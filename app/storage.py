@@ -44,8 +44,21 @@ def new_conversation(data_dir: Path, note: str, orig_name: str) -> dict:
         "error": None,
         "created_at": now,
         "updated_at": now,
+        "keyframes": [],
+        "prompt": None,
     }
     _write_meta(cdir, meta)
+    return meta
+
+
+def update_meta(data_dir: Path, cid: str, **changes) -> dict | None:
+    """合并写字段并刷新 updated_at；cid 非法或不存在返回 None。"""
+    meta = load_meta(data_dir, cid)
+    if meta is None:
+        return None
+    meta.update(changes)
+    meta["updated_at"] = _now()
+    _write_meta(data_dir / cid, meta)
     return meta
 
 
