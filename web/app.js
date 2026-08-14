@@ -590,7 +590,7 @@ function updateSendBtn() {
 function isVideoFile(file) {
   if (!file) return false;
   if (file.type && file.type.startsWith("video/")) return true;
-  return /\.(mp4|mov|m4v|webm|mkv|avi)$/i.test(file.name || "");
+  return /\.(mp4|mov|webm)$/i.test(file.name || "");
 }
 
 function pickFile(file) {
