@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>清洁视频工作室</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<svg aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden">
+  <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-attach" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+  <symbol id="i-film" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M8 5v14M16 5v14M3 10h5M3 14h5M16 10h5M16 14h5"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 14.5h-.5A2.5 2.5 0 0 1 2 12V4.5A2.5 2.5 0 0 1 4.5 2H12a2.5 2.5 0 0 1 2.5 2.5V5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 2.6 17.1a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9.2v4.6"/><path d="M12 17h.01"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5.5 11.5 6.5-6.5 6.5 6.5"/></symbol>
+  <symbol id="i-sparkle" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5 14 8.6l6.1 2-6.1 2L12 18.7 10 12.6l-6.1-2 6.1-2L12 2.5Z"/></symbol>
+</svg>
+
+<div id="login-view" class="login-view" hidden>
+  <div class="login-card">
+    <div class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sparkle"></use></svg></div>
+    <h1 class="login-title">清洁视频工作室</h1>
+    <p class="login-sub">输入访问口令以继续</p>
+    <form id="login-form" novalidate>
+      <label class="sr-only" for="login-token">访问口令</label>
+      <input id="login-token" class="text-input" type="password" placeholder="访问口令" autocomplete="current-password">
+      <p id="login-error" class="form-error" role="alert" hidden></p>
+      <button id="login-btn" class="btn btn-primary btn-block" type="submit">进入</button>
+    </form>
+  </div>
+</div>
+
+<div id="app-view" class="app" hidden>
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+
+  <aside id="sidebar" class="sidebar" aria-label="会话栏">
+    <div class="sidebar-top">
+      <div class="brand">
+        <span class="brand-dot"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sparkle"></use></svg></span>
+        <span>清洁视频工作室</span>
+      </div>
+      <button id="new-chat-btn" class="btn btn-primary btn-new" type="button">
+        <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-plus"></use></svg></span>新建会话
+      </button>
+    </div>
+    <nav id="conv-list" class="conv-list" aria-label="会话列表"></nav>
+    <div class="sidebar-foot">
+      <button id="logout-btn" class="btn btn-ghost" type="button">退出登录</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="main-header">
+      <button id="menu-btn" class="icon-btn" type="button" aria-label="打开会话列表" aria-expanded="false">
+        <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-menu"></use></svg></span>
+      </button>
+      <h1 id="main-title" class="main-title">清洁视频工作室</h1>
+    </header>
+
+    <div id="stream" class="stream" aria-live="polite"></div>
+
+    <div class="composer-dock">
+      <div class="composer-inner">
+        <p id="composer-error" class="inline-error" role="alert" hidden></p>
+        <form id="composer" class="composer" novalidate>
+          <div id="file-chip" class="file-chip" hidden>
+            <span class="ic ic-film"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-film"></use></svg></span>
+            <span id="file-chip-name" class="file-chip-name"></span>
+            <span id="file-chip-size" class="file-chip-size"></span>
+            <button type="button" id="file-remove" class="icon-btn icon-btn-sm" aria-label="移除已选文件">
+              <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"></use></svg></span>
+            </button>
+          </div>
+          <div class="composer-row">
+            <button type="button" id="attach-btn" class="icon-btn" aria-label="选择视频文件">
+              <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-attach"></use></svg></span>
+            </button>
+            <label class="sr-only" for="note-input">备注</label>
+            <input id="note-input" class="composer-input" type="text" placeholder="备注（可选）：想复刻的镜头重点" autocomplete="off">
+            <button type="submit" id="send-btn" class="send-btn" aria-label="发送" disabled>
+              <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-send"></use></svg></span>
+            </button>
+          </div>
+          <div id="upload-progress" class="upload-progress" hidden>
+            <div class="up-track"><div id="up-fill" class="up-fill"></div></div>
+            <span id="up-label" class="up-label">正在上传 0%</span>
+          </div>
+        </form>
+        <p class="composer-hint">上传一段清洁类视频，AI 将抽取关键帧并生成 Seedance 提示词与 15 秒预览</p>
+      </div>
+    </div>
+  </main>
+
+  <input type="file" id="file-input" accept="video/*" hidden>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
