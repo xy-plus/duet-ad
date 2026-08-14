@@ -1,0 +1,773 @@
+/* 清洁视频工作室 — ChatGPT 式单页前端
+ * 同源 API：/api/*，共享口令 Bearer 鉴权；文件直链也需鉴权，故一律 fetch(blob) → ObjectURL。
+ */
+"use strict";
+
+/* ===== 常量与状态 ===== */
+const TOKEN_KEY = "cvs_token";
+const POLL_MS = 2000;
+
+const STATUS_TEXT = { queued: "排队中", processing: "处理中", done: "已完成", failed: "失败" };
+
+const state = {
+  token: null,
+  conversations: [],
+  currentId: null,
+  detail: null,        // 当前会话详情
+  file: null,          // composer 已选文件
+  uploading: false,
+  pollTimer: null,
+  detailSeq: 0,        // 防止过期响应覆盖新渲染
+  objectURLs: [],      // 当前 stream 渲染产生的 blob URL，重渲染前统一 revoke
+};
+
+class AuthError extends Error {}
+
+/* ===== 小工具 ===== */
+const $ = (id) => document.getElementById(id);
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+
+function icon(name, cls) {
+  const span = el("span", "ic" + (cls ? " " + cls : ""));
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", "#" + name);
+  svg.appendChild(use);
+  span.appendChild(svg);
+  return span;
+}
+
+function fmtBytes(n) {
+  if (!Number.isFinite(n) || n < 0) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+  return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
+}
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const now = new Date();
+  const pad = (x) => String(x).padStart(2, "0");
+  const hm = pad(d.getHours()) + ":" + pad(d.getMinutes());
+  if (d.toDateString() === now.toDateString()) return hm;
+  if (d.getFullYear() === now.getFullYear()) return pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hm;
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+}
+
+function trackURL(url) {
+  state.objectURLs.push(url);
+  return url;
+}
+
+function revokeURLs() {
+  for (const u of state.objectURLs) URL.revokeObjectURL(u);
+  state.objectURLs = [];
+}
+
+/* ===== API ===== */
+async function api(path, options = {}) {
+  const headers = Object.assign({}, options.headers);
+  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  let res;
+  try {
+    res = await fetch(path, Object.assign({}, options, { headers }));
+  } catch (e) {
+    throw new Error("无法连接服务器，请检查网络后重试");
+  }
+  if (res.status === 401) throw new AuthError("口令已失效");
+  return res;
+}
+
+async function apiJSON(path, options = {}) {
+  const res = await api(path, options);
+  if (!res.ok) {
+    let msg = "请求失败（" + res.status + "），请稍后重试";
+    try {
+      const data = await res.json();
+      if (data && (data.detail || data.error || data.message)) {
+        msg = String(data.detail || data.error || data.message);
+      }
+    } catch (_) { /* 保留默认文案 */ }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+async function apiBlobURL(path) {
+  const res = await api(path);
+  if (!res.ok) throw new Error("文件加载失败（" + res.status + "）");
+  const blob = await res.blob();
+  return trackURL(URL.createObjectURL(blob));
+}
+
+function handleAuthError(err) {
+  if (err instanceof AuthError) {
+    sessionExpired();
+    return true;
+  }
+  return false;
+}
+
+/* ===== 登录 / 会话鉴权 ===== */
+function showLogin(message) {
+  stopPolling();
+  state.currentId = null;
+  state.detail = null;
+  $("app-view").hidden = true;
+  $("login-view").hidden = false;
+  const errEl = $("login-error");
+  if (message) {
+    errEl.textContent = message;
+    errEl.hidden = false;
+  } else {
+    errEl.hidden = true;
+  }
+  $("login-token").value = "";
+  setTimeout(() => $("login-token").focus(), 0);
+}
+
+function sessionExpired() {
+  state.token = null;
+  localStorage.removeItem(TOKEN_KEY);
+  showLogin("登录状态已失效，请重新输入口令");
+}
+
+async function doLogin(token) {
+  const btn = $("login-btn");
+  const errEl = $("login-error");
+  btn.disabled = true;
+  btn.textContent = "验证中…";
+  errEl.hidden = true;
+  try {
+    const res = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    if (res.status === 401) {
+      errEl.textContent = "口令不正确，请重新输入";
+      errEl.hidden = false;
+      return;
+    }
+    if (!res.ok) {
+      errEl.textContent = "登录失败（" + res.status + "），请稍后重试";
+      errEl.hidden = false;
+      return;
+    }
+    state.token = token;
+    localStorage.setItem(TOKEN_KEY, token);
+    enterApp();
+  } catch (e) {
+    errEl.textContent = "无法连接服务器，请检查网络后重试";
+    errEl.hidden = false;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "进入";
+  }
+}
+
+function enterApp() {
+  $("login-view").hidden = true;
+  $("app-view").hidden = false;
+  state.currentId = null;
+  state.detail = null;
+  renderEmptyHero();
+  refreshList(true);
+}
+
+/* ===== 侧栏会话列表 ===== */
+async function refreshList(autoSelect) {
+  try {
+    const list = await apiJSON("/api/conversations");
+    state.conversations = Array.isArray(list) ? list : [];
+    renderList();
+    if (autoSelect && state.conversations.length > 0 && !state.currentId) {
+      selectConversation(state.conversations[0].id);
+    }
+  } catch (err) {
+    if (handleAuthError(err)) return;
+    renderListError(err.message);
+  }
+}
+
+function renderList() {
+  const nav = $("conv-list");
+  nav.textContent = "";
+  if (state.conversations.length === 0) {
+    nav.appendChild(el("div", "conv-empty", "还没有会话\n在下方选择一段视频，开始第一次生成"));
+    return;
+  }
+  for (const c of state.conversations) {
+    const item = el("button", "conv-item" + (c.id === state.currentId ? " selected" : ""));
+    item.type = "button";
+    item.appendChild(el("span", "conv-title", c.title || "未命名会话"));
+    const meta = el("span", "conv-meta");
+    const badge = el("span", "badge " + (c.status || "queued"), STATUS_TEXT[c.status] || c.status || "");
+    meta.appendChild(badge);
+    meta.appendChild(el("span", "conv-time", fmtTime(c.created_at)));
+    item.appendChild(meta);
+    item.addEventListener("click", () => {
+      selectConversation(c.id);
+      closeDrawer();
+    });
+    nav.appendChild(item);
+  }
+}
+
+function renderListError(msg) {
+  const nav = $("conv-list");
+  nav.textContent = "";
+  const box = el("div", "conv-list-error");
+  box.appendChild(el("div", null, "会话列表加载失败：" + msg));
+  const retry = el("button", "btn btn-ghost", "重试");
+  retry.type = "button";
+  retry.addEventListener("click", () => refreshList(false));
+  box.appendChild(retry);
+  nav.appendChild(box);
+}
+
+/* ===== 抽屉（移动端） ===== */
+function openDrawer() {
+  $("sidebar").classList.add("open");
+  $("drawer-backdrop").hidden = false;
+  $("menu-btn").setAttribute("aria-expanded", "true");
+}
+
+function closeDrawer() {
+  $("sidebar").classList.remove("open");
+  $("drawer-backdrop").hidden = true;
+  $("menu-btn").setAttribute("aria-expanded", "false");
+}
+
+/* ===== Stream 渲染 ===== */
+function clearStream() {
+  revokeURLs();
+  $("stream").textContent = "";
+}
+
+function renderEmptyHero() {
+  stopPolling();
+  clearStream();
+  $("main-title").textContent = "清洁视频工作室";
+
+  const inner = el("div", "stream-inner");
+  const hero = el("div", "empty-hero");
+  const iconBox = el("div", "empty-icon");
+  iconBox.appendChild(icon("i-film"));
+  hero.appendChild(iconBox);
+  hero.appendChild(el("h2", null, "上传清洁视频，生成复刻配方"));
+  hero.appendChild(el("p", "empty-sub", "AI 会抽取关键帧、生成 Seedance 提示词，并给出 15 秒预览"));
+  const steps = el("ol", "empty-steps");
+  const items = [
+    "点击回形针或把视频拖进输入框",
+    "可选：填写备注，说明想复刻的镜头重点",
+    "发送后等待处理，结果会出现在这里",
+  ];
+  items.forEach((t, i) => {
+    const li = el("li");
+    li.appendChild(el("span", "step-n", String(i + 1)));
+    li.appendChild(el("span", null, t));
+    steps.appendChild(li);
+  });
+  hero.appendChild(steps);
+  inner.appendChild(hero);
+  $("stream").appendChild(inner);
+}
+
+function renderSkeleton() {
+  clearStream();
+  const inner = el("div", "stream-inner");
+  inner.appendChild(el("div", "sk-block shimmer sk-user"));
+  inner.appendChild(el("div", "sk-block shimmer sk-assistant"));
+  $("stream").appendChild(inner);
+}
+
+function renderStreamError(msg) {
+  clearStream();
+  const inner = el("div", "stream-inner");
+  const box = el("div", "stream-error");
+  box.appendChild(el("p", null, msg));
+  const retry = el("button", "btn btn-ghost", "重新加载");
+  retry.type = "button";
+  retry.addEventListener("click", () => {
+    if (state.currentId) selectConversation(state.currentId);
+  });
+  box.appendChild(retry);
+  inner.appendChild(box);
+  $("stream").appendChild(inner);
+}
+
+function assistantHead(timeISO) {
+  const head = el("div", "assistant-head");
+  head.appendChild(icon("i-sparkle", "ic-accent"));
+  head.appendChild(el("span", "assistant-name", "助手"));
+  head.appendChild(el("span", "assistant-time", fmtTime(timeISO)));
+  return head;
+}
+
+function renderUserBubble(detail) {
+  const row = el("div", "msg-row msg-user");
+  const bubble = el("div", "bubble-user");
+  if (detail.note) bubble.appendChild(el("p", "bubble-note", detail.note));
+  const fileRow = el("div", "bubble-file");
+  fileRow.appendChild(icon("i-film"));
+  fileRow.appendChild(el("span", "bubble-file-name", detail.title || "已上传视频"));
+  bubble.appendChild(fileRow);
+  row.appendChild(bubble);
+  return row;
+}
+
+/* 状态时间线（queued / processing） */
+function renderActivity(status) {
+  const row = el("div", "msg-row");
+  row.appendChild(assistantHead(null));
+  const card = el("div", "activity-card");
+  card.appendChild(el("p", "ac-title", status === "queued" ? "排队等待中" : "正在处理"));
+  card.appendChild(el("p", "ac-sub", "通常需要几十秒到几分钟，可稍后再来查看"));
+  const track = el("div", "progress-track");
+  track.appendChild(el("div", "progress-fill"));
+  card.appendChild(track);
+
+  const stages = el("ol", "stages");
+  // [标签, 状态]：done=已完成, active=进行中, pending=未开始
+  const defs = status === "queued"
+    ? [["上传完成", "done"], ["排队等待", "active"], ["抽取关键帧并生成提示词", "pending"], ["生成 15 秒预览", "pending"]]
+    : [["上传完成", "done"], ["排队等待", "done"], ["抽取关键帧并生成提示词", "active"], ["生成 15 秒预览", "pending"]];
+  for (const [label, st] of defs) {
+    const li = el("li", "stage " + st);
+    const ic = el("span", "stage-icon");
+    if (st === "done") ic.appendChild(icon("i-check"));
+    else if (st === "active") ic.appendChild(el("span", "pulse-dot"));
+    li.appendChild(ic);
+    li.appendChild(el("span", "stage-label", label));
+    stages.appendChild(li);
+  }
+  card.appendChild(stages);
+  row.appendChild(card);
+  return row;
+}
+
+function renderFail(detail) {
+  const row = el("div", "msg-row");
+  row.appendChild(assistantHead(detail.updated_at));
+  const card = el("div", "fail-card");
+  card.appendChild(icon("i-alert", "ic-danger"));
+  const body = el("div");
+  body.appendChild(el("p", "fail-title", "处理失败"));
+  body.appendChild(el("p", "fail-msg", detail.error || "后端未返回具体原因"));
+  body.appendChild(el("p", "fail-tip", "请确认视频可正常播放、格式常见（如 MP4 / MOV），然后重新上传"));
+  card.appendChild(body);
+  row.appendChild(card);
+  return row;
+}
+
+/* 结果区（done） */
+function renderResults(detail) {
+  const frag = document.createDocumentFragment();
+
+  const headRow = el("div", "msg-row");
+  headRow.appendChild(assistantHead(detail.updated_at));
+  const doneCard = el("div", "activity-card");
+  doneCard.appendChild(el("p", "ac-title", "处理完成"));
+  doneCard.appendChild(el("p", "ac-sub", "关键帧、提示词与预览已生成，可直接复制使用"));
+  headRow.appendChild(doneCard);
+  frag.appendChild(headRow);
+
+  // 关键帧 Bento
+  const names = Array.isArray(detail.keyframes) ? detail.keyframes : [];
+  if (names.length > 0) {
+    const sec = el("section", "res-section");
+    const h = el("h3", "res-h3", "关键帧");
+    h.appendChild(el("span", "res-count", names.length + " 张"));
+    sec.appendChild(h);
+    const grid = el("div", "kf-grid");
+    for (const name of names) {
+      const fig = el("figure", "kf-card shimmer");
+      const img = el("img");
+      img.alt = "关键帧 " + name;
+      fig.appendChild(img);
+      grid.appendChild(fig);
+      apiBlobURL("/api/conversations/" + detail.id + "/files/keyframes/" + encodeURIComponent(name))
+        .then((url) => {
+          img.src = url;
+          img.addEventListener("load", () => {
+            fig.classList.remove("shimmer");
+            fig.classList.add("is-loaded");
+          }, { once: true });
+        })
+        .catch(() => {
+          fig.classList.remove("shimmer");
+          fig.appendChild(el("div", "kf-err", "加载失败"));
+        });
+    }
+    sec.appendChild(grid);
+    frag.appendChild(sec);
+  }
+
+  // Prompt 卡片
+  if (detail.prompt) {
+    const sec = el("section", "res-section");
+    sec.appendChild(el("h3", "res-h3", "Seedance 提示词"));
+    const card = el("div", "prompt-card");
+    const head = el("div", "prompt-head");
+    head.appendChild(el("span", "prompt-hint", "复制后可直接粘贴到 Seedance"));
+    const copyBtn = el("button", "copy-btn");
+    copyBtn.type = "button";
+    copyBtn.appendChild(icon("i-copy"));
+    const copyLabel = el("span", null, "复制");
+    copyBtn.appendChild(copyLabel);
+    copyBtn.addEventListener("click", async () => {
+      const ok = await copyText(detail.prompt);
+      copyBtn.classList.add("copied");
+      copyLabel.textContent = ok ? "已复制" : "复制失败";
+      setTimeout(() => {
+        copyBtn.classList.remove("copied");
+        copyLabel.textContent = "复制";
+      }, 1600);
+    });
+    head.appendChild(copyBtn);
+    card.appendChild(head);
+    card.appendChild(el("pre", "prompt-text", detail.prompt));
+    sec.appendChild(card);
+    frag.appendChild(sec);
+  }
+
+  // 预览视频
+  if (detail.has_preview) {
+    const sec = el("section", "res-section");
+    sec.appendChild(el("h3", "res-h3", "15 秒预览"));
+    const wrap = el("div", "video-wrap");
+    wrap.appendChild(el("div", "video-shimmer shimmer", "正在加载预览…"));
+    const video = el("video");
+    video.controls = true;
+    video.playsInline = true;
+    video.preload = "metadata";
+    wrap.appendChild(video);
+    sec.appendChild(wrap);
+    frag.appendChild(sec);
+    apiBlobURL("/api/conversations/" + detail.id + "/files/preview.mp4")
+      .then((url) => {
+        video.src = url;
+        video.addEventListener("loadeddata", () => wrap.classList.add("is-ready"), { once: true });
+        video.addEventListener("error", () => wrap.classList.add("is-error"), { once: true });
+      })
+      .catch(() => wrap.classList.add("is-error"));
+  }
+
+  // 生成最终视频（预留）
+  const sec = el("section", "res-section");
+  const card = el("div", "final-card");
+  card.appendChild(el("h3", "res-h3", "最终视频"));
+  const row = el("div", "final-row");
+  const btnWrap = el("span", "submit-wrap");
+  const btn = el("button", "btn btn-primary", "生成最终视频");
+  btn.type = "button";
+  btn.disabled = true;
+  btn.setAttribute("aria-describedby", "final-caption");
+  btnWrap.appendChild(btn);
+  row.appendChild(btnWrap);
+  const cap = el("p", "final-caption", "预留接口，当前阶段未开放");
+  cap.id = "final-caption";
+  row.appendChild(cap);
+  card.appendChild(row);
+  sec.appendChild(card);
+  frag.appendChild(sec);
+
+  return frag;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    // 降级：隐藏 textarea + execCommand
+    try {
+      const ta = el("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+}
+
+function renderDetail(detail) {
+  clearStream();
+  const inner = el("div", "stream-inner");
+  inner.appendChild(renderUserBubble(detail));
+  if (detail.status === "queued" || detail.status === "processing") {
+    inner.appendChild(renderActivity(detail.status));
+  } else if (detail.status === "failed") {
+    inner.appendChild(renderFail(detail));
+  } else if (detail.status === "done") {
+    inner.appendChild(renderResults(detail));
+  }
+  $("stream").appendChild(inner);
+}
+
+/* ===== 会话详情 + 轮询 ===== */
+async function loadDetail(id, silent) {
+  const seq = ++state.detailSeq;
+  if (!silent) renderSkeleton();
+  try {
+    const detail = await apiJSON("/api/conversations/" + encodeURIComponent(id));
+    if (seq !== state.detailSeq || state.currentId !== id) return; // 已切换会话
+    state.detail = detail;
+    renderDetail(detail);
+    if (detail.status === "queued" || detail.status === "processing") {
+      startPolling(id);
+    } else {
+      stopPolling();
+      refreshList(false); // 终态：同步侧栏徽章
+    }
+  } catch (err) {
+    if (handleAuthError(err)) return;
+    if (seq !== state.detailSeq) return;
+    stopPolling();
+    renderStreamError("会话加载失败：" + err.message);
+  }
+}
+
+function selectConversation(id) {
+  if (state.uploading) return; // 上传中不切换，避免打断
+  state.currentId = id;
+  const conv = state.conversations.find((c) => c.id === id);
+  $("main-title").textContent = (conv && conv.title) || "会话";
+  renderList();
+  loadDetail(id, false);
+}
+
+function startPolling(id) {
+  stopPolling();
+  state.pollTimer = setInterval(() => {
+    if (state.currentId !== id) {
+      stopPolling();
+      return;
+    }
+    loadDetail(id, true);
+  }, POLL_MS);
+}
+
+function stopPolling() {
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
+/* ===== Composer ===== */
+function setComposerError(msg) {
+  const box = $("composer-error");
+  if (msg) {
+    box.textContent = msg;
+    box.hidden = false;
+  } else {
+    box.hidden = true;
+  }
+}
+
+function updateSendBtn() {
+  $("send-btn").disabled = state.uploading || !state.file;
+}
+
+function isVideoFile(file) {
+  if (!file) return false;
+  if (file.type && file.type.startsWith("video/")) return true;
+  return /\.(mp4|mov|m4v|webm|mkv|avi)$/i.test(file.name || "");
+}
+
+function pickFile(file) {
+  setComposerError(null);
+  if (!file) return;
+  if (!isVideoFile(file)) {
+    setComposerError("仅支持视频文件（如 MP4 / MOV），请重新选择");
+    return;
+  }
+  state.file = file;
+  $("file-chip-name").textContent = file.name;
+  $("file-chip-size").textContent = fmtBytes(file.size);
+  $("file-chip").hidden = false;
+  updateSendBtn();
+}
+
+function clearFile() {
+  state.file = null;
+  $("file-input").value = "";
+  $("file-chip").hidden = true;
+  updateSendBtn();
+}
+
+function setUploading(on) {
+  state.uploading = on;
+  $("attach-btn").disabled = on;
+  $("note-input").disabled = on;
+  $("file-remove").disabled = on;
+  $("send-btn").disabled = on || !state.file;
+  if (!on) $("upload-progress").hidden = true;
+}
+
+function uploadConversation(file, note, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/conversations");
+    xhr.setRequestHeader("Authorization", "Bearer " + state.token);
+    xhr.responseType = "json";
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable && e.total > 0) onProgress(e.loaded / e.total);
+    });
+    xhr.addEventListener("load", () => {
+      if (xhr.status === 201) {
+        resolve(xhr.response);
+      } else if (xhr.status === 401) {
+        reject(new AuthError("口令已失效"));
+      } else {
+        const data = xhr.response;
+        const msg = data && (data.detail || data.error || data.message)
+          ? String(data.detail || data.error || data.message)
+          : "上传失败（" + xhr.status + "），请稍后重试";
+        reject(new Error(msg));
+      }
+    });
+    xhr.addEventListener("error", () => reject(new Error("网络异常，上传未完成，请重试")));
+    xhr.addEventListener("abort", () => reject(new Error("上传已中断，请重试")));
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    if (note) fd.append("note", note);
+    xhr.send(fd);
+  });
+}
+
+async function handleSend(event) {
+  event.preventDefault();
+  if (state.uploading) return;
+  if (!state.file) {
+    setComposerError("请先选择或拖入一段视频文件");
+    return;
+  }
+  const file = state.file;
+  const note = $("note-input").value.trim();
+
+  setComposerError(null);
+  setUploading(true);
+  const progress = $("upload-progress");
+  const fill = $("up-fill");
+  const label = $("up-label");
+  progress.hidden = false;
+  fill.style.width = "0%";
+  label.textContent = "正在上传 0%";
+
+  try {
+    const created = await uploadConversation(file, note, (ratio) => {
+      const pct = Math.round(ratio * 100);
+      fill.style.width = pct + "%";
+      label.textContent = pct >= 100 ? "上传完成，等待处理…" : "正在上传 " + pct + "%";
+    });
+    // 成功：清空 composer，刷新列表并选中新会话
+    clearFile();
+    $("note-input").value = "";
+    setUploading(false);
+    await refreshList(false);
+    if (created && created.id) {
+      selectConversation(created.id);
+    }
+  } catch (err) {
+    setUploading(false);
+    if (handleAuthError(err)) return;
+    setComposerError(err.message);
+  }
+}
+
+/* ===== 事件绑定与启动 ===== */
+function bindEvents() {
+  $("login-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const token = $("login-token").value.trim();
+    if (!token) {
+      $("login-error").textContent = "请输入访问口令";
+      $("login-error").hidden = false;
+      return;
+    }
+    doLogin(token);
+  });
+
+  $("logout-btn").addEventListener("click", () => {
+    state.token = null;
+    localStorage.removeItem(TOKEN_KEY);
+    showLogin(null);
+  });
+
+  $("menu-btn").addEventListener("click", openDrawer);
+  $("drawer-backdrop").addEventListener("click", closeDrawer);
+
+  $("new-chat-btn").addEventListener("click", () => {
+    if (state.uploading) return;
+    state.currentId = null;
+    state.detail = null;
+    renderList();
+    renderEmptyHero();
+    closeDrawer();
+    $("note-input").focus();
+  });
+
+  $("attach-btn").addEventListener("click", () => $("file-input").click());
+  $("file-input").addEventListener("change", (e) => {
+    pickFile(e.target.files && e.target.files[0]);
+  });
+  $("file-remove").addEventListener("click", clearFile);
+
+  const composer = $("composer");
+  composer.addEventListener("submit", handleSend);
+  composer.addEventListener("dragenter", (e) => {
+    e.preventDefault();
+    if (!state.uploading) composer.classList.add("drag-over");
+  });
+  composer.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    if (!state.uploading) composer.classList.add("drag-over");
+  });
+  composer.addEventListener("dragleave", (e) => {
+    if (!composer.contains(e.relatedTarget)) composer.classList.remove("drag-over");
+  });
+  composer.addEventListener("drop", (e) => {
+    e.preventDefault();
+    composer.classList.remove("drag-over");
+    if (state.uploading) return;
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    pickFile(file);
+  });
+
+  window.addEventListener("resize", () => {
+    if (window.innerWidth > 768) closeDrawer();
+  });
+}
+
+function boot() {
+  bindEvents();
+  updateSendBtn();
+  const saved = localStorage.getItem(TOKEN_KEY);
+  if (saved) {
+    state.token = saved;
+    enterApp(); // refreshList 遇 401 会自动回登录页
+  } else {
+    showLogin(null);
+  }
+}
+
+boot();
