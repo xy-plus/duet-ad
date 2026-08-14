@@ -3,12 +3,13 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import storage
+from app import pipeline, storage
 from app.auth import require_auth
+from app.codex_runner import CodexRunner
 from app.config import Settings, get_settings
 
 _RATE_LIMIT = 10  # 每 IP 每分钟上传次数
@@ -34,6 +35,9 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI()
     app.state.settings = settings
     limiter = _RateLimiter()
+    codex_runner = CodexRunner(
+        timeout_s=settings.codex_timeout_s, concurrency=settings.codex_concurrency
+    )
 
     @app.get("/api/health")
     async def health():
@@ -63,6 +67,7 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/api/conversations", status_code=201, dependencies=[Depends(require_auth)])
     async def create_conversation(
         request: Request,
+        background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
         note: str = Form(""),
     ):
@@ -77,6 +82,8 @@ def create_app(settings: Settings) -> FastAPI:
         except storage.UploadError as e:
             storage.remove_conversation(settings.data_dir, meta["id"])
             raise HTTPException(status_code=422, detail=str(e)) from e
+        if settings.enable_pipeline:
+            background_tasks.add_task(pipeline.run, settings, meta["id"], codex_runner)
         return {"id": meta["id"], "status": "queued"}
 
     @app.get("/api/conversations/{cid}", dependencies=[Depends(require_auth)])
@@ -87,8 +94,8 @@ def create_app(settings: Settings) -> FastAPI:
         cdir = settings.data_dir / cid
         return {
             **meta,
-            "keyframes": [],
-            "prompt": None,
+            "keyframes": meta.get("keyframes", []),
+            "prompt": meta.get("prompt"),
             "has_contact_sheet": (cdir / "work" / "contact_sheet.jpg").is_file(),
             "has_preview": (cdir / "preview.mp4").is_file(),
             "has_video": (cdir / "generated.mp4").is_file(),
