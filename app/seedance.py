@@ -83,8 +83,12 @@ def _load_reviewed(cdir: Path) -> dict:
 
 
 def _keyframes(cdir: Path) -> list[Path]:
+    # 与 pipeline 的产物布局对齐：目录里还有 contact_sheet.jpg/manifest.json，只取关键帧 PNG
     kdir = cdir / "work" / "keyframes"
-    files = sorted(p for p in kdir.iterdir() if p.is_file()) if kdir.is_dir() else []
+    files = sorted(
+        p for p in kdir.iterdir()
+        if p.is_file() and p.suffix == ".png" and "keyframe" in p.name
+    ) if kdir.is_dir() else []
     if not files:
         raise SubmitError(409, "payload changed since review")
     return files

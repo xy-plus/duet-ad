@@ -49,7 +49,10 @@ def _make_conv(settings, status="done", has_video=False, with_work=True):
     (cdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     if with_work:
         (cdir / "work" / "keyframes").mkdir(parents=True)
-        (cdir / "work" / "keyframes" / "k01.jpg").write_bytes(b"img1")
+        # 与 pipeline 真实产物布局一致：关键帧 PNG 与 contact_sheet/manifest 同目录
+        (cdir / "work" / "keyframes" / "01_keyframe_0.330s.png").write_bytes(b"img1")
+        (cdir / "work" / "keyframes" / "contact_sheet.jpg").write_bytes(b"sheet")
+        (cdir / "work" / "keyframes" / "manifest.json").write_text("{}", encoding="utf-8")
         (cdir / "work" / "seedance_prompt.txt").write_text(PROMPT, encoding="utf-8")
         (cdir / "work" / "api_request.json").write_text(
             json.dumps(REVIEWED, ensure_ascii=False), encoding="utf-8"
@@ -238,9 +241,11 @@ def test_submit_success_200(enabled, monkeypatch):
                  "--state-file", "work/task.json",
                  "--download", "generated.mp4",
                  "--prompt-file", "work/seedance_prompt.txt",
-                 "--ref-images", "work/keyframes/k01.jpg",
+                 "--ref-images", "work/keyframes/01_keyframe_0.330s.png",
                  "--model", REVIEWED["model"]):
         assert flag in argv
+    # 回归：keyframes/ 里的非关键帧产物不得进 ref-images
+    assert not any("contact_sheet" in a or "manifest" in a for a in argv)
 
     # meta 落盘：has_video / submitted_at / task_id；密钥不进任何写盘文件
     meta = storage.load_meta(settings.data_dir, cid)
@@ -253,6 +258,7 @@ def test_submit_success_200(enabled, monkeypatch):
     # detail 冻结契约仍 13 字段（meta 新增字段不外泄），has_video 按文件翻真
     d = c.get(f"/api/conversations/{cid}", headers=AUTH).json()
     assert len(d) == 13
+    assert "task_id" not in d
     assert d["has_video"] is True
 
     # 幂等：再提交一次 → 409
