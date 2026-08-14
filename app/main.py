@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import time
 from collections import defaultdict, deque
@@ -7,7 +8,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import storage
+from app import seedance, storage
 from app.auth import require_auth
 from app.config import Settings, get_settings
 
@@ -34,6 +35,7 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI()
     app.state.settings = settings
     limiter = _RateLimiter()
+    submit_locks: dict[str, asyncio.Lock] = {}
 
     @app.get("/api/health")
     async def health():
@@ -85,8 +87,15 @@ def create_app(settings: Settings) -> FastAPI:
         if meta is None:
             raise HTTPException(status_code=404, detail="not found")
         cdir = settings.data_dir / cid
+        # 显式键：meta 落盘的提交标记（submitted_at/task_id 等）不外泄，冻结 13 字段契约
         return {
-            **meta,
+            "id": meta["id"],
+            "title": meta["title"],
+            "note": meta["note"],
+            "status": meta["status"],
+            "error": meta["error"],
+            "created_at": meta["created_at"],
+            "updated_at": meta["updated_at"],
             "keyframes": [],
             "prompt": None,
             "has_contact_sheet": (cdir / "work" / "contact_sheet.jpg").is_file(),
@@ -101,6 +110,13 @@ def create_app(settings: Settings) -> FastAPI:
         if path is None:
             raise HTTPException(status_code=404, detail="not found")
         return FileResponse(path)
+
+    @app.post("/api/conversations/{cid}/submit", dependencies=[Depends(require_auth)])
+    async def submit_conversation(cid: str, payload: dict):
+        try:
+            return await seedance.submit(settings, cid, payload, submit_locks)
+        except seedance.SubmitError as e:
+            raise HTTPException(status_code=e.status, detail=e.detail) from e
 
     web = Path(__file__).resolve().parent.parent / "web"
     if web.is_dir():

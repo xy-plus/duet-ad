@@ -74,6 +74,19 @@ def remove_conversation(data_dir: Path, cid: str) -> None:
         shutil.rmtree(data_dir / cid, ignore_errors=True)
 
 
+def mark_submitted(data_dir: Path, cid: str, task_id: str | None) -> dict:
+    """提交成功后回写 meta：has_video/submitted_at/task_id，供幂等门控与展示。"""
+    meta = load_meta(data_dir, cid)
+    if meta is None:
+        raise ValueError(f"unknown conversation: {cid}")
+    meta["has_video"] = True
+    meta["submitted_at"] = _now()
+    meta["task_id"] = task_id
+    meta["updated_at"] = meta["submitted_at"]
+    _write_meta(data_dir / cid, meta)
+    return meta
+
+
 async def save_upload(cdir: Path, upload, max_bytes: int) -> Path:
     """流式落盘为 source.<ext>，超限即删并报错；不读进内存。"""
     ext = Path(upload.filename or "").suffix.lower()
