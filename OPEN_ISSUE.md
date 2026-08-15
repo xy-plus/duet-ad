@@ -10,7 +10,7 @@
 
 <!-- 开工登记、集成即删；重开任务记重开链：继承未解 blockers 与已用轮次 -->
 
-- D e2e+文档：样例视频全链路冒烟(e2e 编排者自跑)、README+docs/human+docs/agent(worker)；并行中。（→ 分支 task/docs）
+（空）
 
 ## 📌 待办与限制
 
