@@ -711,3 +711,25 @@ def test_full_pipeline_with_stub_codex(tmp_path, video_1s, monkeypatch):
     assert (stream["width"], stream["height"]) == (720, 1280)
     assert stream["avg_frame_rate"] == "25/1"
     assert abs(float(info["format"]["duration"]) - 15.0) < 0.2
+
+
+def test_full_pipeline_relative_data_dir(tmp_path, video_1s, monkeypatch):
+    """回归：DATA_DIR 为相对路径（生产默认 "data"）时流水线也必须成功。
+
+    _render_preview 以 keyframes/ 为 cwd 跑 ffmpeg，相对 dest 会解析到错误位置。
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_stub_codex(bin_dir, "0.05,0.15,0.25,0.35,0.45,0.55,0.65,0.75,0.85")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.chdir(tmp_path)
+
+    settings = make_settings(tmp_path, data_dir=Path("data"))
+    meta = _make_conversation(settings, video_1s)
+    cid = meta["id"]
+
+    pipeline.run(settings, cid, CodexRunner(settings.codex_timeout_s, settings.codex_concurrency))
+
+    m = storage.load_meta(settings.data_dir, cid)
+    assert m["status"] == "done", m["error"]
+    assert (tmp_path / "data" / cid / "preview.mp4").is_file()

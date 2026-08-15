@@ -164,7 +164,8 @@ def _render_preview(work: Path, dest: Path) -> None:
 
 def run(settings: Settings, cid: str, runner) -> None:
     """后台任务入口；任何步骤失败 → status=failed + error，不抛异常。"""
-    cdir = settings.data_dir / cid
+    # data_dir 可能是相对路径（生产默认 "data"）：子进程带 cwd 时相对路径会错位，统一起点解析为绝对
+    cdir = (settings.data_dir / cid).resolve()
     work = cdir / "work"
     try:
         if storage.update_meta(settings.data_dir, cid, status="processing", error=None) is None:
