@@ -25,7 +25,7 @@ ACCESS_TOKEN=<访问口令> ./run.sh
 ## 结构
 
 ```
-app/            FastAPI 后端：main(路由) config auth storage pipeline codex_runner seedance
+app/            FastAPI 后端：main(路由) config auth storage downloader pipeline codex_runner seedance
 web/            单页前端（原生 JS，同源 /api/*，由后端 StaticFiles 挂载在 /）
 skills/seedance-cleaning-video-maker/   codex agent 使用的技能（脚本+参考文档）
 tests/          pytest（conftest 直建 Settings，默认 enable_pipeline=False 不跑流水线）

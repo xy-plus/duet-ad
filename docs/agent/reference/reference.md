@@ -4,7 +4,7 @@ type: reference
 status: done
 owner: agent
 updated: 2026-08-15
-links: [conversation-task, app/main.py, app/storage.py, app/pipeline.py, app/codex_runner.py, app/seedance.py]
+links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/pipeline.py, app/codex_runner.py, app/seedance.py]
 ---
 
 # backend-api · 接口（How/Now）
@@ -29,16 +29,19 @@ links: [conversation-task, app/main.py, app/storage.py, app/pipeline.py, app/cod
 
 ### `POST /api/conversations`
 
-- 请求：multipart，`file`（必填）+ `note`（可选，默认 `""`）
+- 请求：multipart，`file` 与 `reference_url`（http(s) 直链 / TikTok 视频页）恰好一个 + `note`（可选，默认 `""`）
 - 201 → `{"id": "<32位hex>", "status": "queued"}`；`enable_pipeline` 开时登记后台流水线
+- 400 `provide exactly one of file or reference_url`：`file`/`reference_url` 都不给或都给
 - 429 `too many uploads`：同 IP 1 分钟超 10 次（内存滑动窗口，进程重启清零）
-- 422：上传校验链失败，detail 为具体原因；失败即回滚删除整个会话目录
+- 422：上传/下载校验链失败（`UploadError`/`DownloadError`），detail 为具体原因；失败即回滚删除整个会话目录
 
 上传校验链（顺序执行，`storage.save_upload` → `storage.probe_video`）：
 
 1. 扩展名 ∈ `{.mp4, .mov, .webm}`（小写化），否则 `unsupported extension: <ext>`
 2. 流式落盘（1MB 块），累计超 `MAX_UPLOAD_MB*1024*1024` → `file exceeds <n> bytes`，已写部分删除
 3. ffprobe 实探（30s 超时）：打不开 → `ffprobe failed: ...` / `unreadable video file`；时长解析失败 → `cannot parse video duration`；时长超 `MAX_DURATION_S` → `duration <d>s exceeds <n>s`
+
+URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）：TikTok 视频页先经 TikWM API 解析出 play 直链；下载带 SSRF 防护（见架构安全模型），任一步失败（含解析到私网、HTTP 非 2xx、超限/超时/空文件、连接/读取异常归一）抛 `DownloadError` → 422 + 回滚；落盘 `source.<ext>`（后缀取 URL path，白名单外默认 `.mp4`）后与文件分支汇合同一 `probe_video`
 
 ### `GET /api/conversations/{cid}`
 
@@ -87,7 +90,7 @@ links: [conversation-task, app/main.py, app/storage.py, app/pipeline.py, app/cod
 ## 公开接口（Python 模块）
 
 - `app.config.get_settings() -> Settings` — 读环境变量建配置；缺 `ACCESS_TOKEN` 抛 RuntimeError
-- `app.config.Settings` — frozen dataclass，8 字段（见架构配置表）；直建默认 `enable_pipeline=False`
+- `app.config.Settings` — frozen dataclass，10 字段（见架构配置表）；直建默认 `enable_pipeline=False`
 - `app.auth.require_auth(request, cred)` — FastAPI 依赖，Bearer 校验
 - `app.main.create_app(settings) -> FastAPI` — 应用工厂（测试注入用）；模块级 `app = create_app(get_settings())`
 - `app.storage.new_conversation(data_dir, note, orig_name) -> dict` — 建目录 + 初始 meta（status=queued）
@@ -97,6 +100,7 @@ links: [conversation-task, app/main.py, app/storage.py, app/pipeline.py, app/cod
 - `app.storage.remove_conversation(data_dir, cid)` — 回滚删目录（cid 校验）
 - `app.storage.mark_submitted(data_dir, cid, task_id) -> dict` — 提交标记回写（供幂等门控）
 - `app.storage.save_upload(cdir, upload, max_bytes) -> Path` — 流式落盘 `source.<ext>`；`UploadError` 由 HTTP 层转 422
+- `app.downloader.fetch_reference(url, cdir, settings) -> Path` — URL 分流（TikTok 经 TikWM / http(s) 直链）下载落盘 `source.<ext>`；`DownloadError` 由 HTTP 层转 422
 - `app.storage.probe_video(path, max_duration_s) -> float` — ffprobe 探测，返回时长
 - `app.storage.resolve_file(data_dir, cid, name) -> Path | None` — files 白名单解析
 - `app.pipeline.run(settings, cid, runner)` — 后台任务入口；任何失败 → `failed`+`error`，不抛

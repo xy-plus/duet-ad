@@ -2,7 +2,8 @@
 
 移植 TrendScout tools/lib/media.py 的最小必要逻辑（无缓存）：DNS pinning
 （解析一次后固定 IP 直连，防 DNS rebinding）、每次跳转独立重校验、
-Content-Length 预检 + 流式写盘上限 + 整体 deadline。proxy 为空即直连。
+Content-Length 预检 + 流式写盘上限 + 整体 deadline。proxy 为空即直连；
+非空时域名解析改问代理对面的 DoH（本机 DNS 可能被污染），校验与拨号仍共用同一 IP。
 """
 import http.client
 import ipaddress
@@ -20,6 +21,7 @@ from app.storage import ALLOWED_EXT
 _CHUNK = 64 * 1024
 _MAX_REDIRECTS = 5
 _TIKWM_API = "https://www.tikwm.com/api/"
+_DOH_URL = "https://1.1.1.1/dns-query"
 
 
 class DownloadError(RuntimeError):
@@ -40,6 +42,41 @@ def _local_resolve(host: str) -> list[str]:
     except OSError as e:
         raise DownloadError(f"DNS resolution failed: {host}") from e
     return [info[4][0] for info in infos if len(info) >= 5 and info[4]]
+
+
+def _doh_resolve(host: str, *, proxy: str | None, timeout: int, transport=None) -> list[str]:
+    """经代理向 DoH 解析器要 A 记录。查不到就报错，绝不回落到会撒谎的本机解析。"""
+    options: dict = {"timeout": timeout, "trust_env": False}
+    if transport is not None:
+        options["transport"] = transport
+    elif proxy:
+        options["proxy"] = proxy
+    try:
+        with httpx.Client(**options) as client:
+            response = client.get(
+                _DOH_URL, params={"name": host, "type": "A"},
+                headers={"accept": "application/dns-json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as e:
+        raise DownloadError(f"DoH resolution failed: {host} ({str(e)[:120]})") from e
+    answers = payload.get("Answer") if isinstance(payload, dict) else None
+    addresses = [
+        str(item["data"]) for item in (answers or [])
+        if isinstance(item, dict) and item.get("type") == 1 and item.get("data")
+    ]
+    if not addresses:
+        raise DownloadError(f"DoH resolution found no A record: {host}")
+    return addresses
+
+
+def _resolver_for(proxy: str | None, timeout: int):
+    """有代理就问代理对面的 DoH（本机 DNS 对 CDN 域名可能被污染，钉到死 IP 隧道必炸）；
+    没配代理才用本机解析。校验与拨号共用同一次解析结果，保住"校验的=真连的"。"""
+    if not proxy:
+        return _local_resolve
+    return lambda host: _doh_resolve(host, proxy=proxy, timeout=timeout)
 
 
 def _validate_public_url(url: str, resolve):
@@ -145,9 +182,10 @@ def download_public_video(
     temporary = dest.with_suffix(dest.suffix + ".part")
     deadline = time.monotonic() + timeout
     temporary.unlink(missing_ok=True)
+    resolve = _resolver_for(proxy, timeout)
     try:
         for _ in range(_MAX_REDIRECTS):
-            validated = _validate_public_url(current, _local_resolve)
+            validated = _validate_public_url(current, resolve)
             connection, response = _open_pinned(*validated, timeout=timeout, proxy=proxy)
             try:
                 status = int(getattr(response, "status", 0) or 0)

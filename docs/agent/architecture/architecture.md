@@ -19,6 +19,7 @@ links: [conversation-task]
 | `app/config.py` | `Settings` dataclass + `get_settings()` 读环境变量 | conversation-task |
 | `app/auth.py` | Bearer 口令校验（`hmac.compare_digest`） | conversation-task |
 | `app/storage.py` | 会话目录/元数据读写、上传流式落盘、ffprobe 探测、files 白名单解析 | conversation-task |
+| `app/downloader.py` | URL 视频下载（http(s) 直链 / TikTok 经 TikWM 解析）：SSRF 防护（私网 IP 拒绝、DNS pinning、跳转逐次重校验）、大小/超时上限 | conversation-task |
 | `app/pipeline.py` | 处理流水线编排 + agent 产物白名单校验 + 预览合成 | conversation-task |
 | `app/codex_runner.py` | 沙箱化 `codex exec` 调用（argv、断网、env 清洗、超时、并发信号量） | conversation-task |
 | `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 复核 + 脱敏 | conversation-task |
@@ -86,6 +87,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 4. **files 白名单**：`resolve_file` 只映射 `preview.mp4`/`generated.mp4`/`contact_sheet.jpg`/`keyframes/<fn>`，resolved-path 防穿越。
 5. **codex 沙箱**：argv 逐项见下表；永不 `shell=True`，永不 `--dangerously-bypass-*`；硬超时 `CODEX_TIMEOUT_S`；并发信号量 `CODEX_CONCURRENCY`。
 6. **密钥红线**：`ACCESS_TOKEN`/`ARK_API_KEY` 只存在于服务进程环境；不进日志/响应/meta.json；seedance 报错一律 `_sanitize` 脱敏（删含 key|authorization 行 + 抹除密钥字面值）；pipeline/codex 报错先 `clean_stderr`（剔环境变量行，截 500 字）。
+7. **URL 下载 SSRF 防护**：`reference_url` 下载在后端进程内做（`app/downloader.py`），URL 不进 codex 沙箱（沙箱依旧断网，只有落盘视频进工作目录）：scheme 仅 http(s)、解析所得 IP 拒绝私网/回环/link-local/reserved、DNS pinning（解析一次固定 IP 直连，每次跳转独立重校验）、Content-Length 预检 + 流式写盘限 `MAX_UPLOAD_MB` + 整体超时 `DOWNLOAD_TIMEOUT_S`；连接/读取异常归一为 `DownloadError` → 422 + 回滚目录。
 
 ### codex 沙箱 argv 逐项（`CodexRunner.build_argv`，codex-cli 0.147.0 实证）
 
@@ -118,6 +120,8 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 | `ACCESS_TOKEN` | 无（必填，缺则 RuntimeError） | 全站共享口令，Bearer 校验 |
 | `MAX_UPLOAD_MB` | `500` | 上传大小上限 |
 | `MAX_DURATION_S` | `300` | 视频时长上限（ffprobe 实探） |
+| `TIKTOK_PROXY` | 空 | TikTok 解析/下载走的 HTTP 代理（空 = 直连；仅 TikTok 分支用） |
+| `DOWNLOAD_TIMEOUT_S` | `120` | `reference_url` 下载与 TikWM 解析的整体超时；下载大小上限复用 `MAX_UPLOAD_MB` |
 | `ENABLE_SEEDANCE_SUBMIT` | 关 | `1/true/yes` 开启真实提交（否则 501） |
 | `DATA_DIR` | `data` | 会话数据根目录 |
 | `CODEX_TIMEOUT_S` | `600` | codex 硬超时 |

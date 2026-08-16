@@ -3,6 +3,7 @@ import shutil
 import subprocess
 
 import httpx
+import pytest
 from conftest import AUTH, make_settings
 from fastapi.testclient import TestClient
 
@@ -157,6 +158,55 @@ def test_url_connection_refused_422(client, monkeypatch, settings):
     assert r.status_code == 422
     assert "refused" in r.json()["detail"]
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+
+
+def test_doh_resolve_via_mock_transport():
+    def handler(request):
+        assert request.url.host == "1.1.1.1"
+        assert request.url.path == "/dns-query"
+        assert request.url.params["name"] == "cdn.example.com"
+        assert request.url.params["type"] == "A"
+        assert request.headers["accept"] == "application/dns-json"
+        return httpx.Response(200, json={
+            "Status": 0,
+            "Answer": [
+                {"name": "cdn.example.com", "type": 5, "data": "alias.example.com"},
+                {"name": "cdn.example.com", "type": 1, "data": "93.184.216.34"},
+            ],
+        })
+
+    addresses = downloader._doh_resolve(
+        "cdn.example.com", proxy="http://127.0.0.1:7897", timeout=5,
+        transport=httpx.MockTransport(handler),
+    )
+    assert addresses == ["93.184.216.34"]
+
+    def no_answer(request):
+        return httpx.Response(200, json={"Status": 0})
+
+    with pytest.raises(downloader.DownloadError):
+        downloader._doh_resolve(
+            "cdn.example.com", proxy="http://127.0.0.1:7897", timeout=5,
+            transport=httpx.MockTransport(no_answer),
+        )
+
+
+def test_proxy_download_uses_doh_not_local_dns(tmp_path, monkeypatch):
+    """代理路径全程不碰本机 DNS：_local_resolve 被碰即炸，DoH 供 IP，假响应落盘。"""
+
+    def no_local(host):
+        raise AssertionError("local DNS must not be used when proxy is set")
+
+    monkeypatch.setattr("app.downloader._local_resolve", no_local)
+    monkeypatch.setattr("app.downloader._doh_resolve", lambda host, **kw: ["93.184.216.34"])
+    resp = _FakeResponse(200, {"content-length": "4"}, b"data")
+    monkeypatch.setattr("app.downloader._open_pinned", lambda *a, **kw: (_FakeConn(), resp))
+    dest = tmp_path / "v.mp4"
+    downloader.download_public_video(
+        "http://cdn.example.com/v.mp4", dest,
+        proxy="http://127.0.0.1:7897", max_bytes=1024, timeout=5,
+    )
+    assert dest.read_bytes() == b"data"
 
 
 def test_tiktok_video_facts_via_mock_transport():
