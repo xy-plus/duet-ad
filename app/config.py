@@ -12,6 +12,9 @@ class Settings:
     data_dir: Path = Path("data")
     codex_timeout_s: int = 600
     codex_concurrency: int = 1
+    # TikTok 解析/下载走的 HTTP 代理（空 = 直连）；URL 下载大小上限复用 max_upload_mb
+    tiktok_proxy: str = ""
+    download_timeout_s: int = 120
     # 直建 Settings（测试）默认不跑流水线；get_settings（生产）默认开
     enable_pipeline: bool = False
 
@@ -28,5 +31,7 @@ def get_settings() -> Settings:
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "600")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "1")),
+        tiktok_proxy=os.environ.get("TIKTOK_PROXY", ""),
+        download_timeout_s=int(os.environ.get("DOWNLOAD_TIMEOUT_S", "120")),
         enable_pipeline=os.environ.get("ENABLE_PIPELINE", "1").lower() in ("1", "true", "yes"),
     )

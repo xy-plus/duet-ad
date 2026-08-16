@@ -584,7 +584,7 @@ function setComposerError(msg) {
 }
 
 function updateSendBtn() {
-  $("send-btn").disabled = state.uploading || !state.file;
+  $("send-btn").disabled = state.uploading || (!state.file && !$("url-input").value.trim());
 }
 
 function isVideoFile(file) {
@@ -601,6 +601,8 @@ function pickFile(file) {
     return;
   }
   state.file = file;
+  $("url-input").value = ""; // 与链接输入互斥：选了文件就清掉链接
+  $("attach-btn").disabled = false;
   $("file-chip-name").textContent = file.name;
   $("file-chip-size").textContent = fmtBytes(file.size);
   $("file-chip").hidden = false;
@@ -616,14 +618,15 @@ function clearFile() {
 
 function setUploading(on) {
   state.uploading = on;
-  $("attach-btn").disabled = on;
+  $("attach-btn").disabled = on || !!$("url-input").value.trim();
   $("note-input").disabled = on;
+  $("url-input").disabled = on;
   $("file-remove").disabled = on;
-  $("send-btn").disabled = on || !state.file;
+  updateSendBtn();
   if (!on) $("upload-progress").hidden = true;
 }
 
-function uploadConversation(file, note, onProgress) {
+function uploadConversation({ file, url, note }, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/conversations");
@@ -648,7 +651,8 @@ function uploadConversation(file, note, onProgress) {
     xhr.addEventListener("error", () => reject(new Error("网络异常，上传未完成，请重试")));
     xhr.addEventListener("abort", () => reject(new Error("上传已中断，请重试")));
     const fd = new FormData();
-    fd.append("file", file, file.name);
+    if (file) fd.append("file", file, file.name);
+    else if (url) fd.append("reference_url", url);
     if (note) fd.append("note", note);
     xhr.send(fd);
   });
@@ -657,12 +661,13 @@ function uploadConversation(file, note, onProgress) {
 async function handleSend(event) {
   event.preventDefault();
   if (state.uploading) return;
-  if (!state.file) {
-    setComposerError("请先选择或拖入一段视频文件");
+  const file = state.file;
+  const url = $("url-input").value.trim();
+  const note = $("note-input").value.trim();
+  if (!file && !url) {
+    setComposerError("请先选择视频文件，或粘贴视频链接");
     return;
   }
-  const file = state.file;
-  const note = $("note-input").value.trim();
 
   setComposerError(null);
   setUploading(true);
@@ -671,10 +676,12 @@ async function handleSend(event) {
   const label = $("up-label");
   progress.hidden = false;
   fill.style.width = "0%";
-  label.textContent = "正在上传 0%";
+  // 链接分支没有本地上传进度：下载发生在服务端
+  label.textContent = url ? "服务器正在下载视频…" : "正在上传 0%";
 
   try {
-    const created = await uploadConversation(file, note, (ratio) => {
+    const created = await uploadConversation({ file, url, note }, (ratio) => {
+      if (url) return;
       const pct = Math.round(ratio * 100);
       fill.style.width = pct + "%";
       label.textContent = pct >= 100 ? "上传完成，等待处理…" : "正在上传 " + pct + "%";
@@ -682,6 +689,8 @@ async function handleSend(event) {
     // 成功：清空 composer，刷新列表并选中新会话
     clearFile();
     $("note-input").value = "";
+    $("url-input").value = "";
+    $("attach-btn").disabled = false;
     setUploading(false);
     await refreshList(false);
     if (created && created.id) {
@@ -731,6 +740,18 @@ function bindEvents() {
     pickFile(e.target.files && e.target.files[0]);
   });
   $("file-remove").addEventListener("click", clearFile);
+
+  // 与文件选择互斥：填了链接就清掉已选文件并禁用选择按钮
+  $("url-input").addEventListener("input", () => {
+    setComposerError(null);
+    if ($("url-input").value.trim()) {
+      if (state.file) clearFile();
+      $("attach-btn").disabled = true;
+    } else {
+      $("attach-btn").disabled = state.uploading;
+    }
+    updateSendBtn();
+  });
 
   const composer = $("composer");
   composer.addEventListener("submit", handleSend);

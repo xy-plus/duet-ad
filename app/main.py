@@ -7,8 +7,9 @@ from pathlib import Path
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
-from app import pipeline, seedance, storage
+from app import downloader, pipeline, seedance, storage
 from app.auth import require_auth
 from app.codex_runner import CodexRunner
 from app.config import Settings, get_settings
@@ -70,18 +71,26 @@ def create_app(settings: Settings) -> FastAPI:
     async def create_conversation(
         request: Request,
         background_tasks: BackgroundTasks,
-        file: UploadFile = File(...),
+        file: UploadFile | None = File(None),
+        reference_url: str = Form(""),
         note: str = Form(""),
     ):
         ip = request.client.host if request.client else "unknown"
         if not limiter.allow(ip):
             raise HTTPException(status_code=429, detail="too many uploads")
-        meta = storage.new_conversation(settings.data_dir, note, file.filename or "")
+        reference_url = reference_url.strip()
+        if (file is None) == (not reference_url):
+            raise HTTPException(status_code=400, detail="provide exactly one of file or reference_url")
+        meta = storage.new_conversation(settings.data_dir, note, (file.filename or "") if file else reference_url)
         cdir = settings.data_dir / meta["id"]
         try:
-            dest = await storage.save_upload(cdir, file, settings.max_upload_mb * 1024 * 1024)
+            if file is not None:
+                dest = await storage.save_upload(cdir, file, settings.max_upload_mb * 1024 * 1024)
+            else:
+                # 下载最长 download_timeout_s 秒，不能堵事件循环
+                dest = await run_in_threadpool(downloader.fetch_reference, reference_url, cdir, settings)
             storage.probe_video(dest, settings.max_duration_s)
-        except storage.UploadError as e:
+        except (storage.UploadError, downloader.DownloadError) as e:
             storage.remove_conversation(settings.data_dir, meta["id"])
             raise HTTPException(status_code=422, detail=str(e)) from e
         if settings.enable_pipeline:

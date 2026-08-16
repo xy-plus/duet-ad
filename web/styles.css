@@ -801,6 +801,10 @@ input { font-family: inherit; }
 .composer-input::placeholder { color: var(--text-2); }
 .composer-input:disabled { opacity: .5; }
 
+.url-row { border-top: 1px solid rgba(0, 0, 0, .06); }
+
+.url-row .composer-input { height: 38px; font-size: 14px; }
+
 .send-btn {
   width: 44px;
   height: 44px;

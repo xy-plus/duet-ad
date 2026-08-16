@@ -10,7 +10,7 @@
 
 <!-- 开工登记、集成即删；重开任务记重开链：继承未解 blockers 与已用轮次 -->
 
-（空）
+- URL/TikTok 上传：POST /api/conversations 增 reference_url（与 file 互斥），含 SSRF 防护；e2e 用 TrendScout 素材 90b6b60b / TikTok 9244a720。（→ 计划见会话 plans/tempest-shang-chi-aquaman.md）
 
 ## 📌 待办与限制
 

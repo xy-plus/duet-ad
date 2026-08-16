@@ -1,9 +1,12 @@
 import json
+import shutil
 import subprocess
 
+import httpx
 from conftest import AUTH, make_settings
 from fastapi.testclient import TestClient
 
+from app import downloader
 from app.main import create_app
 
 
@@ -73,9 +76,125 @@ def test_upload_requires_auth(client, video_1s):
     assert r.status_code == 401
 
 
-def test_upload_missing_file_422(client):
+def test_upload_neither_file_nor_url_400(client):
     r = client.post("/api/conversations", headers=AUTH, data={"note": "x"})
+    assert r.status_code == 400
+
+
+def test_upload_both_file_and_url_400(client, video_1s):
+    with open(video_1s, "rb") as f:
+        r = client.post("/api/conversations", headers=AUTH,
+                        files={"file": ("clip.mp4", f, "video/mp4")},
+                        data={"reference_url": "https://example.com/a.mp4"})
+    assert r.status_code == 400
+
+
+class _FakeConn:
+    def close(self):
+        pass
+
+
+class _FakeResponse:
+    """钉住 _open_pinned 用的假 HTTP 响应：status + headers + 一次性 body。"""
+
+    def __init__(self, status, headers=None, body=b""):
+        self.status = status
+        self._headers = headers or {}
+        self._body = body
+
+    def getheader(self, name):
+        return self._headers.get(name.lower())
+
+    def read(self, n=-1):
+        data, self._body = self._body, b""
+        return data
+
+
+def test_url_resolves_to_private_ip_422(client, monkeypatch, settings):
+    """注入假 resolver：域名解析到私网 IP，直接拒。"""
+    monkeypatch.setattr("app.downloader._local_resolve", lambda host: ["10.0.0.1"])
+    r = client.post("/api/conversations", headers=AUTH,
+                    data={"reference_url": "http://internal.example.com/a.mp4"})
     assert r.status_code == 422
+    assert "private" in r.json()["detail"]
+    assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+
+
+def test_url_redirect_to_private_ip_422(client, monkeypatch, settings):
+    """每次跳转独立重校验：跳到 link-local 地址必须拒。"""
+    monkeypatch.setattr("app.downloader._local_resolve", lambda host: ["93.184.216.34"])
+    resp = _FakeResponse(302, {"location": "http://169.254.169.254/latest/meta-data"})
+    monkeypatch.setattr("app.downloader._open_pinned", lambda *a, **kw: (_FakeConn(), resp))
+    r = client.post("/api/conversations", headers=AUTH,
+                    data={"reference_url": "http://cdn.example.com/a.mp4"})
+    assert r.status_code == 422
+    assert "private" in r.json()["detail"]
+    assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+
+
+def test_url_content_length_over_limit_422(client, monkeypatch, settings):
+    monkeypatch.setattr("app.downloader._local_resolve", lambda host: ["93.184.216.34"])
+    over = settings.max_upload_mb * 1024 * 1024 + 1
+    resp = _FakeResponse(200, {"content-length": str(over)})
+    monkeypatch.setattr("app.downloader._open_pinned", lambda *a, **kw: (_FakeConn(), resp))
+    r = client.post("/api/conversations", headers=AUTH,
+                    data={"reference_url": "http://cdn.example.com/big.mp4"})
+    assert r.status_code == 422
+    assert "exceeds" in r.json()["detail"]
+    assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+
+
+def test_url_connection_refused_422(client, monkeypatch, settings):
+    """连接被拒（OSError）归一为 DownloadError → 422，不残留会话目录。"""
+    monkeypatch.setattr("app.downloader._local_resolve", lambda host: ["93.184.216.34"])
+
+    def boom(*a, **kw):
+        raise ConnectionRefusedError("connection refused")
+
+    monkeypatch.setattr("app.downloader._pinned_socket", boom)
+    r = client.post("/api/conversations", headers=AUTH,
+                    data={"reference_url": "http://cdn.example.com/a.mp4"})
+    assert r.status_code == 422
+    assert "refused" in r.json()["detail"]
+    assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+
+
+def test_tiktok_video_facts_via_mock_transport():
+    def handler(request):
+        assert request.url.host == "www.tikwm.com"
+        return httpx.Response(200, json={
+            "code": 0,
+            "data": {"play": " https://cdn.example.com/v.mp4 ", "duration": 13},
+        })
+
+    facts = downloader.tiktok_video_facts(
+        "https://www.tiktok.com/@someone/video/7664758988675878151",
+        api_transport=httpx.MockTransport(handler),
+    )
+    assert facts == {"video_id": "7664758988675878151", "play": "https://cdn.example.com/v.mp4"}
+
+
+def test_create_with_reference_url_queued(client, monkeypatch, settings, video_1s):
+    seen = {}
+
+    def fake_fetch(url, cdir, s):
+        seen["url"] = url
+        dest = cdir / "source.mp4"
+        shutil.copyfile(video_1s, dest)
+        return dest
+
+    monkeypatch.setattr("app.downloader.fetch_reference", fake_fetch)
+    r = client.post("/api/conversations", headers=AUTH,
+                    data={"reference_url": "https://example.com/clip.mp4", "note": "链接"})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["status"] == "queued"
+    assert seen["url"] == "https://example.com/clip.mp4"
+    cdir = settings.data_dir / body["id"]
+    assert (cdir / "source.mp4").is_file()
+    meta = json.loads((cdir / "meta.json").read_text())
+    assert meta["note"] == "链接"
+    assert meta["status"] == "queued"
 
 
 def test_upload_rate_limit(client):
