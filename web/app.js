@@ -372,6 +372,30 @@ function renderFail(detail) {
 }
 
 /* 结果区（done） */
+/* 视频区块：原始 / 生成预览共用同一加载骨架，靠标题与副标题区分 */
+function videoSection(detail, file, title, sub) {
+  const sec = el("section", "res-section");
+  const h = el("h3", "res-h3", title);
+  if (sub) h.appendChild(el("span", "res-count", sub));
+  sec.appendChild(h);
+  const wrap = el("div", "video-wrap");
+  wrap.appendChild(el("div", "video-shimmer shimmer", "正在加载视频…"));
+  const video = el("video");
+  video.controls = true;
+  video.playsInline = true;
+  video.preload = "metadata";
+  wrap.appendChild(video);
+  sec.appendChild(wrap);
+  apiBlobURL("/api/conversations/" + detail.id + "/files/" + file)
+    .then((url) => {
+      video.src = url;
+      video.addEventListener("loadeddata", () => wrap.classList.add("is-ready"), { once: true });
+      video.addEventListener("error", () => wrap.classList.add("is-error"), { once: true });
+    })
+    .catch(() => wrap.classList.add("is-error"));
+  return sec;
+}
+
 function renderResults(detail) {
   const frag = document.createDocumentFragment();
 
@@ -382,6 +406,11 @@ function renderResults(detail) {
   doneCard.appendChild(el("p", "ac-sub", "关键帧、提示词与预览已生成，可直接复制使用"));
   headRow.appendChild(doneCard);
   frag.appendChild(headRow);
+
+  // 原始视频（上传即存在，与生成物明确分区）
+  if (detail.has_source) {
+    frag.appendChild(videoSection(detail, "source.mp4", "原始视频", "上传的源素材"));
+  }
 
   // 关键帧 Bento
   const names = Array.isArray(detail.keyframes) ? detail.keyframes : [];
@@ -404,6 +433,7 @@ function renderResults(detail) {
             fig.classList.remove("shimmer");
             fig.classList.add("is-loaded");
           }, { once: true });
+          img.addEventListener("click", () => openLightbox(img.src, img.alt));
         })
         .catch(() => {
           fig.classList.remove("shimmer");
@@ -442,26 +472,9 @@ function renderResults(detail) {
     frag.appendChild(sec);
   }
 
-  // 预览视频
+  // 生成预览（关键帧占位合成，非最终成片）
   if (detail.has_preview) {
-    const sec = el("section", "res-section");
-    sec.appendChild(el("h3", "res-h3", "15 秒预览"));
-    const wrap = el("div", "video-wrap");
-    wrap.appendChild(el("div", "video-shimmer shimmer", "正在加载预览…"));
-    const video = el("video");
-    video.controls = true;
-    video.playsInline = true;
-    video.preload = "metadata";
-    wrap.appendChild(video);
-    sec.appendChild(wrap);
-    frag.appendChild(sec);
-    apiBlobURL("/api/conversations/" + detail.id + "/files/preview.mp4")
-      .then((url) => {
-        video.src = url;
-        video.addEventListener("loadeddata", () => wrap.classList.add("is-ready"), { once: true });
-        video.addEventListener("error", () => wrap.classList.add("is-error"), { once: true });
-      })
-      .catch(() => wrap.classList.add("is-error"));
+    frag.appendChild(videoSection(detail, "preview.mp4", "生成预览", "关键帧占位合成 · 15 秒"));
   }
 
   // 生成最终视频（预留）
@@ -484,6 +497,35 @@ function renderResults(detail) {
   frag.appendChild(sec);
 
   return frag;
+}
+
+/* 关键帧放大查看：点击开、点任意处或 Esc 关 */
+let lightboxEl = null;
+
+function openLightbox(src, alt) {
+  if (!lightboxEl) {
+    lightboxEl = el("div", "lightbox");
+    lightboxEl.setAttribute("role", "dialog");
+    lightboxEl.setAttribute("aria-label", "查看大图");
+    lightboxEl.appendChild(el("img"));
+    lightboxEl.addEventListener("click", closeLightbox);
+    document.body.appendChild(lightboxEl);
+  }
+  const img = lightboxEl.querySelector("img");
+  img.src = src;
+  img.alt = alt || "";
+  lightboxEl.classList.add("is-open");
+  document.addEventListener("keydown", onLightboxKey);
+}
+
+function closeLightbox() {
+  if (!lightboxEl) return;
+  lightboxEl.classList.remove("is-open");
+  document.removeEventListener("keydown", onLightboxKey);
+}
+
+function onLightboxKey(e) {
+  if (e.key === "Escape") closeLightbox();
 }
 
 async function copyText(text) {

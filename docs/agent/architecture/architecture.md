@@ -40,7 +40,7 @@ flowchart LR
   PL -->|ffmpeg 合成| PV[preview.mp4]
   PL -->|status/keyframes/prompt| META[meta.json]
   U -->|2s 轮询 GET detail| API
-  API -->|13 字段| U
+  API -->|14 字段| U
   U -.->|submit 预留| SD[app/seedance.py<br/>三重门控+dry-run 复核]
   SD -.->|seedance_task.py --confirm-submit| ARK[Volcengine Ark]
 ```

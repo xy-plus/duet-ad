@@ -145,7 +145,10 @@ def resolve_file(data_dir: Path, cid: str, name: str) -> Path | None:
     if not _ID_RE.match(cid):
         return None
     cdir = (data_dir / cid).resolve()
-    if name == "preview.mp4":
+    if name == "source.mp4":
+        # 源视频扩展名不定（ALLOWED_EXT 内），取唯一 source.*；缺文件走下方 is_file 判空
+        cand = next(iter(sorted(cdir.glob("source.*"))), cdir / "source.mp4")
+    elif name == "preview.mp4":
         cand = cdir / "preview.mp4"
     elif name == "generated.mp4":
         cand = cdir / "generated.mp4"

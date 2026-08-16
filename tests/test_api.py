@@ -39,6 +39,7 @@ def test_detail_shape(client, video_1s):
         "updated_at": r.json()["updated_at"],
         "keyframes": [],
         "prompt": None,
+        "has_source": True,
         "has_contact_sheet": False,
         "has_preview": False,
         "has_video": False,
@@ -70,6 +71,8 @@ def test_files_endpoint(client, video_1s, settings):
 
     r = client.get(f"/api/conversations/{cid}/files/preview.mp4", headers=AUTH)
     assert r.status_code == 200 and r.content == b"fake-preview"
+    r = client.get(f"/api/conversations/{cid}/files/source.mp4", headers=AUTH)
+    assert r.status_code == 200  # 上传落盘的源视频（_make_conv 已产出 source.<ext>）
     r = client.get(f"/api/conversations/{cid}/files/contact_sheet.jpg", headers=AUTH)
     assert r.status_code == 200 and r.content == b"sheet"
     r = client.get(f"/api/conversations/{cid}/files/keyframes/k01.jpg", headers=AUTH)
@@ -77,6 +80,7 @@ def test_files_endpoint(client, video_1s, settings):
 
     # 生成物落盘后 has_* 翻真
     r = client.get(f"/api/conversations/{cid}", headers=AUTH)
+    assert r.json()["has_source"] is True
     assert r.json()["has_preview"] is True
     assert r.json()["has_contact_sheet"] is True
 
@@ -93,7 +97,7 @@ def test_files_traversal_404(client, video_1s):
 
 def test_files_not_whitelisted_404(client, video_1s):
     cid = _make_conv(client, video_1s)
-    for name in ["meta.json", "source.mp4", "preview.exe", "work/meta.json", "keyframes/nope.jpg"]:
+    for name in ["meta.json", "preview.exe", "work/meta.json", "keyframes/nope.jpg"]:
         r = client.get(f"/api/conversations/{cid}/files/{name}", headers=AUTH)
         assert r.status_code == 404, name
 

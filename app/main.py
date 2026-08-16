@@ -103,7 +103,7 @@ def create_app(settings: Settings) -> FastAPI:
         if meta is None:
             raise HTTPException(status_code=404, detail="not found")
         cdir = settings.data_dir / cid
-        # 显式键：meta 落盘的提交标记（submitted_at/task_id 等）不外泄，冻结 13 字段契约
+        # 显式键：meta 落盘的提交标记（submitted_at/task_id 等）不外泄，冻结 14 字段契约
         return {
             "id": meta["id"],
             "title": meta["title"],
@@ -114,6 +114,7 @@ def create_app(settings: Settings) -> FastAPI:
             "updated_at": meta["updated_at"],
             "keyframes": meta.get("keyframes", []),
             "prompt": meta.get("prompt"),
+            "has_source": any(cdir.glob("source.*")),
             "has_contact_sheet": (cdir / "work" / "contact_sheet.jpg").is_file(),
             "has_preview": (cdir / "preview.mp4").is_file(),
             "has_video": (cdir / "generated.mp4").is_file(),

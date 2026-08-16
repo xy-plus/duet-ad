@@ -45,13 +45,14 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 
 ### `GET /api/conversations/{cid}`
 
-- 200 → **冻结的 13 字段契约**（显式键，meta 内部字段不外泄）：
+- 200 → **冻结的 14 字段契约**（显式键，meta 内部字段不外泄）：
 
 | 字段 | 来源 |
 | --- | --- |
 | `id, title, note, status, error, created_at, updated_at` | meta.json |
 | `keyframes` | meta.json（字符串数组，缺省 `[]`） |
 | `prompt` | meta.json（缺省 `null`） |
+| `has_source` | `source.*` 磁盘探测 |
 | `has_contact_sheet` | `work/contact_sheet.jpg` 磁盘探测 |
 | `has_preview` / `has_video` | `preview.mp4` / `generated.mp4` 磁盘探测 |
 | `submit_enabled` | `settings.enable_seedance_submit` |
@@ -61,7 +62,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 ### `GET /api/conversations/{cid}/files/{name:path}`
 
 - 200 → `FileResponse`
-- files 白名单（`storage.resolve_file`，此外一律 404）：`preview.mp4`、`generated.mp4`、`contact_sheet.jpg`（映射 `work/contact_sheet.jpg`）、`keyframes/<fn>`（映射 `work/keyframes/<fn>`，`<fn>` 必须是不含路径的纯文件名）
+- files 白名单（`storage.resolve_file`，此外一律 404）：`source.mp4`（映射唯一的 `source.*`，扩展名不定）、`preview.mp4`、`generated.mp4`、`contact_sheet.jpg`（映射 `work/contact_sheet.jpg`）、`keyframes/<fn>`（映射 `work/keyframes/<fn>`，`<fn>` 必须是不含路径的纯文件名）
 - 防御：cid 正则校验 + `resolve()` 后必须 `is_relative_to` 会话目录且是文件；symlink 越界/穿越一律 404
 
 ### `POST /api/conversations/{cid}/submit`（预留，默认 501）

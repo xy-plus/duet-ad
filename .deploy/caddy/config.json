@@ -1,0 +1,38 @@
+{
+  "admin": {"disabled": true},
+  "apps": {
+    "http": {
+      "servers": {
+        "srv3211": {
+          "listen": [":3211"],
+          "protocols": ["h1", "h2"],
+          "automatic_https": {"disable_redirects": true},
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [{"dial": "127.0.0.1:3212"}]
+                }
+              ]
+            }
+          ],
+          "tls_connection_policies": [
+            {"certificate_selection": {"any_tag": ["duet-ad1-cert"]}}
+          ]
+        }
+      }
+    },
+    "tls": {
+      "certificates": {
+        "load_files": [
+          {
+            "certificate": "/home/xy/duet-video-v2/live/caddy/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/8.166.140.227/8.166.140.227.crt",
+            "key": "/home/xy/duet-video-v2/live/caddy/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/8.166.140.227/8.166.140.227.key",
+            "tags": ["duet-ad1-cert"]
+          }
+        ]
+      }
+    }
+  }
+}

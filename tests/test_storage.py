@@ -44,6 +44,7 @@ def test_list_conversations(tmp_path):
 def test_resolve_file_whitelist(tmp_path):
     meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
     cdir = tmp_path / meta["id"]
+    (cdir / "source.mov").write_bytes(b"s")
     (cdir / "preview.mp4").write_bytes(b"p")
     (cdir / "generated.mp4").write_bytes(b"g")
     (cdir / "work" / "contact_sheet.jpg").write_bytes(b"c")
@@ -51,6 +52,7 @@ def test_resolve_file_whitelist(tmp_path):
     (cdir / "work" / "keyframes" / "k01.jpg").write_bytes(b"k")
 
     cid = meta["id"]
+    assert storage.resolve_file(tmp_path, cid, "source.mp4") == (cdir / "source.mov").resolve()
     assert storage.resolve_file(tmp_path, cid, "preview.mp4") == (cdir / "preview.mp4").resolve()
     assert storage.resolve_file(tmp_path, cid, "generated.mp4") == (cdir / "generated.mp4").resolve()
     assert storage.resolve_file(tmp_path, cid, "contact_sheet.jpg") == (cdir / "work" / "contact_sheet.jpg").resolve()
@@ -65,7 +67,6 @@ def test_resolve_file_rejects_traversal_and_unknown(tmp_path):
     assert storage.resolve_file(tmp_path, cid, "keyframes/sub/dir.jpg") is None
     assert storage.resolve_file(tmp_path, cid, "keyframes/") is None
     assert storage.resolve_file(tmp_path, cid, "meta.json") is None
-    assert storage.resolve_file(tmp_path, cid, "source.mp4") is None
     assert storage.resolve_file(tmp_path, cid, "preview.exe") is None
     assert storage.resolve_file(tmp_path, "..", "preview.mp4") is None
 
@@ -73,4 +74,5 @@ def test_resolve_file_rejects_traversal_and_unknown(tmp_path):
 def test_resolve_file_missing_on_disk(tmp_path):
     meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
     assert storage.resolve_file(tmp_path, meta["id"], "preview.mp4") is None
+    assert storage.resolve_file(tmp_path, meta["id"], "source.mp4") is None
     assert storage.resolve_file(tmp_path, meta["id"], "keyframes/nope.jpg") is None
