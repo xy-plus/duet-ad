@@ -1,5 +1,4 @@
-"""任务 B：处理流水线（extract → codex 沙箱 → 白名单校验 → ffmpeg 占位预览）。"""
-import json
+"""任务 B：处理流水线（extract --fps 4 → codex 沙箱 → 白名单校验 → meta 落盘）。"""
 import os
 import re
 import shutil
@@ -20,8 +19,8 @@ from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
 ROOT = Path(pipeline.__file__).resolve().parent.parent
-EXTRACT_SCRIPT = ROOT / "skills" / "seedance-cleaning-video-maker" / "scripts" / "extract_keyframes.py"
-SEEDANCE_SCRIPT = ROOT / "skills" / "seedance-cleaning-video-maker" / "scripts" / "seedance_task.py"
+EXTRACT_SCRIPT = ROOT / "skills" / "video-maker" / "scripts" / "extract_keyframes.py"
+CROP_SCRIPT = ROOT / "skills" / "video-maker" / "scripts" / "crop_image.py"
 
 PROMPT_TEXT = "生成一支 15 秒、9:16 竖屏、720p、写实手机实拍风格的清洁短视频。"
 
@@ -32,28 +31,10 @@ def _write_valid_package(work: Path, frames: int = 3, prompt: str = PROMPT_TEXT)
     kdir.mkdir(parents=True, exist_ok=True)
     names = []
     for i in range(1, frames + 1):
-        name = f"{i:02d}_keyframe_{i / 10:.3f}s.png"
+        name = f"{i:02d}.png"
         (kdir / name).write_bytes(b"\x89PNG")
         names.append(name)
-    (work / "seedance_prompt.txt").write_text(prompt, encoding="utf-8")
-    (work / "shot_timeline.md").write_text("# 分镜时间线\n", encoding="utf-8")
-    req = {
-        "model": "doubao-seedance-2-0-260128",
-        "content": [{"type": "text", "text": prompt}] + [
-            {
-                "type": "image_url",
-                "image_url": {"url": "data:image/png;base64,AA=="},
-                "role": "reference_image",
-            }
-            for _ in names
-        ],
-        "ratio": "9:16",
-        "duration": 15,
-        "resolution": "720p",
-        "generate_audio": True,
-        "watermark": False,
-    }
-    (work / "api_request.json").write_text(json.dumps(req, ensure_ascii=False), encoding="utf-8")
+    (work / "prompt.txt").write_text(prompt, encoding="utf-8")
     return names
 
 
@@ -65,7 +46,7 @@ def _make_conversation(settings, video_1s):
 
 @pytest.fixture
 def fake_steps(monkeypatch):
-    """mock 掉 extract/ffmpeg 子进程与 codex；返回调用记录。"""
+    """mock 掉 extract 子进程与 codex；返回调用记录。"""
     calls = {"cmd": [], "codex": []}
 
     def fake_cmd(argv, *, timeout, step, cwd=None):
@@ -74,8 +55,6 @@ def fake_steps(monkeypatch):
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
             (work / "manifest.json").write_text("{}")
-        elif step == "preview":
-            Path(argv[-1]).write_bytes(b"mp4")
 
     def fake_codex(self, workdir, prompt):
         calls["codex"].append({"workdir": Path(workdir), "prompt": prompt})
@@ -116,7 +95,7 @@ class TestValidateWorkDir:
         work = tmp_path / "work"
         work.mkdir()
         _write_valid_package(work)
-        (work / "seedance_prompt.txt").unlink()
+        (work / "prompt.txt").unlink()
         with pytest.raises(pipeline.PipelineError, match="prompt"):
             pipeline.validate_work_dir(work)
 
@@ -131,98 +110,18 @@ class TestValidateWorkDir:
         work = tmp_path / "work"
         work.mkdir()
         _write_valid_package(work)
-        (work / "seedance_prompt.txt").write_bytes(b"x" * (32 * 1024 + 1))
+        (work / "prompt.txt").write_bytes(b"x" * (32 * 1024 + 1))
         with pytest.raises(pipeline.PipelineError, match="prompt"):
             pipeline.validate_work_dir(work)
 
-    def test_timeline_missing(self, tmp_path):
+    def test_non_png_not_counted(self, tmp_path):
+        """keyframes/ 里的非 PNG 文件不计入帧数。"""
         work = tmp_path / "work"
         work.mkdir()
-        _write_valid_package(work)
-        (work / "shot_timeline.md").unlink()
-        with pytest.raises(pipeline.PipelineError, match="shot_timeline"):
-            pipeline.validate_work_dir(work)
-
-    def test_api_request_invalid_json(self, tmp_path):
-        work = tmp_path / "work"
-        work.mkdir()
-        _write_valid_package(work)
-        (work / "api_request.json").write_text("{not json", encoding="utf-8")
-        with pytest.raises(pipeline.PipelineError, match="api_request"):
-            pipeline.validate_work_dir(work)
-
-    def test_api_request_two_texts(self, tmp_path):
-        work = tmp_path / "work"
-        work.mkdir()
-        _write_valid_package(work)
-        req = json.loads((work / "api_request.json").read_text())
-        req["content"].insert(1, {"type": "text", "text": "extra"})
-        (work / "api_request.json").write_text(json.dumps(req), encoding="utf-8")
-        with pytest.raises(pipeline.PipelineError, match="text"):
-            pipeline.validate_work_dir(work)
-
-    def test_api_request_no_text(self, tmp_path):
-        work = tmp_path / "work"
-        work.mkdir()
-        _write_valid_package(work)
-        req = json.loads((work / "api_request.json").read_text())
-        req["content"] = [i for i in req["content"] if i["type"] != "text"]
-        (work / "api_request.json").write_text(json.dumps(req), encoding="utf-8")
-        with pytest.raises(pipeline.PipelineError, match="text"):
-            pipeline.validate_work_dir(work)
-
-    def test_api_request_ten_images(self, tmp_path):
-        work = tmp_path / "work"
-        work.mkdir()
-        _write_valid_package(work)
-        req = json.loads((work / "api_request.json").read_text())
-        img = req["content"][1]
-        req["content"] = req["content"][:1] + [img] * 10
-        (work / "api_request.json").write_text(json.dumps(req), encoding="utf-8")
-        with pytest.raises(pipeline.PipelineError, match="image"):
-            pipeline.validate_work_dir(work)
-
-    def test_api_request_unknown_item_type(self, tmp_path):
-        work = tmp_path / "work"
-        work.mkdir()
-        _write_valid_package(work)
-        req = json.loads((work / "api_request.json").read_text())
-        req["content"].append({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA=="}})
-        (work / "api_request.json").write_text(json.dumps(req), encoding="utf-8")
-        with pytest.raises(pipeline.PipelineError, match="content"):
-            pipeline.validate_work_dir(work)
-
-    @pytest.mark.parametrize("bad_key", ["authorization", "Token", "API_KEY", "secret"])
-    @pytest.mark.parametrize(
-        "where",
-        ["top", "nested_dict", "nested_list", "inside_content"],
-    )
-    def test_api_request_secret_keys_rejected(self, tmp_path, bad_key, where):
-        work = tmp_path / "work"
-        work.mkdir()
-        _write_valid_package(work)
-        req = json.loads((work / "api_request.json").read_text())
-        if where == "top":
-            req[bad_key] = "x"
-        elif where == "nested_dict":
-            req["extra"] = {"deep": {bad_key: "x"}}
-        elif where == "nested_list":
-            req["extra"] = [[{bad_key: "x"}]]
-        else:
-            req["content"][0][bad_key] = "x"
-        (work / "api_request.json").write_text(json.dumps(req), encoding="utf-8")
-        with pytest.raises(pipeline.PipelineError, match="api_request"):
-            pipeline.validate_work_dir(work)
-
-    def test_secret_words_in_values_are_ok(self, tmp_path):
-        """只扫字段名，不扫值：URL/文本里出现 token 字样不误伤。"""
-        work = tmp_path / "work"
-        work.mkdir()
-        _write_valid_package(work)
-        req = json.loads((work / "api_request.json").read_text())
-        req["content"][1]["image_url"]["url"] = "data:image/png;base64,tokenlikevalue"
-        (work / "api_request.json").write_text(json.dumps(req), encoding="utf-8")
-        pipeline.validate_work_dir(work)
+        names = _write_valid_package(work, frames=2)
+        (work / "keyframes" / "notes.txt").write_text("x", encoding="utf-8")
+        got_names, _ = pipeline.validate_work_dir(work)
+        assert got_names == names
 
 
 # ---------- _run_cmd：子进程包装 ----------
@@ -390,44 +289,35 @@ def test_run_done(tmp_path, video_1s, fake_steps):
 
     done = storage.load_meta(settings.data_dir, cid)
     assert done["status"] == "done" and done["error"] is None
-    assert done["keyframes"] == [
-        "01_keyframe_0.100s.png",
-        "02_keyframe_0.200s.png",
-        "03_keyframe_0.300s.png",
-    ]
+    assert done["keyframes"] == ["01.png", "02.png", "03.png"]
     assert done["prompt"] == PROMPT_TEXT
-    assert (cdir / "preview.mp4").read_bytes() == b"mp4"
+    assert not (cdir / "preview.mp4").exists()  # 新契约不再生成占位预览
 
-    # extract 调用契约：venv python 绝对路径、argv 列表、40 帧、inspect 前缀、120s 超时
+    # extract 调用契约：venv python 绝对路径、argv 列表、--fps 4、120s 超时
     extract = fake_steps["cmd"][0]
     assert extract["step"] == "extract"
     assert extract["argv"][0] == sys.executable
     assert str(EXTRACT_SCRIPT) in extract["argv"]
-    assert "40" in extract["argv"] and "inspect" in extract["argv"]
+    assert "--fps" in extract["argv"] and "4" in extract["argv"]
     assert extract["timeout"] == 120
 
-    # codex：工作目录=会话目录；prompt 含产物约定与禁令
+    # codex 运行前 skill 的 scripts/ 拷进会话目录（crop_image.py 相对引用）
+    assert (cdir / "scripts" / "crop_image.py").read_bytes() == CROP_SCRIPT.read_bytes()
+    assert (cdir / "scripts" / "extract_keyframes.py").is_file()
+
+    # codex：工作目录=会话目录；prompt 指向 SKILL.md 且含硬性禁令
     (codex_call,) = fake_steps["codex"]
     assert codex_call["workdir"] == cdir
     prompt = codex_call["prompt"]
     for needle in (
-        "seedance_prompt.txt",
-        "shot_timeline.md",
-        "api_request.json",
-        "keyframes",
-        "--dry-run",
+        str(pipeline.SKILL_MD),
+        "work/",
+        sys.executable,
+        str(cdir),
         "禁止联网",
         "环境变量",
     ):
         assert needle in prompt, needle
-
-    # ffmpeg 预览契约：720x1280、25fps、120s 超时、argv 列表
-    preview = fake_steps["cmd"][1]
-    assert preview["step"] == "preview"
-    assert preview["argv"][0] == "ffmpeg"
-    joined = " ".join(preview["argv"])
-    assert "720:1280" in joined and "fps=25" in joined
-    assert preview["timeout"] == 120
 
 
 def test_run_status_sequence_processing_then_done(tmp_path, video_1s, fake_steps, monkeypatch):
@@ -458,7 +348,6 @@ def test_run_extract_failure(tmp_path, video_1s, monkeypatch):
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
     assert "extract" in m["error"]
-    assert not (settings.data_dir / meta["id"] / "preview.mp4").exists()
 
 
 def test_run_codex_failure(tmp_path, video_1s, monkeypatch):
@@ -524,29 +413,6 @@ def test_run_validation_failure(tmp_path, video_1s, monkeypatch):
     assert "keyframe" in m["error"]
 
 
-def test_run_preview_failure(tmp_path, video_1s, monkeypatch):
-    settings = make_settings(tmp_path)
-    meta = _make_conversation(settings, video_1s)
-
-    def fake_cmd(argv, *, timeout, step, cwd=None):
-        if step == "extract":
-            work = Path(argv[argv.index("--out-dir") + 1])
-            (work / "contact_sheet.jpg").write_bytes(b"sheet")
-            (work / "manifest.json").write_text("{}")
-        elif step == "preview":
-            raise pipeline.PipelineError("preview exit 1: encoder missing")
-
-    def fake_codex(self, workdir, prompt):
-        _write_valid_package(Path(workdir) / "work")
-
-    monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
-    monkeypatch.setattr(CodexRunner, "run", fake_codex)
-    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
-    m = storage.load_meta(settings.data_dir, meta["id"])
-    assert m["status"] == "failed"
-    assert "preview" in m["error"]
-
-
 # ---------- HTTP 接线 ----------
 
 
@@ -564,14 +430,10 @@ def test_post_triggers_pipeline_and_detail_filled(tmp_path, video_1s, fake_steps
         r = c.get(f"/api/conversations/{cid}", headers=AUTH)
     body = r.json()
     assert body["status"] == "done"
-    assert body["keyframes"] == [
-        "01_keyframe_0.100s.png",
-        "02_keyframe_0.200s.png",
-        "03_keyframe_0.300s.png",
-    ]
+    assert body["keyframes"] == ["01.png", "02.png", "03.png"]
     assert body["prompt"] == PROMPT_TEXT
     assert body["has_contact_sheet"] is True
-    assert body["has_preview"] is True
+    assert "has_preview" not in body
     assert body["error"] is None
 
 
@@ -633,37 +495,27 @@ def test_update_meta(tmp_path):
 # ---------- 假 codex 桩：全编排真实子进程 e2e（无 mock） ----------
 
 
-def _write_stub_codex(bin_dir: Path, times: str) -> Path:
-    """生成一个按约定文件名直产合法产物的假 codex 可执行文件。"""
+def _write_stub_codex(bin_dir: Path, frames: int) -> Path:
+    """生成一个按新契约直产合法产物的假 codex：从 work/ 抽好的帧里挑 frames 张复制进 keyframes/。"""
     stub = bin_dir / "codex"
     stub.write_text(
         f"#!{sys.executable}\n"
         + textwrap.dedent(
             f"""\
-            import subprocess, sys
+            import shutil, sys
             from pathlib import Path
 
             argv = sys.argv[1:]
             workdir = Path(argv[argv.index("-C") + 1])
             out = Path(argv[argv.index("-o") + 1])
             work = workdir / "work"
-            source = next(workdir.glob("source.*"))
-            subprocess.run([{sys.executable!r}, {str(EXTRACT_SCRIPT)!r}, str(source),
-                            "--out-dir", str(work / "keyframes"), "--times", {times!r},
-                            "--prefix", "keyframe", "--columns", "3"], check=True)
-            frames = sorted((work / "keyframes").glob("*.png"))
-            assert 1 <= len(frames) <= 9
-            (work / "shot_timeline.md").write_text(
-                "# 分镜时间线\\n\\n0.0-15.0 秒：单场景清洁演示。\\n", encoding="utf-8")
-            (work / "seedance_prompt.txt").write_text(
-                {PROMPT_TEXT!r} + "（桩产物）", encoding="utf-8")
-            subprocess.run([{sys.executable!r}, {str(SEEDANCE_SCRIPT)!r}, "create", "--dry-run",
-                            "--prompt-file", str(work / "seedance_prompt.txt"),
-                            "--ref-images", *[str(p) for p in frames],
-                            "--model", "doubao-seedance-2-0-260128", "--ratio", "9:16",
-                            "--duration", "15", "--resolution", "720p",
-                            "--generate-audio", "--no-watermark",
-                            "--payload-out", str(work / "api_request.json")], check=True)
+            kdir = work / "keyframes"
+            kdir.mkdir(exist_ok=True)
+            frames = sorted(work.glob("*_frame_*.png"))[:{frames}]
+            assert frames, "no extracted frames in work/"
+            for i, src in enumerate(frames, start=1):
+                shutil.copy(src, kdir / f"{{i:02d}}.png")
+            (work / "prompt.txt").write_text({PROMPT_TEXT!r} + "（桩产物）", encoding="utf-8")
             out.write_text("stub done", encoding="utf-8")
             """
         ),
@@ -674,10 +526,10 @@ def _write_stub_codex(bin_dir: Path, times: str) -> Path:
 
 
 def test_full_pipeline_with_stub_codex(tmp_path, video_1s, monkeypatch):
-    """真 subprocess 全链路：extract → 桩 codex → 校验 → ffmpeg → done。"""
+    """真 subprocess 全链路：extract --fps 4 → 桩 codex → 校验 → done（不再生成 preview）。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _write_stub_codex(bin_dir, "0.05,0.15,0.25,0.35,0.45,0.55,0.65,0.75,0.85")
+    _write_stub_codex(bin_dir, 3)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 
     settings = make_settings(tmp_path)
@@ -689,42 +541,23 @@ def test_full_pipeline_with_stub_codex(tmp_path, video_1s, monkeypatch):
 
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "done", m["error"]
-    assert len(m["keyframes"]) == 9
-    assert all(re.match(r"^\d{2}_keyframe_.*\.png$", n) for n in m["keyframes"])
+    assert m["keyframes"] == ["01.png", "02.png", "03.png"]
     assert "15 秒" in m["prompt"]
     assert (cdir / "codex_last_message.txt").is_file()
-    assert (cdir / "work" / "contact_sheet.jpg").is_file()
+    assert (cdir / "work" / "contact_sheet.jpg").is_file()  # 1s×4fps=5 帧，单页联系表
     assert (cdir / "work" / "manifest.json").is_file()
-    assert (cdir / "work" / "shot_timeline.md").is_file()
-
-    req = json.loads((cdir / "work" / "api_request.json").read_text())
-    types = [i["type"] for i in req["content"]]
-    assert types.count("text") == 1 and types.count("image_url") == 9
-
-    info = json.loads(
-        subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "stream=width,height,avg_frame_rate:format=duration",
-                "-of", "json", str(cdir / "preview.mp4"),
-            ],
-            capture_output=True, text=True, check=True,
-        ).stdout
-    )
-    stream = info["streams"][0]
-    assert (stream["width"], stream["height"]) == (720, 1280)
-    assert stream["avg_frame_rate"] == "25/1"
-    assert abs(float(info["format"]["duration"]) - 15.0) < 0.2
+    assert (cdir / "scripts" / "crop_image.py").is_file()  # skill 脚本已拷进会话目录
+    assert not (cdir / "preview.mp4").exists()
 
 
 def test_full_pipeline_relative_data_dir(tmp_path, video_1s, monkeypatch):
     """回归：DATA_DIR 为相对路径（生产默认 "data"）时流水线也必须成功。
 
-    _render_preview 以 keyframes/ 为 cwd 跑 ffmpeg，相对 dest 会解析到错误位置。
+    子进程带 cwd 时相对 data_dir 会错位，run() 入口须先把会话目录解析为绝对路径。
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _write_stub_codex(bin_dir, "0.05,0.15,0.25,0.35,0.45,0.55,0.65,0.75,0.85")
+    _write_stub_codex(bin_dir, 3)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.chdir(tmp_path)
 
@@ -736,4 +569,5 @@ def test_full_pipeline_relative_data_dir(tmp_path, video_1s, monkeypatch):
 
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "done", m["error"]
-    assert (tmp_path / "data" / cid / "preview.mp4").is_file()
+    assert m["keyframes"] == ["01.png", "02.png", "03.png"]
+    assert (tmp_path / "data" / cid / "work" / "prompt.txt").is_file()

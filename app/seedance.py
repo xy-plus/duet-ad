@@ -18,15 +18,13 @@ from app.config import Settings
 
 log = logging.getLogger(__name__)
 
-_SCRIPT = (
-    Path(__file__).resolve().parent.parent
-    / "skills" / "seedance-cleaning-video-maker" / "scripts" / "seedance_task.py"
-)
+_SCRIPT = Path(__file__).resolve().parent / "seedance_task.py"
 _SUBMIT_TIMEOUT_S = 1800
 _DRYRUN_TIMEOUT_S = 120
 _DETAIL_LIMIT = 300
 _LEAK_RE = re.compile(r"key|authorization", re.IGNORECASE)
-_COMPARE_FIELDS = ("model", "ratio", "duration", "resolution", "generate_audio", "watermark")
+# 建模特固定（新契约无评审 payload，提交时由 work/prompt.txt + work/keyframes/*.png 现构建请求）
+_MODEL = "doubao-seedance-2-0-260128"
 
 
 class SubmitError(Exception):
@@ -59,92 +57,74 @@ async def submit(
         if meta is None or meta.get("has_video"):
             raise SubmitError(409, "already submitted")
         cdir = settings.data_dir / cid
-        reviewed = _load_reviewed(cdir)
+        _check_prompt(cdir)
         keyframes = _keyframes(cdir)
-        await asyncio.to_thread(_recheck_payload, cdir, reviewed, keyframes)
+        await asyncio.to_thread(_dryrun_check, cdir, keyframes)
         if not os.environ.get("ARK_API_KEY", "").strip():
             raise SubmitError(503, "ARK_API_KEY not configured")
-        await asyncio.to_thread(_run_submit, cdir, reviewed, keyframes)
+        await asyncio.to_thread(_run_submit, cdir, keyframes)
         storage.mark_submitted(settings.data_dir, cid, _read_task_id(cdir))
         return {"status": "succeeded", "video": "generated.mp4"}
 
 
-def _load_reviewed(cdir: Path) -> dict:
-    """评审时落盘的 work/api_request.json；缺失/损坏/缺字段等同 payload 已变。"""
+def _check_prompt(cdir: Path) -> None:
+    """work/prompt.txt 是评审确认的提示词；缺失/为空等同产物已变。"""
     try:
-        data = json.loads((cdir / "work" / "api_request.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
+        prompt = (cdir / "work" / "prompt.txt").read_text(encoding="utf-8")
+    except OSError as e:
         raise SubmitError(409, "payload changed since review") from e
-    if not isinstance(data, dict) or any(
-        data.get(k) is None for k in ("model", "ratio", "duration", "resolution")
-    ):
+    if not prompt.strip():
         raise SubmitError(409, "payload changed since review")
-    return data
 
 
 def _keyframes(cdir: Path) -> list[Path]:
-    # 与 pipeline 的产物布局对齐：目录里还有 contact_sheet.jpg/manifest.json，只取关键帧 PNG
+    """work/keyframes/*.png 即全部参考图（新契约该目录只有选定帧）；空则等同产物已变。"""
     kdir = cdir / "work" / "keyframes"
-    files = sorted(
-        p for p in kdir.iterdir()
-        if p.is_file() and p.suffix == ".png" and "keyframe" in p.name
-    ) if kdir.is_dir() else []
+    files = (
+        sorted(p for p in kdir.glob("*.png") if p.is_file()) if kdir.is_dir() else []
+    )
     if not files:
         raise SubmitError(409, "payload changed since review")
     return files
 
 
-def _create_argv(reviewed: dict, keyframes: list[Path]) -> list[str]:
-    """以评审 payload 的标量 + 当前 prompt/keyframes 重建 create argv（相对 cwd 路径）。"""
+def _create_argv(keyframes: list[Path]) -> list[str]:
+    """提交时现构建 create argv（相对 cwd 路径 + 固定建模特）。"""
     return [
         sys.executable, str(_SCRIPT), "create",
-        "--prompt-file", "work/seedance_prompt.txt",
+        "--prompt-file", "work/prompt.txt",
         "--ref-images", *[f"work/keyframes/{p.name}" for p in keyframes],
-        "--model", str(reviewed["model"]),
-        "--ratio", str(reviewed["ratio"]),
-        "--duration", str(reviewed["duration"]),
-        "--resolution", str(reviewed["resolution"]),
-        "--generate-audio" if reviewed.get("generate_audio") else "--no-generate-audio",
-        "--watermark" if reviewed.get("watermark") else "--no-watermark",
+        "--model", _MODEL,
+        "--ratio", "9:16",
+        "--duration", "15",
+        "--resolution", "720p",
+        "--generate-audio",
+        "--no-watermark",
     ]
 
 
-def _recheck_payload(cdir: Path, reviewed: dict, keyframes: list[Path]) -> None:
-    """重放 dry-run 重建 payload，与评审版本逐项比对；任何不一致即 409。"""
+def _dryrun_check(cdir: Path, keyframes: list[Path]) -> None:
+    """提交前 dry-run 重建 payload 预检（无网络、无费用）；构建失败等同产物已变。"""
     out = "work/recheck_payload.json"
-    argv = _create_argv(reviewed, keyframes) + ["--dry-run", "--payload-out", out]
+    argv = _create_argv(keyframes) + ["--dry-run", "--payload-out", out]
     try:
         r = subprocess.run(
             argv, cwd=cdir, capture_output=True, text=True, timeout=_DRYRUN_TIMEOUT_S
         )
-        rebuilt = (
-            json.loads((cdir / out).read_text(encoding="utf-8")) if r.returncode == 0 else None
-        )
-    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
-        log.info("seedance dry-run recheck failed for %s: %s", cdir.name, _sanitize(str(e)))
+        ok = r.returncode == 0 and (cdir / out).is_file()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.info("seedance dry-run precheck failed for %s: %s", cdir.name, _sanitize(str(e)))
         raise SubmitError(409, "payload changed since review") from e
     finally:
         (cdir / out).unlink(missing_ok=True)
-    if not isinstance(rebuilt, dict) or not _same_payload(reviewed, rebuilt):
-        log.info("seedance payload mismatch for %s", cdir.name)
+    if not ok:
+        log.info("seedance dry-run precheck failed for %s", cdir.name)
         raise SubmitError(409, "payload changed since review")
 
 
-def _same_payload(reviewed: dict, rebuilt: dict) -> bool:
-    if any(reviewed.get(k) != rebuilt.get(k) for k in _COMPARE_FIELDS):
-        return False
-    rc, bc = reviewed.get("content"), rebuilt.get("content")
-    if not isinstance(rc, list) or not isinstance(bc, list) or len(rc) != len(bc):
-        return False
-    for a, b in zip(rc, bc):
-        if not isinstance(a, dict) or not isinstance(b, dict) or a.get("text") != b.get("text"):
-            return False
-    return True
-
-
-def _run_submit(cdir: Path, reviewed: dict, keyframes: list[Path]) -> None:
+def _run_submit(cdir: Path, keyframes: list[Path]) -> None:
     """真实提交：argv 列表、无 shell、env 缺省继承服务进程、1800s 超时。"""
-    argv = _create_argv(reviewed, keyframes) + [
+    argv = _create_argv(keyframes) + [
         "--confirm-submit", "--wait",
         "--state-file", "work/task.json",
         "--download", "generated.mp4",

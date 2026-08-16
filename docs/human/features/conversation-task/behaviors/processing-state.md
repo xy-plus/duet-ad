@@ -3,7 +3,7 @@ name: processing-state
 type: behavior
 status: done
 owner: human
-updated: 2026-08-15
+updated: 2026-08-17
 links: []
 ---
 
@@ -15,8 +15,8 @@ links: []
 | --- | --- |
 | 会话刚创建 | 状态 `queued`，界面显示「排队中」 |
 | 后台任务开始处理 | 状态转 `processing`，界面显示「处理中」，每 2 秒轮询刷新 |
-| 抽帧 → codex 沙箱处理 → 产物校验 → 合成预览全部成功 | 状态转 `done`，停止轮询，展示结果 |
-| 任一步骤失败（含 codex 超时 600s、产物校验不过、ffmpeg 失败） | 状态转 `failed`，`error` 展示截断后的可读原因（≤500 字） |
+| 4fps 抽帧 → codex 沙箱处理 → 产物校验全部成功 | 状态转 `done`，停止轮询，展示结果 |
+| 任一步骤失败（含 codex 超时 600s、产物校验不过、抽帧失败） | 状态转 `failed`，`error` 展示截断后的可读原因（≤500 字） |
 | 状态到达 `done`/`failed` | 终态，不再自动刷新；`failed` 只展示错误，无重试按钮 |
 
 ## 边界

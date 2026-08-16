@@ -634,7 +634,7 @@ input { font-family: inherit; }
   overflow-y: auto;
 }
 
-/* preview video */
+/* result video */
 .video-wrap {
   position: relative;
   border-radius: 16px;

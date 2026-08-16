@@ -1,7 +1,0 @@
-interface:
-  display_name: "Seedance Cleaning Video Maker"
-  short_description: "Turn cleaning references into reviewed 15-second Seedance videos"
-  default_prompt: "Use $seedance-cleaning-video-maker to analyze this cleaning reference, select nine keyframes, and prepare a reviewed 15-second Seedance package."
-
-policy:
-  allow_implicit_invocation: false

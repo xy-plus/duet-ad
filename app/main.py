@@ -73,7 +73,6 @@ def create_app(settings: Settings) -> FastAPI:
                 "note": m["note"],
                 "status": m["status"],
                 "created_at": m["created_at"],
-                "has_preview": (settings.data_dir / m["id"] / "preview.mp4").is_file(),
                 "has_video": (settings.data_dir / m["id"] / "generated.mp4").is_file(),
             }
             for m in storage.list_conversations(settings.data_dir)
@@ -135,7 +134,7 @@ def create_app(settings: Settings) -> FastAPI:
         if meta is None:
             raise HTTPException(status_code=404, detail="not found")
         cdir = settings.data_dir / cid
-        # 显式键：meta 落盘的提交标记（submitted_at/task_id 等）不外泄，冻结 14 字段契约
+        # 显式键：meta 落盘的提交标记（submitted_at/task_id 等）不外泄，冻结 13 字段契约
         return {
             "id": meta["id"],
             "title": meta["title"],
@@ -148,7 +147,6 @@ def create_app(settings: Settings) -> FastAPI:
             "prompt": meta.get("prompt"),
             "has_source": any(cdir.glob("source.*")),
             "has_contact_sheet": (cdir / "work" / "contact_sheet.jpg").is_file(),
-            "has_preview": (cdir / "preview.mp4").is_file(),
             "has_video": (cdir / "generated.mp4").is_file(),
             "submit_enabled": settings.enable_seedance_submit,
         }

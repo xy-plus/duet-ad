@@ -1,4 +1,4 @@
-/* 清洁视频工作室 — ChatGPT 式单页前端
+/* 视频工作室 — ChatGPT 式单页前端
  * 同源 API：/api/*，共享口令 Bearer 鉴权；文件直链也需鉴权，故一律 fetch(blob) → ObjectURL。
  */
 "use strict";
@@ -265,15 +265,15 @@ function clearStream() {
 function renderEmptyHero() {
   stopPolling();
   clearStream();
-  $("main-title").textContent = "清洁视频工作室";
+  $("main-title").textContent = "视频工作室";
 
   const inner = el("div", "stream-inner");
   const hero = el("div", "empty-hero");
   const iconBox = el("div", "empty-icon");
   iconBox.appendChild(icon("i-film"));
   hero.appendChild(iconBox);
-  hero.appendChild(el("h2", null, "上传清洁视频，生成复刻配方"));
-  hero.appendChild(el("p", "empty-sub", "AI 会抽取关键帧、生成 Seedance 提示词，并给出 15 秒预览"));
+  hero.appendChild(el("h2", null, "上传参考视频，生成复刻配方"));
+  hero.appendChild(el("p", "empty-sub", "AI 会抽取关键帧并生成 Seedance 提示词"));
   const steps = el("ol", "empty-steps");
   const items = [
     "点击回形针或把视频拖进输入框",
@@ -348,8 +348,8 @@ function renderActivity(status) {
   const stages = el("ol", "stages");
   // [标签, 状态]：done=已完成, active=进行中, pending=未开始
   const defs = status === "queued"
-    ? [["上传完成", "done"], ["排队等待", "active"], ["抽取关键帧并生成提示词", "pending"], ["生成 15 秒预览", "pending"]]
-    : [["上传完成", "done"], ["排队等待", "done"], ["抽取关键帧并生成提示词", "active"], ["生成 15 秒预览", "pending"]];
+    ? [["上传完成", "done"], ["排队等待", "active"], ["抽取关键帧并生成提示词", "pending"]]
+    : [["上传完成", "done"], ["排队等待", "done"], ["抽取关键帧并生成提示词", "active"]];
   for (const [label, st] of defs) {
     const li = el("li", "stage " + st);
     const ic = el("span", "stage-icon");
@@ -379,7 +379,7 @@ function renderFail(detail) {
 }
 
 /* 结果区（done） */
-/* 视频区块：原始 / 生成预览共用同一加载骨架，靠标题与副标题区分 */
+/* 视频区块：原始 / 最终成片共用同一加载骨架，靠标题与副标题区分 */
 function videoSection(detail, file, title, sub) {
   const sec = el("section", "res-section");
   const h = el("h3", "res-h3", title);
@@ -410,7 +410,7 @@ function renderResults(detail) {
   headRow.appendChild(assistantHead(detail.updated_at));
   const doneCard = el("div", "activity-card");
   doneCard.appendChild(el("p", "ac-title", "处理完成"));
-  doneCard.appendChild(el("p", "ac-sub", "关键帧、提示词与预览已生成，可直接复制使用"));
+  doneCard.appendChild(el("p", "ac-sub", "关键帧与提示词已生成，可直接复制使用"));
   headRow.appendChild(doneCard);
   frag.appendChild(headRow);
 
@@ -479,29 +479,28 @@ function renderResults(detail) {
     frag.appendChild(sec);
   }
 
-  // 生成预览（关键帧占位合成，非最终成片）
-  if (detail.has_preview) {
-    frag.appendChild(videoSection(detail, "preview.mp4", "生成预览", "关键帧占位合成 · 15 秒"));
+  // 最终视频：已提交生成则播放成片，否则显示「待提交生成」（提交接口预留未开放）
+  if (detail.has_video) {
+    frag.appendChild(videoSection(detail, "generated.mp4", "最终视频", "Seedance 生成成片"));
+  } else {
+    const sec = el("section", "res-section");
+    const card = el("div", "final-card");
+    card.appendChild(el("h3", "res-h3", "最终视频"));
+    const row = el("div", "final-row");
+    const btnWrap = el("span", "submit-wrap");
+    const btn = el("button", "btn btn-primary", "生成最终视频");
+    btn.type = "button";
+    btn.disabled = true;
+    btn.setAttribute("aria-describedby", "final-caption");
+    btnWrap.appendChild(btn);
+    row.appendChild(btnWrap);
+    const cap = el("p", "final-caption", "待提交生成（接口预留，当前阶段未开放）");
+    cap.id = "final-caption";
+    row.appendChild(cap);
+    card.appendChild(row);
+    sec.appendChild(card);
+    frag.appendChild(sec);
   }
-
-  // 生成最终视频（预留）
-  const sec = el("section", "res-section");
-  const card = el("div", "final-card");
-  card.appendChild(el("h3", "res-h3", "最终视频"));
-  const row = el("div", "final-row");
-  const btnWrap = el("span", "submit-wrap");
-  const btn = el("button", "btn btn-primary", "生成最终视频");
-  btn.type = "button";
-  btn.disabled = true;
-  btn.setAttribute("aria-describedby", "final-caption");
-  btnWrap.appendChild(btn);
-  row.appendChild(btnWrap);
-  const cap = el("p", "final-caption", "预留接口，当前阶段未开放");
-  cap.id = "final-caption";
-  row.appendChild(cap);
-  card.appendChild(row);
-  sec.appendChild(card);
-  frag.appendChild(sec);
 
   return frag;
 }

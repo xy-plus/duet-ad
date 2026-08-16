@@ -3,8 +3,8 @@ name: backend-api
 type: reference
 status: done
 owner: agent
-updated: 2026-08-16
-links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/pipeline.py, app/codex_runner.py, app/seedance.py]
+updated: 2026-08-17
+links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/pipeline.py, app/codex_runner.py, app/seedance.py, app/seedance_task.py]
 ---
 
 # backend-api · 接口（How/Now）
@@ -24,8 +24,8 @@ links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/p
 
 ### `GET /api/conversations`
 
-- 200 → 数组，按 `created_at` 倒序，每项恰 7 字段：`id, title, note, status, created_at, has_preview, has_video`
-- `has_preview`/`has_video` 为磁盘实况探测（`preview.mp4`/`generated.mp4` 是否存在），不读 meta
+- 200 → 数组，按 `created_at` 倒序，每项恰 6 字段：`id, title, note, status, created_at, has_video`
+- `has_video` 为磁盘实况探测（`generated.mp4` 是否存在），不读 meta
 
 ### `POST /api/conversations`
 
@@ -48,7 +48,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 
 ### `GET /api/conversations/{cid}`
 
-- 200 → **冻结的 14 字段契约**（显式键，meta 内部字段不外泄）：
+- 200 → **冻结的 13 字段契约**（显式键，meta 内部字段不外泄）：
 
 | 字段 | 来源 |
 | --- | --- |
@@ -57,7 +57,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 | `prompt` | meta.json（缺省 `null`） |
 | `has_source` | `source.*` 磁盘探测 |
 | `has_contact_sheet` | `work/contact_sheet.jpg` 磁盘探测 |
-| `has_preview` / `has_video` | `preview.mp4` / `generated.mp4` 磁盘探测 |
+| `has_video` | `generated.mp4` 磁盘探测 |
 | `submit_enabled` | `settings.enable_seedance_submit` |
 
 - 404 `not found`：cid 非法（非 `^[0-9a-f]{32}$`）或目录/meta 不存在
@@ -70,7 +70,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 
 ### `POST /api/conversations/{cid}/submit`（预留，默认 501）
 
-- 请求：JSON，仅接受 `{"confirm": true}`；不接受任何 prompt/参数覆盖（提交用评审落盘的 payload 重建）
+- 请求：JSON，仅接受 `{"confirm": true}`；不接受任何 prompt/参数覆盖（提交时由 `work/prompt.txt` + 关键帧现构建请求）
 - 成功 200 → `{"status": "succeeded", "video": "generated.mp4"}`，并回写 meta：`has_video/submitted_at/task_id`（内部字段，不进响应）
 - 门控矩阵（`seedance.submit`，**固定顺序**）：
 
@@ -82,13 +82,13 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 | 4 | `status != "done"` | 409 `artifacts not ready` |
 | 5 | `has_video` 已真 | 409 `already submitted` |
 | 6 | 每会话锁内复查：meta 消失或 `has_video` 已真 | 409 `already submitted` |
-| 7 | `work/api_request.json` 缺失/损坏/缺标量字段（model/ratio/duration/resolution） | 409 `payload changed since review` |
-| 8 | `work/keyframes/` 下无 keyframe PNG | 409 `payload changed since review` |
-| 9 | dry-run 重放（120s 超时）重建 payload 与评审版逐项比对不一致（标量 6 字段 + content 逐条 text） | 409 `payload changed since review` |
+| 7 | `work/prompt.txt` 缺失或为空 | 409 `payload changed since review` |
+| 8 | `work/keyframes/` 下无 PNG | 409 `payload changed since review` |
+| 9 | dry-run 预检（120s 超时）构建 payload 失败或未落 payload-out | 409 `payload changed since review` |
 | 10 | 服务进程无 `ARK_API_KEY` | 503 `ARK_API_KEY not configured` |
 | 11 | 真实提交超时（1800s）/ 执行器不可用 / 非零退出 | 502 `seedance task timed out` / `seedance runner unavailable` / 脱敏后输出（≤300 字） |
 
-- 提交 argv：以评审 payload 的标量 + 当前 `work/seedance_prompt.txt`/`work/keyframes/` 重建 `seedance_task.py create --confirm-submit --wait --state-file work/task.json --download generated.mp4`；argv 列表、无 shell、env 缺省继承服务进程（`ARK_API_KEY` 由此进入脚本）
+- 提交 argv：提交时由当前 `work/prompt.txt` + `work/keyframes/*.png` 现构建 `app/seedance_task.py create --confirm-submit --wait --state-file work/task.json --download generated.mp4`，建模固定 `doubao-seedance-2-0-260128 / 9:16 / 15s / 720p / --generate-audio / --no-watermark`；argv 列表、无 shell、env 缺省继承服务进程（`ARK_API_KEY` 由此进入脚本）
 - 幂等：成功后 `has_video=true` 落盘，重复/并发提交一律 409；锁常驻内存，进程重启即失效
 
 ## 公开接口（Python 模块）
@@ -133,16 +133,12 @@ meta.json（`data/<cid>/meta.json`）：
 
 产物白名单校验（`pipeline.validate_work_dir`，任一不过即 PipelineError → `failed`）：
 
-- `work/keyframes/*.png` 且文件名含 `keyframe`：数量 ∈ 1..9
-- `work/seedance_prompt.txt`：存在、非空、≤ 32KB（`MAX_PROMPT_BYTES`）
-- `work/shot_timeline.md`：存在
-- `work/api_request.json`：可解析；`content` 为 list 且恰含 1 个 `text` 项 + 1..9 个 `image_url` 项（无其他类型）；递归扫描，任何层字段名含 `authorization/token/api_key/secret` 即拒（密钥红线）
-
-预览合成（`pipeline._render_preview`）：ffmpeg 等时长 slideshow，n 帧/15s，`scale+pad` 到 720x1280 黑边竖屏，25fps，libx264/yuv420p，无声，120s 超时。
+- `work/keyframes/*.png`：数量 ∈ 1..9（新契约该目录只有选定帧 `01.png…N.png`）
+- `work/prompt.txt`：存在、非空、≤ 32KB（`MAX_PROMPT_BYTES`）
 
 ## 依赖
 
 - Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless（skill 脚本用）、pytest、httpx（TestClient）
-- 外部可执行：ffmpeg/ffprobe（探测+预览+测试造样例）、codex CLI（0.147.0 实证基线，仅流水线用）
-- 技能脚本：`skills/seedance-cleaning-video-maker/scripts/extract_keyframes.py`（`--sample-count`/`--times`/`--prefix`/`--columns`/`--out-dir`）、`seedance_task.py`（`create --dry-run|--confirm-submit --wait`，模型默认 `doubao-seedance-2-0-260128`，Ark `https://ark.cn-beijing.volces.com/api/v3`）
-- 流水线固定参数：检查帧 40 张；提交建模 `9:16 / 15s / 720p / --generate-audio / --no-watermark`（以 agent dry-run 落盘为准）
+- 外部可执行：ffmpeg/ffprobe（探测+抽帧+测试造样例）、codex CLI（0.147.0 实证基线，仅流水线用）
+- 技能脚本：`skills/video-maker/scripts/extract_keyframes.py`（`--fps`/`--times`/`--sample-count`/`--prefix`/`--columns`/`--out-dir`）、`skills/video-maker/scripts/crop_image.py`（裁字幕/水印）；提交脚本 `app/seedance_task.py`（`create --dry-run|--confirm-submit --wait`，模型默认 `doubao-seedance-2-0-260128`，Ark `https://ark.cn-beijing.volces.com/api/v3`）
+- 流水线固定参数：抽帧 `--fps 4`（分页联系表落 `work/`）；提交建模 `9:16 / 15s / 720p / --generate-audio / --no-watermark`（提交时现构建，无评审 payload）

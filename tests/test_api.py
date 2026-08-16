@@ -19,10 +19,10 @@ def test_list_conversations_shape(client, video_1s):
     r = client.get("/api/conversations", headers=AUTH)
     assert r.status_code == 200
     (item,) = r.json()
-    assert set(item) == {"id", "title", "note", "status", "created_at", "has_preview", "has_video"}
+    assert set(item) == {"id", "title", "note", "status", "created_at", "has_video"}
     assert item["id"] == cid
     assert item["status"] == "queued"
-    assert item["has_preview"] is False and item["has_video"] is False
+    assert item["has_video"] is False
 
 
 def test_detail_shape(client, video_1s):
@@ -41,7 +41,6 @@ def test_detail_shape(client, video_1s):
         "prompt": None,
         "has_source": True,
         "has_contact_sheet": False,
-        "has_preview": False,
         "has_video": False,
         "submit_enabled": False,
     }
@@ -64,13 +63,13 @@ def test_detail_404(client):
 def test_files_endpoint(client, video_1s, settings):
     cid = _make_conv(client, video_1s)
     cdir = settings.data_dir / cid
-    (cdir / "preview.mp4").write_bytes(b"fake-preview")
+    (cdir / "generated.mp4").write_bytes(b"fake-video")
     (cdir / "work" / "contact_sheet.jpg").write_bytes(b"sheet")
     (cdir / "work" / "keyframes").mkdir()
     (cdir / "work" / "keyframes" / "k01.jpg").write_bytes(b"k")
 
-    r = client.get(f"/api/conversations/{cid}/files/preview.mp4", headers=AUTH)
-    assert r.status_code == 200 and r.content == b"fake-preview"
+    r = client.get(f"/api/conversations/{cid}/files/generated.mp4", headers=AUTH)
+    assert r.status_code == 200 and r.content == b"fake-video"
     r = client.get(f"/api/conversations/{cid}/files/source.mp4", headers=AUTH)
     assert r.status_code == 200  # 上传落盘的源视频（_make_conv 已产出 source.<ext>）
     r = client.get(f"/api/conversations/{cid}/files/contact_sheet.jpg", headers=AUTH)
@@ -81,7 +80,7 @@ def test_files_endpoint(client, video_1s, settings):
     # 生成物落盘后 has_* 翻真
     r = client.get(f"/api/conversations/{cid}", headers=AUTH)
     assert r.json()["has_source"] is True
-    assert r.json()["has_preview"] is True
+    assert r.json()["has_video"] is True
     assert r.json()["has_contact_sheet"] is True
 
 

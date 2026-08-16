@@ -29,6 +29,11 @@ def parse_args() -> argparse.Namespace:
     choice = parser.add_mutually_exclusive_group(required=True)
     choice.add_argument("--times", help="Comma-separated timestamps in seconds.")
     choice.add_argument("--sample-count", type=int, help="Number of evenly sampled frames.")
+    choice.add_argument(
+        "--fps",
+        type=float,
+        help="Sample this many frames per second; writes paged contact sheets.",
+    )
     parser.add_argument("--prefix", default="frame", help="Filename role label.")
     parser.add_argument("--columns", type=int, default=4, help="Contact-sheet columns.")
     return parser.parse_args()
@@ -92,6 +97,61 @@ def fit_thumbnail(frame: np.ndarray, width: int, height: int) -> np.ndarray:
     return canvas
 
 
+def build_sheet(
+    contact_frames: list[tuple[np.ndarray, str]], columns: int, thumb_height: int
+) -> np.ndarray:
+    columns = min(columns, len(contact_frames))
+    rows = math.ceil(len(contact_frames) / columns)
+    thumb_width = 360
+    label_height = 42
+    gap = 8
+    sheet_width = columns * thumb_width + (columns - 1) * gap
+    sheet_height = rows * (thumb_height + label_height) + (rows - 1) * gap
+    sheet = np.full((sheet_height, sheet_width, 3), 255, dtype=np.uint8)
+    for zero_index, (frame, label) in enumerate(contact_frames):
+        row = zero_index // columns
+        column = zero_index % columns
+        x = column * (thumb_width + gap)
+        y = row * (thumb_height + label_height + gap)
+        sheet[y : y + thumb_height, x : x + thumb_width] = fit_thumbnail(
+            frame, thumb_width, thumb_height
+        )
+        cv2.putText(
+            sheet,
+            label,
+            (x + 8, y + thumb_height + 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (20, 20, 20),
+            1,
+            cv2.LINE_AA,
+        )
+    return sheet
+
+
+def write_contact_sheets(
+    out_dir: Path,
+    contact_frames: list[tuple[np.ndarray, str]],
+    columns: int,
+    thumb_height: int,
+    paged: bool,
+) -> None:
+    """paged 时按页输出 contact_sheet_01.jpg…（每页 columns×6 帧），否则单张 contact_sheet.jpg。"""
+    page_size = columns * 6
+    if not paged or len(contact_frames) <= page_size:
+        sheet = build_sheet(contact_frames, columns, thumb_height)
+        write_image(out_dir / "contact_sheet.jpg", sheet, ".jpg", [cv2.IMWRITE_JPEG_QUALITY, 92])
+        return
+    for start in range(0, len(contact_frames), page_size):
+        sheet = build_sheet(contact_frames[start : start + page_size], columns, thumb_height)
+        write_image(
+            out_dir / f"contact_sheet_{start // page_size + 1:02d}.jpg",
+            sheet,
+            ".jpg",
+            [cv2.IMWRITE_JPEG_QUALITY, 92],
+        )
+
+
 def main() -> int:
     args = parse_args()
     video = Path(args.video).expanduser().resolve()
@@ -100,6 +160,8 @@ def main() -> int:
         raise SystemExit(f"Video does not exist: {video}")
     if args.sample_count is not None and args.sample_count < 1:
         raise SystemExit("--sample-count must be positive.")
+    if args.fps is not None and args.fps <= 0:
+        raise SystemExit("--fps must be positive.")
     if args.columns < 1:
         raise SystemExit("--columns must be positive.")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -120,6 +182,13 @@ def main() -> int:
     last_safe_time = max(0.0, duration - (1.0 / fps))
     if args.times:
         times = parse_times(args.times)
+    elif args.fps is not None:
+        step = 1.0 / args.fps
+        times = [k * step for k in range(int(duration * args.fps) + 1)]
+        if not times or last_safe_time - times[-1] > step / 2:
+            times.append(last_safe_time)
+        else:
+            times[-1] = last_safe_time
     elif args.sample_count == 1:
         times = [0.0]
     else:
@@ -157,34 +226,13 @@ def main() -> int:
         contact_frames.append((frame, f"{index:02d}  {requested_time:.3f}s"))
     capture.release()
 
-    columns = min(args.columns, len(contact_frames))
-    rows = math.ceil(len(contact_frames) / columns)
-    thumb_width = 360
-    thumb_height = round(thumb_width * height / width)
-    label_height = 42
-    gap = 8
-    sheet_width = columns * thumb_width + (columns - 1) * gap
-    sheet_height = rows * (thumb_height + label_height) + (rows - 1) * gap
-    sheet = np.full((sheet_height, sheet_width, 3), 255, dtype=np.uint8)
-    for zero_index, (frame, label) in enumerate(contact_frames):
-        row = zero_index // columns
-        column = zero_index % columns
-        x = column * (thumb_width + gap)
-        y = row * (thumb_height + label_height + gap)
-        sheet[y : y + thumb_height, x : x + thumb_width] = fit_thumbnail(
-            frame, thumb_width, thumb_height
-        )
-        cv2.putText(
-            sheet,
-            label,
-            (x + 8, y + thumb_height + 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (20, 20, 20),
-            1,
-            cv2.LINE_AA,
-        )
-    write_image(out_dir / "contact_sheet.jpg", sheet, ".jpg", [cv2.IMWRITE_JPEG_QUALITY, 92])
+    write_contact_sheets(
+        out_dir,
+        contact_frames,
+        args.columns,
+        thumb_height=round(360 * height / width),
+        paged=args.fps is not None,
+    )
 
     manifest = {
         "source": str(video),

@@ -13,22 +13,6 @@ from app import seedance, storage
 from app.main import create_app
 
 PROMPT = "把房间打扫干净的视频"
-REVIEWED = {
-    "model": "doubao-seedance-2-0-260128",
-    "ratio": "9:16",
-    "duration": 15,
-    "resolution": "720p",
-    "generate_audio": True,
-    "watermark": False,
-    "content": [
-        {"type": "text", "text": PROMPT},
-        {
-            "type": "image_url",
-            "image_url": {"url": "data:image/jpeg;base64,AAAA"},
-            "role": "reference_image",
-        },
-    ],
-}
 
 
 @pytest.fixture
@@ -38,8 +22,8 @@ def enabled(tmp_path):
         yield settings, c
 
 
-def _make_conv(settings, status="done", has_video=False, with_work=True):
-    """造一个会话；默认 status=done 且 work/ 下有 prompt+keyframes+评审 payload。"""
+def _make_conv(settings, status="done", has_video=False, with_work=True, with_prompt=True, with_frames=True):
+    """造一个会话；默认 status=done 且 work/ 下有 prompt.txt + keyframes（新契约产物）。"""
     meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
     cid = meta["id"]
     cdir = settings.data_dir / cid
@@ -49,14 +33,11 @@ def _make_conv(settings, status="done", has_video=False, with_work=True):
     (cdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     if with_work:
         (cdir / "work" / "keyframes").mkdir(parents=True)
-        # 与 pipeline 真实产物布局一致：关键帧 PNG 与 contact_sheet/manifest 同目录
-        (cdir / "work" / "keyframes" / "01_keyframe_0.330s.png").write_bytes(b"img1")
-        (cdir / "work" / "keyframes" / "contact_sheet.jpg").write_bytes(b"sheet")
-        (cdir / "work" / "keyframes" / "manifest.json").write_text("{}", encoding="utf-8")
-        (cdir / "work" / "seedance_prompt.txt").write_text(PROMPT, encoding="utf-8")
-        (cdir / "work" / "api_request.json").write_text(
-            json.dumps(REVIEWED, ensure_ascii=False), encoding="utf-8"
-        )
+        if with_frames:
+            # 新契约：keyframes/ 里只有选定帧
+            (cdir / "work" / "keyframes" / "01.png").write_bytes(b"img1")
+        if with_prompt:
+            (cdir / "work" / "prompt.txt").write_text(PROMPT, encoding="utf-8")
     return cid
 
 
@@ -65,21 +46,22 @@ def _no_subprocess(*a, **k):
 
 
 class FakeSubmit:
-    """模拟 seedance_task.py：dry-run 写 recheck payload；真实提交写 task.json + generated.mp4。"""
+    """模拟 seedance_task.py：dry-run 写 payload-out 预检文件；真实提交写 task.json + generated.mp4。"""
 
-    def __init__(self, rebuilt=None, rc=0, stderr="", task_id="task-123"):
-        self.rebuilt = REVIEWED if rebuilt is None else rebuilt
+    def __init__(self, rc=0, stderr="", task_id="task-123", write_payload=True):
         self.rc = rc
         self.stderr = stderr
         self.task_id = task_id
+        self.write_payload = write_payload
         self.calls = []
 
     def __call__(self, argv, **kwargs):
         cwd = Path(kwargs["cwd"])
         self.calls.append((list(argv), kwargs))
         if "--dry-run" in argv:
-            out = cwd / argv[argv.index("--payload-out") + 1]
-            out.write_text(json.dumps(self.rebuilt, ensure_ascii=False), encoding="utf-8")
+            if self.write_payload:
+                out = cwd / argv[argv.index("--payload-out") + 1]
+                out.write_text("{}", encoding="utf-8")
             return subprocess.CompletedProcess(argv, 0, stdout="dry", stderr="")
         if self.rc == 0:
             (cwd / "work" / "task.json").write_text(
@@ -152,35 +134,21 @@ def test_already_submitted_409(enabled, monkeypatch):
     assert r.json() == {"detail": "already submitted"}
 
 
-# ---------- 矩阵 6：dry-run 复核不一致 → 409 ----------
+# ---------- 矩阵 6：dry-run 预检失败 / 产物缺失 → 409 ----------
 
-_CHANGED_PAYLOADS = [
-    {**REVIEWED, "ratio": "16:9"},                       # 标量被改
-    {**REVIEWED, "generate_audio": False},               # 布尔被改
-    {**REVIEWED, "content": [dict(REVIEWED["content"][0], text="改过的 prompt"),
-                             REVIEWED["content"][1]]},   # text 被改
-    {**REVIEWED, "content": [*REVIEWED["content"],
-                             REVIEWED["content"][1]]},   # content 长度变
-]
-
-
-@pytest.mark.parametrize("rebuilt", _CHANGED_PAYLOADS)
-def test_payload_changed_409(enabled, monkeypatch, rebuilt):
+def test_prompt_missing_409(enabled, monkeypatch):
     settings, c = enabled
-    cid = _make_conv(settings)
-    fake = FakeSubmit(rebuilt=rebuilt)
-    monkeypatch.setattr(subprocess, "run", fake)
+    cid = _make_conv(settings, with_prompt=False)  # 无 work/prompt.txt
+    monkeypatch.setattr(subprocess, "run", _no_subprocess)
     monkeypatch.setenv("ARK_API_KEY", "sk-test")
     r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
     assert r.status_code == 409
     assert r.json() == {"detail": "payload changed since review"}
-    assert fake.real_calls == []  # 未进入真实提交
-    assert len(fake.calls) == 1   # 只跑了 dry-run 复核
 
 
-def test_payload_review_missing_409(enabled, monkeypatch):
+def test_keyframes_missing_409(enabled, monkeypatch):
     settings, c = enabled
-    cid = _make_conv(settings, with_work=False)  # 无 api_request.json
+    cid = _make_conv(settings, with_frames=False)  # keyframes/ 为空
     monkeypatch.setattr(subprocess, "run", _no_subprocess)
     monkeypatch.setenv("ARK_API_KEY", "sk-test")
     r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
@@ -202,6 +170,19 @@ def test_payload_dryrun_failed_409(enabled, monkeypatch):
     assert r.json() == {"detail": "payload changed since review"}
 
 
+def test_payload_dryrun_no_output_409(enabled, monkeypatch):
+    """dry-run 退出码正常但没写 payload-out，同样视为产物已变。"""
+    settings, c = enabled
+    cid = _make_conv(settings)
+    fake = FakeSubmit(write_payload=False)
+    monkeypatch.setattr(subprocess, "run", fake)
+    monkeypatch.setenv("ARK_API_KEY", "sk-test")
+    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
+    assert r.status_code == 409
+    assert r.json() == {"detail": "payload changed since review"}
+    assert fake.real_calls == []  # 未进入真实提交
+
+
 # ---------- 矩阵 7：无 ARK_API_KEY → 503 ----------
 
 def test_missing_ark_key_503(enabled, monkeypatch):
@@ -213,7 +194,7 @@ def test_missing_ark_key_503(enabled, monkeypatch):
     r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
     assert r.status_code == 503
     assert r.json() == {"detail": "ARK_API_KEY not configured"}
-    assert fake.real_calls == [] and len(fake.calls) == 1  # dry-run 复核后才查 key
+    assert fake.real_calls == [] and len(fake.calls) == 1  # dry-run 预检后才查 key
 
 
 # ---------- 矩阵 8a：成功 → 200 + meta 落盘 + 契约不破 ----------
@@ -240,12 +221,17 @@ def test_submit_success_200(enabled, monkeypatch):
     for flag in ("--confirm-submit", "--wait",
                  "--state-file", "work/task.json",
                  "--download", "generated.mp4",
-                 "--prompt-file", "work/seedance_prompt.txt",
-                 "--ref-images", "work/keyframes/01_keyframe_0.330s.png",
-                 "--model", REVIEWED["model"]):
+                 "--prompt-file", "work/prompt.txt",
+                 "--model", "doubao-seedance-2-0-260128"):
         assert flag in argv
-    # 回归：keyframes/ 里的非关键帧产物不得进 ref-images
-    assert not any("contact_sheet" in a or "manifest" in a for a in argv)
+    # 提交时现构建：--ref-images 后（到下个旗标前）即 keyframes/ 下全部 PNG（新契约该目录只有选定帧）
+    tail = argv[argv.index("--ref-images") + 1:]
+    ref = []
+    for a in tail:
+        if a.startswith("--"):
+            break
+        ref.append(a)
+    assert ref == ["work/keyframes/01.png"]
 
     # meta 落盘：has_video / submitted_at / task_id；密钥不进任何写盘文件
     meta = storage.load_meta(settings.data_dir, cid)
@@ -253,11 +239,11 @@ def test_submit_success_200(enabled, monkeypatch):
     assert meta["task_id"] == "cgt-abc123"
     assert meta["submitted_at"]
     assert "sk-test-secret" not in (cdir / "meta.json").read_text(encoding="utf-8")
-    assert not (cdir / "work" / "recheck_payload.json").exists()  # 复核临时文件已清理
+    assert not (cdir / "work" / "recheck_payload.json").exists()  # 预检临时文件已清理
 
-    # detail 冻结契约仍 14 字段（meta 新增字段不外泄），has_video 按文件翻真
+    # detail 冻结契约现 13 字段（meta 新增字段不外泄），has_video 按文件翻真
     d = c.get(f"/api/conversations/{cid}", headers=AUTH).json()
-    assert len(d) == 14
+    assert len(d) == 13
     assert "task_id" not in d
     assert d["has_video"] is True
 
@@ -303,7 +289,7 @@ def test_concurrent_submit_single_task(tmp_path, monkeypatch):
         cwd = Path(kwargs["cwd"])
         if "--dry-run" in argv:
             out = cwd / argv[argv.index("--payload-out") + 1]
-            out.write_text(json.dumps(REVIEWED, ensure_ascii=False), encoding="utf-8")
+            out.write_text("{}", encoding="utf-8")
             return subprocess.CompletedProcess(argv, 0, "", "")
         real_calls.append(argv)
         time.sleep(0.3)  # 让第二个请求抵达锁
