@@ -3,7 +3,7 @@ name: backend-api
 type: reference
 status: done
 owner: agent
-updated: 2026-08-15
+updated: 2026-08-16
 links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/pipeline.py, app/codex_runner.py, app/seedance.py]
 ---
 
@@ -29,10 +29,13 @@ links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/p
 
 ### `POST /api/conversations`
 
-- 请求：multipart，`file` 与 `reference_url`（http(s) 直链 / TikTok 视频页）恰好一个 + `note`（可选，默认 `""`）
-- 201 → `{"id": "<32位hex>", "status": "queued"}`；`enable_pipeline` 开时登记后台流水线
+- 请求：multipart，`file` 与 `reference_url`（http(s) 直链 / TikTok 视频页）恰好一个 + `note`（可选，默认 `""`）+ `client_request_id`（可选幂等键，格式 `^[0-9A-Za-z-]{8,64}$`，空 = 不参与幂等）
+- 201 → `{"id": "<32位hex>", "status": "queued"}`；`enable_pipeline` 开时登记后台流水线（经管道闸，见架构）
+- 200 → `{"id", "status"}`：`client_request_id` 命中既有会话 meta（扫 meta.json 查重），不建目录、不重复入队
 - 400 `provide exactly one of file or reference_url`：`file`/`reference_url` 都不给或都给
+- 400 `invalid client_request_id`：幂等键非空但不合格式
 - 429 `too many uploads`：同 IP 1 分钟超 10 次（内存滑动窗口，进程重启清零）
+- 429 `too many queued tasks`：`queued` 状态会话数达 `MAX_QUEUED`（processing/done/failed 不计；查重+计数+建目录在同一把锁内，无竞态）
 - 422：上传/下载校验链失败（`UploadError`/`DownloadError`），detail 为具体原因；失败即回滚删除整个会话目录
 
 上传校验链（顺序执行，`storage.save_upload` → `storage.probe_video`）：
@@ -91,10 +94,10 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 ## 公开接口（Python 模块）
 
 - `app.config.get_settings() -> Settings` — 读环境变量建配置；缺 `ACCESS_TOKEN` 抛 RuntimeError
-- `app.config.Settings` — frozen dataclass，10 字段（见架构配置表）；直建默认 `enable_pipeline=False`
+- `app.config.Settings` — frozen dataclass，11 字段（见架构配置表）；直建默认 `enable_pipeline=False`
 - `app.auth.require_auth(request, cred)` — FastAPI 依赖，Bearer 校验
 - `app.main.create_app(settings) -> FastAPI` — 应用工厂（测试注入用）；模块级 `app = create_app(get_settings())`
-- `app.storage.new_conversation(data_dir, note, orig_name) -> dict` — 建目录 + 初始 meta（status=queued）
+- `app.storage.new_conversation(data_dir, note, orig_name, client_request_id="") -> dict` — 建目录 + 初始 meta（status=queued）；幂等键非空才落 meta
 - `app.storage.update_meta(data_dir, cid, **changes) -> dict | None` — 合并写字段并刷新 `updated_at`
 - `app.storage.load_meta(data_dir, cid) -> dict | None` — cid 正则不过/文件缺 → None
 - `app.storage.list_conversations(data_dir) -> list[dict]` — 扫描合法目录，按 `created_at` 倒序
@@ -124,6 +127,7 @@ meta.json（`data/<cid>/meta.json`）：
 | `created_at` / `updated_at` | str | ISO8601 UTC |
 | `keyframes` | list[str] | 关键帧文件名（done 后写入） |
 | `prompt` | str \| null | Seedance prompt（done 后写入） |
+| `client_request_id` | str | 前端幂等键（仅提交时带才存在；内部字段，查重依据） |
 | `has_video` | bool | 提交标记（仅提交后存在；内部字段） |
 | `submitted_at` / `task_id` | str | 提交时间 / Ark 任务 id（内部字段，读不到 task.json 则为 null） |
 

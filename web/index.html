@@ -69,6 +69,16 @@
       <div class="composer-inner">
         <p id="composer-error" class="inline-error" role="alert" hidden></p>
         <form id="composer" class="composer" novalidate>
+          <div class="source-switch" role="radiogroup" aria-label="视频来源">
+            <label class="source-option">
+              <input type="radio" name="source-mode" value="upload" checked>
+              <span>上传视频</span>
+            </label>
+            <label class="source-option">
+              <input type="radio" name="source-mode" value="link">
+              <span>视频链接</span>
+            </label>
+          </div>
           <div id="file-chip" class="file-chip" hidden>
             <span class="ic ic-film"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-film"></use></svg></span>
             <span id="file-chip-name" class="file-chip-name"></span>
@@ -87,11 +97,12 @@
               <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-send"></use></svg></span>
             </button>
           </div>
-          <div class="composer-row url-row">
+          <div id="url-row" class="composer-row url-row" hidden>
             <label class="sr-only" for="url-input">视频链接</label>
             <input id="url-input" class="composer-input" type="url" inputmode="url" autocomplete="off"
-                   placeholder="或粘贴视频链接：http(s) 直链 / TikTok 视频页">
+                   placeholder="视频链接：http(s) 直链 / TikTok 视频页">
           </div>
+          <p id="file-hint" class="file-hint">最长 300 秒 · 最大 500MB · MP4/MOV/WebM，或直接拖拽文件到此处</p>
           <div id="upload-progress" class="upload-progress" hidden>
             <div class="up-track"><div id="up-fill" class="up-fill"></div></div>
             <span id="up-label" class="up-label">正在上传 0%</span>

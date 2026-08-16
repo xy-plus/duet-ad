@@ -15,6 +15,7 @@ const state = {
   currentId: null,
   detail: null,        // 当前会话详情
   file: null,          // composer 已选文件
+  clientRequestId: null, // 幂等键：内容变更/成功才轮换，失败重试复用
   uploading: false,
   pollTimer: null,
   detailSeq: 0,        // 防止过期响应覆盖新渲染
@@ -51,6 +52,12 @@ function fmtBytes(n) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
   if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
   return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
+}
+
+// 幂等键；非安全上下文（如 LAN http 直连）无 crypto.randomUUID，退化为时间戳+随机串（满足后端 ^[0-9A-Za-z-]{8,64}$）
+function newRequestId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return "rid-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 12);
 }
 
 function fmtTime(iso) {
@@ -625,8 +632,31 @@ function setComposerError(msg) {
   }
 }
 
+function sourceMode() {
+  const checked = document.querySelector('input[name="source-mode"]:checked');
+  return checked ? checked.value : "upload";
+}
+
+// 来源二选一：同一时刻只存在一种输入，切换即清空另一边
+function setSourceMode(mode) {
+  const isUpload = mode === "upload";
+  if (isUpload) {
+    $("url-input").value = "";
+  } else {
+    clearFile();
+  }
+  state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
+  $("attach-btn").hidden = !isUpload;
+  $("file-hint").hidden = !isUpload;
+  $("url-row").hidden = isUpload;
+  $("url-input").required = !isUpload;
+  setComposerError(null);
+  updateSendBtn();
+}
+
 function updateSendBtn() {
-  $("send-btn").disabled = state.uploading || (!state.file && !$("url-input").value.trim());
+  const ready = sourceMode() === "upload" ? !!state.file : !!$("url-input").value.trim();
+  $("send-btn").disabled = state.uploading || !ready;
 }
 
 function isVideoFile(file) {
@@ -643,8 +673,7 @@ function pickFile(file) {
     return;
   }
   state.file = file;
-  $("url-input").value = ""; // 与链接输入互斥：选了文件就清掉链接
-  $("attach-btn").disabled = false;
+  state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
   $("file-chip-name").textContent = file.name;
   $("file-chip-size").textContent = fmtBytes(file.size);
   $("file-chip").hidden = false;
@@ -660,15 +689,18 @@ function clearFile() {
 
 function setUploading(on) {
   state.uploading = on;
-  $("attach-btn").disabled = on || !!$("url-input").value.trim();
+  $("attach-btn").disabled = on;
   $("note-input").disabled = on;
   $("url-input").disabled = on;
   $("file-remove").disabled = on;
+  document.querySelectorAll('input[name="source-mode"]').forEach((r) => {
+    r.disabled = on;
+  });
   updateSendBtn();
   if (!on) $("upload-progress").hidden = true;
 }
 
-function uploadConversation({ file, url, note }, onProgress) {
+function uploadConversation({ file, url, note, requestId }, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/conversations");
@@ -678,10 +710,18 @@ function uploadConversation({ file, url, note }, onProgress) {
       if (e.lengthComputable && e.total > 0) onProgress(e.loaded / e.total);
     });
     xhr.addEventListener("load", () => {
-      if (xhr.status === 201) {
+      // 200 = 幂等命中返回既有会话；201 = 新建成功
+      if (xhr.status === 200 || xhr.status === 201) {
         resolve(xhr.response);
       } else if (xhr.status === 401) {
         reject(new AuthError("口令已失效"));
+      } else if (xhr.status === 429) {
+        // 429 有两种来源：排队满 / IP 限流，按 detail 文案区分
+        const data = xhr.response;
+        const detail = data && data.detail ? String(data.detail) : "";
+        reject(new Error(detail.indexOf("queued") >= 0
+          ? "当前排队任务较多，请稍后再试"
+          : "操作过于频繁，请稍后再试"));
       } else {
         const data = xhr.response;
         const msg = data && (data.detail || data.error || data.message)
@@ -696,6 +736,7 @@ function uploadConversation({ file, url, note }, onProgress) {
     if (file) fd.append("file", file, file.name);
     else if (url) fd.append("reference_url", url);
     if (note) fd.append("note", note);
+    if (requestId) fd.append("client_request_id", requestId);
     xhr.send(fd);
   });
 }
@@ -703,11 +744,12 @@ function uploadConversation({ file, url, note }, onProgress) {
 async function handleSend(event) {
   event.preventDefault();
   if (state.uploading) return;
-  const file = state.file;
-  const url = $("url-input").value.trim();
+  const mode = sourceMode();
+  const file = mode === "upload" ? state.file : null;
+  const url = mode === "link" ? $("url-input").value.trim() : "";
   const note = $("note-input").value.trim();
   if (!file && !url) {
-    setComposerError("请先选择视频文件，或粘贴视频链接");
+    setComposerError(mode === "upload" ? "请先选择视频文件" : "请先粘贴视频链接");
     return;
   }
 
@@ -722,17 +764,20 @@ async function handleSend(event) {
   label.textContent = url ? "服务器正在下载视频…" : "正在上传 0%";
 
   try {
-    const created = await uploadConversation({ file, url, note }, (ratio) => {
-      if (url) return;
-      const pct = Math.round(ratio * 100);
-      fill.style.width = pct + "%";
-      label.textContent = pct >= 100 ? "上传完成，等待处理…" : "正在上传 " + pct + "%";
-    });
-    // 成功：清空 composer，刷新列表并选中新会话
+    const created = await uploadConversation(
+      { file, url, note, requestId: state.clientRequestId },
+      (ratio) => {
+        if (url) return;
+        const pct = Math.round(ratio * 100);
+        fill.style.width = pct + "%";
+        label.textContent = pct >= 100 ? "上传完成，等待处理…" : "正在上传 " + pct + "%";
+      }
+    );
+    // 成功：清空 composer、换新幂等键，刷新列表并选中新会话
+    state.clientRequestId = newRequestId();
     clearFile();
     $("note-input").value = "";
     $("url-input").value = "";
-    $("attach-btn").disabled = false;
     setUploading(false);
     await refreshList(false);
     if (created && created.id) {
@@ -783,15 +828,14 @@ function bindEvents() {
   });
   $("file-remove").addEventListener("click", clearFile);
 
-  // 与文件选择互斥：填了链接就清掉已选文件并禁用选择按钮
+  // 来源 radio 互斥切换
+  document.querySelectorAll('input[name="source-mode"]').forEach((radio) => {
+    radio.addEventListener("change", () => setSourceMode(radio.value));
+  });
+
   $("url-input").addEventListener("input", () => {
+    state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
     setComposerError(null);
-    if ($("url-input").value.trim()) {
-      if (state.file) clearFile();
-      $("attach-btn").disabled = true;
-    } else {
-      $("attach-btn").disabled = state.uploading;
-    }
     updateSendBtn();
   });
 
@@ -799,11 +843,11 @@ function bindEvents() {
   composer.addEventListener("submit", handleSend);
   composer.addEventListener("dragenter", (e) => {
     e.preventDefault();
-    if (!state.uploading) composer.classList.add("drag-over");
+    if (!state.uploading && sourceMode() === "upload") composer.classList.add("drag-over");
   });
   composer.addEventListener("dragover", (e) => {
     e.preventDefault();
-    if (!state.uploading) composer.classList.add("drag-over");
+    if (!state.uploading && sourceMode() === "upload") composer.classList.add("drag-over");
   });
   composer.addEventListener("dragleave", (e) => {
     if (!composer.contains(e.relatedTarget)) composer.classList.remove("drag-over");
@@ -811,7 +855,7 @@ function bindEvents() {
   composer.addEventListener("drop", (e) => {
     e.preventDefault();
     composer.classList.remove("drag-over");
-    if (state.uploading) return;
+    if (state.uploading || sourceMode() !== "upload") return;
     const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     pickFile(file);
   });
@@ -822,8 +866,9 @@ function bindEvents() {
 }
 
 function boot() {
+  state.clientRequestId = newRequestId();
   bindEvents();
-  updateSendBtn();
+  setSourceMode(sourceMode());
   const saved = localStorage.getItem(TOKEN_KEY);
   if (saved) {
     state.token = saved;

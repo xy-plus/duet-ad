@@ -1,10 +1,12 @@
 import asyncio
 import hmac
+import re
+import threading
 import time
 from collections import defaultdict, deque
 from pathlib import Path
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -16,6 +18,8 @@ from app.config import Settings, get_settings
 
 _RATE_LIMIT = 10  # 每 IP 每分钟上传次数
 _RATE_WINDOW_S = 60
+# 前端幂等键（boot / 内容变更 / 上传成功时轮换，失败重试复用）；空 = 不参与幂等（兼容 curl）
+_CLIENT_REQUEST_ID_RE = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 
 
 class _RateLimiter:
@@ -40,7 +44,15 @@ def create_app(settings: Settings) -> FastAPI:
     codex_runner = CodexRunner(
         timeout_s=settings.codex_timeout_s, concurrency=settings.codex_concurrency
     )
+    # 管道闸：同时处理的会话数上限；拿不到闸的会话保持 queued
+    pipeline_sem = threading.Semaphore(settings.codex_concurrency)
+    # 创建临界区：幂等查重 + queued 计数 + 建目录必须原子
+    create_lock = threading.Lock()
     submit_locks: dict[str, asyncio.Lock] = {}
+
+    def run_pipeline_gated(cid: str) -> None:
+        with pipeline_sem:
+            pipeline.run(settings, cid, codex_runner)
 
     @app.get("/api/health")
     async def health():
@@ -70,10 +82,12 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/api/conversations", status_code=201, dependencies=[Depends(require_auth)])
     async def create_conversation(
         request: Request,
+        response: Response,
         background_tasks: BackgroundTasks,
         file: UploadFile | None = File(None),
         reference_url: str = Form(""),
         note: str = Form(""),
+        client_request_id: str = Form(""),
     ):
         ip = request.client.host if request.client else "unknown"
         if not limiter.allow(ip):
@@ -81,7 +95,25 @@ def create_app(settings: Settings) -> FastAPI:
         reference_url = reference_url.strip()
         if (file is None) == (not reference_url):
             raise HTTPException(status_code=400, detail="provide exactly one of file or reference_url")
-        meta = storage.new_conversation(settings.data_dir, note, (file.filename or "") if file else reference_url)
+        client_request_id = client_request_id.strip()
+        if client_request_id and not _CLIENT_REQUEST_ID_RE.match(client_request_id):
+            raise HTTPException(status_code=400, detail="invalid client_request_id")
+        with create_lock:
+            metas = storage.list_conversations(settings.data_dir)
+            if client_request_id:
+                for m in metas:
+                    if m.get("client_request_id") == client_request_id:
+                        # 幂等命中：不建目录、不重复入队，200 返回既有会话
+                        response.status_code = 200
+                        return {"id": m["id"], "status": m["status"]}
+            if sum(1 for m in metas if m["status"] == "queued") >= settings.max_queued:
+                raise HTTPException(status_code=429, detail="too many queued tasks")
+            meta = storage.new_conversation(
+                settings.data_dir,
+                note,
+                (file.filename or "") if file else reference_url,
+                client_request_id,
+            )
         cdir = settings.data_dir / meta["id"]
         try:
             if file is not None:
@@ -94,7 +126,7 @@ def create_app(settings: Settings) -> FastAPI:
             storage.remove_conversation(settings.data_dir, meta["id"])
             raise HTTPException(status_code=422, detail=str(e)) from e
         if settings.enable_pipeline:
-            background_tasks.add_task(pipeline.run, settings, meta["id"], codex_runner)
+            background_tasks.add_task(run_pipeline_gated, meta["id"])
         return {"id": meta["id"], "status": "queued"}
 
     @app.get("/api/conversations/{cid}", dependencies=[Depends(require_auth)])

@@ -11,7 +11,9 @@ class Settings:
     enable_seedance_submit: bool = False
     data_dir: Path = Path("data")
     codex_timeout_s: int = 600
-    codex_concurrency: int = 1
+    codex_concurrency: int = 10
+    # queued 状态会话数上限（不计 processing/done/failed），超过即 429
+    max_queued: int = 100
     # TikTok 解析/下载走的 HTTP 代理（空 = 直连）；URL 下载大小上限复用 max_upload_mb
     tiktok_proxy: str = ""
     download_timeout_s: int = 120
@@ -30,7 +32,8 @@ def get_settings() -> Settings:
         enable_seedance_submit=os.environ.get("ENABLE_SEEDANCE_SUBMIT", "").lower() in ("1", "true", "yes"),
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "600")),
-        codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "1")),
+        codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),
+        max_queued=int(os.environ.get("MAX_QUEUED", "100")),
         tiktok_proxy=os.environ.get("TIKTOK_PROXY", ""),
         download_timeout_s=int(os.environ.get("DOWNLOAD_TIMEOUT_S", "120")),
         enable_pipeline=os.environ.get("ENABLE_PIPELINE", "1").lower() in ("1", "true", "yes"),

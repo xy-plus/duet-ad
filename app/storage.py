@@ -31,7 +31,7 @@ def _write_meta(cdir: Path, meta: dict) -> None:
     (cdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
 
 
-def new_conversation(data_dir: Path, note: str, orig_name: str) -> dict:
+def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_id: str = "") -> dict:
     cid = uuid.uuid4().hex
     cdir = data_dir / cid
     (cdir / "work").mkdir(parents=True)
@@ -47,6 +47,8 @@ def new_conversation(data_dir: Path, note: str, orig_name: str) -> dict:
         "keyframes": [],
         "prompt": None,
     }
+    if client_request_id:
+        meta["client_request_id"] = client_request_id
     _write_meta(cdir, meta)
     return meta
 

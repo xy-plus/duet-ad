@@ -10,7 +10,7 @@
 
 <!-- 开工登记、集成即删；重开任务记重开链：继承未解 blockers 与已用轮次 -->
 
-（空）
+- 上传防呆：radio 二选一表单 + client_request_id 幂等 + 并发 10/排队 100 闸。（→ 计划见会话 plans/archangel-riri-williams-superman.md）
 
 ## 📌 待办与限制
 

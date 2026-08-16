@@ -598,18 +598,22 @@ def test_config_pipeline_fields(monkeypatch):
     monkeypatch.setenv("ACCESS_TOKEN", "t")
     monkeypatch.setenv("CODEX_TIMEOUT_S", "42")
     monkeypatch.setenv("CODEX_CONCURRENCY", "3")
+    monkeypatch.setenv("MAX_QUEUED", "7")
     monkeypatch.setenv("ENABLE_PIPELINE", "0")
     s = get_settings()
     assert s.codex_timeout_s == 42
     assert s.codex_concurrency == 3
+    assert s.max_queued == 7
     assert s.enable_pipeline is False
 
     monkeypatch.delenv("CODEX_TIMEOUT_S")
     monkeypatch.delenv("CODEX_CONCURRENCY")
+    monkeypatch.delenv("MAX_QUEUED")
     monkeypatch.delenv("ENABLE_PIPELINE")
     s = get_settings()
     assert s.codex_timeout_s == 600
-    assert s.codex_concurrency == 1
+    assert s.codex_concurrency == 10
+    assert s.max_queued == 100
     assert s.enable_pipeline is True  # 生产路径默认开
 
 
