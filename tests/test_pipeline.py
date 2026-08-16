@@ -432,7 +432,6 @@ def test_post_triggers_pipeline_and_detail_filled(tmp_path, video_1s, fake_steps
     assert body["status"] == "done"
     assert body["keyframes"] == ["01.png", "02.png", "03.png"]
     assert body["prompt"] == PROMPT_TEXT
-    assert body["has_contact_sheet"] is True
     assert "has_preview" not in body
     assert body["error"] is None
 

@@ -48,7 +48,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 
 ### `GET /api/conversations/{cid}`
 
-- 200 → **冻结的 13 字段契约**（显式键，meta 内部字段不外泄）：
+- 200 → **冻结的 12 字段契约**（显式键，meta 内部字段不外泄）：
 
 | 字段 | 来源 |
 | --- | --- |
@@ -56,7 +56,6 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 | `keyframes` | meta.json（字符串数组，缺省 `[]`） |
 | `prompt` | meta.json（缺省 `null`） |
 | `has_source` | `source.*` 磁盘探测 |
-| `has_contact_sheet` | `work/contact_sheet.jpg` 磁盘探测 |
 | `has_video` | `generated.mp4` 磁盘探测 |
 | `submit_enabled` | `settings.enable_seedance_submit` |
 

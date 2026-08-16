@@ -41,7 +41,7 @@ flowchart LR
   PL -->|白名单校验| FS
   PL -->|status/keyframes/prompt| META[meta.json]
   U -->|2s 轮询 GET detail| API
-  API -->|13 字段| U
+  API -->|12 字段| U
   U -.->|submit 预留| SD[app/seedance.py<br/>三重门控+dry-run 预检]
   SD -.->|app/seedance_task.py --confirm-submit| ARK[Volcengine Ark]
 ```

@@ -40,7 +40,6 @@ def test_detail_shape(client, video_1s):
         "keyframes": [],
         "prompt": None,
         "has_source": True,
-        "has_contact_sheet": False,
         "has_video": False,
         "submit_enabled": False,
     }
@@ -81,7 +80,6 @@ def test_files_endpoint(client, video_1s, settings):
     r = client.get(f"/api/conversations/{cid}", headers=AUTH)
     assert r.json()["has_source"] is True
     assert r.json()["has_video"] is True
-    assert r.json()["has_contact_sheet"] is True
 
 
 def test_files_traversal_404(client, video_1s):
