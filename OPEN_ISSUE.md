@@ -10,7 +10,7 @@
 
 <!-- 开工登记、集成即删；重开任务记重开链：继承未解 blockers 与已用轮次 -->
 
-- video-maker skill 对齐：DoD=项目自用与 web/video-maker.zip 逐字节一致、pipeline 跑通新契约（4fps 抽帧/基本校验/生成位留空）、目录改名 video-maker、测试全绿、公网服务重启验证；当前阶段=实现。（→ 分支 video-maker-skill）
+（空）
 
 ## 📌 待办与限制
 
