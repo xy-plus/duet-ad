@@ -21,6 +21,8 @@
 - codex 认证只支持 CODEX_HOME 文件认证：env 清洗会杀 OPENAI_API_KEY/CODEX_API_KEY 等 env 认证路径（有意设计）。（→ app/codex_runner.py）
 - TikTok 链接依赖第三方 TikWM API + TIKTOK_PROXY（境外），TikWM 故障时 TikTok 分支不可用、直链不受影响；新版 video-maker skill 已移除商标/版权硬规则（内容后处理归将来的第二个 skill）。（→ app/downloader.py, skills/video-maker/）
 - data 目录无磁盘清理策略（LRU/TTL）：会话只进不出，量起来后需清理机制。
-- 失败任务无重试按钮：TrendScout 有 retry 模式可参考；当前只能新建会话重传。
+- 失败任务无重试按钮：TrendScout 有 retry 模式可参考；当前只能新建会话重传；pipeline copytree 无重入保护，加重试前需处理。
+- "payload changed since review" 文案在新契约下语义已变（无评审 payload 可比对，实际=产物缺失/不可构建）：改文案连带冻结测试，留到下轮。（→ app/seedance.py）
+- web/video-maker.zip 与 skills/video-maker/ 的字节一致性无 CI 防漂移：改 skill 后需手动重打包。（→ skills/video-maker/）
 - 闸等待占线程池线程：管道闸阻塞的是 anyio 线程（默认 40），极端排队场景会拖慢 URL 下载/静态文件；正确性不受影响，量大再改异步闸。（→ app/main.py run_pipeline_gated）
 - 审查 nits 汇总（R1/R2，不阻塞）：/api/login 无限流；_RateLimiter IP 条目只增不删、反代后共享一桶；save_upload async 内同步写盘；note 无长度上限；submit_locks 字典常驻内存；503 排在 dry-run 复核后；_SECRET_KEY_MARKERS 与 env 清洗口径不齐；_render_preview glob 不过滤前缀；has_video 磁盘探测与 meta 标记双源；URL 上传且无 note 时标题取整串 URL；限流先于幂等查重（重试消耗限流额度，有意外先撞 429）；幂等命中时首请求未落盘完成则随后 422 回滚会让重试方短暂 404。

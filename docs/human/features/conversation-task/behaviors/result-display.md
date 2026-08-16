@@ -23,7 +23,7 @@ links: []
 ## 边界
 
 - `has_video` 由后端按磁盘实况探测（`generated.mp4` 是否存在）
-- 接触表（contact_sheet）经 files 接口可取，但前端当前不展示
+- 分页联系表（contact_sheet_01.jpg…）不进 files 白名单；白名单仅保留旧版单页 contact_sheet.jpg 映射以兼容存量会话；前端不展示
 - 文件直链全部需要 Bearer 鉴权，不能直接 `<img src>`，故一律 blob 化
 - 「生成最终视频」按钮当前恒禁用，提示「待提交生成（接口预留，当前阶段未开放）」
 

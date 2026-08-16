@@ -22,7 +22,7 @@ links: []
 ## 边界
 
 - 状态只前进不回退：`queued → processing → done|failed`，无取消、无重跑
-- 后端默认串行处理（CODEX_CONCURRENCY=1），并发上传排队等待
+- 后端默认并发 10（CODEX_CONCURRENCY，部署未覆盖），并发上传排队等待信号量
 - 测试配置下 `enable_pipeline=False`：会话停在 `queued`，不启动处理
 - 进程重启后 `processing` 中的会话不会自动续跑（内存后台任务）
 
