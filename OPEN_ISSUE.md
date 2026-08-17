@@ -19,7 +19,7 @@
 - codex 认证只支持 CODEX_HOME 文件认证：env 清洗会杀 OPENAI_API_KEY/CODEX_API_KEY 等 env 认证路径（有意设计）。（→ app/codex_runner.py）
 - TikTok 链接依赖第三方 TikWM API + TIKTOK_PROXY（境外），TikWM 故障时 TikTok 分支不可用、直链不受影响；新版 video-maker skill 已移除商标/版权硬规则（内容后处理归将来的第二个 skill）。（→ app/downloader.py, skills/video-maker/）
 - data 目录无磁盘清理策略（LRU/TTL）：会话只进不出，量起来后需清理机制。
-- 长视频（>15s、抽帧多）codex 耗时可能顶到 CODEX_TIMEOUT_S（默认 600）：已落盘完整产物会被超时收养逻辑判 done，未写完的仍 failed；不够就调 CODEX_TIMEOUT_S。（→ app/pipeline.py）
+- 长视频（拆段多）codex 耗时可能顶到 CODEX_TIMEOUT_S（默认 1800）：已落盘完整产物会被超时收养逻辑判 done，未写完的仍 failed；不够就调 CODEX_TIMEOUT_S。（→ app/pipeline.py）
 - 失败任务无重试按钮：TrendScout 有 retry 模式可参考；当前只能新建会话重传；pipeline copytree 无重入保护，加重试前需处理。
 - "payload changed since review" 文案在新契约下语义已变（无评审 payload 可比对，实际=产物缺失/不可构建）：改文案连带冻结测试，留到下轮。（→ app/seedance.py）
 - web/video-maker.zip 与 skills/video-maker/ 的字节一致性无 CI 防漂移：改 skill 后需手动重打包。（→ skills/video-maker/）
