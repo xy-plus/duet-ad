@@ -45,7 +45,7 @@ def load_manifest(work_dir: Path) -> tuple[float, list[dict]]:
         raise SystemExit(f"无法读取 {path}: {exc}") from exc
     duration = manifest.get("duration_seconds")
     frames = manifest.get("frames")
-    if not isinstance(duration, (int, float)) or duration <= 0:
+    if not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration <= 0:
         raise SystemExit("manifest.json 缺少有效的 duration_seconds。")
     if not isinstance(frames, list) or not frames:
         raise SystemExit("manifest.json 缺少非空的 frames 列表。")
@@ -54,6 +54,7 @@ def load_manifest(work_dir: Path) -> tuple[float, list[dict]]:
             not isinstance(frame, dict)
             or "file" not in frame
             or not isinstance(frame.get("time_seconds"), (int, float))
+            or not math.isfinite(frame.get("time_seconds"))
         ):
             raise SystemExit("manifest.json 的 frames 元素缺少 file/time_seconds。")
     return float(duration), frames

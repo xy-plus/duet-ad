@@ -181,6 +181,25 @@ def test_manifest_missing_fields_fails(video_10s, tmp_path):
     assert result.returncode != 0
 
 
+@pytest.mark.parametrize(
+    "manifest_body",
+    [
+        # json.loads 默认接受 NaN/Infinity 字面量（Python 扩展），必须显式拒绝
+        '{"duration_seconds": NaN, "frames": [{"file": "f1.png", "time_seconds": 0.0}]}',
+        '{"duration_seconds": Infinity, "frames": [{"file": "f1.png", "time_seconds": 0.0}]}',
+        '{"duration_seconds": 10.0, "frames": [{"file": "f1.png", "time_seconds": NaN}]}',
+    ],
+)
+def test_manifest_non_finite_numbers_fail(video_10s, tmp_path, manifest_body):
+    """NaN/Infinity 时长或帧时间 → 非零退出，不产出 scenes.json。"""
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "manifest.json").write_text(manifest_body, encoding="utf-8")
+    result = run_scenes(video_10s, work)
+    assert result.returncode != 0
+    assert not (work / "scenes.json").exists()
+
+
 def test_nan_threshold_fails(video_10s, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
