@@ -66,7 +66,7 @@ def detect_scene_bounds(video: Path, threshold: float) -> list[tuple[float, floa
         scene_list = detect(str(video), ContentDetector(threshold=threshold))
     except Exception as exc:
         raise SystemExit(f"场景检测失败: {exc}") from exc
-    bounds = [(start.get_seconds(), end.get_seconds()) for start, end in scene_list]
+    bounds = [(start.seconds, end.seconds) for start, end in scene_list]
     if not bounds:
         raise SystemExit("未检测到任何场景。")
     return bounds
@@ -107,7 +107,7 @@ def _assert_segments_valid(
         prev_end = end
     if abs(segments[0][0]) > 1e-6 or abs(prev_end - duration) > 1e-6:
         raise SystemExit(
-            f"拆段未覆盖全程: [{segments[0][0]:.3f}s, {prev_end:.3f}s] vs {duration:.3f}s"
+            f"拆段未覆盖全程: [{segments[0][0]:.3f}s, {prev_end:.3f}s] vs {duration:.6f}s"
         )
 
 
@@ -115,6 +115,7 @@ def build_segments(
     bounds: list[tuple[float, float]], duration: float
 ) -> list[tuple[float, float]]:
     """按场景边界生成拆段建议：每段 4~15s、覆盖全程无缝隙、边界单调递增（算法级不变量）。"""
+    duration = round(duration, 3)  # 统一 3 位口径：bounds 已 round(3)，断言两端才可比
     if duration <= SEGMENT_ONLY_ABOVE_S:
         return []
     # 1. 预处理：>15s 场景均分为 ceil(时长/15) 块，得原子块列表（每块 ∈ (0, 15]）
@@ -138,19 +139,17 @@ def build_segments(
             seg_start = start
         seg_end = end
     segments.append((seg_start, seg_end))
-    # 3. 修复违规段（一轮收敛）：<4s 并入邻段（合并体 >15s 则均分成 2），>15s 均分成 2
+    # 3. 修复违规段（一轮收敛）：<4s 并入邻段（合并体 >15s 则均分成 2）
+    # 步骤 2 不变量保证装箱段恒 ≤15，>15 只可能由合并产生、已在分支内均分，无需独立分支
     fixed: list[tuple[float, float]] = list(segments)
     i = 0
     while i < len(fixed):
         start, end = fixed[i]
         length = end - start
-        if length > SEGMENT_MAX_S:
-            half = length / 2
-            fixed[i : i + 1] = [(start, start + half), (start + half, end)]
-        elif length < SEGMENT_MIN_S:
+        if length < SEGMENT_MIN_S:
             if i == 0 and len(fixed) > 1:
                 # 首段并入后段
-                next_start, next_end = fixed[1]
+                _, next_end = fixed[1]
                 if next_end - start > SEGMENT_MAX_S:
                     half = (next_end - start) / 2
                     fixed[0:2] = [(start, start + half), (start + half, next_end)]

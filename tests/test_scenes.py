@@ -69,6 +69,15 @@ def video_10s(tmp_path_factory):
     )
 
 
+@pytest.fixture(scope="module")
+def video_24s(tmp_path_factory):
+    """~24.03s 真实视频（含一切点），配 6 位小数帧量化时长（29.97fps 形态）的 manifest 用。"""
+    return build_scene_video(
+        tmp_path_factory.mktemp("video") / "scenes_24s.mp4",
+        [("color=c=red", 12.0), ("color=c=blue", 12.033367)],
+    )
+
+
 def write_manifest(work: Path, duration: float) -> dict[str, float]:
     """按 4fps 抽帧节奏伪造 manifest，返回 file -> time_seconds 映射。"""
     frames = []
@@ -187,6 +196,44 @@ def test_nan_threshold_fails(video_10s, tmp_path):
     assert result.returncode != 0
 
 
+def test_e2e_manifest_duration_six_decimals(video_30s, tmp_path):
+    """真实 6 位小数 duration_seconds（extract_keyframes round(6) 口径）全脚本跑通。"""
+    work = tmp_path / "work"
+    work.mkdir()
+    duration = 29.123456
+    write_manifest(work, duration)
+
+    result = run_scenes(video_30s, work)
+    assert result.returncode == 0, result.stderr
+
+    scenes_path = work / "scenes.json"
+    assert scenes_path.is_file()
+    data = json.loads(scenes_path.read_text(encoding="utf-8"))
+    assert data["duration_s"] == round(duration, 3)
+    segments = [(seg["start_s"], seg["end_s"]) for seg in data["segments"]]
+    assert segments[-1][1] == round(duration, 3)
+    assert_segments_valid(segments, data["duration_s"])
+
+
+def test_e2e_manifest_duration_frame_quantized(video_24s, tmp_path):
+    """帧量化 6 位小数 duration_seconds（29.97fps 时长形态）——本次 blocker 的回归锁。"""
+    work = tmp_path / "work"
+    work.mkdir()
+    duration = 24.033367
+    write_manifest(work, duration)
+
+    result = run_scenes(video_24s, work)
+    assert result.returncode == 0, result.stderr
+
+    scenes_path = work / "scenes.json"
+    assert scenes_path.is_file()
+    data = json.loads(scenes_path.read_text(encoding="utf-8"))
+    assert data["duration_s"] == round(duration, 3)
+    segments = [(seg["start_s"], seg["end_s"]) for seg in data["segments"]]
+    assert segments[-1][1] == round(duration, 3)
+    assert_segments_valid(segments, data["duration_s"])
+
+
 def test_build_segments_splits_long_scene_evenly():
     """单场景超 15s 动态均分：22s 场景 → 两段 11s。"""
     assert build_segments([(0.0, 10.0), (10.0, 32.0)], 32.0) == [
@@ -245,6 +292,12 @@ def test_build_segments_merges_short_tail():
     assert_segments_valid(build_segments(bounds, 29.5), 29.5)
 
 
+def test_build_segments_round3_bounds_with_6dp_duration():
+    """round(3) 的 bounds 配 6 位小数 duration（extract_keyframes round(6) 口径）不炸。"""
+    segments = build_segments([(0.0, round(29.123456, 3))], 29.123456)
+    assert_segments_valid(segments, round(29.123456, 3))
+
+
 def _scene_length_sequences():
     """生成场景长 1..16s、总时长 21..48s 的所有有序组合（2~4 个场景）。"""
 
@@ -260,7 +313,9 @@ def _scene_length_sequences():
 
 
 def test_build_segments_exhaustive_invariants():
-    """穷举 59,865 个场景组合断言拆段不变量——防回归关键。"""
+    """穷举场景长 1..16s、总时长 21..48s、2~4 个场景的有序组合共 59,865 个断言不变量。
+
+    仅对该有限域完备的回归，非任意输入完备证明。"""
     count = 0
     for lengths in _scene_length_sequences():
         duration = float(sum(lengths))
