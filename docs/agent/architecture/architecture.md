@@ -20,7 +20,8 @@ links: [conversation-task]
 | `app/auth.py` | Bearer 口令校验（`hmac.compare_digest`） | conversation-task |
 | `app/storage.py` | 会话目录/元数据读写、上传流式落盘、ffprobe 探测、files 白名单解析 | conversation-task |
 | `app/downloader.py` | URL 视频下载（http(s) 直链 / TikTok 经 TikWM 解析）：SSRF 防护（私网 IP 拒绝、DNS pinning、跳转逐次重校验）、大小/超时上限 | conversation-task |
-| `app/pipeline.py` | 处理流水线编排 + agent 产物白名单校验 | conversation-task |
+| `app/pipeline.py` | 处理流水线编排（抽帧 → [口播] codex 听写/洗稿/翻译 → codex 沙箱选帧写 prompt）+ agent 产物白名单校验 | conversation-task |
+| `app/voice.py` | 口播纯函数：ffmpeg 抽音轨 work/voice.mp3、台词 JSON 白名单校验（不装 ASR 库，听写交 codex） | conversation-task |
 | `app/codex_runner.py` | 沙箱化 `codex exec` 调用（argv、断网、env 清洗、超时、并发信号量） | conversation-task |
 | `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
@@ -35,6 +36,9 @@ flowchart LR
   API -->|流式落盘+校验| FS[data/<cid>/]
   API -->|BackgroundTasks| PL[app/pipeline.py]
   PL -->|--fps 4 全帧+分页联系表| EX[extract_keyframes.py]
+  PL -.->|[口播模式] ffmpeg 抽音轨| VO[work/voice.mp3]
+  PL -.->|[口播模式] 沙箱 prompt| VX[codex 听写+洗稿/翻译]
+  VX -.->|voice_lines.json| FS
   PL -->|拷贝 skill scripts/| FS
   PL -->|沙箱 prompt| CX[codex exec 沙箱<br/>app/codex_runner.py]
   CX -->|keyframes/prompt.txt| FS

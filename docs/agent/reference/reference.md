@@ -97,6 +97,8 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 - `app.auth.require_auth(request, cred)` — FastAPI 依赖，Bearer 校验
 - `app.main.create_app(settings) -> FastAPI` — 应用工厂（测试注入用）；模块级 `app = create_app(get_settings())`
 - `app.storage.new_conversation(data_dir, note, orig_name, client_request_id="") -> dict` — 建目录 + 初始 meta（status=queued）；幂等键非空才落 meta
+- `app.voice.extract_audio(cdir) -> Path | None` — ffmpeg 抽音轨为 work/voice.mp3；无音轨 → None；失败 → PipelineError
+- `app.voice.validate_voice_lines(raw, duration_s) -> list[dict]` — 台词 JSON 白名单校验（text/start_s/end_s 三字段、时间单调且落在时长内）；返回净化列表
 - `app.storage.update_meta(data_dir, cid, **changes) -> dict | None` — 合并写字段并刷新 `updated_at`
 - `app.storage.load_meta(data_dir, cid) -> dict | None` — cid 正则不过/文件缺 → None
 - `app.storage.list_conversations(data_dir) -> list[dict]` — 扫描合法目录，按 `created_at` 倒序
