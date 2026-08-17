@@ -62,6 +62,11 @@ def fake_steps(monkeypatch):
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
             (work / "manifest.json").write_text("{}")
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 1.0, "scenes": [], "segments": []})
+            )
 
     def fake_codex(self, workdir, prompt):
         calls["codex"].append({"workdir": Path(workdir), "prompt": prompt})
@@ -366,6 +371,11 @@ def test_run_codex_failure(tmp_path, video_1s, monkeypatch):
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
             (work / "manifest.json").write_text("{}")
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 1.0, "scenes": [], "segments": []})
+            )
 
     def bad_codex(self, workdir, prompt):
         raise CodexError("codex exit 2: agent crashed")
@@ -387,6 +397,11 @@ def test_run_codex_timeout(tmp_path, video_1s, monkeypatch):
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
             (work / "manifest.json").write_text("{}")
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 1.0, "scenes": [], "segments": []})
+            )
 
     def slow_codex(self, workdir, prompt):
         raise CodexError("codex timed out after 600s")
@@ -409,6 +424,11 @@ def test_run_codex_timeout_salvages_complete_output(tmp_path, video_1s, monkeypa
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
             (work / "manifest.json").write_text("{}")
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 1.0, "scenes": [], "segments": []})
+            )
 
     def slow_codex(self, workdir, prompt):
         _write_valid_package(Path(workdir) / "work")  # 被杀前产物已写完
@@ -432,6 +452,11 @@ def test_run_validation_failure(tmp_path, video_1s, monkeypatch):
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
             (work / "manifest.json").write_text("{}")
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 1.0, "scenes": [], "segments": []})
+            )
 
     def noop_codex(self, workdir, prompt):
         pass  # 一个产物都不写
@@ -453,12 +478,18 @@ VOICE_LINES = [
 
 
 def _fake_extract_ok(argv, *, timeout, step, cwd=None):
-    """extract 假子进程：写 manifest（含 duration_seconds，口播步要读）。"""
-    work = Path(argv[argv.index("--out-dir") + 1])
-    (work / "contact_sheet.jpg").write_bytes(b"sheet")
-    (work / "manifest.json").write_text(
-        json.dumps({"duration_seconds": 1.0}), encoding="utf-8"
-    )
+    """extract/scenes 假子进程：写 manifest（含 duration_seconds，口播步要读）与空拆段 scenes.json。"""
+    if step == "extract":
+        work = Path(argv[argv.index("--out-dir") + 1])
+        (work / "contact_sheet.jpg").write_bytes(b"sheet")
+        (work / "manifest.json").write_text(
+            json.dumps({"duration_seconds": 1.0}), encoding="utf-8"
+        )
+    elif step == "scenes":
+        work = Path(argv[argv.index("--work-dir") + 1])
+        (work / "scenes.json").write_text(
+            json.dumps({"duration_s": 1.0, "scenes": [], "segments": []})
+        )
 
 
 def _set_voice_mode(settings, meta, voice_mode, target_language=""):
@@ -563,6 +594,8 @@ def test_run_voice_translate_prompt_has_target_language(tmp_path, video_1s, monk
     assert m["status"] == "done"
     assert m["voice_lines"] == VOICE_LINES
     assert "翻译成英文" in calls[0]
+    # 目标语言由后端注入 maker prompt（codex 不从台词反推）
+    assert "提示词与台词使用目标语言：英文" in calls[1]
 
 
 def test_run_voice_rewrite_prompt_has_rule_and_lines(tmp_path, video_1s, monkeypatch):

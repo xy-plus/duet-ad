@@ -53,13 +53,15 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 
 ### `GET /api/conversations/{cid}`
 
-- 200 → **冻结的 12 字段契约**（显式键，meta 内部字段不外泄）：
+- 200 → **冻结的 14 字段契约**（显式键，meta 内部字段不外泄）：
 
 | 字段 | 来源 |
 | --- | --- |
 | `id, title, note, status, error, created_at, updated_at` | meta.json |
-| `keyframes` | meta.json（字符串数组，缺省 `[]`） |
-| `prompt` | meta.json（缺省 `null`） |
+| `keyframes` | meta.json（字符串数组，缺省 `[]`；多段模式保持 `[]`） |
+| `prompt` | meta.json（缺省 `null`；多段模式保持 `null`） |
+| `segments` | meta.json（缺省 `[]`；多段模式为各段产物数组，见关键数据形） |
+| `voice_lines` | meta.json（缺省 `[]`；口播模式为全片台词数组） |
 | `has_source` | `source.*` 磁盘探测 |
 | `has_video` | `generated.mp4` 磁盘探测 |
 | `submit_enabled` | `settings.enable_seedance_submit` |
@@ -116,6 +118,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 - `app.storage.resolve_file(data_dir, cid, name) -> Path | None` — files 白名单解析
 - `app.pipeline.run(settings, cid, runner)` — 后台任务入口；任何失败 → `failed`+`error`，不抛
 - `app.pipeline.validate_work_dir(work) -> (list[str], str)` — agent 产物白名单校验，返回 (关键帧名, prompt)
+- `app.pipeline.attribute_lines(lines, segments) -> dict[int, list[dict]]` — 台词按 start_s 落入段 [start_s, end_s) 归段（恰在边界归后段；超出末段终点 ≤0.01s 浮点误差归末段，更远不归段），返回 {index: [台词]}
 - `app.seedream.edit_image(settings, cdir, image, prompt, out, lock, confirm) -> Path` — 编辑门控纯函数：三重门控（开关/confirm/并发锁，confirm 须严格 True）+ dry-run 预检 + 真实提交；失败抛 `SeedreamError(status, detail)`
 - `app.codex_runner.CodexRunner(timeout_s, concurrency)` — `.build_argv(workdir, prompt)` / `.run(workdir, prompt)`；`CodexError` 包装超时/非零/找不到二进制
 - `app.codex_runner.clean_stderr(text, limit=500)` — 剔环境变量行 + 截断（pipeline 的 `_run_cmd` 复用）
@@ -138,7 +141,10 @@ meta.json（`data/<cid>/meta.json`）：
 | `client_request_id` | str | 前端幂等键（仅提交时带才存在；内部字段，查重依据；查重不比对任何提交参数，靠前端换键保证同键同参数） |
 | `voice_mode` | str | `none/keep/rewrite/translate`（恒落，默认 `none`；内部字段） |
 | `target_language` | str | 翻译目标语言（仅 `translate` 且非空时落；内部字段） |
-| `voice_lines` | list[dict] | 口播台词（`voice_mode≠none` 时 ASR 校验后写入；内部字段，不进 detail 响应） |
+| `voice_lines` | list[dict] | 口播台词（`voice_mode≠none` 时 ASR 校验后写入；进 detail 响应 `voice_lines` 字段） |
+| `segments` | list[dict] | 多段模式逐段产物：`index`（1 起）/`start_s`/`end_s`/`keyframes`/`prompt`/`lines`（该段台词 text 列表）；单段模式不写（缺省） |
+| `scenes_note` | str | 场景检测失败或 scenes.json 非法回退单段的留痕（内部字段，仅回退时写） |
+| `voice_lines_dropped` | int | 多段模式下未归段的越界台词数（内部字段，仅 >0 时写） |
 | `has_video` | bool | 提交标记（仅提交后存在；内部字段） |
 | `submitted_at` / `task_id` | str | 提交时间 / Ark 任务 id（内部字段，读不到 task.json 则为 null） |
 
@@ -148,16 +154,18 @@ scenes.json（`work/scenes.json`，`app/scenes.py` 产物）：
 | --- | --- | --- |
 | `duration_s` | float | 视频时长（= manifest.duration_seconds，round 3 位） |
 | `scenes` | list | 场景边界：`index`（1 起）/`start_s`/`end_s`/`frames`（帧按 time_seconds 落入 [start_s, end_s) 分组的文件名） |
-| `segments` | list | 拆段边界建议：`index`/`start_s`/`end_s`，每段 4~15s、覆盖全程无缝隙；`duration_s` ≤ 20 时为空数组（时长 ∈ (15, 20] 超 Seedance 单段上限，T4 接入时注意） |
+| `segments` | list | 拆段边界建议：`index`/`start_s`/`end_s`，每段 4~15s、覆盖全程无缝隙；`duration_s` ≤ 20 时为空数组（时长 ∈ (15, 20] 超 Seedance 单段上限，流水线按单段处理） |
 
 产物白名单校验（`pipeline.validate_work_dir`，任一不过即 PipelineError → `failed`）：
 
 - `work/keyframes/*.png`：数量 ∈ 1..9（新契约该目录只有选定帧 `01.png…N.png`）
 - `work/prompt.txt`：存在、非空、≤ 32KB（`MAX_PROMPT_BYTES`）
 
+多段模式每段目录 `work/segments/N/` 按同规则校验；校验通过后由后端在 `prompt.txt` 开头机械加一行「不要生成背景音乐」（不依赖 codex 写），meta.segments 存的 prompt 含该行。scenes 检测失败（无场景切点/缺 PySceneDetect）或 scenes.json 的 segments 违反结构不变量（4~15s/相邻无缝/覆盖全程）→ 回退单段模式（meta.scenes_note 留痕），不判失败。段 codex 的 cwd 与单段模式一致（会话目录），只按 prompt 指明的段目录读写；scripts/ 与 scenes.json 复用会话目录/ work/ 下的一份，不逐段复制。
+
 ## 依赖
 
 - Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless（skill 脚本用）、scenedetect（场景检测，`app/scenes.py` 用；`>=0.7`——0.6.x 无 FrameTimecode.seconds 属性）、pytest、httpx（TestClient）
 - 外部可执行：ffmpeg/ffprobe（探测+抽帧+测试造样例）、codex CLI（0.147.0 实证基线，仅流水线用）
 - 技能脚本：`skills/video-maker/scripts/extract_keyframes.py`（`--fps`/`--times`/`--sample-count`/`--prefix`/`--columns`/`--out-dir`）、`skills/video-maker/scripts/crop_image.py`（裁字幕/水印）；提交脚本 `app/seedance_task.py`（`create --dry-run|--confirm-submit --wait`，模型默认 `doubao-seedance-2-0-260128`，Ark `https://ark.cn-beijing.volces.com/api/v3`）；场景脚本 `app/scenes.py`（`<video> --work-dir <work>`，PySceneDetect 场景检测 + 拆段建议，写 scenes.json）
-- 流水线固定参数：抽帧 `--fps 4`（分页联系表落 `work/`）；提交建模 `9:16 / 15s / 720p / --generate-audio / --no-watermark`（提交时现构建，无评审 payload）
+- 流水线固定参数：抽帧 `--fps 4`（分页联系表落 `work/`）；scenes 检测超时 300s；拆段切分 `ffmpeg -ss <start> -i <src> -to <len>` 重编码落 `work/segments/N/source.mp4`（切出时长与边界误差 <0.1s）；提交建模 `9:16 / 15s / 720p / --generate-audio / --no-watermark`（提交时现构建，无评审 payload）

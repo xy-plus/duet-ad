@@ -9,7 +9,7 @@ links: [conversation-task]
 
 # 架构现状（How/Now）
 
-单进程 uvicorn（0.0.0.0:3211）跑 FastAPI，同源挂静态前端；上传即建 `data/<cid>/` 目录，后台任务经管道闸跑「4fps 抽帧 → [口播模式] 抽音轨 + codex 听写 → codex 沙箱 → 白名单校验」，状态落 `meta.json`，前端 2s 轮询。无数据库、无队列——文件系统即存储，内存即任务态。
+单进程 uvicorn（0.0.0.0:3211）跑 FastAPI，同源挂静态前端；上传即建 `data/<cid>/` 目录，后台任务经管道闸跑「4fps 抽帧 → [口播模式] 抽音轨 + codex 听写 → 场景检测/拆段 → 单段或多段 codex 沙箱 → 白名单校验」，状态落 `meta.json`，前端 2s 轮询。无数据库、无队列——文件系统即存储，内存即任务态。
 
 ## 模块
 
@@ -20,14 +20,14 @@ links: [conversation-task]
 | `app/auth.py` | Bearer 口令校验（`hmac.compare_digest`） | conversation-task |
 | `app/storage.py` | 会话目录/元数据读写、上传流式落盘、ffprobe 探测、files 白名单解析 | conversation-task |
 | `app/downloader.py` | URL 视频下载（http(s) 直链 / TikTok 经 TikWM 解析）：SSRF 防护（私网 IP 拒绝、DNS pinning、跳转逐次重校验）、大小/超时上限 | conversation-task |
-| `app/pipeline.py` | 处理流水线编排（抽帧 → [口播] codex 听写/洗稿/翻译 → codex 沙箱选帧写 prompt）+ agent 产物白名单校验 | conversation-task |
+| `app/pipeline.py` | 处理流水线编排（抽帧 → [口播] codex 听写/洗稿/翻译 → scenes 检测拆段 → 单段/多段 codex 沙箱选帧写 prompt）+ agent 产物白名单校验 | conversation-task |
 | `app/voice.py` | 口播纯函数：ffmpeg 抽音轨 work/voice.mp3、台词 JSON 白名单校验（不装 ASR 库，听写交 codex） | conversation-task |
 | `app/codex_runner.py` | 沙箱化 `codex exec` 调用（argv、断网、env 清洗、超时、并发信号量） | conversation-task |
 | `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
 | `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：三重门控 + dry-run 预检 + 脱敏（HTTP 路由随 T5b） | conversation-task |
 | `app/seedream_task.py` | Ark Seedream 编辑任务脚本：multipart 提交 `/api/v1/images/edits`、异步轮询、b64/url 双态下载 | conversation-task |
-| `app/scenes.py` | PySceneDetect 场景检测：manifest 帧按场景分组写 scenes.json + 拆段边界建议（>20s 才计算，每段 4~15s 为算法级不变量，末尾防御断言）；流水线接入随 T4 | conversation-task |
+| `app/scenes.py` | PySceneDetect 场景检测：manifest 帧按场景分组写 scenes.json + 拆段边界建议（>20s 才计算，每段 4~15s 为算法级不变量，末尾防御断言）；流水线按 segments 拆段（空则单段模式） | conversation-task |
 | `web/` | 原生 JS 单页前端（登录/会话列表/上传/轮询/结果展示），无构建 | conversation-task |
 | `skills/video-maker/` | codex agent 用的技能：`SKILL.md` + `scripts/extract_keyframes.py`、`scripts/crop_image.py`（与 web/video-maker.zip 逐字节一致） | conversation-task |
 
@@ -42,13 +42,17 @@ flowchart LR
   PL -.->|[口播模式] ffmpeg 抽音轨| VO[work/voice.mp3]
   PL -.->|[口播模式] 沙箱 prompt| VX[codex 听写+洗稿/翻译]
   VX -.->|voice_lines.json| FS
+  PL -->|python app/scenes.py| SC[scenes.py 场景检测]
+  SC -->|scenes.json（segments 拆段建议）| FS
+  PL -->|segments 非空: ffmpeg -ss 切段| SEG[work/segments/N/source.mp4]
+  SEG -->|--fps 4 段内抽帧| EX
   PL -->|拷贝 skill scripts/| FS
-  PL -->|沙箱 prompt| CX[codex exec 沙箱<br/>app/codex_runner.py]
-  CX -->|keyframes/prompt.txt| FS
+  PL -->|沙箱 prompt（单段或多段）| CX[codex exec 沙箱<br/>app/codex_runner.py]
+  CX -->|keyframes/prompt.txt（段目录或 work/）| FS
   PL -->|白名单校验| FS
-  PL -->|status/keyframes/prompt/voice_lines| META[meta.json]
+  PL -->|status/keyframes/prompt/segments/voice_lines| META[meta.json]
   U -->|2s 轮询 GET detail| API
-  API -->|12 字段| U
+  API -->|14 字段| U
   U -.->|submit 预留| SD[app/seedance.py<br/>三重门控+dry-run 预检]
   SD -.->|app/seedance_task.py --confirm-submit| ARK[Volcengine Ark]
 ```
@@ -59,7 +63,7 @@ flowchart LR
 
 - `queued`：创建即得（`storage.new_conversation`）；拿不到管道闸的会话一直保持 queued（真排队）。
 - `processing`：`pipeline.run` 第一步置位——后台任务先经管道闸（`threading.Semaphore(codex_concurrency)`，默认 10，抽帧 + codex 全在闸内），拿到才进 pipeline（真处理）。
-- `done`：产物校验过，写入 `keyframes`/`prompt`。
+- `done`：产物校验过，单段模式写顶层 `keyframes`/`prompt`；多段模式写 `segments`（各段 keyframes/prompt/台词，顶层 `keyframes`/`prompt` 保持空值）。
 - `failed`：任一步异常，写 `error`（截断 ≤500 字）；不抛回 HTTP 层。
 - 终态后另有提交标记：`mark_submitted` 写 `has_video/submitted_at/task_id`（meta 内部字段，不进 API 响应）。
 - queued 上限 `MAX_QUEUED`（默认 100）：创建时在同一把锁内数 queued 会话，超额 429 `too many queued tasks`；processing 由闸保证 ≤ 并发数，无需单独计数。
@@ -72,16 +76,26 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 ├── meta.json                   会话元数据（见 reference 关键数据形）
 ├── source.<mp4|mov|webm>       原始上传（流式落盘）
 ├── generated.mp4               真实提交成功后下载的成片（仅 submit 开启后）
-├── codex_last_message.txt      codex -o 落盘的最终消息
-├── scripts/                    pipeline 拷入的 skill 脚本（crop_image.py 按相对路径引用）
+├── codex_last_message.txt      codex -o 落盘的最终消息（多段模式各段共用同一路径，后写覆盖）
+├── scripts/                    pipeline 拷入的 skill 脚本（单/多段模式共用；crop_image.py 按相对路径引用）
 └── work/
     ├── NN_frame_*.png          按每秒 4 帧抽取的全部帧（pipeline 预生成）
     ├── contact_sheet(_NN).jpg  分页联系表（>24 帧时 contact_sheet_01.jpg… 分页）
     ├── manifest.json           视频元数据 + 全部帧时间戳
+    ├── scenes.json             scenes.py 场景检测产物（场景分组 + 拆段边界建议）
     ├── voice.mp3               口播模式抽出的音轨（16kHz 单声道）
     ├── voice_lines.json        口播模式 codex 听写的台词（白名单校验后采信）
-    ├── keyframes/              01.png…N.png（1..9 张选定帧，白名单校验后采信）
-    ├── prompt.txt              agent 写的 prompt（非空、≤32KB）
+    ├── keyframes/              01.png…N.png（1..9 张选定帧，白名单校验后采信；单段模式）
+    ├── prompt.txt              agent 写的 prompt（非空、≤32KB；单段模式）
+    ├── segments/               多段模式：每段一目录（N 从 1 起，与 segments index 对应）
+    │   └── N/
+    │       ├── source.mp4      按段边界切出的源视频（ffmpeg -ss 重编码，时长误差 <0.1s）
+    │       ├── NN_frame_*.png  该段 4fps 抽帧
+    │       ├── contact_sheet(_NN).jpg / manifest.json   该段分页联系表 / 段元数据
+    │       ├── voice_lines.json  该段台词（按 start_s 归段；口播模式下每段都有，空数组 = 无台词）
+    │       └── keyframes/、prompt.txt   该段产物（prompt 首行为后端加的「不要生成背景音乐」）
+    │   （scenes.json 不逐段复制，全片一份在 work/；scripts/ 与 codex_last_message.txt
+    │    复用会话目录一份——段 codex 的 cwd 与单段模式一致）
     ├── recheck_payload.json    提交预检的瞬时产物（用完即删）
     └── task.json               提交后脚本自写的任务状态（task_id 来源）
 ```
