@@ -132,7 +132,7 @@ meta.json（`data/<cid>/meta.json`）：
 | `created_at` / `updated_at` | str | ISO8601 UTC |
 | `keyframes` | list[str] | 关键帧文件名（done 后写入） |
 | `prompt` | str \| null | Seedance prompt（done 后写入） |
-| `client_request_id` | str | 前端幂等键（仅提交时带才存在；内部字段，查重依据；不比对 voice 参数，靠前端换键保证同键同参数） |
+| `client_request_id` | str | 前端幂等键（仅提交时带才存在；内部字段，查重依据；查重不比对任何提交参数，靠前端换键保证同键同参数） |
 | `voice_mode` | str | `none/keep/rewrite/translate`（恒落，默认 `none`；内部字段） |
 | `target_language` | str | 翻译目标语言（仅 `translate` 且非空时落；内部字段） |
 | `has_video` | bool | 提交标记（仅提交后存在；内部字段） |
