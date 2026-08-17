@@ -10,8 +10,7 @@
 
 <!-- 开工登记、集成即删；重开任务记重开链：继承未解 blockers 与已用轮次 -->
 
-- T3 场景划分（feature/t3-scenes）：现状=帧无场景结构；出路=app/scenes.py（PySceneDetect 检测→帧分组 scenes.json→拆段边界建议）+scenedetect 依赖+单测。（→ app/scenes.py）
-- T4 拆段流水线+句子归属（待开工，依赖 T3）：>20s 按场景拆 4~15s 段→每段独立走现有流程→prompt 前缀"不要生成背景音乐"→SKILL.md 分段模式+口播骨架。（→ app/pipeline.py, skills/video-maker/）
+- T4 拆段流水线+句子归属（feature/t4-segments）：>20s 按 scenes.json 拆 4~15s 段（ffmpeg）→每段独立走现有流程（段并发）→prompt 前缀"不要生成背景音乐"（后端机械加）→句子按开始时间归属各段→SKILL.md 分段模式+口播骨架→detail 契约 12→14 字段（segments/voice_lines）。（→ app/pipeline.py, skills/video-maker/）；scenedetect 版本 nits（锁 <0.8 上限、.seconds 解析 try 外防御）记待办收尾。
 - T5 Seedream 后处理（feature/t5-seedream 后端部分 T5a 已实现；T5b=HTTP 路由+前端按钮/弹窗/前后对比+含人脸规则+seedance 优先优化图，依赖 T4）：seedream 5.0 Pro 编辑+轮询通路。（→ app/seedream.py, web/）；T5b 接线待办（审查共识）：_sanitize 等提取公共模块、multipart 文件名用固定名、双态兼容首次实测后删死分支、README/architecture 补 seedream 模块枚举。
 
 ## 📌 待办与限制
