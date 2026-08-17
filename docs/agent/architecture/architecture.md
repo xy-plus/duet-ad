@@ -83,8 +83,8 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 ├── meta.json                   会话元数据（见 reference 关键数据形）
 ├── source.<mp4|mov|webm>       原始上传（流式落盘）
 ├── generated.mp4               真实提交成功后下载的成片（仅 submit 开启后）
-├── codex_last_message.txt      codex -o 落盘的最终消息（多段模式各段共用同一路径，后写覆盖）
-├── scripts/                    pipeline 拷入的 skill 脚本（单/多段模式共用；crop_image.py 按相对路径引用）
+├── codex_last_message.txt      codex -o 落盘的最终消息（单段模式；多段模式落各段目录，随 -C 段目录各自独立）
+├── scripts/                    pipeline 拷入的 skill 脚本（单段模式；多段模式拷入各段目录；crop_image.py 按相对路径引用）
 └── work/
     ├── NN_frame_*.png          按每秒 4 帧抽取的全部帧（pipeline 预生成）
     ├── contact_sheet(_NN).jpg  分页联系表（>24 帧时 contact_sheet_01.jpg… 分页）
@@ -102,9 +102,10 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
     │       ├── contact_sheet(_NN).jpg / manifest.json   该段分页联系表 / 段元数据
     │       ├── voice_lines.json  该段台词（按 start_s 归段；口播模式下每段都有，空数组 = 无台词）
     │       ├── postprocessed/  T5b 后处理优化图（该段 keyframes/ 同名对应；多段模式）
+    │       ├── scripts/       pipeline 拷入的 skill 脚本（每段一份；crop_image.py 按相对路径引用）
+    │       ├── codex_last_message.txt   codex -o 落盘的最终消息（每段独立）
     │       └── keyframes/、prompt.txt   该段产物（prompt 首行为后端加的「不要生成背景音乐」）
-    │   （scenes.json 不逐段复制，全片一份在 work/；scripts/ 与 codex_last_message.txt
-    │    复用会话目录一份——段 codex 的 cwd 与单段模式一致）
+    │   （scenes.json 不拷入段目录，全片一份在 work/——段 codex 的 cwd 即段目录，物理隔离）
     ├── recheck_payload.json    提交预检的瞬时产物（用完即删）
     └── task.json               提交后脚本自写的任务状态（task_id 来源）
 ```
@@ -126,12 +127,12 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 | argv 项 | 作用 |
 | --- | --- |
 | `codex exec` | 非交互执行，prompt 作位置参数 |
-| `-C <data/<cid>>` | 工作区限定在该会话目录 |
+| `-C <workdir>` | 工作区限定在 codex 工作目录（单段=会话目录；多段=段目录，物理隔离） |
 | `-s workspace-write` | 沙箱可写工作区、其余只读 |
 | `--skip-git-repo-check` | data/ 非 git 仓库，跳过检查 |
 | `--ephemeral` | 不持久化会话 |
 | `--color never` | 输出无 ANSI，便于 stderr 清洗 |
-| `-o <workdir>/codex_last_message.txt` | agent 最终消息落盘 |
+| `-o <workdir>/codex_last_message.txt` | agent 最终消息落盘（多段模式随 -C 段目录各自独立，消除共享写冲突） |
 | `-c sandbox_workspace_write.network_access=false` | agent shell 断网（实证 curl 不通） |
 | `-c shell_environment_policy.inherit="core"` | 只继承核心环境（`inherit="none"` 实证会让沙箱启动器找不到 bwrap，不可用） |
 | `-c shell_environment_policy.exclude=["*KEY*","*TOKEN*","*SECRET*","*PASSWORD*"]` | 配置级剔除秘密变量（兜底） |
@@ -141,7 +142,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 - **宿主进程级（必需）**：调起 codex 前 `_scrubbed_env()` 剔除名字匹配 `KEY|TOKEN|SECRET|PASSWORD`（忽略大小写）的环境变量，PATH/HOME/代理保留。原因：codex 0.147.0 的 shell 命令经 code-mode-host 执行，`shell_environment_policy` 的 inherit/exclude **拦不住**宿主秘密泄进 agent shell，必须在本进程侧清洗。
 - **codex 配置级（兜底）**：上表后两条 `-c`。
 - **推论（有意设计）**：env 清洗会杀掉 `OPENAI_API_KEY`/`CODEX_API_KEY` 类 env 认证，codex 只支持 CODEX_HOME 文件认证（HOME 保留，`~/.codex/auth.json` 可达）。
-- prompt 同时硬性禁令：只在会话目录写文件、禁止联网、禁止打印/读取任何环境变量。
+- prompt 同时硬性禁令：只在工作目录写文件、禁止联网、禁止打印/读取任何环境变量。
 
 ## 配置
 

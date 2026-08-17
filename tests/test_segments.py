@@ -3,7 +3,6 @@
 import base64
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -227,8 +226,8 @@ def test_run_single_segment_no_prefix_and_no_segments_key(tmp_path, monkeypatch)
 
 
 def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
-    """分段 codex 调用：cwd=会话目录（与单段一致）；prompt 含 SKILL.md、分段模式、
-    work/segments/N/、全片 scenes.json、该段台词与硬性禁令。"""
+    """分段 codex 调用：cwd=段目录（物理隔离）；prompt 与单段同构——含 SKILL.md、
+    工作目录即本段输入目录、该段台词与硬性禁令，不含「分段模式」/ scenes.json / work/ 路径。"""
     settings = make_settings(tmp_path)
     meta = _make_segment_conversation(settings, SEGMENTS)
     cid = meta["id"]
@@ -236,10 +235,8 @@ def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
     calls = {"cmd": [], "codex": []}
 
     def fake_codex(self, workdir, prompt):
-        m = re.search(r"work/segments/(\d+)/", prompt)
-        assert m, "segment index missing from prompt"
         calls["codex"].append({"workdir": Path(workdir), "prompt": prompt})
-        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+        _write_valid_package(Path(workdir))
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
     monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
@@ -249,29 +246,30 @@ def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "done", m["error"]
     assert len(calls["codex"]) == 3
-    assert {c["workdir"] for c in calls["codex"]} == {cdir}  # 与单段模式同一 cwd
-    by_index = {
-        re.search(r"work/segments/(\d+)/", c["prompt"]).group(1): c
-        for c in calls["codex"]
-    }
+    assert {c["workdir"] for c in calls["codex"]} == {
+        cdir / "work" / "segments" / str(n) for n in (1, 2, 3)
+    }  # cwd = 段目录，看不到段外
+    by_index = {c["workdir"].name: c for c in calls["codex"]}
     prompt = by_index["2"]["prompt"]
     for needle in (
         str(pipeline.SKILL_MD),
-        "分段模式",
-        "work/segments/2/",
-        "work/scenes.json",
+        "工作目录即本段输入目录",
         "voice_lines.json",
         sys.executable,
+        str((cdir / "work" / "segments" / "2").resolve()),  # 硬性禁令限定的写目录 = 段目录
         "禁止联网",
         "环境变量",
     ):
         assert needle in prompt, needle
+    for banned in ("分段模式", "scenes.json"):
+        assert banned not in prompt
     assert "voice.mp3" not in prompt
-    # scripts 只拷一份到会话目录；段目录不复制 scripts/scenes.json；无口播不写段台词文件
-    assert (cdir / "scripts" / "crop_image.py").is_file()
+    # scripts 拷入每段目录；段目录不拷 scenes.json；无口播不写段台词文件
+    for n in (1, 2, 3):
+        segdir = cdir / "work" / "segments" / str(n)
+        assert (segdir / "scripts" / "crop_image.py").is_file()
+        assert not (segdir / "scenes.json").exists()
     segdir = cdir / "work" / "segments" / "2"
-    assert not (segdir / "scripts").exists()
-    assert not (segdir / "scenes.json").exists()
     assert not (segdir / "voice_lines.json").exists()
 
 
@@ -283,10 +281,9 @@ def test_run_segment_failure_marks_overall_failed(tmp_path, monkeypatch):
     calls = {"cmd": []}
 
     def fake_codex(self, workdir, prompt):
-        if "work/segments/2/" in prompt:
+        if Path(workdir).name == "2":
             raise CodexError("codex exit 3: segment crashed")
-        m = re.search(r"work/segments/(\d+)/", prompt)
-        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+        _write_valid_package(Path(workdir))
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
     monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
@@ -312,8 +309,7 @@ def test_run_segments_voice_lines_written_per_segment_including_empty(tmp_path, 
     calls = {"cmd": []}
 
     def fake_codex(self, workdir, prompt):
-        m = re.search(r"work/segments/(\d+)/", prompt)
-        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+        _write_valid_package(Path(workdir))
 
     monkeypatch.setattr(pipeline, "_voice_step", fake_voice_step)
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
@@ -341,12 +337,11 @@ def test_run_segments_processed_concurrently(tmp_path, monkeypatch):
 
     def fake_codex(self, workdir, prompt):
         nonlocal active, max_active
-        m = re.search(r"work/segments/(\d+)/", prompt)
         with lock:
             active += 1
             max_active = max(max_active, active)
         time.sleep(0.3)
-        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+        _write_valid_package(Path(workdir))
         with lock:
             active -= 1
 
@@ -435,8 +430,7 @@ def test_run_translate_target_language_in_segment_prompt(tmp_path, monkeypatch):
 
     def fake_codex(self, workdir, prompt):
         calls["codex"].append({"workdir": Path(workdir), "prompt": prompt})
-        m = re.search(r"work/segments/(\d+)/", prompt)
-        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+        _write_valid_package(Path(workdir))
 
     monkeypatch.setattr(pipeline, "_voice_step", fake_voice_step)
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
@@ -467,8 +461,7 @@ def test_run_voice_lines_dropped_recorded(tmp_path, monkeypatch):
     calls = {"cmd": []}
 
     def fake_codex(self, workdir, prompt):
-        m = re.search(r"work/segments/(\d+)/", prompt)
-        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+        _write_valid_package(Path(workdir))
 
     monkeypatch.setattr(pipeline, "_voice_step", fake_voice_step)
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
@@ -498,8 +491,7 @@ def test_run_segment_workers_capped_at_half_codex_concurrency(tmp_path, monkeypa
             active += 1
             max_active = max(max_active, active)
         time.sleep(0.3)
-        m = re.search(r"work/segments/(\d+)/", prompt)
-        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+        _write_valid_package(Path(workdir))
         with lock:
             active -= 1
 
@@ -565,13 +557,13 @@ def _make_scene_video_24s(path: Path) -> Path:
 
 
 def _write_stub_codex_segments(bin_dir: Path, frames: int = 3) -> Path:
-    """桩 codex 兼处理两种调用：ASR 写 3 句台词；分段调用按 prompt 里的段号写 work/segments/N/ 产物。"""
+    """桩 codex 兼处理两种调用：ASR 写 3 句台词；分段调用 cwd 即段目录，产物直接写工作目录。"""
     stub = bin_dir / "codex"
     stub.write_text(
         f"#!{sys.executable}\n"
         + textwrap.dedent(
             f"""\
-            import json, re, shutil, sys
+            import json, shutil, sys
             from pathlib import Path
 
             argv = sys.argv[1:]
@@ -589,16 +581,14 @@ def _write_stub_codex_segments(bin_dir: Path, frames: int = 3) -> Path:
                 )
                 out.write_text("asr done", encoding="utf-8")
                 raise SystemExit(0)
-            m = re.search(r"work/segments/(\\d+)/", prompt)
-            assert m, "segment index missing from prompt"
-            segdir = workdir / "work" / "segments" / m.group(1)
-            kdir = segdir / "keyframes"
+            # 分段调用：cwd 即段目录（含该段帧），产物写当前工作目录
+            kdir = workdir / "keyframes"
             kdir.mkdir(exist_ok=True)
-            frames = sorted(segdir.glob("*_frame_*.png"))[:{frames}]
+            frames = sorted(workdir.glob("*_frame_*.png"))[:{frames}]
             assert frames, "no extracted frames in segment dir"
             for i, src in enumerate(frames, start=1):
                 shutil.copy(src, kdir / f"{{i:02d}}.png")
-            (segdir / "prompt.txt").write_text("分段桩产物", encoding="utf-8")
+            (workdir / "prompt.txt").write_text("分段桩产物", encoding="utf-8")
             out.write_text("stub done", encoding="utf-8")
             """
         ),
@@ -651,6 +641,8 @@ def test_run_multi_segment_full_pipeline(tmp_path, monkeypatch):
         duration = pipeline._probe_duration(segdir / "source.mp4")
         assert abs(duration - 8.0) < pipeline.CUT_DURATION_TOLERANCE_S  # 切段时长准确
     assert not (cdir / "work" / "keyframes").exists()  # 多段模式不产出顶层 keyframes
-    assert (cdir / "scripts" / "crop_image.py").is_file()  # scripts 拷进会话目录（一份）
     assert (cdir / "work" / "scenes.json").is_file()  # 全片场景清单留在 work/
-    assert not (cdir / "work" / "segments" / "2" / "scenes.json").exists()
+    for n in (1, 2, 3):
+        segdir = cdir / "work" / "segments" / str(n)
+        assert (segdir / "scripts" / "crop_image.py").is_file()  # scripts 逐段拷入
+        assert not (segdir / "scenes.json").exists()  # scenes.json 不拷入段目录
