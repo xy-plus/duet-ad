@@ -3,7 +3,7 @@ name: backend-api
 type: reference
 status: done
 owner: agent
-updated: 2026-08-17
+updated: 2026-08-18
 links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/pipeline.py, app/codex_runner.py, app/seedance.py, app/seedance_task.py]
 ---
 
@@ -45,7 +45,9 @@ links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/p
 1. 扩展名 ∈ `{.mp4, .mov, .webm}`（小写化），否则 `unsupported extension: <ext>`
 2. 流式落盘（1MB 块），累计超 `MAX_UPLOAD_MB*1024*1024` → `file exceeds <n> bytes`，已写部分删除
 3. ffprobe 实探（30s 超时）：打不开 → `ffprobe failed: ...` / `unreadable video file`；时长解析失败 → `cannot parse video duration`；时长超 `MAX_DURATION_S` → `duration <d>s exceeds <n>s`
-4. `voice_mode != none` 时音轨探测（`ffprobe -select_streams a`，30s 超时）：无音轨 → 422 `no audio track in video` + 回滚；`voice_mode`/`target_language`（仅 translate）落 meta 内部字段，不进 detail 响应
+4. `voice_mode != none` 时音轨探测（`ffprobe -select_streams a`，30s 超时）：无音轨 → 422 `no audio track in video` + 回滚；探测故障 → `ffprobe failed: ...` / `unreadable video file` / `cannot parse audio probe result` + 回滚
+
+注：`voice_mode`/`target_language`（仅 translate）在建目录时（`new_conversation`，早于本校验链）即落 meta 内部字段，不进 detail 响应；校验失败回滚删除整个会话目录
 
 URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）：TikTok 视频页先经 TikWM API 解析出 play 直链；下载带 SSRF 防护（见架构安全模型），任一步失败（含解析到私网、HTTP 非 2xx、超限/超时/空文件、连接/读取异常归一）抛 `DownloadError` → 422 + 回滚；落盘 `source.<ext>`（后缀取 URL path，白名单外默认 `.mp4`）后与文件分支汇合同一 `probe_video`
 
@@ -130,7 +132,9 @@ meta.json（`data/<cid>/meta.json`）：
 | `created_at` / `updated_at` | str | ISO8601 UTC |
 | `keyframes` | list[str] | 关键帧文件名（done 后写入） |
 | `prompt` | str \| null | Seedance prompt（done 后写入） |
-| `client_request_id` | str | 前端幂等键（仅提交时带才存在；内部字段，查重依据） |
+| `client_request_id` | str | 前端幂等键（仅提交时带才存在；内部字段，查重依据；不比对 voice 参数，靠前端换键保证同键同参数） |
+| `voice_mode` | str | `none/keep/rewrite/translate`（恒落，默认 `none`；内部字段） |
+| `target_language` | str | 翻译目标语言（仅 `translate` 且非空时落；内部字段） |
 | `has_video` | bool | 提交标记（仅提交后存在；内部字段） |
 | `submitted_at` / `task_id` | str | 提交时间 / Ark 任务 id（内部字段，读不到 task.json 则为 null） |
 

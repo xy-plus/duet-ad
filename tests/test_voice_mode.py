@@ -94,6 +94,14 @@ def test_voice_mode_keep_with_audio_ok(client, video_with_audio, settings):
     assert "target_language" not in meta
 
 
+def test_voice_mode_keep_drops_target_language(client, video_with_audio, settings):
+    """非 translate 模式显式带 target_language → 201 且被丢弃。"""
+    r = _post(client, video_with_audio,
+              {"voice_mode": "keep", "target_language": "日语"})
+    assert r.status_code == 201
+    assert "target_language" not in _meta(settings, r.json()["id"])
+
+
 def test_voice_mode_rewrite_with_audio_ok(client, video_with_audio, settings):
     r = _post(client, video_with_audio, {"voice_mode": "rewrite"})
     assert r.status_code == 201

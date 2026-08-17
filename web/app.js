@@ -810,6 +810,7 @@ async function handleSend(event) {
     noneRadio.checked = true;
     $("lang-input").value = "";
     $("lang-input").hidden = true;
+    $("lang-input").required = false;
     setUploading(false);
     await refreshList(false);
     if (created && created.id) {
