@@ -9,6 +9,8 @@ class Settings:
     max_upload_mb: int = 500
     max_duration_s: int = 300
     enable_seedance_submit: bool = False
+    enable_seedream_edit: bool = False
+    seedream_model: str = "doubao-seedream-5-0-pro-260628"
     data_dir: Path = Path("data")
     codex_timeout_s: int = 1800
     codex_concurrency: int = 10
@@ -30,6 +32,8 @@ def get_settings() -> Settings:
         max_upload_mb=int(os.environ.get("MAX_UPLOAD_MB", "500")),
         max_duration_s=int(os.environ.get("MAX_DURATION_S", "300")),
         enable_seedance_submit=os.environ.get("ENABLE_SEEDANCE_SUBMIT", "").lower() in ("1", "true", "yes"),
+        enable_seedream_edit=os.environ.get("ENABLE_SEEDREAM_EDIT", "").lower() in ("1", "true", "yes"),
+        seedream_model=os.environ.get("SEEDREAM_MODEL", "doubao-seedream-5-0-pro-260628"),
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),

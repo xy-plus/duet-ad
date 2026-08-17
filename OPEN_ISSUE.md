@@ -32,3 +32,4 @@
 - 审查 nits（T1，不阻塞）：web/styles.css 语音选项与来源选项约 14 行逐字重复可合并选择器；index.html 的 voice-row role=radiogroup 内含 lang-input 文本输入（a11y 语义偏差）；target_language 无长度上限（与 note 同桶）；幂等查重不比对 voice 参数（前端换键规避，reference 已注明语义）。（→ web/, app/main.py）
 - voice_lines 已落 meta 但暂无消费方（detail 响应/前端未透出）：透出留给后续任务，期间纯 meta 内部字段。（→ app/pipeline.py）
 - validate_voice_lines 时间下界容差放宽到 -0.01s（_EPS_S 浮点误差允许）：审查裁决设计合理，不改。（→ app/voice.py）
+- Seedream nits（编排裁决留待后续）：_sanitize 等公共逻辑在 seedance/seedream 各有一份副本，T5b 出现第三份前提取公共模块；seedream_task multipart filename 未做引号转义（T5b 接线时必须用固定文件名）；seedream_task 双态兼容（同步带图/异步轮询）为猜测路径，首次真实调用后删死分支。（→ app/seedream.py, app/seedream_task.py）
