@@ -31,3 +31,5 @@
 - 闸等待占线程池线程：管道闸阻塞的是 anyio 线程（默认 40），极端排队场景会拖慢 URL 下载/静态文件；正确性不受影响，量大再改异步闸。（→ app/main.py run_pipeline_gated）
 - 审查 nits 汇总（R1/R2，不阻塞）：/api/login 无限流；_RateLimiter IP 条目只增不删、反代后共享一桶；save_upload async 内同步写盘；note 无长度上限；submit_locks 字典常驻内存；503 排在 dry-run 复核后；_SECRET_KEY_MARKERS 与 env 清洗口径不齐；_render_preview glob 不过滤前缀；has_video 磁盘探测与 meta 标记双源；URL 上传且无 note 时标题取整串 URL；限流先于幂等查重（重试消耗限流额度，有意外先撞 429）；幂等命中时首请求未落盘完成则随后 422 回滚会让重试方短暂 404。
 - 审查 nits（T1，不阻塞）：web/styles.css 语音选项与来源选项约 14 行逐字重复可合并选择器；index.html 的 voice-row role=radiogroup 内含 lang-input 文本输入（a11y 语义偏差）；target_language 无长度上限（与 note 同桶）；幂等查重不比对 voice 参数（前端换键规避，reference 已注明语义）。（→ web/, app/main.py）
+- voice_lines 已落 meta 但暂无消费方（detail 响应/前端未透出）：透出留给后续任务，期间纯 meta 内部字段。（→ app/pipeline.py）
+- validate_voice_lines 时间下界容差放宽到 -0.01s（_EPS_S 浮点误差允许）：审查裁决设计合理，不改。（→ app/voice.py）

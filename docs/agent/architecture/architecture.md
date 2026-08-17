@@ -9,7 +9,7 @@ links: [conversation-task]
 
 # 架构现状（How/Now）
 
-单进程 uvicorn（0.0.0.0:3211）跑 FastAPI，同源挂静态前端；上传即建 `data/<cid>/` 目录，后台任务经管道闸跑「4fps 抽帧 → codex 沙箱 → 白名单校验」，状态落 `meta.json`，前端 2s 轮询。无数据库、无队列——文件系统即存储，内存即任务态。
+单进程 uvicorn（0.0.0.0:3211）跑 FastAPI，同源挂静态前端；上传即建 `data/<cid>/` 目录，后台任务经管道闸跑「4fps 抽帧 → [口播模式] 抽音轨 + codex 听写 → codex 沙箱 → 白名单校验」，状态落 `meta.json`，前端 2s 轮询。无数据库、无队列——文件系统即存储，内存即任务态。
 
 ## 模块
 
@@ -20,7 +20,8 @@ links: [conversation-task]
 | `app/auth.py` | Bearer 口令校验（`hmac.compare_digest`） | conversation-task |
 | `app/storage.py` | 会话目录/元数据读写、上传流式落盘、ffprobe 探测、files 白名单解析 | conversation-task |
 | `app/downloader.py` | URL 视频下载（http(s) 直链 / TikTok 经 TikWM 解析）：SSRF 防护（私网 IP 拒绝、DNS pinning、跳转逐次重校验）、大小/超时上限 | conversation-task |
-| `app/pipeline.py` | 处理流水线编排 + agent 产物白名单校验 | conversation-task |
+| `app/pipeline.py` | 处理流水线编排（抽帧 → [口播] codex 听写/洗稿/翻译 → codex 沙箱选帧写 prompt）+ agent 产物白名单校验 | conversation-task |
+| `app/voice.py` | 口播纯函数：ffmpeg 抽音轨 work/voice.mp3、台词 JSON 白名单校验（不装 ASR 库，听写交 codex） | conversation-task |
 | `app/codex_runner.py` | 沙箱化 `codex exec` 调用（argv、断网、env 清洗、超时、并发信号量） | conversation-task |
 | `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
@@ -35,11 +36,14 @@ flowchart LR
   API -->|流式落盘+校验| FS[data/<cid>/]
   API -->|BackgroundTasks| PL[app/pipeline.py]
   PL -->|--fps 4 全帧+分页联系表| EX[extract_keyframes.py]
+  PL -.->|[口播模式] ffmpeg 抽音轨| VO[work/voice.mp3]
+  PL -.->|[口播模式] 沙箱 prompt| VX[codex 听写+洗稿/翻译]
+  VX -.->|voice_lines.json| FS
   PL -->|拷贝 skill scripts/| FS
   PL -->|沙箱 prompt| CX[codex exec 沙箱<br/>app/codex_runner.py]
   CX -->|keyframes/prompt.txt| FS
   PL -->|白名单校验| FS
-  PL -->|status/keyframes/prompt| META[meta.json]
+  PL -->|status/keyframes/prompt/voice_lines| META[meta.json]
   U -->|2s 轮询 GET detail| API
   API -->|12 字段| U
   U -.->|submit 预留| SD[app/seedance.py<br/>三重门控+dry-run 预检]
@@ -71,6 +75,8 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
     ├── NN_frame_*.png          按每秒 4 帧抽取的全部帧（pipeline 预生成）
     ├── contact_sheet(_NN).jpg  分页联系表（>24 帧时 contact_sheet_01.jpg… 分页）
     ├── manifest.json           视频元数据 + 全部帧时间戳
+    ├── voice.mp3               口播模式抽出的音轨（16kHz 单声道）
+    ├── voice_lines.json        口播模式 codex 听写的台词（白名单校验后采信）
     ├── keyframes/              01.png…N.png（1..9 张选定帧，白名单校验后采信）
     ├── prompt.txt              agent 写的 prompt（非空、≤32KB）
     ├── recheck_payload.json    提交预检的瞬时产物（用完即删）
@@ -124,7 +130,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 | `DOWNLOAD_TIMEOUT_S` | `120` | `reference_url` 下载与 TikWM 解析的整体超时；下载大小上限复用 `MAX_UPLOAD_MB` |
 | `ENABLE_SEEDANCE_SUBMIT` | 关 | `1/true/yes` 开启真实提交（否则 501） |
 | `DATA_DIR` | `data` | 会话数据根目录 |
-| `CODEX_TIMEOUT_S` | `600` | codex 硬超时 |
+| `CODEX_TIMEOUT_S` | `1800` | codex 硬超时 |
 | `CODEX_CONCURRENCY` | `10` | 管道闸（同时处理的会话数，含抽帧 + codex）；CodexRunner 内部信号量同值兜底 |
 | `MAX_QUEUED` | `100` | queued 状态会话数上限，超过即 429 `too many queued tasks` |
 | `ENABLE_PIPELINE` | 生产默认 `1` | 关掉则上传后不跑流水线（停 `queued`） |
