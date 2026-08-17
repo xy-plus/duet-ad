@@ -24,6 +24,8 @@ links: [conversation-task]
 | `app/codex_runner.py` | 沙箱化 `codex exec` 调用（argv、断网、env 清洗、超时、并发信号量） | conversation-task |
 | `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
+| `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：三重门控 + dry-run 预检 + 脱敏（HTTP 路由随 T5b） | conversation-task |
+| `app/seedream_task.py` | Ark Seedream 编辑任务脚本：multipart 提交 `/api/v1/images/edits`、异步轮询、b64/url 双态下载 | conversation-task |
 | `web/` | 原生 JS 单页前端（登录/会话列表/上传/轮询/结果展示），无构建 | conversation-task |
 | `skills/video-maker/` | codex agent 用的技能：`SKILL.md` + `scripts/extract_keyframes.py`、`scripts/crop_image.py`（与 web/video-maker.zip 逐字节一致） | conversation-task |
 
@@ -123,6 +125,8 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 | `TIKTOK_PROXY` | 空 | TikTok 解析/下载走的 HTTP 代理（空 = 直连；仅 TikTok 分支用） |
 | `DOWNLOAD_TIMEOUT_S` | `120` | `reference_url` 下载与 TikWM 解析的整体超时；下载大小上限复用 `MAX_UPLOAD_MB` |
 | `ENABLE_SEEDANCE_SUBMIT` | 关 | `1/true/yes` 开启真实提交（否则 501） |
+| `ENABLE_SEEDREAM_EDIT` | 关 | `1/true/yes` 开启 Seedream 图像编辑（否则 501） |
+| `SEEDREAM_MODEL` | `doubao-seedream-5-0-pro-260628` | Seedream 编辑模型（5.0 Pro，非 Lite） |
 | `DATA_DIR` | `data` | 会话数据根目录 |
 | `CODEX_TIMEOUT_S` | `600` | codex 硬超时 |
 | `CODEX_CONCURRENCY` | `10` | 管道闸（同时处理的会话数，含抽帧 + codex）；CodexRunner 内部信号量同值兜底 |
