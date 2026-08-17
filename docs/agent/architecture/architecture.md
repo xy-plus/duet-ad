@@ -76,8 +76,8 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 ├── meta.json                   会话元数据（见 reference 关键数据形）
 ├── source.<mp4|mov|webm>       原始上传（流式落盘）
 ├── generated.mp4               真实提交成功后下载的成片（仅 submit 开启后）
-├── codex_last_message.txt      codex -o 落盘的最终消息
-├── scripts/                    pipeline 拷入的 skill 脚本（crop_image.py 按相对路径引用）
+├── codex_last_message.txt      codex -o 落盘的最终消息（多段模式各段共用同一路径，后写覆盖）
+├── scripts/                    pipeline 拷入的 skill 脚本（单/多段模式共用；crop_image.py 按相对路径引用）
 └── work/
     ├── NN_frame_*.png          按每秒 4 帧抽取的全部帧（pipeline 预生成）
     ├── contact_sheet(_NN).jpg  分页联系表（>24 帧时 contact_sheet_01.jpg… 分页）
@@ -91,12 +91,11 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
     │   └── N/
     │       ├── source.mp4      按段边界切出的源视频（ffmpeg -ss 重编码，时长误差 <0.1s）
     │       ├── NN_frame_*.png  该段 4fps 抽帧
-    │       ├── contact_sheet.jpg / manifest.json   该段联系表 / 段元数据
-    │       ├── scenes.json     全片场景清单副本
-    │       ├── voice_lines.json  该段台词（按 start_s 归段，有台词时）
-    │       ├── scripts/        skill 脚本副本（codex 的 cwd 是段目录）
-    │       ├── keyframes/、prompt.txt   该段产物（prompt 首行为后端加的「不要生成背景音乐」）
-    │       └── codex_last_message.txt
+    │       ├── contact_sheet(_NN).jpg / manifest.json   该段分页联系表 / 段元数据
+    │       ├── voice_lines.json  该段台词（按 start_s 归段；口播模式下每段都有，空数组 = 无台词）
+    │       └── keyframes/、prompt.txt   该段产物（prompt 首行为后端加的「不要生成背景音乐」）
+    │   （scenes.json 不逐段复制，全片一份在 work/；scripts/ 与 codex_last_message.txt
+    │    复用会话目录一份——段 codex 的 cwd 与单段模式一致）
     ├── recheck_payload.json    提交预检的瞬时产物（用完即删）
     └── task.json               提交后脚本自写的任务状态（task_id 来源）
 ```

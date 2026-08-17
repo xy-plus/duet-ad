@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
@@ -28,6 +30,13 @@ SEGMENTS = [
     {"index": 1, "start_s": 0.0, "end_s": 8.0},
     {"index": 2, "start_s": 8.0, "end_s": 16.0},
     {"index": 3, "start_s": 16.0, "end_s": 24.0},
+]
+
+SEGMENTS_4 = [
+    {"index": 1, "start_s": 0.0, "end_s": 6.0},
+    {"index": 2, "start_s": 6.0, "end_s": 12.0},
+    {"index": 3, "start_s": 12.0, "end_s": 18.0},
+    {"index": 4, "start_s": 18.0, "end_s": 24.0},
 ]
 
 
@@ -64,6 +73,38 @@ def test_attribute_lines_start_at_boundary_belongs_to_later_segment():
     got = pipeline.attribute_lines(lines, SEGMENTS)
     assert got[1] == []
     assert [l["text"] for l in got[2]] == ["边界句。"]
+
+
+def test_attribute_lines_tail_within_epsilon_belongs_to_last_segment():
+    """start_s 恰在末段终点或 0.01s 浮点误差内 → 归末段；超出容差 → 不归任何段。"""
+    lines = [
+        {"text": "终点句。", "start_s": 24.0, "end_s": 24.5},
+        {"text": "误差句。", "start_s": 24.005, "end_s": 24.5},
+        {"text": "越界句。", "start_s": 24.5, "end_s": 24.9},
+    ]
+    got = pipeline.attribute_lines(lines, SEGMENTS)
+    assert [l["text"] for l in got[3]] == ["终点句。", "误差句。"]
+    assert got[1] == [] and got[2] == []
+    assert "越界句。" not in [l["text"] for l in got[3]]
+
+
+# ---------- 后端前缀（不依赖 codex 写） ----------
+
+
+def test_prefix_no_bgm_prepends_line(tmp_path):
+    prompt_path = tmp_path / "prompt.txt"
+    prompt_path.write_text("正文", encoding="utf-8")
+    got = pipeline._prefix_no_bgm("正文", prompt_path)
+    assert got == pipeline.NO_BGM_LINE + "\n正文"
+    assert prompt_path.read_text(encoding="utf-8") == got
+
+
+def test_prefix_no_bgm_rejects_oversize(tmp_path):
+    """前缀后超 MAX_PROMPT_BYTES → PipelineError（校验在前缀插入前，机械操作须自查）。"""
+    prompt_path = tmp_path / "prompt.txt"
+    big = "x" * (pipeline.MAX_PROMPT_BYTES - 1)  # 加前缀必然超限
+    with pytest.raises(pipeline.PipelineError, match="prefix"):
+        pipeline._prefix_no_bgm(big, prompt_path)
 
 
 # ---------- ffmpeg 切段精度 ----------
@@ -186,15 +227,19 @@ def test_run_single_segment_no_prefix_and_no_segments_key(tmp_path, monkeypatch)
 
 
 def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
-    """分段 codex 调用：cwd=段目录；prompt 含 SKILL.md、分段模式、scenes.json、该段台词与硬性禁令。"""
+    """分段 codex 调用：cwd=会话目录（与单段一致）；prompt 含 SKILL.md、分段模式、
+    work/segments/N/、全片 scenes.json、该段台词与硬性禁令。"""
     settings = make_settings(tmp_path)
     meta = _make_segment_conversation(settings, SEGMENTS)
     cid = meta["id"]
+    cdir = settings.data_dir / cid
     calls = {"cmd": [], "codex": []}
 
     def fake_codex(self, workdir, prompt):
+        m = re.search(r"work/segments/(\d+)/", prompt)
+        assert m, "segment index missing from prompt"
         calls["codex"].append({"workdir": Path(workdir), "prompt": prompt})
-        _write_valid_package(Path(workdir))  # 分段模式产物在段目录（cwd）内
+        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
     monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
@@ -204,15 +249,17 @@ def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "done", m["error"]
     assert len(calls["codex"]) == 3
-    # 段间并发，调用顺序不定：按 workdir 取第二段的调用
-    by_workdir = {c["workdir"]: c for c in calls["codex"]}
-    call = by_workdir[settings.data_dir / cid / "work" / "segments" / "2"]
-    prompt = call["prompt"]
+    assert {c["workdir"] for c in calls["codex"]} == {cdir}  # 与单段模式同一 cwd
+    by_index = {
+        re.search(r"work/segments/(\d+)/", c["prompt"]).group(1): c
+        for c in calls["codex"]
+    }
+    prompt = by_index["2"]["prompt"]
     for needle in (
         str(pipeline.SKILL_MD),
         "分段模式",
         "work/segments/2/",
-        "scenes.json",
+        "work/scenes.json",
         "voice_lines.json",
         sys.executable,
         "禁止联网",
@@ -220,6 +267,12 @@ def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
     ):
         assert needle in prompt, needle
     assert "voice.mp3" not in prompt
+    # scripts 只拷一份到会话目录；段目录不复制 scripts/scenes.json；无口播不写段台词文件
+    assert (cdir / "scripts" / "crop_image.py").is_file()
+    segdir = cdir / "work" / "segments" / "2"
+    assert not (segdir / "scripts").exists()
+    assert not (segdir / "scenes.json").exists()
+    assert not (segdir / "voice_lines.json").exists()
 
 
 def test_run_segment_failure_marks_overall_failed(tmp_path, monkeypatch):
@@ -230,9 +283,10 @@ def test_run_segment_failure_marks_overall_failed(tmp_path, monkeypatch):
     calls = {"cmd": []}
 
     def fake_codex(self, workdir, prompt):
-        if str(workdir).endswith(f"segments{os.sep}2"):
+        if "work/segments/2/" in prompt:
             raise CodexError("codex exit 3: segment crashed")
-        _write_valid_package(Path(workdir))
+        m = re.search(r"work/segments/(\d+)/", prompt)
+        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
     monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
@@ -242,6 +296,37 @@ def test_run_segment_failure_marks_overall_failed(tmp_path, monkeypatch):
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "failed"
     assert "segment 2" in m["error"]
+
+
+def test_run_segments_voice_lines_written_per_segment_including_empty(tmp_path, monkeypatch):
+    """口播模式：每段都写 voice_lines.json（无台词的段写空数组）；meta.segments 逐段带 lines。"""
+    settings = make_settings(tmp_path)
+    meta = _make_segment_conversation(settings, SEGMENTS, voice_mode="keep")
+    cid = meta["id"]
+    cdir = settings.data_dir / cid
+    lines = [{"text": "第一段。", "start_s": 3.0, "end_s": 3.5}]
+
+    def fake_voice_step(settings, cid, cdir, work, runner, voice_mode, target_language):
+        return lines
+
+    calls = {"cmd": []}
+
+    def fake_codex(self, workdir, prompt):
+        m = re.search(r"work/segments/(\d+)/", prompt)
+        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+
+    monkeypatch.setattr(pipeline, "_voice_step", fake_voice_step)
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
+    monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    pipeline.run(settings, cid, CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, cid)
+    assert m["status"] == "done", m["error"]
+    for n, expected in ((1, lines), (2, []), (3, [])):
+        segdir = cdir / "work" / "segments" / str(n)
+        assert json.loads((segdir / "voice_lines.json").read_text(encoding="utf-8")) == expected
+    assert [s["lines"] for s in m["segments"]] == [["第一段。"], [], []]
 
 
 def test_run_segments_processed_concurrently(tmp_path, monkeypatch):
@@ -256,11 +341,12 @@ def test_run_segments_processed_concurrently(tmp_path, monkeypatch):
 
     def fake_codex(self, workdir, prompt):
         nonlocal active, max_active
+        m = re.search(r"work/segments/(\d+)/", prompt)
         with lock:
             active += 1
             max_active = max(max_active, active)
         time.sleep(0.3)
-        _write_valid_package(Path(workdir))
+        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
         with lock:
             active -= 1
 
@@ -275,7 +361,7 @@ def test_run_segments_processed_concurrently(tmp_path, monkeypatch):
 
 
 def test_run_scenes_detection_failure_falls_back_to_single_segment(tmp_path, monkeypatch):
-    """scenes.py 检测不出场景（如无硬切的单场景视频）→ 回退单段模式，照常 done。"""
+    """scenes.py 检测不出场景（如无硬切的单场景视频）→ 回退单段模式并留痕，照常 done。"""
     settings = make_settings(tmp_path)
     meta = _make_segment_conversation(settings, [])
     cid = meta["id"]
@@ -298,6 +384,163 @@ def test_run_scenes_detection_failure_falls_back_to_single_segment(tmp_path, mon
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "done", m["error"]
     assert "segments" not in m
+    assert "fallback" in m["scenes_note"]  # 回退留痕（内部字段）
+
+
+def test_run_scenes_invalid_segments_falls_back_to_single_segment(tmp_path, monkeypatch):
+    """scenes.json 的 segments 违反结构不变量（长度/连续性/覆盖）→ 回退单段模式并留痕。"""
+    settings = make_settings(tmp_path)
+    meta = _make_segment_conversation(settings, [])
+    cid = meta["id"]
+    bad = [
+        {"index": 1, "start_s": 0.0, "end_s": 3.0},  # <4s 违规
+        {"index": 2, "start_s": 3.0, "end_s": 24.0},
+    ]
+
+    def fake_cmd(argv, *, timeout, step, cwd=None):
+        if step == "extract":
+            out = Path(argv[argv.index("--out-dir") + 1])
+            (out / "contact_sheet.jpg").write_bytes(b"sheet")
+            (out / "manifest.json").write_text("{}")
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 24.0, "scenes": [], "segments": bad}),
+                encoding="utf-8",
+            )
+
+    def fake_codex(self, workdir, prompt):
+        _write_valid_package(Path(workdir) / "work")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    pipeline.run(settings, cid, CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, cid)
+    assert m["status"] == "done", m["error"]
+    assert "segments" not in m
+    assert "invalid" in m["scenes_note"]
+
+
+def test_run_translate_target_language_in_segment_prompt(tmp_path, monkeypatch):
+    """voice_mode=translate：目标语言由后端写进分段 prompt（codex 不从台词反推）。"""
+    settings = make_settings(tmp_path)
+    meta = _make_segment_conversation(settings, SEGMENTS, voice_mode="translate")
+    storage.update_meta(settings.data_dir, meta["id"], target_language="日语")
+    cid = meta["id"]
+    calls = {"cmd": [], "codex": []}
+
+    def fake_voice_step(settings, cid, cdir, work, runner, voice_mode, target_language):
+        return [{"text": "你好。", "start_s": 3.0, "end_s": 3.5}]
+
+    def fake_codex(self, workdir, prompt):
+        calls["codex"].append({"workdir": Path(workdir), "prompt": prompt})
+        m = re.search(r"work/segments/(\d+)/", prompt)
+        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+
+    monkeypatch.setattr(pipeline, "_voice_step", fake_voice_step)
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
+    monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    pipeline.run(settings, cid, CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, cid)
+    assert m["status"] == "done", m["error"]
+    assert len(calls["codex"]) == 3
+    for call in calls["codex"]:
+        assert "提示词与台词使用目标语言：日语" in call["prompt"]
+
+
+def test_run_voice_lines_dropped_recorded(tmp_path, monkeypatch):
+    """越界台词（超出末段终点+容差）不归段，但计数落 meta.voice_lines_dropped（内部字段）。"""
+    settings = make_settings(tmp_path)
+    meta = _make_segment_conversation(settings, SEGMENTS, voice_mode="keep")
+    cid = meta["id"]
+    lines = [
+        {"text": "第一段。", "start_s": 3.0, "end_s": 3.5},
+        {"text": "越界句。", "start_s": 30.0, "end_s": 30.5},
+    ]
+
+    def fake_voice_step(settings, cid, cdir, work, runner, voice_mode, target_language):
+        return lines
+
+    calls = {"cmd": []}
+
+    def fake_codex(self, workdir, prompt):
+        m = re.search(r"work/segments/(\d+)/", prompt)
+        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+
+    monkeypatch.setattr(pipeline, "_voice_step", fake_voice_step)
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
+    monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    pipeline.run(settings, cid, CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, cid)
+    assert m["status"] == "done", m["error"]
+    assert m["voice_lines_dropped"] == 1
+    assert [s["lines"] for s in m["segments"]] == [["第一段。"], [], []]
+
+
+def test_run_segment_workers_capped_at_half_codex_concurrency(tmp_path, monkeypatch):
+    """段并发上限 = codex_concurrency//2：一条长视频不得占满全部 codex 槽饿死其他会话。"""
+    settings = make_settings(tmp_path, codex_concurrency=4)
+    meta = _make_segment_conversation(settings, SEGMENTS_4)
+    cid = meta["id"]
+    calls = {"cmd": []}
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_codex(self, workdir, prompt):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.3)
+        m = re.search(r"work/segments/(\d+)/", prompt)
+        _write_valid_package(Path(workdir) / "work" / "segments" / m.group(1))
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS_4))
+    monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    pipeline.run(settings, cid, CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, cid)
+    assert m["status"] == "done", m["error"]
+    assert max_active == 2  # 4 槽 → 2 并发段；不设上限则为 4
+
+
+def test_run_segment_cut_failure_marks_overall_failed(tmp_path, monkeypatch):
+    """ffmpeg 切段非零退出 → 整体 failed，error 指明段号与切段步。"""
+    settings = make_settings(tmp_path)
+    meta = _make_segment_conversation(settings, SEGMENTS)
+    cid = meta["id"]
+
+    def fake_cmd(argv, *, timeout, step, cwd=None):
+        if step == "extract":
+            out = Path(argv[argv.index("--out-dir") + 1])
+            (out / "contact_sheet.jpg").write_bytes(b"sheet")
+            (out / "manifest.json").write_text("{}")
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 24.0, "scenes": [], "segments": SEGMENTS}),
+                encoding="utf-8",
+            )
+        else:
+            raise pipeline.PipelineError(f"{step} exit 1: codec missing")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(CodexRunner, "run", lambda self, workdir, prompt: None)
+    pipeline.run(settings, cid, CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, cid)
+    assert m["status"] == "failed"
+    assert "segment 1" in m["error"]
+    assert "segment cut" in m["error"]
 
 
 # ---------- 拆段 e2e：真 subprocess 全链路 + 桩 codex ----------
@@ -322,13 +565,13 @@ def _make_scene_video_24s(path: Path) -> Path:
 
 
 def _write_stub_codex_segments(bin_dir: Path, frames: int = 3) -> Path:
-    """桩 codex 兼处理三种调用：ASR 写 3 句台词；分段调用在 cwd（段目录）内产产物。"""
+    """桩 codex 兼处理两种调用：ASR 写 3 句台词；分段调用按 prompt 里的段号写 work/segments/N/ 产物。"""
     stub = bin_dir / "codex"
     stub.write_text(
         f"#!{sys.executable}\n"
         + textwrap.dedent(
             f"""\
-            import json, shutil, sys
+            import json, re, shutil, sys
             from pathlib import Path
 
             argv = sys.argv[1:]
@@ -346,13 +589,16 @@ def _write_stub_codex_segments(bin_dir: Path, frames: int = 3) -> Path:
                 )
                 out.write_text("asr done", encoding="utf-8")
                 raise SystemExit(0)
-            kdir = workdir / "keyframes"
+            m = re.search(r"work/segments/(\\d+)/", prompt)
+            assert m, "segment index missing from prompt"
+            segdir = workdir / "work" / "segments" / m.group(1)
+            kdir = segdir / "keyframes"
             kdir.mkdir(exist_ok=True)
-            frames = sorted(workdir.glob("*_frame_*.png"))[:{frames}]
+            frames = sorted(segdir.glob("*_frame_*.png"))[:{frames}]
             assert frames, "no extracted frames in segment dir"
             for i, src in enumerate(frames, start=1):
                 shutil.copy(src, kdir / f"{{i:02d}}.png")
-            (workdir / "prompt.txt").write_text("分段桩产物", encoding="utf-8")
+            (segdir / "prompt.txt").write_text("分段桩产物", encoding="utf-8")
             out.write_text("stub done", encoding="utf-8")
             """
         ),
@@ -401,9 +647,10 @@ def test_run_multi_segment_full_pipeline(tmp_path, monkeypatch):
         assert (segdir / "prompt.txt").read_text(encoding="utf-8") == (
             pipeline.NO_BGM_LINE + "\n分段桩产物"
         )
-        assert (segdir / "scenes.json").is_file()  # 全片场景清单副本
-        assert (segdir / "scripts" / "crop_image.py").is_file()
         assert (segdir / "manifest.json").is_file()  # 该段抽帧产物
         duration = pipeline._probe_duration(segdir / "source.mp4")
         assert abs(duration - 8.0) < pipeline.CUT_DURATION_TOLERANCE_S  # 切段时长准确
     assert not (cdir / "work" / "keyframes").exists()  # 多段模式不产出顶层 keyframes
+    assert (cdir / "scripts" / "crop_image.py").is_file()  # scripts 拷进会话目录（一份）
+    assert (cdir / "work" / "scenes.json").is_file()  # 全片场景清单留在 work/
+    assert not (cdir / "work" / "segments" / "2" / "scenes.json").exists()

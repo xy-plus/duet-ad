@@ -594,6 +594,8 @@ def test_run_voice_translate_prompt_has_target_language(tmp_path, video_1s, monk
     assert m["status"] == "done"
     assert m["voice_lines"] == VOICE_LINES
     assert "翻译成英文" in calls[0]
+    # 目标语言由后端注入 maker prompt（codex 不从台词反推）
+    assert "提示词与台词使用目标语言：英文" in calls[1]
 
 
 def test_run_voice_rewrite_prompt_has_rule_and_lines(tmp_path, video_1s, monkeypatch):

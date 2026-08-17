@@ -10,10 +10,13 @@ codex 听写台词（voice_lines.json 白名单校验，落 meta.voice_lines）�
   「不要生成背景音乐」行；段间 ThreadPoolExecutor 并发（每段目录独立，CodexRunner 自带
   信号量兜底）；meta.voice_lines 按 start_s 归段（[start_s, end_s) 口径，恰在边界归后段），
   每段写 work/segments/N/voice_lines.json；任一段失败 → 整体 failed（error 指明段号）；
-  meta.segments 落各段产物，顶层 keyframes/prompt 保持空值。
-scenes 检测失败（无场景/环境缺依赖）→ 回退单段模式，不做拆段。
+  meta.segments 落各段产物，顶层 keyframes/prompt 保持空值。段 codex 的 cwd 与单段一致
+  （会话目录），scripts/ 与全片 scenes.json 复用会话目录/ work/ 下的一份，不逐段复制。
+scenes 检测失败或 scenes.json 非法（含拆段不变量违规）→ 回退单段模式（meta.scenes_note
+留痕），不做拆段；越界台词不归段并计数落 meta.voice_lines_dropped（内部字段）；翻译模式
+的目标语言由后端写进 prompt（codex 不从台词反推）。
 codex 超时/非零退出时先校验已落盘产物，完整则收养，不完整才判失败。
-codex 运行前把 skill 的 scripts/ 拷进工作目录（裁剪工具按 scripts/crop_image.py 相对引用）。
+codex 运行前把 skill 的 scripts/ 拷进会话目录（裁剪工具按 scripts/crop_image.py 相对引用）。
 流水线复用 skills/video-maker 的脚本，不重造。
 """
 
@@ -44,6 +47,11 @@ MAX_PROMPT_BYTES = 32 * 1024
 SCENES_TIMEOUT_S = 300  # scenes.py 场景检测超时（长视频 PySceneDetect 较慢）
 CUT_DURATION_TOLERANCE_S = 0.1  # 切段时长允许误差（秒）
 NO_BGM_LINE = "不要生成背景音乐"  # 多段模式由后端机械加进 prompt 首行（不依赖 codex 写）
+_SEG_TAIL_EPS_S = 0.01  # 台词 start_s 超出末段终点 ≤0.01s（与 voice 校验容差同口径）→ 归末段
+# 拆段不变量（与 app/scenes.py 的算法级不变量同值；不 import scenes：scenedetect 缺依赖时
+# scenes 模块会 SystemExit，流水线不能因此加载失败）
+SEGMENT_MIN_S = 4.0
+SEGMENT_MAX_S = 15.0
 
 
 class PipelineError(RuntimeError):
@@ -96,19 +104,30 @@ def _hard_rules(cdir: Path) -> str:
 - 禁止打印、读取或记录任何环境变量。"""
 
 
-def _codex_prompt(cdir: Path) -> str:
-    return f"""按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。输入在 work/，产物（keyframes/ 与 prompt.txt）必须按文档写入 work/。
-
-{_hard_rules(cdir)}
-"""
+def _language_note(target_language: str) -> str:
+    """翻译模式：目标语言由后端注入 prompt（codex 不从台词反推语言）。"""
+    return f"提示词与台词使用目标语言：{target_language}。" if target_language else ""
 
 
-def _segment_prompt(cdir: Path, index: int, start_s: float, end_s: float) -> str:
-    """分段 codex prompt：指明按 SKILL.md 分段模式处理 work/segments/N/（cwd 即该段目录）。"""
-    return f"""按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。按 SKILL.md 分段模式处理 work/segments/{index}/（本段 {start_s:.3f}~{end_s:.3f} 秒）：当前工作目录即该段目录，输入含其中的帧与联系表、全片场景清单 scenes.json（已拷入该目录）与该段台词 voice_lines.json（如存在）；产物（keyframes/ 与 prompt.txt）必须按文档写入该目录。
+def _codex_prompt(cdir: Path, target_language: str = "") -> str:
+    parts = [
+        f"按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。输入在 work/，产物（keyframes/ 与 prompt.txt）必须按文档写入 work/。"
+    ]
+    if target_language:
+        parts.append(_language_note(target_language))
+    parts.append(_hard_rules(cdir))
+    return "\n\n".join(parts) + "\n"
 
-{_hard_rules(cdir)}
-"""
+
+def _segment_prompt(cdir: Path, index: int, target_language: str = "") -> str:
+    """分段 codex prompt：指明按 SKILL.md 分段模式处理 work/segments/N/（cwd 为会话目录，与单段一致）。"""
+    parts = [
+        f"按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。本次为分段模式：按 SKILL.md 的「分段模式」小节处理 work/segments/{index}/（该段的帧与联系表在该目录）。输入另含全片 work/scenes.json（场景分组与拆段边界）与该段台词 work/segments/{index}/voice_lines.json（如存在）。产物（keyframes/ 与 prompt.txt）必须按文档写入 work/segments/{index}/。"
+    ]
+    if target_language:
+        parts.append(_language_note(target_language))
+    parts.append(_hard_rules(cdir))
+    return "\n\n".join(parts) + "\n"
 
 
 def _voice_prompt(cdir: Path, voice_mode: str, target_language: str, duration_s: float) -> str:
@@ -181,7 +200,11 @@ def _voice_step(
 
 
 def _load_scenes(work: Path) -> list[dict]:
-    """读并校验 work/scenes.json；返回 segments（空 = 单段模式）。缺失/非法 → PipelineError。"""
+    """读并校验 work/scenes.json；返回 segments（空 = 单段模式）。缺失/非法 → PipelineError。
+
+    结构不变量（与 scenes.py 同口径）：每段 4~15s（1e-9 容差）、相邻无缝（1e-6 容差，
+    隐含单调有序）、首段 0 起且覆盖 [0, duration_s]。
+    """
     try:
         data = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -201,14 +224,30 @@ def _load_scenes(work: Path) -> list[dict]:
         if not (math.isfinite(start_s) and math.isfinite(end_s) and start_s < end_s):
             raise PipelineError(f"scenes.json segments[{i}] invalid bounds: {start_s}..{end_s}")
         out.append({"index": seg["index"], "start_s": start_s, "end_s": end_s})
+    if not out:
+        return out  # 空 segments = 单段模式（合法），无需时长与覆盖校验
+    duration = data.get("duration_s")
+    if (isinstance(duration, bool) or not isinstance(duration, (int, float))
+            or not math.isfinite(duration) or duration <= 0):
+        raise PipelineError("scenes.json missing valid duration_s")
+    prev_end = 0.0
+    for i, seg in enumerate(out):
+        length = seg["end_s"] - seg["start_s"]
+        if length < SEGMENT_MIN_S - 1e-9 or length > SEGMENT_MAX_S + 1e-9:
+            raise PipelineError(f"scenes.json segments[{i}] length {length:.3f}s not in 4..15s")
+        if abs(seg["start_s"] - prev_end) > 1e-6:
+            raise PipelineError(f"scenes.json segments[{i}] not contiguous with previous")
+        prev_end = seg["end_s"]
+    if abs(prev_end - float(duration)) > 1e-6:
+        raise PipelineError("scenes.json segments do not cover [0, duration]")
     return out
 
 
-def _detect_segments(source: Path, work: Path) -> list[dict]:
+def _detect_segments(settings: Settings, cid: str, source: Path, work: Path) -> list[dict]:
     """跑 app/scenes.py 检测场景并读拆段建议。
 
-    检测失败（无场景硬切、缺 PySceneDetect 等，scenes.py 非零退出）→ 回退空列表 =
-    单段模式，不判失败；scenes.json 已产出但非法 → PipelineError（自己写坏的不容忍）。
+    检测失败或 scenes.json 非法（含拆段结构不变量违规）→ 回退空列表 = 单段模式，
+    不判失败，meta.scenes_note 留痕；segments 空（≤20s）是合法单段结果，不留痕。
     """
     try:
         _run_cmd(
@@ -218,8 +257,20 @@ def _detect_segments(source: Path, work: Path) -> list[dict]:
         )
     except PipelineError as e:
         print(f"scenes detection failed ({e}); falling back to single-segment mode")
+        storage.update_meta(
+            settings.data_dir, cid,
+            scenes_note="scenes detection failed, single-segment fallback",
+        )
         return []
-    return _load_scenes(work)
+    try:
+        return _load_scenes(work)
+    except PipelineError as e:
+        print(f"scenes.json invalid ({e}); falling back to single-segment mode")
+        storage.update_meta(
+            settings.data_dir, cid,
+            scenes_note="scenes.json invalid, single-segment fallback",
+        )
+        return []
 
 
 def _probe_duration(path: Path) -> float:
@@ -263,20 +314,43 @@ def _cut_segment(source: Path, start_s: float, end_s: float, segdir: Path) -> No
 
 
 def attribute_lines(lines: list[dict], segments: list[dict]) -> dict[int, list[dict]]:
-    """按台词 start_s 落入段 [start_s, end_s) 归段（恰在边界归后段）；返回 {index: [台词]}。"""
+    """按台词 start_s 落入段 [start_s, end_s) 归段（恰在边界归后段）；返回 {index: [台词]}。
+
+    start_s 超出末段终点但在 0.01s 浮点误差内（voice 校验同口径容差）→ 归末段；
+    更远的越界台词不归任何段。
+    """
     result: dict[int, list[dict]] = {seg["index"]: [] for seg in segments}
+    if not segments:
+        return result
+    last_end = segments[-1]["end_s"]
     for line in lines:
+        target: int | None = None
         for seg in segments:
             if seg["start_s"] <= line["start_s"] < seg["end_s"]:
-                result[seg["index"]].append(line)
+                target = seg["index"]
                 break
+        if target is None and line["start_s"] <= last_end + _SEG_TAIL_EPS_S:
+            target = segments[-1]["index"]
+        if target is not None:
+            result[target].append(line)
     return result
 
 
-def _process_segment(cdir: Path, work: Path, source: Path, seg: dict, runner,
-                     lines: list[dict]) -> dict:
-    """单段完整流程：切段 → 抽帧 → codex 分段 prompt → 校验 → 后端加「不要生成背景音乐」前缀。
+def _prefix_no_bgm(prompt: str, prompt_path: Path) -> str:
+    """后端机械操作：prompt 开头加「不要生成背景音乐」行并写回（不依赖 codex 写）；超限 → PipelineError。"""
+    prefixed = NO_BGM_LINE + "\n" + prompt
+    if len(prefixed.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise PipelineError(f"prompt.txt exceeds {MAX_PROMPT_BYTES} bytes after prefix")
+    prompt_path.write_text(prefixed, encoding="utf-8")
+    return prefixed
 
+
+def _process_segment(cdir: Path, work: Path, source: Path, seg: dict, runner,
+                     lines: list[dict] | None, target_language: str = "") -> dict:
+    """单段完整流程：切段 → 抽帧 → 写该段台词 → codex 分段 prompt → 校验 → 后端加前缀。
+
+    codex 的 cwd 与单段模式一致（会话目录），产物落在 work/segments/N/；scripts/ 与
+    全片 scenes.json 复用会话目录/ work/ 下的一份，不逐段复制。
     任一失败包装为 PipelineError 并指明段号；返回 meta.segments 条目。
     """
     index = seg["index"]
@@ -289,16 +363,13 @@ def _process_segment(cdir: Path, work: Path, source: Path, seg: dict, runner,
             timeout=120,
             step=f"segment {index} extract",
         )
-        # 裁剪工具按 scripts/crop_image.py 相对引用；分段模式 codex 的 cwd 是段目录
-        shutil.copytree(SCRIPTS_DIR, segdir / "scripts")
-        # 该段台词（白名单净化后）与全片场景清单，供 codex 参考定位
-        if lines:
+        # 该段台词（白名单净化后；lines 为 None = 无口播，不写文件）
+        if lines is not None:
             (segdir / "voice_lines.json").write_text(
                 json.dumps(lines, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        shutil.copy(work / "scenes.json", segdir / "scenes.json")
         try:
-            runner.run(segdir, _segment_prompt(cdir, index, seg["start_s"], seg["end_s"]))
+            runner.run(cdir, _segment_prompt(cdir, index, target_language))
         except CodexError as e:
             # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
             try:
@@ -306,15 +377,14 @@ def _process_segment(cdir: Path, work: Path, source: Path, seg: dict, runner,
             except PipelineError:
                 raise e from None
         keyframes, prompt = validate_work_dir(segdir)
-        prefixed = NO_BGM_LINE + "\n" + prompt  # 后端机械操作，不依赖 codex 写
-        (segdir / "prompt.txt").write_text(prefixed, encoding="utf-8")
+        prompt = _prefix_no_bgm(prompt, segdir / "prompt.txt")
         return {
             "index": index,
             "start_s": seg["start_s"],
             "end_s": seg["end_s"],
             "keyframes": keyframes,
-            "prompt": prefixed,
-            "lines": [line["text"] for line in lines],
+            "prompt": prompt,
+            "lines": [line["text"] for line in (lines or [])],
         }
     except Exception as e:
         raise PipelineError(f"segment {index} failed: {e}") from None
@@ -350,12 +420,16 @@ def run(settings: Settings, cid: str, runner) -> None:
                 settings, cid, cdir, work, runner, voice_mode,
                 meta.get("target_language") or "",
             )
-        segments = _detect_segments(source, work)
+        translate_lang = ""
+        if voice_mode == "translate":
+            translate_lang = (meta.get("target_language") or "").strip()
+        segments = _detect_segments(settings, cid, source, work)
+        # skill 的裁剪工具以 scripts/crop_image.py 相对工作目录引用，codex 的 cwd 是 cdir（单/多段同）
+        shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
         if not segments:
             # 单段模式：现有流程原样（work/keyframes + work/prompt.txt，不加前缀）
-            shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
             try:
-                runner.run(cdir, _codex_prompt(cdir))
+                runner.run(cdir, _codex_prompt(cdir, translate_lang))
             except CodexError as e:
                 # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
                 try:
@@ -368,14 +442,24 @@ def run(settings: Settings, cid: str, runner) -> None:
             )
         else:
             # 多段模式：各段目录独立、无共享状态，线程池并发；CodexRunner.run 自带信号量兜底
-            lines_by_seg = attribute_lines(voice_lines or [], segments)
-            workers = min(len(segments), max(1, settings.codex_concurrency))
+            # lines_by_seg 为 None = 无口播：段目录不写 voice_lines.json
+            lines_by_seg = (
+                attribute_lines(voice_lines, segments) if voice_lines is not None else None
+            )
+            if lines_by_seg is not None:
+                # 越界台词不归段：计数留痕（meta 内部字段，不静默丢失）
+                dropped = len(voice_lines) - sum(len(v) for v in lines_by_seg.values())
+                if dropped:
+                    storage.update_meta(settings.data_dir, cid, voice_lines_dropped=dropped)
+            # 段并发上限 = codex_concurrency 的一半：一条长视频不得占满全部 codex 槽饿死其他会话
+            workers = min(len(segments), max(1, settings.codex_concurrency // 2))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 seg_metas = list(
                     pool.map(
                         lambda seg: _process_segment(
                             cdir, work, source, seg, runner,
-                            lines_by_seg.get(seg["index"], []),
+                            lines_by_seg.get(seg["index"]) if lines_by_seg is not None else None,
+                            translate_lang,
                         ),
                         segments,
                     )

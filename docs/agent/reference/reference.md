@@ -118,7 +118,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 - `app.storage.resolve_file(data_dir, cid, name) -> Path | None` — files 白名单解析
 - `app.pipeline.run(settings, cid, runner)` — 后台任务入口；任何失败 → `failed`+`error`，不抛
 - `app.pipeline.validate_work_dir(work) -> (list[str], str)` — agent 产物白名单校验，返回 (关键帧名, prompt)
-- `app.pipeline.attribute_lines(lines, segments) -> dict[int, list[dict]]` — 台词按 start_s 落入段 [start_s, end_s) 归段（恰在边界归后段），返回 {index: [台词]}
+- `app.pipeline.attribute_lines(lines, segments) -> dict[int, list[dict]]` — 台词按 start_s 落入段 [start_s, end_s) 归段（恰在边界归后段；超出末段终点 ≤0.01s 浮点误差归末段，更远不归段），返回 {index: [台词]}
 - `app.seedream.edit_image(settings, cdir, image, prompt, out, lock, confirm) -> Path` — 编辑门控纯函数：三重门控（开关/confirm/并发锁，confirm 须严格 True）+ dry-run 预检 + 真实提交；失败抛 `SeedreamError(status, detail)`
 - `app.codex_runner.CodexRunner(timeout_s, concurrency)` — `.build_argv(workdir, prompt)` / `.run(workdir, prompt)`；`CodexError` 包装超时/非零/找不到二进制
 - `app.codex_runner.clean_stderr(text, limit=500)` — 剔环境变量行 + 截断（pipeline 的 `_run_cmd` 复用）
@@ -143,6 +143,8 @@ meta.json（`data/<cid>/meta.json`）：
 | `target_language` | str | 翻译目标语言（仅 `translate` 且非空时落；内部字段） |
 | `voice_lines` | list[dict] | 口播台词（`voice_mode≠none` 时 ASR 校验后写入；进 detail 响应 `voice_lines` 字段） |
 | `segments` | list[dict] | 多段模式逐段产物：`index`（1 起）/`start_s`/`end_s`/`keyframes`/`prompt`/`lines`（该段台词 text 列表）；单段模式不写（缺省） |
+| `scenes_note` | str | 场景检测失败或 scenes.json 非法回退单段的留痕（内部字段，仅回退时写） |
+| `voice_lines_dropped` | int | 多段模式下未归段的越界台词数（内部字段，仅 >0 时写） |
 | `has_video` | bool | 提交标记（仅提交后存在；内部字段） |
 | `submitted_at` / `task_id` | str | 提交时间 / Ark 任务 id（内部字段，读不到 task.json 则为 null） |
 
@@ -159,7 +161,7 @@ scenes.json（`work/scenes.json`，`app/scenes.py` 产物）：
 - `work/keyframes/*.png`：数量 ∈ 1..9（新契约该目录只有选定帧 `01.png…N.png`）
 - `work/prompt.txt`：存在、非空、≤ 32KB（`MAX_PROMPT_BYTES`）
 
-多段模式每段目录 `work/segments/N/` 按同规则校验；校验通过后由后端在 `prompt.txt` 开头机械加一行「不要生成背景音乐」（不依赖 codex 写），meta.segments 存的 prompt 含该行。scenes 检测失败（无场景切点/缺 PySceneDetect）回退单段模式，不判失败。
+多段模式每段目录 `work/segments/N/` 按同规则校验；校验通过后由后端在 `prompt.txt` 开头机械加一行「不要生成背景音乐」（不依赖 codex 写），meta.segments 存的 prompt 含该行。scenes 检测失败（无场景切点/缺 PySceneDetect）或 scenes.json 的 segments 违反结构不变量（4~15s/相邻无缝/覆盖全程）→ 回退单段模式（meta.scenes_note 留痕），不判失败。段 codex 的 cwd 与单段模式一致（会话目录），只按 prompt 指明的段目录读写；scripts/ 与 scenes.json 复用会话目录/ work/ 下的一份，不逐段复制。
 
 ## 依赖
 
