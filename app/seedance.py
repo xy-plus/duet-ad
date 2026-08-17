@@ -8,21 +8,19 @@ import asyncio
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 from app import storage
 from app.config import Settings
+from app.sanitize import sanitize as _sanitize
 
 log = logging.getLogger(__name__)
 
 _SCRIPT = Path(__file__).resolve().parent / "seedance_task.py"
 _SUBMIT_TIMEOUT_S = 1800
 _DRYRUN_TIMEOUT_S = 120
-_DETAIL_LIMIT = 300
-_LEAK_RE = re.compile(r"key|authorization", re.IGNORECASE)
 # 建模特固定（新契约无评审 payload，提交时由 work/prompt.txt + work/keyframes/*.png 现构建请求）
 _MODEL = "doubao-seedance-2-0-260128"
 
@@ -78,22 +76,27 @@ def _check_prompt(cdir: Path) -> None:
 
 
 def _keyframes(cdir: Path) -> list[Path]:
-    """work/keyframes/*.png 即全部参考图（新契约该目录只有选定帧）；空则等同产物已变。"""
+    """work/keyframes/*.png 即全部参考图（新契约该目录只有选定帧）；空则等同产物已变。
+
+    T5b：每张帧若存在 work/postprocessed/<同名> 优化图则优先用之（多段暂不涉及——
+    seedance 提交仅支持单段 work/ 契约）。
+    """
     kdir = cdir / "work" / "keyframes"
     files = (
         sorted(p for p in kdir.glob("*.png") if p.is_file()) if kdir.is_dir() else []
     )
     if not files:
         raise SubmitError(409, "payload changed since review")
-    return files
+    post = cdir / "work" / "postprocessed"
+    return [post / p.name if (post / p.name).is_file() else p for p in files]
 
 
-def _create_argv(keyframes: list[Path]) -> list[str]:
+def _create_argv(cdir: Path, keyframes: list[Path]) -> list[str]:
     """提交时现构建 create argv（相对 cwd 路径 + 固定建模特）。"""
     return [
         sys.executable, str(_SCRIPT), "create",
         "--prompt-file", "work/prompt.txt",
-        "--ref-images", *[f"work/keyframes/{p.name}" for p in keyframes],
+        "--ref-images", *[str(p.relative_to(cdir)) for p in keyframes],
         "--model", _MODEL,
         "--ratio", "9:16",
         "--duration", "15",
@@ -106,7 +109,7 @@ def _create_argv(keyframes: list[Path]) -> list[str]:
 def _dryrun_check(cdir: Path, keyframes: list[Path]) -> None:
     """提交前 dry-run 重建 payload 预检（无网络、无费用）；构建失败等同产物已变。"""
     out = "work/recheck_payload.json"
-    argv = _create_argv(keyframes) + ["--dry-run", "--payload-out", out]
+    argv = _create_argv(cdir, keyframes) + ["--dry-run", "--payload-out", out]
     try:
         r = subprocess.run(
             argv, cwd=cdir, capture_output=True, text=True, timeout=_DRYRUN_TIMEOUT_S
@@ -124,7 +127,7 @@ def _dryrun_check(cdir: Path, keyframes: list[Path]) -> None:
 
 def _run_submit(cdir: Path, keyframes: list[Path]) -> None:
     """真实提交：argv 列表、无 shell、env 缺省继承服务进程、1800s 超时。"""
-    argv = _create_argv(keyframes) + [
+    argv = _create_argv(cdir, keyframes) + [
         "--confirm-submit", "--wait",
         "--state-file", "work/task.json",
         "--download", "generated.mp4",
@@ -139,18 +142,8 @@ def _run_submit(cdir: Path, keyframes: list[Path]) -> None:
         raise SubmitError(502, "seedance runner unavailable") from e
     if r.returncode != 0:
         detail = _sanitize(f"{r.stdout or ''}\n{r.stderr or ''}") or "seedance task failed"
-        detail = detail[:_DETAIL_LIMIT]
         log.warning("seedance submit failed for %s: %s", cdir.name, detail)
         raise SubmitError(502, detail)
-
-
-def _sanitize(text: str) -> str:
-    """剔除任何含 key/authorization 的行，并就地抹除密钥字面值。"""
-    out = "\n".join(ln for ln in text.splitlines() if not _LEAK_RE.search(ln)).strip()
-    key = os.environ.get("ARK_API_KEY", "").strip()
-    if key:
-        out = out.replace(key, "***")
-    return out
 
 
 def _read_task_id(cdir: Path) -> str | None:

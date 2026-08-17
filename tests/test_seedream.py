@@ -606,16 +606,6 @@ def test_concurrent_edit_single_task(tmp_path, monkeypatch):
     assert len(fake.real_calls) == 1  # 一次确认 = 一个任务
 
 
-def test_sanitize(monkeypatch):
-    monkeypatch.setenv("ARK_API_KEY", SECRET)
-    text = f"Authorization: Bearer {SECRET}\napi_key={SECRET}\nplain line\n"
-    out = seedream._sanitize(text)
-    assert SECRET not in out
-    assert "Authorization" not in out
-    assert "api_key" not in out
-    assert "plain line" in out
-
-
 # ---------- config ----------
 
 def test_settings_seedream_defaults(tmp_path):

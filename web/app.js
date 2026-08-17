@@ -20,6 +20,7 @@ const state = {
   pollTimer: null,
   detailSeq: 0,        // 防止过期响应覆盖新渲染
   objectURLs: [],      // 当前 stream 渲染产生的 blob URL，重渲染前统一 revoke
+  ppDetail: null,      // 后处理弹窗对应的会话详情
 };
 
 class AuthError extends Error {}
@@ -69,6 +70,10 @@ function fmtTime(iso) {
   if (d.toDateString() === now.toDateString()) return hm;
   if (d.getFullYear() === now.getFullYear()) return pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hm;
   return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+}
+
+function fmtSec(x) {
+  return Number.isFinite(x) ? Number(x).toFixed(1) : "?";
 }
 
 function trackURL(url) {
@@ -419,64 +424,21 @@ function renderResults(detail) {
     frag.appendChild(videoSection(detail, "source.mp4", "原始视频", "上传的源素材"));
   }
 
-  // 关键帧 Bento
-  const names = Array.isArray(detail.keyframes) ? detail.keyframes : [];
-  if (names.length > 0) {
-    const sec = el("section", "res-section");
-    const h = el("h3", "res-h3", "关键帧");
-    h.appendChild(el("span", "res-count", names.length + " 张"));
-    sec.appendChild(h);
-    const grid = el("div", "kf-grid");
-    for (const name of names) {
-      const fig = el("figure", "kf-card shimmer");
-      const img = el("img");
-      img.alt = "关键帧 " + name;
-      fig.appendChild(img);
-      grid.appendChild(fig);
-      apiBlobURL("/api/conversations/" + detail.id + "/files/keyframes/" + encodeURIComponent(name))
-        .then((url) => {
-          img.src = url;
-          img.addEventListener("load", () => {
-            fig.classList.remove("shimmer");
-            fig.classList.add("is-loaded");
-          }, { once: true });
-          img.addEventListener("click", () => openLightbox(img.src, img.alt));
-        })
-        .catch(() => {
-          fig.classList.remove("shimmer");
-          fig.appendChild(el("div", "kf-err", "加载失败"));
-        });
+  // 多段模式：逐段渲染「第 N 段」卡片；单段模式保持现有逻辑
+  const segments = Array.isArray(detail.segments) ? detail.segments : [];
+  if (segments.length > 0) {
+    frag.appendChild(renderSegments(detail));
+  } else {
+    const names = Array.isArray(detail.keyframes) ? detail.keyframes : [];
+    if (names.length > 0) {
+      frag.appendChild(keyframesSection(detail));
     }
-    sec.appendChild(grid);
-    frag.appendChild(sec);
-  }
-
-  // Prompt 卡片
-  if (detail.prompt) {
-    const sec = el("section", "res-section");
-    sec.appendChild(el("h3", "res-h3", "Seedance 提示词"));
-    const card = el("div", "prompt-card");
-    const head = el("div", "prompt-head");
-    head.appendChild(el("span", "prompt-hint", "复制后可直接粘贴到 Seedance"));
-    const copyBtn = el("button", "copy-btn");
-    copyBtn.type = "button";
-    copyBtn.appendChild(icon("i-copy"));
-    const copyLabel = el("span", null, "复制");
-    copyBtn.appendChild(copyLabel);
-    copyBtn.addEventListener("click", async () => {
-      const ok = await copyText(detail.prompt);
-      copyBtn.classList.add("copied");
-      copyLabel.textContent = ok ? "已复制" : "复制失败";
-      setTimeout(() => {
-        copyBtn.classList.remove("copied");
-        copyLabel.textContent = "复制";
-      }, 1600);
-    });
-    head.appendChild(copyBtn);
-    card.appendChild(head);
-    card.appendChild(el("pre", "prompt-text", detail.prompt));
-    sec.appendChild(card);
-    frag.appendChild(sec);
+    if (detail.prompt) {
+      const sec = el("section", "res-section");
+      sec.appendChild(el("h3", "res-h3", "Seedance 提示词"));
+      sec.appendChild(promptCard(detail.prompt));
+      frag.appendChild(sec);
+    }
   }
 
   // 最终视频：已提交生成则播放成片，否则显示「待提交生成」（提交接口预留未开放）
@@ -502,6 +464,155 @@ function renderResults(detail) {
     frag.appendChild(sec);
   }
 
+  return frag;
+}
+
+/* 关键帧网格：blob 化加载 + 点击放大灯箱（单段/多段/优化后共用；pathPrefix 即 files 白名单路径） */
+function kfGrid(detail, names, pathPrefix, altPrefix) {
+  const grid = el("div", "kf-grid");
+  for (const name of names) {
+    const fig = el("figure", "kf-card shimmer");
+    const img = el("img");
+    img.alt = altPrefix + name;
+    fig.appendChild(img);
+    grid.appendChild(fig);
+    apiBlobURL("/api/conversations/" + detail.id + "/files/" + pathPrefix + "/" + encodeURIComponent(name))
+      .then((url) => {
+        img.src = url;
+        img.addEventListener("load", () => {
+          fig.classList.remove("shimmer");
+          fig.classList.add("is-loaded");
+        }, { once: true });
+        img.addEventListener("click", () => openLightbox(img.src, img.alt));
+      })
+      .catch(() => {
+        fig.classList.remove("shimmer");
+        fig.appendChild(el("div", "kf-err", "加载失败"));
+      });
+  }
+  return grid;
+}
+
+/* prompt 卡片（复制按钮 + 全文；单段/多段共用） */
+function promptCard(text) {
+  const card = el("div", "prompt-card");
+  const head = el("div", "prompt-head");
+  head.appendChild(el("span", "prompt-hint", "复制后可直接粘贴到 Seedance"));
+  const copyBtn = el("button", "copy-btn");
+  copyBtn.type = "button";
+  copyBtn.appendChild(icon("i-copy"));
+  const copyLabel = el("span", null, "复制");
+  copyBtn.appendChild(copyLabel);
+  copyBtn.addEventListener("click", async () => {
+    const ok = await copyText(text);
+    copyBtn.classList.add("copied");
+    copyLabel.textContent = ok ? "已复制" : "复制失败";
+    setTimeout(() => {
+      copyBtn.classList.remove("copied");
+      copyLabel.textContent = "复制";
+    }, 1600);
+  });
+  head.appendChild(copyBtn);
+  card.appendChild(head);
+  card.appendChild(el("pre", "prompt-text", text));
+  return card;
+}
+
+/* 后处理按钮：postprocess_enabled（submit_enabled 同款开关）关则禁用；
+   running 时转「处理中…」禁用 */
+function postprocessBtn(detail) {
+  const wrap = el("span", "pp-wrap");
+  const btn = el("button", "btn btn-primary pp-btn", "后处理");
+  btn.type = "button";
+  const pp = detail.postprocess || {};
+  if (!detail.postprocess_enabled) {
+    btn.disabled = true;
+  } else if (pp.status === "running") {
+    btn.disabled = true;
+    btn.textContent = "处理中…";
+  }
+  btn.addEventListener("click", () => openPostprocessModal(detail));
+  wrap.appendChild(btn);
+  if (!detail.postprocess_enabled) {
+    wrap.appendChild(el("span", "pp-caption", "待开放（接口预留）"));
+  } else if (pp.status === "running") {
+    wrap.appendChild(el("span", "pp-caption", "正在逐帧优化，请稍候…"));
+  }
+  return wrap;
+}
+
+/* 单段模式：关键帧区（标题旁后处理按钮）+ 失败提示 + 「优化后」对比 grid */
+function keyframesSection(detail) {
+  const sec = el("section", "res-section");
+  const names = Array.isArray(detail.keyframes) ? detail.keyframes : [];
+  const h = el("h3", "res-h3", "关键帧");
+  h.appendChild(el("span", "res-count", names.length + " 张"));
+  const head = el("div", "res-head");
+  head.appendChild(h);
+  head.appendChild(postprocessBtn(detail));
+  sec.appendChild(head);
+  sec.appendChild(kfGrid(detail, names, "keyframes", "关键帧 "));
+  const pp = detail.postprocess || {};
+  if (pp.status === "failed" && pp.error) {
+    sec.appendChild(el("p", "pp-error", "后处理失败：" + pp.error + "（已成功的帧保留）"));
+  }
+  const frames = Array.isArray(pp.frames) ? pp.frames : [];
+  if (pp.status === "done" && frames.length) {
+    sec.appendChild(el("h4", "res-sub", "优化后"));
+    sec.appendChild(kfGrid(detail, frames, "postprocessed", "优化后 "));
+  }
+  return sec;
+}
+
+/* 多段模式：逐段「第 N 段」卡片（段关键帧 grid + 段提示词 + 段台词） */
+function renderSegments(detail) {
+  const frag = document.createDocumentFragment();
+  const headSec = el("section", "res-section");
+  const h = el("h3", "res-h3", "分段产物");
+  h.appendChild(el("span", "res-count", detail.segments.length + " 段"));
+  const head = el("div", "res-head");
+  head.appendChild(h);
+  head.appendChild(postprocessBtn(detail));
+  headSec.appendChild(head);
+  const pp = detail.postprocess || {};
+  if (pp.status === "failed" && pp.error) {
+    headSec.appendChild(el("p", "pp-error", "后处理失败：" + pp.error + "（已成功的帧保留）"));
+  }
+  frag.appendChild(headSec);
+
+  const frames = Array.isArray(pp.frames) ? pp.frames : [];
+  for (const seg of detail.segments) {
+    const n = seg.index;
+    const card = el("section", "res-section seg-card");
+    const sh = el("h3", "res-h3", "第 " + n + " 段");
+    sh.appendChild(el("span", "res-count", fmtSec(seg.start_s) + "s – " + fmtSec(seg.end_s) + "s"));
+    card.appendChild(sh);
+    const names = Array.isArray(seg.keyframes) ? seg.keyframes : [];
+    if (names.length) {
+      card.appendChild(kfGrid(detail, names, "segments/" + n + "/keyframes", "第 " + n + " 段关键帧 "));
+    }
+    const prefix = "segments/" + n + "/postprocessed/";
+    const own = frames.filter((f) => f.startsWith(prefix)).map((f) => f.slice(prefix.length));
+    if (pp.status === "done" && own.length) {
+      card.appendChild(el("h4", "res-sub", "优化后"));
+      card.appendChild(kfGrid(detail, own, "segments/" + n + "/postprocessed", "第 " + n + " 段优化后 "));
+    }
+    if (seg.prompt) {
+      card.appendChild(el("h4", "res-sub", "Seedance 提示词"));
+      card.appendChild(promptCard(seg.prompt));
+    }
+    if (Array.isArray(seg.lines) && seg.lines.length) {
+      const lines = el("div", "lines-card");
+      lines.appendChild(el("h4", "res-sub", "段台词"));
+      const ul = el("ul", "lines-list");
+      for (const line of seg.lines) {
+        ul.appendChild(el("li", null, line));
+      }
+      lines.appendChild(ul);
+      card.appendChild(lines);
+    }
+    frag.appendChild(card);
+  }
   return frag;
 }
 
@@ -556,6 +667,59 @@ async function copyText(text) {
   }
 }
 
+/* ===== 后处理弹窗 ===== */
+function ppCheckedOptions() {
+  const options = { change_bg: false, face_hold: false, remove_subtitle: false, remove_brand: false };
+  document.querySelectorAll('#pp-form input[name="opt"]:checked').forEach((c) => {
+    options[c.value] = true;
+  });
+  return options;
+}
+
+function updatePpConfirm() {
+  $("pp-confirm").disabled = !Object.values(ppCheckedOptions()).some(Boolean);
+}
+
+function openPostprocessModal(detail) {
+  state.ppDetail = detail;
+  document.querySelectorAll('#pp-form input[name="opt"]').forEach((c) => {
+    c.checked = false;
+  });
+  $("pp-error").hidden = true;
+  updatePpConfirm();
+  $("pp-dialog").showModal();
+}
+
+function closePostprocessModal() {
+  $("pp-dialog").close();
+  state.ppDetail = null;
+}
+
+async function submitPostprocess(event) {
+  event.preventDefault();
+  const detail = state.ppDetail;
+  if (!detail) return;
+  const btn = $("pp-confirm");
+  const errEl = $("pp-error");
+  btn.disabled = true;
+  errEl.hidden = true;
+  try {
+    await apiJSON("/api/conversations/" + detail.id + "/postprocess", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ options: ppCheckedOptions(), confirm: true }),
+    });
+    closePostprocessModal();
+    // 刷新进入「处理中…」；loadDetail 见到 postprocess.status==running 会沿用 2s 轮询到终态
+    loadDetail(detail.id, true);
+  } catch (err) {
+    if (handleAuthError(err)) return;
+    errEl.textContent = err.message;
+    errEl.hidden = false;
+    updatePpConfirm();
+  }
+}
+
 function renderDetail(detail) {
   clearStream();
   const inner = el("div", "stream-inner");
@@ -579,7 +743,8 @@ async function loadDetail(id, silent) {
     if (seq !== state.detailSeq || state.currentId !== id) return; // 已切换会话
     state.detail = detail;
     renderDetail(detail);
-    if (detail.status === "queued" || detail.status === "processing") {
+    if (detail.status === "queued" || detail.status === "processing"
+        || (detail.postprocess && detail.postprocess.status === "running")) {
       startPolling(id);
     } else {
       stopPolling();
@@ -881,6 +1046,10 @@ function bindEvents() {
     setComposerError(null);
     updateSendBtn();
   });
+
+  $("pp-form").addEventListener("submit", submitPostprocess);
+  $("pp-cancel").addEventListener("click", closePostprocessModal);
+  $("pp-form").addEventListener("change", updatePpConfirm);
 
   const composer = $("composer");
   composer.addEventListener("submit", handleSend);

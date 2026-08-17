@@ -1,4 +1,4 @@
-"""T4 拆段流水线：scenes 接入、拆段并发、句子归属、切段精度、detail 14 字段契约。"""
+"""T4 拆段流水线：scenes 接入、拆段并发、句子归属、切段精度、detail 16 字段契约。"""
 
 import base64
 import json
@@ -128,7 +128,7 @@ def test_cut_segment_duration_within_tolerance(tmp_path):
     assert abs(pipeline._probe_duration(out) - 7.0) < pipeline.CUT_DURATION_TOLERANCE_S
 
 
-# ---------- detail 14 字段契约 ----------
+# ---------- detail 16 字段契约 ----------
 
 
 def test_detail_segments_voice_lines_defaults(client, video_1s):

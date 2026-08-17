@@ -25,7 +25,7 @@ ACCESS_TOKEN=<访问口令> ./run.sh
 ## 结构
 
 ```
-app/            FastAPI 后端：main(路由) config auth storage downloader pipeline codex_runner seedance seedance_task(提交脚本)
+app/            FastAPI 后端：main(路由) config auth storage downloader pipeline codex_runner scenes voice seedance seedance_task(提交脚本) seedream seedream_task(编辑脚本) postprocess(后处理编排) sanitize(公共脱敏)
 web/            单页前端（原生 JS，同源 /api/*，由后端 StaticFiles 挂载在 /）
 skills/video-maker/   codex agent 使用的技能（SKILL.md + extract_keyframes/crop_image 两脚本）
 tests/          pytest（conftest 直建 Settings，默认 enable_pipeline=False 不跑流水线）
@@ -46,4 +46,4 @@ OPEN_ISSUE.md   待拍板/进行中/待办与限制（活文档）
 - `ACCESS_TOKEN` 必填，缺了 `get_settings()` 直接 RuntimeError；所有 `/api/conversations*` 走 `Authorization: Bearer <token>`。
 - `ENABLE_PIPELINE`：`get_settings()`（生产）默认开；直建 `Settings`（测试）默认关——测试不会真跑流水线。
 - codex 认证只支持 CODEX_HOME 文件认证：调起 codex 前进程级 env 清洗会剔除名字含 KEY/TOKEN/SECRET/PASSWORD 的变量，`OPENAI_API_KEY` 类 env 认证路径不可用（有意设计，原因见 architecture 安全模型）。
-- 改 API 响应字段先读 `docs/agent/reference/reference.md`：detail 是冻结的 14 字段契约，meta.json 内部字段（submitted_at/task_id 等）不外泄。
+- 改 API 响应字段先读 `docs/agent/reference/reference.md`：detail 是冻结的 16 字段契约，meta.json 内部字段（submitted_at/task_id 等）不外泄。

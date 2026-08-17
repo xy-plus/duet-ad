@@ -3,7 +3,7 @@ name: architecture
 type: architecture
 status: done
 owner: agent
-updated: 2026-08-17
+updated: 2026-08-18
 links: [conversation-task]
 ---
 
@@ -25,8 +25,10 @@ links: [conversation-task]
 | `app/codex_runner.py` | 沙箱化 `codex exec` 调用（argv、断网、env 清洗、超时、并发信号量） | conversation-task |
 | `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
-| `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：三重门控 + dry-run 预检 + 脱敏（HTTP 路由随 T5b） | conversation-task |
+| `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedream_task.py` | Ark Seedream 编辑任务脚本：multipart 提交 `/api/v1/images/edits`、异步轮询、b64/url 双态下载 | conversation-task |
+| `app/postprocess.py` | T5b 后处理编排：HTTP 门控（含换选项重跑 409、无 cascade 数据 503）+ 后台逐帧 Seedream 编辑（收集目标帧/cv2 haarcascade 人脸检测/指令构造/prompt 追加动作线/失败保留）+ `meta.postprocess` 状态机 | conversation-task |
+| `app/sanitize.py` | 公共脱敏函数（seedance/seedream/postprocess 共用）：删 key|authorization 行 + 抹密钥字面值 + 截断 | conversation-task |
 | `app/scenes.py` | PySceneDetect 场景检测：manifest 帧按场景分组写 scenes.json + 拆段边界建议（>20s 才计算，每段 4~15s 为算法级不变量，末尾防御断言）；流水线按 segments 拆段（空则单段模式） | conversation-task |
 | `web/` | 原生 JS 单页前端（登录/会话列表/上传/轮询/结果展示），无构建 | conversation-task |
 | `skills/video-maker/` | codex agent 用的技能：`SKILL.md` + `scripts/extract_keyframes.py`、`scripts/crop_image.py`（与 web/video-maker.zip 逐字节一致） | conversation-task |
@@ -52,9 +54,13 @@ flowchart LR
   PL -->|白名单校验| FS
   PL -->|status/keyframes/prompt/segments/voice_lines| META[meta.json]
   U -->|2s 轮询 GET detail| API
-  API -->|14 字段| U
+  API -->|16 字段| U
   U -.->|submit 预留| SD[app/seedance.py<br/>三重门控+dry-run 预检]
   SD -.->|app/seedance_task.py --confirm-submit| ARK[Volcengine Ark]
+  U -.->|postprocess 确认| PP[app/postprocess.py<br/>门控+后台逐帧编辑]
+  PP -.->|逐帧 seedream.edit_image<br/>confirm=True| SR[app/seedream.py]
+  SR -.->|app/seedream_task.py --confirm-submit| ARK
+  PP -->|work/(segments/N/)postprocessed/ + meta.postprocess| FS
 ```
 
 ## 状态机
@@ -66,6 +72,7 @@ flowchart LR
 - `done`：产物校验过，单段模式写顶层 `keyframes`/`prompt`；多段模式写 `segments`（各段 keyframes/prompt/台词，顶层 `keyframes`/`prompt` 保持空值）。
 - `failed`：任一步异常，写 `error`（截断 ≤500 字）；不抛回 HTTP 层。
 - 终态后另有提交标记：`mark_submitted` 写 `has_video/submitted_at/task_id`（meta 内部字段，不进 API 响应）。
+- 后处理状态机（`done` 会话上独立于主状态机运行，不影响 `status`）：`meta.postprocess.status = running → done | failed`。`running` 时再提交 409；`done/failed` 后可重跑（已有优化图跳过）；进程重启后 `running` 残留卡死（同主状态机，无恢复机制）。
 - queued 上限 `MAX_QUEUED`（默认 100）：创建时在同一把锁内数 queued 会话，超额 429 `too many queued tasks`；processing 由闸保证 ≤ 并发数，无需单独计数。
 - 只前进不回退；无取消/重跑；进程重启后 `processing` 会话不自动续跑。
 
@@ -87,12 +94,14 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
     ├── voice_lines.json        口播模式 codex 听写的台词（白名单校验后采信）
     ├── keyframes/              01.png…N.png（1..9 张选定帧，白名单校验后采信；单段模式）
     ├── prompt.txt              agent 写的 prompt（非空、≤32KB；单段模式）
+    ├── postprocessed/          T5b 后处理优化图（<帧名>.png，与 keyframes/ 同名对应；单段模式）
     ├── segments/               多段模式：每段一目录（N 从 1 起，与 segments index 对应）
     │   └── N/
     │       ├── source.mp4      按段边界切出的源视频（ffmpeg -ss 重编码，时长误差 <0.1s）
     │       ├── NN_frame_*.png  该段 4fps 抽帧
     │       ├── contact_sheet(_NN).jpg / manifest.json   该段分页联系表 / 段元数据
     │       ├── voice_lines.json  该段台词（按 start_s 归段；口播模式下每段都有，空数组 = 无台词）
+    │       ├── postprocessed/  T5b 后处理优化图（该段 keyframes/ 同名对应；多段模式）
     │       └── keyframes/、prompt.txt   该段产物（prompt 首行为后端加的「不要生成背景音乐」）
     │   （scenes.json 不逐段复制，全片一份在 work/；scripts/ 与 codex_last_message.txt
     │    复用会话目录一份——段 codex 的 cwd 与单段模式一致）
@@ -107,9 +116,9 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 1. **传输入口**：`/api/conversations*` 全部要 `Authorization: Bearer`，`hmac.compare_digest` 比较；`/api/login` 同样比较后只回 `{"ok":true}`（口令由前端存 localStorage）。上传限流 10 次/分/IP（内存滑动窗口）；queued 会话超 `MAX_QUEUED` 拒新建（429）；`client_request_id` 幂等键防重复提交（查重+计数+建目录同一把锁）。
 2. **上传校验链**：扩展名白名单 → 流式落盘限大小（超限即删）→ ffprobe 实探（打不开/时长超限即 422）→ 失败整体回滚目录。详见 reference。
 3. **不信任 agent 输出**：codex 产物经 `validate_work_dir` 白名单校验才采信（关键帧 1..9 张、prompt 非空且 ≤32KB）；meta 提交标记不回 API。
-4. **files 白名单**：`resolve_file` 只映射 `source.mp4`（唯一 `source.*`）/`preview.mp4`（遗留，新契约不再生成）/`generated.mp4`/`contact_sheet.jpg`/`keyframes/<fn>`，resolved-path 防穿越。
+4. **files 白名单**：`resolve_file` 只映射 `source.mp4`（唯一 `source.*`）/`preview.mp4`（遗留，新契约不再生成）/`generated.mp4`/`contact_sheet.jpg`/`keyframes/<fn>`/`postprocessed/<fn>`/`segments/<N>/(keyframes|postprocessed)/<fn>`（N 正整数、fn 纯文件名），resolved-path 防穿越。
 5. **codex 沙箱**：argv 逐项见下表；永不 `shell=True`，永不 `--dangerously-bypass-*`；硬超时 `CODEX_TIMEOUT_S`；并发信号量 `CODEX_CONCURRENCY`。
-6. **密钥红线**：`ACCESS_TOKEN`/`ARK_API_KEY` 只存在于服务进程环境；不进日志/响应/meta.json；seedance 报错一律 `_sanitize` 脱敏（删含 key|authorization 行 + 抹除密钥字面值）；pipeline/codex 报错先 `clean_stderr`（剔环境变量行，截 500 字）。
+6. **密钥红线**：`ACCESS_TOKEN`/`ARK_API_KEY` 只存在于服务进程环境；不进日志/响应/meta.json；seedance/seedream/postprocess 报错一律 `app.sanitize.sanitize` 脱敏（删含 key|authorization 行 + 抹除密钥字面值，截 300 字）；pipeline/codex 报错先 `clean_stderr`（剔环境变量行，截 500 字）。
 7. **URL 下载 SSRF 防护**：`reference_url` 下载在后端进程内做（`app/downloader.py`），URL 不进 codex 沙箱（沙箱依旧断网，只有落盘视频进工作目录）：scheme 仅 http(s)、解析所得 IP 拒绝私网/回环/link-local/reserved、DNS pinning（解析一次固定 IP 直连，每次跳转独立重校验）、Content-Length 预检 + 流式写盘限 `MAX_UPLOAD_MB` + 整体超时 `DOWNLOAD_TIMEOUT_S`；连接/读取异常归一为 `DownloadError` → 422 + 回滚目录。
 
 ### codex 沙箱 argv 逐项（`CodexRunner.build_argv`，codex-cli 0.147.0 实证）
@@ -161,6 +170,6 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 ## 对外接口
 
 - `GET /api/health`（无鉴权）；`POST /api/login`（口令交换）
-- `GET/POST /api/conversations`，`GET /api/conversations/{cid}`，`GET /api/conversations/{cid}/files/{name}`，`POST /api/conversations/{cid}/submit`（均 Bearer）
+- `GET/POST /api/conversations`，`GET /api/conversations/{cid}`，`GET /api/conversations/{cid}/files/{name}`，`POST /api/conversations/{cid}/submit`，`POST /api/conversations/{cid}/postprocess`（均 Bearer）
 - `/`：StaticFiles 挂 `web/`（html=True）
 - 完整契约（字段/状态码/门控矩阵）见 `docs/agent/reference/reference.md`
