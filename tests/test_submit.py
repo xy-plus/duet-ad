@@ -241,9 +241,9 @@ def test_submit_success_200(enabled, monkeypatch):
     assert "sk-test-secret" not in (cdir / "meta.json").read_text(encoding="utf-8")
     assert not (cdir / "work" / "recheck_payload.json").exists()  # 预检临时文件已清理
 
-    # detail 冻结契约现 12 字段（meta 新增字段不外泄），has_video 按文件翻真
+    # detail 冻结契约现 14 字段（meta 新增字段不外泄），has_video 按文件翻真
     d = c.get(f"/api/conversations/{cid}", headers=AUTH).json()
-    assert len(d) == 12
+    assert len(d) == 14
     assert "task_id" not in d
     assert d["has_video"] is True
 

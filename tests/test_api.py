@@ -39,6 +39,8 @@ def test_detail_shape(client, video_1s):
         "updated_at": r.json()["updated_at"],
         "keyframes": [],
         "prompt": None,
+        "segments": [],
+        "voice_lines": [],
         "has_source": True,
         "has_video": False,
         "submit_enabled": False,

@@ -1,19 +1,30 @@
 """处理流水线：queued → processing → done|failed。
 
 步骤：extract_keyframes --fps 4 抽帧 + 分页联系表 → （voice_mode ≠ none 时）抽音轨 +
-codex 听写台词（voice_lines.json 白名单校验，落 meta.voice_lines）→ codex 沙箱按 SKILL.md
-选帧/写 prompt → 后端白名单校验（不信任 agent 输出）→ meta 落盘。不再生成 preview.mp4（生成位留空）。
+codex 听写台词（voice_lines.json 白名单校验，落 meta.voice_lines）→ scenes.py 场景检测
+（work/scenes.json）→ 按 segments 决定模式：
+- 单段模式（segments 空）：codex 沙箱按 SKILL.md 选帧/写 prompt → 后端白名单校验 →
+  meta 落盘（work/keyframes + work/prompt.txt，不加前缀）。
+- 多段模式（segments 非空）：ffmpeg 按段边界切源视频（work/segments/N/source.mp4，
+  N 从 1 起），每段独立走抽帧 → codex 分段 prompt → 校验 → 后端机械操作在 prompt 开头加
+  「不要生成背景音乐」行；段间 ThreadPoolExecutor 并发（每段目录独立，CodexRunner 自带
+  信号量兜底）；meta.voice_lines 按 start_s 归段（[start_s, end_s) 口径，恰在边界归后段），
+  每段写 work/segments/N/voice_lines.json；任一段失败 → 整体 failed（error 指明段号）；
+  meta.segments 落各段产物，顶层 keyframes/prompt 保持空值。
+scenes 检测失败（无场景/环境缺依赖）→ 回退单段模式，不做拆段。
 codex 超时/非零退出时先校验已落盘产物，完整则收养，不完整才判失败。
-codex 运行前把 skill 的 scripts/ 拷进会话目录（裁剪工具按 scripts/crop_image.py 相对引用）。
+codex 运行前把 skill 的 scripts/ 拷进工作目录（裁剪工具按 scripts/crop_image.py 相对引用）。
 流水线复用 skills/video-maker 的脚本，不重造。
 """
 
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -26,9 +37,13 @@ ROOT = Path(__file__).resolve().parent.parent
 SKILL_DIR = ROOT / "skills" / "video-maker"
 SCRIPTS_DIR = SKILL_DIR / "scripts"
 EXTRACT_SCRIPT = SCRIPTS_DIR / "extract_keyframes.py"
+SCENES_SCRIPT = ROOT / "app" / "scenes.py"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 
 MAX_PROMPT_BYTES = 32 * 1024
+SCENES_TIMEOUT_S = 300  # scenes.py 场景检测超时（长视频 PySceneDetect 较慢）
+CUT_DURATION_TOLERANCE_S = 0.1  # 切段时长允许误差（秒）
+NO_BGM_LINE = "不要生成背景音乐"  # 多段模式由后端机械加进 prompt 首行（不依赖 codex 写）
 
 
 class PipelineError(RuntimeError):
@@ -72,14 +87,27 @@ def validate_work_dir(work: Path) -> tuple[list[str], str]:
     return frames, prompt
 
 
-def _codex_prompt(cdir: Path) -> str:
-    return f"""按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。输入在 work/，产物（keyframes/ 与 prompt.txt）必须按文档写入 work/。
-
-硬性禁令：
+def _hard_rules(cdir: Path) -> str:
+    """codex prompt 硬性禁令四条（口播/选帧/分段各步共用）。"""
+    return f"""硬性禁令：
 - 运行 Python 脚本一律用 {sys.executable}（系统 python3 缺 cv2）。
 - 只在 {cdir} 内创建/修改文件。
 - 禁止联网（沙箱已断网，联网必然失败）。
-- 禁止打印、读取或记录任何环境变量。
+- 禁止打印、读取或记录任何环境变量。"""
+
+
+def _codex_prompt(cdir: Path) -> str:
+    return f"""按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。输入在 work/，产物（keyframes/ 与 prompt.txt）必须按文档写入 work/。
+
+{_hard_rules(cdir)}
+"""
+
+
+def _segment_prompt(cdir: Path, index: int, start_s: float, end_s: float) -> str:
+    """分段 codex prompt：指明按 SKILL.md 分段模式处理 work/segments/N/（cwd 即该段目录）。"""
+    return f"""按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。按 SKILL.md 分段模式处理 work/segments/{index}/（本段 {start_s:.3f}~{end_s:.3f} 秒）：当前工作目录即该段目录，输入含其中的帧与联系表、全片场景清单 scenes.json（已拷入该目录）与该段台词 voice_lines.json（如存在）；产物（keyframes/ 与 prompt.txt）必须按文档写入该目录。
+
+{_hard_rules(cdir)}
 """
 
 
@@ -99,11 +127,7 @@ def _voice_prompt(cdir: Path, voice_mode: str, target_language: str, duration_s:
 - {rule}
 - 输出 work/voice_lines.json（UTF-8）：JSON 数组 [{{"text": "...", "start_s": 0.5, "end_s": 2.1}}]，0 ≤ start_s < end_s ≤ 音频时长，按 start_s 升序，覆盖人声区间；不写其他文件。
 
-硬性禁令：
-- 运行 Python 脚本一律用 {sys.executable}（系统 python3 缺 cv2）。
-- 只在 {cdir} 内创建/修改文件。
-- 禁止联网（沙箱已断网，联网必然失败）。
-- 禁止打印、读取或记录任何环境变量。
+{_hard_rules(cdir)}
 """
 
 
@@ -119,11 +143,11 @@ def _load_voice_lines(work: Path, duration_s: float) -> list[dict]:
 def _voice_step(
     settings: Settings, cid: str, cdir: Path, work: Path, runner,
     voice_mode: str, target_language: str,
-) -> None:
+) -> list[dict]:
     """口播步（抽帧后）：抽音轨 → codex 听写 → 白名单校验 → voice_lines 落 meta。
 
     时长约束用源视频时长，取自抽帧步产出的 manifest.json。失败 → PipelineError 走现有
-    meta failed 落盘链路。
+    meta failed 落盘链路。返回白名单净化后的台词列表（多段模式按 start_s 归段用）。
     """
     target_language = (target_language or "").strip()  # 纯空白串视为缺失，不生成「翻译成   」prompt
     if voice_mode not in ("keep", "rewrite", "translate"):
@@ -153,6 +177,147 @@ def _voice_step(
     else:
         lines = _load_voice_lines(work, duration_s)
     storage.update_meta(settings.data_dir, cid, voice_lines=lines)
+    return lines
+
+
+def _load_scenes(work: Path) -> list[dict]:
+    """读并校验 work/scenes.json；返回 segments（空 = 单段模式）。缺失/非法 → PipelineError。"""
+    try:
+        data = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise PipelineError("scenes.json missing or invalid") from None
+    segments = data.get("segments") if isinstance(data, dict) else None
+    if not isinstance(segments, list):
+        raise PipelineError("scenes.json missing segments")
+    out: list[dict] = []
+    for i, seg in enumerate(segments):
+        if not isinstance(seg, dict) or not isinstance(seg.get("index"), int):
+            raise PipelineError(f"scenes.json segments[{i}] must be an object with int index")
+        start_s, end_s = seg.get("start_s"), seg.get("end_s")
+        for key, val in (("start_s", start_s), ("end_s", end_s)):
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise PipelineError(f"scenes.json segments[{i}].{key} must be a number")
+        start_s, end_s = float(start_s), float(end_s)
+        if not (math.isfinite(start_s) and math.isfinite(end_s) and start_s < end_s):
+            raise PipelineError(f"scenes.json segments[{i}] invalid bounds: {start_s}..{end_s}")
+        out.append({"index": seg["index"], "start_s": start_s, "end_s": end_s})
+    return out
+
+
+def _detect_segments(source: Path, work: Path) -> list[dict]:
+    """跑 app/scenes.py 检测场景并读拆段建议。
+
+    检测失败（无场景硬切、缺 PySceneDetect 等，scenes.py 非零退出）→ 回退空列表 =
+    单段模式，不判失败；scenes.json 已产出但非法 → PipelineError（自己写坏的不容忍）。
+    """
+    try:
+        _run_cmd(
+            [sys.executable, str(SCENES_SCRIPT), str(source), "--work-dir", str(work)],
+            timeout=SCENES_TIMEOUT_S,
+            step="scenes",
+        )
+    except PipelineError as e:
+        print(f"scenes detection failed ({e}); falling back to single-segment mode")
+        return []
+    return _load_scenes(work)
+
+
+def _probe_duration(path: Path) -> float:
+    """ffprobe 探测视频时长（秒）；失败 → PipelineError。"""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise PipelineError("ffprobe timed out after 30s") from None
+    except FileNotFoundError:
+        raise PipelineError("ffprobe not found on PATH") from None
+    if proc.returncode != 0:
+        raise PipelineError(f"ffprobe exit {proc.returncode}: {clean_stderr(proc.stderr)}")
+    try:
+        return float(json.loads(proc.stdout)["format"]["duration"])
+    except (ValueError, KeyError, TypeError):
+        raise PipelineError("cannot parse video duration") from None
+
+
+def _cut_segment(source: Path, start_s: float, end_s: float, segdir: Path) -> None:
+    """ffmpeg 按段边界切源视频（-ss 在 -i 前重编码）+ ffprobe 验证切出时长误差 <0.1s。"""
+    segdir.mkdir(parents=True, exist_ok=True)
+    out = segdir / "source.mp4"
+    length = end_s - start_s
+    _run_cmd(
+        ["ffmpeg", "-y", "-ss", f"{start_s:.3f}", "-i", str(source),
+         "-to", f"{length:.3f}", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", str(out)],
+        timeout=300,
+        step="segment cut",
+    )
+    duration = _probe_duration(out)
+    if abs(duration - length) > CUT_DURATION_TOLERANCE_S:
+        raise PipelineError(
+            f"segment cut duration {duration:.3f}s off target {length:.3f}s "
+            f"beyond tolerance {CUT_DURATION_TOLERANCE_S}s"
+        )
+
+
+def attribute_lines(lines: list[dict], segments: list[dict]) -> dict[int, list[dict]]:
+    """按台词 start_s 落入段 [start_s, end_s) 归段（恰在边界归后段）；返回 {index: [台词]}。"""
+    result: dict[int, list[dict]] = {seg["index"]: [] for seg in segments}
+    for line in lines:
+        for seg in segments:
+            if seg["start_s"] <= line["start_s"] < seg["end_s"]:
+                result[seg["index"]].append(line)
+                break
+    return result
+
+
+def _process_segment(cdir: Path, work: Path, source: Path, seg: dict, runner,
+                     lines: list[dict]) -> dict:
+    """单段完整流程：切段 → 抽帧 → codex 分段 prompt → 校验 → 后端加「不要生成背景音乐」前缀。
+
+    任一失败包装为 PipelineError 并指明段号；返回 meta.segments 条目。
+    """
+    index = seg["index"]
+    segdir = work / "segments" / str(index)
+    try:
+        _cut_segment(source, seg["start_s"], seg["end_s"], segdir)
+        _run_cmd(
+            [sys.executable, str(EXTRACT_SCRIPT), str(segdir / "source.mp4"),
+             "--out-dir", str(segdir), "--fps", "4"],
+            timeout=120,
+            step=f"segment {index} extract",
+        )
+        # 裁剪工具按 scripts/crop_image.py 相对引用；分段模式 codex 的 cwd 是段目录
+        shutil.copytree(SCRIPTS_DIR, segdir / "scripts")
+        # 该段台词（白名单净化后）与全片场景清单，供 codex 参考定位
+        if lines:
+            (segdir / "voice_lines.json").write_text(
+                json.dumps(lines, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        shutil.copy(work / "scenes.json", segdir / "scenes.json")
+        try:
+            runner.run(segdir, _segment_prompt(cdir, index, seg["start_s"], seg["end_s"]))
+        except CodexError as e:
+            # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
+            try:
+                validate_work_dir(segdir)
+            except PipelineError:
+                raise e from None
+        keyframes, prompt = validate_work_dir(segdir)
+        prefixed = NO_BGM_LINE + "\n" + prompt  # 后端机械操作，不依赖 codex 写
+        (segdir / "prompt.txt").write_text(prefixed, encoding="utf-8")
+        return {
+            "index": index,
+            "start_s": seg["start_s"],
+            "end_s": seg["end_s"],
+            "keyframes": keyframes,
+            "prompt": prefixed,
+            "lines": [line["text"] for line in lines],
+        }
+    except Exception as e:
+        raise PipelineError(f"segment {index} failed: {e}") from None
 
 
 def run(settings: Settings, cid: str, runner) -> None:
@@ -179,24 +344,43 @@ def run(settings: Settings, cid: str, runner) -> None:
         )
         # 口播步放在抽帧之后：ASR 的输入含 work/manifest.json（抽帧步产物）
         voice_mode = meta.get("voice_mode", "none")
+        voice_lines: list[dict] | None = None
         if voice_mode != "none":
-            _voice_step(
+            voice_lines = _voice_step(
                 settings, cid, cdir, work, runner, voice_mode,
                 meta.get("target_language") or "",
             )
-        # skill 的裁剪工具以 scripts/crop_image.py 相对工作目录引用，codex 的 cwd 是 cdir
-        shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
-        try:
-            runner.run(cdir, _codex_prompt(cdir))
-        except CodexError as e:
-            # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
+        segments = _detect_segments(source, work)
+        if not segments:
+            # 单段模式：现有流程原样（work/keyframes + work/prompt.txt，不加前缀）
+            shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
             try:
-                validate_work_dir(work)
-            except PipelineError:
-                raise e from None
-        keyframes, prompt = validate_work_dir(work)
-        storage.update_meta(
-            settings.data_dir, cid, status="done", keyframes=keyframes, prompt=prompt
-        )
+                runner.run(cdir, _codex_prompt(cdir))
+            except CodexError as e:
+                # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
+                try:
+                    validate_work_dir(work)
+                except PipelineError:
+                    raise e from None
+            keyframes, prompt = validate_work_dir(work)
+            storage.update_meta(
+                settings.data_dir, cid, status="done", keyframes=keyframes, prompt=prompt
+            )
+        else:
+            # 多段模式：各段目录独立、无共享状态，线程池并发；CodexRunner.run 自带信号量兜底
+            lines_by_seg = attribute_lines(voice_lines or [], segments)
+            workers = min(len(segments), max(1, settings.codex_concurrency))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                seg_metas = list(
+                    pool.map(
+                        lambda seg: _process_segment(
+                            cdir, work, source, seg, runner,
+                            lines_by_seg.get(seg["index"], []),
+                        ),
+                        segments,
+                    )
+                )
+            # 顶层 keyframes/prompt 保持空值（各段产物在 segments 列表里，不重复写）
+            storage.update_meta(settings.data_dir, cid, status="done", segments=seg_metas)
     except Exception as e:
         storage.update_meta(settings.data_dir, cid, status="failed", error=str(e)[:500])
