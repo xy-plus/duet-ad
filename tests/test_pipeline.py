@@ -1,5 +1,6 @@
 """任务 B：处理流水线（extract --fps 4 → codex 沙箱 → 白名单校验 → meta 落盘）。"""
 import base64
+import json
 import os
 import re
 import shutil
@@ -15,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import codex_runner, pipeline, storage
+from app import codex_runner, pipeline, storage, voice
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
@@ -443,6 +444,237 @@ def test_run_validation_failure(tmp_path, video_1s, monkeypatch):
     assert "keyframe" in m["error"]
 
 
+# ---------- 口播步（ASR，抽帧之后） ----------
+
+VOICE_LINES = [
+    {"text": "第一句。", "start_s": 0.0, "end_s": 0.5},
+    {"text": "第二句。", "start_s": 0.5, "end_s": 1.0},
+]
+
+
+def _fake_extract_ok(argv, *, timeout, step, cwd=None):
+    """extract 假子进程：写 manifest（含 duration_seconds，口播步要读）。"""
+    work = Path(argv[argv.index("--out-dir") + 1])
+    (work / "contact_sheet.jpg").write_bytes(b"sheet")
+    (work / "manifest.json").write_text(
+        json.dumps({"duration_seconds": 1.0}), encoding="utf-8"
+    )
+
+
+def _set_voice_mode(settings, meta, voice_mode, target_language=""):
+    changes = {"voice_mode": voice_mode}
+    if target_language:
+        changes["target_language"] = target_language
+    storage.update_meta(settings.data_dir, meta["id"], **changes)
+
+
+def _no_codex(self, workdir, prompt):
+    raise AssertionError("codex must not run")
+
+
+def test_run_voice_none_skips_asr(tmp_path, video_1s, fake_steps):
+    """voice_mode=none（默认）不跑口播步：codex 只被调一次、无 voice 产物。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    cdir = settings.data_dir / meta["id"]
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "done"
+    assert "voice_lines" not in m
+    (codex_call,) = fake_steps["codex"]
+    assert "voice.mp3" not in codex_call["prompt"] and "听写" not in codex_call["prompt"]
+    assert not (cdir / "work" / "voice.mp3").exists()
+
+
+def test_run_voice_keep_runs_asr_and_stores_lines(tmp_path, video_1s, monkeypatch):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    cdir = settings.data_dir / meta["id"]
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    codex_calls = []
+
+    def fake_codex(self, workdir, prompt):
+        codex_calls.append({"workdir": Path(workdir), "prompt": prompt})
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:  # ASR 调用
+            (work / "voice_lines.json").write_text(json.dumps(VOICE_LINES), encoding="utf-8")
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "done" and m["error"] is None
+    assert m["voice_lines"] == VOICE_LINES
+    assert (cdir / "work" / "voice.mp3").read_bytes() == b"mp3-bytes"
+
+    # 两次 codex 调用：ASR 在前（抽帧之后）、video-maker 在后；ASR 不带 SKILL.md
+    assert len(codex_calls) == 2
+    (asr_call, maker_call) = codex_calls
+    asr_prompt = asr_call["prompt"]
+    assert "work/voice.mp3" in asr_prompt
+    assert "work/manifest.json" in asr_prompt
+    assert "1.000" in asr_prompt  # 时长数字直传 prompt
+    assert "原文保持" in asr_prompt
+    assert str(pipeline.SKILL_MD) not in asr_prompt
+    for needle in (sys.executable, str(cdir), "禁止联网", "环境变量"):
+        assert needle in asr_prompt, needle
+    assert str(pipeline.SKILL_MD) in maker_call["prompt"]
+
+
+def test_run_voice_translate_prompt_has_target_language(tmp_path, video_1s, monkeypatch):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "translate", target_language="英文")
+    calls = []
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        calls.append(prompt)
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(json.dumps(VOICE_LINES), encoding="utf-8")
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "done"
+    assert m["voice_lines"] == VOICE_LINES
+    assert "翻译成英文" in calls[0]
+
+
+def test_run_voice_translate_requires_target_language(tmp_path, video_1s, monkeypatch):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "translate")  # 契约要求 translate 必带 target_language
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(CodexRunner, "run", _no_codex)
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "failed"
+    assert "target_language" in m["error"]
+
+
+def test_run_voice_no_audio_track_fails(tmp_path, video_1s, monkeypatch):
+    """上传时 422 已拦无音轨，这里兜底：抽不到音轨 → failed。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(CodexRunner, "run", _no_codex)
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "failed"
+    assert "audio" in m["error"]
+
+
+def test_run_voice_codex_timeout_salvages_complete_lines(tmp_path, video_1s, monkeypatch):
+    """ASR 的 codex 超时被杀但 voice_lines.json 已完整 → 收养，继续 video-maker。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    calls = {"asr": 0, "maker": 0}
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            calls["asr"] += 1
+            (work / "voice_lines.json").write_text(json.dumps(VOICE_LINES), encoding="utf-8")
+            raise CodexError("codex timed out after 600s")
+        calls["maker"] += 1
+        _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "done" and m["error"] is None
+    assert m["voice_lines"] == VOICE_LINES
+    assert calls == {"asr": 1, "maker": 1}
+
+
+def test_run_voice_codex_failure_no_product(tmp_path, video_1s, monkeypatch):
+    """ASR 失败且无完整产物 → 报原始 CodexError。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def bad_codex(self, workdir, prompt):
+        if "voice.mp3" in prompt:  # 只有 ASR 调用失败；video-maker 正常则验证断言只针对 ASR
+            raise CodexError("codex timed out after 600s")
+        _write_valid_package(Path(workdir) / "work")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", bad_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "failed"
+    assert "timed out" in m["error"]
+
+
+def test_run_voice_validation_failure(tmp_path, video_1s, monkeypatch):
+    """ASR 产物过不了白名单 → failed，错误指明 voice_lines。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def bad_codex(self, workdir, prompt):
+        (Path(workdir) / "work" / "voice_lines.json").write_bytes(b"not json")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", bad_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "failed"
+    assert "voice_lines" in m["error"]
+
+
 # ---------- HTTP 接线 ----------
 
 
@@ -552,6 +784,76 @@ def _write_stub_codex(bin_dir: Path, frames: int) -> Path:
     )
     stub.chmod(0o755)
     return stub
+
+
+def _write_stub_codex_voice(bin_dir: Path, frames: int) -> Path:
+    """桩 codex 兼处理两种调用：ASR 调用写 voice_lines.json，video-maker 调用挑帧写 prompt。"""
+    stub = bin_dir / "codex"
+    stub.write_text(
+        f"#!{sys.executable}\n"
+        + textwrap.dedent(
+            f"""\
+            import json, shutil, sys
+            from pathlib import Path
+
+            argv = sys.argv[1:]
+            workdir = Path(argv[argv.index("-C") + 1])
+            out = Path(argv[argv.index("-o") + 1])
+            work = workdir / "work"
+            if "voice.mp3" in argv[-1]:
+                (work / "voice_lines.json").write_text(
+                    json.dumps([{{"text": "你好，世界。", "start_s": 0.0, "end_s": 1.0}}]),
+                    encoding="utf-8",
+                )
+                out.write_text("asr done", encoding="utf-8")
+                raise SystemExit(0)
+            kdir = work / "keyframes"
+            kdir.mkdir(exist_ok=True)
+            frames = sorted(work.glob("*_frame_*.png"))[:{frames}]
+            assert frames, "no extracted frames in work/"
+            for i, src in enumerate(frames, start=1):
+                shutil.copy(src, kdir / f"{{i:02d}}.png")
+            (work / "prompt.txt").write_text({PROMPT_TEXT!r} + "（桩产物）", encoding="utf-8")
+            out.write_text("stub done", encoding="utf-8")
+            """
+        ),
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def test_full_pipeline_voice_with_stub_codex(tmp_path, monkeypatch):
+    """真 subprocess 全链路含口播：extract → ffmpeg 抽音轨 → 桩 codex ASR → 桩 codex 选帧 → done。"""
+    video = tmp_path / "talk.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=10",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-shortest", "-pix_fmt", "yuv420p", str(video),
+        ],
+        check=True, capture_output=True,
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_stub_codex_voice(bin_dir, 3)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video)
+    _set_voice_mode(settings, meta, "keep")
+    cid = meta["id"]
+    cdir = settings.data_dir / cid
+
+    pipeline.run(settings, cid, CodexRunner(settings.codex_timeout_s, settings.codex_concurrency))
+
+    m = storage.load_meta(settings.data_dir, cid)
+    assert m["status"] == "done", m["error"]
+    assert m["voice_lines"] == [{"text": "你好，世界。", "start_s": 0.0, "end_s": 1.0}]
+    assert (cdir / "work" / "voice.mp3").is_file()
+    assert (cdir / "work" / "voice_lines.json").is_file()
+    assert m["keyframes"] == ["01.png", "02.png", "03.png"]
 
 
 def test_full_pipeline_with_stub_codex(tmp_path, video_1s, monkeypatch):
