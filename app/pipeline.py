@@ -2,6 +2,7 @@
 
 步骤：extract_keyframes --fps 4 抽帧 + 分页联系表 → codex 沙箱按 SKILL.md 选帧/写 prompt →
 后端白名单校验（不信任 agent 输出）→ meta 落盘。不再生成 preview.mp4（生成位留空）。
+codex 超时/非零退出时先校验已落盘产物，完整则收养，不完整才判失败。
 codex 运行前把 skill 的 scripts/ 拷进会话目录（裁剪工具按 scripts/crop_image.py 相对引用）。
 流水线复用 skills/video-maker 的脚本，不重造。
 """
@@ -13,8 +14,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import cv2
+
 from app import storage
-from app.codex_runner import clean_stderr
+from app.codex_runner import CodexError, clean_stderr
 from app.config import Settings
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,6 +54,9 @@ def validate_work_dir(work: Path) -> tuple[list[str], str]:
     )
     if not 1 <= len(frames) <= 9:
         raise PipelineError(f"keyframe count {len(frames)} not in 1..9")
+    for name in frames:
+        if cv2.imread(str(work / "keyframes" / name)) is None:
+            raise PipelineError(f"keyframe undecodable: {name}")
 
     prompt_path = work / "prompt.txt"
     if not prompt_path.is_file():
@@ -65,7 +71,7 @@ def validate_work_dir(work: Path) -> tuple[list[str], str]:
 
 
 def _codex_prompt(cdir: Path) -> str:
-    return f"""按技能文档执行（只读）：{SKILL_MD}。输入在 work/。
+    return f"""按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。输入在 work/，产物（keyframes/ 与 prompt.txt）必须按文档写入 work/。
 
 硬性禁令：
 - 运行 Python 脚本一律用 {sys.executable}（系统 python3 缺 cv2）。
@@ -98,7 +104,14 @@ def run(settings: Settings, cid: str, runner) -> None:
         )
         # skill 的裁剪工具以 scripts/crop_image.py 相对工作目录引用，codex 的 cwd 是 cdir
         shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
-        runner.run(cdir, _codex_prompt(cdir))
+        try:
+            runner.run(cdir, _codex_prompt(cdir))
+        except CodexError as e:
+            # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
+            try:
+                validate_work_dir(work)
+            except PipelineError:
+                raise e from None
         keyframes, prompt = validate_work_dir(work)
         storage.update_meta(
             settings.data_dir, cid, status="done", keyframes=keyframes, prompt=prompt

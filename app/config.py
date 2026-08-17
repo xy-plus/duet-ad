@@ -10,7 +10,7 @@ class Settings:
     max_duration_s: int = 300
     enable_seedance_submit: bool = False
     data_dir: Path = Path("data")
-    codex_timeout_s: int = 600
+    codex_timeout_s: int = 1800
     codex_concurrency: int = 10
     # queued 状态会话数上限（不计 processing/done/failed），超过即 429
     max_queued: int = 100
@@ -31,7 +31,7 @@ def get_settings() -> Settings:
         max_duration_s=int(os.environ.get("MAX_DURATION_S", "300")),
         enable_seedance_submit=os.environ.get("ENABLE_SEEDANCE_SUBMIT", "").lower() in ("1", "true", "yes"),
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
-        codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "600")),
+        codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),
         max_queued=int(os.environ.get("MAX_QUEUED", "100")),
         tiktok_proxy=os.environ.get("TIKTOK_PROXY", ""),

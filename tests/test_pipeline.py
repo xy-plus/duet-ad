@@ -1,4 +1,5 @@
 """任务 B：处理流水线（extract --fps 4 → codex 沙箱 → 白名单校验 → meta 落盘）。"""
+import base64
 import os
 import re
 import shutil
@@ -24,6 +25,11 @@ CROP_SCRIPT = ROOT / "skills" / "video-maker" / "scripts" / "crop_image.py"
 
 PROMPT_TEXT = "生成一支 15 秒、9:16 竖屏、720p、写实手机实拍风格的清洁短视频。"
 
+# 1×1 真实 PNG（validate_work_dir 会用 cv2 解码校验，占位字节过不了）
+_PX_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
 
 def _write_valid_package(work: Path, frames: int = 3, prompt: str = PROMPT_TEXT):
     """按约定文件名造一套合法产物，返回关键帧文件名列表。"""
@@ -32,7 +38,7 @@ def _write_valid_package(work: Path, frames: int = 3, prompt: str = PROMPT_TEXT)
     names = []
     for i in range(1, frames + 1):
         name = f"{i:02d}.png"
-        (kdir / name).write_bytes(b"\x89PNG")
+        (kdir / name).write_bytes(_PX_PNG)
         names.append(name)
     (work / "prompt.txt").write_text(prompt, encoding="utf-8")
     return names
@@ -392,6 +398,30 @@ def test_run_codex_timeout(tmp_path, video_1s, monkeypatch):
     assert "timed out" in m["error"]
 
 
+def test_run_codex_timeout_salvages_complete_output(tmp_path, video_1s, monkeypatch):
+    """codex 超时被杀但产物已完整落盘 → 收养为 done。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+
+    def fake_cmd(argv, *, timeout, step, cwd=None):
+        if step == "extract":
+            work = Path(argv[argv.index("--out-dir") + 1])
+            (work / "contact_sheet.jpg").write_bytes(b"sheet")
+            (work / "manifest.json").write_text("{}")
+
+    def slow_codex(self, workdir, prompt):
+        _write_valid_package(Path(workdir) / "work")  # 被杀前产物已写完
+        raise CodexError("codex timed out after 600s")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(CodexRunner, "run", slow_codex)
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "done"
+    assert m["keyframes"] == ["01.png", "02.png", "03.png"]
+    assert m["prompt"] == PROMPT_TEXT
+
+
 def test_run_validation_failure(tmp_path, video_1s, monkeypatch):
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
@@ -472,7 +502,7 @@ def test_config_pipeline_fields(monkeypatch):
     monkeypatch.delenv("MAX_QUEUED")
     monkeypatch.delenv("ENABLE_PIPELINE")
     s = get_settings()
-    assert s.codex_timeout_s == 600
+    assert s.codex_timeout_s == 1800
     assert s.codex_concurrency == 10
     assert s.max_queued == 100
     assert s.enable_pipeline is True  # 生产路径默认开
