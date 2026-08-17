@@ -29,20 +29,23 @@ links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/p
 
 ### `POST /api/conversations`
 
-- 请求：multipart，`file` 与 `reference_url`（http(s) 直链 / TikTok 视频页）恰好一个 + `note`（可选，默认 `""`）+ `client_request_id`（可选幂等键，格式 `^[0-9A-Za-z-]{8,64}$`，空 = 不参与幂等）
+- 请求：multipart，`file` 与 `reference_url`（http(s) 直链 / TikTok 视频页）恰好一个 + `note`（可选，默认 `""`）+ `client_request_id`（可选幂等键，格式 `^[0-9A-Za-z-]{8,64}$`，空 = 不参与幂等）+ `voice_mode`（`none|keep|rewrite|translate`，默认 `none`）+ `target_language`（仅 `translate` 时必填非空，其余模式忽略）
 - 201 → `{"id": "<32位hex>", "status": "queued"}`；`enable_pipeline` 开时登记后台流水线（经管道闸，见架构）
 - 200 → `{"id", "status"}`：`client_request_id` 命中既有会话 meta（扫 meta.json 查重），不建目录、不重复入队
 - 400 `provide exactly one of file or reference_url`：`file`/`reference_url` 都不给或都给
 - 400 `invalid client_request_id`：幂等键非空但不合格式
+- 422 `invalid voice_mode: <v>`：`voice_mode` 不在枚举
+- 422 `target_language required for translate`：`translate` 模式缺目标语言（strip 后为空）
 - 429 `too many uploads`：同 IP 1 分钟超 10 次（内存滑动窗口，进程重启清零）
 - 429 `too many queued tasks`：`queued` 状态会话数达 `MAX_QUEUED`（processing/done/failed 不计；查重+计数+建目录在同一把锁内，无竞态）
 - 422：上传/下载校验链失败（`UploadError`/`DownloadError`），detail 为具体原因；失败即回滚删除整个会话目录
 
-上传校验链（顺序执行，`storage.save_upload` → `storage.probe_video`）：
+上传校验链（顺序执行，`storage.save_upload` → `storage.probe_video` → [口播模式] `storage.probe_audio`）：
 
 1. 扩展名 ∈ `{.mp4, .mov, .webm}`（小写化），否则 `unsupported extension: <ext>`
 2. 流式落盘（1MB 块），累计超 `MAX_UPLOAD_MB*1024*1024` → `file exceeds <n> bytes`，已写部分删除
 3. ffprobe 实探（30s 超时）：打不开 → `ffprobe failed: ...` / `unreadable video file`；时长解析失败 → `cannot parse video duration`；时长超 `MAX_DURATION_S` → `duration <d>s exceeds <n>s`
+4. `voice_mode != none` 时音轨探测（`ffprobe -select_streams a`，30s 超时）：无音轨 → 422 `no audio track in video` + 回滚；`voice_mode`/`target_language`（仅 translate）落 meta 内部字段，不进 detail 响应
 
 URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）：TikTok 视频页先经 TikWM API 解析出 play 直链；下载带 SSRF 防护（见架构安全模型），任一步失败（含解析到私网、HTTP 非 2xx、超限/超时/空文件、连接/读取异常归一）抛 `DownloadError` → 422 + 回滚；落盘 `source.<ext>`（后缀取 URL path，白名单外默认 `.mp4`）后与文件分支汇合同一 `probe_video`
 
@@ -96,7 +99,8 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 - `app.config.Settings` — frozen dataclass，11 字段（见架构配置表）；直建默认 `enable_pipeline=False`
 - `app.auth.require_auth(request, cred)` — FastAPI 依赖，Bearer 校验
 - `app.main.create_app(settings) -> FastAPI` — 应用工厂（测试注入用）；模块级 `app = create_app(get_settings())`
-- `app.storage.new_conversation(data_dir, note, orig_name, client_request_id="") -> dict` — 建目录 + 初始 meta（status=queued）；幂等键非空才落 meta
+- `app.storage.new_conversation(data_dir, note, orig_name, client_request_id="", voice_mode="none", target_language="") -> dict` — 建目录 + 初始 meta（status=queued）；幂等键/目标语言非空才落 meta，`voice_mode` 恒落
+- `app.storage.probe_audio(path) -> bool` — `ffprobe -select_streams a` 探测音轨；探测失败抛 `UploadError`
 - `app.storage.update_meta(data_dir, cid, **changes) -> dict | None` — 合并写字段并刷新 `updated_at`
 - `app.storage.load_meta(data_dir, cid) -> dict | None` — cid 正则不过/文件缺 → None
 - `app.storage.list_conversations(data_dir) -> list[dict]` — 扫描合法目录，按 `created_at` 倒序

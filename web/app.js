@@ -636,6 +636,21 @@ function sourceMode() {
   return checked ? checked.value : "upload";
 }
 
+function voiceMode() {
+  const checked = document.querySelector('input[name="voice-mode"]:checked');
+  return checked ? checked.value : "none";
+}
+
+// 口播转换切换：翻译模式才显示语言填空（必填）
+function setVoiceMode() {
+  const translate = voiceMode() === "translate";
+  $("lang-input").hidden = !translate;
+  $("lang-input").required = translate;
+  state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
+  setComposerError(null);
+  updateSendBtn();
+}
+
 // 来源二选一：同一时刻只存在一种输入，切换即清空另一边
 function setSourceMode(mode) {
   const isUpload = mode === "upload";
@@ -655,7 +670,9 @@ function setSourceMode(mode) {
 
 function updateSendBtn() {
   const ready = sourceMode() === "upload" ? !!state.file : !!$("url-input").value.trim();
-  $("send-btn").disabled = state.uploading || !ready;
+  // 翻译模式必须填目标语言
+  const langReady = voiceMode() !== "translate" || !!$("lang-input").value.trim();
+  $("send-btn").disabled = state.uploading || !ready || !langReady;
 }
 
 function isVideoFile(file) {
@@ -692,14 +709,18 @@ function setUploading(on) {
   $("note-input").disabled = on;
   $("url-input").disabled = on;
   $("file-remove").disabled = on;
+  $("lang-input").disabled = on;
   document.querySelectorAll('input[name="source-mode"]').forEach((r) => {
+    r.disabled = on;
+  });
+  document.querySelectorAll('input[name="voice-mode"]').forEach((r) => {
     r.disabled = on;
   });
   updateSendBtn();
   if (!on) $("upload-progress").hidden = true;
 }
 
-function uploadConversation({ file, url, note, requestId }, onProgress) {
+function uploadConversation({ file, url, note, requestId, voiceMode: mode, targetLanguage }, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/conversations");
@@ -736,6 +757,8 @@ function uploadConversation({ file, url, note, requestId }, onProgress) {
     else if (url) fd.append("reference_url", url);
     if (note) fd.append("note", note);
     if (requestId) fd.append("client_request_id", requestId);
+    fd.append("voice_mode", mode || "none");
+    if (mode === "translate" && targetLanguage) fd.append("target_language", targetLanguage);
     xhr.send(fd);
   });
 }
@@ -747,8 +770,14 @@ async function handleSend(event) {
   const file = mode === "upload" ? state.file : null;
   const url = mode === "link" ? $("url-input").value.trim() : "";
   const note = $("note-input").value.trim();
+  const vMode = voiceMode();
+  const targetLanguage = $("lang-input").value.trim();
   if (!file && !url) {
     setComposerError(mode === "upload" ? "请先选择视频文件" : "请先粘贴视频链接");
+    return;
+  }
+  if (vMode === "translate" && !targetLanguage) {
+    setComposerError("请填写翻译目标语言");
     return;
   }
 
@@ -764,7 +793,7 @@ async function handleSend(event) {
 
   try {
     const created = await uploadConversation(
-      { file, url, note, requestId: state.clientRequestId },
+      { file, url, note, requestId: state.clientRequestId, voiceMode: vMode, targetLanguage },
       (ratio) => {
         if (url) return;
         const pct = Math.round(ratio * 100);
@@ -777,6 +806,10 @@ async function handleSend(event) {
     clearFile();
     $("note-input").value = "";
     $("url-input").value = "";
+    const noneRadio = document.querySelector('input[name="voice-mode"][value="none"]');
+    noneRadio.checked = true;
+    $("lang-input").value = "";
+    $("lang-input").hidden = true;
     setUploading(false);
     await refreshList(false);
     if (created && created.id) {
@@ -830,6 +863,16 @@ function bindEvents() {
   // 来源 radio 互斥切换
   document.querySelectorAll('input[name="source-mode"]').forEach((radio) => {
     radio.addEventListener("change", () => setSourceMode(radio.value));
+  });
+
+  // 口播转换 radio 切换
+  document.querySelectorAll('input[name="voice-mode"]').forEach((radio) => {
+    radio.addEventListener("change", setVoiceMode);
+  });
+  $("lang-input").addEventListener("input", () => {
+    state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
+    setComposerError(null);
+    updateSendBtn();
   });
 
   $("url-input").addEventListener("input", () => {

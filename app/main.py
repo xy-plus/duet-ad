@@ -87,6 +87,8 @@ def create_app(settings: Settings) -> FastAPI:
         reference_url: str = Form(""),
         note: str = Form(""),
         client_request_id: str = Form(""),
+        voice_mode: str = Form("none"),
+        target_language: str = Form(""),
     ):
         ip = request.client.host if request.client else "unknown"
         if not limiter.allow(ip):
@@ -97,6 +99,13 @@ def create_app(settings: Settings) -> FastAPI:
         client_request_id = client_request_id.strip()
         if client_request_id and not _CLIENT_REQUEST_ID_RE.match(client_request_id):
             raise HTTPException(status_code=400, detail="invalid client_request_id")
+        # 口播转换：模式白名单 + 翻译必填目标语言；非 translate 忽略 target_language
+        voice_mode = voice_mode.strip()
+        if voice_mode not in ("none", "keep", "rewrite", "translate"):
+            raise HTTPException(status_code=422, detail=f"invalid voice_mode: {voice_mode}")
+        target_language = target_language.strip()
+        if voice_mode == "translate" and not target_language:
+            raise HTTPException(status_code=422, detail="target_language required for translate")
         with create_lock:
             metas = storage.list_conversations(settings.data_dir)
             if client_request_id:
@@ -112,6 +121,8 @@ def create_app(settings: Settings) -> FastAPI:
                 note,
                 (file.filename or "") if file else reference_url,
                 client_request_id,
+                voice_mode=voice_mode,
+                target_language=target_language if voice_mode == "translate" else "",
             )
         cdir = settings.data_dir / meta["id"]
         try:
@@ -121,6 +132,8 @@ def create_app(settings: Settings) -> FastAPI:
                 # 下载最长 download_timeout_s 秒，不能堵事件循环
                 dest = await run_in_threadpool(downloader.fetch_reference, reference_url, cdir, settings)
             storage.probe_video(dest, settings.max_duration_s)
+            if voice_mode != "none" and not storage.probe_audio(dest):
+                raise storage.UploadError("no audio track in video")
         except (storage.UploadError, downloader.DownloadError) as e:
             storage.remove_conversation(settings.data_dir, meta["id"])
             raise HTTPException(status_code=422, detail=str(e)) from e

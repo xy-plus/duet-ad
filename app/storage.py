@@ -31,7 +31,8 @@ def _write_meta(cdir: Path, meta: dict) -> None:
     (cdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
 
 
-def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_id: str = "") -> dict:
+def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_id: str = "",
+                     voice_mode: str = "none", target_language: str = "") -> dict:
     cid = uuid.uuid4().hex
     cdir = data_dir / cid
     (cdir / "work").mkdir(parents=True)
@@ -46,9 +47,12 @@ def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_i
         "updated_at": now,
         "keyframes": [],
         "prompt": None,
+        "voice_mode": voice_mode,
     }
     if client_request_id:
         meta["client_request_id"] = client_request_id
+    if target_language:
+        meta["target_language"] = target_language
     _write_meta(cdir, meta)
     return meta
 
@@ -140,6 +144,24 @@ def probe_video(path: Path, max_duration_s: float) -> float:
     if duration > max_duration_s:
         raise UploadError(f"duration {duration:.1f}s exceeds {max_duration_s}s")
     return duration
+
+
+def probe_audio(path: Path) -> bool:
+    """ffprobe 探测是否有音轨（-select_streams a，同 video-maker 的 probe_audio 逻辑）。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        raise UploadError(f"ffprobe failed: {e}") from e
+    if r.returncode != 0:
+        raise UploadError("unreadable video file")
+    try:
+        return bool(json.loads(r.stdout or "{}").get("streams"))
+    except ValueError as e:
+        raise UploadError("cannot parse audio probe result") from e
 
 
 def resolve_file(data_dir: Path, cid: str, name: str) -> Path | None:
