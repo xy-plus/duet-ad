@@ -16,6 +16,7 @@ except ImportError as exc:  # pragma: no cover - environment-dependent message
         "PySceneDetect is required. Install scenedetect in a task-local environment."
     ) from exc
 
+# 与 Seedance 单段上限耦合：拆段目标每段 4~15s，仅时长 >20s 才计算
 SEGMENT_MIN_S = 4.0
 SEGMENT_MAX_S = 15.0
 SEGMENT_ONLY_ABOVE_S = 20.0
@@ -61,12 +62,11 @@ def load_manifest(work_dir: Path) -> tuple[float, list[dict]]:
 def detect_scene_bounds(video: Path, threshold: float) -> list[tuple[float, float]]:
     """用 PySceneDetect 检测场景，返回 [(start, end), ...] 时间边界列表。"""
     try:
-        detected = detect(str(video), ContentDetector(threshold=threshold))
-        # scenedetect 0.6+ 的 detect 可能返回 SceneManager，兼容取列表
-        scene_list = detected.get_scene_list() if hasattr(detected, "get_scene_list") else detected
+        # detect() 直接返回 [(FrameTimecode, FrameTimecode), ...] 边界列表（0.6.x~0.7.x 均如此）
+        scene_list = detect(str(video), ContentDetector(threshold=threshold))
     except Exception as exc:
         raise SystemExit(f"场景检测失败: {exc}") from exc
-    bounds = [(float(start), float(end)) for start, end in scene_list]
+    bounds = [(start.get_seconds(), end.get_seconds()) for start, end in scene_list]
     if not bounds:
         raise SystemExit("未检测到任何场景。")
     return bounds
@@ -179,8 +179,8 @@ def main() -> int:
     work_dir = Path(args.work_dir).expanduser().resolve()
     if not video.is_file():
         raise SystemExit(f"Video does not exist: {video}")
-    if args.threshold <= 0:
-        raise SystemExit("--threshold must be positive.")
+    if not math.isfinite(args.threshold) or args.threshold <= 0:
+        raise SystemExit("--threshold must be a positive finite number.")
     work_dir.mkdir(parents=True, exist_ok=True)
 
     duration, frames = load_manifest(work_dir)
@@ -195,7 +195,7 @@ def main() -> int:
         for index, ((start, end), group) in enumerate(zip(bounds, groups), start=1)
     ]
     result = {
-        "duration_s": duration,
+        "duration_s": round(duration, 3),  # 与 start_s/end_s 同为 3 位，round 口径一致
         "scenes": scenes,
         "segments": [
             {"index": index, "start_s": round(start, 3), "end_s": round(end, 3)}

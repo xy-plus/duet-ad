@@ -172,6 +172,21 @@ def test_manifest_missing_fields_fails(video_10s, tmp_path):
     assert result.returncode != 0
 
 
+def test_nan_threshold_fails(video_10s, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    write_manifest(work, 10.0)
+    result = subprocess.run(
+        [
+            sys.executable, str(SCENES_SCRIPT), str(video_10s),
+            "--work-dir", str(work), "--threshold", "nan",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+
+
 def test_build_segments_splits_long_scene_evenly():
     """单场景超 15s 动态均分：22s 场景 → 两段 11s。"""
     assert build_segments([(0.0, 10.0), (10.0, 32.0)], 32.0) == [
