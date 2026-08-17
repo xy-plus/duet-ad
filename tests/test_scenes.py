@@ -181,6 +181,19 @@ def test_build_segments_splits_long_scene_evenly():
     ]
 
 
+def assert_segments_valid(segments, duration):
+    """拆段不变量：非空、每段 4~15s、首 0 尾 duration、相邻无缝、单调递增。"""
+    assert segments
+    assert segments[0][0] == pytest.approx(0.0)
+    assert segments[-1][1] == pytest.approx(duration)
+    prev_end = 0.0
+    for start, end in segments:
+        assert start == pytest.approx(prev_end)  # 无缝隙
+        assert 4.0 <= end - start <= 15.0
+        assert end > start  # 单调
+        prev_end = end
+
+
 @pytest.mark.parametrize(
     "bounds,duration",
     [
@@ -193,18 +206,54 @@ def test_build_segments_splits_long_scene_evenly():
 )
 def test_build_segments_long_scene_stays_within_limits(bounds, duration):
     """超 15s 单场景：每段 4~15s、覆盖全程无缝隙、边界单调递增。"""
-    segments = build_segments(bounds, duration)
-    assert segments
-    assert segments[0][0] == 0.0
-    assert segments[-1][1] == pytest.approx(duration)
-    for prev, cur in zip(segments, segments[1:]):
-        assert cur[0] == pytest.approx(prev[1])  # 无缝隙
-        assert cur[0] >= prev[0]  # 单调
-    for start, end in segments:
-        assert 4.0 <= end - start <= 15.0
+    assert_segments_valid(build_segments(bounds, duration), duration)
+
+
+@pytest.mark.parametrize(
+    "bounds,duration",
+    [
+        ([(0.0, 10.0), (10.0, 25.0), (25.0, 28.0)], 28.0),  # 反例：合并后 18s 段
+        ([(0.0, 1.0), (1.0, 16.0), (16.0, 21.0)], 21.0),  # 反例：首段 1s
+        ([(0.0, 8.0), (8.0, 23.0), (23.0, 26.0)], 26.0),  # [8,15,3]
+        ([(0.0, 4.0), (4.0, 18.0), (18.0, 21.0)], 21.0),  # [4,14,3]
+        ([(0.0, 14.0), (14.0, 17.0), (17.0, 23.0)], 23.0),  # [14,3] + 6s 尾
+    ],
+)
+def test_build_segments_violation_cases(bounds, duration):
+    """对抗审查反例与短场景变体：任意输入输出均满足拆段不变量。"""
+    assert_segments_valid(build_segments(bounds, duration), duration)
 
 
 def test_build_segments_merges_short_tail():
-    """末段不足 4s 并入前段。"""
+    """末段不足 4s 并入前段（合并体超 15s 则均分）。"""
     bounds = [(0.0, 8.0), (8.0, 14.0), (14.0, 27.5), (27.5, 29.5)]
-    assert build_segments(bounds, 29.5) == [(0.0, 14.0), (14.0, 29.5)]
+    assert_segments_valid(build_segments(bounds, 29.5), 29.5)
+
+
+def _scene_length_sequences():
+    """生成场景长 1..16s、总时长 21..48s 的所有有序组合（2~4 个场景）。"""
+
+    def generate(prefix, total):
+        if len(prefix) >= 2 and 21 <= total <= 48:
+            yield tuple(prefix)
+        if len(prefix) < 4:
+            for length in range(1, 17):
+                if total + length <= 48:
+                    yield from generate(prefix + [length], total + length)
+
+    return generate([], 0)
+
+
+def test_build_segments_exhaustive_invariants():
+    """穷举 59,865 个场景组合断言拆段不变量——防回归关键。"""
+    count = 0
+    for lengths in _scene_length_sequences():
+        duration = float(sum(lengths))
+        bounds = []
+        cum = 0.0
+        for length in lengths:
+            bounds.append((cum, cum + length))
+            cum += length
+        assert_segments_valid(build_segments(bounds, duration), duration)
+        count += 1
+    assert count == 59865

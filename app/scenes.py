@@ -92,38 +92,85 @@ def group_frames(
     return groups
 
 
+def _assert_segments_valid(
+    segments: list[tuple[float, float]], duration: float
+) -> None:
+    """防御性断言拆段不变量：每段 4~15s、相邻无缝、首 0 尾 duration（算法已保证，兜底）。"""
+    if not segments:
+        raise SystemExit("拆段结果为空。")
+    prev_end = 0.0
+    for start, end in segments:
+        if abs(start - prev_end) > 1e-6:
+            raise SystemExit(f"拆段边界不连续: {start:.3f}s 与 {prev_end:.3f}s")
+        if end - start < SEGMENT_MIN_S - 1e-9 or end - start > SEGMENT_MAX_S + 1e-9:
+            raise SystemExit(f"拆段长度违规: {start:.3f}s - {end:.3f}s")
+        prev_end = end
+    if abs(segments[0][0]) > 1e-6 or abs(prev_end - duration) > 1e-6:
+        raise SystemExit(
+            f"拆段未覆盖全程: [{segments[0][0]:.3f}s, {prev_end:.3f}s] vs {duration:.3f}s"
+        )
+
+
 def build_segments(
     bounds: list[tuple[float, float]], duration: float
 ) -> list[tuple[float, float]]:
-    """按场景边界贪心聚合拆段建议：每段目标 4~15s，覆盖全程无缝隙、边界单调递增。"""
+    """按场景边界生成拆段建议：每段 4~15s、覆盖全程无缝隙、边界单调递增（算法级不变量）。"""
     if duration <= SEGMENT_ONLY_ABOVE_S:
         return []
-    segments: list[tuple[float, float]] = []
-    seg_start = seg_end = bounds[0][0]
+    # 1. 预处理：>15s 场景均分为 ceil(时长/15) 块，得原子块列表（每块 ∈ (0, 15]）
+    blocks: list[tuple[float, float]] = []
     for start, end in bounds:
         if end - start > SEGMENT_MAX_S:
-            # 单场景超 15s：动态均分为 ceil(时长/15) 段，每段必然落在 (7.5, 15]，避免固定硬切的短尾并入超长段
-            if seg_end > seg_start:
-                segments.append((seg_start, seg_end))
             piece_count = math.ceil((end - start) / SEGMENT_MAX_S)
             piece = (end - start) / piece_count
-            for k in range(1, piece_count):
-                segments.append((start + (k - 1) * piece, start + k * piece))
-            seg_start, seg_end = start + (piece_count - 1) * piece, end
-        elif end - seg_start > SEGMENT_MAX_S:
-            # 累加该场景将超 15s：闭合当前段
-            segments.append((seg_start, seg_end))
-            seg_start, seg_end = start, end
+            for k in range(piece_count):
+                block_end = end if k == piece_count - 1 else start + (k + 1) * piece
+                blocks.append((start + k * piece, block_end))
         else:
-            seg_end = end
-    if seg_end > seg_start:
-        segments.append((seg_start, seg_end))
-    # 末段不足 4s 并入前段
-    if len(segments) >= 2 and segments[-1][1] - segments[-1][0] < SEGMENT_MIN_S:
-        (_, last_end) = segments.pop()
-        (prev_start, _) = segments.pop()
-        segments.append((prev_start, last_end))
-    return segments
+            blocks.append((start, end))
+    # 2. 贪心装箱：累加块至将超 15s 时闭合当前段（闭合段长 ∈ (0, 15]）
+    segments: list[tuple[float, float]] = []
+    seg_start = 0.0  # 首段起点钉 0
+    seg_end = 0.0
+    for start, end in blocks:
+        if end - seg_start > SEGMENT_MAX_S:
+            segments.append((seg_start, seg_end))
+            seg_start = start
+        seg_end = end
+    segments.append((seg_start, seg_end))
+    # 3. 修复违规段（一轮收敛）：<4s 并入邻段（合并体 >15s 则均分成 2），>15s 均分成 2
+    fixed: list[tuple[float, float]] = list(segments)
+    i = 0
+    while i < len(fixed):
+        start, end = fixed[i]
+        length = end - start
+        if length > SEGMENT_MAX_S:
+            half = length / 2
+            fixed[i : i + 1] = [(start, start + half), (start + half, end)]
+        elif length < SEGMENT_MIN_S:
+            if i == 0 and len(fixed) > 1:
+                # 首段并入后段
+                next_start, next_end = fixed[1]
+                if next_end - start > SEGMENT_MAX_S:
+                    half = (next_end - start) / 2
+                    fixed[0:2] = [(start, start + half), (start + half, next_end)]
+                else:
+                    fixed[0:2] = [(start, next_end)]
+            elif i > 0:
+                # 并入前段
+                prev_start, _ = fixed[i - 1]
+                if end - prev_start > SEGMENT_MAX_S:
+                    half = (end - prev_start) / 2
+                    fixed[i - 1 : i + 1] = [
+                        (prev_start, prev_start + half),
+                        (prev_start + half, end),
+                    ]
+                else:
+                    fixed[i - 1 : i + 1] = [(prev_start, end)]
+        i += 1
+    # 4. 防御性断言不变量
+    _assert_segments_valid(fixed, duration)
+    return fixed
 
 
 def main() -> int:
