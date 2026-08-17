@@ -27,6 +27,7 @@ links: [conversation-task]
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
 | `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：三重门控 + dry-run 预检 + 脱敏（HTTP 路由随 T5b） | conversation-task |
 | `app/seedream_task.py` | Ark Seedream 编辑任务脚本：multipart 提交 `/api/v1/images/edits`、异步轮询、b64/url 双态下载 | conversation-task |
+| `app/scenes.py` | PySceneDetect 场景检测：manifest 帧按场景分组写 scenes.json + 拆段边界建议（>20s 才计算，每段 4~15s 为算法级不变量，末尾防御断言）；流水线接入随 T4 | conversation-task |
 | `web/` | 原生 JS 单页前端（登录/会话列表/上传/轮询/结果展示），无构建 | conversation-task |
 | `skills/video-maker/` | codex agent 用的技能：`SKILL.md` + `scripts/extract_keyframes.py`、`scripts/crop_image.py`（与 web/video-maker.zip 逐字节一致） | conversation-task |
 

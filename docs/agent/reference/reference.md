@@ -142,6 +142,14 @@ meta.json（`data/<cid>/meta.json`）：
 | `has_video` | bool | 提交标记（仅提交后存在；内部字段） |
 | `submitted_at` / `task_id` | str | 提交时间 / Ark 任务 id（内部字段，读不到 task.json 则为 null） |
 
+scenes.json（`work/scenes.json`，`app/scenes.py` 产物）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `duration_s` | float | 视频时长（= manifest.duration_seconds，round 3 位） |
+| `scenes` | list | 场景边界：`index`（1 起）/`start_s`/`end_s`/`frames`（帧按 time_seconds 落入 [start_s, end_s) 分组的文件名） |
+| `segments` | list | 拆段边界建议：`index`/`start_s`/`end_s`，每段 4~15s、覆盖全程无缝隙；`duration_s` ≤ 20 时为空数组（时长 ∈ (15, 20] 超 Seedance 单段上限，T4 接入时注意） |
+
 产物白名单校验（`pipeline.validate_work_dir`，任一不过即 PipelineError → `failed`）：
 
 - `work/keyframes/*.png`：数量 ∈ 1..9（新契约该目录只有选定帧 `01.png…N.png`）
@@ -149,7 +157,7 @@ meta.json（`data/<cid>/meta.json`）：
 
 ## 依赖
 
-- Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless（skill 脚本用）、pytest、httpx（TestClient）
+- Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless（skill 脚本用）、scenedetect（场景检测，`app/scenes.py` 用；`>=0.7`——0.6.x 无 FrameTimecode.seconds 属性）、pytest、httpx（TestClient）
 - 外部可执行：ffmpeg/ffprobe（探测+抽帧+测试造样例）、codex CLI（0.147.0 实证基线，仅流水线用）
-- 技能脚本：`skills/video-maker/scripts/extract_keyframes.py`（`--fps`/`--times`/`--sample-count`/`--prefix`/`--columns`/`--out-dir`）、`skills/video-maker/scripts/crop_image.py`（裁字幕/水印）；提交脚本 `app/seedance_task.py`（`create --dry-run|--confirm-submit --wait`，模型默认 `doubao-seedance-2-0-260128`，Ark `https://ark.cn-beijing.volces.com/api/v3`）
+- 技能脚本：`skills/video-maker/scripts/extract_keyframes.py`（`--fps`/`--times`/`--sample-count`/`--prefix`/`--columns`/`--out-dir`）、`skills/video-maker/scripts/crop_image.py`（裁字幕/水印）；提交脚本 `app/seedance_task.py`（`create --dry-run|--confirm-submit --wait`，模型默认 `doubao-seedance-2-0-260128`，Ark `https://ark.cn-beijing.volces.com/api/v3`）；场景脚本 `app/scenes.py`（`<video> --work-dir <work>`，PySceneDetect 场景检测 + 拆段建议，写 scenes.json）
 - 流水线固定参数：抽帧 `--fps 4`（分页联系表落 `work/`）；提交建模 `9:16 / 15s / 720p / --generate-audio / --no-watermark`（提交时现构建，无评审 payload）
