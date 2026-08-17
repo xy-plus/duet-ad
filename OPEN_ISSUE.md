@@ -28,4 +28,5 @@
 - 审查 nits（T1，不阻塞）：web/styles.css 语音选项与来源选项约 14 行逐字重复可合并选择器；index.html 的 voice-row role=radiogroup 内含 lang-input 文本输入（a11y 语义偏差）；target_language 无长度上限（与 note 同桶）；幂等查重不比对 voice 参数（前端换键规避，reference 已注明语义）。（→ web/, app/main.py）
 
 - validate_voice_lines 时间下界容差放宽到 -0.01s（_EPS_S 浮点误差允许）：审查裁决设计合理，不改。（→ app/voice.py）
+- Ark 脚本公共模块：第三只 Ark 脚本出现再抽公共模块（rule of three；seedance_task/seedream_task 的 api_key 与 HTTP 错误包装 request_json/_urlopen_json 已两份）。（→ app/seedance_task.py, app/seedream_task.py）
 - T5b 后处理 nits（审查裁决不改，记同桶）：postprocess_locks 字典常驻内存不驱逐（同 submit_locks 桶）；FACE_LINE 追加非原子写（进程中断可能只写文件或只写 meta）；重跑 face_hold 对已存在优化图无效果（跳过语义固有）；换选项重跑 409 无重置路径且 detail 对用户无下一步指引（前端可在 409 时提示「仅同选项可重跑」）；seedream.edit_image 的 out.exists() 冗余防线保留。（→ app/postprocess.py）

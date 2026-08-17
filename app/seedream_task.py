@@ -9,7 +9,7 @@
            "response_format": "b64_json", "watermark": false}
 
 响应为同步 200（实测 60s 级返回）：{"model", "created", "data": [{"b64_json": ...}]}；
-无 request_id、无异步轮询。b64_json 缺失/为空时回落 data[0].url 下载。
+无 request_id、无异步轮询。data[0].b64_json 缺失、为空或非法即失败退出（契约恒 b64_json）。
 """
 
 from __future__ import annotations
@@ -25,10 +25,10 @@ from pathlib import Path
 from typing import Any
 
 BASE_URL = "https://ark.cn-beijing.volces.com"
-# Seedream 5.0 Pro 编辑 = 图生图，走 /api/v3/images/generations（不是 SeedEdit 的 /api/v1/images/edits）
+# Seedream 5.0 Pro 编辑 = 图生图（实测契约，2026-08-18）
 EDIT_URL = f"{BASE_URL}/api/v3/images/generations"
 DEFAULT_MODEL = "doubao-seedream-5-0-pro-260628"
-RESPONSE_FORMAT = "b64_json"  # 官方支持则优先 b64（免二次下载），否则可改 "url"
+RESPONSE_FORMAT = "b64_json"  # 实测契约：响应恒 b64_json
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
@@ -47,17 +47,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Mechanical gate required for a live edit after user confirmation.",
     )
-    edit.add_argument("--state-file", help="Write the latest task JSON.")
     edit.add_argument("--request-timeout", type=float, default=300.0)
     return parser.parse_args(argv)
-
-
-def write_json(path_value: str | None, data: dict[str, Any]) -> None:
-    if not path_value:
-        return
-    path = Path(path_value).expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def api_key() -> str:
@@ -113,39 +104,30 @@ def submit_edit(
     return _urlopen_json(request, timeout)
 
 
-def save_result(task: dict[str, Any], destination: str, timeout: float) -> Path:
-    """data[0].b64_json 优先解码写盘；缺失/为空则按 data[0].url 下载。写 --out（PNG 字节落盘）。"""
+def save_result(task: dict[str, Any], destination: str) -> Path:
+    """data[0].b64_json 严格校验解码写 --out；缺失/为空/非法一律硬错误。"""
     data_list = task.get("data") or []
     first = data_list[0] if data_list else None
     b64 = (first or {}).get("b64_json")
-    if b64:
-        data = base64.b64decode(b64)
-    else:
-        url = (first or {}).get("url")
-        if not url:
-            raise RuntimeError("Successful edit response did not include image data (b64_json or url).")
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            data = response.read()
+    if not b64:
+        raise RuntimeError("Successful edit response did not include b64_json image data.")
+    data = base64.b64decode(b64, validate=True)
+    if not data:
+        raise RuntimeError("Empty image data in edit response.")
     path = Path(destination).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
-    if path.stat().st_size == 0:
-        raise RuntimeError("Downloaded image is empty.")
     print(f"Saved: {path}", flush=True)
     return path
 
 
 def summarize(task: dict[str, Any]) -> dict[str, Any]:
-    """响应摘要（b64 只记字节数，不把图塞进 state-file）。"""
+    """成功响应摘要：模型/时间 + 图片字节数（不把图本身打到 stdout）。"""
     summary = {key: task.get(key) for key in ("model", "created", "id") if key in task}
     data_list = task.get("data") or []
     first = data_list[0] if data_list else None
-    if first is None:
-        return summary
-    if first.get("b64_json"):
-        summary["image"] = {"format": "b64_json", "bytes": len(base64.b64decode(first["b64_json"]))}
-    elif first.get("url"):
-        summary["image"] = {"format": "url", "url": first["url"]}
+    if first and first.get("b64_json"):
+        summary["image_bytes"] = len(base64.b64decode(first["b64_json"], validate=True))
     return summary
 
 
@@ -172,10 +154,8 @@ def run_edit(args: argparse.Namespace) -> int:
         )
     key = api_key()
     task = submit_edit(key, args.model, prompt, image_bytes, args.request_timeout)
-    summary = summarize(task)
-    write_json(args.state_file, summary)
-    save_result(task, args.out, args.request_timeout)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    save_result(task, args.out)
+    print(json.dumps(summarize(task), ensure_ascii=False, indent=2))
     return 0
 
 

@@ -53,6 +53,7 @@ def test_edit_arg_defaults(tmp_path):
     assert args.request_timeout == 300  # 实测同步响应 60s+，默认留余量
     assert not hasattr(args, "poll_interval")  # 同步为唯一形态，轮询参数已删
     assert not hasattr(args, "poll_timeout")
+    assert not hasattr(args, "state_file")  # 无消费方，轮询时代残余已删
 
 
 def test_edit_bad_request_timeout(tmp_path):
@@ -150,14 +151,12 @@ def test_script_error_exit_nonzero_no_key_leak(tmp_path):
 # ---------- 真实提交全链路（monkeypatch urllib，同步 JSON 契约） ----------
 
 class FakeResponse:
-    """JSON 响应假实现；bytes 直接原样返回（下载分支）。"""
+    """JSON 响应假实现。"""
 
     def __init__(self, payload):
         self._payload = payload
 
     def read(self):
-        if isinstance(self._payload, bytes):
-            return self._payload
         return json.dumps(self._payload).encode("utf-8")
 
     def __enter__(self):
@@ -187,7 +186,6 @@ def test_full_chain_success_b64(tmp_path, monkeypatch, capsys):
     """实测契约：单次同步 POST，JSON body（image 为 data URI 数组），b64_json 解码落盘。"""
     monkeypatch.setenv("ARK_API_KEY", SECRET)
     out = tmp_path / "edited.png"
-    state = tmp_path / "task.json"
     src = PNG + b"fake-image-data"
     img = PNG + b"edited-image-bytes"
     b64 = base64.b64encode(img).decode("ascii")
@@ -197,7 +195,7 @@ def test_full_chain_success_b64(tmp_path, monkeypatch, capsys):
     ])
     args = seedream_task.parse_args(
         ["edit", "--image", str(_png(tmp_path)), "--prompt", "戴上眼镜",
-         "--out", str(out), "--confirm-submit", "--state-file", str(state)]
+         "--out", str(out), "--confirm-submit"]
     )
     assert seedream_task.run_edit(args) == 0
 
@@ -217,51 +215,45 @@ def test_full_chain_success_b64(tmp_path, monkeypatch, capsys):
     assert body["response_format"] == "b64_json"
     assert body["watermark"] is False
 
-    # b64 解码落盘 + state-file 写响应摘要（不塞图字节）
+    # b64 解码落盘 + stdout 打响应摘要（不塞图字节）
     assert out.read_bytes() == img
-    task = json.loads(state.read_text(encoding="utf-8"))
-    assert task["model"] == "doubao-seedream-5-0-pro-260628"
-    assert task["image"] == {"format": "b64_json", "bytes": len(img)}
-    assert "b64_json" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("entry", [
-    {"url": "https://tos.example/edited.png"},
-    {"b64_json": "", "url": "https://tos.example/edited.png"},  # b64 为空回落 url
-])
-def test_url_download_fallback(tmp_path, monkeypatch, entry):
-    """b64_json 缺失/为空 → data[0].url 下载兜底。"""
-    monkeypatch.setenv("ARK_API_KEY", SECRET)
-    out = tmp_path / "edited.png"
-    img = PNG + b"url-downloaded"
-    calls = _fake_ark(monkeypatch, [
-        {"model": "doubao-seedream-5-0-pro-260628", "data": [entry]},
-        img,
-    ])
-    args = seedream_task.parse_args(
-        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
-         "--out", str(out), "--confirm-submit"]
-    )
-    assert seedream_task.run_edit(args) == 0
-    assert len(calls) == 2
-    assert calls[1][0] == "https://tos.example/edited.png"
-    assert out.read_bytes() == img
+    assert "image_bytes" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("payload", [
     {"model": "doubao-seedream-5-0-pro-260628", "data": []},
     {"model": "doubao-seedream-5-0-pro-260628", "data": [{}]},
+    {"model": "doubao-seedream-5-0-pro-260628", "data": [{"b64_json": ""}]},
+    {"model": "doubao-seedream-5-0-pro-260628", "data": [{"url": "https://tos.example/edited.png"}]},
     {},
 ])
-def test_success_without_image_data_fails(tmp_path, monkeypatch, payload):
+def test_missing_or_empty_b64_fails(tmp_path, monkeypatch, payload):
+    """b64_json 缺失或为空 → RuntimeError（契约恒 b64_json，无 url 兜底）。"""
     monkeypatch.setenv("ARK_API_KEY", SECRET)
-    _fake_ark(monkeypatch, [payload])
+    calls = _fake_ark(monkeypatch, [payload])
     args = seedream_task.parse_args(
         ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
          "--out", str(tmp_path / "o.png"), "--confirm-submit"]
     )
-    with pytest.raises(RuntimeError, match="image"):
+    with pytest.raises(RuntimeError, match="b64_json"):
         seedream_task.run_edit(args)
+    assert len(calls) == 1  # 无兜底下载请求
+
+
+def test_bad_b64_exit_1_no_out(tmp_path, monkeypatch, capsys):
+    """非法 b64 → 硬错误退出码 1，不落盘、不泄密钥。"""
+    monkeypatch.setenv("ARK_API_KEY", SECRET)
+    out = tmp_path / "o.png"
+    _fake_ark(monkeypatch, [{"data": [{"b64_json": "!!not-base64!!"}]}])
+    rc = seedream_task.cli(
+        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
+         "--out", str(out), "--confirm-submit"]
+    )
+    assert rc == 1
+    err_text = capsys.readouterr().err
+    assert "base64" in err_text
+    assert SECRET not in err_text
+    assert not out.exists()
 
 
 def test_http_error_exit_nonzero_no_key_leak(tmp_path, monkeypatch, capsys):
