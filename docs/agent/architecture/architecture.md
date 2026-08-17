@@ -24,6 +24,7 @@ links: [conversation-task]
 | `app/codex_runner.py` | 沙箱化 `codex exec` 调用（argv、断网、env 清洗、超时、并发信号量） | conversation-task |
 | `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
+| `app/scenes.py` | PySceneDetect 场景检测：manifest 帧按场景分组写 scenes.json + 拆段边界建议（>20s 才计算，4~15s/段）；流水线接入随 T4 | conversation-task |
 | `web/` | 原生 JS 单页前端（登录/会话列表/上传/轮询/结果展示），无构建 | conversation-task |
 | `skills/video-maker/` | codex agent 用的技能：`SKILL.md` + `scripts/extract_keyframes.py`、`scripts/crop_image.py`（与 web/video-maker.zip 逐字节一致） | conversation-task |
 
