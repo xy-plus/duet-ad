@@ -63,7 +63,7 @@ def load_manifest(work_dir: Path) -> tuple[float, list[dict]]:
 def detect_scene_bounds(video: Path, threshold: float) -> list[tuple[float, float]]:
     """用 PySceneDetect 检测场景，返回 [(start, end), ...] 时间边界列表。"""
     try:
-        # detect() 直接返回 [(FrameTimecode, FrameTimecode), ...] 边界列表（0.7.x；requirements 锁 scenedetect>=0.7）
+        # detect() 直接返回 [(FrameTimecode, FrameTimecode), ...] 边界列表（>=0.7；requirements 锁 scenedetect>=0.7）
         scene_list = detect(str(video), ContentDetector(threshold=threshold))
     except Exception as exc:
         raise SystemExit(f"场景检测失败: {exc}") from exc
