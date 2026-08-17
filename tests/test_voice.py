@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app import voice
+from app import storage, voice
 from app.pipeline import PipelineError
 
 
@@ -68,18 +68,14 @@ class TestExtractAudio:
         with pytest.raises(PipelineError, match="exit 1"):
             voice.extract_audio(cdir)
 
-    @pytest.mark.parametrize("stdout", ["", '{"programs": []}'])
-    def test_probe_failure_defers_to_ffmpeg(self, tmp_path, video_with_audio, monkeypatch, stdout):
-        """ffprobe rc=0 但 stdout 空/缺 streams 键 → 视为探测失败交 ffmpeg，不误判无音轨。"""
+    def test_probe_failure_defers_to_ffmpeg(self, tmp_path, video_with_audio, monkeypatch):
+        """storage.probe_audio 探测失败（UploadError）→ 交 ffmpeg 裁决，不误判无音轨。"""
         cdir = _conv(tmp_path, video_with_audio)
-        real_run = voice.subprocess.run
 
-        def fake_run(argv, **kw):
-            if Path(argv[0]).name == "ffprobe":
-                return subprocess.CompletedProcess(argv, 0, stdout, "")
-            return real_run(argv, **kw)
+        def fake_probe(_path):
+            raise storage.UploadError("ffprobe failed")
 
-        monkeypatch.setattr(voice.subprocess, "run", fake_run)
+        monkeypatch.setattr(voice.storage, "probe_audio", fake_probe)
         out = voice.extract_audio(cdir)
         assert out == cdir / "work" / "voice.mp3"
         assert out.is_file() and out.stat().st_size > 0

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from app import storage
 from app.codex_runner import clean_stderr
 
 _FFMPEG_TIMEOUT_S = 120
@@ -30,22 +31,13 @@ def extract_audio(cdir: Path) -> Path | None:
     if not shutil.which("ffmpeg"):
         raise PipelineError("ffmpeg not found on PATH")
     source = sources[0]
-    # 先 ffprobe 探测音轨（同 extract_keyframes.probe_audio）：明确无音轨返回 None；
-    # 探测不了（缺 ffprobe/出错/输出缺 streams 键）不拦截，交给 ffmpeg 裁决。
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe:
-        try:
-            r = subprocess.run(
-                [ffprobe, "-v", "error", "-select_streams", "a",
-                 "-show_entries", "stream=index", "-of", "json", str(source)],
-                capture_output=True, text=True, timeout=30,
-            )
-            if r.returncode == 0:
-                streams = json.loads(r.stdout or "{}").get("streams")
-                if isinstance(streams, list) and not streams:
-                    return None
-        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-            pass
+    # 音轨探测复用 storage.probe_audio（上传校验同源）：无音轨 → None；
+    # 探测失败（UploadError）不拦截，交给 ffmpeg 裁决（与 skill 侧 probe_audio 三态语义一致）。
+    try:
+        if storage.probe_audio(source) is False:
+            return None
+    except storage.UploadError:
+        pass
     work = cdir / "work"
     work.mkdir(parents=True, exist_ok=True)
     out = work / "voice.mp3"
