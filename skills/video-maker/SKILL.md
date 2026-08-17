@@ -42,7 +42,7 @@ description: 用户提供一段参考视频（任意类别）；抽帧由外部�
 本次只处理 `work/segments/N/` 这一段（N 从 1 起；工作目录与单段模式一样是会话目录）：
 
 - 该段输入在 `work/segments/N/` 内：`NN_frame_*.png`（该段按每秒 4 帧抽好的全部帧）、`contact_sheet_01.jpg、02.jpg …`（该段分页联系表）、`manifest.json`（该段源视频元信息）；`voice_lines.json` 为该段台词（口播模式下每段都有，空数组 = 该段无台词；无该文件 = 全片无台词）；全片场景清单在 `work/scenes.json`（场景分组与拆段边界，供定位该段在全片的位置）。
-- **除全片 `work/scenes.json` 外，只读写 `work/segments/N/` 目录（含其中的联系表页）；不读取、不修改 `work/` 下该段目录以外的帧与产物。**
+- **除全片 `work/scenes.json` 外，只读写 `work/segments/N/` 目录（含其中的联系表页；`scripts/` 工具除外）；不读取、不修改 `work/` 下该段目录以外的帧与产物。**
 - 选帧只看该段帧：联系表逐页看该段页即可，**不需要全看**；场景分组参考 `work/scenes.json`。
 - 目标时长 = 段时长（源时长见该段目录 `manifest.json`）`[C09]`。
 - 产物写该段目录：`keyframes/01.png、02.png … N.png` 与 `prompt.txt`（即 `work/segments/N/keyframes/` 与 `work/segments/N/prompt.txt`）。
