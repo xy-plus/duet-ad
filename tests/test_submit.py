@@ -241,9 +241,9 @@ def test_submit_success_200(enabled, monkeypatch):
     assert "sk-test-secret" not in (cdir / "meta.json").read_text(encoding="utf-8")
     assert not (cdir / "work" / "recheck_payload.json").exists()  # 预检临时文件已清理
 
-    # detail 冻结契约现 14 字段（meta 新增字段不外泄），has_video 按文件翻真
+    # detail 冻结契约现 16 字段（meta 新增字段不外泄），has_video 按文件翻真
     d = c.get(f"/api/conversations/{cid}", headers=AUTH).json()
-    assert len(d) == 14
+    assert len(d) == 16
     assert "task_id" not in d
     assert d["has_video"] is True
 
@@ -251,6 +251,43 @@ def test_submit_success_200(enabled, monkeypatch):
     r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
     assert r.status_code == 409
     assert r.json() == {"detail": "already submitted"}
+
+
+# ---------- 矩阵 7b：后处理优化图优先（T5b） ----------
+
+def test_keyframes_prefer_postprocessed(enabled, monkeypatch):
+    """work/postprocessed/<同名> 存在 → _keyframes 与提交 argv（含 dry-run 预检）都用优化图。"""
+    settings, c = enabled
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    (cdir / "work" / "postprocessed").mkdir()
+    (cdir / "work" / "postprocessed" / "01.png").write_bytes(b"optimized")
+    fake = FakeSubmit()
+    monkeypatch.setattr(subprocess, "run", fake)
+    monkeypatch.setenv("ARK_API_KEY", "sk-test")
+
+    files = seedance._keyframes(cdir)
+    assert [str(p.relative_to(cdir)) for p in files] == ["work/postprocessed/01.png"]
+
+    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
+    assert r.status_code == 200
+    # dry-run 预检与真实提交同一 argv：--ref-images 用优化图路径
+    dry, (argv, _) = fake.calls[0][0], fake.real_calls[0]
+    assert "work/postprocessed/01.png" in dry
+    tail = argv[argv.index("--ref-images") + 1:]
+    ref = []
+    for a in tail:
+        if a.startswith("--"):
+            break
+        ref.append(a)
+    assert ref == ["work/postprocessed/01.png"]
+
+
+def test_keyframes_original_without_postprocessed(enabled):
+    settings, _ = enabled
+    cid = _make_conv(settings)
+    files = seedance._keyframes(settings.data_dir / cid)
+    assert [str(p.relative_to(settings.data_dir / cid)) for p in files] == ["work/keyframes/01.png"]
 
 
 # ---------- 矩阵 8b：脚本非零 → 502，detail 脱敏 ----------

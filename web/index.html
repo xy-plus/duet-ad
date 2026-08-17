@@ -137,6 +137,36 @@
   <input type="file" id="file-input" accept="video/*" hidden>
 </div>
 
+<dialog id="pp-dialog" class="pp-dialog" aria-labelledby="pp-title">
+  <form id="pp-form" class="pp-form" novalidate>
+    <h2 id="pp-title" class="pp-title">后处理关键帧</h2>
+    <p class="pp-sub">勾选处理项（至少一项），AI 将逐帧优化并生成对比图</p>
+    <div class="pp-opts" role="group" aria-label="后处理选项">
+      <label class="pp-opt">
+        <input type="checkbox" name="opt" value="change_bg">
+        <span>换背景</span>
+      </label>
+      <label class="pp-opt">
+        <input type="checkbox" name="opt" value="face_hold">
+        <span>含人脸遮挡</span>
+      </label>
+      <label class="pp-opt">
+        <input type="checkbox" name="opt" value="remove_subtitle">
+        <span>去字幕水印</span>
+      </label>
+      <label class="pp-opt">
+        <input type="checkbox" name="opt" value="remove_brand">
+        <span>去版权物品</span>
+      </label>
+    </div>
+    <p id="pp-error" class="form-error" role="alert" hidden></p>
+    <div class="pp-actions">
+      <button type="button" id="pp-cancel" class="btn btn-ghost">取消</button>
+      <button type="submit" id="pp-confirm" class="btn btn-primary" disabled>确认处理</button>
+    </div>
+  </form>
+</dialog>
+
 <script src="app.js"></script>
 </body>
 </html>

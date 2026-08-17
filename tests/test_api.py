@@ -44,6 +44,8 @@ def test_detail_shape(client, video_1s):
         "has_source": True,
         "has_video": False,
         "submit_enabled": False,
+        "postprocess": None,
+        "postprocess_enabled": False,
     }
 
 

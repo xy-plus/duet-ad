@@ -9,12 +9,13 @@ confirm 语义由调用方传入（同 seedance.submit 的 payload.confirm，必
 import asyncio
 import logging
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 from app.config import Settings
+from app.sanitize import DETAIL_LIMIT as _DETAIL_LIMIT
+from app.sanitize import sanitize as _sanitize
 
 log = logging.getLogger(__name__)
 
@@ -23,8 +24,6 @@ _SCRIPT = Path(__file__).resolve().parent / "seedream_task.py"
 # 外层超时须覆盖全部，否则会在写盘中途杀子进程
 _SUBMIT_TIMEOUT_S = 960
 _DRYRUN_TIMEOUT_S = 120
-_DETAIL_LIMIT = 300
-_LEAK_RE = re.compile(r"key|authorization", re.IGNORECASE)
 
 
 class SeedreamError(Exception):
@@ -105,12 +104,3 @@ def _run_edit(cdir: Path, image: Path, prompt: str, out: Path, model: str) -> No
         detail = detail[:_DETAIL_LIMIT]
         log.warning("seedream edit failed: %s", detail)
         raise SeedreamError(502, detail)
-
-
-def _sanitize(text: str) -> str:
-    """剔除任何含 key/authorization 的行，并就地抹除密钥字面值。"""
-    out = "\n".join(ln for ln in text.splitlines() if not _LEAK_RE.search(ln)).strip()
-    key = os.environ.get("ARK_API_KEY", "").strip()
-    if key:
-        out = out.replace(key, "***")
-    return out

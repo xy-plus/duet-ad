@@ -10,6 +10,8 @@ ALLOWED_EXT = {".mp4", ".mov", ".webm"}
 _CHUNK = 1024 * 1024
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# files 白名单：segments/<正整数N>/(keyframes|postprocessed)/<纯文件名>
+_SEG_FILE_RE = re.compile(r"^([1-9]\d*)/(keyframes|postprocessed)/([^/]+)$")
 
 
 class UploadError(ValueError):
@@ -183,6 +185,16 @@ def resolve_file(data_dir: Path, cid: str, name: str) -> Path | None:
         if not fn or fn != Path(fn).name:
             return None
         cand = cdir / "work" / "keyframes" / fn
+    elif name.startswith("postprocessed/"):
+        fn = name[len("postprocessed/"):]
+        if not fn or fn != Path(fn).name:
+            return None
+        cand = cdir / "work" / "postprocessed" / fn
+    elif name.startswith("segments/"):
+        m = _SEG_FILE_RE.match(name[len("segments/"):])
+        if not m or m.group(3) != Path(m.group(3)).name:
+            return None
+        cand = cdir / "work" / "segments" / m.group(1) / m.group(2) / m.group(3)
     else:
         return None
     resolved = cand.resolve()

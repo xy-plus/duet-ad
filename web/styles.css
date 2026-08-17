@@ -691,6 +691,118 @@ input { font-family: inherit; }
   cursor: zoom-out;
 }
 
+/* ===== Postprocess（结果区按钮/弹窗/对比区） ===== */
+.res-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.res-head .res-h3 { margin: 0; }
+
+.pp-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pp-btn { min-height: 36px; padding: 0 16px; font-size: 14px; border-radius: 10px; }
+
+.pp-caption { font-size: 12px; color: var(--text-2); }
+
+.pp-error {
+  margin: 12px 0 0;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(255, 59, 48, .08);
+  color: var(--danger);
+  font-size: 14px;
+}
+
+.res-sub {
+  margin: 0 0 10px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.lines-card {
+  background: var(--card);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+  padding: 14px 18px;
+}
+
+.lines-list {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+/* modal */
+.pp-dialog {
+  border: none;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  width: min(420px, calc(100vw - 32px));
+  padding: 0;
+  background: var(--card);
+  color: var(--text);
+}
+
+.pp-dialog::backdrop { background: rgba(0, 0, 0, .32); }
+
+.pp-form { padding: 24px; }
+
+.pp-title { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -.01em; }
+
+.pp-sub { margin: 6px 0 0; font-size: 13px; color: var(--text-2); }
+
+.pp-opts {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  margin: 16px 0 4px;
+}
+
+.pp-opt { position: relative; }
+
+.pp-opt input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.pp-opt span {
+  display: block;
+  text-align: center;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, .05);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-2);
+  transition: background .15s ease, color .15s ease;
+}
+
+.pp-opt input:checked + span { background: var(--accent); color: #FFFFFF; }
+
+.pp-opt input:focus-visible + span {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.pp-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
 /* final video (reserved) */
 .final-card {
   background: var(--card);

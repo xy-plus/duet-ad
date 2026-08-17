@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from app import downloader, pipeline, seedance, storage
+from app import downloader, pipeline, postprocess, seedance, storage
 from app.auth import require_auth
 from app.codex_runner import CodexRunner
 from app.config import Settings, get_settings
@@ -49,6 +49,7 @@ def create_app(settings: Settings) -> FastAPI:
     # 创建临界区：幂等查重 + queued 计数 + 建目录必须原子
     create_lock = threading.Lock()
     submit_locks: dict[str, asyncio.Lock] = {}
+    postprocess_locks: dict[str, asyncio.Lock] = {}
 
     def run_pipeline_gated(cid: str) -> None:
         with pipeline_sem:
@@ -147,7 +148,7 @@ def create_app(settings: Settings) -> FastAPI:
         if meta is None:
             raise HTTPException(status_code=404, detail="not found")
         cdir = settings.data_dir / cid
-        # 显式键：meta 落盘的提交标记（submitted_at/task_id 等）不外泄，冻结 14 字段契约
+        # 显式键：meta 落盘的提交标记（submitted_at/task_id 等）不外泄，冻结 16 字段契约
         return {
             "id": meta["id"],
             "title": meta["title"],
@@ -163,6 +164,8 @@ def create_app(settings: Settings) -> FastAPI:
             "has_source": any(cdir.glob("source.*")),
             "has_video": (cdir / "generated.mp4").is_file(),
             "submit_enabled": settings.enable_seedance_submit,
+            "postprocess": meta.get("postprocess"),
+            "postprocess_enabled": settings.enable_seedream_edit,
         }
 
     @app.get("/api/conversations/{cid}/files/{name:path}", dependencies=[Depends(require_auth)])
@@ -178,6 +181,19 @@ def create_app(settings: Settings) -> FastAPI:
             return await seedance.submit(settings, cid, payload, submit_locks)
         except seedance.SubmitError as e:
             raise HTTPException(status_code=e.status, detail=e.detail) from e
+
+    @app.post("/api/conversations/{cid}/postprocess", dependencies=[Depends(require_auth)])
+    async def postprocess_conversation(
+        cid: str, payload: dict, background_tasks: BackgroundTasks
+    ):
+        try:
+            options = await postprocess.start(settings, cid, payload, postprocess_locks)
+        except postprocess.PostprocessError as e:
+            raise HTTPException(status_code=e.status, detail=e.detail) from e
+        background_tasks.add_task(
+            postprocess.run_task, settings, cid, options, postprocess_locks[cid]
+        )
+        return {"status": "running", "frames": []}
 
     web = Path(__file__).resolve().parent.parent / "web"
     if web.is_dir():
