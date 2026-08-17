@@ -27,7 +27,7 @@ links: [conversation-task]
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
 | `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedream_task.py` | Ark Seedream 编辑任务脚本：multipart 提交 `/api/v1/images/edits`、异步轮询、b64/url 双态下载 | conversation-task |
-| `app/postprocess.py` | T5b 后处理编排：HTTP 门控 + 后台逐帧 Seedream 编辑（收集目标帧/人脸检测/指令构造/prompt 追加动作线/失败保留）+ `meta.postprocess` 状态机 | conversation-task |
+| `app/postprocess.py` | T5b 后处理编排：HTTP 门控（含换选项重跑 409、无 cascade 数据 503）+ 后台逐帧 Seedream 编辑（收集目标帧/cv2 haarcascade 人脸检测/指令构造/prompt 追加动作线/失败保留）+ `meta.postprocess` 状态机 | conversation-task |
 | `app/sanitize.py` | 公共脱敏函数（seedance/seedream/postprocess 共用）：删 key|authorization 行 + 抹密钥字面值 + 截断 | conversation-task |
 | `app/scenes.py` | PySceneDetect 场景检测：manifest 帧按场景分组写 scenes.json + 拆段边界建议（>20s 才计算，每段 4~15s 为算法级不变量，末尾防御断言）；流水线按 segments 拆段（空则单段模式） | conversation-task |
 | `web/` | 原生 JS 单页前端（登录/会话列表/上传/轮询/结果展示），无构建 | conversation-task |
@@ -118,7 +118,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 3. **不信任 agent 输出**：codex 产物经 `validate_work_dir` 白名单校验才采信（关键帧 1..9 张、prompt 非空且 ≤32KB）；meta 提交标记不回 API。
 4. **files 白名单**：`resolve_file` 只映射 `source.mp4`（唯一 `source.*`）/`preview.mp4`（遗留，新契约不再生成）/`generated.mp4`/`contact_sheet.jpg`/`keyframes/<fn>`/`postprocessed/<fn>`/`segments/<N>/(keyframes|postprocessed)/<fn>`（N 正整数、fn 纯文件名），resolved-path 防穿越。
 5. **codex 沙箱**：argv 逐项见下表；永不 `shell=True`，永不 `--dangerously-bypass-*`；硬超时 `CODEX_TIMEOUT_S`；并发信号量 `CODEX_CONCURRENCY`。
-6. **密钥红线**：`ACCESS_TOKEN`/`ARK_API_KEY` 只存在于服务进程环境；不进日志/响应/meta.json；seedance 报错一律 `_sanitize` 脱敏（删含 key|authorization 行 + 抹除密钥字面值）；pipeline/codex 报错先 `clean_stderr`（剔环境变量行，截 500 字）。
+6. **密钥红线**：`ACCESS_TOKEN`/`ARK_API_KEY` 只存在于服务进程环境；不进日志/响应/meta.json；seedance/seedream/postprocess 报错一律 `app.sanitize.sanitize` 脱敏（删含 key|authorization 行 + 抹除密钥字面值，截 300 字）；pipeline/codex 报错先 `clean_stderr`（剔环境变量行，截 500 字）。
 7. **URL 下载 SSRF 防护**：`reference_url` 下载在后端进程内做（`app/downloader.py`），URL 不进 codex 沙箱（沙箱依旧断网，只有落盘视频进工作目录）：scheme 仅 http(s)、解析所得 IP 拒绝私网/回环/link-local/reserved、DNS pinning（解析一次固定 IP 直连，每次跳转独立重校验）、Content-Length 预检 + 流式写盘限 `MAX_UPLOAD_MB` + 整体超时 `DOWNLOAD_TIMEOUT_S`；连接/读取异常归一为 `DownloadError` → 422 + 回滚目录。
 
 ### codex 沙箱 argv 逐项（`CodexRunner.build_argv`，codex-cli 0.147.0 实证）

@@ -127,11 +127,19 @@ def test_no_options_422(enabled):
     empty = {"change_bg": False, "face_hold": False, "remove_subtitle": False, "remove_brand": False}
     for body in ({"confirm": True},
                  {"options": {}, "confirm": True},
-                 {"options": empty, "confirm": True},
-                 {"options": {"change_bg": "yes"}, "confirm": True}):
+                 {"options": empty, "confirm": True}):
         r = c.post(f"/api/conversations/{cid}/postprocess", headers=AUTH, json=body)
         assert r.status_code == 422, body
         assert r.json() == {"detail": "at least one option required"}
+
+
+def test_options_non_bool_422(enabled):
+    settings, c = enabled
+    cid = _make_conv(settings)
+    r = c.post(f"/api/conversations/{cid}/postprocess", headers=AUTH,
+               json={"options": {"change_bg": "yes"}, "confirm": True})
+    assert r.status_code == 422
+    assert r.json() == {"detail": "options must be booleans"}
 
 
 def test_not_done_409(enabled, monkeypatch):
@@ -231,7 +239,12 @@ def test_multi_segment_full_chain(enabled, monkeypatch):
 
     pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
     assert pp["status"] == "done"
-    assert pp["frames"] == ["segments/1/01.png", "segments/2/01.png", "segments/2/02.png"]
+    # frames 为全形路径（与 files 白名单同形），前端按 segments/N/postprocessed/ 前缀过滤展示
+    assert pp["frames"] == [
+        "segments/1/postprocessed/01.png",
+        "segments/2/postprocessed/01.png",
+        "segments/2/postprocessed/02.png",
+    ]
 
 
 # ---------- face_hold 人脸规则 ----------
@@ -297,7 +310,7 @@ def test_face_hold_appends_per_segment(enabled, monkeypatch):
     meta = storage.load_meta(settings.data_dir, cid)
     assert meta["segments"][0]["prompt"] == seg1_p
     assert meta["segments"][1]["prompt"] == seg2_p
-    assert meta["postprocess"]["frames"] == ["segments/2/02.png"]
+    assert meta["postprocess"]["frames"] == ["segments/2/postprocessed/02.png"]
 
 
 def test_no_face_hold_never_detects(enabled, monkeypatch):
@@ -425,7 +438,58 @@ def test_detect_face_undecodable_and_missing_cascade(tmp_path):
     assert postprocess._detect_face(bad, None) is False
 
 
+def test_detect_face_real_cascade_on_synthetic(tmp_path):
+    """真 cascade 数据 + 真 cv2 管线端到端：纯色合成图无人脸 → False（4.x 环境能力回归守卫）。"""
+    import cv2
+    import numpy as np
+    img = tmp_path / "synth.png"
+    cv2.imwrite(str(img), np.zeros((96, 96, 3), dtype=np.uint8))
+    cascade = postprocess._load_cascade()
+    assert cascade is not None
+    assert postprocess._detect_face(img, cascade) is False
+
+
 def test_load_cascade_missing_file_returns_none(tmp_path, monkeypatch):
     import cv2
     monkeypatch.setattr(cv2.data, "haarcascades", str(tmp_path / "no-cascade-dir"))
     assert postprocess._load_cascade() is None
+
+
+def test_load_cascade_loads_with_real_data():
+    """cv2 4.x 自带 haarcascade 数据：加载成功非 None（face_hold 可用）。"""
+    assert postprocess._load_cascade() is not None
+
+
+def test_face_hold_no_cascade_503(enabled, monkeypatch):
+    """cv2 数据目录无 haarcascade → 勾选 face_hold 在门控直接 503，不做静默降级。"""
+    settings, c = enabled
+    cid = _make_conv(settings)
+    monkeypatch.setattr(postprocess.cv2.data, "haarcascades",
+                        str(settings.data_dir / "no-cascade"))
+    monkeypatch.setattr(postprocess.seedream, "edit_image",
+                        lambda *a, **k: pytest.fail("edit must not be called"))
+    r = _post(c, cid, FACE_ONLY)
+    assert r.status_code == 503
+    assert r.json() == {"detail": "face detection data unavailable"}
+    assert storage.load_meta(settings.data_dir, cid).get("postprocess") is None
+
+
+def test_rerun_different_options_409(enabled, monkeypatch):
+    """上次 done 的 options 与本次不同 → 409（防旧产物贴新标签）；同选项重跑照常跳过已有图。"""
+    settings, c = enabled
+    cid = _make_conv(settings)
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+
+    assert _post(c, cid, OPTIONS_BG).status_code == 200
+    other = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": True}
+    r = _post(c, cid, other)
+    assert r.status_code == 409
+    assert r.json() == {"detail": "options changed since last run"}
+    assert len(fake.calls) == 2  # 未产生新编辑
+
+    # 同选项重跑：跳过已有优化图，正常 200 done
+    r = _post(c, cid, OPTIONS_BG)
+    assert r.status_code == 200
+    assert len(fake.calls) == 2  # 全部帧已存在，无新编辑
+    assert storage.load_meta(settings.data_dir, cid)["postprocess"]["status"] == "done"

@@ -710,9 +710,8 @@ async function submitPostprocess(event) {
       body: JSON.stringify({ options: ppCheckedOptions(), confirm: true }),
     });
     closePostprocessModal();
-    // 刷新进入「处理中…」并沿用 2s 轮询，直到 postprocess 终态（done/failed）
+    // 刷新进入「处理中…」；loadDetail 见到 postprocess.status==running 会沿用 2s 轮询到终态
     loadDetail(detail.id, true);
-    startPolling(detail.id);
   } catch (err) {
     if (handleAuthError(err)) return;
     errEl.textContent = err.message;

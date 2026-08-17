@@ -29,3 +29,4 @@
 
 - validate_voice_lines 时间下界容差放宽到 -0.01s（_EPS_S 浮点误差允许）：审查裁决设计合理，不改。（→ app/voice.py）
 - Seedream nits（编排裁决留待后续）：seedream_task multipart filename 未做引号转义（T5b 后处理只传流水线固定名帧 01.png…，风险面已收窄；任意文件名加固留待需要时）；seedream_task 双态兼容（同步带图/异步轮询）为猜测路径，首次真实调用后删死分支。（→ app/seedream_task.py）
+- T5b 后处理 nits（审查裁决不改，记同桶）：postprocess_locks 字典常驻内存不驱逐（同 submit_locks 桶）；FACE_LINE 追加非原子写（进程中断可能只写文件或只写 meta）；重跑 face_hold 对已存在优化图无效果（跳过语义固有）；POST /postprocess body 非 JSON 对象时 FastAPI 500（与 submit 路由同病同桶）；seedream.edit_image 的 out.exists() 冗余防线保留。（→ app/postprocess.py）

@@ -23,8 +23,10 @@ links: [result-display, submit-gate]
 
 ## 边界
 
-- 后处理可重复提交：`running` 中再提交 409；done/failed 后可重跑，已有优化图的帧不重复处理
+- 后处理可重复提交：`running` 中再提交 409；done/failed 后可**同选项**重跑，已有优化图的帧不重复处理
+- 换选项重跑 → 409 `options changed since last run`（防止把上一次的优化图当成新选项的产物展示；想换选项需与编排者确认后续策略，当前一律拒绝）
 - 人脸遮挡选项对每帧先做人脸检测：无人脸的帧不做该处理（有其他勾选项则只做其他项；无适用选项的帧整帧跳过）
+- 人脸检测依赖 cv2 自带 haarcascade 数据（opencv-python-headless 4.x）：数据不可用时勾选「含人脸遮挡」提交直接被拒（503 `face detection data unavailable`），不会静默跳过
 - 有人脸被处理时，该帧所属段（或单段）的提示词末尾追加动作线（放下手 + 正常节奏后续剧情），显示与复制内容同步更新
 - 后处理不改变会话 `status`（始终 `done`），进度与结果只看 detail 的 `postprocess` 字段
 

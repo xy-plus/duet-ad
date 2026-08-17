@@ -14,7 +14,6 @@ from pathlib import Path
 
 from app import storage
 from app.config import Settings
-from app.sanitize import DETAIL_LIMIT as _DETAIL_LIMIT
 from app.sanitize import sanitize as _sanitize
 
 log = logging.getLogger(__name__)
@@ -143,7 +142,6 @@ def _run_submit(cdir: Path, keyframes: list[Path]) -> None:
         raise SubmitError(502, "seedance runner unavailable") from e
     if r.returncode != 0:
         detail = _sanitize(f"{r.stdout or ''}\n{r.stderr or ''}") or "seedance task failed"
-        detail = detail[:_DETAIL_LIMIT]
         log.warning("seedance submit failed for %s: %s", cdir.name, detail)
         raise SubmitError(502, detail)
 
