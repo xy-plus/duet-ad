@@ -13,7 +13,7 @@ try:
     from scenedetect import ContentDetector, detect
 except ImportError as exc:  # pragma: no cover - environment-dependent message
     raise SystemExit(
-        "PySceneDetect is required. Install scenedetect in a task-local environment."
+        "PySceneDetect is required. Install scenedetect>=0.7 in the server environment."
     ) from exc
 
 # 与 Seedance 单段上限耦合：拆段目标每段 4~15s，仅时长 >20s 才计算
@@ -62,7 +62,7 @@ def load_manifest(work_dir: Path) -> tuple[float, list[dict]]:
 def detect_scene_bounds(video: Path, threshold: float) -> list[tuple[float, float]]:
     """用 PySceneDetect 检测场景，返回 [(start, end), ...] 时间边界列表。"""
     try:
-        # detect() 直接返回 [(FrameTimecode, FrameTimecode), ...] 边界列表（0.6.x~0.7.x 均如此）
+        # detect() 直接返回 [(FrameTimecode, FrameTimecode), ...] 边界列表（0.7.x；requirements 锁 scenedetect>=0.7）
         scene_list = detect(str(video), ContentDetector(threshold=threshold))
     except Exception as exc:
         raise SystemExit(f"场景检测失败: {exc}") from exc
@@ -101,20 +101,22 @@ def _assert_segments_valid(
     prev_end = 0.0
     for start, end in segments:
         if abs(start - prev_end) > 1e-6:
-            raise SystemExit(f"拆段边界不连续: {start:.3f}s 与 {prev_end:.3f}s")
+            raise SystemExit(f"拆段边界不连续: {start:.6f}s 与 {prev_end:.6f}s")
         if end - start < SEGMENT_MIN_S - 1e-9 or end - start > SEGMENT_MAX_S + 1e-9:
-            raise SystemExit(f"拆段长度违规: {start:.3f}s - {end:.3f}s")
+            raise SystemExit(f"拆段长度违规: {start:.6f}s - {end:.6f}s")
         prev_end = end
     if abs(segments[0][0]) > 1e-6 or abs(prev_end - duration) > 1e-6:
         raise SystemExit(
-            f"拆段未覆盖全程: [{segments[0][0]:.3f}s, {prev_end:.3f}s] vs {duration:.6f}s"
+            f"拆段未覆盖全程: [{segments[0][0]:.6f}s, {prev_end:.6f}s] vs {duration:.6f}s"
         )
 
 
 def build_segments(
     bounds: list[tuple[float, float]], duration: float
 ) -> list[tuple[float, float]]:
-    """按场景边界生成拆段建议：每段 4~15s、覆盖全程无缝隙、边界单调递增（算法级不变量）。"""
+    """按场景边界生成拆段建议：每段 4~15s、覆盖全程无缝隙、边界单调递增（算法级不变量）。
+
+    输入契约：bounds 须已 round(3)（main 侧已做，本函数内部对 duration 同口径 round）。"""
     duration = round(duration, 3)  # 统一 3 位口径：bounds 已 round(3)，断言两端才可比
     if duration <= SEGMENT_ONLY_ABOVE_S:
         return []
