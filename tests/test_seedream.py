@@ -275,6 +275,34 @@ def test_failed_status_exit_1(tmp_path, monkeypatch):
     assert seedream_task.run_edit(args) == 1
 
 
+@pytest.mark.parametrize("status", ["cancelled", "expired"])
+def test_initial_cancelled_expired_exit_1(tmp_path, monkeypatch, status):
+    """提交即终态（取消/过期）→ 退出码 1，不再轮询。"""
+    monkeypatch.setenv("ARK_API_KEY", SECRET)
+    calls = _fake_ark(monkeypatch, [{"request_id": "req-c", "status": status}])
+    args = seedream_task.parse_args(
+        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
+         "--out", str(tmp_path / "o.png"), "--confirm-submit"]
+    )
+    assert seedream_task.run_edit(args) == 1
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", ["cancelled", "expired"])
+def test_poll_terminal_cancelled_expired_exit_1(tmp_path, monkeypatch, status):
+    """轮询中变取消/过期 → 退出码 1，不白等 poll-timeout。"""
+    monkeypatch.setenv("ARK_API_KEY", SECRET)
+    _fake_ark(monkeypatch, [
+        {"request_id": "req-c", "status": "running"},
+        {"request_id": "req-c", "status": status},
+    ])
+    args = seedream_task.parse_args(
+        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
+         "--out", str(tmp_path / "o.png"), "--confirm-submit"]
+    )
+    assert seedream_task.run_edit(args) == 1
+
+
 def test_poll_timeout_nonzero_exit(tmp_path, monkeypatch, capsys):
     """轮询超时：cli 把 TimeoutError 转成退出码 1，stderr 不泄密钥。"""
     monkeypatch.setenv("ARK_API_KEY", SECRET)
@@ -341,8 +369,8 @@ class FakeEdit:
         return [c for c in self.calls if "--dry-run" not in c[0]]
 
 
-def _edit(settings, cdir, image, prompt, out, lock):
-    return asyncio.run(seedream.edit_image(settings, cdir, image, prompt, out, lock))
+def _edit(settings, cdir, image, prompt, out, lock, confirm=True):
+    return asyncio.run(seedream.edit_image(settings, cdir, image, prompt, out, lock, confirm))
 
 
 def test_seedream_error_shape():
@@ -357,10 +385,30 @@ def test_disabled_501(tmp_path, monkeypatch):
     cdir.mkdir()
     out = cdir / "edited.png"
     monkeypatch.setattr(subprocess, "run", _no_subprocess)
+    for confirm in (False, True):  # 开关最优先，不看 confirm
+        with pytest.raises(seedream.SeedreamError) as e:
+            _edit(settings, cdir, _png(tmp_path), "p", out, asyncio.Lock(), confirm=confirm)
+        assert e.value.status == 501
+        assert e.value.detail == "Seedream edit is disabled."
+
+
+def test_confirm_required_409(tmp_path, monkeypatch):
+    """confirm 严格为 True 才放行（同 seedance payload.confirm 语义），位置在锁与入参校验之前。"""
+    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    cdir = tmp_path / "c"
+    cdir.mkdir()
+    out = cdir / "edited.png"
+    monkeypatch.setattr(subprocess, "run", _no_subprocess)
+    lock = asyncio.Lock()
+    for confirm in (False, "true", 1):
+        with pytest.raises(seedream.SeedreamError) as e:
+            _edit(settings, cdir, _png(tmp_path), "p", out, lock, confirm=confirm)
+        assert e.value.status == 409, confirm
+        assert e.value.detail == "confirmation required"
+    # confirm 门控先于入参校验：图缺失也先报 confirmation required
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, _png(tmp_path), "p", out, asyncio.Lock())
-    assert e.value.status == 501
-    assert e.value.detail == "Seedream edit is disabled."
+        _edit(settings, cdir, tmp_path / "missing.png", "p", out, lock, confirm=False)
+    assert e.value.status == 409 and e.value.detail == "confirmation required"
 
 
 def test_bad_input_409(tmp_path, monkeypatch):
@@ -440,7 +488,8 @@ def test_edit_success(tmp_path, monkeypatch):
     assert result == out
     assert out.read_bytes() == PNG + b"edited"
 
-    # dry-run 预检 argv 契约：列表、cwd、120s、无 shell、env 继承、不带 --confirm-submit
+    # dry-run 预检 argv 契约：列表、cwd、120s、无 shell、env 继承、不带 --confirm-submit；
+    # 带 --model，保证预检即真实请求形态
     (dargv, dkw), = fake.calls[:1]
     assert isinstance(dargv, list)
     assert dkw["cwd"] == cdir
@@ -449,12 +498,13 @@ def test_edit_success(tmp_path, monkeypatch):
     assert dkw.get("env") is None
     assert "--dry-run" in dargv
     assert "--confirm-submit" not in dargv
+    assert dargv[dargv.index("--model") + 1] == "doubao-seedream-custom"
 
-    # 真实提交 argv 契约：列表、cwd、900s、无 shell、env 继承、机械门控 flag
+    # 真实提交 argv 契约：列表、cwd、960s、无 shell、env 继承、机械门控 flag
     (argv, kw), = fake.real_calls
     assert isinstance(argv, list)
     assert kw["cwd"] == cdir
-    assert kw["timeout"] == 900
+    assert kw["timeout"] == 960
     assert kw.get("shell") is not True
     assert kw.get("env") is None
     assert "--confirm-submit" in argv
@@ -503,7 +553,7 @@ def test_edit_timeout_502(tmp_path, monkeypatch):
     def fake(argv, **kwargs):
         if "--dry-run" in argv:
             return real(argv, **kwargs)
-        raise subprocess.TimeoutExpired(argv, 900)
+        raise subprocess.TimeoutExpired(argv, 960)
 
     monkeypatch.setattr(subprocess, "run", fake)
     with pytest.raises(seedream.SeedreamError) as e:
@@ -542,8 +592,8 @@ def test_concurrent_edit_single_task(tmp_path, monkeypatch):
 
     async def run_both():
         return await asyncio.gather(
-            seedream.edit_image(settings, cdir, _png(tmp_path), "p", out, lock),
-            seedream.edit_image(settings, cdir, _png(tmp_path), "p", out, lock),
+            seedream.edit_image(settings, cdir, _png(tmp_path), "p", out, lock, True),
+            seedream.edit_image(settings, cdir, _png(tmp_path), "p", out, lock, True),
             return_exceptions=True,
         )
 

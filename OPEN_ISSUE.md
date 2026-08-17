@@ -27,3 +27,4 @@
 - web/video-maker.zip 与 skills/video-maker/ 的字节一致性无 CI 防漂移：改 skill 后需手动重打包。（→ skills/video-maker/）
 - 闸等待占线程池线程：管道闸阻塞的是 anyio 线程（默认 40），极端排队场景会拖慢 URL 下载/静态文件；正确性不受影响，量大再改异步闸。（→ app/main.py run_pipeline_gated）
 - 审查 nits 汇总（R1/R2，不阻塞）：/api/login 无限流；_RateLimiter IP 条目只增不删、反代后共享一桶；save_upload async 内同步写盘；note 无长度上限；submit_locks 字典常驻内存；503 排在 dry-run 复核后；_SECRET_KEY_MARKERS 与 env 清洗口径不齐；_render_preview glob 不过滤前缀；has_video 磁盘探测与 meta 标记双源；URL 上传且无 note 时标题取整串 URL；限流先于幂等查重（重试消耗限流额度，有意外先撞 429）；幂等命中时首请求未落盘完成则随后 422 回滚会让重试方短暂 404。
+- Seedream nits（编排裁决留待后续）：_sanitize 等公共逻辑在 seedance/seedream 各有一份副本，T5b 出现第三份前提取公共模块；seedream_task multipart filename 未做引号转义（T5b 接线时必须用固定文件名）；seedream_task 双态兼容（同步带图/异步轮询）为猜测路径，首次真实调用后删死分支。（→ app/seedream.py, app/seedream_task.py）

@@ -32,7 +32,7 @@ EDIT_URL = f"{BASE_URL}/api/v1/images/edits"
 # 异步任务查询端点：官方文档未确证路径，如上游调整改此常量即可
 TASK_URL_TEMPLATE = f"{EDIT_URL}/{{id}}"
 DEFAULT_MODEL = "doubao-seedream-5-0-pro-260628"
-TERMINAL_STATUSES = {"succeeded", "failed"}
+TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "expired"}  # 取消/过期即终态，防白轮询到超时
 RESPONSE_FORMAT = "b64_json"  # 官方支持则优先 b64（免二次下载），否则可改 "url"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 

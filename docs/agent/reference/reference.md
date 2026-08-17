@@ -108,7 +108,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 - `app.storage.resolve_file(data_dir, cid, name) -> Path | None` — files 白名单解析
 - `app.pipeline.run(settings, cid, runner)` — 后台任务入口；任何失败 → `failed`+`error`，不抛
 - `app.pipeline.validate_work_dir(work) -> (list[str], str)` — agent 产物白名单校验，返回 (关键帧名, prompt)
-- `app.seedream.edit_image(settings, cdir, image, prompt, out, lock) -> Path` — 编辑门控纯函数：三重门控（开关/confirm/并发锁）+ dry-run 预检 + 真实提交；失败抛 `SeedreamError(status, detail)`
+- `app.seedream.edit_image(settings, cdir, image, prompt, out, lock, confirm) -> Path` — 编辑门控纯函数：三重门控（开关/confirm/并发锁，confirm 须严格 True）+ dry-run 预检 + 真实提交；失败抛 `SeedreamError(status, detail)`
 - `app.codex_runner.CodexRunner(timeout_s, concurrency)` — `.build_argv(workdir, prompt)` / `.run(workdir, prompt)`；`CodexError` 包装超时/非零/找不到二进制
 - `app.codex_runner.clean_stderr(text, limit=500)` — 剔环境变量行 + 截断（pipeline 的 `_run_cmd` 复用）
 - `app.seedance.submit(settings, cid, payload, locks) -> dict` — 门控 + 执行；`SubmitError(status, detail)` 由 HTTP 层转响应
