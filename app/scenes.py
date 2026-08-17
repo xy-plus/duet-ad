@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -101,14 +102,14 @@ def build_segments(
     seg_start = seg_end = bounds[0][0]
     for start, end in bounds:
         if end - start > SEGMENT_MAX_S:
-            # 单场景超 15s：按 15s 硬切（不重编码，只算边界）
+            # 单场景超 15s：动态均分为 ceil(时长/15) 段，每段必然落在 (7.5, 15]，避免固定硬切的短尾并入超长段
             if seg_end > seg_start:
                 segments.append((seg_start, seg_end))
-            cut = start
-            while cut + SEGMENT_MAX_S < end:
-                segments.append((cut, cut + SEGMENT_MAX_S))
-                cut += SEGMENT_MAX_S
-            seg_start, seg_end = cut, end
+            piece_count = math.ceil((end - start) / SEGMENT_MAX_S)
+            piece = (end - start) / piece_count
+            for k in range(1, piece_count):
+                segments.append((start + (k - 1) * piece, start + k * piece))
+            seg_start, seg_end = start + (piece_count - 1) * piece, end
         elif end - seg_start > SEGMENT_MAX_S:
             # 累加该场景将超 15s：闭合当前段
             segments.append((seg_start, seg_end))

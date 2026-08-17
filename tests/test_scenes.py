@@ -172,13 +172,36 @@ def test_manifest_missing_fields_fails(video_10s, tmp_path):
     assert result.returncode != 0
 
 
-def test_build_segments_hard_cut_long_scene():
-    """单场景超 15s 按 15s 硬切，只算边界。"""
+def test_build_segments_splits_long_scene_evenly():
+    """单场景超 15s 动态均分：22s 场景 → 两段 11s。"""
     assert build_segments([(0.0, 10.0), (10.0, 32.0)], 32.0) == [
         (0.0, 10.0),
-        (10.0, 25.0),
-        (25.0, 32.0),
+        (10.0, 21.0),
+        (21.0, 32.0),
     ]
+
+
+@pytest.mark.parametrize(
+    "bounds,duration",
+    [
+        ([(0.0, 5.0), (5.0, 20.5)], 20.5),  # 单场景 15.5s
+        ([(0.0, 5.0), (5.0, 21.0)], 21.0),  # 单场景 16s
+        ([(0.0, 5.0), (5.0, 23.9)], 23.9),  # 单场景 18.9s
+        ([(0.0, 29.0)], 29.0),  # 单场景 29s
+        ([(0.0, 32.0)], 32.0),  # 单场景 32s（旧 15s 硬切尾段 2s 并入前段会超 15s）
+    ],
+)
+def test_build_segments_long_scene_stays_within_limits(bounds, duration):
+    """超 15s 单场景：每段 4~15s、覆盖全程无缝隙、边界单调递增。"""
+    segments = build_segments(bounds, duration)
+    assert segments
+    assert segments[0][0] == 0.0
+    assert segments[-1][1] == pytest.approx(duration)
+    for prev, cur in zip(segments, segments[1:]):
+        assert cur[0] == pytest.approx(prev[1])  # 无缝隙
+        assert cur[0] >= prev[0]  # 单调
+    for start, end in segments:
+        assert 4.0 <= end - start <= 15.0
 
 
 def test_build_segments_merges_short_tail():
