@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Build, submit, poll, and save Volcengine Ark Seedream image edit tasks safely.
+"""Build, submit, and save Volcengine Ark Seedream image edit tasks safely.
 
-编辑端点（multipart 表单，OpenAI images API 兼容风格，与 seedance 的 /api/v3 不同）：
+编辑端点（实测契约，2026-08-18 首次真实调用验证）：Seedream 5.0 Pro 编辑 = 图生图，
+走 images/generations（SeedEdit 专用的 /api/v1/images/edits 与本模型无关）：
 
-    POST {BASE_URL}/api/v1/images/edits
-    异步任务查询：GET {EDIT_URL}/{request_id}
+    POST https://ark.cn-beijing.volces.com/api/v3/images/generations
+    JSON: {"model", "prompt", "image": ["data:image/png;base64,<b64>"],
+           "response_format": "b64_json", "watermark": false}
 
-官方文档实现时未确证（https://www.volcengine.com/docs/82379/1541523 为 JS 渲染页，
-镜像文档记该接口为同步返回 data[]），端点与查询路径均做成模块常量；脚本同时兼容
-两种响应：提交即带图（data[]/content 内 b64_json 或 url）则直接写盘，否则按
-request_id（或 id/task_id）轮询至 succeeded/failed 后取图。b64_json 优先于 url。
+响应为同步 200（实测 60s 级返回）：{"model", "created", "data": [{"b64_json": ...}]}；
+无 request_id、无异步轮询。b64_json 缺失/为空时回落 data[0].url 下载。
 """
 
 from __future__ import annotations
@@ -19,20 +19,15 @@ import base64
 import json
 import os
 import sys
-import time
 import urllib.error
 import urllib.request
-import uuid
 from pathlib import Path
 from typing import Any
 
 BASE_URL = "https://ark.cn-beijing.volces.com"
-# 编辑端点走 /api/v1（seedance 用 /api/v3；两者路径前缀不同，勿混用）
-EDIT_URL = f"{BASE_URL}/api/v1/images/edits"
-# 异步任务查询端点：官方文档未确证路径，如上游调整改此常量即可
-TASK_URL_TEMPLATE = f"{EDIT_URL}/{{id}}"
+# Seedream 5.0 Pro 编辑 = 图生图，走 /api/v3/images/generations（不是 SeedEdit 的 /api/v1/images/edits）
+EDIT_URL = f"{BASE_URL}/api/v3/images/generations"
 DEFAULT_MODEL = "doubao-seedream-5-0-pro-260628"
-TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "expired"}  # 取消/过期即终态，防白轮询到超时
 RESPONSE_FORMAT = "b64_json"  # 官方支持则优先 b64（免二次下载），否则可改 "url"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -53,9 +48,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Mechanical gate required for a live edit after user confirmation.",
     )
     edit.add_argument("--state-file", help="Write the latest task JSON.")
-    edit.add_argument("--poll-interval", type=float, default=5.0)
-    edit.add_argument("--poll-timeout", type=float, default=600.0)
-    edit.add_argument("--request-timeout", type=float, default=120.0)
+    edit.add_argument("--request-timeout", type=float, default=300.0)
     return parser.parse_args(argv)
 
 
@@ -74,7 +67,7 @@ def api_key() -> str:
     return value
 
 
-def read_image(value: str) -> tuple[bytes, str]:
+def read_image(value: str) -> bytes:
     """读 PNG 字节并校验魔数（契约只收 PNG，避免把任意文件当图片上传）。"""
     path = Path(value).expanduser().resolve()
     if not path.is_file():
@@ -82,28 +75,7 @@ def read_image(value: str) -> tuple[bytes, str]:
     data = path.read_bytes()
     if not data.startswith(PNG_MAGIC):
         raise SystemExit(f"Image is not a PNG file: {path}")
-    return data, path.name
-
-
-def multipart_body(
-    fields: dict[str, str], file_field: str, filename: str, data: bytes, mime: str
-) -> tuple[bytes, str]:
-    """手工构造 multipart/form-data body（不引入 requests）。"""
-    boundary = "----ark-edit-" + uuid.uuid4().hex
-    parts: list[bytes] = []
-    for name, value in fields.items():
-        parts.append(
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8")
-        )
-    parts.append(
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
-        f"Content-Type: {mime}\r\n\r\n".encode("utf-8")
-    )
-    parts.append(data)
-    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
-    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+    return data
 
 
 def _urlopen_json(request: urllib.request.Request, timeout: float) -> dict[str, Any]:
@@ -122,96 +94,34 @@ def submit_edit(
     model: str,
     prompt: str,
     image_bytes: bytes,
-    filename: str,
     timeout: float,
 ) -> dict[str, Any]:
-    body, content_type = multipart_body(
-        {
-            "model": model,
-            "prompt": prompt,
-            "response_format": RESPONSE_FORMAT,
-            "watermark": "false",
-        },
-        "image",
-        filename,
-        image_bytes,
-        "image/png",
-    )
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "image": [f"data:image/png;base64,{base64.b64encode(image_bytes).decode('ascii')}"],
+        "response_format": RESPONSE_FORMAT,
+        "watermark": False,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         EDIT_URL,
         data=body,
         method="POST",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": content_type},
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
     return _urlopen_json(request, timeout)
 
 
-def task_id_of(task: dict[str, Any]) -> str:
-    """兼容多种命名：request_id / id / task_id。"""
-    return str(task.get("request_id") or task.get("id") or task.get("task_id") or "")
-
-
-def _find_first(obj: Any, key: str) -> Any:
-    """递归查找第一个非空 key 值（兼容 data[]/content/... 多种结构）。"""
-    if isinstance(obj, dict):
-        if obj.get(key):
-            return obj[key]
-        for value in obj.values():
-            found = _find_first(value, key)
-            if found:
-                return found
-    elif isinstance(obj, list):
-        for value in obj:
-            found = _find_first(value, key)
-            if found:
-                return found
-    return None
-
-
-def has_image(task: dict[str, Any]) -> bool:
-    return bool(_find_first(task, "b64_json") or _find_first(task, "url"))
-
-
-def poll_task(
-    initial: dict[str, Any],
-    key: str,
-    interval: float,
-    wait_timeout: float,
-    request_timeout: float,
-    state_file: str | None,
-) -> dict[str, Any]:
-    task = initial
-    task_id = task_id_of(task)
-    if not task_id:
-        raise RuntimeError("Ark response did not include a task ID.")
-    deadline = time.monotonic() + wait_timeout
-    last_status = None
-    while True:
-        status = str(task.get("status") or "unknown")
-        if status != last_status:
-            print(f"Edit task {task_id}: {status}", flush=True)
-            last_status = status
-        write_json(state_file, task)
-        if status in TERMINAL_STATUSES:
-            return task
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"Edit task {task_id} did not finish within {wait_timeout:.0f}s.")
-        time.sleep(max(1.0, interval))
-        request = urllib.request.Request(
-            TASK_URL_TEMPLATE.format(id=task_id),
-            method="GET",
-            headers={"Authorization": f"Bearer {key}"},
-        )
-        task = _urlopen_json(request, request_timeout)
-
-
 def save_result(task: dict[str, Any], destination: str, timeout: float) -> Path:
-    """b64_json 优先解码写盘；否则按 url 下载。写 --out（PNG 字节落盘）。"""
-    b64 = _find_first(task, "b64_json")
+    """data[0].b64_json 优先解码写盘；缺失/为空则按 data[0].url 下载。写 --out（PNG 字节落盘）。"""
+    data_list = task.get("data") or []
+    first = data_list[0] if data_list else None
+    b64 = (first or {}).get("b64_json")
     if b64:
         data = base64.b64decode(b64)
     else:
-        url = _find_first(task, "url")
+        url = (first or {}).get("url")
         if not url:
             raise RuntimeError("Successful edit response did not include image data (b64_json or url).")
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -226,15 +136,21 @@ def save_result(task: dict[str, Any], destination: str, timeout: float) -> Path:
 
 
 def summarize(task: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: task.get(key)
-        for key in ("request_id", "id", "model", "status")
-        if key in task
-    }
+    """响应摘要（b64 只记字节数，不把图塞进 state-file）。"""
+    summary = {key: task.get(key) for key in ("model", "created", "id") if key in task}
+    data_list = task.get("data") or []
+    first = data_list[0] if data_list else None
+    if first is None:
+        return summary
+    if first.get("b64_json"):
+        summary["image"] = {"format": "b64_json", "bytes": len(base64.b64decode(first["b64_json"]))}
+    elif first.get("url"):
+        summary["image"] = {"format": "url", "url": first["url"]}
+    return summary
 
 
 def run_edit(args: argparse.Namespace) -> int:
-    image_bytes, filename = read_image(args.image)
+    image_bytes = read_image(args.image)
     prompt = args.prompt.strip()
     if not prompt:
         raise SystemExit("Prompt is empty.")
@@ -255,35 +171,18 @@ def run_edit(args: argparse.Namespace) -> int:
             "Live edit blocked. Obtain a separate user confirmation, then add --confirm-submit."
         )
     key = api_key()
-    task = submit_edit(key, args.model, prompt, image_bytes, filename, args.request_timeout)
-    write_json(args.state_file, task)
-    status = str(task.get("status") or "")
-    if status in TERMINAL_STATUSES and status != "succeeded":
-        print(json.dumps(summarize(task), ensure_ascii=False, indent=2))
-        return 1
-    if has_image(task):  # 同步响应：提交即带图，直接写盘
-        save_result(task, args.out, args.request_timeout)
-        print(json.dumps(summarize(task), ensure_ascii=False, indent=2))
-        return 0
-    task_id = task_id_of(task)
-    if not task_id:
-        raise RuntimeError("Ark edit response did not include a task ID or image data.")
-    print(f"Created edit task: {task_id}", flush=True)
-    task = poll_task(
-        task, key, args.poll_interval, args.poll_timeout, args.request_timeout, args.state_file
-    )
-    status = str(task.get("status") or "unknown")
-    print(json.dumps(summarize(task), ensure_ascii=False, indent=2))
-    if status == "succeeded":
-        save_result(task, args.out, args.request_timeout)
-        return 0
-    return 1
+    task = submit_edit(key, args.model, prompt, image_bytes, args.request_timeout)
+    summary = summarize(task)
+    write_json(args.state_file, summary)
+    save_result(task, args.out, args.request_timeout)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.poll_interval <= 0 or args.poll_timeout <= 0 or args.request_timeout <= 0:
-        raise SystemExit("Timeout and interval values must be positive.")
+    if args.request_timeout <= 0:
+        raise SystemExit("Request timeout must be positive.")
     return run_edit(args)
 
 

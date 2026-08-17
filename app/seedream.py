@@ -19,9 +19,9 @@ from app.sanitize import sanitize as _sanitize
 log = logging.getLogger(__name__)
 
 _SCRIPT = Path(__file__).resolve().parent / "seedream_task.py"
-# 脚本最坏耗时 120(提交)+600(轮询)+120(下载)+120(请求超时) = 960s；
+# 脚本最坏耗时 300(同步请求，实测 60s 级返回)+300(余量) = 600s；
 # 外层超时须覆盖全部，否则会在写盘中途杀子进程
-_SUBMIT_TIMEOUT_S = 960
+_SUBMIT_TIMEOUT_S = 600
 _DRYRUN_TIMEOUT_S = 120
 
 
@@ -86,7 +86,7 @@ def _dryrun_check(cdir: Path, image: Path, prompt: str, out: Path, model: str) -
 
 
 def _run_edit(cdir: Path, image: Path, prompt: str, out: Path, model: str) -> None:
-    """真实提交：argv 列表、无 shell、env 缺省继承服务进程、900s 超时。"""
+    """真实提交：argv 列表、无 shell、env 缺省继承服务进程、600s 超时（同步单请求）。"""
     argv = [sys.executable, str(_SCRIPT), "edit",
             "--image", str(image), "--prompt", prompt, "--out", str(out),
             "--model", model, "--confirm-submit"]

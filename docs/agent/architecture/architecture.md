@@ -26,7 +26,7 @@ links: [conversation-task]
 | `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
 | `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
-| `app/seedream_task.py` | Ark Seedream 编辑任务脚本：multipart 提交 `/api/v1/images/edits`、异步轮询、b64/url 双态下载 | conversation-task |
+| `app/seedream_task.py` | Ark Seedream 编辑任务脚本：JSON 图生图提交 `/api/v3/images/generations`、同步响应、b64/url 双态下载 | conversation-task |
 | `app/postprocess.py` | T5b 后处理编排：HTTP 门控（含换选项重跑 409、无 cascade 数据 503）+ 后台逐帧 Seedream 编辑（收集目标帧/cv2 haarcascade 人脸检测/指令构造/prompt 追加动作线/失败保留）+ `meta.postprocess` 状态机 | conversation-task |
 | `app/sanitize.py` | 公共脱敏函数（seedance/seedream/postprocess 共用）：删 key|authorization 行 + 抹密钥字面值 + 截断 | conversation-task |
 | `app/scenes.py` | PySceneDetect 场景检测：manifest 帧按场景分组写 scenes.json + 拆段边界建议（>20s 才计算，每段 4~15s 为算法级不变量，末尾防御断言）；流水线按 segments 拆段（空则单段模式） | conversation-task |

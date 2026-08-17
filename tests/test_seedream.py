@@ -2,11 +2,13 @@
 
 import asyncio
 import base64
+import io
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -18,7 +20,7 @@ from app.config import get_settings
 
 PNG = b"\x89PNG\r\n\x1a\n"
 SECRET = "sk-live-abcdef123456"
-EDIT_URL = "https://ark.cn-beijing.volces.com/api/v1/images/edits"
+EDIT_URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
 
 
 def _png(tmp_path, name="in.png"):
@@ -48,18 +50,17 @@ def test_edit_arg_defaults(tmp_path):
         ["edit", "--image", str(png), "--prompt", "p", "--out", str(tmp_path / "o.png")]
     )
     assert args.model == "doubao-seedream-5-0-pro-260628"
-    assert args.poll_interval == 5
-    assert args.poll_timeout == 600
-    assert args.request_timeout == 120
+    assert args.request_timeout == 300  # 实测同步响应 60s+，默认留余量
+    assert not hasattr(args, "poll_interval")  # 同步为唯一形态，轮询参数已删
+    assert not hasattr(args, "poll_timeout")
 
 
-def test_edit_bad_timeouts(tmp_path):
+def test_edit_bad_request_timeout(tmp_path):
     png = _png(tmp_path)
-    for flag in ("--poll-interval", "--poll-timeout", "--request-timeout"):
-        argv = ["edit", "--image", str(png), "--prompt", "p",
-                "--out", str(tmp_path / "o.png"), flag, "-1"]
-        with pytest.raises(SystemExit, match="positive"):
-            seedream_task.main(argv)
+    argv = ["edit", "--image", str(png), "--prompt", "p",
+            "--out", str(tmp_path / "o.png"), "--request-timeout", "-1"]
+    with pytest.raises(SystemExit, match="positive"):
+        seedream_task.main(argv)
 
 
 # ---------- dry-run：不联网、不需要 key、校验入参 ----------
@@ -146,7 +147,7 @@ def test_script_error_exit_nonzero_no_key_leak(tmp_path):
     assert "does not exist" in r.stderr
 
 
-# ---------- 真实提交全链路（monkeypatch urllib） ----------
+# ---------- 真实提交全链路（monkeypatch urllib，同步 JSON 契约） ----------
 
 class FakeResponse:
     """JSON 响应假实现；bytes 直接原样返回（下载分支）。"""
@@ -179,21 +180,20 @@ def _fake_ark(monkeypatch, responses):
         return FakeResponse(payload)
 
     monkeypatch.setattr(seedream_task.urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(seedream_task.time, "sleep", lambda s: None)
     return calls
 
 
 def test_full_chain_success_b64(tmp_path, monkeypatch, capsys):
+    """实测契约：单次同步 POST，JSON body（image 为 data URI 数组），b64_json 解码落盘。"""
     monkeypatch.setenv("ARK_API_KEY", SECRET)
     out = tmp_path / "edited.png"
     state = tmp_path / "task.json"
+    src = PNG + b"fake-image-data"
     img = PNG + b"edited-image-bytes"
     b64 = base64.b64encode(img).decode("ascii")
     calls = _fake_ark(monkeypatch, [
-        {"request_id": "req-123", "status": "queued"},
-        {"request_id": "req-123", "status": "processing"},
-        {"request_id": "req-123", "status": "succeeded",
-         "content": [{"type": "image_url", "b64_json": b64}]},
+        {"model": "doubao-seedream-5-0-pro-260628", "created": 1758200023,
+         "data": [{"b64_json": b64}]},
     ])
     args = seedream_task.parse_args(
         ["edit", "--image", str(_png(tmp_path)), "--prompt", "戴上眼镜",
@@ -201,56 +201,41 @@ def test_full_chain_success_b64(tmp_path, monkeypatch, capsys):
     )
     assert seedream_task.run_edit(args) == 0
 
-    # POST：multipart 构造 + 认证头
-    (req, kw), = calls[:1]
+    # 唯一一次请求：POST images/generations，同步返回，无轮询
+    (req, kw), = calls
     assert req.full_url == EDIT_URL
     assert req.get_header("Authorization") == f"Bearer {SECRET}"
-    assert kw["timeout"] == 120
-    assert req.get_header("Content-type").startswith("multipart/form-data; boundary=")
-    body = req.data
-    assert b'name="model"' in body
-    assert b"doubao-seedream-5-0-pro-260628" in body
-    assert b'name="prompt"' in body and "戴上眼镜".encode("utf-8") in body
-    assert b'name="image"' in body
-    assert b'filename="in.png"' in body
-    assert b"image/png" in body
-    assert PNG in body
-    assert b'name="response_format"' in body and b"b64_json" in body
-    assert b'name="watermark"' in body and b"false" in body
+    assert kw["timeout"] == 300
+    assert req.get_header("Content-type") == "application/json"
 
-    # 轮询：GET {EDIT_URL}/{request_id}
-    assert [r.full_url for r, _ in calls[1:]] == [f"{EDIT_URL}/req-123"] * 2
-    # b64 解码落盘 + state-file 写最新任务
+    # JSON body：中文 ensure_ascii=False、image 为 data URI 字符串数组
+    assert "戴上眼镜".encode("utf-8") in req.data
+    body = json.loads(req.data.decode("utf-8"))
+    assert body["model"] == "doubao-seedream-5-0-pro-260628"
+    assert body["prompt"] == "戴上眼镜"
+    assert body["image"] == [f"data:image/png;base64,{base64.b64encode(src).decode('ascii')}"]
+    assert body["response_format"] == "b64_json"
+    assert body["watermark"] is False
+
+    # b64 解码落盘 + state-file 写响应摘要（不塞图字节）
     assert out.read_bytes() == img
     task = json.loads(state.read_text(encoding="utf-8"))
-    assert task["status"] == "succeeded"
-    assert "req-123" in capsys.readouterr().out
+    assert task["model"] == "doubao-seedream-5-0-pro-260628"
+    assert task["image"] == {"format": "b64_json", "bytes": len(img)}
+    assert "b64_json" in capsys.readouterr().out
 
 
-def test_sync_response_saves_without_poll(tmp_path, monkeypatch):
-    """提交即带图（同步风格 data[] 响应，无 id）→ 不轮询直接写盘。"""
-    monkeypatch.setenv("ARK_API_KEY", SECRET)
-    out = tmp_path / "edited.png"
-    img = PNG + b"sync-bytes"
-    b64 = base64.b64encode(img).decode("ascii")
-    calls = _fake_ark(monkeypatch, [{"created": 1758200023, "data": [{"b64_json": b64}]}])
-    args = seedream_task.parse_args(
-        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
-         "--out", str(out), "--confirm-submit"]
-    )
-    assert seedream_task.run_edit(args) == 0
-    assert len(calls) == 1
-    assert out.read_bytes() == img
-
-
-def test_succeeded_url_download(tmp_path, monkeypatch):
+@pytest.mark.parametrize("entry", [
+    {"url": "https://tos.example/edited.png"},
+    {"b64_json": "", "url": "https://tos.example/edited.png"},  # b64 为空回落 url
+])
+def test_url_download_fallback(tmp_path, monkeypatch, entry):
+    """b64_json 缺失/为空 → data[0].url 下载兜底。"""
     monkeypatch.setenv("ARK_API_KEY", SECRET)
     out = tmp_path / "edited.png"
     img = PNG + b"url-downloaded"
     calls = _fake_ark(monkeypatch, [
-        {"request_id": "req-9", "status": "running"},
-        {"request_id": "req-9", "status": "succeeded",
-         "content": {"image_url": {"url": "https://tos.example/edited.png"}}},
+        {"model": "doubao-seedream-5-0-pro-260628", "data": [entry]},
         img,
     ])
     args = seedream_task.parse_args(
@@ -258,81 +243,42 @@ def test_succeeded_url_download(tmp_path, monkeypatch):
          "--out", str(out), "--confirm-submit"]
     )
     assert seedream_task.run_edit(args) == 0
-    assert calls[2][0] == "https://tos.example/edited.png"
+    assert len(calls) == 2
+    assert calls[1][0] == "https://tos.example/edited.png"
     assert out.read_bytes() == img
 
 
-def test_failed_status_exit_1(tmp_path, monkeypatch):
+@pytest.mark.parametrize("payload", [
+    {"model": "doubao-seedream-5-0-pro-260628", "data": []},
+    {"model": "doubao-seedream-5-0-pro-260628", "data": [{}]},
+    {},
+])
+def test_success_without_image_data_fails(tmp_path, monkeypatch, payload):
     monkeypatch.setenv("ARK_API_KEY", SECRET)
-    _fake_ark(monkeypatch, [
-        {"request_id": "req-f", "status": "running"},
-        {"request_id": "req-f", "status": "failed"},
-    ])
-    args = seedream_task.parse_args(
-        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
-         "--out", str(tmp_path / "o.png"), "--confirm-submit"]
-    )
-    assert seedream_task.run_edit(args) == 1
-
-
-@pytest.mark.parametrize("status", ["cancelled", "expired"])
-def test_initial_cancelled_expired_exit_1(tmp_path, monkeypatch, status):
-    """提交即终态（取消/过期）→ 退出码 1，不再轮询。"""
-    monkeypatch.setenv("ARK_API_KEY", SECRET)
-    calls = _fake_ark(monkeypatch, [{"request_id": "req-c", "status": status}])
-    args = seedream_task.parse_args(
-        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
-         "--out", str(tmp_path / "o.png"), "--confirm-submit"]
-    )
-    assert seedream_task.run_edit(args) == 1
-    assert len(calls) == 1
-
-
-@pytest.mark.parametrize("status", ["cancelled", "expired"])
-def test_poll_terminal_cancelled_expired_exit_1(tmp_path, monkeypatch, status):
-    """轮询中变取消/过期 → 退出码 1，不白等 poll-timeout。"""
-    monkeypatch.setenv("ARK_API_KEY", SECRET)
-    _fake_ark(monkeypatch, [
-        {"request_id": "req-c", "status": "running"},
-        {"request_id": "req-c", "status": status},
-    ])
-    args = seedream_task.parse_args(
-        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
-         "--out", str(tmp_path / "o.png"), "--confirm-submit"]
-    )
-    assert seedream_task.run_edit(args) == 1
-
-
-def test_poll_timeout_nonzero_exit(tmp_path, monkeypatch, capsys):
-    """轮询超时：cli 把 TimeoutError 转成退出码 1，stderr 不泄密钥。"""
-    monkeypatch.setenv("ARK_API_KEY", SECRET)
-    _fake_ark(monkeypatch, [
-        {"request_id": "req-t", "status": "running"},
-    ])
-    clock = iter([0.0, 5.0])
-    monkeypatch.setattr(seedream_task.time, "monotonic", lambda: next(clock))
-    rc = seedream_task.cli(
-        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
-         "--out", str(tmp_path / "o.png"), "--confirm-submit",
-         "--poll-timeout", "1"]
-    )
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "did not finish" in err
-    assert SECRET not in err
-
-
-def test_succeeded_without_image_data_fails(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARK_API_KEY", SECRET)
-    _fake_ark(monkeypatch, [
-        {"request_id": "req-x", "status": "succeeded"},  # 成功但缺图
-    ])
+    _fake_ark(monkeypatch, [payload])
     args = seedream_task.parse_args(
         ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
          "--out", str(tmp_path / "o.png"), "--confirm-submit"]
     )
     with pytest.raises(RuntimeError, match="image"):
         seedream_task.run_edit(args)
+
+
+def test_http_error_exit_nonzero_no_key_leak(tmp_path, monkeypatch, capsys):
+    """HTTP 错误走既有报错路径：退出码 1，stderr 不含密钥字面值。"""
+    monkeypatch.setenv("ARK_API_KEY", SECRET)
+    err = urllib.error.HTTPError(
+        EDIT_URL, 400, "bad request", {}, io.BytesIO(b'{"error": "bad request"}')
+    )
+    _fake_ark(monkeypatch, [err])
+    rc = seedream_task.cli(
+        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
+         "--out", str(tmp_path / "o.png"), "--confirm-submit"]
+    )
+    assert rc == 1
+    err_text = capsys.readouterr().err
+    assert "Ark HTTP 400" in err_text
+    assert SECRET not in err_text
 
 
 # ---------- seedream.py 门控 ----------
@@ -500,11 +446,11 @@ def test_edit_success(tmp_path, monkeypatch):
     assert "--confirm-submit" not in dargv
     assert dargv[dargv.index("--model") + 1] == "doubao-seedream-custom"
 
-    # 真实提交 argv 契约：列表、cwd、960s、无 shell、env 继承、机械门控 flag
+    # 真实提交 argv 契约：列表、cwd、600s（300 请求 + 余量）、无 shell、env 继承、机械门控 flag
     (argv, kw), = fake.real_calls
     assert isinstance(argv, list)
     assert kw["cwd"] == cdir
-    assert kw["timeout"] == 960
+    assert kw["timeout"] == 600
     assert kw.get("shell") is not True
     assert kw.get("env") is None
     assert "--confirm-submit" in argv
@@ -553,7 +499,7 @@ def test_edit_timeout_502(tmp_path, monkeypatch):
     def fake(argv, **kwargs):
         if "--dry-run" in argv:
             return real(argv, **kwargs)
-        raise subprocess.TimeoutExpired(argv, 960)
+        raise subprocess.TimeoutExpired(argv, 600)
 
     monkeypatch.setattr(subprocess, "run", fake)
     with pytest.raises(seedream.SeedreamError) as e:
