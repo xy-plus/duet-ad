@@ -125,6 +125,7 @@ def _voice_step(
     时长约束用源视频时长，取自抽帧步产出的 manifest.json。失败 → PipelineError 走现有
     meta failed 落盘链路。
     """
+    target_language = (target_language or "").strip()  # 纯空白串视为缺失，不生成「翻译成   」prompt
     if voice_mode not in ("keep", "rewrite", "translate"):
         raise PipelineError(f"unknown voice_mode: {voice_mode}")
     if voice_mode == "translate" and not target_language:
@@ -146,10 +147,11 @@ def _voice_step(
     except CodexError as e:
         # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
         try:
-            _load_voice_lines(work, duration_s)
+            lines = _load_voice_lines(work, duration_s)
         except PipelineError:
             raise e from None
-    lines = _load_voice_lines(work, duration_s)
+    else:
+        lines = _load_voice_lines(work, duration_s)
     storage.update_meta(settings.data_dir, cid, voice_lines=lines)
 
 

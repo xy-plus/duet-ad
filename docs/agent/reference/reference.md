@@ -98,7 +98,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 - `app.main.create_app(settings) -> FastAPI` — 应用工厂（测试注入用）；模块级 `app = create_app(get_settings())`
 - `app.storage.new_conversation(data_dir, note, orig_name, client_request_id="") -> dict` — 建目录 + 初始 meta（status=queued）；幂等键非空才落 meta
 - `app.voice.extract_audio(cdir) -> Path | None` — ffmpeg 抽音轨为 work/voice.mp3；无音轨 → None；失败 → PipelineError
-- `app.voice.validate_voice_lines(raw, duration_s) -> list[dict]` — 台词 JSON 白名单校验（text/start_s/end_s 三字段、时间单调且落在时长内）；返回净化列表
+- `app.voice.validate_voice_lines(raw, duration_s) -> list[dict]` — 台词 JSON 白名单校验（raw ≤ 32KB、条目 ≤ 200、每行 text ≤ 500 字、text/start_s/end_s 三字段、时间单调且落在时长内）；返回净化列表
 - `app.storage.update_meta(data_dir, cid, **changes) -> dict | None` — 合并写字段并刷新 `updated_at`
 - `app.storage.load_meta(data_dir, cid) -> dict | None` — cid 正则不过/文件缺 → None
 - `app.storage.list_conversations(data_dir) -> list[dict]` — 扫描合法目录，按 `created_at` 倒序
@@ -128,6 +128,7 @@ meta.json（`data/<cid>/meta.json`）：
 | `created_at` / `updated_at` | str | ISO8601 UTC |
 | `keyframes` | list[str] | 关键帧文件名（done 后写入） |
 | `prompt` | str \| null | Seedance prompt（done 后写入） |
+| `voice_lines` | list[dict] | 口播台词（`voice_mode≠none` 时 ASR 校验后写入；内部字段，不进 detail 响应） |
 | `client_request_id` | str | 前端幂等键（仅提交时带才存在；内部字段，查重依据） |
 | `has_video` | bool | 提交标记（仅提交后存在；内部字段） |
 | `submitted_at` / `task_id` | str | 提交时间 / Ark 任务 id（内部字段，读不到 task.json 则为 null） |

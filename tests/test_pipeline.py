@@ -565,6 +565,68 @@ def test_run_voice_translate_prompt_has_target_language(tmp_path, video_1s, monk
     assert "翻译成英文" in calls[0]
 
 
+def test_run_voice_rewrite_prompt_has_rule_and_lines(tmp_path, video_1s, monkeypatch):
+    """rewrite 模式：ASR prompt 含洗稿规则（句数/句序/时间边界不变）且 voice_lines 落 meta。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "rewrite")
+    calls = []
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        calls.append(prompt)
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(json.dumps(VOICE_LINES), encoding="utf-8")
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "done"
+    assert m["voice_lines"] == VOICE_LINES
+    asr_prompt = calls[0]
+    assert "洗稿" in asr_prompt
+    assert "句数不变" in asr_prompt
+    assert "句序不变" in asr_prompt
+    assert "时间边界不变" in asr_prompt
+
+
+def test_run_voice_mode_unknown_fails(tmp_path, video_1s, monkeypatch):
+    """绕过入口校验直改 meta 的非法 voice_mode → failed 且 error 含 unknown voice_mode。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "dub")
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(CodexRunner, "run", _no_codex)
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "failed"
+    assert "unknown voice_mode" in m["error"]
+
+
+def test_run_voice_translate_whitespace_target_fails(tmp_path, video_1s, monkeypatch):
+    """target_language 为纯空白串 → 视为缺失 failed，不生成「翻译成   」prompt。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "translate", target_language="   ")
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(CodexRunner, "run", _no_codex)
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "failed"
+    assert "target_language" in m["error"]
+
+
 def test_run_voice_translate_requires_target_language(tmp_path, video_1s, monkeypatch):
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
@@ -578,7 +640,7 @@ def test_run_voice_translate_requires_target_language(tmp_path, video_1s, monkey
 
 
 def test_run_voice_no_audio_track_fails(tmp_path, video_1s, monkeypatch):
-    """上传时 422 已拦无音轨，这里兜底：抽不到音轨 → failed。"""
+    """无音轨兜底：extract_audio 探测返回 None → failed（上传校验只查时长，不查音轨）。"""
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
     _set_voice_mode(settings, meta, "keep")

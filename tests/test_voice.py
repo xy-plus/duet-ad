@@ -2,6 +2,7 @@
 import json
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -66,6 +67,22 @@ class TestExtractAudio:
         monkeypatch.setattr(voice.subprocess, "run", lambda *a, **kw: fake)
         with pytest.raises(PipelineError, match="exit 1"):
             voice.extract_audio(cdir)
+
+    @pytest.mark.parametrize("stdout", ["", '{"programs": []}'])
+    def test_probe_failure_defers_to_ffmpeg(self, tmp_path, video_with_audio, monkeypatch, stdout):
+        """ffprobe rc=0 但 stdout 空/缺 streams 键 → 视为探测失败交 ffmpeg，不误判无音轨。"""
+        cdir = _conv(tmp_path, video_with_audio)
+        real_run = voice.subprocess.run
+
+        def fake_run(argv, **kw):
+            if Path(argv[0]).name == "ffprobe":
+                return subprocess.CompletedProcess(argv, 0, stdout, "")
+            return real_run(argv, **kw)
+
+        monkeypatch.setattr(voice.subprocess, "run", fake_run)
+        out = voice.extract_audio(cdir)
+        assert out == cdir / "work" / "voice.mp3"
+        assert out.is_file() and out.stat().st_size > 0
 
 
 # ---------- validate_voice_lines ----------
@@ -149,4 +166,28 @@ class TestValidateVoiceLines:
             {"text": "a", "start_s": 1.0, "end_s": 2.0},
         ]
         with pytest.raises(PipelineError, match=r"voice_lines\[1\]"):
+            voice.validate_voice_lines(json.dumps(data).encode(), 10.0)
+
+    def test_raw_too_large(self):
+        """raw 超 32KB 上限 → PipelineError（错误带实际大小与上限）。"""
+        raw = b"[" + b" " * (voice.MAX_VOICE_LINES_BYTES + 1) + b"]"
+        with pytest.raises(PipelineError, match="exceeds 32768 bytes"):
+            voice.validate_voice_lines(raw, 10.0)
+
+    def test_text_too_long(self):
+        data = [{"text": "字" * 501, "start_s": 0.0, "end_s": 1.0}]
+        with pytest.raises(PipelineError, match=r"voice_lines\[0\].text.*500"):
+            voice.validate_voice_lines(json.dumps(data).encode(), 10.0)
+
+    def test_text_at_limit_ok(self):
+        data = [{"text": "字" * 500, "start_s": 0.0, "end_s": 1.0}]
+        lines = voice.validate_voice_lines(json.dumps(data).encode(), 10.0)
+        assert len(lines[0]["text"]) == 500
+
+    def test_too_many_items(self):
+        data = [
+            {"text": f"第{i}句", "start_s": i * 0.01, "end_s": i * 0.01 + 0.005}
+            for i in range(201)
+        ]
+        with pytest.raises(PipelineError, match="exceeds 200 items"):
             voice.validate_voice_lines(json.dumps(data).encode(), 10.0)
