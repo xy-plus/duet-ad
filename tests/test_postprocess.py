@@ -466,3 +466,41 @@ def test_legacy_change_bg_in_meta_options_rerun_no_409(enabled, monkeypatch):
     r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 409
     assert r.json() == {"detail": "options changed since last run"}
+
+
+def test_legacy_pure_change_bg_rerun_clears_artifacts_and_reedits(enabled, monkeypatch):
+    """旧会话「只勾 change_bg」（当前三键全 False 的纯废弃形态）→ 放行重跑：
+    旧产物清除、全帧强制重编辑（防旧 change_bg 产物贴新三键标签）。"""
+    settings, c = enabled
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+
+    legacy = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": False}
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "failed", "options": legacy, "frames": ["01.png", "02.png"], "error": "x",
+    })
+    (cdir / "work" / "postprocessed").mkdir(parents=True)
+    for name in ("01.png", "02.png"):
+        (cdir / "work" / "postprocessed" / name).write_bytes(PNG + b"legacy")
+
+    r = _post(c, cid, OPTIONS_SUB)
+    assert r.status_code == 200
+    assert len(fake.calls) == 2  # 旧产物已清，两帧全部重新编辑
+    assert not (cdir / "work" / "postprocessed" / "01.png").exists() or \
+        (cdir / "work" / "postprocessed" / "01.png").read_bytes() == PNG + b"edited"
+
+
+def test_legacy_pure_change_bg_any_new_option_no_409(enabled, monkeypatch):
+    """纯废弃形态下任何合法新三键（≥1 True）都不 409——永久死锁回归。"""
+    settings, c = enabled
+    cid = _make_conv(settings)
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    legacy = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": False}
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "failed", "options": legacy, "frames": [], "error": "x",
+    })
+    r = _post(c, cid, FACE_ONLY)
+    assert r.status_code == 200

@@ -61,8 +61,13 @@ async def start(
     if (meta.get("postprocess") or {}).get("status") == "running":
         raise PostprocessError(409, "already running")
     last = meta.get("postprocess") or {}
-    if last.get("status") in ("done", "failed") and not _options_match(last.get("options"), options):
-        raise PostprocessError(409, "options changed since last run")
+    if last.get("status") in ("done", "failed"):
+        if not _options_match(last.get("options"), options):
+            raise PostprocessError(409, "options changed since last run")
+        # 纯废弃形态（旧版只勾 change_bg 等）放行重跑：清除旧产物，强制全帧重编辑防贴错标签；
+        # 同选项正常重跑不清产物（跳过逻辑依赖已有输出）
+        if _is_pure_legacy(last.get("options")):
+            _clear_postprocessed(settings.data_dir / cid, meta)
     lock = locks.setdefault(cid, asyncio.Lock())
     async with lock:
         meta = storage.load_meta(settings.data_dir, cid)
@@ -112,12 +117,36 @@ async def run_task(
 
 def _options_match(last_options: object, options: dict[str, bool]) -> bool:
     """锁定比对只认当前 OPTION_KEYS 内共有键：旧会话 options 里的废弃键忽略（历史会话可能
-    存四键 options）；上次 options 非 dict（如 None）一律视为不一致。"""
+    存四键 options）；上次 options 非 dict（如 None）一律视为不一致；
+    纯废弃形态（上次在当前键上无任何 True，如旧版只勾 change_bg）视为无锁定放行——
+    否则该类会话永久 409 无出口。"""
     if not isinstance(last_options, dict):
         return False
+    if not any(last_options.get(key) is True for key in OPTION_KEYS if key in last_options):
+        return True
     return all(
         last_options.get(key) == options[key] for key in OPTION_KEYS if key in last_options
     )
+
+
+def _is_pure_legacy(last_options: object) -> bool:
+    """上次 options 为 dict 且当前键无任何 True（旧版只勾 change_bg 等废弃选择）→ 纯废弃形态。"""
+    return isinstance(last_options, dict) and not any(
+        last_options.get(key) is True for key in OPTION_KEYS if key in last_options
+    )
+
+
+def _clear_postprocessed(cdir: Path, meta: dict) -> None:
+    """删除既有 postprocessed 产物（纯废弃形态重跑时旧产物无对应新选项意义，防贴错标签）。"""
+    targets = [cdir / "work" / "postprocessed"]
+    targets += [
+        cdir / "work" / "segments" / str(seg.get("index")) / "work" / "postprocessed"
+        for seg in meta.get("segments") or []
+    ]
+    for d in targets:
+        if d.is_dir():
+            for p in d.glob("*.png"):
+                p.unlink(missing_ok=True)
 
 
 def _parse_options(payload: dict) -> dict[str, bool]:
