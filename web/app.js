@@ -875,24 +875,24 @@ function renderPpDynamic(detail) {
    完全不变 → 什么都不做（连 DOM 都不碰，杜绝每 2s 清空重建媒体引发的闪烁）。
    dyn 取 postprocess.frames 长度：只有它会在 stable 不变时随轮询增长。 */
 function detailSignature(detail) {
+  // stable 覆盖稳定区渲染消费的全部字段（未覆盖字段如 title/note 由创建后不变兜底，
+  // pp.options 与 status 原子落盘——见审查记录）；dyn 只跟后处理进度（frames 单调增长）。
   const pp = detail.postprocess || null;
   const segments = Array.isArray(detail.segments) ? detail.segments : [];
-  const segSig = segments.map((seg) => [
-    seg.index,
-    Array.isArray(seg.keyframes) ? seg.keyframes.join(",") : "",
-    seg.prompt || "",
-    Array.isArray(seg.lines) ? seg.lines.join("\n") : "",
-  ].join("§")).join("#");
-  const stable = [
+  const stable = JSON.stringify([
     detail.status,
     pp ? pp.status : "",
     pp && pp.error ? pp.error : "",
     Array.isArray(detail.keyframes) ? detail.keyframes.join(",") : "",
     detail.prompt || "",
-    segSig,
-    Array.isArray(detail.voice_lines) ? detail.voice_lines.length : 0,
+    segments.map((seg) => [
+      seg.index,
+      Array.isArray(seg.keyframes) ? seg.keyframes.join(",") : "",
+      seg.prompt || "",
+      Array.isArray(seg.lines) ? seg.lines.join("\n") : "",
+    ]),
     detail.has_video ? 1 : 0,
-  ].join("|");
+  ]);
   const dyn = pp && Array.isArray(pp.frames) ? pp.frames.length : 0;
   return { stable, dyn };
 }
