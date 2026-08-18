@@ -4,7 +4,7 @@ type: reference
 status: done
 owner: agent
 updated: 2026-08-18
-links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/pipeline.py, app/codex_runner.py, app/seedance.py, app/seedance_task.py, app/seedream.py, app/seedream_task.py, app/postprocess.py, app/sanitize.py]
+links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/pipeline.py, app/codex_runner.py, app/seedance.py, app/seedance_task.py, app/seedream.py, app/seedream_task.py, app/postprocess.py, app/sanitize.py, app/vocal.py]
 ---
 
 # backend-api · 接口（How/Now）
@@ -179,7 +179,7 @@ meta.json（`data/<cid>/meta.json`）：
 | `voice_mode` | str | `none/keep/rewrite/translate`（恒落，默认 `none`；内部字段） |
 | `target_language` | str | 翻译目标语言（仅 `translate` 且非空时落；内部字段） |
 | `voice_lines` | list[dict] | 口播台词（`voice_mode≠none` 时 ASR 校验 + YAMNet 声学过滤后写入；进 detail 响应 `voice_lines` 字段） |
-| `has_bgm` | bool | 口播模式 YAMNet 判定的整片背景音乐有无（`voice_mode≠none` 时恒写） |
+| `has_bgm` | bool | 口播模式 YAMNet 判定的整片背景音乐有无（`voice_mode≠none` 时恒写；内部字段，不进 detail 响应） |
 | `segments` | list[dict] | 多段模式逐段产物：`index`（1 起）/`start_s`/`end_s`/`keyframes`/`prompt`/`lines`（该段台词 text 列表）；单段模式不写（缺省） |
 | `scenes_note` | str | 场景检测失败或 scenes.json 非法回退单段的留痕（内部字段，仅回退时写） |
 | `voice_lines_dropped` | int | 多段模式下未归段的越界台词数（内部字段，仅 >0 时写） |
