@@ -131,10 +131,14 @@ class TestValidateVoiceLines:
         with pytest.raises(PipelineError, match="JSON"):
             voice.validate_voice_lines(b"not json", 10.0)
 
-    @pytest.mark.parametrize("payload", [b"{}", b"[]", b'"str"'])
-    def test_not_a_nonempty_list(self, payload):
+    @pytest.mark.parametrize("payload", [b"{}", b'"str"'])
+    def test_not_a_list(self, payload):
         with pytest.raises(PipelineError, match="array"):
             voice.validate_voice_lines(payload, 10.0)
+
+    def test_empty_array_is_valid(self):
+        """空数组 = 音轨无台词（合法结果，由 pipeline 声学预判兜底 codex 摆烂）。"""
+        assert voice.validate_voice_lines(b"[]", 10.0) == []
 
     def test_item_not_object(self):
         with pytest.raises(PipelineError, match=r"voice_lines\[0\]"):

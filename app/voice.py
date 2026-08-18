@@ -77,7 +77,7 @@ def extract_audio(cdir: Path) -> Path | None:
 def validate_voice_lines(raw: bytes, duration_s: float) -> list[dict]:
     """voice_lines.json 白名单校验（不信任 agent 输出）；返回台词列表，任一不过 → PipelineError。
 
-    校验：raw ≤ 32KB（MAX_VOICE_LINES_BYTES）、UTF-8 可解、JSON 解析为非空 list、
+    校验：raw ≤ 32KB（MAX_VOICE_LINES_BYTES）、UTF-8 可解、JSON 解析为 list（空数组合法 = 无台词）、
     条目 ≤ 200（MAX_VOICE_LINES_ITEMS）、每项含非空 text（strip 后 ≤ 500 字，
     MAX_VOICE_TEXT_CHARS）与 number 型 start_s/end_s 且 0 ≤ start_s < end_s ≤ duration_s
     （边界允许 0.01s 浮点误差）、start_s 单调不减。错误信息指明第几项与原因；返回项只保留白名单三字段。
@@ -94,8 +94,10 @@ def validate_voice_lines(raw: bytes, duration_s: float) -> list[dict]:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         raise PipelineError(f"voice_lines.json not valid JSON: {e}") from None
-    if not isinstance(data, list) or not data:
-        raise PipelineError("voice_lines.json must be a non-empty array")
+    if not isinstance(data, list):
+        raise PipelineError("voice_lines.json must be an array")
+    if not data:
+        return []  # 空数组 = 音轨无台词（合法；codex 摆烂由 pipeline 声学预判 + 重试兜底）
     if len(data) > MAX_VOICE_LINES_ITEMS:
         raise PipelineError(f"voice_lines.json exceeds {MAX_VOICE_LINES_ITEMS} items: {len(data)}")
     lines: list[dict] = []

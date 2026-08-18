@@ -1164,3 +1164,109 @@ def test_full_pipeline_relative_data_dir(tmp_path, video_1s, monkeypatch):
     assert m["status"] == "done", m["error"]
     assert m["keyframes"] == ["01.png", "02.png", "03.png"]
     assert (tmp_path / "data" / cid / "work" / "prompt.txt").is_file()
+
+
+def _spoken_analysis(spoken: bool) -> vocal.VocalAnalysis:
+    """声学预判桩：spoken=True 表示音轨含人声（12 窗口 spoken≥0.2 的形态）。"""
+    return vocal.VocalAnalysis(
+        windows=[
+            vocal.VocalWindow(0, 30_000, sung=0.0, spoken=0.3 if spoken else 0.01, music=0.0),
+        ],
+        has_bgm=False,
+    )
+
+
+def test_run_voice_empty_lines_with_spoken_retries_and_succeeds(tmp_path, video_1s, monkeypatch):
+    """音轨有人声但 codex 第一次输出空数组（随机摆烂）：重试一次听出台词 → done。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    line = {"text": "台词", "start_s": 0.0, "end_s": 0.9}
+    codex_calls = []
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        codex_calls.append(prompt)
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(
+                json.dumps([] if len(codex_calls) == 1 else [line]), encoding="utf-8"
+            )
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(vocal, "analyze", lambda _a: _spoken_analysis(True))
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == [line]
+    # voice 调用 = 第一次听写 + 重试共 2 次（prompt 步另有 1 次非 voice 调用）
+    assert sum(1 for p in codex_calls if "voice.mp3" in p) == 2
+
+
+def test_run_voice_empty_lines_with_spoken_retry_still_empty_fails(tmp_path, video_1s, monkeypatch):
+    """音轨有人声、重试后仍空：失败并给出明确错误，不静默吞台词。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        if "voice.mp3" in prompt:
+            (Path(workdir) / "work" / "voice_lines.json").write_text(
+                json.dumps([]), encoding="utf-8"
+            )
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(vocal, "analyze", lambda _a: _spoken_analysis(True))
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "failed"
+    assert "spoken" in stored["error"]
+
+
+def test_run_voice_empty_lines_without_spoken_passes(tmp_path, video_1s, monkeypatch):
+    """音轨无人声（纯 BGM/静音）且听写为空：合法「无台词」，done 且 voice_lines=[]。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(json.dumps([]), encoding="utf-8")
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(vocal, "analyze", lambda _a: _spoken_analysis(False))
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == []

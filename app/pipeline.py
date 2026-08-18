@@ -157,10 +157,11 @@ def _voice_step(
     settings: Settings, cid: str, cdir: Path, work: Path, runner,
     voice_mode: str, target_language: str,
 ) -> list[dict]:
-    """口播步（抽帧后）：抽音轨 → codex 听写 → 白名单校验 → voice_lines 落 meta。
+    """口播步（抽帧后）：抽音轨 → 声学预判 → codex 听写 → 白名单校验 → voice_lines 落 meta。
 
     台词时间戳在音频时间轴上（codex 听 voice.mp3），校验基准与提示词时长用音频实际时长
-    （音频流可比容器长几十 ms，常态）；容器时长（manifest）仍供场景/拆段用。失败 →
+    （音频流可比容器长几十 ms，常态）；容器时长（manifest）仍供场景/拆段用。空台词数组
+    且音轨有声 → 重试一次 codex，仍空则失败；音轨无声 → 空数组合法（无台词）。失败 →
     PipelineError 走现有 meta failed 落盘链路。返回白名单净化后的台词列表（多段模式按
     start_s 归段用）。
     """
@@ -183,6 +184,12 @@ def _voice_step(
         raise PipelineError(f"manifest.json invalid duration: {duration_s}")
     # 台词校验基准 = 音频实际时长；probe 失败回退容器时长（旧行为）
     audio_duration_s = voice.probe_audio_duration(work / "voice.mp3") or duration_s
+    # 声学分析提前到听写前：空台词数组时区分「音轨无口播（合法无台词）」与「codex 摆烂（重试兜底）」
+    try:
+        analysis = vocal.analyze(work / "voice.mp3")
+    except Exception as e:
+        raise PipelineError(f"vocal classification unavailable: {e}") from None
+    has_spoken = any(w.spoken >= vocal.SPEECH_SCORE_MIN for w in analysis.windows)
     try:
         runner.run(cdir, _voice_prompt(cdir, voice_mode, target_language, audio_duration_s))
     except CodexError as e:
@@ -193,20 +200,31 @@ def _voice_step(
             raise e from None
     else:
         lines = _load_voice_lines(work, audio_duration_s)
-    try:
-        analysis = vocal.analyze(work / "voice.mp3")
-        filtered_lines = []
-        vocal_dropped = 0
-        for line in lines:
-            classification = vocal.classify_segment(
-                int(line["start_s"] * 1000), int(line["end_s"] * 1000), analysis.windows
+    if not lines and has_spoken:
+        # 音轨有人声但听写为空（codex 随机摆烂）：重试一次，仍空则失败——不静默吞台词
+        try:
+            runner.run(cdir, _voice_prompt(cdir, voice_mode, target_language, audio_duration_s))
+        except CodexError as e:
+            try:
+                lines = _load_voice_lines(work, audio_duration_s)
+            except PipelineError:
+                raise e from None
+        else:
+            lines = _load_voice_lines(work, audio_duration_s)
+        if not lines:
+            raise PipelineError(
+                "voice_lines.json empty but audio has spoken content (retried once)"
             )
-            if classification == "spoken":
-                filtered_lines.append(line)
-            else:
-                vocal_dropped += 1
-    except Exception as e:
-        raise PipelineError(f"vocal classification unavailable: {e}") from None
+    filtered_lines = []
+    vocal_dropped = 0
+    for line in lines:
+        classification = vocal.classify_segment(
+            int(line["start_s"] * 1000), int(line["end_s"] * 1000), analysis.windows
+        )
+        if classification == "spoken":
+            filtered_lines.append(line)
+        else:
+            vocal_dropped += 1
 
     changes = {"voice_lines": filtered_lines, "has_bgm": bool(analysis.has_bgm)}
     if vocal_dropped:
