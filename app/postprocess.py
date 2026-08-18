@@ -6,10 +6,10 @@ status != done → 409；meta.postprocess 已在 running → 409；face_hold 被
 数据不可用 → 503（不静默降级）；上次 done/failed 的 options 与本次不同 → 409（防旧产物
 贴新标签）；锁内复查（running / 产物完整）后置 running。
 后台任务（BackgroundTasks，独立路径不吃管道闸；可并发，每会话一把锁）：
-收集目标帧（单段 work/keyframes/*.png；多段 work/segments/N/keyframes/*.png）→ 按勾选选项
+收集目标帧（单段 work/keyframes/*.png；多段 work/segments/N/work/keyframes/*.png）→ 按勾选选项
 构造中文编辑指令（多选项分号连接；face_hold 先 cv2 haarcascade 正面人脸检测，有人脸才做，
 无人脸跳过该帧的此选项；无适用选项的帧整帧跳过）→ 逐帧 seedream.edit_image(confirm=True)
-产出写 work/postprocessed/<帧名>.png 或 work/segments/N/postprocessed/<帧名>.png → 有人脸被
+产出写 work/postprocessed/<帧名>.png 或 work/segments/N/work/postprocessed/<帧名>.png → 有人脸被
 处理时，该帧所属段（或单段）的 prompt 末尾追加动作线（写回 prompt.txt 与 meta 对应 prompt）→
 任一帧失败整体 failed（error 指明帧名，已成功帧保留且重跑跳过）→
 meta.postprocess = {status: running|done|failed, options, frames, error}（内部字段）。
@@ -147,14 +147,14 @@ def _parse_options(payload: dict) -> dict[str, bool]:
 
 
 def _targets(cdir: Path, meta: dict) -> list[tuple[int | None, Path, Path]]:
-    """收集 (段号|None, 源帧, 目标帧)：单段 = work/keyframes；多段 = work/segments/N/keyframes。"""
+    """收集 (段号|None, 源帧, 目标帧)：单段 = work/keyframes；多段 = work/segments/N/work/keyframes。"""
     segs = meta.get("segments") or []
     if segs:
         out: list[tuple[int | None, Path, Path]] = []
         for seg in segs:
             n = seg.get("index")
-            src_dir = cdir / "work" / "segments" / str(n) / "keyframes"
-            dst_dir = cdir / "work" / "segments" / str(n) / "postprocessed"
+            src_dir = cdir / "work" / "segments" / str(n) / "work" / "keyframes"
+            dst_dir = cdir / "work" / "segments" / str(n) / "work" / "postprocessed"
             files = (
                 sorted(p for p in src_dir.glob("*.png") if p.is_file())
                 if src_dir.is_dir() else []
@@ -172,8 +172,8 @@ def _targets(cdir: Path, meta: dict) -> list[tuple[int | None, Path, Path]]:
 
 
 def _frame_ref(seg_index: int | None, name: str) -> str:
-    """frames 列表条目：单段 = 帧名；多段 = segments/N/postprocessed/帧名（全形路径，与 files 白名单同形）。"""
-    return name if seg_index is None else f"segments/{seg_index}/postprocessed/{name}"
+    """frames 列表条目：单段 = 帧名；多段 = segments/N/work/postprocessed/帧名。"""
+    return name if seg_index is None else f"segments/{seg_index}/work/postprocessed/{name}"
 
 
 def _load_cascade():
@@ -229,7 +229,7 @@ def _append_face_line(
         n = seg.get("index")
         if n not in face_segments:
             continue
-        path = cdir / "work" / "segments" / str(n) / "prompt.txt"
+        path = cdir / "work" / "segments" / str(n) / "work" / "prompt.txt"
         prompt = path.read_text(encoding="utf-8")
         if FACE_LINE not in prompt:
             prompt = f"{prompt.rstrip()}\n{FACE_LINE}"

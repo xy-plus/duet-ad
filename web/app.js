@@ -589,13 +589,13 @@ function renderSegments(detail) {
     card.appendChild(sh);
     const names = Array.isArray(seg.keyframes) ? seg.keyframes : [];
     if (names.length) {
-      card.appendChild(kfGrid(detail, names, "segments/" + n + "/keyframes", "第 " + n + " 段关键帧 "));
+      card.appendChild(kfGrid(detail, names, "segments/" + n + "/work/keyframes", "第 " + n + " 段关键帧 "));
     }
-    const prefix = "segments/" + n + "/postprocessed/";
+    const prefix = "segments/" + n + "/work/postprocessed/";
     const own = frames.filter((f) => f.startsWith(prefix)).map((f) => f.slice(prefix.length));
     if (pp.status === "done" && own.length) {
       card.appendChild(el("h4", "res-sub", "优化后"));
-      card.appendChild(kfGrid(detail, own, "segments/" + n + "/postprocessed", "第 " + n + " 段优化后 "));
+      card.appendChild(kfGrid(detail, own, "segments/" + n + "/work/postprocessed", "第 " + n + " 段优化后 "));
     }
     if (seg.prompt) {
       card.appendChild(el("h4", "res-sub", "Seedance 提示词"));

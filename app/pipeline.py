@@ -9,14 +9,16 @@ codex 听写台词（voice_lines.json 白名单校验，落 meta.voice_lines）�
   N 从 1 起），每段独立走抽帧 → codex 分段 prompt → 校验 → 后端机械操作在 prompt 开头加
   「不要生成背景音乐」行；段间 ThreadPoolExecutor 并发（每段目录独立，CodexRunner 自带
   信号量兜底）；meta.voice_lines 按 start_s 归段（[start_s, end_s) 口径，恰在边界归后段），
-  每段写 work/segments/N/voice_lines.json；任一段失败 → 整体 failed（error 指明段号）；
-  meta.segments 落各段产物，顶层 keyframes/prompt 保持空值。段 codex 的 cwd 与单段一致
-  （会话目录），scripts/ 与全片 scenes.json 复用会话目录/ work/ 下的一份，不逐段复制。
+  每段写 work/segments/N/work/voice_lines.json；任一段失败 → 整体 failed（error 指明段号）；
+  meta.segments 落各段产物，顶层 keyframes/prompt 保持空值。段 codex 的 cwd 即段目录
+  （物理隔离，看不到段外内容）；段目录内嵌套 work/（帧/台词/产物落段 work/，SKILL.md
+  的 work/ 路径逐字适用，段 prompt 与单段逐字相同）；scripts/ 逐段拷入段目录，
+  scenes.json 不拷入（段 codex 不需要知道全片）。
 scenes 检测失败或 scenes.json 非法（含拆段不变量违规）→ 回退单段模式（meta.scenes_note
 留痕），不做拆段；越界台词不归段并计数落 meta.voice_lines_dropped（内部字段）；翻译模式
 的目标语言由后端写进 prompt（codex 不从台词反推）。
 codex 超时/非零退出时先校验已落盘产物，完整则收养，不完整才判失败。
-codex 运行前把 skill 的 scripts/ 拷进会话目录（裁剪工具按 scripts/crop_image.py 相对引用）。
+codex 运行前把 skill 的 scripts/ 拷进 codex 工作目录（单段=会话目录、多段=段目录；裁剪工具按 scripts/crop_image.py 相对引用）。
 流水线复用 skills/video-maker 的脚本，不重造。
 """
 
@@ -112,17 +114,6 @@ def _language_note(target_language: str) -> str:
 def _codex_prompt(cdir: Path, target_language: str = "") -> str:
     parts = [
         f"按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。输入在 work/，产物（keyframes/ 与 prompt.txt）必须按文档写入 work/。"
-    ]
-    if target_language:
-        parts.append(_language_note(target_language))
-    parts.append(_hard_rules(cdir))
-    return "\n\n".join(parts) + "\n"
-
-
-def _segment_prompt(cdir: Path, index: int, target_language: str = "") -> str:
-    """分段 codex prompt：指明按 SKILL.md 分段模式处理 work/segments/N/（cwd 为会话目录，与单段一致）。"""
-    parts = [
-        f"按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。本次为分段模式：按 SKILL.md 的「分段模式」小节处理 work/segments/{index}/（该段的帧与联系表在该目录）。输入另含全片 work/scenes.json（场景分组与拆段边界）与该段台词 work/segments/{index}/voice_lines.json（如存在）。产物（keyframes/ 与 prompt.txt）必须按文档写入 work/segments/{index}/。"
     ]
     if target_language:
         parts.append(_language_note(target_language))
@@ -345,39 +336,44 @@ def _prefix_no_bgm(prompt: str, prompt_path: Path) -> str:
     return prefixed
 
 
-def _process_segment(cdir: Path, work: Path, source: Path, seg: dict, runner,
+def _process_segment(work: Path, source: Path, seg: dict, runner,
                      lines: list[dict] | None, target_language: str = "") -> dict:
-    """单段完整流程：切段 → 抽帧 → 写该段台词 → codex 分段 prompt → 校验 → 后端加前缀。
+    """单段完整流程：切段 → 抽帧 → 写该段台词 → codex（cwd=段目录）→ 校验 → 后端加前缀。
 
-    codex 的 cwd 与单段模式一致（会话目录），产物落在 work/segments/N/；scripts/ 与
-    全片 scenes.json 复用会话目录/ work/ 下的一份，不逐段复制。
+    段目录内嵌套 work/：帧/台词/产物都在 segdir/work/，SKILL.md 的 work/ 路径逐字适用，
+    段 prompt 与单段逐字相同（_codex_prompt）；codex 的 cwd 即段目录（物理隔离，看不到
+    段外内容）；scripts/ 拷入段目录（裁剪工具按相对路径引用），scenes.json 不拷入。
     任一失败包装为 PipelineError 并指明段号；返回 meta.segments 条目。
     """
     index = seg["index"]
     segdir = work / "segments" / str(index)
+    segwork = segdir / "work"
     try:
         _cut_segment(source, seg["start_s"], seg["end_s"], segdir)
+        segwork.mkdir(parents=True, exist_ok=True)
         _run_cmd(
             [sys.executable, str(EXTRACT_SCRIPT), str(segdir / "source.mp4"),
-             "--out-dir", str(segdir), "--fps", "4"],
+             "--out-dir", str(segwork), "--fps", "4"],
             timeout=120,
             step=f"segment {index} extract",
         )
         # 该段台词（白名单净化后；lines 为 None = 无口播，不写文件）
         if lines is not None:
-            (segdir / "voice_lines.json").write_text(
+            (segwork / "voice_lines.json").write_text(
                 json.dumps(lines, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+        # 裁剪工具按 scripts/crop_image.py 相对 cwd 引用：scripts/ 拷入段目录
+        shutil.copytree(SCRIPTS_DIR, segdir / "scripts")
         try:
-            runner.run(cdir, _segment_prompt(cdir, index, target_language))
+            runner.run(segdir, _codex_prompt(segdir, target_language))
         except CodexError as e:
             # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
             try:
-                validate_work_dir(segdir)
+                validate_work_dir(segwork)
             except PipelineError:
                 raise e from None
-        keyframes, prompt = validate_work_dir(segdir)
-        prompt = _prefix_no_bgm(prompt, segdir / "prompt.txt")
+        keyframes, prompt = validate_work_dir(segwork)
+        prompt = _prefix_no_bgm(prompt, segwork / "prompt.txt")
         return {
             "index": index,
             "start_s": seg["start_s"],
@@ -424,10 +420,10 @@ def run(settings: Settings, cid: str, runner) -> None:
         if voice_mode == "translate":
             translate_lang = (meta.get("target_language") or "").strip()
         segments = _detect_segments(settings, cid, source, work)
-        # skill 的裁剪工具以 scripts/crop_image.py 相对工作目录引用，codex 的 cwd 是 cdir（单/多段同）
-        shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
         if not segments:
-            # 单段模式：现有流程原样（work/keyframes + work/prompt.txt，不加前缀）
+            # 单段模式：现有流程原样（work/keyframes + work/prompt.txt，不加前缀）；
+            # 裁剪工具以 scripts/crop_image.py 相对工作目录引用，scripts/ 拷进会话目录
+            shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
             try:
                 runner.run(cdir, _codex_prompt(cdir, translate_lang))
             except CodexError as e:
@@ -457,7 +453,7 @@ def run(settings: Settings, cid: str, runner) -> None:
                 seg_metas = list(
                     pool.map(
                         lambda seg: _process_segment(
-                            cdir, work, source, seg, runner,
+                            work, source, seg, runner,
                             lines_by_seg.get(seg["index"]) if lines_by_seg is not None else None,
                             translate_lang,
                         ),

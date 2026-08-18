@@ -73,7 +73,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 ### `GET /api/conversations/{cid}/files/{name:path}`
 
 - 200 → `FileResponse`
-- files 白名单（`storage.resolve_file`，此外一律 404）：`source.mp4`（映射唯一的 `source.*`，扩展名不定）、`preview.mp4`、`generated.mp4`、`contact_sheet.jpg`（映射 `work/contact_sheet.jpg`）、`keyframes/<fn>`（映射 `work/keyframes/<fn>`）、`postprocessed/<fn>`（映射 `work/postprocessed/<fn>`）、`segments/<N>/keyframes/<fn>` 与 `segments/<N>/postprocessed/<fn>`（映射 `work/segments/<N>/` 下同名目录；`<N>` 为正整数，`<fn>` 必须是不含路径的纯文件名）
+- files 白名单（`storage.resolve_file`，此外一律 404）：`source.mp4`（映射唯一的 `source.*`，扩展名不定）、`preview.mp4`、`generated.mp4`、`contact_sheet.jpg`（映射 `work/contact_sheet.jpg`）、`keyframes/<fn>`（映射 `work/keyframes/<fn>`）、`postprocessed/<fn>`（映射 `work/postprocessed/<fn>`）、`segments/<N>/work/keyframes/<fn>` 与 `segments/<N>/work/postprocessed/<fn>`（映射 `work/segments/<N>/work/` 下同名目录；`<N>` 为正整数，`<fn>` 必须是不含路径的纯文件名）
 - 防御：cid 正则校验 + `resolve()` 后必须 `is_relative_to` 会话目录且是文件；symlink 越界/穿越一律 404
 
 ### `POST /api/conversations/{cid}/postprocess`（T5b，默认 501）
@@ -97,12 +97,12 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 | 11 | 后台逐帧执行中任一帧失败 | 受理后 meta 落 `postprocess.status=failed`，`error` 指明帧名（已成功帧保留） |
 
 - 后台任务（`postprocess.run_task`，BackgroundTasks，独立路径不吃管道闸；每会话一把锁，可跨会话并发）：
-  - 收集目标帧：单段 = `work/keyframes/*.png`；多段 = `work/segments/N/keyframes/*.png`（N 来自 `meta.segments`）
+  - 收集目标帧：单段 = `work/keyframes/*.png`；多段 = `work/segments/N/work/keyframes/*.png`（N 来自 `meta.segments`）
   - 每帧按勾选选项构造中文编辑指令（多选项用 `；` 连接）：换背景「将图片背景更换为简洁干净的背景，保持主体人物与物品不变」；含人脸遮挡「将图片中的人物改为用手捂住脸的造型，其余保持不变」；去字幕水印「移除图片中的所有字幕、水印和贴纸元素，其余保持不变」；去版权物品「移除图片中的所有品牌标志、logo、商标等版权元素，其余保持不变」
   - `face_hold`：先 cv2 haarcascade 正面人脸检测（`cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'`，opencv-python-headless 4.x 自带该数据；5.0 无 CascadeClassifier API 不可用，故依赖锁定 `>=4.8,<5`；数据不可用时勾选 face_hold 直接 503，不静默降级），有人脸才注入该选项；无人脸该帧跳过此选项，无适用选项的帧整帧跳过
-  - 有人脸被处理时，该帧所属段（或单段）prompt 末尾追加一行「图中所有人物在1秒内快速把手放下到一个合理的位置，然后按照正常节奏进行后续剧情」，写回 `work/prompt.txt`（或 `work/segments/N/prompt.txt`）与 meta 对应 prompt
-  - 逐帧调用 `seedream.edit_image(..., confirm=True)`（路由层已校验 confirm）；产出 `work/postprocessed/<帧名>.png`（单段）或 `work/segments/N/postprocessed/<帧名>.png`（多段）；已存在的输出跳过（重跑不重复扣费）
-  - 任一帧失败 → 整体 failed（`error` 指明帧名，脱敏 ≤300 字）；已成功帧保留；`meta.postprocess.frames` 记有优化版的帧名列表（单段 = 帧名；多段 = `segments/N/postprocessed/帧名` 全形路径，与 files 白名单路径同形，前端按段前缀过滤展示）
+  - 有人脸被处理时，该帧所属段（或单段）prompt 末尾追加一行「图中所有人物在1秒内快速把手放下到一个合理的位置，然后按照正常节奏进行后续剧情」，写回 `work/prompt.txt`（或 `work/segments/N/work/prompt.txt`）与 meta 对应 prompt
+  - 逐帧调用 `seedream.edit_image(..., confirm=True)`（路由层已校验 confirm）；产出 `work/postprocessed/<帧名>.png`（单段）或 `work/segments/N/work/postprocessed/<帧名>.png`（多段）；已存在的输出跳过（重跑不重复扣费）
+  - 任一帧失败 → 整体 failed（`error` 指明帧名，脱敏 ≤300 字）；已成功帧保留；`meta.postprocess.frames` 记有优化版的帧名列表（单段 = 帧名；多段 = `segments/N/work/postprocessed/帧名` 全形路径，与 files 白名单路径同形，前端按段前缀过滤展示）
 - 幂等：`meta.postprocess.status == "running"` 时再提交一律 409；锁常驻内存，进程重启即失效；done/failed 后可重跑（已有优化图跳过）
 
 ### `POST /api/conversations/{cid}/submit`（预留，默认 501）
@@ -182,7 +182,7 @@ meta.json（`data/<cid>/meta.json`）：
 | `voice_lines_dropped` | int | 多段模式下未归段的越界台词数（内部字段，仅 >0 时写） |
 | `has_video` | bool | 提交标记（仅提交后存在；内部字段） |
 | `submitted_at` / `task_id` | str | 提交时间 / Ark 任务 id（内部字段，读不到 task.json 则为 null） |
-| `postprocess` | dict \| null | 后处理状态（仅后处理启动后存在）：`status`（`running/done/failed`）/`options`（勾选选项）/`frames`（有优化版的帧名列表，单段=帧名、多段=`segments/N/postprocessed/帧名` 全形路径）/`error`（失败原因，指明帧名）；进 detail 响应 `postprocess` 字段 |
+| `postprocess` | dict \| null | 后处理状态（仅后处理启动后存在）：`status`（`running/done/failed`）/`options`（勾选选项）/`frames`（有优化版的帧名列表，单段=帧名、多段=`segments/N/work/postprocessed/帧名` 全形路径）/`error`（失败原因，指明帧名）；进 detail 响应 `postprocess` 字段 |
 
 scenes.json（`work/scenes.json`，`app/scenes.py` 产物）：
 
@@ -197,11 +197,11 @@ scenes.json（`work/scenes.json`，`app/scenes.py` 产物）：
 - `work/keyframes/*.png`：数量 ∈ 1..9（新契约该目录只有选定帧 `01.png…N.png`）
 - `work/prompt.txt`：存在、非空、≤ 32KB（`MAX_PROMPT_BYTES`）
 
-多段模式每段目录 `work/segments/N/` 按同规则校验；校验通过后由后端在 `prompt.txt` 开头机械加一行「不要生成背景音乐」（不依赖 codex 写），meta.segments 存的 prompt 含该行。scenes 检测失败（无场景切点/缺 PySceneDetect）或 scenes.json 的 segments 违反结构不变量（4~15s/相邻无缝/覆盖全程）→ 回退单段模式（meta.scenes_note 留痕），不判失败。段 codex 的 cwd 与单段模式一致（会话目录），只按 prompt 指明的段目录读写；scripts/ 与 scenes.json 复用会话目录/ work/ 下的一份，不逐段复制。
+多段模式每段目录 `work/segments/N/` 的嵌套 `work/` 按同规则校验；校验通过后由后端在 `prompt.txt` 开头机械加一行「不要生成背景音乐」（不依赖 codex 写），meta.segments 存的 prompt 含该行。scenes 检测失败（无场景切点/缺 PySceneDetect）或 scenes.json 的 segments 违反结构不变量（4~15s/相邻无缝/覆盖全程）→ 回退单段模式（meta.scenes_note 留痕），不判失败。段 codex 的 cwd 即段目录（物理隔离，看不到段外内容）：`scripts/` 与 `source.mp4` 留在段根，抽帧/联系表/manifest/台词/关键帧/prompt/后处理均在段 `work/`；scenes.json 不拷入段目录；codex `-o` 落盘的 codex_last_message.txt 随段目录各自独立。
 
 ## 依赖
 
 - Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless `>=4.8,<5`（skill 脚本用；后处理 face_hold 用其自带 haarcascade 数据与 CascadeClassifier API——5.0 无此 API，故锁 `<5`）、scenedetect（场景检测，`app/scenes.py` 用；`>=0.7`——0.6.x 无 FrameTimecode.seconds 属性）、pytest、httpx（TestClient）
 - 外部可执行：ffmpeg/ffprobe（探测+抽帧+测试造样例）、codex CLI（0.147.0 实证基线，仅流水线用）
 - 技能脚本：`skills/video-maker/scripts/extract_keyframes.py`（`--fps`/`--times`/`--sample-count`/`--prefix`/`--columns`/`--out-dir`）、`skills/video-maker/scripts/crop_image.py`（裁字幕/水印）；提交脚本 `app/seedance_task.py`（`create --dry-run|--confirm-submit --wait`，模型默认 `doubao-seedance-2-0-260128`，Ark `https://ark.cn-beijing.volces.com/api/v3`）；编辑脚本 `app/seedream_task.py`（`edit --dry-run|--confirm-submit`，模型默认 `doubao-seedream-5-0-pro-260628`，实测契约：JSON 图生图 POST `https://ark.cn-beijing.volces.com/api/v3/images/generations`，`image` 为 data URI 字符串数组，同步 200 返回 `data[0].b64_json`（缺失/为空/非法即失败退出））；场景脚本 `app/scenes.py`（`<video> --work-dir <work>`，PySceneDetect 场景检测 + 拆段建议，写 scenes.json）
-- 流水线固定参数：抽帧 `--fps 4`（分页联系表落 `work/`）；scenes 检测超时 300s；拆段切分 `ffmpeg -ss <start> -i <src> -to <len>` 重编码落 `work/segments/N/source.mp4`（切出时长与边界误差 <0.1s）；提交建模 `9:16 / 15s / 720p / --generate-audio / --no-watermark`（提交时现构建，无评审 payload）
+- 流水线固定参数：抽帧 `--fps 4`（分页联系表落 `work/`；段内落 `work/segments/N/work/`）；scenes 检测超时 300s；拆段切分 `ffmpeg -ss <start> -i <src> -to <len>` 重编码落 `work/segments/N/source.mp4`（切出时长与边界误差 <0.1s）；提交建模 `9:16 / 15s / 720p / --generate-audio / --no-watermark`（提交时现构建，无评审 payload）
