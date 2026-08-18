@@ -18,7 +18,7 @@ links: [postprocess]
 | 关键帧 1..9 张 | 按时间序网格展示，图片经鉴权接口逐张取回（fetch blob → ObjectURL） |
 | prompt 存在 | 全文展示，提供复制按钮（clipboard API，失败时降级 execCommand）；多段模式每段独立卡片 |
 | 段台词（`seg.lines`） | 该段卡片内以列表展示；空列表不展示台词区 |
-| 后处理（`postprocess`） | 关键帧区标题旁显示「后处理」按钮与弹窗、优化后对比网格、失败提示——见 `postprocess` behavior |
+| 后处理（`postprocess`） | 关键帧区标题旁显示「后处理」按钮与弹窗；结果区下方以聊天消息展示请求摘要与状态/结果（进行中卡 / 优化后网格 / 失败提示）——见 `postprocess` behavior |
 | `has_video` 为真 | 最终视频区内嵌播放 `generated.mp4` 成片 |
 | `has_video` 为假 | 最终视频区显示「待提交生成」，按钮恒禁用 |
 | 侧栏列表 | 每项显示标题 + 状态徽章，按创建时间倒序 |

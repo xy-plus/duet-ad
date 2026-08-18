@@ -712,13 +712,38 @@ input { font-family: inherit; }
 
 .pp-caption { font-size: 12px; color: var(--text-2); }
 
-.pp-error {
+/* 后处理聊天消息：用户摘要 chips + 助手结果卡 */
+.pp-bubble {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.pp-bubble-label { font-size: 13px; font-weight: 600; margin-right: 2px; }
+
+.pp-chip {
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .18);
+  border: 1px solid rgba(255, 255, 255, .35);
+}
+
+.pp-seg + .pp-seg {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--divider);
+}
+
+.pp-lock-hint {
   margin: 12px 0 0;
-  padding: 10px 14px;
-  border-radius: 12px;
-  background: rgba(255, 59, 48, .08);
-  color: var(--danger);
-  font-size: 14px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(0, 113, 227, .08);
+  color: var(--accent);
+  font-size: 13px;
 }
 
 .res-sub {

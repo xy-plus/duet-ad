@@ -105,11 +105,7 @@
           <div class="voice-row" role="radiogroup" aria-label="口播转换">
             <span class="voice-label">口播转换</span>
             <label class="voice-option">
-              <input type="radio" name="voice-mode" value="none" checked>
-              <span>无口播</span>
-            </label>
-            <label class="voice-option">
-              <input type="radio" name="voice-mode" value="keep">
+              <input type="radio" name="voice-mode" value="keep" checked>
               <span>原文保持</span>
             </label>
             <label class="voice-option">
@@ -141,21 +137,22 @@
   <form id="pp-form" class="pp-form" novalidate>
     <h2 id="pp-title" class="pp-title">后处理关键帧</h2>
     <p class="pp-sub">勾选处理项（至少一项），AI 将逐帧优化并生成对比图</p>
+    <p id="pp-lock-hint" class="pp-lock-hint" hidden>已运行过后处理，选项已锁定为上次选择</p>
     <div class="pp-opts" role="group" aria-label="后处理选项">
       <label class="pp-opt">
-        <input type="checkbox" name="opt" value="change_bg">
+        <input type="checkbox" name="opt" value="change_bg" checked>
         <span>换背景</span>
       </label>
       <label class="pp-opt">
-        <input type="checkbox" name="opt" value="face_hold">
+        <input type="checkbox" name="opt" value="face_hold" checked>
         <span>含人脸遮挡</span>
       </label>
       <label class="pp-opt">
-        <input type="checkbox" name="opt" value="remove_subtitle">
+        <input type="checkbox" name="opt" value="remove_subtitle" checked>
         <span>去字幕水印</span>
       </label>
       <label class="pp-opt">
-        <input type="checkbox" name="opt" value="remove_brand">
+        <input type="checkbox" name="opt" value="remove_brand" checked>
         <span>去版权物品</span>
       </label>
     </div>

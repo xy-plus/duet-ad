@@ -541,7 +541,7 @@ function postprocessBtn(detail) {
   return wrap;
 }
 
-/* 单段模式：关键帧区（标题旁后处理按钮）+ 失败提示 + 「优化后」对比 grid */
+/* 单段模式：关键帧区（标题旁后处理按钮）；「优化后」与失败提示统一走聊天消息（renderPpChat） */
 function keyframesSection(detail) {
   const sec = el("section", "res-section");
   const names = Array.isArray(detail.keyframes) ? detail.keyframes : [];
@@ -552,15 +552,6 @@ function keyframesSection(detail) {
   head.appendChild(postprocessBtn(detail));
   sec.appendChild(head);
   sec.appendChild(kfGrid(detail, names, "keyframes", "关键帧 "));
-  const pp = detail.postprocess || {};
-  if (pp.status === "failed" && pp.error) {
-    sec.appendChild(el("p", "pp-error", "后处理失败：" + pp.error + "（已成功的帧保留）"));
-  }
-  const frames = Array.isArray(pp.frames) ? pp.frames : [];
-  if (pp.status === "done" && frames.length) {
-    sec.appendChild(el("h4", "res-sub", "优化后"));
-    sec.appendChild(kfGrid(detail, frames, "postprocessed", "优化后 "));
-  }
   return sec;
 }
 
@@ -574,13 +565,8 @@ function renderSegments(detail) {
   head.appendChild(h);
   head.appendChild(postprocessBtn(detail));
   headSec.appendChild(head);
-  const pp = detail.postprocess || {};
-  if (pp.status === "failed" && pp.error) {
-    headSec.appendChild(el("p", "pp-error", "后处理失败：" + pp.error + "（已成功的帧保留）"));
-  }
   frag.appendChild(headSec);
 
-  const frames = Array.isArray(pp.frames) ? pp.frames : [];
   for (const seg of detail.segments) {
     const n = seg.index;
     const card = el("section", "res-section seg-card");
@@ -590,12 +576,6 @@ function renderSegments(detail) {
     const names = Array.isArray(seg.keyframes) ? seg.keyframes : [];
     if (names.length) {
       card.appendChild(kfGrid(detail, names, "segments/" + n + "/work/keyframes", "第 " + n + " 段关键帧 "));
-    }
-    const prefix = "segments/" + n + "/work/postprocessed/";
-    const own = frames.filter((f) => f.startsWith(prefix)).map((f) => f.slice(prefix.length));
-    if (pp.status === "done" && own.length) {
-      card.appendChild(el("h4", "res-sub", "优化后"));
-      card.appendChild(kfGrid(detail, own, "segments/" + n + "/work/postprocessed", "第 " + n + " 段优化后 "));
     }
     if (seg.prompt) {
       card.appendChild(el("h4", "res-sub", "Seedance 提示词"));
@@ -682,9 +662,11 @@ function updatePpConfirm() {
 
 function openPostprocessModal(detail) {
   state.ppDetail = detail;
+  const last = detail.postprocess && detail.postprocess.options;
   document.querySelectorAll('#pp-form input[name="opt"]').forEach((c) => {
-    c.checked = false;
+    c.checked = last ? last[c.value] === true : true; // 已运行过 → 预填上次选项（后端锁定）；首次 → 默认全选
   });
+  $("pp-lock-hint").hidden = !last;
   $("pp-error").hidden = true;
   updatePpConfirm();
   $("pp-dialog").showModal();
@@ -714,10 +696,122 @@ async function submitPostprocess(event) {
     loadDetail(detail.id, true);
   } catch (err) {
     if (handleAuthError(err)) return;
-    errEl.textContent = err.message;
+    if (err.message.includes("options changed since last run")) {
+      // 后端锁定上次选项：回填并提示直接确认，避免反复踩 409
+      const last = detail.postprocess && detail.postprocess.options;
+      document.querySelectorAll('#pp-form input[name="opt"]').forEach((c) => {
+        c.checked = last ? last[c.value] === true : true;
+      });
+      $("pp-lock-hint").hidden = false;
+      errEl.textContent = "选项与上次不一致，已按上次选项预填，请直接确认";
+    } else {
+      errEl.textContent = err.message;
+    }
     errEl.hidden = false;
     updatePpConfirm();
   }
+}
+
+/* ===== 后处理聊天消息 ===== */
+/* 选项标签单一来源：弹窗勾选项 DOM（index.html），避免与 HTML 重复硬编码 */
+let ppOptionLabelsCache = null;
+
+function ppOptionLabels() {
+  if (!ppOptionLabelsCache) {
+    ppOptionLabelsCache = {};
+    document.querySelectorAll('#pp-form input[name="opt"]').forEach((c) => {
+      ppOptionLabelsCache[c.value] = c.nextElementSibling ? c.nextElementSibling.textContent : c.value;
+    });
+  }
+  return ppOptionLabelsCache;
+}
+
+function ppCheckedLabels(options) {
+  const opts = options || {};
+  const labels = ppOptionLabels();
+  return Object.keys(labels)
+    .filter((k) => opts[k] === true)
+    .map((k) => labels[k]);
+}
+
+/* 用户消息：后处理请求摘要（勾选项 chips） */
+function renderPpUserBubble(pp) {
+  const row = el("div", "msg-row msg-user");
+  const bubble = el("div", "bubble-user pp-bubble");
+  bubble.appendChild(el("span", "pp-bubble-label", "后处理"));
+  for (const label of ppCheckedLabels(pp.options)) {
+    bubble.appendChild(el("span", "pp-chip", label));
+  }
+  row.appendChild(bubble);
+  return row;
+}
+
+/* 「优化后」结果区（done）：多段逐段分组；单段按一个虚拟段统一处理 */
+function ppFramesSection(detail, frames) {
+  const wrap = el("div");
+  const segs = (Array.isArray(detail.segments) && detail.segments.length > 0)
+    ? detail.segments
+    : [{ index: null }]; // 单段：帧名为裸文件名，路径前缀为空
+  for (const seg of segs) {
+    const n = seg.index;
+    const prefix = n == null ? "" : "segments/" + n + "/work/postprocessed/";
+    const own = frames.filter((f) => f.startsWith(prefix)).map((f) => f.slice(prefix.length));
+    if (!own.length) continue;
+    const title = n == null ? "优化后" : "第 " + n + " 段优化后";
+    const pathPrefix = n == null ? "postprocessed" : "segments/" + n + "/work/postprocessed";
+    const block = el("div", "pp-seg");
+    block.appendChild(el("h4", "res-sub", title));
+    block.appendChild(kfGrid(detail, own, pathPrefix, title + " "));
+    wrap.appendChild(block);
+  }
+  return wrap;
+}
+
+/* 助手消息：running 进行中卡 / done 优化后结果 / failed 错误卡（detail 轮询重渲染自然保持） */
+function renderPpAssistant(detail, pp) {
+  const row = el("div", "msg-row");
+  row.appendChild(assistantHead(detail.updated_at));
+  if (pp.status === "running") {
+    const card = el("div", "activity-card");
+    card.appendChild(el("p", "ac-title", "后处理进行中…"));
+    card.appendChild(el("p", "ac-sub", "正在逐帧优化关键帧，通常需要一两分钟"));
+    const track = el("div", "progress-track");
+    track.appendChild(el("div", "progress-fill"));
+    card.appendChild(track);
+    row.appendChild(card);
+  } else if (pp.status === "failed") {
+    const card = el("div", "fail-card");
+    card.appendChild(icon("i-alert", "ic-danger"));
+    const body = el("div");
+    body.appendChild(el("p", "fail-title", "后处理失败"));
+    body.appendChild(el("p", "fail-msg", pp.error || "后端未返回具体原因"));
+    if (Array.isArray(pp.frames) && pp.frames.length) {
+      body.appendChild(el("p", "fail-tip", "已成功优化的帧保留"));
+    }
+    card.appendChild(body);
+    row.appendChild(card);
+  } else if (pp.status === "done") {
+    const frames = Array.isArray(pp.frames) ? pp.frames : [];
+    const card = el("div", "activity-card");
+    if (frames.length) {
+      card.appendChild(ppFramesSection(detail, frames));
+    } else {
+      card.appendChild(el("p", "ac-title", "后处理完成"));
+      card.appendChild(el("p", "ac-sub", "无适用帧（如勾选「含人脸遮挡」但未检出人脸）"));
+    }
+    row.appendChild(card);
+  }
+  return row;
+}
+
+/* postprocess 存在即渲染：用户摘要 + 助手消息（renderDetail 全量重渲染，随轮询自然更新） */
+function renderPpChat(detail) {
+  const pp = detail.postprocess || {};
+  if (!pp.status || !pp.options) return null;
+  const frag = document.createDocumentFragment();
+  frag.appendChild(renderPpUserBubble(pp));
+  frag.appendChild(renderPpAssistant(detail, pp));
+  return frag;
 }
 
 function renderDetail(detail) {
@@ -731,6 +825,8 @@ function renderDetail(detail) {
   } else if (detail.status === "done") {
     inner.appendChild(renderResults(detail));
   }
+  const ppChat = renderPpChat(detail);
+  if (ppChat) inner.appendChild(ppChat);
   $("stream").appendChild(inner);
 }
 
@@ -803,7 +899,7 @@ function sourceMode() {
 
 function voiceMode() {
   const checked = document.querySelector('input[name="voice-mode"]:checked');
-  return checked ? checked.value : "none";
+  return checked ? checked.value : "keep";
 }
 
 // 口播转换切换：翻译模式才显示语言填空（必填）
@@ -971,8 +1067,8 @@ async function handleSend(event) {
     clearFile();
     $("note-input").value = "";
     $("url-input").value = "";
-    const noneRadio = document.querySelector('input[name="voice-mode"][value="none"]');
-    noneRadio.checked = true;
+    const keepRadio = document.querySelector('input[name="voice-mode"][value="keep"]');
+    keepRadio.checked = true;
     $("lang-input").value = "";
     $("lang-input").hidden = true;
     $("lang-input").required = false;
@@ -984,7 +1080,10 @@ async function handleSend(event) {
   } catch (err) {
     setUploading(false);
     if (handleAuthError(err)) return;
-    setComposerError(err.message);
+    // 422 no audio track in video → 换成可读引导（本产品仅处理带口播视频）
+    setComposerError(err.message.includes("no audio track in video")
+      ? "该视频没有音轨，本产品仅支持带口播的视频"
+      : err.message);
   }
 }
 

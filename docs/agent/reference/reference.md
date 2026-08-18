@@ -29,7 +29,7 @@ links: [conversation-task, app/main.py, app/storage.py, app/downloader.py, app/p
 
 ### `POST /api/conversations`
 
-- 请求：multipart，`file` 与 `reference_url`（http(s) 直链 / TikTok 视频页）恰好一个 + `note`（可选，默认 `""`）+ `client_request_id`（可选幂等键，格式 `^[0-9A-Za-z-]{8,64}$`，空 = 不参与幂等）+ `voice_mode`（`none|keep|rewrite|translate`，默认 `none`）+ `target_language`（仅 `translate` 时必填非空，其余模式忽略）
+- 请求：multipart，`file` 与 `reference_url`（http(s) 直链 / TikTok 视频页）恰好一个 + `note`（可选，默认 `""`）+ `client_request_id`（可选幂等键，格式 `^[0-9A-Za-z-]{8,64}$`，空 = 不参与幂等）+ `voice_mode`（`none|keep|rewrite|translate`，默认 `none`）+ `target_language`（仅 `translate` 时必填非空，其余模式忽略）。Web 端恒传 `keep/rewrite/translate` 之一（默认 `keep`），恒触发音轨探测；API 直接调用默认 `none`（不探测音轨，兼容 curl 等存量用法）
 - 201 → `{"id": "<32位hex>", "status": "queued"}`；`enable_pipeline` 开时登记后台流水线（经管道闸，见架构）
 - 200 → `{"id", "status"}`：`client_request_id` 命中既有会话 meta（扫 meta.json 查重），不建目录、不重复入队
 - 400 `provide exactly one of file or reference_url`：`file`/`reference_url` 都不给或都给
