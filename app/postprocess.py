@@ -2,26 +2,23 @@
 
 门控顺序（仿 seedance.submit 模式）：ENABLE_SEEDREAM_EDIT 关 → 501；会话不存在 → 404；
 confirm 非严格 True → 409；四选项至少选一否则 422（非 bool 值 → 422 明确类型错误）；
-status != done → 409；meta.postprocess 已在 running → 409；face_hold 被勾选但 cv2 haarcascade
-数据不可用 → 503（不静默降级）；上次 done/failed 的 options 与本次不同 → 409（防旧产物
-贴新标签）；锁内复查（running / 产物完整）后置 running。
+status != done → 409；meta.postprocess 已在 running → 409；上次 done/failed 的 options 与本次
+不同 → 409（防旧产物贴新标签）；锁内复查（running / 产物完整）后置 running。
 后台任务（BackgroundTasks，独立路径不吃管道闸；可并发，每会话一把锁）：
 收集目标帧（单段 work/keyframes/*.png；多段 work/segments/N/work/keyframes/*.png）→ 按勾选选项
-构造中文编辑指令（多选项分号连接；face_hold 先 cv2 haarcascade 正面人脸检测，有人脸才做，
-无人脸跳过该帧的此选项；无适用选项的帧整帧跳过）→ 逐帧 seedream.edit_image(confirm=True)
-产出写 work/postprocessed/<帧名>.png 或 work/segments/N/work/postprocessed/<帧名>.png → 有人脸被
-处理时，该帧所属段（或单段）的 prompt 末尾追加动作线（写回 prompt.txt 与 meta 对应 prompt）→
+构造中文编辑指令（多选项分号连接；face_hold 为条件式指令——含人脸则捂脸、不含人脸保持原样，
+条件句放最前，所有帧都发编辑请求，不做人脸预判/过滤）→ 逐帧 seedream.edit_image(confirm=True)
+产出写 work/postprocessed/<帧名>.png 或 work/segments/N/work/postprocessed/<帧名>.png →
 任一帧失败整体 failed（error 指明帧名，已成功帧保留且重跑跳过）→
 meta.postprocess = {status: running|done|failed, options, frames, error}（内部字段）。
-cv2 检测（cascade 加载 / imread / detectMultiScale）一律 asyncio.to_thread，不堵事件循环。
+无人脸帧的编辑输出为近似原图（seedream 条件指令已实证能正确区分），直接存 postprocessed 展示；
+将来可加输入-输出变化判定过滤（见 OPEN_ISSUE）。
 """
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-
-import cv2
 
 from app import seedream, storage
 from app.config import Settings
@@ -31,13 +28,10 @@ OPTION_KEYS = ("change_bg", "face_hold", "remove_subtitle", "remove_brand")
 
 _INSTRUCTIONS = {
     "change_bg": "将图片背景更换为简洁干净的背景，保持主体人物与物品不变",
-    "face_hold": "将图片中的人物改为用手捂住脸的造型，其余保持不变",
+    "face_hold": "如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。",
     "remove_subtitle": "移除图片中的所有字幕、水印和贴纸元素，其余保持不变",
     "remove_brand": "图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变",
 }
-
-# 有人脸被处理时追加到所属段（或单段）prompt 末尾的动作线
-FACE_LINE = "图中所有人物在1秒内快速把手放下到一个合理的位置，然后按照正常节奏进行后续剧情"
 
 
 class PostprocessError(Exception):
@@ -65,8 +59,6 @@ async def start(
         raise PostprocessError(409, "artifacts not ready")
     if (meta.get("postprocess") or {}).get("status") == "running":
         raise PostprocessError(409, "already running")
-    if options.get("face_hold") and await asyncio.to_thread(_load_cascade) is None:
-        raise PostprocessError(503, "face detection data unavailable")
     last = meta.get("postprocess") or {}
     if last.get("status") in ("done", "failed") and last.get("options") != options:
         raise PostprocessError(409, "options changed since last run")
@@ -93,35 +85,19 @@ async def run_task(
         meta = storage.load_meta(settings.data_dir, cid)
         if meta is None:
             raise PostprocessError(404, "not found")
-        if options.get("face_hold"):
-            cascade = await asyncio.to_thread(_load_cascade)
-            if cascade is None:
-                raise PostprocessError(503, "face detection data unavailable")
-        else:
-            cascade = None
-        face_segments: set[int | None] = set()
         for seg_index, src, out in _targets(cdir, meta):
             if out.is_file():
                 frames.append(_frame_ref(seg_index, out.name))  # 已成功帧保留，重跑不重复扣费
                 continue
-            has_face = (
-                await asyncio.to_thread(_detect_face, src, cascade)
-                if options.get("face_hold") else False
-            )
-            if has_face:
-                face_segments.add(seg_index)
-            prompt = _build_instruction(options, has_face)
-            if not prompt:
-                continue  # 该帧无适用选项（face_hold 且无人脸）→ 整帧跳过
             try:
-                await seedream.edit_image(settings, cdir, src, prompt, out, lock, True)
+                await seedream.edit_image(
+                    settings, cdir, src, _build_instruction(options), out, lock, True
+                )
             except seedream.SeedreamError as e:
                 raise PostprocessError(502, f"frame {out.name} failed: {sanitize(e.detail)}") from None
             except Exception as e:
                 raise PostprocessError(502, f"frame {out.name} failed: {sanitize(str(e))}") from None
             frames.append(_frame_ref(seg_index, out.name))
-        if face_segments:
-            _append_face_line(settings, cid, cdir, meta, face_segments)
         post = {"status": "done", "options": options, "frames": frames, "error": None}
     except PostprocessError as e:
         post = {"status": "failed", "options": options, "frames": frames, "error": e.detail}
@@ -176,65 +152,15 @@ def _frame_ref(seg_index: int | None, name: str) -> str:
     return name if seg_index is None else f"segments/{seg_index}/work/postprocessed/{name}"
 
 
-def _load_cascade():
-    """cv2 自带 haarcascade 正面人脸分类器；数据文件缺失/载入失败 → None（face_hold 勾选时 503）。"""
-    path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-    if not path.is_file():
-        return None
-    cascade = cv2.CascadeClassifier(str(path))
-    return None if cascade.empty() else cascade
-
-
-def _detect_face(image: Path, cascade=None) -> bool:
-    """正面人脸检测；cascade 缺失/图不可解码/无人脸 → False（跳过该帧的此选项）。"""
-    if cascade is None:
-        return False
-    img = cv2.imread(str(image))
-    if img is None:
-        return False
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # bool(数组) 对多元素数组抛 numpy 真值歧义——必须按长度判定（空数组 = 无人脸）
-    return len(cascade.detectMultiScale(gray)) > 0
-
-
-def _build_instruction(options: dict[str, bool], has_face: bool) -> str:
-    """多选项合并为一条指令（分号连接）；face_hold 仅当该帧有人脸。"""
+def _build_instruction(options: dict[str, bool]) -> str:
+    """多选项合并为一条指令（分号连接）；face_hold 条件句放最前（无人脸帧由 seedream 保持原样）。"""
     parts = []
+    if options.get("face_hold"):
+        parts.append(_INSTRUCTIONS["face_hold"])
     if options.get("change_bg"):
         parts.append(_INSTRUCTIONS["change_bg"])
-    if options.get("face_hold") and has_face:
-        parts.append(_INSTRUCTIONS["face_hold"])
     if options.get("remove_subtitle"):
         parts.append(_INSTRUCTIONS["remove_subtitle"])
     if options.get("remove_brand"):
         parts.append(_INSTRUCTIONS["remove_brand"])
     return "；".join(parts)
-
-
-def _append_face_line(
-    settings: Settings, cid: str, cdir: Path, meta: dict, face_segments: set
-) -> None:
-    """有人脸被处理 → 所属段（或单段）prompt 末尾追加动作线，写回 prompt.txt 与 meta。"""
-    if None in face_segments:
-        prompt = (cdir / "work" / "prompt.txt").read_text(encoding="utf-8")
-        if FACE_LINE not in prompt:
-            prompt = f"{prompt.rstrip()}\n{FACE_LINE}"
-            (cdir / "work" / "prompt.txt").write_text(prompt, encoding="utf-8")
-        storage.update_meta(settings.data_dir, cid, prompt=prompt)
-    segs = meta.get("segments") or []
-    if not segs:
-        return
-    changed = False
-    for seg in segs:
-        n = seg.get("index")
-        if n not in face_segments:
-            continue
-        path = cdir / "work" / "segments" / str(n) / "work" / "prompt.txt"
-        prompt = path.read_text(encoding="utf-8")
-        if FACE_LINE not in prompt:
-            prompt = f"{prompt.rstrip()}\n{FACE_LINE}"
-            path.write_text(prompt, encoding="utf-8")
-            seg["prompt"] = prompt
-            changed = True
-    if changed:
-        storage.update_meta(settings.data_dir, cid, segments=segs)

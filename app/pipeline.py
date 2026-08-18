@@ -4,11 +4,12 @@
 codex 听写台词（voice_lines.json 白名单校验，落 meta.voice_lines）→ scenes.py 场景检测
 （work/scenes.json）→ 按 segments 决定模式：
 - 单段模式（segments 空）：codex 沙箱按 SKILL.md 选帧/写 prompt → 后端白名单校验 →
-  meta 落盘（work/keyframes + work/prompt.txt，不加前缀）。
+  meta 落盘（work/keyframes + work/prompt.txt，条件动作行机械加在 prompt 开头）。
 - 多段模式（segments 非空）：ffmpeg 按段边界切源视频（work/segments/N/source.mp4，
   N 从 1 起），每段独立走抽帧 → codex prompt（单段/多段共用） → 校验 → 后端机械操作在 prompt 开头加
-  「不要生成背景音乐」行；段间 ThreadPoolExecutor 并发（每段目录独立，CodexRunner 自带
-  信号量兜底）；meta.voice_lines 按 start_s 归段（[start_s, end_s) 口径，恰在边界归后段），
+  「不要生成背景音乐」行 + 条件动作行（BGM 行在前、条件行在后、原文最后）；段间
+  ThreadPoolExecutor 并发（每段目录独立，CodexRunner 自带信号量兜底）；meta.voice_lines
+  按 start_s 归段（[start_s, end_s) 口径，恰在边界归后段），
   每段写 work/segments/N/work/voice_lines.json；任一段失败 → 整体 failed（error 指明段号）；
   meta.segments 落各段产物，顶层 keyframes/prompt 保持空值。段 codex 的 cwd 即段目录
   （物理隔离，看不到段外内容）；段目录内嵌套 work/（帧/台词/产物落段 work/，SKILL.md
@@ -49,6 +50,8 @@ MAX_PROMPT_BYTES = 32 * 1024
 SCENES_TIMEOUT_S = 300  # scenes.py 场景检测超时（长视频 PySceneDetect 较慢）
 CUT_DURATION_TOLERANCE_S = 0.1  # 切段时长允许误差（秒）
 NO_BGM_LINE = "不要生成背景音乐"  # 多段模式由后端机械加进 prompt 首行（不依赖 codex 写）
+# 条件动作行（所有模式由后端机械加进 prompt，不依赖 codex 写）：与 face_hold 捂脸处理配套
+FACE_HOLD_CONDITION_LINE = "如果画面中出现用手捂住脸的人物：图中所有人物在1秒内快速把手放下到一个合理的位置，然后按照正常节奏进行后续剧情。"
 _SEG_TAIL_EPS_S = 0.01  # 台词 start_s 超出末段终点 ≤0.01s（与 voice 校验容差同口径）→ 归末段
 # 拆段不变量（与 app/scenes.py 的算法级不变量同值；不 import scenes：scenedetect 缺依赖时
 # scenes 模块会 SystemExit，流水线不能因此加载失败）
@@ -345,9 +348,13 @@ def attribute_lines(lines: list[dict], segments: list[dict]) -> dict[int, list[d
     return result
 
 
-def _prefix_no_bgm(prompt: str, prompt_path: Path) -> str:
-    """后端机械操作：prompt 开头加「不要生成背景音乐」行并写回（不依赖 codex 写）；超限 → PipelineError。"""
-    prefixed = NO_BGM_LINE + "\n" + prompt
+def _apply_prefix(prompt: str, prompt_path: Path, *, include_no_bgm: bool) -> str:
+    """后端机械操作：条件动作行（所有模式）+ BGM 行（仅多段，在条件行之前）加进 prompt 开头并写回。
+
+    校验在前缀插入前做过（codex 原文 ≤32KB），前缀后总长复核——超限 → PipelineError。
+    """
+    lines = ([NO_BGM_LINE] if include_no_bgm else []) + [FACE_HOLD_CONDITION_LINE]
+    prefixed = "\n".join(lines) + "\n" + prompt
     if len(prefixed.encode("utf-8")) > MAX_PROMPT_BYTES:
         raise PipelineError(f"prompt.txt exceeds {MAX_PROMPT_BYTES} bytes after prefix")
     prompt_path.write_text(prefixed, encoding="utf-8")
@@ -391,7 +398,7 @@ def _process_segment(work: Path, source: Path, seg: dict, runner,
             except PipelineError:
                 raise e from None
         keyframes, prompt = validate_work_dir(segwork)
-        prompt = _prefix_no_bgm(prompt, segwork / "prompt.txt")
+        prompt = _apply_prefix(prompt, segwork / "prompt.txt", include_no_bgm=True)
         return {
             "index": index,
             "start_s": seg["start_s"],
@@ -439,7 +446,7 @@ def run(settings: Settings, cid: str, runner) -> None:
             translate_lang = (meta.get("target_language") or "").strip()
         segments = _detect_segments(settings, cid, source, work)
         if not segments:
-            # 单段模式：现有流程原样（work/keyframes + work/prompt.txt，不加前缀）；
+            # 单段模式：work/keyframes + work/prompt.txt，条件动作行机械加在 prompt 开头（无 BGM 行）；
             # 裁剪工具以 scripts/crop_image.py 相对工作目录引用，scripts/ 拷进会话目录
             shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
             try:
@@ -451,6 +458,7 @@ def run(settings: Settings, cid: str, runner) -> None:
                 except PipelineError:
                     raise e from None
             keyframes, prompt = validate_work_dir(work)
+            prompt = _apply_prefix(prompt, work / "prompt.txt", include_no_bgm=False)
             storage.update_meta(
                 settings.data_dir, cid, status="done", keyframes=keyframes, prompt=prompt
             )

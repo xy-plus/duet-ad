@@ -21,6 +21,7 @@ const state = {
   detailSeq: 0,        // 防止过期响应覆盖新渲染
   objectURLs: [],      // 当前 stream 渲染产生的 blob URL，重渲染前统一 revoke
   ppDetail: null,      // 后处理弹窗对应的会话详情
+  ppAskDismissed: {},  // cid → true：后处理入口消息已点「否」（会话内记忆，重渲染不复活）
 };
 
 class AuthError extends Error {}
@@ -441,30 +442,31 @@ function renderResults(detail) {
     }
   }
 
-  // 最终视频：已提交生成则播放成片，否则显示「待提交生成」（提交接口预留未开放）
-  if (detail.has_video) {
-    frag.appendChild(videoSection(detail, "generated.mp4", "最终视频", "Seedance 生成成片"));
-  } else {
-    const sec = el("section", "res-section");
-    const card = el("div", "final-card");
-    card.appendChild(el("h3", "res-h3", "最终视频"));
-    const row = el("div", "final-row");
-    const btnWrap = el("span", "submit-wrap");
-    const btn = el("button", "btn btn-primary", "生成最终视频");
-    btn.type = "button";
-    btn.disabled = true;
-    btn.setAttribute("aria-describedby", "final-caption");
-    btnWrap.appendChild(btn);
-    row.appendChild(btnWrap);
-    const cap = el("p", "final-caption", "待提交生成（接口预留，当前阶段未开放）");
-    cap.id = "final-caption";
-    row.appendChild(cap);
-    card.appendChild(row);
-    sec.appendChild(card);
-    frag.appendChild(sec);
-  }
-
   return frag;
+}
+
+/* 最终视频区（结果区最后一段）：已提交生成则播放成片，否则显示「待提交生成」（提交接口预留未开放） */
+function renderFinalSection(detail) {
+  if (detail.has_video) {
+    return videoSection(detail, "generated.mp4", "最终视频", "Seedance 生成成片");
+  }
+  const sec = el("section", "res-section");
+  const card = el("div", "final-card");
+  card.appendChild(el("h3", "res-h3", "最终视频"));
+  const row = el("div", "final-row");
+  const btnWrap = el("span", "submit-wrap");
+  const btn = el("button", "btn btn-primary", "生成最终视频");
+  btn.type = "button";
+  btn.disabled = true;
+  btn.setAttribute("aria-describedby", "final-caption");
+  btnWrap.appendChild(btn);
+  row.appendChild(btnWrap);
+  const cap = el("p", "final-caption", "待提交生成（接口预留，当前阶段未开放）");
+  cap.id = "final-caption";
+  row.appendChild(cap);
+  card.appendChild(row);
+  sec.appendChild(card);
+  return sec;
 }
 
 /* 关键帧网格：blob 化加载 + 点击放大灯箱（单段/多段/优化后共用；pathPrefix 即 files 白名单路径） */
@@ -518,39 +520,13 @@ function promptCard(text) {
   return card;
 }
 
-/* 后处理按钮：postprocess_enabled（submit_enabled 同款开关）关则禁用；
-   running 时转「处理中…」禁用 */
-function postprocessBtn(detail) {
-  const wrap = el("span", "pp-wrap");
-  const btn = el("button", "btn btn-primary pp-btn", "后处理");
-  btn.type = "button";
-  const pp = detail.postprocess || {};
-  if (!detail.postprocess_enabled) {
-    btn.disabled = true;
-  } else if (pp.status === "running") {
-    btn.disabled = true;
-    btn.textContent = "处理中…";
-  }
-  btn.addEventListener("click", () => openPostprocessModal(detail));
-  wrap.appendChild(btn);
-  if (!detail.postprocess_enabled) {
-    wrap.appendChild(el("span", "pp-caption", "待开放（接口预留）"));
-  } else if (pp.status === "running") {
-    wrap.appendChild(el("span", "pp-caption", "正在逐帧优化，请稍候…"));
-  }
-  return wrap;
-}
-
-/* 单段模式：关键帧区（标题旁后处理按钮）；「优化后」与失败提示统一走聊天消息（renderPpChat） */
+/* 单段模式：关键帧区；「优化后」与失败提示统一走聊天消息（renderPpChat） */
 function keyframesSection(detail) {
   const sec = el("section", "res-section");
   const names = Array.isArray(detail.keyframes) ? detail.keyframes : [];
   const h = el("h3", "res-h3", "关键帧");
   h.appendChild(el("span", "res-count", names.length + " 张"));
-  const head = el("div", "res-head");
-  head.appendChild(h);
-  head.appendChild(postprocessBtn(detail));
-  sec.appendChild(head);
+  sec.appendChild(h);
   sec.appendChild(kfGrid(detail, names, "keyframes", "关键帧 "));
   return sec;
 }
@@ -561,10 +537,7 @@ function renderSegments(detail) {
   const headSec = el("section", "res-section");
   const h = el("h3", "res-h3", "分段产物");
   h.appendChild(el("span", "res-count", detail.segments.length + " 段"));
-  const head = el("div", "res-head");
-  head.appendChild(h);
-  head.appendChild(postprocessBtn(detail));
-  headSec.appendChild(head);
+  headSec.appendChild(h);
   frag.appendChild(headSec);
 
   for (const seg of detail.segments) {
@@ -797,10 +770,42 @@ function renderPpAssistant(detail, pp) {
       card.appendChild(ppFramesSection(detail, frames));
     } else {
       card.appendChild(el("p", "ac-title", "后处理完成"));
-      card.appendChild(el("p", "ac-sub", "无适用帧（如勾选「含人脸遮挡」但未检出人脸）"));
+      card.appendChild(el("p", "ac-sub", "所有目标帧均已处理"));
     }
     row.appendChild(card);
   }
+  return row;
+}
+
+/* 后处理入口消息：postprocess 未做（或 failed 可重试）且接口开放时，结果区末尾提问。
+   点「是」打开弹窗（消息流照旧）；点「否」原位标记已结束，不再弹窗（会话内记忆）。
+   running/done 时不显示——renderPpChat 的进行中卡/结果卡接管。 */
+function renderPpAsk(detail) {
+  const pp = detail.postprocess || {};
+  if (!detail.postprocess_enabled) return null;
+  if (pp.status === "running" || pp.status === "done") return null;
+  const row = el("div", "msg-row");
+  row.appendChild(assistantHead(detail.updated_at));
+  const card = el("div", "activity-card pp-ask-card");
+  card.appendChild(el("p", "pp-ask-text", "是否优化素材？"));
+  if (state.ppAskDismissed[detail.id]) {
+    card.appendChild(el("p", "pp-ask-ended", "已跳过优化，素材保持原样"));
+  } else {
+    const actions = el("div", "pp-ask-actions");
+    const yes = el("button", "btn btn-primary pp-ask-btn", "是");
+    yes.type = "button";
+    yes.addEventListener("click", () => openPostprocessModal(detail));
+    const no = el("button", "btn btn-ghost pp-ask-btn", "否");
+    no.type = "button";
+    no.addEventListener("click", () => {
+      state.ppAskDismissed[detail.id] = true;
+      actions.replaceWith(el("p", "pp-ask-ended", "已跳过优化，素材保持原样"));
+    });
+    actions.appendChild(yes);
+    actions.appendChild(no);
+    card.appendChild(actions);
+  }
+  row.appendChild(card);
   return row;
 }
 
@@ -824,9 +829,12 @@ function renderDetail(detail) {
     inner.appendChild(renderFail(detail));
   } else if (detail.status === "done") {
     inner.appendChild(renderResults(detail));
+    const ppAsk = renderPpAsk(detail);
+    if (ppAsk) inner.appendChild(ppAsk);
+    const ppChat = renderPpChat(detail);
+    if (ppChat) inner.appendChild(ppChat);
+    inner.appendChild(renderFinalSection(detail));
   }
-  const ppChat = renderPpChat(detail);
-  if (ppChat) inner.appendChild(ppChat);
   $("stream").appendChild(inner);
 }
 
