@@ -737,6 +737,15 @@ input { font-family: inherit; }
   border-top: 1px solid var(--divider);
 }
 
+.pp-lock-hint {
+  margin: 12px 0 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(0, 113, 227, .08);
+  color: var(--accent);
+  font-size: 13px;
+}
+
 .res-sub {
   margin: 0 0 10px;
   font-size: 14px;

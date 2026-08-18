@@ -662,9 +662,11 @@ function updatePpConfirm() {
 
 function openPostprocessModal(detail) {
   state.ppDetail = detail;
+  const last = detail.postprocess && detail.postprocess.options;
   document.querySelectorAll('#pp-form input[name="opt"]').forEach((c) => {
-    c.checked = true; // 默认全选，用户可取消勾选
+    c.checked = last ? last[c.value] === true : true; // 已运行过 → 预填上次选项（后端锁定）；首次 → 默认全选
   });
+  $("pp-lock-hint").hidden = !last;
   $("pp-error").hidden = true;
   updatePpConfirm();
   $("pp-dialog").showModal();
@@ -694,26 +696,42 @@ async function submitPostprocess(event) {
     loadDetail(detail.id, true);
   } catch (err) {
     if (handleAuthError(err)) return;
-    errEl.textContent = err.message;
+    if (err.message.includes("options changed since last run")) {
+      // 后端锁定上次选项：回填并提示直接确认，避免反复踩 409
+      const last = detail.postprocess && detail.postprocess.options;
+      document.querySelectorAll('#pp-form input[name="opt"]').forEach((c) => {
+        c.checked = last ? last[c.value] === true : true;
+      });
+      $("pp-lock-hint").hidden = false;
+      errEl.textContent = "选项与上次不一致，已按上次选项预填，请直接确认";
+    } else {
+      errEl.textContent = err.message;
+    }
     errEl.hidden = false;
     updatePpConfirm();
   }
 }
 
 /* ===== 后处理聊天消息 ===== */
-/* 选项标签（与弹窗勾选项一一对应） */
-const PP_OPTION_LABELS = {
-  change_bg: "换背景",
-  face_hold: "含人脸遮挡",
-  remove_subtitle: "去字幕水印",
-  remove_brand: "去版权物品",
-};
+/* 选项标签单一来源：弹窗勾选项 DOM（index.html），避免与 HTML 重复硬编码 */
+let ppOptionLabelsCache = null;
+
+function ppOptionLabels() {
+  if (!ppOptionLabelsCache) {
+    ppOptionLabelsCache = {};
+    document.querySelectorAll('#pp-form input[name="opt"]').forEach((c) => {
+      ppOptionLabelsCache[c.value] = c.nextElementSibling ? c.nextElementSibling.textContent : c.value;
+    });
+  }
+  return ppOptionLabelsCache;
+}
 
 function ppCheckedLabels(options) {
   const opts = options || {};
-  return Object.keys(PP_OPTION_LABELS)
+  const labels = ppOptionLabels();
+  return Object.keys(labels)
     .filter((k) => opts[k] === true)
-    .map((k) => PP_OPTION_LABELS[k]);
+    .map((k) => labels[k]);
 }
 
 /* 用户消息：后处理请求摘要（勾选项 chips） */
@@ -728,25 +746,22 @@ function renderPpUserBubble(pp) {
   return row;
 }
 
-/* 「优化后」结果区（done）：单段一张 grid；多段逐段分组（frames 全形路径带 segments/N/work/） */
+/* 「优化后」结果区（done）：多段逐段分组；单段按一个虚拟段统一处理 */
 function ppFramesSection(detail, frames) {
   const wrap = el("div");
-  const segments = Array.isArray(detail.segments) ? detail.segments : [];
-  if (segments.length > 0) {
-    for (const seg of segments) {
-      const n = seg.index;
-      const prefix = "segments/" + n + "/work/postprocessed/";
-      const own = frames.filter((f) => f.startsWith(prefix)).map((f) => f.slice(prefix.length));
-      if (!own.length) continue;
-      const block = el("div", "pp-seg");
-      block.appendChild(el("h4", "res-sub", "第 " + n + " 段优化后"));
-      block.appendChild(kfGrid(detail, own, "segments/" + n + "/work/postprocessed", "第 " + n + " 段优化后 "));
-      wrap.appendChild(block);
-    }
-  } else {
+  const segs = (Array.isArray(detail.segments) && detail.segments.length > 0)
+    ? detail.segments
+    : [{ index: null }]; // 单段：帧名为裸文件名，路径前缀为空
+  for (const seg of segs) {
+    const n = seg.index;
+    const prefix = n == null ? "" : "segments/" + n + "/work/postprocessed/";
+    const own = frames.filter((f) => f.startsWith(prefix)).map((f) => f.slice(prefix.length));
+    if (!own.length) continue;
+    const title = n == null ? "优化后" : "第 " + n + " 段优化后";
+    const pathPrefix = n == null ? "postprocessed" : "segments/" + n + "/work/postprocessed";
     const block = el("div", "pp-seg");
-    block.appendChild(el("h4", "res-sub", "优化后"));
-    block.appendChild(kfGrid(detail, frames, "postprocessed", "优化后 "));
+    block.appendChild(el("h4", "res-sub", title));
+    block.appendChild(kfGrid(detail, own, pathPrefix, title + " "));
     wrap.appendChild(block);
   }
   return wrap;
@@ -777,7 +792,7 @@ function renderPpAssistant(detail, pp) {
     row.appendChild(card);
   } else if (pp.status === "done") {
     const frames = Array.isArray(pp.frames) ? pp.frames : [];
-    const card = el("div", "activity-card pp-done-card");
+    const card = el("div", "activity-card");
     if (frames.length) {
       card.appendChild(ppFramesSection(detail, frames));
     } else {
@@ -1065,7 +1080,10 @@ async function handleSend(event) {
   } catch (err) {
     setUploading(false);
     if (handleAuthError(err)) return;
-    setComposerError(err.message);
+    // 422 no audio track in video → 换成可读引导（本产品仅处理带口播视频）
+    setComposerError(err.message.includes("no audio track in video")
+      ? "该视频没有音轨，本产品仅支持带口播的视频"
+      : err.message);
   }
 }
 
