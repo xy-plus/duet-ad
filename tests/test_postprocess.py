@@ -44,10 +44,10 @@ def _make_conv(settings, status="done", segments=False):
         meta["segments"] = segs
         for seg in segs:
             segdir = cdir / "work" / "segments" / str(seg["index"])
-            (segdir / "keyframes").mkdir(parents=True)
+            (segdir / "work" / "keyframes").mkdir(parents=True)
             for name in seg["keyframes"]:
-                (segdir / "keyframes" / name).write_bytes(PNG)
-            (segdir / "prompt.txt").write_text(seg["prompt"], encoding="utf-8")
+                (segdir / "work" / "keyframes" / name).write_bytes(PNG)
+            (segdir / "work" / "prompt.txt").write_text(seg["prompt"], encoding="utf-8")
     else:
         (cdir / "work" / "keyframes").mkdir(parents=True)
         for i in (1, 2):
@@ -232,18 +232,18 @@ def test_multi_segment_full_chain(enabled, monkeypatch):
     assert r.status_code == 200
 
     assert [call["image"] for call in fake.calls] == ["01.png", "01.png", "02.png"]
-    assert (cdir / "work" / "segments" / "1" / "postprocessed" / "01.png").is_file()
-    assert (cdir / "work" / "segments" / "2" / "postprocessed" / "01.png").is_file()
-    assert (cdir / "work" / "segments" / "2" / "postprocessed" / "02.png").is_file()
+    assert (cdir / "work" / "segments" / "1" / "work" / "postprocessed" / "01.png").is_file()
+    assert (cdir / "work" / "segments" / "2" / "work" / "postprocessed" / "01.png").is_file()
+    assert (cdir / "work" / "segments" / "2" / "work" / "postprocessed" / "02.png").is_file()
     assert not (cdir / "work" / "postprocessed").exists()
 
     pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
     assert pp["status"] == "done"
-    # frames 为全形路径（与 files 白名单同形），前端按 segments/N/postprocessed/ 前缀过滤展示
+    # frames 为全形路径（与 files 白名单同形），前端按 segments/N/work/postprocessed/ 前缀过滤展示
     assert pp["frames"] == [
-        "segments/1/postprocessed/01.png",
-        "segments/2/postprocessed/01.png",
-        "segments/2/postprocessed/02.png",
+        "segments/1/work/postprocessed/01.png",
+        "segments/2/work/postprocessed/01.png",
+        "segments/2/work/postprocessed/02.png",
     ]
 
 
@@ -298,19 +298,19 @@ def test_face_hold_appends_per_segment(enabled, monkeypatch):
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
     # 只有段 2 的 02.png 有人脸
     monkeypatch.setattr(postprocess, "_detect_face",
-                        lambda image, cascade=None: str(image).endswith("segments/2/keyframes/02.png"))
+                        lambda image, cascade=None: str(image).endswith("segments/2/work/keyframes/02.png"))
 
     r = _post(c, cid, FACE_ONLY)
     assert r.status_code == 200
 
-    seg1_p = (cdir / "work" / "segments" / "1" / "prompt.txt").read_text(encoding="utf-8")
-    seg2_p = (cdir / "work" / "segments" / "2" / "prompt.txt").read_text(encoding="utf-8")
+    seg1_p = (cdir / "work" / "segments" / "1" / "work" / "prompt.txt").read_text(encoding="utf-8")
+    seg2_p = (cdir / "work" / "segments" / "2" / "work" / "prompt.txt").read_text(encoding="utf-8")
     assert seg1_p == "段一提示词"  # 段 1 无人脸：不动
     assert seg2_p == "段二提示词\n" + postprocess.FACE_LINE
     meta = storage.load_meta(settings.data_dir, cid)
     assert meta["segments"][0]["prompt"] == seg1_p
     assert meta["segments"][1]["prompt"] == seg2_p
-    assert meta["postprocess"]["frames"] == ["segments/2/postprocessed/02.png"]
+    assert meta["postprocess"]["frames"] == ["segments/2/work/postprocessed/02.png"]
 
 
 def test_no_face_hold_never_detects(enabled, monkeypatch):
@@ -401,12 +401,12 @@ def test_files_endpoint_serves_postprocessed(enabled):
 
     r = c.get(f"/api/conversations/{cid}/files/postprocessed/01.png", headers=AUTH)
     assert r.status_code == 200 and r.content == b"opt"
-    r = c.get(f"/api/conversations/{cid}/files/segments/2/keyframes/01.png", headers=AUTH)
+    r = c.get(f"/api/conversations/{cid}/files/segments/2/work/keyframes/01.png", headers=AUTH)
     assert r.status_code == 200 and r.content == PNG
-    r = c.get(f"/api/conversations/{cid}/files/segments/2/postprocessed/01.png", headers=AUTH)
+    r = c.get(f"/api/conversations/{cid}/files/segments/2/work/postprocessed/01.png", headers=AUTH)
     assert r.status_code == 404  # 磁盘上不存在
     # 穿越一律 404：%2F 编码斜杠会绕过 HTTP 客户端的路径归一化，直击服务端白名单
-    for name in ("segments/2/postprocessed/..%2Fkeyframes/01.png",
+    for name in ("segments/2/work/postprocessed/..%2Fkeyframes/01.png",
                  "postprocessed/..%2Fmeta.json"):
         r = c.get(f"/api/conversations/{cid}/files/{name}", headers=AUTH)
         assert r.status_code == 404, name

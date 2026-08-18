@@ -9,10 +9,11 @@ codex 听写台词（voice_lines.json 白名单校验，落 meta.voice_lines）�
   N 从 1 起），每段独立走抽帧 → codex 分段 prompt → 校验 → 后端机械操作在 prompt 开头加
   「不要生成背景音乐」行；段间 ThreadPoolExecutor 并发（每段目录独立，CodexRunner 自带
   信号量兜底）；meta.voice_lines 按 start_s 归段（[start_s, end_s) 口径，恰在边界归后段），
-  每段写 work/segments/N/voice_lines.json；任一段失败 → 整体 failed（error 指明段号）；
+  每段写 work/segments/N/work/voice_lines.json；任一段失败 → 整体 failed（error 指明段号）；
   meta.segments 落各段产物，顶层 keyframes/prompt 保持空值。段 codex 的 cwd 即段目录
-  （物理隔离，看不到段外内容）；scripts/ 逐段拷入段目录，scenes.json 不拷入（段 codex
-  不需要知道全片）。
+  （物理隔离，看不到段外内容）；段目录内嵌套 work/（帧/台词/产物落段 work/，SKILL.md
+  的 work/ 路径逐字适用，段 prompt 与单段逐字相同）；scripts/ 逐段拷入段目录，
+  scenes.json 不拷入（段 codex 不需要知道全片）。
 scenes 检测失败或 scenes.json 非法（含拆段不变量违规）→ 回退单段模式（meta.scenes_note
 留痕），不做拆段；越界台词不归段并计数落 meta.voice_lines_dropped（内部字段）；翻译模式
 的目标语言由后端写进 prompt（codex 不从台词反推）。
@@ -117,17 +118,6 @@ def _codex_prompt(cdir: Path, target_language: str = "") -> str:
     if target_language:
         parts.append(_language_note(target_language))
     parts.append(_hard_rules(cdir))
-    return "\n\n".join(parts) + "\n"
-
-
-def _segment_prompt(workdir: Path, target_language: str = "") -> str:
-    """段 codex prompt：与单段同构——cwd 即段目录（物理隔离），无需指明任何段外路径。"""
-    parts = [
-        f"按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。工作目录即本段输入目录：其中含本段帧与联系表、本段台词 voice_lines.json（如存在）。产物（keyframes/ 与 prompt.txt）必须按文档写入当前工作目录。"
-    ]
-    if target_language:
-        parts.append(_language_note(target_language))
-    parts.append(_hard_rules(workdir))
     return "\n\n".join(parts) + "\n"
 
 
@@ -350,37 +340,40 @@ def _process_segment(work: Path, source: Path, seg: dict, runner,
                      lines: list[dict] | None, target_language: str = "") -> dict:
     """单段完整流程：切段 → 抽帧 → 写该段台词 → codex（cwd=段目录）→ 校验 → 后端加前缀。
 
-    codex 的 cwd 即段目录（物理隔离，看不到段外内容）；scripts/ 拷入段目录（裁剪工具
-    按相对路径引用），scenes.json 不拷入。任一失败包装为 PipelineError 并指明段号；
-    返回 meta.segments 条目。
+    段目录内嵌套 work/：帧/台词/产物都在 segdir/work/，SKILL.md 的 work/ 路径逐字适用，
+    段 prompt 与单段逐字相同（_codex_prompt）；codex 的 cwd 即段目录（物理隔离，看不到
+    段外内容）；scripts/ 拷入段目录（裁剪工具按相对路径引用），scenes.json 不拷入。
+    任一失败包装为 PipelineError 并指明段号；返回 meta.segments 条目。
     """
     index = seg["index"]
     segdir = work / "segments" / str(index)
+    segwork = segdir / "work"
     try:
         _cut_segment(source, seg["start_s"], seg["end_s"], segdir)
+        segwork.mkdir(parents=True, exist_ok=True)
         _run_cmd(
             [sys.executable, str(EXTRACT_SCRIPT), str(segdir / "source.mp4"),
-             "--out-dir", str(segdir), "--fps", "4"],
+             "--out-dir", str(segwork), "--fps", "4"],
             timeout=120,
             step=f"segment {index} extract",
         )
         # 该段台词（白名单净化后；lines 为 None = 无口播，不写文件）
         if lines is not None:
-            (segdir / "voice_lines.json").write_text(
+            (segwork / "voice_lines.json").write_text(
                 json.dumps(lines, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         # 裁剪工具按 scripts/crop_image.py 相对 cwd 引用：scripts/ 拷入段目录
         shutil.copytree(SCRIPTS_DIR, segdir / "scripts")
         try:
-            runner.run(segdir, _segment_prompt(segdir, target_language))
+            runner.run(segdir, _codex_prompt(segdir, target_language))
         except CodexError as e:
             # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
             try:
-                validate_work_dir(segdir)
+                validate_work_dir(segwork)
             except PipelineError:
                 raise e from None
-        keyframes, prompt = validate_work_dir(segdir)
-        prompt = _prefix_no_bgm(prompt, segdir / "prompt.txt")
+        keyframes, prompt = validate_work_dir(segwork)
+        prompt = _prefix_no_bgm(prompt, segwork / "prompt.txt")
         return {
             "index": index,
             "start_s": seg["start_s"],

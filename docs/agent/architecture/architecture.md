@@ -50,7 +50,7 @@ flowchart LR
   SEG -->|--fps 4 段内抽帧| EX
   PL -->|拷贝 skill scripts/| FS
   PL -->|沙箱 prompt（单段或多段）| CX[codex exec 沙箱<br/>app/codex_runner.py]
-  CX -->|keyframes/prompt.txt（段目录或 work/）| FS
+  CX -->|work/keyframes/ + work/prompt.txt| FS
   PL -->|白名单校验| FS
   PL -->|status/keyframes/prompt/segments/voice_lines| META[meta.json]
   U -->|2s 轮询 GET detail| API
@@ -60,7 +60,7 @@ flowchart LR
   U -.->|postprocess 确认| PP[app/postprocess.py<br/>门控+后台逐帧编辑]
   PP -.->|逐帧 seedream.edit_image<br/>confirm=True| SR[app/seedream.py]
   SR -.->|app/seedream_task.py --confirm-submit| ARK
-  PP -->|work/(segments/N/)postprocessed/ + meta.postprocess| FS
+  PP -->|work/postprocessed/ 或 segments/N/work/postprocessed/ + meta.postprocess| FS
 ```
 
 ## 状态机
@@ -83,8 +83,8 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 ├── meta.json                   会话元数据（见 reference 关键数据形）
 ├── source.<mp4|mov|webm>       原始上传（流式落盘）
 ├── generated.mp4               真实提交成功后下载的成片（仅 submit 开启后）
-├── codex_last_message.txt      codex -o 落盘的最终消息（单段模式；多段模式落各段目录，随 -C 段目录各自独立）
-├── scripts/                    pipeline 拷入的 skill 脚本（单段模式；多段模式拷入各段目录；crop_image.py 按相对路径引用）
+├── codex_last_message.txt      codex -o 落盘的最终消息（单段模式）
+├── scripts/                    pipeline 拷入的 skill 脚本（单段模式；crop_image.py 按相对路径引用）
 └── work/
     ├── NN_frame_*.png          按每秒 4 帧抽取的全部帧（pipeline 预生成）
     ├── contact_sheet(_NN).jpg  分页联系表（>24 帧时 contact_sheet_01.jpg… 分页）
@@ -98,14 +98,16 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
     ├── segments/               多段模式：每段一目录（N 从 1 起，与 segments index 对应）
     │   └── N/
     │       ├── source.mp4      按段边界切出的源视频（ffmpeg -ss 重编码，时长误差 <0.1s）
-    │       ├── NN_frame_*.png  该段 4fps 抽帧
-    │       ├── contact_sheet(_NN).jpg / manifest.json   该段分页联系表 / 段元数据
-    │       ├── voice_lines.json  该段台词（按 start_s 归段；口播模式下每段都有，空数组 = 无台词）
-    │       ├── postprocessed/  T5b 后处理优化图（该段 keyframes/ 同名对应；多段模式）
     │       ├── scripts/       pipeline 拷入的 skill 脚本（每段一份；crop_image.py 按相对路径引用）
     │       ├── codex_last_message.txt   codex -o 落盘的最终消息（每段独立）
-    │       └── keyframes/、prompt.txt   该段产物（prompt 首行为后端加的「不要生成背景音乐」）
-    │   （scenes.json 不拷入段目录，全片一份在 work/——段 codex 的 cwd 即段目录，物理隔离）
+    │       └── work/          段 codex 的完整 SKILL.md 工作目录
+    │           ├── NN_frame_*.png  该段 4fps 抽帧
+    │           ├── contact_sheet(_NN).jpg / manifest.json   该段分页联系表 / 段元数据
+    │           ├── voice_lines.json  该段台词（按 start_s 归段；口播模式下每段都有，空数组 = 无台词）
+    │           ├── keyframes/  该段选定关键帧（1..9 张）
+    │           ├── prompt.txt  该段提示词（首行为后端加的「不要生成背景音乐」）
+    │           └── postprocessed/  T5b 后处理优化图（与该段 keyframes/ 同名对应）
+    │   （scenes.json 不拷入段目录，全片一份在 work/；段 source.mp4/scripts 留在段根；段 codex 的 cwd 即段目录，物理隔离）
     ├── recheck_payload.json    提交预检的瞬时产物（用完即删）
     └── task.json               提交后脚本自写的任务状态（task_id 来源）
 ```
@@ -117,7 +119,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 1. **传输入口**：`/api/conversations*` 全部要 `Authorization: Bearer`，`hmac.compare_digest` 比较；`/api/login` 同样比较后只回 `{"ok":true}`（口令由前端存 localStorage）。上传限流 10 次/分/IP（内存滑动窗口）；queued 会话超 `MAX_QUEUED` 拒新建（429）；`client_request_id` 幂等键防重复提交（查重+计数+建目录同一把锁）。
 2. **上传校验链**：扩展名白名单 → 流式落盘限大小（超限即删）→ ffprobe 实探（打不开/时长超限即 422）→ 失败整体回滚目录。详见 reference。
 3. **不信任 agent 输出**：codex 产物经 `validate_work_dir` 白名单校验才采信（关键帧 1..9 张、prompt 非空且 ≤32KB）；meta 提交标记不回 API。
-4. **files 白名单**：`resolve_file` 只映射 `source.mp4`（唯一 `source.*`）/`preview.mp4`（遗留，新契约不再生成）/`generated.mp4`/`contact_sheet.jpg`/`keyframes/<fn>`/`postprocessed/<fn>`/`segments/<N>/(keyframes|postprocessed)/<fn>`（N 正整数、fn 纯文件名），resolved-path 防穿越。
+4. **files 白名单**：`resolve_file` 只映射 `source.mp4`（唯一 `source.*`）/`preview.mp4`（遗留，新契约不再生成）/`generated.mp4`/`contact_sheet.jpg`/`keyframes/<fn>`/`postprocessed/<fn>`/`segments/<N>/work/(keyframes|postprocessed)/<fn>`（N 正整数、fn 纯文件名），resolved-path 防穿越。
 5. **codex 沙箱**：argv 逐项见下表；永不 `shell=True`，永不 `--dangerously-bypass-*`；硬超时 `CODEX_TIMEOUT_S`；并发信号量 `CODEX_CONCURRENCY`。
 6. **密钥红线**：`ACCESS_TOKEN`/`ARK_API_KEY` 只存在于服务进程环境；不进日志/响应/meta.json；seedance/seedream/postprocess 报错一律 `app.sanitize.sanitize` 脱敏（删含 key|authorization 行 + 抹除密钥字面值，截 300 字）；pipeline/codex 报错先 `clean_stderr`（剔环境变量行，截 500 字）。
 7. **URL 下载 SSRF 防护**：`reference_url` 下载在后端进程内做（`app/downloader.py`），URL 不进 codex 沙箱（沙箱依旧断网，只有落盘视频进工作目录）：scheme 仅 http(s)、解析所得 IP 拒绝私网/回环/link-local/reserved、DNS pinning（解析一次固定 IP 直连，每次跳转独立重校验）、Content-Length 预检 + 流式写盘限 `MAX_UPLOAD_MB` + 整体超时 `DOWNLOAD_TIMEOUT_S`；连接/读取异常归一为 `DownloadError` → 422 + 回滚目录。
@@ -127,7 +129,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 | argv 项 | 作用 |
 | --- | --- |
 | `codex exec` | 非交互执行，prompt 作位置参数 |
-| `-C <workdir>` | 工作区限定在 codex 工作目录（单段=会话目录；多段=段目录，物理隔离） |
+| `-C <workdir>` | 工作区限定在 codex 工作目录（单段=会话目录；多段=段目录，物理隔离；段目录内嵌套 work/） |
 | `-s workspace-write` | 沙箱可写工作区、其余只读 |
 | `--skip-git-repo-check` | data/ 非 git 仓库，跳过检查 |
 | `--ephemeral` | 不持久化会话 |

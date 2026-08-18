@@ -84,31 +84,33 @@ def test_resolve_file_postprocessed_and_segments(tmp_path):
     cdir = tmp_path / cid
     (cdir / "work" / "postprocessed").mkdir(parents=True)
     (cdir / "work" / "postprocessed" / "01.png").write_bytes(b"p")
-    (cdir / "work" / "segments" / "2" / "keyframes").mkdir(parents=True)
-    (cdir / "work" / "segments" / "2" / "keyframes" / "01.png").write_bytes(b"k")
-    (cdir / "work" / "segments" / "2" / "postprocessed").mkdir(parents=True)
-    (cdir / "work" / "segments" / "2" / "postprocessed" / "01.png").write_bytes(b"s")
+    (cdir / "work" / "segments" / "2" / "work" / "keyframes").mkdir(parents=True)
+    (cdir / "work" / "segments" / "2" / "work" / "keyframes" / "01.png").write_bytes(b"k")
+    (cdir / "work" / "segments" / "2" / "work" / "postprocessed").mkdir(parents=True)
+    (cdir / "work" / "segments" / "2" / "work" / "postprocessed" / "01.png").write_bytes(b"s")
 
     assert storage.resolve_file(tmp_path, cid, "postprocessed/01.png") == \
         (cdir / "work" / "postprocessed" / "01.png").resolve()
-    assert storage.resolve_file(tmp_path, cid, "segments/2/keyframes/01.png") == \
-        (cdir / "work" / "segments" / "2" / "keyframes" / "01.png").resolve()
-    assert storage.resolve_file(tmp_path, cid, "segments/2/postprocessed/01.png") == \
-        (cdir / "work" / "segments" / "2" / "postprocessed" / "01.png").resolve()
+    assert storage.resolve_file(tmp_path, cid, "segments/2/work/keyframes/01.png") == \
+        (cdir / "work" / "segments" / "2" / "work" / "keyframes" / "01.png").resolve()
+    assert storage.resolve_file(tmp_path, cid, "segments/2/work/postprocessed/01.png") == \
+        (cdir / "work" / "segments" / "2" / "work" / "postprocessed" / "01.png").resolve()
 
 
 def test_resolve_file_rejects_bad_segments_and_postprocessed(tmp_path):
     meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
     cid = meta["id"]
     # N 必须为正整数、fn 必须是纯文件名、目录必须是白名单两类；穿越/越界一律 None
-    for name in ("segments/0/keyframes/a.png", "segments/x/keyframes/a.png",
-                 "segments/1/meta.json", "segments/1/keyframes/",
-                 "segments/1/keyframes/../prompt.txt",
-                 "segments/1/postprocessed/../keyframes/a.png",
-                 "segments/1/keyframes/sub/a.png",
+    for name in ("segments/0/work/keyframes/a.png", "segments/x/work/keyframes/a.png",
+                 "segments/1/keyframes/a.png",  # 缺 work/ 层级
+                 "segments/1/meta.json", "segments/1/work/keyframes/",
+                 "segments/1/work/keyframes/../prompt.txt",
+                 "segments/1/work/postprocessed/../keyframes/a.png",
+                 "segments/1/work/keyframes/sub/a.png",
+                 "segments/1/work/../meta.json",
                  "postprocessed/", "postprocessed/../meta.json",
                  "postprocessed/sub/a.png"):
         assert storage.resolve_file(tmp_path, cid, name) is None, name
     # 合法格式但磁盘上不存在 → None
     assert storage.resolve_file(tmp_path, cid, "postprocessed/nope.png") is None
-    assert storage.resolve_file(tmp_path, cid, "segments/1/keyframes/nope.png") is None
+    assert storage.resolve_file(tmp_path, cid, "segments/1/work/keyframes/nope.png") is None
