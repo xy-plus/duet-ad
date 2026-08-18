@@ -78,7 +78,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 
 ### `POST /api/conversations/{cid}/postprocess`（T5b，默认 501）
 
-- 请求：JSON `{"options": {"change_bg": bool, "face_hold": bool, "remove_subtitle": bool, "remove_brand": bool}, "confirm": true}`；四选项至少一个为真，否则 422 `at least one option required`；选项值非 bool → 422 `options must be booleans`
+- 请求：JSON `{"options": {"face_hold": bool, "remove_subtitle": bool, "remove_brand": bool}, "confirm": true}`；三选项至少一个为真，否则 422 `at least one option required`；选项值非 bool → 422 `options must be booleans`；未知键忽略（旧客户端残留的 `change_bg` 静默丢弃）
 - 成功 200 → `{"status": "running", "frames": []}`（受理即返回；后台逐帧编辑，结果经 detail 的 `postprocess` 字段轮询，复用 2s 轮询；终态 `{status: "done"|"failed", options, frames, error}`）
 - 门控矩阵（`postprocess.start`，**固定顺序**）：
 
@@ -87,17 +87,17 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 | 1 | `enable_seedream_edit` 关 | 501 `Seedream edit is disabled.` |
 | 2 | 会话不存在 | 404 `not found` |
 | 3 | `confirm` 不为 `true` | 409 `confirmation required` |
-| 4 | `options` 非对象/四选项全假 | 422 `at least one option required`；选项值非 bool → 422 `options must be booleans` |
+| 4 | `options` 非对象/三选项全假 | 422 `at least one option required`；选项值非 bool → 422 `options must be booleans` |
 | 5 | `status != "done"` | 409 `artifacts not ready` |
 | 6 | `meta.postprocess.status` 已 `running` | 409 `already running` |
-| 7 | 上次 `done/failed` 的 `options` 与本次不同 | 409 `options changed since last run`（防旧产物贴新标签；同选项重跑照常跳过已有图） |
+| 7 | 上次 `done/failed` 的 `options` 与本次不同 | 409 `options changed since last run`（防旧产物贴新标签；同选项重跑照常跳过已有图；锁定比对只认当前三选项与上次 options 的共有键——旧会话四键 options 里的废弃 `change_bg` 键忽略；纯废弃形态（上次在当前键上无任何 True，如旧版只勾 `change_bg`）不 409，放行重跑并清除旧 postprocessed 产物强制全帧重编辑） |
 | 8 | 每会话锁内复查：meta 消失或已在 running | 409 `already running` |
 | 9 | 锁内复查：目标帧目录缺失/为空 | 409 `artifacts not ready` |
 | 10 | 后台逐帧执行中任一帧失败 | 受理后 meta 落 `postprocess.status=failed`，`error` 指明帧名（已成功帧保留） |
 
 - 后台任务（`postprocess.run_task`，BackgroundTasks，独立路径不吃管道闸；每会话一把锁，可跨会话并发）：
   - 收集目标帧：单段 = `work/keyframes/*.png`；多段 = `work/segments/N/work/keyframes/*.png`（N 来自 `meta.segments`）
-  - 每帧按勾选选项构造中文编辑指令（多选项用 `；` 连接）：换背景「将图片背景更换为简洁干净的背景，保持主体人物与物品不变」；含人脸遮挡「如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。」（条件式指令，由 Seedream 自己判断有无脸；多选项时条件句放最前）；去字幕水印「移除图片中的所有字幕、水印和贴纸元素，其余保持不变」；去版权物品「图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变」
+  - 每帧按勾选选项构造中文编辑指令（多选项用 `；` 连接）：含人脸遮挡「如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。」（条件式指令，由 Seedream 自己判断有无脸；多选项时条件句放最前）；去字幕水印「移除图片中的所有字幕、水印和贴纸元素，其余保持不变」；去版权物品「图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变」
   - 所有目标帧都发编辑请求（不做人脸预判/过滤）：无人脸帧由 Seedream 按条件指令输出近似原图，直接存 postprocessed 展示；将来可加输出-输入变化判定过滤（见 OPEN_ISSUE）
   - 逐帧调用 `seedream.edit_image(..., confirm=True)`（路由层已校验 confirm）；产出 `work/postprocessed/<帧名>.png`（单段）或 `work/segments/N/work/postprocessed/<帧名>.png`（多段）；已存在的输出跳过（重跑不重复扣费）
   - 任一帧失败 → 整体 failed（`error` 指明帧名，脱敏 ≤300 字）；已成功帧保留；`meta.postprocess.frames` 记有优化版的帧名列表（单段 = 帧名；多段 = `segments/N/work/postprocessed/帧名` 全形路径，与 files 白名单路径同形，前端按段前缀过滤展示）

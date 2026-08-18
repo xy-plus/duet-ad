@@ -14,13 +14,13 @@ from app.main import create_app
 
 PNG = b"\x89PNG\r\n\x1a\n"
 
-CHANGE_BG = "微调图片的背景和主体，让画面更好看，但是不要做大的改动。保持物品形状和用法完全不变。"
 FACE_HOLD = ("如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。"
              "如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。")
 REMOVE_SUBTITLE = "移除图片中的所有字幕、水印和贴纸元素，其余保持不变"
+REMOVE_BRAND = "图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变"
 
-OPTIONS_BG = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": False}
-FACE_ONLY = {"change_bg": False, "face_hold": True, "remove_subtitle": False, "remove_brand": False}
+OPTIONS_SUB = {"face_hold": False, "remove_subtitle": True, "remove_brand": False}
+FACE_ONLY = {"face_hold": True, "remove_subtitle": False, "remove_brand": False}
 
 
 @pytest.fixture
@@ -92,20 +92,20 @@ def test_requires_auth(client, video_1s):
                         files={"file": ("clip.mp4", f, "video/mp4")})
     cid = r.json()["id"]
     assert client.post(f"/api/conversations/{cid}/postprocess",
-                       json={"options": OPTIONS_BG, "confirm": True}).status_code == 401
+                       json={"options": OPTIONS_SUB, "confirm": True}).status_code == 401
 
 
 def test_disabled_501(client):
     # 开关最优先（默认关）：不看 confirm、不看会话是否存在、不看选项
     r = client.post(f"/api/conversations/{'0' * 32}/postprocess", headers=AUTH,
-                    json={"options": OPTIONS_BG, "confirm": True})
+                    json={"options": OPTIONS_SUB, "confirm": True})
     assert r.status_code == 501
     assert r.json() == {"detail": "Seedream edit is disabled."}
 
 
 def test_404_when_enabled(enabled):
     _, c = enabled
-    r = _post(c, "0" * 32, OPTIONS_BG)
+    r = _post(c, "0" * 32, OPTIONS_SUB)
     assert r.status_code == 404
     assert r.json() == {"detail": "not found"}
 
@@ -115,8 +115,8 @@ def test_confirm_required_409(enabled, monkeypatch):
     cid = _make_conv(settings)
     monkeypatch.setattr(postprocess.seedream, "edit_image",
                         lambda *a, **k: pytest.fail("edit must not be called"))
-    for body in ({}, {"options": OPTIONS_BG}, {"options": OPTIONS_BG, "confirm": False},
-                 {"options": OPTIONS_BG, "confirm": "true"}, {"options": OPTIONS_BG, "confirm": 1}):
+    for body in ({}, {"options": OPTIONS_SUB}, {"options": OPTIONS_SUB, "confirm": False},
+                 {"options": OPTIONS_SUB, "confirm": "true"}, {"options": OPTIONS_SUB, "confirm": 1}):
         r = c.post(f"/api/conversations/{cid}/postprocess", headers=AUTH, json=body)
         assert r.status_code == 409, body
         assert r.json() == {"detail": "confirmation required"}
@@ -125,7 +125,7 @@ def test_confirm_required_409(enabled, monkeypatch):
 def test_no_options_422(enabled):
     settings, c = enabled
     cid = _make_conv(settings)
-    empty = {"change_bg": False, "face_hold": False, "remove_subtitle": False, "remove_brand": False}
+    empty = {"face_hold": False, "remove_subtitle": False, "remove_brand": False}
     for body in ({"confirm": True},
                  {"options": {}, "confirm": True},
                  {"options": empty, "confirm": True}):
@@ -138,7 +138,7 @@ def test_options_non_bool_422(enabled):
     settings, c = enabled
     cid = _make_conv(settings)
     r = c.post(f"/api/conversations/{cid}/postprocess", headers=AUTH,
-               json={"options": {"change_bg": "yes"}, "confirm": True})
+               json={"options": {"remove_subtitle": "yes"}, "confirm": True})
     assert r.status_code == 422
     assert r.json() == {"detail": "options must be booleans"}
 
@@ -148,7 +148,7 @@ def test_not_done_409(enabled, monkeypatch):
     cid = _make_conv(settings, status="queued")
     monkeypatch.setattr(postprocess.seedream, "edit_image",
                         lambda *a, **k: pytest.fail("edit must not be called"))
-    r = _post(c, cid, OPTIONS_BG)
+    r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 409
     assert r.json() == {"detail": "artifacts not ready"}
 
@@ -157,11 +157,11 @@ def test_already_running_409(enabled, monkeypatch):
     settings, c = enabled
     cid = _make_conv(settings)
     storage.update_meta(settings.data_dir, cid, postprocess={
-        "status": "running", "options": OPTIONS_BG, "frames": [], "error": None,
+        "status": "running", "options": OPTIONS_SUB, "frames": [], "error": None,
     })
     monkeypatch.setattr(postprocess.seedream, "edit_image",
                         lambda *a, **k: pytest.fail("edit must not be called"))
-    r = _post(c, cid, OPTIONS_BG)
+    r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 409
     assert r.json() == {"detail": "already running"}
 
@@ -174,7 +174,7 @@ def test_artifacts_gone_409(enabled, monkeypatch):
         settings.data_dir / cid / "work" / "gone")
     monkeypatch.setattr(postprocess.seedream, "edit_image",
                         lambda *a, **k: pytest.fail("edit must not be called"))
-    r = _post(c, cid, OPTIONS_BG)
+    r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 409
     assert r.json() == {"detail": "artifacts not ready"}
     assert storage.load_meta(settings.data_dir, cid).get("postprocess") is None
@@ -189,15 +189,15 @@ def test_single_segment_full_chain(enabled, monkeypatch):
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
 
-    options = {"change_bg": True, "face_hold": False,
-               "remove_subtitle": True, "remove_brand": False}
+    options = {"face_hold": False,
+               "remove_subtitle": True, "remove_brand": True}
     r = _post(c, cid, options)
     assert r.status_code == 200
     assert r.json() == {"status": "running", "frames": []}  # 受理即返回，进度走 detail 轮询
 
     # 每帧一条合并指令（分号连接），confirm 恒 True
     assert [call["image"] for call in fake.calls] == ["01.png", "02.png"]
-    expected = f"{CHANGE_BG}；{REMOVE_SUBTITLE}"
+    expected = f"{REMOVE_SUBTITLE}；{REMOVE_BRAND}"
     for call in fake.calls:
         assert call["prompt"] == expected
         assert call["confirm"] is True
@@ -229,7 +229,7 @@ def test_multi_segment_full_chain(enabled, monkeypatch):
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
 
-    r = _post(c, cid, OPTIONS_BG)
+    r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 200
 
     assert [call["image"] for call in fake.calls] == ["01.png", "01.png", "02.png"]
@@ -281,11 +281,11 @@ def test_face_hold_merges_conditional_first(enabled, monkeypatch):
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
 
-    options = {"change_bg": True, "face_hold": True, "remove_subtitle": False, "remove_brand": False}
+    options = {"face_hold": True, "remove_subtitle": True, "remove_brand": False}
     r = _post(c, cid, options)
     assert r.status_code == 200
     assert len(fake.calls) == 2
-    assert all(call["prompt"] == f"{FACE_HOLD}；{CHANGE_BG}" for call in fake.calls)
+    assert all(call["prompt"] == f"{FACE_HOLD}；{REMOVE_SUBTITLE}" for call in fake.calls)
 
 
 def test_face_hold_all_frames_multi_segment(enabled, monkeypatch):
@@ -323,9 +323,9 @@ def test_no_face_hold_instruction_omits_face_hold(enabled, monkeypatch):
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
 
-    r = _post(c, cid, OPTIONS_BG)
+    r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 200
-    assert all(call["prompt"] == CHANGE_BG for call in fake.calls)
+    assert all(call["prompt"] == REMOVE_SUBTITLE for call in fake.calls)
 
 
 # ---------- 失败处理 ----------
@@ -336,7 +336,7 @@ def test_frame_failure_marks_failed_keeps_successes(enabled, monkeypatch):
     cdir = settings.data_dir / cid
     monkeypatch.setattr(postprocess.seedream, "edit_image", FakeEdit(fail=["02.png"]))
 
-    r = _post(c, cid, OPTIONS_BG)
+    r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 200  # 受理成功；结果走 detail
 
     pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
@@ -360,7 +360,7 @@ def test_rerun_skips_existing_outputs(enabled, monkeypatch):
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
 
-    r = _post(c, cid, OPTIONS_BG)
+    r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 200
 
     assert [call["image"] for call in fake.calls] == ["02.png"]  # 已有优化图的帧不重复扣费
@@ -379,8 +379,8 @@ def test_concurrent_start_single_runner(tmp_path, monkeypatch):
 
     async def run_both():
         return await asyncio.gather(
-            postprocess.start(settings, cid, {"options": OPTIONS_BG, "confirm": True}, locks),
-            postprocess.start(settings, cid, {"options": OPTIONS_BG, "confirm": True}, locks),
+            postprocess.start(settings, cid, {"options": OPTIONS_SUB, "confirm": True}, locks),
+            postprocess.start(settings, cid, {"options": OPTIONS_SUB, "confirm": True}, locks),
             return_exceptions=True,
         )
 
@@ -421,15 +421,111 @@ def test_rerun_different_options_409(enabled, monkeypatch):
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
 
-    assert _post(c, cid, OPTIONS_BG).status_code == 200
-    other = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": True}
+    assert _post(c, cid, OPTIONS_SUB).status_code == 200
+    other = {"face_hold": False, "remove_subtitle": True, "remove_brand": True}
     r = _post(c, cid, other)
     assert r.status_code == 409
     assert r.json() == {"detail": "options changed since last run"}
     assert len(fake.calls) == 2  # 未产生新编辑
 
     # 同选项重跑：跳过已有优化图，正常 200 done
-    r = _post(c, cid, OPTIONS_BG)
+    r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 200
     assert len(fake.calls) == 2  # 全部帧已存在，无新编辑
     assert storage.load_meta(settings.data_dir, cid)["postprocess"]["status"] == "done"
+
+
+def test_legacy_change_bg_in_meta_options_rerun_no_409(enabled, monkeypatch):
+    """旧会话 meta 存四键 options（含已废弃 change_bg），新请求三键且共有键一致 →
+    锁定比对只认当前 OPTION_KEYS 共有键，重跑不 409，正常覆盖为新三键 options。"""
+    settings, c = enabled
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+
+    # 历史会话：meta 里存的是四键 options（change_bg 时代产物）
+    legacy = {"change_bg": True, "face_hold": True, "remove_subtitle": False, "remove_brand": False}
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "done", "options": legacy, "frames": ["01.png", "02.png"], "error": None,
+    })
+    (cdir / "work" / "postprocessed").mkdir(parents=True)
+    for name in ("01.png", "02.png"):
+        (cdir / "work" / "postprocessed" / name).write_bytes(PNG + b"legacy")
+
+    # 新请求三键（face_hold 等共有键与旧一致；change_bg 忽略，不比）
+    r = _post(c, cid, FACE_ONLY)
+    assert r.status_code == 200
+    assert len(fake.calls) == 0  # 已有优化图，全部跳过
+
+    pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    assert pp["status"] == "done"
+    assert pp["options"] == FACE_ONLY  # 覆盖为三键契约
+
+    # 共有键真变了仍然 409：兼容比对不放松锁定
+    r = _post(c, cid, OPTIONS_SUB)
+    assert r.status_code == 409
+    assert r.json() == {"detail": "options changed since last run"}
+
+
+def test_legacy_pure_change_bg_rerun_clears_artifacts_and_reedits(enabled, monkeypatch):
+    """旧会话「只勾 change_bg」（当前三键全 False 的纯废弃形态）→ 放行重跑：
+    旧产物清除、全帧强制重编辑（防旧 change_bg 产物贴新三键标签）。"""
+    settings, c = enabled
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+
+    legacy = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": False}
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "failed", "options": legacy, "frames": ["01.png", "02.png"], "error": "x",
+    })
+    (cdir / "work" / "postprocessed").mkdir(parents=True)
+    for name in ("01.png", "02.png"):
+        (cdir / "work" / "postprocessed" / name).write_bytes(PNG + b"legacy")
+
+    r = _post(c, cid, OPTIONS_SUB)
+    assert r.status_code == 200
+    assert len(fake.calls) == 2  # 旧产物已清，两帧全部重新编辑
+    assert not (cdir / "work" / "postprocessed" / "01.png").exists() or \
+        (cdir / "work" / "postprocessed" / "01.png").read_bytes() == PNG + b"edited"
+
+
+def test_legacy_pure_change_bg_any_new_option_no_409(enabled, monkeypatch):
+    """纯废弃形态下任何合法新三键（≥1 True）都不 409——永久死锁回归。"""
+    settings, c = enabled
+    cid = _make_conv(settings)
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    legacy = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": False}
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "failed", "options": legacy, "frames": [], "error": "x",
+    })
+    r = _post(c, cid, FACE_ONLY)
+    assert r.status_code == 200
+
+
+def test_legacy_pure_change_bg_multi_segment_clears_artifacts(enabled, monkeypatch):
+    """多段会话纯废弃形态重跑 → 各段 postprocessed 旧产物同样清除。"""
+    settings, c = enabled
+    cid = _make_conv(settings, segments=True)
+    cdir = settings.data_dir / cid
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+
+    legacy = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": False}
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "failed", "options": legacy, "frames": ["segments/1/work/postprocessed/01.png"], "error": "x",
+    })
+    for n in (1, 2):
+        d = cdir / "work" / "segments" / str(n) / "work" / "postprocessed"
+        d.mkdir(parents=True)
+        (d / "01.png").write_bytes(PNG + b"legacy")
+
+    r = _post(c, cid, OPTIONS_SUB)
+    assert r.status_code == 200
+    for n in (1, 2):
+        d = cdir / "work" / "segments" / str(n) / "work" / "postprocessed"
+        assert not (d / "01.png").exists() or (d / "01.png").read_bytes() == PNG + b"edited"
+    assert len(fake.calls) == 3  # 段1两帧 + 段2一帧全量重编辑

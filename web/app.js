@@ -623,7 +623,7 @@ async function copyText(text) {
 
 /* ===== 后处理弹窗 ===== */
 function ppCheckedOptions() {
-  const options = { change_bg: false, face_hold: false, remove_subtitle: false, remove_brand: false };
+  const options = { face_hold: false, remove_subtitle: false, remove_brand: false };
   document.querySelectorAll('#pp-form input[name="opt"]:checked').forEach((c) => {
     options[c.value] = true;
   });
