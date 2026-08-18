@@ -26,9 +26,9 @@ links: [conversation-task]
 | `app/codex_runner.py` | 沙箱化 `codex exec` 调用（argv、断网、env 清洗、超时、并发信号量） | conversation-task |
 | `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
-| `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
+| `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：开关 + confirm 门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedream_task.py` | Ark Seedream 编辑任务脚本：JSON 图生图提交 `/api/v3/images/generations`、同步响应、b64_json 严格解码落盘 | conversation-task |
-| `app/postprocess.py` | T5b 后处理编排：HTTP 门控（换选项重跑 409）+ 后台并行逐帧 Seedream 编辑（收集目标帧/条件式 face_hold 指令（Seedream 自判有无脸，无人脸帧近似原图）/按帧像素等比算 `--size` 保持宽高比/平台级信号量限并发/失败保留）+ `meta.postprocess` 状态机 | conversation-task |
+| `app/postprocess.py` | T5b 后处理编排：HTTP 门控（换选项重跑 409）+ 后台并行逐帧 Seedream 编辑（收集目标帧/条件式 face_hold 指令（Seedream 自判有无脸，无人脸帧近似原图）/按帧像素等比算 `--size` 保持宽高比/进程级信号量限并发/失败保留/取消写 failed）+ `meta.postprocess` 状态机 | conversation-task |
 | `app/sanitize.py` | 公共脱敏函数（seedance/seedream/postprocess 共用）：删 key|authorization 行 + 抹密钥字面值 + 截断 | conversation-task |
 | `app/scenes.py` | PySceneDetect 场景检测：manifest 帧按场景分组写 scenes.json + 拆段边界建议（>20s 才计算，每段 4~15s 为算法级不变量，末尾防御断言）；流水线按 segments 拆段（空则单段模式） | conversation-task |
 | `web/` | 原生 JS 单页前端（登录/会话列表/上传/轮询/结果展示），无构建 | conversation-task |
@@ -163,7 +163,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 | `ENABLE_SEEDANCE_SUBMIT` | 关 | `1/true/yes` 开启真实提交（否则 501） |
 | `ENABLE_SEEDREAM_EDIT` | 关 | `1/true/yes` 开启 Seedream 图像编辑（否则 501） |
 | `SEEDREAM_MODEL` | `doubao-seedream-5-0-pro-260628` | Seedream 编辑模型（5.0 Pro，非 Lite） |
-| `SEEDREAM_CONCURRENCY` | `10` | Seedream 后处理逐帧并行提交的平台级并发上限（asyncio 信号量，跨会话全局） |
+| `SEEDREAM_CONCURRENCY` | `10` | Seedream 后处理逐帧并行提交的进程级并发上限（asyncio 信号量；单个 uvicorn 进程内跨会话共享，多 worker 部署时每进程独立限额；≤0 钳制为 1） |
 | `DATA_DIR` | `data` | 会话数据根目录 |
 | `CODEX_TIMEOUT_S` | `1800` | codex 硬超时 |
 | `CODEX_CONCURRENCY` | `10` | 管道闸（同时处理的会话数，含抽帧 + codex）；CodexRunner 内部信号量同值兜底 |

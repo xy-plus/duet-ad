@@ -50,7 +50,7 @@ def create_app(settings: Settings) -> FastAPI:
     create_lock = threading.Lock()
     submit_locks: dict[str, asyncio.Lock] = {}
     postprocess_locks: dict[str, asyncio.Lock] = {}
-    # Seedream 后处理并行提交的平台级信号量：跨会话全局并发上限（SEEDREAM_CONCURRENCY）
+    # Seedream 后处理并行提交的进程级信号量：单进程内跨会话全局并发上限（SEEDREAM_CONCURRENCY）
     seedream_sem = asyncio.Semaphore(settings.seedream_concurrency)
 
     def run_pipeline_gated(cid: str) -> None:

@@ -72,7 +72,7 @@ class FakeEdit:
         self.calls = []
         self.fail = list(fail)
 
-    async def __call__(self, settings, cdir, image, prompt, out, lock, confirm, size=""):
+    async def __call__(self, settings, cdir, image, prompt, out, confirm, size=""):
         self.calls.append({
             "image": image.name, "prompt": prompt, "out": out, "confirm": confirm, "size": size,
         })
@@ -199,8 +199,8 @@ def test_single_segment_full_chain(enabled, monkeypatch):
     assert r.status_code == 200
     assert r.json() == {"status": "running", "frames": []}  # 受理即返回，进度走 detail 轮询
 
-    # 每帧一条合并指令（分号连接），confirm 恒 True
-    assert [call["image"] for call in fake.calls] == ["01.png", "02.png"]
+    # 每帧一条合并指令（分号连接），confirm 恒 True（到达顺序不定：线程池并发读尺寸）
+    assert sorted(call["image"] for call in fake.calls) == ["01.png", "02.png"]
     expected = f"{REMOVE_SUBTITLE}；{REMOVE_BRAND}"
     for call in fake.calls:
         assert call["prompt"] == expected
@@ -236,7 +236,7 @@ def test_multi_segment_full_chain(enabled, monkeypatch):
     r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 200
 
-    assert [call["image"] for call in fake.calls] == ["01.png", "01.png", "02.png"]
+    assert sorted(call["image"] for call in fake.calls) == ["01.png", "01.png", "02.png"]
     assert (cdir / "work" / "segments" / "1" / "work" / "postprocessed" / "01.png").is_file()
     assert (cdir / "work" / "segments" / "2" / "work" / "postprocessed" / "01.png").is_file()
     assert (cdir / "work" / "segments" / "2" / "work" / "postprocessed" / "02.png").is_file()
@@ -266,7 +266,7 @@ def test_face_hold_conditional_instruction_all_frames_single(enabled, monkeypatc
     assert r.status_code == 200
 
     # 每帧一条条件指令（含人脸遮挡、无人脸保持原样），无帧被跳过
-    assert [call["image"] for call in fake.calls] == ["01.png", "02.png"]
+    assert sorted(call["image"] for call in fake.calls) == ["01.png", "02.png"]
     for call in fake.calls:
         assert call["prompt"] == FACE_HOLD
 
@@ -303,7 +303,7 @@ def test_face_hold_all_frames_multi_segment(enabled, monkeypatch):
     r = _post(c, cid, FACE_ONLY)
     assert r.status_code == 200
 
-    assert [call["image"] for call in fake.calls] == ["01.png", "01.png", "02.png"]
+    assert sorted(call["image"] for call in fake.calls) == ["01.png", "01.png", "02.png"]
     assert all(call["prompt"] == FACE_HOLD for call in fake.calls)
 
     seg1_p = (cdir / "work" / "segments" / "1" / "work" / "prompt.txt").read_text(encoding="utf-8")
@@ -562,7 +562,8 @@ def _write_real_png(path, w, h):
 
 
 def test_run_task_passes_fitted_size(enabled, monkeypatch):
-    """run_task 用 cv2 读帧像素尺寸（imread shape 高x宽），等比放大后的 "WxH" 传给 edit_image。"""
+    """run_task 用 cv2 读帧像素尺寸（imread shape 高x宽），等比放大后的 "WxH" 传给 edit_image；
+    线程池并发读尺寸，到达顺序不定——断言按帧名配对，不断言顺序。"""
     settings, c = enabled
     cid = _make_conv(settings)
     cdir = settings.data_dir / cid
@@ -572,7 +573,9 @@ def test_run_task_passes_fitted_size(enabled, monkeypatch):
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
 
     assert _post(c, cid, OPTIONS_SUB).status_code == 200
-    assert [call["size"] for call in fake.calls] == ["1440x2560", "2560x1440"]
+    assert {call["image"]: call["size"] for call in fake.calls} == {
+        "01.png": "1440x2560", "02.png": "2560x1440",
+    }
 
 
 def test_run_task_unreadable_frame_omits_size(enabled, monkeypatch):
@@ -583,11 +586,41 @@ def test_run_task_unreadable_frame_omits_size(enabled, monkeypatch):
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
 
     assert _post(c, cid, OPTIONS_SUB).status_code == 200
-    assert [call["image"] for call in fake.calls] == ["01.png", "02.png"]
+    assert sorted(call["image"] for call in fake.calls) == ["01.png", "02.png"]
     assert all(call["size"] == "" for call in fake.calls)
 
 
-# ---------- 并行提交：平台级信号量限流与失败语义 ----------
+def test_edit_one_reads_size_in_thread_pool(tmp_path, monkeypatch):
+    """imread 移出事件循环：_read_size 经 asyncio.to_thread 在线程池执行（线程 ≠ 驱动协程所在
+    线程），同步 cv2 读图不阻塞 loop、不占信号量槽；返回空串时 size 透传空串（降级不传 size）。"""
+    import threading
+    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    src = cdir / "work" / "keyframes" / "01.png"
+    out = cdir / "work" / "postprocessed" / "01.png"
+    driver_tid = threading.get_ident()
+    seen = {}
+
+    def fake_read_size(path):
+        seen["tid"] = threading.get_ident()
+        seen["path"] = path
+        return ""
+
+    monkeypatch.setattr(postprocess, "_read_size", fake_read_size)
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    sem = asyncio.Semaphore(1)
+    frames: list[str] = []
+    asyncio.run(postprocess._edit_one(
+        settings, cdir, cid, src, out, None, OPTIONS_SUB, frames, sem))
+    assert seen["path"] == src
+    assert seen["tid"] != driver_tid  # 在线程池执行，不阻塞事件循环
+    assert frames == ["01.png"]
+    assert [call["size"] for call in fake.calls] == [""]
+
+
+# ---------- 并行提交：进程级信号量限流与失败语义 ----------
 
 class SlowEdit:
     """慢速桩：asyncio.sleep 模拟真实耗时；记录并发活跃数与峰值；按 fail 名单抛 SeedreamError。"""
@@ -599,7 +632,7 @@ class SlowEdit:
         self.active = 0
         self.max_active = 0
 
-    async def __call__(self, settings, cdir, image, prompt, out, lock, confirm, size=""):
+    async def __call__(self, settings, cdir, image, prompt, out, confirm, size=""):
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         self.calls.append({"image": image.name, "size": size})
@@ -622,8 +655,8 @@ def _add_frames(settings, cid, names):
         (settings.data_dir / cid / "work" / "keyframes" / name).write_bytes(PNG)
 
 
-def test_parallel_edits_respect_platform_semaphore(tmp_path, monkeypatch):
-    """5 帧、平台并发上限 2：编辑并行提交且活跃数峰值恰为 2（信号量限流）。"""
+def test_parallel_edits_respect_process_semaphore(tmp_path, monkeypatch):
+    """5 帧、进程并发上限 2：编辑并行提交且活跃数峰值恰为 2（信号量限流）。"""
     settings = make_settings(tmp_path, enable_seedream_edit=True, seedream_concurrency=2)
     cid = _make_conv(settings)
     _add_frames(settings, cid, ["03.png", "04.png", "05.png"])
@@ -635,7 +668,8 @@ def test_parallel_edits_respect_platform_semaphore(tmp_path, monkeypatch):
 
     assert slow.max_active == 2
     assert slow.max_active <= settings.seedream_concurrency
-    assert [call["image"] for call in slow.calls] == \
+    # 帧到达顺序不定（线程池并发读尺寸），断言按集合：每帧恰一次
+    assert sorted(call["image"] for call in slow.calls) == \
         ["01.png", "02.png", "03.png", "04.png", "05.png"]
     pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
     assert pp["status"] == "done"
@@ -662,3 +696,34 @@ def test_parallel_frame_failure_waits_for_rest(enabled, monkeypatch):
     assert (cdir / "work" / "postprocessed" / "01.png").is_file()
     assert (cdir / "work" / "postprocessed" / "03.png").is_file()
     assert not (cdir / "work" / "postprocessed" / "02.png").exists()
+
+
+# ---------- 取消：父任务取消写 failed 终态 ----------
+
+def test_run_task_cancelled_writes_failed(tmp_path, monkeypatch):
+    """父任务被取消（uvicorn graceful shutdown）：CancelledError 是 BaseException，run_task 须在
+    继续传播前把 meta.postprocess 写成 failed——否则永久 running、start 永久 409 拒重跑。"""
+    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    cid = _make_conv(settings)
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "running", "options": OPTIONS_SUB, "frames": [], "error": None,
+    })
+
+    async def hang(*a, **k):
+        await asyncio.Event().wait()  # 被取消时才结束的挂起桩
+
+    monkeypatch.setattr(postprocess, "_edit_one", hang)
+    sem = asyncio.Semaphore(10)
+
+    async def drive():
+        task = asyncio.create_task(postprocess.run_task(settings, cid, OPTIONS_SUB, sem))
+        await asyncio.sleep(0.05)  # 让出至进入 gather
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(drive())
+    pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    assert pp["status"] == "failed"
+    assert "cancelled" in pp["error"]
+    assert pp["options"] == OPTIONS_SUB

@@ -314,6 +314,39 @@ def test_http_error_exit_nonzero_no_key_leak(tmp_path, monkeypatch, capsys):
     assert SECRET not in err_text
 
 
+# ---------- save_result 原子落盘 ----------
+
+def test_save_result_no_tmp_leftover(tmp_path):
+    """正常落盘后目录只有目标文件（无临时文件残留），字节完整。"""
+    out = tmp_path / "sub" / "edited.png"
+    data = PNG + b"edited-image-bytes"
+    b64 = base64.b64encode(data).decode("ascii")
+    path = seedream_task.save_result({"data": [{"b64_json": b64}]}, str(out))
+    assert path == out
+    assert out.read_bytes() == data
+    assert sorted(p.name for p in out.parent.iterdir()) == ["edited.png"]
+
+
+def test_save_result_replaces_atomically(tmp_path, monkeypatch):
+    """先写同目录临时文件再 os.replace 到目标：目标路径上不会出现半写状态（600s 超时恰逢
+    写盘时杀子进程 → 半写 PNG 残留会被重跑误判已成功跳过）。"""
+    out = tmp_path / "edited.png"
+    data = PNG + b"edited-image-bytes"
+    b64 = base64.b64encode(data).decode("ascii")
+    real_replace = os.replace
+    calls = []
+    monkeypatch.setattr(
+        seedream_task.os, "replace",
+        lambda src, dst: (calls.append((Path(src), Path(dst))), real_replace(src, dst))[1],
+    )
+    seedream_task.save_result({"data": [{"b64_json": b64}]}, str(out))
+    assert out.read_bytes() == data
+    (tmp, dst), = calls
+    assert dst == out
+    assert tmp.parent == out.parent and tmp != out
+    assert not tmp.exists()  # 替换完成后临时文件已消失
+
+
 # ---------- seedream.py 门控 ----------
 
 def _no_subprocess(*a, **k):
@@ -348,9 +381,9 @@ class FakeEdit:
         return [c for c in self.calls if "--dry-run" not in c[0]]
 
 
-def _edit(settings, cdir, image, prompt, out, lock, confirm=True, size=""):
+def _edit(settings, cdir, image, prompt, out, confirm=True, size=""):
     return asyncio.run(
-        seedream.edit_image(settings, cdir, image, prompt, out, lock, confirm, size=size)
+        seedream.edit_image(settings, cdir, image, prompt, out, confirm, size=size)
     )
 
 
@@ -368,27 +401,26 @@ def test_disabled_501(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", _no_subprocess)
     for confirm in (False, True):  # 开关最优先，不看 confirm
         with pytest.raises(seedream.SeedreamError) as e:
-            _edit(settings, cdir, _png(tmp_path), "p", out, asyncio.Lock(), confirm=confirm)
+            _edit(settings, cdir, _png(tmp_path), "p", out, confirm=confirm)
         assert e.value.status == 501
         assert e.value.detail == "Seedream edit is disabled."
 
 
 def test_confirm_required_409(tmp_path, monkeypatch):
-    """confirm 严格为 True 才放行（同 seedance payload.confirm 语义），位置在锁与入参校验之前。"""
+    """confirm 严格为 True 才放行（同 seedance payload.confirm 语义），位置在入参校验之前。"""
     settings = make_settings(tmp_path, enable_seedream_edit=True)
     cdir = tmp_path / "c"
     cdir.mkdir()
     out = cdir / "edited.png"
     monkeypatch.setattr(subprocess, "run", _no_subprocess)
-    lock = asyncio.Lock()
     for confirm in (False, "true", 1):
         with pytest.raises(seedream.SeedreamError) as e:
-            _edit(settings, cdir, _png(tmp_path), "p", out, lock, confirm=confirm)
+            _edit(settings, cdir, _png(tmp_path), "p", out, confirm=confirm)
         assert e.value.status == 409, confirm
         assert e.value.detail == "confirmation required"
     # confirm 门控先于入参校验：图缺失也先报 confirmation required
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, tmp_path / "missing.png", "p", out, lock, confirm=False)
+        _edit(settings, cdir, tmp_path / "missing.png", "p", out, confirm=False)
     assert e.value.status == 409 and e.value.detail == "confirmation required"
 
 
@@ -398,12 +430,11 @@ def test_bad_input_409(tmp_path, monkeypatch):
     cdir.mkdir()
     out = cdir / "edited.png"
     monkeypatch.setattr(subprocess, "run", _no_subprocess)
-    lock = asyncio.Lock()
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, tmp_path / "missing.png", "p", out, lock)
+        _edit(settings, cdir, tmp_path / "missing.png", "p", out)
     assert e.value.status == 409 and e.value.detail == "invalid edit request"
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, _png(tmp_path), "   ", out, lock)
+        _edit(settings, cdir, _png(tmp_path), "   ", out)
     assert e.value.status == 409 and e.value.detail == "invalid edit request"
 
 
@@ -419,7 +450,7 @@ def test_dryrun_failed_409(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", dry_fails)
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, _png(tmp_path), "p", out, asyncio.Lock())
+        _edit(settings, cdir, _png(tmp_path), "p", out)
     assert e.value.status == 409
     assert e.value.detail == "invalid edit request"
 
@@ -434,7 +465,7 @@ def test_dryrun_no_marker_409(tmp_path, monkeypatch):
     fake = FakeEdit(dry_stdout="")
     monkeypatch.setattr(subprocess, "run", fake)
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, _png(tmp_path), "p", out, asyncio.Lock())
+        _edit(settings, cdir, _png(tmp_path), "p", out)
     assert e.value.status == 409
     assert fake.real_calls == []  # 未进入真实提交
 
@@ -448,7 +479,7 @@ def test_missing_ark_key_503(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.delenv("ARK_API_KEY", raising=False)
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, _png(tmp_path), "p", out, asyncio.Lock())
+        _edit(settings, cdir, _png(tmp_path), "p", out)
     assert e.value.status == 503
     assert e.value.detail == "ARK_API_KEY not configured"
     assert fake.real_calls == [] and len(fake.calls) == 1  # dry-run 预检后才查 key
@@ -465,7 +496,7 @@ def test_edit_success(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setenv("ARK_API_KEY", SECRET)
 
-    result = _edit(settings, cdir, image, "戴上眼镜", out, asyncio.Lock())
+    result = _edit(settings, cdir, image, "戴上眼镜", out)
     assert result == out
     assert out.read_bytes() == PNG + b"edited"
 
@@ -497,7 +528,7 @@ def test_edit_success(tmp_path, monkeypatch):
 
     # 幂等：out 已存在 → 409
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, image, "戴上眼镜", out, asyncio.Lock())
+        _edit(settings, cdir, image, "戴上眼镜", out)
     assert e.value.status == 409 and e.value.detail == "already edited"
 
 
@@ -511,11 +542,11 @@ def test_edit_size_in_argv(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setenv("ARK_API_KEY", SECRET)
 
-    _edit(settings, cdir, image, "p", cdir / "a.png", asyncio.Lock(), size="1440x2560")
+    _edit(settings, cdir, image, "p", cdir / "a.png", size="1440x2560")
     for argv, _ in fake.calls[:2]:  # dry-run + 真实提交
         assert argv[argv.index("--size") + 1] == "1440x2560"
 
-    _edit(settings, cdir, image, "p", cdir / "b.png", asyncio.Lock())
+    _edit(settings, cdir, image, "p", cdir / "b.png")
     assert all("--size" not in argv for argv, _ in fake.calls[2:])
 
 
@@ -535,7 +566,7 @@ def test_edit_relative_paths_resolved(tmp_path, monkeypatch):
     rel_cdir = Path("c")
     rel_image = Path("in.png")
     rel_out = Path("c") / "edited.png"
-    result = _edit(settings, rel_cdir, rel_image, "戴上眼镜", rel_out, asyncio.Lock())
+    result = _edit(settings, rel_cdir, rel_image, "戴上眼镜", rel_out)
     assert result == cdir / "edited.png"  # 返回绝对
     assert out.read_bytes() == PNG + b"edited"
     (dargv, dkw), = fake.calls[:1]
@@ -555,7 +586,7 @@ def test_edit_failure_502_sanitized(tmp_path, monkeypatch):
            "plain failure line")
     monkeypatch.setattr(subprocess, "run", FakeEdit(rc=1, stderr=err))
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, _png(tmp_path), "p", out, asyncio.Lock())
+        _edit(settings, cdir, _png(tmp_path), "p", out)
     assert e.value.status == 502
     detail = e.value.detail
     assert len(detail) <= 300
@@ -581,7 +612,7 @@ def test_edit_timeout_502(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake)
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, _png(tmp_path), "p", out, asyncio.Lock())
+        _edit(settings, cdir, _png(tmp_path), "p", out)
     assert e.value.status == 502 and e.value.detail == "seedream task timed out"
 
 
@@ -600,34 +631,35 @@ def test_edit_runner_unavailable_502(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake)
     with pytest.raises(seedream.SeedreamError) as e:
-        _edit(settings, cdir, _png(tmp_path), "p", out, asyncio.Lock())
+        _edit(settings, cdir, _png(tmp_path), "p", out)
     assert e.value.status == 502 and e.value.detail == "seedream runner unavailable"
 
 
-def test_concurrent_edit_single_task(tmp_path, monkeypatch):
+def test_concurrent_edit_no_builtin_dedup(tmp_path, monkeypatch):
+    """edit_image 不自带并发锁（并发化后每帧新建锁、锁内重查退化为自守卫，已移除）：并发同
+    out 提交两份都发生；「同 out 仅一次提交」由编排层保证——start 门控同 cid 无并发 run_task
+    + run_task 收集阶段 out 互异且跳过已有产物（见 tests/test_postprocess.py 并发与重跑测试）。"""
     settings = make_settings(tmp_path, enable_seedream_edit=True)
     cdir = tmp_path / "c"
     cdir.mkdir()
     out = cdir / "edited.png"
     monkeypatch.setenv("ARK_API_KEY", "sk-x")
-    fake = FakeEdit(delay=0.3)
+    fake = FakeEdit(delay=0.1)
     monkeypatch.setattr(subprocess, "run", fake)
-    lock = asyncio.Lock()
 
     async def run_both():
         return await asyncio.gather(
-            seedream.edit_image(settings, cdir, _png(tmp_path), "p", out, lock, True),
-            seedream.edit_image(settings, cdir, _png(tmp_path), "p", out, lock, True),
+            seedream.edit_image(settings, cdir, _png(tmp_path), "p", out, True),
+            seedream.edit_image(settings, cdir, _png(tmp_path), "p", out, True),
             return_exceptions=True,
         )
 
     results = asyncio.run(run_both())
     oks = [r for r in results if isinstance(r, Path)]
     errs = [r for r in results if isinstance(r, seedream.SeedreamError)]
-    assert len(oks) == 1 and oks[0] == out
-    assert len(errs) == 1 and errs[0].status == 409
-    assert errs[0].detail == "already edited"
-    assert len(fake.real_calls) == 1  # 一次确认 = 一个任务
+    assert len(oks) == 2 and set(oks) == {out}
+    assert errs == []
+    assert len(fake.real_calls) == 2  # 去重不在 edit_image 内，由调用方编排保证
 
 
 # ---------- config ----------
@@ -654,3 +686,16 @@ def test_settings_seedream_concurrency_default(tmp_path):
 def test_get_settings_seedream_concurrency_env(monkeypatch):
     monkeypatch.setenv("SEEDREAM_CONCURRENCY", "3")
     assert get_settings().seedream_concurrency == 3
+
+
+def test_get_settings_seedream_concurrency_clamped(monkeypatch):
+    """SEEDREAM_CONCURRENCY 钳制 ≥1：0（Semaphore(0) 所有 acquire 永久阻塞）与负数
+    （Semaphore 构造 ValueError）都归 1。"""
+    monkeypatch.delenv("SEEDREAM_CONCURRENCY", raising=False)
+    assert get_settings().seedream_concurrency == 10
+    monkeypatch.setenv("SEEDREAM_CONCURRENCY", "0")
+    assert get_settings().seedream_concurrency == 1
+    monkeypatch.setenv("SEEDREAM_CONCURRENCY", "-3")
+    assert get_settings().seedream_concurrency == 1
+    monkeypatch.setenv("SEEDREAM_CONCURRENCY", "25")
+    assert get_settings().seedream_concurrency == 25

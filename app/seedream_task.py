@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -112,7 +113,11 @@ def submit_edit(
 
 
 def save_result(task: dict[str, Any], destination: str) -> Path:
-    """data[0].b64_json 严格校验解码写 --out；缺失/为空/非法一律硬错误。"""
+    """data[0].b64_json 严格校验解码写 --out；缺失/为空/非法一律硬错误。
+
+    落盘为原子替换：写同目录临时文件 → flush+close → os.replace 到目标。
+    避免 600s 超时恰逢写盘时杀子进程留下半写 PNG——重跑会以 out 已存在误判已成功跳过。
+    """
     data_list = task.get("data") or []
     first = data_list[0] if data_list else None
     b64 = (first or {}).get("b64_json")
@@ -123,7 +128,15 @@ def save_result(task: dict[str, Any], destination: str) -> Path:
         raise RuntimeError("Empty image data in edit response.")
     path = Path(destination).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".tmp.")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
     print(f"Saved: {path}", flush=True)
     return path
 

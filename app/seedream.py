@@ -1,4 +1,4 @@
-"""预留的 Seedream 图像编辑提交：开关 + confirm + 并发锁三重门控，默认 501。
+"""预留的 Seedream 图像编辑提交：开关 + confirm 门控 + dry-run 预检，默认 501。
 
 confirm 语义由调用方传入（同 seedance.submit 的 payload.confirm，必须严格 True）：
 路由层在用户确认后传 True；脚本侧 --confirm-submit 机械门控始终显式传入。密钥只
@@ -40,11 +40,15 @@ async def edit_image(
     image: Path,
     prompt: str,
     out: Path,
-    lock: asyncio.Lock,
     confirm: bool,
     size: str = "",
 ) -> Path:
-    """按固定顺序过门控（与 seedance.submit 对齐）；同一把锁内重查 out 已存在，防并发重复扣费。
+    """按固定顺序过门控（与 seedance.submit 对齐）：开关 → confirm → out 已存在 409 → dry-run
+    预检 → 真实提交。
+
+    不自带并发锁：并发化后每帧传新建锁、锁内 out.exists() 重查退化为自守卫（锁不共享，无实际
+    防护），已移除；同 out 不重复提交由 postprocess.run_task 收集阶段不变量保证（out 互异、
+    同 cid 无并发 run_task、start 门控），入口 out.exists() 检查保留为调用方兜底。
 
     size = "WxH" 输出尺寸（可选；空串 = 不传，模型默认 2048 方形，方向可能失真）。
     """
@@ -59,18 +63,15 @@ async def edit_image(
     image = image.resolve()
     out = out.resolve()
     _check_input(image, prompt)
-    async with lock:
-        if out.exists():
-            raise SeedreamError(409, "already edited")
-        await asyncio.to_thread(
-            _dryrun_check, cdir, image, prompt, out, settings.seedream_model, size
-        )
-        if not os.environ.get("ARK_API_KEY", "").strip():
-            raise SeedreamError(503, "ARK_API_KEY not configured")
-        await asyncio.to_thread(
-            _run_edit, cdir, image, prompt, out, settings.seedream_model, size
-        )
-        return out
+    await asyncio.to_thread(
+        _dryrun_check, cdir, image, prompt, out, settings.seedream_model, size
+    )
+    if not os.environ.get("ARK_API_KEY", "").strip():
+        raise SeedreamError(503, "ARK_API_KEY not configured")
+    await asyncio.to_thread(
+        _run_edit, cdir, image, prompt, out, settings.seedream_model, size
+    )
+    return out
 
 
 def _check_input(image: Path, prompt: str) -> None:

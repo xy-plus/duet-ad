@@ -9,7 +9,7 @@ options 里的废弃键忽略；纯废弃形态放行并清旧产物）；锁内
 收集目标帧（单段 work/keyframes/*.png；多段 work/segments/N/work/keyframes/*.png）→ 按勾选选项
 构造中文编辑指令（多选项分号连接；face_hold 为条件式指令——含人脸则捂脸、不含人脸保持原样，
 条件句放最前，所有帧都发编辑请求，不做人脸预判/过滤）→ 未跳过帧 asyncio.gather 并行
-seedream.edit_image(confirm=True, size=按帧像素等比放大的 "WxH")，平台级信号量（主进程
+seedream.edit_image(confirm=True, size=按帧像素等比放大的 "WxH")，进程级信号量（主进程
 seedream_sem，SEEDREAM_CONCURRENCY）限并发 → 产出写 work/postprocessed/<帧名>.png 或
 work/segments/N/work/postprocessed/<帧名>.png → 任一帧失败整体 failed（error 列失败帧名；
 其余帧照常跑完，已成功帧保留且重跑跳过）→
@@ -93,8 +93,9 @@ async def start(
 async def run_task(
     settings: Settings, cid: str, options: dict[str, bool], sem: asyncio.Semaphore
 ) -> None:
-    """后台任务：并行逐帧编辑（平台级信号量 sem 限并发）；任一帧失败 → meta.postprocess failed
+    """后台任务：并行逐帧编辑（进程级信号量 sem 限并发）；任一帧失败 → meta.postprocess failed
     （error 列失败帧名，其余帧照常跑完，已成功帧保留，重跑跳过）；
+    父任务被取消（graceful shutdown）→ 写 failed(error=cancelled) 后继续传播取消；
     每成功一帧即写回 frames（status 保持 running），供前端轮询显示实时进度。"""
     # data_dir 可能是相对路径（生产默认 "data"）：子进程带 cwd 时相对路径会错位，统一起点解析为绝对
     cdir = (settings.data_dir / cid).resolve()
@@ -124,6 +125,12 @@ async def run_task(
         if errors:
             raise PostprocessError(502, sanitize("；".join(errors)))
         post = {"status": "done", "options": options, "frames": sorted(frames), "error": None}
+    except asyncio.CancelledError:
+        # 父任务被取消（uvicorn graceful shutdown）：gather 自身抛 CancelledError（BaseException），
+        # 不写终态会永久 running、start 永久 409；先写 failed（update_meta 同步，可安全调用）再传播取消
+        post = {"status": "failed", "options": options, "frames": sorted(frames), "error": "cancelled"}
+        storage.update_meta(settings.data_dir, cid, postprocess=post)
+        raise
     except PostprocessError as e:
         post = {"status": "failed", "options": options, "frames": sorted(frames), "error": e.detail}
     except Exception as e:
@@ -142,16 +149,18 @@ async def _edit_one(
     frames: list[str],
     sem: asyncio.Semaphore,
 ) -> None:
-    """单帧编辑（gather 成员）：读帧尺寸算 size → 信号量内提交；成功后追加帧名并写回进度。
+    """单帧编辑（gather 成员）：线程池读帧尺寸算 size（同步 cv2.imread 不阻塞事件循环、不占
+    信号量槽）→ 信号量内提交；成功后追加帧名并写回进度。
 
-    run_task 收集阶段已保证各帧 out 互异且未产出，同帧不会被并发重复提交，故编辑不再复用
-    会话锁（会话锁跨整个提交持有，共享会串行化所有帧），改传每帧独立锁保持 edit_image 门控形态。
+    run_task 收集阶段已保证各帧 out 互异且未产出，同帧不会被并发重复提交；edit_image 不再
+    接收并发锁（每帧新建锁退化为自守卫，无实际防护），同 out 仅一次提交由收集不变量 + start
+    门控保证。
     """
     try:
+        size = await asyncio.to_thread(_read_size, src)  # 同步 cv2.imread 在线程池，不阻塞 loop
         async with sem:
             await seedream.edit_image(
-                settings, cdir, src, _build_instruction(options), out, asyncio.Lock(), True,
-                size=_read_size(src),
+                settings, cdir, src, _build_instruction(options), out, True, size=size,
             )
     except seedream.SeedreamError as e:
         raise PostprocessError(502, f"frame {out.name} failed: {sanitize(e.detail)}") from None
@@ -266,7 +275,8 @@ def _frame_ref(seg_index: int | None, name: str) -> str:
 def _write_progress(
     settings: Settings, cid: str, options: dict[str, bool], frames: list[str]
 ) -> None:
-    """逐帧写回进度：frames 累计已完成帧，status 保持 running（run_task 是 running 期间唯一写者）。"""
+    """逐帧写回进度：frames 累计已完成帧，status 保持 running。storage.update_meta 全程同步、
+    append 与写回之间无 await，单事件循环内每帧写回是原子块，多协程写者无丢失更新。"""
     storage.update_meta(settings.data_dir, cid, postprocess={
         "status": "running", "options": options, "frames": frames, "error": None,
     })

@@ -29,7 +29,7 @@ links: [result-display, submit-gate]
 - 「含人脸遮挡」是条件式指令（含人脸则改为捂脸造型、不含人脸保持原样），由 Seedream 自己判断；后端不做人脸预判，所有帧都发编辑请求，无人脸帧输出为近似原图直接展示（将来可加输出-输入变化判定过滤，见 OPEN_ISSUE）
 - 捂脸配套的条件动作行（「如果画面中出现用手捂住脸的人物…」）由流水线机械加进 prompt 开头（多段模式在「不要生成背景音乐」行之后），后处理不再追加动作线
 - 后处理不改变会话 `status`（始终 `done`），进度与结果只看 detail 的 `postprocess` 字段
-- 后端对未处理帧并行提交编辑（平台级并发上限 `SEEDREAM_CONCURRENCY`，默认 10，跨会话共享）；任一帧失败则整体 failed、其余帧照常完成（error 列失败帧名）
+- 后端对未处理帧并行提交编辑（进程级并发上限 `SEEDREAM_CONCURRENCY`，默认 10，单个 uvicorn 进程内跨会话共享；多 worker 部署时每进程独立限额）；任一帧失败则整体 failed、其余帧照常完成（error 列失败帧名）
 - 后端每成功一帧即写回 `postprocess.frames`（status 保持 `running`），进度随前端 2s 轮询实时推进；进入/离开 running 时前端全量重建一次，running 期间只刷新动态区
 
 ## 例子
