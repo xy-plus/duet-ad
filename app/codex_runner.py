@@ -21,7 +21,9 @@ import subprocess
 import threading
 from pathlib import Path
 
+# 调用级固定 medium：流水线看图/听写任务要速度不要 max 深度（实测 max 下段任务 30 分钟超时 vs medium 410s）；用户交互式 codex 的全局 effort 不受影响
 _SANDBOX_CONFIGS = [
+    "model_reasoning_effort=\"medium\"",
     "sandbox_workspace_write.network_access=false",
     'shell_environment_policy.inherit="core"',
     'shell_environment_policy.exclude=["*KEY*","*TOKEN*","*SECRET*","*PASSWORD*"]',

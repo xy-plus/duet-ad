@@ -218,6 +218,7 @@ class TestCodexRunner:
         assert argv[argv.index("--color") + 1] == "never"
         assert argv[argv.index("-o") + 1] == str(tmp_path / "codex_last_message.txt")
         configs = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
+        assert 'model_reasoning_effort="medium"' in configs
         assert "sandbox_workspace_write.network_access=false" in configs
         assert 'shell_environment_policy.inherit="core"' in configs
         assert any(
