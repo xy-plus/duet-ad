@@ -68,6 +68,19 @@ class TestExtractAudio:
         with pytest.raises(PipelineError, match="exit 1"):
             voice.extract_audio(cdir)
 
+    def test_probe_audio_duration_real_mp3(self, tmp_path, video_with_audio):
+        """probe_audio_duration：真实抽出的 voice.mp3 时长 ≈ 源音轨时长（>0.5s 且不炸）。"""
+        cdir = _conv(tmp_path, video_with_audio)
+        out = voice.extract_audio(cdir)
+        d = voice.probe_audio_duration(out)
+        assert isinstance(d, float) and 0.5 < d < 2.0
+
+    def test_probe_audio_duration_garbage_returns_none(self, tmp_path):
+        """probe_audio_duration：非音频文件/损坏 → None（不抛）。"""
+        p = tmp_path / "garbage.mp3"
+        p.write_bytes(b"not an mp3")
+        assert voice.probe_audio_duration(p) is None
+
     def test_probe_failure_defers_to_ffmpeg(self, tmp_path, video_with_audio, monkeypatch):
         """storage.probe_audio 探测失败（UploadError）→ 交 ffmpeg 裁决，不误判无音轨。"""
         cdir = _conv(tmp_path, video_with_audio)

@@ -159,8 +159,10 @@ def _voice_step(
 ) -> list[dict]:
     """口播步（抽帧后）：抽音轨 → codex 听写 → 白名单校验 → voice_lines 落 meta。
 
-    时长约束用源视频时长，取自抽帧步产出的 manifest.json。失败 → PipelineError 走现有
-    meta failed 落盘链路。返回白名单净化后的台词列表（多段模式按 start_s 归段用）。
+    台词时间戳在音频时间轴上（codex 听 voice.mp3），校验基准与提示词时长用音频实际时长
+    （音频流可比容器长几十 ms，常态）；容器时长（manifest）仍供场景/拆段用。失败 →
+    PipelineError 走现有 meta failed 落盘链路。返回白名单净化后的台词列表（多段模式按
+    start_s 归段用）。
     """
     target_language = (target_language or "").strip()  # 纯空白串视为缺失，不生成「翻译成   」prompt
     if voice_mode not in ("keep", "rewrite", "translate"):
@@ -179,16 +181,18 @@ def _voice_step(
         raise PipelineError("manifest.json missing or invalid") from None
     if duration_s <= 0:
         raise PipelineError(f"manifest.json invalid duration: {duration_s}")
+    # 台词校验基准 = 音频实际时长；probe 失败回退容器时长（旧行为）
+    audio_duration_s = voice.probe_audio_duration(work / "voice.mp3") or duration_s
     try:
-        runner.run(cdir, _voice_prompt(cdir, voice_mode, target_language, duration_s))
+        runner.run(cdir, _voice_prompt(cdir, voice_mode, target_language, audio_duration_s))
     except CodexError as e:
         # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
         try:
-            lines = _load_voice_lines(work, duration_s)
+            lines = _load_voice_lines(work, audio_duration_s)
         except PipelineError:
             raise e from None
     else:
-        lines = _load_voice_lines(work, duration_s)
+        lines = _load_voice_lines(work, audio_duration_s)
     try:
         analysis = vocal.analyze(work / "voice.mp3")
         filtered_lines = []

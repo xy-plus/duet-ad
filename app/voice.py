@@ -21,6 +21,24 @@ MAX_VOICE_TEXT_CHARS = 500  # 每行台词长度上限（strip 后）
 MAX_VOICE_LINES_ITEMS = 200  # 台词条数上限（300s 视频按每句 1.5s 计 200 句，留裕量）
 
 
+def probe_audio_duration(path: Path) -> float | None:
+    """ffprobe 音频文件实际时长（秒）；非音频/损坏 → None（不抛）。
+
+    音频流可比容器长几十 ms（音轨尾部余量，常态）——台词时间戳在音频时间轴上，
+    校验基准必须用音频时长而非容器时长。
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        d = float(json.loads(r.stdout or "{}").get("format", {}).get("duration", ""))
+    except (OSError, TypeError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return d if d > 0 else None
+
+
 def extract_audio(cdir: Path) -> Path | None:
     """从 source.* 抽音轨为 work/voice.mp3；无音轨 → None，ffmpeg 缺失/失败 → PipelineError。"""
     from app.pipeline import PipelineError  # 循环导入：pipeline 顶层导入本模块

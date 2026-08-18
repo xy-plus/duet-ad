@@ -633,6 +633,59 @@ def test_run_voice_vocal_failure_fails_pipeline(tmp_path, video_1s, monkeypatch)
     assert "模型校验失败" in stored["error"]
 
 
+def test_run_voice_audio_longer_than_container(tmp_path, video_1s, monkeypatch):
+    """音视频不同长（音频流比容器长 36ms，常态）：台词 end_s 写到音频末尾应通过——
+    校验基准是 voice.mp3 实际时长，不是容器时长（否则全部此类视频都 failed）。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    line = {"text": "台词", "start_s": 0.224, "end_s": 27.936}  # end_s 超容器 27.9 但等于音频时长
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(json.dumps([line]), encoding="utf-8")
+        else:
+            _write_valid_package(work)
+
+    def fake_extract_ok(argv, *, timeout, step, cwd=None):
+        if step == "extract":
+            work = Path(argv[argv.index("--out-dir") + 1])
+            (work / "contact_sheet.jpg").write_bytes(b"sheet")
+            (work / "manifest.json").write_text(
+                json.dumps({"duration_seconds": 27.9}), encoding="utf-8"
+            )
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 27.9, "scenes": [], "segments": []})
+            )
+
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(voice, "probe_audio_duration", lambda _path: 27.936)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        vocal,
+        "analyze",
+        lambda _audio: vocal.VocalAnalysis(
+            windows=[vocal.VocalWindow(0, 30_000, sung=0.0, spoken=0.3, music=0.0)],
+            has_bgm=False,
+        ),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done"
+    assert stored["voice_lines"] == [line]
+
+
 def test_run_voice_keep_runs_asr_and_stores_lines(tmp_path, video_1s, monkeypatch):
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
