@@ -137,6 +137,8 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 - `app.storage.new_conversation(data_dir, note, orig_name, client_request_id="", voice_mode="none", target_language="") -> dict` — 建目录 + 初始 meta（status=queued）；幂等键/目标语言非空才落 meta，`voice_mode` 恒落
 - `app.storage.probe_audio(path) -> bool` — `ffprobe -select_streams a` 探测音轨；探测失败抛 `UploadError`
 - `app.voice.extract_audio(cdir) -> Path | None` — ffmpeg 抽音轨为 work/voice.mp3；无音轨 → None；失败 → PipelineError
+- `app.vocal.analyze(audio) -> VocalAnalysis` — ffmpeg 解码 16kHz f32le → YAMNet 逐窗推理 → `VocalAnalysis(windows, has_bgm)`；模型 sha256 校验不符/解码失败 → `VocalError`
+- `app.vocal.classify_segment(start_ms, end_ms, windows) -> "sung" | "spoken" | None` — 台词片段与声学窗口重叠加权判定；None = 无人声证据（假转录，调用方丢弃）
 - `app.voice.validate_voice_lines(raw, duration_s) -> list[dict]` — 台词 JSON 白名单校验（raw ≤ 32KB、条目 ≤ 200、每行 text ≤ 500 字、text/start_s/end_s 三字段、时间单调且落在时长内）；返回净化列表
 - `app.storage.update_meta(data_dir, cid, **changes) -> dict | None` — 合并写字段并刷新 `updated_at`
 - `app.storage.load_meta(data_dir, cid) -> dict | None` — cid 正则不过/文件缺 → None
@@ -176,10 +178,12 @@ meta.json（`data/<cid>/meta.json`）：
 | `client_request_id` | str | 前端幂等键（仅提交时带才存在；内部字段，查重依据；查重不比对任何提交参数，靠前端换键保证同键同参数） |
 | `voice_mode` | str | `none/keep/rewrite/translate`（恒落，默认 `none`；内部字段） |
 | `target_language` | str | 翻译目标语言（仅 `translate` 且非空时落；内部字段） |
-| `voice_lines` | list[dict] | 口播台词（`voice_mode≠none` 时 ASR 校验后写入；进 detail 响应 `voice_lines` 字段） |
+| `voice_lines` | list[dict] | 口播台词（`voice_mode≠none` 时 ASR 校验 + YAMNet 声学过滤后写入；进 detail 响应 `voice_lines` 字段） |
+| `has_bgm` | bool | 口播模式 YAMNet 判定的整片背景音乐有无（`voice_mode≠none` 时恒写） |
 | `segments` | list[dict] | 多段模式逐段产物：`index`（1 起）/`start_s`/`end_s`/`keyframes`/`prompt`/`lines`（该段台词 text 列表）；单段模式不写（缺省） |
 | `scenes_note` | str | 场景检测失败或 scenes.json 非法回退单段的留痕（内部字段，仅回退时写） |
 | `voice_lines_dropped` | int | 多段模式下未归段的越界台词数（内部字段，仅 >0 时写） |
+| `voice_lines_vocal_dropped` | int | 口播模式被声学验证丢弃的假转录句数（唱歌/无人声；内部字段，仅 >0 时写） |
 | `has_video` | bool | 提交标记（仅提交后存在；内部字段） |
 | `submitted_at` / `task_id` | str | 提交时间 / Ark 任务 id（内部字段，读不到 task.json 则为 null） |
 | `postprocess` | dict \| null | 后处理状态（仅后处理启动后存在）：`status`（`running/done/failed`）/`options`（勾选选项）/`frames`（有优化版的帧名列表，单段=帧名、多段=`segments/N/postprocessed/帧名` 全形路径）/`error`（失败原因，指明帧名）；进 detail 响应 `postprocess` 字段 |
@@ -201,7 +205,10 @@ scenes.json（`work/scenes.json`，`app/scenes.py` 产物）：
 
 ## 依赖
 
-- Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless `>=4.8,<5`（skill 脚本用；后处理 face_hold 用其自带 haarcascade 数据与 CascadeClassifier API——5.0 无此 API，故锁 `<5`）、scenedetect（场景检测，`app/scenes.py` 用；`>=0.7`——0.6.x 无 FrameTimecode.seconds 属性）、pytest、httpx（TestClient）
+- Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless `>=4.8,<5`（skill 脚本用；后处理 face_hold 用其自带 haarcascade 数据与 CascadeClassifier API——5.0 无此 API，故锁 `<5`）、scenedetect（场景检测，`app/scenes.py` 用；`>=0.7`——0.6.x 无 FrameTimecode.seconds 属性）、pytest、httpx（TestClient）、ai-edge-litert `==2.1.6`（YAMNet 推理，口播声学验证用）
 - 外部可执行：ffmpeg/ffprobe（探测+抽帧+测试造样例）、codex CLI（0.147.0 实证基线，仅流水线用）
+- 模型：`models/yamnet.tflite`（4.1MB，进仓库即部署自带；AudioSet 521 类；加载前 sha256 校验；环境变量 `YAMNET_MODEL_PATH` 可覆盖默认路径）
+
+口播声学验证环节（`voice_mode≠none`，codex 听写校验之后）：对 work/voice.mp3 跑 `app.vocal.analyze`（YAMNet 521 类逐窗推理，窗长 15600 样本），每句 `classify_segment` 只保留 `"spoken"`，`"sung"` 与 None（无人声证据的假转录）丢弃并计 `voice_lines_vocal_dropped`；同时判整片 BGM 落 `has_bgm`。验证失败 → 整体 `failed`（`vocal classification unavailable: <原因>`），不静默降级。类索引与判定阈值照搬 TrendScout 盘上实测校准（2026-07-28），不自行调参。
 - 技能脚本：`skills/video-maker/scripts/extract_keyframes.py`（`--fps`/`--times`/`--sample-count`/`--prefix`/`--columns`/`--out-dir`）、`skills/video-maker/scripts/crop_image.py`（裁字幕/水印）；提交脚本 `app/seedance_task.py`（`create --dry-run|--confirm-submit --wait`，模型默认 `doubao-seedance-2-0-260128`，Ark `https://ark.cn-beijing.volces.com/api/v3`）；编辑脚本 `app/seedream_task.py`（`edit --dry-run|--confirm-submit`，模型默认 `doubao-seedream-5-0-pro-260628`，实测契约：JSON 图生图 POST `https://ark.cn-beijing.volces.com/api/v3/images/generations`，`image` 为 data URI 字符串数组，同步 200 返回 `data[0].b64_json`（缺失/为空/非法即失败退出））；场景脚本 `app/scenes.py`（`<video> --work-dir <work>`，PySceneDetect 场景检测 + 拆段建议，写 scenes.json）
 - 流水线固定参数：抽帧 `--fps 4`（分页联系表落 `work/`）；scenes 检测超时 300s；拆段切分 `ffmpeg -ss <start> -i <src> -to <len>` 重编码落 `work/segments/N/source.mp4`（切出时长与边界误差 <0.1s）；提交建模 `9:16 / 15s / 720p / --generate-audio / --no-watermark`（提交时现构建，无评审 payload）

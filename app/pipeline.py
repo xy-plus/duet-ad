@@ -32,7 +32,7 @@ from pathlib import Path
 
 import cv2
 
-from app import storage, voice
+from app import storage, vocal, voice
 from app.codex_runner import CodexError, clean_stderr
 from app.config import Settings
 
@@ -195,8 +195,26 @@ def _voice_step(
             raise e from None
     else:
         lines = _load_voice_lines(work, duration_s)
-    storage.update_meta(settings.data_dir, cid, voice_lines=lines)
-    return lines
+    try:
+        analysis = vocal.analyze(work / "voice.mp3")
+        filtered_lines = []
+        vocal_dropped = 0
+        for line in lines:
+            classification = vocal.classify_segment(
+                int(line["start_s"] * 1000), int(line["end_s"] * 1000), analysis.windows
+            )
+            if classification == "spoken":
+                filtered_lines.append(line)
+            else:
+                vocal_dropped += 1
+    except Exception as e:
+        raise PipelineError(f"vocal classification unavailable: {e}") from None
+
+    changes = {"voice_lines": filtered_lines, "has_bgm": bool(analysis.has_bgm)}
+    if vocal_dropped:
+        changes["voice_lines_vocal_dropped"] = vocal_dropped
+    storage.update_meta(settings.data_dir, cid, **changes)
+    return filtered_lines
 
 
 def _load_scenes(work: Path) -> list[dict]:
