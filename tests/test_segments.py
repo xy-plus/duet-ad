@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import pipeline, storage
+from app import pipeline, storage, vocal
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
@@ -624,6 +624,16 @@ def test_run_multi_segment_full_pipeline(tmp_path, monkeypatch):
     cid = meta["id"]
     cdir = settings.data_dir / cid
 
+    # 桩台词不是音轨里的真口播（音轨是 sine），真模型会全滤掉；本测试验证的是
+    # 台词按 start_s 归段，声学过滤由 test_vocal.py 与 test_pipeline.py 覆盖。
+    monkeypatch.setattr(
+        vocal,
+        "analyze",
+        lambda _audio: vocal.VocalAnalysis(
+            windows=[vocal.VocalWindow(0, 24_000, sung=0.0, spoken=0.3, music=0.0)],
+            has_bgm=False,
+        ),
+    )
     pipeline.run(settings, cid, CodexRunner(settings.codex_timeout_s, settings.codex_concurrency))
 
     m = storage.load_meta(settings.data_dir, cid)

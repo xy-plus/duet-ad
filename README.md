@@ -25,7 +25,8 @@ ACCESS_TOKEN=<访问口令> ./run.sh
 ## 结构
 
 ```
-app/            FastAPI 后端：main(路由) config auth storage downloader pipeline codex_runner scenes voice seedance seedance_task(提交脚本) seedream seedream_task(编辑脚本) postprocess(后处理编排) sanitize(公共脱敏)
+app/            FastAPI 后端：main(路由) config auth storage downloader pipeline codex_runner scenes voice vocal(口播声学验证) seedance seedance_task(提交脚本) seedream seedream_task(编辑脚本) postprocess(后处理编排) sanitize(公共脱敏)
+models/         yamnet.tflite（YAMNet 声学分类模型，口播声学验证用，4.1MB 进仓库）
 web/            单页前端（原生 JS，同源 /api/*，由后端 StaticFiles 挂载在 /）
 skills/video-maker/   codex agent 使用的技能（SKILL.md + extract_keyframes/crop_image 两脚本）
 tests/          pytest（conftest 直建 Settings，默认 enable_pipeline=False 不跑流水线）

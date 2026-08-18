@@ -5,3 +5,5 @@ opencv-python-headless>=4.8,<5
 pytest
 httpx
 scenedetect>=0.7
+numpy  # vocal/测试直接 import（此前靠 opencv/litert 传递引入，显式声明）
+ai-edge-litert==2.1.6  # 锁定：声学阈值与推理 API（resize_tensor_input）绑 2.1.6 实测校准

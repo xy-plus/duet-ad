@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import codex_runner, pipeline, storage, voice
+from app import codex_runner, pipeline, storage, vocal, voice
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
@@ -75,6 +75,19 @@ def fake_steps(monkeypatch):
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
     monkeypatch.setattr(CodexRunner, "run", fake_codex)
     return calls
+
+
+@pytest.fixture(autouse=True)
+def fake_vocal_analysis(monkeypatch):
+    """旧口播流水线测试只验证编排；声学算法由 test_vocal.py 和专门集成测试覆盖。"""
+    monkeypatch.setattr(
+        vocal,
+        "analyze",
+        lambda _audio: vocal.VocalAnalysis(
+            windows=[vocal.VocalWindow(0, 1000, sung=0.0, spoken=0.3, music=0.0)],
+            has_bgm=False,
+        ),
+    )
 
 
 # ---------- 产物白名单校验 ----------
@@ -517,6 +530,103 @@ def test_run_voice_none_skips_asr(tmp_path, video_1s, fake_steps):
     (codex_call,) = fake_steps["codex"]
     assert "voice.mp3" not in codex_call["prompt"] and "听写" not in codex_call["prompt"]
     assert not (cdir / "work" / "voice.mp3").exists()
+
+
+def test_run_voice_none_does_not_call_vocal_analyze(tmp_path, video_1s, fake_steps, monkeypatch):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    called = []
+
+    def unexpected(audio):
+        called.append(audio)
+        raise AssertionError("vocal.analyze must not run when voice_mode=none")
+
+    monkeypatch.setattr(vocal, "analyze", unexpected)
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    assert called == []
+    assert storage.load_meta(settings.data_dir, meta["id"])["status"] == "done"
+
+
+def test_run_voice_vocal_filter_records_bgm_and_dropped_count(
+    tmp_path, video_1s, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    lines = [
+        {"text": "口播", "start_s": 0.0, "end_s": 0.3},
+        {"text": "唱歌", "start_s": 0.3, "end_s": 0.6},
+        {"text": "幻觉", "start_s": 0.6, "end_s": 0.9},
+    ]
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(json.dumps(lines), encoding="utf-8")
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        vocal,
+        "analyze",
+        lambda _audio: vocal.VocalAnalysis(
+            windows=[
+                vocal.VocalWindow(0, 300, sung=0.0, spoken=0.3, music=0.2),
+                vocal.VocalWindow(300, 600, sung=0.1, spoken=0.01, music=0.2),
+                vocal.VocalWindow(600, 900, sung=0.01, spoken=0.01, music=0.2),
+            ],
+            has_bgm=True,
+        ),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done"
+    assert stored["voice_lines"] == [lines[0]]
+    assert stored["has_bgm"] is True
+    assert stored["voice_lines_vocal_dropped"] == 2
+
+
+def test_run_voice_vocal_failure_fails_pipeline(tmp_path, video_1s, monkeypatch):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        if "voice.mp3" in prompt:
+            (Path(workdir) / "work" / "voice_lines.json").write_text(
+                json.dumps([{"text": "口播", "start_s": 0.0, "end_s": 0.5}]),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(vocal, "analyze", lambda _audio: (_ for _ in ()).throw(
+        vocal.VocalError("模型校验失败")
+    ))
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "failed"
+    assert "vocal classification unavailable" in stored["error"]
+    assert "模型校验失败" in stored["error"]
 
 
 def test_run_voice_keep_runs_asr_and_stores_lines(tmp_path, video_1s, monkeypatch):

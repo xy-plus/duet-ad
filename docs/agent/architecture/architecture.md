@@ -9,7 +9,7 @@ links: [conversation-task]
 
 # 架构现状（How/Now）
 
-单进程 uvicorn（0.0.0.0:3211）跑 FastAPI，同源挂静态前端；上传即建 `data/<cid>/` 目录，后台任务经管道闸跑「4fps 抽帧 → [口播模式] 抽音轨 + codex 听写 → 场景检测/拆段 → 单段或多段 codex 沙箱 → 白名单校验」，状态落 `meta.json`，前端 2s 轮询。无数据库、无队列——文件系统即存储，内存即任务态。
+单进程 uvicorn（0.0.0.0:3211）跑 FastAPI，同源挂静态前端；上传即建 `data/<cid>/` 目录，后台任务经管道闸跑「4fps 抽帧 → [口播模式] 抽音轨 + codex 听写 + YAMNet 声学验证 → 场景检测/拆段 → 单段或多段 codex 沙箱 → 白名单校验」，状态落 `meta.json`，前端 2s 轮询。无数据库、无队列——文件系统即存储，内存即任务态。
 
 ## 模块
 
@@ -22,6 +22,7 @@ links: [conversation-task]
 | `app/downloader.py` | URL 视频下载（http(s) 直链 / TikTok 经 TikWM 解析）：SSRF 防护（私网 IP 拒绝、DNS pinning、跳转逐次重校验）、大小/超时上限 | conversation-task |
 | `app/pipeline.py` | 处理流水线编排（抽帧 → [口播] codex 听写/洗稿/翻译 → scenes 检测拆段 → 单段/多段 codex 沙箱选帧写 prompt）+ agent 产物白名单校验 | conversation-task |
 | `app/voice.py` | 口播纯函数：ffmpeg 抽音轨 work/voice.mp3、台词 JSON 白名单校验（不装 ASR 库，听写交 codex） | conversation-task |
+| `app/vocal.py` | 口播声学验证：ffmpeg 解码 → YAMNet（AudioSet 521 类，窗长 15600 样本）逐窗推理 → 句级 `spoken/sung/None` 判定 + 整片 BGM 判定；模型 sha256 校验，路径 `YAMNET_MODEL_PATH` 可覆盖 | conversation-task |
 | `app/codex_runner.py` | 沙箱化 `codex exec` 调用（argv、断网、env 清洗、超时、并发信号量） | conversation-task |
 | `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
@@ -44,6 +45,8 @@ flowchart LR
   PL -.->|[口播模式] ffmpeg 抽音轨| VO[work/voice.mp3]
   PL -.->|[口播模式] 沙箱 prompt| VX[codex 听写+洗稿/翻译]
   VX -.->|voice_lines.json| FS
+  PL -.->|[口播模式] YAMNet 逐窗验证| YM[app/vocal.py]
+  YM -.->|仅 spoken 句 + has_bgm| META
   PL -->|python app/scenes.py| SC[scenes.py 场景检测]
   SC -->|scenes.json（segments 拆段建议）| FS
   PL -->|segments 非空: ffmpeg -ss 切段| SEG[work/segments/N/source.mp4]
@@ -148,7 +151,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 
 ## 配置
 
-环境变量（`app/config.py:get_settings()`；`HOST`/`PORT` 在 `run.sh`，`ARK_API_KEY` 在 `app/seedance.py` 直读）：
+环境变量（`app/config.py:get_settings()`；`HOST`/`PORT` 在 `run.sh`，`ARK_API_KEY` 在 `app/seedance.py`、`YAMNET_MODEL_PATH` 在 `app/vocal.py` 直读）：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -167,6 +170,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
 | `ENABLE_PIPELINE` | 生产默认 `1` | 关掉则上传后不跑流水线（停 `queued`） |
 | `HOST` / `PORT` | `0.0.0.0` / `3211` | run.sh 监听地址 |
 | `ARK_API_KEY` | 无 | Seedance 密钥；submit 时缺则 503；只存服务进程环境 |
+| `YAMNET_MODEL_PATH` | `models/yamnet.tflite`（仓库内置） | YAMNet 模型路径覆盖（口播声学验证用；加载前 sha256 校验，文件缺失/不符 → 会话 failed） |
 
 `ENABLE_PIPELINE` 的双默认是测试取向：`Settings` dataclass 字段默认 `False`（测试直建不跑流水线），`get_settings()` 环境默认 `"1"`（生产直跑）。
 
