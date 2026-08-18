@@ -193,7 +193,8 @@ def _detect_face(image: Path, cascade=None) -> bool:
     if img is None:
         return False
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return bool(cascade.detectMultiScale(gray))
+    # bool(数组) 对多元素数组抛 numpy 真值歧义——必须按长度判定（空数组 = 无人脸）
+    return len(cascade.detectMultiScale(gray)) > 0
 
 
 def _build_instruction(options: dict[str, bool], has_face: bool) -> str:

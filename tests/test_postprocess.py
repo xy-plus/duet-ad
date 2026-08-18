@@ -431,6 +431,19 @@ def test_detect_face_real_cv2_pipeline(tmp_path):
     assert postprocess._detect_face(img, FakeCascade([])) is False
 
 
+def test_detect_face_numpy_array_returns(tmp_path):
+    """真实 cascade 返回 numpy 数组：单/多元素数组不得触发 numpy 真值歧义（生产回归）。"""
+    import cv2
+    import numpy as np
+    img = tmp_path / "face.png"
+    cv2.imwrite(str(img), np.zeros((48, 48, 3), dtype=np.uint8))
+    assert postprocess._detect_face(img, FakeCascade(np.array([[10, 10, 20, 20]]))) is True
+    assert postprocess._detect_face(
+        img, FakeCascade(np.array([[1, 1, 5, 5], [30, 30, 10, 10]]))
+    ) is True
+    assert postprocess._detect_face(img, FakeCascade(np.empty((0, 4)))) is False
+
+
 def test_detect_face_undecodable_and_missing_cascade(tmp_path):
     bad = tmp_path / "bad.png"
     bad.write_bytes(b"not an image")
