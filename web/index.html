@@ -71,11 +71,11 @@
         <form id="composer" class="composer" novalidate>
           <div class="source-switch" role="radiogroup" aria-label="视频来源">
             <label class="source-option">
-              <input type="radio" name="source-mode" value="upload" checked>
+              <input type="radio" name="source-mode" value="upload">
               <span>上传视频</span>
             </label>
             <label class="source-option">
-              <input type="radio" name="source-mode" value="link">
+              <input type="radio" name="source-mode" value="link" checked>
               <span>视频链接</span>
             </label>
           </div>
@@ -85,16 +85,6 @@
             <span id="file-chip-size" class="file-chip-size"></span>
             <button type="button" id="file-remove" class="icon-btn icon-btn-sm" aria-label="移除已选文件">
               <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"></use></svg></span>
-            </button>
-          </div>
-          <div class="composer-row">
-            <button type="button" id="attach-btn" class="icon-btn" aria-label="选择视频文件">
-              <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-attach"></use></svg></span>
-            </button>
-            <label class="sr-only" for="note-input">备注</label>
-            <input id="note-input" class="composer-input" type="text" placeholder="备注（可选）：想复刻的镜头重点" autocomplete="off">
-            <button type="submit" id="send-btn" class="send-btn" aria-label="发送" disabled>
-              <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-send"></use></svg></span>
             </button>
           </div>
           <div id="url-row" class="composer-row url-row" hidden>
@@ -110,7 +100,7 @@
             </label>
             <label class="voice-option">
               <input type="radio" name="voice-mode" value="rewrite">
-              <span>原文洗稿</span>
+              <span>原文改编</span>
             </label>
             <label class="voice-option">
               <input type="radio" name="voice-mode" value="translate">
@@ -120,6 +110,16 @@
             <input id="lang-input" class="lang-input" type="text" placeholder="目标语言，如：日语" autocomplete="off" hidden>
           </div>
           <p id="file-hint" class="file-hint">最长 300 秒 · 最大 500MB · MP4/MOV/WebM，或直接拖拽文件到此处</p>
+          <div class="composer-row note-row">
+            <button type="button" id="attach-btn" class="icon-btn" aria-label="选择视频文件">
+              <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-attach"></use></svg></span>
+            </button>
+            <label class="sr-only" for="note-input">备注</label>
+            <input id="note-input" class="composer-input" type="text" placeholder="备注（可选）：想复刻的镜头重点" autocomplete="off">
+            <button type="submit" id="send-btn" class="send-btn" aria-label="发送" disabled>
+              <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-send"></use></svg></span>
+            </button>
+          </div>
           <div id="upload-progress" class="upload-progress" hidden>
             <div class="up-track"><div id="up-fill" class="up-fill"></div></div>
             <span id="up-label" class="up-label">正在上传 0%</span>

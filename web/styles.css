@@ -960,6 +960,9 @@ input { font-family: inherit; }
 
 .url-row .composer-input { height: 38px; font-size: 14px; }
 
+/* 主输入行（备注 + 发送）固定在表单最底：与上方 voice-row / file-hint 留出间距 */
+.note-row { margin-top: 8px; }
+
 .source-switch {
   display: flex;
   gap: 2px;

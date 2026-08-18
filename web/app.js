@@ -22,7 +22,7 @@ const state = {
   objectURLs: [],      // 当前 stream 渲染产生的 blob URL，重渲染前统一 revoke
   ppDetail: null,      // 后处理弹窗对应的会话详情
   ppAskDismissed: {},  // cid → true：后处理入口消息已点「否」（会话内记忆，重渲染不复活）
-  renderedPpRunning: false, // 当前 DOM 是否按后处理 running 态渲染：轮询只刷新动态区的前置条件
+  detailSig: null,     // 当前已渲染详情的状态签名：轮询比对，签名不变不碰 DOM（根治轮询闪烁）
 };
 
 class AuthError extends Error {}
@@ -869,6 +869,34 @@ function renderPpDynamic(detail) {
 }
 
 /* ===== 会话详情 + 轮询 ===== */
+/* 详情状态签名：
+   stable 变（状态机/产物内容变化）→ 全量重渲染一次；
+   仅 dyn 变（后处理 running 时 frames 逐帧增长）→ 只刷新后处理动态区；
+   完全不变 → 什么都不做（连 DOM 都不碰，杜绝每 2s 清空重建媒体引发的闪烁）。
+   dyn 取 postprocess.frames 长度：只有它会在 stable 不变时随轮询增长。 */
+function detailSignature(detail) {
+  const pp = detail.postprocess || null;
+  const segments = Array.isArray(detail.segments) ? detail.segments : [];
+  const segSig = segments.map((seg) => [
+    seg.index,
+    Array.isArray(seg.keyframes) ? seg.keyframes.join(",") : "",
+    seg.prompt || "",
+    Array.isArray(seg.lines) ? seg.lines.join("\n") : "",
+  ].join("§")).join("#");
+  const stable = [
+    detail.status,
+    pp ? pp.status : "",
+    pp && pp.error ? pp.error : "",
+    Array.isArray(detail.keyframes) ? detail.keyframes.join(",") : "",
+    detail.prompt || "",
+    segSig,
+    Array.isArray(detail.voice_lines) ? detail.voice_lines.length : 0,
+    detail.has_video ? 1 : 0,
+  ].join("|");
+  const dyn = pp && Array.isArray(pp.frames) ? pp.frames.length : 0;
+  return { stable, dyn };
+}
+
 async function loadDetail(id, silent) {
   const seq = ++state.detailSeq;
   if (!silent) renderSkeleton();
@@ -876,19 +904,25 @@ async function loadDetail(id, silent) {
     const detail = await apiJSON("/api/conversations/" + encodeURIComponent(id));
     if (seq !== state.detailSeq || state.currentId !== id) return; // 已切换会话
     state.detail = detail;
-    const ppRunning = !!(detail.postprocess && detail.postprocess.status === "running");
-    if (silent && ppRunning && state.renderedPpRunning) {
-      // 后处理 running 轮询：只刷新动态区，稳定区（视频/图片）不重建；进入/离开 running 时全量一次
-      renderPpDynamic(detail);
-    } else {
+    const sig = detailSignature(detail);
+    if (!silent) {
+      // 手动切换 / 首次进入：全量渲染照旧
       renderDetail(detail);
+    } else if (!state.detailSig || sig.stable !== state.detailSig.stable) {
+      // 轮询：stable 变（queued→processing→done、后处理进入/离开 running、产物变化）→ 全量一次
+      renderDetail(detail);
+    } else if (sig.dyn !== state.detailSig.dyn) {
+      // 轮询：仅后处理进度增长 → 只刷动态区，稳定区 <video>/<img> 引用不重建
+      renderPpDynamic(detail);
     }
-    state.renderedPpRunning = ppRunning;
+    // 签名完全不变 → 不碰 DOM（根治轮询闪烁的关键）
+    state.detailSig = sig;
+    const ppRunning = !!(detail.postprocess && detail.postprocess.status === "running");
     if (detail.status === "queued" || detail.status === "processing" || ppRunning) {
       startPolling(id);
     } else {
       stopPolling();
-      refreshList(false); // 终态：同步侧栏徽章
+      refreshList(false); // 终态：同步侧栏徽章（轻量更新，不动 stream）
     }
   } catch (err) {
     if (handleAuthError(err)) return;
@@ -938,7 +972,7 @@ function setComposerError(msg) {
 
 function sourceMode() {
   const checked = document.querySelector('input[name="source-mode"]:checked');
-  return checked ? checked.value : "upload";
+  return checked ? checked.value : "link"; // 与 HTML 默认 checked 一致：默认视频链接
 }
 
 function voiceMode() {
