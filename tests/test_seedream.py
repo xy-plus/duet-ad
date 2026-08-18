@@ -458,6 +458,31 @@ def test_edit_success(tmp_path, monkeypatch):
     assert e.value.status == 409 and e.value.detail == "already edited"
 
 
+def test_edit_relative_paths_resolved(tmp_path, monkeypatch):
+    """相对 cdir/image/out（生产 data_dir=相对 "data" 的形态）→ 入口统一转绝对，
+    子进程 cwd 与 argv 路径不再错位（回归：生产 invalid edit request）。"""
+    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    cdir = tmp_path / "c"
+    cdir.mkdir()
+    image = _png(tmp_path)
+    out = cdir / "edited.png"
+    fake = FakeEdit()
+    monkeypatch.setattr(subprocess, "run", fake)
+    monkeypatch.setenv("ARK_API_KEY", SECRET)
+    monkeypatch.chdir(tmp_path)  # 服务 cwd 形态
+
+    rel_cdir = Path("c")
+    rel_image = Path("in.png")
+    rel_out = Path("c") / "edited.png"
+    result = _edit(settings, rel_cdir, rel_image, "戴上眼镜", rel_out, asyncio.Lock())
+    assert result == cdir / "edited.png"  # 返回绝对
+    assert out.read_bytes() == PNG + b"edited"
+    (dargv, dkw), = fake.calls[:1]
+    assert Path(dargv[dargv.index("--image") + 1]).is_absolute()
+    assert Path(dargv[dargv.index("--out") + 1]).is_absolute()
+    assert Path(dkw["cwd"]).is_absolute()
+
+
 def test_edit_failure_502_sanitized(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, enable_seedream_edit=True)
     cdir = tmp_path / "c"

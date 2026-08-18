@@ -50,6 +50,10 @@ async def edit_image(
         raise SeedreamError(409, "confirmation required")
     if out.exists():
         raise SeedreamError(409, "already edited")
+    # 防御：调用方传相对路径时，dry-run 子进程（cwd=cdir）内相对解析会错位——入口统一转绝对
+    cdir = cdir.resolve()
+    image = image.resolve()
+    out = out.resolve()
     _check_input(image, prompt)
     async with lock:
         if out.exists():

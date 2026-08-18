@@ -86,7 +86,8 @@ async def run_task(
     settings: Settings, cid: str, options: dict[str, bool], lock: asyncio.Lock
 ) -> None:
     """后台任务：逐帧编辑；任一帧失败 → meta.postprocess failed（已成功帧保留，重跑跳过）。"""
-    cdir = settings.data_dir / cid
+    # data_dir 可能是相对路径（生产默认 "data"）：子进程带 cwd 时相对路径会错位，统一起点解析为绝对
+    cdir = (settings.data_dir / cid).resolve()
     frames: list[str] = []
     try:
         meta = storage.load_meta(settings.data_dir, cid)

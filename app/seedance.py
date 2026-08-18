@@ -54,7 +54,8 @@ async def submit(
         meta = storage.load_meta(settings.data_dir, cid)
         if meta is None or meta.get("has_video"):
             raise SubmitError(409, "already submitted")
-        cdir = settings.data_dir / cid
+        # data_dir 可能是相对路径：dry-run/提交子进程带 cwd 时相对路径会错位，统一转绝对（与 pipeline 同口径）
+        cdir = (settings.data_dir / cid).resolve()
         _check_prompt(cdir)
         keyframes = _keyframes(cdir)
         await asyncio.to_thread(_dryrun_check, cdir, keyframes)
