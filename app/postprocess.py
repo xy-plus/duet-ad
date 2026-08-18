@@ -1,9 +1,10 @@
 """Seedream 后处理编排：HTTP 门控 + 后台逐帧编辑。
 
 门控顺序（仿 seedance.submit 模式）：ENABLE_SEEDREAM_EDIT 关 → 501；会话不存在 → 404；
-confirm 非严格 True → 409；四选项至少选一否则 422（非 bool 值 → 422 明确类型错误）；
+confirm 非严格 True → 409；三选项至少选一否则 422（非 bool 值 → 422 明确类型错误）；
 status != done → 409；meta.postprocess 已在 running → 409；上次 done/failed 的 options 与本次
-不同 → 409（防旧产物贴新标签）；锁内复查（running / 产物完整）后置 running。
+不同 → 409（防旧产物贴新标签，锁定比对只认当前 OPTION_KEYS 共有键——旧会话四键
+options 里的废弃键忽略）；锁内复查（running / 产物完整）后置 running。
 后台任务（BackgroundTasks，独立路径不吃管道闸；可并发，每会话一把锁）：
 收集目标帧（单段 work/keyframes/*.png；多段 work/segments/N/work/keyframes/*.png）→ 按勾选选项
 构造中文编辑指令（多选项分号连接；face_hold 为条件式指令——含人脸则捂脸、不含人脸保持原样，
@@ -25,10 +26,9 @@ from app import seedream, storage
 from app.config import Settings
 from app.sanitize import sanitize
 
-OPTION_KEYS = ("change_bg", "face_hold", "remove_subtitle", "remove_brand")
+OPTION_KEYS = ("face_hold", "remove_subtitle", "remove_brand")
 
 _INSTRUCTIONS = {
-    "change_bg": "微调图片的背景和主体，让画面更好看，但是不要做大的改动。保持物品形状和用法完全不变。",
     "face_hold": "如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。",
     "remove_subtitle": "移除图片中的所有字幕、水印和贴纸元素，其余保持不变",
     "remove_brand": "图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变",
@@ -61,7 +61,7 @@ async def start(
     if (meta.get("postprocess") or {}).get("status") == "running":
         raise PostprocessError(409, "already running")
     last = meta.get("postprocess") or {}
-    if last.get("status") in ("done", "failed") and last.get("options") != options:
+    if last.get("status") in ("done", "failed") and not _options_match(last.get("options"), options):
         raise PostprocessError(409, "options changed since last run")
     lock = locks.setdefault(cid, asyncio.Lock())
     async with lock:
@@ -108,6 +108,16 @@ async def run_task(
     except Exception as e:
         post = {"status": "failed", "options": options, "frames": frames, "error": sanitize(str(e))}
     storage.update_meta(settings.data_dir, cid, postprocess=post)
+
+
+def _options_match(last_options: object, options: dict[str, bool]) -> bool:
+    """锁定比对只认当前 OPTION_KEYS 内共有键：旧会话 options 里的废弃键忽略（历史会话可能
+    存四键 options）；上次 options 非 dict（如 None）一律视为不一致。"""
+    if not isinstance(last_options, dict):
+        return False
+    return all(
+        last_options.get(key) == options[key] for key in OPTION_KEYS if key in last_options
+    )
 
 
 def _parse_options(payload: dict) -> dict[str, bool]:
@@ -170,8 +180,6 @@ def _build_instruction(options: dict[str, bool]) -> str:
     parts = []
     if options.get("face_hold"):
         parts.append(_INSTRUCTIONS["face_hold"])
-    if options.get("change_bg"):
-        parts.append(_INSTRUCTIONS["change_bg"])
     if options.get("remove_subtitle"):
         parts.append(_INSTRUCTIONS["remove_subtitle"])
     if options.get("remove_brand"):
