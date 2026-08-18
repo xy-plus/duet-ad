@@ -10,7 +10,8 @@ status != done → 409；meta.postprocess 已在 running → 409；上次 done/f
 条件句放最前，所有帧都发编辑请求，不做人脸预判/过滤）→ 逐帧 seedream.edit_image(confirm=True)
 产出写 work/postprocessed/<帧名>.png 或 work/segments/N/work/postprocessed/<帧名>.png →
 任一帧失败整体 failed（error 指明帧名，已成功帧保留且重跑跳过）→
-meta.postprocess = {status: running|done|failed, options, frames, error}（内部字段）。
+meta.postprocess = {status: running|done|failed, options, frames, error}（内部字段；
+running 期间每成功一帧即写回 frames，前端 2s 轮询据此显示 n/m 实时进度）。
 无人脸帧的编辑输出为近似原图（seedream 条件指令已实证能正确区分），直接存 postprocessed 展示；
 将来可加输入-输出变化判定过滤（见 OPEN_ISSUE）。
 """
@@ -27,7 +28,7 @@ from app.sanitize import sanitize
 OPTION_KEYS = ("change_bg", "face_hold", "remove_subtitle", "remove_brand")
 
 _INSTRUCTIONS = {
-    "change_bg": "微调图片的背景、主体、机位、光线，让画面更好看，但是不要做大的改动。保持物品形状和用法完全不变。",
+    "change_bg": "微调图片的背景和主体，让画面更好看，但是不要做大的改动。保持物品形状和用法完全不变。",
     "face_hold": "如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。",
     "remove_subtitle": "移除图片中的所有字幕、水印和贴纸元素，其余保持不变",
     "remove_brand": "图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变",
@@ -77,7 +78,8 @@ async def start(
 async def run_task(
     settings: Settings, cid: str, options: dict[str, bool], lock: asyncio.Lock
 ) -> None:
-    """后台任务：逐帧编辑；任一帧失败 → meta.postprocess failed（已成功帧保留，重跑跳过）。"""
+    """后台任务：逐帧编辑；任一帧失败 → meta.postprocess failed（已成功帧保留，重跑跳过）；
+    每成功一帧即写回 frames（status 保持 running），供前端轮询显示实时进度。"""
     # data_dir 可能是相对路径（生产默认 "data"）：子进程带 cwd 时相对路径会错位，统一起点解析为绝对
     cdir = (settings.data_dir / cid).resolve()
     frames: list[str] = []
@@ -88,6 +90,7 @@ async def run_task(
         for seg_index, src, out in _targets(cdir, meta):
             if out.is_file():
                 frames.append(_frame_ref(seg_index, out.name))  # 已成功帧保留，重跑不重复扣费
+                _write_progress(settings, cid, options, frames)
                 continue
             try:
                 await seedream.edit_image(
@@ -98,6 +101,7 @@ async def run_task(
             except Exception as e:
                 raise PostprocessError(502, f"frame {out.name} failed: {sanitize(str(e))}") from None
             frames.append(_frame_ref(seg_index, out.name))
+            _write_progress(settings, cid, options, frames)
         post = {"status": "done", "options": options, "frames": frames, "error": None}
     except PostprocessError as e:
         post = {"status": "failed", "options": options, "frames": frames, "error": e.detail}
@@ -150,6 +154,15 @@ def _targets(cdir: Path, meta: dict) -> list[tuple[int | None, Path, Path]]:
 def _frame_ref(seg_index: int | None, name: str) -> str:
     """frames 列表条目：单段 = 帧名；多段 = segments/N/work/postprocessed/帧名。"""
     return name if seg_index is None else f"segments/{seg_index}/work/postprocessed/{name}"
+
+
+def _write_progress(
+    settings: Settings, cid: str, options: dict[str, bool], frames: list[str]
+) -> None:
+    """逐帧写回进度：frames 累计已完成帧，status 保持 running（run_task 是 running 期间唯一写者）。"""
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "running", "options": options, "frames": frames, "error": None,
+    })
 
 
 def _build_instruction(options: dict[str, bool]) -> str:
