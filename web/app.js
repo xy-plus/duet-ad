@@ -22,6 +22,7 @@ const state = {
   objectURLs: [],      // 当前 stream 渲染产生的 blob URL，重渲染前统一 revoke
   ppDetail: null,      // 后处理弹窗对应的会话详情
   ppAskDismissed: {},  // cid → true：后处理入口消息已点「否」（会话内记忆，重渲染不复活）
+  renderedPpRunning: false, // 当前 DOM 是否按后处理 running 态渲染：轮询只刷新动态区的前置条件
 };
 
 class AuthError extends Error {}
@@ -740,14 +741,28 @@ function ppFramesSection(detail, frames) {
   return wrap;
 }
 
-/* 助手消息：running 进行中卡 / done 优化后结果 / failed 错误卡（detail 轮询重渲染自然保持） */
+/* 后处理目标帧总数：多段 = 各段 keyframes 之和；单段 = detail.keyframes 长度 */
+function ppTotalFrames(detail) {
+  const segments = Array.isArray(detail.segments) ? detail.segments : [];
+  if (segments.length > 0) {
+    return segments.reduce((sum, seg) => sum + (Array.isArray(seg.keyframes) ? seg.keyframes.length : 0), 0);
+  }
+  return Array.isArray(detail.keyframes) ? detail.keyframes.length : 0;
+}
+
+/* 助手消息：running 进行中卡 / done 优化后结果 / failed 错误卡（动态区，轮询期间单独重渲染） */
 function renderPpAssistant(detail, pp) {
   const row = el("div", "msg-row");
   row.appendChild(assistantHead(detail.updated_at));
   if (pp.status === "running") {
     const card = el("div", "activity-card");
-    card.appendChild(el("p", "ac-title", "后处理进行中…"));
-    card.appendChild(el("p", "ac-sub", "正在逐帧优化关键帧，通常需要一两分钟"));
+    card.appendChild(el("p", "ac-title", "正在优化素材…"));
+    // 实时进度：n = postprocess.frames 已完成数（后端逐帧写回）；m = 目标帧总数
+    const total = ppTotalFrames(detail);
+    if (total > 0) {
+      const done = Array.isArray(pp.frames) ? pp.frames.length : 0;
+      card.appendChild(el("p", "ac-sub", `已完成 ${done}/${total} 帧（每帧约需 1 分钟）`));
+    }
     const track = el("div", "progress-track");
     track.appendChild(el("div", "progress-fill"));
     card.appendChild(track);
@@ -809,7 +824,7 @@ function renderPpAsk(detail) {
   return row;
 }
 
-/* postprocess 存在即渲染：用户摘要 + 助手消息（renderDetail 全量重渲染，随轮询自然更新） */
+/* postprocess 存在即渲染：用户摘要 + 助手消息（动态区，renderPpDynamic 随轮询更新） */
 function renderPpChat(detail) {
   const pp = detail.postprocess || {};
   if (!pp.status || !pp.options) return null;
@@ -820,6 +835,12 @@ function renderPpChat(detail) {
 }
 
 function renderDetail(detail) {
+  renderStable(detail);
+  renderPpDynamic(detail);
+}
+
+/* 稳定区：用户气泡 + 结果区 + 后处理入口 + 最终视频；中间留 .pp-dynamic 插槽给后处理聊天 */
+function renderStable(detail) {
   clearStream();
   const inner = el("div", "stream-inner");
   inner.appendChild(renderUserBubble(detail));
@@ -831,11 +852,20 @@ function renderDetail(detail) {
     inner.appendChild(renderResults(detail));
     const ppAsk = renderPpAsk(detail);
     if (ppAsk) inner.appendChild(ppAsk);
-    const ppChat = renderPpChat(detail);
-    if (ppChat) inner.appendChild(ppChat);
+    inner.appendChild(el("div", "pp-dynamic"));
     inner.appendChild(renderFinalSection(detail));
   }
   $("stream").appendChild(inner);
+}
+
+/* 动态区：后处理聊天（用户摘要 + 状态卡/结果）。running 轮询期间只重渲染本区，
+   稳定区的 <video>/<img> 引用不重建，避免每 2s 全量重建导致媒体反复重载闪烁 */
+function renderPpDynamic(detail) {
+  const slot = document.querySelector(".pp-dynamic");
+  if (!slot) return;
+  slot.textContent = "";
+  const ppChat = renderPpChat(detail);
+  if (ppChat) slot.appendChild(ppChat);
 }
 
 /* ===== 会话详情 + 轮询 ===== */
@@ -846,9 +876,15 @@ async function loadDetail(id, silent) {
     const detail = await apiJSON("/api/conversations/" + encodeURIComponent(id));
     if (seq !== state.detailSeq || state.currentId !== id) return; // 已切换会话
     state.detail = detail;
-    renderDetail(detail);
-    if (detail.status === "queued" || detail.status === "processing"
-        || (detail.postprocess && detail.postprocess.status === "running")) {
+    const ppRunning = !!(detail.postprocess && detail.postprocess.status === "running");
+    if (silent && ppRunning && state.renderedPpRunning) {
+      // 后处理 running 轮询：只刷新动态区，稳定区（视频/图片）不重建；进入/离开 running 时全量一次
+      renderPpDynamic(detail);
+    } else {
+      renderDetail(detail);
+    }
+    state.renderedPpRunning = ppRunning;
+    if (detail.status === "queued" || detail.status === "processing" || ppRunning) {
       startPolling(id);
     } else {
       stopPolling();

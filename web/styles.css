@@ -338,6 +338,9 @@ input { font-family: inherit; }
 
 .msg-row { margin-bottom: 24px; animation: fadeUp .25s ease both; }
 
+/* 后处理动态区随轮询重渲染，不重放入场动画，避免状态卡每 2s 闪一下 */
+.pp-dynamic .msg-row { animation: none; }
+
 .msg-user { display: flex; justify-content: flex-end; }
 
 .bubble-user {
