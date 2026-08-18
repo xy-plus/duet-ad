@@ -4,7 +4,7 @@
 confirm 非严格 True → 409；三选项至少选一否则 422（非 bool 值 → 422 明确类型错误）；
 status != done → 409；meta.postprocess 已在 running → 409；上次 done/failed 的 options 与本次
 不同 → 409（防旧产物贴新标签，锁定比对只认当前 OPTION_KEYS 共有键——旧会话四键
-options 里的废弃键忽略）；锁内复查（running / 产物完整）后置 running。
+options 里的废弃键忽略；纯废弃形态放行并清旧产物）；锁内复查（running / 产物完整）后置 running。
 后台任务（BackgroundTasks，独立路径不吃管道闸；可并发，每会话一把锁）：
 收集目标帧（单段 work/keyframes/*.png；多段 work/segments/N/work/keyframes/*.png）→ 按勾选选项
 构造中文编辑指令（多选项分号连接；face_hold 为条件式指令——含人脸则捂脸、不含人脸保持原样，
@@ -61,19 +61,20 @@ async def start(
     if (meta.get("postprocess") or {}).get("status") == "running":
         raise PostprocessError(409, "already running")
     last = meta.get("postprocess") or {}
-    if last.get("status") in ("done", "failed"):
-        if not _options_match(last.get("options"), options):
-            raise PostprocessError(409, "options changed since last run")
-        # 纯废弃形态（旧版只勾 change_bg 等）放行重跑：清除旧产物，强制全帧重编辑防贴错标签；
-        # 同选项正常重跑不清产物（跳过逻辑依赖已有输出）
-        if _is_pure_legacy(last.get("options")):
-            _clear_postprocessed(settings.data_dir / cid, meta)
+    if last.get("status") in ("done", "failed") and not _options_match(last.get("options"), options):
+        raise PostprocessError(409, "options changed since last run")
     lock = locks.setdefault(cid, asyncio.Lock())
     async with lock:
         meta = storage.load_meta(settings.data_dir, cid)
         if meta is None or (meta.get("postprocess") or {}).get("status") == "running":
             raise PostprocessError(409, "already running")
         _targets(settings.data_dir / cid, meta)  # 产物完整才受理（帧目录缺失 → 409）
+        # 纯废弃形态（旧版只勾 change_bg 等）放行重跑：清除旧产物，强制全帧重编辑防贴错标签；
+        # 锁内执行（用锁内重载的 meta），避免「清产物后复查失败毁掉旧产物」与并发 stale 读窗口；
+        # 同选项正常重跑不清产物（跳过逻辑依赖已有输出）
+        last_in = meta.get("postprocess") or {}
+        if last_in.get("status") in ("done", "failed") and _is_pure_legacy(last_in.get("options")):
+            _clear_postprocessed(settings.data_dir / cid, meta)
         storage.update_meta(settings.data_dir, cid, postprocess={
             "status": "running", "options": options, "frames": [], "error": None,
         })
@@ -122,7 +123,7 @@ def _options_match(last_options: object, options: dict[str, bool]) -> bool:
     否则该类会话永久 409 无出口。"""
     if not isinstance(last_options, dict):
         return False
-    if not any(last_options.get(key) is True for key in OPTION_KEYS if key in last_options):
+    if _is_pure_legacy(last_options):
         return True
     return all(
         last_options.get(key) == options[key] for key in OPTION_KEYS if key in last_options

@@ -504,3 +504,28 @@ def test_legacy_pure_change_bg_any_new_option_no_409(enabled, monkeypatch):
     })
     r = _post(c, cid, FACE_ONLY)
     assert r.status_code == 200
+
+
+def test_legacy_pure_change_bg_multi_segment_clears_artifacts(enabled, monkeypatch):
+    """多段会话纯废弃形态重跑 → 各段 postprocessed 旧产物同样清除。"""
+    settings, c = enabled
+    cid = _make_conv(settings, segments=True)
+    cdir = settings.data_dir / cid
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+
+    legacy = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": False}
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "failed", "options": legacy, "frames": ["segments/1/work/postprocessed/01.png"], "error": "x",
+    })
+    for n in (1, 2):
+        d = cdir / "work" / "segments" / str(n) / "work" / "postprocessed"
+        d.mkdir(parents=True)
+        (d / "01.png").write_bytes(PNG + b"legacy")
+
+    r = _post(c, cid, OPTIONS_SUB)
+    assert r.status_code == 200
+    for n in (1, 2):
+        d = cdir / "work" / "segments" / str(n) / "work" / "postprocessed"
+        assert not (d / "01.png").exists() or (d / "01.png").read_bytes() == PNG + b"edited"
+    assert len(fake.calls) == 3  # 段1两帧 + 段2一帧全量重编辑

@@ -90,7 +90,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 | 4 | `options` 非对象/三选项全假 | 422 `at least one option required`；选项值非 bool → 422 `options must be booleans` |
 | 5 | `status != "done"` | 409 `artifacts not ready` |
 | 6 | `meta.postprocess.status` 已 `running` | 409 `already running` |
-| 7 | 上次 `done/failed` 的 `options` 与本次不同 | 409 `options changed since last run`（防旧产物贴新标签；同选项重跑照常跳过已有图；锁定比对只认当前三选项与上次 options 的共有键——旧会话四键 options 里的废弃 `change_bg` 键忽略） |
+| 7 | 上次 `done/failed` 的 `options` 与本次不同 | 409 `options changed since last run`（防旧产物贴新标签；同选项重跑照常跳过已有图；锁定比对只认当前三选项与上次 options 的共有键——旧会话四键 options 里的废弃 `change_bg` 键忽略；纯废弃形态（上次在当前键上无任何 True，如旧版只勾 `change_bg`）不 409，放行重跑并清除旧 postprocessed 产物强制全帧重编辑） |
 | 8 | 每会话锁内复查：meta 消失或已在 running | 409 `already running` |
 | 9 | 锁内复查：目标帧目录缺失/为空 | 409 `artifacts not ready` |
 | 10 | 后台逐帧执行中任一帧失败 | 受理后 meta 落 `postprocess.status=failed`，`error` 指明帧名（已成功帧保留） |
