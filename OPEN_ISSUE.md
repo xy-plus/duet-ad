@@ -33,4 +33,4 @@
 - face_hold 条件式指令下无人脸帧输出近似原图直接展示，无输出-输入变化判定过滤；将来可加变化检测判定是否真处理过（用户已确认 seedream 便宜、当前不加）；注意 seedance 提交优先采用 postprocessed 图（app/seedance.py），近似图会替换原帧参与生成。（→ app/postprocess.py）
 - vocal 声学验证 nits（审查裁决不改，记同桶）：group_scores 值域校验在 sha256 门后冗余（可砍 ~6 行）；无重叠窗报错不指明第几句台词；ai_edge_litert 未装时 ImportError 被误报为「声学模型执行失败」；pipeline int() 截断与 vocal round() 毫秒口径不对称（实测无害）。（→ app/vocal.py, app/pipeline.py）
 - 签名 join 分隔符碰撞（keyframes ","、lines "\n"）：理论碰撞但当前状态机不可达（仅随 status=done 原子落盘、轮询期不单独变更），审查降 nit 不改；如改逐字段 JSON.stringify 可彻底消除。（→ web/app.js detailSignature）
-- 后处理速度：批量组图已实测否决（输出不一一对应，语义是生成新图非逐图编辑）；Lite 单图 30.8s（Pro 一半）+ 并发 4 路 ≈ 90s/9 帧方案已调研未实现，待用户指示。（→ app/postprocess.py, app/seedream_task.py）
+- 后处理速度：已并行化（平台级并发上限 `SEEDREAM_CONCURRENCY` 默认 10）+ 提示词强化（尺寸内容不变）+ 输出尺寸保持输入帧宽高比；Lite 模型切换待用户指示。（→ app/postprocess.py, app/config.py）

@@ -41,6 +41,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     edit.add_argument("--prompt", required=True, help="Edit instruction.")
     edit.add_argument("--out", required=True, help="Output PNG path.")
     edit.add_argument("--model", default=DEFAULT_MODEL)
+    edit.add_argument(
+        "--size", default="",
+        help='Output size "WxH" in pixels; omitted = model default (2048 square).',
+    )
     edit.add_argument("--dry-run", action="store_true", help="Validate without network or cost.")
     edit.add_argument(
         "--confirm-submit",
@@ -86,6 +90,7 @@ def submit_edit(
     prompt: str,
     image_bytes: bytes,
     timeout: float,
+    size: str = "",
 ) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -94,6 +99,8 @@ def submit_edit(
         "response_format": RESPONSE_FORMAT,
         "watermark": False,
     }
+    if size:  # 不传 size 时不加入请求体（模型默认 2048 方形）
+        payload["size"] = size
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         EDIT_URL,
@@ -146,6 +153,8 @@ def run_edit(args: argparse.Namespace) -> int:
             "response_format": RESPONSE_FORMAT,
             "watermark": False,
         }
+        if args.size:
+            summary["size"] = args.size
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
     if not args.confirm_submit:
@@ -153,7 +162,7 @@ def run_edit(args: argparse.Namespace) -> int:
             "Live edit blocked. Obtain a separate user confirmation, then add --confirm-submit."
         )
     key = api_key()
-    task = submit_edit(key, args.model, prompt, image_bytes, args.request_timeout)
+    task = submit_edit(key, args.model, prompt, image_bytes, args.request_timeout, args.size)
     save_result(task, args.out)
     print(json.dumps(summarize(task), ensure_ascii=False, indent=2))
     return 0

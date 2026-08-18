@@ -42,8 +42,12 @@ async def edit_image(
     out: Path,
     lock: asyncio.Lock,
     confirm: bool,
+    size: str = "",
 ) -> Path:
-    """按固定顺序过门控（与 seedance.submit 对齐）；同一把锁内重查 out 已存在，防并发重复扣费。"""
+    """按固定顺序过门控（与 seedance.submit 对齐）；同一把锁内重查 out 已存在，防并发重复扣费。
+
+    size = "WxH" 输出尺寸（可选；空串 = 不传，模型默认 2048 方形，方向可能失真）。
+    """
     if not settings.enable_seedream_edit:
         raise SeedreamError(501, "Seedream edit is disabled.")
     if confirm is not True:
@@ -58,10 +62,14 @@ async def edit_image(
     async with lock:
         if out.exists():
             raise SeedreamError(409, "already edited")
-        await asyncio.to_thread(_dryrun_check, cdir, image, prompt, out, settings.seedream_model)
+        await asyncio.to_thread(
+            _dryrun_check, cdir, image, prompt, out, settings.seedream_model, size
+        )
         if not os.environ.get("ARK_API_KEY", "").strip():
             raise SeedreamError(503, "ARK_API_KEY not configured")
-        await asyncio.to_thread(_run_edit, cdir, image, prompt, out, settings.seedream_model)
+        await asyncio.to_thread(
+            _run_edit, cdir, image, prompt, out, settings.seedream_model, size
+        )
         return out
 
 
@@ -71,11 +79,15 @@ def _check_input(image: Path, prompt: str) -> None:
         raise SeedreamError(409, "invalid edit request")
 
 
-def _dryrun_check(cdir: Path, image: Path, prompt: str, out: Path, model: str) -> None:
+def _dryrun_check(
+    cdir: Path, image: Path, prompt: str, out: Path, model: str, size: str = ""
+) -> None:
     """提交前 dry-run 重建请求预检（无网络、无费用，带 --model 保证即真实请求形态）；构建失败等同无效请求。"""
     argv = [sys.executable, str(_SCRIPT), "edit",
             "--image", str(image), "--prompt", prompt, "--out", str(out),
             "--model", model, "--dry-run"]
+    if size:
+        argv += ["--size", size]
     try:
         r = subprocess.run(
             argv, cwd=cdir, capture_output=True, text=True, timeout=_DRYRUN_TIMEOUT_S
@@ -89,11 +101,15 @@ def _dryrun_check(cdir: Path, image: Path, prompt: str, out: Path, model: str) -
         raise SeedreamError(409, "invalid edit request")
 
 
-def _run_edit(cdir: Path, image: Path, prompt: str, out: Path, model: str) -> None:
+def _run_edit(
+    cdir: Path, image: Path, prompt: str, out: Path, model: str, size: str = ""
+) -> None:
     """真实提交：argv 列表、无 shell、env 缺省继承服务进程、600s 超时（同步单请求）。"""
     argv = [sys.executable, str(_SCRIPT), "edit",
             "--image", str(image), "--prompt", prompt, "--out", str(out),
             "--model", model, "--confirm-submit"]
+    if size:
+        argv += ["--size", size]
     try:
         r = subprocess.run(
             argv, cwd=cdir, capture_output=True, text=True, timeout=_SUBMIT_TIMEOUT_S

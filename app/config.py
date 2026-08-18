@@ -11,6 +11,8 @@ class Settings:
     enable_seedance_submit: bool = False
     enable_seedream_edit: bool = False
     seedream_model: str = "doubao-seedream-5-0-pro-260628"
+    # Seedream 后处理逐帧并行提交的平台级并发上限（asyncio 信号量，跨会话全局）
+    seedream_concurrency: int = 10
     data_dir: Path = Path("data")
     codex_timeout_s: int = 1800
     codex_concurrency: int = 10
@@ -34,6 +36,7 @@ def get_settings() -> Settings:
         enable_seedance_submit=os.environ.get("ENABLE_SEEDANCE_SUBMIT", "").lower() in ("1", "true", "yes"),
         enable_seedream_edit=os.environ.get("ENABLE_SEEDREAM_EDIT", "").lower() in ("1", "true", "yes"),
         seedream_model=os.environ.get("SEEDREAM_MODEL", "doubao-seedream-5-0-pro-260628"),
+        seedream_concurrency=int(os.environ.get("SEEDREAM_CONCURRENCY", "10")),
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),

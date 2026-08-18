@@ -112,6 +112,25 @@ def test_dry_run_empty_prompt(tmp_path):
         seedream_task.run_edit(args)
 
 
+def test_dry_run_size_in_summary(tmp_path, capsys):
+    args = seedream_task.parse_args(
+        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
+         "--out", str(tmp_path / "o.png"), "--size", "1440x2560", "--dry-run"]
+    )
+    assert seedream_task.run_edit(args) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["size"] == "1440x2560"
+
+
+def test_dry_run_no_size_omits_summary_key(tmp_path, capsys):
+    args = seedream_task.parse_args(
+        ["edit", "--image", str(_png(tmp_path)), "--prompt", "p",
+         "--out", str(tmp_path / "o.png"), "--dry-run"]
+    )
+    assert seedream_task.run_edit(args) == 0
+    assert "size" not in json.loads(capsys.readouterr().out)
+
+
 # ---------- 机械门控与密钥 ----------
 
 def test_live_without_confirm_blocked(tmp_path, monkeypatch):
@@ -214,10 +233,32 @@ def test_full_chain_success_b64(tmp_path, monkeypatch, capsys):
     assert body["image"] == [f"data:image/png;base64,{base64.b64encode(src).decode('ascii')}"]
     assert body["response_format"] == "b64_json"
     assert body["watermark"] is False
+    assert "size" not in body  # 不传 size：请求体无该键（模型默认 2048 方形）
 
     # b64 解码落盘 + stdout 打响应摘要（不塞图字节）
     assert out.read_bytes() == img
     assert "image_bytes" in capsys.readouterr().out
+
+
+def test_full_chain_size_in_request_body(tmp_path, monkeypatch, capsys):
+    """--size "WxH" 时请求体含 size 键（真实提交透传，保持输入帧宽高比）。"""
+    monkeypatch.setenv("ARK_API_KEY", SECRET)
+    out = tmp_path / "edited.png"
+    img = PNG + b"edited-image-bytes"
+    b64 = base64.b64encode(img).decode("ascii")
+    calls = _fake_ark(monkeypatch, [
+        {"model": "doubao-seedream-5-0-pro-260628", "created": 1758200023,
+         "data": [{"b64_json": b64}]},
+    ])
+    args = seedream_task.parse_args(
+        ["edit", "--image", str(_png(tmp_path)), "--prompt", "戴上眼镜",
+         "--out", str(out), "--confirm-submit", "--size", "1440x2560"]
+    )
+    assert seedream_task.run_edit(args) == 0
+    (req, _), = calls
+    body = json.loads(req.data.decode("utf-8"))
+    assert body["size"] == "1440x2560"
+    assert out.read_bytes() == img
 
 
 @pytest.mark.parametrize("payload", [
@@ -307,8 +348,10 @@ class FakeEdit:
         return [c for c in self.calls if "--dry-run" not in c[0]]
 
 
-def _edit(settings, cdir, image, prompt, out, lock, confirm=True):
-    return asyncio.run(seedream.edit_image(settings, cdir, image, prompt, out, lock, confirm))
+def _edit(settings, cdir, image, prompt, out, lock, confirm=True, size=""):
+    return asyncio.run(
+        seedream.edit_image(settings, cdir, image, prompt, out, lock, confirm, size=size)
+    )
 
 
 def test_seedream_error_shape():
@@ -458,6 +501,24 @@ def test_edit_success(tmp_path, monkeypatch):
     assert e.value.status == 409 and e.value.detail == "already edited"
 
 
+def test_edit_size_in_argv(tmp_path, monkeypatch):
+    """size 非空：dry-run 预检与真实提交 argv 都带 --size；size 空串（默认）：argv 不带 --size。"""
+    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    cdir = tmp_path / "c"
+    cdir.mkdir()
+    image = _png(tmp_path)
+    fake = FakeEdit()
+    monkeypatch.setattr(subprocess, "run", fake)
+    monkeypatch.setenv("ARK_API_KEY", SECRET)
+
+    _edit(settings, cdir, image, "p", cdir / "a.png", asyncio.Lock(), size="1440x2560")
+    for argv, _ in fake.calls[:2]:  # dry-run + 真实提交
+        assert argv[argv.index("--size") + 1] == "1440x2560"
+
+    _edit(settings, cdir, image, "p", cdir / "b.png", asyncio.Lock())
+    assert all("--size" not in argv for argv, _ in fake.calls[2:])
+
+
 def test_edit_relative_paths_resolved(tmp_path, monkeypatch):
     """相对 cdir/image/out（生产 data_dir=相对 "data" 的形态）→ 入口统一转绝对，
     子进程 cwd 与 argv 路径不再错位（回归：生产 invalid edit request）。"""
@@ -583,3 +644,13 @@ def test_get_settings_seedream_env(monkeypatch):
     settings = get_settings()
     assert settings.enable_seedream_edit is True
     assert settings.seedream_model == "doubao-seedream-custom"
+
+
+def test_settings_seedream_concurrency_default(tmp_path):
+    settings = make_settings(tmp_path)
+    assert settings.seedream_concurrency == 10
+
+
+def test_get_settings_seedream_concurrency_env(monkeypatch):
+    monkeypatch.setenv("SEEDREAM_CONCURRENCY", "3")
+    assert get_settings().seedream_concurrency == 3
