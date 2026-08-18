@@ -50,6 +50,8 @@ def create_app(settings: Settings) -> FastAPI:
     create_lock = threading.Lock()
     submit_locks: dict[str, asyncio.Lock] = {}
     postprocess_locks: dict[str, asyncio.Lock] = {}
+    # Seedream 后处理并行提交的进程级信号量：单进程内跨会话全局并发上限（SEEDREAM_CONCURRENCY）
+    seedream_sem = asyncio.Semaphore(settings.seedream_concurrency)
 
     def run_pipeline_gated(cid: str) -> None:
         with pipeline_sem:
@@ -191,7 +193,7 @@ def create_app(settings: Settings) -> FastAPI:
         except postprocess.PostprocessError as e:
             raise HTTPException(status_code=e.status, detail=e.detail) from e
         background_tasks.add_task(
-            postprocess.run_task, settings, cid, options, postprocess_locks[cid]
+            postprocess.run_task, settings, cid, options, seedream_sem
         )
         return {"status": "running", "frames": []}
 

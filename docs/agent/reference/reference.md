@@ -79,7 +79,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 ### `POST /api/conversations/{cid}/postprocess`（T5b，默认 501）
 
 - 请求：JSON `{"options": {"face_hold": bool, "remove_subtitle": bool, "remove_brand": bool}, "confirm": true}`；三选项至少一个为真，否则 422 `at least one option required`；选项值非 bool → 422 `options must be booleans`；未知键忽略（旧客户端残留的 `change_bg` 静默丢弃）
-- 成功 200 → `{"status": "running", "frames": []}`（受理即返回；后台逐帧编辑，结果经 detail 的 `postprocess` 字段轮询，复用 2s 轮询；终态 `{status: "done"|"failed", options, frames, error}`）
+- 成功 200 → `{"status": "running", "frames": []}`（受理即返回；后台并行逐帧编辑，结果经 detail 的 `postprocess` 字段轮询，复用 2s 轮询；终态 `{status: "done"|"failed", options, frames, error}`）
 - 门控矩阵（`postprocess.start`，**固定顺序**）：
 
 | 序 | 条件 | 状态码 / detail |
@@ -93,14 +93,15 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 | 7 | 上次 `done/failed` 的 `options` 与本次不同 | 409 `options changed since last run`（防旧产物贴新标签；同选项重跑照常跳过已有图；锁定比对只认当前三选项与上次 options 的共有键——旧会话四键 options 里的废弃 `change_bg` 键忽略；纯废弃形态（上次在当前键上无任何 True，如旧版只勾 `change_bg`）不 409，放行重跑并清除旧 postprocessed 产物强制全帧重编辑） |
 | 8 | 每会话锁内复查：meta 消失或已在 running | 409 `already running` |
 | 9 | 锁内复查：目标帧目录缺失/为空 | 409 `artifacts not ready` |
-| 10 | 后台逐帧执行中任一帧失败 | 受理后 meta 落 `postprocess.status=failed`，`error` 指明帧名（已成功帧保留） |
+| 10 | 后台逐帧执行中任一帧失败 | 受理后 meta 落 `postprocess.status=failed`，`error` 列失败帧名（其余帧照常跑完；已成功帧保留） |
 
-- 后台任务（`postprocess.run_task`，BackgroundTasks，独立路径不吃管道闸；每会话一把锁，可跨会话并发）：
+- 后台任务（`postprocess.run_task`，BackgroundTasks，独立路径不吃管道闸；每会话一把锁管门控，逐帧编辑经进程级信号量 `SEEDREAM_CONCURRENCY` 限并发——单个 uvicorn 进程内跨会话共享，多 worker 部署时每进程独立限额）：
   - 收集目标帧：单段 = `work/keyframes/*.png`；多段 = `work/segments/N/work/keyframes/*.png`（N 来自 `meta.segments`）
-  - 每帧按勾选选项构造中文编辑指令（多选项用 `；` 连接）：含人脸遮挡「如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。」（条件式指令，由 Seedream 自己判断有无脸；多选项时条件句放最前）；去字幕水印「移除图片中的所有字幕、水印和贴纸元素，其余保持不变」；去版权物品「图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变」
+  - 每帧按勾选选项构造中文编辑指令（多选项用 `；` 连接）：含人脸遮挡「如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。」（条件式指令，由 Seedream 自己判断有无脸；多选项时条件句放最前）；去字幕水印「移除图片中的所有字幕、水印和贴纸元素，其余（尺寸、内容等）保持不变」；去版权物品「图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余（尺寸、内容等）保持不变」
   - 所有目标帧都发编辑请求（不做人脸预判/过滤）：无人脸帧由 Seedream 按条件指令输出近似原图，直接存 postprocessed 展示；将来可加输出-输入变化判定过滤（见 OPEN_ISSUE）
-  - 逐帧调用 `seedream.edit_image(..., confirm=True)`（路由层已校验 confirm）；产出 `work/postprocessed/<帧名>.png`（单段）或 `work/segments/N/work/postprocessed/<帧名>.png`（多段）；已存在的输出跳过（重跑不重复扣费）
-  - 任一帧失败 → 整体 failed（`error` 指明帧名，脱敏 ≤300 字）；已成功帧保留；`meta.postprocess.frames` 记有优化版的帧名列表（单段 = 帧名；多段 = `segments/N/work/postprocessed/帧名` 全形路径，与 files 白名单路径同形，前端按段前缀过滤展示）
+  - 未跳过帧经 `asyncio.gather(return_exceptions=True)` **并行**调用 `seedream.edit_image(..., confirm=True, size=...)`（路由层已校验 confirm；`size` 为按帧实际像素等比放大到 ≥3,686,400 像素的 `"WxH"`——如 720×1280 → `1440x2560`——不传时模型默认 2048 方形、方向可能失真；cv2 读不出的帧不传 size）；产出 `work/postprocessed/<帧名>.png`（单段）或 `work/segments/N/work/postprocessed/<帧名>.png`（多段）；已存在的输出跳过（重跑不重复扣费）
+  - 任一帧失败 → 整体 failed（`error` 列失败帧名，脱敏 ≤300 字）；其余帧照常跑完，已成功帧保留；`meta.postprocess.frames` 记有优化版的帧名列表（单段 = 帧名；多段 = `segments/N/work/postprocessed/帧名` 全形路径，与 files 白名单路径同形，前端按段前缀过滤展示；终态列表为字典序 `sorted(frames)`——段 ≥10 时 `segments/10` 排 `segments/2` 前，前端按段前缀过滤不受影响——与并发完成顺序无关）
+  - running 期间每成功一帧即写回 `frames`（单协程 gather 回调串行执行，无写竞态），前端 2s 轮询据此显示 n/m 实时进度
 - 幂等：`meta.postprocess.status == "running"` 时再提交一律 409；锁常驻内存，进程重启即失效；done/failed 后可重跑（已有优化图跳过）
 
 ### `POST /api/conversations/{cid}/submit`（预留，默认 501）
@@ -129,7 +130,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 ## 公开接口（Python 模块）
 
 - `app.config.get_settings() -> Settings` — 读环境变量建配置；缺 `ACCESS_TOKEN` 抛 RuntimeError
-- `app.config.Settings` — frozen dataclass，13 字段（见架构配置表）；直建默认 `enable_pipeline=False`
+- `app.config.Settings` — frozen dataclass，14 字段（见架构配置表）；直建默认 `enable_pipeline=False`
 - `app.auth.require_auth(request, cred)` — FastAPI 依赖，Bearer 校验
 - `app.main.create_app(settings) -> FastAPI` — 应用工厂（测试注入用）；模块级 `app = create_app(get_settings())`
 - `app.storage.new_conversation(data_dir, note, orig_name, client_request_id="", voice_mode="none", target_language="") -> dict` — 建目录 + 初始 meta（status=queued）；幂等键/目标语言非空才落 meta，`voice_mode` 恒落
@@ -150,9 +151,10 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 - `app.pipeline.run(settings, cid, runner)` — 后台任务入口；任何失败 → `failed`+`error`，不抛
 - `app.pipeline.validate_work_dir(work) -> (list[str], str)` — agent 产物白名单校验，返回 (关键帧名, prompt)
 - `app.pipeline.attribute_lines(lines, segments) -> dict[int, list[dict]]` — 台词按 start_s 落入段 [start_s, end_s) 归段（恰在边界归后段；超出末段终点 ≤0.01s 浮点误差归末段，更远不归段），返回 {index: [台词]}
-- `app.seedream.edit_image(settings, cdir, image, prompt, out, lock, confirm) -> Path` — 编辑门控纯函数：三重门控（开关/confirm/并发锁，confirm 须严格 True）+ dry-run 预检 + 真实提交；失败抛 `SeedreamError(status, detail)`
+- `app.seedream.edit_image(settings, cdir, image, prompt, out, confirm, size="") -> Path` — 编辑门控纯函数：开关 + confirm 门控（confirm 须严格 True）+ 入口 out 已存在 409 + dry-run 预检 + 真实提交；不自带并发锁（同 out 仅一次提交由 postprocess 编排保证）；`size`（`"WxH"`，可选）非空时 dry-run 与真实提交 argv 均带 `--size`；失败抛 `SeedreamError(status, detail)`
 - `app.postprocess.start(settings, cid, payload, locks) -> dict` — 后处理门控（换选项重跑 409）+ 置 `meta.postprocess=running`；返回勾选选项（路由层据此调度后台任务）；失败抛 `PostprocessError(status, detail)`
-- `app.postprocess.run_task(settings, cid, options, lock)` — 后处理后台任务：收集目标帧、条件式指令构造、逐帧 `seedream.edit_image(confirm=True)`、写 `meta.postprocess` 终态；不抛
+- `app.postprocess.run_task(settings, cid, options, sem)` — 后处理后台任务：收集目标帧、条件式指令构造、未跳过帧 gather 并行 `seedream.edit_image(confirm=True, size=按帧像素等比放大的 "WxH")`（`sem` 为进程级信号量）、写 `meta.postprocess` 终态（含父任务取消时写 failed(error=cancelled) 后继续传播取消）；不抛
+- `app.postprocess._fit_size(w, h) -> str` — 等比放大到 ≥3,686,400 像素保持宽高比：`scale = ceil(sqrt(3686400/(w*h)))`，返回 `"WxH"`（如 720×1280 → `1440x2560`）
 - `app.pipeline.FACE_HOLD_CONDITION_LINE` — 捂脸配套条件动作行，后端机械加进 prompt（所有模式；多段模式排在「不要生成背景音乐」行之后）
 - `app.sanitize.sanitize(text, limit=300) -> str` — 公共脱敏（seedance/seedream/postprocess 共用）：删含 key|authorization 的行 + 抹 `ARK_API_KEY` 字面值 + 截断
 - `app.codex_runner.CodexRunner(timeout_s, concurrency)` — `.build_argv(workdir, prompt)` / `.run(workdir, prompt)`；`CodexError` 包装超时/非零/找不到二进制
@@ -208,5 +210,5 @@ scenes.json（`work/scenes.json`，`app/scenes.py` 产物）：
 - 模型：`models/yamnet.tflite`（4.1MB，进仓库即部署自带；AudioSet 521 类；加载前 sha256 校验；环境变量 `YAMNET_MODEL_PATH` 可覆盖默认路径）
 
 口播声学验证环节（`voice_mode≠none`，codex 听写校验之后）：对 work/voice.mp3 跑 `app.vocal.analyze`（YAMNet 521 类逐窗推理，窗长 15600 样本），每句 `classify_segment` 只保留 `"spoken"`，`"sung"` 与 None（无人声证据的假转录）丢弃并计 `voice_lines_vocal_dropped`；同时判整片 BGM 落 `has_bgm`。验证失败 → 整体 `failed`（`vocal classification unavailable: <原因>`），不静默降级。类索引与判定阈值照搬 TrendScout 盘上实测校准（2026-07-28），不自行调参。
-- 技能脚本：`skills/video-maker/scripts/extract_keyframes.py`（`--fps`/`--times`/`--sample-count`/`--prefix`/`--columns`/`--out-dir`）、`skills/video-maker/scripts/crop_image.py`（裁字幕/水印）；提交脚本 `app/seedance_task.py`（`create --dry-run|--confirm-submit --wait`，模型默认 `doubao-seedance-2-0-260128`，Ark `https://ark.cn-beijing.volces.com/api/v3`）；编辑脚本 `app/seedream_task.py`（`edit --dry-run|--confirm-submit`，模型默认 `doubao-seedream-5-0-pro-260628`，实测契约：JSON 图生图 POST `https://ark.cn-beijing.volces.com/api/v3/images/generations`，`image` 为 data URI 字符串数组，同步 200 返回 `data[0].b64_json`（缺失/为空/非法即失败退出））；场景脚本 `app/scenes.py`（`<video> --work-dir <work>`，PySceneDetect 场景检测 + 拆段建议，写 scenes.json）
+- 技能脚本：`skills/video-maker/scripts/extract_keyframes.py`（`--fps`/`--times`/`--sample-count`/`--prefix`/`--columns`/`--out-dir`）、`skills/video-maker/scripts/crop_image.py`（裁字幕/水印）；提交脚本 `app/seedance_task.py`（`create --dry-run|--confirm-submit --wait`，模型默认 `doubao-seedance-2-0-260128`，Ark `https://ark.cn-beijing.volces.com/api/v3`）；编辑脚本 `app/seedream_task.py`（`edit --dry-run|--confirm-submit [--size WxH]`，模型默认 `doubao-seedream-5-0-pro-260628`，实测契约：JSON 图生图 POST `https://ark.cn-beijing.volces.com/api/v3/images/generations`，`image` 为 data URI 字符串数组，`size` 可选（不传不加入请求体，模型默认 2048 方形），同步 200 返回 `data[0].b64_json`（缺失/为空/非法即失败退出））；场景脚本 `app/scenes.py`（`<video> --work-dir <work>`，PySceneDetect 场景检测 + 拆段建议，写 scenes.json）
 - 流水线固定参数：抽帧 `--fps 4`（分页联系表落 `work/`；段内落 `work/segments/N/work/`）；scenes 检测超时 300s；拆段切分 `ffmpeg -ss <start> -i <src> -to <len>` 重编码落 `work/segments/N/source.mp4`（切出时长与边界误差 <0.1s）；提交建模 `9:16 / 15s / 720p / --generate-audio / --no-watermark`（提交时现构建，无评审 payload）
