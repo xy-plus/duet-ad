@@ -14,7 +14,7 @@ description: 用户提供一段参考视频（任意类别）；抽帧由外部�
   - `NN_frame_*.png`：按每秒 4 帧抽取的全部帧
   - `contact_sheet_01.jpg、02.jpg …`：分页联系表
   - `manifest.json`：源视频时长、尺寸、帧率、总帧数
-  - `scenes.json`：全片场景划分清单（可选：每场景起止时间与帧分组、拆段边界）
+  - `scenes.json`：场景划分清单（可选：每场景起止时间与帧分组）
   - `voice_lines.json`：台词（可选：JSON 数组 `[{"text", "start_s", "end_s"}]`）
 - 输出（固定路径）：
   - `work/keyframes/01.png、02.png … N.png`：选定的关键帧，按时间序命名

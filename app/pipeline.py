@@ -6,7 +6,7 @@ codex 听写台词（voice_lines.json 白名单校验，落 meta.voice_lines）�
 - 单段模式（segments 空）：codex 沙箱按 SKILL.md 选帧/写 prompt → 后端白名单校验 →
   meta 落盘（work/keyframes + work/prompt.txt，不加前缀）。
 - 多段模式（segments 非空）：ffmpeg 按段边界切源视频（work/segments/N/source.mp4，
-  N 从 1 起），每段独立走抽帧 → codex 分段 prompt → 校验 → 后端机械操作在 prompt 开头加
+  N 从 1 起），每段独立走抽帧 → codex prompt（单段/多段共用） → 校验 → 后端机械操作在 prompt 开头加
   「不要生成背景音乐」行；段间 ThreadPoolExecutor 并发（每段目录独立，CodexRunner 自带
   信号量兜底）；meta.voice_lines 按 start_s 归段（[start_s, end_s) 口径，恰在边界归后段），
   每段写 work/segments/N/work/voice_lines.json；任一段失败 → 整体 failed（error 指明段号）；
@@ -98,7 +98,7 @@ def validate_work_dir(work: Path) -> tuple[list[str], str]:
 
 
 def _hard_rules(cdir: Path) -> str:
-    """codex prompt 硬性禁令四条（口播/选帧/分段各步共用）。"""
+    """codex prompt 硬性禁令四条（口播/选帧各步共用）。"""
     return f"""硬性禁令：
 - 运行 Python 脚本一律用 {sys.executable}（系统 python3 缺 cv2）。
 - 只在 {cdir} 内创建/修改文件。
