@@ -27,7 +27,7 @@ from app.sanitize import sanitize
 OPTION_KEYS = ("change_bg", "face_hold", "remove_subtitle", "remove_brand")
 
 _INSTRUCTIONS = {
-    "change_bg": "将图片背景更换为简洁干净的背景，保持主体人物与物品不变",
+    "change_bg": "微调图片的背景、主体、机位、光线，让画面更好看，但是不要做大的改动。保持物品形状和用法完全不变。",
     "face_hold": "如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。",
     "remove_subtitle": "移除图片中的所有字幕、水印和贴纸元素，其余保持不变",
     "remove_brand": "图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变",
