@@ -42,6 +42,7 @@ _INSTRUCTIONS = {
 # Seedream size 参数下限（像素数）；不传 size 时模型输出 2048 方形（方向可能失真），
 # 故按输入帧尺寸等比放大到 ≥ 下限保持宽高比（实测 1440×2560 可用，无需 16 对齐）
 _SEEDREAM_MIN_PIXELS = 3_686_400
+_SEEDREAM_MAX_PIXELS = 4_624_220  # Ark 实测：超上限 400「image area must be at most 4624220 pixels」
 
 
 class PostprocessError(Exception):
@@ -187,9 +188,17 @@ def _read_size(src: Path) -> str:
 
 
 def _fit_size(w: int, h: int) -> str:
-    """等比放大到 Seedream size 下限（≥3,686,400 像素）保持宽高比：scale = ceil(sqrt(下限/(w*h)))。"""
-    scale = math.ceil(math.sqrt(_SEEDREAM_MIN_PIXELS / (w * h)))
-    return f"{w * scale}x{h * scale}"
+    """输出尺寸落在 Ark 合法面积区间 [3,686,400, 4,624,220]：原图已在区间 → 原尺寸不动；
+    否则等比缩放（浮点 scale，非整数倍）到下限附近——整数 ceil 倍会远超上限（1080×1920→
+    2160×3840=8.29MP 实测 400），round 亏空则加宽一维补足（最多几个像素）。"""
+    area = w * h
+    if _SEEDREAM_MIN_PIXELS <= area <= _SEEDREAM_MAX_PIXELS:
+        return f"{w}x{h}"
+    scale = math.sqrt(_SEEDREAM_MIN_PIXELS / area)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    while nw * nh < _SEEDREAM_MIN_PIXELS:  # round 舍入亏空（极小，通常一次即足）
+        nw += 1
+    return f"{nw}x{nh}"
 
 
 def _options_match(last_options: object, options: dict[str, bool]) -> bool:

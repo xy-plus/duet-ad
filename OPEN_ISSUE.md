@@ -34,4 +34,4 @@
 - vocal 声学验证 nits（审查裁决不改，记同桶）：group_scores 值域校验在 sha256 门后冗余（可砍 ~6 行）；无重叠窗报错不指明第几句台词；ai_edge_litert 未装时 ImportError 被误报为「声学模型执行失败」；pipeline int() 截断与 vocal round() 毫秒口径不对称（实测无害）。（→ app/vocal.py, app/pipeline.py）
 - 签名 join 分隔符碰撞（keyframes ","、lines "\n"）：理论碰撞但当前状态机不可达（仅随 status=done 原子落盘、轮询期不单独变更），审查降 nit 不改；如改逐字段 JSON.stringify 可彻底消除。（→ web/app.js detailSignature）
 - 后处理速度：已并行化（进程级并发上限 `SEEDREAM_CONCURRENCY` 默认 10，单 uvicorn 进程内跨会话共享）+ 提示词强化（尺寸内容不变）+ 输出尺寸保持输入帧宽高比；Lite 模型切换待用户指示。（→ app/postprocess.py, app/config.py）
-- 后处理已修：`SEEDREAM_CONCURRENCY` 钳制 ≥1、父任务取消写 failed(error=cancelled)、seedream_task.save_result 原子落盘（临时文件 + os.replace）；`_fit_size` 整数 scale 使 1920×1080 → 3840×2160（8.29MP），该尺寸未经真实 API 验证，集成后需实测一次。（→ app/postprocess.py, app/seedream_task.py）
+- 后处理已修：`SEEDREAM_CONCURRENCY` 钳制 ≥1、父任务取消写 failed(error=cancelled)、seedream_task.save_result 原子落盘（临时文件 + os.replace）；`_fit_size` 实测发现 Ark size 上限 4,624,220 像素（2160×3840 提交 400），已改为浮点 scale 落在合法区间 [3,686,400, 4,624,220]（1080×1920 → 1440×2560）。（→ app/postprocess.py, app/seedream_task.py）

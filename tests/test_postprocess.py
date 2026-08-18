@@ -538,20 +538,21 @@ def test_legacy_pure_change_bg_multi_segment_clears_artifacts(enabled, monkeypat
 # ---------- 输出尺寸：_fit_size 与 run_task 透传 ----------
 
 def test_fit_size_min_pixels_floor():
-    """已 ≥3,686,400 像素（1920×1920 恰好达标）不放大。"""
+    """面积已在合法区间 [3,686,400, 4,624,220]（1920×1920 恰下限、2048×2048 区间内）不缩放。"""
     assert postprocess._fit_size(1920, 1920) == "1920x1920"
     assert postprocess._fit_size(2048, 2048) == "2048x2048"
 
 
 @pytest.mark.parametrize("w,h,expected", [
-    (720, 1280, "1440x2560"),   # 竖屏 9:16 帧
+    (720, 1280, "1440x2560"),   # 竖屏 9:16 帧（scale 恰 2，恰好下限）
     (1280, 720, "2560x1440"),   # 横屏 16:9 帧
-    (1080, 1920, "2160x3840"),  # 1080p 竖屏
-    (1920, 1080, "3840x2160"),  # 1080p 横屏
-    (640, 480, "2560x1920"),    # 非整数平方根向上取整（sqrt(12)≈3.46 → 4）
+    (1080, 1920, "1440x2560"),  # 1080p 竖屏：浮点 scale≈1.333 恰下限（ceil 版 2160×3840=8.29MP 实测 400 超上限）
+    (1920, 1080, "2560x1440"),  # 1080p 横屏
+    (640, 480, "2217x1663"),    # 非整数 scale（sqrt(12)≈3.464，round 后 3,686,871 达标）
+    (4096, 4096, "1920x1920"),  # 超大图缩到下限
 ])
 def test_fit_size_scales_up_keeping_aspect_ratio(w, h, expected):
-    """等比放大到 ≥3,686,400 像素且保持宽高比（scale = ceil(sqrt(下限/(w*h)))）。"""
+    """输出面积落在 Ark 合法区间 [3,686,400, 4,624,220] 且保持宽高比（浮点 scale 非整数倍）。"""
     assert postprocess._fit_size(w, h) == expected
 
 

@@ -154,7 +154,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 - `app.seedream.edit_image(settings, cdir, image, prompt, out, confirm, size="") -> Path` — 编辑门控纯函数：开关 + confirm 门控（confirm 须严格 True）+ 入口 out 已存在 409 + dry-run 预检 + 真实提交；不自带并发锁（同 out 仅一次提交由 postprocess 编排保证）；`size`（`"WxH"`，可选）非空时 dry-run 与真实提交 argv 均带 `--size`；失败抛 `SeedreamError(status, detail)`
 - `app.postprocess.start(settings, cid, payload, locks) -> dict` — 后处理门控（换选项重跑 409）+ 置 `meta.postprocess=running`；返回勾选选项（路由层据此调度后台任务）；失败抛 `PostprocessError(status, detail)`
 - `app.postprocess.run_task(settings, cid, options, sem)` — 后处理后台任务：收集目标帧、条件式指令构造、未跳过帧 gather 并行 `seedream.edit_image(confirm=True, size=按帧像素等比放大的 "WxH")`（`sem` 为进程级信号量）、写 `meta.postprocess` 终态（含父任务取消时写 failed(error=cancelled) 后继续传播取消）；不抛
-- `app.postprocess._fit_size(w, h) -> str` — 等比放大到 ≥3,686,400 像素保持宽高比：`scale = ceil(sqrt(3686400/(w*h)))`，返回 `"WxH"`（如 720×1280 → `1440x2560`）
+- `app.postprocess._fit_size(w, h) -> str` — 输出尺寸落在 Ark 合法面积区间 [3,686,400, 4,624,220]：原图已在区间 → 原尺寸不动；否则等比缩放（浮点 scale 非整数倍，`scale = sqrt(3686400/(w*h))`）到下限附近，round 亏空加宽一维补足，返回 `"WxH"`（如 720×1280 → `1440x2560`、1080×1920 → `1440x2560`；整数 ceil 倍会超上限，实测 400）
 - `app.pipeline.FACE_HOLD_CONDITION_LINE` — 捂脸配套条件动作行，后端机械加进 prompt（所有模式；多段模式排在「不要生成背景音乐」行之后）
 - `app.sanitize.sanitize(text, limit=300) -> str` — 公共脱敏（seedance/seedream/postprocess 共用）：删含 key|authorization 的行 + 抹 `ARK_API_KEY` 字面值 + 截断
 - `app.codex_runner.CodexRunner(timeout_s, concurrency)` — `.build_argv(workdir, prompt)` / `.run(workdir, prompt)`；`CodexError` 包装超时/非零/找不到二进制
