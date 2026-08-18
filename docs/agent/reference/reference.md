@@ -90,17 +90,15 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 | 4 | `options` 非对象/四选项全假 | 422 `at least one option required`；选项值非 bool → 422 `options must be booleans` |
 | 5 | `status != "done"` | 409 `artifacts not ready` |
 | 6 | `meta.postprocess.status` 已 `running` | 409 `already running` |
-| 7 | `face_hold` 勾选但 cv2 haarcascade 数据不可用 | 503 `face detection data unavailable`（不静默降级） |
-| 8 | 上次 `done/failed` 的 `options` 与本次不同 | 409 `options changed since last run`（防旧产物贴新标签；同选项重跑照常跳过已有图） |
-| 9 | 每会话锁内复查：meta 消失或已在 running | 409 `already running` |
-| 10 | 锁内复查：目标帧目录缺失/为空 | 409 `artifacts not ready` |
-| 11 | 后台逐帧执行中任一帧失败 | 受理后 meta 落 `postprocess.status=failed`，`error` 指明帧名（已成功帧保留） |
+| 7 | 上次 `done/failed` 的 `options` 与本次不同 | 409 `options changed since last run`（防旧产物贴新标签；同选项重跑照常跳过已有图） |
+| 8 | 每会话锁内复查：meta 消失或已在 running | 409 `already running` |
+| 9 | 锁内复查：目标帧目录缺失/为空 | 409 `artifacts not ready` |
+| 10 | 后台逐帧执行中任一帧失败 | 受理后 meta 落 `postprocess.status=failed`，`error` 指明帧名（已成功帧保留） |
 
 - 后台任务（`postprocess.run_task`，BackgroundTasks，独立路径不吃管道闸；每会话一把锁，可跨会话并发）：
   - 收集目标帧：单段 = `work/keyframes/*.png`；多段 = `work/segments/N/work/keyframes/*.png`（N 来自 `meta.segments`）
-  - 每帧按勾选选项构造中文编辑指令（多选项用 `；` 连接）：换背景「将图片背景更换为简洁干净的背景，保持主体人物与物品不变」；含人脸遮挡「将图片中的人物改为用手捂住脸的造型，其余保持不变」；去字幕水印「移除图片中的所有字幕、水印和贴纸元素，其余保持不变」；去版权物品「移除图片中的所有品牌标志、logo、商标等版权元素，其余保持不变」
-  - `face_hold`：先 cv2 haarcascade 正面人脸检测（`cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'`，opencv-python-headless 4.x 自带该数据；5.0 无 CascadeClassifier API 不可用，故依赖锁定 `>=4.8,<5`；数据不可用时勾选 face_hold 直接 503，不静默降级），有人脸才注入该选项；无人脸该帧跳过此选项，无适用选项的帧整帧跳过
-  - 有人脸被处理时，该帧所属段（或单段）prompt 末尾追加一行「图中所有人物在1秒内快速把手放下到一个合理的位置，然后按照正常节奏进行后续剧情」，写回 `work/prompt.txt`（或 `work/segments/N/work/prompt.txt`）与 meta 对应 prompt
+  - 每帧按勾选选项构造中文编辑指令（多选项用 `；` 连接）：换背景「将图片背景更换为简洁干净的背景，保持主体人物与物品不变」；含人脸遮挡「如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：保持图片与输入完全一致，不做任何修改。」（条件式指令，由 Seedream 自己判断有无脸；多选项时条件句放最前）；去字幕水印「移除图片中的所有字幕、水印和贴纸元素，其余保持不变」；去版权物品「图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变」
+  - 所有目标帧都发编辑请求（不做人脸预判/过滤）：无人脸帧由 Seedream 按条件指令输出近似原图，直接存 postprocessed 展示；将来可加输出-输入变化判定过滤（见 OPEN_ISSUE）
   - 逐帧调用 `seedream.edit_image(..., confirm=True)`（路由层已校验 confirm）；产出 `work/postprocessed/<帧名>.png`（单段）或 `work/segments/N/work/postprocessed/<帧名>.png`（多段）；已存在的输出跳过（重跑不重复扣费）
   - 任一帧失败 → 整体 failed（`error` 指明帧名，脱敏 ≤300 字）；已成功帧保留；`meta.postprocess.frames` 记有优化版的帧名列表（单段 = 帧名；多段 = `segments/N/work/postprocessed/帧名` 全形路径，与 files 白名单路径同形，前端按段前缀过滤展示）
 - 幂等：`meta.postprocess.status == "running"` 时再提交一律 409；锁常驻内存，进程重启即失效；done/failed 后可重跑（已有优化图跳过）
@@ -153,9 +151,9 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 - `app.pipeline.validate_work_dir(work) -> (list[str], str)` — agent 产物白名单校验，返回 (关键帧名, prompt)
 - `app.pipeline.attribute_lines(lines, segments) -> dict[int, list[dict]]` — 台词按 start_s 落入段 [start_s, end_s) 归段（恰在边界归后段；超出末段终点 ≤0.01s 浮点误差归末段，更远不归段），返回 {index: [台词]}
 - `app.seedream.edit_image(settings, cdir, image, prompt, out, lock, confirm) -> Path` — 编辑门控纯函数：三重门控（开关/confirm/并发锁，confirm 须严格 True）+ dry-run 预检 + 真实提交；失败抛 `SeedreamError(status, detail)`
-- `app.postprocess.start(settings, cid, payload, locks) -> dict` — 后处理门控（含 face_hold 无 cascade 数据 503、换选项重跑 409）+ 置 `meta.postprocess=running`；返回勾选选项（路由层据此调度后台任务）；失败抛 `PostprocessError(status, detail)`
-- `app.postprocess.run_task(settings, cid, options, lock)` — 后处理后台任务：收集目标帧、人脸检测、逐帧 `seedream.edit_image(confirm=True)`、prompt 追加动作线、写 `meta.postprocess` 终态；不抛
-- `app.postprocess.FACE_LINE` — 有人脸被处理时追加到所属段（或单段）prompt 末尾的动作线
+- `app.postprocess.start(settings, cid, payload, locks) -> dict` — 后处理门控（换选项重跑 409）+ 置 `meta.postprocess=running`；返回勾选选项（路由层据此调度后台任务）；失败抛 `PostprocessError(status, detail)`
+- `app.postprocess.run_task(settings, cid, options, lock)` — 后处理后台任务：收集目标帧、条件式指令构造、逐帧 `seedream.edit_image(confirm=True)`、写 `meta.postprocess` 终态；不抛
+- `app.pipeline.FACE_HOLD_CONDITION_LINE` — 捂脸配套条件动作行，后端机械加进 prompt（所有模式；多段模式排在「不要生成背景音乐」行之后）
 - `app.sanitize.sanitize(text, limit=300) -> str` — 公共脱敏（seedance/seedream/postprocess 共用）：删含 key|authorization 的行 + 抹 `ARK_API_KEY` 字面值 + 截断
 - `app.codex_runner.CodexRunner(timeout_s, concurrency)` — `.build_argv(workdir, prompt)` / `.run(workdir, prompt)`；`CodexError` 包装超时/非零/找不到二进制
 - `app.codex_runner.clean_stderr(text, limit=500)` — 剔环境变量行 + 截断（pipeline 的 `_run_cmd` 复用）
@@ -201,11 +199,11 @@ scenes.json（`work/scenes.json`，`app/scenes.py` 产物）：
 - `work/keyframes/*.png`：数量 ∈ 1..9（新契约该目录只有选定帧 `01.png…N.png`）
 - `work/prompt.txt`：存在、非空、≤ 32KB（`MAX_PROMPT_BYTES`）
 
-多段模式每段目录 `work/segments/N/` 的嵌套 `work/` 按同规则校验；校验通过后由后端在 `prompt.txt` 开头机械加一行「不要生成背景音乐」（不依赖 codex 写），meta.segments 存的 prompt 含该行。scenes 检测失败（无场景切点/缺 PySceneDetect）或 scenes.json 的 segments 违反结构不变量（4~15s/相邻无缝/覆盖全程）→ 回退单段模式（meta.scenes_note 留痕），不判失败。段 codex 的 cwd 即段目录（物理隔离，看不到段外内容）：`scripts/` 与 `source.mp4` 留在段根，抽帧/联系表/manifest/台词/关键帧/prompt/后处理均在段 `work/`；scenes.json 不拷入段目录；codex `-o` 落盘的 codex_last_message.txt 随段目录各自独立。
+多段模式每段目录 `work/segments/N/` 的嵌套 `work/` 按同规则校验；校验通过后由后端在 `prompt.txt` 开头机械加两行「不要生成背景音乐」+ 捂脸条件动作行（`FACE_HOLD_CONDITION_LINE`，不依赖 codex 写），meta.segments 存的 prompt 含这两行。单段模式同样机械加条件动作行（无 BGM 行），meta.prompt 含该行；前缀后总长复核 ≤32KB（超限 → 会话 failed）。scenes 检测失败（无场景切点/缺 PySceneDetect）或 scenes.json 的 segments 违反结构不变量（4~15s/相邻无缝/覆盖全程）→ 回退单段模式（meta.scenes_note 留痕），不判失败。段 codex 的 cwd 即段目录（物理隔离，看不到段外内容）：`scripts/` 与 `source.mp4` 留在段根，抽帧/联系表/manifest/台词/关键帧/prompt/后处理均在段 `work/`；scenes.json 不拷入段目录；codex `-o` 落盘的 codex_last_message.txt 随段目录各自独立。
 
 ## 依赖
 
-- Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless `>=4.8,<5`（skill 脚本用；后处理 face_hold 用其自带 haarcascade 数据与 CascadeClassifier API——5.0 无此 API，故锁 `<5`）、scenedetect（场景检测，`app/scenes.py` 用；`>=0.7`——0.6.x 无 FrameTimecode.seconds 属性）、pytest、httpx（TestClient）、ai-edge-litert `==2.1.6`（YAMNet 推理，口播声学验证用）
+- Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless `>=4.8,<5`（skill 脚本与 pipeline 关键帧解码校验用）、scenedetect（场景检测，`app/scenes.py` 用；`>=0.7`——0.6.x 无 FrameTimecode.seconds 属性）、pytest、httpx（TestClient）、ai-edge-litert `==2.1.6`（YAMNet 推理，口播声学验证用）
 - 外部可执行：ffmpeg/ffprobe（探测+抽帧+测试造样例）、codex CLI（0.147.0 实证基线，仅流水线用）
 - 模型：`models/yamnet.tflite`（4.1MB，进仓库即部署自带；AudioSet 521 类；加载前 sha256 校验；环境变量 `YAMNET_MODEL_PATH` 可覆盖默认路径）
 

@@ -691,26 +691,16 @@ input { font-family: inherit; }
   cursor: zoom-out;
 }
 
-/* ===== Postprocess（结果区按钮/弹窗/对比区） ===== */
-.res-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
+/* ===== Postprocess（入口消息/弹窗/对比区） ===== */
 
-.res-head .res-h3 { margin: 0; }
+/* 后处理入口消息：「是否优化素材？」+ 是/否按钮（聊天消息内） */
+.pp-ask-text { margin: 0; font-size: 15px; font-weight: 600; }
 
-.pp-wrap {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-}
+.pp-ask-actions { display: flex; gap: 8px; margin-top: 12px; }
 
-.pp-btn { min-height: 36px; padding: 0 16px; font-size: 14px; border-radius: 10px; }
+.pp-ask-btn { min-height: 34px; padding: 0 18px; font-size: 14px; border-radius: 10px; }
 
-.pp-caption { font-size: 12px; color: var(--text-2); }
+.pp-ask-ended { margin: 12px 0 0; font-size: 13px; color: var(--text-2); }
 
 /* 后处理聊天消息：用户摘要 chips + 助手结果卡 */
 .pp-bubble {

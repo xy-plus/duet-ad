@@ -1,4 +1,4 @@
-"""T5b 后处理编排：HTTP 门控矩阵、全链路（桩 edit_image）、人脸规则、失败处理。"""
+"""T5b 后处理编排：HTTP 门控矩阵、全链路（桩 edit_image）、face_hold 条件指令、失败处理。"""
 
 import asyncio
 import json
@@ -15,7 +15,8 @@ from app.main import create_app
 PNG = b"\x89PNG\r\n\x1a\n"
 
 CHANGE_BG = "将图片背景更换为简洁干净的背景，保持主体人物与物品不变"
-FACE_HOLD = "将图片中的人物改为用手捂住脸的造型，其余保持不变"
+FACE_HOLD = ("如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。"
+             "如果图片中不含人脸：保持图片与输入完全一致，不做任何修改。")
 REMOVE_SUBTITLE = "移除图片中的所有字幕、水印和贴纸元素，其余保持不变"
 
 OPTIONS_BG = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": False}
@@ -247,79 +248,80 @@ def test_multi_segment_full_chain(enabled, monkeypatch):
     ]
 
 
-# ---------- face_hold 人脸规则 ----------
+# ---------- face_hold 条件指令 ----------
 
-def test_face_hold_with_face_appends_prompt_line_single(enabled, monkeypatch):
+def test_face_hold_conditional_instruction_all_frames_single(enabled, monkeypatch):
+    """face_hold 单独勾选：所有帧都发编辑请求，指令为条件式文案（不预判人脸、不跳帧）。"""
     settings, c = enabled
     cid = _make_conv(settings)
     cdir = settings.data_dir / cid
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
-    monkeypatch.setattr(postprocess, "_detect_face",
-                        lambda image, cascade=None: image.name == "01.png")
 
     r = _post(c, cid, FACE_ONLY)
     assert r.status_code == 200
 
-    # 有人脸帧带 face_hold 指令；无人脸帧无适用选项 → 整帧跳过不编辑
-    assert [call["image"] for call in fake.calls] == ["01.png"]
-    assert fake.calls[0]["prompt"] == FACE_HOLD
+    # 每帧一条条件指令（含人脸遮挡、无人脸保持原样），无帧被跳过
+    assert [call["image"] for call in fake.calls] == ["01.png", "02.png"]
+    for call in fake.calls:
+        assert call["prompt"] == FACE_HOLD
 
-    # 有人脸被处理 → prompt.txt 末尾追加一行，meta.prompt 同步
+    # 不再向后追加动作线（条件动作行由流水线机械加进 prompt，见 pipeline）
     prompt = (cdir / "work" / "prompt.txt").read_text(encoding="utf-8")
-    assert prompt == "单段提示词\n" + postprocess.FACE_LINE
+    assert prompt == "单段提示词"
     meta = storage.load_meta(settings.data_dir, cid)
-    assert meta["prompt"] == prompt
-    assert meta["postprocess"]["frames"] == ["01.png"]
+    assert meta["prompt"] == "单段提示词"
+    assert meta["postprocess"]["frames"] == ["01.png", "02.png"]
 
 
-def test_face_hold_no_face_skips_option(enabled, monkeypatch):
+def test_face_hold_merges_conditional_first(enabled, monkeypatch):
+    """face_hold 与其他选项合并：条件句放最前，其余选项照旧分号连接。"""
     settings, c = enabled
     cid = _make_conv(settings)
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
-    monkeypatch.setattr(postprocess, "_detect_face", lambda image, cascade=None: False)
 
     options = {"change_bg": True, "face_hold": True, "remove_subtitle": False, "remove_brand": False}
     r = _post(c, cid, options)
     assert r.status_code == 200
-    # 无人脸：该帧跳过 face_hold 选项，其余选项照常
-    assert all(call["prompt"] == CHANGE_BG for call in fake.calls)
     assert len(fake.calls) == 2
-    meta = storage.load_meta(settings.data_dir, cid)
-    assert postprocess.FACE_LINE not in meta["prompt"]  # 不追加动作线
+    assert all(call["prompt"] == f"{FACE_HOLD}；{CHANGE_BG}" for call in fake.calls)
 
 
-def test_face_hold_appends_per_segment(enabled, monkeypatch):
+def test_face_hold_all_frames_multi_segment(enabled, monkeypatch):
+    """多段模式 face_hold：每段每帧都编辑、指令条件式；段 prompt 不被追加动作线。"""
     settings, c = enabled
     cid = _make_conv(settings, segments=True)
     cdir = settings.data_dir / cid
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
-    # 只有段 2 的 02.png 有人脸
-    monkeypatch.setattr(postprocess, "_detect_face",
-                        lambda image, cascade=None: str(image).endswith("segments/2/work/keyframes/02.png"))
 
     r = _post(c, cid, FACE_ONLY)
     assert r.status_code == 200
 
+    assert [call["image"] for call in fake.calls] == ["01.png", "01.png", "02.png"]
+    assert all(call["prompt"] == FACE_HOLD for call in fake.calls)
+
     seg1_p = (cdir / "work" / "segments" / "1" / "work" / "prompt.txt").read_text(encoding="utf-8")
     seg2_p = (cdir / "work" / "segments" / "2" / "work" / "prompt.txt").read_text(encoding="utf-8")
-    assert seg1_p == "段一提示词"  # 段 1 无人脸：不动
-    assert seg2_p == "段二提示词\n" + postprocess.FACE_LINE
+    assert seg1_p == "段一提示词"
+    assert seg2_p == "段二提示词"
     meta = storage.load_meta(settings.data_dir, cid)
     assert meta["segments"][0]["prompt"] == seg1_p
     assert meta["segments"][1]["prompt"] == seg2_p
-    assert meta["postprocess"]["frames"] == ["segments/2/work/postprocessed/02.png"]
+    assert meta["postprocess"]["frames"] == [
+        "segments/1/work/postprocessed/01.png",
+        "segments/2/work/postprocessed/01.png",
+        "segments/2/work/postprocessed/02.png",
+    ]
 
 
-def test_no_face_hold_never_detects(enabled, monkeypatch):
+def test_no_face_hold_instruction_omits_face_hold(enabled, monkeypatch):
+    """未勾选 face_hold：指令不含条件句，其余选项照常合并。"""
     settings, c = enabled
     cid = _make_conv(settings)
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
-    monkeypatch.setattr(postprocess, "_detect_face",
-                        lambda *a, **k: pytest.fail("face detection must not run"))
 
     r = _post(c, cid, OPTIONS_BG)
     assert r.status_code == 200
@@ -410,81 +412,6 @@ def test_files_endpoint_serves_postprocessed(enabled):
                  "postprocessed/..%2Fmeta.json"):
         r = c.get(f"/api/conversations/{cid}/files/{name}", headers=AUTH)
         assert r.status_code == 404, name
-
-
-# ---------- 人脸检测单元（真 cv2 管线） ----------
-
-class FakeCascade:
-    def __init__(self, faces):
-        self._faces = list(faces)
-
-    def detectMultiScale(self, gray):
-        return self._faces
-
-
-def test_detect_face_real_cv2_pipeline(tmp_path):
-    import cv2
-    import numpy as np
-    img = tmp_path / "face.png"
-    cv2.imwrite(str(img), np.zeros((48, 48, 3), dtype=np.uint8))
-    assert postprocess._detect_face(img, FakeCascade([[10, 10, 20, 20]])) is True
-    assert postprocess._detect_face(img, FakeCascade([])) is False
-
-
-def test_detect_face_numpy_array_returns(tmp_path):
-    """真实 cascade 返回 numpy 数组：单/多元素数组不得触发 numpy 真值歧义（生产回归）。"""
-    import cv2
-    import numpy as np
-    img = tmp_path / "face.png"
-    cv2.imwrite(str(img), np.zeros((48, 48, 3), dtype=np.uint8))
-    assert postprocess._detect_face(img, FakeCascade(np.array([[10, 10, 20, 20]]))) is True
-    assert postprocess._detect_face(
-        img, FakeCascade(np.array([[1, 1, 5, 5], [30, 30, 10, 10]]))
-    ) is True
-    assert postprocess._detect_face(img, FakeCascade(np.empty((0, 4)))) is False
-
-
-def test_detect_face_undecodable_and_missing_cascade(tmp_path):
-    bad = tmp_path / "bad.png"
-    bad.write_bytes(b"not an image")
-    assert postprocess._detect_face(bad, FakeCascade([[0, 0, 1, 1]])) is False
-    assert postprocess._detect_face(bad, None) is False
-
-
-def test_detect_face_real_cascade_on_synthetic(tmp_path):
-    """真 cascade 数据 + 真 cv2 管线端到端：纯色合成图无人脸 → False（4.x 环境能力回归守卫）。"""
-    import cv2
-    import numpy as np
-    img = tmp_path / "synth.png"
-    cv2.imwrite(str(img), np.zeros((96, 96, 3), dtype=np.uint8))
-    cascade = postprocess._load_cascade()
-    assert cascade is not None
-    assert postprocess._detect_face(img, cascade) is False
-
-
-def test_load_cascade_missing_file_returns_none(tmp_path, monkeypatch):
-    import cv2
-    monkeypatch.setattr(cv2.data, "haarcascades", str(tmp_path / "no-cascade-dir"))
-    assert postprocess._load_cascade() is None
-
-
-def test_load_cascade_loads_with_real_data():
-    """cv2 4.x 自带 haarcascade 数据：加载成功非 None（face_hold 可用）。"""
-    assert postprocess._load_cascade() is not None
-
-
-def test_face_hold_no_cascade_503(enabled, monkeypatch):
-    """cv2 数据目录无 haarcascade → 勾选 face_hold 在门控直接 503，不做静默降级。"""
-    settings, c = enabled
-    cid = _make_conv(settings)
-    monkeypatch.setattr(postprocess.cv2.data, "haarcascades",
-                        str(settings.data_dir / "no-cascade"))
-    monkeypatch.setattr(postprocess.seedream, "edit_image",
-                        lambda *a, **k: pytest.fail("edit must not be called"))
-    r = _post(c, cid, FACE_ONLY)
-    assert r.status_code == 503
-    assert r.json() == {"detail": "face detection data unavailable"}
-    assert storage.load_meta(settings.data_dir, cid).get("postprocess") is None
 
 
 def test_rerun_different_options_409(enabled, monkeypatch):

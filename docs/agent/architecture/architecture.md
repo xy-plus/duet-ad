@@ -28,7 +28,7 @@ links: [conversation-task]
 | `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
 | `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
 | `app/seedream_task.py` | Ark Seedream 编辑任务脚本：JSON 图生图提交 `/api/v3/images/generations`、同步响应、b64_json 严格解码落盘 | conversation-task |
-| `app/postprocess.py` | T5b 后处理编排：HTTP 门控（含换选项重跑 409、无 cascade 数据 503）+ 后台逐帧 Seedream 编辑（收集目标帧/cv2 haarcascade 人脸检测/指令构造/prompt 追加动作线/失败保留）+ `meta.postprocess` 状态机 | conversation-task |
+| `app/postprocess.py` | T5b 后处理编排：HTTP 门控（换选项重跑 409）+ 后台逐帧 Seedream 编辑（收集目标帧/条件式 face_hold 指令（Seedream 自判有无脸，无人脸帧近似原图）/失败保留）+ `meta.postprocess` 状态机 | conversation-task |
 | `app/sanitize.py` | 公共脱敏函数（seedance/seedream/postprocess 共用）：删 key|authorization 行 + 抹密钥字面值 + 截断 | conversation-task |
 | `app/scenes.py` | PySceneDetect 场景检测：manifest 帧按场景分组写 scenes.json + 拆段边界建议（>20s 才计算，每段 4~15s 为算法级不变量，末尾防御断言）；流水线按 segments 拆段（空则单段模式） | conversation-task |
 | `web/` | 原生 JS 单页前端（登录/会话列表/上传/轮询/结果展示），无构建 | conversation-task |
@@ -96,7 +96,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
     ├── voice.mp3               口播模式抽出的音轨（16kHz 单声道）
     ├── voice_lines.json        口播模式 codex 听写的台词（白名单校验后采信）
     ├── keyframes/              01.png…N.png（1..9 张选定帧，白名单校验后采信；单段模式）
-    ├── prompt.txt              agent 写的 prompt（非空、≤32KB；单段模式）
+    ├── prompt.txt              agent 写的 prompt（非空、≤32KB；单段模式；首行为后端机械加的条件动作行）
     ├── postprocessed/          T5b 后处理优化图（<帧名>.png，与 keyframes/ 同名对应；单段模式）
     ├── segments/               多段模式：每段一目录（N 从 1 起，与 segments index 对应）
     │   └── N/
@@ -108,7 +108,7 @@ data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则
     │           ├── contact_sheet(_NN).jpg / manifest.json   该段分页联系表 / 段元数据
     │           ├── voice_lines.json  该段台词（按 start_s 归段；口播模式下每段都有，空数组 = 无台词）
     │           ├── keyframes/  该段选定关键帧（1..9 张）
-    │           ├── prompt.txt  该段提示词（首行为后端加的「不要生成背景音乐」）
+    │           ├── prompt.txt  该段提示词（首两行为后端加的「不要生成背景音乐」+ 条件动作行）
     │           └── postprocessed/  T5b 后处理优化图（与该段 keyframes/ 同名对应）
     │   （scenes.json 不拷入段目录，全片一份在 work/；段 source.mp4/scripts 留在段根；段 codex 的 cwd 即段目录，物理隔离）
     ├── recheck_payload.json    提交预检的瞬时产物（用完即删）

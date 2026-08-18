@@ -315,7 +315,10 @@ def test_run_done(tmp_path, video_1s, fake_steps):
     done = storage.load_meta(settings.data_dir, cid)
     assert done["status"] == "done" and done["error"] is None
     assert done["keyframes"] == ["01.png", "02.png", "03.png"]
-    assert done["prompt"] == PROMPT_TEXT
+    # 单段模式：条件动作行机械加在 prompt 开头（无 BGM 行），meta 与磁盘同步
+    assert done["prompt"] == pipeline.FACE_HOLD_CONDITION_LINE + "\n" + PROMPT_TEXT
+    assert done["prompt"].splitlines()[0] == pipeline.FACE_HOLD_CONDITION_LINE
+    assert (cdir / "work" / "prompt.txt").read_text(encoding="utf-8") == done["prompt"]
     assert not (cdir / "preview.mp4").exists()  # 新契约不再生成占位预览
 
     # extract 调用契约：venv python 绝对路径、argv 列表、--fps 4、120s 超时
@@ -453,7 +456,7 @@ def test_run_codex_timeout_salvages_complete_output(tmp_path, video_1s, monkeypa
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "done"
     assert m["keyframes"] == ["01.png", "02.png", "03.png"]
-    assert m["prompt"] == PROMPT_TEXT
+    assert m["prompt"] == pipeline.FACE_HOLD_CONDITION_LINE + "\n" + PROMPT_TEXT
 
 
 def test_run_validation_failure(tmp_path, video_1s, monkeypatch):
@@ -898,7 +901,7 @@ def test_post_triggers_pipeline_and_detail_filled(tmp_path, video_1s, fake_steps
     body = r.json()
     assert body["status"] == "done"
     assert body["keyframes"] == ["01.png", "02.png", "03.png"]
-    assert body["prompt"] == PROMPT_TEXT
+    assert body["prompt"] == pipeline.FACE_HOLD_CONDITION_LINE + "\n" + PROMPT_TEXT
     assert "has_preview" not in body
     assert body["error"] is None
 
