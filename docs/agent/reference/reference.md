@@ -97,7 +97,7 @@ URL 分支（`downloader.fetch_reference`，线程池执行不堵事件循环）
 
 - 后台任务（`postprocess.run_task`，BackgroundTasks，独立路径不吃管道闸；每会话一把锁，可跨会话并发）：
   - 收集目标帧：单段 = `work/keyframes/*.png`；多段 = `work/segments/N/work/keyframes/*.png`（N 来自 `meta.segments`）
-  - 每帧按勾选选项构造中文编辑指令（多选项用 `；` 连接）：换背景「将图片背景更换为简洁干净的背景，保持主体人物与物品不变」；含人脸遮挡「如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：保持图片与输入完全一致，不做任何修改。」（条件式指令，由 Seedream 自己判断有无脸；多选项时条件句放最前）；去字幕水印「移除图片中的所有字幕、水印和贴纸元素，其余保持不变」；去版权物品「图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变」
+  - 每帧按勾选选项构造中文编辑指令（多选项用 `；` 连接）：换背景「将图片背景更换为简洁干净的背景，保持主体人物与物品不变」；含人脸遮挡「如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。」（条件式指令，由 Seedream 自己判断有无脸；多选项时条件句放最前）；去字幕水印「移除图片中的所有字幕、水印和贴纸元素，其余保持不变」；去版权物品「图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余保持不变」
   - 所有目标帧都发编辑请求（不做人脸预判/过滤）：无人脸帧由 Seedream 按条件指令输出近似原图，直接存 postprocessed 展示；将来可加输出-输入变化判定过滤（见 OPEN_ISSUE）
   - 逐帧调用 `seedream.edit_image(..., confirm=True)`（路由层已校验 confirm）；产出 `work/postprocessed/<帧名>.png`（单段）或 `work/segments/N/work/postprocessed/<帧名>.png`（多段）；已存在的输出跳过（重跑不重复扣费）
   - 任一帧失败 → 整体 failed（`error` 指明帧名，脱敏 ≤300 字）；已成功帧保留；`meta.postprocess.frames` 记有优化版的帧名列表（单段 = 帧名；多段 = `segments/N/work/postprocessed/帧名` 全形路径，与 files 白名单路径同形，前端按段前缀过滤展示）
@@ -199,11 +199,11 @@ scenes.json（`work/scenes.json`，`app/scenes.py` 产物）：
 - `work/keyframes/*.png`：数量 ∈ 1..9（新契约该目录只有选定帧 `01.png…N.png`）
 - `work/prompt.txt`：存在、非空、≤ 32KB（`MAX_PROMPT_BYTES`）
 
-多段模式每段目录 `work/segments/N/` 的嵌套 `work/` 按同规则校验；校验通过后由后端在 `prompt.txt` 开头机械加两行「不要生成背景音乐」+ 捂脸条件动作行（`FACE_HOLD_CONDITION_LINE`，不依赖 codex 写），meta.segments 存的 prompt 含这两行。单段模式同样机械加条件动作行（无 BGM 行），meta.prompt 含该行；前缀后总长复核 ≤32KB（超限 → 会话 failed）。scenes 检测失败（无场景切点/缺 PySceneDetect）或 scenes.json 的 segments 违反结构不变量（4~15s/相邻无缝/覆盖全程）→ 回退单段模式（meta.scenes_note 留痕），不判失败。段 codex 的 cwd 即段目录（物理隔离，看不到段外内容）：`scripts/` 与 `source.mp4` 留在段根，抽帧/联系表/manifest/台词/关键帧/prompt/后处理均在段 `work/`；scenes.json 不拷入段目录；codex `-o` 落盘的 codex_last_message.txt 随段目录各自独立。
+多段模式每段目录 `work/segments/N/` 的嵌套 `work/` 按同规则校验；校验通过后由后端在 `prompt.txt` 开头机械加两行「不要生成背景音乐」+ 捂脸条件动作行（`FACE_HOLD_CONDITION_LINE`，不依赖 codex 写），meta.segments 存的 prompt 含这两行（两行恒为中文，不随 translate 目标语言翻译）。单段模式同样机械加条件动作行（无 BGM 行），meta.prompt 含该行；前缀后总长复核 ≤32KB（超限 → 会话 failed）。scenes 检测失败（无场景切点/缺 PySceneDetect）或 scenes.json 的 segments 违反结构不变量（4~15s/相邻无缝/覆盖全程）→ 回退单段模式（meta.scenes_note 留痕），不判失败。段 codex 的 cwd 即段目录（物理隔离，看不到段外内容）：`scripts/` 与 `source.mp4` 留在段根，抽帧/联系表/manifest/台词/关键帧/prompt/后处理均在段 `work/`；scenes.json 不拷入段目录；codex `-o` 落盘的 codex_last_message.txt 随段目录各自独立。
 
 ## 依赖
 
-- Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless `>=4.8,<5`（skill 脚本与 pipeline 关键帧解码校验用）、scenedetect（场景检测，`app/scenes.py` 用；`>=0.7`——0.6.x 无 FrameTimecode.seconds 属性）、pytest、httpx（TestClient）、ai-edge-litert `==2.1.6`（YAMNet 推理，口播声学验证用）
+- Python 包（`requirements.txt`）：fastapi、uvicorn[standard]、python-multipart、opencv-python-headless `>=4.8,<5`（skill 脚本与 pipeline 关键帧解码校验用；`<5` 因 skill 脚本的 cv2 API 兼容性仅在 4.x 验证）、scenedetect（场景检测，`app/scenes.py` 用；`>=0.7`——0.6.x 无 FrameTimecode.seconds 属性）、pytest、httpx（TestClient）、ai-edge-litert `==2.1.6`（YAMNet 推理，口播声学验证用）
 - 外部可执行：ffmpeg/ffprobe（探测+抽帧+测试造样例）、codex CLI（0.147.0 实证基线，仅流水线用）
 - 模型：`models/yamnet.tflite`（4.1MB，进仓库即部署自带；AudioSet 521 类；加载前 sha256 校验；环境变量 `YAMNET_MODEL_PATH` 可覆盖默认路径）
 

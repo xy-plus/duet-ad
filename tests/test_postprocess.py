@@ -16,7 +16,7 @@ PNG = b"\x89PNG\r\n\x1a\n"
 
 CHANGE_BG = "将图片背景更换为简洁干净的背景，保持主体人物与物品不变"
 FACE_HOLD = ("如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。"
-             "如果图片中不含人脸：保持图片与输入完全一致，不做任何修改。")
+             "如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。")
 REMOVE_SUBTITLE = "移除图片中的所有字幕、水印和贴纸元素，其余保持不变"
 
 OPTIONS_BG = {"change_bg": True, "face_hold": False, "remove_subtitle": False, "remove_brand": False}

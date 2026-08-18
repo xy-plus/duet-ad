@@ -770,7 +770,7 @@ function renderPpAssistant(detail, pp) {
       card.appendChild(ppFramesSection(detail, frames));
     } else {
       card.appendChild(el("p", "ac-title", "后处理完成"));
-      card.appendChild(el("p", "ac-sub", "无适用帧（如勾选「含人脸遮挡」但未检出人脸）"));
+      card.appendChild(el("p", "ac-sub", "所有目标帧均已处理"));
     }
     row.appendChild(card);
   }
