@@ -7,8 +7,9 @@
   a) 宿主进程级：调起 codex 前剔除名字含 KEY/TOKEN/SECRET/PASSWORD 的环境变量
      （实证：0.147.0 的 shell 命令经 code-mode-host 执行，shell_environment_policy
      的 inherit/exclude 不能阻止宿主秘密泄漏进 agent shell，必须在本进程侧清洗）；
-  b) codex 配置级：inherit="core" + exclude 兜底（inherit="none" 实证会让沙箱
-     启动器找不到 bwrap，不可用）；
+    b) codex 配置级：inherit="core" + exclude 兜底；
+- 当前生产宿主禁止 bubblewrap 所需的非特权 user namespace；显式使用 Codex 0.147
+  的 legacy Landlock 后端，仍保留 workspace-write/断网边界且不使用危险旁路；
 - 硬超时 settings.codex_timeout_s；并发信号量 settings.codex_concurrency；
 - 超时/非零退出 → CodexError，stderr 先剔除环境变量行再截断 ≤500 字。
 """
@@ -58,6 +59,7 @@ class CodexRunner:
     def build_argv(self, workdir: Path, prompt: str) -> list[str]:
         argv = [
             "codex", "exec",
+            "--enable", "use_legacy_landlock",
             "-C", str(workdir),
             "-s", "workspace-write",
             "--skip-git-repo-check",

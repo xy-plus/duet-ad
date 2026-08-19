@@ -215,6 +215,7 @@ class TestCodexRunner:
         assert argv[:2] == ["codex", "exec"]
         assert argv[argv.index("-C") + 1] == str(tmp_path)
         assert argv[argv.index("-s") + 1] == "workspace-write"
+        assert argv[argv.index("--enable") + 1] == "use_legacy_landlock"
         assert "--skip-git-repo-check" in argv
         assert "--ephemeral" in argv
         assert argv[argv.index("--color") + 1] == "never"
