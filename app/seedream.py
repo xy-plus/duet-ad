@@ -1,6 +1,6 @@
 """预留的 Seedream 图像编辑提交：开关 + confirm 门控 + dry-run 预检，默认 501。
 
-confirm 语义由调用方传入（同 seedance.submit 的 payload.confirm，必须严格 True）：
+confirm 语义由调用方传入（payload.confirm 必须严格 True）：
 路由层在用户确认后传 True；脚本侧 --confirm-submit 机械门控始终显式传入。密钥只
 存在于服务进程环境（ARK_API_KEY），子进程直接继承；不进日志、不进响应。报错信息
 一律先过 _sanitize 脱敏。
@@ -43,7 +43,7 @@ async def edit_image(
     confirm: bool,
     size: str = "",
 ) -> Path:
-    """按固定顺序过门控（与 seedance.submit 对齐）：开关 → confirm → out 已存在 409 → dry-run
+    """按固定顺序过门控：开关 → confirm → out 已存在 409 → dry-run
     预检 → 真实提交。
 
     不自带并发锁：并发化后每帧传新建锁、锁内 out.exists() 重查退化为自守卫（锁不共享，无实际

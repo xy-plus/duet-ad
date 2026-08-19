@@ -1,37 +1,23 @@
 # OPEN_ISSUE
 
-<!-- 活文档，只许这三节；每条 ≤3 行：一句现状 + 一句出路 + 指针（细节放 docs）；完成即删、不留 ✅ 编年史；全文超 ~60 行＝有条目该清 -->
+<!-- 活文档，只许这三节；每条 ≤3 行。完成即删，不保留编年史。 -->
 
 ## ⚠️ 待拍板
 
-<!-- 需人决策才能推进；自愈终审失败件放这里，标 ⚠️需人确认 -->
+- 旧人物策略资料包仍在根目录，但不进入现行 Context IR → H3 运行链；需决定删除归档，还是只保留独立的授权/商标版权规则。（→ `seedance-cleaning-video-maker-中文完整资料包.zip`）
 
 ## 🚧 进行中
 
-<!-- 开工登记、集成即删；重开任务记重开链：继承未解 blockers 与已用轮次 -->
+<!-- 当前无跨轮未完成实施项；新工作开工时登记，完成后删除。 -->
 
 ## 📌 待办与限制
 
-<!-- 已知但当前不做：TODO、技术债、接受的边界，含审查 nits；升级即挪进「进行中」，做完/失效即删 -->
-
-- Seedance 真实提交：接口仅预留(501)，ENABLE_SEEDANCE_SUBMIT=true+confirm 才启用；本阶段不触密钥。（→ app/seedance.py）
-- 状态推送用轮询而非 SSE/WebSocket：当前阶段够用；量起来再升级。
-- codex 认证只支持 CODEX_HOME 文件认证：env 清洗会杀 OPENAI_API_KEY/CODEX_API_KEY 等 env 认证路径（有意设计）。（→ app/codex_runner.py）
-- TikTok 链接依赖第三方 TikWM API + TIKTOK_PROXY（境外），TikWM 故障时 TikTok 分支不可用、直链不受影响；新版 video-maker skill 已移除商标/版权硬规则（内容后处理归将来的第二个 skill）。（→ app/downloader.py, skills/video-maker/）
-- data 目录无磁盘清理策略（LRU/TTL）：会话只进不出，量起来后需清理机制。
-- 长视频（拆段多）codex 耗时可能顶到 CODEX_TIMEOUT_S（默认 1800）：已落盘完整产物会被超时收养逻辑判 done，未写完的仍 failed；不够就调 CODEX_TIMEOUT_S。（→ app/pipeline.py）
-- 失败任务无重试按钮：TrendScout 有 retry 模式可参考；当前只能新建会话重传；pipeline copytree 无重入保护，加重试前需处理。
-- "payload changed since review" 文案在新契约下语义已变（无评审 payload 可比对，实际=产物缺失/不可构建）：改文案连带冻结测试，留到下轮。（→ app/seedance.py）
-- web/video-maker.zip 与 skills/video-maker/ 的字节一致性无 CI 防漂移：改 skill 后需手动重打包。（→ skills/video-maker/）
-- 闸等待占线程池线程：管道闸阻塞的是 anyio 线程（默认 40），极端排队场景会拖慢 URL 下载/静态文件；正确性不受影响，量大再改异步闸。（→ app/main.py run_pipeline_gated）
-- 审查 nits 汇总（R1/R2，不阻塞）：/api/login 无限流；_RateLimiter IP 条目只增不删、反代后共享一桶；save_upload async 内同步写盘；note 无长度上限；submit_locks 字典常驻内存；503 排在 dry-run 复核后；_SECRET_KEY_MARKERS 与 env 清洗口径不齐；_render_preview glob 不过滤前缀；has_video 磁盘探测与 meta 标记双源；URL 上传且无 note 时标题取整串 URL；限流先于幂等查重（重试消耗限流额度，有意外先撞 429）；幂等命中时首请求未落盘完成则随后 422 回滚会让重试方短暂 404。
-- 审查 nits（T1，不阻塞）：web/styles.css 语音选项与来源选项约 14 行逐字重复可合并选择器；index.html 的 voice-row role=radiogroup 内含 lang-input 文本输入（a11y 语义偏差）；target_language 无长度上限（与 note 同桶）；幂等查重不比对 voice 参数（前端换键规避，reference 已注明语义）。（→ web/, app/main.py）
-
-- validate_voice_lines 时间下界容差放宽到 -0.01s（_EPS_S 浮点误差允许）：审查裁决设计合理，不改。（→ app/voice.py）
-- Ark 脚本公共模块：第三只 Ark 脚本出现再抽公共模块（rule of three；seedance_task/seedream_task 的 api_key 与 HTTP 错误包装 request_json/_urlopen_json 已两份）。（→ app/seedance_task.py, app/seedream_task.py）
-- T5b 后处理 nits（审查裁决不改，记同桶）：postprocess_locks 字典常驻内存不驱逐（同 submit_locks 桶）；换选项重跑 409 无重置路径且 detail 对用户无下一步指引（前端可在 409 时提示「仅同选项可重跑」）；seedream.edit_image 的 out.exists() 冗余防线保留。（→ app/postprocess.py）
-- face_hold 条件式指令下无人脸帧输出近似原图直接展示，无输出-输入变化判定过滤；将来可加变化检测判定是否真处理过（用户已确认 seedream 便宜、当前不加）；注意 seedance 提交优先采用 postprocessed 图（app/seedance.py），近似图会替换原帧参与生成。（→ app/postprocess.py）
-- vocal 声学验证 nits（审查裁决不改，记同桶）：group_scores 值域校验在 sha256 门后冗余（可砍 ~6 行）；无重叠窗报错不指明第几句台词；ai_edge_litert 未装时 ImportError 被误报为「声学模型执行失败」；pipeline int() 截断与 vocal round() 毫秒口径不对称（实测无害）。（→ app/vocal.py, app/pipeline.py）
-- 签名 join 分隔符碰撞（keyframes ","、lines "\n"）：理论碰撞但当前状态机不可达（仅随 status=done 原子落盘、轮询期不单独变更），审查降 nit 不改；如改逐字段 JSON.stringify 可彻底消除。（→ web/app.js detailSignature）
-- 后处理速度：已并行化（进程级并发上限 `SEEDREAM_CONCURRENCY` 默认 10，单 uvicorn 进程内跨会话共享）+ 提示词强化（尺寸内容不变）+ 输出尺寸保持输入帧宽高比；Lite 模型切换待用户指示。（→ app/postprocess.py, app/config.py）
-- 后处理已修：`SEEDREAM_CONCURRENCY` 钳制 ≥1、父任务取消写 failed(error=cancelled)、seedream_task.save_result 原子落盘（临时文件 + os.replace）；`_fit_size` 实测发现 Ark size 上限 4,624,220 像素（2160×3840 提交 400），已改为浮点 scale 落在合法区间 [3,686,400, 4,624,220]（1080×1920 → 1440×2560）。（→ app/postprocess.py, app/seedream_task.py）
+- Context IR + H3 只能做高相似复刻，不能保证逐像素、逐帧、文字、原音或节奏一致；若目标升级为“一模一样”，需重新定义输入契约、模型与验收指标。（→ `temp/09-restore-h3-no-face/`, `docs/human/features/conversation-task/`）
+- 从仓库根直接运行 `pytest -q` 会收集 `temp/09-*`、`temp/10-*` 的同名测试模块并冲突；规范命令暂为 `pytest tests -q`，后续应增加 pytest 收集隔离或重命名模块。（→ `temp/`）
+- 全量测试仍有 FastAPI `on_event` 与 Starlette TestClient/httpx 弃用 warning；迁移 lifespan 和兼容测试客户端后再升级依赖。（→ `app/main.py`, `tests/`）
+- 状态更新仍用 2 秒轮询，不用 SSE/WebSocket；规模和实时性要求上升后再升级。（→ `web/app.js`）
+- Codex 认证只支持 `CODEX_HOME` 文件认证；服务会清除名称含 KEY/TOKEN/SECRET/PASSWORD 的 agent 子进程环境，环境变量 API key 路径有意不可用。（→ `app/codex_runner.py`）
+- TikTok 链接依赖 TikWM 与可选 `TIKTOK_PROXY`，第三方故障会影响该分支；普通受支持直链不依赖 TikWM。（→ `app/downloader.py`）
+- `data/` 尚无 TTL/LRU 或磁盘水位清理，长期运行会持续增长。（→ `app/storage.py`）
+- pipeline 闸等待占用 anyio worker thread；极端排队会拖慢同池下载/文件工作，正确性不受影响。（→ `app/main.py:run_pipeline_gated`）
+- `/api/login` 未限流、note/target language 无长度上限、进程内锁字典不驱逐；量级和攻击面扩大时统一处理。（→ `app/main.py`）

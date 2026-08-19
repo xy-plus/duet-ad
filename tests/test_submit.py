@@ -1,353 +1,805 @@
-import asyncio
 import json
-import subprocess
-import time
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import seedance, storage
-from app.main import create_app
+from app import h3, prepared_input, storage
+from app.main import _result_fields, _resume_generation, create_app
 
-PROMPT = "把房间打扫干净的视频"
+
+PROMPT = "镜头从整洁的房间缓慢推进。"
+REQUEST_ID = "request-123456"
+
+
+def _png(path: Path, width: int = 90, height: int = 160, value: int = 127) -> bytes:
+    image = np.full((height, width, 3), value, dtype=np.uint8)
+    ok, encoded = cv2.imencode(".png", image)
+    assert ok
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = encoded.tobytes()
+    path.write_bytes(data)
+    return data
+
+
+def _make_conv(settings, *, fit_required=False, duration_s=9.2, status="done"):
+    meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
+    cid = meta["id"]
+    cdir = settings.data_dir / cid
+    (cdir / "source.mp4").write_bytes(b"source-video")
+    original = _png(cdir / "work" / "keyframes" / "01.png", 160 if fit_required else 90, 90 if fit_required else 160)
+    (cdir / "work" / "visual_prompt.txt").write_text(PROMPT, encoding="utf-8")
+    (cdir / "work" / "prompt.txt").write_text(PROMPT, encoding="utf-8")
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status=status,
+        duration_s=duration_s,
+        source_width=160 if fit_required else 90,
+        source_height=90 if fit_required else 160,
+        fit_required=fit_required,
+        keyframes=["01.png"],
+        prompt=PROMPT,
+        voice_lines=[],
+        voice_line_provenance=[],
+    )
+    return cid, original
 
 
 @pytest.fixture
 def enabled(tmp_path):
-    settings = make_settings(tmp_path, enable_seedance_submit=True)
-    with TestClient(create_app(settings)) as c:
-        yield settings, c
+    settings = make_settings(
+        tmp_path,
+        enable_h3_submit=True,
+        minimax_api_key="mm-test-secret",
+        autodl_art_token="art-test-secret",
+    )
+    with TestClient(create_app(settings)) as client:
+        yield settings, client
 
 
-def _make_conv(settings, status="done", has_video=False, with_work=True, with_prompt=True, with_frames=True):
-    """造一个会话；默认 status=done 且 work/ 下有 prompt.txt + keyframes（新契约产物）。"""
-    meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
-    cid = meta["id"]
+def test_disabled_is_501_before_conversation_lookup(client):
+    response = client.post(
+        f"/api/conversations/{'0' * 32}/submit",
+        headers=AUTH,
+        json={"confirm": True},
+    )
+    assert response.status_code == 501
+    assert response.json() == {"detail": "H3 submission is disabled."}
+
+
+def test_submit_requires_auth(enabled):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    assert client.post(f"/api/conversations/{cid}/submit", json={}).status_code == 401
+
+
+def test_submit_validates_confirmation_id_dialogue_and_fit(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("must not submit"))
+
+    cases = [
+        ({"client_request_id": REQUEST_ID, "dialogue_mode": "auto", "fit_mode": "none"}, 409),
+        ({"confirm": True, "client_request_id": "short", "dialogue_mode": "auto", "fit_mode": "none"}, 422),
+        ({"confirm": True, "client_request_id": REQUEST_ID, "dialogue_mode": "auto", "lines": [], "fit_mode": "none"}, 422),
+        ({"confirm": True, "client_request_id": REQUEST_ID, "dialogue_mode": "custom", "lines": [], "fit_mode": "none"}, 422),
+        ({"confirm": True, "client_request_id": REQUEST_ID, "dialogue_mode": "custom", "lines": [{"text": "x", "start_s": 0, "end_s": 1, "extra": True}], "fit_mode": "none"}, 422),
+        ({"confirm": True, "client_request_id": REQUEST_ID, "dialogue_mode": "auto", "fit_mode": "crop"}, 422),
+    ]
+    for payload, status in cases:
+        response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=payload)
+        assert response.status_code == status, payload
+
+
+def test_fit_required_forces_explicit_crop_or_pad(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings, fit_required=True)
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("must not submit"))
+    payload = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "none",
+        "fit_mode": "none",
+    }
+    response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=payload)
+    assert response.status_code == 422
+
+
+def test_submit_uses_frozen_original_frames_never_postprocessed(enabled, monkeypatch):
+    settings, client = enabled
+    cid, original = _make_conv(settings, duration_s=9.2)
     cdir = settings.data_dir / cid
-    meta["status"] = status
-    if has_video:
-        meta["has_video"] = True
-    (cdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    if with_work:
-        (cdir / "work" / "keyframes").mkdir(parents=True)
-        if with_frames:
-            # 新契约：keyframes/ 里只有选定帧
-            (cdir / "work" / "keyframes" / "01.png").write_bytes(b"img1")
-        if with_prompt:
-            (cdir / "work" / "prompt.txt").write_text(PROMPT, encoding="utf-8")
-    return cid
+    _png(cdir / "work" / "postprocessed" / "01.png", value=240)
+    seen = []
 
+    def fake_start(request):
+        seen.append(request)
+        (request.workdir / "generated.mp4").write_bytes(b"generated")
+        return h3.H3Result(status="succeeded", attempt_id="000001", output=request.workdir / "generated.mp4")
 
-def _no_subprocess(*a, **k):
-    raise AssertionError("subprocess.run must not be called in this branch")
+    monkeypatch.setattr(h3, "start", fake_start)
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "client_request_id": REQUEST_ID,
+            "dialogue_mode": "none",
+            "fit_mode": "none",
+        },
+    )
+    assert response.status_code == 202
+    assert response.json() == {"status": "queued", "attempt": 1}
+    (request,) = seen
+    assert request.duration == 10
+    assert request.ratio == "9:16"
+    assert request.keyframes[0][1] == original
+    assert request.minimax_api_key == "mm-test-secret"
+    assert request.autodl_token == "art-test-secret"
+    assert request.voice_receipt == h3.voice_texts_receipt(())
 
-
-class FakeSubmit:
-    """模拟 seedance_task.py：dry-run 写 payload-out 预检文件；真实提交写 task.json + generated.mp4。"""
-
-    def __init__(self, rc=0, stderr="", task_id="task-123", write_payload=True):
-        self.rc = rc
-        self.stderr = stderr
-        self.task_id = task_id
-        self.write_payload = write_payload
-        self.calls = []
-
-    def __call__(self, argv, **kwargs):
-        cwd = Path(kwargs["cwd"])
-        self.calls.append((list(argv), kwargs))
-        if "--dry-run" in argv:
-            if self.write_payload:
-                out = cwd / argv[argv.index("--payload-out") + 1]
-                out.write_text("{}", encoding="utf-8")
-            return subprocess.CompletedProcess(argv, 0, stdout="dry", stderr="")
-        if self.rc == 0:
-            (cwd / "work" / "task.json").write_text(
-                json.dumps({"id": self.task_id, "status": "succeeded"}), encoding="utf-8"
-            )
-            (cwd / "generated.mp4").write_bytes(b"mp4")
-        return subprocess.CompletedProcess(argv, self.rc, stdout="out", stderr=self.stderr)
-
-    @property
-    def real_calls(self):
-        return [c for c in self.calls if "--dry-run" not in c[0]]
-
-
-# ---------- 矩阵 1：开关关闭 → 501（不看 confirm、不看会话是否存在） ----------
-
-def test_disabled_501(client):
-    r = client.post(f"/api/conversations/{'0' * 32}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 501
-    assert r.json() == {"detail": "Seedance submission is disabled."}
-    r = client.post(f"/api/conversations/{'0' * 32}/submit", headers=AUTH, json={})
-    assert r.status_code == 501
-
-
-def test_requires_auth(enabled):
-    settings, c = enabled
-    cid = _make_conv(settings)
-    assert c.post(f"/api/conversations/{cid}/submit", json={"confirm": True}).status_code == 401
-
-
-# ---------- 矩阵 2：会话不存在 → 404 ----------
-
-def test_404_when_enabled(enabled):
-    _, c = enabled
-    r = c.post(f"/api/conversations/{'0' * 32}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 404
-    assert r.json() == {"detail": "not found"}
-
-
-# ---------- 矩阵 3：confirm 不是 true → 409 ----------
-
-def test_confirm_required_409(enabled, monkeypatch):
-    settings, c = enabled
-    cid = _make_conv(settings)
-    monkeypatch.setattr(subprocess, "run", _no_subprocess)
-    for body in ({}, {"confirm": False}, {"confirm": "true"}, {"confirm": 1}):
-        r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body)
-        assert r.status_code == 409, body
-        assert r.json() == {"detail": "confirmation required"}
-
-
-# ---------- 矩阵 4：status != done → 409 ----------
-
-def test_not_done_409(enabled, monkeypatch):
-    settings, c = enabled
-    cid = _make_conv(settings, status="queued")
-    monkeypatch.setattr(subprocess, "run", _no_subprocess)
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 409
-    assert r.json() == {"detail": "artifacts not ready"}
-
-
-# ---------- 矩阵 5：已 has_video → 409 ----------
-
-def test_already_submitted_409(enabled, monkeypatch):
-    settings, c = enabled
-    cid = _make_conv(settings, has_video=True)
-    monkeypatch.setattr(subprocess, "run", _no_subprocess)
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 409
-    assert r.json() == {"detail": "already submitted"}
-
-
-# ---------- 矩阵 6：dry-run 预检失败 / 产物缺失 → 409 ----------
-
-def test_prompt_missing_409(enabled, monkeypatch):
-    settings, c = enabled
-    cid = _make_conv(settings, with_prompt=False)  # 无 work/prompt.txt
-    monkeypatch.setattr(subprocess, "run", _no_subprocess)
-    monkeypatch.setenv("ARK_API_KEY", "sk-test")
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 409
-    assert r.json() == {"detail": "payload changed since review"}
-
-
-def test_keyframes_missing_409(enabled, monkeypatch):
-    settings, c = enabled
-    cid = _make_conv(settings, with_frames=False)  # keyframes/ 为空
-    monkeypatch.setattr(subprocess, "run", _no_subprocess)
-    monkeypatch.setenv("ARK_API_KEY", "sk-test")
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 409
-    assert r.json() == {"detail": "payload changed since review"}
-
-
-def test_payload_dryrun_failed_409(enabled, monkeypatch):
-    settings, c = enabled
-    cid = _make_conv(settings)
-
-    def dry_fails(argv, **kwargs):
-        return subprocess.CompletedProcess(argv, 2, stdout="", stderr="Prompt is empty.")
-
-    monkeypatch.setattr(subprocess, "run", dry_fails)
-    monkeypatch.setenv("ARK_API_KEY", "sk-test")
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 409
-    assert r.json() == {"detail": "payload changed since review"}
-
-
-def test_payload_dryrun_no_output_409(enabled, monkeypatch):
-    """dry-run 退出码正常但没写 payload-out，同样视为产物已变。"""
-    settings, c = enabled
-    cid = _make_conv(settings)
-    fake = FakeSubmit(write_payload=False)
-    monkeypatch.setattr(subprocess, "run", fake)
-    monkeypatch.setenv("ARK_API_KEY", "sk-test")
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 409
-    assert r.json() == {"detail": "payload changed since review"}
-    assert fake.real_calls == []  # 未进入真实提交
-
-
-# ---------- 矩阵 7：无 ARK_API_KEY → 503 ----------
-
-def test_missing_ark_key_503(enabled, monkeypatch):
-    settings, c = enabled
-    cid = _make_conv(settings)
-    fake = FakeSubmit()
-    monkeypatch.setattr(subprocess, "run", fake)
-    monkeypatch.delenv("ARK_API_KEY", raising=False)
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 503
-    assert r.json() == {"detail": "ARK_API_KEY not configured"}
-    assert fake.real_calls == [] and len(fake.calls) == 1  # dry-run 预检后才查 key
-
-
-# ---------- 矩阵 8a：成功 → 200 + meta 落盘 + 契约不破 ----------
-
-def test_submit_success_200(enabled, monkeypatch):
-    settings, c = enabled
-    cid = _make_conv(settings)
-    cdir = settings.data_dir / cid
-    fake = FakeSubmit(task_id="cgt-abc123")
-    monkeypatch.setattr(subprocess, "run", fake)
-    monkeypatch.setenv("ARK_API_KEY", "sk-test-secret")
-
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 200
-    assert r.json() == {"status": "succeeded", "video": "generated.mp4"}
-
-    # 真实提交 argv 契约：列表、cwd、1800s、无 shell、env 继承
-    (argv, kw), = fake.real_calls
-    assert isinstance(argv, list)
-    assert kw["cwd"] == cdir
-    assert kw["timeout"] == 1800
-    assert kw.get("shell") is not True
-    assert kw.get("env") is None
-    for flag in ("--confirm-submit", "--wait",
-                 "--state-file", "work/task.json",
-                 "--download", "generated.mp4",
-                 "--prompt-file", "work/prompt.txt",
-                 "--model", "doubao-seedance-2-0-260128"):
-        assert flag in argv
-    # 提交时现构建：--ref-images 后（到下个旗标前）即 keyframes/ 下全部 PNG（新契约该目录只有选定帧）
-    tail = argv[argv.index("--ref-images") + 1:]
-    ref = []
-    for a in tail:
-        if a.startswith("--"):
-            break
-        ref.append(a)
-    assert ref == ["work/keyframes/01.png"]
-
-    # meta 落盘：has_video / submitted_at / task_id；密钥不进任何写盘文件
     meta = storage.load_meta(settings.data_dir, cid)
-    assert meta["has_video"] is True
-    assert meta["task_id"] == "cgt-abc123"
-    assert meta["submitted_at"]
-    assert "sk-test-secret" not in (cdir / "meta.json").read_text(encoding="utf-8")
-    assert not (cdir / "work" / "recheck_payload.json").exists()  # 预检临时文件已清理
-
-    # detail 冻结契约现 16 字段（meta 新增字段不外泄），has_video 按文件翻真
-    d = c.get(f"/api/conversations/{cid}", headers=AUTH).json()
-    assert len(d) == 16
-    assert "task_id" not in d
-    assert d["has_video"] is True
-
-    # 幂等：再提交一次 → 409
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 409
-    assert r.json() == {"detail": "already submitted"}
+    assert meta["generation"] == {
+        "status": "succeeded",
+        "error": None,
+        "attempt": 1,
+        "client_request_id": REQUEST_ID,
+    }
+    receipt = prepared_input.load_prepared_input(
+        cdir,
+        cdir / prepared_input.RECEIPT_FILENAME,
+        expected_dialogue=(),
+    )
+    assert receipt.fit_mode == "none"
+    assert receipt.keyframes[0].data == original
 
 
-# ---------- 矩阵 7b：后处理优化图优先（T5b） ----------
-
-def test_keyframes_prefer_postprocessed(enabled, monkeypatch):
-    """work/postprocessed/<同名> 存在 → _keyframes 与提交 argv（含 dry-run 预检）都用优化图。"""
-    settings, c = enabled
-    cid = _make_conv(settings)
-    cdir = settings.data_dir / cid
-    (cdir / "work" / "postprocessed").mkdir()
-    (cdir / "work" / "postprocessed" / "01.png").write_bytes(b"optimized")
-    fake = FakeSubmit()
-    monkeypatch.setattr(subprocess, "run", fake)
-    monkeypatch.setenv("ARK_API_KEY", "sk-test")
-
-    files = seedance._keyframes(cdir)
-    assert [str(p.relative_to(cdir)) for p in files] == ["work/postprocessed/01.png"]
-
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 200
-    # dry-run 预检与真实提交同一 argv：--ref-images 用优化图路径
-    dry, (argv, _) = fake.calls[0][0], fake.real_calls[0]
-    assert "work/postprocessed/01.png" in dry
-    tail = argv[argv.index("--ref-images") + 1:]
-    ref = []
-    for a in tail:
-        if a.startswith("--"):
-            break
-        ref.append(a)
-    assert ref == ["work/postprocessed/01.png"]
-
-
-def test_keyframes_original_without_postprocessed(enabled):
-    settings, _ = enabled
-    cid = _make_conv(settings)
-    files = seedance._keyframes(settings.data_dir / cid)
-    assert [str(p.relative_to(settings.data_dir / cid)) for p in files] == ["work/keyframes/01.png"]
+def test_fit_frames_are_derived_and_bound_to_receipt(enabled, monkeypatch):
+    settings, client = enabled
+    cid, original = _make_conv(settings, fit_required=True)
+    seen = []
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: seen.append(request) or h3.H3Result("failed", "000001", error_code="h3_provider_failed"),
+    )
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "client_request_id": REQUEST_ID,
+            "dialogue_mode": "none",
+            "fit_mode": "crop",
+        },
+    )
+    assert response.status_code == 202
+    derived = seen[0].keyframes[0][1]
+    assert derived != original
+    image = cv2.imdecode(np.frombuffer(derived, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert image.shape[1] * 16 == image.shape[0] * 9
+    receipt = json.loads((settings.data_dir / cid / prepared_input.RECEIPT_FILENAME).read_text())
+    assert receipt["video"]["fit_mode"] == "crop"
+    assert "postprocessed" not in json.dumps(receipt)
 
 
-# ---------- 矩阵 8b：脚本非零 → 502，detail 脱敏 ----------
+def test_custom_dialogue_is_validated_frozen_and_exposed(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings, duration_s=2.0)
+    seen = []
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: seen.append(request) or h3.H3Result("failed", "000001", error_code="ir_provider_failed"),
+    )
+    lines = [{"text": "  hello  ", "start_s": 0, "end_s": 1.5}]
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "client_request_id": REQUEST_ID,
+            "dialogue_mode": "custom",
+            "lines": lines,
+            "fit_mode": "none",
+        },
+    )
+    assert response.status_code == 202
+    assert seen[0].voice_texts == ("hello",)
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert detail["dialogue"] == {
+        "mode": "custom",
+        "lines": [{"text": "hello", "start_s": 0.0, "end_s": 1.5}],
+        "auto_lines": [],
+    }
+    assert detail["generation"]["error"] == "ir_provider_failed"
 
-def test_submit_failure_502_sanitized(enabled, monkeypatch):
-    settings, c = enabled
-    cid = _make_conv(settings)
-    secret = "sk-live-abcdef123456"
-    monkeypatch.setenv("ARK_API_KEY", secret)
-    err = (f"Authorization: Bearer {secret}\n"
-           f"request failed with api_key={secret}\n"
-           "plain failure line")
-    fake = FakeSubmit(rc=1, stderr=err)
-    monkeypatch.setattr(subprocess, "run", fake)
 
-    r = c.post(f"/api/conversations/{cid}/submit", headers=AUTH, json={"confirm": True})
-    assert r.status_code == 502
-    detail = r.json()["detail"]
-    assert len(detail) <= 300
-    assert secret not in detail
-    assert "Authorization" not in detail
-    assert "api_key" not in detail
-    assert "plain failure line" in detail
-    assert not storage.load_meta(settings.data_dir, cid).get("has_video")  # 未误标记
+def test_failed_attempt_requires_a_new_id_and_uses_retry(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    starts = []
+    retries = []
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: starts.append(request) or h3.H3Result("failed", "000001", error_code="ir_provider_failed"),
+    )
+    monkeypatch.setattr(
+        h3,
+        "retry",
+        lambda request, request_id: retries.append((request, request_id)) or h3.H3Result("failed", "000002", error_code="h3_provider_failed"),
+    )
+    body = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "none",
+        "fit_mode": "none",
+    }
+    assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body).status_code == 202
+    assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body).status_code == 409
+    body["client_request_id"] = "request-654321"
+    assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body).status_code == 202
+    assert len(starts) == 1
+    assert len(retries) == 1 and retries[0][1] == "request-654321"
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["attempt"] == 2
 
 
-# ---------- 矩阵 9：并发双击 → 锁内重查，只产生一个任务 ----------
+def test_submission_unknown_cannot_create_a_second_paid_attempt(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={
+            "status": "submission_unknown",
+            "error": "submission_unknown",
+            "attempt": 1,
+            "client_request_id": REQUEST_ID,
+        },
+    )
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("must not submit"))
+    monkeypatch.setattr(h3, "retry", lambda *_args: pytest.fail("must not retry"))
 
-def test_concurrent_submit_single_task(tmp_path, monkeypatch):
-    settings = make_settings(tmp_path, enable_seedance_submit=True)
-    cid = _make_conv(settings)
-    monkeypatch.setenv("ARK_API_KEY", "sk-x")
-    real_calls = []
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "client_request_id": "request-different",
+            "dialogue_mode": "none",
+            "fit_mode": "none",
+        },
+    )
 
-    def fake(argv, **kwargs):
-        cwd = Path(kwargs["cwd"])
-        if "--dry-run" in argv:
-            out = cwd / argv[argv.index("--payload-out") + 1]
-            out.write_text("{}", encoding="utf-8")
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        real_calls.append(argv)
-        time.sleep(0.3)  # 让第二个请求抵达锁
-        (cwd / "work" / "task.json").write_text(json.dumps({"id": "t-1"}), encoding="utf-8")
-        (cwd / "generated.mp4").write_bytes(b"v")
-        return subprocess.CompletedProcess(argv, 0, "", "")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "submission_outcome_unknown"}
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["attempt"] == 1
 
-    monkeypatch.setattr(subprocess, "run", fake)
-    locks = {}
 
-    async def run_both():
-        return await asyncio.gather(
-            seedance.submit(settings, cid, {"confirm": True}, locks),
-            seedance.submit(settings, cid, {"confirm": True}, locks),
-            return_exceptions=True,
+def test_state_persist_failure_with_raw_submitting_state_is_submission_unknown(
+    enabled, monkeypatch
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    inspected = []
+
+    def fail_after_post(_request):
+        raise h3.H3Error("state_persist_failed")
+
+    def fake_inspect(request):
+        inspected.append(request)
+        return h3.H3Result("ir_submitting", "000001")
+
+    monkeypatch.setattr(h3, "start", fail_after_post)
+    monkeypatch.setattr(h3, "inspect", fake_inspect)
+    body = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "none",
+        "fit_mode": "none",
+    }
+    assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body).status_code == 202
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation == {
+        "status": "submission_unknown",
+        "error": "submission_unknown",
+        "attempt": 1,
+        "client_request_id": REQUEST_ID,
+    }
+    assert len(inspected) == 1
+
+    body["client_request_id"] = "request-new-123"
+    response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "submission_outcome_unknown"}
+
+
+@pytest.mark.parametrize("error_code", ["state_persist_failed", "submission_unknown"])
+def test_ambiguous_submit_error_stays_unknown_when_inspect_also_fails(
+    enabled, monkeypatch, error_code
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    monkeypatch.setattr(
+        h3, "start", lambda _request: (_ for _ in ()).throw(h3.H3Error(error_code))
+    )
+    monkeypatch.setattr(
+        h3, "inspect", lambda _request: (_ for _ in ()).throw(h3.ReceiptError("state_invalid"))
+    )
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "client_request_id": REQUEST_ID,
+            "dialogue_mode": "none",
+            "fit_mode": "none",
+        },
+    )
+    assert response.status_code == 202
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation["status"] == "submission_unknown"
+    assert generation["error"] == "submission_unknown"
+    assert generation["attempt"] == 1
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "ir_query_failed",
+        "ir_timeout",
+        "h3_query_failed",
+        "h3_timeout",
+        "download_failed",
+        "download_dns_failed",
+        "download_peer_unverified",
+        "output_write_failed",
+        "output_probe_failed",
+    ],
+)
+def test_known_remote_task_failure_requires_same_attempt_resume(
+    enabled, monkeypatch, error_code
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda _request: h3.H3Result(
+            "retryable_failure", "000001", retryable=True, error_code=error_code
+        ),
+    )
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "client_request_id": REQUEST_ID,
+            "dialogue_mode": "none",
+            "fit_mode": "none",
+        },
+    )
+    assert response.status_code == 202
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation["status"] == "resume_required"
+    assert generation["error"] == error_code
+    assert generation["attempt"] == 1
+
+
+@pytest.mark.parametrize("inspect_fails", [False, True])
+def test_raised_known_task_query_error_cannot_open_a_paid_retry(
+    enabled, monkeypatch, inspect_fails
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+
+    def raise_query_error(_request):
+        raise h3.H3Error("ir_query_failed", retryable=True)
+
+    def inspect_state(_request):
+        if inspect_fails:
+            raise h3.ReceiptError("state_invalid")
+        return h3.H3Result(
+            "retryable_failure",
+            "000001",
+            retryable=True,
+            error_code="ir_query_failed",
         )
 
-    results = asyncio.run(run_both())
-    oks = [r for r in results if isinstance(r, dict)]
-    errs = [r for r in results if isinstance(r, seedance.SubmitError)]
-    assert len(oks) == 1 and oks[0]["status"] == "succeeded"
-    assert len(errs) == 1 and errs[0].status == 409
-    assert len(real_calls) == 1  # 一次确认 = 一个任务
-    assert storage.load_meta(settings.data_dir, cid)["has_video"] is True
+    monkeypatch.setattr(h3, "start", raise_query_error)
+    monkeypatch.setattr(h3, "inspect", inspect_state)
+    body = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "none",
+        "fit_mode": "none",
+    }
+    assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body).status_code == 202
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation["status"] == "resume_required"
+    assert generation["error"] == "ir_query_failed"
+    assert generation["attempt"] == 1
+
+    body["client_request_id"] = "request-new-456"
+    response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "resume_request_id_mismatch"}
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["attempt"] == 1
+
+
+def test_unexpected_provider_exception_inspects_and_resumes_same_attempt(
+    enabled, monkeypatch
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    calls = {"start": 0, "inspect": 0}
+
+    def unexpected_then_continue(_request):
+        calls["start"] += 1
+        if calls["start"] == 1:
+            raise RuntimeError("provider transport broke after POST")
+        return h3.H3Result("h3_running", "000001")
+
+    def inspect_running(_request):
+        calls["inspect"] += 1
+        return h3.H3Result("h3_running", "000001")
+
+    monkeypatch.setattr(h3, "start", unexpected_then_continue)
+    monkeypatch.setattr(h3, "inspect", inspect_running)
+    monkeypatch.setattr(h3, "retry", lambda *_args: pytest.fail("must not create a paid retry"))
+    body = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "none",
+        "fit_mode": "none",
+    }
+
+    assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body).status_code == 202
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation == {
+        "status": "resume_required",
+        "error": "h3_running",
+        "attempt": 1,
+        "client_request_id": REQUEST_ID,
+    }
+    assert calls == {"start": 1, "inspect": 1}
+
+    changed_id = {**body, "client_request_id": "request-new-456"}
+    response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=changed_id)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "resume_request_id_mismatch"}
+    assert calls == {"start": 1, "inspect": 1}
+
+    response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body)
+    assert response.status_code == 202
+    assert response.json() == {"status": "queued", "attempt": 1}
+    assert calls == {"start": 2, "inspect": 1}
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["attempt"] == 1
+
+
+@pytest.mark.parametrize(
+    ("inspect_result", "expected_status", "expected_error"),
+    [
+        (None, "submission_unknown", "submission_unknown"),
+        (h3.H3Result("not_started", None), "submission_unknown", "submission_unknown"),
+        (h3.H3Result("ir_submitting", "000001"), "submission_unknown", "submission_unknown"),
+        (h3.H3Result("h3_submitting", "000001"), "submission_unknown", "submission_unknown"),
+        (h3.H3Result("unexpected_state", "000001"), "submission_unknown", "submission_unknown"),
+        (h3.H3Result("ir_running", "000001"), "resume_required", "ir_running"),
+        (
+            h3.H3Result(
+                "retryable_failure",
+                "000001",
+                retryable=True,
+                error_code="download_dns_failed",
+            ),
+            "resume_required",
+            "download_dns_failed",
+        ),
+        (
+            h3.H3Result("failed", "000001", error_code="download_invalid_video"),
+            "failed",
+            "download_invalid_video",
+        ),
+    ],
+)
+def test_unexpected_provider_exception_uses_only_inspected_state(
+    enabled, monkeypatch, inspect_result, expected_status, expected_error
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    inspected = []
+
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda _request: (_ for _ in ()).throw(RuntimeError("unexpected provider failure")),
+    )
+
+    def inspect_state(request):
+        inspected.append(request)
+        if inspect_result is None:
+            raise RuntimeError("state unavailable")
+        return inspect_result
+
+    monkeypatch.setattr(h3, "inspect", inspect_state)
+    body = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "none",
+        "fit_mode": "none",
+    }
+    assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body).status_code == 202
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert len(inspected) == 1
+    assert generation["status"] == expected_status
+    assert generation["error"] == expected_error
+    assert generation["attempt"] == 1
+
+
+@pytest.mark.parametrize("raw_status", ["ir_submitting", "h3_submitting"])
+def test_raw_submitting_status_is_never_treated_as_safe_retry(raw_status):
+    assert _result_fields(h3.H3Result(raw_status, "000001")) == (
+        "submission_unknown",
+        "submission_unknown",
+    )
+
+
+def test_resume_required_same_id_reuses_receipt_and_attempt(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    starts = []
+
+    def ready(request):
+        starts.append(request)
+        return h3.H3Result("ready_for_h3", "000001")
+
+    monkeypatch.setattr(h3, "start", ready)
+    monkeypatch.setattr(h3, "retry", lambda *_args: pytest.fail("resume must not retry"))
+    body = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "none",
+        "fit_mode": "none",
+    }
+    assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body).status_code == 202
+    receipt_path = settings.data_dir / cid / prepared_input.RECEIPT_FILENAME
+    receipt_before = receipt_path.read_bytes()
+    meta_before = storage.load_meta(settings.data_dir, cid)
+    assert meta_before["generation"]["status"] == "resume_required"
+
+    response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body)
+
+    assert response.status_code == 202
+    assert response.json() == {"status": "queued", "attempt": 1}
+    assert len(starts) == 2
+    meta_after = storage.load_meta(settings.data_dir, cid)
+    assert meta_after["generation"]["status"] == "resume_required"
+    assert meta_after["generation"]["attempt"] == 1
+    assert receipt_path.read_bytes() == receipt_before
+    assert meta_after["prepared_dialogue"] == meta_before["prepared_dialogue"]
+
+
+def test_resume_required_rejects_new_id_and_frozen_parameter_drift(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings, fit_required=True)
+    calls = []
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: calls.append(request) or h3.H3Result("ready_for_h3", "000001"),
+    )
+    body = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "custom",
+        "lines": [{"text": "hello", "start_s": 0, "end_s": 1}],
+        "fit_mode": "crop",
+    }
+    assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=body).status_code == 202
+    receipt_path = settings.data_dir / cid / prepared_input.RECEIPT_FILENAME
+    receipt_before = receipt_path.read_bytes()
+
+    changed_id = {**body, "client_request_id": "request-other-123"}
+    response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=changed_id)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "resume_request_id_mismatch"}
+
+    changed_lines = {**body, "lines": [{"text": "changed", "start_s": 0, "end_s": 1}]}
+    response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=changed_lines)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "resume_parameters_changed"}
+
+    changed_fit = {**body, "fit_mode": "pad"}
+    response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=changed_fit)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "resume_parameters_changed"}
+
+    assert len(calls) == 1
+    assert receipt_path.read_bytes() == receipt_before
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert detail["fit_mode"] == "crop"
+    assert detail["generation"]["attempt"] == 1
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "succeeded"])
+def test_active_or_succeeded_generation_cannot_be_duplicated(enabled, monkeypatch, status):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={"status": status, "error": None, "attempt": 1, "client_request_id": REQUEST_ID},
+    )
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("must not submit"))
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "client_request_id": "request-different",
+            "dialogue_mode": "none",
+            "fit_mode": "none",
+        },
+    )
+    assert response.status_code == 409
+
+
+def test_old_session_is_read_only_for_submit(enabled):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    meta.pop("schema_version")
+    (settings.data_dir / cid / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "client_request_id": REQUEST_ID,
+            "dialogue_mode": "none",
+            "fit_mode": "none",
+        },
+    )
+    assert response.status_code == 409
+    assert response.json() == {"detail": "read_only"}
+
+
+@pytest.mark.parametrize(
+    ("resumed_result", "expected_error"),
+    [
+        (h3.H3Result("ready_for_h3", "000001"), "ready_for_h3"),
+        (
+            h3.H3Result(
+                "retryable_failure",
+                "000001",
+                retryable=True,
+                error_code="h3_timeout",
+            ),
+            "h3_timeout",
+        ),
+    ],
+)
+def test_startup_resumes_with_get_only_and_marks_confirmation_required(
+    tmp_path, monkeypatch, resumed_result, expected_error
+):
+    settings = make_settings(
+        tmp_path,
+        enable_h3_submit=True,
+        minimax_api_key="mm",
+        autodl_art_token="art",
+    )
+    cid, _ = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    frozen = prepared_input.write_prepared_input(
+        root=cdir,
+        source=cdir / "source.mp4",
+        audio=None,
+        keyframes=[cdir / "work" / "keyframes" / "01.png"],
+        visual=cdir / "work" / "visual_prompt.txt",
+        final=cdir / "work" / "prompt.txt",
+        dialogue_mode="none",
+        dialogue=(),
+        vocal_filter_enabled=True,
+        duration_s=9.2,
+        ratio="9:16",
+        fit_mode="none",
+        engine_request={"duration": 10},
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        dialogue_mode="none",
+        fit_mode="none",
+        prepared_dialogue=[],
+        prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
+        generation={"status": "running", "error": None, "attempt": 1, "client_request_id": REQUEST_ID},
+    )
+    resumed = []
+
+    def fake_resume(request):
+        resumed.append(request)
+        return resumed_result
+
+    monkeypatch.setattr(h3, "resume", fake_resume)
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("startup must not POST"))
+    monkeypatch.setattr(h3, "retry", lambda *_args: pytest.fail("startup must not retry"))
+    with TestClient(create_app(settings)) as client:
+        for thread in client.app.state.h3_resume_threads:
+            thread.join(timeout=1)
+        detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert len(resumed) == 1
+    assert resumed[0].client_request_id == REQUEST_ID
+    assert detail["generation"]["status"] == "resume_required"
+    assert detail["generation"]["error"] == expected_error
+    assert frozen.voice_texts == ()
+
+
+def test_startup_unexpected_error_inspects_existing_attempt_before_retry_gate(
+    tmp_path, monkeypatch
+):
+    settings = make_settings(
+        tmp_path,
+        enable_h3_submit=True,
+        minimax_api_key="mm",
+        autodl_art_token="art",
+    )
+    cid, _ = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    prepared_input.write_prepared_input(
+        root=cdir,
+        source=cdir / "source.mp4",
+        audio=None,
+        keyframes=[cdir / "work" / "keyframes" / "01.png"],
+        visual=cdir / "work" / "visual_prompt.txt",
+        final=cdir / "work" / "prompt.txt",
+        dialogue_mode="none",
+        dialogue=(),
+        vocal_filter_enabled=True,
+        duration_s=9.2,
+        ratio="9:16",
+        fit_mode="none",
+        engine_request={"duration": 10},
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        dialogue_mode="none",
+        fit_mode="none",
+        prepared_dialogue=[],
+        prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
+        generation={
+            "status": "running",
+            "error": None,
+            "attempt": 1,
+            "client_request_id": REQUEST_ID,
+        },
+    )
+    inspected = []
+
+    monkeypatch.setattr(
+        h3,
+        "resume",
+        lambda _request: (_ for _ in ()).throw(RuntimeError("unexpected provider failure")),
+    )
+
+    def inspect_running(request):
+        inspected.append(request)
+        return h3.H3Result("h3_running", "000001")
+
+    monkeypatch.setattr(h3, "inspect", inspect_running)
+    _resume_generation(settings, cid)
+
+    assert len(inspected) == 1
+    assert storage.load_meta(settings.data_dir, cid)["generation"] == {
+        "status": "resume_required",
+        "error": "h3_running",
+        "attempt": 1,
+        "client_request_id": REQUEST_ID,
+    }

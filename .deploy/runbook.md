@@ -1,0 +1,185 @@
+# duet-ad1 · H3 生产部署
+
+目标拓扑固定为 `Caddy :3211 → 127.0.0.1:3212 uvicorn`。Caddy 配置只启用 HTTP/1.1、HTTP/2；H3 是模型名，不是 HTTP/3。
+
+本 runbook 的纯文档部分 TDD=N/A；部署前仍必须运行下面的自动化测试。上线采用 fix-forward，不恢复已删除的 Seedance 提交路径。
+
+## 1. Preflight
+
+在仓库根目录执行：
+
+```bash
+cd /home/xy/duet-ad1
+test -x .venv/bin/python
+command -v ffmpeg
+command -v ffprobe
+command -v codex
+.venv/bin/python -m compileall -q app
+bash -n run.sh .deploy/smoke-h3.sh
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+config = json.loads(Path('.deploy/caddy/config.json').read_text())
+server = config['apps']['http']['servers']['srv3211']
+assert server['listen'] == [':3211']
+assert server['protocols'] == ['h1', 'h2']
+upstream = server['routes'][0]['handle'][0]['upstreams'][0]['dial']
+assert upstream == '127.0.0.1:3212'
+PY
+```
+
+确认磁盘可写且现有恢复状态不会被清理：
+
+```bash
+test -d data
+test -w data
+find data -maxdepth 4 -path '*/.h3/attempts/*/attempt.json' -type f -print | head
+```
+
+不要删除或改写既有 `prepared_input.json`、`.h3/`、`generated.mp4`；它们是恢复和防重复扣费的依据。
+
+## 2. 测试
+
+```bash
+.venv/bin/python -m pytest tests -q
+git diff --check
+systemd-analyze --user verify .deploy/systemd/duet-ad1.service
+```
+
+全量测试必须通过。此阶段不运行 smoke；smoke 会创建真实会话，并在显式解锁后触发付费 Context IR/H3 请求。
+
+## 3. 唯一 EnvironmentFile 与原 user unit
+
+生产只保留现有 `systemctl --user` 的 `duet-ad1.service`。本次把同名 unit 原地替换，不创建 root system service，也不创建第二个 user service。所有服务环境——包括非秘密的监听、PATH 和开关——统一放在：
+
+```text
+%h/.config/duet-ad1/service.env
+```
+
+先用不会把值写进 shell history 的编辑器创建/迁移环境文件：
+
+```bash
+install -d -m 0700 ~/.config/duet-ad1
+test -e ~/.config/duet-ad1/service.env || install -m 0600 /dev/null ~/.config/duet-ad1/service.env
+chmod 0600 ~/.config/duet-ad1/service.env
+${EDITOR:?set EDITOR first} ~/.config/duet-ad1/service.env
+chmod 0600 ~/.config/duet-ad1/service.env
+```
+
+首条命令只在文件不存在时创建它；重复执行不得截断或重建已有文件。在编辑器中把原 unit、旧 drop-in 和旧环境文件里的所有服务变量迁入这一份文件；不要在终端打印、复制到工单或提交到仓库。文件按实际启用能力填写以下键，秘密值在现场录入：
+
+```text
+HOST=127.0.0.1
+PORT=3212
+PATH=/home/xy/.local/bin:/home/xy/duet-ad1/.venv/bin:/usr/local/bin:/usr/bin:/bin
+DATA_DIR=/home/xy/duet-ad1/data
+
+ACCESS_TOKEN=
+ENABLE_PIPELINE=1
+MAX_UPLOAD_MB=500
+MAX_DURATION_S=15
+CODEX_TIMEOUT_S=1800
+CODEX_CONCURRENCY=10
+MAX_QUEUED=100
+VOCAL_FILTER=on
+YAMNET_MODEL_PATH=/home/xy/duet-ad1/models/yamnet.tflite
+
+ENABLE_H3_SUBMIT=1
+MINIMAX_API_KEY=
+AUTODL_ART_TOKEN=
+H3_REQUEST_TIMEOUT_S=30
+H3_UPLOAD_TIMEOUT_S=60
+H3_IR_POLL_TIMEOUT_S=900
+H3_POLL_TIMEOUT_S=1500
+H3_DOWNLOAD_TIMEOUT_S=180
+H3_POLL_INTERVAL_S=3
+
+ENABLE_SEEDREAM_EDIT=0
+ARK_API_KEY=
+SEEDREAM_MODEL=doubao-seedream-5-0-pro-260628
+SEEDREAM_CONCURRENCY=10
+
+TIKTOK_PROXY=
+DOWNLOAD_TIMEOUT_S=120
+```
+
+只有确实使用显式 Codex 认证目录时，才另加 `CODEX_HOME=/absolute/path`；否则整行省略，让 Codex 使用默认认证目录，禁止用空值覆盖。未启用的可选能力保留空凭据并关闭对应开关。`HOST=127.0.0.1`、`PORT=3212` 是 Caddy 拓扑的一部分，不得放宽为公网监听。
+
+确认 `service.env` 已完整迁移后，用仓库 unit 覆盖同名原 unit：
+
+```bash
+install -d -m 0700 ~/.config/systemd/user
+install -m 0644 .deploy/systemd/duet-ad1.service \
+  ~/.config/systemd/user/duet-ad1.service
+systemd-analyze --user verify ~/.config/systemd/user/duet-ad1.service
+```
+
+新 unit 只有一个 `EnvironmentFile=`，没有任何 inline `Environment=`。在 `daemon-reload` 前删除仅指向旧 `h3.env` 的 drop-in 和旧环境文件，确保本次重启已经只有一个环境源：
+
+```bash
+rm -f ~/.config/systemd/user/duet-ad1.service.d/h3.conf
+rm -f ~/.config/duet-ad1/h3.env
+```
+
+删除前必须确认所有变量已经迁移；上述两个精确旧路径删除后不可由本 runbook 恢复。不要运行会展开值的 `systemctl --user show ... Environment`，也不要 `cat`、`env`、`set` 或 shell trace 读取 `service.env`。
+
+## 4. 原地发布
+
+确保代码和依赖已经位于 `/home/xy/duet-ad1`，再执行：
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable duet-ad1.service
+systemctl --user restart duet-ad1.service
+systemctl --user is-active duet-ad1.service
+journalctl --user -u duet-ad1.service --since '-2 minutes' --no-pager
+```
+
+服务必须是单进程；不要给 uvicorn 增加 `--workers`。重启时 schema v2 的 `queued/running` generation 只执行 GET-only resume，不补发供应商 POST。
+
+## 5. 健康检查
+
+先查本机 uvicorn：
+
+```bash
+curl --fail --silent --show-error \
+  http://127.0.0.1:3212/api/health
+```
+
+应返回 `{"ok":true}`。再查 Caddy 公网入口（替换成实际域名/IP；保留 3211）：
+
+```bash
+PUBLIC_BASE_URL='https://<public-host>:3211'
+curl --fail --silent --show-error \
+  "$PUBLIC_BASE_URL/api/health"
+```
+
+健康接口只证明进程和反代可达，不验证 H3 凭据、余额或付费链路。
+
+## 6. 正式 API smoke（会付费）
+
+脚本要求显式 `RUN_PAID_SMOKE=1`，默认走本机 3212，通过正式 API 创建、轮询、提交和验证 H3 成片。它不会打印 access token 或供应商凭据。
+
+```bash
+read -rsp 'ACCESS_TOKEN: ' ACCESS_TOKEN; printf '\n'
+export ACCESS_TOKEN
+RUN_PAID_SMOKE=1 \
+  .deploy/smoke-h3.sh \
+  temp/10-restore-h3-vocal-face/benchmark.mp4
+unset ACCESS_TOKEN
+```
+
+非 9:16 样本默认使用 `pad`，可在人工确认内容可裁时加 `FIT_MODE=crop`。脚本默认台词模式为 `auto`；无音轨同样合法。
+
+成功标准：创建阶段到 `done`，submit 返回 202，generation 到 `succeeded` 且 `has_video=true`。记录 cid 和 attempt 即可，不要复制 token、EnvironmentFile 或供应商响应。
+
+## 7. 失败时 fix-forward
+
+1. 停止重复点击和重复 smoke；保留 cid、`prepared_input.json`、`.h3/` 和 `meta.json`。
+2. 用 detail API 或 journal 确认是输入准备、凭据、Context IR、H3 查询/下载还是公开反代问题；不要打印环境。
+3. 修复当前 H3 代码/配置，重新运行相关测试和全量测试。
+4. 再次 `daemon-reload`（unit 有改动时）并原地 `restart`，重复本地和公网 `/health`。
+5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；确定 `failed` 才用新 id 人工 retry。`submission_unknown` 不得继续或重试，先到 MiniMax/AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
+
+禁止以 Seedance 代码、旧 unit 或旧提交开关回退；它们不再属于生产契约。若 H3 仍不可用，保持服务可读、关闭 `ENABLE_H3_SUBMIT`，修复后再开启。

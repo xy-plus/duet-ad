@@ -3,33 +3,38 @@ name: processing-state
 type: behavior
 status: done
 owner: human
-updated: 2026-08-17
-links: []
+updated: 2026-08-20
+tdd: N/A
+links: [conversation-task, submit-gate]
 ---
 
-# 处理状态机
+# 准备与生成状态
 
 ## 规则
 
-| 当 | 则 |
-| --- | --- |
-| 会话刚创建 | 状态 `queued`，界面显示「排队中」 |
-| 后台任务开始处理 | 状态转 `processing`，界面显示「处理中」，每 2 秒轮询刷新 |
-| 4fps 抽帧 → codex 沙箱处理 → 产物校验全部成功 | 状态转 `done`，停止轮询，展示结果 |
-| 所有视频：抽帧后先做场景检测（scenes.json）；仅时长 >20 秒才拆段（每段 4~15 秒），拆段后各段独立切视频 + 抽帧 + codex 并行处理 | 逐段产物聚合进 meta.segments（每段关键帧、提示词、该段台词）；台词按句子时间落入段区间归属；分段模式下该段提示词由后端加「不要生成背景音乐」+ 条件动作行两行（单段模式只加条件动作行一行） |
-| 视频 ≤20 秒（segments 为空）或场景检测失败/结果非法 | 按单段流程处理（不拆段，现有行为不变；检测失败落 meta 内部字段 scenes_note 留痕） |
-| 选了口播转换时：抽帧后先做口播听写（codex 听 work/voice.mp3，按模式保持/改编/翻译，输出带时间戳台词） | 台词经 YAMNet 声学验证（只保留真有口播声的句子，纯 BGM/唱歌的假转录丢弃）后随结果落盘（进 meta.voice_lines，detail 响应含 voice_lines 字段）；失败则整个会话 `failed` |
-| 任一步骤失败（含 codex 超时 1800s、产物校验不过、抽帧失败）；拆段模式下任一段失败 | 状态转 `failed`，`error` 展示截断后的可读原因（≤500 字；段失败会指明段号） |
-| 状态到达 `done`/`failed` | 终态，不再自动刷新；`failed` 只展示错误，无重试按钮 |
+| 阶段 | 可见状态 | 行为 |
+| --- | --- | --- |
+| 输入准备 | `queued → processing → done/failed` | 抽帧、台词准备、视觉 prompt 和 receipt 完成后才允许生成 |
+| 首次人工提交 | `generation: queued → running` | 返回 202 后后台调用 H3 `start`，先 Context IR，成功后再提交 AutoDL H3 |
+| 生成成功 | `generation: succeeded` | 原子落盘 `generated.mp4`，详情 `has_video=true` |
+| 已知 task 查询/超时、下载传输/DNS/peer 验证或输出写入/探测基础设施失败 | `generation: resume_required` | 包括 `download_dns_failed/download_peer_unverified/output_probe_failed`；保留原 request id、receipt 和 attempt，只允许原参数继续 |
+| 成片 URL、重定向、体积或媒体内容确定拒绝 | `generation: failed` | 安全拒绝码为 `download_url_rejected/download_redirect_rejected/download_too_large/download_invalid_video`；只有人工新 id retry |
+| 可确定失败 | `generation: failed` | 展示安全错误码；用户确认后必须用新 request id 创建 retry attempt |
+| 供应商 POST 结果未知 | `generation: submission_unknown` | 不猜测是否扣费；隐藏重试入口，所有再次提交返回 409，必须先到供应商侧核对 |
+| 服务重启时存在 `queued/running` | 仍读取同一冻结输入，仅执行 H3 `resume` | 恢复只查询已持久化任务并下载已有结果，不创建供应商任务 |
+| GET-only 恢复到 `ready_for_h3` | 映射为 `resume_required / ready_for_h3` | Context IR 已完成但 H3 尚未提交；必须用原 id 和冻结参数确认继续同一 attempt |
+| 用户在确定的 `failed` 后点重试 | 新 attempt，再次 `queued → running` | 必须生成新的 `client_request_id`；后端调用显式 `retry` |
 
 ## 边界
 
-- 状态只前进不回退：`queued → processing → done|failed`，无取消、无重跑
-- 后端默认并发 10（CODEX_CONCURRENCY，部署未覆盖），并发上传排队等待信号量
-- 测试配置下 `enable_pipeline=False`：会话停在 `queued`，不启动处理
-- 进程重启后 `processing` 中的会话不会自动续跑（内存后台任务）
+- `resume_required` 使用新 id 返回 409 `resume_request_id_mismatch`，台词/画幅漂移返回 409 `resume_parameters_changed`；合法继续仍返回原 attempt 数字。
+- 相同请求 id 在 active/succeeded 状态只返回既有状态；确定失败后复用旧 id 返回 409；`submission_unknown` 使用任何 id 都返回 409 `submission_outcome_unknown`。
+- active 或 succeeded 会话不接受不同 id 的并发提交。
+- 没有自动付费重试、定时重试或 Seedance 回退。
+- `ir_dialogue_mismatch` 是确定失败：Context IR 的严格小写 `<d>` 标签序列在去掉可选语言前缀后，必须与冻结台词数量、顺序、文本全等；空台词也禁止新增角色发声或 OCR 朗读。
+- `.h3/session.lock` 防止同一会话被并发推进；生产仍要求单 uvicorn 进程。
 
 ## 例子
 
-- 输入：上传 20s 合规视频 → 输出：约数分钟内状态 `queued → processing → done`
-- 输入：codex 未安装（PATH 找不到）→ 输出：`failed`，`error` 含 `codex executable not found on PATH`
+- Context IR 已完成后服务重启：恢复只 GET；到达 H3 付费边界时显示 `resume_required`，用户确认后原 attempt 继续。
+- H3 查询超时：显示 `resume_required / h3_timeout`；页面不自动 POST，用户点击“继续既有任务”仍是原 attempt。

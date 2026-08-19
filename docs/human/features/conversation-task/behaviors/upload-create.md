@@ -3,36 +3,34 @@ name: upload-create
 type: behavior
 status: done
 owner: human
-updated: 2026-08-18
-links: []
+updated: 2026-08-20
+tdd: N/A
+links: [conversation-task]
 ---
 
-# 上传创建会话
+# 上传与输入准备
 
 ## 规则
 
 | 当 | 则 |
 | --- | --- |
-| 默认「视频链接」模式粘贴链接、或切「上传视频」选择 mp4/mov/webm 并发送（备注在表单最底，可选） | 创建会话，立即返回 201，状态 `queued`，后台开始处理 |
-| 选择口播转换（原文保持/原文改编/翻译为[语言]，默认原文保持） | 模式与目标语言随会话保存（meta 内部字段）；「翻译为」时目标语言必填 |
-| 视频无音轨 | 422 `no audio track in video`，回滚；composer 提示「该视频没有音轨，本产品仅支持带口播的视频」 |
-| 备注留空 | 标题取净化后的原文件名（去路径/控制字符、限 80 字，空则 `untitled`） |
-| 同一 IP 1 分钟内上传超过 10 次 | 第 11 次起 429 `too many uploads` |
-| 扩展名不是 .mp4/.mov/.webm | 422，指明不支持的扩展名 |
-| 文件超过 500MB（MAX_UPLOAD_MB） | 422 `file exceeds ... bytes`，已写部分删除 |
-| 视频打不开 / 时长超过 300s（MAX_DURATION_S） | 422（ffprobe 探测结果），不留会话 |
-| 任一校验失败 | 整个会话目录回滚删除，列表中不出现 |
+| 上传 `.mp4/.mov/.webm` 或提供受支持的公网视频链接 | 创建 schema v2 会话，立即进入 `queued`；文件与链接必须且只能选一个 |
+| 源视频可读且实际时长 `0 < duration_s <= min(MAX_DURATION_S, 15)` | ffprobe 校验视频流尺寸并保存实际浮点时长；画幅只在准备完成后按实际选中关键帧判断，超过时长上限返回 422 并删除会话目录 |
+| 源视频没有音轨 | 合法；自动台词、声学证据和 normalized audio 均为空，不伪造台词 |
+| 选择原文保持/改编/翻译 | 只决定自动 ASR 的准备方式；翻译必须填目标语言。最终仍在 H3 提交前选择 `auto/edit/custom/none` |
+| 自动听写有结果 | 每句做声学分类；默认只保留 `spoken` 和 `sung`，无声学人声证据的假转录丢弃并留 provenance |
+| 音轨有人声证据但听写为空 | 只重试一次听写；仍为空则记录 warning 并按无台词继续 |
+| 视觉 agent 生成提示词 | 看不到结构化台词；OCR、字幕、画面文字和备注只可作为视觉内容，不能写成角色发声 |
+| 准备完成 | 产出 1–9 张关键帧、`visual_prompt.txt`、机械组合的 `prompt.txt` 和 `prepared_input.json`，状态变为 `done` |
 
 ## 边界
 
-- 未带文件也未给链接/两者都给：400；未登录：401
-- 上传过程中前端禁止切换会话，避免打断；上传有进度条（XHR）
-- 前端仅按 MIME `video/*` 或扩展名预筛，最终以后端校验链为准
-- 本产品仅处理带口播视频：Web 端口播模式恒为三选一（默认「原文保持」），无音轨视频上传即 422；API 直接调用 `voice_mode=none` 可跳过音轨探测（兼容 curl 等存量用法）
-- 视频流式落盘，不读进内存；校验在全部写完后进行（ffprobe）
+- 同一 IP 每分钟最多创建 10 次；排队会话数由 `MAX_QUEUED` 限制。
+- `client_request_id` 可用于创建幂等；同 id 命中返回既有会话。
+- `VOCAL_FILTER=off` 可保留未分类为人声的句子，但仍记录分类；未知值按启用处理。
+- 新 schema v2 输入是单段契约；不会走旧长视频拆段生成。
 
 ## 例子
 
-- 输入：`curl -H "Authorization: Bearer $TOKEN" -F file=@clip.mp4 -F note=厨房去油 http://localhost:3211/api/conversations` → 输出：201 `{"id":"<32位hex>","status":"queued"}`
-- 输入：上传 `clip.mkv` → 输出：422 `{"detail":"unsupported extension: .mkv"}`
-- 输入：`-F voice_mode=translate -F target_language=日语`（视频无音轨）→ 输出：422 `{"detail":"no audio track in video"}`
+- 9.2 秒、无音轨、9:16 视频：准备成功，自动台词为空，引擎提交时长为 10 秒。
+- 15.01 秒视频：422，不留下会话。

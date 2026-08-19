@@ -1,4 +1,4 @@
-"""口播转换三模式：voice_mode/target_language 参数校验、音轨探测 422、meta 落盘、幂等不受影响。"""
+"""口播转换三模式：参数校验、无音轨兼容、meta 落盘和幂等。"""
 import json
 import subprocess
 
@@ -52,28 +52,28 @@ def test_translate_requires_target_language_422(client, video_1s, settings):
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
 
 
-def test_voice_mode_no_audio_422(client, video_1s, settings):
-    """无音轨视频 + 口播模式 → 422，目录回滚不残留。"""
+def test_voice_mode_no_audio_is_valid_empty_dialogue_input(client, video_1s, settings):
+    """无音轨视频合法：后续 auto 模式生成空台词，不把画面文字变成发声。"""
     r = _post(client, video_1s, {"voice_mode": "keep"})
+    assert r.status_code == 201
+    meta = _meta(settings, r.json()["id"])
+    assert meta["voice_mode"] == "keep"
+    assert meta["dialogue_mode"] == "auto"
+
+
+def test_voice_mode_none_is_retired(client, video_1s, settings):
+    """创建阶段只配置听写处理；最终无台词由提交阶段 dialogue_mode=none 表达。"""
+    r = _post(client, video_1s, {"voice_mode": "none"})
     assert r.status_code == 422
-    assert "audio" in r.json()["detail"]
+    assert "voice_mode" in r.json()["detail"]
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
 
 
-def test_voice_mode_none_skips_audio_probe(client, video_1s, settings):
-    """无音轨视频 + none 模式照常创建；meta 落 voice_mode=none、不落 target_language。"""
-    r = _post(client, video_1s, {"voice_mode": "none"})
-    assert r.status_code == 201
-    meta = _meta(settings, r.json()["id"])
-    assert meta["voice_mode"] == "none"
-    assert "target_language" not in meta
-
-
-def test_voice_mode_default_meta_is_none(client, video_1s, settings):
-    """不带 voice_mode 的请求（兼容旧客户端）落 voice_mode=none。"""
+def test_voice_mode_default_meta_is_keep(client, video_1s, settings):
+    """不带 voice_mode 时默认保留自动听写结果。"""
     r = _post(client, video_1s)
     assert r.status_code == 201
-    assert _meta(settings, r.json()["id"])["voice_mode"] == "none"
+    assert _meta(settings, r.json()["id"])["voice_mode"] == "keep"
 
 
 def test_voice_mode_translate_with_audio_ok(client, video_with_audio, settings):
@@ -135,7 +135,7 @@ def test_probe_audio_ffprobe_failure_raises(monkeypatch, tmp_path):
 
 def test_new_conversation_voice_defaults(tmp_path):
     meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
-    assert meta["voice_mode"] == "none"
+    assert meta["voice_mode"] == "keep"
     assert "target_language" not in meta
 
 

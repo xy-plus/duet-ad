@@ -3,35 +3,34 @@ name: result-display
 type: behavior
 status: done
 owner: human
-updated: 2026-08-18
-links: [postprocess]
+updated: 2026-08-20
+tdd: N/A
+links: [conversation-task, processing-state]
 ---
 
-# 结果展示
+# 结果评审与 H3 参数
 
 ## 规则
 
 | 当 | 则 |
 | --- | --- |
-| 会话 `done`（单段模式，`segments` 为空） | 依次展示：用户气泡（标题/备注）→ 原始视频 → 关键帧网格 → Seedance prompt → 后处理对话区 → 最终视频区 |
-| 会话 `done`（多段模式，`segments` 非空） | 依次展示：用户气泡 → 原始视频 → 「分段产物」逐段「第 N 段」卡片（段关键帧网格 + 段提示词卡片 + 段台词列表）→ 后处理对话区 → 最终视频区；不重复展示顶层关键帧/prompt |
-| 关键帧 1..9 张 | 按时间序网格展示，图片经鉴权接口逐张取回（fetch blob → ObjectURL） |
-| prompt 存在 | 全文展示，提供复制按钮（clipboard API，失败时降级 execCommand）；多段模式每段独立卡片 |
-| 段台词（`seg.lines`） | 该段卡片内以列表展示；空列表不展示台词区 |
-| 后处理（`postprocess`） | 后处理对话区（prompt 之后、最终视频之前）：未做（或失败可重试）且接口开放时显示入口消息「是否优化素材？」+ 是/否；已发起后以聊天消息展示请求摘要与状态/结果（进行中卡 / 优化后网格 / 失败提示）——见 `postprocess` behavior |
-| `has_video` 为真 | 最终视频区内嵌播放 `generated.mp4` 成片 |
-| `has_video` 为假 | 最终视频区显示「待提交生成」，按钮恒禁用 |
-| 侧栏列表 | 每项显示标题 + 状态徽章，按创建时间倒序 |
+| 输入准备为 `done` | 展示源视频、1–9 张关键帧、最终 H3 prompt、台词选择、画幅选择和最终视频区 |
+| `10 < duration_s <= 15` | 显示“仍可生成，但稳定性可能下降”的 warning；不阻止提交 |
+| 选择 `auto` | 使用详情 `dialogue.auto_lines` 中的自动有效台词，不允许随请求上传 `lines` |
+| 选择 `edit` | 以自动台词预填，提交至少一行 `{text,start_s,end_s}` |
+| 选择 `custom` | 提交至少一行人工台词，不依赖自动识别结果 |
+| 选择 `none` | 发声块明确写“无台词”，不允许上传 `lines` |
+| 准备完成后的全部实际关键帧都是 9:16 | 画幅固定 `none`，不能选择 crop/pad |
+| 任一实际关键帧不是 9:16 | 必须选择居中 `crop` 或黑边 `pad`，不提供静默默认值；即使源视频是 9:16，关键帧被裁成其他比例也适用 |
+| generation active | 禁用参数和提交按钮，2 秒轮询状态 |
+| generation 为 `resume_required` | 台词、画幅和请求 id 锁定，显示“继续既有任务”；确认后继续原 attempt |
+| generation 确定失败 | 展示错误和“重试生成”；点击才创建新请求 id |
+| generation 为 `submission_unknown` | 展示“先到供应商核对”的阻断说明，不显示重试按钮 |
+| `generated.mp4` 存在 | 内嵌播放 H3 最终视频 |
+| 旧会话 | 展示只读提示；不能修改台词、画幅、后处理或再次生成 |
 
 ## 边界
 
-- `has_video` 由后端按磁盘实况探测（`generated.mp4` 是否存在）
-- 分页联系表（contact_sheet_01.jpg…）不进 files 白名单；白名单仅保留旧版单页 contact_sheet.jpg 映射以兼容存量会话；前端不展示
-- 文件直链全部需要 Bearer 鉴权，不能直接 `<img src>`，故一律 blob 化
-- 「生成最终视频」按钮当前恒禁用，提示「待提交生成（接口预留，当前阶段未开放）」
-- 段关键帧取图路径 `/files/segments/N/work/keyframes/<name>`；优化图 `/files/postprocessed/<name>`（多段 `/files/segments/N/work/postprocessed/<name>`）
-
-## 例子
-
-- 输入：打开一个 `done` 会话（单段）→ 输出：原始视频 → 关键帧网格 + prompt 卡片（复制按钮）→ 后处理入口消息「是否优化素材？」→ 最终视频区「待提交生成」
-- 输入：打开一个多段 `done` 会话 → 输出：原始视频 → 逐段「第 N 段」卡片（段关键帧 + 段提示词 + 段台词）→ 后处理对话区 → 最终视频区
+- `duration_s` 展示实际 ffprobe 时长；Context IR/H3 请求使用 `ceil(duration_s)` 的整数秒，范围 1–15。
+- 所有媒体经带 Bearer 鉴权的 files API 获取，页面使用 blob URL，不暴露目录直链。
+- 画面 OCR 只在视觉 prompt 中展示；唯一发声块只由结构化台词机械生成。

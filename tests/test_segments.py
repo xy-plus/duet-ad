@@ -87,32 +87,33 @@ def test_attribute_lines_tail_within_epsilon_belongs_to_last_segment():
     assert "越界句。" not in [l["text"] for l in got[3]]
 
 
-# ---------- 后端前缀（BGM 行 [仅多段] + 条件动作行 [所有模式]，不依赖 codex 写） ----------
+# ---------- 后端前缀（仅多段 BGM 行，不依赖 codex 写） ----------
 
 
-def test_prefix_multi_segment_bgm_then_condition_line(tmp_path):
-    """多段模式：BGM 行 + 条件动作行 + 原文（条件行在 BGM 行之后、原文之前）。"""
+def test_prefix_multi_segment_bgm_only(tmp_path):
+    """多段模式只加 BGM 行，不再注入人脸动作 workaround。"""
     prompt_path = tmp_path / "prompt.txt"
     prompt_path.write_text("正文", encoding="utf-8")
-    got = pipeline._apply_prefix("正文", prompt_path, include_no_bgm=True)
-    assert got == pipeline.NO_BGM_LINE + "\n" + pipeline.FACE_HOLD_CONDITION_LINE + "\n正文"
+    got = pipeline._apply_no_bgm_prefix("正文", prompt_path, enabled=True)
+    assert got == pipeline.NO_BGM_LINE + "\n正文"
     assert prompt_path.read_text(encoding="utf-8") == got
 
 
-def test_prefix_single_segment_condition_line_only(tmp_path):
-    """单段模式无 BGM 行：条件动作行直接放 prompt 开头。"""
+def test_prefix_single_segment_is_identity_and_preserves_person_semantics(tmp_path):
+    """单段模式无前缀，原 prompt 中普通人物语义逐字保留。"""
     prompt_path = tmp_path / "prompt.txt"
-    got = pipeline._apply_prefix("正文", prompt_path, include_no_bgm=False)
-    assert got == pipeline.FACE_HOLD_CONDITION_LINE + "\n正文"
+    original = "普通人物抬手展示产品，随后自然放下。"
+    got = pipeline._apply_no_bgm_prefix(original, prompt_path, enabled=False)
+    assert got == original
     assert prompt_path.read_text(encoding="utf-8") == got
 
 
 def test_prefix_rejects_oversize(tmp_path):
-    """前缀后超 MAX_PROMPT_BYTES → PipelineError（校验在前缀插入前，机械操作须自查）。"""
+    """BGM 前缀后超 MAX_PROMPT_BYTES → PipelineError。"""
     prompt_path = tmp_path / "prompt.txt"
     big = "x" * (pipeline.MAX_PROMPT_BYTES - 1)  # 加前缀必然超限
     with pytest.raises(pipeline.PipelineError, match="prefix"):
-        pipeline._apply_prefix(big, prompt_path, include_no_bgm=True)
+        pipeline._apply_no_bgm_prefix(big, prompt_path, enabled=True)
 
 
 # ---------- ffmpeg 切段精度 ----------
@@ -174,9 +175,7 @@ def _make_segment_conversation(settings, segments, voice_mode="none"):
     """建会话 + 落 source 占位文件 + 设定 voice_mode；返回 meta。"""
     meta = storage.new_conversation(settings.data_dir, "", "clip.mp4")
     (settings.data_dir / meta["id"] / "source.mp4").write_bytes(b"fake-video")
-    if voice_mode != "none":
-        storage.update_meta(settings.data_dir, meta["id"], voice_mode=voice_mode)
-    return meta
+    return storage.update_meta(settings.data_dir, meta["id"], voice_mode=voice_mode)
 
 
 def _fake_cmd_segments(calls, segments):
@@ -204,8 +203,8 @@ def _fake_cut(source, start_s, end_s, segdir):
     (segdir / "source.mp4").write_bytes(b"fake-video")
 
 
-def test_run_single_segment_condition_line_prefix_and_no_segments_key(tmp_path, monkeypatch):
-    """segments 空（≤20s）：prompt 开头加条件动作行（无 BGM 行）、meta 不写 segments。"""
+def test_run_single_segment_has_no_prefix_and_no_segments_key(tmp_path, monkeypatch):
+    """segments 空（≤20s）：prompt 原样保留、meta 不写 segments。"""
     settings = make_settings(tmp_path)
     meta = _make_segment_conversation(settings, [])
     cid = meta["id"]
@@ -222,7 +221,7 @@ def test_run_single_segment_condition_line_prefix_and_no_segments_key(tmp_path, 
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "done", m["error"]
     assert "segments" not in m
-    assert m["prompt"] == pipeline.FACE_HOLD_CONDITION_LINE + "\n分段桩产物"  # 单段模式条件行在首行
+    assert m["prompt"] == "分段桩产物"
     (codex_call,) = calls["codex"]
     assert "分段模式" not in codex_call["prompt"]
 
@@ -653,9 +652,7 @@ def test_run_multi_segment_full_pipeline(tmp_path, monkeypatch):
         assert abs(seg["start_s"] - start) < 0.001
         assert abs(seg["end_s"] - end) < 0.001
         assert seg["keyframes"] == ["01.png", "02.png", "03.png"]
-        assert seg["prompt"] == (
-            pipeline.NO_BGM_LINE + "\n" + pipeline.FACE_HOLD_CONDITION_LINE + "\n分段桩产物"
-        )
+        assert seg["prompt"] == pipeline.NO_BGM_LINE + "\n分段桩产物"
     # 顶层 keyframes/prompt 保持空值，不重复写
     assert m["keyframes"] == [] and m["prompt"] is None
     # 句子归属：3.0s→段1；8.0s 恰在边界→段2；17.5s→段3
@@ -669,7 +666,7 @@ def test_run_multi_segment_full_pipeline(tmp_path, monkeypatch):
         )
         assert [l["text"] for l in lines] == texts
         assert (segdir / "work" / "prompt.txt").read_text(encoding="utf-8") == (
-            pipeline.NO_BGM_LINE + "\n" + pipeline.FACE_HOLD_CONDITION_LINE + "\n分段桩产物"
+            pipeline.NO_BGM_LINE + "\n分段桩产物"
         )
         assert (segdir / "work" / "manifest.json").is_file()  # 该段抽帧产物
         duration = pipeline._probe_duration(segdir / "source.mp4")

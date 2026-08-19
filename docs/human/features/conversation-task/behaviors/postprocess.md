@@ -3,37 +3,30 @@ name: postprocess
 type: behavior
 status: done
 owner: human
-updated: 2026-08-18
-links: [result-display, submit-gate]
+updated: 2026-08-20
+tdd: N/A
+links: [conversation-task, result-display]
 ---
 
-# 后处理（Seedream 图像编辑）
+# 可选关键帧后处理
 
 ## 规则
 
 | 当 | 则 |
 | --- | --- |
-| 会话 `done`、`postprocess_enabled` 为真、后处理未做（或 `failed` 可重试） | 结果区末尾（提示词之后、最终视频之前）显示助手入口消息「是否优化素材？」+「是 / 否」按钮；`postprocess_enabled` 为假时不显示入口消息 |
-| 点「是」 | 打开弹窗（原生 dialog）列出三选项：含人脸遮挡 / 去字幕水印 / 去版权物品；首次默认全选，已运行过（done/failed）则预填上次选项并提示「选项已锁定为上次选择」；至少勾选一项才可点「确认处理」；「取消」或 Esc 关闭 |
-| 点「否」 | 该入口消息原位标记已结束（按钮消失，替换为「已跳过优化，素材保持原样」），不再弹窗；页面重渲染不复活（会话内记忆） |
-| 点「确认处理」 | 提交 `{"options": {...勾选...}, "confirm": true}`；成功后弹窗关闭、入口消息隐藏、转为聊天消息流；失败（如 422/409/501）在弹窗内显示错误并恢复可编辑；409 选项不一致时按上次选项回填并提示直接确认 |
-| `postprocess.status == "running"` | 结果区（最终视频之前）以聊天消息展示：用户气泡（勾选项摘要 chips）+ 助手状态卡「正在优化素材…」；有目标帧数（m>0）时附实时进度「已完成 n/m 帧（9 帧约需 1-2 分钟）」（n=frames 已完成数、m=目标帧总数：单段 = keyframes 数，多段 = 各段 keyframes 之和）；轮询期间只刷新这条聊天消息，结果区的视频/图片元素不重建（不闪烁）；入口消息隐藏 |
-| `postprocess.status == "done"` | 聊天消息内渲染「优化后」grid（同样的卡片样式与放大灯箱），取 `postprocess.frames` 列出的帧；多段模式优化图逐段分组附在该消息内；入口消息隐藏 |
-| `postprocess.status == "failed"` | 聊天消息内显示错误文案（含失败帧名与原因）；已成功优化帧的对比图保留；入口消息恢复显示（点「是」重新发起，重跑跳过已有优化图） |
-| 多段会话 `done` | 逐段渲染「第 N 段」卡片：段关键帧 grid + 段提示词卡片（含复制按钮）+ 段台词列表；顶层不再展示单段的关键帧/提示词区 |
+| `ENABLE_SEEDREAM_EDIT=true` 且 schema v2 会话已 `done` | 显示“去字幕水印”和“去版权/品牌物品”两个 Seedream 选项 |
+| 至少选一项并严格确认 | `POST /postprocess` 返回 running，逐帧并行编辑并以 2 秒轮询展示进度 |
+| 全部帧完成 | `postprocess.status=done`，展示 `postprocessed/` 对比图 |
+| 任一帧失败 | `postprocess.status=failed`，保留成功帧；相同选项可人工重试 |
+| 旧会话 | 409 `read_only` |
 
 ## 边界
 
-- 后处理可重复提交：`running` 中再提交 409；done/failed 后可**同选项**重跑，已有优化图的帧不重复处理
-- 换选项重跑 → 409 `options changed since last run`（防止把上一次的优化图当成新选项的产物展示；例外：纯废弃形态——旧版只勾 `change_bg` 的会话——放行重跑并清除旧产物强制全帧重编辑）
-- 「含人脸遮挡」是条件式指令（含人脸则改为捂脸造型、不含人脸保持原样），由 Seedream 自己判断；后端不做人脸预判，所有帧都发编辑请求，无人脸帧输出为近似原图直接展示（将来可加输出-输入变化判定过滤，见 OPEN_ISSUE）
-- 捂脸配套的条件动作行（「如果画面中出现用手捂住脸的人物…」）由流水线机械加进 prompt 开头（多段模式在「不要生成背景音乐」行之后），后处理不再追加动作线
-- 后处理不改变会话 `status`（始终 `done`），进度与结果只看 detail 的 `postprocess` 字段
-- 后端对未处理帧并行提交编辑（进程级并发上限 `SEEDREAM_CONCURRENCY`，默认 10，单个 uvicorn 进程内跨会话共享；多 worker 部署时每进程独立限额）；任一帧失败则整体 failed、其余帧照常完成（error 列失败帧名）
-- 后端每成功一帧即写回 `postprocess.frames`（status 保持 `running`），进度随前端 2s 轮询实时推进；进入/离开 running 时前端全量重建一次，running 期间只刷新动态区
+- 当前只保留 `remove_subtitle`、`remove_brand`；`face_hold` 已删除。
+- 后处理不改变输入准备状态，也不进入冻结 H3 receipt。无论先后顺序如何，H3 都不会读取 `postprocessed/`。
+- running 时不能重复提交；done/failed 后改变选项返回 409，避免旧产物贴上新标签。
+- 该能力可关闭；关闭不影响 Context IR → H3 主链路。
 
 ## 例子
 
-- 输入：打开一个 `done` 会话（接口已开放）→ 结果区末尾入口消息点「是」→ 取消其余勾选只留「去字幕水印」→ 确认 → 输出：弹窗关闭，聊天消息出现「正在优化素材…」卡（附 n/m 帧进度），完成后「优化后」网格
-- 输入：已运行过后处理再点入口消息「是」→ 输出：弹窗预填上次选项并提示已锁定；改选项提交 → 409 时回填上次选项并提示直接确认
-- 输入：入口消息点「否」→ 输出：按钮消失、消息标记「已跳过优化，素材保持原样」，不再弹窗
+- 用户先做去字幕后再生成：页面展示优化图，但 H3 receipt 仍绑定原始或 crop/pad 派生关键帧。

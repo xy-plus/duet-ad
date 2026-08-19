@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import codex_runner, pipeline, storage, vocal, voice
+from app import codex_runner, pipeline, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
@@ -48,7 +48,9 @@ def _write_valid_package(work: Path, frames: int = 3, prompt: str = PROMPT_TEXT)
 def _make_conversation(settings, video_1s):
     meta = storage.new_conversation(settings.data_dir, "", "clip.mp4")
     shutil.copy(video_1s, settings.data_dir / meta["id"] / "source.mp4")
-    return meta
+    # 本文件既有用例模拟旧 voice_mode 会话；新 prepared-input 用例会显式补
+    # dialogue_mode + duration_s + 新 voice_mode。
+    return storage.update_meta(settings.data_dir, meta["id"], voice_mode="none")
 
 
 @pytest.fixture
@@ -316,9 +318,8 @@ def test_run_done(tmp_path, video_1s, fake_steps):
     done = storage.load_meta(settings.data_dir, cid)
     assert done["status"] == "done" and done["error"] is None
     assert done["keyframes"] == ["01.png", "02.png", "03.png"]
-    # 单段模式：条件动作行机械加在 prompt 开头（无 BGM 行），meta 与磁盘同步
-    assert done["prompt"] == pipeline.FACE_HOLD_CONDITION_LINE + "\n" + PROMPT_TEXT
-    assert done["prompt"].splitlines()[0] == pipeline.FACE_HOLD_CONDITION_LINE
+    # 单段模式不添加任何 workaround 前缀，meta 与磁盘同步
+    assert done["prompt"] == PROMPT_TEXT
     assert (cdir / "work" / "prompt.txt").read_text(encoding="utf-8") == done["prompt"]
     assert not (cdir / "preview.mp4").exists()  # 新契约不再生成占位预览
 
@@ -457,7 +458,7 @@ def test_run_codex_timeout_salvages_complete_output(tmp_path, video_1s, monkeypa
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "done"
     assert m["keyframes"] == ["01.png", "02.png", "03.png"]
-    assert m["prompt"] == pipeline.FACE_HOLD_CONDITION_LINE + "\n" + PROMPT_TEXT
+    assert m["prompt"] == PROMPT_TEXT
 
 
 def test_run_validation_failure(tmp_path, video_1s, monkeypatch):
@@ -555,6 +556,7 @@ def test_run_voice_none_does_not_call_vocal_analyze(tmp_path, video_1s, fake_ste
 def test_run_voice_vocal_filter_records_bgm_and_dropped_count(
     tmp_path, video_1s, monkeypatch
 ):
+    """句级过滤：spoken 与 sung 都保留（sung = 吟唱/唱词型台词），只丢 None 假转录。"""
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
     _set_voice_mode(settings, meta, "keep")
@@ -596,9 +598,66 @@ def test_run_voice_vocal_filter_records_bgm_and_dropped_count(
 
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done"
-    assert stored["voice_lines"] == [lines[0]]
+    assert stored["voice_lines"] == [lines[0], lines[1]]
     assert stored["has_bgm"] is True
-    assert stored["voice_lines_vocal_dropped"] == 2
+    assert stored["voice_lines_vocal_dropped"] == 1
+    assert stored["vocal_filter_enabled"] is True
+    assert stored["voice_line_provenance"] == [
+        {**lines[0], "classification": "spoken", "provenance": "asr", "kept": True},
+        {**lines[1], "classification": "sung", "provenance": "asr", "kept": True},
+        {**lines[2], "classification": None, "provenance": "asr", "kept": False},
+    ]
+
+
+def test_run_voice_vocal_filter_off_bypasses_but_records_decisions(
+    tmp_path, video_1s, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    lines = [
+        {"text": "口播", "start_s": 0.0, "end_s": 0.4},
+        {"text": "幻觉", "start_s": 0.4, "end_s": 0.9},
+    ]
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(json.dumps(lines), encoding="utf-8")
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setenv("VOCAL_FILTER", "off")
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        vocal,
+        "analyze",
+        lambda _audio: vocal.VocalAnalysis(
+            windows=[
+                vocal.VocalWindow(0, 400, sung=0.0, spoken=0.3, music=0.2),
+                vocal.VocalWindow(400, 900, sung=0.01, spoken=0.01, music=0.2),
+            ],
+            has_bgm=True,
+        ),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == lines
+    assert stored["vocal_filter_enabled"] is False
+    assert stored["voice_line_provenance"] == [
+        {**lines[0], "classification": "spoken", "provenance": "asr", "kept": True},
+        {**lines[1], "classification": None, "provenance": "asr", "kept": True},
+    ]
 
 
 def test_run_voice_vocal_failure_fails_pipeline(tmp_path, video_1s, monkeypatch):
@@ -852,6 +911,236 @@ def test_run_voice_no_audio_track_fails(tmp_path, video_1s, monkeypatch):
     assert "audio" in m["error"]
 
 
+def test_run_dialogue_auto_no_audio_is_valid_and_writes_prepared_receipt(
+    tmp_path, video_1s, monkeypatch
+):
+    """新 H3 auto：无音轨等价于空台词，视觉产物完成后必须冻结 receipt。"""
+    from app import prepared_input
+
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode="auto",
+        voice_mode="keep",
+        duration_s=10.0,
+        ratio="9:16",
+        fit_mode="none",
+    )
+
+    def fake_codex(self, workdir, prompt):
+        _write_valid_package(Path(workdir) / "work")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    cdir = settings.data_dir / meta["id"]
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == []
+    assert stored["voice_line_provenance"] == []
+    assert stored["vocal_filter_enabled"] is True
+    assert stored["prepared_input_receipt"] == prepared_input.RECEIPT_FILENAME
+    receipt_path = cdir / prepared_input.RECEIPT_FILENAME
+    assert receipt_path.is_file()
+    loaded = prepared_input.load_prepared_input(
+        cdir, receipt_path, expected_dialogue=()
+    )
+    assert loaded.dialogue_mode == "auto"
+    assert loaded.normalized_audio is None
+    assert loaded.voice_texts == ()
+
+
+def test_run_dialogue_auto_ignores_external_lines_and_isolates_visual_codex(
+    tmp_path, video_1s, monkeypatch
+):
+    """auto 只收养 _voice_step：外部/OCR 文字不能进入唯一发声块。"""
+    from app import prepared_input
+
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode="auto",
+        voice_mode="keep",
+        duration_s=10.0,
+        voice_lines=[{"text": "外部伪台词", "start_s": 0.0, "end_s": 0.8}],
+        ratio="9:16",
+        fit_mode="crop",
+    )
+    asr_line = {"text": "真实口播。", "start_s": 0.1, "end_s": 0.8}
+    maker_saw_voice_file = []
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"normalized-audio")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(
+                json.dumps([asr_line]), encoding="utf-8"
+            )
+            return
+        maker_saw_voice_file.append((work / "voice_lines.json").exists())
+        assert "最终台词由后端" in prompt
+        _write_valid_package(work, prompt="画面包装上可见 OCR ONLY。")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    cdir = settings.data_dir / meta["id"]
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert maker_saw_voice_file == [False]
+    assert stored["voice_lines"] == [asr_line]
+    assert '说出台词："真实口播。"，嘴型与画面同步' in stored["prompt"]
+    assert '说出台词："OCR ONLY"' not in stored["prompt"]
+    assert "外部伪台词" not in stored["prompt"]
+    expected = prepared_input.prepare_dialogue(
+        "auto",
+        duration_s=10,
+        automatic_lines=[{**asr_line, "classification": "spoken"}],
+    )
+    loaded = prepared_input.load_prepared_input(
+        cdir,
+        cdir / prepared_input.RECEIPT_FILENAME,
+        expected_dialogue=expected,
+    )
+    assert loaded.normalized_audio.data == b"normalized-audio"
+    assert loaded.voice_texts == ("真实口播。",)
+
+
+@pytest.mark.parametrize(
+    ("voice_mode", "target_language", "expected"),
+    [
+        ("rewrite", "", "洗稿"),
+        ("translate", "日语", "翻译成日语"),
+    ],
+)
+def test_run_dialogue_auto_preserves_requested_voice_processing_mode(
+    tmp_path, video_1s, monkeypatch, voice_mode, target_language, expected
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode="auto",
+        voice_mode=voice_mode,
+        target_language=target_language,
+        duration_s=10.0,
+        ratio="9:16",
+        fit_mode="none",
+    )
+    asr_prompts = []
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"normalized-audio")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            asr_prompts.append(prompt)
+            (work / "voice_lines.json").write_text(
+                json.dumps([{"text": "台词。", "start_s": 0.1, "end_s": 0.8}]),
+                encoding="utf-8",
+            )
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert len(asr_prompts) == 1
+    assert expected in asr_prompts[0]
+
+
+def test_run_dialogue_auto_uses_actual_12_4s_duration_and_ceil_engine_request(
+    tmp_path, video_1s, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode="auto",
+        voice_mode="keep",
+        duration_s=12.4,
+        ratio="9:16",
+        fit_mode="pad",
+    )
+    line = {"text": "第十一秒台词。", "start_s": 11.0, "end_s": 12.0}
+
+    def fake_steps(argv, *, timeout, step, cwd=None):
+        if step == "extract":
+            work = Path(argv[argv.index("--out-dir") + 1])
+            (work / "contact_sheet.jpg").write_bytes(b"sheet")
+            (work / "manifest.json").write_text(
+                json.dumps({"duration_seconds": 12.4}), encoding="utf-8"
+            )
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 12.4, "scenes": [], "segments": []}),
+                encoding="utf-8",
+            )
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"normalized-audio")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(json.dumps([line]), encoding="utf-8")
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_steps)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(voice, "probe_audio_duration", lambda _path: 12.4)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        vocal,
+        "analyze",
+        lambda _audio: vocal.VocalAnalysis(
+            windows=[vocal.VocalWindow(0, 12_400, sung=0.0, spoken=0.3, music=0.0)],
+            has_bgm=False,
+        ),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    cdir = settings.data_dir / meta["id"]
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == [line]
+    receipt = json.loads(
+        (cdir / "prepared_input.json").read_text(encoding="utf-8")
+    )
+    assert receipt["video"]["duration_s"] == 12.4
+    assert receipt["engine_request"]["context_ir"]["duration"] == 13
+    assert receipt["engine_request"]["h3"]["duration"] == 13
+
+
 def test_run_voice_codex_timeout_salvages_complete_lines(tmp_path, video_1s, monkeypatch):
     """ASR 的 codex 超时被杀但 voice_lines.json 已完整 → 收养，继续 video-maker。"""
     settings = make_settings(tmp_path)
@@ -955,9 +1244,30 @@ def test_post_triggers_pipeline_and_detail_filled(tmp_path, video_1s, fake_steps
     body = r.json()
     assert body["status"] == "done"
     assert body["keyframes"] == ["01.png", "02.png", "03.png"]
-    assert body["prompt"] == pipeline.FACE_HOLD_CONDITION_LINE + "\n" + PROMPT_TEXT
+    assert body["prompt"] == prepared_input.compose_final_prompt(PROMPT_TEXT, ())
     assert "has_preview" not in body
     assert body["error"] is None
+
+
+def test_done_fit_requirement_uses_actual_keyframes_not_source_dimensions(
+    tmp_path, video_1s, fake_steps, monkeypatch
+):
+    settings = make_settings(tmp_path, enable_pipeline=True)
+    monkeypatch.setattr(storage, "probe_video", lambda *_args: storage.VideoProbe(1.0, 90, 160))
+
+    with TestClient(create_app(settings)) as client:
+        with open(video_1s, "rb") as file:
+            created = client.post(
+                "/api/conversations",
+                headers=AUTH,
+                files={"file": ("clip.mp4", file, "video/mp4")},
+            )
+        detail = client.get(
+            f"/api/conversations/{created.json()['id']}", headers=AUTH
+        ).json()
+
+    assert detail["status"] == "done"
+    assert detail["fit_required"] is True  # fake Codex 产出 1x1 关键帧
 
 
 def test_pipeline_off_by_default(client, video_1s, monkeypatch):
@@ -1176,6 +1486,79 @@ def _spoken_analysis(spoken: bool) -> vocal.VocalAnalysis:
     )
 
 
+def _sung_analysis(sung: float) -> vocal.VocalAnalysis:
+    """声学预判桩：纯唱/吟唱音轨（spoken≈0，sung 给定为强或弱）。"""
+    return vocal.VocalAnalysis(
+        windows=[
+            vocal.VocalWindow(0, 30_000, sung=sung, spoken=0.01, music=0.8),
+        ],
+        has_bgm=True,
+    )
+
+
+def test_run_voice_empty_lines_with_sung_retries_then_warns(tmp_path, video_1s, monkeypatch):
+    """真实量化边界 51/256 算人声；两次空则明确警告并按用户确认继续无台词。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(json.dumps([]), encoding="utf-8")
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(vocal, "analyze", lambda _a: _sung_analysis(0.19921875))
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == []
+    assert stored["voice_warnings"] == [
+        "voice_lines.json empty after one retry despite vocal evidence; continuing without dialogue"
+    ]
+
+
+def test_run_voice_empty_lines_with_weak_sung_passes(tmp_path, video_1s, monkeypatch):
+    """弱 sung（纯 BGM 里蹭出的 <0.2 唱分）+ 听写为空：仍属合法「无台词」。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(json.dumps([]), encoding="utf-8")
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(vocal, "analyze", lambda _a: _sung_analysis(0.059))
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == []
+
+
 def test_run_voice_empty_lines_with_spoken_retries_and_succeeds(tmp_path, video_1s, monkeypatch):
     """音轨有人声但 codex 第一次输出空数组（随机摆烂）：重试一次听出台词 → done。"""
     settings = make_settings(tmp_path)
@@ -1213,8 +1596,8 @@ def test_run_voice_empty_lines_with_spoken_retries_and_succeeds(tmp_path, video_
     assert sum(1 for p in codex_calls if "voice.mp3" in p) == 2
 
 
-def test_run_voice_empty_lines_with_spoken_retry_still_empty_fails(tmp_path, video_1s, monkeypatch):
-    """音轨有人声、重试后仍空：失败并给出明确错误，不静默吞台词。"""
+def test_run_voice_empty_lines_with_spoken_retry_still_empty_warns(tmp_path, video_1s, monkeypatch):
+    """音轨有人声、重试后仍空：明确 warning 后继续，且不会伪造台词。"""
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
     _set_voice_mode(settings, meta, "keep")
@@ -1225,10 +1608,11 @@ def test_run_voice_empty_lines_with_spoken_retry_still_empty_fails(tmp_path, vid
         return out
 
     def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
         if "voice.mp3" in prompt:
-            (Path(workdir) / "work" / "voice_lines.json").write_text(
-                json.dumps([]), encoding="utf-8"
-            )
+            (work / "voice_lines.json").write_text(json.dumps([]), encoding="utf-8")
+        else:
+            _write_valid_package(work)
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
@@ -1238,8 +1622,9 @@ def test_run_voice_empty_lines_with_spoken_retry_still_empty_fails(tmp_path, vid
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
 
     stored = storage.load_meta(settings.data_dir, meta["id"])
-    assert stored["status"] == "failed"
-    assert "spoken" in stored["error"]
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == []
+    assert stored["voice_warnings"]
 
 
 def test_run_voice_empty_lines_without_spoken_passes(tmp_path, video_1s, monkeypatch):

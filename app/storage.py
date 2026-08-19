@@ -4,7 +4,9 @@ import shutil
 import subprocess
 import uuid
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
+from typing import NamedTuple
 
 ALLOWED_EXT = {".mp4", ".mov", ".webm"}
 _CHUNK = 1024 * 1024
@@ -16,6 +18,12 @@ _SEG_FILE_RE = re.compile(r"^([1-9]\d*)/work/(keyframes|postprocessed)/([^/]+)$"
 
 class UploadError(ValueError):
     """上传校验失败（HTTP 层转 422）。"""
+
+
+class VideoProbe(NamedTuple):
+    duration_s: float
+    width: int
+    height: int
 
 
 def _now() -> str:
@@ -34,12 +42,13 @@ def _write_meta(cdir: Path, meta: dict) -> None:
 
 
 def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_id: str = "",
-                     voice_mode: str = "none", target_language: str = "") -> dict:
+                     voice_mode: str = "keep", target_language: str = "") -> dict:
     cid = uuid.uuid4().hex
     cdir = data_dir / cid
     (cdir / "work").mkdir(parents=True)
     now = _now()
     meta = {
+        "schema_version": 2,
         "id": cid,
         "title": note or sanitize_title(orig_name),
         "note": note,
@@ -50,6 +59,10 @@ def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_i
         "keyframes": [],
         "prompt": None,
         "voice_mode": voice_mode,
+        "duration_s": None,
+        "fit_required": None,
+        "dialogue_mode": "auto",
+        "generation": None,
     }
     if client_request_id:
         meta["client_request_id"] = client_request_id
@@ -95,19 +108,6 @@ def remove_conversation(data_dir: Path, cid: str) -> None:
         shutil.rmtree(data_dir / cid, ignore_errors=True)
 
 
-def mark_submitted(data_dir: Path, cid: str, task_id: str | None) -> dict:
-    """提交成功后回写 meta：has_video/submitted_at/task_id，供幂等门控与展示。"""
-    meta = load_meta(data_dir, cid)
-    if meta is None:
-        raise ValueError(f"unknown conversation: {cid}")
-    meta["has_video"] = True
-    meta["submitted_at"] = _now()
-    meta["task_id"] = task_id
-    meta["updated_at"] = meta["submitted_at"]
-    _write_meta(data_dir / cid, meta)
-    return meta
-
-
 async def save_upload(cdir: Path, upload, max_bytes: int) -> Path:
     """流式落盘为 source.<ext>，超限即删并报错；不读进内存。"""
     ext = Path(upload.filename or "").suffix.lower()
@@ -128,11 +128,15 @@ async def save_upload(cdir: Path, upload, max_bytes: int) -> Path:
     return dest
 
 
-def probe_video(path: Path, max_duration_s: float) -> float:
-    """ffprobe 实际探测：打不开或超时即报错；时长超限即报错。"""
+def probe_video(path: Path, max_duration_s: float) -> VideoProbe:
+    """一次 ffprobe 得到源视频时长与首个视频流尺寸，并执行上传上限。"""
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "format=duration:stream=width,height",
+                "-of", "json", str(path),
+            ],
             capture_output=True, text=True, timeout=30,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
@@ -140,12 +144,26 @@ def probe_video(path: Path, max_duration_s: float) -> float:
     if r.returncode != 0:
         raise UploadError("unreadable video file")
     try:
-        duration = float(json.loads(r.stdout)["format"]["duration"])
-    except (ValueError, KeyError, TypeError) as e:
-        raise UploadError("cannot parse video duration") from e
+        payload = json.loads(r.stdout)
+        duration = float(payload["format"]["duration"])
+        stream = payload["streams"][0]
+        width, height = stream["width"], stream["height"]
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise UploadError("cannot parse video duration or dimensions") from e
+    if not isfinite(duration) or duration <= 0:
+        raise UploadError("cannot parse video duration")
+    if (
+        isinstance(width, bool)
+        or isinstance(height, bool)
+        or not isinstance(width, int)
+        or not isinstance(height, int)
+        or width <= 0
+        or height <= 0
+    ):
+        raise UploadError("cannot parse video dimensions")
     if duration > max_duration_s:
         raise UploadError(f"duration {duration:.1f}s exceeds {max_duration_s}s")
-    return duration
+    return VideoProbe(duration, width, height)
 
 
 def probe_audio(path: Path) -> bool:

@@ -16,7 +16,7 @@ except ImportError as exc:  # pragma: no cover - environment-dependent message
         "PySceneDetect is required. Install scenedetect>=0.7 in the server environment."
     ) from exc
 
-# 与 Seedance 单段上限耦合：拆段目标每段 4~15s，仅时长 >20s 才计算
+# 与当前生成链单段上限耦合：拆段目标每段 4~15s，仅时长 >20s 才计算
 SEGMENT_MIN_S = 4.0
 SEGMENT_MAX_S = 15.0
 SEGMENT_ONLY_ABOVE_S = 20.0

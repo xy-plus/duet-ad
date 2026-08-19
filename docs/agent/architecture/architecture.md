@@ -3,181 +3,150 @@ name: architecture
 type: architecture
 status: done
 owner: agent
-updated: 2026-08-18
+updated: 2026-08-20
+tdd: N/A
 links: [conversation-task]
 ---
 
 # 架构现状（How/Now）
 
-单进程 uvicorn（0.0.0.0:3211）跑 FastAPI，同源挂静态前端；上传即建 `data/<cid>/` 目录，后台任务经管道闸跑「4fps 抽帧 → [口播模式] 抽音轨 + codex 听写 + YAMNet 声学验证 → 场景检测/拆段 → 单段或多段 codex 沙箱 → 白名单校验」，状态落 `meta.json`，前端 2s 轮询。无数据库、无队列——文件系统即存储，内存即任务态。
+## 运行边界
+
+生产是单进程 uvicorn，文件系统同时承担会话存储、冻结输入和 H3 恢复日志。公网 Caddy 监听 `:3211`，仅反代到 `127.0.0.1:3212`；H3 是视频模型名，不是 HTTP/3。
+
+```mermaid
+flowchart LR
+  U[Browser / API client] -->|h1 or h2 :3211| C[Caddy]
+  C -->|127.0.0.1:3212| A[FastAPI single process]
+  A --> P[Input preparation]
+  P --> R[prepared_input.json]
+  R --> I[MiniMax Context IR]
+  I --> H[AutoDL Art MiniMax-H3]
+  H --> V[generated.mp4]
+  A -. optional, excluded from H3 .-> S[Seedream postprocess]
+```
 
 ## 模块
 
 | 模块 | 职责 | 实现的 feature |
-| ---- | -------- | -------------- |
-| `app/main.py` | 全部路由、每 IP 上传限流（10 次/分，滑动窗口）、管道闸 + 排队上限 + 创建幂等锁、StaticFiles 挂 `web/` | conversation-task |
-| `app/config.py` | `Settings` dataclass + `get_settings()` 读环境变量 | conversation-task |
-| `app/auth.py` | Bearer 口令校验（`hmac.compare_digest`） | conversation-task |
-| `app/storage.py` | 会话目录/元数据读写、上传流式落盘、ffprobe 探测、files 白名单解析 | conversation-task |
-| `app/downloader.py` | URL 视频下载（http(s) 直链 / TikTok 经 TikWM 解析）：SSRF 防护（私网 IP 拒绝、DNS pinning、跳转逐次重校验）、大小/超时上限 | conversation-task |
-| `app/pipeline.py` | 处理流水线编排（抽帧 → [口播] codex 听写/改编/翻译 → scenes 检测拆段 → 单段/多段 codex 沙箱选帧写 prompt）+ agent 产物白名单校验 | conversation-task |
-| `app/voice.py` | 口播纯函数：ffmpeg 抽音轨 work/voice.mp3、台词 JSON 白名单校验（不装 ASR 库，听写交 codex） | conversation-task |
-| `app/vocal.py` | 口播声学验证：ffmpeg 解码 → YAMNet（AudioSet 521 类，窗长 15600 样本）逐窗推理 → 句级 `spoken/sung/None` 判定 + 整片 BGM 判定；模型 sha256 校验，路径 `YAMNET_MODEL_PATH` 可覆盖 | conversation-task |
-| `app/codex_runner.py` | 沙箱化 `codex exec` 调用（argv、断网、env 清洗、超时、并发信号量） | conversation-task |
-| `app/seedance.py` | 预留的 Seedance 真实提交：三重门控 + dry-run 预检 + 脱敏 | conversation-task |
-| `app/seedance_task.py` | Ark Seedance 任务脚本（create/status；dry-run 构建校验，--confirm-submit 才真实提交） | conversation-task |
-| `app/seedream.py` | Seedream 图像编辑门控层（纯函数，无路由）：开关 + confirm 门控 + dry-run 预检 + 脱敏 | conversation-task |
-| `app/seedream_task.py` | Ark Seedream 编辑任务脚本：JSON 图生图提交 `/api/v3/images/generations`、同步响应、b64_json 严格解码落盘 | conversation-task |
-| `app/postprocess.py` | T5b 后处理编排：HTTP 门控（换选项重跑 409）+ 后台并行逐帧 Seedream 编辑（收集目标帧/条件式 face_hold 指令（Seedream 自判有无脸，无人脸帧近似原图）/按帧像素等比算 `--size` 保持宽高比/进程级信号量限并发/失败保留/取消写 failed）+ `meta.postprocess` 状态机 | conversation-task |
-| `app/sanitize.py` | 公共脱敏函数（seedance/seedream/postprocess 共用）：删 key|authorization 行 + 抹密钥字面值 + 截断 | conversation-task |
-| `app/scenes.py` | PySceneDetect 场景检测：manifest 帧按场景分组写 scenes.json + 拆段边界建议（>20s 才计算，每段 4~15s 为算法级不变量，末尾防御断言）；流水线按 segments 拆段（空则单段模式） | conversation-task |
-| `web/` | 原生 JS 单页前端（登录/会话列表/上传/轮询/结果展示），无构建 | conversation-task |
-| `skills/video-maker/` | codex agent 用的技能：`SKILL.md` + `scripts/extract_keyframes.py`、`scripts/crop_image.py`（与 web/video-maker.zip 逐字节一致） | conversation-task |
+| --- | --- | --- |
+| `app/main.py` | API、schema v2/只读门控、提交锁、异步 generation、启动恢复 | conversation-task |
+| `app/storage.py` | 会话目录、meta、上传/探测、文件白名单 | conversation-task |
+| `app/pipeline.py` | 4fps 抽帧、音频/台词准备、视觉 agent 隔离、初始 receipt | conversation-task |
+| `app/prepared_input.py` | 结构化台词、唯一发声块、文件哈希绑定、fail-closed loader | conversation-task |
+| `app/frame_fit.py` | 用户确认后把关键帧居中 crop 或黑边 pad 为 9:16 | conversation-task |
+| `app/h3.py` | Context IR → H3 的 start/inspect/resume/retry 和磁盘状态机 | conversation-task |
+| `app/voice.py` / `app/vocal.py` | 音频抽取、ASR JSON 校验、YAMNet `spoken/sung` 分类 | conversation-task |
+| `app/postprocess.py` / `app/seedream.py` | 可选去字幕/品牌关键帧编辑；不参与 H3 输入 | postprocess |
+| `app/codex_runner.py` | 本地 codex 沙箱、并发和超时；不把服务凭据交给 agent | conversation-task |
+| `web/` | 同源 UI、2 秒轮询、显式台词/画幅确认和人工重试 | conversation-task |
 
-## 数据流
+Seedance 生产提交模块已删除，`face_hold` 选项和机械提示词注入也已删除。旧实现不是部署回退面。
+
+## 输入准备数据流
 
 ```mermaid
 flowchart LR
-  U[浏览器 web/] -->|multipart 上传| API[FastAPI app/main.py]
-  API -->|流式落盘+校验| FS[data/<cid>/]
-  API -->|BackgroundTasks| PL[app/pipeline.py]
-  PL -->|--fps 4 全帧+分页联系表| EX[extract_keyframes.py]
-  PL -.->|[口播模式] ffmpeg 抽音轨| VO[work/voice.mp3]
-  PL -.->|[口播模式] 沙箱 prompt| VX[codex 听写+改编/翻译]
-  VX -.->|voice_lines.json| FS
-  PL -.->|[口播模式] YAMNet 逐窗验证| YM[app/vocal.py]
-  YM -.->|仅 spoken 句 + has_bgm| META
-  PL -->|python app/scenes.py| SC[scenes.py 场景检测]
-  SC -->|scenes.json（segments 拆段建议）| FS
-  PL -->|segments 非空: ffmpeg -ss 切段| SEG[work/segments/N/source.mp4]
-  SEG -->|--fps 4 段内抽帧| EX
-  PL -->|拷贝 skill scripts/| FS
-  PL -->|沙箱 prompt（单段或多段）| CX[codex exec 沙箱<br/>app/codex_runner.py]
-  CX -->|work/keyframes/ + work/prompt.txt| FS
-  PL -->|白名单校验| FS
-  PL -->|status/keyframes/prompt/segments/voice_lines| META[meta.json]
-  U -->|2s 轮询 GET detail| API
-  API -->|16 字段| U
-  U -.->|submit 预留| SD[app/seedance.py<br/>三重门控+dry-run 预检]
-  SD -.->|app/seedance_task.py --confirm-submit| ARK[Volcengine Ark]
-  U -.->|postprocess 确认| PP[app/postprocess.py<br/>门控+后台并行逐帧编辑]
-  PP -.->|gather 并行 seedream.edit_image<br/>confirm=True + size| SR[app/seedream.py]
-  SR -.->|app/seedream_task.py --confirm-submit| ARK
-  PP -->|work/postprocessed/ 或 segments/N/work/postprocessed/ + meta.postprocess| FS
+  A[upload or URL] --> B[ffprobe duration and dimensions]
+  B --> C[4fps extraction]
+  C --> D{audio track?}
+  D -->|yes| E[ASR then YAMNet classification]
+  D -->|no| F[legal empty dialogue]
+  E --> G[spoken plus sung effective lines]
+  F --> G
+  G --> H[visual Codex without voice_lines]
+  H --> I[visual_prompt.txt]
+  I --> J[deterministic speech block]
+  J --> K[prompt.txt plus prepared_input.json]
 ```
 
-## 状态机
+关键不变量：
 
-`queued → processing → done | failed`
+- 新会话 `schema_version=2`，有效源时长为 `(0, min(MAX_DURATION_S, 15)]`；新契约只处理单段。
+- 视觉 agent 运行时看不到 `voice_lines.json`。视觉 prompt 中的 OCR、字幕、画面文字或备注不会被解析成台词。
+- `auto` 只接受内部 ASR provenance；默认声学过滤同时保留 `spoken` 与 `sung`。`edit/custom` 只接受用户提交的结构化行；`none` 必须为空。
+- `prompt.txt` 由视觉文本和唯一结构化发声块机械组合。无台词时明确禁止角色说出画面文字。
+- Context IR 结果中的全部严格小写 `<d>...</d>` 标签在去掉每段可选 `[Language]` 前缀后，必须与冻结 `voice_texts` 在数量、顺序和文本上全等。少、多、改写、乱序、无标签或残缺标签均在 H3 POST 前失败；空台词时还会拒绝新增台词、角色发声和 OCR 朗读语义。
+- `duration_s` 以实际浮点数写 receipt；Context IR/H3 的请求时长为 `ceil(duration_s)`，范围 1–15。
+- `fit_required` 只在 pipeline `done` 时按实际选中的每张关键帧计算，不持久化源视频宽高作为第二真相。只有全部关键帧都是 9:16 才允许 `none`，任一非 9:16 就必须人工选 `crop` 或 `pad`；即使源视频是 9:16，裁过的关键帧也不能绕过。两种策略都不缩放帧，只做居中裁切或居中黑边扩画布。
+- H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/{crop|pad}/`；永不读取 `postprocessed/`。
 
-- `queued`：创建即得（`storage.new_conversation`）；拿不到管道闸的会话一直保持 queued（真排队）。
-- `processing`：`pipeline.run` 第一步置位——后台任务先经管道闸（`threading.Semaphore(codex_concurrency)`，默认 10，抽帧 + codex 全在闸内），拿到才进 pipeline（真处理）。
-- `done`：产物校验过，单段模式写顶层 `keyframes`/`prompt`；多段模式写 `segments`（各段 keyframes/prompt/台词，顶层 `keyframes`/`prompt` 保持空值）。
-- `failed`：任一步异常，写 `error`（截断 ≤500 字）；不抛回 HTTP 层。
-- 终态后另有提交标记：`mark_submitted` 写 `has_video/submitted_at/task_id`（meta 内部字段，不进 API 响应）。
-- 后处理状态机（`done` 会话上独立于主状态机运行，不影响 `status`）：`meta.postprocess.status = running → done | failed`。`running` 时再提交 409；`done/failed` 后可重跑（已有优化图跳过）；进程重启后 `running` 残留卡死（同主状态机，无恢复机制）。
-- queued 上限 `MAX_QUEUED`（默认 100）：创建时在同一把锁内数 queued 会话，超额 429 `too many queued tasks`；processing 由闸保证 ≤ 并发数，无需单独计数。
-- 只前进不回退；无取消/重跑；进程重启后 `processing` 会话不自动续跑。
+## 冻结输入
+
+`prepared_input.json` 的 schema 是 `duet.prepared-input` v1，与会话 schema v2 分开版本化。它绑定：
+
+- source、可选 normalized audio、1–9 张有序关键帧、视觉 prompt、最终 prompt 的相对路径与 SHA-256；
+- 台词 mode、标准化 lines、provenance、classification 和台词 JSON 哈希；
+- `vocal_filter.enabled`、实际 `duration_s`、`ratio=9:16`、`fit_mode`；
+- Context IR/H3 的模型、workflow、整数时长和分辨率请求。
+
+写 receipt 后立即经过同一 loader 复核；提交和重启恢复也重新加载。未知 schema/version、路径越界、文件缺失/漂移、台词漂移、最终 prompt 不是确定性组合时全部 fail closed。提交锁内会按用户最终台词和画幅选择重写 receipt，随后 H3Request 只使用当次加载的不可变 bytes。
+
+## H3 付费状态机
+
+```mermaid
+stateDiagram-v2
+  [*] --> ir_submitting: manual start or retry
+  ir_submitting --> ir_running: Context IR task id persisted
+  ir_submitting --> submission_unknown: POST outcome unknown
+  ir_running --> ready_for_h3: optimized prompt persisted
+  ready_for_h3 --> h3_submitting: allow_submit only
+  h3_submitting --> h3_running: AutoDL task id persisted
+  h3_submitting --> submission_unknown: POST outcome unknown
+  h3_running --> succeeded: download and atomic replace
+  ir_running --> retryable_failure
+  h3_running --> retryable_failure
+  ir_running --> failed
+  h3_running --> failed
+```
+
+`app/h3.py` 在每次供应商 POST 前先持久化 `submitting`，拿到 task id 后再持久化 receipt，最后才轮询。`.h3/` 的安全边界：
+
+- `session.json` 绑定 cid；`session.lock` 使用非阻塞 flock，拒绝同会话并发推进。
+- `attempts/000001/attempt.json` 以 0600 创建，后续原子写 + `fsync`；attempt state schema 为 v1。
+- input、IR task、H3 task 和最终输出各有 receipt；状态中不保存结果 URL或凭据，只保存安全错误码。
+- `start` 以同一 client id 幂等推进；公开 `resume_required` 由用户用同 id、同台词、同 fit 确认后再次调用 `start`，继续同一 receipt/attempt。只有确定 `failed` 才由新 id 调 `retry` 创建 attempt。
+- 启动 `resume` 设置 `allow_submit=false`，只对已经持久化的 task 做 GET 查询/下载，不发新的供应商 POST。`ready_for_h3`、已知 task 的查询/超时、下载传输/输出写入故障和 raw running 状态映射为 `resume_required`；`submission_unknown` 一律锁死。
+- provider 成片 URL 必须是无 userinfo 的 HTTPS，且 DNS/IP 预解析结果全部为公网地址。下载 client 不读取代理环境；响应到达后在读取 status/body 前，从 httpx network stream 取得实际 socket peer 并再次要求公网地址，从而不把预解析结果当作连接事实。无法解析 DNS、无法验证 peer、ffprobe 缺失/超时属于已有 task 的可恢复故障；预解析或实际 peer 为私网则确定拒绝。
+- 下载不跟随重定向。Content-Length 和实际流都限制为 200 MiB，内容先写同目录 0600 临时文件；ffprobe 正常执行并确认存在 video stream 且 format duration 有限并大于 0 后，才原子替换 `generated.mp4` 并 fsync。
+
+API 暴露的 coarse generation 是 `queued/running/resume_required/succeeded/failed/submission_unknown`。四类 provider 查询/超时及 `download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed` 映射为 `resume_required`；URL/实际 peer、重定向、体积、无效视频等确定性安全拒绝映射为 `failed`。服务没有自动付费重试。`submission_unknown` 对任何 id 固定返回 409 `submission_outcome_unknown`；意外 provider 异常会先 inspect，只有磁盘状态明确为确定失败时才开放新 id。
 
 ## 数据布局
 
-```
-data/<cid>/                     cid = uuid4 hex（32 位小写，目录名正则 ^[0-9a-f]{32}$）
-├── meta.json                   会话元数据（见 reference 关键数据形）
-├── source.<mp4|mov|webm>       原始上传（流式落盘）
-├── generated.mp4               真实提交成功后下载的成片（仅 submit 开启后）
-├── codex_last_message.txt      codex -o 落盘的最终消息（单段模式）
-├── scripts/                    pipeline 拷入的 skill 脚本（单段模式；crop_image.py 按相对路径引用）
+```text
+data/<cid>/
+├── meta.json                         # conversation schema v2
+├── source.<mp4|mov|webm>
+├── prepared_input.json               # duet.prepared-input v1
+├── generated.mp4                     # H3 success only
+├── .h3/
+│   ├── session.json
+│   ├── session.lock
+│   └── attempts/000001/attempt.json
 └── work/
-    ├── NN_frame_*.png          按每秒 4 帧抽取的全部帧（pipeline 预生成）
-    ├── contact_sheet(_NN).jpg  分页联系表（>24 帧时 contact_sheet_01.jpg… 分页）
-    ├── manifest.json           视频元数据 + 全部帧时间戳
-    ├── scenes.json             scenes.py 场景检测产物（场景分组 + 拆段边界建议）
-    ├── voice.mp3               口播模式抽出的音轨（16kHz 单声道）
-    ├── voice_lines.json        口播模式 codex 听写的台词（白名单校验后采信）
-    ├── keyframes/              01.png…N.png（1..9 张选定帧，白名单校验后采信；单段模式）
-    ├── prompt.txt              agent 写的 prompt（非空、≤32KB；单段模式；首行为后端机械加的条件动作行）
-    ├── postprocessed/          T5b 后处理优化图（<帧名>.png，与 keyframes/ 同名对应；单段模式）
-    ├── segments/               多段模式：每段一目录（N 从 1 起，与 segments index 对应）
-    │   └── N/
-    │       ├── source.mp4      按段边界切出的源视频（ffmpeg -ss 重编码，时长误差 <0.1s）
-    │       ├── scripts/       pipeline 拷入的 skill 脚本（每段一份；crop_image.py 按相对路径引用）
-    │       ├── codex_last_message.txt   codex -o 落盘的最终消息（每段独立）
-    │       └── work/          段 codex 的完整 SKILL.md 工作目录
-    │           ├── NN_frame_*.png  该段 4fps 抽帧
-    │           ├── contact_sheet(_NN).jpg / manifest.json   该段分页联系表 / 段元数据
-    │           ├── voice_lines.json  该段台词（按 start_s 归段；口播模式下每段都有，空数组 = 无台词）
-    │           ├── keyframes/  该段选定关键帧（1..9 张）
-    │           ├── prompt.txt  该段提示词（首两行为后端加的「不要生成背景音乐」+ 条件动作行）
-    │           └── postprocessed/  T5b 后处理优化图（与该段 keyframes/ 同名对应）
-    │   （scenes.json 不拷入段目录，全片一份在 work/；段 source.mp4/scripts 留在段根；段 codex 的 cwd 即段目录，物理隔离）
-    ├── recheck_payload.json    提交预检的瞬时产物（用完即删）
-    └── task.json               提交后脚本自写的任务状态（task_id 来源）
+    ├── manifest.json
+    ├── voice.mp3                     # optional
+    ├── voice_lines.json
+    ├── visual_prompt.txt
+    ├── prompt.txt
+    ├── keyframes/*.png
+    ├── h3_frames/{crop|pad}/*.png    # only after explicit fit choice
+    └── postprocessed/*.png           # optional display-only Seedream output
 ```
 
-## 安全模型
+旧 meta 缺 `schema_version=2` 时，详情派生 `read_only=true`；文件仍可查看，但 `/submit` 和 `/postprocess` 都拒绝修改。
 
-公网暴露 + 单口令，防线自外向内：
+## 并发、恢复与安全
 
-1. **传输入口**：`/api/conversations*` 全部要 `Authorization: Bearer`，`hmac.compare_digest` 比较；`/api/login` 同样比较后只回 `{"ok":true}`（口令由前端存 localStorage）。上传限流 10 次/分/IP（内存滑动窗口）；queued 会话超 `MAX_QUEUED` 拒新建（429）；`client_request_id` 幂等键防重复提交（查重+计数+建目录同一把锁）。
-2. **上传校验链**：扩展名白名单 → 流式落盘限大小（超限即删）→ ffprobe 实探（打不开/时长超限即 422）→ 失败整体回滚目录。详见 reference。
-3. **不信任 agent 输出**：codex 产物经 `validate_work_dir` 白名单校验才采信（关键帧 1..9 张、prompt 非空且 ≤32KB）；meta 提交标记不回 API。
-4. **files 白名单**：`resolve_file` 只映射 `source.mp4`（唯一 `source.*`）/`preview.mp4`（遗留，新契约不再生成）/`generated.mp4`/`contact_sheet.jpg`/`keyframes/<fn>`/`postprocessed/<fn>`/`segments/<N>/work/(keyframes|postprocessed)/<fn>`（N 正整数、fn 纯文件名），resolved-path 防穿越。
-5. **codex 沙箱**：argv 逐项见下表；永不 `shell=True`，永不 `--dangerously-bypass-*`；硬超时 `CODEX_TIMEOUT_S`；并发信号量 `CODEX_CONCURRENCY`。
-6. **密钥红线**：`ACCESS_TOKEN`/`ARK_API_KEY` 只存在于服务进程环境；不进日志/响应/meta.json；seedance/seedream/postprocess 报错一律 `app.sanitize.sanitize` 脱敏（删含 key|authorization 行 + 抹除密钥字面值，截 300 字）；pipeline/codex 报错先 `clean_stderr`（剔环境变量行，截 500 字）。
-7. **URL 下载 SSRF 防护**：`reference_url` 下载在后端进程内做（`app/downloader.py`），URL 不进 codex 沙箱（沙箱依旧断网，只有落盘视频进工作目录）：scheme 仅 http(s)、解析所得 IP 拒绝私网/回环/link-local/reserved、DNS pinning（解析一次固定 IP 直连，每次跳转独立重校验）、Content-Length 预检 + 流式写盘限 `MAX_UPLOAD_MB` + 整体超时 `DOWNLOAD_TIMEOUT_S`；连接/读取异常归一为 `DownloadError` → 422 + 回滚目录。
-
-### codex 沙箱 argv 逐项（`CodexRunner.build_argv`，codex-cli 0.147.0 实证）
-
-| argv 项 | 作用 |
-| --- | --- |
-| `codex exec` | 非交互执行，prompt 作位置参数 |
-| `-C <workdir>` | 工作区限定在 codex 工作目录（单段=会话目录；多段=段目录，物理隔离；段目录内嵌套 work/） |
-| `-s workspace-write` | 沙箱可写工作区、其余只读 |
-| `--skip-git-repo-check` | data/ 非 git 仓库，跳过检查 |
-| `--ephemeral` | 不持久化会话 |
-| `--color never` | 输出无 ANSI，便于 stderr 清洗 |
-| `-o <workdir>/codex_last_message.txt` | agent 最终消息落盘（多段模式随 -C 段目录各自独立，消除共享写冲突） |
-| `-c sandbox_workspace_write.network_access=false` | agent shell 断网（实证 curl 不通） |
-| `-c shell_environment_policy.inherit="core"` | 只继承核心环境（`inherit="none"` 实证会让沙箱启动器找不到 bwrap，不可用） |
-| `-c shell_environment_policy.exclude=["*KEY*","*TOKEN*","*SECRET*","*PASSWORD*"]` | 配置级剔除秘密变量（兜底） |
-
-### 环境清洗双保险及原因
-
-- **宿主进程级（必需）**：调起 codex 前 `_scrubbed_env()` 剔除名字匹配 `KEY|TOKEN|SECRET|PASSWORD`（忽略大小写）的环境变量，PATH/HOME/代理保留。原因：codex 0.147.0 的 shell 命令经 code-mode-host 执行，`shell_environment_policy` 的 inherit/exclude **拦不住**宿主秘密泄进 agent shell，必须在本进程侧清洗。
-- **codex 配置级（兜底）**：上表后两条 `-c`。
-- **推论（有意设计）**：env 清洗会杀掉 `OPENAI_API_KEY`/`CODEX_API_KEY` 类 env 认证，codex 只支持 CODEX_HOME 文件认证（HOME 保留，`~/.codex/auth.json` 可达）。
-- prompt 同时硬性禁令：只在工作目录写文件、禁止联网、禁止打印/读取任何环境变量。
-
-## 配置
-
-环境变量（`app/config.py:get_settings()`；`HOST`/`PORT` 在 `run.sh`，`ARK_API_KEY` 在 `app/seedance.py`、`YAMNET_MODEL_PATH` 在 `app/vocal.py` 直读）：
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `ACCESS_TOKEN` | 无（必填，缺则 RuntimeError） | 全站共享口令，Bearer 校验 |
-| `MAX_UPLOAD_MB` | `500` | 上传大小上限 |
-| `MAX_DURATION_S` | `300` | 视频时长上限（ffprobe 实探） |
-| `TIKTOK_PROXY` | 空 | TikTok 解析/下载走的 HTTP 代理（空 = 直连；仅 TikTok 分支用） |
-| `DOWNLOAD_TIMEOUT_S` | `120` | `reference_url` 下载与 TikWM 解析的整体超时；下载大小上限复用 `MAX_UPLOAD_MB` |
-| `ENABLE_SEEDANCE_SUBMIT` | 关 | `1/true/yes` 开启真实提交（否则 501） |
-| `ENABLE_SEEDREAM_EDIT` | 关 | `1/true/yes` 开启 Seedream 图像编辑（否则 501） |
-| `SEEDREAM_MODEL` | `doubao-seedream-5-0-pro-260628` | Seedream 编辑模型（5.0 Pro，非 Lite） |
-| `SEEDREAM_CONCURRENCY` | `10` | Seedream 后处理逐帧并行提交的进程级并发上限（asyncio 信号量；单个 uvicorn 进程内跨会话共享，多 worker 部署时每进程独立限额；≤0 钳制为 1） |
-| `DATA_DIR` | `data` | 会话数据根目录 |
-| `CODEX_TIMEOUT_S` | `1800` | codex 硬超时 |
-| `CODEX_CONCURRENCY` | `10` | 管道闸（同时处理的会话数，含抽帧 + codex）；CodexRunner 内部信号量同值兜底 |
-| `MAX_QUEUED` | `100` | queued 状态会话数上限，超过即 429 `too many queued tasks` |
-| `ENABLE_PIPELINE` | 生产默认 `1` | 关掉则上传后不跑流水线（停 `queued`） |
-| `HOST` / `PORT` | `0.0.0.0` / `3211` | run.sh 监听地址 |
-| `ARK_API_KEY` | 无 | Seedance 密钥；submit 时缺则 503；只存服务进程环境 |
-| `YAMNET_MODEL_PATH` | `models/yamnet.tflite`（仓库内置） | YAMNet 模型路径覆盖（口播声学验证用；加载前 sha256 校验，文件缺失/不符 → 会话 failed） |
-
-`ENABLE_PIPELINE` 的双默认是测试取向：`Settings` dataclass 字段默认 `False`（测试直建不跑流水线），`get_settings()` 环境默认 `"1"`（生产直跑）。
+- 上传创建的查重/排队计数在进程锁内；pipeline 使用进程信号量；提交和后处理各有每会话 asyncio 锁。
+- H3 远程调用在后台线程中执行，状态先写 meta `queued`，再写 `running`。服务启动仅扫描 schema v2 且 generation 为 `queued/running` 的会话。
+- 应用必须单进程运行。内存锁和信号量不跨 worker；不要加 `--workers`。
+- 供应商凭据只在 `Settings`/H3Request 内存中；receipt、attempt、meta、API 与安全错误都不含密钥。
+- Caddy 是唯一公网监听；uvicorn 固定 `127.0.0.1:3212`。systemd 使用 0077 umask 和外部 0600 EnvironmentFile。
 
 ## 对外接口
 
-- `GET /api/health`（无鉴权）；`POST /api/login`（口令交换）
-- `GET/POST /api/conversations`，`GET /api/conversations/{cid}`，`GET /api/conversations/{cid}/files/{name}`，`POST /api/conversations/{cid}/submit`，`POST /api/conversations/{cid}/postprocess`（均 Bearer）
-- `/`：StaticFiles 挂 `web/`（html=True）
-- 完整契约（字段/状态码/门控矩阵）见 `docs/agent/reference/reference.md`
+- HTTP：`/api/health`、`/api/login`、`/api/conversations*`；完整字段和状态码见 [reference](../reference/reference.md)。
+- Python：`prepared_input.write_prepared_input/load_prepared_input`、`h3.start/inspect/resume/retry`、`frame_fit.fit_frames`。
+- 部署：[.deploy/runbook.md](../../../.deploy/runbook.md)；systemd 示例不包含凭据。

@@ -4,10 +4,10 @@
 codex 听写台词（voice_lines.json 白名单校验，落 meta.voice_lines）→ scenes.py 场景检测
 （work/scenes.json）→ 按 segments 决定模式：
 - 单段模式（segments 空）：codex 沙箱按 SKILL.md 选帧/写 prompt → 后端白名单校验 →
-  meta 落盘（work/keyframes + work/prompt.txt，条件动作行机械加在 prompt 开头）。
+  meta 落盘（work/keyframes + work/prompt.txt，保持视觉 prompt 原文）。
 - 多段模式（segments 非空）：ffmpeg 按段边界切源视频（work/segments/N/source.mp4，
   N 从 1 起），每段独立走抽帧 → codex prompt（单段/多段共用） → 校验 → 后端机械操作在 prompt 开头加
-  「不要生成背景音乐」行 + 条件动作行（BGM 行在前、条件行在后、原文最后）；段间
+  「不要生成背景音乐」行；段间
   ThreadPoolExecutor 并发（每段目录独立，CodexRunner 自带信号量兜底）；meta.voice_lines
   按 start_s 归段（[start_s, end_s) 口径，恰在边界归后段），
   每段写 work/segments/N/work/voice_lines.json；任一段失败 → 整体 failed（error 指明段号）；
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -35,7 +36,7 @@ from pathlib import Path
 
 import cv2
 
-from app import storage, vocal, voice
+from app import prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, clean_stderr
 from app.config import Settings
 
@@ -50,9 +51,17 @@ MAX_PROMPT_BYTES = 32 * 1024
 SCENES_TIMEOUT_S = 300  # scenes.py 场景检测超时（长视频 PySceneDetect 较慢）
 CUT_DURATION_TOLERANCE_S = 0.1  # 切段时长允许误差（秒）
 NO_BGM_LINE = "不要生成背景音乐"  # 多段模式由后端机械加进 prompt 首行（不依赖 codex 写）
-# 条件动作行（所有模式由后端机械加进 prompt，不依赖 codex 写）：与 face_hold 捂脸处理配套
-FACE_HOLD_CONDITION_LINE = "如果画面中出现用手捂住脸的人物：图中所有人物在1秒内快速把手放下到一个合理的位置，然后按照正常节奏进行后续剧情。"
 _SEG_TAIL_EPS_S = 0.01  # 台词 start_s 超出末段终点 ≤0.01s（与 voice 校验容差同口径）→ 归末段
+# YAMNet 量化步长为 1/256；0.2 相邻下档 51/256 是线下真实 sung 样本。
+# 该阈值只决定空听写是否重试，不改变逐句 classify_segment 规则。
+EMPTY_TRANSCRIPT_VOCAL_EVIDENCE_MIN = 51 / 256
+EMPTY_TRANSCRIPT_WARNING = (
+    "voice_lines.json empty after one retry despite vocal evidence; "
+    "continuing without dialogue"
+)
+H3_DEFAULT_RATIO = "9:16"
+H3_DEFAULT_FIT_MODE = "none"
+H3_ENGINE_WORKFLOW = "minimax_h3_lightx2v_v5"
 # 拆段不变量（与 app/scenes.py 的算法级不变量同值；不 import scenes：scenedetect 缺依赖时
 # scenes 模块会 SystemExit，流水线不能因此加载失败）
 SEGMENT_MIN_S = 4.0
@@ -114,14 +123,44 @@ def _language_note(target_language: str) -> str:
     return f"提示词与台词使用目标语言：{target_language}。" if target_language else ""
 
 
-def _codex_prompt(cdir: Path, target_language: str = "") -> str:
+def _codex_prompt(
+    cdir: Path, target_language: str = "", *, visual_only: bool = False
+) -> str:
     parts = [
         f"按技能文档执行：{SKILL_MD}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。输入在 work/，产物（keyframes/ 与 prompt.txt）必须按文档写入 work/。"
     ]
     if target_language:
         parts.append(_language_note(target_language))
+    if visual_only:
+        parts.append(
+            "本次只生成视觉叙事 prompt：不要读取、生成、推断、改写或编排 voice_lines；"
+            "画面文字、OCR、字幕和备注只能作为可见视觉元素，禁止写成角色发声。"
+            "最终台词由后端从结构化来源机械合成。"
+        )
     parts.append(_hard_rules(cdir))
     return "\n\n".join(parts) + "\n"
+
+
+def _run_visual_codex(
+    runner,
+    cdir: Path,
+    prompt: str,
+    work: Path,
+    *,
+    isolate_dialogue: bool,
+) -> None:
+    """新 H3 契约下让视觉 Codex 看不到 voice_lines，并丢弃它越权创建的同名文件。"""
+    voice_path = work / "voice_lines.json"
+    frozen_voice = voice_path.read_bytes() if isolate_dialogue and voice_path.is_file() else None
+    if isolate_dialogue:
+        voice_path.unlink(missing_ok=True)
+    try:
+        runner.run(cdir, prompt)
+    finally:
+        if isolate_dialogue:
+            voice_path.unlink(missing_ok=True)
+            if frozen_voice is not None:
+                voice_path.write_bytes(frozen_voice)
 
 
 def _voice_prompt(cdir: Path, voice_mode: str, target_language: str, duration_s: float) -> str:
@@ -153,25 +192,57 @@ def _load_voice_lines(work: Path, duration_s: float) -> list[dict]:
     return voice.validate_voice_lines(raw, duration_s)
 
 
+def _vocal_filter_enabled() -> bool:
+    """唯一环境开关解析点；未知值按启用处理，避免误拼写静默放宽过滤。"""
+    return os.environ.get("VOCAL_FILTER", "on").strip().lower() not in {
+        "0", "off", "false"
+    }
+
+
+def _has_retryable_vocal_evidence(analysis: vocal.VocalAnalysis) -> bool:
+    """空听写重试边界：覆盖真实 51/256 sung，排除 0.059 纯 BGM。"""
+    return any(
+        window.spoken >= EMPTY_TRANSCRIPT_VOCAL_EVIDENCE_MIN
+        or window.sung >= EMPTY_TRANSCRIPT_VOCAL_EVIDENCE_MIN
+        for window in analysis.windows
+    )
+
+
 def _voice_step(
     settings: Settings, cid: str, cdir: Path, work: Path, runner,
-    voice_mode: str, target_language: str,
+    voice_mode: str, target_language: str, *, allow_no_audio: bool = False,
 ) -> list[dict]:
     """口播步（抽帧后）：抽音轨 → 声学预判 → codex 听写 → 白名单校验 → voice_lines 落 meta。
 
     台词时间戳在音频时间轴上（codex 听 voice.mp3），校验基准与提示词时长用音频实际时长
     （音频流可比容器长几十 ms，常态）；容器时长（manifest）仍供场景/拆段用。空台词数组
-    且音轨有声 → 重试一次 codex，仍空则失败；音轨无声 → 空数组合法（无台词）。失败 →
-    PipelineError 走现有 meta failed 落盘链路。返回白名单净化后的台词列表（多段模式按
-    start_s 归段用）。
+    且音轨有人声证据 → 重试一次 codex，再空则写 warning 后以无台词继续。新 auto 契约下
+    无音轨同样是合法空台词；旧 voice_mode 可保留严格失败行为。返回白名单净化后的台词列表。
     """
     target_language = (target_language or "").strip()  # 纯空白串视为缺失，不生成「翻译成   」prompt
     if voice_mode not in ("keep", "rewrite", "translate"):
         raise PipelineError(f"unknown voice_mode: {voice_mode}")
     if voice_mode == "translate" and not target_language:
         raise PipelineError("voice_mode=translate requires target_language")
-    if voice.extract_audio(cdir) is None:
-        raise PipelineError("source video has no audio track")
+    filter_enabled = _vocal_filter_enabled()
+    audio = voice.extract_audio(cdir)
+    if audio is None:
+        if not allow_no_audio:
+            raise PipelineError("source video has no audio track")
+        (work / "voice.mp3").unlink(missing_ok=True)
+        (work / "voice_lines.json").write_text("[]\n", encoding="utf-8")
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            voice_lines=[],
+            has_bgm=False,
+            vocal_filter_enabled=filter_enabled,
+            voice_line_provenance=[],
+            voice_warnings=[],
+            voice_has_retryable_vocal_evidence=False,
+            voice_lines_vocal_dropped=0,
+        )
+        return []
     try:
         manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -183,13 +254,13 @@ def _voice_step(
     if duration_s <= 0:
         raise PipelineError(f"manifest.json invalid duration: {duration_s}")
     # 台词校验基准 = 音频实际时长；probe 失败回退容器时长（旧行为）
-    audio_duration_s = voice.probe_audio_duration(work / "voice.mp3") or duration_s
+    audio_duration_s = voice.probe_audio_duration(audio) or duration_s
     # 声学分析提前到听写前：空台词数组时区分「音轨无口播（合法无台词）」与「codex 摆烂（重试兜底）」
     try:
-        analysis = vocal.analyze(work / "voice.mp3")
+        analysis = vocal.analyze(audio)
     except Exception as e:
         raise PipelineError(f"vocal classification unavailable: {e}") from None
-    has_spoken = any(w.spoken >= vocal.SPEECH_SCORE_MIN for w in analysis.windows)
+    has_vocal = _has_retryable_vocal_evidence(analysis)
     try:
         runner.run(cdir, _voice_prompt(cdir, voice_mode, target_language, audio_duration_s))
     except CodexError as e:
@@ -200,8 +271,8 @@ def _voice_step(
             raise e from None
     else:
         lines = _load_voice_lines(work, audio_duration_s)
-    if not lines and has_spoken:
-        # 音轨有人声但听写为空（codex 随机摆烂）：重试一次，仍空则失败——不静默吞台词
+    if not lines and has_vocal:
+        # 音轨有人声但听写为空：只重试一次；再次为空按用户确认继续，但必须明确留痕。
         try:
             runner.run(cdir, _voice_prompt(cdir, voice_mode, target_language, audio_duration_s))
         except CodexError as e:
@@ -211,24 +282,41 @@ def _voice_step(
                 raise e from None
         else:
             lines = _load_voice_lines(work, audio_duration_s)
-        if not lines:
-            raise PipelineError(
-                "voice_lines.json empty but audio has spoken content (retried once)"
-            )
+    warnings = [EMPTY_TRANSCRIPT_WARNING] if not lines and has_vocal else []
+    # VOCAL_FILTER=off 只旁路 keep/drop，不旁路分类：receipt 必须解释每句为何被保留。
     filtered_lines = []
-    vocal_dropped = 0
+    decisions = []
     for line in lines:
         classification = vocal.classify_segment(
             int(line["start_s"] * 1000), int(line["end_s"] * 1000), analysis.windows
         )
-        if classification == "spoken":
+        kept = not filter_enabled or classification in ("spoken", "sung")
+        decisions.append(
+            {
+                **line,
+                "classification": classification,
+                "provenance": "asr",
+                "kept": kept,
+            }
+        )
+        if kept:
             filtered_lines.append(line)
-        else:
-            vocal_dropped += 1
+    vocal_dropped = sum(not decision["kept"] for decision in decisions)
+    # 后续视觉步骤看到的 voice_lines 也只能是最终有效集，不能重新收养已过滤行。
+    (work / "voice_lines.json").write_text(
+        json.dumps(filtered_lines, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
-    changes = {"voice_lines": filtered_lines, "has_bgm": bool(analysis.has_bgm)}
-    if vocal_dropped:
-        changes["voice_lines_vocal_dropped"] = vocal_dropped
+    changes = {
+        "voice_lines": filtered_lines,
+        "has_bgm": bool(analysis.has_bgm),
+        "vocal_filter_enabled": filter_enabled,
+        "voice_line_provenance": decisions,
+        "voice_warnings": warnings,
+        "voice_has_retryable_vocal_evidence": has_vocal,
+        "voice_lines_vocal_dropped": vocal_dropped,
+    }
     storage.update_meta(settings.data_dir, cid, **changes)
     return filtered_lines
 
@@ -370,17 +458,25 @@ def attribute_lines(lines: list[dict], segments: list[dict]) -> dict[int, list[d
     return result
 
 
-def _apply_prefix(prompt: str, prompt_path: Path, *, include_no_bgm: bool) -> str:
-    """后端机械操作：条件动作行（所有模式）+ BGM 行（仅多段，在条件行之前）加进 prompt 开头并写回。
-
-    校验在前缀插入前做过（codex 原文 ≤32KB），前缀后总长复核——超限 → PipelineError。
-    """
-    lines = ([NO_BGM_LINE] if include_no_bgm else []) + [FACE_HOLD_CONDITION_LINE]
-    prefixed = "\n".join(lines) + "\n" + prompt
-    if len(prefixed.encode("utf-8")) > MAX_PROMPT_BYTES:
+def _apply_no_bgm_prefix(prompt: str, prompt_path: Path, *, enabled: bool) -> str:
+    """多段模式机械添加 BGM 禁令；单段保持原文。两者都复核最终长度。"""
+    final_prompt = f"{NO_BGM_LINE}\n{prompt}" if enabled else prompt
+    if len(final_prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
         raise PipelineError(f"prompt.txt exceeds {MAX_PROMPT_BYTES} bytes after prefix")
-    prompt_path.write_text(prefixed, encoding="utf-8")
-    return prefixed
+    prompt_path.write_text(final_prompt, encoding="utf-8")
+    return final_prompt
+
+
+def _keyframes_require_fit(work: Path, names: list[str]) -> bool:
+    """按 H3 实际接收的关键帧判断是否需要 9:16 适配。"""
+    for name in names:
+        image = cv2.imread(str(work / "keyframes" / name))
+        if image is None:
+            raise PipelineError(f"keyframe cannot be decoded: {name}")
+        height, width = image.shape[:2]
+        if width * 16 != height * 9:
+            return True
+    return False
 
 
 def _process_segment(work: Path, source: Path, seg: dict, runner,
@@ -420,7 +516,7 @@ def _process_segment(work: Path, source: Path, seg: dict, runner,
             except PipelineError:
                 raise e from None
         keyframes, prompt = validate_work_dir(segwork)
-        prompt = _apply_prefix(prompt, segwork / "prompt.txt", include_no_bgm=True)
+        prompt = _apply_no_bgm_prefix(prompt, segwork / "prompt.txt", enabled=True)
         return {
             "index": index,
             "start_s": seg["start_s"],
@@ -431,6 +527,126 @@ def _process_segment(work: Path, source: Path, seg: dict, runner,
         }
     except Exception as e:
         raise PipelineError(f"segment {index} failed: {e}") from None
+
+
+def _dialogue_for_prepared_input(
+    meta: dict,
+    mode: str,
+    voice_lines: list[dict],
+) -> tuple[dict, ...]:
+    """把 meta 中的当前有效台词转换为 prepared-input 的显式来源契约。"""
+    duration_s, _engine_duration = _prepared_durations(meta)
+    filter_enabled = meta.get("vocal_filter_enabled", _vocal_filter_enabled())
+    if not isinstance(filter_enabled, bool):
+        raise PipelineError("vocal_filter_enabled in meta must be bool")
+    if mode == "auto":
+        automatic = [
+            {
+                "text": item["text"],
+                "start_s": item["start_s"],
+                "end_s": item["end_s"],
+                "classification": item["classification"],
+                "provenance": "asr",
+            }
+            for item in meta.get("voice_line_provenance", [])
+            if item.get("kept") is True
+        ]
+        if len(automatic) != len(voice_lines):
+            raise PipelineError("automatic dialogue provenance does not match effective lines")
+        return prepared_input.prepare_dialogue(
+            "auto",
+            duration_s,
+            automatic_lines=automatic,
+            vocal_filter_enabled=filter_enabled,
+        )
+    if mode in ("edit", "custom"):
+        return prepared_input.prepare_dialogue(
+            mode,
+            duration_s,
+            supplied_lines=voice_lines,
+            vocal_filter_enabled=filter_enabled,
+        )
+    if mode == "none":
+        return prepared_input.prepare_dialogue("none", duration_s)
+    raise PipelineError(f"unknown dialogue_mode: {mode}")
+
+
+def _prepared_durations(meta: dict) -> tuple[float, int]:
+    """返回 receipt 的实际时长与 H3 整秒请求时长（向上取整，范围 1..15）。"""
+    raw = meta.get("duration_s")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise PipelineError("duration_s in meta must be a positive finite number")
+    actual = float(raw)
+    if not math.isfinite(actual) or not 0 < actual <= 15:
+        raise PipelineError("duration_s in meta must be within (0, 15]")
+    engine_duration = math.ceil(actual)
+    if not 1 <= engine_duration <= 15:
+        raise PipelineError("engine duration must be within 1..15")
+    return actual, engine_duration
+
+
+def _write_prepared_receipt(
+    settings: Settings,
+    cid: str,
+    cdir: Path,
+    work: Path,
+    source: Path,
+    keyframes: list[str],
+    visual_prompt: str,
+    dialogue_mode: str,
+    voice_lines: list[dict],
+) -> str:
+    """冻结单段 H3 输入并把 receipt 位置写入 meta；不触发任何远程请求。"""
+    current = storage.load_meta(settings.data_dir, cid)
+    if current is None:
+        raise PipelineError("conversation disappeared while preparing H3 input")
+    dialogue = _dialogue_for_prepared_input(current, dialogue_mode, voice_lines)
+    duration_s, engine_duration = _prepared_durations(current)
+    visual_path = work / "visual_prompt.txt"
+    visual_path.write_text(visual_prompt, encoding="utf-8")
+    ratio = current.get("ratio") or H3_DEFAULT_RATIO
+    fit_mode = current.get("fit_mode") or H3_DEFAULT_FIT_MODE
+    filter_enabled = current.get("vocal_filter_enabled", _vocal_filter_enabled())
+    if not isinstance(filter_enabled, bool):
+        raise PipelineError("vocal_filter_enabled in meta must be bool")
+    engine_request = {
+        "context_ir": {
+            "model": "MiniMax-H3",
+            "duration": engine_duration,
+            "ratio": ratio,
+        },
+        "h3": {
+            "workflow": H3_ENGINE_WORKFLOW,
+            "duration": engine_duration,
+            "resolution": "768p竖",
+        },
+    }
+    try:
+        frozen = prepared_input.write_prepared_input(
+            root=cdir,
+            source=source,
+            audio=(work / "voice.mp3") if (work / "voice.mp3").is_file() else None,
+            keyframes=[work / "keyframes" / name for name in keyframes],
+            visual=visual_path,
+            final=work / "prompt.txt",
+            dialogue_mode=dialogue_mode,
+            dialogue=dialogue,
+            vocal_filter_enabled=filter_enabled,
+            duration_s=duration_s,
+            ratio=ratio,
+            fit_mode=fit_mode,
+            engine_request=engine_request,
+        )
+    except prepared_input.PreparedInputError as exc:
+        raise PipelineError(f"prepared input invalid: {exc}") from None
+    final_prompt = frozen.final_prompt.data.decode("utf-8")
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        prompt=final_prompt,
+        prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
+    )
+    return final_prompt
 
 
 def run(settings: Settings, cid: str, runner) -> None:
@@ -455,24 +671,56 @@ def run(settings: Settings, cid: str, runner) -> None:
             timeout=120,
             step="extract",
         )
-        # 口播步放在抽帧之后：ASR 的输入含 work/manifest.json（抽帧步产物）
+        # 新 H3 会话以 dialogue_mode 为唯一产品契约；voice_mode 仅供旧会话内部兼容。
+        # duration_s 是上传探测后才写入的新输入契约完成标记；仅有默认字段但尚未探测，
+        # 或历史会话没有实际时长时，仍走旧流水线且不伪造 prepared receipt。
+        new_input_contract = "dialogue_mode" in meta and meta.get("duration_s") is not None
+        dialogue_mode = meta.get("dialogue_mode") if new_input_contract else None
         voice_mode = meta.get("voice_mode", "none")
         voice_lines: list[dict] | None = None
-        if voice_mode != "none":
+        if new_input_contract:
+            if dialogue_mode != "auto":
+                raise PipelineError(f"unknown initial dialogue_mode: {dialogue_mode}")
+            auto_voice_mode = meta.get("voice_mode")
+            if auto_voice_mode in (None, ""):
+                auto_voice_mode = "keep"
+            if auto_voice_mode not in ("keep", "rewrite", "translate"):
+                raise PipelineError(f"unknown voice_mode for auto dialogue: {auto_voice_mode}")
+            voice_lines = _voice_step(
+                settings,
+                cid,
+                cdir,
+                work,
+                runner,
+                auto_voice_mode,
+                meta.get("target_language") or "",
+                allow_no_audio=True,
+            )
+        elif voice_mode != "none":
             voice_lines = _voice_step(
                 settings, cid, cdir, work, runner, voice_mode,
                 meta.get("target_language") or "",
             )
         translate_lang = ""
-        if voice_mode == "translate":
+        if not new_input_contract and voice_mode == "translate":
             translate_lang = (meta.get("target_language") or "").strip()
         segments = _detect_segments(settings, cid, source, work)
+        if new_input_contract and segments:
+            raise PipelineError("prepared input currently requires a single segment")
         if not segments:
-            # 单段模式：work/keyframes + work/prompt.txt，条件动作行机械加在 prompt 开头（无 BGM 行）；
+            # 单段模式：work/keyframes + work/prompt.txt，不注入 workaround 前缀；
             # 裁剪工具以 scripts/crop_image.py 相对工作目录引用，scripts/ 拷进会话目录
             shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
             try:
-                runner.run(cdir, _codex_prompt(cdir, translate_lang))
+                _run_visual_codex(
+                    runner,
+                    cdir,
+                    _codex_prompt(
+                        cdir, translate_lang, visual_only=new_input_contract
+                    ),
+                    work,
+                    isolate_dialogue=new_input_contract,
+                )
             except CodexError as e:
                 # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
                 try:
@@ -480,9 +728,27 @@ def run(settings: Settings, cid: str, runner) -> None:
                 except PipelineError:
                     raise e from None
             keyframes, prompt = validate_work_dir(work)
-            prompt = _apply_prefix(prompt, work / "prompt.txt", include_no_bgm=False)
+            prompt = _apply_no_bgm_prefix(prompt, work / "prompt.txt", enabled=False)
+            fit_required = _keyframes_require_fit(work, keyframes)
+            if new_input_contract:
+                prompt = _write_prepared_receipt(
+                    settings,
+                    cid,
+                    cdir,
+                    work,
+                    source,
+                    keyframes,
+                    prompt,
+                    dialogue_mode,
+                    voice_lines or [],
+                )
             storage.update_meta(
-                settings.data_dir, cid, status="done", keyframes=keyframes, prompt=prompt
+                settings.data_dir,
+                cid,
+                status="done",
+                keyframes=keyframes,
+                prompt=prompt,
+                fit_required=fit_required,
             )
         else:
             # 多段模式：各段目录独立、无共享状态，线程池并发；CodexRunner.run 自带信号量兜底

@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -7,8 +7,16 @@ from pathlib import Path
 class Settings:
     access_token: str
     max_upload_mb: int = 500
-    max_duration_s: int = 300
-    enable_seedance_submit: bool = False
+    max_duration_s: int = 15
+    enable_h3_submit: bool = False
+    minimax_api_key: str = field(default="", repr=False)
+    autodl_art_token: str = field(default="", repr=False)
+    h3_request_timeout_s: float = 30.0
+    h3_upload_timeout_s: float = 60.0
+    h3_ir_poll_timeout_s: float = 900.0
+    h3_poll_timeout_s: float = 1500.0
+    h3_download_timeout_s: float = 180.0
+    h3_poll_interval_s: float = 3.0
     enable_seedream_edit: bool = False
     seedream_model: str = "doubao-seedream-5-0-pro-260628"
     # Seedream 后处理逐帧并行提交的进程级并发上限（asyncio 信号量，单进程内跨会话全局；≤0 钳制为 1）
@@ -32,8 +40,16 @@ def get_settings() -> Settings:
     return Settings(
         access_token=token,
         max_upload_mb=int(os.environ.get("MAX_UPLOAD_MB", "500")),
-        max_duration_s=int(os.environ.get("MAX_DURATION_S", "300")),
-        enable_seedance_submit=os.environ.get("ENABLE_SEEDANCE_SUBMIT", "").lower() in ("1", "true", "yes"),
+        max_duration_s=int(os.environ.get("MAX_DURATION_S", "15")),
+        enable_h3_submit=os.environ.get("ENABLE_H3_SUBMIT", "").lower() in ("1", "true", "yes"),
+        minimax_api_key=os.environ.get("MINIMAX_API_KEY", "").strip(),
+        autodl_art_token=os.environ.get("AUTODL_ART_TOKEN", "").strip(),
+        h3_request_timeout_s=float(os.environ.get("H3_REQUEST_TIMEOUT_S", "30")),
+        h3_upload_timeout_s=float(os.environ.get("H3_UPLOAD_TIMEOUT_S", "60")),
+        h3_ir_poll_timeout_s=float(os.environ.get("H3_IR_POLL_TIMEOUT_S", "900")),
+        h3_poll_timeout_s=float(os.environ.get("H3_POLL_TIMEOUT_S", "1500")),
+        h3_download_timeout_s=float(os.environ.get("H3_DOWNLOAD_TIMEOUT_S", "180")),
+        h3_poll_interval_s=float(os.environ.get("H3_POLL_INTERVAL_S", "3")),
         enable_seedream_edit=os.environ.get("ENABLE_SEEDREAM_EDIT", "").lower() in ("1", "true", "yes"),
         seedream_model=os.environ.get("SEEDREAM_MODEL", "doubao-seedream-5-0-pro-260628"),
         seedream_concurrency=max(1, int(os.environ.get("SEEDREAM_CONCURRENCY", "10"))),

@@ -1,22 +1,19 @@
 """Seedream 后处理编排：HTTP 门控 + 后台并行逐帧编辑。
 
-门控顺序（仿 seedance.submit 模式）：ENABLE_SEEDREAM_EDIT 关 → 501；会话不存在 → 404；
-confirm 非严格 True → 409；三选项至少选一否则 422（非 bool 值 → 422 明确类型错误）；
+门控顺序：ENABLE_SEEDREAM_EDIT 关 → 501；会话不存在 → 404；
+confirm 非严格 True → 409；字幕/品牌选项至少选一否则 422（未知键或非 bool 值 → 422）；
 status != done → 409；meta.postprocess 已在 running → 409；上次 done/failed 的 options 与本次
-不同 → 409（防旧产物贴新标签，锁定比对只认当前 OPTION_KEYS 共有键——旧会话四键
-options 里的废弃键忽略；纯废弃形态放行并清旧产物）；锁内复查（running / 产物完整）后置 running。
+不同 → 409（防旧产物贴新标签，锁定比对只认当前 OPTION_KEYS 共有键——旧状态中的
+废弃键忽略；纯废弃形态放行并清旧产物）；锁内复查（running / 产物完整）后置 running。
 后台任务（BackgroundTasks，独立路径不吃管道闸；可并发，每会话一把锁）：
 收集目标帧（单段 work/keyframes/*.png；多段 work/segments/N/work/keyframes/*.png）→ 按勾选选项
-构造中文编辑指令（多选项分号连接；face_hold 为条件式指令——含人脸则捂脸、不含人脸保持原样，
-条件句放最前，所有帧都发编辑请求，不做人脸预判/过滤）→ 未跳过帧 asyncio.gather 并行
+构造中文编辑指令（多选项分号连接）→ 未跳过帧 asyncio.gather 并行
 seedream.edit_image(confirm=True, size=按帧像素等比放大的 "WxH")，进程级信号量（主进程
 seedream_sem，SEEDREAM_CONCURRENCY）限并发 → 产出写 work/postprocessed/<帧名>.png 或
 work/segments/N/work/postprocessed/<帧名>.png → 任一帧失败整体 failed（error 列失败帧名；
 其余帧照常跑完，已成功帧保留且重跑跳过）→
 meta.postprocess = {status: running|done|failed, options, frames, error}（内部字段；
 running 期间每成功一帧即写回 frames，前端 2s 轮询据此显示 n/m 实时进度）。
-无人脸帧的编辑输出为近似原图（seedream 条件指令已实证能正确区分），直接存 postprocessed 展示；
-将来可加输入-输出变化判定过滤（见 OPEN_ISSUE）。
 """
 
 from __future__ import annotations
@@ -31,10 +28,9 @@ from app import seedream, storage
 from app.config import Settings
 from app.sanitize import sanitize
 
-OPTION_KEYS = ("face_hold", "remove_subtitle", "remove_brand")
+OPTION_KEYS = ("remove_subtitle", "remove_brand")
 
 _INSTRUCTIONS = {
-    "face_hold": "如果图片中含有人脸：将图片中的人物改为用手捂住脸的造型。如果图片中不含人脸：跳过捂脸处理，仅执行其余修改。",
     "remove_subtitle": "移除图片中的所有字幕、水印和贴纸元素，其余（尺寸、内容等）保持不变",
     "remove_brand": "图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余（尺寸、内容等）保持不变",
 }
@@ -202,8 +198,8 @@ def _fit_size(w: int, h: int) -> str:
 
 
 def _options_match(last_options: object, options: dict[str, bool]) -> bool:
-    """锁定比对只认当前 OPTION_KEYS 内共有键：旧会话 options 里的废弃键忽略（历史会话可能
-    存四键 options）；上次 options 非 dict（如 None）一律视为不一致；
+    """锁定比对只认当前 OPTION_KEYS 内共有键：旧状态 options 里的废弃键忽略；
+    上次 options 非 dict（如 None）一律视为不一致；
     纯废弃形态（上次在当前键上无任何 True，如旧版只勾 change_bg）视为无锁定放行——
     否则该类会话永久 409 无出口。"""
     if not isinstance(last_options, dict):
@@ -236,10 +232,13 @@ def _clear_postprocessed(cdir: Path, meta: dict) -> None:
 
 
 def _parse_options(payload: dict) -> dict[str, bool]:
-    """options 白名单校验：至少选一，否则 422；选项值非 bool → 422 明确类型错误；未知键忽略。"""
+    """options 白名单校验：未知键、非 bool 或未选中任何选项均 fail closed 为 422。"""
     raw = payload.get("options")
     if not isinstance(raw, dict):
         raise PostprocessError(422, "at least one option required")
+    unknown = sorted(set(raw) - set(OPTION_KEYS))
+    if unknown:
+        raise PostprocessError(422, f"unknown options: {', '.join(unknown)}")
     options: dict[str, bool] = {}
     for key in OPTION_KEYS:
         value = raw.get(key)
@@ -292,12 +291,5 @@ def _write_progress(
 
 
 def _build_instruction(options: dict[str, bool]) -> str:
-    """多选项合并为一条指令（分号连接）；face_hold 条件句放最前（无人脸帧由 seedream 保持原样）。"""
-    parts = []
-    if options.get("face_hold"):
-        parts.append(_INSTRUCTIONS["face_hold"])
-    if options.get("remove_subtitle"):
-        parts.append(_INSTRUCTIONS["remove_subtitle"])
-    if options.get("remove_brand"):
-        parts.append(_INSTRUCTIONS["remove_brand"])
-    return "；".join(parts)
+    """按稳定白名单顺序将多选项合并为一条指令（分号连接）。"""
+    return "；".join(_INSTRUCTIONS[key] for key in OPTION_KEYS if options.get(key))

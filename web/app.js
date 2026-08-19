@@ -22,6 +22,8 @@ const state = {
   objectURLs: [],      // 当前 stream 渲染产生的 blob URL，重渲染前统一 revoke
   ppDetail: null,      // 后处理弹窗对应的会话详情
   ppAskDismissed: {},  // cid → true：后处理入口消息已点「否」（会话内记忆，重渲染不复活）
+  generationDrafts: {}, // cid → 最终视频表单草稿；轮询重渲染时保留用户输入
+  generationSubmitting: {}, // cid → true：本页已有 /submit 请求在途，阻止重复提交
   detailSig: null,     // 当前已渲染详情的状态签名：轮询比对，签名不变不碰 DOM（根治轮询闪烁）
 };
 
@@ -61,6 +63,104 @@ function fmtBytes(n) {
 function newRequestId() {
   if (crypto.randomUUID) return crypto.randomUUID();
   return "rid-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 12);
+}
+
+/* 最终视频提交的纯契约能力：浏览器 UI 与无 DOM 测试共用，避免两套校验漂移。 */
+function normalizeDialogueLines(dialogue) {
+  let raw = dialogue;
+  if (!Array.isArray(raw) && raw && typeof raw === "object") {
+    raw = Array.isArray(raw.lines) ? raw.lines
+      : (Array.isArray(raw.auto_lines) ? raw.auto_lines : []);
+  }
+  if (!Array.isArray(raw)) return [];
+  return raw.map((line) => {
+    if (!line || typeof line !== "object") return null;
+    const start = Number(line.start_s !== undefined ? line.start_s : line.start);
+    const end = Number(line.end_s !== undefined ? line.end_s : line.end);
+    const text = String(line.text || "").trim();
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start >= end || !text) return null;
+    return { start_s: start, end_s: end, text };
+  }).filter(Boolean);
+}
+
+function formatDialogueLines(dialogue) {
+  return normalizeDialogueLines(dialogue)
+    .map((line) => line.start_s + " - " + line.end_s + " | " + line.text)
+    .join("\n");
+}
+
+function parseDialogueLines(text) {
+  const rows = String(text || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return rows.map((line, index) => {
+    const match = line.match(/^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\|\s*(.+)$/);
+    if (!match) throw new Error("第 " + (index + 1) + " 行格式应为：开始 - 结束 | 台词");
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    const value = match[3].trim();
+    if (start >= end) throw new Error("第 " + (index + 1) + " 行结束时间必须晚于开始时间");
+    if (!value) throw new Error("第 " + (index + 1) + " 行台词不能为空");
+    return { start_s: start, end_s: end, text: value };
+  });
+}
+
+function buildSubmitPayload(input) {
+  const dialogueMode = input.dialogueMode;
+  if (!["auto", "edit", "custom", "none"].includes(dialogueMode)) {
+    throw new Error("请选择台词模式");
+  }
+  const requestId = String(input.clientRequestId || "").trim();
+  if (!requestId) throw new Error("缺少本次生成请求标识");
+
+  let fitMode = "none";
+  if (input.fitRequired) {
+    fitMode = input.fitMode;
+    if (!["crop", "pad"].includes(fitMode)) throw new Error("请选择裁切或留边以适配画幅");
+  }
+
+  const body = {
+    confirm: true,
+    client_request_id: requestId,
+    dialogue_mode: dialogueMode,
+    fit_mode: fitMode,
+  };
+  if (dialogueMode === "edit" || dialogueMode === "custom") {
+    const lines = parseDialogueLines(input.linesText);
+    if (lines.length === 0) throw new Error("请至少填写一行台词");
+    body.lines = lines;
+  }
+  return body;
+}
+
+function generationAction(status) {
+  if (status === null || status === undefined) return "new";
+  if (status === "failed") return "retry";
+  if (status === "resume_required") return "resume";
+  return "none";
+}
+
+function buildResumePayload(detail) {
+  const generation = detail && detail.generation;
+  const dialogue = detail && detail.dialogue;
+  if (!generation || generation.status !== "resume_required") throw new Error("当前任务无需继续");
+  if (typeof generation.client_request_id !== "string" || !generation.client_request_id.trim()) {
+    throw new Error("缺少既有任务请求标识");
+  }
+  if (!dialogue || !["auto", "edit", "custom", "none"].includes(dialogue.mode)) {
+    throw new Error("既有任务台词模式无效");
+  }
+  if (!["none", "crop", "pad"].includes(detail.fit_mode)) throw new Error("既有任务画幅模式无效");
+
+  const body = {
+    confirm: true,
+    client_request_id: generation.client_request_id,
+    dialogue_mode: dialogue.mode,
+    fit_mode: detail.fit_mode,
+  };
+  if (dialogue.mode === "edit" || dialogue.mode === "custom") {
+    if (!Array.isArray(dialogue.lines) || dialogue.lines.length === 0) throw new Error("既有任务台词缺失");
+    body.lines = dialogue.lines;
+  }
+  return body;
 }
 
 function fmtTime(iso) {
@@ -280,7 +380,7 @@ function renderEmptyHero() {
   iconBox.appendChild(icon("i-film"));
   hero.appendChild(iconBox);
   hero.appendChild(el("h2", null, "上传参考视频，生成复刻配方"));
-  hero.appendChild(el("p", "empty-sub", "AI 会抽取关键帧并生成 Seedance 提示词"));
+  hero.appendChild(el("p", "empty-sub", "AI 会抽取关键帧并准备 H3 视频生成"));
   const steps = el("ol", "empty-steps");
   const items = [
     "点击回形针或把视频拖进输入框",
@@ -437,7 +537,7 @@ function renderResults(detail) {
     }
     if (detail.prompt) {
       const sec = el("section", "res-section");
-      sec.appendChild(el("h3", "res-h3", "Seedance 提示词"));
+      sec.appendChild(el("h3", "res-h3", "H3 提示词"));
       sec.appendChild(promptCard(detail.prompt));
       frag.appendChild(sec);
     }
@@ -446,26 +546,272 @@ function renderResults(detail) {
   return frag;
 }
 
-/* 最终视频区（结果区最后一段）：已提交生成则播放成片，否则显示「待提交生成」（提交接口预留未开放） */
-function renderFinalSection(detail) {
-  if (detail.has_video) {
-    return videoSection(detail, "generated.mp4", "最终视频", "Seedance 生成成片");
+function canOperate(detail) {
+  // 缺少新契约字段的旧会话按只读处理，避免旧 UI 状态绕过服务端门控。
+  return detail.read_only === false && detail.submit_enabled === true;
+}
+
+function generationDraft(detail) {
+  let draft = state.generationDrafts[detail.id];
+  if (!draft) {
+    draft = {
+      dialogueMode: "auto",
+      editLinesText: formatDialogueLines(detail.dialogue),
+      customLinesText: "",
+      fitMode: "",
+      receiptVersion: detail.receipt_version,
+    };
+    state.generationDrafts[detail.id] = draft;
+  } else if (draft.receiptVersion !== detail.receipt_version && !draft.editTouched) {
+    draft.editLinesText = formatDialogueLines(detail.dialogue);
+    draft.receiptVersion = detail.receipt_version;
   }
+  return draft;
+}
+
+function choice(name, value, label, checked) {
+  const item = el("label", "final-choice");
+  const input = el("input");
+  input.type = "radio";
+  input.name = name;
+  input.value = value;
+  input.checked = checked;
+  item.appendChild(input);
+  item.appendChild(el("span", null, label));
+  return item;
+}
+
+function setGenerationCardBusy(card, busy) {
+  card.querySelectorAll("input, textarea, button").forEach((control) => {
+    control.disabled = busy;
+  });
+  const button = card.querySelector(".generation-submit");
+  if (button && busy) button.textContent = "正在提交…";
+}
+
+async function submitGeneration(detail, card) {
+  const generation = detail.generation || {};
+  const action = generationAction(generation.status);
+  if (!canOperate(detail) || state.generationSubmitting[detail.id]
+      || (action !== "new" && action !== "retry")) return;
+  const draft = generationDraft(detail);
+  const errorBox = card.querySelector(".generation-form-error");
+  let body;
+  try {
+    // 每次用户明确点击都代表一个新 attempt；失败后的重试绝不复用旧键。
+    body = buildSubmitPayload({
+      clientRequestId: newRequestId(),
+      dialogueMode: draft.dialogueMode,
+      linesText: draft.dialogueMode === "edit" ? draft.editLinesText : draft.customLinesText,
+      fitRequired: detail.fit_required === true,
+      fitMode: draft.fitMode,
+    });
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.hidden = false;
+    return;
+  }
+
+  await postGeneration(detail, card, body);
+}
+
+async function resumeGeneration(detail, card) {
+  if (!canOperate(detail) || state.generationSubmitting[detail.id]
+      || generationAction(detail.generation && detail.generation.status) !== "resume") return;
+  const errorBox = card.querySelector(".generation-form-error");
+  let body;
+  try {
+    body = buildResumePayload(detail);
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.hidden = false;
+    return;
+  }
+  await postGeneration(detail, card, body);
+}
+
+async function postGeneration(detail, card, body) {
+  const generation = detail.generation || {};
+  const errorBox = card.querySelector(".generation-form-error");
+  errorBox.hidden = true;
+  state.generationSubmitting[detail.id] = true;
+  setGenerationCardBusy(card, true);
+  let accepted = false;
+  try {
+    await apiJSON("/api/conversations/" + encodeURIComponent(detail.id) + "/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    accepted = true;
+    await loadDetail(detail.id, true);
+    // 极短暂的详情落盘延迟也不能开放第二次 POST；保持禁用并继续 GET 轮询。
+    if (state.generationSubmitting[detail.id]) startPolling(detail.id);
+  } catch (error) {
+    if (handleAuthError(error)) return;
+    errorBox.textContent = error.message;
+    errorBox.hidden = false;
+    // POST 断线时结果可能未知：先 GET 当前状态再开放重试，但绝不自动再次 POST。
+    state.generationSubmitting[detail.id] = false;
+    await loadDetail(detail.id, true);
+  } finally {
+    if (!accepted) state.generationSubmitting[detail.id] = false;
+    if (!state.generationSubmitting[detail.id] && card.isConnected) {
+      setGenerationCardBusy(card, false);
+      const button = card.querySelector(".generation-submit");
+      if (button) {
+        const action = generationAction(generation.status);
+        button.textContent = action === "resume" ? "继续既有任务" : (action === "retry" ? "重试生成" : "生成最终视频");
+      }
+    }
+  }
+}
+
+/* 最终视频区：H3 生成参数、异步状态、失败后的显式重试和历史成片都在同一卡片。 */
+function renderFinalSection(detail) {
+  const generation = detail.generation || { status: null, error: null, attempt: null };
+  if (detail.has_video) {
+    return videoSection(detail, "generated.mp4", "最终视频", "H3 生成成片");
+  }
+
   const sec = el("section", "res-section");
   const card = el("div", "final-card");
-  card.appendChild(el("h3", "res-h3", "最终视频"));
+  card.appendChild(el("h3", "res-h3", "最终视频 · H3"));
+
+  const duration = Number(detail.duration_s);
+  if (duration > 10 && duration <= 15) {
+    const warning = el("p", "final-warning");
+    warning.appendChild(icon("i-alert"));
+    warning.appendChild(el("span", null, "视频超过 10 秒，仍可生成，但结果稳定性可能下降。"));
+    card.appendChild(warning);
+  }
+
+  if (generation.status === "queued" || generation.status === "running") {
+    const status = el("div", "generation-status is-running");
+    status.appendChild(el("strong", null, generation.status === "queued" ? "H3 已排队" : "H3 正在生成"));
+    status.appendChild(el("span", null, generation.attempt ? "第 " + generation.attempt + " 次尝试" : "请稍候，页面会自动更新"));
+    card.appendChild(status);
+  } else if (generation.status === "failed" || generation.status === "submission_unknown") {
+    const status = el("div", "generation-status is-error");
+    status.appendChild(el("strong", null, generation.status === "submission_unknown" ? "提交结果未知" : "H3 生成失败"));
+    status.appendChild(el("span", null, generation.error || "后端未返回具体原因"));
+    card.appendChild(status);
+  } else if (generation.status === "resume_required") {
+    const status = el("div", "generation-status is-resume");
+    status.appendChild(el("strong", null, "既有 H3 任务等待继续"));
+    status.appendChild(el("span", null, generation.error || "任务已保存，可从原进度继续"));
+    card.appendChild(status);
+  }
+
+  if (generation.status === "submission_unknown") {
+    card.appendChild(el("p", "final-caption", "提交结果未知，禁止重复提交；请先在 provider 侧核对任务。"));
+    sec.appendChild(card);
+    return sec;
+  }
+
+  if (!canOperate(detail)) {
+    card.appendChild(el("p", "final-caption", "此会话为只读状态，不能修改台词、画幅、后处理或再次生成。"));
+    sec.appendChild(card);
+    return sec;
+  }
+
+  if (generationAction(generation.status) === "resume") {
+    const locked = el("div", "resume-lock");
+    locked.appendChild(el("strong", null, "继续既有任务"));
+    locked.appendChild(el("p", null, "将使用已保存的请求标识、台词和画幅设置原样继续；这些参数已锁定。"));
+    card.appendChild(locked);
+    const errorBox = el("p", "form-error generation-form-error");
+    errorBox.hidden = true;
+    card.appendChild(errorBox);
+    const row = el("div", "final-row");
+    const button = el("button", "btn btn-primary generation-submit", "继续既有任务");
+    button.type = "button";
+    button.addEventListener("click", () => resumeGeneration(detail, card));
+    row.appendChild(button);
+    row.appendChild(el("p", "final-caption", "只恢复原任务，不会创建新付费 attempt。"));
+    card.appendChild(row);
+    if (state.generationSubmitting[detail.id]) setGenerationCardBusy(card, true);
+    sec.appendChild(card);
+    return sec;
+  }
+
+  const draft = generationDraft(detail);
+  const busy = generation.status === "queued" || generation.status === "running"
+    || !!state.generationSubmitting[detail.id];
+  const dialogueField = el("fieldset", "final-field");
+  dialogueField.appendChild(el("legend", null, "台词模式"));
+  const dialogueChoices = el("div", "final-choices");
+  const modes = [
+    ["auto", "自动台词"],
+    ["edit", "编辑识别台词"],
+    ["custom", "自定义台词"],
+    ["none", "无台词"],
+  ];
+  for (const [value, label] of modes) {
+    const item = choice("dialogue-" + detail.id, value, label, draft.dialogueMode === value);
+    const input = item.querySelector("input");
+    input.addEventListener("change", () => {
+      draft.dialogueMode = value;
+      const editor = card.querySelector(".dialogue-editor");
+      const textarea = editor.querySelector("textarea");
+      const editable = value === "edit" || value === "custom";
+      editor.hidden = !editable;
+      if (editable) textarea.value = value === "edit" ? draft.editLinesText : draft.customLinesText;
+    });
+    dialogueChoices.appendChild(item);
+  }
+  dialogueField.appendChild(dialogueChoices);
+  const autoCount = normalizeDialogueLines(detail.dialogue).length;
+  dialogueField.appendChild(el("p", "final-help", autoCount
+    ? "自动识别到 " + autoCount + " 行台词；编辑模式会以这些台词预填。"
+    : "未识别到自动台词；可改用自定义或无台词。"));
+  card.appendChild(dialogueField);
+
+  const editor = el("div", "dialogue-editor");
+  editor.hidden = draft.dialogueMode !== "edit" && draft.dialogueMode !== "custom";
+  const textarea = el("textarea", "dialogue-textarea");
+  textarea.rows = 5;
+  textarea.placeholder = "0 - 1.5 | 第一行台词\n1.5 - 3 | 第二行台词";
+  textarea.setAttribute("aria-label", "台词，每行格式为开始 - 结束 | 文本");
+  textarea.value = draft.dialogueMode === "custom" ? draft.customLinesText : draft.editLinesText;
+  textarea.addEventListener("input", () => {
+    if (draft.dialogueMode === "edit") {
+      draft.editLinesText = textarea.value;
+      draft.editTouched = true;
+    } else {
+      draft.customLinesText = textarea.value;
+    }
+  });
+  editor.appendChild(textarea);
+  editor.appendChild(el("p", "final-help", "每行格式：开始秒 - 结束秒 | 台词。自定义模式不受识别结果限制。"));
+  card.appendChild(editor);
+
+  if (detail.fit_required === true) {
+    const fitField = el("fieldset", "final-field");
+    fitField.appendChild(el("legend", null, "源画幅需要适配"));
+    const fitChoices = el("div", "final-choices");
+    for (const [value, label] of [["crop", "裁切画面"], ["pad", "留边完整展示"]]) {
+      const item = choice("fit-" + detail.id, value, label, draft.fitMode === value);
+      item.querySelector("input").addEventListener("change", () => { draft.fitMode = value; });
+      fitChoices.appendChild(item);
+    }
+    fitField.appendChild(fitChoices);
+    fitField.appendChild(el("p", "final-help", "必须选择一种方式后才能生成。"));
+    card.appendChild(fitField);
+  }
+
+  const errorBox = el("p", "form-error generation-form-error");
+  errorBox.hidden = true;
+  card.appendChild(errorBox);
   const row = el("div", "final-row");
-  const btnWrap = el("span", "submit-wrap");
-  const btn = el("button", "btn btn-primary", "生成最终视频");
-  btn.type = "button";
-  btn.disabled = true;
-  btn.setAttribute("aria-describedby", "final-caption");
-  btnWrap.appendChild(btn);
-  row.appendChild(btnWrap);
-  const cap = el("p", "final-caption", "待提交生成（接口预留，当前阶段未开放）");
-  cap.id = "final-caption";
-  row.appendChild(cap);
+  const button = el("button", "btn btn-primary generation-submit",
+    generation.status === "failed" ? "重试生成" : "生成最终视频");
+  button.type = "button";
+  button.addEventListener("click", () => submitGeneration(detail, card));
+  row.appendChild(button);
+  row.appendChild(el("p", "final-caption", busy ? "提交后将持续更新 H3 生成状态" : "确认参数后提交；失败时仅在你点击重试后再次提交"));
   card.appendChild(row);
+  if (busy) setGenerationCardBusy(card, true);
   sec.appendChild(card);
   return sec;
 }
@@ -500,7 +846,7 @@ function kfGrid(detail, names, pathPrefix, altPrefix) {
 function promptCard(text) {
   const card = el("div", "prompt-card");
   const head = el("div", "prompt-head");
-  head.appendChild(el("span", "prompt-hint", "复制后可直接粘贴到 Seedance"));
+  head.appendChild(el("span", "prompt-hint", "用于 H3 视频生成"));
   const copyBtn = el("button", "copy-btn");
   copyBtn.type = "button";
   copyBtn.appendChild(icon("i-copy"));
@@ -552,7 +898,7 @@ function renderSegments(detail) {
       card.appendChild(kfGrid(detail, names, "segments/" + n + "/work/keyframes", "第 " + n + " 段关键帧 "));
     }
     if (seg.prompt) {
-      card.appendChild(el("h4", "res-sub", "Seedance 提示词"));
+      card.appendChild(el("h4", "res-sub", "H3 提示词"));
       card.appendChild(promptCard(seg.prompt));
     }
     if (Array.isArray(seg.lines) && seg.lines.length) {
@@ -623,7 +969,7 @@ async function copyText(text) {
 
 /* ===== 后处理弹窗 ===== */
 function ppCheckedOptions() {
-  const options = { face_hold: false, remove_subtitle: false, remove_brand: false };
+  const options = { remove_subtitle: false, remove_brand: false };
   document.querySelectorAll('#pp-form input[name="opt"]:checked').forEach((c) => {
     options[c.value] = true;
   });
@@ -635,6 +981,7 @@ function updatePpConfirm() {
 }
 
 function openPostprocessModal(detail) {
+  if (!canOperate(detail)) return;
   state.ppDetail = detail;
   const last = detail.postprocess && detail.postprocess.options;
   document.querySelectorAll('#pp-form input[name="opt"]').forEach((c) => {
@@ -654,7 +1001,10 @@ function closePostprocessModal() {
 async function submitPostprocess(event) {
   event.preventDefault();
   const detail = state.ppDetail;
-  if (!detail) return;
+  if (!detail || !canOperate(detail)) {
+    closePostprocessModal();
+    return;
+  }
   const btn = $("pp-confirm");
   const errEl = $("pp-error");
   btn.disabled = true;
@@ -797,7 +1147,7 @@ function renderPpAssistant(detail, pp) {
    running/done 时不显示——renderPpChat 的进行中卡/结果卡接管。 */
 function renderPpAsk(detail) {
   const pp = detail.postprocess || {};
-  if (!detail.postprocess_enabled) return null;
+  if (!detail.postprocess_enabled || !canOperate(detail)) return null;
   if (pp.status === "running" || pp.status === "done") return null;
   const row = el("div", "msg-row");
   row.appendChild(assistantHead(detail.updated_at));
@@ -878,9 +1228,21 @@ function detailSignature(detail) {
   // stable 覆盖稳定区渲染消费的全部字段（未覆盖字段如 title/note 由创建后不变兜底，
   // pp.options 与 status 原子落盘——见审查记录）；dyn 只跟后处理进度（frames 单调增长）。
   const pp = detail.postprocess || null;
+  const generation = detail.generation || null;
   const segments = Array.isArray(detail.segments) ? detail.segments : [];
   const stable = JSON.stringify([
     detail.status,
+    detail.read_only === true,
+    detail.submit_enabled === true,
+    detail.fit_required === true,
+    detail.fit_mode,
+    detail.duration_s,
+    detail.receipt_version,
+    detail.dialogue || null,
+    generation ? generation.status : null,
+    generation ? generation.error : null,
+    generation ? generation.attempt : null,
+    generation ? generation.client_request_id : null,
     pp ? pp.status : "",
     pp && pp.error ? pp.error : "",
     Array.isArray(detail.keyframes) ? detail.keyframes.join(",") : "",
@@ -903,6 +1265,9 @@ async function loadDetail(id, silent) {
   try {
     const detail = await apiJSON("/api/conversations/" + encodeURIComponent(id));
     if (seq !== state.detailSeq || state.currentId !== id) return; // 已切换会话
+    if (detail.generation && detail.generation.status !== null) {
+      state.generationSubmitting[id] = false;
+    }
     state.detail = detail;
     const sig = detailSignature(detail);
     if (!silent) {
@@ -918,7 +1283,10 @@ async function loadDetail(id, silent) {
     // 签名完全不变 → 不碰 DOM（根治轮询闪烁的关键）
     state.detailSig = sig;
     const ppRunning = !!(detail.postprocess && detail.postprocess.status === "running");
-    if (detail.status === "queued" || detail.status === "processing" || ppRunning) {
+    const generationRunning = !!(detail.generation
+      && (detail.generation.status === "queued" || detail.generation.status === "running"));
+    if (detail.status === "queued" || detail.status === "processing" || ppRunning
+        || generationRunning || state.generationSubmitting[id]) {
       startPolling(id);
     } else {
       stopPolling();
@@ -1096,7 +1464,7 @@ function uploadConversation({ file, url, note, requestId, voiceMode: mode, targe
     else if (url) fd.append("reference_url", url);
     if (note) fd.append("note", note);
     if (requestId) fd.append("client_request_id", requestId);
-    fd.append("voice_mode", mode || "none");
+    fd.append("voice_mode", mode || "keep");
     if (mode === "translate" && targetLanguage) fd.append("target_language", targetLanguage);
     xhr.send(fd);
   });
@@ -1267,4 +1635,17 @@ function boot() {
   }
 }
 
-boot();
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    buildResumePayload,
+    buildSubmitPayload,
+    canOperate,
+    detailSignature,
+    formatDialogueLines,
+    generationAction,
+    normalizeDialogueLines,
+    parseDialogueLines,
+  };
+}
+
+if (typeof document !== "undefined") boot();

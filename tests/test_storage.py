@@ -9,12 +9,19 @@ def test_new_conversation_layout(tmp_path):
     assert cdir.is_dir()
     assert (cdir / "work").is_dir()
     saved = json.loads((cdir / "meta.json").read_text())
-    for key in ("id", "title", "note", "status", "error", "created_at", "updated_at"):
+    for key in (
+        "id", "title", "note", "status", "error", "created_at", "updated_at",
+        "schema_version", "duration_s", "fit_required", "dialogue_mode", "generation",
+    ):
         assert key in saved
     assert saved["status"] == "queued"
     assert saved["error"] is None
     assert saved["title"] == "我的笔记"
     assert saved["note"] == "我的笔记"
+    assert saved["schema_version"] == 2
+    assert saved["dialogue_mode"] == "auto"
+    assert saved["generation"] is None
+    assert saved["voice_mode"] == "keep"
     assert len(saved["id"]) == 32
 
 
@@ -114,3 +121,40 @@ def test_resolve_file_rejects_bad_segments_and_postprocessed(tmp_path):
     # 合法格式但磁盘上不存在 → None
     assert storage.resolve_file(tmp_path, cid, "postprocessed/nope.png") is None
     assert storage.resolve_file(tmp_path, cid, "segments/1/work/keyframes/nope.png") is None
+
+
+def test_probe_video_returns_duration_and_dimensions_in_one_probe(tmp_path, monkeypatch):
+    calls = []
+
+    class Completed:
+        returncode = 0
+        stdout = json.dumps({
+            "format": {"duration": "14.25"},
+            "streams": [{"width": 1080, "height": 1920}],
+        })
+        stderr = ""
+
+    monkeypatch.setattr(
+        storage.subprocess,
+        "run",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or Completed(),
+    )
+    info = storage.probe_video(tmp_path / "source.mp4", 15)
+    assert info.duration_s == 14.25
+    assert (info.width, info.height) == (1080, 1920)
+    assert len(calls) == 1
+
+
+def test_probe_video_rejects_missing_or_invalid_dimensions(tmp_path, monkeypatch):
+    class Completed:
+        returncode = 0
+        stdout = json.dumps({"format": {"duration": "1"}, "streams": []})
+        stderr = ""
+
+    monkeypatch.setattr(storage.subprocess, "run", lambda *args, **kwargs: Completed())
+    try:
+        storage.probe_video(tmp_path / "source.mp4", 15)
+    except storage.UploadError as exc:
+        assert "dimensions" in str(exc)
+    else:
+        raise AssertionError("missing video dimensions must be rejected")
