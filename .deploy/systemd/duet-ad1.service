@@ -18,7 +18,6 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectControlGroups=true
-ProtectKernelModules=true
 ProtectKernelTunables=true
 LockPersonality=true
 RestrictSUIDSGID=true
