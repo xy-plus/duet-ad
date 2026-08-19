@@ -9,9 +9,17 @@ ARCHIVE = Path(__file__).parents[1] / "web" / "video-maker.zip"
 def test_skill_keeps_normal_people_guidance_without_face_workaround():
     text = SKILL.read_text(encoding="utf-8")
 
-    for retained in ("主体可见", "遮挡少", "嘴型与画面同步", "不要生成背景音乐"):
+    for retained in ("主体可见", "遮挡少"):
         assert retained in text
-    for retired in ("捂脸", "1秒内快速把手放下", "face_hold", "Seedance"):
+    for retired in (
+        "捂脸",
+        "1秒内快速把手放下",
+        "face_hold",
+        "Seedance",
+        "voice_lines.json",
+        "台词逐句编排",
+        "嘴型与画面同步",
+    ):
         assert retired not in text
 
 

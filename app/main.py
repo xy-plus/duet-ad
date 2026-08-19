@@ -439,6 +439,19 @@ def _run_generation(settings: Settings, cid: str, request: h3.H3Request, retry: 
     _finish_generation(settings, cid, request, result)
 
 
+def _mark_submission_unknown(settings: Settings, cid: str, generation: dict) -> None:
+    """Lock an active paid attempt when it cannot be inspected safely."""
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={
+            **generation,
+            "status": "submission_unknown",
+            "error": "submission_unknown",
+        },
+    )
+
+
 def _resume_generation(settings: Settings, cid: str) -> None:
     meta = storage.load_meta(settings.data_dir, cid)
     if meta is None or _is_read_only(meta):
@@ -447,29 +460,17 @@ def _resume_generation(settings: Settings, cid: str) -> None:
     if not isinstance(generation, dict) or generation.get("status") not in _GENERATION_ACTIVE:
         return
     if not _credentials_ready(settings):
-        storage.update_meta(
-            settings.data_dir,
-            cid,
-            generation={**generation, "status": "failed", "error": "h3_credentials_missing"},
-        )
+        _mark_submission_unknown(settings, cid, generation)
         return
     request = None
     try:
         request = _load_h3_request(settings, cid, meta)
         result = h3.resume(request)
-    except _SubmitError as exc:
-        storage.update_meta(
-            settings.data_dir,
-            cid,
-            generation={**generation, "status": "failed", "error": exc.detail},
-        )
+    except _SubmitError:
+        _mark_submission_unknown(settings, cid, generation)
     except h3.H3Error as exc:
         if request is None:
-            storage.update_meta(
-                settings.data_dir,
-                cid,
-                generation={**generation, "status": "failed", "error": exc.code},
-            )
+            _mark_submission_unknown(settings, cid, generation)
         else:
             _generation_error(settings, cid, request, exc.code)
     except Exception:
@@ -479,15 +480,7 @@ def _resume_generation(settings: Settings, cid: str) -> None:
             # The persisted generation says a paid attempt may already exist,
             # but we could not rebuild enough immutable input to inspect it.
             # Fail closed: never expose the new-request-id retry path.
-            storage.update_meta(
-                settings.data_dir,
-                cid,
-                generation={
-                    **generation,
-                    "status": "submission_unknown",
-                    "error": "submission_unknown",
-                },
-            )
+            _mark_submission_unknown(settings, cid, generation)
     else:
         _finish_generation(settings, cid, request, result)
 

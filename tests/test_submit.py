@@ -803,3 +803,72 @@ def test_startup_unexpected_error_inspects_existing_attempt_before_retry_gate(
         "attempt": 1,
         "client_request_id": REQUEST_ID,
     }
+
+
+def _make_running_generation(settings):
+    cid, _ = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    prepared_input.write_prepared_input(
+        root=cdir,
+        source=cdir / "source.mp4",
+        audio=None,
+        keyframes=[cdir / "work" / "keyframes" / "01.png"],
+        visual=cdir / "work" / "visual_prompt.txt",
+        final=cdir / "work" / "prompt.txt",
+        dialogue_mode="none",
+        dialogue=(),
+        vocal_filter_enabled=True,
+        duration_s=9.2,
+        ratio="9:16",
+        fit_mode="none",
+        engine_request={"duration": 10},
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        dialogue_mode="none",
+        fit_mode="none",
+        prepared_dialogue=[],
+        prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
+        generation={
+            "status": "running",
+            "error": None,
+            "attempt": 1,
+            "client_request_id": REQUEST_ID,
+        },
+    )
+    return cid
+
+
+def test_startup_missing_credentials_locks_existing_attempt(tmp_path):
+    settings = make_settings(tmp_path, enable_h3_submit=True)
+    cid = _make_running_generation(settings)
+
+    _resume_generation(settings, cid)
+
+    assert storage.load_meta(settings.data_dir, cid)["generation"] == {
+        "status": "submission_unknown",
+        "error": "submission_unknown",
+        "attempt": 1,
+        "client_request_id": REQUEST_ID,
+    }
+
+
+def test_startup_invalid_receipt_locks_existing_attempt(tmp_path):
+    settings = make_settings(
+        tmp_path,
+        enable_h3_submit=True,
+        minimax_api_key="mm",
+        autodl_art_token="art",
+    )
+    cid = _make_running_generation(settings)
+    (settings.data_dir / cid / prepared_input.RECEIPT_FILENAME).unlink()
+
+    _resume_generation(settings, cid)
+
+    assert storage.load_meta(settings.data_dir, cid)["generation"] == {
+        "status": "submission_unknown",
+        "error": "submission_unknown",
+        "attempt": 1,
+        "client_request_id": REQUEST_ID,
+    }
