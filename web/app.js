@@ -786,6 +786,9 @@ function renderContextIRReview(detail, card) {
   review.appendChild(textarea);
   const status = el("p", "final-help", "正在读取 Context IR 提示词…");
   review.appendChild(status);
+  const errorBox = el("p", "form-error generation-form-error");
+  errorBox.hidden = true;
+  review.appendChild(errorBox);
   const row = el("div", "final-row");
   const saveButton = el("button", "btn save-ir", "保存 IR 修改");
   saveButton.type = "button";

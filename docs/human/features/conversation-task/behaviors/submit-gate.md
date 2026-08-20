@@ -41,6 +41,7 @@ links: [conversation-task, processing-state]
 ## 边界
 
 - 首次 start 和确定失败后的 retry 会在锁内按人工选择冻结 receipt；`resume_required` 只加载既有 receipt，不重写它、不递增 attempt。
+- Context IR 审阅卡的“生成最终视频”点击后必须立即进入提交态或显示错误；前端异常不得表现为无响应。
 - H3 只使用 `work/keyframes/` 原图或 `work/h3_frames/{crop|pad}/` 派生图；不读取 Seedream `postprocessed/`。
 - Context IR 不设置台词内容或标签结构门禁；用户确认的非空、限长正文可直接提交 H3。
 - 成片下载先验证全部 DNS 解析地址，再在读取 status/body 前验证实际 socket peer 为公网；拒绝 userinfo 和重定向，限制 200 MiB，并在原子落盘前通过 ffprobe 正时长视频流验证。

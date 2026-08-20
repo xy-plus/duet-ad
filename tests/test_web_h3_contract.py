@@ -160,6 +160,17 @@ def test_context_ir_is_an_explicit_editable_stage_before_h3():
     assert '"/submit"' not in prepare
 
 
+def test_context_ir_review_has_an_error_surface_before_final_submit():
+    source = APP_JS.read_text(encoding="utf-8")
+    review = source.split("function renderContextIRReview", 1)[1].split(
+        "function renderFinalSection", 1
+    )[0]
+    assert '"form-error generation-form-error"' in review
+    assert review.index('"form-error generation-form-error"') < review.index(
+        '"生成最终视频"'
+    )
+
+
 def test_context_ir_prompt_is_not_part_of_detail_polling_or_signature():
     source = APP_JS.read_text(encoding="utf-8")
     signature = source.split("function detailSignature", 1)[1].split("async function loadDetail", 1)[0]
