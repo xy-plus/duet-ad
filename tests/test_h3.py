@@ -432,6 +432,23 @@ def test_ir_dialogue_must_exactly_match_frozen_voice_texts(tmp_path, ir_prompt):
     assert state["error"] == {"code": "ir_dialogue_mismatch"}
 
 
+def test_repaired_dialogue_validator_rechecks_existing_ir_without_reposting(tmp_path):
+    request = _request(tmp_path)
+    rejected = HappyProvider(ir_prompt="<d>第一句台词</d>")
+    with _client(rejected) as client:
+        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
+            h3.start(request, client=client)
+
+    accepted = HappyProvider(ir_prompt=OPTIMIZED_PROMPT)
+    with _client(accepted) as client:
+        result = h3.start(request, client=client)
+
+    assert result.status == "succeeded"
+    assert accepted.uploads == []
+    assert accepted.ir_posts == []
+    assert len(accepted.h3_posts) == 1
+
+
 @pytest.mark.parametrize(
     "ir_prompt",
     [
@@ -540,6 +557,200 @@ def test_real_temp10_speaks_clearly_then_dialogue_is_bound(tmp_path):
 
     assert result.status == "succeeded"
     assert len(provider.h3_posts) == 1
+
+
+def test_ir_allows_contentless_speech_context_around_exact_frozen_dialogue(
+    tmp_path,
+):
+    voice_texts = ("Kalung Ayatul Kursi.",)
+    summary = "Subject 1 speaks a brief introductory line at the beginning."
+    intervening_sections = "\n\n".join(
+        f"[Visual section {index}] " + "Detailed silent visual direction. " * 14
+        for index in range(5)
+    )
+    timeline = (
+        "Subject 1 speaks, <d>[Indonesian] Kalung Ayatul Kursi.</d> "
+        "As he speaks, the pendant remains centered, responding to gentle body "
+        "breathing and natural torso movement."
+    )
+    prompt = f"summary:\n{summary}\n\n{intervening_sections}\n\n[Timeline]\n{timeline}"
+    assert prompt.index("<d>") - prompt.index("speaks") > 2151
+
+    request = replace(
+        _request(tmp_path),
+        voice_texts=voice_texts,
+        voice_receipt=h3.voice_texts_receipt(voice_texts),
+    )
+    provider = HappyProvider(ir_prompt=prompt)
+
+    with _client(provider) as client:
+        result = h3.start(request, client=client)
+
+    assert result.status == "succeeded"
+    assert len(provider.h3_posts) == 1
+
+
+@pytest.mark.parametrize(
+    "extra_context",
+    [
+        "As he speaks: extra words.",
+        "Subject 1 responds: extra words.",
+        "Subject 1 speaks the OCR text: LIMITED OFFER.",
+        'Subject 1 says "extra words".',
+        "The pendant responds: extra words.",
+    ],
+)
+def test_ir_contentless_context_exceptions_do_not_allow_literal_speech(
+    extra_context,
+):
+    prompt = (
+        "Subject 1 speaks a brief introductory line at the beginning. "
+        "<d>[Indonesian] Kalung Ayatul Kursi.</d> "
+        f"{extra_context}"
+    )
+
+    assert not h3._ir_dialogue_matches(prompt, ("Kalung Ayatul Kursi.",))
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "The actor speaks softly.",
+        "人物开口微笑。",
+    ],
+)
+def test_empty_voice_still_rejects_any_affirmative_speech_action(prompt):
+    assert not h3._ir_dialogue_matches(prompt, ())
+
+
+@pytest.mark.xfail(
+    reason="deferred adversarial free-form IR prose hardening",
+    strict=False,
+)
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Subject 1 says: extra words. <d>[Indonesian] Kalung Ayatul Kursi.</d>",
+        'Subject 1 says "extra words", then <d>Kalung Ayatul Kursi.</d>',
+        (
+            "<d>Kalung Ayatul Kursi.</d> Then he speaks an extra slogan while "
+            "looking at the camera."
+        ),
+        "<d>Kalung Ayatul Kursi.</d> Then he speaks softly.",
+        "<d>Kalung Ayatul Kursi.</d> Afterward the actor begins speaking.",
+        "Subject says extra words then <d>Kalung Ayatul Kursi.</d>",
+        (
+            "[Summary]\nSubject speaks an opening line reading BUY NOW at the "
+            "start.\n\n[Timeline]\nSubject speaks, "
+            "<d>Kalung Ayatul Kursi.</d>"
+        ),
+        (
+            "<d>Kalung Ayatul Kursi.</d> The actor responds to camera motion with "
+            "an extra slogan."
+        ),
+        (
+            "<d>Kalung Ayatul Kursi.</d> As the words BUY NOW play he speaks "
+            "softly."
+        ),
+    ],
+)
+def test_exact_dialogue_does_not_bind_or_hide_neighboring_added_speech(prompt):
+    assert not h3._ir_dialogue_matches(prompt, ("Kalung Ayatul Kursi.",))
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        (
+            "[Summary]\nSubject 1 speaks an opening line at the start.\n\n"
+            "[Timeline]\nSubject 1 speaks, <d>Kalung Ayatul Kursi.</d>"
+        ),
+        (
+            "<d>Kalung Ayatul Kursi.</d> While he speaks, the camera slowly "
+            "pushes in."
+        ),
+        (
+            "Subject 1 says: <d>Kalung Ayatul Kursi.</d> As he speaks, the camera "
+            "slowly pushes in."
+        ),
+        (
+            "<d>Kalung Ayatul Kursi.</d> During his speaking, the pendant remains "
+            "centered."
+        ),
+        (
+            "Subject 1 speaks, <d>Kalung Ayatul Kursi.</d> The pendant responds "
+            "to camera motion."
+        ),
+    ],
+)
+def test_exact_dialogue_allows_only_explicit_nonnew_speech_references(prompt):
+    assert h3._ir_dialogue_matches(prompt, ("Kalung Ayatul Kursi.",))
+
+
+@pytest.mark.xfail(
+    reason="deferred adversarial free-form IR prose hardening",
+    strict=False,
+)
+@pytest.mark.parametrize(
+    ("voice_texts", "ir_prompt"),
+    [
+        (
+            ("Kalung Ayatul Kursi.",),
+            "Subject says extra words then <d>Kalung Ayatul Kursi.</d>",
+        ),
+        (
+            ("Kalung Ayatul Kursi.",),
+            "[Summary]\nSubject speaks an opening line reading BUY NOW at the "
+            "start.\n\n[Timeline]\nSubject speaks, "
+            "<d>Kalung Ayatul Kursi.</d>",
+        ),
+        (
+            ("Kalung Ayatul Kursi.",),
+            "<d>Kalung Ayatul Kursi.</d> The actor responds to camera motion with "
+            "an extra slogan.",
+        ),
+        (
+            ("Kalung Ayatul Kursi.",),
+            "<d>Kalung Ayatul Kursi.</d> As the words BUY NOW play he speaks "
+            "softly.",
+        ),
+        ((), "The actor does not hesitate and speaks extra words."),
+        ((), "The actor silently whispers buy now."),
+        ((), "The actor talks to camera and delivers a sales pitch."),
+        (
+            ("Kalung Ayatul Kursi.",),
+            "<d>Kalung Ayatul Kursi.</d> He states BUY NOW.",
+        ),
+        (
+            ("Kalung Ayatul Kursi.",),
+            "<d>Kalung Ayatul Kursi.</d> Then he speaks softly.",
+        ),
+    ],
+)
+def test_security_review_prompts_fail_before_h3_post(
+    tmp_path,
+    voice_texts,
+    ir_prompt,
+):
+    request = replace(
+        _request(tmp_path),
+        voice_texts=voice_texts,
+        voice_receipt=h3.voice_texts_receipt(voice_texts),
+    )
+    provider = HappyProvider(ir_prompt=ir_prompt)
+
+    with _client(provider) as client:
+        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
+            h3.start(request, client=client)
+
+    assert provider.h3_posts == []
+
+
+def test_direct_speech_cue_may_introduce_the_exact_tag():
+    assert h3._ir_dialogue_matches(
+        "Subject 1 says: <d>[Indonesian] Kalung Ayatul Kursi.</d>",
+        ("Kalung Ayatul Kursi.",),
+    )
 
 
 def test_receipt_tampering_blocks_recovery_before_network(tmp_path):
