@@ -6,7 +6,7 @@ import pytest
 from conftest import AUTH, make_settings
 from fastapi.testclient import TestClient
 
-from app import h3, storage
+from app import context_ir_translation, h3, storage
 from app.main import create_app
 
 
@@ -85,6 +85,8 @@ def test_detail_shape(client, video_1s):
         "updated_at": r.json()["updated_at"],
         "keyframes": [],
         "prompt": None,
+        "source_prompt": None,
+        "source_prompt_sha256": None,
         "segments": [],
         "voice_lines": [],
         "read_only": False,
@@ -142,6 +144,57 @@ def test_context_ir_details_are_small_and_prompt_is_loaded_only_from_authenticat
         "sha256": digest,
         "dialogue_valid": True,
     }
+
+
+def test_context_ir_translation_is_authenticated_hash_bound_and_view_only(
+    tmp_path, monkeypatch
+):
+    settings = make_settings(tmp_path, minimax_api_key="mm-secret")
+    meta = storage.new_conversation(settings.data_dir, note="", orig_name="a.mp4")
+    prompt = "Optimized prompt"
+    state_path = _write_context_ir_state(settings, meta["id"], prompt=prompt)
+    before = state_path.read_bytes()
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    seen = []
+
+    def fake_translate(**kwargs):
+        seen.append(kwargs)
+        return context_ir_translation.Translation(
+            source_sha256=digest,
+            language="zh-CN",
+            translation="优化后的中文提示词",
+        )
+
+    monkeypatch.setattr(context_ir_translation, "translate", fake_translate)
+    with TestClient(create_app(settings)) as client:
+        unauthorized = client.post(
+            f"/api/conversations/{meta['id']}/context-ir/translation",
+            json={"expected_sha256": digest},
+        )
+        stale = client.post(
+            f"/api/conversations/{meta['id']}/context-ir/translation",
+            headers=AUTH,
+            json={"expected_sha256": "0" * 64},
+        )
+        translated = client.post(
+            f"/api/conversations/{meta['id']}/context-ir/translation",
+            headers=AUTH,
+            json={"expected_sha256": digest},
+        )
+
+    assert unauthorized.status_code == 401
+    assert stale.status_code == 409
+    assert stale.json() == {"detail": "context_ir_changed"}
+    assert translated.status_code == 200
+    assert translated.json() == {
+        "source_sha256": digest,
+        "language": "zh-CN",
+        "translation": "优化后的中文提示词",
+    }
+    assert len(seen) == 1
+    assert seen[0]["prompt"] == prompt
+    assert seen[0]["source_sha256"] == digest
+    assert state_path.read_bytes() == before
 
 
 def test_context_ir_endpoint_distinguishes_absent_running_and_unknown_conversation(tmp_path):

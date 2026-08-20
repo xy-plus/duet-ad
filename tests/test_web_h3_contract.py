@@ -107,19 +107,18 @@ def test_detail_signature_tracks_h3_render_fields():
         "{...base,receipt_version:2},{...base,fit_mode:'pad'},"
         "{...base,generation:{status:'running',error:null,attempt:1,client_request_id:'request-a'}},"
         "{...base,generation:{status:'failed',error:'x',attempt:2,client_request_id:'request-b'}},"
+        "{...base,source_prompt:'edited',source_prompt_sha256:'b'.repeat(64)},"
         "{...base,context_ir:{status:'succeeded',available:true,sha256:'a'.repeat(64)}}];"
         "return variants.map(value => contract.detailSignature(value).stable !== original);"
         "})()"
     )
-    assert result == [True, True, True, True, True, True, True]
+    assert result == [True, True, True, True, True, True, True, True]
 
 
-def test_context_ir_has_an_independent_lazy_once_disclosure_and_exact_payload_contract():
+def test_context_ir_has_an_independent_cached_body_and_exact_payload_contract():
     source = APP_JS.read_text(encoding="utf-8")
     for token in (
         "Context IR 优化提示词",
-        '"toggle"',
-        "disclosure.open",
         '"/context-ir"',
         "contextIRCache",
         "contextIRLoads",
@@ -158,6 +157,50 @@ def test_context_ir_is_an_explicit_editable_stage_before_h3():
     assert '"/context-ir"' in prepare
     assert 'method: "POST"' in prepare
     assert '"/submit"' not in prepare
+
+
+def test_source_prompt_is_editable_before_ir_and_ir_uses_the_same_prompt_card_after_video():
+    source = APP_JS.read_text(encoding="utf-8")
+    results = source.split("function renderResults", 1)[1].split(
+        "function canOperate", 1
+    )[0]
+    assert "source_prompt" in results
+    assert '"修改提示词"' in source
+    assert '"/prompt"' in source
+    assert 'method: "PATCH"' in source
+    assert "renderContextIRSection(detail)" in results
+    assert results.index("renderSourcePromptCard(") < results.index(
+        "renderContextIRSection(detail)"
+    )
+    context_section = source.split("function renderContextIRSection", 1)[1].split(
+        "function kfGrid", 1
+    )[0]
+    assert "promptCard(" in context_section
+    assert 'el("details"' not in context_section
+
+
+def test_context_ir_translation_button_exists_before_and_after_video_and_is_view_only():
+    source = APP_JS.read_text(encoding="utf-8")
+    review = source.split("function renderContextIRReview", 1)[1].split(
+        "function renderFinalSection", 1
+    )[0]
+    completed = source.split("function renderContextIRSection", 1)[1].split(
+        "function kfGrid", 1
+    )[0]
+    assert '"翻译为中文"' in review
+    assert '"翻译为中文"' in completed
+    assert '"/context-ir/translation"' in source
+    assert "仅供查看，不参与实际生成" in source
+    translated = _run_contract(
+        "contract.validateContextIRTranslationPayload("
+        "{id:'cid',context_ir:{status:'succeeded',available:true,sha256:'a'.repeat(64)}},"
+        "{source_sha256:'a'.repeat(64),language:'zh-CN',translation:'中文译文'})"
+    )
+    assert translated == {
+        "source_sha256": "a" * 64,
+        "language": "zh-CN",
+        "translation": "中文译文",
+    }
 
 
 def test_context_ir_review_has_an_error_surface_before_final_submit():

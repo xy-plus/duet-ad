@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import hmac
+import json
 import math
 import re
 import threading
@@ -12,7 +14,17 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from app import downloader, frame_fit, h3, pipeline, postprocess, prepared_input, storage, voice
+from app import (
+    context_ir_translation,
+    downloader,
+    frame_fit,
+    h3,
+    pipeline,
+    postprocess,
+    prepared_input,
+    storage,
+    voice,
+)
 from app.auth import require_auth
 from app.codex_runner import CodexRunner
 from app.config import Settings, get_settings
@@ -135,6 +147,76 @@ def _public_context_ir(cdir: Path, cid: str) -> dict:
         "available": snapshot.prompt is not None,
         "sha256": snapshot.sha256,
     }
+
+
+def _source_prompt_snapshot(cdir: Path) -> tuple[str | None, str | None]:
+    path = cdir / "work" / "visual_prompt.txt"
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None, None
+    if not text.strip() or len(raw) > prepared_input.MAX_FINAL_PROMPT_BYTES:
+        return None, None
+    return text, hashlib.sha256(raw).hexdigest()
+
+
+def _replace_source_prompt(
+    settings: Settings,
+    cid: str,
+    meta: dict,
+    expected_sha256: str,
+    prompt: str,
+) -> tuple[str, str, str]:
+    cdir = (settings.data_dir / cid).resolve()
+    current, current_sha256 = _source_prompt_snapshot(cdir)
+    if current is None or current_sha256 is None:
+        raise _SubmitError(409, "prepared_input_invalid")
+    if expected_sha256 != current_sha256:
+        raise _SubmitError(409, "prompt_changed")
+    replacement = prompt.strip()
+    if (
+        not replacement
+        or len(replacement.encode("utf-8")) > prepared_input.MAX_FINAL_PROMPT_BYTES
+    ):
+        raise _SubmitError(422, "invalid_prompt")
+    receipt_name = meta.get("prepared_input_receipt")
+    if not isinstance(receipt_name, str) or receipt_name != prepared_input.RECEIPT_FILENAME:
+        raise _SubmitError(409, "prepared_input_invalid")
+    receipt_path = cdir / receipt_name
+    try:
+        receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        expected_dialogue = receipt_payload["dialogue"]["lines"]
+        frozen = prepared_input.load_prepared_input(
+            cdir, receipt_path, expected_dialogue=expected_dialogue
+        )
+        prepared_input.compose_final_prompt(replacement, frozen.dialogue)
+    except (OSError, KeyError, TypeError, json.JSONDecodeError, prepared_input.PreparedInputError):
+        raise _SubmitError(409, "prepared_input_invalid") from None
+
+    frozen.visual_prompt.path.write_text(replacement, encoding="utf-8")
+    try:
+        rewritten = prepared_input.write_prepared_input(
+            root=cdir,
+            source=frozen.source.path,
+            audio=frozen.normalized_audio.path if frozen.normalized_audio else None,
+            keyframes=[item.path for item in frozen.keyframes],
+            visual=frozen.visual_prompt.path,
+            final=frozen.final_prompt.path,
+            dialogue_mode=frozen.dialogue_mode,
+            dialogue=frozen.dialogue,
+            vocal_filter_enabled=frozen.vocal_filter_enabled,
+            duration_s=frozen.duration_s,
+            ratio=frozen.ratio,
+            fit_mode=frozen.fit_mode,
+            engine_request=frozen.engine_request,
+            receipt_path=frozen.receipt_path,
+        )
+    except prepared_input.PreparedInputError:
+        raise _SubmitError(409, "prepared_input_invalid") from None
+    storage.update_meta(settings.data_dir, cid, prompt=rewritten.prompt_text)
+    digest = hashlib.sha256(replacement.encode("utf-8")).hexdigest()
+    return replacement, digest, rewritten.prompt_text
 
 
 def _receipt_version(cdir: Path, meta: dict) -> int | None:
@@ -568,6 +650,7 @@ def create_app(settings: Settings) -> FastAPI:
     # 创建临界区：幂等查重 + queued 计数 + 建目录必须原子
     create_lock = threading.Lock()
     submit_locks: dict[str, asyncio.Lock] = {}
+    translation_locks: dict[str, asyncio.Lock] = {}
     postprocess_locks: dict[str, asyncio.Lock] = {}
     # Seedream 后处理并行提交的进程级信号量：单进程内跨会话全局并发上限（SEEDREAM_CONCURRENCY）
     seedream_sem = asyncio.Semaphore(settings.seedream_concurrency)
@@ -693,6 +776,7 @@ def create_app(settings: Settings) -> FastAPI:
         if meta is None:
             raise HTTPException(status_code=404, detail="not found")
         cdir = settings.data_dir / cid
+        source_prompt, source_prompt_sha256 = _source_prompt_snapshot(cdir)
         return {
             "id": meta["id"],
             "title": meta["title"],
@@ -703,6 +787,8 @@ def create_app(settings: Settings) -> FastAPI:
             "updated_at": meta["updated_at"],
             "keyframes": meta.get("keyframes", []),
             "prompt": meta.get("prompt"),
+            "source_prompt": source_prompt,
+            "source_prompt_sha256": source_prompt_sha256,
             "segments": meta.get("segments", []),
             "voice_lines": meta.get("voice_lines", []),
             "read_only": _is_read_only(meta),
@@ -719,6 +805,45 @@ def create_app(settings: Settings) -> FastAPI:
             "postprocess": meta.get("postprocess"),
             "postprocess_enabled": settings.enable_seedream_edit,
         }
+
+    @app.patch(
+        "/api/conversations/{cid}/prompt",
+        dependencies=[Depends(require_auth)],
+    )
+    async def edit_source_prompt(cid: str, payload: dict):
+        if set(payload) != {"confirm", "expected_sha256", "prompt"}:
+            raise HTTPException(status_code=422, detail="invalid_prompt_request")
+        if payload.get("confirm") is not True:
+            raise HTTPException(status_code=409, detail="confirmation required")
+        expected_sha256 = payload.get("expected_sha256")
+        prompt = payload.get("prompt")
+        if not isinstance(expected_sha256, str) or not isinstance(prompt, str):
+            raise HTTPException(status_code=422, detail="invalid_prompt_request")
+        lock = submit_locks.setdefault(cid, asyncio.Lock())
+        async with lock:
+            meta = storage.load_meta(settings.data_dir, cid)
+            if meta is None:
+                raise HTTPException(status_code=404, detail="not found")
+            if _is_read_only(meta):
+                raise HTTPException(status_code=409, detail="read_only")
+            if meta.get("status") != "done":
+                raise HTTPException(status_code=409, detail="artifacts not ready")
+            if isinstance(meta.get("generation"), dict) or (
+                settings.data_dir / cid / ".h3" / "session.json"
+            ).exists():
+                raise HTTPException(status_code=409, detail="prompt_frozen")
+            try:
+                updated, digest, final_prompt = await asyncio.to_thread(
+                    _replace_source_prompt,
+                    settings,
+                    cid,
+                    meta,
+                    expected_sha256,
+                    prompt,
+                )
+            except _SubmitError as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        return {"prompt": updated, "sha256": digest, "final_prompt": final_prompt}
 
     @app.get(
         "/api/conversations/{cid}/context-ir",
@@ -742,6 +867,58 @@ def create_app(settings: Settings) -> FastAPI:
             "sha256": snapshot.sha256,
             # Kept for response compatibility; reviewed IR is the authority.
             "dialogue_valid": True,
+        }
+
+    @app.post(
+        "/api/conversations/{cid}/context-ir/translation",
+        dependencies=[Depends(require_auth)],
+    )
+    async def translate_context_ir(cid: str, payload: dict):
+        if set(payload) != {"expected_sha256"} or not isinstance(
+            payload.get("expected_sha256"), str
+        ):
+            raise HTTPException(
+                status_code=422, detail="invalid_context_ir_translation_request"
+            )
+        if not settings.minimax_api_key or not settings.minimax_text_model:
+            raise HTTPException(
+                status_code=503, detail="context_ir_translation_unavailable"
+            )
+        expected_sha256 = payload["expected_sha256"]
+        lock = translation_locks.setdefault(cid, asyncio.Lock())
+        async with lock:
+            meta = storage.load_meta(settings.data_dir, cid)
+            if meta is None:
+                raise HTTPException(status_code=404, detail="not found")
+            try:
+                snapshot = h3.inspect_context_ir(settings.data_dir / cid, cid)
+            except h3.H3Error as exc:
+                raise HTTPException(status_code=409, detail="context_ir_invalid") from exc
+            if (
+                snapshot.status != "succeeded"
+                or snapshot.prompt is None
+                or snapshot.sha256 is None
+            ):
+                raise HTTPException(status_code=409, detail="context_ir_not_ready")
+            if snapshot.sha256 != expected_sha256:
+                raise HTTPException(status_code=409, detail="context_ir_changed")
+            try:
+                result = await asyncio.to_thread(
+                    context_ir_translation.translate,
+                    root=settings.data_dir / cid,
+                    prompt=snapshot.prompt,
+                    source_sha256=snapshot.sha256,
+                    api_key=settings.minimax_api_key,
+                    model=settings.minimax_text_model,
+                    timeout_s=settings.context_ir_translation_timeout_s,
+                )
+            except context_ir_translation.TranslationError as exc:
+                status = 503 if exc.code == "context_ir_translation_unavailable" else 502
+                raise HTTPException(status_code=status, detail=exc.code) from exc
+        return {
+            "source_sha256": result.source_sha256,
+            "language": result.language,
+            "translation": result.translation,
         }
 
     @app.post(

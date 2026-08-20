@@ -25,7 +25,9 @@ const state = {
   generationDrafts: {}, // cid → 最终视频表单草稿；轮询重渲染时保留用户输入
   generationSubmitting: {}, // cid → true：本页已有 /submit 请求在途，阻止重复提交
   contextIRCache: {},  // cid:sha256 → 已校验正文或错误；同版本只请求一次
-  contextIRLoads: {},  // cid:sha256 → 在途 Promise；折叠区并发打开时复用
+  contextIRLoads: {},  // cid:sha256 → 在途 Promise；同版本并发渲染时复用
+  contextIRTranslations: {}, // cid:sha256 → 仅供查看的中文译文或错误
+  contextIRTranslationLoads: {}, // cid:sha256 → 在途翻译 Promise
   detailSig: null,     // 当前已渲染详情的状态签名：轮询比对，签名不变不碰 DOM（根治轮询闪烁）
 };
 
@@ -194,6 +196,22 @@ function validateContextIRPayload(detail, payload) {
     prompt: payload.prompt,
     sha256: payload.sha256,
     dialogue_valid: payload.dialogue_valid,
+  };
+}
+
+function validateContextIRTranslationPayload(detail, payload) {
+  const key = contextIRCacheKey(detail);
+  const fields = payload && typeof payload === "object" ? Object.keys(payload).sort() : [];
+  if (!key || fields.join(",") !== "language,source_sha256,translation"
+      || payload.source_sha256 !== detail.context_ir.sha256
+      || payload.language !== "zh-CN"
+      || typeof payload.translation !== "string" || !payload.translation.trim()) {
+    throw new Error("Context IR 中文翻译响应校验失败");
+  }
+  return {
+    source_sha256: payload.source_sha256,
+    language: payload.language,
+    translation: payload.translation,
   };
 }
 
@@ -569,12 +587,19 @@ function renderResults(detail) {
     if (names.length > 0) {
       frag.appendChild(keyframesSection(detail));
     }
-    if (detail.prompt) {
+    const sourcePrompt = detail.source_prompt || detail.prompt;
+    if (sourcePrompt) {
       const sec = el("section", "res-section");
-      sec.appendChild(el("h3", "res-h3", "H3 提示词"));
-      sec.appendChild(promptCard(detail.prompt));
+      sec.appendChild(el("h3", "res-h3", "H3 源提示词"));
+      sec.appendChild(renderSourcePromptCard(detail, sourcePrompt));
       frag.appendChild(sec);
     }
+  }
+
+  // 成片后的 IR 紧跟源提示词，使用同一 promptCard；不再放在最终视频下方。
+  if (detail.has_video) {
+    const contextIR = renderContextIRSection(detail);
+    if (contextIR) frag.appendChild(contextIR);
   }
 
   return frag;
@@ -748,6 +773,32 @@ async function contextIRValue(detail) {
   return cached.value;
 }
 
+async function contextIRTranslationValue(detail) {
+  const key = contextIRCacheKey(detail);
+  if (!key) throw new Error("Context IR 尚不可翻译");
+  if (!state.contextIRTranslations[key]) {
+    if (!state.contextIRTranslationLoads[key]) {
+      const path = "/api/conversations/" + encodeURIComponent(detail.id)
+        + "/context-ir/translation";
+      state.contextIRTranslationLoads[key] = apiJSON(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expected_sha256: detail.context_ir.sha256 }),
+      }).then((payload) => ({
+        value: validateContextIRTranslationPayload(detail, payload),
+      })).catch((error) => ({ error }));
+    }
+    state.contextIRTranslations[key] = await state.contextIRTranslationLoads[key];
+    delete state.contextIRTranslationLoads[key];
+  }
+  const cached = state.contextIRTranslations[key];
+  if (cached.error) {
+    delete state.contextIRTranslations[key];
+    throw cached.error;
+  }
+  return cached.value;
+}
+
 async function saveContextIREdit(detail, card, textarea, status, saveButton, generateButton) {
   const key = contextIRCacheKey(detail);
   const cached = key && state.contextIRCache[key] && state.contextIRCache[key].value;
@@ -793,6 +844,9 @@ function renderContextIRReview(detail, card) {
   const saveButton = el("button", "btn save-ir", "保存 IR 修改");
   saveButton.type = "button";
   saveButton.disabled = true;
+  const translateButton = el("button", "btn translate-ir-btn", "翻译为中文");
+  translateButton.type = "button";
+  translateButton.disabled = true;
   const generateButton = el("button", "btn btn-primary generation-submit", "生成最终视频");
   generateButton.type = "button";
   generateButton.disabled = true;
@@ -801,17 +855,52 @@ function renderContextIRReview(detail, card) {
   });
   generateButton.addEventListener("click", () => resumeGeneration(detail, card));
   row.appendChild(saveButton);
+  row.appendChild(translateButton);
   row.appendChild(generateButton);
   review.appendChild(row);
+  const original = contextIRValue(detail);
+  let showingTranslation = false;
+  translateButton.addEventListener("click", async () => {
+    translateButton.disabled = true;
+    if (showingTranslation) {
+      const value = await original;
+      textarea.value = value.prompt;
+      textarea.disabled = false;
+      showingTranslation = false;
+      translateButton.textContent = "翻译为中文";
+      status.textContent = "IR 已完成；可直接生成，也可修改后保存。";
+      translateButton.disabled = false;
+      return;
+    }
+    translateButton.textContent = "翻译中…";
+    textarea.disabled = true;
+    status.textContent = "正在生成仅供查看的中文译文…";
+    try {
+      const value = await contextIRTranslationValue(detail);
+      textarea.value = value.translation;
+      showingTranslation = true;
+      translateButton.textContent = "查看原文";
+      status.textContent = "中文译文仅供查看，不参与实际生成。";
+    } catch (error) {
+      if (handleAuthError(error)) return;
+      translateButton.textContent = "翻译为中文";
+      textarea.disabled = false;
+      status.textContent = "翻译失败：" + error.message;
+    } finally {
+      translateButton.disabled = false;
+    }
+  });
   textarea.addEventListener("input", () => {
     saveButton.disabled = false;
     generateButton.disabled = true;
+    translateButton.disabled = true;
     status.textContent = "提示词已修改，请先保存再生成视频。";
   });
-  contextIRValue(detail).then((value) => {
+  original.then((value) => {
     textarea.value = value.prompt;
     textarea.disabled = false;
     saveButton.disabled = true;
+    translateButton.disabled = false;
     generateButton.disabled = false;
     status.textContent = "IR 已完成；可直接生成，也可修改后保存。";
   }).catch((error) => {
@@ -988,26 +1077,56 @@ function renderFinalSection(detail) {
   return sec;
 }
 
-async function loadContextIR(detail, output) {
-  try {
-    output.textContent = (await contextIRValue(detail)).prompt;
-  } catch (error) {
-    if (handleAuthError(error)) return;
-    output.textContent = "加载失败：" + error.message;
-  }
-}
-
 function renderContextIRSection(detail) {
   if (!contextIRCacheKey(detail)) return null;
   const sec = el("section", "res-section context-ir-section");
-  const disclosure = el("details", "context-ir-disclosure");
-  disclosure.appendChild(el("summary", "res-h3", "Context IR 优化提示词"));
-  const output = el("pre", "prompt-text", "展开后加载优化提示词…");
-  disclosure.appendChild(output);
-  disclosure.addEventListener("toggle", () => {
-    if (disclosure.open) loadContextIR(detail, output);
+  sec.appendChild(el("h3", "res-h3", "Context IR 优化提示词"));
+  const translateButton = el("button", "copy-btn translate-ir-btn", "翻译为中文");
+  translateButton.type = "button";
+  translateButton.disabled = true;
+  const card = promptCard("正在加载 Context IR 提示词…", [translateButton]);
+  const output = card.querySelector(".prompt-text");
+  const status = el("p", "final-help", "正在读取 Context IR 提示词…");
+  card.appendChild(status);
+  sec.appendChild(card);
+  const original = contextIRValue(detail);
+  let showingTranslation = false;
+  original.then((value) => {
+    output.textContent = value.prompt;
+    translateButton.disabled = false;
+    status.textContent = "Context IR 原文；该内容用于实际生成。";
+  }).catch((error) => {
+    if (handleAuthError(error)) return;
+    output.textContent = "加载失败：" + error.message;
+    status.textContent = "Context IR 加载失败";
   });
-  sec.appendChild(disclosure);
+  translateButton.addEventListener("click", async () => {
+    translateButton.disabled = true;
+    if (showingTranslation) {
+      const value = await original;
+      output.textContent = value.prompt;
+      showingTranslation = false;
+      translateButton.textContent = "翻译为中文";
+      status.textContent = "Context IR 原文；该内容用于实际生成。";
+      translateButton.disabled = false;
+      return;
+    }
+    translateButton.textContent = "翻译中…";
+    status.textContent = "正在生成仅供查看的中文译文…";
+    try {
+      const value = await contextIRTranslationValue(detail);
+      output.textContent = value.translation;
+      showingTranslation = true;
+      translateButton.textContent = "查看原文";
+      status.textContent = "中文译文仅供查看，不参与实际生成。";
+    } catch (error) {
+      if (handleAuthError(error)) return;
+      translateButton.textContent = "翻译为中文";
+      status.textContent = "翻译失败：" + error.message;
+    } finally {
+      translateButton.disabled = false;
+    }
+  });
   return sec;
 }
 
@@ -1037,18 +1156,109 @@ function kfGrid(detail, names, pathPrefix, altPrefix) {
   return grid;
 }
 
-/* prompt 卡片（复制按钮 + 全文；单段/多段共用） */
-function promptCard(text) {
+function sourcePromptEditable(detail) {
+  const contextIR = detail && detail.context_ir;
+  return canOperate(detail)
+    && (!detail.generation || detail.generation.status === null)
+    && contextIR && contextIR.status === "not_started"
+    && typeof detail.source_prompt_sha256 === "string"
+    && /^[0-9a-f]{64}$/.test(detail.source_prompt_sha256);
+}
+
+function renderSourcePromptCard(detail, text) {
+  const editable = sourcePromptEditable(detail);
+  const editButton = el("button", "copy-btn edit-prompt-btn", "修改提示词");
+  editButton.type = "button";
+  const card = promptCard(text, editable ? [editButton] : []);
+  if (!editable) return card;
+
+  const output = card.querySelector(".prompt-text");
+  const textarea = el("textarea", "dialogue-textarea prompt-editor");
+  textarea.rows = 14;
+  textarea.value = text;
+  textarea.hidden = true;
+  textarea.setAttribute("aria-label", "修改 H3 源提示词");
+  card.appendChild(textarea);
+  const error = el("p", "form-error");
+  error.hidden = true;
+  card.appendChild(error);
+  const controls = el("div", "final-row prompt-edit-actions");
+  controls.hidden = true;
+  const save = el("button", "btn btn-primary", "保存提示词");
+  save.type = "button";
+  const cancel = el("button", "btn", "取消");
+  cancel.type = "button";
+  controls.appendChild(save);
+  controls.appendChild(cancel);
+  card.appendChild(controls);
+
+  const showEditor = (shown) => {
+    output.hidden = shown;
+    textarea.hidden = !shown;
+    controls.hidden = !shown;
+    editButton.hidden = shown;
+    error.hidden = true;
+  };
+  editButton.addEventListener("click", () => showEditor(true));
+  cancel.addEventListener("click", () => {
+    textarea.value = output.textContent;
+    showEditor(false);
+  });
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    cancel.disabled = true;
+    error.hidden = true;
+    try {
+      const payload = await apiJSON(
+        "/api/conversations/" + encodeURIComponent(detail.id) + "/prompt",
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            confirm: true,
+            expected_sha256: detail.source_prompt_sha256,
+            prompt: textarea.value,
+          }),
+        },
+      );
+      if (!payload || typeof payload.prompt !== "string"
+          || typeof payload.final_prompt !== "string"
+          || typeof payload.sha256 !== "string"
+          || !/^[0-9a-f]{64}$/.test(payload.sha256)) {
+        throw new Error("源提示词保存响应校验失败");
+      }
+      output.textContent = payload.prompt;
+      detail.source_prompt = payload.prompt;
+      detail.source_prompt_sha256 = payload.sha256;
+      detail.prompt = payload.final_prompt;
+      showEditor(false);
+      await loadDetail(detail.id, true);
+    } catch (saveError) {
+      if (handleAuthError(saveError)) return;
+      error.textContent = "保存失败：" + saveError.message;
+      error.hidden = false;
+    } finally {
+      save.disabled = false;
+      cancel.disabled = false;
+    }
+  });
+  return card;
+}
+
+/* prompt 卡片（复制按钮 + 全文；源提示词、IR、单段/多段共用） */
+function promptCard(text, actions = []) {
   const card = el("div", "prompt-card");
   const head = el("div", "prompt-head");
   head.appendChild(el("span", "prompt-hint", "用于 H3 视频生成"));
+  for (const action of actions) head.appendChild(action);
+  const output = el("pre", "prompt-text", text);
   const copyBtn = el("button", "copy-btn");
   copyBtn.type = "button";
   copyBtn.appendChild(icon("i-copy"));
   const copyLabel = el("span", null, "复制");
   copyBtn.appendChild(copyLabel);
   copyBtn.addEventListener("click", async () => {
-    const ok = await copyText(text);
+    const ok = await copyText(output.textContent);
     copyBtn.classList.add("copied");
     copyLabel.textContent = ok ? "已复制" : "复制失败";
     setTimeout(() => {
@@ -1058,7 +1268,7 @@ function promptCard(text) {
   });
   head.appendChild(copyBtn);
   card.appendChild(head);
-  card.appendChild(el("pre", "prompt-text", text));
+  card.appendChild(output);
   return card;
 }
 
@@ -1399,8 +1609,6 @@ function renderStable(detail) {
     if (ppAsk) inner.appendChild(ppAsk);
     inner.appendChild(el("div", "pp-dynamic"));
     inner.appendChild(renderFinalSection(detail));
-    const contextIR = detail.has_video ? renderContextIRSection(detail) : null;
-    if (contextIR) inner.appendChild(contextIR);
   }
   $("stream").appendChild(inner);
 }
@@ -1436,6 +1644,8 @@ function detailSignature(detail) {
     detail.fit_mode,
     detail.duration_s,
     detail.receipt_version,
+    detail.source_prompt || null,
+    detail.source_prompt_sha256 || null,
     detail.dialogue || null,
     generation ? generation.status : null,
     generation ? generation.error : null,
@@ -1850,6 +2060,7 @@ if (typeof module !== "undefined" && module.exports) {
     normalizeDialogueLines,
     parseDialogueLines,
     validateContextIRPayload,
+    validateContextIRTranslationPayload,
   };
 }
 

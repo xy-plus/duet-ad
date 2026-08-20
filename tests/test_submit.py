@@ -50,6 +50,105 @@ def _make_conv(settings, *, fit_required=False, duration_s=9.2, status="done"):
     return cid, original
 
 
+def _write_initial_receipt(settings, cid):
+    cdir = settings.data_dir / cid
+    frozen = prepared_input.write_prepared_input(
+        root=cdir,
+        source=cdir / "source.mp4",
+        audio=None,
+        keyframes=[cdir / "work" / "keyframes" / "01.png"],
+        visual=cdir / "work" / "visual_prompt.txt",
+        final=cdir / "work" / "prompt.txt",
+        dialogue_mode="auto",
+        dialogue=(),
+        vocal_filter_enabled=True,
+        duration_s=9.2,
+        ratio="9:16",
+        fit_mode="none",
+        engine_request={"fixture": "initial"},
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        prompt=frozen.prompt_text,
+        prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
+    )
+    return frozen
+
+
+def test_source_h3_prompt_can_be_cas_edited_before_context_ir(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    initial = _write_initial_receipt(settings, cid)
+    digest = initial.visual_prompt.sha256
+    replacement = "镜头改为从宠物眼睛高度缓慢向前移动。"
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    response = client.patch(
+        f"/api/conversations/{cid}/prompt",
+        headers=AUTH,
+        json={"confirm": True, "expected_sha256": digest, "prompt": replacement},
+    )
+
+    assert detail["source_prompt"] == PROMPT
+    assert detail["source_prompt_sha256"] == digest
+    assert response.status_code == 200
+    assert response.json()["prompt"] == replacement
+    cdir = settings.data_dir / cid
+    stored = storage.load_meta(settings.data_dir, cid)
+    assert (cdir / "work" / "visual_prompt.txt").read_text() == replacement
+    assert stored["prompt"].startswith(replacement)
+    reloaded = prepared_input.load_prepared_input(
+        cdir, cdir / prepared_input.RECEIPT_FILENAME, expected_dialogue=()
+    )
+    assert reloaded.visual_prompt.data.decode() == replacement
+    assert reloaded.final_prompt.data.decode() == stored["prompt"]
+
+    prepared = []
+    monkeypatch.setattr(
+        h3,
+        "prepare_context_ir",
+        lambda request: prepared.append(request)
+        or h3.H3Result("ready_for_h3", "000001"),
+    )
+    started = client.post(
+        f"/api/conversations/{cid}/context-ir",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "client_request_id": REQUEST_ID,
+            "dialogue_mode": "none",
+            "fit_mode": "none",
+        },
+    )
+    assert started.status_code == 202
+    assert len(prepared) == 1
+    assert prepared[0].prompt.startswith(replacement)
+
+
+def test_source_h3_prompt_is_frozen_once_context_ir_exists(enabled):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    initial = _write_initial_receipt(settings, cid)
+    h3_root = settings.data_dir / cid / ".h3"
+    h3_root.mkdir()
+    (h3_root / "session.json").write_text("{}", encoding="utf-8")
+
+    response = client.patch(
+        f"/api/conversations/{cid}/prompt",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "expected_sha256": initial.visual_prompt.sha256,
+            "prompt": "不得写入",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "prompt_frozen"}
+    assert (settings.data_dir / cid / "work" / "visual_prompt.txt").read_text() == PROMPT
+
+
 @pytest.fixture
 def enabled(tmp_path):
     settings = make_settings(

@@ -70,6 +70,8 @@ multipart 字段：
   "updated_at": "...",
   "keyframes": ["01.png"],
   "prompt": "...",
+  "source_prompt": "...",
+  "source_prompt_sha256": "64 lowercase hex characters",
   "segments": [],
   "voice_lines": [],
   "read_only": false,
@@ -101,7 +103,7 @@ multipart 字段：
 }
 ```
 
-`generation`、`receipt_version` 和 `fit_mode` 在尚未创建时为 null。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source/has_video` 按磁盘实况计算。
+`generation`、`receipt_version` 和 `fit_mode` 在尚未创建时为 null。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于 IR 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source/has_video` 按磁盘实况计算。
 
 `context_ir` 只用于小体积轮询：仅在本地状态、正文状态和 SHA-256 一致时返回 `available=true` 与 hash；损坏时固定为 `invalid/false/null`。详情不返回优化 prompt、provider task id、result URL、凭据或任意供应商原始对象。
 
@@ -124,9 +126,17 @@ multipart 字段：
 
 请求字段沿用输入冻结契约：`confirm/client_request_id/dialogue_mode/lines?/fit_mode`。该接口只提交或恢复 Context IR，在 `ready_for_h3` 停止，绝不提交 H3。首次请求冻结 prepared input；确定失败后的新 id 创建新 IR attempt。
 
+### `PATCH /api/conversations/{cid}/prompt`
+
+请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。只在 schema v2、输入准备完成且 Context IR 尚未开始时，以 SHA-256 CAS 更新 `work/visual_prompt.txt`，重新机械组合结构化台词并重写 prepared receipt。IR 已开始后返回 409 `prompt_frozen`。
+
 ### `PATCH /api/conversations/{cid}/context-ir`
 
 请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。只允许在 H3 尚未提交时修改；SHA 不一致返回 409，空白或超限返回 422。成功返回新的 `status/prompt/sha256/dialogue_valid`。
+
+### `POST /api/conversations/{cid}/context-ir/translation`
+
+请求严格为 `{expected_sha256:"..."}`。仅在 Context IR 正文完成且 hash 完全一致时，按需生成并返回 `{source_sha256,language:"zh-CN",translation}`。译文按源 hash 独立缓存，只供界面查看；不得改写 Context IR、prepared receipt、源 prompt 或 H3 状态。
 
 ### `GET /api/conversations/{cid}/files/{name}`
 
@@ -334,7 +344,9 @@ IR 台词门禁已删除：服务端不比较 `<d>` 内容与冻结台词，也�
 | `ASR_TIMEOUT_S` | `180` | 单次本地听写超时 |
 | `ASR_THREADS` | `4` | 单次本地听写 CPU 线程数 |
 | `ENABLE_H3_SUBMIT` | false | H3 提交总开关 |
-| `MINIMAX_API_KEY` | 空 | Context IR 凭据 |
+| `MINIMAX_API_KEY` | 空 | Context IR 与按需中文翻译凭据 |
+| `MINIMAX_TEXT_MODEL` | `MiniMax-M2.7` | Context IR 中文翻译文本模型 |
+| `CONTEXT_IR_TRANSLATION_TIMEOUT_S` | `120` | 单个翻译分块请求超时 |
 | `AUTODL_ART_TOKEN` | 空 | AutoDL H3 凭据 |
 | `H3_REQUEST_TIMEOUT_S` | `30` | 普通供应商请求超时 |
 | `H3_UPLOAD_TIMEOUT_S` | `60` | 单关键帧上传超时 |

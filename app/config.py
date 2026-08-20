@@ -10,6 +10,8 @@ class Settings:
     max_duration_s: int = 15
     enable_h3_submit: bool = False
     minimax_api_key: str = field(default="", repr=False)
+    minimax_text_model: str = "MiniMax-M2.7"
+    context_ir_translation_timeout_s: float = 120.0
     autodl_art_token: str = field(default="", repr=False)
     h3_request_timeout_s: float = 30.0
     h3_upload_timeout_s: float = 60.0
@@ -47,6 +49,12 @@ def get_settings() -> Settings:
         max_duration_s=int(os.environ.get("MAX_DURATION_S", "15")),
         enable_h3_submit=os.environ.get("ENABLE_H3_SUBMIT", "").lower() in ("1", "true", "yes"),
         minimax_api_key=os.environ.get("MINIMAX_API_KEY", "").strip(),
+        minimax_text_model=os.environ.get(
+            "MINIMAX_TEXT_MODEL", "MiniMax-M2.7"
+        ).strip(),
+        context_ir_translation_timeout_s=float(
+            os.environ.get("CONTEXT_IR_TRANSLATION_TIMEOUT_S", "120")
+        ),
         autodl_art_token=os.environ.get("AUTODL_ART_TOKEN", "").strip(),
         h3_request_timeout_s=float(os.environ.get("H3_REQUEST_TIMEOUT_S", "30")),
         h3_upload_timeout_s=float(os.environ.get("H3_UPLOAD_TIMEOUT_S", "60")),
