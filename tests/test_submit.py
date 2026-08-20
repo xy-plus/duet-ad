@@ -448,6 +448,15 @@ def test_ir_dialogue_mismatch_is_failed_and_new_id_can_rebuild_dialogue_attempt(
     assert same_id.status_code == 409
     assert same_id.json() == {"detail": "new client_request_id required"}
 
+    unchanged_auto = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json={**original, "client_request_id": "request-dialogue-auto-2"},
+    )
+    assert unchanged_auto.status_code == 409
+    assert unchanged_auto.json() == {"detail": "ir_dialogue_correction_required"}
+    assert retries == []
+
     changed = {
         **original,
         "client_request_id": "request-dialogue-2",

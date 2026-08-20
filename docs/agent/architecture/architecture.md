@@ -67,6 +67,7 @@ flowchart LR
 - 自动台词 Codex 不在会话目录运行。后端为每次尝试新建 `/tmp/duet-voice-*`，只复制 `work/voice.mp3` 和仅含 `duration_seconds` 的 `work/manifest.json`；外层 `bwrap` 在内层 `workspace-write`、断网和秘密环境变量清洗之外遮住 checkout、`/tmp` 其余内容及必要时的会话目录。缺少 `bwrap`、stage/work/session 路径异常或 symlink 音频都 fail closed。
 - 自动台词的唯一可收养 agent 输出是隔离区 `work/voice_lines.json`：先做大小、普通文件与 JSON 字段白名单校验，再把净化结果写回主 `work/`。重试创建全新隔离区；Codex 超时/非零退出但完整产物已通过同一校验时仍可收养。
 - ASR 初次校验和 YAMNet 分类使用 `voice.mp3` 的真实时长；随后、写 `voice_lines/meta/receipt` 前，必须把有效台词归一到 manifest 的视频时间轴。跨越视频结尾的行把 `end_s` 截到视频时长，`start_s >= duration_s` 的 MP3 编码纯尾部行丢弃并留 provenance/warning，归一结果再过一次 voice 白名单。receipt 的时间真相始终是视频时长。
+- YAMNet 默认按句区间分类；仅当 ASR 只返回一句、该区间未命中而全轨单窗达到同一个 `51/256` 明确人声阈值时，允许按全轨较强的 `spoken/sung` 兜底。多句或纯 BGM 不使用该兜底。
 - 视觉 agent 运行时看不到 `voice_lines.json`。视觉 prompt 中的 OCR、字幕、画面文字或备注不会被解析成台词。
 - `auto` 只接受内部 ASR provenance；默认声学过滤同时保留 `spoken` 与 `sung`。`edit/custom` 只接受用户提交的结构化行；`none` 必须为空。
 - `prompt.txt` 由视觉文本和唯一结构化发声块机械组合。无台词时明确禁止角色说出画面文字。

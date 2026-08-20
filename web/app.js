@@ -110,6 +110,9 @@ function buildSubmitPayload(input) {
   if (!["auto", "edit", "custom", "none"].includes(dialogueMode)) {
     throw new Error("请选择台词模式");
   }
+  if (input.dialogueCorrectionRequired === true && dialogueMode === "auto") {
+    throw new Error("Context IR 台词不匹配，请编辑、自定义或选择无台词");
+  }
   const requestId = String(input.clientRequestId || "").trim();
   if (!requestId) throw new Error("缺少本次生成请求标识");
 
@@ -576,11 +579,19 @@ function canOperate(detail) {
   return detail.read_only === false && detail.submit_enabled === true;
 }
 
+function requiresDialogueCorrection(detail) {
+  const generation = detail && detail.generation;
+  return !!generation
+    && generation.status === "failed"
+    && generation.error === "ir_dialogue_mismatch";
+}
+
 function generationDraft(detail) {
+  const correctionRequired = requiresDialogueCorrection(detail);
   let draft = state.generationDrafts[detail.id];
   if (!draft) {
     draft = {
-      dialogueMode: "auto",
+      dialogueMode: correctionRequired ? "none" : "auto",
       editLinesText: formatDialogueLines(detail.dialogue),
       customLinesText: "",
       fitMode: "",
@@ -591,6 +602,7 @@ function generationDraft(detail) {
     draft.editLinesText = formatDialogueLines(detail.dialogue);
     draft.receiptVersion = detail.receipt_version;
   }
+  if (correctionRequired && draft.dialogueMode === "auto") draft.dialogueMode = "none";
   return draft;
 }
 
@@ -630,6 +642,7 @@ async function submitGeneration(detail, card) {
       linesText: draft.dialogueMode === "edit" ? draft.editLinesText : draft.customLinesText,
       fitRequired: detail.fit_required === true,
       fitMode: draft.fitMode,
+      dialogueCorrectionRequired: requiresDialogueCorrection(detail),
     });
   } catch (error) {
     errorBox.textContent = error.message;
@@ -772,9 +785,11 @@ function renderFinalSection(detail) {
     ["custom", "自定义台词"],
     ["none", "无台词"],
   ];
+  const correctionRequired = requiresDialogueCorrection(detail);
   for (const [value, label] of modes) {
     const item = choice("dialogue-" + detail.id, value, label, draft.dialogueMode === value);
     const input = item.querySelector("input");
+    if (correctionRequired && value === "auto") input.disabled = true;
     input.addEventListener("change", () => {
       draft.dialogueMode = value;
       const editor = card.querySelector(".dialogue-editor");
@@ -787,9 +802,11 @@ function renderFinalSection(detail) {
   }
   dialogueField.appendChild(dialogueChoices);
   const autoCount = normalizeDialogueLines(detail.dialogue).length;
-  dialogueField.appendChild(el("p", "final-help", autoCount
-    ? "自动识别到 " + autoCount + " 行台词；编辑模式会以这些台词预填。"
-    : "未识别到自动台词；可改用自定义或无台词。"));
+  dialogueField.appendChild(el("p", "final-help", correctionRequired
+    ? "Context IR 与自动台词不一致；请编辑识别台词、自定义台词或选择无台词后重试。"
+    : (autoCount
+      ? "自动识别到 " + autoCount + " 行台词；编辑模式会以这些台词预填。"
+      : "未识别到自动台词；可改用自定义或无台词。")));
   card.appendChild(dialogueField);
 
   const editor = el("div", "dialogue-editor");
@@ -1713,6 +1730,7 @@ if (typeof module !== "undefined" && module.exports) {
     contextIRCacheKey,
     detailSignature,
     formatDialogueLines,
+    generationDraft,
     generationAction,
     normalizeDialogueLines,
     parseDialogueLines,

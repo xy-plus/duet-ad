@@ -156,6 +156,21 @@ def test_ir_dialogue_mismatch_uses_retry_ui_not_resume_ui():
     assert "H3 生成失败" in source
     assert "generation.error ||" in source
 
+    corrected = _run_contract(
+        "(() => {"
+        "const detail={id:'cid-mismatch',receipt_version:1,fit_required:false,fit_mode:'none',"
+        "dialogue:{mode:'auto',lines:[{start_s:0,end_s:1,text:'OCR'}],auto_lines:[]},"
+        "generation:{status:'failed',error:'ir_dialogue_mismatch'}};"
+        "const draft=contract.generationDraft(detail);"
+        "let rejected=false;"
+        "try { contract.buildSubmitPayload({clientRequestId:'request-auto-2',dialogueMode:'auto',"
+        "linesText:'',fitRequired:false,fitMode:'',dialogueCorrectionRequired:true}); }"
+        "catch (_) { rejected=true; }"
+        "return [draft.dialogueMode,rejected];"
+        "})()"
+    )
+    assert corrected == ["none", True]
+
 
 def test_resume_builder_reuses_the_persisted_paid_attempt_exactly():
     result = _run_contract(

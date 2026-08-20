@@ -1532,6 +1532,27 @@ def test_voice_timeline_normalization_preserves_11_12_13_text_and_order(lines):
     assert warnings == []
 
 
+def test_single_voice_line_uses_strong_track_evidence_when_asr_timestamp_misses():
+    """temp/11 形态：唯一台词文本正确，但 ASR 区间早于真实口播，不能被误删。"""
+    line = {"text": "Jumpa geng sekelapa.", "start_s": 0.0, "end_s": 2.5}
+    analysis = vocal.VocalAnalysis(
+        windows=[
+            vocal.VocalWindow(0, 975, sung=0.0, spoken=0.015625, music=0.0),
+            vocal.VocalWindow(4875, 5850, sung=0.0, spoken=0.33203125, music=0.0),
+        ],
+        has_bgm=False,
+    )
+    bgm_only = vocal.VocalAnalysis(
+        windows=[
+            vocal.VocalWindow(0, 975, sung=0.0, spoken=0.05859375, music=0.2),
+        ],
+        has_bgm=True,
+    )
+
+    assert pipeline._classify_voice_line(line, analysis, only_line=True) == "spoken"
+    assert pipeline._classify_voice_line(line, bgm_only, only_line=True) is None
+
+
 def test_run_voice_codex_timeout_salvages_complete_lines(tmp_path, video_1s, monkeypatch):
     """ASR 的 codex 超时被杀但 voice_lines.json 已完整 → 收养，继续 video-maker。"""
     settings = make_settings(tmp_path)
@@ -1779,7 +1800,7 @@ def _write_stub_codex_voice(bin_dir: Path, frames: int) -> Path:
     """桩 codex 兼处理两种调用：ASR 调用写 voice_lines.json，video-maker 调用挑帧写 prompt。"""
     stub = bin_dir / "codex"
     stub.write_text(
-        f"#!{sys.executable}\n"
+        "#!/usr/bin/python3\n"
         + textwrap.dedent(
             f"""\
             import json, shutil, sys
@@ -1812,7 +1833,14 @@ def _write_stub_codex_voice(bin_dir: Path, frames: int) -> Path:
     return stub
 
 
-def test_full_pipeline_voice_with_stub_codex(tmp_path, monkeypatch):
+@pytest.fixture
+def voice_stub_bin():
+    """外层 voice bwrap 会隐藏 /tmp 和仓库，桩程序必须放在仍可见的位置。"""
+    with tempfile.TemporaryDirectory(prefix="duet-codex-stub-", dir="/var/tmp") as raw:
+        yield Path(raw)
+
+
+def test_full_pipeline_voice_with_stub_codex(tmp_path, monkeypatch, voice_stub_bin):
     """真 subprocess 全链路含口播：extract → ffmpeg 抽音轨 → 桩 codex ASR → 桩 codex 选帧 → done。"""
     video = tmp_path / "talk.mp4"
     subprocess.run(
@@ -1824,8 +1852,7 @@ def test_full_pipeline_voice_with_stub_codex(tmp_path, monkeypatch):
         ],
         check=True, capture_output=True,
     )
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+    bin_dir = voice_stub_bin
     _write_stub_codex_voice(bin_dir, 3)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 

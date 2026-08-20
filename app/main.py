@@ -765,6 +765,15 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail=detail)
                 if previous_status in _GENERATION_RETRYABLE and previous_id == request_id:
                     raise HTTPException(status_code=409, detail="new client_request_id required")
+                if (
+                    previous_status in _GENERATION_RETRYABLE
+                    and generation.get("error") == "ir_dialogue_mismatch"
+                    and payload["dialogue_mode"] == "auto"
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="ir_dialogue_correction_required",
+                    )
                 if previous_status in _GENERATION_RESUMABLE:
                     if previous_id != request_id:
                         raise HTTPException(status_code=409, detail="resume_request_id_mismatch")

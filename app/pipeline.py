@@ -236,6 +236,29 @@ def _has_retryable_vocal_evidence(analysis: vocal.VocalAnalysis) -> bool:
     )
 
 
+def _classify_voice_line(
+    line: dict,
+    analysis: vocal.VocalAnalysis,
+    *,
+    only_line: bool,
+) -> str | None:
+    """逐句分类；唯一台词时间戳漂移时允许用明确的全轨人声证据兜底。"""
+    classification = vocal.classify_segment(
+        int(line["start_s"] * 1000), int(line["end_s"] * 1000), analysis.windows
+    )
+    if classification is not None or not only_line or not analysis.windows:
+        return classification
+    max_spoken = max(window.spoken for window in analysis.windows)
+    max_sung = max(window.sung for window in analysis.windows)
+    if max_sung >= EMPTY_TRANSCRIPT_VOCAL_EVIDENCE_MIN and max_sung > max_spoken:
+        return "sung"
+    if max_spoken >= EMPTY_TRANSCRIPT_VOCAL_EVIDENCE_MIN:
+        return "spoken"
+    if max_sung >= EMPTY_TRANSCRIPT_VOCAL_EVIDENCE_MIN:
+        return "sung"
+    return None
+
+
 def _normalize_voice_timeline(
     decisions: list[dict], duration_s: float
 ) -> tuple[list[dict], list[dict], list[str]]:
@@ -345,8 +368,10 @@ def _voice_step(
     # VOCAL_FILTER=off 只旁路 keep/drop，不旁路分类：receipt 必须解释每句为何被保留。
     decisions = []
     for line in lines:
-        classification = vocal.classify_segment(
-            int(line["start_s"] * 1000), int(line["end_s"] * 1000), analysis.windows
+        classification = _classify_voice_line(
+            line,
+            analysis,
+            only_line=len(lines) == 1,
         )
         kept = not filter_enabled or classification in ("spoken", "sung")
         decisions.append(

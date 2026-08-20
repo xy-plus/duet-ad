@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -618,7 +619,7 @@ def _write_stub_codex_segments(bin_dir: Path, frames: int = 3) -> Path:
     按 SKILL.md 字面路径写 workdir/work/ 产物（段目录内嵌套 work/ 的设计前提）。"""
     stub = bin_dir / "codex"
     stub.write_text(
-        f"#!{sys.executable}\n"
+        "#!/usr/bin/python3\n"
         + textwrap.dedent(
             f"""\
             import json, shutil, sys
@@ -657,14 +658,20 @@ def _write_stub_codex_segments(bin_dir: Path, frames: int = 3) -> Path:
     return stub
 
 
-def test_run_multi_segment_full_pipeline(tmp_path, monkeypatch):
+@pytest.fixture
+def segment_voice_stub_bin():
+    """voice 外层 bwrap 会隐藏 /tmp 和仓库，桩程序放在仍可见的位置。"""
+    with tempfile.TemporaryDirectory(prefix="duet-segment-stub-", dir="/var/tmp") as raw:
+        yield Path(raw)
+
+
+def test_run_multi_segment_full_pipeline(tmp_path, monkeypatch, segment_voice_stub_bin):
     """真 subprocess 全链路：>20s 多场景视频 → 场景检测拆 3 段 → 并发处理 → meta.segments。
 
     桩 codex 按 SKILL.md 字面执行（输入/产物均 workdir/work/，与单段 codex 逐字相同）→
     白名单校验通过；这是「段目录嵌套 work/，SKILL.md 逐字适用」的 e2e 形状用例。"""
     video = _make_scene_video_24s(tmp_path / "scene.mp4")
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+    bin_dir = segment_voice_stub_bin
     _write_stub_codex_segments(bin_dir)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 

@@ -117,7 +117,7 @@ multipart 字段：
 }
 ```
 
-不得附带 provider task id、result URL、凭据或其他内部状态。会话或 Context IR 不存在分别返回 404 `not found` / `context_ir_not_found`；attempt 尚未产出已校验正文返回 409 `context_ir_not_ready`；hash、状态或本地收据损坏返回 409 `context_ir_invalid`。该 GET 不写盘、不联网；前端首次展开“Context IR 优化提示词”时读取并按 `cid:sha256` 缓存，详情轮询不携带正文，最终视频存在后仍可读取。
+不得附带 provider task id、result URL、凭据或其他内部状态。会话或 Context IR 不存在分别返回 404 `not found` / `context_ir_not_found`；attempt 尚未产出已校验正文返回 409 `context_ir_not_ready`；输入哈希、状态或正文 SHA-256 不一致返回 409 `context_ir_invalid`。该 GET 不写盘、不联网；前端首次展开“Context IR 优化提示词”时读取并按 `cid:sha256` 缓存，详情轮询不携带正文，最终视频存在后仍可读取。
 
 ### `GET /api/conversations/{cid}/files/{name}`
 
@@ -165,6 +165,7 @@ multipart 字段：
 | 409 | `prepared_input_invalid` / `frame_fit_failed` | 冻结输入或画幅派生失败 |
 | 409 | `generation in progress` / `already submitted` | active/succeeded 使用不同 id |
 | 409 | `new client_request_id required` | 确定 failed 后复用旧 id |
+| 409 | `ir_dialogue_correction_required` | `ir_dialogue_mismatch` 后仍试图原样复用 `auto`；必须 edit/custom/none |
 | 409 | `resume_request_id_mismatch` | resume_required 没有使用原 client_request_id |
 | 409 | `resume_parameters_changed` | resume_required 的 mode、归一化 lines 或 fit 与冻结值不一致 |
 | 409 | `submission_outcome_unknown` | 既有 generation 为 submission_unknown；任意 id 均拒绝 |
@@ -174,7 +175,7 @@ multipart 字段：
 
 `resume_required` 表示 provider task 已知或 Context IR 已完成：只接受原 `client_request_id`，且 dialogue mode、标准化 lines、`fit_mode` 必须与 meta 和 prepared receipt 完全一致。合法继续返回 `202 {"status":"queued","attempt":<原值>}`，不重写 receipt、不递增 attempt，后台调用幂等 `h3.start` 而非 `h3.retry`。已知 task 错误包括 `ir_query_failed/ir_timeout/h3_query_failed/h3_timeout/download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed`；`ready_for_h3`、`ir_running`、`h3_running` 也进入此状态。
 
-`ir_dialogue_mismatch` 是确定性 `failed`，不属于 `resume_required`：同一 `client_request_id` 返回 409 `new client_request_id required`；用户可改用 edit/custom/none 修正台词，并以新 id 重建 prepared receipt、创建新 attempt。该失败仍保证 H3 POST 为 0。
+`ir_dialogue_mismatch` 是确定性 `failed`，不属于 `resume_required`：同一 `client_request_id` 返回 409 `new client_request_id required`，新 id 也禁止原样复用 `auto`；用户必须改用 edit/custom/none 修正台词，再重建 prepared receipt、创建新 attempt。该失败仍保证 H3 POST 为 0。
 
 确定性输出安全拒绝 `download_url_rejected/download_redirect_rejected/download_too_large/download_invalid_video` 映射为 `failed`，只有用户明确使用新 id 才创建 retry attempt。它们不属于会因同参数继续而消失的传输故障。
 
