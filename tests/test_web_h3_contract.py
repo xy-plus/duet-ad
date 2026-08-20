@@ -48,6 +48,13 @@ def test_creation_and_copy_use_h3_contract_only():
     assert "最长 " + "300 秒" not in source
 
 
+def test_pipeline_failure_tip_does_not_blame_every_failure_on_the_video():
+    source = APP_JS.read_text(encoding="utf-8")
+    assert "请确认视频可正常播放、格式常见" not in source
+    assert "输入准备未完成" in source
+    assert "保留上方错误信息" in source
+
+
 def test_submit_and_detail_state_are_part_of_the_static_contract():
     source = APP_JS.read_text(encoding="utf-8")
     for token in (

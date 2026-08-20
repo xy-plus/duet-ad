@@ -72,6 +72,16 @@ class PipelineError(RuntimeError):
     """流水线单步失败（HTTP 层不感知，只进 meta.error）。"""
 
 
+def _codex_output_error(stage: str) -> PipelineError:
+    """把 Codex 成功退出后的产物问题归到正确阶段，不暴露内部文件校验细节。"""
+    details = {
+        "voice": "required voice_lines artifact is missing or invalid",
+        "visual": "required keyframes/prompt artifacts are missing or invalid",
+    }
+    detail = details[stage]
+    return PipelineError(f"codex {stage} output invalid: {detail}")
+
+
 def _run_cmd(argv: list[str], *, timeout: int, step: str, cwd: Path | None = None) -> None:
     """argv 列表子进程；超时/找不到可执行/非零退出 → PipelineError（stderr 已清洗）。"""
     try:
@@ -270,7 +280,10 @@ def _voice_step(
         except PipelineError:
             raise e from None
     else:
-        lines = _load_voice_lines(work, audio_duration_s)
+        try:
+            lines = _load_voice_lines(work, audio_duration_s)
+        except PipelineError:
+            raise _codex_output_error("voice") from None
     if not lines and has_vocal:
         # 音轨有人声但听写为空：只重试一次；再次为空按用户确认继续，但必须明确留痕。
         try:
@@ -281,7 +294,10 @@ def _voice_step(
             except PipelineError:
                 raise e from None
         else:
-            lines = _load_voice_lines(work, audio_duration_s)
+            try:
+                lines = _load_voice_lines(work, audio_duration_s)
+            except PipelineError:
+                raise _codex_output_error("voice") from None
     warnings = [EMPTY_TRANSCRIPT_WARNING] if not lines and has_vocal else []
     # VOCAL_FILTER=off 只旁路 keep/drop，不旁路分类：receipt 必须解释每句为何被保留。
     filtered_lines = []
@@ -512,10 +528,14 @@ def _process_segment(work: Path, source: Path, seg: dict, runner,
         except CodexError as e:
             # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
             try:
-                validate_work_dir(segwork)
+                keyframes, prompt = validate_work_dir(segwork)
             except PipelineError:
                 raise e from None
-        keyframes, prompt = validate_work_dir(segwork)
+        else:
+            try:
+                keyframes, prompt = validate_work_dir(segwork)
+            except PipelineError:
+                raise _codex_output_error("visual") from None
         prompt = _apply_no_bgm_prefix(prompt, segwork / "prompt.txt", enabled=True)
         return {
             "index": index,
@@ -724,10 +744,14 @@ def run(settings: Settings, cid: str, runner) -> None:
             except CodexError as e:
                 # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
                 try:
-                    validate_work_dir(work)
+                    keyframes, prompt = validate_work_dir(work)
                 except PipelineError:
                     raise e from None
-            keyframes, prompt = validate_work_dir(work)
+            else:
+                try:
+                    keyframes, prompt = validate_work_dir(work)
+                except PipelineError:
+                    raise _codex_output_error("visual") from None
             prompt = _apply_no_bgm_prefix(prompt, work / "prompt.txt", enabled=False)
             fit_required = _keyframes_require_fit(work, keyframes)
             if new_input_contract:

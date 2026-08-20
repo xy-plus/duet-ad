@@ -8,7 +8,7 @@
 
 ## 🚧 进行中
 
-<!-- 当前无跨轮未完成实施项；新工作开工时登记，完成后删除。 -->
+- 修复生产上传解析：systemd 必须允许 Codex bwrap 沙箱正常启动，缺失产物须报真实阶段错误；以真实视频完成线上 Context IR → H3 E2E 后才关闭。（→ `app/codex_runner.py`, `app/pipeline.py`, `.deploy/systemd/duet-ad1.service`, `web/app.js`）
 
 ## 📌 待办与限制
 
@@ -17,7 +17,6 @@
 - 全量测试仍有 FastAPI `on_event` 与 Starlette TestClient/httpx 弃用 warning；迁移 lifespan 和兼容测试客户端后再升级依赖。（→ `app/main.py`, `tests/`）
 - 状态更新仍用 2 秒轮询，不用 SSE/WebSocket；规模和实时性要求上升后再升级。（→ `web/app.js`）
 - Codex 认证只支持 `CODEX_HOME` 文件认证；服务会清除名称含 KEY/TOKEN/SECRET/PASSWORD 的 agent 子进程环境，环境变量 API key 路径有意不可用。（→ `app/codex_runner.py`）
-- 当前宿主禁止 bubblewrap 所需的非特权 user namespace，故 CodexRunner 固定使用 0.147 的 legacy Landlock；该开关已弃用，升级 Codex 前必须验证替代沙箱。（→ `app/codex_runner.py`）
 - TikTok 链接依赖 TikWM 与可选 `TIKTOK_PROXY`，第三方故障会影响该分支；普通受支持直链不依赖 TikWM。（→ `app/downloader.py`）
 - `data/` 尚无 TTL/LRU 或磁盘水位清理，长期运行会持续增长。（→ `app/storage.py`）
 - pipeline 闸等待占用 anyio worker thread；极端排队会拖慢同池下载/文件工作，正确性不受影响。（→ `app/main.py:run_pipeline_gated`）

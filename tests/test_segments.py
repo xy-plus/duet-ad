@@ -307,6 +307,49 @@ def test_run_segment_failure_marks_overall_failed(tmp_path, monkeypatch):
     assert "segment 2" in m["error"]
 
 
+def test_run_segment_zero_exit_without_outputs_reports_codex_stage(tmp_path, monkeypatch):
+    """段 Codex 返回 0 但缺产物时，错误归因到视觉输出而非 keyframe 数量。"""
+    settings = make_settings(tmp_path)
+    meta = _make_segment_conversation(settings, SEGMENTS)
+    cid = meta["id"]
+    calls = {"cmd": []}
+
+    def fake_codex(self, workdir, prompt):
+        if Path(workdir).name != "2":
+            _write_valid_package(Path(workdir) / "work")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
+    monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    pipeline.run(settings, cid, CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, cid)
+    assert m["status"] == "failed"
+    assert "segment 2 failed: codex visual output invalid" in m["error"]
+    assert "keyframe count 0" not in m["error"]
+
+
+def test_run_segment_codex_error_salvages_complete_outputs(tmp_path, monkeypatch):
+    """段 Codex 报错但完整产物已落盘时，逐段收养且整体成功。"""
+    settings = make_settings(tmp_path)
+    meta = _make_segment_conversation(settings, SEGMENTS)
+    cid = meta["id"]
+    calls = {"cmd": []}
+
+    def fake_codex(self, workdir, prompt):
+        _write_valid_package(Path(workdir) / "work")
+        raise CodexError("codex timed out after 600s")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
+    monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    pipeline.run(settings, cid, CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, cid)
+    assert m["status"] == "done", m["error"]
+    assert len(m["segments"]) == len(SEGMENTS)
+
+
 def test_run_segments_voice_lines_written_per_segment_including_empty(tmp_path, monkeypatch):
     """口播模式：每段都写 voice_lines.json（无台词的段写空数组）；meta.segments 逐段带 lines。"""
     settings = make_settings(tmp_path)

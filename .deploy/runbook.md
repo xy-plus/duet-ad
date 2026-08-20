@@ -14,6 +14,7 @@ test -x .venv/bin/python
 command -v ffmpeg
 command -v ffprobe
 command -v codex
+command -v bwrap
 .venv/bin/python -m compileall -q app
 bash -n run.sh .deploy/smoke-h3.sh
 .venv/bin/python - <<'PY'
@@ -28,6 +29,27 @@ upstream = server['routes'][0]['handle'][0]['upstreams'][0]['dial']
 assert upstream == '127.0.0.1:3212'
 PY
 ```
+
+Codex 使用 bwrap 创建自己的 user/mount/network namespace。Ubuntu AppArmor
+下不能再在外层 user service 叠加 `PrivateTmp` / `ProtectSystem` /
+`ProtectControlGroups` / `ProtectKernelTunables`，否则
+服务会进入 `unprivileged_userns` profile，内层沙箱在解析开始前就失败。
+仓库 unit 保留 `NoNewPrivileges` / `LockPersonality` / `RestrictSUIDSGID`；
+`RestrictAddressFamilies` 显式加入 bwrap 配置 loopback 所需的 `AF_NETLINK`。
+CodexRunner 仍固定 `workspace-write` 且禁网。
+
+在发布前用与 unit 相同的保留属性执行一次无付费沙箱探针：
+
+```bash
+systemd-run --user --wait --pipe --collect \
+  --property=NoNewPrivileges=true \
+  --property=LockPersonality=true \
+  --property=RestrictSUIDSGID=true \
+  --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' \
+  codex sandbox -P :workspace -C "$PWD" -- /bin/true
+```
+
+该命令必须退出 0；它只启动本地 sandbox，不调用模型或视频 API。
 
 确认磁盘可写且现有恢复状态不会被清理：
 
@@ -114,6 +136,9 @@ install -m 0644 .deploy/systemd/duet-ad1.service \
   ~/.config/systemd/user/duet-ad1.service
 systemd-analyze --user verify ~/.config/systemd/user/duet-ad1.service
 ```
+
+不要将上述 namespace 限制作为 drop-in 加回去；如果需要改变 unit 硬化策略，
+必须先在同样的 user-service 属性下完成一次 bwrap 与 Codex 断网写入测试。
 
 新 unit 只有一个 `EnvironmentFile=`，没有任何 inline `Environment=`。在 `daemon-reload` 前删除仅指向旧 `h3.env` 的 drop-in 和旧环境文件，确保本次重启已经只有一个环境源：
 

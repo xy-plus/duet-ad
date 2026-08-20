@@ -13,15 +13,14 @@ RestartSec=5s
 TimeoutStopSec=45s
 UMask=0077
 
-# Keep the writable surface small without hiding the user's CODEX_HOME.
+# Codex creates its own bwrap user/mount/network namespaces.  Do not add
+# systemd namespace directives here: on Ubuntu's AppArmor policy they move the
+# service into unprivileged_userns and prevent the inner sandbox from starting.
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectControlGroups=true
-ProtectKernelTunables=true
 LockPersonality=true
 RestrictSUIDSGID=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# bwrap needs AF_NETLINK to configure loopback inside its denied-network namespace.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 StandardOutput=journal
 StandardError=journal

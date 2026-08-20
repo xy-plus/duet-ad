@@ -479,7 +479,7 @@ function renderFail(detail) {
   const body = el("div");
   body.appendChild(el("p", "fail-title", "处理失败"));
   body.appendChild(el("p", "fail-msg", detail.error || "后端未返回具体原因"));
-  body.appendChild(el("p", "fail-tip", "请确认视频可正常播放、格式常见（如 MP4 / MOV），然后重新上传"));
+  body.appendChild(el("p", "fail-tip", "输入准备未完成；请保留上方错误信息后重试，若重复出现请联系管理员"));
   card.appendChild(body);
   row.appendChild(card);
   return row;

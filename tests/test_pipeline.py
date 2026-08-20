@@ -215,7 +215,7 @@ class TestCodexRunner:
         assert argv[:2] == ["codex", "exec"]
         assert argv[argv.index("-C") + 1] == str(tmp_path)
         assert argv[argv.index("-s") + 1] == "workspace-write"
-        assert argv[argv.index("--enable") + 1] == "use_legacy_landlock"
+        assert "use_legacy_landlock" not in argv
         assert "--skip-git-repo-check" in argv
         assert "--ephemeral" in argv
         assert argv[argv.index("--color") + 1] == "never"
@@ -485,7 +485,11 @@ def test_run_validation_failure(tmp_path, video_1s, monkeypatch):
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert "keyframe" in m["error"]
+    assert m["error"] == (
+        "codex visual output invalid: required keyframes/prompt artifacts "
+        "are missing or invalid"
+    )
+    assert "keyframe count 0" not in m["error"]
 
 
 # ---------- 口播步（ASR，抽帧之后） ----------
@@ -1203,7 +1207,7 @@ def test_run_voice_codex_failure_no_product(tmp_path, video_1s, monkeypatch):
 
 
 def test_run_voice_validation_failure(tmp_path, video_1s, monkeypatch):
-    """ASR 产物过不了白名单 → failed，错误指明 voice_lines。"""
+    """ASR 返回 0 但产物非法 → failed，错误归因于 Codex 输出阶段。"""
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
     _set_voice_mode(settings, meta, "keep")
@@ -1224,7 +1228,33 @@ def test_run_voice_validation_failure(tmp_path, video_1s, monkeypatch):
 
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert "voice_lines" in m["error"]
+    assert m["error"] == (
+        "codex voice output invalid: required voice_lines artifact "
+        "is missing or invalid"
+    )
+
+
+def test_run_voice_missing_output_reports_codex_stage(tmp_path, video_1s, monkeypatch):
+    """ASR 返回 0 但没写产物时，不把底层文件缺失误报成输入视频问题。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", lambda self, workdir, prompt: None)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    m = storage.load_meta(settings.data_dir, meta["id"])
+    assert m["status"] == "failed"
+    assert m["error"].startswith("codex voice output invalid:")
+    assert "voice_lines.json missing" not in m["error"]
 
 
 # ---------- HTTP 接线 ----------
