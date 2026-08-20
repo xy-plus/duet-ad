@@ -87,6 +87,11 @@ multipart 字段：
     "attempt": 1,
     "client_request_id": "request-123456"
   },
+  "context_ir": {
+    "status": "not_started|submitting|running|succeeded|failed|submission_unknown|invalid",
+    "available": false,
+    "sha256": null
+  },
   "fit_mode": "none",
   "has_source": true,
   "has_video": false,
@@ -97,6 +102,22 @@ multipart 字段：
 ```
 
 `generation`、`receipt_version` 和 `fit_mode` 在尚未创建时为 null。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source/has_video` 按磁盘实况计算。
+
+`context_ir` 只用于小体积轮询：仅在本地状态、正文状态和 SHA-256 一致时返回 `available=true` 与 hash；损坏时固定为 `invalid/false/null`。详情不返回优化 prompt、provider task id、result URL、凭据或任意供应商原始对象。
+
+### `GET /api/conversations/{cid}/context-ir`
+
+带 Bearer 鉴权的只读按需端点。仅在最新 attempt 的 Context IR 正文通过状态与 SHA-256 校验时返回固定字段：
+
+```json
+{
+  "status": "succeeded",
+  "prompt": "精确的优化提示词全文",
+  "sha256": "64 lowercase hex characters"
+}
+```
+
+不得附带 provider task id、result URL、凭据或其他内部状态。会话或 Context IR 不存在分别返回 404 `not found` / `context_ir_not_found`；attempt 尚未产出已校验正文返回 409 `context_ir_not_ready`；hash、状态或本地收据损坏返回 409 `context_ir_invalid`。该 GET 不写盘、不联网；前端首次展开“Context IR 优化提示词”时读取并按 `cid:sha256` 缓存，详情轮询不携带正文，最终视频存在后仍可读取。
 
 ### `GET /api/conversations/{cid}/files/{name}`
 
@@ -152,6 +173,8 @@ multipart 字段：
 相同 id 在 `queued/running/succeeded` 时返回现有 `{status,attempt}`，不重复 POST。确定 `failed` 只有新 id 才进入人工 retry。
 
 `resume_required` 表示 provider task 已知或 Context IR 已完成：只接受原 `client_request_id`，且 dialogue mode、标准化 lines、`fit_mode` 必须与 meta 和 prepared receipt 完全一致。合法继续返回 `202 {"status":"queued","attempt":<原值>}`，不重写 receipt、不递增 attempt，后台调用幂等 `h3.start` 而非 `h3.retry`。已知 task 错误包括 `ir_query_failed/ir_timeout/h3_query_failed/h3_timeout/download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed`；`ready_for_h3`、`ir_running`、`h3_running` 也进入此状态。
+
+`ir_dialogue_mismatch` 是确定性 `failed`，不属于 `resume_required`：同一 `client_request_id` 返回 409 `new client_request_id required`；用户可改用 edit/custom/none 修正台词，并以新 id 重建 prepared receipt、创建新 attempt。该失败仍保证 H3 POST 为 0。
 
 确定性输出安全拒绝 `download_url_rejected/download_redirect_rejected/download_too_large/download_invalid_video` 映射为 `failed`，只有用户明确使用新 id 才创建 retry attempt。它们不属于会因同参数继续而消失的传输故障。
 

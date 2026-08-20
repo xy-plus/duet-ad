@@ -354,7 +354,6 @@ def test_ambiguous_submit_error_stays_unknown_when_inspect_also_fails(
     [
         "ir_query_failed",
         "ir_timeout",
-        "ir_dialogue_mismatch",
         "h3_query_failed",
         "h3_timeout",
         "download_failed",
@@ -391,6 +390,83 @@ def test_known_remote_task_failure_requires_same_attempt_resume(
     assert generation["status"] == "resume_required"
     assert generation["error"] == error_code
     assert generation["attempt"] == 1
+
+
+@pytest.mark.parametrize(
+    ("dialogue_mode", "lines", "expected_voice_texts"),
+    [
+        ("edit", [{"text": "修正台词", "start_s": 0, "end_s": 1}], ("修正台词",)),
+        ("custom", [{"text": "自定义台词", "start_s": 0, "end_s": 1}], ("自定义台词",)),
+        ("none", None, ()),
+    ],
+)
+def test_ir_dialogue_mismatch_is_failed_and_new_id_can_rebuild_dialogue_attempt(
+    enabled, monkeypatch, dialogue_mode, lines, expected_voice_texts
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings, duration_s=2.0)
+    starts = []
+    retries = []
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: starts.append(request)
+        or h3.H3Result("failed", "000001", error_code="ir_dialogue_mismatch"),
+    )
+    monkeypatch.setattr(
+        h3,
+        "retry",
+        lambda request, request_id: retries.append((request, request_id))
+        or h3.H3Result("failed", "000002", error_code="h3_provider_failed"),
+    )
+    original = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "auto",
+        "fit_mode": "none",
+    }
+
+    assert client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=original
+    ).status_code == 202
+    failed_meta = storage.load_meta(settings.data_dir, cid)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={**failed_meta["generation"], "status": "resume_required"},
+    )
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert detail["generation"] == {
+        "status": "failed",
+        "error": "ir_dialogue_mismatch",
+        "attempt": 1,
+        "client_request_id": REQUEST_ID,
+    }
+    same_id = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=original
+    )
+    assert same_id.status_code == 409
+    assert same_id.json() == {"detail": "new client_request_id required"}
+
+    changed = {
+        **original,
+        "client_request_id": "request-dialogue-2",
+        "dialogue_mode": dialogue_mode,
+    }
+    if lines is not None:
+        changed["lines"] = lines
+    retried = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=changed
+    )
+
+    assert retried.status_code == 202
+    assert len(starts) == 1
+    assert len(retries) == 1
+    assert retries[0][1] == "request-dialogue-2"
+    assert retries[0][0].voice_texts == expected_voice_texts
+    meta = storage.load_meta(settings.data_dir, cid)
+    assert meta["generation"]["attempt"] == 2
+    assert meta["dialogue_mode"] == dialogue_mode
 
 
 @pytest.mark.parametrize("inspect_fails", [False, True])

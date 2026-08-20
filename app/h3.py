@@ -128,6 +128,9 @@ _SAFE_ERROR_CODES = {
     "output_probe_failed",
     "output_write_failed",
 }
+_CONTEXT_IR_STATUSES = frozenset(
+    {"submitting", "running", "succeeded", "failed", "submission_unknown"}
+)
 
 FrozenKeyframes = tuple[tuple[Path, bytes], ...]
 FrozenVoiceTexts = tuple[str, ...]
@@ -247,6 +250,15 @@ class H3Result:
     output: Path | None = None
     retryable: bool = False
     error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class ContextIRSnapshot:
+    """Validated local Context IR observation; never contains provider metadata."""
+
+    status: str
+    prompt: str | None
+    sha256: str | None
 
 
 def freeze_keyframes(paths: Sequence[Path]) -> FrozenKeyframes:
@@ -473,6 +485,75 @@ def inspect(request: H3Request) -> H3Result:
     if latest is None:
         return H3Result(status="not_started", attempt_id=None)
     return _result(latest)
+
+
+def inspect_context_ir(workdir: Path, cid: str) -> ContextIRSnapshot:
+    """Read only the latest Context IR status and verified prompt from disk."""
+    root = Path(workdir) / ".h3"
+    if not root.exists():
+        return ContextIRSnapshot("not_started", None, None)
+
+    attempts = root / "attempts"
+    try:
+        latest_path = (
+            next(iter(sorted(attempts.glob("*/attempt.json"), reverse=True)), None)
+            if attempts.is_dir()
+            else None
+        )
+    except OSError:
+        raise ReceiptError("state_invalid") from None
+    latest = _read_json(latest_path) if latest_path is not None else None
+
+    marker = root / "session.json"
+    if marker.is_file():
+        expected = {"schema_version": SCHEMA_VERSION, "cid": cid}
+        if _read_json(marker) != expected:
+            raise ReceiptError("session_cid_mismatch")
+    elif latest is not None:
+        raise ReceiptError("state_invalid")
+    if latest is None:
+        return ContextIRSnapshot("not_started", None, None)
+
+    attempt_id = latest.get("attempt_id")
+    client_request_id = latest.get("client_request_id")
+    manifest = latest.get("input")
+    ir = latest.get("ir")
+    if (
+        latest.get("schema_version") != SCHEMA_VERSION
+        or latest.get("cid") != cid
+        or not isinstance(attempt_id, str)
+        or len(attempt_id) != 6
+        or not attempt_id.isdigit()
+        or not isinstance(client_request_id, str)
+        or not client_request_id.strip()
+        or not isinstance(manifest, dict)
+        or latest.get("input_receipt") != canonical_json_sha256(manifest)
+        or not isinstance(ir, dict)
+    ):
+        raise ReceiptError("state_invalid")
+
+    ir_status = ir.get("status")
+    if ir_status not in _CONTEXT_IR_STATUSES:
+        raise ReceiptError("state_invalid")
+    prompt = ir.get("optimized_prompt")
+    digest = ir.get("optimized_prompt_sha256")
+    if ir_status == "succeeded":
+        if (
+            not isinstance(prompt, str)
+            or not prompt
+            or not isinstance(digest, str)
+            or digest != hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        ):
+            raise ReceiptError("context_ir_mismatch")
+        return ContextIRSnapshot("succeeded", prompt, digest)
+    if prompt is not None or digest is not None:
+        raise ReceiptError("context_ir_mismatch")
+    public_status = (
+        "failed"
+        if latest.get("status") in {"failed", "retryable_failure"}
+        else str(ir_status)
+    )
+    return ContextIRSnapshot(public_status, None, None)
 
 
 def resume(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:

@@ -294,6 +294,47 @@ def test_inspect_is_read_only_when_session_has_not_started(tmp_path):
     assert not (request.workdir / ".h3").exists()
 
 
+def test_context_ir_snapshot_is_absent_before_start_and_available_after_video(tmp_path):
+    request = _request(tmp_path)
+
+    before = h3.inspect_context_ir(request.workdir, request.cid)
+
+    assert before == h3.ContextIRSnapshot("not_started", None, None)
+    assert not (request.workdir / ".h3").exists()
+
+    provider = HappyProvider()
+    with _client(provider) as client:
+        result = h3.start(request, client=client)
+    assert result.status == "succeeded"
+    assert (request.workdir / "generated.mp4").is_file()
+
+    after = h3.inspect_context_ir(request.workdir, request.cid)
+
+    assert after == h3.ContextIRSnapshot(
+        "succeeded",
+        OPTIMIZED_PROMPT,
+        hashlib.sha256(OPTIMIZED_PROMPT.encode("utf-8")).hexdigest(),
+    )
+
+
+@pytest.mark.parametrize("tamper", ["hash", "status"])
+def test_context_ir_snapshot_fails_closed_on_hash_or_status_tamper(tmp_path, tamper):
+    request = _request(tmp_path)
+    provider = HappyProvider()
+    with _client(provider) as client:
+        h3.start(request, client=client)
+    state_path = _attempt_file(request)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if tamper == "hash":
+        state["ir"]["optimized_prompt_sha256"] = "0" * 64
+    else:
+        state["ir"]["status"] = "running"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(h3.ReceiptError, match="context_ir_mismatch"):
+        h3.inspect_context_ir(request.workdir, request.cid)
+
+
 def test_start_is_idempotent_for_the_same_client_request_id(tmp_path):
     request = _request(tmp_path)
     provider = HappyProvider()
