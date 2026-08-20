@@ -36,7 +36,7 @@ from pathlib import Path
 
 import cv2
 
-from app import prepared_input, storage, vocal, voice
+from app import asr, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 
@@ -58,6 +58,9 @@ EMPTY_TRANSCRIPT_VOCAL_EVIDENCE_MIN = 51 / 256
 EMPTY_TRANSCRIPT_WARNING = (
     "voice_lines.json empty after one retry despite vocal evidence; "
     "continuing without dialogue"
+)
+UNRECOGNIZED_TRANSCRIPT_WARNING = (
+    "自动听写只返回无法辨识占位符；已丢弃占位符，未将其作为台词"
 )
 VOICE_TIMELINE_WARNING = (
     "voice lines normalized to video duration {duration_s:.3f}s: "
@@ -188,9 +191,10 @@ def _voice_prompt(_cdir: Path, voice_mode: str, target_language: str, duration_s
     return f"""听写并处理视频台词。输入：work/voice.mp3（源视频音轨，16kHz 单声道）与 work/manifest.json（源视频元信息，供参考）。音频时长约 {duration_s:.3f} 秒。
 
 任务：
-- 听写音频中的人声台词，按句切分；
+- 自动识别实际语言并听写音频中的人声台词，按句切分；必须支持中文、英文、西班牙语、马来语及其他源音频语言；
 - 每句标出起止时间（秒，从音频开头起算）；
 - {rule}
+- `[无法辨识]`、`[无法识别]`、`[inaudible]`、`[unintelligible]` 等只是失败占位符，禁止作为 text 输出；无法得到任何可靠原文时输出空数组 `[]`；
 - 输出 work/voice_lines.json（UTF-8）：JSON 数组 [{{"text": "...", "start_s": 0.5, "end_s": 2.1}}]，0 ≤ start_s < end_s ≤ 音频时长，按 start_s 升序，覆盖人声区间；不写其他文件。
 
 硬性禁令：
@@ -218,6 +222,34 @@ def _run_voice_attempt(
         raise
     except (CodexOutputError, PipelineError, OSError):
         raise _codex_output_error("voice") from None
+
+
+def _transcribe_voice_attempt(
+    settings: Settings,
+    runner,
+    work: Path,
+    prompt: str,
+    duration_s: float,
+    voice_mode: str,
+) -> list[dict]:
+    """Use deterministic local multilingual ASR for keep mode when configured."""
+    if (settings.asr_cli is None) != (settings.asr_model is None):
+        raise PipelineError("local ASR configuration incomplete")
+    if voice_mode == "keep" and settings.asr_cli is not None:
+        try:
+            lines = asr.transcribe(
+                work / "voice.mp3",
+                cli=settings.asr_cli,
+                model=settings.asr_model,
+                duration_s=duration_s,
+                timeout_s=settings.asr_timeout_s,
+                threads=settings.asr_threads,
+            )
+            raw = json.dumps(lines, ensure_ascii=False).encode("utf-8")
+            return voice.validate_voice_lines(raw, duration_s)
+        except asr.ASRError as exc:
+            raise PipelineError(str(exc)) from None
+    return _run_voice_attempt(runner, work, prompt, duration_s)
 
 
 def _vocal_filter_enabled() -> bool:
@@ -360,11 +392,23 @@ def _voice_step(
         raise PipelineError(f"vocal classification unavailable: {e}") from None
     has_vocal = _has_retryable_vocal_evidence(analysis)
     prompt = _voice_prompt(cdir, voice_mode, target_language, audio_duration_s)
-    lines = _run_voice_attempt(runner, work, prompt, audio_duration_s)
+    lines = _transcribe_voice_attempt(
+        settings, runner, work, prompt, audio_duration_s, voice_mode
+    )
+    unrecognized = any(voice.is_unrecognized_text(line["text"]) for line in lines)
+    lines = [line for line in lines if not voice.is_unrecognized_text(line["text"])]
     if not lines and has_vocal:
         # 音轨有人声但听写为空：只重试一次；再次为空按用户确认继续，但必须明确留痕。
-        lines = _run_voice_attempt(runner, work, prompt, audio_duration_s)
+        lines = _transcribe_voice_attempt(
+            settings, runner, work, prompt, audio_duration_s, voice_mode
+        )
+        unrecognized = unrecognized or any(
+            voice.is_unrecognized_text(line["text"]) for line in lines
+        )
+        lines = [line for line in lines if not voice.is_unrecognized_text(line["text"])]
     warnings = [EMPTY_TRANSCRIPT_WARNING] if not lines and has_vocal else []
+    if unrecognized:
+        warnings.append(UNRECOGNIZED_TRANSCRIPT_WARNING)
     # VOCAL_FILTER=off 只旁路 keep/drop，不旁路分类：receipt 必须解释每句为何被保留。
     decisions = []
     for line in lines:

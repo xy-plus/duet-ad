@@ -113,11 +113,20 @@ multipart 字段：
 {
   "status": "succeeded",
   "prompt": "精确的优化提示词全文",
-  "sha256": "64 lowercase hex characters"
+  "sha256": "64 lowercase hex characters",
+  "dialogue_valid": true
 }
 ```
 
-不得附带 provider task id、result URL、凭据或其他内部状态。会话或 Context IR 不存在分别返回 404 `not found` / `context_ir_not_found`；attempt 尚未产出已校验正文返回 409 `context_ir_not_ready`；输入哈希、状态或正文 SHA-256 不一致返回 409 `context_ir_invalid`。该 GET 不写盘、不联网；前端首次展开“Context IR 优化提示词”时读取并按 `cid:sha256` 缓存，详情轮询不携带正文，最终视频存在后仍可读取。
+`dialogue_valid=false` 表示 IR 已产出、但发声标签与冻结台词不一致；正文仍必须展示给用户修正，不能折叠成不可观察的 H3 失败。不得附带 provider task id、result URL、凭据或其他内部状态。会话或 Context IR 不存在分别返回 404 `not found` / `context_ir_not_found`；attempt 尚未产出正文返回 409 `context_ir_not_ready`；输入哈希、状态或正文 SHA-256 不一致返回 409 `context_ir_invalid`。该 GET 不写盘、不联网。
+
+### `POST /api/conversations/{cid}/context-ir`
+
+请求字段沿用输入冻结契约：`confirm/client_request_id/dialogue_mode/lines?/fit_mode`。该接口只提交或恢复 Context IR，在 `ready_for_h3` 停止，绝不提交 H3。首次请求冻结 prepared input；确定失败后的新 id 创建新 IR attempt。
+
+### `PATCH /api/conversations/{cid}/context-ir`
+
+请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。只允许在 H3 尚未提交时修改；SHA 不一致返回 409，空白/超限或结构化台词不匹配返回 422。成功返回新的 `status/prompt/sha256/dialogue_valid`。
 
 ### `GET /api/conversations/{cid}/files/{name}`
 
@@ -125,18 +134,18 @@ multipart 字段：
 
 ### `POST /api/conversations/{cid}/submit`
 
-严格 JSON 形状：
+Context IR 就绪后，严格使用已冻结的 request id 推进 H3：
 
 ```json
 {
   "confirm": true,
-  "client_request_id": "request-123456",
-  "dialogue_mode": "auto",
-  "fit_mode": "none"
+  "client_request_id": "request-123456"
 }
 ```
 
-允许键只有 `confirm/client_request_id/dialogue_mode/lines/fit_mode`：
+没有 Context IR、IR 尚未完成、request id 不一致或当前 IR 正文未通过台词校验时拒绝，不得隐式提交/重提 Context IR。台词与画幅在 Context IR 阶段已经冻结；若需要修改，创建新的 Context IR attempt。
+
+`POST /context-ir` 的冻结请求允许键只有 `confirm/client_request_id/dialogue_mode/lines/fit_mode`：
 
 - `confirm` 必须是 JSON boolean `true`。
 - `client_request_id` 必须完整匹配 `^[0-9A-Za-z-]{8,64}$`。
@@ -320,6 +329,10 @@ IR 台词门禁：标签少、多、改写、乱序、只有裸文本而无标�
 | `CODEX_CONCURRENCY` | `10` | pipeline 并发闸 |
 | `MAX_QUEUED` | `100` | queued 会话上限 |
 | `VOCAL_FILTER` | `on` | off/false/0 才关闭 keep/drop；未知值保持开启 |
+| `ASR_CLI` | `/home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli` | 本地多语种 whisper.cpp 可执行文件 |
+| `ASR_MODEL` | `/home/xy/.local/share/duet-asr/ggml-small.bin` | multilingual small 模型；运行时不得下载 |
+| `ASR_TIMEOUT_S` | `180` | 单次本地听写超时 |
+| `ASR_THREADS` | `4` | 单次本地听写 CPU 线程数 |
 | `ENABLE_H3_SUBMIT` | false | H3 提交总开关 |
 | `MINIMAX_API_KEY` | 空 | Context IR 凭据 |
 | `AUTODL_ART_TOKEN` | 空 | AutoDL H3 凭据 |

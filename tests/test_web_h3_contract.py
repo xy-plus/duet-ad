@@ -131,14 +131,33 @@ def test_context_ir_has_an_independent_lazy_once_disclosure_and_exact_payload_co
     result = _run_contract(
         "(() => {"
         "const detail={id:'cid-1',context_ir:{status:'succeeded',available:true,sha256:'a'.repeat(64)}};"
-        "const valid=contract.validateContextIRPayload(detail,{status:'succeeded',prompt:'  exact\\ntext  ',sha256:'a'.repeat(64)});"
+        "const valid=contract.validateContextIRPayload(detail,{status:'succeeded',prompt:'  exact\\ntext  ',sha256:'a'.repeat(64),dialogue_valid:true});"
         "let rejected=false;"
-        "try { contract.validateContextIRPayload(detail,{status:'succeeded',prompt:'x',sha256:'b'.repeat(64)}); }"
+        "try { contract.validateContextIRPayload(detail,{status:'succeeded',prompt:'x',sha256:'b'.repeat(64),dialogue_valid:true}); }"
         "catch (_) { rejected=true; }"
         "return [valid.prompt,valid.sha256,rejected,contract.contextIRCacheKey(detail)];"
         "})()"
     )
     assert result == ["  exact\ntext  ", "a" * 64, True, "cid-1:" + "a" * 64]
+
+
+def test_context_ir_is_an_explicit_editable_stage_before_h3():
+    source = APP_JS.read_text(encoding="utf-8")
+    for token in (
+        "优化 Context IR",
+        "Context IR 正在优化",
+        "保存 IR 修改",
+        "生成最终视频",
+        'method: "PATCH"',
+        "dialogue_valid",
+    ):
+        assert token in source
+    prepare = source.split("async function prepareContextIR", 1)[1].split(
+        "async function", 1
+    )[0]
+    assert '"/context-ir"' in prepare
+    assert 'method: "POST"' in prepare
+    assert '"/submit"' not in prepare
 
 
 def test_context_ir_prompt_is_not_part_of_detail_polling_or_signature():
@@ -197,7 +216,7 @@ def test_generation_actions_never_retry_unknown_or_active_statuses():
 
 def test_resume_ui_is_locked_and_explicit_about_cost():
     source = APP_JS.read_text(encoding="utf-8")
-    assert "继续既有任务" in source
+    assert "继续 Context IR" in source
     assert "不会创建新付费 attempt" in source
     assert "buildResumePayload(detail)" in source
     resume_function = source.split("async function resumeGeneration", 1)[1].split("async function postGeneration", 1)[0]

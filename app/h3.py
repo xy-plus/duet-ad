@@ -103,6 +103,7 @@ _NEGATED_SPEECH_RE = re.compile(
 )
 _CLAUSE_BOUNDARY_RE = re.compile(r"[。！？!?；;，,\n]")
 _ACTION_BIND_MAX_CHARS = 200
+_MAX_CONTEXT_IR_PROMPT_BYTES = 32 * 1024
 
 _SAFE_ERROR_CODES = {
     "ir_upload_failed",
@@ -284,6 +285,11 @@ def voice_texts_receipt(voice_texts: Sequence[str]) -> str:
     return canonical_json_sha256(list(voice_texts))
 
 
+def context_ir_dialogue_matches(prompt: str, voice_texts: FrozenVoiceTexts) -> bool:
+    """Public validation used by the review UI; it never mutates provider state."""
+    return isinstance(prompt, str) and _ir_dialogue_matches(prompt, voice_texts)
+
+
 def _ir_dialogue_matches(prompt: str, voice_texts: FrozenVoiceTexts) -> bool:
     """Bind every H3 dialogue tag to the frozen ASR text, in exact order."""
     matches = list(_DIALOGUE_RE.finditer(prompt))
@@ -461,6 +467,30 @@ def start(request: H3Request, *, client: httpx.Client | None = None) -> H3Result
             )
 
 
+def prepare_context_ir(
+    request: H3Request, *, client: httpx.Client | None = None
+) -> H3Result:
+    """Create/query Context IR and stop before the paid H3 video submission."""
+    with _session_lease(request):
+        existing = _find_attempt(request, request.client_request_id)
+        if _has_output(request):
+            return _output_result(request, existing)
+        state = (
+            _create_attempt(request, request.client_request_id)
+            if existing is None
+            else existing
+        )
+        with _client(client) as active_client:
+            return _advance(
+                request,
+                state,
+                active_client,
+                allow_submit=True,
+                new_attempt=existing is None,
+                stop_after_ir=True,
+            )
+
+
 def inspect(request: H3Request) -> H3Result:
     """Read the latest attempt for UI/startup decisions, without any writes."""
     root = _state_root(request)
@@ -554,6 +584,55 @@ def inspect_context_ir(workdir: Path, cid: str) -> ContextIRSnapshot:
         else str(ir_status)
     )
     return ContextIRSnapshot(public_status, None, None)
+
+
+def edit_context_ir(
+    request: H3Request,
+    expected_sha256: str,
+    prompt: str,
+) -> ContextIRSnapshot:
+    """Atomically replace the reviewed IR prompt before H3 has been submitted."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise H3Error("invalid_context_ir_prompt")
+    encoded = prompt.encode("utf-8")
+    if len(encoded) > _MAX_CONTEXT_IR_PROMPT_BYTES:
+        raise H3Error("invalid_context_ir_prompt")
+    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+        raise H3Error("context_ir_version_conflict")
+    if not _ir_dialogue_matches(prompt, request.voice_texts):
+        raise H3Error("ir_dialogue_mismatch")
+
+    with _session_lease(request):
+        state = _find_attempt(request, request.client_request_id)
+        if state is None:
+            raise H3Error("context_ir_not_ready")
+        ir = state.get("ir")
+        h3_state = state.get("h3")
+        if (
+            state.get("status") != "ready_for_h3"
+            or not isinstance(ir, dict)
+            or ir.get("status") != "succeeded"
+            or not isinstance(h3_state, dict)
+            or h3_state.get("status") not in {"ready", "not_started"}
+            or _task_id(h3_state.get("task_id"), required=False) is not None
+        ):
+            raise H3Error("context_ir_not_editable")
+        current = ir.get("optimized_prompt")
+        current_sha = ir.get("optimized_prompt_sha256")
+        if (
+            not isinstance(current, str)
+            or not isinstance(current_sha, str)
+            or current_sha != hashlib.sha256(current.encode("utf-8")).hexdigest()
+        ):
+            raise ReceiptError("context_ir_mismatch")
+        if current_sha != expected_sha256:
+            raise H3Error("context_ir_version_conflict")
+        digest = hashlib.sha256(encoded).hexdigest()
+        ir["optimized_prompt"] = prompt
+        ir["optimized_prompt_sha256"] = digest
+        state["h3"] = {"status": "ready"}
+        _save_state(request, state)
+        return ContextIRSnapshot("succeeded", prompt, digest)
 
 
 def resume(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
@@ -798,7 +877,9 @@ def _validate_state(
     if optimized is not None:
         if not isinstance(optimized, str):
             raise ReceiptError("receipt_mismatch")
-        if not _ir_dialogue_matches(optimized, request.voice_texts):
+        if h3_task_id is not None and not _ir_dialogue_matches(
+            optimized, request.voice_texts
+        ):
             raise ReceiptError("ir_dialogue_mismatch")
         if ir.get("optimized_prompt_sha256") != hashlib.sha256(
             optimized.encode("utf-8")
@@ -874,6 +955,7 @@ def _advance(
     *,
     allow_submit: bool,
     new_attempt: bool,
+    stop_after_ir: bool = False,
 ) -> H3Result:
     _validate_state(request, state)
     if _has_output(request):
@@ -926,6 +1008,9 @@ def _advance(
         result = _poll_ir(request, state, client, ir_task_id)
         if result is not None:
             return result
+
+    if stop_after_ir:
+        return _result(state)
 
     h3_state = state["h3"]
     h3_task_id = _task_id(h3_state.get("task_id"), required=False)
@@ -1058,15 +1143,6 @@ def _poll_ir(
                 if not isinstance(optimized, str) or not optimized:
                     _fail(request, state, "ir_prompt_missing", retryable=False, keep_task=True)
                     raise H3Error("ir_prompt_missing")
-                if not _ir_dialogue_matches(optimized, request.voice_texts):
-                    _fail(
-                        request,
-                        state,
-                        "ir_dialogue_mismatch",
-                        retryable=False,
-                        keep_task=True,
-                    )
-                    raise H3Error("ir_dialogue_mismatch")
                 state["ir"]["status"] = "succeeded"
                 state["ir"]["optimized_prompt"] = optimized
                 state["ir"]["optimized_prompt_sha256"] = hashlib.sha256(

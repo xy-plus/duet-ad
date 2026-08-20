@@ -15,6 +15,11 @@ command -v ffmpeg
 command -v ffprobe
 command -v codex
 command -v bwrap
+test -x /home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli
+test -s /home/xy/.local/share/duet-asr/ggml-small.bin
+printf '%s  %s\n' \
+  1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b \
+  /home/xy/.local/share/duet-asr/ggml-small.bin | sha256sum -c -
 .venv/bin/python -m compileall -q app
 bash -n run.sh .deploy/smoke-h3.sh
 .venv/bin/python - <<'PY'
@@ -106,6 +111,10 @@ CODEX_CONCURRENCY=10
 MAX_QUEUED=100
 VOCAL_FILTER=on
 YAMNET_MODEL_PATH=/home/xy/duet-ad1/models/yamnet.tflite
+ASR_CLI=/home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli
+ASR_MODEL=/home/xy/.local/share/duet-asr/ggml-small.bin
+ASR_TIMEOUT_S=180
+ASR_THREADS=4
 
 ENABLE_H3_SUBMIT=1
 MINIMAX_API_KEY=

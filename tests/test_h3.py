@@ -317,6 +317,53 @@ def test_context_ir_snapshot_is_absent_before_start_and_available_after_video(tm
     )
 
 
+def test_prepare_context_ir_stops_before_h3_and_exposes_mismatched_prompt(tmp_path):
+    request = _request(tmp_path)
+    raw = "镜头稳定。<d>第一句被改写</d><d>第二句台词</d>"
+    provider = HappyProvider(ir_prompt=raw)
+
+    with _client(provider) as client:
+        result = h3.prepare_context_ir(request, client=client)
+
+    assert result.status == "ready_for_h3"
+    assert len(provider.ir_posts) == 1
+    assert provider.h3_posts == []
+    snapshot = h3.inspect_context_ir(request.workdir, request.cid)
+    assert snapshot.prompt == raw
+    assert snapshot.sha256 == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert h3.context_ir_dialogue_matches(raw, request.voice_texts) is False
+
+
+def test_context_ir_can_be_corrected_before_h3_and_uses_expected_sha(tmp_path):
+    request = _request(tmp_path)
+    raw = "镜头稳定。<d>第一句被改写</d><d>第二句台词</d>"
+    provider = HappyProvider(ir_prompt=raw)
+    with _client(provider) as client:
+        h3.prepare_context_ir(request, client=client)
+
+        with pytest.raises(h3.H3Error, match="context_ir_version_conflict"):
+            h3.edit_context_ir(request, "0" * 64, OPTIMIZED_PROMPT)
+        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
+            h3.edit_context_ir(
+                request,
+                hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                raw,
+            )
+
+        edited = h3.edit_context_ir(
+            request,
+            hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            OPTIMIZED_PROMPT,
+        )
+        completed = h3.start(request, client=client)
+
+    assert edited.prompt == OPTIMIZED_PROMPT
+    assert edited.sha256 == hashlib.sha256(OPTIMIZED_PROMPT.encode("utf-8")).hexdigest()
+    assert completed.status == "succeeded"
+    assert len(provider.ir_posts) == 1
+    assert len(provider.h3_posts) == 1
+
+
 @pytest.mark.parametrize("tamper", ["hash", "status"])
 def test_context_ir_snapshot_fails_closed_on_hash_or_status_tamper(tmp_path, tamper):
     request = _request(tmp_path)
@@ -402,8 +449,8 @@ def test_startup_resume_only_queries_existing_ir_task(tmp_path):
         state["ir"]["optimized_prompt"].encode("utf-8")
     ).hexdigest()
     state_path.write_text(json.dumps(state), encoding="utf-8")
-    with _client(lambda _req: pytest.fail("tamper must fail before network")) as client:
-        with pytest.raises(h3.ReceiptError, match="ir_dialogue_mismatch"):
+    with _client(lambda _req: pytest.fail("mismatch must fail before network")) as client:
+        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
             h3.start(request, client=client)
 
 
@@ -473,21 +520,19 @@ def test_ir_dialogue_must_exactly_match_frozen_voice_texts(tmp_path, ir_prompt):
     assert state["error"] == {"code": "ir_dialogue_mismatch"}
 
 
-def test_repaired_dialogue_validator_rechecks_existing_ir_without_reposting(tmp_path):
+def test_mismatched_ir_is_edited_without_reposting(tmp_path):
     request = _request(tmp_path)
     rejected = HappyProvider(ir_prompt="<d>第一句台词</d>")
     with _client(rejected) as client:
-        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
-            h3.start(request, client=client)
-
-    accepted = HappyProvider(ir_prompt=OPTIMIZED_PROMPT)
-    with _client(accepted) as client:
+        prepared = h3.prepare_context_ir(request, client=client)
+        snapshot = h3.inspect_context_ir(request.workdir, request.cid)
+        h3.edit_context_ir(request, snapshot.sha256, OPTIMIZED_PROMPT)
         result = h3.start(request, client=client)
 
+    assert prepared.status == "ready_for_h3"
     assert result.status == "succeeded"
-    assert accepted.uploads == []
-    assert accepted.ir_posts == []
-    assert len(accepted.h3_posts) == 1
+    assert len(rejected.ir_posts) == 1
+    assert len(rejected.h3_posts) == 1
 
 
 @pytest.mark.parametrize(

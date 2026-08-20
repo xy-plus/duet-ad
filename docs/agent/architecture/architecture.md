@@ -36,7 +36,7 @@ flowchart LR
 | `app/prepared_input.py` | 结构化台词、唯一发声块、文件哈希绑定、fail-closed loader | conversation-task |
 | `app/frame_fit.py` | 用户确认后把关键帧居中 crop 或黑边 pad 为 9:16 | conversation-task |
 | `app/h3.py` | Context IR → H3 的 start/inspect/resume/retry 和磁盘状态机 | conversation-task |
-| `app/voice.py` / `app/vocal.py` | 音频抽取、ASR JSON 校验、YAMNet `spoken/sung` 分类 | conversation-task |
+| `app/asr.py` / `app/voice.py` / `app/vocal.py` | 本地多语种听写、ASR JSON 校验、YAMNet `spoken/sung` 分类 | conversation-task |
 | `app/postprocess.py` / `app/seedream.py` | 可选去字幕/品牌关键帧编辑；不参与 H3 输入 | postprocess |
 | `app/codex_runner.py` | 本地 codex 内层 workspace 沙箱、voice 专用外层文件系统隔离、并发和超时；不把服务凭据交给 agent | conversation-task |
 | `web/` | 同源 UI、2 秒轮询、显式台词/画幅确认和人工重试 | conversation-task |
@@ -50,7 +50,9 @@ flowchart LR
   A[upload or URL] --> B[ffprobe duration and dimensions]
   B --> C[4fps extraction]
   C --> D{audio track?}
-  D -->|yes| E[ASR in audio-only tmp sandbox]
+  D -->|keep| E[local whisper.cpp multilingual ASR]
+  D -->|rewrite or translate| E2[ASR in audio-only tmp sandbox]
+  E2 --> Y
   E --> Y[YAMNet spoken or sung classification]
   D -->|no| F[legal empty dialogue]
   Y --> G[spoken plus sung effective lines]
@@ -64,13 +66,15 @@ flowchart LR
 关键不变量：
 
 - 新会话 `schema_version=2`，有效源时长为 `(0, min(MAX_DURATION_S, 15)]`；新契约只处理单段。
-- 自动台词 Codex 不在会话目录运行。后端为每次尝试新建 `/tmp/duet-voice-*`，只复制 `work/voice.mp3` 和仅含 `duration_seconds` 的 `work/manifest.json`；外层 `bwrap` 在内层 `workspace-write`、断网和秘密环境变量清洗之外遮住 checkout、`/tmp` 其余内容及必要时的会话目录。缺少 `bwrap`、stage/work/session 路径异常或 symlink 音频都 fail closed。
+- `keep` 模式由固定的本地 `whisper.cpp` multilingual small 处理 16kHz 单声道音频，自动检测语言；模型和二进制由部署固定，运行时不下载。`rewrite/translate` 才进入音频专用 Codex 隔离区。
 - 自动台词的唯一可收养 agent 输出是隔离区 `work/voice_lines.json`：先做大小、普通文件与 JSON 字段白名单校验，再把净化结果写回主 `work/`。重试创建全新隔离区；Codex 超时/非零退出但完整产物已通过同一校验时仍可收养。
 - ASR 初次校验和 YAMNet 分类使用 `voice.mp3` 的真实时长；随后、写 `voice_lines/meta/receipt` 前，必须把有效台词归一到 manifest 的视频时间轴。跨越视频结尾的行把 `end_s` 截到视频时长，`start_s >= duration_s` 的 MP3 编码纯尾部行丢弃并留 provenance/warning，归一结果再过一次 voice 白名单。receipt 的时间真相始终是视频时长。
 - YAMNet 默认按句区间分类；仅当 ASR 只返回一句、该区间未命中而全轨单窗达到同一个 `51/256` 明确人声阈值时，允许按全轨较强的 `spoken/sung` 兜底。多句或纯 BGM 不使用该兜底。
 - 视觉 agent 运行时看不到 `voice_lines.json`。视觉 prompt 中的 OCR、字幕、画面文字或备注不会被解析成台词。
 - `auto` 只接受内部 ASR provenance；默认声学过滤同时保留 `spoken` 与 `sung`。`edit/custom` 只接受用户提交的结构化行；`none` 必须为空。
 - `prompt.txt` 由视觉文本和唯一结构化发声块机械组合。无台词时明确禁止角色说出画面文字。
+- ASR 输出中的 `[无法辨识]`、`[inaudible]`、`[unintelligible]` 等哨兵文本不是业务台词：净化为“本次未得到转写”，复用有声学人声证据时的一次重试；任何哨兵不得进入 `voice_lines.json`、prepared receipt 或 H3 prompt。
+- Context IR 与 H3 是两个用户可见、可独立推进的阶段。第一次 POST 只创建/恢复 IR attempt，并在 `ready_for_h3` 停止；IR 原文必须可读取。用户可用 `expected_sha256` 原子替换有效 IR prompt；H3 POST 仅在同一冻结输入、IR 已就绪且当前正文通过结构化台词校验时发生。
 - Context IR 结果中的全部严格小写 `<d>...</d>` 标签在去掉每段可选 `[Language]` 前缀后，必须与冻结 `voice_texts` 在数量、顺序和文本上全等。少、多、改写、乱序、无标签或残缺标签均在 H3 POST 前失败；空台词时还会拒绝新增台词、角色发声和 OCR 朗读语义。
 - `duration_s` 以实际浮点数写 receipt；Context IR/H3 的请求时长为 `ceil(duration_s)`，范围 1–15。
 - `fit_required` 只在 pipeline `done` 时按实际选中的每张关键帧计算，不持久化源视频宽高作为第二真相。只有全部关键帧都是 9:16 才允许 `none`，任一非 9:16 就必须人工选 `crop` 或 `pad`；即使源视频是 9:16，裁过的关键帧也不能绕过。两种策略都不缩放帧，只做居中裁切或居中黑边扩画布。

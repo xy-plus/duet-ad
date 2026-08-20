@@ -204,3 +204,26 @@ class TestValidateVoiceLines:
         ]
         with pytest.raises(PipelineError, match="exceeds 200 items"):
             voice.validate_voice_lines(json.dumps(data).encode(), 10.0)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[无法辨识]",
+        "（无法识别）",
+        "[inaudible]",
+        "(unintelligible)",
+        "[no speech]",
+        "Hola [inaudible]",
+        "[BLANK_AUDIO]",
+        "[Music]",
+        "（听不清。）",
+        "[unrecognized speech]",
+    ],
+)
+def test_unrecognized_asr_sentinels_are_not_dialogue(text):
+    assert voice.is_unrecognized_text(text) is True
+
+
+def test_normal_foreign_language_dialogue_is_not_an_asr_sentinel():
+    assert voice.is_unrecognized_text("¿Tu perro tiene nudos y demasiado pelo suelto?") is False

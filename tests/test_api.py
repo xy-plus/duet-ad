@@ -140,6 +140,7 @@ def test_context_ir_details_are_small_and_prompt_is_loaded_only_from_authenticat
         "status": "succeeded",
         "prompt": prompt,
         "sha256": digest,
+        "dialogue_valid": True,
     }
 
 

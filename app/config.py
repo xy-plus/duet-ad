@@ -24,6 +24,10 @@ class Settings:
     data_dir: Path = Path("data")
     codex_timeout_s: int = 1800
     codex_concurrency: int = 10
+    asr_cli: Path | None = None
+    asr_model: Path | None = None
+    asr_timeout_s: int = 180
+    asr_threads: int = 4
     # queued 状态会话数上限（不计 processing/done/failed），超过即 429
     max_queued: int = 100
     # TikTok 解析/下载走的 HTTP 代理（空 = 直连）；URL 下载大小上限复用 max_upload_mb
@@ -56,6 +60,15 @@ def get_settings() -> Settings:
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),
+        asr_cli=Path(os.environ.get(
+            "ASR_CLI",
+            "/home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli",
+        )),
+        asr_model=Path(os.environ.get(
+            "ASR_MODEL", "/home/xy/.local/share/duet-asr/ggml-small.bin"
+        )),
+        asr_timeout_s=int(os.environ.get("ASR_TIMEOUT_S", "180")),
+        asr_threads=max(1, int(os.environ.get("ASR_THREADS", "4"))),
         max_queued=int(os.environ.get("MAX_QUEUED", "100")),
         tiktok_proxy=os.environ.get("TIKTOK_PROXY", ""),
         download_timeout_s=int(os.environ.get("DOWNLOAD_TIMEOUT_S", "120")),

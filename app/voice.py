@@ -1,12 +1,13 @@
 """口播链路纯函数：extract_audio 抽音轨、validate_voice_lines 台词白名单校验。
 
-听写本身交给 codex 沙箱，本模块不装任何 ASR 库。PipelineError 归口 pipeline.py；
+听写由 app.asr 或隔离 Codex 调用方完成。PipelineError 归口 pipeline.py；
 pipeline 顶层导入本模块，为避免循环导入，异常类在函数内延迟导入。
 """
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,6 +20,18 @@ _EPS_S = 0.01  # 台词时间边界允许的浮点误差（秒）
 MAX_VOICE_LINES_BYTES = 32 * 1024  # voice_lines.json 大小上限（与 MAX_PROMPT_BYTES 同级）
 MAX_VOICE_TEXT_CHARS = 500  # 每行台词长度上限（strip 后）
 MAX_VOICE_LINES_ITEMS = 200  # 台词条数上限（300s 视频按每句 1.5s 计 200 句，留裕量）
+_UNRECOGNIZED_ASR_RE = re.compile(
+    r"(?:[\[\(\{（【]\s*)?(?:无法(?:辨识|识别|听清)|听不清|"
+    r"inaudible|unintelligible|unrecognized(?:\s+speech)?|"
+    r"no\s+(?:speech|audio)|blank[_\s-]?audio|silence|music)"
+    r"\s*[.!。]?\s*(?:[\]\)\}）】]|$)",
+    re.IGNORECASE,
+)
+
+
+def is_unrecognized_text(text: str) -> bool:
+    """整句 ASR 失败哨兵不是源素材台词，不能进入后续 prompt。"""
+    return isinstance(text, str) and _UNRECOGNIZED_ASR_RE.search(text.strip()) is not None
 
 
 def probe_audio_duration(path: Path) -> float | None:

@@ -78,6 +78,135 @@ def test_submit_requires_auth(enabled):
     assert client.post(f"/api/conversations/{cid}/submit", json={}).status_code == 401
 
 
+def test_context_ir_is_explicit_and_h3_submit_reuses_the_ready_attempt(
+    enabled, monkeypatch
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    prepared_requests = []
+    h3_requests = []
+
+    monkeypatch.setattr(
+        h3,
+        "prepare_context_ir",
+        lambda request: prepared_requests.append(request)
+        or h3.H3Result("ready_for_h3", "000001"),
+    )
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: h3_requests.append(request)
+        or h3.H3Result("failed", "000001", error_code="h3_provider_failed"),
+    )
+    payload = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "none",
+        "fit_mode": "none",
+    }
+
+    prepared = client.post(
+        f"/api/conversations/{cid}/context-ir", headers=AUTH, json=payload
+    )
+    assert prepared.status_code == 202
+    assert prepared_requests and h3_requests == []
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert detail["generation"]["status"] == "resume_required"
+    assert detail["generation"]["error"] == "ready_for_h3"
+
+    generated = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+    )
+    assert generated.status_code == 202
+    assert len(prepared_requests) == len(h3_requests) == 1
+    assert prepared_requests[0].client_request_id == h3_requests[0].client_request_id
+
+
+def test_context_ir_resume_stops_for_review_and_never_calls_h3(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    calls = []
+
+    def prepare(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return h3.H3Result(
+                "retryable_failure",
+                "000001",
+                retryable=True,
+                error_code="ir_timeout",
+            )
+        return h3.H3Result("ready_for_h3", "000001")
+
+    monkeypatch.setattr(h3, "prepare_context_ir", prepare)
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("must not call H3"))
+    payload = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "none",
+        "fit_mode": "none",
+    }
+
+    first = client.post(
+        f"/api/conversations/{cid}/context-ir", headers=AUTH, json=payload
+    )
+    second = client.post(
+        f"/api/conversations/{cid}/context-ir", headers=AUTH, json=payload
+    )
+
+    assert first.status_code == second.status_code == 202
+    assert len(calls) == 2
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert detail["generation"]["status"] == "resume_required"
+    assert detail["generation"]["error"] == "ready_for_h3"
+
+
+def test_context_ir_patch_returns_reviewed_prompt(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    payload = {
+        "confirm": True,
+        "client_request_id": REQUEST_ID,
+        "dialogue_mode": "none",
+        "fit_mode": "none",
+    }
+    monkeypatch.setattr(
+        h3,
+        "prepare_context_ir",
+        lambda _request: h3.H3Result("ready_for_h3", "000001"),
+    )
+    assert client.post(
+        f"/api/conversations/{cid}/context-ir", headers=AUTH, json=payload
+    ).status_code == 202
+    digest = "a" * 64
+    reviewed = "reviewed prompt"
+    monkeypatch.setattr(
+        h3,
+        "edit_context_ir",
+        lambda _request, expected, prompt: h3.ContextIRSnapshot(
+            "succeeded", prompt, digest
+        ),
+    )
+
+    response = client.patch(
+        f"/api/conversations/{cid}/context-ir",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "expected_sha256": "b" * 64,
+            "prompt": reviewed,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "succeeded",
+        "prompt": reviewed,
+        "sha256": digest,
+        "dialogue_valid": True,
+    }
+
+
 def test_submit_validates_confirmation_id_dialogue_and_fit(enabled, monkeypatch):
     settings, client = enabled
     cid, _ = _make_conv(settings)
@@ -149,6 +278,7 @@ def test_submit_uses_frozen_original_frames_never_postprocessed(enabled, monkeyp
         "error": None,
         "attempt": 1,
         "client_request_id": REQUEST_ID,
+        "stage": "h3",
     }
     receipt = prepared_input.load_prepared_input(
         cdir,
@@ -311,6 +441,7 @@ def test_state_persist_failure_with_raw_submitting_state_is_submission_unknown(
         "error": "submission_unknown",
         "attempt": 1,
         "client_request_id": REQUEST_ID,
+        "stage": "h3",
     }
     assert len(inspected) == 1
 
@@ -441,6 +572,7 @@ def test_ir_dialogue_mismatch_is_failed_and_new_id_can_rebuild_dialogue_attempt(
         "error": "ir_dialogue_mismatch",
         "attempt": 1,
         "client_request_id": REQUEST_ID,
+        "stage": "h3",
     }
     same_id = client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH, json=original
@@ -553,6 +685,7 @@ def test_unexpected_provider_exception_inspects_and_resumes_same_attempt(
         "error": "h3_running",
         "attempt": 1,
         "client_request_id": REQUEST_ID,
+        "stage": "h3",
     }
     assert calls == {"start": 1, "inspect": 1}
 

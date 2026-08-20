@@ -1553,6 +1553,56 @@ def test_single_voice_line_uses_strong_track_evidence_when_asr_timestamp_misses(
     assert pipeline._classify_voice_line(line, bgm_only, only_line=True) is None
 
 
+def test_voice_prompt_requires_multilingual_transcript_and_forbids_placeholders(tmp_path):
+    prompt = pipeline._voice_prompt(tmp_path, "keep", "", 10.08)
+    assert "自动识别实际语言" in prompt
+    assert "[无法辨识]" in prompt
+    assert "[inaudible]" in prompt
+    assert "输出空数组" in prompt
+
+
+def test_run_voice_placeholder_retries_then_continues_without_fake_dialogue(
+    tmp_path, video_1s, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    calls = {"voice": 0}
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            calls["voice"] += 1
+            (work / "voice_lines.json").write_text(
+                json.dumps([
+                    {"text": "[无法辨识]", "start_s": 0.0, "end_s": 0.9}
+                ]),
+                encoding="utf-8",
+            )
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(voice, "probe_audio_duration", lambda _path: 1.0)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(vocal, "analyze", lambda _a: _spoken_analysis(True))
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert calls["voice"] == 2
+    assert stored["voice_lines"] == []
+    assert "[无法辨识]" not in stored["prompt"]
+    assert any("占位符" in warning for warning in stored["voice_warnings"])
+
+
 def test_run_voice_codex_timeout_salvages_complete_lines(tmp_path, video_1s, monkeypatch):
     """ASR 的 codex 超时被杀但 voice_lines.json 已完整 → 收养，继续 video-maker。"""
     settings = make_settings(tmp_path)

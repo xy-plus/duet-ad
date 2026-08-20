@@ -182,13 +182,19 @@ function contextIRCacheKey(detail) {
 function validateContextIRPayload(detail, payload) {
   const key = contextIRCacheKey(detail);
   const fields = payload && typeof payload === "object" ? Object.keys(payload).sort() : [];
-  if (!key || fields.join(",") !== "prompt,sha256,status"
+  if (!key || fields.join(",") !== "dialogue_valid,prompt,sha256,status"
       || payload.status !== "succeeded"
       || typeof payload.prompt !== "string" || !payload.prompt
+      || typeof payload.dialogue_valid !== "boolean"
       || payload.sha256 !== detail.context_ir.sha256) {
     throw new Error("Context IR 响应校验失败");
   }
-  return { status: payload.status, prompt: payload.prompt, sha256: payload.sha256 };
+  return {
+    status: payload.status,
+    prompt: payload.prompt,
+    sha256: payload.sha256,
+    dialogue_valid: payload.dialogue_valid,
+  };
 }
 
 function fmtTime(iso) {
@@ -586,6 +592,13 @@ function requiresDialogueCorrection(detail) {
     && generation.error === "ir_dialogue_mismatch";
 }
 
+function isContextIRReady(detail) {
+  const generation = detail && detail.generation;
+  return !!generation
+    && generation.status === "resume_required"
+    && generation.error === "ready_for_h3";
+}
+
 function generationDraft(detail) {
   const correctionRequired = requiresDialogueCorrection(detail);
   let draft = state.generationDrafts[detail.id];
@@ -627,30 +640,35 @@ function setGenerationCardBusy(card, busy) {
 }
 
 async function submitGeneration(detail, card) {
+  return prepareContextIR(detail, card);
+}
+
+async function prepareContextIR(detail, card) {
   const generation = detail.generation || {};
   const action = generationAction(generation.status);
+  const resumingIR = action === "resume" && !isContextIRReady(detail);
   if (!canOperate(detail) || state.generationSubmitting[detail.id]
-      || (action !== "new" && action !== "retry")) return;
+      || (action !== "new" && action !== "retry" && !resumingIR)) return;
   const draft = generationDraft(detail);
   const errorBox = card.querySelector(".generation-form-error");
   let body;
   try {
-    // 每次用户明确点击都代表一个新 attempt；失败后的重试绝不复用旧键。
-    body = buildSubmitPayload({
-      clientRequestId: newRequestId(),
-      dialogueMode: draft.dialogueMode,
-      linesText: draft.dialogueMode === "edit" ? draft.editLinesText : draft.customLinesText,
-      fitRequired: detail.fit_required === true,
-      fitMode: draft.fitMode,
-      dialogueCorrectionRequired: requiresDialogueCorrection(detail),
-    });
+    body = resumingIR ? buildResumePayload(detail) : buildSubmitPayload({
+        // 新 IR attempt 使用新 id；恢复 IR 则严格复用既有 id 和冻结参数。
+        clientRequestId: newRequestId(),
+        dialogueMode: draft.dialogueMode,
+        linesText: draft.dialogueMode === "edit" ? draft.editLinesText : draft.customLinesText,
+        fitRequired: detail.fit_required === true,
+        fitMode: draft.fitMode,
+        dialogueCorrectionRequired: requiresDialogueCorrection(detail),
+      });
   } catch (error) {
     errorBox.textContent = error.message;
     errorBox.hidden = false;
     return;
   }
 
-  await postGeneration(detail, card, body);
+  await postGeneration(detail, card, body, { path: "/context-ir", method: "POST" });
 }
 
 async function resumeGeneration(detail, card) {
@@ -668,7 +686,12 @@ async function resumeGeneration(detail, card) {
   await postGeneration(detail, card, body);
 }
 
-async function postGeneration(detail, card, body) {
+async function postGeneration(
+  detail,
+  card,
+  body,
+  endpoint = { path: "/submit", method: "POST" },
+) {
   const generation = detail.generation || {};
   const errorBox = card.querySelector(".generation-form-error");
   errorBox.hidden = true;
@@ -676,8 +699,8 @@ async function postGeneration(detail, card, body) {
   setGenerationCardBusy(card, true);
   let accepted = false;
   try {
-    await apiJSON("/api/conversations/" + encodeURIComponent(detail.id) + "/submit", {
-      method: "POST",
+    await apiJSON("/api/conversations/" + encodeURIComponent(detail.id) + endpoint.path, {
+      method: endpoint.method,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
@@ -699,10 +722,102 @@ async function postGeneration(detail, card, body) {
       const button = card.querySelector(".generation-submit");
       if (button) {
         const action = generationAction(generation.status);
-        button.textContent = action === "resume" ? "继续既有任务" : (action === "retry" ? "重试生成" : "生成最终视频");
+        button.textContent = endpoint.path === "/context-ir"
+          ? (action === "resume" ? "继续 Context IR" : "优化 Context IR")
+          : "生成最终视频";
       }
     }
   }
+}
+
+async function contextIRValue(detail) {
+  const key = contextIRCacheKey(detail);
+  if (!key) throw new Error("Context IR 尚不可用");
+  if (!state.contextIRCache[key]) {
+    if (!state.contextIRLoads[key]) {
+      const path = "/api/conversations/" + encodeURIComponent(detail.id) + "/context-ir";
+      state.contextIRLoads[key] = apiJSON(path)
+        .then((payload) => ({ value: validateContextIRPayload(detail, payload) }))
+        .catch((error) => ({ error }));
+    }
+    state.contextIRCache[key] = await state.contextIRLoads[key];
+    delete state.contextIRLoads[key];
+  }
+  const cached = state.contextIRCache[key];
+  if (cached.error) throw cached.error;
+  return cached.value;
+}
+
+async function saveContextIREdit(detail, card, textarea, status, saveButton, generateButton) {
+  const key = contextIRCacheKey(detail);
+  const cached = key && state.contextIRCache[key] && state.contextIRCache[key].value;
+  if (!cached) return;
+  saveButton.disabled = true;
+  generateButton.disabled = true;
+  status.textContent = "正在保存 IR 修改…";
+  try {
+    await apiJSON("/api/conversations/" + encodeURIComponent(detail.id) + "/context-ir", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true,
+        expected_sha256: cached.sha256,
+        prompt: textarea.value,
+      }),
+    });
+    delete state.contextIRCache[key];
+    status.textContent = "IR 修改已保存";
+    await loadDetail(detail.id, true);
+  } catch (error) {
+    if (handleAuthError(error)) return;
+    status.textContent = "保存失败：" + error.message;
+    saveButton.disabled = false;
+  }
+}
+
+function renderContextIRReview(detail, card) {
+  const review = el("div", "context-ir-review");
+  review.appendChild(el("h4", "res-sub", "Context IR 优化提示词"));
+  const textarea = el("textarea", "dialogue-textarea context-ir-editor");
+  textarea.rows = 16;
+  textarea.disabled = true;
+  textarea.placeholder = "正在读取 Context IR 提示词…";
+  textarea.setAttribute("aria-label", "Context IR 优化提示词，可修改后保存");
+  review.appendChild(textarea);
+  const status = el("p", "final-help", "正在读取 Context IR 提示词…");
+  review.appendChild(status);
+  const row = el("div", "final-row");
+  const saveButton = el("button", "btn save-ir", "保存 IR 修改");
+  saveButton.type = "button";
+  saveButton.disabled = true;
+  const generateButton = el("button", "btn btn-primary generation-submit", "生成最终视频");
+  generateButton.type = "button";
+  generateButton.disabled = true;
+  saveButton.addEventListener("click", () => {
+    saveContextIREdit(detail, card, textarea, status, saveButton, generateButton);
+  });
+  generateButton.addEventListener("click", () => resumeGeneration(detail, card));
+  row.appendChild(saveButton);
+  row.appendChild(generateButton);
+  review.appendChild(row);
+  textarea.addEventListener("input", () => {
+    saveButton.disabled = false;
+    generateButton.disabled = true;
+    status.textContent = "提示词已修改，请先保存再生成视频。";
+  });
+  contextIRValue(detail).then((value) => {
+    textarea.value = value.prompt;
+    textarea.disabled = false;
+    saveButton.disabled = true;
+    generateButton.disabled = !value.dialogue_valid;
+    status.textContent = value.dialogue_valid
+      ? "IR 已完成且台词一致；可直接生成，也可修改后保存。"
+      : "IR 中的台词与当前台词不一致；请修改提示词中的 <d> 台词并保存。";
+  }).catch((error) => {
+    if (handleAuthError(error)) return;
+    status.textContent = "Context IR 加载失败：" + error.message;
+  });
+  return review;
 }
 
 /* 最终视频区：H3 生成参数、异步状态、失败后的显式重试和历史成片都在同一卡片。 */
@@ -726,7 +841,10 @@ function renderFinalSection(detail) {
 
   if (generation.status === "queued" || generation.status === "running") {
     const status = el("div", "generation-status is-running");
-    status.appendChild(el("strong", null, generation.status === "queued" ? "H3 已排队" : "H3 正在生成"));
+    const irStage = generation.stage === "context_ir";
+    status.appendChild(el("strong", null, irStage
+      ? "Context IR 正在优化"
+      : (generation.status === "queued" ? "H3 已排队" : "H3 正在生成")));
     status.appendChild(el("span", null, generation.attempt ? "第 " + generation.attempt + " 次尝试" : "请稍候，页面会自动更新"));
     card.appendChild(status);
   } else if (generation.status === "failed" || generation.status === "submission_unknown") {
@@ -736,7 +854,9 @@ function renderFinalSection(detail) {
     card.appendChild(status);
   } else if (generation.status === "resume_required") {
     const status = el("div", "generation-status is-resume");
-    status.appendChild(el("strong", null, "既有 H3 任务等待继续"));
+    status.appendChild(el("strong", null, isContextIRReady(detail)
+      ? "Context IR 已完成，等待确认"
+      : "既有 H3 任务等待继续"));
     status.appendChild(el("span", null, generation.error || "任务已保存，可从原进度继续"));
     card.appendChild(status);
   }
@@ -753,20 +873,27 @@ function renderFinalSection(detail) {
     return sec;
   }
 
+  if (isContextIRReady(detail)) {
+    card.appendChild(renderContextIRReview(detail, card));
+    if (state.generationSubmitting[detail.id]) setGenerationCardBusy(card, true);
+    sec.appendChild(card);
+    return sec;
+  }
+
   if (generationAction(generation.status) === "resume") {
     const locked = el("div", "resume-lock");
-    locked.appendChild(el("strong", null, "继续既有任务"));
-    locked.appendChild(el("p", null, "将使用已保存的请求标识、台词和画幅设置原样继续；这些参数已锁定。"));
+    locked.appendChild(el("strong", null, "继续 Context IR 优化"));
+    locked.appendChild(el("p", null, "将使用已保存的请求标识、台词和画幅设置恢复 IR；完成后仍会先展示提示词，不会直接生成视频。"));
     card.appendChild(locked);
     const errorBox = el("p", "form-error generation-form-error");
     errorBox.hidden = true;
     card.appendChild(errorBox);
     const row = el("div", "final-row");
-    const button = el("button", "btn btn-primary generation-submit", "继续既有任务");
+    const button = el("button", "btn btn-primary generation-submit", "继续 Context IR");
     button.type = "button";
-    button.addEventListener("click", () => resumeGeneration(detail, card));
+    button.addEventListener("click", () => prepareContextIR(detail, card));
     row.appendChild(button);
-    row.appendChild(el("p", "final-caption", "只恢复原任务，不会创建新付费 attempt。"));
+    row.appendChild(el("p", "final-caption", "只恢复原 IR 任务，不会创建新付费 attempt，也不会提交 H3。"));
     card.appendChild(row);
     if (state.generationSubmitting[detail.id]) setGenerationCardBusy(card, true);
     sec.appendChild(card);
@@ -847,11 +974,13 @@ function renderFinalSection(detail) {
   card.appendChild(errorBox);
   const row = el("div", "final-row");
   const button = el("button", "btn btn-primary generation-submit",
-    generation.status === "failed" ? "重试生成" : "生成最终视频");
+    "优化 Context IR");
   button.type = "button";
   button.addEventListener("click", () => submitGeneration(detail, card));
   row.appendChild(button);
-  row.appendChild(el("p", "final-caption", busy ? "提交后将持续更新 H3 生成状态" : "确认参数后提交；失败时仅在你点击重试后再次提交"));
+  row.appendChild(el("p", "final-caption", busy
+    ? "正在等待 Context IR 优化结果"
+    : "先生成并检查 IR 提示词；确认后才会提交 H3 视频生成"));
   card.appendChild(row);
   if (busy) setGenerationCardBusy(card, true);
   sec.appendChild(card);
@@ -859,28 +988,12 @@ function renderFinalSection(detail) {
 }
 
 async function loadContextIR(detail, output) {
-  const key = contextIRCacheKey(detail);
-  if (!key) {
-    output.textContent = "Context IR 尚不可用";
-    return;
+  try {
+    output.textContent = (await contextIRValue(detail)).prompt;
+  } catch (error) {
+    if (handleAuthError(error)) return;
+    output.textContent = "加载失败：" + error.message;
   }
-  if (!state.contextIRCache[key]) {
-    if (!state.contextIRLoads[key]) {
-      const path = "/api/conversations/" + encodeURIComponent(detail.id) + "/context-ir";
-      state.contextIRLoads[key] = apiJSON(path)
-        .then((payload) => ({ value: validateContextIRPayload(detail, payload) }))
-        .catch((error) => ({ error }));
-    }
-    state.contextIRCache[key] = await state.contextIRLoads[key];
-    delete state.contextIRLoads[key];
-  }
-  const cached = state.contextIRCache[key];
-  if (cached.error) {
-    if (handleAuthError(cached.error)) return;
-    output.textContent = "加载失败：" + cached.error.message;
-    return;
-  }
-  output.textContent = cached.value.prompt;
 }
 
 function renderContextIRSection(detail) {
@@ -1285,7 +1398,7 @@ function renderStable(detail) {
     if (ppAsk) inner.appendChild(ppAsk);
     inner.appendChild(el("div", "pp-dynamic"));
     inner.appendChild(renderFinalSection(detail));
-    const contextIR = renderContextIRSection(detail);
+    const contextIR = detail.has_video ? renderContextIRSection(detail) : null;
     if (contextIR) inner.appendChild(contextIR);
   }
   $("stream").appendChild(inner);
@@ -1327,6 +1440,7 @@ function detailSignature(detail) {
     generation ? generation.error : null,
     generation ? generation.attempt : null,
     generation ? generation.client_request_id : null,
+    generation ? generation.stage : null,
     contextIR ? contextIR.status : "not_started",
     contextIR ? contextIR.available === true : false,
     contextIR ? contextIR.sha256 : null,

@@ -8,7 +8,6 @@
 
 ## 🚧 进行中
 
-
 ## 📌 待办与限制
 
 - Context IR + H3 只能做高相似复刻，不能保证逐像素、逐帧、文字、原音或节奏一致；若目标升级为“一模一样”，需重新定义输入契约、模型与验收指标。（→ `temp/09-restore-h3-no-face/`, `docs/human/features/conversation-task/`）
