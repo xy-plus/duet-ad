@@ -354,6 +354,7 @@ def test_ambiguous_submit_error_stays_unknown_when_inspect_also_fails(
     [
         "ir_query_failed",
         "ir_timeout",
+        "ir_dialogue_mismatch",
         "h3_query_failed",
         "h3_timeout",
         "download_failed",

@@ -33,6 +33,7 @@ _KNOWN_TASK_ERRORS = frozenset(
     {
         "ir_query_failed",
         "ir_timeout",
+        "ir_dialogue_mismatch",
         "h3_query_failed",
         "h3_timeout",
         "download_failed",
