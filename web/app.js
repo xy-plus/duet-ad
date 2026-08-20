@@ -24,6 +24,8 @@ const state = {
   ppAskDismissed: {},  // cid → true：后处理入口消息已点「否」（会话内记忆，重渲染不复活）
   generationDrafts: {}, // cid → 最终视频表单草稿；轮询重渲染时保留用户输入
   generationSubmitting: {}, // cid → true：本页已有 /submit 请求在途，阻止重复提交
+  contextIRCache: {},  // cid:sha256 → 已校验正文或错误；同版本只请求一次
+  contextIRLoads: {},  // cid:sha256 → 在途 Promise；折叠区并发打开时复用
   detailSig: null,     // 当前已渲染详情的状态签名：轮询比对，签名不变不碰 DOM（根治轮询闪烁）
 };
 
@@ -161,6 +163,29 @@ function buildResumePayload(detail) {
     body.lines = dialogue.lines;
   }
   return body;
+}
+
+function contextIRCacheKey(detail) {
+  const meta = detail && detail.context_ir;
+  const cid = detail && detail.id;
+  if (!meta || meta.available !== true || meta.status !== "succeeded"
+      || typeof cid !== "string" || !cid
+      || typeof meta.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(meta.sha256)) {
+    return null;
+  }
+  return cid + ":" + meta.sha256;
+}
+
+function validateContextIRPayload(detail, payload) {
+  const key = contextIRCacheKey(detail);
+  const fields = payload && typeof payload === "object" ? Object.keys(payload).sort() : [];
+  if (!key || fields.join(",") !== "prompt,sha256,status"
+      || payload.status !== "succeeded"
+      || typeof payload.prompt !== "string" || !payload.prompt
+      || payload.sha256 !== detail.context_ir.sha256) {
+    throw new Error("Context IR 响应校验失败");
+  }
+  return { status: payload.status, prompt: payload.prompt, sha256: payload.sha256 };
 }
 
 function fmtTime(iso) {
@@ -816,6 +841,45 @@ function renderFinalSection(detail) {
   return sec;
 }
 
+async function loadContextIR(detail, output) {
+  const key = contextIRCacheKey(detail);
+  if (!key) {
+    output.textContent = "Context IR 尚不可用";
+    return;
+  }
+  if (!state.contextIRCache[key]) {
+    if (!state.contextIRLoads[key]) {
+      const path = "/api/conversations/" + encodeURIComponent(detail.id) + "/context-ir";
+      state.contextIRLoads[key] = apiJSON(path)
+        .then((payload) => ({ value: validateContextIRPayload(detail, payload) }))
+        .catch((error) => ({ error }));
+    }
+    state.contextIRCache[key] = await state.contextIRLoads[key];
+    delete state.contextIRLoads[key];
+  }
+  const cached = state.contextIRCache[key];
+  if (cached.error) {
+    if (handleAuthError(cached.error)) return;
+    output.textContent = "加载失败：" + cached.error.message;
+    return;
+  }
+  output.textContent = cached.value.prompt;
+}
+
+function renderContextIRSection(detail) {
+  if (!contextIRCacheKey(detail)) return null;
+  const sec = el("section", "res-section context-ir-section");
+  const disclosure = el("details", "context-ir-disclosure");
+  disclosure.appendChild(el("summary", "res-h3", "Context IR 优化提示词"));
+  const output = el("pre", "prompt-text", "展开后加载优化提示词…");
+  disclosure.appendChild(output);
+  disclosure.addEventListener("toggle", () => {
+    if (disclosure.open) loadContextIR(detail, output);
+  });
+  sec.appendChild(disclosure);
+  return sec;
+}
+
 /* 关键帧网格：blob 化加载 + 点击放大灯箱（单段/多段/优化后共用；pathPrefix 即 files 白名单路径） */
 function kfGrid(detail, names, pathPrefix, altPrefix) {
   const grid = el("div", "kf-grid");
@@ -1204,6 +1268,8 @@ function renderStable(detail) {
     if (ppAsk) inner.appendChild(ppAsk);
     inner.appendChild(el("div", "pp-dynamic"));
     inner.appendChild(renderFinalSection(detail));
+    const contextIR = renderContextIRSection(detail);
+    if (contextIR) inner.appendChild(contextIR);
   }
   $("stream").appendChild(inner);
 }
@@ -1229,6 +1295,7 @@ function detailSignature(detail) {
   // pp.options 与 status 原子落盘——见审查记录）；dyn 只跟后处理进度（frames 单调增长）。
   const pp = detail.postprocess || null;
   const generation = detail.generation || null;
+  const contextIR = detail.context_ir || null;
   const segments = Array.isArray(detail.segments) ? detail.segments : [];
   const stable = JSON.stringify([
     detail.status,
@@ -1243,6 +1310,9 @@ function detailSignature(detail) {
     generation ? generation.error : null,
     generation ? generation.attempt : null,
     generation ? generation.client_request_id : null,
+    contextIR ? contextIR.status : "not_started",
+    contextIR ? contextIR.available === true : false,
+    contextIR ? contextIR.sha256 : null,
     pp ? pp.status : "",
     pp && pp.error ? pp.error : "",
     Array.isArray(detail.keyframes) ? detail.keyframes.join(",") : "",
@@ -1640,11 +1710,13 @@ if (typeof module !== "undefined" && module.exports) {
     buildResumePayload,
     buildSubmitPayload,
     canOperate,
+    contextIRCacheKey,
     detailSignature,
     formatDialogueLines,
     generationAction,
     normalizeDialogueLines,
     parseDialogueLines,
+    validateContextIRPayload,
   };
 }
 

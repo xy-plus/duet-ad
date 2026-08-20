@@ -33,7 +33,6 @@ _KNOWN_TASK_ERRORS = frozenset(
     {
         "ir_query_failed",
         "ir_timeout",
-        "ir_dialogue_mismatch",
         "h3_query_failed",
         "h3_timeout",
         "download_failed",
@@ -102,14 +101,33 @@ def _public_generation(meta: dict) -> dict | None:
     generation = meta.get("generation")
     if not isinstance(generation, dict):
         return None
-    status = generation.get("status")
-    if status == "failed" and generation.get("error") in _KNOWN_TASK_ERRORS:
-        status = "resume_required"
     return {
-        "status": status,
+        "status": _effective_generation_status(generation),
         "error": generation.get("error"),
         "attempt": generation.get("attempt"),
         "client_request_id": generation.get("client_request_id"),
+    }
+
+
+def _effective_generation_status(generation: dict) -> str | None:
+    status = generation.get("status")
+    error = generation.get("error")
+    if error == "ir_dialogue_mismatch":
+        return "failed"
+    if status == "failed" and error in _KNOWN_TASK_ERRORS:
+        return "resume_required"
+    return status
+
+
+def _public_context_ir(cdir: Path, cid: str) -> dict:
+    try:
+        snapshot = h3.inspect_context_ir(cdir, cid)
+    except h3.H3Error:
+        return {"status": "invalid", "available": False, "sha256": None}
+    return {
+        "status": snapshot.status,
+        "available": snapshot.prompt is not None,
+        "sha256": snapshot.sha256,
     }
 
 
@@ -657,11 +675,34 @@ def create_app(settings: Settings) -> FastAPI:
             "dialogue": _public_dialogue(meta),
             "receipt_version": _receipt_version(cdir, meta),
             "generation": _public_generation(meta),
+            "context_ir": _public_context_ir(cdir, meta["id"]),
             "has_source": any(cdir.glob("source.*")),
             "has_video": (cdir / "generated.mp4").is_file(),
             "submit_enabled": settings.enable_h3_submit,
             "postprocess": meta.get("postprocess"),
             "postprocess_enabled": settings.enable_seedream_edit,
+        }
+
+    @app.get(
+        "/api/conversations/{cid}/context-ir",
+        dependencies=[Depends(require_auth)],
+    )
+    async def get_context_ir(cid: str):
+        meta = storage.load_meta(settings.data_dir, cid)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            snapshot = h3.inspect_context_ir(settings.data_dir / cid, cid)
+        except h3.H3Error as exc:
+            raise HTTPException(status_code=409, detail="context_ir_invalid") from exc
+        if snapshot.status == "not_started":
+            raise HTTPException(status_code=404, detail="context_ir_not_found")
+        if snapshot.prompt is None or snapshot.sha256 is None:
+            raise HTTPException(status_code=409, detail="context_ir_not_ready")
+        return {
+            "status": snapshot.status,
+            "prompt": snapshot.prompt,
+            "sha256": snapshot.sha256,
         }
 
     @app.get("/api/conversations/{cid}/files/{name:path}", dependencies=[Depends(require_auth)])
@@ -701,13 +742,9 @@ def create_app(settings: Settings) -> FastAPI:
             if (settings.data_dir / cid / "generated.mp4").is_file():
                 raise HTTPException(status_code=409, detail="already submitted")
             generation = meta.get("generation")
+            previous_status = None
             if isinstance(generation, dict):
-                previous_status = generation.get("status")
-                if (
-                    previous_status == "failed"
-                    and generation.get("error") in _KNOWN_TASK_ERRORS
-                ):
-                    previous_status = "resume_required"
+                previous_status = _effective_generation_status(generation)
                 previous_id = generation.get("client_request_id")
                 if previous_status == "submission_unknown":
                     raise HTTPException(status_code=409, detail="submission_outcome_unknown")
@@ -765,7 +802,7 @@ def create_app(settings: Settings) -> FastAPI:
                         _run_generation, settings, cid, request, False
                     )
                     return {"status": "queued", "attempt": previous_attempt}
-            retry = isinstance(generation, dict) and generation.get("status") in _GENERATION_RETRYABLE
+            retry = isinstance(generation, dict) and previous_status in _GENERATION_RETRYABLE
             previous_attempt = generation.get("attempt") if isinstance(generation, dict) else 0
             if (
                 isinstance(previous_attempt, bool)

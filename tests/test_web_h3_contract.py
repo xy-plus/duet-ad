@@ -99,17 +99,62 @@ def test_detail_signature_tracks_h3_render_fields():
         "(() => {"
         "const base={status:'done',read_only:false,submit_enabled:true,fit_required:false,duration_s:10,"
         "receipt_version:1,fit_mode:'none',dialogue:[],"
-        "generation:{status:null,error:null,attempt:0,client_request_id:null},keyframes:[],segments:[]};"
+        "generation:{status:null,error:null,attempt:0,client_request_id:null},keyframes:[],segments:[],"
+        "context_ir:{status:'not_started',available:false,sha256:null}};"
         "const original=contract.detailSignature(base).stable;"
         "const variants=["
         "{...base,read_only:true},{...base,dialogue:[{start_s:0,end_s:1,text:'x'}]},"
         "{...base,receipt_version:2},{...base,fit_mode:'pad'},"
         "{...base,generation:{status:'running',error:null,attempt:1,client_request_id:'request-a'}},"
-        "{...base,generation:{status:'failed',error:'x',attempt:2,client_request_id:'request-b'}}];"
+        "{...base,generation:{status:'failed',error:'x',attempt:2,client_request_id:'request-b'}},"
+        "{...base,context_ir:{status:'succeeded',available:true,sha256:'a'.repeat(64)}}];"
         "return variants.map(value => contract.detailSignature(value).stable !== original);"
         "})()"
     )
-    assert result == [True, True, True, True, True, True]
+    assert result == [True, True, True, True, True, True, True]
+
+
+def test_context_ir_has_an_independent_lazy_once_disclosure_and_exact_payload_contract():
+    source = APP_JS.read_text(encoding="utf-8")
+    for token in (
+        "Context IR 优化提示词",
+        '"toggle"',
+        "disclosure.open",
+        '"/context-ir"',
+        "contextIRCache",
+        "contextIRLoads",
+        "validateContextIRPayload",
+    ):
+        assert token in source
+    assert source.count('apiJSON(path)') == 1
+
+    result = _run_contract(
+        "(() => {"
+        "const detail={id:'cid-1',context_ir:{status:'succeeded',available:true,sha256:'a'.repeat(64)}};"
+        "const valid=contract.validateContextIRPayload(detail,{status:'succeeded',prompt:'  exact\\ntext  ',sha256:'a'.repeat(64)});"
+        "let rejected=false;"
+        "try { contract.validateContextIRPayload(detail,{status:'succeeded',prompt:'x',sha256:'b'.repeat(64)}); }"
+        "catch (_) { rejected=true; }"
+        "return [valid.prompt,valid.sha256,rejected,contract.contextIRCacheKey(detail)];"
+        "})()"
+    )
+    assert result == ["  exact\ntext  ", "a" * 64, True, "cid-1:" + "a" * 64]
+
+
+def test_context_ir_prompt_is_not_part_of_detail_polling_or_signature():
+    source = APP_JS.read_text(encoding="utf-8")
+    signature = source.split("function detailSignature", 1)[1].split("async function loadDetail", 1)[0]
+    assert "contextIR.prompt" not in signature
+    assert "context_ir.prompt" not in signature
+    assert "context_ir" in signature
+
+
+def test_ir_dialogue_mismatch_uses_retry_ui_not_resume_ui():
+    result = _run_contract("contract.generationAction('failed')")
+    assert result == "retry"
+    source = APP_JS.read_text(encoding="utf-8")
+    assert "H3 生成失败" in source
+    assert "generation.error ||" in source
 
 
 def test_resume_builder_reuses_the_persisted_paid_attempt_exactly():
