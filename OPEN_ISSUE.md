@@ -8,7 +8,6 @@
 
 ## 🚧 进行中
 
-- 修复生产上传解析：systemd 必须允许 Codex bwrap 沙箱正常启动，缺失产物须报真实阶段错误；以真实视频完成线上 Context IR → H3 E2E 后才关闭。（→ `app/codex_runner.py`, `app/pipeline.py`, `.deploy/systemd/duet-ad1.service`, `web/app.js`）
 
 ## 📌 待办与限制
 
