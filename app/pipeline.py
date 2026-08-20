@@ -37,7 +37,7 @@ from pathlib import Path
 import cv2
 
 from app import prepared_input, storage, vocal, voice
-from app.codex_runner import CodexError, clean_stderr
+from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -58,6 +58,10 @@ EMPTY_TRANSCRIPT_VOCAL_EVIDENCE_MIN = 51 / 256
 EMPTY_TRANSCRIPT_WARNING = (
     "voice_lines.json empty after one retry despite vocal evidence; "
     "continuing without dialogue"
+)
+VOICE_TIMELINE_WARNING = (
+    "voice lines normalized to video duration {duration_s:.3f}s: "
+    "clipped {clipped}, dropped {dropped}"
 )
 H3_DEFAULT_RATIO = "9:16"
 H3_DEFAULT_FIT_MODE = "none"
@@ -173,8 +177,8 @@ def _run_visual_codex(
                 voice_path.write_bytes(frozen_voice)
 
 
-def _voice_prompt(cdir: Path, voice_mode: str, target_language: str, duration_s: float) -> str:
-    """口播步 codex prompt：听写 + 模式处理 + 硬性禁令（同 _codex_prompt）。"""
+def _voice_prompt(_cdir: Path, voice_mode: str, target_language: str, duration_s: float) -> str:
+    """口播步 codex prompt：只使用隔离区内的音频输入，不暴露原会话路径。"""
     if voice_mode == "keep":
         rule = "原文保持：只修正错别字与标点，不改写措辞。"
     elif voice_mode == "rewrite":
@@ -189,17 +193,31 @@ def _voice_prompt(cdir: Path, voice_mode: str, target_language: str, duration_s:
 - {rule}
 - 输出 work/voice_lines.json（UTF-8）：JSON 数组 [{{"text": "...", "start_s": 0.5, "end_s": 2.1}}]，0 ≤ start_s < end_s ≤ 音频时长，按 start_s 升序，覆盖人声区间；不写其他文件。
 
-{_hard_rules(cdir)}
+硬性禁令：
+- 只在当前音频专用工作区内创建/修改文件。
+- 禁止联网（沙箱已断网，联网必然失败）。
+- 禁止打印、读取或记录任何环境变量。
 """
 
 
-def _load_voice_lines(work: Path, duration_s: float) -> list[dict]:
-    """读并校验 work/voice_lines.json；缺失/非法 → PipelineError。"""
+def _run_voice_attempt(
+    runner,
+    work: Path,
+    prompt: str,
+    duration_s: float,
+) -> list[dict]:
+    """在音频隔离区听写；成功退出后的缺失/非法产物稳定归因为 voice 输出错误。"""
     try:
-        raw = (work / "voice_lines.json").read_bytes()
-    except OSError:
-        raise PipelineError("voice_lines.json missing") from None
-    return voice.validate_voice_lines(raw, duration_s)
+        return runner.run_voice(
+            work,
+            prompt,
+            duration_s=duration_s,
+            validate_output=lambda raw: voice.validate_voice_lines(raw, duration_s),
+        )
+    except CodexError:
+        raise
+    except (CodexOutputError, PipelineError, OSError):
+        raise _codex_output_error("voice") from None
 
 
 def _vocal_filter_enabled() -> bool:
@@ -218,6 +236,53 @@ def _has_retryable_vocal_evidence(analysis: vocal.VocalAnalysis) -> bool:
     )
 
 
+def _normalize_voice_timeline(
+    decisions: list[dict], duration_s: float
+) -> tuple[list[dict], list[dict], list[str]]:
+    """把已完成 YAMNet 分类的 ASR 行裁到视频时间轴，再做一次完整白名单校验。"""
+    normalized_decisions = []
+    effective_lines = []
+    clipped = 0
+    dropped = 0
+    for decision in decisions:
+        current = dict(decision)
+        start_s = float(current["start_s"])
+        end_s = float(current["end_s"])
+        if start_s >= duration_s:
+            current["kept"] = False
+            current["drop_reason"] = "starts_at_or_after_video_duration"
+            dropped += 1
+        elif end_s > duration_s:
+            current["asr_start_s"] = start_s
+            current["asr_end_s"] = end_s
+            current["end_s"] = duration_s
+            current["time_adjustment"] = "clipped_to_video_duration"
+            clipped += 1
+        normalized_decisions.append(current)
+        if current["kept"]:
+            effective_lines.append(
+                {
+                    "text": current["text"],
+                    "start_s": current["start_s"],
+                    "end_s": current["end_s"],
+                }
+            )
+
+    normalized_lines = voice.validate_voice_lines(
+        json.dumps(effective_lines, ensure_ascii=False).encode("utf-8"), duration_s
+    )
+    warnings = []
+    if clipped or dropped:
+        warnings.append(
+            VOICE_TIMELINE_WARNING.format(
+                duration_s=duration_s,
+                clipped=clipped,
+                dropped=dropped,
+            )
+        )
+    return normalized_lines, normalized_decisions, warnings
+
+
 def _voice_step(
     settings: Settings, cid: str, cdir: Path, work: Path, runner,
     voice_mode: str, target_language: str, *, allow_no_audio: bool = False,
@@ -225,9 +290,9 @@ def _voice_step(
     """口播步（抽帧后）：抽音轨 → 声学预判 → codex 听写 → 白名单校验 → voice_lines 落 meta。
 
     台词时间戳在音频时间轴上（codex 听 voice.mp3），校验基准与提示词时长用音频实际时长
-    （音频流可比容器长几十 ms，常态）；容器时长（manifest）仍供场景/拆段用。空台词数组
-    且音轨有人声证据 → 重试一次 codex，再空则写 warning 后以无台词继续。新 auto 契约下
-    无音轨同样是合法空台词；旧 voice_mode 可保留严格失败行为。返回白名单净化后的台词列表。
+    （音频流可比容器长几十 ms，常态）；YAMNet 分类后再把最终行裁到 manifest 视频时间轴。
+    空台词数组且音轨有人声证据 → 重试一次 codex，再空则写 warning 后以无台词继续。新 auto
+    契约下无音轨同样是合法空台词；旧 voice_mode 可保留严格失败行为。返回白名单净化后的台词列表。
     """
     target_language = (target_language or "").strip()  # 纯空白串视为缺失，不生成「翻译成   」prompt
     if voice_mode not in ("keep", "rewrite", "translate"):
@@ -261,7 +326,7 @@ def _voice_step(
         duration_s = float(manifest["duration_seconds"])
     except (KeyError, TypeError, ValueError):
         raise PipelineError("manifest.json missing or invalid") from None
-    if duration_s <= 0:
+    if not math.isfinite(duration_s) or duration_s <= 0:
         raise PipelineError(f"manifest.json invalid duration: {duration_s}")
     # 台词校验基准 = 音频实际时长；probe 失败回退容器时长（旧行为）
     audio_duration_s = voice.probe_audio_duration(audio) or duration_s
@@ -271,36 +336,13 @@ def _voice_step(
     except Exception as e:
         raise PipelineError(f"vocal classification unavailable: {e}") from None
     has_vocal = _has_retryable_vocal_evidence(analysis)
-    try:
-        runner.run(cdir, _voice_prompt(cdir, voice_mode, target_language, audio_duration_s))
-    except CodexError as e:
-        # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
-        try:
-            lines = _load_voice_lines(work, audio_duration_s)
-        except PipelineError:
-            raise e from None
-    else:
-        try:
-            lines = _load_voice_lines(work, audio_duration_s)
-        except PipelineError:
-            raise _codex_output_error("voice") from None
+    prompt = _voice_prompt(cdir, voice_mode, target_language, audio_duration_s)
+    lines = _run_voice_attempt(runner, work, prompt, audio_duration_s)
     if not lines and has_vocal:
         # 音轨有人声但听写为空：只重试一次；再次为空按用户确认继续，但必须明确留痕。
-        try:
-            runner.run(cdir, _voice_prompt(cdir, voice_mode, target_language, audio_duration_s))
-        except CodexError as e:
-            try:
-                lines = _load_voice_lines(work, audio_duration_s)
-            except PipelineError:
-                raise e from None
-        else:
-            try:
-                lines = _load_voice_lines(work, audio_duration_s)
-            except PipelineError:
-                raise _codex_output_error("voice") from None
+        lines = _run_voice_attempt(runner, work, prompt, audio_duration_s)
     warnings = [EMPTY_TRANSCRIPT_WARNING] if not lines and has_vocal else []
     # VOCAL_FILTER=off 只旁路 keep/drop，不旁路分类：receipt 必须解释每句为何被保留。
-    filtered_lines = []
     decisions = []
     for line in lines:
         classification = vocal.classify_segment(
@@ -315,9 +357,15 @@ def _voice_step(
                 "kept": kept,
             }
         )
-        if kept:
-            filtered_lines.append(line)
-    vocal_dropped = sum(not decision["kept"] for decision in decisions)
+    filtered_lines, decisions, timeline_warnings = _normalize_voice_timeline(
+        decisions, duration_s
+    )
+    warnings.extend(timeline_warnings)
+    vocal_dropped = sum(
+        decision.get("classification") not in ("spoken", "sung")
+        for decision in decisions
+        if filter_enabled
+    )
     # 后续视觉步骤看到的 voice_lines 也只能是最终有效集，不能重新收养已过滤行。
     (work / "voice_lines.json").write_text(
         json.dumps(filtered_lines, ensure_ascii=False, indent=2) + "\n",

@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -303,6 +304,136 @@ class TestCodexRunner:
         for t in threads:
             t.join()
         assert max_active == 1
+
+    def test_voice_run_stages_only_audio_inputs_behind_outer_bwrap(
+        self, monkeypatch, tmp_path
+    ):
+        """音频 agent 的可见输入只有 voice.mp3 与最小 manifest；输出不直接落主 work。"""
+        cdir = tmp_path / "conversation"
+        work = cdir / "work"
+        frames = work / "frames"
+        frames.mkdir(parents=True)
+        (cdir / "source.mp4").write_text("SOURCE_VISUAL_SECRET", encoding="utf-8")
+        (frames / "000001.png").write_text("FRAME_VISUAL_SECRET", encoding="utf-8")
+        (work / "contact_sheet.jpg").write_text("OCR_FAKE_DIALOGUE", encoding="utf-8")
+        (work / "visual_prompt.txt").write_text("OCR_FAKE_DIALOGUE", encoding="utf-8")
+        (work / "voice.mp3").write_bytes(b"audio-only")
+        (work / "manifest.json").write_text(
+            json.dumps({"duration_seconds": 99, "frames": ["000001.png"]}),
+            encoding="utf-8",
+        )
+
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((list(argv), kwargs))
+            stage = Path(argv[argv.index("-C") + 1])
+            visible = {
+                path.relative_to(stage).as_posix()
+                for path in stage.rglob("*")
+                if path.is_file()
+            }
+            assert visible == {"work/voice.mp3", "work/manifest.json"}
+            assert json.loads((stage / "work" / "manifest.json").read_text()) == {
+                "duration_seconds": 1.25
+            }
+            (stage / "work" / "voice_lines.json").write_text(
+                json.dumps([{"text": "真实口播", "start_s": 0.0, "end_s": 1.0}]),
+                encoding="utf-8",
+            )
+            (stage / "work" / "rogue.txt").write_text("ignore me", encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setenv("ARK_API_KEY", "must-not-leak")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "must-not-leak")
+        monkeypatch.setattr(codex_runner.subprocess, "run", fake_run)
+        lines = CodexRunner(timeout_s=7, concurrency=1).run_voice(
+            work,
+            "voice prompt",
+            duration_s=1.25,
+            validate_output=lambda raw: voice.validate_voice_lines(raw, 1.25),
+        )
+
+        assert lines == [{"text": "真实口播", "start_s": 0.0, "end_s": 1.0}]
+        assert not (work / "voice_lines.json").exists()
+        assert not (work / "rogue.txt").exists()
+        (argv, kwargs), = calls
+        assert Path(argv[0]).name == "bwrap"
+        assert any(argv[index:index + 2] == ["--tmpfs", "/tmp"] for index in range(len(argv)))
+        assert "--bind" in argv and "--chdir" in argv
+        inner = argv.index("codex")
+        assert argv[inner:inner + 2] == ["codex", "exec"]
+        assert argv[argv.index("-s", inner) + 1] == "workspace-write"
+        assert "sandbox_workspace_write.network_access=false" in argv
+        assert kwargs["timeout"] == 7
+        assert all(
+            secret not in kwargs["env"]
+            for secret in ("ARK_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+        )
+
+    def test_voice_run_fails_closed_without_bwrap(self, monkeypatch, tmp_path):
+        work = tmp_path / "conversation" / "work"
+        work.mkdir(parents=True)
+        (work / "voice.mp3").write_bytes(b"audio")
+        monkeypatch.setattr(codex_runner.shutil, "which", lambda name: None)
+        monkeypatch.setattr(
+            codex_runner.subprocess,
+            "run",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("must not run")),
+        )
+
+        with pytest.raises(CodexError, match="bwrap"):
+            CodexRunner(timeout_s=1, concurrency=1).run_voice(
+                work,
+                "voice prompt",
+                duration_s=1.0,
+                validate_output=lambda raw: raw,
+            )
+
+    def test_voice_run_rejects_symlinked_audio(self, tmp_path):
+        work = tmp_path / "conversation" / "work"
+        work.mkdir(parents=True)
+        outside = tmp_path / "outside.mp3"
+        outside.write_bytes(b"audio")
+        (work / "voice.mp3").symlink_to(outside)
+
+        with pytest.raises(CodexError, match="voice.mp3"):
+            CodexRunner(timeout_s=1, concurrency=1).run_voice(
+                work,
+                "voice prompt",
+                duration_s=1.0,
+                validate_output=lambda raw: raw,
+            )
+
+    def test_real_nonpaid_voice_sandbox_probe_blocks_session_and_repo(self, tmp_path):
+        """真实 bwrap + `codex sandbox` 探针，不调用模型/API。"""
+        if not shutil.which("bwrap") or not shutil.which("codex"):
+            pytest.skip("bwrap/codex unavailable")
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        (cdir / "source.mp4").write_text("outside", encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="duet-voice-probe-", dir="/tmp") as raw_stage:
+            stage = Path(raw_stage)
+            (stage / "work").mkdir()
+            (stage / "work" / "voice.mp3").write_bytes(b"audio")
+            (stage / "work" / "manifest.json").write_text(
+                json.dumps({"duration_seconds": 1.0}), encoding="utf-8"
+            )
+            script = (
+                f"test ! -r {str(cdir / 'source.mp4')!r} && "
+                f"test ! -r {str(ROOT / 'app' / 'pipeline.py')!r} && "
+                "test -r work/voice.mp3 && test -r work/manifest.json && "
+                "printf '[]' > work/voice_lines.json"
+            )
+            inner = [
+                "codex", "sandbox", "-P", ":workspace", "-C", str(stage),
+                "bash", "-c", script,
+            ]
+            argv = codex_runner._voice_outer_argv(stage, cdir, inner)
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+
+            assert proc.returncode == 0, proc.stderr
+            assert (stage / "work" / "voice_lines.json").read_text() == "[]"
 
 
 # ---------- 流水线编排（状态机） ----------
@@ -698,8 +829,7 @@ def test_run_voice_vocal_failure_fails_pipeline(tmp_path, video_1s, monkeypatch)
 
 
 def test_run_voice_audio_longer_than_container(tmp_path, video_1s, monkeypatch):
-    """音视频不同长（音频流比容器长 36ms，常态）：台词 end_s 写到音频末尾应通过——
-    校验基准是 voice.mp3 实际时长，不是容器时长（否则全部此类视频都 failed）。"""
+    """音频长 36ms 时 ASR 先按音频通过，再把最终台词裁回视频时间轴。"""
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
     _set_voice_mode(settings, meta, "keep")
@@ -747,7 +877,10 @@ def test_run_voice_audio_longer_than_container(tmp_path, video_1s, monkeypatch):
 
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done"
-    assert stored["voice_lines"] == [line]
+    assert stored["voice_lines"] == [
+        {"text": "台词", "start_s": 0.224, "end_s": 27.9}
+    ]
+    assert any("video duration 27.900s" in item for item in stored["voice_warnings"])
 
 
 def test_run_voice_keep_runs_asr_and_stores_lines(tmp_path, video_1s, monkeypatch):
@@ -791,9 +924,67 @@ def test_run_voice_keep_runs_asr_and_stores_lines(tmp_path, video_1s, monkeypatc
     assert "1.000" in asr_prompt  # 时长数字直传 prompt
     assert "原文保持" in asr_prompt
     assert str(pipeline.SKILL_MD) not in asr_prompt
-    for needle in (sys.executable, str(cdir), "禁止联网", "环境变量"):
+    for needle in ("禁止联网", "环境变量"):
         assert needle in asr_prompt, needle
+    assert sys.executable not in asr_prompt
+    assert str(cdir) not in asr_prompt
+    assert asr_call["workdir"] != cdir
+    assert asr_call["workdir"].parent == Path("/tmp")
     assert str(pipeline.SKILL_MD) in maker_call["prompt"]
+
+
+def test_run_voice_agent_cannot_see_visual_or_ocr_inputs(
+    tmp_path, video_1s, monkeypatch
+):
+    """独立污染反例：原会话有 OCR 假台词和视觉输入，ASR stage 仍只有音频输入。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    cdir = settings.data_dir / meta["id"]
+    work = cdir / "work"
+    work.mkdir(exist_ok=True)
+    (work / "visual_prompt.txt").write_text("画面字：买一送一（不要朗读）", encoding="utf-8")
+    (work / "frame_note.txt").write_text("OCR_FAKE_DIALOGUE", encoding="utf-8")
+    asr_seen = []
+    real_line = {"text": "Jumpa geng sekelapa.", "start_s": 0.0, "end_s": 0.8}
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        stage_work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            visible = {
+                path.relative_to(Path(workdir)).as_posix()
+                for path in Path(workdir).rglob("*")
+                if path.is_file()
+            }
+            asr_seen.append((Path(workdir), visible))
+            assert visible == {"work/voice.mp3", "work/manifest.json"}
+            assert "OCR_FAKE_DIALOGUE" not in "\n".join(
+                path.read_text(encoding="utf-8", errors="ignore")
+                for path in Path(workdir).rglob("*")
+                if path.is_file()
+            )
+            (stage_work / "voice_lines.json").write_text(
+                json.dumps([real_line]), encoding="utf-8"
+            )
+        else:
+            _write_valid_package(stage_work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == [real_line]
+    assert len(asr_seen) == 1
+    assert asr_seen[0][0] != cdir
 
 
 def test_run_voice_translate_prompt_has_target_language(tmp_path, video_1s, monkeypatch):
@@ -1144,6 +1335,201 @@ def test_run_dialogue_auto_uses_actual_12_4s_duration_and_ceil_engine_request(
     assert receipt["video"]["duration_s"] == 12.4
     assert receipt["engine_request"]["context_ir"]["duration"] == 13
     assert receipt["engine_request"]["h3"]["duration"] == 13
+
+
+def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
+    tmp_path, video_1s, monkeypatch
+):
+    """线上复现：10.080s MP3 不能把 10.000s 视频 receipt 的台词时间轴撑长。"""
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode="auto",
+        voice_mode="keep",
+        duration_s=10.0,
+        ratio="9:16",
+        fit_mode="none",
+    )
+    asr_line = {"text": "完整十秒口播。", "start_s": 0.0, "end_s": 10.08}
+    normalized = {"text": "完整十秒口播。", "start_s": 0.0, "end_s": 10.0}
+
+    def fake_steps(argv, *, timeout, step, cwd=None):
+        if step == "extract":
+            work = Path(argv[argv.index("--out-dir") + 1])
+            (work / "contact_sheet.jpg").write_bytes(b"sheet")
+            (work / "manifest.json").write_text(
+                json.dumps({"duration_seconds": 10.0}), encoding="utf-8"
+            )
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 10.0, "scenes": [], "segments": []}),
+                encoding="utf-8",
+            )
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"normalized-audio")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(
+                json.dumps([asr_line]), encoding="utf-8"
+            )
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_steps)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(voice, "probe_audio_duration", lambda _path: 10.08)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        vocal,
+        "analyze",
+        lambda _audio: vocal.VocalAnalysis(
+            windows=[vocal.VocalWindow(0, 10_080, sung=0.0, spoken=0.3, music=0.0)],
+            has_bgm=False,
+        ),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    cdir = settings.data_dir / meta["id"]
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == [normalized]
+    assert stored["voice_line_provenance"] == [
+        {
+            **normalized,
+            "classification": "spoken",
+            "provenance": "asr",
+            "kept": True,
+            "asr_start_s": 0.0,
+            "asr_end_s": 10.08,
+            "time_adjustment": "clipped_to_video_duration",
+        }
+    ]
+    assert any("video duration 10.000s" in item for item in stored["voice_warnings"])
+    receipt = json.loads((cdir / "prepared_input.json").read_text(encoding="utf-8"))
+    assert receipt["video"]["duration_s"] == 10.0
+    assert receipt["dialogue"]["lines"][0]["end_s"] == 10.0
+
+
+def test_run_voice_drops_lines_starting_in_mp3_only_tail(tmp_path, video_1s, monkeypatch):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    kept = {"text": "视频内台词", "start_s": 9.5, "end_s": 9.9}
+    tail = {"text": "编码尾部伪句", "start_s": 10.0, "end_s": 10.08}
+
+    def fake_steps(argv, *, timeout, step, cwd=None):
+        if step == "extract":
+            work = Path(argv[argv.index("--out-dir") + 1])
+            (work / "contact_sheet.jpg").write_bytes(b"sheet")
+            (work / "manifest.json").write_text(
+                json.dumps({"duration_seconds": 10.0}), encoding="utf-8"
+            )
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 10.0, "scenes": [], "segments": []}),
+                encoding="utf-8",
+            )
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"normalized-audio")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(
+                json.dumps([kept, tail]), encoding="utf-8"
+            )
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_steps)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(voice, "probe_audio_duration", lambda _path: 10.08)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        vocal,
+        "analyze",
+        lambda _audio: vocal.VocalAnalysis(
+            windows=[vocal.VocalWindow(0, 10_080, sung=0.0, spoken=0.3, music=0.0)],
+            has_bgm=False,
+        ),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == [kept]
+    assert stored["voice_line_provenance"][1] == {
+        **tail,
+        "classification": "spoken",
+        "provenance": "asr",
+        "kept": False,
+        "drop_reason": "starts_at_or_after_video_duration",
+    }
+    assert any("dropped 1" in item for item in stored["voice_warnings"])
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        [{"text": "Jumpa geng sekelapa.", "start_s": 0.0, "end_s": 2.5}],
+        [
+            {
+                "text": "¿Tu perro tiene nudos y demasiado pelo suelto?",
+                "start_s": 0.05,
+                "end_s": 3.35,
+            },
+            {
+                "text": "Este peine de doble diente es la solución.",
+                "start_s": 3.84,
+                "end_s": 6.65,
+            },
+            {
+                "text": "Desenreda suavemente y sin tirones.",
+                "start_s": 7.09,
+                "end_s": 9.32,
+            },
+        ],
+        [
+            {
+                "text": "Finally found the cheapest cheese squishy!",
+                "start_s": 0.2,
+                "end_s": 2.0,
+            }
+        ],
+    ],
+)
+def test_voice_timeline_normalization_preserves_11_12_13_text_and_order(lines):
+    decisions = [
+        {
+            **line,
+            "classification": "spoken" if index % 2 == 0 else "sung",
+            "provenance": "asr",
+            "kept": True,
+        }
+        for index, line in enumerate(lines)
+    ]
+
+    normalized, normalized_decisions, warnings = pipeline._normalize_voice_timeline(
+        decisions, 10.0
+    )
+
+    assert normalized == lines
+    assert normalized_decisions == decisions
+    assert warnings == []
 
 
 def test_run_voice_codex_timeout_salvages_complete_lines(tmp_path, video_1s, monkeypatch):
@@ -1597,6 +1983,7 @@ def test_run_voice_empty_lines_with_spoken_retries_and_succeeds(tmp_path, video_
     _set_voice_mode(settings, meta, "keep")
     line = {"text": "台词", "start_s": 0.0, "end_s": 0.9}
     codex_calls = []
+    voice_stages = []
 
     def fake_extract_audio(cdir_arg):
         out = cdir_arg / "work" / "voice.mp3"
@@ -1607,9 +1994,17 @@ def test_run_voice_empty_lines_with_spoken_retries_and_succeeds(tmp_path, video_
         codex_calls.append(prompt)
         work = Path(workdir) / "work"
         if "voice.mp3" in prompt:
+            visible_before = {
+                path.relative_to(Path(workdir)).as_posix()
+                for path in Path(workdir).rglob("*")
+                if path.is_file()
+            }
+            assert visible_before == {"work/voice.mp3", "work/manifest.json"}
+            voice_stages.append(Path(workdir))
             (work / "voice_lines.json").write_text(
                 json.dumps([] if len(codex_calls) == 1 else [line]), encoding="utf-8"
             )
+            (work / "stale-from-attempt.txt").write_text("must not survive", encoding="utf-8")
         else:
             _write_valid_package(work)
 
@@ -1625,6 +2020,7 @@ def test_run_voice_empty_lines_with_spoken_retries_and_succeeds(tmp_path, video_
     assert stored["voice_lines"] == [line]
     # voice 调用 = 第一次听写 + 重试共 2 次（prompt 步另有 1 次非 voice 调用）
     assert sum(1 for p in codex_calls if "voice.mp3" in p) == 2
+    assert len(voice_stages) == 2 and voice_stages[0] != voice_stages[1]
 
 
 def test_run_voice_empty_lines_with_spoken_retry_still_empty_warns(tmp_path, video_1s, monkeypatch):
