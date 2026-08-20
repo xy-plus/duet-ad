@@ -58,6 +58,39 @@ _SPEECH_SYNC_RE = re.compile(
     r"(?:嘴型|口型|\bmouth\s+movements?\b|\blip[\s-]?sync\b)",
     re.IGNORECASE,
 )
+_UNTAGGED_LITERAL_SPEECH_RE = re.compile(
+    r"(?:[:：]\s*\S|(?:^|[\s,，:：])(?:[\"“][^\r\n\"”]+[\"”]|"
+    r"[‘'][^\r\n’']+[’'])|字幕|(?:屏幕|画面)(?:上)?(?:的)?(?:文字|文本)|"
+    r"二维码|\b(?:ocr|on[\s-]?screen|screen|visible)\s+"
+    r"(?:text|subtitle|caption)|\b(?:subtitle|caption)\b)",
+    re.IGNORECASE,
+)
+_SPEECH_CONTEXT_END_RE = re.compile(r"[。！？!?；;，,\n]|\.(?=\s|$)")
+_SPEECH_SENTENCE_END_RE = re.compile(r"[。！？!?；;\n]|\.(?=\s|$)")
+_SECTION_HEADING_RE = re.compile(
+    r"^[ \t]*(?:\[([^\]\r\n]+)\]|([a-z][a-z0-9_ -]{0,48})\s*:)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_SUMMARY_SPEECH_REFERENCE_RE = re.compile(
+    r"\b(?:an?|the)?\s*(?:brief\s+)?(?:introductory|opening)\s+"
+    r"(?:line|phrase|dialogue|statement)\b.{0,64}"
+    r"\b(?:at|near)\s+(?:the\s+)?(?:beginning|start|opening)\b",
+    re.IGNORECASE,
+)
+_DIALOGUE_CONTINUATION_PREFIX_RE = re.compile(
+    r"^\s*(?:[.!?。！？]\s*)?(?:as|while|during|when)\b"
+    r"[^.!?。！？;；:,：\r\n]{0,80}$",
+    re.IGNORECASE,
+)
+_CONTENTLESS_ACTION_TAIL_RE = re.compile(
+    r"^\s*(?:[a-z-]+ly\s*)*$",
+    re.IGNORECASE,
+)
+_PHYSICAL_RESPONSE_RE = re.compile(
+    r"\brespond(?:s|ed|ing)?\s+to\b.{0,96}\b(?:breath(?:ing)?|bod(?:y|ily)|"
+    r"torso|movement|motion|camera|handling|touch|gravity|wind|airflow|gesture)\b",
+    re.IGNORECASE,
+)
 _NEGATED_SPEECH_RE = re.compile(
     r"(?:无(?:台词|对白|旁白|配音|发声|口播)|不得|不能|禁止|避免|无需|"
     r"从不|绝不|不应|不可|不要|不(?:说出|说道|说话|发声|开口|朗读|口播|"
@@ -263,13 +296,29 @@ def _speech_actions_are_bound(
             continue
         if _speech_action_is_negated(prompt, action.start(), action.end()):
             continue
-        if not _has_nearby_dialogue(
+        if not dialogue_spans or _speech_action_has_literal_content(
+            prompt, action.start(), action.end()
+        ):
+            return False
+        if _has_nearby_dialogue(
             prompt,
             action.end(),
             dialogue_spans,
             following_only=True,
         ):
-            return False
+            continue
+        if _is_summary_speech_reference(prompt, action.start(), action.end()):
+            continue
+        if _is_dialogue_continuation(
+            prompt,
+            action.start(),
+            action.end(),
+            dialogue_spans,
+        ):
+            continue
+        if _is_physical_response(prompt, action.start(), action.end()):
+            continue
+        return False
     for sync in _SPEECH_SYNC_RE.finditer(prompt):
         if _inside_any_span(sync.start(), dialogue_spans):
             continue
@@ -283,6 +332,60 @@ def _speech_actions_are_bound(
         ):
             return False
     return True
+
+
+def _speech_action_has_literal_content(prompt: str, start: int, end: int) -> bool:
+    """Reject only speech actions that introduce untagged words or visible text."""
+    # Dialogue tags are the frozen authority.  Replace each complete tag with a
+    # sentence boundary so its text and any later continuation cannot make
+    # ``says: <d>...</d>`` look like untagged direct speech.
+    context_source = _DIALOGUE_RE.sub("\n", prompt[start:])
+    action_length = end - start
+    boundary = _SPEECH_SENTENCE_END_RE.search(context_source, action_length)
+    context_end = boundary.start() if boundary else len(context_source)
+    return _UNTAGGED_LITERAL_SPEECH_RE.search(context_source[:context_end]) is not None
+
+
+def _is_summary_speech_reference(prompt: str, start: int, end: int) -> bool:
+    headings = list(_SECTION_HEADING_RE.finditer(prompt, 0, start))
+    if not headings:
+        return False
+    heading = headings[-1].group(1) or headings[-1].group(2) or ""
+    if heading.strip().casefold() != "summary":
+        return False
+    boundary = _SPEECH_CONTEXT_END_RE.search(prompt, end)
+    context_end = boundary.start() if boundary else len(prompt)
+    return _SUMMARY_SPEECH_REFERENCE_RE.search(prompt[end:context_end]) is not None
+
+
+def _is_dialogue_continuation(
+    prompt: str,
+    start: int,
+    end: int,
+    dialogue_spans: tuple[tuple[int, int], ...],
+) -> bool:
+    previous = next(
+        (
+            (span_start, span_end)
+            for span_start, span_end in reversed(dialogue_spans)
+            if span_end <= start
+        ),
+        None,
+    )
+    if previous is None:
+        return False
+    gap = prompt[previous[1]:start]
+    if _DIALOGUE_CONTINUATION_PREFIX_RE.fullmatch(gap) is None:
+        return False
+    boundary = _SPEECH_CONTEXT_END_RE.search(prompt, end)
+    context_end = boundary.start() if boundary else len(prompt)
+    return _CONTENTLESS_ACTION_TAIL_RE.fullmatch(prompt[end:context_end]) is not None
+
+
+def _is_physical_response(prompt: str, start: int, end: int) -> bool:
+    boundary = _SPEECH_CONTEXT_END_RE.search(prompt, end)
+    context_end = boundary.start() if boundary else len(prompt)
+    return _PHYSICAL_RESPONSE_RE.search(prompt[start:context_end]) is not None
 
 
 def _inside_any_span(position: int, spans: tuple[tuple[int, int], ...]) -> bool:
