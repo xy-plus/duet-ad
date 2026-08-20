@@ -803,7 +803,26 @@ def _advance(
     if status == "submission_unknown":
         return _result(state)
     if status == "failed":
-        return _result(state)
+        error = state.get("error")
+        ir = state.get("ir")
+        h3_state = state.get("h3")
+        if (
+            error == {"code": "ir_dialogue_mismatch"}
+            and isinstance(ir, dict)
+            and ir.get("status") == "running"
+            and _task_id(ir.get("task_id"), required=False) is not None
+            and isinstance(h3_state, dict)
+            and h3_state.get("status") == "not_started"
+        ):
+            # A validator-only failure has no paid H3 side effect.  After a
+            # validator repair, re-query the already bound IR task instead of
+            # creating a second attempt or repeating the IR POST.
+            state["status"] = "ir_running"
+            state["retryable"] = False
+            state.pop("error", None)
+            _save_state(request, state)
+        else:
+            return _result(state)
 
     ir = state["ir"]
     ir_task_id = _task_id(ir.get("task_id"), required=False)
