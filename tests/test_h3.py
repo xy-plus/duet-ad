@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app import h3, prepared_input
+from app import h3
 
 
 VOICE_TEXTS = ("第一句台词", "第二句台词")
@@ -317,7 +317,7 @@ def test_context_ir_snapshot_is_absent_before_start_and_available_after_video(tm
     )
 
 
-def test_prepare_context_ir_stops_before_h3_and_exposes_mismatched_prompt(tmp_path):
+def test_prepare_context_ir_allows_rewritten_dialogue_before_h3(tmp_path):
     request = _request(tmp_path)
     raw = "镜头稳定。<d>第一句被改写</d><d>第二句台词</d>"
     provider = HappyProvider(ir_prompt=raw)
@@ -331,10 +331,9 @@ def test_prepare_context_ir_stops_before_h3_and_exposes_mismatched_prompt(tmp_pa
     snapshot = h3.inspect_context_ir(request.workdir, request.cid)
     assert snapshot.prompt == raw
     assert snapshot.sha256 == hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    assert h3.context_ir_dialogue_matches(raw, request.voice_texts) is False
 
 
-def test_context_ir_can_be_corrected_before_h3_and_uses_expected_sha(tmp_path):
+def test_context_ir_can_be_edited_before_h3_and_uses_expected_sha(tmp_path):
     request = _request(tmp_path)
     raw = "镜头稳定。<d>第一句被改写</d><d>第二句台词</d>"
     provider = HappyProvider(ir_prompt=raw)
@@ -343,22 +342,16 @@ def test_context_ir_can_be_corrected_before_h3_and_uses_expected_sha(tmp_path):
 
         with pytest.raises(h3.H3Error, match="context_ir_version_conflict"):
             h3.edit_context_ir(request, "0" * 64, OPTIMIZED_PROMPT)
-        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
-            h3.edit_context_ir(
-                request,
-                hashlib.sha256(raw.encode("utf-8")).hexdigest(),
-                raw,
-            )
-
+        revised = "镜头推进。<d>完全改写的台词</d><d>新增台词</d>"
         edited = h3.edit_context_ir(
             request,
             hashlib.sha256(raw.encode("utf-8")).hexdigest(),
-            OPTIMIZED_PROMPT,
+            revised,
         )
         completed = h3.start(request, client=client)
 
-    assert edited.prompt == OPTIMIZED_PROMPT
-    assert edited.sha256 == hashlib.sha256(OPTIMIZED_PROMPT.encode("utf-8")).hexdigest()
+    assert edited.prompt == revised
+    assert edited.sha256 == hashlib.sha256(revised.encode("utf-8")).hexdigest()
     assert completed.status == "succeeded"
     assert len(provider.ir_posts) == 1
     assert len(provider.h3_posts) == 1
@@ -449,9 +442,12 @@ def test_startup_resume_only_queries_existing_ir_task(tmp_path):
         state["ir"]["optimized_prompt"].encode("utf-8")
     ).hexdigest()
     state_path.write_text(json.dumps(state), encoding="utf-8")
-    with _client(lambda _req: pytest.fail("mismatch must fail before network")) as client:
-        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
-            h3.start(request, client=client)
+    provider = HappyProvider()
+    with _client(provider) as client:
+        completed = h3.start(request, client=client)
+
+    assert completed.status == "succeeded"
+    assert len(provider.h3_posts) == 1
 
 
 def test_startup_resume_only_queries_and_downloads_existing_h3_task(tmp_path):
@@ -503,24 +499,21 @@ def test_startup_resume_only_queries_and_downloads_existing_h3_task(tmp_path):
         "<d>第一句台词</d><d>第二句被改写</d>",
         "<d>第一句台词</d><d>第二句台词</d><d>额外台词</d>",
         "<d>第二句台词</d><d>第一句台词</d>",
-        "文本里提到第一句台词和第二句台词，但没有 dialogue 标签",
     ],
 )
-def test_ir_dialogue_must_exactly_match_frozen_voice_texts(tmp_path, ir_prompt):
+def test_ir_dialogue_content_does_not_have_to_match_frozen_voice_texts(
+    tmp_path, ir_prompt
+):
     request = _request(tmp_path)
     provider = HappyProvider(ir_prompt=ir_prompt)
     with _client(provider) as client:
-        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch") as caught:
-            h3.start(request, client=client)
+        result = h3.start(request, client=client)
 
-    assert "第二句台词" not in str(caught.value)
-    assert provider.h3_posts == []
-    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
-    assert state["status"] == "failed"
-    assert state["error"] == {"code": "ir_dialogue_mismatch"}
+    assert result.status == "succeeded"
+    assert len(provider.h3_posts) == 1
 
 
-def test_mismatched_ir_is_edited_without_reposting(tmp_path):
+def test_rewritten_ir_is_edited_without_reposting(tmp_path):
     request = _request(tmp_path)
     rejected = HappyProvider(ir_prompt="<d>第一句台词</d>")
     with _client(rejected) as client:
@@ -538,14 +531,13 @@ def test_mismatched_ir_is_edited_without_reposting(tmp_path):
 @pytest.mark.parametrize(
     "ir_prompt",
     [
-        "无原始台词，但<d>新增一句</d>",
         "角色朗读画面字幕：限时优惠",
         "the character speaks the OCR text: limited offer",
         "人物开口：请扫描屏幕上的二维码。",
         "The actor reads the on-screen subtitle aloud: Limited offer.",
     ],
 )
-def test_empty_voice_texts_reject_added_dialogue_or_ocr_reading(tmp_path, ir_prompt):
+def test_context_ir_content_is_not_rejected_without_frozen_voice(tmp_path, ir_prompt):
     request = _request(tmp_path)
     request = replace(
         request,
@@ -555,26 +547,37 @@ def test_empty_voice_texts_reject_added_dialogue_or_ocr_reading(tmp_path, ir_pro
     provider = HappyProvider(ir_prompt=ir_prompt)
 
     with _client(provider) as client:
-        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
-            h3.start(request, client=client)
+        result = h3.start(request, client=client)
 
-    assert provider.h3_posts == []
-    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
-    assert state["error"] == {"code": "ir_dialogue_mismatch"}
+    assert result.status == "succeeded"
+    assert len(provider.h3_posts) == 1
 
 
-def test_nonempty_voice_rejects_unbound_extra_speech_after_exact_dialogue(tmp_path):
+def test_empty_voice_texts_allow_ir_to_add_tagged_dialogue(tmp_path):
+    request = replace(
+        _request(tmp_path),
+        voice_texts=(),
+        voice_receipt=h3.voice_texts_receipt(()),
+    )
+    provider = HappyProvider(ir_prompt="无原始台词，但<d>新增一句</d>")
+
+    with _client(provider) as client:
+        result = h3.start(request, client=client)
+
+    assert result.status == "succeeded"
+    assert len(provider.h3_posts) == 1
+
+
+def test_context_ir_extra_speech_is_not_rejected(tmp_path):
     request = _request(tmp_path)
     prompt = OPTIMIZED_PROMPT + "随后人物又开口：额外一句。"
     provider = HappyProvider(ir_prompt=prompt)
 
     with _client(provider) as client:
-        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
-            h3.start(request, client=client)
+        result = h3.start(request, client=client)
 
-    assert provider.h3_posts == []
-    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
-    assert state["error"] == {"code": "ir_dialogue_mismatch"}
+    assert result.status == "succeeded"
+    assert len(provider.h3_posts) == 1
 
 
 @pytest.mark.parametrize(
@@ -588,7 +591,7 @@ def test_nonempty_voice_rejects_unbound_extra_speech_after_exact_dialogue(tmp_pa
         ((), "The actor recites the on-screen caption: Limited offer."),
     ],
 )
-def test_ir_rejects_unbound_speech_synonyms_before_h3_post(
+def test_ir_speech_prose_does_not_block_h3_post(
     tmp_path, voice_texts, ir_prompt
 ):
     request = _request(tmp_path)
@@ -600,27 +603,10 @@ def test_ir_rejects_unbound_speech_synonyms_before_h3_post(
     provider = HappyProvider(ir_prompt=ir_prompt)
 
     with _client(provider) as client:
-        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
-            h3.start(request, client=client)
+        result = h3.start(request, client=client)
 
-    assert provider.h3_posts == []
-
-
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        "无台词；角色不得说出画面文字，禁止发声，全程保持安静。",
-        "No dialogue. The actor must not speak and moves silently.",
-        "The actor never speaks and must not read the subtitle aloud.",
-    ],
-)
-def test_negated_speech_actions_are_safe_without_dialogue(prompt):
-    assert h3._ir_dialogue_matches(prompt, ())
-
-
-def test_prepared_input_empty_dialogue_safety_block_is_accepted():
-    prompt = prepared_input.compose_final_prompt("静态产品展示。", ())
-    assert h3._ir_dialogue_matches(prompt, ())
+    assert result.status == "succeeded"
+    assert len(provider.h3_posts) == 1
 
 
 def test_real_temp10_speaks_clearly_then_dialogue_is_bound(tmp_path):
@@ -677,107 +663,6 @@ def test_ir_allows_contentless_speech_context_around_exact_frozen_dialogue(
 
 
 @pytest.mark.parametrize(
-    "extra_context",
-    [
-        "As he speaks: extra words.",
-        "Subject 1 responds: extra words.",
-        "Subject 1 speaks the OCR text: LIMITED OFFER.",
-        'Subject 1 says "extra words".',
-        "The pendant responds: extra words.",
-    ],
-)
-def test_ir_contentless_context_exceptions_do_not_allow_literal_speech(
-    extra_context,
-):
-    prompt = (
-        "Subject 1 speaks a brief introductory line at the beginning. "
-        "<d>[Indonesian] Kalung Ayatul Kursi.</d> "
-        f"{extra_context}"
-    )
-
-    assert not h3._ir_dialogue_matches(prompt, ("Kalung Ayatul Kursi.",))
-
-
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        "The actor speaks softly.",
-        "人物开口微笑。",
-    ],
-)
-def test_empty_voice_still_rejects_any_affirmative_speech_action(prompt):
-    assert not h3._ir_dialogue_matches(prompt, ())
-
-
-@pytest.mark.xfail(
-    reason="deferred adversarial free-form IR prose hardening",
-    strict=False,
-)
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        "Subject 1 says: extra words. <d>[Indonesian] Kalung Ayatul Kursi.</d>",
-        'Subject 1 says "extra words", then <d>Kalung Ayatul Kursi.</d>',
-        (
-            "<d>Kalung Ayatul Kursi.</d> Then he speaks an extra slogan while "
-            "looking at the camera."
-        ),
-        "<d>Kalung Ayatul Kursi.</d> Then he speaks softly.",
-        "<d>Kalung Ayatul Kursi.</d> Afterward the actor begins speaking.",
-        "Subject says extra words then <d>Kalung Ayatul Kursi.</d>",
-        (
-            "[Summary]\nSubject speaks an opening line reading BUY NOW at the "
-            "start.\n\n[Timeline]\nSubject speaks, "
-            "<d>Kalung Ayatul Kursi.</d>"
-        ),
-        (
-            "<d>Kalung Ayatul Kursi.</d> The actor responds to camera motion with "
-            "an extra slogan."
-        ),
-        (
-            "<d>Kalung Ayatul Kursi.</d> As the words BUY NOW play he speaks "
-            "softly."
-        ),
-    ],
-)
-def test_exact_dialogue_does_not_bind_or_hide_neighboring_added_speech(prompt):
-    assert not h3._ir_dialogue_matches(prompt, ("Kalung Ayatul Kursi.",))
-
-
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        (
-            "[Summary]\nSubject 1 speaks an opening line at the start.\n\n"
-            "[Timeline]\nSubject 1 speaks, <d>Kalung Ayatul Kursi.</d>"
-        ),
-        (
-            "<d>Kalung Ayatul Kursi.</d> While he speaks, the camera slowly "
-            "pushes in."
-        ),
-        (
-            "Subject 1 says: <d>Kalung Ayatul Kursi.</d> As he speaks, the camera "
-            "slowly pushes in."
-        ),
-        (
-            "<d>Kalung Ayatul Kursi.</d> During his speaking, the pendant remains "
-            "centered."
-        ),
-        (
-            "Subject 1 speaks, <d>Kalung Ayatul Kursi.</d> The pendant responds "
-            "to camera motion."
-        ),
-    ],
-)
-def test_exact_dialogue_allows_only_explicit_nonnew_speech_references(prompt):
-    assert h3._ir_dialogue_matches(prompt, ("Kalung Ayatul Kursi.",))
-
-
-@pytest.mark.xfail(
-    reason="deferred adversarial free-form IR prose hardening",
-    strict=False,
-)
-@pytest.mark.parametrize(
     ("voice_texts", "ir_prompt"),
     [
         (
@@ -813,7 +698,7 @@ def test_exact_dialogue_allows_only_explicit_nonnew_speech_references(prompt):
         ),
     ],
 )
-def test_security_review_prompts_fail_before_h3_post(
+def test_context_ir_prose_is_reviewed_by_user_not_blocked_by_server(
     tmp_path,
     voice_texts,
     ir_prompt,
@@ -826,17 +711,10 @@ def test_security_review_prompts_fail_before_h3_post(
     provider = HappyProvider(ir_prompt=ir_prompt)
 
     with _client(provider) as client:
-        with pytest.raises(h3.H3Error, match="ir_dialogue_mismatch"):
-            h3.start(request, client=client)
+        result = h3.start(request, client=client)
 
-    assert provider.h3_posts == []
-
-
-def test_direct_speech_cue_may_introduce_the_exact_tag():
-    assert h3._ir_dialogue_matches(
-        "Subject 1 says: <d>[Indonesian] Kalung Ayatul Kursi.</d>",
-        ("Kalung Ayatul Kursi.",),
-    )
+    assert result.status == "succeeded"
+    assert len(provider.h3_posts) == 1
 
 
 def test_receipt_tampering_blocks_recovery_before_network(tmp_path):

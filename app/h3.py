@@ -15,7 +15,6 @@ import ipaddress
 import json
 import math
 import os
-import re
 import socket
 import subprocess
 import time
@@ -37,72 +36,6 @@ MINIMAX_BASE_URL = "https://api.minimaxi.com"
 AUTODL_BASE_URL = "https://autodl.art"
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
 
-_DIALOGUE_RE = re.compile(r"<d>(.*?)</d>", re.DOTALL)
-_LANGUAGE_PREFIX_RE = re.compile(r"^\[[^\[\]\r\n]+\]\s*")
-_SPEECH_ACTION_RE = re.compile(
-    r"(?:开口|说出|说道|说话|发声(?!通道)|朗读|口播|念出|念道|读出|"
-    r"回答|回应|答道|问道|讲出|讲道|喊出|诵读|背诵|播报|宣布|低语|耳语|"
-    r"吟唱|演唱|"
-    r"(?:添加|加入|生成|开始|继续)(?:台词|对白|旁白|配音)|"
-    r"\b(?:speak(?:s|ing)?|say(?:s|ing)?|said|"
-    r"answer(?:s|ed|ing)?|respond(?:s|ed|ing)?|repl(?:y|ies|ied|ying)|"
-    r"recit(?:e|es|ed|ing)|utter(?:s|ed|ing)?|announce(?:s|d|ing)?|"
-    r"declare(?:s|d|ing)?|whisper(?:s|ed|ing)?|shout(?:s|ed|ing)?|"
-    r"exclaim(?:s|ed|ing)?|murmur(?:s|ed|ing)?|vocaliz(?:e|es|ed|ing)|"
-    r"(?:is|are|was|were|be|being)\s+spoken|"
-    r"read(?:s|ing)?\b.{0,64}\baloud|dialogue|voice[\s-]?over|narration|"
-    r"sing(?:s|ing)?|sang|sung|chant(?:s|ed|ing)?)\b)",
-    re.IGNORECASE,
-)
-_SPEECH_SYNC_RE = re.compile(
-    r"(?:嘴型|口型|\bmouth\s+movements?\b|\blip[\s-]?sync\b)",
-    re.IGNORECASE,
-)
-_UNTAGGED_LITERAL_SPEECH_RE = re.compile(
-    r"(?:[:：]\s*\S|(?:^|[\s,，:：])(?:[\"“][^\r\n\"”]+[\"”]|"
-    r"[‘'][^\r\n’']+[’'])|字幕|(?:屏幕|画面)(?:上)?(?:的)?(?:文字|文本)|"
-    r"二维码|\b(?:ocr|on[\s-]?screen|screen|visible)\s+"
-    r"(?:text|subtitle|caption)|\b(?:subtitle|caption)\b)",
-    re.IGNORECASE,
-)
-_SPEECH_CONTEXT_END_RE = re.compile(r"[。！？!?；;，,\n]|\.(?=\s|$)")
-_SPEECH_SENTENCE_END_RE = re.compile(r"[。！？!?；;\n]|\.(?=\s|$)")
-_SECTION_HEADING_RE = re.compile(
-    r"^[ \t]*(?:\[([^\]\r\n]+)\]|([a-z][a-z0-9_ -]{0,48})\s*:)[ \t]*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-_SUMMARY_SPEECH_REFERENCE_RE = re.compile(
-    r"\b(?:an?|the)?\s*(?:brief\s+)?(?:introductory|opening)\s+"
-    r"(?:line|phrase|dialogue|statement)\b.{0,64}"
-    r"\b(?:at|near)\s+(?:the\s+)?(?:beginning|start|opening)\b",
-    re.IGNORECASE,
-)
-_DIALOGUE_CONTINUATION_PREFIX_RE = re.compile(
-    r"^\s*(?:[.!?。！？]\s*)?(?:as|while|during|when)\b"
-    r"[^.!?。！？;；:,：\r\n]{0,80}$",
-    re.IGNORECASE,
-)
-_CONTENTLESS_ACTION_TAIL_RE = re.compile(
-    r"^\s*(?:[a-z-]+ly\s*)*$",
-    re.IGNORECASE,
-)
-_PHYSICAL_RESPONSE_RE = re.compile(
-    r"\brespond(?:s|ed|ing)?\s+to\b.{0,96}\b(?:breath(?:ing)?|bod(?:y|ily)|"
-    r"torso|movement|motion|camera|handling|touch|gravity|wind|airflow|gesture)\b",
-    re.IGNORECASE,
-)
-_NEGATED_SPEECH_RE = re.compile(
-    r"(?:无(?:台词|对白|旁白|配音|发声|口播)|不得|不能|禁止|避免|无需|"
-    r"从不|绝不|不应|不可|不要|不(?:说出|说道|说话|发声|开口|朗读|口播|"
-    r"念出|念道|读出|回答|回应|答道|问道|讲出|讲道|喊出|诵读|背诵|"
-    r"播报|宣布|低语|耳语|吟唱|演唱)|仅.{0,48}允许|"
-    r"\bno\b|\bnot\b|\bnever\b|\bwithout\b|\bsilent(?:ly)?\b|"
-    r"\bmust\s+not\b|\bdo(?:es)?\s+not\b|\bdon't\b|\bdoesn't\b|"
-    r"\bcannot\b|\bcan't\b)",
-    re.IGNORECASE,
-)
-_CLAUSE_BOUNDARY_RE = re.compile(r"[。！？!?；;，,\n]")
-_ACTION_BIND_MAX_CHARS = 200
 _MAX_CONTEXT_IR_PROMPT_BYTES = 32 * 1024
 
 _SAFE_ERROR_CODES = {
@@ -285,161 +218,6 @@ def voice_texts_receipt(voice_texts: Sequence[str]) -> str:
     return canonical_json_sha256(list(voice_texts))
 
 
-def context_ir_dialogue_matches(prompt: str, voice_texts: FrozenVoiceTexts) -> bool:
-    """Public validation used by the review UI; it never mutates provider state."""
-    return isinstance(prompt, str) and _ir_dialogue_matches(prompt, voice_texts)
-
-
-def _ir_dialogue_matches(prompt: str, voice_texts: FrozenVoiceTexts) -> bool:
-    """Bind every H3 dialogue tag to the frozen ASR text, in exact order."""
-    matches = list(_DIALOGUE_RE.finditer(prompt))
-    residue = _DIALOGUE_RE.sub("", prompt)
-    if "<d>" in residue or "</d>" in residue:
-        return False
-    dialogues = tuple(
-        _LANGUAGE_PREFIX_RE.sub("", match.group(1), count=1) for match in matches
-    )
-    if dialogues != voice_texts:
-        return False
-    spans = tuple((match.start(), match.end()) for match in matches)
-    return _speech_actions_are_bound(prompt, spans)
-
-
-def _speech_actions_are_bound(
-    prompt: str,
-    dialogue_spans: tuple[tuple[int, int], ...],
-) -> bool:
-    for action in _SPEECH_ACTION_RE.finditer(prompt):
-        if _inside_any_span(action.start(), dialogue_spans):
-            continue
-        if _speech_action_is_negated(prompt, action.start(), action.end()):
-            continue
-        if not dialogue_spans or _speech_action_has_literal_content(
-            prompt, action.start(), action.end()
-        ):
-            return False
-        if _has_nearby_dialogue(
-            prompt,
-            action.end(),
-            dialogue_spans,
-            following_only=True,
-        ):
-            continue
-        if _is_summary_speech_reference(prompt, action.start(), action.end()):
-            continue
-        if _is_dialogue_continuation(
-            prompt,
-            action.start(),
-            action.end(),
-            dialogue_spans,
-        ):
-            continue
-        if _is_physical_response(prompt, action.start(), action.end()):
-            continue
-        return False
-    for sync in _SPEECH_SYNC_RE.finditer(prompt):
-        if _inside_any_span(sync.start(), dialogue_spans):
-            continue
-        if _speech_action_is_negated(prompt, sync.start(), sync.end()):
-            continue
-        if not _has_nearby_dialogue(
-            prompt,
-            sync.start(),
-            dialogue_spans,
-            following_only=False,
-        ):
-            return False
-    return True
-
-
-def _speech_action_has_literal_content(prompt: str, start: int, end: int) -> bool:
-    """Reject only speech actions that introduce untagged words or visible text."""
-    # Dialogue tags are the frozen authority.  Replace each complete tag with a
-    # sentence boundary so its text and any later continuation cannot make
-    # ``says: <d>...</d>`` look like untagged direct speech.
-    context_source = _DIALOGUE_RE.sub("\n", prompt[start:])
-    action_length = end - start
-    boundary = _SPEECH_SENTENCE_END_RE.search(context_source, action_length)
-    context_end = boundary.start() if boundary else len(context_source)
-    return _UNTAGGED_LITERAL_SPEECH_RE.search(context_source[:context_end]) is not None
-
-
-def _is_summary_speech_reference(prompt: str, start: int, end: int) -> bool:
-    headings = list(_SECTION_HEADING_RE.finditer(prompt, 0, start))
-    if not headings:
-        return False
-    heading = headings[-1].group(1) or headings[-1].group(2) or ""
-    if heading.strip().casefold() != "summary":
-        return False
-    boundary = _SPEECH_CONTEXT_END_RE.search(prompt, end)
-    context_end = boundary.start() if boundary else len(prompt)
-    return _SUMMARY_SPEECH_REFERENCE_RE.search(prompt[end:context_end]) is not None
-
-
-def _is_dialogue_continuation(
-    prompt: str,
-    start: int,
-    end: int,
-    dialogue_spans: tuple[tuple[int, int], ...],
-) -> bool:
-    previous = next(
-        (
-            (span_start, span_end)
-            for span_start, span_end in reversed(dialogue_spans)
-            if span_end <= start
-        ),
-        None,
-    )
-    if previous is None:
-        return False
-    gap = prompt[previous[1]:start]
-    if _DIALOGUE_CONTINUATION_PREFIX_RE.fullmatch(gap) is None:
-        return False
-    boundary = _SPEECH_CONTEXT_END_RE.search(prompt, end)
-    context_end = boundary.start() if boundary else len(prompt)
-    return _CONTENTLESS_ACTION_TAIL_RE.fullmatch(prompt[end:context_end]) is not None
-
-
-def _is_physical_response(prompt: str, start: int, end: int) -> bool:
-    boundary = _SPEECH_CONTEXT_END_RE.search(prompt, end)
-    context_end = boundary.start() if boundary else len(prompt)
-    return _PHYSICAL_RESPONSE_RE.search(prompt[start:context_end]) is not None
-
-
-def _inside_any_span(position: int, spans: tuple[tuple[int, int], ...]) -> bool:
-    return any(start <= position < end for start, end in spans)
-
-
-def _speech_action_is_negated(prompt: str, start: int, end: int) -> bool:
-    before = list(_CLAUSE_BOUNDARY_RE.finditer(prompt, 0, start))
-    after = _CLAUSE_BOUNDARY_RE.search(prompt, end)
-    clause_start = before[-1].end() if before else 0
-    clause_end = after.start() if after else len(prompt)
-    return _NEGATED_SPEECH_RE.search(prompt[clause_start:clause_end]) is not None
-
-
-def _has_nearby_dialogue(
-    prompt: str,
-    position: int,
-    spans: tuple[tuple[int, int], ...],
-    *,
-    following_only: bool,
-) -> bool:
-    candidates = (
-        (start - position, start, end)
-        for start, end in spans
-        if not following_only or start >= position
-    )
-    for _distance, start, end in sorted(candidates, key=lambda item: abs(item[0])):
-        distance = start - position if start >= position else position - end
-        if distance < 0 or distance > _ACTION_BIND_MAX_CHARS:
-            continue
-        between = prompt[position:start] if start >= position else prompt[end:position]
-        if "\n\n" not in between:
-            return True
-    return False
-
-
 def start(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
     """Start or idempotently advance one client request.
 
@@ -599,8 +377,6 @@ def edit_context_ir(
         raise H3Error("invalid_context_ir_prompt")
     if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
         raise H3Error("context_ir_version_conflict")
-    if not _ir_dialogue_matches(prompt, request.voice_texts):
-        raise H3Error("ir_dialogue_mismatch")
 
     with _session_lease(request):
         state = _find_attempt(request, request.client_request_id)
@@ -877,10 +653,6 @@ def _validate_state(
     if optimized is not None:
         if not isinstance(optimized, str):
             raise ReceiptError("receipt_mismatch")
-        if h3_task_id is not None and not _ir_dialogue_matches(
-            optimized, request.voice_texts
-        ):
-            raise ReceiptError("ir_dialogue_mismatch")
         if ir.get("optimized_prompt_sha256") != hashlib.sha256(
             optimized.encode("utf-8")
         ).hexdigest():
@@ -1166,15 +938,6 @@ def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) 
     optimized = state["ir"].get("optimized_prompt")
     if not isinstance(optimized, str):
         raise ReceiptError("receipt_mismatch")
-    if not _ir_dialogue_matches(optimized, request.voice_texts):
-        _fail(
-            request,
-            state,
-            "ir_dialogue_mismatch",
-            retryable=False,
-            keep_task=True,
-        )
-        raise H3Error("ir_dialogue_mismatch")
     state["h3"] = {"status": "submitting"}
     state["status"] = "h3_submitting"
     state["retryable"] = False

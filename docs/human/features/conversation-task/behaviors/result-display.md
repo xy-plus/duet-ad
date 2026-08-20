@@ -27,7 +27,7 @@ links: [conversation-task, processing-state]
 | Context IR 已校验成功 | 详情只返回状态、可用性和 SHA-256；显示独立折叠区“Context IR 优化提示词”，首次展开时才鉴权读取精确全文，之后不重复请求 |
 | Context IR 尚未开始或仍在运行 | 折叠区不读取正文；正文接口分别返回 404 或 409，不能从轮询详情获得大 prompt |
 | Context IR 状态、正文或 SHA-256 不一致 | 按损坏状态关闭访问，不展示正文或摘要 hash |
-| Context IR 返回 `ir_dialogue_mismatch` | 这是确定性失败：展示 `H3 生成失败 / ir_dialogue_mismatch` 和可编辑的台词参数；同请求 id 不能继续，用户修改为 edit/custom/none 并点击重试时创建新请求 id、新 receipt 和新 attempt |
+| 历史 Context IR attempt 已有 `ir_dialogue_mismatch` | 兼容展示 `H3 生成失败 / ir_dialogue_mismatch` 和可编辑的台词参数；同请求 id 不能继续，用户修改为 edit/custom/none 并点击重试时创建新请求 id、新 receipt 和新 attempt；新 attempt 不再产生该错误 |
 | generation 确定失败 | 展示错误和“重试生成”；点击才创建新请求 id |
 | generation 为 `submission_unknown` | 展示“先到供应商核对”的阻断说明，不显示重试按钮 |
 | `generated.mp4` 存在 | 内嵌播放 H3 最终视频 |

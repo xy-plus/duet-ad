@@ -736,21 +736,12 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail="context_ir_not_found")
         if snapshot.prompt is None or snapshot.sha256 is None:
             raise HTTPException(status_code=409, detail="context_ir_not_ready")
-        try:
-            request = await asyncio.to_thread(_load_h3_request, settings, cid, meta)
-        except (_SubmitError, h3.H3Error) as exc:
-            if not (settings.data_dir / cid / "generated.mp4").is_file():
-                raise HTTPException(status_code=409, detail="context_ir_invalid") from exc
-            dialogue_valid = True
-        else:
-            dialogue_valid = h3.context_ir_dialogue_matches(
-                snapshot.prompt, request.voice_texts
-            )
         return {
             "status": snapshot.status,
             "prompt": snapshot.prompt,
             "sha256": snapshot.sha256,
-            "dialogue_valid": dialogue_valid,
+            # Kept for response compatibility; reviewed IR is the authority.
+            "dialogue_valid": True,
         }
 
     @app.post(

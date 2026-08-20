@@ -118,7 +118,7 @@ multipart 字段：
 }
 ```
 
-`dialogue_valid=false` 表示 IR 已产出、但发声标签与冻结台词不一致；正文仍必须展示给用户修正，不能折叠成不可观察的 H3 失败。不得附带 provider task id、result URL、凭据或其他内部状态。会话或 Context IR 不存在分别返回 404 `not found` / `context_ir_not_found`；attempt 尚未产出正文返回 409 `context_ir_not_ready`；输入哈希、状态或正文 SHA-256 不一致返回 409 `context_ir_invalid`。该 GET 不写盘、不联网。
+`dialogue_valid` 为兼容旧客户端保留，当前固定返回 `true`；服务端不再校验 Context IR 的 `<d>` 台词内容或结构。不得附带 provider task id、result URL、凭据或其他内部状态。会话或 Context IR 不存在分别返回 404 `not found` / `context_ir_not_found`；attempt 尚未产出正文返回 409 `context_ir_not_ready`；输入哈希、状态或正文 SHA-256 不一致返回 409 `context_ir_invalid`。该 GET 不写盘、不联网。
 
 ### `POST /api/conversations/{cid}/context-ir`
 
@@ -126,7 +126,7 @@ multipart 字段：
 
 ### `PATCH /api/conversations/{cid}/context-ir`
 
-请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。只允许在 H3 尚未提交时修改；SHA 不一致返回 409，空白/超限或结构化台词不匹配返回 422。成功返回新的 `status/prompt/sha256/dialogue_valid`。
+请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。只允许在 H3 尚未提交时修改；SHA 不一致返回 409，空白或超限返回 422。成功返回新的 `status/prompt/sha256/dialogue_valid`。
 
 ### `GET /api/conversations/{cid}/files/{name}`
 
@@ -174,7 +174,7 @@ Context IR 就绪后，严格使用已冻结的 request id 推进 H3：
 | 409 | `prepared_input_invalid` / `frame_fit_failed` | 冻结输入或画幅派生失败 |
 | 409 | `generation in progress` / `already submitted` | active/succeeded 使用不同 id |
 | 409 | `new client_request_id required` | 确定 failed 后复用旧 id |
-| 409 | `ir_dialogue_correction_required` | `ir_dialogue_mismatch` 后仍试图原样复用 `auto`；必须 edit/custom/none |
+| 409 | `ir_dialogue_correction_required` | 仅兼容历史 `ir_dialogue_mismatch` attempt；必须 edit/custom/none |
 | 409 | `resume_request_id_mismatch` | resume_required 没有使用原 client_request_id |
 | 409 | `resume_parameters_changed` | resume_required 的 mode、归一化 lines 或 fit 与冻结值不一致 |
 | 409 | `submission_outcome_unknown` | 既有 generation 为 submission_unknown；任意 id 均拒绝 |
@@ -184,7 +184,7 @@ Context IR 就绪后，严格使用已冻结的 request id 推进 H3：
 
 `resume_required` 表示 provider task 已知或 Context IR 已完成：只接受原 `client_request_id`，且 dialogue mode、标准化 lines、`fit_mode` 必须与 meta 和 prepared receipt 完全一致。合法继续返回 `202 {"status":"queued","attempt":<原值>}`，不重写 receipt、不递增 attempt，后台调用幂等 `h3.start` 而非 `h3.retry`。已知 task 错误包括 `ir_query_failed/ir_timeout/h3_query_failed/h3_timeout/download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed`；`ready_for_h3`、`ir_running`、`h3_running` 也进入此状态。
 
-`ir_dialogue_mismatch` 是确定性 `failed`，不属于 `resume_required`：同一 `client_request_id` 返回 409 `new client_request_id required`，新 id 也禁止原样复用 `auto`；用户必须改用 edit/custom/none 修正台词，再重建 prepared receipt、创建新 attempt。该失败仍保证 H3 POST 为 0。
+新 attempt 不再产生 `ir_dialogue_mismatch`。为兼容历史状态，该错误仍按确定性 `failed` 处理：同一 `client_request_id` 返回 409 `new client_request_id required`，新 id 也禁止原样复用 `auto`；用户改用 edit/custom/none 后重建 prepared receipt、创建新 attempt。
 
 确定性输出安全拒绝 `download_url_rejected/download_redirect_rejected/download_too_large/download_invalid_video` 映射为 `failed`，只有用户明确使用新 id 才创建 retry attempt。它们不属于会因同参数继续而消失的传输故障。
 
@@ -287,7 +287,7 @@ Context IR 就绪后，严格使用已冻结的 request id 推进 H3：
 }
 ```
 
-内部 status：`ir_submitting/ir_running/ready_for_h3/h3_submitting/h3_running/succeeded/retryable_failure/failed/submission_unknown`。任务 id 出现后必须同时存在对应 receipt；optimized prompt 的全部严格小写 `<d>...</d>` 在去掉每段可选 `[Language]` 前缀后，必须与冻结 `voice_texts` 数量、顺序、文本全等；最终 output receipt 只能是 `{name:"generated.mp4",sha256,size}`。`result_url` 明确禁止落状态文件。
+内部 status：`ir_submitting/ir_running/ready_for_h3/h3_submitting/h3_running/succeeded/retryable_failure/failed/submission_unknown`。任务 id 出现后必须同时存在对应 receipt；optimized prompt 只绑定正文 SHA-256，不校验 `<d>` 台词；最终 output receipt 只能是 `{name:"generated.mp4",sha256,size}`。`result_url` 明确禁止落状态文件。
 
 ### start / inspect / resume / retry
 
@@ -296,9 +296,9 @@ Context IR 就绪后，严格使用已冻结的 request id 推进 H3：
 - `h3.resume(request)`：获取会话 flock 后 GET-only 推进已有任务；`allow_submit=false`，不创建供应商任务。
 - `h3.retry(request,new_id)`：底层显式创建新 attempt；runtime 只在公开 generation 已确定为 `failed` 且用户提交新 id 时调用。`resume_required` 调 `start` 续同 attempt，`submission_unknown` 不调用。
 
-供应商顺序固定：上传 1–9 张冻结帧 → `POST /v2/h3_context_ir` → GET 查询并精确验证 optimized prompt 台词 → `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写 `generated.mp4`。
+供应商顺序固定：上传 1–9 张冻结帧 → `POST /v2/h3_context_ir` → GET 查询并保存 optimized prompt → 用户确认 → `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写 `generated.mp4`。
 
-IR 台词门禁：标签少、多、改写、乱序、只有裸文本而无标签或标签残缺均为 `ir_dialogue_mismatch`，H3 POST 不会发生；冻结台词为空时必须没有 `<d>`，并额外拒绝新增台词、角色/旁白发声和 OCR/字幕朗读语义。
+IR 台词门禁已删除：服务端不比较 `<d>` 内容与冻结台词，也不检查标签结构或额外发声；用户确认的 IR 正文直接进入 H3。
 
 输出下载门禁：只接受无 userinfo 的 HTTPS；hostname/IP 预解析必须全为公网地址，私网、loopback、local、reserved、multicast 均确定拒绝。owned httpx client 使用 `trust_env=false`；响应后在读取 status/body 前通过 `extensions.network_stream.get_extra_info("server_addr")` 验证实际 socket peer 也是公网地址。实际 peer 为私网仍是 `download_url_rejected`；DNS 临时失败为 `download_dns_failed`，缺失/异常/非 IP peer 为 `download_peer_unverified`，后二者同 id 恢复。
 

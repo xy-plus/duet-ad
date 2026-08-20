@@ -31,7 +31,7 @@ links: [conversation-task, submit-gate]
 - 相同请求 id 在 active/succeeded 状态只返回既有状态；确定失败后复用旧 id 返回 409；`submission_unknown` 使用任何 id 都返回 409 `submission_outcome_unknown`。
 - active 或 succeeded 会话不接受不同 id 的并发提交。
 - 没有自动付费重试、定时重试或 Seedance 回退。
-- `ir_dialogue_mismatch` 是确定失败：Context IR 的严格小写 `<d>` 标签序列在去掉可选语言前缀后，必须与冻结台词数量、顺序、文本全等；空台词也禁止新增角色发声或 OCR 朗读。
+- 新 attempt 不再产生 `ir_dialogue_mismatch`；历史 attempt 若已有该错误，仍按确定失败展示并允许用户用新请求重试。
 - `.h3/session.lock` 防止同一会话被并发推进；生产仍要求单 uvicorn 进程。
 
 ## 例子

@@ -22,7 +22,7 @@ links: []
 
 - [x] 新会话使用 schema v2；无音轨视频合法，自动台词为空也能继续
 - [x] 自动台词只来自 ASR，声学分类为 `spoken` 或 `sung` 的句子都可保留；OCR、字幕、画面文字和备注绝不成为台词
-- [x] Context IR 台词与冻结台词逐条精确一致才允许进入 H3；少、多、改写、乱序或 OCR 衍生发声均失败关闭
+- [x] Context IR 以用户可见、可编辑的正文为准；不校验 `<d>` 台词内容或结构，用户确认后直接进入 H3
 - [x] 生成前可选 `auto/edit/custom/none`；非 9:16 必须人工选择居中裁切或黑边留边
 - [x] 界面展示实际时长；10–15 秒仍可提交但显示稳定性 warning，引擎时长按实际时长向上取整
 - [x] 提交冻结版本化 receipt，随后异步执行 Context IR → H3，并持续显示 `queued/running/resume_required/succeeded/failed/submission_unknown`

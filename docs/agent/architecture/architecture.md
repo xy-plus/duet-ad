@@ -74,8 +74,8 @@ flowchart LR
 - `auto` 只接受内部 ASR provenance；默认声学过滤同时保留 `spoken` 与 `sung`。`edit/custom` 只接受用户提交的结构化行；`none` 必须为空。
 - `prompt.txt` 由视觉文本和唯一结构化发声块机械组合。无台词时明确禁止角色说出画面文字。
 - ASR 输出中的 `[无法辨识]`、`[inaudible]`、`[unintelligible]` 等哨兵文本不是业务台词：净化为“本次未得到转写”，复用有声学人声证据时的一次重试；任何哨兵不得进入 `voice_lines.json`、prepared receipt 或 H3 prompt。
-- Context IR 与 H3 是两个用户可见、可独立推进的阶段。第一次 POST 只创建/恢复 IR attempt，并在 `ready_for_h3` 停止；IR 原文必须可读取。用户可用 `expected_sha256` 原子替换有效 IR prompt；H3 POST 仅在同一冻结输入、IR 已就绪且当前正文通过结构化台词校验时发生。
-- Context IR 结果中的全部严格小写 `<d>...</d>` 标签在去掉每段可选 `[Language]` 前缀后，必须与冻结 `voice_texts` 在数量、顺序和文本上全等。少、多、改写、乱序、无标签或残缺标签均在 H3 POST 前失败；空台词时还会拒绝新增台词、角色发声和 OCR 朗读语义。
+- Context IR 与 H3 是两个用户可见、可独立推进的阶段。第一次 POST 只创建/恢复 IR attempt，并在 `ready_for_h3` 停止；IR 原文必须可读取。用户可用 `expected_sha256` 原子替换非空、限长的 IR prompt；H3 POST 仅在同一冻结输入、IR 已就绪且用户明确确认后发生。
+- Context IR 正文是 H3 prompt 的最终权威，不再与冻结 `voice_texts` 比较，也不对 `<d>` 内容或结构设置额外门禁。
 - `duration_s` 以实际浮点数写 receipt；Context IR/H3 的请求时长为 `ceil(duration_s)`，范围 1–15。
 - `fit_required` 只在 pipeline `done` 时按实际选中的每张关键帧计算，不持久化源视频宽高作为第二真相。只有全部关键帧都是 9:16 才允许 `none`，任一非 9:16 就必须人工选 `crop` 或 `pad`；即使源视频是 9:16，裁过的关键帧也不能绕过。两种策略都不缩放帧，只做居中裁切或居中黑边扩画布。
 - H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/{crop|pad}/`；永不读取 `postprocessed/`。

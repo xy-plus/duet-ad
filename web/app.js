@@ -111,7 +111,7 @@ function buildSubmitPayload(input) {
     throw new Error("请选择台词模式");
   }
   if (input.dialogueCorrectionRequired === true && dialogueMode === "auto") {
-    throw new Error("Context IR 台词不匹配，请编辑、自定义或选择无台词");
+    throw new Error("Context IR 台词标签或发声结构无效，请编辑、自定义或选择无台词");
   }
   const requestId = String(input.clientRequestId || "").trim();
   if (!requestId) throw new Error("缺少本次生成请求标识");
@@ -809,10 +809,8 @@ function renderContextIRReview(detail, card) {
     textarea.value = value.prompt;
     textarea.disabled = false;
     saveButton.disabled = true;
-    generateButton.disabled = !value.dialogue_valid;
-    status.textContent = value.dialogue_valid
-      ? "IR 已完成且台词一致；可直接生成，也可修改后保存。"
-      : "IR 中的台词与当前台词不一致；请修改提示词中的 <d> 台词并保存。";
+    generateButton.disabled = false;
+    status.textContent = "IR 已完成；可直接生成，也可修改后保存。";
   }).catch((error) => {
     if (handleAuthError(error)) return;
     status.textContent = "Context IR 加载失败：" + error.message;
