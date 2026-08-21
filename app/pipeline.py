@@ -53,6 +53,7 @@ MAX_PROMPT_BYTES = 32 * 1024
 SCENES_TIMEOUT_S = 300  # scenes.py 场景检测超时（长视频 PySceneDetect 较慢）
 CUT_DURATION_TOLERANCE_S = 0.1  # 切段时长允许误差（秒）
 SCENE_BOUNDARY_ROUNDING_TOLERANCE_S = 0.001  # scenes.json 仅保留毫秒
+_FLOAT_COMPARISON_EPS_S = 1e-12
 NO_BGM_LINE = "不要生成背景音乐"  # 多段模式由后端机械加进 prompt 首行（不依赖 codex 写）
 _SEG_TAIL_EPS_S = 0.01  # 台词 start_s 超出末段终点 ≤0.01s（与 voice 校验容差同口径）→ 归末段
 # YAMNet 量化步长为 1/256；0.2 相邻下档 51/256 是线下真实 sung 样本。
@@ -694,9 +695,10 @@ def _scene_bounds_for_long_plan(work: Path, duration_s: float) -> list[dict]:
     # scenes.py serializes boundaries to milliseconds, while upload ffprobe
     # preserves finer precision.  The source duration remains authoritative;
     # only the two outer boundaries may absorb that bounded serialization loss.
-    if abs(bounds[0]["start_s"]) <= SCENE_BOUNDARY_ROUNDING_TOLERANCE_S:
+    tolerance = SCENE_BOUNDARY_ROUNDING_TOLERANCE_S + _FLOAT_COMPARISON_EPS_S
+    if abs(bounds[0]["start_s"]) <= tolerance:
         bounds[0]["start_s"] = 0.0
-    if abs(bounds[-1]["end_s"] - duration_s) <= SCENE_BOUNDARY_ROUNDING_TOLERANCE_S:
+    if abs(bounds[-1]["end_s"] - duration_s) <= tolerance:
         bounds[-1]["end_s"] = duration_s
     return bounds
 

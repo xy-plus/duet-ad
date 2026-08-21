@@ -78,6 +78,33 @@ def test_long_scene_bounds_normalize_detector_millisecond_rounding(tmp_path):
     ]
 
 
+def test_long_scene_bounds_include_the_one_millisecond_limit(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "scenes.json").write_text(
+        json.dumps({"scenes": [{"start_s": 0.0, "end_s": 36.733}]}),
+        encoding="utf-8",
+    )
+
+    assert pipeline._scene_bounds_for_long_plan(work, 36.734) == [
+        {"start_s": 0.0, "end_s": 36.734}
+    ]
+
+
+def test_long_scene_bounds_reject_just_over_one_millisecond(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "scenes.json").write_text(
+        json.dumps({"scenes": [{"start_s": 0.0, "end_s": 36.733}]}),
+        encoding="utf-8",
+    )
+
+    bounds = pipeline._scene_bounds_for_long_plan(work, 36.734001)
+    with pytest.raises(long_video.LongVideoError) as caught:
+        long_video.plan_segments(36.734001, bounds, [])
+    assert caught.value.code == "long_video_invalid_scenes"
+
+
 def test_long_scene_bounds_do_not_hide_a_real_terminal_gap(tmp_path):
     work = tmp_path / "work"
     work.mkdir()
