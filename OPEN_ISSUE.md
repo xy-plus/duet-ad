@@ -8,8 +8,6 @@
 
 ## 🚧 进行中
 
-- 长视频 H3 生成：支持最长 300 秒输入，单段 ≤15 秒 FL2VA 连续生成并拼接；完成代码、文档、全量测试、生产部署及 10/15/30 秒真实 E2E。（→ `.worktree/long-plan/`, `.worktree/h3-fl2va/`, `.worktree/stitch/`）
-
 ## 📌 待办与限制
 
 - H3 只能做高相似复刻，不能保证逐像素、逐帧、文字、原音或节奏一致；若目标升级为“一模一样”，需重新定义输入契约、模型与验收指标。（→ `temp/09-restore-h3-no-face/`, `docs/human/features/conversation-task/`）
