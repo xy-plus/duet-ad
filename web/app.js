@@ -170,11 +170,36 @@ function buildSubmitPayload(input) {
   return body;
 }
 
-function generationAction(status) {
+function generationAction(status, stage) {
   if (status === null || status === undefined) return "new";
-  if (status === "failed") return "retry";
+  if (status === "failed") return stage === "stitch" ? "retry_stitch" : "retry";
   if (status === "resume_required") return "resume";
   return "none";
+}
+
+function generationRetryContract(detail) {
+  const generation = detail && detail.generation;
+  const action = generationAction(
+    generation && generation.status,
+    generation && generation.stage,
+  );
+  const longContract = longVideoContract(detail);
+  if (!longContract.isLong) {
+    return { action, paidTaskCount: action === "new" || action === "retry" ? 1 : 0 };
+  }
+  if (action === "new") return { action, paidTaskCount: longContract.segmentCount };
+  if (action === "retry_stitch" || action === "none" || action === "resume") {
+    return { action, paidTaskCount: 0 };
+  }
+  const segments = Array.isArray(generation && generation.segments)
+    ? generation.segments : [];
+  if (segments.length !== longContract.segmentCount) {
+    return { action, paidTaskCount: null };
+  }
+  return {
+    action,
+    paidTaskCount: segments.filter((segment) => segment && segment.status !== "succeeded").length,
+  };
 }
 
 function buildResumePayload(detail) {
@@ -208,6 +233,46 @@ function buildResumePayload(detail) {
     body.lines = dialogue.lines;
   }
   return body;
+}
+
+function buildStitchRetryPayload(detail) {
+  const generation = detail && detail.generation;
+  if (!generation || generationAction(generation.status, generation.stage) !== "retry_stitch") {
+    throw new Error("当前任务无需重试拼接");
+  }
+  const requestId = generation.client_request_id;
+  const dialogue = detail && detail.dialogue;
+  const longContract = longVideoContract(detail);
+  if (!longContract.isLong || !longContract.ready) throw new Error("长视频生成计划尚未就绪，请刷新后重试");
+  if (typeof requestId !== "string" || !requestId.trim()) throw new Error("缺少既有任务请求标识");
+  if (!dialogue || !["auto", "none"].includes(dialogue.mode)) throw new Error("既有任务台词模式无效");
+  if (!["none", "crop", "pad"].includes(detail.fit_mode)) throw new Error("既有任务画幅模式无效");
+  return {
+    confirm: true,
+    client_request_id: requestId,
+    dialogue_mode: dialogue.mode,
+    fit_mode: detail.fit_mode,
+    expected_plan_receipt: longContract.planReceipt,
+  };
+}
+
+function buildLongRetryPayload(detail, clientRequestId) {
+  const generation = detail && detail.generation;
+  const dialogue = detail && detail.dialogue;
+  const longContract = longVideoContract(detail);
+  if (!generation || generationAction(generation.status, generation.stage) !== "retry") {
+    throw new Error("当前任务无需重试生成");
+  }
+  if (!longContract.isLong || !longContract.ready) throw new Error("长视频生成计划尚未就绪，请刷新后重试");
+  if (!dialogue || !["auto", "none"].includes(dialogue.mode)) throw new Error("既有任务台词模式无效");
+  return buildSubmitPayload({
+    clientRequestId,
+    dialogueMode: dialogue.mode,
+    fitRequired: detail.fit_required === true,
+    fitMode: detail.fit_mode,
+    isLong: true,
+    planReceipt: longContract.planReceipt,
+  });
 }
 
 function fmtTime(iso) {
@@ -639,23 +704,29 @@ function setGenerationCardBusy(card, busy) {
 
 async function submitGeneration(detail, card) {
   const generation = detail.generation || {};
-  const action = generationAction(generation.status);
+  const action = generationAction(generation.status, generation.stage);
   if (!canOperate(detail) || state.generationSubmitting[detail.id]
-      || (action !== "new" && action !== "retry")) return;
+      || !["new", "retry", "retry_stitch"].includes(action)) return;
   const draft = generationDraft(detail);
   const longContract = longVideoContract(detail);
   const errorBox = card.querySelector(".generation-form-error");
   let body;
   try {
-    body = buildSubmitPayload({
-      clientRequestId: newRequestId(),
-      dialogueMode: draft.dialogueMode,
-      linesText: draft.dialogueMode === "edit" ? draft.editLinesText : draft.customLinesText,
-      fitRequired: detail.fit_required === true,
-      fitMode: draft.fitMode,
-      isLong: longContract.isLong,
-      planReceipt: longContract.planReceipt,
-    });
+    if (action === "retry_stitch") {
+      body = buildStitchRetryPayload(detail);
+    } else if (longContract.isLong && action === "retry") {
+      body = buildLongRetryPayload(detail, newRequestId());
+    } else {
+      body = buildSubmitPayload({
+        clientRequestId: newRequestId(),
+        dialogueMode: draft.dialogueMode,
+        linesText: draft.dialogueMode === "edit" ? draft.editLinesText : draft.customLinesText,
+        fitRequired: detail.fit_required === true,
+        fitMode: draft.fitMode,
+        isLong: longContract.isLong,
+        planReceipt: longContract.planReceipt,
+      });
+    }
   } catch (error) {
     errorBox.textContent = error.message;
     errorBox.hidden = false;
@@ -667,6 +738,7 @@ async function submitGeneration(detail, card) {
 
 function generationStageText(stage) {
   if (stage === "h3") return "H3 子任务生成";
+  if (stage === "stitch") return "视频拼接";
   if (stage === "stitching") return "视频拼接";
   return stage ? String(stage) : "等待开始";
 }
@@ -757,7 +829,9 @@ async function postGeneration(
       setGenerationCardBusy(card, false);
       const button = card.querySelector(".generation-submit");
       if (button) {
-        button.textContent = "生成最终视频";
+        const action = generationAction(generation.status, generation.stage);
+        button.textContent = action === "retry_stitch" ? "重试拼接"
+          : action === "retry" ? "重试生成" : "生成最终视频";
       }
     }
   }
@@ -783,7 +857,9 @@ function renderFinalSection(detail) {
     card.appendChild(status);
   } else if (generation.status === "failed" || generation.status === "submission_unknown") {
     const status = el("div", "generation-status is-error");
-    status.appendChild(el("strong", null, generation.status === "submission_unknown" ? "提交结果未知" : "H3 生成失败"));
+    const failedTitle = generation.stage === "stitch" ? "视频拼接失败" : "H3 生成失败";
+    status.appendChild(el("strong", null,
+      generation.status === "submission_unknown" ? "提交结果未知" : failedTitle));
     const errorText = generation.error || "后端未返回具体原因";
     status.appendChild(el("span", null, errorText));
     card.appendChild(status);
@@ -813,14 +889,28 @@ function renderFinalSection(detail) {
     return sec;
   }
 
-  if (longContract.isLong) {
+  const retryContract = generationRetryContract(detail);
+  if (longContract.isLong && retryContract.action === "retry"
+      && retryContract.paidTaskCount === null) {
+    card.appendChild(el("p", "final-warning", "分段冻结状态不完整，无法安全计算本次付费子任务数，请刷新后重试"));
+    sec.appendChild(card);
+    return sec;
+  }
+
+  if (longContract.isLong && ["new", "retry", "retry_stitch"].includes(retryContract.action)) {
     const notice = el("div", "long-video-notice");
-    notice.appendChild(el("strong", null, "将创建 " + longContract.segmentCount + " 个 H3 子任务"));
-    notice.appendChild(el("p", null, "跨段连续性为 best effort；失败时只重做失败段。"));
+    notice.appendChild(el("strong", null,
+      "本次新增 " + retryContract.paidTaskCount + " 个付费 H3 子任务"));
+    const noticeText = retryContract.action === "retry_stitch"
+      ? "全部分段成片已复用，本次只在本地重试拼接。"
+      : retryContract.action === "retry"
+        ? "跨段连续性为 best effort；成功段复用，失败时只重做失败段及同链下游。"
+        : "跨段连续性为 best effort；首次生成覆盖全部逐段冻结输入。";
+    notice.appendChild(el("p", null, noticeText));
     card.appendChild(notice);
   }
 
-  if (generationAction(generation.status) === "resume") {
+  if (generationAction(generation.status, generation.stage) === "resume") {
     const locked = el("div", "resume-lock");
     locked.appendChild(el("strong", null, "继续既有 H3 任务"));
     locked.appendChild(el("p", null,
@@ -837,6 +927,34 @@ function renderFinalSection(detail) {
     });
     row.appendChild(button);
     row.appendChild(el("p", "final-caption", "继续原任务，不创建新的 H3 attempt。"));
+    card.appendChild(row);
+    if (state.generationSubmitting[detail.id]) setGenerationCardBusy(card, true);
+    sec.appendChild(card);
+    return sec;
+  }
+
+
+  if (longContract.isLong && (retryContract.action === "retry"
+      || retryContract.action === "retry_stitch")) {
+    const stitchOnly = retryContract.action === "retry_stitch";
+    const locked = el("div", "resume-lock");
+    locked.appendChild(el("strong", null, stitchOnly ? "重试本地拼接" : "重试失败的 H3 分段"));
+    locked.appendChild(el("p", null, stitchOnly
+      ? "复用原请求标识和全部成功分段，不创建新的付费 H3 子任务。"
+      : "使用新的请求标识和逐段冻结输入；成功段复用，只重做失败段及同链下游。"));
+    card.appendChild(locked);
+    const errorBox = el("p", "form-error generation-form-error");
+    errorBox.hidden = true;
+    card.appendChild(errorBox);
+    const row = el("div", "final-row");
+    const label = stitchOnly ? "重试拼接" : "重试生成";
+    const button = el("button", "btn btn-primary generation-submit", label);
+    button.type = "button";
+    button.addEventListener("click", () => submitGeneration(detail, card));
+    row.appendChild(button);
+    row.appendChild(el("p", "final-caption", stitchOnly
+      ? "本次新增 0 个付费 H3 子任务。"
+      : "本次新增 " + retryContract.paidTaskCount + " 个付费 H3 子任务。"));
     card.appendChild(row);
     if (state.generationSubmitting[detail.id]) setGenerationCardBusy(card, true);
     sec.appendChild(card);
@@ -921,7 +1039,8 @@ function renderFinalSection(detail) {
   errorBox.hidden = true;
   card.appendChild(errorBox);
   const row = el("div", "final-row");
-  const button = el("button", "btn btn-primary generation-submit", "生成最终视频");
+  const buttonLabel = generation.status === "failed" ? "重试生成" : "生成最终视频";
+  const button = el("button", "btn btn-primary generation-submit", buttonLabel);
   button.type = "button";
   button.addEventListener("click", () => submitGeneration(detail, card));
   row.appendChild(button);
@@ -1105,7 +1224,7 @@ function renderSegments(detail) {
       card.appendChild(kfGrid(detail, names, "segments/" + n + "/work/keyframes", "第 " + n + " 段关键帧 "));
     }
     if (seg.prompt) {
-      card.appendChild(el("h4", "res-sub", "H3 提示词"));
+      card.appendChild(el("h4", "res-sub", "本段冻结的 H3 提示词"));
       card.appendChild(promptCard(seg.prompt));
     }
     if (Array.isArray(seg.lines) && seg.lines.length) {
@@ -1868,6 +1987,8 @@ function boot() {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    buildLongRetryPayload,
+    buildStitchRetryPayload,
     buildResumePayload,
     buildSubmitPayload,
     apiErrorFromPayload,
@@ -1876,6 +1997,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatDialogueLines,
     generationDraft,
     generationAction,
+    generationRetryContract,
     generationSegmentLabel,
     longVideoContract,
     normalizeDialogueLines,

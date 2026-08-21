@@ -145,6 +145,15 @@ def test_generation_actions_never_retry_unknown_or_active_statuses():
     assert result == ["retry", "resume", "none", "none", "none", "none", "new"]
 
 
+def test_failed_stitch_has_distinct_non_paid_retry_action():
+    result = _run_contract(
+        "[contract.generationAction('failed','h3'),"
+        "contract.generationAction('failed','stitch'),"
+        "contract.generationAction('submission_unknown','stitch')]"
+    )
+    assert result == ["retry", "retry_stitch", "none"]
+
+
 def test_resume_ui_is_locked_and_explicit_about_cost():
     source = APP_JS.read_text(encoding="utf-8")
     assert "继续既有 H3 任务" in source

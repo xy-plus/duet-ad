@@ -189,13 +189,13 @@ multipart 字段：
 | 409 | `prepared_input_invalid` / `frame_fit_failed` | 冻结输入或画幅派生失败 |
 | 409 | `long_video_plan_changed` / `long_video_plan_invalid` | 长链 CAS 不匹配或 plan/文件绑定无效 |
 | 409 | `generation in progress` / `already submitted` | active/succeeded 使用不同 id |
-| 409 | `new client_request_id required` | 确定 failed 后复用旧 id |
+| 409 | `new client_request_id required` | H3 阶段确定 failed 后复用旧 id；长链 `stage=stitch` 除外 |
 | 409 | `resume_request_id_mismatch` | resume_required 没有使用原 client_request_id |
 | 409 | `resume_parameters_changed` | resume_required 的 mode、归一化 lines 或 fit 与冻结值不一致 |
 | 409 | `submission_outcome_unknown` | 既有 generation 为 submission_unknown；任意 id 均拒绝 |
 | 409 | `generation_state_invalid` | 已持久化 generation status/attempt 不满足安全状态形状 |
 
-相同 id 在 `queued/running/succeeded` 时返回现有 `{status,attempt}`，不重复 POST。确定 `failed` 只有新 id 才进入人工 retry。
+相同 id 在 `queued/running/succeeded` 时返回现有 `{status,attempt}`，不重复 POST。确定 `failed` 的短链或长链 H3 阶段只有新 id 才进入人工 retry。长链 retry 从冻结的 `generation.segments` 复用仍有成片的 `succeeded` 段，把其余失败段和同链尚未生成的下游段重置为待生成；前端据此显示本次实际新增的付费 H3 子任务数。若长链为 `failed + stage=stitch`，必须复用原 `client_request_id` 和冻结参数，只重新执行本地拼接，attempt 不递增且新增付费 H3 子任务数为 0。
 
 旧 Context IR 契约下未完成的 generation 对外固定映射为 `failed / generation_path_removed`；历史成片保持可读。用户用新 id 重试时重写为当前直接 H3 receipt，不再恢复或查询 MiniMax task。
 
@@ -322,7 +322,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 - `h3.start(request)`：同 client id 幂等；新 attempt 允许一次 H3 POST，已有 attempt 只按已知状态推进。
 - `h3.inspect(request)`：纯读，不写、不联网；验证 session/attempt receipts。
 - `h3.resume(request)`：获取会话 flock 后 GET-only 推进已有任务；`allow_submit=false`，不创建供应商任务。
-- `h3.retry(request,new_id)`：底层显式创建新 attempt；runtime 只在公开 generation 已确定为 `failed` 且用户提交新 id 时调用。`resume_required` 调 `start` 续同 attempt，`submission_unknown` 不调用。
+- `h3.retry(request,new_id)`：底层显式创建新 attempt；短链 runtime 只在公开 generation 已确定为 `failed` 且用户提交新 id 时调用。长链 H3 阶段确定失败同样要求新父 id，只重做未成功段；`stage=stitch` 失败复用原父 id，且只运行本地拼接。`resume_required` 调 `start` 续同 attempt，`submission_unknown` 不调用。
 
 短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。长链每段使用 `minimax_h3_lightx2v`，只传冻结的 `first_frame/last_frame/prompt/duration/resolution`，输出到该段 `generated.mp4`；不是供应商原生 extend。
 
