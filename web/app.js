@@ -188,17 +188,15 @@ function generationRetryContract(detail) {
     return { action, paidTaskCount: action === "new" || action === "retry" ? 1 : 0 };
   }
   if (action === "new") return { action, paidTaskCount: longContract.segmentCount };
-  if (action === "retry_stitch" || action === "none" || action === "resume") {
+  if (action === "none" || action === "resume") {
     return { action, paidTaskCount: 0 };
   }
-  const segments = Array.isArray(generation && generation.segments)
-    ? generation.segments : [];
-  if (segments.length !== longContract.segmentCount) {
-    return { action, paidTaskCount: null };
-  }
+  const serverCount = generation && generation.retry_paid_segment_count;
+  const validServerCount = Number.isInteger(serverCount)
+    && serverCount >= 0 && serverCount <= longContract.segmentCount;
   return {
     action,
-    paidTaskCount: segments.filter((segment) => segment && segment.status !== "succeeded").length,
+    paidTaskCount: validServerCount ? serverCount : null,
   };
 }
 
@@ -840,11 +838,16 @@ async function postGeneration(
 /* 最终视频区：H3 生成参数、异步状态、失败后的显式重试和历史成片都在同一卡片。 */
 function renderFinalSection(detail) {
   const generation = detail.generation || { status: null, error: null, attempt: null };
-  if (detail.has_video) {
-    return videoSection(detail, "generated.mp4", "最终视频", "H3 生成成片");
+  const showPublishedVideo = detail.has_video === true;
+  const showStitchRecovery = generation.status === "failed" && generation.stage === "stitch";
+  const published = document.createDocumentFragment();
+  if (showPublishedVideo) {
+    published.appendChild(videoSection(detail, "generated.mp4", "最终视频", "H3 生成成片"));
   }
+  if (showPublishedVideo && !showStitchRecovery) return published;
 
   const sec = el("section", "res-section");
+  published.appendChild(sec);
   const card = el("div", "final-card");
   card.appendChild(el("h3", "res-h3", "最终视频 · H3"));
   appendGenerationProgress(card, generation);
@@ -873,28 +876,28 @@ function renderFinalSection(detail) {
   if (generation.status === "submission_unknown") {
     card.appendChild(el("p", "final-caption", "提交结果未知，禁止重复提交；请先在 provider 侧核对任务。"));
     sec.appendChild(card);
-    return sec;
+    return published;
   }
 
   if (!canOperate(detail)) {
     card.appendChild(el("p", "final-caption", "此会话为只读状态，不能修改台词、画幅、后处理或再次生成。"));
     sec.appendChild(card);
-    return sec;
+    return published;
   }
 
   const longContract = longVideoContract(detail);
   if (longContract.isLong && !longContract.ready) {
     card.appendChild(el("p", "final-warning", "长视频生成计划尚未就绪，请刷新后重试"));
     sec.appendChild(card);
-    return sec;
+    return published;
   }
 
   const retryContract = generationRetryContract(detail);
-  if (longContract.isLong && retryContract.action === "retry"
+  if (longContract.isLong && ["retry", "retry_stitch"].includes(retryContract.action)
       && retryContract.paidTaskCount === null) {
     card.appendChild(el("p", "final-warning", "分段冻结状态不完整，无法安全计算本次付费子任务数，请刷新后重试"));
     sec.appendChild(card);
-    return sec;
+    return published;
   }
 
   if (longContract.isLong && ["new", "retry", "retry_stitch"].includes(retryContract.action)) {
@@ -930,7 +933,7 @@ function renderFinalSection(detail) {
     card.appendChild(row);
     if (state.generationSubmitting[detail.id]) setGenerationCardBusy(card, true);
     sec.appendChild(card);
-    return sec;
+    return published;
   }
 
 
@@ -958,7 +961,7 @@ function renderFinalSection(detail) {
     card.appendChild(row);
     if (state.generationSubmitting[detail.id]) setGenerationCardBusy(card, true);
     sec.appendChild(card);
-    return sec;
+    return published;
   }
 
   const draft = generationDraft(detail);
@@ -1050,7 +1053,7 @@ function renderFinalSection(detail) {
   card.appendChild(row);
   if (busy) setGenerationCardBusy(card, true);
   sec.appendChild(card);
-  return sec;
+  return published;
 }
 
 /* 关键帧网格：blob 化加载 + 点击放大灯箱（单段/多段/优化后共用；pathPrefix 即 files 白名单路径） */
@@ -1224,7 +1227,7 @@ function renderSegments(detail) {
       card.appendChild(kfGrid(detail, names, "segments/" + n + "/work/keyframes", "第 " + n + " 段关键帧 "));
     }
     if (seg.prompt) {
-      card.appendChild(el("h4", "res-sub", "本段冻结的 H3 提示词"));
+      card.appendChild(el("h4", "res-sub", "逐段冻结的 H3 提示词"));
       card.appendChild(promptCard(seg.prompt));
     }
     if (Array.isArray(seg.lines) && seg.lines.length) {

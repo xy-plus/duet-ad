@@ -358,7 +358,6 @@ def test_stitch_receipt_publish_failure_can_rebuild_over_existing_output_without
         kwargs["output"].write_bytes(b"complete-local-output")
         if len(stitch_attempts) == 1:
             raise OSError("injected receipt publish failure")
-        kwargs["receipt_path"].write_text("{}", encoding="utf-8")
 
     monkeypatch.setattr(h3, "start", start)
     monkeypatch.setattr(long_generation.stitch, "stitch_video", publish_then_fail_once)
@@ -376,6 +375,42 @@ def test_stitch_receipt_publish_failure_can_rebuild_over_existing_output_without
     assert retried.status_code == 202
     assert len(stitch_attempts) == 2
     assert len(posts) == 1
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+
+
+def test_detail_retry_paid_count_uses_segment_files_and_stitch_is_free(
+    enabled,
+):
+    settings, client = enabled
+    cid, _receipt = _make_long(settings, joins=("hard_cut", "hard_cut"))
+    root = settings.data_dir / cid
+    generation = {
+        "status": "failed",
+        "error": "long_video_segment_failed",
+        "attempt": 1,
+        "client_request_id": "parent-request-123",
+        "stage": "h3",
+        "segments": [
+            {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut",
+             "status": "succeeded", "attempt": 1, "error": None},
+            {"index": 2, "chain_id": "chain-002", "join_mode": "hard_cut",
+             "status": "succeeded", "attempt": 1, "error": None},
+        ],
+    }
+    (root / "work" / "segments" / "2" / "generated.mp4").write_bytes(b"segment")
+    storage.update_meta(settings.data_dir, cid, generation=generation)
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert detail["generation"]["retry_paid_segment_count"] == 1
+    assert all("path" not in item and "task_id" not in item
+               for item in detail["generation"]["segments"])
+
+    generation.update(stage="stitch", error="long_video_stitch_failed")
+    (root / "generated.mp4").write_bytes(b"previous-published-video")
+    storage.update_meta(settings.data_dir, cid, generation=generation)
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert detail["has_video"] is True
+    assert detail["generation"]["retry_paid_segment_count"] == 0
 
 
 def test_startup_recovery_only_resumes_attempted_segments(tmp_path, monkeypatch):

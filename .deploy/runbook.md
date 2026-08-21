@@ -245,10 +245,10 @@ done
 
 ## 7. 失败时 fix-forward
 
-1. 停止重复点击和重复 smoke；保留 cid、`prepared_input.json`、`.h3/` 和 `meta.json`。
+1. 停止重复点击和重复 smoke；保留 cid、`prepared_input.json`、`long_video_plan.json`、`.h3/` 和 `meta.json`。
 2. 用 detail API 或 journal 确认是输入准备、凭据、H3 查询/下载还是公开反代问题；不要打印环境。
 3. 修复当前 H3 代码/配置，重新运行相关测试和全量测试。
 4. 再次 `daemon-reload`（unit 有改动时）并原地 `restart`，重复本地和公网 `/health`。
-5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；H3 阶段确定 `failed` 才点“重试生成”，使用新 id，并以 UI 从冻结分段状态计算的数量为本次新增付费任务数（成功段复用，失败段及同链下游重做）。长链 `failed + stage=stitch` 点“重试拼接”，必须用原 id，只本地重拼且新增付费任务为 0。`submission_unknown` 不得继续或重试，先到 AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
+5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；H3 阶段确定 `failed` 才点“重试生成”，使用新 id，并以 detail API 的服务端 `generation.retry_paid_segment_count` 为本次新增付费任务数（状态成功但分段成片缺失也会计入）。长链 `failed + stage=stitch` 点“重试拼接”，必须用原 id，只本地重拼且新增付费任务为 0；半发布成片不会隐藏恢复入口。`submission_unknown` 不得继续或重试，先到 AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
 
 禁止以 Seedance 代码、旧 unit 或旧提交开关回退；它们不再属于生产契约。若 H3 仍不可用，保持服务可读、关闭 `ENABLE_H3_SUBMIT`，修复后再开启。

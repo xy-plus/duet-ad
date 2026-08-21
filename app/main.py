@@ -134,7 +134,7 @@ def _public_dialogue(meta: dict) -> dict:
     return {"mode": mode, "lines": effective, "auto_lines": automatic}
 
 
-def _public_generation(meta: dict) -> dict | None:
+def _public_generation(meta: dict, cdir: Path) -> dict | None:
     generation = meta.get("generation")
     if not isinstance(generation, dict):
         return None
@@ -153,6 +153,24 @@ def _public_generation(meta: dict) -> dict | None:
     }
     if isinstance(generation.get("segments"), list):
         public["segments"] = long_generation.public_segments(generation)
+        if _is_long_video(meta) and status == "failed":
+            if public["stage"] == "stitch":
+                public["retry_paid_segment_count"] = 0
+            else:
+                # A persisted success is reusable only while its paid artifact exists.
+                # Invalid/misaligned entries fail closed by counting as a new task.
+                public["retry_paid_segment_count"] = sum(
+                    1
+                    for position, segment in enumerate(generation["segments"], 1)
+                    if not (
+                        isinstance(segment, dict)
+                        and segment.get("index") == position
+                        and segment.get("status") == "succeeded"
+                        and (
+                            cdir / "work" / "segments" / str(position) / "generated.mp4"
+                        ).is_file()
+                    )
+                )
     return public
 
 
@@ -899,7 +917,7 @@ def create_app(settings: Settings) -> FastAPI:
             "fit_mode": meta.get("fit_mode"),
             "dialogue": _public_dialogue(meta),
             "receipt_version": _receipt_version(cdir, meta),
-            "generation": _public_generation(meta),
+            "generation": _public_generation(meta, cdir),
             "has_source": any(cdir.glob("source.*")),
             "has_video": (cdir / "generated.mp4").is_file(),
             "submit_enabled": settings.enable_h3_submit,
