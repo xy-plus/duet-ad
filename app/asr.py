@@ -15,7 +15,12 @@ from pathlib import Path
 
 
 class ASRError(RuntimeError):
-    pass
+    _RETRYABLE_CODES = {"asr_timeout", "asr_failed", "asr_output_invalid"}
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+        self.retryable = code in self._RETRYABLE_CODES
 
 
 def _lines_from_json(payload: object, duration_s: float) -> list[dict]:

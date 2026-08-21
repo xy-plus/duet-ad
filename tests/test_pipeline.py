@@ -255,8 +255,9 @@ class TestCodexRunner:
             raise subprocess.TimeoutExpired(cmd=argv, timeout=kw["timeout"])
 
         monkeypatch.setattr(codex_runner.subprocess, "run", slow)
-        with pytest.raises(CodexError, match="timed out"):
+        with pytest.raises(CodexError, match="timed out") as caught:
             CodexRunner(timeout_s=7, concurrency=1).run(Path("/wd"), "p")
+        assert caught.value.retryable is True
 
     def test_nonzero_stderr_scrubbed(self, monkeypatch):
         stderr = (
@@ -270,14 +271,16 @@ class TestCodexRunner:
         assert "real codex failure" in msg
         assert "abc123" not in msg and "AWS_SECRET_ACCESS_KEY" not in msg
         assert len(msg) <= 560
+        assert exc_info.value.retryable is True
 
     def test_missing_codex_binary(self, monkeypatch):
         def nope(argv, **kw):
             raise FileNotFoundError(2, "No such file or directory", argv[0])
 
         monkeypatch.setattr(codex_runner.subprocess, "run", nope)
-        with pytest.raises(CodexError, match="codex"):
+        with pytest.raises(CodexError, match="codex") as caught:
             CodexRunner(timeout_s=1, concurrency=1).run(Path("/wd"), "p")
+        assert caught.value.retryable is False
 
     def test_concurrency_serialized(self, monkeypatch):
         runner = CodexRunner(timeout_s=30, concurrency=1)
@@ -562,6 +565,37 @@ def test_run_codex_timeout(tmp_path, video_1s, monkeypatch):
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
     assert "timed out" in m["error"]
+
+
+def test_run_visual_retries_invalid_output_and_transient_timeout(
+    tmp_path, video_1s, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    calls = 0
+
+    def flaky_codex(self, workdir, prompt):
+        nonlocal calls
+        calls += 1
+        work = Path(workdir) / "work"
+        assert not (work / "keyframes").exists()
+        assert not (work / "prompt.txt").exists()
+        if calls == 1:
+            (work / "keyframes").mkdir()
+            (work / "keyframes" / "stale.txt").write_text("stale")
+            return
+        if calls == 2:
+            raise CodexError("codex timed out after 600s", retryable=True)
+        _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(CodexRunner, "run", flaky_codex)
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert calls == 3
+    assert not (settings.data_dir / meta["id"] / "work" / "keyframes" / "stale.txt").exists()
 
 
 def test_run_codex_timeout_salvages_complete_output(tmp_path, video_1s, monkeypatch):
@@ -883,6 +917,10 @@ def test_run_voice_audio_longer_than_container(tmp_path, video_1s, monkeypatch):
     assert any("video duration 27.900s" in item for item in stored["voice_warnings"])
 
 
+def test_prepared_duration_has_no_project_upper_bound():
+    assert pipeline._prepared_durations({"duration_s": 3600.1}) == (3600.1, 3601)
+
+
 def test_run_voice_keep_runs_asr_and_stores_lines(tmp_path, video_1s, monkeypatch):
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
@@ -1026,6 +1064,9 @@ def test_run_voice_rewrite_prompt_has_rule_and_lines(tmp_path, video_1s, monkeyp
     meta = _make_conversation(settings, video_1s)
     _set_voice_mode(settings, meta, "rewrite")
     calls = []
+    rewritten_lines = [
+        {"text": "直接使用金刚刷。", "start_s": 0.0, "end_s": 1.0}
+    ]
 
     def fake_extract_audio(cdir_arg):
         out = cdir_arg / "work" / "voice.mp3"
@@ -1036,7 +1077,9 @@ def test_run_voice_rewrite_prompt_has_rule_and_lines(tmp_path, video_1s, monkeyp
         calls.append(prompt)
         work = Path(workdir) / "work"
         if "voice.mp3" in prompt:
-            (work / "voice_lines.json").write_text(json.dumps(VOICE_LINES), encoding="utf-8")
+            (work / "voice_lines.json").write_text(
+                json.dumps(rewritten_lines), encoding="utf-8"
+            )
         else:
             _write_valid_package(work)
 
@@ -1048,12 +1091,16 @@ def test_run_voice_rewrite_prompt_has_rule_and_lines(tmp_path, video_1s, monkeyp
 
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "done"
-    assert m["voice_lines"] == VOICE_LINES
+    assert m["voice_lines"] == [
+        {"text": "直接使用金刚刷。", "start_s": 0.0, "end_s": 1.0}
+    ]
+    assert m["voice_text_normalizations"] == []
     asr_prompt = calls[0]
     assert "洗稿" in asr_prompt
     assert "句数不变" in asr_prompt
     assert "句序不变" in asr_prompt
     assert "时间边界不变" in asr_prompt
+    assert "通用称呼" in asr_prompt
 
 
 def test_run_voice_mode_unknown_fails(tmp_path, video_1s, monkeypatch):
@@ -1333,7 +1380,7 @@ def test_run_dialogue_auto_uses_actual_12_4s_duration_and_ceil_engine_request(
         (cdir / "prepared_input.json").read_text(encoding="utf-8")
     )
     assert receipt["video"]["duration_s"] == 12.4
-    assert receipt["engine_request"]["context_ir"]["duration"] == 13
+    assert set(receipt["engine_request"]) == {"h3"}
     assert receipt["engine_request"]["h3"]["duration"] == 13
 
 
@@ -1597,7 +1644,7 @@ def test_run_voice_placeholder_retries_then_continues_without_fake_dialogue(
 
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done", stored.get("error")
-    assert calls["voice"] == 2
+    assert calls["voice"] == 3
     assert stored["voice_lines"] == []
     assert "[无法辨识]" not in stored["prompt"]
     assert any("占位符" in warning for warning in stored["voice_warnings"])
@@ -1991,7 +2038,7 @@ def _sung_analysis(sung: float) -> vocal.VocalAnalysis:
 
 
 def test_run_voice_empty_lines_with_sung_retries_then_warns(tmp_path, video_1s, monkeypatch):
-    """真实量化边界 51/256 算人声；两次空则明确警告并按用户确认继续无台词。"""
+    """真实量化边界 51/256 算人声；三次空则明确警告并按用户确认继续无台词。"""
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
     _set_voice_mode(settings, meta, "keep")
@@ -2019,7 +2066,7 @@ def test_run_voice_empty_lines_with_sung_retries_then_warns(tmp_path, video_1s, 
     assert stored["status"] == "done", stored.get("error")
     assert stored["voice_lines"] == []
     assert stored["voice_warnings"] == [
-        "voice_lines.json empty after one retry despite vocal evidence; continuing without dialogue"
+        "voice_lines.json empty after automatic retries despite vocal evidence; continuing without dialogue"
     ]
 
 

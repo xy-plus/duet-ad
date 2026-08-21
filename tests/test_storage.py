@@ -139,7 +139,7 @@ def test_probe_video_returns_duration_and_dimensions_in_one_probe(tmp_path, monk
         "run",
         lambda *args, **kwargs: calls.append((args, kwargs)) or Completed(),
     )
-    info = storage.probe_video(tmp_path / "source.mp4", 15)
+    info = storage.probe_video(tmp_path / "source.mp4")
     assert info.duration_s == 14.25
     assert (info.width, info.height) == (1080, 1920)
     assert len(calls) == 1
@@ -153,7 +153,7 @@ def test_probe_video_rejects_missing_or_invalid_dimensions(tmp_path, monkeypatch
 
     monkeypatch.setattr(storage.subprocess, "run", lambda *args, **kwargs: Completed())
     try:
-        storage.probe_video(tmp_path / "source.mp4", 15)
+        storage.probe_video(tmp_path / "source.mp4")
     except storage.UploadError as exc:
         assert "dimensions" in str(exc)
     else:

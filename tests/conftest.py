@@ -19,7 +19,7 @@ def make_settings(tmp_path, **overrides):
         access_token=TOKEN,
         data_dir=tmp_path / "data",
         max_upload_mb=5,
-        max_duration_s=2,
+        retry_interval_s=0,
     )
     base.update(overrides)
     return Settings(**base)

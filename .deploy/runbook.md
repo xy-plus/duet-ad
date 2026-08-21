@@ -74,7 +74,7 @@ git diff --check
 systemd-analyze --user verify .deploy/systemd/duet-ad1.service
 ```
 
-全量测试必须通过。此阶段不运行 smoke；smoke 会创建真实会话，并在显式解锁后触发付费 Context IR/H3 请求。
+全量测试必须通过。此阶段不运行 smoke；smoke 会创建真实会话，并在显式解锁后触发付费 H3 请求。
 
 ## 3. 唯一 EnvironmentFile 与原 user unit
 
@@ -105,7 +105,6 @@ DATA_DIR=/home/xy/duet-ad1/data
 ACCESS_TOKEN=
 ENABLE_PIPELINE=1
 MAX_UPLOAD_MB=500
-MAX_DURATION_S=15
 CODEX_TIMEOUT_S=1800
 CODEX_CONCURRENCY=10
 MAX_QUEUED=100
@@ -117,11 +116,8 @@ ASR_TIMEOUT_S=180
 ASR_THREADS=4
 
 ENABLE_H3_SUBMIT=1
-MINIMAX_API_KEY=
 AUTODL_ART_TOKEN=
 H3_REQUEST_TIMEOUT_S=30
-H3_UPLOAD_TIMEOUT_S=60
-H3_IR_POLL_TIMEOUT_S=900
 H3_POLL_TIMEOUT_S=1500
 H3_DOWNLOAD_TIMEOUT_S=180
 H3_POLL_INTERVAL_S=3
@@ -211,9 +207,9 @@ unset ACCESS_TOKEN
 ## 7. 失败时 fix-forward
 
 1. 停止重复点击和重复 smoke；保留 cid、`prepared_input.json`、`.h3/` 和 `meta.json`。
-2. 用 detail API 或 journal 确认是输入准备、凭据、Context IR、H3 查询/下载还是公开反代问题；不要打印环境。
+2. 用 detail API 或 journal 确认是输入准备、凭据、H3 查询/下载还是公开反代问题；不要打印环境。
 3. 修复当前 H3 代码/配置，重新运行相关测试和全量测试。
 4. 再次 `daemon-reload`（unit 有改动时）并原地 `restart`，重复本地和公网 `/health`。
-5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；确定 `failed` 才用新 id 人工 retry。`submission_unknown` 不得继续或重试，先到 MiniMax/AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
+5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；确定 `failed` 才用新 id 人工 retry。`submission_unknown` 不得继续或重试，先到 AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
 
 禁止以 Seedance 代码、旧 unit 或旧提交开关回退；它们不再属于生产契约。若 H3 仍不可用，保持服务可读、关闭 `ENABLE_H3_SUBMIT`，修复后再开启。

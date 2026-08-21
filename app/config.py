@@ -1,3 +1,4 @@
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -7,15 +8,9 @@ from pathlib import Path
 class Settings:
     access_token: str
     max_upload_mb: int = 500
-    max_duration_s: int = 15
     enable_h3_submit: bool = False
-    minimax_api_key: str = field(default="", repr=False)
-    minimax_text_model: str = "MiniMax-M2.7"
-    context_ir_translation_timeout_s: float = 120.0
     autodl_art_token: str = field(default="", repr=False)
     h3_request_timeout_s: float = 30.0
-    h3_upload_timeout_s: float = 60.0
-    h3_ir_poll_timeout_s: float = 900.0
     h3_poll_timeout_s: float = 1500.0
     h3_download_timeout_s: float = 180.0
     h3_poll_interval_s: float = 3.0
@@ -26,6 +21,8 @@ class Settings:
     data_dir: Path = Path("data")
     codex_timeout_s: int = 1800
     codex_concurrency: int = 10
+    retry_count: int = 2
+    retry_interval_s: float = 15.0
     asr_cli: Path | None = None
     asr_model: Path | None = None
     asr_timeout_s: int = 180
@@ -38,6 +35,21 @@ class Settings:
     # 直建 Settings（测试）默认不跑流水线；get_settings（生产）默认开
     enable_pipeline: bool = False
 
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.retry_count, bool)
+            or not isinstance(self.retry_count, int)
+            or self.retry_count < 0
+        ):
+            raise ValueError("retry_count must be a non-negative integer")
+        if (
+            isinstance(self.retry_interval_s, bool)
+            or not isinstance(self.retry_interval_s, (int, float))
+            or not math.isfinite(float(self.retry_interval_s))
+            or self.retry_interval_s < 0
+        ):
+            raise ValueError("retry_interval_s must be a non-negative finite number")
+
 
 def get_settings() -> Settings:
     token = os.environ.get("ACCESS_TOKEN")
@@ -46,19 +58,9 @@ def get_settings() -> Settings:
     return Settings(
         access_token=token,
         max_upload_mb=int(os.environ.get("MAX_UPLOAD_MB", "500")),
-        max_duration_s=int(os.environ.get("MAX_DURATION_S", "15")),
         enable_h3_submit=os.environ.get("ENABLE_H3_SUBMIT", "").lower() in ("1", "true", "yes"),
-        minimax_api_key=os.environ.get("MINIMAX_API_KEY", "").strip(),
-        minimax_text_model=os.environ.get(
-            "MINIMAX_TEXT_MODEL", "MiniMax-M2.7"
-        ).strip(),
-        context_ir_translation_timeout_s=float(
-            os.environ.get("CONTEXT_IR_TRANSLATION_TIMEOUT_S", "120")
-        ),
         autodl_art_token=os.environ.get("AUTODL_ART_TOKEN", "").strip(),
         h3_request_timeout_s=float(os.environ.get("H3_REQUEST_TIMEOUT_S", "30")),
-        h3_upload_timeout_s=float(os.environ.get("H3_UPLOAD_TIMEOUT_S", "60")),
-        h3_ir_poll_timeout_s=float(os.environ.get("H3_IR_POLL_TIMEOUT_S", "900")),
         h3_poll_timeout_s=float(os.environ.get("H3_POLL_TIMEOUT_S", "1500")),
         h3_download_timeout_s=float(os.environ.get("H3_DOWNLOAD_TIMEOUT_S", "180")),
         h3_poll_interval_s=float(os.environ.get("H3_POLL_INTERVAL_S", "3")),
@@ -68,6 +70,8 @@ def get_settings() -> Settings:
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),
+        retry_count=int(os.environ.get("AUTO_RETRY_COUNT", "2")),
+        retry_interval_s=float(os.environ.get("AUTO_RETRY_INTERVAL_S", "15")),
         asr_cli=Path(os.environ.get(
             "ASR_CLI",
             "/home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli",

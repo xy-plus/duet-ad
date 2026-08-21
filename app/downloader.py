@@ -7,6 +7,7 @@ Content-Length 预检 + 流式写盘上限 + 整体 deadline。proxy 为空即�
 """
 import http.client
 import ipaddress
+import logging
 import re
 import socket
 import ssl
@@ -16,6 +17,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 
+from app.retry import RetryPolicy, run_with_retry
 from app.storage import ALLOWED_EXT
 
 _CHUNK = 64 * 1024
@@ -23,9 +25,19 @@ _MAX_REDIRECTS = 5
 _TIKWM_API = "https://www.tikwm.com/api/"
 _DOH_URL = "https://1.1.1.1/dns-query"
 
+log = logging.getLogger(__name__)
+
 
 class DownloadError(RuntimeError):
     """下载或 URL 校验失败（HTTP 层转 422）。"""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _retryable_http_status(status: int) -> bool:
+    return status in {408, 425, 429} or 500 <= status <= 599
 
 
 def _public_ip(address: str) -> bool:
@@ -40,7 +52,7 @@ def _local_resolve(host: str) -> list[str]:
     try:
         infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except OSError as e:
-        raise DownloadError(f"DNS resolution failed: {host}") from e
+        raise DownloadError(f"DNS resolution failed: {host}", retryable=True) from e
     return [info[4][0] for info in infos if len(info) >= 5 and info[4]]
 
 
@@ -59,15 +71,22 @@ def _doh_resolve(host: str, *, proxy: str | None, timeout: int, transport=None) 
             )
             response.raise_for_status()
             payload = response.json()
+    except httpx.HTTPStatusError as e:
+        raise DownloadError(
+            f"DoH resolution failed: {host} ({str(e)[:120]})",
+            retryable=_retryable_http_status(e.response.status_code),
+        ) from e
     except (httpx.HTTPError, ValueError) as e:
-        raise DownloadError(f"DoH resolution failed: {host} ({str(e)[:120]})") from e
+        raise DownloadError(
+            f"DoH resolution failed: {host} ({str(e)[:120]})", retryable=True
+        ) from e
     answers = payload.get("Answer") if isinstance(payload, dict) else None
     addresses = [
         str(item["data"]) for item in (answers or [])
         if isinstance(item, dict) and item.get("type") == 1 and item.get("data")
     ]
     if not addresses:
-        raise DownloadError(f"DoH resolution found no A record: {host}")
+        raise DownloadError(f"DoH resolution found no A record: {host}", retryable=True)
     return addresses
 
 
@@ -100,7 +119,9 @@ def _read_proxy_headers(sock) -> bytes:
     while b"\r\n\r\n" not in data:
         chunk = sock.recv(4096)
         if not chunk:
-            raise DownloadError("proxy closed connection before tunnel established")
+            raise DownloadError(
+                "proxy closed connection before tunnel established", retryable=True
+            )
         data += chunk
         if len(data) > 64 * 1024:
             raise DownloadError("proxy response headers abnormally long")
@@ -116,7 +137,7 @@ def _proxy_tunnel(proxy: str, address: str, port: int, timeout: int):
     try:
         sock = socket.create_connection((parsed.hostname, parsed.port or 80), timeout)
     except OSError as e:
-        raise DownloadError(f"proxy unreachable: {proxy} ({e})") from e
+        raise DownloadError(f"proxy unreachable: {proxy} ({e})", retryable=True) from e
     try:
         sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("ascii"))
         head, _, extra = _read_proxy_headers(sock).partition(b"\r\n\r\n")
@@ -125,10 +146,15 @@ def _proxy_tunnel(proxy: str, address: str, port: int, timeout: int):
             raise DownloadError("proxy sent data before tunnel established")
         status_line = head.split(b"\r\n", 1)[0]
         if status_line.split(b" ")[1:2] != [b"200"]:
-            raise DownloadError(f"proxy refused tunnel to {target}: {status_line.decode('latin-1', 'replace')}")
+            raise DownloadError(
+                f"proxy refused tunnel to {target}: {status_line.decode('latin-1', 'replace')}",
+                retryable=True,
+            )
     except OSError as e:
         sock.close()
-        raise DownloadError(f"proxy tunnel failed: {proxy} -> {target} ({e})") from e
+        raise DownloadError(
+            f"proxy tunnel failed: {proxy} -> {target} ({e})", retryable=True
+        ) from e
     except Exception:
         sock.close()
         raise
@@ -194,7 +220,10 @@ def download_public_video(
                     current = urljoin(current, location)
                     continue
                 if status < 200 or status >= 300:
-                    raise DownloadError(f"download failed: HTTP {status}")
+                    raise DownloadError(
+                        f"download failed: HTTP {status}",
+                        retryable=_retryable_http_status(status),
+                    )
                 expected = response.getheader("content-length")
                 if expected and expected.isdigit() and int(expected) > max_bytes:
                     raise DownloadError(f"file exceeds {max_bytes} bytes")
@@ -202,7 +231,7 @@ def download_public_video(
                 with temporary.open("wb") as handle:
                     while True:
                         if time.monotonic() > deadline:
-                            raise DownloadError("download timed out")
+                            raise DownloadError("download timed out", retryable=True)
                         chunk = response.read(_CHUNK)
                         if not chunk:
                             break
@@ -211,7 +240,7 @@ def download_public_video(
                             raise DownloadError(f"file exceeds {max_bytes} bytes")
                         handle.write(chunk)
                 if total == 0:
-                    raise DownloadError("downloaded file is empty")
+                    raise DownloadError("downloaded file is empty", retryable=True)
                 temporary.replace(dest)
                 return
             finally:
@@ -222,7 +251,10 @@ def download_public_video(
         dest.unlink(missing_ok=True)
         if isinstance(e, DownloadError):
             raise
-        if isinstance(e, (OSError, ValueError, http.client.HTTPException)):
+        if isinstance(e, (OSError, http.client.HTTPException)):
+            retryable = not isinstance(e, ssl.SSLCertVerificationError)
+            raise DownloadError(f"download failed: {e}", retryable=retryable) from e
+        if isinstance(e, ValueError):
             raise DownloadError(f"download failed: {e}") from e
         raise
 
@@ -240,8 +272,14 @@ def tiktok_video_id(url: str) -> str:
     return match.group(1)
 
 
-def tiktok_video_facts(url: str, proxy: str | None = None, *, timeout: int = 120, api_transport=None, retries: int = 4, sleep=time.sleep) -> dict:
-    """问固定的 TikWM API 拿 {video_id, play}；code==-1 指数退避重试。"""
+def tiktok_video_facts(
+    url: str,
+    proxy: str | None = None,
+    *,
+    timeout: int = 120,
+    api_transport=None,
+) -> dict:
+    """问固定的 TikWM API 拿 {video_id, play}；重试由 fetch_reference 统一控制。"""
     video_id = tiktok_video_id(url)
     options: dict = {"timeout": timeout, "follow_redirects": False, "trust_env": False}
     if api_transport is not None:
@@ -249,29 +287,31 @@ def tiktok_video_facts(url: str, proxy: str | None = None, *, timeout: int = 120
     elif proxy:
         options["proxy"] = proxy
     with httpx.Client(**options) as client:
-        for attempt in range(retries):
-            try:
-                response = client.get(_TIKWM_API, params={"url": url})
-            except httpx.HTTPError as e:
-                raise DownloadError(f"tikwm request failed: {str(e)[:120]}") from e
-            if response.status_code < 200 or response.status_code >= 300:
-                raise DownloadError(f"tikwm request failed: HTTP {response.status_code}")
-            try:
-                payload = response.json()
-            except ValueError as e:
-                raise DownloadError("tikwm response is not JSON") from e
-            code = payload.get("code")
-            if code == 0:
-                data = payload.get("data") or {}
-                play = data.get("play")
-                if not isinstance(play, str) or not play.strip():
-                    raise DownloadError("tikwm response lacks media URL")
-                return {"video_id": video_id, "play": play.strip()}
-            if code == -1 and attempt < retries - 1:
-                sleep(2 ** attempt)
-                continue
-            raise DownloadError(f"tikwm returned code={code}")
-    raise DownloadError("tikwm retries exhausted")
+        try:
+            response = client.get(_TIKWM_API, params={"url": url})
+        except httpx.HTTPError as e:
+            raise DownloadError(
+                f"tikwm request failed: {str(e)[:120]}", retryable=True
+            ) from e
+        if response.status_code < 200 or response.status_code >= 300:
+            raise DownloadError(
+                f"tikwm request failed: HTTP {response.status_code}",
+                retryable=_retryable_http_status(response.status_code),
+            )
+        try:
+            payload = response.json()
+        except ValueError as e:
+            raise DownloadError("tikwm response is not JSON", retryable=True) from e
+        if not isinstance(payload, dict):
+            raise DownloadError("tikwm response is not an object", retryable=True)
+        code = payload.get("code")
+        if code == 0:
+            data = payload.get("data") or {}
+            play = data.get("play")
+            if not isinstance(play, str) or not play.strip():
+                raise DownloadError("tikwm response lacks media URL", retryable=True)
+            return {"video_id": video_id, "play": play.strip()}
+        raise DownloadError(f"tikwm returned code={code}", retryable=code == -1)
 
 
 def download_tiktok_video(url: str, dest: Path, *, proxy: str | None, max_bytes: int, timeout: int) -> None:
@@ -293,9 +333,38 @@ def fetch_reference(url: str, cdir: Path, settings) -> Path:
     url = url.strip()
     max_bytes = settings.max_upload_mb * 1024 * 1024
     dest = _dest_for(url, cdir)
-    if is_tiktok_page_url(url):
-        download_tiktok_video(url, dest, proxy=settings.tiktok_proxy or None,
-                              max_bytes=max_bytes, timeout=settings.download_timeout_s)
-    else:
-        download_public_video(url, dest, max_bytes=max_bytes, timeout=settings.download_timeout_s)
-    return dest
+
+    def attempt() -> Path:
+        if is_tiktok_page_url(url):
+            download_tiktok_video(
+                url,
+                dest,
+                proxy=settings.tiktok_proxy or None,
+                max_bytes=max_bytes,
+                timeout=settings.download_timeout_s,
+            )
+        else:
+            download_public_video(
+                url,
+                dest,
+                max_bytes=max_bytes,
+                timeout=settings.download_timeout_s,
+            )
+        return dest
+
+    policy = RetryPolicy(settings.retry_count, settings.retry_interval_s)
+
+    def report(retry_number: int, _exc: Exception) -> None:
+        log.warning(
+            "reference download failed; retry %d/%d in %.1fs",
+            retry_number,
+            policy.retries,
+            policy.interval_s,
+        )
+
+    return run_with_retry(
+        attempt,
+        policy=policy,
+        is_retryable=lambda exc: isinstance(exc, DownloadError) and exc.retryable,
+        on_retry=report,
+    )

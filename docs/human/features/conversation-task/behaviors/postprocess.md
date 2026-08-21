@@ -25,7 +25,7 @@ links: [conversation-task, result-display]
 - 当前只保留 `remove_subtitle`、`remove_brand`；`face_hold` 已删除。
 - 后处理不改变输入准备状态，也不进入冻结 H3 receipt。无论先后顺序如何，H3 都不会读取 `postprocessed/`。
 - running 时不能重复提交；done/failed 后改变选项返回 409，避免旧产物贴上新标签。
-- 该能力可关闭；关闭不影响 Context IR → H3 主链路。
+- 该能力可关闭；关闭不影响直接 H3 主链路。
 
 ## 例子
 

@@ -1,4 +1,4 @@
-"""Recoverable Context IR -> H3 generation primitives.
+"""Recoverable direct H3 generation primitives.
 
 The caller owns review/confirmation and supplies an immutable request.  This
 module owns the paid-provider crash boundary: every provider submission is
@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import os
 import socket
@@ -22,31 +23,22 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
 
+from app.retry import RetryPolicy, run_with_retry
+from app.sanitize import sanitize
+
 
 SCHEMA_VERSION = 1
-IR_MODEL = "MiniMax-H3"
 H3_WORKFLOW = "minimax_h3_lightx2v_v5"
 H3_RESOLUTION = "768p竖"
-MINIMAX_BASE_URL = "https://api.minimaxi.com"
 AUTODL_BASE_URL = "https://autodl.art"
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
 
-_MAX_CONTEXT_IR_PROMPT_BYTES = 32 * 1024
-
 _SAFE_ERROR_CODES = {
-    "ir_upload_failed",
-    "ir_upload_rejected",
-    "ir_submit_rejected",
-    "ir_query_failed",
-    "ir_prompt_missing",
-    "ir_dialogue_mismatch",
-    "ir_provider_failed",
-    "ir_timeout",
     "h3_submit_rejected",
     "h3_query_failed",
     "h3_result_missing",
@@ -62,9 +54,9 @@ _SAFE_ERROR_CODES = {
     "output_probe_failed",
     "output_write_failed",
 }
-_CONTEXT_IR_STATUSES = frozenset(
-    {"submitting", "running", "succeeded", "failed", "submission_unknown"}
-)
+
+log = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 FrozenKeyframes = tuple[tuple[Path, bytes], ...]
 FrozenVoiceTexts = tuple[str, ...]
@@ -87,6 +79,10 @@ class H3BusyError(H3Error):
     """Another process/thread currently owns this session."""
 
 
+class _AutomaticRetryH3Error(H3Error):
+    """A safe same-attempt failure that may be retried without another POST."""
+
+
 class _DNSLookupFailed(Exception):
     pass
 
@@ -98,18 +94,16 @@ class _ProbeUnavailable(Exception):
 @dataclass(frozen=True)
 class Timeouts:
     request_s: float = 30.0
-    upload_s: float = 60.0
-    ir_poll_s: float = 900.0
     h3_poll_s: float = 1500.0
     download_s: float = 180.0
     poll_interval_s: float = 3.0
     probe_s: float = 30.0
+    retry_count: int = 2
+    retry_interval_s: float = 15.0
 
     def __post_init__(self) -> None:
         positive = (
             self.request_s,
-            self.upload_s,
-            self.ir_poll_s,
             self.h3_poll_s,
             self.download_s,
             self.probe_s,
@@ -117,6 +111,19 @@ class Timeouts:
         if any(isinstance(value, bool) or value <= 0 for value in positive):
             raise H3Error("invalid_timeout")
         if isinstance(self.poll_interval_s, bool) or self.poll_interval_s < 0:
+            raise H3Error("invalid_timeout")
+        if (
+            isinstance(self.retry_count, bool)
+            or not isinstance(self.retry_count, int)
+            or self.retry_count < 0
+        ):
+            raise H3Error("invalid_timeout")
+        if (
+            isinstance(self.retry_interval_s, bool)
+            or not isinstance(self.retry_interval_s, (int, float))
+            or not math.isfinite(float(self.retry_interval_s))
+            or self.retry_interval_s < 0
+        ):
             raise H3Error("invalid_timeout")
 
 
@@ -130,8 +137,6 @@ class H3Request:
     voice_texts: FrozenVoiceTexts
     voice_receipt: str
     duration: int
-    ratio: str
-    minimax_api_key: str
     autodl_token: str
     timeouts: Timeouts = Timeouts()
 
@@ -146,13 +151,9 @@ class H3Request:
         if (
             not isinstance(self.duration, int)
             or isinstance(self.duration, bool)
-            or not 1 <= self.duration <= 15
+            or self.duration < 1
         ):
             raise H3Error("invalid_duration")
-        if not isinstance(self.ratio, str) or not self.ratio.strip():
-            raise H3Error("invalid_ratio")
-        if not isinstance(self.minimax_api_key, str) or not self.minimax_api_key.strip():
-            raise H3Error("missing_minimax_credential")
         if not isinstance(self.autodl_token, str) or not self.autodl_token.strip():
             raise H3Error("missing_autodl_credential")
         if not isinstance(self.keyframes, tuple) or not 1 <= len(self.keyframes) <= 9:
@@ -186,13 +187,61 @@ class H3Result:
     error_code: str | None = None
 
 
-@dataclass(frozen=True)
-class ContextIRSnapshot:
-    """Validated local Context IR observation; never contains provider metadata."""
+def _retryable_http_status(status: int) -> bool:
+    return status in {408, 425, 429} or 500 <= status <= 599
 
-    status: str
-    prompt: str | None
-    sha256: str | None
+
+def _provider_error_detail(payload: Mapping[str, Any], *, secret: str) -> str:
+    """Extract only provider-owned error fields; never log the full response."""
+
+    values: list[str] = []
+
+    def append(value: Any) -> None:
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            text = str(value).strip()
+            if text and text not in values:
+                values.append(text)
+
+    for key in ("code", "msg", "message"):
+        append(payload.get(key))
+    error = payload.get("error")
+    if isinstance(error, Mapping):
+        for key in ("code", "msg", "message"):
+            append(error.get(key))
+    else:
+        append(error)
+    return sanitize(" | ".join(values), secrets=(secret,))
+
+
+def _run_automatic_retry(
+    timeouts: Timeouts,
+    operation: Callable[[], _T],
+    *,
+    step: str,
+    deadline: float | None = None,
+) -> _T:
+    policy = RetryPolicy(timeouts.retry_count, timeouts.retry_interval_s)
+
+    def retryable(exc: Exception) -> bool:
+        if not isinstance(exc, _AutomaticRetryH3Error):
+            return False
+        return deadline is None or time.monotonic() + policy.interval_s < deadline
+
+    def report(retry_number: int, _exc: Exception) -> None:
+        log.warning(
+            "%s failed; retry %d/%d in %.1fs",
+            step,
+            retry_number,
+            policy.retries,
+            policy.interval_s,
+        )
+
+    return run_with_retry(
+        operation,
+        policy=policy,
+        is_retryable=retryable,
+        on_retry=report,
+    )
 
 
 def freeze_keyframes(paths: Sequence[Path]) -> FrozenKeyframes:
@@ -221,14 +270,14 @@ def voice_texts_receipt(voice_texts: Sequence[str]) -> str:
 def start(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
     """Start or idempotently advance one client request.
 
-    A repeated ``client_request_id`` resolves to its existing attempt.  It may
-    query an already persisted task or submit H3 from ``ready_for_h3``; it never
-    repeats a provider POST whose outcome is unknown.
+    A repeated ``client_request_id`` resolves to its existing attempt. It may
+    query an already persisted task, but never repeats a provider POST whose
+    outcome is unknown.
     """
     with _session_lease(request):
-        existing = _find_attempt(request, request.client_request_id)
         if _has_output(request):
-            return _output_result(request, existing)
+            return _output_result(request, None)
+        existing = _find_attempt(request, request.client_request_id)
         if existing is None:
             state = _create_attempt(request, request.client_request_id)
             is_new = True
@@ -244,31 +293,6 @@ def start(request: H3Request, *, client: httpx.Client | None = None) -> H3Result
                 new_attempt=is_new,
             )
 
-
-def prepare_context_ir(
-    request: H3Request, *, client: httpx.Client | None = None
-) -> H3Result:
-    """Create/query Context IR and stop before the paid H3 video submission."""
-    with _session_lease(request):
-        existing = _find_attempt(request, request.client_request_id)
-        if _has_output(request):
-            return _output_result(request, existing)
-        state = (
-            _create_attempt(request, request.client_request_id)
-            if existing is None
-            else existing
-        )
-        with _client(client) as active_client:
-            return _advance(
-                request,
-                state,
-                active_client,
-                allow_submit=True,
-                new_attempt=existing is None,
-                stop_after_ir=True,
-            )
-
-
 def inspect(request: H3Request) -> H3Result:
     """Read the latest attempt for UI/startup decisions, without any writes."""
     root = _state_root(request)
@@ -278,6 +302,8 @@ def inspect(request: H3Request) -> H3Result:
             return _output_result(request, None)
         return H3Result(status="not_started", attempt_id=None)
 
+    if _has_output(request):
+        return _output_result(request, None)
     latest = _latest_attempt(request)
     if marker.is_file():
         expected = {"schema_version": SCHEMA_VERSION, "cid": request.cid}
@@ -288,127 +314,9 @@ def inspect(request: H3Request) -> H3Result:
 
     if latest is not None:
         _validate_state(request, latest, require_client_request_id=False)
-    if _has_output(request):
-        return _output_result(request, latest)
     if latest is None:
         return H3Result(status="not_started", attempt_id=None)
     return _result(latest)
-
-
-def inspect_context_ir(workdir: Path, cid: str) -> ContextIRSnapshot:
-    """Read only the latest Context IR status and verified prompt from disk."""
-    root = Path(workdir) / ".h3"
-    if not root.exists():
-        return ContextIRSnapshot("not_started", None, None)
-
-    attempts = root / "attempts"
-    try:
-        latest_path = (
-            next(iter(sorted(attempts.glob("*/attempt.json"), reverse=True)), None)
-            if attempts.is_dir()
-            else None
-        )
-    except OSError:
-        raise ReceiptError("state_invalid") from None
-    latest = _read_json(latest_path) if latest_path is not None else None
-
-    marker = root / "session.json"
-    if marker.is_file():
-        expected = {"schema_version": SCHEMA_VERSION, "cid": cid}
-        if _read_json(marker) != expected:
-            raise ReceiptError("session_cid_mismatch")
-    elif latest is not None:
-        raise ReceiptError("state_invalid")
-    if latest is None:
-        return ContextIRSnapshot("not_started", None, None)
-
-    attempt_id = latest.get("attempt_id")
-    client_request_id = latest.get("client_request_id")
-    manifest = latest.get("input")
-    ir = latest.get("ir")
-    if (
-        latest.get("schema_version") != SCHEMA_VERSION
-        or latest.get("cid") != cid
-        or not isinstance(attempt_id, str)
-        or len(attempt_id) != 6
-        or not attempt_id.isdigit()
-        or not isinstance(client_request_id, str)
-        or not client_request_id.strip()
-        or not isinstance(manifest, dict)
-        or latest.get("input_receipt") != canonical_json_sha256(manifest)
-        or not isinstance(ir, dict)
-    ):
-        raise ReceiptError("state_invalid")
-
-    ir_status = ir.get("status")
-    if ir_status not in _CONTEXT_IR_STATUSES:
-        raise ReceiptError("state_invalid")
-    prompt = ir.get("optimized_prompt")
-    digest = ir.get("optimized_prompt_sha256")
-    if ir_status == "succeeded":
-        if (
-            not isinstance(prompt, str)
-            or not prompt
-            or not isinstance(digest, str)
-            or digest != hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        ):
-            raise ReceiptError("context_ir_mismatch")
-        return ContextIRSnapshot("succeeded", prompt, digest)
-    if prompt is not None or digest is not None:
-        raise ReceiptError("context_ir_mismatch")
-    public_status = (
-        "failed"
-        if latest.get("status") in {"failed", "retryable_failure"}
-        else str(ir_status)
-    )
-    return ContextIRSnapshot(public_status, None, None)
-
-
-def edit_context_ir(
-    request: H3Request,
-    expected_sha256: str,
-    prompt: str,
-) -> ContextIRSnapshot:
-    """Atomically replace the reviewed IR prompt before H3 has been submitted."""
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise H3Error("invalid_context_ir_prompt")
-    encoded = prompt.encode("utf-8")
-    if len(encoded) > _MAX_CONTEXT_IR_PROMPT_BYTES:
-        raise H3Error("invalid_context_ir_prompt")
-    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
-        raise H3Error("context_ir_version_conflict")
-
-    with _session_lease(request):
-        state = _find_attempt(request, request.client_request_id)
-        if state is None:
-            raise H3Error("context_ir_not_ready")
-        ir = state.get("ir")
-        h3_state = state.get("h3")
-        if (
-            state.get("status") != "ready_for_h3"
-            or not isinstance(ir, dict)
-            or ir.get("status") != "succeeded"
-            or not isinstance(h3_state, dict)
-            or h3_state.get("status") not in {"ready", "not_started"}
-            or _task_id(h3_state.get("task_id"), required=False) is not None
-        ):
-            raise H3Error("context_ir_not_editable")
-        current = ir.get("optimized_prompt")
-        current_sha = ir.get("optimized_prompt_sha256")
-        if (
-            not isinstance(current, str)
-            or not isinstance(current_sha, str)
-            or current_sha != hashlib.sha256(current.encode("utf-8")).hexdigest()
-        ):
-            raise ReceiptError("context_ir_mismatch")
-        if current_sha != expected_sha256:
-            raise H3Error("context_ir_version_conflict")
-        digest = hashlib.sha256(encoded).hexdigest()
-        ir["optimized_prompt"] = prompt
-        ir["optimized_prompt_sha256"] = digest
-        state["h3"] = {"status": "ready"}
-        _save_state(request, state)
-        return ContextIRSnapshot("succeeded", prompt, digest)
 
 
 def resume(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
@@ -522,6 +430,11 @@ def _ensure_session_marker(request: H3Request) -> None:
 
 
 def _input_manifest(request: H3Request) -> dict[str, Any]:
+    provider_request = {
+        "h3_workflow": H3_WORKFLOW,
+        "duration": request.duration,
+        "resolution": H3_RESOLUTION,
+    }
     return {
         "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
         "keyframes": [
@@ -529,13 +442,7 @@ def _input_manifest(request: H3Request) -> dict[str, Any]:
             for path, blob in request.keyframes
         ],
         "voice_texts_sha256": request.voice_receipt,
-        "request": {
-            "ir_model": IR_MODEL,
-            "h3_workflow": H3_WORKFLOW,
-            "duration": request.duration,
-            "ratio": request.ratio,
-            "resolution": H3_RESOLUTION,
-        },
+        "request": provider_request,
     }
 
 
@@ -548,10 +455,9 @@ def _new_state(request: H3Request, attempt_id: str, client_request_id: str) -> d
         "client_request_id": client_request_id,
         "input": manifest,
         "input_receipt": canonical_json_sha256(manifest),
-        "status": "ir_submitting",
+        "status": "h3_submitting",
         "retryable": False,
-        "ir": {"status": "submitting"},
-        "h3": {"status": "not_started"},
+        "h3": {"status": "submitting"},
     }
 
 
@@ -636,31 +542,17 @@ def _validate_state(
         or state.get("input_receipt") != canonical_json_sha256(manifest)
     ):
         raise ReceiptError("receipt_mismatch")
-    ir = state.get("ir")
     h3_state = state.get("h3")
-    if not isinstance(ir, dict) or not isinstance(h3_state, dict):
+    if not isinstance(h3_state, dict):
         raise ReceiptError("state_invalid")
     error = state.get("error")
     if error is not None and (
         not isinstance(error, dict) or error.get("code") not in _SAFE_ERROR_CODES
     ):
         raise ReceiptError("state_invalid")
-    ir_task_id = _task_id(ir.get("task_id"), required=False)
-    if ir_task_id is not None and ir.get("receipt") != _ir_receipt(request, ir_task_id):
-        raise ReceiptError("receipt_mismatch")
     h3_task_id = _task_id(h3_state.get("task_id"), required=False)
-    optimized = ir.get("optimized_prompt")
-    if optimized is not None:
-        if not isinstance(optimized, str):
-            raise ReceiptError("receipt_mismatch")
-        if ir.get("optimized_prompt_sha256") != hashlib.sha256(
-            optimized.encode("utf-8")
-        ).hexdigest():
-            raise ReceiptError("receipt_mismatch")
     if h3_task_id is not None:
-        if not isinstance(optimized, str):
-            raise ReceiptError("receipt_mismatch")
-        if h3_state.get("receipt") != _h3_receipt(request, h3_task_id, optimized):
+        if h3_state.get("receipt") != _h3_receipt(request, h3_task_id):
             raise ReceiptError("receipt_mismatch")
     if "result_url" in h3_state:
         raise ReceiptError("state_invalid")
@@ -690,27 +582,11 @@ def _task_id(value: Any, *, required: bool) -> str | None:
     return normalized
 
 
-def _ir_receipt(request: H3Request, task_id: str) -> dict[str, Any]:
-    manifest = _input_manifest(request)
-    return {
-        "task_id": task_id,
-        "input_receipt": canonical_json_sha256(manifest),
-        "prompt_sha256": manifest["prompt_sha256"],
-        "keyframes": manifest["keyframes"],
-        "voice_texts_sha256": manifest["voice_texts_sha256"],
-        "request": {
-            "model": IR_MODEL,
-            "duration": request.duration,
-            "ratio": request.ratio,
-        },
-    }
-
-
-def _h3_receipt(request: H3Request, task_id: str, prompt: str) -> dict[str, Any]:
+def _h3_receipt(request: H3Request, task_id: str) -> dict[str, Any]:
     return {
         "task_id": task_id,
         "input_receipt": canonical_json_sha256(_input_manifest(request)),
-        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
         "keyframes": _input_manifest(request)["keyframes"],
         "request": {
             "workflow": H3_WORKFLOW,
@@ -727,7 +603,6 @@ def _advance(
     *,
     allow_submit: bool,
     new_attempt: bool,
-    stop_after_ir: bool = False,
 ) -> H3Result:
     _validate_state(request, state)
     if _has_output(request):
@@ -738,212 +613,68 @@ def _advance(
     if status == "submission_unknown":
         return _result(state)
     if status == "failed":
-        error = state.get("error")
-        ir = state.get("ir")
-        h3_state = state.get("h3")
-        if (
-            error == {"code": "ir_dialogue_mismatch"}
-            and isinstance(ir, dict)
-            and ir.get("status") == "running"
-            and _task_id(ir.get("task_id"), required=False) is not None
-            and isinstance(h3_state, dict)
-            and h3_state.get("status") == "not_started"
-        ):
-            # A validator-only failure has no paid H3 side effect.  After a
-            # validator repair, re-query the already bound IR task instead of
-            # creating a second attempt or repeating the IR POST.
-            state["status"] = "ir_running"
-            state["retryable"] = False
-            state.pop("error", None)
-            _save_state(request, state)
-        else:
-            return _result(state)
-
-    ir = state["ir"]
-    ir_task_id = _task_id(ir.get("task_id"), required=False)
-    if ir_task_id is None:
-        if new_attempt and allow_submit and ir.get("status") == "submitting":
-            submitted = _submit_ir(request, state, client)
-            if isinstance(submitted, H3Result):
-                return submitted
-            ir_task_id = submitted
-        elif ir.get("status") == "submitting":
-            state["status"] = "submission_unknown"
-            state["retryable"] = False
-            ir["status"] = "submission_unknown"
-            _save_state(request, state)
-            return _result(state)
-        else:
-            return _result(state)
-
-    if state["ir"].get("status") != "succeeded":
-        result = _poll_ir(request, state, client, ir_task_id)
-        if result is not None:
-            return result
-
-    if stop_after_ir:
         return _result(state)
 
     h3_state = state["h3"]
     h3_task_id = _task_id(h3_state.get("task_id"), required=False)
     if h3_task_id is None:
         if h3_state.get("status") == "submitting":
+            if new_attempt and allow_submit:
+                h3_task_id = _submit_h3(request, state, client)
+                return _poll_h3(request, state, client, h3_task_id)
             state["status"] = "submission_unknown"
             state["retryable"] = False
             h3_state["status"] = "submission_unknown"
             _save_state(request, state)
             return _result(state)
-        if not allow_submit:
-            state["status"] = "ready_for_h3"
-            state["retryable"] = False
-            h3_state["status"] = "ready"
-            _save_state(request, state)
-            return _result(state)
-        h3_task_id = _submit_h3(request, state, client)
+        raise ReceiptError("state_invalid")
 
     return _poll_h3(request, state, client, h3_task_id)
 
 
-def _submit_ir(
-    request: H3Request, state: dict[str, Any], client: httpx.Client
-) -> str | H3Result:
-    headers = {"Authorization": f"Bearer {request.minimax_api_key}"}
-    content: list[dict[str, Any]] = [{"type": "text", "text": request.prompt}]
-    for index, (path, blob) in enumerate(request.keyframes):
-        try:
-            response = client.post(
-                f"{MINIMAX_BASE_URL}/v1/files/upload",
-                headers=headers,
-                files={"file": (path.name, blob, "image/png")},
-                data={"purpose": "video_generation_input"},
-                timeout=request.timeouts.upload_s,
-            )
-            payload = _response_json(response)
-        except (httpx.HTTPError, ValueError, TypeError):
-            _fail(request, state, "ir_upload_failed", retryable=True)
-            raise H3Error("ir_upload_failed", retryable=True) from None
-        file_data = payload.get("file")
-        file_id = file_data.get("file_id") if isinstance(file_data, dict) else None
-        if response.status_code != 200 or not isinstance(file_id, (str, int)) or not str(file_id):
-            _fail(request, state, "ir_upload_rejected", retryable=False)
-            raise H3Error("ir_upload_rejected")
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"mm_file://{file_id}"},
-                "role": "reference_image",
-            }
-        )
-    body = {
-        "model": IR_MODEL,
-        "content": content,
-        "duration": request.duration,
-        "ratio": request.ratio,
-    }
-    try:
-        response = client.post(
-            f"{MINIMAX_BASE_URL}/v2/h3_context_ir",
-            headers=headers,
-            json=body,
-            timeout=request.timeouts.request_s,
-        )
-        payload = _response_json(response)
-    except (httpx.HTTPError, ValueError, TypeError):
-        _submission_unknown(request, state, "ir")
-        raise H3Error("submission_unknown") from None
-    task_value = payload.get("task_id")
-    if response.status_code != 200 or isinstance(task_value, bool) or not isinstance(
-        task_value, (str, int)
-    ) or not str(task_value).strip():
-        _fail(request, state, "ir_submit_rejected", retryable=False)
-        raise H3Error("ir_submit_rejected")
-    task_id = str(task_value).strip()
-    state["ir"] = {
-        "status": "running",
-        "task_id": task_id,
-        "receipt": _ir_receipt(request, task_id),
-    }
-    state["status"] = "ir_running"
-    state["retryable"] = False
-    _save_state(request, state)
-    return task_id
-
-
-def _poll_ir(
+def _query_json_with_retry(
     request: H3Request,
-    state: dict[str, Any],
-    client: httpx.Client,
-    task_id: str,
-) -> H3Result | None:
-    if state["ir"].get("receipt") != _ir_receipt(request, task_id):
-        raise ReceiptError("receipt_mismatch")
-    deadline = time.monotonic() + request.timeouts.ir_poll_s
-    headers = {"Authorization": f"Bearer {request.minimax_api_key}"}
-    while True:
+    operation: Callable[[], httpx.Response],
+    *,
+    code: str,
+    step: str,
+    deadline: float,
+) -> tuple[httpx.Response, dict[str, Any]]:
+    """Retry only same-task GET failures; provider POSTs never enter here."""
+
+    def attempt() -> tuple[httpx.Response, dict[str, Any]]:
         try:
-            response = client.get(
-                f"{MINIMAX_BASE_URL}/v2/query/video_generation",
-                headers=headers,
-                params={"task_id": task_id},
-                timeout=request.timeouts.request_s,
-            )
-            payload = _response_json(response)
-        except (httpx.HTTPError, ValueError, TypeError):
-            _fail(request, state, "ir_query_failed", retryable=True, keep_task=True)
-            raise H3Error("ir_query_failed", retryable=True) from None
+            response = operation()
+        except httpx.HTTPError:
+            raise _AutomaticRetryH3Error(code, retryable=True) from None
         if response.status_code != 200:
-            _fail(request, state, "ir_query_failed", retryable=True, keep_task=True)
-            raise H3Error("ir_query_failed", retryable=True)
-        items = payload.get("items")
-        item = next(
-            (
-                candidate
-                for candidate in items if isinstance(candidate, dict)
-                and str(candidate.get("id")) == task_id
-            ),
-            None,
-        ) if isinstance(items, list) else None
-        if item is not None:
-            provider_status = str(item.get("status") or "").lower()
-            if provider_status == "succeeded":
-                content = item.get("content")
-                optimized = (
-                    content.get("prompt")
-                    if isinstance(content, dict)
-                    else content if isinstance(content, str) else None
-                )
-                if not isinstance(optimized, str) or not optimized:
-                    _fail(request, state, "ir_prompt_missing", retryable=False, keep_task=True)
-                    raise H3Error("ir_prompt_missing")
-                state["ir"]["status"] = "succeeded"
-                state["ir"]["optimized_prompt"] = optimized
-                state["ir"]["optimized_prompt_sha256"] = hashlib.sha256(
-                    optimized.encode("utf-8")
-                ).hexdigest()
-                state["status"] = "ready_for_h3"
-                state["retryable"] = False
-                state["h3"] = {"status": "ready"}
-                _save_state(request, state)
-                return None
-            if provider_status not in {"", "queued", "running"}:
-                _fail(request, state, "ir_provider_failed", retryable=False, keep_task=True)
-                return _result(state)
-        if time.monotonic() >= deadline:
-            _fail(request, state, "ir_timeout", retryable=True, keep_task=True)
-            return _result(state)
-        _pause(request.timeouts.poll_interval_s)
+            error_type = (
+                _AutomaticRetryH3Error
+                if _retryable_http_status(response.status_code)
+                else H3Error
+            )
+            raise error_type(code, retryable=True)
+        try:
+            payload = _response_json(response)
+        except (ValueError, TypeError):
+            raise _AutomaticRetryH3Error(code, retryable=True) from None
+        return response, payload
+
+    return _run_automatic_retry(
+        request.timeouts,
+        attempt,
+        step=step,
+        deadline=deadline,
+    )
 
 
 def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) -> str:
-    optimized = state["ir"].get("optimized_prompt")
-    if not isinstance(optimized, str):
-        raise ReceiptError("receipt_mismatch")
     state["h3"] = {"status": "submitting"}
     state["status"] = "h3_submitting"
     state["retryable"] = False
     _save_state(request, state)
     body: dict[str, Any] = {
-        "prompt": optimized,
+        "prompt": request.prompt,
         "duration": request.duration,
         "resolution": H3_RESOLUTION,
     }
@@ -967,13 +698,21 @@ def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) 
     if response.status_code != 200 or isinstance(task_value, bool) or not isinstance(
         task_value, (str, int)
     ) or not str(task_value).strip():
+        detail = _provider_error_detail(payload, secret=request.autodl_token)
+        log.warning(
+            "H3 submission rejected cid=%s attempt=%s http_status=%d detail=%s",
+            request.cid,
+            state.get("attempt_id"),
+            response.status_code,
+            detail or "no_safe_detail",
+        )
         _fail(request, state, "h3_submit_rejected", retryable=False)
         raise H3Error("h3_submit_rejected")
     task_id = str(task_value).strip()
     state["h3"] = {
         "status": "running",
         "task_id": task_id,
-        "receipt": _h3_receipt(request, task_id, optimized),
+        "receipt": _h3_receipt(request, task_id),
     }
     state["status"] = "h3_running"
     state["retryable"] = False
@@ -987,27 +726,26 @@ def _poll_h3(
     client: httpx.Client,
     task_id: str,
 ) -> H3Result:
-    optimized = state["ir"].get("optimized_prompt")
-    if not isinstance(optimized, str) or state["h3"].get("receipt") != _h3_receipt(
-        request, task_id, optimized
-    ):
+    if state["h3"].get("receipt") != _h3_receipt(request, task_id):
         raise ReceiptError("receipt_mismatch")
     deadline = time.monotonic() + request.timeouts.h3_poll_s
     headers = {"Authorization": request.autodl_token}
     while True:
         try:
-            response = client.get(
-                f"{AUTODL_BASE_URL}/api/v1/comfyui/comfyui_workflow/result/{task_id}",
-                headers=headers,
-                timeout=request.timeouts.request_s,
+            _, payload = _query_json_with_retry(
+                request,
+                lambda: client.get(
+                    f"{AUTODL_BASE_URL}/api/v1/comfyui/comfyui_workflow/result/{task_id}",
+                    headers=headers,
+                    timeout=request.timeouts.request_s,
+                ),
+                code="h3_query_failed",
+                step="H3 result query",
+                deadline=deadline,
             )
-            payload = _response_json(response)
-        except (httpx.HTTPError, ValueError, TypeError):
+        except H3Error:
             _fail(request, state, "h3_query_failed", retryable=True, keep_task=True)
             raise H3Error("h3_query_failed", retryable=True) from None
-        if response.status_code != 200:
-            _fail(request, state, "h3_query_failed", retryable=True, keep_task=True)
-            raise H3Error("h3_query_failed", retryable=True)
         data = payload.get("data")
         data = data if isinstance(data, dict) else {}
         provider_status = str(data.get("status") or "").upper()
@@ -1047,11 +785,35 @@ def _download(
     url: str,
 ) -> dict[str, Any]:
     try:
+        receipt = _run_automatic_retry(
+            request.timeouts,
+            lambda: _download_once(request, client, url),
+            step="H3 result download",
+        )
+    except H3Error as exc:
+        _fail(request, state, exc.code, retryable=exc.retryable, keep_task=True)
+        raise
+    # Earlier failed attempts persist a recoverable state.  A later success in
+    # the same process must remove that stale error before the caller commits
+    # the final succeeded state.
+    state.pop("error", None)
+    state["status"] = "h3_running"
+    state["retryable"] = False
+    state["h3"]["status"] = "running"
+    return receipt
+
+
+def _download_once(
+    request: H3Request,
+    client: httpx.Client,
+    url: str,
+) -> dict[str, Any]:
+    try:
         public_url = _is_public_https_url(url)
     except _DNSLookupFailed:
-        _reject_download(request, state, "download_dns_failed", retryable=True)
+        _raise_download_error("download_dns_failed", retryable=True)
     if not public_url:
-        _reject_download(request, state, "download_url_rejected", retryable=False)
+        _raise_download_error("download_url_rejected", retryable=False)
 
     destination = request.workdir / "generated.mp4"
     temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
@@ -1070,76 +832,78 @@ def _download(
             ) as response:
                 public_peer = _response_has_public_peer(response)
                 if public_peer is None:
-                    _reject_download(
-                        request,
-                        state,
+                    _raise_download_error(
                         "download_peer_unverified",
                         retryable=True,
                     )
                 if not public_peer:
-                    _reject_download(
-                        request,
-                        state,
+                    _raise_download_error(
                         "download_url_rejected",
                         retryable=False,
                     )
                 if 300 <= response.status_code < 400:
-                    _reject_download(
-                        request,
-                        state,
+                    _raise_download_error(
                         "download_redirect_rejected",
                         retryable=False,
                     )
                 if response.status_code != 200:
-                    _reject_download(request, state, "download_failed", retryable=True)
+                    _raise_download_error(
+                        "download_failed",
+                        retryable=True,
+                        automatic_retryable=_retryable_http_status(response.status_code),
+                    )
                 declared = response.headers.get("Content-Length")
                 if declared is not None:
                     try:
                         declared_size = int(declared)
                     except ValueError:
-                        _reject_download(
-                            request, state, "download_failed", retryable=True
-                        )
+                        _raise_download_error("download_failed", retryable=True)
                     if declared_size < 0:
-                        _reject_download(
-                            request, state, "download_failed", retryable=True
-                        )
+                        _raise_download_error("download_failed", retryable=True)
                     if declared_size > MAX_VIDEO_BYTES:
-                        _reject_download(
-                            request, state, "download_too_large", retryable=False
-                        )
+                        _raise_download_error("download_too_large", retryable=False)
                 for chunk in response.iter_bytes():
                     if not chunk:
                         continue
                     size += len(chunk)
                     if size > MAX_VIDEO_BYTES:
-                        _reject_download(
-                            request, state, "download_too_large", retryable=False
-                        )
+                        _raise_download_error("download_too_large", retryable=False)
                     _write_all(fd, chunk)
                     digest.update(chunk)
         except httpx.HTTPError:
-            _reject_download(request, state, "download_failed", retryable=True)
+            _raise_download_error("download_failed", retryable=True)
         if size <= 0:
-            _reject_download(request, state, "download_failed", retryable=True)
+            _raise_download_error("download_failed", retryable=True)
         os.fsync(fd)
         os.close(fd)
         fd = None
+
+        def probe_attempt() -> bool:
+            try:
+                return _probe_video(temporary, request.timeouts.probe_s)
+            except _ProbeUnavailable:
+                raise _AutomaticRetryH3Error(
+                    "output_probe_failed", retryable=True
+                ) from None
+
         try:
-            valid_video = _probe_video(temporary, request.timeouts.probe_s)
-        except _ProbeUnavailable:
-            _reject_download(
-                request, state, "output_probe_failed", retryable=True
+            valid_video = _run_automatic_retry(
+                request.timeouts,
+                probe_attempt,
+                step="downloaded video probe",
+            )
+        except _AutomaticRetryH3Error:
+            _raise_download_error(
+                "output_probe_failed",
+                retryable=True,
+                automatic_retryable=False,
             )
         if not valid_video:
-            _reject_download(
-                request, state, "download_invalid_video", retryable=False
-            )
+            _raise_download_error("download_invalid_video", retryable=False)
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
     except OSError:
-        _fail(request, state, "output_write_failed", retryable=True, keep_task=True)
-        raise H3Error("output_write_failed", retryable=True) from None
+        raise _AutomaticRetryH3Error("output_write_failed", retryable=True) from None
     finally:
         if fd is not None:
             os.close(fd)
@@ -1150,15 +914,15 @@ def _download(
     return {"name": "generated.mp4", "sha256": digest.hexdigest(), "size": size}
 
 
-def _reject_download(
-    request: H3Request,
-    state: dict[str, Any],
+def _raise_download_error(
     code: str,
     *,
     retryable: bool,
+    automatic_retryable: bool | None = None,
 ) -> None:
-    _fail(request, state, code, retryable=retryable, keep_task=True)
-    raise H3Error(code, retryable=retryable)
+    automatic = retryable if automatic_retryable is None else automatic_retryable
+    error_type = _AutomaticRetryH3Error if automatic else H3Error
+    raise error_type(code, retryable=retryable)
 
 
 def _is_public_https_url(url: str) -> bool:
@@ -1287,8 +1051,6 @@ def _fail(
     if not keep_task:
         if state["h3"].get("status") == "submitting":
             state["h3"]["status"] = "failed"
-        elif state["ir"].get("status") == "submitting":
-            state["ir"]["status"] = "failed"
     _save_state(request, state)
 
 

@@ -4,13 +4,13 @@
 
 ## ⚠️ 待拍板
 
-- 旧人物策略资料包仍在根目录，但不进入现行 Context IR → H3 运行链；需决定删除归档，还是只保留独立的授权/商标版权规则。（→ `seedance-cleaning-video-maker-中文完整资料包.zip`）
+- 旧人物策略资料包仍在根目录，但不进入现行直接 H3 运行链；需决定删除归档，还是只保留独立的授权/商标版权规则。（→ `seedance-cleaning-video-maker-中文完整资料包.zip`）
 
 ## 🚧 进行中
 
 ## 📌 待办与限制
 
-- Context IR + H3 只能做高相似复刻，不能保证逐像素、逐帧、文字、原音或节奏一致；若目标升级为“一模一样”，需重新定义输入契约、模型与验收指标。（→ `temp/09-restore-h3-no-face/`, `docs/human/features/conversation-task/`）
+- H3 只能做高相似复刻，不能保证逐像素、逐帧、文字、原音或节奏一致；若目标升级为“一模一样”，需重新定义输入契约、模型与验收指标。（→ `temp/09-restore-h3-no-face/`, `docs/human/features/conversation-task/`）
 - 从仓库根直接运行 `pytest -q` 会收集 `temp/09-*`、`temp/10-*` 的同名测试模块并冲突；规范命令暂为 `pytest tests -q`，后续应增加 pytest 收集隔离或重命名模块。（→ `temp/`）
 - 全量测试仍有 FastAPI `on_event` 与 Starlette TestClient/httpx 弃用 warning；迁移 lifespan 和兼容测试客户端后再升级依赖。（→ `app/main.py`, `tests/`）
 - 状态更新仍用 2 秒轮询，不用 SSE/WebSocket；规模和实时性要求上升后再升级。（→ `web/app.js`）

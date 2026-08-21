@@ -79,6 +79,46 @@ def test_half_configured_local_asr_fails_closed(tmp_path):
         )
 
 
+def test_local_asr_retries_transient_timeout(tmp_path, monkeypatch):
+    cli = tmp_path / "whisper-cli"
+    model = tmp_path / "ggml-small.bin"
+    cli.write_bytes(b"binary")
+    model.write_bytes(b"model")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "voice.mp3").write_bytes(b"audio")
+    settings = Settings(
+        access_token="test",
+        asr_cli=cli,
+        asr_model=model,
+        retry_interval_s=0,
+    )
+    expected = [{"text": "Hola.", "start_s": 0.2, "end_s": 1.1}]
+    calls = 0
+
+    def flaky_transcribe(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise asr.ASRError("asr_timeout")
+        return expected
+
+    monkeypatch.setattr(asr, "transcribe", flaky_transcribe)
+    lines, unrecognized = pipeline._transcribe_voice_with_retry(
+        settings,
+        object(),
+        work,
+        "unused",
+        2.0,
+        "keep",
+        has_vocal=False,
+    )
+
+    assert lines == expected
+    assert unrecognized is False
+    assert calls == 3
+
+
 def test_production_config_defaults_to_pinned_multilingual_small(monkeypatch):
     monkeypatch.setenv("ACCESS_TOKEN", "test")
     monkeypatch.delenv("ASR_CLI", raising=False)

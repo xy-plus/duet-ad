@@ -16,7 +16,6 @@ def sanitize(text: str, limit: int = DETAIL_LIMIT, *, secrets=()) -> str:
     out = BEARER_RE.sub("Bearer ***", out)
     actual = list(secrets) + [
         os.environ.get("ARK_API_KEY", ""),
-        os.environ.get("MINIMAX_API_KEY", ""),
         os.environ.get("AUTODL_ART_TOKEN", ""),
     ]
     for secret in actual:

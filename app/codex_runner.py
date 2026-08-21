@@ -56,6 +56,10 @@ _ACTIVE_VOICE_STAGE: ContextVar[tuple[int, Path, Path] | None] = ContextVar(
 class CodexError(RuntimeError):
     """codex 启动/运行失败（超时、非零退出、找不到二进制）。"""
 
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
 
 class CodexOutputError(RuntimeError):
     """codex 成功退出，但音频隔离区没有可安全读取的唯一输出。"""
@@ -217,11 +221,16 @@ class CodexRunner:
                     env=_scrubbed_env(),
                 )
             except subprocess.TimeoutExpired:
-                raise CodexError(f"codex timed out after {self._timeout_s}s") from None
+                raise CodexError(
+                    f"codex timed out after {self._timeout_s}s", retryable=True
+                ) from None
             except FileNotFoundError:
                 raise CodexError("codex executable not found on PATH") from None
         if proc.returncode != 0:
-            raise CodexError(f"codex exit {proc.returncode}: {clean_stderr(proc.stderr)}")
+            raise CodexError(
+                f"codex exit {proc.returncode}: {clean_stderr(proc.stderr)}",
+                retryable=True,
+            )
 
     def run_voice(
         self,

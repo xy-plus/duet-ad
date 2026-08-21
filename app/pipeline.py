@@ -26,6 +26,7 @@ codex 运行前把 skill 的 scripts/ 拷进 codex 工作目录（单段=会话�
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import shutil
@@ -39,6 +40,7 @@ import cv2
 from app import asr, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
+from app.retry import RetryPolicy, run_with_retry
 
 ROOT = Path(__file__).resolve().parent.parent
 SKILL_DIR = ROOT / "skills" / "video-maker"
@@ -56,7 +58,7 @@ _SEG_TAIL_EPS_S = 0.01  # 台词 start_s 超出末段终点 ≤0.01s（与 voice
 # 该阈值只决定空听写是否重试，不改变逐句 classify_segment 规则。
 EMPTY_TRANSCRIPT_VOCAL_EVIDENCE_MIN = 51 / 256
 EMPTY_TRANSCRIPT_WARNING = (
-    "voice_lines.json empty after one retry despite vocal evidence; "
+    "voice_lines.json empty after automatic retries despite vocal evidence; "
     "continuing without dialogue"
 )
 UNRECOGNIZED_TRANSCRIPT_WARNING = (
@@ -74,9 +76,20 @@ H3_ENGINE_WORKFLOW = "minimax_h3_lightx2v_v5"
 SEGMENT_MIN_S = 4.0
 SEGMENT_MAX_S = 15.0
 
+log = logging.getLogger(__name__)
+
 
 class PipelineError(RuntimeError):
     """流水线单步失败（HTTP 层不感知，只进 meta.error）。"""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class _EmptyTranscript(PipelineError):
+    def __init__(self) -> None:
+        super().__init__("voice transcript empty despite vocal evidence", retryable=True)
 
 
 def _codex_output_error(stage: str) -> PipelineError:
@@ -86,7 +99,32 @@ def _codex_output_error(stage: str) -> PipelineError:
         "visual": "required keyframes/prompt artifacts are missing or invalid",
     }
     detail = details[stage]
-    return PipelineError(f"codex {stage} output invalid: {detail}")
+    return PipelineError(f"codex {stage} output invalid: {detail}", retryable=True)
+
+
+def _retry_policy(settings: Settings) -> RetryPolicy:
+    return RetryPolicy(settings.retry_count, settings.retry_interval_s)
+
+
+def _retryable_operation_error(exc: Exception) -> bool:
+    return bool(
+        isinstance(exc, (CodexError, PipelineError))
+        and getattr(exc, "retryable", False)
+    )
+
+
+def _retry_logger(step: str, policy: RetryPolicy):
+    def report(retry_number: int, exc: Exception) -> None:
+        log.warning(
+            "%s failed; retry %d/%d in %.1fs (%s)",
+            step,
+            retry_number,
+            policy.retries,
+            policy.interval_s,
+            type(exc).__name__,
+        )
+
+    return report
 
 
 def _run_cmd(argv: list[str], *, timeout: int, step: str, cwd: Path | None = None) -> None:
@@ -180,12 +218,78 @@ def _run_visual_codex(
                 voice_path.write_bytes(frozen_voice)
 
 
+def _clear_visual_outputs(cdir: Path, work: Path) -> None:
+    """Start every visual attempt without outputs from an earlier attempt."""
+    keyframes = work / "keyframes"
+    if keyframes.exists():
+        shutil.rmtree(keyframes)
+    (work / "prompt.txt").unlink(missing_ok=True)
+    (cdir / "codex_last_message.txt").unlink(missing_ok=True)
+
+
+def _run_visual_attempt(
+    runner,
+    cdir: Path,
+    prompt: str,
+    work: Path,
+    *,
+    isolate_dialogue: bool,
+) -> tuple[list[str], str]:
+    """Run once, adopting complete outputs even when Codex exits abnormally."""
+    _clear_visual_outputs(cdir, work)
+    run_error: CodexError | None = None
+    try:
+        _run_visual_codex(
+            runner,
+            cdir,
+            prompt,
+            work,
+            isolate_dialogue=isolate_dialogue,
+        )
+    except CodexError as exc:
+        run_error = exc
+    try:
+        return validate_work_dir(work)
+    except PipelineError:
+        if run_error is not None:
+            raise run_error from None
+        raise _codex_output_error("visual") from None
+
+
+def _run_visual_with_retry(
+    settings: Settings,
+    runner,
+    cdir: Path,
+    prompt: str,
+    work: Path,
+    *,
+    isolate_dialogue: bool,
+    step: str,
+) -> tuple[list[str], str]:
+    policy = _retry_policy(settings)
+    return run_with_retry(
+        lambda: _run_visual_attempt(
+            runner,
+            cdir,
+            prompt,
+            work,
+            isolate_dialogue=isolate_dialogue,
+        ),
+        policy=policy,
+        is_retryable=_retryable_operation_error,
+        on_retry=_retry_logger(step, policy),
+    )
+
+
 def _voice_prompt(_cdir: Path, voice_mode: str, target_language: str, duration_s: float) -> str:
     """口播步 codex prompt：只使用隔离区内的音频输入，不暴露原会话路径。"""
     if voice_mode == "keep":
         rule = "原文保持：只修正错别字与标点，不改写措辞。"
     elif voice_mode == "rewrite":
-        rule = "洗稿：把台词改写得更自然；句数不变、句序不变、每句时间边界不变。"
+        rule = (
+            "洗稿：把台词改写得更自然；句数不变、句序不变、每句时间边界不变；"
+            "产品和工具使用准确的通用称呼，不保留未经确认的夸张别名。"
+        )
     else:  # translate
         rule = f"翻译成{target_language}：句对句对齐，每句时间边界不变。"
     return f"""听写并处理视频台词。输入：work/voice.mp3（源视频音轨，16kHz 单声道）与 work/manifest.json（源视频元信息，供参考）。音频时长约 {duration_s:.3f} 秒。
@@ -248,7 +352,7 @@ def _transcribe_voice_attempt(
             raw = json.dumps(lines, ensure_ascii=False).encode("utf-8")
             return voice.validate_voice_lines(raw, duration_s)
         except asr.ASRError as exc:
-            raise PipelineError(str(exc)) from None
+            raise PipelineError(str(exc), retryable=exc.retryable) from None
     return _run_voice_attempt(runner, work, prompt, duration_s)
 
 
@@ -266,6 +370,47 @@ def _has_retryable_vocal_evidence(analysis: vocal.VocalAnalysis) -> bool:
         or window.sung >= EMPTY_TRANSCRIPT_VOCAL_EVIDENCE_MIN
         for window in analysis.windows
     )
+
+
+def _transcribe_voice_with_retry(
+    settings: Settings,
+    runner,
+    work: Path,
+    prompt: str,
+    duration_s: float,
+    voice_mode: str,
+    *,
+    has_vocal: bool,
+) -> tuple[list[dict], bool]:
+    """Retry transient execution/output failures and suspicious empty transcripts."""
+    policy = _retry_policy(settings)
+    unrecognized = False
+
+    def attempt() -> list[dict]:
+        nonlocal unrecognized
+        lines = _transcribe_voice_attempt(
+            settings, runner, work, prompt, duration_s, voice_mode
+        )
+        unrecognized = unrecognized or any(
+            voice.is_unrecognized_text(line["text"]) for line in lines
+        )
+        lines = [
+            line for line in lines if not voice.is_unrecognized_text(line["text"])
+        ]
+        if not lines and has_vocal:
+            raise _EmptyTranscript()
+        return lines
+
+    try:
+        lines = run_with_retry(
+            attempt,
+            policy=policy,
+            is_retryable=_retryable_operation_error,
+            on_retry=_retry_logger("voice transcription", policy),
+        )
+    except _EmptyTranscript:
+        lines = []
+    return lines, unrecognized
 
 
 def _classify_voice_line(
@@ -346,7 +491,7 @@ def _voice_step(
 
     台词时间戳在音频时间轴上（codex 听 voice.mp3），校验基准与提示词时长用音频实际时长
     （音频流可比容器长几十 ms，常态）；YAMNet 分类后再把最终行裁到 manifest 视频时间轴。
-    空台词数组且音轨有人声证据 → 重试一次 codex，再空则写 warning 后以无台词继续。新 auto
+    空台词数组且音轨有人声证据 → 按统一策略重试，再空则写 warning 后以无台词继续。新 auto
     契约下无音轨同样是合法空台词；旧 voice_mode 可保留严格失败行为。返回白名单净化后的台词列表。
     """
     target_language = (target_language or "").strip()  # 纯空白串视为缺失，不生成「翻译成   」prompt
@@ -371,6 +516,7 @@ def _voice_step(
             voice_warnings=[],
             voice_has_retryable_vocal_evidence=False,
             voice_lines_vocal_dropped=0,
+            voice_text_normalizations=[],
         )
         return []
     try:
@@ -392,20 +538,15 @@ def _voice_step(
         raise PipelineError(f"vocal classification unavailable: {e}") from None
     has_vocal = _has_retryable_vocal_evidence(analysis)
     prompt = _voice_prompt(cdir, voice_mode, target_language, audio_duration_s)
-    lines = _transcribe_voice_attempt(
-        settings, runner, work, prompt, audio_duration_s, voice_mode
+    lines, unrecognized = _transcribe_voice_with_retry(
+        settings,
+        runner,
+        work,
+        prompt,
+        audio_duration_s,
+        voice_mode,
+        has_vocal=has_vocal,
     )
-    unrecognized = any(voice.is_unrecognized_text(line["text"]) for line in lines)
-    lines = [line for line in lines if not voice.is_unrecognized_text(line["text"])]
-    if not lines and has_vocal:
-        # 音轨有人声但听写为空：只重试一次；再次为空按用户确认继续，但必须明确留痕。
-        lines = _transcribe_voice_attempt(
-            settings, runner, work, prompt, audio_duration_s, voice_mode
-        )
-        unrecognized = unrecognized or any(
-            voice.is_unrecognized_text(line["text"]) for line in lines
-        )
-        lines = [line for line in lines if not voice.is_unrecognized_text(line["text"])]
     warnings = [EMPTY_TRANSCRIPT_WARNING] if not lines and has_vocal else []
     if unrecognized:
         warnings.append(UNRECOGNIZED_TRANSCRIPT_WARNING)
@@ -449,6 +590,7 @@ def _voice_step(
         "voice_warnings": warnings,
         "voice_has_retryable_vocal_evidence": has_vocal,
         "voice_lines_vocal_dropped": vocal_dropped,
+        "voice_text_normalizations": [],
     }
     storage.update_meta(settings.data_dir, cid, **changes)
     return filtered_lines
@@ -612,7 +754,7 @@ def _keyframes_require_fit(work: Path, names: list[str]) -> bool:
     return False
 
 
-def _process_segment(work: Path, source: Path, seg: dict, runner,
+def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, runner,
                      lines: list[dict] | None, target_language: str = "") -> dict:
     """单段完整流程：切段 → 抽帧 → 写该段台词 → codex（cwd=段目录）→ 校验 → 后端加前缀。
 
@@ -640,19 +782,15 @@ def _process_segment(work: Path, source: Path, seg: dict, runner,
             )
         # 裁剪工具按 scripts/crop_image.py 相对 cwd 引用：scripts/ 拷入段目录
         shutil.copytree(SCRIPTS_DIR, segdir / "scripts")
-        try:
-            runner.run(segdir, _codex_prompt(segdir, target_language))
-        except CodexError as e:
-            # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
-            try:
-                keyframes, prompt = validate_work_dir(segwork)
-            except PipelineError:
-                raise e from None
-        else:
-            try:
-                keyframes, prompt = validate_work_dir(segwork)
-            except PipelineError:
-                raise _codex_output_error("visual") from None
+        keyframes, prompt = _run_visual_with_retry(
+            settings,
+            runner,
+            segdir,
+            _codex_prompt(segdir, target_language),
+            segwork,
+            isolate_dialogue=False,
+            step=f"segment {index} visual codex",
+        )
         prompt = _apply_no_bgm_prefix(prompt, segwork / "prompt.txt", enabled=True)
         return {
             "index": index,
@@ -709,16 +847,14 @@ def _dialogue_for_prepared_input(
 
 
 def _prepared_durations(meta: dict) -> tuple[float, int]:
-    """返回 receipt 的实际时长与 H3 整秒请求时长（向上取整，范围 1..15）。"""
+    """返回 receipt 的实际时长与 H3 整秒请求时长（向上取整，不设上限）。"""
     raw = meta.get("duration_s")
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         raise PipelineError("duration_s in meta must be a positive finite number")
     actual = float(raw)
-    if not math.isfinite(actual) or not 0 < actual <= 15:
-        raise PipelineError("duration_s in meta must be within (0, 15]")
+    if not math.isfinite(actual) or actual <= 0:
+        raise PipelineError("duration_s in meta must be a positive finite number")
     engine_duration = math.ceil(actual)
-    if not 1 <= engine_duration <= 15:
-        raise PipelineError("engine duration must be within 1..15")
     return actual, engine_duration
 
 
@@ -747,11 +883,6 @@ def _write_prepared_receipt(
     if not isinstance(filter_enabled, bool):
         raise PipelineError("vocal_filter_enabled in meta must be bool")
     engine_request = {
-        "context_ir": {
-            "model": "MiniMax-H3",
-            "duration": engine_duration,
-            "ratio": ratio,
-        },
         "h3": {
             "workflow": H3_ENGINE_WORKFLOW,
             "duration": engine_duration,
@@ -842,33 +973,22 @@ def run(settings: Settings, cid: str, runner) -> None:
         if not new_input_contract and voice_mode == "translate":
             translate_lang = (meta.get("target_language") or "").strip()
         segments = _detect_segments(settings, cid, source, work)
-        if new_input_contract and segments:
-            raise PipelineError("prepared input currently requires a single segment")
+        if new_input_contract:
+            # 场景检测仍供关键帧选择参考，但 H3 请求必须保留完整源视频时长。
+            segments = []
         if not segments:
             # 单段模式：work/keyframes + work/prompt.txt，不注入 workaround 前缀；
             # 裁剪工具以 scripts/crop_image.py 相对工作目录引用，scripts/ 拷进会话目录
             shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
-            try:
-                _run_visual_codex(
-                    runner,
-                    cdir,
-                    _codex_prompt(
-                        cdir, translate_lang, visual_only=new_input_contract
-                    ),
-                    work,
-                    isolate_dialogue=new_input_contract,
-                )
-            except CodexError as e:
-                # 超时被杀时产物可能已完整落盘：校验通过则收养，否则报原始错误
-                try:
-                    keyframes, prompt = validate_work_dir(work)
-                except PipelineError:
-                    raise e from None
-            else:
-                try:
-                    keyframes, prompt = validate_work_dir(work)
-                except PipelineError:
-                    raise _codex_output_error("visual") from None
+            keyframes, prompt = _run_visual_with_retry(
+                settings,
+                runner,
+                cdir,
+                _codex_prompt(cdir, translate_lang, visual_only=new_input_contract),
+                work,
+                isolate_dialogue=new_input_contract,
+                step="visual codex",
+            )
             prompt = _apply_no_bgm_prefix(prompt, work / "prompt.txt", enabled=False)
             fit_required = _keyframes_require_fit(work, keyframes)
             if new_input_contract:
@@ -908,7 +1028,7 @@ def run(settings: Settings, cid: str, runner) -> None:
                 seg_metas = list(
                     pool.map(
                         lambda seg: _process_segment(
-                            work, source, seg, runner,
+                            settings, work, source, seg, runner,
                             lines_by_seg.get(seg["index"]) if lines_by_seg is not None else None,
                             translate_lang,
                         ),

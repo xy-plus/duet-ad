@@ -20,8 +20,7 @@ flowchart LR
   C -->|127.0.0.1:3212| A[FastAPI single process]
   A --> P[Input preparation]
   P --> R[prepared_input.json]
-  R --> I[MiniMax Context IR]
-  I --> H[AutoDL Art MiniMax-H3]
+  R --> H[AutoDL Art MiniMax-H3]
   H --> V[generated.mp4]
   A -. optional, excluded from H3 .-> S[Seedream postprocess]
 ```
@@ -35,7 +34,7 @@ flowchart LR
 | `app/pipeline.py` | 4fps 抽帧、音频/台词准备、视觉 agent 隔离、初始 receipt | conversation-task |
 | `app/prepared_input.py` | 结构化台词、唯一发声块、文件哈希绑定、fail-closed loader | conversation-task |
 | `app/frame_fit.py` | 用户确认后把关键帧居中 crop 或黑边 pad 为 9:16 | conversation-task |
-| `app/h3.py` | Context IR → H3 的 start/inspect/resume/retry 和磁盘状态机 | conversation-task |
+| `app/h3.py` | 直接 H3 的 start/inspect/resume/retry 和磁盘状态机 | conversation-task |
 | `app/asr.py` / `app/voice.py` / `app/vocal.py` | 本地多语种听写、ASR JSON 校验、YAMNet `spoken/sung` 分类 | conversation-task |
 | `app/postprocess.py` / `app/seedream.py` | 可选去字幕/品牌关键帧编辑；不参与 H3 输入 | postprocess |
 | `app/codex_runner.py` | 本地 codex 内层 workspace 沙箱、voice 专用外层文件系统隔离、并发和超时；不把服务凭据交给 agent | conversation-task |
@@ -65,7 +64,7 @@ flowchart LR
 
 关键不变量：
 
-- 新会话 `schema_version=2`，有效源时长为 `(0, min(MAX_DURATION_S, 15)]`；新契约只处理单段。
+- 新会话 `schema_version=2`，有效源时长为正有限数；场景检测可辅助选帧，但新契约始终把完整源视频作为一次 H3 请求，不按总时长截断。
 - `keep` 模式由固定的本地 `whisper.cpp` multilingual small 处理 16kHz 单声道音频，自动检测语言；模型和二进制由部署固定，运行时不下载。`rewrite/translate` 才进入音频专用 Codex 隔离区。
 - 自动台词的唯一可收养 agent 输出是隔离区 `work/voice_lines.json`：先做大小、普通文件与 JSON 字段白名单校验，再把净化结果写回主 `work/`。重试创建全新隔离区；Codex 超时/非零退出但完整产物已通过同一校验时仍可收养。
 - ASR 初次校验和 YAMNet 分类使用 `voice.mp3` 的真实时长；随后、写 `voice_lines/meta/receipt` 前，必须把有效台词归一到 manifest 的视频时间轴。跨越视频结尾的行把 `end_s` 截到视频时长，`start_s >= duration_s` 的 MP3 编码纯尾部行丢弃并留 provenance/warning，归一结果再过一次 voice 白名单。receipt 的时间真相始终是视频时长。
@@ -74,9 +73,8 @@ flowchart LR
 - `auto` 只接受内部 ASR provenance；默认声学过滤同时保留 `spoken` 与 `sung`。`edit/custom` 只接受用户提交的结构化行；`none` 必须为空。
 - `prompt.txt` 由视觉文本和唯一结构化发声块机械组合。无台词时明确禁止角色说出画面文字。
 - ASR 输出中的 `[无法辨识]`、`[inaudible]`、`[unintelligible]` 等哨兵文本不是业务台词：净化为“本次未得到转写”，复用有声学人声证据时的一次重试；任何哨兵不得进入 `voice_lines.json`、prepared receipt 或 H3 prompt。
-- Context IR 与 H3 是两个用户可见、可独立推进的阶段。第一次 POST 只创建/恢复 IR attempt，并在 `ready_for_h3` 停止；IR 原文必须可读取。用户可用 `expected_sha256` 原子替换非空、限长的 IR prompt；H3 POST 仅在同一冻结输入、IR 已就绪且用户明确确认后发生。
-- Context IR 正文是 H3 prompt 的最终权威，不再与冻结 `voice_texts` 比较，也不对 `<d>` 内容或结构设置额外门禁。
-- `duration_s` 以实际浮点数写 receipt；Context IR/H3 的请求时长为 `ceil(duration_s)`，范围 1–15。
+- 冻结的 H3 源提示词是唯一生成输入；项目不调用 MiniMax Context IR，也不接受运行时优化开关。
+- `duration_s` 以实际浮点数写 receipt；H3 请求时长为 `ceil(duration_s)`，项目不设上限。
 - `fit_required` 只在 pipeline `done` 时按实际选中的每张关键帧计算，不持久化源视频宽高作为第二真相。只有全部关键帧都是 9:16 才允许 `none`，任一非 9:16 就必须人工选 `crop` 或 `pad`；即使源视频是 9:16，裁过的关键帧也不能绕过。两种策略都不缩放帧，只做居中裁切或居中黑边扩画布。
 - H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/{crop|pad}/`；永不读取 `postprocessed/`。
 
@@ -87,7 +85,7 @@ flowchart LR
 - source、可选 normalized audio、1–9 张有序关键帧、视觉 prompt、最终 prompt 的相对路径与 SHA-256；
 - 台词 mode、标准化 lines、provenance、classification 和台词 JSON 哈希；
 - `vocal_filter.enabled`、实际 `duration_s`、`ratio=9:16`、`fit_mode`；
-- Context IR/H3 的模型、workflow、整数时长和分辨率请求。
+- H3 的 workflow、整数时长和分辨率请求。
 
 写 receipt 后立即经过同一 loader 复核；提交和重启恢复也重新加载。未知 schema/version、路径越界、文件缺失/漂移、台词漂移、最终 prompt 不是确定性组合时全部 fail closed。提交锁内会按用户最终台词和画幅选择重写 receipt，随后 H3Request 只使用当次加载的不可变 bytes。
 
@@ -95,17 +93,11 @@ flowchart LR
 
 ```mermaid
 stateDiagram-v2
-  [*] --> ir_submitting: manual start or retry
-  ir_submitting --> ir_running: Context IR task id persisted
-  ir_submitting --> submission_unknown: POST outcome unknown
-  ir_running --> ready_for_h3: optimized prompt persisted
-  ready_for_h3 --> h3_submitting: allow_submit only
+  [*] --> h3_submitting: manual start or retry
   h3_submitting --> h3_running: AutoDL task id persisted
   h3_submitting --> submission_unknown: POST outcome unknown
   h3_running --> succeeded: download and atomic replace
-  ir_running --> retryable_failure
   h3_running --> retryable_failure
-  ir_running --> failed
   h3_running --> failed
 ```
 
@@ -113,9 +105,9 @@ stateDiagram-v2
 
 - `session.json` 绑定 cid；`session.lock` 使用非阻塞 flock，拒绝同会话并发推进。
 - `attempts/000001/attempt.json` 以 0600 创建，后续原子写 + `fsync`；attempt state schema 为 v1。
-- input、IR task、H3 task 和最终输出各有 receipt；状态中不保存结果 URL或凭据，只保存安全错误码。
+- input、H3 task 和最终输出各有 receipt；状态中不保存结果 URL或凭据，只保存安全错误码。
 - `start` 以同一 client id 幂等推进；公开 `resume_required` 由用户用同 id、同台词、同 fit 确认后再次调用 `start`，继续同一 receipt/attempt。只有确定 `failed` 才由新 id 调 `retry` 创建 attempt。
-- 启动 `resume` 设置 `allow_submit=false`，只对已经持久化的 task 做 GET 查询/下载，不发新的供应商 POST。`ready_for_h3`、已知 task 的查询/超时、下载传输/输出写入故障和 raw running 状态映射为 `resume_required`；`submission_unknown` 一律锁死。
+- 启动 `resume` 设置 `allow_submit=false`，只对已经持久化的 task 做 GET 查询/下载，不发新的供应商 POST。已知 task 的查询/超时、下载传输/输出写入故障和 raw running 状态映射为 `resume_required`；`submission_unknown` 一律锁死。
 - provider 成片 URL 必须是无 userinfo 的 HTTPS，且 DNS/IP 预解析结果全部为公网地址。下载 client 不读取代理环境；响应到达后在读取 status/body 前，从 httpx network stream 取得实际 socket peer 并再次要求公网地址，从而不把预解析结果当作连接事实。无法解析 DNS、无法验证 peer、ffprobe 缺失/超时属于已有 task 的可恢复故障；预解析或实际 peer 为私网则确定拒绝。
 - 下载不跟随重定向。Content-Length 和实际流都限制为 200 MiB，内容先写同目录 0600 临时文件；ffprobe 正常执行并确认存在 video stream 且 format duration 有限并大于 0 后，才原子替换 `generated.mp4` 并 fsync。
 

@@ -217,7 +217,7 @@ print(json.dumps({
 }, ensure_ascii=False, separators=(",", ":")))
 ' "$generation_id" "$dialogue_mode" "$selected_fit")
 
-echo "Submitting Context IR -> H3: cid=$cid dialogue=$dialogue_mode fit=$selected_fit"
+echo "Submitting H3: cid=$cid dialogue=$dialogue_mode fit=$selected_fit"
 submit_response=$(curl --fail-with-body --silent --show-error \
   --header "@$auth_header" \
   --header 'Content-Type: application/json' \

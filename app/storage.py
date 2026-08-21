@@ -128,8 +128,8 @@ async def save_upload(cdir: Path, upload, max_bytes: int) -> Path:
     return dest
 
 
-def probe_video(path: Path, max_duration_s: float) -> VideoProbe:
-    """一次 ffprobe 得到源视频时长与首个视频流尺寸，并执行上传上限。"""
+def probe_video(path: Path) -> VideoProbe:
+    """一次 ffprobe 得到源视频时长与首个视频流尺寸。"""
     try:
         r = subprocess.run(
             [
@@ -161,8 +161,6 @@ def probe_video(path: Path, max_duration_s: float) -> VideoProbe:
         or height <= 0
     ):
         raise UploadError("cannot parse video dimensions")
-    if duration > max_duration_s:
-        raise UploadError(f"duration {duration:.1f}s exceeds {max_duration_s}s")
     return VideoProbe(duration, width, height)
 
 

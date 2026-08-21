@@ -15,7 +15,6 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from app import (
-    context_ir_translation,
     downloader,
     frame_fit,
     h3,
@@ -43,8 +42,6 @@ _AMBIGUOUS_SUBMIT_ERRORS = frozenset(
 )
 _KNOWN_TASK_ERRORS = frozenset(
     {
-        "ir_query_failed",
-        "ir_timeout",
         "h3_query_failed",
         "h3_timeout",
         "download_failed",
@@ -118,35 +115,39 @@ def _public_generation(meta: dict) -> dict | None:
     generation = meta.get("generation")
     if not isinstance(generation, dict):
         return None
+    legacy = _is_legacy_generation_contract(generation)
+    status = _effective_generation_status(generation)
     return {
-        "status": _effective_generation_status(generation),
-        "error": generation.get("error"),
+        "status": status,
+        "error": (
+            "generation_path_removed"
+            if legacy and status == "failed"
+            else generation.get("error")
+        ),
         "attempt": generation.get("attempt"),
         "client_request_id": generation.get("client_request_id"),
-        "stage": generation.get("stage"),
+        "stage": "h3" if legacy else generation.get("stage"),
     }
+
+
+def _is_legacy_generation_contract(generation: dict) -> bool:
+    return (
+        "context_ir_enabled" in generation
+        or generation.get("stage") == "context_ir"
+    )
 
 
 def _effective_generation_status(generation: dict) -> str | None:
     status = generation.get("status")
     error = generation.get("error")
-    if error == "ir_dialogue_mismatch":
+    if (
+        _is_legacy_generation_contract(generation)
+        and status not in {"succeeded", "submission_unknown"}
+    ):
         return "failed"
     if status == "failed" and error in _KNOWN_TASK_ERRORS:
         return "resume_required"
     return status
-
-
-def _public_context_ir(cdir: Path, cid: str) -> dict:
-    try:
-        snapshot = h3.inspect_context_ir(cdir, cid)
-    except h3.H3Error:
-        return {"status": "invalid", "available": False, "sha256": None}
-    return {
-        "status": snapshot.status,
-        "available": snapshot.prompt is not None,
-        "sha256": snapshot.sha256,
-    }
 
 
 def _source_prompt_snapshot(cdir: Path) -> tuple[str | None, str | None]:
@@ -229,16 +230,16 @@ def _receipt_version(cdir: Path, meta: dict) -> int | None:
 def _timeouts(settings: Settings) -> h3.Timeouts:
     return h3.Timeouts(
         request_s=settings.h3_request_timeout_s,
-        upload_s=settings.h3_upload_timeout_s,
-        ir_poll_s=settings.h3_ir_poll_timeout_s,
         h3_poll_s=settings.h3_poll_timeout_s,
         download_s=settings.h3_download_timeout_s,
         poll_interval_s=settings.h3_poll_interval_s,
+        retry_count=settings.retry_count,
+        retry_interval_s=settings.retry_interval_s,
     )
 
 
 def _credentials_ready(settings: Settings) -> bool:
-    return bool(settings.minimax_api_key.strip() and settings.autodl_art_token.strip())
+    return bool(settings.autodl_art_token.strip())
 
 
 def _source(cdir: Path) -> Path:
@@ -324,10 +325,18 @@ def _validated_dialogue(meta: dict, payload: dict) -> tuple[dict, ...]:
         raise _SubmitError(422, "invalid_dialogue") from None
 
 
-def _validate_submit_payload(meta: dict, payload: dict) -> tuple[str, str, tuple[dict, ...]]:
+def _validate_submit_payload(
+    meta: dict, payload: dict
+) -> tuple[str, str, tuple[dict, ...]]:
     if payload.get("confirm") is not True:
         raise _SubmitError(409, "confirmation required")
-    allowed = {"confirm", "client_request_id", "dialogue_mode", "lines", "fit_mode"}
+    allowed = {
+        "confirm",
+        "client_request_id",
+        "dialogue_mode",
+        "lines",
+        "fit_mode",
+    }
     if set(payload) - allowed:
         raise _SubmitError(422, "invalid_submit_request")
     request_id = payload.get("client_request_id")
@@ -350,7 +359,7 @@ def _make_h3_request(
     frozen: prepared_input.PreparedInput,
     client_request_id: str,
 ) -> h3.H3Request:
-    duration = max(1, min(15, math.ceil(frozen.duration_s)))
+    duration = max(1, math.ceil(frozen.duration_s))
     return h3.H3Request(
         cid=cid,
         workdir=(settings.data_dir / cid).resolve(),
@@ -360,8 +369,6 @@ def _make_h3_request(
         voice_texts=frozen.voice_texts,
         voice_receipt=h3.voice_texts_receipt(frozen.voice_texts),
         duration=duration,
-        ratio="9:16",
-        minimax_api_key=settings.minimax_api_key,
         autodl_token=settings.autodl_art_token,
         timeouts=_timeouts(settings),
     )
@@ -390,9 +397,8 @@ def _freeze_submission(
     if not visual.is_file():
         raise _SubmitError(409, "prepared_input_invalid")
     duration = float(meta["duration_s"])
-    request_duration = max(1, min(15, math.ceil(duration)))
+    request_duration = max(1, math.ceil(duration))
     engine_request = {
-        "context_ir": {"model": h3.IR_MODEL, "duration": request_duration, "ratio": "9:16"},
         "h3": {
             "workflow": h3.H3_WORKFLOW,
             "duration": request_duration,
@@ -453,13 +459,11 @@ def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
 def _result_fields(result: h3.H3Result) -> tuple[str, str | None]:
     if result.status == "succeeded":
         return "succeeded", None
-    if result.status in {"submission_unknown", "ir_submitting", "h3_submitting"}:
+    if result.status in {"submission_unknown", "h3_submitting"}:
         return "submission_unknown", "submission_unknown"
-    if result.status == "ready_for_h3":
-        return "resume_required", "ready_for_h3"
     if result.error_code in _KNOWN_TASK_ERRORS:
         return "resume_required", result.error_code
-    if result.status in {"ir_running", "h3_running"}:
+    if result.status == "h3_running":
         return "resume_required", result.status
     if result.status in {"failed", "retryable_failure"}:
         return "failed", result.error_code or "h3_failed"
@@ -508,10 +512,7 @@ def _generation_error(settings: Settings, cid: str, request: h3.H3Request, code:
         elif code in _AMBIGUOUS_SUBMIT_ERRORS and inspected.status not in {
             "succeeded",
             "submission_unknown",
-            "ir_submitting",
             "h3_submitting",
-            "ready_for_h3",
-            "ir_running",
             "h3_running",
             "failed",
             "retryable_failure",
@@ -550,33 +551,6 @@ def _run_generation(settings: Settings, cid: str, request: h3.H3Request, retry: 
     _finish_generation(settings, cid, request, result)
 
 
-def _run_context_ir(settings: Settings, cid: str, request: h3.H3Request) -> None:
-    """Prepare Context IR only; H3 submission remains an explicit later action."""
-    meta = storage.load_meta(settings.data_dir, cid)
-    generation = meta.get("generation") if meta else None
-    if not isinstance(generation, dict) or generation.get("client_request_id") != request.client_request_id:
-        return
-    storage.update_meta(
-        settings.data_dir,
-        cid,
-        generation={
-            **generation,
-            "status": "running",
-            "error": None,
-            "stage": "context_ir",
-        },
-    )
-    try:
-        result = h3.prepare_context_ir(request)
-    except h3.H3Error as exc:
-        _generation_error(settings, cid, request, exc.code)
-        return
-    except Exception:
-        _generation_error(settings, cid, request, "h3_internal_error")
-        return
-    _finish_generation(settings, cid, request, result)
-
-
 def _mark_submission_unknown(settings: Settings, cid: str, generation: dict) -> None:
     """Lock an active paid attempt when it cannot be inspected safely."""
     storage.update_meta(
@@ -596,6 +570,18 @@ def _resume_generation(settings: Settings, cid: str) -> None:
         return
     generation = meta.get("generation")
     if not isinstance(generation, dict) or generation.get("status") not in _GENERATION_ACTIVE:
+        return
+    if _is_legacy_generation_contract(generation):
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            generation={
+                **generation,
+                "status": "failed",
+                "error": "generation_path_removed",
+                "stage": "h3",
+            },
+        )
         return
     if not _credentials_ready(settings):
         _mark_submission_unknown(settings, cid, generation)
@@ -650,7 +636,6 @@ def create_app(settings: Settings) -> FastAPI:
     # 创建临界区：幂等查重 + queued 计数 + 建目录必须原子
     create_lock = threading.Lock()
     submit_locks: dict[str, asyncio.Lock] = {}
-    translation_locks: dict[str, asyncio.Lock] = {}
     postprocess_locks: dict[str, asyncio.Lock] = {}
     # Seedream 后处理并行提交的进程级信号量：单进程内跨会话全局并发上限（SEEDREAM_CONCURRENCY）
     seedream_sem = asyncio.Semaphore(settings.seedream_concurrency)
@@ -757,7 +742,7 @@ def create_app(settings: Settings) -> FastAPI:
             else:
                 # 下载最长 download_timeout_s 秒，不能堵事件循环
                 dest = await run_in_threadpool(downloader.fetch_reference, reference_url, cdir, settings)
-            video = storage.probe_video(dest, min(settings.max_duration_s, 15))
+            video = storage.probe_video(dest)
             storage.update_meta(
                 settings.data_dir,
                 meta["id"],
@@ -798,7 +783,6 @@ def create_app(settings: Settings) -> FastAPI:
             "dialogue": _public_dialogue(meta),
             "receipt_version": _receipt_version(cdir, meta),
             "generation": _public_generation(meta),
-            "context_ir": _public_context_ir(cdir, meta["id"]),
             "has_source": any(cdir.glob("source.*")),
             "has_video": (cdir / "generated.mp4").is_file(),
             "submit_enabled": settings.enable_h3_submit,
@@ -844,272 +828,6 @@ def create_app(settings: Settings) -> FastAPI:
             except _SubmitError as exc:
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
         return {"prompt": updated, "sha256": digest, "final_prompt": final_prompt}
-
-    @app.get(
-        "/api/conversations/{cid}/context-ir",
-        dependencies=[Depends(require_auth)],
-    )
-    async def get_context_ir(cid: str):
-        meta = storage.load_meta(settings.data_dir, cid)
-        if meta is None:
-            raise HTTPException(status_code=404, detail="not found")
-        try:
-            snapshot = h3.inspect_context_ir(settings.data_dir / cid, cid)
-        except h3.H3Error as exc:
-            raise HTTPException(status_code=409, detail="context_ir_invalid") from exc
-        if snapshot.status == "not_started":
-            raise HTTPException(status_code=404, detail="context_ir_not_found")
-        if snapshot.prompt is None or snapshot.sha256 is None:
-            raise HTTPException(status_code=409, detail="context_ir_not_ready")
-        return {
-            "status": snapshot.status,
-            "prompt": snapshot.prompt,
-            "sha256": snapshot.sha256,
-            # Kept for response compatibility; reviewed IR is the authority.
-            "dialogue_valid": True,
-        }
-
-    @app.post(
-        "/api/conversations/{cid}/context-ir/translation",
-        dependencies=[Depends(require_auth)],
-    )
-    async def translate_context_ir(cid: str, payload: dict):
-        if set(payload) != {"expected_sha256"} or not isinstance(
-            payload.get("expected_sha256"), str
-        ):
-            raise HTTPException(
-                status_code=422, detail="invalid_context_ir_translation_request"
-            )
-        if not settings.minimax_api_key or not settings.minimax_text_model:
-            raise HTTPException(
-                status_code=503, detail="context_ir_translation_unavailable"
-            )
-        expected_sha256 = payload["expected_sha256"]
-        lock = translation_locks.setdefault(cid, asyncio.Lock())
-        async with lock:
-            meta = storage.load_meta(settings.data_dir, cid)
-            if meta is None:
-                raise HTTPException(status_code=404, detail="not found")
-            try:
-                snapshot = h3.inspect_context_ir(settings.data_dir / cid, cid)
-            except h3.H3Error as exc:
-                raise HTTPException(status_code=409, detail="context_ir_invalid") from exc
-            if (
-                snapshot.status != "succeeded"
-                or snapshot.prompt is None
-                or snapshot.sha256 is None
-            ):
-                raise HTTPException(status_code=409, detail="context_ir_not_ready")
-            if snapshot.sha256 != expected_sha256:
-                raise HTTPException(status_code=409, detail="context_ir_changed")
-            try:
-                result = await asyncio.to_thread(
-                    context_ir_translation.translate,
-                    root=settings.data_dir / cid,
-                    prompt=snapshot.prompt,
-                    source_sha256=snapshot.sha256,
-                    api_key=settings.minimax_api_key,
-                    model=settings.minimax_text_model,
-                    timeout_s=settings.context_ir_translation_timeout_s,
-                )
-            except context_ir_translation.TranslationError as exc:
-                status = 503 if exc.code == "context_ir_translation_unavailable" else 502
-                raise HTTPException(status_code=status, detail=exc.code) from exc
-        return {
-            "source_sha256": result.source_sha256,
-            "language": result.language,
-            "translation": result.translation,
-        }
-
-    @app.post(
-        "/api/conversations/{cid}/context-ir",
-        status_code=202,
-        dependencies=[Depends(require_auth)],
-    )
-    async def prepare_context_ir(
-        cid: str, payload: dict, background_tasks: BackgroundTasks
-    ):
-        if not settings.enable_h3_submit:
-            raise HTTPException(status_code=501, detail="H3 submission is disabled.")
-        meta = storage.load_meta(settings.data_dir, cid)
-        if meta is None:
-            raise HTTPException(status_code=404, detail="not found")
-        if _is_read_only(meta):
-            raise HTTPException(status_code=409, detail="read_only")
-        try:
-            request_id, fit_mode, dialogue = _validate_submit_payload(meta, payload)
-        except _SubmitError as exc:
-            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-        if meta.get("status") != "done":
-            raise HTTPException(status_code=409, detail="artifacts not ready")
-        if not _credentials_ready(settings):
-            raise HTTPException(status_code=503, detail="h3_credentials_missing")
-
-        lock = submit_locks.setdefault(cid, asyncio.Lock())
-        async with lock:
-            meta = storage.load_meta(settings.data_dir, cid)
-            if meta is None:
-                raise HTTPException(status_code=404, detail="not found")
-            if (settings.data_dir / cid / "generated.mp4").is_file():
-                raise HTTPException(status_code=409, detail="already submitted")
-            generation = meta.get("generation")
-            previous_attempt = 0
-            if isinstance(generation, dict):
-                previous_status = _effective_generation_status(generation)
-                previous_id = generation.get("client_request_id")
-                if previous_status == "submission_unknown":
-                    raise HTTPException(status_code=409, detail="submission_outcome_unknown")
-                if previous_status in _GENERATION_ACTIVE:
-                    if previous_id == request_id:
-                        return {
-                            "status": previous_status,
-                            "attempt": generation.get("attempt"),
-                        }
-                    raise HTTPException(status_code=409, detail="generation in progress")
-                if previous_status in _GENERATION_RESUMABLE:
-                    if (
-                        generation.get("error") == "ready_for_h3"
-                        and previous_id == request_id
-                    ):
-                        return {
-                            "status": "ready_for_h3",
-                            "attempt": generation.get("attempt"),
-                        }
-                    if previous_id != request_id:
-                        raise HTTPException(
-                            status_code=409, detail="resume_request_id_mismatch"
-                        )
-                    expected_dialogue = meta.get("prepared_dialogue")
-                    if (
-                        meta.get("dialogue_mode") != payload["dialogue_mode"]
-                        or meta.get("fit_mode") != fit_mode
-                        or not isinstance(expected_dialogue, list)
-                        or expected_dialogue != [dict(line) for line in dialogue]
-                    ):
-                        raise HTTPException(
-                            status_code=409, detail="resume_parameters_changed"
-                        )
-                    try:
-                        request = await asyncio.to_thread(
-                            _load_h3_request, settings, cid, meta
-                        )
-                    except _SubmitError as exc:
-                        raise HTTPException(
-                            status_code=exc.status, detail=exc.detail
-                        ) from exc
-                    storage.update_meta(
-                        settings.data_dir,
-                        cid,
-                        generation={
-                            **generation,
-                            "status": "queued",
-                            "error": None,
-                            "stage": "context_ir",
-                        },
-                    )
-                    background_tasks.add_task(
-                        _run_context_ir, settings, cid, request
-                    )
-                    return {
-                        "status": "queued",
-                        "attempt": generation.get("attempt"),
-                    }
-                if previous_status == "succeeded":
-                    raise HTTPException(status_code=409, detail="already submitted")
-                if previous_status not in _GENERATION_RETRYABLE:
-                    raise HTTPException(status_code=409, detail="generation_state_invalid")
-                if previous_id == request_id:
-                    raise HTTPException(
-                        status_code=409, detail="new client_request_id required"
-                    )
-                previous_attempt = generation.get("attempt")
-            if (
-                isinstance(previous_attempt, bool)
-                or not isinstance(previous_attempt, int)
-                or previous_attempt < 0
-            ):
-                raise HTTPException(status_code=409, detail="generation_state_invalid")
-            attempt = previous_attempt + 1
-            dialogue_mode = payload["dialogue_mode"]
-            try:
-                request = await asyncio.to_thread(
-                    _freeze_submission,
-                    settings,
-                    cid,
-                    meta,
-                    request_id,
-                    dialogue_mode,
-                    fit_mode,
-                    dialogue,
-                )
-            except _SubmitError as exc:
-                raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-            except h3.H3Error as exc:
-                raise HTTPException(
-                    status_code=503, detail="h3_configuration_invalid"
-                ) from exc
-            bare_lines = [
-                {key: line[key] for key in ("text", "start_s", "end_s")}
-                for line in dialogue
-            ]
-            generation = {
-                "status": "queued",
-                "error": None,
-                "attempt": attempt,
-                "client_request_id": request_id,
-                "stage": "context_ir",
-            }
-            storage.update_meta(
-                settings.data_dir,
-                cid,
-                dialogue_mode=dialogue_mode,
-                voice_lines=bare_lines,
-                prompt=request.prompt,
-                prepared_dialogue=[dict(line) for line in dialogue],
-                prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
-                fit_mode=fit_mode,
-                generation=generation,
-            )
-            background_tasks.add_task(_run_context_ir, settings, cid, request)
-        return {"status": "queued", "attempt": attempt}
-
-    @app.patch(
-        "/api/conversations/{cid}/context-ir",
-        dependencies=[Depends(require_auth)],
-    )
-    async def edit_context_ir(cid: str, payload: dict):
-        if set(payload) != {"confirm", "expected_sha256", "prompt"}:
-            raise HTTPException(status_code=422, detail="invalid_context_ir_request")
-        if payload.get("confirm") is not True:
-            raise HTTPException(status_code=409, detail="confirmation required")
-        expected_sha256 = payload.get("expected_sha256")
-        prompt = payload.get("prompt")
-        if not isinstance(expected_sha256, str) or not isinstance(prompt, str):
-            raise HTTPException(status_code=422, detail="invalid_context_ir_request")
-        meta = storage.load_meta(settings.data_dir, cid)
-        if meta is None:
-            raise HTTPException(status_code=404, detail="not found")
-        if _is_read_only(meta):
-            raise HTTPException(status_code=409, detail="read_only")
-        try:
-            request = await asyncio.to_thread(_load_h3_request, settings, cid, meta)
-            snapshot = await asyncio.to_thread(
-                h3.edit_context_ir, request, expected_sha256, prompt
-            )
-        except _SubmitError as exc:
-            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-        except h3.H3Error as exc:
-            status = 422 if exc.code in {
-                "invalid_context_ir_prompt",
-                "ir_dialogue_mismatch",
-            } else 409
-            raise HTTPException(status_code=status, detail=exc.code) from exc
-        return {
-            "status": snapshot.status,
-            "prompt": snapshot.prompt,
-            "sha256": snapshot.sha256,
-            "dialogue_valid": True,
-        }
 
     @app.get("/api/conversations/{cid}/files/{name:path}", dependencies=[Depends(require_auth)])
     async def get_file(cid: str, name: str):
@@ -1171,15 +889,6 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail=detail)
                 if previous_status in _GENERATION_RETRYABLE and previous_id == request_id:
                     raise HTTPException(status_code=409, detail="new client_request_id required")
-                if (
-                    previous_status in _GENERATION_RETRYABLE
-                    and generation.get("error") == "ir_dialogue_mismatch"
-                    and payload["dialogue_mode"] == "auto"
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="ir_dialogue_correction_required",
-                    )
                 if previous_status in _GENERATION_RESUMABLE:
                     if previous_id != request_id:
                         raise HTTPException(status_code=409, detail="resume_request_id_mismatch")

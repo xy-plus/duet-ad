@@ -56,18 +56,22 @@ def test_upload_oversize_422(tmp_path, video_1s):
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
 
 
-def test_upload_too_long_422_via_mock(client, video_1s, monkeypatch, settings):
-    """伪造 ffprobe 输出：时长 999s > 上限 2s。"""
+def test_upload_accepts_arbitrary_positive_duration(client, video_1s, monkeypatch, settings):
+    """项目不对视频总时长设上限。"""
     fake = subprocess.CompletedProcess(
         args=[], returncode=0,
-        stdout=json.dumps({"format": {"duration": "999.0"}}), stderr="",
+        stdout=json.dumps({
+            "format": {"duration": "999.0"},
+            "streams": [{"width": 320, "height": 240}],
+        }), stderr="",
     )
     monkeypatch.setattr("app.storage.subprocess.run", lambda *a, **kw: fake)
     with open(video_1s, "rb") as f:
         r = client.post("/api/conversations", headers=AUTH,
                         files={"file": ("clip.mp4", f, "video/mp4")})
-    assert r.status_code == 422
-    assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+    assert r.status_code == 201
+    meta = json.loads((settings.data_dir / r.json()["id"] / "meta.json").read_text())
+    assert meta["duration_s"] == 999.0
 
 
 def test_upload_requires_auth(client, video_1s):
@@ -222,6 +226,77 @@ def test_tiktok_video_facts_via_mock_transport():
         api_transport=httpx.MockTransport(handler),
     )
     assert facts == {"video_id": "7664758988675878151", "play": "https://cdn.example.com/v.mp4"}
+
+
+def test_reference_download_retries_two_transient_failures(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    cdir = tmp_path / "session"
+    cdir.mkdir()
+    calls = 0
+
+    def flaky(_url, dest, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise downloader.DownloadError("temporary", retryable=True)
+        dest.write_bytes(b"video")
+
+    monkeypatch.setattr(downloader, "download_public_video", flaky)
+    result = downloader.fetch_reference(
+        "https://example.com/video.mp4", cdir, settings
+    )
+
+    assert calls == 3
+    assert result.read_bytes() == b"video"
+
+
+def test_reference_download_does_not_retry_permanent_failure(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    cdir = tmp_path / "session"
+    cdir.mkdir()
+    calls = 0
+
+    def rejected(_url, _dest, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise downloader.DownloadError("private address")
+
+    monkeypatch.setattr(downloader, "download_public_video", rejected)
+    with pytest.raises(downloader.DownloadError, match="private address"):
+        downloader.fetch_reference("https://example.com/video.mp4", cdir, settings)
+
+    assert calls == 1
+
+
+def test_tiktok_retry_refreshes_temporary_play_url(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    cdir = tmp_path / "session"
+    cdir.mkdir()
+    facts_calls = 0
+    play_urls = []
+
+    def facts(_url, _proxy, *, timeout):
+        nonlocal facts_calls
+        facts_calls += 1
+        return {"video_id": "123", "play": f"https://cdn.example.com/{facts_calls}.mp4"}
+
+    def download(play_url, dest, **_kwargs):
+        play_urls.append(play_url)
+        if len(play_urls) == 1:
+            raise downloader.DownloadError("expired", retryable=True)
+        dest.write_bytes(b"video")
+
+    monkeypatch.setattr(downloader, "tiktok_video_facts", facts)
+    monkeypatch.setattr(downloader, "download_public_video", download)
+    downloader.fetch_reference(
+        "https://www.tiktok.com/@someone/video/123", cdir, settings
+    )
+
+    assert facts_calls == 2
+    assert play_urls == [
+        "https://cdn.example.com/1.mp4",
+        "https://cdn.example.com/2.mp4",
+    ]
 
 
 def test_create_with_reference_url_queued(client, monkeypatch, settings, video_1s):
