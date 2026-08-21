@@ -20,6 +20,8 @@ from typing import Literal, Sequence
 
 FPS = 24
 FRAME_DURATION_S = 1 / FPS
+MAX_SEGMENT_DURATION_S = 15.0
+MAX_TOTAL_DURATION_S = 300.0
 RECEIPT_FILENAME = "stitch-receipt.json"
 _TIMEOUT_S = 300
 
@@ -145,6 +147,7 @@ def _validate_request(
     if not frozen:
         raise ValueError("segments must not be empty")
     normalized: list[StitchSegment] = []
+    total_duration_s = 0.0
     for index, segment in enumerate(frozen):
         if not isinstance(segment, StitchSegment):
             raise TypeError("segments must contain StitchSegment values")
@@ -155,6 +158,12 @@ def _validate_request(
         duration = float(duration)
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError(f"segment {index + 1} target_duration_s must be finite and positive")
+        if duration > MAX_SEGMENT_DURATION_S:
+            raise ValueError(
+                f"segment {index + 1} target_duration_s must not exceed "
+                f"{MAX_SEGMENT_DURATION_S:g}s"
+            )
+        total_duration_s += duration
         if segment.join_mode not in {"continue", "hard_cut"}:
             raise ValueError(f"segment {index + 1} join_mode is invalid")
         if index == 0 and segment.join_mode != "hard_cut":
@@ -162,6 +171,10 @@ def _validate_request(
         if not path.is_file():
             raise ValueError(f"segment {index + 1} does not exist: {path}")
         normalized.append(StitchSegment(path, duration, segment.join_mode))
+    if total_duration_s > MAX_TOTAL_DURATION_S:
+        raise ValueError(
+            f"total target duration must not exceed {MAX_TOTAL_DURATION_S:g}s"
+        )
     source = Path(source_video).resolve()
     if not source.is_file():
         raise ValueError(f"source_video does not exist: {source}")
