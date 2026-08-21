@@ -1,4 +1,6 @@
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from app import storage
 
@@ -46,6 +48,26 @@ def test_list_conversations(tmp_path):
     items = storage.list_conversations(tmp_path)
     assert {m["id"] for m in items} == {a["id"], b["id"]}
     assert storage.list_conversations(tmp_path / "empty") == []
+
+
+def test_concurrent_meta_updates_are_atomic_and_do_not_lose_fields(tmp_path):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    barrier = threading.Barrier(2)
+
+    def update(**changes):
+        barrier.wait()
+        storage.update_meta(tmp_path, meta["id"], **changes)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(update, generation={"status": "running"}),
+            pool.submit(update, segments=[{"index": 1, "status": "succeeded"}]),
+        ]
+        for future in futures:
+            future.result()
+    stored = storage.load_meta(tmp_path, meta["id"])
+    assert stored["generation"] == {"status": "running"}
+    assert stored["segments"] == [{"index": 1, "status": "succeeded"}]
 
 
 def test_resolve_file_whitelist(tmp_path):

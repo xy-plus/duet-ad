@@ -1,8 +1,12 @@
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
@@ -14,6 +18,8 @@ _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 # files 白名单：segments/<正整数N>/work/(keyframes|postprocessed)/<纯文件名>
 _SEG_FILE_RE = re.compile(r"^([1-9]\d*)/work/(keyframes|postprocessed)/([^/]+)$")
+_META_LOCKS: dict[str, threading.Lock] = {}
+_META_LOCKS_GUARD = threading.Lock()
 
 
 class UploadError(ValueError):
@@ -38,7 +44,25 @@ def sanitize_title(filename: str) -> str:
 
 
 def _write_meta(cdir: Path, meta: dict) -> None:
-    (cdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+    payload = json.dumps(meta, ensure_ascii=False, indent=2)
+    fd, temporary = tempfile.mkstemp(prefix=".meta-", suffix=".json", dir=cdir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, cdir / "meta.json")
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+@contextmanager
+def _meta_lock(cdir: Path):
+    key = str(cdir.resolve())
+    with _META_LOCKS_GUARD:
+        lock = _META_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        yield
 
 
 def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_id: str = "",
@@ -74,13 +98,17 @@ def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_i
 
 def update_meta(data_dir: Path, cid: str, **changes) -> dict | None:
     """合并写字段并刷新 updated_at；cid 非法或不存在返回 None。"""
-    meta = load_meta(data_dir, cid)
-    if meta is None:
+    if not _ID_RE.match(cid):
         return None
-    meta.update(changes)
-    meta["updated_at"] = _now()
-    _write_meta(data_dir / cid, meta)
-    return meta
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = load_meta(data_dir, cid)
+        if meta is None:
+            return None
+        meta.update(changes)
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
 
 
 def load_meta(data_dir: Path, cid: str) -> dict | None:
