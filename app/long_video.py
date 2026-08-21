@@ -219,8 +219,8 @@ def build_continuity_block() -> str:
 def compose_segment_visual_prompt(local_prompt: str, continuity_block: str | None = None) -> str:
     if not isinstance(local_prompt, str) or not local_prompt.strip():
         raise LongVideoError("long_video_invalid_visual_prompt")
-    block = build_continuity_block() if continuity_block is None else continuity_block
-    if block != build_continuity_block():
+    block = _CONTINUITY_BLOCK if continuity_block is None else continuity_block
+    if block != _CONTINUITY_BLOCK:
         raise LongVideoError("long_video_invalid_continuity_block")
     return f"{block}\n\n【本段局部动作】\n{local_prompt.strip()}\n"
 
