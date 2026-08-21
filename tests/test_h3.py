@@ -370,6 +370,74 @@ def test_resume_only_queries_existing_h3_task(tmp_path):
     assert calls and all(call.method == "GET" for call in calls)
 
 
+def test_existing_v1_reference_attempt_remains_inspectable_and_get_only_resumable(tmp_path):
+    request = _request(tmp_path)
+    keyframes = [
+        {"name": path.name, "sha256": hashlib.sha256(blob).hexdigest()}
+        for path, blob in request.keyframes
+    ]
+    manifest = {
+        "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
+        "keyframes": keyframes,
+        "voice_texts_sha256": request.voice_receipt,
+        "request": {
+            "h3_workflow": "minimax_h3_lightx2v_v5",
+            "duration": 10,
+            "resolution": "768p竖",
+        },
+    }
+    receipt = {
+        "task_id": "old-known-task",
+        "input_receipt": h3.canonical_json_sha256(manifest),
+        "prompt_sha256": manifest["prompt_sha256"],
+        "keyframes": keyframes,
+        "request": {
+            "workflow": "minimax_h3_lightx2v_v5",
+            "duration": 10,
+            "resolution": "768p竖",
+        },
+    }
+    attempt = {
+        "schema_version": 1,
+        "cid": request.cid,
+        "attempt_id": "000001",
+        "client_request_id": request.client_request_id,
+        "input": manifest,
+        "input_receipt": h3.canonical_json_sha256(manifest),
+        "status": "h3_running",
+        "retryable": False,
+        "h3": {
+            "status": "running",
+            "task_id": "old-known-task",
+            "receipt": receipt,
+        },
+    }
+    path = _attempt_file(request)
+    path.parent.mkdir(parents=True)
+    (request.workdir / ".h3" / "session.json").write_text(
+        json.dumps({"schema_version": 1, "cid": request.cid}),
+        encoding="utf-8",
+    )
+    path.write_text(json.dumps(attempt), encoding="utf-8")
+
+    assert h3.inspect(request).status == "h3_running"
+    calls = []
+
+    def recovery(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        assert req.method == "GET"
+        if req.url.path.endswith("/result/old-known-task"):
+            return httpx.Response(
+                200,
+                json={"data": {"status": "SUCCESS", "results": [{"url": "https://download.invalid/video.mp4"}]}},
+            )
+        return _download_response(200, content=HappyProvider.video_bytes)
+
+    with _client(recovery) as client:
+        assert h3.resume(request, client=client).status == "succeeded"
+    assert calls and all(call.method == "GET" for call in calls)
+
+
 def test_h3_query_retries_without_repeating_post(tmp_path):
     request = _request(tmp_path)
     provider = HappyProvider()

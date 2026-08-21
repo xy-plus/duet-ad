@@ -32,7 +32,7 @@ from app.retry import RetryPolicy, run_with_retry
 from app.sanitize import sanitize
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 1
 H3_WORKFLOW = "minimax_h3_lightx2v_v5"
 H3_BOUNDARY_WORKFLOW = "minimax_h3_lightx2v"
 H3_RESOLUTION = "768p竖"
@@ -471,6 +471,23 @@ def _ensure_session_marker(request: H3Request) -> None:
 
 
 def _input_manifest(request: H3Request) -> dict[str, Any]:
+    if request.mode == "reference":
+        provider_request = {
+            "h3_workflow": H3_WORKFLOW,
+            "duration": request.duration,
+            "resolution": H3_RESOLUTION,
+        }
+        if request.seed is not None:
+            provider_request["seed"] = request.seed
+        return {
+            "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
+            "keyframes": [
+                {"name": path.name, "sha256": hashlib.sha256(blob).hexdigest()}
+                for path, blob in request.keyframes
+            ],
+            "voice_texts_sha256": request.voice_receipt,
+            "request": provider_request,
+        }
     provider_request = {
         "mode": request.mode,
         "h3_workflow": _workflow(request),
@@ -652,6 +669,21 @@ def _task_id(value: Any, *, required: bool) -> str | None:
 
 
 def _h3_receipt(request: H3Request, task_id: str) -> dict[str, Any]:
+    if request.mode == "reference":
+        provider_request = {
+            "workflow": H3_WORKFLOW,
+            "duration": request.duration,
+            "resolution": H3_RESOLUTION,
+        }
+        if request.seed is not None:
+            provider_request["seed"] = request.seed
+        return {
+            "task_id": task_id,
+            "input_receipt": canonical_json_sha256(_input_manifest(request)),
+            "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
+            "keyframes": _input_manifest(request)["keyframes"],
+            "request": provider_request,
+        }
     provider_request = {
         "mode": request.mode,
         "workflow": _workflow(request),
