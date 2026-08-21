@@ -1,6 +1,8 @@
 """任务 B：处理流水线（extract --fps 4 → codex 沙箱 → 白名单校验 → meta 落盘）。"""
 import base64
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -17,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import codex_runner, pipeline, prepared_input, storage, vocal, voice
+from app import codex_runner, long_generation, pipeline, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
@@ -1315,7 +1317,7 @@ def test_run_dialogue_auto_preserves_requested_voice_processing_mode(
     assert expected in asr_prompts[0]
 
 
-def test_run_dialogue_auto_uses_actual_12_4s_duration_and_ceil_engine_request(
+def test_run_dialogue_auto_routes_explicit_empty_12_4s_scene_result_to_long_plan(
     tmp_path, video_1s, monkeypatch
 ):
     settings = make_settings(tmp_path)
@@ -1344,6 +1346,24 @@ def test_run_dialogue_auto_uses_actual_12_4s_duration_and_ceil_engine_request(
                 json.dumps({"duration_s": 12.4, "scenes": [], "segments": []}),
                 encoding="utf-8",
             )
+        elif step.startswith("segment ") and step.endswith(" extract"):
+            work = Path(argv[argv.index("--out-dir") + 1])
+            work.mkdir(parents=True, exist_ok=True)
+            (work / "001_frame_000.000s.png").write_bytes(b"source-first")
+            (work / "002_frame_012.400s.png").write_bytes(b"source-last")
+            (work / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "frames": [
+                            {"index": 1, "time_seconds": 0.0,
+                             "file": "001_frame_000.000s.png"},
+                            {"index": 2, "time_seconds": 12.4,
+                             "file": "002_frame_012.400s.png"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
 
     def fake_extract_audio(cdir_arg):
         out = cdir_arg / "work" / "voice.mp3"
@@ -1358,6 +1378,14 @@ def test_run_dialogue_auto_uses_actual_12_4s_duration_and_ceil_engine_request(
             _write_valid_package(work)
 
     monkeypatch.setattr(pipeline, "_run_cmd", fake_steps)
+    monkeypatch.setattr(
+        pipeline,
+        "_cut_segment",
+        lambda _source, _start, _end, segdir: (
+            segdir.mkdir(parents=True, exist_ok=True),
+            (segdir / "source.mp4").write_bytes(b"segment"),
+        ),
+    )
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(voice, "probe_audio_duration", lambda _path: 12.4)
     monkeypatch.setattr(CodexRunner, "run", fake_codex)
@@ -1376,12 +1404,16 @@ def test_run_dialogue_auto_uses_actual_12_4s_duration_and_ceil_engine_request(
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done", stored.get("error")
     assert stored["voice_lines"] == [line]
-    receipt = json.loads(
-        (cdir / "prepared_input.json").read_text(encoding="utf-8")
-    )
+    receipt = json.loads((cdir / "long_video_plan.json").read_text(encoding="utf-8"))
     assert receipt["video"]["duration_s"] == 12.4
-    assert set(receipt["engine_request"]) == {"h3"}
-    assert receipt["engine_request"]["h3"]["duration"] == 13
+    assert len(receipt["segments"]) == 1
+    assert math.ceil(
+        receipt["segments"][0]["end_s"] - receipt["segments"][0]["start_s"]
+    ) == 13
+    assert stored["segments"][0]["dialogue"] == [line]
+    digest = hashlib.sha256((cdir / "long_video_plan.json").read_bytes()).hexdigest()
+    frozen = long_generation.freeze_plan(cdir, stored, digest, "none", "auto")
+    assert [math.ceil(item.end_s - item.start_s) for item in frozen.segments] == [13]
 
 
 def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(

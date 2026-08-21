@@ -139,7 +139,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
     if (
         not math.isfinite(duration)
         or duration <= long_video.SHORT_VIDEO_MAX_S
-        or duration > long_video.LONG_VIDEO_MAX_S + _EPS
+        or duration > long_video.LONG_VIDEO_MAX_S
         or abs(duration - meta_duration) > _EPS
         or not isinstance(raw_segments, list)
         or not raw_segments
@@ -167,8 +167,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             or not math.isfinite(start_s)
             or not math.isfinite(end_s)
             or abs(start_s - previous_end) > _EPS
-            or end_s - start_s < 1 - _EPS
-            or end_s - start_s > 15 + _EPS
+            or end_s - start_s < 1
             or math.ceil(end_s - start_s) > 15
             or not isinstance(chain_id, str)
             or not chain_id

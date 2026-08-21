@@ -21,6 +21,19 @@ def test_short_video_keeps_single_input_contract():
     assert plan_segments(10.0, [(0.0, 10.0)], []) == []
 
 
+def test_provider_integer_duration_boundaries_do_not_hide_positive_overflow():
+    ten_plus = math.nextafter(10.0, math.inf)
+    fifteen_plus = math.nextafter(15.0, math.inf)
+
+    assert plan_segments(ten_plus, [(0.0, ten_plus)], [])
+    segments = plan_segments(fifteen_plus, [(0.0, fifteen_plus)], [])
+    assert len(segments) == 2
+    assert all(math.ceil(item["end_s"] - item["start_s"]) <= 15 for item in segments)
+
+    with pytest.raises(LongVideoError, match="long_video_duration_exceeded"):
+        plan_segments(math.nextafter(300.0, math.inf), [], [])
+
+
 def test_long_scene_is_split_near_fifteen_and_continues_chain():
     segments = plan_segments(31.0, [(0.0, 31.0)], [])
 

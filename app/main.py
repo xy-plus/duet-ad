@@ -1010,7 +1010,16 @@ def create_app(settings: Settings) -> FastAPI:
                     return {"status": previous_status, "attempt": old.get("attempt")}
                 if previous_status == "submission_unknown":
                     raise HTTPException(status_code=409, detail="submission_outcome_unknown")
-                if (settings.data_dir / cid / "generated.mp4").is_file():
+                stitch_retry = (
+                    previous_status == "failed"
+                    and old.get("stage") == "stitch"
+                    and previous_id == request_id
+                    and same_parameters
+                )
+                if (
+                    (settings.data_dir / cid / "generated.mp4").is_file()
+                    and not stitch_retry
+                ):
                     raise HTTPException(status_code=409, detail="already submitted")
                 if previous_status == "failed" and not same_parameters:
                     raise HTTPException(status_code=409, detail="resume_parameters_changed")
