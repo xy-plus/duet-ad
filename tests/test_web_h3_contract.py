@@ -42,7 +42,8 @@ def test_creation_and_copy_use_h3_contract_only():
     assert "voice-mode" in source
     assert "target_language" in source
     assert "H3" in source
-    assert "最长 10 秒" in source
+    assert "最长 300 秒" in source
+    assert "10 秒以上会拆分为最长 15 秒的 H3 子任务" in source
     assert "时长不限" not in source
 
 
@@ -109,13 +110,14 @@ def test_detail_signature_tracks_direct_h3_render_fields():
         "receipt_version:1,fit_mode:'none',dialogue:[],"
         "generation:{status:null,error:null,attempt:0,client_request_id:null,stage:'h3'},"
         "keyframes:[],segments:[]};"
-        "const original=contract.detailSignature(base).stable;"
+        "const original=contract.detailSignature(base);"
         "const variants=["
         "{...base,read_only:true},{...base,dialogue:[{start_s:0,end_s:1,text:'x'}]},"
         "{...base,receipt_version:2},{...base,fit_mode:'pad'},"
         "{...base,generation:{status:'running',error:null,attempt:1,client_request_id:'request-a',stage:'h3'}},"
         "{...base,source_prompt:'edited',source_prompt_sha256:'b'.repeat(64)}];"
-        "return variants.map(value => contract.detailSignature(value).stable !== original);"
+        "return variants.map(value => {const next=contract.detailSignature(value);"
+        "return next.stable !== original.stable || next.generation !== original.generation;});"
         "})()"
     )
     assert result == [True, True, True, True, True, True]

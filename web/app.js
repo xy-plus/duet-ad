@@ -120,6 +120,20 @@ function parseDialogueLines(text) {
   });
 }
 
+function longVideoContract(detail) {
+  const isLong = Number(detail && detail.duration_s) > 10;
+  const segmentCount = Number.isInteger(detail && detail.segment_count)
+    && detail.segment_count > 0 ? detail.segment_count : null;
+  const planReceipt = typeof (detail && detail.plan_receipt) === "string"
+    && /^[0-9a-f]{64}$/.test(detail.plan_receipt) ? detail.plan_receipt : null;
+  return {
+    isLong,
+    ready: !isLong || (segmentCount !== null && planReceipt !== null),
+    segmentCount,
+    planReceipt,
+  };
+}
+
 function buildSubmitPayload(input) {
   const dialogueMode = input.dialogueMode;
   if (!["auto", "edit", "custom", "none"].includes(dialogueMode)) {
@@ -127,6 +141,13 @@ function buildSubmitPayload(input) {
   }
   const requestId = String(input.clientRequestId || "").trim();
   if (!requestId) throw new Error("缺少本次生成请求标识");
+  if (input.isLong && dialogueMode !== "auto" && dialogueMode !== "none") {
+    throw new Error("长视频仅支持保留完整源音轨或静音");
+  }
+  if (input.isLong && (typeof input.planReceipt !== "string"
+      || !/^[0-9a-f]{64}$/.test(input.planReceipt))) {
+    throw new Error("长视频生成计划尚未就绪，请刷新后重试");
+  }
 
   let fitMode = "none";
   if (input.fitRequired) {
@@ -140,6 +161,7 @@ function buildSubmitPayload(input) {
     dialogue_mode: dialogueMode,
     fit_mode: fitMode,
   };
+  if (input.isLong) body.expected_plan_receipt = input.planReceipt;
   if (dialogueMode === "edit" || dialogueMode === "custom") {
     const lines = parseDialogueLines(input.linesText);
     if (lines.length === 0) throw new Error("请至少填写一行台词");
@@ -173,6 +195,14 @@ function buildResumePayload(detail) {
     dialogue_mode: dialogue.mode,
     fit_mode: detail.fit_mode,
   };
+  const longContract = longVideoContract(detail);
+  if (longContract.isLong) {
+    if (!longContract.ready) throw new Error("长视频生成计划尚未就绪，请刷新后重试");
+    if (dialogue.mode !== "auto" && dialogue.mode !== "none") {
+      throw new Error("长视频既有任务台词模式无效");
+    }
+    body.expected_plan_receipt = longContract.planReceipt;
+  }
   if (dialogue.mode === "edit" || dialogue.mode === "custom") {
     if (!Array.isArray(dialogue.lines) || dialogue.lines.length === 0) throw new Error("既有任务台词缺失");
     body.lines = dialogue.lines;
@@ -613,6 +643,7 @@ async function submitGeneration(detail, card) {
   if (!canOperate(detail) || state.generationSubmitting[detail.id]
       || (action !== "new" && action !== "retry")) return;
   const draft = generationDraft(detail);
+  const longContract = longVideoContract(detail);
   const errorBox = card.querySelector(".generation-form-error");
   let body;
   try {
@@ -622,6 +653,8 @@ async function submitGeneration(detail, card) {
       linesText: draft.dialogueMode === "edit" ? draft.editLinesText : draft.customLinesText,
       fitRequired: detail.fit_required === true,
       fitMode: draft.fitMode,
+      isLong: longContract.isLong,
+      planReceipt: longContract.planReceipt,
     });
   } catch (error) {
     errorBox.textContent = error.message;
@@ -630,6 +663,43 @@ async function submitGeneration(detail, card) {
   }
 
   await postGeneration(detail, card, body);
+}
+
+function generationStageText(stage) {
+  if (stage === "h3") return "H3 子任务生成";
+  if (stage === "stitching") return "视频拼接";
+  return stage ? String(stage) : "等待开始";
+}
+
+function generationSegmentStatusText(status) {
+  const labels = {
+    pending: "等待中", queued: "排队中", running: "生成中", succeeded: "已完成",
+    failed: "失败", resume_required: "等待继续", submission_unknown: "状态未知",
+  };
+  return labels[status] || status || "等待中";
+}
+
+function appendGenerationProgress(card, generation) {
+  const segments = Array.isArray(generation.segments) ? generation.segments : [];
+  if (segments.length === 0) return;
+  const completed = segments.filter((segment) => segment && segment.status === "succeeded").length;
+  const progress = el("div", "generation-progress");
+  progress.appendChild(el("strong", null, "完成 " + completed + "/" + segments.length));
+  progress.appendChild(el("span", null, "当前阶段：" + generationStageText(generation.stage)));
+  const list = el("ol", "generation-segments");
+  for (const segment of segments) {
+    const item = el("li", "generation-segment status-" + String(segment.status || "pending"));
+    item.appendChild(el("strong", null, "第 " + (Number(segment.index) + 1) + " 段 · "
+      + generationSegmentStatusText(segment.status)));
+    const meta = el("span", null, "chain：" + (segment.chain_id || "-")
+      + " · join：" + (segment.join_mode || "-")
+      + " · 尝试 " + (segment.attempt || 0));
+    item.appendChild(meta);
+    if (segment.error) item.appendChild(el("span", "generation-segment-error", segment.error));
+    list.appendChild(item);
+  }
+  progress.appendChild(list);
+  card.appendChild(progress);
 }
 
 async function resumeGeneration(detail, card) {
@@ -697,6 +767,7 @@ function renderFinalSection(detail) {
   const sec = el("section", "res-section");
   const card = el("div", "final-card");
   card.appendChild(el("h3", "res-h3", "最终视频 · H3"));
+  appendGenerationProgress(card, generation);
 
   if (generation.status === "queued" || generation.status === "running") {
     const status = el("div", "generation-status is-running");
@@ -729,6 +800,20 @@ function renderFinalSection(detail) {
     return sec;
   }
 
+  const longContract = longVideoContract(detail);
+  if (longContract.isLong && !longContract.ready) {
+    card.appendChild(el("p", "final-warning", "长视频生成计划尚未就绪，请刷新后重试"));
+    sec.appendChild(card);
+    return sec;
+  }
+
+  if (longContract.isLong) {
+    const notice = el("div", "long-video-notice");
+    notice.appendChild(el("strong", null, "将创建 " + longContract.segmentCount + " 个 H3 子任务"));
+    notice.appendChild(el("p", null, "跨段连续性为 best effort；失败时只重做失败段。"));
+    card.appendChild(notice);
+  }
+
   if (generationAction(generation.status) === "resume") {
     const locked = el("div", "resume-lock");
     locked.appendChild(el("strong", null, "继续既有 H3 任务"));
@@ -758,12 +843,18 @@ function renderFinalSection(detail) {
   const dialogueField = el("fieldset", "final-field");
   dialogueField.appendChild(el("legend", null, "台词模式"));
   const dialogueChoices = el("div", "final-choices");
-  const modes = [
+  const modes = longContract.isLong ? [
+    ["auto", "保留完整源音轨"],
+    ["none", "静音"],
+  ] : [
     ["auto", "自动台词"],
     ["edit", "编辑识别台词"],
     ["custom", "自定义台词"],
     ["none", "无台词"],
   ];
+  if (longContract.isLong && draft.dialogueMode !== "auto" && draft.dialogueMode !== "none") {
+    draft.dialogueMode = "auto";
+  }
   for (const [value, label] of modes) {
     const item = choice("dialogue-" + detail.id, value, label, draft.dialogueMode === value);
     const input = item.querySelector("input");
@@ -779,13 +870,16 @@ function renderFinalSection(detail) {
   }
   dialogueField.appendChild(dialogueChoices);
   const autoCount = normalizeDialogueLines(detail.dialogue).length;
-  dialogueField.appendChild(el("p", "final-help", autoCount
-    ? "自动识别到 " + autoCount + " 行台词；编辑模式会以这些台词预填。"
-    : "未识别到自动台词；可改用自定义或无台词。"));
+  dialogueField.appendChild(el("p", "final-help", longContract.isLong
+    ? "保留完整源音轨不会按段改写台词；选择静音将移除源音轨。"
+    : (autoCount
+      ? "自动识别到 " + autoCount + " 行台词；编辑模式会以这些台词预填。"
+      : "未识别到自动台词；可改用自定义或无台词。")));
   card.appendChild(dialogueField);
 
   const editor = el("div", "dialogue-editor");
-  editor.hidden = draft.dialogueMode !== "edit" && draft.dialogueMode !== "custom";
+  editor.hidden = longContract.isLong
+    || (draft.dialogueMode !== "edit" && draft.dialogueMode !== "custom");
   const textarea = el("textarea", "dialogue-textarea");
   textarea.rows = 5;
   textarea.placeholder = "0 - 1.5 | 第一行台词\n1.5 - 3 | 第二行台词";
@@ -1294,6 +1388,7 @@ function renderPpChat(detail) {
 function renderDetail(detail) {
   renderStable(detail);
   renderPpDynamic(detail);
+  renderGenerationDynamic(detail);
 }
 
 /* 稳定区：用户气泡 + 结果区 + 后处理入口 + 最终视频；中间留 .pp-dynamic 插槽给后处理聊天 */
@@ -1310,7 +1405,7 @@ function renderStable(detail) {
     const ppAsk = renderPpAsk(detail);
     if (ppAsk) inner.appendChild(ppAsk);
     inner.appendChild(el("div", "pp-dynamic"));
-    inner.appendChild(renderFinalSection(detail));
+    inner.appendChild(el("div", "generation-dynamic"));
   }
   $("stream").appendChild(inner);
 }
@@ -1325,17 +1420,25 @@ function renderPpDynamic(detail) {
   if (ppChat) slot.appendChild(ppChat);
 }
 
+/* H3 任务进度独立刷新，避免每个分段状态变化都重建原视频和关键帧。 */
+function renderGenerationDynamic(detail) {
+  const slot = document.querySelector(".generation-dynamic");
+  if (!slot) return;
+  slot.textContent = "";
+  slot.appendChild(renderFinalSection(detail));
+}
+
 /* ===== 会话详情 + 轮询 ===== */
 /* 详情状态签名：
    stable 变（状态机/产物内容变化）→ 全量重渲染一次；
    仅 dyn 变（后处理 running 时 frames 逐帧增长）→ 只刷新后处理动态区；
+   generation 变 → 只刷新最终视频区，保留原视频 DOM；
    完全不变 → 什么都不做（连 DOM 都不碰，杜绝每 2s 清空重建媒体引发的闪烁）。
    dyn 取 postprocess.frames 长度：只有它会在 stable 不变时随轮询增长。 */
 function detailSignature(detail) {
   // stable 覆盖稳定区渲染消费的全部字段（未覆盖字段如 title/note 由创建后不变兜底，
   // pp.options 与 status 原子落盘——见审查记录）；dyn 只跟后处理进度（frames 单调增长）。
   const pp = detail.postprocess || null;
-  const generation = detail.generation || null;
   const segments = Array.isArray(detail.segments) ? detail.segments : [];
   const stable = JSON.stringify([
     detail.status,
@@ -1348,11 +1451,6 @@ function detailSignature(detail) {
     detail.source_prompt || null,
     detail.source_prompt_sha256 || null,
     detail.dialogue || null,
-    generation ? generation.status : null,
-    generation ? generation.error : null,
-    generation ? generation.attempt : null,
-    generation ? generation.client_request_id : null,
-    generation ? generation.stage : null,
     pp ? pp.status : "",
     pp && pp.error ? pp.error : "",
     Array.isArray(detail.keyframes) ? detail.keyframes.join(",") : "",
@@ -1366,7 +1464,13 @@ function detailSignature(detail) {
     detail.has_video ? 1 : 0,
   ]);
   const dyn = pp && Array.isArray(pp.frames) ? pp.frames.length : 0;
-  return { stable, dyn };
+  const generation = JSON.stringify([
+    detail.plan_receipt || null,
+    Number.isInteger(detail.segment_count) ? detail.segment_count : null,
+    detail.generation || null,
+    detail.has_video ? 1 : 0,
+  ]);
+  return { stable, dyn, generation };
 }
 
 async function loadDetail(id, silent) {
@@ -1386,9 +1490,15 @@ async function loadDetail(id, silent) {
     } else if (!state.detailSig || sig.stable !== state.detailSig.stable) {
       // 轮询：stable 变（queued→processing→done、后处理进入/离开 running、产物变化）→ 全量一次
       renderDetail(detail);
-    } else if (sig.dyn !== state.detailSig.dyn) {
-      // 轮询：仅后处理进度增长 → 只刷动态区，稳定区 <video>/<img> 引用不重建
-      renderPpDynamic(detail);
+    } else {
+      if (sig.dyn !== state.detailSig.dyn) {
+        // 轮询：仅后处理进度增长 → 只刷动态区，稳定区 <video>/<img> 引用不重建
+        renderPpDynamic(detail);
+      }
+      if (sig.generation !== state.detailSig.generation) {
+        // 分段 H3 / 拼接进度变化只刷新最终视频卡片，不重载源视频。
+        renderGenerationDynamic(detail);
+      }
     }
     // 签名完全不变 → 不碰 DOM（根治轮询闪烁的关键）
     state.detailSig = sig;
@@ -1760,6 +1870,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatDialogueLines,
     generationDraft,
     generationAction,
+    longVideoContract,
     normalizeDialogueLines,
     parseDialogueLines,
   };
