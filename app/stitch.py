@@ -1,0 +1,355 @@
+"""Deterministic local assembly for ordered H3 segment outputs.
+
+This module has no provider dependency.  It normalizes paid segment artifacts,
+joins them, optionally restores the original source audio, validates the result,
+and only then atomically replaces the conversation-level output.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, Sequence
+
+
+FPS = 24
+FRAME_DURATION_S = 1 / FPS
+RECEIPT_FILENAME = "stitch-receipt.json"
+_TIMEOUT_S = 300
+
+JoinMode = Literal["continue", "hard_cut"]
+AudioMode = Literal["keep", "mute"]
+
+
+class StitchError(RuntimeError):
+    """A local probe, normalization, mux, or validation step failed."""
+
+
+@dataclass(frozen=True)
+class StitchSegment:
+    path: Path
+    target_duration_s: float
+    join_mode: JoinMode
+
+
+@dataclass(frozen=True)
+class StitchResult:
+    output: Path
+    receipt_path: Path
+    duration_s: float
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
+class _VideoInfo:
+    duration_s: float
+    width: int
+    height: int
+    codec_name: str
+    pix_fmt: str
+    frame_rate: float
+    has_audio: bool
+
+
+def _clean_error(stderr: str) -> str:
+    text = " ".join(stderr.strip().split())
+    return text[-600:] if text else "no diagnostic output"
+
+
+def _run(argv: list[str], *, cwd: Path | None = None, step: str) -> None:
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT_S,
+        )
+    except FileNotFoundError:
+        raise StitchError(f"{argv[0]} not found during {step}") from None
+    except subprocess.TimeoutExpired:
+        raise StitchError(f"{step} timed out after {_TIMEOUT_S}s") from None
+    if result.returncode != 0:
+        raise StitchError(
+            f"ffmpeg failed during {step}: {_clean_error(result.stderr)}"
+        )
+
+
+def _parse_rate(value: object) -> float:
+    if not isinstance(value, str) or "/" not in value:
+        raise ValueError
+    numerator, denominator = value.split("/", 1)
+    rate = float(numerator) / float(denominator)
+    if not math.isfinite(rate) or rate <= 0:
+        raise ValueError
+    return rate
+
+
+def _probe(path: Path) -> _VideoInfo:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries",
+                "stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,duration:format=duration",
+                "-of", "json", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        raise StitchError("ffprobe not found") from None
+    except subprocess.TimeoutExpired:
+        raise StitchError("ffprobe timed out after 30s") from None
+    if result.returncode != 0:
+        raise StitchError(f"ffprobe failed for {path}: {_clean_error(result.stderr)}")
+    try:
+        payload = json.loads(result.stdout)
+        streams = payload["streams"]
+        video = next(stream for stream in streams if stream.get("codec_type") == "video")
+        duration = float(video.get("duration") or payload["format"]["duration"])
+        width = int(video["width"])
+        height = int(video["height"])
+        codec_name = str(video["codec_name"])
+        pix_fmt = str(video["pix_fmt"])
+        frame_rate = _parse_rate(video["avg_frame_rate"])
+        has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+    except (KeyError, StopIteration, TypeError, ValueError, ZeroDivisionError):
+        raise StitchError(f"ffprobe returned invalid video metadata for {path}") from None
+    if not math.isfinite(duration) or duration <= 0 or width <= 0 or height <= 0:
+        raise StitchError(f"ffprobe returned invalid video metadata for {path}")
+    return _VideoInfo(duration, width, height, codec_name, pix_fmt, frame_rate, has_audio)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_request(
+    segments: Sequence[StitchSegment], source_video: Path, output: Path, audio_mode: str,
+) -> tuple[tuple[StitchSegment, ...], Path, Path]:
+    if audio_mode not in {"keep", "mute"}:
+        raise ValueError("audio_mode must be 'keep' or 'mute'")
+    frozen = tuple(segments)
+    if not frozen:
+        raise ValueError("segments must not be empty")
+    normalized: list[StitchSegment] = []
+    for index, segment in enumerate(frozen):
+        if not isinstance(segment, StitchSegment):
+            raise TypeError("segments must contain StitchSegment values")
+        path = Path(segment.path).resolve()
+        duration = segment.target_duration_s
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            raise ValueError(f"segment {index + 1} target_duration_s must be finite and positive")
+        duration = float(duration)
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError(f"segment {index + 1} target_duration_s must be finite and positive")
+        if segment.join_mode not in {"continue", "hard_cut"}:
+            raise ValueError(f"segment {index + 1} join_mode is invalid")
+        if index == 0 and segment.join_mode != "hard_cut":
+            raise ValueError("first segment join_mode must be 'hard_cut'")
+        if not path.is_file():
+            raise ValueError(f"segment {index + 1} does not exist: {path}")
+        normalized.append(StitchSegment(path, duration, segment.join_mode))
+    source = Path(source_video).resolve()
+    if not source.is_file():
+        raise ValueError(f"source_video does not exist: {source}")
+    destination = Path(output).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    inputs = {source, *(segment.path for segment in normalized)}
+    if destination in inputs:
+        raise ValueError("output must not overwrite an input file")
+    return tuple(normalized), source, destination
+
+
+def _frame_budgets(segments: Sequence[StitchSegment]) -> list[int]:
+    budgets: list[int] = []
+    prior_total = 0
+    target_total = 0.0
+    for index, segment in enumerate(segments):
+        target_total += segment.target_duration_s
+        cumulative_frames = round(target_total * FPS)
+        frames = cumulative_frames - prior_total
+        if frames < 1:
+            raise ValueError(
+                f"segment {index + 1} target duration is too short for {FPS}fps output"
+            )
+        budgets.append(frames)
+        prior_total = cumulative_frames
+    return budgets
+
+
+def _normalize_segment(
+    segment: StitchSegment,
+    destination: Path,
+    frames: int,
+    width: int,
+    height: int,
+    index: int,
+) -> None:
+    drop = 1 if index > 0 and segment.join_mode == "continue" else 0
+    # trim before fps so `continue` removes exactly one decoded supplier frame.
+    video_filter = (
+        f"trim=start_frame={drop},setpts=PTS-STARTPTS,"
+        f"fps={FPS},"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+        f"tpad=stop_mode=clone:stop_duration={frames / FPS + 1:.9f},"
+        f"trim=end_frame={frames},setpts=N/({FPS}*TB),format=yuv420p"
+    )
+    _run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-i", str(segment.path),
+            "-map", "0:v:0", "-an", "-vf", video_filter,
+            "-frames:v", str(frames), "-r", str(FPS),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-video_track_timescale", str(FPS), str(destination),
+        ],
+        step=f"normalizing segment {index + 1}",
+    )
+
+
+def _validate_output(path: Path, expected_duration_s: float, audio_mode: str,
+                     source_has_audio: bool) -> _VideoInfo:
+    info = _probe(path)
+    if info.codec_name != "h264" or info.pix_fmt != "yuv420p":
+        raise StitchError("final video is not H.264/yuv420p")
+    if abs(info.frame_rate - FPS) > 0.001:
+        raise StitchError(f"final video frame rate is {info.frame_rate}, expected {FPS}")
+    if abs(info.duration_s - expected_duration_s) > FRAME_DURATION_S + 1e-6:
+        raise StitchError(
+            f"final video duration {info.duration_s:.6f}s differs from "
+            f"target {expected_duration_s:.6f}s by more than one frame"
+        )
+    expected_audio = audio_mode == "keep" and source_has_audio
+    if info.has_audio != expected_audio:
+        raise StitchError("final audio streams do not match requested audio strategy")
+    return info
+
+
+def stitch_video(
+    *,
+    segments: Sequence[StitchSegment],
+    source_video: Path,
+    output: Path,
+    audio_mode: AudioMode,
+    receipt_path: Path | None = None,
+) -> StitchResult:
+    """Assemble local segment files and atomically publish a validated MP4.
+
+    ``join_mode`` describes the boundary before each segment.  The first segment
+    must therefore be ``hard_cut``.  At a ``continue`` boundary, exactly the
+    latter segment's first decoded frame is removed before 24fps conversion.
+    """
+    normalized, source, destination = _validate_request(
+        segments, Path(source_video), Path(output), audio_mode
+    )
+    receipt = Path(receipt_path or destination.with_name(RECEIPT_FILENAME)).resolve()
+    if receipt.parent != destination.parent:
+        raise ValueError("receipt_path must be in the output directory")
+    if receipt == destination:
+        raise ValueError("receipt_path must differ from output")
+    if receipt == source or any(receipt == segment.path for segment in normalized):
+        raise ValueError("receipt_path must not overwrite an input file")
+    if receipt.exists() and not receipt.is_file():
+        raise ValueError("receipt_path must be a regular file or not exist")
+
+    budgets = _frame_budgets(normalized)
+    first_info = _probe(normalized[0].path)
+    width = first_info.width - first_info.width % 2
+    height = first_info.height - first_info.height % 2
+    source_info = _probe(source)
+    encoded_duration = sum(budgets) / FPS
+    requested_duration = sum(segment.target_duration_s for segment in normalized)
+    segment_bindings = [
+        {
+            "index": index,
+            "path": str(segment.path),
+            "sha256": _sha256(segment.path),
+            "target_duration_s": segment.target_duration_s,
+            "output_frames": budgets[index - 1],
+            "join_mode": segment.join_mode,
+        }
+        for index, segment in enumerate(normalized, 1)
+    ]
+
+    with tempfile.TemporaryDirectory(prefix=".stitch-", dir=destination.parent) as raw_tmp:
+        tmp = Path(raw_tmp)
+        normalized_paths: list[Path] = []
+        for index, (segment, frames) in enumerate(zip(normalized, budgets), 1):
+            segment_output = tmp / f"segment-{index:04d}.mp4"
+            _normalize_segment(segment, segment_output, frames, width, height, index - 1)
+            normalized_paths.append(segment_output)
+
+        concat_file = tmp / "concat.txt"
+        concat_file.write_text(
+            "".join(f"file '{path.name}'\n" for path in normalized_paths),
+            encoding="utf-8",
+        )
+        joined = tmp / "joined.mp4"
+        _run(
+            [
+                "ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "1",
+                "-i", concat_file.name, "-map", "0:v:0", "-c:v", "copy", "-an",
+                "-movflags", "+faststart", joined.name,
+            ],
+            cwd=tmp,
+            step="concatenating normalized segments",
+        )
+
+        candidate = joined
+        if audio_mode == "keep" and source_info.has_audio:
+            candidate = tmp / "candidate.mp4"
+            _run(
+                [
+                    "ffmpeg", "-v", "error", "-y", "-i", str(joined),
+                    "-i", str(source), "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy", "-c:a", "aac", "-t", f"{encoded_duration:.9f}",
+                    "-movflags", "+faststart", str(candidate),
+                ],
+                step="restoring source audio",
+            )
+
+        final_info = _validate_output(
+            candidate, requested_duration, audio_mode, source_info.has_audio
+        )
+        output_sha = _sha256(candidate)
+        output_size = candidate.stat().st_size
+        payload = {
+            "schema": "duet.stitch",
+            "version": 1,
+            "segments": segment_bindings,
+            "audio": {
+                "mode": audio_mode,
+                "source": str(source),
+                "source_sha256": _sha256(source),
+                "source_has_audio": source_info.has_audio,
+            },
+            "output": {
+                "name": destination.name,
+                "sha256": output_sha,
+                "size": output_size,
+                "duration_s": final_info.duration_s,
+                "fps": FPS,
+            },
+        }
+        temporary_receipt = tmp / "receipt.json"
+        temporary_receipt.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(candidate, destination)
+        os.replace(temporary_receipt, receipt)
+
+    return StitchResult(destination, receipt, final_info.duration_s, output_sha, output_size)
