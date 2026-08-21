@@ -254,6 +254,31 @@ def _provider_error_detail(payload: Mapping[str, Any], *, secret: str) -> str:
     return sanitize(" | ".join(values), secrets=(secret,))
 
 
+def _provider_failure_diagnostic(
+    payload: Mapping[str, Any], *, status: str, secret: str
+) -> dict[str, str]:
+    """Keep only bounded provider-owned fields needed to investigate a failure."""
+
+    diagnostic = {
+        "status": status,
+        "detail": _safe_provider_field(
+            _provider_error_detail(payload, secret=secret), limit=300, secret=secret
+        ),
+    }
+    request_id = payload.get("request_id")
+    if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
+        safe_request_id = _safe_provider_field(request_id, limit=128, secret=secret)
+        if safe_request_id:
+            diagnostic["request_id"] = safe_request_id
+    return diagnostic
+
+
+def _safe_provider_field(value: Any, *, limit: int, secret: str) -> str:
+    return " ".join(
+        sanitize(str(value).strip(), limit=limit, secrets=(secret,)).splitlines()
+    )
+
+
 def _run_automatic_retry(
     timeouts: Timeouts,
     operation: Callable[[], _T],
@@ -634,6 +659,37 @@ def _validate_state(
         not isinstance(error, dict) or error.get("code") not in _SAFE_ERROR_CODES
     ):
         raise ReceiptError("state_invalid")
+    if isinstance(error, dict) and "provider" in error:
+        provider = error["provider"]
+        if (
+            error.get("code") != "h3_provider_failed"
+            or set(error) != {"code", "provider"}
+            or not isinstance(provider, dict)
+            or not {"status", "detail"}.issubset(provider)
+            or not set(provider).issubset({"status", "detail", "request_id"})
+            or provider.get("status") not in {"FAILED", "ERROR", "FAIL"}
+            or not isinstance(provider.get("detail"), str)
+            or len(provider["detail"]) > 300
+            or provider["detail"]
+            != _safe_provider_field(
+                provider["detail"], limit=300, secret=request.autodl_token
+            )
+            or (
+                "request_id" in provider
+                and (
+                    not isinstance(provider["request_id"], str)
+                    or not provider["request_id"]
+                    or len(provider["request_id"]) > 128
+                    or provider["request_id"]
+                    != _safe_provider_field(
+                        provider["request_id"],
+                        limit=128,
+                        secret=request.autodl_token,
+                    )
+                )
+            )
+        ):
+            raise ReceiptError("state_invalid")
     h3_task_id = _task_id(h3_state.get("task_id"), required=False)
     if h3_task_id is not None:
         if h3_state.get("receipt") != _h3_receipt(request, h3_task_id):
@@ -873,7 +929,25 @@ def _poll_h3(
             _save_state(request, state)
             return _result(state, output=request.workdir / "generated.mp4")
         if provider_status in {"FAILED", "ERROR", "FAIL"}:
-            _fail(request, state, "h3_provider_failed", retryable=False, keep_task=True)
+            diagnostic = _provider_failure_diagnostic(
+                payload, status=provider_status, secret=request.autodl_token
+            )
+            log.warning(
+                "H3 provider failed cid=%s attempt=%s request_id=%s detail=%s",
+                request.cid,
+                state.get("attempt_id"),
+                diagnostic.get("request_id") or "unavailable",
+                diagnostic.get("detail") or "no_safe_detail",
+            )
+            state["h3"]["status"] = "failed"
+            _fail(
+                request,
+                state,
+                "h3_provider_failed",
+                retryable=False,
+                keep_task=True,
+                provider_diagnostic=diagnostic,
+            )
             return _result(state)
         if time.monotonic() >= deadline:
             _fail(request, state, "h3_timeout", retryable=True, keep_task=True)
@@ -1147,10 +1221,13 @@ def _fail(
     *,
     retryable: bool,
     keep_task: bool = False,
+    provider_diagnostic: Mapping[str, str] | None = None,
 ) -> None:
     state["status"] = "retryable_failure" if retryable else "failed"
     state["retryable"] = retryable
     state["error"] = {"code": code}
+    if provider_diagnostic is not None:
+        state["error"]["provider"] = dict(provider_diagnostic)
     if not keep_task:
         if state["h3"].get("status") == "submitting":
             state["h3"]["status"] = "failed"
