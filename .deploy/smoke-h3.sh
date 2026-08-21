@@ -194,11 +194,41 @@ echo "Created cid=$cid; waiting for frozen input."
 
 detail=$(poll_prepare "$cid")
 read_only=$(json_get read_only <<<"$detail")
+duration_s=$(json_get duration_s <<<"$detail")
 receipt_version=$(json_get receipt_version <<<"$detail")
+plan_receipt=$(json_get plan_receipt <<<"$detail")
+segment_count=$(json_get segment_count <<<"$detail")
 fit_required=$(json_get fit_required <<<"$detail")
-if [[ "$read_only" != "false" || "$receipt_version" != "1" ]]; then
+video_kind=$("$python_bin" -c '
+import math, sys
+try:
+    duration = float(sys.argv[1])
+except (TypeError, ValueError):
+    print("invalid")
+else:
+    print("long" if math.isfinite(duration) and duration > 10 else
+          "short" if math.isfinite(duration) and duration > 0 else "invalid")
+' "$duration_s")
+if [[ "$read_only" != "false" || "$video_kind" == "invalid" ]]; then
   echo "Conversation is not an operable schema-v2 frozen input: cid=$cid" >&2
   exit 1
+fi
+if [[ "$video_kind" == "short" ]]; then
+  if [[ "$receipt_version" != "1" ]]; then
+    echo "Short-video input is missing prepared-input receipt v1: cid=$cid" >&2
+    exit 1
+  fi
+  safe_segment_count=1
+else
+  if ! [[ "$plan_receipt" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Long-video input is missing a valid frozen plan receipt: cid=$cid" >&2
+    exit 1
+  fi
+  if ! [[ "$segment_count" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Long-video input has no positive segment count: cid=$cid" >&2
+    exit 1
+  fi
+  safe_segment_count=$segment_count
 fi
 if [[ "$fit_required" == "true" ]]; then
   selected_fit=$fit_choice
@@ -207,17 +237,24 @@ else
 fi
 
 generation_id=$(new_request_id)
+payload_args=("$generation_id" "$dialogue_mode" "$selected_fit")
+if [[ "$video_kind" == "long" ]]; then
+  payload_args+=("$plan_receipt")
+fi
 payload=$("$python_bin" -c '
 import json, sys
-print(json.dumps({
+payload = {
     "confirm": True,
     "client_request_id": sys.argv[1],
     "dialogue_mode": sys.argv[2],
     "fit_mode": sys.argv[3],
-}, ensure_ascii=False, separators=(",", ":")))
-' "$generation_id" "$dialogue_mode" "$selected_fit")
+}
+if len(sys.argv) == 5:
+    payload["expected_plan_receipt"] = sys.argv[4]
+print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+' "${payload_args[@]}")
 
-echo "Submitting H3: cid=$cid dialogue=$dialogue_mode fit=$selected_fit"
+echo "Submitting H3: cid=$cid client_request_id=$generation_id segment_count=$safe_segment_count dialogue=$dialogue_mode fit=$selected_fit"
 submit_response=$(curl --fail-with-body --silent --show-error \
   --header "@$auth_header" \
   --header 'Content-Type: application/json' \

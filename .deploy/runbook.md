@@ -187,22 +187,61 @@ curl --fail --silent --show-error \
 
 健康接口只证明进程和反代可达，不验证 H3 凭据、余额或付费链路。
 
-## 6. 正式 API smoke（会付费）
+## 6. 正式 API smoke（每次调用都会新建会话并付费）
 
-脚本要求显式 `RUN_PAID_SMOKE=1`，默认走本机 3212，通过正式 API 创建、轮询、提交和验证 H3 成片。它不会打印 access token 或供应商凭据。
+脚本要求显式 `RUN_PAID_SMOKE=1`，默认走本机 3212，通过正式 API 创建、轮询、提交和验证 H3 成片。每执行一次脚本都会生成新的创建 id 和 generation `client_request_id`，创建一个新会话，并按冻结计划产生真实付费 H3 task；不得把下面三次验收放进自动重试器。脚本会打印 cid、generation request id 和付费子任务数，不会打印 access token、供应商凭据或 task id。
+
+先准备实测时长分别为 10、15、30 秒的样本，并在付费前确认：
 
 ```bash
+SAMPLE_10=/absolute/path/to/10s.mp4
+SAMPLE_15=/absolute/path/to/15s.mp4
+SAMPLE_30=/absolute/path/to/30s.mp4
+for sample in "$SAMPLE_10" "$SAMPLE_15" "$SAMPLE_30"; do
+  ffprobe -v error -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$sample"
+done
+
 read -rsp 'ACCESS_TOKEN: ' ACCESS_TOKEN; printf '\n'
 export ACCESS_TOKEN
-RUN_PAID_SMOKE=1 \
-  .deploy/smoke-h3.sh \
-  temp/10-restore-h3-vocal-face/benchmark.mp4
+
+# 第 1 次新建/付费：10s，原 Ref2VA 单任务
+RUN_PAID_SMOKE=1 .deploy/smoke-h3.sh "$SAMPLE_10"
+
+# 第 2 次新建/付费：15s，FL2VA 长链；冻结计划通常为 1 个子任务
+RUN_PAID_SMOKE=1 .deploy/smoke-h3.sh "$SAMPLE_15"
+
+# 第 3 次新建/付费：30s，FL2VA 长链；以脚本打印的 segment_count 为准
+RUN_PAID_SMOKE=1 .deploy/smoke-h3.sh "$SAMPLE_30"
+
 unset ACCESS_TOKEN
 ```
 
-非 9:16 样本默认使用 `pad`，可在人工确认内容可裁时加 `FIT_MODE=crop`。脚本默认台词模式为 `auto`；无音轨同样合法。
+非 9:16 样本默认使用 `pad`，可在人工确认内容可裁时加 `FIT_MODE=crop`。脚本默认台词模式为 `auto`；无音轨同样合法。长视频只允许 `DIALOGUE_MODE=auto|none`，其中 auto 复用完整源音轨，none 输出静音。
 
-成功标准：创建阶段到 `done`，submit 返回 202，generation 到 `succeeded` 且 `has_video=true`。记录 cid 和 attempt 即可，不要复制 token、EnvironmentFile 或供应商响应。
+成功标准：创建阶段到 `done`；10 秒输入通过 prepared receipt v1，15/30 秒输入通过 64 位 plan receipt 和正整数 `segment_count`；submit 返回 202；generation 到 `succeeded` 且 `has_video=true`。记录每次输出的 cid 和 `client_request_id`，不要复制 token、EnvironmentFile 或供应商响应。
+
+把三次输出的 cid 人工填入以下变量，逐个验证最终文件。长链拼接目标是与源时长误差不超过 1/24 秒；同时确认视频编码/像素格式和音轨。若 `DIALOGUE_MODE=none`，音频 stream 查询应为空。
+
+```bash
+CID_10='replace-with-10s-cid'
+CID_15='replace-with-15s-cid'
+CID_30='replace-with-30s-cid'
+for cid in "$CID_10" "$CID_15" "$CID_30"; do
+  output="data/$cid/generated.mp4"
+  test -s "$output"
+  ffprobe -v error -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$output"
+  ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name,pix_fmt,r_frame_rate \
+    -of default=noprint_wrappers=1 "$output"
+  ffprobe -v error -select_streams a:0 \
+    -show_entries stream=codec_name,channels \
+    -of default=noprint_wrappers=1 "$output"
+done
+```
+
+脚本遇到 `failed`、`submission_unknown`、`resume_required` 或超时都会退出，绝不会自动再发 paid POST。保留它打印的 cid 和原 `client_request_id`，按下一节判断是原 attempt 继续、确定失败的新 id，还是先去供应商核对。
 
 ## 7. 失败时 fix-forward
 
