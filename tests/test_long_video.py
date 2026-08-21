@@ -127,6 +127,12 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     segment_source.write_bytes(b"segment source")
     frame = keyframes / "01.png"
     frame.write_bytes(b"frame")
+    anchors = segment_work / "anchors"
+    anchors.mkdir()
+    first_anchor = anchors / "first.png"
+    last_anchor = anchors / "last.png"
+    first_anchor.write_bytes(b"source first")
+    last_anchor.write_bytes(b"source last")
     visual = segment_work / "visual_prompt.txt"
     visual.write_text("local action", encoding="utf-8")
     final = segment_work / "prompt.txt"
@@ -140,6 +146,8 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
         "join_mode": "hard_cut",
         "source_path": segment_source,
         "keyframe_paths": [frame],
+        "first_frame_path": first_anchor,
+        "last_frame_path": last_anchor,
         "visual_prompt_path": visual,
         "final_prompt_path": final,
         "dialogue": dialogue,
@@ -150,7 +158,7 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
         source=source,
         duration_s=12.0,
         segments=segments,
-        workflow="minimax_h3_lightx2v_v5",
+        workflow="minimax_h3_lightx2v",
     )
     first_bytes = first.read_bytes()
     second = write_plan_receipt(
@@ -158,7 +166,7 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
         source=source,
         duration_s=12.0,
         segments=segments,
-        workflow="minimax_h3_lightx2v_v5",
+        workflow="minimax_h3_lightx2v",
     )
     assert second.read_bytes() == first_bytes
 
@@ -167,14 +175,80 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     assert receipt["version"] == 1
     assert receipt["source"]["sha256"] == hashlib.sha256(b"whole source").hexdigest()
     assert receipt["video"]["duration_s"] == 12.0
-    assert receipt["workflow"] == "minimax_h3_lightx2v_v5"
+    assert receipt["workflow"] == "minimax_h3_lightx2v"
     planned = receipt["segments"][0]
     assert (planned["start_s"], planned["end_s"]) == (0.0, 12.0)
     assert (planned["chain_id"], planned["join_mode"]) == ("chain-001", "hard_cut")
     assert planned["source"]["sha256"] == hashlib.sha256(b"segment source").hexdigest()
     assert planned["keyframes"][0]["sha256"] == hashlib.sha256(b"frame").hexdigest()
+    assert planned["anchors"] == [
+        {
+            "role": "first",
+            "path": "work/segments/1/work/anchors/first.png",
+            "sha256": hashlib.sha256(b"source first").hexdigest(),
+        },
+        {
+            "role": "end",
+            "path": "work/segments/1/work/anchors/last.png",
+            "sha256": hashlib.sha256(b"source last").hexdigest(),
+        },
+    ]
     assert planned["visual_prompt"]["sha256"] == hashlib.sha256(b"local action").hexdigest()
     assert planned["final_prompt"]["sha256"] == hashlib.sha256(
         b"global continuity\nlocal action"
     ).hexdigest()
     assert planned["dialogue"]["count"] == 1
+
+
+@pytest.mark.parametrize("duration", [15.0, 30.0])
+def test_exact_planner_receipts_bind_source_anchors_not_codex_keyframes(tmp_path, duration):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    planned = plan_segments(duration, [(0.0, duration)], [])
+    receipt_input = []
+    for segment in planned:
+        index = segment["index"]
+        segdir = tmp_path / "work" / "segments" / str(index)
+        segwork = segdir / "work"
+        keyframes = segwork / "keyframes"
+        anchors = segwork / "anchors"
+        keyframes.mkdir(parents=True)
+        anchors.mkdir()
+        segment_source = segdir / "source.mp4"
+        segment_source.write_bytes(f"segment-{index}".encode())
+        selected = keyframes / "01.png"
+        selected.write_bytes(f"codex-selected-{index}".encode())
+        first = anchors / "first.png"
+        last = anchors / "last.png"
+        first.write_bytes(f"source-first-{index}".encode())
+        last.write_bytes(f"source-last-{index}".encode())
+        visual = segwork / "visual_prompt.txt"
+        final = segwork / "prompt.txt"
+        visual.write_text(f"visual-{index}", encoding="utf-8")
+        final.write_text(f"final-{index}", encoding="utf-8")
+        receipt_input.append(
+            {
+                **segment,
+                "source_path": segment_source,
+                "keyframe_paths": [selected],
+                "first_frame_path": first,
+                "last_frame_path": last,
+                "visual_prompt_path": visual,
+                "final_prompt_path": final,
+                "dialogue": [],
+            }
+        )
+
+    path = write_plan_receipt(
+        tmp_path,
+        source=source,
+        duration_s=duration,
+        segments=receipt_input,
+        workflow="minimax_h3_lightx2v",
+    )
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    assert len(receipt["segments"]) == (1 if duration == 15.0 else 2)
+    for segment in receipt["segments"]:
+        assert [anchor["role"] for anchor in segment["anchors"]] == ["first", "end"]
+        anchor_hashes = {anchor["sha256"] for anchor in segment["anchors"]}
+        assert segment["keyframes"][0]["sha256"] not in anchor_hashes

@@ -1,6 +1,7 @@
 """T4 拆段流水线：scenes 接入、拆段并发、句子归属、切段精度、detail 16 字段契约。"""
 
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -248,6 +249,24 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
                 ),
                 encoding="utf-8",
             )
+        elif step.startswith("segment ") and step.endswith(" extract"):
+            out = Path(argv[argv.index("--out-dir") + 1])
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "001_frame_000.000s.png").write_bytes(b"source-first")
+            (out / "002_frame_007.750s.png").write_bytes(b"source-last")
+            (out / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "frames": [
+                            {"index": 1, "time_seconds": 0.0,
+                             "file": "001_frame_000.000s.png"},
+                            {"index": 2, "time_seconds": 7.75,
+                             "file": "002_frame_007.750s.png"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
 
     monkeypatch.setattr(pipeline, "_voice_step", fake_voice_step)
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
@@ -276,6 +295,12 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     assert stored["segments"][0]["keyframe_paths"][0].startswith(
         "segments/1/work/keyframes/"
     )
+    assert stored["segments"][0]["first_frame_path"] == (
+        "segments/1/work/anchors/first.png"
+    )
+    assert stored["segments"][0]["last_frame_path"] == (
+        "segments/1/work/anchors/last.png"
+    )
     continuity = long_video.build_continuity_block()
     for segment in stored["segments"]:
         assert continuity in segment["prompt"]
@@ -283,6 +308,20 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     assert stored["long_video_plan_receipt"] == long_video.PLAN_RECEIPT_FILENAME
     receipt = json.loads((cdir / long_video.PLAN_RECEIPT_FILENAME).read_text(encoding="utf-8"))
     assert receipt["source"]["sha256"]
+    assert receipt["workflow"] == "minimax_h3_lightx2v"
+    assert [anchor["role"] for anchor in receipt["segments"][0]["anchors"]] == [
+        "first",
+        "end",
+    ]
+    assert receipt["segments"][0]["anchors"][0]["sha256"] == hashlib.sha256(
+        b"source-first"
+    ).hexdigest()
+    assert receipt["segments"][0]["anchors"][1]["sha256"] == hashlib.sha256(
+        b"source-last"
+    ).hexdigest()
+    assert receipt["segments"][0]["anchors"][0]["sha256"] != (
+        receipt["segments"][0]["keyframes"][0]["sha256"]
+    )
     assert [s["chain_id"] for s in receipt["segments"]] == [
         "chain-001",
         "chain-002",
