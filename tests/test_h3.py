@@ -43,6 +43,19 @@ def _request(tmp_path: Path, *, request_id: str = "request-1") -> h3.H3Request:
     )
 
 
+def _boundary_request(tmp_path: Path, *, request_id: str = "boundary-1") -> h3.H3Request:
+    first = (Path("first.png"), b"first-boundary")
+    last = (Path("last.png"), b"last-boundary")
+    return replace(
+        _request(tmp_path, request_id=request_id),
+        mode="boundary",
+        keyframes=(),
+        first_frame=first,
+        last_frame=last,
+        duration=15,
+    )
+
+
 class FakeNetworkStream:
     def __init__(self, server_addr=("93.184.216.34", 443)) -> None:
         self.server_addr = server_addr
@@ -73,7 +86,7 @@ class HappyProvider:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         path = request.url.path
-        if path.endswith("/minimax_h3_lightx2v_v5"):
+        if path.endswith(("/minimax_h3_lightx2v_v5", "/minimax_h3_lightx2v")):
             return httpx.Response(200, json={"data": {"task_id": "h3-task-local"}})
         if path.endswith("/result/h3-task-local"):
             payload = {"status": self.result_status}
@@ -89,7 +102,7 @@ class HappyProvider:
         return [
             request
             for request in self.requests
-            if request.url.path.endswith("/minimax_h3_lightx2v_v5")
+            if request.url.path.endswith(("/minimax_h3_lightx2v_v5", "/minimax_h3_lightx2v"))
         ]
 
 
@@ -173,6 +186,97 @@ def test_start_submits_source_prompt_directly_and_writes_state(tmp_path):
     }
     assert "download.invalid" not in json.dumps(state)
     assert "art-secret" not in json.dumps(state)
+
+
+def test_boundary_mode_selects_fl2va_workflow_and_only_boundary_fields(tmp_path):
+    request = _boundary_request(tmp_path)
+    provider = HappyProvider()
+
+    with _client(provider) as client:
+        assert h3.start(request, client=client).status == "succeeded"
+
+    post = provider.h3_posts[0]
+    assert post.url.path.endswith("/minimax_h3_lightx2v")
+    assert json.loads(post.content) == {
+        "prompt": request.prompt,
+        "duration": 15,
+        "resolution": "768p竖",
+        "first_frame": "data:image/png;base64,"
+        + base64.b64encode(b"first-boundary").decode("ascii"),
+        "last_frame": "data:image/png;base64,"
+        + base64.b64encode(b"last-boundary").decode("ascii"),
+    }
+    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
+    assert state["input"]["request"] == {
+        "mode": "boundary",
+        "h3_workflow": "minimax_h3_lightx2v",
+        "duration": 15,
+        "resolution": "768p竖",
+    }
+    assert state["input"]["images"] == [
+        {
+            "role": "first_frame",
+            "name": "first.png",
+            "sha256": hashlib.sha256(b"first-boundary").hexdigest(),
+        },
+        {
+            "role": "last_frame",
+            "name": "last.png",
+            "sha256": hashlib.sha256(b"last-boundary").hexdigest(),
+        },
+    ]
+
+
+def test_explicit_reference_seed_is_posted_and_frozen_in_receipts(tmp_path):
+    request = replace(_request(tmp_path), seed=123456)
+    provider = HappyProvider(result_status="RUNNING")
+    with _client(provider) as client:
+        assert h3.start(request, client=client).status == "retryable_failure"
+
+    assert json.loads(provider.h3_posts[0].content)["seed"] == 123456
+    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
+    assert state["input"]["request"]["seed"] == 123456
+    assert state["h3"]["receipt"]["request"]["seed"] == 123456
+
+    drifted = replace(request, seed=654321)
+    with _client(lambda _request: pytest.fail("drift must fail before network")) as client:
+        with pytest.raises(h3.ReceiptError, match="receipt_mismatch"):
+            h3.resume(drifted, client=client)
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        ({"mode": "unknown"}, "invalid_mode"),
+        ({"mode": "boundary", "keyframes": (), "first_frame": (Path("first.png"), b"a"), "last_frame": None}, "invalid_boundary_frames"),
+        ({"mode": "boundary", "first_frame": (Path("first.png"), b"a"), "last_frame": (Path("last.png"), b"b")}, "mixed_h3_inputs"),
+        ({"mode": "reference", "first_frame": (Path("first.png"), b"a")}, "mixed_h3_inputs"),
+        ({"mode": "reference", "seed": 0}, "invalid_seed"),
+        ({"mode": "reference", "seed": 1_000_000_000_000_000}, "invalid_seed"),
+        ({"mode": "boundary", "keyframes": (), "first_frame": (Path("first.png"), b"a"), "last_frame": (Path("last.png"), b"b"), "seed": 1}, "seed_not_supported"),
+    ],
+)
+def test_request_modes_reject_ambiguous_or_invalid_inputs(tmp_path, changes, error):
+    with pytest.raises(h3.H3Error, match=error):
+        replace(_request(tmp_path), **changes)
+
+
+def test_mode_specific_duration_limits(tmp_path):
+    with pytest.raises(h3.H3Error, match="invalid_duration"):
+        replace(_request(tmp_path), duration=11)
+    with pytest.raises(h3.H3Error, match="invalid_duration"):
+        replace(_boundary_request(tmp_path), duration=16)
+
+
+def test_boundary_receipt_drift_is_rejected_before_network(tmp_path):
+    request = _boundary_request(tmp_path)
+    with _client(HappyProvider(result_status="RUNNING")) as client:
+        assert h3.start(request, client=client).status == "retryable_failure"
+
+    drifted = replace(request, last_frame=(Path("last.png"), b"changed"))
+    with _client(lambda _request: pytest.fail("drift must fail before network")) as client:
+        with pytest.raises(h3.ReceiptError, match="receipt_mismatch"):
+            h3.resume(drifted, client=client)
 
 
 def test_h3_rejection_logs_sanitized_provider_reason_without_retry(tmp_path, caplog):
