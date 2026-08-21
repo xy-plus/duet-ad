@@ -60,6 +60,27 @@ class _SubmitError(RuntimeError):
         self.detail = detail
 
 
+def _duration_limit_detail(duration_s: float) -> dict:
+    return {
+        "code": "video_duration_exceeds_h3_limit",
+        "message": (
+            f"视频时长 {duration_s:.1f} 秒，超过 H3 最大允许时长 "
+            f"{h3.H3_MAX_DURATION_S} 秒，请裁剪后重新上传。"
+        ),
+        "actual_duration_s": duration_s,
+        "max_duration_s": h3.H3_MAX_DURATION_S,
+    }
+
+
+def _duration_exceeds_h3_limit(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) > h3.H3_MAX_DURATION_S
+    )
+
+
 def _is_read_only(meta: dict) -> bool:
     return meta.get("schema_version") != 2
 
@@ -743,6 +764,12 @@ def create_app(settings: Settings) -> FastAPI:
                 # 下载最长 download_timeout_s 秒，不能堵事件循环
                 dest = await run_in_threadpool(downloader.fetch_reference, reference_url, cdir, settings)
             video = storage.probe_video(dest)
+            if _duration_exceeds_h3_limit(video.duration_s):
+                storage.remove_conversation(settings.data_dir, meta["id"])
+                raise HTTPException(
+                    status_code=422,
+                    detail=_duration_limit_detail(video.duration_s),
+                )
             storage.update_meta(
                 settings.data_dir,
                 meta["id"],
@@ -855,6 +882,11 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
         if meta.get("status") != "done":
             raise HTTPException(status_code=409, detail="artifacts not ready")
+        if _duration_exceeds_h3_limit(meta.get("duration_s")):
+            raise HTTPException(
+                status_code=422,
+                detail=_duration_limit_detail(float(meta["duration_s"])),
+            )
         if not _credentials_ready(settings):
             raise HTTPException(status_code=503, detail="h3_credentials_missing")
 

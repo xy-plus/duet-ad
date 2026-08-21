@@ -42,8 +42,25 @@ def test_creation_and_copy_use_h3_contract_only():
     assert "voice-mode" in source
     assert "target_language" in source
     assert "H3" in source
-    assert "时长不限" in source
-    assert "最长 15 秒" not in source
+    assert "最长 10 秒" in source
+    assert "时长不限" not in source
+
+
+def test_duration_limit_error_is_structured_and_shown_as_popup():
+    source = APP_JS.read_text(encoding="utf-8")
+    assert 'err.code === "video_duration_exceeds_h3_limit"' in source
+    assert "window.alert(err.message)" in source
+    result = _run_contract(
+        "(() => {"
+        "const error=contract.apiErrorFromPayload({detail:{code:'video_duration_exceeds_h3_limit',"
+        "message:'最长 10 秒'}},'fallback');"
+        "return {message:error.message,code:error.code};"
+        "})()"
+    )
+    assert result == {
+        "message": "最长 10 秒",
+        "code": "video_duration_exceeds_h3_limit",
+    }
 
 
 def test_context_ir_is_absent_from_web_runtime():

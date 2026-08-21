@@ -399,8 +399,9 @@ def test_voice_receipt_is_canonical_and_required(tmp_path):
         replace(_request(tmp_path), voice_receipt="0" * 64)
 
 
-def test_duration_has_no_project_upper_bound(tmp_path):
-    assert replace(_request(tmp_path), duration=3600).duration == 3600
+def test_duration_over_provider_limit_is_rejected(tmp_path):
+    with pytest.raises(h3.H3Error, match="invalid_duration"):
+        replace(_request(tmp_path), duration=h3.H3_MAX_DURATION_S + 1)
 
 
 def test_zero_duration_is_rejected(tmp_path):

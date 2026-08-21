@@ -28,6 +28,12 @@ const state = {
 };
 
 class AuthError extends Error {}
+class ApiError extends Error {
+  constructor(message, code = "") {
+    super(message);
+    this.code = code;
+  }
+}
 
 /* ===== 小工具 ===== */
 const $ = (id) => document.getElementById(id);
@@ -57,6 +63,17 @@ function fmtBytes(n) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
   if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
   return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
+}
+
+function apiErrorFromPayload(data, fallback) {
+  const detail = data && (data.detail || data.error || data.message);
+  if (detail && typeof detail === "object") {
+    return new ApiError(
+      String(detail.message || fallback),
+      typeof detail.code === "string" ? detail.code : ""
+    );
+  }
+  return new ApiError(detail ? String(detail) : fallback);
 }
 
 // 幂等键；非安全上下文（如 LAN http 直连）无 crypto.randomUUID，退化为时间戳+随机串（满足后端 ^[0-9A-Za-z-]{8,64}$）
@@ -205,14 +222,14 @@ async function api(path, options = {}) {
 async function apiJSON(path, options = {}) {
   const res = await api(path, options);
   if (!res.ok) {
-    let msg = "请求失败（" + res.status + "），请稍后重试";
+    const fallback = "请求失败（" + res.status + "），请稍后重试";
     try {
       const data = await res.json();
-      if (data && (data.detail || data.error || data.message)) {
-        msg = String(data.detail || data.error || data.message);
-      }
-    } catch (_) { /* 保留默认文案 */ }
-    throw new Error(msg);
+      throw apiErrorFromPayload(data, fallback);
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(fallback);
+    }
   }
   return res.json();
 }
@@ -1544,10 +1561,10 @@ function uploadConversation({ file, url, note, requestId, voiceMode: mode, targe
           : "操作过于频繁，请稍后再试"));
       } else {
         const data = xhr.response;
-        const msg = data && (data.detail || data.error || data.message)
-          ? String(data.detail || data.error || data.message)
-          : "上传失败（" + xhr.status + "），请稍后重试";
-        reject(new Error(msg));
+        reject(apiErrorFromPayload(
+          data,
+          "上传失败（" + xhr.status + "），请稍后重试"
+        ));
       }
     });
     xhr.addEventListener("error", () => reject(new Error("网络异常，上传未完成，请重试")));
@@ -1619,6 +1636,11 @@ async function handleSend(event) {
   } catch (err) {
     setUploading(false);
     if (handleAuthError(err)) return;
+    if (err.code === "video_duration_exceeds_h3_limit") {
+      window.alert(err.message);
+      setComposerError(err.message);
+      return;
+    }
     // 422 no audio track in video → 换成可读引导（本产品仅处理带口播视频）
     setComposerError(err.message.includes("no audio track in video")
       ? "该视频没有音轨，本产品仅支持带口播的视频"
@@ -1732,6 +1754,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildResumePayload,
     buildSubmitPayload,
+    apiErrorFromPayload,
     canOperate,
     detailSignature,
     formatDialogueLines,

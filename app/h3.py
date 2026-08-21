@@ -35,6 +35,7 @@ from app.sanitize import sanitize
 SCHEMA_VERSION = 1
 H3_WORKFLOW = "minimax_h3_lightx2v_v5"
 H3_RESOLUTION = "768p竖"
+H3_MAX_DURATION_S = 10
 AUTODL_BASE_URL = "https://autodl.art"
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
 
@@ -151,7 +152,7 @@ class H3Request:
         if (
             not isinstance(self.duration, int)
             or isinstance(self.duration, bool)
-            or self.duration < 1
+            or not 1 <= self.duration <= H3_MAX_DURATION_S
         ):
             raise H3Error("invalid_duration")
         if not isinstance(self.autodl_token, str) or not self.autodl_token.strip():

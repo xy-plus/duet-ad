@@ -183,6 +183,22 @@ def test_missing_autodl_credential_is_503(tmp_path):
     assert response.json() == {"detail": "h3_credentials_missing"}
 
 
+def test_submit_rejects_existing_video_over_h3_limit_before_provider(enabled):
+    settings, client = enabled
+    cid, _ = _make_conv(settings, duration_s=14.0)
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload()
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "video_duration_exceeds_h3_limit",
+        "message": "视频时长 14.0 秒，超过 H3 最大允许时长 10 秒，请裁剪后重新上传。",
+        "actual_duration_s": 14.0,
+        "max_duration_s": 10,
+    }
+    assert not (settings.data_dir / cid / ".h3").exists()
+
+
 def test_context_ir_field_is_rejected_from_submit_contract(enabled):
     settings, client = enabled
     cid, _ = _make_conv(settings)
@@ -197,7 +213,7 @@ def test_context_ir_field_is_rejected_from_submit_contract(enabled):
 
 def test_submit_freezes_direct_h3_receipt_and_source_prompt(enabled, monkeypatch):
     settings, client = enabled
-    cid, original = _make_conv(settings, duration_s=12.4)
+    cid, original = _make_conv(settings, duration_s=9.2)
     seen = []
     monkeypatch.setattr(
         h3,
@@ -209,7 +225,7 @@ def test_submit_freezes_direct_h3_receipt_and_source_prompt(enabled, monkeypatch
     (request,) = seen
     assert request.prompt.startswith(PROMPT)
     assert "无台词" in request.prompt
-    assert request.duration == 13
+    assert request.duration == 10
     assert request.keyframes[0][1] == original
     meta = storage.load_meta(settings.data_dir, cid)
     cdir = settings.data_dir / cid
@@ -219,7 +235,7 @@ def test_submit_freezes_direct_h3_receipt_and_source_prompt(enabled, monkeypatch
     assert set(frozen.engine_request) == {"h3"}
     assert frozen.engine_request["h3"] == {
         "workflow": h3.H3_WORKFLOW,
-        "duration": 13,
+        "duration": 10,
         "resolution": h3.H3_RESOLUTION,
     }
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()

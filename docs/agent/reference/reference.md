@@ -53,7 +53,7 @@ multipart 字段：
 | `voice_mode` | `keep/rewrite/translate`，默认 `keep`；只控制 auto 输入准备 |
 | `target_language` | `voice_mode=translate` 时必填；其他模式忽略 |
 
-新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长为正有限数，项目不设总时长上限；文件大小默认 ≤500MB。无音轨合法。常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
+新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长为正有限数且不超过 10 秒；文件大小默认 ≤500MB。无音轨合法。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
 
 ### `GET /api/conversations/{cid}`
 

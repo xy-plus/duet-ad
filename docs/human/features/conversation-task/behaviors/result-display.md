@@ -33,6 +33,6 @@ links: [conversation-task, processing-state]
 
 ## 边界
 
-- `duration_s` 展示实际 ffprobe 时长；H3 请求使用 `ceil(duration_s)` 的整数秒，项目不设上限。
+- `duration_s` 展示实际 ffprobe 时长；上传门禁确保其不超过 H3 上限 10 秒。
 - 所有媒体经带 Bearer 鉴权的 files API 获取，页面使用 blob URL，不暴露目录直链。
 - 画面 OCR 只在视觉 prompt 中展示；唯一发声块只由结构化台词机械生成。

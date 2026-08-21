@@ -20,7 +20,7 @@ ACCESS_TOKEN='<local-only-token>' HOST=127.0.0.1 PORT=3211 ./run.sh
 
 ## 生产契约摘要
 
-- 新会话是 `schema_version=2`；项目不限制源视频总时长，H3 请求使用实际时长向上取整后的整数秒。
+- 新会话是 `schema_version=2`；源视频最长 10 秒，上传后以 ffprobe 实测时长做服务端门禁，超限会话不入队。
 - 原文保持使用本地 `whisper.cpp` multilingual small，只读取规范化音频并自动识别语言；改写/翻译仍使用音频专用隔离区。两条路径都看不到源视频、帧、OCR 或视觉 prompt。
 - 输入准备只从结构化台词生成发声块。`auto` 同时保留 `spoken` 与 `sung`，无音轨是合法的空台词输入；MP3 编码尾部先按音频分析，再把最终台词裁到视频时间轴。OCR、字幕、画面文字和备注永远不能被提升为台词。
 - 自动生成的 H3 源提示词可在首次 H3 attempt 创建前二次修改；保存后重写绑定 receipt，attempt 创建后即锁定。

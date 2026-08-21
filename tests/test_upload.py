@@ -56,12 +56,37 @@ def test_upload_oversize_422(tmp_path, video_1s):
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
 
 
-def test_upload_accepts_arbitrary_positive_duration(client, video_1s, monkeypatch, settings):
-    """项目不对视频总时长设上限。"""
+def test_upload_rejects_video_over_h3_limit_and_cleans_up(
+    client, video_1s, monkeypatch, settings
+):
     fake = subprocess.CompletedProcess(
         args=[], returncode=0,
         stdout=json.dumps({
-            "format": {"duration": "999.0"},
+            "format": {"duration": "10.01"},
+            "streams": [{"width": 320, "height": 240}],
+        }), stderr="",
+    )
+    monkeypatch.setattr("app.storage.subprocess.run", lambda *a, **kw: fake)
+    with open(video_1s, "rb") as f:
+        r = client.post("/api/conversations", headers=AUTH,
+                        files={"file": ("clip.mp4", f, "video/mp4")})
+    assert r.status_code == 422
+    assert r.json() == {
+        "detail": {
+            "code": "video_duration_exceeds_h3_limit",
+            "message": "视频时长 10.0 秒，超过 H3 最大允许时长 10 秒，请裁剪后重新上传。",
+            "actual_duration_s": 10.01,
+            "max_duration_s": 10,
+        }
+    }
+    assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+
+
+def test_upload_accepts_exact_h3_limit(client, video_1s, monkeypatch, settings):
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=json.dumps({
+            "format": {"duration": "10.0"},
             "streams": [{"width": 320, "height": 240}],
         }), stderr="",
     )
@@ -71,7 +96,7 @@ def test_upload_accepts_arbitrary_positive_duration(client, video_1s, monkeypatc
                         files={"file": ("clip.mp4", f, "video/mp4")})
     assert r.status_code == 201
     meta = json.loads((settings.data_dir / r.json()["id"] / "meta.json").read_text())
-    assert meta["duration_s"] == 999.0
+    assert meta["duration_s"] == 10.0
 
 
 def test_upload_requires_auth(client, video_1s):
