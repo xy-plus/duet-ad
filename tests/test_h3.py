@@ -302,6 +302,134 @@ def test_h3_rejection_logs_sanitized_provider_reason_without_retry(tmp_path, cap
     assert state["error"] == {"code": "h3_submit_rejected"}
 
 
+def test_provider_failure_diagnostic_survives_successful_paid_retry(
+    tmp_path, caplog
+):
+    request = _boundary_request(tmp_path)
+
+    def failed(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/minimax_h3_lightx2v"):
+            return httpx.Response(200, json={"data": {"task_id": "art-secret"}})
+        if req.url.path.endswith("/result/art-secret"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": "Success",
+                    "msg": "GPU OOM art-secret",
+                    "request_id": "provider-request-1",
+                    "data": {"status": "FAILED", "results": []},
+                },
+            )
+        raise AssertionError(f"unexpected request path: {req.url.path}")
+
+    caplog.set_level(logging.WARNING, logger="app.h3")
+    with _client(failed) as client:
+        result = h3.start(request, client=client)
+
+    assert result.status == "failed"
+    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
+    assert state["h3"]["status"] == "failed"
+    assert state["error"] == {
+        "code": "h3_provider_failed",
+        "provider": {
+            "status": "FAILED",
+            "request_id": "provider-request-1",
+            "detail": "Success | GPU OOM ***",
+        },
+    }
+    assert "provider-request-1" in caplog.text
+    assert "art-secret" not in caplog.text
+
+    failed_attempt = _attempt_file(request).read_bytes()
+
+    def recovered(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/minimax_h3_lightx2v"):
+            return httpx.Response(200, json={"data": {"task_id": "recovered-task"}})
+        if req.url.path.endswith("/result/recovered-task"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "status": "SUCCESS",
+                        "results": [{"url": "https://download.invalid/video.mp4"}],
+                    }
+                },
+            )
+        if req.url.host == "download.invalid":
+            return _download_response(200, content=HappyProvider.video_bytes)
+        raise AssertionError(f"unexpected request path: {req.url.path}")
+
+    with _client(recovered) as client:
+        retried = h3.retry(request, "boundary-2", client=client)
+
+    assert retried.status == "succeeded"
+    assert _attempt_file(request).read_bytes() == failed_attempt
+    recovered_state = json.loads(
+        _attempt_file(request, 2).read_text(encoding="utf-8")
+    )
+    assert recovered_state["status"] == "succeeded"
+    assert recovered_state["input_receipt"] == state["input_receipt"]
+
+
+@pytest.mark.parametrize(
+    "case", ("secret_detail", "multiline_detail", "multiline_request_id", "extra_key")
+)
+def test_tampered_provider_failure_diagnostic_is_rejected(tmp_path, case):
+    request = _boundary_request(tmp_path)
+
+    def failed(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/minimax_h3_lightx2v"):
+            return httpx.Response(200, json={"data": {"task_id": "failed-task"}})
+        return httpx.Response(
+            200,
+            json={
+                "msg": "GPU OOM",
+                "request_id": "provider-request-1",
+                "data": {"status": "FAILED"},
+            },
+        )
+
+    with _client(failed) as client:
+        assert h3.start(request, client=client).status == "failed"
+
+    path = _attempt_file(request)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if case == "secret_detail":
+        state["error"]["provider"]["detail"] = "art-secret"
+    elif case == "multiline_detail":
+        state["error"]["provider"]["detail"] = "safe\nforged"
+    elif case == "multiline_request_id":
+        state["error"]["provider"]["request_id"] = "safe\nforged"
+    else:
+        state["error"]["unexpected"] = "value"
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(h3.ReceiptError, match="state_invalid"):
+        h3.inspect(request)
+
+
+def test_legacy_provider_failure_without_diagnostic_remains_idempotent(tmp_path):
+    request = _boundary_request(tmp_path)
+
+    def failed(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/minimax_h3_lightx2v"):
+            return httpx.Response(200, json={"data": {"task_id": "legacy-task"}})
+        return httpx.Response(200, json={"data": {"status": "FAILED"}})
+
+    with _client(failed) as client:
+        assert h3.start(request, client=client).status == "failed"
+
+    path = _attempt_file(request)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["error"] = {"code": "h3_provider_failed"}
+    state["h3"]["status"] = "running"
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    assert h3.inspect(request).status == "failed"
+    with _client(lambda _req: pytest.fail("legacy terminal state must stay offline")) as client:
+        assert h3.start(request, client=client).status == "failed"
+
+
 def test_existing_generated_video_is_idempotent_without_network(tmp_path):
     request = _request(tmp_path)
     request.workdir.mkdir(parents=True)
