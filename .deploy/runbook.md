@@ -241,7 +241,7 @@ for cid in "$CID_10" "$CID_15" "$CID_30"; do
 done
 ```
 
-脚本遇到 `failed`、`submission_unknown`、`resume_required` 或超时都会退出，绝不会自动再发 paid POST。保留它打印的 cid 和原 `client_request_id`，按下一节判断是原 attempt 继续、确定失败的新 id，还是先去供应商核对。
+脚本遇到 `failed`、`submission_unknown`、`resume_required` 或超时都会退出，绝不会自动再发 paid POST。保留它打印的 cid 和原 `client_request_id`，按下一节判断是原 attempt 继续、H3 阶段确定失败的新 id、拼接失败的原 id 本地重拼，还是先去供应商核对。
 
 ## 7. 失败时 fix-forward
 
@@ -249,6 +249,6 @@ done
 2. 用 detail API 或 journal 确认是输入准备、凭据、H3 查询/下载还是公开反代问题；不要打印环境。
 3. 修复当前 H3 代码/配置，重新运行相关测试和全量测试。
 4. 再次 `daemon-reload`（unit 有改动时）并原地 `restart`，重复本地和公网 `/health`。
-5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；确定 `failed` 才用新 id 人工 retry。`submission_unknown` 不得继续或重试，先到 AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
+5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；H3 阶段确定 `failed` 才点“重试生成”，使用新 id，并以 UI 从冻结分段状态计算的数量为本次新增付费任务数（成功段复用，失败段及同链下游重做）。长链 `failed + stage=stitch` 点“重试拼接”，必须用原 id，只本地重拼且新增付费任务为 0。`submission_unknown` 不得继续或重试，先到 AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
 
 禁止以 Seedance 代码、旧 unit 或旧提交开关回退；它们不再属于生产契约。若 H3 仍不可用，保持服务可读、关闭 `ENABLE_H3_SUBMIT`，修复后再开启。

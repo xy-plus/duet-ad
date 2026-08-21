@@ -72,6 +72,63 @@ def test_long_resume_reuses_attempt_and_current_plan_receipt():
     }
 
 
+def test_long_retry_cost_uses_frozen_segment_progress_and_stitch_is_free():
+    result = _run_contract(
+        "["
+        "contract.generationRetryContract({duration_s:30,segment_count:3,"
+        "generation:null}),"
+        "contract.generationRetryContract({duration_s:30,segment_count:3,"
+        "generation:{status:'failed',stage:'h3',segments:["
+        "{index:1,status:'succeeded'},{index:2,status:'failed'},"
+        "{index:3,status:'not_started'}]}}),"
+        "contract.generationRetryContract({duration_s:30,segment_count:3,"
+        "generation:{status:'failed',stage:'stitch',client_request_id:'request-old',"
+        "segments:[{index:1,status:'succeeded'},{index:2,status:'succeeded'},"
+        "{index:3,status:'succeeded'}]}}),"
+        "contract.generationRetryContract({duration_s:30,segment_count:3,"
+        "generation:{status:'submission_unknown',stage:'h3',segments:[]}})"
+        "]"
+    )
+    assert result == [
+        {"action": "new", "paidTaskCount": 3},
+        {"action": "retry", "paidTaskCount": 2},
+        {"action": "retry_stitch", "paidTaskCount": 0},
+        {"action": "none", "paidTaskCount": 0},
+    ]
+
+
+def test_stitch_retry_reuses_frozen_request_and_parameters():
+    payload = _run_contract(
+        "contract.buildStitchRetryPayload({duration_s:30,segment_count:2,"
+        "plan_receipt:'a'.repeat(64),fit_mode:'pad',dialogue:{mode:'none',lines:[]},"
+        "generation:{status:'failed',stage:'stitch',client_request_id:'request-old'}})"
+    )
+    assert payload == {
+        "confirm": True,
+        "client_request_id": "request-old",
+        "dialogue_mode": "none",
+        "fit_mode": "pad",
+        "expected_plan_receipt": "a" * 64,
+    }
+
+
+def test_failed_segment_retry_uses_new_request_with_frozen_parameters():
+    payload = _run_contract(
+        "contract.buildLongRetryPayload({duration_s:30,segment_count:2,"
+        "plan_receipt:'b'.repeat(64),fit_required:true,fit_mode:'crop',"
+        "dialogue:{mode:'auto',lines:[]},generation:{status:'failed',stage:'h3',"
+        "client_request_id:'request-old',segments:[{index:1,status:'succeeded'},"
+        "{index:2,status:'failed'}]}},'request-new')"
+    )
+    assert payload == {
+        "confirm": True,
+        "client_request_id": "request-new",
+        "dialogue_mode": "auto",
+        "fit_mode": "crop",
+        "expected_plan_receipt": "b" * 64,
+    }
+
+
 def test_long_submit_rejects_edit_custom_and_missing_receipt():
     result = _run_contract(
         "['edit','custom'].map(mode=>{try{contract.buildSubmitPayload({clientRequestId:'request-x',"
@@ -122,8 +179,10 @@ def test_generation_segment_display_keeps_one_based_contract_index():
 def test_long_video_ui_copy_and_segment_progress_contract():
     source = APP_JS.read_text(encoding="utf-8")
     for text in (
-        "将创建",
-        "个 H3 子任务",
+        "本次新增 ",
+        "个付费 H3 子任务",
+        "重试生成",
+        "重试拼接",
         "连续性为 best effort",
         "失败时只重做失败段",
         "保留完整源音轨",
@@ -136,3 +195,4 @@ def test_long_video_ui_copy_and_segment_progress_contract():
         "长视频生成计划尚未就绪，请刷新后重试",
     ):
         assert text in source
+    assert 'if (stage === "stitch") return "视频拼接"' in source

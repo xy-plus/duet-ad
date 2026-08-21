@@ -17,14 +17,15 @@ links: [conversation-task, submit-gate]
 | 输入准备 | `queued → processing → done/failed` | 抽帧、台词准备、视觉 prompt 和 receipt 完成后才允许生成 |
 | 首次人工提交 | `generation: queued → running` | 冻结的 H3 源提示词直接提交 AutoDL H3 |
 | 长视频分段生成 | `generation.stage=h3`，每段独立状态 | 同链串行、最多两链并发；成功段保留，确定失败只开放失败段及下游继续 |
-| 长视频本地拼接 | `generation.stage=stitch` | 全段成功后去除子片段音轨并拼接；失败用原 request id 只重跑拼接 |
+| 长视频本地拼接 | `generation.stage=stitch` | 全段成功后去除子片段音轨并拼接；失败用原 request id 只重跑本地拼接，新增付费 H3 子任务为 0 |
 | 生成成功 | `generation: succeeded` | 原子落盘 `generated.mp4`，详情 `has_video=true` |
 | 已知 task 查询/超时、下载传输/DNS/peer 验证或输出写入/探测基础设施失败 | `generation: resume_required` | 包括 `download_dns_failed/download_peer_unverified/output_probe_failed`；保留原 request id、receipt 和 attempt，只允许原参数继续 |
 | 成片 URL、重定向、体积或媒体内容确定拒绝 | `generation: failed` | 安全拒绝码为 `download_url_rejected/download_redirect_rejected/download_too_large/download_invalid_video`；只有人工新 id retry |
 | 可确定失败 | `generation: failed` | 展示安全错误码；用户确认后必须用新 request id 创建 retry attempt |
 | 供应商 POST 结果未知 | `generation: submission_unknown` | 不猜测是否扣费；隐藏重试入口，所有再次提交返回 409，必须先到供应商侧核对 |
 | 服务重启时存在 `queued/running` | 仍读取同一冻结输入，仅执行 H3 `resume` | 恢复只查询已持久化任务并下载已有结果，不创建供应商任务 |
-| 用户在确定的 `failed` 后点重试 | 新 attempt，再次 `queued → running` | 必须生成新的 `client_request_id`；后端调用显式 `retry` |
+| 用户在 H3 阶段确定的 `failed` 后点“重试生成” | 新 attempt，再次 `queued → running` | 必须生成新的 `client_request_id`；长链复用成功段，只重做失败段及同链下游 |
+| 用户在长链 `failed + stage=stitch` 后点“重试拼接” | 原 attempt，再次 `queued → running` | 必须复用原 `client_request_id` 和冻结参数，只重跑本地拼接 |
 
 ## 边界
 
