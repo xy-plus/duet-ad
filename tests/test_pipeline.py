@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import codex_runner, long_generation, pipeline, prepared_input, storage, vocal, voice
+from app import codex_runner, long_generation, long_video, pipeline, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
@@ -54,6 +54,49 @@ def _make_conversation(settings, video_1s):
     # 本文件既有用例模拟旧 voice_mode 会话；新 prepared-input 用例会显式补
     # dialogue_mode + duration_s + 新 voice_mode。
     return storage.update_meta(settings.data_dir, meta["id"], voice_mode="none")
+
+
+def test_long_scene_bounds_normalize_detector_millisecond_rounding(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "scenes.json").write_text(
+        json.dumps(
+            {
+                "duration_s": 36.733,
+                "scenes": [
+                    {"start_s": 0.0, "end_s": 20.467},
+                    {"start_s": 20.467, "end_s": 36.733},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert pipeline._scene_bounds_for_long_plan(work, 36.733333) == [
+        {"start_s": 0.0, "end_s": 20.467},
+        {"start_s": 20.467, "end_s": 36.733333},
+    ]
+
+
+def test_long_scene_bounds_do_not_hide_a_real_terminal_gap(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "scenes.json").write_text(
+        json.dumps(
+            {
+                "scenes": [
+                    {"start_s": 0.0, "end_s": 20.467},
+                    {"start_s": 20.467, "end_s": 36.7},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bounds = pipeline._scene_bounds_for_long_plan(work, 36.733333)
+    with pytest.raises(long_video.LongVideoError) as caught:
+        long_video.plan_segments(36.733333, bounds, [])
+    assert caught.value.code == "long_video_invalid_scenes"
 
 
 @pytest.fixture
