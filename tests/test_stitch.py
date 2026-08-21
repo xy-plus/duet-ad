@@ -224,3 +224,55 @@ def test_rejects_invalid_audio_mode_before_running_ffmpeg(tmp_path, audio_mode):
             output=tmp_path / "generated.mp4",
             audio_mode=audio_mode,
         )
+
+
+def test_duration_limits_accept_15_second_segment_and_300_second_total(
+    tmp_path, monkeypatch,
+):
+    media = tmp_path / "input.mp4"
+    media.write_bytes(b"validation-only")
+    segments = [stitch.StitchSegment(media, 15.0, "hard_cut")]
+    segments += [stitch.StitchSegment(media, 15.0, "hard_cut") for _ in range(19)]
+
+    class ReachedProbe(Exception):
+        pass
+
+    monkeypatch.setattr(
+        stitch, "_probe", lambda _path: (_ for _ in ()).throw(ReachedProbe())
+    )
+    with pytest.raises(ReachedProbe):
+        stitch.stitch_video(
+            segments=segments,
+            source_video=media,
+            output=tmp_path / "generated.mp4",
+            audio_mode="mute",
+        )
+
+
+@pytest.mark.parametrize(
+    "durations, message",
+    [
+        ([15.001], "15"),
+        ([15.0] * 20 + [0.001], "300"),
+    ],
+)
+def test_duration_limits_reject_overflow_before_probe(
+    tmp_path, monkeypatch, durations, message,
+):
+    media = tmp_path / "input.mp4"
+    media.write_bytes(b"validation-only")
+    probe_calls = []
+    monkeypatch.setattr(stitch, "_probe", lambda path: probe_calls.append(path))
+
+    with pytest.raises(ValueError, match=message):
+        stitch.stitch_video(
+            segments=[
+                stitch.StitchSegment(media, duration, "hard_cut")
+                for duration in durations
+            ],
+            source_video=media,
+            output=tmp_path / "generated.mp4",
+            audio_mode="mute",
+        )
+
+    assert probe_calls == []
