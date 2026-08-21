@@ -860,6 +860,46 @@ input, textarea { font-family: inherit; }
 .generation-status.is-resume { background: rgba(0, 113, 227, .08); color: var(--accent); }
 .generation-status span { color: var(--text-2); overflow-wrap: anywhere; }
 
+.long-video-notice,
+.generation-progress {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+  background: var(--bg);
+  font-size: 13px;
+}
+
+.long-video-notice p { margin: 4px 0 0; color: var(--text-2); }
+
+.generation-progress > span {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-2);
+}
+
+.generation-segments {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.generation-segment {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 7px;
+  border-top: 1px solid var(--divider);
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.generation-segment strong { color: var(--text); }
+.generation-segment.status-failed strong,
+.generation-segment-error { color: var(--danger); }
+
 .resume-lock {
   margin-top: 12px;
   padding: 12px;
