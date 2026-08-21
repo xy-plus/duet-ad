@@ -215,4 +215,11 @@ def test_published_video_does_not_hide_stitch_recovery():
 
 
 def test_long_segment_prompt_copy_is_explicitly_frozen():
-    assert "逐段冻结的 H3 提示词" in APP_JS.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    assert "逐段冻结的 H3 提示词将提交生成" in source
+    assert "H3 源提示词将直接提交生成" in source
+    assert (
+        ': longContract.isLong\n'
+        '      ? "逐段冻结的 H3 提示词将提交生成"\n'
+        '      : "H3 源提示词将直接提交生成"'
+    ) in source

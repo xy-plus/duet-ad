@@ -413,6 +413,73 @@ def test_detail_retry_paid_count_uses_segment_files_and_stitch_is_free(
     assert detail["generation"]["retry_paid_segment_count"] == 0
 
 
+def test_detail_retry_paid_count_uses_complete_frozen_segment_set(
+    enabled,
+):
+    settings, client = enabled
+    cid, _receipt = _make_long(
+        settings, joins=("hard_cut", "hard_cut", "hard_cut")
+    )
+    root = settings.data_dir / cid
+    for index in (1, 2, 3):
+        (root / "work" / "segments" / str(index) / "generated.mp4").write_bytes(
+            b"segment"
+        )
+
+    def segment(index):
+        return {
+            "index": index,
+            "chain_id": f"chain-{index:03d}",
+            "join_mode": "hard_cut",
+            "status": "succeeded",
+            "attempt": 1,
+            "error": None,
+        }
+
+    cases = (
+        ([segment(1), segment(3)], 1),
+        ([segment(1), segment(1), segment(3)], 3),
+        ([segment(2), segment(1), segment(3)], 3),
+        ([segment(1), segment(2), segment(3)], 0),
+    )
+    for segments, expected in cases:
+        storage.update_meta(settings.data_dir, cid, generation={
+            "status": "failed",
+            "error": "long_video_segment_failed",
+            "attempt": 1,
+            "client_request_id": "parent-request-123",
+            "stage": "h3",
+            "segments": segments,
+        })
+        detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+        assert detail["generation"]["retry_paid_segment_count"] == expected
+
+
+def test_retry_initialization_uses_same_fail_closed_reuse_contract(enabled):
+    settings, _client = enabled
+    cid, receipt = _make_long(
+        settings, joins=("hard_cut", "hard_cut", "hard_cut")
+    )
+    root = settings.data_dir / cid
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(root, meta, receipt, "none", "auto")
+    for segment in plan.segments:
+        (segment.workdir / "generated.mp4").write_bytes(b"segment")
+    old = {
+        "segments": [
+            {"index": 2, "status": "succeeded", "attempt": 1},
+            {"index": 1, "status": "succeeded", "attempt": 1},
+            {"index": 3, "status": "succeeded", "attempt": 1},
+        ]
+    }
+    generation = long_generation.initial_generation(
+        plan, "parent-request-new", 2, old
+    )
+    assert [item["status"] for item in generation["segments"]] == [
+        "not_started", "not_started", "not_started"
+    ]
+
+
 def test_startup_recovery_only_resumes_attempted_segments(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))

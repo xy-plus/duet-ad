@@ -121,7 +121,7 @@ multipart 字段：
 }
 ```
 
-`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 是服务端结合持久化状态与分段 `generated.mp4` 文件实况计算的人工重试新增付费任务数；`stage=stitch` 固定为 0。前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source/has_video` 按磁盘实况计算。
+`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 以冻结 `meta.segments` 的完整索引集合为基数，由服务端结合持久化状态与分段 `generated.mp4` 文件实况计算：缺项计入，重复、未知或乱序状态整批不复用；`stage=stitch` 固定为 0。该复用判定与 retry 初始化共用，前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source/has_video` 按磁盘实况计算。
 
 ### `PATCH /api/conversations/{cid}/prompt`
 

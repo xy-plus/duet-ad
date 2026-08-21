@@ -9,7 +9,7 @@ import subprocess
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping, Sequence
 
 from app import frame_fit, h3, long_video, prepared_input, stitch, storage
 
@@ -335,18 +335,64 @@ def _result_status(result: h3.H3Result) -> tuple[str, str | None]:
     return "failed", result.error_code or "h3_failed"
 
 
+def reusable_segment_indices(
+    expected_indices: Sequence[int],
+    prior_segments: object,
+    artifact_exists: Callable[[int], bool],
+) -> frozenset[int]:
+    """Return paid segment outputs that are safe to reuse on retry."""
+    expected = tuple(expected_indices)
+    if len(set(expected)) != len(expected) or not isinstance(prior_segments, list):
+        return frozenset()
+    by_index: dict[int, dict] = {}
+    observed: list[int] = []
+    for item in prior_segments:
+        if not isinstance(item, dict):
+            return frozenset()
+        index = item.get("index")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index not in expected
+            or index in by_index
+        ):
+            return frozenset()
+        observed.append(index)
+        by_index[index] = item
+    if observed != [index for index in expected if index in by_index]:
+        return frozenset()
+
+    reusable = set()
+    for index, item in by_index.items():
+        if item.get("status") != "succeeded":
+            continue
+        try:
+            exists = artifact_exists(index)
+        except OSError:
+            exists = False
+        if exists:
+            reusable.add(index)
+    return frozenset(reusable)
+
+
 def initial_generation(plan: FrozenPlan, parent_id: str, attempt: int,
                        old: Mapping | None = None) -> dict:
+    plan_by_index = {segment.index: segment for segment in plan.segments}
+    raw_old_segments = (old or {}).get("segments", [])
+    old_segments = raw_old_segments if isinstance(raw_old_segments, list) else []
+    reusable = reusable_segment_indices(
+        tuple(plan_by_index),
+        old_segments,
+        lambda index: (plan_by_index[index].workdir / "generated.mp4").is_file(),
+    )
     old_by_index = {
-        item.get("index"): item for item in (old or {}).get("segments", [])
+        item.get("index"): item for item in old_segments
         if isinstance(item, dict)
     }
     items = []
     for segment in plan.segments:
         prior = old_by_index.get(segment.index, {})
-        succeeded = prior.get("status") == "succeeded" and (
-            segment.workdir / "generated.mp4"
-        ).is_file()
+        succeeded = segment.index in reusable
         items.append({
             "index": segment.index,
             "chain_id": segment.chain_id,
