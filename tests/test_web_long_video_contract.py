@@ -72,19 +72,24 @@ def test_long_resume_reuses_attempt_and_current_plan_receipt():
     }
 
 
-def test_long_retry_cost_uses_frozen_segment_progress_and_stitch_is_free():
+def test_long_retry_cost_uses_server_truth_and_stitch_is_free():
     result = _run_contract(
         "["
         "contract.generationRetryContract({duration_s:30,segment_count:3,"
         "generation:null}),"
         "contract.generationRetryContract({duration_s:30,segment_count:3,"
-        "generation:{status:'failed',stage:'h3',segments:["
-        "{index:1,status:'succeeded'},{index:2,status:'failed'},"
-        "{index:3,status:'not_started'}]}}),"
+        "generation:{status:'failed',stage:'h3',retry_paid_segment_count:2,segments:["
+        "{index:1,status:'succeeded'},{index:2,status:'succeeded'},"
+        "{index:3,status:'succeeded'}]}}),"
         "contract.generationRetryContract({duration_s:30,segment_count:3,"
         "generation:{status:'failed',stage:'stitch',client_request_id:'request-old',"
+        "retry_paid_segment_count:0,"
         "segments:[{index:1,status:'succeeded'},{index:2,status:'succeeded'},"
         "{index:3,status:'succeeded'}]}}),"
+        "contract.generationRetryContract({duration_s:30,segment_count:3,"
+        "generation:{status:'failed',stage:'h3',segments:["
+        "{index:1,status:'failed'},{index:2,status:'failed'},"
+        "{index:3,status:'failed'}]}}),"
         "contract.generationRetryContract({duration_s:30,segment_count:3,"
         "generation:{status:'submission_unknown',stage:'h3',segments:[]}})"
         "]"
@@ -93,6 +98,7 @@ def test_long_retry_cost_uses_frozen_segment_progress_and_stitch_is_free():
         {"action": "new", "paidTaskCount": 3},
         {"action": "retry", "paidTaskCount": 2},
         {"action": "retry_stitch", "paidTaskCount": 0},
+        {"action": "retry", "paidTaskCount": None},
         {"action": "none", "paidTaskCount": 0},
     ]
 
@@ -196,3 +202,17 @@ def test_long_video_ui_copy_and_segment_progress_contract():
     ):
         assert text in source
     assert 'if (stage === "stitch") return "视频拼接"' in source
+
+
+def test_published_video_does_not_hide_stitch_recovery():
+    source = APP_JS.read_text(encoding="utf-8")
+    branch = source.split("function renderFinalSection(detail)", 1)[1]
+    branch = branch.split("function kfGrid", 1)[0]
+    assert "showPublishedVideo" in branch
+    assert "showStitchRecovery" in branch
+    assert "published.appendChild(videoSection" in branch
+    assert "if (showPublishedVideo && !showStitchRecovery) return" in branch
+
+
+def test_long_segment_prompt_copy_is_explicitly_frozen():
+    assert "逐段冻结的 H3 提示词" in APP_JS.read_text(encoding="utf-8")

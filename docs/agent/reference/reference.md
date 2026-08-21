@@ -121,7 +121,7 @@ multipart 字段：
 }
 ```
 
-`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id 或内部 child request id。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source/has_video` 按磁盘实况计算。
+`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 是服务端结合持久化状态与分段 `generated.mp4` 文件实况计算的人工重试新增付费任务数；`stage=stitch` 固定为 0。前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source/has_video` 按磁盘实况计算。
 
 ### `PATCH /api/conversations/{cid}/prompt`
 
@@ -195,7 +195,7 @@ multipart 字段：
 | 409 | `submission_outcome_unknown` | 既有 generation 为 submission_unknown；任意 id 均拒绝 |
 | 409 | `generation_state_invalid` | 已持久化 generation status/attempt 不满足安全状态形状 |
 
-相同 id 在 `queued/running/succeeded` 时返回现有 `{status,attempt}`，不重复 POST。确定 `failed` 的短链或长链 H3 阶段只有新 id 才进入人工 retry。长链 retry 从冻结的 `generation.segments` 复用仍有成片的 `succeeded` 段，把其余失败段和同链尚未生成的下游段重置为待生成；前端据此显示本次实际新增的付费 H3 子任务数。若长链为 `failed + stage=stitch`，必须复用原 `client_request_id` 和冻结参数，只重新执行本地拼接，attempt 不递增且新增付费 H3 子任务数为 0。
+相同 id 在 `queued/running/succeeded` 时返回现有 `{status,attempt}`，不重复 POST。确定 `failed` 的短链或长链 H3 阶段只有新 id 才进入人工 retry。长链 retry 从冻结的 `generation.segments` 复用状态和文件均完整的 `succeeded` 段，把其余段重置为待生成；前端直接展示服务端 `retry_paid_segment_count`。若长链为 `failed + stage=stitch`，必须复用原 `client_request_id` 和冻结参数，只重新执行本地拼接，attempt 不递增且新增付费 H3 子任务数为 0。即使半发布留下可播放的会话级 `generated.mp4`，详情仍同时公开 `has_video=true` 与拼接恢复状态。
 
 旧 Context IR 契约下未完成的 generation 对外固定映射为 `failed / generation_path_removed`；历史成片保持可读。用户用新 id 重试时重写为当前直接 H3 receipt，不再恢复或查询 MiniMax task。
 
@@ -253,7 +253,7 @@ multipart 字段：
 | `long_video_plan_receipt` | 长链固定为 `long_video_plan.json` |
 | `frozen_plan_receipt` | 长链首次提交确认的 plan SHA-256 |
 | `fit_mode` | `none/crop/pad` |
-| `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含内部 `segments`，status 含 resume_required |
+| `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含内部 `segments`，failed 时公开 `retry_paid_segment_count`，status 含 resume_required |
 | `postprocess` | `{status,options,frames,error}`，与 H3 输入隔离 |
 
 `≤10s` 的 schema v2 使用顶层 keyframes/prompt；`>10s` 使用 `segments` 与 `long_video_plan.json`，每段独立工作目录和 H3 状态。两种契约不能互相降级或混用 receipt。
