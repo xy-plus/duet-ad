@@ -293,6 +293,11 @@ def write_plan_receipt(
         keyframe_paths = list(raw.get("keyframe_paths", []))
         if not 1 <= len(keyframe_paths) <= 9:
             raise LongVideoError("long_video_plan_invalid_keyframes")
+        try:
+            first_frame_path = Path(raw["first_frame_path"])
+            last_frame_path = Path(raw["last_frame_path"])
+        except (KeyError, TypeError):
+            raise LongVideoError("long_video_plan_invalid_anchors") from None
         dialogue = list(raw.get("dialogue", []))
         receipt_segments.append(
             {
@@ -304,6 +309,10 @@ def write_plan_receipt(
                 "source": _artifact(root, Path(raw["source_path"])),
                 "keyframes": [
                     _artifact(root, Path(path)) for path in keyframe_paths
+                ],
+                "anchors": [
+                    {"role": "first", **_artifact(root, first_frame_path)},
+                    {"role": "end", **_artifact(root, last_frame_path)},
                 ],
                 "visual_prompt": _artifact(root, Path(raw["visual_prompt_path"])),
                 "final_prompt": _artifact(root, Path(raw["final_prompt_path"])),

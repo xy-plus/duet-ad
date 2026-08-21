@@ -71,6 +71,7 @@ VOICE_TIMELINE_WARNING = (
 H3_DEFAULT_RATIO = "9:16"
 H3_DEFAULT_FIT_MODE = "none"
 H3_ENGINE_WORKFLOW = "minimax_h3_lightx2v_v5"
+H3_BOUNDARY_WORKFLOW = "minimax_h3_lightx2v"
 # 拆段不变量（与 app/scenes.py 的算法级不变量同值；不 import scenes：scenedetect 缺依赖时
 # scenes 模块会 SystemExit，流水线不能因此加载失败）
 SEGMENT_MIN_S = 1.0
@@ -775,6 +776,56 @@ def _keyframes_require_fit(work: Path, names: list[str]) -> bool:
     return False
 
 
+def _read_segment_anchor_frames(work: Path) -> tuple[bytes, bytes]:
+    """Snapshot the first/end sampled source frames before Codex can mutate work/."""
+    try:
+        manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise PipelineError("segment manifest missing or invalid for source anchors") from None
+    frames = manifest.get("frames") if isinstance(manifest, dict) else None
+    if not isinstance(frames, list) or not frames:
+        raise PipelineError("segment manifest has no frames for source anchors")
+    ordered: list[tuple[float, int, Path]] = []
+    root = work.resolve()
+    for position, frame in enumerate(frames):
+        if not isinstance(frame, dict) or not isinstance(frame.get("file"), str):
+            raise PipelineError("segment manifest frame invalid for source anchors")
+        try:
+            time_s = float(frame["time_seconds"])
+        except (KeyError, TypeError, ValueError):
+            raise PipelineError("segment manifest frame invalid for source anchors") from None
+        if not math.isfinite(time_s):
+            raise PipelineError("segment manifest frame invalid for source anchors")
+        path = (work / frame["file"]).resolve()
+        if path.parent != root or not path.is_file():
+            raise PipelineError("segment manifest frame path invalid for source anchors")
+        ordered.append((time_s, position, path))
+    ordered.sort(key=lambda item: (item[0], item[1]))
+    try:
+        first = ordered[0][2].read_bytes()
+        last = ordered[-1][2].read_bytes()
+    except OSError:
+        raise PipelineError("cannot read segment source anchors") from None
+    if not first or not last:
+        raise PipelineError("segment source anchor is empty")
+    return first, last
+
+
+def _write_segment_anchors(work: Path, anchors: tuple[bytes, bytes]) -> tuple[Path, Path]:
+    """Write stable server-owned anchor paths from the pre-Codex snapshots."""
+    anchor_dir = work / "anchors"
+    if anchor_dir.is_dir():
+        shutil.rmtree(anchor_dir)
+    elif anchor_dir.exists():
+        anchor_dir.unlink()
+    anchor_dir.mkdir()
+    first_path = anchor_dir / "first.png"
+    last_path = anchor_dir / "last.png"
+    first_path.write_bytes(anchors[0])
+    last_path.write_bytes(anchors[1])
+    return first_path, last_path
+
+
 def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, runner,
                      lines: list[dict] | None, target_language: str = "",
                      *, new_input_contract: bool = False) -> dict:
@@ -797,6 +848,7 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             timeout=120,
             step=f"segment {index} extract",
         )
+        anchor_frames = _read_segment_anchor_frames(segwork) if new_input_contract else None
         # 该段台词（白名单净化后；lines 为 None = 无口播，不写文件）
         if lines is not None:
             (segwork / "voice_lines.json").write_text(
@@ -819,6 +871,7 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
         )
         visual_prompt = prompt
         if new_input_contract:
+            first_anchor, last_anchor = _write_segment_anchors(segwork, anchor_frames)
             (segwork / "visual_prompt.txt").write_text(visual_prompt, encoding="utf-8")
             prompt = long_video.compose_segment_visual_prompt(visual_prompt)
             try:
@@ -842,6 +895,8 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
                 keyframe_paths=[
                     f"segments/{index}/work/keyframes/{name}" for name in keyframes
                 ],
+                first_frame_path=f"segments/{index}/work/anchors/{first_anchor.name}",
+                last_frame_path=f"segments/{index}/work/anchors/{last_anchor.name}",
                 visual_prompt=visual_prompt,
                 dialogue=list(lines or []),
             )
@@ -1113,6 +1168,8 @@ def run(settings: Settings, cid: str, runner) -> None:
                             "keyframe_paths": [
                                 segwork / "keyframes" / name for name in seg["keyframes"]
                             ],
+                            "first_frame_path": segwork / "anchors" / "first.png",
+                            "last_frame_path": segwork / "anchors" / "last.png",
                             "visual_prompt_path": segwork / "visual_prompt.txt",
                             "final_prompt_path": segwork / "prompt.txt",
                             "dialogue": seg["dialogue"],
@@ -1123,7 +1180,7 @@ def run(settings: Settings, cid: str, runner) -> None:
                     source=source,
                     duration_s=duration_s,
                     segments=receipt_segments,
-                    workflow=H3_ENGINE_WORKFLOW,
+                    workflow=H3_BOUNDARY_WORKFLOW,
                 )
                 changes["long_video_plan_receipt"] = receipt_path.name
             # 新 schema 保留 segments；短视频仍只写顶层 keyframes/prompt。
