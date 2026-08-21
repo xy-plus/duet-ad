@@ -3,7 +3,7 @@ name: result-display
 type: behavior
 status: done
 owner: human
-updated: 2026-08-20
+updated: 2026-08-21
 tdd: N/A
 links: [conversation-task, processing-state]
 ---
@@ -15,13 +15,16 @@ links: [conversation-task, processing-state]
 | 当 | 则 |
 | --- | --- |
 | 输入准备为 `done` | 展示源视频、1–9 张关键帧、最终 H3 prompt、台词选择、画幅选择和最终视频区 |
-| H3 attempt 尚未创建 | 自动生成的 H3 源提示词可二次修改；保存使用当前 SHA-256 防止覆盖新版本 |
+| 短视频 H3 attempt 尚未创建 | 自动生成的 H3 源提示词可二次修改；保存使用当前 SHA-256 防止覆盖新版本 |
+| 长视频准备完成 | 展示各段提示词但不提供顶层编辑；各段内容已由 plan receipt 绑定 |
 | H3 attempt 已创建 | H3 源提示词锁定；不能让页面展示内容与已冻结输入发生漂移 |
 | 选择 `auto` | 使用详情 `dialogue.auto_lines` 中的自动有效台词，不允许随请求上传 `lines` |
 | 选择 `edit` | 以自动台词预填，提交至少一行 `{text,start_s,end_s}` |
 | 选择 `custom` | 提交至少一行人工台词，不依赖自动识别结果 |
 | 选择 `none` | 发声块明确写“无台词”，不允许上传 `lines` |
 | 用户确认台词与画幅 | 按钮为“生成最终视频”；H3 源提示词直接作为实际生成输入 |
+| 长视频生成确认 | 展示冻结的子任务数量；提交时绑定当前 plan receipt，只允许 `auto/none` |
+| 长视频生成中 | 展示各段的 chain、join、状态和 attempt；不公开供应商 task id |
 | 准备完成后的全部实际关键帧都是 9:16 | 画幅固定 `none`，不能选择 crop/pad |
 | 任一实际关键帧不是 9:16 | 必须选择居中 `crop` 或黑边 `pad`，不提供静默默认值；即使源视频是 9:16，关键帧被裁成其他比例也适用 |
 | generation active | 禁用参数和提交按钮，2 秒轮询状态 |
@@ -33,6 +36,6 @@ links: [conversation-task, processing-state]
 
 ## 边界
 
-- `duration_s` 展示实际 ffprobe 时长；上传门禁确保其不超过 H3 上限 10 秒。
+- `duration_s` 展示实际 ffprobe 时长；上传门禁确保其不超过总输入上限 300 秒。
 - 所有媒体经带 Bearer 鉴权的 files API 获取，页面使用 blob URL，不暴露目录直链。
 - 画面 OCR 只在视觉 prompt 中展示；唯一发声块只由结构化台词机械生成。

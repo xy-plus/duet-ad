@@ -3,7 +3,7 @@ name: architecture
 type: architecture
 status: done
 owner: agent
-updated: 2026-08-20
+updated: 2026-08-21
 tdd: N/A
 links: [conversation-task]
 ---
@@ -19,9 +19,14 @@ flowchart LR
   U[Browser / API client] -->|h1 or h2 :3211| C[Caddy]
   C -->|127.0.0.1:3212| A[FastAPI single process]
   A --> P[Input preparation]
-  P --> R[prepared_input.json]
-  R --> H[AutoDL Art MiniMax-H3]
+  P --> Q{duration <= 10s?}
+  Q -->|yes| R[prepared_input.json]
+  Q -->|no| L[long_video_plan.json]
+  R --> H[Ref2VA single task]
+  L --> F[FL2VA segment chains]
   H --> V[generated.mp4]
+  F --> X[ffmpeg stitch]
+  X --> V
   A -. optional, excluded from H3 .-> S[Seedream postprocess]
 ```
 
@@ -35,6 +40,9 @@ flowchart LR
 | `app/prepared_input.py` | 结构化台词、唯一发声块、文件哈希绑定、fail-closed loader | conversation-task |
 | `app/frame_fit.py` | 用户确认后把关键帧居中 crop 或黑边 pad 为 9:16 | conversation-task |
 | `app/h3.py` | 直接 H3 的 start/inspect/resume/retry 和磁盘状态机 | conversation-task |
+| `app/long_video.py` | 1–15 秒安全分段、hard_cut/continue 链语义、canonical plan receipt | conversation-task |
+| `app/long_generation.py` | FL2VA 子任务冻结、最多两链调度、分段恢复和拼接编排 | conversation-task |
+| `app/stitch.py` | 24fps H.264 归一化、连续边界去重帧、源音频/静音拼接 | conversation-task |
 | `app/asr.py` / `app/voice.py` / `app/vocal.py` | 本地多语种听写、ASR JSON 校验、YAMNet `spoken/sung` 分类 | conversation-task |
 | `app/postprocess.py` / `app/seedream.py` | 可选去字幕/品牌关键帧编辑；不参与 H3 输入 | postprocess |
 | `app/codex_runner.py` | 本地 codex 内层 workspace 沙箱、voice 专用外层文件系统隔离、并发和超时；不把服务凭据交给 agent | conversation-task |
@@ -64,17 +72,17 @@ flowchart LR
 
 关键不变量：
 
-- 新会话 `schema_version=2`，有效源时长为正有限数且不超过 10 秒；场景检测可辅助选帧，但新契约始终把完整源视频作为一次 H3 请求，不截断、不隐式分段。
+- 新会话 `schema_version=2`，有效源时长为正有限数且不超过 300 秒。`≤10s` 保持完整源视频的 Ref2VA 单请求；`>10s` 必须形成连续覆盖全片的 1–15 秒 FL2VA 分段，不能回落到单请求。
 - `keep` 模式由固定的本地 `whisper.cpp` multilingual small 处理 16kHz 单声道音频，自动检测语言；模型和二进制由部署固定，运行时不下载。`rewrite/translate` 才进入音频专用 Codex 隔离区。
 - 自动台词的唯一可收养 agent 输出是隔离区 `work/voice_lines.json`：先做大小、普通文件与 JSON 字段白名单校验，再把净化结果写回主 `work/`。重试创建全新隔离区；Codex 超时/非零退出但完整产物已通过同一校验时仍可收养。
 - ASR 初次校验和 YAMNet 分类使用 `voice.mp3` 的真实时长；随后、写 `voice_lines/meta/receipt` 前，必须把有效台词归一到 manifest 的视频时间轴。跨越视频结尾的行把 `end_s` 截到视频时长，`start_s >= duration_s` 的 MP3 编码纯尾部行丢弃并留 provenance/warning，归一结果再过一次 voice 白名单。receipt 的时间真相始终是视频时长。
 - YAMNet 默认按句区间分类；仅当 ASR 只返回一句、该区间未命中而全轨单窗达到同一个 `51/256` 明确人声阈值时，允许按全轨较强的 `spoken/sung` 兜底。多句或纯 BGM 不使用该兜底。
 - 视觉 agent 运行时看不到 `voice_lines.json`。视觉 prompt 中的 OCR、字幕、画面文字或备注不会被解析成台词。
-- `auto` 只接受内部 ASR provenance；默认声学过滤同时保留 `spoken` 与 `sung`。`edit/custom` 只接受用户提交的结构化行；`none` 必须为空。
+- `auto` 只接受内部 ASR provenance；默认声学过滤同时保留 `spoken` 与 `sung`。短链可使用 `edit/custom`；长链创建只允许 `voice_mode=keep`，提交只允许复用源音频的 `auto` 或静音 `none`。
 - `prompt.txt` 由视觉文本和唯一结构化发声块机械组合。无台词时明确禁止角色说出画面文字。
 - ASR 输出中的 `[无法辨识]`、`[inaudible]`、`[unintelligible]` 等哨兵文本不是业务台词：净化为“本次未得到转写”，复用有声学人声证据时的一次重试；任何哨兵不得进入 `voice_lines.json`、prepared receipt 或 H3 prompt。
 - 冻结的 H3 源提示词是唯一生成输入；项目不调用 MiniMax Context IR，也不接受运行时优化开关。
-- `duration_s` 以实际浮点数写 receipt；上传与提交双重门禁限制为 10 秒，H3 请求时长为 `ceil(duration_s)`。
+- `duration_s` 以实际浮点数写 receipt；上传与提交双重门禁限制为 300 秒。短链 H3 时长为 `ceil(duration_s)` 且不超过 10；长链每段为 `ceil(end_s-start_s)` 且不超过 15。
 - `fit_required` 只在 pipeline `done` 时按实际选中的每张关键帧计算，不持久化源视频宽高作为第二真相。只有全部关键帧都是 9:16 才允许 `none`，任一非 9:16 就必须人工选 `crop` 或 `pad`；即使源视频是 9:16，裁过的关键帧也不能绕过。两种策略都不缩放帧，只做居中裁切或居中黑边扩画布。
 - H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/{crop|pad}/`；永不读取 `postprocessed/`。
 
@@ -88,6 +96,10 @@ flowchart LR
 - H3 的 workflow、整数时长和分辨率请求。
 
 写 receipt 后立即经过同一 loader 复核；提交和重启恢复也重新加载。未知 schema/version、路径越界、文件缺失/漂移、台词漂移、最终 prompt 不是确定性组合时全部 fail closed。提交锁内会按用户最终台词和画幅选择重写 receipt，随后 H3Request 只使用当次加载的不可变 bytes。
+
+长链不用短链 receipt 冒充多段输入。`long_video_plan.json`（`duet.long-video-plan` v1）绑定完整源文件、总时长、FL2VA workflow，以及每段的范围、chain/join、源片、关键帧、首尾锚点、视觉/最终提示词和台词摘要。detail 暴露该文件内容的 SHA-256 为 `plan_receipt`；提交必须原样回传 `expected_plan_receipt`。服务在任何供应商 POST 前重新校验 plan、meta 和所有文件哈希，并将确认值冻结到 `frozen_plan_receipt`。
+
+同一镜头切出的 `continue` 段使用上一成功生成段的精确尾帧作为本段首帧，当前源片段末帧作为目标尾帧；`hard_cut` 段用自身源首尾锚点开始新链。每段都有统一连续性约束和本段局部提示词，但这只是最佳努力约束，不是供应商原生 extend，也不承诺逐帧无缝。
 
 ## H3 付费状态机
 
@@ -113,15 +125,18 @@ stateDiagram-v2
 
 API 暴露的 coarse generation 是 `queued/running/resume_required/succeeded/failed/submission_unknown`。四类 provider 查询/超时及 `download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed` 映射为 `resume_required`；URL/实际 peer、重定向、体积、无效视频等确定性安全拒绝映射为 `failed`。服务没有自动付费重试。`submission_unknown` 对任何 id 固定返回 409 `submission_outcome_unknown`；意外 provider 异常会先 inspect，只有磁盘状态明确为确定失败时才开放新 id。
 
+长链在 `generation.segments` 中保存每段 `index/chain_id/join_mode/status/attempt/error/child_request_id`；公开接口省略 `child_request_id`。同链严格串行，不同链最多两个并发。任一段结果未知即锁住整批；启动恢复只对已知子任务执行 GET，不会替尚未开始的段 POST。确定失败的新父请求只推进失败段和其未完成下游，成功产物继续复用。全部成功后进入 `stage=stitch`：子片段归一为 24fps H.264/yuv420p，`continue` 边界移除后一段首帧，输出总时长误差不超过一帧；`auto` 复用完整源音轨，`none` 静音。拼接失败用原请求只重跑本地拼接。
+
 ## 数据布局
 
 ```text
 data/<cid>/
 ├── meta.json                         # conversation schema v2
 ├── source.<mp4|mov|webm>
-├── prepared_input.json               # duet.prepared-input v1
+├── prepared_input.json               # short only: duet.prepared-input v1
+├── long_video_plan.json              # long only: duet.long-video-plan v1
 ├── generated.mp4                     # H3 success only
-├── .h3/
+├── .h3/                               # short-video attempt state
 │   ├── session.json
 │   ├── session.lock
 │   └── attempts/000001/attempt.json
@@ -132,15 +147,25 @@ data/<cid>/
     ├── visual_prompt.txt
     ├── prompt.txt
     ├── keyframes/*.png
-    ├── h3_frames/{crop|pad}/*.png    # only after explicit fit choice
-    └── postprocessed/*.png           # optional display-only Seedream output
+    ├── h3_frames/{crop|pad}/*.png    # short only, after explicit fit choice
+    ├── postprocessed/*.png           # optional display-only Seedream output
+    └── segments/<N>/
+        ├── source.mp4
+        ├── generated.mp4             # paid FL2VA segment output
+        ├── .h3/attempts/...           # segment-owned provider state
+        └── work/
+            ├── anchors/{first,last}.png
+            ├── keyframes/*.png
+            ├── h3_frames/...         # fitted anchors when required
+            ├── visual_prompt.txt
+            └── prompt.txt
 ```
 
 旧 meta 缺 `schema_version=2` 时，详情派生 `read_only=true`；文件仍可查看，但 `/submit` 和 `/postprocess` 都拒绝修改。
 
 ## 并发、恢复与安全
 
-- 上传创建的查重/排队计数在进程锁内；pipeline 使用进程信号量；提交和后处理各有每会话 asyncio 锁。
+- 上传创建的查重/排队计数在进程锁内；pipeline 使用进程信号量；提交和后处理各有每会话 asyncio 锁。长视频提示词准备最多使用一半 Codex 并发槽，生成最多推进两条独立 chain。
 - H3 远程调用在后台线程中执行，状态先写 meta `queued`，再写 `running`。服务启动仅扫描 schema v2 且 generation 为 `queued/running` 的会话。
 - 应用必须单进程运行。内存锁和信号量不跨 worker；不要加 `--workers`。
 - 供应商凭据只在 `Settings`/H3Request 内存中；receipt、attempt、meta、API 与安全错误都不含密钥。
@@ -150,5 +175,5 @@ data/<cid>/
 ## 对外接口
 
 - HTTP：`/api/health`、`/api/login`、`/api/conversations*`；完整字段和状态码见 [reference](../reference/reference.md)。
-- Python：`prepared_input.write_prepared_input/load_prepared_input`、`h3.start/inspect/resume/retry`、`frame_fit.fit_frames`。
+- Python：短链使用 `prepared_input.write_prepared_input/load_prepared_input`；长链使用 `long_video.plan_segments/write_plan_receipt`、`long_generation.freeze_plan/run` 和 `stitch.stitch_video`；两者复用 `h3.start/inspect/resume/retry` 与 `frame_fit.fit_frames`。
 - 部署：[.deploy/runbook.md](../../../.deploy/runbook.md)；systemd 示例不包含凭据。

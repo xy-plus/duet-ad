@@ -3,9 +3,9 @@ name: h3-runtime
 type: reference
 status: done
 owner: agent
-updated: 2026-08-20
+updated: 2026-08-21
 tdd: N/A
-links: [conversation-task, app/main.py, app/h3.py, app/prepared_input.py]
+links: [conversation-task, app/main.py, app/h3.py, app/prepared_input.py, app/long_generation.py]
 ---
 
 # H3 runtime · 接口（How/Now）
@@ -53,7 +53,7 @@ multipart 字段：
 | `voice_mode` | `keep/rewrite/translate`，默认 `keep`；只控制 auto 输入准备 |
 | `target_language` | `voice_mode=translate` 时必填；其他模式忽略 |
 
-新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长为正有限数且不超过 10 秒；文件大小默认 ≤500MB。无音轨合法。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
+新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长为正有限数且不超过 300 秒；文件大小默认 ≤500MB。无音轨合法。`>10s` 只接受 `voice_mode=keep`，否则 422 `long_video_audio_mode_unsupported`。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
 
 ### `GET /api/conversations/{cid}`
 
@@ -98,19 +98,42 @@ multipart 字段：
 }
 ```
 
-`generation`、`receipt_version` 和 `fit_mode` 在尚未创建时为 null。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source/has_video` 按磁盘实况计算。
+短视频使用上面的 `receipt_version=1`，不返回 plan 字段。长视频的同一响应还包含：
+
+```json
+{
+  "duration_s": 30.0,
+  "receipt_version": null,
+  "plan_receipt": "64 lowercase hex characters",
+  "segment_count": 2,
+  "segments": [
+    {"index": 1, "start_s": 0.0, "end_s": 15.0, "chain_id": "chain-001", "join_mode": "hard_cut"},
+    {"index": 2, "start_s": 15.0, "end_s": 30.0, "chain_id": "chain-001", "join_mode": "continue"}
+  ],
+  "generation": {
+    "status": "running",
+    "stage": "h3",
+    "segments": [
+      {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut", "status": "succeeded", "attempt": 1, "error": null},
+      {"index": 2, "chain_id": "chain-001", "join_mode": "continue", "status": "running", "attempt": 1, "error": null}
+    ]
+  }
+}
+```
+
+`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id 或内部 child request id。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source/has_video` 按磁盘实况计算。
 
 ### `PATCH /api/conversations/{cid}/prompt`
 
-请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。只在 schema v2、输入准备完成且 H3 attempt 尚未创建时，以 SHA-256 CAS 更新 `work/visual_prompt.txt`，重新机械组合结构化台词并重写 prepared receipt。attempt 已创建后返回 409 `prompt_frozen`。
+请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。该接口只适用于 `≤10s` 短链：在 schema v2、输入准备完成且 H3 attempt 尚未创建时，以 SHA-256 CAS 更新 `work/visual_prompt.txt`，重新机械组合结构化台词并重写 prepared receipt。attempt 已创建后返回 409 `prompt_frozen`。长链的分段提示词已由 plan receipt 逐段绑定，不提供此顶层编辑接口。
 
 ### `GET /api/conversations/{cid}/files/{name}`
 
-白名单：`source.mp4`（映射唯一 `source.*`）、`preview.mp4`、`generated.mp4`、`contact_sheet.jpg`、`keyframes/<basename>`、`postprocessed/<basename>`，以及旧分段路径 `segments/N/work/{keyframes|postprocessed}/<basename>`。路径穿越、非白名单或文件不存在均 404。
+白名单：`source.mp4`（映射唯一 `source.*`）、`preview.mp4`、`generated.mp4`、`contact_sheet.jpg`、`keyframes/<basename>`、`postprocessed/<basename>`，以及长视频 `segments/N/work/{keyframes|postprocessed}/<basename>`。路径穿越、非白名单或文件不存在均 404。
 
 ### `POST /api/conversations/{cid}/submit`
 
-该接口直接提交冻结的 H3 源提示词：
+短视频直接提交 frozen prepared input：
 
 ```json
 {
@@ -121,7 +144,7 @@ multipart 字段：
 }
 ```
 
-允许键只有 `confirm/client_request_id/dialogue_mode/lines/fit_mode`：
+短视频允许键只有 `confirm/client_request_id/dialogue_mode/lines/fit_mode`：
 
 - `confirm` 必须是 JSON boolean `true`。
 - `client_request_id` 必须完整匹配 `^[0-9A-Za-z-]{8,64}$`。
@@ -129,6 +152,20 @@ multipart 字段：
 - `dialogue_mode=edit|custom`：必须有非空 `lines`；每项只能含 `text/start_s/end_s`，文本非空、时间有序且落在实际视频时长内。`edit` provenance 固定 `asr+edited`，`custom` 固定 `manual`。
 - `dialogue_mode=none`：禁止 `lines`，有效台词为空。
 - `fit_required=false` 时只允许 `fit_mode=none`；为 true 时只允许 `crop` 或 `pad`。该值只在 pipeline `done` 时按实际选中关键帧计算，源视频 9:16 不能豁免非 9:16 关键帧。
+
+长视频请求严格为：
+
+```json
+{
+  "confirm": true,
+  "client_request_id": "request-123456",
+  "dialogue_mode": "auto",
+  "fit_mode": "none",
+  "expected_plan_receipt": "64 lowercase hex characters"
+}
+```
+
+长视频只允许这五个键，`dialogue_mode` 只能为 `auto`（最终复用完整源音轨）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希。画幅规则与短链相同。
 
 接受后返回 `202 {"status":"queued","attempt":N}`。后台状态写入 `generation`，客户端轮询 detail。
 
@@ -143,11 +180,14 @@ multipart 字段：
 | 422 | `invalid_submit_request` | 出现未知键 |
 | 422 | `invalid_client_request_id` | id 不合规 |
 | 422 | `invalid_dialogue` | mode、lines 形状或台词内容不合规 |
+| 422 | `long_video_audio_mode_unsupported` | 长链使用了非 keep 创建模式、edit/custom 或 lines |
+| 422 | `invalid_plan_receipt` | 长链缺失或 plan receipt 格式非法 |
 | 422 | `invalid_fit_mode` / `fit_mode_required` / `fit_mode_not_allowed` | 画幅选择不合规 |
 | 409 | `artifacts not ready` | 输入准备 status 不是 done |
 | 503 | `h3_credentials_missing` | AutoDL 凭据缺失 |
 | 503 | `h3_configuration_invalid` | 冻结后无法构造合法 H3Request/timeout 配置 |
 | 409 | `prepared_input_invalid` / `frame_fit_failed` | 冻结输入或画幅派生失败 |
+| 409 | `long_video_plan_changed` / `long_video_plan_invalid` | 长链 CAS 不匹配或 plan/文件绑定无效 |
 | 409 | `generation in progress` / `already submitted` | active/succeeded 使用不同 id |
 | 409 | `new client_request_id required` | 确定 failed 后复用旧 id |
 | 409 | `resume_request_id_mismatch` | resume_required 没有使用原 client_request_id |
@@ -159,7 +199,7 @@ multipart 字段：
 
 旧 Context IR 契约下未完成的 generation 对外固定映射为 `failed / generation_path_removed`；历史成片保持可读。用户用新 id 重试时重写为当前直接 H3 receipt，不再恢复或查询 MiniMax task。
 
-`resume_required` 表示 H3 provider task 已知：只接受原 `client_request_id`，且 dialogue mode、标准化 lines 和 `fit_mode` 必须与 meta 和 prepared receipt 完全一致。合法继续返回 `202 {"status":"queued","attempt":<原值>}`，不重写 receipt、不递增 attempt，后台调用幂等 `h3.start` 而非 `h3.retry`。已知 task 错误包括 `h3_query_failed/h3_timeout/download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed`；`h3_running` 也进入此状态。
+`resume_required` 表示 H3 provider task 已知：只接受原 `client_request_id`，且 dialogue mode、标准化 lines、`fit_mode` 及长链 plan receipt 必须与冻结输入完全一致。合法继续返回 `202 {"status":"queued","attempt":<原值>}`，不重写 receipt、不递增 attempt。已知 task 错误包括 `h3_query_failed/h3_timeout/download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed`；`h3_running` 也进入此状态。长链启动恢复只 GET 已持久化子任务，不会 POST 尚未开始的段。
 
 确定性输出安全拒绝 `download_url_rejected/download_redirect_rejected/download_too_large/download_invalid_video` 映射为 `failed`，只有用户明确使用新 id 才创建 retry attempt。它们不属于会因同参数继续而消失的传输故障。
 
@@ -198,6 +238,7 @@ multipart 字段：
 | `fit_required` | bool/null | pipeline done 时按实际选中关键帧计算，任一非 9:16 即 true |
 | `dialogue_mode` | str | 默认 auto；最终提交选择 |
 | `generation` | object/null | coarse H3 attempt 状态 |
+| `segments` | list | 长链分段计划；短链为空 |
 
 准备/提交后可增加：
 
@@ -209,11 +250,13 @@ multipart 字段：
 | `vocal_filter_enabled`, `voice_warnings`, `voice_lines_vocal_dropped` | 声学过滤留痕 |
 | `prepared_dialogue` | 本次提交冻结的完整有效台词（含 classification/provenance） |
 | `prepared_input_receipt` / `receipt_version` | `prepared_input.json` / 1 |
+| `long_video_plan_receipt` | 长链固定为 `long_video_plan.json` |
+| `frozen_plan_receipt` | 长链首次提交确认的 plan SHA-256 |
 | `fit_mode` | `none/crop/pad` |
-| `generation` | `{status,error,attempt,client_request_id,stage}`；status 含 resume_required |
+| `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含内部 `segments`，status 含 resume_required |
 | `postprocess` | `{status,options,frames,error}`，与 H3 输入隔离 |
 
-旧 `segments` 字段只用于读取历史产物；schema v2 可使用场景检测辅助选帧，但冻结输入与生成请求始终覆盖完整源视频。
+`≤10s` 的 schema v2 使用顶层 keyframes/prompt；`>10s` 使用 `segments` 与 `long_video_plan.json`，每段独立工作目录和 H3 状态。两种契约不能互相降级或混用 receipt。
 
 ## Prepared input receipt v1
 
@@ -243,9 +286,20 @@ multipart 字段：
 
 `normalized_audio=null` 是无音轨的合法表示。crop/pad 时 keyframe binding 指向 `work/h3_frames/<mode>/`，且不会出现 `postprocessed`。
 
+## Long-video plan receipt v1
+
+`data/<cid>/long_video_plan.json` 是 canonical JSON，固定 `schema=duet.long-video-plan`、`version=1`。顶层绑定完整 source 的路径/SHA-256、实际总时长、`workflow=minimax_h3_lightx2v` 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，长度 1–15 秒，并绑定：
+
+- `index/start_s/end_s/chain_id/join_mode`；首段必须 `hard_cut`，后续为 `hard_cut` 或 `continue`；
+- 分段 source、1–9 张关键帧、`first/end` 两张锚点及其 SHA-256；
+- `visual_prompt`、最终 `prompt` 的路径/SHA-256；
+- 本段局部台词的 canonical 数量与 SHA-256。
+
+detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字段。提交时服务同时比对该摘要、meta 分段和全部 artifact；`fit_mode=crop/pad` 时冻结的 FL2VA 请求改用服务端派生的 9:16 锚点。每段工作目录为 `work/segments/<N>/`，其中 `.h3/` 只归该子任务所有。
+
 ## H3 attempt state v1
 
-路径 `.h3/attempts/<六位递增号>/attempt.json`。最小形状：
+短链路径 `.h3/attempts/<六位递增号>/attempt.json`；长链路径 `work/segments/<N>/.h3/attempts/<六位递增号>/attempt.json`。最小形状：
 
 ```json
 {
@@ -270,7 +324,9 @@ multipart 字段：
 - `h3.resume(request)`：获取会话 flock 后 GET-only 推进已有任务；`allow_submit=false`，不创建供应商任务。
 - `h3.retry(request,new_id)`：底层显式创建新 attempt；runtime 只在公开 generation 已确定为 `failed` 且用户提交新 id 时调用。`resume_required` 调 `start` 续同 attempt，`submission_unknown` 不调用。
 
-供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写 `generated.mp4`。
+短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。长链每段使用 `minimax_h3_lightx2v`，只传冻结的 `first_frame/last_frame/prompt/duration/resolution`，输出到该段 `generated.mp4`；不是供应商原生 extend。
+
+长链同一 `chain_id` 严格串行，最多并发两条 chain。`continue` 段在前一段成功后提取其精确尾帧作为 first frame；`hard_cut` 段直接使用本段源首帧。任一子任务 `submission_unknown` 锁住整批；确定失败只允许新父请求推进失败段及未完成下游，已成功段复用。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 映射为完整 source 音轨，`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
 
 输出下载门禁：只接受无 userinfo 的 HTTPS；hostname/IP 预解析必须全为公网地址，私网、loopback、local、reserved、multicast 均确定拒绝。owned httpx client 使用 `trust_env=false`；响应后在读取 status/body 前通过 `extensions.network_stream.get_extra_info("server_addr")` 验证实际 socket peer 也是公网地址。实际 peer 为私网仍是 `download_url_rejected`；DNS 临时失败为 `download_dns_failed`，缺失/异常/非 IP peer 为 `download_peer_unverified`，后二者同 id 恢复。
 
@@ -286,6 +342,9 @@ multipart 字段：
 - `app.prepared_input.load_prepared_input(...) -> PreparedInput` — 读取冻结 bytes，漂移即拒绝。
 - `app.frame_fit.fit_frames(paths,output_dir,mode) -> tuple[Path,...]` — 显式 crop/pad 9:16 派生。
 - `app.h3.start/inspect/resume/retry` — 可恢复状态机；runtime 对 resume_required 暴露同 id start，对确定 failed 暴露新 id retry，不对 submission_unknown 暴露操作。
+- `app.long_video.plan_segments/write_plan_receipt` — 安全边界规划与 canonical plan 落盘。
+- `app.long_generation.freeze_plan/run` — fail-closed 冻结、最多两链编排和分段恢复。
+- `app.stitch.stitch_video` — 本地确定性归一化、音轨选择、拼接与 receipt。
 - `app.postprocess.start/run_task` — 可选展示后处理；与 H3 请求隔离。
 
 ## 配置
