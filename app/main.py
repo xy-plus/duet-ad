@@ -157,20 +157,17 @@ def _public_generation(meta: dict, cdir: Path) -> dict | None:
             if public["stage"] == "stitch":
                 public["retry_paid_segment_count"] = 0
             else:
-                # A persisted success is reusable only while its paid artifact exists.
-                # Invalid/misaligned entries fail closed by counting as a new task.
-                public["retry_paid_segment_count"] = sum(
-                    1
-                    for position, segment in enumerate(generation["segments"], 1)
-                    if not (
-                        isinstance(segment, dict)
-                        and segment.get("index") == position
-                        and segment.get("status") == "succeeded"
-                        and (
-                            cdir / "work" / "segments" / str(position) / "generated.mp4"
-                        ).is_file()
+                frozen_segments = meta.get("segments")
+                if isinstance(frozen_segments, list):
+                    expected = tuple(range(1, len(frozen_segments) + 1))
+                    reusable = long_generation.reusable_segment_indices(
+                        expected,
+                        generation["segments"],
+                        lambda index: (
+                            cdir / "work" / "segments" / str(index) / "generated.mp4"
+                        ).is_file(),
                     )
-                )
+                    public["retry_paid_segment_count"] = len(expected) - len(reusable)
     return public
 
 

@@ -908,7 +908,7 @@ function renderFinalSection(detail) {
       ? "全部分段成片已复用，本次只在本地重试拼接。"
       : retryContract.action === "retry"
         ? "跨段连续性为 best effort；成功段复用，失败时只重做失败段及同链下游。"
-        : "跨段连续性为 best effort；首次生成覆盖全部逐段冻结输入。";
+        : "跨段连续性为 best effort；逐段冻结的 H3 提示词将提交生成。";
     notice.appendChild(el("p", null, noticeText));
     card.appendChild(notice);
   }
@@ -1049,7 +1049,9 @@ function renderFinalSection(detail) {
   row.appendChild(button);
   row.appendChild(el("p", "final-caption generation-mode-caption", busy
     ? "正在等待 H3 生成结果"
-    : "H3 源提示词将直接提交生成"));
+    : longContract.isLong
+      ? "逐段冻结的 H3 提示词将提交生成"
+      : "H3 源提示词将直接提交生成"));
   card.appendChild(row);
   if (busy) setGenerationCardBusy(card, true);
   sec.appendChild(card);
