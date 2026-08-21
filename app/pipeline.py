@@ -683,15 +683,6 @@ def _scene_bounds_for_long_plan(work: Path, duration_s: float) -> list[dict]:
     return scenes
 
 
-def _has_explicit_empty_segment_plan(work: Path) -> bool:
-    """Recognize the pre-long-video scenes contract for rolling-upgrade compatibility."""
-    try:
-        data = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return isinstance(data, dict) and data.get("segments") == []
-
-
 def _probe_duration(path: Path) -> float:
     """ffprobe 探测视频时长（秒）；失败 → PipelineError。"""
     try:
@@ -1082,7 +1073,6 @@ def run(settings: Settings, cid: str, runner) -> None:
         if (
             new_input_contract
             and duration_s > long_video.SHORT_VIDEO_MAX_S
-            and not (not segments and _has_explicit_empty_segment_plan(work))
         ):
             segments = long_video.plan_segments(
                 duration_s,

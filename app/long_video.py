@@ -41,7 +41,7 @@ def _finite_duration(value: object) -> float:
     duration = float(value)
     if not math.isfinite(duration) or duration <= 0:
         raise LongVideoError("long_video_invalid_duration")
-    if duration > LONG_VIDEO_MAX_S + _EPS:
+    if duration > LONG_VIDEO_MAX_S:
         raise LongVideoError("long_video_duration_exceeded")
     return duration
 
@@ -131,22 +131,22 @@ def plan_segments(
     segment carries chain semantics so downstream code never has to infer it.
     """
     duration = _finite_duration(duration_s)
-    if duration <= SHORT_VIDEO_MAX_S + _EPS:
+    if duration <= SHORT_VIDEO_MAX_S:
         return []
     scene_bounds = _bounds(scenes, duration)
     dialogue_intervals = _dialogue_intervals(dialogue, duration)
     hard_cuts = {end for _start, end in scene_bounds[:-1]}
 
     cuts = [0.0]
-    while duration - cuts[-1] > SEGMENT_MAX_S + _EPS:
+    while duration - cuts[-1] > SEGMENT_MAX_S:
         start = cuts[-1]
         target = min(start + SEGMENT_MAX_S, duration - SEGMENT_MIN_S)
         minimum = start + SEGMENT_MIN_S
         eligible_hard_cuts = [
             cut
             for cut in hard_cuts
-            if minimum - _EPS <= cut <= target + _EPS
-            and duration - cut >= SEGMENT_MIN_S - _EPS
+            if minimum <= cut <= target
+            and duration - cut >= SEGMENT_MIN_S
             and _is_safe_boundary(cut, dialogue_intervals)
         ]
         boundary = max(eligible_hard_cuts) if eligible_hard_cuts else _safe_at_or_before(
@@ -159,12 +159,12 @@ def plan_segments(
 
     # The final remainder may be shorter than one second after a preferred hard
     # cut.  Fold that cut back and choose the latest safe ordinary boundary.
-    if cuts[-1] - cuts[-2] < SEGMENT_MIN_S - _EPS:
+    if cuts[-1] - cuts[-2] < SEGMENT_MIN_S:
         cuts.pop(-2)
         start = cuts[-2]
         target = duration - SEGMENT_MIN_S
         boundary = _safe_at_or_before(target, start + SEGMENT_MIN_S, dialogue_intervals)
-        if boundary is None or duration - boundary > SEGMENT_MAX_S + _EPS:
+        if boundary is None or math.ceil(duration - boundary) > SEGMENT_MAX_S:
             raise LongVideoError("long_video_no_safe_dialogue_boundary")
         cuts.insert(-1, round(boundary, 6))
 
@@ -172,7 +172,7 @@ def plan_segments(
     chain_number = 1
     for index, (start, end) in enumerate(zip(cuts, cuts[1:]), start=1):
         length = end - start
-        if length < SEGMENT_MIN_S - _EPS or length > SEGMENT_MAX_S + _EPS:
+        if length < SEGMENT_MIN_S or math.ceil(length) > SEGMENT_MAX_S:
             raise LongVideoError("long_video_no_safe_dialogue_boundary")
         hard_cut = index == 1 or any(abs(start - cut) <= _EPS for cut in hard_cuts)
         if index > 1 and hard_cut:
@@ -264,7 +264,7 @@ def write_plan_receipt(
     """Write a canonical receipt binding the complete generated long-video plan."""
     root = root.resolve()
     duration = _finite_duration(duration_s)
-    if duration <= SHORT_VIDEO_MAX_S + _EPS or not segments:
+    if duration <= SHORT_VIDEO_MAX_S or not segments:
         raise LongVideoError("long_video_plan_requires_segments")
     if not isinstance(workflow, str) or not workflow.strip():
         raise LongVideoError("long_video_plan_invalid_workflow")
@@ -283,8 +283,8 @@ def write_plan_receipt(
             index != expected_index
             or not (math.isfinite(start_s) and math.isfinite(end_s))
             or abs(start_s - previous_end) > _EPS
-            or end_s - start_s < SEGMENT_MIN_S - _EPS
-            or end_s - start_s > SEGMENT_MAX_S + _EPS
+            or end_s - start_s < SEGMENT_MIN_S
+            or math.ceil(end_s - start_s) > SEGMENT_MAX_S
             or not isinstance(chain_id, str)
             or not chain_id
             or join_mode not in {"hard_cut", "continue"}

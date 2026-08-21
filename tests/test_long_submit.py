@@ -1,4 +1,5 @@
 import hashlib
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -23,8 +24,13 @@ def _png(path: Path, value: int) -> None:
 
 
 def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
-               segment_duration=15.0):
-    duration = segment_duration * len(joins)
+               segment_duration=15.0, duration=None):
+    planned = None
+    if duration is None:
+        duration = segment_duration * len(joins)
+    else:
+        planned = long_video.plan_segments(duration, [(0.0, duration)], [])
+        joins = tuple(item["join_mode"] for item in planned)
     meta = storage.new_conversation(settings.data_dir, "long", "source.mp4")
     cid = meta["id"]
     root = settings.data_dir / cid
@@ -34,9 +40,18 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
     public_segments = []
     chain_no = 0
     for index, join_mode in enumerate(joins, 1):
-        if join_mode == "hard_cut":
-            chain_no += 1
-        chain_id = f"chain-{chain_no:03d}"
+        if planned is None:
+            if join_mode == "hard_cut":
+                chain_no += 1
+            start_s = segment_duration * (index - 1)
+            end_s = segment_duration * index
+            chain_id = f"chain-{chain_no:03d}"
+            local_dialogue = ({"text": dialogue_text, "start_s": 1.0, "end_s": 2.0},)
+        else:
+            start_s = planned[index - 1]["start_s"]
+            end_s = planned[index - 1]["end_s"]
+            chain_id = planned[index - 1]["chain_id"]
+            local_dialogue = ()
         segdir = root / "work" / "segments" / str(index)
         work = segdir / "work"
         (segdir / "source.mp4").parent.mkdir(parents=True, exist_ok=True)
@@ -50,7 +65,6 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
         visual_text = f"第{index}段局部动作"
         visual = work / "visual_prompt.txt"
         visual.write_text(visual_text, encoding="utf-8")
-        local_dialogue = ({"text": dialogue_text, "start_s": 1.0, "end_s": 2.0},)
         prompt_text = "不要生成背景音乐\n" + prepared_input.compose_final_prompt(
             long_video.compose_segment_visual_prompt(visual_text), local_dialogue
         )
@@ -58,8 +72,8 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
         final.write_text(prompt_text, encoding="utf-8")
         segment = {
             "index": index,
-            "start_s": segment_duration * (index - 1),
-            "end_s": segment_duration * index,
+            "start_s": start_s,
+            "end_s": end_s,
             "chain_id": chain_id,
             "join_mode": join_mode,
             "source": f"segments/{index}/source.mp4",
@@ -325,6 +339,45 @@ def test_stitch_failure_retry_is_local_only(enabled, monkeypatch):
     assert len(posts) == 1
 
 
+def test_stitch_receipt_publish_failure_can_rebuild_over_existing_output_without_h3(
+    enabled, monkeypatch
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    posts = []
+
+    def start(request):
+        posts.append(request)
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "task")
+
+    stitch_attempts = []
+
+    def publish_then_fail_once(**kwargs):
+        stitch_attempts.append(kwargs)
+        kwargs["output"].write_bytes(b"complete-local-output")
+        if len(stitch_attempts) == 1:
+            raise OSError("injected receipt publish failure")
+        kwargs["receipt_path"].write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(h3, "start", start)
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", publish_then_fail_once)
+
+    first = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload(receipt)
+    )
+    assert first.status_code == 202
+    assert (settings.data_dir / cid / "generated.mp4").read_bytes() == b"complete-local-output"
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["stage"] == "stitch"
+
+    retried = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload(receipt)
+    )
+    assert retried.status_code == 202
+    assert len(stitch_attempts) == 2
+    assert len(posts) == 1
+
+
 def test_startup_recovery_only_resumes_attempted_segments(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
@@ -438,14 +491,31 @@ def test_resume_same_child_does_not_increment_segment_attempt(tmp_path, monkeypa
     assert storage.load_meta(settings.data_dir, cid)["generation"]["segments"][0]["attempt"] == 1
 
 
-def test_freeze_rejects_segment_whose_ceil_duration_exceeds_15(tmp_path):
+def test_receipt_rejects_unsplit_segment_whose_ceil_duration_exceeds_15(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
-    cid, receipt = _make_long(settings, segment_duration=15.0000005)
-    with pytest.raises(long_generation.LongGenerationError, match="long_video_plan_invalid"):
-        long_generation.freeze_plan(
-            settings.data_dir / cid, storage.load_meta(settings.data_dir, cid),
-            receipt, "none", "auto",
-        )
+    with pytest.raises(long_video.LongVideoError, match="long_video_plan_invalid_segment"):
+        _make_long(settings, segment_duration=15.0000005)
+
+
+@pytest.mark.parametrize(
+    "duration", [math.nextafter(10.0, math.inf), math.nextafter(15.0, math.inf)]
+)
+def test_positive_float_boundary_overflow_plans_and_freezes_provider_safe_segments(
+    tmp_path, duration
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, duration=duration)
+
+    frozen = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+
+    assert frozen.segments
+    assert all(math.ceil(item.end_s - item.start_s) <= 15 for item in frozen.segments)
 
 
 def test_local_continue_request_failure_is_structured_failed_not_coordinator_crash(
