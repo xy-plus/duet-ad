@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import pipeline, storage, vocal
+from app import long_video, pipeline, storage, vocal
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
@@ -204,8 +204,121 @@ def _fake_cut(source, start_s, end_s, segdir):
     (segdir / "source.mp4").write_bytes(b"fake-video")
 
 
+def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
+    tmp_path, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _make_segment_conversation(settings, [])
+    cid = meta["id"]
+    cdir = settings.data_dir / cid
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        duration_s=24.0,
+        dialogue_mode="auto",
+        voice_mode="keep",
+    )
+    line = {"text": "局部台词", "start_s": 16.5, "end_s": 17.5}
+    calls = {"cmd": [], "codex": []}
+
+    def fake_voice_step(*args, **kwargs):
+        return [line]
+
+    def fake_codex(self, workdir, prompt):
+        calls["codex"].append(Path(workdir))
+        _write_valid_package(Path(workdir) / "work", prompt=f"局部动作-{Path(workdir).name}")
+
+    base_fake_cmd = _fake_cmd_segments(calls, SEGMENTS)
+
+    def fake_cmd(argv, *, timeout, step, cwd=None):
+        base_fake_cmd(argv, timeout=timeout, step=step, cwd=cwd)
+        if step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps(
+                    {
+                        "duration_s": 24.0,
+                        "scenes": [
+                            {"index": seg["index"], "start_s": seg["start_s"],
+                             "end_s": seg["end_s"], "frames": []}
+                            for seg in SEGMENTS
+                        ],
+                        "segments": SEGMENTS,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(pipeline, "_voice_step", fake_voice_step)
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+
+    pipeline.run(settings, cid, CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, cid)
+    assert stored["status"] == "done", stored["error"]
+    assert [(s["start_s"], s["end_s"]) for s in stored["segments"]] == [
+        (0.0, 8.0),
+        (8.0, 16.0),
+        (16.0, 24.0),
+    ]
+    assert [s["chain_id"] for s in stored["segments"]] == [
+        "chain-001",
+        "chain-002",
+        "chain-003",
+    ]
+    assert [s["join_mode"] for s in stored["segments"]] == ["hard_cut"] * 3
+    assert stored["segments"][2]["dialogue"] == [
+        {"text": "局部台词", "start_s": 0.5, "end_s": 1.5}
+    ]
+    assert stored["segments"][0]["source"] == "segments/1/source.mp4"
+    assert stored["segments"][0]["keyframe_paths"][0].startswith(
+        "segments/1/work/keyframes/"
+    )
+    continuity = long_video.build_continuity_block()
+    for segment in stored["segments"]:
+        assert continuity in segment["prompt"]
+        assert f"局部动作-{segment['index']}" in segment["prompt"]
+    assert stored["long_video_plan_receipt"] == long_video.PLAN_RECEIPT_FILENAME
+    receipt = json.loads((cdir / long_video.PLAN_RECEIPT_FILENAME).read_text(encoding="utf-8"))
+    assert receipt["source"]["sha256"]
+    assert [s["chain_id"] for s in receipt["segments"]] == [
+        "chain-001",
+        "chain-002",
+        "chain-003",
+    ]
+
+
+def test_new_input_over_300_seconds_fails_before_any_pipeline_operation(
+    tmp_path, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _make_segment_conversation(settings, [])
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        duration_s=300.001,
+        dialogue_mode="auto",
+        voice_mode="keep",
+    )
+    calls = []
+
+    def must_not_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("pipeline operation ran for oversized input")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", must_not_run)
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "failed"
+    assert stored["error"] == "long_video_duration_exceeded"
+    assert calls == []
+
+
 def test_run_single_segment_has_no_prefix_and_no_segments_key(tmp_path, monkeypatch):
-    """segments 空（≤20s）：prompt 原样保留、meta 不写 segments。"""
+    """旧 scenes 契约显式返回空 segments：prompt 原样保留、meta 不写 segments。"""
     settings = make_settings(tmp_path)
     meta = _make_segment_conversation(settings, [])
     cid = meta["id"]

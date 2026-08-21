@@ -16,10 +16,10 @@ except ImportError as exc:  # pragma: no cover - environment-dependent message
         "PySceneDetect is required. Install scenedetect>=0.7 in the server environment."
     ) from exc
 
-# 与当前生成链单段上限耦合：拆段目标每段 4~15s，仅时长 >20s 才计算
-SEGMENT_MIN_S = 4.0
+# 与当前生成链单段上限耦合：长视频每段 1~15s，超过 10s 即规划
+SEGMENT_MIN_S = 1.0
 SEGMENT_MAX_S = 15.0
-SEGMENT_ONLY_ABOVE_S = 20.0
+SEGMENT_ONLY_ABOVE_S = 10.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,7 +96,7 @@ def group_frames(
 def _assert_segments_valid(
     segments: list[tuple[float, float]], duration: float
 ) -> None:
-    """防御性断言拆段不变量：每段 4~15s、相邻无缝、首 0 尾 duration（算法已保证，兜底）。"""
+    """防御性断言拆段不变量：每段 1~15s、相邻无缝、首 0 尾 duration（算法已保证，兜底）。"""
     if not segments:
         raise SystemExit("拆段结果为空。")
     prev_end = 0.0
@@ -115,7 +115,7 @@ def _assert_segments_valid(
 def build_segments(
     bounds: list[tuple[float, float]], duration: float
 ) -> list[tuple[float, float]]:
-    """按场景边界生成拆段建议：每段 4~15s、覆盖全程无缝隙、边界单调递增（算法级不变量）。
+    """按场景边界生成拆段建议：每段 1~15s、覆盖全程无缝隙、边界单调递增（算法级不变量）。
 
     输入契约：bounds 须已 round(3)（main 侧已做，本函数内部对 duration 同口径 round）。"""
     duration = round(duration, 3)  # 统一 3 位口径：bounds 已 round(3)，断言两端才可比
@@ -199,11 +199,23 @@ def main() -> int:
     result = {
         "duration_s": round(duration, 3),  # 与 start_s/end_s 同为 3 位，round 口径一致
         "scenes": scenes,
-        "segments": [
-            {"index": index, "start_s": round(start, 3), "end_s": round(end, 3)}
-            for index, (start, end) in enumerate(build_segments(bounds, duration), start=1)
-        ],
+        "segments": [],
     }
+    chain = 0
+    scene_starts = {start for start, _end in bounds}
+    for index, (start, end) in enumerate(build_segments(bounds, duration), start=1):
+        hard_cut = index == 1 or start in scene_starts
+        if hard_cut:
+            chain += 1
+        result["segments"].append(
+            {
+                "index": index,
+                "start_s": round(start, 3),
+                "end_s": round(end, 3),
+                "chain_id": f"chain-{chain:03d}",
+                "join_mode": "hard_cut" if hard_cut else "continue",
+            }
+        )
     (work_dir / "scenes.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )

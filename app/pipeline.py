@@ -37,7 +37,7 @@ from pathlib import Path
 
 import cv2
 
-from app import asr, prepared_input, storage, vocal, voice
+from app import asr, long_video, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -73,7 +73,7 @@ H3_DEFAULT_FIT_MODE = "none"
 H3_ENGINE_WORKFLOW = "minimax_h3_lightx2v_v5"
 # 拆段不变量（与 app/scenes.py 的算法级不变量同值；不 import scenes：scenedetect 缺依赖时
 # scenes 模块会 SystemExit，流水线不能因此加载失败）
-SEGMENT_MIN_S = 4.0
+SEGMENT_MIN_S = 1.0
 SEGMENT_MAX_S = 15.0
 
 log = logging.getLogger(__name__)
@@ -599,7 +599,7 @@ def _voice_step(
 def _load_scenes(work: Path) -> list[dict]:
     """读并校验 work/scenes.json；返回 segments（空 = 单段模式）。缺失/非法 → PipelineError。
 
-    结构不变量（与 scenes.py 同口径）：每段 4~15s（1e-9 容差）、相邻无缝（1e-6 容差，
+    结构不变量（与 scenes.py 同口径）：每段 1~15s（1e-9 容差）、相邻无缝（1e-6 容差，
     隐含单调有序）、首段 0 起且覆盖 [0, duration_s]。
     """
     try:
@@ -631,7 +631,7 @@ def _load_scenes(work: Path) -> list[dict]:
     for i, seg in enumerate(out):
         length = seg["end_s"] - seg["start_s"]
         if length < SEGMENT_MIN_S - 1e-9 or length > SEGMENT_MAX_S + 1e-9:
-            raise PipelineError(f"scenes.json segments[{i}] length {length:.3f}s not in 4..15s")
+            raise PipelineError(f"scenes.json segments[{i}] length {length:.3f}s not in 1..15s")
         if abs(seg["start_s"] - prev_end) > 1e-6:
             raise PipelineError(f"scenes.json segments[{i}] not contiguous with previous")
         prev_end = seg["end_s"]
@@ -644,7 +644,7 @@ def _detect_segments(settings: Settings, cid: str, source: Path, work: Path) -> 
     """跑 app/scenes.py 检测场景并读拆段建议。
 
     检测失败或 scenes.json 非法（含拆段结构不变量违规）→ 回退空列表 = 单段模式，
-    不判失败，meta.scenes_note 留痕；segments 空（≤20s）是合法单段结果，不留痕。
+    不判失败，meta.scenes_note 留痕；segments 空（≤10s）是合法单段结果，不留痕。
     """
     try:
         _run_cmd(
@@ -668,6 +668,27 @@ def _detect_segments(settings: Settings, cid: str, source: Path, work: Path) -> 
             scenes_note="scenes.json invalid, single-segment fallback",
         )
         return []
+
+
+def _scene_bounds_for_long_plan(work: Path, duration_s: float) -> list[dict]:
+    """Load detected scene bounds; absence means one scene, never guessed hard cuts."""
+    try:
+        data = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [{"start_s": 0.0, "end_s": duration_s}]
+    scenes = data.get("scenes") if isinstance(data, dict) else None
+    if not isinstance(scenes, list) or not scenes:
+        return [{"start_s": 0.0, "end_s": duration_s}]
+    return scenes
+
+
+def _has_explicit_empty_segment_plan(work: Path) -> bool:
+    """Recognize the pre-long-video scenes contract for rolling-upgrade compatibility."""
+    try:
+        data = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and data.get("segments") == []
 
 
 def _probe_duration(path: Path) -> float:
@@ -755,7 +776,8 @@ def _keyframes_require_fit(work: Path, names: list[str]) -> bool:
 
 
 def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, runner,
-                     lines: list[dict] | None, target_language: str = "") -> dict:
+                     lines: list[dict] | None, target_language: str = "",
+                     *, new_input_contract: bool = False) -> dict:
     """单段完整流程：切段 → 抽帧 → 写该段台词 → codex（cwd=段目录）→ 校验 → 后端加前缀。
 
     段目录内嵌套 work/：帧/台词/产物都在 segdir/work/，SKILL.md 的 work/ 路径逐字适用，
@@ -786,13 +808,25 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             settings,
             runner,
             segdir,
-            _codex_prompt(segdir, target_language),
+            _codex_prompt(
+                segdir,
+                target_language,
+                visual_only=new_input_contract,
+            ),
             segwork,
-            isolate_dialogue=False,
+            isolate_dialogue=new_input_contract,
             step=f"segment {index} visual codex",
         )
+        visual_prompt = prompt
+        if new_input_contract:
+            (segwork / "visual_prompt.txt").write_text(visual_prompt, encoding="utf-8")
+            prompt = long_video.compose_segment_visual_prompt(visual_prompt)
+            try:
+                prompt = prepared_input.compose_final_prompt(prompt, lines or [])
+            except prepared_input.PreparedInputError as exc:
+                raise PipelineError(f"prepared segment prompt invalid: {exc}") from None
         prompt = _apply_no_bgm_prefix(prompt, segwork / "prompt.txt", enabled=True)
-        return {
+        result = {
             "index": index,
             "start_s": seg["start_s"],
             "end_s": seg["end_s"],
@@ -800,6 +834,18 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             "prompt": prompt,
             "lines": [line["text"] for line in (lines or [])],
         }
+        if new_input_contract:
+            result.update(
+                chain_id=seg["chain_id"],
+                join_mode=seg["join_mode"],
+                source=f"segments/{index}/source.mp4",
+                keyframe_paths=[
+                    f"segments/{index}/work/keyframes/{name}" for name in keyframes
+                ],
+                visual_prompt=visual_prompt,
+                dialogue=list(lines or []),
+            )
+        return result
     except Exception as e:
         raise PipelineError(f"segment {index} failed: {e}") from None
 
@@ -930,6 +976,11 @@ def run(settings: Settings, cid: str, runner) -> None:
         if not sources:
             raise PipelineError("source video missing")
         source = sources[0]
+        # Reject an invalid/oversized new contract before extraction, ASR, Codex,
+        # or any later provider can observe the input.
+        new_input_contract = "dialogue_mode" in meta and meta.get("duration_s") is not None
+        if new_input_contract:
+            long_video.plan_segments(meta["duration_s"], [], [])
         _run_cmd(
             [
                 sys.executable, str(EXTRACT_SCRIPT), str(source),
@@ -942,7 +993,6 @@ def run(settings: Settings, cid: str, runner) -> None:
         # 新 H3 会话以 dialogue_mode 为唯一产品契约；voice_mode 仅供旧会话内部兼容。
         # duration_s 是上传探测后才写入的新输入契约完成标记；仅有默认字段但尚未探测，
         # 或历史会话没有实际时长时，仍走旧流水线且不伪造 prepared receipt。
-        new_input_contract = "dialogue_mode" in meta and meta.get("duration_s") is not None
         dialogue_mode = meta.get("dialogue_mode") if new_input_contract else None
         voice_mode = meta.get("voice_mode", "none")
         voice_lines: list[dict] | None = None
@@ -973,9 +1023,17 @@ def run(settings: Settings, cid: str, runner) -> None:
         if not new_input_contract and voice_mode == "translate":
             translate_lang = (meta.get("target_language") or "").strip()
         segments = _detect_segments(settings, cid, source, work)
-        if new_input_contract:
-            # 场景检测仍供关键帧选择参考，但 H3 请求必须保留完整源视频时长。
-            segments = []
+        duration_s = float(meta["duration_s"]) if new_input_contract else None
+        if (
+            new_input_contract
+            and duration_s > long_video.SHORT_VIDEO_MAX_S
+            and not (not segments and _has_explicit_empty_segment_plan(work))
+        ):
+            segments = long_video.plan_segments(
+                duration_s,
+                _scene_bounds_for_long_plan(work, duration_s),
+                voice_lines or [],
+            )
         if not segments:
             # 单段模式：work/keyframes + work/prompt.txt，不注入 workaround 前缀；
             # 裁剪工具以 scripts/crop_image.py 相对工作目录引用，scripts/ 拷进会话目录
@@ -1014,9 +1072,15 @@ def run(settings: Settings, cid: str, runner) -> None:
         else:
             # 多段模式：各段目录独立、无共享状态，线程池并发；CodexRunner.run 自带信号量兜底
             # lines_by_seg 为 None = 无口播：段目录不写 voice_lines.json
-            lines_by_seg = (
-                attribute_lines(voice_lines, segments) if voice_lines is not None else None
-            )
+            if new_input_contract:
+                lines_by_seg = {
+                    seg["index"]: long_video.localize_dialogue(voice_lines or [], seg)
+                    for seg in segments
+                }
+            else:
+                lines_by_seg = (
+                    attribute_lines(voice_lines, segments) if voice_lines is not None else None
+                )
             if lines_by_seg is not None:
                 # 越界台词不归段：计数留痕（meta 内部字段，不静默丢失）
                 dropped = len(voice_lines) - sum(len(v) for v in lines_by_seg.values())
@@ -1031,11 +1095,38 @@ def run(settings: Settings, cid: str, runner) -> None:
                             settings, work, source, seg, runner,
                             lines_by_seg.get(seg["index"]) if lines_by_seg is not None else None,
                             translate_lang,
+                            new_input_contract=new_input_contract,
                         ),
                         segments,
                     )
                 )
-            # 顶层 keyframes/prompt 保持空值（各段产物在 segments 列表里，不重复写）
-            storage.update_meta(settings.data_dir, cid, status="done", segments=seg_metas)
+            changes: dict = {"status": "done", "segments": seg_metas}
+            if new_input_contract:
+                receipt_segments = []
+                for seg in seg_metas:
+                    segdir = work / "segments" / str(seg["index"])
+                    segwork = segdir / "work"
+                    receipt_segments.append(
+                        {
+                            **seg,
+                            "source_path": segdir / "source.mp4",
+                            "keyframe_paths": [
+                                segwork / "keyframes" / name for name in seg["keyframes"]
+                            ],
+                            "visual_prompt_path": segwork / "visual_prompt.txt",
+                            "final_prompt_path": segwork / "prompt.txt",
+                            "dialogue": seg["dialogue"],
+                        }
+                    )
+                receipt_path = long_video.write_plan_receipt(
+                    cdir,
+                    source=source,
+                    duration_s=duration_s,
+                    segments=receipt_segments,
+                    workflow=H3_ENGINE_WORKFLOW,
+                )
+                changes["long_video_plan_receipt"] = receipt_path.name
+            # 新 schema 保留 segments；短视频仍只写顶层 keyframes/prompt。
+            storage.update_meta(settings.data_dir, cid, **changes)
     except Exception as e:
         storage.update_meta(settings.data_dir, cid, status="failed", error=str(e)[:500])

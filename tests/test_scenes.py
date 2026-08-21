@@ -134,7 +134,7 @@ def test_segments_cover_and_sized(video_30s, tmp_path):
     data = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
 
     segments = data["segments"]
-    assert segments  # >20s 视频必须给出拆段建议
+    assert segments  # >10s 视频必须给出拆段建议
     bounds = [(seg["start_s"], seg["end_s"]) for seg in segments]
     assert bounds[0][0] == 0.0
     assert bounds[-1][1] == pytest.approx(data["duration_s"])  # 覆盖全程
@@ -142,7 +142,9 @@ def test_segments_cover_and_sized(video_30s, tmp_path):
         assert cur[0] == pytest.approx(prev[1])  # 无缝隙
         assert cur[0] >= prev[0]  # 单调递增
     for start, end in bounds:
-        assert 4.0 <= end - start <= 15.0  # 每段 4~15s
+        assert 1.0 <= end - start <= 15.0  # 每段 1~15s
+    assert all(seg["chain_id"].startswith("chain-") for seg in segments)
+    assert all(seg["join_mode"] in {"hard_cut", "continue"} for seg in segments)
 
 
 def test_segments_empty_for_short_video(video_10s, tmp_path):
@@ -153,8 +155,13 @@ def test_segments_empty_for_short_video(video_10s, tmp_path):
     result = run_scenes(video_10s, work)
     assert result.returncode == 0, result.stderr
     data = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
-    assert data["segments"] == []  # ≤20s 不算拆段
+    assert data["segments"] == []  # ≤10s 不算拆段
     assert data["scenes"]  # 场景照常输出
+
+
+def test_build_segments_starts_immediately_above_ten_seconds():
+    segments = build_segments([(0.0, 10.001)], 10.001)
+    assert segments == [(0.0, 10.001)]
 
 
 def test_missing_manifest_fails(video_10s, tmp_path):
@@ -263,14 +270,14 @@ def test_build_segments_splits_long_scene_evenly():
 
 
 def assert_segments_valid(segments, duration):
-    """拆段不变量：非空、每段 4~15s、首 0 尾 duration、相邻无缝、单调递增。"""
+    """拆段不变量：非空、每段 1~15s、首 0 尾 duration、相邻无缝、单调递增。"""
     assert segments
     assert segments[0][0] == pytest.approx(0.0)
     assert segments[-1][1] == pytest.approx(duration)
     prev_end = 0.0
     for start, end in segments:
         assert start == pytest.approx(prev_end)  # 无缝隙
-        assert 4.0 <= end - start <= 15.0
+        assert 1.0 <= end - start <= 15.0
         assert end > start  # 单调
         prev_end = end
 
@@ -286,7 +293,7 @@ def assert_segments_valid(segments, duration):
     ],
 )
 def test_build_segments_long_scene_stays_within_limits(bounds, duration):
-    """超 15s 单场景：每段 4~15s、覆盖全程无缝隙、边界单调递增。"""
+    """超 15s 单场景：每段 1~15s、覆盖全程无缝隙、边界单调递增。"""
     assert_segments_valid(build_segments(bounds, duration), duration)
 
 
