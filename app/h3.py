@@ -23,7 +23,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
+from typing import Any, Callable, Iterator, Literal, Mapping, Sequence, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
@@ -32,10 +32,12 @@ from app.retry import RetryPolicy, run_with_retry
 from app.sanitize import sanitize
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 H3_WORKFLOW = "minimax_h3_lightx2v_v5"
+H3_BOUNDARY_WORKFLOW = "minimax_h3_lightx2v"
 H3_RESOLUTION = "768p竖"
 H3_MAX_DURATION_S = 10
+H3_BOUNDARY_MAX_DURATION_S = 15
 AUTODL_BASE_URL = "https://autodl.art"
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
 
@@ -60,7 +62,9 @@ log = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 FrozenKeyframes = tuple[tuple[Path, bytes], ...]
+FrozenFrame = tuple[Path, bytes]
 FrozenVoiceTexts = tuple[str, ...]
+H3Mode = Literal["reference", "boundary"]
 
 
 class H3Error(RuntimeError):
@@ -140,6 +144,10 @@ class H3Request:
     duration: int
     autodl_token: str
     timeouts: Timeouts = Timeouts()
+    mode: H3Mode = "reference"
+    first_frame: FrozenFrame | None = None
+    last_frame: FrozenFrame | None = None
+    seed: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workdir", Path(self.workdir))
@@ -149,34 +157,66 @@ class H3Request:
             raise H3Error("invalid_client_request_id")
         if not isinstance(self.prompt, str) or not self.prompt.strip():
             raise H3Error("invalid_prompt")
+        if not isinstance(self.mode, str) or self.mode not in {"reference", "boundary"}:
+            raise H3Error("invalid_mode")
+        max_duration = (
+            H3_MAX_DURATION_S
+            if self.mode == "reference"
+            else H3_BOUNDARY_MAX_DURATION_S
+        )
         if (
             not isinstance(self.duration, int)
             or isinstance(self.duration, bool)
-            or not 1 <= self.duration <= H3_MAX_DURATION_S
+            or not 1 <= self.duration <= max_duration
         ):
             raise H3Error("invalid_duration")
         if not isinstance(self.autodl_token, str) or not self.autodl_token.strip():
             raise H3Error("missing_autodl_credential")
-        if not isinstance(self.keyframes, tuple) or not 1 <= len(self.keyframes) <= 9:
+        if not isinstance(self.keyframes, tuple):
             raise H3Error("invalid_keyframes")
-        names: list[str] = []
-        for item in self.keyframes:
-            if not isinstance(item, tuple) or len(item) != 2:
+        if self.mode == "reference":
+            if self.first_frame is not None or self.last_frame is not None:
+                raise H3Error("mixed_h3_inputs")
+            if not 1 <= len(self.keyframes) <= 9:
                 raise H3Error("invalid_keyframes")
-            path, blob = item
-            if not isinstance(path, Path) or not isinstance(blob, bytes) or not blob:
-                raise H3Error("invalid_keyframes")
-            if not path.name or path.name != Path(path.name).name:
-                raise H3Error("invalid_keyframes")
-            names.append(path.name)
-        if len(names) != len(set(names)):
-            raise H3Error("duplicate_keyframe_name")
+            names = [
+                _validate_frame(item, "invalid_keyframes")[0].name
+                for item in self.keyframes
+            ]
+            if len(names) != len(set(names)):
+                raise H3Error("duplicate_keyframe_name")
+            if self.seed is not None and (
+                isinstance(self.seed, bool)
+                or not isinstance(self.seed, int)
+                or not 1 <= self.seed <= 999_999_999_999_999
+            ):
+                raise H3Error("invalid_seed")
+        else:
+            if self.keyframes:
+                raise H3Error("mixed_h3_inputs")
+            if self.first_frame is None or self.last_frame is None:
+                raise H3Error("invalid_boundary_frames")
+            _validate_frame(self.first_frame, "invalid_boundary_frames")
+            _validate_frame(self.last_frame, "invalid_boundary_frames")
+            if self.seed is not None:
+                raise H3Error("seed_not_supported")
         if not isinstance(self.voice_texts, tuple):
             raise H3Error("invalid_voice_texts")
         if any(not isinstance(text, str) or not text for text in self.voice_texts):
             raise H3Error("invalid_voice_texts")
         if self.voice_receipt != voice_texts_receipt(self.voice_texts):
             raise ReceiptError("voice_receipt_mismatch")
+
+
+def _validate_frame(item: Any, code: str) -> FrozenFrame:
+    if not isinstance(item, tuple) or len(item) != 2:
+        raise H3Error(code)
+    path, blob = item
+    if not isinstance(path, Path) or not isinstance(blob, bytes) or not blob:
+        raise H3Error(code)
+    if not path.name or path.name != Path(path.name).name:
+        raise H3Error(code)
+    return path, blob
 
 
 @dataclass(frozen=True)
@@ -432,19 +472,47 @@ def _ensure_session_marker(request: H3Request) -> None:
 
 def _input_manifest(request: H3Request) -> dict[str, Any]:
     provider_request = {
-        "h3_workflow": H3_WORKFLOW,
+        "mode": request.mode,
+        "h3_workflow": _workflow(request),
         "duration": request.duration,
         "resolution": H3_RESOLUTION,
     }
+    if request.seed is not None:
+        provider_request["seed"] = request.seed
     return {
         "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
-        "keyframes": [
-            {"name": path.name, "sha256": hashlib.sha256(blob).hexdigest()}
-            for path, blob in request.keyframes
-        ],
+        "images": _image_manifest(request),
         "voice_texts_sha256": request.voice_receipt,
         "request": provider_request,
     }
+
+
+def _workflow(request: H3Request) -> str:
+    return H3_WORKFLOW if request.mode == "reference" else H3_BOUNDARY_WORKFLOW
+
+
+def _image_inputs(request: H3Request) -> tuple[tuple[str, FrozenFrame], ...]:
+    if request.mode == "reference":
+        return tuple(
+            (f"ref_image_{index}", frame)
+            for index, frame in enumerate(request.keyframes)
+        )
+    assert request.first_frame is not None and request.last_frame is not None
+    return (
+        ("first_frame", request.first_frame),
+        ("last_frame", request.last_frame),
+    )
+
+
+def _image_manifest(request: H3Request) -> list[dict[str, str]]:
+    return [
+        {
+            "role": role,
+            "name": path.name,
+            "sha256": hashlib.sha256(blob).hexdigest(),
+        }
+        for role, (path, blob) in _image_inputs(request)
+    ]
 
 
 def _new_state(request: H3Request, attempt_id: str, client_request_id: str) -> dict[str, Any]:
@@ -584,16 +652,20 @@ def _task_id(value: Any, *, required: bool) -> str | None:
 
 
 def _h3_receipt(request: H3Request, task_id: str) -> dict[str, Any]:
+    provider_request = {
+        "mode": request.mode,
+        "workflow": _workflow(request),
+        "duration": request.duration,
+        "resolution": H3_RESOLUTION,
+    }
+    if request.seed is not None:
+        provider_request["seed"] = request.seed
     return {
         "task_id": task_id,
         "input_receipt": canonical_json_sha256(_input_manifest(request)),
         "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
-        "keyframes": _input_manifest(request)["keyframes"],
-        "request": {
-            "workflow": H3_WORKFLOW,
-            "duration": request.duration,
-            "resolution": H3_RESOLUTION,
-        },
+        "images": _image_manifest(request),
+        "request": provider_request,
     }
 
 
@@ -679,13 +751,15 @@ def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) 
         "duration": request.duration,
         "resolution": H3_RESOLUTION,
     }
-    for index, (_path, blob) in enumerate(request.keyframes):
-        body[f"ref_image_{index}"] = (
+    if request.seed is not None:
+        body["seed"] = request.seed
+    for role, (_path, blob) in _image_inputs(request):
+        body[role] = (
             "data:image/png;base64," + base64.b64encode(blob).decode("ascii")
         )
     try:
         response = client.post(
-            f"{AUTODL_BASE_URL}/api/v1/comfyui/comfyui_workflow/{H3_WORKFLOW}",
+            f"{AUTODL_BASE_URL}/api/v1/comfyui/comfyui_workflow/{_workflow(request)}",
             headers={"Authorization": request.autodl_token},
             json=body,
             timeout=request.timeouts.request_s,
