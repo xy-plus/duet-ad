@@ -679,13 +679,10 @@ function generationSegmentStatusText(status) {
   return labels[status] || status || "等待中";
 }
 
-function generationSegmentIndex(segment, position) {
-  return segment && Number.isInteger(segment.index) && segment.index > 0
-    ? segment.index : position + 1;
-}
-
 function generationSegmentLabel(segment, position) {
-  return "第 " + generationSegmentIndex(segment, position) + " 段 · "
+  const index = segment && Number.isInteger(segment.index) && segment.index > 0
+    ? segment.index : position + 1;
+  return "第 " + index + " 段 · "
     + generationSegmentStatusText(segment && segment.status);
 }
 
@@ -1880,7 +1877,6 @@ if (typeof module !== "undefined" && module.exports) {
     generationDraft,
     generationAction,
     generationSegmentLabel,
-    generationSegmentIndex,
     longVideoContract,
     normalizeDialogueLines,
     parseDialogueLines,

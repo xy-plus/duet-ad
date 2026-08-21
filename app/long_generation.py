@@ -14,6 +14,7 @@ from typing import Mapping
 from app import frame_fit, h3, long_video, prepared_input, stitch, storage
 
 WORKFLOW = h3.H3_BOUNDARY_WORKFLOW
+_PIPELINE_NO_BGM = "不要生成背景音乐"
 _EPS = 1e-6
 
 
@@ -228,7 +229,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             raise LongGenerationError("long_video_plan_invalid")
         try:
             rebuilt_visual = long_video.compose_segment_visual_prompt(visual)
-            auto_prompt = f"{pipeline_no_bgm()}\n" + prepared_input.compose_final_prompt(
+            auto_prompt = f"{_PIPELINE_NO_BGM}\n" + prepared_input.compose_final_prompt(
                 rebuilt_visual, dialogue
             )
         except (prepared_input.PreparedInputError, long_video.LongVideoError):
@@ -242,7 +243,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 )
             except (prepared_input.PreparedInputError, long_video.LongVideoError):
                 raise LongGenerationError("long_video_plan_invalid") from None
-            prompt = f"{pipeline_no_bgm()}\n{rebuilt}"
+            prompt = f"{_PIPELINE_NO_BGM}\n{rebuilt}"
         else:
             prompt = final
         segdir = root / "work" / "segments" / str(index)
@@ -256,11 +257,6 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
     if abs(previous_end - duration) > _EPS:
         raise LongGenerationError("long_video_plan_invalid")
     return FrozenPlan(root, source, receipt, tuple(frozen))
-
-
-def pipeline_no_bgm() -> str:
-    # Kept local to avoid making pipeline's execution module an orchestration dependency.
-    return "不要生成背景音乐"
 
 
 def child_request_id(parent_id: str, receipt: str, index: int) -> str:
@@ -451,12 +447,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         try:
             request = _request(settings, cid, plan, segment, parent_id, fit_mode)
         except LongGenerationError as exc:
-            return segment.index, None, ("failed", exc.code)
+            return None, ("failed", exc.code)
         except Exception:
-            return segment.index, None, ("failed", "long_video_request_invalid")
+            return None, ("failed", "long_video_request_invalid")
         try:
             result = h3.start(request)
-            return segment.index, request.client_request_id, _result_status(result)
+            return request.client_request_id, _result_status(result)
         except h3.H3Error as exc:
             try:
                 inspected = h3.inspect(request)
@@ -465,9 +461,9 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 status = ("submission_unknown", "submission_unknown")
             if status[0] == "failed" and exc.code in {"submission_unknown", "state_persist_failed", "h3_internal_error"}:
                 status = ("submission_unknown", "submission_unknown")
-            return segment.index, request.client_request_id, status
+            return request.client_request_id, status
         except Exception:
-            return segment.index, request.client_request_id, ("submission_unknown", "submission_unknown")
+            return request.client_request_id, ("submission_unknown", "submission_unknown")
 
     active = {}
     locked = False
@@ -495,8 +491,10 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             done, _pending = wait(tuple(active), return_when=FIRST_COMPLETED)
             for future in done:
                 segment = active.pop(future)
-                index, child_id, (status, error) = future.result()
-                states[index].update(status=status, error=error, child_request_id=child_id)
+                child_id, (status, error) = future.result()
+                states[segment.index].update(
+                    status=status, error=error, child_request_id=child_id
+                )
                 if status == "submission_unknown":
                     locked = True
                 persist("submission_unknown" if locked else "running",

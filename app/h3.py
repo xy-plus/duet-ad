@@ -494,8 +494,6 @@ def _input_manifest(request: H3Request) -> dict[str, Any]:
         "duration": request.duration,
         "resolution": H3_RESOLUTION,
     }
-    if request.seed is not None:
-        provider_request["seed"] = request.seed
     return {
         "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
         "images": _image_manifest(request),
@@ -690,8 +688,6 @@ def _h3_receipt(request: H3Request, task_id: str) -> dict[str, Any]:
         "duration": request.duration,
         "resolution": H3_RESOLUTION,
     }
-    if request.seed is not None:
-        provider_request["seed"] = request.seed
     return {
         "task_id": task_id,
         "input_receipt": canonical_json_sha256(_input_manifest(request)),
