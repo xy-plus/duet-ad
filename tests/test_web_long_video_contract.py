@@ -90,9 +90,9 @@ def test_long_submit_rejects_edit_custom_and_missing_receipt():
 def test_generation_signature_tracks_plan_and_segment_progress_separately():
     result = _run_contract(
         "(()=>{const base={status:'done',duration_s:30,plan_receipt:'a'.repeat(64),segment_count:2,"
-        "generation:{status:'running',stage:'h3',segments:[{index:0,status:'running'}]}};"
+        "generation:{status:'running',stage:'h3',segments:[{index:1,status:'running'}]}};"
         "const original=contract.detailSignature(base);"
-        "const progressed={...base,generation:{...base.generation,segments:[{index:0,status:'succeeded'}]}};"
+        "const progressed={...base,generation:{...base.generation,segments:[{index:1,status:'succeeded'}]}};"
         "const replanned={...base,plan_receipt:'b'.repeat(64)};"
         "return {progress:contract.detailSignature(progressed),replanned:contract.detailSignature(replanned),original};})()"
     )
@@ -100,6 +100,23 @@ def test_generation_signature_tracks_plan_and_segment_progress_separately():
     assert result["progress"]["generation"] != result["original"]["generation"]
     assert result["replanned"]["stable"] == result["original"]["stable"]
     assert result["replanned"]["generation"] != result["original"]["generation"]
+
+
+def test_generation_segment_display_keeps_one_based_contract_index():
+    result = _run_contract(
+        "["
+        "contract.generationSegmentLabel({index:1,status:'running'},0),"
+        "contract.generationSegmentLabel({index:2,status:'succeeded'},1),"
+        "contract.generationSegmentLabel({index:0,status:'failed'},2),"
+        "contract.generationSegmentLabel({index:'bad',status:'pending'},3)"
+        "]"
+    )
+    assert result == [
+        "第 1 段 · 生成中",
+        "第 2 段 · 已完成",
+        "第 3 段 · 失败",
+        "第 4 段 · 等待中",
+    ]
 
 
 def test_long_video_ui_copy_and_segment_progress_contract():

@@ -679,6 +679,16 @@ function generationSegmentStatusText(status) {
   return labels[status] || status || "等待中";
 }
 
+function generationSegmentIndex(segment, position) {
+  return segment && Number.isInteger(segment.index) && segment.index > 0
+    ? segment.index : position + 1;
+}
+
+function generationSegmentLabel(segment, position) {
+  return "第 " + generationSegmentIndex(segment, position) + " 段 · "
+    + generationSegmentStatusText(segment && segment.status);
+}
+
 function appendGenerationProgress(card, generation) {
   const segments = Array.isArray(generation.segments) ? generation.segments : [];
   if (segments.length === 0) return;
@@ -687,17 +697,16 @@ function appendGenerationProgress(card, generation) {
   progress.appendChild(el("strong", null, "完成 " + completed + "/" + segments.length));
   progress.appendChild(el("span", null, "当前阶段：" + generationStageText(generation.stage)));
   const list = el("ol", "generation-segments");
-  for (const segment of segments) {
+  segments.forEach((segment, position) => {
     const item = el("li", "generation-segment status-" + String(segment.status || "pending"));
-    item.appendChild(el("strong", null, "第 " + (Number(segment.index) + 1) + " 段 · "
-      + generationSegmentStatusText(segment.status)));
+    item.appendChild(el("strong", null, generationSegmentLabel(segment, position)));
     const meta = el("span", null, "chain：" + (segment.chain_id || "-")
       + " · join：" + (segment.join_mode || "-")
       + " · 尝试 " + (segment.attempt || 0));
     item.appendChild(meta);
     if (segment.error) item.appendChild(el("span", "generation-segment-error", segment.error));
     list.appendChild(item);
-  }
+  });
   progress.appendChild(list);
   card.appendChild(progress);
 }
@@ -1870,6 +1879,8 @@ if (typeof module !== "undefined" && module.exports) {
     formatDialogueLines,
     generationDraft,
     generationAction,
+    generationSegmentLabel,
+    generationSegmentIndex,
     longVideoContract,
     normalizeDialogueLines,
     parseDialogueLines,
