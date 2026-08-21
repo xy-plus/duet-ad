@@ -18,6 +18,8 @@ from app import (
     downloader,
     frame_fit,
     h3,
+    long_generation,
+    long_video,
     pipeline,
     postprocess,
     prepared_input,
@@ -65,10 +67,10 @@ def _duration_limit_detail(duration_s: float) -> dict:
         "code": "video_duration_exceeds_h3_limit",
         "message": (
             f"视频时长 {duration_s:.1f} 秒，超过 H3 最大允许时长 "
-            f"{h3.H3_MAX_DURATION_S} 秒，请裁剪后重新上传。"
+            f"{long_video.LONG_VIDEO_MAX_S:g} 秒，请裁剪后重新上传。"
         ),
         "actual_duration_s": duration_s,
-        "max_duration_s": h3.H3_MAX_DURATION_S,
+        "max_duration_s": long_video.LONG_VIDEO_MAX_S,
     }
 
 
@@ -77,7 +79,7 @@ def _duration_exceeds_h3_limit(value) -> bool:
         isinstance(value, (int, float))
         and not isinstance(value, bool)
         and math.isfinite(float(value))
-        and float(value) > h3.H3_MAX_DURATION_S
+        and float(value) > long_video.LONG_VIDEO_MAX_S
     )
 
 
@@ -138,7 +140,7 @@ def _public_generation(meta: dict) -> dict | None:
         return None
     legacy = _is_legacy_generation_contract(generation)
     status = _effective_generation_status(generation)
-    return {
+    public = {
         "status": status,
         "error": (
             "generation_path_removed"
@@ -149,6 +151,19 @@ def _public_generation(meta: dict) -> dict | None:
         "client_request_id": generation.get("client_request_id"),
         "stage": "h3" if legacy else generation.get("stage"),
     }
+    if isinstance(generation.get("segments"), list):
+        public["segments"] = long_generation.public_segments(generation)
+    return public
+
+
+def _is_long_video(meta: dict) -> bool:
+    duration = meta.get("duration_s")
+    return (
+        isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and math.isfinite(float(duration))
+        and float(duration) > long_video.SHORT_VIDEO_MAX_S
+    )
 
 
 def _is_legacy_generation_contract(generation: dict) -> bool:
@@ -372,6 +387,39 @@ def _validate_submit_payload(
     elif fit_mode != "none":
         raise _SubmitError(422, "fit_mode_not_allowed")
     return request_id, fit_mode, _validated_dialogue(meta, payload)
+
+
+def _validate_long_submit_payload(meta: dict, payload: dict) -> tuple[str, str, str, str]:
+    if payload.get("confirm") is not True:
+        raise _SubmitError(409, "confirmation required")
+    allowed = {
+        "confirm", "client_request_id", "dialogue_mode", "fit_mode",
+        "expected_plan_receipt",
+    }
+    if set(payload) != allowed:
+        if "lines" in payload or payload.get("dialogue_mode") in {"edit", "custom"}:
+            raise _SubmitError(422, "long_video_audio_mode_unsupported")
+        raise _SubmitError(422, "invalid_submit_request")
+    request_id = payload.get("client_request_id")
+    if not isinstance(request_id, str) or not _CLIENT_REQUEST_ID_RE.fullmatch(request_id):
+        raise _SubmitError(422, "invalid_client_request_id")
+    dialogue_mode = payload.get("dialogue_mode")
+    if dialogue_mode not in {"auto", "none"}:
+        raise _SubmitError(422, "long_video_audio_mode_unsupported")
+    if meta.get("voice_mode") != "keep":
+        raise _SubmitError(422, "long_video_audio_mode_unsupported")
+    fit_mode = payload.get("fit_mode")
+    if fit_mode not in _FIT_MODES:
+        raise _SubmitError(422, "invalid_fit_mode")
+    if meta.get("fit_required") is True:
+        if fit_mode not in {"crop", "pad"}:
+            raise _SubmitError(422, "fit_mode_required")
+    elif fit_mode != "none":
+        raise _SubmitError(422, "fit_mode_not_allowed")
+    expected = payload.get("expected_plan_receipt")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise _SubmitError(422, "invalid_plan_receipt")
+    return request_id, fit_mode, dialogue_mode, expected
 
 
 def _make_h3_request(
@@ -630,6 +678,34 @@ def _resume_generation(settings: Settings, cid: str) -> None:
         _finish_generation(settings, cid, request, result)
 
 
+def _resume_long_generation(settings: Settings, cid: str) -> None:
+    meta = storage.load_meta(settings.data_dir, cid)
+    generation = meta.get("generation") if meta else None
+    if not isinstance(generation, dict) or not isinstance(generation.get("segments"), list):
+        return
+    expected = meta.get("frozen_plan_receipt")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        storage.update_meta(
+            settings.data_dir, cid,
+            generation={**generation, "status": "submission_unknown",
+                        "error": "submission_unknown"},
+        )
+        return
+    try:
+        plan = long_generation.freeze_plan(
+            settings.data_dir / cid, meta, expected,
+            meta.get("fit_mode"), meta.get("dialogue_mode"),
+        )
+    except Exception:
+        storage.update_meta(
+            settings.data_dir, cid,
+            generation={**generation, "status": "submission_unknown",
+                        "error": "submission_unknown"},
+        )
+        return
+    long_generation.run(settings, cid, plan, startup=True)
+
+
 class _RateLimiter:
     def __init__(self) -> None:
         self._hits: dict[str, deque] = defaultdict(deque)
@@ -673,8 +749,13 @@ def create_app(settings: Settings) -> FastAPI:
                 and isinstance(generation, dict)
                 and generation.get("status") in _GENERATION_ACTIVE
             ):
+                target = (
+                    _resume_long_generation
+                    if isinstance(generation.get("segments"), list)
+                    else _resume_generation
+                )
                 thread = threading.Thread(
-                    target=_resume_generation,
+                    target=target,
                     args=(settings, meta["id"]),
                     daemon=True,
                     name=f"h3-resume-{meta['id'][:8]}",
@@ -770,6 +851,15 @@ def create_app(settings: Settings) -> FastAPI:
                     status_code=422,
                     detail=_duration_limit_detail(video.duration_s),
                 )
+            if (
+                video.duration_s > long_video.SHORT_VIDEO_MAX_S
+                and voice_mode != "keep"
+            ):
+                storage.remove_conversation(settings.data_dir, meta["id"])
+                raise HTTPException(
+                    status_code=422,
+                    detail="long_video_audio_mode_unsupported",
+                )
             storage.update_meta(
                 settings.data_dir,
                 meta["id"],
@@ -789,7 +879,7 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail="not found")
         cdir = settings.data_dir / cid
         source_prompt, source_prompt_sha256 = _source_prompt_snapshot(cdir)
-        return {
+        result = {
             "id": meta["id"],
             "title": meta["title"],
             "note": meta["note"],
@@ -816,6 +906,11 @@ def create_app(settings: Settings) -> FastAPI:
             "postprocess": meta.get("postprocess"),
             "postprocess_enabled": settings.enable_seedream_edit,
         }
+        if _is_long_video(meta):
+            result["plan_receipt"] = long_generation.plan_receipt(cdir, meta)
+            segments = meta.get("segments")
+            result["segment_count"] = len(segments) if isinstance(segments, list) else 0
+        return result
 
     @app.patch(
         "/api/conversations/{cid}/prompt",
@@ -876,6 +971,95 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail="not found")
         if _is_read_only(meta):
             raise HTTPException(status_code=409, detail="read_only")
+        if _is_long_video(meta):
+            try:
+                request_id, fit_mode, dialogue_mode, expected_receipt = (
+                    _validate_long_submit_payload(meta, payload)
+                )
+            except _SubmitError as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+            if meta.get("status") != "done":
+                raise HTTPException(status_code=409, detail="artifacts not ready")
+            if _duration_exceeds_h3_limit(meta.get("duration_s")):
+                raise HTTPException(
+                    status_code=422,
+                    detail=_duration_limit_detail(float(meta["duration_s"])),
+                )
+            if not _credentials_ready(settings):
+                raise HTTPException(status_code=503, detail="h3_credentials_missing")
+            lock = submit_locks.setdefault(cid, asyncio.Lock())
+            async with lock:
+                meta = storage.load_meta(settings.data_dir, cid)
+                if meta is None:
+                    raise HTTPException(status_code=404, detail="not found")
+                old = meta.get("generation")
+                previous_status = old.get("status") if isinstance(old, dict) else None
+                previous_id = old.get("client_request_id") if isinstance(old, dict) else None
+                same_parameters = (
+                    meta.get("dialogue_mode") == dialogue_mode
+                    and meta.get("fit_mode") == fit_mode
+                    and meta.get("frozen_plan_receipt") == expected_receipt
+                )
+                # Active replays are pure idempotent reads.  In particular they
+                # must not rewrite fitted inputs or enqueue a second coordinator.
+                if previous_status in {"queued", "running"}:
+                    if previous_id != request_id:
+                        raise HTTPException(status_code=409, detail="generation in progress")
+                    if not same_parameters:
+                        raise HTTPException(status_code=409, detail="resume_parameters_changed")
+                    return {"status": previous_status, "attempt": old.get("attempt")}
+                if previous_status == "submission_unknown":
+                    raise HTTPException(status_code=409, detail="submission_outcome_unknown")
+                if (settings.data_dir / cid / "generated.mp4").is_file():
+                    raise HTTPException(status_code=409, detail="already submitted")
+                try:
+                    plan = await asyncio.to_thread(
+                        long_generation.freeze_plan,
+                        settings.data_dir / cid,
+                        meta,
+                        expected_receipt,
+                        fit_mode,
+                        dialogue_mode,
+                    )
+                except long_generation.LongGenerationError as exc:
+                    raise HTTPException(status_code=exc.status, detail=exc.code) from exc
+                if previous_status == "resume_required":
+                    if previous_id != request_id:
+                        raise HTTPException(status_code=409, detail="resume_request_id_mismatch")
+                    if not same_parameters:
+                        raise HTTPException(status_code=409, detail="resume_parameters_changed")
+                    background_tasks.add_task(long_generation.run, settings, cid, plan)
+                    return {"status": "queued", "attempt": old.get("attempt")}
+                if previous_status == "succeeded":
+                    raise HTTPException(status_code=409, detail="already submitted")
+                if previous_status == "failed" and old.get("stage") == "stitch":
+                    if previous_id != request_id or not same_parameters:
+                        raise HTTPException(status_code=409, detail="resume_parameters_changed")
+                    updated = {**old, "status": "queued", "error": None}
+                    storage.update_meta(settings.data_dir, cid, generation=updated)
+                    background_tasks.add_task(long_generation.run, settings, cid, plan)
+                    return {"status": "queued", "attempt": old.get("attempt")}
+                if previous_status == "failed" and previous_id == request_id:
+                    raise HTTPException(status_code=409, detail="new client_request_id required")
+                previous_attempt = old.get("attempt", 0) if isinstance(old, dict) else 0
+                if isinstance(previous_attempt, bool) or not isinstance(previous_attempt, int):
+                    raise HTTPException(status_code=409, detail="generation_state_invalid")
+                attempt = previous_attempt + 1
+                generation = long_generation.initial_generation(
+                    plan, request_id, attempt, old if isinstance(old, dict) else None
+                )
+                storage.update_meta(
+                    settings.data_dir,
+                    cid,
+                    dialogue_mode=dialogue_mode,
+                    voice_lines=[],
+                    prepared_dialogue=[],
+                    fit_mode=fit_mode,
+                    frozen_plan_receipt=expected_receipt,
+                    generation=generation,
+                )
+                background_tasks.add_task(long_generation.run, settings, cid, plan)
+            return {"status": "queued", "attempt": attempt}
         try:
             request_id, fit_mode, dialogue = _validate_submit_payload(meta, payload)
         except _SubmitError as exc:

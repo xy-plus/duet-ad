@@ -183,19 +183,15 @@ def test_missing_autodl_credential_is_503(tmp_path):
     assert response.json() == {"detail": "h3_credentials_missing"}
 
 
-def test_submit_rejects_existing_video_over_h3_limit_before_provider(enabled):
+def test_submit_rejects_long_video_without_bound_plan_before_provider(enabled):
     settings, client = enabled
     cid, _ = _make_conv(settings, duration_s=14.0)
     response = client.post(
-        f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload()
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json={**_payload(), "expected_plan_receipt": "0" * 64},
     )
-    assert response.status_code == 422
-    assert response.json()["detail"] == {
-        "code": "video_duration_exceeds_h3_limit",
-        "message": "视频时长 14.0 秒，超过 H3 最大允许时长 10 秒，请裁剪后重新上传。",
-        "actual_duration_s": 14.0,
-        "max_duration_s": 10,
-    }
+    assert response.status_code == 409
+    assert response.json() == {"detail": "long_video_plan_invalid"}
     assert not (settings.data_dir / cid / ".h3").exists()
 
 

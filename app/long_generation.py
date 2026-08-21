@@ -1,0 +1,509 @@
+"""Fail-closed orchestration for paid long-video H3 segment generation."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import subprocess
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
+
+from app import frame_fit, h3, long_video, prepared_input, stitch, storage
+
+WORKFLOW = h3.H3_BOUNDARY_WORKFLOW
+_EPS = 1e-6
+
+
+class LongGenerationError(RuntimeError):
+    def __init__(self, code: str, status: int = 409) -> None:
+        self.code = code
+        self.status = status
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
+class FrozenSegment:
+    index: int
+    start_s: float
+    end_s: float
+    chain_id: str
+    join_mode: str
+    workdir: Path
+    first_frame: Path
+    last_frame: Path
+    prompt: str
+
+
+@dataclass(frozen=True)
+class FrozenPlan:
+    root: Path
+    source: Path
+    receipt: str
+    segments: tuple[FrozenSegment, ...]
+
+
+def _digest(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        raise LongGenerationError("long_video_plan_invalid") from None
+
+
+def _canonical_digest(value: object) -> str:
+    try:
+        data = (json.dumps(value, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), allow_nan=False) + "\n").encode()
+    except (TypeError, ValueError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    return hashlib.sha256(data).hexdigest()
+
+
+def plan_receipt(root: Path, meta: Mapping) -> str | None:
+    name = meta.get("long_video_plan_receipt")
+    if name != long_video.PLAN_RECEIPT_FILENAME:
+        return None
+    path = Path(root) / name
+    return _digest(path) if path.is_file() else None
+
+
+def _bound_path(root: Path, artifact: object) -> Path:
+    if not isinstance(artifact, dict) or set(artifact) != {"path", "sha256"}:
+        raise LongGenerationError("long_video_plan_invalid")
+    relative, expected = artifact.get("path"), artifact.get("sha256")
+    if not isinstance(relative, str) or not isinstance(expected, str):
+        raise LongGenerationError("long_video_plan_invalid")
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        raise LongGenerationError("long_video_plan_invalid") from None
+    if not path.is_file() or _digest(path) != expected:
+        raise LongGenerationError("long_video_plan_invalid")
+    return path
+
+
+def _relative_to_work(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root / "work").as_posix()
+    except ValueError:
+        raise LongGenerationError("long_video_plan_invalid") from None
+
+
+def _fit_anchor(path: Path, output: Path, fit_mode: str) -> Path:
+    if fit_mode == "none":
+        return path
+    try:
+        return frame_fit.fit_frames((path,), output, fit_mode)[0]
+    except frame_fit.FrameFitError:
+        raise LongGenerationError("frame_fit_failed") from None
+
+
+def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
+                dialogue_mode: str) -> FrozenPlan:
+    """Validate every immutable plan fact and pre-fit every source anchor."""
+    root = Path(root).resolve()
+    name = meta.get("long_video_plan_receipt")
+    if name != long_video.PLAN_RECEIPT_FILENAME:
+        raise LongGenerationError("long_video_plan_invalid")
+    receipt_path = root / name
+    receipt = _digest(receipt_path)
+    if expected_receipt != receipt:
+        raise LongGenerationError("long_video_plan_changed", 409)
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != "duet.long-video-plan"
+        or payload.get("version") != 1
+        or payload.get("workflow") != WORKFLOW
+    ):
+        raise LongGenerationError("long_video_plan_invalid")
+    source = _bound_path(root, payload.get("source"))
+    try:
+        duration = float(payload["video"]["duration_s"])
+        meta_duration = float(meta["duration_s"])
+    except (KeyError, TypeError, ValueError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    raw_segments, meta_segments = payload.get("segments"), meta.get("segments")
+    if (
+        not math.isfinite(duration)
+        or duration <= long_video.SHORT_VIDEO_MAX_S
+        or duration > long_video.LONG_VIDEO_MAX_S + _EPS
+        or abs(duration - meta_duration) > _EPS
+        or not isinstance(raw_segments, list)
+        or not raw_segments
+        or not isinstance(meta_segments, list)
+        or len(raw_segments) != len(meta_segments)
+    ):
+        raise LongGenerationError("long_video_plan_invalid")
+
+    frozen: list[FrozenSegment] = []
+    previous_end = 0.0
+    previous_chain = None
+    for position, (raw, current) in enumerate(zip(raw_segments, meta_segments), 1):
+        if not isinstance(raw, dict) or not isinstance(current, dict):
+            raise LongGenerationError("long_video_plan_invalid")
+        try:
+            index = raw["index"]
+            start_s, end_s = float(raw["start_s"]), float(raw["end_s"])
+            chain_id, join_mode = raw["chain_id"], raw["join_mode"]
+        except (KeyError, TypeError, ValueError):
+            raise LongGenerationError("long_video_plan_invalid") from None
+        comparable = ("index", "start_s", "end_s", "chain_id", "join_mode")
+        if (
+            index != position
+            or any(current.get(key) != raw.get(key) for key in comparable)
+            or not math.isfinite(start_s)
+            or not math.isfinite(end_s)
+            or abs(start_s - previous_end) > _EPS
+            or end_s - start_s < 1 - _EPS
+            or end_s - start_s > 15 + _EPS
+            or math.ceil(end_s - start_s) > 15
+            or not isinstance(chain_id, str)
+            or not chain_id
+            or join_mode not in {"hard_cut", "continue"}
+            or (position == 1 and join_mode != "hard_cut")
+            or (join_mode == "continue" and chain_id != previous_chain)
+            or (position > 1 and join_mode == "hard_cut" and chain_id == previous_chain)
+        ):
+            raise LongGenerationError("long_video_plan_invalid")
+        if raw.get("source") is None:
+            raise LongGenerationError("long_video_plan_invalid")
+        segment_source = _bound_path(root, raw["source"])
+        keys = raw.get("keyframes")
+        if not isinstance(keys, list) or not 1 <= len(keys) <= 9:
+            raise LongGenerationError("long_video_plan_invalid")
+        keyframe_paths = [_bound_path(root, artifact) for artifact in keys]
+        anchors = raw.get("anchors")
+        if (
+            not isinstance(anchors, list)
+            or len(anchors) != 2
+            or [item.get("role") if isinstance(item, dict) else None for item in anchors]
+            != ["first", "end"]
+        ):
+            raise LongGenerationError("long_video_plan_invalid")
+        first_source = _bound_path(root, {k: v for k, v in anchors[0].items() if k != "role"})
+        last_source = _bound_path(root, {k: v for k, v in anchors[1].items() if k != "role"})
+        expected_prefix = f"segments/{index}/"
+        if (
+            current.get("source") != expected_prefix + "source.mp4"
+            or segment_source != root / "work" / current["source"]
+            or current.get("keyframe_paths") != [
+                _relative_to_work(root, path) for path in keyframe_paths
+            ]
+            or current.get("first_frame_path")
+            != _relative_to_work(root, first_source)
+            or current.get("last_frame_path")
+            != _relative_to_work(root, last_source)
+        ):
+            raise LongGenerationError("long_video_plan_invalid")
+        visual_path = _bound_path(root, raw.get("visual_prompt"))
+        final_path = _bound_path(root, raw.get("final_prompt"))
+        try:
+            visual = visual_path.read_text(encoding="utf-8")
+            final = final_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise LongGenerationError("long_video_plan_invalid") from None
+        dialogue = current.get("dialogue")
+        dialogue_binding = raw.get("dialogue")
+        if (
+            not isinstance(dialogue, list)
+            or not isinstance(dialogue_binding, dict)
+            or set(dialogue_binding) != {"count", "sha256"}
+            or dialogue_binding.get("count") != len(dialogue)
+            or dialogue_binding.get("sha256") != _canonical_digest(dialogue)
+            or current.get("visual_prompt") != visual
+            or current.get("prompt") != final
+        ):
+            raise LongGenerationError("long_video_plan_invalid")
+        try:
+            rebuilt_visual = long_video.compose_segment_visual_prompt(visual)
+            auto_prompt = f"{pipeline_no_bgm()}\n" + prepared_input.compose_final_prompt(
+                rebuilt_visual, dialogue
+            )
+        except (prepared_input.PreparedInputError, long_video.LongVideoError):
+            raise LongGenerationError("long_video_plan_invalid") from None
+        if final != auto_prompt:
+            raise LongGenerationError("long_video_plan_invalid")
+        if dialogue_mode == "none":
+            try:
+                rebuilt = prepared_input.compose_final_prompt(
+                    long_video.compose_segment_visual_prompt(visual), ()
+                )
+            except (prepared_input.PreparedInputError, long_video.LongVideoError):
+                raise LongGenerationError("long_video_plan_invalid") from None
+            prompt = f"{pipeline_no_bgm()}\n{rebuilt}"
+        else:
+            prompt = final
+        segdir = root / "work" / "segments" / str(index)
+        fit_root = segdir / "work" / "h3_frames" / fit_mode
+        # Complete all static transformations before the caller can make a POST.
+        first = _fit_anchor(first_source, fit_root / "first", fit_mode)
+        last = _fit_anchor(last_source, fit_root / "end", fit_mode)
+        frozen.append(FrozenSegment(index, start_s, end_s, chain_id, join_mode,
+                                    segdir, first, last, prompt))
+        previous_end, previous_chain = end_s, chain_id
+    if abs(previous_end - duration) > _EPS:
+        raise LongGenerationError("long_video_plan_invalid")
+    return FrozenPlan(root, source, receipt, tuple(frozen))
+
+
+def pipeline_no_bgm() -> str:
+    # Kept local to avoid making pipeline's execution module an orchestration dependency.
+    return "不要生成背景音乐"
+
+
+def child_request_id(parent_id: str, receipt: str, index: int) -> str:
+    digest = hashlib.sha256(f"{parent_id}\0{receipt}\0{index}".encode()).hexdigest()
+    return f"long-{digest[:59]}"  # 64 bytes, deterministic, provider-safe.
+
+
+def _extract_last_frame(video: Path, output: Path) -> Path:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(".tmp.png")
+    result = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-sseof", "-1", "-i", str(video),
+         "-vf", "reverse", "-frames:v", "1", str(temporary)],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        raise LongGenerationError("long_video_tail_frame_failed")
+    temporary.replace(output)
+    return output
+
+
+def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
+             parent_id: str, fit_mode: str) -> h3.H3Request:
+    first = segment.first_frame
+    if segment.join_mode == "continue":
+        upstream = plan.segments[segment.index - 2]
+        tail = _extract_last_frame(
+            upstream.workdir / "generated.mp4",
+            upstream.workdir / "work" / "generated_last.png",
+        )
+        first = _fit_anchor(tail, segment.workdir / "work" / "h3_frames" / fit_mode / "continued", fit_mode)
+    first_data, last_data = first.read_bytes(), segment.last_frame.read_bytes()
+    return h3.H3Request(
+        cid=f"{cid}-segment-{segment.index}",
+        workdir=segment.workdir,
+        client_request_id=child_request_id(parent_id, plan.receipt, segment.index),
+        prompt=segment.prompt,
+        keyframes=(),
+        voice_texts=(),
+        voice_receipt=h3.voice_texts_receipt(()),
+        duration=max(1, math.ceil(segment.end_s - segment.start_s)),
+        autodl_token=settings.autodl_art_token,
+        timeouts=h3.Timeouts(
+            request_s=settings.h3_request_timeout_s,
+            h3_poll_s=settings.h3_poll_timeout_s,
+            download_s=settings.h3_download_timeout_s,
+            poll_interval_s=settings.h3_poll_interval_s,
+            retry_count=settings.retry_count,
+            retry_interval_s=settings.retry_interval_s,
+        ),
+        mode="boundary",
+        first_frame=(first, first_data),
+        last_frame=(segment.last_frame, last_data),
+    )
+
+
+def public_segments(generation: Mapping) -> list[dict]:
+    result = []
+    for item in generation.get("segments", []):
+        if isinstance(item, dict):
+            result.append({key: item.get(key) for key in
+                           ("index", "chain_id", "join_mode", "status", "attempt", "error")})
+    return result
+
+
+def _result_status(result: h3.H3Result) -> tuple[str, str | None]:
+    if result.status == "succeeded":
+        return "succeeded", None
+    if result.status in {"submission_unknown", "h3_submitting"}:
+        return "submission_unknown", "submission_unknown"
+    if result.status == "h3_running" or result.error_code in {
+        "h3_query_failed", "h3_timeout", "download_failed", "download_dns_failed",
+        "download_peer_unverified", "output_write_failed", "output_probe_failed",
+    }:
+        return "resume_required", result.error_code or result.status
+    return "failed", result.error_code or "h3_failed"
+
+
+def initial_generation(plan: FrozenPlan, parent_id: str, attempt: int,
+                       old: Mapping | None = None) -> dict:
+    old_by_index = {
+        item.get("index"): item for item in (old or {}).get("segments", [])
+        if isinstance(item, dict)
+    }
+    items = []
+    for segment in plan.segments:
+        prior = old_by_index.get(segment.index, {})
+        succeeded = prior.get("status") == "succeeded" and (
+            segment.workdir / "generated.mp4"
+        ).is_file()
+        items.append({
+            "index": segment.index,
+            "chain_id": segment.chain_id,
+            "join_mode": segment.join_mode,
+            "status": "succeeded" if succeeded else "not_started",
+            "attempt": prior.get("attempt", 0) if succeeded else int(prior.get("attempt", 0) or 0),
+            "error": None,
+            "child_request_id": prior.get("child_request_id") if succeeded else None,
+        })
+    return {"status": "queued", "error": None, "attempt": attempt,
+            "client_request_id": parent_id, "stage": "h3", "segments": items}
+
+
+def _stitch(settings, cid: str, plan: FrozenPlan, dialogue_mode: str) -> None:
+    stitch.stitch_video(
+        segments=[stitch.StitchSegment(
+            item.workdir / "generated.mp4", item.end_s - item.start_s, item.join_mode
+        ) for item in plan.segments],
+        source_video=plan.source,
+        output=plan.root / "generated.mp4",
+        audio_mode="keep" if dialogue_mode == "auto" else "mute",
+    )
+
+
+def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
+    """Drive chains with max-two concurrency; only this coordinator writes meta."""
+    meta = storage.load_meta(settings.data_dir, cid)
+    if not meta or not isinstance(meta.get("generation"), dict):
+        return
+    generation = meta["generation"]
+    parent_id = generation.get("client_request_id")
+    fit_mode = meta.get("fit_mode")
+    dialogue_mode = meta.get("dialogue_mode")
+    states = {item["index"]: dict(item) for item in generation.get("segments", [])}
+    if not isinstance(parent_id, str) or fit_mode not in {"none", "crop", "pad"}:
+        return
+
+    def persist(status: str | None = None, error: str | None = None, stage: str = "h3") -> None:
+        nonlocal generation
+        ordered = [states[item.index] for item in plan.segments]
+        generation = {**generation, "segments": ordered,
+                      "status": status or generation.get("status"), "error": error, "stage": stage}
+        storage.update_meta(settings.data_dir, cid, generation=generation)
+
+    if startup:
+        for segment in plan.segments:
+            state = states[segment.index]
+            if state.get("status") not in {"queued", "running", "resume_required"}:
+                continue
+            try:
+                request = _request(settings, cid, plan, segment, parent_id, fit_mode)
+                result = h3.resume(request)
+                state["status"], state["error"] = _result_status(result)
+            except Exception:
+                state["status"], state["error"] = "submission_unknown", "submission_unknown"
+        if any(item.get("status") == "submission_unknown" for item in states.values()):
+            persist("submission_unknown", "submission_unknown")
+        elif all(item.get("status") == "succeeded" for item in states.values()):
+            try:
+                _stitch(settings, cid, plan, dialogue_mode)
+            except Exception:
+                persist("failed", "long_video_stitch_failed", "stitch")
+            else:
+                persist("succeeded", None, "stitch")
+        elif any(item.get("status") == "failed" for item in states.values()):
+            persist("failed", "long_video_segment_failed")
+        else:
+            # A known attempt still needs GET recovery, or an unstarted child
+            # awaits an explicit same-parent confirmation.  Startup never POSTs.
+            persist("resume_required", "long_video_resume_required")
+        return
+
+    chains: dict[str, list[FrozenSegment]] = {}
+    for segment in plan.segments:
+        chains.setdefault(segment.chain_id, []).append(segment)
+
+    def ready() -> list[FrozenSegment]:
+        candidates = []
+        for chain in chains.values():
+            for segment in chain:
+                state = states[segment.index]
+                if state.get("status") == "succeeded":
+                    continue
+                if state.get("status") in {"not_started", "queued", "resume_required"}:
+                    prior = [states[item.index].get("status") for item in chain if item.index < segment.index]
+                    if all(value == "succeeded" for value in prior):
+                        candidates.append(segment)
+                    break
+                break
+        return candidates
+
+    def worker(segment: FrozenSegment):
+        try:
+            request = _request(settings, cid, plan, segment, parent_id, fit_mode)
+        except LongGenerationError as exc:
+            return segment.index, None, ("failed", exc.code)
+        except Exception:
+            return segment.index, None, ("failed", "long_video_request_invalid")
+        try:
+            result = h3.start(request)
+            return segment.index, request.client_request_id, _result_status(result)
+        except h3.H3Error as exc:
+            try:
+                inspected = h3.inspect(request)
+                status = _result_status(inspected)
+            except Exception:
+                status = ("submission_unknown", "submission_unknown")
+            if status[0] == "failed" and exc.code in {"submission_unknown", "state_persist_failed", "h3_internal_error"}:
+                status = ("submission_unknown", "submission_unknown")
+            return segment.index, request.client_request_id, status
+        except Exception:
+            return segment.index, request.client_request_id, ("submission_unknown", "submission_unknown")
+
+    active = {}
+    locked = False
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        while True:
+            if not locked:
+                active_chains = {segment.chain_id for segment in active.values()}
+                for segment in ready():
+                    if len(active) >= 2:
+                        break
+                    if segment.chain_id in active_chains:
+                        continue
+                    state = states[segment.index]
+                    is_new_child = state.get("status") == "not_started"
+                    state["status"], state["error"] = "running", None
+                    if is_new_child:
+                        state["attempt"] = int(state.get("attempt", 0) or 0) + 1
+                    persist("running", None)
+                    future = pool.submit(worker, segment)
+                    active[future] = segment
+                    active_chains.add(segment.chain_id)
+            if not active:
+                break
+            done, _pending = wait(tuple(active), return_when=FIRST_COMPLETED)
+            for future in done:
+                segment = active.pop(future)
+                index, child_id, (status, error) = future.result()
+                states[index].update(status=status, error=error, child_request_id=child_id)
+                if status == "submission_unknown":
+                    locked = True
+                persist("submission_unknown" if locked else "running",
+                        "submission_unknown" if locked else None)
+
+    if locked:
+        persist("submission_unknown", "submission_unknown")
+        return
+    statuses = {item.get("status") for item in states.values()}
+    if statuses == {"succeeded"}:
+        try:
+            _stitch(settings, cid, plan, dialogue_mode)
+        except Exception:
+            persist("failed", "long_video_stitch_failed", "stitch")
+        else:
+            persist("succeeded", None, "stitch")
+    elif "resume_required" in statuses:
+        persist("resume_required", "long_video_resume_required")
+    else:
+        persist("failed", "long_video_segment_failed")
