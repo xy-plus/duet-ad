@@ -1,6 +1,7 @@
 import hashlib
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
 import cv2
@@ -94,12 +95,12 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
     return cid, receipt
 
 
-def _payload(receipt, request_id="parent-request-123", mode="auto"):
+def _payload(receipt, request_id="parent-request-123", mode="auto", fit="none"):
     return {
         "confirm": True,
         "client_request_id": request_id,
         "dialogue_mode": mode,
-        "fit_mode": "none",
+        "fit_mode": fit,
         "expected_plan_receipt": receipt,
     }
 
@@ -467,3 +468,114 @@ def test_local_continue_request_failure_is_structured_failed_not_coordinator_cra
     generation = client.get(f"/api/conversations/{cid}", headers=AUTH).json()["generation"]
     assert generation["status"] == "failed"
     assert generation["segments"][1]["error"] == "tail_failed"
+
+
+def test_resume_required_segment_runs_at_most_once_per_coordinator_invocation(
+    tmp_path, monkeypatch
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(settings.data_dir / cid, meta, receipt, "none", "auto")
+    generation = long_generation.initial_generation(plan, "parent-request-123", 1)
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    calls = 0
+    stop = threading.Event()
+
+    def query_failure(_request):
+        nonlocal calls
+        calls += 1
+        if stop.is_set():
+            return h3.H3Result("failed", "task", error_code="h3_provider_failed")
+        return h3.H3Result(
+            "retryable_failure", "task", retryable=True,
+            error_code="h3_query_failed",
+        )
+
+    monkeypatch.setattr(h3, "start", query_failure)
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(long_generation.run, settings, cid, plan)
+    timed_out = False
+    try:
+        future.result(timeout=0.2)
+    except TimeoutError:
+        timed_out = True
+        stop.set()
+        future.result(timeout=1)
+    finally:
+        pool.shutdown()
+    assert not timed_out
+    assert calls == 1
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "resume_required"
+
+
+@pytest.mark.parametrize("changed", ["plan", "dialogue", "fit"])
+def test_failed_retry_rejects_all_frozen_parameter_changes_with_zero_new_posts(
+    enabled, monkeypatch, changed
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
+    if changed == "fit":
+        storage.update_meta(settings.data_dir, cid, fit_required=True)
+    calls = []
+    monkeypatch.setattr(long_generation, "_extract_last_frame", lambda _v, output: (
+        output.parent.mkdir(parents=True, exist_ok=True) or _png(output, 200) or output
+    ))
+
+    def start(request):
+        index = int(request.workdir.name)
+        calls.append(index)
+        if index == 2:
+            return h3.H3Result("failed", "task", error_code="h3_provider_failed")
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "task")
+
+    monkeypatch.setattr(h3, "start", start)
+    initial_fit = "crop" if changed == "fit" else "none"
+    assert client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, fit=initial_fit),
+    ).status_code == 202
+    assert calls == [1, 2]
+    calls.clear()
+
+    retry_receipt = receipt
+    retry_mode = "auto"
+    retry_fit = initial_fit
+    if changed == "plan":
+        path = settings.data_dir / cid / long_video.PLAN_RECEIPT_FILENAME
+        path.write_text(path.read_text() + " ", encoding="utf-8")
+        retry_receipt = hashlib.sha256(path.read_bytes()).hexdigest()
+    elif changed == "dialogue":
+        retry_mode = "none"
+    else:
+        retry_fit = "pad"
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(
+            retry_receipt, request_id="parent-request-999",
+            mode=retry_mode, fit=retry_fit,
+        ),
+    )
+    assert response.status_code == 409
+    assert response.json() == {"detail": "resume_parameters_changed"}
+    assert calls == []
+
+
+def test_plan_receipt_read_error_degrades_to_none(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    cid, _receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    target = settings.data_dir / cid / long_video.PLAN_RECEIPT_FILENAME
+    original = Path.read_bytes
+
+    def fail_target(path):
+        if path == target:
+            raise OSError("unreadable")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_target)
+    assert long_generation.plan_receipt(settings.data_dir / cid, meta) is None

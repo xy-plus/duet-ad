@@ -66,7 +66,12 @@ def plan_receipt(root: Path, meta: Mapping) -> str | None:
     if name != long_video.PLAN_RECEIPT_FILENAME:
         return None
     path = Path(root) / name
-    return _digest(path) if path.is_file() else None
+    if not path.is_file():
+        return None
+    try:
+        return _digest(path)
+    except LongGenerationError:
+        return None
 
 
 def _bound_path(root: Path, artifact: object) -> Path:
@@ -423,6 +428,8 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
     for segment in plan.segments:
         chains.setdefault(segment.chain_id, []).append(segment)
 
+    attempted_indices: set[int] = set()
+
     def ready() -> list[FrozenSegment]:
         candidates = []
         for chain in chains.values():
@@ -431,6 +438,8 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 if state.get("status") == "succeeded":
                     continue
                 if state.get("status") in {"not_started", "queued", "resume_required"}:
+                    if segment.index in attempted_indices:
+                        break
                     prior = [states[item.index].get("status") for item in chain if item.index < segment.index]
                     if all(value == "succeeded" for value in prior):
                         candidates.append(segment)
@@ -476,6 +485,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     state["status"], state["error"] = "running", None
                     if is_new_child:
                         state["attempt"] = int(state.get("attempt", 0) or 0) + 1
+                    attempted_indices.add(segment.index)
                     persist("running", None)
                     future = pool.submit(worker, segment)
                     active[future] = segment

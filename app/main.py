@@ -1012,6 +1012,8 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail="submission_outcome_unknown")
                 if (settings.data_dir / cid / "generated.mp4").is_file():
                     raise HTTPException(status_code=409, detail="already submitted")
+                if previous_status == "failed" and not same_parameters:
+                    raise HTTPException(status_code=409, detail="resume_parameters_changed")
                 try:
                     plan = await asyncio.to_thread(
                         long_generation.freeze_plan,
