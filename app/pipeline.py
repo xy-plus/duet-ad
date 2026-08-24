@@ -1047,10 +1047,12 @@ def run(settings: Settings, cid: str, runner) -> None:
     # data_dir 可能是相对路径（生产默认 "data"）：子进程带 cwd 时相对路径会错位，统一起点解析为绝对
     cdir = (settings.data_dir / cid).resolve()
     work = cdir / "work"
+    claim_owner = None
     try:
         meta = storage.claim_pipeline_input(settings.data_dir, cid)
         if meta is None:
             return
+        claim_owner = meta["_input_owner"]
         sources = sorted(cdir.glob("source.*"))
         if not sources:
             raise PipelineError("source video missing")
@@ -1155,7 +1157,7 @@ def run(settings: Settings, cid: str, runner) -> None:
             storage.finish_input_claim(
                 settings.data_dir,
                 cid,
-                "pipeline",
+                claim_owner,
                 status="done",
                 keyframes=keyframes,
                 prompt=prompt,
@@ -1222,10 +1224,11 @@ def run(settings: Settings, cid: str, runner) -> None:
                 changes["long_video_plan_receipt"] = receipt_path.name
             # 新 schema 保留 segments；短视频仍只写顶层 keyframes/prompt。
             storage.finish_input_claim(
-                settings.data_dir, cid, "pipeline", **changes
+                settings.data_dir, cid, claim_owner, **changes
             )
     except Exception as e:
-        storage.finish_input_claim(
-            settings.data_dir, cid, "pipeline",
-            status="failed", error=str(e)[:500],
-        )
+        if claim_owner is not None:
+            storage.finish_input_claim(
+                settings.data_dir, cid, claim_owner,
+                status="failed", error=str(e)[:500],
+            )

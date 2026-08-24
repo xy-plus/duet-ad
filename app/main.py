@@ -582,8 +582,7 @@ def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
 
 def _claim_first_submission(
     settings: Settings, cid: str, request_id: str,
-) -> tuple[dict, str]:
-    owner = f"submit:{request_id}"
+) -> tuple[dict, object]:
     claimed = storage.claim_submission_input(settings.data_dir, cid, request_id)
     if claimed is None:
         current = storage.load_meta(settings.data_dir, cid)
@@ -593,11 +592,11 @@ def _claim_first_submission(
             else "generation in progress"
         )
         raise HTTPException(status_code=409, detail=detail)
-    return claimed, owner
+    return claimed, claimed["_input_owner"]
 
 
 def _finish_submission_claim(
-    settings: Settings, cid: str, owner: str, **changes,
+    settings: Settings, cid: str, owner: object, **changes,
 ) -> None:
     if storage.finish_input_claim(
         settings.data_dir, cid, owner, **changes

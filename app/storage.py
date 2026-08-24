@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -22,6 +23,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _SEG_FILE_RE = re.compile(r"^([1-9]\d*)/work/(keyframes|postprocessed)/([^/]+)$")
 _META_LOCKS: dict[str, threading.Lock] = {}
 _META_LOCKS_GUARD = threading.Lock()
+PROCESS_GENERATION = uuid.uuid4().hex
 
 
 class UploadError(ValueError):
@@ -113,6 +115,63 @@ def update_meta(data_dir: Path, cid: str, **changes) -> dict | None:
         return meta
 
 
+def _frozen_input_snapshot(cdir: Path, *, include_prompts: bool) -> dict[str, str]:
+    patterns = [
+        "prepared_input.json",
+        "long_video_plan.json",
+        "work/**/h3_frames/**/*",
+    ]
+    if include_prompts:
+        patterns.append("work/**/prompt.txt")
+    paths = {
+        path
+        for pattern in patterns
+        for path in cdir.glob(pattern)
+        if path.is_file()
+    }
+    return {
+        path.relative_to(cdir).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(paths)
+    }
+
+
+def _input_owner(cdir: Path, kind: str, request_id: str | None = None) -> dict:
+    owner = {
+        "kind": kind,
+        "process_generation": PROCESS_GENERATION,
+        "frozen_input_snapshot": _frozen_input_snapshot(
+            cdir, include_prompts=kind == "submit"
+        ),
+    }
+    if request_id is not None:
+        owner["request_id"] = request_id
+    return owner
+
+
+def _has_frozen_input(cdir: Path, meta: dict) -> bool:
+    return bool(
+        meta.get("generation") is not None
+        or meta.get("prepared_input_receipt")
+        or meta.get("long_video_plan_receipt")
+        or (cdir / "prepared_input.json").exists()
+        or (cdir / "long_video_plan.json").exists()
+        or any(cdir.glob("work/**/h3_frames"))
+    )
+
+
+def _stale_owner_has_new_frozen_input(cdir: Path, meta: dict, owner: object) -> bool:
+    if meta.get("generation") is not None:
+        return True
+    if not isinstance(owner, dict):
+        return _has_frozen_input(cdir, meta)
+    snapshot = owner.get("frozen_input_snapshot")
+    if not isinstance(snapshot, dict):
+        return _has_frozen_input(cdir, meta)
+    return snapshot != _frozen_input_snapshot(
+        cdir, include_prompts=owner.get("kind") == "submit"
+    )
+
+
 def claim_pipeline_input(data_dir: Path, cid: str) -> dict | None:
     """Atomically claim an unfrozen conversation for input preparation."""
     if not _ID_RE.match(cid):
@@ -120,16 +179,21 @@ def claim_pipeline_input(data_dir: Path, cid: str) -> dict | None:
     cdir = data_dir / cid
     with _meta_lock(cdir):
         meta = load_meta(data_dir, cid)
-        if meta is None or any((
-            meta.get("_input_owner"),
-            meta.get("generation") is not None,
-            meta.get("prepared_input_receipt"),
-            meta.get("long_video_plan_receipt"),
-            (cdir / "prepared_input.json").exists(),
-            (cdir / "long_video_plan.json").exists(),
-        )):
+        if meta is None:
             return None
-        meta.update(status="processing", error=None, _input_owner="pipeline")
+        current = meta.get("_input_owner")
+        if current:
+            if (
+                isinstance(current, dict)
+                and current.get("process_generation") == PROCESS_GENERATION
+            ) or _stale_owner_has_new_frozen_input(cdir, meta, current):
+                return None
+        elif _has_frozen_input(cdir, meta):
+            return None
+        meta.update(
+            status="processing", error=None,
+            _input_owner=_input_owner(cdir, "pipeline"),
+        )
         meta["updated_at"] = _now()
         _write_meta(cdir, meta)
         return meta
@@ -140,19 +204,20 @@ def claim_submission_input(data_dir: Path, cid: str, request_id: str) -> dict | 
     if not _ID_RE.match(cid):
         return None
     cdir = data_dir / cid
-    owner = f"submit:{request_id}"
     with _meta_lock(cdir):
         meta = load_meta(data_dir, cid)
         if meta is None:
             return None
-        if meta.get("_input_owner") == owner:
-            return meta
-        if (
-            meta.get("_input_owner")
-            or meta.get("generation") is not None
-            or meta.get("status") != "done"
-        ):
+        current = meta.get("_input_owner")
+        if current:
+            if (
+                isinstance(current, dict)
+                and current.get("process_generation") == PROCESS_GENERATION
+            ) or _stale_owner_has_new_frozen_input(cdir, meta, current):
+                return None
+        if meta.get("generation") is not None or meta.get("status") != "done":
             return None
+        owner = _input_owner(cdir, "submit", request_id)
         meta["_input_owner"] = owner
         meta["updated_at"] = _now()
         _write_meta(cdir, meta)
@@ -160,7 +225,7 @@ def claim_submission_input(data_dir: Path, cid: str, request_id: str) -> dict | 
 
 
 def finish_input_claim(
-    data_dir: Path, cid: str, owner: str, **changes,
+    data_dir: Path, cid: str, owner: object, **changes,
 ) -> dict | None:
     """Commit or release a claim only when its current owner still matches."""
     if not _ID_RE.match(cid):
