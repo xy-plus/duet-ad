@@ -158,7 +158,7 @@ def test_authoritative_navigation_status_maps_without_local_inference():
         {"className": "done", "text": "已完成"},
         {"className": "processing", "text": "素材优化中"},
         {"className": "failed", "text": "素材优化失败"},
-        {"className": "analyzed", "text": "素材优化完成"},
+        {"className": "done", "text": "已完成"},
         {"className": "failed", "text": "状态异常"},
     ]
 

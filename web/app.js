@@ -559,7 +559,8 @@ function conversationBadge(conversation) {
     completed: { className: "done", text: "已完成" },
     postprocessing: { className: "processing", text: "素材优化中" },
     postprocess_failed: { className: "failed", text: "素材优化失败" },
-    postprocess_done: { className: "analyzed", text: "素材优化完成" },
+    // 兼容滚动升级期间旧后端的枚举；有最终视频时完成态始终统一为“已完成”。
+    postprocess_done: { className: "done", text: "已完成" },
   };
   if (Object.prototype.hasOwnProperty.call(item, "navigation_status")) {
     return navigationBadges[item.navigation_status]

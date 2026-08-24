@@ -49,3 +49,9 @@ def test_postprocess_chat_children_remain_in_normal_flow_and_wrap_labels():
     assert "max-width: 100%" in chip
     assert "overflow-wrap: anywhere" in chip
 
+
+def test_segment_products_leave_message_spacing_before_postprocess_chat():
+    css = STYLES.read_text(encoding="utf-8")
+    disclosure = _rule(css, ".segment-products-disclosure")
+
+    assert "margin-bottom: 24px" in disclosure

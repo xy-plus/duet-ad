@@ -31,7 +31,7 @@ links: [conversation-task, submit-gate]
 `navigation_status`：分析阶段、生成阶段、输出缺失、完成以及后处理状态都有独立枚举。
 只有 generation 明确 `succeeded` 且最终输出通过服务端验收时才是 `completed`；孤立成片
 不能把 `analysis_complete` 冒充为完成。已有有效成片时，后处理的进行中、失败、完成状态
-优先显示为 `postprocessing/postprocess_failed/postprocess_done`。
+进行中或失败时优先显示为 `postprocessing/postprocess_failed`；后处理完成且最终视频有效时统一显示 `completed`（“已完成”）。
 
 ## 边界
 

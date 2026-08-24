@@ -684,6 +684,8 @@ input, textarea { font-family: inherit; }
 .segment-prompt-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .segment-prompt-panel { margin-top: 8px; }
 
+.segment-products-disclosure { margin-bottom: 24px; }
+
 .segment-products-toggle {
   width: 100%;
   min-height: 44px;

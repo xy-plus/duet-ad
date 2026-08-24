@@ -115,7 +115,8 @@ multipart 只允许表中字段及 `file`，未知或重复字段返回 422 `inv
 | generation 未知 | `generation_unknown` |
 | generation `succeeded` 但最终输出未通过服务端验收 | `output_missing` |
 | generation `succeeded` 且最终输出有效 | `completed` |
-| 有效最终输出上的 postprocess `running/failed/done` | `postprocessing/postprocess_failed/postprocess_done`，优先于 `completed` |
+| 有效最终输出上的 postprocess `running/failed` | `postprocessing/postprocess_failed`，优先于 `completed` |
+| generation `succeeded`、最终输出有效，且 postprocess 未运行或已 `done` | `completed` |
 
 analysis 的非终态/失败优先于所有 generation/postprocess 状态。投影只返回枚举字符串，
 不包含供应商 task id、文件路径或其他内部恢复字段。

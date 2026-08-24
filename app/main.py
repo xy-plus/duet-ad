@@ -240,7 +240,6 @@ def _navigation_status(meta: dict, *, has_video: bool) -> str:
         postprocess_states = {
             "running": "postprocessing",
             "failed": "postprocess_failed",
-            "done": "postprocess_done",
         }
         projected = postprocess_states.get(postprocess_state.get("status"))
         if projected is not None:

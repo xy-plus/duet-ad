@@ -85,7 +85,7 @@ def test_detail_shape_has_no_context_ir_contract(client, video_1s):
         ("done", "succeeded", True, None, "completed"),
         ("done", "succeeded", True, "running", "postprocessing"),
         ("done", "succeeded", True, "failed", "postprocess_failed"),
-        ("done", "succeeded", True, "done", "postprocess_done"),
+        ("done", "succeeded", True, "done", "completed"),
     ),
 )
 def test_navigation_status_matrix_is_authoritative_and_consistent(
