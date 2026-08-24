@@ -9,6 +9,11 @@ import math
 import sys
 from pathlib import Path
 
+if __package__ in {None, ""}:  # direct script execution: expose repository package root
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app import long_video
+
 try:
     from scenedetect import ContentDetector, detect
 except ImportError as exc:  # pragma: no cover - environment-dependent message
@@ -16,10 +21,10 @@ except ImportError as exc:  # pragma: no cover - environment-dependent message
         "PySceneDetect is required. Install scenedetect>=0.7 in the server environment."
     ) from exc
 
-# 与当前生成链单段上限耦合：长视频每段 1~15s，超过 10s 即规划
-SEGMENT_MIN_S = 1.0
-SEGMENT_MAX_S = 15.0
-SEGMENT_ONLY_ABOVE_S = 10.0
+# 与当前生成链单段上限耦合：新长视频每段 provider 请求不超过 10s。
+SEGMENT_MIN_S = long_video.SEGMENT_MIN_S
+SEGMENT_MAX_S = long_video.SEGMENT_PROVIDER_MAX_DURATION_S
+SEGMENT_ONLY_ABOVE_S = long_video.SHORT_VIDEO_MAX_S
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,14 +101,17 @@ def group_frames(
 def _assert_segments_valid(
     segments: list[tuple[float, float]], duration: float
 ) -> None:
-    """防御性断言拆段不变量：每段 1~15s、相邻无缝、首 0 尾 duration（算法已保证，兜底）。"""
+    """防御性断言拆段不变量：请求 ≤10s、相邻无缝、首 0 尾 duration。"""
     if not segments:
         raise SystemExit("拆段结果为空。")
     prev_end = 0.0
     for start, end in segments:
         if abs(start - prev_end) > 1e-6:
             raise SystemExit(f"拆段边界不连续: {start:.6f}s 与 {prev_end:.6f}s")
-        if end - start < SEGMENT_MIN_S - 1e-9 or end - start > SEGMENT_MAX_S + 1e-9:
+        if (
+            end - start < SEGMENT_MIN_S - 1e-9
+            or long_video.provider_duration_s(start, end) > SEGMENT_MAX_S
+        ):
             raise SystemExit(f"拆段长度违规: {start:.6f}s - {end:.6f}s")
         prev_end = end
     if abs(segments[0][0]) > 1e-6 or abs(prev_end - duration) > 1e-6:
@@ -115,64 +123,16 @@ def _assert_segments_valid(
 def build_segments(
     bounds: list[tuple[float, float]], duration: float
 ) -> list[tuple[float, float]]:
-    """按场景边界生成拆段建议：每段 1~15s、覆盖全程无缝隙、边界单调递增（算法级不变量）。
+    """按统一 planner 生成 provider-safe 的旧/辅助拆段建议。
 
     输入契约：bounds 须已 round(3)（main 侧已做，本函数内部对 duration 同口径 round）。"""
     duration = round(duration, 3)  # 统一 3 位口径：bounds 已 round(3)，断言两端才可比
     if duration <= SEGMENT_ONLY_ABOVE_S:
         return []
-    # 1. 预处理：>15s 场景均分为 ceil(时长/15) 块，得原子块列表（每块 ∈ (0, 15]）
-    blocks: list[tuple[float, float]] = []
-    for start, end in bounds:
-        if end - start > SEGMENT_MAX_S:
-            piece_count = math.ceil((end - start) / SEGMENT_MAX_S)
-            piece = (end - start) / piece_count
-            for k in range(piece_count):
-                block_end = end if k == piece_count - 1 else start + (k + 1) * piece
-                blocks.append((start + k * piece, block_end))
-        else:
-            blocks.append((start, end))
-    # 2. 贪心装箱：累加块至将超 15s 时闭合当前段（闭合段长 ∈ (0, 15]）
-    segments: list[tuple[float, float]] = []
-    seg_start = 0.0  # 首段起点钉 0
-    seg_end = 0.0
-    for start, end in blocks:
-        if end - seg_start > SEGMENT_MAX_S:
-            segments.append((seg_start, seg_end))
-            seg_start = start
-        seg_end = end
-    segments.append((seg_start, seg_end))
-    # 3. 修复违规段（一轮收敛）：<4s 并入邻段（合并体 >15s 则均分成 2）
-    # 步骤 2 不变量保证装箱段恒 ≤15，>15 只可能由合并产生、已在分支内均分，无需独立分支
-    fixed: list[tuple[float, float]] = list(segments)
-    i = 0
-    while i < len(fixed):
-        start, end = fixed[i]
-        length = end - start
-        if length < SEGMENT_MIN_S:
-            if i == 0 and len(fixed) > 1:
-                # 首段并入后段
-                _, next_end = fixed[1]
-                if next_end - start > SEGMENT_MAX_S:
-                    half = (next_end - start) / 2
-                    fixed[0:2] = [(start, start + half), (start + half, next_end)]
-                else:
-                    fixed[0:2] = [(start, next_end)]
-            elif i > 0:
-                # 并入前段
-                prev_start, _ = fixed[i - 1]
-                if end - prev_start > SEGMENT_MAX_S:
-                    half = (end - prev_start) / 2
-                    fixed[i - 1 : i + 1] = [
-                        (prev_start, prev_start + half),
-                        (prev_start + half, end),
-                    ]
-                else:
-                    fixed[i - 1 : i + 1] = [(prev_start, end)]
-        i += 1
-    # 4. 防御性断言不变量
-    _assert_segments_valid(fixed, duration)
-    return fixed
+    planned = long_video.plan_segments(duration, bounds, [])
+    segments = [(item["start_s"], item["end_s"]) for item in planned]
+    _assert_segments_valid(segments, duration)
+    return segments
 
 
 def main() -> int:

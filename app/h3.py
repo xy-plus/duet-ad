@@ -40,6 +40,8 @@ H3_MAX_DURATION_S = 10
 H3_BOUNDARY_MAX_DURATION_S = 15
 AUTODL_BASE_URL = "https://autodl.art"
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
+H3_OUTPUT_FRAME_DURATION_S = 1 / 24
+_DURATION_EPS_S = 1e-6
 
 _SAFE_ERROR_CODES = {
     "h3_submit_rejected",
@@ -478,10 +480,16 @@ def output_is_reusable(
         expected = float(
             request.duration if expected_duration_s is None else expected_duration_s
         )
-        if (
-            not math.isfinite(expected)
-            or expected <= 0
-            or abs(duration - expected) > 0.5
+        if not math.isfinite(expected) or expected <= 0:
+            return False
+        if request.mode == "reference":
+            if abs(duration - expected) > 0.5:
+                return False
+        elif (
+            expected < request.duration - 1 - _DURATION_EPS_S
+            or expected > request.duration + _DURATION_EPS_S
+            or duration < expected - H3_OUTPUT_FRAME_DURATION_S - _DURATION_EPS_S
+            or duration > request.duration + 1
         ):
             return False
         return True

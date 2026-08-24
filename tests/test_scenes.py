@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from app.scenes import build_segments
+from app.long_video import provider_duration_s
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENES_SCRIPT = ROOT / "app" / "scenes.py"
@@ -142,7 +143,8 @@ def test_segments_cover_and_sized(video_30s, tmp_path):
         assert cur[0] == pytest.approx(prev[1])  # 无缝隙
         assert cur[0] >= prev[0]  # 单调递增
     for start, end in bounds:
-        assert 1.0 <= end - start <= 15.0  # 每段 1~15s
+        assert 1.0 <= end - start
+        assert provider_duration_s(start, end) <= 10
     assert all(seg["chain_id"].startswith("chain-") for seg in segments)
     assert all(seg["join_mode"] in {"hard_cut", "continue"} for seg in segments)
 
@@ -161,7 +163,7 @@ def test_segments_empty_for_short_video(video_10s, tmp_path):
 
 def test_build_segments_starts_immediately_above_ten_seconds():
     segments = build_segments([(0.0, 10.001)], 10.001)
-    assert segments == [(0.0, 10.001)]
+    assert segments == [(0.0, 9.001), (9.001, 10.001)]
 
 
 def test_missing_manifest_fails(video_10s, tmp_path):
@@ -260,24 +262,25 @@ def test_e2e_manifest_duration_frame_quantized(video_24s, tmp_path):
     assert_segments_valid(segments, data["duration_s"])
 
 
-def test_build_segments_splits_long_scene_evenly():
-    """单场景超 15s 动态均分：22s 场景 → 两段 11s。"""
+def test_build_segments_splits_long_scene_at_provider_safe_boundaries():
     assert build_segments([(0.0, 10.0), (10.0, 32.0)], 32.0) == [
         (0.0, 10.0),
-        (10.0, 21.0),
-        (21.0, 32.0),
+        (10.0, 20.0),
+        (20.0, 30.0),
+        (30.0, 32.0),
     ]
 
 
 def assert_segments_valid(segments, duration):
-    """拆段不变量：非空、每段 1~15s、首 0 尾 duration、相邻无缝、单调递增。"""
+    """拆段不变量：非空、请求不超过 10s、首 0 尾 duration、相邻无缝。"""
     assert segments
     assert segments[0][0] == pytest.approx(0.0)
     assert segments[-1][1] == pytest.approx(duration)
     prev_end = 0.0
     for start, end in segments:
         assert start == pytest.approx(prev_end)  # 无缝隙
-        assert 1.0 <= end - start <= 15.0
+        assert 1.0 <= end - start
+        assert provider_duration_s(start, end) <= 10
         assert end > start  # 单调
         prev_end = end
 

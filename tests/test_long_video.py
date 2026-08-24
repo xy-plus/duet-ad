@@ -13,6 +13,7 @@ from app.long_video import (
     build_continuity_block,
     localize_dialogue,
     plan_segments,
+    provider_duration_s,
     write_plan_receipt,
 )
 
@@ -22,29 +23,36 @@ def test_short_video_keeps_single_input_contract():
 
 
 def test_provider_integer_duration_boundaries_do_not_hide_positive_overflow():
-    ten_plus = math.nextafter(10.0, math.inf)
-    fifteen_plus = math.nextafter(15.0, math.inf)
+    assert provider_duration_s(37.52, 47.52) == 10
+    assert provider_duration_s(0.0, 10.000001) == 11
+    assert provider_duration_s(
+        25.52, 37.52, receipt_version=1
+    ) == 13
 
-    assert plan_segments(ten_plus, [(0.0, ten_plus)], [])
-    segments = plan_segments(fifteen_plus, [(0.0, fifteen_plus)], [])
+    segments = plan_segments(10.000001, [(0.0, 10.000001)], [])
     assert len(segments) == 2
-    assert all(math.ceil(item["end_s"] - item["start_s"]) <= 15 for item in segments)
+    assert all(
+        provider_duration_s(item["start_s"], item["end_s"]) <= 10
+        for item in segments
+    )
 
     with pytest.raises(LongVideoError, match="long_video_duration_exceeded"):
         plan_segments(math.nextafter(300.0, math.inf), [], [])
 
 
-def test_long_scene_is_split_near_fifteen_and_continues_chain():
+def test_long_scene_is_split_at_provider_safe_ten_seconds_and_continues_chain():
     segments = plan_segments(31.0, [(0.0, 31.0)], [])
 
     assert [(s["start_s"], s["end_s"]) for s in segments] == [
-        (0.0, 15.0),
-        (15.0, 30.0),
+        (0.0, 10.0),
+        (10.0, 20.0),
+        (20.0, 30.0),
         (30.0, 31.0),
     ]
-    assert [s["chain_id"] for s in segments] == ["chain-001"] * 3
+    assert [s["chain_id"] for s in segments] == ["chain-001"] * 4
     assert [s["join_mode"] for s in segments] == [
         "hard_cut",
+        "continue",
         "continue",
         "continue",
     ]
@@ -53,11 +61,15 @@ def test_long_scene_is_split_near_fifteen_and_continues_chain():
 @pytest.mark.parametrize(
     "duration,expected,expected_join_modes",
     [
-        (15.0, [(0.0, 15.0)], ["hard_cut"]),
-        (30.0, [(0.0, 15.0), (15.0, 30.0)], ["hard_cut", "continue"]),
+        (15.0, [(0.0, 10.0), (10.0, 15.0)], ["hard_cut", "continue"]),
+        (
+            30.0,
+            [(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)],
+            ["hard_cut", "continue", "continue"],
+        ),
     ],
 )
-def test_exact_fifteen_second_planning_examples(duration, expected, expected_join_modes):
+def test_exact_ten_second_provider_planning_examples(duration, expected, expected_join_modes):
     segments = plan_segments(duration, [(0.0, duration)], [])
     assert [(segment["start_s"], segment["end_s"]) for segment in segments] == expected
     assert [segment["join_mode"] for segment in segments] == expected_join_modes
@@ -67,21 +79,51 @@ def test_scene_cut_starts_a_new_chain_and_coverage_is_exact():
     segments = plan_segments(28.0, [(0.0, 13.0), (13.0, 28.0)], [])
 
     assert [(s["start_s"], s["end_s"]) for s in segments] == [
-        (0.0, 13.0),
-        (13.0, 28.0),
+        (0.0, 10.0),
+        (10.0, 13.0),
+        (13.0, 23.0),
+        (23.0, 28.0),
     ]
-    assert [s["chain_id"] for s in segments] == ["chain-001", "chain-002"]
-    assert [s["join_mode"] for s in segments] == ["hard_cut", "hard_cut"]
-    assert all(1.0 <= s["end_s"] - s["start_s"] <= 15.0 for s in segments)
-    assert all(math.ceil(s["end_s"] - s["start_s"]) <= 15 for s in segments)
+    assert [s["chain_id"] for s in segments] == [
+        "chain-001", "chain-001", "chain-002", "chain-002"
+    ]
+    assert [s["join_mode"] for s in segments] == [
+        "hard_cut", "continue", "hard_cut", "continue"
+    ]
+    assert all(1.0 <= s["end_s"] - s["start_s"] for s in segments)
+    assert all(provider_duration_s(s["start_s"], s["end_s"]) <= 10 for s in segments)
+
+
+def test_real_night_market_scene_bounds_never_plan_an_eleven_second_request():
+    duration = 50.64
+    ends = [
+        8.08, 8.92, 10.84, 18.68, 19.92, 20.84,
+        21.72, 22.64, 24.88, 25.52, 37.52, 50.64,
+    ]
+    starts = [0.0, *ends[:-1]]
+    scenes = list(zip(starts, ends))
+
+    segments = plan_segments(duration, scenes, [])
+
+    assert segments[0]["end_s"] == 8.92
+    assert all(
+        provider_duration_s(item["start_s"], item["end_s"]) <= 10
+        for item in segments
+    )
+    assert segments[0]["start_s"] == 0.0
+    assert segments[-1]["end_s"] == duration
+    assert all(
+        left["end_s"] == right["start_s"]
+        for left, right in zip(segments, segments[1:])
+    )
 
 
 def test_dialogue_boundary_moves_split_without_cutting_a_sentence():
-    lines = [{"text": "one sentence", "start_s": 14.0, "end_s": 16.0}]
+    lines = [{"text": "one sentence", "start_s": 9.0, "end_s": 11.0}]
     segments = plan_segments(28.0, [(0.0, 28.0)], lines)
 
-    assert segments[0]["end_s"] == 14.0
-    assert segments[1]["start_s"] == 14.0
+    assert segments[0]["end_s"] == 9.0
+    assert segments[1]["start_s"] == 9.0
     for boundary in [s["end_s"] for s in segments[:-1]]:
         assert not any(line["start_s"] < boundary < line["end_s"] for line in lines)
 
@@ -151,10 +193,11 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     final = segment_work / "prompt.txt"
     final.write_text("global continuity\nlocal action", encoding="utf-8")
     dialogue = [{"text": "hello", "start_s": 0.0, "end_s": 1.0}]
+    duration = 10.000000000000004
     segments = [{
         "index": 1,
         "start_s": 0.0,
-        "end_s": 12.0,
+        "end_s": duration,
         "chain_id": "chain-001",
         "join_mode": "hard_cut",
         "source_path": segment_source,
@@ -169,7 +212,7 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     first = write_plan_receipt(
         tmp_path,
         source=source,
-        duration_s=12.0,
+        duration_s=duration,
         segments=segments,
         workflow="minimax_h3_lightx2v",
     )
@@ -177,7 +220,7 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     second = write_plan_receipt(
         tmp_path,
         source=source,
-        duration_s=12.0,
+        duration_s=duration,
         segments=segments,
         workflow="minimax_h3_lightx2v",
     )
@@ -185,12 +228,12 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
 
     receipt = json.loads(first_bytes)
     assert receipt["schema"] == "duet.long-video-plan"
-    assert receipt["version"] == 1
+    assert receipt["version"] == 2
     assert receipt["source"]["sha256"] == hashlib.sha256(b"whole source").hexdigest()
-    assert receipt["video"]["duration_s"] == 12.0
+    assert receipt["video"]["duration_s"] == duration
     assert receipt["workflow"] == "minimax_h3_lightx2v"
     planned = receipt["segments"][0]
-    assert (planned["start_s"], planned["end_s"]) == (0.0, 12.0)
+    assert (planned["start_s"], planned["end_s"]) == (0.0, duration)
     assert (planned["chain_id"], planned["join_mode"]) == ("chain-001", "hard_cut")
     assert planned["source"]["sha256"] == hashlib.sha256(b"segment source").hexdigest()
     assert planned["keyframes"][0]["sha256"] == hashlib.sha256(b"frame").hexdigest()
@@ -260,7 +303,7 @@ def test_exact_planner_receipts_bind_source_anchors_not_codex_keyframes(tmp_path
         workflow="minimax_h3_lightx2v",
     )
     receipt = json.loads(path.read_text(encoding="utf-8"))
-    assert len(receipt["segments"]) == (1 if duration == 15.0 else 2)
+    assert len(receipt["segments"]) == len(planned)
     for segment in receipt["segments"]:
         assert [anchor["role"] for anchor in segment["anchors"]] == ["first", "end"]
         anchor_hashes = {anchor["sha256"] for anchor in segment["anchors"]}

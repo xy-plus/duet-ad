@@ -46,6 +46,7 @@ class FrozenPlan:
     source: Path
     receipt: str
     segments: tuple[FrozenSegment, ...]
+    receipt_version: int = long_video.PLAN_RECEIPT_VERSION
 
 
 def _digest(path: Path) -> str:
@@ -164,10 +165,16 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         payload = json.loads(receipt_data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise LongGenerationError("long_video_plan_invalid") from None
+    receipt_version = payload.get("version") if isinstance(payload, dict) else None
     if (
         not isinstance(payload, dict)
         or payload.get("schema") != "duet.long-video-plan"
-        or payload.get("version") != 1
+        or isinstance(receipt_version, bool)
+        or not isinstance(receipt_version, int)
+        or receipt_version not in {
+            long_video.LEGACY_PLAN_RECEIPT_VERSION,
+            long_video.PLAN_RECEIPT_VERSION,
+        }
         or payload.get("workflow") != WORKFLOW
     ):
         raise LongGenerationError("long_video_plan_invalid")
@@ -191,6 +198,11 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         raise LongGenerationError("long_video_plan_invalid")
 
     frozen: list[FrozenSegment] = []
+    max_provider_duration = (
+        long_video.SEGMENT_PROVIDER_MAX_DURATION_S
+        if receipt_version == long_video.PLAN_RECEIPT_VERSION
+        else long_video.LEGACY_PROVIDER_MAX_DURATION_S
+    )
     previous_end = 0.0
     previous_chain = None
     for position, (raw, current) in enumerate(zip(raw_segments, meta_segments), 1):
@@ -210,7 +222,10 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             or not math.isfinite(end_s)
             or abs(start_s - previous_end) > _EPS
             or end_s - start_s < 1
-            or math.ceil(end_s - start_s) > 15
+            or long_video.provider_duration_s(
+                start_s, end_s, receipt_version=receipt_version
+            )
+            > max_provider_duration
             or not isinstance(chain_id, str)
             or not chain_id
             or join_mode not in {"hard_cut", "continue"}
@@ -308,7 +323,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         previous_end, previous_chain = end_s, chain_id
     if abs(previous_end - duration) > _EPS:
         raise LongGenerationError("long_video_plan_invalid")
-    return FrozenPlan(root, source, receipt, tuple(frozen))
+    return FrozenPlan(root, source, receipt, tuple(frozen), receipt_version)
 
 
 def child_request_id(parent_id: str, receipt: str, index: int) -> str:
@@ -363,7 +378,11 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
         keyframes=(),
         voice_texts=(),
         voice_receipt=h3.voice_texts_receipt(()),
-        duration=max(1, math.ceil(segment.end_s - segment.start_s)),
+        duration=long_video.provider_duration_s(
+            segment.start_s,
+            segment.end_s,
+            receipt_version=plan.receipt_version,
+        ),
         autodl_token=settings.autodl_art_token,
         timeouts=h3.Timeouts(
             request_s=settings.h3_request_timeout_s,
@@ -523,8 +542,12 @@ def bound_reusable_segment_indices(
             return False
         attempt = item.get("attempt")
         child_id = item.get("child_request_id")
+        status_can_revalidate = item.get("status") == "succeeded" or (
+            item.get("status") == "failed"
+            and item.get("error") == "long_video_segment_output_invalid"
+        )
         if (
-            item.get("status") != "succeeded"
+            not status_can_revalidate
             or isinstance(attempt, bool)
             or not isinstance(attempt, int)
             or attempt <= 0
@@ -545,7 +568,8 @@ def bound_reusable_segment_indices(
                 prepare_inputs=False,
             )
             return h3.output_is_reusable(
-                request, expected_duration_s=request.duration
+                request,
+                expected_duration_s=segment.end_s - segment.start_s,
             )
         except (OSError, h3.H3Error, LongGenerationError, ValueError):
             return False
@@ -717,7 +741,13 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
 
     reusable = bound_reusable_segment_indices(settings, cid, plan, generation)
     for index, state in states.items():
-        if state.get("status") == "succeeded" and index not in reusable:
+        if (
+            index in reusable
+            and state.get("status") == "failed"
+            and state.get("error") == "long_video_segment_output_invalid"
+        ):
+            state.update(status="succeeded", error=None)
+        elif state.get("status") == "succeeded" and index not in reusable:
             state.update(
                 status="failed",
                 error="long_video_segment_output_invalid",
@@ -783,6 +813,16 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         return candidates
 
     def worker(segment: FrozenSegment, action: str):
+        if (
+            action == "start"
+            and long_video.provider_duration_s(
+                segment.start_s,
+                segment.end_s,
+                receipt_version=plan.receipt_version,
+            )
+            > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
+        ):
+            return None, ("failed", "long_video_legacy_plan_read_only")
         existing_child_id = states[segment.index].get("child_request_id")
         try:
             request = _request(
@@ -809,7 +849,8 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 )
             status = _result_status(result)
             if status[0] == "succeeded" and not h3.output_is_reusable(
-                request, expected_duration_s=request.duration
+                request,
+                expected_duration_s=segment.end_s - segment.start_s,
             ):
                 status = ("failed", "long_video_segment_output_invalid")
             return request.client_request_id, status

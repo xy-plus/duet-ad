@@ -1694,14 +1694,21 @@ def test_run_dialogue_auto_routes_explicit_empty_12_4s_scene_result_to_long_plan
     assert stored["voice_lines"] == [line]
     receipt = json.loads((cdir / "long_video_plan.json").read_text(encoding="utf-8"))
     assert receipt["video"]["duration_s"] == 12.4
-    assert len(receipt["segments"]) == 1
-    assert math.ceil(
-        receipt["segments"][0]["end_s"] - receipt["segments"][0]["start_s"]
-    ) == 13
-    assert stored["segments"][0]["dialogue"] == [line]
+    assert len(receipt["segments"]) == 2
+    assert [
+        long_video.provider_duration_s(item["start_s"], item["end_s"])
+        for item in receipt["segments"]
+    ] == [10, 3]
+    assert stored["segments"][0]["dialogue"] == []
+    assert stored["segments"][1]["dialogue"] == [
+        {"text": "第十一秒台词。", "start_s": 1.0, "end_s": 2.0}
+    ]
     digest = hashlib.sha256((cdir / "long_video_plan.json").read_bytes()).hexdigest()
     frozen = long_generation.freeze_plan(cdir, stored, digest, "none", "auto")
-    assert [math.ceil(item.end_s - item.start_s) for item in frozen.segments] == [13]
+    assert [
+        long_video.provider_duration_s(item.start_s, item.end_s)
+        for item in frozen.segments
+    ] == [10, 3]
 
 
 def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
@@ -2340,8 +2347,9 @@ def test_startup_reconciles_half_committed_long_plan_without_rewrite(
         encoding="utf-8",
     )
     (segwork / "voice_lines.json").write_text("[]", encoding="utf-8")
+    duration = 10.000000000000004
     public = {
-        "index": 1, "start_s": 0.0, "end_s": 11.0,
+        "index": 1, "start_s": 0.0, "end_s": duration,
         "chain_id": "chain-001", "join_mode": "hard_cut",
         "source": "segments/1/source.mp4", "keyframes": ["01.png"],
         "keyframe_paths": ["segments/1/work/keyframes/01.png"],
@@ -2351,13 +2359,13 @@ def test_startup_reconciles_half_committed_long_plan_without_rewrite(
         "dialogue": [], "lines": [],
     }
     storage.update_meta(
-        settings.data_dir, meta["id"], duration_s=11.0,
+        settings.data_dir, meta["id"], duration_s=duration,
         dialogue_mode="auto", voice_mode="keep", voice_lines=[],
     )
     monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
     assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
     receipt = long_video.write_plan_receipt(
-        cdir, source=cdir / "source.mp4", duration_s=11.0,
+        cdir, source=cdir / "source.mp4", duration_s=duration,
         segments=[{
             **public, "source_path": segdir / "source.mp4",
             "keyframe_paths": [key], "first_frame_path": first,
