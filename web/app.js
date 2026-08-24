@@ -1379,7 +1379,12 @@ function closeLightbox({ restoreFocus = true } = {}) {
 }
 
 function onLightboxKey(e) {
-  if (e.key === "Escape") closeLightbox();
+  if (e.key === "Escape") {
+    closeLightbox();
+  } else if (e.key === "Tab" && lightboxEl && !lightboxEl.hidden) {
+    e.preventDefault();
+    lightboxEl.querySelector(".lightbox-close").focus();
+  }
 }
 
 async function copyText(text) {

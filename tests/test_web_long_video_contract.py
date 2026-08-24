@@ -306,6 +306,12 @@ def test_lightbox_dom_lifecycle_hides_and_restores_focus_for_every_close_path():
         "contract.openLightbox('blob:short','短视频关键帧');"
         "const box=doc.body.querySelector('.lightbox');const close=box.querySelector('.lightbox-close');"
         "const shortOpened={hidden:box.hidden,closeFocused:doc.activeElement===close};"
+        "shortOrigin.focus();const tab={type:'keydown',key:'Tab',defaultPrevented:false,"
+        "preventDefault(){this.defaultPrevented=true}};doc.dispatchEvent(tab);"
+        "const tabTrapped={prevented:tab.defaultPrevented,closeFocused:doc.activeElement===close};"
+        "shortOrigin.focus();const shiftTab={type:'keydown',key:'Tab',shiftKey:true,defaultPrevented:false,"
+        "preventDefault(){this.defaultPrevented=true}};doc.dispatchEvent(shiftTab);"
+        "const shiftTabTrapped={prevented:shiftTab.defaultPrevented,closeFocused:doc.activeElement===close};"
         "box.dispatchEvent({type:'click'});"
         "const backgroundClosed={hidden:box.hidden,focusRestored:doc.activeElement===shortOrigin};"
         "const sentinel=doc.createElement('button');doc.body.appendChild(sentinel);sentinel.focus();contract.closeLightbox();"
@@ -332,11 +338,13 @@ def test_lightbox_dom_lifecycle_hides_and_restores_focus_for_every_close_path():
         "const cleared={hidden:box.hidden,expanded:stale.getAttribute('aria-expanded'),"
         "src:box.querySelector('img').getAttribute('src')||null,"
         "alt:box.querySelector('img').getAttribute('alt')||null,focusLeftDialog:doc.activeElement===doc.body};"
-        "return {shortOpened,backgroundClosed,backgroundCleared,buttonClosed,buttonCleared,"
+        "return {shortOpened,tabTrapped,shiftTabTrapped,backgroundClosed,backgroundCleared,buttonClosed,buttonCleared,"
         "segmentOpened,escapeClosed,cleared}})()"
     )
     assert result == {
         "shortOpened": {"hidden": False, "closeFocused": True},
+        "tabTrapped": {"prevented": True, "closeFocused": True},
+        "shiftTabTrapped": {"prevented": True, "closeFocused": True},
         "backgroundClosed": {"hidden": True, "focusRestored": True},
         "backgroundCleared": True,
         "buttonClosed": {"hidden": True, "focusRestored": True, "bubbled": 0},
