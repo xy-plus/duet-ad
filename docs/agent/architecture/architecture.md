@@ -103,7 +103,7 @@ flowchart LR
 
 历史长会话若 `fit_required=null` 且尚未冻结提交，detail 与 submit 从通过路径和哈希校验的 plan anchors 纯派生，不由 GET 改写 meta；不完整或越界 plan 返回未知并在付费前拒绝。plan、prompt 与 anchors 都以单次读取的 SHA-bound bytes 快照完成解析、比例判断、画幅派生和 H3 请求构造，路径随后变化不能替换已验证的付费输入。若会话已有 generation/frozen receipt，则以已冻结 `fit_mode` 投影有效值，保持 active、failed 和 resume 请求的原 CAS，不重写输入。
 
-同一镜头切出的 `continue` 段使用上一成功生成段的精确尾帧作为本段首帧，当前源片段末帧作为目标尾帧；`hard_cut` 段用自身源首尾锚点开始新链。每段都有统一连续性约束和本段局部提示词，但这只是最佳努力约束，不是供应商原生 extend，也不承诺逐帧无缝。
+同一镜头切出的 `continue` 段在快速模式关闭时，使用上一成功成片的精确尾帧作为本段首帧；开启时，使用前一分段 plan 经 SHA 绑定并按同一 `fit_mode` 处理的冻结 last-frame bytes，不等待或读取 `generated.mp4`。当前源片段末帧仍是目标尾帧；`hard_cut` 段用自身源首尾锚点开始新链。两种模式都只是最佳努力约束，不是供应商原生 extend，也不承诺逐帧无缝。
 
 ## H3 付费状态机
 
