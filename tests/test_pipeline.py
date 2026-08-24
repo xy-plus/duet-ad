@@ -126,6 +126,116 @@ def test_long_scene_bounds_do_not_hide_a_real_terminal_gap(tmp_path):
     assert caught.value.code == "long_video_invalid_scenes"
 
 
+def test_run_converges_container_duration_to_visual_manifest_timeline(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "", "clip.mp4")
+    cdir = settings.data_dir / meta["id"]
+    (cdir / "source.mp4").write_bytes(b"fake")
+    storage.update_meta(
+        settings.data_dir, meta["id"], duration_s=16.787007,
+        dialogue_mode="auto", voice_mode="keep",
+    )
+    captured = {}
+
+    def fake_cmd(argv, *, timeout, step, cwd=None):
+        if step == "extract":
+            work = Path(argv[argv.index("--out-dir") + 1])
+            (work / "manifest.json").write_text(
+                json.dumps({"duration_seconds": 16.766667}), encoding="utf-8"
+            )
+            (work / "contact_sheet.jpg").write_bytes(b"sheet")
+
+    def fake_write(root, *, source, duration_s, segments, workflow):
+        captured["duration_s"] = duration_s
+        captured["segments"] = segments
+        path = root / long_video.PLAN_RECEIPT_FILENAME
+        path.write_text("{}", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(
+        storage, "probe_video",
+        lambda _path: storage.VideoProbe(16.766667, 1080, 1920),
+    )
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(pipeline, "_voice_step", lambda *_a, **_kw: [])
+    monkeypatch.setattr(pipeline, "_detect_segments", lambda *_a, **_kw: [])
+    (cdir / "work" / "scenes.json").write_text(
+        json.dumps({
+            "duration_s": 16.767,
+            "scenes": [{"start_s": 0.0, "end_s": 16.767}],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline, "_process_segment",
+        lambda _settings, _work, _source, seg, _runner, lines, _lang,
+               new_input_contract: {
+            **seg, "keyframes": [], "prompt": "p", "dialogue": lines or [],
+        },
+    )
+    monkeypatch.setattr(long_video, "write_plan_receipt", fake_write)
+
+    pipeline.run(settings, meta["id"], object())
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["duration_s"] == 16.766667
+    assert captured["duration_s"] == 16.766667
+    assert captured["segments"][-1]["end_s"] == 16.766667
+
+
+def test_run_does_not_reprobe_or_rewrite_frozen_generation(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "", "clip.mp4")
+    cdir = settings.data_dir / meta["id"]
+    (cdir / "source.mp4").write_bytes(b"fake")
+    original_generation = {"status": "succeeded", "attempt": 1}
+    storage.update_meta(
+        settings.data_dir, meta["id"], status="done", duration_s=9.5,
+        generation=original_generation,
+    )
+    monkeypatch.setattr(
+        storage, "probe_video",
+        lambda _path: (_ for _ in ()).throw(AssertionError("must stay frozen")),
+    )
+
+    pipeline.run(settings, meta["id"], object())
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done"
+    assert stored["duration_s"] == 9.5
+    assert stored["generation"] == original_generation
+
+
+def test_run_rechecks_300_second_gate_after_manifest(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "", "clip.mp4")
+    cdir = settings.data_dir / meta["id"]
+    (cdir / "source.mp4").write_bytes(b"fake")
+    storage.update_meta(settings.data_dir, meta["id"], duration_s=300.0)
+
+    def fake_cmd(argv, *, timeout, step, cwd=None):
+        assert step == "extract"
+        work = Path(argv[argv.index("--out-dir") + 1])
+        (work / "manifest.json").write_text(
+            json.dumps({"duration_seconds": 300.001}), encoding="utf-8"
+        )
+
+    monkeypatch.setattr(
+        storage, "probe_video",
+        lambda _path: storage.VideoProbe(300.0, 320, 240),
+    )
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
+
+    pipeline.run(settings, meta["id"], object())
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "failed"
+    assert stored["error"] == "long_video_duration_exceeded"
+
+
 @pytest.fixture
 def fake_steps(monkeypatch):
     """mock 掉 extract 子进程与 codex；返回调用记录。"""
@@ -136,7 +246,9 @@ def fake_steps(monkeypatch):
         if step == "extract":
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
-            (work / "manifest.json").write_text("{}")
+            (work / "manifest.json").write_text(
+                json.dumps({"duration_seconds": 1.0})
+            )
         elif step == "scenes":
             work = Path(argv[argv.index("--work-dir") + 1])
             (work / "scenes.json").write_text(

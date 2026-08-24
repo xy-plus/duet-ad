@@ -53,7 +53,7 @@ multipart 字段：
 | `voice_mode` | `keep/rewrite/translate`，默认 `keep`；只控制 auto 输入准备 |
 | `target_language` | `voice_mode=translate` 时必填；其他模式忽略 |
 
-新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长为正有限数且不超过 300 秒；文件大小默认 ≤500MB。无音轨合法。`>10s` 只接受 `voice_mode=keep`，否则 422 `long_video_audio_mode_unsupported`。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
+新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长是 `v:0` 视觉时长：优先 `stream.duration`，其次 `duration_ts*time_base`，最后用可解码的帧数/FPS；不得使用音轨或 `format.duration` 补长。该值须正有限且不超过 300 秒；文件大小默认 ≤500MB。无音轨合法。`>10s` 只接受 `voice_mode=keep`，否则 422 `long_video_audio_mode_unsupported`。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
 
 ### `GET /api/conversations/{cid}`
 
@@ -234,7 +234,7 @@ multipart 字段：
 | `created_at`, `updated_at` | str | ISO-8601 UTC |
 | `keyframes`, `prompt` | list[str], str/null | 准备产物 |
 | `voice_mode` | str | 创建阶段 auto 的 keep/rewrite/translate 方式 |
-| `duration_s` | float/null | ffprobe 实际时长 |
+| `duration_s` | float/null | ffprobe `v:0` 视觉时长；音频/容器时长不参与画面规划和门禁 |
 | `fit_required` | bool/null | pipeline done 时按实际选中关键帧计算，任一非 9:16 即 true |
 | `dialogue_mode` | str | 默认 auto；最终提交选择 |
 | `generation` | object/null | coarse H3 attempt 状态 |
@@ -330,7 +330,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 
 输出下载门禁：只接受无 userinfo 的 HTTPS；hostname/IP 预解析必须全为公网地址，私网、loopback、local、reserved、multicast 均确定拒绝。owned httpx client 使用 `trust_env=false`；响应后在读取 status/body 前通过 `extensions.network_stream.get_extra_info("server_addr")` 验证实际 socket peer 也是公网地址。实际 peer 为私网仍是 `download_url_rejected`；DNS 临时失败为 `download_dns_failed`，缺失/异常/非 IP peer 为 `download_peer_unverified`，后二者同 id 恢复。
 
-显式不跟随 3xx；Content-Length 和实际流都不得超过 `200 * 1024 * 1024` 字节。内容先以 0600 写同目录临时文件。ffprobe 缺失、OS 错误或超时为可恢复 `output_probe_failed`；ffprobe 正常执行但媒体无法解析、无 video stream 或时长非正有限值为确定失败 `download_invalid_video`。验证通过后才 `os.replace`、目录 fsync。状态只保存输出 name/SHA-256/size，不保存 URL。
+显式不跟随 3xx；Content-Length 和实际流都不得超过 `200 * 1024 * 1024` 字节。内容先以 0600 写同目录临时文件。ffprobe 缺失、OS 错误或超时为可恢复 `output_probe_failed`；ffprobe 正常执行但媒体无法解析、无 `v:0` 或其 `duration`/`duration_ts*time_base` 非正有限为确定失败 `download_invalid_video`。验证通过后才 `os.replace`、目录 fsync。状态只保存输出 name/SHA-256/size，不保存 URL。
 
 ## Python 公开接口
 

@@ -17,6 +17,29 @@ from app import h3
 VOICE_TEXTS = ("第一句台词", "第二句台词")
 
 
+@pytest.mark.parametrize(
+    "stream,expected",
+    [
+        ({"codec_type": "video", "duration": "1.25"}, True),
+        ({"codec_type": "video", "duration_ts": "30", "time_base": "1/24"}, True),
+        ({"codec_type": "video", "duration": "0"}, False),
+        ({"codec_type": "video"}, False),
+        ({"codec_type": "audio", "duration": "2"}, False),
+    ],
+)
+def test_download_probe_requires_positive_visual_stream_duration(
+    tmp_path, monkeypatch, stream, expected,
+):
+    completed = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=json.dumps({
+            "format": {"duration": "99"}, "streams": [stream],
+        }), stderr="",
+    )
+    monkeypatch.setattr(h3.subprocess, "run", lambda *_a, **_kw: completed)
+    assert h3._probe_video(tmp_path / "generated.mp4", 1) is expected
+
+
 def _request(tmp_path: Path, *, request_id: str = "request-1") -> h3.H3Request:
     first = tmp_path / "01.png"
     second = tmp_path / "02.png"

@@ -198,7 +198,7 @@ SAMPLE_10=/absolute/path/to/10s.mp4
 SAMPLE_15=/absolute/path/to/15s.mp4
 SAMPLE_30=/absolute/path/to/30s.mp4
 for sample in "$SAMPLE_10" "$SAMPLE_15" "$SAMPLE_30"; do
-  ffprobe -v error -show_entries format=duration \
+  ffprobe -v error -select_streams v:0 -show_entries stream=duration,duration_ts,time_base \
     -of default=noprint_wrappers=1:nokey=1 "$sample"
 done
 
@@ -230,7 +230,7 @@ CID_30='replace-with-30s-cid'
 for cid in "$CID_10" "$CID_15" "$CID_30"; do
   output="data/$cid/generated.mp4"
   test -s "$output"
-  ffprobe -v error -show_entries format=duration \
+  ffprobe -v error -select_streams v:0 -show_entries stream=duration,duration_ts,time_base \
     -of default=noprint_wrappers=1:nokey=1 "$output"
   ffprobe -v error -select_streams v:0 \
     -show_entries stream=codec_name,pix_fmt,r_frame_rate \

@@ -77,6 +77,41 @@ def probe_audio(video: Path) -> bool | None:
         return None
 
 
+def probe_video_duration(video: Path, decoded_duration: float) -> float:
+    """Return the v:0 visual timeline; decoded metadata is the final fallback."""
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        command = [
+            ffprobe, "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=duration,duration_ts,time_base",
+            "-of", "json", str(video),
+        ]
+        try:
+            completed = subprocess.run(
+                command, check=True, capture_output=True, text=True, timeout=30
+            )
+            stream = (json.loads(completed.stdout or "{}").get("streams") or [])[0]
+            try:
+                candidate = float(stream.get("duration"))
+                if math.isfinite(candidate) and candidate > 0:
+                    return candidate
+            except (TypeError, ValueError):
+                pass
+            try:
+                ticks = float(stream.get("duration_ts"))
+                numerator, denominator = str(stream.get("time_base")).split("/", 1)
+                candidate = ticks * float(numerator) / float(denominator)
+                if math.isfinite(candidate) and candidate > 0:
+                    return candidate
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError, IndexError):
+            pass
+    if math.isfinite(decoded_duration) and decoded_duration > 0:
+        return decoded_duration
+    raise SystemExit("Could not determine the video stream duration.")
+
+
 def write_image(path: Path, frame: np.ndarray, extension: str, params: list[int] | None = None) -> None:
     success, encoded = cv2.imencode(extension, frame, params or [])
     if not success:
@@ -178,7 +213,8 @@ def main() -> int:
         capture.release()
         raise SystemExit("Video metadata is incomplete or invalid.")
 
-    duration = frame_count / fps
+    decoded_duration = frame_count / fps
+    duration = probe_video_duration(video, decoded_duration)
     last_safe_time = max(0.0, duration - (1.0 / fps))
     if args.times:
         times = parse_times(args.times)
