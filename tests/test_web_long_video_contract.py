@@ -1,4 +1,4 @@
-from test_web_h3_contract import APP_JS, _run_contract
+from test_web_h3_contract import APP_JS, ROOT, _run_contract
 
 
 def test_long_video_task_count_comes_from_frozen_plan():
@@ -214,15 +214,19 @@ def test_published_video_does_not_hide_stitch_recovery():
     assert "if (showPublishedVideo && !showStitchRecovery) return" in branch
 
 
-def test_long_segment_prompt_copy_is_explicitly_frozen():
+def test_removed_frozen_prompt_display_copy_does_not_change_submit_or_cost_copy():
+    removed_copy = "逐段冻结的" + " H3 提示词"
+    offenders = []
+    for suffix in ("*.js", "*.html", "*.css", "*.md", "*.py"):
+        for path in ROOT.rglob(suffix):
+            if removed_copy in path.read_text(encoding="utf-8"):
+                offenders.append(str(path.relative_to(ROOT)))
+    assert offenders == []
+
     source = APP_JS.read_text(encoding="utf-8")
-    assert "逐段冻结的 H3 提示词将提交生成" in source
+    assert "各段 H3 提示词将提交生成" in source
     assert "H3 源提示词将直接提交生成" in source
-    assert (
-        ': longContract.isLong\n'
-        '      ? "逐段冻结的 H3 提示词将提交生成"\n'
-        '      : "H3 源提示词将直接提交生成"'
-    ) in source
+    assert "个付费 H3 子任务" in source
 
 
 def test_segment_disclosure_state_defaults_collapsed_and_toggles_both_ways():
@@ -271,6 +275,24 @@ def test_long_segment_prompt_and_keyframes_use_accessible_disclosures_only():
     assert "setDisclosureState(button, null, false" in grid
     assert "openLightbox(img.src, img.alt, button)" in grid
     assert 'trigger.setAttribute("aria-expanded", String(expanded))' in source
+
+
+def test_long_segment_dialogue_reuses_disclosure_and_omits_empty_toggle():
+    source = APP_JS.read_text(encoding="utf-8")
+    branch = source.split("function renderSegments(detail)", 1)[1]
+    branch = branch.split("/* 关键帧放大查看", 1)[0]
+    assert "if (Array.isArray(seg.lines) && seg.lines.length)" in branch
+    assert "segmentDialogueDisclosure(seg.lines, n)" in branch
+
+    disclosure = source.split("function segmentDisclosure", 1)[1]
+    disclosure = disclosure.split("function sourcePromptEditable", 1)[0]
+    assert 'el("button", "segment-prompt-toggle")' in disclosure
+    assert 'button.type = "button"' in disclosure
+    assert 'panel.id = "segment-disclosure-" + (++disclosureSeq)' in disclosure
+    assert 'button.setAttribute("aria-controls", panel.id)' in disclosure
+    assert "setDisclosureState(button, panel, false, labels)" in disclosure
+    assert 'expandText: "展开段台词"' in disclosure
+    assert 'collapseText: "收起段台词"' in disclosure
 
 
 def test_lightbox_dom_lifecycle_hides_and_restores_focus_for_every_close_path():
