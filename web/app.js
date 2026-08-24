@@ -475,6 +475,7 @@ function closeDrawer() {
 
 /* ===== Stream 渲染 ===== */
 function clearStream() {
+  closeLightbox({ restoreFocus: false });
   revokeURLs();
   $("stream").textContent = "";
 }
@@ -1307,16 +1308,22 @@ function renderSegments(detail) {
 /* 关键帧放大查看：点击开、点任意处或 Esc 关 */
 let lightboxEl = null;
 let activeLightboxDisclosure = null;
+let lightboxReturnFocus = null;
 
 function openLightbox(src, alt, trigger = null) {
   if (!lightboxEl) {
     lightboxEl = el("div", "lightbox");
     lightboxEl.setAttribute("role", "dialog");
     lightboxEl.setAttribute("aria-label", "查看大图");
+    lightboxEl.setAttribute("aria-modal", "true");
+    lightboxEl.hidden = true;
     const close = el("button", "lightbox-close", "×");
     close.type = "button";
     close.setAttribute("aria-label", "关闭大图");
-    close.addEventListener("click", closeLightbox);
+    close.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeLightbox();
+    });
     lightboxEl.appendChild(close);
     lightboxEl.appendChild(el("img"));
     lightboxEl.addEventListener("click", closeLightbox);
@@ -1336,23 +1343,38 @@ function openLightbox(src, alt, trigger = null) {
   if (activeLightboxDisclosure) {
     setDisclosureState(trigger, null, true, activeLightboxDisclosure.labels);
   }
+  const focusOrigin = trigger || document.activeElement;
+  lightboxReturnFocus = focusOrigin && typeof focusOrigin.focus === "function"
+    ? focusOrigin : null;
   const img = lightboxEl.querySelector("img");
-  img.src = src;
-  img.alt = alt || "";
+  img.setAttribute("src", src);
+  img.setAttribute("alt", alt || "");
+  lightboxEl.hidden = false;
   lightboxEl.classList.add("is-open");
   document.addEventListener("keydown", onLightboxKey);
   lightboxEl.querySelector(".lightbox-close").focus();
 }
 
-function closeLightbox() {
-  if (!lightboxEl) return;
+function closeLightbox({ restoreFocus = true } = {}) {
+  if (!lightboxEl || lightboxEl.hidden) return;
   lightboxEl.classList.remove("is-open");
+  lightboxEl.hidden = true;
   document.removeEventListener("keydown", onLightboxKey);
+  const img = lightboxEl.querySelector("img");
+  img.removeAttribute("src");
+  img.removeAttribute("alt");
   if (activeLightboxDisclosure) {
     const disclosure = activeLightboxDisclosure;
     activeLightboxDisclosure = null;
     setDisclosureState(disclosure.trigger, null, false, disclosure.labels);
-    disclosure.trigger.focus();
+  }
+  const focusTarget = lightboxReturnFocus;
+  lightboxReturnFocus = null;
+  if (restoreFocus && focusTarget && focusTarget.isConnected !== false) {
+    focusTarget.focus();
+  } else {
+    const active = document.activeElement;
+    if (active && lightboxEl.contains(active) && typeof active.blur === "function") active.blur();
   }
 }
 
@@ -2082,6 +2104,8 @@ if (typeof module !== "undefined" && module.exports) {
     buildSubmitPayload,
     apiErrorFromPayload,
     canOperate,
+    clearStream,
+    closeLightbox,
     detailSignature,
     formatDialogueLines,
     generationDraft,
@@ -2091,6 +2115,7 @@ if (typeof module !== "undefined" && module.exports) {
     longVideoContract,
     normalizeDialogueLines,
     parseDialogueLines,
+    openLightbox,
     setDisclosureState,
   };
 }

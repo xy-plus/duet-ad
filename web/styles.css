@@ -728,6 +728,8 @@ input, textarea { font-family: inherit; }
   transition: opacity .18s ease;
 }
 
+.lightbox[hidden] { display: none; }
+
 .lightbox.is-open { opacity: 1; pointer-events: auto; }
 
 .lightbox img {
