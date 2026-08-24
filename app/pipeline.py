@@ -724,6 +724,18 @@ def _manifest_duration(work: Path) -> float:
     return duration
 
 
+def _validate_calibrated_duration(meta: dict, duration_s: float) -> float:
+    """Apply every gate whenever the authoritative visual duration changes."""
+    long_video.plan_segments(duration_s, [], [])
+    duration = float(duration_s)
+    if (
+        duration > long_video.SHORT_VIDEO_MAX_S
+        and meta.get("voice_mode") != "keep"
+    ):
+        raise PipelineError("long_video_audio_mode_unsupported")
+    return duration
+
+
 def _cut_segment(source: Path, start_s: float, end_s: float, segdir: Path) -> None:
     """ffmpeg 按段边界切源视频（-ss 在 -i 前重编码）+ ffprobe 验证切出时长误差 <0.1s。"""
     segdir.mkdir(parents=True, exist_ok=True)
@@ -1062,7 +1074,7 @@ def run(settings: Settings, cid: str, runner) -> None:
                 probed_duration = storage.probe_video(source).duration_s
             except storage.UploadError as exc:
                 raise PipelineError(str(exc)) from None
-            long_video.plan_segments(probed_duration, [], [])
+            probed_duration = _validate_calibrated_duration(meta, probed_duration)
             meta = storage.update_meta(
                 settings.data_dir, cid, duration_s=probed_duration
             ) or meta
@@ -1077,7 +1089,7 @@ def run(settings: Settings, cid: str, runner) -> None:
         )
         if new_input_contract:
             manifest_duration = _manifest_duration(work)
-            long_video.plan_segments(manifest_duration, [], [])
+            manifest_duration = _validate_calibrated_duration(meta, manifest_duration)
             meta = storage.update_meta(
                 settings.data_dir, cid, duration_s=manifest_duration
             ) or meta
