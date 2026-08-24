@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 300" role="img" aria-label="窗边人物端起咖啡">
+  <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#5d6466"/><stop offset="1" stop-color="#d7d0c5"/></linearGradient></defs>
+  <rect width="480" height="300" fill="url(#bg)"/>
+  <rect x="285" width="195" height="235" fill="#ece8df" opacity=".78"/>
+  <path d="M348 0v235M414 0v235M285 78h195M285 156h195" stroke="#98958f" stroke-width="5"/>
+  <circle cx="182" cy="86" r="41" fill="#c8a88f"/>
+  <path d="M117 270c8-104 25-139 69-139s69 54 77 139Z" fill="#34383a"/>
+  <path d="M224 176c42 0 59 15 77 36" fill="none" stroke="#c8a88f" stroke-width="18" stroke-linecap="round"/>
+  <rect x="293" y="191" width="48" height="40" rx="9" fill="#f1ede6"/>
+</svg>

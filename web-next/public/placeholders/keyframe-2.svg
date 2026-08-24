@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 300" role="img" aria-label="木桌上的咖啡杯特写">
+  <defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#e8ded2"/><stop offset="1" stop-color="#9c795f"/></linearGradient></defs>
+  <rect width="480" height="300" fill="url(#bg)"/>
+  <ellipse cx="250" cy="246" rx="170" ry="28" fill="#4a382d" opacity=".25"/>
+  <path d="M155 96h170l-18 131c-3 24-111 24-115 0Z" fill="#eee9e1"/>
+  <ellipse cx="240" cy="98" rx="85" ry="22" fill="#f8f5ef"/>
+  <ellipse cx="240" cy="101" rx="69" ry="16" fill="#604536"/>
+  <path d="M325 127c63-8 64 76 8 80" fill="none" stroke="#eee9e1" stroke-width="18"/>
+  <path d="M218 101c14-12 29-9 44 0-10 10-30 12-44 0Z" fill="#d8c5aa"/>
+</svg>

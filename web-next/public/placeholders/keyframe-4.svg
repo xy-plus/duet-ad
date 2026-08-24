@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 300" role="img" aria-label="咖啡产品与品牌文字定格">
+  <defs><radialGradient id="bg"><stop stop-color="#eee8df"/><stop offset="1" stop-color="#9c948a"/></radialGradient></defs>
+  <rect width="480" height="300" fill="url(#bg)"/>
+  <ellipse cx="240" cy="257" rx="135" ry="18" fill="#32302f" opacity=".18"/>
+  <path d="M180 62h120l-14 174c-2 20-90 20-92 0Z" fill="#efeae2"/>
+  <rect x="191" y="112" width="98" height="77" rx="4" fill="#393a3b"/>
+  <text x="240" y="143" fill="#efebe5" font-family="sans-serif" font-size="13" text-anchor="middle">DUET</text>
+  <text x="240" y="164" fill="#efebe5" font-family="sans-serif" font-size="10" text-anchor="middle">MORNING BLEND</text>
+  <path d="M300 90c40 0 51 58 7 69" fill="none" stroke="#ece7df" stroke-width="14"/>
+</svg>

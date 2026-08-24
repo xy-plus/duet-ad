@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 300" role="img" aria-label="清晨城市街道中的咖啡店">
+  <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#d8d2ca"/><stop offset="1" stop-color="#77736f"/></linearGradient></defs>
+  <rect width="480" height="300" fill="url(#bg)"/>
+  <circle cx="385" cy="70" r="48" fill="#f3e8cc" opacity=".8"/>
+  <path d="M0 230 150 118l116 112 84-84 130 84v70H0Z" fill="#353638" opacity=".72"/>
+  <rect x="52" y="135" width="150" height="98" rx="5" fill="#ece7df" opacity=".8"/>
+  <rect x="72" y="158" width="50" height="75" fill="#7c6656"/>
+  <text x="142" y="177" fill="#343434" font-family="sans-serif" font-size="18" text-anchor="middle">COFFEE</text>
+</svg>
