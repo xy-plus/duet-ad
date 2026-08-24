@@ -86,6 +86,13 @@ def _post(c, cid, options, confirm=True):
                   json={"options": options, "confirm": confirm})
 
 
+def _file_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in root.rglob("*") if path.is_file()
+    }
+
+
 # ---------- 门控矩阵 ----------
 
 def test_requires_auth(client, video_1s):
@@ -117,7 +124,7 @@ def test_confirm_required_409(enabled, monkeypatch):
     cid = _make_conv(settings)
     monkeypatch.setattr(postprocess.seedream, "edit_image",
                         lambda *a, **k: pytest.fail("edit must not be called"))
-    for body in ({}, {"options": OPTIONS_SUB}, {"options": OPTIONS_SUB, "confirm": False},
+    for body in ({"options": OPTIONS_SUB, "confirm": False},
                  {"options": OPTIONS_SUB, "confirm": "true"}, {"options": OPTIONS_SUB, "confirm": 1}):
         r = c.post(f"/api/conversations/{cid}/postprocess", headers=AUTH, json=body)
         assert r.status_code == 409, body
@@ -128,8 +135,7 @@ def test_no_options_422(enabled):
     settings, c = enabled
     cid = _make_conv(settings)
     empty = {"remove_subtitle": False, "remove_brand": False}
-    for body in ({"confirm": True},
-                 {"options": {}, "confirm": True},
+    for body in ({"options": {}, "confirm": True},
                  {"options": empty, "confirm": True}):
         r = c.post(f"/api/conversations/{cid}/postprocess", headers=AUTH, json=body)
         assert r.status_code == 422, body
@@ -145,15 +151,83 @@ def test_options_non_bool_422(enabled):
     assert r.json() == {"detail": "options must be booleans"}
 
 
-@pytest.mark.parametrize("face_hold", [False, True])
-def test_face_hold_is_unknown_option_422(enabled, face_hold):
-    """退役选项即使为 false 或与合法选项并存也必须 fail closed，不能静默接受。"""
+@pytest.mark.parametrize(
+    ("legacy_key", "legacy_value"),
+    [("change_bg", True), ("change_bg", False), ("face_hold", True), ("face_hold", False)],
+)
+def test_known_stale_postprocess_options_require_refresh_without_side_effects(
+    enabled, monkeypatch, legacy_key, legacy_value
+):
     settings, c = enabled
     cid = _make_conv(settings)
-    r = _post(c, cid, {**OPTIONS_SUB, "face_hold": face_hold})
+    cdir = settings.data_dir / cid
+    before = _file_snapshot(cdir)
+    calls = []
+    monkeypatch.setattr(
+        postprocess.seedream, "edit_image",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    r = _post(c, cid, {**OPTIONS_SUB, legacy_key: legacy_value})
+
+    assert r.status_code == 409
+    assert r.json() == {"detail": "页面版本已更新，请刷新页面后重试。"}
+    assert calls == []
+    assert _file_snapshot(cdir) == before
+
+
+@pytest.mark.parametrize(
+    ("options", "detail"),
+    [
+        ({**OPTIONS_SUB, "future_option": True}, "unknown options: future_option"),
+        (
+            {**OPTIONS_SUB, "face_hold": True, "future_option": True},
+            "unknown options: face_hold, future_option",
+        ),
+    ],
+)
+def test_other_unknown_postprocess_option_remains_fail_closed(
+    enabled, options, detail
+):
+    settings, c = enabled
+    cid = _make_conv(settings)
+    r = _post(c, cid, options)
     assert r.status_code == 422
-    assert r.json() == {"detail": "unknown options: face_hold"}
-    assert storage.load_meta(settings.data_dir, cid).get("postprocess") is None
+    assert r.json() == {"detail": detail}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"confirm": True},
+        {"options": OPTIONS_SUB},
+        {"confirm": True, "options": OPTIONS_SUB, "unexpected": True},
+    ],
+)
+def test_invalid_postprocess_top_level_shape_is_rejected_before_write_or_provider(
+    enabled, monkeypatch, body
+):
+    settings, c = enabled
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    before = _file_snapshot(cdir)
+    calls = []
+    monkeypatch.setattr(
+        postprocess.seedream, "edit_image",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    r = c.post(
+        f"/api/conversations/{cid}/postprocess",
+        headers=AUTH,
+        json=body,
+    )
+
+    assert r.status_code == 422
+    assert r.json() == {"detail": "invalid_postprocess_request"}
+    assert calls == []
+    assert _file_snapshot(cdir) == before
 
 
 def test_not_done_409(enabled, monkeypatch):
@@ -337,6 +411,40 @@ def test_concurrent_start_single_runner(tmp_path, monkeypatch):
     assert storage.load_meta(settings.data_dir, cid)["postprocess"]["status"] == "running"
 
 
+def test_options_lock_is_rechecked_inside_lock_without_writing(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    before = _file_snapshot(cdir)
+    initial = storage.load_meta(settings.data_dir, cid)
+    locked = {
+        **initial,
+        "postprocess": {
+            "status": "done",
+            "options": OPTIONS_BRAND,
+            "frames": [],
+            "error": None,
+        },
+    }
+    reads = iter((initial, locked))
+    monkeypatch.setattr(postprocess.storage, "load_meta", lambda *_args: next(reads))
+
+    with pytest.raises(postprocess.PostprocessError) as caught:
+        asyncio.run(postprocess.start(
+            settings,
+            cid,
+            {"confirm": True, "options": OPTIONS_SUB},
+            {},
+        ))
+
+    assert caught.value.status == 409
+    assert caught.value.detail == {
+        "code": "postprocess_options_locked",
+        "message": "后处理选项已锁定，请刷新页面后按原选项重试。",
+    }
+    assert _file_snapshot(cdir) == before
+
+
 # ---------- files 接口（前端取图路径） ----------
 
 def test_files_endpoint_serves_postprocessed(enabled):
@@ -370,7 +478,10 @@ def test_rerun_different_options_409(enabled, monkeypatch):
     other = {"remove_subtitle": True, "remove_brand": True}
     r = _post(c, cid, other)
     assert r.status_code == 409
-    assert r.json() == {"detail": "options changed since last run"}
+    assert r.json() == {"detail": {
+        "code": "postprocess_options_locked",
+        "message": "后处理选项已锁定，请刷新页面后按原选项重试。",
+    }}
     assert len(fake.calls) == 2  # 未产生新编辑
 
     # 同选项重跑：跳过已有优化图，正常 200 done
@@ -410,7 +521,10 @@ def test_legacy_change_bg_in_meta_options_rerun_no_409(enabled, monkeypatch):
     # 共有键真变了仍然 409：兼容比对不放松锁定
     r = _post(c, cid, OPTIONS_BRAND)
     assert r.status_code == 409
-    assert r.json() == {"detail": "options changed since last run"}
+    assert r.json() == {"detail": {
+        "code": "postprocess_options_locked",
+        "message": "后处理选项已锁定，请刷新页面后按原选项重试。",
+    }}
 
 
 def test_legacy_pure_change_bg_rerun_clears_artifacts_and_reedits(enabled, monkeypatch):

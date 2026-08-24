@@ -26,6 +26,51 @@ def test_upload_ok(client, video_1s, settings):
     assert meta["status"] == "queued"
 
 
+def test_stale_none_voice_mode_requires_refresh_without_creating_upload(
+    client, video_1s, settings
+):
+    with open(video_1s, "rb") as source:
+        response = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            files={"file": ("clip.mp4", source, "video/mp4")},
+            data={"voice_mode": "none"},
+        )
+    assert response.status_code == 409
+    assert response.json() == {"detail": "页面版本已更新，请刷新页面后重试。"}
+    assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+
+
+def test_upload_rejects_unknown_multipart_field_without_creating_upload(
+    client, video_1s, settings
+):
+    with open(video_1s, "rb") as source:
+        response = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            files={"file": ("clip.mp4", source, "video/mp4")},
+            data={"unexpected": "value"},
+        )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid_create_request"}
+    assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+
+
+def test_stale_none_voice_mode_with_unknown_field_is_not_misclassified(
+    client, video_1s, settings
+):
+    with open(video_1s, "rb") as source:
+        response = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            files={"file": ("clip.mp4", source, "video/mp4")},
+            data={"voice_mode": "none", "unexpected": "value"},
+        )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid_create_request"}
+    assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+
+
 def test_upload_uppercase_ext_ok(client, video_1s):
     with open(video_1s, "rb") as f:
         r = client.post("/api/conversations", headers=AUTH,

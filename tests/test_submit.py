@@ -132,6 +132,37 @@ def test_source_prompt_can_be_cas_edited_before_h3(enabled, monkeypatch):
     assert seen[0].prompt.startswith(replacement)
 
 
+def test_source_prompt_cas_conflict_is_structured_and_does_not_write(enabled):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    _write_initial_receipt(settings, cid)
+    cdir = settings.data_dir / cid
+    tracked = [
+        cdir / "meta.json",
+        cdir / "work" / "visual_prompt.txt",
+        cdir / "work" / "prompt.txt",
+        cdir / prepared_input.RECEIPT_FILENAME,
+    ]
+    before = {path: path.read_bytes() for path in tracked}
+
+    response = client.patch(
+        f"/api/conversations/{cid}/prompt",
+        headers=AUTH,
+        json={
+            "confirm": True,
+            "expected_sha256": "0" * 64,
+            "prompt": "不得覆盖现有提示词。",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {
+        "code": "prompt_changed",
+        "message": "提示词已更新，请刷新页面后重试。",
+    }}
+    assert {path: path.read_bytes() for path in tracked} == before
+
+
 def test_source_prompt_is_frozen_once_h3_session_exists(enabled):
     settings, client = enabled
     cid, _ = _make_conv(settings)

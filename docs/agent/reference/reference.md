@@ -3,7 +3,7 @@ name: h3-runtime
 type: reference
 status: done
 owner: agent
-updated: 2026-08-21
+updated: 2026-08-24
 tdd: N/A
 links: [conversation-task, app/main.py, app/h3.py, app/prepared_input.py, app/long_generation.py]
 ---
@@ -13,7 +13,7 @@ links: [conversation-task, app/main.py, app/h3.py, app/prepared_input.py, app/lo
 ## HTTP 通则
 
 - `/api/health`、`/api/login` 无需鉴权；其余 `/api/conversations*` 使用 `Authorization: Bearer <ACCESS_TOKEN>`。
-- JSON 错误为 `{"detail":"<safe message>"}`。供应商响应正文、URL、token 和本机路径不作为公开错误。
+- JSON 错误 detail 为安全字符串或 `{code,message}`。结构化冲突只公开固定 code/中文提示；供应商响应正文、URL、token 和本机路径不作为公开错误。
 - H3 提交是 202 + 轮询；`POST /submit` 不等待最终视频。
 
 ### `GET /api/health`
@@ -22,7 +22,7 @@ links: [conversation-task, app/main.py, app/h3.py, app/prepared_input.py, app/lo
 
 ### `POST /api/login`
 
-请求 `{"token":"..."}`。匹配 `ACCESS_TOKEN` 返回 `200 {"ok":true}`，否则 401 `invalid token`。
+请求只能是 `{"token":"..."}`。额外键或非字符串 token 返回 422 `invalid_login_request`；字符串不匹配 `ACCESS_TOKEN` 返回 401 `invalid token`；匹配返回 `200 {"ok":true}`。
 
 ### `GET /api/conversations`
 
@@ -52,6 +52,8 @@ multipart 字段：
 | `client_request_id` | 可选，`^[0-9A-Za-z-]{8,64}$`；命中既有创建请求返回 200，不重复入队 |
 | `voice_mode` | `keep/rewrite/translate`，默认 `keep`；只控制 auto 输入准备 |
 | `target_language` | `voice_mode=translate` 时必填；其他模式忽略 |
+
+multipart 只允许表中字段及 `file`，未知或重复字段返回 422 `invalid_create_request`，且不会创建会话。已知旧页面提交 `voice_mode=none` 时返回纯文本中文刷新提示，不写文件、不入队；混入未知字段不会被归为旧页面。
 
 新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长是 `v:0` 视觉时长：优先 `stream.duration`，其次 `duration_ts*time_base`，最后用可解码的帧数/FPS；不得使用音轨或 `format.duration` 补长。该值须正有限且不超过 300 秒；文件大小默认 ≤500MB。无音轨合法。`>10s` 只接受 `voice_mode=keep`，否则 422 `long_video_audio_mode_unsupported`。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
 
@@ -125,7 +127,7 @@ multipart 字段：
 
 ### `PATCH /api/conversations/{cid}/prompt`
 
-请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。该接口只适用于 `≤10s` 短链：在 schema v2、输入准备完成且 H3 attempt 尚未创建时，以 SHA-256 CAS 更新 `work/visual_prompt.txt`，重新机械组合结构化台词并重写 prepared receipt。attempt 已创建后返回 409 `prompt_frozen`。长链的分段提示词已由 plan receipt 逐段绑定，不提供此顶层编辑接口。
+请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。该接口只适用于 `≤10s` 短链：在 schema v2、输入准备完成且 H3 attempt 尚未创建时，以 SHA-256 CAS 更新 `work/visual_prompt.txt`，重新机械组合结构化台词并重写 prepared receipt。CAS 不一致返回结构化 409 `prompt_changed` 和中文刷新提示，不改写 prompt/meta/receipt；attempt 已创建后返回 409 `prompt_frozen`。长链的分段提示词已由 plan receipt 逐段绑定，不提供此顶层编辑接口。
 
 ### `GET /api/conversations/{cid}/files/{name}`
 
@@ -222,7 +224,9 @@ multipart 字段：
 }
 ```
 
-至少一项为 true；未知 option 或非 bool 返回 422。禁用返回 501，旧会话返回 409 `read_only`，输入未 done/正在运行/重跑改变选项返回 409。接受后返回 `{"status":"running","frames":[]}`，detail 的 `postprocess` 轮询到 done/failed。后处理产物不进入 H3 receipt。
+顶层 key 必须恰为 `confirm/options`，未知或缺失返回 422 `invalid_postprocess_request`；至少一项为 true，未知 option 或非 bool 返回 422。已知旧页面 option `change_bg/face_hold` 返回纯文本中文刷新提示，不写状态、不调用供应商；若同时混入其他未知字段仍 fail closed。禁用返回 501，旧会话返回 409 `read_only`，输入未 done/正在运行返回 409；重跑改变锁定选项返回结构化 409 `postprocess_options_locked` 和中文提示。接受后返回 `{"status":"running","frames":[]}`，detail 的 `postprocess` 轮询到 done/failed。后处理产物不进入 H3 receipt。
+
+`/`、`/index.html`、`/app.js`、`/styles.css` 的 GET/HEAD 响应（含条件请求的 304）均带 `Cache-Control: no-store`，避免 HTML、脚本和样式跨版本组合。
 
 ## Conversation meta schema v2
 

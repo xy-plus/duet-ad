@@ -62,10 +62,10 @@ def test_voice_mode_no_audio_is_valid_empty_dialogue_input(client, video_1s, set
 
 
 def test_voice_mode_none_is_retired(client, video_1s, settings):
-    """创建阶段只配置听写处理；最终无台词由提交阶段 dialogue_mode=none 表达。"""
+    """旧页面的 none 不再接受，明确提示刷新；最终无台词由提交 dialogue_mode=none 表达。"""
     r = _post(client, video_1s, {"voice_mode": "none"})
-    assert r.status_code == 422
-    assert "voice_mode" in r.json()["detail"]
+    assert r.status_code == 409
+    assert r.json() == {"detail": "页面版本已更新，请刷新页面后重试。"}
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
 
 

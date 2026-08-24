@@ -1,3 +1,5 @@
+import pytest
+
 from conftest import AUTH
 
 
@@ -40,3 +42,17 @@ def test_login_wrong_token_401(client):
 
 def test_login_missing_token_401(client):
     assert client.post("/api/login", json={}).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"token": "test-token", "unexpected": True},
+        {"token": 123},
+        {"token": None},
+    ],
+)
+def test_login_rejects_extra_keys_and_non_string_tokens(client, payload):
+    response = client.post("/api/login", json=payload)
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid_login_request"}
