@@ -40,12 +40,12 @@ import {
 } from './mockStore';
 
 const { Text, Title, Paragraph } = Typography;
-const languageLabels: Record<string, string> = {
-  English: '英语',
-  Japanese: '日语',
-  Korean: '韩语',
-  Spanish: '西班牙语',
-};
+const languageOptions = [
+  { value: 'English', label: '英语' },
+  { value: 'Japanese', label: '日语' },
+  { value: 'Korean', label: '韩语' },
+  { value: 'Spanish', label: '西班牙语' },
+];
 
 function StatusBadge({ item }: { item: Conversation }) {
   if (item.postStatus === 'running') return <Tag icon={<ClockCircleOutlined />}>后处理中</Tag>;
@@ -206,7 +206,8 @@ function AnalysisSummary({ item, dispatch, onPost }: AnalysisSummaryProps) {
           <Tag variant="filled">
             {item.transcriptMode === 'keep' && '原文保持'}
             {item.transcriptMode === 'rewrite' && '原文改编'}
-            {item.transcriptMode === 'translate' && `翻译为 ${languageLabels[item.targetLanguage] ?? item.targetLanguage}`}
+            {item.transcriptMode === 'translate' &&
+              `翻译为 ${languageOptions.find(({ value }) => value === item.targetLanguage)?.label ?? item.targetLanguage}`}
           </Tag>
         </div>
         <div className="transcript-preview">
@@ -508,12 +509,7 @@ function TaskSender({ item, dispatch }: TaskSenderProps) {
               value={item.targetLanguage}
               disabled={analysisRunning}
               onChange={(language) => dispatch({ type: 'targetLanguage', language })}
-              options={[
-                { value: 'English', label: '英语' },
-                { value: 'Japanese', label: '日语' },
-                { value: 'Korean', label: '韩语' },
-                { value: 'Spanish', label: '西班牙语' },
-              ]}
+              options={languageOptions}
             />
           )}
         </div>
@@ -759,13 +755,7 @@ function Workspace() {
                   placement="start"
                   variant="borderless"
                   rootClassName="assistant-bubble"
-                  content={(
-                    <AnalysisSummary
-                      item={active}
-                      dispatch={dispatch}
-                      onPost={() => setPostOpen(true)}
-                    />
-                  )}
+                  content={<AnalysisSummary item={active} dispatch={dispatch} onPost={() => setPostOpen(true)} />}
                 />
                 {active.phase === 'analysisDone' && <GenerationPanel item={active} dispatch={dispatch} />}
                 {active.phase === 'generating' && (
