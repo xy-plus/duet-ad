@@ -541,18 +541,141 @@ def legacy_succeeded_output_is_valid(
         legacy_input = state.get("input")
         ir_state = state.get("ir")
         h3_state = state.get("h3")
+        legacy_request = (
+            legacy_input.get("request") if isinstance(legacy_input, dict) else None
+        )
+        request_keys = (
+            frozenset(legacy_request) if isinstance(legacy_request, dict) else frozenset()
+        )
+        base_request_keys = {
+            "duration", "h3_workflow", "ir_model", "ratio", "resolution",
+        }
         if (
             state.get("schema_version") != 1
             or state.get("cid") != cid
             or state.get("attempt_id") != attempt_id
             or state.get("client_request_id") != client_request_id
             or state.get("status") != "succeeded"
+            or state.get("retryable") is not False
             or not isinstance(legacy_input, dict)
-            or "keyframes" not in legacy_input
-            or "images" in legacy_input
+            or set(legacy_input) != {
+                "prompt_sha256", "keyframes", "voice_texts_sha256", "request",
+            }
+            or not isinstance(legacy_input.get("prompt_sha256"), str)
+            or len(legacy_input["prompt_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in legacy_input["prompt_sha256"]
+            )
+            or not isinstance(legacy_input.get("voice_texts_sha256"), str)
+            or len(legacy_input["voice_texts_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in legacy_input["voice_texts_sha256"]
+            )
+            or not isinstance(legacy_input.get("keyframes"), list)
+            or not 1 <= len(legacy_input["keyframes"]) <= 9
+            or not isinstance(legacy_request, dict)
+            or request_keys not in {
+                frozenset(base_request_keys),
+                frozenset(base_request_keys | {"context_ir_enabled"}),
+            }
+            or isinstance(legacy_request.get("duration"), bool)
+            or not isinstance(legacy_request.get("duration"), int)
+            or not 1 <= legacy_request["duration"] <= 15
+            or legacy_request.get("h3_workflow") != H3_WORKFLOW
+            or legacy_request.get("ir_model") != "MiniMax-H3"
+            or legacy_request.get("ratio") != "9:16"
+            or legacy_request.get("resolution") != H3_RESOLUTION
+            or any(
+                not isinstance(frame, dict)
+                or set(frame) != {"name", "sha256"}
+                or not isinstance(frame.get("name"), str)
+                or not frame["name"]
+                or Path(frame["name"]).name != frame["name"]
+                or "\\" in frame["name"]
+                or not isinstance(frame.get("sha256"), str)
+                or len(frame["sha256"]) != 64
+                or any(character not in "0123456789abcdef" for character in frame["sha256"])
+                for frame in legacy_input.get("keyframes", [])
+            )
+            or len({frame["name"] for frame in legacy_input["keyframes"]})
+            != len(legacy_input["keyframes"])
+            or state.get("input_receipt") != canonical_json_sha256(legacy_input)
             or not isinstance(ir_state, dict)
             or not isinstance(h3_state, dict)
+            or set(h3_state) != {"status", "task_id", "receipt", "output"}
             or h3_state.get("status") != "succeeded"
+            or not isinstance(h3_state.get("task_id"), str)
+            or not h3_state["task_id"].strip()
+        ):
+            return False
+        optimized_prompt = ir_state.get("optimized_prompt")
+        optimized_prompt_sha256 = ir_state.get("optimized_prompt_sha256")
+        if (
+            not isinstance(optimized_prompt, str)
+            or not optimized_prompt
+            or not isinstance(optimized_prompt_sha256, str)
+            or hashlib.sha256(optimized_prompt.encode("utf-8")).hexdigest()
+            != optimized_prompt_sha256
+        ):
+            return False
+        if set(ir_state) == {
+            "mode", "optimized_prompt", "optimized_prompt_sha256", "status",
+        }:
+            if (
+                ir_state.get("status") != "succeeded"
+                or ir_state.get("mode") != "skipped"
+                or legacy_request.get("context_ir_enabled") is not False
+                or request_keys != base_request_keys | {"context_ir_enabled"}
+                or optimized_prompt_sha256 != legacy_input.get("prompt_sha256")
+            ):
+                return False
+        elif set(ir_state) == {
+            "optimized_prompt", "optimized_prompt_sha256", "receipt", "status",
+            "task_id",
+        }:
+            ir_receipt = ir_state.get("receipt")
+            if (
+                ir_state.get("status") != "succeeded"
+                or request_keys != base_request_keys
+                or not isinstance(ir_state.get("task_id"), str)
+                or not ir_state["task_id"].strip()
+                or not isinstance(ir_receipt, dict)
+                or set(ir_receipt) != {
+                    "input_receipt", "keyframes", "prompt_sha256", "request",
+                    "task_id", "voice_texts_sha256",
+                }
+                or ir_receipt.get("input_receipt") != state.get("input_receipt")
+                or ir_receipt.get("keyframes") != legacy_input.get("keyframes")
+                or ir_receipt.get("prompt_sha256") != legacy_input.get("prompt_sha256")
+                or ir_receipt.get("voice_texts_sha256")
+                != legacy_input.get("voice_texts_sha256")
+                or ir_receipt.get("task_id") != ir_state.get("task_id")
+                or ir_receipt.get("request") != {
+                    "duration": legacy_request.get("duration"),
+                    "model": legacy_request.get("ir_model"),
+                    "ratio": legacy_request.get("ratio"),
+                }
+            ):
+                return False
+        else:
+            return False
+        h3_receipt = h3_state.get("receipt")
+        if (
+            not isinstance(h3_receipt, dict)
+            or set(h3_receipt) != {
+                "input_receipt", "keyframes", "prompt_sha256", "request", "task_id",
+            }
+            or h3_receipt.get("input_receipt") != state.get("input_receipt")
+            or h3_receipt.get("keyframes") != legacy_input.get("keyframes")
+            or h3_receipt.get("prompt_sha256") != optimized_prompt_sha256
+            or h3_receipt.get("task_id") != h3_state.get("task_id")
+            or h3_receipt.get("request") != {
+                "duration": min(legacy_request["duration"], H3_MAX_DURATION_S),
+                "resolution": legacy_request.get("resolution"),
+                "workflow": legacy_request.get("h3_workflow"),
+            }
         ):
             return False
         receipt = h3_state.get("output")
