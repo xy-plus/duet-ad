@@ -1,5 +1,7 @@
 import hashlib
 import json
+import shutil
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -7,6 +9,21 @@ from types import SimpleNamespace
 import pytest
 
 from app import storage
+
+
+def _webm_with_longer_audio(path, video_duration, audio_duration):
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i",
+            f"testsrc2=size=64x64:rate=10:duration={video_duration}",
+            "-f", "lavfi", "-i",
+            f"sine=frequency=440:sample_rate=48000:duration={audio_duration}",
+            "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8",
+            "-c:a", "libopus", str(path),
+        ],
+        check=True,
+    )
 
 
 def test_new_conversation_layout(tmp_path):
@@ -418,8 +435,8 @@ def test_probe_video_rejects_bool_duration_and_uses_duration_ts(tmp_path, monkey
     assert storage.probe_video(tmp_path / "source.mp4").duration_s == pytest.approx(503 / 30)
 
 
-def test_probe_video_rejects_bool_ticks_and_uses_decoded_fallback(tmp_path, monkeypatch):
-    completed = SimpleNamespace(
+def test_probe_video_rejects_bool_ticks_and_uses_packet_timeline(tmp_path, monkeypatch):
+    metadata = SimpleNamespace(
         returncode=0,
         stdout=json.dumps({"streams": [{
             "width": 320, "height": 240, "duration": False,
@@ -427,19 +444,21 @@ def test_probe_video_rejects_bool_ticks_and_uses_decoded_fallback(tmp_path, monk
         }]}),
         stderr="",
     )
-    capture = SimpleNamespace(
-        isOpened=lambda: True,
-        get=lambda prop: {storage.cv2.CAP_PROP_FRAME_COUNT: 600,
-                          storage.cv2.CAP_PROP_FPS: 30}[prop],
-        release=lambda: None,
+    packets = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"packets": [
+            {"pts_time": "0", "duration_time": "0.1"},
+                {"pts_time": "19.9", "duration_time": "0.1"},
+        ]}),
+        stderr="",
     )
-    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: completed)
-    monkeypatch.setattr(storage.cv2, "VideoCapture", lambda _path: capture)
+    responses = iter((metadata, packets))
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: next(responses))
     assert storage.probe_video(tmp_path / "source.mp4").duration_s == 20.0
 
 
-def test_probe_video_falls_back_to_decoded_frame_timeline(tmp_path, monkeypatch):
-    completed = SimpleNamespace(
+def test_probe_video_falls_back_to_packet_timeline_not_format(tmp_path, monkeypatch):
+    metadata = SimpleNamespace(
         returncode=0,
         stdout=json.dumps({
             "format": {"duration": "99"},
@@ -447,15 +466,67 @@ def test_probe_video_falls_back_to_decoded_frame_timeline(tmp_path, monkeypatch)
         }),
         stderr="",
     )
-    capture = SimpleNamespace(
-        isOpened=lambda: True,
-        get=lambda prop: {storage.cv2.CAP_PROP_FRAME_COUNT: 503,
-                          storage.cv2.CAP_PROP_FPS: 30}[prop],
-        release=lambda: None,
+    packets = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"packets": [
+            {"pts_time": "0"},
+            {"pts_time": "16.733333", "duration_time": "0.033334"},
+        ]}),
+        stderr="",
     )
-    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: completed)
-    monkeypatch.setattr(storage.cv2, "VideoCapture", lambda _path: capture)
+    responses = iter((metadata, packets))
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: next(responses))
     assert storage.probe_video(tmp_path / "source.mp4").duration_s == pytest.approx(503 / 30)
+
+
+def test_probe_video_infers_missing_last_packet_duration_from_adjacent_pts(
+    tmp_path, monkeypatch,
+):
+    metadata = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"streams": [{
+            "width": 320, "height": 240, "avg_frame_rate": "1/1",
+        }]}),
+        stderr="",
+    )
+    packets = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"packets": [
+            {"pts_time": "3.000"}, {"pts_time": "3.040"}, {"pts_time": "3.080"},
+        ]}),
+        stderr="",
+    )
+    responses = iter((metadata, packets))
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: next(responses))
+
+    assert storage.probe_video(tmp_path / "source.webm").duration_s == pytest.approx(0.12)
+
+
+def test_probe_video_infers_single_packet_duration_from_average_rate(tmp_path, monkeypatch):
+    metadata = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"streams": [{
+            "width": 320, "height": 240, "avg_frame_rate": "25/1",
+        }]}),
+        stderr="",
+    )
+    packets = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"packets": [{"pts_time": "7.5"}]}),
+        stderr="",
+    )
+    responses = iter((metadata, packets))
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: next(responses))
+
+    assert storage.probe_video(tmp_path / "source.webm").duration_s == pytest.approx(0.04)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg unavailable")
+def test_probe_video_real_webm_ignores_longer_audio_duration(tmp_path):
+    source = tmp_path / "offset.webm"
+    _webm_with_longer_audio(source, 2.0, 2.2)
+
+    assert storage.probe_video(source).duration_s == pytest.approx(2.0, abs=0.02)
 
 
 @pytest.mark.parametrize("stream_duration", ["0", "nan", "inf", "-1"])
@@ -472,9 +543,30 @@ def test_probe_video_rejects_invalid_stream_duration_without_decoded_fallback(
         }),
         stderr="",
     )
-    capture = SimpleNamespace(isOpened=lambda: False, release=lambda: None)
-    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: completed)
-    monkeypatch.setattr(storage.cv2, "VideoCapture", lambda _path: capture)
+    packets = SimpleNamespace(returncode=0, stdout='{"packets": []}', stderr="")
+    responses = iter((completed, packets))
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: next(responses))
+    with pytest.raises(storage.UploadError, match="duration"):
+        storage.probe_video(tmp_path / "source.mp4")
+
+
+@pytest.mark.parametrize("bad_pts", [True, False, "nan", "inf", "-inf"])
+def test_probe_video_rejects_non_finite_or_bool_packet_pts(
+    tmp_path, monkeypatch, bad_pts,
+):
+    metadata = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"streams": [{"width": 320, "height": 240}]}),
+        stderr="",
+    )
+    packets = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"packets": [{"pts_time": bad_pts}]}),
+        stderr="",
+    )
+    responses = iter((metadata, packets))
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: next(responses))
+
     with pytest.raises(storage.UploadError, match="duration"):
         storage.probe_video(tmp_path / "source.mp4")
 

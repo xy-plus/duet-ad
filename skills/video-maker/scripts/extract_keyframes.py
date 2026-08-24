@@ -78,12 +78,14 @@ def probe_audio(video: Path) -> bool | None:
 
 
 def probe_video_duration(video: Path, decoded_duration: float) -> float:
-    """Return the v:0 visual timeline; decoded metadata is the final fallback."""
+    """Return the v:0 visual timeline; container/audio/OpenCV metadata are excluded."""
     ffprobe = shutil.which("ffprobe")
     if ffprobe:
         command = [
             ffprobe, "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=duration,duration_ts,time_base",
+            "-show_entries", (
+                "stream=duration,duration_ts,time_base,avg_frame_rate,r_frame_rate"
+            ),
             "-of", "json", str(video),
         ]
         try:
@@ -111,11 +113,78 @@ def probe_video_duration(video: Path, decoded_duration: float) -> float:
                     return candidate
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
+            packet_command = [
+                ffprobe, "-v", "error", "-select_streams", "v:0",
+                "-show_packets", "-show_entries",
+                "packet=pts_time,dts_time,duration_time", "-of", "json", str(video),
+            ]
+            packets_result = subprocess.run(
+                packet_command, check=True, capture_output=True, text=True, timeout=30
+            )
+            packets = json.loads(packets_result.stdout or "{}").get("packets")
+            if isinstance(packets, list):
+                starts: list[float] = []
+                ends: list[float] = []
+                starts_with_duration: set[float] = set()
+                for packet in packets:
+                    if not isinstance(packet, dict):
+                        continue
+                    start = _finite_packet_number(packet.get("pts_time"))
+                    if start is None:
+                        start = _finite_packet_number(packet.get("dts_time"))
+                    if start is None:
+                        continue
+                    starts.append(start)
+                    packet_duration = _finite_packet_number(packet.get("duration_time"))
+                    if packet_duration is not None and packet_duration > 0:
+                        ends.append(start + packet_duration)
+                        starts_with_duration.add(start)
+                starts = sorted(set(starts))
+                step = None
+                if len(starts) > 1:
+                    positive = [b - a for a, b in zip(starts, starts[1:]) if b > a]
+                    if positive:
+                        step = positive[-1]
+                if step is None:
+                    rate = _positive_rate(stream.get("avg_frame_rate")) or _positive_rate(
+                        stream.get("r_frame_rate")
+                    )
+                    step = 1 / rate if rate else None
+                if (
+                    starts
+                    and starts[-1] not in starts_with_duration
+                    and step is not None
+                    and step > 0
+                ):
+                    ends.append(starts[-1] + step)
+                if starts and ends:
+                    candidate = max(ends) - starts[0]
+                    if math.isfinite(candidate) and candidate > 0:
+                        return candidate
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError, IndexError):
             pass
-    if math.isfinite(decoded_duration) and decoded_duration > 0:
-        return decoded_duration
     raise SystemExit("Could not determine the video stream duration.")
+
+
+def _finite_packet_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _positive_rate(value: object) -> float | None:
+    if not isinstance(value, str) or "/" not in value:
+        return None
+    try:
+        numerator, denominator = value.split("/", 1)
+        rate = float(numerator) / float(denominator)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return rate if math.isfinite(rate) and rate > 0 else None
 
 
 def write_image(path: Path, frame: np.ndarray, extension: str, params: list[int] | None = None) -> None:

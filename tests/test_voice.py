@@ -1,5 +1,6 @@
 """任务 T2：口播链路纯函数（extract_audio 抽音轨 / validate_voice_lines 白名单校验）。"""
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -34,10 +35,53 @@ def _conv(tmp_path, video):
     return cdir
 
 
+def _make_offset_video(path: Path, offset: float) -> None:
+    video_offset = max(0.0, -offset)
+    audio_offset = max(0.0, offset)
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-itsoffset", str(video_offset),
+            "-f", "lavfi", "-i", "color=c=black:size=64x64:rate=24:d=2",
+            "-itsoffset", str(audio_offset), "-f", "lavfi", "-i",
+            "sine=frequency=1000:sample_rate=48000:duration=2.5",
+            "-map", "0:v", "-map", "1:a", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-copyts", str(path),
+        ],
+        check=True,
+    )
+
+
+def _audible_start(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-i", str(path), "-af",
+            "silencedetect=noise=-35dB:d=0.05", "-f", "null", "-",
+        ],
+        capture_output=True, text=True,
+    )
+    match = re.search(r"silence_end: ([0-9.]+)", result.stderr)
+    return float(match.group(1)) if match else 0.0
+
+
 # ---------- extract_audio ----------
 
 
 class TestExtractAudio:
+    @pytest.mark.parametrize("offset", [-0.5, 0.0, 0.5])
+    def test_extract_audio_preserves_relative_stream_offset(
+        self, tmp_path, offset,
+    ):
+        source = tmp_path / f"offset-{offset}.mp4"
+        _make_offset_video(source, offset)
+        out = voice.extract_audio(_conv(tmp_path / f"c-{offset}", source))
+
+        onset = _audible_start(out)
+        if offset > 0:
+            assert onset == pytest.approx(0.5, abs=0.08)
+        else:
+            assert onset < 0.08
+        assert voice.probe_audio_duration(out) == pytest.approx(2.0, abs=0.12)
+
     def test_extracts_voice_mp3(self, tmp_path, video_with_audio):
         cdir = _conv(tmp_path, video_with_audio)
         out = voice.extract_audio(cdir)
@@ -63,6 +107,13 @@ class TestExtractAudio:
 
     def test_ffmpeg_failure(self, tmp_path, video_with_audio, monkeypatch):
         cdir = _conv(tmp_path, video_with_audio)
+        monkeypatch.setattr(
+            voice.storage, "probe_video",
+            lambda _path: storage.VideoProbe(1.0, 320, 240),
+        )
+        monkeypatch.setattr(
+            voice.storage, "probe_stream_first_pts", lambda _path, _selector: 0.0,
+        )
         fake = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="codec broken")
         monkeypatch.setattr(voice.subprocess, "run", lambda *a, **kw: fake)
         with pytest.raises(PipelineError, match="exit 1"):
