@@ -1942,8 +1942,20 @@ def create_app(settings: Settings) -> FastAPI:
                         raise HTTPException(status_code=409, detail="resume_request_id_mismatch")
                     if not same_parameters:
                         raise HTTPException(status_code=409, detail="resume_parameters_changed")
+                    claimed_generation = {
+                        **old, "status": "queued", "error": None
+                    }
+                    claimed = storage.update_meta(
+                        settings.data_dir, cid,
+                        generation=claimed_generation,
+                    )
+                    if claimed is None:
+                        raise HTTPException(status_code=404, detail="not found")
                     background_tasks.add_task(long_generation.run, settings, cid, plan)
-                    return {"status": "queued", "attempt": old.get("attempt")}
+                    return {
+                        "status": "queued",
+                        "attempt": claimed_generation.get("attempt"),
+                    }
                 if previous_status == "succeeded":
                     if previous_id != request_id or not same_parameters:
                         raise HTTPException(

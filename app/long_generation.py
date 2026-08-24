@@ -898,7 +898,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 if result.status == "not_started":
                     return (
                         ("queued", None)
-                        if fast_mode and state.get("status") == "queued"
+                        if (
+                            fast_mode
+                            and state.get("status") == "queued"
+                            and isinstance(result.attempt_id, str)
+                            and bool(result.attempt_id)
+                        )
                         else ("submission_unknown", "submission_unknown")
                     )
                 status = _result_status(result)
@@ -1025,6 +1030,8 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     return "failed", "long_video_segment_output_invalid"
                 return status
             except h3.H3Error as exc:
+                if exc.code == "attempt_not_prepared":
+                    return "submission_unknown", "submission_unknown"
                 try:
                     inspected = h3.inspect(requests[segment.index])
                     status = _result_status(inspected)
