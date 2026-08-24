@@ -562,7 +562,7 @@ function TaskSender({ item, dispatch }: TaskSenderProps) {
         ) : undefined}
       />
       <div className="sender-disclaimer" aria-live="polite">
-        {localFeedback || '本原型不会发起网络请求，所有状态在刷新后复位。'}
+        {localFeedback || '本原型不会发起后端或外部请求，所有状态在刷新后复位。'}
       </div>
     </div>
   );
@@ -585,14 +585,11 @@ function PostProcessModal({ item, open, onClose, dispatch }: PostProcessModalPro
       title="关键帧后处理"
       open={open}
       onCancel={onClose}
-      keyboard={!running}
-      mask={{ closable: !running }}
-      closable={!running}
       footer={succeeded ? (
         <Button type="primary" onClick={onClose}>完成</Button>
       ) : (
         <Space>
-          <Button onClick={onClose} disabled={running}>取消</Button>
+          <Button onClick={onClose}>{running ? '转到后台' : '取消'}</Button>
           <Button
             type="primary"
             loading={running}
@@ -613,7 +610,7 @@ function PostProcessModal({ item, open, onClose, dispatch }: PostProcessModalPro
         </div>
       ) : (
         <div className="post-options">
-          <Paragraph type="secondary">选择关键帧清理步骤。运行期间会锁定操作，避免重复提交。</Paragraph>
+          <Paragraph type="secondary">选择关键帧清理步骤。运行期间选项锁定，可关闭弹窗转到后台。</Paragraph>
           <Checkbox.Group
             value={options}
             disabled={running}
@@ -765,7 +762,7 @@ function Workspace() {
       <PostProcessModal
         item={active}
         open={postOpen}
-        onClose={() => { if (active.postStatus !== 'running') setPostOpen(false); }}
+        onClose={() => setPostOpen(false)}
         dispatch={dispatch}
       />
     </div>

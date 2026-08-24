@@ -131,6 +131,8 @@ describe('Duet AI prototype', () => {
 
     await user.click(screen.getByRole('button', { name: '打开关键帧后处理' }));
     await user.click(screen.getByRole('button', { name: '开始后处理' }));
+    await user.click(screen.getByRole('button', { name: '转到后台' }));
+    expect(screen.queryByRole('dialog', { name: '关键帧后处理' })).not.toBeInTheDocument();
     await user.click(screen.getByText('最终成片完成'));
     act(() => vi.advanceTimersByTime(2500));
     await user.click(screen.getByText('分析完成待生成'));
