@@ -392,6 +392,36 @@ def test_startup_reconciles_half_frozen_short_submit_without_provider(
     )
 
 
+def test_startup_releases_non_utf8_half_frozen_submit_without_provider(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=False, enable_h3_submit=False
+    )
+    cid, _ = _make_conv(settings)
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_submission_input(
+        settings.data_dir, cid, "request-old-bad"
+    )
+    receipt = settings.data_dir / cid / prepared_input.RECEIPT_FILENAME
+    receipt.write_bytes(b"\xff\xfeinvalid")
+    before = receipt.read_bytes()
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    provider_calls = []
+    monkeypatch.setattr(h3, "start", lambda *_args, **_kwargs: provider_calls.append(1))
+
+    with TestClient(create_app(settings)):
+        pass
+
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert recovered["status"] == "done"
+    assert recovered["error"] == "submission_recovery_required"
+    assert recovered["generation"] is None
+    assert recovered["_input_owner"] is None
+    assert provider_calls == []
+    assert receipt.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "change,detail",
     [

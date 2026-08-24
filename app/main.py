@@ -794,7 +794,6 @@ def _reconcile_stale_submission(settings: Settings, cid: str, owner: object) -> 
     changes = {
         "status": "done",
         "error": "submission_recovery_required",
-        "input_recovery": "submission_recovery_required",
     }
     receipt = cdir / prepared_input.RECEIPT_FILENAME
     if receipt.is_file():
@@ -813,6 +812,7 @@ def _reconcile_stale_submission(settings: Settings, cid: str, owner: object) -> 
             )
         except (
             OSError,
+            UnicodeDecodeError,
             KeyError,
             TypeError,
             json.JSONDecodeError,
