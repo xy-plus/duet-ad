@@ -1708,7 +1708,9 @@ def test_legacy_binary_float_duration_rebuilds_original_thirteen_second_request(
         join_mode="hard_cut",
         workdir=root,
         first_frame=anchor,
+        first_frame_data=b"anchor",
         last_frame=anchor,
+        last_frame_data=b"anchor",
         prompt="prompt",
     )
     plan = long_generation.FrozenPlan(
