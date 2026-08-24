@@ -258,10 +258,6 @@ def reconcile_stale_pipeline(settings: Settings, cid: str, owner: object) -> Non
         changes = {"status": "failed", "error": "input_recovery_required"}
     storage.finish_input_claim(settings.data_dir, cid, owner, **changes)
 H3_BOUNDARY_WORKFLOW = "minimax_h3_lightx2v"
-# 拆段不变量（与 app/scenes.py 的算法级不变量同值；不 import scenes：scenedetect 缺依赖时
-# scenes 模块会 SystemExit，流水线不能因此加载失败）
-SEGMENT_MIN_S = 1.0
-SEGMENT_MAX_S = long_video.SEGMENT_PROVIDER_MAX_DURATION_S
 
 log = logging.getLogger(__name__)
 
@@ -818,9 +814,9 @@ def _load_scenes(work: Path) -> list[dict]:
     for i, seg in enumerate(out):
         length = seg["end_s"] - seg["start_s"]
         if (
-            length < SEGMENT_MIN_S - 1e-9
+            length < long_video.SEGMENT_MIN_S - 1e-9
             or long_video.provider_duration_s(seg["start_s"], seg["end_s"])
-            > SEGMENT_MAX_S
+            > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
         ):
             raise PipelineError(
                 f"scenes.json segments[{i}] provider duration not in 1..10s"
