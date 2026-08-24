@@ -299,11 +299,6 @@ textarea {
   font-size: 10px;
 }
 
-.language-select {
-  width: 150px;
-  margin-left: 10px;
-}
-
 .transcript-preview {
   margin-top: 14px;
   padding: 16px 18px;
@@ -357,6 +352,20 @@ textarea {
   align-items: flex-start;
   gap: 10px;
   flex-direction: column;
+}
+
+.parameter-dialogue {
+  grid-column: 1 / -1;
+}
+
+.dialogue-mode-group {
+  display: flex;
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+
+.parameter-dialogue .ant-input {
+  max-width: 680px;
 }
 
 .generation-actions {
@@ -496,6 +505,25 @@ textarea {
   padding: 4px 3px 10px;
   flex-direction: column;
   border-bottom: 1px solid var(--ant-color-border-secondary);
+}
+
+.creation-transcript-options {
+  display: flex;
+  gap: 8px;
+  padding-top: 2px;
+  flex-direction: column;
+}
+
+.creation-transcript-heading,
+.creation-transcript-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.creation-transcript-controls .ant-select {
+  min-width: 140px;
 }
 
 .local-upload {
@@ -649,7 +677,8 @@ textarea {
   .result-heading,
   .section-heading,
   .generation-actions,
-  .sender-source-top {
+  .sender-source-top,
+  .creation-transcript-controls {
     align-items: flex-start;
     flex-direction: column;
   }

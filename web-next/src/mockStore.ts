@@ -2,6 +2,7 @@ import { useReducer } from 'react';
 
 export type SourceMode = 'link' | 'upload';
 export type TranscriptMode = 'keep' | 'rewrite' | 'translate';
+export type H3DialogueMode = 'auto' | 'edit' | 'custom' | 'none';
 export type AnalysisStatus = 'idle' | 'queued' | 'processing' | 'done';
 export type GenerationStatus = 'idle' | 'running' | 'succeeded';
 export type PostStatus = 'idle' | 'running' | 'succeeded';
@@ -17,6 +18,8 @@ export interface Conversation {
   analysisStatus: AnalysisStatus;
   transcriptMode: TranscriptMode;
   targetLanguage: string;
+  h3DialogueMode: H3DialogueMode;
+  h3Dialogue: string;
   prompt: string;
   aspect: '16:9' | '9:16';
   resolution: '480p' | '768p';
@@ -44,6 +47,8 @@ type Action =
   | { type: 'analysisDone'; id: string }
   | { type: 'transcriptMode'; mode: TranscriptMode }
   | { type: 'targetLanguage'; language: string }
+  | { type: 'h3DialogueMode'; mode: H3DialogueMode }
+  | { type: 'h3Dialogue'; value: string }
   | { type: 'prompt'; prompt: string }
   | { type: 'aspect'; value: Conversation['aspect'] }
   | { type: 'resolution'; value: Conversation['resolution'] }
@@ -58,6 +63,8 @@ const shared = {
   analysisStatus: 'done' as const,
   transcriptMode: 'keep' as const,
   targetLanguage: 'English',
+  h3DialogueMode: 'auto' as const,
+  h3Dialogue: '一杯好咖啡，让城市的早晨慢下来。今天，也给自己留一点从容。',
   prompt:
     '以原视频的镜头节奏为基准，保留咖啡杯与城市晨光的视觉锚点，生成自然、克制、具有真实摄影质感的新品短片。',
   aspect: '16:9' as const,
@@ -185,9 +192,29 @@ function reducer(state: State, action: Action): State {
           : item,
       );
     case 'transcriptMode':
-      return updateActive(state, (item) => ({ ...item, transcriptMode: action.mode }));
+      return updateActive(state, (item) =>
+        item.phase === 'draft' && item.analysisStatus === 'idle'
+          ? { ...item, transcriptMode: action.mode }
+          : item,
+      );
     case 'targetLanguage':
-      return updateActive(state, (item) => ({ ...item, targetLanguage: action.language }));
+      return updateActive(state, (item) =>
+        item.phase === 'draft' && item.analysisStatus === 'idle'
+          ? { ...item, targetLanguage: action.language }
+          : item,
+      );
+    case 'h3DialogueMode':
+      return updateActive(state, (item) =>
+        item.phase === 'analysisDone' && item.generationStatus === 'idle'
+          ? { ...item, h3DialogueMode: action.mode }
+          : item,
+      );
+    case 'h3Dialogue':
+      return updateActive(state, (item) =>
+        item.phase === 'analysisDone' && item.generationStatus === 'idle'
+          ? { ...item, h3Dialogue: action.value }
+          : item,
+      );
     case 'prompt':
       return updateActive(state, (item) => ({ ...item, prompt: action.prompt }));
     case 'aspect':
@@ -205,6 +232,10 @@ function reducer(state: State, action: Action): State {
     case 'startGeneration':
       return updateActive(state, (item) => {
         if (item.phase !== 'analysisDone' || item.generationStatus !== 'idle') return item;
+        if (
+          (item.h3DialogueMode === 'edit' || item.h3DialogueMode === 'custom') &&
+          !item.h3Dialogue.trim()
+        ) return item;
         return {
           ...item,
           phase: 'generating',
@@ -230,7 +261,7 @@ function reducer(state: State, action: Action): State {
       });
     case 'startPost':
       return updateActive(state, (item) => {
-        if (item.phase !== 'complete' || item.postStatus !== 'idle') return item;
+        if (item.phase === 'draft' || item.analysisStatus !== 'done' || item.postStatus !== 'idle') return item;
         return { ...item, postStatus: 'running' };
       });
     case 'postDone':
