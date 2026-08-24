@@ -258,6 +258,36 @@ def test_generation_options_select_server_defaults_and_switch_fit_profile():
     ]
 
 
+def test_generation_draft_discards_touched_values_after_remote_freeze():
+    result = _run_contract(
+        "(()=>{const initial={id:'cross-tab-cid',aspect_ratio:'9:16',resolution:'768p',"
+        "fit_mode:'crop',fit_profiles:{"
+        "'16:9':{fit_required:false,default_fit_mode:'none'},"
+        "'9:16':{fit_required:true,default_fit_mode:'crop'}},"
+        "dialogue:{mode:'auto',lines:[],auto_lines:[]},receipt_version:1,generation:null};"
+        "const draft=contract.generationDraft(initial);"
+        "Object.assign(draft,{aspectRatio:'9:16',resolution:'768p',fitMode:'pad',"
+        "dialogueMode:'custom',customLinesText:'0 - 1 | local',parameterTouched:true});"
+        "const frozen={...initial,aspect_ratio:'16:9',resolution:'480p',fit_mode:'none',"
+        "dialogue:{mode:'auto',lines:[],auto_lines:[]},"
+        "generation:{status:'failed',attempt:1,client_request_id:'remote-request'}};"
+        "const synced=contract.generationDraft(frozen);"
+        "return {aspectRatio:synced.aspectRatio,resolution:synced.resolution,"
+        "fitMode:synced.fitMode,dialogueMode:synced.dialogueMode,"
+        "parameterTouched:synced.parameterTouched};})()"
+    )
+    assert result == {
+        "aspectRatio": "16:9",
+        "resolution": "480p",
+        "fitMode": "none",
+        "dialogueMode": "auto",
+        "parameterTouched": False,
+    }
+    source = _web_source()
+    assert 'card.querySelectorAll("input, textarea")' in source
+    assert "重试将使用上次服务端冻结的生成参数" in source
+
+
 def test_success_snapshot_uses_only_server_frozen_generation_values():
     result = _run_contract(
         "contract.generationParameterSnapshot({aspect_ratio:'16:9',resolution:'768p',"

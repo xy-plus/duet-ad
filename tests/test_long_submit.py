@@ -221,13 +221,54 @@ def test_long_validation_fingerprint_tracks_selected_aspect_fit_outputs(tmp_path
     cid, _receipt = _make_long(settings, landscape_first_indices=(1,))
     root = settings.data_dir / cid
     meta = storage.load_meta(settings.data_dir, cid)
-    meta.update(aspect_ratio="16:9", resolution="480p", fit_mode="crop")
+    meta.update(
+        aspect_ratio="16:9",
+        resolution="480p",
+        fit_mode="crop",
+        generation={"fit_layout": long_generation.FIT_LAYOUT_ASPECT},
+    )
 
     paths = _long_validation_paths(root, meta)
 
     expected_root = root / "work" / "segments" / "1" / "work" / "h3_frames"
     assert expected_root / "16x9" / "crop" / "first" / "first.png" in paths
     assert expected_root / "crop" / "first" / "first.png" not in paths
+
+
+def test_pre_marker_recovery_rejects_ambiguous_complete_fit_layouts(tmp_path):
+    settings = make_settings(tmp_path, enable_pipeline=False)
+    cid, receipt = _make_long(
+        settings, fit_required=True, landscape_first_indices=(1,)
+    )
+    root = settings.data_dir / cid
+    legacy_meta = storage.load_meta(settings.data_dir, cid)
+    long_generation.freeze_plan(root, legacy_meta, receipt, "crop", "auto")
+    semantic_meta = {
+        **legacy_meta,
+        "aspect_ratio": "9:16",
+        "resolution": "768p",
+    }
+    long_generation.freeze_plan(
+        root,
+        semantic_meta,
+        receipt,
+        "crop",
+        "auto",
+        aspect_ratio="9:16",
+        resolution="768p",
+    )
+
+    with pytest.raises(long_generation.LongGenerationError) as raised:
+        long_generation.freeze_plan(
+            root,
+            semantic_meta,
+            receipt,
+            "crop",
+            "auto",
+            prepare_fit=False,
+        )
+
+    assert raised.value.code == "frame_fit_failed"
 
 
 def _small_video(path: Path, color: str = "black") -> None:
@@ -1248,6 +1289,175 @@ def test_startup_recovery_only_resumes_attempted_segments(tmp_path, monkeypatch)
     assert [request.workdir.name for request in resumed] == ["1"]
     stored = storage.load_meta(settings.data_dir, cid)["generation"]
     assert stored["segments"][1]["status"] == "not_started"
+
+
+@pytest.mark.parametrize("fit_mode", ["crop", "pad"])
+def test_current_first_failure_restart_uses_persisted_fit_layout_get_only(
+    tmp_path, monkeypatch, fit_mode,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    client = TestClient(create_app(settings))
+    cid, receipt = _make_long(
+        settings, fit_required=True, landscape_first_indices=(1,)
+    )
+    submitted = []
+
+    def first_start(request):
+        submitted.append(request)
+        return h3.H3Result(
+            "retryable_failure",
+            "000001",
+            retryable=True,
+            error_code="h3_query_failed",
+        )
+
+    monkeypatch.setattr(h3, "start", first_start)
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt, fit=fit_mode),
+    )
+    assert response.status_code == 202
+    assert len(submitted) == 1
+    meta = storage.load_meta(settings.data_dir, cid)
+    assert meta["generation"]["status"] == "resume_required"
+    assert (meta["aspect_ratio"], meta["resolution"], meta["fit_mode"]) == (
+        "9:16", "768p", fit_mode
+    )
+    assert meta["generation"]["fit_layout"] == long_generation.FIT_LAYOUT_ASPECT
+
+    fit_base = (
+        settings.data_dir / cid / "work" / "segments" / "1" / "work"
+        / "h3_frames"
+    )
+    legacy_first = fit_base / fit_mode / "first" / "first.png"
+    semantic_first = fit_base / "9x16" / fit_mode / "first" / "first.png"
+    frozen_first = semantic_first
+    other_first = legacy_first
+    assert frozen_first.is_file()
+    assert not other_first.exists()
+    frozen_bytes = frozen_first.read_bytes()
+
+    monkeypatch.setattr(
+        long_generation.frame_fit,
+        "fit_frames",
+        lambda *_a, **_kw: pytest.fail("restart must not re-fit frozen inputs"),
+    )
+    monkeypatch.setattr(
+        h3, "start", lambda _request: pytest.fail("restart must not POST")
+    )
+    resumed = []
+
+    def resume(request):
+        resumed.append(request)
+        return h3.H3Result(
+            "retryable_failure",
+            "000001",
+            retryable=True,
+            error_code="h3_query_failed",
+        )
+
+    monkeypatch.setattr(h3, "resume", resume)
+    _resume_long_generation(settings, cid)
+
+    assert len(resumed) == 1
+    assert resumed[0].first_frame[0] == frozen_first
+    assert resumed[0].first_frame[1] == frozen_bytes
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert recovered["generation"]["status"] == "resume_required"
+    assert (recovered["aspect_ratio"], recovered["resolution"]) == (
+        "9:16", "768p"
+    )
+
+
+@pytest.mark.parametrize("fit_mode", ["crop", "pad"])
+@pytest.mark.parametrize("layout", ["legacy", "semantic"])
+def test_pre_marker_restart_discovers_existing_fit_layout_get_only(
+    tmp_path, monkeypatch, fit_mode, layout,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    cid, receipt = _make_long(
+        settings, fit_required=True, landscape_first_indices=(1,)
+    )
+    root = settings.data_dir / cid
+    meta = storage.load_meta(settings.data_dir, cid)
+    if layout == "semantic":
+        meta = storage.update_meta(
+            settings.data_dir, cid, aspect_ratio="9:16", resolution="768p"
+        )
+        plan = long_generation.freeze_plan(
+            root,
+            meta,
+            receipt,
+            fit_mode,
+            "auto",
+            aspect_ratio="9:16",
+            resolution="768p",
+        )
+    else:
+        plan = long_generation.freeze_plan(
+            root, meta, receipt, fit_mode, "auto"
+        )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    generation.pop("fit_layout")
+    generation["status"] = "resume_required"
+    generation["segments"][0].update(status="resume_required", attempt=1)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        aspect_ratio="9:16",
+        resolution="768p",
+        fit_mode=fit_mode,
+        dialogue_mode="auto",
+        frozen_plan_receipt=receipt,
+        generation=generation,
+    )
+
+    fit_base = root / "work" / "segments" / "1" / "work" / "h3_frames"
+    legacy_first = fit_base / fit_mode / "first" / "first.png"
+    semantic_first = fit_base / "9x16" / fit_mode / "first" / "first.png"
+    frozen_first = legacy_first if layout == "legacy" else semantic_first
+    other_first = semantic_first if layout == "legacy" else legacy_first
+    assert frozen_first.is_file()
+    assert not other_first.exists()
+    frozen_bytes = frozen_first.read_bytes()
+
+    monkeypatch.setattr(
+        long_generation.frame_fit,
+        "fit_frames",
+        lambda *_a, **_kw: pytest.fail("restart must not re-fit frozen inputs"),
+    )
+    monkeypatch.setattr(
+        h3, "start", lambda _request: pytest.fail("restart must not POST")
+    )
+    resumed = []
+
+    def resume(request):
+        resumed.append(request)
+        return h3.H3Result(
+            "retryable_failure",
+            "000001",
+            retryable=True,
+            error_code="h3_query_failed",
+        )
+
+    monkeypatch.setattr(h3, "resume", resume)
+    _resume_long_generation(settings, cid)
+
+    assert len(resumed) == 1
+    assert resumed[0].first_frame[0] == frozen_first
+    assert resumed[0].first_frame[1] == frozen_bytes
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert recovered["generation"]["status"] == "resume_required"
+    assert (recovered["aspect_ratio"], recovered["resolution"]) == (
+        "9:16", "768p"
+    )
 
 
 def test_active_same_parent_is_idempotent_without_refreeze_or_second_coordinator(

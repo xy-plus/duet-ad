@@ -150,7 +150,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 }
 ```
 
-`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。`aspect_ratio/resolution` 是服务端推荐值，首次提交后即为冻结值；闭集分别为 `16:9|9:16` 和 `480p|768p`。`fit_profiles` 同时公开两个画幅的 `fit_required/default_fit_mode`，浏览器改变画幅时只能据此切换适配选项。历史 meta 缺少新字段时精确投影为 `9:16 + 768p`，不会改写旧 receipt。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 以冻结 `meta.segments` 的完整索引集合为基数，由服务端结合持久化状态与分段 `generated.mp4` 文件实况计算：缺项计入，重复、未知或乱序状态整批不复用；`stage=stitch` 固定为 0。该复用判定与 retry 初始化共用，前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source` 按源文件实况计算；`has_video` 与 `navigation_status` 共用当前服务端最终输出验收结果。成功页继续播放成片，并从这些服务端冻结值生成只读参数摘要。
+`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。`aspect_ratio/resolution` 是服务端推荐值，首次提交后即为冻结值；闭集分别为 `16:9|9:16` 和 `480p|768p`。`fit_profiles` 同时公开两个画幅的 `fit_required/default_fit_mode`，浏览器改变画幅时只能据此切换适配选项。历史 meta 缺少新字段时精确投影为 `9:16 + 768p`，不会改写旧 receipt。一旦详情出现 generation，浏览器必须丢弃本地可编辑草稿，以详情中的画幅、清晰度、台词和 fit 重新同步并锁定参数控件；跨标签页提交不能继续显示另一个草稿值。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 以冻结 `meta.segments` 的完整索引集合为基数，由服务端结合持久化状态与分段 `generated.mp4` 文件实况计算：缺项计入，重复、未知或乱序状态整批不复用；`stage=stitch` 固定为 0。该复用判定与 retry 初始化共用，前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source` 按源文件实况计算；`has_video` 与 `navigation_status` 共用当前服务端最终输出验收结果。成功页继续播放成片，并从这些服务端冻结值生成只读参数摘要。
 
 ### `PATCH /api/conversations/{cid}/prompt`
 
@@ -296,7 +296,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | `long_video_plan_receipt` | 长链固定为 `long_video_plan.json` |
 | `frozen_plan_receipt` | 长链首次提交确认的 plan SHA-256 |
 | `fit_mode` | `none/crop/pad`；随冻结画幅解释 |
-| `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含内部 `segments`，failed 时公开 `retry_paid_segment_count`，status 含 resume_required |
+| `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含内部 `segments` 与 `fit_layout`，failed 时公开 `retry_paid_segment_count`，status 含 resume_required |
 | `postprocess` | `{status,options,frames,error}`，与 H3 输入隔离 |
 
 `≤10s` 的 schema v2 使用顶层 keyframes/prompt；`>10s` 使用 `segments` 与 `long_video_plan.json`，每段独立工作目录和 H3 状态。两种契约不能互相降级或混用 receipt。
@@ -344,7 +344,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 - `visual_prompt`、最终 `prompt` 的路径/SHA-256；
 - 本段局部台词的 canonical 数量与 SHA-256。
 
-detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字段。提交时服务同时比对该摘要、meta 分段和全部 artifact；`fit_mode=crop/pad` 时冻结的 FL2VA 请求改用服务端派生为所选 `16:9/9:16` 的锚点。每段工作目录为 `work/segments/<N>/`，其中 `.h3/` 只归该子任务所有。
+detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字段。提交时服务同时比对该摘要、meta 分段和全部 artifact；`fit_mode=crop/pad` 时冻结的 FL2VA 请求改用服务端派生为所选 `16:9/9:16` 的锚点。每段工作目录为 `work/segments/<N>/`，其中 `.h3/` 只归该子任务所有。当前 generation 在任何供应商 POST 前持久化内部 `fit_layout=legacy-v0|aspect-v1`，恢复只按该冻结布局读取。旧 attempt 没有 marker 时，只在历史 `h3_frames/<mode>/...` 与当前 `h3_frames/<aspect>/<mode>/...` 中恰有一套完整、可解码且匹配目标画幅的静态输入时恢复；两套同时存在、混用或均不完整都以 `frame_fit_failed` fail closed，不重新适配。
 
 历史 `version=1` receipt 仍可读取并按其原始浮点换算重建最长 15 秒的已知 attempt；超过 10 秒的历史段只能 GET 恢复，绝不创建新 POST，也不改写原 receipt。
 
@@ -393,7 +393,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 - `app.prepared_input.prepare_dialogue(...) -> tuple[dict,...]` — 规范化 auto/edit/custom/none 来源。
 - `app.prepared_input.write_prepared_input(...) -> PreparedInput` — 原子写 receipt 并复用 loader 验证。
 - `app.prepared_input.load_prepared_input(...) -> PreparedInput` — 读取冻结 bytes，漂移即拒绝。
-- `app.frame_fit.fit_frames(paths,output_dir,mode) -> tuple[Path,...]` — 显式 crop/pad 9:16 派生。
+- `app.frame_fit.fit_frames(paths,output_dir,mode,aspect_ratio) -> tuple[Path,...]` — 调用方必须显式传 `16:9|9:16` 目标；crop/pad 都严格输出该比例，没有隐藏的固定 9:16 默认值。
 - `app.h3.start/inspect/resume/retry` — 可恢复状态机；runtime 对 resume_required 暴露同 id start，对确定 failed 暴露新 id retry，不对 submission_unknown 暴露操作。
 - `app.long_video.plan_segments/write_plan_receipt` — 安全边界规划与 canonical plan 落盘。
 - `app.long_generation.freeze_plan/run` — fail-closed 冻结、最多两链编排和分段恢复。
