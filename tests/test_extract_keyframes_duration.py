@@ -113,3 +113,29 @@ def test_real_webm_manifest_uses_visual_packets_not_longer_audio(tmp_path):
 
     manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["duration_seconds"] == pytest.approx(9.8, abs=0.02)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg unavailable")
+def test_real_vfr_webm_extracts_by_presentation_timeline(tmp_path):
+    source = tmp_path / "vfr.webm"
+    work = tmp_path / "work"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1",
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=5:duration=1",
+            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map", "[v]", "-fps_mode", "vfr", "-c:v", "libvpx-vp9",
+            "-deadline", "realtime", "-cpu-used", "8", str(source),
+        ],
+        check=True,
+    )
+
+    subprocess.run(
+        [sys.executable, str(SCRIPT), str(source), "--out-dir", str(work), "--fps", "4"],
+        check=True,
+    )
+    manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["duration_seconds"] == pytest.approx(2.0, abs=0.02)
+    assert any(frame["time_seconds"] >= 1.5 for frame in manifest["frames"])
+    assert all((work / frame["file"]).is_file() for frame in manifest["frames"])

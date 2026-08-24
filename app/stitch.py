@@ -327,17 +327,12 @@ def stitch_video(
         if audio_mode == "keep" and source_info.has_audio:
             candidate = tmp / "candidate.mp4"
             try:
-                offset = (
-                    storage.probe_stream_first_pts(source, "a:0")
-                    - storage.probe_stream_first_pts(source, "v:0")
-                )
+                video_start = storage.probe_stream_start_time(source, "v:0")
             except storage.UploadError as exc:
                 raise StitchError(f"source timeline probe failed: {exc}") from None
-            trim_start = max(0.0, -offset)
-            delay_ms = max(0, round(max(0.0, offset) * 1000))
             audio_filter = (
-                f"[1:a:0]atrim=start={trim_start:.9f},asetpts=PTS-STARTPTS,"
-                f"adelay=delays={delay_ms}:all=1,apad,"
+                f"[1:a:0]asetpts=PTS-({video_start:.9f})/TB,"
+                "aresample=async=1:first_pts=0,apad,"
                 f"atrim=duration={encoded_duration:.9f}[a]"
             )
             _run(

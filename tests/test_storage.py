@@ -529,6 +529,80 @@ def test_probe_video_real_webm_ignores_longer_audio_duration(tmp_path):
     assert storage.probe_video(source).duration_s == pytest.approx(2.0, abs=0.02)
 
 
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg unavailable")
+def test_stream_start_time_uses_presentation_start_not_aac_priming_packet(tmp_path):
+    source = tmp_path / "aac.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=black:size=64x64:rate=24:d=2",
+            "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=2",
+            "-map", "0:v", "-map", "1:a", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", str(source),
+        ],
+        check=True,
+    )
+
+    raw_audio_pts = min(
+        float(packet["pts_time"])
+        for packet in storage._probe_packets(source, "a:0")
+        if "pts_time" in packet
+    )
+    assert raw_audio_pts < 0
+    assert storage.probe_stream_start_time(source, "v:0") == pytest.approx(0.0)
+    assert storage.probe_stream_start_time(source, "a:0") == pytest.approx(0.0)
+
+
+def test_audio_start_time_without_stream_start_corrects_skip_samples(tmp_path, monkeypatch):
+    metadata = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"streams": [{"sample_rate": "48000"}]}),
+        stderr="",
+    )
+    packets = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"packets": [{
+            "pts_time": "-0.021333",
+            "side_data_list": [{"side_data_type": "Skip Samples", "skip_samples": 1024}],
+        }]}),
+        stderr="",
+    )
+    responses = iter((metadata, packets))
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: next(responses))
+
+    assert storage.probe_stream_start_time(
+        tmp_path / "source.mp4", "a:0"
+    ) == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize(("sample_rate", "skip_samples"), [
+    (True, 1024), ("nan", 1024), ("48000", True), ("48000", "nan"),
+])
+def test_audio_start_time_rejects_invalid_priming_numbers(
+    tmp_path, monkeypatch, sample_rate, skip_samples,
+):
+    metadata = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"streams": [{"sample_rate": sample_rate}]}),
+        stderr="",
+    )
+    packets = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"packets": [{
+            "pts_time": "-0.021333",
+            "side_data_list": [{
+                "side_data_type": "Skip Samples", "skip_samples": skip_samples,
+            }],
+        }]}),
+        stderr="",
+    )
+    responses = iter((metadata, packets))
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: next(responses))
+
+    with pytest.raises(storage.UploadError, match="priming"):
+        storage.probe_stream_start_time(tmp_path / "source.mp4", "a:0")
+
+
 @pytest.mark.parametrize("stream_duration", ["0", "nan", "inf", "-1"])
 def test_probe_video_rejects_invalid_stream_duration_without_decoded_fallback(
     tmp_path, monkeypatch, stream_duration,

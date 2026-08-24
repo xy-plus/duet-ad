@@ -74,17 +74,12 @@ def extract_audio(cdir: Path) -> Path | None:
     out = work / "voice.mp3"
     try:
         visual_duration = storage.probe_video(source).duration_s
-        offset = (
-            storage.probe_stream_first_pts(source, "a:0")
-            - storage.probe_stream_first_pts(source, "v:0")
-        )
+        video_start = storage.probe_stream_start_time(source, "v:0")
     except storage.UploadError as exc:
         raise PipelineError(f"audio timeline probe failed: {exc}") from None
-    trim_start = max(0.0, -offset)
-    delay_ms = max(0, round(max(0.0, offset) * 1000))
     audio_filter = (
-        f"atrim=start={trim_start:.9f},asetpts=PTS-STARTPTS,"
-        f"adelay=delays={delay_ms}:all=1,apad,"
+        f"asetpts=PTS-({video_start:.9f})/TB,"
+        "aresample=async=1:first_pts=0,apad,"
         f"atrim=duration={visual_duration:.9f}"
     )
     try:

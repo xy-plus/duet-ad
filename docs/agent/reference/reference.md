@@ -329,7 +329,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 
 短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。长链每段使用 `minimax_h3_lightx2v`，只传冻结的 `first_frame/last_frame/prompt/duration/resolution`，输出到该段 `generated.mp4`；不是供应商原生 extend。
 
-长链同一 `chain_id` 严格串行，最多并发两条 chain。`continue` 段在前一段成功后提取其精确尾帧作为 first frame；`hard_cut` 段直接使用本段源首帧。任一子任务 `submission_unknown` 锁住整批；确定失败只允许新父请求推进失败段及未完成下游，已成功段复用。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 复用 source 音轨并保留 `audio_first_pts-video_first_pts`（正值补前置静音、负值裁视频零点前音频），最后在画面终点裁剪或补静音，画面时长不变；`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
+长链同一 `chain_id` 严格串行，最多并发两条 chain。`continue` 段在前一段成功后提取其精确尾帧作为 first frame；`hard_cut` 段直接使用本段源首帧。任一子任务 `submission_unknown` 锁住整批；确定失败只允许新父请求推进失败段及未完成下游，已成功段复用。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 复用 source 音轨，以视频 presentation start 归零并由解码器处理 AAC/Opus priming，再按解码后的音频时间戳补前置静音或裁视频零点前音频，最后在画面终点裁剪或补静音，画面时长不变；`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
 
 输出下载门禁：只接受无 userinfo 的 HTTPS；hostname/IP 预解析必须全为公网地址，私网、loopback、local、reserved、multicast 均确定拒绝。owned httpx client 使用 `trust_env=false`；响应后在读取 status/body 前通过 `extensions.network_stream.get_extra_info("server_addr")` 验证实际 socket peer 也是公网地址。实际 peer 为私网仍是 `download_url_rejected`；DNS 临时失败为 `download_dns_failed`，缺失/异常/非 IP peer 为 `download_peer_unverified`，后二者同 id 恢复。
 
