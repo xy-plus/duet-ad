@@ -332,7 +332,6 @@ def claim_submission_input(data_dir: Path, cid: str, request_id: str) -> dict | 
         owner = _input_owner(cdir, "submit", request_id)
         meta["_input_owner"] = owner
         meta["error"] = None
-        meta.pop("input_recovery", None)
         meta["updated_at"] = _now()
         _write_meta(cdir, meta)
         return meta
