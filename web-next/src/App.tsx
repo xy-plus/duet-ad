@@ -733,11 +733,7 @@ function Workspace() {
                   placement="end"
                   variant="filled"
                   rootClassName="user-bubble"
-                  content={(
-                    <SourceVideo
-                      name={active.sourceMode === 'link' ? active.sourceUrl : active.uploadFileName}
-                    />
-                  )}
+                  content={<SourceVideo name={active.sourceMode === 'link' ? active.sourceUrl : active.uploadFileName} />}
                 />
                 <Bubble
                   placement="start"
