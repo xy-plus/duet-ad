@@ -296,7 +296,7 @@ def assert_segments_valid(segments, duration):
     ],
 )
 def test_build_segments_long_scene_stays_within_limits(bounds, duration):
-    """超 15s 单场景：每段 1~15s、覆盖全程无缝隙、边界单调递增。"""
+    """长单场景：provider 请求不超过 10s，覆盖全程且边界连续。"""
     assert_segments_valid(build_segments(bounds, duration), duration)
 
 
@@ -316,7 +316,7 @@ def test_build_segments_violation_cases(bounds, duration):
 
 
 def test_build_segments_merges_short_tail():
-    """末段不足 4s 并入前段（合并体超 15s 则均分）。"""
+    """场景尾段较短时仍要保持 provider-safe 且全程连续。"""
     bounds = [(0.0, 8.0), (8.0, 14.0), (14.0, 27.5), (27.5, 29.5)]
     assert_segments_valid(build_segments(bounds, 29.5), 29.5)
 

@@ -99,7 +99,7 @@ flowchart LR
 
 写 receipt 后立即经过同一 loader 复核；提交和重启恢复也重新加载。未知 schema/version、路径越界、文件缺失/漂移、台词漂移、最终 prompt 不是确定性组合时全部 fail closed。提交锁内会按用户最终台词和画幅选择重写 receipt，随后 H3Request 只使用当次加载的不可变 bytes。
 
-长链不用短链 receipt 冒充多段输入。`long_video_plan.json`（`duet.long-video-plan` v1）绑定完整源文件、总时长、FL2VA workflow，以及每段的范围、chain/join、源片、关键帧、首尾锚点、视觉/最终提示词和台词摘要。detail 暴露该文件内容的 SHA-256 为 `plan_receipt`；提交必须原样回传 `expected_plan_receipt`。服务在任何供应商 POST 前重新校验 plan、meta 和所有文件哈希，并将确认值冻结到 `frozen_plan_receipt`。
+长链不用短链 receipt 冒充多段输入。新 `long_video_plan.json`（`duet.long-video-plan` v2，v1 仅用于历史恢复）绑定完整源文件、总时长、FL2VA workflow，以及每段的范围、chain/join、源片、关键帧、首尾锚点、视觉/最终提示词和台词摘要。detail 暴露该文件内容的 SHA-256 为 `plan_receipt`；提交必须原样回传 `expected_plan_receipt`。服务在任何供应商 POST 前重新校验 plan、meta 和所有文件哈希，并将确认值冻结到 `frozen_plan_receipt`。
 
 历史长会话若 `fit_required=null` 且尚未冻结提交，detail 与 submit 从通过路径和哈希校验的 plan anchors 纯派生，不由 GET 改写 meta；不完整或越界 plan 返回未知并在付费前拒绝。plan、prompt 与 anchors 都以单次读取的 SHA-bound bytes 快照完成解析、比例判断、画幅派生和 H3 请求构造，路径随后变化不能替换已验证的付费输入。若会话已有 generation/frozen receipt，则以已冻结 `fit_mode` 投影有效值，保持 active、failed 和 resume 请求的原 CAS，不重写输入。
 
@@ -138,7 +138,7 @@ data/<cid>/
 ├── meta.json                         # conversation schema v2
 ├── source.<mp4|mov|webm>
 ├── prepared_input.json               # short only: duet.prepared-input v1
-├── long_video_plan.json              # long only: duet.long-video-plan v1
+├── long_video_plan.json              # long only: duet.long-video-plan v2 (v1 recovery)
 ├── generated.mp4                     # H3 success only
 ├── .h3/                               # short-video attempt state
 │   ├── session.json

@@ -9,7 +9,7 @@ import subprocess
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Mapping
 
 from app import frame_fit, h3, long_video, prepared_input, stitch, storage
 
@@ -420,46 +420,6 @@ def _result_status(result: h3.H3Result) -> tuple[str, str | None]:
     return "failed", result.error_code or "h3_failed"
 
 
-def reusable_segment_indices(
-    expected_indices: Sequence[int],
-    prior_segments: object,
-    artifact_exists: Callable[[int], bool],
-) -> frozenset[int]:
-    """Return paid segment outputs that are safe to reuse on retry."""
-    expected = tuple(expected_indices)
-    if len(set(expected)) != len(expected) or not isinstance(prior_segments, list):
-        return frozenset()
-    by_index: dict[int, dict] = {}
-    observed: list[int] = []
-    for item in prior_segments:
-        if not isinstance(item, dict):
-            return frozenset()
-        index = item.get("index")
-        if (
-            isinstance(index, bool)
-            or not isinstance(index, int)
-            or index not in expected
-            or index in by_index
-        ):
-            return frozenset()
-        observed.append(index)
-        by_index[index] = item
-    if observed != [index for index in expected if index in by_index]:
-        return frozenset()
-
-    reusable = set()
-    for index, item in by_index.items():
-        if item.get("status") != "succeeded":
-            continue
-        try:
-            exists = artifact_exists(index)
-        except OSError:
-            exists = False
-        if exists:
-            reusable.add(index)
-    return frozenset(reusable)
-
-
 def generation_segments_are_valid(
     expected_segments: object,
     generation: Mapping,
@@ -574,12 +534,6 @@ def bound_reusable_segment_indices(
         except (OSError, h3.H3Error, LongGenerationError, ValueError):
             return False
 
-    structurally_valid = reusable_segment_indices(expected, segments, lambda _index: True)
-    if structurally_valid != frozenset(
-        item.get("index") for item in segments or []
-        if isinstance(item, dict) and item.get("status") == "succeeded"
-    ):
-        return frozenset()
     for index in expected:
         if valid(index):
             reusable.add(index)

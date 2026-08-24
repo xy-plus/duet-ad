@@ -21,12 +21,6 @@ except ImportError as exc:  # pragma: no cover - environment-dependent message
         "PySceneDetect is required. Install scenedetect>=0.7 in the server environment."
     ) from exc
 
-# 与当前生成链单段上限耦合：新长视频每段 provider 请求不超过 10s。
-SEGMENT_MIN_S = long_video.SEGMENT_MIN_S
-SEGMENT_MAX_S = long_video.SEGMENT_PROVIDER_MAX_DURATION_S
-SEGMENT_ONLY_ABOVE_S = long_video.SHORT_VIDEO_MAX_S
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="检测视频场景边界，把关键帧按场景分组，并给出拆段边界建议。"
@@ -98,28 +92,6 @@ def group_frames(
     return groups
 
 
-def _assert_segments_valid(
-    segments: list[tuple[float, float]], duration: float
-) -> None:
-    """防御性断言拆段不变量：请求 ≤10s、相邻无缝、首 0 尾 duration。"""
-    if not segments:
-        raise SystemExit("拆段结果为空。")
-    prev_end = 0.0
-    for start, end in segments:
-        if abs(start - prev_end) > 1e-6:
-            raise SystemExit(f"拆段边界不连续: {start:.6f}s 与 {prev_end:.6f}s")
-        if (
-            end - start < SEGMENT_MIN_S - 1e-9
-            or long_video.provider_duration_s(start, end) > SEGMENT_MAX_S
-        ):
-            raise SystemExit(f"拆段长度违规: {start:.6f}s - {end:.6f}s")
-        prev_end = end
-    if abs(segments[0][0]) > 1e-6 or abs(prev_end - duration) > 1e-6:
-        raise SystemExit(
-            f"拆段未覆盖全程: [{segments[0][0]:.6f}s, {prev_end:.6f}s] vs {duration:.6f}s"
-        )
-
-
 def build_segments(
     bounds: list[tuple[float, float]], duration: float
 ) -> list[tuple[float, float]]:
@@ -127,12 +99,10 @@ def build_segments(
 
     输入契约：bounds 须已 round(3)（main 侧已做，本函数内部对 duration 同口径 round）。"""
     duration = round(duration, 3)  # 统一 3 位口径：bounds 已 round(3)，断言两端才可比
-    if duration <= SEGMENT_ONLY_ABOVE_S:
+    if duration <= long_video.SHORT_VIDEO_MAX_S:
         return []
     planned = long_video.plan_segments(duration, bounds, [])
-    segments = [(item["start_s"], item["end_s"]) for item in planned]
-    _assert_segments_valid(segments, duration)
-    return segments
+    return [(item["start_s"], item["end_s"]) for item in planned]
 
 
 def main() -> int:
