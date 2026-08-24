@@ -29,6 +29,8 @@ from app.config import Settings
 from app.sanitize import sanitize
 
 OPTION_KEYS = ("remove_subtitle", "remove_brand")
+_LEGACY_OPTION_KEYS = frozenset({"change_bg", "face_hold"})
+_CLIENT_REFRESH_MESSAGE = "页面版本已更新，请刷新页面后重试。"
 
 _INSTRUCTIONS = {
     "remove_subtitle": "移除图片中的所有字幕、水印和贴纸元素，其余（尺寸、内容等）保持不变",
@@ -44,10 +46,24 @@ _SEEDREAM_MAX_PIXELS = 4_624_220  # Ark 实测：超上限 400「image area must
 class PostprocessError(Exception):
     """后处理门控/执行失败（路由层转成 status+detail，同 SubmitError 模式）。"""
 
-    def __init__(self, status: int, detail: str) -> None:
-        super().__init__(detail)
+    def __init__(self, status: int, detail: str | dict[str, str]) -> None:
+        if isinstance(detail, dict):
+            if set(detail) != {"code", "message"} or not all(
+                isinstance(detail[key], str) and detail[key]
+                for key in ("code", "message")
+            ):
+                raise TypeError("structured postprocess detail must contain safe code and message")
+            public_detail: str | dict[str, str] = {
+                "code": detail["code"],
+                "message": detail["message"],
+            }
+        elif isinstance(detail, str):
+            public_detail = detail
+        else:
+            raise TypeError("postprocess detail must be a public string or safe structure")
+        super().__init__(str(public_detail))
         self.status = status
-        self.detail = detail
+        self.detail = public_detail
 
 
 async def start(
@@ -59,6 +75,8 @@ async def start(
     meta = storage.load_meta(settings.data_dir, cid)
     if meta is None:
         raise PostprocessError(404, "not found")
+    if set(payload) != {"confirm", "options"}:
+        raise PostprocessError(422, "invalid_postprocess_request")
     if payload.get("confirm") is not True:
         raise PostprocessError(409, "confirmation required")
     options = _parse_options(payload)
@@ -68,17 +86,22 @@ async def start(
         raise PostprocessError(409, "already running")
     last = meta.get("postprocess") or {}
     if last.get("status") in ("done", "failed") and not _options_match(last.get("options"), options):
-        raise PostprocessError(409, "options changed since last run")
+        raise PostprocessError(409, _options_locked_detail())
     lock = locks.setdefault(cid, asyncio.Lock())
     async with lock:
         meta = storage.load_meta(settings.data_dir, cid)
         if meta is None or (meta.get("postprocess") or {}).get("status") == "running":
             raise PostprocessError(409, "already running")
+        last_in = meta.get("postprocess") or {}
+        if (
+            last_in.get("status") in ("done", "failed")
+            and not _options_match(last_in.get("options"), options)
+        ):
+            raise PostprocessError(409, _options_locked_detail())
         _targets(settings.data_dir / cid, meta)  # 产物完整才受理（帧目录缺失 → 409）
         # 纯废弃形态（旧版只勾 change_bg 等）放行重跑：清除旧产物，强制全帧重编辑防贴错标签；
         # 锁内执行（用锁内重载的 meta），避免「清产物后复查失败毁掉旧产物」与并发 stale 读窗口；
         # 同选项正常重跑不清产物（跳过逻辑依赖已有输出）
-        last_in = meta.get("postprocess") or {}
         if last_in.get("status") in ("done", "failed") and _is_pure_legacy(last_in.get("options")):
             _clear_postprocessed(settings.data_dir / cid, meta)
         storage.update_meta(settings.data_dir, cid, postprocess={
@@ -129,7 +152,8 @@ async def run_task(
         storage.update_meta(settings.data_dir, cid, postprocess=post)
         raise
     except PostprocessError as e:
-        post = {"status": "failed", "options": options, "frames": sorted(frames), "error": e.detail}
+        error = e.detail if isinstance(e.detail, str) else e.detail["message"]
+        post = {"status": "failed", "options": options, "frames": sorted(frames), "error": error}
     except Exception as e:
         post = {"status": "failed", "options": options, "frames": sorted(frames), "error": sanitize(str(e))}
     storage.update_meta(settings.data_dir, cid, postprocess=post)
@@ -170,7 +194,7 @@ async def _edit_one(
 def _frame_error(name: str, e: BaseException) -> str:
     """失败帧错误文案：_edit_one 已包装成 PostprocessError 的直接用 detail，异常形态兜底脱敏。"""
     if isinstance(e, PostprocessError):
-        return e.detail
+        return e.detail if isinstance(e.detail, str) else e.detail["message"]
     return f"frame {name} failed: {sanitize(str(e))}"
 
 
@@ -238,6 +262,11 @@ def _parse_options(payload: dict) -> dict[str, bool]:
         raise PostprocessError(422, "at least one option required")
     unknown = sorted(set(raw) - set(OPTION_KEYS))
     if unknown:
+        if (
+            set(unknown) <= _LEGACY_OPTION_KEYS
+            and all(isinstance(value, bool) for value in raw.values())
+        ):
+            raise PostprocessError(409, _CLIENT_REFRESH_MESSAGE)
         raise PostprocessError(422, f"unknown options: {', '.join(unknown)}")
     options: dict[str, bool] = {}
     for key in OPTION_KEYS:
@@ -248,6 +277,13 @@ def _parse_options(payload: dict) -> dict[str, bool]:
     if not any(options.values()):
         raise PostprocessError(422, "at least one option required")
     return options
+
+
+def _options_locked_detail() -> dict[str, str]:
+    return {
+        "code": "postprocess_options_locked",
+        "message": "后处理选项已锁定，请刷新页面后按原选项重试。",
+    }
 
 
 def _targets(cdir: Path, meta: dict) -> list[tuple[int | None, Path, Path]]:

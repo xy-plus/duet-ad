@@ -31,14 +31,16 @@ def test_list_conversations_shape(client, video_1s):
 
 
 def test_html_entrypoints_and_app_contract_are_never_cached(client):
-    for path in ("/", "/index.html", "/app.js"):
+    for path in ("/", "/index.html", "/app.js", "/styles.css"):
         response = client.get(path)
         assert response.status_code == 200
         assert response.headers["cache-control"] == "no-store"
+        conditional = client.get(
+            path, headers={"If-None-Match": response.headers["etag"]}
+        )
+        assert conditional.status_code == 304
+        assert conditional.headers["cache-control"] == "no-store"
 
-    assert "no-store" not in client.get("/styles.css").headers.get(
-        "cache-control", ""
-    )
     assert "no-store" not in client.get("/api/health").headers.get(
         "cache-control", ""
     )

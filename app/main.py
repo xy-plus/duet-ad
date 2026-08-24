@@ -53,6 +53,8 @@ _KNOWN_TASK_ERRORS = frozenset(
         "output_probe_failed",
     }
 )
+_NO_STORE_WEB_PATHS = frozenset({"/", "/index.html", "/app.js", "/styles.css"})
+_CLIENT_REFRESH_MESSAGE = "页面版本已更新，请刷新页面后重试。"
 
 
 class _SubmitError(RuntimeError):
@@ -239,7 +241,10 @@ def _replace_source_prompt(
     if current is None or current_sha256 is None:
         raise _SubmitError(409, "prepared_input_invalid")
     if expected_sha256 != current_sha256:
-        raise _SubmitError(409, "prompt_changed")
+        raise _SubmitError(409, {
+            "code": "prompt_changed",
+            "message": "提示词已更新，请刷新页面后重试。",
+        })
     replacement = prompt.strip()
     if (
         not replacement
@@ -854,6 +859,14 @@ class _RateLimiter:
 def create_app(settings: Settings) -> FastAPI:
     app = FastAPI()
     app.state.settings = settings
+
+    @app.middleware("http")
+    async def prevent_stale_web_contracts(request: Request, call_next):
+        response = await call_next(request)
+        if request.method in {"GET", "HEAD"} and request.url.path in _NO_STORE_WEB_PATHS:
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
     limiter = _RateLimiter()
     codex_runner = CodexRunner(
         timeout_s=settings.codex_timeout_s, concurrency=settings.codex_concurrency
@@ -928,7 +941,10 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/api/login")
     async def login(payload: dict):
-        if not hmac.compare_digest(str(payload.get("token", "")), settings.access_token):
+        token = payload.get("token")
+        if set(payload) - {"token"} or ("token" in payload and not isinstance(token, str)):
+            raise HTTPException(status_code=422, detail="invalid_login_request")
+        if not isinstance(token, str) or not hmac.compare_digest(token, settings.access_token):
             raise HTTPException(status_code=401, detail="invalid token")
         return {"ok": True}
 
@@ -961,6 +977,15 @@ def create_app(settings: Settings) -> FastAPI:
         ip = request.client.host if request.client else "unknown"
         if not limiter.allow(ip):
             raise HTTPException(status_code=429, detail="too many uploads")
+        form = await request.form()
+        allowed_form_fields = {
+            "file", "reference_url", "note", "client_request_id",
+            "voice_mode", "target_language",
+        }
+        if set(form) - allowed_form_fields or any(
+            len(form.getlist(key)) != 1 for key in form
+        ):
+            raise HTTPException(status_code=422, detail="invalid_create_request")
         reference_url = reference_url.strip()
         if (file is None) == (not reference_url):
             raise HTTPException(status_code=400, detail="provide exactly one of file or reference_url")
@@ -969,9 +994,11 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=400, detail="invalid client_request_id")
         # 口播转换：模式白名单 + 翻译必填目标语言；非 translate 忽略 target_language
         voice_mode = voice_mode.strip()
+        target_language = target_language.strip()
+        if voice_mode == "none" and not target_language:
+            raise HTTPException(status_code=409, detail=_CLIENT_REFRESH_MESSAGE)
         if voice_mode not in ("keep", "rewrite", "translate"):
             raise HTTPException(status_code=422, detail=f"invalid voice_mode: {voice_mode}")
-        target_language = target_language.strip()
         if voice_mode == "translate" and not target_language:
             raise HTTPException(status_code=422, detail="target_language required for translate")
         with create_lock:
@@ -1417,17 +1444,6 @@ def create_app(settings: Settings) -> FastAPI:
 
     web = Path(__file__).resolve().parent.parent / "web"
     if web.is_dir():
-        no_store = {"Cache-Control": "no-store"}
-
-        @app.get("/", include_in_schema=False)
-        @app.get("/index.html", include_in_schema=False)
-        async def web_index():
-            return FileResponse(web / "index.html", headers=no_store)
-
-        @app.get("/app.js", include_in_schema=False)
-        async def web_app_contract():
-            return FileResponse(web / "app.js", headers=no_store)
-
         app.mount("/", StaticFiles(directory=web, html=True), name="web")
 
     return app
