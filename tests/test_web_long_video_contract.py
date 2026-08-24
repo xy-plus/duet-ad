@@ -32,13 +32,16 @@ def test_long_video_contract_fails_closed_when_plan_metadata_is_missing():
 def test_long_submit_is_restricted_and_binds_current_plan_receipt():
     payload = _run_contract(
         "contract.buildSubmitPayload({clientRequestId:'request-long',dialogueMode:'auto',"
-        "fitRequired:false,isLong:true,planReceipt:'c'.repeat(64)})"
+        "fitRequired:false,isLong:true,planReceipt:'c'.repeat(64),"
+        "aspectRatio:'16:9',resolution:'480p'})"
     )
     assert payload == {
         "confirm": True,
         "client_request_id": "request-long",
         "dialogue_mode": "auto",
         "fit_mode": "none",
+        "aspect_ratio": "16:9",
+        "resolution": "480p",
         "expected_plan_receipt": "c" * 64,
     }
 
@@ -46,13 +49,16 @@ def test_long_submit_is_restricted_and_binds_current_plan_receipt():
 def test_short_submit_payload_remains_unchanged():
     payload = _run_contract(
         "contract.buildSubmitPayload({clientRequestId:'request-short',dialogueMode:'custom',"
-        "linesText:'0 - 1 | hello',fitRequired:false,isLong:false,planReceipt:'d'.repeat(64)})"
+        "linesText:'0 - 1 | hello',fitRequired:false,isLong:false,planReceipt:'d'.repeat(64),"
+        "aspectRatio:'9:16',resolution:'768p'})"
     )
     assert payload == {
         "confirm": True,
         "client_request_id": "request-short",
         "dialogue_mode": "custom",
         "fit_mode": "none",
+        "aspect_ratio": "9:16",
+        "resolution": "768p",
         "lines": [{"start_s": 0, "end_s": 1, "text": "hello"}],
     }
 
@@ -61,13 +67,15 @@ def test_long_resume_reuses_attempt_and_current_plan_receipt():
     payload = _run_contract(
         "contract.buildResumePayload({duration_s:30,segment_count:2,plan_receipt:'f'.repeat(64),"
         "generation:{status:'resume_required',client_request_id:'request-old'},"
-        "dialogue:{mode:'none',lines:[]},fit_mode:'none'})"
+        "dialogue:{mode:'none',lines:[]},fit_mode:'none',aspect_ratio:'16:9',resolution:'480p'})"
     )
     assert payload == {
         "confirm": True,
         "client_request_id": "request-old",
         "dialogue_mode": "none",
         "fit_mode": "none",
+        "aspect_ratio": "16:9",
+        "resolution": "480p",
         "expected_plan_receipt": "f" * 64,
     }
 
@@ -107,6 +115,7 @@ def test_stitch_retry_reuses_frozen_request_and_parameters():
     payload = _run_contract(
         "contract.buildStitchRetryPayload({duration_s:30,segment_count:2,"
         "plan_receipt:'a'.repeat(64),fit_mode:'pad',dialogue:{mode:'none',lines:[]},"
+        "aspect_ratio:'9:16',resolution:'768p',"
         "generation:{status:'failed',stage:'stitch',client_request_id:'request-old'}})"
     )
     assert payload == {
@@ -114,6 +123,8 @@ def test_stitch_retry_reuses_frozen_request_and_parameters():
         "client_request_id": "request-old",
         "dialogue_mode": "none",
         "fit_mode": "pad",
+        "aspect_ratio": "9:16",
+        "resolution": "768p",
         "expected_plan_receipt": "a" * 64,
     }
 
@@ -122,6 +133,7 @@ def test_failed_segment_retry_uses_new_request_with_frozen_parameters():
     payload = _run_contract(
         "contract.buildLongRetryPayload({duration_s:30,segment_count:2,"
         "plan_receipt:'b'.repeat(64),fit_required:true,fit_mode:'crop',"
+        "aspect_ratio:'9:16',resolution:'768p',"
         "dialogue:{mode:'auto',lines:[]},generation:{status:'failed',stage:'h3',"
         "client_request_id:'request-old',segments:[{index:1,status:'succeeded'},"
         "{index:2,status:'failed'}]}},'request-new')"
@@ -131,6 +143,8 @@ def test_failed_segment_retry_uses_new_request_with_frozen_parameters():
         "client_request_id": "request-new",
         "dialogue_mode": "auto",
         "fit_mode": "crop",
+        "aspect_ratio": "9:16",
+        "resolution": "768p",
         "expected_plan_receipt": "b" * 64,
     }
 

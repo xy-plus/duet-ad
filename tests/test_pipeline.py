@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import codex_runner, long_generation, long_video, pipeline, prepared_input, storage, vocal, voice
+from app import codex_runner, h3, long_generation, long_video, pipeline, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
@@ -2266,7 +2266,7 @@ def test_startup_reconciles_half_committed_prepared_receipt_without_rewrite(
         ratio="9:16",
         fit_mode="none",
         engine_request={"h3": {"workflow": pipeline.H3_ENGINE_WORKFLOW,
-                               "duration": 1, "resolution": "720p"}},
+                               "duration": 1, "resolution": h3.H3_RESOLUTION}},
     )
     if meta_pointer:
         storage.update_meta(
@@ -2427,6 +2427,12 @@ def test_post_triggers_pipeline_and_detail_filled(tmp_path, video_1s, fake_steps
     assert body["status"] == "done"
     assert body["keyframes"] == ["01.png", "02.png", "03.png"]
     assert body["prompt"] == prepared_input.compose_final_prompt(PROMPT_TEXT, ())
+    assert body["aspect_ratio"] == "16:9"
+    assert body["resolution"] == "480p"
+    assert body["fit_profiles"] == {
+        "16:9": {"fit_required": True, "default_fit_mode": "crop"},
+        "9:16": {"fit_required": True, "default_fit_mode": "crop"},
+    }
     assert "has_preview" not in body
     assert body["error"] is None
 
@@ -2450,6 +2456,8 @@ def test_done_fit_requirement_uses_actual_keyframes_not_source_dimensions(
 
     assert detail["status"] == "done"
     assert detail["fit_required"] is True  # fake Codex 产出 1x1 关键帧
+    assert detail["aspect_ratio"] == "9:16"
+    assert detail["resolution"] == "480p"
 
 
 def test_pipeline_off_by_default(client, video_1s, monkeypatch):

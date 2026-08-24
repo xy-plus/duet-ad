@@ -36,6 +36,8 @@ _RATE_WINDOW_S = 60
 _CLIENT_REQUEST_ID_RE = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 _DIALOGUE_MODES = frozenset({"auto", "edit", "custom", "none"})
 _FIT_MODES = frozenset({"none", "crop", "pad"})
+_ASPECT_RATIOS = h3.H3_ASPECT_RATIOS
+_RESOLUTIONS = h3.H3_RESOLUTIONS
 _GENERATION_ACTIVE = frozenset({"queued", "running"})
 _GENERATION_RETRYABLE = frozenset({"failed"})
 _GENERATION_RESUMABLE = frozenset({"resume_required"})
@@ -301,6 +303,50 @@ def _is_long_video(meta: dict) -> bool:
     )
 
 
+def _generation_semantics(meta: dict) -> tuple[str, str]:
+    """Read frozen/recommended values; missing historical fields are exact legacy defaults."""
+    aspect_ratio = meta.get("aspect_ratio", h3.H3_DEFAULT_ASPECT_RATIO)
+    resolution = meta.get("resolution", h3.H3_DEFAULT_RESOLUTION)
+    if aspect_ratio not in _ASPECT_RATIOS or resolution not in _RESOLUTIONS:
+        raise _SubmitError(409, "generation_parameters_invalid")
+    return aspect_ratio, resolution
+
+
+def _validated_fit_profiles(meta: dict) -> dict[str, dict[str, object]]:
+    raw = meta.get("fit_profiles")
+    if isinstance(raw, dict) and set(raw) == set(_ASPECT_RATIOS):
+        normalized = {}
+        for aspect_ratio in ("16:9", "9:16"):
+            profile = raw.get(aspect_ratio)
+            if (
+                not isinstance(profile, dict)
+                or set(profile) != {"fit_required", "default_fit_mode"}
+                or not isinstance(profile.get("fit_required"), bool)
+                or profile.get("default_fit_mode")
+                != ("crop" if profile["fit_required"] else "none")
+            ):
+                raise _SubmitError(409, "generation_parameters_invalid")
+            normalized[aspect_ratio] = dict(profile)
+        return normalized
+    # Historical receipts had only the fixed 9:16 requirement. Preserve that
+    # exact interpretation; the alternative profile is conservatively fitted.
+    legacy_required = meta.get("fit_required")
+    if isinstance(legacy_required, bool):
+        return {
+            "16:9": {"fit_required": True, "default_fit_mode": "crop"},
+            "9:16": {
+                "fit_required": legacy_required,
+                "default_fit_mode": "crop" if legacy_required else "none",
+            },
+        }
+    raise _SubmitError(409, "fit_requirement_unknown")
+
+
+def _selected_fit(meta: dict, aspect_ratio: str) -> tuple[bool, str]:
+    profile = _validated_fit_profiles(meta)[aspect_ratio]
+    return bool(profile["fit_required"]), str(profile["default_fit_mode"])
+
+
 def _long_fit_required(cdir: Path, meta: dict) -> bool:
     """Resolve legacy-null long-video fit state from its immutable H3 anchors."""
     generation = meta.get("generation")
@@ -332,7 +378,8 @@ def _long_fit_required(cdir: Path, meta: dict) -> bool:
                     ((segment.first_frame,) if segment.join_mode == "hard_cut" else ())
                     + (segment.last_frame,)
                 )
-            ]
+            ],
+            h3.H3_DEFAULT_ASPECT_RATIO,
         )
     except (frame_fit.FrameFitError, long_generation.LongGenerationError):
         raise _SubmitError(409, "fit_requirement_unknown") from None
@@ -538,7 +585,7 @@ def _validated_dialogue(meta: dict, payload: dict) -> tuple[dict, ...]:
 
 def _validate_submit_payload(
     meta: dict, payload: dict
-) -> tuple[str, str, tuple[dict, ...]]:
+) -> tuple[str, str, str, str, tuple[dict, ...]]:
     if payload.get("confirm") is not True:
         raise _SubmitError(409, "confirmation required")
     allowed = {
@@ -547,34 +594,54 @@ def _validate_submit_payload(
         "dialogue_mode",
         "lines",
         "fit_mode",
+        "aspect_ratio",
+        "resolution",
     }
     if set(payload) - allowed:
         raise _SubmitError(422, "invalid_submit_request")
     request_id = payload.get("client_request_id")
     if not isinstance(request_id, str) or not _CLIENT_REQUEST_ID_RE.fullmatch(request_id):
         raise _SubmitError(422, "invalid_client_request_id")
+    aspect_ratio = payload.get("aspect_ratio")
+    if aspect_ratio not in _ASPECT_RATIOS:
+        raise _SubmitError(422, "invalid_aspect_ratio")
+    resolution = payload.get("resolution")
+    if resolution not in _RESOLUTIONS:
+        raise _SubmitError(422, "invalid_resolution")
     fit_mode = payload.get("fit_mode")
     if fit_mode not in _FIT_MODES:
         raise _SubmitError(422, "invalid_fit_mode")
-    if meta.get("fit_required") is True:
+    fit_required, _default_fit = _selected_fit(meta, aspect_ratio)
+    if fit_required:
         if fit_mode not in {"crop", "pad"}:
             raise _SubmitError(422, "fit_mode_required")
     elif fit_mode != "none":
         raise _SubmitError(422, "fit_mode_not_allowed")
-    return request_id, fit_mode, _validated_dialogue(meta, payload)
+    return (
+        request_id,
+        fit_mode,
+        aspect_ratio,
+        resolution,
+        _validated_dialogue(meta, payload),
+    )
 
 
-def _validate_long_submit_payload(meta: dict, payload: dict) -> tuple[str, str, str, str]:
+def _validate_long_submit_payload(
+    meta: dict, payload: dict,
+) -> tuple[str, str, str, str, str, str]:
     if payload.get("confirm") is not True:
         raise _SubmitError(409, "confirmation required")
     allowed = {
         "confirm", "client_request_id", "dialogue_mode", "fit_mode",
+        "aspect_ratio", "resolution",
         "expected_plan_receipt",
     }
     if set(payload) != allowed:
         if "lines" in payload or payload.get("dialogue_mode") in {"edit", "custom"}:
             raise _SubmitError(422, "long_video_audio_mode_unsupported")
-        legacy_allowed = allowed - {"expected_plan_receipt"}
+        legacy_allowed = allowed - {
+            "expected_plan_receipt", "aspect_ratio", "resolution"
+        }
         request_id = payload.get("client_request_id")
         dialogue_mode = payload.get("dialogue_mode")
         fit_mode = payload.get("fit_mode")
@@ -610,22 +677,29 @@ def _validate_long_submit_payload(meta: dict, payload: dict) -> tuple[str, str, 
         raise _SubmitError(422, "long_video_audio_mode_unsupported")
     if meta.get("voice_mode") != "keep":
         raise _SubmitError(422, "long_video_audio_mode_unsupported")
+    aspect_ratio = payload.get("aspect_ratio")
+    if aspect_ratio not in _ASPECT_RATIOS:
+        raise _SubmitError(422, "invalid_aspect_ratio")
+    resolution = payload.get("resolution")
+    if resolution not in _RESOLUTIONS:
+        raise _SubmitError(422, "invalid_resolution")
     fit_mode = payload.get("fit_mode")
     if fit_mode not in _FIT_MODES:
         raise _SubmitError(422, "invalid_fit_mode")
     if not isinstance(meta.get("generation"), dict):
-        if meta.get("fit_required") is True:
+        fit_required, _default_fit = _selected_fit(meta, aspect_ratio)
+        if fit_required:
             if fit_mode not in {"crop", "pad"}:
                 raise _SubmitError(422, "fit_mode_required")
-        elif meta.get("fit_required") is False:
+        else:
             if fit_mode != "none":
                 raise _SubmitError(422, "fit_mode_not_allowed")
-        else:
-            raise _SubmitError(409, "fit_requirement_unknown")
     expected = payload.get("expected_plan_receipt")
     if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise _SubmitError(422, "invalid_plan_receipt")
-    return request_id, fit_mode, dialogue_mode, expected
+    return (
+        request_id, fit_mode, dialogue_mode, expected, aspect_ratio, resolution
+    )
 
 
 def _make_h3_request(
@@ -635,6 +709,29 @@ def _make_h3_request(
     client_request_id: str,
 ) -> h3.H3Request:
     duration = max(1, math.ceil(frozen.duration_s))
+    engine_h3 = frozen.engine_request.get("h3")
+    legacy_engine = (
+        frozen.ratio == h3.H3_DEFAULT_ASPECT_RATIO
+        and isinstance(engine_h3, dict)
+        and engine_h3.get("resolution") == h3.H3_RESOLUTION
+        and "aspect_ratio" not in engine_h3
+        and "provider_resolution" not in engine_h3
+    )
+    if legacy_engine:
+        aspect_ratio = h3.H3_DEFAULT_ASPECT_RATIO
+        resolution = h3.H3_DEFAULT_RESOLUTION
+    elif (
+        frozen.ratio not in _ASPECT_RATIOS
+        or not isinstance(engine_h3, dict)
+        or engine_h3.get("aspect_ratio") != frozen.ratio
+        or engine_h3.get("resolution") not in _RESOLUTIONS
+        or engine_h3.get("provider_resolution")
+        != h3.provider_resolution(frozen.ratio, engine_h3.get("resolution"))
+    ):
+        raise _SubmitError(409, "prepared_input_invalid")
+    else:
+        aspect_ratio = frozen.ratio
+        resolution = engine_h3["resolution"]
     return h3.H3Request(
         cid=cid,
         workdir=(settings.data_dir / cid).resolve(),
@@ -646,6 +743,8 @@ def _make_h3_request(
         duration=duration,
         autodl_token=settings.autodl_art_token,
         timeouts=_timeouts(settings),
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
     )
 
 
@@ -656,6 +755,8 @@ def _freeze_submission(
     request_id: str,
     dialogue_mode: str,
     fit_mode: str,
+    aspect_ratio: str,
+    resolution: str,
     dialogue: tuple[dict, ...],
 ) -> h3.H3Request:
     cdir = (settings.data_dir / cid).resolve()
@@ -665,7 +766,12 @@ def _freeze_submission(
         keyframes = originals
     else:
         try:
-            keyframes = list(frame_fit.fit_frames(originals, work / "h3_frames" / fit_mode, fit_mode))
+            keyframes = list(frame_fit.fit_frames(
+                originals,
+                work / "h3_frames" / aspect_ratio.replace(":", "x") / fit_mode,
+                fit_mode,
+                aspect_ratio,
+            ))
         except frame_fit.FrameFitError:
             raise _SubmitError(409, "frame_fit_failed") from None
     visual = work / "visual_prompt.txt"
@@ -677,7 +783,11 @@ def _freeze_submission(
         "h3": {
             "workflow": h3.H3_WORKFLOW,
             "duration": request_duration,
-            "resolution": h3.H3_RESOLUTION,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "provider_resolution": h3.provider_resolution(
+                aspect_ratio, resolution
+            ),
         },
     }
     try:
@@ -692,7 +802,7 @@ def _freeze_submission(
             dialogue=dialogue,
             vocal_filter_enabled=bool(meta.get("vocal_filter_enabled", True)),
             duration_s=duration,
-            ratio="9:16",
+            ratio=aspect_ratio,
             fit_mode=fit_mode,
             engine_request=engine_request,
         )
@@ -723,12 +833,17 @@ def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
         )
     except prepared_input.PreparedInputError:
         raise _SubmitError(409, "prepared_input_invalid") from None
+    aspect_ratio, resolution = _generation_semantics(meta)
     if (
         frozen.dialogue_mode != meta.get("dialogue_mode")
         or frozen.fit_mode != meta.get("fit_mode")
+        or frozen.ratio != aspect_ratio
     ):
         raise _SubmitError(409, "prepared_input_invalid")
-    return _make_h3_request(settings, cid, frozen, request_id)
+    request = _make_h3_request(settings, cid, frozen, request_id)
+    if request.resolution != resolution:
+        raise _SubmitError(409, "prepared_input_invalid")
+    return request
 
 
 def _claim_first_submission(
@@ -960,6 +1075,12 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
     if not isinstance(raw_segments, list):
         return paths
     fit_mode = meta.get("fit_mode")
+    aspect_ratio = meta.get("aspect_ratio")
+    aspect_dir = (
+        aspect_ratio.replace(":", "x")
+        if aspect_ratio in _ASPECT_RATIOS
+        else None
+    )
     for raw in raw_segments:
         if not isinstance(raw, dict):
             continue
@@ -981,17 +1102,19 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
             tail = workdir / "work" / "generated_last.png"
             paths.add(tail)
             if fit_mode in {"crop", "pad"}:
+                fit_root = workdir / "work" / "h3_frames"
+                if aspect_dir is not None:
+                    fit_root = fit_root / aspect_dir
+                fit_root = fit_root / fit_mode
                 for role, anchor_index in (("first", 0), ("end", 1)):
                     if isinstance(anchors, list) and len(anchors) > anchor_index:
                         bound = _bound_artifact_path(cdir, anchors[anchor_index])
                         if bound is not None:
                             paths.add(
-                                workdir / "work" / "h3_frames" / fit_mode
-                                / role / bound.name
+                                fit_root / role / bound.name
                             )
                 paths.add(
-                    workdir / "work" / "h3_frames" / fit_mode
-                    / "continued" / tail.name
+                    fit_root / "continued" / tail.name
                 )
     paths.update(
         path for binding in candidates
@@ -1019,6 +1142,8 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
                 "id": meta.get("id"),
                 "duration_s": meta.get("duration_s"),
                 "fit_mode": meta.get("fit_mode"),
+                "aspect_ratio": meta.get("aspect_ratio"),
+                "resolution": meta.get("resolution"),
                 "dialogue_mode": meta.get("dialogue_mode"),
                 "segments": meta.get("segments"),
                 "frozen_plan_receipt": meta.get("frozen_plan_receipt"),
@@ -1034,6 +1159,8 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
                 "prepared_input_receipt": meta.get("prepared_input_receipt"),
                 "dialogue_mode": meta.get("dialogue_mode"),
                 "fit_mode": meta.get("fit_mode"),
+                "aspect_ratio": meta.get("aspect_ratio"),
+                "resolution": meta.get("resolution"),
                 "generation": generation_binding,
             }
             paths = _short_validation_paths(cdir, meta)
@@ -1262,6 +1389,12 @@ def _reconcile_stale_submission(settings: Settings, cid: str, owner: object) -> 
                 dialogue_mode=frozen.dialogue_mode,
                 prepared_dialogue=[dict(line) for line in frozen.dialogue],
                 fit_mode=frozen.fit_mode,
+                aspect_ratio=frozen.ratio,
+                resolution=(
+                    frozen.engine_request.get("h3", {}).get("resolution")
+                    if isinstance(frozen.engine_request.get("h3"), dict)
+                    else None
+                ),
             )
         except (
             OSError,
@@ -1502,6 +1635,8 @@ def create_app(settings: Settings) -> FastAPI:
                 settings.data_dir,
                 meta["id"],
                 duration_s=video.duration_s,
+                source_width=video.width,
+                source_height=video.height,
             )
         except (storage.UploadError, downloader.DownloadError) as e:
             storage.remove_conversation(settings.data_dir, meta["id"])
@@ -1518,12 +1653,19 @@ def create_app(settings: Settings) -> FastAPI:
         cdir = settings.data_dir / cid
         has_video = _has_valid_generated_video(settings, meta)
         source_prompt, source_prompt_sha256 = _source_prompt_snapshot(cdir)
-        effective_fit_required = meta.get("fit_required")
-        if _is_long_video(meta):
-            try:
-                effective_fit_required = _long_fit_required(cdir, meta)
-            except _SubmitError:
-                effective_fit_required = None
+        try:
+            effective_meta = meta
+            if _is_long_video(meta) and not isinstance(meta.get("fit_profiles"), dict):
+                effective_meta = {
+                    **meta,
+                    "fit_required": _long_fit_required(cdir, meta),
+                }
+            aspect_ratio, resolution = _generation_semantics(effective_meta)
+            fit_profiles = _validated_fit_profiles(effective_meta)
+            effective_fit_required = fit_profiles[aspect_ratio]["fit_required"]
+        except _SubmitError:
+            aspect_ratio = resolution = fit_profiles = None
+            effective_fit_required = None
         result = {
             "id": meta["id"],
             "title": meta["title"],
@@ -1543,6 +1685,9 @@ def create_app(settings: Settings) -> FastAPI:
             "duration_s": meta.get("duration_s"),
             "fit_required": effective_fit_required,
             "fit_mode": meta.get("fit_mode"),
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "fit_profiles": fit_profiles,
             "dialogue": _public_dialogue(meta),
             "receipt_version": _receipt_version(cdir, meta),
             "generation": _public_generation(meta, cdir, settings),
@@ -1625,7 +1770,14 @@ def create_app(settings: Settings) -> FastAPI:
                         settings.data_dir / cid, meta
                     ),
                 }
-                request_id, fit_mode, dialogue_mode, expected_receipt = (
+                (
+                    request_id,
+                    fit_mode,
+                    dialogue_mode,
+                    expected_receipt,
+                    aspect_ratio,
+                    resolution,
+                ) = (
                     _validate_long_submit_payload(effective_meta, payload)
                 )
             except _SubmitError as exc:
@@ -1658,6 +1810,8 @@ def create_app(settings: Settings) -> FastAPI:
                     meta.get("dialogue_mode") == dialogue_mode
                     and meta.get("fit_mode") == fit_mode
                     and meta.get("frozen_plan_receipt") == expected_receipt
+                    and _generation_semantics(meta)
+                    == (aspect_ratio, resolution)
                 )
                 # Active replays are pure idempotent reads.  In particular they
                 # must not rewrite fitted inputs or enqueue a second coordinator.
@@ -1702,6 +1856,8 @@ def create_app(settings: Settings) -> FastAPI:
                         expected_receipt,
                         fit_mode,
                         dialogue_mode,
+                        aspect_ratio=aspect_ratio,
+                        resolution=resolution,
                         prepare_fit=not isinstance(old, dict),
                     )
                 except long_generation.LongGenerationError as exc:
@@ -1765,6 +1921,8 @@ def create_app(settings: Settings) -> FastAPI:
                     voice_lines=[],
                     prepared_dialogue=[],
                     fit_mode=fit_mode,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
                     frozen_plan_receipt=expected_receipt,
                     generation=generation,
                 )
@@ -1777,7 +1935,13 @@ def create_app(settings: Settings) -> FastAPI:
                 background_tasks.add_task(long_generation.run, settings, cid, plan)
             return {"status": "queued", "attempt": attempt}
         try:
-            request_id, fit_mode, dialogue = _validate_submit_payload(meta, payload)
+            (
+                request_id,
+                fit_mode,
+                aspect_ratio,
+                resolution,
+                dialogue,
+            ) = _validate_submit_payload(meta, payload)
         except _SubmitError as exc:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
         if meta.get("status") != "done":
@@ -1819,18 +1983,20 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail="generation_state_invalid")
                 if previous_status in _GENERATION_ACTIVE or previous_status == "succeeded":
                     if previous_id == request_id:
+                        expected_dialogue = meta.get("prepared_dialogue")
+                        if (
+                            meta.get("dialogue_mode") != payload["dialogue_mode"]
+                            or meta.get("fit_mode") != fit_mode
+                            or _generation_semantics(meta)
+                            != (aspect_ratio, resolution)
+                            or not isinstance(expected_dialogue, list)
+                            or expected_dialogue != [dict(line) for line in dialogue]
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="resume_parameters_changed",
+                            )
                         if previous_status == "succeeded":
-                            expected_dialogue = meta.get("prepared_dialogue")
-                            if (
-                                meta.get("dialogue_mode") != payload["dialogue_mode"]
-                                or meta.get("fit_mode") != fit_mode
-                                or not isinstance(expected_dialogue, list)
-                                or expected_dialogue != [dict(line) for line in dialogue]
-                            ):
-                                raise HTTPException(
-                                    status_code=409,
-                                    detail="resume_parameters_changed",
-                                )
                             try:
                                 request = await asyncio.to_thread(
                                     _load_h3_request, settings, cid, meta
@@ -1875,6 +2041,13 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail=detail)
                 if previous_status in _GENERATION_RETRYABLE and previous_id == request_id:
                     raise HTTPException(status_code=409, detail="new client_request_id required")
+                if (
+                    previous_status in _GENERATION_RETRYABLE
+                    and _generation_semantics(meta) != (aspect_ratio, resolution)
+                ):
+                    raise HTTPException(
+                        status_code=409, detail="resume_parameters_changed"
+                    )
                 if previous_status in _GENERATION_RESUMABLE:
                     if previous_id != request_id:
                         raise HTTPException(status_code=409, detail="resume_request_id_mismatch")
@@ -1882,6 +2055,8 @@ def create_app(settings: Settings) -> FastAPI:
                     if (
                         meta.get("dialogue_mode") != payload["dialogue_mode"]
                         or meta.get("fit_mode") != fit_mode
+                        or _generation_semantics(meta)
+                        != (aspect_ratio, resolution)
                         or not isinstance(expected_dialogue, list)
                         or expected_dialogue != [dict(line) for line in dialogue]
                     ):
@@ -1950,6 +2125,8 @@ def create_app(settings: Settings) -> FastAPI:
                     request_id,
                     dialogue_mode,
                     fit_mode,
+                    aspect_ratio,
+                    resolution,
                     dialogue,
                 )
             except _SubmitError as exc:
@@ -1982,6 +2159,8 @@ def create_app(settings: Settings) -> FastAPI:
                 prepared_dialogue=[dict(line) for line in dialogue],
                 prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
                 fit_mode=fit_mode,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
                 generation=generation,
             )
             if claim_owner:

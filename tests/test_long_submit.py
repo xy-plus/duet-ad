@@ -16,6 +16,7 @@ from app import h3, long_generation, long_video, prepared_input, storage
 from app.main import (
     _SubmitError,
     _long_fit_required,
+    _long_validation_paths,
     _resume_long_generation,
     _validate_long_submit_payload,
     create_app,
@@ -148,12 +149,17 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
     return cid, receipt
 
 
-def _payload(receipt, request_id="parent-request-123", mode="auto", fit="none"):
+def _payload(
+    receipt, request_id="parent-request-123", mode="auto", fit="none",
+    aspect_ratio="9:16", resolution="768p",
+):
     return {
         "confirm": True,
         "client_request_id": request_id,
         "dialogue_mode": mode,
         "fit_mode": fit,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
         "expected_plan_receipt": receipt,
     }
 
@@ -163,6 +169,20 @@ def _fake_stitch(calls):
         calls.append(kwargs)
         kwargs["output"].write_bytes(b"joined")
     return invoke
+
+
+def test_long_validation_fingerprint_tracks_selected_aspect_fit_outputs(tmp_path):
+    settings = make_settings(tmp_path, enable_pipeline=False)
+    cid, _receipt = _make_long(settings, landscape_first_indices=(1,))
+    root = settings.data_dir / cid
+    meta = storage.load_meta(settings.data_dir, cid)
+    meta.update(aspect_ratio="16:9", resolution="480p", fit_mode="crop")
+
+    paths = _long_validation_paths(root, meta)
+
+    expected_root = root / "work" / "segments" / "1" / "work" / "h3_frames"
+    assert expected_root / "16x9" / "crop" / "first" / "first.png" in paths
+    assert expected_root / "crop" / "first" / "first.png" not in paths
 
 
 def _small_video(path: Path, color: str = "black") -> None:
@@ -619,6 +639,51 @@ def test_30_second_continue_uses_generated_tail_and_two_posts(enabled, monkeypat
     ).status_code == 202
     assert [request.workdir.name for request in seen] == ["1", "2"]
     assert seen[1].first_frame[1] == tail_bytes.read_bytes()
+
+
+def test_all_long_segments_and_continue_share_frozen_generation_parameters(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
+    seen = []
+    tail = settings.data_dir / cid / "tail.png"
+    _png(tail, 222)
+
+    def extract_tail(_video, output):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(tail.read_bytes())
+        return output
+
+    def start(request):
+        seen.append(request)
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", str(len(seen)))
+
+    monkeypatch.setattr(long_generation, "_extract_last_frame", extract_tail)
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+    monkeypatch.setattr(h3, "start", start)
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(
+            receipt, fit="crop", aspect_ratio="16:9", resolution="480p"
+        ),
+    )
+
+    assert response.status_code == 202
+    assert len(seen) == 2
+    assert {
+        (request.aspect_ratio, request.resolution)
+        for request in seen
+    } == {("16:9", "480p")}
+    assert {
+        h3._input_manifest(request)["request"]["provider_resolution"]
+        for request in seen
+    } == {"480p横"}
+    meta = storage.load_meta(settings.data_dir, cid)
+    assert (meta["aspect_ratio"], meta["resolution"]) == ("16:9", "480p")
 
 
 def test_plan_freeze_failure_makes_zero_posts(enabled, monkeypatch):
@@ -1136,7 +1201,9 @@ def test_resume_required_segment_runs_at_most_once_per_coordinator_invocation(
     assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "resume_required"
 
 
-@pytest.mark.parametrize("changed", ["plan", "dialogue", "fit"])
+@pytest.mark.parametrize(
+    "changed", ["plan", "dialogue", "fit", "aspect_ratio", "resolution"]
+)
 def test_failed_retry_rejects_all_frozen_parameter_changes_with_zero_new_posts(
     enabled, monkeypatch, changed
 ):
@@ -1169,19 +1236,27 @@ def test_failed_retry_rejects_all_frozen_parameter_changes_with_zero_new_posts(
     retry_receipt = receipt
     retry_mode = "auto"
     retry_fit = initial_fit
+    retry_aspect = "9:16"
+    retry_resolution = "768p"
     if changed == "plan":
         path = settings.data_dir / cid / long_video.PLAN_RECEIPT_FILENAME
         path.write_text(path.read_text() + " ", encoding="utf-8")
         retry_receipt = hashlib.sha256(path.read_bytes()).hexdigest()
     elif changed == "dialogue":
         retry_mode = "none"
-    else:
+    elif changed == "fit":
         retry_fit = "pad"
+    elif changed == "aspect_ratio":
+        retry_aspect = "16:9"
+        retry_fit = "crop"
+    else:
+        retry_resolution = "480p"
     response = client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH,
         json=_payload(
             retry_receipt, request_id="parent-request-999",
             mode=retry_mode, fit=retry_fit,
+            aspect_ratio=retry_aspect, resolution=retry_resolution,
         ),
     )
     assert response.status_code == 409

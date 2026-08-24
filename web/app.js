@@ -181,6 +181,74 @@ function longVideoContract(detail) {
   };
 }
 
+function fitProfile(detail, aspectRatio) {
+  const profile = detail && detail.fit_profiles && detail.fit_profiles[aspectRatio];
+  if (!profile || typeof profile.fit_required !== "boolean"
+      || profile.default_fit_mode !== (profile.fit_required ? "crop" : "none")) {
+    throw new Error("服务端画幅适配建议无效，请刷新页面后重试");
+  }
+  return {
+    fit_required: profile.fit_required,
+    default_fit_mode: profile.default_fit_mode,
+  };
+}
+
+function generationParameterDraft(detail) {
+  const aspectRatio = detail && detail.aspect_ratio;
+  const resolution = detail && detail.resolution;
+  if (!["16:9", "9:16"].includes(aspectRatio)) {
+    throw new Error("服务端推荐画幅无效，请刷新页面后重试");
+  }
+  if (!["480p", "768p"].includes(resolution)) {
+    throw new Error("服务端推荐清晰度无效，请刷新页面后重试");
+  }
+  const profile = fitProfile(detail, aspectRatio);
+  return {
+    aspectRatio,
+    resolution,
+    fitMode: profile.default_fit_mode,
+  };
+}
+
+function generationParameterSnapshot(detail) {
+  return {
+    aspect_ratio: detail.aspect_ratio,
+    resolution: detail.resolution,
+    dialogue_mode: detail.dialogue && detail.dialogue.mode,
+    fit_mode: detail.fit_mode,
+    duration_s: detail.duration_s,
+    segment_count: detail.segment_count,
+  };
+}
+
+function generationParameterSummary(detail) {
+  const snapshot = generationParameterSnapshot(detail);
+  const section = el("section", "res-section generation-parameter-summary");
+  section.appendChild(el("h3", "res-h3", "生成参数"));
+  const list = el("dl", "parameter-summary-grid");
+  const dialogueLabels = {
+    auto: "自动台词 / 保留源音轨", edit: "编辑识别台词",
+    custom: "自定义台词", none: "无台词 / 静音",
+  };
+  const fitLabels = { none: "无需适配", crop: "裁切画面", pad: "留边完整展示" };
+  const entries = [
+    ["画幅", snapshot.aspect_ratio],
+    ["清晰度", snapshot.resolution],
+    ["台词模式", dialogueLabels[snapshot.dialogue_mode] || snapshot.dialogue_mode],
+    ["适配方式", fitLabels[snapshot.fit_mode] || snapshot.fit_mode],
+    ["实际总时长", Number.isFinite(Number(snapshot.duration_s))
+      ? Number(snapshot.duration_s).toFixed(2) + " 秒" : "-"],
+    ["长视频分段数", Number.isInteger(snapshot.segment_count)
+      ? String(snapshot.segment_count) : "无（单段）"],
+  ];
+  entries.forEach(([label, value]) => {
+    list.appendChild(el("dt", null, label));
+    list.appendChild(el("dd", null, value || "-"));
+  });
+  section.appendChild(list);
+  return section;
+}
+
 function buildSubmitPayload(input) {
   const dialogueMode = input.dialogueMode;
   if (!["auto", "edit", "custom", "none"].includes(dialogueMode)) {
@@ -195,6 +263,8 @@ function buildSubmitPayload(input) {
       || !/^[0-9a-f]{64}$/.test(input.planReceipt))) {
     throw new Error("长视频生成计划尚未就绪，请刷新后重试");
   }
+  if (!["16:9", "9:16"].includes(input.aspectRatio)) throw new Error("请选择画幅");
+  if (!["480p", "768p"].includes(input.resolution)) throw new Error("请选择清晰度");
 
   let fitMode = "none";
   if (input.fitRequired) {
@@ -207,6 +277,8 @@ function buildSubmitPayload(input) {
     client_request_id: requestId,
     dialogue_mode: dialogueMode,
     fit_mode: fitMode,
+    aspect_ratio: input.aspectRatio,
+    resolution: input.resolution,
   };
   if (input.isLong) body.expected_plan_receipt = input.planReceipt;
   if (dialogueMode === "edit" || dialogueMode === "custom") {
@@ -258,12 +330,18 @@ function buildResumePayload(detail) {
     throw new Error("既有任务台词模式无效");
   }
   if (!["none", "crop", "pad"].includes(detail.fit_mode)) throw new Error("既有任务画幅模式无效");
+  if (!["16:9", "9:16"].includes(detail.aspect_ratio)
+      || !["480p", "768p"].includes(detail.resolution)) {
+    throw new Error("既有任务生成参数无效");
+  }
 
   const body = {
     confirm: true,
     client_request_id: generation.client_request_id,
     dialogue_mode: dialogue.mode,
     fit_mode: detail.fit_mode,
+    aspect_ratio: detail.aspect_ratio,
+    resolution: detail.resolution,
   };
   const longContract = longVideoContract(detail);
   if (longContract.isLong) {
@@ -292,11 +370,17 @@ function buildStitchRetryPayload(detail) {
   if (typeof requestId !== "string" || !requestId.trim()) throw new Error("缺少既有任务请求标识");
   if (!dialogue || !["auto", "none"].includes(dialogue.mode)) throw new Error("既有任务台词模式无效");
   if (!["none", "crop", "pad"].includes(detail.fit_mode)) throw new Error("既有任务画幅模式无效");
+  if (!["16:9", "9:16"].includes(detail.aspect_ratio)
+      || !["480p", "768p"].includes(detail.resolution)) {
+    throw new Error("既有任务生成参数无效");
+  }
   return {
     confirm: true,
     client_request_id: requestId,
     dialogue_mode: dialogue.mode,
     fit_mode: detail.fit_mode,
+    aspect_ratio: detail.aspect_ratio,
+    resolution: detail.resolution,
     expected_plan_receipt: longContract.planReceipt,
   };
 }
@@ -315,6 +399,8 @@ function buildLongRetryPayload(detail, clientRequestId) {
     dialogueMode: dialogue.mode,
     fitRequired: detail.fit_required === true,
     fitMode: detail.fit_mode,
+    aspectRatio: detail.aspect_ratio,
+    resolution: detail.resolution,
     isLong: true,
     planReceipt: longContract.planReceipt,
   });
@@ -811,18 +897,25 @@ function canOperate(detail) {
 
 function generationDraft(detail) {
   let draft = state.generationDrafts[detail.id];
+  const parameters = generationParameterDraft(detail);
+  const parameterVersion = detail.aspect_ratio + "|" + detail.resolution
+    + "|" + JSON.stringify(detail.fit_profiles);
   if (!draft) {
     draft = {
       dialogueMode: "auto",
       editLinesText: formatDialogueLines(detail.dialogue),
       customLinesText: "",
-      fitMode: "",
+      ...parameters,
+      parameterVersion,
       receiptVersion: detail.receipt_version,
     };
     state.generationDrafts[detail.id] = draft;
   } else if (draft.receiptVersion !== detail.receipt_version && !draft.editTouched) {
     draft.editLinesText = formatDialogueLines(detail.dialogue);
     draft.receiptVersion = detail.receipt_version;
+  }
+  if (draft.parameterVersion !== parameterVersion && !draft.parameterTouched) {
+    Object.assign(draft, parameters, { parameterVersion });
   }
   return draft;
 }
@@ -862,12 +955,15 @@ async function submitGeneration(detail, card) {
     } else if (longContract.isLong && action === "retry") {
       body = buildLongRetryPayload(detail, newRequestId());
     } else {
+      const profile = fitProfile(detail, draft.aspectRatio);
       body = buildSubmitPayload({
         clientRequestId: newRequestId(),
         dialogueMode: draft.dialogueMode,
         linesText: draft.dialogueMode === "edit" ? draft.editLinesText : draft.customLinesText,
-        fitRequired: detail.fit_required === true,
+        fitRequired: profile.fit_required,
         fitMode: draft.fitMode,
+        aspectRatio: draft.aspectRatio,
+        resolution: draft.resolution,
         isLong: longContract.isLong,
         planReceipt: longContract.planReceipt,
       });
@@ -989,6 +1085,7 @@ function renderFinalSection(detail) {
   const published = document.createDocumentFragment();
   if (showPublishedVideo) {
     published.appendChild(videoSection(detail, "generated.mp4", "最终视频", "H3 生成成片"));
+    published.appendChild(generationParameterSummary(detail));
   }
   if (showPublishedVideo && !showStitchRecovery) return published;
 
@@ -1113,6 +1210,38 @@ function renderFinalSection(detail) {
   const draft = generationDraft(detail);
   const busy = generation.status === "queued" || generation.status === "running"
     || !!state.generationSubmitting[detail.id];
+  const aspectField = el("fieldset", "final-field");
+  aspectField.appendChild(el("legend", null, "画幅"));
+  const aspectChoices = el("div", "final-choices");
+  for (const [value, label] of [["16:9", "横屏 16:9"], ["9:16", "竖屏 9:16"]]) {
+    const item = choice("aspect-" + detail.id, value, label, draft.aspectRatio === value);
+    item.querySelector("input").addEventListener("change", () => {
+      draft.aspectRatio = value;
+      draft.fitMode = fitProfile(detail, value).default_fit_mode;
+      draft.parameterTouched = true;
+      renderGenerationDynamic(detail);
+    });
+    aspectChoices.appendChild(item);
+  }
+  aspectField.appendChild(aspectChoices);
+  aspectField.appendChild(el("p", "final-help", "系统已按实际 H3 输入帧的总几何损失预选。"));
+  card.appendChild(aspectField);
+
+  const resolutionField = el("fieldset", "final-field");
+  resolutionField.appendChild(el("legend", null, "清晰度"));
+  const resolutionChoices = el("div", "final-choices");
+  for (const value of ["480p", "768p"]) {
+    const item = choice("resolution-" + detail.id, value, value, draft.resolution === value);
+    item.querySelector("input").addEventListener("change", () => {
+      draft.resolution = value;
+      draft.parameterTouched = true;
+    });
+    resolutionChoices.appendChild(item);
+  }
+  resolutionField.appendChild(resolutionChoices);
+  resolutionField.appendChild(el("p", "final-help", "系统已按源视频短边最接近档位预选。"));
+  card.appendChild(resolutionField);
+
   const dialogueField = el("fieldset", "final-field");
   dialogueField.appendChild(el("legend", null, "台词模式"));
   const dialogueChoices = el("div", "final-choices");
@@ -1170,13 +1299,17 @@ function renderFinalSection(detail) {
   editor.appendChild(el("p", "final-help", "每行格式：开始秒 - 结束秒 | 台词。自定义模式不受识别结果限制。"));
   card.appendChild(editor);
 
-  if (detail.fit_required === true) {
+  const selectedFitProfile = fitProfile(detail, draft.aspectRatio);
+  if (selectedFitProfile.fit_required) {
     const fitField = el("fieldset", "final-field");
     fitField.appendChild(el("legend", null, "源画幅需要适配"));
     const fitChoices = el("div", "final-choices");
     for (const [value, label] of [["crop", "裁切画面"], ["pad", "留边完整展示"]]) {
       const item = choice("fit-" + detail.id, value, label, draft.fitMode === value);
-      item.querySelector("input").addEventListener("change", () => { draft.fitMode = value; });
+      item.querySelector("input").addEventListener("change", () => {
+        draft.fitMode = value;
+        draft.parameterTouched = true;
+      });
       fitChoices.appendChild(item);
     }
     fitField.appendChild(fitChoices);
@@ -1940,6 +2073,9 @@ function detailSignature(detail) {
     detail.submit_enabled === true,
     detail.fit_required === true,
     detail.fit_mode,
+    detail.aspect_ratio,
+    detail.resolution,
+    detail.fit_profiles || null,
     detail.duration_s,
     detail.receipt_version,
     detail.source_prompt || null,
@@ -2380,9 +2516,12 @@ if (typeof module !== "undefined" && module.exports) {
     conversationBadge,
     createDisclosure,
     detailSignature,
+    fitProfile,
     formatDialogueLines,
     generationDraft,
     generationAction,
+    generationParameterDraft,
+    generationParameterSnapshot,
     generationRetryContract,
     generationSegmentLabel,
     longVideoContract,

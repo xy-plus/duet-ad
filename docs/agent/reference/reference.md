@@ -81,6 +81,12 @@ multipart 只允许表中字段及 `file`，未知或重复字段返回 422 `inv
   "read_only": false,
   "duration_s": 9.2,
   "fit_required": false,
+  "fit_profiles": {
+    "16:9": {"fit_required": true, "default_fit_mode": "crop"},
+    "9:16": {"fit_required": false, "default_fit_mode": "none"}
+  },
+  "aspect_ratio": "9:16",
+  "resolution": "768p",
   "dialogue": {
     "mode": "auto|edit|custom|none",
     "lines": [],
@@ -144,7 +150,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 }
 ```
 
-`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 以冻结 `meta.segments` 的完整索引集合为基数，由服务端结合持久化状态与分段 `generated.mp4` 文件实况计算：缺项计入，重复、未知或乱序状态整批不复用；`stage=stitch` 固定为 0。该复用判定与 retry 初始化共用，前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source` 按源文件实况计算；`has_video` 与 `navigation_status` 共用当前服务端最终输出验收结果。
+`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。`aspect_ratio/resolution` 是服务端推荐值，首次提交后即为冻结值；闭集分别为 `16:9|9:16` 和 `480p|768p`。`fit_profiles` 同时公开两个画幅的 `fit_required/default_fit_mode`，浏览器改变画幅时只能据此切换适配选项。历史 meta 缺少新字段时精确投影为 `9:16 + 768p`，不会改写旧 receipt。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 以冻结 `meta.segments` 的完整索引集合为基数，由服务端结合持久化状态与分段 `generated.mp4` 文件实况计算：缺项计入，重复、未知或乱序状态整批不复用；`stage=stitch` 固定为 0。该复用判定与 retry 初始化共用，前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source` 按源文件实况计算；`has_video` 与 `navigation_status` 共用当前服务端最终输出验收结果。成功页继续播放成片，并从这些服务端冻结值生成只读参数摘要。
 
 ### `PATCH /api/conversations/{cid}/prompt`
 
@@ -163,18 +169,21 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
   "confirm": true,
   "client_request_id": "request-123456",
   "dialogue_mode": "none",
-  "fit_mode": "none"
+  "fit_mode": "none",
+  "aspect_ratio": "9:16",
+  "resolution": "768p"
 }
 ```
 
-短视频允许键只有 `confirm/client_request_id/dialogue_mode/lines/fit_mode`：
+短视频允许键只有 `confirm/client_request_id/dialogue_mode/lines/fit_mode/aspect_ratio/resolution`：
 
 - `confirm` 必须是 JSON boolean `true`。
 - `client_request_id` 必须完整匹配 `^[0-9A-Za-z-]{8,64}$`。
 - `dialogue_mode=auto`：禁止 `lines`，使用 `voice_line_provenance` 中 `kept=true` 的内部 ASR 行；启用 vocal filter 时每句必须为 `spoken` 或 `sung`。
 - `dialogue_mode=edit|custom`：必须有非空 `lines`；每项只能含 `text/start_s/end_s`，文本非空、时间有序且落在实际视频时长内。`edit` provenance 固定 `asr+edited`，`custom` 固定 `manual`。
 - `dialogue_mode=none`：禁止 `lines`，有效台词为空。
-- `fit_required=false` 时只允许 `fit_mode=none`；为 true 时只允许 `crop` 或 `pad`。该值只在 pipeline `done` 时按实际选中关键帧计算，源视频 9:16 不能豁免非 9:16 关键帧。
+- `aspect_ratio` 只允许 `16:9|9:16`，`resolution` 只允许 `480p|768p`；两者都必须显式提交。
+- 所选画幅的 `fit_required=false` 时只允许 `fit_mode=none`；为 true 时只允许 `crop` 或 `pad`。该值只在 pipeline `done` 时按实际 H3 输入帧计算，浏览器不能从源媒体自行推断。
 
 长视频请求严格为：
 
@@ -184,11 +193,13 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
   "client_request_id": "request-123456",
   "dialogue_mode": "auto",
   "fit_mode": "none",
+  "aspect_ratio": "9:16",
+  "resolution": "768p",
   "expected_plan_receipt": "64 lowercase hex characters"
 }
 ```
 
-长视频只允许这五个键，`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希。长链 `fit_required` 以每个 `hard_cut` first 和全部 end anchors 为准；`continue` first 运行时由上游生成尾帧替换。历史未冻结 null 会话从安全 plan 纯派生，无法派生时付费前拒绝。已有冻结提交继续以原 `fit_mode` 为准。
+长视频只允许这七个键，`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希。长链推荐画幅以每个 `hard_cut` first 和全部 end anchors 为准；`continue` first 不参与推荐，运行时上游尾帧仍按冻结的同一画幅处理。所有段共用冻结的画幅、清晰度和 fit。历史未冻结 null 会话从安全 plan 纯派生，无法派生时付费前拒绝。
 
 旧标签页可能仍按四键长视频契约提交，缺少 `expected_plan_receipt`。服务仅对这个精确旧请求返回结构化 `409 client_refresh_required`，提示刷新页面；不会自动采用服务端当前 receipt，也不会创建付费任务。`/`、`/index.html` 和 `/app.js` 均使用 `Cache-Control: no-store`，刷新后会取得当前提交契约。
 
@@ -206,6 +217,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | 422 | `invalid_submit_request` | 出现未知键 |
 | 422 | `invalid_client_request_id` | id 不合规 |
 | 422 | `invalid_dialogue` | mode、lines 形状或台词内容不合规 |
+| 422 | `invalid_aspect_ratio` / `invalid_resolution` | 语义画幅或清晰度缺失/越界；claim 和供应商 POST 前拒绝 |
 | 422 | `long_video_audio_mode_unsupported` | 长链使用了非 keep 创建模式、edit/custom 或 lines |
 | 422 | `invalid_plan_receipt` | 长链缺失或 plan receipt 格式非法 |
 | 422 | `invalid_fit_mode` / `fit_mode_required` / `fit_mode_not_allowed` | 画幅选择不合规 |
@@ -218,7 +230,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | 409 | `generation in progress` / `already submitted` | active/succeeded 使用不同 id |
 | 409 | `new client_request_id required` | H3 阶段确定 failed 后复用旧 id；长链 `stage=stitch` 除外 |
 | 409 | `resume_request_id_mismatch` | resume_required 没有使用原 client_request_id |
-| 409 | `resume_parameters_changed` | resume_required 的 mode、归一化 lines 或 fit 与冻结值不一致 |
+| 409 | `resume_parameters_changed` | active/resume/retry/stitch-retry 的 mode、归一化 lines、画幅、清晰度或 fit 与冻结值不一致 |
 | 409 | `submission_outcome_unknown` | 既有 generation 为 submission_unknown；任意 id 均拒绝 |
 | 409 | `generation_state_invalid` | 已持久化 generation status/attempt 不满足安全状态形状 |
 
@@ -226,7 +238,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 旧 Context IR 契约下未完成的 generation 对外固定映射为 `failed / generation_path_removed`；历史成片保持可读。用户用新 id 重试时重写为当前直接 H3 receipt，不再恢复或查询 MiniMax task。
 
-`resume_required` 表示 H3 provider task 已知：只接受原 `client_request_id`，且 dialogue mode、标准化 lines、`fit_mode` 及长链 plan receipt 必须与冻结输入完全一致。合法继续返回 `202 {"status":"queued","attempt":<原值>}`，不重写 receipt、不递增 attempt。已知 task 错误包括 `h3_query_failed/h3_timeout/download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed`；`h3_running` 也进入此状态。长链启动恢复只 GET 已持久化子任务，不会 POST 尚未开始的段。
+`resume_required` 表示 H3 provider task 已知：只接受原 `client_request_id`，且 dialogue mode、标准化 lines、`fit_mode`、画幅、清晰度及长链 plan receipt 必须与冻结输入完全一致。合法继续返回 `202 {"status":"queued","attempt":<原值>}`，不重写 receipt、不递增 attempt。已知 task 错误包括 `h3_query_failed/h3_timeout/download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed`；`h3_running` 也进入此状态。长链启动恢复只 GET 已持久化子任务，不会 POST 尚未开始的段。
 
 确定性输出安全拒绝 `download_url_rejected/download_redirect_rejected/download_too_large/download_invalid_video` 映射为 `failed`，只有用户明确使用新 id 才创建 retry attempt。它们不属于会因同参数继续而消失的传输故障。
 
@@ -264,7 +276,9 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | `keyframes`, `prompt` | list[str], str/null | 准备产物 |
 | `voice_mode` | str | 创建阶段 auto 的 keep/rewrite/translate 方式 |
 | `duration_s` | float/null | ffprobe `v:0` 视觉时长；音频/容器时长不参与画面规划和门禁 |
-| `fit_required` | bool/null | pipeline done 时计算；短链按实际关键帧，长链按 `hard_cut` first 与全部 end anchors；历史未冻结 null 会话纯派生，无法安全派生仍为 null |
+| `fit_required` | bool/null | 当前 `aspect_ratio` 对应 profile 的兼容投影 |
+| `fit_profiles` | object/null | `16:9/9:16` 各自的 `fit_required/default_fit_mode`；pipeline 按实际 H3 输入计算 |
+| `aspect_ratio`, `resolution` | str/null | pipeline 推荐，提交后冻结；闭集为 `16:9|9:16`、`480p|768p` |
 | `dialogue_mode` | str | 默认 auto；最终提交选择 |
 | `generation` | object/null | coarse H3 attempt 状态 |
 | `segments` | list | 长链分段计划；短链为空 |
@@ -281,7 +295,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | `prepared_input_receipt` / `receipt_version` | `prepared_input.json` / 1 |
 | `long_video_plan_receipt` | 长链固定为 `long_video_plan.json` |
 | `frozen_plan_receipt` | 长链首次提交确认的 plan SHA-256 |
-| `fit_mode` | `none/crop/pad` |
+| `fit_mode` | `none/crop/pad`；随冻结画幅解释 |
 | `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含内部 `segments`，failed 时公开 `retry_paid_segment_count`，status 含 resume_required |
 | `postprocess` | `{status,options,frames,error}`，与 H3 输入隔离 |
 
@@ -306,14 +320,20 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
   "vocal_filter": {"enabled": true},
   "video": {"duration_s": 9.2, "ratio": "9:16", "fit_mode": "none"},
   "engine_request": {
-    "h3": {"workflow": "minimax_h3_lightx2v_v5", "duration": 10, "resolution": "768p竖"}
+    "h3": {
+      "workflow": "minimax_h3_lightx2v_v5",
+      "duration": 10,
+      "aspect_ratio": "9:16",
+      "resolution": "768p",
+      "provider_resolution": "768p竖"
+    }
   }
 }
 ```
 
 严格要求顶层和子对象 key 集合完全匹配；绑定路径必须位于会话根内；关键帧 1–9 张且路径唯一；每个文件重读校验 SHA-256；台词 canonical JSON、provenance 和 hash 必须匹配；最终 prompt 必须等于当前视觉 prompt + 当前结构化发声块。任何偏差抛 `PreparedInputError`，HTTP 层归一为 409 `prepared_input_invalid`。
 
-`normalized_audio=null` 是无音轨的合法表示。crop/pad 时 keyframe binding 指向 `work/h3_frames/<mode>/`，且不会出现 `postprocessed`。
+`normalized_audio=null` 是无音轨的合法表示。crop/pad 时 keyframe binding 指向 `work/h3_frames/<aspect>/<mode>/`，且不会出现 `postprocessed`。历史 receipt 缺少语义参数时仅按原 `ratio=9:16`、`resolution=768p竖` 精确恢复，loader 不重写文件。
 
 ## Long-video plan receipt v1
 
@@ -324,7 +344,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 - `visual_prompt`、最终 `prompt` 的路径/SHA-256；
 - 本段局部台词的 canonical 数量与 SHA-256。
 
-detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字段。提交时服务同时比对该摘要、meta 分段和全部 artifact；`fit_mode=crop/pad` 时冻结的 FL2VA 请求改用服务端派生的 9:16 锚点。每段工作目录为 `work/segments/<N>/`，其中 `.h3/` 只归该子任务所有。
+detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字段。提交时服务同时比对该摘要、meta 分段和全部 artifact；`fit_mode=crop/pad` 时冻结的 FL2VA 请求改用服务端派生为所选 `16:9/9:16` 的锚点。每段工作目录为 `work/segments/<N>/`，其中 `.h3/` 只归该子任务所有。
 
 ## H3 attempt state v1
 
@@ -344,7 +364,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 }
 ```
 
-内部 status：`h3_submitting/h3_running/succeeded/retryable_failure/failed/submission_unknown`。任务 id 出现后必须同时存在对应 receipt；最终 output receipt 只能是 `{name:"generated.mp4",sha256,size}`。`result_url` 明确禁止落状态文件。
+内部 status：`h3_submitting/h3_running/succeeded/retryable_failure/failed/submission_unknown`。当前 input manifest 与 attempt receipt 同时冻结语义 `aspect_ratio/resolution` 和 provider `resolution`；唯一投影为 `480p横/480p竖/768p横/768p竖`，provider body 只使用投影值。任务 id 出现后必须同时存在对应 receipt；最终 output receipt 只能是 `{name:"generated.mp4",sha256,size}`。`result_url` 明确禁止落状态文件。
 
 ### start / inspect / resume / retry
 

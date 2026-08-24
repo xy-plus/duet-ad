@@ -44,6 +44,9 @@ class FrozenPlan:
     source: Path
     receipt: str
     segments: tuple[FrozenSegment, ...]
+    aspect_ratio: str = h3.H3_DEFAULT_ASPECT_RATIO
+    resolution: str = h3.H3_DEFAULT_RESOLUTION
+    legacy_layout: bool = False
 
 
 def _digest(path: Path) -> str:
@@ -98,19 +101,36 @@ def _relative_to_work(root: Path, path: Path) -> str:
         raise LongGenerationError("long_video_plan_invalid") from None
 
 
-def _fit_anchor(path: Path, output: Path, fit_mode: str) -> Path:
+def _fit_anchor(
+    path: Path, output: Path, fit_mode: str, aspect_ratio: str,
+) -> Path:
     if fit_mode == "none":
         return path
     try:
-        return frame_fit.fit_frames((path,), output, fit_mode)[0]
+        return frame_fit.fit_frames((path,), output, fit_mode, aspect_ratio)[0]
     except frame_fit.FrameFitError:
         raise LongGenerationError("frame_fit_failed") from None
 
 
 def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
-                dialogue_mode: str, *, prepare_fit: bool = True) -> FrozenPlan:
+                dialogue_mode: str, *, aspect_ratio: str | None = None,
+                resolution: str | None = None,
+                prepare_fit: bool = True) -> FrozenPlan:
     """Validate every immutable plan fact and pre-fit every source anchor."""
     root = Path(root).resolve()
+    legacy_layout = "aspect_ratio" not in meta
+    aspect_ratio = (
+        meta.get("aspect_ratio", h3.H3_DEFAULT_ASPECT_RATIO)
+        if aspect_ratio is None else aspect_ratio
+    )
+    resolution = (
+        meta.get("resolution", h3.H3_DEFAULT_RESOLUTION)
+        if resolution is None else resolution
+    )
+    if aspect_ratio not in h3.H3_ASPECT_RATIOS:
+        raise LongGenerationError("invalid_aspect_ratio", 422)
+    if resolution not in h3.H3_RESOLUTIONS:
+        raise LongGenerationError("invalid_resolution", 422)
     name = meta.get("long_video_plan_receipt")
     if name != long_video.PLAN_RECEIPT_FILENAME:
         raise LongGenerationError("long_video_plan_invalid")
@@ -246,11 +266,18 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         else:
             prompt = final
         segdir = root / "work" / "segments" / str(index)
-        fit_root = segdir / "work" / "h3_frames" / fit_mode
+        fit_root = segdir / "work" / "h3_frames"
+        if not legacy_layout:
+            fit_root = fit_root / aspect_ratio.replace(":", "x")
+        fit_root = fit_root / fit_mode
         # Complete all static transformations before the caller can make a POST.
         if prepare_fit or fit_mode == "none":
-            first = _fit_anchor(first_source, fit_root / "first", fit_mode)
-            last = _fit_anchor(last_source, fit_root / "end", fit_mode)
+            first = _fit_anchor(
+                first_source, fit_root / "first", fit_mode, aspect_ratio
+            )
+            last = _fit_anchor(
+                last_source, fit_root / "end", fit_mode, aspect_ratio
+            )
         else:
             first = fit_root / "first" / first_source.name
             last = fit_root / "end" / last_source.name
@@ -261,7 +288,10 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         previous_end, previous_chain = end_s, chain_id
     if abs(previous_end - duration) > _EPS:
         raise LongGenerationError("long_video_plan_invalid")
-    return FrozenPlan(root, source, receipt, tuple(frozen))
+    return FrozenPlan(
+        root, source, receipt, tuple(frozen), aspect_ratio, resolution,
+        legacy_layout,
+    )
 
 
 def child_request_id(parent_id: str, receipt: str, index: int) -> str:
@@ -295,9 +325,12 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
             if not prepare_inputs:
                 raise LongGenerationError("long_video_tail_frame_missing")
             tail = _extract_last_frame(upstream.workdir / "generated.mp4", tail)
-        continued = segment.workdir / "work" / "h3_frames" / fit_mode / "continued"
+        continued = segment.workdir / "work" / "h3_frames"
+        if not plan.legacy_layout:
+            continued = continued / plan.aspect_ratio.replace(":", "x")
+        continued = continued / fit_mode / "continued"
         if prepare_inputs or fit_mode == "none":
-            first = _fit_anchor(tail, continued, fit_mode)
+            first = _fit_anchor(tail, continued, fit_mode, plan.aspect_ratio)
         else:
             first = continued / tail.name
             if not first.is_file():
@@ -327,6 +360,8 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
         mode="boundary",
         first_frame=(first, first_data),
         last_frame=(segment.last_frame, last_data),
+        aspect_ratio=plan.aspect_ratio,
+        resolution=plan.resolution,
     )
 
 
@@ -656,7 +691,14 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
     fit_mode = meta.get("fit_mode")
     dialogue_mode = meta.get("dialogue_mode")
     states = {item["index"]: dict(item) for item in generation.get("segments", [])}
-    if not isinstance(parent_id, str) or fit_mode not in {"none", "crop", "pad"}:
+    if (
+        not isinstance(parent_id, str)
+        or fit_mode not in {"none", "crop", "pad"}
+        or meta.get("aspect_ratio", h3.H3_DEFAULT_ASPECT_RATIO)
+        != plan.aspect_ratio
+        or meta.get("resolution", h3.H3_DEFAULT_RESOLUTION)
+        != plan.resolution
+    ):
         return
 
     def persist(status: str | None = None, error: str | None = None, stage: str = "h3") -> None:

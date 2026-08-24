@@ -3,7 +3,7 @@ name: architecture
 type: architecture
 status: done
 owner: agent
-updated: 2026-08-21
+updated: 2026-08-24
 tdd: N/A
 links: [conversation-task]
 ---
@@ -38,7 +38,7 @@ flowchart LR
 | `app/storage.py` | 会话目录、meta、上传/探测、文件白名单 | conversation-task |
 | `app/pipeline.py` | 4fps 抽帧、音频/台词准备、视觉 agent 隔离、初始 receipt | conversation-task |
 | `app/prepared_input.py` | 结构化台词、唯一发声块、文件哈希绑定、fail-closed loader | conversation-task |
-| `app/frame_fit.py` | 用户确认后把关键帧居中 crop 或黑边 pad 为 9:16 | conversation-task |
+| `app/frame_fit.py` | 按真实 H3 输入推荐 `16:9/9:16`，并显式 crop/pad 为所选目标画幅 | conversation-task |
 | `app/h3.py` | 直接 H3 的 start/inspect/resume/retry 和磁盘状态机 | conversation-task |
 | `app/long_video.py` | 1–15 秒安全分段、hard_cut/continue 链语义、canonical plan receipt | conversation-task |
 | `app/long_generation.py` | FL2VA 子任务冻结、最多两链调度、分段恢复和拼接编排 | conversation-task |
@@ -46,7 +46,7 @@ flowchart LR
 | `app/asr.py` / `app/voice.py` / `app/vocal.py` | 本地多语种听写、ASR JSON 校验、YAMNet `spoken/sung` 分类 | conversation-task |
 | `app/postprocess.py` / `app/seedream.py` | 可选去字幕/品牌关键帧编辑；不参与 H3 输入 | postprocess |
 | `app/codex_runner.py` | 本地 codex 内层 workspace 沙箱、voice 专用外层文件系统隔离、并发和超时；不把服务凭据交给 agent | conversation-task |
-| `web/` | 同源 UI、2 秒轮询、显式台词/画幅确认和人工重试 | conversation-task |
+| `web/` | 同源 UI、2 秒轮询、显式台词/画幅/清晰度/适配确认、冻结参数回显和人工重试 | conversation-task |
 
 Seedance 生产提交模块已删除，`face_hold` 选项和机械提示词注入也已删除。旧实现不是部署回退面。
 
@@ -84,7 +84,7 @@ flowchart LR
 - 冻结的 H3 源提示词是唯一生成输入；项目不调用 MiniMax Context IR，也不接受运行时优化开关。
 - `duration_s` 以 `v:0` 实际浮点时长写 receipt；上传、pipeline 重探测和提交门禁限制为 300 秒。短链 H3 时长为 `ceil(duration_s)` 且不超过 10；长链每段为 `ceil(end_s-start_s)` 且不超过 15。最终 `keep` 拼接以视频 presentation start 归零音频时间戳，保留源音频相对画面的起音位置，再把长音频裁到画面终点、短音频补静音到画面终点，不改变画面帧预算。
 - pipeline 首次进入 `processing` 与首次 submit 冻结输入共用同一个 per-CID 原子所有权 claim；检查 generation/receipt、取得所有权和写 meta 在同一把锁内完成。输家不得运行输入准备、改写 receipt 或触发 provider，完成/回滚也只能由当前 owner 提交。
-- `fit_required` 与 pipeline `done` 原子落盘：短链按实际选中的关键帧；长链按 plan 绑定且真正静态送入 H3 boundary 的每个 `hard_cut` first anchor 与全部 end anchors 判断，`continue` 的 source first 会被运行时上游生成尾帧替换，不能作为判定对象。不以源视频宽高或展示关键帧建立第二真相。只有全部实际输入帧都是 9:16 才允许 `none`，任一非 9:16 就必须人工选 `crop` 或 `pad`。
+- 生成推荐值与 pipeline `done` 原子落盘：短链使用实际选中的关键帧；长链使用 plan 中每个 `hard_cut` first anchor 与全部 end anchors，`continue` source first 不计。画幅在 `16:9/9:16` 中取总几何比例损失较小者，平局按源视频方向、仍平局取 `9:16`；清晰度按源视频短边与 `480/768` 的距离，平局取 `480p`。两种画幅都冻结 `fit_profiles`；所选目标完全匹配才用 `none`，否则默认 `crop` 并允许用户改为 `pad`。
 - H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/{crop|pad}/`；永不读取 `postprocessed/`。
 
 ## 冻结输入
@@ -93,10 +93,10 @@ flowchart LR
 
 - source、可选 normalized audio、1–9 张有序关键帧、视觉 prompt、最终 prompt 的相对路径与 SHA-256；
 - 台词 mode、标准化 lines、provenance、classification 和台词 JSON 哈希；
-- `vocal_filter.enabled`、实际 `duration_s`、`ratio=9:16`、`fit_mode`；
-- H3 的 workflow、整数时长和分辨率请求。
+- `vocal_filter.enabled`、实际 `duration_s`、闭集 `ratio=16:9|9:16`、`fit_mode`；
+- H3 的 workflow、整数时长、语义清晰度及唯一 provider 分辨率投影。
 
-写 receipt 后立即经过同一 loader 复核；提交和重启恢复也重新加载。未知 schema/version、路径越界、文件缺失/漂移、台词漂移、最终 prompt 不是确定性组合时全部 fail closed。提交锁内会按用户最终台词和画幅选择重写 receipt，随后 H3Request 只使用当次加载的不可变 bytes。
+写 receipt 后立即经过同一 loader 复核；提交和重启恢复也重新加载。未知 schema/version、路径越界、文件缺失/漂移、台词或生成参数漂移、最终 prompt 不是确定性组合时全部 fail closed。提交锁内会按用户最终台词、画幅、清晰度和适配选择重写 receipt，随后 H3Request 只使用当次加载的不可变 bytes。`H3Request` 只持有语义值，`provider_resolution()` 唯一投影为 `480p横/480p竖/768p横/768p竖`；input manifest、attempt receipt 和 provider body 必须一致。
 
 长链不用短链 receipt 冒充多段输入。`long_video_plan.json`（`duet.long-video-plan` v1）绑定完整源文件、总时长、FL2VA workflow，以及每段的范围、chain/join、源片、关键帧、首尾锚点、视觉/最终提示词和台词摘要。detail 暴露该文件内容的 SHA-256 为 `plan_receipt`；提交必须原样回传 `expected_plan_receipt`。服务在任何供应商 POST 前重新校验 plan、meta 和所有文件哈希，并将确认值冻结到 `frozen_plan_receipt`。
 
@@ -121,7 +121,7 @@ stateDiagram-v2
 - `session.json` 绑定 cid；`session.lock` 使用非阻塞 flock，拒绝同会话并发推进。
 - `attempts/000001/attempt.json` 以 0600 创建，后续原子写 + `fsync`；attempt state schema 为 v1。
 - input、H3 task 和最终输出各有 receipt；状态中不保存结果 URL或凭据，只保存安全错误码。
-- `start` 以同一 client id 幂等推进；公开 `resume_required` 由用户用同 id、同台词、同 fit 确认后再次调用 `start`，继续同一 receipt/attempt。只有确定 `failed` 才由新 id 调 `retry` 创建 attempt。
+- `start` 以同一 client id 幂等推进；公开 `resume_required` 由用户用同 id、同台词、同画幅、同清晰度和同 fit 确认后再次调用 `start`，继续同一 receipt/attempt。只有确定 `failed` 才由新 id 调 `retry` 创建 attempt。
 - 启动 `resume` 设置 `allow_submit=false`，只对已经持久化的 task 做 GET 查询/下载，不发新的供应商 POST。已知 task 的查询/超时、下载传输/输出写入故障和 raw running 状态映射为 `resume_required`；`submission_unknown` 一律锁死。
 - provider 成片 URL 必须是无 userinfo 的 HTTPS，且 DNS/IP 预解析结果全部为公网地址。下载 client 不读取代理环境；响应到达后在读取 status/body 前，从 httpx network stream 取得实际 socket peer 并再次要求公网地址，从而不把预解析结果当作连接事实。无法解析 DNS、无法验证 peer、ffprobe 缺失/超时属于已有 task 的可恢复故障；预解析或实际 peer 为私网则确定拒绝。
 - 下载不跟随重定向。Content-Length 和实际流都限制为 200 MiB，内容先写同目录 0600 临时文件；ffprobe 正常执行并确认 `v:0` 的 `duration` 或 `duration_ts*time_base` 正有限后，才原子替换 `generated.mp4` 并 fsync；音频或容器时长不能让无有效视觉时间轴的文件通过。

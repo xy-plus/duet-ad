@@ -59,6 +59,7 @@ def test_detail_shape_has_no_context_ir_contract(client, video_1s):
         "id", "title", "note", "status", "error", "created_at", "updated_at",
         "keyframes", "prompt", "source_prompt", "source_prompt_sha256", "segments",
         "voice_lines", "read_only", "duration_s", "fit_required", "fit_mode",
+        "aspect_ratio", "resolution", "fit_profiles",
         "dialogue", "receipt_version", "generation", "has_source", "has_video",
         "navigation_status", "submit_enabled", "postprocess", "postprocess_enabled",
     }

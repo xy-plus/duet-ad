@@ -23,6 +23,7 @@ MAX_FINAL_PROMPT_BYTES = 32 * 1024
 _DIALOGUE_MODES = frozenset({"auto", "edit", "custom", "none"})
 _CLASSIFICATIONS = frozenset({"spoken", "sung", None})
 _FIT_MODES = frozenset({"none", "crop", "pad"})
+_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
 _PROVENANCE_BY_MODE = {
     "auto": "asr",
     "edit": "asr+edited",
@@ -285,6 +286,13 @@ def _normalize_fit_mode(value: object) -> str:
     return fit_mode
 
 
+def _normalize_ratio(value: object) -> str:
+    ratio = _normalized_string(value, "ratio")
+    if ratio not in _ASPECT_RATIOS:
+        raise PreparedInputError("ratio must be one of: 16:9, 9:16")
+    return ratio
+
+
 def write_prepared_input(
     *,
     root: Path,
@@ -307,7 +315,7 @@ def write_prepared_input(
     if not root.is_dir():
         raise PreparedInputError("prepared-input root is missing")
     duration = _validate_duration(duration_s)
-    ratio = _normalized_string(ratio, "ratio")
+    ratio = _normalize_ratio(ratio)
     fit_mode = _normalize_fit_mode(fit_mode)
     if not isinstance(vocal_filter_enabled, bool):
         raise PreparedInputError("vocal_filter_enabled must be bool")
@@ -486,7 +494,7 @@ def load_prepared_input(
     if not isinstance(enabled, bool):
         raise PreparedInputError("prepared-input vocal_filter.enabled is invalid")
     duration = _validate_duration(video["duration_s"])
-    ratio = _normalized_string(video["ratio"], "ratio")
+    ratio = _normalize_ratio(video["ratio"])
     fit_mode = _normalize_fit_mode(video["fit_mode"])
     mode = dialogue_section["mode"]
     lines = dialogue_section["lines"]

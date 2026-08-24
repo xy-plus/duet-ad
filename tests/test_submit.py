@@ -57,6 +57,18 @@ def _make_conv(settings, *, fit_required=False, duration_s=9.2, status="done"):
         source_width=160 if fit_required else 90,
         source_height=90 if fit_required else 160,
         fit_required=fit_required,
+        fit_profiles={
+            "16:9": {
+                "fit_required": not fit_required,
+                "default_fit_mode": "crop" if not fit_required else "none",
+            },
+            "9:16": {
+                "fit_required": fit_required,
+                "default_fit_mode": "crop" if fit_required else "none",
+            },
+        },
+        aspect_ratio="9:16",
+        resolution="768p",
         keyframes=["01.png"],
         prompt=PROMPT,
         voice_lines=[],
@@ -80,7 +92,13 @@ def _write_initial_receipt(settings, cid):
         duration_s=9.2,
         ratio="9:16",
         fit_mode="none",
-        engine_request={"fixture": "initial"},
+        engine_request={
+            "h3": {
+                "workflow": h3.H3_WORKFLOW,
+                "duration": 10,
+                "resolution": h3.H3_RESOLUTION,
+            }
+        },
     )
     storage.update_meta(
         settings.data_dir,
@@ -151,16 +169,46 @@ def _write_startup_h3_attempt(settings, cid, *, generation_status="running"):
     return request, state_root / "session.json", attempt_path
 
 
-def _payload(request_id=REQUEST_ID, *, mode="none", fit="none", lines=None):
+def _payload(
+    request_id=REQUEST_ID, *, mode="none", fit="none", lines=None,
+    aspect_ratio="9:16", resolution="768p",
+):
     payload = {
         "confirm": True,
         "client_request_id": request_id,
         "dialogue_mode": mode,
         "fit_mode": fit,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
     }
     if lines is not None:
         payload["lines"] = lines
     return payload
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    [("aspect_ratio", "1:1", "invalid_aspect_ratio"),
+     ("resolution", "1080p", "invalid_resolution")],
+)
+def test_submit_rejects_generation_parameters_before_provider_post(
+    enabled, monkeypatch, field, value, code,
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    called = []
+    monkeypatch.setattr(h3, "start", lambda *_a, **_kw: called.append(True))
+    payload = _payload()
+    payload[field] = value
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": code}
+    assert called == []
+    assert storage.load_meta(settings.data_dir, cid)["generation"] is None
 
 
 @pytest.fixture
@@ -355,11 +403,85 @@ def test_submit_freezes_direct_h3_receipt_and_source_prompt(enabled, monkeypatch
     assert frozen.engine_request["h3"] == {
         "workflow": h3.H3_WORKFLOW,
         "duration": 10,
-        "resolution": h3.H3_RESOLUTION,
+        "aspect_ratio": "9:16",
+        "resolution": "768p",
+        "provider_resolution": "768p竖",
     }
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
     assert "context_ir_enabled" not in detail["generation"]
     assert detail["generation"]["stage"] == "h3"
+
+
+def test_submit_freezes_horizontal_480p_across_meta_receipt_and_request(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings, fit_required=True)
+    seen = []
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: seen.append(request)
+        or h3.H3Result("failed", "000001", error_code="h3_provider_failed"),
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(aspect_ratio="16:9", resolution="480p"),
+    )
+
+    assert response.status_code == 202
+    request = seen[0]
+    assert (request.aspect_ratio, request.resolution) == ("16:9", "480p")
+    meta = storage.load_meta(settings.data_dir, cid)
+    assert (meta["aspect_ratio"], meta["resolution"]) == ("16:9", "480p")
+    receipt = json.loads(
+        (settings.data_dir / cid / prepared_input.RECEIPT_FILENAME).read_text()
+    )
+    assert receipt["video"]["ratio"] == "16:9"
+    assert receipt["engine_request"]["h3"] == {
+        "workflow": h3.H3_WORKFLOW,
+        "duration": 10,
+        "aspect_ratio": "16:9",
+        "resolution": "480p",
+        "provider_resolution": "480p横",
+    }
+
+
+def test_paid_retry_rejects_aspect_or_resolution_drift_before_provider(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    calls = []
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: calls.append(("start", request))
+        or h3.H3Result("failed", "000001", error_code="h3_provider_failed"),
+    )
+    monkeypatch.setattr(
+        h3,
+        "retry",
+        lambda *args: calls.append(("retry", args))
+        or h3.H3Result("failed", "000002", error_code="h3_provider_failed"),
+    )
+    assert client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload()
+    ).status_code == 202
+
+    changed = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(
+            "request-654321", aspect_ratio="9:16", resolution="480p"
+        ),
+    )
+
+    assert changed.status_code == 409
+    assert changed.json() == {"detail": "resume_parameters_changed"}
+    assert [kind for kind, _value in calls] == ["start"]
 
 
 def test_submit_claim_wins_atomically_before_pipeline(enabled, monkeypatch):
@@ -483,7 +605,8 @@ def test_startup_reconciles_half_frozen_short_submit_without_provider(
     )
     assert claimed
     _freeze_submission(
-        settings, cid, claimed, "request-old-123", "none", "none", ()
+        settings, cid, claimed, "request-old-123", "none", "none",
+        "9:16", "768p", (),
     )
     cdir = settings.data_dir / cid
     before = {
