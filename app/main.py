@@ -342,9 +342,8 @@ def _validated_fit_profiles(meta: dict) -> dict[str, dict[str, object]]:
     raise _SubmitError(409, "fit_requirement_unknown")
 
 
-def _selected_fit(meta: dict, aspect_ratio: str) -> tuple[bool, str]:
-    profile = _validated_fit_profiles(meta)[aspect_ratio]
-    return bool(profile["fit_required"]), str(profile["default_fit_mode"])
+def _fit_required(meta: dict, aspect_ratio: str) -> bool:
+    return bool(_validated_fit_profiles(meta)[aspect_ratio]["fit_required"])
 
 
 def _long_fit_required(cdir: Path, meta: dict) -> bool:
@@ -611,7 +610,7 @@ def _validate_submit_payload(
     fit_mode = payload.get("fit_mode")
     if fit_mode not in _FIT_MODES:
         raise _SubmitError(422, "invalid_fit_mode")
-    fit_required, _default_fit = _selected_fit(meta, aspect_ratio)
+    fit_required = _fit_required(meta, aspect_ratio)
     if fit_required:
         if fit_mode not in {"crop", "pad"}:
             raise _SubmitError(422, "fit_mode_required")
@@ -687,7 +686,7 @@ def _validate_long_submit_payload(
     if fit_mode not in _FIT_MODES:
         raise _SubmitError(422, "invalid_fit_mode")
     if not isinstance(meta.get("generation"), dict):
-        fit_required, _default_fit = _selected_fit(meta, aspect_ratio)
+        fit_required = _fit_required(meta, aspect_ratio)
         if fit_required:
             if fit_mode not in {"crop", "pad"}:
                 raise _SubmitError(422, "fit_mode_required")
