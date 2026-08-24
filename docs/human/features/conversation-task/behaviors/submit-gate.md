@@ -67,7 +67,7 @@ links: [conversation-task, processing-state]
 - 首次 start 和 H3 阶段确定失败后的 retry 会在锁内冻结画幅、清晰度、台词和适配方式；长链所有 segment（含运行时续接尾帧）共用同一选择。长链另冻结当前 plan receipt，并在新 id retry 时复用成功段、只重做失败段及同链下游。长链拼接失败复用原 id 且不创建供应商任务。`resume_required` 只加载既有 receipt，不重写它、不递增 attempt。
 - “生成最终视频”点击后必须立即进入提交态或显示错误；前端异常不得表现为无响应。
 - 自动 H3 源提示词只允许在 H3 attempt 创建前通过 CAS 保存；attempt 创建后锁定，防止页面内容与实际生成输入不一致。
-- 短链 H3 只使用 `work/keyframes/` 原图或 `work/h3_frames/{crop|pad}/` 派生图；长链 FL2VA 只使用 plan 绑定的首尾锚点或其画幅派生图；都不读取 Seedream `postprocessed/`。
+- 短链 H3 只使用 `work/keyframes/` 原图或 `work/h3_frames/<aspect>/{crop|pad}/` 派生图；长链 FL2VA 只使用 plan 绑定的首尾锚点或其画幅派生图；都不读取 Seedream `postprocessed/`。
 - 已有 generation + frozen plan 的历史长会话沿用冻结 `fit_mode`；即使旧 meta 的 `fit_required` 为 null，也不重写 active/failed/resume 的 receipt、输入或重试参数。
 - 成片下载先验证全部 DNS 解析地址，再在读取 status/body 前验证实际 socket peer 为公网；拒绝 userinfo 和重定向，限制 200 MiB，并在原子落盘前通过 ffprobe 正时长视频流验证。
 - 旧 Seedance 提交实现和 `face_hold` 参数/提示词注入已删除，不是失败回退选项。
