@@ -285,6 +285,48 @@ def test_fast_mode_prepares_all_segments_then_submits_before_any_poll(
     assert stored["fast_mode"] is True
 
 
+def test_fast_mode_submit_workers_enter_concurrently(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=True
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    submit_barrier = threading.Barrier(2)
+    submit_threads = []
+    threads_lock = threading.Lock()
+    monkeypatch.setattr(
+        h3, "prepare", lambda _request: h3.H3Result("not_started", "attempt")
+    )
+
+    def submit(_request):
+        with threads_lock:
+            submit_threads.append(threading.get_ident())
+        submit_barrier.wait(timeout=2)
+        return h3.H3Result("h3_running", "attempt")
+
+    def resume(request):
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "attempt")
+
+    monkeypatch.setattr(h3, "submit", submit)
+    monkeypatch.setattr(h3, "resume", resume)
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    long_generation.run(settings, cid, plan)
+
+    assert len(submit_threads) == 2
+    assert len(set(submit_threads)) == 2
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+
+
 def test_fast_mode_preflight_failure_makes_zero_provider_posts(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
