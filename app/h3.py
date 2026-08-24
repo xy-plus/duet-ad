@@ -491,6 +491,99 @@ def output_is_reusable(
         return False
 
 
+def legacy_succeeded_output_is_valid(
+    workdir: Path,
+    *,
+    cid: str,
+    client_request_id: str,
+    attempt: int,
+    probe_timeout_s: float = 30.0,
+) -> bool:
+    """Validate display-only evidence from the removed Context IR contract.
+
+    This deliberately does not reconstruct or validate the obsolete input
+    schema.  The legacy-only ``ir``/``keyframes`` discriminator prevents a
+    current receipt-aware attempt from bypassing ``output_is_reusable``.
+    """
+    if (
+        not isinstance(cid, str)
+        or not cid.strip()
+        or not isinstance(client_request_id, str)
+        or not client_request_id.strip()
+        or isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or not 1 <= attempt <= 999999
+        or isinstance(probe_timeout_s, bool)
+        or not isinstance(probe_timeout_s, (int, float))
+        or not math.isfinite(float(probe_timeout_s))
+        or probe_timeout_s <= 0
+    ):
+        return False
+    attempt_id = f"{attempt:06d}"
+    path = (
+        Path(workdir) / ".h3" / "attempts" / attempt_id / "attempt.json"
+    )
+    try:
+        state = _read_json(path)
+        if set(state) != {
+            "schema_version",
+            "cid",
+            "attempt_id",
+            "client_request_id",
+            "input",
+            "input_receipt",
+            "status",
+            "retryable",
+            "ir",
+            "h3",
+        }:
+            return False
+        legacy_input = state.get("input")
+        ir_state = state.get("ir")
+        h3_state = state.get("h3")
+        if (
+            state.get("schema_version") != 1
+            or state.get("cid") != cid
+            or state.get("attempt_id") != attempt_id
+            or state.get("client_request_id") != client_request_id
+            or state.get("status") != "succeeded"
+            or not isinstance(legacy_input, dict)
+            or "keyframes" not in legacy_input
+            or "images" in legacy_input
+            or not isinstance(ir_state, dict)
+            or not isinstance(h3_state, dict)
+            or h3_state.get("status") != "succeeded"
+        ):
+            return False
+        receipt = h3_state.get("output")
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != {"name", "sha256", "size"}
+            or receipt.get("name") != "generated.mp4"
+            or not isinstance(receipt.get("sha256"), str)
+            or len(receipt["sha256"]) != 64
+            or any(character not in "0123456789abcdef" for character in receipt["sha256"])
+            or isinstance(receipt.get("size"), bool)
+            or not isinstance(receipt.get("size"), int)
+            or receipt["size"] <= 0
+        ):
+            return False
+        output = Path(workdir) / "generated.mp4"
+        stat = output.stat()
+        if not output.is_file() or stat.st_size != receipt["size"]:
+            return False
+        digest = hashlib.sha256()
+        with output.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        if digest.hexdigest() != receipt["sha256"]:
+            return False
+        duration = _probe_video_duration(output, float(probe_timeout_s))
+        return duration is not None and math.isfinite(duration) and duration > 0
+    except (OSError, ReceiptError, _ProbeUnavailable):
+        return False
+
+
 def _output_result(request: H3Request, state: Mapping[str, Any] | None) -> H3Result:
     attempt_id = str(state["attempt_id"]) if state is not None else None
     return H3Result(

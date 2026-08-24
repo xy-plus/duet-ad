@@ -962,6 +962,7 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
         generation_binding = (
             {
                 "status": generation.get("status"),
+                "attempt": generation.get("attempt"),
                 "client_request_id": generation.get("client_request_id"),
                 "segments": generation.get("segments"),
             }
@@ -1087,7 +1088,13 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
         request = _load_h3_request(settings, cid, meta)
         return h3.output_is_reusable(request)
     except (_SubmitError, h3.H3Error):
-        return False
+        return h3.legacy_succeeded_output_is_valid(
+            settings.data_dir / cid,
+            cid=cid,
+            client_request_id=generation.get("client_request_id"),
+            attempt=generation.get("attempt"),
+            probe_timeout_s=_timeouts(settings).probe_s,
+        )
 
 
 def _resume_generation(settings: Settings, cid: str) -> None:
