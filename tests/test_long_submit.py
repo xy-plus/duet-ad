@@ -5,14 +5,16 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from app import h3, long_generation, long_video, prepared_input, storage
+from app import h3, long_generation, long_video, prepared_input, stitch, storage
 from app.main import (
     _SubmitError,
     _long_fit_required,
@@ -217,6 +219,15 @@ def _small_video(path: Path, color: str = "black") -> None:
         ],
         check=True,
         capture_output=True,
+    )
+
+
+def _with_boundary_bounds(plan, *, receipt_version):
+    segment = replace(plan.segments[0], start_s=27.52, end_s=37.52)
+    return replace(
+        plan,
+        segments=(segment,),
+        receipt_version=receipt_version,
     )
 
 
@@ -1309,6 +1320,147 @@ def test_boundary_reuse_validation_receives_original_segment_target(
     assert targets == [10.84]
 
 
+@pytest.mark.parametrize(
+    ("receipt_version", "expected_duration_s"),
+    [
+        (long_video.PLAN_RECEIPT_VERSION, 10.0),
+        (long_video.LEGACY_PLAN_RECEIPT_VERSION, 37.52 - 27.52),
+    ],
+)
+def test_boundary_reuse_uses_receipt_version_segment_duration(
+    tmp_path, monkeypatch, receipt_version, expected_duration_s,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    plan = _with_boundary_bounds(plan, receipt_version=receipt_version)
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    generation["segments"][0].update(
+        status="succeeded", attempt=1, child_request_id="child-1"
+    )
+    plan.segments[0].workdir.joinpath("generated.mp4").write_bytes(b"segment")
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        dialogue_mode="auto",
+        generation=generation,
+    )
+    targets = []
+    monkeypatch.setattr(
+        h3,
+        "output_is_reusable",
+        lambda _request, *_args, expected_duration_s=None, **_kwargs: (
+            targets.append(expected_duration_s) or True
+        ),
+    )
+
+    assert long_generation.bound_reusable_segment_indices(
+        settings, cid, plan, generation
+    ) == frozenset({1})
+    assert targets == [expected_duration_s]
+
+
+@pytest.mark.parametrize(
+    ("receipt_version", "expected_duration_s"),
+    [
+        (long_video.PLAN_RECEIPT_VERSION, 10.0),
+        (long_video.LEGACY_PLAN_RECEIPT_VERSION, 37.52 - 27.52),
+    ],
+)
+def test_stitch_input_uses_receipt_version_segment_duration(
+    tmp_path, monkeypatch, receipt_version, expected_duration_s,
+):
+    settings = make_settings(tmp_path)
+    cid, receipt = _make_long(settings)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+    plan = _with_boundary_bounds(plan, receipt_version=receipt_version)
+    calls = []
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch(calls))
+    monkeypatch.setattr(long_generation, "stitched_output_is_reusable", lambda *_a: True)
+
+    long_generation._stitch(settings, cid, plan, "auto")
+
+    assert len(calls) == 1
+    assert calls[0]["segments"][0].target_duration_s == expected_duration_s
+
+
+@pytest.mark.parametrize(
+    ("receipt_version", "expected_duration_s", "resume"),
+    [
+        (long_video.PLAN_RECEIPT_VERSION, 10.0, False),
+        (long_video.LEGACY_PLAN_RECEIPT_VERSION, 37.52 - 27.52, True),
+    ],
+)
+def test_success_validation_uses_receipt_version_segment_duration(
+    tmp_path, monkeypatch, receipt_version, expected_duration_s, resume,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+    plan = _with_boundary_bounds(plan, receipt_version=receipt_version)
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    if resume:
+        generation["segments"][0].update(status="resume_required", attempt=1)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        dialogue_mode="auto",
+        generation=generation,
+    )
+    targets = []
+
+    def succeed(request):
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "task")
+
+    monkeypatch.setattr(
+        h3,
+        "start",
+        (lambda _request: pytest.fail("legacy recovery must not POST"))
+        if resume
+        else succeed,
+    )
+    monkeypatch.setattr(
+        h3,
+        "resume",
+        succeed if resume else lambda _request: pytest.fail("new task must POST"),
+    )
+    monkeypatch.setattr(
+        h3,
+        "output_is_reusable",
+        lambda _request, *_args, expected_duration_s=None, **_kwargs: (
+            targets.append(expected_duration_s) or True
+        ),
+    )
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    long_generation.run(settings, cid, plan)
+
+    assert targets == [expected_duration_s]
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+
+
 def test_startup_revalidates_previous_output_invalid_without_new_provider_call(
     tmp_path, monkeypatch,
 ):
@@ -1440,6 +1592,17 @@ def test_new_receipt_rejects_segment_whose_provider_duration_exceeds_ten(tmp_pat
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     with pytest.raises(long_video.LongVideoError, match="long_video_plan_invalid_segment"):
         _make_long(settings, segment_duration=10.000001)
+
+
+def test_new_receipt_rejects_true_six_decimal_subsecond_segment(tmp_path):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    joins = ("hard_cut",) + ("continue",) * 10
+
+    with pytest.raises(
+        long_video.LongVideoError,
+        match="long_video_plan_invalid_segment",
+    ):
+        _make_long(settings, joins=joins, segment_duration=0.999999)
 
 
 def test_freeze_rejects_new_receipt_with_over_ten_provider_duration(tmp_path):
@@ -1966,6 +2129,102 @@ def test_stitched_output_reuse_validates_receipt_bytes_and_target_duration(
         )
         receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     assert _REAL_STITCHED_OUTPUT_IS_REUSABLE(plan, "none") is False
+
+
+@pytest.mark.parametrize(
+    ("receipt_version", "expected_duration_s"),
+    [
+        (long_video.PLAN_RECEIPT_VERSION, 10.0),
+        (long_video.LEGACY_PLAN_RECEIPT_VERSION, 37.52 - 27.52),
+    ],
+)
+def test_stitched_receipt_and_success_validation_use_receipt_version_duration(
+    tmp_path, monkeypatch, receipt_version, expected_duration_s,
+):
+    monkeypatch.setattr(
+        long_generation,
+        "stitched_output_is_reusable",
+        _REAL_STITCHED_OUTPUT_IS_REUSABLE,
+    )
+    settings = make_settings(tmp_path)
+    cid, receipt = _make_long(settings)
+    root = settings.data_dir / cid
+    plan = long_generation.freeze_plan(
+        root,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+    plan = _with_boundary_bounds(plan, receipt_version=receipt_version)
+    segment_output = plan.segments[0].workdir / "generated.mp4"
+    segment_output.write_bytes(b"segment-output")
+    output = root / "generated.mp4"
+    output.write_bytes(b"stitched-output")
+    receipt_path = root / stitch.RECEIPT_FILENAME
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "schema": "duet.stitch",
+                "version": 1,
+                "segments": [
+                    {
+                        "index": 1,
+                        "path": str(segment_output.resolve()),
+                        "sha256": hashlib.sha256(
+                            segment_output.read_bytes()
+                        ).hexdigest(),
+                        "target_duration_s": expected_duration_s,
+                        "output_frames": 240,
+                        "join_mode": "hard_cut",
+                    }
+                ],
+                "audio": {
+                    "mode": "mute",
+                    "source": str(plan.source.resolve()),
+                    "source_sha256": hashlib.sha256(
+                        plan.source.read_bytes()
+                    ).hexdigest(),
+                    "source_has_audio": False,
+                },
+                "output": {
+                    "name": "generated.mp4",
+                    "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+                    "size": output.stat().st_size,
+                    "duration_s": expected_duration_s,
+                    "fps": stitch.FPS,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed = {"budgets": [], "validation": []}
+
+    def frame_budgets(segments):
+        observed["budgets"].append(
+            [segment.target_duration_s for segment in segments]
+        )
+        return [240]
+
+    def validate_output(_output, duration_s, audio_mode, source_has_audio):
+        observed["validation"].append(
+            (duration_s, audio_mode, source_has_audio)
+        )
+        return SimpleNamespace(duration_s=expected_duration_s)
+
+    monkeypatch.setattr(stitch, "_frame_budgets", frame_budgets)
+    monkeypatch.setattr(
+        stitch,
+        "_probe",
+        lambda _path: SimpleNamespace(has_audio=False),
+    )
+    monkeypatch.setattr(stitch, "_validate_output", validate_output)
+
+    assert _REAL_STITCHED_OUTPUT_IS_REUSABLE(plan, "none") is True
+    assert observed == {
+        "budgets": [[expected_duration_s]],
+        "validation": [(expected_duration_s, "mute", False)],
+    }
 
 
 @pytest.mark.parametrize("entrypoint", ["startup", "submit"])

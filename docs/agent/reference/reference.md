@@ -317,7 +317,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 ## Long-video plan receipt v2（兼容只读恢复 v1）
 
-`data/<cid>/long_video_plan.json` 是 canonical JSON。新计划固定 `schema=duet.long-video-plan`、`version=2`；顶层绑定完整 source 的路径/SHA-256、实际总时长、`workflow=minimax_h3_lightx2v` 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，六位小数边界归一后的 provider 整秒时长不得超过 10 秒，并绑定：
+`data/<cid>/long_video_plan.json` 是 canonical JSON。新计划固定 `schema=duet.long-video-plan`、`version=2`；顶层绑定完整 source 的路径/SHA-256、实际总时长、`workflow=minimax_h3_lightx2v` 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，六位小数边界归一后的长度至少 1 秒，provider 整秒时长不得超过 10 秒，并绑定：
 
 - `index/start_s/end_s/chain_id/join_mode`；首段必须 `hard_cut`，后续为 `hard_cut` 或 `continue`；
 - 分段 source、1–9 张关键帧、`first/end` 两张锚点及其 SHA-256；
