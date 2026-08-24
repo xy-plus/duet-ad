@@ -346,6 +346,7 @@ input, textarea { font-family: inherit; }
 .msg-user { display: flex; justify-content: flex-end; }
 
 .bubble-user {
+  min-width: 0;
   max-width: min(70%, 560px);
   background: var(--accent);
   color: #FFFFFF;
@@ -524,7 +525,7 @@ input, textarea { font-family: inherit; }
 
 .kf-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -540,7 +541,7 @@ input, textarea { font-family: inherit; }
 .kf-card:first-child {
   grid-column: span 2;
   grid-row: span 2;
-  aspect-ratio: auto;
+  aspect-ratio: 4 / 3;
 }
 
 .kf-card img {
@@ -787,12 +788,14 @@ input, textarea { font-family: inherit; }
 .pp-bubble-label { font-size: 13px; font-weight: 600; margin-right: 2px; }
 
 .pp-chip {
+  max-width: 100%;
   font-size: 12px;
   line-height: 1;
   padding: 6px 10px;
   border-radius: 999px;
   background: rgba(255, 255, 255, .18);
   border: 1px solid rgba(255, 255, 255, .35);
+  overflow-wrap: anywhere;
 }
 
 .pp-seg + .pp-seg {
@@ -800,6 +803,8 @@ input, textarea { font-family: inherit; }
   padding-top: 16px;
   border-top: 1px solid var(--divider);
 }
+
+.pp-result-disclosure { min-width: 0; }
 
 .pp-result-toggle {
   width: 100%;
@@ -1434,7 +1439,7 @@ input, textarea { font-family: inherit; }
 
   .bubble-user { max-width: 85%; }
 
-  .kf-grid { grid-template-columns: repeat(2, 1fr); }
+  .kf-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
   .kf-card:first-child {
     grid-column: span 2;
