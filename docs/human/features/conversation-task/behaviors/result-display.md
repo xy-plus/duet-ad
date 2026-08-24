@@ -16,7 +16,7 @@ links: [conversation-task, processing-state]
 | --- | --- |
 | 输入准备为 `done` | 展示源视频、1–9 张关键帧、最终 H3 prompt、台词选择、画幅选择和最终视频区 |
 | 短视频 H3 attempt 尚未创建 | 自动生成的 H3 源提示词可二次修改；保存使用当前 SHA-256 防止覆盖新版本 |
-| 长视频准备完成 | 展示“逐段冻结的 H3 提示词”但不提供顶层编辑；各段内容已由 plan receipt 逐段绑定 |
+| 长视频准备完成 | 展示每段 H3 提示词但不提供顶层编辑；各段内容已由 plan receipt 逐段绑定 |
 | H3 attempt 已创建 | H3 源提示词锁定；不能让页面展示内容与已冻结输入发生漂移 |
 | 选择 `auto` | 使用详情 `dialogue.auto_lines` 中的自动有效台词，不允许随请求上传 `lines` |
 | 选择 `edit` | 以自动台词预填，提交至少一行 `{text,start_s,end_s}` |

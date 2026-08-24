@@ -909,7 +909,7 @@ function renderFinalSection(detail) {
       ? "全部分段成片已复用，本次只在本地重试拼接。"
       : retryContract.action === "retry"
         ? "跨段连续性为 best effort；成功段复用，失败时只重做失败段及同链下游。"
-        : "跨段连续性为 best effort；逐段冻结的 H3 提示词将提交生成。";
+        : "跨段连续性为 best effort；各段 H3 提示词将提交生成。";
     notice.appendChild(el("p", null, noticeText));
     card.appendChild(notice);
   }
@@ -1051,7 +1051,7 @@ function renderFinalSection(detail) {
   row.appendChild(el("p", "final-caption generation-mode-caption", busy
     ? "正在等待 H3 生成结果"
     : longContract.isLong
-      ? "逐段冻结的 H3 提示词将提交生成"
+      ? "各段 H3 提示词将提交生成"
       : "H3 源提示词将直接提交生成"));
   card.appendChild(row);
   if (busy) setGenerationCardBusy(card, true);
@@ -1113,27 +1113,43 @@ function kfGrid(detail, names, pathPrefix, altPrefix, options = {}) {
 
 let disclosureSeq = 0;
 
-function segmentPromptDisclosure(text, segmentIndex) {
+function segmentDisclosure(content, labels) {
   const wrap = el("div", "segment-prompt-disclosure");
   const button = el("button", "segment-prompt-toggle");
   button.type = "button";
   const panel = el("div", "segment-prompt-panel");
-  panel.id = "segment-prompt-" + (++disclosureSeq);
+  panel.id = "segment-disclosure-" + (++disclosureSeq);
   button.setAttribute("aria-controls", panel.id);
-  const labels = {
-    expand: "展开第 " + segmentIndex + " 段提示词",
-    collapse: "收起第 " + segmentIndex + " 段提示词",
-    expandText: "展开提示词",
-    collapseText: "收起提示词",
-  };
   setDisclosureState(button, panel, false, labels);
   button.addEventListener("click", () => {
     setDisclosureState(button, panel, panel.hidden, labels);
   });
-  panel.appendChild(promptCard(text));
+  panel.appendChild(content);
   wrap.appendChild(button);
   wrap.appendChild(panel);
   return wrap;
+}
+
+function segmentPromptDisclosure(text, segmentIndex) {
+  return segmentDisclosure(promptCard(text), {
+    expand: "展开第 " + segmentIndex + " 段提示词",
+    collapse: "收起第 " + segmentIndex + " 段提示词",
+    expandText: "展开提示词",
+    collapseText: "收起提示词",
+  });
+}
+
+function segmentDialogueDisclosure(dialogueLines, segmentIndex) {
+  const lines = el("div", "lines-card");
+  const list = el("ul", "lines-list");
+  for (const line of dialogueLines) list.appendChild(el("li", null, line));
+  lines.appendChild(list);
+  return segmentDisclosure(lines, {
+    expand: "展开第 " + segmentIndex + " 段台词",
+    collapse: "收起第 " + segmentIndex + " 段台词",
+    expandText: "展开段台词",
+    collapseText: "收起段台词",
+  });
 }
 
 function sourcePromptEditable(detail) {
@@ -1287,18 +1303,12 @@ function renderSegments(detail) {
       ));
     }
     if (seg.prompt) {
-      card.appendChild(el("h4", "res-sub", "逐段冻结的 H3 提示词"));
+      card.appendChild(el("h4", "res-sub", "H3 提示词"));
       card.appendChild(segmentPromptDisclosure(seg.prompt, n));
     }
     if (Array.isArray(seg.lines) && seg.lines.length) {
-      const lines = el("div", "lines-card");
-      lines.appendChild(el("h4", "res-sub", "段台词"));
-      const ul = el("ul", "lines-list");
-      for (const line of seg.lines) {
-        ul.appendChild(el("li", null, line));
-      }
-      lines.appendChild(ul);
-      card.appendChild(lines);
+      card.appendChild(el("h4", "res-sub", "段台词"));
+      card.appendChild(segmentDialogueDisclosure(seg.lines, n));
     }
     frag.appendChild(card);
   }
