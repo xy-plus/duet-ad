@@ -341,9 +341,9 @@ def start(request: H3Request, *, client: httpx.Client | None = None) -> H3Result
     outcome is unknown.
     """
     with _session_lease(request):
-        if _has_output(request):
-            return _output_result(request, None)
         existing = _find_attempt(request, request.client_request_id)
+        if output_is_reusable(request, existing):
+            return _output_result(request, existing)
         if existing is None:
             state = _create_attempt(request, request.client_request_id)
             is_new = True
@@ -364,12 +364,7 @@ def inspect(request: H3Request) -> H3Result:
     root = _state_root(request)
     marker = root / "session.json"
     if not root.exists():
-        if _has_output(request):
-            return _output_result(request, None)
         return H3Result(status="not_started", attempt_id=None)
-
-    if _has_output(request):
-        return _output_result(request, None)
     latest = _latest_attempt(request)
     if marker.is_file():
         expected = {"schema_version": SCHEMA_VERSION, "cid": request.cid}
@@ -382,6 +377,8 @@ def inspect(request: H3Request) -> H3Result:
         _validate_state(request, latest, require_client_request_id=False)
     if latest is None:
         return H3Result(status="not_started", attempt_id=None)
+    if output_is_reusable(request, latest):
+        return _output_result(request, latest)
     return _result(latest)
 
 
@@ -389,7 +386,7 @@ def resume(request: H3Request, *, client: httpx.Client | None = None) -> H3Resul
     """Recover one attempt using GET only; intended for startup scanners."""
     with _session_lease(request):
         state = _find_attempt(request, request.client_request_id)
-        if _has_output(request):
+        if output_is_reusable(request, state):
             return _output_result(request, state)
         if state is None:
             return H3Result(status="not_started", attempt_id=None)
@@ -413,7 +410,7 @@ def retry(
     retried = replace(request, client_request_id=client_request_id)
     with _session_lease(retried):
         existing = _find_attempt(retried, client_request_id)
-        if _has_output(retried):
+        if output_is_reusable(retried, existing):
             return _output_result(retried, existing)
         is_new = existing is None
         state = _create_attempt(retried, client_request_id) if is_new else existing
@@ -435,11 +432,59 @@ def _attempt_path(request: H3Request, attempt_id: str) -> Path:
     return _state_root(request) / "attempts" / attempt_id / "attempt.json"
 
 
-def _has_output(request: H3Request) -> bool:
+def output_is_reusable(
+    request: H3Request,
+    state: Mapping[str, Any] | None = None,
+    *,
+    expected_duration_s: float | None = None,
+) -> bool:
+    """Validate a local output against its exact paid attempt and frozen input."""
+    if state is None:
+        state = _find_attempt(request, request.client_request_id)
+    if state is None:
+        return False
+    _validate_state(request, state)
+    h3_state = state.get("h3")
+    if (
+        state.get("status") != "succeeded"
+        or not isinstance(h3_state, dict)
+        or h3_state.get("status") != "succeeded"
+    ):
+        return False
+    receipt = h3_state.get("output")
+    if not isinstance(receipt, dict):
+        return False
     output = request.workdir / "generated.mp4"
     try:
-        return output.is_file() and output.stat().st_size > 0
+        stat = output.stat()
+        if (
+            not output.is_file()
+            or stat.st_size <= 0
+            or receipt.get("size") != stat.st_size
+        ):
+            return False
+        digest = hashlib.sha256()
+        with output.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        if digest.hexdigest() != receipt.get("sha256"):
+            return False
+        duration = _probe_video_duration(output, request.timeouts.probe_s)
+        if duration is None:
+            return False
+        expected = float(
+            request.duration if expected_duration_s is None else expected_duration_s
+        )
+        if (
+            not math.isfinite(expected)
+            or expected <= 0
+            or abs(duration - expected) > 0.5
+        ):
+            return False
+        return True
     except OSError:
+        return False
+    except _ProbeUnavailable:
         return False
 
 
@@ -762,11 +807,9 @@ def _advance(
     new_attempt: bool,
 ) -> H3Result:
     _validate_state(request, state)
-    if _has_output(request):
+    if output_is_reusable(request, state):
         return _output_result(request, state)
     status = str(state.get("status") or "")
-    if status == "succeeded":
-        raise ReceiptError("output_missing")
     if status == "submission_unknown":
         return _result(state)
     if status == "failed":
@@ -1164,7 +1207,7 @@ def _response_has_public_peer(response: httpx.Response) -> bool | None:
     return address.is_global and not address.is_multicast
 
 
-def _probe_video(path: Path, timeout_s: float) -> bool:
+def _probe_video_duration(path: Path, timeout_s: float) -> float | None:
     try:
         result = subprocess.run(
             [
@@ -1186,7 +1229,7 @@ def _probe_video(path: Path, timeout_s: float) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         raise _ProbeUnavailable from None
     if result.returncode != 0:
-        return False
+        return None
     try:
         payload = json.loads(result.stdout)
         streams = payload.get("streams")
@@ -1196,31 +1239,35 @@ def _probe_video(path: Path, timeout_s: float) -> bool:
         AttributeError,
         json.JSONDecodeError,
     ):
-        return False
+        return None
     if not isinstance(streams, list) or not streams:
-        return False
+        return None
     stream = streams[0]
     if not isinstance(stream, dict) or stream.get("codec_type") != "video":
-        return False
+        return None
     try:
         raw_duration = stream.get("duration")
         if isinstance(raw_duration, bool):
-            return False
+            return None
         duration = float(raw_duration)
         if math.isfinite(duration) and duration > 0:
-            return True
+            return duration
     except (TypeError, ValueError):
         pass
     try:
         raw_duration_ts = stream.get("duration_ts")
         if isinstance(raw_duration_ts, bool):
-            return False
+            return None
         ticks = float(raw_duration_ts)
         numerator, denominator = str(stream.get("time_base")).split("/", 1)
         duration = ticks * float(numerator) / float(denominator)
     except (TypeError, ValueError, ZeroDivisionError):
-        return False
-    return math.isfinite(duration) and duration > 0
+        return None
+    return duration if math.isfinite(duration) and duration > 0 else None
+
+
+def _probe_video(path: Path, timeout_s: float) -> bool:
+    return _probe_video_duration(path, timeout_s) is not None
 
 
 def _submission_unknown(request: H3Request, state: dict[str, Any], stage: str) -> None:

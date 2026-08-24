@@ -147,7 +147,7 @@ def valid_video_bytes(tmp_path_factory) -> bytes:
             "-f",
             "lavfi",
             "-i",
-            "color=c=black:s=32x32:r=5:d=0.4",
+            "color=c=black:s=32x32:r=5:d=10",
             "-an",
             "-c:v",
             "libx264",
@@ -456,17 +456,71 @@ def test_legacy_provider_failure_without_diagnostic_remains_idempotent(tmp_path)
         assert h3.start(request, client=client).status == "failed"
 
 
-def test_existing_generated_video_is_idempotent_without_network(tmp_path):
+def test_unbound_generated_video_is_not_treated_as_resumable_success(tmp_path):
     request = _request(tmp_path)
     request.workdir.mkdir(parents=True)
     output = request.workdir / "generated.mp4"
     output.write_bytes(b"already-done")
 
-    with _client(lambda _request: pytest.fail("network must not be used")) as client:
-        first = h3.start(request, client=client)
-        second = h3.resume(request, client=client)
+    with _client(lambda _request: pytest.fail("resume must not use network without task")) as client:
+        result = h3.resume(request, client=client)
 
-    assert first.status == second.status == "succeeded"
+    assert result.status == "not_started"
+
+
+def test_reusable_output_requires_bound_receipt_valid_video_duration_and_frozen_bytes(
+    tmp_path
+):
+    request = _request(tmp_path)
+    provider = HappyProvider()
+    with _client(provider) as client:
+        assert h3.start(request, client=client).status == "succeeded"
+    output = request.workdir / "generated.mp4"
+    actual_duration = h3._probe_video_duration(output, 1)
+    assert actual_duration is not None
+    assert h3.output_is_reusable(
+        request, expected_duration_s=actual_duration
+    ) is True
+    assert h3.output_is_reusable(
+        request, expected_duration_s=actual_duration + 2
+    ) is False
+
+    original = output.read_bytes()
+    output.write_bytes(b"")
+    assert h3.output_is_reusable(request) is False
+    output.write_bytes(b"not-a-video")
+    assert h3.output_is_reusable(request) is False
+    output.write_bytes(original)
+    drifted = replace(request, prompt=request.prompt + " changed")
+    with pytest.raises(h3.ReceiptError, match="receipt_mismatch"):
+        h3.output_is_reusable(drifted)
+
+
+def test_succeeded_attempt_with_missing_output_redownloads_by_get_only(tmp_path):
+    request = _request(tmp_path)
+    provider = HappyProvider()
+    with _client(provider) as client:
+        assert h3.start(request, client=client).status == "succeeded"
+    (request.workdir / "generated.mp4").unlink()
+    calls = []
+
+    def recover(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        assert req.method == "GET"
+        if req.url.path.endswith("/result/h3-task-local"):
+            return httpx.Response(
+                200,
+                json={"data": {"status": "SUCCESS", "results": [
+                    {"url": "https://download.invalid/video.mp4"}
+                ]}},
+            )
+        return _download_response(200, content=HappyProvider.video_bytes)
+
+    with _client(recover) as client:
+        result = h3.resume(request, client=client)
+    assert result.status == "succeeded"
+    assert calls and all(call.method == "GET" for call in calls)
+    assert h3.output_is_reusable(request) is True
 
 
 def test_empty_voice_texts_are_valid_and_bound(tmp_path):
