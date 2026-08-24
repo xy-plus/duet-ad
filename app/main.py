@@ -1055,6 +1055,14 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
     cid = meta.get("id")
     if not isinstance(cid, str):
         return False
+    if h3.legacy_succeeded_output_is_valid(
+        settings.data_dir / cid,
+        cid=cid,
+        client_request_id=generation.get("client_request_id"),
+        attempt=generation.get("attempt"),
+        probe_timeout_s=_timeouts(settings).probe_s,
+    ):
+        return True
     if _is_long_video(meta):
         expected = meta.get("frozen_plan_receipt")
         if (
@@ -1086,17 +1094,9 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
             return False
     try:
         request = _load_h3_request(settings, cid, meta)
-        if h3.output_is_reusable(request):
-            return True
+        return h3.output_is_reusable(request)
     except (_SubmitError, h3.H3Error):
-        pass
-    return h3.legacy_succeeded_output_is_valid(
-        settings.data_dir / cid,
-        cid=cid,
-        client_request_id=generation.get("client_request_id"),
-        attempt=generation.get("attempt"),
-        probe_timeout_s=_timeouts(settings).probe_s,
-    )
+        return False
 
 
 def _resume_generation(settings: Settings, cid: str) -> None:

@@ -190,7 +190,12 @@ def test_legacy_evidence_is_checked_after_strict_validator_returns_false(
         "client_request_id": REQUEST_ID,
         "stage": "h3",
     }
-    meta = {**meta, "status": "done", "generation": generation}
+    meta = {
+        **meta,
+        "status": "done",
+        "duration_s": 12.5,
+        "generation": generation,
+    }
     monkeypatch.setattr(main_module, "_load_h3_request", lambda *_args: object())
     monkeypatch.setattr(h3, "output_is_reusable", lambda *_args: False)
     monkeypatch.setattr(h3, "_probe_video_duration", lambda *_args: 10.125)
