@@ -338,10 +338,12 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
     if segment.join_mode == "continue":
         upstream = plan.segments[segment.index - 2]
         tail = upstream.workdir / "work" / "generated_last.png"
-        if not tail.is_file():
-            if not prepare_inputs:
-                raise LongGenerationError("long_video_tail_frame_missing")
+        # A paid start belongs to the current parent attempt and must refresh
+        # the dependency; resume may only reuse the already-frozen tail.
+        if prepare_inputs:
             tail = _extract_last_frame(upstream.workdir / "generated.mp4", tail)
+        elif not tail.is_file():
+            raise LongGenerationError("long_video_tail_frame_missing")
         try:
             tail_data = tail.read_bytes()
         except OSError:
@@ -727,7 +729,10 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             if state.get("status") not in {"queued", "running", "resume_required"}:
                 continue
             try:
-                request = _request(settings, cid, plan, segment, parent_id, fit_mode)
+                request = _request(
+                    settings, cid, plan, segment, parent_id, fit_mode,
+                    prepare_inputs=False,
+                )
                 result = h3.resume(request)
                 if result.status == "not_started":
                     state["status"], state["error"] = (
@@ -779,7 +784,10 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
 
     def worker(segment: FrozenSegment, action: str):
         try:
-            request = _request(settings, cid, plan, segment, parent_id, fit_mode)
+            request = _request(
+                settings, cid, plan, segment, parent_id, fit_mode,
+                prepare_inputs=action == "start",
+            )
         except LongGenerationError as exc:
             return None, ("failed", exc.code)
         except Exception:
