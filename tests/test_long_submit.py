@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import h3, long_generation, long_video, prepared_input, storage
-from app.main import _resume_long_generation, create_app
+from app.main import _SubmitError, _resume_long_generation, create_app
 from conftest import AUTH, make_settings
 
 
@@ -159,6 +159,115 @@ def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkey
         "status": "succeeded", "attempt": 1, "error": None,
     }]
     assert "provider-task-secret" not in str(generation)
+
+
+@pytest.mark.parametrize("mode", ["auto", "none"])
+def test_stale_long_page_requires_refresh_before_credentials_or_provider(
+    tmp_path, monkeypatch, mode
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token=""
+    )
+    cid, _receipt = _make_long(settings)
+    root = settings.data_dir / cid
+    meta_path = root / "meta.json"
+    receipt_path = root / long_video.PLAN_RECEIPT_FILENAME
+    before_meta = meta_path.read_bytes()
+    before_receipt = receipt_path.read_bytes()
+    provider_calls = []
+    monkeypatch.setattr(h3, "start", lambda request: provider_calls.append(request))
+
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            f"/api/conversations/{cid}/submit",
+            headers=AUTH,
+            json={
+                "confirm": True,
+                "client_request_id": "stale-page-request",
+                "dialogue_mode": mode,
+                "fit_mode": "none",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "client_refresh_required",
+            "message": "页面版本已更新，请刷新页面后重试。",
+        }
+    }
+    assert provider_calls == []
+    assert meta_path.read_bytes() == before_meta
+    assert receipt_path.read_bytes() == before_receipt
+    assert not (root / ".h3").exists()
+
+
+def test_structured_submit_error_rejects_non_public_fields():
+    with pytest.raises(TypeError, match="safe code and message"):
+        _SubmitError(
+            409,
+            {
+                "code": "client_refresh_required",
+                "message": "safe",
+                "provider_error": "must-not-escape",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_detail"),
+    [
+        (
+            {
+                "confirm": True,
+                "client_request_id": "stale-page-request",
+                "dialogue_mode": "auto",
+                "fit_mode": "none",
+                "unexpected": True,
+            },
+            "invalid_submit_request",
+        ),
+        (
+            {
+                "confirm": True,
+                "client_request_id": "stale-page-request",
+                "dialogue_mode": "edit",
+                "fit_mode": "none",
+            },
+            "long_video_audio_mode_unsupported",
+        ),
+        (
+            {
+                "confirm": True,
+                "client_request_id": "bad",
+                "dialogue_mode": "none",
+                "fit_mode": "none",
+            },
+            "invalid_submit_request",
+        ),
+        (
+            {
+                "confirm": True,
+                "client_request_id": "stale-page-request",
+                "dialogue_mode": "none",
+                "fit_mode": "bad",
+            },
+            "invalid_submit_request",
+        ),
+    ],
+)
+def test_malformed_long_payloads_are_not_misclassified_as_stale_page(
+    enabled, payload, expected_detail
+):
+    settings, client = enabled
+    cid, _receipt = _make_long(settings)
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": expected_detail}
 
 
 def test_15_seconds_one_post_and_none_rebuilds_prompt_without_source_dialogue(

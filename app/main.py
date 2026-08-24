@@ -56,10 +56,24 @@ _KNOWN_TASK_ERRORS = frozenset(
 
 
 class _SubmitError(RuntimeError):
-    def __init__(self, status: int, detail: str) -> None:
-        super().__init__(detail)
+    def __init__(self, status: int, detail: str | dict[str, str]) -> None:
+        if isinstance(detail, dict):
+            if set(detail) != {"code", "message"} or not all(
+                isinstance(detail[key], str) and detail[key]
+                for key in ("code", "message")
+            ):
+                raise TypeError("structured submit detail must contain safe code and message")
+            public_detail: str | dict[str, str] = {
+                "code": detail["code"],
+                "message": detail["message"],
+            }
+        elif isinstance(detail, str):
+            public_detail = detail
+        else:
+            raise TypeError("submit detail must be a public string or safe structure")
+        super().__init__(str(public_detail))
         self.status = status
-        self.detail = detail
+        self.detail = public_detail
 
 
 def _duration_limit_detail(duration_s: float) -> dict:
@@ -414,6 +428,32 @@ def _validate_long_submit_payload(meta: dict, payload: dict) -> tuple[str, str, 
     if set(payload) != allowed:
         if "lines" in payload or payload.get("dialogue_mode") in {"edit", "custom"}:
             raise _SubmitError(422, "long_video_audio_mode_unsupported")
+        legacy_allowed = allowed - {"expected_plan_receipt"}
+        request_id = payload.get("client_request_id")
+        dialogue_mode = payload.get("dialogue_mode")
+        fit_mode = payload.get("fit_mode")
+        legacy_fit_valid = (
+            fit_mode in _FIT_MODES
+            and (
+                (meta.get("fit_required") is True and fit_mode in {"crop", "pad"})
+                or (meta.get("fit_required") is not True and fit_mode == "none")
+            )
+        )
+        if (
+            set(payload) == legacy_allowed
+            and isinstance(request_id, str)
+            and _CLIENT_REQUEST_ID_RE.fullmatch(request_id)
+            and dialogue_mode in {"auto", "none"}
+            and meta.get("voice_mode") == "keep"
+            and legacy_fit_valid
+        ):
+            raise _SubmitError(
+                409,
+                {
+                    "code": "client_refresh_required",
+                    "message": "页面版本已更新，请刷新页面后重试。",
+                },
+            )
         raise _SubmitError(422, "invalid_submit_request")
     request_id = payload.get("client_request_id")
     if not isinstance(request_id, str) or not _CLIENT_REQUEST_ID_RE.fullmatch(request_id):
@@ -1245,6 +1285,17 @@ def create_app(settings: Settings) -> FastAPI:
 
     web = Path(__file__).resolve().parent.parent / "web"
     if web.is_dir():
+        no_store = {"Cache-Control": "no-store"}
+
+        @app.get("/", include_in_schema=False)
+        @app.get("/index.html", include_in_schema=False)
+        async def web_index():
+            return FileResponse(web / "index.html", headers=no_store)
+
+        @app.get("/app.js", include_in_schema=False)
+        async def web_app_contract():
+            return FileResponse(web / "app.js", headers=no_store)
+
         app.mount("/", StaticFiles(directory=web, html=True), name="web")
 
     return app

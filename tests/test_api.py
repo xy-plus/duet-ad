@@ -30,6 +30,20 @@ def test_list_conversations_shape(client, video_1s):
     assert item["has_video"] is False
 
 
+def test_html_entrypoints_and_app_contract_are_never_cached(client):
+    for path in ("/", "/index.html", "/app.js"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+
+    assert "no-store" not in client.get("/styles.css").headers.get(
+        "cache-control", ""
+    )
+    assert "no-store" not in client.get("/api/health").headers.get(
+        "cache-control", ""
+    )
+
+
 def test_detail_shape_has_no_context_ir_contract(client, video_1s):
     cid = _make_conv(client, video_1s, note="n1")
     response = client.get(f"/api/conversations/{cid}", headers=AUTH)

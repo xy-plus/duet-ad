@@ -167,6 +167,8 @@ multipart 字段：
 
 长视频只允许这五个键，`dialogue_mode` 只能为 `auto`（最终复用完整源音轨）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希。画幅规则与短链相同。
 
+旧标签页可能仍按四键长视频契约提交，缺少 `expected_plan_receipt`。服务仅对这个精确旧请求返回结构化 `409 client_refresh_required`，提示刷新页面；不会自动采用服务端当前 receipt，也不会创建付费任务。`/`、`/index.html` 和 `/app.js` 均使用 `Cache-Control: no-store`，刷新后会取得当前提交契约。
+
 接受后返回 `202 {"status":"queued","attempt":N}`。后台状态写入 `generation`，客户端轮询 detail。
 
 门控和错误：
@@ -177,6 +179,7 @@ multipart 字段：
 | 404 | `not found` | cid 不存在/非法 |
 | 409 | `read_only` | 非 schema v2 |
 | 409 | `confirmation required` | 非严格 true |
+| 409 | `client_refresh_required` + 中文 `message` | 精确旧版四键长视频请求；刷新页面，不产生付费任务 |
 | 422 | `invalid_submit_request` | 出现未知键 |
 | 422 | `invalid_client_request_id` | id 不合规 |
 | 422 | `invalid_dialogue` | mode、lines 形状或台词内容不合规 |
