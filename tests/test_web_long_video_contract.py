@@ -32,7 +32,7 @@ def test_long_video_contract_fails_closed_when_plan_metadata_is_missing():
 def test_long_submit_is_restricted_and_binds_current_plan_receipt():
     payload = _run_contract(
         "contract.buildSubmitPayload({clientRequestId:'request-long',dialogueMode:'auto',"
-        "fitRequired:false,isLong:true,planReceipt:'c'.repeat(64),"
+        "fitRequired:false,isLong:true,fastMode:false,planReceipt:'c'.repeat(64),"
         "aspectRatio:'16:9',resolution:'480p'})"
     )
     assert payload == {
@@ -43,7 +43,22 @@ def test_long_submit_is_restricted_and_binds_current_plan_receipt():
         "aspect_ratio": "16:9",
         "resolution": "480p",
         "expected_plan_receipt": "c" * 64,
+        "fast_mode": False,
     }
+
+
+def test_long_submit_fast_mode_is_explicit_and_short_submit_is_unchanged():
+    payloads = _run_contract(
+        "[false,true].map(fastMode=>contract.buildSubmitPayload({"
+        "clientRequestId:'request-long',dialogueMode:'auto',fitRequired:false,isLong:true,"
+        "fastMode,planReceipt:'c'.repeat(64),aspectRatio:'16:9',resolution:'480p'}))"
+        ".concat([contract.buildSubmitPayload({clientRequestId:'request-short',"
+        "dialogueMode:'none',fitRequired:false,isLong:false,fastMode:true,"
+        "aspectRatio:'9:16',resolution:'768p'})])"
+    )
+    assert payloads[0]["fast_mode"] is False
+    assert payloads[1]["fast_mode"] is True
+    assert "fast_mode" not in payloads[2]
 
 
 def test_short_submit_payload_remains_unchanged():
@@ -66,7 +81,7 @@ def test_short_submit_payload_remains_unchanged():
 def test_long_resume_reuses_attempt_and_current_plan_receipt():
     payload = _run_contract(
         "contract.buildResumePayload({duration_s:30,segment_count:2,plan_receipt:'f'.repeat(64),"
-        "generation:{status:'resume_required',client_request_id:'request-old'},"
+        "generation:{status:'resume_required',client_request_id:'request-old',fast_mode:true},"
         "dialogue:{mode:'none',lines:[]},fit_mode:'none',aspect_ratio:'16:9',resolution:'480p'})"
     )
     assert payload == {
@@ -77,6 +92,7 @@ def test_long_resume_reuses_attempt_and_current_plan_receipt():
         "aspect_ratio": "16:9",
         "resolution": "480p",
         "expected_plan_receipt": "f" * 64,
+        "fast_mode": True,
     }
 
 
@@ -116,7 +132,7 @@ def test_stitch_retry_reuses_frozen_request_and_parameters():
         "contract.buildStitchRetryPayload({duration_s:30,segment_count:2,"
         "plan_receipt:'a'.repeat(64),fit_mode:'pad',dialogue:{mode:'none',lines:[]},"
         "aspect_ratio:'9:16',resolution:'768p',"
-        "generation:{status:'failed',stage:'stitch',client_request_id:'request-old'}})"
+        "generation:{status:'failed',stage:'stitch',client_request_id:'request-old',fast_mode:true}})"
     )
     assert payload == {
         "confirm": True,
@@ -126,6 +142,7 @@ def test_stitch_retry_reuses_frozen_request_and_parameters():
         "aspect_ratio": "9:16",
         "resolution": "768p",
         "expected_plan_receipt": "a" * 64,
+        "fast_mode": True,
     }
 
 
@@ -135,7 +152,7 @@ def test_failed_segment_retry_uses_new_request_with_frozen_parameters():
         "plan_receipt:'b'.repeat(64),fit_required:true,fit_mode:'crop',"
         "aspect_ratio:'9:16',resolution:'768p',"
         "dialogue:{mode:'auto',lines:[]},generation:{status:'failed',stage:'h3',"
-        "client_request_id:'request-old',segments:[{index:1,status:'succeeded'},"
+        "client_request_id:'request-old',fast_mode:true,segments:[{index:1,status:'succeeded'},"
         "{index:2,status:'failed'}]}},'request-new')"
     )
     assert payload == {
@@ -146,7 +163,84 @@ def test_failed_segment_retry_uses_new_request_with_frozen_parameters():
         "aspect_ratio": "9:16",
         "resolution": "768p",
         "expected_plan_receipt": "b" * 64,
+        "fast_mode": True,
     }
+
+
+def test_historical_long_generation_freezes_fast_mode_off_for_retry_and_resume():
+    payloads = _run_contract(
+        "[contract.buildLongRetryPayload({duration_s:30,segment_count:2,"
+        "plan_receipt:'a'.repeat(64),fit_required:false,fit_mode:'none',"
+        "aspect_ratio:'16:9',resolution:'480p',dialogue:{mode:'auto',lines:[]},"
+        "generation:{status:'failed',stage:'h3'}},'request-new'),"
+        "contract.buildResumePayload({duration_s:30,segment_count:2,"
+        "plan_receipt:'b'.repeat(64),fit_mode:'none',aspect_ratio:'16:9',resolution:'480p',"
+        "dialogue:{mode:'none',lines:[]},generation:{status:'resume_required',"
+        "client_request_id:'request-old'}})]"
+    )
+    assert [payload["fast_mode"] for payload in payloads] == [False, False]
+
+
+def test_fast_mode_draft_is_per_conversation_and_server_frozen():
+    result = _run_contract(
+        "(()=>{const base={aspect_ratio:'16:9',resolution:'480p',fit_mode:'none',"
+        "fit_profiles:{'16:9':{fit_required:false,default_fit_mode:'none'}},"
+        "dialogue:{mode:'auto',lines:[]},receipt_version:1};"
+        "const first=contract.generationDraft({...base,id:'cid-a',duration_s:30,generation:null});"
+        "first.fastMode=true;"
+        "const polled=contract.generationDraft({...base,id:'cid-a',duration_s:30,generation:null});"
+        "const other=contract.generationDraft({...base,id:'cid-b',duration_s:30,generation:null});"
+        "const frozenOn=contract.generationDraft({...base,id:'cid-c',duration_s:30,"
+        "generation:{status:'failed',fast_mode:true}});"
+        "frozenOn.fastMode=false;"
+        "const resynced=contract.generationDraft({...base,id:'cid-c',duration_s:30,"
+        "generation:{status:'failed',fast_mode:true}});"
+        "const historical=contract.generationDraft({...base,id:'cid-d',duration_s:30,"
+        "generation:{status:'succeeded'}});"
+        "return {polled:polled.fastMode,other:other.fastMode,frozen:resynced.fastMode,"
+        "historical:historical.fastMode}})()"
+    )
+    assert result == {
+        "polled": True,
+        "other": False,
+        "frozen": True,
+        "historical": False,
+    }
+
+
+def test_fast_mode_control_is_long_only_accessible_and_updates_draft():
+    result = _run_contract(
+        "(()=>{class E{constructor(tag){this.tagName=tag.toUpperCase();this.children=[];"
+        "this.attrs={};this.listeners={};this.checked=false;this.type='';this.textContent=''}"
+        "appendChild(x){this.children.push(x);return x}setAttribute(k,v){this.attrs[k]=String(v)}"
+        "addEventListener(k,f){this.listeners[k]=f}dispatchEvent(e){this.listeners[e.type](e)}"
+        "querySelector(s){const match=x=>s==='input'?x.tagName==='INPUT':"
+        "s==='label'?x.tagName==='LABEL':s==='span'?x.tagName==='SPAN':false;"
+        "for(const c of this.children){if(match(c))return c;const n=c.querySelector(s);if(n)return n}return null}}"
+        "global.document={createElement:tag=>new E(tag)};"
+        "const draft={fastMode:false};"
+        "const long=contract.fastModeField({id:'cid-a',duration_s:30},draft);"
+        "const input=long.querySelector('input');const label=long.querySelector('label');"
+        "const text=long.querySelector('span').textContent;input.checked=true;"
+        "input.dispatchEvent({type:'change'});"
+        "return {short:contract.fastModeField({id:'cid-b',duration_s:10},{fastMode:false}),"
+        "tag:input.tagName,type:input.type,text,labelTag:label.tagName,"
+        "describedBy:input.attrs['aria-describedby'],draft:draft.fastMode}})()"
+    )
+    assert result == {
+        "short": None,
+        "tag": "INPUT",
+        "type": "checkbox",
+        "text": "快速模式",
+        "labelTag": "LABEL",
+        "describedBy": "fast-mode-help-cid-a",
+        "draft": True,
+    }
+
+    source = APP_JS.read_text(encoding="utf-8")
+    assert "开启后会快速提交所有分段、缩短等待" in source
+    assert "连续运动可能不如关闭时自然" in source
+    assert "不代表供应商 GPU 同时生成" in source
 
 
 def test_long_submit_rejects_edit_custom_and_missing_receipt():
