@@ -1227,7 +1227,7 @@ function renderFinalSection(detail) {
     const noticeText = retryContract.action === "retry_stitch"
       ? "全部分段成片已复用，本次只在本地重试拼接。"
       : retryContract.action === "retry"
-        ? "跨段连续性为 best effort；成功段复用，失败时只重做失败段及同链下游。"
+        ? "跨段连续性为 best effort；服务端按冻结模式复用成功段，本次只提交上方所示新增付费分段。"
         : "跨段连续性为 best effort；各段 H3 提示词将提交生成。";
     notice.appendChild(el("p", null, noticeText));
     card.appendChild(notice);
@@ -1264,7 +1264,7 @@ function renderFinalSection(detail) {
     locked.appendChild(el("strong", null, stitchOnly ? "重试本地拼接" : "重试失败的 H3 分段"));
     locked.appendChild(el("p", null, stitchOnly
       ? "复用原请求标识和全部成功分段，不创建新的付费 H3 子任务。"
-      : "使用新的请求标识和逐段冻结输入；成功段复用，只重做失败段及同链下游。"));
+      : "使用新的请求标识和逐段冻结输入；本次只提交服务端计算出的新增付费分段。"));
     card.appendChild(locked);
     const errorBox = el("p", "form-error generation-form-error");
     errorBox.hidden = true;
