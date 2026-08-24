@@ -228,6 +228,10 @@ def _write_legacy_pre_h3_attempt(
         settings.data_dir / cid / ".h3" / "attempts" / attempt_id / "attempt.json"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    (path.parents[2] / "session.json").write_text(
+        json.dumps({"schema_version": h3.SCHEMA_VERSION, "cid": cid}),
+        encoding="utf-8",
+    )
     path.write_text(json.dumps(state), encoding="utf-8")
     return path
 
@@ -1101,6 +1105,10 @@ def test_legacy_context_ir_attempt_is_exposed_as_direct_retry(enabled, monkeypat
         "retryable",
         "corrupt-input",
         "corrupt-ir",
+        "marker-missing",
+        "marker-corrupt",
+        "marker-mismatched",
+        "marker-extra",
     ],
 )
 def test_legacy_context_marker_cannot_hide_ambiguous_or_paid_h3_attempt(
@@ -1136,6 +1144,25 @@ def test_legacy_context_marker_cannot_hide_ambiguous_or_paid_h3_attempt(
         elif evidence == "corrupt-ir":
             state["ir"]["receipt"]["input_receipt"] = "0" * 64
         path.write_text(json.dumps(state), encoding="utf-8")
+        marker = path.parents[2] / "session.json"
+        if evidence == "marker-missing":
+            marker.unlink()
+        elif evidence == "marker-corrupt":
+            marker.write_text("{", encoding="utf-8")
+        elif evidence == "marker-mismatched":
+            marker.write_text(
+                json.dumps({"schema_version": h3.SCHEMA_VERSION, "cid": "wrong"}),
+                encoding="utf-8",
+            )
+        elif evidence == "marker-extra":
+            marker.write_text(
+                json.dumps({
+                    "schema_version": h3.SCHEMA_VERSION,
+                    "cid": cid,
+                    "extra": True,
+                }),
+                encoding="utf-8",
+            )
     storage.update_meta(
         settings.data_dir,
         cid,

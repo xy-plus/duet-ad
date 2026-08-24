@@ -534,9 +534,15 @@ def legacy_h3_is_provably_unsubmitted(
         or not client_request_id
     ):
         return False
-    attempts = Path(workdir) / ".h3" / "attempts"
+    root = Path(workdir) / ".h3"
+    attempts = root / "attempts"
     expected_id = f"{attempt:06d}"
     try:
+        if _read_json(root / "session.json") != {
+            "schema_version": SCHEMA_VERSION,
+            "cid": cid,
+        }:
+            return False
         entries = list(attempts.iterdir())
         if len(entries) != 1:
             return False
