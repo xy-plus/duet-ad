@@ -23,6 +23,7 @@ const state = {
   objectURLs: [],      // 当前 stream 渲染产生的 blob URL，重渲染前统一 revoke
   ppDetail: null,      // 后处理弹窗对应的会话详情
   ppAskDismissed: {},  // cid → true：后处理入口消息已点「否」（会话内记忆，重渲染不复活）
+  ppResultExpanded: {}, // cid → 后处理结果是否由用户展开；轮询重渲染时保留，切会话重置
   generationDrafts: {}, // cid → 最终视频表单草稿；轮询重渲染时保留用户输入
   generationSubmitting: {}, // cid → true：本页已有 /submit 请求在途，阻止重复提交
   detailSig: null,     // 当前已渲染详情的状态签名：轮询比对，签名不变不碰 DOM（根治轮询闪烁）
@@ -341,6 +342,16 @@ function trackURL(url) {
 function revokeURLs() {
   for (const u of state.objectURLs) URL.revokeObjectURL(u);
   state.objectURLs = [];
+}
+
+function releaseTrackedURL(
+  url,
+  urls = state.objectURLs,
+  revoke = (value) => URL.revokeObjectURL(value),
+) {
+  const index = urls.indexOf(url);
+  if (index >= 0) urls.splice(index, 1);
+  revoke(url);
 }
 
 /* ===== API ===== */
@@ -1139,6 +1150,10 @@ function kfGrid(detail, names, pathPrefix, altPrefix, options = {}) {
     grid.appendChild(fig);
     apiBlobURL("/api/conversations/" + detail.id + "/files/" + pathPrefix + "/" + encodeURIComponent(name))
       .then((url) => {
+        if (fig.isConnected === false) {
+          releaseTrackedURL(url);
+          return;
+        }
         img.src = url;
         img.addEventListener("load", () => {
           fig.classList.remove("shimmer");
@@ -1157,21 +1172,40 @@ function kfGrid(detail, names, pathPrefix, altPrefix, options = {}) {
 
 let disclosureSeq = 0;
 
-function segmentDisclosure(content, labels) {
-  const wrap = el("div", "segment-prompt-disclosure");
-  const button = el("button", "segment-prompt-toggle");
+function createDisclosure(labels, buildContent, options = {}) {
+  const wrap = el("div", options.wrapClass || "disclosure");
+  const button = el("button", options.buttonClass || "disclosure-toggle");
   button.type = "button";
-  const panel = el("div", "segment-prompt-panel");
-  panel.id = "segment-disclosure-" + (++disclosureSeq);
+  const panel = el("div", options.panelClass || "disclosure-panel");
+  panel.id = (options.idPrefix || "disclosure") + "-" + (++disclosureSeq);
   button.setAttribute("aria-controls", panel.id);
-  setDisclosureState(button, panel, false, labels);
+  let rendered = false;
+  const ensureContent = () => {
+    if (rendered) return;
+    panel.appendChild(buildContent());
+    rendered = true;
+  };
+  const initialExpanded = options.expanded === true;
+  if (initialExpanded) ensureContent();
+  setDisclosureState(button, panel, initialExpanded, labels);
   button.addEventListener("click", () => {
-    setDisclosureState(button, panel, panel.hidden, labels);
+    const expanded = panel.hidden;
+    if (expanded) ensureContent();
+    setDisclosureState(button, panel, expanded, labels);
+    if (options.onChange) options.onChange(expanded);
   });
-  panel.appendChild(content);
   wrap.appendChild(button);
   wrap.appendChild(panel);
   return wrap;
+}
+
+function segmentDisclosure(content, labels) {
+  return createDisclosure(labels, () => content, {
+    idPrefix: "segment-disclosure",
+    wrapClass: "segment-prompt-disclosure",
+    buttonClass: "segment-prompt-toggle",
+    panelClass: "segment-prompt-panel",
+  });
 }
 
 function segmentPromptDisclosure(text, segmentIndex) {
@@ -1606,6 +1640,27 @@ function ppFramesSection(detail, frames) {
   return wrap;
 }
 
+function ppResultDisclosure(detail, frames) {
+  const labels = {
+    expand: "展开优化后素材",
+    collapse: "收起优化后素材",
+    expandText: "展开优化后素材",
+    collapseText: "收起优化后素材",
+  };
+  return createDisclosure(labels, () => {
+    const card = el("div", "activity-card");
+    card.appendChild(ppFramesSection(detail, frames));
+    return card;
+  }, {
+    idPrefix: "pp-result",
+    wrapClass: "pp-result-disclosure",
+    buttonClass: "btn btn-primary pp-result-toggle",
+    panelClass: "pp-result-panel",
+    expanded: state.ppResultExpanded[detail.id] === true,
+    onChange: (expanded) => { state.ppResultExpanded[detail.id] = expanded; },
+  });
+}
+
 /* 后处理目标帧总数：多段 = 各段 keyframes 之和；单段 = detail.keyframes 长度 */
 function ppTotalFrames(detail) {
   const segments = Array.isArray(detail.segments) ? detail.segments : [];
@@ -1645,14 +1700,14 @@ function renderPpAssistant(detail, pp) {
     row.appendChild(card);
   } else if (pp.status === "done") {
     const frames = Array.isArray(pp.frames) ? pp.frames : [];
-    const card = el("div", "activity-card");
     if (frames.length) {
-      card.appendChild(ppFramesSection(detail, frames));
+      row.appendChild(ppResultDisclosure(detail, frames));
     } else {
+      const card = el("div", "activity-card");
       card.appendChild(el("p", "ac-title", "后处理完成"));
       card.appendChild(el("p", "ac-sub", "所有目标帧均已处理"));
+      row.appendChild(card);
     }
-    row.appendChild(card);
   }
   return row;
 }
@@ -1838,6 +1893,7 @@ async function loadDetail(id, silent) {
 
 function selectConversation(id) {
   if (state.uploading) return; // 上传中不切换，避免打断
+  delete state.ppResultExpanded[id];
   state.currentId = id;
   const conv = state.conversations.find((c) => c.id === id);
   $("main-title").textContent = (conv && conv.title) || "会话";
@@ -2194,6 +2250,7 @@ if (typeof module !== "undefined" && module.exports) {
     canOperate,
     clearStream,
     closeLightbox,
+    createDisclosure,
     detailSignature,
     formatDialogueLines,
     generationDraft,
@@ -2204,6 +2261,7 @@ if (typeof module !== "undefined" && module.exports) {
     normalizeDialogueLines,
     parseDialogueLines,
     openLightbox,
+    releaseTrackedURL,
     recoverLockedPostprocess,
     recoverPromptChanged,
     runSingleFlightPollCycle,

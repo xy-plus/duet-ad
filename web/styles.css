@@ -792,6 +792,13 @@ input, textarea { font-family: inherit; }
   border-top: 1px solid var(--divider);
 }
 
+.pp-result-toggle {
+  width: 100%;
+  min-height: 44px;
+}
+
+.pp-result-panel { margin-top: 10px; }
+
 .pp-lock-hint {
   margin: 12px 0 0;
   padding: 8px 12px;
