@@ -18,6 +18,7 @@ const state = {
   clientRequestId: null, // 幂等键：内容变更/成功才轮换，失败重试复用
   uploading: false,
   pollTimer: null,
+  pollToken: 0,
   detailSeq: 0,        // 防止过期响应覆盖新渲染
   objectURLs: [],      // 当前 stream 渲染产生的 blob URL，重渲染前统一 revoke
   ppDetail: null,      // 后处理弹窗对应的会话详情
@@ -74,6 +75,50 @@ function apiErrorFromPayload(data, fallback) {
     );
   }
   return new ApiError(detail ? String(detail) : fallback);
+}
+
+function showActionError(error, errorElement, controls = []) {
+  errorElement.textContent = error && error.code === "client_refresh_required"
+    ? "页面版本已更新，请刷新页面后重试。"
+    : String(error && error.message ? error.message : error || "操作失败，请稍后重试");
+  errorElement.hidden = false;
+  for (const control of controls) control.disabled = false;
+}
+
+async function recoverPromptChanged(error, detail, fetchLatest, refs) {
+  if (!error || error.code !== "prompt_changed") return false;
+  const latest = await fetchLatest();
+  if (!latest || typeof latest.source_prompt !== "string"
+      || typeof latest.source_prompt_sha256 !== "string"
+      || !/^[0-9a-f]{64}$/.test(latest.source_prompt_sha256)) {
+    throw new Error("最新提示词详情校验失败，请刷新页面后重试");
+  }
+  Object.assign(detail, latest);
+  refs.output.textContent = latest.source_prompt;
+  refs.textarea.value = latest.source_prompt;
+  refs.error.textContent = "提示词已在其他页面更新，已加载最新版本，请重新编辑";
+  refs.error.hidden = false;
+  return true;
+}
+
+async function recoverLockedPostprocess(error, fetchLatest, inputs, lockHint, errorElement) {
+  if (!error || error.code !== "postprocess_options_locked") return null;
+  const latest = await fetchLatest();
+  const options = latest && latest.postprocess && latest.postprocess.options;
+  if (!options || typeof options !== "object") {
+    throw new Error("服务端锁定选项校验失败，请刷新页面后重试");
+  }
+  for (const input of inputs) input.checked = options[input.value] === true;
+  lockHint.hidden = false;
+  errorElement.textContent = "选项已在其他页面锁定，已加载服务端选项，请直接确认";
+  errorElement.hidden = false;
+  return latest;
+}
+
+async function runSingleFlightPollCycle(isCurrent, load, schedule) {
+  if (!isCurrent()) return;
+  await load();
+  if (isCurrent()) schedule();
 }
 
 // 幂等键；非安全上下文（如 LAN http 直连）无 crypto.randomUUID，退化为时间戳+随机串（满足后端 ^[0-9A-Za-z-]{8,64}$）
@@ -817,8 +862,7 @@ async function postGeneration(
     if (state.generationSubmitting[detail.id]) startPolling(detail.id);
   } catch (error) {
     if (handleAuthError(error)) return;
-    errorBox.textContent = error.message;
-    errorBox.hidden = false;
+    showActionError(error, errorBox);
     // POST 断线时结果可能未知：先 GET 当前状态再开放重试，但绝不自动再次 POST。
     state.generationSubmitting[detail.id] = false;
     await loadDetail(detail.id, true);
@@ -1229,8 +1273,21 @@ function renderSourcePromptCard(detail, text) {
       await loadDetail(detail.id, true);
     } catch (saveError) {
       if (handleAuthError(saveError)) return;
-      error.textContent = "保存失败：" + saveError.message;
-      error.hidden = false;
+      try {
+        const recovered = await recoverPromptChanged(
+          saveError,
+          detail,
+          () => apiJSON("/api/conversations/" + encodeURIComponent(detail.id)),
+          { output, textarea, error },
+        );
+        if (recovered) {
+          if (state.currentId === detail.id) state.detail = detail;
+        } else {
+          showActionError(saveError, error, [save, cancel]);
+        }
+      } catch (recoveryError) {
+        showActionError(recoveryError, error, [save, cancel]);
+      }
     } finally {
       save.disabled = false;
       cancel.disabled = false;
@@ -1472,18 +1529,24 @@ async function submitPostprocess(event) {
     loadDetail(detail.id, true);
   } catch (err) {
     if (handleAuthError(err)) return;
-    if (err.message.includes("options changed since last run")) {
-      // 后端锁定上次选项：回填并提示直接确认，避免反复踩 409
-      const last = detail.postprocess && detail.postprocess.options;
-      document.querySelectorAll('#pp-form input[name="opt"]').forEach((c) => {
-        c.checked = last ? last[c.value] === true : true;
-      });
-      $("pp-lock-hint").hidden = false;
-      errEl.textContent = "选项与上次不一致，已按上次选项预填，请直接确认";
-    } else {
-      errEl.textContent = err.message;
+    try {
+      const inputs = Array.from(document.querySelectorAll('#pp-form input[name="opt"]'));
+      const latest = await recoverLockedPostprocess(
+        err,
+        () => apiJSON("/api/conversations/" + encodeURIComponent(detail.id)),
+        inputs,
+        $("pp-lock-hint"),
+        errEl,
+      );
+      if (latest) {
+        state.ppDetail = latest;
+        if (state.currentId === detail.id) state.detail = latest;
+      } else {
+        showActionError(err, errEl, [btn]);
+      }
+    } catch (recoveryError) {
+      showActionError(recoveryError, errEl, [btn]);
     }
-    errEl.hidden = false;
     updatePpConfirm();
   }
 }
@@ -1766,8 +1829,10 @@ async function loadDetail(id, silent) {
   } catch (err) {
     if (handleAuthError(err)) return;
     if (seq !== state.detailSeq) return;
-    stopPolling();
+    state.detailSig = null;
     renderStreamError("会话加载失败：" + err.message);
+    if (silent && state.currentId === id) startPolling(id);
+    else stopPolling();
   }
 }
 
@@ -1782,20 +1847,28 @@ function selectConversation(id) {
 
 function startPolling(id) {
   stopPolling();
-  state.pollTimer = setInterval(() => {
-    if (state.currentId !== id) {
-      stopPolling();
-      return;
-    }
-    loadDetail(id, true);
-  }, POLL_MS);
+  const token = state.pollToken;
+  const isCurrent = () => state.pollToken === token && state.currentId === id;
+  const schedule = () => {
+    if (!isCurrent()) return;
+    state.pollTimer = setTimeout(async () => {
+      state.pollTimer = null;
+      await runSingleFlightPollCycle(
+        isCurrent,
+        () => loadDetail(id, true),
+        schedule,
+      );
+    }, POLL_MS);
+  };
+  schedule();
 }
 
 function stopPolling() {
   if (state.pollTimer) {
-    clearInterval(state.pollTimer);
+    clearTimeout(state.pollTimer);
     state.pollTimer = null;
   }
+  state.pollToken += 1;
 }
 
 /* ===== Composer ===== */
@@ -2131,7 +2204,11 @@ if (typeof module !== "undefined" && module.exports) {
     normalizeDialogueLines,
     parseDialogueLines,
     openLightbox,
+    recoverLockedPostprocess,
+    recoverPromptChanged,
+    runSingleFlightPollCycle,
     setDisclosureState,
+    showActionError,
   };
 }
 
