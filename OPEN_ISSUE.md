@@ -8,6 +8,7 @@
 
 ## 🚧 进行中
 
+- Ant Design X 无后端原型：在独立 `web-next/` 中复刻当前会话、素材、分析、生成与后处理主流程，所有状态由本地 mock 驱动；当前阶段为隔离实现与浏览器验收。（→ `feat/antd-x-prototype`, `.worktree/antd-x-prototype`）
 
 ## 📌 待办与限制
 

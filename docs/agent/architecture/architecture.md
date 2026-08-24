@@ -5,7 +5,7 @@ status: done
 owner: agent
 updated: 2026-08-24
 tdd: N/A
-links: [conversation-task]
+links: [conversation-task, antd-x-prototype]
 ---
 
 # 架构现状（How/Now）
@@ -47,8 +47,11 @@ flowchart LR
 | `app/postprocess.py` / `app/seedream.py` | 可选去字幕/品牌关键帧编辑；不参与 H3 输入 | postprocess |
 | `app/codex_runner.py` | 本地 codex 内层 workspace 沙箱、voice 专用外层文件系统隔离、并发和超时；不把服务凭据交给 agent | conversation-task |
 | `web/` | 同源 UI、2 秒轮询、显式台词/画幅/清晰度/适配确认、冻结参数回显和人工重试 | conversation-task |
+| `web-next/` | React + Ant Design X 无后端原型；以内存 mock 演示会话、分析、后处理和生成，不进入生产路由 | antd-x-prototype |
 
 Seedance 生产提交模块已删除，`face_hold` 选项和机械提示词注入也已删除。旧实现不是部署回退面。
+
+`web-next/` 只是设计评审面：Vite 开发服务器直接载入本地 mock，不读取 `data/`，不挂载到 FastAPI，不是当前生产前端或其回退路径。
 
 ## 输入准备数据流
 

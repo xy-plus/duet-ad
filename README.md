@@ -18,6 +18,16 @@ ACCESS_TOKEN='<local-only-token>' HOST=127.0.0.1 PORT=3211 ./run.sh
 .venv/bin/python -m pytest tests -q
 ```
 
+### Ant Design X 交互原型
+
+`web-next/` 是不连接后端的本地原型，用于评审 React + Ant Design X 重建后的会话式布局与主要操作。它不替换生产 `web/`，不发起 API 或 provider 请求。
+
+```bash
+cd web-next
+npm install
+npm run dev -- --host 127.0.0.1
+```
+
 ## 生产契约摘要
 
 - 新会话是 `schema_version=2`；`duration_s` 固定为 ffprobe `v:0` 视觉时长（缺失时依次用 `duration_ts*time_base`、视频包 PTS 范围，绝不使用 OpenCV `frame_count/fps` 元数据），音频或容器尾巴不参与 10/300 秒门禁。`≤10s` 保持原 Ref2VA 单请求；`>10s` 冻结为 provider 整秒时长不超过 10 秒的 FL2VA 首尾帧子任务。
@@ -49,6 +59,7 @@ systemd 示例、预检、上线步骤和付费 smoke 保护见 [部署 runbook]
 
 - `app/`：API、输入准备、长视频计划/编排/拼接、可恢复 H3 状态机、文件存储和可选 Seedream 后处理。
 - `web/`：同源单页 UI；详情和 generation 均以 2 秒轮询刷新。
+- `web-next/`：Ant Design + Ant Design X 无后端交互原型；所有任务状态只存在浏览器内存。
 - `skills/video-maker/`：输入准备阶段的关键帧选择/视觉 prompt skill。
 - `data/<cid>/`：会话文件、短链 receipt 或长链 plan receipt、每段 `.h3/` attempt 状态和最终视频。
 - [功能与验收](docs/human/features/conversation-task/README.md)
