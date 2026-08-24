@@ -13,7 +13,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import h3, long_generation, long_video, prepared_input, storage
-from app.main import _SubmitError, _resume_long_generation, create_app
+from app.main import (
+    _SubmitError,
+    _long_fit_required,
+    _resume_long_generation,
+    _validate_long_submit_payload,
+    create_app,
+)
 from conftest import AUTH, make_settings
 
 
@@ -41,8 +47,8 @@ def _mock_provider_bound_segment_outputs(monkeypatch):
     )
 
 
-def _png(path: Path, value: int) -> None:
-    image = np.full((160, 90, 3), value, dtype=np.uint8)
+def _png(path: Path, value: int, *, width: int = 90, height: int = 160) -> None:
+    image = np.full((height, width, 3), value, dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", image)
     assert ok
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,7 +56,8 @@ def _png(path: Path, value: int) -> None:
 
 
 def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
-               segment_duration=15.0, duration=None):
+               segment_duration=15.0, duration=None, fit_required=False,
+               landscape_first_indices=(), landscape_end_indices=()):
     planned = None
     if duration is None:
         duration = segment_duration * len(joins)
@@ -86,8 +93,14 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
         first = work / "anchors" / "first.png"
         last = work / "anchors" / "last.png"
         _png(key, 20 + index)
-        _png(first, 40 + index)
-        _png(last, 60 + index)
+        if index in landscape_first_indices:
+            _png(first, 40 + index, width=160, height=90)
+        else:
+            _png(first, 40 + index)
+        if index in landscape_end_indices:
+            _png(last, 60 + index, width=160, height=90)
+        else:
+            _png(last, 60 + index)
         visual_text = f"第{index}段局部动作"
         visual = work / "visual_prompt.txt"
         visual.write_text(visual_text, encoding="utf-8")
@@ -129,7 +142,7 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
     receipt = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
     storage.update_meta(
         settings.data_dir, cid, status="done", duration_s=duration,
-        voice_mode="keep", fit_required=False, segments=public_segments,
+        voice_mode="keep", fit_required=fit_required, segments=public_segments,
         long_video_plan_receipt=receipt_path.name,
     )
     return cid, receipt
@@ -240,6 +253,209 @@ def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkey
         "status": "succeeded", "attempt": 1, "error": None,
     }]
     assert "provider-task-secret" not in str(generation)
+
+
+def test_legacy_long_detail_and_submit_derive_fit_from_frozen_h3_anchors(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(
+        settings, fit_required=None, landscape_first_indices=(1,)
+    )
+    calls = []
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    def start(request):
+        calls.append(request)
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "task")
+
+    monkeypatch.setattr(h3, "start", start)
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+    rejected = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, fit="none"),
+    )
+    accepted = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, request_id="legacy-fit-request-2", fit="crop"),
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is True
+    assert rejected.status_code == 422
+    assert rejected.json() == {"detail": "fit_mode_required"}
+    assert accepted.status_code == 202
+    assert len(calls) == 1
+    assert storage.load_meta(settings.data_dir, cid)["fit_required"] is None
+
+
+def test_legacy_long_detail_derives_false_from_all_portrait_h3_anchors(enabled):
+    settings, client = enabled
+    cid, _receipt = _make_long(settings, fit_required=None)
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is False
+    assert storage.load_meta(settings.data_dir, cid)["fit_required"] is None
+
+
+def test_legacy_long_invalid_anchor_path_fails_closed_before_paid_submit(
+    enabled, monkeypatch, tmp_path,
+):
+    settings, client = enabled
+    cid, _receipt = _make_long(settings, fit_required=None)
+    root = settings.data_dir / cid
+    outside = tmp_path / "outside.png"
+    _png(outside, 99, width=160, height=90)
+    plan_path = root / long_video.PLAN_RECEIPT_FILENAME
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    payload["segments"][0]["anchors"][0]["path"] = "../outside.png"
+    payload["segments"][0]["anchors"][0]["sha256"] = hashlib.sha256(
+        outside.read_bytes()
+    ).hexdigest()
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
+    receipt = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    calls = []
+    monkeypatch.setattr(h3, "start", lambda request: calls.append(request))
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+    submitted = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, fit="none"),
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is None
+    assert submitted.status_code == 409
+    assert submitted.json() == {"detail": "fit_requirement_unknown"}
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("status", "fit_mode", "stored_required", "expected"),
+    [
+        ("running", "none", True, False),
+        ("failed", "crop", False, True),
+        ("resume_required", "pad", None, True),
+    ],
+)
+def test_frozen_long_fit_uses_frozen_mode_without_reinterpreting_anchors(
+    enabled, status, fit_mode, stored_required, expected,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(
+        settings, fit_required=stored_required, landscape_first_indices=(1,)
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode=fit_mode,
+        frozen_plan_receipt=receipt,
+        generation={
+            "status": status,
+            "client_request_id": "frozen-request-1",
+            "attempt": 1,
+            "segments": [],
+        },
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+
+    effective = _long_fit_required(settings.data_dir / cid, meta)
+    parsed = _validate_long_submit_payload(
+        {**meta, "fit_required": effective},
+        _payload(receipt, request_id="frozen-request-1", fit=fit_mode),
+    )
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+
+    assert effective is expected
+    assert parsed[1] == fit_mode
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is expected
+    assert storage.load_meta(settings.data_dir, cid)["fit_required"] is stored_required
+
+
+def test_legacy_long_ignores_continue_source_first_when_deriving_fit(enabled):
+    settings, client = enabled
+    cid, _receipt = _make_long(
+        settings,
+        joins=("hard_cut", "continue"),
+        fit_required=None,
+        landscape_first_indices=(2,),
+    )
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is False
+
+
+def test_legacy_long_uses_continue_end_when_deriving_fit(enabled):
+    settings, client = enabled
+    cid, _receipt = _make_long(
+        settings,
+        joins=("hard_cut", "continue"),
+        fit_required=None,
+        landscape_end_indices=(2,),
+    )
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is True
+
+
+def test_frozen_receipt_without_generation_still_derives_from_h3_anchors(enabled):
+    settings, client = enabled
+    cid, receipt = _make_long(
+        settings, fit_required=None, landscape_first_indices=(1,)
+    )
+    storage.update_meta(
+        settings.data_dir, cid, frozen_plan_receipt=receipt, fit_mode="none"
+    )
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is True
+
+
+def test_active_frozen_null_fit_change_reaches_locked_parameter_cas(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(
+        settings, fit_required=None, landscape_first_indices=(1,)
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "frozen-request-1", 1
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        dialogue_mode="auto",
+        frozen_plan_receipt=receipt,
+        generation={**generation, "status": "running"},
+    )
+    calls = []
+    monkeypatch.setattr(h3, "start", lambda request: calls.append(request))
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt, request_id="frozen-request-1", fit="crop"),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "resume_parameters_changed"}
+    assert calls == []
 
 
 @pytest.mark.parametrize("mode", ["auto", "none"])

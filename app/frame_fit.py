@@ -14,6 +14,22 @@ class FrameFitError(RuntimeError):
     """关键帧无法按已确认的画幅策略派生。"""
 
 
+def frames_require_fit(paths: Sequence[Path]) -> bool:
+    """Return whether any actual H3 input frame is not exactly 9:16."""
+    inputs = [Path(path) for path in paths]
+    if not inputs:
+        raise FrameFitError("frame set must not be empty")
+    required = False
+    for source in inputs:
+        image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+        if image is None or image.ndim != 3 or image.shape[2] != 3:
+            raise FrameFitError(f"cannot decode keyframe: {source.name}")
+        height, width = image.shape[:2]
+        if width * 16 != height * 9:
+            required = True
+    return required
+
+
 def _target_size(width: int, height: int, mode: str) -> tuple[int, int]:
     if mode == "crop":
         scale = min(width // 9, height // 16)
