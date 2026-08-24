@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 from app import h3, pipeline, prepared_input, storage
-from app.main import _result_fields, _resume_generation, create_app
+from app.main import _freeze_submission, _result_fields, _resume_generation, create_app
 
 
 PROMPT = "镜头从整洁的房间缓慢推进。"
@@ -345,6 +345,51 @@ def test_pipeline_claim_wins_atomically_before_submit(enabled, monkeypatch):
         path.relative_to(cdir).as_posix(): path.read_bytes()
         for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
     } == frozen_files
+
+
+def test_startup_reconciles_half_frozen_short_submit_without_provider(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=False, enable_h3_submit=False,
+        autodl_art_token="unused-test-token",
+    )
+    cid, _ = _make_conv(settings)
+    _write_initial_receipt(settings, cid)
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    claimed = storage.claim_submission_input(
+        settings.data_dir, cid, "request-old-123"
+    )
+    assert claimed
+    _freeze_submission(
+        settings, cid, claimed, "request-old-123", "none", "none", ()
+    )
+    cdir = settings.data_dir / cid
+    before = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
+    }
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    provider_calls = []
+    monkeypatch.setattr(h3, "start", lambda *_args, **_kwargs: provider_calls.append(1))
+
+    with TestClient(create_app(settings)):
+        pass
+
+    recovered = storage.load_meta(settings.data_dir, cid)
+    after = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
+    }
+    assert recovered["status"] == "done"
+    assert recovered["error"] == "submission_recovery_required"
+    assert recovered["generation"] is None
+    assert recovered["_input_owner"] is None
+    assert provider_calls == []
+    assert after == before
+    assert storage.claim_submission_input(
+        settings.data_dir, cid, "request-new-123"
+    )
 
 
 @pytest.mark.parametrize(

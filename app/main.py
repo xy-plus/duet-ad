@@ -785,6 +785,57 @@ def _resume_long_generation(settings: Settings, cid: str) -> None:
     long_generation.run(settings, cid, plan, startup=True)
 
 
+def _reconcile_stale_submission(settings: Settings, cid: str, owner: object) -> None:
+    """Release a half-frozen first submit without creating paid generation evidence."""
+    meta = storage.load_submission_claim(settings.data_dir, cid, owner)
+    if meta is None:
+        return
+    cdir = (settings.data_dir / cid).resolve()
+    changes = {
+        "status": "done",
+        "error": "submission_recovery_required",
+        "input_recovery": "submission_recovery_required",
+    }
+    receipt = cdir / prepared_input.RECEIPT_FILENAME
+    if receipt.is_file():
+        try:
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            dialogue = payload["dialogue"]["lines"]
+            frozen = prepared_input.load_prepared_input(
+                cdir, receipt, expected_dialogue=dialogue
+            )
+            changes.update(
+                prompt=frozen.prompt_text,
+                prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
+                dialogue_mode=frozen.dialogue_mode,
+                prepared_dialogue=[dict(line) for line in frozen.dialogue],
+                fit_mode=frozen.fit_mode,
+            )
+        except (
+            OSError,
+            KeyError,
+            TypeError,
+            json.JSONDecodeError,
+            prepared_input.PreparedInputError,
+        ):
+            pass
+    else:
+        expected = long_generation.plan_receipt(cdir, meta)
+        if expected is not None:
+            try:
+                long_generation.freeze_plan(
+                    cdir,
+                    meta,
+                    expected,
+                    "none",
+                    meta.get("dialogue_mode", "auto"),
+                )
+                changes["frozen_plan_receipt"] = expected
+            except long_generation.LongGenerationError:
+                pass
+    storage.finish_input_claim(settings.data_dir, cid, owner, **changes)
+
+
 class _RateLimiter:
     def __init__(self) -> None:
         self._hits: dict[str, deque] = defaultdict(deque)
@@ -816,7 +867,6 @@ def create_app(settings: Settings) -> FastAPI:
     # Seedream 后处理并行提交的进程级信号量：单进程内跨会话全局并发上限（SEEDREAM_CONCURRENCY）
     seedream_sem = asyncio.Semaphore(settings.seedream_concurrency)
     app.state.h3_resume_threads = []
-    app.state.pipeline_recovery_threads = []
 
     @app.on_event("startup")
     async def resume_h3_generations() -> None:
@@ -854,6 +904,13 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.on_event("startup")
     async def recover_pipeline_inputs() -> None:
+        for cid, owner in storage.claim_stale_input_reconciliations(
+            settings.data_dir
+        ):
+            if owner["kind"] == "pipeline":
+                pipeline.reconcile_stale_pipeline(settings, cid, owner)
+            else:
+                _reconcile_stale_submission(settings, cid, owner)
         if not settings.enable_pipeline:
             return
         for cid, owner in storage.claim_stale_pipeline_inputs(settings.data_dir):
@@ -863,7 +920,6 @@ def create_app(settings: Settings) -> FastAPI:
                 daemon=True,
                 name=f"pipeline-recover-{cid[:8]}",
             )
-            app.state.pipeline_recovery_threads.append(thread)
             thread.start()
 
     @app.get("/api/health")
