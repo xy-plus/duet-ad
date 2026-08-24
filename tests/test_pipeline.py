@@ -168,14 +168,33 @@ def test_run_converges_container_duration_to_visual_manifest_timeline(
         }),
         encoding="utf-8",
     )
-    monkeypatch.setattr(
-        pipeline, "_process_segment",
-        lambda _settings, _work, _source, seg, _runner, lines, _lang,
-               new_input_contract: {
-            **seg, "keyframes": [], "prompt": "p", "dialogue": lines or [],
-        },
-    )
+    def fake_process_segment(
+        _settings, work, _source, seg, _runner, lines, _lang,
+        new_input_contract,
+    ):
+        anchors = work / "segments" / str(seg["index"]) / "work" / "anchors"
+        anchors.mkdir(parents=True, exist_ok=True)
+        (anchors / "first.png").write_bytes(_PX_PNG)
+        (anchors / "last.png").write_bytes(_PX_PNG)
+        return {**seg, "keyframes": [], "prompt": "p", "dialogue": lines or []}
+
+    monkeypatch.setattr(pipeline, "_process_segment", fake_process_segment)
     monkeypatch.setattr(long_video, "write_plan_receipt", fake_write)
+    def fake_freeze(root, meta, receipt, fit_mode, dialogue_mode):
+        seg = meta["segments"][0]
+        segdir = Path(root) / "work" / "segments" / "1"
+        first = segdir / "work" / "anchors" / "first.png"
+        last = segdir / "work" / "anchors" / "last.png"
+        return long_generation.FrozenPlan(
+            Path(root), Path(root) / "source.mp4", receipt,
+            (long_generation.FrozenSegment(
+                seg["index"], seg["start_s"], seg["end_s"], seg["chain_id"],
+                seg["join_mode"], segdir, first, first.read_bytes(), last,
+                last.read_bytes(), "p",
+            ),),
+        )
+
+    monkeypatch.setattr(long_generation, "freeze_plan", fake_freeze)
 
     pipeline.run(settings, meta["id"], object())
 
@@ -1617,8 +1636,8 @@ def test_run_dialogue_auto_routes_explicit_empty_12_4s_scene_result_to_long_plan
         elif step.startswith("segment ") and step.endswith(" extract"):
             work = Path(argv[argv.index("--out-dir") + 1])
             work.mkdir(parents=True, exist_ok=True)
-            (work / "001_frame_000.000s.png").write_bytes(b"source-first")
-            (work / "002_frame_012.400s.png").write_bytes(b"source-last")
+            (work / "001_frame_000.000s.png").write_bytes(_PX_PNG)
+            (work / "002_frame_012.400s.png").write_bytes(_PX_PNG)
             (work / "manifest.json").write_text(
                 json.dumps(
                     {
@@ -1671,6 +1690,7 @@ def test_run_dialogue_auto_routes_explicit_empty_12_4s_scene_result_to_long_plan
     cdir = settings.data_dir / meta["id"]
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done", stored.get("error")
+    assert stored["fit_required"] is True
     assert stored["voice_lines"] == [line]
     receipt = json.loads((cdir / "long_video_plan.json").read_text(encoding="utf-8"))
     assert receipt["video"]["duration_s"] == 12.4
@@ -2370,6 +2390,7 @@ def test_startup_reconciles_half_committed_long_plan_without_rewrite(
     }
     assert recovered["status"] == "done", recovered.get("error")
     assert recovered["long_video_plan_receipt"] == receipt.name
+    assert recovered["fit_required"] is True
     assert after == before
 
 

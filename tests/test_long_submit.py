@@ -13,7 +13,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import h3, long_generation, long_video, prepared_input, storage
-from app.main import _SubmitError, _resume_long_generation, create_app
+from app.main import (
+    _SubmitError,
+    _long_fit_required,
+    _resume_long_generation,
+    _validate_long_submit_payload,
+    create_app,
+)
 from conftest import AUTH, make_settings
 
 
@@ -41,8 +47,8 @@ def _mock_provider_bound_segment_outputs(monkeypatch):
     )
 
 
-def _png(path: Path, value: int) -> None:
-    image = np.full((160, 90, 3), value, dtype=np.uint8)
+def _png(path: Path, value: int, *, width: int = 90, height: int = 160) -> None:
+    image = np.full((height, width, 3), value, dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", image)
     assert ok
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,7 +56,8 @@ def _png(path: Path, value: int) -> None:
 
 
 def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
-               segment_duration=15.0, duration=None):
+               segment_duration=15.0, duration=None, fit_required=False,
+               landscape_first_indices=(), landscape_end_indices=()):
     planned = None
     if duration is None:
         duration = segment_duration * len(joins)
@@ -86,8 +93,14 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
         first = work / "anchors" / "first.png"
         last = work / "anchors" / "last.png"
         _png(key, 20 + index)
-        _png(first, 40 + index)
-        _png(last, 60 + index)
+        if index in landscape_first_indices:
+            _png(first, 40 + index, width=160, height=90)
+        else:
+            _png(first, 40 + index)
+        if index in landscape_end_indices:
+            _png(last, 60 + index, width=160, height=90)
+        else:
+            _png(last, 60 + index)
         visual_text = f"第{index}段局部动作"
         visual = work / "visual_prompt.txt"
         visual.write_text(visual_text, encoding="utf-8")
@@ -129,7 +142,7 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
     receipt = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
     storage.update_meta(
         settings.data_dir, cid, status="done", duration_s=duration,
-        voice_mode="keep", fit_required=False, segments=public_segments,
+        voice_mode="keep", fit_required=fit_required, segments=public_segments,
         long_video_plan_receipt=receipt_path.name,
     )
     return cid, receipt
@@ -240,6 +253,209 @@ def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkey
         "status": "succeeded", "attempt": 1, "error": None,
     }]
     assert "provider-task-secret" not in str(generation)
+
+
+def test_legacy_long_detail_and_submit_derive_fit_from_frozen_h3_anchors(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(
+        settings, fit_required=None, landscape_first_indices=(1,)
+    )
+    calls = []
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    def start(request):
+        calls.append(request)
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "task")
+
+    monkeypatch.setattr(h3, "start", start)
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+    rejected = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, fit="none"),
+    )
+    accepted = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, request_id="legacy-fit-request-2", fit="crop"),
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is True
+    assert rejected.status_code == 422
+    assert rejected.json() == {"detail": "fit_mode_required"}
+    assert accepted.status_code == 202
+    assert len(calls) == 1
+    assert storage.load_meta(settings.data_dir, cid)["fit_required"] is None
+
+
+def test_legacy_long_detail_derives_false_from_all_portrait_h3_anchors(enabled):
+    settings, client = enabled
+    cid, _receipt = _make_long(settings, fit_required=None)
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is False
+    assert storage.load_meta(settings.data_dir, cid)["fit_required"] is None
+
+
+def test_legacy_long_invalid_anchor_path_fails_closed_before_paid_submit(
+    enabled, monkeypatch, tmp_path,
+):
+    settings, client = enabled
+    cid, _receipt = _make_long(settings, fit_required=None)
+    root = settings.data_dir / cid
+    outside = tmp_path / "outside.png"
+    _png(outside, 99, width=160, height=90)
+    plan_path = root / long_video.PLAN_RECEIPT_FILENAME
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    payload["segments"][0]["anchors"][0]["path"] = "../outside.png"
+    payload["segments"][0]["anchors"][0]["sha256"] = hashlib.sha256(
+        outside.read_bytes()
+    ).hexdigest()
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
+    receipt = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    calls = []
+    monkeypatch.setattr(h3, "start", lambda request: calls.append(request))
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+    submitted = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, fit="none"),
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is None
+    assert submitted.status_code == 409
+    assert submitted.json() == {"detail": "fit_requirement_unknown"}
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("status", "fit_mode", "stored_required", "expected"),
+    [
+        ("running", "none", True, False),
+        ("failed", "crop", False, True),
+        ("resume_required", "pad", None, True),
+    ],
+)
+def test_frozen_long_fit_uses_frozen_mode_without_reinterpreting_anchors(
+    enabled, status, fit_mode, stored_required, expected,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(
+        settings, fit_required=stored_required, landscape_first_indices=(1,)
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode=fit_mode,
+        frozen_plan_receipt=receipt,
+        generation={
+            "status": status,
+            "client_request_id": "frozen-request-1",
+            "attempt": 1,
+            "segments": [],
+        },
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+
+    effective = _long_fit_required(settings.data_dir / cid, meta)
+    parsed = _validate_long_submit_payload(
+        {**meta, "fit_required": effective},
+        _payload(receipt, request_id="frozen-request-1", fit=fit_mode),
+    )
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+
+    assert effective is expected
+    assert parsed[1] == fit_mode
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is expected
+    assert storage.load_meta(settings.data_dir, cid)["fit_required"] is stored_required
+
+
+def test_legacy_long_ignores_continue_source_first_when_deriving_fit(enabled):
+    settings, client = enabled
+    cid, _receipt = _make_long(
+        settings,
+        joins=("hard_cut", "continue"),
+        fit_required=None,
+        landscape_first_indices=(2,),
+    )
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is False
+
+
+def test_legacy_long_uses_continue_end_when_deriving_fit(enabled):
+    settings, client = enabled
+    cid, _receipt = _make_long(
+        settings,
+        joins=("hard_cut", "continue"),
+        fit_required=None,
+        landscape_end_indices=(2,),
+    )
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is True
+
+
+def test_frozen_receipt_without_generation_still_derives_from_h3_anchors(enabled):
+    settings, client = enabled
+    cid, receipt = _make_long(
+        settings, fit_required=None, landscape_first_indices=(1,)
+    )
+    storage.update_meta(
+        settings.data_dir, cid, frozen_plan_receipt=receipt, fit_mode="none"
+    )
+
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+
+    assert detail.status_code == 200
+    assert detail.json()["fit_required"] is True
+
+
+def test_active_frozen_null_fit_change_reaches_locked_parameter_cas(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(
+        settings, fit_required=None, landscape_first_indices=(1,)
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "frozen-request-1", 1
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        dialogue_mode="auto",
+        frozen_plan_receipt=receipt,
+        generation={**generation, "status": "running"},
+    )
+    calls = []
+    monkeypatch.setattr(h3, "start", lambda request: calls.append(request))
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt, request_id="frozen-request-1", fit="crop"),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "resume_parameters_changed"}
+    assert calls == []
 
 
 @pytest.mark.parametrize("mode", ["auto", "none"])
@@ -385,9 +601,19 @@ def test_30_second_continue_uses_generated_tail_and_two_posts(enabled, monkeypat
     settings, client = enabled
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
     seen = []
-    tail_bytes = (settings.data_dir / cid / "work" / "tail-fixture.png")
+    tail_bytes = settings.data_dir / cid / "work" / "tail-fixture.png"
+    stale_tail = settings.data_dir / cid / "work" / "stale-tail.png"
     _png(tail_bytes, 222)
+    _png(stale_tail, 111)
+    generated_tail = (
+        settings.data_dir / cid / "work" / "segments" / "1"
+        / "work" / "generated_last.png"
+    )
+    generated_tail.parent.mkdir(parents=True, exist_ok=True)
+    generated_tail.write_bytes(stale_tail.read_bytes())
+    extract_calls = []
     def extract_tail(_video, output):
+        extract_calls.append(output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(tail_bytes.read_bytes())
         return output
@@ -401,8 +627,126 @@ def test_30_second_continue_uses_generated_tail_and_two_posts(enabled, monkeypat
     assert client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload(receipt)
     ).status_code == 202
+    assert extract_calls == [generated_tail]
     assert [request.workdir.name for request in seen] == ["1", "2"]
     assert seen[1].first_frame[1] == tail_bytes.read_bytes()
+    assert seen[1].first_frame[1] != stale_tail.read_bytes()
+
+
+def test_new_parent_retry_reextracts_continue_tail_instead_of_reusing_stale_file(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
+    root = settings.data_dir / cid
+    fresh = []
+    extract_calls = []
+
+    def extract_tail(_video, output):
+        extract_calls.append(output)
+        fixture = root / "work" / f"fresh-tail-{len(extract_calls)}.png"
+        _png(fixture, 170 + len(extract_calls))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(fixture.read_bytes())
+        fresh.append(fixture.read_bytes())
+        return output
+
+    starts = []
+    segment_two_attempts = 0
+
+    def start(request):
+        nonlocal segment_two_attempts
+        starts.append(request)
+        index = int(request.workdir.name)
+        if index == 2:
+            segment_two_attempts += 1
+            if segment_two_attempts == 1:
+                return h3.H3Result("failed", "task", error_code="h3_provider_failed")
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "task")
+
+    monkeypatch.setattr(long_generation, "_extract_last_frame", extract_tail)
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+    monkeypatch.setattr(h3, "start", start)
+
+    first = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt),
+    )
+    stale = root / "work" / "stale-retry-tail.png"
+    _png(stale, 33)
+    generated_tail = root / "work" / "segments" / "1" / "work" / "generated_last.png"
+    generated_tail.write_bytes(stale.read_bytes())
+    second = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, request_id="retry-parent-request-2"),
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert len(extract_calls) == 2
+    second_segment_requests = [request for request in starts if request.workdir.name == "2"]
+    assert len(second_segment_requests) == 2
+    assert second_segment_requests[-1].first_frame[1] == fresh[-1]
+    assert second_segment_requests[-1].first_frame[1] != stale.read_bytes()
+
+
+def test_resume_with_missing_frozen_continue_tail_fails_closed_without_post_or_extract(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    plan.segments[0].workdir.joinpath("generated.mp4").write_bytes(b"segment")
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "resume-parent-request", 1
+    )
+    generation["status"] = "resume_required"
+    generation["segments"][0].update(
+        status="succeeded", attempt=1, child_request_id="child-one"
+    )
+    generation["segments"][1].update(
+        status="resume_required", attempt=1, child_request_id="child-two"
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    extracts = []
+    starts = []
+    resumes = []
+    monkeypatch.setattr(
+        long_generation, "_extract_last_frame",
+        lambda *_args: extracts.append(1),
+    )
+    monkeypatch.setattr(h3, "start", lambda request: starts.append(request))
+    monkeypatch.setattr(h3, "resume", lambda request: resumes.append(request))
+
+    long_generation.run(settings, cid, plan)
+
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert extracts == []
+    assert starts == []
+    assert resumes == []
+    assert stored["status"] == "submission_unknown"
+    assert stored["client_request_id"] == "resume-parent-request"
+    assert stored["segments"][1]["status"] == "submission_unknown"
+    assert stored["segments"][1]["error"] == "submission_unknown"
+    assert stored["segments"][1]["child_request_id"] == "child-two"
+    assert stored["segments"][1]["attempt"] == 1
+
+    retry = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt, request_id="retry-after-missing-tail"),
+    )
+
+    assert retry.status_code == 409
+    assert retry.json() == {"detail": "submission_outcome_unknown"}
+    assert starts == []
 
 
 def test_plan_freeze_failure_makes_zero_posts(enabled, monkeypatch):
@@ -420,6 +764,94 @@ def test_plan_freeze_failure_makes_zero_posts(enabled, monkeypatch):
     assert response.json() == {"detail": "long_video_plan_invalid"}
     assert calls == []
     assert meta["generation"] is None
+
+
+def test_anchor_swap_before_bound_read_fails_sha_and_makes_zero_posts(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    anchor = (
+        settings.data_dir / cid / "work" / "segments" / "1"
+        / "work" / "anchors" / "first.png"
+    )
+    original = anchor.read_bytes()
+    replacement_path = anchor.with_name("replacement.png")
+    _png(replacement_path, 211)
+    replacement = replacement_path.read_bytes()
+    anchor.write_bytes(replacement)
+    real_read_bytes = Path.read_bytes
+    restored = False
+
+    def swap_then_restore(path):
+        nonlocal restored
+        data = real_read_bytes(path)
+        if path == anchor and not restored:
+            anchor.write_bytes(original)
+            restored = True
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", swap_then_restore)
+    calls = []
+    monkeypatch.setattr(h3, "start", lambda request: calls.append(request))
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "long_video_plan_invalid"}
+    assert restored is True
+    assert calls == []
+
+
+def test_anchor_swap_after_bound_read_cannot_change_paid_request_bytes(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    anchor = (
+        settings.data_dir / cid / "work" / "segments" / "1"
+        / "work" / "anchors" / "first.png"
+    )
+    original = anchor.read_bytes()
+    replacement_path = anchor.with_name("replacement.png")
+    _png(replacement_path, 233)
+    replacement = replacement_path.read_bytes()
+    real_read_bytes = Path.read_bytes
+    swapped = False
+
+    def snapshot_then_swap(path):
+        nonlocal swapped
+        data = real_read_bytes(path)
+        if path == anchor and not swapped:
+            anchor.write_bytes(replacement)
+            swapped = True
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", snapshot_then_swap)
+    seen = []
+
+    def start(request):
+        anchor.write_bytes(original)
+        seen.append(request)
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "task")
+
+    monkeypatch.setattr(h3, "start", start)
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt),
+    )
+
+    assert response.status_code == 202
+    assert swapped is True
+    assert len(seen) == 1
+    assert seen[0].first_frame[1] == original
+    assert seen[0].last_frame[1] != replacement
 
 
 def test_unknown_locks_batch_and_stops_continue_segment(enabled, monkeypatch):
@@ -1228,7 +1660,9 @@ def test_stitched_output_reuse_validates_receipt_bytes_and_target_duration(
             join_mode="hard_cut",
             workdir=segment_root,
             first_frame=anchor,
+            first_frame_data=b"unused",
             last_frame=anchor,
+            last_frame_data=b"unused",
             prompt="prompt",
         ),),
     )

@@ -84,7 +84,7 @@ flowchart LR
 - 冻结的 H3 源提示词是唯一生成输入；项目不调用 MiniMax Context IR，也不接受运行时优化开关。
 - `duration_s` 以 `v:0` 实际浮点时长写 receipt；上传、pipeline 重探测和提交门禁限制为 300 秒。短链 H3 时长为 `ceil(duration_s)` 且不超过 10；长链每段为 `ceil(end_s-start_s)` 且不超过 15。最终 `keep` 拼接以视频 presentation start 归零音频时间戳，保留源音频相对画面的起音位置，再把长音频裁到画面终点、短音频补静音到画面终点，不改变画面帧预算。
 - pipeline 首次进入 `processing` 与首次 submit 冻结输入共用同一个 per-CID 原子所有权 claim；检查 generation/receipt、取得所有权和写 meta 在同一把锁内完成。输家不得运行输入准备、改写 receipt 或触发 provider，完成/回滚也只能由当前 owner 提交。
-- `fit_required` 只在 pipeline `done` 时按实际选中的每张关键帧计算，不持久化源视频宽高作为第二真相。只有全部关键帧都是 9:16 才允许 `none`，任一非 9:16 就必须人工选 `crop` 或 `pad`；即使源视频是 9:16，裁过的关键帧也不能绕过。两种策略都不缩放帧，只做居中裁切或居中黑边扩画布。
+- `fit_required` 与 pipeline `done` 原子落盘：短链按实际选中的关键帧；长链按 plan 绑定且真正静态送入 H3 boundary 的每个 `hard_cut` first anchor 与全部 end anchors 判断，`continue` 的 source first 会被运行时上游生成尾帧替换，不能作为判定对象。不以源视频宽高或展示关键帧建立第二真相。只有全部实际输入帧都是 9:16 才允许 `none`，任一非 9:16 就必须人工选 `crop` 或 `pad`。
 - H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/{crop|pad}/`；永不读取 `postprocessed/`。
 
 ## 冻结输入
@@ -99,6 +99,8 @@ flowchart LR
 写 receipt 后立即经过同一 loader 复核；提交和重启恢复也重新加载。未知 schema/version、路径越界、文件缺失/漂移、台词漂移、最终 prompt 不是确定性组合时全部 fail closed。提交锁内会按用户最终台词和画幅选择重写 receipt，随后 H3Request 只使用当次加载的不可变 bytes。
 
 长链不用短链 receipt 冒充多段输入。`long_video_plan.json`（`duet.long-video-plan` v1）绑定完整源文件、总时长、FL2VA workflow，以及每段的范围、chain/join、源片、关键帧、首尾锚点、视觉/最终提示词和台词摘要。detail 暴露该文件内容的 SHA-256 为 `plan_receipt`；提交必须原样回传 `expected_plan_receipt`。服务在任何供应商 POST 前重新校验 plan、meta 和所有文件哈希，并将确认值冻结到 `frozen_plan_receipt`。
+
+历史长会话若 `fit_required=null` 且尚未冻结提交，detail 与 submit 从通过路径和哈希校验的 plan anchors 纯派生，不由 GET 改写 meta；不完整或越界 plan 返回未知并在付费前拒绝。plan、prompt 与 anchors 都以单次读取的 SHA-bound bytes 快照完成解析、比例判断、画幅派生和 H3 请求构造，路径随后变化不能替换已验证的付费输入。若会话已有 generation/frozen receipt，则以已冻结 `fit_mode` 投影有效值，保持 active、failed 和 resume 请求的原 CAS，不重写输入。
 
 同一镜头切出的 `continue` 段使用上一成功生成段的精确尾帧作为本段首帧，当前源片段末帧作为目标尾帧；`hard_cut` 段用自身源首尾锚点开始新链。每段都有统一连续性约束和本段局部提示词，但这只是最佳努力约束，不是供应商原生 extend，也不承诺逐帧无缝。
 

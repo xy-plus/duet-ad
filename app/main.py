@@ -301,6 +301,47 @@ def _is_long_video(meta: dict) -> bool:
     )
 
 
+def _long_fit_required(cdir: Path, meta: dict) -> bool:
+    """Resolve legacy-null long-video fit state from its immutable H3 anchors."""
+    generation = meta.get("generation")
+    if isinstance(generation, dict):
+        fit_mode = meta.get("fit_mode")
+        if fit_mode in _FIT_MODES:
+            return fit_mode != "none"
+        raise _SubmitError(409, "fit_requirement_unknown")
+    persisted = meta.get("fit_required")
+    if isinstance(persisted, bool):
+        return persisted
+    expected = long_generation.plan_receipt(cdir, meta)
+    if expected is None:
+        raise _SubmitError(409, "fit_requirement_unknown")
+    try:
+        plan = long_generation.freeze_plan(
+            cdir,
+            meta,
+            expected,
+            "none",
+            meta.get("dialogue_mode", "auto"),
+            prepare_fit=False,
+        )
+        return frame_fit.frame_bytes_require_fit(
+            [
+                anchor
+                for segment in plan.segments
+                for anchor in (
+                    (
+                        (segment.first_frame_data,)
+                        if segment.join_mode == "hard_cut"
+                        else ()
+                    )
+                    + (segment.last_frame_data,)
+                )
+            ]
+        )
+    except (frame_fit.FrameFitError, long_generation.LongGenerationError):
+        raise _SubmitError(409, "fit_requirement_unknown") from None
+
+
 def _is_legacy_generation_contract(generation: dict) -> bool:
     return (
         "context_ir_enabled" in generation
@@ -544,8 +585,9 @@ def _validate_long_submit_payload(meta: dict, payload: dict) -> tuple[str, str, 
         legacy_fit_valid = (
             fit_mode in _FIT_MODES
             and (
-                (meta.get("fit_required") is True and fit_mode in {"crop", "pad"})
-                or (meta.get("fit_required") is not True and fit_mode == "none")
+                isinstance(meta.get("generation"), dict)
+                or (meta.get("fit_required") is True and fit_mode in {"crop", "pad"})
+                or (meta.get("fit_required") is False and fit_mode == "none")
             )
         )
         if (
@@ -575,11 +617,15 @@ def _validate_long_submit_payload(meta: dict, payload: dict) -> tuple[str, str, 
     fit_mode = payload.get("fit_mode")
     if fit_mode not in _FIT_MODES:
         raise _SubmitError(422, "invalid_fit_mode")
-    if meta.get("fit_required") is True:
-        if fit_mode not in {"crop", "pad"}:
-            raise _SubmitError(422, "fit_mode_required")
-    elif fit_mode != "none":
-        raise _SubmitError(422, "fit_mode_not_allowed")
+    if not isinstance(meta.get("generation"), dict):
+        if meta.get("fit_required") is True:
+            if fit_mode not in {"crop", "pad"}:
+                raise _SubmitError(422, "fit_mode_required")
+        elif meta.get("fit_required") is False:
+            if fit_mode != "none":
+                raise _SubmitError(422, "fit_mode_not_allowed")
+        else:
+            raise _SubmitError(409, "fit_requirement_unknown")
     expected = payload.get("expected_plan_receipt")
     if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise _SubmitError(422, "invalid_plan_receipt")
@@ -1476,6 +1522,12 @@ def create_app(settings: Settings) -> FastAPI:
         cdir = settings.data_dir / cid
         has_video = _has_valid_generated_video(settings, meta)
         source_prompt, source_prompt_sha256 = _source_prompt_snapshot(cdir)
+        effective_fit_required = meta.get("fit_required")
+        if _is_long_video(meta):
+            try:
+                effective_fit_required = _long_fit_required(cdir, meta)
+            except _SubmitError:
+                effective_fit_required = None
         result = {
             "id": meta["id"],
             "title": meta["title"],
@@ -1493,7 +1545,7 @@ def create_app(settings: Settings) -> FastAPI:
             "voice_lines": meta.get("voice_lines", []),
             "read_only": _is_read_only(meta),
             "duration_s": meta.get("duration_s"),
-            "fit_required": meta.get("fit_required"),
+            "fit_required": effective_fit_required,
             "fit_mode": meta.get("fit_mode"),
             "dialogue": _public_dialogue(meta),
             "receipt_version": _receipt_version(cdir, meta),
@@ -1571,8 +1623,14 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=409, detail="read_only")
         if _is_long_video(meta):
             try:
+                effective_meta = {
+                    **meta,
+                    "fit_required": _long_fit_required(
+                        settings.data_dir / cid, meta
+                    ),
+                }
                 request_id, fit_mode, dialogue_mode, expected_receipt = (
-                    _validate_long_submit_payload(meta, payload)
+                    _validate_long_submit_payload(effective_meta, payload)
                 )
             except _SubmitError as exc:
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
