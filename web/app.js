@@ -1058,14 +1058,39 @@ function renderFinalSection(detail) {
   return published;
 }
 
-/* 关键帧网格：blob 化加载 + 点击放大灯箱（单段/多段/优化后共用；pathPrefix 即 files 白名单路径） */
-function kfGrid(detail, names, pathPrefix, altPrefix) {
+function setDisclosureState(trigger, panel, expanded, labels) {
+  trigger.setAttribute("aria-expanded", String(expanded));
+  trigger.setAttribute("aria-label", expanded ? labels.collapse : labels.expand);
+  if (panel) panel.hidden = !expanded;
+  if (labels.expandText && labels.collapseText) {
+    trigger.textContent = expanded ? labels.collapseText : labels.expandText;
+  }
+}
+
+function keyframeDisclosureLabels(alt) {
+  return { expand: "展开查看" + alt, collapse: "关闭" + alt + "大图" };
+}
+
+/* 关键帧网格：长视频分段用小缩略图按钮，其他结果保持现有网格。 */
+function kfGrid(detail, names, pathPrefix, altPrefix, options = {}) {
   const grid = el("div", "kf-grid");
+  if (options.compact) grid.classList.add("kf-grid-compact");
   for (const name of names) {
     const fig = el("figure", "kf-card shimmer");
     const img = el("img");
     img.alt = altPrefix + name;
-    fig.appendChild(img);
+    let button = null;
+    if (options.expandable) {
+      button = el("button", "kf-expand-button");
+      button.type = "button";
+      button.disabled = true;
+      setDisclosureState(button, null, false, keyframeDisclosureLabels(img.alt));
+      button.appendChild(img);
+      button.addEventListener("click", () => openLightbox(img.src, img.alt, button));
+      fig.appendChild(button);
+    } else {
+      fig.appendChild(img);
+    }
     grid.appendChild(fig);
     apiBlobURL("/api/conversations/" + detail.id + "/files/" + pathPrefix + "/" + encodeURIComponent(name))
       .then((url) => {
@@ -1074,7 +1099,8 @@ function kfGrid(detail, names, pathPrefix, altPrefix) {
           fig.classList.remove("shimmer");
           fig.classList.add("is-loaded");
         }, { once: true });
-        img.addEventListener("click", () => openLightbox(img.src, img.alt));
+        if (button) button.disabled = false;
+        else img.addEventListener("click", () => openLightbox(img.src, img.alt));
       })
       .catch(() => {
         fig.classList.remove("shimmer");
@@ -1082,6 +1108,31 @@ function kfGrid(detail, names, pathPrefix, altPrefix) {
       });
   }
   return grid;
+}
+
+let disclosureSeq = 0;
+
+function segmentPromptDisclosure(text, segmentIndex) {
+  const wrap = el("div", "segment-prompt-disclosure");
+  const button = el("button", "segment-prompt-toggle");
+  button.type = "button";
+  const panel = el("div", "segment-prompt-panel");
+  panel.id = "segment-prompt-" + (++disclosureSeq);
+  button.setAttribute("aria-controls", panel.id);
+  const labels = {
+    expand: "展开第 " + segmentIndex + " 段提示词",
+    collapse: "收起第 " + segmentIndex + " 段提示词",
+    expandText: "展开提示词",
+    collapseText: "收起提示词",
+  };
+  setDisclosureState(button, panel, false, labels);
+  button.addEventListener("click", () => {
+    setDisclosureState(button, panel, panel.hidden, labels);
+  });
+  panel.appendChild(promptCard(text));
+  wrap.appendChild(button);
+  wrap.appendChild(panel);
+  return wrap;
 }
 
 function sourcePromptEditable(detail) {
@@ -1226,11 +1277,17 @@ function renderSegments(detail) {
     card.appendChild(sh);
     const names = Array.isArray(seg.keyframes) ? seg.keyframes : [];
     if (names.length) {
-      card.appendChild(kfGrid(detail, names, "segments/" + n + "/work/keyframes", "第 " + n + " 段关键帧 "));
+      card.appendChild(kfGrid(
+        detail,
+        names,
+        "segments/" + n + "/work/keyframes",
+        "第 " + n + " 段关键帧 ",
+        { compact: true, expandable: true },
+      ));
     }
     if (seg.prompt) {
       card.appendChild(el("h4", "res-sub", "逐段冻结的 H3 提示词"));
-      card.appendChild(promptCard(seg.prompt));
+      card.appendChild(segmentPromptDisclosure(seg.prompt, n));
     }
     if (Array.isArray(seg.lines) && seg.lines.length) {
       const lines = el("div", "lines-card");
@@ -1249,27 +1306,54 @@ function renderSegments(detail) {
 
 /* 关键帧放大查看：点击开、点任意处或 Esc 关 */
 let lightboxEl = null;
+let activeLightboxDisclosure = null;
 
-function openLightbox(src, alt) {
+function openLightbox(src, alt, trigger = null) {
   if (!lightboxEl) {
     lightboxEl = el("div", "lightbox");
     lightboxEl.setAttribute("role", "dialog");
     lightboxEl.setAttribute("aria-label", "查看大图");
+    const close = el("button", "lightbox-close", "×");
+    close.type = "button";
+    close.setAttribute("aria-label", "关闭大图");
+    close.addEventListener("click", closeLightbox);
+    lightboxEl.appendChild(close);
     lightboxEl.appendChild(el("img"));
     lightboxEl.addEventListener("click", closeLightbox);
     document.body.appendChild(lightboxEl);
+  }
+  if (activeLightboxDisclosure) {
+    setDisclosureState(
+      activeLightboxDisclosure.trigger,
+      null,
+      false,
+      activeLightboxDisclosure.labels,
+    );
+  }
+  activeLightboxDisclosure = trigger
+    ? { trigger, labels: keyframeDisclosureLabels(alt || "关键帧") }
+    : null;
+  if (activeLightboxDisclosure) {
+    setDisclosureState(trigger, null, true, activeLightboxDisclosure.labels);
   }
   const img = lightboxEl.querySelector("img");
   img.src = src;
   img.alt = alt || "";
   lightboxEl.classList.add("is-open");
   document.addEventListener("keydown", onLightboxKey);
+  lightboxEl.querySelector(".lightbox-close").focus();
 }
 
 function closeLightbox() {
   if (!lightboxEl) return;
   lightboxEl.classList.remove("is-open");
   document.removeEventListener("keydown", onLightboxKey);
+  if (activeLightboxDisclosure) {
+    const disclosure = activeLightboxDisclosure;
+    activeLightboxDisclosure = null;
+    setDisclosureState(disclosure.trigger, null, false, disclosure.labels);
+    disclosure.trigger.focus();
+  }
 }
 
 function onLightboxKey(e) {
@@ -2007,6 +2091,7 @@ if (typeof module !== "undefined" && module.exports) {
     longVideoContract,
     normalizeDialogueLines,
     parseDialogueLines,
+    setDisclosureState,
   };
 }
 

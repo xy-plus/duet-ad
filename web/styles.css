@@ -554,6 +554,36 @@ input, textarea { font-family: inherit; }
 
 .kf-card.is-loaded img { opacity: 1; }
 
+.kf-grid-compact {
+  grid-template-columns: repeat(auto-fill, minmax(84px, 112px));
+  gap: 8px;
+}
+
+.kf-grid-compact .kf-card,
+.kf-grid-compact .kf-card:first-child {
+  grid-column: auto;
+  grid-row: auto;
+  aspect-ratio: 4 / 3;
+  border-radius: 10px;
+}
+
+.kf-expand-button {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border-radius: inherit;
+  cursor: zoom-in;
+}
+
+.kf-expand-button:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+}
+
+.kf-expand-button:disabled { cursor: wait; }
+
 .kf-err {
   position: absolute;
   inset: 0;
@@ -637,6 +667,20 @@ input, textarea { font-family: inherit; }
   overflow-y: auto;
 }
 
+.segment-prompt-toggle {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.segment-prompt-toggle:hover { background: rgba(0, 113, 227, .08); }
+.segment-prompt-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.segment-prompt-panel { margin-top: 8px; }
+
 /* result video */
 .video-wrap {
   position: relative;
@@ -693,6 +737,22 @@ input, textarea { font-family: inherit; }
   box-shadow: var(--shadow-card);
   cursor: zoom-out;
 }
+
+.lightbox-close {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  z-index: 1;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .16);
+  color: #FFFFFF;
+  font-size: 28px;
+  line-height: 1;
+}
+
+.lightbox-close:focus-visible { outline: 3px solid #FFFFFF; outline-offset: 2px; }
 
 /* ===== Postprocess（入口消息/弹窗/对比区） ===== */
 

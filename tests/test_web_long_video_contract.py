@@ -223,3 +223,60 @@ def test_long_segment_prompt_copy_is_explicitly_frozen():
         '      ? "逐段冻结的 H3 提示词将提交生成"\n'
         '      : "H3 源提示词将直接提交生成"'
     ) in source
+
+
+def test_segment_disclosure_state_defaults_collapsed_and_toggles_both_ways():
+    result = _run_contract(
+        "(()=>{const trigger={attrs:{},textContent:'',setAttribute(k,v){this.attrs[k]=v}};"
+        "const panel={hidden:false};const labels={expand:'展开第 1 段提示词',collapse:'收起第 1 段提示词',"
+        "expandText:'展开提示词',collapseText:'收起提示词'};"
+        "contract.setDisclosureState(trigger,panel,false,labels);"
+        "const collapsed={attrs:{...trigger.attrs},text:trigger.textContent,hidden:panel.hidden};"
+        "contract.setDisclosureState(trigger,panel,true,labels);"
+        "const expanded={attrs:{...trigger.attrs},text:trigger.textContent,hidden:panel.hidden};"
+        "contract.setDisclosureState(trigger,panel,false,labels);"
+        "return {collapsed,expanded,collapsedAgain:{attrs:{...trigger.attrs},"
+        "text:trigger.textContent,hidden:panel.hidden}}})()"
+    )
+    assert result == {
+        "collapsed": {
+            "attrs": {"aria-expanded": "false", "aria-label": "展开第 1 段提示词"},
+            "text": "展开提示词",
+            "hidden": True,
+        },
+        "expanded": {
+            "attrs": {"aria-expanded": "true", "aria-label": "收起第 1 段提示词"},
+            "text": "收起提示词",
+            "hidden": False,
+        },
+        "collapsedAgain": {
+            "attrs": {"aria-expanded": "false", "aria-label": "展开第 1 段提示词"},
+            "text": "展开提示词",
+            "hidden": True,
+        },
+    }
+
+
+def test_long_segment_prompt_and_keyframes_use_accessible_disclosures_only():
+    source = APP_JS.read_text(encoding="utf-8")
+    branch = source.split("function renderSegments(detail)", 1)[1]
+    branch = branch.split("/* 关键帧放大查看", 1)[0]
+    assert "segmentPromptDisclosure(seg.prompt, n)" in branch
+    assert '{ compact: true, expandable: true }' in branch
+
+    grid = source.split("function kfGrid", 1)[1]
+    grid = grid.split("function sourcePromptEditable", 1)[0]
+    assert 'el("button", "kf-expand-button")' in grid
+    assert 'button.type = "button"' in grid
+    assert "setDisclosureState(button, null, false" in grid
+    assert "openLightbox(img.src, img.alt, button)" in grid
+    assert 'trigger.setAttribute("aria-expanded", String(expanded))' in source
+
+
+def test_closing_lightbox_returns_segment_thumbnail_to_collapsed_state():
+    source = APP_JS.read_text(encoding="utf-8")
+    close_branch = source.split("function closeLightbox()", 1)[1]
+    close_branch = close_branch.split("function onLightboxKey", 1)[0]
+    assert "activeLightboxDisclosure" in close_branch
+    assert "setDisclosureState" in close_branch
+    assert ".focus()" in close_branch
