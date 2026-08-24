@@ -630,8 +630,6 @@ def bound_reusable_segment_indices(
     if fit_mode not in {"none", "crop", "pad"}:
         return frozenset()
     fast_mode = generation.get("fast_mode", False)
-    if not isinstance(fast_mode, bool):
-        return frozenset()
     by_index = {
         item.get("index"): item for item in segments or [] if isinstance(item, dict)
     }
@@ -837,7 +835,6 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
     states = {item["index"]: dict(item) for item in generation.get("segments", [])}
     if (
         not isinstance(parent_id, str)
-        or not isinstance(fast_mode, bool)
         or fit_mode not in {"none", "crop", "pad"}
         or meta.get("aspect_ratio", h3.H3_DEFAULT_ASPECT_RATIO)
         != plan.aspect_ratio
@@ -852,6 +849,19 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         generation = {**generation, "segments": ordered,
                       "status": status or generation.get("status"), "error": error, "stage": stage}
         storage.update_meta(settings.data_dir, cid, generation=generation)
+
+    def parallel_update(segments, operation) -> None:
+        with ThreadPoolExecutor(
+            max_workers=min(_FAST_MODE_WORKERS, len(segments))
+        ) as pool:
+            futures = {pool.submit(operation, segment): segment for segment in segments}
+            while futures:
+                done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    segment = futures.pop(future)
+                    status, error = future.result()
+                    states[segment.index].update(status=status, error=error)
+                    persist("running", None)
 
     reusable = bound_reusable_segment_indices(settings, cid, plan, generation)
     for index, state in states.items():
@@ -906,17 +916,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 return "submission_unknown", "submission_unknown"
 
         if recoverable and fast_mode:
-            with ThreadPoolExecutor(
-                max_workers=min(_FAST_MODE_WORKERS, len(recoverable))
-            ) as pool:
-                futures = {pool.submit(recover, segment): segment for segment in recoverable}
-                while futures:
-                    done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
-                    for future in done:
-                        segment = futures.pop(future)
-                        status, error = future.result()
-                        states[segment.index].update(status=status, error=error)
-                        persist("running", None)
+            parallel_update(recoverable, recover)
         elif recoverable:
             for segment in recoverable:
                 status, error = recover(segment)
@@ -1045,17 +1045,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             if states[segment.index].get("status") == "queued"
         ]
         if to_submit:
-            with ThreadPoolExecutor(
-                max_workers=min(_FAST_MODE_WORKERS, len(to_submit))
-            ) as pool:
-                futures = {pool.submit(submit_one, segment): segment for segment in to_submit}
-                while futures:
-                    done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
-                    for future in done:
-                        segment = futures.pop(future)
-                        status, error = future.result()
-                        states[segment.index].update(status=status, error=error)
-                        persist("running", None)
+            parallel_update(to_submit, submit_one)
 
         def poll_one(segment: FrozenSegment):
             request = requests[segment.index]
@@ -1086,17 +1076,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             if states[segment.index].get("status") in {"running", "resume_required"}
         ]
         if to_poll:
-            with ThreadPoolExecutor(
-                max_workers=min(_FAST_MODE_WORKERS, len(to_poll))
-            ) as pool:
-                futures = {pool.submit(poll_one, segment): segment for segment in to_poll}
-                while futures:
-                    done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
-                    for future in done:
-                        segment = futures.pop(future)
-                        status, error = future.result()
-                        states[segment.index].update(status=status, error=error)
-                        persist("running", None)
+            parallel_update(to_poll, poll_one)
 
         statuses = {item.get("status") for item in states.values()}
         if statuses == {"succeeded"}:
