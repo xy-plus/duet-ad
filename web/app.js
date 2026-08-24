@@ -213,7 +213,7 @@ function generationParameterDraft(detail) {
 }
 
 function generationParameterSnapshot(detail) {
-  return {
+  const snapshot = {
     aspect_ratio: detail.aspect_ratio,
     resolution: detail.resolution,
     dialogue_mode: detail.dialogue && detail.dialogue.mode,
@@ -221,6 +221,14 @@ function generationParameterSnapshot(detail) {
     duration_s: detail.duration_s,
     segment_count: detail.segment_count,
   };
+  if (longVideoContract(detail).isLong) {
+    snapshot.fast_mode = generationFastMode(detail);
+  }
+  return snapshot;
+}
+
+function generationFastMode(detail) {
+  return !!(detail && detail.generation && detail.generation.fast_mode === true);
 }
 
 function generationParameterSummary(detail) {
@@ -243,6 +251,9 @@ function generationParameterSummary(detail) {
     ["长视频分段数", Number.isInteger(snapshot.segment_count)
       ? String(snapshot.segment_count) : "无（单段）"],
   ];
+  if (longVideoContract(detail).isLong) {
+    entries.push(["快速模式", snapshot.fast_mode ? "已开启" : "已关闭"]);
+  }
   entries.forEach(([label, value]) => {
     list.appendChild(el("dt", null, label));
     list.appendChild(el("dd", null, value || "-"));
@@ -282,7 +293,10 @@ function buildSubmitPayload(input) {
     aspect_ratio: input.aspectRatio,
     resolution: input.resolution,
   };
-  if (input.isLong) body.expected_plan_receipt = input.planReceipt;
+  if (input.isLong) {
+    body.expected_plan_receipt = input.planReceipt;
+    body.fast_mode = input.fastMode === true;
+  }
   if (dialogueMode === "edit" || dialogueMode === "custom") {
     const lines = parseDialogueLines(input.linesText);
     if (lines.length === 0) throw new Error("请至少填写一行台词");
@@ -352,6 +366,7 @@ function buildResumePayload(detail) {
       throw new Error("长视频既有任务台词模式无效");
     }
     body.expected_plan_receipt = longContract.planReceipt;
+    body.fast_mode = generationFastMode(detail);
   }
   if (dialogue.mode === "edit" || dialogue.mode === "custom") {
     if (!Array.isArray(dialogue.lines) || dialogue.lines.length === 0) throw new Error("既有任务台词缺失");
@@ -384,6 +399,7 @@ function buildStitchRetryPayload(detail) {
     aspect_ratio: detail.aspect_ratio,
     resolution: detail.resolution,
     expected_plan_receipt: longContract.planReceipt,
+    fast_mode: generationFastMode(detail),
   };
 }
 
@@ -404,6 +420,7 @@ function buildLongRetryPayload(detail, clientRequestId) {
     aspectRatio: detail.aspect_ratio,
     resolution: detail.resolution,
     isLong: true,
+    fastMode: generationFastMode(detail),
     planReceipt: longContract.planReceipt,
   });
 }
@@ -909,6 +926,7 @@ function generationDraft(detail) {
       dialogueMode: "auto",
       editLinesText: formatDialogueLines(detail.dialogue),
       customLinesText: "",
+      fastMode: false,
       ...parameters,
       parameterVersion,
       receiptVersion: detail.receipt_version,
@@ -937,6 +955,7 @@ function generationDraft(detail) {
       parameterTouched: false,
       editTouched: false,
       frozen: true,
+      fastMode: generationFastMode(detail),
     });
     return draft;
   }
@@ -961,6 +980,32 @@ function choice(name, value, label, checked) {
   item.appendChild(input);
   item.appendChild(el("span", null, label));
   return item;
+}
+
+function fastModeField(detail, draft) {
+  if (!longVideoContract(detail).isLong) return null;
+  const field = el("fieldset", "final-field");
+  field.appendChild(el("legend", null, "提交方式"));
+  const choices = el("div", "final-choices");
+  const label = el("label", "final-choice");
+  const input = el("input");
+  const helpId = "fast-mode-help-" + detail.id;
+  input.type = "checkbox";
+  input.checked = draft.fastMode === true;
+  input.setAttribute("aria-describedby", helpId);
+  input.addEventListener("change", () => {
+    draft.fastMode = input.checked;
+  });
+  label.appendChild(input);
+  label.appendChild(el("span", null, "快速模式"));
+  choices.appendChild(label);
+  field.appendChild(choices);
+  const help = el("p", "final-help",
+    "开启后会快速提交所有分段、缩短等待；连续运动可能不如关闭时自然。"
+    + "供应商仍可能排队，不代表供应商 GPU 同时生成。");
+  help.id = helpId;
+  field.appendChild(help);
+  return field;
 }
 
 function setGenerationCardBusy(card, busy) {
@@ -996,6 +1041,7 @@ async function submitGeneration(detail, card) {
         aspectRatio: draft.aspectRatio,
         resolution: draft.resolution,
         isLong: longContract.isLong,
+        fastMode: draft.fastMode,
         planReceipt: longContract.planReceipt,
       });
     }
@@ -1348,6 +1394,9 @@ function renderFinalSection(detail) {
     fitField.appendChild(el("p", "final-help", "必须选择一种方式后才能生成。"));
     card.appendChild(fitField);
   }
+
+  const fastField = fastModeField(detail, draft);
+  if (fastField) card.appendChild(fastField);
 
   const errorBox = el("p", "form-error generation-form-error");
   errorBox.hidden = true;
@@ -2194,6 +2243,7 @@ async function loadDetail(id, silent) {
 function selectConversation(id) {
   if (state.uploading) return; // 上传中不切换，避免打断
   delete state.ppResultExpanded[id];
+  delete state.generationDrafts[id];
   resetSegmentProductsDisclosure(id);
   state.currentId = id;
   const conv = state.conversations.find((c) => c.id === id);
@@ -2555,6 +2605,7 @@ if (typeof module !== "undefined" && module.exports) {
     createDisclosure,
     detailSignature,
     fitProfile,
+    fastModeField,
     formatDialogueLines,
     generationDraft,
     generationAction,

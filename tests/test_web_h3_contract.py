@@ -302,6 +302,7 @@ def test_success_snapshot_uses_only_server_frozen_generation_values():
         "fit_mode": "crop",
         "duration_s": 20.25,
         "segment_count": 3,
+        "fast_mode": False,
     }
 
 
