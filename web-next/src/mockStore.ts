@@ -14,7 +14,6 @@ export interface Conversation {
   phase: Phase;
   sourceMode: SourceMode;
   sourceValue: string;
-  fileName?: string;
   analysisStatus: AnalysisStatus;
   transcriptMode: TranscriptMode;
   targetLanguage: string;
@@ -159,12 +158,11 @@ function reducer(state: State, action: Action): State {
         ...item,
         sourceMode: action.mode,
         sourceValue: action.mode === 'link' ? item.sourceValue : '',
-        fileName: action.mode === 'upload' ? item.fileName : undefined,
       }));
     case 'sourceValue':
       return updateActive(state, (item) => ({ ...item, sourceValue: action.value }));
     case 'file':
-      return updateActive(state, (item) => ({ ...item, fileName: action.name, sourceValue: action.name }));
+      return updateActive(state, (item) => ({ ...item, sourceValue: action.name }));
     case 'submitAnalysis':
       return updateActive(state, (item) => {
         if (item.analysisStatus !== 'idle' || !item.sourceValue.trim()) return item;

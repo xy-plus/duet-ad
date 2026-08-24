@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   App as AntApp,
   Button,
@@ -29,7 +29,6 @@ import {
   VideoCameraAddOutlined,
 } from '@ant-design/icons';
 import { Attachments, Bubble, Conversations, Sender, ThoughtChain } from '@ant-design/x';
-import type { UploadFile } from 'antd';
 import { appTheme } from './theme';
 import {
   type Conversation,
@@ -394,9 +393,6 @@ function TaskSender({ item, dispatch }: TaskSenderProps) {
   const [localFeedback, setLocalFeedback] = useState('');
   const analysisRunning = item.analysisStatus === 'queued' || item.analysisStatus === 'processing';
   const canAnalyze = Boolean(item.sourceValue.trim()) && item.analysisStatus === 'idle';
-  const attachments: UploadFile[] = item.fileName
-    ? [{ uid: 'local-file', name: item.fileName, status: 'done' }]
-    : [];
 
   const sourceHeader = item.phase === 'draft' ? (
     <div className="sender-source">
@@ -440,11 +436,11 @@ function TaskSender({ item, dispatch }: TaskSenderProps) {
             <VideoCameraAddOutlined aria-hidden="true" />
             选择视频文件
           </label>
-          {attachments.length > 0 && (
+          {item.sourceValue && (
             <div className="selected-attachment">
-              <Text type="secondary">已选择：{item.fileName}</Text>
+              <Text type="secondary">已选择：{item.sourceValue}</Text>
               <Attachments
-                items={attachments}
+                items={[{ uid: 'local-file', name: item.sourceValue, status: 'done' }]}
                 disabled={analysisRunning}
                 customRequest={() => ({ abort: () => undefined })}
                 onRemove={() => {
@@ -604,7 +600,7 @@ function Workspace() {
     }
   }, [active.id, active.postStatus, dispatch]);
 
-  const sidebarProps = useMemo(() => ({
+  const sidebarProps: SidebarProps = {
     conversations: state.conversations,
     activeId: state.activeId,
     onSelect: (id: string) => {
@@ -617,7 +613,7 @@ function Workspace() {
       setDrawerOpen(false);
       setPostOpen(false);
     },
-  }), [state.conversations, state.activeId, dispatch]);
+  };
 
   return (
     <div className="app-shell">
