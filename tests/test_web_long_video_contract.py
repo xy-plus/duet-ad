@@ -284,13 +284,16 @@ def test_long_segment_dialogue_reuses_disclosure_and_omits_empty_toggle():
     assert "if (Array.isArray(seg.lines) && seg.lines.length)" in branch
     assert "segmentDialogueDisclosure(seg.lines, n)" in branch
 
+    generic = source.split("function createDisclosure", 1)[1]
+    generic = generic.split("function segmentDisclosure", 1)[0]
+    assert 'button.type = "button"' in generic
+    assert 'button.setAttribute("aria-controls", panel.id)' in generic
+    assert "setDisclosureState(button, panel, initialExpanded, labels)" in generic
+
     disclosure = source.split("function segmentDisclosure", 1)[1]
     disclosure = disclosure.split("function sourcePromptEditable", 1)[0]
-    assert 'el("button", "segment-prompt-toggle")' in disclosure
-    assert 'button.type = "button"' in disclosure
-    assert 'panel.id = "segment-disclosure-" + (++disclosureSeq)' in disclosure
-    assert 'button.setAttribute("aria-controls", panel.id)' in disclosure
-    assert "setDisclosureState(button, panel, false, labels)" in disclosure
+    assert 'idPrefix: "segment-disclosure"' in disclosure
+    assert "return createDisclosure(labels" in disclosure
     assert 'expandText: "展开段台词"' in disclosure
     assert 'collapseText: "收起段台词"' in disclosure
 
