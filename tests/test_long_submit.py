@@ -1,5 +1,7 @@
 import hashlib
+import json
 import math
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -15,6 +17,9 @@ from app.main import _SubmitError, _resume_long_generation, create_app
 from conftest import AUTH, make_settings
 
 
+_REAL_STITCHED_OUTPUT_IS_REUSABLE = long_generation.stitched_output_is_reusable
+
+
 @pytest.fixture(autouse=True)
 def _mock_provider_bound_segment_outputs(monkeypatch):
     """Coordinator tests mock H3; receipt/media validation is covered in H3 tests."""
@@ -24,6 +29,14 @@ def _mock_provider_bound_segment_outputs(monkeypatch):
         lambda request, *_args, **_kwargs: (
             request.workdir.joinpath("generated.mp4").is_file()
             and request.workdir.joinpath("generated.mp4").stat().st_size > 0
+        ),
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "stitched_output_is_reusable",
+        lambda plan, _dialogue_mode: (
+            plan.root.joinpath("generated.mp4").is_file()
+            and plan.root.joinpath("generated.mp4").stat().st_size > 0
         ),
     )
 
@@ -137,6 +150,18 @@ def _fake_stitch(calls):
         calls.append(kwargs)
         kwargs["output"].write_bytes(b"joined")
     return invoke
+
+
+def _small_video(path: Path, color: str = "black") -> None:
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+            f"color=c={color}:s=32x32:r=5:d=1", "-an", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y", str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
 
 
 def test_startup_reconciles_half_frozen_long_submit_without_provider(
@@ -574,7 +599,7 @@ def test_detail_retry_paid_count_uses_segment_files_and_stitch_is_free(
     (root / "generated.mp4").write_bytes(b"previous-published-video")
     storage.update_meta(settings.data_dir, cid, generation=generation)
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
-    assert detail["has_video"] is True
+    assert detail["has_video"] is False
     assert detail["generation"]["retry_paid_segment_count"] == 2
 
 
@@ -610,7 +635,7 @@ def test_detail_retry_paid_count_uses_complete_frozen_segment_set(
         }
 
     cases = (
-        ([segment(1), segment(3)], 1),
+        ([segment(1), segment(3)], 3),
         ([segment(1), segment(1), segment(3)], 3),
         ([segment(2), segment(1), segment(3)], 3),
         ([segment(1), segment(2), segment(3)], 0),
@@ -1099,3 +1124,221 @@ def test_long_resume_corrupt_plan_converges_to_unknown(enabled, monkeypatch):
     assert response.status_code == 409
     assert response.json() == {"detail": "submission_outcome_unknown"}
     assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "submission_unknown"
+
+
+@pytest.mark.parametrize("entrypoint", ["startup", "submit"])
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "reordered"])
+def test_long_succeeded_recovery_rejects_malformed_segment_state_atomically(
+    enabled, monkeypatch, entrypoint, damage
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings, joins=("hard_cut", "hard_cut"))
+    root = settings.data_dir / cid
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(root, meta, receipt, "none", "auto")
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    generation.update(status="succeeded", stage="stitch")
+    for item in generation["segments"]:
+        item.update(
+            status="succeeded",
+            attempt=1,
+            child_request_id=f"child-{item['index']}",
+        )
+        (root / "work" / "segments" / str(item["index"]) / "generated.mp4").write_bytes(
+            f"segment-{item['index']}".encode()
+        )
+    if damage == "missing":
+        generation["segments"] = generation["segments"][:1]
+    elif damage == "duplicate":
+        generation["segments"][1] = dict(generation["segments"][0])
+    else:
+        generation["segments"].reverse()
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        dialogue_mode="auto",
+        frozen_plan_receipt=receipt,
+        generation=generation,
+    )
+    before = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and path.name != "meta.json"
+    }
+    provider_calls = []
+    monkeypatch.setattr(h3, "start", lambda request: provider_calls.append("POST"))
+    monkeypatch.setattr(h3, "resume", lambda request: provider_calls.append("GET"))
+
+    if entrypoint == "startup":
+        _resume_long_generation(settings, cid)
+    else:
+        response = client.post(
+            f"/api/conversations/{cid}/submit",
+            headers=AUTH,
+            json=_payload(receipt),
+        )
+        assert response.status_code == 409
+        assert response.json() == {"detail": "submission_outcome_unknown"}
+
+    recovered = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert recovered["status"] == "submission_unknown"
+    assert recovered["error"] == "submission_unknown"
+    assert recovered["attempt"] == 1
+    assert provider_calls == []
+    after = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and path.name != "meta.json"
+    }
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing_receipt", "corrupt_receipt", "zero", "tampered", "wrong_duration"]
+)
+def test_stitched_output_reuse_validates_receipt_bytes_and_target_duration(
+    tmp_path, monkeypatch, damage
+):
+    monkeypatch.setattr(
+        long_generation,
+        "stitched_output_is_reusable",
+        _REAL_STITCHED_OUTPUT_IS_REUSABLE,
+    )
+    root = tmp_path / "conversation"
+    segment_root = root / "work" / "segments" / "1"
+    segment_root.mkdir(parents=True)
+    source = root / "source.mp4"
+    segment_video = segment_root / "generated.mp4"
+    _small_video(source)
+    _small_video(segment_video, "blue")
+    anchor = segment_root / "anchor.png"
+    anchor.write_bytes(b"unused")
+    plan = long_generation.FrozenPlan(
+        root=root,
+        source=source,
+        receipt="frozen-plan",
+        segments=(long_generation.FrozenSegment(
+            index=1,
+            start_s=0.0,
+            end_s=11.0,
+            chain_id="chain-001",
+            join_mode="hard_cut",
+            workdir=segment_root,
+            first_frame=anchor,
+            last_frame=anchor,
+            prompt="prompt",
+        ),),
+    )
+    long_generation._stitch(None, "unused", plan, "none")
+    assert _REAL_STITCHED_OUTPUT_IS_REUSABLE(plan, "none") is True
+    output = root / "generated.mp4"
+    receipt_path = root / long_generation.stitch.RECEIPT_FILENAME
+    if damage == "missing_receipt":
+        receipt_path.unlink()
+    elif damage == "corrupt_receipt":
+        receipt_path.write_bytes(b"\xff")
+    elif damage == "zero":
+        output.write_bytes(b"")
+    elif damage == "tampered":
+        data = output.read_bytes()
+        output.write_bytes(data[:-32] + b"x" * 32)
+    else:
+        _small_video(output, "red")
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["output"].update(
+            sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
+            size=output.stat().st_size,
+            duration_s=1.0,
+        )
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    assert _REAL_STITCHED_OUTPUT_IS_REUSABLE(plan, "none") is False
+
+
+@pytest.mark.parametrize("entrypoint", ["startup", "submit"])
+@pytest.mark.parametrize("damage", ["missing", "zero", "tampered", "receipt"])
+def test_long_invalid_top_output_is_hidden_and_restitched_without_provider(
+    enabled, monkeypatch, entrypoint, damage
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    root = settings.data_dir / cid
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(root, meta, receipt, "none", "auto")
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    generation.update(status="succeeded", stage="stitch")
+    segment = generation["segments"][0]
+    segment.update(status="succeeded", attempt=1, child_request_id="child-1")
+    plan.segments[0].workdir.joinpath("generated.mp4").write_bytes(b"segment")
+    output = root / "generated.mp4"
+    top_receipt = root / long_generation.stitch.RECEIPT_FILENAME
+    output.write_bytes(b"valid-top")
+    top_receipt.write_bytes(b"valid-receipt")
+    if damage == "missing":
+        output.unlink()
+    elif damage == "zero":
+        output.write_bytes(b"")
+    elif damage == "tampered":
+        output.write_bytes(b"tampered")
+    else:
+        top_receipt.write_bytes(b"broken")
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        dialogue_mode="auto",
+        frozen_plan_receipt=receipt,
+        generation=generation,
+    )
+
+    def top_is_valid(current_plan, _dialogue_mode):
+        try:
+            return (
+                current_plan.root.joinpath("generated.mp4").read_bytes() == b"valid-top"
+                and current_plan.root.joinpath(
+                    long_generation.stitch.RECEIPT_FILENAME
+                ).read_bytes() == b"valid-receipt"
+            )
+        except OSError:
+            return False
+
+    stitch_calls = []
+
+    def restitch(**kwargs):
+        stitch_calls.append(kwargs)
+        kwargs["output"].write_bytes(b"valid-top")
+        kwargs["output"].with_name(
+            long_generation.stitch.RECEIPT_FILENAME
+        ).write_bytes(b"valid-receipt")
+
+    monkeypatch.setattr(
+        long_generation, "stitched_output_is_reusable", top_is_valid
+    )
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", restitch)
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("must not POST"))
+    monkeypatch.setattr(h3, "resume", lambda _request: pytest.fail("must not GET"))
+    assert client.get(f"/api/conversations/{cid}", headers=AUTH).json()["has_video"] is False
+    listed = client.get("/api/conversations", headers=AUTH).json()
+    assert next(item for item in listed if item["id"] == cid)["has_video"] is False
+
+    if entrypoint == "startup":
+        _resume_long_generation(settings, cid)
+    else:
+        response = client.post(
+            f"/api/conversations/{cid}/submit",
+            headers=AUTH,
+            json=_payload(receipt),
+        )
+        assert response.status_code == 202
+
+    assert len(stitch_calls) == 1
+    recovered = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert recovered["status"] == "succeeded"
+    assert recovered["attempt"] == 1
+    assert client.get(f"/api/conversations/{cid}", headers=AUTH).json()["has_video"] is True
+    listed = client.get("/api/conversations", headers=AUTH).json()
+    assert next(item for item in listed if item["id"] == cid)["has_video"] is True
