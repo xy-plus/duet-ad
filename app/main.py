@@ -150,6 +150,54 @@ def _public_dialogue(meta: dict) -> dict:
     return {"mode": mode, "lines": effective, "auto_lines": automatic}
 
 
+def _has_accepted_generated_output(cdir: Path) -> bool:
+    """Single seam for the service's current final-output acceptance check."""
+    return (cdir / "generated.mp4").is_file()
+
+
+def _navigation_status(meta: dict, *, has_video: bool) -> str:
+    analysis = meta.get("status")
+    analysis_states = {
+        "queued": "analysis_queued",
+        "processing": "analysis_processing",
+        "failed": "analysis_failed",
+    }
+    if analysis in analysis_states:
+        return analysis_states[analysis]
+    if analysis != "done":
+        return "analysis_unknown"
+
+    generation = meta.get("generation")
+    if not isinstance(generation, dict):
+        return "analysis_complete"
+    generation_status = _effective_generation_status(generation)
+    generation_states = {
+        "queued": "generation_queued",
+        "running": "generation_running",
+        "failed": "generation_failed",
+        "submission_unknown": "generation_submission_unknown",
+        "resume_required": "generation_resume_required",
+    }
+    if generation_status in generation_states:
+        return generation_states[generation_status]
+    if generation_status != "succeeded":
+        return "generation_unknown"
+    if not has_video:
+        return "output_missing"
+
+    postprocess_state = meta.get("postprocess")
+    if isinstance(postprocess_state, dict):
+        postprocess_states = {
+            "running": "postprocessing",
+            "failed": "postprocess_failed",
+            "done": "postprocess_done",
+        }
+        projected = postprocess_states.get(postprocess_state.get("status"))
+        if projected is not None:
+            return projected
+    return "completed"
+
+
 def _public_generation(meta: dict, cdir: Path, settings: Settings) -> dict | None:
     generation = meta.get("generation")
     if not isinstance(generation, dict):
@@ -996,17 +1044,20 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/conversations", dependencies=[Depends(require_auth)])
     async def list_conversations():
-        return [
-            {
-                "id": m["id"],
-                "title": m["title"],
-                "note": m["note"],
-                "status": m["status"],
-                "created_at": m["created_at"],
-                "has_video": (settings.data_dir / m["id"] / "generated.mp4").is_file(),
-            }
-            for m in storage.list_conversations(settings.data_dir)
-        ]
+        result = []
+        for meta in storage.list_conversations(settings.data_dir):
+            cdir = settings.data_dir / meta["id"]
+            has_video = _has_accepted_generated_output(cdir)
+            result.append({
+                "id": meta["id"],
+                "title": meta["title"],
+                "note": meta["note"],
+                "status": meta["status"],
+                "navigation_status": _navigation_status(meta, has_video=has_video),
+                "created_at": meta["created_at"],
+                "has_video": has_video,
+            })
+        return result
 
     @app.post("/api/conversations", status_code=201, dependencies=[Depends(require_auth)])
     async def create_conversation(
@@ -1106,12 +1157,14 @@ def create_app(settings: Settings) -> FastAPI:
         if meta is None:
             raise HTTPException(status_code=404, detail="not found")
         cdir = settings.data_dir / cid
+        has_video = _has_accepted_generated_output(cdir)
         source_prompt, source_prompt_sha256 = _source_prompt_snapshot(cdir)
         result = {
             "id": meta["id"],
             "title": meta["title"],
             "note": meta["note"],
             "status": meta["status"],
+            "navigation_status": _navigation_status(meta, has_video=has_video),
             "error": meta["error"],
             "created_at": meta["created_at"],
             "updated_at": meta["updated_at"],
@@ -1129,7 +1182,7 @@ def create_app(settings: Settings) -> FastAPI:
             "receipt_version": _receipt_version(cdir, meta),
             "generation": _public_generation(meta, cdir, settings),
             "has_source": any(cdir.glob("source.*")),
-            "has_video": (cdir / "generated.mp4").is_file(),
+            "has_video": has_video,
             "submit_enabled": settings.enable_h3_submit,
             "postprocess": meta.get("postprocess"),
             "postprocess_enabled": settings.enable_seedream_edit,

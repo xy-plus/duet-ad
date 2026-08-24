@@ -1,9 +1,9 @@
 import json
-
+import pytest
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
-from app import storage
+from app import main as main_module, storage
 from app.main import create_app
 
 
@@ -24,7 +24,10 @@ def test_list_conversations_shape(client, video_1s):
     response = client.get("/api/conversations", headers=AUTH)
     assert response.status_code == 200
     (item,) = response.json()
-    assert set(item) == {"id", "title", "note", "status", "created_at", "has_video"}
+    assert set(item) == {
+        "id", "title", "note", "status", "navigation_status", "created_at",
+        "has_video",
+    }
     assert item["id"] == cid
     assert item["status"] == "queued"
     assert item["has_video"] is False
@@ -57,11 +60,79 @@ def test_detail_shape_has_no_context_ir_contract(client, video_1s):
         "keyframes", "prompt", "source_prompt", "source_prompt_sha256", "segments",
         "voice_lines", "read_only", "duration_s", "fit_required", "fit_mode",
         "dialogue", "receipt_version", "generation", "has_source", "has_video",
-        "submit_enabled", "postprocess", "postprocess_enabled",
+        "navigation_status", "submit_enabled", "postprocess", "postprocess_enabled",
     }
     assert body["generation"] is None
     assert body["has_source"] is True
     assert 0.9 <= body["duration_s"] <= 1.1
+
+
+@pytest.mark.parametrize(
+    ("analysis", "generation_status", "has_video", "postprocess_status", "expected"),
+    (
+        ("queued", "succeeded", True, "done", "analysis_queued"),
+        ("processing", "succeeded", True, "done", "analysis_processing"),
+        ("failed", "succeeded", True, "done", "analysis_failed"),
+        ("unexpected", None, False, None, "analysis_unknown"),
+        ("done", None, True, "done", "analysis_complete"),
+        ("done", "queued", False, None, "generation_queued"),
+        ("done", "running", False, None, "generation_running"),
+        ("done", "failed", False, None, "generation_failed"),
+        ("done", "submission_unknown", False, None, "generation_submission_unknown"),
+        ("done", "resume_required", False, None, "generation_resume_required"),
+        ("done", "unexpected", True, "done", "generation_unknown"),
+        ("done", "succeeded", False, None, "output_missing"),
+        ("done", "succeeded", True, None, "completed"),
+        ("done", "succeeded", True, "running", "postprocessing"),
+        ("done", "succeeded", True, "failed", "postprocess_failed"),
+        ("done", "succeeded", True, "done", "postprocess_done"),
+    ),
+)
+def test_navigation_status_matrix_is_authoritative_and_consistent(
+    tmp_path, monkeypatch, analysis, generation_status, has_video,
+    postprocess_status, expected,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, note="nav", orig_name="a.mp4")
+    cid = meta["id"]
+    generation = None if generation_status is None else {
+        "status": generation_status,
+        "error": None,
+        "attempt": 1,
+        "client_request_id": "request-nav-test",
+        "stage": "h3",
+        "task_id": "secret-provider-task",
+    }
+    postprocess = (
+        None if postprocess_status is None else {
+            "status": postprocess_status,
+        }
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status=analysis,
+        generation=generation,
+        postprocess=postprocess,
+    )
+    output = settings.data_dir / cid / "generated.mp4"
+    if has_video:
+        output.write_bytes(b"accepted-by-test-double")
+    monkeypatch.setattr(
+        main_module,
+        "_has_accepted_generated_output",
+        lambda cdir: (cdir / "generated.mp4").is_file(),
+    )
+
+    with TestClient(create_app(settings)) as client:
+        listed = client.get("/api/conversations", headers=AUTH).json()[0]
+        detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+
+    assert listed["navigation_status"] == expected
+    assert detail["navigation_status"] == expected
+    assert listed["has_video"] is has_video
+    assert detail["has_video"] is has_video
+    assert "secret-provider-task" not in json.dumps(detail)
 
 
 def test_removed_context_ir_endpoints_are_not_registered(tmp_path):

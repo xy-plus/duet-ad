@@ -27,6 +27,12 @@ links: [conversation-task, submit-gate]
 | 用户在 H3 阶段确定的 `failed` 后点“重试生成” | 新 attempt，再次 `queued → running` | 必须生成新的 `client_request_id`；长链复用成功段，只重做失败段及同链下游 |
 | 用户在长链 `failed + stage=stitch` 后点“重试拼接” | 原 attempt，再次 `queued → running` | 必须复用原 `client_request_id` 和冻结参数，只重跑本地拼接 |
 
+会话导航不再自行拼接这些底层状态。列表和详情均返回同一个
+`navigation_status`：分析阶段、生成阶段、输出缺失、完成以及后处理状态都有独立枚举。
+只有 generation 明确 `succeeded` 且最终输出通过服务端验收时才是 `completed`；孤立成片
+不能把 `analysis_complete` 冒充为完成。已有有效成片时，后处理的进行中、失败、完成状态
+优先显示为 `postprocessing/postprocess_failed/postprocess_done`。
+
 ## 边界
 
 - `resume_required` 使用新 id 返回 409 `resume_request_id_mismatch`，台词/画幅漂移返回 409 `resume_parameters_changed`；合法继续仍返回原 attempt 数字。
