@@ -35,6 +35,7 @@ links: [conversation-task, app/main.py, app/h3.py, app/prepared_input.py, app/lo
     "title": "...",
     "note": "...",
     "status": "queued|processing|done|failed",
+    "navigation_status": "analysis_queued|...|completed",
     "created_at": "ISO-8601 UTC",
     "has_video": false
   }
@@ -67,6 +68,7 @@ multipart 只允许表中字段及 `file`，未知或重复字段返回 422 `inv
   "title": "...",
   "note": "...",
   "status": "queued|processing|done|failed",
+  "navigation_status": "analysis_queued|...|completed",
   "error": null,
   "created_at": "...",
   "updated_at": "...",
@@ -100,6 +102,24 @@ multipart 只允许表中字段及 `file`，未知或重复字段返回 422 `inv
 }
 ```
 
+列表和详情的 `navigation_status` 来自同一个服务端投影，客户端不得再组合
+`status/generation/postprocess/has_video` 猜测。完整枚举及优先级：
+
+| 条件 | `navigation_status` |
+| --- | --- |
+| analysis `queued/processing/failed` | `analysis_queued/analysis_processing/analysis_failed` |
+| analysis 未知 | `analysis_unknown` |
+| analysis `done` 且无 generation 证据 | `analysis_complete`；即使存在孤立 `generated.mp4` 也不算完成 |
+| generation `queued/running/failed` | `generation_queued/generation_running/generation_failed` |
+| generation `submission_unknown/resume_required` | `generation_submission_unknown/generation_resume_required` |
+| generation 未知 | `generation_unknown` |
+| generation `succeeded` 但最终输出未通过服务端验收 | `output_missing` |
+| generation `succeeded` 且最终输出有效 | `completed` |
+| 有效最终输出上的 postprocess `running/failed/done` | `postprocessing/postprocess_failed/postprocess_done`，优先于 `completed` |
+
+analysis 的非终态/失败优先于所有 generation/postprocess 状态。投影只返回枚举字符串，
+不包含供应商 task id、文件路径或其他内部恢复字段。
+
 短视频使用上面的 `receipt_version=1`，不返回 plan 字段。长视频的同一响应还包含：
 
 ```json
@@ -123,7 +143,7 @@ multipart 只允许表中字段及 `file`，未知或重复字段返回 422 `inv
 }
 ```
 
-`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 以冻结 `meta.segments` 的完整索引集合为基数，由服务端结合持久化状态与分段 `generated.mp4` 文件实况计算：缺项计入，重复、未知或乱序状态整批不复用；`stage=stitch` 固定为 0。该复用判定与 retry 初始化共用，前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source/has_video` 按磁盘实况计算。
+`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 以冻结 `meta.segments` 的完整索引集合为基数，由服务端结合持久化状态与分段 `generated.mp4` 文件实况计算：缺项计入，重复、未知或乱序状态整批不复用；`stage=stitch` 固定为 0。该复用判定与 retry 初始化共用，前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source` 按源文件实况计算；`has_video` 与 `navigation_status` 共用当前服务端最终输出验收结果。
 
 ### `PATCH /api/conversations/{cid}/prompt`
 
