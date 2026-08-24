@@ -8,6 +8,7 @@ import math
 
 import pytest
 
+from app import long_video as long_video_module
 from app.long_video import (
     LongVideoError,
     build_continuity_block,
@@ -116,6 +117,65 @@ def test_real_night_market_scene_bounds_never_plan_an_eleven_second_request():
         left["end_s"] == right["start_s"]
         for left, right in zip(segments, segments[1:])
     )
+
+
+def test_reserved_one_second_tail_uses_frozen_boundary_precision():
+    duration = 128.842639
+    scenes = [
+        (0.0, 33.97548),
+        (33.97548, 78.404549),
+        (78.404549, duration),
+    ]
+
+    segments = plan_segments(duration, scenes, [])
+
+    assert segments[-1]["start_s"] == 127.842639
+    assert segments[-1]["end_s"] == duration
+    assert round(segments[-1]["end_s"] - segments[-1]["start_s"], 6) == 1.0
+    assert all(
+        provider_duration_s(item["start_s"], item["end_s"]) <= 10
+        for item in segments
+    )
+
+
+@pytest.mark.parametrize(
+    "duration",
+    [16.123457, 32.000001, 64.654321, 256.123457],
+)
+def test_six_decimal_plans_keep_frozen_segment_lengths_in_range(duration):
+    hard_cut = round(duration - 10.43809, 6)
+    segments = plan_segments(
+        duration,
+        [(0.0, hard_cut), (hard_cut, duration)],
+        [],
+    )
+
+    assert segments[0]["start_s"] == 0.0
+    assert segments[-1]["end_s"] == duration
+    assert all(
+        left["end_s"] == right["start_s"]
+        for left, right in zip(segments, segments[1:])
+    )
+    assert all(
+        1.0
+        <= long_video_module.segment_duration_s(item["start_s"], item["end_s"])
+        <= 10.0
+        for item in segments
+    )
+
+
+@pytest.mark.parametrize(
+    ("start_s", "end_s", "expected"),
+    [
+        (127.842639, 128.842639, 1.0),
+        (37.52, 47.52, 10.0),
+        (0.0, 0.999999, 0.999999),
+    ],
+)
+def test_segment_duration_uses_frozen_six_decimal_boundaries(
+    start_s, end_s, expected
+):
+    assert long_video_module.segment_duration_s(start_s, end_s) == expected
 
 
 def test_dialogue_boundary_moves_split_without_cutting_a_sentence():

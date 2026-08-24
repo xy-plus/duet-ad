@@ -50,20 +50,18 @@ def _finite_duration(value: object) -> float:
     return duration
 
 
-def provider_duration_s(
+def segment_duration_s(
     start_s: object,
     end_s: object,
     *,
     receipt_version: int = PLAN_RECEIPT_VERSION,
-) -> int:
-    """Return the provider integer duration for frozen segment boundaries.
+) -> float:
+    """Return segment length using the receipt's frozen-boundary precision.
 
     Current segment boundaries are persisted with six decimal places.
-    Normalize to that precision before ``ceil`` so a binary artifact such as
-    ``47.52 - 37.52 == 10.000000000000004`` stays ten seconds, while a real
-    10.000001-second segment remains eleven seconds.  Receipt v1 preserves its
-    historical raw-float conversion solely to reconstruct already-paid H3
-    attempts byte-for-byte; v1 plans cannot create a new request above ten.
+    Normalize both endpoints and their difference before applying any duration
+    constraint.  Receipt v1 preserves its historical raw-float calculation
+    solely to reconstruct already-paid H3 attempts byte-for-byte.
     """
     if (
         isinstance(start_s, bool)
@@ -91,6 +89,26 @@ def provider_duration_s(
         duration = round(end - start, BOUNDARY_PRECISION)
     if not (math.isfinite(start) and math.isfinite(end) and duration > 0):
         raise LongVideoError("long_video_invalid_segment_duration")
+    return duration
+
+
+def provider_duration_s(
+    start_s: object,
+    end_s: object,
+    *,
+    receipt_version: int = PLAN_RECEIPT_VERSION,
+) -> int:
+    """Return the provider integer duration for frozen segment boundaries.
+
+    The shared frozen-boundary calculation keeps a binary artifact such as
+    ``47.52 - 37.52 == 10.000000000000004`` at ten seconds, while a real
+    10.000001-second segment remains eleven seconds.
+    """
+    duration = segment_duration_s(
+        start_s,
+        end_s,
+        receipt_version=receipt_version,
+    )
     return max(1, math.ceil(duration))
 
 
@@ -197,7 +215,7 @@ def plan_segments(
             cut
             for cut in hard_cuts
             if minimum <= cut <= target
-            and duration - cut >= SEGMENT_MIN_S
+            and segment_duration_s(cut, duration) >= SEGMENT_MIN_S
             and _is_safe_boundary(cut, dialogue_intervals)
             and provider_duration_s(start, cut) <= SEGMENT_PROVIDER_MAX_DURATION_S
         ]
@@ -211,7 +229,7 @@ def plan_segments(
 
     # The final remainder may be shorter than one second after a preferred hard
     # cut.  Fold that cut back and choose the latest safe ordinary boundary.
-    if cuts[-1] - cuts[-2] < SEGMENT_MIN_S:
+    if segment_duration_s(cuts[-2], cuts[-1]) < SEGMENT_MIN_S:
         cuts.pop(-2)
         start = cuts[-2]
         target = duration - SEGMENT_MIN_S
@@ -227,9 +245,8 @@ def plan_segments(
     segments: list[dict] = []
     chain_number = 1
     for index, (start, end) in enumerate(zip(cuts, cuts[1:]), start=1):
-        length = end - start
         if (
-            length < SEGMENT_MIN_S
+            segment_duration_s(start, end) < SEGMENT_MIN_S
             or provider_duration_s(start, end) > SEGMENT_PROVIDER_MAX_DURATION_S
         ):
             raise LongVideoError("long_video_no_safe_dialogue_boundary")
@@ -338,11 +355,15 @@ def write_plan_receipt(
             join_mode = raw["join_mode"]
         except (KeyError, TypeError, ValueError):
             raise LongVideoError("long_video_plan_invalid_segment") from None
+        try:
+            frozen_duration = segment_duration_s(start_s, end_s)
+        except LongVideoError:
+            raise LongVideoError("long_video_plan_invalid_segment") from None
         if (
             index != expected_index
             or not (math.isfinite(start_s) and math.isfinite(end_s))
             or abs(start_s - previous_end) > _EPS
-            or end_s - start_s < SEGMENT_MIN_S
+            or frozen_duration < SEGMENT_MIN_S
             or provider_duration_s(start_s, end_s)
             > SEGMENT_PROVIDER_MAX_DURATION_S
             or not isinstance(chain_id, str)
