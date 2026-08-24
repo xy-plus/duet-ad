@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -45,6 +46,31 @@ def _make_video_with_audio_duration(path: Path, video_duration: float,
     )
 
 
+def _make_offset_video(path: Path, offset: float) -> None:
+    video_offset = max(0.0, -offset)
+    audio_offset = max(0.0, offset)
+    _run(
+        "ffmpeg", "-v", "error", "-y", "-itsoffset", str(video_offset),
+        "-f", "lavfi", "-i", "color=c=black:size=160x120:rate=24:d=2",
+        "-itsoffset", str(audio_offset), "-f", "lavfi", "-i",
+        "sine=frequency=1000:sample_rate=48000:duration=2.5",
+        "-map", "0:v", "-map", "1:a", "-c:v", "libx264",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-copyts", str(path),
+    )
+
+
+def _audible_start(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-i", str(path), "-af",
+            "silencedetect=noise=-35dB:d=0.05", "-f", "null", "-",
+        ],
+        capture_output=True, text=True,
+    )
+    match = re.search(r"silence_end: ([0-9.]+)", result.stderr)
+    return float(match.group(1)) if match else 0.0
+
+
 def _make_leading_duplicate(path: Path, *, blue_duration: float = 0.75) -> None:
     _run(
         "ffmpeg", "-y",
@@ -87,6 +113,30 @@ def test_keep_audio_is_trimmed_or_padded_to_visual_timeline(tmp_path, audio_dura
     audio = next(stream for stream in probe["streams"] if stream["codec_type"] == "audio")
     assert abs(float(video["duration"]) - 1.0) <= 1 / 24
     assert abs(float(audio["duration"]) - float(video["duration"])) <= 0.05
+
+
+@pytest.mark.parametrize("offset", [-0.5, 0.0, 0.5])
+def test_keep_audio_preserves_relative_source_offset(tmp_path, offset):
+    segment = tmp_path / "segment.mp4"
+    source = tmp_path / f"source-{offset}.mp4"
+    output = tmp_path / f"generated-{offset}.mp4"
+    _make_video(segment, "red", 2.0, codec="libx264", rate=24)
+    _make_offset_video(source, offset)
+
+    stitch.stitch_video(
+        segments=[stitch.StitchSegment(segment, 2.0, "hard_cut")],
+        source_video=source,
+        output=output,
+        audio_mode="keep",
+    )
+
+    onset = _audible_start(output)
+    if offset > 0:
+        assert onset == pytest.approx(0.5, abs=0.08)
+    else:
+        assert onset < 0.08
+    video = next(s for s in _probe(output)["streams"] if s["codec_type"] == "video")
+    assert float(video["duration"]) == pytest.approx(2.0, abs=1 / 24)
 
 
 def _pixel(path: Path, timestamp: float) -> tuple[int, int, int]:

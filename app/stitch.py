@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Sequence
 
+from app import storage
+
 
 FPS = 24
 FRAME_DURATION_S = 1 / FPS
@@ -324,9 +326,19 @@ def stitch_video(
         candidate = joined
         if audio_mode == "keep" and source_info.has_audio:
             candidate = tmp / "candidate.mp4"
+            try:
+                offset = (
+                    storage.probe_stream_first_pts(source, "a:0")
+                    - storage.probe_stream_first_pts(source, "v:0")
+                )
+            except storage.UploadError as exc:
+                raise StitchError(f"source timeline probe failed: {exc}") from None
+            trim_start = max(0.0, -offset)
+            delay_ms = max(0, round(max(0.0, offset) * 1000))
             audio_filter = (
-                f"[1:a:0]atrim=duration={encoded_duration:.9f},"
-                f"asetpts=PTS-STARTPTS,apad=whole_dur={encoded_duration:.9f}[a]"
+                f"[1:a:0]atrim=start={trim_start:.9f},asetpts=PTS-STARTPTS,"
+                f"adelay=delays={delay_ms}:all=1,apad,"
+                f"atrim=duration={encoded_duration:.9f}[a]"
             )
             _run(
                 [

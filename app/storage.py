@@ -13,8 +13,6 @@ from math import isfinite
 from pathlib import Path
 from typing import NamedTuple
 
-import cv2
-
 ALLOWED_EXT = {".mp4", ".mov", ".webm"}
 _CHUNK = 1024 * 1024
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -406,7 +404,10 @@ def probe_video(path: Path) -> VideoProbe:
         r = subprocess.run(
             [
                 "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,duration,duration_ts,time_base",
+                "-show_entries", (
+                    "stream=width,height,duration,duration_ts,time_base,"
+                    "avg_frame_rate,r_frame_rate"
+                ),
                 "-of", "json", str(path),
             ],
             capture_output=True, text=True, timeout=30,
@@ -454,19 +455,113 @@ def probe_video(path: Path) -> VideoProbe:
         except (TypeError, ValueError, ZeroDivisionError):
             pass
     if duration is None:
-        capture = cv2.VideoCapture(str(path))
-        try:
-            if capture.isOpened():
-                frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-                fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
-                candidate = frame_count / fps if fps > 0 else 0
-                if isfinite(candidate) and candidate > 0:
-                    duration = candidate
-        finally:
-            capture.release()
+        duration = _probe_packet_duration(path, stream)
     if duration is None:
         raise UploadError("cannot parse video duration")
     return VideoProbe(duration, width, height)
+
+
+def _positive_rate(value: object) -> float | None:
+    if not isinstance(value, str) or "/" not in value:
+        return None
+    try:
+        numerator, denominator = value.split("/", 1)
+        rate = float(numerator) / float(denominator)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return rate if isfinite(rate) and rate > 0 else None
+
+
+def _packet_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if isfinite(number) else None
+
+
+def _probe_packets(path: Path, selector: str) -> list[dict]:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", selector,
+                "-show_packets", "-show_entries",
+                "packet=pts_time,dts_time,duration_time", "-of", "json", str(path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        raise UploadError(f"ffprobe failed: {exc}") from exc
+    if result.returncode != 0:
+        raise UploadError("unreadable video file")
+    try:
+        packets = json.loads(result.stdout).get("packets")
+    except (TypeError, json.JSONDecodeError):
+        packets = None
+    if not isinstance(packets, list):
+        raise UploadError("cannot parse video packet timeline")
+    return packets
+
+
+def probe_stream_first_pts(path: Path, selector: str) -> float:
+    starts = []
+    for packet in _probe_packets(path, selector):
+        if not isinstance(packet, dict):
+            continue
+        start = _packet_number(packet.get("pts_time"))
+        if start is None:
+            start = _packet_number(packet.get("dts_time"))
+        if start is not None:
+            starts.append(start)
+    if not starts:
+        raise UploadError("cannot parse stream packet timeline")
+    return min(starts)
+
+
+def _probe_packet_duration(path: Path, stream: dict) -> float | None:
+    packets = _probe_packets(path, "v:0")
+    starts: list[float] = []
+    explicit_ends: list[float] = []
+    starts_with_duration: set[float] = set()
+    for packet in packets:
+        if not isinstance(packet, dict):
+            continue
+        start = _packet_number(packet.get("pts_time"))
+        if start is None:
+            start = _packet_number(packet.get("dts_time"))
+        if start is None:
+            continue
+        starts.append(start)
+        packet_duration = _packet_number(packet.get("duration_time"))
+        if packet_duration is not None and packet_duration > 0:
+            explicit_ends.append(start + packet_duration)
+            starts_with_duration.add(start)
+    starts = sorted(set(starts))
+    if not starts:
+        return None
+    inferred_step = None
+    if len(starts) > 1:
+        positive_steps = [b - a for a, b in zip(starts, starts[1:]) if b > a]
+        if positive_steps:
+            inferred_step = positive_steps[-1]
+    if inferred_step is None:
+        rate = _positive_rate(stream.get("avg_frame_rate")) or _positive_rate(
+            stream.get("r_frame_rate")
+        )
+        inferred_step = 1 / rate if rate else None
+    ends = explicit_ends
+    if (
+        starts[-1] not in starts_with_duration
+        and inferred_step is not None
+        and inferred_step > 0
+    ):
+        ends.append(starts[-1] + inferred_step)
+    if not ends:
+        return None
+    candidate = max(ends) - starts[0]
+    return candidate if isfinite(candidate) and candidate > 0 else None
 
 
 def probe_audio(path: Path) -> bool:

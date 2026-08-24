@@ -55,7 +55,7 @@ multipart 字段：
 
 multipart 只允许表中字段及 `file`，未知或重复字段返回 422 `invalid_create_request`，且不会创建会话。已知旧页面提交 `voice_mode=none` 时返回纯文本中文刷新提示，不写文件、不入队；混入未知字段不会被归为旧页面。
 
-新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长是 `v:0` 视觉时长：优先 `stream.duration`，其次 `duration_ts*time_base`，最后用可解码的帧数/FPS；不得使用音轨或 `format.duration` 补长。该值须正有限且不超过 300 秒；文件大小默认 ≤500MB。无音轨合法。`>10s` 只接受 `voice_mode=keep`，否则 422 `long_video_audio_mode_unsupported`。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
+新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长是 `v:0` 视觉时长：优先 `stream.duration`，其次 `duration_ts*time_base`，最后扫描视频包 PTS 范围并对缺失的末包 duration 使用相邻 PTS/帧率补尾；不得使用 OpenCV 帧数/FPS、音轨或 `format.duration` 补长。该值须正有限且不超过 300 秒；文件大小默认 ≤500MB。无音轨合法。`>10s` 只接受 `voice_mode=keep`，否则 422 `long_video_audio_mode_unsupported`。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
 
 ### `GET /api/conversations/{cid}`
 
@@ -333,7 +333,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 
 短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。长链每段使用 `minimax_h3_lightx2v`，只传冻结的 `first_frame/last_frame/prompt/duration/resolution`，输出到该段 `generated.mp4`；不是供应商原生 extend。
 
-长链同一 `chain_id` 严格串行，最多并发两条 chain。`continue` 段在前一段成功后提取其精确尾帧作为 first frame；`hard_cut` 段直接使用本段源首帧。任一子任务 `submission_unknown` 锁住整批；确定失败只允许新父请求推进失败段及未完成下游，已成功段复用。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 复用 source 音轨，长于画面时裁剪、短于画面时补静音，画面时长不变；`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
+长链同一 `chain_id` 严格串行，最多并发两条 chain。`continue` 段在前一段成功后提取其精确尾帧作为 first frame；`hard_cut` 段直接使用本段源首帧。任一子任务 `submission_unknown` 锁住整批；确定失败只允许新父请求推进失败段及未完成下游，已成功段复用。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 复用 source 音轨并保留 `audio_first_pts-video_first_pts`（正值补前置静音、负值裁视频零点前音频），最后在画面终点裁剪或补静音，画面时长不变；`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
 
 输出下载门禁：只接受无 userinfo 的 HTTPS；hostname/IP 预解析必须全为公网地址，私网、loopback、local、reserved、multicast 均确定拒绝。owned httpx client 使用 `trust_env=false`；响应后在读取 status/body 前通过 `extensions.network_stream.get_extra_info("server_addr")` 验证实际 socket peer 也是公网地址。实际 peer 为私网仍是 `download_url_rejected`；DNS 临时失败为 `download_dns_failed`，缺失/异常/非 IP peer 为 `download_peer_unverified`，后二者同 id 恢复。
 

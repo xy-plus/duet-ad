@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,13 +24,16 @@ finally:
     sys.dont_write_bytecode = _dont_write_bytecode
 
 
-def _probe(monkeypatch, stream):
+def _probe(monkeypatch, stream, packets=None):
     monkeypatch.setattr(extract.shutil, "which", lambda _name: "/usr/bin/ffprobe")
     monkeypatch.setattr(
         extract.subprocess,
         "run",
-        lambda *_a, **_kw: SimpleNamespace(
-            stdout=json.dumps({"streams": [stream]}), returncode=0, stderr=""
+        lambda argv, *_a, **_kw: SimpleNamespace(
+            stdout=json.dumps(
+                {"packets": packets or []}
+                if "-show_packets" in argv else {"streams": [stream]}
+            ), returncode=0, stderr=""
         ),
     )
     return extract.probe_video_duration(Path("source.mp4"), decoded_duration=20.0)
@@ -44,8 +49,10 @@ def test_manifest_duration_uses_duration_ts_time_base(monkeypatch):
     }) == pytest.approx(503 / 30)
 
 
-def test_manifest_duration_uses_decoded_fallback_not_format(monkeypatch):
-    assert _probe(monkeypatch, {}) == 20.0
+def test_manifest_duration_uses_packet_timeline_not_decoded_metadata(monkeypatch):
+    assert _probe(monkeypatch, {}, [
+        {"pts_time": "0"}, {"pts_time": "19.9", "duration_time": "0.1"},
+    ]) == 20.0
 
 
 def test_manifest_duration_rejects_bool_duration_and_uses_ticks(monkeypatch):
@@ -54,7 +61,55 @@ def test_manifest_duration_rejects_bool_duration_and_uses_ticks(monkeypatch):
     }) == pytest.approx(503 / 30)
 
 
-def test_manifest_duration_rejects_bool_ticks_and_uses_decoded_fallback(monkeypatch):
+def test_manifest_duration_rejects_bool_ticks_and_uses_packet_timeline(monkeypatch):
     assert _probe(monkeypatch, {
         "duration": False, "duration_ts": True, "time_base": "1/30",
-    }) == 20.0
+    }, [{"pts_time": "0"}, {"pts_time": "19.9", "duration_time": "0.1"}]) == 20.0
+
+
+def test_manifest_duration_infers_missing_last_packet_duration_from_adjacent_pts(monkeypatch):
+    assert _probe(
+        monkeypatch,
+        {"avg_frame_rate": "1/1"},
+        [{"pts_time": "3"}, {"pts_time": "3.04"}, {"pts_time": "3.08"}],
+    ) == pytest.approx(0.12)
+
+
+def test_manifest_duration_infers_single_packet_duration_from_average_rate(monkeypatch):
+    assert _probe(
+        monkeypatch,
+        {"avg_frame_rate": "25/1"},
+        [{"pts_time": "7.5"}],
+    ) == pytest.approx(0.04)
+
+
+@pytest.mark.parametrize("bad_pts", [True, False, "nan", "inf"])
+def test_manifest_duration_rejects_bool_or_non_finite_packet_pts(
+    monkeypatch, bad_pts,
+):
+    with pytest.raises(SystemExit, match="video stream duration"):
+        _probe(monkeypatch, {}, [{"pts_time": bad_pts}])
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg unavailable")
+def test_real_webm_manifest_uses_visual_packets_not_longer_audio(tmp_path):
+    source = tmp_path / "source.webm"
+    work = tmp_path / "work"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=9.8",
+            "-f", "lavfi", "-i",
+            "sine=frequency=440:sample_rate=48000:duration=10.2",
+            "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8",
+            "-c:a", "libopus", str(source),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [sys.executable, str(SCRIPT), str(source), "--out-dir", str(work), "--fps", "4"],
+        check=True,
+    )
+
+    manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["duration_seconds"] == pytest.approx(9.8, abs=0.02)

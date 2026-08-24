@@ -200,6 +200,9 @@ SAMPLE_30=/absolute/path/to/30s.mp4
 for sample in "$SAMPLE_10" "$SAMPLE_15" "$SAMPLE_30"; do
   ffprobe -v error -select_streams v:0 -show_entries stream=duration,duration_ts,time_base \
     -of default=noprint_wrappers=1:nokey=1 "$sample"
+  # WebM/Matroska 若 stream duration/ticks 为空，以 v:0 packet PTS 起止验收；禁止用 format.duration 或 frame_count/fps。
+  ffprobe -v error -select_streams v:0 -show_packets \
+    -show_entries packet=pts_time,dts_time,duration_time -of csv=p=0 "$sample"
 done
 
 read -rsp 'ACCESS_TOKEN: ' ACCESS_TOKEN; printf '\n'
@@ -238,6 +241,12 @@ for cid in "$CID_10" "$CID_15" "$CID_30"; do
   ffprobe -v error -select_streams a:0 \
     -show_entries stream=codec_name,channels,duration,duration_ts,time_base \
     -of default=noprint_wrappers=1 "$output"
+  # keep 模式同时核对源 a:0/v:0 首包差值与成片实际起音位置。
+  source=$(find "data/$cid" -maxdepth 1 -type f -name 'source.*' -print -quit)
+  for selector in v:0 a:0; do
+    ffprobe -v error -select_streams "$selector" -read_intervals '%+#1' \
+      -show_packets -show_entries packet=pts_time,dts_time -of csv=p=0 "$source"
+  done
 done
 ```
 
