@@ -16,6 +16,9 @@ from app import frame_fit, h3, long_video, prepared_input, stitch, storage
 WORKFLOW = h3.H3_BOUNDARY_WORKFLOW
 _PIPELINE_NO_BGM = "不要生成背景音乐"
 _EPS = 1e-6
+FIT_LAYOUT_LEGACY = "legacy-v0"
+FIT_LAYOUT_ASPECT = "aspect-v1"
+_FIT_LAYOUTS = frozenset({FIT_LAYOUT_LEGACY, FIT_LAYOUT_ASPECT})
 
 
 class LongGenerationError(RuntimeError):
@@ -112,13 +115,49 @@ def _fit_anchor(
         raise LongGenerationError("frame_fit_failed") from None
 
 
+def _persisted_fit_layout(meta: Mapping) -> str | None:
+    generation = meta.get("generation")
+    if not isinstance(generation, Mapping) or "fit_layout" not in generation:
+        return None
+    layout = generation.get("fit_layout")
+    if layout not in _FIT_LAYOUTS:
+        raise LongGenerationError("frame_fit_failed")
+    return str(layout)
+
+
+def _fit_outputs_complete(paths: tuple[Path, Path], aspect_ratio: str) -> bool:
+    if not all(path.is_file() for path in paths):
+        return False
+    try:
+        return not frame_fit.frames_require_fit(paths, aspect_ratio)
+    except frame_fit.FrameFitError:
+        return False
+
+
 def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 dialogue_mode: str, *, aspect_ratio: str | None = None,
                 resolution: str | None = None,
                 prepare_fit: bool = True) -> FrozenPlan:
     """Validate every immutable plan fact and pre-fit every source anchor."""
     root = Path(root).resolve()
-    legacy_layout = "aspect_ratio" not in meta
+    if (aspect_ratio is None) != (resolution is None):
+        raise LongGenerationError("invalid_generation_parameters", 422)
+    parameters_explicit = aspect_ratio is not None
+    persisted_layout = _persisted_fit_layout(meta)
+    detect_existing_layout = (
+        persisted_layout is None and not prepare_fit and fit_mode != "none"
+    )
+    if persisted_layout is not None:
+        legacy_layout: bool | None = persisted_layout == FIT_LAYOUT_LEGACY
+    elif prepare_fit or fit_mode == "none":
+        # Current callers explicitly supply semantic parameters and always use
+        # the versioned path.  Calls without them are the historical contract.
+        # initial_generation persists this choice before any provider POST.
+        legacy_layout = not parameters_explicit
+    else:
+        # Pre-marker attempts are recovered from their complete, decodable
+        # frozen files.  Never let fields added after the POST select a path.
+        legacy_layout = None
     aspect_ratio = (
         meta.get("aspect_ratio", h3.H3_DEFAULT_ASPECT_RATIO)
         if aspect_ratio is None else aspect_ratio
@@ -131,6 +170,8 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         raise LongGenerationError("invalid_aspect_ratio", 422)
     if resolution not in h3.H3_RESOLUTIONS:
         raise LongGenerationError("invalid_resolution", 422)
+    if fit_mode not in {"none", "crop", "pad"}:
+        raise LongGenerationError("frame_fit_failed")
     name = meta.get("long_video_plan_receipt")
     if name != long_video.PLAN_RECEIPT_FILENAME:
         raise LongGenerationError("long_video_plan_invalid")
@@ -266,10 +307,27 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         else:
             prompt = final
         segdir = root / "work" / "segments" / str(index)
-        fit_root = segdir / "work" / "h3_frames"
-        if not legacy_layout:
-            fit_root = fit_root / aspect_ratio.replace(":", "x")
-        fit_root = fit_root / fit_mode
+        fit_base = segdir / "work" / "h3_frames"
+        legacy_root = fit_base / fit_mode
+        aspect_root = fit_base / aspect_ratio.replace(":", "x") / fit_mode
+        if detect_existing_layout:
+            legacy_paths = (
+                legacy_root / "first" / first_source.name,
+                legacy_root / "end" / last_source.name,
+            )
+            aspect_paths = (
+                aspect_root / "first" / first_source.name,
+                aspect_root / "end" / last_source.name,
+            )
+            has_legacy = _fit_outputs_complete(legacy_paths, aspect_ratio)
+            has_aspect = _fit_outputs_complete(aspect_paths, aspect_ratio)
+            if has_legacy == has_aspect:
+                raise LongGenerationError("frame_fit_failed")
+            if legacy_layout is None:
+                legacy_layout = has_legacy
+            elif legacy_layout != has_legacy:
+                raise LongGenerationError("frame_fit_failed")
+        fit_root = legacy_root if legacy_layout else aspect_root
         # Complete all static transformations before the caller can make a POST.
         if prepare_fit or fit_mode == "none":
             first = _fit_anchor(
@@ -288,6 +346,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         previous_end, previous_chain = end_s, chain_id
     if abs(previous_end - duration) > _EPS:
         raise LongGenerationError("long_video_plan_invalid")
+    assert legacy_layout is not None
     return FrozenPlan(
         root, source, receipt, tuple(frozen), aspect_ratio, resolution,
         legacy_layout,
@@ -573,8 +632,17 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
             "error": None,
             "child_request_id": prior.get("child_request_id") if succeeded else None,
         })
-    return {"status": "queued", "error": None, "attempt": attempt,
-            "client_request_id": parent_id, "stage": "h3", "segments": items}
+    return {
+        "status": "queued",
+        "error": None,
+        "attempt": attempt,
+        "client_request_id": parent_id,
+        "stage": "h3",
+        "fit_layout": (
+            FIT_LAYOUT_LEGACY if plan.legacy_layout else FIT_LAYOUT_ASPECT
+        ),
+        "segments": items,
+    }
 
 
 def _stitch(settings, cid: str, plan: FrozenPlan, dialogue_mode: str) -> None:

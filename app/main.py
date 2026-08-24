@@ -1075,11 +1075,28 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
         return paths
     fit_mode = meta.get("fit_mode")
     aspect_ratio = meta.get("aspect_ratio")
-    aspect_dir = (
-        aspect_ratio.replace(":", "x")
-        if aspect_ratio in _ASPECT_RATIOS
+    generation = meta.get("generation")
+    fit_layout = (
+        generation.get("fit_layout")
+        if isinstance(generation, dict)
         else None
     )
+    if fit_layout == long_generation.FIT_LAYOUT_LEGACY:
+        layout_dirs: tuple[str | None, ...] = (None,)
+    elif (
+        fit_layout == long_generation.FIT_LAYOUT_ASPECT
+        and aspect_ratio in _ASPECT_RATIOS
+    ):
+        layout_dirs = (aspect_ratio.replace(":", "x"),)
+    else:
+        # Pre-marker generations may have either historical or semantic paths.
+        # Fingerprint both; strict freeze_plan later selects exactly one complete
+        # layout and rejects missing, mixed, or ambiguous frozen inputs.
+        semantic_dir = (
+            aspect_ratio if aspect_ratio in _ASPECT_RATIOS
+            else h3.H3_DEFAULT_ASPECT_RATIO
+        )
+        layout_dirs = (None, semantic_dir.replace(":", "x"))
     for raw in raw_segments:
         if not isinstance(raw, dict):
             continue
@@ -1101,20 +1118,17 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
             tail = workdir / "work" / "generated_last.png"
             paths.add(tail)
             if fit_mode in {"crop", "pad"}:
-                fit_root = workdir / "work" / "h3_frames"
-                if aspect_dir is not None:
-                    fit_root = fit_root / aspect_dir
-                fit_root = fit_root / fit_mode
-                for role, anchor_index in (("first", 0), ("end", 1)):
-                    if isinstance(anchors, list) and len(anchors) > anchor_index:
-                        bound = _bound_artifact_path(cdir, anchors[anchor_index])
-                        if bound is not None:
-                            paths.add(
-                                fit_root / role / bound.name
-                            )
-                paths.add(
-                    fit_root / "continued" / tail.name
-                )
+                for layout_dir in layout_dirs:
+                    fit_root = workdir / "work" / "h3_frames"
+                    if layout_dir is not None:
+                        fit_root = fit_root / layout_dir
+                    fit_root = fit_root / fit_mode
+                    for role, anchor_index in (("first", 0), ("end", 1)):
+                        if isinstance(anchors, list) and len(anchors) > anchor_index:
+                            bound = _bound_artifact_path(cdir, anchors[anchor_index])
+                            if bound is not None:
+                                paths.add(fit_root / role / bound.name)
+                    paths.add(fit_root / "continued" / tail.name)
     paths.update(
         path for binding in candidates
         if (path := _bound_artifact_path(cdir, binding)) is not None
@@ -1131,6 +1145,7 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
                 "status": generation.get("status"),
                 "attempt": generation.get("attempt"),
                 "client_request_id": generation.get("client_request_id"),
+                "fit_layout": generation.get("fit_layout"),
                 "segments": generation.get("segments"),
             }
             if isinstance(generation, dict)

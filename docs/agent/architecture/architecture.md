@@ -85,7 +85,7 @@ flowchart LR
 - `duration_s` 以 `v:0` 实际浮点时长写 receipt；上传、pipeline 重探测和提交门禁限制为 300 秒。短链 H3 时长为 `ceil(duration_s)` 且不超过 10；长链每段为 `ceil(end_s-start_s)` 且不超过 15。最终 `keep` 拼接以视频 presentation start 归零音频时间戳，保留源音频相对画面的起音位置，再把长音频裁到画面终点、短音频补静音到画面终点，不改变画面帧预算。
 - pipeline 首次进入 `processing` 与首次 submit 冻结输入共用同一个 per-CID 原子所有权 claim；检查 generation/receipt、取得所有权和写 meta 在同一把锁内完成。输家不得运行输入准备、改写 receipt 或触发 provider，完成/回滚也只能由当前 owner 提交。
 - 生成推荐值与 pipeline `done` 原子落盘：短链使用实际选中的关键帧；长链使用 plan 中每个 `hard_cut` first anchor 与全部 end anchors，`continue` source first 不计。画幅在 `16:9/9:16` 中取总几何比例损失较小者，平局按源视频方向、仍平局取 `9:16`；清晰度按源视频短边与 `480/768` 的距离，平局取 `480p`。两种画幅都冻结 `fit_profiles`；所选目标完全匹配才用 `none`，否则默认 `crop` 并允许用户改为 `pad`。
-- H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/{crop|pad}/`；永不读取 `postprocessed/`。
+- H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/<aspect>/{crop|pad}/`；历史长链可按冻结 marker 使用旧 `h3_frames/{crop|pad}/`。恢复不能从后来新增的 meta 字段猜目录；无 marker 时只接受唯一完整且匹配目标画幅的旧/新布局。永不读取 `postprocessed/`。
 
 ## 冻结输入
 
@@ -150,7 +150,7 @@ data/<cid>/
     ├── visual_prompt.txt
     ├── prompt.txt
     ├── keyframes/*.png
-    ├── h3_frames/{crop|pad}/*.png    # short only, after explicit fit choice
+    ├── h3_frames/<aspect>/{crop|pad}/*.png # short only, after explicit fit choice
     ├── postprocessed/*.png           # optional display-only Seedream output
     └── segments/<N>/
         ├── source.mp4

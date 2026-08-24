@@ -902,6 +902,8 @@ function generationDraft(detail) {
   const parameters = generationParameterDraft(detail);
   const parameterVersion = detail.aspect_ratio + "|" + detail.resolution
     + "|" + JSON.stringify(detail.fit_profiles);
+  const hasFrozenGeneration = !!(detail.generation
+    && typeof detail.generation === "object");
   if (!draft) {
     draft = {
       dialogueMode: "auto",
@@ -912,7 +914,34 @@ function generationDraft(detail) {
       receiptVersion: detail.receipt_version,
     };
     state.generationDrafts[detail.id] = draft;
-  } else if (draft.receiptVersion !== detail.receipt_version && !draft.editTouched) {
+  }
+  if (hasFrozenGeneration) {
+    const dialogueMode = detail.dialogue && detail.dialogue.mode;
+    if (!["auto", "edit", "custom", "none"].includes(dialogueMode)) {
+      throw new Error("服务端冻结台词模式无效，请刷新页面后重试");
+    }
+    const fitMode = detail.fit_mode;
+    const profile = fitProfile(detail, detail.aspect_ratio);
+    if ((profile.fit_required && !["crop", "pad"].includes(fitMode))
+        || (!profile.fit_required && fitMode !== "none")) {
+      throw new Error("服务端冻结适配方式无效，请刷新页面后重试");
+    }
+    const frozenLines = formatDialogueLines(detail.dialogue);
+    Object.assign(draft, parameters, {
+      dialogueMode,
+      fitMode,
+      editLinesText: dialogueMode === "edit" ? frozenLines : draft.editLinesText,
+      customLinesText: dialogueMode === "custom" ? frozenLines : draft.customLinesText,
+      parameterVersion,
+      receiptVersion: detail.receipt_version,
+      parameterTouched: false,
+      editTouched: false,
+      frozen: true,
+    });
+    return draft;
+  }
+  draft.frozen = false;
+  if (draft.receiptVersion !== detail.receipt_version && !draft.editTouched) {
     draft.editLinesText = formatDialogueLines(detail.dialogue);
     draft.receiptVersion = detail.receipt_version;
   }
@@ -1210,6 +1239,7 @@ function renderFinalSection(detail) {
   }
 
   const draft = generationDraft(detail);
+  const hasFrozenGeneration = draft.frozen === true;
   const busy = generation.status === "queued" || generation.status === "running"
     || !!state.generationSubmitting[detail.id];
   const aspectField = el("fieldset", "final-field");
@@ -1328,12 +1358,18 @@ function renderFinalSection(detail) {
   button.type = "button";
   button.addEventListener("click", () => submitGeneration(detail, card));
   row.appendChild(button);
-  row.appendChild(el("p", "final-caption generation-mode-caption", busy
-    ? "正在等待 H3 生成结果"
+  row.appendChild(el("p", "final-caption generation-mode-caption", hasFrozenGeneration
+    ? (busy ? "参数已按服务端冻结，正在等待 H3 生成结果"
+      : "重试将使用上次服务端冻结的生成参数")
     : longContract.isLong
       ? "各段 H3 提示词将提交生成"
       : "H3 源提示词将直接提交生成"));
   card.appendChild(row);
+  if (hasFrozenGeneration) {
+    card.querySelectorAll("input, textarea").forEach((control) => {
+      control.disabled = true;
+    });
+  }
   if (busy) setGenerationCardBusy(card, true);
   sec.appendChild(card);
   return published;
