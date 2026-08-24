@@ -3,7 +3,7 @@ name: architecture
 type: architecture
 status: done
 owner: agent
-updated: 2026-08-24
+updated: 2026-08-25
 tdd: N/A
 links: [conversation-task]
 ---
@@ -39,9 +39,9 @@ flowchart LR
 | `app/pipeline.py` | 4fps 抽帧、音频/台词准备、视觉 agent 隔离、初始 receipt | conversation-task |
 | `app/prepared_input.py` | 结构化台词、唯一发声块、文件哈希绑定、fail-closed loader | conversation-task |
 | `app/frame_fit.py` | 按真实 H3 输入推荐 `16:9/9:16`，并显式 crop/pad 为所选目标画幅 | conversation-task |
-| `app/h3.py` | 直接 H3 的 start/inspect/resume/retry 和磁盘状态机 | conversation-task |
+| `app/h3.py` | 直接 H3 的 prepare/submit/start/inspect/resume/retry 和磁盘状态机 | conversation-task |
 | `app/long_video.py` | provider 整秒时长不超过 10 秒的安全分段、hard_cut/continue 链语义、canonical plan receipt | conversation-task |
-| `app/long_generation.py` | FL2VA 子任务冻结、最多两链调度、分段恢复和拼接编排 | conversation-task |
+| `app/long_generation.py` | FL2VA 子任务冻结、默认最多两链串行依赖、可选快速 fan-out、分段恢复和拼接编排 | conversation-task |
 | `app/stitch.py` | 24fps H.264 归一化、连续边界去重帧、源音频/静音拼接 | conversation-task |
 | `app/asr.py` / `app/voice.py` / `app/vocal.py` | 本地多语种听写、ASR JSON 校验、YAMNet `spoken/sung` 分类 | conversation-task |
 | `app/postprocess.py` / `app/seedream.py` | 可选去字幕/品牌关键帧编辑；不参与 H3 输入 | postprocess |
@@ -129,7 +129,7 @@ stateDiagram-v2
 
 API 暴露的 coarse generation 是 `queued/running/resume_required/succeeded/failed/submission_unknown`。四类 provider 查询/超时及 `download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed` 映射为 `resume_required`；URL/实际 peer、重定向、体积、无效视频等确定性安全拒绝映射为 `failed`。服务没有自动付费重试。`submission_unknown` 对任何 id 固定返回 409 `submission_outcome_unknown`；意外 provider 异常会先 inspect，只有磁盘状态明确为确定失败时才开放新 id。
 
-长链在 `generation.segments` 中保存每段 `index/chain_id/join_mode/status/attempt/error/child_request_id`；公开接口省略 `child_request_id`。同链严格串行，不同链最多两个并发。任一段结果未知即锁住整批；启动恢复只对已知子任务执行 GET，不会替尚未开始的段 POST。确定失败的新父请求只推进失败段和其未完成下游，成功产物继续复用。全部成功后进入 `stage=stitch`：子片段归一为 24fps H.264/yuv420p，`continue` 边界移除后一段首帧，输出总时长误差不超过一帧；`auto` 复用源音轨，长于画面时裁剪、短于画面时补静音，画面时长不变；`none` 静音。拼接失败用原请求只重跑本地拼接。
+长链在 `generation.fast_mode` 冻结调度语义；字段缺失精确解释为 `false`。`generation.segments` 保存每段 `index/chain_id/join_mode/status/attempt/error/child_request_id`，公开接口省略 `child_request_id`。默认模式同链严格串行、不同链最多两个并发，`continue` 使用上游真实成片尾帧；确定失败的新父请求重做失败段及未完成下游。快速模式先构造全部不可变请求并通过 unpaid `h3.prepare` 落盘全部 input receipt，任一本地预检失败都不会产生供应商 POST；随后有界并发 `h3.submit`，每个 worker 只跨越一次 POST 边界，不等待生成完成，最后有界并行 `h3.resume` GET。快速 `continue` 的 first frame 是上一 `FrozenSegment.last_frame` 已 receipt 绑定、按同一 fit 处理的原 bytes，不读取 `generated.mp4/generated_last.png`。快速模式单段确定失败只重做该段，成功下游可独立复用；未知段锁住整批且绝不二次 POST，但已知兄弟任务仍继续 GET 并保存结果。启动恢复两种模式都为 GET-only；快速模式可并行查询已知 child，已 prepare 未 POST 的 child 保持 queued 等待用户同 id 确认。全部成功后沿用同一 stitch、源音轨和时长/SHA 验收。
 
 ## 数据布局
 
@@ -179,5 +179,5 @@ data/<cid>/
 ## 对外接口
 
 - HTTP：`/api/health`、`/api/login`、`/api/conversations*`；完整字段和状态码见 [reference](../reference/reference.md)。
-- Python：短链使用 `prepared_input.write_prepared_input/load_prepared_input`；长链使用 `long_video.plan_segments/write_plan_receipt`、`long_generation.freeze_plan/run` 和 `stitch.stitch_video`；两者复用 `h3.start/inspect/resume/retry` 与 `frame_fit.fit_frames`。
+- Python：短链使用 `prepared_input.write_prepared_input/load_prepared_input`；长链使用 `long_video.plan_segments/write_plan_receipt`、`long_generation.freeze_plan/run` 和 `stitch.stitch_video`；默认链复用 `h3.start/inspect/resume/retry`，快速链另用 `h3.prepare/submit/resume`，两者共用 `frame_fit.fit_frames`。
 - 部署：[.deploy/runbook.md](../../../.deploy/runbook.md)；systemd 示例不包含凭据。

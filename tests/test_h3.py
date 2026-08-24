@@ -244,6 +244,40 @@ def test_start_submits_source_prompt_directly_and_writes_state(tmp_path):
     assert "art-secret" not in json.dumps(state)
 
 
+def test_prepare_then_submit_persists_receipt_before_post_and_does_not_poll(tmp_path):
+    request = _request(tmp_path)
+    provider = HappyProvider(result_status="RUNNING")
+
+    prepared = h3.prepare(request)
+
+    assert prepared.status == "not_started"
+    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
+    assert state["status"] == "ready_to_submit"
+    assert state["h3"] == {"status": "ready"}
+    assert isinstance(state["input_receipt"], str)
+    with _client(provider) as client:
+        submitted = h3.submit(request, client=client)
+
+    assert submitted.status == "h3_running"
+    assert len(provider.h3_posts) == 1
+    assert not any("/result/" in item.url.path for item in provider.requests)
+    persisted = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
+    assert persisted["h3"]["task_id"] == "h3-task-local"
+
+
+def test_prepared_attempt_is_get_only_on_resume_and_submit_is_idempotent(tmp_path):
+    request = _request(tmp_path)
+    provider = HappyProvider(result_status="RUNNING")
+    h3.prepare(request)
+
+    with _client(provider) as client:
+        assert h3.resume(request, client=client).status == "not_started"
+        assert h3.submit(request, client=client).status == "h3_running"
+        assert h3.submit(request, client=client).status == "h3_running"
+
+    assert len(provider.h3_posts) == 1
+
+
 def test_boundary_mode_selects_fl2va_workflow_and_only_boundary_fields(tmp_path):
     request = _boundary_request(tmp_path)
     provider = HappyProvider()

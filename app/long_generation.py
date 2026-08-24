@@ -19,6 +19,7 @@ _EPS = 1e-6
 FIT_LAYOUT_LEGACY = "legacy-v0"
 FIT_LAYOUT_ASPECT = "aspect-v1"
 _FIT_LAYOUTS = frozenset({FIT_LAYOUT_LEGACY, FIT_LAYOUT_ASPECT})
+_FAST_MODE_WORKERS = 8
 
 
 class LongGenerationError(RuntimeError):
@@ -472,29 +473,35 @@ def _extract_last_frame(video: Path, output: Path) -> Path:
 
 def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
              parent_id: str, fit_mode: str, *, frozen_child_id: str | None = None,
-             prepare_inputs: bool = True) -> h3.H3Request:
+             prepare_inputs: bool = True, fast_mode: bool = False) -> h3.H3Request:
     first, first_data = segment.first_frame, segment.first_frame_data
     if segment.join_mode == "continue":
         upstream = plan.segments[segment.index - 2]
-        tail = upstream.workdir / "work" / "generated_last.png"
-        # A paid start belongs to the current parent attempt and must refresh
-        # the dependency; resume may only reuse the already-frozen tail.
-        if prepare_inputs:
-            tail = _extract_last_frame(upstream.workdir / "generated.mp4", tail)
-        elif not tail.is_file():
-            raise LongGenerationError("long_video_tail_frame_missing")
-        try:
-            tail_data = tail.read_bytes()
-        except OSError:
-            raise LongGenerationError("long_video_tail_frame_missing") from None
-        continued = segment.workdir / "work" / "h3_frames"
-        if not plan.legacy_layout:
-            continued = continued / plan.aspect_ratio.replace(":", "x")
-        continued = continued / fit_mode / "continued"
-        first, first_data = _fit_anchor(
-            tail, tail_data, continued, fit_mode, plan.aspect_ratio,
-            prepare=prepare_inputs,
-        )
+        if fast_mode:
+            # The upstream end anchor is already receipt-bound and fitted by
+            # freeze_plan.  Reuse those exact immutable bytes; no generated
+            # output is read and no duplicate anchor file is created.
+            first, first_data = upstream.last_frame, upstream.last_frame_data
+        else:
+            tail = upstream.workdir / "work" / "generated_last.png"
+            # A paid start belongs to the current parent attempt and must refresh
+            # the dependency; resume may only reuse the already-frozen tail.
+            if prepare_inputs:
+                tail = _extract_last_frame(upstream.workdir / "generated.mp4", tail)
+            elif not tail.is_file():
+                raise LongGenerationError("long_video_tail_frame_missing")
+            try:
+                tail_data = tail.read_bytes()
+            except OSError:
+                raise LongGenerationError("long_video_tail_frame_missing") from None
+            continued = segment.workdir / "work" / "h3_frames"
+            if not plan.legacy_layout:
+                continued = continued / plan.aspect_ratio.replace(":", "x")
+            continued = continued / fit_mode / "continued"
+            first, first_data = _fit_anchor(
+                tail, tail_data, continued, fit_mode, plan.aspect_ratio,
+                prepare=prepare_inputs,
+            )
     return h3.H3Request(
         cid=f"{cid}-segment-{segment.index}",
         workdir=segment.workdir,
@@ -556,6 +563,8 @@ def generation_segments_are_valid(
 ) -> bool:
     """Validate the complete ordered persisted coordinator state."""
     raw = generation.get("segments")
+    if "fast_mode" in generation and not isinstance(generation.get("fast_mode"), bool):
+        return False
     if not isinstance(expected_segments, (list, tuple)) or not isinstance(raw, list):
         return False
     if len(raw) != len(expected_segments) or not raw:
@@ -620,6 +629,9 @@ def bound_reusable_segment_indices(
     fit_mode = meta.get("fit_mode") if isinstance(meta, dict) else None
     if fit_mode not in {"none", "crop", "pad"}:
         return frozenset()
+    fast_mode = generation.get("fast_mode", False)
+    if not isinstance(fast_mode, bool):
+        return frozenset()
     by_index = {
         item.get("index"): item for item in segments or [] if isinstance(item, dict)
     }
@@ -644,6 +656,8 @@ def bound_reusable_segment_indices(
             or not isinstance(child_id, str)
             or not child_id
             or (
+                not fast_mode
+                and
                 segment.join_mode == "continue"
                 and segment.index - 1 not in reusable
             )
@@ -656,6 +670,7 @@ def bound_reusable_segment_indices(
                 fit_mode,
                 frozen_child_id=child_id,
                 prepare_inputs=False,
+                fast_mode=fast_mode,
             )
             return h3.output_is_reusable(
                 request,
@@ -671,7 +686,9 @@ def bound_reusable_segment_indices(
 
 
 def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, attempt: int,
-                       old: Mapping | None = None) -> dict:
+                       old: Mapping | None = None, *, fast_mode: bool = False) -> dict:
+    if not isinstance(fast_mode, bool):
+        raise LongGenerationError("invalid_fast_mode", 422)
     raw_old_segments = (old or {}).get("segments", [])
     old_segments = raw_old_segments if isinstance(raw_old_segments, list) else []
     reusable = bound_reusable_segment_indices(
@@ -703,6 +720,7 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
         "fit_layout": (
             FIT_LAYOUT_LEGACY if plan.legacy_layout else FIT_LAYOUT_ASPECT
         ),
+        "fast_mode": fast_mode,
         "segments": items,
     }
 
@@ -796,7 +814,7 @@ def stitched_output_is_reusable(plan: FrozenPlan, dialogue_mode: str) -> bool:
 
 
 def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
-    """Drive chains with max-two concurrency; only this coordinator writes meta."""
+    """Drive frozen serial chains or fast fan-out; only this coordinator writes meta."""
     meta = storage.load_meta(settings.data_dir, cid)
     if not meta or not isinstance(meta.get("generation"), dict):
         return
@@ -813,11 +831,13 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         )
         return
     parent_id = generation.get("client_request_id")
+    fast_mode = generation.get("fast_mode", False)
     fit_mode = meta.get("fit_mode")
     dialogue_mode = meta.get("dialogue_mode")
     states = {item["index"]: dict(item) for item in generation.get("segments", [])}
     if (
         not isinstance(parent_id, str)
+        or not isinstance(fast_mode, bool)
         or fit_mode not in {"none", "crop", "pad"}
         or meta.get("aspect_ratio", h3.H3_DEFAULT_ASPECT_RATIO)
         != plan.aspect_ratio
@@ -848,24 +868,59 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             )
 
     if startup:
+        recoverable = []
         for segment in plan.segments:
             state = states[segment.index]
             if state.get("status") not in {"queued", "running", "resume_required"}:
                 continue
+            recoverable.append(segment)
+
+        def recover(segment: FrozenSegment):
+            state = states[segment.index]
             try:
                 request = _request(
                     settings, cid, plan, segment, parent_id, fit_mode,
                     prepare_inputs=False,
+                    fast_mode=fast_mode,
+                    frozen_child_id=state.get("child_request_id"),
                 )
                 result = h3.resume(request)
                 if result.status == "not_started":
-                    state["status"], state["error"] = (
-                        "submission_unknown", "submission_unknown"
+                    return (
+                        ("queued", None)
+                        if fast_mode and state.get("status") == "queued"
+                        else ("submission_unknown", "submission_unknown")
                     )
-                else:
-                    state["status"], state["error"] = _result_status(result)
+                status = _result_status(result)
+                if (
+                    fast_mode
+                    and status[0] == "succeeded"
+                    and not h3.output_is_reusable(
+                        request,
+                        expected_duration_s=_segment_duration_s(plan, segment),
+                    )
+                ):
+                    return "failed", "long_video_segment_output_invalid"
+                return status
             except Exception:
-                state["status"], state["error"] = "submission_unknown", "submission_unknown"
+                return "submission_unknown", "submission_unknown"
+
+        if recoverable and fast_mode:
+            with ThreadPoolExecutor(
+                max_workers=min(_FAST_MODE_WORKERS, len(recoverable))
+            ) as pool:
+                futures = {pool.submit(recover, segment): segment for segment in recoverable}
+                while futures:
+                    done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        segment = futures.pop(future)
+                        status, error = future.result()
+                        states[segment.index].update(status=status, error=error)
+                        persist("running", None)
+        elif recoverable:
+            for segment in recoverable:
+                status, error = recover(segment)
+                states[segment.index].update(status=status, error=error)
         if any(item.get("status") == "submission_unknown" for item in states.values()):
             persist("submission_unknown", "submission_unknown")
         elif all(item.get("status") == "succeeded" for item in states.values()):
@@ -881,6 +936,182 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             # A known attempt still needs GET recovery, or an unstarted child
             # awaits an explicit same-parent confirmation.  Startup never POSTs.
             persist("resume_required", "long_video_resume_required")
+        return
+
+    if fast_mode:
+        # Phase 1: construct every immutable request before creating any paid
+        # attempt. A local validation failure therefore guarantees zero POSTs.
+        requests: dict[int, h3.H3Request] = {}
+        try:
+            for segment in plan.segments:
+                state = states[segment.index]
+                if state.get("status") == "succeeded":
+                    continue
+                if state.get("status") not in {
+                    "not_started", "queued", "running", "resume_required",
+                }:
+                    continue
+                child_id = state.get("child_request_id")
+                if not isinstance(child_id, str) or not child_id:
+                    child_id = child_request_id(parent_id, plan.receipt, segment.index)
+                requests[segment.index] = _request(
+                    settings, cid, plan, segment, parent_id, fit_mode,
+                    frozen_child_id=child_id,
+                    prepare_inputs=False,
+                    fast_mode=True,
+                )
+
+            # Phase 2: persist every unpaid child receipt before the first POST.
+            for segment in plan.segments:
+                state = states[segment.index]
+                if state.get("status") != "not_started":
+                    continue
+                result = h3.prepare(requests[segment.index])
+                if result.status == "not_started":
+                    prepared_status, prepared_error = "queued", None
+                elif result.status == "h3_running":
+                    prepared_status, prepared_error = "running", None
+                elif result.status == "succeeded":
+                    if not h3.output_is_reusable(
+                        requests[segment.index],
+                        expected_duration_s=_segment_duration_s(plan, segment),
+                    ):
+                        prepared_status, prepared_error = (
+                            "failed", "long_video_segment_output_invalid"
+                        )
+                    else:
+                        prepared_status, prepared_error = "succeeded", None
+                else:
+                    prepared_status, prepared_error = _result_status(result)
+                state.update(
+                    status=prepared_status,
+                    attempt=int(state.get("attempt", 0) or 0) + 1,
+                    error=prepared_error,
+                    child_request_id=requests[segment.index].client_request_id,
+                )
+            persist("running", None)
+        except (h3.H3Error, LongGenerationError, OSError, ValueError) as exc:
+            code = exc.code if isinstance(exc, (h3.H3Error, LongGenerationError)) else "long_video_request_invalid"
+            failed_index = next(
+                (
+                    segment.index for segment in plan.segments
+                    if states[segment.index].get("status") == "not_started"
+                ),
+                None,
+            )
+            if failed_index is not None:
+                states[failed_index].update(status="failed", error=code)
+            persist("failed", "long_video_segment_failed")
+            return
+
+        prepared_statuses = {item.get("status") for item in states.values()}
+        if "submission_unknown" in prepared_statuses:
+            persist("submission_unknown", "submission_unknown")
+            return
+        if "failed" in prepared_statuses:
+            persist("failed", "long_video_segment_failed")
+            return
+
+        def submit_one(segment: FrozenSegment):
+            try:
+                result = h3.submit(requests[segment.index])
+                if result.status == "h3_running":
+                    return "running", None
+                status = _result_status(result)
+                if status[0] == "succeeded" and not h3.output_is_reusable(
+                    requests[segment.index],
+                    expected_duration_s=_segment_duration_s(plan, segment),
+                ):
+                    return "failed", "long_video_segment_output_invalid"
+                return status
+            except h3.H3Error as exc:
+                try:
+                    inspected = h3.inspect(requests[segment.index])
+                    status = _result_status(inspected)
+                except Exception:
+                    status = ("submission_unknown", "submission_unknown")
+                if status[0] == "failed" and exc.code in {
+                    "submission_unknown", "state_persist_failed", "h3_internal_error",
+                }:
+                    return "submission_unknown", "submission_unknown"
+                return status
+            except Exception:
+                return "submission_unknown", "submission_unknown"
+
+        # Phase 3: fan out only the short POST boundary. No worker waits for a
+        # provider result, so every queued child is submitted before polling.
+        to_submit = [
+            segment for segment in plan.segments
+            if states[segment.index].get("status") == "queued"
+        ]
+        if to_submit:
+            with ThreadPoolExecutor(
+                max_workers=min(_FAST_MODE_WORKERS, len(to_submit))
+            ) as pool:
+                futures = {pool.submit(submit_one, segment): segment for segment in to_submit}
+                while futures:
+                    done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        segment = futures.pop(future)
+                        status, error = future.result()
+                        states[segment.index].update(status=status, error=error)
+                        persist("running", None)
+
+        def poll_one(segment: FrozenSegment):
+            request = requests[segment.index]
+            try:
+                result = h3.resume(request)
+                if result.status == "not_started":
+                    return "submission_unknown", "submission_unknown"
+                status = _result_status(result)
+                if status[0] == "succeeded" and not h3.output_is_reusable(
+                    request,
+                    expected_duration_s=_segment_duration_s(plan, segment),
+                ):
+                    return "failed", "long_video_segment_output_invalid"
+                return status
+            except h3.H3Error as exc:
+                return (
+                    "submission_unknown", "submission_unknown"
+                ) if exc.code in {
+                    "submission_unknown", "state_persist_failed", "h3_internal_error",
+                } else ("resume_required", exc.code)
+            except Exception:
+                return "submission_unknown", "submission_unknown"
+
+        # Phase 4: bounded long-lived GET polling. Unknown children never get a
+        # second POST, while known siblings are still allowed to finish.
+        to_poll = [
+            segment for segment in plan.segments
+            if states[segment.index].get("status") in {"running", "resume_required"}
+        ]
+        if to_poll:
+            with ThreadPoolExecutor(
+                max_workers=min(_FAST_MODE_WORKERS, len(to_poll))
+            ) as pool:
+                futures = {pool.submit(poll_one, segment): segment for segment in to_poll}
+                while futures:
+                    done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        segment = futures.pop(future)
+                        status, error = future.result()
+                        states[segment.index].update(status=status, error=error)
+                        persist("running", None)
+
+        statuses = {item.get("status") for item in states.values()}
+        if statuses == {"succeeded"}:
+            try:
+                _stitch(settings, cid, plan, dialogue_mode)
+            except Exception:
+                persist("failed", "long_video_stitch_failed", "stitch")
+            else:
+                persist("succeeded", None, "stitch")
+        elif "submission_unknown" in statuses:
+            persist("submission_unknown", "submission_unknown")
+        elif "resume_required" in statuses or "running" in statuses:
+            persist("resume_required", "long_video_resume_required")
+        else:
+            persist("failed", "long_video_segment_failed")
         return
 
     chains: dict[str, list[FrozenSegment]] = {}

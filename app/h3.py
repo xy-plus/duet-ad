@@ -383,6 +383,49 @@ def start(request: H3Request, *, client: httpx.Client | None = None) -> H3Result
                 new_attempt=is_new,
             )
 
+
+def prepare(request: H3Request) -> H3Result:
+    """Persist an exact unpaid attempt without contacting the provider.
+
+    Fast fan-out callers prepare every child first.  A persisted ``ready``
+    state proves that no POST has started; ``submitting`` remains ambiguous.
+    """
+    with _session_lease(request):
+        existing = _find_attempt(request, request.client_request_id)
+        if output_is_reusable(request, existing):
+            return _output_result(request, existing)
+        state = (
+            _create_attempt(request, request.client_request_id)
+            if existing is None
+            else existing
+        )
+        if state.get("status") == "ready_to_submit":
+            return H3Result("not_started", str(state["attempt_id"]))
+        return _result(state)
+
+
+def submit(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
+    """POST one previously prepared attempt and return before any GET poll."""
+    with _session_lease(request):
+        state = _find_attempt(request, request.client_request_id)
+        if state is None:
+            raise H3Error("attempt_not_prepared")
+        if output_is_reusable(request, state):
+            return _output_result(request, state)
+        status = str(state.get("status") or "")
+        if status in {"submission_unknown", "failed", "retryable_failure"}:
+            return _result(state)
+        h3_state = state["h3"]
+        task_id = _task_id(h3_state.get("task_id"), required=False)
+        if task_id is not None:
+            return _result(state)
+        if status != "ready_to_submit" or h3_state.get("status") != "ready":
+            _submission_unknown(request, state, "h3")
+            return _result(state)
+        with _client(client) as active_client:
+            _submit_h3(request, state, active_client)
+        return _result(state)
+
 def inspect(request: H3Request) -> H3Result:
     """Read the latest attempt for UI/startup decisions, without any writes."""
     root = _state_root(request)
@@ -928,9 +971,9 @@ def _new_state(request: H3Request, attempt_id: str, client_request_id: str) -> d
         "client_request_id": client_request_id,
         "input": manifest,
         "input_receipt": canonical_json_sha256(manifest),
-        "status": "h3_submitting",
+        "status": "ready_to_submit",
         "retryable": False,
-        "h3": {"status": "submitting"},
+        "h3": {"status": "ready"},
     }
 
 
@@ -1206,6 +1249,11 @@ def _advance(
     h3_state = state["h3"]
     h3_task_id = _task_id(h3_state.get("task_id"), required=False)
     if h3_task_id is None:
+        if h3_state.get("status") == "ready":
+            if allow_submit:
+                h3_task_id = _submit_h3(request, state, client)
+                return _poll_h3(request, state, client, h3_task_id)
+            return H3Result("not_started", str(state["attempt_id"]))
         if h3_state.get("status") == "submitting":
             if new_attempt and allow_submit:
                 h3_task_id = _submit_h3(request, state, client)
