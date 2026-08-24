@@ -173,23 +173,62 @@ def _write_legacy_pre_h3_attempt(
     settings, cid, *, attempt=1, request_id=REQUEST_ID, h3_state=None,
 ):
     attempt_id = f"{attempt:06d}"
+    keyframes = [{
+        "name": "legacy-frame.png",
+        "sha256": hashlib.sha256(b"legacy-frame").hexdigest(),
+    }]
+    source_prompt = "legacy source prompt"
+    optimized_prompt = "legacy optimized prompt"
+    legacy_input = {
+        "prompt_sha256": hashlib.sha256(source_prompt.encode("utf-8")).hexdigest(),
+        "keyframes": keyframes,
+        "voice_texts_sha256": "2" * 64,
+        "request": {
+            "duration": 10,
+            "h3_workflow": h3.H3_WORKFLOW,
+            "ir_model": "MiniMax-H3",
+            "ratio": h3.H3_DEFAULT_ASPECT_RATIO,
+            "resolution": h3.H3_RESOLUTION,
+        },
+    }
+    input_receipt = h3.canonical_json_sha256(legacy_input)
+    ir_task_id = "legacy-ir-task"
+    state = {
+        "schema_version": h3.SCHEMA_VERSION,
+        "cid": cid,
+        "attempt_id": attempt_id,
+        "client_request_id": request_id,
+        "input": legacy_input,
+        "input_receipt": input_receipt,
+        "status": "ready_for_h3",
+        "retryable": False,
+        "ir": {
+            "optimized_prompt": optimized_prompt,
+            "optimized_prompt_sha256": hashlib.sha256(
+                optimized_prompt.encode("utf-8")
+            ).hexdigest(),
+            "receipt": {
+                "input_receipt": input_receipt,
+                "keyframes": keyframes,
+                "prompt_sha256": legacy_input["prompt_sha256"],
+                "request": {
+                    "duration": 10,
+                    "model": "MiniMax-H3",
+                    "ratio": h3.H3_DEFAULT_ASPECT_RATIO,
+                },
+                "task_id": ir_task_id,
+                "voice_texts_sha256": legacy_input["voice_texts_sha256"],
+            },
+            "status": "succeeded",
+            "task_id": ir_task_id,
+        },
+        "h3": h3_state or {"status": "ready"},
+    }
     path = (
         settings.data_dir / cid / ".h3" / "attempts" / attempt_id / "attempt.json"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": h3.SCHEMA_VERSION,
-                "cid": cid,
-                "attempt_id": attempt_id,
-                "client_request_id": request_id,
-                "status": "ready_for_h3",
-                "h3": h3_state or {"status": "ready"},
-            }
-        ),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(state), encoding="utf-8")
     return path
 
 
@@ -1050,7 +1089,20 @@ def test_legacy_context_ir_attempt_is_exposed_as_direct_retry(enabled, monkeypat
     assert seen and seen[0][1] == "request-654321"
 
 
-@pytest.mark.parametrize("evidence", ["missing", "corrupt", "paid", "ambiguous"])
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "missing",
+        "corrupt",
+        "paid",
+        "ambiguous",
+        "top-level-extra",
+        "contradictory-status",
+        "retryable",
+        "corrupt-input",
+        "corrupt-ir",
+    ],
+)
 def test_legacy_context_marker_cannot_hide_ambiguous_or_paid_h3_attempt(
     enabled, monkeypatch, evidence,
 ):
@@ -1070,6 +1122,20 @@ def test_legacy_context_marker_cannot_hide_ambiguous_or_paid_h3_attempt(
         _write_legacy_pre_h3_attempt(
             settings, cid, attempt=2, request_id="older-request-123"
         )
+    elif evidence != "missing":
+        path = _write_legacy_pre_h3_attempt(settings, cid)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        if evidence == "top-level-extra":
+            state["h3_task_id"] = "ambiguous-paid-evidence"
+        elif evidence == "contradictory-status":
+            state["status"] = "succeeded"
+        elif evidence == "retryable":
+            state["retryable"] = True
+        elif evidence == "corrupt-input":
+            state["input_receipt"] = "0" * 64
+        elif evidence == "corrupt-ir":
+            state["ir"]["receipt"]["input_receipt"] = "0" * 64
+        path.write_text(json.dumps(state), encoding="utf-8")
     storage.update_meta(
         settings.data_dir,
         cid,
