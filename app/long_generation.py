@@ -47,6 +47,29 @@ class FrozenPlan:
     receipt_version: int = long_video.PLAN_RECEIPT_VERSION
 
 
+def _segment_duration_s(plan: FrozenPlan, segment: FrozenSegment) -> float:
+    """Interpret a segment boundary with its frozen plan receipt version."""
+    try:
+        return long_video.segment_duration_s(
+            segment.start_s,
+            segment.end_s,
+            receipt_version=plan.receipt_version,
+        )
+    except long_video.LongVideoError:
+        raise LongGenerationError("long_video_plan_invalid") from None
+
+
+def _stitch_segments(plan: FrozenPlan) -> list[stitch.StitchSegment]:
+    return [
+        stitch.StitchSegment(
+            item.workdir / "generated.mp4",
+            _segment_duration_s(plan, item),
+            item.join_mode,
+        )
+        for item in plan.segments
+    ]
+
+
 def _digest(path: Path) -> str:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -486,7 +509,7 @@ def bound_reusable_segment_indices(
             )
             return h3.output_is_reusable(
                 request,
-                expected_duration_s=segment.end_s - segment.start_s,
+                expected_duration_s=_segment_duration_s(plan, segment),
             )
         except (OSError, h3.H3Error, LongGenerationError, ValueError):
             return False
@@ -499,7 +522,6 @@ def bound_reusable_segment_indices(
 
 def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, attempt: int,
                        old: Mapping | None = None) -> dict:
-    plan_by_index = {segment.index: segment for segment in plan.segments}
     raw_old_segments = (old or {}).get("segments", [])
     old_segments = raw_old_segments if isinstance(raw_old_segments, list) else []
     reusable = bound_reusable_segment_indices(
@@ -528,9 +550,7 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
 
 def _stitch(settings, cid: str, plan: FrozenPlan, dialogue_mode: str) -> None:
     stitch.stitch_video(
-        segments=[stitch.StitchSegment(
-            item.workdir / "generated.mp4", item.end_s - item.start_s, item.join_mode
-        ) for item in plan.segments],
+        segments=_stitch_segments(plan),
         source_video=plan.source,
         output=plan.root / "generated.mp4",
         audio_mode="keep" if dialogue_mode == "auto" else "mute",
@@ -555,20 +575,14 @@ def stitched_output_is_reusable(plan: FrozenPlan, dialogue_mode: str) -> bool:
             or payload.get("version") != 1
         ):
             return False
-        budgets = stitch._frame_budgets([
-            stitch.StitchSegment(
-                item.workdir / "generated.mp4",
-                item.end_s - item.start_s,
-                item.join_mode,
-            )
-            for item in plan.segments
-        ])
+        stitch_segments = _stitch_segments(plan)
+        budgets = stitch._frame_budgets(stitch_segments)
         expected_segments = [
             {
                 "index": index,
                 "path": str((item.workdir / "generated.mp4").resolve()),
                 "sha256": stitch._sha256(item.workdir / "generated.mp4"),
-                "target_duration_s": item.end_s - item.start_s,
+                "target_duration_s": stitch_segments[index - 1].target_duration_s,
                 "output_frames": budgets[index - 1],
                 "join_mode": item.join_mode,
             }
@@ -599,7 +613,9 @@ def stitched_output_is_reusable(plan: FrozenPlan, dialogue_mode: str) -> bool:
             or output_receipt.get("fps") != stitch.FPS
         ):
             return False
-        expected_duration = sum(item.end_s - item.start_s for item in plan.segments)
+        expected_duration = sum(
+            item.target_duration_s for item in stitch_segments
+        )
         output_info = stitch._validate_output(
             output, expected_duration, audio_mode, source_info.has_audio
         )
@@ -614,6 +630,7 @@ def stitched_output_is_reusable(plan: FrozenPlan, dialogue_mode: str) -> bool:
         json.JSONDecodeError,
         TypeError,
         ValueError,
+        LongGenerationError,
         stitch.StitchError,
     ):
         return False
@@ -746,7 +763,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             status = _result_status(result)
             if status[0] == "succeeded" and not h3.output_is_reusable(
                 request,
-                expected_duration_s=segment.end_s - segment.start_s,
+                expected_duration_s=_segment_duration_s(plan, segment),
             ):
                 status = ("failed", "long_video_segment_output_invalid")
             return request.client_request_id, status
