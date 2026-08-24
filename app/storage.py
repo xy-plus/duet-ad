@@ -1,5 +1,5 @@
-import json
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -196,6 +196,55 @@ def claim_pipeline_input(data_dir: Path, cid: str) -> dict | None:
         )
         meta["updated_at"] = _now()
         _write_meta(cdir, meta)
+        return meta
+
+
+def claim_stale_pipeline_inputs(data_dir: Path) -> list[tuple[str, dict]]:
+    """Move recoverable pipeline leases from an older boot to this process."""
+    claimed = []
+    for listed in list_conversations(data_dir):
+        cid = listed.get("id")
+        if not isinstance(cid, str) or not _ID_RE.match(cid):
+            continue
+        cdir = data_dir / cid
+        with _meta_lock(cdir):
+            meta = load_meta(data_dir, cid)
+            if meta is None or meta.get("status") != "processing":
+                continue
+            current = meta.get("_input_owner")
+            is_pipeline = current == "pipeline" or (
+                isinstance(current, dict) and current.get("kind") == "pipeline"
+            )
+            if not is_pipeline:
+                continue
+            if (
+                isinstance(current, dict)
+                and current.get("process_generation") == PROCESS_GENERATION
+            ):
+                continue
+            if _stale_owner_has_new_frozen_input(cdir, meta, current):
+                continue
+            owner = _input_owner(cdir, "pipeline")
+            meta["_input_owner"] = owner
+            meta["updated_at"] = _now()
+            _write_meta(cdir, meta)
+            claimed.append((cid, owner))
+    return claimed
+
+
+def load_pipeline_claim(data_dir: Path, cid: str, owner: object) -> dict | None:
+    """Load an exact, currently owned pipeline claim."""
+    if (
+        not _ID_RE.match(cid)
+        or not isinstance(owner, dict)
+        or owner.get("kind") != "pipeline"
+    ):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = load_meta(data_dir, cid)
+        if meta is None or meta.get("_input_owner") != owner:
+            return None
         return meta
 
 
