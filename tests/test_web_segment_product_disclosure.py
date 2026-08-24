@@ -122,8 +122,8 @@ def test_conversation_badge_uses_final_video_truth_and_generation_precedence():
     )
     assert result == [
         {"className": "analyzed", "text": "分析完成"},
-        {"className": "analyzed", "text": "分析完成"},
-        {"className": "analyzed", "text": "分析完成"},
+        {"className": "done", "text": "已完成"},
+        {"className": "done", "text": "已完成"},
         {"className": "failed", "text": "最终视频缺失"},
         {"className": "processing", "text": "生成排队中"},
         {"className": "processing", "text": "生成中"},

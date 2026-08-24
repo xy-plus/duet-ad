@@ -577,14 +577,16 @@ function conversationBadge(conversation) {
   if (generationBadges[generationStatus]) return generationBadges[generationStatus];
   if (generationStatus === "succeeded") {
     return item.has_video === true
-      ? { className: "analyzed", text: "分析完成" }
+      ? { className: "done", text: "已完成" }
       : { className: "failed", text: "最终视频缺失" };
   }
   if (generationStatus) return { className: "failed", text: "生成状态未知" };
 
   if (item.status === "done") {
-    // 缺少 generation 契约时无法证明生成成功，安全降级为分析完成。
-    return { className: "analyzed", text: "分析完成" };
+    // 兼容尚未发布 navigation_status 的旧后端；新版响应仍只信上面的权威枚举。
+    return item.has_video === true
+      ? { className: "done", text: "已完成" }
+      : { className: "analyzed", text: "分析完成" };
   }
   if (item.status === "failed") return { className: "failed", text: "失败" };
   if (item.status === "processing") return { className: "processing", text: "处理中" };
