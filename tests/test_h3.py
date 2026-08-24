@@ -496,6 +496,39 @@ def test_reusable_output_requires_bound_receipt_valid_video_duration_and_frozen_
         h3.output_is_reusable(drifted)
 
 
+@pytest.mark.parametrize(
+    ("request_duration", "source_target", "output_duration", "expected"),
+    [
+        (11, 10.84, 11.541667, True),
+        (13, 12.0, 13.666667, True),
+        (11, 10.84, 10.79, False),
+        (11, 10.84, 12.000001, False),
+    ],
+)
+def test_boundary_output_reuse_uses_source_floor_and_provider_request_ceiling(
+    tmp_path, monkeypatch, request_duration, source_target, output_duration, expected,
+):
+    request = replace(_boundary_request(tmp_path), duration=request_duration)
+    with _client(HappyProvider()) as client:
+        assert h3.start(request, client=client).status == "succeeded"
+    monkeypatch.setattr(h3, "_probe_video_duration", lambda *_args: output_duration)
+
+    assert h3.output_is_reusable(
+        request, expected_duration_s=source_target
+    ) is expected
+
+
+def test_reference_output_reuse_keeps_half_second_tolerance(tmp_path, monkeypatch):
+    request = _request(tmp_path)
+    with _client(HappyProvider()) as client:
+        assert h3.start(request, client=client).status == "succeeded"
+
+    monkeypatch.setattr(h3, "_probe_video_duration", lambda *_args: 9.5)
+    assert h3.output_is_reusable(request, expected_duration_s=10.0) is True
+    monkeypatch.setattr(h3, "_probe_video_duration", lambda *_args: 9.499999)
+    assert h3.output_is_reusable(request, expected_duration_s=10.0) is False
+
+
 def test_succeeded_attempt_with_missing_output_redownloads_by_get_only(tmp_path):
     request = _request(tmp_path)
     provider = HappyProvider()

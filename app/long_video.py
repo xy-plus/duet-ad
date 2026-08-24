@@ -15,8 +15,12 @@ from typing import Iterable, Mapping, Sequence
 SHORT_VIDEO_MAX_S = 10.0
 LONG_VIDEO_MAX_S = 300.0
 SEGMENT_MIN_S = 1.0
-SEGMENT_MAX_S = 15.0
+SEGMENT_PROVIDER_MAX_DURATION_S = 10
+LEGACY_PROVIDER_MAX_DURATION_S = 15
+BOUNDARY_PRECISION = 6
 PLAN_RECEIPT_FILENAME = "long_video_plan.json"
+PLAN_RECEIPT_VERSION = 2
+LEGACY_PLAN_RECEIPT_VERSION = 1
 
 _EPS = 1e-6
 _CONTINUITY_BLOCK = """【全局连续性（所有分段必须逐字遵守）】
@@ -44,6 +48,50 @@ def _finite_duration(value: object) -> float:
     if duration > LONG_VIDEO_MAX_S:
         raise LongVideoError("long_video_duration_exceeded")
     return duration
+
+
+def provider_duration_s(
+    start_s: object,
+    end_s: object,
+    *,
+    receipt_version: int = PLAN_RECEIPT_VERSION,
+) -> int:
+    """Return the provider integer duration for frozen segment boundaries.
+
+    Current segment boundaries are persisted with six decimal places.
+    Normalize to that precision before ``ceil`` so a binary artifact such as
+    ``47.52 - 37.52 == 10.000000000000004`` stays ten seconds, while a real
+    10.000001-second segment remains eleven seconds.  Receipt v1 preserves its
+    historical raw-float conversion solely to reconstruct already-paid H3
+    attempts byte-for-byte; v1 plans cannot create a new request above ten.
+    """
+    if (
+        isinstance(start_s, bool)
+        or isinstance(end_s, bool)
+        or not isinstance(start_s, (int, float))
+        or not isinstance(end_s, (int, float))
+    ):
+        raise LongVideoError("long_video_invalid_segment_duration")
+    if (
+        isinstance(receipt_version, bool)
+        or not isinstance(receipt_version, int)
+        or receipt_version not in {
+            LEGACY_PLAN_RECEIPT_VERSION,
+            PLAN_RECEIPT_VERSION,
+        }
+    ):
+        raise LongVideoError("long_video_invalid_segment_duration")
+    if receipt_version == LEGACY_PLAN_RECEIPT_VERSION:
+        start = float(start_s)
+        end = float(end_s)
+        duration = end - start
+    else:
+        start = round(float(start_s), BOUNDARY_PRECISION)
+        end = round(float(end_s), BOUNDARY_PRECISION)
+        duration = round(end - start, BOUNDARY_PRECISION)
+    if not (math.isfinite(start) and math.isfinite(end) and duration > 0):
+        raise LongVideoError("long_video_invalid_segment_duration")
+    return max(1, math.ceil(duration))
 
 
 def _bounds(
@@ -125,7 +173,7 @@ def plan_segments(
     scenes: Iterable[Mapping | Sequence[float]],
     dialogue: Iterable[Mapping],
 ) -> list[dict]:
-    """Plan 1..15 second segments with hard cuts preferred over timed splits.
+    """Plan provider-safe segments with hard cuts preferred over timed splits.
 
     ``[]`` deliberately means the unchanged short-video path.  Every emitted
     segment carries chain semantics so downstream code never has to infer it.
@@ -138,9 +186,12 @@ def plan_segments(
     hard_cuts = {end for _start, end in scene_bounds[:-1]}
 
     cuts = [0.0]
-    while duration - cuts[-1] > SEGMENT_MAX_S:
+    while provider_duration_s(cuts[-1], duration) > SEGMENT_PROVIDER_MAX_DURATION_S:
         start = cuts[-1]
-        target = min(start + SEGMENT_MAX_S, duration - SEGMENT_MIN_S)
+        target = min(
+            round(start + SEGMENT_PROVIDER_MAX_DURATION_S, BOUNDARY_PRECISION),
+            duration - SEGMENT_MIN_S,
+        )
         minimum = start + SEGMENT_MIN_S
         eligible_hard_cuts = [
             cut
@@ -148,6 +199,7 @@ def plan_segments(
             if minimum <= cut <= target
             and duration - cut >= SEGMENT_MIN_S
             and _is_safe_boundary(cut, dialogue_intervals)
+            and provider_duration_s(start, cut) <= SEGMENT_PROVIDER_MAX_DURATION_S
         ]
         boundary = max(eligible_hard_cuts) if eligible_hard_cuts else _safe_at_or_before(
             target, minimum, dialogue_intervals
@@ -164,7 +216,11 @@ def plan_segments(
         start = cuts[-2]
         target = duration - SEGMENT_MIN_S
         boundary = _safe_at_or_before(target, start + SEGMENT_MIN_S, dialogue_intervals)
-        if boundary is None or math.ceil(duration - boundary) > SEGMENT_MAX_S:
+        if (
+            boundary is None
+            or provider_duration_s(boundary, duration)
+            > SEGMENT_PROVIDER_MAX_DURATION_S
+        ):
             raise LongVideoError("long_video_no_safe_dialogue_boundary")
         cuts.insert(-1, round(boundary, 6))
 
@@ -172,7 +228,10 @@ def plan_segments(
     chain_number = 1
     for index, (start, end) in enumerate(zip(cuts, cuts[1:]), start=1):
         length = end - start
-        if length < SEGMENT_MIN_S or math.ceil(length) > SEGMENT_MAX_S:
+        if (
+            length < SEGMENT_MIN_S
+            or provider_duration_s(start, end) > SEGMENT_PROVIDER_MAX_DURATION_S
+        ):
             raise LongVideoError("long_video_no_safe_dialogue_boundary")
         hard_cut = index == 1 or any(abs(start - cut) <= _EPS for cut in hard_cuts)
         if index > 1 and hard_cut:
@@ -284,7 +343,8 @@ def write_plan_receipt(
             or not (math.isfinite(start_s) and math.isfinite(end_s))
             or abs(start_s - previous_end) > _EPS
             or end_s - start_s < SEGMENT_MIN_S
-            or math.ceil(end_s - start_s) > SEGMENT_MAX_S
+            or provider_duration_s(start_s, end_s)
+            > SEGMENT_PROVIDER_MAX_DURATION_S
             or not isinstance(chain_id, str)
             or not chain_id
             or join_mode not in {"hard_cut", "continue"}
@@ -327,7 +387,7 @@ def write_plan_receipt(
         raise LongVideoError("long_video_plan_invalid_segment")
     receipt = {
         "schema": "duet.long-video-plan",
-        "version": 1,
+        "version": PLAN_RECEIPT_VERSION,
         "source": _artifact(root, source),
         "video": {"duration_s": duration},
         "workflow": workflow.strip(),

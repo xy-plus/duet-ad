@@ -314,9 +314,9 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 `normalized_audio=null` 是无音轨的合法表示。crop/pad 时 keyframe binding 指向 `work/h3_frames/<mode>/`，且不会出现 `postprocessed`。
 
-## Long-video plan receipt v1
+## Long-video plan receipt v2（兼容只读恢复 v1）
 
-`data/<cid>/long_video_plan.json` 是 canonical JSON，固定 `schema=duet.long-video-plan`、`version=1`。顶层绑定完整 source 的路径/SHA-256、实际总时长、`workflow=minimax_h3_lightx2v` 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，长度 1–15 秒，并绑定：
+`data/<cid>/long_video_plan.json` 是 canonical JSON。新计划固定 `schema=duet.long-video-plan`、`version=2`；顶层绑定完整 source 的路径/SHA-256、实际总时长、`workflow=minimax_h3_lightx2v` 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，六位小数边界归一后的 provider 整秒时长不得超过 10 秒，并绑定：
 
 - `index/start_s/end_s/chain_id/join_mode`；首段必须 `hard_cut`，后续为 `hard_cut` 或 `continue`；
 - 分段 source、1–9 张关键帧、`first/end` 两张锚点及其 SHA-256；
@@ -324,6 +324,8 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 - 本段局部台词的 canonical 数量与 SHA-256。
 
 detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字段。提交时服务同时比对该摘要、meta 分段和全部 artifact；`fit_mode=crop/pad` 时冻结的 FL2VA 请求改用服务端派生的 9:16 锚点。每段工作目录为 `work/segments/<N>/`，其中 `.h3/` 只归该子任务所有。
+
+历史 `version=1` receipt 仍可读取并按其原始浮点换算重建最长 15 秒的已知 attempt；超过 10 秒的历史段只能 GET 恢复，绝不创建新 POST，也不改写原 receipt。
 
 ## H3 attempt state v1
 
@@ -355,6 +357,8 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。长链每段使用 `minimax_h3_lightx2v`，只传冻结的 `first_frame/last_frame/prompt/duration/resolution`，输出到该段 `generated.mp4`；不是供应商原生 extend。
 
 长链同一 `chain_id` 严格串行，最多并发两条 chain。`continue` 段在前一段成功后提取其精确尾帧作为 first frame；`hard_cut` 段直接使用本段源首帧。任一子任务 `submission_unknown` 锁住整批；确定失败只允许新父请求推进失败段及未完成下游，已成功段复用。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 复用 source 音轨，以视频 presentation start 归零并由解码器处理 AAC/Opus priming，再按解码后的音频时间戳补前置静音或裁视频零点前音频，最后在画面终点裁剪或补静音，画面时长不变；`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
+
+分段原始输出复用与 reference 输出分开验收：reference 仍要求目标时长 ±0.5 秒；boundary 在 attempt receipt、输入和输出 hash 完整匹配后，要求不比源片段目标短超过一帧，且不比整秒请求长超过 1 秒。该容差不改变最终时长契约，stitch 仍按每个 source segment 的 24fps 帧预算精确裁剪或补齐并验证全片。
 
 输出下载门禁：只接受无 userinfo 的 HTTPS；hostname/IP 预解析必须全为公网地址，私网、loopback、local、reserved、multicast 均确定拒绝。owned httpx client 使用 `trust_env=false`；响应后在读取 status/body 前通过 `extensions.network_stream.get_extra_info("server_addr")` 验证实际 socket peer 也是公网地址。实际 peer 为私网仍是 `download_url_rejected`；DNS 临时失败为 `download_dns_failed`，缺失/异常/非 IP peer 为 `download_peer_unverified`，后二者同 id 恢复。
 

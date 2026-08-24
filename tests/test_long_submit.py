@@ -50,7 +50,7 @@ def _png(path: Path, value: int) -> None:
 
 
 def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
-               segment_duration=15.0, duration=None):
+               segment_duration=10.000000000000004, duration=None, legacy=False):
     planned = None
     if duration is None:
         duration = segment_duration * len(joins)
@@ -122,10 +122,52 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
             "visual_prompt_path": visual,
             "final_prompt_path": final,
         })
-    receipt_path = long_video.write_plan_receipt(
-        root, source=source, duration_s=duration, segments=receipt_input,
-        workflow=h3.H3_BOUNDARY_WORKFLOW,
-    )
+    if legacy:
+        def artifact(path):
+            path = Path(path)
+            return {
+                "path": path.resolve().relative_to(root.resolve()).as_posix(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+
+        bound_segments = []
+        for item in receipt_input:
+            dialogue = item["dialogue"]
+            bound_segments.append({
+                "index": item["index"],
+                "start_s": item["start_s"],
+                "end_s": item["end_s"],
+                "chain_id": item["chain_id"],
+                "join_mode": item["join_mode"],
+                "source": artifact(item["source_path"]),
+                "keyframes": [artifact(path) for path in item["keyframe_paths"]],
+                "anchors": [
+                    {"role": "first", **artifact(item["first_frame_path"])},
+                    {"role": "end", **artifact(item["last_frame_path"])},
+                ],
+                "visual_prompt": artifact(item["visual_prompt_path"]),
+                "final_prompt": artifact(item["final_prompt_path"]),
+                "dialogue": {
+                    "count": len(dialogue),
+                    "sha256": hashlib.sha256(
+                        long_video._canonical_bytes(dialogue)
+                    ).hexdigest(),
+                },
+            })
+        receipt_path = root / long_video.PLAN_RECEIPT_FILENAME
+        receipt_path.write_bytes(long_video._canonical_bytes({
+            "schema": "duet.long-video-plan",
+            "version": long_video.LEGACY_PLAN_RECEIPT_VERSION,
+            "source": artifact(source),
+            "video": {"duration_s": duration},
+            "workflow": h3.H3_BOUNDARY_WORKFLOW,
+            "segments": bound_segments,
+        }))
+    else:
+        receipt_path = long_video.write_plan_receipt(
+            root, source=source, duration_s=duration, segments=receipt_input,
+            workflow=h3.H3_BOUNDARY_WORKFLOW,
+        )
     receipt = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
     storage.update_meta(
         settings.data_dir, cid, status="done", duration_s=duration,
@@ -802,6 +844,140 @@ def test_resume_same_child_does_not_increment_segment_attempt(tmp_path, monkeypa
     assert storage.load_meta(settings.data_dir, cid)["generation"]["segments"][0]["attempt"] == 1
 
 
+def test_boundary_reuse_validation_receives_original_segment_target(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, segment_duration=10.84, legacy=True)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(settings.data_dir / cid, meta, receipt, "none", "auto")
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    generation["segments"][0].update(
+        status="succeeded", attempt=1, child_request_id="child-1"
+    )
+    plan.segments[0].workdir.joinpath("generated.mp4").write_bytes(b"segment")
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        generation=generation,
+    )
+    targets = []
+
+    def reusable(_request, *_args, expected_duration_s=None, **_kwargs):
+        targets.append(expected_duration_s)
+        return True
+
+    monkeypatch.setattr(h3, "output_is_reusable", reusable)
+
+    assert long_generation.bound_reusable_segment_indices(
+        settings, cid, plan, generation
+    ) == frozenset({1})
+    assert targets == [10.84]
+
+
+def test_startup_revalidates_previous_output_invalid_without_new_provider_call(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(
+        settings, segment_duration=10.84, legacy=True
+    )
+    root = settings.data_dir / cid
+    plan = long_generation.freeze_plan(
+        root, storage.load_meta(settings.data_dir, cid), receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    generation["status"] = "failed"
+    generation["error"] = "long_video_segment_failed"
+    generation["segments"][0].update(
+        status="failed",
+        attempt=1,
+        error="long_video_segment_output_invalid",
+        child_request_id="child-1",
+    )
+    plan.segments[0].workdir.joinpath("generated.mp4").write_bytes(b"paid-segment")
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        generation=generation,
+    )
+    targets = []
+    monkeypatch.setattr(
+        h3,
+        "output_is_reusable",
+        lambda _request, *_args, expected_duration_s=None, **_kwargs: (
+            targets.append(expected_duration_s) or True
+        ),
+    )
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("must not POST"))
+    monkeypatch.setattr(h3, "resume", lambda _request: pytest.fail("must not GET"))
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    long_generation.run(settings, cid, plan, startup=True)
+
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert targets == [10.84]
+    assert stored["segments"][0]["status"] == "succeeded"
+    assert stored["status"] == "succeeded"
+
+
+def test_legacy_over_ten_segment_never_starts_a_new_paid_attempt(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, segment_duration=11.0, legacy=True)
+    root = settings.data_dir / cid
+    plan = long_generation.freeze_plan(
+        root, storage.load_meta(settings.data_dir, cid), receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        generation=generation,
+    )
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("legacy plan must not POST"))
+
+    long_generation.run(settings, cid, plan)
+
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "failed"
+    assert stored["segments"][0]["error"] == "long_video_legacy_plan_read_only"
+
+
+@pytest.mark.parametrize("duration", [11.0, 13.0, 15.0])
+def test_legacy_boundary_attempts_up_to_fifteen_seconds_remain_get_only_recoverable(
+    tmp_path, monkeypatch, duration,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, segment_duration=duration, legacy=True)
+    root = settings.data_dir / cid
+    plan = long_generation.freeze_plan(
+        root, storage.load_meta(settings.data_dir, cid), receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    generation["segments"][0].update(status="resume_required", attempt=1)
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        generation=generation,
+    )
+    resumed = []
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("recovery must not POST"))
+    monkeypatch.setattr(
+        h3, "resume",
+        lambda request: resumed.append(request) or h3.H3Result("h3_running", "task"),
+    )
+
+    long_generation.run(settings, cid, plan)
+
+    assert [request.duration for request in resumed] == [int(duration)]
+
+
 def test_long_resume_required_missing_attempt_locks_batch_without_post(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, receipt = _make_long(settings)
@@ -827,10 +1003,34 @@ def test_long_resume_required_missing_attempt_locks_batch_without_post(tmp_path,
     assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "submission_unknown"
 
 
-def test_receipt_rejects_unsplit_segment_whose_ceil_duration_exceeds_15(tmp_path):
+def test_new_receipt_rejects_segment_whose_provider_duration_exceeds_ten(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     with pytest.raises(long_video.LongVideoError, match="long_video_plan_invalid_segment"):
-        _make_long(settings, segment_duration=15.0000005)
+        _make_long(settings, segment_duration=10.000001)
+
+
+def test_freeze_rejects_new_receipt_with_over_ten_provider_duration(tmp_path):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, _receipt = _make_long(
+        settings, segment_duration=11.0, legacy=True
+    )
+    root = settings.data_dir / cid
+    path = root / long_video.PLAN_RECEIPT_FILENAME
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["version"] = long_video.PLAN_RECEIPT_VERSION
+    path.write_bytes(long_video._canonical_bytes(payload))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    with pytest.raises(
+        long_generation.LongGenerationError, match="long_video_plan_invalid"
+    ):
+        long_generation.freeze_plan(
+            root,
+            storage.load_meta(settings.data_dir, cid),
+            digest,
+            "none",
+            "auto",
+        )
 
 
 @pytest.mark.parametrize(
@@ -851,7 +1051,83 @@ def test_positive_float_boundary_overflow_plans_and_freezes_provider_safe_segmen
     )
 
     assert frozen.segments
-    assert all(math.ceil(item.end_s - item.start_s) <= 15 for item in frozen.segments)
+    assert all(
+        long_video.provider_duration_s(item.start_s, item.end_s) <= 10
+        for item in frozen.segments
+    )
+
+
+def test_every_new_long_generation_request_is_at_most_ten_seconds(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, duration=31.0)
+    root = settings.data_dir / cid
+    plan = long_generation.freeze_plan(
+        root, storage.load_meta(settings.data_dir, cid), receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    requests = []
+
+    def start(request):
+        requests.append(request)
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", f"task-{request.duration}")
+
+    def extract_tail(_video, output):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"tail-frame")
+        return output
+
+    monkeypatch.setattr(h3, "start", start)
+    monkeypatch.setattr(long_generation, "_extract_last_frame", extract_tail)
+    monkeypatch.setattr(long_generation, "_fit_anchor", lambda path, _output, _fit: path)
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    long_generation.run(settings, cid, plan)
+
+    assert requests
+    assert all(request.duration <= 10 for request in requests)
+
+
+def test_legacy_binary_float_duration_rebuilds_original_thirteen_second_request(
+    tmp_path,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    root = tmp_path / "legacy"
+    root.mkdir()
+    anchor = root / "anchor.png"
+    anchor.write_bytes(b"anchor")
+    segment = long_generation.FrozenSegment(
+        index=1,
+        start_s=25.52,
+        end_s=37.52,
+        chain_id="chain-001",
+        join_mode="hard_cut",
+        workdir=root,
+        first_frame=anchor,
+        last_frame=anchor,
+        prompt="prompt",
+    )
+    plan = long_generation.FrozenPlan(
+        root=root,
+        source=root / "source.mp4",
+        receipt="legacy",
+        segments=(segment,),
+        receipt_version=long_video.LEGACY_PLAN_RECEIPT_VERSION,
+    )
+
+    request = long_generation._request(
+        settings, "cid", plan, segment, "parent-request-123", "none"
+    )
+
+    assert request.duration == 13
 
 
 def test_local_continue_request_failure_is_structured_failed_not_coordinator_crash(

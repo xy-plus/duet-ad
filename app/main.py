@@ -592,7 +592,7 @@ def _make_h3_request(
     frozen: prepared_input.PreparedInput,
     client_request_id: str,
 ) -> h3.H3Request:
-    duration = max(1, math.ceil(frozen.duration_s))
+    duration = long_video.provider_duration_s(0.0, frozen.duration_s)
     return h3.H3Request(
         cid=cid,
         workdir=(settings.data_dir / cid).resolve(),
@@ -630,7 +630,7 @@ def _freeze_submission(
     if not visual.is_file():
         raise _SubmitError(409, "prepared_input_invalid")
     duration = float(meta["duration_s"])
-    request_duration = max(1, math.ceil(duration))
+    request_duration = long_video.provider_duration_s(0.0, duration)
     engine_request = {
         "h3": {
             "workflow": h3.H3_WORKFLOW,

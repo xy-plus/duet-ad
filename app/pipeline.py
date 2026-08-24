@@ -261,7 +261,7 @@ H3_BOUNDARY_WORKFLOW = "minimax_h3_lightx2v"
 # 拆段不变量（与 app/scenes.py 的算法级不变量同值；不 import scenes：scenedetect 缺依赖时
 # scenes 模块会 SystemExit，流水线不能因此加载失败）
 SEGMENT_MIN_S = 1.0
-SEGMENT_MAX_S = 15.0
+SEGMENT_MAX_S = long_video.SEGMENT_PROVIDER_MAX_DURATION_S
 
 log = logging.getLogger(__name__)
 
@@ -786,7 +786,7 @@ def _voice_step(
 def _load_scenes(work: Path) -> list[dict]:
     """读并校验 work/scenes.json；返回 segments（空 = 单段模式）。缺失/非法 → PipelineError。
 
-    结构不变量（与 scenes.py 同口径）：每段 1~15s（1e-9 容差）、相邻无缝（1e-6 容差，
+    结构不变量（与 scenes.py 同口径）：每段 provider 请求不超过 10s、相邻无缝（1e-6 容差，
     隐含单调有序）、首段 0 起且覆盖 [0, duration_s]。
     """
     try:
@@ -817,8 +817,14 @@ def _load_scenes(work: Path) -> list[dict]:
     prev_end = 0.0
     for i, seg in enumerate(out):
         length = seg["end_s"] - seg["start_s"]
-        if length < SEGMENT_MIN_S - 1e-9 or length > SEGMENT_MAX_S + 1e-9:
-            raise PipelineError(f"scenes.json segments[{i}] length {length:.3f}s not in 1..15s")
+        if (
+            length < SEGMENT_MIN_S - 1e-9
+            or long_video.provider_duration_s(seg["start_s"], seg["end_s"])
+            > SEGMENT_MAX_S
+        ):
+            raise PipelineError(
+                f"scenes.json segments[{i}] provider duration not in 1..10s"
+            )
         if abs(seg["start_s"] - prev_end) > 1e-6:
             raise PipelineError(f"scenes.json segments[{i}] not contiguous with previous")
         prev_end = seg["end_s"]
@@ -1156,14 +1162,14 @@ def _dialogue_for_prepared_input(
 
 
 def _prepared_durations(meta: dict) -> tuple[float, int]:
-    """返回 receipt 的实际时长与 H3 整秒请求时长（向上取整，不设上限）。"""
+    """返回 receipt 的实际时长与统一换算的 H3 整秒请求时长。"""
     raw = meta.get("duration_s")
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         raise PipelineError("duration_s in meta must be a positive finite number")
     actual = float(raw)
     if not math.isfinite(actual) or actual <= 0:
         raise PipelineError("duration_s in meta must be a positive finite number")
-    engine_duration = math.ceil(actual)
+    engine_duration = long_video.provider_duration_s(0.0, actual)
     return actual, engine_duration
 
 

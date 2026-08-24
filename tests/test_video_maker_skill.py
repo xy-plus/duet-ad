@@ -32,3 +32,11 @@ def test_download_archive_matches_skill_source():
         assert sorted(name for name in archive.namelist() if not name.endswith("/")) == expected
         for path, name in zip(files, expected, strict=True):
             assert archive.read(name) == path.read_bytes()
+
+
+def test_prompt_contract_uses_source_duration_without_numeric_seconds():
+    text = SKILL.read_text(encoding="utf-8")
+
+    assert "与源片段时长一致" in text
+    assert "[目标时长] 秒" not in text
+    assert "不写具体秒数" in text
