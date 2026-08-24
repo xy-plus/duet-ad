@@ -163,6 +163,17 @@ def test_authoritative_navigation_status_maps_without_local_inference():
     ]
 
 
+def test_present_but_invalid_navigation_status_never_uses_legacy_fallback():
+    result = _run_contract(
+        "(()=>[null,''].map((navigation_status)=>contract.conversationBadge({"
+        "navigation_status,status:'done',has_video:true})))()"
+    )
+    assert result == [
+        {"className": "failed", "text": "状态异常"},
+        {"className": "failed", "text": "状态异常"},
+    ]
+
+
 def test_navigation_has_distinct_yellow_analysis_badge():
     css = (APP_JS.parent / "styles.css").read_text(encoding="utf-8")
     assert ".badge.analyzed" in css

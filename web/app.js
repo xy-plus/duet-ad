@@ -561,7 +561,7 @@ function conversationBadge(conversation) {
     postprocess_failed: { className: "failed", text: "素材优化失败" },
     postprocess_done: { className: "analyzed", text: "素材优化完成" },
   };
-  if (item.navigation_status) {
+  if (Object.prototype.hasOwnProperty.call(item, "navigation_status")) {
     return navigationBadges[item.navigation_status]
       || { className: "failed", text: "状态异常" };
   }
