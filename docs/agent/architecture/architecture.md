@@ -109,7 +109,8 @@ flowchart LR
 
 ```mermaid
 stateDiagram-v2
-  [*] --> h3_submitting: manual start or retry
+  [*] --> ready_to_submit: exact unpaid receipt persisted
+  ready_to_submit --> h3_submitting: one submit begins
   h3_submitting --> h3_running: AutoDL task id persisted
   h3_submitting --> submission_unknown: POST outcome unknown
   h3_running --> succeeded: download and atomic replace
@@ -117,7 +118,7 @@ stateDiagram-v2
   h3_running --> failed
 ```
 
-`app/h3.py` 在每次供应商 POST 前先持久化 `submitting`，拿到 task id 后再持久化 receipt，最后才轮询。`.h3/` 的安全边界：
+`app/h3.py` 先以 `ready_to_submit` 持久化 exact unpaid input receipt；单次 `submit` 在供应商 POST 前改写为 `h3_submitting`，拿到 task id 后再持久化 task receipt，最后才允许 GET 轮询。`.h3/` 的安全边界：
 
 - `session.json` 绑定 cid；`session.lock` 使用非阻塞 flock，拒绝同会话并发推进。
 - `attempts/000001/attempt.json` 以 0600 创建，后续原子写 + `fsync`；attempt state schema 为 v1。

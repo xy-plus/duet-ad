@@ -505,6 +505,242 @@ def test_fast_mode_startup_revalidates_completed_child_output(tmp_path, monkeypa
     assert stored["segments"][0]["error"] == "long_video_segment_output_invalid"
 
 
+def test_fast_resume_claim_schedules_exactly_one_coordinator(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=True
+    )
+    generation["status"] = "resume_required"
+    generation["segments"][0].update(
+        status="resume_required", attempt=1,
+        child_request_id=long_generation.child_request_id(
+            "parent-request-123", receipt, 1
+        ),
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        aspect_ratio="9:16", resolution="768p",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    launch = threading.Barrier(3)
+    first_entered = threading.Event()
+    release = threading.Event()
+    first_finished = threading.Event()
+    calls = []
+    calls_lock = threading.Lock()
+
+    def fake_run(_settings, _cid, _plan):
+        with calls_lock:
+            calls.append(len(calls) + 1)
+            call_number = calls[-1]
+        first_entered.set()
+        release.wait(timeout=2)
+        current = storage.load_meta(settings.data_dir, cid)["generation"]
+        if call_number == 1:
+            succeeded = {
+                **current, "status": "succeeded", "error": None, "stage": "stitch"
+            }
+            succeeded["segments"][0] = {
+                **succeeded["segments"][0], "status": "succeeded", "error": None
+            }
+            storage.update_meta(settings.data_dir, cid, generation=succeeded)
+            first_finished.set()
+        else:
+            first_finished.wait(timeout=2)
+            storage.update_meta(
+                settings.data_dir, cid,
+                generation={
+                    **storage.load_meta(settings.data_dir, cid)["generation"],
+                    "status": "submission_unknown", "error": "submission_unknown",
+                },
+            )
+
+    monkeypatch.setattr(long_generation, "run", fake_run)
+
+    def submit_once():
+        launch.wait(timeout=2)
+        return client.post(
+            f"/api/conversations/{cid}/submit", headers=AUTH,
+            json=_payload(receipt, fast_mode=True),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(submit_once) for _ in range(2)]
+        launch.wait(timeout=2)
+        assert first_entered.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        while not any(future.done() for future in futures) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        release.set()
+        responses = [future.result(timeout=2) for future in futures]
+
+    assert [response.status_code for response in responses] == [202, 202]
+    assert calls == [1]
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "succeeded"
+    assert stored["client_request_id"] == "parent-request-123"
+    assert stored["segments"][0]["child_request_id"] == generation["segments"][0]["child_request_id"]
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_fast_startup_missing_or_corrupt_attempt_locks_without_post(
+    tmp_path, monkeypatch, corrupt,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=True
+    )
+    child_id = long_generation.child_request_id("parent-request-123", receipt, 1)
+    generation["status"] = "running"
+    generation["segments"][0].update(
+        status="queued", attempt=1, child_request_id=child_id
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        aspect_ratio="9:16", resolution="768p",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    if corrupt:
+        attempt = (
+            plan.segments[0].workdir / ".h3" / "attempts" / "000001" / "attempt.json"
+        )
+        attempt.parent.mkdir(parents=True)
+        attempt.write_text(
+            json.dumps({"client_request_id": child_id}), encoding="utf-8"
+        )
+    monkeypatch.setattr(
+        h3, "_submit_h3", lambda *_a, **_kw: pytest.fail("recovery must make zero POSTs")
+    )
+
+    long_generation.run(settings, cid, plan, startup=True)
+
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "submission_unknown"
+    assert stored["client_request_id"] == "parent-request-123"
+    assert stored["segments"][0]["attempt"] == 1
+    assert stored["segments"][0]["child_request_id"] == child_id
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_fast_explicit_resume_missing_or_corrupt_attempt_becomes_unknown(
+    enabled, monkeypatch, corrupt,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=True
+    )
+    child_id = long_generation.child_request_id("parent-request-123", receipt, 1)
+    generation["status"] = "resume_required"
+    generation["segments"][0].update(
+        status="queued", attempt=1, child_request_id=child_id
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        aspect_ratio="9:16", resolution="768p",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    if corrupt:
+        attempt = (
+            plan.segments[0].workdir / ".h3" / "attempts" / "000001" / "attempt.json"
+        )
+        attempt.parent.mkdir(parents=True)
+        attempt.write_text(
+            json.dumps({"client_request_id": child_id}), encoding="utf-8"
+        )
+    monkeypatch.setattr(
+        h3, "_submit_h3", lambda *_a, **_kw: pytest.fail("missing attempt must make zero POSTs")
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, fast_mode=True),
+    )
+    retry = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(
+            receipt, request_id="parent-request-999", fast_mode=True
+        ),
+    )
+
+    assert response.status_code == 202
+    assert retry.status_code == 409
+    assert retry.json() == {"detail": "submission_outcome_unknown"}
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "submission_unknown"
+    assert stored["client_request_id"] == "parent-request-123"
+    assert stored["segments"][0]["attempt"] == 1
+    assert stored["segments"][0]["child_request_id"] == child_id
+
+
+def test_fast_explicit_resume_submits_provably_prepared_child(enabled, monkeypatch):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=True
+    )
+    child_id = long_generation.child_request_id("parent-request-123", receipt, 1)
+    generation["status"] = "resume_required"
+    generation["segments"][0].update(
+        status="queued", attempt=1, child_request_id=child_id
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        aspect_ratio="9:16", resolution="768p",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    request = long_generation._request(
+        settings, cid, plan, plan.segments[0], "parent-request-123", "none",
+        frozen_child_id=child_id, prepare_inputs=False, fast_mode=True,
+    )
+    assert h3.prepare(request).attempt_id == "000001"
+    submitted = []
+
+    def submit(prepared_request):
+        inspected = h3.inspect(prepared_request)
+        assert inspected.status == "ready_to_submit"
+        assert inspected.attempt_id == "000001"
+        submitted.append(prepared_request.client_request_id)
+        return h3.H3Result("h3_running", "000001")
+
+    def resume(resumed_request):
+        resumed_request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "000001")
+
+    monkeypatch.setattr(h3, "submit", submit)
+    monkeypatch.setattr(h3, "resume", resume)
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, fast_mode=True),
+    )
+
+    assert response.status_code == 202
+    assert submitted == [child_id]
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+
+
 def test_fast_mode_is_frozen_across_failed_parent_retry(enabled, monkeypatch):
     settings, client = enabled
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
