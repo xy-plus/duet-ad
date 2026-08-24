@@ -75,6 +75,8 @@ class _GeneratedVideoValidationCache:
                 if cached is not None and cached[0] == fingerprint:
                     self._entries.move_to_end(identity)
                     return cached[1]
+                if cached is not None:
+                    self._entries.pop(identity)
                 event = self._inflight.get(identity)
                 if event is None:
                     event = threading.Event()
@@ -90,7 +92,7 @@ class _GeneratedVideoValidationCache:
             result = bool(validator())
             stable_fingerprint = fingerprint_fn()
             with self._lock:
-                if stable_fingerprint == fingerprint:
+                if result and stable_fingerprint == fingerprint:
                     self._entries[identity] = (fingerprint, result)
                     self._entries.move_to_end(identity)
                     while len(self._entries) > self._max_entries:

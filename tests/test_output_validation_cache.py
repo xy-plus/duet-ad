@@ -265,6 +265,58 @@ def test_generated_video_validation_cache_coalesces_concurrent_misses(
     assert calls == 1
 
 
+def test_generated_video_validation_cache_does_not_persist_false(
+    tmp_path, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _succeeded_conversation(settings)
+    results = iter((False, True))
+    calls = 0
+
+    def validate(_settings, _meta):
+        nonlocal calls
+        calls += 1
+        return next(results)
+
+    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
+
+    assert main_module._has_valid_generated_video(settings, meta) is False
+    assert main_module._has_valid_generated_video(settings, meta) is True
+    assert calls == 2
+
+
+def test_concurrent_false_validation_waiters_do_not_deadlock(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    meta = _succeeded_conversation(settings)
+    start = threading.Barrier(5)
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def validate(_settings, _meta):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        time.sleep(0.01)
+        return False
+
+    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
+    results = []
+
+    def worker():
+        start.wait()
+        results.append(main_module._has_valid_generated_video(settings, meta))
+
+    threads = [threading.Thread(target=worker) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert results == [False] * 5
+    assert calls == 5
+
+
 def test_repeated_list_and_detail_share_one_expensive_validation(tmp_path, monkeypatch):
     settings = make_settings(tmp_path)
     calls = 0
