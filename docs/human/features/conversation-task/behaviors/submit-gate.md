@@ -50,6 +50,7 @@ links: [conversation-task, processing-state]
 | 输入准备未 `done` | 409 `artifacts not ready` |
 | AutoDL 凭据缺失 | 503 `h3_credentials_missing` |
 | 冻结输入、receipt 或画幅派生失败 | 409 `prepared_input_invalid` / `frame_fit_failed` |
+| 历史未冻结长会话的 anchors 缺失、损坏或路径越界 | 409 `fit_requirement_unknown`；不静默按 `none`，不创建付费任务 |
 | 长视频 plan receipt 缺失/格式非法或已变化 | 422 `invalid_plan_receipt` / 409 `long_video_plan_changed`；付费前拒绝 |
 | 同一 generation active/succeeded，或 H3 阶段确定失败后复用旧 id | 409；不创建新供应商任务。长链 `stage=stitch` 失败必须复用旧 id，只本地重拼 |
 | generation 为 `resume_required` | 只接受原 id、原台词和原 fit；合法时返回 202 + 原 attempt，新 id/参数漂移分别 409 |
@@ -62,5 +63,6 @@ links: [conversation-task, processing-state]
 - “生成最终视频”点击后必须立即进入提交态或显示错误；前端异常不得表现为无响应。
 - 自动 H3 源提示词只允许在 H3 attempt 创建前通过 CAS 保存；attempt 创建后锁定，防止页面内容与实际生成输入不一致。
 - 短链 H3 只使用 `work/keyframes/` 原图或 `work/h3_frames/{crop|pad}/` 派生图；长链 FL2VA 只使用 plan 绑定的首尾锚点或其画幅派生图；都不读取 Seedream `postprocessed/`。
+- 已有 generation + frozen plan 的历史长会话沿用冻结 `fit_mode`；即使旧 meta 的 `fit_required` 为 null，也不重写 active/failed/resume 的 receipt、输入或重试参数。
 - 成片下载先验证全部 DNS 解析地址，再在读取 status/body 前验证实际 socket peer 为公网；拒绝 userinfo 和重定向，限制 200 MiB，并在原子落盘前通过 ffprobe 正时长视频流验证。
 - 旧 Seedance 提交实现和 `face_hold` 参数/提示词注入已删除，不是失败回退选项。

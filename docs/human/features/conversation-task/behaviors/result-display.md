@@ -25,8 +25,8 @@ links: [conversation-task, processing-state]
 | 用户确认台词与画幅 | 按钮为“生成最终视频”；H3 源提示词直接作为实际生成输入 |
 | 长视频生成确认 | 展示冻结的子任务数量；提交时绑定当前 plan receipt，只允许 `auto/none` |
 | 长视频生成中 | 展示各段的 chain、join、状态和 attempt；不公开供应商 task id |
-| 准备完成后的全部实际关键帧都是 9:16 | 画幅固定 `none`，不能选择 crop/pad |
-| 任一实际关键帧不是 9:16 | 必须选择居中 `crop` 或黑边 `pad`，不提供静默默认值；即使源视频是 9:16，关键帧被裁成其他比例也适用 |
+| 准备完成后的全部实际 H3 输入帧都是 9:16 | 画幅固定 `none`，不能选择 crop/pad；长视频检查每个硬切段 first 与全部 end anchors，续接段 first 由上游尾帧替换 |
+| 任一实际 H3 输入帧不是 9:16 | 必须选择居中 `crop` 或黑边 `pad`，不提供静默默认值；历史未冻结长会话也从 plan anchors 派生 |
 | generation active | 禁用参数和提交按钮，2 秒轮询状态 |
 | generation 为 `resume_required` | 台词、画幅和请求 id 锁定，显示“继续既有任务”；确认后继续原 attempt |
 | 长链 H3 阶段确定失败 | 展示错误、“重试生成”和服务端给出的本次新增付费子任务数；状态成功但分段文件缺失时仍计入；点击才创建新请求 id |

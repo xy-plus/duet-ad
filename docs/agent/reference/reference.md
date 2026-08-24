@@ -188,7 +188,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 }
 ```
 
-长视频只允许这五个键，`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希。画幅规则与短链相同。
+长视频只允许这五个键，`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希。长链 `fit_required` 以每个 `hard_cut` first 和全部 end anchors 为准；`continue` first 运行时由上游生成尾帧替换。历史未冻结 null 会话从安全 plan 纯派生，无法派生时付费前拒绝。已有冻结提交继续以原 `fit_mode` 为准。
 
 旧标签页可能仍按四键长视频契约提交，缺少 `expected_plan_receipt`。服务仅对这个精确旧请求返回结构化 `409 client_refresh_required`，提示刷新页面；不会自动采用服务端当前 receipt，也不会创建付费任务。`/`、`/index.html` 和 `/app.js` 均使用 `Cache-Control: no-store`，刷新后会取得当前提交契约。
 
@@ -213,6 +213,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | 503 | `h3_credentials_missing` | AutoDL 凭据缺失 |
 | 503 | `h3_configuration_invalid` | 冻结后无法构造合法 H3Request/timeout 配置 |
 | 409 | `prepared_input_invalid` / `frame_fit_failed` | 冻结输入或画幅派生失败 |
+| 409 | `fit_requirement_unknown` | 历史长会话的 plan/anchors 无法安全派生画幅要求；不提交付费任务 |
 | 409 | `long_video_plan_changed` / `long_video_plan_invalid` | 长链 CAS 不匹配或 plan/文件绑定无效 |
 | 409 | `generation in progress` / `already submitted` | active/succeeded 使用不同 id |
 | 409 | `new client_request_id required` | H3 阶段确定 failed 后复用旧 id；长链 `stage=stitch` 除外 |
@@ -263,7 +264,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | `keyframes`, `prompt` | list[str], str/null | 准备产物 |
 | `voice_mode` | str | 创建阶段 auto 的 keep/rewrite/translate 方式 |
 | `duration_s` | float/null | ffprobe `v:0` 视觉时长；音频/容器时长不参与画面规划和门禁 |
-| `fit_required` | bool/null | pipeline done 时按实际选中关键帧计算，任一非 9:16 即 true |
+| `fit_required` | bool/null | pipeline done 时计算；短链按实际关键帧，长链按 `hard_cut` first 与全部 end anchors；历史未冻结 null 会话纯派生，无法安全派生仍为 null |
 | `dialogue_mode` | str | 默认 auto；最终提交选择 |
 | `generation` | object/null | coarse H3 attempt 状态 |
 | `segments` | list | 长链分段计划；短链为空 |

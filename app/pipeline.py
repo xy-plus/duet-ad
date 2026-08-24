@@ -39,7 +39,7 @@ from pathlib import Path
 
 import cv2
 
-from app import asr, long_generation, long_video, prepared_input, storage, vocal, voice
+from app import asr, frame_fit, long_generation, long_video, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -225,15 +225,26 @@ def _recover_long_plan(cdir: Path, meta: dict) -> dict:
         "long_video_plan_receipt": long_video.PLAN_RECEIPT_FILENAME,
     }
     try:
-        long_generation.freeze_plan(
+        plan = long_generation.freeze_plan(
             cdir, recovered_meta, digest, "none", meta.get("dialogue_mode", "auto")
         )
-    except (long_generation.LongGenerationError, ValueError):
+        fit_required = frame_fit.frames_require_fit(
+            [
+                anchor
+                for segment in plan.segments
+                for anchor in (
+                    ((segment.first_frame,) if segment.join_mode == "hard_cut" else ())
+                    + (segment.last_frame,)
+                )
+            ]
+        )
+    except (frame_fit.FrameFitError, long_generation.LongGenerationError, ValueError):
         raise PipelineError("long video plan recovery invalid") from None
     return {
         "status": "done",
         "error": None,
         "segments": segments,
+        "fit_required": fit_required,
         "long_video_plan_receipt": long_video.PLAN_RECEIPT_FILENAME,
     }
 
@@ -974,14 +985,12 @@ def _apply_no_bgm_prefix(prompt: str, prompt_path: Path, *, enabled: bool) -> st
 
 def _keyframes_require_fit(work: Path, names: list[str]) -> bool:
     """按 H3 实际接收的关键帧判断是否需要 9:16 适配。"""
-    for name in names:
-        image = cv2.imread(str(work / "keyframes" / name))
-        if image is None:
-            raise PipelineError(f"keyframe cannot be decoded: {name}")
-        height, width = image.shape[:2]
-        if width * 16 != height * 9:
-            return True
-    return False
+    try:
+        return frame_fit.frames_require_fit(
+            [work / "keyframes" / name for name in names]
+        )
+    except frame_fit.FrameFitError as exc:
+        raise PipelineError(str(exc)) from None
 
 
 def _read_segment_anchor_frames(work: Path) -> tuple[bytes, bytes]:
@@ -1411,6 +1420,23 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     workflow=H3_BOUNDARY_WORKFLOW,
                 )
                 changes["long_video_plan_receipt"] = receipt_path.name
+                try:
+                    changes["fit_required"] = frame_fit.frames_require_fit(
+                        [
+                            anchor
+                            for segment in receipt_segments
+                            for anchor in (
+                                (
+                                    (segment["first_frame_path"],)
+                                    if segment["join_mode"] == "hard_cut"
+                                    else ()
+                                )
+                                + (segment["last_frame_path"],)
+                            )
+                        ]
+                    )
+                except frame_fit.FrameFitError as exc:
+                    raise PipelineError(str(exc)) from None
             # 新 schema 保留 segments；短视频仍只写顶层 keyframes/prompt。
             storage.finish_input_claim(
                 settings.data_dir, cid, claim_owner, **changes
