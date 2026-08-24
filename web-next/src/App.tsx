@@ -138,15 +138,16 @@ interface AnalysisSummaryProps {
 function AnalysisSummary({ item, dispatch, onPost }: AnalysisSummaryProps) {
   const [editingPrompt, setEditingPrompt] = useState(false);
   const [draftPrompt, setDraftPrompt] = useState(item.prompt);
+  const promptLocked = item.generationStatus !== 'idle';
 
   useEffect(() => {
     setDraftPrompt(item.prompt);
     setEditingPrompt(false);
-  }, [item.id, item.prompt]);
+  }, [item.id, item.prompt, item.generationStatus]);
 
   const savePrompt = () => {
     const nextPrompt = draftPrompt.trim();
-    if (!nextPrompt) return;
+    if (!nextPrompt || promptLocked) return;
     dispatch({ type: 'prompt', prompt: nextPrompt });
     setEditingPrompt(false);
   };
@@ -225,7 +226,7 @@ function AnalysisSummary({ item, dispatch, onPost }: AnalysisSummaryProps) {
           {
             key: 'prompt',
             label: <Text strong>生成提示词</Text>,
-            children: editingPrompt ? (
+            children: editingPrompt && !promptLocked ? (
               <Space orientation="vertical" className="full-width">
                 <Input.TextArea
                   aria-label="生成提示词内容"
@@ -241,7 +242,15 @@ function AnalysisSummary({ item, dispatch, onPost }: AnalysisSummaryProps) {
             ) : (
               <div className="prompt-readonly">
                 <Paragraph>{item.prompt}</Paragraph>
-                <Button icon={<EditOutlined />} onClick={() => setEditingPrompt(true)}>编辑提示词</Button>
+                {!promptLocked && (
+                  <Button
+                    aria-label="编辑提示词"
+                    icon={<EditOutlined />}
+                    onClick={() => setEditingPrompt(true)}
+                  >
+                    编辑提示词
+                  </Button>
+                )}
               </div>
             ),
           },
@@ -269,7 +278,7 @@ function GenerationPanel({ item, dispatch, summary = false }: GenerationPanelPro
         <div>
           <Title level={4} id="generation-title">{summary ? '已冻结生成参数' : '生成设置'}</Title>
           <Text type="secondary">
-            {summary ? '本次成片使用的服务端语义参数快照，不可修改。' : '提交后参数锁定；原型会在本地模拟 4 个分片。'}
+            {summary ? '本地冻结参数快照，不可修改。' : '提交后参数锁定；原型会在本地模拟 4 个分片。'}
           </Text>
         </div>
         <Tag variant="filled">{summary ? '不可修改' : '预计 4 段'}</Tag>
@@ -297,19 +306,17 @@ function GenerationPanel({ item, dispatch, summary = false }: GenerationPanelPro
             <Radio.Button value="768p" aria-label="分辨率 768p">768p</Radio.Button>
           </Radio.Group>
         </div>
-        {(summary || item.aspect === '9:16') && (
-          <div className="parameter-field">
-            <Text strong>画面适配</Text>
-            <Radio.Group
-              value={item.fit}
-              disabled={locked}
-              onChange={(event) => dispatch({ type: 'fit', value: event.target.value })}
-            >
-              <Radio.Button value="crop" aria-label="适配方式 裁切">裁切铺满</Radio.Button>
-              <Radio.Button value="pad" aria-label="适配方式 留白">完整留白</Radio.Button>
-            </Radio.Group>
-          </div>
-        )}
+        <div className="parameter-field">
+          <Text strong>画面适配</Text>
+          <Radio.Group
+            value={item.fit}
+            disabled={locked}
+            onChange={(event) => dispatch({ type: 'fit', value: event.target.value })}
+          >
+            <Radio.Button value="crop" aria-label="适配方式 裁切">裁切铺满</Radio.Button>
+            <Radio.Button value="pad" aria-label="适配方式 留白">完整留白</Radio.Button>
+          </Radio.Group>
+        </div>
         <div className="parameter-field parameter-dialogue">
           <Text strong>H3 台词模式</Text>
           <Radio.Group
@@ -409,7 +416,7 @@ function FinalVideo() {
             <Text strong id="final-title">最终成片已就绪</Text>
             <Text type="secondary" className="media-description">4 个分片 · 已拼接 · 本地高质量占位</Text>
           </div>
-          <Button type="primary">预览成片</Button>
+          <Tag color="success">已完成</Tag>
         </div>
       </div>
     </section>
@@ -425,7 +432,8 @@ function TaskSender({ item, dispatch }: TaskSenderProps) {
   const [message, setMessage] = useState('');
   const [localFeedback, setLocalFeedback] = useState('');
   const analysisRunning = item.analysisStatus === 'queued' || item.analysisStatus === 'processing';
-  const canAnalyze = Boolean(item.sourceValue.trim()) && item.analysisStatus === 'idle';
+  const selectedSource = item.sourceMode === 'link' ? item.sourceUrl : item.uploadFileName;
+  const canAnalyze = Boolean(selectedSource.trim()) && item.analysisStatus === 'idle';
 
   const sourceHeader = item.phase === 'draft' ? (
     <div className="sender-source">
@@ -445,11 +453,11 @@ function TaskSender({ item, dispatch }: TaskSenderProps) {
       {item.sourceMode === 'link' ? (
         <Input
           aria-label="视频链接"
-          value={item.sourceValue}
+          value={item.sourceUrl}
           disabled={analysisRunning}
           placeholder="https://example.com/video.mp4"
           prefix={<VideoCameraOutlined />}
-          onChange={(event) => dispatch({ type: 'sourceValue', value: event.target.value })}
+          onChange={(event) => dispatch({ type: 'sourceUrl', value: event.target.value })}
         />
       ) : (
         <div className="local-upload">
@@ -469,11 +477,11 @@ function TaskSender({ item, dispatch }: TaskSenderProps) {
             <VideoCameraAddOutlined aria-hidden="true" />
             选择视频文件
           </label>
-          {item.sourceValue && (
+          {item.uploadFileName && (
             <div className="selected-attachment">
-              <Text type="secondary">已选择：{item.sourceValue}</Text>
+              <Text type="secondary">已选择：{item.uploadFileName}</Text>
               <Attachments
-                items={[{ uid: 'local-file', name: item.sourceValue, status: 'done' }]}
+                items={[{ uid: 'local-file', name: item.uploadFileName, status: 'done' }]}
                 disabled={analysisRunning}
                 customRequest={() => ({ abort: () => undefined })}
                 onRemove={() => {
@@ -634,33 +642,9 @@ function Workspace() {
   const [postOpen, setPostOpen] = useState(false);
 
   useEffect(() => {
-    if (active.analysisStatus === 'queued') {
-      const id = active.id;
-      const timer = window.setTimeout(() => dispatch({ type: 'analysisProcessing', id }), 700);
-      return () => window.clearTimeout(timer);
-    }
-    if (active.analysisStatus === 'processing') {
-      const id = active.id;
-      const timer = window.setTimeout(() => dispatch({ type: 'analysisDone', id }), 1300);
-      return () => window.clearTimeout(timer);
-    }
-  }, [active.analysisStatus, active.id, dispatch]);
-
-  useEffect(() => {
-    if (active.generationStatus === 'running' && active.simulatingGeneration) {
-      const id = active.id;
-      const timer = window.setInterval(() => dispatch({ type: 'generationTick', id }), 700);
-      return () => window.clearInterval(timer);
-    }
-  }, [active.generationStatus, active.id, active.simulatingGeneration, dispatch]);
-
-  useEffect(() => {
-    if (active.postStatus === 'running') {
-      const id = active.id;
-      const timer = window.setTimeout(() => dispatch({ type: 'postDone', id }), 1800);
-      return () => window.clearTimeout(timer);
-    }
-  }, [active.id, active.postStatus, dispatch]);
+    const timer = window.setInterval(() => dispatch({ type: 'tick' }), 700);
+    return () => window.clearInterval(timer);
+  }, [dispatch]);
 
   const sidebarProps: SidebarProps = {
     conversations: state.conversations,
@@ -749,7 +733,11 @@ function Workspace() {
                   placement="end"
                   variant="filled"
                   rootClassName="user-bubble"
-                  content={<SourceVideo name={active.sourceValue} />}
+                  content={(
+                    <SourceVideo
+                      name={active.sourceMode === 'link' ? active.sourceUrl : active.uploadFileName}
+                    />
+                  )}
                 />
                 <Bubble
                   placement="start"

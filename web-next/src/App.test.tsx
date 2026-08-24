@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
+import { getInitialMockState, mockReducer } from './mockStore';
 
 describe('Duet AI prototype', () => {
   const clickLabeledControl = async (user: ReturnType<typeof userEvent.setup>, label: string) => {
@@ -70,6 +71,8 @@ describe('Duet AI prototype', () => {
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
     render(<App />);
 
+    expect(screen.getByLabelText('适配方式 裁切')).toBeInTheDocument();
+    expect(screen.getByLabelText('适配方式 留白')).toBeInTheDocument();
     await clickLabeledControl(user, '画幅 9:16');
     await clickLabeledControl(user, '分辨率 768p');
     await clickLabeledControl(user, '适配方式 留白');
@@ -88,6 +91,52 @@ describe('Duet AI prototype', () => {
     expect(screen.getByDisplayValue('从清晨第一杯咖啡开始。')).toBeDisabled();
     expect(screen.getByText('最终成片已就绪')).toBeInTheDocument();
   });
+
+  it('freezes prompt UI and reducer state after generation submission', async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<App />);
+
+    await user.click(screen.getByRole('button', { name: '生成提示词' }));
+    expect(screen.getByRole('button', { name: '编辑提示词' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '生成视频' }));
+
+    expect(screen.queryByRole('button', { name: '编辑提示词' })).not.toBeInTheDocument();
+
+    const initial = getInitialMockState();
+    const submitted = mockReducer(initial, { type: 'startGeneration' });
+    const tampered = mockReducer(submitted, { type: 'prompt', prompt: '不应写入' });
+    expect(tampered).toEqual(submitted);
+  });
+
+  it('keeps local timers advancing across conversation switches without advancing presets', async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<App />);
+
+    await user.click(screen.getByRole('button', { name: '新建会话' }));
+    await user.type(screen.getByLabelText('视频链接'), 'https://example.com/background.mp4');
+    await user.click(screen.getByRole('button', { name: '开始分析' }));
+    await user.click(screen.getByText('最终成片完成'));
+    act(() => vi.advanceTimersByTime(2800));
+    await user.click(screen.getByText('本地视频分析'));
+    expect(screen.getByRole('heading', { name: '视频分析完成' })).toBeInTheDocument();
+
+    await user.click(screen.getByText('分析完成待生成'));
+    await user.click(screen.getByRole('button', { name: '生成视频' }));
+    await user.click(screen.getByText('长视频分片生成中'));
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '50');
+    act(() => vi.advanceTimersByTime(5000));
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '50');
+    await user.click(screen.getByText('分析完成待生成'));
+    expect(screen.getByText('最终成片已就绪')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '打开关键帧后处理' }));
+    await user.click(screen.getByRole('button', { name: '开始后处理' }));
+    await user.click(screen.getByText('最终成片完成'));
+    act(() => vi.advanceTimersByTime(2500));
+    await user.click(screen.getByText('分析完成待生成'));
+    await user.click(screen.getByRole('button', { name: '打开关键帧后处理' }));
+    expect(screen.getByText('后处理已完成')).toBeInTheDocument();
+  }, 10_000);
 
   it('runs keyframe post processing locally with current product options', async () => {
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
@@ -114,6 +163,23 @@ describe('Duet AI prototype', () => {
     expect(screen.getByLabelText('H3 台词模式 自动台词')).toBeDisabled();
     expect(screen.queryByRole('button', { name: '打开后处理' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '打开关键帧后处理' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '预览成片' })).not.toBeInTheDocument();
+    expect(screen.getByText('本地冻结参数快照，不可修改。')).toBeInTheDocument();
+  });
+
+  it('keeps URL and uploaded file state separate when switching sources', async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<App />);
+    await user.click(screen.getByRole('button', { name: '新建会话' }));
+    await user.click(screen.getByText('上传文件'));
+    fireEvent.change(screen.getByLabelText('选择视频文件'), {
+      target: { files: [new File(['local-only'], 'upload-only.mp4', { type: 'video/mp4' })] },
+    });
+    expect(screen.getByRole('button', { name: '开始分析' })).toBeEnabled();
+
+    await user.click(screen.getByText('链接输入'));
+    expect(screen.getByLabelText('视频链接')).toHaveValue('');
+    expect(screen.getByRole('button', { name: '开始分析' })).toBeDisabled();
   });
 
   it('never calls fetch while using local interactions', async () => {

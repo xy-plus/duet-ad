@@ -14,8 +14,10 @@ export interface Conversation {
   group: '今天' | '最近 7 天';
   phase: Phase;
   sourceMode: SourceMode;
-  sourceValue: string;
+  sourceUrl: string;
+  uploadFileName: string;
   analysisStatus: AnalysisStatus;
+  analysisTicks: number;
   transcriptMode: TranscriptMode;
   targetLanguage: string;
   h3DialogueMode: H3DialogueMode;
@@ -28,9 +30,10 @@ export interface Conversation {
   segmentsDone: number;
   simulatingGeneration: boolean;
   postStatus: PostStatus;
+  postTicks: number;
 }
 
-interface State {
+export interface MockState {
   activeId: string;
   nextId: number;
   conversations: Conversation[];
@@ -40,11 +43,9 @@ type Action =
   | { type: 'select'; id: string }
   | { type: 'new' }
   | { type: 'sourceMode'; mode: SourceMode }
-  | { type: 'sourceValue'; value: string }
+  | { type: 'sourceUrl'; value: string }
   | { type: 'file'; name: string }
   | { type: 'submitAnalysis' }
-  | { type: 'analysisProcessing'; id: string }
-  | { type: 'analysisDone'; id: string }
   | { type: 'transcriptMode'; mode: TranscriptMode }
   | { type: 'targetLanguage'; language: string }
   | { type: 'h3DialogueMode'; mode: H3DialogueMode }
@@ -54,13 +55,14 @@ type Action =
   | { type: 'resolution'; value: Conversation['resolution'] }
   | { type: 'fit'; value: Conversation['fit'] }
   | { type: 'startGeneration' }
-  | { type: 'generationTick'; id: string }
   | { type: 'startPost' }
-  | { type: 'postDone'; id: string };
+  | { type: 'tick' };
 
 const shared = {
-  sourceMode: 'link' as const,
+  sourceMode: 'upload' as const,
+  sourceUrl: '',
   analysisStatus: 'done' as const,
+  analysisTicks: 0,
   transcriptMode: 'keep' as const,
   targetLanguage: 'English',
   h3DialogueMode: 'auto' as const,
@@ -72,9 +74,10 @@ const shared = {
   fit: 'crop' as const,
   simulatingGeneration: false,
   postStatus: 'idle' as const,
+  postTicks: 0,
 };
 
-const initialState: State = {
+const initialState: MockState = {
   activeId: 'analysis-ready',
   nextId: 1,
   conversations: [
@@ -84,7 +87,7 @@ const initialState: State = {
       title: '分析完成待生成',
       group: '今天',
       phase: 'analysisDone',
-      sourceValue: '城市咖啡新品短片.mp4',
+      uploadFileName: '城市咖啡新品短片.mp4',
       generationStatus: 'idle',
       segmentsDone: 0,
     },
@@ -94,7 +97,7 @@ const initialState: State = {
       title: '长视频分片生成中',
       group: '今天',
       phase: 'generating',
-      sourceValue: '城市漫游长片.mp4',
+      uploadFileName: '城市漫游长片.mp4',
       aspect: '9:16',
       resolution: '768p',
       fit: 'pad',
@@ -107,14 +110,17 @@ const initialState: State = {
       title: '最终成片完成',
       group: '最近 7 天',
       phase: 'complete',
-      sourceValue: '秋日护肤品牌片.mp4',
+      uploadFileName: '秋日护肤品牌片.mp4',
       generationStatus: 'succeeded',
       segmentsDone: 4,
     },
   ],
 };
 
-function updateActive(state: State, updater: (item: Conversation) => Conversation): State {
+function updateActive(
+  state: MockState,
+  updater: (item: Conversation) => Conversation,
+): MockState {
   return {
     ...state,
     conversations: state.conversations.map((item) =>
@@ -123,18 +129,7 @@ function updateActive(state: State, updater: (item: Conversation) => Conversatio
   };
 }
 
-function updateById(
-  state: State,
-  id: string,
-  updater: (item: Conversation) => Conversation,
-): State {
-  return {
-    ...state,
-    conversations: state.conversations.map((item) => (item.id === id ? updater(item) : item)),
-  };
-}
-
-function reducer(state: State, action: Action): State {
+export function mockReducer(state: MockState, action: Action): MockState {
   switch (action.type) {
     case 'select':
       return state.conversations.some((item) => item.id === action.id)
@@ -148,8 +143,11 @@ function reducer(state: State, action: Action): State {
         title: `新视频任务 ${state.nextId}`,
         group: '今天',
         phase: 'draft',
-        sourceValue: '',
+        sourceMode: 'link',
+        sourceUrl: '',
+        uploadFileName: '',
         analysisStatus: 'idle',
+        analysisTicks: 0,
         prompt: '',
         generationStatus: 'idle',
         segmentsDone: 0,
@@ -161,36 +159,29 @@ function reducer(state: State, action: Action): State {
       };
     }
     case 'sourceMode':
-      return updateActive(state, (item) => ({
-        ...item,
-        sourceMode: action.mode,
-        sourceValue: action.mode === 'link' ? item.sourceValue : '',
-      }));
-    case 'sourceValue':
-      return updateActive(state, (item) => ({ ...item, sourceValue: action.value }));
-    case 'file':
-      return updateActive(state, (item) => ({ ...item, sourceValue: action.name }));
-    case 'submitAnalysis':
-      return updateActive(state, (item) => {
-        if (item.analysisStatus !== 'idle' || !item.sourceValue.trim()) return item;
-        return { ...item, analysisStatus: 'queued' };
-      });
-    case 'analysisProcessing':
-      return updateById(state, action.id, (item) =>
-        item.analysisStatus === 'queued' ? { ...item, analysisStatus: 'processing' } : item,
-      );
-    case 'analysisDone':
-      return updateById(state, action.id, (item) =>
-        item.analysisStatus === 'processing'
-          ? {
-              ...item,
-              phase: 'analysisDone',
-              analysisStatus: 'done',
-              title: '本地视频分析',
-              prompt: shared.prompt,
-            }
+      return updateActive(state, (item) =>
+        item.phase === 'draft' && item.analysisStatus === 'idle'
+          ? { ...item, sourceMode: action.mode }
           : item,
       );
+    case 'sourceUrl':
+      return updateActive(state, (item) =>
+        item.phase === 'draft' && item.analysisStatus === 'idle'
+          ? { ...item, sourceUrl: action.value }
+          : item,
+      );
+    case 'file':
+      return updateActive(state, (item) =>
+        item.phase === 'draft' && item.analysisStatus === 'idle'
+          ? { ...item, uploadFileName: action.name }
+          : item,
+      );
+    case 'submitAnalysis':
+      return updateActive(state, (item) => {
+        const selectedSource = item.sourceMode === 'link' ? item.sourceUrl : item.uploadFileName;
+        if (item.analysisStatus !== 'idle' || !selectedSource.trim()) return item;
+        return { ...item, analysisStatus: 'queued', analysisTicks: 0 };
+      });
     case 'transcriptMode':
       return updateActive(state, (item) =>
         item.phase === 'draft' && item.analysisStatus === 'idle'
@@ -216,7 +207,11 @@ function reducer(state: State, action: Action): State {
           : item,
       );
     case 'prompt':
-      return updateActive(state, (item) => ({ ...item, prompt: action.prompt }));
+      return updateActive(state, (item) =>
+        item.phase === 'analysisDone' && item.generationStatus === 'idle'
+          ? { ...item, prompt: action.prompt }
+          : item,
+      );
     case 'aspect':
       return updateActive(state, (item) =>
         item.generationStatus === 'idle' ? { ...item, aspect: action.value } : item,
@@ -244,35 +239,70 @@ function reducer(state: State, action: Action): State {
           simulatingGeneration: true,
         };
       });
-    case 'generationTick':
-      return updateById(state, action.id, (item) => {
-        if (item.generationStatus !== 'running' || !item.simulatingGeneration) return item;
-        const segmentsDone = Math.min(item.segmentsDone + 1, 4);
-        if (segmentsDone === 4) {
-          return {
-            ...item,
-            phase: 'complete',
-            generationStatus: 'succeeded',
-            segmentsDone,
-            simulatingGeneration: false,
-          };
-        }
-        return { ...item, segmentsDone };
-      });
     case 'startPost':
       return updateActive(state, (item) => {
         if (item.phase === 'draft' || item.analysisStatus !== 'done' || item.postStatus !== 'idle') return item;
-        return { ...item, postStatus: 'running' };
+        return { ...item, postStatus: 'running', postTicks: 0 };
       });
-    case 'postDone':
-      return updateById(state, action.id, (item) =>
-        item.postStatus === 'running' ? { ...item, postStatus: 'succeeded' } : item,
-      );
+    case 'tick':
+      {
+        let changed = false;
+        const conversations = state.conversations.map((item) => {
+          let next = item;
+
+          if (next.analysisStatus === 'queued') {
+            next = { ...next, analysisStatus: 'processing', analysisTicks: 1 };
+          } else if (next.analysisStatus === 'processing') {
+            const analysisTicks = next.analysisTicks + 1;
+            next = analysisTicks >= 3
+              ? {
+                  ...next,
+                  phase: 'analysisDone',
+                  analysisStatus: 'done',
+                  analysisTicks,
+                  title: '本地视频分析',
+                  prompt: shared.prompt,
+                }
+              : { ...next, analysisTicks };
+          }
+
+          if (next.generationStatus === 'running' && next.simulatingGeneration) {
+            const segmentsDone = Math.min(next.segmentsDone + 1, 4);
+            next = segmentsDone === 4
+              ? {
+                  ...next,
+                  phase: 'complete',
+                  generationStatus: 'succeeded',
+                  segmentsDone,
+                  simulatingGeneration: false,
+                }
+              : { ...next, segmentsDone };
+          }
+
+          if (next.postStatus === 'running') {
+            const postTicks = next.postTicks + 1;
+            next = postTicks >= 3
+              ? { ...next, postStatus: 'succeeded', postTicks }
+              : { ...next, postTicks };
+          }
+
+          changed ||= next !== item;
+          return next;
+        });
+        return changed ? { ...state, conversations } : state;
+      }
   }
 }
 
+export function getInitialMockState(): MockState {
+  return {
+    ...initialState,
+    conversations: initialState.conversations.map((item) => ({ ...item })),
+  };
+}
+
 export function useMockStore() {
-  const [state, dispatch] = useReducer(reducer, initialState);
+  const [state, dispatch] = useReducer(mockReducer, undefined, getInitialMockState);
   const active = state.conversations.find((item) => item.id === state.activeId)!;
   return { state, active, dispatch };
 }
