@@ -24,6 +24,7 @@ const state = {
   ppDetail: null,      // 后处理弹窗对应的会话详情
   ppAskDismissed: {},  // cid → true：后处理入口消息已点「否」（会话内记忆，重渲染不复活）
   ppResultExpanded: {}, // cid → 后处理结果是否由用户展开；轮询重渲染时保留，切会话重置
+  segmentProductsExpanded: {}, // cid → 分段产物是否由用户展开；轮询重渲染时保留，切会话重置
   generationDrafts: {}, // cid → 最终视频表单草稿；轮询重渲染时保留用户输入
   generationSubmitting: {}, // cid → true：本页已有 /submit 请求在途，阻止重复提交
   detailSig: null,     // 当前已渲染详情的状态签名：轮询比对，签名不变不碰 DOM（根治轮询闪烁）
@@ -354,6 +355,10 @@ function releaseTrackedURL(
   revoke(url);
 }
 
+function releaseTrackedURLs(urls, release = releaseTrackedURL) {
+  for (const url of urls.splice(0)) release(url);
+}
+
 /* ===== API ===== */
 async function api(path, options = {}) {
   const headers = Object.assign({}, options.headers);
@@ -469,7 +474,10 @@ function enterApp() {
 async function refreshList(autoSelect) {
   try {
     const list = await apiJSON("/api/conversations");
-    state.conversations = Array.isArray(list) ? list : [];
+    state.conversations = mergeConversationList(
+      Array.isArray(list) ? list : [],
+      state.conversations,
+    );
     renderList();
     if (autoSelect && state.conversations.length > 0 && !state.currentId) {
       selectConversation(state.conversations[0].id);
@@ -478,6 +486,34 @@ async function refreshList(autoSelect) {
     if (handleAuthError(err)) return;
     renderListError(err.message);
   }
+}
+
+function mergeConversationList(incoming, previous) {
+  const previousById = new Map((previous || []).map((item) => [item.id, item]));
+  return incoming.map((item) => {
+    const known = previousById.get(item.id);
+    if (!known) return item;
+    const merged = Object.assign({}, item);
+    for (const field of ["generation", "navigation_status"]) {
+      if (!Object.prototype.hasOwnProperty.call(item, field)
+          && Object.prototype.hasOwnProperty.call(known, field)) {
+        merged[field] = known[field];
+      }
+    }
+    return merged;
+  });
+}
+
+function syncConversationDetail(conversations, detail) {
+  const summary = conversations.find((item) => item.id === detail.id);
+  if (!summary) return false;
+  summary.status = detail.status;
+  summary.has_video = detail.has_video === true;
+  summary.generation = detail.generation || null;
+  if (Object.prototype.hasOwnProperty.call(detail, "navigation_status")) {
+    summary.navigation_status = detail.navigation_status;
+  }
+  return true;
 }
 
 function renderList() {
@@ -492,7 +528,8 @@ function renderList() {
     item.type = "button";
     item.appendChild(el("span", "conv-title", c.title || "未命名会话"));
     const meta = el("span", "conv-meta");
-    const badge = el("span", "badge " + (c.status || "queued"), STATUS_TEXT[c.status] || c.status || "");
+    const badgeState = conversationBadge(c);
+    const badge = el("span", "badge " + badgeState.className, badgeState.text);
     meta.appendChild(badge);
     meta.appendChild(el("span", "conv-time", fmtTime(c.created_at)));
     item.appendChild(meta);
@@ -502,6 +539,56 @@ function renderList() {
     });
     nav.appendChild(item);
   }
+}
+
+function conversationBadge(conversation) {
+  const item = conversation || {};
+  const navigationBadges = {
+    analysis_queued: { className: "queued", text: "分析排队中" },
+    analysis_processing: { className: "processing", text: "分析中" },
+    analysis_failed: { className: "failed", text: "分析失败" },
+    analysis_unknown: { className: "failed", text: "分析状态未知" },
+    analysis_complete: { className: "analyzed", text: "分析完成" },
+    generation_queued: { className: "processing", text: "生成排队中" },
+    generation_running: { className: "processing", text: "生成中" },
+    generation_failed: { className: "failed", text: "生成失败" },
+    generation_submission_unknown: { className: "failed", text: "提交结果未知" },
+    generation_resume_required: { className: "failed", text: "等待继续" },
+    generation_unknown: { className: "failed", text: "生成状态未知" },
+    output_missing: { className: "failed", text: "最终视频缺失" },
+    completed: { className: "done", text: "已完成" },
+    postprocessing: { className: "processing", text: "素材优化中" },
+    postprocess_failed: { className: "failed", text: "素材优化失败" },
+    postprocess_done: { className: "analyzed", text: "素材优化完成" },
+  };
+  if (item.navigation_status) {
+    return navigationBadges[item.navigation_status]
+      || { className: "failed", text: "状态异常" };
+  }
+
+  const generationStatus = item.generation && item.generation.status;
+  const generationBadges = {
+    queued: { className: "processing", text: "生成排队中" },
+    running: { className: "processing", text: "生成中" },
+    failed: { className: "failed", text: "生成失败" },
+    submission_unknown: { className: "failed", text: "提交结果未知" },
+    resume_required: { className: "failed", text: "等待继续" },
+  };
+  if (generationBadges[generationStatus]) return generationBadges[generationStatus];
+  if (generationStatus === "succeeded") {
+    return item.has_video === true
+      ? { className: "analyzed", text: "分析完成" }
+      : { className: "failed", text: "最终视频缺失" };
+  }
+  if (generationStatus) return { className: "failed", text: "生成状态未知" };
+
+  if (item.status === "done") {
+    // 缺少 generation 契约时无法证明生成成功，安全降级为分析完成。
+    return { className: "analyzed", text: "分析完成" };
+  }
+  if (item.status === "failed") return { className: "failed", text: "失败" };
+  if (item.status === "processing") return { className: "processing", text: "处理中" };
+  return { className: "queued", text: STATUS_TEXT[item.status] || item.status || "排队中" };
 }
 
 function renderListError(msg) {
@@ -696,7 +783,7 @@ function renderResults(detail) {
   // 多段模式：逐段渲染「第 N 段」卡片；单段模式保持现有逻辑
   const segments = Array.isArray(detail.segments) ? detail.segments : [];
   if (segments.length > 0) {
-    frag.appendChild(renderSegments(detail));
+    frag.appendChild(segmentProductsDisclosure(detail));
   } else {
     const names = Array.isArray(detail.keyframes) ? detail.keyframes : [];
     if (names.length > 0) {
@@ -1154,6 +1241,7 @@ function kfGrid(detail, names, pathPrefix, altPrefix, options = {}) {
           releaseTrackedURL(url);
           return;
         }
+        if (options.onURL) options.onURL(url);
         img.src = url;
         img.addEventListener("load", () => {
           fig.classList.remove("shimmer");
@@ -1192,6 +1280,11 @@ function createDisclosure(labels, buildContent, options = {}) {
     const expanded = panel.hidden;
     if (expanded) ensureContent();
     setDisclosureState(button, panel, expanded, labels);
+    if (!expanded && rendered && options.onDispose) {
+      options.onDispose(panel);
+      panel.textContent = "";
+      rendered = false;
+    }
     if (options.onChange) options.onChange(expanded);
   });
   wrap.appendChild(button);
@@ -1370,6 +1463,7 @@ function keyframesSection(detail) {
 
 /* 多段模式：逐段「第 N 段」卡片（段关键帧 grid + 段提示词 + 段台词） */
 function renderSegments(detail) {
+  const mediaURLs = arguments[1] || [];
   const frag = document.createDocumentFragment();
   const headSec = el("section", "res-section");
   const h = el("h3", "res-h3", "分段产物");
@@ -1390,7 +1484,7 @@ function renderSegments(detail) {
         names,
         "segments/" + n + "/work/keyframes",
         "第 " + n + " 段关键帧 ",
-        { compact: true, expandable: true },
+        { compact: true, expandable: true, onURL: (url) => mediaURLs.push(url) },
       ));
     }
     if (seg.prompt) {
@@ -1404,6 +1498,34 @@ function renderSegments(detail) {
     frag.appendChild(card);
   }
   return frag;
+}
+
+function resetSegmentProductsDisclosure(id) {
+  delete state.segmentProductsExpanded[id];
+}
+
+function segmentProductsDisclosure(detail, buildContent = null) {
+  const mediaURLs = [];
+  const labels = {
+    expand: "展开分段产物",
+    collapse: "收起分段产物",
+    expandText: "展开分段产物",
+    collapseText: "收起分段产物",
+  };
+  return createDisclosure(labels, buildContent || (() => renderSegments(detail, mediaURLs)), {
+    idPrefix: "segment-products",
+    wrapClass: "segment-products-disclosure",
+    buttonClass: "btn btn-primary segment-products-toggle",
+    panelClass: "segment-products-panel",
+    expanded: state.segmentProductsExpanded[detail.id] === true,
+    onChange: (expanded) => { state.segmentProductsExpanded[detail.id] = expanded; },
+    onDispose: (panel) => {
+      if (activeLightboxDisclosure && panel.contains(activeLightboxDisclosure)) {
+        closeLightbox({ restoreFocus: false });
+      }
+      releaseTrackedURLs(mediaURLs);
+    },
+  });
 }
 
 /* 关键帧放大查看：点击开、点任意处或 Esc 关 */
@@ -1852,6 +1974,7 @@ async function loadDetail(id, silent) {
       state.generationSubmitting[id] = false;
     }
     state.detail = detail;
+    if (syncConversationDetail(state.conversations, detail)) renderList();
     const sig = detailSignature(detail);
     if (!silent) {
       // 手动切换 / 首次进入：全量渲染照旧
@@ -1894,6 +2017,7 @@ async function loadDetail(id, silent) {
 function selectConversation(id) {
   if (state.uploading) return; // 上传中不切换，避免打断
   delete state.ppResultExpanded[id];
+  resetSegmentProductsDisclosure(id);
   state.currentId = id;
   const conv = state.conversations.find((c) => c.id === id);
   $("main-title").textContent = (conv && conv.title) || "会话";
@@ -2250,6 +2374,7 @@ if (typeof module !== "undefined" && module.exports) {
     canOperate,
     clearStream,
     closeLightbox,
+    conversationBadge,
     createDisclosure,
     detailSignature,
     formatDialogueLines,
@@ -2258,15 +2383,20 @@ if (typeof module !== "undefined" && module.exports) {
     generationRetryContract,
     generationSegmentLabel,
     longVideoContract,
+    mergeConversationList,
     normalizeDialogueLines,
     parseDialogueLines,
     openLightbox,
+    releaseTrackedURLs,
     releaseTrackedURL,
+    resetSegmentProductsDisclosure,
     recoverLockedPostprocess,
     recoverPromptChanged,
     runSingleFlightPollCycle,
+    segmentProductsDisclosure,
     setDisclosureState,
     showActionError,
+    syncConversationDetail,
   };
 }
 

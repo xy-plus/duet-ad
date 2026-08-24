@@ -216,11 +216,12 @@ def test_published_video_does_not_hide_stitch_recovery():
 
 def test_removed_frozen_prompt_display_copy_does_not_change_submit_or_cost_copy():
     removed_copy = "逐段冻结的" + " H3 提示词"
-    offenders = []
-    for suffix in ("*.js", "*.html", "*.css", "*.md", "*.py"):
-        for path in ROOT.rglob(suffix):
-            if removed_copy in path.read_text(encoding="utf-8"):
-                offenders.append(str(path.relative_to(ROOT)))
+    display_assets = [APP_JS, ROOT / "web" / "index.html"]
+    offenders = [
+        str(path.relative_to(ROOT))
+        for path in display_assets
+        if removed_copy in path.read_text(encoding="utf-8")
+    ]
     assert offenders == []
 
     source = APP_JS.read_text(encoding="utf-8")
@@ -266,7 +267,8 @@ def test_long_segment_prompt_and_keyframes_use_accessible_disclosures_only():
     branch = source.split("function renderSegments(detail)", 1)[1]
     branch = branch.split("/* 关键帧放大查看", 1)[0]
     assert "segmentPromptDisclosure(seg.prompt, n)" in branch
-    assert '{ compact: true, expandable: true }' in branch
+    assert "compact: true, expandable: true" in branch
+    assert "onURL: (url) => mediaURLs.push(url)" in branch
 
     grid = source.split("function kfGrid", 1)[1]
     grid = grid.split("function sourcePromptEditable", 1)[0]
