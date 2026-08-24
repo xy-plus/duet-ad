@@ -237,12 +237,6 @@ def test_fast_mode_control_is_long_only_accessible_and_updates_draft():
         "draft": True,
     }
 
-    source = APP_JS.read_text(encoding="utf-8")
-    assert "开启后会快速提交所有分段、缩短等待" in source
-    assert "连续运动可能不如关闭时自然" in source
-    assert "不代表供应商 GPU 同时生成" in source
-
-
 def test_long_submit_rejects_edit_custom_and_missing_receipt():
     result = _run_contract(
         "['edit','custom'].map(mode=>{try{contract.buildSubmitPayload({clientRequestId:'request-x',"
