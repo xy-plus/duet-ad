@@ -324,13 +324,17 @@ def _long_fit_required(cdir: Path, meta: dict) -> bool:
             meta.get("dialogue_mode", "auto"),
             prepare_fit=False,
         )
-        return frame_fit.frames_require_fit(
+        return frame_fit.frame_bytes_require_fit(
             [
                 anchor
                 for segment in plan.segments
                 for anchor in (
-                    ((segment.first_frame,) if segment.join_mode == "hard_cut" else ())
-                    + (segment.last_frame,)
+                    (
+                        (segment.first_frame_data,)
+                        if segment.join_mode == "hard_cut"
+                        else ()
+                    )
+                    + (segment.last_frame_data,)
                 )
             ]
         )

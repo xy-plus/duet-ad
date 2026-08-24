@@ -638,6 +638,94 @@ def test_plan_freeze_failure_makes_zero_posts(enabled, monkeypatch):
     assert meta["generation"] is None
 
 
+def test_anchor_swap_before_bound_read_fails_sha_and_makes_zero_posts(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    anchor = (
+        settings.data_dir / cid / "work" / "segments" / "1"
+        / "work" / "anchors" / "first.png"
+    )
+    original = anchor.read_bytes()
+    replacement_path = anchor.with_name("replacement.png")
+    _png(replacement_path, 211)
+    replacement = replacement_path.read_bytes()
+    anchor.write_bytes(replacement)
+    real_read_bytes = Path.read_bytes
+    restored = False
+
+    def swap_then_restore(path):
+        nonlocal restored
+        data = real_read_bytes(path)
+        if path == anchor and not restored:
+            anchor.write_bytes(original)
+            restored = True
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", swap_then_restore)
+    calls = []
+    monkeypatch.setattr(h3, "start", lambda request: calls.append(request))
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "long_video_plan_invalid"}
+    assert restored is True
+    assert calls == []
+
+
+def test_anchor_swap_after_bound_read_cannot_change_paid_request_bytes(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    anchor = (
+        settings.data_dir / cid / "work" / "segments" / "1"
+        / "work" / "anchors" / "first.png"
+    )
+    original = anchor.read_bytes()
+    replacement_path = anchor.with_name("replacement.png")
+    _png(replacement_path, 233)
+    replacement = replacement_path.read_bytes()
+    real_read_bytes = Path.read_bytes
+    swapped = False
+
+    def snapshot_then_swap(path):
+        nonlocal swapped
+        data = real_read_bytes(path)
+        if path == anchor and not swapped:
+            anchor.write_bytes(replacement)
+            swapped = True
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", snapshot_then_swap)
+    seen = []
+
+    def start(request):
+        anchor.write_bytes(original)
+        seen.append(request)
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "task")
+
+    monkeypatch.setattr(h3, "start", start)
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt),
+    )
+
+    assert response.status_code == 202
+    assert swapped is True
+    assert len(seen) == 1
+    assert seen[0].first_frame[1] == original
+    assert seen[0].last_frame[1] != replacement
+
+
 def test_unknown_locks_batch_and_stops_continue_segment(enabled, monkeypatch):
     settings, client = enabled
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
@@ -1444,7 +1532,9 @@ def test_stitched_output_reuse_validates_receipt_bytes_and_target_duration(
             join_mode="hard_cut",
             workdir=segment_root,
             first_frame=anchor,
+            first_frame_data=b"unused",
             last_frame=anchor,
+            last_frame_data=b"unused",
             prompt="prompt",
         ),),
     )

@@ -100,7 +100,7 @@ flowchart LR
 
 长链不用短链 receipt 冒充多段输入。`long_video_plan.json`（`duet.long-video-plan` v1）绑定完整源文件、总时长、FL2VA workflow，以及每段的范围、chain/join、源片、关键帧、首尾锚点、视觉/最终提示词和台词摘要。detail 暴露该文件内容的 SHA-256 为 `plan_receipt`；提交必须原样回传 `expected_plan_receipt`。服务在任何供应商 POST 前重新校验 plan、meta 和所有文件哈希，并将确认值冻结到 `frozen_plan_receipt`。
 
-历史长会话若 `fit_required=null` 且尚未冻结提交，detail 与 submit 从通过路径和哈希校验的 plan anchors 纯派生，不由 GET 改写 meta；不完整或越界 plan 返回未知并在付费前拒绝。若会话已有 generation/frozen receipt，则以已冻结 `fit_mode` 投影有效值，保持 active、failed 和 resume 请求的原 CAS，不重写输入。
+历史长会话若 `fit_required=null` 且尚未冻结提交，detail 与 submit 从通过路径和哈希校验的 plan anchors 纯派生，不由 GET 改写 meta；不完整或越界 plan 返回未知并在付费前拒绝。plan、prompt 与 anchors 都以单次读取的 SHA-bound bytes 快照完成解析、比例判断、画幅派生和 H3 请求构造，路径随后变化不能替换已验证的付费输入。若会话已有 generation/frozen receipt，则以已冻结 `fit_mode` 投影有效值，保持 active、failed 和 resume 请求的原 CAS，不重写输入。
 
 同一镜头切出的 `continue` 段使用上一成功生成段的精确尾帧作为本段首帧，当前源片段末帧作为目标尾帧；`hard_cut` 段用自身源首尾锚点开始新链。每段都有统一连续性约束和本段局部提示词，但这只是最佳努力约束，不是供应商原生 extend，也不承诺逐帧无缝。
 

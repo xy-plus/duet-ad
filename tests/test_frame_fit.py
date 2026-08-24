@@ -68,3 +68,22 @@ def test_frames_require_fit_rejects_empty_or_undecodable_anchor_sets(tmp_path):
         frame_fit.frames_require_fit([])
     with pytest.raises(frame_fit.FrameFitError):
         frame_fit.frames_require_fit([broken])
+
+
+def test_frame_bytes_require_fit_uses_the_supplied_immutable_png_bytes(tmp_path):
+    portrait = tmp_path / "portrait.png"
+    landscape = tmp_path / "landscape.png"
+    _write(portrait, 90, 160)
+    _write(landscape, 160, 90)
+
+    assert frame_fit.frame_bytes_require_fit([portrait.read_bytes()]) is False
+    assert frame_fit.frame_bytes_require_fit(
+        [portrait.read_bytes(), landscape.read_bytes()]
+    ) is True
+
+
+def test_frame_bytes_require_fit_rejects_invalid_bytes():
+    with pytest.raises(frame_fit.FrameFitError):
+        frame_fit.frame_bytes_require_fit([])
+    with pytest.raises(frame_fit.FrameFitError):
+        frame_fit.frame_bytes_require_fit([b"not-png"])
