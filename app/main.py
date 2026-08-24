@@ -148,7 +148,7 @@ def _public_dialogue(meta: dict) -> dict:
     return {"mode": mode, "lines": effective, "auto_lines": automatic}
 
 
-def _public_generation(meta: dict, cdir: Path) -> dict | None:
+def _public_generation(meta: dict, cdir: Path, settings: Settings) -> dict | None:
     generation = meta.get("generation")
     if not isinstance(generation, dict):
         return None
@@ -168,20 +168,27 @@ def _public_generation(meta: dict, cdir: Path) -> dict | None:
     if isinstance(generation.get("segments"), list):
         public["segments"] = long_generation.public_segments(generation)
         if _is_long_video(meta) and status == "failed":
-            if public["stage"] == "stitch":
-                public["retry_paid_segment_count"] = 0
-            else:
-                frozen_segments = meta.get("segments")
-                if isinstance(frozen_segments, list):
-                    expected = tuple(range(1, len(frozen_segments) + 1))
-                    reusable = long_generation.reusable_segment_indices(
-                        expected,
-                        generation["segments"],
-                        lambda index: (
-                            cdir / "work" / "segments" / str(index) / "generated.mp4"
-                        ).is_file(),
-                    )
-                    public["retry_paid_segment_count"] = len(expected) - len(reusable)
+            frozen_segments = meta.get("segments")
+            if isinstance(frozen_segments, list):
+                expected = tuple(range(1, len(frozen_segments) + 1))
+                reusable = frozenset()
+                receipt = meta.get("frozen_plan_receipt")
+                if isinstance(receipt, str):
+                    try:
+                        plan = long_generation.freeze_plan(
+                            cdir,
+                            meta,
+                            receipt,
+                            meta.get("fit_mode"),
+                            meta.get("dialogue_mode"),
+                            prepare_fit=False,
+                        )
+                        reusable = long_generation.bound_reusable_segment_indices(
+                            settings, meta["id"], plan, generation
+                        )
+                    except long_generation.LongGenerationError:
+                        pass
+                public["retry_paid_segment_count"] = len(expected) - len(reusable)
     return public
 
 
@@ -678,7 +685,14 @@ def _generation_error(settings: Settings, cid: str, request: h3.H3Request, code:
         )
 
 
-def _run_generation(settings: Settings, cid: str, request: h3.H3Request, retry: bool) -> None:
+def _run_generation(
+    settings: Settings,
+    cid: str,
+    request: h3.H3Request,
+    action: str,
+) -> None:
+    if action not in {"start", "resume", "retry"}:
+        raise ValueError("invalid generation action")
     meta = storage.load_meta(settings.data_dir, cid)
     generation = meta.get("generation") if meta else None
     if not isinstance(generation, dict) or generation.get("client_request_id") != request.client_request_id:
@@ -689,8 +703,19 @@ def _run_generation(settings: Settings, cid: str, request: h3.H3Request, retry: 
         generation={**generation, "status": "running", "error": None},
     )
     try:
-        result = h3.retry(request, request.client_request_id) if retry else h3.start(request)
+        if action == "start":
+            result = h3.start(request)
+        elif action == "resume":
+            result = h3.resume(request)
+        else:
+            result = h3.retry(request, request.client_request_id)
+        if action == "resume" and result.status == "not_started":
+            _mark_submission_unknown(settings, cid, generation)
+            return
     except h3.H3Error as exc:
+        if action == "resume" and isinstance(exc, h3.ReceiptError):
+            _mark_submission_unknown(settings, cid, generation)
+            return
         _generation_error(settings, cid, request, exc.code)
         return
     except Exception:
@@ -717,7 +742,16 @@ def _resume_generation(settings: Settings, cid: str) -> None:
     if meta is None or _is_read_only(meta):
         return
     generation = meta.get("generation")
-    if not isinstance(generation, dict) or generation.get("status") not in _GENERATION_ACTIVE:
+    if not isinstance(generation, dict):
+        return
+    recovering_missing_output = (
+        generation.get("status") == "succeeded"
+        and not (settings.data_dir / cid / "generated.mp4").is_file()
+    )
+    if (
+        generation.get("status") not in _GENERATION_ACTIVE
+        and not recovering_missing_output
+    ):
         return
     if _is_legacy_generation_contract(generation):
         storage.update_meta(
@@ -754,7 +788,10 @@ def _resume_generation(settings: Settings, cid: str) -> None:
             # Fail closed: never expose the new-request-id retry path.
             _mark_submission_unknown(settings, cid, generation)
     else:
-        _finish_generation(settings, cid, request, result)
+        if result.status == "not_started":
+            _mark_submission_unknown(settings, cid, generation)
+        else:
+            _finish_generation(settings, cid, request, result)
 
 
 def _resume_long_generation(settings: Settings, cid: str) -> None:
@@ -774,6 +811,7 @@ def _resume_long_generation(settings: Settings, cid: str) -> None:
         plan = long_generation.freeze_plan(
             settings.data_dir / cid, meta, expected,
             meta.get("fit_mode"), meta.get("dialogue_mode"),
+            prepare_fit=False,
         )
     except Exception:
         storage.update_meta(
@@ -877,7 +915,15 @@ def create_app(settings: Settings) -> FastAPI:
             if (
                 meta.get("schema_version") == 2
                 and isinstance(generation, dict)
-                and generation.get("status") in _GENERATION_ACTIVE
+                and (
+                    generation.get("status") in _GENERATION_ACTIVE
+                    or (
+                        generation.get("status") == "succeeded"
+                        and not (
+                            settings.data_dir / meta["id"] / "generated.mp4"
+                        ).is_file()
+                    )
+                )
             ):
                 target = (
                     _resume_long_generation
@@ -1054,7 +1100,7 @@ def create_app(settings: Settings) -> FastAPI:
             "fit_mode": meta.get("fit_mode"),
             "dialogue": _public_dialogue(meta),
             "receipt_version": _receipt_version(cdir, meta),
-            "generation": _public_generation(meta, cdir),
+            "generation": _public_generation(meta, cdir, settings),
             "has_source": any(cdir.glob("source.*")),
             "has_video": (cdir / "generated.mp4").is_file(),
             "submit_enabled": settings.enable_h3_submit,
@@ -1171,11 +1217,18 @@ def create_app(settings: Settings) -> FastAPI:
                     and previous_id == request_id
                     and same_parameters
                 )
-                if (
-                    (settings.data_dir / cid / "generated.mp4").is_file()
-                    and not stitch_retry
-                ):
-                    raise HTTPException(status_code=409, detail="already submitted")
+                if (settings.data_dir / cid / "generated.mp4").is_file():
+                    if previous_status == "succeeded":
+                        if previous_id != request_id or not same_parameters:
+                            raise HTTPException(
+                                status_code=409, detail="already submitted"
+                            )
+                        return {
+                            "status": "succeeded",
+                            "attempt": old.get("attempt"),
+                        }
+                    if not stitch_retry:
+                        raise HTTPException(status_code=409, detail="already submitted")
                 if previous_status == "failed" and not same_parameters:
                     raise HTTPException(status_code=409, detail="resume_parameters_changed")
                 claim_owner = None
@@ -1191,10 +1244,21 @@ def create_app(settings: Settings) -> FastAPI:
                         expected_receipt,
                         fit_mode,
                         dialogue_mode,
+                        prepare_fit=not isinstance(old, dict),
                     )
                 except long_generation.LongGenerationError as exc:
                     if claim_owner:
                         _finish_submission_claim(settings, cid, claim_owner)
+                    if previous_status in {"resume_required", "succeeded"} or (
+                        previous_status == "failed"
+                        and isinstance(old, dict)
+                        and old.get("stage") == "stitch"
+                    ):
+                        _mark_submission_unknown(settings, cid, old)
+                        raise HTTPException(
+                            status_code=409,
+                            detail="submission_outcome_unknown",
+                        ) from exc
                     raise HTTPException(status_code=exc.status, detail=exc.code) from exc
                 except BaseException:
                     if claim_owner:
@@ -1208,7 +1272,19 @@ def create_app(settings: Settings) -> FastAPI:
                     background_tasks.add_task(long_generation.run, settings, cid, plan)
                     return {"status": "queued", "attempt": old.get("attempt")}
                 if previous_status == "succeeded":
-                    raise HTTPException(status_code=409, detail="already submitted")
+                    if previous_id != request_id or not same_parameters:
+                        raise HTTPException(
+                            status_code=409, detail="resume_parameters_changed"
+                        )
+                    storage.update_meta(
+                        settings.data_dir,
+                        cid,
+                        generation={**old, "status": "queued", "error": None},
+                    )
+                    background_tasks.add_task(
+                        long_generation.run, settings, cid, plan
+                    )
+                    return {"status": "queued", "attempt": old.get("attempt")}
                 if previous_status == "failed" and old.get("stage") == "stitch":
                     if previous_id != request_id or not same_parameters:
                         raise HTTPException(status_code=409, detail="resume_parameters_changed")
@@ -1223,7 +1299,8 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail="generation_state_invalid")
                 attempt = previous_attempt + 1
                 generation = long_generation.initial_generation(
-                    plan, request_id, attempt, old if isinstance(old, dict) else None
+                    settings, cid, plan, request_id, attempt,
+                    old if isinstance(old, dict) else None,
                 )
                 changes = dict(
                     dialogue_mode=dialogue_mode,
@@ -1260,9 +1337,15 @@ def create_app(settings: Settings) -> FastAPI:
             meta = storage.load_meta(settings.data_dir, cid)
             if meta is None:
                 raise HTTPException(status_code=404, detail="not found")
-            if (settings.data_dir / cid / "generated.mp4").is_file():
-                raise HTTPException(status_code=409, detail="already submitted")
             generation = meta.get("generation")
+            if (
+                (settings.data_dir / cid / "generated.mp4").is_file()
+                and not (
+                    isinstance(generation, dict)
+                    and generation.get("status") == "succeeded"
+                )
+            ):
+                raise HTTPException(status_code=409, detail="already submitted")
             previous_status = None
             if isinstance(generation, dict):
                 previous_status = _effective_generation_status(generation)
@@ -1278,6 +1361,54 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail="generation_state_invalid")
                 if previous_status in _GENERATION_ACTIVE or previous_status == "succeeded":
                     if previous_id == request_id:
+                        if previous_status == "succeeded":
+                            expected_dialogue = meta.get("prepared_dialogue")
+                            if (
+                                meta.get("dialogue_mode") != payload["dialogue_mode"]
+                                or meta.get("fit_mode") != fit_mode
+                                or not isinstance(expected_dialogue, list)
+                                or expected_dialogue != [dict(line) for line in dialogue]
+                            ):
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="resume_parameters_changed",
+                                )
+                            try:
+                                request = await asyncio.to_thread(
+                                    _load_h3_request, settings, cid, meta
+                                )
+                            except (_SubmitError, h3.H3Error) as exc:
+                                _mark_submission_unknown(settings, cid, generation)
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="submission_outcome_unknown",
+                                ) from exc
+                            if h3.output_is_reusable(request):
+                                return {
+                                    "status": "succeeded",
+                                    "attempt": generation.get("attempt"),
+                                }
+                            storage.update_meta(
+                                settings.data_dir,
+                                cid,
+                                generation={
+                                    **generation,
+                                    "status": "queued",
+                                    "error": None,
+                                    "stage": "h3",
+                                },
+                            )
+                            background_tasks.add_task(
+                                _run_generation,
+                                settings,
+                                cid,
+                                request,
+                                "resume",
+                            )
+                            return {
+                                "status": "queued",
+                                "attempt": generation.get("attempt"),
+                            }
                         return {
                             "status": previous_status,
                             "attempt": generation.get("attempt"),
@@ -1309,10 +1440,14 @@ def create_app(settings: Settings) -> FastAPI:
                             _load_h3_request, settings, cid, meta
                         )
                     except _SubmitError as exc:
-                        raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-                    except h3.H3Error as exc:
+                        _mark_submission_unknown(settings, cid, generation)
                         raise HTTPException(
-                            status_code=503, detail="h3_configuration_invalid"
+                            status_code=409, detail="submission_outcome_unknown"
+                        ) from exc
+                    except h3.H3Error as exc:
+                        _mark_submission_unknown(settings, cid, generation)
+                        raise HTTPException(
+                            status_code=409, detail="submission_outcome_unknown"
                         ) from exc
                     storage.update_meta(
                         settings.data_dir,
@@ -1325,10 +1460,15 @@ def create_app(settings: Settings) -> FastAPI:
                         },
                     )
                     background_tasks.add_task(
-                        _run_generation, settings, cid, request, False
+                        _run_generation, settings, cid, request, "resume"
                     )
                     return {"status": "queued", "attempt": previous_attempt}
-            retry = isinstance(generation, dict) and previous_status in _GENERATION_RETRYABLE
+            action = (
+                "retry"
+                if isinstance(generation, dict)
+                and previous_status in _GENERATION_RETRYABLE
+                else "start"
+            )
             previous_attempt = generation.get("attempt") if isinstance(generation, dict) else 0
             if (
                 isinstance(previous_attempt, bool)
@@ -1392,7 +1532,7 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             else:
                 storage.update_meta(settings.data_dir, cid, **changes)
-            background_tasks.add_task(_run_generation, settings, cid, request, retry)
+            background_tasks.add_task(_run_generation, settings, cid, request, action)
         return {"status": "queued", "attempt": attempt}
 
     @app.post("/api/conversations/{cid}/postprocess", dependencies=[Depends(require_auth)])

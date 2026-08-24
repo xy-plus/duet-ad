@@ -108,7 +108,7 @@ def _fit_anchor(path: Path, output: Path, fit_mode: str) -> Path:
 
 
 def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
-                dialogue_mode: str) -> FrozenPlan:
+                dialogue_mode: str, *, prepare_fit: bool = True) -> FrozenPlan:
     """Validate every immutable plan fact and pre-fit every source anchor."""
     root = Path(root).resolve()
     name = meta.get("long_video_plan_receipt")
@@ -248,8 +248,14 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         segdir = root / "work" / "segments" / str(index)
         fit_root = segdir / "work" / "h3_frames" / fit_mode
         # Complete all static transformations before the caller can make a POST.
-        first = _fit_anchor(first_source, fit_root / "first", fit_mode)
-        last = _fit_anchor(last_source, fit_root / "end", fit_mode)
+        if prepare_fit or fit_mode == "none":
+            first = _fit_anchor(first_source, fit_root / "first", fit_mode)
+            last = _fit_anchor(last_source, fit_root / "end", fit_mode)
+        else:
+            first = fit_root / "first" / first_source.name
+            last = fit_root / "end" / last_source.name
+            if not first.is_file() or not last.is_file():
+                raise LongGenerationError("frame_fit_failed")
         frozen.append(FrozenSegment(index, start_s, end_s, chain_id, join_mode,
                                     segdir, first, last, prompt))
         previous_end, previous_chain = end_s, chain_id
@@ -279,20 +285,31 @@ def _extract_last_frame(video: Path, output: Path) -> Path:
 
 
 def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
-             parent_id: str, fit_mode: str) -> h3.H3Request:
+             parent_id: str, fit_mode: str, *, frozen_child_id: str | None = None,
+             prepare_inputs: bool = True) -> h3.H3Request:
     first = segment.first_frame
     if segment.join_mode == "continue":
         upstream = plan.segments[segment.index - 2]
-        tail = _extract_last_frame(
-            upstream.workdir / "generated.mp4",
-            upstream.workdir / "work" / "generated_last.png",
-        )
-        first = _fit_anchor(tail, segment.workdir / "work" / "h3_frames" / fit_mode / "continued", fit_mode)
+        tail = upstream.workdir / "work" / "generated_last.png"
+        if not tail.is_file():
+            if not prepare_inputs:
+                raise LongGenerationError("long_video_tail_frame_missing")
+            tail = _extract_last_frame(upstream.workdir / "generated.mp4", tail)
+        continued = segment.workdir / "work" / "h3_frames" / fit_mode / "continued"
+        if prepare_inputs or fit_mode == "none":
+            first = _fit_anchor(tail, continued, fit_mode)
+        else:
+            first = continued / tail.name
+            if not first.is_file():
+                raise LongGenerationError("frame_fit_failed")
     first_data, last_data = first.read_bytes(), segment.last_frame.read_bytes()
     return h3.H3Request(
         cid=f"{cid}-segment-{segment.index}",
         workdir=segment.workdir,
-        client_request_id=child_request_id(parent_id, plan.receipt, segment.index),
+        client_request_id=(
+            frozen_child_id
+            or child_request_id(parent_id, plan.receipt, segment.index)
+        ),
         prompt=segment.prompt,
         keyframes=(),
         voice_texts=(),
@@ -375,15 +392,77 @@ def reusable_segment_indices(
     return frozenset(reusable)
 
 
-def initial_generation(plan: FrozenPlan, parent_id: str, attempt: int,
+def bound_reusable_segment_indices(
+    settings,
+    cid: str,
+    plan: FrozenPlan,
+    generation: Mapping,
+) -> frozenset[int]:
+    """Single source of truth for paid-count and execution reuse decisions."""
+    segments = generation.get("segments")
+    expected = tuple(item.index for item in plan.segments)
+    meta = storage.load_meta(settings.data_dir, cid)
+    fit_mode = meta.get("fit_mode") if isinstance(meta, dict) else None
+    if fit_mode not in {"none", "crop", "pad"}:
+        return frozenset()
+    by_index = {
+        item.get("index"): item for item in segments or [] if isinstance(item, dict)
+    }
+    reusable: set[int] = set()
+
+    def valid(index: int) -> bool:
+        item = by_index.get(index)
+        segment = plan.segments[index - 1]
+        if not isinstance(item, dict):
+            return False
+        attempt = item.get("attempt")
+        child_id = item.get("child_request_id")
+        if (
+            item.get("status") != "succeeded"
+            or isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or attempt <= 0
+            or not isinstance(child_id, str)
+            or not child_id
+            or (
+                segment.join_mode == "continue"
+                and segment.index - 1 not in reusable
+            )
+        ):
+            return False
+        try:
+            request = _request(
+                settings, cid, plan, segment,
+                str(generation.get("client_request_id") or "frozen-parent"),
+                fit_mode,
+                frozen_child_id=child_id,
+                prepare_inputs=False,
+            )
+            return h3.output_is_reusable(
+                request, expected_duration_s=request.duration
+            )
+        except (OSError, h3.H3Error, LongGenerationError, ValueError):
+            return False
+
+    structurally_valid = reusable_segment_indices(expected, segments, lambda _index: True)
+    if structurally_valid != frozenset(
+        item.get("index") for item in segments or []
+        if isinstance(item, dict) and item.get("status") == "succeeded"
+    ):
+        return frozenset()
+    for index in expected:
+        if valid(index):
+            reusable.add(index)
+    return frozenset(reusable)
+
+
+def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, attempt: int,
                        old: Mapping | None = None) -> dict:
     plan_by_index = {segment.index: segment for segment in plan.segments}
     raw_old_segments = (old or {}).get("segments", [])
     old_segments = raw_old_segments if isinstance(raw_old_segments, list) else []
-    reusable = reusable_segment_indices(
-        tuple(plan_by_index),
-        old_segments,
-        lambda index: (plan_by_index[index].workdir / "generated.mp4").is_file(),
+    reusable = bound_reusable_segment_indices(
+        settings, cid, plan, old or {"segments": []}
     )
     old_by_index = {
         item.get("index"): item for item in old_segments
@@ -437,6 +516,14 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                       "status": status or generation.get("status"), "error": error, "stage": stage}
         storage.update_meta(settings.data_dir, cid, generation=generation)
 
+    reusable = bound_reusable_segment_indices(settings, cid, plan, generation)
+    for index, state in states.items():
+        if state.get("status") == "succeeded" and index not in reusable:
+            state.update(
+                status="failed",
+                error="long_video_segment_output_invalid",
+            )
+
     if startup:
         for segment in plan.segments:
             state = states[segment.index]
@@ -445,7 +532,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             try:
                 request = _request(settings, cid, plan, segment, parent_id, fit_mode)
                 result = h3.resume(request)
-                state["status"], state["error"] = _result_status(result)
+                if result.status == "not_started":
+                    state["status"], state["error"] = (
+                        "submission_unknown", "submission_unknown"
+                    )
+                else:
+                    state["status"], state["error"] = _result_status(result)
             except Exception:
                 state["status"], state["error"] = "submission_unknown", "submission_unknown"
         if any(item.get("status") == "submission_unknown" for item in states.values()):
@@ -488,7 +580,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 break
         return candidates
 
-    def worker(segment: FrozenSegment):
+    def worker(segment: FrozenSegment, action: str):
         try:
             request = _request(settings, cid, plan, segment, parent_id, fit_mode)
         except LongGenerationError as exc:
@@ -496,8 +588,17 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         except Exception:
             return None, ("failed", "long_video_request_invalid")
         try:
-            result = h3.start(request)
-            return request.client_request_id, _result_status(result)
+            result = h3.start(request) if action == "start" else h3.resume(request)
+            if action == "resume" and result.status == "not_started":
+                return request.client_request_id, (
+                    "submission_unknown", "submission_unknown"
+                )
+            status = _result_status(result)
+            if status[0] == "succeeded" and not h3.output_is_reusable(
+                request, expected_duration_s=request.duration
+            ):
+                status = ("failed", "long_video_segment_output_invalid")
+            return request.client_request_id, status
         except h3.H3Error as exc:
             try:
                 inspected = h3.inspect(request)
@@ -523,12 +624,13 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                         continue
                     state = states[segment.index]
                     is_new_child = state.get("status") == "not_started"
+                    action = "start" if is_new_child else "resume"
                     state["status"], state["error"] = "running", None
                     if is_new_child:
                         state["attempt"] = int(state.get("attempt", 0) or 0) + 1
                     attempted_indices.add(segment.index)
                     persist("running", None)
-                    future = pool.submit(worker, segment)
+                    future = pool.submit(worker, segment, action)
                     active[future] = segment
                     active_chains.add(segment.chain_id)
             if not active:

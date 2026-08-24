@@ -515,13 +515,19 @@ def test_resume_required_reuses_same_id_and_receipt(enabled, monkeypatch):
     seen = []
     def start(request):
         seen.append(request)
-        if len(seen) == 1:
-            return h3.H3Result(
-                "retryable_failure", "000001", retryable=True, error_code="h3_query_failed"
-            )
-        return h3.H3Result("failed", "000001", error_code="h3_provider_failed")
+        return h3.H3Result(
+            "retryable_failure", "000001", retryable=True, error_code="h3_query_failed"
+        )
 
     monkeypatch.setattr(h3, "start", start)
+    resumed_requests = []
+    monkeypatch.setattr(
+        h3,
+        "resume",
+        lambda request: resumed_requests.append(request)
+        or h3.H3Result("failed", "000001", error_code="h3_provider_failed"),
+    )
+    monkeypatch.setattr(h3, "retry", lambda *_a, **_kw: pytest.fail("resume must not retry"))
     assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload()).status_code == 202
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
     assert detail["generation"]["status"] == "resume_required"
@@ -531,8 +537,111 @@ def test_resume_required_reuses_same_id_and_receipt(enabled, monkeypatch):
     assert wrong.status_code == 409
     resumed = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload())
     assert resumed.status_code == 202
-    assert len(seen) == 2
-    assert all(request.client_request_id == REQUEST_ID for request in seen)
+    assert len(seen) == 1
+    assert len(resumed_requests) == 1
+    assert resumed_requests[0].client_request_id == REQUEST_ID
+
+
+def test_short_resume_required_missing_attempt_locks_unknown_without_post(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    _write_initial_receipt(settings, cid)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={
+            "status": "resume_required",
+            "error": "h3_query_failed",
+            "attempt": 1,
+            "client_request_id": REQUEST_ID,
+            "stage": "h3",
+        },
+        prepared_dialogue=[],
+        fit_mode="none",
+        dialogue_mode="auto",
+    )
+    calls = []
+    monkeypatch.setattr(h3, "start", lambda request: calls.append("start"))
+    monkeypatch.setattr(h3, "retry", lambda *args: calls.append("retry"))
+    monkeypatch.setattr(
+        h3, "resume",
+        lambda request: calls.append("resume") or h3.H3Result("not_started", None),
+    )
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(mode="auto"),
+    )
+    assert response.status_code == 202
+    assert calls == ["resume"]
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation["status"] == "submission_unknown"
+
+
+def test_short_succeeded_missing_output_redownloads_known_task_get_only(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    _write_initial_receipt(settings, cid)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={
+            "status": "succeeded",
+            "error": None,
+            "attempt": 1,
+            "client_request_id": REQUEST_ID,
+            "stage": "h3",
+        },
+        prepared_dialogue=[],
+        fit_mode="none",
+        dialogue_mode="auto",
+    )
+    calls = []
+    monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("must not POST"))
+    monkeypatch.setattr(h3, "retry", lambda *_args: pytest.fail("must not retry"))
+
+    def resume(request):
+        calls.append(request)
+        request.workdir.joinpath("generated.mp4").write_bytes(b"recovered")
+        return h3.H3Result(
+            "succeeded", "000001", output=request.workdir / "generated.mp4"
+        )
+
+    monkeypatch.setattr(h3, "resume", resume)
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(mode="auto"),
+    )
+    assert response.status_code == 202
+    assert len(calls) == 1
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+
+
+def test_short_resume_corrupt_receipt_converges_to_unknown(enabled):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    _write_initial_receipt(settings, cid)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={
+            "status": "resume_required",
+            "error": "h3_query_failed",
+            "attempt": 1,
+            "client_request_id": REQUEST_ID,
+            "stage": "h3",
+        },
+        prepared_dialogue=[],
+        fit_mode="none",
+        dialogue_mode="auto",
+    )
+    (settings.data_dir / cid / prepared_input.RECEIPT_FILENAME).write_text("broken")
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(mode="auto"),
+    )
+    assert response.status_code == 409
+    assert response.json() == {"detail": "submission_outcome_unknown"}
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "submission_unknown"
 
 
 @pytest.mark.parametrize("status", ["queued", "running", "succeeded"])
