@@ -4,7 +4,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from app import h3, storage
+from app import h3, main as main_module, storage
 from app.main import create_app
 from conftest import AUTH, make_settings
 
@@ -172,6 +172,30 @@ def test_current_attempt_cannot_use_legacy_compatibility(tmp_path, monkeypatch):
     monkeypatch.setattr(h3, "_probe_video_duration", lambda *_args: 10.0)
 
     assert _accept(root) is False
+
+
+def test_legacy_evidence_is_checked_after_strict_validator_returns_false(
+    tmp_path, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(
+        settings.data_dir, note="legacy", orig_name="legacy.mp4"
+    )
+    cid = meta["id"]
+    _write_legacy_success(settings.data_dir / cid, cid=cid)
+    generation = {
+        "status": "succeeded",
+        "error": None,
+        "attempt": 1,
+        "client_request_id": REQUEST_ID,
+        "stage": "h3",
+    }
+    meta = {**meta, "status": "done", "generation": generation}
+    monkeypatch.setattr(main_module, "_load_h3_request", lambda *_args: object())
+    monkeypatch.setattr(h3, "output_is_reusable", lambda *_args: False)
+    monkeypatch.setattr(h3, "_probe_video_duration", lambda *_args: 10.125)
+
+    assert main_module._validate_generated_video_uncached(settings, meta) is True
 
 
 def test_startup_and_list_preserve_valid_legacy_success_without_provider(
