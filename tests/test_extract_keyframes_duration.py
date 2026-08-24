@@ -46,3 +46,15 @@ def test_manifest_duration_uses_duration_ts_time_base(monkeypatch):
 
 def test_manifest_duration_uses_decoded_fallback_not_format(monkeypatch):
     assert _probe(monkeypatch, {}) == 20.0
+
+
+def test_manifest_duration_rejects_bool_duration_and_uses_ticks(monkeypatch):
+    assert _probe(monkeypatch, {
+        "duration": True, "duration_ts": "503", "time_base": "1/30",
+    }) == pytest.approx(503 / 30)
+
+
+def test_manifest_duration_rejects_bool_ticks_and_uses_decoded_fallback(monkeypatch):
+    assert _probe(monkeypatch, {
+        "duration": False, "duration_ts": True, "time_base": "1/30",
+    }) == 20.0

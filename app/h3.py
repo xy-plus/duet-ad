@@ -1203,13 +1203,19 @@ def _probe_video(path: Path, timeout_s: float) -> bool:
     if not isinstance(stream, dict) or stream.get("codec_type") != "video":
         return False
     try:
-        duration = float(stream.get("duration"))
+        raw_duration = stream.get("duration")
+        if isinstance(raw_duration, bool):
+            return False
+        duration = float(raw_duration)
         if math.isfinite(duration) and duration > 0:
             return True
     except (TypeError, ValueError):
         pass
     try:
-        ticks = float(stream.get("duration_ts"))
+        raw_duration_ts = stream.get("duration_ts")
+        if isinstance(raw_duration_ts, bool):
+            return False
+        ticks = float(raw_duration_ts)
         numerator, denominator = str(stream.get("time_base")).split("/", 1)
         duration = ticks * float(numerator) / float(denominator)
     except (TypeError, ValueError, ZeroDivisionError):

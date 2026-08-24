@@ -751,14 +751,22 @@ def test_run_status_sequence_processing_then_done(tmp_path, video_1s, fake_steps
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
     seen = []
-    orig = storage.update_meta
+    original_claim = storage.claim_pipeline_input
+    original_finish = storage.finish_input_claim
 
-    def recording(data_dir, cid, **changes):
+    def claim(data_dir, cid):
+        claimed = original_claim(data_dir, cid)
+        if claimed is not None:
+            seen.append(claimed["status"])
+        return claimed
+
+    def finish(data_dir, cid, owner, **changes):
         if "status" in changes:
             seen.append(changes["status"])
-        return orig(data_dir, cid, **changes)
+        return original_finish(data_dir, cid, owner, **changes)
 
-    monkeypatch.setattr(storage, "update_meta", recording)
+    monkeypatch.setattr(storage, "claim_pipeline_input", claim)
+    monkeypatch.setattr(storage, "finish_input_claim", finish)
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
     assert seen == ["processing", "done"]
 
