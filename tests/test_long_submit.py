@@ -694,7 +694,7 @@ def test_new_parent_retry_reextracts_continue_tail_instead_of_reusing_stale_file
 def test_resume_with_missing_frozen_continue_tail_fails_closed_without_post_or_extract(
     enabled, monkeypatch,
 ):
-    settings, _client = enabled
+    settings, client = enabled
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
     meta = storage.load_meta(settings.data_dir, cid)
     plan = long_generation.freeze_plan(
@@ -731,8 +731,19 @@ def test_resume_with_missing_frozen_continue_tail_fails_closed_without_post_or_e
     assert extracts == []
     assert starts == []
     assert resumes == []
-    assert stored["status"] == "failed"
-    assert stored["segments"][1]["error"] == "long_video_tail_frame_missing"
+    assert stored["status"] == "submission_unknown"
+    assert stored["segments"][1]["status"] == "submission_unknown"
+    assert stored["segments"][1]["error"] == "submission_unknown"
+
+    retry = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt, request_id="retry-after-missing-tail"),
+    )
+
+    assert retry.status_code == 409
+    assert retry.json() == {"detail": "submission_outcome_unknown"}
+    assert starts == []
 
 
 def test_plan_freeze_failure_makes_zero_posts(enabled, monkeypatch):

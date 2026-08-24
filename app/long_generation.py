@@ -789,8 +789,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 prepare_inputs=action == "start",
             )
         except LongGenerationError as exc:
+            if action == "resume":
+                return None, ("submission_unknown", "submission_unknown")
             return None, ("failed", exc.code)
         except Exception:
+            if action == "resume":
+                return None, ("submission_unknown", "submission_unknown")
             return None, ("failed", "long_video_request_invalid")
         try:
             result = h3.start(request) if action == "start" else h3.resume(request)
