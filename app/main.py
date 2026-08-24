@@ -580,6 +580,31 @@ def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
     return _make_h3_request(settings, cid, frozen, request_id)
 
 
+def _claim_first_submission(
+    settings: Settings, cid: str, request_id: str,
+) -> tuple[dict, str]:
+    owner = f"submit:{request_id}"
+    claimed = storage.claim_submission_input(settings.data_dir, cid, request_id)
+    if claimed is None:
+        current = storage.load_meta(settings.data_dir, cid)
+        detail = (
+            "artifacts not ready"
+            if current and current.get("status") != "done"
+            else "generation in progress"
+        )
+        raise HTTPException(status_code=409, detail=detail)
+    return claimed, owner
+
+
+def _finish_submission_claim(
+    settings: Settings, cid: str, owner: str, **changes,
+) -> None:
+    if storage.finish_input_claim(
+        settings.data_dir, cid, owner, **changes
+    ) is None:
+        raise HTTPException(status_code=409, detail="generation in progress")
+
+
 def _result_fields(result: h3.H3Result) -> tuple[str, str | None]:
     if result.status == "succeeded":
         return "succeeded", None
@@ -1078,6 +1103,11 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail="already submitted")
                 if previous_status == "failed" and not same_parameters:
                     raise HTTPException(status_code=409, detail="resume_parameters_changed")
+                claim_owner = None
+                if not isinstance(old, dict):
+                    meta, claim_owner = _claim_first_submission(
+                        settings, cid, request_id
+                    )
                 try:
                     plan = await asyncio.to_thread(
                         long_generation.freeze_plan,
@@ -1088,7 +1118,13 @@ def create_app(settings: Settings) -> FastAPI:
                         dialogue_mode,
                     )
                 except long_generation.LongGenerationError as exc:
+                    if claim_owner:
+                        _finish_submission_claim(settings, cid, claim_owner)
                     raise HTTPException(status_code=exc.status, detail=exc.code) from exc
+                except BaseException:
+                    if claim_owner:
+                        _finish_submission_claim(settings, cid, claim_owner)
+                    raise
                 if previous_status == "resume_required":
                     if previous_id != request_id:
                         raise HTTPException(status_code=409, detail="resume_request_id_mismatch")
@@ -1114,9 +1150,7 @@ def create_app(settings: Settings) -> FastAPI:
                 generation = long_generation.initial_generation(
                     plan, request_id, attempt, old if isinstance(old, dict) else None
                 )
-                storage.update_meta(
-                    settings.data_dir,
-                    cid,
+                changes = dict(
                     dialogue_mode=dialogue_mode,
                     voice_lines=[],
                     prepared_dialogue=[],
@@ -1124,6 +1158,12 @@ def create_app(settings: Settings) -> FastAPI:
                     frozen_plan_receipt=expected_receipt,
                     generation=generation,
                 )
+                if claim_owner:
+                    _finish_submission_claim(
+                        settings, cid, claim_owner, **changes
+                    )
+                else:
+                    storage.update_meta(settings.data_dir, cid, **changes)
                 background_tasks.add_task(long_generation.run, settings, cid, plan)
             return {"status": "queued", "attempt": attempt}
         try:
@@ -1223,6 +1263,11 @@ def create_app(settings: Settings) -> FastAPI:
                 raise HTTPException(status_code=409, detail="generation_state_invalid")
             attempt = previous_attempt + 1
             dialogue_mode = payload["dialogue_mode"]
+            claim_owner = None
+            if not isinstance(generation, dict):
+                meta, claim_owner = _claim_first_submission(
+                    settings, cid, request_id
+                )
             try:
                 request = await asyncio.to_thread(
                     _freeze_submission,
@@ -1235,9 +1280,17 @@ def create_app(settings: Settings) -> FastAPI:
                     dialogue,
                 )
             except _SubmitError as exc:
+                if claim_owner:
+                    _finish_submission_claim(settings, cid, claim_owner)
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             except h3.H3Error as exc:
+                if claim_owner:
+                    _finish_submission_claim(settings, cid, claim_owner)
                 raise HTTPException(status_code=503, detail="h3_configuration_invalid") from exc
+            except BaseException:
+                if claim_owner:
+                    _finish_submission_claim(settings, cid, claim_owner)
+                raise
             bare_lines = [
                 {key: line[key] for key in ("text", "start_s", "end_s")}
                 for line in dialogue
@@ -1249,9 +1302,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "client_request_id": request_id,
                 "stage": "h3",
             }
-            storage.update_meta(
-                settings.data_dir,
-                cid,
+            changes = dict(
                 dialogue_mode=dialogue_mode,
                 voice_lines=bare_lines,
                 prompt=request.prompt,
@@ -1260,6 +1311,12 @@ def create_app(settings: Settings) -> FastAPI:
                 fit_mode=fit_mode,
                 generation=generation,
             )
+            if claim_owner:
+                _finish_submission_claim(
+                    settings, cid, claim_owner, **changes
+                )
+            else:
+                storage.update_meta(settings.data_dir, cid, **changes)
             background_tasks.add_task(_run_generation, settings, cid, request, retry)
         return {"status": "queued", "attempt": attempt}
 

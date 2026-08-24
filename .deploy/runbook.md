@@ -217,7 +217,7 @@ RUN_PAID_SMOKE=1 .deploy/smoke-h3.sh "$SAMPLE_30"
 unset ACCESS_TOKEN
 ```
 
-非 9:16 样本默认使用 `pad`，可在人工确认内容可裁时加 `FIT_MODE=crop`。脚本默认台词模式为 `auto`；无音轨同样合法。长视频只允许 `DIALOGUE_MODE=auto|none`，其中 auto 复用完整源音轨，none 输出静音。
+非 9:16 样本默认使用 `pad`，可在人工确认内容可裁时加 `FIT_MODE=crop`。脚本默认台词模式为 `auto`；无音轨同样合法。长视频只允许 `DIALOGUE_MODE=auto|none`，其中 auto 复用源音轨：长于画面时裁剪、短于画面时补静音，画面时长不变；none 输出静音。
 
 成功标准：创建阶段到 `done`；10 秒输入通过 prepared receipt v1，15/30 秒输入通过 64 位 plan receipt 和正整数 `segment_count`；submit 返回 202；generation 到 `succeeded` 且 `has_video=true`。记录每次输出的 cid 和 `client_request_id`，不要复制 token、EnvironmentFile 或供应商响应。
 
@@ -236,7 +236,7 @@ for cid in "$CID_10" "$CID_15" "$CID_30"; do
     -show_entries stream=codec_name,pix_fmt,r_frame_rate \
     -of default=noprint_wrappers=1 "$output"
   ffprobe -v error -select_streams a:0 \
-    -show_entries stream=codec_name,channels \
+    -show_entries stream=codec_name,channels,duration,duration_ts,time_base \
     -of default=noprint_wrappers=1 "$output"
 done
 ```

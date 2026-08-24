@@ -1048,18 +1048,7 @@ def run(settings: Settings, cid: str, runner) -> None:
     cdir = (settings.data_dir / cid).resolve()
     work = cdir / "work"
     try:
-        existing = storage.load_meta(settings.data_dir, cid)
-        if existing is None:
-            return
-        if (
-            existing.get("generation") is not None
-            or existing.get("prepared_input_receipt")
-            or existing.get("long_video_plan_receipt")
-            or (cdir / prepared_input.RECEIPT_FILENAME).exists()
-            or (cdir / long_video.PLAN_RECEIPT_FILENAME).exists()
-        ):
-            return
-        meta = storage.update_meta(settings.data_dir, cid, status="processing", error=None)
+        meta = storage.claim_pipeline_input(settings.data_dir, cid)
         if meta is None:
             return
         sources = sorted(cdir.glob("source.*"))
@@ -1163,9 +1152,10 @@ def run(settings: Settings, cid: str, runner) -> None:
                     dialogue_mode,
                     voice_lines or [],
                 )
-            storage.update_meta(
+            storage.finish_input_claim(
                 settings.data_dir,
                 cid,
+                "pipeline",
                 status="done",
                 keyframes=keyframes,
                 prompt=prompt,
@@ -1231,6 +1221,11 @@ def run(settings: Settings, cid: str, runner) -> None:
                 )
                 changes["long_video_plan_receipt"] = receipt_path.name
             # 新 schema 保留 segments；短视频仍只写顶层 keyframes/prompt。
-            storage.update_meta(settings.data_dir, cid, **changes)
+            storage.finish_input_claim(
+                settings.data_dir, cid, "pipeline", **changes
+            )
     except Exception as e:
-        storage.update_meta(settings.data_dir, cid, status="failed", error=str(e)[:500])
+        storage.finish_input_claim(
+            settings.data_dir, cid, "pipeline",
+            status="failed", error=str(e)[:500],
+        )

@@ -92,13 +92,19 @@ def probe_video_duration(video: Path, decoded_duration: float) -> float:
             )
             stream = (json.loads(completed.stdout or "{}").get("streams") or [])[0]
             try:
-                candidate = float(stream.get("duration"))
+                raw_duration = stream.get("duration")
+                if isinstance(raw_duration, bool):
+                    raise TypeError
+                candidate = float(raw_duration)
                 if math.isfinite(candidate) and candidate > 0:
                     return candidate
             except (TypeError, ValueError):
                 pass
             try:
-                ticks = float(stream.get("duration_ts"))
+                raw_duration_ts = stream.get("duration_ts")
+                if isinstance(raw_duration_ts, bool):
+                    raise TypeError
+                ticks = float(raw_duration_ts)
                 numerator, denominator = str(stream.get("time_base")).split("/", 1)
                 candidate = ticks * float(numerator) / float(denominator)
                 if math.isfinite(candidate) and candidate > 0:

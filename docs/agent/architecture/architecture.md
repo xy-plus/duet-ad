@@ -83,6 +83,7 @@ flowchart LR
 - ASR 输出中的 `[无法辨识]`、`[inaudible]`、`[unintelligible]` 等哨兵文本不是业务台词：净化为“本次未得到转写”，复用有声学人声证据时的一次重试；任何哨兵不得进入 `voice_lines.json`、prepared receipt 或 H3 prompt。
 - 冻结的 H3 源提示词是唯一生成输入；项目不调用 MiniMax Context IR，也不接受运行时优化开关。
 - `duration_s` 以 `v:0` 实际浮点时长写 receipt；上传、pipeline 重探测和提交门禁限制为 300 秒。短链 H3 时长为 `ceil(duration_s)` 且不超过 10；长链每段为 `ceil(end_s-start_s)` 且不超过 15。最终 `keep` 拼接把长音频裁到画面终点、短音频补静音到画面终点，不改变画面帧预算。
+- pipeline 首次进入 `processing` 与首次 submit 冻结输入共用同一个 per-CID 原子所有权 claim；检查 generation/receipt、取得所有权和写 meta 在同一把锁内完成。输家不得运行输入准备、改写 receipt 或触发 provider，完成/回滚也只能由当前 owner 提交。
 - `fit_required` 只在 pipeline `done` 时按实际选中的每张关键帧计算，不持久化源视频宽高作为第二真相。只有全部关键帧都是 9:16 才允许 `none`，任一非 9:16 就必须人工选 `crop` 或 `pad`；即使源视频是 9:16，裁过的关键帧也不能绕过。两种策略都不缩放帧，只做居中裁切或居中黑边扩画布。
 - H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/{crop|pad}/`；永不读取 `postprocessed/`。
 
@@ -125,7 +126,7 @@ stateDiagram-v2
 
 API 暴露的 coarse generation 是 `queued/running/resume_required/succeeded/failed/submission_unknown`。四类 provider 查询/超时及 `download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed` 映射为 `resume_required`；URL/实际 peer、重定向、体积、无效视频等确定性安全拒绝映射为 `failed`。服务没有自动付费重试。`submission_unknown` 对任何 id 固定返回 409 `submission_outcome_unknown`；意外 provider 异常会先 inspect，只有磁盘状态明确为确定失败时才开放新 id。
 
-长链在 `generation.segments` 中保存每段 `index/chain_id/join_mode/status/attempt/error/child_request_id`；公开接口省略 `child_request_id`。同链严格串行，不同链最多两个并发。任一段结果未知即锁住整批；启动恢复只对已知子任务执行 GET，不会替尚未开始的段 POST。确定失败的新父请求只推进失败段和其未完成下游，成功产物继续复用。全部成功后进入 `stage=stitch`：子片段归一为 24fps H.264/yuv420p，`continue` 边界移除后一段首帧，输出总时长误差不超过一帧；`auto` 复用完整源音轨，`none` 静音。拼接失败用原请求只重跑本地拼接。
+长链在 `generation.segments` 中保存每段 `index/chain_id/join_mode/status/attempt/error/child_request_id`；公开接口省略 `child_request_id`。同链严格串行，不同链最多两个并发。任一段结果未知即锁住整批；启动恢复只对已知子任务执行 GET，不会替尚未开始的段 POST。确定失败的新父请求只推进失败段和其未完成下游，成功产物继续复用。全部成功后进入 `stage=stitch`：子片段归一为 24fps H.264/yuv420p，`continue` 边界移除后一段首帧，输出总时长误差不超过一帧；`auto` 复用源音轨，长于画面时裁剪、短于画面时补静音，画面时长不变；`none` 静音。拼接失败用原请求只重跑本地拼接。
 
 ## 数据布局
 

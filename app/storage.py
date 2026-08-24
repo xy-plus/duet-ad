@@ -113,6 +113,70 @@ def update_meta(data_dir: Path, cid: str, **changes) -> dict | None:
         return meta
 
 
+def claim_pipeline_input(data_dir: Path, cid: str) -> dict | None:
+    """Atomically claim an unfrozen conversation for input preparation."""
+    if not _ID_RE.match(cid):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = load_meta(data_dir, cid)
+        if meta is None or any((
+            meta.get("_input_owner"),
+            meta.get("generation") is not None,
+            meta.get("prepared_input_receipt"),
+            meta.get("long_video_plan_receipt"),
+            (cdir / "prepared_input.json").exists(),
+            (cdir / "long_video_plan.json").exists(),
+        )):
+            return None
+        meta.update(status="processing", error=None, _input_owner="pipeline")
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
+
+
+def claim_submission_input(data_dir: Path, cid: str, request_id: str) -> dict | None:
+    """Atomically exclude pipeline work before a first submission freezes files."""
+    if not _ID_RE.match(cid):
+        return None
+    cdir = data_dir / cid
+    owner = f"submit:{request_id}"
+    with _meta_lock(cdir):
+        meta = load_meta(data_dir, cid)
+        if meta is None:
+            return None
+        if meta.get("_input_owner") == owner:
+            return meta
+        if (
+            meta.get("_input_owner")
+            or meta.get("generation") is not None
+            or meta.get("status") != "done"
+        ):
+            return None
+        meta["_input_owner"] = owner
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
+
+
+def finish_input_claim(
+    data_dir: Path, cid: str, owner: str, **changes,
+) -> dict | None:
+    """Commit or release a claim only when its current owner still matches."""
+    if not _ID_RE.match(cid):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = load_meta(data_dir, cid)
+        if meta is None or meta.get("_input_owner") != owner:
+            return None
+        meta.update(changes)
+        meta["_input_owner"] = None
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
+
+
 def load_meta(data_dir: Path, cid: str) -> dict | None:
     if not _ID_RE.match(cid):
         return None
@@ -190,14 +254,20 @@ def probe_video(path: Path) -> VideoProbe:
         raise UploadError("cannot parse video dimensions")
     duration: float | None = None
     try:
-        candidate = float(stream.get("duration"))
+        raw_duration = stream.get("duration")
+        if isinstance(raw_duration, bool):
+            raise TypeError
+        candidate = float(raw_duration)
         if isfinite(candidate) and candidate > 0:
             duration = candidate
     except (TypeError, ValueError):
         pass
     if duration is None:
         try:
-            duration_ts = float(stream.get("duration_ts"))
+            raw_duration_ts = stream.get("duration_ts")
+            if isinstance(raw_duration_ts, bool):
+                raise TypeError
+            duration_ts = float(raw_duration_ts)
             numerator, denominator = str(stream.get("time_base")).split("/", 1)
             time_base = float(numerator) / float(denominator)
             candidate = duration_ts * time_base

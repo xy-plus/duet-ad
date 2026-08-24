@@ -73,6 +73,45 @@ def test_concurrent_meta_updates_are_atomic_and_do_not_lose_fields(tmp_path):
     assert stored["segments"] == [{"index": 1, "status": "succeeded"}]
 
 
+@pytest.mark.parametrize("first_owner", ["pipeline", "submit"])
+def test_pipeline_and_submission_claim_share_one_atomic_owner(
+    tmp_path, monkeypatch, first_owner,
+):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    storage.update_meta(tmp_path, meta["id"], status="done", duration_s=9.2)
+    entered = threading.Event()
+    release = threading.Event()
+    writes = []
+    original_write = storage._write_meta
+
+    def blocked_write(cdir, payload):
+        writes.append(payload.get("_input_owner"))
+        entered.set()
+        assert release.wait(timeout=5)
+        original_write(cdir, payload)
+
+    monkeypatch.setattr(storage, "_write_meta", blocked_write)
+
+    def claim(owner):
+        if owner == "pipeline":
+            return storage.claim_pipeline_input(tmp_path, meta["id"])
+        return storage.claim_submission_input(tmp_path, meta["id"], "request-123456")
+
+    second_owner = "submit" if first_owner == "pipeline" else "pipeline"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(claim, first_owner)
+        assert entered.wait(timeout=5)
+        second = pool.submit(claim, second_owner)
+        release.set()
+        results = {first_owner: first.result(), second_owner: second.result()}
+
+    assert results[first_owner] is not None
+    assert results[second_owner] is None
+    assert len(writes) == 1
+    provider_calls = 1 if results["submit"] is not None else 0
+    assert provider_calls == (1 if first_owner == "submit" else 0)
+
+
 def test_resolve_file_whitelist(tmp_path):
     meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
     cdir = tmp_path / meta["id"]
@@ -200,6 +239,39 @@ def test_probe_video_falls_back_to_duration_ts_time_base(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: completed)
     assert storage.probe_video(tmp_path / "source.mp4").duration_s == pytest.approx(503 / 30)
+
+
+def test_probe_video_rejects_bool_duration_and_uses_duration_ts(tmp_path, monkeypatch):
+    completed = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"streams": [{
+            "width": 320, "height": 240, "duration": True,
+            "duration_ts": "503", "time_base": "1/30",
+        }]}),
+        stderr="",
+    )
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: completed)
+    assert storage.probe_video(tmp_path / "source.mp4").duration_s == pytest.approx(503 / 30)
+
+
+def test_probe_video_rejects_bool_ticks_and_uses_decoded_fallback(tmp_path, monkeypatch):
+    completed = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"streams": [{
+            "width": 320, "height": 240, "duration": False,
+            "duration_ts": True, "time_base": "1/30",
+        }]}),
+        stderr="",
+    )
+    capture = SimpleNamespace(
+        isOpened=lambda: True,
+        get=lambda prop: {storage.cv2.CAP_PROP_FRAME_COUNT: 600,
+                          storage.cv2.CAP_PROP_FPS: 30}[prop],
+        release=lambda: None,
+    )
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: completed)
+    monkeypatch.setattr(storage.cv2, "VideoCapture", lambda _path: capture)
+    assert storage.probe_video(tmp_path / "source.mp4").duration_s == 20.0
 
 
 def test_probe_video_falls_back_to_decoded_frame_timeline(tmp_path, monkeypatch):

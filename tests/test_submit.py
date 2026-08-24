@@ -1,4 +1,6 @@
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -7,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
-from app import h3, prepared_input, storage
+from app import h3, pipeline, prepared_input, storage
 from app.main import _result_fields, _resume_generation, create_app
 
 
@@ -237,6 +239,105 @@ def test_submit_freezes_direct_h3_receipt_and_source_prompt(enabled, monkeypatch
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
     assert "context_ir_enabled" not in detail["generation"]
     assert detail["generation"]["stage"] == "h3"
+
+
+def test_submit_claim_wins_atomically_before_pipeline(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    entered = threading.Event()
+    release = threading.Event()
+    blocked = False
+    original_write = storage._write_meta
+
+    def block_first_submit_claim(path, meta):
+        nonlocal blocked
+        if meta.get("_input_owner") == f"submit:{REQUEST_ID}" and not blocked:
+            blocked = True
+            entered.set()
+            assert release.wait(timeout=5)
+        original_write(path, meta)
+
+    provider_calls = []
+    pipeline_steps = []
+    monkeypatch.setattr(storage, "_write_meta", block_first_submit_claim)
+    monkeypatch.setattr(
+        h3, "start",
+        lambda request: provider_calls.append(request) or h3.H3Result(
+            "failed", "000001", error_code="h3_provider_failed"
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline, "_run_cmd",
+        lambda *_a, **_kw: pipeline_steps.append(_kw.get("step")),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submitted = pool.submit(
+            client.post, f"/api/conversations/{cid}/submit",
+            headers=AUTH, json=_payload(),
+        )
+        assert entered.wait(timeout=5)
+        pipeline_future = pool.submit(pipeline.run, settings, cid, object())
+        release.set()
+        response = submitted.result()
+        pipeline_future.result()
+
+    assert response.status_code == 202
+    assert len(provider_calls) == 1
+    assert pipeline_steps == []
+    receipt = (cdir / prepared_input.RECEIPT_FILENAME).read_bytes()
+    meta_bytes = (cdir / "meta.json").read_bytes()
+    pipeline.run(settings, cid, object())
+    assert (cdir / prepared_input.RECEIPT_FILENAME).read_bytes() == receipt
+    assert (cdir / "meta.json").read_bytes() == meta_bytes
+
+
+def test_pipeline_claim_wins_atomically_before_submit(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    entered = threading.Event()
+    release = threading.Event()
+    blocked = False
+    original_write = storage._write_meta
+
+    def block_first_pipeline_claim(path, meta):
+        nonlocal blocked
+        if meta.get("_input_owner") == "pipeline" and not blocked:
+            blocked = True
+            entered.set()
+            assert release.wait(timeout=5)
+        original_write(path, meta)
+
+    provider_calls = []
+    monkeypatch.setattr(storage, "_write_meta", block_first_pipeline_claim)
+    monkeypatch.setattr(
+        h3, "start", lambda request: provider_calls.append(request)
+    )
+    frozen_files = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pipeline_future = pool.submit(pipeline.run, settings, cid, object())
+        assert entered.wait(timeout=5)
+        submitted = pool.submit(
+            client.post, f"/api/conversations/{cid}/submit",
+            headers=AUTH, json=_payload(),
+        )
+        release.set()
+        response = submitted.result()
+        pipeline_future.result()
+
+    assert response.status_code == 409
+    assert provider_calls == []
+    assert not (cdir / prepared_input.RECEIPT_FILENAME).exists()
+    assert {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
+    } == frozen_files
 
 
 @pytest.mark.parametrize(
