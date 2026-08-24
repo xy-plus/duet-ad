@@ -64,6 +64,20 @@ def test_duration_limit_error_is_structured_and_shown_as_popup():
     }
 
 
+def test_stale_page_error_shows_refresh_instruction():
+    result = _run_contract(
+        "(() => {"
+        "const error=contract.apiErrorFromPayload({detail:{code:'client_refresh_required',"
+        "message:'页面版本已更新，请刷新页面后重试。'}},'fallback');"
+        "return {message:error.message,code:error.code};"
+        "})()"
+    )
+    assert result == {
+        "message": "页面版本已更新，请刷新页面后重试。",
+        "code": "client_refresh_required",
+    }
+
+
 def test_context_ir_is_absent_from_web_runtime():
     source = _web_source().lower()
     assert "context ir" not in source

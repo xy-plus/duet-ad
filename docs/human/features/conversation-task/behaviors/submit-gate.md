@@ -39,11 +39,14 @@ links: [conversation-task, processing-state]
 
 长链只允许 `dialogue_mode=auto|none`，不允许 `lines/edit/custom`；`expected_plan_receipt` 必须与当前详情一致。
 
+如果旧标签页缺少 `expected_plan_receipt`，服务会提示“页面版本已更新，请刷新页面后重试”。此请求不会自动补 receipt、不会提交 H3，也不会产生付费任务；刷新页面后再确认即可。页面入口和 `app.js` 禁止缓存，确保刷新取得当前契约。
+
 | 条件 | 结果 |
 | --- | --- |
 | `ENABLE_H3_SUBMIT` 未开 | 501 `H3 submission is disabled.` |
 | 会话不存在 | 404 `not found` |
 | schema 不是 v2 | 409 `read_only` |
+| 精确旧版四键长视频提交 | 409 `client_refresh_required` + 中文刷新提示；不创建付费任务 |
 | 输入准备未 `done` | 409 `artifacts not ready` |
 | AutoDL 凭据缺失 | 503 `h3_credentials_missing` |
 | 冻结输入、receipt 或画幅派生失败 | 409 `prepared_input_invalid` / `frame_fit_failed` |
