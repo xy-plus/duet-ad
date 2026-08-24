@@ -113,22 +113,19 @@ def _generation_fit_profiles(
         selected = "9:16"
     else:
         selected = "9:16"
+    fit_requirements = {
+        aspect: any(
+            width * target_height != height * target_width
+            for width, height in dimensions
+        )
+        for aspect, (target_width, target_height) in TARGET_ASPECTS.items()
+    }
     profiles = {
         aspect: {
-            "fit_required": any(
-                width * target_height != height * target_width
-                for width, height in dimensions
-            ),
-            "default_fit_mode": (
-                "crop"
-                if any(
-                    width * target_height != height * target_width
-                    for width, height in dimensions
-                )
-                else "none"
-            ),
+            "fit_required": required,
+            "default_fit_mode": "crop" if required else "none",
         }
-        for aspect, (target_width, target_height) in TARGET_ASPECTS.items()
+        for aspect, required in fit_requirements.items()
     }
     return profiles, selected
 

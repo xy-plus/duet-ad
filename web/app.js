@@ -6,6 +6,8 @@
 /* ===== 常量与状态 ===== */
 const TOKEN_KEY = "cvs_token";
 const POLL_MS = 2000;
+const H3_ASPECT_RATIOS = Object.freeze(["16:9", "9:16"]);
+const H3_RESOLUTIONS = Object.freeze(["480p", "768p"]);
 
 const STATUS_TEXT = { queued: "排队中", processing: "处理中", done: "已完成", failed: "失败" };
 
@@ -196,10 +198,10 @@ function fitProfile(detail, aspectRatio) {
 function generationParameterDraft(detail) {
   const aspectRatio = detail && detail.aspect_ratio;
   const resolution = detail && detail.resolution;
-  if (!["16:9", "9:16"].includes(aspectRatio)) {
+  if (!H3_ASPECT_RATIOS.includes(aspectRatio)) {
     throw new Error("服务端推荐画幅无效，请刷新页面后重试");
   }
-  if (!["480p", "768p"].includes(resolution)) {
+  if (!H3_RESOLUTIONS.includes(resolution)) {
     throw new Error("服务端推荐清晰度无效，请刷新页面后重试");
   }
   const profile = fitProfile(detail, aspectRatio);
@@ -263,8 +265,8 @@ function buildSubmitPayload(input) {
       || !/^[0-9a-f]{64}$/.test(input.planReceipt))) {
     throw new Error("长视频生成计划尚未就绪，请刷新后重试");
   }
-  if (!["16:9", "9:16"].includes(input.aspectRatio)) throw new Error("请选择画幅");
-  if (!["480p", "768p"].includes(input.resolution)) throw new Error("请选择清晰度");
+  if (!H3_ASPECT_RATIOS.includes(input.aspectRatio)) throw new Error("请选择画幅");
+  if (!H3_RESOLUTIONS.includes(input.resolution)) throw new Error("请选择清晰度");
 
   let fitMode = "none";
   if (input.fitRequired) {
@@ -330,8 +332,8 @@ function buildResumePayload(detail) {
     throw new Error("既有任务台词模式无效");
   }
   if (!["none", "crop", "pad"].includes(detail.fit_mode)) throw new Error("既有任务画幅模式无效");
-  if (!["16:9", "9:16"].includes(detail.aspect_ratio)
-      || !["480p", "768p"].includes(detail.resolution)) {
+  if (!H3_ASPECT_RATIOS.includes(detail.aspect_ratio)
+      || !H3_RESOLUTIONS.includes(detail.resolution)) {
     throw new Error("既有任务生成参数无效");
   }
 
@@ -370,8 +372,8 @@ function buildStitchRetryPayload(detail) {
   if (typeof requestId !== "string" || !requestId.trim()) throw new Error("缺少既有任务请求标识");
   if (!dialogue || !["auto", "none"].includes(dialogue.mode)) throw new Error("既有任务台词模式无效");
   if (!["none", "crop", "pad"].includes(detail.fit_mode)) throw new Error("既有任务画幅模式无效");
-  if (!["16:9", "9:16"].includes(detail.aspect_ratio)
-      || !["480p", "768p"].includes(detail.resolution)) {
+  if (!H3_ASPECT_RATIOS.includes(detail.aspect_ratio)
+      || !H3_RESOLUTIONS.includes(detail.resolution)) {
     throw new Error("既有任务生成参数无效");
   }
   return {
@@ -1230,7 +1232,7 @@ function renderFinalSection(detail) {
   const resolutionField = el("fieldset", "final-field");
   resolutionField.appendChild(el("legend", null, "清晰度"));
   const resolutionChoices = el("div", "final-choices");
-  for (const value of ["480p", "768p"]) {
+  for (const value of H3_RESOLUTIONS) {
     const item = choice("resolution-" + detail.id, value, value, draft.resolution === value);
     item.querySelector("input").addEventListener("change", () => {
       draft.resolution = value;
