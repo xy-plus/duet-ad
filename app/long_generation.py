@@ -172,6 +172,12 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             chain_id, join_mode = raw["chain_id"], raw["join_mode"]
         except (KeyError, TypeError, ValueError):
             raise LongGenerationError("long_video_plan_invalid") from None
+        try:
+            frozen_duration = long_video.segment_duration_s(
+                start_s, end_s, receipt_version=receipt_version
+            )
+        except long_video.LongVideoError:
+            raise LongGenerationError("long_video_plan_invalid") from None
         comparable = ("index", "start_s", "end_s", "chain_id", "join_mode")
         if (
             index != position
@@ -179,7 +185,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             or not math.isfinite(start_s)
             or not math.isfinite(end_s)
             or abs(start_s - previous_end) > _EPS
-            or end_s - start_s < 1
+            or frozen_duration < long_video.SEGMENT_MIN_S
             or long_video.provider_duration_s(
                 start_s, end_s, receipt_version=receipt_version
             )

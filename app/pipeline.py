@@ -812,9 +812,16 @@ def _load_scenes(work: Path) -> list[dict]:
         raise PipelineError("scenes.json missing valid duration_s")
     prev_end = 0.0
     for i, seg in enumerate(out):
-        length = seg["end_s"] - seg["start_s"]
+        try:
+            frozen_duration = long_video.segment_duration_s(
+                seg["start_s"], seg["end_s"]
+            )
+        except long_video.LongVideoError:
+            raise PipelineError(
+                f"scenes.json segments[{i}] provider duration not in 1..10s"
+            ) from None
         if (
-            length < long_video.SEGMENT_MIN_S - 1e-9
+            frozen_duration < long_video.SEGMENT_MIN_S
             or long_video.provider_duration_s(seg["start_s"], seg["end_s"])
             > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
         ):
