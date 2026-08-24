@@ -601,9 +601,19 @@ def test_30_second_continue_uses_generated_tail_and_two_posts(enabled, monkeypat
     settings, client = enabled
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
     seen = []
-    tail_bytes = (settings.data_dir / cid / "work" / "tail-fixture.png")
+    tail_bytes = settings.data_dir / cid / "work" / "tail-fixture.png"
+    stale_tail = settings.data_dir / cid / "work" / "stale-tail.png"
     _png(tail_bytes, 222)
+    _png(stale_tail, 111)
+    generated_tail = (
+        settings.data_dir / cid / "work" / "segments" / "1"
+        / "work" / "generated_last.png"
+    )
+    generated_tail.parent.mkdir(parents=True, exist_ok=True)
+    generated_tail.write_bytes(stale_tail.read_bytes())
+    extract_calls = []
     def extract_tail(_video, output):
+        extract_calls.append(output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(tail_bytes.read_bytes())
         return output
@@ -617,8 +627,112 @@ def test_30_second_continue_uses_generated_tail_and_two_posts(enabled, monkeypat
     assert client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload(receipt)
     ).status_code == 202
+    assert extract_calls == [generated_tail]
     assert [request.workdir.name for request in seen] == ["1", "2"]
     assert seen[1].first_frame[1] == tail_bytes.read_bytes()
+    assert seen[1].first_frame[1] != stale_tail.read_bytes()
+
+
+def test_new_parent_retry_reextracts_continue_tail_instead_of_reusing_stale_file(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
+    root = settings.data_dir / cid
+    fresh = []
+    extract_calls = []
+
+    def extract_tail(_video, output):
+        extract_calls.append(output)
+        fixture = root / "work" / f"fresh-tail-{len(extract_calls)}.png"
+        _png(fixture, 170 + len(extract_calls))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(fixture.read_bytes())
+        fresh.append(fixture.read_bytes())
+        return output
+
+    starts = []
+    segment_two_attempts = 0
+
+    def start(request):
+        nonlocal segment_two_attempts
+        starts.append(request)
+        index = int(request.workdir.name)
+        if index == 2:
+            segment_two_attempts += 1
+            if segment_two_attempts == 1:
+                return h3.H3Result("failed", "task", error_code="h3_provider_failed")
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "task")
+
+    monkeypatch.setattr(long_generation, "_extract_last_frame", extract_tail)
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+    monkeypatch.setattr(h3, "start", start)
+
+    first = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt),
+    )
+    stale = root / "work" / "stale-retry-tail.png"
+    _png(stale, 33)
+    generated_tail = root / "work" / "segments" / "1" / "work" / "generated_last.png"
+    generated_tail.write_bytes(stale.read_bytes())
+    second = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(receipt, request_id="retry-parent-request-2"),
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert len(extract_calls) == 2
+    second_segment_requests = [request for request in starts if request.workdir.name == "2"]
+    assert len(second_segment_requests) == 2
+    assert second_segment_requests[-1].first_frame[1] == fresh[-1]
+    assert second_segment_requests[-1].first_frame[1] != stale.read_bytes()
+
+
+def test_resume_with_missing_frozen_continue_tail_fails_closed_without_post_or_extract(
+    enabled, monkeypatch,
+):
+    settings, _client = enabled
+    cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    plan.segments[0].workdir.joinpath("generated.mp4").write_bytes(b"segment")
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "resume-parent-request", 1
+    )
+    generation["status"] = "resume_required"
+    generation["segments"][0].update(
+        status="succeeded", attempt=1, child_request_id="child-one"
+    )
+    generation["segments"][1].update(
+        status="resume_required", attempt=1, child_request_id="child-two"
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    extracts = []
+    starts = []
+    resumes = []
+    monkeypatch.setattr(
+        long_generation, "_extract_last_frame",
+        lambda *_args: extracts.append(1),
+    )
+    monkeypatch.setattr(h3, "start", lambda request: starts.append(request))
+    monkeypatch.setattr(h3, "resume", lambda request: resumes.append(request))
+
+    long_generation.run(settings, cid, plan)
+
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert extracts == []
+    assert starts == []
+    assert resumes == []
+    assert stored["status"] == "failed"
+    assert stored["segments"][1]["error"] == "long_video_tail_frame_missing"
 
 
 def test_plan_freeze_failure_makes_zero_posts(enabled, monkeypatch):

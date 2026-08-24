@@ -26,6 +26,9 @@ from app.main import create_app
 _PX_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
+_ANCHOR_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAkAAAAQCAIAAABLKsIUAAAAMklEQVQYGXXBAQEAAAABIJZ33QJV5ChyFDmKHEWOIkeRo8hR5ChyFDmKHEWOIkeRo8gxBaoX4WKqZ68AAAAASUVORK5CYII="
+)
 
 SEGMENTS = [
     {"index": 1, "start_s": 0.0, "end_s": 8.0},
@@ -254,8 +257,8 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
         elif step.startswith("segment ") and step.endswith(" extract"):
             out = Path(argv[argv.index("--out-dir") + 1])
             out.mkdir(parents=True, exist_ok=True)
-            (out / "001_frame_000.000s.png").write_bytes(b"source-first")
-            (out / "002_frame_007.750s.png").write_bytes(b"source-last")
+            (out / "001_frame_000.000s.png").write_bytes(_ANCHOR_PNG)
+            (out / "002_frame_007.750s.png").write_bytes(_ANCHOR_PNG)
             (out / "manifest.json").write_text(
                 json.dumps(
                     {
@@ -319,10 +322,10 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
         "end",
     ]
     assert receipt["segments"][0]["anchors"][0]["sha256"] == hashlib.sha256(
-        b"source-first"
+        _ANCHOR_PNG
     ).hexdigest()
     assert receipt["segments"][0]["anchors"][1]["sha256"] == hashlib.sha256(
-        b"source-last"
+        _ANCHOR_PNG
     ).hexdigest()
     assert receipt["segments"][0]["anchors"][0]["sha256"] != (
         receipt["segments"][0]["keyframes"][0]["sha256"]
