@@ -2078,11 +2078,23 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail=detail)
                 if previous_status in _GENERATION_RETRYABLE and previous_id == request_id:
                     raise HTTPException(status_code=409, detail="new client_request_id required")
+                legacy_pre_h3 = (
+                    previous_status in _GENERATION_RETRYABLE
+                    and _is_legacy_generation_contract(generation)
+                )
+                if legacy_pre_h3 and not h3.legacy_h3_is_provably_unsubmitted(
+                    settings.data_dir / cid,
+                    cid=cid,
+                    attempt=generation.get("attempt"),
+                    client_request_id=previous_id,
+                ):
+                    _mark_submission_unknown(settings, cid, generation)
+                    raise HTTPException(
+                        status_code=409, detail="submission_outcome_unknown"
+                    )
                 if (
                     previous_status in _GENERATION_RETRYABLE
-                    # Removed Context-IR records predate any paid H3 input;
-                    # their first direct H3 request has nothing to compare.
-                    and not _is_legacy_generation_contract(generation)
+                    and not legacy_pre_h3
                     and not _short_generation_parameters_match(
                         meta,
                         dialogue_mode=payload["dialogue_mode"],

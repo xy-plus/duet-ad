@@ -169,6 +169,30 @@ def _write_startup_h3_attempt(settings, cid, *, generation_status="running"):
     return request, state_root / "session.json", attempt_path
 
 
+def _write_legacy_pre_h3_attempt(
+    settings, cid, *, attempt=1, request_id=REQUEST_ID, h3_state=None,
+):
+    attempt_id = f"{attempt:06d}"
+    path = (
+        settings.data_dir / cid / ".h3" / "attempts" / attempt_id / "attempt.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": h3.SCHEMA_VERSION,
+                "cid": cid,
+                "attempt_id": attempt_id,
+                "client_request_id": request_id,
+                "status": "ready_for_h3",
+                "h3": h3_state or {"status": "ready"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _payload(
     request_id=REQUEST_ID, *, mode="none", fit="none", lines=None,
     aspect_ratio="9:16", resolution="768p",
@@ -989,6 +1013,7 @@ def test_result_fields_only_contains_direct_h3_states():
 def test_legacy_context_ir_attempt_is_exposed_as_direct_retry(enabled, monkeypatch):
     settings, client = enabled
     cid, _ = _make_conv(settings)
+    _write_legacy_pre_h3_attempt(settings, cid)
     storage.update_meta(
         settings.data_dir,
         cid,
@@ -1023,6 +1048,54 @@ def test_legacy_context_ir_attempt_is_exposed_as_direct_retry(enabled, monkeypat
     )
     assert response.status_code == 202
     assert seen and seen[0][1] == "request-654321"
+
+
+@pytest.mark.parametrize("evidence", ["missing", "corrupt", "paid", "ambiguous"])
+def test_legacy_context_marker_cannot_hide_ambiguous_or_paid_h3_attempt(
+    enabled, monkeypatch, evidence,
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    if evidence == "corrupt":
+        path = _write_legacy_pre_h3_attempt(settings, cid)
+        path.write_text("{", encoding="utf-8")
+    elif evidence == "paid":
+        _write_legacy_pre_h3_attempt(
+            settings,
+            cid,
+            h3_state={"status": "running", "task_id": "already-paid-h3"},
+        )
+    elif evidence == "ambiguous":
+        _write_legacy_pre_h3_attempt(settings, cid)
+        _write_legacy_pre_h3_attempt(
+            settings, cid, attempt=2, request_id="older-request-123"
+        )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={
+            "status": "resume_required",
+            "error": "ready_for_h3",
+            "attempt": 1,
+            "client_request_id": REQUEST_ID,
+            "stage": "context_ir",
+            "context_ir_enabled": True,
+        },
+    )
+    monkeypatch.setattr(
+        h3, "retry", lambda *_args, **_kwargs: pytest.fail("must not retry")
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload("request-654321", resolution="480p"),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "submission_outcome_unknown"}
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation["status"] == "submission_unknown"
 
 
 def test_startup_resume_uses_direct_h3_state(tmp_path, monkeypatch):

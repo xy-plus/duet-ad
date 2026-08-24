@@ -406,6 +406,56 @@ def inspect(request: H3Request) -> H3Result:
     return _result(latest)
 
 
+def legacy_h3_is_provably_unsubmitted(
+    workdir: Path,
+    *,
+    cid: str,
+    attempt: int,
+    client_request_id: str,
+) -> bool:
+    """Accept a removed pre-H3 flow only with one explicit unpaid receipt.
+
+    Missing, malformed, extra, or paid attempt evidence is ambiguous and must
+    stay locked.  This function is deliberately read-only.
+    """
+    if (
+        not isinstance(cid, str)
+        or not cid
+        or isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or not 1 <= attempt <= 999999
+        or not isinstance(client_request_id, str)
+        or not client_request_id
+    ):
+        return False
+    attempts = Path(workdir) / ".h3" / "attempts"
+    expected_id = f"{attempt:06d}"
+    try:
+        entries = list(attempts.iterdir())
+        if len(entries) != 1:
+            return False
+        directory = entries[0]
+        if not directory.is_dir() or directory.name != expected_id:
+            return False
+        children = list(directory.iterdir())
+        if len(children) != 1 or children[0].name != "attempt.json":
+            return False
+        state = _read_json(children[0])
+    except (OSError, ReceiptError):
+        return False
+    h3_state = state.get("h3")
+    return (
+        state.get("schema_version") == SCHEMA_VERSION
+        and state.get("cid") == cid
+        and state.get("attempt_id") == expected_id
+        and state.get("client_request_id") == client_request_id
+        and isinstance(h3_state, dict)
+        and set(h3_state) == {"status"}
+        and h3_state.get("status") in {"not_started", "ready"}
+        and not (Path(workdir) / "generated.mp4").exists()
+    )
+
+
 def resume(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
     """Recover one attempt using GET only; intended for startup scanners."""
     with _session_lease(request):
