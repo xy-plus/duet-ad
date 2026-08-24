@@ -312,6 +312,26 @@ def _generation_semantics(meta: dict) -> tuple[str, str]:
     return aspect_ratio, resolution
 
 
+def _short_generation_parameters_match(
+    meta: dict,
+    *,
+    dialogue_mode: str,
+    dialogue: tuple[dict, ...],
+    fit_mode: str,
+    aspect_ratio: str,
+    resolution: str,
+) -> bool:
+    """Compare every paid short-video input against its frozen semantics."""
+    expected_dialogue = meta.get("prepared_dialogue")
+    return (
+        meta.get("dialogue_mode") == dialogue_mode
+        and meta.get("fit_mode") == fit_mode
+        and _generation_semantics(meta) == (aspect_ratio, resolution)
+        and isinstance(expected_dialogue, list)
+        and expected_dialogue == [dict(line) for line in dialogue]
+    )
+
+
 def _validated_fit_profiles(meta: dict) -> dict[str, dict[str, object]]:
     raw = meta.get("fit_profiles")
     if isinstance(raw, dict) and set(raw) == set(_ASPECT_RATIOS):
@@ -2001,14 +2021,13 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail="generation_state_invalid")
                 if previous_status in _GENERATION_ACTIVE or previous_status == "succeeded":
                     if previous_id == request_id:
-                        expected_dialogue = meta.get("prepared_dialogue")
-                        if (
-                            meta.get("dialogue_mode") != payload["dialogue_mode"]
-                            or meta.get("fit_mode") != fit_mode
-                            or _generation_semantics(meta)
-                            != (aspect_ratio, resolution)
-                            or not isinstance(expected_dialogue, list)
-                            or expected_dialogue != [dict(line) for line in dialogue]
+                        if not _short_generation_parameters_match(
+                            meta,
+                            dialogue_mode=payload["dialogue_mode"],
+                            dialogue=dialogue,
+                            fit_mode=fit_mode,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
                         ):
                             raise HTTPException(
                                 status_code=409,
@@ -2061,7 +2080,14 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail="new client_request_id required")
                 if (
                     previous_status in _GENERATION_RETRYABLE
-                    and _generation_semantics(meta) != (aspect_ratio, resolution)
+                    and not _short_generation_parameters_match(
+                        meta,
+                        dialogue_mode=payload["dialogue_mode"],
+                        dialogue=dialogue,
+                        fit_mode=fit_mode,
+                        aspect_ratio=aspect_ratio,
+                        resolution=resolution,
+                    )
                 ):
                     raise HTTPException(
                         status_code=409, detail="resume_parameters_changed"
@@ -2069,14 +2095,13 @@ def create_app(settings: Settings) -> FastAPI:
                 if previous_status in _GENERATION_RESUMABLE:
                     if previous_id != request_id:
                         raise HTTPException(status_code=409, detail="resume_request_id_mismatch")
-                    expected_dialogue = meta.get("prepared_dialogue")
-                    if (
-                        meta.get("dialogue_mode") != payload["dialogue_mode"]
-                        or meta.get("fit_mode") != fit_mode
-                        or _generation_semantics(meta)
-                        != (aspect_ratio, resolution)
-                        or not isinstance(expected_dialogue, list)
-                        or expected_dialogue != [dict(line) for line in dialogue]
+                    if not _short_generation_parameters_match(
+                        meta,
+                        dialogue_mode=payload["dialogue_mode"],
+                        dialogue=dialogue,
+                        fit_mode=fit_mode,
+                        aspect_ratio=aspect_ratio,
+                        resolution=resolution,
                     ):
                         raise HTTPException(status_code=409, detail="resume_parameters_changed")
                     previous_attempt = generation.get("attempt")

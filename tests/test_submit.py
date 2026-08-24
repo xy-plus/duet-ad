@@ -484,6 +484,71 @@ def test_paid_retry_rejects_aspect_or_resolution_drift_before_provider(
     assert [kind for kind, _value in calls] == ["start"]
 
 
+@pytest.mark.parametrize(
+    ("fit_required", "initial", "changed"),
+    [
+        (False, _payload(), _payload("request-654321", mode="auto")),
+        (
+            False,
+            _payload(
+                mode="custom",
+                lines=[{"text": "台词 A", "start_s": 0, "end_s": 1.0}],
+            ),
+            _payload(
+                "request-654321",
+                mode="custom",
+                lines=[{"text": "台词 B", "start_s": 0, "end_s": 1.0}],
+            ),
+        ),
+        (
+            True,
+            _payload(fit="crop"),
+            _payload("request-654321", fit="pad"),
+        ),
+        (
+            False,
+            _payload(),
+            _payload("request-654321", fit="crop", aspect_ratio="16:9"),
+        ),
+        (
+            False,
+            _payload(),
+            _payload("request-654321", resolution="480p"),
+        ),
+    ],
+    ids=["dialogue-mode", "dialogue-lines", "fit", "aspect", "resolution"],
+)
+def test_paid_retry_rejects_every_frozen_input_drift_before_provider(
+    enabled, monkeypatch, fit_required, initial, changed,
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings, fit_required=fit_required)
+    calls = []
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: calls.append(("start", request))
+        or h3.H3Result("failed", "000001", error_code="h3_provider_failed"),
+    )
+    monkeypatch.setattr(
+        h3,
+        "retry",
+        lambda *args: calls.append(("retry", args))
+        or h3.H3Result("failed", "000002", error_code="h3_provider_failed"),
+    )
+    assert client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=initial
+    ).status_code == 202
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=changed
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "resume_parameters_changed"}
+    assert [kind for kind, _value in calls] == ["start"]
+
+
 def test_submit_claim_wins_atomically_before_pipeline(enabled, monkeypatch):
     settings, client = enabled
     cid, _ = _make_conv(settings)

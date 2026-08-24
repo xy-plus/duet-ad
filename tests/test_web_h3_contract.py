@@ -43,7 +43,8 @@ def test_creation_and_copy_use_h3_contract_only():
     assert "target_language" in source
     assert "H3" in source
     assert "最长 300 秒" in source
-    assert "10 秒以上会拆分为最长 15 秒的 H3 子任务" in source
+    assert "10 秒以上会拆分为 provider 整秒时长不超过 10 秒的 H3 子任务" in source
+    assert "最长 15 秒的 H3 子任务" not in source
     assert "时长不限" not in source
 
 
