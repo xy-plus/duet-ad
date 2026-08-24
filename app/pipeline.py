@@ -25,6 +25,7 @@ codex 运行前把 skill 的 scripts/ 拷进 codex 工作目录（单段=会话�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -32,12 +33,13 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
 
-from app import asr, long_video, prepared_input, storage, vocal, voice
+from app import asr, long_generation, long_video, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -73,6 +75,188 @@ VOICE_TIMELINE_WARNING = (
 H3_DEFAULT_RATIO = "9:16"
 H3_DEFAULT_FIT_MODE = "none"
 H3_ENGINE_WORKFLOW = "minimax_h3_lightx2v_v5"
+
+
+def _remove_local_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def _replace_scripts(cdir: Path, workdir: Path) -> None:
+    """Install trusted skill scripts without retaining any previous directory bytes."""
+    root = cdir.resolve()
+    destination_root = workdir.resolve()
+    try:
+        destination_root.relative_to(root)
+    except ValueError:
+        raise PipelineError("scripts destination escapes conversation") from None
+    if not destination_root.is_dir():
+        raise PipelineError("scripts destination is not a directory")
+    stage_root = Path(
+        tempfile.mkdtemp(prefix=".scripts-stage-", dir=destination_root)
+    )
+    staged = stage_root / "scripts"
+    target = destination_root / "scripts"
+    try:
+        shutil.copytree(SCRIPTS_DIR, staged)
+        _remove_local_path(target)
+        staged.replace(target)
+    finally:
+        _remove_local_path(stage_root)
+
+
+def _load_receipt_dialogue(path: Path) -> list[dict]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        lines = payload["dialogue"]["lines"]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+        raise PipelineError("prepared input recovery invalid") from None
+    if not isinstance(lines, list):
+        raise PipelineError("prepared input recovery invalid")
+    return lines
+
+
+def _recovery_path(cdir: Path, value: object) -> Path:
+    if not isinstance(value, str) or not value:
+        raise PipelineError("long video plan recovery invalid")
+    path = (cdir / value).resolve()
+    try:
+        path.relative_to(cdir)
+    except ValueError:
+        raise PipelineError("long video plan recovery invalid") from None
+    return path
+
+
+def _recover_prepared_input(cdir: Path, meta: dict) -> dict:
+    receipt = cdir / prepared_input.RECEIPT_FILENAME
+    lines = _load_receipt_dialogue(receipt)
+    try:
+        frozen = prepared_input.load_prepared_input(
+            cdir, receipt, expected_dialogue=lines
+        )
+    except prepared_input.PreparedInputError:
+        raise PipelineError("prepared input recovery invalid") from None
+    try:
+        names = [
+            artifact.path.relative_to(cdir / "work" / "keyframes").as_posix()
+            for artifact in frozen.keyframes
+        ]
+    except ValueError:
+        raise PipelineError("prepared input recovery invalid") from None
+    if any(Path(name).name != name for name in names):
+        raise PipelineError("prepared input recovery invalid")
+    duration = meta.get("duration_s")
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or abs(float(duration) - frozen.duration_s) > _FLOAT_COMPARISON_EPS_S
+    ):
+        raise PipelineError("prepared input recovery invalid")
+    return {
+        "status": "done",
+        "error": None,
+        "keyframes": names,
+        "prompt": frozen.prompt_text,
+        "fit_required": _keyframes_require_fit(cdir / "work", names),
+        "prepared_input_receipt": prepared_input.RECEIPT_FILENAME,
+    }
+
+
+def _recover_long_plan(cdir: Path, meta: dict) -> dict:
+    receipt = cdir / long_video.PLAN_RECEIPT_FILENAME
+    try:
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        raw_segments = payload["segments"]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+        raise PipelineError("long video plan recovery invalid") from None
+    if not isinstance(raw_segments, list) or not raw_segments:
+        raise PipelineError("long video plan recovery invalid")
+    segments = []
+    for position, raw in enumerate(raw_segments, 1):
+        if not isinstance(raw, dict) or raw.get("index") != position:
+            raise PipelineError("long video plan recovery invalid")
+        segwork = cdir / "work" / "segments" / str(position) / "work"
+        try:
+            dialogue = json.loads(
+                (segwork / "voice_lines.json").read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            dialogue = []
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise PipelineError("long video plan recovery invalid") from None
+        if not isinstance(dialogue, list):
+            raise PipelineError("long video plan recovery invalid")
+        try:
+            key_paths = [item["path"] for item in raw["keyframes"]]
+            first_path = raw["anchors"][0]["path"]
+            last_path = raw["anchors"][1]["path"]
+            visual_path = _recovery_path(cdir, raw["visual_prompt"]["path"])
+            final_path = _recovery_path(cdir, raw["final_prompt"]["path"])
+            visual = visual_path.read_text(encoding="utf-8")
+            final = final_path.read_text(encoding="utf-8")
+        except (KeyError, IndexError, TypeError, OSError, UnicodeDecodeError):
+            raise PipelineError("long video plan recovery invalid") from None
+        segments.append({
+            "index": position,
+            "start_s": raw.get("start_s"),
+            "end_s": raw.get("end_s"),
+            "chain_id": raw.get("chain_id"),
+            "join_mode": raw.get("join_mode"),
+            "source": f"segments/{position}/source.mp4",
+            "keyframes": [Path(path).name for path in key_paths],
+            "keyframe_paths": [
+                Path(path).relative_to("work").as_posix() for path in key_paths
+            ],
+            "first_frame_path": Path(first_path).relative_to("work").as_posix(),
+            "last_frame_path": Path(last_path).relative_to("work").as_posix(),
+            "visual_prompt": visual,
+            "prompt": final,
+            "dialogue": dialogue,
+            "lines": [line.get("text") for line in dialogue if isinstance(line, dict)],
+        })
+    digest = hashlib.sha256(receipt.read_bytes()).hexdigest()
+    recovered_meta = {
+        **meta,
+        "segments": segments,
+        "long_video_plan_receipt": long_video.PLAN_RECEIPT_FILENAME,
+    }
+    try:
+        long_generation.freeze_plan(
+            cdir, recovered_meta, digest, "none", meta.get("dialogue_mode", "auto")
+        )
+    except (long_generation.LongGenerationError, ValueError):
+        raise PipelineError("long video plan recovery invalid") from None
+    return {
+        "status": "done",
+        "error": None,
+        "segments": segments,
+        "long_video_plan_receipt": long_video.PLAN_RECEIPT_FILENAME,
+    }
+
+
+def reconcile_stale_pipeline(settings: Settings, cid: str, owner: object) -> None:
+    """Read-only validate a half-committed pipeline freeze and reach a terminal state."""
+    meta = storage.load_pipeline_claim(settings.data_dir, cid, owner)
+    if meta is None:
+        return
+    cdir = (settings.data_dir / cid).resolve()
+    try:
+        has_prepared = (cdir / prepared_input.RECEIPT_FILENAME).is_file()
+        has_plan = (cdir / long_video.PLAN_RECEIPT_FILENAME).is_file()
+        if has_prepared == has_plan:
+            raise PipelineError("pipeline recovery has ambiguous frozen input")
+        changes = (
+            _recover_prepared_input(cdir, meta)
+            if has_prepared
+            else _recover_long_plan(cdir, meta)
+        )
+    except Exception:
+        changes = {"status": "failed", "error": "input_recovery_required"}
+    storage.finish_input_claim(settings.data_dir, cid, owner, **changes)
 H3_BOUNDARY_WORKFLOW = "minimax_h3_lightx2v"
 # 拆段不变量（与 app/scenes.py 的算法级不变量同值；不 import scenes：scenedetect 缺依赖时
 # scenes 模块会 SystemExit，流水线不能因此加载失败）
@@ -879,7 +1063,7 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
                 json.dumps(lines, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         # 裁剪工具按 scripts/crop_image.py 相对 cwd 引用：scripts/ 拷入段目录
-        shutil.copytree(SCRIPTS_DIR, segdir / "scripts")
+        _replace_scripts(work.parent, segdir)
         keyframes, prompt = _run_visual_with_retry(
             settings,
             runner,
@@ -1135,7 +1319,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
         if not segments:
             # 单段模式：work/keyframes + work/prompt.txt，不注入 workaround 前缀；
             # 裁剪工具以 scripts/crop_image.py 相对工作目录引用，scripts/ 拷进会话目录
-            shutil.copytree(SCRIPTS_DIR, cdir / "scripts")
+            _replace_scripts(cdir, cdir)
             keyframes, prompt = _run_visual_with_retry(
                 settings,
                 runner,

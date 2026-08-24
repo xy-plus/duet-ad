@@ -2135,7 +2135,15 @@ def test_startup_does_not_resume_stale_pipeline_after_input_freezes(
         for path in cdir.rglob("*") if path.is_file()
     }
     assert called == []
-    assert after == before
+    if frozen == "generation":
+        assert after == before
+    else:
+        assert {key: value for key, value in after.items() if key != "meta.json"} == {
+            key: value for key, value in before.items() if key != "meta.json"
+        }
+        recovered = storage.load_meta(settings.data_dir, meta["id"])
+        assert recovered["status"] == "failed"
+        assert recovered["error"] == "input_recovery_required"
 
 
 def test_startup_does_not_duplicate_current_process_pipeline_claim(
@@ -2154,6 +2162,247 @@ def test_startup_does_not_duplicate_current_process_pipeline_claim(
         pass
 
     assert called == []
+
+
+def _wait_for_pipeline_terminal(settings, cid):
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        meta = storage.load_meta(settings.data_dir, cid)
+        if meta["status"] in {"done", "failed"}:
+            return meta
+        time.sleep(0.01)
+    pytest.fail("pipeline recovery did not reach a terminal status")
+
+
+def test_startup_pipeline_recovery_replaces_stale_short_scripts(
+    tmp_path, video_1s, fake_steps, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=True, enable_h3_submit=False
+    )
+    meta = _make_conversation(settings, video_1s)
+    cdir = settings.data_dir / meta["id"]
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
+    scripts = cdir / "scripts"
+    scripts.mkdir()
+    (scripts / "untrusted.py").write_text("raise SystemExit", encoding="utf-8")
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+
+    with TestClient(create_app(settings)):
+        terminal = _wait_for_pipeline_terminal(settings, meta["id"])
+
+    assert terminal["status"] == "done", terminal.get("error")
+    assert not (scripts / "untrusted.py").exists()
+    assert (scripts / "crop_image.py").read_bytes() == CROP_SCRIPT.read_bytes()
+
+
+def test_startup_pipeline_recovery_replaces_stale_segment_scripts(
+    tmp_path, video_1s, fake_steps, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=True, enable_h3_submit=False
+    )
+    meta = _make_conversation(settings, video_1s)
+    cdir = settings.data_dir / meta["id"]
+    segment = {"index": 1, "start_s": 0.0, "end_s": 1.0}
+    monkeypatch.setattr(pipeline, "_detect_segments", lambda *_args: [segment])
+
+    def fake_cut(_source, _start_s, _end_s, segdir):
+        segdir.mkdir(parents=True, exist_ok=True)
+        (segdir / "source.mp4").write_bytes(b"segment")
+
+    monkeypatch.setattr(pipeline, "_cut_segment", fake_cut)
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
+    scripts = cdir / "work" / "segments" / "1" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "untrusted.py").write_text("raise SystemExit", encoding="utf-8")
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+
+    with TestClient(create_app(settings)):
+        terminal = _wait_for_pipeline_terminal(settings, meta["id"])
+
+    assert terminal["status"] == "done", terminal.get("error")
+    assert not (scripts / "untrusted.py").exists()
+    assert (scripts / "crop_image.py").read_bytes() == CROP_SCRIPT.read_bytes()
+
+
+@pytest.mark.parametrize("meta_pointer", [False, True])
+def test_startup_reconciles_half_committed_prepared_receipt_without_rewrite(
+    tmp_path, video_1s, monkeypatch, meta_pointer,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=True, enable_h3_submit=False
+    )
+    meta = _make_conversation(settings, video_1s)
+    cdir = settings.data_dir / meta["id"]
+    work = cdir / "work"
+    names = _write_valid_package(work)
+    visual = work / "visual_prompt.txt"
+    visual.write_text(PROMPT_TEXT, encoding="utf-8")
+    storage.update_meta(
+        settings.data_dir, meta["id"], duration_s=1.0,
+        dialogue_mode="auto", voice_mode="keep", voice_lines=[],
+    )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
+    frozen = prepared_input.write_prepared_input(
+        root=cdir,
+        source=cdir / "source.mp4",
+        audio=None,
+        keyframes=[work / "keyframes" / name for name in names],
+        visual=visual,
+        final=work / "prompt.txt",
+        dialogue_mode="auto",
+        dialogue=[],
+        vocal_filter_enabled=True,
+        duration_s=1.0,
+        ratio="9:16",
+        fit_mode="none",
+        engine_request={"h3": {"workflow": pipeline.H3_ENGINE_WORKFLOW,
+                               "duration": 1, "resolution": "720p"}},
+    )
+    if meta_pointer:
+        storage.update_meta(
+            settings.data_dir, meta["id"],
+            prompt=frozen.prompt_text,
+            prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
+        )
+    before = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
+    }
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    monkeypatch.setattr(
+        pipeline, "run", lambda *_args, **_kwargs: pytest.fail("must not rerun")
+    )
+
+    with TestClient(create_app(settings)):
+        pass
+
+    recovered = storage.load_meta(settings.data_dir, meta["id"])
+    after = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
+    }
+    assert recovered["status"] == "done"
+    assert recovered["prepared_input_receipt"] == prepared_input.RECEIPT_FILENAME
+    assert after == before
+
+
+@pytest.mark.parametrize("meta_pointer", [False, True])
+def test_startup_reconciles_half_committed_long_plan_without_rewrite(
+    tmp_path, video_1s, monkeypatch, meta_pointer,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=True, enable_h3_submit=False
+    )
+    meta = _make_conversation(settings, video_1s)
+    cdir = settings.data_dir / meta["id"]
+    segdir = cdir / "work" / "segments" / "1"
+    segwork = segdir / "work"
+    key = segwork / "keyframes" / "01.png"
+    first = segwork / "anchors" / "first.png"
+    last = segwork / "anchors" / "last.png"
+    for path in (key, first, last):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_PX_PNG)
+    (segdir / "source.mp4").write_bytes(b"segment")
+    visual = segwork / "visual_prompt.txt"
+    visual_text = "产品保持在画面中央。"
+    visual.write_text(visual_text, encoding="utf-8")
+    final = segwork / "prompt.txt"
+    final.write_text(
+        pipeline.NO_BGM_LINE + "\n" + prepared_input.compose_final_prompt(
+            long_video.compose_segment_visual_prompt(visual_text), []
+        ),
+        encoding="utf-8",
+    )
+    (segwork / "voice_lines.json").write_text("[]", encoding="utf-8")
+    public = {
+        "index": 1, "start_s": 0.0, "end_s": 11.0,
+        "chain_id": "chain-001", "join_mode": "hard_cut",
+        "source": "segments/1/source.mp4", "keyframes": ["01.png"],
+        "keyframe_paths": ["segments/1/work/keyframes/01.png"],
+        "first_frame_path": "segments/1/work/anchors/first.png",
+        "last_frame_path": "segments/1/work/anchors/last.png",
+        "visual_prompt": visual_text, "prompt": final.read_text(encoding="utf-8"),
+        "dialogue": [], "lines": [],
+    }
+    storage.update_meta(
+        settings.data_dir, meta["id"], duration_s=11.0,
+        dialogue_mode="auto", voice_mode="keep", voice_lines=[],
+    )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
+    receipt = long_video.write_plan_receipt(
+        cdir, source=cdir / "source.mp4", duration_s=11.0,
+        segments=[{
+            **public, "source_path": segdir / "source.mp4",
+            "keyframe_paths": [key], "first_frame_path": first,
+            "last_frame_path": last, "visual_prompt_path": visual,
+            "final_prompt_path": final,
+        }],
+        workflow=pipeline.H3_BOUNDARY_WORKFLOW,
+    )
+    if meta_pointer:
+        storage.update_meta(
+            settings.data_dir, meta["id"], segments=[public],
+            long_video_plan_receipt=receipt.name,
+        )
+    before = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
+    }
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    monkeypatch.setattr(
+        pipeline, "run", lambda *_args, **_kwargs: pytest.fail("must not rerun")
+    )
+
+    with TestClient(create_app(settings)):
+        pass
+
+    recovered = storage.load_meta(settings.data_dir, meta["id"])
+    after = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
+    }
+    assert recovered["status"] == "done", recovered.get("error")
+    assert recovered["long_video_plan_receipt"] == receipt.name
+    assert after == before
+
+
+def test_startup_marks_corrupt_half_frozen_pipeline_as_recovery_required(
+    tmp_path, video_1s, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=True, enable_h3_submit=False
+    )
+    meta = _make_conversation(settings, video_1s)
+    cdir = settings.data_dir / meta["id"]
+    storage.update_meta(
+        settings.data_dir, meta["id"], duration_s=1.0,
+        dialogue_mode="auto", voice_mode="keep",
+    )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
+    receipt = cdir / prepared_input.RECEIPT_FILENAME
+    receipt.write_bytes(b"not-json")
+    before = receipt.read_bytes()
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    monkeypatch.setattr(
+        pipeline, "run", lambda *_args, **_kwargs: pytest.fail("must not rerun")
+    )
+
+    with TestClient(create_app(settings)):
+        pass
+
+    recovered = storage.load_meta(settings.data_dir, meta["id"])
+    assert recovered["status"] == "failed"
+    assert recovered["error"] == "input_recovery_required"
+    assert recovered["_input_owner"] is None
+    assert receipt.read_bytes() == before
 
 
 def test_post_triggers_pipeline_and_detail_filled(tmp_path, video_1s, fake_steps):

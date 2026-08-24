@@ -232,12 +232,75 @@ def claim_stale_pipeline_inputs(data_dir: Path) -> list[tuple[str, dict]]:
     return claimed
 
 
+def claim_stale_input_reconciliations(data_dir: Path) -> list[tuple[str, dict]]:
+    """Claim stale leases whose frozen bytes changed for local-only reconciliation."""
+    claimed = []
+    for listed in list_conversations(data_dir):
+        cid = listed.get("id")
+        if not isinstance(cid, str) or not _ID_RE.match(cid):
+            continue
+        cdir = data_dir / cid
+        with _meta_lock(cdir):
+            meta = load_meta(data_dir, cid)
+            if meta is None or meta.get("generation") is not None:
+                continue
+            current = meta.get("_input_owner")
+            if current == "pipeline":
+                kind, request_id = "pipeline", None
+            elif isinstance(current, str) and current.startswith("submit:"):
+                kind, request_id = "submit", current.removeprefix("submit:")
+            elif isinstance(current, dict):
+                kind, request_id = current.get("kind"), current.get("request_id")
+            else:
+                continue
+            if kind not in {"pipeline", "submit"}:
+                continue
+            if (
+                isinstance(current, dict)
+                and current.get("process_generation") == PROCESS_GENERATION
+            ):
+                continue
+            if not _stale_owner_has_new_frozen_input(cdir, meta, current):
+                continue
+            owner = (
+                {**current, "process_generation": PROCESS_GENERATION}
+                if isinstance(current, dict)
+                else {
+                    "kind": kind,
+                    "process_generation": PROCESS_GENERATION,
+                    "frozen_input_snapshot": None,
+                    **({"request_id": request_id} if request_id is not None else {}),
+                }
+            )
+            meta["_input_owner"] = owner
+            meta["updated_at"] = _now()
+            _write_meta(cdir, meta)
+            claimed.append((cid, owner))
+    return claimed
+
+
 def load_pipeline_claim(data_dir: Path, cid: str, owner: object) -> dict | None:
     """Load an exact, currently owned pipeline claim."""
     if (
         not _ID_RE.match(cid)
         or not isinstance(owner, dict)
         or owner.get("kind") != "pipeline"
+    ):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = load_meta(data_dir, cid)
+        if meta is None or meta.get("_input_owner") != owner:
+            return None
+        return meta
+
+
+def load_submission_claim(data_dir: Path, cid: str, owner: object) -> dict | None:
+    """Load an exact, currently owned submission claim."""
+    if (
+        not _ID_RE.match(cid)
+        or not isinstance(owner, dict)
+        or owner.get("kind") != "submit"
     ):
         return None
     cdir = data_dir / cid
@@ -268,6 +331,8 @@ def claim_submission_input(data_dir: Path, cid: str, request_id: str) -> dict | 
             return None
         owner = _input_owner(cdir, "submit", request_id)
         meta["_input_owner"] = owner
+        meta["error"] = None
+        meta.pop("input_recovery", None)
         meta["updated_at"] = _now()
         _write_meta(cdir, meta)
         return meta

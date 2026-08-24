@@ -158,6 +158,25 @@ def test_new_process_generation_does_not_rerun_pipeline_after_receipt_landed(
     assert (tmp_path / meta["id"] / "meta.json").read_bytes() == before
 
 
+def test_frozen_reconciliation_claim_preserves_original_snapshot_across_crashes(
+    tmp_path, monkeypatch,
+):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    cdir = tmp_path / meta["id"]
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    old = storage.claim_pipeline_input(tmp_path, meta["id"])
+    assert old["_input_owner"]["frozen_input_snapshot"] == {}
+    (cdir / "prepared_input.json").write_bytes(b"half-frozen")
+
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-reconcile-1")
+    first = storage.claim_stale_input_reconciliations(tmp_path)
+    assert first[0][1]["frozen_input_snapshot"] == {}
+
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-reconcile-2")
+    second = storage.claim_stale_input_reconciliations(tmp_path)
+    assert second[0][1]["frozen_input_snapshot"] == {}
+
+
 def test_new_process_generation_reclaims_unfrozen_submit_owner_with_new_request(
     tmp_path, monkeypatch,
 ):

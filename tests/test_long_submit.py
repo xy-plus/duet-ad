@@ -126,6 +126,49 @@ def _fake_stitch(calls):
     return invoke
 
 
+def test_startup_reconciles_half_frozen_long_submit_without_provider(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=False, enable_h3_submit=False
+    )
+    cid, receipt = _make_long(settings)
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    claimed = storage.claim_submission_input(
+        settings.data_dir, cid, "request-old-long"
+    )
+    assert claimed
+    long_generation.freeze_plan(
+        settings.data_dir / cid, claimed, receipt, "crop", "auto"
+    )
+    cdir = settings.data_dir / cid
+    before = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
+    }
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    provider_calls = []
+    monkeypatch.setattr(h3, "start", lambda *_args, **_kwargs: provider_calls.append(1))
+
+    with TestClient(create_app(settings)):
+        pass
+
+    recovered = storage.load_meta(settings.data_dir, cid)
+    after = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
+    }
+    assert recovered["status"] == "done"
+    assert recovered["error"] == "submission_recovery_required"
+    assert recovered["generation"] is None
+    assert recovered["_input_owner"] is None
+    assert provider_calls == []
+    assert after == before
+    assert storage.claim_submission_input(
+        settings.data_dir, cid, "request-new-long"
+    )
+
+
 @pytest.fixture
 def enabled(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
