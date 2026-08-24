@@ -816,6 +816,7 @@ def create_app(settings: Settings) -> FastAPI:
     # Seedream 后处理并行提交的进程级信号量：单进程内跨会话全局并发上限（SEEDREAM_CONCURRENCY）
     seedream_sem = asyncio.Semaphore(settings.seedream_concurrency)
     app.state.h3_resume_threads = []
+    app.state.pipeline_recovery_threads = []
 
     @app.on_event("startup")
     async def resume_h3_generations() -> None:
@@ -842,9 +843,28 @@ def create_app(settings: Settings) -> FastAPI:
                 app.state.h3_resume_threads.append(thread)
                 thread.start()
 
-    def run_pipeline_gated(cid: str) -> None:
+    def run_pipeline_gated(cid: str, claimed_owner: object = None) -> None:
         with pipeline_sem:
-            pipeline.run(settings, cid, codex_runner)
+            if claimed_owner is None:
+                pipeline.run(settings, cid, codex_runner)
+            else:
+                pipeline.run(
+                    settings, cid, codex_runner, claimed_owner=claimed_owner
+                )
+
+    @app.on_event("startup")
+    async def recover_pipeline_inputs() -> None:
+        if not settings.enable_pipeline:
+            return
+        for cid, owner in storage.claim_stale_pipeline_inputs(settings.data_dir):
+            thread = threading.Thread(
+                target=run_pipeline_gated,
+                args=(cid, owner),
+                daemon=True,
+                name=f"pipeline-recover-{cid[:8]}",
+            )
+            app.state.pipeline_recovery_threads.append(thread)
+            thread.start()
 
     @app.get("/api/health")
     async def health():

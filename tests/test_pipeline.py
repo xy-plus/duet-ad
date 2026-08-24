@@ -2064,6 +2064,98 @@ def test_run_voice_missing_output_reports_codex_stage(tmp_path, video_1s, monkey
 # ---------- HTTP 接线 ----------
 
 
+@pytest.mark.parametrize("partial_prompt", [False, True])
+def test_startup_recovers_stale_unfrozen_pipeline_claim_without_h3(
+    tmp_path, monkeypatch, partial_prompt,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=True, enable_h3_submit=False
+    )
+    meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
+    if partial_prompt:
+        (settings.data_dir / meta["id"] / "work" / "prompt.txt").write_text(
+            "partial, not frozen", encoding="utf-8"
+        )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    called = threading.Event()
+
+    def fake_run(_settings, cid, _runner, **_kwargs):
+        assert cid == meta["id"]
+        owner = _kwargs["claimed_owner"]
+        assert owner["process_generation"] == "boot-new"
+        assert storage.load_pipeline_claim(settings.data_dir, cid, owner)
+        assert storage.finish_input_claim(
+            settings.data_dir, cid, owner, status="failed", error="recovered-test"
+        )
+        called.set()
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+    with TestClient(create_app(settings)):
+        assert called.wait(timeout=1)
+
+
+@pytest.mark.parametrize("frozen", ["generation", "receipt", "plan", "fit"])
+def test_startup_does_not_resume_stale_pipeline_after_input_freezes(
+    tmp_path, monkeypatch, frozen,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=True, enable_h3_submit=False
+    )
+    meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
+    cdir = settings.data_dir / meta["id"]
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
+    if frozen == "generation":
+        storage.update_meta(
+            settings.data_dir, meta["id"], generation={"status": "queued"}
+        )
+    elif frozen == "receipt":
+        (cdir / "prepared_input.json").write_bytes(b"frozen-receipt")
+    elif frozen == "plan":
+        (cdir / "long_video_plan.json").write_bytes(b"frozen-plan")
+    else:
+        fitted = cdir / "work" / "h3_frames" / "crop" / "01.png"
+        fitted.parent.mkdir(parents=True)
+        fitted.write_bytes(b"frozen-fit")
+    before = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file()
+    }
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    called = []
+    monkeypatch.setattr(pipeline, "run", lambda *_args, **_kwargs: called.append(1))
+
+    with TestClient(create_app(settings)):
+        pass
+
+    after = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file()
+    }
+    assert called == []
+    assert after == before
+
+
+def test_startup_does_not_duplicate_current_process_pipeline_claim(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_pipeline=True, enable_h3_submit=False
+    )
+    meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-current")
+    assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
+    called = []
+    monkeypatch.setattr(pipeline, "run", lambda *_args, **_kwargs: called.append(1))
+
+    with TestClient(create_app(settings)):
+        pass
+
+    assert called == []
+
+
 def test_post_triggers_pipeline_and_detail_filled(tmp_path, video_1s, fake_steps):
     settings = make_settings(tmp_path, enable_pipeline=True)
     with TestClient(create_app(settings)) as c:

@@ -1042,17 +1042,22 @@ def _write_prepared_receipt(
     return final_prompt
 
 
-def run(settings: Settings, cid: str, runner) -> None:
+def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -> None:
     """后台任务入口；任何步骤失败 → status=failed + error，不抛异常。"""
     # data_dir 可能是相对路径（生产默认 "data"）：子进程带 cwd 时相对路径会错位，统一起点解析为绝对
     cdir = (settings.data_dir / cid).resolve()
     work = cdir / "work"
-    claim_owner = None
+    claim_owner = claimed_owner
     try:
-        meta = storage.claim_pipeline_input(settings.data_dir, cid)
+        meta = (
+            storage.claim_pipeline_input(settings.data_dir, cid)
+            if claim_owner is None
+            else storage.load_pipeline_claim(settings.data_dir, cid, claim_owner)
+        )
         if meta is None:
             return
-        claim_owner = meta["_input_owner"]
+        if claim_owner is None:
+            claim_owner = meta["_input_owner"]
         sources = sorted(cdir.glob("source.*"))
         if not sources:
             raise PipelineError("source video missing")
