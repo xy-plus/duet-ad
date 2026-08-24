@@ -9,6 +9,7 @@
   --divider: rgba(0, 0, 0, .08);
   --danger: #D70015;
   --success: #248A3D;
+  --warning: #9A6700;
   --radius-card: 20px;
   --radius-lg: 24px;
   --shadow-card: 0 4px 24px rgba(0, 0, 0, .06);
@@ -269,6 +270,7 @@ input, textarea { font-family: inherit; }
 
 .badge.queued { background: rgba(0, 0, 0, .06); color: var(--text-2); }
 .badge.processing { background: rgba(0, 113, 227, .12); color: var(--accent); }
+.badge.analyzed { background: rgba(255, 159, 10, .16); color: var(--warning); }
 .badge.done { background: rgba(52, 199, 89, .16); color: var(--success); }
 .badge.failed { background: rgba(255, 59, 48, .12); color: var(--danger); }
 
@@ -680,6 +682,13 @@ input, textarea { font-family: inherit; }
 .segment-prompt-toggle:hover { background: rgba(0, 113, 227, .08); }
 .segment-prompt-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .segment-prompt-panel { margin-top: 8px; }
+
+.segment-products-toggle {
+  width: 100%;
+  min-height: 44px;
+}
+
+.segment-products-panel { margin-top: 16px; }
 
 /* result video */
 .video-wrap {
