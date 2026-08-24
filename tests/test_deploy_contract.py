@@ -10,6 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / ".deploy" / "systemd" / "duet-ad1.service"
 SMOKE = ROOT / ".deploy" / "smoke-h3.sh"
 RUNBOOK = ROOT / ".deploy" / "runbook.md"
+LONG_VIDEO_BEHAVIOR = (
+    ROOT / "docs" / "human" / "features" / "conversation-task"
+    / "behaviors" / "long-video.md"
+)
 
 
 def test_user_service_preserves_codex_bwrap_sandbox_compatibility():
@@ -34,10 +38,12 @@ def test_user_service_preserves_codex_bwrap_sandbox_compatibility():
 
 
 def test_runbook_checks_audio_and_visual_durations_without_full_audio_claim():
-    text = RUNBOOK.read_text(encoding="utf-8")
-    assert "复用完整源音轨" not in text
-    assert "长于画面时裁剪、短于画面时补静音，画面时长不变" in text
-    assert "stream=codec_name,channels,duration,duration_ts,time_base" in text
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    behavior = LONG_VIDEO_BEHAVIOR.read_text(encoding="utf-8")
+    for text in (runbook, behavior):
+        assert "复用完整源音轨" not in text
+        assert "长于画面时裁剪、短于画面时补静音，画面时长不变" in text
+    assert "stream=codec_name,channels,duration,duration_ts,time_base" in runbook
 
 
 @pytest.mark.parametrize(

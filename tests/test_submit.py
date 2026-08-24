@@ -252,7 +252,13 @@ def test_submit_claim_wins_atomically_before_pipeline(enabled, monkeypatch):
 
     def block_first_submit_claim(path, meta):
         nonlocal blocked
-        if meta.get("_input_owner") == f"submit:{REQUEST_ID}" and not blocked:
+        owner = meta.get("_input_owner")
+        if (
+            isinstance(owner, dict)
+            and owner.get("kind") == "submit"
+            and owner.get("request_id") == REQUEST_ID
+            and not blocked
+        ):
             blocked = True
             entered.set()
             assert release.wait(timeout=5)
@@ -304,7 +310,8 @@ def test_pipeline_claim_wins_atomically_before_submit(enabled, monkeypatch):
 
     def block_first_pipeline_claim(path, meta):
         nonlocal blocked
-        if meta.get("_input_owner") == "pipeline" and not blocked:
+        owner = meta.get("_input_owner")
+        if isinstance(owner, dict) and owner.get("kind") == "pipeline" and not blocked:
             blocked = True
             entered.set()
             assert release.wait(timeout=5)

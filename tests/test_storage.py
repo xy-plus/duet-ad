@@ -1,3 +1,4 @@
+import hashlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -110,6 +111,150 @@ def test_pipeline_and_submission_claim_share_one_atomic_owner(
     assert len(writes) == 1
     provider_calls = 1 if results["submit"] is not None else 0
     assert provider_calls == (1 if first_owner == "submit" else 0)
+
+
+def test_new_process_generation_reclaims_unfrozen_pipeline_owner(tmp_path, monkeypatch):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    old = storage.claim_pipeline_input(tmp_path, meta["id"])
+    assert old["_input_owner"]["process_generation"] == "boot-old"
+
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    recovered = storage.claim_pipeline_input(tmp_path, meta["id"])
+
+    assert recovered is not None
+    assert recovered["status"] == "processing"
+    assert recovered["_input_owner"] == {
+        "kind": "pipeline", "process_generation": "boot-new",
+        "frozen_input_snapshot": {},
+    }
+
+
+def test_new_process_generation_reruns_pipeline_after_only_partial_prompt(
+    tmp_path, monkeypatch,
+):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_pipeline_input(tmp_path, meta["id"])
+    prompt = tmp_path / meta["id"] / "work" / "prompt.txt"
+    prompt.write_text("partial, not frozen", encoding="utf-8")
+
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    assert storage.claim_pipeline_input(tmp_path, meta["id"]) is not None
+
+
+def test_new_process_generation_does_not_rerun_pipeline_after_receipt_landed(
+    tmp_path, monkeypatch,
+):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_pipeline_input(tmp_path, meta["id"])
+    receipt = tmp_path / meta["id"] / "prepared_input.json"
+    receipt.write_bytes(b"frozen")
+
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    before = (tmp_path / meta["id"] / "meta.json").read_bytes()
+    assert storage.claim_pipeline_input(tmp_path, meta["id"]) is None
+    assert (tmp_path / meta["id"] / "meta.json").read_bytes() == before
+
+
+def test_new_process_generation_reclaims_unfrozen_submit_owner_with_new_request(
+    tmp_path, monkeypatch,
+):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    storage.update_meta(tmp_path, meta["id"], status="done", duration_s=9.2)
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_submission_input(tmp_path, meta["id"], "request-old")
+
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    recovered = storage.claim_submission_input(tmp_path, meta["id"], "request-new")
+
+    assert recovered is not None
+    assert recovered["_input_owner"] == {
+        "kind": "submit", "process_generation": "boot-new",
+        "request_id": "request-new", "frozen_input_snapshot": {},
+    }
+
+
+def test_new_process_reclaims_submit_owner_when_preexisting_receipt_is_unchanged(
+    tmp_path, monkeypatch,
+):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    cdir = tmp_path / meta["id"]
+    (cdir / "prepared_input.json").write_bytes(b"pipeline-receipt")
+    storage.update_meta(
+        tmp_path, meta["id"], status="done", duration_s=9.2,
+        prepared_input_receipt="prepared_input.json",
+    )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_submission_input(tmp_path, meta["id"], "request-old")
+
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    recovered = storage.claim_submission_input(tmp_path, meta["id"], "request-new")
+
+    assert recovered is not None
+    assert recovered["_input_owner"]["request_id"] == "request-new"
+    assert recovered["_input_owner"]["frozen_input_snapshot"] == {
+        "prepared_input.json": hashlib.sha256(b"pipeline-receipt").hexdigest(),
+    }
+
+
+@pytest.mark.parametrize("frozen", ["generation", "prepared", "plan", "fit"])
+def test_new_process_cannot_take_over_submit_owner_after_frozen_artifact(
+    tmp_path, monkeypatch, frozen,
+):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    cdir = tmp_path / meta["id"]
+    storage.update_meta(tmp_path, meta["id"], status="done", duration_s=9.2)
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert storage.claim_submission_input(tmp_path, meta["id"], "request-old")
+    if frozen == "generation":
+        storage.update_meta(tmp_path, meta["id"], generation={"status": "queued"})
+    elif frozen == "prepared":
+        (cdir / "prepared_input.json").write_bytes(b"frozen-prepared")
+    elif frozen == "plan":
+        (cdir / "long_video_plan.json").write_bytes(b"frozen-plan")
+    else:
+        fit = cdir / "work" / "h3_frames" / "crop"
+        fit.mkdir(parents=True)
+        (fit / "01.png").write_bytes(b"frozen-fit")
+    before = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file()
+    }
+
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    assert storage.claim_submission_input(tmp_path, meta["id"], "request-new") is None
+
+    after = {
+        path.relative_to(cdir).as_posix(): path.read_bytes()
+        for path in cdir.rglob("*") if path.is_file()
+    }
+    assert after == before
+
+
+def test_finish_input_claim_is_bound_to_exact_process_generation(tmp_path, monkeypatch):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    claimed = storage.claim_pipeline_input(tmp_path, meta["id"])
+    owner = claimed["_input_owner"]
+    before = (tmp_path / meta["id"] / "meta.json").read_bytes()
+
+    wrong = {**owner, "process_generation": "boot-new"}
+    assert storage.finish_input_claim(
+        tmp_path, meta["id"], wrong, status="done"
+    ) is None
+    assert (tmp_path / meta["id"] / "meta.json").read_bytes() == before
+    assert storage.finish_input_claim(
+        tmp_path, meta["id"], owner, status="done"
+    )["status"] == "done"
+
+
+def test_legacy_meta_without_owner_remains_claimable(tmp_path, monkeypatch):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    claimed = storage.claim_pipeline_input(tmp_path, meta["id"])
+    assert claimed is not None
 
 
 def test_resolve_file_whitelist(tmp_path):
