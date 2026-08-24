@@ -120,8 +120,10 @@ def test_navigation_status_matrix_is_authoritative_and_consistent(
         output.write_bytes(b"accepted-by-test-double")
     monkeypatch.setattr(
         main_module,
-        "_has_accepted_generated_output",
-        lambda cdir: (cdir / "generated.mp4").is_file(),
+        "_has_valid_generated_video",
+        lambda _settings, candidate: (
+            _settings.data_dir / candidate["id"] / "generated.mp4"
+        ).is_file(),
     )
 
     with TestClient(create_app(settings)) as client:

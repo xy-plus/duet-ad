@@ -392,6 +392,61 @@ def reusable_segment_indices(
     return frozenset(reusable)
 
 
+def generation_segments_are_valid(
+    expected_segments: object,
+    generation: Mapping,
+) -> bool:
+    """Validate the complete ordered persisted coordinator state."""
+    raw = generation.get("segments")
+    if not isinstance(expected_segments, (list, tuple)) or not isinstance(raw, list):
+        return False
+    if len(raw) != len(expected_segments) or not raw:
+        return False
+    keys = {
+        "index", "chain_id", "join_mode", "status", "attempt", "error",
+        "child_request_id",
+    }
+    statuses = {
+        "not_started", "queued", "running", "resume_required", "succeeded",
+        "failed", "submission_unknown",
+    }
+    for position, (expected, item) in enumerate(zip(expected_segments, raw), 1):
+        if not isinstance(item, dict) or set(item) != keys:
+            return False
+        if isinstance(expected, FrozenSegment):
+            expected_index = expected.index
+            expected_chain = expected.chain_id
+            expected_join = expected.join_mode
+        elif isinstance(expected, Mapping):
+            expected_index = expected.get("index")
+            expected_chain = expected.get("chain_id")
+            expected_join = expected.get("join_mode")
+        else:
+            return False
+        attempt = item.get("attempt")
+        child_id = item.get("child_request_id")
+        if (
+            expected_index != position
+            or item.get("index") != expected_index
+            or item.get("chain_id") != expected_chain
+            or item.get("join_mode") != expected_join
+            or item.get("status") not in statuses
+            or isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or attempt < 0
+            or (
+                item.get("error") is not None
+                and not isinstance(item.get("error"), str)
+            )
+            or (
+                child_id is not None
+                and (not isinstance(child_id, str) or not child_id)
+            )
+        ):
+            return False
+    return True
+
+
 def bound_reusable_segment_indices(
     settings,
     cid: str,
@@ -401,6 +456,8 @@ def bound_reusable_segment_indices(
     """Single source of truth for paid-count and execution reuse decisions."""
     segments = generation.get("segments")
     expected = tuple(item.index for item in plan.segments)
+    if not generation_segments_are_valid(plan.segments, generation):
+        return frozenset()
     meta = storage.load_meta(settings.data_dir, cid)
     fit_mode = meta.get("fit_mode") if isinstance(meta, dict) else None
     if fit_mode not in {"none", "crop", "pad"}:
@@ -494,6 +551,88 @@ def _stitch(settings, cid: str, plan: FrozenPlan, dialogue_mode: str) -> None:
         output=plan.root / "generated.mp4",
         audio_mode="keep" if dialogue_mode == "auto" else "mute",
     )
+    if not stitched_output_is_reusable(plan, dialogue_mode):
+        raise LongGenerationError("long_video_stitch_output_invalid")
+
+
+def stitched_output_is_reusable(plan: FrozenPlan, dialogue_mode: str) -> bool:
+    """Validate the published video against the exact local stitch receipt."""
+    if dialogue_mode not in {"auto", "none"}:
+        return False
+    output = plan.root / "generated.mp4"
+    receipt_path = plan.root / stitch.RECEIPT_FILENAME
+    audio_mode = "keep" if dialogue_mode == "auto" else "mute"
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema", "version", "segments", "audio", "output"}
+            or payload.get("schema") != "duet.stitch"
+            or payload.get("version") != 1
+        ):
+            return False
+        budgets = stitch._frame_budgets([
+            stitch.StitchSegment(
+                item.workdir / "generated.mp4",
+                item.end_s - item.start_s,
+                item.join_mode,
+            )
+            for item in plan.segments
+        ])
+        expected_segments = [
+            {
+                "index": index,
+                "path": str((item.workdir / "generated.mp4").resolve()),
+                "sha256": stitch._sha256(item.workdir / "generated.mp4"),
+                "target_duration_s": item.end_s - item.start_s,
+                "output_frames": budgets[index - 1],
+                "join_mode": item.join_mode,
+            }
+            for index, item in enumerate(plan.segments, 1)
+        ]
+        if payload.get("segments") != expected_segments:
+            return False
+        source_info = stitch._probe(plan.source)
+        expected_audio = {
+            "mode": audio_mode,
+            "source": str(plan.source.resolve()),
+            "source_sha256": stitch._sha256(plan.source),
+            "source_has_audio": source_info.has_audio,
+        }
+        if payload.get("audio") != expected_audio:
+            return False
+        output_receipt = payload.get("output")
+        stat = output.stat()
+        if (
+            not output.is_file()
+            or stat.st_size <= 0
+            or not isinstance(output_receipt, dict)
+            or set(output_receipt)
+            != {"name", "sha256", "size", "duration_s", "fps"}
+            or output_receipt.get("name") != "generated.mp4"
+            or output_receipt.get("size") != stat.st_size
+            or output_receipt.get("sha256") != stitch._sha256(output)
+            or output_receipt.get("fps") != stitch.FPS
+        ):
+            return False
+        expected_duration = sum(item.end_s - item.start_s for item in plan.segments)
+        output_info = stitch._validate_output(
+            output, expected_duration, audio_mode, source_info.has_audio
+        )
+        receipt_duration = float(output_receipt.get("duration_s"))
+        return (
+            math.isfinite(receipt_duration)
+            and abs(receipt_duration - output_info.duration_s) <= _EPS
+        )
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        stitch.StitchError,
+    ):
+        return False
 
 
 def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
@@ -502,6 +641,17 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
     if not meta or not isinstance(meta.get("generation"), dict):
         return
     generation = meta["generation"]
+    if not generation_segments_are_valid(plan.segments, generation):
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            generation={
+                **generation,
+                "status": "submission_unknown",
+                "error": "submission_unknown",
+            },
+        )
+        return
     parent_id = generation.get("client_request_id")
     fit_mode = meta.get("fit_mode")
     dialogue_mode = meta.get("dialogue_mode")

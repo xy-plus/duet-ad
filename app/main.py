@@ -150,11 +150,6 @@ def _public_dialogue(meta: dict) -> dict:
     return {"mode": mode, "lines": effective, "auto_lines": automatic}
 
 
-def _has_accepted_generated_output(cdir: Path) -> bool:
-    """Single seam for the service's current final-output acceptance check."""
-    return (cdir / "generated.mp4").is_file()
-
-
 def _navigation_status(meta: dict, *, has_video: bool) -> str:
     analysis = meta.get("status")
     analysis_states = {
@@ -790,6 +785,57 @@ def _mark_submission_unknown(settings: Settings, cid: str, generation: dict) -> 
     )
 
 
+def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
+    generation = meta.get("generation")
+    # Pre-H3 legacy conversations have no receipt to validate. Preserve their
+    # historical visibility; every receipt-aware generation is fail closed.
+    if generation is None:
+        cid = meta.get("id")
+        return (
+            isinstance(cid, str)
+            and (settings.data_dir / cid / "generated.mp4").is_file()
+        )
+    if not isinstance(generation, dict) or generation.get("status") != "succeeded":
+        return False
+    cid = meta.get("id")
+    if not isinstance(cid, str):
+        return False
+    if _is_long_video(meta):
+        expected = meta.get("frozen_plan_receipt")
+        if (
+            not isinstance(expected, str)
+            or not long_generation.generation_segments_are_valid(
+                meta.get("segments"), generation
+            )
+        ):
+            return False
+        try:
+            plan = long_generation.freeze_plan(
+                settings.data_dir / cid,
+                meta,
+                expected,
+                meta.get("fit_mode"),
+                meta.get("dialogue_mode"),
+                prepare_fit=False,
+            )
+            reusable = long_generation.bound_reusable_segment_indices(
+                settings, cid, plan, generation
+            )
+            return (
+                reusable == frozenset(item.index for item in plan.segments)
+                and long_generation.stitched_output_is_reusable(
+                    plan, meta.get("dialogue_mode")
+                )
+            )
+        except long_generation.LongGenerationError:
+            return False
+    try:
+        request = _load_h3_request(settings, cid, meta)
+        return h3.output_is_reusable(request)
+    except (_SubmitError, h3.H3Error):
+        return False
+
+
 def _resume_generation(settings: Settings, cid: str) -> None:
     meta = storage.load_meta(settings.data_dir, cid)
     if meta is None or _is_read_only(meta):
@@ -799,7 +845,7 @@ def _resume_generation(settings: Settings, cid: str) -> None:
         return
     recovering_missing_output = (
         generation.get("status") == "succeeded"
-        and not (settings.data_dir / cid / "generated.mp4").is_file()
+        and not _has_valid_generated_video(settings, meta)
     )
     if (
         generation.get("status") not in _GENERATION_ACTIVE
@@ -827,8 +873,10 @@ def _resume_generation(settings: Settings, cid: str) -> None:
         result = h3.resume(request)
     except _SubmitError:
         _mark_submission_unknown(settings, cid, generation)
+    except h3.ReceiptError:
+        _mark_submission_unknown(settings, cid, generation)
     except h3.H3Error as exc:
-        if request is None:
+        if request is None or exc.code == "state_unavailable":
             _mark_submission_unknown(settings, cid, generation)
         else:
             _generation_error(settings, cid, request, exc.code)
@@ -851,6 +899,11 @@ def _resume_long_generation(settings: Settings, cid: str) -> None:
     meta = storage.load_meta(settings.data_dir, cid)
     generation = meta.get("generation") if meta else None
     if not isinstance(generation, dict) or not isinstance(generation.get("segments"), list):
+        return
+    if not long_generation.generation_segments_are_valid(
+        meta.get("segments"), generation
+    ):
+        _mark_submission_unknown(settings, cid, generation)
         return
     expected = meta.get("frozen_plan_receipt")
     if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
@@ -980,9 +1033,7 @@ def create_app(settings: Settings) -> FastAPI:
                     generation.get("status") in _GENERATION_ACTIVE
                     or (
                         generation.get("status") == "succeeded"
-                        and not (
-                            settings.data_dir / meta["id"] / "generated.mp4"
-                        ).is_file()
+                        and not _has_valid_generated_video(settings, meta)
                     )
                 )
             ):
@@ -1046,8 +1097,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def list_conversations():
         result = []
         for meta in storage.list_conversations(settings.data_dir):
-            cdir = settings.data_dir / meta["id"]
-            has_video = _has_accepted_generated_output(cdir)
+            has_video = _has_valid_generated_video(settings, meta)
             result.append({
                 "id": meta["id"],
                 "title": meta["title"],
@@ -1157,7 +1207,7 @@ def create_app(settings: Settings) -> FastAPI:
         if meta is None:
             raise HTTPException(status_code=404, detail="not found")
         cdir = settings.data_dir / cid
-        has_video = _has_accepted_generated_output(cdir)
+        has_video = _has_valid_generated_video(settings, meta)
         source_prompt, source_prompt_sha256 = _source_prompt_snapshot(cdir)
         result = {
             "id": meta["id"],
@@ -1276,6 +1326,13 @@ def create_app(settings: Settings) -> FastAPI:
                 old = meta.get("generation")
                 previous_status = old.get("status") if isinstance(old, dict) else None
                 previous_id = old.get("client_request_id") if isinstance(old, dict) else None
+                if isinstance(old, dict) and not long_generation.generation_segments_are_valid(
+                    meta.get("segments"), old
+                ):
+                    _mark_submission_unknown(settings, cid, old)
+                    raise HTTPException(
+                        status_code=409, detail="submission_outcome_unknown"
+                    )
                 same_parameters = (
                     meta.get("dialogue_mode") == dialogue_mode
                     and meta.get("fit_mode") == fit_mode
@@ -1297,7 +1354,7 @@ def create_app(settings: Settings) -> FastAPI:
                     and previous_id == request_id
                     and same_parameters
                 )
-                if (settings.data_dir / cid / "generated.mp4").is_file():
+                if _has_valid_generated_video(settings, meta):
                     if previous_status == "succeeded":
                         if previous_id != request_id or not same_parameters:
                             raise HTTPException(

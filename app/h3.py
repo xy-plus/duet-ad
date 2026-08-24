@@ -443,6 +443,9 @@ def output_is_reusable(
         state = _find_attempt(request, request.client_request_id)
     if state is None:
         return False
+    marker = _state_root(request) / "session.json"
+    if _read_json(marker) != {"schema_version": SCHEMA_VERSION, "cid": request.cid}:
+        raise ReceiptError("session_cid_mismatch")
     _validate_state(request, state)
     h3_state = state.get("h3")
     if (

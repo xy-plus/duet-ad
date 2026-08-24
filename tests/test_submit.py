@@ -1,16 +1,26 @@
+import hashlib
 import json
+import socket
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
+import httpx
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 from app import h3, pipeline, prepared_input, storage
-from app.main import _freeze_submission, _result_fields, _resume_generation, create_app
+from app.main import (
+    _freeze_submission,
+    _load_h3_request,
+    _result_fields,
+    _resume_generation,
+    create_app,
+)
 
 
 PROMPT = "镜头从整洁的房间缓慢推进。"
@@ -81,6 +91,66 @@ def _write_initial_receipt(settings, cid):
     return frozen
 
 
+def _write_startup_h3_attempt(settings, cid, *, generation_status="running"):
+    cdir = settings.data_dir / cid
+    prepared_input.write_prepared_input(
+        root=cdir,
+        source=cdir / "source.mp4",
+        audio=None,
+        keyframes=[cdir / "work" / "keyframes" / "01.png"],
+        visual=cdir / "work" / "visual_prompt.txt",
+        final=cdir / "work" / "prompt.txt",
+        dialogue_mode="none",
+        dialogue=(),
+        vocal_filter_enabled=True,
+        duration_s=9.2,
+        ratio="9:16",
+        fit_mode="none",
+        engine_request={
+            "h3": {
+                "workflow": h3.H3_WORKFLOW,
+                "duration": 10,
+                "resolution": h3.H3_RESOLUTION,
+            }
+        },
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={
+            "status": generation_status,
+            "error": None,
+            "attempt": 1,
+            "client_request_id": REQUEST_ID,
+            "stage": "h3",
+        },
+        prepared_dialogue=[],
+        prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
+        fit_mode="none",
+        dialogue_mode="none",
+    )
+    request = _load_h3_request(
+        settings, cid, storage.load_meta(settings.data_dir, cid)
+    )
+    state_root = cdir / ".h3"
+    attempt_path = state_root / "attempts" / "000001" / "attempt.json"
+    attempt_path.parent.mkdir(parents=True)
+    (state_root / "session.json").write_text(
+        json.dumps({"schema_version": h3.SCHEMA_VERSION, "cid": cid}),
+        encoding="utf-8",
+    )
+    state = h3._new_state(request, "000001", REQUEST_ID)
+    task_id = "known-paid-task"
+    state.update(status="h3_running", retryable=False)
+    state["h3"] = {
+        "status": "running",
+        "task_id": task_id,
+        "receipt": h3._h3_receipt(request, task_id),
+    }
+    attempt_path.write_text(json.dumps(state), encoding="utf-8")
+    return request, state_root / "session.json", attempt_path
+
+
 def _payload(request_id=REQUEST_ID, *, mode="none", fit="none", lines=None):
     payload = {
         "confirm": True,
@@ -102,6 +172,26 @@ def enabled(tmp_path):
     )
     with TestClient(create_app(settings)) as client:
         yield settings, client
+
+
+@pytest.fixture(scope="session")
+def recovery_video_bytes(tmp_path_factory):
+    root = tmp_path_factory.mktemp("short-recovery-videos")
+    result = {}
+    for name, duration in (("target", 10), ("wrong", 1)):
+        path = root / f"{name}.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                f"color=c=black:s=32x32:r=5:d={duration}",
+                "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", "-y", str(path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        result[name] = path.read_bytes()
+    return result
 
 
 def test_source_prompt_can_be_cas_edited_before_h3(enabled, monkeypatch):
@@ -788,3 +878,204 @@ def test_startup_resume_uses_direct_h3_state(tmp_path, monkeypatch):
     assert request and request[0].client_request_id == REQUEST_ID
     meta = storage.load_meta(settings.data_dir, cid)
     assert meta["generation"]["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("damage", "generation_status"),
+    [
+        ("session_wrong_cid", "running"),
+        ("session_unicode", "running"),
+        ("attempt_missing", "running"),
+        ("attempt_json", "running"),
+        ("attempt_unicode", "running"),
+        ("input_receipt", "running"),
+        ("output_receipt", "succeeded"),
+    ],
+)
+def test_short_startup_corrupt_paid_receipt_locks_unknown_without_provider_post(
+    tmp_path, monkeypatch, damage, generation_status
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art-test-secret"
+    )
+    cid, _ = _make_conv(settings)
+    _request, session_path, attempt_path = _write_startup_h3_attempt(
+        settings, cid, generation_status=generation_status
+    )
+    if damage == "session_wrong_cid":
+        session_path.write_text(
+            json.dumps({"schema_version": h3.SCHEMA_VERSION, "cid": "wrong"}),
+            encoding="utf-8",
+        )
+    elif damage == "session_unicode":
+        session_path.write_bytes(b"\xff")
+    elif damage == "attempt_missing":
+        attempt_path.unlink()
+    elif damage == "attempt_json":
+        attempt_path.write_text("{", encoding="utf-8")
+    elif damage == "attempt_unicode":
+        attempt_path.write_bytes(b"\xff")
+    else:
+        state = json.loads(attempt_path.read_text(encoding="utf-8"))
+        if damage == "input_receipt":
+            state["input_receipt"] = "0" * 64
+        else:
+            state.update(status="succeeded", retryable=False)
+            state["h3"].update(
+                status="succeeded",
+                output={"name": "generated.mp4", "sha256": "bad", "size": 1},
+            )
+        attempt_path.write_text(json.dumps(state), encoding="utf-8")
+
+    prepared_path = settings.data_dir / cid / prepared_input.RECEIPT_FILENAME
+    frozen_prepared = prepared_path.read_bytes()
+    frozen_attempt = attempt_path.read_bytes() if attempt_path.exists() else None
+    provider_calls = []
+    original_resume = h3.resume
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        provider_calls.append(request)
+        assert request.method == "GET"
+        return httpx.Response(503)
+
+    def resume(request):
+        with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+            return original_resume(request, client=client)
+
+    monkeypatch.setattr(h3, "resume", resume)
+    _resume_generation(settings, cid)
+
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation["status"] == "submission_unknown"
+    assert generation["error"] == "submission_unknown"
+    assert generation["attempt"] == 1
+    assert provider_calls == []
+    assert prepared_path.read_bytes() == frozen_prepared
+    if frozen_attempt is None:
+        assert not attempt_path.exists()
+    else:
+        assert attempt_path.read_bytes() == frozen_attempt
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_status"),
+    [
+        ("state_unavailable", "submission_unknown"),
+        ("h3_provider_failed", "failed"),
+    ],
+)
+def test_short_startup_only_locks_local_state_access_errors(
+    tmp_path, monkeypatch, code, expected_status
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art-test-secret"
+    )
+    cid, _ = _make_conv(settings)
+    _write_startup_h3_attempt(settings, cid)
+    monkeypatch.setattr(
+        h3,
+        "resume",
+        lambda _request: (_ for _ in ()).throw(h3.H3Error(code)),
+    )
+    monkeypatch.setattr(h3, "retry", lambda *_args: pytest.fail("must not retry"))
+    _resume_generation(settings, cid)
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation["status"] == expected_status
+    assert generation["attempt"] == 1
+
+
+@pytest.mark.parametrize("damage", ["zero", "tampered", "wrong_duration"])
+def test_short_invalid_published_video_is_hidden_and_startup_redownloads_get_only(
+    enabled, monkeypatch, recovery_video_bytes, damage
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    request, _session_path, attempt_path = _write_startup_h3_attempt(
+        settings, cid, generation_status="succeeded"
+    )
+    output = request.workdir / "generated.mp4"
+    target = recovery_video_bytes["target"]
+    output.write_bytes(target)
+    state = json.loads(attempt_path.read_text(encoding="utf-8"))
+    state.update(status="succeeded", retryable=False)
+    state["h3"].update(
+        status="succeeded",
+        output={
+            "name": "generated.mp4",
+            "sha256": hashlib.sha256(target).hexdigest(),
+            "size": len(target),
+        },
+    )
+    if damage == "zero":
+        output.write_bytes(b"")
+    elif damage == "tampered":
+        output.write_bytes(target[:-32] + b"x" * 32)
+    else:
+        wrong = recovery_video_bytes["wrong"]
+        output.write_bytes(wrong)
+        state["h3"]["output"] = {
+            "name": "generated.mp4",
+            "sha256": hashlib.sha256(wrong).hexdigest(),
+            "size": len(wrong),
+        }
+    attempt_path.write_text(json.dumps(state), encoding="utf-8")
+    frozen_input = (state["input"], state["input_receipt"], state["attempt_id"])
+    prepared_path = settings.data_dir / cid / prepared_input.RECEIPT_FILENAME
+    frozen_prepared = prepared_path.read_bytes()
+
+    assert client.get(f"/api/conversations/{cid}", headers=AUTH).json()["has_video"] is False
+    listed = client.get("/api/conversations", headers=AUTH).json()
+    assert next(item for item in listed if item["id"] == cid)["has_video"] is False
+    calls = []
+
+    class PublicStream:
+        def get_extra_info(self, name):
+            return ("93.184.216.34", 443) if name == "server_addr" else None
+
+    def provider(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        assert req.method == "GET"
+        if req.url.path.endswith("/result/known-paid-task"):
+            return httpx.Response(
+                200,
+                json={"data": {"status": "SUCCESS", "results": [
+                    {"url": "https://download.invalid/video.mp4"}
+                ]}},
+            )
+        return httpx.Response(
+            200,
+            content=target,
+            extensions={"network_stream": PublicStream()},
+        )
+
+    original_resume = h3.resume
+
+    def resume(value):
+        with httpx.Client(transport=httpx.MockTransport(provider)) as provider_client:
+            return original_resume(value, client=provider_client)
+
+    monkeypatch.setattr(h3, "resume", resume)
+    monkeypatch.setattr(
+        h3.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    _resume_generation(settings, cid)
+
+    assert calls and all(call.method == "GET" for call in calls)
+    assert output.read_bytes() == target
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert recovered["generation"]["status"] == "succeeded"
+    assert recovered["generation"]["attempt"] == 1
+    assert prepared_path.read_bytes() == frozen_prepared
+    final_state = json.loads(attempt_path.read_text(encoding="utf-8"))
+    assert (
+        final_state["input"],
+        final_state["input_receipt"],
+        final_state["attempt_id"],
+    ) == frozen_input
+    assert client.get(f"/api/conversations/{cid}", headers=AUTH).json()["has_video"] is True
+    listed = client.get("/api/conversations", headers=AUTH).json()
+    assert next(item for item in listed if item["id"] == cid)["has_video"] is True
