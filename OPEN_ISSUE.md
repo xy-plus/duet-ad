@@ -8,8 +8,12 @@
 
 ## 🚧 进行中
 
+
 ## 📌 待办与限制
 
+- `stitch` 对受控 ffmpeg 产物的探测仍在视频流 duration 缺失时回退容器时长；后续一致性清理改用 `duration_ts × time_base` 并移除该容器兜底。（→ `app/stitch.py`）
+- `input_recovery_required` / `submission_recovery_required` 已稳定对外，但 reference、human 与 runbook 尚未专门说明含义及用户动作。（→ `docs/agent/reference/`, `docs/human/`, `.deploy/runbook.md`）
+- 非 UTF-8 stale receipt 回归已锁 receipt 字节不变；后续可扩为与相邻恢复测试一致的全部非 meta 文件快照闭包。（→ `tests/test_submit.py`）
 - H3 只能做高相似复刻，不能保证逐像素、逐帧、文字、原音或节奏一致；若目标升级为“一模一样”，需重新定义输入契约、模型与验收指标。（→ `temp/09-restore-h3-no-face/`, `docs/human/features/conversation-task/`）
 - 从仓库根直接运行 `pytest -q` 会收集 `temp/09-*`、`temp/10-*` 的同名测试模块并冲突；规范命令暂为 `pytest tests -q`，后续应增加 pytest 收集隔离或重命名模块。（→ `temp/`）
 - 全量测试仍有 FastAPI `on_event` 与 Starlette TestClient/httpx 弃用 warning；迁移 lifespan 和兼容测试客户端后再升级依赖。（→ `app/main.py`, `tests/`）
