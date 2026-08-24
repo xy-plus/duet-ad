@@ -444,7 +444,8 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 
 - 入口：`web-next/index.html` → `src/main.tsx` → `App.tsx`。
 - 状态：`useMockStore()` 使用内存 reducer 提供三个预置会话与新建会话；刷新页面即复位。
-- 时序：分析、四分片生成和关键帧后处理都由可清理的浏览器 timer 推进，运行中按钮锁定。
+- 时序：一个可清理的浏览器 timer 统一推进所有会话的分析、四分片生成和关键帧后处理；切换会话不会暂停任务，运行中按钮锁定。
+- 输入冻结：链接与上传文件分槽保存；生成开始后提示词和生成参数在 UI 与 reducer 两层拒绝修改。
 - 网络边界：不存在 API base，不调用 `fetch`/XHR；图像只读取 `public/placeholders/` 中的本地 SVG。
 - 视觉体系：只使用 `antd` 与 `@ant-design/x`，主题入口为 `src/theme.ts`，业务样式为 `src/styles.css`。
 - 验证：在 `web-next/` 执行 `npm test -- --run && npm run lint && npm run build`。
