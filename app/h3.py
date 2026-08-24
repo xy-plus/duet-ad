@@ -1171,8 +1171,10 @@ def _probe_video(path: Path, timeout_s: float) -> bool:
                 "ffprobe",
                 "-v",
                 "error",
+                "-select_streams",
+                "v:0",
                 "-show_entries",
-                "stream=codec_type:format=duration",
+                "stream=codec_type,duration,duration_ts,time_base",
                 "-of",
                 "json",
                 str(path),
@@ -1187,7 +1189,6 @@ def _probe_video(path: Path, timeout_s: float) -> bool:
         return False
     try:
         payload = json.loads(result.stdout)
-        duration = float((payload.get("format") or {}).get("duration"))
         streams = payload.get("streams")
     except (
         ValueError,
@@ -1196,15 +1197,24 @@ def _probe_video(path: Path, timeout_s: float) -> bool:
         json.JSONDecodeError,
     ):
         return False
-    return (
-        math.isfinite(duration)
-        and duration > 0
-        and isinstance(streams, list)
-        and any(
-            isinstance(stream, dict) and stream.get("codec_type") == "video"
-            for stream in streams
-        )
-    )
+    if not isinstance(streams, list) or not streams:
+        return False
+    stream = streams[0]
+    if not isinstance(stream, dict) or stream.get("codec_type") != "video":
+        return False
+    try:
+        duration = float(stream.get("duration"))
+        if math.isfinite(duration) and duration > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        ticks = float(stream.get("duration_ts"))
+        numerator, denominator = str(stream.get("time_base")).split("/", 1)
+        duration = ticks * float(numerator) / float(denominator)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return False
+    return math.isfinite(duration) and duration > 0
 
 
 def _submission_unknown(request: H3Request, state: dict[str, Any], stage: str) -> None:

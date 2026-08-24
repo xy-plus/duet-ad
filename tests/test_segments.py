@@ -189,7 +189,9 @@ def _fake_cmd_segments(calls, segments):
             out = Path(argv[argv.index("--out-dir") + 1])
             out.mkdir(parents=True, exist_ok=True)
             (out / "contact_sheet.jpg").write_bytes(b"sheet")
-            (out / "manifest.json").write_text("{}")
+            (out / "manifest.json").write_text(
+                json.dumps({"duration_seconds": 24.0})
+            )
         elif step == "scenes":
             work = Path(argv[argv.index("--work-dir") + 1])
             (work / "scenes.json").write_text(
@@ -269,6 +271,9 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
             )
 
     monkeypatch.setattr(pipeline, "_voice_step", fake_voice_step)
+    monkeypatch.setattr(
+        storage, "probe_video", lambda _path: storage.VideoProbe(24.0, 320, 240)
+    )
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
     monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
     monkeypatch.setattr(CodexRunner, "run", fake_codex)
@@ -348,6 +353,11 @@ def test_new_input_over_300_seconds_fails_before_any_pipeline_operation(
         raise AssertionError("pipeline operation ran for oversized input")
 
     monkeypatch.setattr(pipeline, "_run_cmd", must_not_run)
+    monkeypatch.setattr(
+        storage,
+        "probe_video",
+        lambda _path: storage.VideoProbe(300.001, 320, 240),
+    )
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
 
     stored = storage.load_meta(settings.data_dir, meta["id"])

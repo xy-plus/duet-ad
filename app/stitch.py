@@ -324,10 +324,15 @@ def stitch_video(
         candidate = joined
         if audio_mode == "keep" and source_info.has_audio:
             candidate = tmp / "candidate.mp4"
+            audio_filter = (
+                f"[1:a:0]atrim=duration={encoded_duration:.9f},"
+                f"asetpts=PTS-STARTPTS,apad=whole_dur={encoded_duration:.9f}[a]"
+            )
             _run(
                 [
                     "ffmpeg", "-v", "error", "-y", "-i", str(joined),
-                    "-i", str(source), "-map", "0:v:0", "-map", "1:a:0",
+                    "-i", str(source), "-filter_complex", audio_filter,
+                    "-map", "0:v:0", "-map", "[a]",
                     "-c:v", "copy", "-c:a", "aac", "-t", f"{encoded_duration:.9f}",
                     "-movflags", "+faststart", str(candidate),
                 ],

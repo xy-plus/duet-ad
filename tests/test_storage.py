@@ -1,6 +1,9 @@
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import pytest
 
 from app import storage
 
@@ -151,8 +154,8 @@ def test_probe_video_returns_duration_and_dimensions_in_one_probe(tmp_path, monk
     class Completed:
         returncode = 0
         stdout = json.dumps({
-            "format": {"duration": "14.25"},
-            "streams": [{"width": 1080, "height": 1920}],
+            "format": {"duration": "14.27"},
+            "streams": [{"width": 1080, "height": 1920, "duration": "14.25"}],
         })
         stderr = ""
 
@@ -165,6 +168,79 @@ def test_probe_video_returns_duration_and_dimensions_in_one_probe(tmp_path, monk
     assert info.duration_s == 14.25
     assert (info.width, info.height) == (1080, 1920)
     assert len(calls) == 1
+
+
+def test_probe_video_uses_video_stream_not_longer_audio_or_container(tmp_path, monkeypatch):
+    completed = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({
+            "format": {"duration": "16.787007"},
+            "streams": [{
+                "width": 1080, "height": 1920, "duration": "16.766667",
+                "duration_ts": "503", "time_base": "1/30",
+            }],
+        }),
+        stderr="",
+    )
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: completed)
+    assert storage.probe_video(tmp_path / "source.mp4").duration_s == 16.766667
+
+
+def test_probe_video_falls_back_to_duration_ts_time_base(tmp_path, monkeypatch):
+    completed = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({
+            "format": {"duration": "99"},
+            "streams": [{
+                "width": 320, "height": 240, "duration": "N/A",
+                "duration_ts": "503", "time_base": "1/30",
+            }],
+        }),
+        stderr="",
+    )
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: completed)
+    assert storage.probe_video(tmp_path / "source.mp4").duration_s == pytest.approx(503 / 30)
+
+
+def test_probe_video_falls_back_to_decoded_frame_timeline(tmp_path, monkeypatch):
+    completed = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({
+            "format": {"duration": "99"},
+            "streams": [{"width": 320, "height": 240}],
+        }),
+        stderr="",
+    )
+    capture = SimpleNamespace(
+        isOpened=lambda: True,
+        get=lambda prop: {storage.cv2.CAP_PROP_FRAME_COUNT: 503,
+                          storage.cv2.CAP_PROP_FPS: 30}[prop],
+        release=lambda: None,
+    )
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: completed)
+    monkeypatch.setattr(storage.cv2, "VideoCapture", lambda _path: capture)
+    assert storage.probe_video(tmp_path / "source.mp4").duration_s == pytest.approx(503 / 30)
+
+
+@pytest.mark.parametrize("stream_duration", ["0", "nan", "inf", "-1"])
+def test_probe_video_rejects_invalid_stream_duration_without_decoded_fallback(
+    tmp_path, monkeypatch, stream_duration,
+):
+    completed = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({
+            "format": {"duration": "99"},
+            "streams": [{
+                "width": 320, "height": 240, "duration": stream_duration,
+            }],
+        }),
+        stderr="",
+    )
+    capture = SimpleNamespace(isOpened=lambda: False, release=lambda: None)
+    monkeypatch.setattr(storage.subprocess, "run", lambda *_a, **_kw: completed)
+    monkeypatch.setattr(storage.cv2, "VideoCapture", lambda _path: capture)
+    with pytest.raises(storage.UploadError, match="duration"):
+        storage.probe_video(tmp_path / "source.mp4")
 
 
 def test_probe_video_rejects_missing_or_invalid_dimensions(tmp_path, monkeypatch):

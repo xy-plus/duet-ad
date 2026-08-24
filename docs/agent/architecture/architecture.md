@@ -54,7 +54,7 @@ Seedance 生产提交模块已删除，`face_hold` 选项和机械提示词注�
 
 ```mermaid
 flowchart LR
-  A[upload or URL] --> B[ffprobe duration and dimensions]
+  A[upload or URL] --> B[ffprobe v:0 duration and dimensions]
   B --> C[4fps extraction]
   C --> D{audio track?}
   D -->|keep| E[local whisper.cpp multilingual ASR]
@@ -72,17 +72,17 @@ flowchart LR
 
 关键不变量：
 
-- 新会话 `schema_version=2`，有效源时长为正有限数且不超过 300 秒。`≤10s` 保持完整源视频的 Ref2VA 单请求；`>10s` 必须形成连续覆盖全片的 1–15 秒 FL2VA 分段，不能回落到单请求。
+- 新会话 `schema_version=2`，`duration_s` 只表示首个视频流 `v:0` 的正有限视觉时长且不超过 300 秒；优先 `stream.duration`，其次 `duration_ts*time_base`，最后才用可解码的 `frame_count/fps`。容器总时长和音轨时长不得覆盖它。`≤10s` 保持完整源视频的 Ref2VA 单请求；`>10s` 必须形成连续覆盖全片的 1–15 秒 FL2VA 分段，不能回落到单请求。
 - `keep` 模式由固定的本地 `whisper.cpp` multilingual small 处理 16kHz 单声道音频，自动检测语言；模型和二进制由部署固定，运行时不下载。`rewrite/translate` 才进入音频专用 Codex 隔离区。
 - 自动台词的唯一可收养 agent 输出是隔离区 `work/voice_lines.json`：先做大小、普通文件与 JSON 字段白名单校验，再把净化结果写回主 `work/`。重试创建全新隔离区；Codex 超时/非零退出但完整产物已通过同一校验时仍可收养。
-- ASR 初次校验和 YAMNet 分类使用 `voice.mp3` 的真实时长；随后、写 `voice_lines/meta/receipt` 前，必须把有效台词归一到 manifest 的视频时间轴。跨越视频结尾的行把 `end_s` 截到视频时长，`start_s >= duration_s` 的 MP3 编码纯尾部行丢弃并留 provenance/warning，归一结果再过一次 voice 白名单。receipt 的时间真相始终是视频时长。
+- ASR 初次校验和 YAMNet 分类使用 `voice.mp3` 的真实音频时长；这是独立于 `v:0` 的第二条时间轴。随后、写 `voice_lines/meta/receipt` 前，必须把有效台词归一到 manifest 的视觉时间轴。跨越视频结尾的行把 `end_s` 截到视频时长，`start_s >= duration_s` 的音频纯尾部行丢弃并留 provenance/warning，归一结果再过一次 voice 白名单。receipt 的时间真相始终是视觉时长。
 - YAMNet 默认按句区间分类；仅当 ASR 只返回一句、该区间未命中而全轨单窗达到同一个 `51/256` 明确人声阈值时，允许按全轨较强的 `spoken/sung` 兜底。多句或纯 BGM 不使用该兜底。
 - 视觉 agent 运行时看不到 `voice_lines.json`。视觉 prompt 中的 OCR、字幕、画面文字或备注不会被解析成台词。
 - `auto` 只接受内部 ASR provenance；默认声学过滤同时保留 `spoken` 与 `sung`。短链可使用 `edit/custom`；长链创建只允许 `voice_mode=keep`，提交只允许复用源音频的 `auto` 或静音 `none`。
 - `prompt.txt` 由视觉文本和唯一结构化发声块机械组合。无台词时明确禁止角色说出画面文字。
 - ASR 输出中的 `[无法辨识]`、`[inaudible]`、`[unintelligible]` 等哨兵文本不是业务台词：净化为“本次未得到转写”，复用有声学人声证据时的一次重试；任何哨兵不得进入 `voice_lines.json`、prepared receipt 或 H3 prompt。
 - 冻结的 H3 源提示词是唯一生成输入；项目不调用 MiniMax Context IR，也不接受运行时优化开关。
-- `duration_s` 以实际浮点数写 receipt；上传与提交双重门禁限制为 300 秒。短链 H3 时长为 `ceil(duration_s)` 且不超过 10；长链每段为 `ceil(end_s-start_s)` 且不超过 15。
+- `duration_s` 以 `v:0` 实际浮点时长写 receipt；上传、pipeline 重探测和提交门禁限制为 300 秒。短链 H3 时长为 `ceil(duration_s)` 且不超过 10；长链每段为 `ceil(end_s-start_s)` 且不超过 15。最终 `keep` 拼接把长音频裁到画面终点、短音频补静音到画面终点，不改变画面帧预算。
 - `fit_required` 只在 pipeline `done` 时按实际选中的每张关键帧计算，不持久化源视频宽高作为第二真相。只有全部关键帧都是 9:16 才允许 `none`，任一非 9:16 就必须人工选 `crop` 或 `pad`；即使源视频是 9:16，裁过的关键帧也不能绕过。两种策略都不缩放帧，只做居中裁切或居中黑边扩画布。
 - H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/{crop|pad}/`；永不读取 `postprocessed/`。
 
@@ -121,7 +121,7 @@ stateDiagram-v2
 - `start` 以同一 client id 幂等推进；公开 `resume_required` 由用户用同 id、同台词、同 fit 确认后再次调用 `start`，继续同一 receipt/attempt。只有确定 `failed` 才由新 id 调 `retry` 创建 attempt。
 - 启动 `resume` 设置 `allow_submit=false`，只对已经持久化的 task 做 GET 查询/下载，不发新的供应商 POST。已知 task 的查询/超时、下载传输/输出写入故障和 raw running 状态映射为 `resume_required`；`submission_unknown` 一律锁死。
 - provider 成片 URL 必须是无 userinfo 的 HTTPS，且 DNS/IP 预解析结果全部为公网地址。下载 client 不读取代理环境；响应到达后在读取 status/body 前，从 httpx network stream 取得实际 socket peer 并再次要求公网地址，从而不把预解析结果当作连接事实。无法解析 DNS、无法验证 peer、ffprobe 缺失/超时属于已有 task 的可恢复故障；预解析或实际 peer 为私网则确定拒绝。
-- 下载不跟随重定向。Content-Length 和实际流都限制为 200 MiB，内容先写同目录 0600 临时文件；ffprobe 正常执行并确认存在 video stream 且 format duration 有限并大于 0 后，才原子替换 `generated.mp4` 并 fsync。
+- 下载不跟随重定向。Content-Length 和实际流都限制为 200 MiB，内容先写同目录 0600 临时文件；ffprobe 正常执行并确认 `v:0` 的 `duration` 或 `duration_ts*time_base` 正有限后，才原子替换 `generated.mp4` 并 fsync；音频或容器时长不能让无有效视觉时间轴的文件通过。
 
 API 暴露的 coarse generation 是 `queued/running/resume_required/succeeded/failed/submission_unknown`。四类 provider 查询/超时及 `download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed` 映射为 `resume_required`；URL/实际 peer、重定向、体积、无效视频等确定性安全拒绝映射为 `failed`。服务没有自动付费重试。`submission_unknown` 对任何 id 固定返回 409 `submission_outcome_unknown`；意外 provider 异常会先 inspect，只有磁盘状态明确为确定失败时才开放新 id。
 

@@ -34,6 +34,17 @@ def _make_video(path: Path, color: str, duration: float, *, codec: str, rate: in
     _run(*argv)
 
 
+def _make_video_with_audio_duration(path: Path, video_duration: float,
+                                    audio_duration: float) -> None:
+    _run(
+        "ffmpeg", "-y", "-f", "lavfi", "-i",
+        f"color=c=black:s=160x120:r=24:d={video_duration}",
+        "-f", "lavfi", "-i", f"sine=frequency=440:duration={audio_duration}",
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", str(path),
+    )
+
+
 def _make_leading_duplicate(path: Path, *, blue_duration: float = 0.75) -> None:
     _run(
         "ffmpeg", "-y",
@@ -54,6 +65,28 @@ def _probe(path: Path) -> dict:
         check=True, capture_output=True, text=True,
     )
     return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("audio_duration", [0.35, 1.6])
+def test_keep_audio_is_trimmed_or_padded_to_visual_timeline(tmp_path, audio_duration):
+    segment = tmp_path / "segment.mp4"
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "generated.mp4"
+    _make_video(segment, "red", 1.0, codec="libx264", rate=24)
+    _make_video_with_audio_duration(source, 1.0, audio_duration)
+
+    stitch.stitch_video(
+        segments=[stitch.StitchSegment(segment, 1.0, "hard_cut")],
+        source_video=source,
+        output=output,
+        audio_mode="keep",
+    )
+
+    probe = _probe(output)
+    video = next(stream for stream in probe["streams"] if stream["codec_type"] == "video")
+    audio = next(stream for stream in probe["streams"] if stream["codec_type"] == "audio")
+    assert abs(float(video["duration"]) - 1.0) <= 1 / 24
+    assert abs(float(audio["duration"]) - float(video["duration"])) <= 0.05
 
 
 def _pixel(path: Path, timestamp: float) -> tuple[int, int, int]:

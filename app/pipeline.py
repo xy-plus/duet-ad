@@ -704,23 +704,24 @@ def _scene_bounds_for_long_plan(work: Path, duration_s: float) -> list[dict]:
 
 
 def _probe_duration(path: Path) -> float:
-    """ffprobe 探测视频时长（秒）；失败 → PipelineError。"""
+    """探测 v:0 视觉时长；音频/容器尾巴不得影响切段验收。"""
     try:
-        proc = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        raise PipelineError("ffprobe timed out after 30s") from None
-    except FileNotFoundError:
-        raise PipelineError("ffprobe not found on PATH") from None
-    if proc.returncode != 0:
-        raise PipelineError(f"ffprobe exit {proc.returncode}: {clean_stderr(proc.stderr)}")
+        return storage.probe_video(path).duration_s
+    except storage.UploadError as exc:
+        raise PipelineError(str(exc)) from None
+
+
+def _manifest_duration(work: Path) -> float:
     try:
-        return float(json.loads(proc.stdout)["format"]["duration"])
-    except (ValueError, KeyError, TypeError):
-        raise PipelineError("cannot parse video duration") from None
+        raw = json.loads((work / "manifest.json").read_text(encoding="utf-8"))[
+            "duration_seconds"
+        ]
+        duration = float(raw)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        raise PipelineError("manifest.json invalid duration") from None
+    if not math.isfinite(duration) or duration <= 0:
+        raise PipelineError("manifest.json invalid duration")
+    return duration
 
 
 def _cut_segment(source: Path, start_s: float, end_s: float, segdir: Path) -> None:
@@ -1035,6 +1036,17 @@ def run(settings: Settings, cid: str, runner) -> None:
     cdir = (settings.data_dir / cid).resolve()
     work = cdir / "work"
     try:
+        existing = storage.load_meta(settings.data_dir, cid)
+        if existing is None:
+            return
+        if (
+            existing.get("generation") is not None
+            or existing.get("prepared_input_receipt")
+            or existing.get("long_video_plan_receipt")
+            or (cdir / prepared_input.RECEIPT_FILENAME).exists()
+            or (cdir / long_video.PLAN_RECEIPT_FILENAME).exists()
+        ):
+            return
         meta = storage.update_meta(settings.data_dir, cid, status="processing", error=None)
         if meta is None:
             return
@@ -1046,7 +1058,14 @@ def run(settings: Settings, cid: str, runner) -> None:
         # or any later provider can observe the input.
         new_input_contract = "dialogue_mode" in meta and meta.get("duration_s") is not None
         if new_input_contract:
-            long_video.plan_segments(meta["duration_s"], [], [])
+            try:
+                probed_duration = storage.probe_video(source).duration_s
+            except storage.UploadError as exc:
+                raise PipelineError(str(exc)) from None
+            long_video.plan_segments(probed_duration, [], [])
+            meta = storage.update_meta(
+                settings.data_dir, cid, duration_s=probed_duration
+            ) or meta
         _run_cmd(
             [
                 sys.executable, str(EXTRACT_SCRIPT), str(source),
@@ -1056,6 +1075,12 @@ def run(settings: Settings, cid: str, runner) -> None:
             timeout=120,
             step="extract",
         )
+        if new_input_contract:
+            manifest_duration = _manifest_duration(work)
+            long_video.plan_segments(manifest_duration, [], [])
+            meta = storage.update_meta(
+                settings.data_dir, cid, duration_s=manifest_duration
+            ) or meta
         # 新 H3 会话以 dialogue_mode 为唯一产品契约；voice_mode 仅供旧会话内部兼容。
         # duration_s 是上传探测后才写入的新输入契约完成标记；仅有默认字段但尚未探测，
         # 或历史会话没有实际时长时，仍走旧流水线且不伪造 prepared receipt。

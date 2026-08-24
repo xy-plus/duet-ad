@@ -12,6 +12,8 @@ from math import isfinite
 from pathlib import Path
 from typing import NamedTuple
 
+import cv2
+
 ALLOWED_EXT = {".mp4", ".mov", ".webm"}
 _CHUNK = 1024 * 1024
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -157,12 +159,12 @@ async def save_upload(cdir: Path, upload, max_bytes: int) -> Path:
 
 
 def probe_video(path: Path) -> VideoProbe:
-    """一次 ffprobe 得到源视频时长与首个视频流尺寸。"""
+    """探测首个视频流的视觉时长与尺寸；容器/音频时长不参与。"""
     try:
         r = subprocess.run(
             [
                 "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "format=duration:stream=width,height",
+                "-show_entries", "stream=width,height,duration,duration_ts,time_base",
                 "-of", "json", str(path),
             ],
             capture_output=True, text=True, timeout=30,
@@ -173,13 +175,10 @@ def probe_video(path: Path) -> VideoProbe:
         raise UploadError("unreadable video file")
     try:
         payload = json.loads(r.stdout)
-        duration = float(payload["format"]["duration"])
         stream = payload["streams"][0]
         width, height = stream["width"], stream["height"]
     except (ValueError, KeyError, IndexError, TypeError) as e:
         raise UploadError("cannot parse video duration or dimensions") from e
-    if not isfinite(duration) or duration <= 0:
-        raise UploadError("cannot parse video duration")
     if (
         isinstance(width, bool)
         or isinstance(height, bool)
@@ -189,6 +188,36 @@ def probe_video(path: Path) -> VideoProbe:
         or height <= 0
     ):
         raise UploadError("cannot parse video dimensions")
+    duration: float | None = None
+    try:
+        candidate = float(stream.get("duration"))
+        if isfinite(candidate) and candidate > 0:
+            duration = candidate
+    except (TypeError, ValueError):
+        pass
+    if duration is None:
+        try:
+            duration_ts = float(stream.get("duration_ts"))
+            numerator, denominator = str(stream.get("time_base")).split("/", 1)
+            time_base = float(numerator) / float(denominator)
+            candidate = duration_ts * time_base
+            if isfinite(candidate) and candidate > 0:
+                duration = candidate
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    if duration is None:
+        capture = cv2.VideoCapture(str(path))
+        try:
+            if capture.isOpened():
+                frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+                candidate = frame_count / fps if fps > 0 else 0
+                if isfinite(candidate) and candidate > 0:
+                    duration = candidate
+        finally:
+            capture.release()
+    if duration is None:
+        raise UploadError("cannot parse video duration")
     return VideoProbe(duration, width, height)
 
 

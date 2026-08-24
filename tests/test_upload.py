@@ -67,7 +67,7 @@ def test_upload_accepts_long_video_and_rejects_only_over_300_seconds(
             args=[], returncode=0,
             stdout=json.dumps({
                 "format": {"duration": str(duration)},
-                "streams": [{"width": 320, "height": 240}],
+                "streams": [{"width": 320, "height": 240, "duration": str(duration)}],
             }), stderr="",
         )
 
@@ -97,7 +97,7 @@ def test_long_upload_rejects_non_keep_audio_and_cleans_up(
         args=[], returncode=0,
         stdout=json.dumps({
             "format": {"duration": "15"},
-            "streams": [{"width": 320, "height": 240}],
+            "streams": [{"width": 320, "height": 240, "duration": "15"}],
         }), stderr="",
     )
     monkeypatch.setattr("app.storage.subprocess.run", lambda *_a, **_kw: fake)
@@ -117,7 +117,7 @@ def test_upload_accepts_exact_h3_limit(client, video_1s, monkeypatch, settings):
         args=[], returncode=0,
         stdout=json.dumps({
             "format": {"duration": "10.0"},
-            "streams": [{"width": 320, "height": 240}],
+            "streams": [{"width": 320, "height": 240, "duration": "10.0"}],
         }), stderr="",
     )
     monkeypatch.setattr("app.storage.subprocess.run", lambda *a, **kw: fake)
@@ -127,6 +127,38 @@ def test_upload_accepts_exact_h3_limit(client, video_1s, monkeypatch, settings):
     assert r.status_code == 201
     meta = json.loads((settings.data_dir / r.json()["id"] / "meta.json").read_text())
     assert meta["duration_s"] == 10.0
+
+
+@pytest.mark.parametrize(
+    "video_duration,format_duration,voice_mode,expected_status",
+    [
+        (10.0, 10.1, "rewrite", 201),
+        (10.001, 9.9, "rewrite", 422),
+        (300.0, 300.2, "keep", 201),
+        (300.001, 299.9, "keep", 422),
+    ],
+)
+def test_upload_gates_use_video_stream_duration_only(
+    client, video_1s, monkeypatch, video_duration, format_duration,
+    voice_mode, expected_status,
+):
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=json.dumps({
+            "format": {"duration": str(format_duration)},
+            "streams": [{
+                "width": 320, "height": 240, "duration": str(video_duration),
+            }],
+        }), stderr="",
+    )
+    monkeypatch.setattr("app.storage.subprocess.run", lambda *_a, **_kw: fake)
+    with open(video_1s, "rb") as file:
+        response = client.post(
+            "/api/conversations", headers=AUTH,
+            files={"file": ("clip.mp4", file, "video/mp4")},
+            data={"voice_mode": voice_mode},
+        )
+    assert response.status_code == expected_status
 
 
 def test_upload_requires_auth(client, video_1s):
