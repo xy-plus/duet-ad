@@ -732,8 +732,11 @@ def test_resume_with_missing_frozen_continue_tail_fails_closed_without_post_or_e
     assert starts == []
     assert resumes == []
     assert stored["status"] == "submission_unknown"
+    assert stored["client_request_id"] == "resume-parent-request"
     assert stored["segments"][1]["status"] == "submission_unknown"
     assert stored["segments"][1]["error"] == "submission_unknown"
+    assert stored["segments"][1]["child_request_id"] == "child-two"
+    assert stored["segments"][1]["attempt"] == 1
 
     retry = client.post(
         f"/api/conversations/{cid}/submit",

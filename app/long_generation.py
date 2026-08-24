@@ -783,6 +783,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         return candidates
 
     def worker(segment: FrozenSegment, action: str):
+        existing_child_id = states[segment.index].get("child_request_id")
         try:
             request = _request(
                 settings, cid, plan, segment, parent_id, fit_mode,
@@ -790,11 +791,15 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             )
         except LongGenerationError as exc:
             if action == "resume":
-                return None, ("submission_unknown", "submission_unknown")
+                return existing_child_id, (
+                    "submission_unknown", "submission_unknown"
+                )
             return None, ("failed", exc.code)
         except Exception:
             if action == "resume":
-                return None, ("submission_unknown", "submission_unknown")
+                return existing_child_id, (
+                    "submission_unknown", "submission_unknown"
+                )
             return None, ("failed", "long_video_request_invalid")
         try:
             result = h3.start(request) if action == "start" else h3.resume(request)
