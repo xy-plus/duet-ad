@@ -2243,7 +2243,6 @@ async function loadDetail(id, silent) {
 function selectConversation(id) {
   if (state.uploading) return; // 上传中不切换，避免打断
   delete state.ppResultExpanded[id];
-  delete state.generationDrafts[id];
   resetSegmentProductsDisclosure(id);
   state.currentId = id;
   const conv = state.conversations.find((c) => c.id === id);
