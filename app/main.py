@@ -267,6 +267,7 @@ def _public_generation(meta: dict, cdir: Path, settings: Settings) -> dict | Non
         "stage": "h3" if legacy else generation.get("stage"),
     }
     if isinstance(generation.get("segments"), list):
+        public["fast_mode"] = generation.get("fast_mode", False)
         public["segments"] = long_generation.public_segments(generation)
         if _is_long_video(meta) and status == "failed":
             frozen_segments = meta.get("segments")
@@ -651,18 +652,20 @@ def _validate_submit_payload(
 
 def _validate_long_submit_payload(
     meta: dict, payload: dict,
-) -> tuple[str, str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str, bool]:
     if payload.get("confirm") is not True:
         raise _SubmitError(409, "confirmation required")
     allowed = {
         "confirm", "client_request_id", "dialogue_mode", "fit_mode",
         "aspect_ratio", "resolution",
         "expected_plan_receipt",
+        "fast_mode",
     }
-    if set(payload) != allowed:
+    required = allowed - {"fast_mode"}
+    if not required.issubset(payload) or set(payload) - allowed:
         if "lines" in payload or payload.get("dialogue_mode") in {"edit", "custom"}:
             raise _SubmitError(422, "long_video_audio_mode_unsupported")
-        legacy_allowed = allowed - {
+        legacy_allowed = required - {
             "expected_plan_receipt", "aspect_ratio", "resolution"
         }
         request_id = payload.get("client_request_id")
@@ -720,8 +723,12 @@ def _validate_long_submit_payload(
     expected = payload.get("expected_plan_receipt")
     if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise _SubmitError(422, "invalid_plan_receipt")
+    fast_mode = payload.get("fast_mode", False)
+    if not isinstance(fast_mode, bool):
+        raise _SubmitError(422, "invalid_fast_mode")
     return (
-        request_id, fit_mode, dialogue_mode, expected, aspect_ratio, resolution
+        request_id, fit_mode, dialogue_mode, expected, aspect_ratio, resolution,
+        fast_mode,
     )
 
 
@@ -1100,6 +1107,11 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
     fit_mode = meta.get("fit_mode")
     aspect_ratio = meta.get("aspect_ratio")
     generation = meta.get("generation")
+    fast_mode = (
+        generation.get("fast_mode", False)
+        if isinstance(generation, dict)
+        else False
+    )
     fit_layout = (
         generation.get("fit_layout")
         if isinstance(generation, dict)
@@ -1140,7 +1152,8 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
             workdir = cdir / "work" / "segments" / str(index)
             paths.update(_h3_validation_paths(workdir))
             tail = workdir / "work" / "generated_last.png"
-            paths.add(tail)
+            if not fast_mode:
+                paths.add(tail)
             if fit_mode in {"crop", "pad"}:
                 for layout_dir in layout_dirs:
                     fit_root = workdir / "work" / "h3_frames"
@@ -1152,7 +1165,8 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
                             bound = _bound_artifact_path(cdir, anchors[anchor_index])
                             if bound is not None:
                                 paths.add(fit_root / role / bound.name)
-                    paths.add(fit_root / "continued" / tail.name)
+                    if not fast_mode:
+                        paths.add(fit_root / "continued" / tail.name)
     paths.update(
         path for binding in candidates
         if (path := _bound_artifact_path(cdir, binding)) is not None
@@ -1170,6 +1184,7 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
                 "attempt": generation.get("attempt"),
                 "client_request_id": generation.get("client_request_id"),
                 "fit_layout": generation.get("fit_layout"),
+                "fast_mode": generation.get("fast_mode", False),
                 "segments": generation.get("segments"),
             }
             if isinstance(generation, dict)
@@ -1815,6 +1830,7 @@ def create_app(settings: Settings) -> FastAPI:
                     expected_receipt,
                     aspect_ratio,
                     resolution,
+                    fast_mode,
                 ) = (
                     _validate_long_submit_payload(effective_meta, payload)
                 )
@@ -1850,6 +1866,11 @@ def create_app(settings: Settings) -> FastAPI:
                     and meta.get("frozen_plan_receipt") == expected_receipt
                     and _generation_semantics(meta)
                     == (aspect_ratio, resolution)
+                    and (
+                        old.get("fast_mode", False) == fast_mode
+                        if isinstance(old, dict)
+                        else True
+                    )
                 )
                 # Active replays are pure idempotent reads.  In particular they
                 # must not rewrite fitted inputs or enqueue a second coordinator.
@@ -1953,6 +1974,7 @@ def create_app(settings: Settings) -> FastAPI:
                 generation = long_generation.initial_generation(
                     settings, cid, plan, request_id, attempt,
                     old if isinstance(old, dict) else None,
+                    fast_mode=fast_mode,
                 )
                 changes = dict(
                     dialogue_mode=dialogue_mode,
