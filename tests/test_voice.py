@@ -3,6 +3,7 @@ import json
 import re
 import shutil
 import subprocess
+from array import array
 from pathlib import Path
 
 import pytest
@@ -63,10 +64,49 @@ def _audible_start(path: Path) -> float:
     return float(match.group(1)) if match else 0.0
 
 
+def _make_priming_video(path: Path, audio_codec: str) -> None:
+    video_codec = "libvpx-vp9" if path.suffix == ".webm" else "libx264"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=black:size=64x64:rate=24:d=2",
+            "-f", "lavfi", "-i",
+            "aevalsrc=if(lt(t\\,0.012)\\,sin(2*PI*1000*t)\\,0):s=48000:d=2",
+            "-map", "0:v", "-map", "1:a", "-c:v", video_codec,
+            "-pix_fmt", "yuv420p", "-c:a", audio_codec, str(path),
+        ],
+        check=True,
+    )
+
+
+def _initial_peak(path: Path) -> int:
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", str(path), "-t", "0.012",
+            "-f", "s16le", "-ac", "1", "-ar", "16000", "-",
+        ],
+        check=True, capture_output=True,
+    )
+    samples = array("h")
+    samples.frombytes(result.stdout)
+    return max(map(abs, samples), default=0)
+
+
 # ---------- extract_audio ----------
 
 
 class TestExtractAudio:
+    @pytest.mark.parametrize(("suffix", "audio_codec"), [(".mp4", "aac"), (".webm", "libopus")])
+    def test_extract_audio_does_not_trim_codec_priming_twice(
+        self, tmp_path, suffix, audio_codec,
+    ):
+        source = tmp_path / f"priming{suffix}"
+        _make_priming_video(source, audio_codec)
+
+        out = voice.extract_audio(_conv(tmp_path / f"c-{audio_codec}", source))
+
+        assert _initial_peak(out) > 5_000
+
     @pytest.mark.parametrize("offset", [-0.5, 0.0, 0.5])
     def test_extract_audio_preserves_relative_stream_offset(
         self, tmp_path, offset,
@@ -112,7 +152,7 @@ class TestExtractAudio:
             lambda _path: storage.VideoProbe(1.0, 320, 240),
         )
         monkeypatch.setattr(
-            voice.storage, "probe_stream_first_pts", lambda _path, _selector: 0.0,
+            voice.storage, "probe_stream_start_time", lambda _path, _selector: 0.0,
         )
         fake = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="codec broken")
         monkeypatch.setattr(voice.subprocess, "run", lambda *a, **kw: fake)

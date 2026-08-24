@@ -9,6 +9,7 @@ import math
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 try:
@@ -262,6 +263,76 @@ def write_contact_sheets(
         )
 
 
+def _run_frame_extract(command: list[str]) -> None:
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=120
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit(f"Could not decode requested video frames: {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise SystemExit(f"Could not decode requested video frames{suffix}")
+
+
+def extract_frames(
+    video: Path,
+    out_dir: Path,
+    times: list[float],
+    *,
+    uniform_rate: float | None,
+) -> list[np.ndarray]:
+    """Decode requested frames in one ffmpeg pass using presentation timestamps."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise SystemExit("ffmpeg is required to extract video frames.")
+    with tempfile.TemporaryDirectory(prefix=".frames-", dir=out_dir) as raw_tmp:
+        tmp = Path(raw_tmp)
+        temporary_paths = [tmp / f"{index:06d}.png" for index in range(1, len(times) + 1)]
+        if uniform_rate is not None:
+            pattern = tmp / "%06d.png"
+            step = 1.0 / uniform_rate
+            _run_frame_extract([
+                ffmpeg, "-v", "error", "-y", "-i", str(video),
+                "-map", "0:v:0", "-vf",
+                f"setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={step:.9f},"
+                f"fps=fps={uniform_rate:.12g}:start_time=0",
+                "-frames:v", str(len(times)), str(pattern),
+            ])
+        else:
+            branches = "".join(f"[source{index}]" for index in range(len(times)))
+            filters = []
+            if len(times) == 1:
+                filters.append("[0:v:0]setpts=PTS-STARTPTS[normalized]")
+                inputs = ["[normalized]"]
+            else:
+                filters.append(
+                    f"[0:v:0]setpts=PTS-STARTPTS,split={len(times)}{branches}"
+                )
+                inputs = [f"[source{index}]" for index in range(len(times))]
+            for index, (input_name, timestamp) in enumerate(zip(inputs, times)):
+                filters.append(
+                    f"{input_name}trim=start={timestamp:.9f},setpts=PTS-STARTPTS[out{index}]"
+                )
+            command = [
+                ffmpeg, "-v", "error", "-y", "-i", str(video),
+                "-filter_complex", ";".join(filters),
+            ]
+            for index, path in enumerate(temporary_paths):
+                command.extend([
+                    "-map", f"[out{index}]", "-frames:v", "1", "-c:v", "png", str(path),
+                ])
+            _run_frame_extract(command)
+        frames = []
+        for path in temporary_paths:
+            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise SystemExit("Could not decode all requested video frames.")
+            frames.append(frame)
+        return frames
+
+
 def main() -> int:
     args = parse_args()
     video = Path(args.video).expanduser().resolve()
@@ -284,8 +355,8 @@ def main() -> int:
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    capture.release()
     if fps <= 0 or frame_count <= 0 or width <= 0 or height <= 0:
-        capture.release()
         raise SystemExit("Video metadata is incomplete or invalid.")
 
     decoded_duration = frame_count / fps
@@ -310,21 +381,29 @@ def main() -> int:
 
     for timestamp in times:
         if timestamp < 0 or timestamp > duration:
-            capture.release()
             raise SystemExit(
                 f"Timestamp {timestamp:.3f}s is outside video duration {duration:.3f}s."
             )
 
+    if args.fps is not None:
+        uniform_rate = args.fps
+    elif args.sample_count is not None and len(times) > 1 and last_safe_time > 0:
+        uniform_rate = (len(times) - 1) / last_safe_time
+    elif args.sample_count == 1:
+        uniform_rate = 1.0
+    else:
+        uniform_rate = None
+    decoded_frames = extract_frames(
+        video,
+        out_dir,
+        [min(timestamp, last_safe_time) for timestamp in times],
+        uniform_rate=uniform_rate,
+    )
+
     records: list[dict[str, object]] = []
     contact_frames: list[tuple[np.ndarray, str]] = []
     digits = max(2, len(str(len(times))))
-    for index, requested_time in enumerate(times, start=1):
-        seek_time = min(requested_time, last_safe_time)
-        capture.set(cv2.CAP_PROP_POS_MSEC, seek_time * 1000.0)
-        ok, frame = capture.read()
-        if not ok or frame is None:
-            capture.release()
-            raise SystemExit(f"Could not decode frame near {requested_time:.3f}s.")
+    for index, (requested_time, frame) in enumerate(zip(times, decoded_frames), start=1):
         filename = f"{index:0{digits}d}_{args.prefix}_{requested_time:07.3f}s.png"
         write_image(out_dir / filename, frame, ".png")
         records.append(
@@ -335,7 +414,6 @@ def main() -> int:
             }
         )
         contact_frames.append((frame, f"{index:02d}  {requested_time:.3f}s"))
-    capture.release()
 
     write_contact_sheets(
         out_dir,

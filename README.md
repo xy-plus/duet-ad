@@ -27,7 +27,7 @@ ACCESS_TOKEN='<local-only-token>' HOST=127.0.0.1 PORT=3211 ./run.sh
 - 短视频提交可选 `auto/edit/custom/none`；长视频一期只接受源音频 `auto` 或静音 `none`。非 9:16 必须选择居中 `crop` 或黑边 `pad`。
 - 短视频用 `prepared_input.json` 绑定输入；长视频用 `long_video_plan.json` 绑定完整源文件、分段、首尾锚点、提示词和台词摘要。客户端提交当前 `plan_receipt` 做 CAS，任何漂移都在付费前拒绝。
 - 长视频在 `hard_cut` 处新建生成链；同链 `continue` 段以上一生成段尾帧为首帧、当前源片段末帧为目标尾帧。同链串行，不同链最多两条并发；这是连续性约束，不承诺逐帧无缝，也不是供应商原生 extend。
-- 所有 FL2VA 子片段去除自身音轨后由 ffmpeg 归一化、拼接。`auto` 先保留源音频首包相对视频首包的 offset（正值补前置静音、负值裁掉视频零点前音频），再在画面终点裁剪或补静音；`none` 输出静音。两者都不改变画面时长，拼接失败只重跑本地拼接。
+- 4fps 关键帧由 ffmpeg 按 `v:0` PTS 顺序批量解码，VFR 视频不依赖 OpenCV 毫秒随机 seek。所有 FL2VA 子片段去除自身音轨后由 ffmpeg 归一化、拼接。`auto` 以视频 presentation start 为零点，让解码器处理 AAC/Opus priming，并由音频时间戳确定前置静音或视频零点前裁剪，最后在画面终点裁剪或补静音；`none` 输出静音。两者都不改变画面时长，拼接失败只重跑本地拼接。
 - Web 只调用 `POST /submit`。已知 task 的查询、超时、下载或输出故障只继续同一 attempt，不自动重复付费提交；长链只重做确定失败及其未完成下游段，成功段复用。
 - `submission_unknown` 完全锁死，必须先到供应商侧核对。重启只对 `queued/running` generation 做 GET-only `resume`，不会补发供应商 POST。旧 schema 会话仍可查看，但提交和后处理均为只读。
 - H3 成片只接受无 userinfo、全部预解析地址和实际 socket peer 均为公网的 HTTPS URL；拒绝重定向，流式下载最多 200 MiB，并在原子替换前用 ffprobe 验证正时长视频流。

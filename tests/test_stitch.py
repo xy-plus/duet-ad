@@ -3,6 +3,7 @@ import json
 import re
 import shutil
 import subprocess
+from array import array
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,31 @@ def _audible_start(path: Path) -> float:
     return float(match.group(1)) if match else 0.0
 
 
+def _make_priming_video(path: Path, audio_codec: str) -> None:
+    video_codec = "libvpx-vp9" if path.suffix == ".webm" else "libx264"
+    _run(
+        "ffmpeg", "-v", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=black:size=160x120:rate=24:d=2",
+        "-f", "lavfi", "-i",
+        "aevalsrc=if(lt(t\\,0.012)\\,sin(2*PI*1000*t)\\,0):s=48000:d=2",
+        "-map", "0:v", "-map", "1:a", "-c:v", video_codec,
+        "-pix_fmt", "yuv420p", "-c:a", audio_codec, str(path),
+    )
+
+
+def _initial_peak(path: Path) -> int:
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", str(path), "-t", "0.012",
+            "-f", "s16le", "-ac", "1", "-ar", "16000", "-",
+        ],
+        check=True, capture_output=True,
+    )
+    samples = array("h")
+    samples.frombytes(result.stdout)
+    return max(map(abs, samples), default=0)
+
+
 def _make_leading_duplicate(path: Path, *, blue_duration: float = 0.75) -> None:
     _run(
         "ffmpeg", "-y",
@@ -137,6 +163,24 @@ def test_keep_audio_preserves_relative_source_offset(tmp_path, offset):
         assert onset < 0.08
     video = next(s for s in _probe(output)["streams"] if s["codec_type"] == "video")
     assert float(video["duration"]) == pytest.approx(2.0, abs=1 / 24)
+
+
+@pytest.mark.parametrize(("suffix", "audio_codec"), [(".mp4", "aac"), (".webm", "libopus")])
+def test_keep_audio_does_not_trim_codec_priming_twice(tmp_path, suffix, audio_codec):
+    segment = tmp_path / "segment.mp4"
+    source = tmp_path / f"source{suffix}"
+    output = tmp_path / f"generated-{audio_codec}.mp4"
+    _make_video(segment, "red", 2.0, codec="libx264", rate=24)
+    _make_priming_video(source, audio_codec)
+
+    stitch.stitch_video(
+        segments=[stitch.StitchSegment(segment, 2.0, "hard_cut")],
+        source_video=source,
+        output=output,
+        audio_mode="keep",
+    )
+
+    assert _initial_peak(output) > 3_000
 
 
 def _pixel(path: Path, timestamp: float) -> tuple[int, int, int]:

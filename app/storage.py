@@ -488,7 +488,8 @@ def _probe_packets(path: Path, selector: str) -> list[dict]:
             [
                 "ffprobe", "-v", "error", "-select_streams", selector,
                 "-show_packets", "-show_entries",
-                "packet=pts_time,dts_time,duration_time", "-of", "json", str(path),
+                "packet=pts_time,dts_time,duration_time,side_data_list",
+                "-of", "json", str(path),
             ],
             capture_output=True, text=True, timeout=30,
         )
@@ -498,15 +499,39 @@ def _probe_packets(path: Path, selector: str) -> list[dict]:
         raise UploadError("unreadable video file")
     try:
         packets = json.loads(result.stdout).get("packets")
-    except (TypeError, json.JSONDecodeError):
+    except (AttributeError, TypeError, json.JSONDecodeError):
         packets = None
     if not isinstance(packets, list):
         raise UploadError("cannot parse video packet timeline")
     return packets
 
 
-def probe_stream_first_pts(path: Path, selector: str) -> float:
-    starts = []
+def probe_stream_start_time(path: Path, selector: str) -> float:
+    """Return a stream's presentation start; correct packet fallback codec priming."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", selector,
+                "-show_entries", "stream=start_time,sample_rate", "-of", "json", str(path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        raise UploadError(f"ffprobe failed: {exc}") from exc
+    if result.returncode != 0:
+        raise UploadError("unreadable video file")
+    try:
+        streams = json.loads(result.stdout).get("streams")
+    except (AttributeError, TypeError, json.JSONDecodeError):
+        streams = None
+    if not isinstance(streams, list) or not streams or not isinstance(streams[0], dict):
+        raise UploadError("cannot parse stream timeline")
+    stream = streams[0]
+    start_time = _packet_number(stream.get("start_time"))
+    if start_time is not None:
+        return start_time
+
+    starts: list[tuple[float, dict]] = []
     for packet in _probe_packets(path, selector):
         if not isinstance(packet, dict):
             continue
@@ -514,10 +539,28 @@ def probe_stream_first_pts(path: Path, selector: str) -> float:
         if start is None:
             start = _packet_number(packet.get("dts_time"))
         if start is not None:
-            starts.append(start)
+            starts.append((start, packet))
     if not starts:
         raise UploadError("cannot parse stream packet timeline")
-    return min(starts)
+    start, first_packet = min(starts, key=lambda item: item[0])
+    if selector.startswith("a:"):
+        sample_rate = _packet_number(stream.get("sample_rate"))
+        side_data = first_packet.get("side_data_list")
+        if isinstance(side_data, list):
+            for item in side_data:
+                if not isinstance(item, dict) or item.get("side_data_type") != "Skip Samples":
+                    continue
+                skip_samples = _packet_number(item.get("skip_samples"))
+                if (
+                    sample_rate is None
+                    or sample_rate <= 0
+                    or skip_samples is None
+                    or skip_samples < 0
+                ):
+                    raise UploadError("cannot parse audio priming timeline")
+                start += skip_samples / sample_rate
+                break
+    return start
 
 
 def _probe_packet_duration(path: Path, stream: dict) -> float | None:
