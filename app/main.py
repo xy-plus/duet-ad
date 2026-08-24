@@ -6,7 +6,7 @@ import math
 import re
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
@@ -55,6 +55,59 @@ _KNOWN_TASK_ERRORS = frozenset(
 )
 _NO_STORE_WEB_PATHS = frozenset({"/", "/index.html", "/app.js", "/styles.css"})
 _CLIENT_REFRESH_MESSAGE = "页面版本已更新，请刷新页面后重试。"
+_GENERATED_VIDEO_VALIDATION_CACHE_SIZE = 256
+
+
+class _GeneratedVideoValidationCache:
+    """Bound strict local validation without weakening its file bindings."""
+
+    def __init__(self, max_entries: int) -> None:
+        self._max_entries = max_entries
+        self._entries: OrderedDict[tuple, tuple[str, bool]] = OrderedDict()
+        self._inflight: dict[tuple, threading.Event] = {}
+        self._lock = threading.Lock()
+
+    def get_or_validate(self, identity: tuple, fingerprint: str, fingerprint_fn,
+                        validator) -> bool:
+        while True:
+            with self._lock:
+                cached = self._entries.get(identity)
+                if cached is not None and cached[0] == fingerprint:
+                    self._entries.move_to_end(identity)
+                    return cached[1]
+                event = self._inflight.get(identity)
+                if event is None:
+                    event = threading.Event()
+                    self._inflight[identity] = event
+                    break
+            event.wait()
+            refreshed = fingerprint_fn()
+            if refreshed is None:
+                return bool(validator())
+            fingerprint = refreshed
+
+        try:
+            result = bool(validator())
+            stable_fingerprint = fingerprint_fn()
+            with self._lock:
+                if stable_fingerprint == fingerprint:
+                    self._entries[identity] = (fingerprint, result)
+                    self._entries.move_to_end(identity)
+                    while len(self._entries) > self._max_entries:
+                        self._entries.popitem(last=False)
+            # A changing artifact makes a successful observation stale. The
+            # next request will validate the new state from scratch.
+            return result if stable_fingerprint == fingerprint else False
+        finally:
+            with self._lock:
+                current = self._inflight.pop(identity, None)
+                if current is not None:
+                    current.set()
+
+
+_GENERATED_VIDEO_VALIDATION_CACHE = _GeneratedVideoValidationCache(
+    _GENERATED_VIDEO_VALIDATION_CACHE_SIZE
+)
 
 
 class _SubmitError(RuntimeError):
@@ -785,6 +838,182 @@ def _mark_submission_unknown(settings: Settings, cid: str, generation: dict) -> 
     )
 
 
+def _bound_artifact_path(root: Path, binding: object) -> Path | None:
+    if not isinstance(binding, dict):
+        return None
+    relative = binding.get("path")
+    if (
+        not isinstance(relative, str)
+        or not relative
+        or Path(relative).is_absolute()
+        or ".." in Path(relative).parts
+    ):
+        return None
+    return root / relative
+
+
+def _h3_validation_paths(workdir: Path) -> set[Path]:
+    paths = {
+        workdir / "generated.mp4",
+        workdir / ".h3" / "session.json",
+    }
+    attempts = workdir / ".h3" / "attempts"
+    try:
+        paths.update(attempts.glob("*/attempt.json"))
+    except OSError:
+        paths.add(attempts)
+    return paths
+
+
+def _short_validation_paths(cdir: Path, meta: dict) -> set[Path]:
+    paths = _h3_validation_paths(cdir)
+    receipt_name = meta.get("prepared_input_receipt")
+    if not isinstance(receipt_name, str) or receipt_name != Path(receipt_name).name:
+        return paths
+    receipt_path = cdir / receipt_name
+    paths.add(receipt_path)
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return paths
+    bindings = payload.get("bindings") if isinstance(payload, dict) else None
+    if not isinstance(bindings, dict):
+        return paths
+    candidates = [
+        bindings.get("source"),
+        bindings.get("normalized_audio"),
+        bindings.get("visual_prompt"),
+        bindings.get("final_prompt"),
+    ]
+    keyframes = bindings.get("keyframes")
+    if isinstance(keyframes, list):
+        candidates.extend(keyframes)
+    paths.update(
+        path for binding in candidates
+        if (path := _bound_artifact_path(cdir, binding)) is not None
+    )
+    return paths
+
+
+def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
+    paths = {cdir / "generated.mp4", cdir / "stitch-receipt.json"}
+    receipt_name = meta.get("long_video_plan_receipt")
+    if not isinstance(receipt_name, str) or receipt_name != Path(receipt_name).name:
+        return paths
+    receipt_path = cdir / receipt_name
+    paths.add(receipt_path)
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return paths
+    if not isinstance(payload, dict):
+        return paths
+    candidates = [payload.get("source")]
+    raw_segments = payload.get("segments")
+    if not isinstance(raw_segments, list):
+        return paths
+    fit_mode = meta.get("fit_mode")
+    for raw in raw_segments:
+        if not isinstance(raw, dict):
+            continue
+        candidates.extend([
+            raw.get("source"),
+            raw.get("visual_prompt"),
+            raw.get("final_prompt"),
+        ])
+        keyframes = raw.get("keyframes")
+        if isinstance(keyframes, list):
+            candidates.extend(keyframes)
+        anchors = raw.get("anchors")
+        if isinstance(anchors, list):
+            candidates.extend(anchors)
+        index = raw.get("index")
+        if isinstance(index, int) and not isinstance(index, bool) and index > 0:
+            workdir = cdir / "work" / "segments" / str(index)
+            paths.update(_h3_validation_paths(workdir))
+            tail = workdir / "work" / "generated_last.png"
+            paths.add(tail)
+            if fit_mode in {"crop", "pad"}:
+                for role, anchor_index in (("first", 0), ("end", 1)):
+                    if isinstance(anchors, list) and len(anchors) > anchor_index:
+                        bound = _bound_artifact_path(cdir, anchors[anchor_index])
+                        if bound is not None:
+                            paths.add(
+                                workdir / "work" / "h3_frames" / fit_mode
+                                / role / bound.name
+                            )
+                paths.add(
+                    workdir / "work" / "h3_frames" / fit_mode
+                    / "continued" / tail.name
+                )
+    paths.update(
+        path for binding in candidates
+        if (path := _bound_artifact_path(cdir, binding)) is not None
+    )
+    return paths
+
+
+def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | None:
+    """Bind the cache only to fields and files read by strict validation."""
+    try:
+        generation = meta.get("generation")
+        generation_binding = (
+            {
+                "status": generation.get("status"),
+                "client_request_id": generation.get("client_request_id"),
+                "segments": generation.get("segments"),
+            }
+            if isinstance(generation, dict)
+            else generation
+        )
+        if _is_long_video(meta):
+            binding = {
+                "id": meta.get("id"),
+                "duration_s": meta.get("duration_s"),
+                "fit_mode": meta.get("fit_mode"),
+                "dialogue_mode": meta.get("dialogue_mode"),
+                "segments": meta.get("segments"),
+                "frozen_plan_receipt": meta.get("frozen_plan_receipt"),
+                "long_video_plan_receipt": meta.get("long_video_plan_receipt"),
+                "generation": generation_binding,
+            }
+            paths = _long_validation_paths(cdir, meta)
+        else:
+            binding = {
+                "id": meta.get("id"),
+                "duration_s": meta.get("duration_s"),
+                "prepared_dialogue": meta.get("prepared_dialogue"),
+                "prepared_input_receipt": meta.get("prepared_input_receipt"),
+                "dialogue_mode": meta.get("dialogue_mode"),
+                "fit_mode": meta.get("fit_mode"),
+                "generation": generation_binding,
+            }
+            paths = _short_validation_paths(cdir, meta)
+        binding_bytes = json.dumps(
+            binding,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        digest = hashlib.sha256(binding_bytes)
+        for path in sorted(paths, key=lambda candidate: candidate.as_posix()):
+            relative = path.relative_to(cdir).as_posix()
+            try:
+                stat = path.stat()
+            except OSError:
+                digest.update(relative.encode("utf-8") + b"\0missing\n")
+                continue
+            digest.update(relative.encode("utf-8"))
+            digest.update(
+                f"\0{stat.st_mode}\0{stat.st_ino}\0{stat.st_size}"
+                f"\0{stat.st_mtime_ns}\0{stat.st_ctime_ns}\n".encode("ascii")
+            )
+        return digest.hexdigest()
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
     generation = meta.get("generation")
     # Pre-H3 legacy conversations have no receipt to validate. Preserve their
@@ -795,6 +1024,29 @@ def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
             isinstance(cid, str)
             and (settings.data_dir / cid / "generated.mp4").is_file()
         )
+    if not isinstance(generation, dict) or generation.get("status") != "succeeded":
+        return False
+    cid = meta.get("id")
+    if not isinstance(cid, str):
+        return False
+    cdir = (settings.data_dir / cid).resolve()
+    fingerprint = _generated_video_validation_fingerprint(cdir, meta)
+    if fingerprint is None:
+        return _validate_generated_video_uncached(settings, meta)
+    identity = (
+        str(settings.data_dir.resolve()),
+        cid,
+    )
+    return _GENERATED_VIDEO_VALIDATION_CACHE.get_or_validate(
+        identity,
+        fingerprint,
+        lambda: _generated_video_validation_fingerprint(cdir, meta),
+        lambda: _validate_generated_video_uncached(settings, meta),
+    )
+
+
+def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
+    generation = meta.get("generation")
     if not isinstance(generation, dict) or generation.get("status") != "succeeded":
         return False
     cid = meta.get("id")
