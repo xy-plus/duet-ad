@@ -14,20 +14,37 @@ class FrameFitError(RuntimeError):
     """关键帧无法按已确认的画幅策略派生。"""
 
 
-def frames_require_fit(paths: Sequence[Path]) -> bool:
-    """Return whether any actual H3 input frame is not exactly 9:16."""
-    inputs = [Path(path) for path in paths]
-    if not inputs:
+def _decode_frame(data: bytes, label: str) -> np.ndarray:
+    if not isinstance(data, bytes) or not data:
+        raise FrameFitError(f"cannot decode keyframe: {label}")
+    image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None or image.ndim != 3 or image.shape[2] != 3:
+        raise FrameFitError(f"cannot decode keyframe: {label}")
+    return image
+
+
+def frame_bytes_require_fit(frames: Sequence[bytes]) -> bool:
+    """Judge exact immutable H3 frame bytes, decoding every supplied frame."""
+    snapshots = list(frames)
+    if not snapshots:
         raise FrameFitError("frame set must not be empty")
     required = False
-    for source in inputs:
-        image = cv2.imread(str(source), cv2.IMREAD_COLOR)
-        if image is None or image.ndim != 3 or image.shape[2] != 3:
-            raise FrameFitError(f"cannot decode keyframe: {source.name}")
+    for position, data in enumerate(snapshots, 1):
+        image = _decode_frame(data, f"frame-{position}")
         height, width = image.shape[:2]
         if width * 16 != height * 9:
             required = True
     return required
+
+
+def frames_require_fit(paths: Sequence[Path]) -> bool:
+    """Read each H3 input path once, then judge the immutable snapshots."""
+    inputs = [Path(path) for path in paths]
+    try:
+        snapshots = [path.read_bytes() for path in inputs]
+    except OSError as exc:
+        raise FrameFitError(f"cannot read keyframe: {exc.filename}") from None
+    return frame_bytes_require_fit(snapshots)
 
 
 def _target_size(width: int, height: int, mode: str) -> tuple[int, int]:
@@ -57,6 +74,17 @@ def _fit(image: np.ndarray, mode: str) -> np.ndarray:
     return canvas
 
 
+def fit_frame_bytes(data: bytes, mode: str, *, label: str = "frame") -> bytes:
+    """Derive encoded PNG bytes from one immutable source-frame snapshot."""
+    if mode not in {"crop", "pad"}:
+        raise FrameFitError("fit_mode must be crop or pad")
+    fitted = _fit(_decode_frame(data, label), mode)
+    ok, encoded = cv2.imencode(".png", fitted)
+    if not ok:
+        raise FrameFitError(f"cannot encode keyframe: {label}")
+    return encoded.tobytes()
+
+
 def fit_frames(paths: Sequence[Path], output_dir: Path, mode: str) -> tuple[Path, ...]:
     """从给定原始帧生成同名 PNG；绝不推断或默认选择适配模式。"""
     if mode not in {"crop", "pad"}:
@@ -72,17 +100,15 @@ def fit_frames(paths: Sequence[Path], output_dir: Path, mode: str) -> tuple[Path
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs: list[Path] = []
     for source in inputs:
-        image = cv2.imread(str(source), cv2.IMREAD_COLOR)
-        if image is None or image.ndim != 3 or image.shape[2] != 3:
+        try:
+            data = source.read_bytes()
+        except OSError:
             raise FrameFitError(f"cannot decode keyframe: {source.name}")
-        fitted = _fit(image, mode)
-        ok, encoded = cv2.imencode(".png", fitted)
-        if not ok:
-            raise FrameFitError(f"cannot encode keyframe: {source.name}")
+        encoded = fit_frame_bytes(data, mode, label=source.name)
         output = output_dir / (source.stem + ".png")
         temporary = output.with_suffix(output.suffix + ".tmp")
         try:
-            temporary.write_bytes(encoded.tobytes())
+            temporary.write_bytes(encoded)
             temporary.replace(output)
         except OSError:
             temporary.unlink(missing_ok=True)

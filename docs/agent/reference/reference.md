@@ -188,7 +188,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 }
 ```
 
-长视频只允许这五个键，`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希。长链 `fit_required` 以每个 `hard_cut` first 和全部 end anchors 为准；`continue` first 运行时由上游生成尾帧替换。历史未冻结 null 会话从安全 plan 纯派生，无法派生时付费前拒绝。已有冻结提交继续以原 `fit_mode` 为准。
+长视频只允许这五个键，`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希；SHA 校验、画幅判断/派生与 H3 请求消费同一份不可变 bytes，不会在校验后重新读取路径。长链 `fit_required` 以每个 `hard_cut` first 和全部 end anchors 为准；`continue` first 运行时由上游生成尾帧替换。历史未冻结 null 会话从安全 plan 纯派生，无法派生时付费前拒绝。已有冻结提交继续以原 `fit_mode` 为准。
 
 旧标签页可能仍按四键长视频契约提交，缺少 `expected_plan_receipt`。服务仅对这个精确旧请求返回结构化 `409 client_refresh_required`，提示刷新页面；不会自动采用服务端当前 receipt，也不会创建付费任务。`/`、`/index.html` 和 `/app.js` 均使用 `Cache-Control: no-store`，刷新后会取得当前提交契约。
 

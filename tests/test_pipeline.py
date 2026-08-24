@@ -180,6 +180,21 @@ def test_run_converges_container_duration_to_visual_manifest_timeline(
 
     monkeypatch.setattr(pipeline, "_process_segment", fake_process_segment)
     monkeypatch.setattr(long_video, "write_plan_receipt", fake_write)
+    def fake_freeze(root, meta, receipt, fit_mode, dialogue_mode):
+        seg = meta["segments"][0]
+        segdir = Path(root) / "work" / "segments" / "1"
+        first = segdir / "work" / "anchors" / "first.png"
+        last = segdir / "work" / "anchors" / "last.png"
+        return long_generation.FrozenPlan(
+            Path(root), Path(root) / "source.mp4", receipt,
+            (long_generation.FrozenSegment(
+                seg["index"], seg["start_s"], seg["end_s"], seg["chain_id"],
+                seg["join_mode"], segdir, first, first.read_bytes(), last,
+                last.read_bytes(), "p",
+            ),),
+        )
+
+    monkeypatch.setattr(long_generation, "freeze_plan", fake_freeze)
 
     pipeline.run(settings, meta["id"], object())
 

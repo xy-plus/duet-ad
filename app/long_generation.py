@@ -34,7 +34,9 @@ class FrozenSegment:
     join_mode: str
     workdir: Path
     first_frame: Path
+    first_frame_data: bytes
     last_frame: Path
+    last_frame_data: bytes
     prompt: str
 
 
@@ -91,6 +93,24 @@ def _bound_path(root: Path, artifact: object) -> Path:
     return path
 
 
+def _bound_bytes(root: Path, artifact: object) -> tuple[Path, bytes]:
+    """Read one receipt-bound artifact once and retain the verified bytes."""
+    if not isinstance(artifact, dict) or set(artifact) != {"path", "sha256"}:
+        raise LongGenerationError("long_video_plan_invalid")
+    relative, expected = artifact.get("path"), artifact.get("sha256")
+    if not isinstance(relative, str) or not isinstance(expected, str):
+        raise LongGenerationError("long_video_plan_invalid")
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+        data = path.read_bytes()
+    except (ValueError, OSError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise LongGenerationError("long_video_plan_invalid")
+    return path, data
+
+
 def _relative_to_work(root: Path, path: Path) -> str:
     try:
         return path.relative_to(root / "work").as_posix()
@@ -98,13 +118,31 @@ def _relative_to_work(root: Path, path: Path) -> str:
         raise LongGenerationError("long_video_plan_invalid") from None
 
 
-def _fit_anchor(path: Path, output: Path, fit_mode: str) -> Path:
+def _fit_anchor(path: Path, data: bytes, output: Path, fit_mode: str,
+                *, prepare: bool) -> tuple[Path, bytes]:
     if fit_mode == "none":
-        return path
+        return path, data
     try:
-        return frame_fit.fit_frames((path,), output, fit_mode)[0]
+        fitted = frame_fit.fit_frame_bytes(data, fit_mode, label=path.name)
     except frame_fit.FrameFitError:
         raise LongGenerationError("frame_fit_failed") from None
+    target = output / (path.stem + ".png")
+    if prepare:
+        output.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        try:
+            temporary.write_bytes(fitted)
+            temporary.replace(target)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise LongGenerationError("frame_fit_failed") from None
+    else:
+        try:
+            if target.read_bytes() != fitted:
+                raise LongGenerationError("frame_fit_failed")
+        except OSError:
+            raise LongGenerationError("frame_fit_failed") from None
+    return target, fitted
 
 
 def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
@@ -115,12 +153,16 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
     if name != long_video.PLAN_RECEIPT_FILENAME:
         raise LongGenerationError("long_video_plan_invalid")
     receipt_path = root / name
-    receipt = _digest(receipt_path)
+    try:
+        receipt_data = receipt_path.read_bytes()
+    except OSError:
+        raise LongGenerationError("long_video_plan_invalid") from None
+    receipt = hashlib.sha256(receipt_data).hexdigest()
     if expected_receipt != receipt:
         raise LongGenerationError("long_video_plan_changed", 409)
     try:
-        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        payload = json.loads(receipt_data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         raise LongGenerationError("long_video_plan_invalid") from None
     if (
         not isinstance(payload, dict)
@@ -192,8 +234,12 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             != ["first", "end"]
         ):
             raise LongGenerationError("long_video_plan_invalid")
-        first_source = _bound_path(root, {k: v for k, v in anchors[0].items() if k != "role"})
-        last_source = _bound_path(root, {k: v for k, v in anchors[1].items() if k != "role"})
+        first_source, first_source_data = _bound_bytes(
+            root, {k: v for k, v in anchors[0].items() if k != "role"}
+        )
+        last_source, last_source_data = _bound_bytes(
+            root, {k: v for k, v in anchors[1].items() if k != "role"}
+        )
         expected_prefix = f"segments/{index}/"
         if (
             current.get("source") != expected_prefix + "source.mp4"
@@ -207,12 +253,12 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             != _relative_to_work(root, last_source)
         ):
             raise LongGenerationError("long_video_plan_invalid")
-        visual_path = _bound_path(root, raw.get("visual_prompt"))
-        final_path = _bound_path(root, raw.get("final_prompt"))
+        visual_path, visual_data = _bound_bytes(root, raw.get("visual_prompt"))
+        final_path, final_data = _bound_bytes(root, raw.get("final_prompt"))
         try:
-            visual = visual_path.read_text(encoding="utf-8")
-            final = final_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            visual = visual_data.decode("utf-8")
+            final = final_data.decode("utf-8")
+        except UnicodeDecodeError:
             raise LongGenerationError("long_video_plan_invalid") from None
         dialogue = current.get("dialogue")
         dialogue_binding = raw.get("dialogue")
@@ -248,16 +294,17 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         segdir = root / "work" / "segments" / str(index)
         fit_root = segdir / "work" / "h3_frames" / fit_mode
         # Complete all static transformations before the caller can make a POST.
-        if prepare_fit or fit_mode == "none":
-            first = _fit_anchor(first_source, fit_root / "first", fit_mode)
-            last = _fit_anchor(last_source, fit_root / "end", fit_mode)
-        else:
-            first = fit_root / "first" / first_source.name
-            last = fit_root / "end" / last_source.name
-            if not first.is_file() or not last.is_file():
-                raise LongGenerationError("frame_fit_failed")
+        first, first_data = _fit_anchor(
+            first_source, first_source_data, fit_root / "first", fit_mode,
+            prepare=prepare_fit,
+        )
+        last, last_data = _fit_anchor(
+            last_source, last_source_data, fit_root / "end", fit_mode,
+            prepare=prepare_fit,
+        )
         frozen.append(FrozenSegment(index, start_s, end_s, chain_id, join_mode,
-                                    segdir, first, last, prompt))
+                                    segdir, first, first_data, last, last_data,
+                                    prompt))
         previous_end, previous_chain = end_s, chain_id
     if abs(previous_end - duration) > _EPS:
         raise LongGenerationError("long_video_plan_invalid")
@@ -287,7 +334,7 @@ def _extract_last_frame(video: Path, output: Path) -> Path:
 def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
              parent_id: str, fit_mode: str, *, frozen_child_id: str | None = None,
              prepare_inputs: bool = True) -> h3.H3Request:
-    first = segment.first_frame
+    first, first_data = segment.first_frame, segment.first_frame_data
     if segment.join_mode == "continue":
         upstream = plan.segments[segment.index - 2]
         tail = upstream.workdir / "work" / "generated_last.png"
@@ -295,14 +342,14 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
             if not prepare_inputs:
                 raise LongGenerationError("long_video_tail_frame_missing")
             tail = _extract_last_frame(upstream.workdir / "generated.mp4", tail)
+        try:
+            tail_data = tail.read_bytes()
+        except OSError:
+            raise LongGenerationError("long_video_tail_frame_missing") from None
         continued = segment.workdir / "work" / "h3_frames" / fit_mode / "continued"
-        if prepare_inputs or fit_mode == "none":
-            first = _fit_anchor(tail, continued, fit_mode)
-        else:
-            first = continued / tail.name
-            if not first.is_file():
-                raise LongGenerationError("frame_fit_failed")
-    first_data, last_data = first.read_bytes(), segment.last_frame.read_bytes()
+        first, first_data = _fit_anchor(
+            tail, tail_data, continued, fit_mode, prepare=prepare_inputs
+        )
     return h3.H3Request(
         cid=f"{cid}-segment-{segment.index}",
         workdir=segment.workdir,
@@ -326,7 +373,7 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
         ),
         mode="boundary",
         first_frame=(first, first_data),
-        last_frame=(segment.last_frame, last_data),
+        last_frame=(segment.last_frame, segment.last_frame_data),
     )
 
 

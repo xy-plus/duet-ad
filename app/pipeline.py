@@ -228,13 +228,17 @@ def _recover_long_plan(cdir: Path, meta: dict) -> dict:
         plan = long_generation.freeze_plan(
             cdir, recovered_meta, digest, "none", meta.get("dialogue_mode", "auto")
         )
-        fit_required = frame_fit.frames_require_fit(
+        fit_required = frame_fit.frame_bytes_require_fit(
             [
                 anchor
                 for segment in plan.segments
                 for anchor in (
-                    ((segment.first_frame,) if segment.join_mode == "hard_cut" else ())
-                    + (segment.last_frame,)
+                    (
+                        (segment.first_frame_data,)
+                        if segment.join_mode == "hard_cut"
+                        else ()
+                    )
+                    + (segment.last_frame_data,)
                 )
             ]
         )
@@ -1421,21 +1425,29 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 )
                 changes["long_video_plan_receipt"] = receipt_path.name
                 try:
-                    changes["fit_required"] = frame_fit.frames_require_fit(
+                    digest = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+                    plan = long_generation.freeze_plan(
+                        cdir, {**meta, **changes}, digest, "none", dialogue_mode
+                    )
+                    changes["fit_required"] = frame_fit.frame_bytes_require_fit(
                         [
                             anchor
-                            for segment in receipt_segments
+                            for segment in plan.segments
                             for anchor in (
                                 (
-                                    (segment["first_frame_path"],)
-                                    if segment["join_mode"] == "hard_cut"
+                                    (segment.first_frame_data,)
+                                    if segment.join_mode == "hard_cut"
                                     else ()
                                 )
-                                + (segment["last_frame_path"],)
+                                + (segment.last_frame_data,)
                             )
                         ]
                     )
-                except frame_fit.FrameFitError as exc:
+                except (
+                    OSError,
+                    frame_fit.FrameFitError,
+                    long_generation.LongGenerationError,
+                ) as exc:
                     raise PipelineError(str(exc)) from None
             # 新 schema 保留 segments；短视频仍只写顶层 keyframes/prompt。
             storage.finish_input_claim(
