@@ -273,10 +273,81 @@ def test_long_segment_prompt_and_keyframes_use_accessible_disclosures_only():
     assert 'trigger.setAttribute("aria-expanded", String(expanded))' in source
 
 
-def test_closing_lightbox_returns_segment_thumbnail_to_collapsed_state():
-    source = APP_JS.read_text(encoding="utf-8")
-    close_branch = source.split("function closeLightbox()", 1)[1]
-    close_branch = close_branch.split("function onLightboxKey", 1)[0]
-    assert "activeLightboxDisclosure" in close_branch
-    assert "setDisclosureState" in close_branch
-    assert ".focus()" in close_branch
+def test_lightbox_dom_lifecycle_hides_and_restores_focus_for_every_close_path():
+    result = _run_contract(
+        "(()=>{"
+        "class FakeElement{constructor(tag,doc){this.tagName=tag.toUpperCase();this.doc=doc;"
+        "this.children=[];this.attrs={};this.listeners={};this.hidden=false;this.className='';this.isConnected=false;"
+        "this.classList={add:(v)=>{const s=new Set(this.className.split(/\\s+/).filter(Boolean));"
+        "s.add(v);this.className=[...s].join(' ')},remove:(v)=>{this.className=this.className"
+        ".split(/\\s+/).filter(x=>x&&x!==v).join(' ')},contains:(v)=>this.className.split(/\\s+/).includes(v)}}"
+        "appendChild(child){this.children.push(child);child.parent=this;child.isConnected=this.isConnected;return child}"
+        "setAttribute(k,v){this.attrs[k]=String(v)}getAttribute(k){return this.attrs[k]}"
+        "removeAttribute(k){delete this.attrs[k]}"
+        "addEventListener(k,fn){(this.listeners[k]||(this.listeners[k]=[])).push(fn)}"
+        "dispatchEvent(e){e.target=e.target||this;e.currentTarget=this;"
+        "e.stopPropagation=e.stopPropagation||(()=>{e.cancelBubble=true});"
+        "for(const fn of this.listeners[e.type]||[])fn(e);"
+        "if(e.bubbles!==false&&!e.cancelBubble&&this.parent)this.parent.dispatchEvent(e)}"
+        "querySelector(sel){const match=(x)=>sel[0]==='.'?x.className.split(/\\s+/).includes(sel.slice(1)):"
+        "x.tagName===sel.toUpperCase();for(const child of this.children){if(match(child))return child;"
+        "const nested=child.querySelector(sel);if(nested)return nested}return null}"
+        "contains(node){return this===node||this.children.some(x=>x.contains(node))}"
+        "focus(){this.doc.activeElement=this}blur(){if(this.doc.activeElement===this)this.doc.activeElement=this.doc.body}}"
+        "const doc={activeElement:null,listeners:{},createElement(tag){return new FakeElement(tag,this)},"
+        "addEventListener(k,fn){(this.listeners[k]||(this.listeners[k]=[])).push(fn)},"
+        "removeEventListener(k,fn){this.listeners[k]=(this.listeners[k]||[]).filter(x=>x!==fn)},"
+        "dispatchEvent(e){for(const fn of this.listeners[e.type]||[])fn(e)}};"
+        "doc.body=doc.createElement('body');doc.body.isConnected=true;"
+        "doc.getElementById=(id)=>{const walk=(node)=>{if(node.attrs.id===id)return node;"
+        "for(const child of node.children){const found=walk(child);if(found)return found}return null};return walk(doc.body)};"
+        "global.document=doc;"
+        "const shortOrigin=doc.createElement('button');doc.body.appendChild(shortOrigin);shortOrigin.focus();"
+        "contract.openLightbox('blob:short','短视频关键帧');"
+        "const box=doc.body.querySelector('.lightbox');const close=box.querySelector('.lightbox-close');"
+        "const shortOpened={hidden:box.hidden,closeFocused:doc.activeElement===close};"
+        "box.dispatchEvent({type:'click'});"
+        "const backgroundClosed={hidden:box.hidden,focusRestored:doc.activeElement===shortOrigin};"
+        "const sentinel=doc.createElement('button');doc.body.appendChild(sentinel);sentinel.focus();contract.closeLightbox();"
+        "const backgroundCleared=doc.activeElement===sentinel;"
+        "const otherOrigin=doc.createElement('button');doc.body.appendChild(otherOrigin);otherOrigin.focus();"
+        "contract.openLightbox('blob:other','其他关键帧');let closeClickBubbled=0;"
+        "box.addEventListener('click',()=>{closeClickBubbled+=1});close.dispatchEvent({type:'click'});"
+        "const buttonClosed={hidden:box.hidden,focusRestored:doc.activeElement===otherOrigin,"
+        "bubbled:closeClickBubbled};"
+        "const buttonSentinel=doc.createElement('button');doc.body.appendChild(buttonSentinel);"
+        "buttonSentinel.focus();contract.closeLightbox();const buttonCleared=doc.activeElement===buttonSentinel;"
+        "const segment=doc.createElement('button');doc.body.appendChild(segment);segment.focus();"
+        "contract.setDisclosureState(segment,null,false,{expand:'展开分段关键帧',collapse:'关闭分段关键帧'});"
+        "contract.openLightbox('blob:segment','分段关键帧',segment);"
+        "const segmentOpened={hidden:box.hidden,expanded:segment.getAttribute('aria-expanded'),"
+        "closeFocused:doc.activeElement===close};"
+        "doc.dispatchEvent({type:'keydown',key:'Escape'});"
+        "const escapeClosed={hidden:box.hidden,expanded:segment.getAttribute('aria-expanded'),"
+        "focusRestored:doc.activeElement===segment};"
+        "const stream=doc.createElement('div');stream.setAttribute('id','stream');doc.body.appendChild(stream);"
+        "const stale=doc.createElement('button');stream.appendChild(stale);stale.focus();"
+        "contract.setDisclosureState(stale,null,false,{expand:'展开旧图',collapse:'关闭旧图'});"
+        "contract.openLightbox('blob:stale','旧图',stale);stale.isConnected=false;contract.clearStream();"
+        "const cleared={hidden:box.hidden,expanded:stale.getAttribute('aria-expanded'),"
+        "src:box.querySelector('img').getAttribute('src')||null,"
+        "alt:box.querySelector('img').getAttribute('alt')||null,focusLeftDialog:doc.activeElement===doc.body};"
+        "return {shortOpened,backgroundClosed,backgroundCleared,buttonClosed,buttonCleared,"
+        "segmentOpened,escapeClosed,cleared}})()"
+    )
+    assert result == {
+        "shortOpened": {"hidden": False, "closeFocused": True},
+        "backgroundClosed": {"hidden": True, "focusRestored": True},
+        "backgroundCleared": True,
+        "buttonClosed": {"hidden": True, "focusRestored": True, "bubbled": 0},
+        "buttonCleared": True,
+        "segmentOpened": {"hidden": False, "expanded": "true", "closeFocused": True},
+        "escapeClosed": {"hidden": True, "expanded": "false", "focusRestored": True},
+        "cleared": {
+            "hidden": True,
+            "expanded": "false",
+            "src": None,
+            "alt": None,
+            "focusLeftDialog": True,
+        },
+    }
