@@ -236,6 +236,84 @@ def test_run_rechecks_300_second_gate_after_manifest(tmp_path, monkeypatch):
     assert stored["error"] == "long_video_duration_exceeded"
 
 
+def test_run_rejects_rewrite_when_source_probe_crosses_long_threshold(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "", "clip.mp4")
+    cdir = settings.data_dir / meta["id"]
+    (cdir / "source.mp4").write_bytes(b"fake")
+    storage.update_meta(
+        settings.data_dir, meta["id"], duration_s=9.9, voice_mode="rewrite",
+    )
+    operations = []
+    monkeypatch.setattr(
+        storage, "probe_video",
+        lambda _path: storage.VideoProbe(10.001, 320, 240),
+    )
+    monkeypatch.setattr(
+        pipeline, "_run_cmd",
+        lambda *_a, **_kw: operations.append("extract"),
+    )
+
+    pipeline.run(settings, meta["id"], object())
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "failed"
+    assert stored["error"] == "long_video_audio_mode_unsupported"
+    assert operations == []
+
+
+def test_run_rejects_translate_when_manifest_crosses_long_threshold_before_voice(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "", "clip.mp4")
+    cdir = settings.data_dir / meta["id"]
+    (cdir / "source.mp4").write_bytes(b"fake")
+    storage.update_meta(
+        settings.data_dir, meta["id"], duration_s=9.9, voice_mode="translate",
+        target_language="English",
+    )
+    operations = []
+
+    def fake_cmd(argv, *, timeout, step, cwd=None):
+        operations.append(step)
+        work = Path(argv[argv.index("--out-dir") + 1])
+        (work / "manifest.json").write_text(
+            json.dumps({"duration_seconds": 10.001}), encoding="utf-8"
+        )
+
+    monkeypatch.setattr(
+        storage, "probe_video",
+        lambda _path: storage.VideoProbe(9.9, 320, 240),
+    )
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(
+        pipeline, "_voice_step",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("voice must not run")),
+    )
+
+    pipeline.run(settings, meta["id"], object())
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "failed"
+    assert stored["error"] == "long_video_audio_mode_unsupported"
+    assert operations == ["extract"]
+
+
+def test_duration_calibration_accepts_keep_after_crossing_long_threshold():
+    assert pipeline._validate_calibrated_duration(
+        {"voice_mode": "keep"}, 10.001
+    ) == 10.001
+
+
+def test_duration_calibration_keeps_short_rewrite_valid():
+    assert pipeline._validate_calibrated_duration(
+        {"voice_mode": "rewrite"}, 10.0
+    ) == 10.0
+
+
 @pytest.fixture
 def fake_steps(monkeypatch):
     """mock 掉 extract 子进程与 codex；返回调用记录。"""
