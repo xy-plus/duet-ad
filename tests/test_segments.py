@@ -13,6 +13,8 @@ import threading
 import time
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -29,6 +31,18 @@ _PX_PNG = base64.b64decode(
 _ANCHOR_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAkAAAAQCAIAAABLKsIUAAAAMklEQVQYGXXBAQEAAAABIJZ33QJV5ChyFDmKHEWOIkeRo8hR5ChyFDmKHEWOIkeRo8gxBaoX4WKqZ68AAAAASUVORK5CYII="
 )
+
+
+def _solid_png(value: int) -> bytes:
+    ok, encoded = cv2.imencode(
+        ".png", np.full((240, 320, 3), value, dtype=np.uint8)
+    )
+    assert ok
+    return encoded.tobytes()
+
+
+_SOURCE_FIRST_PNG = _solid_png(40)
+_SOURCE_LAST_PNG = _solid_png(80)
 
 SEGMENTS = [
     {"index": 1, "start_s": 0.0, "end_s": 8.0},
@@ -257,8 +271,8 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
         elif step.startswith("segment ") and step.endswith(" extract"):
             out = Path(argv[argv.index("--out-dir") + 1])
             out.mkdir(parents=True, exist_ok=True)
-            (out / "001_frame_000.000s.png").write_bytes(_ANCHOR_PNG)
-            (out / "002_frame_007.750s.png").write_bytes(_ANCHOR_PNG)
+            (out / "001_frame_000.000s.png").write_bytes(_SOURCE_FIRST_PNG)
+            (out / "002_frame_007.750s.png").write_bytes(_SOURCE_LAST_PNG)
             (out / "manifest.json").write_text(
                 json.dumps(
                     {
@@ -285,6 +299,13 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
 
     stored = storage.load_meta(settings.data_dir, cid)
     assert stored["status"] == "done", stored["error"]
+    assert (stored["aspect_ratio"], stored["resolution"], stored["fit_mode"]) == (
+        "16:9", "480p", "crop"
+    )
+    assert stored["fit_profiles"] == {
+        "16:9": {"fit_required": True, "default_fit_mode": "crop"},
+        "9:16": {"fit_required": True, "default_fit_mode": "crop"},
+    }
     assert [(s["start_s"], s["end_s"]) for s in stored["segments"]] == [
         (0.0, 8.0),
         (8.0, 16.0),
@@ -322,10 +343,10 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
         "end",
     ]
     assert receipt["segments"][0]["anchors"][0]["sha256"] == hashlib.sha256(
-        _ANCHOR_PNG
+        _SOURCE_FIRST_PNG
     ).hexdigest()
     assert receipt["segments"][0]["anchors"][1]["sha256"] == hashlib.sha256(
-        _ANCHOR_PNG
+        _SOURCE_LAST_PNG
     ).hexdigest()
     assert receipt["segments"][0]["anchors"][0]["sha256"] != (
         receipt["segments"][0]["keyframes"][0]["sha256"]

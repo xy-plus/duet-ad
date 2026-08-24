@@ -1007,6 +1007,20 @@ input, textarea { font-family: inherit; }
 
 .final-choices { display: flex; flex-wrap: wrap; gap: 6px; }
 
+.parameter-summary-grid {
+  display: grid;
+  grid-template-columns: minmax(100px, auto) 1fr;
+  gap: 8px 16px;
+  margin: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.parameter-summary-grid dt { color: var(--text-2); }
+.parameter-summary-grid dd { margin: 0; color: var(--text); font-weight: 600; }
+
 .final-choice { position: relative; }
 
 .final-choice input {

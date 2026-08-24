@@ -35,6 +35,22 @@ from app.sanitize import sanitize
 SCHEMA_VERSION = 1
 H3_WORKFLOW = "minimax_h3_lightx2v_v5"
 H3_BOUNDARY_WORKFLOW = "minimax_h3_lightx2v"
+H3_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
+H3_RESOLUTIONS = frozenset({"480p", "768p"})
+H3_DEFAULT_ASPECT_RATIO = "9:16"
+H3_DEFAULT_RESOLUTION = "768p"
+
+
+def provider_resolution(aspect_ratio: str, resolution: str) -> str:
+    """Project closed product semantics to the provider's single enum."""
+    if aspect_ratio not in H3_ASPECT_RATIOS:
+        raise H3Error("invalid_aspect_ratio")
+    if resolution not in H3_RESOLUTIONS:
+        raise H3Error("invalid_resolution")
+    return resolution + ("横" if aspect_ratio == "16:9" else "竖")
+
+
+# Historical public constant kept for exact legacy attempt recovery only.
 H3_RESOLUTION = "768p竖"
 H3_MAX_DURATION_S = 10
 H3_BOUNDARY_MAX_DURATION_S = 15
@@ -150,6 +166,8 @@ class H3Request:
     first_frame: FrozenFrame | None = None
     last_frame: FrozenFrame | None = None
     seed: int | None = None
+    aspect_ratio: str = H3_DEFAULT_ASPECT_RATIO
+    resolution: str = H3_DEFAULT_RESOLUTION
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workdir", Path(self.workdir))
@@ -161,6 +179,10 @@ class H3Request:
             raise H3Error("invalid_prompt")
         if not isinstance(self.mode, str) or self.mode not in {"reference", "boundary"}:
             raise H3Error("invalid_mode")
+        if self.aspect_ratio not in H3_ASPECT_RATIOS:
+            raise H3Error("invalid_aspect_ratio")
+        if self.resolution not in H3_RESOLUTIONS:
+            raise H3Error("invalid_resolution")
         max_duration = (
             H3_MAX_DURATION_S
             if self.mode == "reference"
@@ -768,11 +790,14 @@ def _ensure_session_marker(request: H3Request) -> None:
 
 
 def _input_manifest(request: H3Request) -> dict[str, Any]:
+    projected = provider_resolution(request.aspect_ratio, request.resolution)
     if request.mode == "reference":
         provider_request = {
             "h3_workflow": H3_WORKFLOW,
             "duration": request.duration,
-            "resolution": H3_RESOLUTION,
+            "aspect_ratio": request.aspect_ratio,
+            "resolution": request.resolution,
+            "provider_resolution": projected,
         }
         if request.seed is not None:
             provider_request["seed"] = request.seed
@@ -789,7 +814,9 @@ def _input_manifest(request: H3Request) -> dict[str, Any]:
         "mode": request.mode,
         "h3_workflow": _workflow(request),
         "duration": request.duration,
-        "resolution": H3_RESOLUTION,
+        "aspect_ratio": request.aspect_ratio,
+        "resolution": request.resolution,
+        "provider_resolution": projected,
     }
     return {
         "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
@@ -898,6 +925,42 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _legacy_input_manifest(request: H3Request) -> dict[str, Any] | None:
+    if (
+        request.aspect_ratio != H3_DEFAULT_ASPECT_RATIO
+        or request.resolution != H3_DEFAULT_RESOLUTION
+    ):
+        return None
+    if request.mode == "reference":
+        provider_request = {
+            "h3_workflow": H3_WORKFLOW,
+            "duration": request.duration,
+            "resolution": H3_RESOLUTION,
+        }
+        if request.seed is not None:
+            provider_request["seed"] = request.seed
+        return {
+            "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
+            "keyframes": [
+                {"name": path.name, "sha256": hashlib.sha256(blob).hexdigest()}
+                for path, blob in request.keyframes
+            ],
+            "voice_texts_sha256": request.voice_receipt,
+            "request": provider_request,
+        }
+    return {
+        "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
+        "images": _image_manifest(request),
+        "voice_texts_sha256": request.voice_receipt,
+        "request": {
+            "mode": request.mode,
+            "h3_workflow": _workflow(request),
+            "duration": request.duration,
+            "resolution": H3_RESOLUTION,
+        },
+    }
+
+
 def _validate_state(
     request: H3Request,
     state: Mapping[str, Any],
@@ -905,6 +968,10 @@ def _validate_state(
     require_client_request_id: bool = True,
 ) -> None:
     manifest = _input_manifest(request)
+    legacy_manifest = _legacy_input_manifest(request)
+    legacy = legacy_manifest is not None and state.get("input") == legacy_manifest
+    if legacy:
+        manifest = legacy_manifest
     attempt_id = state.get("attempt_id")
     stored_request_id = state.get("client_request_id")
     if (
@@ -964,7 +1031,9 @@ def _validate_state(
             raise ReceiptError("state_invalid")
     h3_task_id = _task_id(h3_state.get("task_id"), required=False)
     if h3_task_id is not None:
-        if h3_state.get("receipt") != _h3_receipt(request, h3_task_id):
+        if h3_state.get("receipt") != _h3_receipt(
+            request, h3_task_id, legacy=legacy
+        ):
             raise ReceiptError("receipt_mismatch")
     if "result_url" in h3_state:
         raise ReceiptError("state_invalid")
@@ -983,6 +1052,13 @@ def _validate_state(
         raise ReceiptError("state_invalid")
 
 
+def _state_uses_legacy_generation_parameters(
+    request: H3Request, state: Mapping[str, Any],
+) -> bool:
+    legacy = _legacy_input_manifest(request)
+    return legacy is not None and state.get("input") == legacy
+
+
 def _task_id(value: Any, *, required: bool) -> str | None:
     if value is None and not required:
         return None
@@ -994,18 +1070,33 @@ def _task_id(value: Any, *, required: bool) -> str | None:
     return normalized
 
 
-def _h3_receipt(request: H3Request, task_id: str) -> dict[str, Any]:
+def _h3_receipt(
+    request: H3Request, task_id: str, *, legacy: bool = False,
+) -> dict[str, Any]:
+    manifest = _legacy_input_manifest(request) if legacy else _input_manifest(request)
+    if manifest is None:
+        raise ReceiptError("receipt_mismatch")
+    projected = (
+        H3_RESOLUTION
+        if legacy
+        else provider_resolution(request.aspect_ratio, request.resolution)
+    )
     if request.mode == "reference":
         provider_request = {
             "workflow": H3_WORKFLOW,
             "duration": request.duration,
-            "resolution": H3_RESOLUTION,
+            "resolution": projected,
         }
+        if not legacy:
+            provider_request.update(
+                aspect_ratio=request.aspect_ratio,
+                semantic_resolution=request.resolution,
+            )
         if request.seed is not None:
             provider_request["seed"] = request.seed
         return {
             "task_id": task_id,
-            "input_receipt": canonical_json_sha256(_input_manifest(request)),
+            "input_receipt": canonical_json_sha256(manifest),
             "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
             "keyframes": _input_manifest(request)["keyframes"],
             "request": provider_request,
@@ -1014,11 +1105,16 @@ def _h3_receipt(request: H3Request, task_id: str) -> dict[str, Any]:
         "mode": request.mode,
         "workflow": _workflow(request),
         "duration": request.duration,
-        "resolution": H3_RESOLUTION,
+        "resolution": projected,
     }
+    if not legacy:
+        provider_request.update(
+            aspect_ratio=request.aspect_ratio,
+            semantic_resolution=request.resolution,
+        )
     return {
         "task_id": task_id,
-        "input_receipt": canonical_json_sha256(_input_manifest(request)),
+        "input_receipt": canonical_json_sha256(manifest),
         "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
         "images": _image_manifest(request),
         "request": provider_request,
@@ -1103,7 +1199,7 @@ def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) 
     body: dict[str, Any] = {
         "prompt": request.prompt,
         "duration": request.duration,
-        "resolution": H3_RESOLUTION,
+        "resolution": provider_resolution(request.aspect_ratio, request.resolution),
     }
     if request.seed is not None:
         body["seed"] = request.seed
@@ -1155,7 +1251,11 @@ def _poll_h3(
     client: httpx.Client,
     task_id: str,
 ) -> H3Result:
-    if state["h3"].get("receipt") != _h3_receipt(request, task_id):
+    if state["h3"].get("receipt") != _h3_receipt(
+        request,
+        task_id,
+        legacy=_state_uses_legacy_generation_parameters(request, state),
+    ):
         raise ReceiptError("receipt_mismatch")
     deadline = time.monotonic() + request.timeouts.h3_poll_s
     headers = {"Authorization": request.autodl_token}

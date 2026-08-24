@@ -18,6 +18,36 @@ VOICE_TEXTS = ("第一句台词", "第二句台词")
 
 
 @pytest.mark.parametrize(
+    ("aspect_ratio", "resolution", "provider_value"),
+    [
+        ("16:9", "480p", "480p横"),
+        ("9:16", "480p", "480p竖"),
+        ("16:9", "768p", "768p横"),
+        ("9:16", "768p", "768p竖"),
+    ],
+)
+def test_provider_resolution_is_the_only_semantic_projection(
+    aspect_ratio, resolution, provider_value,
+):
+    assert h3.provider_resolution(aspect_ratio, resolution) == provider_value
+
+
+@pytest.mark.parametrize(
+    ("aspect_ratio", "resolution"),
+    [("1:1", "768p"), ("9:16", "1080p"), (None, "480p")],
+)
+def test_h3_request_rejects_generation_values_before_provider_post(
+    tmp_path, aspect_ratio, resolution,
+):
+    with pytest.raises(h3.H3Error, match="invalid_(aspect_ratio|resolution)"):
+        replace(
+            _request(tmp_path),
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+        )
+
+
+@pytest.mark.parametrize(
     "stream,expected",
     [
         ({"codec_type": "video", "duration": "1.25"}, True),
@@ -237,7 +267,9 @@ def test_boundary_mode_selects_fl2va_workflow_and_only_boundary_fields(tmp_path)
         "mode": "boundary",
         "h3_workflow": "minimax_h3_lightx2v",
         "duration": 15,
-        "resolution": "768p竖",
+        "aspect_ratio": "9:16",
+        "resolution": "768p",
+        "provider_resolution": "768p竖",
     }
     assert state["input"]["images"] == [
         {
@@ -677,6 +709,9 @@ def test_existing_v1_reference_attempt_remains_inspectable_and_get_only_resumabl
     with _client(recovery) as client:
         assert h3.resume(request, client=client).status == "succeeded"
     assert calls and all(call.method == "GET" for call in calls)
+    recovered = json.loads(path.read_text(encoding="utf-8"))
+    assert recovered["input"] == manifest
+    assert recovered["h3"]["receipt"] == receipt
 
 
 def test_h3_query_retries_without_repeating_post(tmp_path):

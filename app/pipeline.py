@@ -39,7 +39,7 @@ from pathlib import Path
 
 import cv2
 
-from app import asr, frame_fit, long_generation, long_video, prepared_input, storage, vocal, voice
+from app import asr, frame_fit, h3, long_generation, long_video, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -140,13 +140,7 @@ def _recover_prepared_input(cdir: Path, meta: dict) -> dict:
         )
     except prepared_input.PreparedInputError:
         raise PipelineError("prepared input recovery invalid") from None
-    try:
-        names = [
-            artifact.path.relative_to(cdir / "work" / "keyframes").as_posix()
-            for artifact in frozen.keyframes
-        ]
-    except ValueError:
-        raise PipelineError("prepared input recovery invalid") from None
+    names = [artifact.path.name for artifact in frozen.keyframes]
     if any(Path(name).name != name for name in names):
         raise PipelineError("prepared input recovery invalid")
     duration = meta.get("duration_s")
@@ -156,12 +150,45 @@ def _recover_prepared_input(cdir: Path, meta: dict) -> dict:
         or abs(float(duration) - frozen.duration_s) > _FLOAT_COMPARISON_EPS_S
     ):
         raise PipelineError("prepared input recovery invalid")
+    effective_meta = dict(meta)
+    if not isinstance(effective_meta.get("source_width"), int):
+        try:
+            source_probe = storage.probe_video(frozen.source.path)
+        except storage.UploadError:
+            raise PipelineError("prepared input recovery invalid") from None
+        effective_meta.update(
+            source_width=source_probe.width,
+            source_height=source_probe.height,
+        )
+    try:
+        profiles, _recommended_aspect, _recommended_resolution, _recommended_fit = _generation_defaults(
+            [cdir / "work" / "keyframes" / name for name in names],
+            effective_meta,
+        )
+    except (PipelineError, KeyError):
+        raise PipelineError("prepared input recovery invalid") from None
+    engine_h3 = frozen.engine_request.get("h3")
+    if not isinstance(engine_h3, dict):
+        raise PipelineError("prepared input recovery invalid")
+    raw_resolution = engine_h3.get("resolution")
+    if raw_resolution in h3.H3_RESOLUTIONS:
+        resolution = raw_resolution
+    elif raw_resolution == h3.H3_RESOLUTION:
+        resolution = h3.H3_DEFAULT_RESOLUTION
+    else:
+        raise PipelineError("prepared input recovery invalid")
+    aspect_ratio = frozen.ratio
+    fit_mode = frozen.fit_mode
     return {
         "status": "done",
         "error": None,
         "keyframes": names,
         "prompt": frozen.prompt_text,
-        "fit_required": _keyframes_require_fit(cdir / "work", names),
+        "fit_required": profiles[aspect_ratio]["fit_required"],
+        "fit_profiles": profiles,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "fit_mode": fit_mode,
         "prepared_input_receipt": prepared_input.RECEIPT_FILENAME,
     }
 
@@ -228,27 +255,37 @@ def _recover_long_plan(cdir: Path, meta: dict) -> dict:
         plan = long_generation.freeze_plan(
             cdir, recovered_meta, digest, "none", meta.get("dialogue_mode", "auto")
         )
-        fit_required = frame_fit.frame_bytes_require_fit(
-            [
-                anchor
-                for segment in plan.segments
-                for anchor in (
-                    (
-                        (segment.first_frame_data,)
-                        if segment.join_mode == "hard_cut"
-                        else ()
-                    )
-                    + (segment.last_frame_data,)
+        anchors = [
+            anchor
+            for segment in plan.segments
+            for anchor in (
+                (
+                    (segment.first_frame_data,)
+                    if segment.join_mode == "hard_cut"
+                    else ()
                 )
-            ]
-        )
+                + (segment.last_frame_data,)
+            )
+        ]
+        if "source_width" in meta or "source_height" in meta:
+            profiles, aspect_ratio, resolution, fit_mode = (
+                _generation_defaults_from_bytes(anchors, meta)
+            )
+        else:
+            profiles, aspect_ratio, resolution, fit_mode = (
+                _legacy_generation_defaults_from_bytes(anchors)
+            )
     except (frame_fit.FrameFitError, long_generation.LongGenerationError, ValueError):
         raise PipelineError("long video plan recovery invalid") from None
     return {
         "status": "done",
         "error": None,
         "segments": segments,
-        "fit_required": fit_required,
+        "fit_required": profiles[aspect_ratio]["fit_required"],
+        "fit_profiles": profiles,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "fit_mode": fit_mode,
         "long_video_plan_receipt": long_video.PLAN_RECEIPT_FILENAME,
     }
 
@@ -996,14 +1033,96 @@ def _apply_no_bgm_prefix(prompt: str, prompt_path: Path, *, enabled: bool) -> st
     return final_prompt
 
 
-def _keyframes_require_fit(work: Path, names: list[str]) -> bool:
-    """按 H3 实际接收的关键帧判断是否需要 9:16 适配。"""
+def _source_dimensions(meta: dict) -> tuple[int, int]:
+    width, height = meta.get("source_width"), meta.get("source_height")
+    if (
+        isinstance(width, bool)
+        or isinstance(height, bool)
+        or not isinstance(width, int)
+        or not isinstance(height, int)
+        or width <= 0
+        or height <= 0
+    ):
+        raise PipelineError("source dimensions missing for generation defaults")
+    return width, height
+
+
+def _generation_defaults(
+    paths: list[Path], meta: dict,
+) -> tuple[dict[str, dict[str, object]], str, str, str]:
+    width, height = _source_dimensions(meta)
     try:
-        return frame_fit.frames_require_fit(
-            [work / "keyframes" / name for name in names]
+        profiles, aspect_ratio = frame_fit.generation_fit_profiles(
+            paths, source_width=width, source_height=height
+        )
+        resolution = frame_fit.recommended_resolution(min(width, height))
+    except frame_fit.FrameFitError as exc:
+        raise PipelineError(str(exc)) from None
+    fit_mode = str(profiles[aspect_ratio]["default_fit_mode"])
+    return profiles, aspect_ratio, resolution, fit_mode
+
+
+def _generation_defaults_from_bytes(
+    frames: list[bytes], meta: dict,
+) -> tuple[dict[str, dict[str, object]], str, str, str]:
+    width, height = _source_dimensions(meta)
+    try:
+        profiles, aspect_ratio = frame_fit.generation_fit_profiles_from_bytes(
+            frames, source_width=width, source_height=height
+        )
+        resolution = frame_fit.recommended_resolution(min(width, height))
+    except frame_fit.FrameFitError as exc:
+        raise PipelineError(str(exc)) from None
+    fit_mode = str(profiles[aspect_ratio]["default_fit_mode"])
+    return profiles, aspect_ratio, resolution, fit_mode
+
+
+def _legacy_generation_defaults(
+    paths: list[Path],
+) -> tuple[dict[str, dict[str, object]], str, str, str]:
+    try:
+        required = frame_fit.frames_require_fit(
+            paths, h3.H3_DEFAULT_ASPECT_RATIO
         )
     except frame_fit.FrameFitError as exc:
         raise PipelineError(str(exc)) from None
+    profiles = {
+        "16:9": {"fit_required": True, "default_fit_mode": "crop"},
+        "9:16": {
+            "fit_required": required,
+            "default_fit_mode": "crop" if required else "none",
+        },
+    }
+    return (
+        profiles,
+        h3.H3_DEFAULT_ASPECT_RATIO,
+        h3.H3_DEFAULT_RESOLUTION,
+        profiles[h3.H3_DEFAULT_ASPECT_RATIO]["default_fit_mode"],
+    )
+
+
+def _legacy_generation_defaults_from_bytes(
+    frames: list[bytes],
+) -> tuple[dict[str, dict[str, object]], str, str, str]:
+    try:
+        required = frame_fit.frame_bytes_require_fit(
+            frames, h3.H3_DEFAULT_ASPECT_RATIO
+        )
+    except frame_fit.FrameFitError as exc:
+        raise PipelineError(str(exc)) from None
+    profiles = {
+        "16:9": {"fit_required": True, "default_fit_mode": "crop"},
+        "9:16": {
+            "fit_required": required,
+            "default_fit_mode": "crop" if required else "none",
+        },
+    }
+    return (
+        profiles,
+        h3.H3_DEFAULT_ASPECT_RATIO,
+        h3.H3_DEFAULT_RESOLUTION,
+        profiles[h3.H3_DEFAULT_ASPECT_RATIO]["default_fit_mode"],
+    )
 
 
 def _read_segment_anchor_frames(work: Path) -> tuple[bytes, bytes]:
@@ -1199,6 +1318,9 @@ def _write_prepared_receipt(
     visual_prompt: str,
     dialogue_mode: str,
     voice_lines: list[dict],
+    aspect_ratio: str,
+    resolution: str,
+    fit_mode: str,
 ) -> str:
     """冻结单段 H3 输入并把 receipt 位置写入 meta；不触发任何远程请求。"""
     current = storage.load_meta(settings.data_dir, cid)
@@ -1208,8 +1330,19 @@ def _write_prepared_receipt(
     duration_s, engine_duration = _prepared_durations(current)
     visual_path = work / "visual_prompt.txt"
     visual_path.write_text(visual_prompt, encoding="utf-8")
-    ratio = current.get("ratio") or H3_DEFAULT_RATIO
-    fit_mode = current.get("fit_mode") or H3_DEFAULT_FIT_MODE
+    originals = [work / "keyframes" / name for name in keyframes]
+    if fit_mode == "none":
+        h3_keyframes = originals
+    else:
+        try:
+            h3_keyframes = list(frame_fit.fit_frames(
+                originals,
+                work / "h3_frames" / aspect_ratio.replace(":", "x") / fit_mode,
+                fit_mode,
+                aspect_ratio,
+            ))
+        except frame_fit.FrameFitError as exc:
+            raise PipelineError(str(exc)) from None
     filter_enabled = current.get("vocal_filter_enabled", _vocal_filter_enabled())
     if not isinstance(filter_enabled, bool):
         raise PipelineError("vocal_filter_enabled in meta must be bool")
@@ -1217,7 +1350,11 @@ def _write_prepared_receipt(
         "h3": {
             "workflow": H3_ENGINE_WORKFLOW,
             "duration": engine_duration,
-            "resolution": "768p竖",
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "provider_resolution": h3.provider_resolution(
+                aspect_ratio, resolution
+            ),
         },
     }
     try:
@@ -1225,14 +1362,14 @@ def _write_prepared_receipt(
             root=cdir,
             source=source,
             audio=(work / "voice.mp3") if (work / "voice.mp3").is_file() else None,
-            keyframes=[work / "keyframes" / name for name in keyframes],
+            keyframes=h3_keyframes,
             visual=visual_path,
             final=work / "prompt.txt",
             dialogue_mode=dialogue_mode,
             dialogue=dialogue,
             vocal_filter_enabled=filter_enabled,
             duration_s=duration_s,
-            ratio=ratio,
+            ratio=aspect_ratio,
             fit_mode=fit_mode,
             engine_request=engine_request,
         )
@@ -1273,12 +1410,16 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
         new_input_contract = "dialogue_mode" in meta and meta.get("duration_s") is not None
         if new_input_contract:
             try:
-                probed_duration = storage.probe_video(source).duration_s
+                source_probe = storage.probe_video(source)
+                probed_duration = source_probe.duration_s
             except storage.UploadError as exc:
                 raise PipelineError(str(exc)) from None
             probed_duration = _validate_calibrated_duration(meta, probed_duration)
             meta = storage.update_meta(
-                settings.data_dir, cid, duration_s=probed_duration
+                settings.data_dir, cid,
+                duration_s=probed_duration,
+                source_width=source_probe.width,
+                source_height=source_probe.height,
             ) or meta
         _run_cmd(
             [
@@ -1352,7 +1493,13 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 step="visual codex",
             )
             prompt = _apply_no_bgm_prefix(prompt, work / "prompt.txt", enabled=False)
-            fit_required = _keyframes_require_fit(work, keyframes)
+            frame_paths = [work / "keyframes" / name for name in keyframes]
+            profiles, aspect_ratio, resolution, default_fit_mode = (
+                _generation_defaults(frame_paths, meta)
+                if new_input_contract
+                else _legacy_generation_defaults(frame_paths)
+            )
+            fit_required = bool(profiles[aspect_ratio]["fit_required"])
             if new_input_contract:
                 prompt = _write_prepared_receipt(
                     settings,
@@ -1364,6 +1511,9 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     prompt,
                     dialogue_mode,
                     voice_lines or [],
+                    aspect_ratio,
+                    resolution,
+                    default_fit_mode,
                 )
             storage.finish_input_claim(
                 settings.data_dir,
@@ -1373,6 +1523,10 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 keyframes=keyframes,
                 prompt=prompt,
                 fit_required=fit_required,
+                fit_profiles=profiles,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                fit_mode=default_fit_mode,
             )
         else:
             # 多段模式：各段目录独立、无共享状态，线程池并发；CodexRunner.run 自带信号量兜底
@@ -1438,19 +1592,20 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     plan = long_generation.freeze_plan(
                         cdir, {**meta, **changes}, digest, "none", dialogue_mode
                     )
-                    changes["fit_required"] = frame_fit.frame_bytes_require_fit(
-                        [
-                            anchor
-                            for segment in plan.segments
-                            for anchor in (
-                                (
-                                    (segment.first_frame_data,)
-                                    if segment.join_mode == "hard_cut"
-                                    else ()
-                                )
-                                + (segment.last_frame_data,)
+                    anchors = [
+                        anchor
+                        for segment in plan.segments
+                        for anchor in (
+                            (
+                                (segment.first_frame_data,)
+                                if segment.join_mode == "hard_cut"
+                                else ()
                             )
-                        ]
+                            + (segment.last_frame_data,)
+                        )
+                    ]
+                    profiles, aspect_ratio, resolution, default_fit_mode = (
+                        _generation_defaults_from_bytes(anchors, meta)
                     )
                 except (
                     OSError,
@@ -1458,6 +1613,13 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     long_generation.LongGenerationError,
                 ) as exc:
                     raise PipelineError(str(exc)) from None
+                changes.update(
+                    fit_required=profiles[aspect_ratio]["fit_required"],
+                    fit_profiles=profiles,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    fit_mode=default_fit_mode,
+                )
             # 新 schema 保留 segments；短视频仍只写顶层 keyframes/prompt。
             storage.finish_input_claim(
                 settings.data_dir, cid, claim_owner, **changes

@@ -1,4 +1,4 @@
-"""显式把原始关键帧适配为 9:16；调用方必须先得到用户的 crop/pad 选择。"""
+"""H3 输入画幅推荐与显式适配；浏览器不得自行猜测媒体几何。"""
 
 from __future__ import annotations
 
@@ -14,6 +14,17 @@ class FrameFitError(RuntimeError):
     """关键帧无法按已确认的画幅策略派生。"""
 
 
+TARGET_ASPECTS = {"16:9": (16, 9), "9:16": (9, 16)}
+TARGET_RESOLUTIONS = {"480p": 480, "768p": 768}
+
+
+def _target_ratio(aspect_ratio: str) -> tuple[int, int]:
+    target = TARGET_ASPECTS.get(aspect_ratio)
+    if target is None:
+        raise FrameFitError("aspect_ratio must be 16:9 or 9:16")
+    return target
+
+
 def _decode_frame(data: bytes, label: str) -> np.ndarray:
     if not isinstance(data, bytes) or not data:
         raise FrameFitError(f"cannot decode keyframe: {label}")
@@ -23,46 +34,167 @@ def _decode_frame(data: bytes, label: str) -> np.ndarray:
     return image
 
 
-def frame_bytes_require_fit(frames: Sequence[bytes]) -> bool:
-    """Judge exact immutable H3 frame bytes, decoding every supplied frame."""
+def _byte_dimensions(frames: Sequence[bytes]) -> list[tuple[int, int]]:
     snapshots = list(frames)
     if not snapshots:
         raise FrameFitError("frame set must not be empty")
-    required = False
+    result = []
     for position, data in enumerate(snapshots, 1):
         image = _decode_frame(data, f"frame-{position}")
         height, width = image.shape[:2]
-        if width * 16 != height * 9:
-            required = True
-    return required
+        result.append((width, height))
+    return result
 
 
-def frames_require_fit(paths: Sequence[Path]) -> bool:
-    """Read each H3 input path once, then judge the immutable snapshots."""
+def _dimensions(paths: Sequence[Path]) -> list[tuple[int, int]]:
     inputs = [Path(path) for path in paths]
     try:
         snapshots = [path.read_bytes() for path in inputs]
     except OSError as exc:
         raise FrameFitError(f"cannot read keyframe: {exc.filename}") from None
-    return frame_bytes_require_fit(snapshots)
+    return _byte_dimensions(snapshots)
 
 
-def _target_size(width: int, height: int, mode: str) -> tuple[int, int]:
+def frame_bytes_require_fit(
+    frames: Sequence[bytes], aspect_ratio: str,
+) -> bool:
+    """Judge exact immutable H3 frame bytes against an explicit target."""
+    target_width, target_height = _target_ratio(aspect_ratio)
+    return any(
+        width * target_height != height * target_width
+        for width, height in _byte_dimensions(frames)
+    )
+
+
+def frames_require_fit(paths: Sequence[Path], aspect_ratio: str) -> bool:
+    """Return whether any actual H3 input frame differs from the target."""
+    target_width, target_height = _target_ratio(aspect_ratio)
+    return any(
+        width * target_height != height * target_width
+        for width, height in _dimensions(paths)
+    )
+
+
+def _generation_fit_profiles(
+    dimensions: Sequence[tuple[int, int]], *,
+    source_width: int, source_height: int,
+) -> tuple[dict[str, dict[str, object]], str]:
+    """Recommend one closed aspect by total symmetric ratio loss.
+
+    Equal H3-input loss is resolved by the source-video orientation; a square
+    source leaves the product-level 9:16 fallback as the final deterministic tie.
+    """
+    if (
+        isinstance(source_width, bool)
+        or isinstance(source_height, bool)
+        or not isinstance(source_width, int)
+        or not isinstance(source_height, int)
+        or source_width <= 0
+        or source_height <= 0
+    ):
+        raise FrameFitError("source dimensions must be positive integers")
+    losses = {
+        aspect: sum(
+            abs(math.log((width / height) / (target_width / target_height)))
+            for width, height in dimensions
+        )
+        for aspect, (target_width, target_height) in TARGET_ASPECTS.items()
+    }
+    minimum = min(losses.values())
+    candidates = [
+        aspect for aspect in TARGET_ASPECTS
+        if math.isclose(losses[aspect], minimum, rel_tol=0, abs_tol=1e-12)
+    ]
+    if len(candidates) == 1:
+        selected = candidates[0]
+    elif source_width > source_height:
+        selected = "16:9"
+    elif source_height > source_width:
+        selected = "9:16"
+    else:
+        selected = "9:16"
+    profiles = {
+        aspect: {
+            "fit_required": any(
+                width * target_height != height * target_width
+                for width, height in dimensions
+            ),
+            "default_fit_mode": (
+                "crop"
+                if any(
+                    width * target_height != height * target_width
+                    for width, height in dimensions
+                )
+                else "none"
+            ),
+        }
+        for aspect, (target_width, target_height) in TARGET_ASPECTS.items()
+    }
+    return profiles, selected
+
+
+def generation_fit_profiles(
+    paths: Sequence[Path], *, source_width: int, source_height: int,
+) -> tuple[dict[str, dict[str, object]], str]:
+    return _generation_fit_profiles(
+        _dimensions(paths), source_width=source_width, source_height=source_height
+    )
+
+
+def generation_fit_profiles_from_bytes(
+    frames: Sequence[bytes], *, source_width: int, source_height: int,
+) -> tuple[dict[str, dict[str, object]], str]:
+    """Recommend from the exact immutable frame bytes frozen for H3."""
+    return _generation_fit_profiles(
+        _byte_dimensions(frames),
+        source_width=source_width,
+        source_height=source_height,
+    )
+
+
+def recommended_resolution(source_short_edge: int) -> str:
+    if (
+        isinstance(source_short_edge, bool)
+        or not isinstance(source_short_edge, int)
+        or source_short_edge <= 0
+    ):
+        raise FrameFitError("source short edge must be a positive integer")
+    return min(
+        TARGET_RESOLUTIONS,
+        key=lambda value: (
+            abs(source_short_edge - TARGET_RESOLUTIONS[value]),
+            TARGET_RESOLUTIONS[value],
+        ),
+    )
+
+
+def _target_size(
+    width: int, height: int, mode: str, aspect_ratio: str,
+) -> tuple[int, int]:
+    ratio_width, ratio_height = _target_ratio(aspect_ratio)
     if mode == "crop":
-        scale = min(width // 9, height // 16)
+        scale = min(width // ratio_width, height // ratio_height)
     elif mode == "pad":
-        scale = max(math.ceil(width / 9), math.ceil(height / 16))
+        scale = max(
+            math.ceil(width / ratio_width), math.ceil(height / ratio_height)
+        )
     else:
         raise FrameFitError("fit_mode must be crop or pad")
-    if scale < 1:
-        raise FrameFitError("frame is too small for 9:16 fitting")
-    return 9 * scale, 16 * scale
+    scale = max(1, scale)
+    return ratio_width * scale, ratio_height * scale
 
 
-def _fit(image: np.ndarray, mode: str) -> np.ndarray:
+def _fit(image: np.ndarray, mode: str, aspect_ratio: str) -> np.ndarray:
     height, width = image.shape[:2]
-    target_width, target_height = _target_size(width, height, mode)
+    target_width, target_height = _target_size(
+        width, height, mode, aspect_ratio
+    )
     if mode == "crop":
+        if width < target_width or height < target_height:
+            scale = max(target_width / width, target_height / height)
+            width = max(target_width, round(width * scale))
+            height = max(target_height, round(height * scale))
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_CUBIC)
         left = (width - target_width) // 2
         top = (height - target_height) // 2
         return image[top : top + target_height, left : left + target_width].copy()
@@ -74,21 +206,27 @@ def _fit(image: np.ndarray, mode: str) -> np.ndarray:
     return canvas
 
 
-def fit_frame_bytes(data: bytes, mode: str, *, label: str = "frame") -> bytes:
+def fit_frame_bytes(
+    data: bytes, mode: str, aspect_ratio: str, *, label: str = "frame",
+) -> bytes:
     """Derive encoded PNG bytes from one immutable source-frame snapshot."""
     if mode not in {"crop", "pad"}:
         raise FrameFitError("fit_mode must be crop or pad")
-    fitted = _fit(_decode_frame(data, label), mode)
+    _target_ratio(aspect_ratio)
+    fitted = _fit(_decode_frame(data, label), mode, aspect_ratio)
     ok, encoded = cv2.imencode(".png", fitted)
     if not ok:
         raise FrameFitError(f"cannot encode keyframe: {label}")
     return encoded.tobytes()
 
 
-def fit_frames(paths: Sequence[Path], output_dir: Path, mode: str) -> tuple[Path, ...]:
+def fit_frames(
+    paths: Sequence[Path], output_dir: Path, mode: str, aspect_ratio: str,
+) -> tuple[Path, ...]:
     """从给定原始帧生成同名 PNG；绝不推断或默认选择适配模式。"""
     if mode not in {"crop", "pad"}:
         raise FrameFitError("fit_mode must be crop or pad")
+    _target_ratio(aspect_ratio)
     inputs = [Path(path) for path in paths]
     if not inputs or len(inputs) > 9:
         raise FrameFitError("keyframe count must be in 1..9")
@@ -104,7 +242,9 @@ def fit_frames(paths: Sequence[Path], output_dir: Path, mode: str) -> tuple[Path
             data = source.read_bytes()
         except OSError:
             raise FrameFitError(f"cannot decode keyframe: {source.name}")
-        encoded = fit_frame_bytes(data, mode, label=source.name)
+        encoded = fit_frame_bytes(
+            data, mode, aspect_ratio, label=source.name
+        )
         output = output_dir / (source.stem + ".png")
         temporary = output.with_suffix(output.suffix + ".tmp")
         try:

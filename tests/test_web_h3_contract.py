@@ -99,6 +99,9 @@ def test_submit_and_detail_state_are_part_of_static_contract():
         "receipt_version",
         "read_only",
         "duration_s",
+        "aspect_ratio",
+        "resolution",
+        "fit_profiles",
     ):
         assert token in source
     assert "提交结果未知，禁止重复提交" in source
@@ -140,13 +143,16 @@ def test_detail_signature_tracks_direct_h3_render_fields():
 def test_resume_builder_reuses_persisted_h3_attempt_exactly():
     payload = _run_contract(
         "contract.buildResumePayload({generation:{status:'resume_required',client_request_id:'request-old'},"
-        "dialogue:{mode:'edit',lines:[{text:'x',start_s:0,end_s:1}]},fit_mode:'pad'})"
+        "dialogue:{mode:'edit',lines:[{text:'x',start_s:0,end_s:1}]},fit_mode:'pad',"
+        "aspect_ratio:'9:16',resolution:'768p'})"
     )
     assert payload == {
         "confirm": True,
         "client_request_id": "request-old",
         "dialogue_mode": "edit",
         "fit_mode": "pad",
+        "aspect_ratio": "9:16",
+        "resolution": "768p",
         "lines": [{"text": "x", "start_s": 0, "end_s": 1}],
     }
 
@@ -186,26 +192,29 @@ def test_submission_unknown_branch_has_no_action_button():
 def test_pure_submit_builder_omits_lines_for_auto_and_none():
     result = _run_contract(
         "["
-        "contract.buildSubmitPayload({clientRequestId:'request-1',dialogueMode:'auto',fitRequired:false}),"
-        "contract.buildSubmitPayload({clientRequestId:'request-2',dialogueMode:'none',fitRequired:false})"
+        "contract.buildSubmitPayload({clientRequestId:'request-1',dialogueMode:'auto',fitRequired:false,aspectRatio:'16:9',resolution:'480p'}),"
+        "contract.buildSubmitPayload({clientRequestId:'request-2',dialogueMode:'none',fitRequired:false,aspectRatio:'9:16',resolution:'768p'})"
         "]"
     )
     assert result == [
-        {"confirm": True, "client_request_id": "request-1", "dialogue_mode": "auto", "fit_mode": "none"},
-        {"confirm": True, "client_request_id": "request-2", "dialogue_mode": "none", "fit_mode": "none"},
+        {"confirm": True, "client_request_id": "request-1", "dialogue_mode": "auto", "fit_mode": "none", "aspect_ratio": "16:9", "resolution": "480p"},
+        {"confirm": True, "client_request_id": "request-2", "dialogue_mode": "none", "fit_mode": "none", "aspect_ratio": "9:16", "resolution": "768p"},
     ]
 
 
 def test_pure_submit_builder_parses_custom_lines():
     result = _run_contract(
         "contract.buildSubmitPayload({clientRequestId:'request-3',dialogueMode:'custom',"
-        "linesText:'0 - 1.5 | first\\n1.5 - 3 | second',fitRequired:true,fitMode:'crop'})"
+        "linesText:'0 - 1.5 | first\\n1.5 - 3 | second',fitRequired:true,fitMode:'crop',"
+        "aspectRatio:'9:16',resolution:'768p'})"
     )
     assert result == {
         "confirm": True,
         "client_request_id": "request-3",
         "dialogue_mode": "custom",
         "fit_mode": "crop",
+        "aspect_ratio": "9:16",
+        "resolution": "768p",
         "lines": [
             {"start_s": 0, "end_s": 1.5, "text": "first"},
             {"start_s": 1.5, "end_s": 3, "text": "second"},
@@ -233,3 +242,42 @@ def test_pure_submit_builder_rejects_incomplete_attempts(expression):
     )
     assert completed.returncode == 0
     assert completed.stdout
+
+
+def test_generation_options_select_server_defaults_and_switch_fit_profile():
+    result = _run_contract(
+        "(()=>{const detail={aspect_ratio:'16:9',resolution:'480p',fit_profiles:{"
+        "'16:9':{fit_required:false,default_fit_mode:'none'},"
+        "'9:16':{fit_required:true,default_fit_mode:'crop'}}};"
+        "return [contract.generationParameterDraft(detail),"
+        "contract.fitProfile(detail,'9:16')];})()"
+    )
+    assert result == [
+        {"aspectRatio": "16:9", "resolution": "480p", "fitMode": "none"},
+        {"fit_required": True, "default_fit_mode": "crop"},
+    ]
+
+
+def test_success_snapshot_uses_only_server_frozen_generation_values():
+    result = _run_contract(
+        "contract.generationParameterSnapshot({aspect_ratio:'16:9',resolution:'768p',"
+        "fit_mode:'crop',duration_s:20.25,segment_count:3,"
+        "dialogue:{mode:'auto'},generation:{status:'succeeded'}})"
+    )
+    assert result == {
+        "aspect_ratio": "16:9",
+        "resolution": "768p",
+        "dialogue_mode": "auto",
+        "fit_mode": "crop",
+        "duration_s": 20.25,
+        "segment_count": 3,
+    }
+
+
+def test_parameter_controls_and_success_summary_are_rendered_together():
+    source = _web_source()
+    assert "画幅" in source
+    assert "清晰度" in source
+    assert "生成参数" in source
+    assert "实际总时长" in source
+    assert "长视频分段数" in source
