@@ -7,8 +7,40 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 from app import storage
+
+
+def test_mutate_meta_serializes_entire_read_modify_write(tmp_path):
+    meta = storage.new_conversation(tmp_path, "x", "x.mp4")
+    active = 0
+    maximum = 0
+    guard = threading.Lock()
+    observations = []
+
+    def worker(field):
+        def mutate(current):
+            nonlocal active, maximum
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+            observations.append((field, current.get("first"), current.get("second")))
+            time.sleep(0.03)
+            current[field] = True
+            with guard:
+                active -= 1
+        storage.mutate_meta(tmp_path, meta["id"], mutate)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(worker, ("first", "second")))
+
+    current = storage.load_meta(tmp_path, meta["id"])
+    assert maximum == 1
+    assert current["first"] is True and current["second"] is True
+    assert any(first is True or second is True for _, first, second in observations)
 
 
 def _webm_with_longer_audio(path, video_duration, audio_duration):

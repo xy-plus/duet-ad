@@ -519,17 +519,29 @@ def test_submit_freezes_postprocessed_keyframe_bytes_when_optimization_done(
     assert frozen.keyframes[0].path == cdir / "work" / "postprocessed" / "01.png"
 
 
-def test_submit_does_not_fall_back_while_postprocess_is_incomplete(enabled):
+@pytest.mark.parametrize("postprocess_status", ["running", "failed"])
+def test_submit_does_not_fall_back_while_postprocess_is_incomplete(
+    enabled, postprocess_status,
+):
     settings, client = enabled
     cid, _ = _make_conv(settings, duration_s=9.2)
     storage.update_meta(
         settings.data_dir,
         cid,
         postprocess={
-            "status": "running",
-            "options": {"remove_subtitle": True, "remove_brand": False},
+            "status": postprocess_status,
+            "options": {
+                "remove_subtitle": True, "remove_brand": False,
+                "optimize_image": False,
+            },
             "frames": [],
-            "error": None,
+            "segments": [{
+                "index": 0, "status": postprocess_status,
+                "stage": "text", "completed_frames": 0, "total_frames": 1,
+                "revision": 1,
+                "error": "frame failed" if postprocess_status == "failed" else None,
+            }],
+            "error": "segment 0 failed" if postprocess_status == "failed" else None,
         },
     )
 

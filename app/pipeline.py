@@ -39,7 +39,7 @@ from pathlib import Path
 
 import cv2
 
-from app import asr, frame_fit, h3, long_generation, long_video, prepared_input, storage, vocal, voice
+from app import asr, frame_fit, h3, image_optimization, long_generation, long_video, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -1515,10 +1515,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     resolution,
                     default_fit_mode,
                 )
-            storage.finish_input_claim(
-                settings.data_dir,
-                cid,
-                claim_owner,
+            completion = dict(
                 status="done",
                 keyframes=keyframes,
                 prompt=prompt,
@@ -1527,6 +1524,16 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 aspect_ratio=aspect_ratio,
                 resolution=resolution,
                 fit_mode=default_fit_mode,
+            )
+            if new_input_contract:
+                completion.update(image_optimization.freeze_prompts(
+                    settings, {**meta, **completion}
+                ))
+            storage.finish_input_claim(
+                settings.data_dir,
+                cid,
+                claim_owner,
+                **completion,
             )
         else:
             # 多段模式：各段目录独立、无共享状态，线程池并发；CodexRunner.run 自带信号量兜底
@@ -1621,6 +1628,10 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     fit_mode=default_fit_mode,
                 )
             # 新 schema 保留 segments；短视频仍只写顶层 keyframes/prompt。
+            if new_input_contract:
+                changes.update(image_optimization.freeze_prompts(
+                    settings, {**meta, **changes}
+                ))
             storage.finish_input_claim(
                 settings.data_dir, cid, claim_owner, **changes
             )

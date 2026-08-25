@@ -1,327 +1,726 @@
-"""MediaKit erase-image 后处理编排：HTTP 门控 + 后台并行逐帧擦除。
-
-门控顺序：ENABLE_MEDIAKIT_ERASE 关 → 501；会话不存在 → 404；
-confirm 非严格 True → 409；字幕/品牌选项至少选一否则 422（未知键或非 bool 值 → 422）；
-status != done → 409；meta.postprocess 已在 running → 409；上次 done/failed 的 options 与本次
-不同 → 409（防旧产物贴新标签，锁定比对只认当前 OPTION_KEYS 共有键——旧状态中的
-废弃键忽略；纯废弃形态放行并清旧产物）；锁内复查（running / 产物完整）后置 running。
-后台任务（BackgroundTasks，独立路径不吃管道闸；可并发，每会话一把锁）：
-收集目标帧（单段 work/keyframes/*.png；多段 work/segments/N/work/keyframes/*.png）→ 按勾选选项
-映射文字/图标擦除场景 → 未跳过帧 asyncio.gather 并行
-mediakit.erase_image(confirm=True)，进程级信号量（主进程
-mediakit_sem，MEDIAKIT_CONCURRENCY）限并发 → 产出写 work/postprocessed/<帧名>.png 或
-work/segments/N/work/postprocessed/<帧名>.png → 任一帧失败整体 failed（error 列失败帧名；
-其余帧照常跑完，已成功帧保留且重跑跳过）→
-meta.postprocess = {status: running|done|failed, options, frames, error}（内部字段；
-running 期间每成功一帧即写回 frames，前端 2s 轮询据此显示 n/m 实时进度）。
-"""
+"""Fail-closed, segment-scoped MediaKit -> Seedream postprocessing."""
 
 from __future__ import annotations
 
 import asyncio
+import json
+import math
+import os
+import re
+import shutil
+from dataclasses import replace
 from pathlib import Path
 
-from app import mediakit, storage
+import cv2
+
+from app import image_optimization, mediakit, seedream, storage
 from app.config import Settings
 from app.sanitize import sanitize
 
-OPTION_KEYS = ("remove_subtitle", "remove_brand")
-_LEGACY_OPTION_KEYS = frozenset({"change_bg", "face_hold"})
-_CLIENT_REFRESH_MESSAGE = "页面版本已更新，请刷新页面后重试。"
-
-_SCENES = {
-    "remove_subtitle": mediakit.TEXT_SCENE,
-    "remove_brand": mediakit.ICON_SCENE,
-}
+OPTION_KEYS = ("remove_subtitle", "remove_brand", "optimize_image")
+_OLD_OPTION_KEYS = frozenset({"remove_subtitle", "remove_brand"})
+_OPTION_SET = frozenset(OPTION_KEYS)
+_STALE_KEYS = frozenset({"change_bg", "face_hold"})
+_PUBLIC_STATUSES = frozenset({"running", "done", "failed"})
+_PUBLIC_STAGES = frozenset({"queued", "text", "brand", "seedream", "publishing", "done"})
+_PUBLIC_ERROR_CODES = frozenset({
+    "cancelled", "submission_unknown", "provider_rejected",
+    "provider_protocol_error", "postprocess_artifacts_invalid",
+    "postprocess_canonical_conflict", "image_optimization_prompt_invalid",
+    "postprocess_receipt_invalid", "segment_failed",
+})
+_FRAME_ERROR_RE = re.compile(r"^frame ([A-Za-z0-9_.-]{1,128}) failed(?:$|:)")
+_PUBLIC_FRAME_RE = re.compile(
+    r"^(?:[A-Za-z0-9_.-]{1,128}|segments/[1-9]\d*/work/postprocessed/[A-Za-z0-9_.-]{1,128})$"
+)
 
 
 class PostprocessError(Exception):
-    """后处理门控/执行失败（路由层转成 status+detail，同 SubmitError 模式）。"""
-
     def __init__(self, status: int, detail: str | dict[str, str]) -> None:
-        if isinstance(detail, dict):
-            if set(detail) != {"code", "message"} or not all(
-                isinstance(detail[key], str) and detail[key]
-                for key in ("code", "message")
-            ):
-                raise TypeError("structured postprocess detail must contain safe code and message")
-            public_detail: str | dict[str, str] = {
-                "code": detail["code"],
-                "message": detail["message"],
-            }
-        elif isinstance(detail, str):
-            public_detail = detail
-        else:
-            raise TypeError("postprocess detail must be a public string or safe structure")
-        super().__init__(str(public_detail))
+        super().__init__(str(detail))
         self.status = status
-        self.detail = public_detail
+        self.detail = detail
 
 
-async def start(
-    settings: Settings, cid: str, payload: dict, locks: dict[str, asyncio.Lock]
-) -> dict[str, bool]:
-    """门控 + 置 running；返回勾选选项（路由层据此调度后台任务）。"""
-    if not settings.enable_mediakit_erase:
-        raise PostprocessError(501, "MediaKit erase is disabled.")
-    meta = storage.load_meta(settings.data_dir, cid)
-    if meta is None:
-        raise PostprocessError(404, "not found")
-    if set(payload) != {"confirm", "options"}:
-        raise PostprocessError(422, "invalid_postprocess_request")
-    if payload.get("confirm") is not True:
-        raise PostprocessError(409, "confirmation required")
-    options = _parse_options(payload)
-    if meta.get("status") != "done":
-        raise PostprocessError(409, "artifacts not ready")
-    if isinstance(meta.get("generation"), dict) or meta.get("_input_owner"):
-        raise PostprocessError(409, "generation_already_started")
-    if (meta.get("postprocess") or {}).get("status") == "running":
-        raise PostprocessError(409, "already running")
-    last = meta.get("postprocess") or {}
-    if last.get("status") in ("done", "failed") and not _options_match(last.get("options"), options):
-        raise PostprocessError(409, _options_locked_detail())
-    lock = locks.setdefault(cid, asyncio.Lock())
-    async with lock:
-        meta = storage.load_meta(settings.data_dir, cid)
-        if meta is None or (meta.get("postprocess") or {}).get("status") == "running":
-            raise PostprocessError(409, "already running")
-        if isinstance(meta.get("generation"), dict) or meta.get("_input_owner"):
-            raise PostprocessError(409, "generation_already_started")
-        last_in = meta.get("postprocess") or {}
-        if (
-            last_in.get("status") in ("done", "failed")
-            and not _options_match(last_in.get("options"), options)
-        ):
-            raise PostprocessError(409, _options_locked_detail())
-        _targets(settings.data_dir / cid, meta)  # 产物完整才受理（帧目录缺失 → 409）
-        # 纯废弃形态（旧版只勾 change_bg 等）放行重跑：清除旧产物，强制全帧重编辑防贴错标签；
-        # 锁内执行（用锁内重载的 meta），避免「清产物后复查失败毁掉旧产物」与并发 stale 读窗口；
-        # 同选项正常重跑不清产物（跳过逻辑依赖已有输出）
-        if last_in.get("status") in ("done", "failed") and _is_pure_legacy(last_in.get("options")):
-            _clear_postprocessed(settings.data_dir / cid, meta)
-        storage.update_meta(settings.data_dir, cid, postprocess={
-            "status": "running", "options": options, "frames": [], "error": None,
-        })
-    return options
+def _structured(code: str, message: str) -> dict[str, str]:
+    return {"code": code, "message": message}
 
 
-async def run_task(
-    settings: Settings, cid: str, options: dict[str, bool], sem: asyncio.Semaphore
-) -> None:
-    """后台任务：并行逐帧编辑（进程级信号量 sem 限并发）；任一帧失败 → meta.postprocess failed
-    （error 列失败帧名，其余帧照常跑完，已成功帧保留，重跑跳过）；
-    父任务被取消（graceful shutdown）→ 写 failed(error=cancelled) 后继续传播取消；
-    每成功一帧即写回 frames（status 保持 running），供前端轮询显示实时进度。"""
-    # data_dir 可能是相对路径（生产默认 "data"）：子进程带 cwd 时相对路径会错位，统一起点解析为绝对
-    cdir = (settings.data_dir / cid).resolve()
-    frames: list[str] = []
-    try:
-        meta = storage.load_meta(settings.data_dir, cid)
-        if meta is None:
-            raise PostprocessError(404, "not found")
-        todo: list[tuple[int | None, Path, Path]] = []
-        for seg_index, src, out in _targets(cdir, meta):
-            if out.is_file():
-                frames.append(_frame_ref(seg_index, out.name))  # 已成功帧保留，重跑不重复扣费
-                _write_progress(settings, cid, options, frames)
-                continue
-            todo.append((seg_index, src, out))
-        # 并发编辑：return_exceptions 收集，全部完成后统一判定（任一失败 → failed；
-        # 其余帧自然跑完，保留更多产物；每帧一次编辑，无同 out 并发，不需会话锁串行）
-        results = await asyncio.gather(
-            *(_edit_one(settings, cdir, cid, src, out, seg_index, options, frames, sem)
-              for seg_index, src, out in todo),
-            return_exceptions=True,
+def _public_error(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value in _PUBLIC_ERROR_CODES:
+        return value
+    if isinstance(value, str):
+        matched = _FRAME_ERROR_RE.match(value)
+        if matched and matched.group(1) not in {".", ".."}:
+            return f"frame {matched.group(1)} failed"
+    return "postprocess_failed"
+
+
+def public_state(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    status = value.get("status")
+    raw_options = value.get("options")
+    options = {
+        key: raw_options.get(key) if isinstance(raw_options, dict)
+        and isinstance(raw_options.get(key), bool) else False
+        for key in OPTION_KEYS
+    }
+    raw_frames = value.get("frames")
+    result = {
+        "status": (
+            status if isinstance(status, str) and status in _PUBLIC_STATUSES else "failed"
+        ),
+        "options": options,
+        "frames": [
+            item for item in raw_frames
+            if isinstance(item, str) and _PUBLIC_FRAME_RE.match(item)
+            and item.rsplit("/", 1)[-1] not in {".", ".."}
+        ] if isinstance(raw_frames, list) else [],
+        "error": _public_error(value.get("error")),
+    }
+    raw_segments = value.get("segments")
+    if raw_segments is None:
+        raw_segments = []
+        valid_segments = True
+    else:
+        valid_segments = isinstance(raw_segments, list)
+    indices = [
+        item.get("index") for item in raw_segments
+        if isinstance(item, dict)
+    ] if isinstance(raw_segments, list) else []
+    valid_segments = (
+        valid_segments and len(indices) == len(raw_segments)
+        and all(isinstance(index, int) and not isinstance(index, bool) for index in indices)
+        and (
+        indices == [0] or indices == list(range(1, len(indices) + 1))
         )
-        errors = [
-            _frame_error(out.name, e)
-            for (_, _, out), e in zip(todo, results) if isinstance(e, BaseException)
-        ]
-        if errors:
-            raise PostprocessError(502, sanitize("；".join(errors)))
-        post = {"status": "done", "options": options, "frames": sorted(frames), "error": None}
-    except asyncio.CancelledError:
-        # 父任务被取消（uvicorn graceful shutdown）：gather 自身抛 CancelledError（BaseException），
-        # 不写终态会永久 running、start 永久 409；先写 failed（update_meta 同步，可安全调用）再传播取消
-        post = {"status": "failed", "options": options, "frames": sorted(frames), "error": "cancelled"}
-        storage.update_meta(settings.data_dir, cid, postprocess=post)
-        raise
-    except PostprocessError as e:
-        error = e.detail if isinstance(e.detail, str) else e.detail["message"]
-        post = {"status": "failed", "options": options, "frames": sorted(frames), "error": error}
-    except Exception as e:
-        post = {"status": "failed", "options": options, "frames": sorted(frames), "error": sanitize(str(e))}
-    storage.update_meta(settings.data_dir, cid, postprocess=post)
-
-
-async def _edit_one(
-    settings: Settings,
-    cdir: Path,
-    cid: str,
-    src: Path,
-    out: Path,
-    seg_index: int | None,
-    options: dict[str, bool],
-    frames: list[str],
-    sem: asyncio.Semaphore,
-) -> None:
-    """单帧编辑（gather 成员）：信号量内提交；成功后追加帧名并写回进度。
-
-    run_task 收集阶段已保证各帧 out 互异且未产出，同帧不会被并发重复提交；erase_image 不再
-    接收并发锁（每帧新建锁退化为自守卫，无实际防护），同 out 仅一次提交由收集不变量 + start
-    门控保证。
-    """
-    try:
-        async with sem:
-            await mediakit.erase_image(
-                settings, cdir, src, out, True, _selected_scenes(options),
+    )
+    if valid_segments:
+        for item in raw_segments:
+            completed, total, revision = (
+                item.get("completed_frames"), item.get("total_frames"), item.get("revision")
             )
-    except mediakit.MediaKitError as e:
-        raise PostprocessError(502, f"frame {out.name} failed: {sanitize(e.detail)}") from None
-    except Exception as e:
-        raise PostprocessError(502, f"frame {out.name} failed: {sanitize(str(e))}") from None
-    frames.append(_frame_ref(seg_index, out.name))
-    _write_progress(settings, cid, options, frames)
+            if (
+                isinstance(completed, bool) or not isinstance(completed, int)
+                or isinstance(total, bool) or not isinstance(total, int)
+                or isinstance(revision, bool) or not isinstance(revision, int)
+                or completed < 0 or total < 0 or completed > total or revision < 1
+            ):
+                valid_segments = False
+                break
+    result["segments"] = [
+        {
+            "index": item.get("index"),
+            "status": (
+                item.get("status")
+                if isinstance(item.get("status"), str)
+                and item.get("status") in _PUBLIC_STATUSES else "failed"
+            ),
+            "stage": (
+                item.get("stage")
+                if isinstance(item.get("stage"), str)
+                and item.get("stage") in _PUBLIC_STAGES else "unknown"
+            ),
+            "completed_frames": item["completed_frames"],
+            "total_frames": item["total_frames"],
+            "revision": item["revision"],
+            "error": _public_error(item.get("error")),
+        }
+        for item in raw_segments
+    ] if valid_segments else []
+    if not valid_segments:
+        result.update(status="failed", frames=[], error="postprocess_receipt_invalid")
+    return result
 
 
-def _frame_error(name: str, e: BaseException) -> str:
-    """失败帧错误文案：_edit_one 已包装成 PostprocessError 的直接用 detail，异常形态兜底脱敏。"""
-    if isinstance(e, PostprocessError):
-        return e.detail if isinstance(e.detail, str) else e.detail["message"]
-    return f"frame {name} failed: {sanitize(str(e))}"
-
-
-def _options_match(last_options: object, options: dict[str, bool]) -> bool:
-    """锁定比对只认当前 OPTION_KEYS 内共有键：旧状态 options 里的废弃键忽略；
-    上次 options 非 dict（如 None）一律视为不一致；
-    纯废弃形态（上次在当前键上无任何 True，如旧版只勾 change_bg）视为无锁定放行——
-    否则该类会话永久 409 无出口。"""
-    if not isinstance(last_options, dict):
-        return False
-    if _is_pure_legacy(last_options):
-        return True
-    return all(
-        last_options.get(key) == options[key] for key in OPTION_KEYS if key in last_options
-    )
-
-
-def _is_pure_legacy(last_options: object) -> bool:
-    """上次 options 为 dict 且当前键无任何 True（旧版只勾 change_bg 等废弃选择）→ 纯废弃形态。"""
-    return isinstance(last_options, dict) and not any(
-        last_options.get(key) is True for key in OPTION_KEYS if key in last_options
-    )
-
-
-def _clear_postprocessed(cdir: Path, meta: dict) -> None:
-    """删除既有 postprocessed 产物（纯废弃形态重跑时旧产物无对应新选项意义，防贴错标签）。"""
-    targets = [cdir / "work" / "postprocessed"]
-    targets += [
-        cdir / "work" / "segments" / str(seg.get("index")) / "work" / "postprocessed"
-        for seg in meta.get("segments") or []
-    ]
-    for d in targets:
-        if d.is_dir():
-            for p in d.glob("*.png"):
-                p.unlink(missing_ok=True)
+def _private_receipt(meta: dict) -> dict:
+    raw = meta.get("_postprocess_receipt")
+    expected_keys = {
+        "version", "options", "model", "edit_mode", "prompt_template",
+        "timeout_s", "prompts",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_keys or raw.get("version") != 1:
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    options = raw.get("options")
+    post = meta.get("postprocess")
+    if not isinstance(post, dict):
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    public_options = post.get("options")
+    if (
+        not isinstance(options, dict) or set(options) != _OPTION_SET
+        or any(not isinstance(options[key], bool) for key in OPTION_KEYS)
+        or not any(options.values())
+        or not isinstance(public_options, dict) or set(public_options) != _OPTION_SET
+        or any(not isinstance(public_options[key], bool) for key in OPTION_KEYS)
+        or any(public_options[key] != options[key] for key in OPTION_KEYS)
+    ):
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    timeout = raw.get("timeout_s")
+    if (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+        or not math.isfinite(float(timeout)) or timeout <= 0
+    ):
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    private_frozen = {
+        "version": 1, "model": raw.get("model"), "edit_mode": raw.get("edit_mode"),
+        "prompt_template": raw.get("prompt_template"), "segments": raw.get("prompts"),
+    }
+    project_frozen = image_optimization.receipt(meta)
+    if project_frozen is None or private_frozen != project_frozen:
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    return {
+        **raw,
+        "options": {key: options[key] for key in OPTION_KEYS},
+        "prompts": [dict(item) for item in project_frozen["segments"]],
+    }
 
 
 def _parse_options(payload: dict) -> dict[str, bool]:
-    """options 白名单校验：未知键、非 bool 或未选中任何选项均 fail closed 为 422。"""
     raw = payload.get("options")
     if not isinstance(raw, dict):
         raise PostprocessError(422, "at least one option required")
-    unknown = sorted(set(raw) - set(OPTION_KEYS))
-    if unknown:
-        if (
-            set(unknown) <= _LEGACY_OPTION_KEYS
-            and all(isinstance(value, bool) for value in raw.values())
-        ):
-            raise PostprocessError(409, _CLIENT_REFRESH_MESSAGE)
-        raise PostprocessError(422, f"unknown options: {', '.join(unknown)}")
-    options: dict[str, bool] = {}
-    for key in OPTION_KEYS:
-        value = raw.get(key)
-        if value is not None and not isinstance(value, bool):
-            raise PostprocessError(422, "options must be booleans")
-        options[key] = bool(value)
+    if not raw:
+        raise PostprocessError(422, "at least one option required")
+    if any(not isinstance(value, bool) for value in raw.values()):
+        raise PostprocessError(422, "options must be booleans")
+    keys = frozenset(raw)
+    stale = keys - _OPTION_SET
+    if stale and stale <= _STALE_KEYS:
+        raise PostprocessError(409, "页面版本已更新，请刷新页面后重试。")
+    if keys not in {_OLD_OPTION_KEYS, _OPTION_SET}:
+        unknown = sorted(keys - _OPTION_SET)
+        if unknown:
+            raise PostprocessError(422, f"unknown options: {', '.join(unknown)}")
+        raise PostprocessError(422, "invalid_postprocess_options")
+    options = {key: bool(raw.get(key, False)) for key in OPTION_KEYS}
     if not any(options.values()):
         raise PostprocessError(422, "at least one option required")
     return options
 
 
-def _options_locked_detail() -> dict[str, str]:
+def _capability_gate(settings: Settings, options: dict[str, bool]) -> None:
+    if (options["remove_subtitle"] or options["remove_brand"]) and not settings.enable_mediakit_erase:
+        raise PostprocessError(501, "MediaKit erase is disabled.")
+    if options["optimize_image"] and not os.environ.get("ARK_API_KEY", "").strip():
+        raise PostprocessError(501, "Seedream image optimization is disabled.")
+
+
+def _options_match(previous: object, current: dict[str, bool]) -> bool:
+    if not isinstance(previous, dict):
+        return False
+    if set(previous) and not any(previous.get(key) is True for key in OPTION_KEYS):
+        return True
+    return all(bool(previous.get(key, False)) == value for key, value in current.items())
+
+
+def _pure_legacy(previous: object) -> bool:
+    return (
+        isinstance(previous, dict)
+        and bool(set(previous) & _STALE_KEYS)
+        and not any(previous.get(key) is True for key in OPTION_KEYS)
+    )
+
+
+def _clear_canonical(cdir: Path, grouped: dict[int, list[tuple[Path, Path]]]) -> None:
+    for targets in grouped.values():
+        destination = targets[0][1].parent
+        if destination.is_dir():
+            shutil.rmtree(destination)
+
+
+def _valid_png(candidate: Path, source: Path) -> bool:
+    try:
+        with candidate.open("rb") as handle:
+            if handle.read(8) != b"\x89PNG\r\n\x1a\n":
+                return False
+        decoded = cv2.imread(str(candidate), cv2.IMREAD_UNCHANGED)
+        original = cv2.imread(str(source), cv2.IMREAD_UNCHANGED)
+    except OSError:
+        return False
+    return (
+        decoded is not None and original is not None
+        and decoded.shape[:2] == original.shape[:2]
+    )
+
+
+def _canonical_complete(targets: list[tuple[Path, Path]]) -> bool:
+    destination = targets[0][1].parent
+    if not destination.is_dir():
+        return False
+    existing = sorted(path for path in destination.iterdir() if path.is_file())
+    expected = sorted(canonical.name for _, canonical in targets)
+    sources = {canonical.name: source for source, canonical in targets}
+    return (
+        [path.name for path in existing] == expected
+        and all(_valid_png(path, sources[path.name]) for path in existing)
+    )
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_dir(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _group_targets(cdir: Path, meta: dict) -> dict[int, list[tuple[Path, Path]]]:
+    segments = meta.get("segments")
+    grouped: dict[int, list[tuple[Path, Path]]] = {}
+    if isinstance(segments, list) and segments:
+        for segment in segments:
+            index = segment.get("index") if isinstance(segment, dict) else None
+            if not isinstance(index, int) or isinstance(index, bool) or index < 1:
+                raise PostprocessError(409, "artifacts not ready")
+            src_dir = cdir / "work" / "segments" / str(index) / "work" / "keyframes"
+            dst_dir = cdir / "work" / "segments" / str(index) / "work" / "postprocessed"
+            files = sorted(path for path in src_dir.glob("*.png") if path.is_file())
+            if not files:
+                raise PostprocessError(409, "artifacts not ready")
+            grouped[index] = [(path, dst_dir / path.name) for path in files]
+    else:
+        src_dir = cdir / "work" / "keyframes"
+        files = sorted(path for path in src_dir.glob("*.png") if path.is_file())
+        if not files:
+            raise PostprocessError(409, "artifacts not ready")
+        grouped[0] = [(path, cdir / "work" / "postprocessed" / path.name) for path in files]
+    return grouped
+
+
+def _segment_state(index: int, total: int, revision: int = 1) -> dict:
     return {
-        "code": "postprocess_options_locked",
-        "message": "后处理选项已锁定，请刷新页面后按原选项重试。",
+        "index": index, "status": "running", "stage": "queued",
+        "completed_frames": 0, "total_frames": total,
+        "revision": revision, "error": None,
     }
 
 
-def _targets(cdir: Path, meta: dict) -> list[tuple[int | None, Path, Path]]:
-    """收集 (段号|None, 源帧, 目标帧)：单段 = work/keyframes；多段 = work/segments/N/work/keyframes。"""
-    segs = meta.get("segments") or []
-    if segs:
-        out: list[tuple[int | None, Path, Path]] = []
-        for seg in segs:
-            n = seg.get("index")
-            src_dir = cdir / "work" / "segments" / str(n) / "work" / "keyframes"
-            dst_dir = cdir / "work" / "segments" / str(n) / "work" / "postprocessed"
-            files = (
-                sorted(p for p in src_dir.glob("*.png") if p.is_file())
-                if src_dir.is_dir() else []
+async def start(settings: Settings, cid: str, payload: dict,
+                locks: dict[str, asyncio.Lock]) -> None:
+    if set(payload) != {"confirm", "options"}:
+        raise PostprocessError(422, "invalid_postprocess_request")
+    if payload.get("confirm") is not True:
+        raise PostprocessError(409, "confirmation required")
+    options = _parse_options(payload)
+    _capability_gate(settings, options)
+    lock = locks.setdefault(cid, asyncio.Lock())
+    async with lock:
+        cdir = (settings.data_dir / cid).resolve()
+        def mutate(meta: dict) -> None:
+            if meta.get("schema_version") != 2:
+                raise PostprocessError(409, "read_only")
+            if meta.get("status") != "done":
+                raise PostprocessError(409, "artifacts not ready")
+            if isinstance(meta.get("generation"), dict) or meta.get("_input_owner"):
+                raise PostprocessError(409, "generation_already_started")
+            previous = meta.get("postprocess")
+            if isinstance(previous, dict) and previous.get("status") == "running":
+                raise PostprocessError(409, "already running")
+            if isinstance(previous, dict) and previous.get("status") == "failed":
+                raise PostprocessError(409, _structured(
+                    "postprocess_segment_retry_required",
+                    "后处理存在失败分段，请使用分段重试。",
+                ))
+            if (
+                isinstance(previous, dict) and previous.get("status") == "done"
+                and not _options_match(previous.get("options"), options)
+            ):
+                raise PostprocessError(409, _structured(
+                    "postprocess_options_locked", "后处理选项已锁定，请刷新页面后按原选项重试。"
+                ))
+            grouped = _group_targets(cdir, meta)
+            for frames in grouped.values():
+                destination = frames[0][1].parent
+                if destination.is_dir():
+                    if not _canonical_complete(frames) and not (
+                        isinstance(previous, dict)
+                        and _pure_legacy(previous.get("options"))
+                    ):
+                        raise PostprocessError(409, "postprocess_canonical_conflict")
+            if isinstance(previous, dict) and _pure_legacy(previous.get("options")):
+                _clear_canonical(cdir, grouped)
+            optimization = image_optimization.receipt(meta, settings)
+            if optimization is None:
+                raise PostprocessError(409, "image_optimization_prompt_invalid")
+            private = {
+                "version": 1, "options": options,
+                "model": optimization["model"],
+                "edit_mode": optimization["edit_mode"],
+                "prompt_template": optimization["prompt_template"],
+                "timeout_s": settings.seedream_timeout_s,
+                "prompts": optimization["segments"],
+            }
+            states = [
+                _segment_state(index, len(frames)) for index, frames in grouped.items()
+            ]
+            reuse_done = (
+                isinstance(previous, dict) and previous.get("status") == "done"
+                and _options_match(previous.get("options"), options)
+                and all(_canonical_complete(frames) for frames in grouped.values())
             )
-            for p in files:
-                out.append((n, p, dst_dir / p.name))
-        if not out:
-            raise PostprocessError(409, "artifacts not ready")
-        return out
-    kdir = cdir / "work" / "keyframes"
-    files = sorted(p for p in kdir.glob("*.png") if p.is_file()) if kdir.is_dir() else []
-    if not files:
-        raise PostprocessError(409, "artifacts not ready")
-    return [(None, p, cdir / "work" / "postprocessed" / p.name) for p in files]
+            if reuse_done:
+                for item in states:
+                    item.update(
+                        status="done", stage="done",
+                        completed_frames=item["total_frames"],
+                    )
+            meta["_image_optimization"] = optimization
+            meta["_postprocess_receipt"] = private
+            meta["postprocess"] = {
+                "status": "done" if reuse_done else "running",
+                "options": options,
+                "frames": sorted(
+                    _frame_ref(index, canonical.name)
+                    for index, frames in grouped.items()
+                    for _, canonical in frames if reuse_done
+                ),
+                "segments": states, "error": None,
+            }
+
+        if storage.mutate_meta(settings.data_dir, cid, mutate) is None:
+            raise PostprocessError(404, "not found")
+def _prompt(private: dict, index: int) -> str:
+    for item in private.get("prompts", []):
+        if item.get("segment_index") == index:
+            return item["current"]
+    raise PostprocessError(409, "image_optimization_prompt_invalid")
 
 
-def _frame_ref(seg_index: int | None, name: str) -> str:
-    """frames 列表条目：单段 = 帧名；多段 = segments/N/work/postprocessed/帧名。"""
-    return name if seg_index is None else f"segments/{seg_index}/work/postprocessed/{name}"
+def _frame_ref(index: int, name: str) -> str:
+    return name if index == 0 else f"segments/{index}/work/postprocessed/{name}"
 
 
-def _write_progress(
-    settings: Settings, cid: str, options: dict[str, bool], frames: list[str]
-) -> None:
-    """逐帧写回进度：frames 累计已完成帧，status 保持 running。storage.update_meta 全程同步、
-    append 与写回之间无 await，单事件循环内每帧写回是原子块，多协程写者无丢失更新。"""
-    storage.update_meta(settings.data_dir, cid, postprocess={
-        "status": "running", "options": options, "frames": frames, "error": None,
-    })
+def _private_dir(cdir: Path, index: int) -> Path:
+    return cdir / "work" / ".postprocess-private" / str(index)
 
 
-def _selected_scenes(options: dict[str, bool]) -> tuple[str, ...]:
-    """按稳定选项顺序生成 MediaKit 擦除场景；双选即两个有回执的阶段。"""
-    return tuple(_SCENES[key] for key in OPTION_KEYS if options.get(key))
+def _mutate_postprocess(settings: Settings, cid: str, mutator) -> dict | None:
+    def mutate(meta: dict) -> None:
+        raw = meta.get("postprocess")
+        post = dict(raw) if isinstance(raw, dict) else {}
+        mutator(meta, post)
+        meta["postprocess"] = post
+
+    return storage.mutate_meta(settings.data_dir, cid, mutate)
+
+
+def _update_segment(settings: Settings, cid: str, index: int, **changes) -> None:
+    def mutate(_meta: dict, post: dict) -> None:
+        segments = [dict(item) for item in post.get("segments", [])]
+        for item in segments:
+            if item.get("index") == index:
+                item.update(changes)
+                break
+        post["segments"] = segments
+        post["frames"] = sorted(
+            _frame_ref(item["index"], path.name)
+            for item in segments if item.get("status") == "done"
+            for path in _canonical_files(settings.data_dir / cid, item["index"])
+        )
+
+    _mutate_postprocess(settings, cid, mutate)
+
+
+def _canonical_files(cdir: Path, index: int) -> list[Path]:
+    root = (
+        cdir / "work" / "postprocessed" if index == 0
+        else cdir / "work" / "segments" / str(index) / "work" / "postprocessed"
+    )
+    return sorted(path for path in root.glob("*.png") if path.is_file()) if root.is_dir() else []
+
+
+async def _mediakit_stage(settings: Settings, cdir: Path, index: int,
+                          inputs: list[Path], stage: str, scene: str,
+                          sem: asyncio.Semaphore) -> list[Path]:
+    root = _private_dir(cdir, index) / stage
+    root.mkdir(parents=True, exist_ok=True)
+    outputs = [root / path.name for path in inputs]
+
+    async def one(source: Path, output: Path) -> None:
+        if output.is_file():
+            return
+        async with sem:
+            await mediakit.erase_image(settings, cdir, source, output, True, (scene,))
+
+    results = await asyncio.gather(
+        *(one(source, output) for source, output in zip(inputs, outputs)),
+        return_exceptions=True,
+    )
+    errors = [
+        f"frame {output.name} failed: {sanitize(str(result))}"
+        for output, result in zip(outputs, results) if isinstance(result, BaseException)
+    ]
+    if errors:
+        raise PostprocessError(502, errors[0])
+    return outputs
+
+
+async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
+                          inputs: list[Path], prompt: str, model: str, mode: str,
+                          timeout_s: float,
+                          sem: asyncio.Semaphore) -> list[Path]:
+    root = _private_dir(cdir, index) / "seedream"
+    attempts = _private_dir(cdir, index) / "attempts"
+    root.mkdir(parents=True, exist_ok=True)
+    attempts.mkdir(parents=True, exist_ok=True)
+    outputs = [root / path.name for path in inputs]
+    latest = storage.load_meta(settings.data_dir, cid) or {}
+    revision = next(
+        (item.get("revision", 1) for item in (latest.get("postprocess") or {}).get("segments", [])
+         if item.get("index") == index),
+        1,
+    )
+    task_settings = replace(
+        settings, seedream_model=model, seedream_edit_mode=mode,
+        seedream_timeout_s=timeout_s,
+    )
+
+    async def call(position: int, image_inputs: list[Path], output: Path) -> None:
+        if output.is_file():
+            return
+        async with sem:
+            await seedream.edit(
+                task_settings, [path.read_bytes() for path in image_inputs], prompt, output,
+                receipt_path=attempts / f"{position:04d}-r{revision}.json",
+            )
+
+    if mode == "independent_parallel":
+        results = await asyncio.gather(
+            *(call(i, [source], output) for i, (source, output) in enumerate(zip(inputs, outputs), 1)),
+            return_exceptions=True,
+        )
+    else:
+        try:
+            await call(1, inputs, outputs[0])
+            results = await asyncio.gather(
+                *(call(i, [source, outputs[0]], output)
+                  for i, (source, output) in enumerate(zip(inputs[1:], outputs[1:]), 2)),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            results = [exc]
+    errors = [result for result in results if isinstance(result, BaseException)]
+    if errors:
+        error = errors[0]
+        if isinstance(error, asyncio.CancelledError):
+            raise error
+        if isinstance(error, seedream.SeedreamError):
+            raise PostprocessError(502, error.code)
+        raise PostprocessError(502, sanitize(str(error)))
+    return outputs
+
+
+def _publish_segment(outputs: list[Path], targets: list[tuple[Path, Path]]) -> None:
+    # Publish the complete directory in one rename; no partial canonical set is observable.
+    output_roots = {path.parent for path in outputs}
+    staged_files = (
+        sorted(path.name for path in next(iter(output_roots)).iterdir() if path.is_file())
+        if len(output_roots) == 1 else []
+    )
+    expected_files = sorted(canonical.name for _, canonical in targets)
+    if (
+        len(outputs) != len(targets)
+        or staged_files != expected_files
+        or any(
+            not output.is_file() or output.name != canonical.name
+            or not _valid_png(output, source)
+            for output, (source, canonical) in zip(outputs, targets)
+        )
+    ):
+        raise PostprocessError(502, "postprocess_artifacts_invalid")
+    destination = targets[0][1].parent
+    if destination.is_dir():
+        if _canonical_complete(targets):
+            return
+        raise PostprocessError(409, "postprocess_canonical_conflict")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.publishing")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir()
+    try:
+        for output, (_, canonical) in zip(outputs, targets):
+            copied = temporary / canonical.name
+            shutil.copyfile(output, copied)
+            _fsync_file(copied)
+        os.replace(temporary, destination)
+        _fsync_dir(destination.parent)
+    finally:
+        if temporary.is_dir():
+            shutil.rmtree(temporary)
+
+
+async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
+                       targets: list[tuple[Path, Path]], options: dict[str, bool],
+                       private: dict, mediakit_sem: asyncio.Semaphore,
+                       seedream_sem: asyncio.Semaphore) -> None:
+    inputs = [source for source, _ in targets]
+    try:
+        if options["remove_subtitle"]:
+            _update_segment(settings, cid, index, stage="text")
+            inputs = await _mediakit_stage(
+                settings, cdir, index, inputs, "text", mediakit.TEXT_SCENE, mediakit_sem
+            )
+            _update_segment(settings, cid, index, completed_frames=len(inputs))
+        if options["remove_brand"]:
+            _update_segment(settings, cid, index, stage="brand")
+            inputs = await _mediakit_stage(
+                settings, cdir, index, inputs, "brand", mediakit.ICON_SCENE, mediakit_sem
+            )
+            _update_segment(settings, cid, index, completed_frames=len(inputs))
+        if options["optimize_image"]:
+            _update_segment(settings, cid, index, stage="seedream", completed_frames=0)
+            inputs = await _seedream_stage(
+                settings, cdir, cid, index, inputs, _prompt(private, index),
+                private["model"], private["edit_mode"], private["timeout_s"], seedream_sem,
+            )
+            _update_segment(settings, cid, index, completed_frames=len(inputs))
+        _update_segment(settings, cid, index, stage="publishing")
+        _publish_segment(inputs, targets)
+        _update_segment(
+            settings, cid, index, status="done", stage="done",
+            completed_frames=len(targets), error=None,
+        )
+    except asyncio.CancelledError:
+        latest = storage.load_meta(settings.data_dir, cid) or {}
+        ambiguous = index in _ambiguous_segments(cdir, latest.get("postprocess"))
+        _update_segment(
+            settings, cid, index, status="failed",
+            error="submission_unknown" if ambiguous else "cancelled",
+        )
+        raise
+    except Exception as exc:
+        detail = exc.detail if isinstance(exc, PostprocessError) else sanitize(str(exc))
+        _update_segment(settings, cid, index, status="failed", error=detail)
+
+
+async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore,
+                   seedream_sem: asyncio.Semaphore | None = None,
+                   only_segments: set[int] | None = None) -> None:
+    cdir = (settings.data_dir / cid).resolve()
+    seedream_sem = seedream_sem or asyncio.Semaphore(settings.seedream_concurrency)
+    meta = storage.load_meta(settings.data_dir, cid)
+    if meta is None:
+        return
+    try:
+        private = _private_receipt(meta)
+    except PostprocessError:
+        _mutate_postprocess(
+            settings, cid,
+            lambda _meta, post: post.update(
+                status="failed", error="postprocess_receipt_invalid"
+            ),
+        )
+        return
+    options = private["options"]
+    grouped = _group_targets(cdir, meta)
+    if only_segments is not None:
+        grouped = {index: targets for index, targets in grouped.items() if index in only_segments}
+    states = {
+        item.get("index"): item.get("status")
+        for item in (meta.get("postprocess") or {}).get("segments", [])
+        if isinstance(item, dict)
+    }
+    grouped = {
+        index: targets for index, targets in grouped.items()
+        if states.get(index) != "done"
+    }
+    try:
+        await asyncio.gather(*(
+            _run_segment(settings, cid, cdir, index, targets, options, private,
+                         mediakit_sem, seedream_sem)
+            for index, targets in grouped.items()
+        ))
+    except asyncio.CancelledError:
+        def cancel(_meta: dict, post: dict) -> None:
+            unknown = any(
+                item.get("error") == "submission_unknown"
+                for item in post.get("segments", []) if isinstance(item, dict)
+            )
+            post.update(
+                status="failed",
+                error="submission_unknown" if unknown else "cancelled",
+            )
+
+        _mutate_postprocess(settings, cid, cancel)
+        raise
+
+    def finalize(_meta: dict, post: dict) -> None:
+        segments = post.get("segments") or []
+        failed = [item for item in segments if item.get("status") == "failed"]
+        running = [item for item in segments if item.get("status") == "running"]
+        post["status"] = "running" if running else ("failed" if failed else "done")
+        post["error"] = (
+            "submission_unknown"
+            if any(item.get("error") == "submission_unknown" for item in failed)
+            else ("segment_failed" if failed else None)
+        )
+        post["frames"] = sorted(
+            _frame_ref(item["index"], path.name)
+            for item in segments if item.get("status") == "done"
+            for path in _canonical_files(cdir, item["index"])
+        )
+
+    _mutate_postprocess(settings, cid, finalize)
+
+
+async def retry_segment(settings: Settings, cid: str, index: int, payload: dict,
+                        locks: dict[str, asyncio.Lock]) -> None:
+    if set(payload) != {"confirm", "expected_revision"}:
+        raise PostprocessError(422, "invalid_postprocess_retry_request")
+    if payload.get("confirm") is not True:
+        raise PostprocessError(409, "confirmation required")
+    expected = payload.get("expected_revision")
+    if isinstance(expected, bool) or not isinstance(expected, int):
+        raise PostprocessError(422, "invalid_postprocess_retry_request")
+    lock = locks.setdefault(cid, asyncio.Lock())
+    async with lock:
+        def mutate(meta: dict) -> None:
+            private = _private_receipt(meta)
+            post = dict(meta["postprocess"])
+            segments = [dict(item) for item in post.get("segments", [])]
+            canonical = private["options"]
+            _capability_gate(settings, canonical)
+            target = next((item for item in segments if item.get("index") == index), None)
+            if target is None or target.get("status") != "failed":
+                raise PostprocessError(409, "segment_not_retryable")
+            if target.get("revision") != expected:
+                raise PostprocessError(409, _structured(
+                    "postprocess_revision_changed", "分段状态已更新，请刷新页面后重试。"
+                ))
+            target.update(
+                status="running", error=None, revision=expected + 1,
+                stage=target.get("stage") or "queued",
+            )
+            post.update(status="running", error=None, segments=segments)
+            meta["postprocess"] = post
+
+        updated = storage.mutate_meta(settings.data_dir, cid, mutate)
+        if updated is None:
+            raise PostprocessError(404, "not found")
 
 
 def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[Path]:
-    """Resolve the only keyframe set generation is allowed to consume.
-
-    No postprocess state means the user skipped optimization and the original
-    keyframes remain authoritative.  Once optimization exists, generation must
-    wait for a complete ``done`` set and then consume every corresponding output;
-    silently falling back to originals would make the confirmation misleading.
-    """
     state = meta.get("postprocess")
     if state is None:
         return originals
     if not isinstance(state, dict) or state.get("status") != "done":
         raise PostprocessError(409, "postprocess_not_ready")
     frame_refs = state.get("frames")
-    if not isinstance(frame_refs, list) or any(
-        not isinstance(item, str) for item in frame_refs
-    ):
+    if not isinstance(frame_refs, list) or any(not isinstance(item, str) for item in frame_refs):
         raise PostprocessError(409, "postprocess_artifacts_invalid")
     available = set(frame_refs)
-    selected: list[Path] = []
+    selected = []
     work = cdir.resolve() / "work"
     for original in originals:
         source = original.resolve()
@@ -331,21 +730,83 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
             raise PostprocessError(409, "postprocess_artifacts_invalid") from None
         parts = relative.parts
         if len(parts) == 2 and parts[0] == "keyframes":
-            output = work / "postprocessed" / source.name
-            frame_ref = source.name
-        elif (
-            len(parts) == 5
-            and parts[0] == "segments"
-            and parts[1].isdigit()
-            and parts[2:4] == ("work", "keyframes")
-        ):
+            output, ref = work / "postprocessed" / source.name, source.name
+        elif len(parts) == 5 and parts[0] == "segments" and parts[1].isdigit() \
+                and parts[2:4] == ("work", "keyframes"):
             output = work / "segments" / parts[1] / "work" / "postprocessed" / source.name
-            frame_ref = f"segments/{parts[1]}/work/postprocessed/{source.name}"
+            ref = f"segments/{parts[1]}/work/postprocessed/{source.name}"
         else:
             raise PostprocessError(409, "postprocess_artifacts_invalid")
-        if frame_ref not in available or not output.is_file():
+        if ref not in available or not output.is_file():
             raise PostprocessError(409, "postprocess_artifacts_invalid")
         selected.append(output)
     if len({path.resolve() for path in selected}) != len(selected):
         raise PostprocessError(409, "postprocess_artifacts_invalid")
     return selected
+
+
+_ATTEMPT_RE = re.compile(r"^\d+-r([1-9]\d*)\.json$")
+
+
+def _ambiguous_segments(cdir: Path, post: object) -> set[int]:
+    ambiguous: set[int] = set()
+    if not isinstance(post, dict):
+        return ambiguous
+    current = {
+        item.get("index"): (item.get("revision"), item.get("status"))
+        for item in post.get("segments", []) if isinstance(item, dict)
+    }
+    attempts_root = cdir / "work" / ".postprocess-private"
+    for attempt in attempts_root.glob("*/attempts/*.json") if attempts_root.is_dir() else ():
+        matched = _ATTEMPT_RE.match(attempt.name)
+        try:
+            index = int(attempt.parents[1].name)
+        except ValueError:
+            continue
+        revision, status = current.get(index, (None, None))
+        if matched is None or status == "done" or int(matched.group(1)) != revision:
+            continue
+        try:
+            payload = json.loads(attempt.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {"status": "submission_unknown"}
+        if payload.get("status") in {"submitting", "submission_unknown"}:
+            ambiguous.add(index)
+    return ambiguous
+
+
+def recover_running(settings: Settings) -> list[str]:
+    """Fail ambiguous Seedream submissions; return only locally safe jobs to resume."""
+    jobs = []
+    for meta in storage.list_conversations(settings.data_dir):
+        post = meta.get("postprocess")
+        if not isinstance(post, dict) or post.get("status") not in {"running", "failed"}:
+            continue
+        cid = meta["id"]
+        try:
+            private = _private_receipt(meta)
+        except PostprocessError:
+            _mutate_postprocess(
+                settings, cid,
+                lambda _meta, current: current.update(
+                    status="failed", error="postprocess_receipt_invalid"
+                ),
+            )
+            continue
+        ambiguous = _ambiguous_segments(settings.data_dir / cid, post)
+        if ambiguous:
+            for index in ambiguous:
+                _update_segment(
+                    settings, cid, index, status="failed", error="submission_unknown"
+                )
+            _mutate_postprocess(
+                settings, cid,
+                lambda _meta, current: current.update(
+                    status="failed", error="submission_unknown"
+                ),
+            )
+            continue
+        if post.get("status") == "failed":
+            continue
+        jobs.append(cid)
+    return jobs
