@@ -87,13 +87,15 @@ def test_image_prompt_save_gate_never_requests_when_disabled_or_long_index_inval
         "const base={id:'c1',read_only:false,submit_enabled:true,generation:null,postprocess:null,"
         "postprocess_capabilities:{optimize_image:false}};"
         "const draft=contract.createImagePromptDraft('c1',0,{text:'x',default_text:'d',sha256:'a'.repeat(64)});"
-        "let disabled=false,invalid=false;try{await contract.saveImageOptimizationPrompt(base,0,draft,request)}"
+        "let disabled=false,invalid=false,mismatch=false;try{await contract.saveImageOptimizationPrompt(base,0,draft,request)}"
         "catch(error){disabled=error.message==='当前会话未开放图片优化编辑'}"
         "try{await contract.saveImageOptimizationPrompt({...base,postprocess_capabilities:{optimize_image:true}},"
         "null,{...draft,segmentIndex:null},request)}catch(error){invalid=error.message==='图片优化提示词段号无效'}"
-        "return {requests,disabled,invalid}})()"
+        "try{await contract.saveImageOptimizationPrompt({...base,postprocess_capabilities:{optimize_image:true}},"
+        "1,{...draft,segmentIndex:2},request)}catch(error){mismatch=error.message==='图片优化提示词段号已变化'}"
+        "return {requests,disabled,invalid,mismatch}})()"
     )
-    assert result == {"requests": 0, "disabled": True, "invalid": True}
+    assert result == {"requests": 0, "disabled": True, "invalid": True, "mismatch": True}
 
 
 def test_discarded_singleton_draft_is_replaced_when_switching_segments():
@@ -179,27 +181,124 @@ def test_segment_progress_retry_and_unknown_warning_are_rendered():
 def test_unknown_segment_retry_cancel_never_requests():
     result = _run_async_contract(
         "(async()=>{let requests=0,accepted=0,confirmed=0;"
-        "const retried=await contract.retryPostprocessSegment({id:'c1'},"
-        "{index:2,status:'submission_unknown',revision:7},"
+        "const retried=await contract.retryPostprocessSegment({id:'c1',duration_s:20,segments:[{index:2}]},"
+        "{index:2,status:'failed',stage:'seedream',error:'submission_unknown',revision:7},"
         "async()=>{requests+=1},()=>{confirmed+=1;return false},()=>{accepted+=1});"
         "return {retried,requests,accepted,confirmed}})()"
     )
     assert result == {"retried": False, "requests": 0, "accepted": 0, "confirmed": 1}
 
 
+def test_submission_unknown_is_derived_only_from_segment_error():
+    result = _run_contract(
+        "["
+        "contract.isPostprocessSubmissionUnknown({status:'failed',stage:'seedream',error:'submission_unknown'}),"
+        "contract.isPostprocessSubmissionUnknown({status:'submission_unknown',stage:'seedream',error:'failed'}),"
+        "contract.isPostprocessSubmissionUnknown({status:'failed',stage:'submission_unknown',error:'failed'})"
+        "]"
+    )
+    assert result == [True, False, False]
+    js = APP_JS.read_text(encoding="utf-8")
+    postprocess = js.split("function postprocessSegmentStatus", 1)[1].split(
+        "function renderPpChat", 1
+    )[0]
+    assert 'segment.status === "submission_unknown"' not in postprocess
+
+
+def test_segment_retry_enforces_short_zero_and_long_positive_indexes():
+    result = _run_async_contract(
+        "(async()=>{let requests=0;const request=async()=>{requests+=1};"
+        "const retry=(detail,index)=>contract.retryPostprocessSegment(detail,"
+        "{index,status:'failed',revision:1},request,()=>true,()=>{});"
+        "const short={id:'short',duration_s:8,segments:[]};"
+        "const long={id:'long',duration_s:20,segments:[{index:1}]};"
+        "return {shortZero:await retry(short,0),shortPositive:await retry(short,1),"
+        "longPositive:await retry(long,1),longZero:await retry(long,0),requests}})()"
+    )
+    assert result == {
+        "shortZero": True,
+        "shortPositive": False,
+        "longPositive": True,
+        "longZero": False,
+        "requests": 2,
+    }
+
+
+def test_retry_request_rejection_never_exposes_raw_error():
+    result = _run_async_contract(
+        "(async()=>{try{await contract.retryPostprocessSegment("
+        "{id:'short',duration_s:8,segments:[]},{index:0,status:'failed',revision:1},"
+        "async()=>{throw new Error('provider raw stack token=secret')},()=>true,()=>{});return null}"
+        "catch(error){return {message:error.message,leaked:/secret|raw stack/.test(error.message)}}})()"
+    )
+    assert result == {"message": "本段处理失败，请重试或联系管理员", "leaked": False}
+    js = APP_JS.read_text(encoding="utf-8")
+    retry_dom = js.split("function renderPostprocessSegments", 1)[1].split(
+        "/* 助手消息", 1
+    )[0]
+    assert 'el("p", "form-error", safePostprocessError(err))' in retry_dom
+    assert "String(err.message" not in retry_dom
+
+
 def test_postprocess_segment_stage_and_error_are_allowlisted():
     result = _run_contract(
-        "({knownStage:contract.safePostprocessStage('optimize_image'),"
+        "({queued:contract.safePostprocessStage('queued'),text:contract.safePostprocessStage('text'),"
+        "brand:contract.safePostprocessStage('brand'),knownStage:contract.safePostprocessStage('seedream'),"
+        "publishing:contract.safePostprocessStage('publishing'),done:contract.safePostprocessStage('done'),"
         "unknownStage:contract.safePostprocessStage('model-template-secret'),"
         "knownError:contract.safePostprocessError('revision_conflict'),"
         "unknownError:contract.safePostprocessError('provider raw stack token=secret')})"
     )
     assert result == {
+        "queued": "等待处理",
+        "text": "移除文字/字幕",
+        "brand": "移除常见 Logo/图标",
         "knownStage": "优化图片质量",
+        "publishing": "正在发布结果",
+        "done": "已完成",
         "unknownStage": "处理中",
         "knownError": "分段状态已更新，请刷新后重试",
         "unknownError": "本段处理失败，请重试或联系管理员",
     }
+    prototype_keys = _run_contract(
+        "['toString','constructor','__proto__'].map(key=>({"
+        "status:contract.postprocessSegmentStatus(key),stage:contract.safePostprocessStage(key),"
+        "error:contract.safePostprocessError(key)}))"
+    )
+    assert prototype_keys == [
+        {
+            "status": "状态未知",
+            "stage": "处理中",
+            "error": "本段处理失败，请重试或联系管理员",
+        }
+    ] * 3
+
+
+def test_failed_postprocess_never_reopens_whole_project_post():
+    base = (
+        "{id:'c1',read_only:false,submit_enabled:true,postprocess_capabilities:{optimize_image:true},"
+    )
+    result = _run_contract(
+        "["
+        f"contract.shouldRenderPostprocessAsk({base}postprocess:null}}),"
+        f"contract.shouldRenderPostprocessAsk({base}postprocess:{{status:'failed',segments:[{{index:1}}]}}}}),"
+        f"contract.shouldRenderPostprocessAsk({base}postprocess:{{status:'failed',segments:[]}}}})"
+        "]"
+    )
+    assert result == [True, False, False]
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "分段状态不完整，请刷新页面后重试" in js
+    ask = js.split("function renderPpAsk", 1)[1].split("function renderPpChat", 1)[0]
+    assert "shouldRenderPostprocessAsk(detail)" in ask
+    assert 'pp.status === "failed"' not in ask
+
+
+def test_short_segment_zero_uses_current_video_copy():
+    js = APP_JS.read_text(encoding="utf-8")
+    segments = js.split("function renderPostprocessSegments", 1)[1].split(
+        "/* 助手消息", 1
+    )[0]
+    assert 'segment.index === 0 ? "当前视频"' in segments
 
 
 def test_removed_segment_disclosure_helpers_are_not_kept_for_tests():

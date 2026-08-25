@@ -141,6 +141,9 @@ async function saveImageOptimizationPrompt(detail, segmentIndex, draft, request 
   if (!Number.isInteger(segmentIndex) || segmentIndex < 0) {
     throw new Error("图片优化提示词段号无效");
   }
+  if (!draft || draft.segmentIndex !== segmentIndex) {
+    throw new Error("图片优化提示词段号已变化");
+  }
   if (!imagePromptEditable(detail, segmentIndex)) {
     throw new Error("当前会话未开放图片优化编辑");
   }
@@ -2215,49 +2218,62 @@ function ppTotalFrames(detail) {
 }
 
 function postprocessSegmentStatus(status) {
-  return {
-    queued: "等待处理",
-    running: "处理中",
-    done: "已完成",
-    failed: "失败",
-    submission_unknown: "提交结果未知",
-  }[status] || "状态未知";
+  const labels = new Map([
+    ["queued", "等待处理"],
+    ["running", "处理中"],
+    ["done", "已完成"],
+    ["failed", "失败"],
+  ]);
+  return labels.get(status) || "状态未知";
 }
 
 function safePostprocessStage(stage) {
-  return {
-    preparing: "准备素材",
-    remove_subtitle: "移除文字/字幕",
-    remove_brand: "移除常见 Logo/图标",
-    optimize_image: "优化图片质量",
-    downloading: "获取处理结果",
-    retrying: "正在重试",
-    done: "已完成",
-  }[stage] || "处理中";
+  const labels = new Map([
+    ["queued", "等待处理"],
+    ["text", "移除文字/字幕"],
+    ["brand", "移除常见 Logo/图标"],
+    ["seedream", "优化图片质量"],
+    ["publishing", "正在发布结果"],
+    ["done", "已完成"],
+  ]);
+  return labels.get(stage) || "处理中";
+}
+
+function isPostprocessSubmissionUnknown(segment) {
+  return !!segment && segment.error === "submission_unknown";
 }
 
 function safePostprocessError(error) {
   const code = error && typeof error === "object" ? error.code : error;
-  return {
-    revision_conflict: "分段状态已更新，请刷新后重试",
-    submission_unknown: "提交结果未知，请谨慎确认后再重试",
-    timeout: "处理超时，请稍后重试",
-    postprocess_failed: "图片处理失败，请重试本段",
-    provider_failed: "图片处理失败，请重试本段",
-  }[code] || "本段处理失败，请重试或联系管理员";
+  const labels = new Map([
+    ["revision_conflict", "分段状态已更新，请刷新后重试"],
+    ["submission_unknown", "提交结果未知，请谨慎确认后再重试"],
+    ["timeout", "处理超时，请稍后重试"],
+    ["postprocess_failed", "图片处理失败，请重试本段"],
+    ["provider_failed", "图片处理失败，请重试本段"],
+  ]);
+  return labels.get(code) || "本段处理失败，请重试或联系管理员";
 }
 
 async function retryPostprocessSegment(detail, segment, request = apiJSON, confirmUnknown, onAccepted) {
-  const retryable = segment && (segment.status === "failed" || segment.status === "submission_unknown");
-  if (!retryable || !Number.isInteger(segment.index) || segment.index < 0
+  const retryable = segment && segment.status === "failed";
+  const duration = Number(detail && detail.duration_s);
+  const knownDuration = Number.isFinite(duration) && duration > 0;
+  const isLong = knownDuration && longVideoContract(detail).isLong;
+  const validIndex = knownDuration && (isLong ? segment && segment.index > 0 : segment && segment.index === 0);
+  if (!retryable || !validIndex || !Number.isInteger(segment.index)
       || !Number.isInteger(segment.revision)) return false;
-  if (segment.status === "submission_unknown"
+  if (isPostprocessSubmissionUnknown(segment)
       && (!confirmUnknown || confirmUnknown() !== true)) return false;
   if (onAccepted) onAccepted();
-  await request(
-    "/api/conversations/" + encodeURIComponent(detail.id) + "/postprocess/segments/" + segment.index + "/retry",
-    {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({confirm: true, expected_revision: segment.revision})},
-  );
+  try {
+    await request(
+      "/api/conversations/" + encodeURIComponent(detail.id) + "/postprocess/segments/" + segment.index + "/retry",
+      {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({confirm: true, expected_revision: segment.revision})},
+    );
+  } catch (error) {
+    throw new Error(safePostprocessError(error));
+  }
   return true;
 }
 
@@ -2265,18 +2281,18 @@ function renderPostprocessSegments(detail, pp) {
   const wrap = el("div", "pp-segment-statuses");
   for (const segment of Array.isArray(pp.segments) ? pp.segments : []) {
     const row = el("div", "pp-segment-status");
-    const title = el("div", "pp-segment-title", "第 " + segment.index + " 段 · " + postprocessSegmentStatus(segment.status));
+    const segmentLabel = segment.index === 0 ? "当前视频" : "第 " + segment.index + " 段";
+    const title = el("div", "pp-segment-title", segmentLabel + " · " + postprocessSegmentStatus(segment.status));
     row.appendChild(title);
     const completed = Number.isInteger(segment.completed_frames) ? segment.completed_frames : 0;
     const total = Number.isInteger(segment.total_frames) ? segment.total_frames : 0;
     row.appendChild(el("p", "ac-sub", `已完成 ${completed}/${total} 帧`));
     if (segment.stage) row.appendChild(el("p", "ac-sub", "阶段：" + safePostprocessStage(segment.stage)));
     if (segment.error) row.appendChild(el("p", "fail-msg", safePostprocessError(segment.error)));
-    if (segment.status === "submission_unknown") {
+    if (isPostprocessSubmissionUnknown(segment)) {
       row.appendChild(el("p", "pp-billing-warning", "提交结果未知；人工重试可能重复计费，请谨慎确认。"));
     }
-    if ((segment.status === "failed" || segment.status === "submission_unknown")
-        && Number.isInteger(segment.revision)) {
+    if (segment.status === "failed" && Number.isInteger(segment.revision)) {
       const retry = el("button", "btn btn-ghost pp-segment-retry", "重试本段");
       retry.type = "button";
       retry.addEventListener("click", async () => {
@@ -2293,7 +2309,7 @@ function renderPostprocessSegments(detail, pp) {
           await loadDetail(detail.id, true);
         } catch (err) {
           retry.disabled = false;
-          const message = el("p", "form-error", String(err.message || err));
+          const message = el("p", "form-error", safePostprocessError(err));
           row.appendChild(message);
         }
       });
@@ -2322,20 +2338,21 @@ function renderPpAssistant(detail, pp) {
     card.appendChild(track);
     card.appendChild(renderPostprocessSegments(detail, pp));
     row.appendChild(card);
-  } else if (pp.status === "failed" || pp.status === "submission_unknown") {
+  } else if (pp.status === "failed") {
     const card = el("div", "fail-card");
     card.appendChild(icon("i-alert", "ic-danger"));
     const body = el("div");
-    body.appendChild(el("p", "fail-title", pp.status === "submission_unknown" ? "后处理提交结果未知" : "后处理失败"));
+    body.appendChild(el("p", "fail-title", "后处理失败"));
     body.appendChild(el("p", "fail-msg", safePostprocessError(pp.error)));
     if (Array.isArray(pp.frames) && pp.frames.length) {
       body.appendChild(el("p", "fail-tip", "已成功优化的帧保留"));
     }
-    if (pp.status === "submission_unknown") {
-      body.appendChild(el("p", "pp-billing-warning", "请勿重复提交，否则可能重复计费。"));
-    }
     card.appendChild(body);
-    card.appendChild(renderPostprocessSegments(detail, pp));
+    if (Array.isArray(pp.segments) && pp.segments.length > 0) {
+      card.appendChild(renderPostprocessSegments(detail, pp));
+    } else {
+      card.appendChild(el("p", "fail-tip", "分段状态不完整，请刷新页面后重试"));
+    }
     row.appendChild(card);
   } else if (pp.status === "done") {
     const frames = Array.isArray(pp.frames) ? pp.frames : [];
@@ -2351,15 +2368,11 @@ function renderPpAssistant(detail, pp) {
   return row;
 }
 
-/* 后处理入口消息：postprocess 未做（或 failed 可重试）且接口开放时，结果区末尾提问。
+/* 后处理入口消息：仅 postprocess 尚未开始且接口开放时，结果区末尾提问。
    点「是」打开弹窗（消息流照旧）；点「否」原位标记已结束，不再弹窗（会话内记忆）。
    running/done 时不显示——renderPpChat 的进行中卡/结果卡接管。 */
 function renderPpAsk(detail) {
-  const pp = detail.postprocess || {};
-  const capabilities = detail.postprocess_capabilities || {};
-  const enabled = Object.values(capabilities).some((value) => value === true) || detail.postprocess_enabled === true;
-  if (!enabled || !canOperate(detail)) return null;
-  if (pp.status === "running" || pp.status === "done") return null;
+  if (!shouldRenderPostprocessAsk(detail)) return null;
   const row = el("div", "msg-row");
   row.appendChild(assistantHead(detail.updated_at));
   const card = el("div", "activity-card pp-ask-card");
@@ -2384,6 +2397,13 @@ function renderPpAsk(detail) {
   }
   row.appendChild(card);
   return row;
+}
+
+function shouldRenderPostprocessAsk(detail) {
+  const capabilities = detail.postprocess_capabilities || {};
+  const enabled = Object.values(capabilities).some((value) => value === true) || detail.postprocess_enabled === true;
+  const pp = detail.postprocess || {};
+  return enabled && canOperate(detail) && !pp.status;
 }
 
 /* postprocess 存在即渲染：用户摘要 + 助手消息（动态区，renderPpDynamic 随轮询更新） */
@@ -2925,11 +2945,13 @@ if (typeof module !== "undefined" && module.exports) {
     generationRetryContract,
     generationSegmentLabel,
     imagePromptEditable,
+    isPostprocessSubmissionUnknown,
     longVideoContract,
     mergeConversationList,
     mergeImagePromptDraft,
     normalizeDialogueLines,
     parseDialogueLines,
+    postprocessSegmentStatus,
     postprocessAskDefault,
     promptSegmentIndex,
     promptWorkspaceModes,
@@ -2947,6 +2969,7 @@ if (typeof module !== "undefined" && module.exports) {
     segmentProductsDisclosure,
     setDisclosureState,
     showActionError,
+    shouldRenderPostprocessAsk,
     syncConversationDetail,
   };
 }
