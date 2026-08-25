@@ -144,10 +144,21 @@ describe('UI foundation contract', () => {
     "import React from 'react'; export const Bad = () => React.createElement('input');",
     "import { createElement } from 'react'; const tag = 'button'; export const Bad = () => createElement(tag);",
     "import React from 'react'; export const Bad = () => React['createElement']('button');",
+    "import { createElement } from 'react'; const h = createElement; export const Bad = () => h('button');",
+    "import { createElement as h } from 'react'; export const Bad = () => h('button');",
+    "import React from 'react'; const { createElement: h } = React; export const Bad = () => h('button');",
   ])('rejects restricted native elements constructed through createElement', async (source) => {
     const messages = await lintBusinessSource(source);
 
     expect(messages).toContainEqual(expect.stringContaining('UI facade'));
+  });
+
+  it('does not confuse unrelated local helpers with createElement aliases', async () => {
+    const messages = await lintBusinessSource(
+      "const h = (value: string) => value; export const safe = () => h('button');",
+    );
+
+    expect(messages).toEqual([]);
   });
 
   it('allows color literals only in the theme module', async () => {
@@ -184,6 +195,16 @@ describe('UI foundation contract', () => {
 
   it('rejects color literals embedded inside longer strings', async () => {
     const messages = await lintBusinessSource("export const border = '1px solid #fff';");
+
+    expect(messages).toContainEqual(expect.stringContaining('Color literals'));
+  });
+
+  it.each([
+    "export const color = '#' + 'fff';",
+    "const hash = '#'; const tail = 'ff' + 'f'; export const color = hash + tail;",
+    "export const color = `${'#'}${'fff'}`;",
+  ])('rejects statically evaluable color expressions', async (source) => {
+    const messages = await lintBusinessSource(source);
 
     expect(messages).toContainEqual(expect.stringContaining('Color literals'));
   });
@@ -232,6 +253,14 @@ describe('UI foundation contract', () => {
     ['font-family', 'Arial'],
   ])('rejects raw %s values from feature CSS', async (property, value) => {
     const messages = await lintStyles(`.feature { ${property}: ${value}; }`);
+
+    expect(messages).toContainEqual(expect.stringContaining('Token'));
+  });
+
+  it('rejects raw drop-shadow filters from feature CSS', async () => {
+    const messages = await lintStyles(
+      '.feature { filter: drop-shadow(0 1px 2px var(--ant-color-text)); }',
+    );
 
     expect(messages).toContainEqual(expect.stringContaining('Token'));
   });

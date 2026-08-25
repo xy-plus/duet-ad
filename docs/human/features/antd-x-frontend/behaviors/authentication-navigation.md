@@ -18,7 +18,7 @@ links: [antd-x-frontend]
 | 用户提交 token | 前端调用 `POST /api/login`；成功后才把 token 存入当前 origin 的 localStorage 并加载会话列表 |
 | 3213 登录成功 | 只代表 3213 origin 已登录；3211 的登录状态不会被读取或覆盖 |
 | 任一 JSON 或文件请求返回 401 | 清除当前 token、TanStack Query cache 和会话 key，返回登录页 |
-| 用户点击退出 | 执行与 401 相同的本地清理，不保留旧账号数据供下一次登录复用 |
+| 用户点击退出 | 执行与 401 相同的本地清理，不保留旧账号查询数据供下一次登录复用；唯一例外是防重复付费的 reconciliation lease，它不含 token 或秘密并按 [generation-safety](generation-safety.md) 契约跨登出保留 |
 | 会话列表加载完成且用户没有主动新建 | 默认打开列表第一项；切换会话不停止其他运行中会话的后台详情轮询 |
 | 用户点击“新建会话” | 保留侧栏，主区域切换到创建页；创建成功后打开真实返回的会话 id |
 | 屏幕为移动尺寸 | 侧栏放入 Drawer；会话选择、新建和退出语义不变 |
