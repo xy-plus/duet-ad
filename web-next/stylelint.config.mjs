@@ -20,7 +20,7 @@ export default {
     ],
     'function-disallowed-list': [
       'color',
-      'drop-shadow',
+      /^drop-shadow$/iu,
       'hsl',
       'hsla',
       'hwb',
