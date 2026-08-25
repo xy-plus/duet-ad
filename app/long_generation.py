@@ -11,9 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from app import frame_fit, h3, long_video, prepared_input, stitch, storage
+from app import frame_fit, h3, long_video, postprocess, prepared_input, stitch, storage
 
-WORKFLOW = h3.H3_BOUNDARY_WORKFLOW
+WORKFLOW = h3.H3_WORKFLOW
+_PLAN_WORKFLOWS = frozenset({h3.H3_WORKFLOW, h3.H3_BOUNDARY_WORKFLOW})
 _PIPELINE_NO_BGM = "不要生成背景音乐"
 _EPS = 1e-6
 FIT_LAYOUT_LEGACY = "legacy-v0"
@@ -42,6 +43,7 @@ class FrozenSegment:
     last_frame: Path
     last_frame_data: bytes
     prompt: str
+    keyframes: tuple[h3.FrozenFrame, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,7 @@ class FrozenPlan:
     aspect_ratio: str = h3.H3_DEFAULT_ASPECT_RATIO
     resolution: str = h3.H3_DEFAULT_RESOLUTION
     legacy_layout: bool = False
+    workflow: str = h3.H3_WORKFLOW
 
 
 def _segment_duration_s(plan: FrozenPlan, segment: FrozenSegment) -> float:
@@ -262,10 +265,29 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             long_video.LEGACY_PLAN_RECEIPT_VERSION,
             long_video.PLAN_RECEIPT_VERSION,
         }
-        or payload.get("workflow") != WORKFLOW
+        or payload.get("workflow") not in _PLAN_WORKFLOWS
     ):
         raise LongGenerationError("long_video_plan_invalid")
     source = _bound_path(root, payload.get("source"))
+    receipt_workflow = payload["workflow"]
+    generation = meta.get("generation")
+    persisted_workflow = (
+        generation.get("workflow") if isinstance(generation, Mapping) else None
+    )
+    if persisted_workflow is not None and persisted_workflow not in _PLAN_WORKFLOWS:
+        raise LongGenerationError("long_video_plan_invalid")
+    # Existing attempts without a marker predate reference-mode long video and
+    # must resume their boundary receipts GET-only.  Unsubmitted v2 plans are
+    # safe to promote because every provider segment is already <=10 seconds.
+    workflow = (
+        persisted_workflow
+        or (receipt_workflow if isinstance(generation, Mapping) else None)
+        or (
+            h3.H3_WORKFLOW
+            if receipt_version == long_video.PLAN_RECEIPT_VERSION
+            else receipt_workflow
+        )
+    )
     try:
         duration = float(payload["video"]["duration_s"])
         meta_duration = float(meta["duration_s"])
@@ -333,7 +355,8 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         keys = raw.get("keyframes")
         if not isinstance(keys, list) or not 1 <= len(keys) <= 9:
             raise LongGenerationError("long_video_plan_invalid")
-        keyframe_paths = [_bound_path(root, artifact) for artifact in keys]
+        bound_keyframes = [_bound_bytes(root, artifact) for artifact in keys]
+        keyframe_paths = [path for path, _data in bound_keyframes]
         anchors = raw.get("anchors")
         if (
             not isinstance(anchors, list)
@@ -432,9 +455,41 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             aspect_ratio,
             prepare=prepare_fit,
         )
+        frozen_keyframes: tuple[h3.FrozenFrame, ...] = ()
+        if workflow == h3.H3_WORKFLOW:
+            try:
+                selected_paths = postprocess.generation_keyframes(
+                    root, dict(meta), keyframe_paths
+                )
+            except postprocess.PostprocessError as exc:
+                detail = exc.detail if isinstance(exc.detail, str) else exc.detail["code"]
+                raise LongGenerationError(detail, exc.status) from None
+            selected: list[h3.FrozenFrame] = []
+            original_data = {path.resolve(): data for path, data in bound_keyframes}
+            for selected_path in selected_paths:
+                resolved = selected_path.resolve()
+                data = original_data.get(resolved)
+                if data is None:
+                    try:
+                        data = resolved.read_bytes()
+                    except OSError:
+                        raise LongGenerationError("postprocess_artifacts_invalid") from None
+                    if not data:
+                        raise LongGenerationError("postprocess_artifacts_invalid")
+                selected.append(
+                    _fit_anchor(
+                        resolved,
+                        data,
+                        fit_root / "keyframes",
+                        fit_mode,
+                        aspect_ratio,
+                        prepare=prepare_fit,
+                    )
+                )
+            frozen_keyframes = tuple(selected)
         frozen.append(FrozenSegment(index, start_s, end_s, chain_id, join_mode,
                                     segdir, first, first_data, last, last_data,
-                                    prompt))
+                                    prompt, frozen_keyframes))
         previous_end, previous_chain = end_s, chain_id
     if abs(previous_end - duration) > _EPS:
         raise LongGenerationError("long_video_plan_invalid")
@@ -448,6 +503,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         aspect_ratio=aspect_ratio,
         resolution=resolution,
         legacy_layout=legacy_layout,
+        workflow=workflow,
     )
 
 
@@ -474,6 +530,36 @@ def _extract_last_frame(video: Path, output: Path) -> Path:
 def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
              parent_id: str, fit_mode: str, *, frozen_child_id: str | None = None,
              prepare_inputs: bool = True, fast_mode: bool = False) -> h3.H3Request:
+    if plan.workflow == h3.H3_WORKFLOW:
+        return h3.H3Request(
+            cid=f"{cid}-segment-{segment.index}",
+            workdir=segment.workdir,
+            client_request_id=(
+                frozen_child_id
+                or child_request_id(parent_id, plan.receipt, segment.index)
+            ),
+            prompt=segment.prompt,
+            keyframes=segment.keyframes,
+            voice_texts=(),
+            voice_receipt=h3.voice_texts_receipt(()),
+            duration=long_video.provider_duration_s(
+                segment.start_s,
+                segment.end_s,
+                receipt_version=plan.receipt_version,
+            ),
+            autodl_token=settings.autodl_art_token,
+            timeouts=h3.Timeouts(
+                request_s=settings.h3_request_timeout_s,
+                h3_poll_s=settings.h3_poll_timeout_s,
+                download_s=settings.h3_download_timeout_s,
+                poll_interval_s=settings.h3_poll_interval_s,
+                retry_count=settings.retry_count,
+                retry_interval_s=settings.retry_interval_s,
+            ),
+            mode="reference",
+            aspect_ratio=plan.aspect_ratio,
+            resolution=plan.resolution,
+        )
     first, first_data = segment.first_frame, segment.first_frame_data
     if segment.join_mode == "continue":
         upstream = plan.segments[segment.index - 2]
@@ -719,6 +805,7 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
             FIT_LAYOUT_LEGACY if plan.legacy_layout else FIT_LAYOUT_ASPECT
         ),
         "fast_mode": fast_mode,
+        "workflow": plan.workflow,
         "segments": items,
     }
 

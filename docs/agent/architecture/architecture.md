@@ -23,7 +23,7 @@ flowchart LR
   Q -->|yes| R[prepared_input.json]
   Q -->|no| L[long_video_plan.json]
   R --> H[Ref2VA single task]
-  L --> F[FL2VA segment chains]
+  L --> F[Ref2VA segment chains]
   H --> V[generated.mp4]
   F --> X[ffmpeg stitch]
   X --> V
@@ -41,7 +41,7 @@ flowchart LR
 | `app/frame_fit.py` | 按真实 H3 输入推荐 `16:9/9:16`，并显式 crop/pad 为所选目标画幅 | conversation-task |
 | `app/h3.py` | 直接 H3 的 prepare/submit/start/inspect/resume/retry 和磁盘状态机 | conversation-task |
 | `app/long_video.py` | provider 整秒时长不超过 10 秒的安全分段、hard_cut/continue 链语义、canonical plan receipt | conversation-task |
-| `app/long_generation.py` | FL2VA 子任务冻结、默认最多两链串行依赖、可选快速 fan-out、分段恢复和拼接编排 | conversation-task |
+| `app/long_generation.py` | 多图参考子任务冻结、默认最多两链调度、可选快速 fan-out、历史 boundary 恢复和拼接编排 | conversation-task |
 | `app/stitch.py` | 24fps H.264 归一化、连续边界去重帧、源音频/静音拼接 | conversation-task |
 | `app/asr.py` / `app/voice.py` / `app/vocal.py` | 本地多语种听写、ASR JSON 校验、YAMNet `spoken/sung` 分类 | conversation-task |
 | `app/postprocess.py` / `app/seedream.py` | 可选去字幕/品牌关键帧编辑；不参与 H3 输入 | postprocess |
@@ -72,7 +72,7 @@ flowchart LR
 
 关键不变量：
 
-- 新会话 `schema_version=2`，`duration_s` 只表示首个视频流 `v:0` 的正有限视觉时长且不超过 300 秒；优先 `stream.duration`，其次 `duration_ts*time_base`，最后扫描 `v:0` 包的 PTS 起止（末包缺 duration 时用相邻 PTS 或帧率补尾）。禁止用 OpenCV `frame_count/fps`、容器总时长或音轨时长覆盖它。`≤10s` 保持完整源视频的 Ref2VA 单请求；`>10s` 必须形成连续覆盖全片、provider 整秒时长不超过 10 秒的 FL2VA 分段，不能回落到单请求。
+- 新会话 `schema_version=2`，`duration_s` 只表示首个视频流 `v:0` 的正有限视觉时长且不超过 300 秒；优先 `stream.duration`，其次 `duration_ts*time_base`，最后扫描 `v:0` 包的 PTS 起止（末包缺 duration 时用相邻 PTS 或帧率补尾）。禁止用 OpenCV `frame_count/fps`、容器总时长或音轨时长覆盖它。`≤10s` 使用完整源视频的多图参考单请求；`>10s` 必须形成连续覆盖全片、provider 整秒时长不超过 10 秒的多图参考分段，不能回落到单请求。
 - `keep` 模式由固定的本地 `whisper.cpp` multilingual small 处理 16kHz 单声道音频，自动检测语言；模型和二进制由部署固定，运行时不下载。`rewrite/translate` 才进入音频专用 Codex 隔离区。
 - 自动台词的唯一可收养 agent 输出是隔离区 `work/voice_lines.json`：先做大小、普通文件与 JSON 字段白名单校验，再把净化结果写回主 `work/`。重试创建全新隔离区；Codex 超时/非零退出但完整产物已通过同一校验时仍可收养。
 - 4fps 抽帧由 ffmpeg 按 `v:0` presentation timestamps 顺序批量解码；禁止用 OpenCV `CAP_PROP_POS_MSEC` 随机 seek 假设 CFR。ASR 初次校验和 YAMNet 分类使用 `voice.mp3` 的真实音频时长；这是独立于 `v:0` 的第二条时间轴。抽音以视频 `stream.start_time`（缺失才回落 packet PTS）为零点，用 `aresample first_pts=0` 让解码器先处理 AAC Skip Samples/Opus pre-skip，再按时间戳补前置静音或裁掉视频零点前音频，并在视觉终点裁剪/补静音。随后、写 `voice_lines/meta/receipt` 前，必须把有效台词归一到 manifest 的视觉时间轴。跨越视频结尾的行把 `end_s` 截到视频时长，`start_s >= duration_s` 的音频纯尾部行丢弃并留 provenance/warning，归一结果再过一次 voice 白名单。receipt 的时间真相始终是视觉时长。
@@ -83,10 +83,10 @@ flowchart LR
 - `prompt.txt` 由视觉文本和唯一结构化发声块机械组合。无台词时明确禁止角色说出画面文字。
 - ASR 输出中的 `[无法辨识]`、`[inaudible]`、`[unintelligible]` 等哨兵文本不是业务台词：净化为“本次未得到转写”，复用有声学人声证据时的一次重试；任何哨兵不得进入 `voice_lines.json`、prepared receipt 或 H3 prompt。
 - 冻结的 H3 源提示词是唯一生成输入；项目不调用 MiniMax Context IR，也不接受运行时优化开关。
-- `duration_s` 以 `v:0` 实际浮点时长写 receipt；上传、pipeline 重探测和提交门禁限制为 300 秒。短链和新长链都先把冻结边界归一到六位小数再 `ceil`，单次请求不超过 10 秒；历史 plan v1 保留原始浮点换算只为重建 11–15 秒的已有 attempt，并禁止新 POST。FL2VA 原始输出在绑定 receipt/input/output hash 后允许比源段目标最多短一帧、比整秒请求最多长 1 秒；最终 `keep` 拼接仍按源段帧预算精确裁补，以视频 presentation start 归零音频时间戳并保持全片时长。
+- `duration_s` 以 `v:0` 实际浮点时长写 receipt；上传、pipeline 重探测和提交门禁限制为 300 秒。短链和新长链都先把冻结边界归一到六位小数再 `ceil`，单次请求不超过 10 秒；历史 plan v1 保留原始浮点换算只为重建 11–15 秒的已有 boundary attempt，并禁止新 POST。最终 `keep` 拼接按源段帧预算精确裁补，以视频 presentation start 归零音频时间戳并保持全片时长。
 - pipeline 首次进入 `processing` 与首次 submit 冻结输入共用同一个 per-CID 原子所有权 claim；检查 generation/receipt、取得所有权和写 meta 在同一把锁内完成。输家不得运行输入准备、改写 receipt 或触发 provider，完成/回滚也只能由当前 owner 提交。
 - 生成推荐值与 pipeline `done` 原子落盘：短链使用实际选中的关键帧；长链使用 plan 中每个 `hard_cut` first anchor 与全部 end anchors，`continue` source first 不计。画幅在 `16:9/9:16` 中取总几何比例损失较小者，平局按源视频方向、仍平局取 `9:16`；清晰度按源视频短边与 `480/768` 的距离，平局取 `480p`。两种画幅都冻结 `fit_profiles`；所选目标完全匹配才用 `none`，否则默认 `crop` 并允许用户改为 `pad`。
-- H3 关键帧只能来自原始 `work/keyframes/` 或 `work/h3_frames/<aspect>/{crop|pad}/`；历史长链可按冻结 marker 使用旧 `h3_frames/{crop|pad}/`。恢复不能从后来新增的 meta 字段猜目录；无 marker 时只接受唯一完整且匹配目标画幅的旧/新布局。永不读取 `postprocessed/`。
+- H3 关键帧来自原始 `work/keyframes/`，或在后处理 `done` 后来自完整的同名 `postprocessed/`；crop/pad 再由最终所选 bytes 派生到 `work/h3_frames/<aspect>/{crop|pad}/`。历史 boundary 长链按冻结 marker 使用旧布局，恢复不从后来新增字段猜输入。
 
 ## 冻结输入
 
@@ -99,11 +99,13 @@ flowchart LR
 
 写 receipt 后立即经过同一 loader 复核；提交和重启恢复也重新加载。未知 schema/version、路径越界、文件缺失/漂移、台词或生成参数漂移、最终 prompt 不是确定性组合时全部 fail closed。提交锁内会按用户最终台词、画幅、清晰度和适配选择重写 receipt，随后 H3Request 只使用当次加载的不可变 bytes。`H3Request` 只持有语义值，`provider_resolution()` 唯一投影为 `480p横/480p竖/768p横/768p竖`；input manifest、attempt receipt 和 provider body 必须一致。
 
-长链不用短链 receipt 冒充多段输入。新 `long_video_plan.json`（`duet.long-video-plan` v2，v1 仅用于历史恢复）绑定完整源文件、总时长、FL2VA workflow，以及每段的范围、chain/join、源片、关键帧、首尾锚点、视觉/最终提示词和台词摘要。detail 暴露该文件内容的 SHA-256 为 `plan_receipt`；提交必须原样回传 `expected_plan_receipt`。服务在任何供应商 POST 前重新校验 plan、meta 和所有文件哈希，并将确认值冻结到 `frozen_plan_receipt`。
+长链不用短链 receipt 冒充多段输入。新 `long_video_plan.json`（`duet.long-video-plan` v2，v1 仅用于历史恢复）绑定完整源文件、总时长、多图参考 workflow，以及每段的范围、chain/join、源片、关键帧、兼容锚点、视觉/最终提示词和台词摘要。detail 暴露该文件内容的 SHA-256 为 `plan_receipt`；提交必须原样回传 `expected_plan_receipt`。服务在任何供应商 POST 前重新校验 plan、meta 和所有文件哈希，并将确认值冻结到 `frozen_plan_receipt`。
 
 历史长会话若 `fit_required=null` 且尚未冻结提交，detail 与 submit 从通过路径和哈希校验的 plan anchors 纯派生，不由 GET 改写 meta；不完整或越界 plan 返回未知并在付费前拒绝。plan、prompt 与 anchors 都以单次读取的 SHA-bound bytes 快照完成解析、比例判断、画幅派生和 H3 请求构造，路径随后变化不能替换已验证的付费输入。若会话已有 generation/frozen receipt，则以已冻结 `fit_mode` 投影有效值，保持 active、failed 和 resume 请求的原 CAS，不重写输入。
 
-同一镜头切出的 `continue` 段在快速模式关闭时，使用上一成功成片的精确尾帧作为本段首帧；开启时，使用前一分段 plan 经 SHA 绑定并按同一 `fit_mode` 处理的冻结 last-frame bytes，不等待或读取 `generated.mp4`。当前源片段末帧仍是目标尾帧；`hard_cut` 段用自身源首尾锚点开始新链。两种模式都只是最佳努力约束，不是供应商原生 extend，也不承诺逐帧无缝。
+新长链的每个 segment 都使用本段 1–9 张冻结参考图；`continue/hard_cut` 只控制调度、连续性提示词和拼接边界，不再把参考图替换成首尾帧。历史已创建的 boundary attempt 仍使用原首尾帧 receipt 恢复，绝不用新模式重发。
+
+`postprocess` 不存在表示用户跳过优化，使用原关键帧；一旦存在则提交必须等待 `done`，并逐一解析同名 `postprocessed/`。所选优化 bytes 经画幅处理后写入短链 prepared-input receipt 或长链分段 H3 input receipt；文件缺失、列表不全或生成已开始后再请求优化均拒绝。
 
 ## H3 付费状态机
 
@@ -157,7 +159,7 @@ data/<cid>/
     ├── postprocessed/*.png           # optional display-only Seedream output
     └── segments/<N>/
         ├── source.mp4
-        ├── generated.mp4             # paid FL2VA segment output
+        ├── generated.mp4             # paid reference segment output
         ├── .h3/attempts/...           # segment-owned provider state
         └── work/
             ├── anchors/{first,last}.png

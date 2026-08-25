@@ -817,6 +817,11 @@ def _freeze_submission(
     cdir = (settings.data_dir / cid).resolve()
     work = cdir / "work"
     originals = _original_keyframes(cdir, meta)
+    try:
+        originals = postprocess.generation_keyframes(cdir, meta, originals)
+    except postprocess.PostprocessError as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else exc.detail["code"]
+        raise _SubmitError(exc.status, detail) from None
     if fit_mode == "none":
         keyframes = originals
     else:
@@ -1866,6 +1871,9 @@ def create_app(settings: Settings) -> FastAPI:
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             if meta.get("status") != "done":
                 raise HTTPException(status_code=409, detail="artifacts not ready")
+            post_state = meta.get("postprocess")
+            if isinstance(post_state, dict) and post_state.get("status") != "done":
+                raise HTTPException(status_code=409, detail="postprocess_not_ready")
             if _duration_exceeds_h3_limit(meta.get("duration_s")):
                 raise HTTPException(
                     status_code=422,
@@ -1878,6 +1886,9 @@ def create_app(settings: Settings) -> FastAPI:
                 meta = storage.load_meta(settings.data_dir, cid)
                 if meta is None:
                     raise HTTPException(status_code=404, detail="not found")
+                post_state = meta.get("postprocess")
+                if isinstance(post_state, dict) and post_state.get("status") != "done":
+                    raise HTTPException(status_code=409, detail="postprocess_not_ready")
                 old = meta.get("generation")
                 previous_status = old.get("status") if isinstance(old, dict) else None
                 previous_id = old.get("client_request_id") if isinstance(old, dict) else None
@@ -2046,6 +2057,9 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
         if meta.get("status") != "done":
             raise HTTPException(status_code=409, detail="artifacts not ready")
+        post_state = meta.get("postprocess")
+        if isinstance(post_state, dict) and post_state.get("status") != "done":
+            raise HTTPException(status_code=409, detail="postprocess_not_ready")
         if _duration_exceeds_h3_limit(meta.get("duration_s")):
             raise HTTPException(
                 status_code=422,
@@ -2059,6 +2073,9 @@ def create_app(settings: Settings) -> FastAPI:
             meta = storage.load_meta(settings.data_dir, cid)
             if meta is None:
                 raise HTTPException(status_code=404, detail="not found")
+            post_state = meta.get("postprocess")
+            if isinstance(post_state, dict) and post_state.get("status") != "done":
+                raise HTTPException(status_code=409, detail="postprocess_not_ready")
             generation = meta.get("generation")
             if (
                 (settings.data_dir / cid / "generated.mp4").is_file()

@@ -82,6 +82,8 @@ async def start(
     options = _parse_options(payload)
     if meta.get("status") != "done":
         raise PostprocessError(409, "artifacts not ready")
+    if isinstance(meta.get("generation"), dict) or meta.get("_input_owner"):
+        raise PostprocessError(409, "generation_already_started")
     if (meta.get("postprocess") or {}).get("status") == "running":
         raise PostprocessError(409, "already running")
     last = meta.get("postprocess") or {}
@@ -92,6 +94,8 @@ async def start(
         meta = storage.load_meta(settings.data_dir, cid)
         if meta is None or (meta.get("postprocess") or {}).get("status") == "running":
             raise PostprocessError(409, "already running")
+        if isinstance(meta.get("generation"), dict) or meta.get("_input_owner"):
+            raise PostprocessError(409, "generation_already_started")
         last_in = meta.get("postprocess") or {}
         if (
             last_in.get("status") in ("done", "failed")
@@ -329,3 +333,52 @@ def _write_progress(
 def _build_instruction(options: dict[str, bool]) -> str:
     """按稳定白名单顺序将多选项合并为一条指令（分号连接）。"""
     return "；".join(_INSTRUCTIONS[key] for key in OPTION_KEYS if options.get(key))
+
+
+def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[Path]:
+    """Resolve the only keyframe set generation is allowed to consume.
+
+    No postprocess state means the user skipped optimization and the original
+    keyframes remain authoritative.  Once optimization exists, generation must
+    wait for a complete ``done`` set and then consume every corresponding output;
+    silently falling back to originals would make the confirmation misleading.
+    """
+    state = meta.get("postprocess")
+    if state is None:
+        return originals
+    if not isinstance(state, dict) or state.get("status") != "done":
+        raise PostprocessError(409, "postprocess_not_ready")
+    frame_refs = state.get("frames")
+    if not isinstance(frame_refs, list) or any(
+        not isinstance(item, str) for item in frame_refs
+    ):
+        raise PostprocessError(409, "postprocess_artifacts_invalid")
+    available = set(frame_refs)
+    selected: list[Path] = []
+    work = cdir.resolve() / "work"
+    for original in originals:
+        source = original.resolve()
+        try:
+            relative = source.relative_to(work)
+        except ValueError:
+            raise PostprocessError(409, "postprocess_artifacts_invalid") from None
+        parts = relative.parts
+        if len(parts) == 2 and parts[0] == "keyframes":
+            output = work / "postprocessed" / source.name
+            frame_ref = source.name
+        elif (
+            len(parts) == 5
+            and parts[0] == "segments"
+            and parts[1].isdigit()
+            and parts[2:4] == ("work", "keyframes")
+        ):
+            output = work / "segments" / parts[1] / "work" / "postprocessed" / source.name
+            frame_ref = f"segments/{parts[1]}/work/postprocessed/{source.name}"
+        else:
+            raise PostprocessError(409, "postprocess_artifacts_invalid")
+        if frame_ref not in available or not output.is_file():
+            raise PostprocessError(409, "postprocess_artifacts_invalid")
+        selected.append(output)
+    if len({path.resolve() for path in selected}) != len(selected):
+        raise PostprocessError(409, "postprocess_artifacts_invalid")
+    return selected

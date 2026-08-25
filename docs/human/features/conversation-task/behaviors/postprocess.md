@@ -24,11 +24,12 @@ links: [conversation-task, result-display]
 ## 边界
 
 - 当前只保留 `remove_subtitle`、`remove_brand`；`change_bg/face_hold` 已删除。旧页面请求只得到纯文本刷新提示，不会静默采用或自动重试。
-- 后处理不改变输入准备状态，也不进入冻结 H3 receipt。无论先后顺序如何，H3 都不会读取 `postprocessed/`。
+- 后处理一旦开始，H3 提交必须等待其 `done`；完成后每张 `postprocessed/` 优化帧都会替代同名原关键帧，进入冻结输入 receipt 和实际 H3 请求。缺帧或状态异常时 fail closed，不回退原图。
+- H3 generation 已创建后禁止再启动后处理，避免已冻结的付费输入与页面展示分叉。
 - 请求顶层严格为 `confirm/options`，未知字段在写状态或调用供应商前拒绝。running 时不能重复提交；done/failed 后改变选项返回结构化 409，避免旧产物贴上新标签。
 - 该能力可关闭；关闭不影响直接 H3 主链路。
 - 页面 HTML、JS 和 CSS 均禁止缓存；遇到版本提示后刷新会取得同一版契约与样式。
 
 ## 例子
 
-- 用户先做去字幕后再生成：页面展示优化图，但 H3 receipt 仍绑定原始或 crop/pad 派生关键帧。
+- 用户先做去字幕后再生成：H3 receipt 绑定优化图；若还需 crop/pad，则绑定由优化图产生的画幅派生帧。

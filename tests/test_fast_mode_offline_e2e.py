@@ -150,7 +150,7 @@ def _make_frozen_long_plan(settings: Settings) -> tuple[str, str]:
         source=source,
         duration_s=11,
         segments=receipt_segments,
-        workflow=h3.H3_BOUNDARY_WORKFLOW,
+        workflow=h3.H3_WORKFLOW,
     )
     receipt = _sha256(receipt_path)
     storage.update_meta(
@@ -407,10 +407,12 @@ def test_fast_mode_http_to_real_stitched_video_is_fully_offline(
         )
         for index in range(1, SEGMENT_COUNT + 1)
     }
-    assert (
-        posted_by_segment[1]["last_frame"]
-        == posted_by_segment[2]["first_frame"]
+    assert all("ref_image_0" in body for body in posted_by_segment.values())
+    assert all(
+        "first_frame" not in body and "last_frame" not in body
+        for body in posted_by_segment.values()
     )
+    assert posted_by_segment[1]["ref_image_0"] != posted_by_segment[2]["ref_image_0"]
 
     assert detail["generation"]["fast_mode"] is True
     assert detail["generation"]["status"] == "succeeded"

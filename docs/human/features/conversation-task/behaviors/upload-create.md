@@ -29,17 +29,17 @@ links: [conversation-task]
 | 短视频准备完成 | 产出 1–9 张关键帧、`visual_prompt.txt`、机械组合的 `prompt.txt` 和 `prepared_input.json`，状态变为 `done` |
 | 长视频准备完成 | 每段独立产出关键帧、首尾锚点和提示词，并以 `long_video_plan.json` 绑定完整计划，状态变为 `done` |
 | 短视频用户在首次 H3 attempt 前二次修改源提示词 | 以当前 SHA-256 做并发保护；保存后重写并复核 prepared receipt |
-| 用户确认台词和画幅后点击“生成最终视频” | 短链冻结 prepared input；长链用当前 plan receipt 做 CAS 后冻结各段 FL2VA 输入 |
+| 用户确认台词和画幅后点击“生成最终视频” | 短链冻结 prepared input；长链用当前 plan receipt 做 CAS 后冻结各段多图参考输入 |
 
 ## 边界
 
 - 同一 IP 每分钟最多创建 10 次；排队会话数由 `MAX_QUEUED` 限制。
 - `client_request_id` 可用于创建幂等；同 id 命中返回既有会话。
 - `VOCAL_FILTER=off` 可保留未分类为人声的句子，但仍记录分类；未知值按启用处理。
-- `≤10s` 是原 Ref2VA 单段契约；`>10s` 是 FL2VA 分段契约。二者都属于 schema v2，但使用不同冻结 receipt。
+- `≤10s` 是多图参考单段契约；`>10s` 是多图参考分段契约。二者都属于 schema v2，但使用不同冻结 receipt。
 
 ## 例子
 
 - 9.2 秒、无音轨、9:16 视频：准备成功，自动台词为空，引擎提交时长为 10 秒。
-- 15 秒、`voice_mode=keep` 视频：准备至少 2 个 FL2VA 首尾帧子任务，每个整秒请求不超过 10 秒。
+- 15 秒、`voice_mode=keep` 视频：准备至少 2 个多图参考子任务，每个整秒请求不超过 10 秒。
 - 300.01 秒视频：上传后返回 `video_duration_exceeds_h3_limit`，不创建可见会话、不运行准备流水线。

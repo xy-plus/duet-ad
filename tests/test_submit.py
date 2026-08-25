@@ -479,6 +479,68 @@ def test_submit_freezes_direct_h3_receipt_and_source_prompt(enabled, monkeypatch
     assert detail["generation"]["stage"] == "h3"
 
 
+def test_submit_freezes_postprocessed_keyframe_bytes_when_optimization_done(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, original = _make_conv(settings, duration_s=9.2)
+    cdir = settings.data_dir / cid
+    optimized = _png(cdir / "work" / "postprocessed" / "01.png", value=231)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={
+            "status": "done",
+            "options": {"remove_subtitle": True, "remove_brand": False},
+            "frames": ["01.png"],
+            "error": None,
+        },
+    )
+    seen = []
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: seen.append(request)
+        or h3.H3Result("failed", "000001", error_code="h3_provider_failed"),
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload()
+    )
+
+    assert response.status_code == 202
+    assert seen[0].keyframes[0][1] == optimized
+    assert seen[0].keyframes[0][1] != original
+    frozen = prepared_input.load_prepared_input(
+        cdir,
+        cdir / prepared_input.RECEIPT_FILENAME,
+        expected_dialogue=storage.load_meta(settings.data_dir, cid)["prepared_dialogue"],
+    )
+    assert frozen.keyframes[0].path == cdir / "work" / "postprocessed" / "01.png"
+
+
+def test_submit_does_not_fall_back_while_postprocess_is_incomplete(enabled):
+    settings, client = enabled
+    cid, _ = _make_conv(settings, duration_s=9.2)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={
+            "status": "running",
+            "options": {"remove_subtitle": True, "remove_brand": False},
+            "frames": [],
+            "error": None,
+        },
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload()
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "postprocess_not_ready"}
+
+
 def test_submit_freezes_horizontal_480p_across_meta_receipt_and_request(
     enabled, monkeypatch,
 ):

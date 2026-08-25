@@ -183,7 +183,7 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
     else:
         receipt_path = long_video.write_plan_receipt(
             root, source=source, duration_s=duration, segments=receipt_input,
-            workflow=h3.H3_BOUNDARY_WORKFLOW,
+            workflow=h3.H3_WORKFLOW,
         )
     receipt = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
     storage.update_meta(
@@ -277,12 +277,80 @@ def test_fast_mode_prepares_all_segments_then_submits_before_any_poll(
     long_generation.run(settings, cid, plan)
 
     assert len(prepared) == len(submitted) == len(polled) == 3
-    assert submitted[1].first_frame[1] == plan.segments[0].last_frame_data
-    assert submitted[1].first_frame[0] == plan.segments[0].last_frame
-    assert submitted[2].first_frame[1] == plan.segments[1].last_frame_data
+    assert all(request.mode == "reference" for request in submitted)
+    assert [request.keyframes for request in submitted] == [
+        segment.keyframes for segment in plan.segments
+    ]
+    assert all(request.first_frame is None and request.last_frame is None for request in submitted)
     stored = storage.load_meta(settings.data_dir, cid)["generation"]
     assert stored["status"] == "succeeded"
     assert stored["fast_mode"] is True
+
+
+def test_long_reference_request_uses_complete_postprocessed_segment_set(
+    tmp_path,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
+    root = settings.data_dir / cid
+    frame_refs = []
+    optimized = []
+    for index in (1, 2):
+        output = (
+            root / "work" / "segments" / str(index) / "work"
+            / "postprocessed" / "01.png"
+        )
+        _png(output, 220 + index)
+        optimized.append(output.read_bytes())
+        frame_refs.append(f"segments/{index}/work/postprocessed/01.png")
+    meta = storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={
+            "status": "done",
+            "options": {"remove_subtitle": True, "remove_brand": False},
+            "frames": frame_refs,
+            "error": None,
+        },
+    )
+
+    plan = long_generation.freeze_plan(root, meta, receipt, "none", "auto")
+    requests = [
+        long_generation._request(
+            settings, cid, plan, segment, "parent-request-123", "none"
+        )
+        for segment in plan.segments
+    ]
+
+    assert plan.workflow == h3.H3_WORKFLOW
+    assert [request.mode for request in requests] == ["reference", "reference"]
+    assert [request.keyframes[0][1] for request in requests] == optimized
+    assert all(request.first_frame is None and request.last_frame is None for request in requests)
+
+
+def test_existing_unmarked_boundary_attempt_keeps_boundary_recovery(tmp_path):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings)
+    root = settings.data_dir / cid
+    meta = storage.load_meta(settings.data_dir, cid)
+    payload = json.loads((root / long_video.PLAN_RECEIPT_FILENAME).read_text())
+    payload["workflow"] = h3.H3_BOUNDARY_WORKFLOW
+    (root / long_video.PLAN_RECEIPT_FILENAME).write_bytes(
+        long_video._canonical_bytes(payload)
+    )
+    receipt = hashlib.sha256(
+        (root / long_video.PLAN_RECEIPT_FILENAME).read_bytes()
+    ).hexdigest()
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={"status": "resume_required", "segments": []},
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+
+    plan = long_generation.freeze_plan(root, meta, receipt, "none", "auto")
+
+    assert plan.workflow == h3.H3_BOUNDARY_WORKFLOW
 
 
 def test_fast_mode_submit_workers_enter_concurrently(tmp_path, monkeypatch):
@@ -1120,6 +1188,7 @@ def _with_boundary_bounds(plan, *, receipt_version):
         plan,
         segments=(segment,),
         receipt_version=receipt_version,
+        workflow=h3.H3_BOUNDARY_WORKFLOW,
     )
 
 
@@ -1543,7 +1612,7 @@ def test_15_seconds_one_post_and_none_rebuilds_prompt_without_source_dialogue(
     assert [call["audio_mode"] for call in stitch_calls] == ["keep", "mute"]
 
 
-def test_30_second_continue_uses_generated_tail_and_two_posts(enabled, monkeypatch):
+def test_30_second_continue_uses_each_segments_reference_frames(enabled, monkeypatch):
     settings, client = enabled
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
     seen = []
@@ -1573,13 +1642,14 @@ def test_30_second_continue_uses_generated_tail_and_two_posts(enabled, monkeypat
     assert client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload(receipt)
     ).status_code == 202
-    assert extract_calls == [generated_tail]
+    assert extract_calls == []
     assert [request.workdir.name for request in seen] == ["1", "2"]
-    assert seen[1].first_frame[1] == tail_bytes.read_bytes()
-    assert seen[1].first_frame[1] != stale_tail.read_bytes()
+    assert all(request.mode == "reference" for request in seen)
+    assert seen[1].first_frame is None and seen[1].last_frame is None
+    assert seen[1].keyframes
 
 
-def test_new_parent_retry_reextracts_continue_tail_instead_of_reusing_stale_file(
+def test_new_parent_retry_reuses_segment_references_without_tail_extraction(
     enabled, monkeypatch,
 ):
     settings, client = enabled
@@ -1630,14 +1700,14 @@ def test_new_parent_retry_reextracts_continue_tail_instead_of_reusing_stale_file
 
     assert first.status_code == 202
     assert second.status_code == 202
-    assert len(extract_calls) == 2
+    assert extract_calls == []
     second_segment_requests = [request for request in starts if request.workdir.name == "2"]
     assert len(second_segment_requests) == 2
-    assert second_segment_requests[-1].first_frame[1] == fresh[-1]
-    assert second_segment_requests[-1].first_frame[1] != stale.read_bytes()
+    assert all(request.mode == "reference" for request in second_segment_requests)
+    assert second_segment_requests[-1].keyframes
 
 
-def test_resume_with_missing_frozen_continue_tail_fails_closed_without_post_or_extract(
+def test_reference_resume_does_not_require_frozen_continue_tail(
     enabled, monkeypatch,
 ):
     settings, client = enabled
@@ -1669,19 +1739,27 @@ def test_resume_with_missing_frozen_continue_tail_fails_closed_without_post_or_e
         lambda *_args: extracts.append(1),
     )
     monkeypatch.setattr(h3, "start", lambda request: starts.append(request))
-    monkeypatch.setattr(h3, "resume", lambda request: resumes.append(request))
+    monkeypatch.setattr(
+        h3, "resume",
+        lambda request: resumes.append(request)
+        or h3.H3Result("retryable_failure", "child-two", retryable=True,
+                       error_code="h3_query_failed"),
+    )
 
     long_generation.run(settings, cid, plan)
 
     stored = storage.load_meta(settings.data_dir, cid)["generation"]
     assert extracts == []
     assert starts == []
-    assert resumes == []
-    assert stored["status"] == "submission_unknown"
+    assert len(resumes) == 1
+    assert resumes[0].mode == "reference"
+    assert stored["status"] == "resume_required"
     assert stored["client_request_id"] == "resume-parent-request"
-    assert stored["segments"][1]["status"] == "submission_unknown"
-    assert stored["segments"][1]["error"] == "submission_unknown"
-    assert stored["segments"][1]["child_request_id"] == "child-two"
+    assert stored["segments"][1]["status"] == "resume_required"
+    assert stored["segments"][1]["error"] == "h3_query_failed"
+    assert stored["segments"][1]["child_request_id"] == long_generation.child_request_id(
+        "resume-parent-request", receipt, 2
+    )
     assert stored["segments"][1]["attempt"] == 1
 
     retry = client.post(
@@ -1691,7 +1769,7 @@ def test_resume_with_missing_frozen_continue_tail_fails_closed_without_post_or_e
     )
 
     assert retry.status_code == 409
-    assert retry.json() == {"detail": "submission_outcome_unknown"}
+    assert retry.json() == {"detail": "resume_request_id_mismatch"}
     assert starts == []
 
 
@@ -1797,7 +1875,7 @@ def test_anchor_swap_before_bound_read_fails_sha_and_makes_zero_posts(
     assert calls == []
 
 
-def test_anchor_swap_after_bound_read_cannot_change_paid_request_bytes(
+def test_anchor_swap_after_bound_read_cannot_replace_reference_request_bytes(
     enabled, monkeypatch,
 ):
     settings, client = enabled
@@ -1807,6 +1885,11 @@ def test_anchor_swap_after_bound_read_cannot_change_paid_request_bytes(
         / "work" / "anchors" / "first.png"
     )
     original = anchor.read_bytes()
+    keyframe = (
+        settings.data_dir / cid / "work" / "segments" / "1"
+        / "work" / "keyframes" / "01.png"
+    )
+    keyframe_bytes = keyframe.read_bytes()
     replacement_path = anchor.with_name("replacement.png")
     _png(replacement_path, 233)
     replacement = replacement_path.read_bytes()
@@ -1841,8 +1924,9 @@ def test_anchor_swap_after_bound_read_cannot_change_paid_request_bytes(
     assert response.status_code == 202
     assert swapped is True
     assert len(seen) == 1
-    assert seen[0].first_frame[1] == original
-    assert seen[0].last_frame[1] != replacement
+    assert seen[0].mode == "reference"
+    assert seen[0].first_frame is None and seen[0].last_frame is None
+    assert seen[0].keyframes[0] == (keyframe, keyframe_bytes)
 
 
 def test_unknown_locks_batch_and_stops_continue_segment(enabled, monkeypatch):
@@ -2163,8 +2247,8 @@ def test_current_first_failure_restart_uses_persisted_fit_layout_get_only(
         settings.data_dir / cid / "work" / "segments" / "1" / "work"
         / "h3_frames"
     )
-    legacy_first = fit_base / fit_mode / "first" / "first.png"
-    semantic_first = fit_base / "9x16" / fit_mode / "first" / "first.png"
+    legacy_first = fit_base / fit_mode / "keyframes" / "01.png"
+    semantic_first = fit_base / "9x16" / fit_mode / "keyframes" / "01.png"
     frozen_first = semantic_first
     other_first = legacy_first
     assert frozen_first.is_file()
@@ -2194,8 +2278,7 @@ def test_current_first_failure_restart_uses_persisted_fit_layout_get_only(
     _resume_long_generation(settings, cid)
 
     assert len(resumed) == 1
-    assert resumed[0].first_frame[0] == frozen_first
-    assert resumed[0].first_frame[1] == frozen_bytes
+    assert resumed[0].keyframes[0] == (frozen_first, frozen_bytes)
     recovered = storage.load_meta(settings.data_dir, cid)
     assert recovered["generation"]["status"] == "resume_required"
     assert (recovered["aspect_ratio"], recovered["resolution"]) == (
@@ -2251,8 +2334,8 @@ def test_pre_marker_restart_discovers_existing_fit_layout_get_only(
     )
 
     fit_base = root / "work" / "segments" / "1" / "work" / "h3_frames"
-    legacy_first = fit_base / fit_mode / "first" / "first.png"
-    semantic_first = fit_base / "9x16" / fit_mode / "first" / "first.png"
+    legacy_first = fit_base / fit_mode / "keyframes" / "01.png"
+    semantic_first = fit_base / "9x16" / fit_mode / "keyframes" / "01.png"
     frozen_first = legacy_first if layout == "legacy" else semantic_first
     other_first = semantic_first if layout == "legacy" else legacy_first
     assert frozen_first.is_file()
@@ -2282,8 +2365,7 @@ def test_pre_marker_restart_discovers_existing_fit_layout_get_only(
     _resume_long_generation(settings, cid)
 
     assert len(resumed) == 1
-    assert resumed[0].first_frame[0] == frozen_first
-    assert resumed[0].first_frame[1] == frozen_bytes
+    assert resumed[0].keyframes[0] == (frozen_first, frozen_bytes)
     recovered = storage.load_meta(settings.data_dir, cid)
     assert recovered["generation"]["status"] == "resume_required"
     assert (recovered["aspect_ratio"], recovered["resolution"]) == (
@@ -2825,6 +2907,7 @@ def test_legacy_binary_float_duration_rebuilds_original_thirteen_second_request(
         receipt="legacy",
         segments=(segment,),
         receipt_version=long_video.LEGACY_PLAN_RECEIPT_VERSION,
+        workflow=h3.H3_BOUNDARY_WORKFLOW,
     )
 
     request = long_generation._request(
@@ -2834,7 +2917,7 @@ def test_legacy_binary_float_duration_rebuilds_original_thirteen_second_request(
     assert request.duration == 13
 
 
-def test_local_continue_request_failure_is_structured_failed_not_coordinator_crash(
+def test_reference_continue_does_not_depend_on_generated_tail(
     enabled, monkeypatch
 ):
     settings, client = enabled
@@ -2852,8 +2935,8 @@ def test_local_continue_request_failure_is_structured_failed_not_coordinator_cra
         f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload(receipt)
     ).status_code == 202
     generation = client.get(f"/api/conversations/{cid}", headers=AUTH).json()["generation"]
-    assert generation["status"] == "failed"
-    assert generation["segments"][1]["error"] == "tail_failed"
+    assert generation["status"] == "succeeded"
+    assert all(item["status"] == "succeeded" for item in generation["segments"])
 
 
 def test_resume_required_segment_runs_at_most_once_per_coordinator_invocation(

@@ -69,7 +69,8 @@ links: [conversation-task, processing-state]
 - 提交门控后的唯一自动新 POST 是完整确认的供应商终态 `h3_provider_failed`：沿用原 `client_request_id` 和同一 input receipt，新建顺序 attempt，累计不超过 `1 + AUTO_RETRY_COUNT`。已落盘的 `ready_to_submit/h3.ready` 自动 attempt 已占额度；`submission_unknown`、提交拒绝、结果缺失和输入/安全错误均不进入该例外。
 - “生成最终视频”点击后必须立即进入提交态或显示错误；前端异常不得表现为无响应。
 - 自动 H3 源提示词只允许在 H3 attempt 创建前通过 CAS 保存；attempt 创建后锁定，防止页面内容与实际生成输入不一致。
-- 短链 H3 只使用 `work/keyframes/` 原图或 `work/h3_frames/<aspect>/{crop|pad}/` 派生图；长链 FL2VA 只使用 plan 绑定的首尾锚点或其画幅派生图；都不读取 Seedream `postprocessed/`。
+- 未做素材优化时，短链和长链每段使用原关键帧；优化完成时必须使用对应 `postprocessed/`，需要 crop/pad 时再从所选帧产生画幅派生图。所有最终 bytes 在付费 POST 前冻结并进入 receipt，禁止缺帧时静默回退。
+- 新长链每个不超过 10 秒的 segment 固定使用多图参考 workflow，传入该段 1–9 张冻结关键帧。已有首尾帧付费 attempt 仅按原 receipt GET-only 恢复，不切换接口。
 - 已有 generation + frozen plan 的历史长会话沿用冻结 `fit_mode`；即使旧 meta 的 `fit_required` 为 null，也不重写 active/failed/resume 的 receipt、输入或重试参数。
 - 成片下载先验证全部 DNS 解析地址，再在读取 status/body 前验证实际 socket peer 为公网；拒绝 userinfo 和重定向，限制 200 MiB，并在原子落盘前通过 ffprobe 正时长视频流验证。
 - 旧 Seedance 提交实现和 `face_hold` 参数/提示词注入已删除，不是失败回退选项。

@@ -1584,7 +1584,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     source=source,
                     duration_s=duration_s,
                     segments=receipt_segments,
-                    workflow=H3_BOUNDARY_WORKFLOW,
+                    workflow=H3_ENGINE_WORKFLOW,
                 )
                 changes["long_video_plan_receipt"] = receipt_path.name
                 try:

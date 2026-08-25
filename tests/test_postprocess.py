@@ -267,6 +267,25 @@ def test_artifacts_gone_409(enabled, monkeypatch):
     assert storage.load_meta(settings.data_dir, cid).get("postprocess") is None
 
 
+def test_postprocess_cannot_start_after_generation_input_is_frozen(enabled):
+    settings, client = enabled
+    cid = _make_conv(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={
+            "status": "queued",
+            "client_request_id": "already-frozen",
+        },
+    )
+
+    response = _post(client, cid, OPTIONS_SUB)
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "generation_already_started"}
+    assert storage.load_meta(settings.data_dir, cid).get("postprocess") is None
+
+
 # ---------- 单段全链路 ----------
 
 def test_single_segment_full_chain(enabled, monkeypatch):

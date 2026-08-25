@@ -201,7 +201,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 }
 ```
 
-长视频允许上述八个键；当前网页新建长视频固定发送 `fast_mode=true` 且不提供选择控件。后端契约不变：`fast_mode` 可缺失且安全等价 `false`，显式 `false` 仍受支持，出现时必须是 JSON boolean，非法类型返回 422 `invalid_fast_mode`。`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希；SHA 校验、画幅推荐/派生与 H3 请求消费同一份不可变 bytes，不会在校验后重新读取路径。默认模式的 `continue` 运行时以上游真实生成尾帧按冻结画幅适配；快速模式直接使用上一个冻结 segment 已适配的 end anchor bytes。所有段共用冻结的画幅、清晰度和 fit。历史未冻结 null 会话从安全 plan 纯派生，无法派生时付费前拒绝；已有冻结提交继续以原参数为准。
+长视频允许上述八个键；当前网页新建长视频固定发送 `fast_mode=true` 且不提供选择控件。后端契约不变：`fast_mode` 可缺失且安全等价 `false`，显式 `false` 仍受支持，出现时必须是 JSON boolean，非法类型返回 422 `invalid_fast_mode`。`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、关键帧、提示词和文件哈希；SHA 校验、优化帧选择、画幅派生与 H3 请求消费同一份不可变 bytes，不会在校验后重新读取路径。所有段共用冻结的画幅、清晰度和 fit。历史未冻结 null 会话从安全 plan 纯派生，无法派生时付费前拒绝；已有冻结提交继续以原参数和 workflow 为准。
 
 旧标签页可能仍按四键长视频契约提交，缺少 `expected_plan_receipt`。服务仅对这个精确旧请求返回结构化 `409 client_refresh_required`，提示刷新页面；不会自动采用服务端当前 receipt，也不会创建付费任务。`/`、`/index.html` 和 `/app.js` 均使用 `Cache-Control: no-store`，刷新后会取得当前提交契约。
 
@@ -261,7 +261,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 }
 ```
 
-顶层 key 必须恰为 `confirm/options`，未知或缺失返回 422 `invalid_postprocess_request`；至少一项为 true，未知 option 或非 bool 返回 422。已知旧页面 option `change_bg/face_hold` 返回纯文本中文刷新提示，不写状态、不调用供应商；若同时混入其他未知字段仍 fail closed。禁用返回 501，旧会话返回 409 `read_only`，输入未 done/正在运行返回 409；重跑改变锁定选项返回结构化 409 `postprocess_options_locked` 和中文提示。接受后返回 `{"status":"running","frames":[]}`，detail 的 `postprocess` 轮询到 done/failed。后处理产物不进入 H3 receipt。
+顶层 key 必须恰为 `confirm/options`，未知或缺失返回 422 `invalid_postprocess_request`；至少一项为 true，未知 option 或非 bool 返回 422。已知旧页面 option `change_bg/face_hold` 返回纯文本中文刷新提示，不写状态、不调用供应商；若同时混入其他未知字段仍 fail closed。禁用返回 501，旧会话返回 409 `read_only`，输入未 done/正在运行返回 409；generation 已创建返回 409 `generation_already_started`；重跑改变锁定选项返回结构化 409 `postprocess_options_locked` 和中文提示。接受后返回 `{"status":"running","frames":[]}`，detail 的 `postprocess` 轮询到 done/failed。生成提交在后处理完成前返回 409 `postprocess_not_ready`；完成后优化帧进入 H3 冻结输入。
 
 `/`、`/index.html`、`/app.js`、`/styles.css` 的 GET/HEAD 响应（含条件请求的 304）均带 `Cache-Control: no-store`，避免 HTML、脚本和样式跨版本组合。
 
@@ -300,7 +300,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | `frozen_plan_receipt` | 长链首次提交确认的 plan SHA-256 |
 | `fit_mode` | `none/crop/pad`；随冻结画幅解释 |
 | `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含冻结 boolean `fast_mode`、内部 `segments` 与 `fit_layout`，failed 时公开 `retry_paid_segment_count`，status 含 resume_required；历史缺 fast_mode 等价 false |
-| `postprocess` | `{status,options,frames,error}`，与 H3 输入隔离 |
+| `postprocess` | `{status,options,frames,error}`；存在时生成必须等待 done，并使用完整优化帧集合 |
 
 `≤10s` 的 schema v2 使用顶层 keyframes/prompt；`>10s` 使用 `segments` 与 `long_video_plan.json`，每段独立工作目录和 H3 状态。两种契约不能互相降级或混用 receipt。
 
@@ -336,18 +336,18 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 严格要求顶层和子对象 key 集合完全匹配；绑定路径必须位于会话根内；关键帧 1–9 张且路径唯一；每个文件重读校验 SHA-256；台词 canonical JSON、provenance 和 hash 必须匹配；最终 prompt 必须等于当前视觉 prompt + 当前结构化发声块。任何偏差抛 `PreparedInputError`，HTTP 层归一为 409 `prepared_input_invalid`。
 
-`normalized_audio=null` 是无音轨的合法表示。crop/pad 时 keyframe binding 指向 `work/h3_frames/<aspect>/<mode>/`，且不会出现 `postprocessed`。历史 receipt 缺少语义参数时仅按原 `ratio=9:16`、`resolution=768p竖` 精确恢复，loader 不重写文件。
+`normalized_audio=null` 是无音轨的合法表示。无需适配时，优化后的 keyframe binding 可直接指向 `work/postprocessed/`；crop/pad 时则指向由所选原图或优化图生成的 `work/h3_frames/<aspect>/<mode>/`。历史 receipt 缺少语义参数时仅按原 `ratio=9:16`、`resolution=768p竖` 精确恢复，loader 不重写文件。
 
 ## Long-video plan receipt v2（兼容只读恢复 v1）
 
-`data/<cid>/long_video_plan.json` 是 canonical JSON。新计划固定 `schema=duet.long-video-plan`、`version=2`；顶层绑定完整 source 的路径/SHA-256、实际总时长、`workflow=minimax_h3_lightx2v` 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，六位小数边界归一后的长度至少 1 秒，provider 整秒时长不得超过 10 秒，并绑定：
+`data/<cid>/long_video_plan.json` 是 canonical JSON。新计划固定 `schema=duet.long-video-plan`、`version=2`；顶层绑定完整 source 的路径/SHA-256、实际总时长、`workflow=minimax_h3_lightx2v_v5` 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，六位小数边界归一后的长度至少 1 秒，provider 整秒时长不得超过 10 秒，并绑定：
 
 - `index/start_s/end_s/chain_id/join_mode`；首段必须 `hard_cut`，后续为 `hard_cut` 或 `continue`；
 - 分段 source、1–9 张关键帧、`first/end` 两张锚点及其 SHA-256；
 - `visual_prompt`、最终 `prompt` 的路径/SHA-256；
 - 本段局部台词的 canonical 数量与 SHA-256。
 
-detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字段。提交时服务同时比对该摘要、meta 分段和全部 artifact；`fit_mode=crop/pad` 时冻结的 FL2VA 请求改用服务端派生为所选 `16:9/9:16` 的锚点。每段工作目录为 `work/segments/<N>/`，其中 `.h3/` 只归该子任务所有。当前 generation 在任何供应商 POST 前持久化内部 `fit_layout=legacy-v0|aspect-v1`，恢复只按该冻结布局读取。旧 attempt 没有 marker 时，只在历史 `h3_frames/<mode>/...` 与当前 `h3_frames/<aspect>/<mode>/...` 中恰有一套完整、可解码且匹配目标画幅的静态输入时恢复；两套同时存在、混用或均不完整都以 `frame_fit_failed` fail closed，不重新适配。
+detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字段。提交时服务同时比对该摘要、meta 分段和全部 artifact；`fit_mode=crop/pad` 时冻结请求使用由本段最终选中关键帧派生的 `16:9/9:16` 输入。每段工作目录为 `work/segments/<N>/`，其中 `.h3/` 只归该子任务所有。当前 generation 在任何供应商 POST 前持久化内部 `workflow` 与 `fit_layout=legacy-v0|aspect-v1`，恢复只按冻结值读取。旧 boundary attempt 没有 workflow marker 时按 plan 中的首尾帧模式恢复，不切换接口。
 
 历史 `version=1` receipt 仍可读取并按其原始浮点换算重建最长 15 秒的已知 attempt；超过 10 秒的历史段只能 GET 恢复，绝不创建新 POST，也不改写原 receipt。
 
@@ -382,9 +382,9 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 
 `start/resume/retry` 共用同一私有自动推进器；`submit` 始终只提交当前 prepared attempt 一次。自动额度只统计同 `client_request_id + input_receipt` 的有效 attempt 链，已创建的 ready attempt 已占额度，总上限为 `1 + retry_count`。每个新 attempt 先原子写 receipt 再 POST；配置降低只停止新增，提高后可从最新完整 provider failure 继续。`h3_submit_rejected/h3_result_missing`、输入与下载安全拒绝不创建新 attempt；查询、超时和下载传输失败继续同 task；`submission_unknown` 永不重复 POST。
 
-短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。长链每段使用 `minimax_h3_lightx2v`，只传冻结的 `first_frame/last_frame/prompt/duration/resolution`，输出到该段 `generated.mp4`；不是供应商原生 extend。
+短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。新长链每段同样使用 `minimax_h3_lightx2v_v5`，传该段冻结的 1–9 张 `ref_image_N`；历史已付费 boundary attempt 仍按 `minimax_h3_lightx2v` 的首尾帧 receipt GET-only 恢复。
 
-默认长链同一 `chain_id` 严格串行，最多并发两条 chain；`continue` 在前一段成功后提取其精确尾帧作为 first frame，确定失败的新父请求推进失败段及未完成下游。快速长链先预构造并 prepare 全部分段，随后最多 8 个短生命周期 worker fan-out POST，再最多 8 个 worker GET 轮询；队列可以超过 8，但不会创建无界长生命周期线程。快速 `continue` 直接复用上一 FrozenSegment 已绑定且已适配的 end anchor path/bytes，单段确定失败只重做该段，已成功下游独立复用。两种模式的 `hard_cut` 都使用本段源首帧；任一子任务 `submission_unknown` 锁住整批且该段不再 POST，快速模式仍让已知兄弟 task 完成 GET。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 复用 source 音轨，以视频 presentation start 归零并由解码器处理 AAC/Opus priming，再按解码后的音频时间戳补前置静音或裁视频零点前音频，最后在画面终点裁剪或补静音，画面时长不变；`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
+默认长链同一 `chain_id` 严格串行，最多并发两条 chain；每段请求只使用本段冻结参考图。快速长链先预构造并 prepare 全部分段，随后最多 8 个短生命周期 worker fan-out POST，再最多 8 个 worker GET 轮询；队列可以超过 8，但不会创建无界长生命周期线程。单段确定失败只重做该段，已成功下游独立复用；任一子任务 `submission_unknown` 锁住整批且该段不再 POST，快速模式仍让已知兄弟 task 完成 GET。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 复用 source 音轨，以视频 presentation start 归零并由解码器处理 AAC/Opus priming，再按解码后的音频时间戳补前置静音或裁视频零点前音频，最后在画面终点裁剪或补静音，画面时长不变；`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
 
 分段原始输出复用与 reference 输出分开验收：reference 仍要求目标时长 ±0.5 秒；boundary 在 attempt receipt、输入和输出 hash 完整匹配后，要求不比源片段目标短超过一帧，且不比整秒请求长超过 1 秒。该容差不改变最终时长契约，stitch 仍按每个 source segment 的 24fps 帧预算精确裁剪或补齐并验证全片。
 
@@ -405,7 +405,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 - `app.long_video.plan_segments/write_plan_receipt` — 安全边界规划与 canonical plan 落盘。
 - `app.long_generation.freeze_plan/run` — fail-closed 冻结、默认最多两链编排、可选快速 fan-out 和分段恢复。
 - `app.stitch.stitch_video` — 本地确定性归一化、音轨选择、拼接与 receipt。
-- `app.postprocess.start/run_task` — 可选展示后处理；与 H3 请求隔离。
+- `app.postprocess.start/run_task/generation_keyframes` — 编辑、完整性门控并解析 H3 唯一可用的优化帧集合。
 
 ## 配置
 
