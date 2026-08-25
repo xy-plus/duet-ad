@@ -1,0 +1,55 @@
+.create-composer {
+  width: min(100%, 840px);
+  margin-inline: auto;
+  padding: var(--ant-padding-lg);
+}
+
+.create-composer__heading {
+  margin-block-end: var(--ant-margin-lg);
+}
+
+.create-composer__title {
+  margin-block-end: var(--ant-margin-xxs);
+}
+
+.create-composer__alert {
+  margin-block-end: var(--ant-margin);
+}
+
+.create-composer__configuration {
+  padding: var(--ant-padding-xxs) var(--ant-padding) 0;
+}
+
+.create-composer__field {
+  margin-block-end: var(--ant-margin);
+}
+
+.create-composer__file-controls {
+  width: 100%;
+}
+
+.create-composer__transcript-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--ant-margin-sm);
+  flex-wrap: wrap;
+}
+
+.create-composer__language {
+  min-width: min(100%, 220px);
+}
+
+@media (max-width: 575px) {
+  .create-composer {
+    padding: var(--ant-padding) var(--ant-padding-sm);
+  }
+
+  .create-composer__configuration {
+    padding-inline: var(--ant-padding-xxs);
+  }
+
+  .create-composer__transcript-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

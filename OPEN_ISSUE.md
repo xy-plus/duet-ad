@@ -8,6 +8,7 @@
 
 ## 🚧 进行中
 
+- 使用 Ant Design / Ant Design X 重构完整前端，保留现有 API、付费恢复契约和旧 `web/`，并在 HTTPS 3213 与旧 UI 共享同一 3212 后端。（→ `docs/human/features/antd-x-frontend/`）
 
 ## 📌 待办与限制
 

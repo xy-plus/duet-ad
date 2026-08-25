@@ -1,0 +1,29 @@
+# web-next 前端约束
+
+本目录只使用 Ant Design 与 Ant Design X 建立可见界面。目标不是复刻库组件，而是让所有功能自然服从同一套 Token、状态语义和交互习惯。
+
+## 组件边界
+
+- 业务代码只能从 `src/ui/antd` 导入可见组件和图标，禁止直接导入 `antd`、`@ant-design/x` 或 `@ant-design/icons`。
+- 可以创建有业务含义的组合组件，但不能创建自己的 Button、Input、Card、Modal、Tag、Progress、Upload、Image、播放器控件或通用视觉包装器。
+- 禁止原生交互控件、手写 SVG 和内联样式。唯一例外是 `src/ui/video.tsx` 中由 AntD Card 承载的原生 `<video controls>`。
+- 如果门面缺少组件，先把确实需要的官方组件加入 `src/ui/antd.ts`；不得通过直引或自制组件绕过门禁。
+
+## 视觉与样式
+
+- 颜色、字体、圆角、阴影和控件尺寸只在 `src/ui/theme.tsx` 定义。功能代码不得声明新的视觉常量。
+- 功能 CSS 只能处理页面几何、滚动、响应式断点和视频宽高比，并使用 Ant Token CSS 变量。
+- 禁止 `.ant-*` 内部选择器、原始颜色、`!important`、渐变、玻璃拟态和组件式 CSS 类。
+
+## 数据与交互
+
+- 服务端状态由 TanStack Query 管理；API 地址始终使用相对 `/api`，不得引入 CORS fallback 或写死端口。
+- 详情、生成参数和恢复动作只信服务端冻结值。`submission_unknown` 禁止提交；resume 和 stitch retry 复用旧请求 id，确定失败重试使用新 id。
+- 认证媒体必须通过 Bearer fetch 生成 Object URL，并在切换资源或卸载时回收。
+- 不得加入后端不存在的聊天入口、统计值、媒体元数据、假计时器或生产 mock。
+
+## 验证
+
+- 功能先写失败测试，再做最小实现。
+- 提交前运行 `npm run check`；真实浏览器契约与截图运行 `npm run test:e2e`。
+- 不得通过禁用 ESLint、Stylelint、TypeScript 或截图断言来换取通过。

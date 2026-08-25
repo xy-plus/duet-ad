@@ -20,6 +20,90 @@
           "tls_connection_policies": [
             {"certificate_selection": {"any_tag": ["duet-ad1-cert"]}}
           ]
+        },
+        "srv3213": {
+          "listen": [":3213"],
+          "protocols": ["h1", "h2"],
+          "automatic_https": {"disable_redirects": true},
+          "routes": [
+            {
+              "match": [{"path": ["/api/*"]}],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [{"dial": "127.0.0.1:3212"}]
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": [
+                    {
+                      "handle": [
+                        {
+                          "handler": "vars",
+                          "root": "/home/xy/duet-ad1/web-next/dist"
+                        }
+                      ]
+                    },
+                    {
+                      "match": [
+                        {
+                          "file": {
+                            "try_files": [
+                              "{http.request.uri.path}",
+                              "/index.html"
+                            ]
+                          }
+                        }
+                      ],
+                      "handle": [
+                        {
+                          "handler": "rewrite",
+                          "uri": "{http.matchers.file.relative}"
+                        }
+                      ]
+                    },
+                    {
+                      "match": [{"path": ["/assets/*"]}],
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {
+                              "Cache-Control": [
+                                "public, max-age=31536000, immutable"
+                              ]
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "match": [{"path": ["/", "/index.html"]}],
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "response": {
+                            "set": {"Cache-Control": ["no-store"]}
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "handle": [{"handler": "file_server"}]
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "tls_connection_policies": [
+            {"certificate_selection": {"any_tag": ["duet-ad1-cert"]}}
+          ]
         }
       }
     },

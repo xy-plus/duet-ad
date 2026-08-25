@@ -1,6 +1,11 @@
-# duet-ad1 · H3 生产部署
+# duet-ad1 · H3 与双前端生产部署
 
-目标拓扑固定为 `Caddy :3211 → 127.0.0.1:3212 uvicorn`。Caddy 配置只启用 HTTP/1.1、HTTP/2；H3 是模型名，不是 HTTP/3。
+目标拓扑固定为同一个 `duet-ad1-caddy.service` 提供两个 HTTPS 入口：
+
+- `:3211 → 127.0.0.1:3212 uvicorn`，保留原有全路径反代语义；
+- `:3213 /api/* → 127.0.0.1:3212 uvicorn`，不剥离 `/api`；其余路径从 `/home/xy/duet-ad1/web-next/dist` 提供 SPA。
+
+不新增前端 service、CORS 或第二个 uvicorn。Caddy 配置只启用 HTTP/1.1、HTTP/2；H3 是模型名，不是 HTTP/3。
 
 本 runbook 的纯文档部分 TDD=N/A；部署前仍必须运行下面的自动化测试。上线采用 fix-forward，不恢复已删除的 Seedance 提交路径。
 
@@ -32,7 +37,16 @@ assert server['listen'] == [':3211']
 assert server['protocols'] == ['h1', 'h2']
 upstream = server['routes'][0]['handle'][0]['upstreams'][0]['dial']
 assert upstream == '127.0.0.1:3212'
+
+server = config['apps']['http']['servers']['srv3213']
+assert server['listen'] == [':3213']
+assert server['protocols'] == ['h1', 'h2']
+api = server['routes'][0]
+assert api['match'] == [{'path': ['/api/*']}]
+assert api['handle'][0]['handler'] == 'reverse_proxy'
+assert api['handle'][0]['upstreams'][0]['dial'] == '127.0.0.1:3212'
 PY
+/usr/local/libexec/duet/caddy validate --config "$PWD/.deploy/caddy/config.json"
 ```
 
 Codex 使用 bwrap 创建自己的 user/mount/network namespace。Ubuntu AppArmor
@@ -69,12 +83,13 @@ find data -maxdepth 4 -path '*/.h3/attempts/*/attempt.json' -type f -print | hea
 ## 2. 测试
 
 ```bash
-.venv/bin/python -m pytest tests -q
+/home/xy/duet-ad1/.venv/bin/python -m pytest tests -q
 git diff --check
 systemd-analyze --user verify .deploy/systemd/duet-ad1.service
+/usr/local/libexec/duet/caddy validate --config "$PWD/.deploy/caddy/config.json"
 ```
 
-全量测试必须通过。此阶段不运行 smoke；smoke 会创建真实会话，并在显式解锁后触发付费 H3 请求。
+全量测试必须通过。此阶段不运行 `.deploy/smoke-h3.sh`；3213 的生产 smoke 只允许第 6 节列出的 GET/HEAD，不创建会话、不提交生成。
 
 ## 3. 唯一 EnvironmentFile 与原 user unit
 
@@ -168,7 +183,56 @@ journalctl --user -u duet-ad1.service --since '-2 minutes' --no-pager
 
 服务必须是单进程；不要给 uvicorn 增加 `--workers`。重启时 schema v2 generation 默认只执行 GET-only resume；唯一补发供应商 POST 的例外是完整确认的 `h3_provider_failed` 仍有自动额度，或该失败后已落盘的 ready 自动 attempt。
 
-## 5. 健康检查
+## 5. 3213 静态前端与同一 Caddy unit 发布
+
+先确认构建产物和候选配置；`validate` 只解析候选文件，不监听端口、不重启服务：
+
+```bash
+cd /home/xy/duet-ad1
+test -s web-next/dist/index.html
+test -d web-next/dist/assets
+/usr/local/libexec/duet/caddy validate --config "$PWD/.deploy/caddy/config.json"
+```
+
+部署前生成本次 3213 变更的精确 3211-only 回滚配置，并验证它可加载：
+
+```bash
+install -d -m 0700 /home/xy/.local/state/duet-ad1
+ROLLBACK_CONFIG=/home/xy/.local/state/duet-ad1/caddy-config.before-3213.json
+git show 2d6567b:.deploy/caddy/config.json > "${ROLLBACK_CONFIG}.tmp"
+/usr/local/libexec/duet/caddy validate --config "${ROLLBACK_CONFIG}.tmp"
+install -m 0600 "${ROLLBACK_CONFIG}.tmp" "$ROLLBACK_CONFIG"
+rm -f "${ROLLBACK_CONFIG}.tmp"
+```
+
+3213 当前的旧预览不是 service。只允许按完整命令行和工作目录同时确认后，精确停止这一个 Vite 进程；零个进程是合法状态，多个匹配则立即停止发布并调查：
+
+```bash
+OLD_VITE_COMMAND='node ./node_modules/.bin/vite preview --host 0.0.0.0 --port 3213'
+mapfile -t OLD_VITE_PIDS < <(pgrep -fx -- "$OLD_VITE_COMMAND" || true)
+test "${#OLD_VITE_PIDS[@]}" -le 1
+if test "${#OLD_VITE_PIDS[@]}" -eq 1; then
+  OLD_VITE_PID="${OLD_VITE_PIDS[0]}"
+  test "$(readlink -f "/proc/$OLD_VITE_PID/cwd")" = \
+    /home/xy/duet-ad1/.worktree/antd-x-prototype/web-next
+  kill -TERM -- "$OLD_VITE_PID"
+  for _ in {1..50}; do
+    kill -0 "$OLD_VITE_PID" 2>/dev/null || break
+    sleep 0.2
+  done
+  ! kill -0 "$OLD_VITE_PID" 2>/dev/null
+fi
+```
+
+不创建新 service，不启动第二个 uvicorn；原地重启同一个 Caddy unit：
+
+```bash
+systemctl --user restart duet-ad1-caddy.service
+systemctl --user is-active duet-ad1-caddy.service
+journalctl --user -u duet-ad1-caddy.service --since '-2 minutes' --no-pager
+```
+
+## 6. 健康检查与只读生产 smoke
 
 先查本机 uvicorn：
 
@@ -187,9 +251,50 @@ curl --fail --silent --show-error \
 
 健康接口只证明进程和反代可达，不验证 H3 凭据、余额或付费链路。
 
-## 6. 正式 API smoke（每次调用都会新建会话并付费）
+3213 生产 smoke 只允许 GET/HEAD；禁止 POST/PUT/PATCH/DELETE，禁止创建会话、提交生成或运行 `.deploy/smoke-h3.sh`。先验证本机 HTTPS、SPA 回退和缓存头，再把 `PUBLIC_3213` 替换为实际公网域名/IP 重复同样的只读请求：
 
-脚本要求显式 `RUN_PAID_SMOKE=1`，默认走本机 3212，通过正式 API 创建、轮询、提交和验证 H3 成片。每执行一次脚本都会生成新的创建 id 和 generation `client_request_id`，创建一个新会话，并按冻结计划产生真实付费 H3 task；不得把下面三次验收放进自动重试器。脚本会打印 cid、generation request id 和付费子任务数，不会打印 access token、供应商凭据或 task id。
+```bash
+curl --fail --silent --show-error --insecure \
+  https://127.0.0.1:3213/api/health
+curl --fail --silent --show-error --insecure --head \
+  https://127.0.0.1:3213/ | rg -i '^cache-control: no-store'
+curl --fail --silent --show-error --insecure --head \
+  https://127.0.0.1:3213/a-client-route | rg -i '^cache-control: no-store'
+
+ASSET_PATH="$(find web-next/dist/assets -maxdepth 1 -type f \
+  -printf '/assets/%f\n' | head -n 1)"
+test -n "$ASSET_PATH"
+curl --fail --silent --show-error --insecure --head \
+  "https://127.0.0.1:3213$ASSET_PATH" | \
+  rg -i '^cache-control: public, max-age=31536000, immutable'
+
+PUBLIC_3213='https://<public-host>:3213'
+curl --fail --silent --show-error "$PUBLIC_3213/api/health"
+curl --fail --silent --show-error --head "$PUBLIC_3213/" | \
+  rg -i '^cache-control: no-store'
+```
+
+### 3213 回滚
+
+若 Caddy restart 或上述只读检查失败，恢复已验证的 3211-only 配置并重启同一 unit；回滚会关闭 3213，不要重新启动旧 Vite：
+
+```bash
+ROLLBACK_CONFIG=/home/xy/.local/state/duet-ad1/caddy-config.before-3213.json
+test -s "$ROLLBACK_CONFIG"
+/usr/local/libexec/duet/caddy validate --config "$ROLLBACK_CONFIG"
+install -m 0644 "$ROLLBACK_CONFIG" \
+  /home/xy/duet-ad1/.deploy/caddy/config.json
+systemctl --user restart duet-ad1-caddy.service
+systemctl --user is-active duet-ad1-caddy.service
+curl --fail --silent --show-error --insecure \
+  https://127.0.0.1:3211/api/health
+```
+
+回滚后将配置恢复变更作为独立 fix-forward commit 审核、测试；不要用 `git reset --hard` 或共享工作区 `git checkout` 掩盖现场状态。
+
+## 7. 可选显式付费验收（不属于生产 smoke）
+
+以下流程不属于 3213 生产部署和生产 smoke，只能在另行批准真实付费验收后人工执行。脚本要求显式 `RUN_PAID_SMOKE=1`，默认走本机 3212，通过正式 API 创建、轮询、提交和验证 H3 成片。每执行一次脚本都会生成新的创建 id 和 generation `client_request_id`，创建一个新会话，并按冻结计划产生真实付费 H3 task；不得把下面三次验收放进自动重试器。脚本会打印 cid、generation request id 和付费子任务数，不会打印 access token、供应商凭据或 task id。
 
 先准备实测时长分别为 10、15、30 秒的样本，并在付费前确认：
 
@@ -252,7 +357,7 @@ done
 
 脚本遇到最终 `failed`、`submission_unknown`、`resume_required` 或超时都会退出，且脚本自身绝不重复调用提交 API。服务内部对完整确认且不计费的 `h3_provider_failed` 会按配置自动补交，默认单逻辑请求总计最多 3 次 POST；其他失败不会。保留脚本打印的 cid 和原 `client_request_id`，按下一节判断是原 attempt 继续、自动额度耗尽后的新 id、拼接失败的原 id 本地重拼，还是先去供应商核对。
 
-## 7. 失败时 fix-forward
+## 8. 失败时 fix-forward
 
 1. 停止重复点击和重复 smoke；保留 cid、`prepared_input.json`、`long_video_plan.json`、`.h3/` 和 `meta.json`。
 2. 用 detail API 或 journal 确认是输入准备、凭据、H3 查询/下载还是公开反代问题；不要打印环境。

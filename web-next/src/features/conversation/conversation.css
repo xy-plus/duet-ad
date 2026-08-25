@@ -1,0 +1,9 @@
+.conversation-overview {
+  min-block-size: 0;
+}
+
+.conversation-overview-list {
+  max-block-size: min(70vh, 45rem);
+  overflow-y: auto;
+  padding-inline: var(--ant-padding-xs);
+}
