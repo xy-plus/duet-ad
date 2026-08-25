@@ -363,7 +363,7 @@ describe('production App integration', () => {
     await waitFor(() => expect(detailCalls).toBeGreaterThan(1));
     expect(screen.queryByRole('button', { name: actionLabel })).not.toBeInTheDocument();
     expect(submitCalls).toBe(1);
-  }, 10_000);
+  });
 
   it('keeps a string submission_outcome_unknown response locked in the App', async () => {
     const storage = new MemoryStorage();
@@ -401,7 +401,7 @@ describe('production App integration', () => {
     await waitFor(() => expect(detailCalls).toBeGreaterThan(1));
     expect(screen.queryByRole('button', { name: '确认生成' })).not.toBeInTheDocument();
     expect(submitCalls).toBe(1);
-  }, 10_000);
+  });
 
   it('withholds postprocess retry authority from a read-only detail', async () => {
     const storage = new MemoryStorage();

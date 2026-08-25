@@ -58,7 +58,7 @@ describe('CreateConversationComposer', () => {
     expect(screen.getByLabelText('视频链接')).toHaveValue('');
     await user.click(screen.getByText('上传文件'));
     expect(screen.queryByText('source.mp4')).not.toBeInTheDocument();
-  }, 10_000);
+  });
 
   it('locks every creation control while submission is in flight', () => {
     render(

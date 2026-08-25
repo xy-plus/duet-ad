@@ -34,5 +34,6 @@
 
 - 功能先写失败测试，再做最小实现。
 - 提交前运行 `npm run check`；真实浏览器契约与截图运行 `npm run test:e2e`。
+- AntD 完整 JSDOM 用例统一使用 `vite.config.ts` 的 10 秒预算；禁止在单个测试上继续放宽超时。撞线时先减少无关交互或拆小 fixture，不能用更长 timeout 掩盖阻塞。
 - 视觉验收固定覆盖 1440×1000 的首屏/生成区和 390×844 的 Drawer/正文；文档滚动、内容宽度、源视频宽度和横向溢出另有几何断言。
 - 不得通过禁用 ESLint、Stylelint、TypeScript 或截图断言来换取通过。

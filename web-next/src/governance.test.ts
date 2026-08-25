@@ -36,6 +36,18 @@ describe('UI foundation contract', () => {
     expect(instructions).toContain('npm run check');
   });
 
+  it('centralizes the AntD JSDOM test budget instead of hiding slow tests locally', () => {
+    const viteConfig = readFileSync(resolve(projectRoot, 'vite.config.ts'), 'utf8');
+    const testFiles = readdirSync(resolve(projectRoot, 'src'), { recursive: true })
+      .map(String)
+      .filter((file) => /\.test\.[cm]?[jt]sx?$/u.test(file) && file !== 'governance.test.ts');
+
+    expect(viteConfig).toContain('testTimeout: 10_000');
+    expect(testFiles.filter((file) => (
+      readFileSync(resolve(projectRoot, 'src', file), 'utf8').includes('}, 10_000);')
+    ))).toEqual([]);
+  });
+
   it('provides one component facade and one token/provider module', () => {
     expect(existsSync(resolve(projectRoot, 'src/ui/antd.ts'))).toBe(true);
     expect(existsSync(resolve(projectRoot, 'src/ui/theme.tsx'))).toBe(true);
