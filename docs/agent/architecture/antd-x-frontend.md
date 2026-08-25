@@ -44,7 +44,7 @@ flowchart LR
 | `src/features/generation` | 生成参数、冻结证据、付费任务数、分段进度和安全动作 | antd-x-frontend |
 | `src/features/postprocess` | 选项 Modal、后台状态卡、冻结选项重试与结果预览 | antd-x-frontend |
 | `src/ui/antd.ts` | AntD、Ant Design X、icons 和唯一 Video 的单一组件门面 | antd-x-frontend |
-| `src/ui/theme.ts` | 唯一 Token、中文 locale、XProvider、AntD App 与 QueryClientProvider 边界 | antd-x-frontend |
+| `src/ui/theme.tsx` | 唯一 Token、中文 locale、XProvider、AntD App 与 QueryClientProvider 边界 | antd-x-frontend |
 | `tests/app.spec.ts` | 真实 Chromium API 合同、付费安全、后台行为、移动端和截图基线 | antd-x-frontend |
 
 ## 数据流

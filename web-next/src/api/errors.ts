@@ -37,7 +37,9 @@ export function apiErrorFromPayload(
     : (detail === undefined || detail === null ? options.fallback : String(detail));
   const code = structured && typeof structured.code === 'string'
     ? structured.code
-    : (options.status === 401 ? 'unauthorized' : 'http_error');
+    : detail === 'submission_outcome_unknown'
+      ? 'submission_outcome_unknown'
+      : (options.status === 401 ? 'unauthorized' : 'http_error');
   return new ApiError(message, { status: options.status, code, detail });
 }
 

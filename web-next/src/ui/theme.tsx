@@ -1,4 +1,4 @@
-import { createElement, type PropsWithChildren } from 'react';
+import type { PropsWithChildren } from 'react';
 import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
 import { AntApp, XProvider, zhCN, type ThemeConfig } from './antd';
 import './baseline.css';
@@ -42,13 +42,11 @@ interface AppThemeProviderProps extends PropsWithChildren {
 }
 
 export function AppThemeProvider({ children, queryClient }: AppThemeProviderProps) {
-  return createElement(
-    QueryClientProvider,
-    { client: queryClient },
-    createElement(
-      XProvider,
-      { theme: appTheme, locale: zhCN },
-      createElement(AntApp, null, children),
-    ),
+  return (
+    <QueryClientProvider client={queryClient}>
+      <XProvider theme={appTheme} locale={zhCN}>
+        <AntApp>{children}</AntApp>
+      </XProvider>
+    </QueryClientProvider>
   );
 }

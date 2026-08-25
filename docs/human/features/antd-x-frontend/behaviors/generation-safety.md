@@ -29,6 +29,7 @@ links: [antd-x-frontend, conversation-task]
 ## 边界
 
 - 前端同一会话同时最多发出一个 submit；TanStack mutation 不自动重试。
+- provider-facing POST 前先持久化 reconciliation lease；network/5xx/响应无效/409 `submission_outcome_unknown` 时跨 reload/logout 只做 GET 核对，直到明确响应或同 request id 相对提交前 baseline 出现权威推进才解锁。
 - `read_only !== false` 或 `submit_enabled !== true` 时，提示词、生成和后处理全部不可操作，但已有详情与媒体仍可查看。
 - `crop` 会裁掉画面边缘，`pad` 保留完整画面并可能留边；界面必须同时暴露两者，不能把 pad 描述为铺满。
 - H3 自动补交、attempt receipt 与 `submission_unknown` 的供应商核对规则见 [长视频行为](../../conversation-task/behaviors/long-video.md)，前端不重新解释或放宽。

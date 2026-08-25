@@ -286,6 +286,121 @@ describe('production App integration', () => {
     expect(submitCalls).toBe(1);
   });
 
+  it.each([
+    [
+      'resume',
+      '继续原任务',
+      {
+        ...baseDetail,
+        navigation_status: 'generation_resume_required',
+        generation: {
+          status: 'resume_required',
+          error: '原任务等待继续',
+          attempt: 1,
+          client_request_id: 'request-resume',
+          stage: 'h3',
+        },
+      },
+    ],
+    [
+      'retry_stitch',
+      '继续拼接',
+      {
+        ...baseDetail,
+        duration_s: 30,
+        segment_count: 3,
+        plan_receipt: 'b'.repeat(64),
+        navigation_status: 'generation_failed',
+        generation: {
+          status: 'failed',
+          error: '拼接失败',
+          attempt: 1,
+          client_request_id: 'request-stitch',
+          stage: 'stitch',
+          fast_mode: false,
+          segments: [],
+        },
+      },
+    ],
+  ])('keeps an ambiguous reused-id %s action locked when GET only returns its baseline proof', async (
+    _name,
+    actionLabel,
+    baselineDetail,
+  ) => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    let submitCalls = 0;
+    let detailCalls = 0;
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'reused-id-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([baselineDetail]);
+        if (url === '/api/conversations/cid-1') {
+          detailCalls += 1;
+          return Response.json(baselineDetail);
+        }
+        if (url.endsWith('/submit')) {
+          submitCalls += 1;
+          throw new TypeError('connection reset after reused-id submit');
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole(
+      'button',
+      { name: actionLabel },
+      { timeout: 4_000 },
+    ));
+
+    expect(await screen.findByText('正在核对提交结果，已锁定再次提交')).toBeInTheDocument();
+    await waitFor(() => expect(detailCalls).toBeGreaterThan(1));
+    expect(screen.queryByRole('button', { name: actionLabel })).not.toBeInTheDocument();
+    expect(submitCalls).toBe(1);
+  }, 10_000);
+
+  it('keeps a string submission_outcome_unknown response locked in the App', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    let submitCalls = 0;
+    let detailCalls = 0;
+    const newDetail = { ...baseDetail, navigation_status: 'prompt_confirmed', generation: null };
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'outcome-unknown-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([newDetail]);
+        if (url === '/api/conversations/cid-1') {
+          detailCalls += 1;
+          return Response.json(newDetail);
+        }
+        if (url.endsWith('/submit')) {
+          submitCalls += 1;
+          return Response.json({ detail: 'submission_outcome_unknown' }, { status: 409 });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole(
+      'button',
+      { name: '确认生成' },
+      { timeout: 4_000 },
+    ));
+
+    expect(await screen.findByText('正在核对提交结果，已锁定再次提交')).toBeInTheDocument();
+    await waitFor(() => expect(detailCalls).toBeGreaterThan(1));
+    expect(screen.queryByRole('button', { name: '确认生成' })).not.toBeInTheDocument();
+    expect(submitCalls).toBe(1);
+  }, 10_000);
+
   it('withholds postprocess retry authority from a read-only detail', async () => {
     const storage = new MemoryStorage();
     storage.setItem('cvs_token', 'stored-token');

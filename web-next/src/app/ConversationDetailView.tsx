@@ -203,8 +203,6 @@ function payloadForAction(
 }
 
 function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail: ConversationDetail }) {
-  const queryClient = useQueryClient();
-  const sessionKey = useApiSessionKey(apiClient);
   const [draft, setDraft] = useState(() => safeGenerationDraft(detail));
   const [error, setError] = useState<string>();
   const [reconciling, setReconciling] = useState(() => apiClient.isSubmissionReconciling(detail.id));
@@ -214,27 +212,6 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
     setDraft((previous) => safeGenerationDraft(detail, previous ?? undefined));
     setReconciling(apiClient.isSubmissionReconciling(detail.id));
   }, [apiClient, detail]);
-
-  useEffect(() => {
-    if (!reconciling) return undefined;
-    let active = true;
-    const reconcile = async () => {
-      try {
-        const latest = await apiClient.getConversation(detail.id);
-        if (!active) return;
-        queryClient.setQueryData(queryKeys.detail(sessionKey, detail.id), latest);
-        if (!apiClient.isSubmissionReconciling(detail.id)) setReconciling(false);
-      } catch {
-        // A failed GET never authorizes another provider-facing POST.
-      }
-    };
-    void reconcile();
-    const interval = globalThis.setInterval(() => { void reconcile(); }, 2_000);
-    return () => {
-      active = false;
-      globalThis.clearInterval(interval);
-    };
-  }, [apiClient, detail.id, queryClient, reconciling, sessionKey]);
 
   const settings = draft ? generationSettingsValue(draft) : undefined;
   const model = generationStatusModel(detail, mutation.isPending);

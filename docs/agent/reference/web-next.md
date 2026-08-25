@@ -78,6 +78,7 @@ Query key 形状：
 - query 默认 `retry=false`、`staleTime=30s`、不在 window focus 自动刷新；文件 `staleTime=Infinity`。
 - 已选中会话由页面 detail observer 轮询；只有未选中且 `navigation_status` 表明仍在后台运行的会话才挂 background poller。浏览器页面进入后台时两者都停止 interval。
 - mutation 成功/结束只 invalidate 当前 session 的 list/detail。
+- provider-facing POST 前必须持久化 reconciliation lease；network/5xx/invalid response/409 `submission_outcome_unknown` 时跨 reload/logout 保持 GET-only，只有明确响应或同 request id 相对 baseline 的权威推进才清除。
 - detail 回写 list 的 `status/has_video/navigation_status/generation`，侧栏不另建状态机。
 - `ObjectUrlLease` 同 key+Blob 复用 URL，替换、清空和 dispose 都先 revoke；sessionKey 是资源 key 一部分。
 - 任一 JSON/Blob 401 执行 `clearSession()`：删 token、清 QueryClient、旋转 sessionKey。
@@ -90,9 +91,9 @@ Query key 形状：
 - 禁止原生 `button/form/input/select/textarea/img/svg/video` 等视觉/交互元素、inline `style`、业务色值和 `.svg` import。
 - 语义 `main/section/header/div/figure/figcaption` 允许。
 - 唯一原生 `<video>` 白名单是 `src/ui/video.tsx`，对外仍从 `src/ui/antd.ts` 导出；props 排除 inline style 并要求 `label`。
-- 测试可直接 import 测试依赖；`src/ui/theme.ts` 是颜色常量例外，不是业务逃生口。
+- 测试可直接 import 测试依赖；`src/ui/theme.tsx` 是颜色常量例外，不是业务逃生口。
 
-`src/ui/theme.ts` 是唯一视觉真源：
+`src/ui/theme.tsx` 是唯一视觉真源：
 
 - `AppThemeProvider` 顺序为 `QueryClientProvider → XProvider(theme=appTheme, locale=zhCN) → AntApp`；禁止另建 ConfigProvider/XProvider。
 - `cssVar.key=duet-next`、`hashed=false`；颜色、字体、圆角、阴影和控件尺寸集中在 `appTheme`。
