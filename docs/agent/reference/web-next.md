@@ -43,7 +43,7 @@ links: [antd-x-frontend]
 | `PATCH /api/conversations/{cid}/image-optimization-prompt` | Bearer | `{confirm:true,segment_index,expected_sha256,prompt}`；短段固定 0，长段用 1..N，SHA 漂移后只刷新 |
 | `POST /api/conversations/{cid}/submit` | Bearer | 冻结 generation payload；ApiClient 同 cid 单飞 |
 | `POST /api/conversations/{cid}/postprocess` | Bearer | `{confirm:true,options:{remove_subtitle,remove_brand,optimize_image}}`；只提交 capabilities 允许项，锁定冲突后只刷新 |
-| `POST /api/conversations/{cid}/postprocess/segments/{index}/retry` | Bearer | `{confirm:true,expected_revision}`；只重试 failed 段，unknown 需额外确认潜在重复计费 |
+| `POST /api/conversations/{cid}/postprocess/segments/{index}/retry` | Bearer | `{confirm:true,expected_revision}`；只重试 failed 段，`error=submission_unknown` 需额外确认潜在重复计费；不提供整项目失败重试 |
 | `GET /api/conversations/{cid}/files/{name}` | Bearer | Blob 媒体；每个 path segment 编码，Object URL 由 hook 管理 |
 | `GET /api/health` | 否 | 只用于部署 smoke，不参与 App 状态 |
 

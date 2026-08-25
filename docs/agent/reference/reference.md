@@ -293,11 +293,11 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 接受后冻结选项、每段提示词与后端模型/模式/模板，返回 `{"status":"running","frames":[]}`。短视频按段 0，长视频按 1..N 并行；段内严格执行已选的 `full_screen_text_erase → full_screen_icon_erase → Seedream` 阶段屏障，帧请求受 MediaKit/Seedream 独立并发上限控制。图片模式为 `anchor_consistency` 时先用本段全部清理帧生成第一张锚帧，再并行处理剩余帧；`independent_parallel` 则每帧独立并行。供应商返回图统一转为源图精确尺寸 PNG，整段完成后才原子发布同名 canonical 文件。
 
-detail 的 `postprocess` 为 `{status,options,frames,segments,error}`；每段只公开 `{index,status,stage,completed_frames,total_frames,revision,error}`。任一段失败不取消其他段，但整体为 failed，生成返回 409 `postprocess_not_ready`；全部完成后优化帧进入 H3 冻结输入。禁用返回 501，旧会话返回 409 `read_only`，输入未 done/正在运行返回 409；generation 已创建返回 409 `generation_already_started`；重跑改变冻结选项返回结构化 409 `postprocess_options_locked`。
+detail 的 `postprocess` 为 `{status,options,frames,segments,error}`；每段只公开 `{index,status,stage,completed_frames,total_frames,revision,error}`。任一段失败不取消其他段，但整体为 failed，生成返回 409 `postprocess_not_ready`；全部完成后优化帧进入 H3 冻结输入。禁用返回 501，旧会话返回 409 `read_only`，输入未 done/正在运行返回 409；generation 已创建返回 409 `generation_already_started`；done 后改变冻结选项返回结构化 409 `postprocess_options_locked`。既有 failed 状态拒绝普通 POST 并返回 `postprocess_segment_retry_required`，避免重置 revision 或绕过分段 CAS。
 
 ### `POST /api/conversations/{cid}/postprocess/segments/{index}/retry`
 
-请求 key 必须恰为 `{"confirm":true,"expected_revision":N}`，仅允许重试当前 failed 段；revision 漂移返回结构化 409 `postprocess_revision_changed`。服务复用项目冻结的选项、提示词、模型、模式和已完成本地产物，不接受客户端覆盖。`submission_unknown` 同样必须由用户明确确认潜在重复计费后人工调用；旧 revision 的 attempt 保留，启动恢复不会替用户调用该接口。
+请求 key 必须恰为 `{"confirm":true,"expected_revision":N}`，仅允许重试当前 failed 段；revision 漂移返回结构化 409 `postprocess_revision_changed`。服务复用项目冻结的选项、提示词、模型、模式和已完成本地产物，不接受客户端覆盖。未知提交的公共真源是分段 `error=submission_unknown`，不得从 `status/stage` 推断；用户明确确认潜在重复计费后才能人工调用。旧 revision 的 attempt 保留，启动恢复不会替用户调用该接口。
 
 Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。自动重试硬上限为总计 3 次，并且只认完整 HTTP 429、精确 `QuotaExceeded`、响应无 `data`；网络、超时、取消及其他不明结果写为 `submission_unknown` 且不自动重发。确定性 4xx/协议错误不重试；成功响应 bytes 已落盘时，恢复只做本地 PNG 发布。
 
