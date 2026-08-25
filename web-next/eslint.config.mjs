@@ -216,27 +216,28 @@ export default tseslint.config(
     ignores: ['src/**/*.test.{ts,tsx}'],
     rules: {
       'governance/no-native-visual-elements': 'error',
-      'no-restricted-properties': [
-        'error',
-        { object: 'document', property: 'createElement', message: DOM_FACTORY_MESSAGE },
-        { object: 'window', property: 'document', message: DOM_FACTORY_MESSAGE },
-        { object: 'globalThis', property: 'document', message: DOM_FACTORY_MESSAGE },
-      ],
     },
   },
   {
     files: ['src/**/*.{ts,tsx}'],
-    ignores: ['src/**/*.test.{ts,tsx}', 'src/main.tsx'],
+    ignores: ['src/**/*.test.{ts,tsx}', 'src/test/**', 'src/main.tsx'],
     rules: {
       'no-restricted-globals': [
         'error',
         { name: 'document', message: DOM_FACTORY_MESSAGE },
+        { name: 'window', message: DOM_FACTORY_MESSAGE },
+        { name: 'globalThis', message: DOM_FACTORY_MESSAGE },
       ],
     },
   },
   {
     files: ['src/main.tsx'],
     rules: {
+      'no-restricted-globals': [
+        'error',
+        { name: 'window', message: DOM_FACTORY_MESSAGE },
+        { name: 'globalThis', message: DOM_FACTORY_MESSAGE },
+      ],
       'no-restricted-syntax': [
         'error',
         {
