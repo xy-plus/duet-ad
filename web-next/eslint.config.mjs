@@ -40,6 +40,7 @@ const governancePlugin = {
           if (node.type === 'Identifier') return node.name;
           if (node.type === 'MemberExpression') return rootCalleeName(node.object);
           if (node.type === 'CallExpression') return rootCalleeName(node.callee);
+          if (node.type === 'TaggedTemplateExpression') return rootCalleeName(node.tag);
           return undefined;
         };
         const memberName = (node) => {
@@ -50,7 +51,9 @@ const governancePlugin = {
         };
         const isTestDeclaration = (node) => {
           if (!['it', 'test'].includes(rootCalleeName(node.callee))) return false;
-          if (node.callee.type === 'Identifier' || node.callee.type === 'CallExpression') return true;
+          if (node.callee.type === 'Identifier'
+              || node.callee.type === 'CallExpression'
+              || node.callee.type === 'TaggedTemplateExpression') return true;
           return node.callee.type === 'MemberExpression'
             && !['each', 'for'].includes(String(memberName(node.callee)));
         };

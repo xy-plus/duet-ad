@@ -49,6 +49,7 @@ describe('UI foundation contract', () => {
     "it.each([['case']])('slow %s', () => undefined, 20_000);",
     "const callback = () => undefined; it('slow', callback, 20_000);",
     "const callback = () => undefined; it.each([['case']])('slow %s', callback, 20_000);",
+    "const callback = () => undefined; it.each`value ${1}`('slow $value', callback, 20_000);",
   ])('rejects local Vitest timeout syntax regardless of formatting', async (source) => {
     const messages = await lintBusinessSource(source, 'src/example.test.ts');
 
