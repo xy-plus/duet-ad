@@ -1,0 +1,30 @@
+.media-artifact-video {
+  display: block;
+  inline-size: 100%;
+  max-block-size: 70vh;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+}
+
+.keyframe-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: var(--ant-padding-sm);
+}
+
+.keyframe-gallery-item {
+  display: grid;
+  gap: var(--ant-padding-xxs);
+  min-inline-size: 0;
+  margin: 0;
+}
+
+.media-artifact-list {
+  inline-size: 100%;
+  max-block-size: 24rem;
+  overflow-y: auto;
+}
+
+.prompt-editor-layout {
+  inline-size: 100%;
+}
