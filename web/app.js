@@ -93,9 +93,11 @@ function showActionError(error, errorElement, controls = []) {
 
 function createImagePromptDraft(conversationId, segmentIndex, prompt) {
   const value = prompt || {};
+  const normalizedIndex = segmentIndex === null || segmentIndex === undefined
+    ? 0 : (Number.isInteger(segmentIndex) && segmentIndex >= 0 ? segmentIndex : null);
   return {
     conversationId,
-    segmentIndex: Number.isInteger(segmentIndex) && segmentIndex >= 0 ? segmentIndex : 0,
+    segmentIndex: normalizedIndex,
     text: String(value.text || ""),
     savedText: String(value.text || ""),
     defaultText: String(value.default_text || ""),
@@ -124,16 +126,24 @@ function mergeImagePromptDraft(draft, prompt) {
 }
 
 function buildImagePromptPatch(draft) {
+  if (!Number.isInteger(draft.segmentIndex) || draft.segmentIndex < 0) {
+    throw new Error("图片优化提示词段号无效");
+  }
   return {
     confirm: true,
-    segment_index: Number.isInteger(draft.segmentIndex) && draft.segmentIndex >= 0 ? draft.segmentIndex : 0,
+    segment_index: draft.segmentIndex,
     expected_sha256: draft.sha256,
     prompt: draft.text,
   };
 }
 
 function promptScopeKey(conversationId, segmentIndex) {
-  return conversationId + ":" + (Number.isInteger(segmentIndex) && segmentIndex >= 0 ? segmentIndex : 0);
+  return conversationId + ":" + (Number.isInteger(segmentIndex) && segmentIndex >= 0 ? segmentIndex : "invalid");
+}
+
+function promptSegmentIndex(segment) {
+  if (segment === null) return 0;
+  return segment && Number.isInteger(segment.index) && segment.index > 0 ? segment.index : null;
 }
 
 async function saveActiveImagePrompt() {
@@ -154,13 +164,24 @@ function dirtyPromptDecision() {
     return Promise.resolve(window.confirm("丢弃未保存的修改吗？") ? "discard" : "cancel");
   }
   return new Promise((resolve) => {
+    let settled = false;
     const finish = (decision) => {
+      if (settled) return;
+      settled = true;
+      $("draft-save").onclick = null;
+      $("draft-discard").onclick = null;
+      $("draft-cancel").onclick = null;
+      dialog.oncancel = null;
       dialog.close();
       resolve(decision);
     };
     $("draft-save").onclick = () => finish("save");
     $("draft-discard").onclick = () => finish("discard");
     $("draft-cancel").onclick = () => finish("cancel");
+    dialog.oncancel = (event) => {
+      event.preventDefault();
+      finish("cancel");
+    };
     dialog.showModal();
   });
 }
@@ -180,22 +201,6 @@ async function guardDirtyPrompt() {
   } catch (_) {
     return false;
   }
-}
-
-async function recoverPromptChanged(error, detail, fetchLatest, refs) {
-  if (!error || error.code !== "prompt_changed") return false;
-  const latest = await fetchLatest();
-  if (!latest || typeof latest.source_prompt !== "string"
-      || typeof latest.source_prompt_sha256 !== "string"
-      || !/^[0-9a-f]{64}$/.test(latest.source_prompt_sha256)) {
-    throw new Error("最新提示词详情校验失败，请刷新页面后重试");
-  }
-  Object.assign(detail, latest);
-  refs.output.textContent = latest.source_prompt;
-  refs.textarea.value = latest.source_prompt;
-  refs.error.textContent = "提示词已在其他页面更新，已加载最新版本，请重新编辑";
-  refs.error.hidden = false;
-  return true;
 }
 
 async function recoverLockedPostprocess(error, fetchLatest, inputs, lockHint, errorElement) {
@@ -1600,14 +1605,17 @@ function dialogueText(lines) {
   return normalizeDialogueLines(lines).map((line) => line.text).join("\n");
 }
 
-function imagePromptEditable(detail) {
+function imagePromptEditable(detail, segmentIndex) {
   const generationStarted = !!(detail.generation && detail.generation.status);
   const postprocessStarted = !!(detail.postprocess && detail.postprocess.status);
-  return canOperate(detail) && !generationStarted && !postprocessStarted;
+  const capabilities = detail.postprocess_capabilities;
+  return Number.isInteger(segmentIndex) && segmentIndex >= 0
+    && !!capabilities && capabilities.optimize_image === true
+    && canOperate(detail) && !generationStarted && !postprocessStarted;
 }
 
 function promptWorkspace(detail, segment = null) {
-  const segmentIndex = segment && Number.isInteger(segment.index) && segment.index >= 0 ? segment.index : 0;
+  const segmentIndex = promptSegmentIndex(segment);
   const scope = promptScopeKey(detail.id, segmentIndex);
   const isLong = Array.isArray(detail.segments) && detail.segments.length > 0;
   const generationText = String(segment ? segment.prompt || "" : detail.source_prompt || detail.prompt || "");
@@ -1689,7 +1697,7 @@ function promptWorkspace(detail, segment = null) {
       panel.appendChild(el("p", "prompt-unavailable", "当前会话没有可编辑的图片优化提示词"));
       return;
     }
-    if (!imagePromptEditable(detail)) {
+    if (!imagePromptEditable(detail, segmentIndex)) {
       panel.appendChild(promptCard(imagePrompt.text));
       return;
     }
@@ -1810,99 +1818,6 @@ function sourcePromptEditable(detail) {
     && (!detail.generation || detail.generation.status === null)
     && typeof detail.source_prompt_sha256 === "string"
     && /^[0-9a-f]{64}$/.test(detail.source_prompt_sha256);
-}
-
-function renderSourcePromptCard(detail, text) {
-  const editable = sourcePromptEditable(detail);
-  const editButton = el("button", "copy-btn edit-prompt-btn", "修改提示词");
-  editButton.type = "button";
-  const card = promptCard(text, editable ? [editButton] : []);
-  if (!editable) return card;
-
-  const output = card.querySelector(".prompt-text");
-  const textarea = el("textarea", "dialogue-textarea prompt-editor");
-  textarea.rows = 14;
-  textarea.value = text;
-  textarea.hidden = true;
-  textarea.setAttribute("aria-label", "修改源提示词");
-  card.appendChild(textarea);
-  const error = el("p", "form-error");
-  error.hidden = true;
-  card.appendChild(error);
-  const controls = el("div", "final-row prompt-edit-actions");
-  controls.hidden = true;
-  const save = el("button", "btn btn-primary", "保存提示词");
-  save.type = "button";
-  const cancel = el("button", "btn", "取消");
-  cancel.type = "button";
-  controls.appendChild(save);
-  controls.appendChild(cancel);
-  card.appendChild(controls);
-
-  const showEditor = (shown) => {
-    output.hidden = shown;
-    textarea.hidden = !shown;
-    controls.hidden = !shown;
-    editButton.hidden = shown;
-    error.hidden = true;
-  };
-  editButton.addEventListener("click", () => showEditor(true));
-  cancel.addEventListener("click", () => {
-    textarea.value = output.textContent;
-    showEditor(false);
-  });
-  save.addEventListener("click", async () => {
-    save.disabled = true;
-    cancel.disabled = true;
-    error.hidden = true;
-    try {
-      const payload = await apiJSON(
-        "/api/conversations/" + encodeURIComponent(detail.id) + "/prompt",
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            confirm: true,
-            expected_sha256: detail.source_prompt_sha256,
-            prompt: textarea.value,
-          }),
-        },
-      );
-      if (!payload || typeof payload.prompt !== "string"
-          || typeof payload.final_prompt !== "string"
-          || typeof payload.sha256 !== "string"
-          || !/^[0-9a-f]{64}$/.test(payload.sha256)) {
-        throw new Error("源提示词保存响应校验失败");
-      }
-      output.textContent = payload.prompt;
-      detail.source_prompt = payload.prompt;
-      detail.source_prompt_sha256 = payload.sha256;
-      detail.prompt = payload.final_prompt;
-      showEditor(false);
-      await loadDetail(detail.id, true);
-    } catch (saveError) {
-      if (handleAuthError(saveError)) return;
-      try {
-        const recovered = await recoverPromptChanged(
-          saveError,
-          detail,
-          () => apiJSON("/api/conversations/" + encodeURIComponent(detail.id)),
-          { output, textarea, error },
-        );
-        if (recovered) {
-          if (state.currentId === detail.id) state.detail = detail;
-        } else {
-          showActionError(saveError, error, [save, cancel]);
-        }
-      } catch (recoveryError) {
-        showActionError(recoveryError, error, [save, cancel]);
-      }
-    } finally {
-      save.disabled = false;
-      cancel.disabled = false;
-    }
-  });
-  return card;
 }
 
 /* prompt 卡片（复制按钮 + 全文；源提示词、IR、单段/多段共用） */
@@ -2943,6 +2858,7 @@ if (typeof module !== "undefined" && module.exports) {
     conversationBadge,
     createDisclosure,
     detailSignature,
+    dirtyPromptDecision,
     fitProfile,
     formatDialogueLines,
     generationDraft,
@@ -2951,18 +2867,19 @@ if (typeof module !== "undefined" && module.exports) {
     generationParameterSnapshot,
     generationRetryContract,
     generationSegmentLabel,
+    imagePromptEditable,
     longVideoContract,
     mergeConversationList,
     mergeImagePromptDraft,
     normalizeDialogueLines,
     parseDialogueLines,
+    promptSegmentIndex,
     openLightbox,
     releaseTrackedURLs,
     releaseTrackedURL,
     resetSegmentProductsDisclosure,
     restoreImagePromptDefault,
     recoverLockedPostprocess,
-    recoverPromptChanged,
     runSingleFlightPollCycle,
     segmentProductsDisclosure,
     setDisclosureState,

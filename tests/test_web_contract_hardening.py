@@ -50,30 +50,14 @@ def test_single_flight_polling_waits_for_rtt_recovers_dom_and_honors_switch():
     }
 
 
-def test_prompt_changed_fetches_latest_page_and_resets_editor_sha():
-    result = _run_async_contract(
-        "(async()=>{const old={id:'c1',source_prompt:'page-a',source_prompt_sha256:'a'.repeat(64)};"
-        "const output={textContent:'page-a'},textarea={value:'page-a edit'},error={textContent:'',hidden:true};"
-        "let gets=0;const latest={id:'c1',source_prompt:'page-b',source_prompt_sha256:'b'.repeat(64),"
-        "prompt:'page-b final'};const handled=await contract.recoverPromptChanged({code:'prompt_changed'},old,"
-        "async()=>{gets+=1;return latest},{output,textarea,error});return {handled,gets,old,output,textarea,error}})()"
-    )
-    assert result == {
-        "handled": True,
-        "gets": 1,
-        "old": {
-            "id": "c1",
-            "source_prompt": "page-b",
-            "source_prompt_sha256": "b" * 64,
-            "prompt": "page-b final",
-        },
-        "output": {"textContent": "page-b"},
-        "textarea": {"value": "page-b"},
-        "error": {
-            "textContent": "提示词已在其他页面更新，已加载最新版本，请重新编辑",
-            "hidden": False,
-        },
-    }
+def test_prompt_workspace_fetches_latest_page_on_prompt_changed():
+    source = APP_JS.read_text(encoding="utf-8")
+    workspace = source.split("function promptWorkspace", 1)[1].split(
+        "function editablePromptCard", 1
+    )[0]
+    assert 'error.code !== "prompt_changed"' in workspace
+    assert 'apiJSON("/api/conversations/" + encodeURIComponent(detail.id))' in workspace
+    assert "conflict.latestText = latest.source_prompt" in workspace
 
 
 def test_postprocess_lock_fetches_latest_options_instead_of_captured_detail():
@@ -128,10 +112,10 @@ def test_runtime_handlers_are_wired_to_structured_recovery_contracts():
     assert "state.detailSig = null" in detail_failure
     assert "if (silent && state.currentId === id) startPolling(id)" in detail_failure
 
-    prompt = source.split("function renderSourcePromptCard", 1)[1].split(
-        "function promptCard", 1
+    prompt = source.split("function promptWorkspace", 1)[1].split(
+        "function editablePromptCard", 1
     )[0]
-    assert "recoverPromptChanged" in prompt
+    assert 'error.code !== "prompt_changed"' in prompt
     assert 'apiJSON("/api/conversations/" + encodeURIComponent(detail.id))' in prompt
 
     postprocess = source.split("async function submitPostprocess", 1)[1].split(

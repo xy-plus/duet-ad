@@ -28,6 +28,7 @@ links: [conversation-task, result-display]
 ## 边界
 
 - 页面将单段/多段提示词收敛为同一个三态工作区：“展开生成提示词 / 展开段台词 / 展开图片优化”。三个按钮等宽并排且窄屏允许文字换行；工作区共用一个文本区域。短视频生成提示词与图片优化可编辑，长视频的逐段生成提示词和段台词只读。
+- 图片优化编辑必须同时满足 `postprocess_capabilities.optimize_image=true`；即使异常详情带回提示词，能力为 false 时也只读且不能发 PATCH。短视频逻辑段号为 0，长视频段号必须为正整数，长视频出现 0 或非法段号时 fail closed。
 - 图片优化提示词提供保存、恢复默认、复制；短视频逻辑段固定使用 `segment_index=0`，长视频使用各自正整数段号。存在 dirty 草稿时，切换文本、分段、会话、新建会话、开始生成、打开或提交后处理、退出应用都会先要求“保存 / 丢弃 / 取消”；保存失败留在原处。刷新或关闭页面由 `beforeunload` 拦截，2 秒轮询不得覆盖 dirty 文本。
 - 当前选项为 `remove_subtitle`、`remove_brand`、`optimize_image`；`change_bg/face_hold` 已删除。旧页面请求只得到纯文本刷新提示，不会静默采用或自动重试。
 - `remove_subtitle` 映射 `full_screen_text_erase`；`remove_brand` 作为兼容字段映射 `full_screen_icon_erase`，只承诺清理常见 Logo/图标。双选会执行两个独立付费阶段。

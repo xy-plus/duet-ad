@@ -1,4 +1,5 @@
 from test_web_h3_contract import APP_JS, INDEX_HTML, STYLES_CSS, _run_contract
+from test_web_contract_hardening import _run_async_contract
 
 
 def _sources():
@@ -54,6 +55,30 @@ def test_image_prompt_patch_is_cas_and_segment_aware():
         "'c-short',null,{text:'short',default_text:'default',sha256:'d'.repeat(64)}))"
     )
     assert short["segment_index"] == 0
+    invalid_rejected = _run_contract(
+        "(()=>{try{contract.buildImagePromptPatch(contract.createImagePromptDraft("
+        "'c-bad',-1,{text:'bad',default_text:'bad',sha256:'e'.repeat(64)}));return false}"
+        "catch(error){return error.message==='图片优化提示词段号无效'}})()"
+    )
+    assert invalid_rejected is True
+
+
+def test_image_prompt_edit_requires_capability_and_valid_segment_index():
+    result = _run_contract(
+        "(()=>{const base={read_only:false,submit_enabled:true,generation:null,postprocess:null};"
+        "return {disabled:contract.imagePromptEditable({...base,postprocess_capabilities:{optimize_image:false}},0),"
+        "enabled:contract.imagePromptEditable({...base,postprocess_capabilities:{optimize_image:true}},0),"
+        "short:contract.promptSegmentIndex(null),long:contract.promptSegmentIndex({index:2}),"
+        "longZero:contract.promptSegmentIndex({index:0}),invalid:contract.promptSegmentIndex({index:-1})}})()"
+    )
+    assert result == {
+        "disabled": False,
+        "enabled": True,
+        "short": 0,
+        "long": 2,
+        "longZero": None,
+        "invalid": None,
+    }
 
 
 def test_discarded_singleton_draft_is_replaced_when_switching_segments():
@@ -82,7 +107,24 @@ def test_dirty_guard_covers_navigation_generation_and_postprocess():
         "function closePostprocessModal", 1
     )[0]
     assert "guardDirtyPrompt" in modal
-    assert "保存" in js and "丢弃" in js and "取消" in js
+    assert 'decision === "cancel"' in js and 'decision === "discard"' in js
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    assert "保存" in html and "丢弃" in html and "取消" in html
+
+
+def test_dirty_prompt_dialog_escape_resolves_as_cancel():
+    result = _run_async_contract(
+        "(async()=>{const buttons={draftSave:{},draftDiscard:{},draftCancel:{}};"
+        "let prevented=false,closed=0,shown=0;const dialog={oncancel:null,"
+        "showModal(){shown+=1},close(){closed+=1}};"
+        "global.document={getElementById:(id)=>({"
+        "'draft-dialog':dialog,'draft-save':buttons.draftSave,"
+        "'draft-discard':buttons.draftDiscard,'draft-cancel':buttons.draftCancel}[id])};"
+        "const pending=contract.dirtyPromptDecision();"
+        "dialog.oncancel({preventDefault(){prevented=true}});"
+        "return {decision:await pending,prevented,closed,shown}})()"
+    )
+    assert result == {"decision": "cancel", "prevented": True, "closed": 1, "shown": 1}
 
 
 def test_postprocess_modal_uses_capabilities_and_image_default_off():
@@ -114,6 +156,8 @@ def test_removed_segment_disclosure_helpers_are_not_kept_for_tests():
     js = APP_JS.read_text(encoding="utf-8")
     for dead in ("function segmentDisclosure", "function segmentPromptDisclosure", "function segmentDialogueDisclosure"):
         assert dead not in js
+
+    assert "function renderSourcePromptCard" not in js
 
 
 def test_ui_never_discloses_backend_execution_identifiers():
