@@ -141,6 +141,9 @@ async function saveImageOptimizationPrompt(detail, segmentIndex, draft, request 
   if (!Number.isInteger(segmentIndex) || segmentIndex < 0) {
     throw new Error("图片优化提示词段号无效");
   }
+  if (!draft || draft.segmentIndex !== segmentIndex) {
+    throw new Error("图片优化提示词段号已变化");
+  }
   if (!imagePromptEditable(detail, segmentIndex)) {
     throw new Error("当前会话未开放图片优化编辑");
   }
@@ -2215,49 +2218,60 @@ function ppTotalFrames(detail) {
 }
 
 function postprocessSegmentStatus(status) {
-  return {
-    queued: "等待处理",
-    running: "处理中",
-    done: "已完成",
-    failed: "失败",
-    submission_unknown: "提交结果未知",
-  }[status] || "状态未知";
+  const labels = new Map([
+    ["queued", "等待处理"],
+    ["running", "处理中"],
+    ["done", "已完成"],
+    ["failed", "失败"],
+    ["submission_unknown", "提交结果未知"],
+  ]);
+  return labels.get(status) || "状态未知";
 }
 
 function safePostprocessStage(stage) {
-  return {
-    preparing: "准备素材",
-    remove_subtitle: "移除文字/字幕",
-    remove_brand: "移除常见 Logo/图标",
-    optimize_image: "优化图片质量",
-    downloading: "获取处理结果",
-    retrying: "正在重试",
-    done: "已完成",
-  }[stage] || "处理中";
+  const labels = new Map([
+    ["preparing", "准备素材"],
+    ["remove_subtitle", "移除文字/字幕"],
+    ["remove_brand", "移除常见 Logo/图标"],
+    ["optimize_image", "优化图片质量"],
+    ["downloading", "获取处理结果"],
+    ["retrying", "正在重试"],
+    ["done", "已完成"],
+  ]);
+  return labels.get(stage) || "处理中";
 }
 
 function safePostprocessError(error) {
   const code = error && typeof error === "object" ? error.code : error;
-  return {
-    revision_conflict: "分段状态已更新，请刷新后重试",
-    submission_unknown: "提交结果未知，请谨慎确认后再重试",
-    timeout: "处理超时，请稍后重试",
-    postprocess_failed: "图片处理失败，请重试本段",
-    provider_failed: "图片处理失败，请重试本段",
-  }[code] || "本段处理失败，请重试或联系管理员";
+  const labels = new Map([
+    ["revision_conflict", "分段状态已更新，请刷新后重试"],
+    ["submission_unknown", "提交结果未知，请谨慎确认后再重试"],
+    ["timeout", "处理超时，请稍后重试"],
+    ["postprocess_failed", "图片处理失败，请重试本段"],
+    ["provider_failed", "图片处理失败，请重试本段"],
+  ]);
+  return labels.get(code) || "本段处理失败，请重试或联系管理员";
 }
 
 async function retryPostprocessSegment(detail, segment, request = apiJSON, confirmUnknown, onAccepted) {
   const retryable = segment && (segment.status === "failed" || segment.status === "submission_unknown");
-  if (!retryable || !Number.isInteger(segment.index) || segment.index < 0
+  const duration = Number(detail && detail.duration_s);
+  const knownDuration = Number.isFinite(duration) && duration > 0;
+  const isLong = knownDuration && longVideoContract(detail).isLong;
+  const validIndex = knownDuration && (isLong ? segment && segment.index > 0 : segment && segment.index === 0);
+  if (!retryable || !validIndex || !Number.isInteger(segment.index)
       || !Number.isInteger(segment.revision)) return false;
   if (segment.status === "submission_unknown"
       && (!confirmUnknown || confirmUnknown() !== true)) return false;
   if (onAccepted) onAccepted();
-  await request(
-    "/api/conversations/" + encodeURIComponent(detail.id) + "/postprocess/segments/" + segment.index + "/retry",
-    {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({confirm: true, expected_revision: segment.revision})},
-  );
+  try {
+    await request(
+      "/api/conversations/" + encodeURIComponent(detail.id) + "/postprocess/segments/" + segment.index + "/retry",
+      {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({confirm: true, expected_revision: segment.revision})},
+    );
+  } catch (error) {
+    throw new Error(safePostprocessError(error));
+  }
   return true;
 }
 
@@ -2293,7 +2307,7 @@ function renderPostprocessSegments(detail, pp) {
           await loadDetail(detail.id, true);
         } catch (err) {
           retry.disabled = false;
-          const message = el("p", "form-error", String(err.message || err));
+          const message = el("p", "form-error", safePostprocessError(err));
           row.appendChild(message);
         }
       });
@@ -2930,6 +2944,7 @@ if (typeof module !== "undefined" && module.exports) {
     mergeImagePromptDraft,
     normalizeDialogueLines,
     parseDialogueLines,
+    postprocessSegmentStatus,
     postprocessAskDefault,
     promptSegmentIndex,
     promptWorkspaceModes,
