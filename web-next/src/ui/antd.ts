@@ -31,10 +31,6 @@ export {
   Typography,
   Upload,
 } from 'antd';
-export type {
-  ThemeConfig,
-} from 'antd';
-
 export {
   Bubble,
   Conversations,
@@ -42,6 +38,7 @@ export {
   ThoughtChain,
   XProvider,
 } from '@ant-design/x';
+export type { XProviderProps } from '@ant-design/x';
 export { default as zhCN } from '@ant-design/x/locale/zh_CN';
 
 export {

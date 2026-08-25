@@ -1,14 +1,19 @@
 import type { PropsWithChildren } from 'react';
 import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
-import { AntApp, XProvider, zhCN, type ThemeConfig } from './antd';
+import { AntApp, XProvider, zhCN, type XProviderProps } from './antd';
 import './baseline.css';
 
-export const appTheme: ThemeConfig = {
+type AppTheme = NonNullable<XProviderProps['theme']>;
+
+export const appTheme: AppTheme = {
   cssVar: { key: 'duet-next' },
   hashed: false,
   token: {
     colorPrimary: '#202123',
     colorInfo: '#202123',
+    colorInfoBg: '#f3f3f4',
+    colorInfoBorder: '#dedee1',
+    colorInfoText: '#202123',
     colorSuccess: '#23855b',
     colorWarning: '#a66a13',
     colorError: '#c2413a',
@@ -34,6 +39,11 @@ export const appTheme: ThemeConfig = {
       primaryShadow: 'none',
     },
     Modal: { borderRadiusLG: 20 },
+    Conversations: {
+      creationBgColor: '#ffffff',
+      creationBorderColor: '#dedee1',
+      creationHoverColor: '#f3f3f4',
+    },
   },
 };
 

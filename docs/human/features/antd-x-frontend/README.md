@@ -1,7 +1,7 @@
 ---
 name: antd-x-frontend
 type: feature
-status: done
+status: building
 owner: human
 updated: 2026-08-25
 tdd: N/A
@@ -33,6 +33,7 @@ links: [conversation-task]
 - [创建会话与分析进度](behaviors/create-analysis.md)
 - [提示词、生成参数与付费安全](behaviors/generation-safety.md)
 - [认证媒体与关键帧后处理](behaviors/media-postprocess.md)
+- [视觉语言与页面密度](behaviors/visual-language.md)
 
 这些文件描述前端可观察行为；H3 receipt、状态机与供应商重试真相仍以 [会话任务](../conversation-task/README.md) 为准，不在这里复制。
 

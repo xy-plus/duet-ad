@@ -6,6 +6,38 @@
   object-fit: contain;
 }
 
+.media-artifact-card--compact .media-artifact-video {
+  max-block-size: 11rem;
+  aspect-ratio: 16 / 10;
+}
+
+.media-artifact-summary {
+  display: flex;
+  gap: var(--ant-margin-sm);
+  flex-direction: column;
+}
+
+.media-dialogue {
+  display: flex;
+  gap: var(--ant-margin-sm);
+  padding: var(--ant-padding-md);
+  border-inline-start: 2px solid var(--ant-color-border);
+  border-radius: var(--ant-border-radius-lg);
+  background: var(--ant-color-fill-quaternary);
+  flex-direction: column;
+}
+
+.media-dialogue__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ant-margin-sm);
+}
+
+.media-dialogue__heading h5 {
+  margin: 0;
+}
+
 .keyframe-gallery {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));

@@ -56,14 +56,18 @@ export function ConversationSidebar<T extends ConversationNavigationItem>({
   return (
     <aside aria-label="会话导航" className="conversation-sidebar">
       <Flex align="center" className="conversation-sidebar__brand" gap="small">
-        <ProductOutlined />
-        <Typography.Text strong>{brand}</Typography.Text>
+        <span className="conversation-sidebar__brand-mark"><ProductOutlined /></span>
+        <span className="conversation-sidebar__brand-copy">
+          <Typography.Text strong>{brand}</Typography.Text>
+          <Typography.Text type="secondary">视频工作台</Typography.Text>
+        </span>
       </Flex>
 
       <Conversations
         activeKey={activeConversationId}
         className="conversation-sidebar__conversations"
         creation={{
+          align: 'center',
           icon: <PlusOutlined />,
           label: '新建会话',
           onClick: onNewConversation,

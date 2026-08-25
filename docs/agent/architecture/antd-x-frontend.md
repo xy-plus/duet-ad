@@ -1,7 +1,7 @@
 ---
 name: antd-x-frontend
 type: architecture
-status: done
+status: building
 owner: agent
 updated: 2026-08-25
 tdd: N/A
@@ -71,6 +71,28 @@ flowchart LR
 - prompt 保存使用 `expected_sha256`，长视频 submit 使用 `expected_plan_receipt`；冲突只刷新，不自动重发。
 - 所有 TanStack mutation `retry=false`；会话 submit 另有 ApiClient 单飞门禁。
 - 认证文件不直接放进 `<img>/<video>` URL；Bearer fetch 得到 Blob 后租约化 Object URL，切换 key 或卸载即 revoke。
+
+## 视觉组合边界
+
+页面由三层组合，不能由 feature 各自重新定义壳或宽度：
+
+```text
+WorkspaceShell (100dvh)
+├─ ConversationSidebar (272px, independent scroll)
+└─ Workspace
+   ├─ Header (fixed in shell)
+   └─ Content (independent scroll)
+      └─ ConversationDetail (max 900px)
+         ├─ analysis summary + compact source video
+         ├─ keyframes + dialogue + segments
+         ├─ prompt Collapse + generation settings/status
+         └─ postprocess + final media + secondary timestamps
+```
+
+- `src/ui/theme.tsx` 决定全局色彩、圆角、阴影、控件高度和 Conversations creation 状态；feature CSS 不能建立第二套视觉变量。
+- shell/app CSS 决定唯一页面几何；media/generation CSS 只决定该业务组合在既定内容流内的排列。
+- 真实媒体、服务端字段和付费门禁优先于原型外观；原型的假 Sender、假指标、固定分片和占位媒体不属于架构。
+- Playwright 同时冻结首屏、生成区、移动 Drawer 和移动正文，防止只优化单一截图。
 
 ## 对外接口
 

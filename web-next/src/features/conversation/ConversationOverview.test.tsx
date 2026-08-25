@@ -70,4 +70,12 @@ describe('ConversationOverview', () => {
     rerender(<ConversationOverview messages={[]} />);
     expect(screen.getByText('暂无会话记录')).toBeInTheDocument();
   });
+
+  it('uses one compact analysis conclusion in the task detail instead of repeating bubbles', () => {
+    render(<ConversationOverview appearance="summary" messages={messages.slice(0, 3)} />);
+
+    expect(screen.getByRole('heading', { name: '视频分析完成' })).toBeInTheDocument();
+    expect(screen.getByText('可生成')).toBeInTheDocument();
+    expect(screen.queryByText('等待上传')).not.toBeInTheDocument();
+  });
 });

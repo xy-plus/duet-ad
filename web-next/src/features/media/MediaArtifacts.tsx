@@ -23,6 +23,7 @@ export interface VideoArtifactProps {
   loading?: boolean;
   error?: string;
   onMediaError?: () => void;
+  compact?: boolean;
 }
 
 interface VideoArtifactCardProps extends VideoArtifactProps {
@@ -38,11 +39,16 @@ function VideoArtifactCard({
   onMediaError,
   fallbackTitle,
   emptyDescription,
+  compact = false,
 }: VideoArtifactCardProps) {
   const resolvedTitle = title ?? fallbackTitle;
 
   return (
-    <Card title={resolvedTitle}>
+    <Card
+      className={compact ? 'media-artifact-card media-artifact-card--compact' : 'media-artifact-card'}
+      size={compact ? 'small' : 'medium'}
+      title={resolvedTitle}
+    >
       {loading ? (
         <div aria-label={`正在加载${resolvedTitle}`}>
           <Skeleton active paragraph={{ rows: 4 }} />
@@ -97,6 +103,7 @@ export interface ArtifactSummaryProps {
   duration?: string | number;
   keyframeCount?: number;
   dialogue?: readonly DialogueArtifact[];
+  dialogueCount?: number;
   loading?: boolean;
   error?: string;
 }
@@ -113,6 +120,7 @@ export function ArtifactSummary({
   duration,
   keyframeCount,
   dialogue,
+  dialogueCount,
   loading = false,
   error,
 }: ArtifactSummaryProps) {
@@ -135,8 +143,8 @@ export function ArtifactSummary({
     keyframeCount !== undefined
       ? { key: 'keyframes', label: '关键帧', children: `${keyframeCount} 帧` }
       : undefined,
-    dialogue !== undefined
-      ? { key: 'dialogue', label: '台词', children: `${dialogue.length} 段` }
+    dialogueCount !== undefined || dialogue !== undefined
+      ? { key: 'dialogue', label: '台词', children: `${dialogueCount ?? dialogue?.length ?? 0} 段` }
       : undefined,
   ].filter((item): item is NonNullable<typeof item> => item !== undefined);
 
@@ -145,21 +153,33 @@ export function ArtifactSummary({
   }
 
   return (
-    <Card title="分析产物摘要">
-      <Descriptions column={{ xs: 1, sm: 3 }} items={metrics} />
-      {dialogue && dialogue.length > 0 ? (
-        <Space orientation="vertical" className="media-artifact-list" aria-label="识别台词">
-          {dialogue.map((item) => (
-            <Space orientation="vertical" size="small" key={item.id}>
-              {dialogueTime(item) ? (
-                <Typography.Text type="secondary">{dialogueTime(item)}</Typography.Text>
-              ) : null}
-              <Typography.Text>{item.text}</Typography.Text>
-            </Space>
-          ))}
-        </Space>
-      ) : null}
-    </Card>
+    <section className="media-artifact-summary" aria-label="分析产物摘要">
+      <Typography.Text strong>分析产物摘要</Typography.Text>
+      <Descriptions bordered column={{ xs: 1, sm: 3 }} items={metrics} size="small" />
+      {dialogue && dialogue.length > 0 ? <DialogueArtifactList dialogue={dialogue} /> : null}
+    </section>
+  );
+}
+
+export function DialogueArtifactList({ dialogue }: { dialogue: readonly DialogueArtifact[] }) {
+  if (dialogue.length === 0) return null;
+  return (
+    <section className="media-dialogue" aria-label="识别台词">
+      <div className="media-dialogue__heading">
+        <Typography.Title level={5}>识别台词</Typography.Title>
+        <Tag variant="filled">{dialogue.length} 段</Tag>
+      </div>
+      <Space orientation="vertical" className="media-artifact-list">
+        {dialogue.map((item) => (
+          <Space orientation="vertical" size="small" key={item.id}>
+            {dialogueTime(item) ? (
+              <Typography.Text type="secondary">{dialogueTime(item)}</Typography.Text>
+            ) : null}
+            <Typography.Text>{item.text}</Typography.Text>
+          </Space>
+        ))}
+      </Space>
+    </section>
   );
 }
 

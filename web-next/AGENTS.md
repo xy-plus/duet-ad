@@ -15,6 +15,14 @@
 - 功能 CSS 只能处理页面几何、滚动、响应式断点和视频宽高比，并使用 Ant Token CSS 变量。
 - 禁止 `.ant-*` 内部选择器、原始颜色、`!important`、渐变、玻璃拟态和组件式 CSS 类。
 
+## 页面骨架与密度
+
+- 这是会话式 AI 工作台，不是后台管理页。桌面固定为 272px 会话侧栏、固定顶栏和不超过 900px 的居中内容流；页面高等于 `100dvh`，只允许内容区和会话列表滚动。
+- 分析完成态的首屏必须容纳结论、真实指标、紧凑源视频和关键帧入口。源视频桌面宽度不得超过 320px；移动端才改为单列全宽。
+- 连续阅读内容不要逐段包 Card。Card 只用于媒体、参数或独立状态边界；摘要使用 Descriptions，提示词使用 Collapse，反馈使用 Alert/Result，进度使用 Progress/ThoughtChain。
+- 提示词默认折叠；生成设置使用一块轻量参数表面；创建/更新时间属于末尾次要信息，不得单独占据大卡片。
+- 修改骨架、密度或组件表面前，先更新 `docs/human/features/antd-x-frontend/behaviors/visual-language.md` 和 `docs/agent/reference/web-next.md`，再更新对应 Playwright 截图；不得只覆盖截图掩盖无规则的漂移。
+
 ## 数据与交互
 
 - 服务端状态由 TanStack Query 管理；API 地址始终使用相对 `/api`，不得引入 CORS fallback 或写死端口。
@@ -26,4 +34,5 @@
 
 - 功能先写失败测试，再做最小实现。
 - 提交前运行 `npm run check`；真实浏览器契约与截图运行 `npm run test:e2e`。
+- 视觉验收固定覆盖 1440×1000 的首屏/生成区和 390×844 的 Drawer/正文；文档滚动、内容宽度、源视频宽度和横向溢出另有几何断言。
 - 不得通过禁用 ESLint、Stylelint、TypeScript 或截图断言来换取通过。

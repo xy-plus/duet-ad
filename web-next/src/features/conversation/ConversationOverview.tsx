@@ -24,6 +24,7 @@ export interface ConversationMessage {
 
 export interface ConversationOverviewProps {
   messages: readonly ConversationMessage[];
+  appearance?: 'thread' | 'summary';
   loading?: boolean;
   error?: string;
   emptyDescription?: ReactNode;
@@ -60,6 +61,7 @@ function MessageContent({ message }: { message: ConversationMessage }) {
 
 export function ConversationOverview({
   messages,
+  appearance = 'thread',
   loading = false,
   error,
   emptyDescription = '暂无会话记录',
@@ -78,6 +80,32 @@ export function ConversationOverview({
 
   if (messages.length === 0) {
     return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={emptyDescription} />;
+  }
+
+  if (appearance === 'summary') {
+    const message = messages[messages.length - 1];
+    const presentation = statusPresentation[message.status];
+    if (message.status === 'failed') {
+      return <Alert type="error" showIcon title={message.error ?? '处理失败'} description={message.content} />;
+    }
+    return (
+      <section className="conversation-analysis-summary" aria-label="会话分析进度">
+        <div className="conversation-analysis-summary__heading">
+          <div>
+            <Typography.Title level={3}>
+              {message.status === 'done' ? '视频分析完成' : message.status === 'processing' ? '正在分析视频' : '分析任务已排队'}
+            </Typography.Title>
+            <Typography.Paragraph type="secondary">
+              {message.status === 'done'
+                ? '已整理真实关键帧、识别台词与生成输入，可以继续调整生成策略。'
+                : message.content}
+            </Typography.Paragraph>
+          </div>
+          <Tag color={presentation.color}>{message.status === 'done' ? '可生成' : presentation.label}</Tag>
+        </div>
+        {message.status === 'processing' ? <Skeleton active paragraph={{ rows: 2 }} title={false} /> : null}
+      </section>
+    );
   }
 
   return (

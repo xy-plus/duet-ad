@@ -35,7 +35,7 @@ import {
   type GenerationAction,
   type GenerationSettingsValue,
 } from '../features/generation';
-import { ArtifactSummary, PromptEditor } from '../features/media';
+import { ArtifactSummary, DialogueArtifactList, PromptEditor } from '../features/media';
 import {
   PostprocessConfig,
   PostprocessStatus,
@@ -43,7 +43,7 @@ import {
   type PostprocessRetryAction,
   type PostprocessTask,
 } from '../features/postprocess';
-import { Alert, Button, Card, Space, Typography } from '../ui/antd';
+import { Alert, Button, Space, Typography } from '../ui/antd';
 import {
   AuthenticatedImageGrid,
   AuthenticatedSegments,
@@ -346,9 +346,7 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
       {error ? <Alert type={isApiErrorCode(mutation.error, 'postprocess_options_locked') ? 'warning' : 'error'} showIcon title={error} /> : null}
       {unknownShape ? <Alert type="error" showIcon title="服务端后处理状态无效" /> : null}
       {canConfigure ? (
-        <Card>
-          <Button onClick={() => setOpen(true)} type="primary">优化关键帧</Button>
-        </Card>
+        <Space><Button onClick={() => setOpen(true)}>优化关键帧</Button></Space>
       ) : null}
       <PostprocessConfig
         onCancel={() => setOpen(false)}
@@ -389,15 +387,26 @@ function LoadedConversationDetail({ apiClient, detail }: { apiClient: ApiClient;
 
   return (
     <main className="app-detail" aria-label="会话详情">
-      <ConversationOverview messages={conversationMessages(detail)} />
-      <ArtifactSummary
-        dialogue={dialogue}
-        duration={detail.duration_s ?? undefined}
-        keyframeCount={detail.keyframes.length}
-      />
-      {detail.has_source ? (
-        <AuthenticatedVideo apiClient={apiClient} conversationId={detail.id} fileName="source.mp4" />
-      ) : null}
+      <div className={detail.has_source ? 'app-detail-intro' : 'app-detail-intro app-detail-intro--single'}>
+        <div className="app-detail-intro__summary">
+          <ConversationOverview appearance="summary" messages={conversationMessages(detail)} />
+          <ArtifactSummary
+            dialogueCount={dialogue.length}
+            duration={detail.duration_s ?? undefined}
+            keyframeCount={detail.keyframes.length}
+          />
+        </div>
+        {detail.has_source ? (
+          <div className="app-detail-intro__media">
+            <AuthenticatedVideo
+              apiClient={apiClient}
+              compact
+              conversationId={detail.id}
+              fileName="source.mp4"
+            />
+          </div>
+        ) : null}
+      </div>
       <AuthenticatedImageGrid
         apiClient={apiClient}
         conversationId={detail.id}
@@ -407,6 +416,7 @@ function LoadedConversationDetail({ apiClient, detail }: { apiClient: ApiClient;
         }))}
         title={detail.keyframes.length > 0 ? '关键帧' : undefined}
       />
+      <DialogueArtifactList dialogue={dialogue} />
       <AuthenticatedSegments apiClient={apiClient} detail={detail} />
       {detail.status === 'done' ? (
         <>
@@ -418,12 +428,12 @@ function LoadedConversationDetail({ apiClient, detail }: { apiClient: ApiClient;
       {detail.has_video ? (
         <AuthenticatedVideo apiClient={apiClient} conversationId={detail.id} fileName="generated.mp4" />
       ) : null}
-      <Card>
-        <Space orientation="vertical">
+      <footer className="app-detail-meta">
+        <Space orientation="vertical" size="small">
           <Typography.Text type="secondary">创建时间：{detail.created_at}</Typography.Text>
           <Typography.Text type="secondary">更新时间：{detail.updated_at}</Typography.Text>
         </Space>
-      </Card>
+      </footer>
     </main>
   );
 }

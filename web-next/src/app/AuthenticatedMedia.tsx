@@ -4,10 +4,11 @@ import type { ConversationDetail, ConversationSegment } from '../domain';
 import { useAuthenticatedFileUrl } from '../state';
 import {
   Alert,
-  Card,
   Empty,
+  Flex,
   Image,
   Skeleton,
+  Tag,
   Typography,
 } from '../ui/antd';
 import {
@@ -26,18 +27,21 @@ interface AuthenticatedVideoProps {
   apiClient: ApiClient;
   conversationId: string;
   fileName: 'source.mp4' | 'generated.mp4';
+  compact?: boolean;
 }
 
 export function AuthenticatedVideo({
   apiClient,
   conversationId,
   fileName,
+  compact = false,
 }: AuthenticatedVideoProps) {
   const file = useAuthenticatedFileUrl(apiClient, conversationId, fileName);
   const props = {
     url: file.url,
     loading: file.isPending,
     error: file.error ? message(file.error, '视频加载失败') : undefined,
+    compact,
   };
   return fileName === 'source.mp4' ? <SourceVideo {...props} /> : <FinalVideo {...props} />;
 }
@@ -65,7 +69,7 @@ export function AuthenticatedImage({
       ) : file.error ? (
         <Alert type="error" showIcon title={message(file.error, `${alt}加载失败`)} />
       ) : file.url ? (
-        <Image src={file.url} alt={alt} />
+        <Image className="app-media-grid__image" src={file.url} alt={alt} />
       ) : (
         <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={`${alt}地址缺失`} />
       )}
@@ -102,7 +106,15 @@ export function AuthenticatedImageGrid({
       </div>
     </Image.PreviewGroup>
   );
-  return title ? <Card title={title}>{content}</Card> : content;
+  return title ? (
+    <section className="app-artifact-section">
+      <Flex align="center" justify="space-between" gap="small">
+        <Typography.Title level={5}>{title}</Typography.Title>
+        <Tag variant="filled">{files.length} 帧</Tag>
+      </Flex>
+      {content}
+    </section>
+  ) : content;
 }
 
 function artifactStatus(detail: ConversationDetail, segment: ConversationSegment): ArtifactStatus {

@@ -281,6 +281,7 @@ test('prompt CAS conflict sends exact PATCH, refetches, and displays the conflic
   };
   await installApi(page, controller);
   await login(page);
+  await page.getByRole('button', { name: /生成提示词/ }).click();
   await page.getByLabel('提示词草稿').fill('我的修改');
   await page.getByRole('button', { name: '确认保存' }).click();
 
@@ -499,30 +500,60 @@ test('postprocess_options_locked refetches and displays server-frozen options wi
 });
 
 test('desktop screenshot baseline', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
   const workspace = detail('desktop', {
     title: '桌面视频会话',
-    note: '稳定截图契约',
-    navigation_status: 'generation_submission_unknown',
-    fit_mode: 'none',
-    generation: {
-      status: 'submission_unknown',
-      stage: 'h3',
-      client_request_id: 'desktop-unknown',
-      error: '无法确认供应商是否已接单',
-    },
+    note: '复刻一支具有城市夜景氛围的宣传片',
+    navigation_status: 'analysis_complete',
+    duration_s: 8,
+    has_source: true,
+    keyframes: ['frame-1.png', 'frame-2.png', 'frame-3.png', 'frame-4.png'],
+    voice_lines: [
+      { start_s: 2.4, end_s: 5.8, text: '灯光点亮城市的夜晚。' },
+      { start_s: 18.2, end_s: 22.6, text: '每一次出发，都有新的故事。' },
+    ],
   });
   const controller: ApiController = { details: { desktop: workspace }, order: ['desktop'], requests: [] };
   await installApi(page, controller);
   await page.addInitScript(() => localStorage.setItem('cvs_token', 'browser-token'));
   await page.goto('/');
   await stabilize(page);
-  await expect(page.getByText('提交状态未知')).toBeVisible();
+  await expect(page.getByRole('button', { name: '确认生成' })).toBeVisible();
+  const geometry = await page.evaluate(() => {
+    const detail = document.querySelector('.app-detail');
+    const source = document.querySelector('.app-detail-intro__media');
+    const content = document.querySelector('.workspace-shell__content');
+    if (!(detail instanceof HTMLElement) || !(source instanceof HTMLElement) || !(content instanceof HTMLElement)) {
+      return null;
+    }
+    return {
+      bodyScrollHeight: document.documentElement.scrollHeight,
+      contentClientHeight: content.clientHeight,
+      contentScrollHeight: content.scrollHeight,
+      detailWidth: detail.getBoundingClientRect().width,
+      sourceWidth: source.getBoundingClientRect().width,
+      viewportHeight: window.innerHeight,
+    };
+  });
+  expect(geometry).not.toBeNull();
+  expect(geometry?.bodyScrollHeight).toBeLessThanOrEqual(geometry?.viewportHeight ?? 0);
+  expect(geometry?.contentScrollHeight).toBeGreaterThan(geometry?.contentClientHeight ?? Number.MAX_SAFE_INTEGER);
+  expect(geometry?.detailWidth).toBeLessThanOrEqual(920);
+  expect(geometry?.sourceWidth).toBeLessThanOrEqual(320);
   await expect(page).toHaveScreenshot('desktop-workspace.png', { animations: 'disabled', fullPage: true });
+  await page.getByText('生成状态', { exact: true }).scrollIntoViewIfNeeded();
+  await expect(page).toHaveScreenshot('desktop-generation.png', { animations: 'disabled', fullPage: true });
 });
 
-test('mobile Drawer and screenshot baseline', async ({ page }) => {
+test('mobile Drawer and detail screenshot baselines', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  const workspace = detail('mobile', { title: '移动端会话', note: 'Drawer 契约' });
+  const workspace = detail('mobile', {
+    title: '移动端会话',
+    note: 'Drawer 与正文契约',
+    has_source: true,
+    keyframes: ['mobile-1.png', 'mobile-2.png'],
+    voice_lines: [{ start_s: 1.2, end_s: 3.8, text: '移动端也保持相同的信息层级。' }],
+  });
   const controller: ApiController = { details: { mobile: workspace }, order: ['mobile'], requests: [] };
   await installApi(page, controller);
   await page.addInitScript(() => localStorage.setItem('cvs_token', 'browser-token'));
@@ -532,4 +563,12 @@ test('mobile Drawer and screenshot baseline', async ({ page }) => {
   await expect(page.getByRole('dialog', { name: '会话导航' })).toBeVisible();
   await expect(page.getByText('移动端会话').first()).toBeVisible();
   await expect(page).toHaveScreenshot('mobile-drawer.png', { animations: 'disabled', fullPage: true });
+  await page.getByRole('button', { name: 'Close' }).click();
+  await expect(page.getByRole('dialog', { name: '会话导航' })).toHaveCount(0);
+  const width = await page.evaluate(() => ({
+    client: document.documentElement.clientWidth,
+    scroll: document.documentElement.scrollWidth,
+  }));
+  expect(width.scroll).toBeLessThanOrEqual(width.client);
+  await expect(page).toHaveScreenshot('mobile-detail.png', { animations: 'disabled', fullPage: true });
 });

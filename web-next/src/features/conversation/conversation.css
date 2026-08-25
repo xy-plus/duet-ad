@@ -7,3 +7,15 @@
   overflow-y: auto;
   padding-inline: var(--ant-padding-xs);
 }
+
+.conversation-analysis-summary__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--ant-margin-md);
+}
+
+.conversation-analysis-summary__heading h3,
+.conversation-analysis-summary__heading p {
+  margin-block-end: var(--ant-margin-xs);
+}

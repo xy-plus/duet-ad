@@ -76,7 +76,7 @@ export function GenerationSettings({
 }: GenerationSettingsProps) {
   if (generation) {
     return (
-      <Card title="已冻结生成参数">
+      <Card className="generation-settings-surface" title="已冻结生成参数" variant="borderless">
         <Descriptions
           bordered
           column={{ xs: 1, sm: 2 }}
@@ -100,7 +100,7 @@ export function GenerationSettings({
   const dialogueEditable = current.dialogueMode === 'edit' || current.dialogueMode === 'custom';
 
   return (
-    <Card title="生成设置">
+    <Card className="generation-settings-surface" title="生成设置" variant="borderless">
       <Form layout="vertical" disabled={disabled}>
         <div className="generation-settings-grid">
           <Form.Item label="台词模式" className="generation-settings-wide">

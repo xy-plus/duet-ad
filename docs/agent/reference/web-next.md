@@ -1,7 +1,7 @@
 ---
 name: web-next
 type: reference
-status: done
+status: building
 owner: agent
 updated: 2026-08-25
 tdd: N/A
@@ -98,6 +98,21 @@ Query key 形状：
 - `AppThemeProvider` 顺序为 `QueryClientProvider → XProvider(theme=appTheme, locale=zhCN) → AntApp`；禁止另建 ConfigProvider/XProvider。
 - `cssVar.key=duet-next`、`hashed=false`；颜色、字体、圆角、阴影和控件尺寸集中在 `appTheme`。
 - AntD reset 只由组件门面载入。
+- Ant Design X `Conversations` 的 creation 背景、边框和 hover 色也在同一个 theme 中声明；不得靠 `.ant-conversations-*` selector 修补。
+
+## 页面视觉骨架
+
+3213 的视觉基线是会话式 AI 工作台，不是通用后台卡片页：
+
+- `.workspace-shell` 固定为 `100dvh`；Sider、Header 固定在壳内，只有 `.workspace-shell__content` 与会话列表可以滚动。
+- 桌面 Sider 固定 272px；任务内容流上限 900px，居中显示。移动端经 Drawer 显示会话列表，正文单列。
+- 分析完成态首屏为“结论/指标 + 右侧紧凑源视频”，后续依次为关键帧、台词、分段、提示词、生成、后处理、最终成片和次要时间。
+- Card 只用于需要封闭操作边界或独立状态的区域；连续阅读区优先使用 Typography、Descriptions、Collapse、Alert、Image.PreviewGroup、ThoughtChain 和 Space/Flex。
+- 源视频桌面紧凑展示；最终成片保持完整宽度。两者继续使用 `ui/Video` 和鉴权 Blob URL，不能改回占位媒体或裸 URL。
+- 禁止为了复刻原型恢复本地 follow-up Sender、固定指标、固定分片或任何服务端不存在的数据。
+- 提示词 Collapse 默认折叠；生成设置使用三列参数网格，移动端降为单列；创建/更新时间只作为末尾次要文本。
+
+新增或调整页面时必须同时满足：Human 视觉对照、CSS hard gates、治理反例，以及同一业务状态的 Playwright `desktop-workspace`、`desktop-generation`、`mobile-drawer`、`mobile-detail` 四张截图。桌面固定 1440×1000，移动固定 390×844。只有截图更新而没有明确规则变更，或只有规则变更而没有截图证据，都不能视为视觉变更完成。
 
 ## CSS hard gates
 

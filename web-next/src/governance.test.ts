@@ -41,6 +41,26 @@ describe('UI foundation contract', () => {
     expect(existsSync(resolve(projectRoot, 'src/ui/theme.tsx'))).toBe(true);
   });
 
+  it('locks the approved AI workspace geometry and visual regression states', () => {
+    const shellStyles = readFileSync(resolve(projectRoot, 'src/features/shell/shell.css'), 'utf8');
+    const appStyles = readFileSync(resolve(projectRoot, 'src/app/app.css'), 'utf8');
+    const promptSource = readFileSync(resolve(projectRoot, 'src/features/media/PromptEditor.tsx'), 'utf8');
+    const browserContract = readFileSync(resolve(projectRoot, 'tests/app.spec.ts'), 'utf8');
+
+    expect(shellStyles).toMatch(/\.workspace-shell\s*\{[^}]*height:\s*100dvh;[^}]*overflow:\s*hidden;/su);
+    expect(shellStyles).toContain('width: 36px;');
+    expect(appStyles).toContain('width: min(100%, 56.25rem);');
+    expect(appStyles).toContain('grid-template-columns: minmax(0, 1fr) minmax(15rem, 18rem);');
+    expect(promptSource).toContain('className="prompt-editor-surface"');
+    expect(promptSource).not.toContain('<Card');
+    expect(readFileSync(resolve(projectRoot, 'src/ui/theme.tsx'), 'utf8'))
+      .toContain('Conversations:');
+    expect(browserContract).toContain("'desktop-workspace.png'");
+    expect(browserContract).toContain("'desktop-generation.png'");
+    expect(browserContract).toContain("'mobile-drawer.png'");
+    expect(browserContract).toContain("'mobile-detail.png'");
+  });
+
   it('lets XProvider own the single Ant theme boundary', () => {
     const facade = readFileSync(resolve(projectRoot, 'src/ui/antd.ts'), 'utf8');
     const provider = readFileSync(resolve(projectRoot, 'src/ui/theme.tsx'), 'utf8');

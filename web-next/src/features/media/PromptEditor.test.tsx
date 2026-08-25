@@ -23,6 +23,8 @@ describe('PromptEditor', () => {
     await user.click(screen.getByRole('button', { name: '复制提示词' }));
     expect(onCopy).toHaveBeenCalledWith('原始提示词');
 
+    expect(screen.queryByLabelText('提示词草稿')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /生成提示词/ }));
     const editor = screen.getByLabelText('提示词草稿');
     await user.clear(editor);
     await user.type(editor, '修改后的提示词');
@@ -30,7 +32,8 @@ describe('PromptEditor', () => {
     expect(onSave).toHaveBeenCalledWith('修改后的提示词');
   });
 
-  it('locks the prompt when generation evidence exists and respects pending state', () => {
+  it('locks the prompt when generation evidence exists and respects pending state', async () => {
+    const user = userEvent.setup();
     const { rerender } = render(
       <PromptEditor
         prompt="已冻结提示词"
@@ -43,6 +46,7 @@ describe('PromptEditor', () => {
       />,
     );
 
+    await user.click(screen.getByRole('button', { name: /生成提示词/ }));
     expect(screen.getByRole('alert')).toHaveTextContent('已生成分段，提示词不可再修改');
     expect(screen.getByLabelText('提示词草稿')).toBeDisabled();
     expect(screen.getByRole('button', { name: '确认保存' })).toBeDisabled();
@@ -76,6 +80,7 @@ describe('PromptEditor', () => {
       />,
     );
 
+    await user.click(screen.getByRole('button', { name: /生成提示词/ }));
     expect(screen.getByRole('alert')).toHaveTextContent('prompt_changed');
     expect(screen.getByRole('alert')).toHaveTextContent('提示词已被其他请求修改');
     await user.click(screen.getByRole('button', { name: '重新加载最新提示词' }));

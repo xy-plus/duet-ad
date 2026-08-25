@@ -30,7 +30,7 @@ npm run test:e2e  # Chromium 真实浏览器契约和截图基线
 
 真实 API 始终使用同源相对路径 `/api`；本地 Vite 不提供后端代理，生产联调以 Caddy `:3213` 拓扑为准。`npm run preview` 只用于本地检查构建产物，不是生产服务器。
 
-开发前先读 [web-next 约束](web-next/AGENTS.md)。组件只能从 [`src/ui/antd.ts`](web-next/src/ui/antd.ts) 导入，Token 与 Provider 只在 [`src/ui/theme.tsx`](web-next/src/ui/theme.tsx) 定义；ESLint、Stylelint 和 [`governance.test.ts`](web-next/src/governance.test.ts) 是不可绕过的治理入口。
+开发前先读 [web-next 约束](web-next/AGENTS.md)和[视觉语言](docs/human/features/antd-x-frontend/behaviors/visual-language.md)。组件只能从 [`src/ui/antd.ts`](web-next/src/ui/antd.ts) 导入，Token 与 Provider 只在 [`src/ui/theme.tsx`](web-next/src/ui/theme.tsx) 定义；ESLint、Stylelint、[`governance.test.ts`](web-next/src/governance.test.ts) 与四个页面截图基线是不可绕过的治理入口。
 
 ## 生产契约摘要
 

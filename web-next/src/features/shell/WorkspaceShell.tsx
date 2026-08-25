@@ -36,7 +36,7 @@ export function WorkspaceShell({
   return (
     <Layout className="workspace-shell">
       {desktop ? (
-        <Layout.Sider className="workspace-shell__sider" theme="light" width={280}>
+        <Layout.Sider className="workspace-shell__sider" theme="light" width={272}>
           {sidebar}
         </Layout.Sider>
       ) : (
@@ -46,7 +46,7 @@ export function WorkspaceShell({
           open={navigationOpen}
           placement="left"
           title="会话导航"
-          size={280}
+          size={272}
         >
           {sidebar}
         </Drawer>

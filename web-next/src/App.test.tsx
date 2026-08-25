@@ -113,6 +113,8 @@ describe('production App integration', () => {
     await user.click(screen.getByRole('button', { name: '登录' }));
 
     expect(await screen.findByText('真实会话')).toBeInTheDocument();
+    expect((await screen.findByLabelText('会话详情')).querySelector('.app-detail-intro--single'))
+      .not.toBeNull();
     expect(await screen.findByText('提交状态未知')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /重试|继续|确认生成/ })).not.toBeInTheDocument();
     await waitFor(() => expect(requests).toEqual(expect.arrayContaining([

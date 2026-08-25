@@ -69,6 +69,17 @@ function statusTag(conversation: ConversationSummary) {
   return <Tag color={color}>{badge.text}</Tag>;
 }
 
+function conversationGroup(createdAt: string, now = new Date()): string {
+  const created = new Date(createdAt);
+  if (Number.isNaN(created.getTime())) return '更早';
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const createdDay = new Date(created.getFullYear(), created.getMonth(), created.getDate()).getTime();
+  const ageInDays = Math.floor((today - createdDay) / 86_400_000);
+  if (ageInDays <= 0) return '今天';
+  if (ageInDays < 7) return '最近 7 天';
+  return '更早';
+}
+
 function Workspace({ apiClient }: AppProps) {
   const conversations = useConversationsQuery(apiClient);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -81,10 +92,14 @@ function Workspace({ apiClient }: AppProps) {
   }, [conversations.data, creating, selectedId]);
 
   const selected = conversations.data?.find(({ id }) => id === selectedId);
+  const navigationItems = (conversations.data ?? []).map((conversation) => ({
+    ...conversation,
+    group: conversationGroup(conversation.created_at),
+  }));
   const sidebar = (
     <ConversationSidebar
       activeConversationId={creating ? undefined : selectedId ?? undefined}
-      conversations={conversations.data ?? []}
+      conversations={navigationItems}
       getNavigationStatus={statusTag}
       onConversationSelect={(id) => {
         setCreating(false);
@@ -134,6 +149,7 @@ function Workspace({ apiClient }: AppProps) {
         .filter(({ id, navigation_status: status }) => id !== selectedId && backgroundStatuses.has(status))
         .map(({ id }) => <BackgroundConversationPoller apiClient={apiClient} id={id} key={id} />)}
       <WorkspaceShell
+        headerExtra={selected ? statusTag(selected) : undefined}
         sidebar={sidebar}
         subtitle={selected?.note || undefined}
         title={creating ? '新建会话' : (selected?.title ?? 'Duet AI 视频工作台')}
