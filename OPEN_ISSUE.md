@@ -11,6 +11,7 @@
 
 ## 📌 待办与限制
 
+- 自动补交依赖 append-only attempt ledger；若带外删除最后一个已落盘 receipt，无独立高水位可识别。该磁盘状态破坏场景按要求不扩展实现。（→ `app/h3.py:_validated_attempt_ledger`）
 - `stitch` 对受控 ffmpeg 产物的探测仍在视频流 duration 缺失时回退容器时长；后续一致性清理改用 `duration_ts × time_base` 并移除该容器兜底。（→ `app/stitch.py`）
 - `probe_stream_start_time(a:0)` 在部分 Opus WebM 上仍可返回约 -7ms 的 initial padding；现行 voice/stitch 只查询 `v:0`，若未来公开音轨调用需先校正该语义。（→ `app/storage.py`）
 - `input_recovery_required` / `submission_recovery_required` 已稳定对外，但 reference、human 与 runbook 尚未专门说明含义及用户动作。（→ `docs/agent/reference/`, `docs/human/`, `.deploy/runbook.md`）
