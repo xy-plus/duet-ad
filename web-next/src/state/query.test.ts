@@ -1,14 +1,20 @@
+import { createElement, type PropsWithChildren } from 'react';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { act, renderHook } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import { QueryClient } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import {
   DETAIL_POLL_INTERVAL_MS,
   conversationDetailQueryOptions,
   detailRefetchInterval,
   queryKeys,
+  useConversationDetailQuery,
 } from './query';
 import { ObjectUrlLease } from './useAuthenticatedFileUrl';
 import { createApiRuntime } from './runtime';
-import { TOKEN_STORAGE_KEY } from '../api/client';
+import { TOKEN_STORAGE_KEY, type ApiClient } from '../api/client';
 
 function detail(id: string, status = 'done') {
   return { id, status, generation: null, postprocess: null };
@@ -57,6 +63,62 @@ describe('TanStack Query state contract', () => {
     );
     expect(generationSection).not.toContain('setInterval');
     expect(generationSection).not.toContain('getConversation(');
+  });
+
+  it('wires the production detail hook to foreground reconciliation polling', async () => {
+    vi.useFakeTimers();
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const getConversation = vi.fn(async (
+      _id: string,
+      options?: { readonly signal?: AbortSignal },
+    ) => {
+      expect(options?.signal).toBeInstanceOf(AbortSignal);
+      return detail('c1');
+    });
+    const isSubmissionReconciling = vi.fn(function isReconciling(
+      this: unknown,
+      id: string,
+    ) {
+      expect(this).toBe(api);
+      expect(id).toBe('c1');
+      return true;
+    });
+    const api = {
+      sessionKey: 'session-hook-reconciliation',
+      hasToken: true,
+      subscribeSession: () => () => undefined,
+      getSessionSnapshot: () => 'session-hook-reconciliation',
+      getConversation,
+      isSubmissionReconciling,
+    } as unknown as ApiClient;
+    const wrapper = ({ children }: PropsWithChildren) => createElement(
+      QueryClientProvider,
+      { client: queryClient },
+      children,
+    );
+    const hook = renderHook(() => useConversationDetailQuery(api, 'c1'), { wrapper });
+
+    try {
+      await vi.waitFor(() => expect(getConversation).toHaveBeenCalledTimes(1));
+      expect(queryClient.getQueryCache().find(
+        { queryKey: queryKeys.detail(api.sessionKey, 'c1') },
+      )?.getObserversCount()).toBe(1);
+
+      await act(async () => vi.advanceTimersByTimeAsync(DETAIL_POLL_INTERVAL_MS));
+      await vi.waitFor(() => expect(getConversation).toHaveBeenCalledTimes(2));
+      expect(isSubmissionReconciling).toHaveBeenCalledWith('c1');
+
+      visibility.mockReturnValue('hidden');
+      document.dispatchEvent(new Event('visibilitychange'));
+      await act(async () => vi.advanceTimersByTimeAsync(DETAIL_POLL_INTERVAL_MS * 2));
+      expect(getConversation).toHaveBeenCalledTimes(2);
+    } finally {
+      hook.unmount();
+      queryClient.clear();
+      visibility.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it('deduplicates an in-flight detail request and keeps stale sessions in old keys', async () => {
@@ -130,6 +192,3 @@ describe('TanStack Query state contract', () => {
     expect(queryClient.getQueryCache().getAll()).toHaveLength(0);
   });
 });
-import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
