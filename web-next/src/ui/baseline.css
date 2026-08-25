@@ -1,0 +1,23 @@
+:root {
+  font-synthesis: none;
+  text-rendering: optimizelegibility;
+}
+
+html,
+body,
+#root {
+  min-block-size: 100%;
+  margin: 0;
+}
+
+body {
+  color: var(--ant-color-text);
+  background: var(--ant-color-bg-layout);
+  font-family: var(--ant-font-family);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
