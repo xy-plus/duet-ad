@@ -15,6 +15,9 @@ export default {
         '/^(?:border(?:-[a-z]+){0,3}-radius|box-shadow|text-shadow|font(?:-family|-size)?)$/': [
           /^(?!var\(--ant-[\w-]+\)$).+/u,
         ],
+        '/^filter$/': [
+          /drop-shadow\s*\(/iu,
+        ],
       },
       { message: 'Token-driven properties must use an Ant Token CSS variable.' },
     ],
