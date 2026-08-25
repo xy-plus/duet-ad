@@ -5,9 +5,12 @@ import type {
   CreateConversationResponse,
   GenerationSubmitPayload,
   GenerationSubmitResponse,
+  ImageOptimizationPrompt,
+  ImageOptimizationPromptPatchPayload,
   LoginResponse,
   PostprocessPayload,
   PostprocessResponse,
+  PostprocessSegmentRetryPayload,
   PromptPatchPayload,
   PromptPatchResponse,
 } from '../domain/types';
@@ -386,6 +389,17 @@ export class ApiClient {
     });
   }
 
+  patchImageOptimizationPrompt(
+    id: string,
+    payload: ImageOptimizationPromptPatchPayload,
+    options: ApiRequestOptions = {},
+  ): Promise<ImageOptimizationPrompt> {
+    return this.requestJson(`/conversations/${encodePath(id)}/image-optimization-prompt`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload), signal: options.signal,
+    });
+  }
+
   async submitConversation(
     id: string,
     payload: GenerationSubmitPayload,
@@ -450,6 +464,18 @@ export class ApiClient {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
       signal: options.signal,
+    });
+  }
+
+  retryPostprocessSegment(
+    id: string,
+    index: number,
+    payload: PostprocessSegmentRetryPayload,
+    options: ApiRequestOptions = {},
+  ): Promise<PostprocessResponse> {
+    return this.requestJson(`/conversations/${encodePath(id)}/postprocess/segments/${index}/retry`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload), signal: options.signal,
     });
   }
 

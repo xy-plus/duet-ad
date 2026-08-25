@@ -119,6 +119,12 @@ describe('ApiClient', () => {
       expected_sha256: 'a'.repeat(64),
       prompt: 'new prompt',
     });
+    await client.patchImageOptimizationPrompt('c1', {
+      confirm: true,
+      segment_index: 2,
+      expected_sha256: 'b'.repeat(64),
+      prompt: 'image prompt',
+    });
     await client.submitConversation('c1', {
       confirm: true,
       client_request_id: 'request-1',
@@ -129,8 +135,9 @@ describe('ApiClient', () => {
     });
     await client.postprocessConversation('c1', {
       confirm: true,
-      options: { remove_subtitle: true, remove_brand: false },
+      options: { remove_subtitle: true, remove_brand: false, optimize_image: false },
     });
+    await client.retryPostprocessSegment('c1', 2, { confirm: true, expected_revision: 4 });
 
     expect(storage.getItem(TOKEN_STORAGE_KEY)).toBe('secret');
     expect(requests.map(({ url }) => url)).toEqual([
@@ -138,12 +145,14 @@ describe('ApiClient', () => {
       '/api/conversations',
       '/api/conversations/c1',
       '/api/conversations/c1/prompt',
+      '/api/conversations/c1/image-optimization-prompt',
       '/api/conversations/c1/submit',
       '/api/conversations/c1/postprocess',
+      '/api/conversations/c1/postprocess/segments/2/retry',
     ]);
     expect(new Headers(requests[1].init?.headers).get('Authorization')).toBe('Bearer secret');
     expect(requests.slice(2).map(({ init }) => init?.method ?? 'GET'))
-      .toEqual(['GET', 'PATCH', 'POST', 'POST']);
+      .toEqual(['GET', 'PATCH', 'PATCH', 'POST', 'POST', 'POST']);
   });
 
   it('uses the default fetch without binding it to globalThis', async () => {

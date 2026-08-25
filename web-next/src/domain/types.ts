@@ -36,6 +36,7 @@ export interface ConversationSegment {
   readonly keyframes?: readonly string[];
   readonly prompt?: string | null;
   readonly lines?: readonly string[];
+  readonly image_optimization_prompt?: ImageOptimizationPrompt | null;
   readonly [compatibilityField: string]: unknown;
 }
 
@@ -64,7 +65,26 @@ export interface GenerationDetail {
 export interface PostprocessOptions {
   readonly remove_subtitle: boolean;
   readonly remove_brand: boolean;
+  readonly optimize_image: boolean;
   readonly [compatibilityField: string]: unknown;
+}
+
+export interface ImageOptimizationPrompt {
+  readonly text: string;
+  readonly default_text: string;
+  readonly sha256: string;
+}
+
+export type PostprocessCapabilities = PostprocessOptions;
+
+export interface PostprocessSegment {
+  readonly index: number;
+  readonly status: string;
+  readonly stage: string | null;
+  readonly completed_frames: number;
+  readonly total_frames: number;
+  readonly revision: number;
+  readonly error: string | null;
 }
 
 export interface PostprocessDetail {
@@ -72,6 +92,7 @@ export interface PostprocessDetail {
   readonly options?: PostprocessOptions | null;
   readonly frames?: readonly string[];
   readonly error?: string | null;
+  readonly segments?: readonly PostprocessSegment[];
   readonly [compatibilityField: string]: unknown;
 }
 
@@ -116,6 +137,8 @@ export interface ConversationDetail {
   readonly submit_enabled: boolean;
   readonly postprocess: PostprocessDetail | null;
   readonly postprocess_enabled: boolean;
+  readonly postprocess_capabilities?: PostprocessCapabilities | null;
+  readonly image_optimization_prompt?: ImageOptimizationPrompt | null;
   readonly plan_receipt?: string | null;
   readonly segment_count?: number;
   readonly [compatibilityField: string]: unknown;
@@ -140,6 +163,18 @@ export interface PromptPatchResponse {
   readonly prompt: string;
   readonly sha256: string;
   readonly final_prompt: string;
+}
+
+export interface ImageOptimizationPromptPatchPayload {
+  readonly confirm: true;
+  readonly segment_index: number;
+  readonly expected_sha256: string;
+  readonly prompt: string;
+}
+
+export interface PostprocessSegmentRetryPayload {
+  readonly confirm: true;
+  readonly expected_revision: number;
 }
 
 export interface GenerationSubmitPayload {

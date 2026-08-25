@@ -28,3 +28,9 @@
 .prompt-editor-layout {
   inline-size: 100%;
 }
+
+.image-prompt-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--ant-margin-xs);
+}

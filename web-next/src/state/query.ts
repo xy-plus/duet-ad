@@ -13,7 +13,9 @@ import type {
   ConversationDetail,
   ConversationSummary,
   GenerationSubmitPayload,
+  ImageOptimizationPromptPatchPayload,
   PostprocessPayload,
+  PostprocessSegmentRetryPayload,
   PromptPatchPayload,
 } from '../domain/types';
 
@@ -204,6 +206,17 @@ export function usePatchPromptMutation(api: ApiClient, id: string) {
   });
 }
 
+export function usePatchImageOptimizationPromptMutation(api: ApiClient, id: string) {
+  const queryClient = useQueryClient();
+  const sessionKey = useApiSessionKey(api);
+  return useMutation({
+    mutationKey: [...queryKeys.detail(sessionKey, id), 'patch-image-optimization-prompt'],
+    mutationFn: (payload: ImageOptimizationPromptPatchPayload) => api.patchImageOptimizationPrompt(id, payload),
+    retry: false,
+    onSuccess: () => invalidateConversation(queryClient, sessionKey, id),
+  });
+}
+
 export function useSubmitConversationMutation(api: ApiClient, id: string) {
   const queryClient = useQueryClient();
   const sessionKey = useApiSessionKey(api);
@@ -221,6 +234,17 @@ export function usePostprocessConversationMutation(api: ApiClient, id: string) {
   return useMutation({
     mutationKey: [...queryKeys.detail(sessionKey, id), 'postprocess'],
     mutationFn: (payload: PostprocessPayload) => api.postprocessConversation(id, payload),
+    retry: false,
+    onSettled: () => invalidateConversation(queryClient, sessionKey, id),
+  });
+}
+
+export function useRetryPostprocessSegmentMutation(api: ApiClient, id: string) {
+  const queryClient = useQueryClient();
+  const sessionKey = useApiSessionKey(api);
+  return useMutation({
+    mutationKey: [...queryKeys.detail(sessionKey, id), 'postprocess-segment-retry'],
+    mutationFn: ({ index, payload }: { readonly index: number; readonly payload: PostprocessSegmentRetryPayload }) => api.retryPostprocessSegment(id, index, payload),
     retry: false,
     onSettled: () => invalidateConversation(queryClient, sessionKey, id),
   });

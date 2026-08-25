@@ -1,7 +1,8 @@
 import type { ReactNode } from 'react';
 import type { ApiClient } from '../api';
 import type { ConversationDetail, ConversationSegment } from '../domain';
-import { useAuthenticatedFileUrl } from '../state';
+import { adaptConversationDetail, adaptImageOptimizationPrompt } from '../domain';
+import { useAuthenticatedFileUrl, usePatchImageOptimizationPromptMutation } from '../state';
 import {
   Alert,
   Card,
@@ -16,6 +17,7 @@ import {
   SourceVideo,
   type ArtifactStatus,
   type KeyframeArtifact,
+  ImageOptimizationPanel,
 } from '../features/media';
 
 function message(error: unknown, fallback: string): string {
@@ -152,6 +154,11 @@ function AuthenticatedSegment({ apiClient, detail, segment }: AuthenticatedSegme
     lastName ? `${prefix}/${lastName}` : null,
   );
   const generation = detail.generation?.segments?.find(({ index }) => index === segment.index);
+  const imageMutation = usePatchImageOptimizationPromptMutation(apiClient, detail.id);
+  const adapted = adaptConversationDetail(detail);
+  const imagePrompt = adapted.postprocessCapabilities.optimize_image ? adapted.segments
+    .find(({ index }) => index === segment.index)?.imageOptimizationPrompt ?? null
+    : null;
 
   return (
     <div className="app-detail-stack">
@@ -165,11 +172,21 @@ function AuthenticatedSegment({ apiClient, detail, segment }: AuthenticatedSegme
           endTime: typeof segment.end_s === 'number' ? `${segment.end_s} 秒` : undefined,
           firstFrame: frameArtifact(firstName, `第 ${segment.index} 段首帧`, first),
           lastFrame: frameArtifact(lastName, `第 ${segment.index} 段尾帧`, last),
-          prompt: segment.prompt ?? undefined,
-          dialogue: segment.lines,
           loading: Boolean((firstName && first.isPending) || (lastName && last.isPending)),
           error: generation?.error ?? undefined,
         }]}
+      />
+      <ImageOptimizationPanel
+        prompt={segment.prompt ?? ''}
+        dialogue={(segment.lines ?? []).join('\n')}
+        imagePrompt={imagePrompt}
+        draftId={`${detail.id}:${segment.index}`}
+        promptEditable={false}
+        onSaveImagePrompt={imagePrompt ? async ({ expected_sha256, prompt }) => {
+          const latest = adaptImageOptimizationPrompt(await imageMutation.mutateAsync({ confirm: true, segment_index: segment.index, expected_sha256, prompt }));
+          if (!latest) throw new Error('图片优化提示词响应无效');
+          return latest;
+        } : undefined}
       />
       {names.length > 2 ? (
         <AuthenticatedImageGrid

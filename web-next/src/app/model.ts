@@ -4,6 +4,7 @@ import type {
   GenerationRetryContract,
 } from '../domain/generation';
 import { generationRetryContract } from '../domain';
+import { adaptConversationDetail } from '../domain';
 import { generationShapeIsOperable } from '../domain/generation';
 import type {
   ConversationDetail,
@@ -166,6 +167,7 @@ export function postprocessOptions(detail: ConversationDetail): ApiPostprocessOp
   return {
     remove_subtitle: options.remove_subtitle,
     remove_brand: options.remove_brand,
+    optimize_image: options.optimize_image === true,
   };
 }
 
@@ -200,6 +202,7 @@ export function postprocessTask(detail: ConversationDetail): PostprocessTask | n
     totalCount: postprocessTotalFrames(detail),
     results: [],
     errorMessage: detail.postprocess?.error ?? undefined,
+    segments: adaptConversationDetail(detail).postprocessSegments,
   };
 }
 
