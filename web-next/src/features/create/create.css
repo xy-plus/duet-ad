@@ -1,0 +1,59 @@
+.create-composer {
+  width: min(100%, 840px);
+  margin-inline: auto;
+  padding: 24px;
+}
+
+.create-composer__heading {
+  margin-block-end: 20px;
+}
+
+.create-composer__title {
+  margin-block-end: 4px;
+}
+
+.create-composer__alert {
+  margin-block-end: 16px;
+}
+
+.create-composer__configuration {
+  padding: 4px 16px 0;
+}
+
+.create-composer__field {
+  margin-block-end: 16px;
+}
+
+.create-composer__file-controls {
+  width: 100%;
+}
+
+.create-composer__attachments-anchor {
+  display: none;
+}
+
+.create-composer__transcript-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.create-composer__language {
+  min-width: min(100%, 220px);
+}
+
+@media (max-width: 575px) {
+  .create-composer {
+    padding: 16px 12px;
+  }
+
+  .create-composer__configuration {
+    padding-inline: 4px;
+  }
+
+  .create-composer__transcript-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
