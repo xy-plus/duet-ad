@@ -62,6 +62,7 @@ def test_detail_shape_has_no_context_ir_contract(client, video_1s):
         "aspect_ratio", "resolution", "fit_profiles",
         "dialogue", "receipt_version", "generation", "has_source", "has_video",
         "navigation_status", "submit_enabled", "postprocess", "postprocess_enabled",
+        "postprocess_capabilities", "image_optimization_prompt",
     }
     assert body["generation"] is None
     assert body["has_source"] is True
@@ -84,7 +85,8 @@ def test_detail_shape_has_no_context_ir_contract(client, video_1s):
         ("done", "unexpected", True, "done", "generation_unknown"),
         ("done", "succeeded", False, None, "output_missing"),
         ("done", "succeeded", True, None, "completed"),
-        ("done", "succeeded", True, "running", "postprocessing"),
+        # A running postprocess without its private frozen receipt is failed closed on startup.
+        ("done", "succeeded", True, "running", "postprocess_failed"),
         ("done", "succeeded", True, "failed", "postprocess_failed"),
         ("done", "succeeded", True, "done", "completed"),
     ),

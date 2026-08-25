@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -18,6 +19,7 @@ from app import (
     downloader,
     frame_fit,
     h3,
+    image_optimization,
     long_generation,
     long_video,
     pipeline,
@@ -1557,11 +1559,25 @@ def create_app(settings: Settings) -> FastAPI:
     pipeline_sem = threading.Semaphore(settings.codex_concurrency)
     # 创建临界区：幂等查重 + queued 计数 + 建目录必须原子
     create_lock = threading.Lock()
-    submit_locks: dict[str, asyncio.Lock] = {}
-    postprocess_locks: dict[str, asyncio.Lock] = {}
+    conversation_locks: dict[str, asyncio.Lock] = {}
+    submit_locks = conversation_locks
+    postprocess_locks = conversation_locks
     # MediaKit 后处理并行提交的进程级信号量：单进程内跨会话全局并发上限
     mediakit_sem = asyncio.Semaphore(settings.mediakit_concurrency)
+    seedream_sem = asyncio.Semaphore(settings.seedream_concurrency)
     app.state.h3_resume_threads = []
+    app.state.postprocess_recovery_tasks = []
+
+    @app.on_event("startup")
+    async def resume_postprocessing() -> None:
+        for cid in postprocess.recover_running(settings):
+            task = asyncio.create_task(
+                postprocess.run_task(
+                    settings, cid, mediakit_sem, seedream_sem
+                ),
+                name=f"postprocess-recover-{cid[:8]}",
+            )
+            app.state.postprocess_recovery_tasks.append(task)
 
     @app.on_event("startup")
     async def resume_h3_generations() -> None:
@@ -1769,6 +1785,18 @@ def create_app(settings: Settings) -> FastAPI:
         except _SubmitError:
             aspect_ratio = resolution = fit_profiles = None
             effective_fit_required = None
+        optimization_prompts = image_optimization.public_prompts(meta, settings)
+        public_segments = []
+        for raw_segment in meta.get("segments", []):
+            segment = dict(raw_segment) if isinstance(raw_segment, dict) else raw_segment
+            if isinstance(segment, dict) and segment.get("index") in optimization_prompts:
+                segment["image_optimization_prompt"] = optimization_prompts[segment["index"]]
+            public_segments.append(segment)
+        capabilities = {
+            "remove_subtitle": bool(settings.enable_mediakit_erase),
+            "remove_brand": bool(settings.enable_mediakit_erase),
+            "optimize_image": bool(os.environ.get("ARK_API_KEY", "").strip()),
+        }
         result = {
             "id": meta["id"],
             "title": meta["title"],
@@ -1782,7 +1810,7 @@ def create_app(settings: Settings) -> FastAPI:
             "prompt": meta.get("prompt"),
             "source_prompt": source_prompt,
             "source_prompt_sha256": source_prompt_sha256,
-            "segments": meta.get("segments", []),
+            "segments": public_segments,
             "voice_lines": meta.get("voice_lines", []),
             "read_only": _is_read_only(meta),
             "duration_s": meta.get("duration_s"),
@@ -1797,14 +1825,56 @@ def create_app(settings: Settings) -> FastAPI:
             "has_source": any(cdir.glob("source.*")),
             "has_video": has_video,
             "submit_enabled": settings.enable_h3_submit,
-            "postprocess": meta.get("postprocess"),
-            "postprocess_enabled": settings.enable_mediakit_erase,
+            "postprocess": postprocess.public_state(meta.get("postprocess")),
+            "postprocess_capabilities": capabilities,
+            "postprocess_enabled": any(capabilities.values()),
         }
+        if not _is_long_video(meta):
+            result["image_optimization_prompt"] = optimization_prompts.get(0)
         if _is_long_video(meta):
             result["plan_receipt"] = long_generation.plan_receipt(cdir, meta)
             segments = meta.get("segments")
             result["segment_count"] = len(segments) if isinstance(segments, list) else 0
         return result
+
+    @app.patch(
+        "/api/conversations/{cid}/image-optimization-prompt",
+        dependencies=[Depends(require_auth)],
+    )
+    async def edit_image_optimization_prompt(cid: str, payload: dict):
+        required = {"confirm", "segment_index", "expected_sha256", "prompt"}
+        if set(payload) != required:
+            raise HTTPException(status_code=422, detail="invalid_image_optimization_prompt_request")
+        if payload.get("confirm") is not True:
+            raise HTTPException(status_code=409, detail="confirmation required")
+        segment_index = payload.get("segment_index")
+        expected = payload.get("expected_sha256")
+        prompt = payload.get("prompt")
+        if (
+            isinstance(segment_index, bool) or not isinstance(segment_index, int)
+            or not isinstance(expected, str) or not isinstance(prompt, str)
+        ):
+            raise HTTPException(status_code=422, detail="invalid_image_optimization_prompt_request")
+        lock = postprocess_locks.setdefault(cid, asyncio.Lock())
+        async with lock:
+            result: dict[str, str] = {}
+
+            def mutate(meta: dict) -> None:
+                frozen = image_optimization.replace(
+                    meta, settings, segment_index, expected, prompt
+                )
+                meta["_image_optimization"] = frozen
+                result.update(
+                    image_optimization.public_prompts(meta, settings)[segment_index]
+                )
+
+            try:
+                updated = storage.mutate_meta(settings.data_dir, cid, mutate)
+            except image_optimization.ImageOptimizationError as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+            if updated is None:
+                raise HTTPException(status_code=404, detail="not found")
+            return result
 
     @app.patch(
         "/api/conversations/{cid}/prompt",
@@ -2330,7 +2400,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def postprocess_conversation(
         cid: str, payload: dict, background_tasks: BackgroundTasks
     ):
-        if not settings.enable_mediakit_erase:
+        if not settings.enable_mediakit_erase and not os.environ.get("ARK_API_KEY", "").strip():
             raise HTTPException(status_code=501, detail="MediaKit erase is disabled.")
         meta = storage.load_meta(settings.data_dir, cid)
         if meta is None:
@@ -2338,13 +2408,31 @@ def create_app(settings: Settings) -> FastAPI:
         if _is_read_only(meta):
             raise HTTPException(status_code=409, detail="read_only")
         try:
-            options = await postprocess.start(settings, cid, payload, postprocess_locks)
+            await postprocess.start(settings, cid, payload, postprocess_locks)
         except postprocess.PostprocessError as e:
             raise HTTPException(status_code=e.status, detail=e.detail) from e
         background_tasks.add_task(
-            postprocess.run_task, settings, cid, options, mediakit_sem
+            postprocess.run_task, settings, cid, mediakit_sem, seedream_sem
         )
         return {"status": "running", "frames": []}
+
+    @app.post(
+        "/api/conversations/{cid}/postprocess/segments/{index}/retry",
+        dependencies=[Depends(require_auth)],
+    )
+    async def retry_postprocess_segment(
+        cid: str, index: int, payload: dict, background_tasks: BackgroundTasks
+    ):
+        try:
+            await postprocess.retry_segment(
+                settings, cid, index, payload, postprocess_locks
+            )
+        except postprocess.PostprocessError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        background_tasks.add_task(
+            postprocess.run_task, settings, cid, mediakit_sem, seedream_sem, {index}
+        )
+        return {"status": "running", "segment_index": index}
 
     web = Path(__file__).resolve().parent.parent / "web"
     if web.is_dir():
