@@ -381,7 +381,7 @@ def test_long_segment_dialogue_reuses_the_three_way_prompt_workspace():
     assert "promptWorkspace(detail, seg)" in branch
 
     generic = source.split("function createDisclosure", 1)[1]
-    generic = generic.split("function segmentDisclosure", 1)[0]
+    generic = generic.split("function dialogueText", 1)[0]
     assert 'button.type = "button"' in generic
     assert 'button.setAttribute("aria-controls", panel.id)' in generic
     assert "setDisclosureState(button, panel, initialExpanded, labels)" in generic

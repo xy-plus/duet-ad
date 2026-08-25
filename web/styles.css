@@ -682,8 +682,6 @@ input, textarea { font-family: inherit; }
 
 .segment-prompt-toggle:hover { background: rgba(0, 113, 227, .08); }
 .segment-prompt-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.segment-prompt-panel { margin-top: 8px; }
-
 .prompt-workspace-tabs {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

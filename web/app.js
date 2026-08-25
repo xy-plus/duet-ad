@@ -95,7 +95,7 @@ function createImagePromptDraft(conversationId, segmentIndex, prompt) {
   const value = prompt || {};
   return {
     conversationId,
-    segmentIndex: Number.isInteger(segmentIndex) ? segmentIndex : null,
+    segmentIndex: Number.isInteger(segmentIndex) && segmentIndex >= 0 ? segmentIndex : 0,
     text: String(value.text || ""),
     savedText: String(value.text || ""),
     defaultText: String(value.default_text || ""),
@@ -126,14 +126,14 @@ function mergeImagePromptDraft(draft, prompt) {
 function buildImagePromptPatch(draft) {
   return {
     confirm: true,
-    segment_index: Number.isInteger(draft.segmentIndex) ? draft.segmentIndex : null,
+    segment_index: Number.isInteger(draft.segmentIndex) && draft.segmentIndex >= 0 ? draft.segmentIndex : 0,
     expected_sha256: draft.sha256,
     prompt: draft.text,
   };
 }
 
 function promptScopeKey(conversationId, segmentIndex) {
-  return conversationId + ":" + (Number.isInteger(segmentIndex) ? segmentIndex : "single");
+  return conversationId + ":" + (Number.isInteger(segmentIndex) && segmentIndex >= 0 ? segmentIndex : 0);
 }
 
 async function saveActiveImagePrompt() {
@@ -1592,37 +1592,6 @@ function createDisclosure(labels, buildContent, options = {}) {
   return wrap;
 }
 
-function segmentDisclosure(content, labels) {
-  return createDisclosure(labels, () => content, {
-    idPrefix: "segment-disclosure",
-    wrapClass: "segment-prompt-disclosure",
-    buttonClass: "segment-prompt-toggle",
-    panelClass: "segment-prompt-panel",
-  });
-}
-
-function segmentPromptDisclosure(text, segmentIndex) {
-  return segmentDisclosure(promptCard(text), {
-    expand: "展开第 " + segmentIndex + " 段提示词",
-    collapse: "收起第 " + segmentIndex + " 段提示词",
-    expandText: "展开提示词",
-    collapseText: "收起提示词",
-  });
-}
-
-function segmentDialogueDisclosure(dialogueLines, segmentIndex) {
-  const lines = el("div", "lines-card");
-  const list = el("ul", "lines-list");
-  for (const line of dialogueLines) list.appendChild(el("li", null, line));
-  lines.appendChild(list);
-  return segmentDisclosure(lines, {
-    expand: "展开第 " + segmentIndex + " 段台词",
-    collapse: "收起第 " + segmentIndex + " 段台词",
-    expandText: "展开段台词",
-    collapseText: "收起段台词",
-  });
-}
-
 function dialogueText(lines) {
   if (Array.isArray(lines)) {
     return lines.map((line) => typeof line === "string" ? line : String(line && line.text || ""))
@@ -1638,7 +1607,7 @@ function imagePromptEditable(detail) {
 }
 
 function promptWorkspace(detail, segment = null) {
-  const segmentIndex = segment && Number.isInteger(segment.index) ? segment.index : null;
+  const segmentIndex = segment && Number.isInteger(segment.index) && segment.index >= 0 ? segment.index : 0;
   const scope = promptScopeKey(detail.id, segmentIndex);
   const isLong = Array.isArray(detail.segments) && detail.segments.length > 0;
   const generationText = String(segment ? segment.prompt || "" : detail.source_prompt || detail.prompt || "");
@@ -2334,12 +2303,16 @@ function renderPostprocessSegments(detail, pp) {
     if (segment.stage) row.appendChild(el("p", "ac-sub", "阶段：" + segment.stage));
     if (segment.error) row.appendChild(el("p", "fail-msg", segment.error));
     if (segment.status === "submission_unknown") {
-      row.appendChild(el("p", "pp-billing-warning", "提交结果未知；请勿重试，否则可能重复计费。"));
-    } else if (segment.status === "failed" && Number.isInteger(segment.revision)) {
+      row.appendChild(el("p", "pp-billing-warning", "提交结果未知；人工重试可能重复计费，请谨慎确认。"));
+    }
+    if ((segment.status === "failed" || segment.status === "submission_unknown")
+        && Number.isInteger(segment.revision)) {
       const retry = el("button", "btn btn-ghost pp-segment-retry", "重试本段");
       retry.type = "button";
       retry.addEventListener("click", async () => {
         if (!await guardDirtyPrompt()) return;
+        if (segment.status === "submission_unknown"
+            && !window.confirm("该段上次提交结果未知，重试可能重复计费。确认仍要重试本段吗？")) return;
         retry.disabled = true; // expected_revision + 立即禁用共同阻止双击
         try {
           await apiJSON(

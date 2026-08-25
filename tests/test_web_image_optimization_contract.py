@@ -49,6 +49,26 @@ def test_image_prompt_patch_is_cas_and_segment_aware():
     js = APP_JS.read_text(encoding="utf-8")
     assert '"/image-optimization-prompt"' in js
 
+    short = _run_contract(
+        "contract.buildImagePromptPatch(contract.createImagePromptDraft("
+        "'c-short',null,{text:'short',default_text:'default',sha256:'d'.repeat(64)}))"
+    )
+    assert short["segment_index"] == 0
+
+
+def test_discarded_singleton_draft_is_replaced_when_switching_segments():
+    result = _run_contract(
+        "(()=>{let draft=contract.createImagePromptDraft('c1',1,{text:'one',default_text:'base',sha256:'a'.repeat(64)});"
+        "contract.restoreImagePromptDefault(draft);draft.text=draft.savedText;draft.dirty=false;"
+        "if(draft.conversationId!=='c1'||draft.segmentIndex!==2){draft=contract.createImagePromptDraft("
+        "'c1',2,{text:'two',default_text:'base-two',sha256:'b'.repeat(64)})}"
+        "return {segmentIndex:draft.segmentIndex,text:draft.text,dirty:draft.dirty}})()"
+    )
+    assert result == {"segmentIndex": 2, "text": "two", "dirty": False}
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "draft.conversationId !== detail.id || draft.segmentIndex !== segmentIndex" in js
+    assert "state.promptDraft = draft" in js
+
 
 def test_dirty_guard_covers_navigation_generation_and_postprocess():
     js = APP_JS.read_text(encoding="utf-8")
@@ -86,6 +106,14 @@ def test_segment_progress_retry_and_unknown_warning_are_rendered():
     assert "expected_revision" in js
     assert "submission_unknown" in js
     assert "可能重复计费" in js
+    assert 'segment.status === "failed"' in js
+    assert "window.confirm" in js
+
+
+def test_removed_segment_disclosure_helpers_are_not_kept_for_tests():
+    js = APP_JS.read_text(encoding="utf-8")
+    for dead in ("function segmentDisclosure", "function segmentPromptDisclosure", "function segmentDialogueDisclosure"):
+        assert dead not in js
 
 
 def test_ui_never_discloses_backend_execution_identifiers():
