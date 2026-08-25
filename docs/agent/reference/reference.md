@@ -386,7 +386,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 
 默认长链同一 `chain_id` 严格串行，最多并发两条 chain；每段请求只使用本段冻结参考图。快速长链先预构造并 prepare 全部分段，随后最多 8 个短生命周期 worker fan-out POST，再最多 8 个 worker GET 轮询；队列可以超过 8，但不会创建无界长生命周期线程。单段确定失败只重做该段，已成功下游独立复用；任一子任务 `submission_unknown` 锁住整批且该段不再 POST，快速模式仍让已知兄弟 task 完成 GET。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 复用 source 音轨，以视频 presentation start 归零并由解码器处理 AAC/Opus priming，再按解码后的音频时间戳补前置静音或裁视频零点前音频，最后在画面终点裁剪或补静音，画面时长不变；`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
 
-分段原始输出复用与 reference 输出分开验收：reference 仍要求目标时长 ±0.5 秒；boundary 在 attempt receipt、输入和输出 hash 完整匹配后，要求不比源片段目标短超过一帧，且不比整秒请求长超过 1 秒。该容差不改变最终时长契约，stitch 仍按每个 source segment 的 24fps 帧预算精确裁剪或补齐并验证全片。
+短链 reference 输出仍要求目标时长 ±0.5 秒。长链分段无论 reference 或历史 boundary，在 attempt receipt、输入和输出 hash 完整匹配后，都按供应商整秒请求验收：不得比源片段目标短超过一帧，也不得比整秒请求长超过 1 秒。该容差不改变最终时长契约，stitch 仍按每个 source segment 的 24fps 帧预算精确裁剪或补齐并验证全片。
 
 输出下载门禁：只接受无 userinfo 的 HTTPS；hostname/IP 预解析必须全为公网地址，私网、loopback、local、reserved、multicast 均确定拒绝。owned httpx client 使用 `trust_env=false`；响应后在读取 status/body 前通过 `extensions.network_stream.get_extra_info("server_addr")` 验证实际 socket peer 也是公网地址。实际 peer 为私网仍是 `download_url_rejected`；DNS 临时失败为 `download_dns_failed`，缺失/异常/非 IP peer 为 `download_peer_unverified`，后二者同 id 恢复。
 

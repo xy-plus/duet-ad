@@ -675,6 +675,7 @@ def output_is_reusable(
     state: Mapping[str, Any] | None = None,
     *,
     expected_duration_s: float | None = None,
+    allow_provider_duration_ceiling: bool = False,
 ) -> bool:
     """Validate a local output against its exact paid attempt and frozen input."""
     if state is None:
@@ -718,7 +719,7 @@ def output_is_reusable(
         )
         if not math.isfinite(expected) or expected <= 0:
             return False
-        if request.mode == "reference":
+        if request.mode == "reference" and not allow_provider_duration_ceiling:
             if abs(duration - expected) > 0.5:
                 return False
         elif (

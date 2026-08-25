@@ -759,6 +759,7 @@ def bound_reusable_segment_indices(
             return h3.output_is_reusable(
                 request,
                 expected_duration_s=_segment_duration_s(plan, segment),
+                allow_provider_duration_ceiling=True,
             )
         except (OSError, h3.H3Error, LongGenerationError, ValueError):
             return False
@@ -1011,6 +1012,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     and not h3.output_is_reusable(
                         request,
                         expected_duration_s=_segment_duration_s(plan, segment),
+                        allow_provider_duration_ceiling=True,
                     )
                 ):
                     return "failed", "long_video_segment_output_invalid"
@@ -1086,6 +1088,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     if not h3.output_is_reusable(
                         requests[segment.index],
                         expected_duration_s=_segment_duration_s(plan, segment),
+                        allow_provider_duration_ceiling=True,
                     ):
                         prepared_status, prepared_error = (
                             "failed", "long_video_segment_output_invalid"
@@ -1132,6 +1135,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 if status[0] == "succeeded" and not h3.output_is_reusable(
                     requests[segment.index],
                     expected_duration_s=_segment_duration_s(plan, segment),
+                    allow_provider_duration_ceiling=True,
                 ):
                     return "failed", "long_video_segment_output_invalid"
                 return status
@@ -1170,6 +1174,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 if status[0] == "succeeded" and not h3.output_is_reusable(
                     request,
                     expected_duration_s=_segment_duration_s(plan, segment),
+                    allow_provider_duration_ceiling=True,
                 ):
                     return "failed", "long_video_segment_output_invalid"
                 return status
@@ -1269,6 +1274,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             if status[0] == "succeeded" and not h3.output_is_reusable(
                 request,
                 expected_duration_s=_segment_duration_s(plan, segment),
+                allow_provider_duration_ceiling=True,
             ):
                 status = ("failed", "long_video_segment_output_invalid")
             return request.client_request_id, status

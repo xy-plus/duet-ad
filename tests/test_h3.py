@@ -832,6 +832,25 @@ def test_reference_output_reuse_keeps_half_second_tolerance(tmp_path, monkeypatc
     assert h3.output_is_reusable(request, expected_duration_s=10.0) is False
 
 
+def test_reference_long_segment_accepts_integer_provider_ceiling_for_stitch(
+    tmp_path, monkeypatch,
+):
+    request = replace(_request(tmp_path), duration=2)
+    with _client(HappyProvider()) as client:
+        assert h3.start(request, client=client).status == "succeeded"
+    monkeypatch.setattr(h3, "_probe_video_duration", lambda *_args: 2.0)
+
+    assert h3.output_is_reusable(
+        request,
+        expected_duration_s=1.133333,
+        allow_provider_duration_ceiling=True,
+    ) is True
+    assert h3.output_is_reusable(
+        request,
+        expected_duration_s=1.133333,
+    ) is False
+
+
 def test_succeeded_attempt_with_missing_output_redownloads_by_get_only(tmp_path):
     request = _request(tmp_path)
     provider = HappyProvider()
