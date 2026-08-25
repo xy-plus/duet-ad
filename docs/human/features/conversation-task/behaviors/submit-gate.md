@@ -38,11 +38,11 @@ links: [conversation-task, processing-state]
   "aspect_ratio": "9:16",
   "resolution": "768p",
   "expected_plan_receipt": "64 lowercase hex characters",
-  "fast_mode": false
+  "fast_mode": true
 }
 ```
 
-长链只允许 `dialogue_mode=auto|none`，不允许 `lines/edit/custom`；`expected_plan_receipt` 必须与当前详情一致。当前页面首次提交总是显式发送布尔值 `fast_mode`；兼容历史调用时字段缺失等价于 `false`。
+长链只允许 `dialogue_mode=auto|none`，不允许 `lines/edit/custom`；`expected_plan_receipt` 必须与当前详情一致。当前页面新建长视频固定显式发送 `fast_mode=true`，确认页不显示快速模式开关或说明，结果参数摘要也不展示该模式；后端继续兼容显式 `false`，历史调用字段缺失等价于 `false`。
 
 如果旧标签页缺少 `expected_plan_receipt`，服务会提示“页面版本已更新，请刷新页面后重试”。此请求不会自动补 receipt、不会提交 H3，也不会产生付费任务；刷新页面后再确认即可。页面入口和 `app.js` 禁止缓存，确保刷新取得当前契约。
 

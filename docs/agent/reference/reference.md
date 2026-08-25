@@ -151,7 +151,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 }
 ```
 
-`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `generation.fast_mode` 是首次提交冻结的 boolean，历史 generation 缺失时公开为 `false`；恢复和重试参数比较都以冻结值为准。`aspect_ratio/resolution` 是服务端推荐值，首次提交后即为冻结值；闭集分别为 `16:9|9:16` 和 `480p|768p`。`fit_profiles` 同时公开两个画幅的 `fit_required/default_fit_mode`，浏览器改变画幅时只能据此切换适配选项。历史 meta 缺少新字段时精确投影为 `9:16 + 768p`，不会改写旧 receipt。一旦详情出现 generation，浏览器必须丢弃本地可编辑草稿，以详情中的画幅、清晰度、台词、fit 和快速模式重新同步并锁定参数控件；跨标签页提交不能继续显示另一个草稿值。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 以冻结 `meta.segments` 的完整索引集合为基数，由服务端结合持久化状态与分段 `generated.mp4` 文件实况计算：缺项计入，重复、未知或乱序状态整批不复用；快速模式成功段彼此独立，默认模式仍要求 `continue` 上游可复用；`stage=stitch` 固定为 0。该复用判定与 retry 初始化共用，前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source` 按源文件实况计算；`has_video` 与 `navigation_status` 共用当前服务端最终输出验收结果。成功页继续播放成片，并从这些服务端冻结值生成只读参数摘要。
+`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `generation.fast_mode` 是首次提交冻结的 boolean，历史 generation 缺失时公开为 `false`；恢复和重试参数比较都以冻结值为准。当前浏览器对尚未创建 generation 的长链固定初始化 `fastMode=true`，确认页不显示模式开关或说明，生成结果参数摘要也不展示该模式；一旦详情出现 generation，浏览器必须丢弃本地可编辑草稿，以详情中的画幅、清晰度、台词、fit 和快速模式重新同步并锁定参数控件，跨标签页提交不能继续显示另一个草稿值。`aspect_ratio/resolution` 是服务端推荐值，首次提交后即为冻结值；闭集分别为 `16:9|9:16` 和 `480p|768p`。`fit_profiles` 同时公开两个画幅的 `fit_required/default_fit_mode`，浏览器改变画幅时只能据此切换适配选项。历史 meta 缺少新字段时精确投影为 `9:16 + 768p`，不会改写旧 receipt。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 以冻结 `meta.segments` 的完整索引集合为基数，由服务端结合持久化状态与分段 `generated.mp4` 文件实况计算：缺项计入，重复、未知或乱序状态整批不复用；快速模式成功段彼此独立，默认模式仍要求 `continue` 上游可复用；`stage=stitch` 固定为 0。该复用判定与 retry 初始化共用，前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source` 按源文件实况计算；`has_video` 与 `navigation_status` 共用当前服务端最终输出验收结果。成功页继续播放成片，并从这些服务端冻结值生成只读参数摘要。
 
 ### `PATCH /api/conversations/{cid}/prompt`
 
@@ -197,11 +197,11 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
   "aspect_ratio": "9:16",
   "resolution": "768p",
   "expected_plan_receipt": "64 lowercase hex characters",
-  "fast_mode": false
+  "fast_mode": true
 }
 ```
 
-长视频允许上述八个键；`fast_mode` 可缺失且安全等价 `false`，出现时必须是 JSON boolean，非法类型返回 422 `invalid_fast_mode`。`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希；SHA 校验、画幅推荐/派生与 H3 请求消费同一份不可变 bytes，不会在校验后重新读取路径。默认模式的 `continue` 运行时以上游真实生成尾帧按冻结画幅适配；快速模式直接使用上一个冻结 segment 已适配的 end anchor bytes。所有段共用冻结的画幅、清晰度和 fit。历史未冻结 null 会话从安全 plan 纯派生，无法派生时付费前拒绝；已有冻结提交继续以原参数为准。
+长视频允许上述八个键；当前网页新建长视频固定发送 `fast_mode=true` 且不提供选择控件。后端契约不变：`fast_mode` 可缺失且安全等价 `false`，显式 `false` 仍受支持，出现时必须是 JSON boolean，非法类型返回 422 `invalid_fast_mode`。`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、锚点、提示词和文件哈希；SHA 校验、画幅推荐/派生与 H3 请求消费同一份不可变 bytes，不会在校验后重新读取路径。默认模式的 `continue` 运行时以上游真实生成尾帧按冻结画幅适配；快速模式直接使用上一个冻结 segment 已适配的 end anchor bytes。所有段共用冻结的画幅、清晰度和 fit。历史未冻结 null 会话从安全 plan 纯派生，无法派生时付费前拒绝；已有冻结提交继续以原参数为准。
 
 旧标签页可能仍按四键长视频契约提交，缺少 `expected_plan_receipt`。服务仅对这个精确旧请求返回结构化 `409 client_refresh_required`，提示刷新页面；不会自动采用服务端当前 receipt，也不会创建付费任务。`/`、`/index.html` 和 `/app.js` 均使用 `Cache-Control: no-store`，刷新后会取得当前提交契约。
 

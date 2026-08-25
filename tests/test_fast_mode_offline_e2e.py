@@ -169,54 +169,28 @@ def _make_frozen_long_plan(settings: Settings) -> tuple[str, str]:
 def _web_fast_mode_payload(cid: str, receipt: str) -> dict:
     script = r"""
 const contract = require(process.argv[1]);
-class FakeElement {
-  constructor(tag) {
-    this.tagName = tag.toUpperCase();
-    this.children = [];
-    this.attrs = {};
-    this.listeners = {};
-    this.checked = false;
-    this.type = "";
-    this.textContent = "";
-    this.className = "";
-    this.id = "";
-  }
-  appendChild(child) { this.children.push(child); return child; }
-  setAttribute(name, value) { this.attrs[name] = String(value); }
-  addEventListener(name, listener) { this.listeners[name] = listener; }
-  dispatchEvent(event) { this.listeners[event.type](event); }
-  querySelector(selector) {
-    const matches = (candidate) => selector === "input"
-      && candidate.tagName === "INPUT";
-    for (const child of this.children) {
-      if (matches(child)) return child;
-      const nested = child.querySelector(selector);
-      if (nested) return nested;
-    }
-    return null;
-  }
-}
-global.document = {createElement: (tag) => new FakeElement(tag)};
 const detail = {
   id: process.argv[2],
   duration_s: 11,
   segment_count: 2,
   plan_receipt: process.argv[3],
+  aspect_ratio: "9:16",
+  resolution: "768p",
+  fit_profiles: {"9:16": {fit_required: false, default_fit_mode: "none"}},
+  dialogue: {mode: "none", lines: []},
+  receipt_version: 1,
+  generation: null,
 };
-const draft = {fastMode: false};
-const field = contract.fastModeField(detail, draft);
-const checkbox = field.querySelector("input");
-checkbox.checked = true;
-checkbox.dispatchEvent({type: "change"});
+const draft = contract.generationDraft(detail);
 const payload = contract.buildSubmitPayload({
   clientRequestId: "offline-fast-parent-001",
-  dialogueMode: "none",
+  dialogueMode: draft.dialogueMode,
   fitRequired: false,
   isLong: true,
   fastMode: draft.fastMode,
   planReceipt: detail.plan_receipt,
-  aspectRatio: "9:16",
-  resolution: "768p",
+  aspectRatio: draft.aspectRatio,
+  resolution: draft.resolution,
 });
 process.stdout.write(JSON.stringify({draftFastMode: draft.fastMode, payload}));
 """
@@ -507,7 +481,7 @@ def test_fast_mode_http_to_real_stitched_video_is_fully_offline(
     assert [item["sha256"] for item in stitch_receipt["segments"]] == [
         _sha256(path) for path in segment_paths
     ]
-    assert stitch_receipt["audio"]["mode"] == "mute"
+    assert stitch_receipt["audio"]["mode"] == "keep"
     assert stitch_receipt["output"] == {
         "name": "generated.mp4",
         "sha256": _sha256(output),
@@ -522,9 +496,9 @@ def test_fast_mode_http_to_real_stitched_video_is_fully_offline(
         final_meta,
         plan_receipt,
         "none",
-        "none",
+        "auto",
         aspect_ratio="9:16",
         resolution="768p",
         prepare_fit=False,
     )
-    assert long_generation.stitched_output_is_reusable(frozen, "none")
+    assert long_generation.stitched_output_is_reusable(frozen, "auto")

@@ -181,15 +181,15 @@ def test_historical_long_generation_freezes_fast_mode_off_for_retry_and_resume()
     assert [payload["fast_mode"] for payload in payloads] == [False, False]
 
 
-def test_fast_mode_draft_is_per_conversation_and_server_frozen():
+def test_new_long_draft_defaults_fast_mode_on_and_server_frozen_values_win():
     result = _run_contract(
         "(()=>{const base={aspect_ratio:'16:9',resolution:'480p',fit_mode:'none',"
         "fit_profiles:{'16:9':{fit_required:false,default_fit_mode:'none'}},"
         "dialogue:{mode:'auto',lines:[]},receipt_version:1};"
         "const first=contract.generationDraft({...base,id:'cid-a',duration_s:30,generation:null});"
-        "first.fastMode=true;"
         "const polled=contract.generationDraft({...base,id:'cid-a',duration_s:30,generation:null});"
         "const other=contract.generationDraft({...base,id:'cid-b',duration_s:30,generation:null});"
+        "const short=contract.generationDraft({...base,id:'cid-short',duration_s:10,generation:null});"
         "const frozenOn=contract.generationDraft({...base,id:'cid-c',duration_s:30,"
         "generation:{status:'failed',fast_mode:true}});"
         "frozenOn.fastMode=false;"
@@ -197,45 +197,37 @@ def test_fast_mode_draft_is_per_conversation_and_server_frozen():
         "generation:{status:'failed',fast_mode:true}});"
         "const historical=contract.generationDraft({...base,id:'cid-d',duration_s:30,"
         "generation:{status:'succeeded'}});"
-        "return {polled:polled.fastMode,other:other.fastMode,frozen:resynced.fastMode,"
+        "return {first:first.fastMode,polled:polled.fastMode,other:other.fastMode,"
+        "short:short.fastMode,frozen:resynced.fastMode,"
         "historical:historical.fastMode}})()"
     )
     assert result == {
+        "first": True,
         "polled": True,
-        "other": False,
+        "other": True,
+        "short": False,
         "frozen": True,
         "historical": False,
     }
 
 
-def test_fast_mode_control_is_long_only_accessible_and_updates_draft():
-    result = _run_contract(
-        "(()=>{class E{constructor(tag){this.tagName=tag.toUpperCase();this.children=[];"
-        "this.attrs={};this.listeners={};this.checked=false;this.type='';this.textContent=''}"
-        "appendChild(x){this.children.push(x);return x}setAttribute(k,v){this.attrs[k]=String(v)}"
-        "addEventListener(k,f){this.listeners[k]=f}dispatchEvent(e){this.listeners[e.type](e)}"
-        "querySelector(s){const match=x=>s==='input'?x.tagName==='INPUT':"
-        "s==='label'?x.tagName==='LABEL':s==='span'?x.tagName==='SPAN':false;"
-        "for(const c of this.children){if(match(c))return c;const n=c.querySelector(s);if(n)return n}return null}}"
-        "global.document={createElement:tag=>new E(tag)};"
-        "const draft={fastMode:false};"
-        "const long=contract.fastModeField({id:'cid-a',duration_s:30},draft);"
-        "const input=long.querySelector('input');const label=long.querySelector('label');"
-        "const text=long.querySelector('span').textContent;input.checked=true;"
-        "input.dispatchEvent({type:'change'});"
-        "return {short:contract.fastModeField({id:'cid-b',duration_s:10},{fastMode:false}),"
-        "tag:input.tagName,type:input.type,text,labelTag:label.tagName,"
-        "describedBy:input.attrs['aria-describedby'],draft:draft.fastMode}})()"
-    )
-    assert result == {
-        "short": None,
-        "tag": "INPUT",
-        "type": "checkbox",
-        "text": "快速模式",
-        "labelTag": "LABEL",
-        "describedBy": "fast-mode-help-cid-a",
-        "draft": True,
-    }
+def test_fast_mode_control_and_explanation_are_absent_from_web_source():
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert "function fastModeField" not in source
+    assert "fastModeField," not in source
+    assert "fastModeField(detail" not in source
+    assert 'el("legend", null, "提交方式")' not in source
+    assert "开启后会快速提交所有分段" not in source
+
+
+def test_long_generation_parameter_summary_hides_fast_mode_label():
+    source = APP_JS.read_text(encoding="utf-8")
+    summary_source = source.split("function generationParameterSummary", 1)[1]
+    summary_source = summary_source.split("function buildSubmitPayload", 1)[0]
+
+    assert "快速模式" not in summary_source
+
 
 def test_long_submit_rejects_edit_custom_and_missing_receipt():
     result = _run_contract(

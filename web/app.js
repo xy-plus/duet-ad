@@ -251,9 +251,6 @@ function generationParameterSummary(detail) {
     ["长视频分段数", Number.isInteger(snapshot.segment_count)
       ? String(snapshot.segment_count) : "无（单段）"],
   ];
-  if (longVideoContract(detail).isLong) {
-    entries.push(["快速模式", snapshot.fast_mode ? "已开启" : "已关闭"]);
-  }
   entries.forEach(([label, value]) => {
     list.appendChild(el("dt", null, label));
     list.appendChild(el("dd", null, value || "-"));
@@ -926,7 +923,7 @@ function generationDraft(detail) {
       dialogueMode: "auto",
       editLinesText: formatDialogueLines(detail.dialogue),
       customLinesText: "",
-      fastMode: false,
+      fastMode: longVideoContract(detail).isLong,
       ...parameters,
       parameterVersion,
       receiptVersion: detail.receipt_version,
@@ -980,32 +977,6 @@ function choice(name, value, label, checked) {
   item.appendChild(input);
   item.appendChild(el("span", null, label));
   return item;
-}
-
-function fastModeField(detail, draft) {
-  if (!longVideoContract(detail).isLong) return null;
-  const field = el("fieldset", "final-field");
-  field.appendChild(el("legend", null, "提交方式"));
-  const choices = el("div", "final-choices");
-  const label = el("label", "final-choice");
-  const input = el("input");
-  const helpId = "fast-mode-help-" + detail.id;
-  input.type = "checkbox";
-  input.checked = draft.fastMode === true;
-  input.setAttribute("aria-describedby", helpId);
-  input.addEventListener("change", () => {
-    draft.fastMode = input.checked;
-  });
-  label.appendChild(input);
-  label.appendChild(el("span", null, "快速模式"));
-  choices.appendChild(label);
-  field.appendChild(choices);
-  const help = el("p", "final-help",
-    "开启后会快速提交所有分段、缩短等待；连续运动可能不如关闭时自然。"
-    + "供应商仍可能排队，不代表供应商 GPU 同时生成。");
-  help.id = helpId;
-  field.appendChild(help);
-  return field;
 }
 
 function setGenerationCardBusy(card, busy) {
@@ -1394,9 +1365,6 @@ function renderFinalSection(detail) {
     fitField.appendChild(el("p", "final-help", "必须选择一种方式后才能生成。"));
     card.appendChild(fitField);
   }
-
-  const fastField = fastModeField(detail, draft);
-  if (fastField) card.appendChild(fastField);
 
   const errorBox = el("p", "form-error generation-form-error");
   errorBox.hidden = true;
@@ -2604,7 +2572,6 @@ if (typeof module !== "undefined" && module.exports) {
     createDisclosure,
     detailSignature,
     fitProfile,
-    fastModeField,
     formatDialogueLines,
     generationDraft,
     generationAction,
