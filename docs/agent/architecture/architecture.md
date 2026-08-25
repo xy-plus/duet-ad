@@ -3,7 +3,7 @@ name: architecture
 type: architecture
 status: done
 owner: agent
-updated: 2026-08-25
+updated: 2026-08-26
 tdd: N/A
 links: [conversation-task]
 ---
@@ -27,7 +27,10 @@ flowchart LR
   H --> V[generated.mp4]
   F --> X[ffmpeg stitch]
   X --> V
-  A -. optional .-> S[MediaKit erase postprocess]
+  A -. optional .-> S[MediaKit text erase]
+  S --> I[MediaKit icon erase]
+  I --> D[Seedream image optimization]
+  D -. complete segment set .-> R
 ```
 
 ## 模块
@@ -44,7 +47,8 @@ flowchart LR
 | `app/long_generation.py` | 多图参考子任务冻结、默认最多两链调度、可选快速 fan-out、历史 boundary 恢复和拼接编排 | conversation-task |
 | `app/stitch.py` | 24fps H.264 归一化、连续边界去重帧、源音频/静音拼接 | conversation-task |
 | `app/asr.py` / `app/voice.py` / `app/vocal.py` | 本地多语种听写、ASR JSON 校验、YAMNet `spoken/sung` 分类 | conversation-task |
-| `app/postprocess.py` / `app/mediakit.py` | 可选文字/字幕与常见 Logo/图标擦除；完成后作为 H3 关键帧输入 | postprocess |
+| `app/postprocess.py` / `app/mediakit.py` / `app/seedream.py` | 分段编排可选文字、图标擦除与图片优化，持久化付费 attempt；整段完成后才发布 H3 关键帧输入 | postprocess |
+| `app/image_optimization.py` | 为短段 0 或长段 1..N 冻结共享提示词、默认模板、模型和编辑模式，并提供 SHA CAS 编辑 | postprocess |
 | `app/codex_runner.py` | 本地 codex 内层 workspace 沙箱、voice 专用外层文件系统隔离、并发和超时；不把服务凭据交给 agent | conversation-task |
 | `web/` | 同源 UI、2 秒轮询、显式台词/画幅/清晰度/适配确认、冻结参数回显和人工重试 | conversation-task |
 
@@ -105,7 +109,13 @@ flowchart LR
 
 新长链的每个 segment 都使用本段 1–9 张冻结参考图；`continue/hard_cut` 只控制调度、连续性提示词和拼接边界，不再把参考图替换成首尾帧。历史已创建的 boundary attempt 仍使用原首尾帧 receipt 恢复，绝不用新模式重发。
 
-`postprocess` 不存在表示用户跳过优化，使用原关键帧；一旦存在则提交必须等待 `done`，并逐一解析同名 `postprocessed/`。所选优化 bytes 经画幅处理后写入短链 prepared-input receipt 或长链分段 H3 input receipt；文件缺失、列表不全或生成已开始后再请求优化均拒绝。
+`postprocess` 不存在表示用户跳过优化，使用原关键帧；一旦存在则提交必须等待 `done`，并逐一解析同名 `postprocessed/`。短视频统一作为逻辑段 `0`，长视频严格使用连续正整数 `1..N`。每段按已选阶段形成屏障：本段全部帧完成 MediaKit 文字擦除后才进入图标擦除，全部完成后才进入 Seedream；段之间并行，每个阶段的帧请求由供应商级信号量限流。
+
+图片优化设置在分析完成时按项目冻结，包含 allowlist 内的模型、`light|balanced|strong` 模板和 `anchor_consistency|independent_parallel` 模式；公开 detail 只投影每段 `{text,default_text,sha256}`。`anchor_consistency` 先以本段全部清理帧生成第一张锚帧，再把其余各帧与锚帧并行编辑；`independent_parallel` 每张清理帧独立并行编辑。两种模式都保持一入一出，不使用供应商多输出映射。
+
+每个 Seedream POST 前原子持久化绑定模型、模式、提示词摘要和输入摘要的 attempt。只有完整 HTTP 429、精确 `QuotaExceeded` 且没有 `data` 时才继续，单帧硬上限 3 次；网络/超时/取消等 POST 结果不明都写为 `submission_unknown`。服务启动仅恢复能由本地产物证明安全的阶段；当前 revision 存在 submitting/unknown attempt 时将该段和整体标为失败，不自动重发。人工重试用 revision CAS 创建下一 revision，旧 attempt 不删除。
+
+只有某段全部输出完成时才以目录级原子替换发布 canonical `postprocessed/`。所选优化 bytes 经画幅处理后写入短链 prepared-input receipt 或长链分段 H3 input receipt；文件缺失、列表不全、任一段失败或生成已开始后再请求优化均拒绝。
 
 ## H3 付费状态机
 
@@ -156,9 +166,9 @@ data/<cid>/
     ├── prompt.txt
     ├── keyframes/*.png
     ├── h3_frames/<aspect>/{crop|pad}/*.png # short only, after explicit fit choice
-    ├── postprocessed/                # optional MediaKit output selected for H3
-    │   ├── *.png
-    │   └── .mediakit/                # private per-frame paid-attempt receipts/artifacts
+    ├── postprocessed/                # optional complete segment-0 output selected for H3
+    │   └── *.png
+    ├── .postprocess-private/<segment>/ # MediaKit/Seedream intermediate and paid attempts
     └── segments/<N>/
         ├── source.mp4
         ├── generated.mp4             # paid reference segment output
@@ -166,7 +176,8 @@ data/<cid>/
         └── work/
             ├── anchors/{first,last}.png
             ├── keyframes/*.png
-            ├── h3_frames/...         # fitted anchors when required
+            ├── h3_frames/...         # fitted frames when required
+            ├── postprocessed/*.png   # complete per-segment output selected for H3
             ├── visual_prompt.txt
             └── prompt.txt
 ```
@@ -175,10 +186,10 @@ data/<cid>/
 
 ## 并发、恢复与安全
 
-- 上传创建的查重/排队计数在进程锁内；pipeline 使用进程信号量；提交和后处理各有每会话 asyncio 锁。长视频提示词准备最多使用一半 Codex 并发槽，生成最多推进两条独立 chain。
+- 上传创建的查重/排队计数在进程锁内；pipeline 使用进程信号量；提交和后处理各有每会话 asyncio 锁。后处理并行调度所有逻辑段，MediaKit 与 Seedream 分别用进程级有界信号量限制帧请求；长视频提示词准备最多使用一半 Codex 并发槽，生成最多推进两条独立 chain。
 - H3 远程调用在后台线程中执行，状态先写 meta `queued`，再写 `running`。服务启动仅扫描 schema v2 且 generation 为 `queued/running` 的会话。
 - 应用必须单进程运行。内存锁和信号量不跨 worker；不要加 `--workers`。
-- 供应商凭据只在 `Settings`/H3Request 内存中；receipt、attempt、meta、API 与安全错误都不含密钥。
+- 供应商凭据只从环境进入请求内存；`ARK_API_KEY` 不属于 Settings 数据模型，receipt、attempt、meta、API 与安全错误都不含密钥。模型、模板和图片编辑模式存私有冻结 receipt，但不投影到前端。
 - 自动台词依赖宿主 `bwrap` 与 Codex 内层 sandbox 能力；任一不可用都令该准备步骤失败，不退化为仅靠提示词禁止读取视觉输入。
 - Caddy 是唯一公网监听；uvicorn 固定 `127.0.0.1:3212`。systemd 使用 0077 umask 和外部 0600 EnvironmentFile。
 

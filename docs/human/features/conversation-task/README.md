@@ -32,7 +32,7 @@ links: []
 - [x] 提交冻结版本化 receipt，随后异步执行 H3，并持续显示 `queued/running/resume_required/succeeded/failed/submission_unknown`
 - [x] 已知 task 故障只允许原参数继续同一 attempt；确定失败才用新请求 id 重试；`submission_unknown` 锁死提交并要求先核对供应商
 - [x] 旧会话可查看但不能提交、重试或后处理
-- [x] 可选 MediaKit 文字/字幕与常见 Logo/图标擦除；完成结果进入 H3 冻结输入
+- [x] 可选 MediaKit 文字/字幕、Logo/图标擦除与 Seedream 图片优化；按段有序执行、失败段可定向重试，全部完成后结果进入 H3 冻结输入
 - [x] `face_hold` 与 Seedance 生产提交/回退路径已删除
 - [x] H3 成片下载只接受预解析地址与实际连接 peer 均为公网的 HTTPS、拒绝重定向、限制 200 MiB，并经 ffprobe 视频门禁后原子落盘
 

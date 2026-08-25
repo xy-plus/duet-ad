@@ -3,7 +3,7 @@ name: web-next
 type: reference
 status: done
 owner: agent
-updated: 2026-08-25
+updated: 2026-08-26
 tdd: N/A
 links: [antd-x-frontend]
 ---
@@ -40,8 +40,10 @@ links: [antd-x-frontend]
 | `POST /api/conversations` | Bearer | multipart `file` 或 `reference_url`，另带 `note/client_request_id/voice_mode[/target_language]`；XHR 暴露进度 |
 | `GET /api/conversations/{cid}` | Bearer | 权威 detail；决定轮询、只读能力、参数、媒体、generation 与 postprocess |
 | `PATCH /api/conversations/{cid}/prompt` | Bearer | `{confirm:true,expected_sha256,prompt}`；`prompt_changed` 后只刷新 |
+| `PATCH /api/conversations/{cid}/image-optimization-prompt` | Bearer | `{confirm:true,segment_index,expected_sha256,prompt}`；短段固定 0，长段用 1..N，SHA 漂移后只刷新 |
 | `POST /api/conversations/{cid}/submit` | Bearer | 冻结 generation payload；ApiClient 同 cid 单飞 |
-| `POST /api/conversations/{cid}/postprocess` | Bearer | `{confirm:true,options:{remove_subtitle,remove_brand}}`；锁定冲突后只刷新 |
+| `POST /api/conversations/{cid}/postprocess` | Bearer | `{confirm:true,options:{remove_subtitle,remove_brand,optimize_image}}`；只提交 capabilities 允许项，锁定冲突后只刷新 |
+| `POST /api/conversations/{cid}/postprocess/segments/{index}/retry` | Bearer | `{confirm:true,expected_revision}`；只重试 failed 段，unknown 需额外确认潜在重复计费 |
 | `GET /api/conversations/{cid}/files/{name}` | Bearer | Blob 媒体；每个 path segment 编码，Object URL 由 hook 管理 |
 | `GET /api/health` | 否 | 只用于部署 smoke，不参与 App 状态 |
 
@@ -64,6 +66,10 @@ generation payload 固定包含：
 - `submission_unknown/running/succeeded` 不构建 action；长视频付费任务数未知时不允许 submit。
 
 完整 response schema、HTTP 错误和 provider 状态机见 [后端 reference](reference.md)，这里不复制。
+
+详情的 `postprocess_capabilities` 是三个入口的唯一能力真源，`postprocess_enabled` 只是 `any(capabilities)` 兼容投影。短视频从顶层读取 `image_optimization_prompt`，长视频从每个 `segments[]` 读取；前端不得显示或提交 Seedream 模型、模板与执行模式。后处理 status 的 `segments[]` 用服务端 `revision` 驱动定向重试，不能由 frame 列表反推。
+
+生成提示词、段台词、图片优化三个并排按钮绑定一个工作区。短视频生成提示词与图片优化可编辑，长视频生成提示词和台词只读；图片优化保存走 SHA CAS，“恢复默认”只替换本地草稿。所有应用内离开动作先完成保存/丢弃/取消，保存失败不离开；刷新/关闭由 `beforeunload` 保护，轮询不得覆盖 dirty 草稿。“是否优化素材？”默认高亮“否”且不持久化，选择“是”才打开三选项弹窗，其中文字/品牌默认开、图片优化默认关。
 
 ## Query 与资源所有权
 
