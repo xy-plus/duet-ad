@@ -321,11 +321,26 @@ def _public_generation(meta: dict, cdir: Path, settings: Settings) -> dict | Non
 
 def _is_long_video(meta: dict) -> bool:
     duration = meta.get("duration_s")
-    return (
+    valid_duration = (
         isinstance(duration, (int, float))
         and not isinstance(duration, bool)
         and math.isfinite(float(duration))
-        and float(duration) > long_video.SHORT_VIDEO_MAX_S
+    )
+    has_frozen_long_plan = (
+        isinstance(meta.get("long_video_plan_receipt"), str)
+        or isinstance(meta.get("segments"), list) and bool(meta["segments"])
+        or isinstance(meta.get("generation"), dict)
+        and isinstance(meta["generation"].get("segments"), list)
+    )
+    return (
+        valid_duration
+        and (
+            float(duration) > long_video.SHORT_VIDEO_MAX_S
+            or (
+                float(duration) > long_video.PREVIOUS_SHORT_VIDEO_MAX_S
+                and has_frozen_long_plan
+            )
+        )
     )
 
 
@@ -778,6 +793,7 @@ def _make_h3_request(
     elif (
         frozen.ratio not in _ASPECT_RATIOS
         or not isinstance(engine_h3, dict)
+        or engine_h3.get("workflow") not in h3.H3_REFERENCE_WORKFLOWS
         or engine_h3.get("aspect_ratio") != frozen.ratio
         or engine_h3.get("resolution") not in _RESOLUTIONS
         or engine_h3.get("provider_resolution")
@@ -800,6 +816,7 @@ def _make_h3_request(
         timeouts=_timeouts(settings),
         aspect_ratio=aspect_ratio,
         resolution=resolution,
+        workflow=engine_h3.get("workflow", h3.H3_PREVIOUS_WORKFLOW),
     )
 
 
@@ -1114,7 +1131,7 @@ def _short_validation_paths(cdir: Path, meta: dict) -> set[Path]:
 
 
 def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
-    # Historical single-output attempts above 10 seconds also reach the
+    # Historical single-output attempts above the previous 10-second limit also reach the
     # long-video validator before their strict legacy fallback. Keep those
     # root H3 receipts in the same fingerprint as modern segment receipts.
     paths = _h3_validation_paths(cdir)
@@ -1542,8 +1559,8 @@ def create_app(settings: Settings) -> FastAPI:
     create_lock = threading.Lock()
     submit_locks: dict[str, asyncio.Lock] = {}
     postprocess_locks: dict[str, asyncio.Lock] = {}
-    # Seedream 后处理并行提交的进程级信号量：单进程内跨会话全局并发上限（SEEDREAM_CONCURRENCY）
-    seedream_sem = asyncio.Semaphore(settings.seedream_concurrency)
+    # MediaKit 后处理并行提交的进程级信号量：单进程内跨会话全局并发上限
+    mediakit_sem = asyncio.Semaphore(settings.mediakit_concurrency)
     app.state.h3_resume_threads = []
 
     @app.on_event("startup")
@@ -1781,7 +1798,7 @@ def create_app(settings: Settings) -> FastAPI:
             "has_video": has_video,
             "submit_enabled": settings.enable_h3_submit,
             "postprocess": meta.get("postprocess"),
-            "postprocess_enabled": settings.enable_seedream_edit,
+            "postprocess_enabled": settings.enable_mediakit_erase,
         }
         if _is_long_video(meta):
             result["plan_receipt"] = long_generation.plan_receipt(cdir, meta)
@@ -2313,8 +2330,8 @@ def create_app(settings: Settings) -> FastAPI:
     async def postprocess_conversation(
         cid: str, payload: dict, background_tasks: BackgroundTasks
     ):
-        if not settings.enable_seedream_edit:
-            raise HTTPException(status_code=501, detail="Seedream edit is disabled.")
+        if not settings.enable_mediakit_erase:
+            raise HTTPException(status_code=501, detail="MediaKit erase is disabled.")
         meta = storage.load_meta(settings.data_dir, cid)
         if meta is None:
             raise HTTPException(status_code=404, detail="not found")
@@ -2325,7 +2342,7 @@ def create_app(settings: Settings) -> FastAPI:
         except postprocess.PostprocessError as e:
             raise HTTPException(status_code=e.status, detail=e.detail) from e
         background_tasks.add_task(
-            postprocess.run_task, settings, cid, options, seedream_sem
+            postprocess.run_task, settings, cid, options, mediakit_sem
         )
         return {"status": "running", "frames": []}
 

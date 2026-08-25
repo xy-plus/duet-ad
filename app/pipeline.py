@@ -74,7 +74,7 @@ VOICE_TIMELINE_WARNING = (
 )
 H3_DEFAULT_RATIO = "9:16"
 H3_DEFAULT_FIT_MODE = "none"
-H3_ENGINE_WORKFLOW = "minimax_h3_lightx2v_v5"
+H3_ENGINE_WORKFLOW = "minimax_h3_lightx2v_v5_15s"
 
 
 def _remove_local_path(path: Path) -> None:
@@ -834,7 +834,7 @@ def _voice_step(
 def _load_scenes(work: Path) -> list[dict]:
     """读并校验 work/scenes.json；返回 segments（空 = 单段模式）。缺失/非法 → PipelineError。
 
-    结构不变量（与 scenes.py 同口径）：每段 provider 请求不超过 10s、相邻无缝（1e-6 容差，
+    结构不变量（与 scenes.py 同口径）：每段 provider 请求不超过 14s、相邻无缝（1e-6 容差，
     隐含单调有序）、首段 0 起且覆盖 [0, duration_s]。
     """
     try:
@@ -870,7 +870,7 @@ def _load_scenes(work: Path) -> list[dict]:
             )
         except long_video.LongVideoError:
             raise PipelineError(
-                f"scenes.json segments[{i}] provider duration not in 1..10s"
+                f"scenes.json segments[{i}] provider duration not in 1..14s"
             ) from None
         if (
             frozen_duration < long_video.SEGMENT_MIN_S
@@ -878,7 +878,7 @@ def _load_scenes(work: Path) -> list[dict]:
             > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
         ):
             raise PipelineError(
-                f"scenes.json segments[{i}] provider duration not in 1..10s"
+                f"scenes.json segments[{i}] provider duration not in 1..14s"
             )
         if abs(seg["start_s"] - prev_end) > 1e-6:
             raise PipelineError(f"scenes.json segments[{i}] not contiguous with previous")
@@ -892,7 +892,7 @@ def _detect_segments(settings: Settings, cid: str, source: Path, work: Path) -> 
     """跑 app/scenes.py 检测场景并读拆段建议。
 
     检测失败或 scenes.json 非法（含拆段结构不变量违规）→ 回退空列表 = 单段模式，
-    不判失败，meta.scenes_note 留痕；segments 空（≤10s）是合法单段结果，不留痕。
+    不判失败，meta.scenes_note 留痕；segments 空（≤15s）是合法单段结果，不留痕。
     """
     try:
         _run_cmd(

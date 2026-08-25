@@ -81,11 +81,11 @@ def _make_frozen_long_plan(settings: Settings) -> tuple[str, str]:
     cid = meta["id"]
     root = settings.data_dir / cid
     source = root / "source.mp4"
-    _make_video(source, duration_s=11, color="black")
+    _make_video(source, duration_s=16, color="black")
 
     receipt_segments = []
     public_segments = []
-    bounds = ((0.0, 5.5), (5.5, 11.0))
+    bounds = ((0.0, 8.0), (8.0, 16.0))
     for index, (start_s, end_s) in enumerate(bounds, 1):
         join_mode = "hard_cut" if index == 1 else "continue"
         segdir = root / "work" / "segments" / str(index)
@@ -148,7 +148,7 @@ def _make_frozen_long_plan(settings: Settings) -> tuple[str, str]:
     receipt_path = long_video.write_plan_receipt(
         root,
         source=source,
-        duration_s=11,
+        duration_s=16,
         segments=receipt_segments,
         workflow=h3.H3_WORKFLOW,
     )
@@ -157,7 +157,7 @@ def _make_frozen_long_plan(settings: Settings) -> tuple[str, str]:
         settings.data_dir,
         cid,
         status="done",
-        duration_s=11,
+        duration_s=16,
         voice_mode="keep",
         fit_required=False,
         segments=public_segments,
@@ -171,7 +171,7 @@ def _web_fast_mode_payload(cid: str, receipt: str) -> dict:
 const contract = require(process.argv[1]);
 const detail = {
   id: process.argv[2],
-  duration_s: 11,
+  duration_s: 16,
   segment_count: 2,
   plan_receipt: process.argv[3],
   aspect_ratio: "9:16",
@@ -248,7 +248,7 @@ class _OfflineProvider:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if request.method == "POST" and path.endswith(
-            ("/minimax_h3_lightx2v_v5", "/minimax_h3_lightx2v")
+            ("/minimax_h3_lightx2v_v5_15s", "/minimax_h3_lightx2v_v5", "/minimax_h3_lightx2v")
         ):
             assert request.url.host == "autodl.art"
             assert request.headers["authorization"] == "offline-art-token"
@@ -350,7 +350,7 @@ def test_fast_mode_http_to_real_stitched_video_is_fully_offline(
     payload = _web_fast_mode_payload(cid, plan_receipt)
 
     provider_video = tmp_path / "provider-output.mp4"
-    _make_video(provider_video, duration_s=6, color="red")
+    _make_video(provider_video, duration_s=8, color="red")
     provider = _OfflineProvider(root, provider_video.read_bytes())
 
     @contextmanager
@@ -468,7 +468,7 @@ def test_fast_mode_http_to_real_stitched_video_is_fully_offline(
     assert video_stream["pix_fmt"] == "yuv420p"
     assert video_stream["avg_frame_rate"] == "24/1"
     duration_s = float(video_stream.get("duration") or probe["format"]["duration"])
-    assert duration_s == pytest.approx(11, abs=1 / 24 + 1e-6)
+    assert duration_s == pytest.approx(16, abs=1 / 24 + 1e-6)
 
     stitch_receipt = json.loads(
         (root / stitch.RECEIPT_FILENAME).read_text(encoding="utf-8")
@@ -488,7 +488,7 @@ def test_fast_mode_http_to_real_stitched_video_is_fully_offline(
         "name": "generated.mp4",
         "sha256": _sha256(output),
         "size": output.stat().st_size,
-        "duration_s": pytest.approx(11, abs=1 / 24 + 1e-6),
+        "duration_s": pytest.approx(16, abs=1 / 24 + 1e-6),
         "fps": 24,
     }
 

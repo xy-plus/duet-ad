@@ -437,7 +437,7 @@ test('postprocess submits exact options, closes to a background card, and surviv
   await installApi(page, controller);
   await login(page);
   await page.getByRole('button', { name: '优化关键帧' }).click();
-  const removeBrand = page.getByRole('checkbox', { name: '移除品牌标识' });
+  const removeBrand = page.getByRole('checkbox', { name: '移除常见 Logo/图标' });
   await removeBrand.click();
   await expect(removeBrand).not.toBeChecked();
   await page.getByRole('button', { name: '开始后处理' }).click();
@@ -494,7 +494,7 @@ test('postprocess_options_locked refetches and displays server-frozen options wi
   await page.getByRole('button', { name: '开始后处理' }).click();
   await expect(page.getByRole('alert').filter({ hasText: '服务端已锁定后处理选项' }))
     .toContainText('服务端已锁定后处理选项');
-  await expect(page.getByLabel('会话详情').getByText('移除品牌标识')).toBeVisible();
+  await expect(page.getByLabel('会话详情').getByText('移除常见 Logo/图标')).toBeVisible();
   expect(count).toBe(1);
 });
 

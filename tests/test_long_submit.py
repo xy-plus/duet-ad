@@ -59,7 +59,7 @@ def _png(path: Path, value: int, *, width: int = 90, height: int = 160) -> None:
 
 
 def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
-               segment_duration=10.000000000000004, duration=None,
+               segment_duration=14.000000000000004, duration=None,
                fit_required=False, landscape_first_indices=(),
                landscape_end_indices=(), legacy=False):
     planned = None
@@ -139,7 +139,7 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
             "visual_prompt_path": visual,
             "final_prompt_path": final,
         })
-    if legacy:
+    if legacy or duration <= long_video.SHORT_VIDEO_MAX_S:
         def artifact(path):
             path = Path(path)
             return {
@@ -174,10 +174,13 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
         receipt_path = root / long_video.PLAN_RECEIPT_FILENAME
         receipt_path.write_bytes(long_video._canonical_bytes({
             "schema": "duet.long-video-plan",
-            "version": long_video.LEGACY_PLAN_RECEIPT_VERSION,
+            "version": (
+                long_video.LEGACY_PLAN_RECEIPT_VERSION
+                if legacy else long_video.PLAN_RECEIPT_VERSION
+            ),
             "source": artifact(source),
             "video": {"duration_s": duration},
-            "workflow": h3.H3_BOUNDARY_WORKFLOW,
+            "workflow": h3.H3_BOUNDARY_WORKFLOW if legacy else h3.H3_WORKFLOW,
             "segments": bound_segments,
         }))
     else:
@@ -2776,15 +2779,19 @@ def test_long_resume_required_missing_attempt_locks_batch_without_post(tmp_path,
     assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "submission_unknown"
 
 
-def test_new_receipt_rejects_segment_whose_provider_duration_exceeds_ten(tmp_path):
+def test_new_receipt_rejects_segment_whose_provider_duration_exceeds_fourteen(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     with pytest.raises(long_video.LongVideoError, match="long_video_plan_invalid_segment"):
-        _make_long(settings, segment_duration=10.000001)
+        _make_long(
+            settings,
+            joins=("hard_cut", "continue"),
+            segment_duration=14.000001,
+        )
 
 
 def test_new_receipt_rejects_true_six_decimal_subsecond_segment(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
-    joins = ("hard_cut",) + ("continue",) * 10
+    joins = ("hard_cut",) + ("continue",) * 15
 
     with pytest.raises(
         long_video.LongVideoError,
@@ -2793,10 +2800,10 @@ def test_new_receipt_rejects_true_six_decimal_subsecond_segment(tmp_path):
         _make_long(settings, joins=joins, segment_duration=0.999999)
 
 
-def test_freeze_rejects_new_receipt_with_over_ten_provider_duration(tmp_path):
+def test_freeze_rejects_new_receipt_with_over_fourteen_provider_duration(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, _receipt = _make_long(
-        settings, segment_duration=11.0, legacy=True
+        settings, segment_duration=15.0, legacy=True
     )
     root = settings.data_dir / cid
     path = root / long_video.PLAN_RECEIPT_FILENAME
@@ -2818,7 +2825,7 @@ def test_freeze_rejects_new_receipt_with_over_ten_provider_duration(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "duration", [math.nextafter(10.0, math.inf), math.nextafter(15.0, math.inf)]
+    "duration", [math.nextafter(15.0, math.inf)]
 )
 def test_positive_float_boundary_overflow_plans_and_freezes_provider_safe_segments(
     tmp_path, duration
@@ -2836,12 +2843,12 @@ def test_positive_float_boundary_overflow_plans_and_freezes_provider_safe_segmen
 
     assert frozen.segments
     assert all(
-        long_video.provider_duration_s(item.start_s, item.end_s) <= 10
+        long_video.provider_duration_s(item.start_s, item.end_s) <= 14
         for item in frozen.segments
     )
 
 
-def test_every_new_long_generation_request_is_at_most_ten_seconds(
+def test_every_new_long_generation_request_is_at_most_fourteen_seconds(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
@@ -2877,7 +2884,7 @@ def test_every_new_long_generation_request_is_at_most_ten_seconds(
     long_generation.run(settings, cid, plan)
 
     assert requests
-    assert all(request.duration <= 10 for request in requests)
+    assert all(request.duration <= 14 for request in requests)
 
 
 def test_legacy_binary_float_duration_rebuilds_original_thirteen_second_request(

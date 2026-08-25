@@ -109,7 +109,7 @@
             <label class="sr-only" for="lang-input">翻译目标语言</label>
             <input id="lang-input" class="lang-input" type="text" placeholder="目标语言，如：日语" autocomplete="off" hidden>
           </div>
-          <p id="file-hint" class="file-hint" hidden>最长 300 秒 · 最大 500MB · MP4/MOV/WebM；10 秒以上会拆分为 provider 整秒时长不超过 10 秒的 H3 子任务</p>
+          <p id="file-hint" class="file-hint" hidden>最长 300 秒 · 最大 500MB · MP4/MOV/WebM；超过 15 秒会拆分为单次不超过 14 秒的视频生成子任务</p>
           <div class="composer-row note-row">
             <button type="button" id="attach-btn" class="icon-btn" aria-label="选择视频文件" hidden>
               <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-attach"></use></svg></span>
@@ -125,7 +125,7 @@
             <span id="up-label" class="up-label">正在上传 0%</span>
           </div>
         </form>
-        <p class="composer-hint">提交一段参考视频，AI 将抽取关键帧并准备 H3 视频生成</p>
+        <p class="composer-hint">提交一段参考视频，AI 将抽取关键帧并准备视频生成</p>
       </div>
     </div>
   </main>
@@ -141,11 +141,11 @@
     <div class="pp-opts" role="group" aria-label="后处理选项">
       <label class="pp-opt">
         <input type="checkbox" name="opt" value="remove_subtitle" checked>
-        <span>去字幕水印</span>
+        <span>移除文字/字幕</span>
       </label>
       <label class="pp-opt">
         <input type="checkbox" name="opt" value="remove_brand" checked>
-        <span>去版权物品</span>
+        <span>移除常见 Logo/图标</span>
       </label>
     </div>
     <p id="pp-error" class="form-error" role="alert" hidden></p>

@@ -1,25 +1,18 @@
-"""T5b 后处理编排：HTTP 门控矩阵、全链路（桩 edit_image）、失败处理、
-并行提交（信号量限流）、输出尺寸。"""
+"""后处理编排：HTTP 门控、MediaKit 场景映射、失败保留和并发限流。"""
 
 import asyncio
 import json
 from pathlib import Path
 
-import cv2
-import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import postprocess, seedream, storage
+from app import mediakit, postprocess, storage
 from app.main import create_app
 
 PNG = b"\x89PNG\r\n\x1a\n"
-
-REMOVE_SUBTITLE = "移除图片中的所有字幕、水印和贴纸元素，其余（尺寸、内容等）保持不变"
-REMOVE_BRAND = ("图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，"
-                "其余（尺寸、内容等）保持不变")
 
 OPTIONS_SUB = {"remove_subtitle": True, "remove_brand": False}
 OPTIONS_BRAND = {"remove_subtitle": False, "remove_brand": True}
@@ -27,7 +20,7 @@ OPTIONS_BRAND = {"remove_subtitle": False, "remove_brand": True}
 
 @pytest.fixture
 def enabled(tmp_path):
-    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
     with TestClient(create_app(settings)) as c:
         yield settings, c
 
@@ -64,18 +57,18 @@ def _make_conv(settings, status="done", segments=False):
 
 
 class FakeEdit:
-    """桩 seedream.edit_image：记录调用（含 size）并写 out；按 fail 名单抛 SeedreamError。"""
+    """桩 mediakit.erase_image：记录场景并写 out；按 fail 名单抛 MediaKitError。"""
 
     def __init__(self, fail=()):
         self.calls = []
         self.fail = list(fail)
 
-    async def __call__(self, settings, cdir, image, prompt, out, confirm, size=""):
+    async def __call__(self, settings, cdir, image, out, confirm, scenes):
         self.calls.append({
-            "image": image.name, "prompt": prompt, "out": out, "confirm": confirm, "size": size,
+            "image": image.name, "out": out, "confirm": confirm, "scenes": scenes,
         })
         if image.name in self.fail:
-            raise seedream.SeedreamError(502, "stub failure")
+            raise mediakit.MediaKitError(502, "stub failure")
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(PNG + b"edited")
         return out
@@ -109,7 +102,7 @@ def test_disabled_501(client):
     r = client.post(f"/api/conversations/{'0' * 32}/postprocess", headers=AUTH,
                     json={"options": OPTIONS_SUB, "confirm": True})
     assert r.status_code == 501
-    assert r.json() == {"detail": "Seedream edit is disabled."}
+    assert r.json() == {"detail": "MediaKit erase is disabled."}
 
 
 def test_404_when_enabled(enabled):
@@ -122,7 +115,7 @@ def test_404_when_enabled(enabled):
 def test_confirm_required_409(enabled, monkeypatch):
     settings, c = enabled
     cid = _make_conv(settings)
-    monkeypatch.setattr(postprocess.seedream, "edit_image",
+    monkeypatch.setattr(postprocess.mediakit, "erase_image",
                         lambda *a, **k: pytest.fail("edit must not be called"))
     for body in ({"options": OPTIONS_SUB, "confirm": False},
                  {"options": OPTIONS_SUB, "confirm": "true"}, {"options": OPTIONS_SUB, "confirm": 1}):
@@ -164,7 +157,7 @@ def test_known_stale_postprocess_options_require_refresh_without_side_effects(
     before = _file_snapshot(cdir)
     calls = []
     monkeypatch.setattr(
-        postprocess.seedream, "edit_image",
+        postprocess.mediakit, "erase_image",
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
 
@@ -214,7 +207,7 @@ def test_invalid_postprocess_top_level_shape_is_rejected_before_write_or_provide
     before = _file_snapshot(cdir)
     calls = []
     monkeypatch.setattr(
-        postprocess.seedream, "edit_image",
+        postprocess.mediakit, "erase_image",
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
 
@@ -233,7 +226,7 @@ def test_invalid_postprocess_top_level_shape_is_rejected_before_write_or_provide
 def test_not_done_409(enabled, monkeypatch):
     settings, c = enabled
     cid = _make_conv(settings, status="queued")
-    monkeypatch.setattr(postprocess.seedream, "edit_image",
+    monkeypatch.setattr(postprocess.mediakit, "erase_image",
                         lambda *a, **k: pytest.fail("edit must not be called"))
     r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 409
@@ -246,7 +239,7 @@ def test_already_running_409(enabled, monkeypatch):
     storage.update_meta(settings.data_dir, cid, postprocess={
         "status": "running", "options": OPTIONS_SUB, "frames": [], "error": None,
     })
-    monkeypatch.setattr(postprocess.seedream, "edit_image",
+    monkeypatch.setattr(postprocess.mediakit, "erase_image",
                         lambda *a, **k: pytest.fail("edit must not be called"))
     r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 409
@@ -259,7 +252,7 @@ def test_artifacts_gone_409(enabled, monkeypatch):
     cid = _make_conv(settings)
     (settings.data_dir / cid / "work" / "keyframes").rename(
         settings.data_dir / cid / "work" / "gone")
-    monkeypatch.setattr(postprocess.seedream, "edit_image",
+    monkeypatch.setattr(postprocess.mediakit, "erase_image",
                         lambda *a, **k: pytest.fail("edit must not be called"))
     r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 409
@@ -293,18 +286,17 @@ def test_single_segment_full_chain(enabled, monkeypatch):
     cid = _make_conv(settings)
     cdir = settings.data_dir / cid
     fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
 
     options = {"remove_subtitle": True, "remove_brand": True}
     r = _post(c, cid, options)
     assert r.status_code == 200
     assert r.json() == {"status": "running", "frames": []}  # 受理即返回，进度走 detail 轮询
 
-    # 每帧一条合并指令（分号连接），confirm 恒 True（到达顺序不定：线程池并发读尺寸）
+    # 每帧按稳定顺序执行文字擦除、图标擦除；confirm 恒 True
     assert sorted(call["image"] for call in fake.calls) == ["01.png", "02.png"]
-    expected = f"{REMOVE_SUBTITLE}；{REMOVE_BRAND}"
     for call in fake.calls:
-        assert call["prompt"] == expected
+        assert call["scenes"] == (mediakit.TEXT_SCENE, mediakit.ICON_SCENE)
         assert call["confirm"] is True
 
     # 产出：work/postprocessed/<帧名>.png（与源帧同目录层级）
@@ -331,7 +323,7 @@ def test_multi_segment_full_chain(enabled, monkeypatch):
     cid = _make_conv(settings, segments=True)
     cdir = settings.data_dir / cid
     fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
 
     r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 200
@@ -352,18 +344,17 @@ def test_multi_segment_full_chain(enabled, monkeypatch):
     ]
 
 
-# ---------- 编辑指令 ----------
+# ---------- 擦除场景 ----------
 
-def test_subtitle_instruction_is_unchanged(enabled, monkeypatch):
-    """退役人脸规避后，字幕处理仍逐帧使用原有指令。"""
+def test_subtitle_option_maps_to_text_scene(enabled, monkeypatch):
     settings, c = enabled
     cid = _make_conv(settings)
     fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
 
     r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 200
-    assert all(call["prompt"] == REMOVE_SUBTITLE for call in fake.calls)
+    assert all(call["scenes"] == (mediakit.TEXT_SCENE,) for call in fake.calls)
 
 
 # ---------- 失败处理 ----------
@@ -372,7 +363,7 @@ def test_frame_failure_marks_failed_keeps_successes(enabled, monkeypatch):
     settings, c = enabled
     cid = _make_conv(settings)
     cdir = settings.data_dir / cid
-    monkeypatch.setattr(postprocess.seedream, "edit_image", FakeEdit(fail=["02.png"]))
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", FakeEdit(fail=["02.png"]))
 
     r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 200  # 受理成功；结果走 detail
@@ -396,7 +387,7 @@ def test_rerun_skips_existing_outputs(enabled, monkeypatch):
     (cdir / "work" / "postprocessed").mkdir()
     (cdir / "work" / "postprocessed" / "01.png").write_bytes(b"kept")
     fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
 
     r = _post(c, cid, OPTIONS_SUB)
     assert r.status_code == 200
@@ -411,7 +402,7 @@ def test_rerun_skips_existing_outputs(enabled, monkeypatch):
 # ---------- 并发：每会话一把锁 ----------
 
 def test_concurrent_start_single_runner(tmp_path, monkeypatch):
-    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
     cid = _make_conv(settings)
     locks = {}
 
@@ -431,7 +422,7 @@ def test_concurrent_start_single_runner(tmp_path, monkeypatch):
 
 
 def test_options_lock_is_rechecked_inside_lock_without_writing(tmp_path, monkeypatch):
-    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
     cid = _make_conv(settings)
     cdir = settings.data_dir / cid
     before = _file_snapshot(cdir)
@@ -491,7 +482,7 @@ def test_rerun_different_options_409(enabled, monkeypatch):
     settings, c = enabled
     cid = _make_conv(settings)
     fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
 
     assert _post(c, cid, OPTIONS_SUB).status_code == 200
     other = {"remove_subtitle": True, "remove_brand": True}
@@ -517,7 +508,7 @@ def test_legacy_change_bg_in_meta_options_rerun_no_409(enabled, monkeypatch):
     cid = _make_conv(settings)
     cdir = settings.data_dir / cid
     fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
 
     # 历史会话：meta 里存有 change_bg 时代的废弃键
     legacy = {"change_bg": True, "remove_subtitle": True, "remove_brand": False}
@@ -553,7 +544,7 @@ def test_legacy_pure_change_bg_rerun_clears_artifacts_and_reedits(enabled, monke
     cid = _make_conv(settings)
     cdir = settings.data_dir / cid
     fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
 
     legacy = {"change_bg": True, "remove_subtitle": False, "remove_brand": False}
     storage.update_meta(settings.data_dir, cid, postprocess={
@@ -575,7 +566,7 @@ def test_legacy_pure_change_bg_any_new_option_no_409(enabled, monkeypatch):
     settings, c = enabled
     cid = _make_conv(settings)
     fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
     legacy = {"change_bg": True, "remove_subtitle": False, "remove_brand": False}
     storage.update_meta(settings.data_dir, cid, postprocess={
         "status": "failed", "options": legacy, "frames": [], "error": "x",
@@ -590,7 +581,7 @@ def test_legacy_pure_change_bg_multi_segment_clears_artifacts(enabled, monkeypat
     cid = _make_conv(settings, segments=True)
     cdir = settings.data_dir / cid
     fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
 
     legacy = {"change_bg": True, "remove_subtitle": False, "remove_brand": False}
     storage.update_meta(settings.data_dir, cid, postprocess={
@@ -609,96 +600,10 @@ def test_legacy_pure_change_bg_multi_segment_clears_artifacts(enabled, monkeypat
     assert len(fake.calls) == 3  # 段1两帧 + 段2一帧全量重编辑
 
 
-# ---------- 输出尺寸：_fit_size 与 run_task 透传 ----------
-
-def test_fit_size_min_pixels_floor():
-    """面积已在合法区间 [3,686,400, 4,624,220]（1920×1920 恰下限、2048×2048 区间内）不缩放。"""
-    assert postprocess._fit_size(1920, 1920) == "1920x1920"
-    assert postprocess._fit_size(2048, 2048) == "2048x2048"
-
-
-@pytest.mark.parametrize("w,h,expected", [
-    (720, 1280, "1440x2560"),   # 竖屏 9:16 帧（scale 恰 2，恰好下限）
-    (1280, 720, "2560x1440"),   # 横屏 16:9 帧
-    (1080, 1920, "1440x2560"),  # 1080p 竖屏：浮点 scale≈1.333 恰下限（ceil 版 2160×3840=8.29MP 实测 400 超上限）
-    (1920, 1080, "2560x1440"),  # 1080p 横屏
-    (640, 480, "2217x1663"),    # 非整数 scale（sqrt(12)≈3.464，round 后 3,686,871 达标）
-    (4096, 4096, "1920x1920"),  # 超大图缩到下限
-])
-def test_fit_size_scales_up_keeping_aspect_ratio(w, h, expected):
-    """输出面积落在 Ark 合法区间 [3,686,400, 4,624,220] 且保持宽高比（浮点 scale 非整数倍）。"""
-    assert postprocess._fit_size(w, h) == expected
-
-
-def _write_real_png(path, w, h):
-    """写真实可读 PNG（cv2.imwrite）：run_task 读尺寸走真实 cv2 路径。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    assert cv2.imwrite(str(path), np.zeros((h, w, 3), dtype=np.uint8))
-
-
-def test_run_task_passes_fitted_size(enabled, monkeypatch):
-    """run_task 用 cv2 读帧像素尺寸（imread shape 高x宽），等比放大后的 "WxH" 传给 edit_image；
-    线程池并发读尺寸，到达顺序不定——断言按帧名配对，不断言顺序。"""
-    settings, c = enabled
-    cid = _make_conv(settings)
-    cdir = settings.data_dir / cid
-    _write_real_png(cdir / "work" / "keyframes" / "01.png", 720, 1280)
-    _write_real_png(cdir / "work" / "keyframes" / "02.png", 1280, 720)
-    fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
-
-    assert _post(c, cid, OPTIONS_SUB).status_code == 200
-    assert {call["image"]: call["size"] for call in fake.calls} == {
-        "01.png": "1440x2560", "02.png": "2560x1440",
-    }
-
-
-def test_run_task_unreadable_frame_omits_size(enabled, monkeypatch):
-    """cv2 读不出的帧（非标准 PNG）→ size 空串 = 不传 size，不阻断编辑。"""
-    settings, c = enabled
-    cid = _make_conv(settings)  # helper 写的是魔数 PNG，cv2.imread 返回 None
-    fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
-
-    assert _post(c, cid, OPTIONS_SUB).status_code == 200
-    assert sorted(call["image"] for call in fake.calls) == ["01.png", "02.png"]
-    assert all(call["size"] == "" for call in fake.calls)
-
-
-def test_edit_one_reads_size_in_thread_pool(tmp_path, monkeypatch):
-    """imread 移出事件循环：_read_size 经 asyncio.to_thread 在线程池执行（线程 ≠ 驱动协程所在
-    线程），同步 cv2 读图不阻塞 loop、不占信号量槽；返回空串时 size 透传空串（降级不传 size）。"""
-    import threading
-    settings = make_settings(tmp_path, enable_seedream_edit=True)
-    cid = _make_conv(settings)
-    cdir = settings.data_dir / cid
-    src = cdir / "work" / "keyframes" / "01.png"
-    out = cdir / "work" / "postprocessed" / "01.png"
-    driver_tid = threading.get_ident()
-    seen = {}
-
-    def fake_read_size(path):
-        seen["tid"] = threading.get_ident()
-        seen["path"] = path
-        return ""
-
-    monkeypatch.setattr(postprocess, "_read_size", fake_read_size)
-    fake = FakeEdit()
-    monkeypatch.setattr(postprocess.seedream, "edit_image", fake)
-    sem = asyncio.Semaphore(1)
-    frames: list[str] = []
-    asyncio.run(postprocess._edit_one(
-        settings, cdir, cid, src, out, None, OPTIONS_SUB, frames, sem))
-    assert seen["path"] == src
-    assert seen["tid"] != driver_tid  # 在线程池执行，不阻塞事件循环
-    assert frames == ["01.png"]
-    assert [call["size"] for call in fake.calls] == [""]
-
-
 # ---------- 并行提交：进程级信号量限流与失败语义 ----------
 
 class SlowEdit:
-    """慢速桩：asyncio.sleep 模拟真实耗时；记录并发活跃数与峰值；按 fail 名单抛 SeedreamError。"""
+    """慢速桩：记录 MediaKit 帧级并发峰值；按 fail 名单抛错。"""
 
     def __init__(self, fail=(), delay=0.05):
         self.fail = list(fail)
@@ -707,17 +612,17 @@ class SlowEdit:
         self.active = 0
         self.max_active = 0
 
-    async def __call__(self, settings, cdir, image, prompt, out, confirm, size=""):
+    async def __call__(self, settings, cdir, image, out, confirm, scenes):
         self.active += 1
         self.max_active = max(self.max_active, self.active)
-        self.calls.append({"image": image.name, "size": size})
+        self.calls.append({"image": image.name, "scenes": scenes})
         try:
             if isinstance(self.delay, dict):
                 await asyncio.sleep(self.delay.get(image.name, 0.0))
             else:
                 await asyncio.sleep(self.delay)
             if image.name in self.fail:
-                raise seedream.SeedreamError(502, "stub failure")
+                raise mediakit.MediaKitError(502, "stub failure")
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_bytes(PNG + b"edited")
             return out
@@ -732,17 +637,17 @@ def _add_frames(settings, cid, names):
 
 def test_parallel_edits_respect_process_semaphore(tmp_path, monkeypatch):
     """5 帧、进程并发上限 2：编辑并行提交且活跃数峰值恰为 2（信号量限流）。"""
-    settings = make_settings(tmp_path, enable_seedream_edit=True, seedream_concurrency=2)
+    settings = make_settings(tmp_path, enable_mediakit_erase=True, mediakit_concurrency=2)
     cid = _make_conv(settings)
     _add_frames(settings, cid, ["03.png", "04.png", "05.png"])
     slow = SlowEdit(delay=0.05)
-    monkeypatch.setattr(postprocess.seedream, "edit_image", slow)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", slow)
 
     with TestClient(create_app(settings)) as c:
         assert _post(c, cid, OPTIONS_SUB).status_code == 200
 
     assert slow.max_active == 2
-    assert slow.max_active <= settings.seedream_concurrency
+    assert slow.max_active <= settings.mediakit_concurrency
     # 帧到达顺序不定（线程池并发读尺寸），断言按集合：每帧恰一次
     assert sorted(call["image"] for call in slow.calls) == \
         ["01.png", "02.png", "03.png", "04.png", "05.png"]
@@ -760,7 +665,7 @@ def test_parallel_frame_failure_waits_for_rest(enabled, monkeypatch):
     _add_frames(settings, cid, ["03.png"])
     # 打乱完成顺序：01 最慢、03 次之、02 最快且失败
     slow = SlowEdit(fail=["02.png"], delay={"01.png": 0.08, "02.png": 0.01, "03.png": 0.04})
-    monkeypatch.setattr(postprocess.seedream, "edit_image", slow)
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", slow)
 
     assert _post(c, cid, OPTIONS_SUB).status_code == 200
 
@@ -778,7 +683,7 @@ def test_parallel_frame_failure_waits_for_rest(enabled, monkeypatch):
 def test_run_task_cancelled_writes_failed(tmp_path, monkeypatch):
     """父任务被取消（uvicorn graceful shutdown）：CancelledError 是 BaseException，run_task 须在
     继续传播前把 meta.postprocess 写成 failed——否则永久 running、start 永久 409 拒重跑。"""
-    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
     cid = _make_conv(settings)
     storage.update_meta(settings.data_dir, cid, postprocess={
         "status": "running", "options": OPTIONS_SUB, "frames": [], "error": None,

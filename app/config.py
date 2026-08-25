@@ -14,10 +14,11 @@ class Settings:
     h3_poll_timeout_s: float = 1500.0
     h3_download_timeout_s: float = 180.0
     h3_poll_interval_s: float = 3.0
-    enable_seedream_edit: bool = False
-    seedream_model: str = "doubao-seedream-5-0-pro-260628"
-    # Seedream 后处理逐帧并行提交的进程级并发上限（asyncio 信号量，单进程内跨会话全局；≤0 钳制为 1）
-    seedream_concurrency: int = 10
+    enable_mediakit_erase: bool = False
+    mediakit_api_key: str = field(default="", repr=False)
+    # MediaKit 后处理逐帧并行提交的进程级并发上限（单进程内跨会话全局）
+    mediakit_concurrency: int = 4
+    mediakit_timeout_s: float = 180.0
     data_dir: Path = Path("data")
     codex_timeout_s: int = 1800
     codex_concurrency: int = 10
@@ -36,6 +37,19 @@ class Settings:
     enable_pipeline: bool = False
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.mediakit_concurrency, bool)
+            or not isinstance(self.mediakit_concurrency, int)
+            or self.mediakit_concurrency < 1
+        ):
+            raise ValueError("mediakit_concurrency must be a positive integer")
+        if (
+            isinstance(self.mediakit_timeout_s, bool)
+            or not isinstance(self.mediakit_timeout_s, (int, float))
+            or not math.isfinite(float(self.mediakit_timeout_s))
+            or self.mediakit_timeout_s <= 0
+        ):
+            raise ValueError("mediakit_timeout_s must be a positive finite number")
         if (
             isinstance(self.retry_count, bool)
             or not isinstance(self.retry_count, int)
@@ -64,9 +78,10 @@ def get_settings() -> Settings:
         h3_poll_timeout_s=float(os.environ.get("H3_POLL_TIMEOUT_S", "1500")),
         h3_download_timeout_s=float(os.environ.get("H3_DOWNLOAD_TIMEOUT_S", "180")),
         h3_poll_interval_s=float(os.environ.get("H3_POLL_INTERVAL_S", "3")),
-        enable_seedream_edit=os.environ.get("ENABLE_SEEDREAM_EDIT", "").lower() in ("1", "true", "yes"),
-        seedream_model=os.environ.get("SEEDREAM_MODEL", "doubao-seedream-5-0-pro-260628"),
-        seedream_concurrency=max(1, int(os.environ.get("SEEDREAM_CONCURRENCY", "10"))),
+        enable_mediakit_erase=os.environ.get("ENABLE_MEDIAKIT_ERASE", "").lower() in ("1", "true", "yes"),
+        mediakit_api_key=os.environ.get("VOLC_MEDIAKIT_API_KEY", "").strip(),
+        mediakit_concurrency=max(1, int(os.environ.get("MEDIAKIT_CONCURRENCY", "4"))),
+        mediakit_timeout_s=float(os.environ.get("MEDIAKIT_TIMEOUT_S", "180")),
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),

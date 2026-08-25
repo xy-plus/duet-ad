@@ -423,7 +423,7 @@ def test_missing_autodl_credential_is_503(tmp_path):
 
 def test_submit_rejects_long_video_without_bound_plan_before_provider(enabled):
     settings, client = enabled
-    cid, _ = _make_conv(settings, duration_s=14.0)
+    cid, _ = _make_conv(settings, duration_s=15.001)
     response = client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH,
         json={**_payload(), "expected_plan_receipt": "0" * 64},

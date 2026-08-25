@@ -19,7 +19,7 @@ flowchart LR
   U[Browser / API client] -->|h1 or h2 :3211| C[Caddy]
   C -->|127.0.0.1:3212| A[FastAPI single process]
   A --> P[Input preparation]
-  P --> Q{duration <= 10s?}
+  P --> Q{duration <= 15s?}
   Q -->|yes| R[prepared_input.json]
   Q -->|no| L[long_video_plan.json]
   R --> H[Ref2VA single task]
@@ -27,7 +27,7 @@ flowchart LR
   H --> V[generated.mp4]
   F --> X[ffmpeg stitch]
   X --> V
-  A -. optional, excluded from H3 .-> S[Seedream postprocess]
+  A -. optional .-> S[MediaKit erase postprocess]
 ```
 
 ## 模块
@@ -40,11 +40,11 @@ flowchart LR
 | `app/prepared_input.py` | 结构化台词、唯一发声块、文件哈希绑定、fail-closed loader | conversation-task |
 | `app/frame_fit.py` | 按真实 H3 输入推荐 `16:9/9:16`，并显式 crop/pad 为所选目标画幅 | conversation-task |
 | `app/h3.py` | 直接 H3 的 prepare/submit/start/inspect/resume/retry 和磁盘状态机 | conversation-task |
-| `app/long_video.py` | provider 整秒时长不超过 10 秒的安全分段、hard_cut/continue 链语义、canonical plan receipt | conversation-task |
+| `app/long_video.py` | provider 整秒时长不超过 14 秒的安全分段、hard_cut/continue 链语义、canonical plan receipt | conversation-task |
 | `app/long_generation.py` | 多图参考子任务冻结、默认最多两链调度、可选快速 fan-out、历史 boundary 恢复和拼接编排 | conversation-task |
 | `app/stitch.py` | 24fps H.264 归一化、连续边界去重帧、源音频/静音拼接 | conversation-task |
 | `app/asr.py` / `app/voice.py` / `app/vocal.py` | 本地多语种听写、ASR JSON 校验、YAMNet `spoken/sung` 分类 | conversation-task |
-| `app/postprocess.py` / `app/seedream.py` | 可选去字幕/品牌关键帧编辑；不参与 H3 输入 | postprocess |
+| `app/postprocess.py` / `app/mediakit.py` | 可选文字/字幕与常见 Logo/图标擦除；完成后作为 H3 关键帧输入 | postprocess |
 | `app/codex_runner.py` | 本地 codex 内层 workspace 沙箱、voice 专用外层文件系统隔离、并发和超时；不把服务凭据交给 agent | conversation-task |
 | `web/` | 同源 UI、2 秒轮询、显式台词/画幅/清晰度/适配确认、冻结参数回显和人工重试 | conversation-task |
 
@@ -72,7 +72,7 @@ flowchart LR
 
 关键不变量：
 
-- 新会话 `schema_version=2`，`duration_s` 只表示首个视频流 `v:0` 的正有限视觉时长且不超过 300 秒；优先 `stream.duration`，其次 `duration_ts*time_base`，最后扫描 `v:0` 包的 PTS 起止（末包缺 duration 时用相邻 PTS 或帧率补尾）。禁止用 OpenCV `frame_count/fps`、容器总时长或音轨时长覆盖它。`≤10s` 使用完整源视频的多图参考单请求；`>10s` 必须形成连续覆盖全片、provider 整秒时长不超过 10 秒的多图参考分段，不能回落到单请求。
+- 新会话 `schema_version=2`，`duration_s` 只表示首个视频流 `v:0` 的正有限视觉时长且不超过 300 秒；优先 `stream.duration`，其次 `duration_ts*time_base`，最后扫描 `v:0` 包的 PTS 起止（末包缺 duration 时用相邻 PTS 或帧率补尾）。禁止用 OpenCV `frame_count/fps`、容器总时长或音轨时长覆盖它。`≤15s` 使用完整源视频的多图参考单请求；`>15s` 必须形成连续覆盖全片、provider 整秒时长不超过 14 秒的多图参考分段，不能回落到单请求。
 - `keep` 模式由固定的本地 `whisper.cpp` multilingual small 处理 16kHz 单声道音频，自动检测语言；模型和二进制由部署固定，运行时不下载。`rewrite/translate` 才进入音频专用 Codex 隔离区。
 - 自动台词的唯一可收养 agent 输出是隔离区 `work/voice_lines.json`：先做大小、普通文件与 JSON 字段白名单校验，再把净化结果写回主 `work/`。重试创建全新隔离区；Codex 超时/非零退出但完整产物已通过同一校验时仍可收养。
 - 4fps 抽帧由 ffmpeg 按 `v:0` presentation timestamps 顺序批量解码；禁止用 OpenCV `CAP_PROP_POS_MSEC` 随机 seek 假设 CFR。ASR 初次校验和 YAMNet 分类使用 `voice.mp3` 的真实音频时长；这是独立于 `v:0` 的第二条时间轴。抽音以视频 `stream.start_time`（缺失才回落 packet PTS）为零点，用 `aresample first_pts=0` 让解码器先处理 AAC Skip Samples/Opus pre-skip，再按时间戳补前置静音或裁掉视频零点前音频，并在视觉终点裁剪/补静音。随后、写 `voice_lines/meta/receipt` 前，必须把有效台词归一到 manifest 的视觉时间轴。跨越视频结尾的行把 `end_s` 截到视频时长，`start_s >= duration_s` 的音频纯尾部行丢弃并留 provenance/warning，归一结果再过一次 voice 白名单。receipt 的时间真相始终是视觉时长。
@@ -83,7 +83,7 @@ flowchart LR
 - `prompt.txt` 由视觉文本和唯一结构化发声块机械组合。无台词时明确禁止角色说出画面文字。
 - ASR 输出中的 `[无法辨识]`、`[inaudible]`、`[unintelligible]` 等哨兵文本不是业务台词：净化为“本次未得到转写”，复用有声学人声证据时的一次重试；任何哨兵不得进入 `voice_lines.json`、prepared receipt 或 H3 prompt。
 - 冻结的 H3 源提示词是唯一生成输入；项目不调用 MiniMax Context IR，也不接受运行时优化开关。
-- `duration_s` 以 `v:0` 实际浮点时长写 receipt；上传、pipeline 重探测和提交门禁限制为 300 秒。短链和新长链都先把冻结边界归一到六位小数再 `ceil`，单次请求不超过 10 秒；历史 plan v1 保留原始浮点换算只为重建 11–15 秒的已有 boundary attempt，并禁止新 POST。最终 `keep` 拼接按源段帧预算精确裁补，以视频 presentation start 归零音频时间戳并保持全片时长。
+- `duration_s` 以 `v:0` 实际浮点时长写 receipt；上传、pipeline 重探测和提交门禁限制为 300 秒。短链请求允许到 15 秒；`>15s` 的新长链先把冻结边界归一到六位小数再 `ceil`，每段请求不超过 14 秒。历史 plan v1 保留原始浮点换算只为重建 11–15 秒的已有 boundary attempt，并禁止新 POST。最终 `keep` 拼接按源段帧预算精确裁补，以视频 presentation start 归零音频时间戳并保持全片时长。
 - pipeline 首次进入 `processing` 与首次 submit 冻结输入共用同一个 per-CID 原子所有权 claim；检查 generation/receipt、取得所有权和写 meta 在同一把锁内完成。输家不得运行输入准备、改写 receipt 或触发 provider，完成/回滚也只能由当前 owner 提交。
 - 生成推荐值与 pipeline `done` 原子落盘：短链使用实际选中的关键帧；长链使用 plan 中每个 `hard_cut` first anchor 与全部 end anchors，`continue` source first 不计。画幅在 `16:9/9:16` 中取总几何比例损失较小者，平局按源视频方向、仍平局取 `9:16`；清晰度按源视频短边与 `480/768` 的距离，平局取 `480p`。两种画幅都冻结 `fit_profiles`；所选目标完全匹配才用 `none`，否则默认 `crop` 并允许用户改为 `pad`。
 - H3 关键帧来自原始 `work/keyframes/`，或在后处理 `done` 后来自完整的同名 `postprocessed/`；crop/pad 再由最终所选 bytes 派生到 `work/h3_frames/<aspect>/{crop|pad}/`。历史 boundary 长链按冻结 marker 使用旧布局，恢复不从后来新增字段猜输入。
@@ -156,7 +156,9 @@ data/<cid>/
     ├── prompt.txt
     ├── keyframes/*.png
     ├── h3_frames/<aspect>/{crop|pad}/*.png # short only, after explicit fit choice
-    ├── postprocessed/*.png           # optional display-only Seedream output
+    ├── postprocessed/                # optional MediaKit output selected for H3
+    │   ├── *.png
+    │   └── .mediakit/                # private per-frame paid-attempt receipts/artifacts
     └── segments/<N>/
         ├── source.mp4
         ├── generated.mp4             # paid reference segment output

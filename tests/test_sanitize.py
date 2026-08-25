@@ -1,4 +1,4 @@
-"""app/sanitize 公共脱敏函数（seedance/seedream 共用）的测试。"""
+"""app/sanitize 公共供应商错误脱敏函数的测试。"""
 
 from app.sanitize import sanitize
 

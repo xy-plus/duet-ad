@@ -198,7 +198,7 @@ def test_creation_preserves_voice_modes_and_translate_requires_language(tmp_path
 
 
 def test_postprocess_rejects_legacy_read_only_session(tmp_path):
-    settings = make_settings(tmp_path, enable_seedream_edit=True)
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
     meta = storage.new_conversation(settings.data_dir, note="", orig_name="a.mp4")
     stored = storage.load_meta(settings.data_dir, meta["id"])
     stored.pop("schema_version")

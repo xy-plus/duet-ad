@@ -14,7 +14,7 @@ from typing import Mapping
 from app import frame_fit, h3, long_video, postprocess, prepared_input, stitch, storage
 
 WORKFLOW = h3.H3_WORKFLOW
-_PLAN_WORKFLOWS = frozenset({h3.H3_WORKFLOW, h3.H3_BOUNDARY_WORKFLOW})
+_PLAN_WORKFLOWS = h3.H3_REFERENCE_WORKFLOWS | {h3.H3_BOUNDARY_WORKFLOW}
 _PIPELINE_NO_BGM = "不要生成背景音乐"
 _EPS = 1e-6
 FIT_LAYOUT_LEGACY = "legacy-v0"
@@ -278,7 +278,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         raise LongGenerationError("long_video_plan_invalid")
     # Existing attempts without a marker predate reference-mode long video and
     # must resume their boundary receipts GET-only.  Unsubmitted v2 plans are
-    # safe to promote because every provider segment is already <=10 seconds.
+    # safe to promote because every provider segment is within the current limit.
     workflow = (
         persisted_workflow
         or (receipt_workflow if isinstance(generation, Mapping) else None)
@@ -296,7 +296,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
     raw_segments, meta_segments = payload.get("segments"), meta.get("segments")
     if (
         not math.isfinite(duration)
-        or duration <= long_video.SHORT_VIDEO_MAX_S
+        or duration <= long_video.PREVIOUS_SHORT_VIDEO_MAX_S
         or duration > long_video.LONG_VIDEO_MAX_S
         or abs(duration - meta_duration) > _EPS
         or not isinstance(raw_segments, list)
@@ -456,7 +456,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             prepare=prepare_fit,
         )
         frozen_keyframes: tuple[h3.FrozenFrame, ...] = ()
-        if workflow == h3.H3_WORKFLOW:
+        if workflow in h3.H3_REFERENCE_WORKFLOWS:
             try:
                 selected_paths = postprocess.generation_keyframes(
                     root, dict(meta), keyframe_paths
@@ -530,7 +530,7 @@ def _extract_last_frame(video: Path, output: Path) -> Path:
 def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
              parent_id: str, fit_mode: str, *, frozen_child_id: str | None = None,
              prepare_inputs: bool = True, fast_mode: bool = False) -> h3.H3Request:
-    if plan.workflow == h3.H3_WORKFLOW:
+    if plan.workflow in h3.H3_REFERENCE_WORKFLOWS:
         return h3.H3Request(
             cid=f"{cid}-segment-{segment.index}",
             workdir=segment.workdir,
@@ -559,6 +559,7 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
             mode="reference",
             aspect_ratio=plan.aspect_ratio,
             resolution=plan.resolution,
+            workflow=plan.workflow,
         )
     first, first_data = segment.first_frame, segment.first_frame_data
     if segment.join_mode == "continue":
@@ -618,6 +619,7 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
         last_frame=(segment.last_frame, segment.last_frame_data),
         aspect_ratio=plan.aspect_ratio,
         resolution=plan.resolution,
+        workflow=h3.H3_BOUNDARY_WORKFLOW,
     )
 
 
@@ -1238,12 +1240,13 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
     def worker(segment: FrozenSegment, action: str):
         if (
             action == "start"
+            and plan.receipt_version == long_video.LEGACY_PLAN_RECEIPT_VERSION
             and long_video.provider_duration_s(
                 segment.start_s,
                 segment.end_s,
                 receipt_version=plan.receipt_version,
             )
-            > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
+            > long_video.PREVIOUS_SEGMENT_PROVIDER_MAX_DURATION_S
         ):
             return None, ("failed", "long_video_legacy_plan_read_only")
         existing_child_id = states[segment.index].get("child_request_id")

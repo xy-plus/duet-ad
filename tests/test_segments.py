@@ -337,7 +337,7 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     assert stored["long_video_plan_receipt"] == long_video.PLAN_RECEIPT_FILENAME
     receipt = json.loads((cdir / long_video.PLAN_RECEIPT_FILENAME).read_text(encoding="utf-8"))
     assert receipt["source"]["sha256"]
-    assert receipt["workflow"] == "minimax_h3_lightx2v_v5"
+    assert receipt["workflow"] == "minimax_h3_lightx2v_v5_15s"
     assert [anchor["role"] for anchor in receipt["segments"][0]["anchors"]] == [
         "first",
         "end",

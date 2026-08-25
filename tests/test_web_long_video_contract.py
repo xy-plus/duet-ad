@@ -280,7 +280,7 @@ def test_long_video_ui_copy_and_segment_progress_contract():
     source = APP_JS.read_text(encoding="utf-8")
     for text in (
         "本次新增 ",
-        "个付费 H3 子任务",
+        "个付费生成子任务",
         "重试生成",
         "重试拼接",
         "连续性为 best effort",
@@ -310,7 +310,7 @@ def test_published_video_does_not_hide_stitch_recovery():
 
 
 def test_removed_frozen_prompt_display_copy_does_not_change_submit_or_cost_copy():
-    removed_copy = "逐段冻结的" + " H3 提示词"
+    removed_copy = "逐段冻结的模型提示词"
     display_assets = [APP_JS, ROOT / "web" / "index.html"]
     offenders = [
         str(path.relative_to(ROOT))
@@ -320,9 +320,9 @@ def test_removed_frozen_prompt_display_copy_does_not_change_submit_or_cost_copy(
     assert offenders == []
 
     source = APP_JS.read_text(encoding="utf-8")
-    assert "各段 H3 提示词将提交生成" in source
-    assert "H3 源提示词将直接提交生成" in source
-    assert "个付费 H3 子任务" in source
+    assert "各段提示词将提交生成" in source
+    assert "源提示词将直接提交生成" in source
+    assert "个付费生成子任务" in source
 
 
 def test_segment_disclosure_state_defaults_collapsed_and_toggles_both_ways():

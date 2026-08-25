@@ -16,8 +16,8 @@ interface PostprocessConfigProps {
 type PostprocessOptionKey = keyof PostprocessOptions;
 
 const optionLabels: Record<PostprocessOptionKey, string> = {
-  remove_subtitle: '移除字幕',
-  remove_brand: '移除品牌标识',
+  remove_subtitle: '移除文字/字幕',
+  remove_brand: '移除常见 Logo/图标',
 };
 
 const optionKeys = Object.keys(optionLabels) as PostprocessOptionKey[];
@@ -70,7 +70,7 @@ export function PostprocessConfig({
     >
       <Space orientation="vertical" size="middle">
         <Typography.Paragraph type="secondary">
-          选项只在提交前配置；提交后由服务端冻结，并在会话内后台处理。
+          每个选项对应一次 MediaKit 擦除；提交后由服务端冻结，并在会话内后台处理。
         </Typography.Paragraph>
         <Checkbox.Group
           value={selectedOptions}

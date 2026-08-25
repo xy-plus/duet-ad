@@ -8,6 +8,12 @@
 
 ## 🚧 进行中
 
+- [image-opt-contract] 为单段/多段会话增加每段独立、CAS 保存且可恢复默认的图片优化提示词；冻结模板、模型与执行模式。
+- [seedream-provider] 恢复 Seedream 单图输出适配器，支持锚帧/独立两模式、尺寸校验、持久 attempt 与最多 3 次安全重试。
+- [postprocess-orchestration] 实现文字 → Logo → 图片优化的分段屏障、双层有界并行、分段失败/定向重试、启动恢复与 H3 fail-closed。
+- [image-opt-frontends] 旧前端和 React 前端统一三按钮共享编辑器，默认高亮“否”，新增图片优化选项、未保存离开保护和分段重试。
+- [image-opt-docs-verification] 同步 human/agent/README/runbook，完成后端、双前端、E2E、简化与对抗审查。
+
 ## 📌 待办与限制
 
 - 自动补交依赖 append-only attempt ledger；若带外删除最后一个已落盘 receipt，无独立高水位可识别。该磁盘状态破坏场景按要求不扩展实现。（→ `app/h3.py:_validated_attempt_ledger`）

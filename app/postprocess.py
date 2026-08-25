@@ -1,15 +1,15 @@
-"""Seedream 后处理编排：HTTP 门控 + 后台并行逐帧编辑。
+"""MediaKit erase-image 后处理编排：HTTP 门控 + 后台并行逐帧擦除。
 
-门控顺序：ENABLE_SEEDREAM_EDIT 关 → 501；会话不存在 → 404；
+门控顺序：ENABLE_MEDIAKIT_ERASE 关 → 501；会话不存在 → 404；
 confirm 非严格 True → 409；字幕/品牌选项至少选一否则 422（未知键或非 bool 值 → 422）；
 status != done → 409；meta.postprocess 已在 running → 409；上次 done/failed 的 options 与本次
 不同 → 409（防旧产物贴新标签，锁定比对只认当前 OPTION_KEYS 共有键——旧状态中的
 废弃键忽略；纯废弃形态放行并清旧产物）；锁内复查（running / 产物完整）后置 running。
 后台任务（BackgroundTasks，独立路径不吃管道闸；可并发，每会话一把锁）：
 收集目标帧（单段 work/keyframes/*.png；多段 work/segments/N/work/keyframes/*.png）→ 按勾选选项
-构造中文编辑指令（多选项分号连接）→ 未跳过帧 asyncio.gather 并行
-seedream.edit_image(confirm=True, size=按帧像素等比放大的 "WxH")，进程级信号量（主进程
-seedream_sem，SEEDREAM_CONCURRENCY）限并发 → 产出写 work/postprocessed/<帧名>.png 或
+映射文字/图标擦除场景 → 未跳过帧 asyncio.gather 并行
+mediakit.erase_image(confirm=True)，进程级信号量（主进程
+mediakit_sem，MEDIAKIT_CONCURRENCY）限并发 → 产出写 work/postprocessed/<帧名>.png 或
 work/segments/N/work/postprocessed/<帧名>.png → 任一帧失败整体 failed（error 列失败帧名；
 其余帧照常跑完，已成功帧保留且重跑跳过）→
 meta.postprocess = {status: running|done|failed, options, frames, error}（内部字段；
@@ -19,12 +19,9 @@ running 期间每成功一帧即写回 frames，前端 2s 轮询据此显示 n/m
 from __future__ import annotations
 
 import asyncio
-import math
 from pathlib import Path
 
-import cv2
-
-from app import seedream, storage
+from app import mediakit, storage
 from app.config import Settings
 from app.sanitize import sanitize
 
@@ -32,15 +29,10 @@ OPTION_KEYS = ("remove_subtitle", "remove_brand")
 _LEGACY_OPTION_KEYS = frozenset({"change_bg", "face_hold"})
 _CLIENT_REFRESH_MESSAGE = "页面版本已更新，请刷新页面后重试。"
 
-_INSTRUCTIONS = {
-    "remove_subtitle": "移除图片中的所有字幕、水印和贴纸元素，其余（尺寸、内容等）保持不变",
-    "remove_brand": "图片中的所有品牌标志、logo、商标等版权元素改为不侵权的类似视觉效果的等效物，其余（尺寸、内容等）保持不变",
+_SCENES = {
+    "remove_subtitle": mediakit.TEXT_SCENE,
+    "remove_brand": mediakit.ICON_SCENE,
 }
-
-# Seedream size 参数下限（像素数）；不传 size 时模型输出 2048 方形（方向可能失真），
-# 故按输入帧尺寸等比放大到 ≥ 下限保持宽高比（实测 1440×2560 可用，无需 16 对齐）
-_SEEDREAM_MIN_PIXELS = 3_686_400
-_SEEDREAM_MAX_PIXELS = 4_624_220  # Ark 实测：超上限 400「image area must be at most 4624220 pixels」
 
 
 class PostprocessError(Exception):
@@ -70,8 +62,8 @@ async def start(
     settings: Settings, cid: str, payload: dict, locks: dict[str, asyncio.Lock]
 ) -> dict[str, bool]:
     """门控 + 置 running；返回勾选选项（路由层据此调度后台任务）。"""
-    if not settings.enable_seedream_edit:
-        raise PostprocessError(501, "Seedream edit is disabled.")
+    if not settings.enable_mediakit_erase:
+        raise PostprocessError(501, "MediaKit erase is disabled.")
     meta = storage.load_meta(settings.data_dir, cid)
     if meta is None:
         raise PostprocessError(404, "not found")
@@ -174,20 +166,18 @@ async def _edit_one(
     frames: list[str],
     sem: asyncio.Semaphore,
 ) -> None:
-    """单帧编辑（gather 成员）：线程池读帧尺寸算 size（同步 cv2.imread 不阻塞事件循环、不占
-    信号量槽）→ 信号量内提交；成功后追加帧名并写回进度。
+    """单帧编辑（gather 成员）：信号量内提交；成功后追加帧名并写回进度。
 
-    run_task 收集阶段已保证各帧 out 互异且未产出，同帧不会被并发重复提交；edit_image 不再
+    run_task 收集阶段已保证各帧 out 互异且未产出，同帧不会被并发重复提交；erase_image 不再
     接收并发锁（每帧新建锁退化为自守卫，无实际防护），同 out 仅一次提交由收集不变量 + start
     门控保证。
     """
     try:
-        size = await asyncio.to_thread(_read_size, src)  # 同步 cv2.imread 在线程池，不阻塞 loop
         async with sem:
-            await seedream.edit_image(
-                settings, cdir, src, _build_instruction(options), out, True, size=size,
+            await mediakit.erase_image(
+                settings, cdir, src, out, True, _selected_scenes(options),
             )
-    except seedream.SeedreamError as e:
+    except mediakit.MediaKitError as e:
         raise PostprocessError(502, f"frame {out.name} failed: {sanitize(e.detail)}") from None
     except Exception as e:
         raise PostprocessError(502, f"frame {out.name} failed: {sanitize(str(e))}") from None
@@ -200,29 +190,6 @@ def _frame_error(name: str, e: BaseException) -> str:
     if isinstance(e, PostprocessError):
         return e.detail if isinstance(e.detail, str) else e.detail["message"]
     return f"frame {name} failed: {sanitize(str(e))}"
-
-
-def _read_size(src: Path) -> str:
-    """读帧像素尺寸 → Seedream size "WxH"；cv2 读不出（非标准图）→ 空串 = 不传 size。"""
-    img = cv2.imread(str(src))
-    if img is None:
-        return ""
-    h, w = img.shape[:2]  # cv2.imread shape 为 (高, 宽, 通道)
-    return _fit_size(w, h)
-
-
-def _fit_size(w: int, h: int) -> str:
-    """输出尺寸落在 Ark 合法面积区间 [3,686,400, 4,624,220]：原图已在区间 → 原尺寸不动；
-    否则等比缩放（浮点 scale，非整数倍）到下限附近——整数 ceil 倍会远超上限（1080×1920→
-    2160×3840=8.29MP 实测 400），round 亏空则加宽一维补足（最多几个像素）。"""
-    area = w * h
-    if _SEEDREAM_MIN_PIXELS <= area <= _SEEDREAM_MAX_PIXELS:
-        return f"{w}x{h}"
-    scale = math.sqrt(_SEEDREAM_MIN_PIXELS / area)
-    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
-    while nw * nh < _SEEDREAM_MIN_PIXELS:  # round 舍入亏空（极小，通常一次即足）
-        nw += 1
-    return f"{nw}x{nh}"
 
 
 def _options_match(last_options: object, options: dict[str, bool]) -> bool:
@@ -330,9 +297,9 @@ def _write_progress(
     })
 
 
-def _build_instruction(options: dict[str, bool]) -> str:
-    """按稳定白名单顺序将多选项合并为一条指令（分号连接）。"""
-    return "；".join(_INSTRUCTIONS[key] for key in OPTION_KEYS if options.get(key))
+def _selected_scenes(options: dict[str, bool]) -> tuple[str, ...]:
+    """按稳定选项顺序生成 MediaKit 擦除场景；双选即两个有回执的阶段。"""
+    return tuple(_SCENES[key] for key in OPTION_KEYS if options.get(key))
 
 
 def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[Path]:

@@ -50,7 +50,7 @@ describe('generation contract', () => {
       ready: false,
       planReceipt: null,
     });
-    expect(longVideoContract({ duration_s: 10 })).toEqual({
+    expect(longVideoContract({ duration_s: 15 })).toEqual({
       isLong: false,
       ready: true,
       segmentCount: null,
@@ -73,7 +73,11 @@ describe('generation contract', () => {
 
   it('silently defaults only a new long-video draft to fast mode', () => {
     expect(createGenerationDraft(longDetail()).fastMode).toBe(true);
-    expect(createGenerationDraft(longDetail({ duration_s: 10 })).fastMode).toBe(false);
+    expect(createGenerationDraft(longDetail({
+      duration_s: 15,
+      segment_count: null,
+      plan_receipt: null,
+    })).fastMode).toBe(false);
     expect(createGenerationDraft(longDetail({
       generation: { status: 'failed', fast_mode: true },
     })).fastMode).toBe(true);

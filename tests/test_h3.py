@@ -143,7 +143,7 @@ class HappyProvider:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         path = request.url.path
-        if path.endswith(("/minimax_h3_lightx2v_v5", "/minimax_h3_lightx2v")):
+        if path.endswith(("/minimax_h3_lightx2v_v5_15s", "/minimax_h3_lightx2v_v5", "/minimax_h3_lightx2v")):
             return httpx.Response(200, json={"data": {"task_id": "h3-task-local"}})
         if path.endswith("/result/h3-task-local"):
             payload = {"status": self.result_status}
@@ -159,7 +159,7 @@ class HappyProvider:
         return [
             request
             for request in self.requests
-            if request.url.path.endswith(("/minimax_h3_lightx2v_v5", "/minimax_h3_lightx2v"))
+            if request.url.path.endswith(("/minimax_h3_lightx2v_v5_15s", "/minimax_h3_lightx2v_v5", "/minimax_h3_lightx2v"))
         ]
 
 
@@ -355,8 +355,15 @@ def test_request_modes_reject_ambiguous_or_invalid_inputs(tmp_path, changes, err
 
 
 def test_mode_specific_duration_limits(tmp_path):
+    assert replace(_request(tmp_path), duration=15).duration == 15
     with pytest.raises(h3.H3Error, match="invalid_duration"):
-        replace(_request(tmp_path), duration=11)
+        replace(_request(tmp_path), duration=16)
+    with pytest.raises(h3.H3Error, match="invalid_duration"):
+        replace(
+            _request(tmp_path),
+            duration=11,
+            workflow=h3.H3_PREVIOUS_WORKFLOW,
+        )
     with pytest.raises(h3.H3Error, match="invalid_duration"):
         replace(_boundary_request(tmp_path), duration=16)
 
@@ -1088,7 +1095,7 @@ def test_nonblocking_session_lock_rejects_same_cid_concurrency(tmp_path):
     provider = HappyProvider()
 
     def blocked(req: httpx.Request) -> httpx.Response:
-        if req.url.path.endswith("/minimax_h3_lightx2v_v5") and not entered.is_set():
+        if req.url.path.endswith("/minimax_h3_lightx2v_v5_15s") and not entered.is_set():
             entered.set()
             assert release.wait(2)
         return provider(req)

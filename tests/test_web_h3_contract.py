@@ -37,14 +37,13 @@ def _run_contract(expression: str):
     return json.loads(completed.stdout)
 
 
-def test_creation_and_copy_use_h3_contract_only():
+def test_creation_and_copy_use_provider_neutral_contract_only():
     source = _web_source()
     assert "voice-mode" in source
     assert "target_language" in source
-    assert "H3" in source
+    assert "H3" not in source
     assert "最长 300 秒" in source
-    assert "10 秒以上会拆分为 provider 整秒时长不超过 10 秒的 H3 子任务" in source
-    assert "最长 15 秒的 H3 子任务" not in source
+    assert "超过 15 秒会拆分为单次不超过 14 秒的视频生成子任务" in source
     assert "时长不限" not in source
 
 
@@ -55,12 +54,12 @@ def test_duration_limit_error_is_structured_and_shown_as_popup():
     result = _run_contract(
         "(() => {"
         "const error=contract.apiErrorFromPayload({detail:{code:'video_duration_exceeds_h3_limit',"
-        "message:'最长 10 秒'}},'fallback');"
+        "message:'最长 14 秒'}},'fallback');"
         "return {message:error.message,code:error.code};"
         "})()"
     )
     assert result == {
-        "message": "最长 10 秒",
+        "message": "最长 14 秒",
         "code": "video_duration_exceeds_h3_limit",
     }
 
@@ -106,7 +105,7 @@ def test_submit_and_detail_state_are_part_of_static_contract():
     ):
         assert token in source
     assert "提交结果未知，禁止重复提交" in source
-    assert "H3 源提示词将直接提交生成" in source
+    assert "源提示词将直接提交生成" in source
 
 
 def test_read_only_gate_fails_closed_for_legacy_details():
@@ -177,8 +176,8 @@ def test_failed_stitch_has_distinct_non_paid_retry_action():
 
 def test_resume_ui_is_locked_and_explicit_about_cost():
     source = APP_JS.read_text(encoding="utf-8")
-    assert "继续既有 H3 任务" in source
-    assert "继续原任务，不创建新的 H3 attempt" in source
+    assert "继续既有生成任务" in source
+    assert "继续原任务，不创建新的生成请求" in source
     assert "buildResumePayload(detail)" in source
 
 

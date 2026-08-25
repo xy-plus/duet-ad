@@ -6,8 +6,8 @@
 /* ===== 常量与状态 ===== */
 const TOKEN_KEY = "cvs_token";
 const POLL_MS = 2000;
-const H3_ASPECT_RATIOS = Object.freeze(["16:9", "9:16"]);
-const H3_RESOLUTIONS = Object.freeze(["480p", "768p"]);
+const GENERATION_ASPECT_RATIOS = Object.freeze(["16:9", "9:16"]);
+const GENERATION_RESOLUTIONS = Object.freeze(["480p", "768p"]);
 
 const STATUS_TEXT = { queued: "排队中", processing: "处理中", done: "已完成", failed: "失败" };
 
@@ -170,11 +170,14 @@ function parseDialogueLines(text) {
 }
 
 function longVideoContract(detail) {
-  const isLong = Number(detail && detail.duration_s) > 10;
+  const duration = Number(detail && detail.duration_s);
   const segmentCount = Number.isInteger(detail && detail.segment_count)
     && detail.segment_count > 0 ? detail.segment_count : null;
   const planReceipt = typeof (detail && detail.plan_receipt) === "string"
     && /^[0-9a-f]{64}$/.test(detail.plan_receipt) ? detail.plan_receipt : null;
+  const hasHistoricalPlan = segmentCount !== null || planReceipt !== null;
+  const isLong = Number.isFinite(duration) && duration > 0
+    && (duration > 15 || (duration > 10 && hasHistoricalPlan));
   return {
     isLong,
     ready: !isLong || (segmentCount !== null && planReceipt !== null),
@@ -198,10 +201,10 @@ function fitProfile(detail, aspectRatio) {
 function generationParameterDraft(detail) {
   const aspectRatio = detail && detail.aspect_ratio;
   const resolution = detail && detail.resolution;
-  if (!H3_ASPECT_RATIOS.includes(aspectRatio)) {
+  if (!GENERATION_ASPECT_RATIOS.includes(aspectRatio)) {
     throw new Error("服务端推荐画幅无效，请刷新页面后重试");
   }
-  if (!H3_RESOLUTIONS.includes(resolution)) {
+  if (!GENERATION_RESOLUTIONS.includes(resolution)) {
     throw new Error("服务端推荐清晰度无效，请刷新页面后重试");
   }
   const profile = fitProfile(detail, aspectRatio);
@@ -273,8 +276,8 @@ function buildSubmitPayload(input) {
       || !/^[0-9a-f]{64}$/.test(input.planReceipt))) {
     throw new Error("长视频生成计划尚未就绪，请刷新后重试");
   }
-  if (!H3_ASPECT_RATIOS.includes(input.aspectRatio)) throw new Error("请选择画幅");
-  if (!H3_RESOLUTIONS.includes(input.resolution)) throw new Error("请选择清晰度");
+  if (!GENERATION_ASPECT_RATIOS.includes(input.aspectRatio)) throw new Error("请选择画幅");
+  if (!GENERATION_RESOLUTIONS.includes(input.resolution)) throw new Error("请选择清晰度");
 
   let fitMode = "none";
   if (input.fitRequired) {
@@ -343,8 +346,8 @@ function buildResumePayload(detail) {
     throw new Error("既有任务台词模式无效");
   }
   if (!["none", "crop", "pad"].includes(detail.fit_mode)) throw new Error("既有任务画幅模式无效");
-  if (!H3_ASPECT_RATIOS.includes(detail.aspect_ratio)
-      || !H3_RESOLUTIONS.includes(detail.resolution)) {
+  if (!GENERATION_ASPECT_RATIOS.includes(detail.aspect_ratio)
+      || !GENERATION_RESOLUTIONS.includes(detail.resolution)) {
     throw new Error("既有任务生成参数无效");
   }
 
@@ -384,8 +387,8 @@ function buildStitchRetryPayload(detail) {
   if (typeof requestId !== "string" || !requestId.trim()) throw new Error("缺少既有任务请求标识");
   if (!dialogue || !["auto", "none"].includes(dialogue.mode)) throw new Error("既有任务台词模式无效");
   if (!["none", "crop", "pad"].includes(detail.fit_mode)) throw new Error("既有任务画幅模式无效");
-  if (!H3_ASPECT_RATIOS.includes(detail.aspect_ratio)
-      || !H3_RESOLUTIONS.includes(detail.resolution)) {
+  if (!GENERATION_ASPECT_RATIOS.includes(detail.aspect_ratio)
+      || !GENERATION_RESOLUTIONS.includes(detail.resolution)) {
     throw new Error("既有任务生成参数无效");
   }
   return {
@@ -739,7 +742,7 @@ function renderEmptyHero() {
   iconBox.appendChild(icon("i-film"));
   hero.appendChild(iconBox);
   hero.appendChild(el("h2", null, "上传参考视频，生成复刻配方"));
-  hero.appendChild(el("p", "empty-sub", "AI 会抽取关键帧并准备 H3 视频生成"));
+  hero.appendChild(el("p", "empty-sub", "AI 会抽取关键帧并准备视频生成"));
   const steps = el("ol", "empty-steps");
   const items = [
     "点击回形针或把视频拖进输入框",
@@ -897,7 +900,7 @@ function renderResults(detail) {
     const sourcePrompt = detail.source_prompt || detail.prompt;
     if (sourcePrompt) {
       const sec = el("section", "res-section");
-      sec.appendChild(el("h3", "res-h3", "H3 源提示词"));
+      sec.appendChild(el("h3", "res-h3", "源提示词"));
       sec.appendChild(renderSourcePromptCard(detail, sourcePrompt));
       frag.appendChild(sec);
     }
@@ -1026,7 +1029,7 @@ async function submitGeneration(detail, card) {
 }
 
 function generationStageText(stage) {
-  if (stage === "h3") return "H3 子任务生成";
+  if (stage === "h3") return "视频子任务生成";
   if (stage === "stitch") return "视频拼接";
   if (stage === "stitching") return "视频拼接";
   return stage ? String(stage) : "等待开始";
@@ -1125,14 +1128,14 @@ async function postGeneration(
   }
 }
 
-/* 最终视频区：H3 生成参数、异步状态、失败后的显式重试和历史成片都在同一卡片。 */
+/* 最终视频区：生成参数、异步状态、失败后的显式重试和历史成片都在同一卡片。 */
 function renderFinalSection(detail) {
   const generation = detail.generation || { status: null, error: null, attempt: null };
   const showPublishedVideo = detail.has_video === true;
   const showStitchRecovery = generation.status === "failed" && generation.stage === "stitch";
   const published = document.createDocumentFragment();
   if (showPublishedVideo) {
-    published.appendChild(videoSection(detail, "generated.mp4", "最终视频", "H3 生成成片"));
+    published.appendChild(videoSection(detail, "generated.mp4", "最终视频", "生成成片"));
     published.appendChild(generationParameterSummary(detail));
   }
   if (showPublishedVideo && !showStitchRecovery) return published;
@@ -1140,18 +1143,18 @@ function renderFinalSection(detail) {
   const sec = el("section", "res-section");
   published.appendChild(sec);
   const card = el("div", "final-card");
-  card.appendChild(el("h3", "res-h3", "最终视频 · H3"));
+  card.appendChild(el("h3", "res-h3", "最终视频"));
   appendGenerationProgress(card, generation);
 
   if (generation.status === "queued" || generation.status === "running") {
     const status = el("div", "generation-status is-running");
     status.appendChild(el("strong", null,
-      generation.status === "queued" ? "H3 已排队" : "H3 正在生成"));
+      generation.status === "queued" ? "生成任务已排队" : "视频正在生成"));
     status.appendChild(el("span", null, generation.attempt ? "第 " + generation.attempt + " 次尝试" : "请稍候，页面会自动更新"));
     card.appendChild(status);
   } else if (generation.status === "failed" || generation.status === "submission_unknown") {
     const status = el("div", "generation-status is-error");
-    const failedTitle = generation.stage === "stitch" ? "视频拼接失败" : "H3 生成失败";
+    const failedTitle = generation.stage === "stitch" ? "视频拼接失败" : "视频生成失败";
     status.appendChild(el("strong", null,
       generation.status === "submission_unknown" ? "提交结果未知" : failedTitle));
     const errorText = generation.error || "后端未返回具体原因";
@@ -1159,7 +1162,7 @@ function renderFinalSection(detail) {
     card.appendChild(status);
   } else if (generation.status === "resume_required") {
     const status = el("div", "generation-status is-resume");
-    status.appendChild(el("strong", null, "既有 H3 任务等待继续"));
+    status.appendChild(el("strong", null, "既有生成任务等待继续"));
     status.appendChild(el("span", null, generation.error || "任务已保存，可从原进度继续"));
     card.appendChild(status);
   }
@@ -1194,33 +1197,33 @@ function renderFinalSection(detail) {
   if (longContract.isLong && ["new", "retry", "retry_stitch"].includes(retryContract.action)) {
     const notice = el("div", "long-video-notice");
     notice.appendChild(el("strong", null,
-      "本次新增 " + retryContract.paidTaskCount + " 个付费 H3 子任务"));
+      "本次新增 " + retryContract.paidTaskCount + " 个付费生成子任务"));
     const noticeText = retryContract.action === "retry_stitch"
       ? "全部分段成片已复用，本次只在本地重试拼接。"
       : retryContract.action === "retry"
         ? "跨段连续性为 best effort；服务端按冻结模式复用成功段，本次只提交上方所示新增付费分段。"
-        : "跨段连续性为 best effort；各段 H3 提示词将提交生成。";
+        : "跨段连续性为 best effort；各段提示词将提交生成。";
     notice.appendChild(el("p", null, noticeText));
     card.appendChild(notice);
   }
 
   if (generationAction(generation.status, generation.stage) === "resume") {
     const locked = el("div", "resume-lock");
-    locked.appendChild(el("strong", null, "继续既有 H3 任务"));
+    locked.appendChild(el("strong", null, "继续既有生成任务"));
     locked.appendChild(el("p", null,
-      "将使用已保存的请求标识和冻结输入继续查询既有 H3 任务。"));
+      "将使用已保存的请求标识和冻结输入继续查询既有生成任务。"));
     card.appendChild(locked);
     const errorBox = el("p", "form-error generation-form-error");
     errorBox.hidden = true;
     card.appendChild(errorBox);
     const row = el("div", "final-row");
-    const button = el("button", "btn btn-primary generation-submit", "继续 H3");
+    const button = el("button", "btn btn-primary generation-submit", "继续生成");
     button.type = "button";
     button.addEventListener("click", () => {
       resumeGeneration(detail, card);
     });
     row.appendChild(button);
-    row.appendChild(el("p", "final-caption", "继续原任务，不创建新的 H3 attempt。"));
+    row.appendChild(el("p", "final-caption", "继续原任务，不创建新的生成请求。"));
     card.appendChild(row);
     if (state.generationSubmitting[detail.id]) setGenerationCardBusy(card, true);
     sec.appendChild(card);
@@ -1232,9 +1235,9 @@ function renderFinalSection(detail) {
       || retryContract.action === "retry_stitch")) {
     const stitchOnly = retryContract.action === "retry_stitch";
     const locked = el("div", "resume-lock");
-    locked.appendChild(el("strong", null, stitchOnly ? "重试本地拼接" : "重试失败的 H3 分段"));
+    locked.appendChild(el("strong", null, stitchOnly ? "重试本地拼接" : "重试失败的生成分段"));
     locked.appendChild(el("p", null, stitchOnly
-      ? "复用原请求标识和全部成功分段，不创建新的付费 H3 子任务。"
+      ? "复用原请求标识和全部成功分段，不创建新的付费生成子任务。"
       : "使用新的请求标识和逐段冻结输入；本次只提交服务端计算出的新增付费分段。"));
     card.appendChild(locked);
     const errorBox = el("p", "form-error generation-form-error");
@@ -1247,8 +1250,8 @@ function renderFinalSection(detail) {
     button.addEventListener("click", () => submitGeneration(detail, card));
     row.appendChild(button);
     row.appendChild(el("p", "final-caption", stitchOnly
-      ? "本次新增 0 个付费 H3 子任务。"
-      : "本次新增 " + retryContract.paidTaskCount + " 个付费 H3 子任务。"));
+      ? "本次新增 0 个付费生成子任务。"
+      : "本次新增 " + retryContract.paidTaskCount + " 个付费生成子任务。"));
     card.appendChild(row);
     if (state.generationSubmitting[detail.id]) setGenerationCardBusy(card, true);
     sec.appendChild(card);
@@ -1273,13 +1276,13 @@ function renderFinalSection(detail) {
     aspectChoices.appendChild(item);
   }
   aspectField.appendChild(aspectChoices);
-  aspectField.appendChild(el("p", "final-help", "系统已按实际 H3 输入帧的总几何损失预选。"));
+  aspectField.appendChild(el("p", "final-help", "系统已按实际输入帧的总几何损失预选。"));
   card.appendChild(aspectField);
 
   const resolutionField = el("fieldset", "final-field");
   resolutionField.appendChild(el("legend", null, "清晰度"));
   const resolutionChoices = el("div", "final-choices");
-  for (const value of H3_RESOLUTIONS) {
+  for (const value of GENERATION_RESOLUTIONS) {
     const item = choice("resolution-" + detail.id, value, value, draft.resolution === value);
     item.querySelector("input").addEventListener("change", () => {
       draft.resolution = value;
@@ -1376,11 +1379,11 @@ function renderFinalSection(detail) {
   button.addEventListener("click", () => submitGeneration(detail, card));
   row.appendChild(button);
   row.appendChild(el("p", "final-caption generation-mode-caption", hasFrozenGeneration
-    ? (busy ? "参数已按服务端冻结，正在等待 H3 生成结果"
+    ? (busy ? "参数已按服务端冻结，正在等待生成结果"
       : "重试将使用上次服务端冻结的生成参数")
     : longContract.isLong
-      ? "各段 H3 提示词将提交生成"
-      : "H3 源提示词将直接提交生成"));
+      ? "各段提示词将提交生成"
+      : "源提示词将直接提交生成"));
   card.appendChild(row);
   if (hasFrozenGeneration) {
     card.querySelectorAll("input, textarea").forEach((control) => {
@@ -1533,7 +1536,7 @@ function renderSourcePromptCard(detail, text) {
   textarea.rows = 14;
   textarea.value = text;
   textarea.hidden = true;
-  textarea.setAttribute("aria-label", "修改 H3 源提示词");
+  textarea.setAttribute("aria-label", "修改源提示词");
   card.appendChild(textarea);
   const error = el("p", "form-error");
   error.hidden = true;
@@ -1618,7 +1621,7 @@ function renderSourcePromptCard(detail, text) {
 function promptCard(text, actions = []) {
   const card = el("div", "prompt-card");
   const head = el("div", "prompt-head");
-  head.appendChild(el("span", "prompt-hint", "用于 H3 视频生成"));
+  head.appendChild(el("span", "prompt-hint", "用于视频生成"));
   for (const action of actions) head.appendChild(action);
   const output = el("pre", "prompt-text", text);
   const copyBtn = el("button", "copy-btn");
@@ -1679,7 +1682,7 @@ function renderSegments(detail) {
       ));
     }
     if (seg.prompt) {
-      card.appendChild(el("h4", "res-sub", "H3 提示词"));
+      card.appendChild(el("h4", "res-sub", "生成提示词"));
       card.appendChild(segmentPromptDisclosure(seg.prompt, n));
     }
     if (Array.isArray(seg.lines) && seg.lines.length) {
@@ -2102,7 +2105,7 @@ function renderPpDynamic(detail) {
   if (ppChat) slot.appendChild(ppChat);
 }
 
-/* H3 任务进度独立刷新，避免每个分段状态变化都重建原视频和关键帧。 */
+/* 生成任务进度独立刷新，避免每个分段状态变化都重建原视频和关键帧。 */
 function renderGenerationDynamic(detail) {
   const slot = document.querySelector(".generation-dynamic");
   if (!slot) return;
@@ -2182,7 +2185,7 @@ async function loadDetail(id, silent) {
         renderPpDynamic(detail);
       }
       if (sig.generation !== state.detailSig.generation) {
-        // 分段 H3 / 拼接进度变化只刷新最终视频卡片，不重载源视频。
+        // 分段生成 / 拼接进度变化只刷新最终视频卡片，不重载源视频。
         renderGenerationDynamic(detail);
       }
     }

@@ -34,7 +34,7 @@ npm run test:e2e  # Chromium 真实浏览器契约和截图基线
 
 ## 生产契约摘要
 
-- 新会话是 `schema_version=2`；`duration_s` 固定为 ffprobe `v:0` 视觉时长（缺失时依次用 `duration_ts*time_base`、视频包 PTS 范围，绝不使用 OpenCV `frame_count/fps` 元数据），音频或容器尾巴不参与 10/300 秒门禁。`≤10s` 保持原 Ref2VA 单请求；`>10s` 冻结为 provider 整秒时长不超过 10 秒的 FL2VA 首尾帧子任务。
+- 新会话是 `schema_version=2`；`duration_s` 固定为 ffprobe `v:0` 视觉时长（缺失时依次用 `duration_ts*time_base`、视频包 PTS 范围，绝不使用 OpenCV `frame_count/fps` 元数据），音频或容器尾巴不参与 15/300 秒门禁。`≤15s` 保持单请求；`>15s` 冻结为单段不超过 14 秒的首尾帧生成子任务。
 - 原文保持使用本地 `whisper.cpp` multilingual small，只读取规范化音频并自动识别语言；改写/翻译仍使用音频专用隔离区。两条路径都看不到源视频、帧、OCR 或视觉 prompt。
 - 输入准备只从结构化台词生成发声块。`auto` 同时保留 `spoken` 与 `sung`，无音轨是合法的空台词输入；MP3 编码尾部先按音频分析，再把最终台词裁到视频时间轴。OCR、字幕、画面文字和备注永远不能被提升为台词。
 - 自动生成的 H3 源提示词可在首次 H3 attempt 创建前二次修改；保存后重写绑定 receipt，attempt 创建后即锁定。
@@ -46,7 +46,7 @@ npm run test:e2e  # Chromium 真实浏览器契约和截图基线
 - Web 只调用 `POST /submit`。已知 task 的查询、超时、下载或输出故障只继续同一 attempt；唯一自动新 POST 例外是供应商明确返回 `FAILED/ERROR/FAIL`，且上一 attempt 的 task id、receipt、诊断和同一 input receipt 已完整落盘。此时沿用原 `client_request_id`，按 `AUTO_RETRY_INTERVAL_S` 等待后新建顺序 attempt，累计不超过 `1 + AUTO_RETRY_COUNT`（默认总计 3 次 POST）。快速模式成功兄弟不重提；串行模式失败段成功后才推进下游。拼接重试只做本地工作，新增供应商 POST 为 0。FL2VA 原始输出允许不短于源段目标超过一帧、且不长于整秒请求 1 秒；最终拼接仍按源段帧预算精确裁补并校验全片时长。
 - `submission_unknown` 完全锁死，必须先到供应商侧核对。快速模式把 unpaid `prepare`、单次 POST `submit` 与恢复推进分开：全部 child receipt 落盘后才允许第一笔 POST，结果未知的 child 不会二次 POST，已提交兄弟仍可完成 GET 收敛。重启恢复默认 GET-only；只对上述完整确认且有额度的 `h3_provider_failed` 创建下一 attempt，或提交该失败后已经落盘的 `ready_to_submit/h3.ready` 自动 attempt。旧 schema 会话仍可查看，但提交和后处理均为只读。
 - H3 成片只接受无 userinfo、全部预解析地址和实际 socket peer 均为公网的 HTTPS URL；拒绝重定向，流式下载最多 200 MiB，并在原子替换前用 ffprobe 验证正时长视频流。
-- Seedream 的去字幕水印/去品牌后处理仍可选，但 H3 只读取原始关键帧或显式 `crop/pad` 派生帧，绝不读取 `postprocessed/`。
+- MediaKit 的文字/字幕与常见 Logo/图标擦除仍可选；只有完整 HTTP 429 + `RequestLimitExceeded` 明确未受理时，才按通用重试上限自动退避重发并保留逐次 attempt；网络/响应结果不明仍锁死。一旦完成，H3 必须读取对应 `postprocessed/`，缺帧时拒绝提交而不回退原图。
 - `face_hold`、Seedance 生产提交路径和 MiniMax Context IR 接入均已删除；上线失败只沿直接 H3 链路修复。
 
 ## 生产拓扑
@@ -66,7 +66,7 @@ public :3213 (Caddy, h1/h2)
 
 ## 目录与文档
 
-- `app/`：API、输入准备、长视频计划/编排/拼接、可恢复 H3 状态机、文件存储和可选 Seedream 后处理。
+- `app/`：API、输入准备、长视频计划/编排/拼接、可恢复 H3 状态机、文件存储和可选 MediaKit 后处理。
 - `web/`：由 uvicorn 提供的现行原生单页 UI。
 - `web-next/`：3213 的 React/Ant Design X 生产 UI；TanStack Query 只在运行态详情每 2 秒轮询，业务组件受组件门面与 Token/CSS 门禁约束。
 - `skills/video-maker/`：输入准备阶段的关键帧选择/视觉 prompt skill。
@@ -83,4 +83,4 @@ public :3213 (Caddy, h1/h2)
 
 ## 安全边界
 
-`ACCESS_TOKEN` 必填，所有 `/api/conversations*` 和文件读取都需要 Bearer 鉴权。3213 的 token 只属于该 origin；任一请求返回 401 时新前端会清除 token 和 Query cache。`AUTODL_ART_TOKEN` 以及可选 Seedream 凭据只从服务环境读取，不进入 API、meta、receipt 或日志。生产使用单进程 uvicorn；进程内锁、信号量和文件锁不是多 worker 协调机制。
+`ACCESS_TOKEN` 必填，所有 `/api/conversations*` 和文件读取都需要 Bearer 鉴权。3213 的 token 只属于该 origin；任一请求返回 401 时新前端会清除 token 和 Query cache。`AUTODL_ART_TOKEN` 与 `VOLC_MEDIAKIT_API_KEY` 只从服务环境读取，不进入公开 API、meta 或日志；MediaKit 带签名结果地址仅存于 0700 私有回执目录。生产使用单进程 uvicorn；进程内锁、信号量和文件锁不是多 worker 协调机制。

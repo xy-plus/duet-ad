@@ -32,8 +32,8 @@ const statusLabels: Record<PostprocessTask['status'], string> = {
 
 function optionsLabel(options: PostprocessOptions) {
   const labels = [
-    options.remove_subtitle ? '移除字幕' : null,
-    options.remove_brand ? '移除品牌标识' : null,
+    options.remove_subtitle ? '移除文字/字幕' : null,
+    options.remove_brand ? '移除常见 Logo/图标' : null,
   ].filter((label): label is string => label !== null);
   return labels.length > 0 ? labels.join('、') : '未选择处理项';
 }

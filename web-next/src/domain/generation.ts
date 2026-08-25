@@ -8,8 +8,8 @@ import type {
   Resolution,
 } from './types';
 
-export const H3_ASPECT_RATIOS = Object.freeze(['16:9', '9:16'] as const);
-export const H3_RESOLUTIONS = Object.freeze(['480p', '768p'] as const);
+export const GENERATION_ASPECT_RATIOS = Object.freeze(['16:9', '9:16'] as const);
+export const GENERATION_RESOLUTIONS = Object.freeze(['480p', '768p'] as const);
 
 const DIALOGUE_MODES = Object.freeze(['auto', 'edit', 'custom', 'none'] as const);
 const FIT_MODES = Object.freeze(['none', 'crop', 'pad'] as const);
@@ -80,14 +80,14 @@ function includes<T extends string>(values: readonly T[], value: unknown): value
 }
 
 function requiredAspectRatio(value: unknown): AspectRatio {
-  if (!includes(H3_ASPECT_RATIOS, value)) {
+  if (!includes(GENERATION_ASPECT_RATIOS, value)) {
     throw new Error('服务端推荐画幅无效，请刷新页面后重试');
   }
   return value;
 }
 
 function requiredResolution(value: unknown): Resolution {
-  if (!includes(H3_RESOLUTIONS, value)) {
+  if (!includes(GENERATION_RESOLUTIONS, value)) {
     throw new Error('服务端推荐清晰度无效，请刷新页面后重试');
   }
   return value;
@@ -103,7 +103,7 @@ function generationFastMode(detail: unknown): boolean {
 
 export function longVideoContract(detail: unknown): LongVideoContract {
   const source = record(detail);
-  const isLong = Number(source?.duration_s) > 10;
+  const duration = source?.duration_s;
   const rawSegmentCount = source?.segment_count;
   const segmentCount = Number.isInteger(rawSegmentCount) && Number(rawSegmentCount) > 0
     ? Number(rawSegmentCount)
@@ -112,6 +112,9 @@ export function longVideoContract(detail: unknown): LongVideoContract {
   const planReceipt = typeof rawReceipt === 'string' && SHA256.test(rawReceipt)
     ? rawReceipt
     : null;
+  const hasHistoricalPlan = segmentCount !== null || planReceipt !== null;
+  const isLong = typeof duration === 'number' && Number.isFinite(duration) && duration > 0
+    && (duration > 15 || (duration > 10 && hasHistoricalPlan));
   return {
     isLong,
     ready: !isLong || (segmentCount !== null && planReceipt !== null),
@@ -264,8 +267,8 @@ export function buildSubmitPayload(input: BuildSubmitInput): GenerationSubmitPay
   if (input.isLong && (typeof input.planReceipt !== 'string' || !SHA256.test(input.planReceipt))) {
     throw new Error('长视频生成计划尚未就绪，请刷新后重试');
   }
-  if (!includes(H3_ASPECT_RATIOS, input.aspectRatio)) throw new Error('请选择画幅');
-  if (!includes(H3_RESOLUTIONS, input.resolution)) throw new Error('请选择清晰度');
+  if (!includes(GENERATION_ASPECT_RATIOS, input.aspectRatio)) throw new Error('请选择画幅');
+  if (!includes(GENERATION_RESOLUTIONS, input.resolution)) throw new Error('请选择清晰度');
 
   let fitMode: FitMode = 'none';
   if (input.fitRequired) {

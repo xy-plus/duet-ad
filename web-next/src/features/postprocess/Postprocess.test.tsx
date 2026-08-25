@@ -35,8 +35,8 @@ describe('PostprocessConfig', () => {
       />,
     );
 
-    expect(screen.getByRole('checkbox', { name: '移除字幕' })).toBeChecked();
-    expect(screen.getByRole('checkbox', { name: '移除品牌标识' })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: '移除文字/字幕' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: '移除常见 Logo/图标' })).not.toBeChecked();
     expect(screen.queryByText(/remove_subtitles|remove_copyrighted_objects/)).not.toBeInTheDocument();
   });
 
@@ -53,7 +53,7 @@ describe('PostprocessConfig', () => {
       />,
     );
 
-    await user.click(screen.getByRole('checkbox', { name: '移除品牌标识' }));
+    await user.click(screen.getByRole('checkbox', { name: '移除常见 Logo/图标' }));
     expect(onOptionsChange).toHaveBeenCalledWith({
       remove_subtitle: true,
       remove_brand: true,
@@ -141,7 +141,7 @@ describe('PostprocessStatus', () => {
     render(<PostprocessStatus task={task} onRetry={onRetry} />);
 
     expect(screen.getAllByText('部分处理成功')).toHaveLength(2);
-    expect(screen.getByText('移除字幕、移除品牌标识')).toBeInTheDocument();
+    expect(screen.getByText('移除文字/字幕、移除常见 Logo/图标')).toBeInTheDocument();
     expect(screen.getByRole('img', { name: '处理后关键帧 1' })).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '重试失败项' }));
     expect(onRetry).toHaveBeenCalledWith({ taskId: 'post-partial', options: task.options });

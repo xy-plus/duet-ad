@@ -56,7 +56,7 @@ multipart 字段：
 
 multipart 只允许表中字段及 `file`，未知或重复字段返回 422 `invalid_create_request`，且不会创建会话。已知旧页面提交 `voice_mode=none` 时返回纯文本中文刷新提示，不写文件、不入队；混入未知字段不会被归为旧页面。
 
-新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长是 `v:0` 视觉时长：优先 `stream.duration`，其次 `duration_ts*time_base`，最后扫描视频包 PTS 范围并对缺失的末包 duration 使用相邻 PTS/帧率补尾；不得使用 OpenCV 帧数/FPS、音轨或 `format.duration` 补长。该值须正有限且不超过 300 秒；文件大小默认 ≤500MB。无音轨合法。`>10s` 只接受 `voice_mode=keep`，否则 422 `long_video_audio_mode_unsupported`。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
+新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长是 `v:0` 视觉时长：优先 `stream.duration`，其次 `duration_ts*time_base`，最后扫描视频包 PTS 范围并对缺失的末包 duration 使用相邻 PTS/帧率补尾；不得使用 OpenCV 帧数/FPS、音轨或 `format.duration` 补长。该值须正有限且不超过 300 秒；文件大小默认 ≤500MB。无音轨合法。`>15s` 只接受 `voice_mode=keep`，否则 422 `long_video_audio_mode_unsupported`。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
 
 ### `GET /api/conversations/{cid}`
 
@@ -155,7 +155,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 ### `PATCH /api/conversations/{cid}/prompt`
 
-请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。该接口只适用于 `≤10s` 短链：在 schema v2、输入准备完成且 H3 attempt 尚未创建时，以 SHA-256 CAS 更新 `work/visual_prompt.txt`，重新机械组合结构化台词并重写 prepared receipt。CAS 不一致返回结构化 409 `prompt_changed` 和中文刷新提示，不改写 prompt/meta/receipt；attempt 已创建后返回 409 `prompt_frozen`。长链的分段提示词已由 plan receipt 逐段绑定，不提供此顶层编辑接口。
+请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。该接口只适用于 `≤15s` 短链：在 schema v2、输入准备完成且生成 attempt 尚未创建时，以 SHA-256 CAS 更新 `work/visual_prompt.txt`，重新机械组合结构化台词并重写 prepared receipt。CAS 不一致返回结构化 409 `prompt_changed` 和中文刷新提示，不改写 prompt/meta/receipt；attempt 已创建后返回 409 `prompt_frozen`。长链的分段提示词已由 plan receipt 逐段绑定，不提供此顶层编辑接口。
 
 ### `GET /api/conversations/{cid}/files/{name}`
 
@@ -249,7 +249,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 ### `POST /api/conversations/{cid}/postprocess`
 
-可选 Seedream 后处理：
+可选 MediaKit `erase-image` 后处理：
 
 ```json
 {
@@ -302,7 +302,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含冻结 boolean `fast_mode`、内部 `segments` 与 `fit_layout`，failed 时公开 `retry_paid_segment_count`，status 含 resume_required；历史缺 fast_mode 等价 false |
 | `postprocess` | `{status,options,frames,error}`；存在时生成必须等待 done，并使用完整优化帧集合 |
 
-`≤10s` 的 schema v2 使用顶层 keyframes/prompt；`>10s` 使用 `segments` 与 `long_video_plan.json`，每段独立工作目录和 H3 状态。两种契约不能互相降级或混用 receipt。
+`≤15s` 的新 schema v2 使用顶层 keyframes/prompt；`>15s` 使用 `segments` 与 `long_video_plan.json`，每段独立工作目录和生成状态。历史 11–15 秒长链仍按已冻结计划恢复，两种契约不能互相降级或混用 receipt。
 
 ## Prepared input receipt v1
 
@@ -324,7 +324,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
   "video": {"duration_s": 9.2, "ratio": "9:16", "fit_mode": "none"},
   "engine_request": {
     "h3": {
-      "workflow": "minimax_h3_lightx2v_v5",
+      "workflow": "minimax_h3_lightx2v_v5_15s",
       "duration": 10,
       "aspect_ratio": "9:16",
       "resolution": "768p",
@@ -340,7 +340,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 ## Long-video plan receipt v2（兼容只读恢复 v1）
 
-`data/<cid>/long_video_plan.json` 是 canonical JSON。新计划固定 `schema=duet.long-video-plan`、`version=2`；顶层绑定完整 source 的路径/SHA-256、实际总时长、`workflow=minimax_h3_lightx2v_v5` 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，六位小数边界归一后的长度至少 1 秒，provider 整秒时长不得超过 10 秒，并绑定：
+`data/<cid>/long_video_plan.json` 是 canonical JSON。新计划固定 `schema=duet.long-video-plan`、`version=2`；顶层绑定完整 source 的路径/SHA-256、实际总时长、`workflow=minimax_h3_lightx2v_v5_15s` 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，六位小数边界归一后的长度至少 1 秒，provider 整秒时长不得超过 14 秒，并绑定：
 
 - `index/start_s/end_s/chain_id/join_mode`；首段必须 `hard_cut`，后续为 `hard_cut` 或 `continue`；
 - 分段 source、1–9 张关键帧、`first/end` 两张锚点及其 SHA-256；
@@ -382,7 +382,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 
 `start/resume/retry` 共用同一私有自动推进器；`submit` 始终只提交当前 prepared attempt 一次。自动额度只统计同 `client_request_id + input_receipt` 的有效 attempt 链，已创建的 ready attempt 已占额度，总上限为 `1 + retry_count`。每个新 attempt 先原子写 receipt 再 POST；配置降低只停止新增，提高后可从最新完整 provider failure 继续。`h3_submit_rejected/h3_result_missing`、输入与下载安全拒绝不创建新 attempt；查询、超时和下载传输失败继续同 task；`submission_unknown` 永不重复 POST。
 
-短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。新长链每段同样使用 `minimax_h3_lightx2v_v5`，传该段冻结的 1–9 张 `ref_image_N`；历史已付费 boundary attempt 仍按 `minimax_h3_lightx2v` 的首尾帧 receipt GET-only 恢复。
+短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5_15s` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。新长链每段同样使用 `minimax_h3_lightx2v_v5_15s`，传该段冻结的 1–9 张 `ref_image_N`；历史 `minimax_h3_lightx2v_v5` 多图回执和 `minimax_h3_lightx2v` 首尾帧回执均保持原工作流恢复，不迁移付费提交。
 
 默认长链同一 `chain_id` 严格串行，最多并发两条 chain；每段请求只使用本段冻结参考图。快速长链先预构造并 prepare 全部分段，随后最多 8 个短生命周期 worker fan-out POST，再最多 8 个 worker GET 轮询；队列可以超过 8，但不会创建无界长生命周期线程。单段确定失败只重做该段，已成功下游独立复用；任一子任务 `submission_unknown` 锁住整批且该段不再 POST，快速模式仍让已知兄弟 task 完成 GET。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 复用 source 音轨，以视频 presentation start 归零并由解码器处理 AAC/Opus priming，再按解码后的音频时间戳补前置静音或裁视频零点前音频，最后在画面终点裁剪或补静音，画面时长不变；`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
 
@@ -416,8 +416,8 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `DATA_DIR` | `data` | 会话根目录 |
 | `MAX_UPLOAD_MB` | `500` | 上传/URL 下载上限 |
 | `CODEX_TIMEOUT_S` | `1800` | 单次 codex 硬超时 |
-| `AUTO_RETRY_COUNT` | `2` | 同 task 的瞬时操作重试次数，也是完整确认 `h3_provider_failed` 后的额外 attempt 数；默认供应商 POST 总数最多 3 |
-| `AUTO_RETRY_INTERVAL_S` | `15` | 同 task 瞬时操作或 provider failure 自动补交前的固定等待秒数 |
+| `AUTO_RETRY_COUNT` | `2` | 同 task 的瞬时操作重试次数、完整确认 `h3_provider_failed` 后的额外 attempt 数，以及 MediaKit 明确 HTTP 429 `RequestLimitExceeded` 的额外尝试数；默认最多 3 次 POST |
+| `AUTO_RETRY_INTERVAL_S` | `15` | 上述瞬时操作、provider failure 或 MediaKit 明确限流重试前的固定等待秒数 |
 | `CODEX_CONCURRENCY` | `10` | pipeline 并发闸 |
 | `MAX_QUEUED` | `100` | queued 会话上限 |
 | `VOCAL_FILTER` | `on` | off/false/0 才关闭 keep/drop；未知值保持开启 |
@@ -431,9 +431,10 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `H3_POLL_TIMEOUT_S` | `1500` | H3 轮询总时限 |
 | `H3_DOWNLOAD_TIMEOUT_S` | `180` | 成片下载超时 |
 | `H3_POLL_INTERVAL_S` | `3` | 两次查询间隔，可为 0 |
-| `ENABLE_SEEDREAM_EDIT` | false | 可选关键帧后处理开关 |
-| `SEEDREAM_MODEL` | `doubao-seedream-5-0-pro-260628` | 后处理模型 |
-| `SEEDREAM_CONCURRENCY` | `10` | 后处理并发，最小钳制为 1 |
+| `ENABLE_MEDIAKIT_ERASE` | false | 可选关键帧擦除开关 |
+| `VOLC_MEDIAKIT_API_KEY` | 空 | AI MediaKit Bearer 凭据，不进入公开 API/meta/日志 |
+| `MEDIAKIT_CONCURRENCY` | `4` | 帧级并发，最小钳制为 1 |
+| `MEDIAKIT_TIMEOUT_S` | `180` | 上传、擦除和结果下载请求超时 |
 | `TIKTOK_PROXY` | 空 | TikTok/DoH 下载代理 |
 | `DOWNLOAD_TIMEOUT_S` | `120` | URL 下载整体时限 |
 | `HOST` / `PORT` | `0.0.0.0` / `3211` | `run.sh` 默认；生产 unit 必须覆盖为 `127.0.0.1/3212` |
@@ -444,5 +445,5 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 
 - Python：FastAPI、uvicorn、httpx、OpenCV、ai-edge-litert 等（以 `requirements.txt` 为准）。
 - 可执行：`ffmpeg`、`ffprobe`、已认证的 `codex` CLI。
-- 外部服务：AutoDL Art H3；可选 Seedream 图像编辑。
+- 外部服务：AutoDL Art H3；可选 AI MediaKit 图像擦除。
 - 运行约束：Linux `flock/fsync` 语义、单 uvicorn 进程、Caddy 本机反代。

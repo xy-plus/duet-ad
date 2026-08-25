@@ -263,12 +263,12 @@ def test_run_rejects_rewrite_when_source_probe_crosses_long_threshold(
     cdir = settings.data_dir / meta["id"]
     (cdir / "source.mp4").write_bytes(b"fake")
     storage.update_meta(
-        settings.data_dir, meta["id"], duration_s=9.9, voice_mode="rewrite",
+        settings.data_dir, meta["id"], duration_s=13.9, voice_mode="rewrite",
     )
     operations = []
     monkeypatch.setattr(
         storage, "probe_video",
-        lambda _path: storage.VideoProbe(10.001, 320, 240),
+        lambda _path: storage.VideoProbe(15.001, 320, 240),
     )
     monkeypatch.setattr(
         pipeline, "_run_cmd",
@@ -291,7 +291,7 @@ def test_run_rejects_translate_when_manifest_crosses_long_threshold_before_voice
     cdir = settings.data_dir / meta["id"]
     (cdir / "source.mp4").write_bytes(b"fake")
     storage.update_meta(
-        settings.data_dir, meta["id"], duration_s=9.9, voice_mode="translate",
+        settings.data_dir, meta["id"], duration_s=13.9, voice_mode="translate",
         target_language="English",
     )
     operations = []
@@ -300,12 +300,12 @@ def test_run_rejects_translate_when_manifest_crosses_long_threshold_before_voice
         operations.append(step)
         work = Path(argv[argv.index("--out-dir") + 1])
         (work / "manifest.json").write_text(
-            json.dumps({"duration_seconds": 10.001}), encoding="utf-8"
+            json.dumps({"duration_seconds": 15.001}), encoding="utf-8"
         )
 
     monkeypatch.setattr(
         storage, "probe_video",
-        lambda _path: storage.VideoProbe(9.9, 320, 240),
+        lambda _path: storage.VideoProbe(13.9, 320, 240),
     )
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
     monkeypatch.setattr(
@@ -1604,7 +1604,7 @@ def test_run_dialogue_auto_preserves_requested_voice_processing_mode(
     assert expected in asr_prompts[0]
 
 
-def test_run_dialogue_auto_routes_explicit_empty_12_4s_scene_result_to_long_plan(
+def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan(
     tmp_path, video_1s, monkeypatch
 ):
     settings = make_settings(tmp_path)
@@ -1614,38 +1614,38 @@ def test_run_dialogue_auto_routes_explicit_empty_12_4s_scene_result_to_long_plan
         meta["id"],
         dialogue_mode="auto",
         voice_mode="keep",
-        duration_s=12.4,
+        duration_s=15.4,
         ratio="9:16",
         fit_mode="pad",
     )
-    line = {"text": "第十一秒台词。", "start_s": 11.0, "end_s": 12.0}
+    line = {"text": "第十六秒台词。", "start_s": 15.1, "end_s": 15.4}
 
     def fake_steps(argv, *, timeout, step, cwd=None):
         if step == "extract":
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
             (work / "manifest.json").write_text(
-                json.dumps({"duration_seconds": 12.4}), encoding="utf-8"
+                json.dumps({"duration_seconds": 15.4}), encoding="utf-8"
             )
         elif step == "scenes":
             work = Path(argv[argv.index("--work-dir") + 1])
             (work / "scenes.json").write_text(
-                json.dumps({"duration_s": 12.4, "scenes": [], "segments": []}),
+                json.dumps({"duration_s": 15.4, "scenes": [], "segments": []}),
                 encoding="utf-8",
             )
         elif step.startswith("segment ") and step.endswith(" extract"):
             work = Path(argv[argv.index("--out-dir") + 1])
             work.mkdir(parents=True, exist_ok=True)
             (work / "001_frame_000.000s.png").write_bytes(_PX_PNG)
-            (work / "002_frame_012.400s.png").write_bytes(_PX_PNG)
+            (work / "002_frame_015.400s.png").write_bytes(_PX_PNG)
             (work / "manifest.json").write_text(
                 json.dumps(
                     {
                         "frames": [
                             {"index": 1, "time_seconds": 0.0,
                              "file": "001_frame_000.000s.png"},
-                            {"index": 2, "time_seconds": 12.4,
-                             "file": "002_frame_012.400s.png"},
+                            {"index": 2, "time_seconds": 15.4,
+                             "file": "002_frame_015.400s.png"},
                         ]
                     }
                 ),
@@ -1674,13 +1674,13 @@ def test_run_dialogue_auto_routes_explicit_empty_12_4s_scene_result_to_long_plan
         ),
     )
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(voice, "probe_audio_duration", lambda _path: 12.4)
+    monkeypatch.setattr(voice, "probe_audio_duration", lambda _path: 15.4)
     monkeypatch.setattr(CodexRunner, "run", fake_codex)
     monkeypatch.setattr(
         vocal,
         "analyze",
         lambda _audio: vocal.VocalAnalysis(
-            windows=[vocal.VocalWindow(0, 12_400, sung=0.0, spoken=0.3, music=0.0)],
+                windows=[vocal.VocalWindow(0, 15_400, sung=0.0, spoken=0.3, music=0.0)],
             has_bgm=False,
         ),
     )
@@ -1693,22 +1693,22 @@ def test_run_dialogue_auto_routes_explicit_empty_12_4s_scene_result_to_long_plan
     assert stored["fit_required"] is True
     assert stored["voice_lines"] == [line]
     receipt = json.loads((cdir / "long_video_plan.json").read_text(encoding="utf-8"))
-    assert receipt["video"]["duration_s"] == 12.4
+    assert receipt["video"]["duration_s"] == 15.4
     assert len(receipt["segments"]) == 2
     assert [
         long_video.provider_duration_s(item["start_s"], item["end_s"])
         for item in receipt["segments"]
-    ] == [10, 3]
+    ] == [14, 2]
     assert stored["segments"][0]["dialogue"] == []
     assert stored["segments"][1]["dialogue"] == [
-        {"text": "第十一秒台词。", "start_s": 1.0, "end_s": 2.0}
+        {"text": "第十六秒台词。", "start_s": 1.1, "end_s": 1.4}
     ]
     digest = hashlib.sha256((cdir / "long_video_plan.json").read_bytes()).hexdigest()
     frozen = long_generation.freeze_plan(cdir, stored, digest, "none", "auto")
     assert [
         long_video.provider_duration_s(item.start_s, item.end_s)
         for item in frozen.segments
-    ] == [10, 3]
+    ] == [14, 2]
 
 
 def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
@@ -2347,7 +2347,7 @@ def test_startup_reconciles_half_committed_long_plan_without_rewrite(
         encoding="utf-8",
     )
     (segwork / "voice_lines.json").write_text("[]", encoding="utf-8")
-    duration = 10.000000000000004
+    duration = 14.000000000000004
     public = {
         "index": 1, "start_s": 0.0, "end_s": duration,
         "chain_id": "chain-001", "join_mode": "hard_cut",
@@ -2364,16 +2364,18 @@ def test_startup_reconciles_half_committed_long_plan_without_rewrite(
     )
     monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
     assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
-    receipt = long_video.write_plan_receipt(
-        cdir, source=cdir / "source.mp4", duration_s=duration,
-        segments=[{
-            **public, "source_path": segdir / "source.mp4",
-            "keyframe_paths": [key], "first_frame_path": first,
-            "last_frame_path": last, "visual_prompt_path": visual,
-            "final_prompt_path": final,
-        }],
-        workflow=pipeline.H3_BOUNDARY_WORKFLOW,
-    )
+    with monkeypatch.context() as historical:
+        historical.setattr(long_video, "SHORT_VIDEO_MAX_S", 14.0)
+        receipt = long_video.write_plan_receipt(
+            cdir, source=cdir / "source.mp4", duration_s=duration,
+            segments=[{
+                **public, "source_path": segdir / "source.mp4",
+                "keyframe_paths": [key], "first_frame_path": first,
+                "last_frame_path": last, "visual_prompt_path": visual,
+                "final_prompt_path": final,
+            }],
+            workflow=pipeline.H3_BOUNDARY_WORKFLOW,
+        )
     if meta_pointer:
         storage.update_meta(
             settings.data_dir, meta["id"], segments=[public],

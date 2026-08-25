@@ -141,8 +141,8 @@ def test_long_upload_rejects_non_keep_audio_and_cleans_up(
     fake = subprocess.CompletedProcess(
         args=[], returncode=0,
         stdout=json.dumps({
-            "format": {"duration": "15"},
-            "streams": [{"width": 320, "height": 240, "duration": "15"}],
+            "format": {"duration": "15.001"},
+            "streams": [{"width": 320, "height": 240, "duration": "15.001"}],
         }), stderr="",
     )
     monkeypatch.setattr("app.storage.subprocess.run", lambda *_a, **_kw: fake)
@@ -177,8 +177,8 @@ def test_upload_accepts_exact_h3_limit(client, video_1s, monkeypatch, settings):
 @pytest.mark.parametrize(
     "video_duration,format_duration,voice_mode,expected_status",
     [
-        (10.0, 10.1, "rewrite", 201),
-        (10.001, 9.9, "rewrite", 422),
+        (15.0, 15.1, "rewrite", 201),
+        (15.001, 14.9, "rewrite", 422),
         (300.0, 300.2, "keep", 201),
         (300.001, 299.9, "keep", 422),
     ],
