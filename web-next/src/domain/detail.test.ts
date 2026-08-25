@@ -5,11 +5,42 @@ import {
   recoverLockedPostprocess,
   recoverPromptChanged,
   shouldPollDetail,
+  adaptConversationDetail,
 } from './detail';
 import { ApiError } from '../api/errors';
 import { conversationBadge } from './navigation';
 
 describe('detail state contract', () => {
+  it('adapts image prompts, capabilities and segment postprocess into a canonical model', () => {
+    const detail = adaptConversationDetail({
+      image_optimization_prompt: { text: '优化', default_text: '默认', sha256: 'a'.repeat(64) },
+      postprocess_capabilities: { remove_subtitle: true, remove_brand: false, optimize_image: true },
+      postprocess: { segments: [{ index: 1, status: 'failed', stage: 'submission_unknown', completed_frames: 2, total_frames: 3, revision: 4, error: '未知' }] },
+      segments: [{ index: 1, image_optimization_prompt: { text: '段优化', default_text: '段默认', sha256: 'b'.repeat(64) } }],
+    });
+    expect(detail.imageOptimizationPrompt?.text).toBe('优化');
+    expect(detail.postprocessCapabilities).toEqual({ remove_subtitle: true, remove_brand: false, optimize_image: true });
+    expect(detail.postprocessSegments[0]).toMatchObject({ index: 1, stage: 'submission_unknown', revision: 4 });
+    expect(detail.segments[0].imageOptimizationPrompt?.defaultText).toBe('段默认');
+  });
+
+  it('accepts postprocess segment zero for short video but rejects it for long video', () => {
+    const short = adaptConversationDetail({
+      segments: [],
+      postprocess: { segments: [{ index: 0, status: 'failed', stage: 'h3', completed_frames: 0, total_frames: 1, revision: 1, error: '失败' }] },
+    });
+    const long = adaptConversationDetail({
+      segment_count: 2,
+      plan_receipt: 'd'.repeat(64),
+      segments: [{ index: 0, image_optimization_prompt: { text: '不可用', default_text: '默认', sha256: 'c'.repeat(64) } }, { index: 1 }],
+      postprocess: { segments: [{ index: 0, status: 'failed', stage: 'h3', completed_frames: 0, total_frames: 1, revision: 1, error: '失败' }] },
+    });
+    expect(short.postprocessSegments).toHaveLength(1);
+    expect(long.segments.map(({ index }) => index)).toEqual([1]);
+    expect(long.postprocessSegments).toEqual([]);
+    expect(adaptConversationDetail({ segment_count: 1, postprocess: short.postprocessSegments.map((segment) => ({ index: segment.index, status: segment.status, stage: segment.stage, completed_frames: segment.completedFrames, total_frames: segment.totalFrames, revision: segment.revision, error: segment.error })) }).postprocessSegments).toEqual([]);
+    expect(adaptConversationDetail({ plan_receipt: 'receipt', postprocess: { segments: [{ index: 0, status: 'failed', stage: 'h3', completed_frames: 0, total_frames: 1, revision: 1, error: null }] } }).postprocessSegments).toEqual([]);
+  });
   it('fails closed when operation capability fields are missing', () => {
     expect(canOperate({ read_only: false, submit_enabled: true })).toBe(true);
     expect(canOperate({ read_only: true, submit_enabled: true })).toBe(false);
@@ -91,6 +122,6 @@ describe('detail state contract', () => {
     await expect(recoverLockedPostprocess(
       new ApiError('locked', { status: 409, code: 'postprocess_options_locked' }),
       async () => latest,
-    )).resolves.toEqual({ latest, options: latest.postprocess.options });
+    )).resolves.toEqual({ latest, options: { ...latest.postprocess.options, optimize_image: false } });
   });
 });

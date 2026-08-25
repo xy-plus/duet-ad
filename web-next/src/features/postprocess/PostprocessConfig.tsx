@@ -11,6 +11,7 @@ interface PostprocessConfigProps {
   onOptionsChange: (options: PostprocessOptions) => void;
   onCancel: () => void;
   onSubmit: (options: PostprocessOptions) => void;
+  capabilities?: PostprocessOptions;
 }
 
 type PostprocessOptionKey = keyof PostprocessOptions;
@@ -18,6 +19,7 @@ type PostprocessOptionKey = keyof PostprocessOptions;
 const optionLabels: Record<PostprocessOptionKey, string> = {
   remove_subtitle: '移除文字/字幕',
   remove_brand: '移除常见 Logo/图标',
+  optimize_image: '进行图片优化',
 };
 
 const optionKeys = Object.keys(optionLabels) as PostprocessOptionKey[];
@@ -30,11 +32,17 @@ export function PostprocessConfig({
   onOptionsChange,
   onCancel,
   onSubmit,
+  capabilities = { remove_subtitle: true, remove_brand: true, optimize_image: true },
 }: PostprocessConfigProps) {
   const [submitRequested, setSubmitRequested] = useState(false);
   const submitted = serverOptions !== undefined;
   const locked = submitting || submitRequested;
-  const selectedOptions = optionKeys.filter((key) => options[key]);
+  const normalizedOptions: PostprocessOptions = {
+    remove_subtitle: capabilities.remove_subtitle && options.remove_subtitle,
+    remove_brand: capabilities.remove_brand && options.remove_brand,
+    optimize_image: capabilities.optimize_image && options.optimize_image,
+  };
+  const selectedOptions = optionKeys.filter((key) => normalizedOptions[key]);
 
   useEffect(() => {
     if (!open) setSubmitRequested(false);
@@ -43,8 +51,7 @@ export function PostprocessConfig({
   const submit = () => {
     if (locked || selectedOptions.length === 0 || submitted) return;
     setSubmitRequested(true);
-    onSubmit(options);
-    onCancel();
+    onSubmit(normalizedOptions);
   };
 
   return (
@@ -70,7 +77,7 @@ export function PostprocessConfig({
     >
       <Space orientation="vertical" size="middle">
         <Typography.Paragraph type="secondary">
-          每个选项对应一次 MediaKit 擦除；提交后由服务端冻结，并在会话内后台处理。
+          服务端会按固定阶段顺序处理所选项目；提交后选项冻结，并在会话内后台处理。
         </Typography.Paragraph>
         <Checkbox.Group
           value={selectedOptions}
@@ -78,13 +85,14 @@ export function PostprocessConfig({
           onChange={(values) => {
             const selected = new Set(values as PostprocessOptionKey[]);
             onOptionsChange({
-              remove_subtitle: selected.has('remove_subtitle'),
-              remove_brand: selected.has('remove_brand'),
+              remove_subtitle: capabilities.remove_subtitle && selected.has('remove_subtitle'),
+              remove_brand: capabilities.remove_brand && selected.has('remove_brand'),
+              optimize_image: capabilities.optimize_image && selected.has('optimize_image'),
             });
           }}
         >
           <Space orientation="vertical">
-            {optionKeys.map((key) => (
+            {optionKeys.filter((key) => capabilities[key]).map((key) => (
               <Checkbox key={key} value={key}>{optionLabels[key]}</Checkbox>
             ))}
           </Space>

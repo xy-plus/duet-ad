@@ -6,6 +6,8 @@ import {
   useConversationDetailQuery,
   useConversationsQuery,
   useLoginMutation,
+  UnsavedDraftProvider,
+  useUnsavedDraftGuard,
 } from './state';
 import { ConversationSidebar, LoginView, WorkspaceShell } from './features/shell';
 import { Alert, Spin, Tag } from './ui/antd';
@@ -73,6 +75,7 @@ function Workspace({ apiClient }: AppProps) {
   const conversations = useConversationsQuery(apiClient);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const draftGuard = useUnsavedDraftGuard();
 
   useEffect(() => {
     if (!creating && selectedId === null && conversations.data?.length) {
@@ -87,13 +90,11 @@ function Workspace({ apiClient }: AppProps) {
       conversations={conversations.data ?? []}
       getNavigationStatus={statusTag}
       onConversationSelect={(id) => {
-        setCreating(false);
-        setSelectedId(id);
+        draftGuard.run(() => { setCreating(false); setSelectedId(id); });
       }}
-      onLogout={() => apiClient.clearSession()}
+      onLogout={() => draftGuard.run(() => apiClient.clearSession())}
       onNewConversation={() => {
-        setSelectedId(null);
-        setCreating(true);
+        draftGuard.run(() => { setSelectedId(null); setCreating(true); });
       }}
     />
   );
@@ -146,5 +147,5 @@ function Workspace({ apiClient }: AppProps) {
 
 export default function App({ apiClient }: AppProps) {
   useApiSessionKey(apiClient);
-  return apiClient.hasToken ? <Workspace apiClient={apiClient} /> : <Login apiClient={apiClient} />;
+  return apiClient.hasToken ? <UnsavedDraftProvider><Workspace apiClient={apiClient} /></UnsavedDraftProvider> : <Login apiClient={apiClient} />;
 }

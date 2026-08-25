@@ -64,8 +64,10 @@ interface ApiController {
   requests: Array<{ method: string; path: string; headers: Record<string, string>; body: string | null }>;
   create?: (route: Route, controller: ApiController) => Promise<void>;
   patchPrompt?: (route: Route, id: string, controller: ApiController) => Promise<void>;
+  patchImagePrompt?: (route: Route, id: string, controller: ApiController) => Promise<void>;
   submit?: (route: Route, id: string, controller: ApiController) => Promise<void>;
   postprocess?: (route: Route, id: string, controller: ApiController) => Promise<void>;
+  retryPostprocessSegment?: (route: Route, id: string, index: number, controller: ApiController) => Promise<void>;
 }
 
 async function installApi(page: Page, controller: ApiController) {
@@ -97,6 +99,11 @@ async function installApi(page: Page, controller: ApiController) {
       await controller.patchPrompt(route, decodeURIComponent(promptMatch[1]), controller);
       return;
     }
+    const imagePromptMatch = path.match(/^\/api\/conversations\/([^/]+)\/image-optimization-prompt$/u);
+    if (imagePromptMatch && method === 'PATCH' && controller.patchImagePrompt) {
+      await controller.patchImagePrompt(route, decodeURIComponent(imagePromptMatch[1]), controller);
+      return;
+    }
     const submitMatch = path.match(/^\/api\/conversations\/([^/]+)\/submit$/u);
     if (submitMatch && method === 'POST' && controller.submit) {
       await controller.submit(route, decodeURIComponent(submitMatch[1]), controller);
@@ -105,6 +112,11 @@ async function installApi(page: Page, controller: ApiController) {
     const postprocessMatch = path.match(/^\/api\/conversations\/([^/]+)\/postprocess$/u);
     if (postprocessMatch && method === 'POST' && controller.postprocess) {
       await controller.postprocess(route, decodeURIComponent(postprocessMatch[1]), controller);
+      return;
+    }
+    const retrySegmentMatch = path.match(/^\/api\/conversations\/([^/]+)\/postprocess\/segments\/(\d+)\/retry$/u);
+    if (retrySegmentMatch && method === 'POST' && controller.retryPostprocessSegment) {
+      await controller.retryPostprocessSegment(route, decodeURIComponent(retrySegmentMatch[1]), Number(retrySegmentMatch[2]), controller);
       return;
     }
     const detailMatch = path.match(/^\/api\/conversations\/([^/]+)$/u);
@@ -281,6 +293,7 @@ test('prompt CAS conflict sends exact PATCH, refetches, and displays the conflic
   };
   await installApi(page, controller);
   await login(page);
+  await page.getByRole('button', { name: '展开生成提示词' }).click();
   await page.getByLabel('提示词草稿').fill('我的修改');
   await page.getByRole('button', { name: '确认保存' }).click();
 
@@ -296,6 +309,28 @@ test('prompt CAS conflict sends exact PATCH, refetches, and displays the conflic
   });
   expect(controller.requests.filter(({ method, path }) => method === 'GET' && path === '/api/conversations/prompt').length)
     .toBeGreaterThanOrEqual(2);
+});
+
+test('prompt consecutive saves immediately use the sha returned by the previous PATCH', async ({ page }) => {
+  const candidate = detail('prompt-twice', { title: '连续保存提示词' });
+  let attempt = 0;
+  const controller: ApiController = {
+    details: { 'prompt-twice': candidate }, order: ['prompt-twice'], requests: [],
+    patchPrompt: async (route) => {
+      attempt += 1;
+      const prompt = String((JSON.parse(route.request().postData() ?? '{}') as JsonRecord).prompt);
+      await route.fulfill({ json: { prompt, sha256: String(attempt + 1).repeat(64), final_prompt: prompt } });
+    },
+  };
+  await installApi(page, controller);
+  await login(page);
+  await page.getByRole('button', { name: '展开生成提示词' }).click();
+  await page.getByRole('textbox', { name: '提示词草稿' }).fill('第一次');
+  await page.getByRole('button', { name: '确认保存' }).click();
+  await page.getByRole('textbox', { name: '提示词草稿' }).fill('第二次');
+  await page.getByRole('button', { name: '确认保存' }).click();
+  const patches = controller.requests.filter(({ method, path }) => method === 'PATCH' && path.endsWith('/prompt'));
+  expect(patches.map(({ body }) => (JSON.parse(body ?? '{}') as JsonRecord).expected_sha256)).toEqual(['a'.repeat(64), '2'.repeat(64)]);
 });
 
 test('generation evidence freezes drafts and every recovery action uses safe ids and parameters', async ({ page }) => {
@@ -399,6 +434,52 @@ test('generation evidence freezes drafts and every recovery action uses safe ids
   await expect(page.getByRole('button', { name: /确认生成|新建任务重试|继续原任务|继续拼接/u })).toHaveCount(0);
 });
 
+test('image optimization uses CAS and dirty navigation requires an explicit decision', async ({ page }) => {
+  const image = detail('image', {
+    title: '图片优化会话',
+    image_optimization_prompt: { text: '当前优化稿', default_text: '默认优化稿', sha256: 'd'.repeat(64) },
+    postprocess_capabilities: { remove_subtitle: true, remove_brand: true, optimize_image: true },
+  });
+  const other = detail('image-other', { title: '图片优化切换目标' });
+  const controller: ApiController = {
+    details: { image, 'image-other': other }, order: ['image', 'image-other'], requests: [],
+    patchImagePrompt: async (route) => route.fulfill({ json: { text: '本地新稿', default_text: '默认优化稿', sha256: 'e'.repeat(64) } }),
+  };
+  await installApi(page, controller);
+  await login(page);
+  await page.getByRole('button', { name: '展开图片优化' }).click();
+  await page.getByRole('textbox', { name: '图片优化' }).fill('本地新稿');
+  await page.getByText('图片优化切换目标').first().click();
+  await expect(page.getByRole('dialog', { name: '文本草稿尚未保存' })).toBeVisible();
+  await page.getByRole('button', { name: /取\s*消/u }).click();
+  await expect(page.getByRole('textbox', { name: '图片优化' })).toHaveValue('本地新稿');
+  await page.getByRole('button', { name: '保存图片优化' }).click();
+  await expect.poll(() => controller.requests.some(({ path }) => path.endsWith('/image-optimization-prompt'))).toBe(true);
+  const request = controller.requests.find(({ path }) => path.endsWith('/image-optimization-prompt'));
+  expect(JSON.parse(request?.body ?? '{}')).toEqual({ confirm: true, segment_index: 0, expected_sha256: 'd'.repeat(64), prompt: '本地新稿' });
+  await page.getByRole('button', { name: '展开生成提示词' }).click();
+  await page.getByRole('textbox', { name: '提示词草稿' }).fill('未保存生成稿');
+  await page.getByText('图片优化切换目标').first().click();
+  await expect(page.getByRole('dialog', { name: '文本草稿尚未保存' })).toContainText('请选择保存、丢弃或取消');
+  await page.getByRole('button', { name: /取\s*消/u }).click();
+});
+
+test('long text workspace remains available when image optimization capability is false', async ({ page }) => {
+  const candidate = detail('long-no-image', {
+    title: '长段无图片优化能力', duration_s: 20, segment_count: 1, plan_receipt: receipt,
+    postprocess_capabilities: { remove_subtitle: true, remove_brand: true, optimize_image: false },
+    segments: [{ index: 1, prompt: '长段提示词', lines: ['长段台词'], keyframes: [], image_optimization_prompt: { text: '不可编辑', default_text: '默认', sha256: 'f'.repeat(64) } }],
+  });
+  const controller: ApiController = { details: { 'long-no-image': candidate }, order: ['long-no-image'], requests: [] };
+  await installApi(page, controller);
+  await login(page);
+  await expect(page.getByRole('button', { name: '展开生成提示词' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '展开段台词' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '展开图片优化' })).toBeDisabled();
+  await page.getByRole('button', { name: '展开生成提示词' }).click();
+  await expect(page.getByRole('textbox', { name: '生成提示词' })).toHaveValue('长段提示词');
+});
+
 test('postprocess submits exact options, closes to a background card, and survives conversation switching', async ({ page }) => {
   const candidate = detail('post', {
     title: '后处理会话',
@@ -426,7 +507,7 @@ test('postprocess submits exact options, closes to a background card, and surviv
         navigation_status: 'postprocessing',
         postprocess: {
           status: 'running',
-          options: { remove_subtitle: true, remove_brand: false },
+          options: { remove_subtitle: true, remove_brand: false, optimize_image: false },
           frames: [],
           error: null,
         },
@@ -436,7 +517,11 @@ test('postprocess submits exact options, closes to a background card, and surviv
   };
   await installApi(page, controller);
   await login(page);
-  await page.getByRole('button', { name: '优化关键帧' }).click();
+  await expect(page.getByRole('button', { name: '否', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', { name: '是', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: /取\s*消/u }).click();
+  await expect(page.getByRole('button', { name: '否', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', { name: '是', exact: true }).click();
   const removeBrand = page.getByRole('checkbox', { name: '移除常见 Logo/图标' });
   await removeBrand.click();
   await expect(removeBrand).not.toBeChecked();
@@ -453,9 +538,25 @@ test('postprocess submits exact options, closes to a background card, and surviv
   const request = controller.requests.find(({ path, method }) => path.endsWith('/postprocess') && method === 'POST');
   expect(JSON.parse(request?.body ?? '{}')).toEqual({
     confirm: true,
-    options: { remove_subtitle: true, remove_brand: false },
+    options: { remove_subtitle: true, remove_brand: false, optimize_image: false },
   });
   expect(postCount).toBe(1);
+});
+
+test('postprocess submission failure restores the default no decision', async ({ page }) => {
+  const candidate = detail('post-failure', {
+    title: '后处理失败恢复否', generation: { status: 'succeeded', stage: 'h3', client_request_id: 'post-failure-generation' }, fit_mode: 'none', keyframes: ['one.png'],
+  });
+  const controller: ApiController = {
+    details: { 'post-failure': candidate }, order: ['post-failure'], requests: [],
+    postprocess: async (route) => route.fulfill({ status: 500, json: { detail: { code: 'postprocess_failed', message: '提交失败' } } }),
+  };
+  await installApi(page, controller);
+  await login(page);
+  await page.getByRole('button', { name: '是', exact: true }).click();
+  await page.getByRole('button', { name: '开始后处理' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: '提交失败' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '否', exact: true })).toHaveAttribute('aria-pressed', 'true');
 });
 
 test('postprocess_options_locked refetches and displays server-frozen options without automatic resend', async ({ page }) => {
@@ -477,7 +578,7 @@ test('postprocess_options_locked refetches and displays server-frozen options wi
         navigation_status: 'postprocessing',
         postprocess: {
           status: 'running',
-          options: { remove_subtitle: false, remove_brand: true },
+          options: { remove_subtitle: false, remove_brand: true, optimize_image: false },
           frames: [],
           error: null,
         },
@@ -490,7 +591,7 @@ test('postprocess_options_locked refetches and displays server-frozen options wi
   };
   await installApi(page, controller);
   await login(page);
-  await page.getByRole('button', { name: '优化关键帧' }).click();
+  await page.getByRole('button', { name: '是', exact: true }).click();
   await page.getByRole('button', { name: '开始后处理' }).click();
   await expect(page.getByRole('alert').filter({ hasText: '服务端已锁定后处理选项' }))
     .toContainText('服务端已锁定后处理选项');

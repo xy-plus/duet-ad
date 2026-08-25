@@ -1,7 +1,10 @@
 export interface PostprocessOptions {
   remove_subtitle: boolean;
   remove_brand: boolean;
+  optimize_image: boolean;
 }
+
+export type PostprocessCapabilities = PostprocessOptions;
 
 export type PostprocessTaskStatus = 'queued' | 'running' | 'partial_success' | 'failed' | 'succeeded';
 
@@ -17,9 +20,25 @@ export interface PostprocessTask {
   totalCount: number;
   results: PostprocessResult[];
   errorMessage?: string;
+  segments?: readonly PostprocessSegmentStatus[];
+}
+
+export interface PostprocessSegmentStatus {
+  index: number;
+  status: string;
+  stage: string | null;
+  completedFrames: number;
+  totalFrames: number;
+  revision: number;
+  error: string | null;
 }
 
 export interface PostprocessRetryAction {
   taskId: string;
   options: PostprocessOptions;
+}
+
+export interface PostprocessSegmentRetryAction {
+  index: number;
+  expectedRevision: number;
 }

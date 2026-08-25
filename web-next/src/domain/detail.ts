@@ -9,12 +9,80 @@ export interface DetailSignature {
   readonly generation: string;
 }
 
+export interface AdaptedImageOptimizationPrompt {
+  readonly text: string;
+  readonly defaultText: string;
+  readonly sha256: string;
+}
+
+export interface AdaptedConversationDetail {
+  readonly imageOptimizationPrompt: AdaptedImageOptimizationPrompt | null;
+  readonly postprocessCapabilities: PostprocessOptions;
+  readonly postprocessSegments: readonly {
+    readonly index: number;
+    readonly status: string;
+    readonly stage: string | null;
+    readonly completedFrames: number;
+    readonly totalFrames: number;
+    readonly revision: number;
+    readonly error: string | null;
+  }[];
+  readonly segments: readonly { readonly index: number; readonly imageOptimizationPrompt: AdaptedImageOptimizationPrompt | null }[];
+}
+
 function record(value: unknown): UnknownRecord | null {
   return typeof value === 'object' && value !== null ? value as UnknownRecord : null;
 }
 
 function array(value: unknown): readonly unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+export function adaptImageOptimizationPrompt(value: unknown): AdaptedImageOptimizationPrompt | null {
+  const source = record(value);
+  if (typeof source?.text !== 'string' || typeof source.default_text !== 'string'
+      || typeof source.sha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(source.sha256)) return null;
+  return { text: source.text, defaultText: source.default_text, sha256: source.sha256 };
+}
+
+export function adaptConversationDetail(value: unknown): AdaptedConversationDetail {
+  const source = record(value) ?? {};
+  const sourceSegments = array(source.segments);
+  const isLong = (Number.isInteger(source.segment_count) && Number(source.segment_count) > 0)
+    || (typeof source.plan_receipt === 'string' && source.plan_receipt.length > 0)
+    || sourceSegments.some((value) => {
+    const segment = record(value);
+    return segment && Number.isInteger(segment.index) && Number(segment.index) > 0;
+  });
+  const capabilities = record(source.postprocess_capabilities);
+  const postprocess = record(source.postprocess);
+  return {
+    imageOptimizationPrompt: adaptImageOptimizationPrompt(source.image_optimization_prompt),
+    postprocessCapabilities: {
+      remove_subtitle: capabilities ? capabilities.remove_subtitle === true : source.postprocess_enabled === true,
+      remove_brand: capabilities ? capabilities.remove_brand === true : source.postprocess_enabled === true,
+      optimize_image: capabilities?.optimize_image === true,
+    },
+    postprocessSegments: array(postprocess?.segments).flatMap((value) => {
+      const segment = record(value);
+      if (!segment || !Number.isInteger(segment.index) || Number(segment.index) < 0
+          || (isLong && Number(segment.index) === 0) || typeof segment.status !== 'string'
+          || !Number.isInteger(segment.completed_frames) || !Number.isInteger(segment.total_frames)
+          || !Number.isInteger(segment.revision)) return [];
+      return [{
+        index: Number(segment.index), status: segment.status,
+        stage: typeof segment.stage === 'string' ? segment.stage : null,
+        completedFrames: Number(segment.completed_frames), totalFrames: Number(segment.total_frames),
+        revision: Number(segment.revision), error: typeof segment.error === 'string' ? segment.error : null,
+      }];
+    }),
+    segments: sourceSegments.flatMap((value) => {
+      const segment = record(value);
+      return segment && Number.isInteger(segment.index) && Number(segment.index) > 0
+        ? [{ index: Number(segment.index), imageOptimizationPrompt: adaptImageOptimizationPrompt(segment.image_optimization_prompt) }]
+        : [];
+    }),
+  };
 }
 
 export function shouldPollDetail(detail: unknown): boolean {
@@ -51,6 +119,8 @@ export function detailSignature(detail: unknown): DetailSignature {
     source.receipt_version,
     source.source_prompt ?? null,
     source.source_prompt_sha256 ?? null,
+    source.image_optimization_prompt ?? null,
+    source.postprocess_capabilities ?? null,
     source.dialogue ?? null,
     postprocess?.status ?? '',
     postprocess?.error ?? '',
@@ -62,6 +132,7 @@ export function detailSignature(detail: unknown): DetailSignature {
         item.index,
         array(item.keyframes).join(','),
         item.prompt ?? '',
+        item.image_optimization_prompt ?? null,
         array(item.lines).join('\n'),
       ];
     }),
@@ -108,6 +179,7 @@ export async function recoverLockedPostprocess<T>(
     options: {
       remove_subtitle: options.remove_subtitle,
       remove_brand: options.remove_brand,
+      optimize_image: options.optimize_image === true,
     },
   };
 }
