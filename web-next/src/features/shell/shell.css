@@ -1,0 +1,97 @@
+.login-view {
+  display: grid;
+  min-height: 100dvh;
+  padding: 24px;
+  place-items: center;
+}
+
+.login-view__card {
+  width: min(100%, 420px);
+}
+
+.login-view__heading {
+  margin-block-end: 24px;
+}
+
+.login-view__title {
+  margin-block-end: 4px;
+}
+
+.login-view__alert {
+  margin-block-end: 20px;
+}
+
+.workspace-shell {
+  min-height: 100dvh;
+  overflow: hidden;
+}
+
+.workspace-shell__sider,
+.workspace-shell__workspace {
+  min-height: 0;
+}
+
+.workspace-shell__sider {
+  overflow: hidden;
+}
+
+.workspace-shell__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 64px;
+  padding-inline: 20px;
+}
+
+.workspace-shell__title {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.workspace-shell__content {
+  min-height: 0;
+  overflow: auto;
+}
+
+.conversation-sidebar {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  padding: 16px 12px 12px;
+  flex-direction: column;
+}
+
+.conversation-sidebar__brand {
+  min-height: 40px;
+  padding-inline: 12px;
+}
+
+.conversation-sidebar__conversations {
+  flex: 1;
+  min-height: 0;
+  margin-block-start: 12px;
+  overflow: auto;
+}
+
+.conversation-sidebar__item-label {
+  display: flex;
+  min-width: 0;
+  gap: 2px;
+  flex-direction: column;
+}
+
+.conversation-sidebar__status {
+  min-width: 0;
+  font-size: var(--ant-font-size-sm);
+}
+
+.conversation-sidebar__footer {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 767px) {
+  .workspace-shell__header {
+    padding-inline: 12px;
+  }
+}
