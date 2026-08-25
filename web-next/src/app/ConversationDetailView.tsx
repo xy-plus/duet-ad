@@ -8,12 +8,13 @@ import {
   buildStitchRetryPayload,
   buildSubmitPayload,
   canOperate,
-  createGenerationDraft,
   fitProfile,
+  generationRetryContract,
   longVideoContract,
   newClientRequestId,
   recoverLockedPostprocess,
   recoverPromptChanged,
+  safeGenerationDraft,
   type ConversationDetail,
   type GenerationDraft,
   type GenerationSubmitPayload,
@@ -202,54 +203,87 @@ function payloadForAction(
 }
 
 function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail: ConversationDetail }) {
-  const [draft, setDraft] = useState(() => createGenerationDraft(detail));
+  const queryClient = useQueryClient();
+  const sessionKey = useApiSessionKey(apiClient);
+  const [draft, setDraft] = useState(() => safeGenerationDraft(detail));
   const [error, setError] = useState<string>();
+  const [reconciling, setReconciling] = useState(() => apiClient.isSubmissionReconciling(detail.id));
   const mutation = useSubmitConversationMutation(apiClient, detail.id);
 
   useEffect(() => {
-    setDraft((previous) => createGenerationDraft(detail, previous));
-  }, [detail]);
+    setDraft((previous) => safeGenerationDraft(detail, previous ?? undefined));
+    setReconciling(apiClient.isSubmissionReconciling(detail.id));
+  }, [apiClient, detail]);
 
-  const settings = generationSettingsValue(draft);
+  useEffect(() => {
+    if (!reconciling) return undefined;
+    let active = true;
+    const reconcile = async () => {
+      try {
+        const latest = await apiClient.getConversation(detail.id);
+        if (!active) return;
+        queryClient.setQueryData(queryKeys.detail(sessionKey, detail.id), latest);
+        if (!apiClient.isSubmissionReconciling(detail.id)) setReconciling(false);
+      } catch {
+        // A failed GET never authorizes another provider-facing POST.
+      }
+    };
+    void reconcile();
+    const interval = globalThis.setInterval(() => { void reconcile(); }, 2_000);
+    return () => {
+      active = false;
+      globalThis.clearInterval(interval);
+    };
+  }, [apiClient, detail.id, queryClient, reconciling, sessionKey]);
+
+  const settings = draft ? generationSettingsValue(draft) : undefined;
   const model = generationStatusModel(detail, mutation.isPending);
   const operationAllowed = canOperate(detail);
-  const actionablePhase = ['new', 'failed', 'resume_required', 'stitch_required'].includes(model.phase);
-  const operationsBlocked = !operationAllowed && actionablePhase;
+  const actionContract = generationRetryContract(detail);
+  const actionAuthorized = operationAllowed
+    && draft !== null
+    && !reconciling
+    && actionContract.action !== 'none';
   const submit = async (action: GenerationAction) => {
+    if (!actionAuthorized || !draft) return;
     setError(undefined);
     try {
       await mutation.mutateAsync(payloadForAction(detail, draft, action));
     } catch (submitError) {
-      setError(errorMessage(submitError, '生成请求提交失败'));
+      if (apiClient.isSubmissionReconciling(detail.id)) {
+        setReconciling(true);
+      } else {
+        setError(errorMessage(submitError, '生成请求提交失败'));
+      }
     }
   };
 
   return (
     <section aria-label="视频生成" className="app-detail-stack">
       {error ? <Alert type="error" showIcon title={error} /> : null}
+      {reconciling ? (
+        <Alert type="warning" showIcon title="正在核对提交结果，已锁定再次提交" />
+      ) : null}
       <GenerationSettings
-        disabled={mutation.isPending || draft.frozen || !operationAllowed}
+        disabled={mutation.isPending || Boolean(draft?.frozen) || !operationAllowed}
         generation={generationEvidence(detail, settings)}
         initialValues={settings}
-        onChange={(value) => setDraft((previous) => updateGenerationDraft(previous, value))}
+        onChange={(value) => setDraft((previous) => previous
+          ? updateGenerationDraft(previous, value)
+          : previous)}
         value={settings}
         videoKind={longVideoContract(detail).isLong ? 'long' : 'short'}
       />
-      {operationsBlocked ? (
-        <Card title="生成状态">
-          <Alert
-            type="warning"
-            showIcon
-            title="当前会话不可执行生成动作"
-            description={detail.generation?.error ?? undefined}
-          />
-        </Card>
-      ) : (
-        <GenerationStatus
-          model={model}
-          onAction={(action) => { void submit(action); }}
-        />
-      )}
+      {!draft && !detail.generation ? (
+        <Alert type="warning" showIcon title="服务端生成参数不完整，已禁止提交" />
+      ) : null}
+      {!operationAllowed ? (
+        <Alert type="warning" showIcon title="当前会话不可执行生成动作" />
+      ) : null}
+      <GenerationStatus
+        model={model}
+        onAction={actionAuthorized ? (action) => { void submit(action); } : undefined}
+      />
     </section>
   );
 }
@@ -283,12 +317,14 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
   const [options, setOptions] = useState<PostprocessOptions>(serverOptions ?? initialPostprocessOptions);
   const [pendingOptions, setPendingOptions] = useState<PostprocessOptions>();
   const [error, setError] = useState<string>();
+  const operationAllowed = canOperate(detail);
 
   useEffect(() => {
     if (serverOptions) setOptions(serverOptions);
   }, [serverOptions?.remove_brand, serverOptions?.remove_subtitle]);
 
   const submit = async (submittedOptions: PostprocessOptions) => {
+    if (!operationAllowed) return;
     const frozen: ApiPostprocessOptions = {
       remove_subtitle: submittedOptions.remove_subtitle,
       remove_brand: submittedOptions.remove_brand,
@@ -326,7 +362,7 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
   const unknownShape = Boolean(detail.postprocess?.status) && !serverTask;
   const canConfigure = detail.postprocess === null
     && detail.postprocess_enabled
-    && canOperate(detail);
+    && operationAllowed;
 
   return (
     <section aria-label="关键帧后处理" className="app-detail-stack">
@@ -348,7 +384,7 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
       />
       {visibleTask ? (
         <PostprocessStatus
-          onRetry={retry}
+          onRetry={operationAllowed ? retry : undefined}
           retrying={mutation.isPending}
           task={visibleTask}
         />

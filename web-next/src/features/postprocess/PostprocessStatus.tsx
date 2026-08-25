@@ -19,7 +19,7 @@ import type {
 interface PostprocessStatusProps {
   task: PostprocessTask;
   retrying?: boolean;
-  onRetry: (action: PostprocessRetryAction) => void;
+  onRetry?: (action: PostprocessRetryAction) => void;
 }
 
 const statusLabels: Record<PostprocessTask['status'], string> = {
@@ -102,7 +102,7 @@ export function PostprocessStatus({ task, retrying = false, onRetry }: Postproce
         />
         <Progress percent={percent} status={progressStatus} aria-label="后处理进度" />
         {taskAlert(task)}
-        {retryable && (
+        {retryable && onRetry && (
           <Button
             aria-label={retrying ? '重试中' : '重试失败项'}
             loading={retrying}

@@ -4,6 +4,7 @@ import type {
   GenerationRetryContract,
 } from '../domain/generation';
 import { generationRetryContract } from '../domain';
+import { generationShapeIsOperable } from '../domain/generation';
 import type {
   ConversationDetail,
   ConversationSegment,
@@ -71,13 +72,19 @@ export function generationSettingsValue(draft: GenerationDraft): GenerationSetti
 
 export function generationEvidence(
   detail: ConversationDetail,
-  parameters: GenerationSettingsValue,
+  parameters?: GenerationSettingsValue,
 ): GenerationEvidence | undefined {
   if (!detail.generation) return undefined;
   const requestId = detail.generation.client_request_id;
   return {
     id: typeof requestId === 'string' && requestId ? requestId : `${detail.id}-generation`,
     parameters,
+    durationSeconds: typeof detail.duration_s === 'number' && Number.isFinite(detail.duration_s)
+      ? detail.duration_s
+      : null,
+    segmentCount: Number.isInteger(detail.segment_count) && Number(detail.segment_count) > 0
+      ? Number(detail.segment_count)
+      : null,
   };
 }
 
@@ -117,8 +124,10 @@ function generationSegments(detail: ConversationDetail): GenerationSegment[] {
 
 function generationPhase(detail: ConversationDetail): GenerationStatusModel['phase'] {
   const generation = detail.generation;
-  if (!generation || generation.status === null) return 'new';
-  if (generation.status === 'queued' || generation.status === 'running') return 'running';
+  if (!generation) return generationShapeIsOperable(detail) ? 'new' : 'submission_unknown';
+  if (generation.status === 'queued'
+      || generation.status === 'submitting'
+      || generation.status === 'running') return 'running';
   if (generation.status === 'failed') {
     return generation.stage === 'stitch' ? 'stitch_required' : 'failed';
   }

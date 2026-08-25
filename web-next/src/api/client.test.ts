@@ -87,9 +87,14 @@ describe('ApiClient', () => {
     const storage = new MemoryStorage();
     const requests: Array<{ url: string; init?: RequestInit }> = [];
     const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push({ url: String(input), init });
+      const url = String(input);
+      requests.push({ url, init });
       return new Response(JSON.stringify(
-        String(input).endsWith('/login') ? { ok: true } : { id: 'c1', status: 'done' },
+        url.endsWith('/login')
+          ? { ok: true }
+          : url.endsWith('/submit')
+            ? { status: 'queued', attempt: 1 }
+            : { id: 'c1', status: 'done' },
       ), { status: 200, headers: { 'Content-Type': 'application/json' } });
     });
     const client = new ApiClient({ storage, fetchImplementation, sessionKeyFactory: () => 'session' });
@@ -230,6 +235,50 @@ describe('ApiClient', () => {
       headers: { 'Content-Type': 'application/json' },
     }));
     await expect(first).resolves.toEqual({ status: 'queued', attempt: 1 });
+  });
+
+  it('keeps an ambiguous submit reconciliation lock until GET returns authoritative generation', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(TOKEN_STORAGE_KEY, 'secret');
+    let detailGeneration: unknown = null;
+    let submitCalls = 0;
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/submit')) {
+        submitCalls += 1;
+        throw new TypeError('connection reset');
+      }
+      if (url === '/api/conversations/c1') {
+        return Response.json({ id: 'c1', generation: detailGeneration });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const client = new ApiClient({ storage, fetchImplementation });
+    const payload = {
+      confirm: true as const,
+      client_request_id: 'request-ambiguous',
+      dialogue_mode: 'auto' as const,
+      fit_mode: 'none' as const,
+      aspect_ratio: '16:9' as const,
+      resolution: '480p' as const,
+    };
+
+    await expect(client.submitConversation('c1', payload)).rejects.toMatchObject({ code: 'network_error' });
+    await expect(client.submitConversation('c1', payload)).rejects.toMatchObject({ code: 'request_in_progress' });
+    expect(submitCalls).toBe(1);
+
+    await client.getConversation('c1');
+    await expect(client.submitConversation('c1', payload)).rejects.toMatchObject({ code: 'request_in_progress' });
+    expect(submitCalls).toBe(1);
+
+    detailGeneration = { status: 'failed', client_request_id: 'request-from-older-attempt' };
+    await client.getConversation('c1');
+    await expect(client.submitConversation('c1', payload)).rejects.toMatchObject({ code: 'request_in_progress' });
+    expect(submitCalls).toBe(1);
+
+    detailGeneration = { status: 'queued', client_request_id: 'request-ambiguous' };
+    await client.getConversation('c1');
+    expect(client.isSubmissionReconciling('c1')).toBe(false);
   });
 
   it('fetches authenticated files as Blob and leaves URL ownership to the hook', async () => {

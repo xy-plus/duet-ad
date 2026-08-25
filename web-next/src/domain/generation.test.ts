@@ -204,6 +204,33 @@ describe('generation contract', () => {
     }))).toEqual({ action: 'none', paidTaskCount: 0 });
   });
 
+  it('fails closed for null or unknown generation status and unknown or contradictory duration shapes', () => {
+    expect(generationAction(null)).toBe('none');
+    expect(generationAction('future_status')).toBe('none');
+    expect(generationRetryContract(longDetail({
+      duration_s: null,
+      segment_count: undefined,
+      plan_receipt: undefined,
+      generation: null,
+    }))).toEqual({ action: 'none', paidTaskCount: null });
+    expect(generationRetryContract(longDetail({
+      duration_s: Number.POSITIVE_INFINITY,
+      generation: null,
+    }))).toEqual({ action: 'none', paidTaskCount: null });
+    expect(generationRetryContract(longDetail({
+      duration_s: 8,
+      segment_count: 3,
+      plan_receipt: receipt,
+      generation: null,
+    }))).toEqual({ action: 'none', paidTaskCount: null });
+    expect(generationRetryContract(longDetail({
+      generation: { status: null },
+    }))).toEqual({ action: 'none', paidTaskCount: null });
+    expect(generationRetryContract(longDetail({
+      generation: { status: 'future_status' },
+    }))).toEqual({ action: 'none', paidTaskCount: null });
+  });
+
   it('snapshots only server-frozen values and keeps historical fast mode false', () => {
     expect(generationParameterSnapshot(longDetail({
       fit_mode: 'crop',

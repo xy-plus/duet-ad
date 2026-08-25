@@ -169,4 +169,156 @@ describe('production App integration', () => {
       .not.toBeInTheDocument();
     expect(submitCalls).toBe(0);
   });
+
+  it('keeps a legacy read-only detail visible when frozen generation fields are null', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    let submitCalls = 0;
+    const legacyDetail = {
+      ...baseDetail,
+      read_only: true,
+      aspect_ratio: null,
+      resolution: null,
+      fit_mode: null,
+      fit_profiles: null,
+      duration_s: null,
+      generation: { ...baseDetail.generation, status: 'succeeded' },
+    };
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'legacy-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([legacyDetail]);
+        if (url === '/api/conversations/cid-1') return Response.json(legacyDetail);
+        if (url.endsWith('/submit')) {
+          submitCalls += 1;
+          return Response.json({ status: 'queued' });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+
+    expect(await screen.findByText('分析产物摘要')).toBeInTheDocument();
+    expect(screen.getByText('已冻结生成参数')).toBeInTheDocument();
+    expect(screen.getByText('视频生成完成')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /确认生成|新建任务重试|继续原任务|继续拼接/ }))
+      .not.toBeInTheDocument();
+    expect(submitCalls).toBe(0);
+  });
+
+  it.each([
+    ['null status', null, 8],
+    ['unknown status', 'future_status', 8],
+    ['unknown duration', null, null],
+  ])('fails closed in the App for malformed generation %s', async (_name, status, duration) => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    let submitCalls = 0;
+    const malformedDetail = {
+      ...baseDetail,
+      duration_s: duration,
+      generation: status === null && duration === null
+        ? null
+        : { ...baseDetail.generation, status },
+    };
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'malformed-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([malformedDetail]);
+        if (url === '/api/conversations/cid-1') return Response.json(malformedDetail);
+        if (url.endsWith('/submit')) {
+          submitCalls += 1;
+          return Response.json({ status: 'queued' });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+
+    expect(await screen.findByText('提交状态未知')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /确认生成|新建任务重试|继续原任务|继续拼接/ }))
+      .not.toBeInTheDocument();
+    expect(submitCalls).toBe(0);
+  });
+
+  it('locks the paid action while an ambiguous submit is reconciled through GET only', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    let submitCalls = 0;
+    let detailCalls = 0;
+    const newDetail = { ...baseDetail, navigation_status: 'prompt_confirmed', generation: null };
+    const unknownDetail = {
+      ...newDetail,
+      navigation_status: 'generation_submission_unknown',
+      generation: { ...baseDetail.generation, status: null },
+    };
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'reconciliation-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([newDetail]);
+        if (url === '/api/conversations/cid-1') {
+          detailCalls += 1;
+          return Response.json(submitCalls > 0 ? unknownDetail : newDetail);
+        }
+        if (url.endsWith('/submit')) {
+          submitCalls += 1;
+          throw new TypeError('connection reset after send');
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: '确认生成' }));
+
+    expect(await screen.findByText('正在核对提交结果，已锁定再次提交')).toBeInTheDocument();
+    await waitFor(() => expect(detailCalls).toBeGreaterThan(1));
+    expect(screen.queryByRole('button', { name: '确认生成' })).not.toBeInTheDocument();
+    expect(submitCalls).toBe(1);
+  });
+
+  it('withholds postprocess retry authority from a read-only detail', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    let postprocessCalls = 0;
+    const readOnlyDetail = {
+      ...baseDetail,
+      read_only: true,
+      postprocess: {
+        status: 'failed',
+        options: { remove_subtitle: true, remove_brand: false },
+        frames: [],
+        error: '服务端确认失败',
+      },
+    };
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'postprocess-gate-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([readOnlyDetail]);
+        if (url === '/api/conversations/cid-1') return Response.json(readOnlyDetail);
+        if (url.endsWith('/postprocess')) {
+          postprocessCalls += 1;
+          return Response.json({ status: 'running', frames: [] });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+
+    expect(await screen.findByText('后处理失败')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重试失败项' })).not.toBeInTheDocument();
+    expect(postprocessCalls).toBe(0);
+  });
 });

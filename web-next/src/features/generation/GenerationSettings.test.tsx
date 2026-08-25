@@ -94,21 +94,24 @@ describe('GenerationSettings', () => {
   });
 
   it('replaces the draft with server-frozen generation evidence and removes all editors', () => {
+    const evidence = {
+      id: 'generation-frozen',
+      durationSeconds: 30,
+      segmentCount: 3,
+      parameters: {
+        dialogueMode: 'custom' as const,
+        dialogueText: '服务端冻结台词',
+        aspectRatio: '9:16' as const,
+        resolution: '480p' as const,
+        fitMode: 'pad' as const,
+      },
+    };
     render(
       <GenerationSettings
         videoKind="short"
         initialValues={recommended}
         value={recommended}
-        generation={{
-          id: 'generation-frozen',
-          parameters: {
-            dialogueMode: 'custom',
-            dialogueText: '服务端冻结台词',
-            aspectRatio: '9:16',
-            resolution: '480p',
-            fitMode: 'pad',
-          },
-        }}
+        generation={evidence}
         onChange={vi.fn()}
       />,
     );
@@ -118,8 +121,31 @@ describe('GenerationSettings', () => {
     expect(screen.getByText('9:16')).toBeInTheDocument();
     expect(screen.getByText('480p')).toBeInTheDocument();
     expect(screen.getByText('完整留白')).toBeInTheDocument();
+    expect(screen.getByText('30 秒')).toBeInTheDocument();
+    expect(screen.getByText('3 段')).toBeInTheDocument();
     expect(screen.queryByRole('radio')).not.toBeInTheDocument();
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+  });
+
+  it('shows safe placeholders for missing legacy frozen fields', () => {
+    const evidence = {
+      id: 'legacy-generation',
+      durationSeconds: null,
+      segmentCount: null,
+    };
+
+    render(
+      <GenerationSettings
+        videoKind="short"
+        initialValues={recommended}
+        generation={evidence}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('已冻结生成参数')).toBeInTheDocument();
+    expect(screen.getAllByText('未提供').length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
   });
 });

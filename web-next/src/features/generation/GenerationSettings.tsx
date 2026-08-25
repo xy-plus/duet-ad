@@ -28,22 +28,38 @@ const fitOptions = (Object.entries(fitLabels) as Array<[FitMode, string]>).map((
 
 interface GenerationSettingsProps {
   videoKind: VideoKind;
-  initialValues: GenerationSettingsValue;
+  initialValues?: GenerationSettingsValue;
   value?: GenerationSettingsValue;
   generation?: GenerationEvidence;
   disabled?: boolean;
-  onChange: (value: GenerationSettingsValue) => void;
+  onChange?: (value: GenerationSettingsValue) => void;
 }
 
-function frozenItems(values: GenerationSettingsValue) {
+function frozenItems(evidence: GenerationEvidence) {
+  const values = evidence.parameters;
+  const missing = '未提供';
   const items = [
-    { key: 'dialogue', label: '台词模式', children: dialogueLabels[values.dialogueMode] },
-    { key: 'aspect', label: '画幅', children: values.aspectRatio },
-    { key: 'resolution', label: '清晰度', children: values.resolution },
-    { key: 'fit', label: '画面适配', children: fitLabels[values.fitMode] },
+    { key: 'dialogue', label: '台词模式', children: values ? dialogueLabels[values.dialogueMode] : missing },
+    { key: 'aspect', label: '画幅', children: values?.aspectRatio ?? missing },
+    { key: 'resolution', label: '清晰度', children: values?.resolution ?? missing },
+    { key: 'fit', label: '画面适配', children: values ? fitLabels[values.fitMode] : missing },
+    {
+      key: 'duration',
+      label: '视频时长',
+      children: evidence.durationSeconds === null || evidence.durationSeconds === undefined
+        ? missing
+        : `${evidence.durationSeconds} 秒`,
+    },
+    {
+      key: 'segments',
+      label: '分段数量',
+      children: evidence.segmentCount === null || evidence.segmentCount === undefined
+        ? missing
+        : `${evidence.segmentCount} 段`,
+    },
   ];
 
-  if ((values.dialogueMode === 'edit' || values.dialogueMode === 'custom') && values.dialogueText) {
+  if (values && (values.dialogueMode === 'edit' || values.dialogueMode === 'custom') && values.dialogueText) {
     items.push({ key: 'dialogue-text', label: '台词内容', children: values.dialogueText });
   }
 
@@ -64,12 +80,14 @@ export function GenerationSettings({
         <Descriptions
           bordered
           column={{ xs: 1, sm: 2 }}
-          items={frozenItems(generation.parameters)}
+          items={frozenItems(generation)}
           size="small"
         />
       </Card>
     );
   }
+
+  if (!initialValues || !onChange) return null;
 
   const current = value ?? initialValues;
   const emit = <Key extends keyof GenerationSettingsValue>(

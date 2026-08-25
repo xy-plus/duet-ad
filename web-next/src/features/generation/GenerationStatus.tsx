@@ -17,7 +17,7 @@ import type {
 
 interface GenerationStatusProps {
   model: GenerationStatusModel;
-  onAction: (action: GenerationAction) => void;
+  onAction?: (action: GenerationAction) => void;
 }
 
 function segmentStatus(status: GenerationSegment['status']) {
@@ -148,7 +148,7 @@ function stateSurface(model: GenerationStatusModel, actionButton: React.ReactNod
 export function GenerationStatus({ model, onAction }: GenerationStatusProps) {
   const action = actionFor(model);
   const paidCountKnown = model.paidTaskCount !== null;
-  const actionButton = action ? (
+  const actionButton = action && onAction ? (
     <Button
       type="primary"
       aria-label={model.actionPending ? '提交中' : action.label}
