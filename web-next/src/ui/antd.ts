@@ -53,9 +53,9 @@ export {
   MenuOutlined,
   PlusOutlined,
   ProductOutlined,
-  ReloadOutlined,
   SendOutlined,
   UploadOutlined,
 } from '@ant-design/icons';
 
 export { Video } from './video';
+export { subscribeBeforeUnload } from './browser';

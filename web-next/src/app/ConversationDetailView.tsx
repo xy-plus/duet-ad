@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import type { ApiClient } from '../api';
 import { isApiErrorCode } from '../api';
@@ -8,6 +8,8 @@ import {
   buildStitchRetryPayload,
   buildSubmitPayload,
   canOperate,
+  adaptConversationDetail,
+  adaptImageOptimizationPrompt,
   fitProfile,
   generationRetryContract,
   longVideoContract,
@@ -25,8 +27,11 @@ import {
   useApiSessionKey,
   useConversationDetailQuery,
   usePatchPromptMutation,
+  usePatchImageOptimizationPromptMutation,
   usePostprocessConversationMutation,
+  useRetryPostprocessSegmentMutation,
   useSubmitConversationMutation,
+  useUnsavedDraftGuard,
 } from '../state';
 import { ConversationOverview } from '../features/conversation';
 import {
@@ -35,7 +40,7 @@ import {
   type GenerationAction,
   type GenerationSettingsValue,
 } from '../features/generation';
-import { ArtifactSummary, PromptEditor } from '../features/media';
+import { ArtifactSummary, ImageOptimizationPanel } from '../features/media';
 import {
   PostprocessConfig,
   PostprocessStatus,
@@ -68,81 +73,88 @@ function PromptSection({ apiClient, detail }: { apiClient: ApiClient; detail: Co
   const queryClient = useQueryClient();
   const sessionKey = useApiSessionKey(apiClient);
   const mutation = usePatchPromptMutation(apiClient, detail.id);
+  const imageMutation = usePatchImageOptimizationPromptMutation(apiClient, detail.id);
+  const adapted = adaptConversationDetail(detail);
+  const imagePrompt = adapted.postprocessCapabilities.optimize_image
+    ? adapted.imageOptimizationPrompt : null;
   const sourcePrompt = detail.source_prompt;
+  const sourceSha = detail.source_prompt_sha256;
+  const [promptSnapshot, setPromptSnapshot] = useState(() => ({
+    text: sourcePrompt ?? '',
+    sha256: typeof sourceSha === 'string' ? sourceSha : null,
+  }));
+  const lastDetailPromptKey = useRef(`${sourceSha ?? ''}:${sourcePrompt ?? ''}`);
   const [draft, setDraft] = useState(sourcePrompt ?? '');
-  const [conflict, setConflict] = useState<{ code: 'prompt_changed'; message?: string }>();
   const [error, setError] = useState<string>();
 
   useEffect(() => {
-    if (!conflict) setDraft(sourcePrompt ?? '');
-  }, [conflict, sourcePrompt]);
+    const key = `${sourceSha ?? ''}:${sourcePrompt ?? ''}`;
+    if (key === lastDetailPromptKey.current) return;
+    lastDetailPromptKey.current = key;
+    setPromptSnapshot({ text: sourcePrompt ?? '', sha256: typeof sourceSha === 'string' ? sourceSha : null });
+    setDraft(sourcePrompt ?? '');
+  }, [sourcePrompt, sourceSha]);
 
   if (typeof sourcePrompt !== 'string') return null;
   const editable = canOperate(detail)
     && detail.generation === null
-    && typeof detail.source_prompt_sha256 === 'string'
-    && /^[0-9a-f]{64}$/u.test(detail.source_prompt_sha256);
+    && typeof promptSnapshot.sha256 === 'string'
+    && /^[0-9a-f]{64}$/u.test(promptSnapshot.sha256);
 
-  const loadLatest = async () => {
-    try {
-      const latest = await apiClient.getConversation(detail.id);
-      queryClient.setQueryData(queryKeys.detail(sessionKey, detail.id), latest);
-      setDraft(latest.source_prompt ?? '');
-      setConflict(undefined);
-      setError(undefined);
-    } catch (loadError) {
-      setError(errorMessage(loadError, '最新提示词加载失败'));
-    }
-  };
-
-  const save = async (prompt: string) => {
-    if (!editable || typeof detail.source_prompt_sha256 !== 'string') return;
-    setConflict(undefined);
+  const save = async (prompt: string): Promise<string> => {
+    if (!editable || typeof promptSnapshot.sha256 !== 'string') throw new Error('当前提示词不可保存');
     setError(undefined);
     try {
       const response = await mutation.mutateAsync({
         confirm: true,
-        expected_sha256: detail.source_prompt_sha256,
+        expected_sha256: promptSnapshot.sha256,
         prompt,
       });
+      setPromptSnapshot({ text: response.prompt, sha256: response.sha256 });
       setDraft(response.prompt);
+      return response.prompt;
     } catch (saveError) {
+      let latest: ConversationDetail | null;
       try {
-        const latest = await recoverPromptChanged(
+        latest = await recoverPromptChanged(
           saveError,
           () => apiClient.getConversation(detail.id),
         );
-        if (latest) {
-          queryClient.setQueryData(queryKeys.detail(sessionKey, detail.id), latest);
-          setDraft(latest.source_prompt ?? '');
-          setConflict({ code: 'prompt_changed', message: errorMessage(saveError, '服务端提示词已变化') });
-          return;
-        }
       } catch (recoveryError) {
         setError(errorMessage(recoveryError, '最新提示词加载失败'));
-        return;
+        throw recoveryError;
+      }
+      if (latest) {
+        queryClient.setQueryData(queryKeys.detail(sessionKey, detail.id), latest);
+        setPromptSnapshot({ text: latest.source_prompt ?? '', sha256: latest.source_prompt_sha256 });
+        setDraft(latest.source_prompt ?? '');
+        const conflict = new Error(`prompt_changed：${errorMessage(saveError, '服务端提示词已变化')}`);
+        setError(conflict.message);
+        throw conflict;
       }
       setError(errorMessage(saveError, '提示词保存失败'));
+      throw saveError;
     }
   };
 
   return (
     <div className="app-detail-stack">
       {error ? <Alert type="error" showIcon title={error} /> : null}
-      <PromptEditor
-        conflict={conflict}
-        draft={draft}
-        locked={!editable}
-        lockReason={detail.generation ? '服务端已有生成记录，提示词已冻结' : '当前会话不可修改提示词'}
-        onCopy={(value) => { void navigator.clipboard?.writeText(value); }}
-        onDraftChange={(value) => {
-          setDraft(value);
-          setError(undefined);
-        }}
-        onReload={() => { void loadLatest(); }}
-        onSave={(value) => { void save(value); }}
-        pending={mutation.isPending}
-        prompt={sourcePrompt}
+      <ImageOptimizationPanel
+        prompt={promptSnapshot.text}
+        promptDraft={draft}
+        dialogue={detail.voice_lines.map(({ text }) => text).join('\n')}
+        imagePrompt={imagePrompt}
+        draftId={`${detail.id}:0`}
+        promptEditable={editable}
+        promptPending={mutation.isPending}
+        onPromptDraftChange={(value) => { setDraft(value); setError(undefined); }}
+        onSavePrompt={save}
+        onSaveImagePrompt={imagePrompt ? async ({ expected_sha256, prompt }) => {
+          const latest = adaptImageOptimizationPrompt(await imageMutation.mutateAsync({ confirm: true, segment_index: 0, expected_sha256, prompt }));
+          if (!latest) throw new Error('图片优化提示词响应无效');
+          return latest;
+        } : undefined}
       />
     </div>
   );
@@ -207,6 +219,7 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
   const [error, setError] = useState<string>();
   const [reconciling, setReconciling] = useState(() => apiClient.isSubmissionReconciling(detail.id));
   const mutation = useSubmitConversationMutation(apiClient, detail.id);
+  const draftGuard = useUnsavedDraftGuard();
 
   useEffect(() => {
     setDraft((previous) => safeGenerationDraft(detail, previous ?? undefined));
@@ -259,7 +272,7 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
       ) : null}
       <GenerationStatus
         model={model}
-        onAction={actionAuthorized ? (action) => { void submit(action); } : undefined}
+        onAction={actionAuthorized ? (action) => { draftGuard.run(() => { void submit(action); }); } : undefined}
       />
     </section>
   );
@@ -268,6 +281,7 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
 const initialPostprocessOptions: PostprocessOptions = {
   remove_subtitle: true,
   remove_brand: true,
+  optimize_image: false,
 };
 
 function queuedPostprocessTask(
@@ -288,29 +302,44 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
   const queryClient = useQueryClient();
   const sessionKey = useApiSessionKey(apiClient);
   const mutation = usePostprocessConversationMutation(apiClient, detail.id);
+  const segmentRetryMutation = useRetryPostprocessSegmentMutation(apiClient, detail.id);
   const serverOptions = postprocessOptions(detail) ?? undefined;
   const serverTask = postprocessTask(detail);
   const [open, setOpen] = useState(false);
+  const [optimizeDecision, setOptimizeDecision] = useState(false);
   const [options, setOptions] = useState<PostprocessOptions>(serverOptions ?? initialPostprocessOptions);
   const [pendingOptions, setPendingOptions] = useState<PostprocessOptions>();
   const [error, setError] = useState<string>();
+  const [retryingSegment, setRetryingSegment] = useState<number>();
   const operationAllowed = canOperate(detail);
+  const draftGuard = useUnsavedDraftGuard();
+  const retrySegment = async (index: number, expectedRevision: number) => {
+    if (retryingSegment !== undefined) return;
+    setRetryingSegment(index); setError(undefined);
+    try {
+      await segmentRetryMutation.mutateAsync({ index, payload: { confirm: true, expected_revision: expectedRevision } });
+    } catch (retryError) {
+      setError(errorMessage(retryError, '分段后处理重试失败'));
+    } finally { setRetryingSegment(undefined); }
+  };
 
   useEffect(() => {
     if (serverOptions) setOptions(serverOptions);
-  }, [serverOptions?.remove_brand, serverOptions?.remove_subtitle]);
+  }, [serverOptions?.optimize_image, serverOptions?.remove_brand, serverOptions?.remove_subtitle]);
 
   const submit = async (submittedOptions: PostprocessOptions) => {
     if (!operationAllowed) return;
     const frozen: ApiPostprocessOptions = {
       remove_subtitle: submittedOptions.remove_subtitle,
       remove_brand: submittedOptions.remove_brand,
+      optimize_image: submittedOptions.optimize_image,
     };
     setPendingOptions(frozen);
     setError(undefined);
     try {
       await mutation.mutateAsync({ confirm: true, options: frozen });
     } catch (submitError) {
+      setOptimizeDecision(false);
       setPendingOptions(undefined);
       try {
         const recovered = await recoverLockedPostprocess(
@@ -347,23 +376,31 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
       {unknownShape ? <Alert type="error" showIcon title="服务端后处理状态无效" /> : null}
       {canConfigure ? (
         <Card>
-          <Button onClick={() => setOpen(true)} type="primary">优化关键帧</Button>
+          <Space orientation="vertical">
+            <Typography.Text strong>是否优化素材？</Typography.Text>
+            <Space>
+              <Button aria-pressed={optimizeDecision} type={optimizeDecision ? 'primary' : 'default'} onClick={() => { draftGuard.run(() => { setOptimizeDecision(true); setOpen(true); }); }}>是</Button>
+              <Button aria-pressed={!optimizeDecision} type={!optimizeDecision ? 'primary' : 'default'} onClick={() => { setOptimizeDecision(false); setOpen(false); }}>否</Button>
+            </Space>
+          </Space>
         </Card>
       ) : null}
       <PostprocessConfig
-        onCancel={() => setOpen(false)}
+        onCancel={() => { setOpen(false); setOptimizeDecision(false); }}
         onOptionsChange={setOptions}
-        onSubmit={(submitted) => { void submit(submitted); }}
+        onSubmit={(submitted) => { setOpen(false); void submit(submitted); }}
         open={open}
         options={options}
         serverOptions={serverOptions}
         submitting={mutation.isPending}
+        capabilities={adaptConversationDetail(detail).postprocessCapabilities}
       />
       {visibleTask ? (
         <PostprocessStatus
           onRetry={operationAllowed ? retry : undefined}
-          retrying={mutation.isPending}
+          retrying={mutation.isPending || segmentRetryMutation.isPending || retryingSegment !== undefined}
           task={visibleTask}
+          onRetrySegment={operationAllowed ? ({ index, expectedRevision }) => { void retrySegment(index, expectedRevision); } : undefined}
         />
       ) : null}
       <AuthenticatedImageGrid
@@ -410,7 +447,7 @@ function LoadedConversationDetail({ apiClient, detail }: { apiClient: ApiClient;
       <AuthenticatedSegments apiClient={apiClient} detail={detail} />
       {detail.status === 'done' ? (
         <>
-          <PromptSection apiClient={apiClient} detail={detail} />
+          {detail.segments.length === 0 ? <PromptSection apiClient={apiClient} detail={detail} /> : null}
           <GenerationSection apiClient={apiClient} detail={detail} />
           <PostprocessSection apiClient={apiClient} detail={detail} />
         </>

@@ -10,6 +10,7 @@ import type { PostprocessOptions, PostprocessTask } from './types';
 const options: PostprocessOptions = {
   remove_subtitle: true,
   remove_brand: false,
+  optimize_image: false,
 };
 
 const runningTask: PostprocessTask = {
@@ -37,6 +38,7 @@ describe('PostprocessConfig', () => {
 
     expect(screen.getByRole('checkbox', { name: '移除文字/字幕' })).toBeChecked();
     expect(screen.getByRole('checkbox', { name: '移除常见 Logo/图标' })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: '进行图片优化' })).not.toBeChecked();
     expect(screen.queryByText(/remove_subtitles|remove_copyrighted_objects/)).not.toBeInTheDocument();
   });
 
@@ -57,7 +59,16 @@ describe('PostprocessConfig', () => {
     expect(onOptionsChange).toHaveBeenCalledWith({
       remove_subtitle: true,
       remove_brand: true,
+      optimize_image: false,
     });
+  });
+
+  it('normalizes hidden unsupported options to false before submit', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(<PostprocessConfig open options={{ remove_subtitle: true, remove_brand: true, optimize_image: true }} capabilities={{ remove_subtitle: true, remove_brand: false, optimize_image: false }} onOptionsChange={vi.fn()} onCancel={vi.fn()} onSubmit={onSubmit} />);
+    await user.click(screen.getByRole('button', { name: '开始后处理' }));
+    expect(onSubmit).toHaveBeenCalledWith({ remove_subtitle: true, remove_brand: false, optimize_image: false });
   });
 
   it('locks duplicate submission immediately', async () => {
@@ -128,7 +139,7 @@ describe('PostprocessStatus', () => {
     const task: PostprocessTask = {
       id: 'post-partial',
       status: 'partial_success',
-      options: { remove_subtitle: true, remove_brand: true },
+      options: { remove_subtitle: true, remove_brand: true, optimize_image: false },
       processedCount: 3,
       totalCount: 3,
       errorMessage: '1 张关键帧处理失败',
@@ -174,5 +185,18 @@ describe('PostprocessStatus', () => {
     await user.click(screen.getByRole('button', { name: '重试失败项' }));
 
     expect(onRetry).toHaveBeenCalledWith({ taskId: 'post-failed', options: failedTask.options });
+  });
+
+  it('renders per-segment progress and retries only with index and expected revision', async () => {
+    const user = userEvent.setup();
+    const onRetrySegment = vi.fn();
+    render(<PostprocessStatus task={{ ...runningTask, segments: [{ index: 2, status: 'failed', stage: 'submission_unknown', completedFrames: 1, totalFrames: 4, revision: 7, error: '提交结果未知' }] }} onRetrySegment={onRetrySegment} />);
+    expect(screen.getByRole('progressbar', { name: '第 2 段后处理进度' })).toHaveAttribute('aria-valuenow', '25');
+    expect(screen.getByText(/重试可能重复计费/u)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '重试本段' }));
+    expect(onRetrySegment).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog', { name: '确认重试未知提交段' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '仍要重试本段' }));
+    expect(onRetrySegment).toHaveBeenCalledWith({ index: 2, expectedRevision: 7 });
   });
 });

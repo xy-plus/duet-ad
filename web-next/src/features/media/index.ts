@@ -1,2 +1,2 @@
 export * from './MediaArtifacts';
-export * from './PromptEditor';
+export * from './ImageOptimizationPanel';
