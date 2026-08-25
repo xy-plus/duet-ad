@@ -58,7 +58,6 @@ import {
   postprocessTask,
   postprocessTotalFrames,
 } from './model';
-import './app.css';
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
@@ -213,8 +212,9 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
 
   const settings = generationSettingsValue(draft);
   const model = generationStatusModel(detail, mutation.isPending);
+  const operationAllowed = canOperate(detail);
   const actionablePhase = ['new', 'failed', 'resume_required', 'stitch_required'].includes(model.phase);
-  const operationsBlocked = !canOperate(detail) && actionablePhase;
+  const operationsBlocked = !operationAllowed && actionablePhase;
   const submit = async (action: GenerationAction) => {
     setError(undefined);
     try {
@@ -228,8 +228,8 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
     <section aria-label="视频生成" className="app-detail-stack">
       {error ? <Alert type="error" showIcon title={error} /> : null}
       <GenerationSettings
-        disabled={mutation.isPending || draft.frozen || !canOperate(detail)}
-        generation={generationEvidence(detail, draft)}
+        disabled={mutation.isPending || draft.frozen || !operationAllowed}
+        generation={generationEvidence(detail, settings)}
         initialValues={settings}
         onChange={(value) => setDraft((previous) => updateGenerationDraft(previous, value))}
         value={settings}

@@ -71,13 +71,13 @@ export function generationSettingsValue(draft: GenerationDraft): GenerationSetti
 
 export function generationEvidence(
   detail: ConversationDetail,
-  draft: GenerationDraft,
+  parameters: GenerationSettingsValue,
 ): GenerationEvidence | undefined {
   if (!detail.generation) return undefined;
   const requestId = detail.generation.client_request_id;
   return {
     id: typeof requestId === 'string' && requestId ? requestId : `${detail.id}-generation`,
-    parameters: generationSettingsValue(draft),
+    parameters,
   };
 }
 

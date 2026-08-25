@@ -11,7 +11,6 @@ import {
   type UploadProgressState,
 } from '../features/create';
 import { Progress } from '../ui/antd';
-import './app.css';
 
 const initialDraft: CreateConversationDraft = {
   source: { type: 'url', url: '' },

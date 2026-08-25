@@ -131,7 +131,7 @@ function Workspace({ apiClient }: AppProps) {
   return (
     <>
       {(conversations.data ?? [])
-        .filter(({ navigation_status: status }) => backgroundStatuses.has(status))
+        .filter(({ id, navigation_status: status }) => id !== selectedId && backgroundStatuses.has(status))
         .map(({ id }) => <BackgroundConversationPoller apiClient={apiClient} id={id} key={id} />)}
       <WorkspaceShell
         sidebar={sidebar}
