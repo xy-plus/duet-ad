@@ -18,6 +18,12 @@ ACCESS_TOKEN='<local-only-token>' HOST=127.0.0.1 PORT=3211 ./run.sh
 .venv/bin/python -m pytest tests -q
 ```
 
+> [!WARNING]
+> **EXPERIMENT — 仅限 `exp/h3-no-subtitles-12379` 分支，尚未上线。**
+> 本分支会在所有 H3 reference/boundary 请求的原提示词前统一加入
+> `不要产出任何字幕和水印，如果参考图里有，请帮忙先消除掉字幕和水印后再根据提示词让图片动起来`；
+> input manifest、attempt/provider receipt 与实际 POST body 共同绑定加入前缀后的同一提示词。
+
 ## 生产契约摘要
 
 - 新会话是 `schema_version=2`；`duration_s` 固定为 ffprobe `v:0` 视觉时长（缺失时依次用 `duration_ts*time_base`、视频包 PTS 范围，绝不使用 OpenCV `frame_count/fps` 元数据），音频或容器尾巴不参与 10/300 秒门禁。`≤10s` 保持原 Ref2VA 单请求；`>10s` 冻结为 provider 整秒时长不超过 10 秒的 FL2VA 首尾帧子任务。

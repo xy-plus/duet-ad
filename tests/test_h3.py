@@ -15,6 +15,9 @@ from app import h3
 
 
 VOICE_TEXTS = ("第一句台词", "第二句台词")
+NO_SUBTITLES_PROMPT_PREFIX = (
+    "不要产出任何字幕和水印，如果参考图里有，请帮忙先消除掉字幕和水印后再根据提示词让图片动起来"
+)
 
 
 @pytest.mark.parametrize(
@@ -110,6 +113,46 @@ def _boundary_request(tmp_path: Path, *, request_id: str = "boundary-1") -> h3.H
         last_frame=last,
         duration=15,
     )
+
+
+@pytest.mark.parametrize("mode", ["reference", "boundary"])
+def test_request_injects_no_subtitles_prefix_into_prompt_receipts_and_post_once(
+    tmp_path, mode
+):
+    original = "  原始提示词第一行\n原始提示词第二行  "
+    request = _request(tmp_path) if mode == "reference" else _boundary_request(tmp_path)
+    request = replace(request, prompt=original)
+    provider = HappyProvider(result_status="RUNNING")
+
+    assert request.prompt == f"{NO_SUBTITLES_PROMPT_PREFIX}\n{original}"
+    assert request.prompt.count(NO_SUBTITLES_PROMPT_PREFIX) == 1
+    assert request.prompt.removeprefix(f"{NO_SUBTITLES_PROMPT_PREFIX}\n") == original
+
+    assert h3.prepare(request).status == "not_started"
+    with _client(provider) as client:
+        assert h3.submit(request, client=client).status == "h3_running"
+
+    body = json.loads(provider.h3_posts[0].content)
+    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
+    prompt_sha256 = hashlib.sha256(request.prompt.encode("utf-8")).hexdigest()
+    assert body["prompt"] == request.prompt
+    assert state["input"]["prompt_sha256"] == prompt_sha256
+    assert state["input_receipt"] == h3.canonical_json_sha256(state["input"])
+    assert state["h3"]["receipt"]["input_receipt"] == state["input_receipt"]
+    assert state["h3"]["receipt"]["prompt_sha256"] == prompt_sha256
+
+
+@pytest.mark.parametrize("mode", ["reference", "boundary"])
+def test_request_does_not_duplicate_existing_complete_no_subtitles_prefix(
+    tmp_path, mode
+):
+    original = f"{NO_SUBTITLES_PROMPT_PREFIX}\n原始提示词"
+    request = _request(tmp_path) if mode == "reference" else _boundary_request(tmp_path)
+
+    normalized = replace(request, prompt=original)
+
+    assert normalized.prompt == original
+    assert normalized.prompt.count(NO_SUBTITLES_PROMPT_PREFIX) == 1
 
 
 class FakeNetworkStream:

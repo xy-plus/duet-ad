@@ -334,7 +334,9 @@ def test_source_prompt_can_be_cas_edited_before_h3(enabled, monkeypatch):
         f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload()
     )
     assert submitted.status_code == 202
-    assert seen[0].prompt.startswith(replacement)
+    assert seen[0].prompt.startswith(
+        f"{h3._H3_NO_SUBTITLES_PREFIX}\n{replacement}"
+    )
 
 
 def test_source_prompt_cas_conflict_is_structured_and_does_not_write(enabled):
@@ -457,7 +459,9 @@ def test_submit_freezes_direct_h3_receipt_and_source_prompt(enabled, monkeypatch
     response = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload())
     assert response.status_code == 202
     (request,) = seen
-    assert request.prompt.startswith(PROMPT)
+    assert request.prompt.startswith(
+        f"{h3._H3_NO_SUBTITLES_PREFIX}\n{PROMPT}"
+    )
     assert "无台词" in request.prompt
     assert request.duration == 10
     assert request.keyframes[0][1] == original

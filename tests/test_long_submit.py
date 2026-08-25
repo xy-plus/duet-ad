@@ -1351,7 +1351,9 @@ def test_15_seconds_one_post_and_none_rebuilds_prompt_without_source_dialogue(
     assert "源台词" in seen[0].prompt
     assert "源台词" not in seen[1].prompt
     assert "无台词" in seen[1].prompt
-    assert seen[1].prompt.startswith("不要生成背景音乐\n")
+    assert seen[1].prompt.startswith(
+        f"{h3._H3_NO_SUBTITLES_PREFIX}\n不要生成背景音乐\n"
+    )
     assert [call["audio_mode"] for call in stitch_calls] == ["keep", "mute"]
 
 

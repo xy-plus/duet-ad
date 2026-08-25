@@ -58,6 +58,9 @@ AUTODL_BASE_URL = "https://autodl.art"
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
 H3_OUTPUT_FRAME_DURATION_S = 1 / 24
 _DURATION_EPS_S = 1e-6
+_H3_NO_SUBTITLES_PREFIX = (
+    "不要产出任何字幕和水印，如果参考图里有，请帮忙先消除掉字幕和水印后再根据提示词让图片动起来"
+)
 
 _SAFE_ERROR_CODES = {
     "h3_submit_rejected",
@@ -177,6 +180,12 @@ class H3Request:
             raise H3Error("invalid_client_request_id")
         if not isinstance(self.prompt, str) or not self.prompt.strip():
             raise H3Error("invalid_prompt")
+        if not self.prompt.startswith(_H3_NO_SUBTITLES_PREFIX):
+            object.__setattr__(
+                self,
+                "prompt",
+                f"{_H3_NO_SUBTITLES_PREFIX}\n{self.prompt}",
+            )
         if not isinstance(self.mode, str) or self.mode not in {"reference", "boundary"}:
             raise H3Error("invalid_mode")
         if self.aspect_ratio not in H3_ASPECT_RATIOS:
