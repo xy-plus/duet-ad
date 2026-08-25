@@ -101,6 +101,16 @@ describe('UI foundation contract', () => {
     expect(messages).toEqual([]);
   });
 
+  it.each([
+    "import React from 'react'; export const fragment = React.Fragment;",
+    "import * as ReactNamespace from 'react'; export const fragment = ReactNamespace.Fragment;",
+    "import { createElement as h } from 'react'; export { h };",
+  ])('rejects React import forms that reopen the native element escape hatch', async (source) => {
+    const messages = await lintBusinessSource(source);
+
+    expect(messages).toContainEqual(expect.stringContaining('named React hooks/types'));
+  });
+
   it.each(['button', 'form', 'input', 'select', 'textarea', 'img', 'svg', 'video'])(
     'rejects native <%s> from business source',
     async (element) => {
@@ -161,6 +171,14 @@ describe('UI foundation contract', () => {
     expect(messages).toEqual([]);
   });
 
+  it('allows an unrelated local function named createElement', async () => {
+    const messages = await lintBusinessSource(
+      "const createElement = (value: string) => value; export const safe = createElement('safe');",
+    );
+
+    expect(messages).toEqual([]);
+  });
+
   it('allows color literals only in the theme module', async () => {
     const facadeMessages = await lintBusinessSource(
       "export const color = '#fff';",
@@ -207,6 +225,20 @@ describe('UI foundation contract', () => {
     const messages = await lintBusinessSource(source);
 
     expect(messages).toContainEqual(expect.stringContaining('Color literals'));
+  });
+
+  it('rejects hash-based colors assembled by otherwise static helper calls', async () => {
+    const messages = await lintBusinessSource(
+      "export const color = ['#', 'fff'].join('');",
+    );
+
+    expect(messages).toContainEqual(expect.stringContaining('Color literals'));
+  });
+
+  it('reports one diagnostic for one statically concatenated color expression', async () => {
+    const messages = await lintBusinessSource("export const color = '#fff' + '00';");
+
+    expect(messages.filter((message) => message.includes('Color literals'))).toHaveLength(1);
   });
 
   it('accepts semantic structure without visual escape hatches', async () => {
@@ -257,13 +289,16 @@ describe('UI foundation contract', () => {
     expect(messages).toContainEqual(expect.stringContaining('Token'));
   });
 
-  it('rejects raw drop-shadow filters from feature CSS', async () => {
-    const messages = await lintStyles(
-      '.feature { filter: drop-shadow(0 1px 2px var(--ant-color-text)); }',
-    );
+  it.each(['filter', '--feature-shadow'])(
+    'rejects drop-shadow functions in %s declarations',
+    async (property) => {
+      const messages = await lintStyles(
+        `.feature { ${property}: drop-shadow(0 1px 2px var(--ant-color-text)); }`,
+      );
 
-    expect(messages).toContainEqual(expect.stringContaining('Token'));
-  });
+      expect(messages).toContainEqual(expect.stringContaining('drop-shadow'));
+    },
+  );
 
   it('rejects inline Stylelint disable directives', async () => {
     const messages = await lintStyles(

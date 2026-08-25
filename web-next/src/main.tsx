@@ -7,7 +7,7 @@ import { AppThemeProvider } from './ui/theme';
 const root = document.getElementById('root');
 
 if (!root) {
-  throw new Error('Missing #root application mount point.');
+  throw new Error('Missing root application mount point.');
 }
 
 const runtime = createApiRuntime();
