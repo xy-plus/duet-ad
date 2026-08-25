@@ -29,14 +29,13 @@ describe('LoginView', () => {
     render(<Harness />);
 
     expect(screen.getByRole('alert')).toHaveTextContent('登录状态已过期');
-    await user.type(screen.getByLabelText('用户名'), 'alice');
+    expect(screen.queryByLabelText('用户名')).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText('访问口令'), 'correct horse battery staple');
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    await user.type(screen.getByLabelText('密码'), 'correct horse battery staple');
     await user.click(screen.getByRole('button', { name: '登录' }));
 
     expect(onSubmit).toHaveBeenCalledWith({
-      username: 'alice',
-      password: 'correct horse battery staple',
+      token: 'correct horse battery staple',
     });
   });
 });

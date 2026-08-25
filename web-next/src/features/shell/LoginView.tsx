@@ -7,18 +7,15 @@ import {
   Input,
   LockOutlined,
   Typography,
-  UserOutlined,
 } from '../../ui/antd';
 import './shell.css';
 
 export interface LoginCredentials {
-  username: string;
-  password: string;
+  token: string;
 }
 
 export interface LoginViewProps {
   error?: string;
-  initialUsername?: string;
   onErrorDismiss?: () => void;
   onSubmit: (credentials: LoginCredentials) => void | Promise<void>;
   submitting: boolean;
@@ -26,7 +23,6 @@ export interface LoginViewProps {
 
 export function LoginView({
   error,
-  initialUsername,
   onErrorDismiss,
   onSubmit,
   submitting,
@@ -57,31 +53,19 @@ export function LoginView({
         <Form<LoginCredentials>
           autoComplete="on"
           disabled={submitting}
-          initialValues={{ username: initialUsername }}
           layout="vertical"
           onFinish={onSubmit}
           onValuesChange={dismissError}
           requiredMark={false}
         >
           <Form.Item
-            label="用户名"
-            name="username"
-            rules={[{ required: true, message: '请输入用户名' }]}
-          >
-            <Input
-              autoComplete="username"
-              placeholder="请输入用户名"
-              prefix={<UserOutlined />}
-            />
-          </Form.Item>
-          <Form.Item
-            label="密码"
-            name="password"
-            rules={[{ required: true, message: '请输入密码' }]}
+            label="访问口令"
+            name="token"
+            rules={[{ required: true, message: '请输入访问口令' }]}
           >
             <Input.Password
               autoComplete="current-password"
-              placeholder="请输入密码"
+              placeholder="请输入访问口令"
               prefix={<LockOutlined />}
             />
           </Form.Item>
