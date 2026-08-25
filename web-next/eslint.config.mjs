@@ -42,6 +42,18 @@ const governancePlugin = {
           if (node.type === 'CallExpression') return rootCalleeName(node.callee);
           return undefined;
         };
+        const memberName = (node) => {
+          if (node.type !== 'MemberExpression') return undefined;
+          if (!node.computed && node.property.type === 'Identifier') return node.property.name;
+          if (node.computed && node.property.type === 'Literal') return node.property.value;
+          return undefined;
+        };
+        const isTestDeclaration = (node) => {
+          if (!['it', 'test'].includes(rootCalleeName(node.callee))) return false;
+          if (node.callee.type === 'Identifier' || node.callee.type === 'CallExpression') return true;
+          return node.callee.type === 'MemberExpression'
+            && !['each', 'for'].includes(String(memberName(node.callee)));
+        };
         const isTimeoutOption = (node) => node.type === 'ObjectExpression'
           && node.properties.some((property) => property.type === 'Property'
             && ((property.key.type === 'Identifier' && property.key.name === 'timeout')
@@ -49,14 +61,11 @@ const governancePlugin = {
 
         return {
           CallExpression(node) {
-            if (!['it', 'test'].includes(rootCalleeName(node.callee))) return;
-            const declaresTest = node.arguments.some((argument) => (
-              argument.type === 'ArrowFunctionExpression' || argument.type === 'FunctionExpression'
-            ));
-            if (!declaresTest) return;
-            for (const argument of node.arguments) {
+            if (!isTestDeclaration(node)) return;
+            for (const [index, argument] of node.arguments.entries()) {
               if ((argument.type === 'Literal' && typeof argument.value === 'number')
-                  || isTimeoutOption(argument)) {
+                  || isTimeoutOption(argument)
+                  || index >= 2) {
                 context.report({ node: argument, messageId: 'forbidden' });
               }
             }
