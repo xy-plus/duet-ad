@@ -137,6 +137,19 @@ function buildImagePromptPatch(draft) {
   };
 }
 
+async function saveImageOptimizationPrompt(detail, segmentIndex, draft, request = apiJSON) {
+  if (!Number.isInteger(segmentIndex) || segmentIndex < 0) {
+    throw new Error("图片优化提示词段号无效");
+  }
+  if (!imagePromptEditable(detail, segmentIndex)) {
+    throw new Error("当前会话未开放图片优化编辑");
+  }
+  return request(
+    "/api/conversations/" + encodeURIComponent(detail.id) + "/image-optimization-prompt",
+    {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(buildImagePromptPatch(draft))},
+  );
+}
+
 function promptScopeKey(conversationId, segmentIndex) {
   return conversationId + ":" + (Number.isInteger(segmentIndex) && segmentIndex >= 0 ? segmentIndex : "invalid");
 }
@@ -144,6 +157,18 @@ function promptScopeKey(conversationId, segmentIndex) {
 function promptSegmentIndex(segment) {
   if (segment === null) return 0;
   return segment && Number.isInteger(segment.index) && segment.index > 0 ? segment.index : null;
+}
+
+function promptWorkspaceModes() {
+  return [
+    ["generation", "展开生成提示词"],
+    ["dialogue", "展开段台词"],
+    ["image", "展开图片优化"],
+  ];
+}
+
+function postprocessAskDefault() {
+  return "no";
 }
 
 async function saveActiveImagePrompt() {
@@ -1627,11 +1652,7 @@ function promptWorkspace(detail, segment = null) {
   const panel = el("div", "prompt-workspace-panel");
   panel.id = "prompt-workspace-" + (++disclosureSeq);
   panel.setAttribute("role", "tabpanel");
-  const modes = [
-    ["generation", "展开生成提示词"],
-    ["dialogue", "展开段台词"],
-    ["image", "展开图片优化"],
-  ];
+  const modes = promptWorkspaceModes();
   const buttons = {};
   let currentMode = state.promptWorkspaceMode[scope] || null;
 
@@ -1721,10 +1742,7 @@ function promptWorkspace(detail, segment = null) {
       onRestore: () => restoreImagePromptDefault(draft).text,
       onSave: async (text) => {
         draft.text = text;
-        const payload = await apiJSON(
-          "/api/conversations/" + encodeURIComponent(detail.id) + "/image-optimization-prompt",
-          {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(buildImagePromptPatch(draft))},
-        );
+        const payload = await saveImageOptimizationPrompt(detail, segmentIndex, draft);
         const saved = payload.image_optimization_prompt || payload;
         if (!saved || typeof saved.text !== "string" || !/^[0-9a-f]{64}$/.test(String(saved.sha256 || ""))) {
           throw new Error("图片优化提示词保存响应校验失败");
@@ -2203,7 +2221,44 @@ function postprocessSegmentStatus(status) {
     done: "已完成",
     failed: "失败",
     submission_unknown: "提交结果未知",
-  }[status] || String(status || "等待处理");
+  }[status] || "状态未知";
+}
+
+function safePostprocessStage(stage) {
+  return {
+    preparing: "准备素材",
+    remove_subtitle: "移除文字/字幕",
+    remove_brand: "移除常见 Logo/图标",
+    optimize_image: "优化图片质量",
+    downloading: "获取处理结果",
+    retrying: "正在重试",
+    done: "已完成",
+  }[stage] || "处理中";
+}
+
+function safePostprocessError(error) {
+  const code = error && typeof error === "object" ? error.code : error;
+  return {
+    revision_conflict: "分段状态已更新，请刷新后重试",
+    submission_unknown: "提交结果未知，请谨慎确认后再重试",
+    timeout: "处理超时，请稍后重试",
+    postprocess_failed: "图片处理失败，请重试本段",
+    provider_failed: "图片处理失败，请重试本段",
+  }[code] || "本段处理失败，请重试或联系管理员";
+}
+
+async function retryPostprocessSegment(detail, segment, request = apiJSON, confirmUnknown, onAccepted) {
+  const retryable = segment && (segment.status === "failed" || segment.status === "submission_unknown");
+  if (!retryable || !Number.isInteger(segment.index) || segment.index < 0
+      || !Number.isInteger(segment.revision)) return false;
+  if (segment.status === "submission_unknown"
+      && (!confirmUnknown || confirmUnknown() !== true)) return false;
+  if (onAccepted) onAccepted();
+  await request(
+    "/api/conversations/" + encodeURIComponent(detail.id) + "/postprocess/segments/" + segment.index + "/retry",
+    {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({confirm: true, expected_revision: segment.revision})},
+  );
+  return true;
 }
 
 function renderPostprocessSegments(detail, pp) {
@@ -2215,8 +2270,8 @@ function renderPostprocessSegments(detail, pp) {
     const completed = Number.isInteger(segment.completed_frames) ? segment.completed_frames : 0;
     const total = Number.isInteger(segment.total_frames) ? segment.total_frames : 0;
     row.appendChild(el("p", "ac-sub", `已完成 ${completed}/${total} 帧`));
-    if (segment.stage) row.appendChild(el("p", "ac-sub", "阶段：" + segment.stage));
-    if (segment.error) row.appendChild(el("p", "fail-msg", segment.error));
+    if (segment.stage) row.appendChild(el("p", "ac-sub", "阶段：" + safePostprocessStage(segment.stage)));
+    if (segment.error) row.appendChild(el("p", "fail-msg", safePostprocessError(segment.error)));
     if (segment.status === "submission_unknown") {
       row.appendChild(el("p", "pp-billing-warning", "提交结果未知；人工重试可能重复计费，请谨慎确认。"));
     }
@@ -2226,14 +2281,15 @@ function renderPostprocessSegments(detail, pp) {
       retry.type = "button";
       retry.addEventListener("click", async () => {
         if (!await guardDirtyPrompt()) return;
-        if (segment.status === "submission_unknown"
-            && !window.confirm("该段上次提交结果未知，重试可能重复计费。确认仍要重试本段吗？")) return;
-        retry.disabled = true; // expected_revision + 立即禁用共同阻止双击
         try {
-          await apiJSON(
-            "/api/conversations/" + encodeURIComponent(detail.id) + "/postprocess/segments/" + segment.index + "/retry",
-            {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({confirm: true, expected_revision: segment.revision})},
+          const retried = await retryPostprocessSegment(
+            detail,
+            segment,
+            apiJSON,
+            () => window.confirm("该段上次提交结果未知，重试可能重复计费。确认仍要重试本段吗？"),
+            () => { retry.disabled = true; }, // revision CAS + 立即禁用共同阻止双击
           );
+          if (!retried) return;
           await loadDetail(detail.id, true);
         } catch (err) {
           retry.disabled = false;
@@ -2271,7 +2327,7 @@ function renderPpAssistant(detail, pp) {
     card.appendChild(icon("i-alert", "ic-danger"));
     const body = el("div");
     body.appendChild(el("p", "fail-title", pp.status === "submission_unknown" ? "后处理提交结果未知" : "后处理失败"));
-    body.appendChild(el("p", "fail-msg", pp.error || "后端未返回具体原因"));
+    body.appendChild(el("p", "fail-msg", safePostprocessError(pp.error)));
     if (Array.isArray(pp.frames) && pp.frames.length) {
       body.appendChild(el("p", "fail-tip", "已成功优化的帧保留"));
     }
@@ -2312,10 +2368,11 @@ function renderPpAsk(detail) {
     card.appendChild(el("p", "pp-ask-ended", "已跳过优化，素材保持原样"));
   } else {
     const actions = el("div", "pp-ask-actions");
-    const yes = el("button", "btn btn-ghost pp-ask-btn", "是");
+    const defaultChoice = postprocessAskDefault();
+    const yes = el("button", defaultChoice === "yes" ? "btn btn-primary pp-ask-btn is-selected" : "btn btn-ghost pp-ask-btn", "是");
     yes.type = "button";
     yes.addEventListener("click", () => requestOpenPostprocessModal(detail));
-    const no = el("button", "btn btn-primary pp-ask-btn is-selected", "否");
+    const no = el("button", defaultChoice === "no" ? "btn btn-primary pp-ask-btn is-selected" : "btn btn-ghost pp-ask-btn", "否");
     no.type = "button";
     no.addEventListener("click", () => {
       state.ppAskDismissed[detail.id] = true;
@@ -2873,14 +2930,20 @@ if (typeof module !== "undefined" && module.exports) {
     mergeImagePromptDraft,
     normalizeDialogueLines,
     parseDialogueLines,
+    postprocessAskDefault,
     promptSegmentIndex,
+    promptWorkspaceModes,
     openLightbox,
     releaseTrackedURLs,
     releaseTrackedURL,
     resetSegmentProductsDisclosure,
+    retryPostprocessSegment,
     restoreImagePromptDefault,
     recoverLockedPostprocess,
     runSingleFlightPollCycle,
+    safePostprocessError,
+    safePostprocessStage,
+    saveImageOptimizationPrompt,
     segmentProductsDisclosure,
     setDisclosureState,
     showActionError,

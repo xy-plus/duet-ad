@@ -81,6 +81,21 @@ def test_image_prompt_edit_requires_capability_and_valid_segment_index():
     }
 
 
+def test_image_prompt_save_gate_never_requests_when_disabled_or_long_index_invalid():
+    result = _run_async_contract(
+        "(async()=>{let requests=0;const request=async()=>{requests+=1;return {}};"
+        "const base={id:'c1',read_only:false,submit_enabled:true,generation:null,postprocess:null,"
+        "postprocess_capabilities:{optimize_image:false}};"
+        "const draft=contract.createImagePromptDraft('c1',0,{text:'x',default_text:'d',sha256:'a'.repeat(64)});"
+        "let disabled=false,invalid=false;try{await contract.saveImageOptimizationPrompt(base,0,draft,request)}"
+        "catch(error){disabled=error.message==='当前会话未开放图片优化编辑'}"
+        "try{await contract.saveImageOptimizationPrompt({...base,postprocess_capabilities:{optimize_image:true}},"
+        "null,{...draft,segmentIndex:null},request)}catch(error){invalid=error.message==='图片优化提示词段号无效'}"
+        "return {requests,disabled,invalid}})()"
+    )
+    assert result == {"requests": 0, "disabled": True, "invalid": True}
+
+
 def test_discarded_singleton_draft_is_replaced_when_switching_segments():
     result = _run_contract(
         "(()=>{let draft=contract.createImagePromptDraft('c1',1,{text:'one',default_text:'base',sha256:'a'.repeat(64)});"
@@ -134,8 +149,17 @@ def test_postprocess_modal_uses_capabilities_and_image_default_off():
     assert "postprocess_capabilities" in js
     assert 'c.value !== "optimize_image"' in js
     assert "c.disabled = !capabilities[c.value]" in js
-    ask = js.split("function renderPpAsk", 1)[1].split("function renderPpChat", 1)[0]
-    assert '"btn btn-primary pp-ask-btn is-selected", "否"' in ask
+    result = _run_contract(
+        "({defaultChoice:contract.postprocessAskDefault(),modes:contract.promptWorkspaceModes()})"
+    )
+    assert result == {
+        "defaultChoice": "no",
+        "modes": [
+            ["generation", "展开生成提示词"],
+            ["dialogue", "展开段台词"],
+            ["image", "展开图片优化"],
+        ],
+    }
 
 
 def test_segment_progress_retry_and_unknown_warning_are_rendered():
@@ -150,6 +174,32 @@ def test_segment_progress_retry_and_unknown_warning_are_rendered():
     assert "可能重复计费" in js
     assert 'segment.status === "failed"' in js
     assert "window.confirm" in js
+
+
+def test_unknown_segment_retry_cancel_never_requests():
+    result = _run_async_contract(
+        "(async()=>{let requests=0,accepted=0,confirmed=0;"
+        "const retried=await contract.retryPostprocessSegment({id:'c1'},"
+        "{index:2,status:'submission_unknown',revision:7},"
+        "async()=>{requests+=1},()=>{confirmed+=1;return false},()=>{accepted+=1});"
+        "return {retried,requests,accepted,confirmed}})()"
+    )
+    assert result == {"retried": False, "requests": 0, "accepted": 0, "confirmed": 1}
+
+
+def test_postprocess_segment_stage_and_error_are_allowlisted():
+    result = _run_contract(
+        "({knownStage:contract.safePostprocessStage('optimize_image'),"
+        "unknownStage:contract.safePostprocessStage('model-template-secret'),"
+        "knownError:contract.safePostprocessError('revision_conflict'),"
+        "unknownError:contract.safePostprocessError('provider raw stack token=secret')})"
+    )
+    assert result == {
+        "knownStage": "优化图片质量",
+        "unknownStage": "处理中",
+        "knownError": "分段状态已更新，请刷新后重试",
+        "unknownError": "本段处理失败，请重试或联系管理员",
+    }
 
 
 def test_removed_segment_disclosure_helpers_are_not_kept_for_tests():
