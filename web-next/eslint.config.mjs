@@ -26,6 +26,29 @@ const RESTRICTED_NATIVE_ELEMENTS = new Set([
 
 const governancePlugin = {
   rules: {
+    'no-direct-ui-imports': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: { forbidden: UI_FACADE_MESSAGE },
+      },
+      create(context) {
+        const reportRestrictedSource = (node, value) => {
+          if (typeof value === 'string'
+              && /^(?:antd|@ant-design\/x|@ant-design\/icons)(?:\/|$)/u.test(value)) {
+            context.report({ node, messageId: 'forbidden' });
+          }
+        };
+        return {
+          ImportDeclaration(node) {
+            reportRestrictedSource(node.source, node.source.value);
+          },
+          ImportExpression(node) {
+            reportRestrictedSource(node.source, node.source.type === 'Literal' ? node.source.value : undefined);
+          },
+        };
+      },
+    },
     'no-color-literals': {
       meta: {
         type: 'problem',
@@ -70,10 +93,13 @@ const governancePlugin = {
         messages: { forbidden: NATIVE_ELEMENT_MESSAGE },
       },
       create(context) {
+        const nativeVideoWrapper = context.filename.replaceAll('\\', '/').endsWith('/src/ui/video.tsx');
         return {
           JSXOpeningElement(node) {
             const name = node.name.type === 'JSXIdentifier' ? node.name.name : undefined;
-            if (name && RESTRICTED_NATIVE_ELEMENTS.has(name)) {
+            if (name
+                && RESTRICTED_NATIVE_ELEMENTS.has(name)
+                && !(nativeVideoWrapper && name === 'video')) {
               context.report({ node, messageId: 'forbidden' });
             }
           },
@@ -99,11 +125,13 @@ export default tseslint.config(
     rules: {
       ...jsxA11y.flatConfigs.recommended.rules,
     },
+    linterOptions: { noInlineConfig: true },
   },
   {
     files: ['src/**/*.{ts,tsx}'],
     ignores: ['src/**/*.test.{ts,tsx}', 'src/ui/antd.ts'],
     rules: {
+      'governance/no-direct-ui-imports': 'error',
       'no-restricted-imports': [
         'error',
         {
@@ -128,15 +156,21 @@ export default tseslint.config(
   },
   {
     files: ['src/**/*.{ts,tsx}'],
-    ignores: ['src/**/*.test.{ts,tsx}', 'src/ui/video.tsx'],
+    ignores: ['src/**/*.test.{ts,tsx}'],
     rules: {
       'governance/no-inline-styles': 'error',
+    },
+  },
+  {
+    files: ['src/**/*.{ts,tsx}'],
+    ignores: ['src/**/*.test.{ts,tsx}'],
+    rules: {
       'governance/no-native-visual-elements': 'error',
     },
   },
   {
     files: ['src/**/*.{ts,tsx}'],
-    ignores: ['src/**/*.test.{ts,tsx}', 'src/ui/**'],
+    ignores: ['src/**/*.test.{ts,tsx}', 'src/ui/theme.ts'],
     rules: {
       'governance/no-color-literals': 'error',
     },

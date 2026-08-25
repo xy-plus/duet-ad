@@ -96,6 +96,16 @@ describe('PostprocessConfig', () => {
 });
 
 describe('PostprocessStatus', () => {
+  it('does not render retry when the caller withholds authority', () => {
+    render(
+      <PostprocessStatus
+        task={{ ...runningTask, status: 'failed', errorMessage: '处理失败' }}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: '重试失败项' })).not.toBeInTheDocument();
+  });
+
   it('is a non-blocking card, so navigation remains available during background work', async () => {
     const user = userEvent.setup();
     const onNavigate = vi.fn();

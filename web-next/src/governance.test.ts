@@ -60,6 +60,18 @@ describe('UI foundation contract', () => {
     },
   );
 
+  it.each([
+    'antd/es/button',
+    '@ant-design/x/es/bubble',
+    '@ant-design/icons/es/icons/PlusOutlined',
+  ])('rejects dynamic imports from %s subpaths', async (moduleName) => {
+    const messages = await lintBusinessSource(
+      `export const load = () => import('${moduleName}');`,
+    );
+
+    expect(messages).toContainEqual(expect.stringContaining('src/ui/antd'));
+  });
+
   it('accepts UI imports through the facade', async () => {
     const messages = await lintBusinessSource(
       "import { Button } from '../ui/antd';\nexport const Example = () => <Button>Run</Button>;",
@@ -86,6 +98,46 @@ describe('UI foundation contract', () => {
     );
 
     expect(messages).toEqual([]);
+  });
+
+  it('still rejects other native controls inside the video wrapper module', async () => {
+    const messages = await lintBusinessSource(
+      'export const BadControl = () => <button>bad</button>;',
+      'src/ui/video.tsx',
+    );
+
+    expect(messages).toContainEqual(expect.stringContaining('UI facade'));
+  });
+
+  it('does not exempt inline styles in the native video wrapper', async () => {
+    const messages = await lintBusinessSource(
+      'export const NativeVideo = () => <video style={{ width: 10 }} />;',
+      'src/ui/video.tsx',
+    );
+
+    expect(messages).toContainEqual(expect.stringContaining('Inline styles'));
+  });
+
+  it('allows color literals only in the theme module', async () => {
+    const facadeMessages = await lintBusinessSource(
+      "export const color = '#fff';",
+      'src/ui/video.tsx',
+    );
+    const themeMessages = await lintBusinessSource(
+      "export const color = '#fff';",
+      'src/ui/theme.ts',
+    );
+
+    expect(facadeMessages).toContainEqual(expect.stringContaining('Color literals'));
+    expect(themeMessages).toEqual([]);
+  });
+
+  it('rejects inline ESLint disable directives', async () => {
+    const messages = await lintBusinessSource(
+      '/* eslint-disable governance/no-inline-styles */\nexport const Example = () => <div />;',
+    );
+
+    expect(messages).toContainEqual(expect.stringContaining('eslint-disable'));
   });
 
   it('rejects inline styles and color constants from business source', async () => {
@@ -130,5 +182,46 @@ describe('UI foundation contract', () => {
     const messages = await lintStyles('.feature { padding: 13px; gap: 1rem; }');
 
     expect(messages).toContainEqual(expect.stringContaining('Token'));
+  });
+
+  it.each([
+    ['border-radius', '12px'],
+    ['box-shadow', '0 1px 2px #000'],
+    ['font-size', '14px'],
+    ['font-family', 'Arial'],
+  ])('rejects raw %s values from feature CSS', async (property, value) => {
+    const messages = await lintStyles(`.feature { ${property}: ${value}; }`);
+
+    expect(messages).toContainEqual(expect.stringContaining('Token'));
+  });
+
+  it('rejects inline Stylelint disable directives', async () => {
+    const messages = await lintStyles(
+      '/* stylelint-disable declaration-property-value-disallowed-list */ .feature { padding: 13px; }',
+    );
+
+    expect(messages).toContainEqual(expect.stringContaining('stylelint-disable'));
+  });
+
+  it('does not expose unused facade components', () => {
+    const facade = readFileSync(resolve(projectRoot, 'src/ui/antd.ts'), 'utf8');
+    const exported = [...facade.matchAll(/export(?:\s+type)?\s*\{([\s\S]*?)\}\s*from/gu)]
+      .flatMap(([, block]) => block.split(','))
+      .map((entry) => entry.trim().match(/(?:\bas\s+)?([A-Za-z_$][\w$]*)$/u)?.[1])
+      .filter((name): name is string => Boolean(name));
+    const sourceFiles = readdirSync(resolve(projectRoot, 'src'), { recursive: true })
+      .map(String)
+      .filter((file) => /\.[cm]?[jt]sx?$/u.test(file) && file !== 'ui/antd.ts');
+    const imported = sourceFiles
+      .map((file) => readFileSync(resolve(projectRoot, 'src', file), 'utf8'))
+      .flatMap((source) => [...source.matchAll(
+        /import(?:\s+type)?\s*\{([^}]*)\}\s*from\s*['"](?:\.{1,2}\/)+(?:ui\/)?antd['"]/gu,
+      )])
+      .flatMap(([, block]) => block.split(','))
+      .map((entry) => entry.trim().replace(/^type\s+/u, '').match(/^([A-Za-z_$][\w$]*)/u)?.[1])
+      .filter((name): name is string => Boolean(name));
+    const unused = exported.filter((name) => !imported.includes(name));
+
+    expect(unused).toEqual([]);
   });
 });

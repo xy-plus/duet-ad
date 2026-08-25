@@ -74,6 +74,7 @@ export class ApiClient {
   private readonly sessionKeyFactory: () => string;
   private readonly listeners = new Set<() => void>();
   private readonly submitFlights = new Set<string>();
+  private readonly submissionReconciliations = new Map<string, string>();
   private token: string | null;
   private sessionEpoch = 0;
   private currentSessionKey = '';
@@ -120,6 +121,8 @@ export class ApiClient {
     this.token = null;
     this.storage?.removeItem(TOKEN_STORAGE_KEY);
     this.clearQueryCache();
+    this.submitFlights.clear();
+    this.submissionReconciliations.clear();
     this.rotateSessionKey();
   }
 
@@ -180,8 +183,29 @@ export class ApiClient {
     return this.requestJson('/conversations', { signal: options.signal });
   }
 
-  getConversation(id: string, options: ApiRequestOptions = {}): Promise<ConversationDetail> {
-    return this.requestJson(`/conversations/${encodePath(id)}`, { signal: options.signal });
+  async getConversation(id: string, options: ApiRequestOptions = {}): Promise<ConversationDetail> {
+    const detail = await this.requestJson<ConversationDetail>(
+      `/conversations/${encodePath(id)}`,
+      { signal: options.signal },
+    );
+    const generation = detail.generation;
+    const status = generation?.status;
+    const ambiguousRequestId = this.submissionReconciliations.get(id);
+    if (ambiguousRequestId
+        && generation?.client_request_id === ambiguousRequestId
+        && (status === 'queued'
+        || status === 'submitting'
+        || status === 'running'
+        || status === 'failed'
+        || status === 'resume_required'
+        || status === 'succeeded')) {
+      this.submissionReconciliations.delete(id);
+    }
+    return detail;
+  }
+
+  isSubmissionReconciling(id: string): boolean {
+    return this.submissionReconciliations.has(id);
   }
 
   patchPrompt(
@@ -202,7 +226,7 @@ export class ApiClient {
     payload: GenerationSubmitPayload,
     options: ApiRequestOptions = {},
   ): Promise<GenerationSubmitResponse> {
-    if (this.submitFlights.has(id)) {
+    if (this.submitFlights.has(id) || this.submissionReconciliations.has(id)) {
       throw new ApiError('生成请求正在提交，请等待详情更新', {
         status: 409,
         code: 'request_in_progress',
@@ -210,12 +234,31 @@ export class ApiClient {
     }
     this.submitFlights.add(id);
     try {
-      return await this.requestJson(`/conversations/${encodePath(id)}/submit`, {
+      const response = await this.requestJson<GenerationSubmitResponse>(`/conversations/${encodePath(id)}/submit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
         signal: options.signal,
       });
+      if (response.status !== 'queued'
+          && response.status !== 'submitting'
+          && response.status !== 'running') {
+        this.submissionReconciliations.set(id, payload.client_request_id);
+        throw new ApiError('提交结果无法确认，正在核对服务端状态', {
+          status: 0,
+          code: 'submission_unknown',
+        });
+      }
+      return response;
+    } catch (error) {
+      if (error instanceof ApiError
+          && (error.code === 'network_error'
+            || error.code === 'invalid_response'
+            || error.code === 'submission_unknown'
+            || error.status >= 500)) {
+        this.submissionReconciliations.set(id, payload.client_request_id);
+      }
+      throw error;
     } finally {
       this.submitFlights.delete(id);
     }

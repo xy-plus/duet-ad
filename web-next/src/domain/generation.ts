@@ -13,6 +13,15 @@ export const H3_RESOLUTIONS = Object.freeze(['480p', '768p'] as const);
 
 const DIALOGUE_MODES = Object.freeze(['auto', 'edit', 'custom', 'none'] as const);
 const FIT_MODES = Object.freeze(['none', 'crop', 'pad'] as const);
+const GENERATION_STATUSES = Object.freeze([
+  'queued',
+  'submitting',
+  'running',
+  'failed',
+  'resume_required',
+  'submission_unknown',
+  'succeeded',
+] as const);
 const SHA256 = /^[0-9a-f]{64}$/u;
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
@@ -109,6 +118,16 @@ export function longVideoContract(detail: unknown): LongVideoContract {
     segmentCount,
     planReceipt,
   };
+}
+
+export function generationShapeIsOperable(detail: unknown): boolean {
+  const source = record(detail);
+  const duration = source?.duration_s;
+  if (typeof duration !== 'number' || !Number.isFinite(duration) || duration <= 0) return false;
+  const long = longVideoContract(source);
+  if (long.isLong) return long.ready;
+  return (source?.segment_count === null || source?.segment_count === undefined)
+    && (source?.plan_receipt === null || source?.plan_receipt === undefined);
 }
 
 export function fitProfile(detail: unknown, aspectRatio: unknown): FitProfile {
@@ -209,6 +228,17 @@ export function createGenerationDraft(
   return next;
 }
 
+export function safeGenerationDraft(
+  detail: unknown,
+  previous?: GenerationDraft,
+): GenerationDraft | null {
+  try {
+    return createGenerationDraft(detail, previous);
+  } catch {
+    return null;
+  }
+}
+
 export function generationParameterSnapshot(detail: unknown) {
   const source = record(detail);
   if (!source) throw new Error('会话详情无效，请刷新页面后重试');
@@ -276,7 +306,6 @@ export function buildSubmitPayload(input: BuildSubmitInput): GenerationSubmitPay
 }
 
 export function generationAction(status: unknown, stage?: unknown): GenerationAction {
-  if (status === null || status === undefined) return 'new';
   if (status === 'failed') return stage === 'stitch' ? 'retry_stitch' : 'retry';
   if (status === 'resume_required') return 'resume';
   return 'none';
@@ -285,7 +314,15 @@ export function generationAction(status: unknown, stage?: unknown): GenerationAc
 export function generationRetryContract(detail: unknown): GenerationRetryContract {
   const source = record(detail);
   const generation = generationRecord(source);
-  const action = generationAction(generation?.status, generation?.stage);
+  if (!source || !generationShapeIsOperable(source)) {
+    return { action: 'none', paidTaskCount: null };
+  }
+  if (generation && !includes(GENERATION_STATUSES, generation.status)) {
+    return { action: 'none', paidTaskCount: null };
+  }
+  const action = generation
+    ? generationAction(generation.status, generation.stage)
+    : 'new';
   const long = longVideoContract(source);
   if (!long.isLong) {
     return { action, paidTaskCount: action === 'new' || action === 'retry' ? 1 : 0 };

@@ -14,7 +14,9 @@ export interface GenerationSettingsValue {
 
 export interface GenerationEvidence {
   id: string;
-  parameters: GenerationSettingsValue;
+  parameters?: GenerationSettingsValue;
+  durationSeconds?: number | null;
+  segmentCount?: number | null;
 }
 
 export type GenerationSegmentStatus =
