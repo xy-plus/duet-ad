@@ -437,7 +437,9 @@ test('postprocess submits exact options, closes to a background card, and surviv
   await installApi(page, controller);
   await login(page);
   await page.getByRole('button', { name: '优化关键帧' }).click();
-  await page.getByRole('checkbox', { name: '移除品牌标识' }).uncheck();
+  const removeBrand = page.getByRole('checkbox', { name: '移除品牌标识' });
+  await removeBrand.click();
+  await expect(removeBrand).not.toBeChecked();
   await page.getByRole('button', { name: '开始后处理' }).click();
   await seen;
   await expect(page.getByRole('dialog')).toHaveCount(0);
