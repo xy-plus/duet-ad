@@ -164,11 +164,13 @@ export function ArtifactSummary({
 export function DialogueArtifactList({ dialogue }: { dialogue: readonly DialogueArtifact[] }) {
   if (dialogue.length === 0) return null;
   return (
-    <section className="media-dialogue" aria-label="识别台词">
-      <div className="media-dialogue__heading">
-        <Typography.Title level={5}>识别台词</Typography.Title>
-        <Tag variant="filled">{dialogue.length} 段</Tag>
-      </div>
+    <Card
+      aria-label="识别台词"
+      className="media-dialogue"
+      extra={<Tag variant="filled">{dialogue.length} 段</Tag>}
+      size="small"
+      title="识别台词"
+    >
       <Space orientation="vertical" className="media-artifact-list">
         {dialogue.map((item) => (
           <Space orientation="vertical" size="small" key={item.id}>
@@ -179,7 +181,7 @@ export function DialogueArtifactList({ dialogue }: { dialogue: readonly Dialogue
           </Space>
         ))}
       </Space>
-    </section>
+    </Card>
   );
 }
 

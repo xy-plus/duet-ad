@@ -44,6 +44,13 @@ export const appTheme: AppTheme = {
       creationBorderColor: '#dedee1',
       creationHoverColor: '#f3f3f4',
     },
+    Layout: {
+      bodyBg: '#ffffff',
+      headerBg: '#ffffff',
+      headerHeight: 64,
+      headerPadding: '0 24px',
+      lightSiderBg: '#f3f3f4',
+    },
   },
 };
 

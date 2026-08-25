@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import {
+  Avatar,
   Button,
   Conversations,
   Divider,
@@ -56,11 +57,11 @@ export function ConversationSidebar<T extends ConversationNavigationItem>({
   return (
     <aside aria-label="会话导航" className="conversation-sidebar">
       <Flex align="center" className="conversation-sidebar__brand" gap="small">
-        <span className="conversation-sidebar__brand-mark"><ProductOutlined /></span>
-        <span className="conversation-sidebar__brand-copy">
+        <Avatar icon={<ProductOutlined />} shape="square" />
+        <Flex className="conversation-sidebar__brand-copy" vertical>
           <Typography.Text strong>{brand}</Typography.Text>
           <Typography.Text type="secondary">视频工作台</Typography.Text>
-        </span>
+        </Flex>
       </Flex>
 
       <Conversations

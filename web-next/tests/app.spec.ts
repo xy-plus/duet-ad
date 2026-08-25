@@ -538,7 +538,7 @@ test('desktop screenshot baseline', async ({ page }) => {
   expect(geometry).not.toBeNull();
   expect(geometry?.bodyScrollHeight).toBeLessThanOrEqual(geometry?.viewportHeight ?? 0);
   expect(geometry?.contentScrollHeight).toBeGreaterThan(geometry?.contentClientHeight ?? Number.MAX_SAFE_INTEGER);
-  expect(geometry?.detailWidth).toBeLessThanOrEqual(920);
+  expect(geometry?.detailWidth).toBeLessThanOrEqual(900);
   expect(geometry?.sourceWidth).toBeLessThanOrEqual(320);
   await expect(page).toHaveScreenshot('desktop-workspace.png', { animations: 'disabled', fullPage: true });
   await page.getByText('生成状态', { exact: true }).scrollIntoViewIfNeeded();

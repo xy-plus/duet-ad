@@ -18,24 +18,7 @@
 }
 
 .media-dialogue {
-  display: flex;
-  gap: var(--ant-margin-sm);
-  padding: var(--ant-padding-md);
-  border-inline-start: 2px solid var(--ant-color-border);
-  border-radius: var(--ant-border-radius-lg);
-  background: var(--ant-color-fill-quaternary);
-  flex-direction: column;
-}
-
-.media-dialogue__heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--ant-margin-sm);
-}
-
-.media-dialogue__heading h5 {
-  margin: 0;
+  inline-size: 100%;
 }
 
 .keyframe-gallery {

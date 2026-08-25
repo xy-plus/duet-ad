@@ -43,7 +43,7 @@ import {
   type PostprocessRetryAction,
   type PostprocessTask,
 } from '../features/postprocess';
-import { Alert, Button, Space, Typography } from '../ui/antd';
+import { Alert, Button, Divider, Space, Typography } from '../ui/antd';
 import {
   AuthenticatedImageGrid,
   AuthenticatedSegments,
@@ -429,6 +429,7 @@ function LoadedConversationDetail({ apiClient, detail }: { apiClient: ApiClient;
         <AuthenticatedVideo apiClient={apiClient} conversationId={detail.id} fileName="generated.mp4" />
       ) : null}
       <footer className="app-detail-meta">
+        <Divider />
         <Space orientation="vertical" size="small">
           <Typography.Text type="secondary">创建时间：{detail.created_at}</Typography.Text>
           <Typography.Text type="secondary">更新时间：{detail.updated_at}</Typography.Text>

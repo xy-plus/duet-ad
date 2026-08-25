@@ -32,8 +32,6 @@
 }
 
 .workspace-shell__sider {
-  border-inline-end: 1px solid var(--ant-color-border-secondary);
-  background: var(--ant-color-fill-quaternary);
   overflow: hidden;
 }
 
@@ -42,7 +40,6 @@
   align-items: center;
   justify-content: space-between;
   min-height: 64px;
-  border-block-end: 1px solid var(--ant-color-border-secondary);
   padding-inline: var(--ant-padding-lg);
 }
 
@@ -70,22 +67,8 @@
   padding: var(--ant-padding-xs) var(--ant-padding-sm) var(--ant-padding-sm);
 }
 
-.conversation-sidebar__brand-mark {
-  display: inline-grid;
-  width: 36px;
-  height: 36px;
-  flex: 0 0 auto;
-  border: 1px solid var(--ant-color-border-secondary);
-  border-radius: var(--ant-border-radius-lg);
-  background: var(--ant-color-bg-container);
-  box-shadow: var(--ant-box-shadow-tertiary);
-  place-items: center;
-}
-
 .conversation-sidebar__brand-copy {
-  display: flex;
   min-width: 0;
-  flex-direction: column;
 }
 
 .conversation-sidebar__conversations {
@@ -104,7 +87,6 @@
 
 .conversation-sidebar__status {
   min-width: 0;
-  font-size: var(--ant-font-size-sm);
 }
 
 .conversation-sidebar__footer {

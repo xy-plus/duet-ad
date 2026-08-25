@@ -169,7 +169,7 @@ export function GenerationStatus({ model, onAction }: GenerationStatusProps) {
         : 'normal';
 
   return (
-    <Card className="generation-status-surface" title="生成状态" variant="borderless">
+    <Card title="生成状态" variant="borderless">
       <Space orientation="vertical" size="middle" className="generation-status-stack">
         <Typography.Text strong>
           {model.paidTaskCount === null

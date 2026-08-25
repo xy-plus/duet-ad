@@ -81,7 +81,6 @@ describe('CreateConversationComposer', () => {
   });
 
   it('accepts a free-form translation language and submits the controlled draft', async () => {
-    const user = userEvent.setup();
     const onSubmit = vi.fn<(draft: CreateConversationDraft) => void>();
     render(
       <ComposerHarness
@@ -94,13 +93,15 @@ describe('CreateConversationComposer', () => {
       />,
     );
 
-    await user.type(screen.getByLabelText('目标语言'), '克林贡语');
-    await user.click(screen.getByRole('button', { name: '创建会话' }));
+    fireEvent.change(screen.getByLabelText('目标语言'), { target: { value: '克林贡语' } });
+    fireEvent.click(screen.getByRole('button', { name: '创建会话' }));
 
-    expect(onSubmit).toHaveBeenCalledWith({
-      source: { type: 'url', url: 'https://example.com/source.mp4' },
-      note: '保留画面节奏',
-      transcript: { mode: 'translate', targetLanguage: '克林贡语' },
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledWith({
+        source: { type: 'url', url: 'https://example.com/source.mp4' },
+        note: '保留画面节奏',
+        transcript: { mode: 'translate', targetLanguage: '克林贡语' },
+      });
     });
   });
 

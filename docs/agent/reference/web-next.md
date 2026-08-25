@@ -120,10 +120,11 @@ Stylelint 对 `src/**/*.css` 强制：
 
 - 禁止 `.ant-*` 内部 selector、hex/named color、`rgb/hsl/.../color()`、`!important`。
 - `margin/padding/gap/row-gap/column-gap` 禁止裸 `px/rem`，必须使用 Ant Token CSS variable。
-- feature CSS 只负责布局、滚动、响应式断点和视频宽高比；组件视觉由 Token/component props 表达。
-- AGENTS 另禁止渐变、玻璃拟态和组件式通用 CSS；当前自动规则不应被描述成能识别全部审美语义。
+- `src/app/**` 与 `src/features/**` 的 CSS 禁止背景、边框、圆角、阴影、字体、颜色、自定义变量和滤镜；这些视觉表面只能由 facade 组件及 `theme.tsx` Token 表达。
+- 任意 `>100dvh` 的文档高度和 `>=57rem` 的固定内容宽度会被拒绝；标准工作台仍由源码与浏览器双重断言锁定 `100dvh / 272px / 900px`。
+- AGENTS 另禁止渐变、玻璃拟态和通用组件式 CSS；视觉语义仍须由对照文档和四张截图共同审查。
 
-`src/governance.test.ts` 用反例验证 import、原生元素、video 白名单、inline style、SVG、颜色、`.ant-*`、`!important` 和 spacing gates，不能靠 disable 注释绕过。
+`src/governance.test.ts` 用反例验证 import、原生元素、video 白名单、inline style、SVG、颜色、手搓表面、第二视觉变量、宽页/长页、`.ant-*`、`!important` 和 spacing gates，不能靠 disable 注释绕过。
 
 ## 运行、测试与 3213 发布契约
 
@@ -140,4 +141,4 @@ npm run test:e2e
 - 生产发布只使用构建后的 `web-next/dist` 和同一个 Caddy unit：3213 `/api/*` 反代 3212，其余路径 file server + SPA fallback；HTML/no-route `no-store`，hash asset `public,max-age=31536000,immutable`。
 - 发布验证必须包含后端全量测试、`tests/test_caddy_dual_frontend.py`、Caddy validate、构建产物检查及 [.deploy/runbook.md](../../../.deploy/runbook.md) 第 6 节 GET/HEAD smoke。
 - 3213 smoke 禁止 POST/PUT/PATCH/DELETE、创建会话或运行付费 H3 smoke。真实付费验收必须另行授权。
-- 生产发布必须同时验证候选配置、监听 socket、本机 API/静态资源与公网 HTTPS；当前 3213 已完成这些只读 smoke，相关文档状态为 `done`。
+- 生产发布必须同时验证候选配置、监听 socket、本机 API/静态资源与公网 HTTPS；本次视觉版本发布并完成只读 smoke 后，才把相关文档状态更新为 `done`。

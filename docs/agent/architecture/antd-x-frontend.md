@@ -12,7 +12,7 @@ links: [antd-x-frontend]
 
 ## 状态与运行边界
 
-`web-next`、双入口 Caddy 配置和自动化测试已集成；生产 3213 已通过本机与公网只读 smoke，并由现有 Caddy unit 提供服务。
+`web-next`、双入口 Caddy 配置和自动化测试已集成；现有生产 3213 由 Caddy 提供服务，本次视觉对齐仍处于发布前验证阶段，发布后必须重新执行本机与公网只读 smoke。
 
 ```mermaid
 flowchart LR
@@ -90,7 +90,7 @@ WorkspaceShell (100dvh)
 ```
 
 - `src/ui/theme.tsx` 决定全局色彩、圆角、阴影、控件高度和 Conversations creation 状态；feature CSS 不能建立第二套视觉变量。
-- shell/app CSS 决定唯一页面几何；media/generation CSS 只决定该业务组合在既定内容流内的排列。
+- shell/app CSS 决定唯一页面几何；media/generation CSS 只决定该业务组合在既定内容流内的排列。业务 CSS 禁止建立背景、边框、圆角、阴影、字体、颜色和自定义变量，视觉表面必须由 facade 暴露的官方组件承担。
 - 真实媒体、服务端字段和付费门禁优先于原型外观；原型的假 Sender、假指标、固定分片和占位媒体不属于架构。
 - Playwright 同时冻结首屏、生成区、移动 Drawer 和移动正文，防止只优化单一截图。
 

@@ -3,6 +3,7 @@ import 'antd/dist/reset.css';
 export {
   Alert,
   App as AntApp,
+  Avatar,
   AutoComplete,
   Button,
   Card,

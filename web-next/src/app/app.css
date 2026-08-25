@@ -4,15 +4,6 @@
   place-items: center;
 }
 
-.workspace-shell__header {
-  background: var(--ant-color-bg-container);
-}
-
-.workspace-shell__workspace,
-.workspace-shell__content {
-  background: var(--ant-color-bg-container);
-}
-
 .app-page-inset {
   padding: var(--ant-padding-lg);
 }
@@ -72,7 +63,6 @@
 
 .app-detail-meta {
   padding-block-start: var(--ant-padding-lg);
-  border-block-start: 1px solid var(--ant-color-border-secondary);
 }
 
 .app-media-grid {
@@ -93,10 +83,6 @@
   width: 100%;
   aspect-ratio: 16 / 10;
   object-fit: cover;
-}
-
-.prompt-editor-surface {
-  border-block: 1px solid var(--ant-color-border-secondary);
 }
 
 @media (width <= 48rem) {

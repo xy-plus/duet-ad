@@ -4,15 +4,6 @@
   gap: 0 var(--ant-padding-lg);
 }
 
-.generation-settings-surface {
-  border: 1px solid var(--ant-color-border-secondary);
-  background: var(--ant-color-fill-quaternary);
-}
-
-.generation-status-surface {
-  border-block-start: 1px solid var(--ant-color-border-secondary);
-}
-
 .generation-settings-wide {
   grid-column: 1 / -1;
 }

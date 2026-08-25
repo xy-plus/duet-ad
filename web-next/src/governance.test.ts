@@ -45,10 +45,12 @@ describe('UI foundation contract', () => {
     const shellStyles = readFileSync(resolve(projectRoot, 'src/features/shell/shell.css'), 'utf8');
     const appStyles = readFileSync(resolve(projectRoot, 'src/app/app.css'), 'utf8');
     const promptSource = readFileSync(resolve(projectRoot, 'src/features/media/PromptEditor.tsx'), 'utf8');
+    const shellSource = readFileSync(resolve(projectRoot, 'src/features/shell/WorkspaceShell.tsx'), 'utf8');
     const browserContract = readFileSync(resolve(projectRoot, 'tests/app.spec.ts'), 'utf8');
 
     expect(shellStyles).toMatch(/\.workspace-shell\s*\{[^}]*height:\s*100dvh;[^}]*overflow:\s*hidden;/su);
-    expect(shellStyles).toContain('width: 36px;');
+    expect(shellSource).toContain('width={272}');
+    expect(shellSource).toContain('size={272}');
     expect(appStyles).toContain('width: min(100%, 56.25rem);');
     expect(appStyles).toContain('grid-template-columns: minmax(0, 1fr) minmax(15rem, 18rem);');
     expect(promptSource).toContain('className="prompt-editor-surface"');
@@ -349,9 +351,29 @@ describe('UI foundation contract', () => {
   });
 
   it('accepts token-driven CSS', async () => {
-    const messages = await lintStyles('.shell { color: var(--ant-color-text); }');
+    const messages = await lintStyles('.shell { display: grid; gap: var(--ant-margin-sm); }');
 
     expect(messages).toEqual([]);
+  });
+
+  it('rejects hand-written visual surfaces and secondary visual variables in feature CSS', async () => {
+    const messages = await lintStyles(`
+      .surface {
+        --surface-color: var(--ant-color-bg-container);
+        background: var(--ant-color-bg-container);
+        border: 1px solid var(--ant-color-border);
+        border-radius: var(--ant-border-radius-lg);
+        box-shadow: var(--ant-box-shadow-tertiary);
+      }
+    `);
+
+    expect(messages.filter((message) => message.includes('geometry-only'))).toHaveLength(5);
+  });
+
+  it('rejects workspace geometry that can recreate a wide or document-scrolling page', async () => {
+    const messages = await lintStyles('.page { width: 72rem; min-height: 200dvh; }');
+
+    expect(messages.filter((message) => message.includes('Token-driven'))).toHaveLength(2);
   });
 
   it('rejects raw spacing values from feature CSS', async () => {
