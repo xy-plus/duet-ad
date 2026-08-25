@@ -1,5 +1,5 @@
 import { createElement, type PropsWithChildren } from 'react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
 import { AntApp, XProvider, zhCN, type ThemeConfig } from './antd';
 import './baseline.css';
 
@@ -37,17 +37,11 @@ export const appTheme: ThemeConfig = {
   },
 };
 
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      refetchOnWindowFocus: false,
-      retry: 1,
-      staleTime: 30_000,
-    },
-  },
-});
+interface AppThemeProviderProps extends PropsWithChildren {
+  queryClient: QueryClient;
+}
 
-export function AppThemeProvider({ children }: PropsWithChildren) {
+export function AppThemeProvider({ children, queryClient }: AppThemeProviderProps) {
   return createElement(
     QueryClientProvider,
     { client: queryClient },
