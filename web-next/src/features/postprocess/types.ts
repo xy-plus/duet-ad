@@ -33,11 +33,6 @@ export interface PostprocessSegmentStatus {
   error: string | null;
 }
 
-export interface PostprocessRetryAction {
-  taskId: string;
-  options: PostprocessOptions;
-}
-
 export interface PostprocessSegmentRetryAction {
   index: number;
   expectedRevision: number;

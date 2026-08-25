@@ -45,7 +45,6 @@ import {
   PostprocessConfig,
   PostprocessStatus,
   type PostprocessOptions,
-  type PostprocessRetryAction,
   type PostprocessTask,
 } from '../features/postprocess';
 import { Alert, Button, Card, Space, Typography } from '../ui/antd';
@@ -360,9 +359,6 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
     }
   };
 
-  const retry = ({ options: frozenOptions }: PostprocessRetryAction) => {
-    void submit(frozenOptions);
-  };
   const visibleTask = serverTask ?? (pendingOptions ? queuedPostprocessTask(detail, pendingOptions) : null);
   const frames = detail.postprocess?.frames ?? [];
   const unknownShape = Boolean(detail.postprocess?.status) && !serverTask;
@@ -397,10 +393,10 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
       />
       {visibleTask ? (
         <PostprocessStatus
-          onRetry={operationAllowed ? retry : undefined}
           retrying={mutation.isPending || segmentRetryMutation.isPending || retryingSegment !== undefined}
           task={visibleTask}
           onRetrySegment={operationAllowed ? ({ index, expectedRevision }) => { void retrySegment(index, expectedRevision); } : undefined}
+          onRefresh={() => { void queryClient.invalidateQueries({ queryKey: queryKeys.detail(sessionKey, detail.id) }); }}
         />
       ) : null}
       <AuthenticatedImageGrid

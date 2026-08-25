@@ -14,7 +14,6 @@ import {
 import './postprocess.css';
 import type {
   PostprocessOptions,
-  PostprocessRetryAction,
   PostprocessSegmentRetryAction,
   PostprocessTask,
 } from './types';
@@ -22,8 +21,8 @@ import type {
 interface PostprocessStatusProps {
   task: PostprocessTask;
   retrying?: boolean;
-  onRetry?: (action: PostprocessRetryAction) => void;
   onRetrySegment?: (action: PostprocessSegmentRetryAction) => void;
+  onRefresh?: () => void;
 }
 
 const statusLabels: Record<PostprocessTask['status'], string> = {
@@ -72,12 +71,25 @@ function taskAlert(task: PostprocessTask) {
   }
 }
 
-export function PostprocessStatus({ task, retrying = false, onRetry, onRetrySegment }: PostprocessStatusProps) {
+function stageLabel(stage: string | null, status: string): string {
+  if (stage === 'queued' || stage === 'pending') return '等待处理';
+  if (stage === 'prepare' || stage === 'extract') return '准备素材';
+  if (stage === 'remove_subtitle' || stage === 'text') return '文字处理';
+  if (stage === 'remove_brand' || stage === 'logo') return '标识处理';
+  if (stage === 'optimize_image' || stage === 'seedream' || stage === 'image') return '图片优化';
+  if (stage === 'finalize' || stage === 'write' || stage === 'done') return '整理结果';
+  if (status === 'failed') return '处理失败';
+  if (status === 'succeeded' || status === 'done') return '处理完成';
+  return '处理中';
+}
+
+export function PostprocessStatus({ task, retrying = false, onRetrySegment, onRefresh }: PostprocessStatusProps) {
   const [unknownRetry, setUnknownRetry] = useState<PostprocessSegmentRetryAction>();
   const percent = task.totalCount > 0
     ? Math.min(100, Math.round((task.processedCount / task.totalCount) * 100))
     : 0;
   const retryable = task.status === 'failed' || task.status === 'partial_success';
+  const failedSegments = task.segments?.filter((segment) => segment.status === 'failed') ?? [];
   const successfulResults = task.results.filter((result) => result.status === 'succeeded');
   const failedResults = task.results.filter((result) => result.status === 'failed');
   const progressStatus = task.status === 'failed'
@@ -108,16 +120,24 @@ export function PostprocessStatus({ task, retrying = false, onRetry, onRetrySegm
         />
         <Progress percent={percent} status={progressStatus} aria-label="后处理进度" />
         {taskAlert(task)}
+        {retryable && failedSegments.length === 0 ? (
+          <Alert
+            type="warning"
+            showIcon
+            title="没有可安全重试的分段 revision，已禁止整体重发"
+            description={onRefresh ? <Button onClick={onRefresh}>刷新状态</Button> : '请刷新详情后再检查。'}
+          />
+        ) : null}
         {task.segments?.map((segment) => {
           const segmentPercent = segment.totalFrames > 0
             ? Math.min(100, Math.round((segment.completedFrames / segment.totalFrames) * 100)) : 0;
-          const retryableSegment = segment.status === 'failed' || segment.status === 'submission_unknown';
-          const submissionUnknown = segment.stage === 'submission_unknown' || segment.status === 'submission_unknown';
+          const retryableSegment = segment.status === 'failed';
+          const submissionUnknown = segment.error === 'submission_unknown';
           return (
-            <Card key={segment.index} size="small" title={`第 ${segment.index} 段`} extra={<Tag>{segment.stage ?? segment.status}</Tag>}>
+            <Card key={segment.index} size="small" title={segment.index === 0 ? '当前视频' : `第 ${segment.index} 段`} extra={<Tag>{stageLabel(segment.stage, segment.status)}</Tag>}>
               <Space orientation="vertical" className="postprocess-status-stack">
                 <Progress aria-label={`第 ${segment.index} 段后处理进度`} percent={segmentPercent} status={retryableSegment ? 'exception' : undefined} />
-                {segment.error ? <Alert type={submissionUnknown ? 'warning' : 'error'} showIcon title={segment.error} description={submissionUnknown ? '提交状态未知，重试可能重复计费。' : undefined} /> : null}
+                {segment.error ? <Alert type={submissionUnknown ? 'warning' : 'error'} showIcon title={submissionUnknown ? '提交状态未知' : segment.error} description={submissionUnknown ? '重试可能重复计费。' : undefined} /> : null}
                 {retryableSegment && onRetrySegment ? <Button disabled={retrying} loading={retrying} onClick={() => {
                   const action = { index: segment.index, expectedRevision: segment.revision };
                   if (submissionUnknown) setUnknownRetry(action); else onRetrySegment(action);
@@ -126,16 +146,6 @@ export function PostprocessStatus({ task, retrying = false, onRetry, onRetrySegm
             </Card>
           );
         })}
-        {retryable && onRetry && (
-          <Button
-            aria-label={retrying ? '重试中' : '重试失败项'}
-            loading={retrying}
-            disabled={retrying}
-            onClick={() => onRetry({ taskId: task.id, options: task.options })}
-          >
-            {retrying ? '重试中' : '重试失败项'}
-          </Button>
-        )}
         {successfulResults.length > 0 && (
           <Image.PreviewGroup>
             <div className="postprocess-result-grid">

@@ -559,6 +559,33 @@ test('postprocess submission failure restores the default no decision', async ({
   await expect(page.getByRole('button', { name: '否', exact: true })).toHaveAttribute('aria-pressed', 'true');
 });
 
+test('submission_unknown segment requires billed-retry confirmation and revision CAS', async ({ page }) => {
+  const candidate = detail('post-unknown-segment', {
+    title: '未知提交分段', navigation_status: 'postprocess_failed', keyframes: ['one.png'],
+    generation: { status: 'succeeded', stage: 'h3', client_request_id: 'post-unknown-generation' }, fit_mode: 'none',
+    postprocess: {
+      status: 'failed', options: { remove_subtitle: true, remove_brand: false, optimize_image: true }, frames: [], error: '分段失败',
+      segments: [{ index: 0, status: 'failed', stage: 'seedream', completed_frames: 0, total_frames: 1, revision: 3, error: 'submission_unknown' }],
+    },
+  });
+  const controller: ApiController = {
+    details: { 'post-unknown-segment': candidate }, order: ['post-unknown-segment'], requests: [],
+    retryPostprocessSegment: async (route) => route.fulfill({ json: { status: 'queued', frames: [] } }),
+  };
+  await installApi(page, controller);
+  await login(page);
+  await expect(page.getByText('当前视频')).toBeVisible();
+  await expect(page.getByText('图片优化', { exact: true })).toBeVisible();
+  await expect(page.getByText('seedream')).toHaveCount(0);
+  await expect(page.getByText(/重试可能重复计费/u)).toBeVisible();
+  await page.getByRole('button', { name: '重试本段' }).click();
+  expect(controller.requests.filter(({ path }) => path.endsWith('/retry'))).toHaveLength(0);
+  await page.getByRole('button', { name: '仍要重试本段' }).click();
+  await expect.poll(() => controller.requests.filter(({ path }) => path.endsWith('/retry')).length).toBe(1);
+  const retry = controller.requests.find(({ path }) => path.endsWith('/retry'));
+  expect(JSON.parse(retry?.body ?? '{}')).toEqual({ confirm: true, expected_revision: 3 });
+});
+
 test('postprocess_options_locked refetches and displays server-frozen options without automatic resend', async ({ page }) => {
   const candidate = detail('locked', {
     title: '锁定选项会话',

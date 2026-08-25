@@ -3,7 +3,7 @@ export { PostprocessStatus } from './PostprocessStatus';
 export type {
   PostprocessOptions,
   PostprocessResult,
-  PostprocessRetryAction,
+  PostprocessSegmentRetryAction,
   PostprocessTask,
   PostprocessTaskStatus,
 } from './types';

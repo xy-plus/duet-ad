@@ -24,15 +24,16 @@ links: [antd-x-frontend]
 | 图片优化 capability 不可用 | 禁用图片优化按钮和保存入口，但生成提示词、段台词工作区仍然可用；隐藏项提交时一律归一为 `false` |
 | 用户提交后处理 | 立即冻结选项并关闭 Modal，主页面显示非阻塞后台状态卡；切换会话不取消任务 |
 | 服务端返回 `postprocess_options_locked` | 拉取并显示服务端冻结选项，不按本地草稿自动重发 |
-| 后处理运行、部分成功或失败 | 按 segment 展示 stage、完成帧/总帧、错误；失败段用 `expected_revision` 重试本段，请求 pending 时禁止重复点击 |
-| segment stage 为 `submission_unknown` | 明确警告重试可能重复计费，不把未知提交当成已确认失败自动重试 |
+| 后处理运行、部分成功或失败 | 按 segment 展示供应商无关的中文阶段、完成帧/总帧、错误；index 0 显示“当前视频”，失败段只用 `expected_revision` 重试本段 |
+| segment `error` 为 `submission_unknown` | 明确警告重试可能重复计费，并要求二次确认；不根据 status 或 stage 猜测未知提交 |
+| 整体失败但缺少 failed segment/revision | 显示安全错误并允许刷新状态；不显示整项目重试，也不重新发送普通后处理 POST |
 | 后处理有成功图片 | 通过认证 Blob URL 展示并允许 AntD 图片预览；失败项保留独立错误 |
 
 ## 边界
 
 - 唯一原生视觉控件是 `src/ui/video.tsx` 封装的 `<video controls>`；它只接收已认证 Blob URL。
 - 后处理完整成功后，服务端自动把同名 `postprocessed/` 图片冻结为 H3 输入；前端不提供手工回灌或绕过完整性门控的入口。
-- 已锁定选项不可改；整体恢复沿用服务端冻结值，分段重试只提交服务端 revision。
+- 已锁定选项不可改；失败恢复只允许带服务端 revision 的分段 CAS 重试。
 - 页面不展示图片优化供应商模型、模板 ID 或执行模式。
 - `postprocess_enabled=false`、只读会话或已有后处理记录时不显示新的配置入口。
 
