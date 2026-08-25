@@ -1,7 +1,7 @@
 ---
 name: antd-x-frontend
 type: architecture
-status: building
+status: done
 owner: agent
 updated: 2026-08-25
 tdd: N/A
@@ -12,7 +12,7 @@ links: [antd-x-frontend]
 
 ## 状态与运行边界
 
-`web-next`、双入口 Caddy 配置和自动化测试已集成；现有生产 3213 由 Caddy 提供服务，本次视觉对齐仍处于发布前验证阶段，发布后必须重新执行本机与公网只读 smoke。
+`web-next`、双入口 Caddy 配置和自动化测试已集成；生产 3213 已发布本次视觉对齐版本，并完成本机与公网只读 smoke，继续由同一 Caddy unit 提供服务。
 
 ```mermaid
 flowchart LR

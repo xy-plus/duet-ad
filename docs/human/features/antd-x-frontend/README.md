@@ -1,7 +1,7 @@
 ---
 name: antd-x-frontend
 type: feature
-status: building
+status: done
 owner: human
 updated: 2026-08-25
 tdd: N/A
@@ -25,7 +25,7 @@ links: [conversation-task]
 - [x] 主题 Token、组件导入、CSS 和视觉回归门禁可阻止后续显示风格漂移
 - [x] 旧 `web/` 和后端不修改，3211/3212 与 3213 两套前端共享同一个 3212 后端
 - [x] 3213 使用现有 Caddy 与 HTTPS，不使用 Vite preview 作为生产服务器
-- [ ] 本次视觉对齐发布后，重新完成 3211/3212/3213 只读 smoke，并把本 feature 和对应 Agent 文档状态更新为 `done`
+- [x] 本次视觉对齐发布后，重新完成 3211/3212/3213 只读 smoke，并把本 feature 和对应 Agent 文档状态更新为 `done`
 
 ## 用户行为
 

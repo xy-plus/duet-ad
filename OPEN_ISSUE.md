@@ -8,8 +8,6 @@
 
 ## 🚧 进行中
 
-- 3213 新前端与已确认的 AntD X 预览版视觉结构偏离：收敛为固定视口、窄内容流、紧凑媒体与弱边框分区，并以文档、治理测试和 Playwright 截图固化。（→ `docs/human/features/antd-x-frontend/behaviors/visual-language.md`）
-
 ## 📌 待办与限制
 
 - 自动补交依赖 append-only attempt ledger；若带外删除最后一个已落盘 receipt，无独立高水位可识别。该磁盘状态破坏场景按要求不扩展实现。（→ `app/h3.py:_validated_attempt_ledger`）
