@@ -1,0 +1,55 @@
+.app-centered {
+  display: grid;
+  min-block-size: 50dvh;
+  place-items: center;
+}
+
+.workspace-shell__header {
+  background: var(--ant-color-bg-container);
+}
+
+.app-page-inset {
+  padding: var(--ant-padding-lg);
+}
+
+.app-create-progress {
+  width: min(100%, 52.5rem);
+  margin-inline: auto;
+  padding: 0 var(--ant-padding-lg) var(--ant-padding-lg);
+}
+
+.app-detail {
+  display: flex;
+  width: min(100%, 72rem);
+  margin-inline: auto;
+  padding: var(--ant-padding-lg);
+  gap: var(--ant-margin-lg);
+  flex-direction: column;
+}
+
+.app-detail-stack {
+  display: flex;
+  gap: var(--ant-margin-md);
+  flex-direction: column;
+}
+
+.app-media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: var(--ant-margin-sm);
+}
+
+.app-media-grid__item {
+  display: grid;
+  min-inline-size: 0;
+  margin: 0;
+  gap: var(--ant-margin-xxs);
+}
+
+@media (width <= 48rem) {
+  .app-detail,
+  .app-create-progress,
+  .app-page-inset {
+    padding: var(--ant-padding-sm);
+  }
+}
