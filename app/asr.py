@@ -42,7 +42,10 @@ def _lines_from_json(payload: object, duration_s: float) -> list[dict]:
             or not isinstance(end_ms, (int, float))
         ):
             raise ASRError("asr_output_invalid")
-        text = text.strip()
+        # whisper.cpp can truncate a multibyte token at a segment boundary.
+        # The JSON remains structurally usable after replacement decoding; do
+        # not leak the replacement marker into the frozen dialogue prompt.
+        text = text.replace("\ufffd", "").strip()
         start_s = max(0.0, float(start_ms) / 1000.0)
         end_s = min(duration_s, float(end_ms) / 1000.0)
         if text and math.isfinite(start_s) and math.isfinite(end_s) and start_s < end_s:
@@ -73,7 +76,6 @@ def transcribe(
                     "-ac", "1", "-c:a", "pcm_s16le", "-y", str(wav),
                 ],
                 capture_output=True,
-                text=True,
                 timeout=min(timeout_s, 120),
             )
             if converted.returncode != 0:
@@ -84,7 +86,6 @@ def transcribe(
                     "-ojf", "-of", str(output), "-ng", "-t", str(max(1, threads)),
                 ],
                 capture_output=True,
-                text=True,
                 timeout=timeout_s,
             )
         except subprocess.TimeoutExpired:
@@ -94,7 +95,8 @@ def transcribe(
         if completed.returncode != 0:
             raise ASRError("asr_failed")
         try:
-            payload = json.loads((output.with_suffix(".json")).read_text(encoding="utf-8"))
+            raw = output.with_suffix(".json").read_bytes()
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
         except (OSError, json.JSONDecodeError):
             raise ASRError("asr_output_invalid") from None
         return _lines_from_json(payload, duration_s)

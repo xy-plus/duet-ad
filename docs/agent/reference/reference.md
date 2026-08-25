@@ -423,7 +423,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `VOCAL_FILTER` | `on` | off/false/0 才关闭 keep/drop；未知值保持开启 |
 | `ASR_CLI` | `/home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli` | 本地多语种 whisper.cpp 可执行文件 |
 | `ASR_MODEL` | `/home/xy/.local/share/duet-asr/ggml-small.bin` | multilingual small 模型；运行时不得下载 |
-| `ASR_TIMEOUT_S` | `180` | 单次本地听写超时 |
+| `ASR_TIMEOUT_S` | `600` | 单次本地听写超时 |
 | `ASR_THREADS` | `4` | 单次本地听写 CPU 线程数 |
 | `ENABLE_H3_SUBMIT` | false | H3 提交总开关 |
 | `AUTODL_ART_TOKEN` | 空 | AutoDL H3 凭据 |

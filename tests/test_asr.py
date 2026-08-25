@@ -1,3 +1,5 @@
+import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -119,6 +121,60 @@ def test_local_asr_retries_transient_timeout(tmp_path, monkeypatch):
     assert calls == 3
 
 
+def test_local_asr_ignores_non_utf8_process_diagnostics(tmp_path, monkeypatch):
+    cli = tmp_path / "whisper-cli"
+    model = tmp_path / "ggml-small.bin"
+    audio = tmp_path / "voice.mp3"
+    cli.write_bytes(b"binary")
+    model.write_bytes(b"model")
+    audio.write_bytes(b"audio")
+
+    def fake_run(argv, **kwargs):
+        assert "text" not in kwargs
+        if argv[0] == "ffmpeg":
+            return subprocess.CompletedProcess(argv, 0, b"", b"\xff")
+        output = Path(argv[argv.index("-of") + 1]).with_suffix(".json")
+        output.write_text(json.dumps({"transcription": []}), encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, b"", b"\xff\xfe")
+
+    monkeypatch.setattr(asr.subprocess, "run", fake_run)
+    assert asr.transcribe(
+        audio,
+        cli=cli,
+        model=model,
+        duration_s=2.0,
+        timeout_s=600,
+        threads=4,
+    ) == []
+
+
+def test_local_asr_repairs_truncated_utf8_token_in_json(tmp_path, monkeypatch):
+    cli = tmp_path / "whisper-cli"
+    model = tmp_path / "ggml-small.bin"
+    audio = tmp_path / "voice.mp3"
+    cli.write_bytes(b"binary")
+    model.write_bytes(b"model")
+    audio.write_bytes(b"audio")
+
+    def fake_run(argv, **_kwargs):
+        if argv[0] != "ffmpeg":
+            output = Path(argv[argv.index("-of") + 1]).with_suffix(".json")
+            output.write_bytes(
+                b'{"transcription":[{"text":"Hola\xe0\xb6","offsets":{"from":0,"to":1000}}]}'
+            )
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(asr.subprocess, "run", fake_run)
+    assert asr.transcribe(
+        audio,
+        cli=cli,
+        model=model,
+        duration_s=2.0,
+        timeout_s=600,
+        threads=4,
+    ) == [{"text": "Hola", "start_s": 0.0, "end_s": 1.0}]
+
+
 def test_production_config_defaults_to_pinned_multilingual_small(monkeypatch):
     monkeypatch.setenv("ACCESS_TOKEN", "test")
     monkeypatch.delenv("ASR_CLI", raising=False)
@@ -128,5 +184,5 @@ def test_production_config_defaults_to_pinned_multilingual_small(monkeypatch):
     assert settings.asr_model == Path(
         "/home/xy/.local/share/duet-asr/ggml-small.bin"
     )
-    assert settings.asr_timeout_s == 180
+    assert settings.asr_timeout_s == 600
     assert settings.asr_threads == 4

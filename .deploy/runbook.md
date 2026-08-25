@@ -112,7 +112,7 @@ VOCAL_FILTER=on
 YAMNET_MODEL_PATH=/home/xy/duet-ad1/models/yamnet.tflite
 ASR_CLI=/home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli
 ASR_MODEL=/home/xy/.local/share/duet-asr/ggml-small.bin
-ASR_TIMEOUT_S=180
+ASR_TIMEOUT_S=600
 ASR_THREADS=4
 
 ENABLE_H3_SUBMIT=1

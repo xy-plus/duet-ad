@@ -25,7 +25,7 @@ class Settings:
     retry_interval_s: float = 15.0
     asr_cli: Path | None = None
     asr_model: Path | None = None
-    asr_timeout_s: int = 180
+    asr_timeout_s: int = 600
     asr_threads: int = 4
     # queued 状态会话数上限（不计 processing/done/failed），超过即 429
     max_queued: int = 100
@@ -79,7 +79,7 @@ def get_settings() -> Settings:
         asr_model=Path(os.environ.get(
             "ASR_MODEL", "/home/xy/.local/share/duet-asr/ggml-small.bin"
         )),
-        asr_timeout_s=int(os.environ.get("ASR_TIMEOUT_S", "180")),
+        asr_timeout_s=int(os.environ.get("ASR_TIMEOUT_S", "600")),
         asr_threads=max(1, int(os.environ.get("ASR_THREADS", "4"))),
         max_queued=int(os.environ.get("MAX_QUEUED", "100")),
         tiktok_proxy=os.environ.get("TIKTOK_PROXY", ""),
