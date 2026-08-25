@@ -1,6 +1,7 @@
 """后处理编排：HTTP 门控、MediaKit 场景映射、失败保留和并发限流。"""
 
 import asyncio
+import base64
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,7 +14,9 @@ from conftest import AUTH, make_settings
 from app import mediakit, postprocess, storage
 from app.main import create_app
 
-PNG = b"\x89PNG\r\n\x1a\n"
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 OPTIONS_SUB = {"remove_subtitle": True, "remove_brand": False}
 OPTIONS_BRAND = {"remove_subtitle": False, "remove_brand": True}
@@ -538,8 +541,7 @@ def test_legacy_change_bg_in_meta_options_rerun_no_409(enabled, monkeypatch):
 
 
 def test_legacy_pure_change_bg_rerun_clears_artifacts_and_reedits(enabled, monkeypatch):
-    """旧会话「只勾 change_bg」（当前两键全 False 的纯废弃形态）→ 放行重跑：
-    旧产物清除、全帧强制重编辑（防旧 change_bg 产物贴新选项标签）。"""
+    """任何 failed 状态都只能走分段重试，包括旧 change_bg 状态。"""
     settings, c = enabled
     cid = _make_conv(settings)
     cdir = settings.data_dir / cid
@@ -555,14 +557,12 @@ def test_legacy_pure_change_bg_rerun_clears_artifacts_and_reedits(enabled, monke
         (cdir / "work" / "postprocessed" / name).write_bytes(PNG + b"legacy")
 
     r = _post(c, cid, OPTIONS_SUB)
-    assert r.status_code == 200
-    assert len(fake.calls) == 2  # 旧产物已清，两帧全部重新编辑
-    assert not (cdir / "work" / "postprocessed" / "01.png").exists() or \
-        (cdir / "work" / "postprocessed" / "01.png").read_bytes() == PNG + b"edited"
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "postprocess_segment_retry_required"
+    assert len(fake.calls) == 0
 
 
-def test_legacy_pure_change_bg_any_new_option_no_409(enabled, monkeypatch):
-    """纯废弃形态下任何合法新选项（≥1 True）都不 409——永久死锁回归。"""
+def test_legacy_pure_change_bg_any_new_option_requires_segment_retry(enabled, monkeypatch):
     settings, c = enabled
     cid = _make_conv(settings)
     fake = FakeEdit()
@@ -572,11 +572,13 @@ def test_legacy_pure_change_bg_any_new_option_no_409(enabled, monkeypatch):
         "status": "failed", "options": legacy, "frames": [], "error": "x",
     })
     r = _post(c, cid, OPTIONS_BRAND)
-    assert r.status_code == 200
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "postprocess_segment_retry_required"
+    assert fake.calls == []
 
 
 def test_legacy_pure_change_bg_multi_segment_clears_artifacts(enabled, monkeypatch):
-    """多段会话纯废弃形态重跑 → 各段 postprocessed 旧产物同样清除。"""
+    """多段 failed 旧状态也不得由普通 start 重建。"""
     settings, c = enabled
     cid = _make_conv(settings, segments=True)
     cdir = settings.data_dir / cid
@@ -593,11 +595,50 @@ def test_legacy_pure_change_bg_multi_segment_clears_artifacts(enabled, monkeypat
         (d / "01.png").write_bytes(PNG + b"legacy")
 
     r = _post(c, cid, OPTIONS_SUB)
-    assert r.status_code == 200
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "postprocess_segment_retry_required"
     for n in (1, 2):
         d = cdir / "work" / "segments" / str(n) / "work" / "postprocessed"
-        assert not (d / "01.png").exists() or (d / "01.png").read_bytes() == PNG + b"edited"
-    assert len(fake.calls) == 3  # 段1两帧 + 段2一帧全量重编辑
+        assert (d / "01.png").read_bytes() == PNG + b"legacy"
+    assert len(fake.calls) == 0
+
+
+def test_failed_start_preserves_meta_revision_and_never_calls_provider(enabled, monkeypatch):
+    settings, c = enabled
+    cid = _make_conv(settings)
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
+    assert _post(c, cid, OPTIONS_SUB).status_code == 200
+    post = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    post.update(status="failed", error="segment_failed")
+    post["segments"][0].update(status="failed", revision=7, error="provider_rejected")
+    storage.update_meta(settings.data_dir, cid, postprocess=post)
+    before = storage.load_meta(settings.data_dir, cid)
+    calls_before = len(fake.calls)
+
+    response = _post(c, cid, OPTIONS_SUB)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "postprocess_segment_retry_required"
+    assert storage.load_meta(settings.data_dir, cid) == before
+    assert len(fake.calls) == calls_before
+
+
+def test_corrupt_existing_canonical_is_not_reused(enabled, monkeypatch):
+    settings, c = enabled
+    cid = _make_conv(settings)
+    fake = FakeEdit()
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
+    assert _post(c, cid, OPTIONS_SUB).status_code == 200
+    canonical = settings.data_dir / cid / "work" / "postprocessed" / "01.png"
+    canonical.write_bytes(b"not-a-png")
+    calls_before = len(fake.calls)
+
+    response = _post(c, cid, OPTIONS_SUB)
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "postprocess_canonical_conflict"}
+    assert len(fake.calls) == calls_before
 
 
 # ---------- 并行提交：进程级信号量限流与失败语义 ----------

@@ -560,6 +560,51 @@ def test_cancelled_postprocess_projects_unknown_and_failed_recovery_does_not_res
     assert calls == 1
 
 
+def test_anchor_first_frame_real_timeout_projects_submission_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARK_API_KEY", "secret")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid = _done(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    storage.update_meta(
+        settings.data_dir, cid, **image_optimization.freeze_prompts(settings, meta)
+    )
+    asyncio.run(postprocess.start(
+        settings, cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+    real_edit = seedream.edit
+    calls = 0
+
+    async def timeout_handler(request):
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("anchor timeout", request=request)
+
+    mock_transport = httpx.MockTransport(timeout_handler)
+
+    async def edit_with_timeout(settings_, images, prompt, output, *, receipt_path, transport=None):
+        return await real_edit(
+            settings_, images, prompt, output, receipt_path=receipt_path,
+            transport=mock_transport,
+        )
+
+    monkeypatch.setattr(postprocess.seedream, "edit", edit_with_timeout)
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1)
+    ))
+
+    stored = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    public = postprocess.public_state(stored)
+    assert calls == 1
+    assert stored["segments"][0]["error"] == "submission_unknown"
+    assert stored["error"] == "submission_unknown"
+    assert public["segments"][0]["error"] == "submission_unknown"
+    assert public["error"] == "submission_unknown"
+
+
 def test_postprocess_has_strict_stage_barriers_and_anchor_single_output(tmp_path, monkeypatch):
     monkeypatch.setenv("ARK_API_KEY", "secret")
     settings = make_settings(tmp_path, enable_mediakit_erase=True)

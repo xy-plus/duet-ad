@@ -11,6 +11,8 @@ import shutil
 from dataclasses import replace
 from pathlib import Path
 
+import cv2
+
 from app import image_optimization, mediakit, seedream, storage
 from app.config import Settings
 from app.sanitize import sanitize
@@ -229,6 +231,47 @@ def _clear_canonical(cdir: Path, grouped: dict[int, list[tuple[Path, Path]]]) ->
             shutil.rmtree(destination)
 
 
+def _valid_png(candidate: Path, source: Path) -> bool:
+    try:
+        with candidate.open("rb") as handle:
+            if handle.read(8) != b"\x89PNG\r\n\x1a\n":
+                return False
+        decoded = cv2.imread(str(candidate), cv2.IMREAD_UNCHANGED)
+        original = cv2.imread(str(source), cv2.IMREAD_UNCHANGED)
+    except OSError:
+        return False
+    return (
+        decoded is not None and original is not None
+        and decoded.shape[:2] == original.shape[:2]
+    )
+
+
+def _canonical_complete(targets: list[tuple[Path, Path]]) -> bool:
+    destination = targets[0][1].parent
+    if not destination.is_dir():
+        return False
+    existing = sorted(path for path in destination.iterdir() if path.is_file())
+    expected = sorted(canonical.name for _, canonical in targets)
+    sources = {canonical.name: source for source, canonical in targets}
+    return (
+        [path.name for path in existing] == expected
+        and all(_valid_png(path, sources[path.name]) for path in existing)
+    )
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_dir(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _group_targets(cdir: Path, meta: dict) -> dict[int, list[tuple[Path, Path]]]:
     segments = meta.get("segments")
     grouped: dict[int, list[tuple[Path, Path]]] = {}
@@ -281,8 +324,13 @@ async def start(settings: Settings, cid: str, payload: dict,
             previous = meta.get("postprocess")
             if isinstance(previous, dict) and previous.get("status") == "running":
                 raise PostprocessError(409, "already running")
+            if isinstance(previous, dict) and previous.get("status") == "failed":
+                raise PostprocessError(409, _structured(
+                    "postprocess_segment_retry_required",
+                    "后处理存在失败分段，请使用分段重试。",
+                ))
             if (
-                isinstance(previous, dict) and previous.get("status") in {"done", "failed"}
+                isinstance(previous, dict) and previous.get("status") == "done"
                 and not _options_match(previous.get("options"), options)
             ):
                 raise PostprocessError(409, _structured(
@@ -292,11 +340,7 @@ async def start(settings: Settings, cid: str, payload: dict,
             for frames in grouped.values():
                 destination = frames[0][1].parent
                 if destination.is_dir():
-                    existing = sorted(
-                        path.name for path in destination.glob("*.png") if path.is_file()
-                    )
-                    expected = sorted(canonical.name for _, canonical in frames)
-                    if existing != expected and not (
+                    if not _canonical_complete(frames) and not (
                         isinstance(previous, dict)
                         and _pure_legacy(previous.get("options"))
                     ):
@@ -320,8 +364,7 @@ async def start(settings: Settings, cid: str, payload: dict,
             reuse_done = (
                 isinstance(previous, dict) and previous.get("status") == "done"
                 and _options_match(previous.get("options"), options)
-                and all(all(canonical.is_file() for _, canonical in frames)
-                        for frames in grouped.values())
+                and all(_canonical_complete(frames) for frames in grouped.values())
             )
             if reuse_done:
                 for item in states:
@@ -455,15 +498,22 @@ async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
             return_exceptions=True,
         )
     else:
-        await call(1, inputs, outputs[0])
-        results = await asyncio.gather(
-            *(call(i, [source, outputs[0]], output)
-              for i, (source, output) in enumerate(zip(inputs[1:], outputs[1:]), 2)),
-            return_exceptions=True,
-        )
+        try:
+            await call(1, inputs, outputs[0])
+            results = await asyncio.gather(
+                *(call(i, [source, outputs[0]], output)
+                  for i, (source, output) in enumerate(zip(inputs[1:], outputs[1:]), 2)),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            results = [exc]
     errors = [result for result in results if isinstance(result, BaseException)]
     if errors:
         error = errors[0]
+        if isinstance(error, asyncio.CancelledError):
+            raise error
         if isinstance(error, seedream.SeedreamError):
             raise PostprocessError(502, error.code)
         raise PostprocessError(502, sanitize(str(error)))
@@ -472,13 +522,25 @@ async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
 
 def _publish_segment(outputs: list[Path], targets: list[tuple[Path, Path]]) -> None:
     # Publish the complete directory in one rename; no partial canonical set is observable.
-    if len(outputs) != len(targets) or any(not path.is_file() for path in outputs):
+    output_roots = {path.parent for path in outputs}
+    staged_files = (
+        sorted(path.name for path in next(iter(output_roots)).iterdir() if path.is_file())
+        if len(output_roots) == 1 else []
+    )
+    expected_files = sorted(canonical.name for _, canonical in targets)
+    if (
+        len(outputs) != len(targets)
+        or staged_files != expected_files
+        or any(
+            not output.is_file() or output.name != canonical.name
+            or not _valid_png(output, source)
+            for output, (source, canonical) in zip(outputs, targets)
+        )
+    ):
         raise PostprocessError(502, "postprocess_artifacts_invalid")
     destination = targets[0][1].parent
     if destination.is_dir():
-        existing = sorted(path.name for path in destination.glob("*.png") if path.is_file())
-        expected = sorted(canonical.name for _, canonical in targets)
-        if existing == expected:
+        if _canonical_complete(targets):
             return
         raise PostprocessError(409, "postprocess_canonical_conflict")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -488,8 +550,11 @@ def _publish_segment(outputs: list[Path], targets: list[tuple[Path, Path]]) -> N
     temporary.mkdir()
     try:
         for output, (_, canonical) in zip(outputs, targets):
-            shutil.copyfile(output, temporary / canonical.name)
+            copied = temporary / canonical.name
+            shutil.copyfile(output, copied)
+            _fsync_file(copied)
         os.replace(temporary, destination)
+        _fsync_dir(destination.parent)
     finally:
         if temporary.is_dir():
             shutil.rmtree(temporary)
