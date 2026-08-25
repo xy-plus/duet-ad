@@ -29,8 +29,8 @@ ACCESS_TOKEN='<local-only-token>' HOST=127.0.0.1 PORT=3211 ./run.sh
 - 新网页入口固定以“快速模式”新建长视频，确认页不显示开关或说明，生成结果参数摘要也不展示该模式：所有分段先完成本地 receipt/输入冻结，再有界并发 POST；`continue` 直接复用上一段已绑定且已适配的源末帧 bytes，因此不依赖上游成片。后端仍兼容 `fast_mode=false` 及已冻结的历史任务：关闭时 `hard_cut` 新建生成链，`continue` 以上一生成段真实尾帧为首帧，同链串行、不同链最多两条并发。两种模式都不承诺逐帧无缝，也不是供应商原生 extend。
 - 分段视觉提示词只声明“与源片段时长一致”，不携带浮点秒数；冻结 plan 和服务端整秒换算是时长唯一真源。历史 plan v1 的 11–15 秒 attempt 仅允许 GET 恢复，不能创建新付费 POST。
 - 4fps 关键帧由 ffmpeg 按 `v:0` PTS 顺序批量解码，VFR 视频不依赖 OpenCV 毫秒随机 seek。所有 FL2VA 子片段去除自身音轨后由 ffmpeg 归一化、拼接。`auto` 以视频 presentation start 为零点，让解码器处理 AAC/Opus priming，并由音频时间戳确定前置静音或视频零点前裁剪，最后在画面终点裁剪或补静音；`none` 输出静音。两者都不改变画面时长，拼接失败只重跑本地拼接。
-- Web 只调用 `POST /submit`。已知 task 的查询、超时、下载或输出故障只继续同一 attempt，不自动重复付费提交。快速模式关闭时，确定失败会连同同链未完成下游重做；开启时成功段独立复用，只提交服务端判定需重做的失败段。拼接重试只做本地工作，新增供应商 POST 为 0。FL2VA 原始输出允许不短于源段目标超过一帧、且不长于整秒请求 1 秒；最终拼接仍按源段帧预算精确裁补并校验全片时长。
-- `submission_unknown` 完全锁死，必须先到供应商侧核对。快速模式把 unpaid `prepare`、单次 POST `submit` 与 GET-only `resume` 分开：全部 child receipt 落盘后才允许第一笔 POST，结果未知的 child 不会二次 POST，已提交兄弟仍可完成 GET 收敛。重启恢复始终为 GET-only。旧 schema 会话仍可查看，但提交和后处理均为只读。
+- Web 只调用 `POST /submit`。已知 task 的查询、超时、下载或输出故障只继续同一 attempt；唯一自动新 POST 例外是供应商明确返回 `FAILED/ERROR/FAIL`，且上一 attempt 的 task id、receipt、诊断和同一 input receipt 已完整落盘。此时沿用原 `client_request_id`，按 `AUTO_RETRY_INTERVAL_S` 等待后新建顺序 attempt，累计不超过 `1 + AUTO_RETRY_COUNT`（默认总计 3 次 POST）。快速模式成功兄弟不重提；串行模式失败段成功后才推进下游。拼接重试只做本地工作，新增供应商 POST 为 0。FL2VA 原始输出允许不短于源段目标超过一帧、且不长于整秒请求 1 秒；最终拼接仍按源段帧预算精确裁补并校验全片时长。
+- `submission_unknown` 完全锁死，必须先到供应商侧核对。快速模式把 unpaid `prepare`、单次 POST `submit` 与恢复推进分开：全部 child receipt 落盘后才允许第一笔 POST，结果未知的 child 不会二次 POST，已提交兄弟仍可完成 GET 收敛。重启恢复默认 GET-only；只对上述完整确认且有额度的 `h3_provider_failed` 创建下一 attempt，或提交该失败后已经落盘的 `ready_to_submit/h3.ready` 自动 attempt。旧 schema 会话仍可查看，但提交和后处理均为只读。
 - H3 成片只接受无 userinfo、全部预解析地址和实际 socket peer 均为公网的 HTTPS URL；拒绝重定向，流式下载最多 200 MiB，并在原子替换前用 ffprobe 验证正时长视频流。
 - Seedream 的去字幕水印/去品牌后处理仍可选，但 H3 只读取原始关键帧或显式 `crop/pad` 派生帧，绝不读取 `postprocessed/`。
 - `face_hold`、Seedance 生产提交路径和 MiniMax Context IR 接入均已删除；上线失败只沿直接 H3 链路修复。

@@ -881,7 +881,14 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         recoverable = []
         for segment in plan.segments:
             state = states[segment.index]
-            if state.get("status") not in {"queued", "running", "resume_required"}:
+            provider_failed = (
+                state.get("status") == "failed"
+                and state.get("error") == "h3_provider_failed"
+            )
+            if (
+                state.get("status") not in {"queued", "running", "resume_required"}
+                and not provider_failed
+            ):
                 continue
             recoverable.append(segment)
 
@@ -938,8 +945,9 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         elif any(item.get("status") == "failed" for item in states.values()):
             persist("failed", "long_video_segment_failed")
         else:
-            # A known attempt still needs GET recovery, or an unstarted child
-            # awaits an explicit same-parent confirmation.  Startup never POSTs.
+            # A known attempt still needs recovery, or an unstarted child
+            # awaits explicit same-parent confirmation. Only a receipt-bound
+            # provider terminal failure may create an automatic retry POST.
             persist("resume_required", "long_video_resume_required")
         return
 

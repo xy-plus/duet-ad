@@ -3,7 +3,7 @@ name: processing-state
 type: behavior
 status: done
 owner: human
-updated: 2026-08-21
+updated: 2026-08-25
 tdd: N/A
 links: [conversation-task, submit-gate]
 ---
@@ -21,9 +21,10 @@ links: [conversation-task, submit-gate]
 | 生成成功 | `generation: succeeded` | 原子落盘 `generated.mp4`，详情 `has_video=true` |
 | 已知 task 查询/超时、下载传输/DNS/peer 验证或输出写入/探测基础设施失败 | `generation: resume_required` | 包括 `download_dns_failed/download_peer_unverified/output_probe_failed`；保留原 request id、receipt 和 attempt，只允许原参数继续 |
 | 成片 URL、重定向、体积或媒体内容确定拒绝 | `generation: failed` | 安全拒绝码为 `download_url_rejected/download_redirect_rejected/download_too_large/download_invalid_video`；只有人工新 id retry |
-| 可确定失败 | `generation: failed` | 展示安全错误码；用户确认后必须用新 request id 创建 retry attempt |
+| 供应商明确返回 `FAILED/ERROR/FAIL` | 自动保持 `running` 并补交，额度耗尽后为 `generation: failed` | 仅当上一 attempt 的 task id、receipt、诊断和同一 input receipt 完整落盘为 `h3_provider_failed` 时，等待固定间隔后沿用原 `client_request_id` 新建顺序 attempt；默认首次加 2 次补交，总计最多 3 次 POST |
+| 其他可确定失败 | `generation: failed` | 展示安全错误码；用户确认后必须用新 request id 创建 retry attempt |
 | 供应商 POST 结果未知 | `generation: submission_unknown` | 不猜测是否扣费；隐藏重试入口，所有再次提交返回 409，必须先到供应商侧核对 |
-| 服务重启时存在 `queued/running` | 仍读取同一冻结输入，仅执行 H3 `resume` | 恢复只查询已持久化任务并下载已有结果，不创建供应商任务 |
+| 服务重启时存在可恢复 generation | 读取同一冻结输入并执行 H3 `resume` | 默认只查询已持久化任务并下载已有结果；唯一新 POST 例外是完整确认的 `h3_provider_failed` 仍有自动额度，或该失败后已落盘的 `ready_to_submit/h3.ready` 自动 attempt |
 | 用户在 H3 阶段确定的 `failed` 后点“重试生成” | 新 attempt，再次 `queued → running` | 必须生成新的 `client_request_id`；长链复用成功段，只重做失败段及同链下游 |
 | 用户在长链 `failed + stage=stitch` 后点“重试拼接” | 原 attempt，再次 `queued → running` | 必须复用原 `client_request_id` 和冻结参数，只重跑本地拼接 |
 
@@ -38,12 +39,12 @@ links: [conversation-task, submit-gate]
 - `resume_required` 使用新 id 返回 409 `resume_request_id_mismatch`，台词/画幅漂移返回 409 `resume_parameters_changed`；合法继续仍返回原 attempt 数字。
 - 相同请求 id 在 active/succeeded 状态只返回既有状态；确定失败后复用旧 id 返回 409；`submission_unknown` 使用任何 id 都返回 409 `submission_outcome_unknown`。
 - active 或 succeeded 会话不接受不同 id 的并发提交。
-- 没有自动付费重试、定时重试或 Seedance 回退。
+- 只有供应商明确终态 `h3_provider_failed` 会自动新建同一逻辑请求的下一 attempt；上限为 `1 + AUTO_RETRY_COUNT`，间隔为 `AUTO_RETRY_INTERVAL_S`。其他失败没有自动新 POST，也没有 Seedance 回退。
 - 长视频任一子任务 `submission_unknown` 会锁住整批；启动恢复只 GET 已知子任务，绝不提交尚未开始的段。
 - 已生成的历史视频保持可读；旧 Context IR 契约下未完成的 generation 映射为 `failed / generation_path_removed`，必须用新请求 id 按直接 H3 链路创建 attempt，不再查询 MiniMax。
 - `.h3/session.lock` 防止同一会话被并发推进；生产仍要求单 uvicorn 进程。
 
 ## 例子
 
-- H3 已提交后服务重启：恢复只 GET；查询或下载失败时显示 `resume_required`，用户确认后原 attempt 继续。
+- H3 已提交后服务重启：通常只 GET；查询或下载失败时显示 `resume_required`，用户确认后原 attempt 继续。若已完整持久化为 `h3_provider_failed` 且额度未尽，恢复会按同一 input receipt 自动创建或提交下一 attempt。
 - H3 查询超时：显示 `resume_required / h3_timeout`；页面不自动 POST，用户点击“继续既有任务”仍是原 attempt。

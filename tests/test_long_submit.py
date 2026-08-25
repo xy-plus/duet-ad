@@ -516,6 +516,139 @@ def test_fast_mode_startup_is_get_only_and_leaves_prepared_child_unpaid(
     assert [item["status"] for item in stored["segments"]] == ["queued", "queued"]
 
 
+def test_fast_startup_auto_retries_only_provider_failed_child(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, joins=("hard_cut", "hard_cut"))
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=True
+    )
+    generation.update(status="failed", error="long_video_segment_failed")
+    generation["segments"][0].update(
+        status="failed", error="h3_provider_failed", attempt=1,
+        child_request_id=long_generation.child_request_id(
+            "parent-request-123", receipt, 1
+        ),
+    )
+    generation["segments"][1].update(
+        status="succeeded", error=None, attempt=1,
+        child_request_id=long_generation.child_request_id(
+            "parent-request-123", receipt, 2
+        ),
+    )
+    plan.segments[1].workdir.joinpath("generated.mp4").write_bytes(b"sibling")
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    resumed = []
+
+    def resume(request):
+        resumed.append(int(request.workdir.name))
+        request.workdir.joinpath("generated.mp4").write_bytes(b"retried")
+        return h3.H3Result("succeeded", "000002")
+
+    monkeypatch.setattr(h3, "resume", resume)
+    monkeypatch.setattr(h3, "output_is_reusable", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        long_generation, "bound_reusable_segment_indices", lambda *_a, **_kw: frozenset({2})
+    )
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    long_generation.run(settings, cid, plan, startup=True)
+
+    assert resumed == [1]
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert [item["status"] for item in stored["segments"]] == ["succeeded", "succeeded"]
+
+
+def test_serial_provider_auto_retry_success_precedes_downstream_submit(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=False
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    events = []
+
+    def start(request):
+        index = int(request.workdir.name)
+        events.append("provider-auto-retried-1" if index == 1 else "submitted-2")
+        request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
+        return h3.H3Result("succeeded", "000002" if index == 1 else "000001")
+
+    monkeypatch.setattr(h3, "start", start)
+    monkeypatch.setattr(h3, "output_is_reusable", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        long_generation,
+        "_extract_last_frame",
+        lambda _v, output: (_png(output, 200) or output),
+    )
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    long_generation.run(settings, cid, plan)
+
+    assert events == ["provider-auto-retried-1", "submitted-2"]
+
+
+@pytest.mark.parametrize(
+    ("root_error", "segment_error", "expected"),
+    [
+        ("long_video_segment_failed", "h3_provider_failed", 1),
+        ("submission_unknown", "submission_unknown", 0),
+        ("long_video_segment_failed", "download_invalid_video", 0),
+    ],
+)
+def test_long_startup_scanner_only_claims_provider_failed_root(
+    tmp_path, monkeypatch, root_error, segment_error, expected,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=True
+    )
+    generation.update(status="failed", error=root_error)
+    generation["segments"][0].update(
+        status="failed", error=segment_error, attempt=1,
+        child_request_id=long_generation.child_request_id(
+            "parent-request-123", receipt, 1
+        ),
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    calls = []
+    monkeypatch.setattr(
+        long_generation, "run", lambda *_args, **kwargs: calls.append(kwargs.get("startup"))
+    )
+
+    with TestClient(create_app(settings)) as client:
+        assert client.get(f"/api/conversations/{cid}", headers=AUTH).status_code == 200
+        for thread in client.app.state.h3_resume_threads:
+            thread.join(timeout=2)
+
+    assert calls == [True] * expected
+
+
 def test_fast_mode_startup_revalidates_completed_child_output(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, receipt = _make_long(settings)

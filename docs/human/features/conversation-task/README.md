@@ -44,7 +44,7 @@ links: []
 - 跨段连续性是首尾帧约束与统一提示词带来的最佳努力结果，不承诺逐帧无缝或人物绝对不漂移。
 - 分段链路不是供应商原生 extend；服务端为每段建立独立、可审计的 FL2VA task，再本地拼接。
 - 单共享口令，无用户级权限；状态用 2 秒轮询，不用 SSE/WebSocket。
-- 供应商确定失败不触发自动重试；已知 task 的查询/超时/下载故障等待人工继续但不创建 attempt；`submission_unknown` 连人工继续也被拒绝，须先核对是否已创建任务。
+- 供应商明确终态 `FAILED/ERROR/FAIL` 且 task id、receipt、诊断与同一 input receipt 完整落盘时，沿用原 client id 自动补交，默认首次加 2 次、总计最多 3 次 POST；其他确定失败仍需人工新 id。已知 task 的查询/超时/下载故障等待人工继续但不创建 attempt；`submission_unknown` 连人工继续也被拒绝，须先核对是否已创建任务。
 
 ## 取舍
 

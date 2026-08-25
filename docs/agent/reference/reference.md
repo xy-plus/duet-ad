@@ -377,8 +377,10 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 - `h3.prepare(request)`：只创建/校验 unpaid attempt 与 input receipt，绝不联网；返回 `not_started` 表示可安全提交。
 - `h3.submit(request)`：只接受已 prepare 的 exact attempt，最多跨越一次 POST 边界，task id/receipt 落盘后立即返回，不做 GET 轮询；无 prepare、输入漂移或无 task id 的 submitting 状态都 fail closed。
 - `h3.inspect(request)`：纯读，不写、不联网；验证 session/attempt receipts。
-- `h3.resume(request)`：获取会话 flock 后 GET-only 推进已有任务；`allow_submit=false`，不创建供应商任务。
-- `h3.retry(request,new_id)`：底层显式创建新 attempt；短链 runtime 只在公开 generation 已确定为 `failed` 且用户提交新 id 时调用。长链 H3 阶段确定失败同样要求新父 id，只重做未成功段；`stage=stitch` 失败复用原父 id，且只运行本地拼接。`resume_required` 调 `start` 续同 attempt，`submission_unknown` 不调用。
+- `h3.resume(request)`：获取会话 flock 后默认 GET-only 推进已有任务；只有完整确认的 `h3_provider_failed` 有额度，或其后已落盘的 `ready_to_submit/h3.ready` 自动 attempt，才允许跨越新的 POST 边界。
+- `h3.retry(request,new_id)`：底层显式创建人工新逻辑请求的 attempt；短链 runtime 只在普通确定失败或 provider 自动额度耗尽后，由用户提交新 id 调用。长链同样要求新父 id并只重做未成功段；`stage=stitch` 失败复用原父 id，且只运行本地拼接。`resume_required` 调 `start` 续同 attempt，`submission_unknown` 不调用。
+
+`start/resume/retry` 共用同一私有自动推进器；`submit` 始终只提交当前 prepared attempt 一次。自动额度只统计同 `client_request_id + input_receipt` 的有效 attempt 链，已创建的 ready attempt 已占额度，总上限为 `1 + retry_count`。每个新 attempt 先原子写 receipt 再 POST；配置降低只停止新增，提高后可从最新完整 provider failure 继续。`h3_submit_rejected/h3_result_missing`、输入与下载安全拒绝不创建新 attempt；查询、超时和下载传输失败继续同 task；`submission_unknown` 永不重复 POST。
 
 短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。长链每段使用 `minimax_h3_lightx2v`，只传冻结的 `first_frame/last_frame/prompt/duration/resolution`，输出到该段 `generated.mp4`；不是供应商原生 extend。
 
@@ -399,7 +401,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 - `app.prepared_input.write_prepared_input(...) -> PreparedInput` — 原子写 receipt 并复用 loader 验证。
 - `app.prepared_input.load_prepared_input(...) -> PreparedInput` — 读取冻结 bytes，漂移即拒绝。
 - `app.frame_fit.fit_frames(paths,output_dir,mode,aspect_ratio) -> tuple[Path,...]` — 调用方必须显式传 `16:9|9:16` 目标；crop/pad 都严格输出该比例，没有隐藏的固定 9:16 默认值。
-- `app.h3.prepare/submit/start/inspect/resume/retry` — 可恢复状态机；prepare/submit 为快速 fan-out 分离 unpaid receipt 与单次 POST，resume 始终 GET-only；runtime 对 resume_required 暴露同 id 继续，对确定 failed 暴露新 id retry，不对 submission_unknown 暴露操作。
+- `app.h3.prepare/submit/start/inspect/resume/retry` — 可恢复状态机；prepare/submit 为快速 fan-out 分离 unpaid receipt 与单次 POST；resume 默认 GET-only，唯一新 POST 例外是严格验证且有额度的 provider terminal failure；runtime 对 resume_required 暴露同 id 继续，对其他确定 failed 暴露新 id retry，不对 submission_unknown 暴露操作。
 - `app.long_video.plan_segments/write_plan_receipt` — 安全边界规划与 canonical plan 落盘。
 - `app.long_generation.freeze_plan/run` — fail-closed 冻结、默认最多两链编排、可选快速 fan-out 和分段恢复。
 - `app.stitch.stitch_video` — 本地确定性归一化、音轨选择、拼接与 receipt。
@@ -414,8 +416,8 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `DATA_DIR` | `data` | 会话根目录 |
 | `MAX_UPLOAD_MB` | `500` | 上传/URL 下载上限 |
 | `CODEX_TIMEOUT_S` | `1800` | 单次 codex 硬超时 |
-| `AUTO_RETRY_COUNT` | `2` | 瞬时失败后的额外重试次数；总尝试次数为该值加 1 |
-| `AUTO_RETRY_INTERVAL_S` | `15` | 自动重试前的固定等待秒数 |
+| `AUTO_RETRY_COUNT` | `2` | 同 task 的瞬时操作重试次数，也是完整确认 `h3_provider_failed` 后的额外 attempt 数；默认供应商 POST 总数最多 3 |
+| `AUTO_RETRY_INTERVAL_S` | `15` | 同 task 瞬时操作或 provider failure 自动补交前的固定等待秒数 |
 | `CODEX_CONCURRENCY` | `10` | pipeline 并发闸 |
 | `MAX_QUEUED` | `100` | queued 会话上限 |
 | `VOCAL_FILTER` | `on` | off/false/0 才关闭 keep/drop；未知值保持开启 |

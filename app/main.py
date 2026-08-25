@@ -60,6 +60,31 @@ _CLIENT_REFRESH_MESSAGE = "页面版本已更新，请刷新页面后重试。"
 _GENERATED_VIDEO_VALIDATION_CACHE_SIZE = 256
 
 
+def _short_provider_failure_is_recoverable(generation: object) -> bool:
+    return (
+        isinstance(generation, dict)
+        and not isinstance(generation.get("segments"), list)
+        and generation.get("status") == "failed"
+        and generation.get("error") == "h3_provider_failed"
+    )
+
+
+def _long_provider_failure_is_recoverable(generation: object) -> bool:
+    if (
+        not isinstance(generation, dict)
+        or generation.get("status") != "failed"
+        or generation.get("error") != "long_video_segment_failed"
+        or not isinstance(generation.get("segments"), list)
+    ):
+        return False
+    return any(
+        isinstance(segment, dict)
+        and segment.get("status") == "failed"
+        and segment.get("error") == "h3_provider_failed"
+        for segment in generation["segments"]
+    )
+
+
 class _GeneratedVideoValidationCache:
     """Bound strict local validation without weakening its file bindings."""
 
@@ -1338,6 +1363,7 @@ def _resume_generation(settings: Settings, cid: str) -> None:
     )
     if (
         generation.get("status") not in _GENERATION_ACTIVE
+        and not _short_provider_failure_is_recoverable(generation)
         and not recovering_missing_output
     ):
         return
@@ -1526,6 +1552,8 @@ def create_app(settings: Settings) -> FastAPI:
                 and isinstance(generation, dict)
                 and (
                     generation.get("status") in _GENERATION_ACTIVE
+                    or _short_provider_failure_is_recoverable(generation)
+                    or _long_provider_failure_is_recoverable(generation)
                     or (
                         generation.get("status") == "succeeded"
                         and not _has_valid_generated_video(settings, meta)

@@ -116,6 +116,7 @@ stateDiagram-v2
   h3_running --> succeeded: download and atomic replace
   h3_running --> retryable_failure
   h3_running --> failed
+  failed --> ready_to_submit: verified provider failure and budget remains
 ```
 
 `app/h3.py` 先以 `ready_to_submit` 持久化 exact unpaid input receipt；单次 `submit` 在供应商 POST 前改写为 `h3_submitting`，拿到 task id 后再持久化 task receipt，最后才允许 GET 轮询。`.h3/` 的安全边界：
@@ -123,14 +124,14 @@ stateDiagram-v2
 - `session.json` 绑定 cid；`session.lock` 使用非阻塞 flock，拒绝同会话并发推进。
 - `attempts/000001/attempt.json` 以 0600 创建，后续原子写 + `fsync`；attempt state schema 为 v1。
 - input、H3 task 和最终输出各有 receipt；状态中不保存结果 URL或凭据，只保存安全错误码。
-- `start` 以同一 client id 幂等推进；公开 `resume_required` 由用户用同 id、同台词、同画幅、同清晰度和同 fit 确认后再次调用 `start`，继续同一 receipt/attempt。只有确定 `failed` 才由新 id 调 `retry` 创建 attempt。
-- 启动 `resume` 设置 `allow_submit=false`，只对已经持久化的 task 做 GET 查询/下载，不发新的供应商 POST。已知 task 的查询/超时、下载传输/输出写入故障和 raw running 状态映射为 `resume_required`；`submission_unknown` 一律锁死。
+- `start` 以同一 client id 幂等推进；公开 `resume_required` 由用户用同 id、同台词、同画幅、同清晰度和同 fit 确认后再次调用 `start`，继续同一 receipt/attempt。普通确定 `failed` 仍由新 id 调 `retry` 创建 attempt。
+- 启动 `resume` 默认只对已经持久化的 task 做 GET 查询/下载。唯一自动新 POST 例外要求上一 attempt 精确为 `failed + h3_provider_failed + h3.failed`，并有 task id、task receipt、受净化 provider 诊断、相同 input receipt 和剩余额度；它等待固定间隔后沿用同 client id 创建下一顺序 attempt。失败后已原子落盘的 `ready_to_submit/h3.ready` 自动 attempt 可由 `resume` 提交一次；无 task id 的 `submitting` 仍锁为 `submission_unknown`。
 - provider 成片 URL 必须是无 userinfo 的 HTTPS，且 DNS/IP 预解析结果全部为公网地址。下载 client 不读取代理环境；响应到达后在读取 status/body 前，从 httpx network stream 取得实际 socket peer 并再次要求公网地址，从而不把预解析结果当作连接事实。无法解析 DNS、无法验证 peer、ffprobe 缺失/超时属于已有 task 的可恢复故障；预解析或实际 peer 为私网则确定拒绝。
 - 下载不跟随重定向。Content-Length 和实际流都限制为 200 MiB，内容先写同目录 0600 临时文件；ffprobe 正常执行并确认 `v:0` 的 `duration` 或 `duration_ts*time_base` 正有限后，才原子替换 `generated.mp4` 并 fsync；音频或容器时长不能让无有效视觉时间轴的文件通过。
 
-API 暴露的 coarse generation 是 `queued/running/resume_required/succeeded/failed/submission_unknown`。四类 provider 查询/超时及 `download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed` 映射为 `resume_required`；URL/实际 peer、重定向、体积、无效视频等确定性安全拒绝映射为 `failed`。服务没有自动付费重试。`submission_unknown` 对任何 id 固定返回 409 `submission_outcome_unknown`；意外 provider 异常会先 inspect，只有磁盘状态明确为确定失败时才开放新 id。
+API 暴露的 coarse generation 是 `queued/running/resume_required/succeeded/failed/submission_unknown`。四类 provider 查询/超时及 `download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed` 映射为 `resume_required`；URL/实际 peer、重定向、体积、无效视频等确定性安全拒绝映射为 `failed`。只有完整确认的 `h3_provider_failed` 会在额度内自动新建 attempt；`h3_submit_rejected`、结果缺失、输入/安全错误和 `submission_unknown` 都不会。`submission_unknown` 对任何 id 固定返回 409 `submission_outcome_unknown`。
 
-长链在 `generation.fast_mode` 冻结调度语义；字段缺失精确解释为 `false`。当前 Web 的新长链 draft 固定为 `true`，确认页不渲染模式开关或说明，生成结果参数摘要也不展示该模式；这只是入口策略，后端仍接受 `false` 并按 generation 冻结值恢复或重试。`generation.segments` 保存每段 `index/chain_id/join_mode/status/attempt/error/child_request_id`，公开接口省略 `child_request_id`。默认模式同链严格串行、不同链最多两个并发，`continue` 使用上游真实成片尾帧；确定失败的新父请求重做失败段及未完成下游。快速模式先构造全部不可变请求并通过 unpaid `h3.prepare` 落盘全部 input receipt，任一本地预检失败都不会产生供应商 POST；随后有界并发 `h3.submit`，每个 worker 只跨越一次 POST 边界，不等待生成完成，最后有界并行 `h3.resume` GET。快速 `continue` 的 first frame 是上一 `FrozenSegment.last_frame` 已 receipt 绑定、按同一 fit 处理的原 bytes，不读取 `generated.mp4/generated_last.png`。快速模式单段确定失败只重做该段，成功下游可独立复用；未知段锁住整批且绝不二次 POST，但已知兄弟任务仍继续 GET 并保存结果。启动恢复两种模式都为 GET-only；快速模式可并行查询已知 child，已 prepare 未 POST 的 child 保持 queued 等待用户同 id 确认。全部成功后沿用同一 stitch、源音轨和时长/SHA 验收。
+长链在 `generation.fast_mode` 冻结调度语义；字段缺失精确解释为 `false`。当前 Web 的新长链 draft 固定为 `true`，确认页不渲染模式开关或说明，生成结果参数摘要也不展示该模式；这只是入口策略，后端仍接受 `false` 并按 generation 冻结值恢复或重试。`generation.segments` 保存每段 `index/chain_id/join_mode/status/attempt/error/child_request_id`，公开接口省略 `child_request_id`。默认模式同链严格串行、不同链最多两个并发，`continue` 使用上游真实成片尾帧；provider 自动补交成功后才推进同链下游。快速模式先构造全部不可变请求并通过 unpaid `h3.prepare` 落盘全部 input receipt，任一本地预检失败都不会产生供应商 POST；随后有界并发 `h3.submit`，每个 worker 只跨越一次 POST 边界，不等待生成完成，最后有界并行 `h3.resume`。快速 `continue` 的 first frame 是上一 `FrozenSegment.last_frame` 已 receipt 绑定、按同一 fit 处理的原 bytes，不读取 `generated.mp4/generated_last.png`。快速模式只自动补交精确失败 child，成功兄弟独立复用；未知段锁住整批且绝不二次 POST，但已知兄弟任务仍继续 GET 并保存结果。启动恢复默认 GET-only，并额外接管含精确 `h3_provider_failed` 子段的失败 root；已 prepare 未 POST 的普通 child 保持 queued 等待用户同 id 确认。全部成功后沿用同一 stitch、源音轨和时长/SHA 验收。
 
 ## 数据布局
 

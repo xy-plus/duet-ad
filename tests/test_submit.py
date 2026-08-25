@@ -865,13 +865,13 @@ def test_failed_attempt_requires_new_id_and_uses_retry(enabled, monkeypatch):
     monkeypatch.setattr(
         h3,
         "start",
-        lambda request: h3.H3Result("failed", "000001", error_code="h3_provider_failed"),
+        lambda request: h3.H3Result("failed", "000001", error_code="download_invalid_video"),
     )
     monkeypatch.setattr(
         h3,
         "retry",
         lambda request, request_id: calls.append((request, request_id))
-        or h3.H3Result("failed", "000002", error_code="h3_provider_failed"),
+        or h3.H3Result("failed", "000002", error_code="download_invalid_video"),
     )
     assert client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload()).status_code == 202
     same = client.post(f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload())
@@ -1232,6 +1232,103 @@ def test_startup_resume_uses_direct_h3_state(tmp_path, monkeypatch):
     assert request and request[0].client_request_id == REQUEST_ID
     meta = storage.load_meta(settings.data_dir, cid)
     assert meta["generation"]["status"] == "failed"
+
+
+def test_short_submit_background_converges_after_provider_auto_retry(
+    enabled, monkeypatch, recovery_video_bytes,
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    original_start = h3.start
+    posts = 0
+
+    class PublicStream:
+        def get_extra_info(self, name):
+            return ("93.184.216.34", 443) if name == "server_addr" else None
+
+    def provider(req: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        if req.method == "POST":
+            posts += 1
+            return httpx.Response(200, json={"data": {"task_id": f"task-{posts}"}})
+        if req.url.path.endswith("/result/task-1"):
+            return httpx.Response(200, json={
+                "request_id": "provider-failure",
+                "data": {"status": "FAILED"},
+            })
+        if req.url.path.endswith("/result/task-2"):
+            return httpx.Response(200, json={"data": {
+                "status": "SUCCESS",
+                "results": [{"url": "https://download.invalid/video.mp4"}],
+            }})
+        return httpx.Response(
+            200,
+            content=recovery_video_bytes["target"],
+            extensions={"network_stream": PublicStream()},
+        )
+
+    monkeypatch.setattr(h3, "_pause", lambda _seconds: None)
+    monkeypatch.setattr(
+        h3.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+
+    def start(request):
+        with httpx.Client(transport=httpx.MockTransport(provider)) as provider_client:
+            return original_start(request, client=provider_client)
+
+    monkeypatch.setattr(h3, "start", start)
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload()
+    )
+
+    assert response.status_code == 202
+    assert posts == 2
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+
+
+def test_short_startup_scanner_claims_persisted_provider_failure(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art-test-secret"
+    )
+    cid, _ = _make_conv(settings)
+    _request, _session, attempt_path = _write_startup_h3_attempt(
+        settings, cid, generation_status="failed"
+    )
+    state = json.loads(attempt_path.read_text(encoding="utf-8"))
+    state.update(status="failed", retryable=False)
+    state["h3"]["status"] = "failed"
+    state["error"] = {
+        "code": "h3_provider_failed",
+        "provider": {"status": "FAILED", "detail": "GPU OOM"},
+    }
+    attempt_path.write_text(json.dumps(state), encoding="utf-8")
+    meta = storage.load_meta(settings.data_dir, cid)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={**meta["generation"], "status": "failed", "error": "h3_provider_failed"},
+    )
+    resumed = []
+    monkeypatch.setattr(
+        h3,
+        "resume",
+        lambda request: resumed.append(request)
+        or h3.H3Result("failed", "000001", error_code="h3_provider_failed"),
+    )
+
+    with TestClient(create_app(settings)) as client:
+        assert client.get(f"/api/conversations/{cid}", headers=AUTH).status_code == 200
+        for thread in client.app.state.h3_resume_threads:
+            thread.join(timeout=2)
+
+    assert len(resumed) == 1
+    assert resumed[0].client_request_id == REQUEST_ID
 
 
 @pytest.mark.parametrize(

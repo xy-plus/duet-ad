@@ -66,6 +66,7 @@ links: [conversation-task, processing-state]
 ## 边界
 
 - 首次 start 和 H3 阶段确定失败后的 retry 会在锁内冻结画幅、清晰度、台词、适配方式和长链快速模式；长链所有 segment 共用同一选择。长链另冻结当前 plan receipt，新 id retry、原 id 拼接重试与 `resume_required` 均复用服务端冻结的 `fast_mode`，历史 generation 缺失时按 `false`；不会被页面草稿或缓存改变。长链拼接失败复用原 id 且不创建供应商任务。`resume_required` 只加载既有 receipt，不重写它、不递增 attempt。
+- 提交门控后的唯一自动新 POST 是完整确认的供应商终态 `h3_provider_failed`：沿用原 `client_request_id` 和同一 input receipt，新建顺序 attempt，累计不超过 `1 + AUTO_RETRY_COUNT`。已落盘的 `ready_to_submit/h3.ready` 自动 attempt 已占额度；`submission_unknown`、提交拒绝、结果缺失和输入/安全错误均不进入该例外。
 - “生成最终视频”点击后必须立即进入提交态或显示错误；前端异常不得表现为无响应。
 - 自动 H3 源提示词只允许在 H3 attempt 创建前通过 CAS 保存；attempt 创建后锁定，防止页面内容与实际生成输入不一致。
 - 短链 H3 只使用 `work/keyframes/` 原图或 `work/h3_frames/<aspect>/{crop|pad}/` 派生图；长链 FL2VA 只使用 plan 绑定的首尾锚点或其画幅派生图；都不读取 Seedream `postprocessed/`。

@@ -166,7 +166,7 @@ systemctl --user is-active duet-ad1.service
 journalctl --user -u duet-ad1.service --since '-2 minutes' --no-pager
 ```
 
-服务必须是单进程；不要给 uvicorn 增加 `--workers`。重启时 schema v2 的 `queued/running` generation 只执行 GET-only resume，不补发供应商 POST。
+服务必须是单进程；不要给 uvicorn 增加 `--workers`。重启时 schema v2 generation 默认只执行 GET-only resume；唯一补发供应商 POST 的例外是完整确认的 `h3_provider_failed` 仍有自动额度，或该失败后已落盘的 ready 自动 attempt。
 
 ## 5. 健康检查
 
@@ -250,7 +250,7 @@ for cid in "$CID_10" "$CID_15" "$CID_30"; do
 done
 ```
 
-脚本遇到 `failed`、`submission_unknown`、`resume_required` 或超时都会退出，绝不会自动再发 paid POST。保留它打印的 cid 和原 `client_request_id`，按下一节判断是原 attempt 继续、H3 阶段确定失败的新 id、拼接失败的原 id 本地重拼，还是先去供应商核对。
+脚本遇到最终 `failed`、`submission_unknown`、`resume_required` 或超时都会退出，且脚本自身绝不重复调用提交 API。服务内部对完整确认且不计费的 `h3_provider_failed` 会按配置自动补交，默认单逻辑请求总计最多 3 次 POST；其他失败不会。保留脚本打印的 cid 和原 `client_request_id`，按下一节判断是原 attempt 继续、自动额度耗尽后的新 id、拼接失败的原 id 本地重拼，还是先去供应商核对。
 
 ## 7. 失败时 fix-forward
 
@@ -258,6 +258,6 @@ done
 2. 用 detail API 或 journal 确认是输入准备、凭据、H3 查询/下载还是公开反代问题；不要打印环境。
 3. 修复当前 H3 代码/配置，重新运行相关测试和全量测试。
 4. 再次 `daemon-reload`（unit 有改动时）并原地 `restart`，重复本地和公网 `/health`。
-5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；H3 阶段确定 `failed` 才点“重试生成”，使用新 id，并以 detail API 的服务端 `generation.retry_paid_segment_count` 为本次新增付费任务数（状态成功但分段成片缺失也会计入）。长链 `failed + stage=stitch` 点“重试拼接”，必须用原 id，只本地重拼且新增付费任务为 0；半发布成片不会隐藏恢复入口。`submission_unknown` 不得继续或重试，先到 AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
+5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；完整确认的 `h3_provider_failed` 先等待服务按额度自动收敛，额度耗尽后才点“重试生成”并使用新 id。其他 H3 确定失败仍按人工新 id 处理，并以 detail API 的 `generation.retry_paid_segment_count` 为本次新增付费任务数。长链 `failed + stage=stitch` 点“重试拼接”，必须用原 id，只本地重拼且新增付费 H3 子任务为 0；半发布成片不会隐藏恢复入口。`submission_unknown` 不得继续或重试，先到 AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
 
 禁止以 Seedance 代码、旧 unit 或旧提交开关回退；它们不再属于生产契约。若 H3 仍不可用，保持服务可读、关闭 `ENABLE_H3_SUBMIT`，修复后再开启。
