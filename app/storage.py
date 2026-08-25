@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 ALLOWED_EXT = {".mp4", ".mov", ".webm"}
 _CHUNK = 1024 * 1024
@@ -104,10 +104,33 @@ def update_meta(data_dir: Path, cid: str, **changes) -> dict | None:
         return None
     cdir = data_dir / cid
     with _meta_lock(cdir):
-        meta = load_meta(data_dir, cid)
+        meta = _load_meta_unlocked(data_dir, cid)
         if meta is None:
             return None
         meta.update(changes)
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
+
+
+def mutate_meta(
+    data_dir: Path, cid: str, mutator: Callable[[dict], None]
+) -> dict | None:
+    """Atomically read-modify-write one conversation in the current process.
+
+    ``mutator`` must be synchronous and must not call another storage mutation.
+    If it raises, no bytes are written.  This matches the repository's existing
+    process-local meta lock model while preventing callers from replacing a
+    nested field using a stale snapshot.
+    """
+    if not _ID_RE.match(cid):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = _load_meta_unlocked(data_dir, cid)
+        if meta is None:
+            return None
+        mutator(meta)
         meta["updated_at"] = _now()
         _write_meta(cdir, meta)
         return meta
@@ -356,6 +379,10 @@ def finish_input_claim(
 def load_meta(data_dir: Path, cid: str) -> dict | None:
     if not _ID_RE.match(cid):
         return None
+    return _load_meta_unlocked(data_dir, cid)
+
+
+def _load_meta_unlocked(data_dir: Path, cid: str) -> dict | None:
     p = data_dir / cid / "meta.json"
     if not p.is_file():
         return None

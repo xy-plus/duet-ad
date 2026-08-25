@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -293,11 +294,12 @@ def test_single_segment_full_chain(enabled, monkeypatch):
     assert r.status_code == 200
     assert r.json() == {"status": "running", "frames": []}  # 受理即返回，进度走 detail 轮询
 
-    # 每帧按稳定顺序执行文字擦除、图标擦除；confirm 恒 True
-    assert sorted(call["image"] for call in fake.calls) == ["01.png", "02.png"]
-    for call in fake.calls:
-        assert call["scenes"] == (mediakit.TEXT_SCENE, mediakit.ICON_SCENE)
-        assert call["confirm"] is True
+    # 严格阶段屏障：全段文字擦除完成后才开始全段图标擦除。
+    assert [call["scenes"] for call in fake.calls] == [
+        (mediakit.TEXT_SCENE,), (mediakit.TEXT_SCENE,),
+        (mediakit.ICON_SCENE,), (mediakit.ICON_SCENE,),
+    ]
+    assert all(call["confirm"] is True for call in fake.calls)
 
     # 产出：work/postprocessed/<帧名>.png（与源帧同目录层级）
     assert (cdir / "work" / "postprocessed" / "01.png").is_file()
@@ -307,7 +309,7 @@ def test_single_segment_full_chain(enabled, monkeypatch):
     meta = storage.load_meta(settings.data_dir, cid)
     pp = meta["postprocess"]
     assert pp["status"] == "done"
-    assert pp["options"] == options
+    assert pp["options"] == {**options, "optimize_image": False}
     assert pp["frames"] == ["01.png", "02.png"]
     assert pp["error"] is None
 
@@ -370,10 +372,12 @@ def test_frame_failure_marks_failed_keeps_successes(enabled, monkeypatch):
 
     pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
     assert pp["status"] == "failed"
-    assert "02.png" in pp["error"]
-    assert pp["frames"] == ["01.png"]  # 已成功帧保留并记录
-    assert (cdir / "work" / "postprocessed" / "01.png").is_file()  # 已成功帧落盘保留
-    assert not (cdir / "work" / "postprocessed" / "02.png").exists()
+    assert pp["error"] == "segment_failed"
+    assert "02.png" in pp["segments"][0]["error"]
+    assert pp["frames"] == []  # 整段完整前不发布 canonical
+    private = cdir / "work" / ".postprocess-private" / "0" / "text"
+    assert (private / "01.png").is_file()
+    assert not (cdir / "work" / "postprocessed").exists()
 
     d = c.get(f"/api/conversations/{cid}", headers=AUTH).json()
     assert d["postprocess"]["status"] == "failed"
@@ -390,12 +394,9 @@ def test_rerun_skips_existing_outputs(enabled, monkeypatch):
     monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
 
     r = _post(c, cid, OPTIONS_SUB)
-    assert r.status_code == 200
-
-    assert [call["image"] for call in fake.calls] == ["02.png"]  # 已有优化图的帧不重复扣费
-    pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
-    assert pp["status"] == "done"
-    assert pp["frames"] == ["01.png", "02.png"]
+    assert r.status_code == 409
+    assert r.json() == {"detail": "postprocess_canonical_conflict"}
+    assert fake.calls == []
     assert (cdir / "work" / "postprocessed" / "01.png").read_bytes() == b"kept"
 
 
@@ -414,7 +415,7 @@ def test_concurrent_start_single_runner(tmp_path, monkeypatch):
         )
 
     results = asyncio.run(run_both())
-    oks = [r for r in results if isinstance(r, dict)]
+    oks = [r for r in results if r is None]
     errs = [r for r in results if isinstance(r, postprocess.PostprocessError)]
     assert len(oks) == 1 and len(errs) == 1
     assert errs[0].status == 409 and errs[0].detail == "already running"
@@ -425,7 +426,6 @@ def test_options_lock_is_rechecked_inside_lock_without_writing(tmp_path, monkeyp
     settings = make_settings(tmp_path, enable_mediakit_erase=True)
     cid = _make_conv(settings)
     cdir = settings.data_dir / cid
-    before = _file_snapshot(cdir)
     initial = storage.load_meta(settings.data_dir, cid)
     locked = {
         **initial,
@@ -436,8 +436,8 @@ def test_options_lock_is_rechecked_inside_lock_without_writing(tmp_path, monkeyp
             "error": None,
         },
     }
-    reads = iter((initial, locked))
-    monkeypatch.setattr(postprocess.storage, "load_meta", lambda *_args: next(reads))
+    (cdir / "meta.json").write_text(json.dumps(locked), encoding="utf-8")
+    before = _file_snapshot(cdir)
 
     with pytest.raises(postprocess.PostprocessError) as caught:
         asyncio.run(postprocess.start(
@@ -526,7 +526,7 @@ def test_legacy_change_bg_in_meta_options_rerun_no_409(enabled, monkeypatch):
 
     pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
     assert pp["status"] == "done"
-    assert pp["options"] == OPTIONS_SUB  # 覆盖为两键契约
+    assert pp["options"] == {**OPTIONS_SUB, "optimize_image": False}
 
     # 共有键真变了仍然 409：兼容比对不放松锁定
     r = _post(c, cid, OPTIONS_BRAND)
@@ -671,11 +671,13 @@ def test_parallel_frame_failure_waits_for_rest(enabled, monkeypatch):
 
     pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
     assert pp["status"] == "failed"
-    assert "02.png" in pp["error"]
-    assert pp["frames"] == ["01.png", "03.png"]  # 完成顺序 02→03→01，终序按目标顺序
-    assert (cdir / "work" / "postprocessed" / "01.png").is_file()
-    assert (cdir / "work" / "postprocessed" / "03.png").is_file()
-    assert not (cdir / "work" / "postprocessed" / "02.png").exists()
+    assert pp["error"] == "segment_failed"
+    assert "02.png" in pp["segments"][0]["error"]
+    assert pp["frames"] == []  # 段内有失败帧时不发布任何 canonical
+    private = cdir / "work" / ".postprocess-private" / "0" / "text"
+    assert (private / "01.png").is_file()
+    assert (private / "03.png").is_file()
+    assert not (private / "02.png").exists()
 
 
 # ---------- 取消：父任务取消写 failed 终态 ----------
@@ -685,18 +687,18 @@ def test_run_task_cancelled_writes_failed(tmp_path, monkeypatch):
     继续传播前把 meta.postprocess 写成 failed——否则永久 running、start 永久 409 拒重跑。"""
     settings = make_settings(tmp_path, enable_mediakit_erase=True)
     cid = _make_conv(settings)
-    storage.update_meta(settings.data_dir, cid, postprocess={
-        "status": "running", "options": OPTIONS_SUB, "frames": [], "error": None,
-    })
+    asyncio.run(postprocess.start(
+        settings, cid, {"confirm": True, "options": OPTIONS_SUB}, {}
+    ))
 
     async def hang(*a, **k):
         await asyncio.Event().wait()  # 被取消时才结束的挂起桩
 
-    monkeypatch.setattr(postprocess, "_edit_one", hang)
+    monkeypatch.setattr(postprocess, "_mediakit_stage", hang)
     sem = asyncio.Semaphore(10)
 
     async def drive():
-        task = asyncio.create_task(postprocess.run_task(settings, cid, OPTIONS_SUB, sem))
+        task = asyncio.create_task(postprocess.run_task(settings, cid, sem))
         await asyncio.sleep(0.05)  # 让出至进入 gather
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -706,4 +708,87 @@ def test_run_task_cancelled_writes_failed(tmp_path, monkeypatch):
     pp = storage.load_meta(settings.data_dir, cid)["postprocess"]
     assert pp["status"] == "failed"
     assert "cancelled" in pp["error"]
-    assert pp["options"] == OPTIONS_SUB
+    assert pp["options"] == {**OPTIONS_SUB, "optimize_image": False}
+
+
+def test_parallel_segment_updates_use_atomic_storage_mutation(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
+    cid = _make_conv(settings, segments=True)
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "running", "options": {**OPTIONS_SUB, "optimize_image": False},
+        "frames": [], "error": None,
+        "segments": [
+            postprocess._segment_state(1, 1),
+            postprocess._segment_state(2, 2),
+        ],
+    })
+    public_load_calls = 0
+
+    def forbidden_stale_load(*_args):
+        nonlocal public_load_calls
+        public_load_calls += 1
+        raise AssertionError("_update_segment must not perform a lock-outside load")
+
+    monkeypatch.setattr(postprocess.storage, "load_meta", forbidden_stale_load)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(
+            lambda args: postprocess._update_segment(
+                settings, cid, args[0], stage=args[1], completed_frames=args[2]
+            ),
+            ((1, "brand", 1), (2, "seedream", 2)),
+        ))
+    current = storage._load_meta_unlocked(settings.data_dir, cid)["postprocess"]
+    by_index = {item["index"]: item for item in current["segments"]}
+    assert public_load_calls == 0
+    assert (by_index[1]["stage"], by_index[1]["completed_frames"]) == ("brand", 1)
+    assert (by_index[2]["stage"], by_index[2]["completed_frames"]) == ("seedream", 2)
+
+
+def test_public_state_maps_untrusted_status_stage_and_error_to_safe_closed_values():
+    public = postprocess.public_state({
+        "status": "provider-secret-status", "options": OPTIONS_SUB,
+        "frames": [], "error": "request_id=req-secret-123",
+        "segments": [{
+            "index": 1, "status": "remote-running", "stage": "task_id=secret",
+            "completed_frames": 0, "total_frames": 1, "revision": 1,
+            "error": "provider task_id=secret-456",
+        }, {
+            "index": 2, "status": "failed", "stage": "brand",
+            "completed_frames": 0, "total_frames": 1, "revision": 2,
+            "error": "frame 02.png failed: provider request req-secret",
+        }],
+    })
+    assert public["status"] == "failed"
+    assert public["error"] == "postprocess_failed"
+    assert public["segments"][0] == {
+        "index": 1, "status": "failed", "stage": "unknown",
+        "completed_frames": 0, "total_frames": 1, "revision": 1,
+        "error": "postprocess_failed",
+    }
+    assert public["segments"][1]["error"] == "frame 02.png failed"
+    assert "secret" not in json.dumps(public)
+
+
+@pytest.mark.parametrize("segments", [
+    [{"index": 0, "status": "running", "stage": "queued", "completed_frames": 0,
+      "total_frames": 1, "revision": 1, "error": None},
+     {"index": 1, "status": "running", "stage": "queued", "completed_frames": 0,
+      "total_frames": 1, "revision": 1, "error": None}],
+    [{"index": 1, "status": "running", "stage": "queued", "completed_frames": 0,
+      "total_frames": 1, "revision": 1, "error": None},
+     {"index": 3, "status": "running", "stage": "queued", "completed_frames": 0,
+      "total_frames": 1, "revision": 1, "error": None}],
+    [{"index": 0, "status": "running", "stage": "queued", "completed_frames": 2,
+      "total_frames": 1, "revision": 1, "error": None}],
+    [{"index": True, "status": "running", "stage": "queued", "completed_frames": 0,
+      "total_frames": 1, "revision": 1, "error": None}],
+])
+def test_public_state_fails_closed_for_invalid_segment_collection(segments):
+    public = postprocess.public_state({
+        "status": "running", "options": {**OPTIONS_SUB, "optimize_image": False},
+        "frames": ["01.png"], "error": None, "segments": segments,
+    })
+    assert public["status"] == "failed"
+    assert public["error"] == "postprocess_receipt_invalid"
+    assert public["segments"] == []
+    assert public["frames"] == []
