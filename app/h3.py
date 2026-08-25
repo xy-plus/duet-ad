@@ -1017,20 +1017,56 @@ def _attempt_chain(
     request: H3Request, state: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     """Load the exact same-request/input attempt chain in creation order."""
-    attempts = _state_root(request) / "attempts"
-    try:
-        paths = sorted(attempts.glob("*/attempt.json"))
-    except OSError:
-        raise H3Error("state_unavailable") from None
+    ledger = _validated_attempt_ledger(request)
     chain = []
-    for path in paths:
-        raw = _read_json(path)
+    for raw in ledger:
         if raw.get("client_request_id") != request.client_request_id:
             continue
         _validate_state(request, raw)
         if raw.get("input_receipt") == state.get("input_receipt"):
             chain.append(raw)
     return chain
+
+
+def _validated_attempt_ledger(request: H3Request) -> list[dict[str, Any]]:
+    """Validate the append-only attempt directory structure without input drift.
+
+    Unrelated client ids need only structural validation here. Matching records
+    receive the full current-request receipt validation in ``_attempt_chain``.
+    """
+    root = _state_root(request)
+    if _read_json(root / "session.json") != {
+        "schema_version": SCHEMA_VERSION,
+        "cid": request.cid,
+    }:
+        raise ReceiptError("state_invalid")
+    attempts = root / "attempts"
+    try:
+        numbered = sorted(
+            (path for path in attempts.iterdir() if path.name.isdigit()),
+            key=lambda path: int(path.name),
+        )
+    except OSError:
+        raise H3Error("state_unavailable") from None
+    if not numbered:
+        raise ReceiptError("state_invalid")
+    expected_names = [f"{index:06d}" for index in range(1, len(numbered) + 1)]
+    if [path.name for path in numbered] != expected_names:
+        raise ReceiptError("state_invalid")
+    ledger = []
+    for path in numbered:
+        attempt_path = path / "attempt.json"
+        if not path.is_dir() or not attempt_path.is_file():
+            raise ReceiptError("state_invalid")
+        raw = _read_json(attempt_path)
+        if (
+            raw.get("schema_version") != SCHEMA_VERSION
+            or raw.get("cid") != request.cid
+            or raw.get("attempt_id") != path.name
+        ):
+            raise ReceiptError("state_invalid")
+        ledger.append(raw)
+    return ledger
 
 
 def _is_complete_provider_failure(state: Mapping[str, Any]) -> bool:

@@ -879,11 +879,15 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
 
     if startup:
         recoverable = []
+        recovered_provider_failure = False
         for segment in plan.segments:
             state = states[segment.index]
             provider_failed = (
                 state.get("status") == "failed"
                 and state.get("error") == "h3_provider_failed"
+            )
+            recovered_provider_failure = (
+                recovered_provider_failure or provider_failed
             )
             if (
                 state.get("status") not in {"queued", "running", "resume_required"}
@@ -935,6 +939,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 states[segment.index].update(status=status, error=error)
         if any(item.get("status") == "submission_unknown" for item in states.values()):
             persist("submission_unknown", "submission_unknown")
+            return
         elif all(item.get("status") == "succeeded" for item in states.values()):
             try:
                 _stitch(settings, cid, plan, dialogue_mode)
@@ -942,14 +947,20 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 persist("failed", "long_video_stitch_failed", "stitch")
             else:
                 persist("succeeded", None, "stitch")
+            return
         elif any(item.get("status") == "failed" for item in states.values()):
             persist("failed", "long_video_segment_failed")
-        else:
-            # A known attempt still needs recovery, or an unstarted child
-            # awaits explicit same-parent confirmation. Only a receipt-bound
-            # provider terminal failure may create an automatic retry POST.
+            return
+        if fast_mode or not recovered_provider_failure:
+            # General startup remains GET-only. A prepared child still awaits
+            # explicit confirmation unless this is the narrow serial provider-
+            # failure continuation handled below.
             persist("resume_required", "long_video_resume_required")
-        return
+            return
+        # The serial chain was already authorized and stopped only at a
+        # provider-declared, non-billable failure. Once that exact attempt is
+        # recovered, continue its already-frozen downstream without a click.
+        persist("running", None)
 
     if fast_mode:
         # Phase 1: construct every immutable request before creating any paid

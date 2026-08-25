@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import logging
+import shutil
 import socket
 import subprocess
 import threading
@@ -530,6 +531,80 @@ def test_provider_failure_auto_retry_budget_counts_created_attempts(tmp_path):
     assert result.status == "failed"
     assert posts == 1 + request.timeouts.retry_count
     assert not _attempt_file(request, posts + 1).exists()
+
+
+@pytest.mark.parametrize("damage", ["first_attempt_json", "middle_attempt_dir"])
+def test_provider_auto_retry_rejects_attempt_ledger_gaps_without_new_post(
+    tmp_path, damage,
+):
+    request = _boundary_request(tmp_path)
+    posts = 0
+
+    def failed(req: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        if req.method == "POST":
+            posts += 1
+            return httpx.Response(200, json={"data": {"task_id": f"task-{posts}"}})
+        return httpx.Response(200, json={
+            "request_id": f"provider-failure-{posts}",
+            "data": {"status": "FAILED"},
+        })
+
+    with _client(failed) as client:
+        assert h3.start(request, client=client).status == "failed"
+    assert posts == 3
+    if damage == "first_attempt_json":
+        _attempt_file(request, 1).unlink()
+    else:
+        shutil.rmtree(_attempt_file(request, 2).parent)
+
+    calls = []
+    expanded = replace(
+        request, timeouts=replace(request.timeouts, retry_count=3)
+    )
+    with _client(lambda req: calls.append(req) or failed(req)) as client:
+        with pytest.raises(h3.ReceiptError, match="state_invalid"):
+            h3.resume(expanded, client=client)
+
+    assert calls == []
+    assert not _attempt_file(request, 4).exists()
+
+
+def test_provider_auto_retry_accepts_structurally_valid_other_request_attempt(
+    tmp_path,
+):
+    request = _boundary_request(tmp_path)
+    request = replace(request, timeouts=replace(request.timeouts, retry_count=1))
+    assert h3.prepare(request).attempt_id == "000001"
+    posts = 0
+
+    def provider(req: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        if req.method == "POST":
+            posts += 1
+            return httpx.Response(200, json={"data": {"task_id": f"task-{posts}"}})
+        if req.url.path.endswith("/result/task-1"):
+            return httpx.Response(200, json={
+                "request_id": "provider-failure",
+                "data": {"status": "FAILED"},
+            })
+        if req.url.path.endswith("/result/task-2"):
+            return httpx.Response(200, json={"data": {
+                "status": "SUCCESS",
+                "results": [{"url": "https://download.invalid/video.mp4"}],
+            }})
+        return _download_response(200, content=HappyProvider.video_bytes)
+
+    with _client(provider) as client:
+        result = h3.retry(request, "boundary-2", client=client)
+
+    assert result.status == "succeeded"
+    assert posts == 2
+    ids = [
+        json.loads(_attempt_file(request, number).read_text())["client_request_id"]
+        for number in (1, 2, 3)
+    ]
+    assert ids == ["boundary-1", "boundary-2", "boundary-2"]
 
 
 def test_resume_automatically_retries_complete_provider_failure(tmp_path):

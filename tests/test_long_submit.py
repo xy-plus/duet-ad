@@ -324,7 +324,10 @@ def test_fast_mode_submit_workers_enter_concurrently(tmp_path, monkeypatch):
 
     assert len(submit_threads) == 2
     assert len(set(submit_threads)) == 2
-    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+    assert (
+        storage.load_meta(settings.data_dir, cid)["generation"]["status"]
+        == "succeeded"
+    )
 
 
 def test_fast_mode_preflight_failure_makes_zero_provider_posts(tmp_path, monkeypatch):
@@ -603,6 +606,58 @@ def test_serial_provider_auto_retry_success_precedes_downstream_submit(
     long_generation.run(settings, cid, plan)
 
     assert events == ["provider-auto-retried-1", "submitted-2"]
+
+
+def test_serial_startup_provider_retry_success_automatically_starts_downstream(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=False
+    )
+    generation.update(status="failed", error="long_video_segment_failed")
+    generation["segments"][0].update(
+        status="failed", error="h3_provider_failed", attempt=1,
+        child_request_id=long_generation.child_request_id(
+            "parent-request-123", receipt, 1
+        ),
+    )
+    storage.update_meta(
+        settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
+        frozen_plan_receipt=receipt, generation=generation,
+    )
+    resumed = []
+    started = []
+
+    def resume(request):
+        resumed.append(int(request.workdir.name))
+        request.workdir.joinpath("generated.mp4").write_bytes(b"recovered")
+        return h3.H3Result("succeeded", "000002")
+
+    def start(request):
+        started.append(int(request.workdir.name))
+        request.workdir.joinpath("generated.mp4").write_bytes(b"downstream")
+        return h3.H3Result("succeeded", "000001")
+
+    monkeypatch.setattr(h3, "resume", resume)
+    monkeypatch.setattr(h3, "start", start)
+    monkeypatch.setattr(
+        long_generation,
+        "_extract_last_frame",
+        lambda _v, output: (_png(output, 200) or output),
+    )
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
+
+    long_generation.run(settings, cid, plan, startup=True)
+
+    assert resumed == [1]
+    assert started == [2]
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
 
 
 @pytest.mark.parametrize(
