@@ -553,6 +553,7 @@ def _publish_segment(outputs: list[Path], targets: list[tuple[Path, Path]]) -> N
             copied = temporary / canonical.name
             shutil.copyfile(output, copied)
             _fsync_file(copied)
+        _fsync_dir(temporary)
         os.replace(temporary, destination)
         _fsync_dir(destination.parent)
     finally:

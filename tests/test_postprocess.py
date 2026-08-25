@@ -641,6 +641,25 @@ def test_corrupt_existing_canonical_is_not_reused(enabled, monkeypatch):
     assert len(fake.calls) == calls_before
 
 
+def test_publish_fsyncs_staged_directory_before_parent(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    staged = tmp_path / "private" / "01.png"
+    canonical = tmp_path / "postprocessed" / "01.png"
+    source.write_bytes(PNG)
+    staged.parent.mkdir()
+    staged.write_bytes(PNG)
+    synced = []
+    monkeypatch.setattr(postprocess, "_fsync_dir", lambda path: synced.append(path))
+
+    postprocess._publish_segment([staged], [(source, canonical)])
+
+    assert synced == [
+        tmp_path / ".postprocessed.publishing",
+        tmp_path,
+    ]
+    assert canonical.read_bytes() == PNG
+
+
 # ---------- 并行提交：进程级信号量限流与失败语义 ----------
 
 class SlowEdit:

@@ -77,7 +77,8 @@ function stageLabel(stage: string | null, status: string): string {
   if (stage === 'remove_subtitle' || stage === 'text') return '文字处理';
   if (stage === 'remove_brand' || stage === 'logo') return '标识处理';
   if (stage === 'optimize_image' || stage === 'seedream' || stage === 'image') return '图片优化';
-  if (stage === 'finalize' || stage === 'write' || stage === 'done') return '整理结果';
+  if (stage === 'finalize' || stage === 'write' || stage === 'publishing') return '整理结果';
+  if (stage === 'done') return '处理完成';
   if (status === 'failed') return '处理失败';
   if (status === 'succeeded' || status === 'done') return '处理完成';
   return '处理中';

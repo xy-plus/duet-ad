@@ -194,6 +194,19 @@ describe('PostprocessStatus', () => {
     expect(onRetrySegment).toHaveBeenCalledWith({ index: 0, expectedRevision: 5 });
   });
 
+  it('maps publication and completion stages to precise public labels', () => {
+    render(<PostprocessStatus task={{
+      ...runningTask,
+      segments: [
+        { index: 1, status: 'running', stage: 'publishing', completedFrames: 1, totalFrames: 1, revision: 1, error: null },
+        { index: 2, status: 'done', stage: 'done', completedFrames: 1, totalFrames: 1, revision: 1, error: null },
+      ],
+    }} />);
+
+    expect(screen.getByText('整理结果')).toBeInTheDocument();
+    expect(screen.getByText('处理完成')).toBeInTheDocument();
+  });
+
   it('renders per-segment progress and retries only with index and expected revision', async () => {
     const user = userEvent.setup();
     const onRetrySegment = vi.fn();
