@@ -26,6 +26,16 @@ async function lintStyles(code: string) {
 }
 
 describe('UI foundation contract', () => {
+  it('ships scoped instructions for future frontend agents', () => {
+    const instructionsPath = resolve(projectRoot, 'AGENTS.md');
+
+    expect(existsSync(instructionsPath)).toBe(true);
+    const instructions = readFileSync(instructionsPath, 'utf8');
+    expect(instructions).toContain('src/ui/antd');
+    expect(instructions).toContain('原生 `<video controls>`');
+    expect(instructions).toContain('npm run check');
+  });
+
   it('provides one component facade and one token/provider module', () => {
     expect(existsSync(resolve(projectRoot, 'src/ui/antd.ts'))).toBe(true);
     expect(existsSync(resolve(projectRoot, 'src/ui/theme.ts'))).toBe(true);

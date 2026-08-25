@@ -11,6 +11,7 @@
     "lint:code": "eslint . --max-warnings 0",
     "lint:styles": "stylelint \"src/**/*.css\"",
     "lint": "npm run typecheck && npm run lint:code && npm run lint:styles",
+    "check": "npm run lint && npm test && npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test"
