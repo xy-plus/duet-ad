@@ -29,6 +29,8 @@ const state = {
   segmentProductsExpanded: {}, // cid → 分段产物是否由用户展开；轮询重渲染时保留，切会话重置
   generationDrafts: {}, // cid → 最终视频表单草稿；轮询重渲染时保留用户输入
   generationSubmitting: {}, // cid → true：本页已有 /submit 请求在途，阻止重复提交
+  promptDraft: null,   // 当前图片优化提示词草稿；跨轮询保留，跨操作由统一守卫处理
+  promptWorkspaceMode: {}, // cid:segment → generation/dialogue/image
   detailSig: null,     // 当前已渲染详情的状态签名：轮询比对，签名不变不碰 DOM（根治轮询闪烁）
 };
 
@@ -87,6 +89,97 @@ function showActionError(error, errorElement, controls = []) {
     : String(error && error.message ? error.message : error || "操作失败，请稍后重试");
   errorElement.hidden = false;
   for (const control of controls) control.disabled = false;
+}
+
+function createImagePromptDraft(conversationId, segmentIndex, prompt) {
+  const value = prompt || {};
+  return {
+    conversationId,
+    segmentIndex: Number.isInteger(segmentIndex) ? segmentIndex : null,
+    text: String(value.text || ""),
+    savedText: String(value.text || ""),
+    defaultText: String(value.default_text || ""),
+    sha256: String(value.sha256 || ""),
+    dirty: false,
+    saving: false,
+    save: null,
+  };
+}
+
+function restoreImagePromptDefault(draft) {
+  draft.text = draft.defaultText;
+  draft.dirty = draft.text !== draft.savedText;
+  return draft;
+}
+
+function mergeImagePromptDraft(draft, prompt) {
+  if (!draft || !prompt) return draft;
+  draft.defaultText = String(prompt.default_text || "");
+  if (!draft.dirty) {
+    draft.text = String(prompt.text || "");
+    draft.savedText = draft.text;
+    draft.sha256 = String(prompt.sha256 || "");
+  }
+  return draft;
+}
+
+function buildImagePromptPatch(draft) {
+  return {
+    confirm: true,
+    segment_index: Number.isInteger(draft.segmentIndex) ? draft.segmentIndex : null,
+    expected_sha256: draft.sha256,
+    prompt: draft.text,
+  };
+}
+
+function promptScopeKey(conversationId, segmentIndex) {
+  return conversationId + ":" + (Number.isInteger(segmentIndex) ? segmentIndex : "single");
+}
+
+async function saveActiveImagePrompt() {
+  const draft = state.promptDraft;
+  if (!draft || !draft.dirty || draft.saving || typeof draft.save !== "function") return !draft || !draft.dirty;
+  draft.saving = true;
+  try {
+    return await draft.save();
+  } finally {
+    draft.saving = false;
+  }
+}
+
+function dirtyPromptDecision() {
+  const dialog = typeof document !== "undefined" ? $("draft-dialog") : null;
+  if (!dialog || typeof dialog.showModal !== "function") {
+    if (window.confirm("图片优化提示词尚未保存。确定保存后继续吗？")) return Promise.resolve("save");
+    return Promise.resolve(window.confirm("丢弃未保存的修改吗？") ? "discard" : "cancel");
+  }
+  return new Promise((resolve) => {
+    const finish = (decision) => {
+      dialog.close();
+      resolve(decision);
+    };
+    $("draft-save").onclick = () => finish("save");
+    $("draft-discard").onclick = () => finish("discard");
+    $("draft-cancel").onclick = () => finish("cancel");
+    dialog.showModal();
+  });
+}
+
+async function guardDirtyPrompt() {
+  const draft = state.promptDraft;
+  if (!draft || !draft.dirty) return true;
+  const decision = await dirtyPromptDecision();
+  if (decision === "cancel") return false;
+  if (decision === "discard") {
+    draft.text = draft.savedText;
+    draft.dirty = false;
+    return true;
+  }
+  try {
+    return await saveActiveImagePrompt();
+  } catch (_) {
+    return false;
+  }
 }
 
 async function recoverPromptChanged(error, detail, fetchLatest, refs) {
@@ -900,8 +993,8 @@ function renderResults(detail) {
     const sourcePrompt = detail.source_prompt || detail.prompt;
     if (sourcePrompt) {
       const sec = el("section", "res-section");
-      sec.appendChild(el("h3", "res-h3", "源提示词"));
-      sec.appendChild(renderSourcePromptCard(detail, sourcePrompt));
+      sec.appendChild(el("h3", "res-h3", "提示词与台词"));
+      sec.appendChild(promptWorkspace(detail));
       frag.appendChild(sec);
     }
   }
@@ -991,6 +1084,7 @@ function setGenerationCardBusy(card, busy) {
 }
 
 async function submitGeneration(detail, card) {
+  if (!await guardDirtyPrompt()) return;
   const generation = detail.generation || {};
   const action = generationAction(generation.status, generation.stage);
   if (!canOperate(detail) || state.generationSubmitting[detail.id]
@@ -1470,7 +1564,7 @@ function createDisclosure(labels, buildContent, options = {}) {
   const initialExpanded = options.expanded === true;
   if (initialExpanded) ensureContent();
   setDisclosureState(button, panel, initialExpanded, labels);
-  button.addEventListener("click", () => {
+  const toggle = () => {
     const expanded = panel.hidden;
     if (expanded) ensureContent();
     setDisclosureState(button, panel, expanded, labels);
@@ -1480,6 +1574,18 @@ function createDisclosure(labels, buildContent, options = {}) {
       rendered = false;
     }
     if (options.onChange) options.onChange(expanded);
+  };
+  button.addEventListener("click", () => {
+    if (options.onBeforeChange) {
+      const allowed = options.onBeforeChange();
+      if (allowed && typeof allowed.then === "function") {
+        allowed.then((resolved) => { if (resolved !== false) toggle(); });
+      } else if (allowed !== false) {
+        toggle();
+      }
+      return;
+    }
+    toggle();
   });
   wrap.appendChild(button);
   wrap.appendChild(panel);
@@ -1515,6 +1621,219 @@ function segmentDialogueDisclosure(dialogueLines, segmentIndex) {
     expandText: "展开段台词",
     collapseText: "收起段台词",
   });
+}
+
+function dialogueText(lines) {
+  if (Array.isArray(lines)) {
+    return lines.map((line) => typeof line === "string" ? line : String(line && line.text || ""))
+      .filter(Boolean).join("\n");
+  }
+  return normalizeDialogueLines(lines).map((line) => line.text).join("\n");
+}
+
+function imagePromptEditable(detail) {
+  const generationStarted = !!(detail.generation && detail.generation.status);
+  const postprocessStarted = !!(detail.postprocess && detail.postprocess.status);
+  return canOperate(detail) && !generationStarted && !postprocessStarted;
+}
+
+function promptWorkspace(detail, segment = null) {
+  const segmentIndex = segment && Number.isInteger(segment.index) ? segment.index : null;
+  const scope = promptScopeKey(detail.id, segmentIndex);
+  const isLong = Array.isArray(detail.segments) && detail.segments.length > 0;
+  const generationText = String(segment ? segment.prompt || "" : detail.source_prompt || detail.prompt || "");
+  const lines = segment ? segment.lines : detail.dialogue;
+  const imagePrompt = segment ? segment.image_optimization_prompt : detail.image_optimization_prompt;
+  const wrap = el("div", "prompt-workspace");
+  const tabs = el("div", "prompt-workspace-tabs");
+  tabs.setAttribute("role", "tablist");
+  const panel = el("div", "prompt-workspace-panel");
+  panel.id = "prompt-workspace-" + (++disclosureSeq);
+  panel.setAttribute("role", "tabpanel");
+  const modes = [
+    ["generation", "展开生成提示词"],
+    ["dialogue", "展开段台词"],
+    ["image", "展开图片优化"],
+  ];
+  const buttons = {};
+  let currentMode = state.promptWorkspaceMode[scope] || null;
+
+  const renderMode = () => {
+    panel.textContent = "";
+    panel.hidden = currentMode === null;
+    for (const [mode, label] of modes) {
+      const selected = mode === currentMode;
+      buttons[mode].classList.toggle("is-active", selected);
+      buttons[mode].setAttribute("aria-selected", String(selected));
+      buttons[mode].textContent = selected ? label.replace("展开", "收起") : label;
+    }
+    if (currentMode === null) return;
+    if (currentMode === "dialogue") {
+      panel.appendChild(promptCard(dialogueText(lines) || "暂无段台词"));
+      return;
+    }
+    if (currentMode === "generation") {
+      if (isLong || !sourcePromptEditable(detail)) {
+        panel.appendChild(promptCard(generationText));
+        return;
+      }
+      panel.appendChild(editablePromptCard({
+        text: generationText,
+        defaultText: generationText,
+        ariaLabel: "修改源提示词",
+        saveLabel: "保存提示词",
+        showRestore: false,
+        onSave: async (text) => {
+          let payload;
+          try {
+            payload = await apiJSON("/api/conversations/" + encodeURIComponent(detail.id) + "/prompt", {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({confirm: true, expected_sha256: detail.source_prompt_sha256, prompt: text}),
+            });
+          } catch (error) {
+            if (!error || error.code !== "prompt_changed") throw error;
+            const latest = await apiJSON("/api/conversations/" + encodeURIComponent(detail.id));
+            if (!latest || typeof latest.source_prompt !== "string"
+                || !/^[0-9a-f]{64}$/.test(String(latest.source_prompt_sha256 || ""))) {
+              throw new Error("最新提示词详情校验失败，请刷新页面后重试");
+            }
+            Object.assign(detail, latest);
+            const conflict = new Error("提示词已在其他页面更新，已加载最新版本，请重新编辑");
+            conflict.latestText = latest.source_prompt;
+            throw conflict;
+          }
+          if (!payload || typeof payload.prompt !== "string"
+              || typeof payload.final_prompt !== "string"
+              || !/^[0-9a-f]{64}$/.test(String(payload.sha256 || ""))) {
+            throw new Error("源提示词保存响应校验失败");
+          }
+          detail.source_prompt = payload.prompt;
+          detail.source_prompt_sha256 = payload.sha256;
+          detail.prompt = payload.final_prompt;
+          return payload.prompt;
+        },
+      }));
+      return;
+    }
+    if (!imagePrompt || typeof imagePrompt.text !== "string") {
+      panel.appendChild(el("p", "prompt-unavailable", "当前会话没有可编辑的图片优化提示词"));
+      return;
+    }
+    if (!imagePromptEditable(detail)) {
+      panel.appendChild(promptCard(imagePrompt.text));
+      return;
+    }
+    let draft = state.promptDraft;
+    if (!draft || draft.conversationId !== detail.id || draft.segmentIndex !== segmentIndex) {
+      draft = createImagePromptDraft(detail.id, segmentIndex, imagePrompt);
+      state.promptDraft = draft;
+    } else {
+      mergeImagePromptDraft(draft, imagePrompt);
+    }
+    const card = editablePromptCard({
+      text: draft.text,
+      defaultText: draft.defaultText,
+      ariaLabel: "修改图片优化提示词",
+      saveLabel: "保存图片优化",
+      showRestore: true,
+      onInput: (text) => {
+        draft.text = text;
+        draft.dirty = text !== draft.savedText;
+      },
+      onRestore: () => restoreImagePromptDefault(draft).text,
+      onSave: async (text) => {
+        draft.text = text;
+        const payload = await apiJSON(
+          "/api/conversations/" + encodeURIComponent(detail.id) + "/image-optimization-prompt",
+          {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(buildImagePromptPatch(draft))},
+        );
+        const saved = payload.image_optimization_prompt || payload;
+        if (!saved || typeof saved.text !== "string" || !/^[0-9a-f]{64}$/.test(String(saved.sha256 || ""))) {
+          throw new Error("图片优化提示词保存响应校验失败");
+        }
+        draft.text = saved.text;
+        draft.savedText = saved.text;
+        draft.defaultText = String(saved.default_text || draft.defaultText);
+        draft.sha256 = saved.sha256;
+        draft.dirty = false;
+        if (segment) segment.image_optimization_prompt = saved;
+        else detail.image_optimization_prompt = saved;
+        return saved.text;
+      },
+    });
+    draft.save = card.save;
+    panel.appendChild(card.node);
+  };
+
+  for (const [mode, label] of modes) {
+    const button = el("button", "segment-prompt-toggle", label);
+    button.type = "button";
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-controls", panel.id);
+    button.addEventListener("click", async () => {
+      if (!await guardDirtyPrompt()) return;
+      currentMode = mode === currentMode ? null : mode;
+      state.promptWorkspaceMode[scope] = currentMode;
+      renderMode();
+    });
+    buttons[mode] = button;
+    tabs.appendChild(button);
+  }
+  wrap.appendChild(tabs);
+  wrap.appendChild(panel);
+  renderMode();
+  return wrap;
+}
+
+function editablePromptCard(options) {
+  const node = el("div", "prompt-card");
+  const head = el("div", "prompt-head");
+  head.appendChild(el("span", "prompt-hint", options.ariaLabel));
+  const copy = el("button", "copy-btn", "复制");
+  copy.type = "button";
+  head.appendChild(copy);
+  node.appendChild(head);
+  const textarea = el("textarea", "dialogue-textarea prompt-editor");
+  textarea.rows = 14;
+  textarea.value = options.text;
+  textarea.setAttribute("aria-label", options.ariaLabel);
+  node.appendChild(textarea);
+  const error = el("p", "form-error");
+  error.hidden = true;
+  node.appendChild(error);
+  const actions = el("div", "final-row prompt-edit-actions");
+  const saveButton = el("button", "btn btn-primary", options.saveLabel);
+  saveButton.type = "button";
+  actions.appendChild(saveButton);
+  if (options.showRestore) {
+    const restore = el("button", "btn", "恢复默认");
+    restore.type = "button";
+    restore.addEventListener("click", () => {
+      textarea.value = options.onRestore();
+      if (options.onInput) options.onInput(textarea.value);
+    });
+    actions.appendChild(restore);
+  }
+  node.appendChild(actions);
+  textarea.addEventListener("input", () => options.onInput && options.onInput(textarea.value));
+  copy.addEventListener("click", () => copyText(textarea.value));
+  const save = async () => {
+    saveButton.disabled = true;
+    error.hidden = true;
+    try {
+      textarea.value = await options.onSave(textarea.value);
+      return true;
+    } catch (err) {
+      if (typeof err.latestText === "string") textarea.value = err.latestText;
+      showActionError(err, error, [saveButton]);
+      return false;
+    } finally {
+      saveButton.disabled = false;
+    }
+  };
+  saveButton.addEventListener("click", save);
+  return options.showRestore ? {node, save} : node;
 }
 
 function sourcePromptEditable(detail) {
@@ -1681,14 +2000,7 @@ function renderSegments(detail) {
         { compact: true, expandable: true, onURL: (url) => mediaURLs.push(url) },
       ));
     }
-    if (seg.prompt) {
-      card.appendChild(el("h4", "res-sub", "生成提示词"));
-      card.appendChild(segmentPromptDisclosure(seg.prompt, n));
-    }
-    if (Array.isArray(seg.lines) && seg.lines.length) {
-      card.appendChild(el("h4", "res-sub", "段台词"));
-      card.appendChild(segmentDialogueDisclosure(seg.lines, n));
-    }
+    card.appendChild(promptWorkspace(detail, seg));
     frag.appendChild(card);
   }
   return frag;
@@ -1712,6 +2024,7 @@ function segmentProductsDisclosure(detail, buildContent = null) {
     buttonClass: "btn btn-primary segment-products-toggle",
     panelClass: "segment-products-panel",
     expanded: state.segmentProductsExpanded[detail.id] === true,
+    onBeforeChange: () => state.promptDraft && state.promptDraft.dirty ? guardDirtyPrompt() : true,
     onChange: (expanded) => { state.segmentProductsExpanded[detail.id] = expanded; },
     onDispose: (panel) => {
       if (activeLightboxDisclosure && panel.contains(activeLightboxDisclosure)) {
@@ -1828,7 +2141,7 @@ async function copyText(text) {
 
 /* ===== 后处理弹窗 ===== */
 function ppCheckedOptions() {
-  const options = { remove_subtitle: false, remove_brand: false };
+  const options = { remove_subtitle: false, remove_brand: false, optimize_image: false };
   document.querySelectorAll('#pp-form input[name="opt"]:checked').forEach((c) => {
     options[c.value] = true;
   });
@@ -1843,13 +2156,25 @@ function openPostprocessModal(detail) {
   if (!canOperate(detail)) return;
   state.ppDetail = detail;
   const last = detail.postprocess && detail.postprocess.options;
+  const capabilities = detail.postprocess_capabilities || {
+    remove_subtitle: detail.postprocess_enabled === true,
+    remove_brand: detail.postprocess_enabled === true,
+    optimize_image: false,
+  };
   document.querySelectorAll('#pp-form input[name="opt"]').forEach((c) => {
-    c.checked = last ? last[c.value] === true : true; // 已运行过 → 预填上次选项（后端锁定）；首次 → 默认全选
+    c.disabled = !capabilities[c.value];
+    c.closest("label").hidden = c.disabled;
+    c.checked = !c.disabled && (last ? last[c.value] === true : c.value !== "optimize_image");
   });
   $("pp-lock-hint").hidden = !last;
   $("pp-error").hidden = true;
   updatePpConfirm();
   $("pp-dialog").showModal();
+}
+
+async function requestOpenPostprocessModal(detail) {
+  if (!await guardDirtyPrompt()) return;
+  openPostprocessModal(detail);
 }
 
 function closePostprocessModal() {
@@ -1859,6 +2184,7 @@ function closePostprocessModal() {
 
 async function submitPostprocess(event) {
   event.preventDefault();
+  if (!await guardDirtyPrompt()) return;
   const detail = state.ppDetail;
   if (!detail || !canOperate(detail)) {
     closePostprocessModal();
@@ -1986,6 +2312,54 @@ function ppTotalFrames(detail) {
   return Array.isArray(detail.keyframes) ? detail.keyframes.length : 0;
 }
 
+function postprocessSegmentStatus(status) {
+  return {
+    queued: "等待处理",
+    running: "处理中",
+    done: "已完成",
+    failed: "失败",
+    submission_unknown: "提交结果未知",
+  }[status] || String(status || "等待处理");
+}
+
+function renderPostprocessSegments(detail, pp) {
+  const wrap = el("div", "pp-segment-statuses");
+  for (const segment of Array.isArray(pp.segments) ? pp.segments : []) {
+    const row = el("div", "pp-segment-status");
+    const title = el("div", "pp-segment-title", "第 " + segment.index + " 段 · " + postprocessSegmentStatus(segment.status));
+    row.appendChild(title);
+    const completed = Number.isInteger(segment.completed_frames) ? segment.completed_frames : 0;
+    const total = Number.isInteger(segment.total_frames) ? segment.total_frames : 0;
+    row.appendChild(el("p", "ac-sub", `已完成 ${completed}/${total} 帧`));
+    if (segment.stage) row.appendChild(el("p", "ac-sub", "阶段：" + segment.stage));
+    if (segment.error) row.appendChild(el("p", "fail-msg", segment.error));
+    if (segment.status === "submission_unknown") {
+      row.appendChild(el("p", "pp-billing-warning", "提交结果未知；请勿重试，否则可能重复计费。"));
+    } else if (segment.status === "failed" && Number.isInteger(segment.revision)) {
+      const retry = el("button", "btn btn-ghost pp-segment-retry", "重试本段");
+      retry.type = "button";
+      retry.addEventListener("click", async () => {
+        if (!await guardDirtyPrompt()) return;
+        retry.disabled = true; // expected_revision + 立即禁用共同阻止双击
+        try {
+          await apiJSON(
+            "/api/conversations/" + encodeURIComponent(detail.id) + "/postprocess/segments/" + segment.index + "/retry",
+            {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({confirm: true, expected_revision: segment.revision})},
+          );
+          await loadDetail(detail.id, true);
+        } catch (err) {
+          retry.disabled = false;
+          const message = el("p", "form-error", String(err.message || err));
+          row.appendChild(message);
+        }
+      });
+      row.appendChild(retry);
+    }
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
 /* 助手消息：running 进行中卡 / done 优化后结果 / failed 错误卡（动态区，轮询期间单独重渲染） */
 function renderPpAssistant(detail, pp) {
   const row = el("div", "msg-row");
@@ -2002,17 +2376,22 @@ function renderPpAssistant(detail, pp) {
     const track = el("div", "progress-track");
     track.appendChild(el("div", "progress-fill"));
     card.appendChild(track);
+    card.appendChild(renderPostprocessSegments(detail, pp));
     row.appendChild(card);
-  } else if (pp.status === "failed") {
+  } else if (pp.status === "failed" || pp.status === "submission_unknown") {
     const card = el("div", "fail-card");
     card.appendChild(icon("i-alert", "ic-danger"));
     const body = el("div");
-    body.appendChild(el("p", "fail-title", "后处理失败"));
+    body.appendChild(el("p", "fail-title", pp.status === "submission_unknown" ? "后处理提交结果未知" : "后处理失败"));
     body.appendChild(el("p", "fail-msg", pp.error || "后端未返回具体原因"));
     if (Array.isArray(pp.frames) && pp.frames.length) {
       body.appendChild(el("p", "fail-tip", "已成功优化的帧保留"));
     }
+    if (pp.status === "submission_unknown") {
+      body.appendChild(el("p", "pp-billing-warning", "请勿重复提交，否则可能重复计费。"));
+    }
     card.appendChild(body);
+    card.appendChild(renderPostprocessSegments(detail, pp));
     row.appendChild(card);
   } else if (pp.status === "done") {
     const frames = Array.isArray(pp.frames) ? pp.frames : [];
@@ -2033,7 +2412,9 @@ function renderPpAssistant(detail, pp) {
    running/done 时不显示——renderPpChat 的进行中卡/结果卡接管。 */
 function renderPpAsk(detail) {
   const pp = detail.postprocess || {};
-  if (!detail.postprocess_enabled || !canOperate(detail)) return null;
+  const capabilities = detail.postprocess_capabilities || {};
+  const enabled = Object.values(capabilities).some((value) => value === true) || detail.postprocess_enabled === true;
+  if (!enabled || !canOperate(detail)) return null;
   if (pp.status === "running" || pp.status === "done") return null;
   const row = el("div", "msg-row");
   row.appendChild(assistantHead(detail.updated_at));
@@ -2043,10 +2424,10 @@ function renderPpAsk(detail) {
     card.appendChild(el("p", "pp-ask-ended", "已跳过优化，素材保持原样"));
   } else {
     const actions = el("div", "pp-ask-actions");
-    const yes = el("button", "btn btn-primary pp-ask-btn", "是");
+    const yes = el("button", "btn btn-ghost pp-ask-btn", "是");
     yes.type = "button";
-    yes.addEventListener("click", () => openPostprocessModal(detail));
-    const no = el("button", "btn btn-ghost pp-ask-btn", "否");
+    yes.addEventListener("click", () => requestOpenPostprocessModal(detail));
+    const no = el("button", "btn btn-primary pp-ask-btn is-selected", "否");
     no.type = "button";
     no.addEventListener("click", () => {
       state.ppAskDismissed[detail.id] = true;
@@ -2138,9 +2519,12 @@ function detailSignature(detail) {
     detail.receipt_version,
     detail.source_prompt || null,
     detail.source_prompt_sha256 || null,
+    detail.image_optimization_prompt || null,
+    detail.postprocess_capabilities || null,
     detail.dialogue || null,
     pp ? pp.status : "",
     pp && pp.error ? pp.error : "",
+    pp && pp.segments ? pp.segments : null,
     Array.isArray(detail.keyframes) ? detail.keyframes.join(",") : "",
     detail.prompt || "",
     segments.map((seg) => [
@@ -2148,6 +2532,7 @@ function detailSignature(detail) {
       Array.isArray(seg.keyframes) ? seg.keyframes.join(",") : "",
       seg.prompt || "",
       Array.isArray(seg.lines) ? seg.lines.join("\n") : "",
+      seg.image_optimization_prompt || null,
     ]),
     detail.has_video ? 1 : 0,
   ]);
@@ -2211,8 +2596,9 @@ async function loadDetail(id, silent) {
   }
 }
 
-function selectConversation(id) {
+async function selectConversation(id) {
   if (state.uploading) return; // 上传中不切换，避免打断
+  if (state.currentId !== id && !await guardDirtyPrompt()) return;
   delete state.ppResultExpanded[id];
   resetSegmentProductsDisclosure(id);
   state.currentId = id;
@@ -2394,6 +2780,7 @@ function uploadConversation({ file, url, note, requestId, voiceMode: mode, targe
 async function handleSend(event) {
   event.preventDefault();
   if (state.uploading) return;
+  if (!await guardDirtyPrompt()) return;
   const mode = sourceMode();
   const file = mode === "upload" ? state.file : null;
   const url = mode === "link" ? $("url-input").value.trim() : "";
@@ -2472,7 +2859,8 @@ function bindEvents() {
     doLogin(token);
   });
 
-  $("logout-btn").addEventListener("click", () => {
+  $("logout-btn").addEventListener("click", async () => {
+    if (!await guardDirtyPrompt()) return;
     state.token = null;
     localStorage.removeItem(TOKEN_KEY);
     showLogin(null);
@@ -2481,8 +2869,9 @@ function bindEvents() {
   $("menu-btn").addEventListener("click", openDrawer);
   $("drawer-backdrop").addEventListener("click", closeDrawer);
 
-  $("new-chat-btn").addEventListener("click", () => {
+  $("new-chat-btn").addEventListener("click", async () => {
     if (state.uploading) return;
+    if (!await guardDirtyPrompt()) return;
     state.currentId = null;
     state.detail = null;
     renderList();
@@ -2546,6 +2935,11 @@ function bindEvents() {
   window.addEventListener("resize", () => {
     if (window.innerWidth > 768) closeDrawer();
   });
+  window.addEventListener("beforeunload", (event) => {
+    if (!state.promptDraft || !state.promptDraft.dirty) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
 }
 
 function boot() {
@@ -2564,11 +2958,13 @@ function boot() {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildLongRetryPayload,
+    buildImagePromptPatch,
     buildStitchRetryPayload,
     buildResumePayload,
     buildSubmitPayload,
     apiErrorFromPayload,
     canOperate,
+    createImagePromptDraft,
     clearStream,
     closeLightbox,
     conversationBadge,
@@ -2584,12 +2980,14 @@ if (typeof module !== "undefined" && module.exports) {
     generationSegmentLabel,
     longVideoContract,
     mergeConversationList,
+    mergeImagePromptDraft,
     normalizeDialogueLines,
     parseDialogueLines,
     openLightbox,
     releaseTrackedURLs,
     releaseTrackedURL,
     resetSegmentProductsDisclosure,
+    restoreImagePromptDefault,
     recoverLockedPostprocess,
     recoverPromptChanged,
     runSingleFlightPollCycle,

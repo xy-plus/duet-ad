@@ -357,11 +357,11 @@ def test_segment_disclosure_state_defaults_collapsed_and_toggles_both_ways():
     }
 
 
-def test_long_segment_prompt_and_keyframes_use_accessible_disclosures_only():
+def test_long_segment_prompt_workspace_and_keyframes_are_accessible():
     source = APP_JS.read_text(encoding="utf-8")
     branch = source.split("function renderSegments(detail)", 1)[1]
     branch = branch.split("/* 关键帧放大查看", 1)[0]
-    assert "segmentPromptDisclosure(seg.prompt, n)" in branch
+    assert "promptWorkspace(detail, seg)" in branch
     assert "compact: true, expandable: true" in branch
     assert "onURL: (url) => mediaURLs.push(url)" in branch
 
@@ -374,12 +374,11 @@ def test_long_segment_prompt_and_keyframes_use_accessible_disclosures_only():
     assert 'trigger.setAttribute("aria-expanded", String(expanded))' in source
 
 
-def test_long_segment_dialogue_reuses_disclosure_and_omits_empty_toggle():
+def test_long_segment_dialogue_reuses_the_three_way_prompt_workspace():
     source = APP_JS.read_text(encoding="utf-8")
     branch = source.split("function renderSegments(detail)", 1)[1]
     branch = branch.split("/* 关键帧放大查看", 1)[0]
-    assert "if (Array.isArray(seg.lines) && seg.lines.length)" in branch
-    assert "segmentDialogueDisclosure(seg.lines, n)" in branch
+    assert "promptWorkspace(detail, seg)" in branch
 
     generic = source.split("function createDisclosure", 1)[1]
     generic = generic.split("function segmentDisclosure", 1)[0]
@@ -387,12 +386,11 @@ def test_long_segment_dialogue_reuses_disclosure_and_omits_empty_toggle():
     assert 'button.setAttribute("aria-controls", panel.id)' in generic
     assert "setDisclosureState(button, panel, initialExpanded, labels)" in generic
 
-    disclosure = source.split("function segmentDisclosure", 1)[1]
-    disclosure = disclosure.split("function sourcePromptEditable", 1)[0]
-    assert 'idPrefix: "segment-disclosure"' in disclosure
-    assert "return createDisclosure(labels" in disclosure
-    assert 'expandText: "展开段台词"' in disclosure
-    assert 'collapseText: "收起段台词"' in disclosure
+    workspace = source.split("function promptWorkspace", 1)[1]
+    workspace = workspace.split("function editablePromptCard", 1)[0]
+    assert '["generation", "展开生成提示词"]' in workspace
+    assert '["dialogue", "展开段台词"]' in workspace
+    assert '["image", "展开图片优化"]' in workspace
 
 
 def test_lightbox_dom_lifecycle_hides_and_restores_focus_for_every_close_path():

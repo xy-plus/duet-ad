@@ -684,6 +684,31 @@ input, textarea { font-family: inherit; }
 .segment-prompt-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .segment-prompt-panel { margin-top: 8px; }
 
+.prompt-workspace-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.prompt-workspace-tabs .segment-prompt-toggle {
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  padding: 8px;
+  white-space: normal;
+  line-height: 1.35;
+}
+
+.prompt-workspace-tabs .segment-prompt-toggle.is-active {
+  color: #FFFFFF;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.prompt-workspace-panel { margin-top: 8px; }
+.prompt-workspace .prompt-editor { width: 100%; resize: vertical; }
+.prompt-unavailable { margin: 0; padding: 16px; color: var(--text-2); }
+
 .segment-products-disclosure { margin-bottom: 24px; }
 
 .segment-products-toggle {
@@ -823,6 +848,16 @@ input, textarea { font-family: inherit; }
   color: var(--accent);
   font-size: 13px;
 }
+
+.pp-segment-statuses { margin-top: 14px; }
+.pp-segment-status {
+  padding: 12px 0;
+  border-top: 1px solid var(--divider);
+}
+.pp-segment-title { font-size: 14px; font-weight: 600; }
+.pp-billing-warning { margin: 8px 0 0; color: var(--danger); font-weight: 600; }
+.pp-segment-retry { margin-top: 8px; }
+.draft-actions { flex-wrap: wrap; }
 
 .res-sub {
   margin: 0 0 10px;

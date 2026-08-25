@@ -147,6 +147,10 @@
         <input type="checkbox" name="opt" value="remove_brand" checked>
         <span>移除常见 Logo/图标</span>
       </label>
+      <label class="pp-opt">
+        <input type="checkbox" name="opt" value="optimize_image">
+        <span>优化图片质量</span>
+      </label>
     </div>
     <p id="pp-error" class="form-error" role="alert" hidden></p>
     <div class="pp-actions">
@@ -154,6 +158,18 @@
       <button type="submit" id="pp-confirm" class="btn btn-primary" disabled>确认处理</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="draft-dialog" class="pp-dialog" aria-labelledby="draft-title">
+  <div class="pp-form">
+    <h2 id="draft-title" class="pp-title">图片优化提示词尚未保存</h2>
+    <p class="pp-sub">请选择保存修改、丢弃修改，或取消当前操作继续编辑。</p>
+    <div class="pp-actions draft-actions">
+      <button type="button" id="draft-cancel" class="btn btn-ghost">取消</button>
+      <button type="button" id="draft-discard" class="btn">丢弃</button>
+      <button type="button" id="draft-save" class="btn btn-primary">保存</button>
+    </div>
+  </div>
 </dialog>
 
 <script src="app.js"></script>
