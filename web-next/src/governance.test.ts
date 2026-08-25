@@ -209,6 +209,32 @@ describe('UI foundation contract', () => {
     expect(messages).toContainEqual(expect.stringContaining('DOM element factory'));
   });
 
+  it.each([
+    "const browser = window; const dom = browser.document; export const bad = dom.createElement('button');",
+    "const browser = globalThis; const dom = browser.document; export const bad = dom.createElement('button');",
+  ])('rejects browser root aliases before they can expose a DOM factory', async (source) => {
+    const messages = await lintBusinessSource(source);
+
+    expect(messages).toContainEqual(expect.stringContaining('DOM element factory'));
+  });
+
+  it('reports one diagnostic for direct document factory access', async () => {
+    const messages = await lintBusinessSource(
+      "export const bad = document.createElement('button');",
+    );
+
+    expect(messages.filter((message) => message.includes('DOM element factory'))).toHaveLength(1);
+  });
+
+  it('leaves browser globals available to the governed test setup only', async () => {
+    const messages = await lintBusinessSource(
+      'export const browser = window; export const runtime = globalThis;',
+      'src/test/governance-helper.ts',
+    );
+
+    expect(messages).toEqual([]);
+  });
+
   it('allows only the root lookup document access in the production entrypoint', async () => {
     const messages = await lintBusinessSource(
       "export const root = document.getElementById('root');",

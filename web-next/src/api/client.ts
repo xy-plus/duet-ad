@@ -182,7 +182,7 @@ export class ApiClient {
   constructor(options: ApiClientOptions = {}) {
     this.basePath = (options.basePath ?? '/api').replace(/\/$/u, '');
     this.storage = options.storage === undefined ? defaultStorage() : options.storage;
-    this.fetchImplementation = options.fetchImplementation ?? fetch.bind(globalThis);
+    this.fetchImplementation = options.fetchImplementation ?? ((input, init) => fetch(input, init));
     this.xhrFactory = options.xhrFactory ?? (() => new XMLHttpRequest());
     this.clearQueryCache = options.clearQueryCache ?? (() => undefined);
     this.sessionKeyFactory = options.sessionKeyFactory ?? defaultSessionKey;

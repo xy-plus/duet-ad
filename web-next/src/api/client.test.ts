@@ -146,6 +146,24 @@ describe('ApiClient', () => {
       .toEqual(['GET', 'PATCH', 'POST', 'POST']);
   });
 
+  it('uses the default fetch without binding it to globalThis', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(TOKEN_STORAGE_KEY, 'secret');
+    const defaultFetch = vi.fn(function fetchWithoutReceiver(this: unknown) {
+      expect(this).toBeUndefined();
+      return Promise.resolve(Response.json([]));
+    });
+    vi.stubGlobal('fetch', defaultFetch);
+
+    try {
+      const client = new ApiClient({ storage });
+      await expect(client.listConversations()).resolves.toEqual([]);
+      expect(defaultFetch).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('clears token and query cache on any 401', async () => {
     const storage = new MemoryStorage();
     storage.setItem(TOKEN_STORAGE_KEY, 'expired');
