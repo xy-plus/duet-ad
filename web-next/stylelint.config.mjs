@@ -12,7 +12,7 @@ export default {
         '/^(?:column-gap|gap|margin|padding|row-gap)/': [
           /\b\d+(?:\.\d+)?(?:px|rem)\b/u,
         ],
-        '/^(?:border-radius|box-shadow|font-family|font-size)$/': [
+        '/^(?:border(?:-[a-z]+){0,3}-radius|box-shadow|text-shadow|font(?:-family|-size)?)$/': [
           /^(?!var\(--ant-[\w-]+\)$).+/u,
         ],
       },

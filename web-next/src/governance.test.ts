@@ -38,16 +38,16 @@ describe('UI foundation contract', () => {
 
   it('provides one component facade and one token/provider module', () => {
     expect(existsSync(resolve(projectRoot, 'src/ui/antd.ts'))).toBe(true);
-    expect(existsSync(resolve(projectRoot, 'src/ui/theme.ts'))).toBe(true);
+    expect(existsSync(resolve(projectRoot, 'src/ui/theme.tsx'))).toBe(true);
   });
 
   it('lets XProvider own the single Ant theme boundary', () => {
     const facade = readFileSync(resolve(projectRoot, 'src/ui/antd.ts'), 'utf8');
-    const provider = readFileSync(resolve(projectRoot, 'src/ui/theme.ts'), 'utf8');
+    const provider = readFileSync(resolve(projectRoot, 'src/ui/theme.tsx'), 'utf8');
 
     expect(facade).not.toMatch(/\bConfigProvider\b/);
-    expect(provider).toMatch(/createElement\(\s*XProvider/);
-    expect(provider).toContain('{ theme: appTheme, locale: zhCN }');
+    expect(provider).toContain('<XProvider theme={appTheme} locale={zhCN}>');
+    expect(provider).not.toContain('createElement');
     expect(provider).not.toMatch(/\bConfigProvider\b/);
   });
 
@@ -70,6 +70,27 @@ describe('UI foundation contract', () => {
     );
 
     expect(messages).toContainEqual(expect.stringContaining('src/ui/antd'));
+  });
+
+  it.each([
+    'antd/es/button',
+    '@ant-design/x/es/bubble',
+    '@ant-design/icons/es/icons/PlusOutlined',
+  ])('rejects template-literal dynamic imports from %s', async (moduleName) => {
+    const messages = await lintBusinessSource(
+      `export const load = () => import(\`${moduleName}\`);`,
+    );
+
+    expect(messages).toContainEqual(expect.stringContaining('src/ui/antd'));
+  });
+
+  it.each([
+    "const target = '../local'; export const load = () => import(target);",
+    "const part = 'local'; export const load = () => import('../' + part);",
+  ])('rejects dynamic imports that are not statically provable local paths', async (source) => {
+    const messages = await lintBusinessSource(source);
+
+    expect(messages).toContainEqual(expect.stringContaining('statically known local path'));
   });
 
   it('accepts UI imports through the facade', async () => {
@@ -118,6 +139,17 @@ describe('UI foundation contract', () => {
     expect(messages).toContainEqual(expect.stringContaining('Inline styles'));
   });
 
+  it.each([
+    "import { createElement } from 'react'; export const Bad = () => createElement('button');",
+    "import React from 'react'; export const Bad = () => React.createElement('input');",
+    "import { createElement } from 'react'; const tag = 'button'; export const Bad = () => createElement(tag);",
+    "import React from 'react'; export const Bad = () => React['createElement']('button');",
+  ])('rejects restricted native elements constructed through createElement', async (source) => {
+    const messages = await lintBusinessSource(source);
+
+    expect(messages).toContainEqual(expect.stringContaining('UI facade'));
+  });
+
   it('allows color literals only in the theme module', async () => {
     const facadeMessages = await lintBusinessSource(
       "export const color = '#fff';",
@@ -125,7 +157,7 @@ describe('UI foundation contract', () => {
     );
     const themeMessages = await lintBusinessSource(
       "export const color = '#fff';",
-      'src/ui/theme.ts',
+      'src/ui/theme.tsx',
     );
 
     expect(facadeMessages).toContainEqual(expect.stringContaining('Color literals'));
@@ -148,6 +180,12 @@ describe('UI foundation contract', () => {
 
     expect(inlineMessages).toContainEqual(expect.stringContaining('Inline styles'));
     expect(colorMessages).toContainEqual(expect.stringContaining('Color literals'));
+  });
+
+  it('rejects color literals embedded inside longer strings', async () => {
+    const messages = await lintBusinessSource("export const border = '1px solid #fff';");
+
+    expect(messages).toContainEqual(expect.stringContaining('Color literals'));
   });
 
   it('accepts semantic structure without visual escape hatches', async () => {
@@ -186,7 +224,10 @@ describe('UI foundation contract', () => {
 
   it.each([
     ['border-radius', '12px'],
+    ['border-top-left-radius', '12px'],
     ['box-shadow', '0 1px 2px #000'],
+    ['text-shadow', '0 1px var(--ant-color-text)'],
+    ['font', '14px Arial'],
     ['font-size', '14px'],
     ['font-family', 'Arial'],
   ])('rejects raw %s values from feature CSS', async (property, value) => {

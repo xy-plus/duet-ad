@@ -81,6 +81,18 @@ describe('ApiClient', () => {
       { detail: 'not found' },
       { status: 404, fallback: 'fallback' },
     )).toMatchObject({ status: 404, code: 'http_error', message: 'not found' });
+    expect(apiErrorFromPayload(
+      { detail: 'submission_outcome_unknown' },
+      { status: 409, fallback: 'fallback' },
+    )).toMatchObject({ status: 409, code: 'submission_outcome_unknown' });
+    expect(apiErrorFromPayload(
+      { detail: { code: 'submission_outcome_unknown', message: '提交结果待核对' } },
+      { status: 409, fallback: 'fallback' },
+    )).toMatchObject({
+      status: 409,
+      code: 'submission_outcome_unknown',
+      message: '提交结果待核对',
+    });
   });
 
   it('stores the bearer token and implements the real JSON endpoints under /api', async () => {
@@ -263,6 +275,7 @@ describe('ApiClient', () => {
       resolution: '480p' as const,
     };
 
+    await client.getConversation('c1');
     await expect(client.submitConversation('c1', payload)).rejects.toMatchObject({ code: 'network_error' });
     await expect(client.submitConversation('c1', payload)).rejects.toMatchObject({ code: 'request_in_progress' });
     expect(submitCalls).toBe(1);
@@ -279,6 +292,204 @@ describe('ApiClient', () => {
     detailGeneration = { status: 'queued', client_request_id: 'request-ambiguous' };
     await client.getConversation('c1');
     expect(client.isSubmissionReconciling('c1')).toBe(false);
+  });
+
+  it('does not treat the unchanged baseline of a reused request id as reconciliation progress', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(TOKEN_STORAGE_KEY, 'secret');
+    let detailGeneration: unknown = {
+      status: 'resume_required',
+      stage: 'h3',
+      client_request_id: 'request-resume',
+    };
+    let submitCalls = 0;
+    let failSubmit: ((error: Error) => void) | undefined;
+    const fetchImplementation = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/submit')) {
+        submitCalls += 1;
+        if (submitCalls > 1) return Promise.reject(new TypeError('unexpected second submit'));
+        return new Promise<Response>((_resolve, reject) => {
+          failSubmit = reject;
+        });
+      }
+      if (url === '/api/conversations/c1') {
+        return Promise.resolve(Response.json({ id: 'c1', generation: detailGeneration }));
+      }
+      return Promise.reject(new Error(`unexpected request ${url}`));
+    });
+    const client = new ApiClient({ storage, fetchImplementation });
+    const payload = {
+      confirm: true as const,
+      client_request_id: 'request-resume',
+      dialogue_mode: 'auto' as const,
+      fit_mode: 'none' as const,
+      aspect_ratio: '16:9' as const,
+      resolution: '480p' as const,
+    };
+
+    await client.getConversation('c1');
+    const submission = client.submitConversation('c1', payload);
+    detailGeneration = { status: 'queued', stage: 'h3', client_request_id: 'request-resume' };
+    await client.getConversation('c1');
+    failSubmit?.(new TypeError('connection reset'));
+    await expect(submission).rejects.toMatchObject({ code: 'network_error' });
+    detailGeneration = {
+      status: 'resume_required',
+      stage: 'h3',
+      client_request_id: 'request-resume',
+    };
+    await client.getConversation('c1');
+    await expect(client.submitConversation('c1', payload)).rejects.toMatchObject({ code: 'request_in_progress' });
+    expect(submitCalls).toBe(1);
+
+    detailGeneration = { status: 'queued', stage: 'h3', client_request_id: 'request-resume' };
+    await client.getConversation('c1');
+    expect(client.isSubmissionReconciling('c1')).toBe(false);
+  });
+
+  it('locks a string submission_outcome_unknown response into GET-only reconciliation', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(TOKEN_STORAGE_KEY, 'secret');
+    let submitCalls = 0;
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/submit')) {
+        submitCalls += 1;
+        return Response.json({ detail: 'submission_outcome_unknown' }, { status: 409 });
+      }
+      if (url === '/api/conversations/c1') {
+        return Response.json({ id: 'c1', generation: null });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const client = new ApiClient({ storage, fetchImplementation });
+    const payload = {
+      confirm: true as const,
+      client_request_id: 'request-new',
+      dialogue_mode: 'auto' as const,
+      fit_mode: 'none' as const,
+      aspect_ratio: '16:9' as const,
+      resolution: '480p' as const,
+    };
+
+    await client.getConversation('c1');
+    await expect(client.submitConversation('c1', payload)).rejects.toMatchObject({
+      code: 'submission_outcome_unknown',
+    });
+    await client.getConversation('c1');
+    await expect(client.submitConversation('c1', payload)).rejects.toMatchObject({ code: 'request_in_progress' });
+    expect(submitCalls).toBe(1);
+  });
+
+  it('persists an ambiguous reconciliation lock across ApiClient instances', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(TOKEN_STORAGE_KEY, 'secret');
+    let submitCalls = 0;
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/submit')) {
+        submitCalls += 1;
+        throw new TypeError('connection reset');
+      }
+      if (url === '/api/conversations/c1') {
+        return Response.json({ id: 'c1', generation: null });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const payload = {
+      confirm: true as const,
+      client_request_id: 'request-persisted',
+      dialogue_mode: 'auto' as const,
+      fit_mode: 'none' as const,
+      aspect_ratio: '16:9' as const,
+      resolution: '480p' as const,
+    };
+
+    const firstClient = new ApiClient({ storage, fetchImplementation });
+    await firstClient.getConversation('c1');
+    await expect(firstClient.submitConversation('c1', payload)).rejects.toMatchObject({
+      code: 'network_error',
+    });
+
+    const reloadedClient = new ApiClient({ storage, fetchImplementation });
+    expect(reloadedClient.isSubmissionReconciling('c1')).toBe(true);
+    await expect(reloadedClient.submitConversation('c1', payload)).rejects.toMatchObject({
+      code: 'request_in_progress',
+    });
+    expect(submitCalls).toBe(1);
+  });
+
+  it.each(['logout', '401'] as const)(
+    'keeps the persisted financial reconciliation fact after %s',
+    async (sessionEnd) => {
+      const storage = new MemoryStorage();
+      storage.setItem(TOKEN_STORAGE_KEY, 'secret');
+      const fetchImplementation = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/submit')) throw new TypeError('connection reset');
+        if (url === '/api/conversations/c1') {
+          return Response.json({ id: 'c1', generation: null });
+        }
+        if (url === '/api/conversations') {
+          return Response.json({ detail: 'invalid token' }, { status: 401 });
+        }
+        throw new Error(`unexpected request ${url}`);
+      });
+      const client = new ApiClient({ storage, fetchImplementation });
+      const payload = {
+        confirm: true as const,
+        client_request_id: 'request-survives-session',
+        dialogue_mode: 'auto' as const,
+        fit_mode: 'none' as const,
+        aspect_ratio: '16:9' as const,
+        resolution: '480p' as const,
+      };
+
+      await client.getConversation('c1');
+      await expect(client.submitConversation('c1', payload)).rejects.toMatchObject({
+        code: 'network_error',
+      });
+      if (sessionEnd === 'logout') {
+        client.clearSession();
+      } else {
+        await expect(client.listConversations()).rejects.toMatchObject({ code: 'unauthorized' });
+      }
+
+      expect(client.isSubmissionReconciling('c1')).toBe(true);
+    },
+  );
+
+  it('fails closed without a provider POST when the reconciliation fact cannot be persisted', async () => {
+    const storage = new MemoryStorage();
+    storage.values.set(TOKEN_STORAGE_KEY, 'secret');
+    storage.setItem = () => {
+      throw new DOMException('quota exceeded', 'QuotaExceededError');
+    };
+    let submitCalls = 0;
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/submit')) {
+        submitCalls += 1;
+        return Response.json({ status: 'queued', attempt: 1 });
+      }
+      if (url === '/api/conversations/c1') {
+        return Response.json({ id: 'c1', generation: null });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const client = new ApiClient({ storage, fetchImplementation });
+
+    await client.getConversation('c1');
+    await expect(client.submitConversation('c1', {
+      confirm: true,
+      client_request_id: 'request-storage-failure',
+      dialogue_mode: 'auto',
+      fit_mode: 'none',
+      aspect_ratio: '16:9',
+      resolution: '480p',
+    })).rejects.toMatchObject({ code: 'reconciliation_persistence_failed' });
+    expect(submitCalls).toBe(0);
   });
 
   it('fetches authenticated files as Blob and leaves URL ownership to the hook', async () => {

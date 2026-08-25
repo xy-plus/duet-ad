@@ -32,6 +32,33 @@ describe('TanStack Query state contract', () => {
     })).toBe(false);
   });
 
+  it('uses the existing detail observer for reconciliation without background polling', () => {
+    const isSubmissionReconciling = vi.fn(() => true);
+    const options = conversationDetailQueryOptions({
+      sessionKey: 'session-reconciliation',
+      getConversation: vi.fn(async () => detail('c1')),
+      isSubmissionReconciling,
+    }, 'c1');
+
+    expect(options.refetchIntervalInBackground).toBe(false);
+    expect(typeof options.refetchInterval).toBe('function');
+    if (typeof options.refetchInterval !== 'function') throw new Error('缺少详情轮询策略');
+    expect(options.refetchInterval({ state: { data: detail('c1') } } as never))
+      .toBe(DETAIL_POLL_INTERVAL_MS);
+    expect(isSubmissionReconciling).toHaveBeenCalledWith('c1');
+
+    const source = readFileSync(resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      '../app/ConversationDetailView.tsx',
+    ), 'utf8');
+    const generationSection = source.slice(
+      source.indexOf('function GenerationSection'),
+      source.indexOf('const initialPostprocessOptions'),
+    );
+    expect(generationSection).not.toContain('setInterval');
+    expect(generationSection).not.toContain('getConversation(');
+  });
+
   it('deduplicates an in-flight detail request and keeps stale sessions in old keys', async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     let releaseOld: ((value: ReturnType<typeof detail>) => void) | undefined;
@@ -103,3 +130,6 @@ describe('TanStack Query state contract', () => {
     expect(queryClient.getQueryCache().getAll()).toHaveLength(0);
   });
 });
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';

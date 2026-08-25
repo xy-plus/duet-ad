@@ -51,6 +51,7 @@ export function createAppQueryClient(): QueryClient {
 interface DetailApi<T> {
   readonly sessionKey: string;
   getConversation(id: string, options?: { readonly signal?: AbortSignal }): Promise<T>;
+  isSubmissionReconciling?(id: string): boolean;
 }
 
 interface ListApi<T> {
@@ -75,7 +76,9 @@ export function conversationDetailQueryOptions<T>(api: DetailApi<T>, id: string)
   return queryOptions({
     queryKey: queryKeys.detail(api.sessionKey, id),
     queryFn: ({ signal }) => api.getConversation(id, { signal }),
-    refetchInterval: detailRefetchInterval,
+    refetchInterval: (query) => api.isSubmissionReconciling?.(id)
+      ? DETAIL_POLL_INTERVAL_MS
+      : detailRefetchInterval(query),
     refetchIntervalInBackground: false,
   });
 }

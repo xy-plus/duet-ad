@@ -5,7 +5,7 @@ import tseslint from 'typescript-eslint';
 
 const UI_FACADE_MESSAGE = 'Import UI components from src/ui/antd instead.';
 const NATIVE_ELEMENT_MESSAGE = 'Use the UI facade instead of native visual elements.';
-const COLOR_LITERAL = /^(?:#[\da-f]{3,8}|(?:rgb|hsl|hwb|lab|lch|oklab|oklch|color)\s*\()/iu;
+const COLOR_LITERAL = /(?:#[\da-f]{3,8}|(?:rgb|hsl|hwb|lab|lch|oklab|oklch|color)\s*\()/iu;
 const RESTRICTED_NATIVE_ELEMENTS = new Set([
   'audio',
   'button',
@@ -30,7 +30,10 @@ const governancePlugin = {
       meta: {
         type: 'problem',
         schema: [],
-        messages: { forbidden: UI_FACADE_MESSAGE },
+        messages: {
+          forbidden: UI_FACADE_MESSAGE,
+          unsafeDynamic: 'Dynamic imports must use a statically known local path.',
+        },
       },
       create(context) {
         const reportRestrictedSource = (node, value) => {
@@ -39,12 +42,29 @@ const governancePlugin = {
             context.report({ node, messageId: 'forbidden' });
           }
         };
+        const staticImportSource = (source) => {
+          if (source.type === 'Literal') {
+            return typeof source.value === 'string' ? source.value : undefined;
+          }
+          if (source.type === 'TemplateLiteral' && source.expressions.length === 0) {
+            return source.quasis[0]?.value.cooked ?? source.quasis[0]?.value.raw;
+          }
+          return undefined;
+        };
         return {
           ImportDeclaration(node) {
             reportRestrictedSource(node.source, node.source.value);
           },
           ImportExpression(node) {
-            reportRestrictedSource(node.source, node.source.type === 'Literal' ? node.source.value : undefined);
+            const source = staticImportSource(node.source);
+            if (source === undefined || (!source.startsWith('./') && !source.startsWith('../'))) {
+              if (typeof source === 'string'
+                  && /^(?:antd|@ant-design\/x|@ant-design\/icons)(?:\/|$)/u.test(source)) {
+                reportRestrictedSource(node.source, source);
+              } else {
+                context.report({ node: node.source, messageId: 'unsafeDynamic' });
+              }
+            }
           },
         };
       },
@@ -53,7 +73,7 @@ const governancePlugin = {
       meta: {
         type: 'problem',
         schema: [],
-        messages: { forbidden: 'Color literals belong in src/ui/theme.ts Tokens.' },
+        messages: { forbidden: 'Color literals belong in src/ui/theme.tsx Tokens.' },
       },
       create(context) {
         return {
@@ -100,6 +120,21 @@ const governancePlugin = {
             if (name
                 && RESTRICTED_NATIVE_ELEMENTS.has(name)
                 && !(nativeVideoWrapper && name === 'video')) {
+              context.report({ node, messageId: 'forbidden' });
+            }
+          },
+          CallExpression(node) {
+            const createElementCall = (node.callee.type === 'Identifier'
+                && node.callee.name === 'createElement')
+              || (node.callee.type === 'MemberExpression' && (
+                (!node.callee.computed
+                  && node.callee.property.type === 'Identifier'
+                  && node.callee.property.name === 'createElement')
+                || (node.callee.computed
+                  && node.callee.property.type === 'Literal'
+                  && node.callee.property.value === 'createElement')
+              ));
+            if (createElementCall) {
               context.report({ node, messageId: 'forbidden' });
             }
           },
@@ -170,7 +205,7 @@ export default tseslint.config(
   },
   {
     files: ['src/**/*.{ts,tsx}'],
-    ignores: ['src/**/*.test.{ts,tsx}', 'src/ui/theme.ts'],
+    ignores: ['src/**/*.test.{ts,tsx}', 'src/ui/theme.tsx'],
     rules: {
       'governance/no-color-literals': 'error',
     },
