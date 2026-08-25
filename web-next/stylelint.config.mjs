@@ -5,6 +5,14 @@ export default {
     'color-named': 'never',
     'color-no-hex': true,
     'declaration-no-important': true,
+    'declaration-property-value-disallowed-list': [
+      {
+        '/^(?:column-gap|gap|margin|padding|row-gap)/': [
+          /\b\d+(?:\.\d+)?(?:px|rem)\b/u,
+        ],
+      },
+      { message: 'Spacing must use an Ant Token CSS variable.' },
+    ],
     'function-disallowed-list': [
       'color',
       'hsl',

@@ -1,9 +1,10 @@
 import { useCallback, type ReactNode } from 'react';
 import {
   Alert,
-  Attachments,
   AutoComplete,
   Button,
+  Card,
+  DeleteOutlined,
   Form,
   Input,
   LinkOutlined,
@@ -16,7 +17,6 @@ import {
   Typography,
   Upload,
   UploadOutlined,
-  type UploadFile,
 } from '../../ui/antd';
 import './create.css';
 
@@ -56,26 +56,6 @@ export interface CreateConversationComposerProps {
   value: CreateConversationDraft;
 }
 
-function toAttachment(file: File, progress?: UploadProgressState): UploadFile {
-  const status = progress?.status === 'active'
-    ? 'uploading'
-    : progress?.status === 'success'
-      ? 'done'
-      : progress?.status === 'exception'
-        ? 'error'
-        : undefined;
-
-  return {
-    lastModified: file.lastModified,
-    name: file.name,
-    percent: progress?.percent,
-    size: file.size,
-    status,
-    type: file.type,
-    uid: `${file.name}-${file.lastModified}-${file.size}`,
-  };
-}
-
 export function CreateConversationComposer({
   error,
   languageOptions,
@@ -113,7 +93,6 @@ export function CreateConversationComposer({
     || Boolean(value.transcript.targetLanguage.trim());
   const canSubmit = sourceReady && transcriptReady && !submitting;
   const selectedFile = value.source.type === 'file' ? value.source.file : undefined;
-  const attachment = selectedFile ? toAttachment(selectedFile, uploadProgress) : undefined;
 
   const submit = () => {
     if (canSubmit) void onSubmit(value);
@@ -171,22 +150,22 @@ export function CreateConversationComposer({
                 选择视频文件
               </Button>
             </Upload>
-            {attachment ? (
-              <div className="create-composer__attachment">
-                <Typography.Text>{attachment.name}</Typography.Text>
-                <Attachments
-                  disabled={submitting}
-                  items={[attachment]}
-                  onRemove={() => {
-                    update({ ...value, source: { type: 'file' } });
-                    return true;
-                  }}
-                >
-                  <span className="create-composer__attachments-anchor" />
-                </Attachments>
-              </div>
+            {selectedFile ? (
+              <Card
+                extra={(
+                  <Button
+                    aria-label="移除视频文件"
+                    disabled={submitting}
+                    icon={<DeleteOutlined />}
+                    onClick={() => update({ ...value, source: { type: 'file' } })}
+                    type="text"
+                  />
+                )}
+                size="small"
+                title={selectedFile.name}
+              />
             ) : null}
-            {attachment && uploadProgress ? (
+            {selectedFile && uploadProgress ? (
               <Progress
                 aria-label="上传进度"
                 percent={uploadProgress.percent}

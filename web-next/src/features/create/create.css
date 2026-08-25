@@ -1,41 +1,37 @@
 .create-composer {
   width: min(100%, 840px);
   margin-inline: auto;
-  padding: 24px;
+  padding: var(--ant-padding-lg);
 }
 
 .create-composer__heading {
-  margin-block-end: 20px;
+  margin-block-end: var(--ant-margin-lg);
 }
 
 .create-composer__title {
-  margin-block-end: 4px;
+  margin-block-end: var(--ant-margin-xxs);
 }
 
 .create-composer__alert {
-  margin-block-end: 16px;
+  margin-block-end: var(--ant-margin);
 }
 
 .create-composer__configuration {
-  padding: 4px 16px 0;
+  padding: var(--ant-padding-xxs) var(--ant-padding) 0;
 }
 
 .create-composer__field {
-  margin-block-end: 16px;
+  margin-block-end: var(--ant-margin);
 }
 
 .create-composer__file-controls {
   width: 100%;
 }
 
-.create-composer__attachments-anchor {
-  display: none;
-}
-
 .create-composer__transcript-controls {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--ant-margin-sm);
   flex-wrap: wrap;
 }
 
@@ -45,11 +41,11 @@
 
 @media (max-width: 575px) {
   .create-composer {
-    padding: 16px 12px;
+    padding: var(--ant-padding) var(--ant-padding-sm);
   }
 
   .create-composer__configuration {
-    padding-inline: 4px;
+    padding-inline: var(--ant-padding-xxs);
   }
 
   .create-composer__transcript-controls {
