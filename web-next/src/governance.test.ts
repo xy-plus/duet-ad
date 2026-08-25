@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { ESLint } from 'eslint';
@@ -29,6 +29,16 @@ describe('UI foundation contract', () => {
   it('provides one component facade and one token/provider module', () => {
     expect(existsSync(resolve(projectRoot, 'src/ui/antd.ts'))).toBe(true);
     expect(existsSync(resolve(projectRoot, 'src/ui/theme.ts'))).toBe(true);
+  });
+
+  it('lets XProvider own the single Ant theme boundary', () => {
+    const facade = readFileSync(resolve(projectRoot, 'src/ui/antd.ts'), 'utf8');
+    const provider = readFileSync(resolve(projectRoot, 'src/ui/theme.ts'), 'utf8');
+
+    expect(facade).not.toMatch(/\bConfigProvider\b/);
+    expect(provider).toMatch(/createElement\(\s*XProvider/);
+    expect(provider).toContain('{ theme: appTheme, locale: zhCN }');
+    expect(provider).not.toMatch(/\bConfigProvider\b/);
   });
 
   it.each(['antd', '@ant-design/x', '@ant-design/icons'])(

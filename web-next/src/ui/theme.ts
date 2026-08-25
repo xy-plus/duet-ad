@@ -1,6 +1,6 @@
 import { createElement, type PropsWithChildren } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { AntApp, ConfigProvider, XProvider, type ThemeConfig } from './antd';
+import { AntApp, XProvider, zhCN, type ThemeConfig } from './antd';
 import './baseline.css';
 
 export const appTheme: ThemeConfig = {
@@ -52,9 +52,9 @@ export function AppThemeProvider({ children }: PropsWithChildren) {
     QueryClientProvider,
     { client: queryClient },
     createElement(
-      ConfigProvider,
-      { theme: appTheme },
-      createElement(XProvider, null, createElement(AntApp, null, children)),
+      XProvider,
+      { theme: appTheme, locale: zhCN },
+      createElement(AntApp, null, children),
     ),
   );
 }
