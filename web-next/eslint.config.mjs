@@ -5,7 +5,7 @@ import tseslint from 'typescript-eslint';
 
 const UI_FACADE_MESSAGE = 'Import UI components from src/ui/antd instead.';
 const NATIVE_ELEMENT_MESSAGE = 'Use the UI facade instead of native visual elements.';
-const COLOR_LITERAL = /(?:#[\da-f]{3,8}|(?:rgb|hsl|hwb|lab|lch|oklab|oklch|color)\s*\()/iu;
+const COLOR_LITERAL = /(?:#|(?:rgb|hsl|hwb|lab|lch|oklab|oklch|color)\s*\()/iu;
 const RESTRICTED_NATIVE_ELEMENTS = new Set([
   'audio',
   'button',
@@ -32,6 +32,7 @@ const governancePlugin = {
         schema: [],
         messages: {
           forbidden: UI_FACADE_MESSAGE,
+          reactFactory: 'Use named React hooks/types and JSX through the UI facade.',
           unsafeDynamic: 'Dynamic imports must use a statically known local path.',
         },
       },
@@ -54,6 +55,18 @@ const governancePlugin = {
         return {
           ImportDeclaration(node) {
             reportRestrictedSource(node.source, node.source.value);
+            if (node.source.value === 'react') {
+              for (const specifier of node.specifiers) {
+                const importsElementFactory = specifier.type === 'ImportDefaultSpecifier'
+                  || specifier.type === 'ImportNamespaceSpecifier'
+                  || (specifier.type === 'ImportSpecifier'
+                    && specifier.imported.type === 'Identifier'
+                    && specifier.imported.name === 'createElement');
+                if (importsElementFactory) {
+                  context.report({ node: specifier, messageId: 'reactFactory' });
+                }
+              }
+            }
           },
           ImportExpression(node) {
             const source = staticImportSource(node.source);
@@ -76,86 +89,16 @@ const governancePlugin = {
         messages: { forbidden: 'Color literals belong in src/ui/theme.tsx Tokens.' },
       },
       create(context) {
-        const sourceCode = context.sourceCode;
-        const unknown = Symbol('unknown static value');
-        const findVariable = (node, name) => {
-          let scope = sourceCode.getScope(node);
-          while (scope) {
-            const variable = scope.set.get(name);
-            if (variable) return variable;
-            scope = scope.upper;
-          }
-          return undefined;
-        };
-        const staticValue = (node, seen = new Set()) => {
-          if (node.type === 'Literal') {
-            return node.value === null
-                || typeof node.value === 'string'
-                || typeof node.value === 'number'
-                || typeof node.value === 'boolean'
-              ? node.value
-              : unknown;
-          }
-          if (node.type === 'TemplateLiteral') {
-            let value = node.quasis[0]?.value.cooked ?? node.quasis[0]?.value.raw ?? '';
-            for (const [index, expression] of node.expressions.entries()) {
-              const expressionValue = staticValue(expression, seen);
-              if (expressionValue === unknown) return unknown;
-              value += String(expressionValue);
-              value += node.quasis[index + 1]?.value.cooked
-                ?? node.quasis[index + 1]?.value.raw
-                ?? '';
-            }
-            return value;
-          }
-          if (node.type === 'BinaryExpression' && node.operator === '+') {
-            const left = staticValue(node.left, seen);
-            const right = staticValue(node.right, seen);
-            if (left === unknown || right === unknown) return unknown;
-            if (typeof left === 'string' || typeof right === 'string') {
-              return String(left) + String(right);
-            }
-            return typeof left === 'number' && typeof right === 'number' ? left + right : unknown;
-          }
-          if (node.type === 'TSAsExpression'
-              || node.type === 'TSTypeAssertion'
-              || node.type === 'TSNonNullExpression') {
-            return staticValue(node.expression, seen);
-          }
-          if (node.type !== 'Identifier') return unknown;
-          const variable = findVariable(node, node.name);
-          if (!variable || seen.has(variable)) return unknown;
-          const definition = variable.defs.find((candidate) => candidate.type === 'Variable');
-          if (!definition
-              || definition.parent?.kind !== 'const'
-              || definition.node.id.type !== 'Identifier'
-              || !definition.node.init) {
-            return unknown;
-          }
-          const nextSeen = new Set(seen);
-          nextSeen.add(variable);
-          return staticValue(definition.node.init, nextSeen);
-        };
-        const reportStaticColor = (node) => {
-          const value = staticValue(node);
-          if (typeof value === 'string' && COLOR_LITERAL.test(value.trim())) {
-            context.report({ node, messageId: 'forbidden' });
-          }
-        };
         return {
           Literal(node) {
-            reportStaticColor(node);
-          },
-          TemplateElement(node) {
-            if (COLOR_LITERAL.test(node.value.raw.trim())) {
+            if (typeof node.value === 'string' && COLOR_LITERAL.test(node.value)) {
               context.report({ node, messageId: 'forbidden' });
             }
           },
-          TemplateLiteral(node) {
-            reportStaticColor(node);
-          },
-          BinaryExpression(node) {
-            if (node.operator === '+') reportStaticColor(node);
+          TemplateElement(node) {
+            if (COLOR_LITERAL.test(node.value.raw)) {
+              context.report({ node, messageId: 'forbidden' });
+            }
           },
         };
       },
@@ -183,85 +126,13 @@ const governancePlugin = {
         messages: { forbidden: NATIVE_ELEMENT_MESSAGE },
       },
       create(context) {
-        const sourceCode = context.sourceCode;
         const nativeVideoWrapper = context.filename.replaceAll('\\', '/').endsWith('/src/ui/video.tsx');
-        const staticPropertyName = (node) => {
-          if (!node.computed && node.property.type === 'Identifier') return node.property.name;
-          if (node.computed && node.property.type === 'Literal') return node.property.value;
-          return undefined;
-        };
-        const findVariable = (node, name) => {
-          let scope = sourceCode.getScope(node);
-          while (scope) {
-            const variable = scope.set.get(name);
-            if (variable) return variable;
-            scope = scope.upper;
-          }
-          return undefined;
-        };
-        const isReactReference = (node, seen = new Set()) => {
-          if (node?.type !== 'Identifier') return false;
-          const variable = findVariable(node, node.name);
-          if (!variable || seen.has(variable)) return false;
-          const importDefinition = variable.defs.find((definition) => (
-            definition.type === 'ImportBinding'
-            && (definition.node.type === 'ImportDefaultSpecifier'
-              || definition.node.type === 'ImportNamespaceSpecifier')
-            && definition.parent.source.value === 'react'
-          ));
-          if (importDefinition) return true;
-          const variableDefinition = variable.defs.find((definition) => definition.type === 'Variable');
-          if (!variableDefinition
-              || variableDefinition.node.id.type !== 'Identifier'
-              || !variableDefinition.node.init) {
-            return false;
-          }
-          const nextSeen = new Set(seen);
-          nextSeen.add(variable);
-          return isReactReference(variableDefinition.node.init, nextSeen);
-        };
-        const destructuresCreateElement = (declarator, localName) => declarator.id.type === 'ObjectPattern'
-          && isReactReference(declarator.init)
-          && declarator.id.properties.some((property) => property.type === 'Property'
-            && ((property.key.type === 'Identifier' && property.key.name === 'createElement')
-              || (property.key.type === 'Literal' && property.key.value === 'createElement'))
-            && ((property.value.type === 'Identifier' && property.value.name === localName)
-              || (property.value.type === 'AssignmentPattern'
-                && property.value.left.type === 'Identifier'
-                && property.value.left.name === localName)));
-        const isCreateElementReference = (node, seen = new Set()) => {
-          if (node.type === 'MemberExpression') return staticPropertyName(node) === 'createElement';
-          if (node.type !== 'Identifier') return false;
-          if (node.name === 'createElement') return true;
-          const variable = findVariable(node, node.name);
-          if (!variable || seen.has(variable)) return false;
-          const importAlias = variable.defs.some((definition) => definition.type === 'ImportBinding'
-            && definition.node.type === 'ImportSpecifier'
-            && definition.node.imported.type === 'Identifier'
-            && definition.node.imported.name === 'createElement'
-            && definition.parent.source.value === 'react');
-          if (importAlias) return true;
-          const variableDefinition = variable.defs.find((definition) => definition.type === 'Variable');
-          if (!variableDefinition) return false;
-          if (destructuresCreateElement(variableDefinition.node, node.name)) return true;
-          if (variableDefinition.node.id.type !== 'Identifier' || !variableDefinition.node.init) {
-            return false;
-          }
-          const nextSeen = new Set(seen);
-          nextSeen.add(variable);
-          return isCreateElementReference(variableDefinition.node.init, nextSeen);
-        };
         return {
           JSXOpeningElement(node) {
             const name = node.name.type === 'JSXIdentifier' ? node.name.name : undefined;
             if (name
                 && RESTRICTED_NATIVE_ELEMENTS.has(name)
                 && !(nativeVideoWrapper && name === 'video')) {
-              context.report({ node, messageId: 'forbidden' });
-            }
-          },
-          CallExpression(node) {
-            if (isCreateElementReference(node.callee)) {
               context.report({ node, messageId: 'forbidden' });
             }
           },
