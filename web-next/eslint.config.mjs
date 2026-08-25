@@ -5,6 +5,7 @@ import tseslint from 'typescript-eslint';
 
 const UI_FACADE_MESSAGE = 'Import UI components from src/ui/antd instead.';
 const NATIVE_ELEMENT_MESSAGE = 'Use the UI facade instead of native visual elements.';
+const DOM_FACTORY_MESSAGE = 'DOM element factory access is forbidden; use the UI facade.';
 const COLOR_LITERAL = /(?:#|(?:rgb|hsl|hwb|lab|lch|oklab|oklch|color)\s*\()/iu;
 const RESTRICTED_NATIVE_ELEMENTS = new Set([
   'audio',
@@ -37,6 +38,8 @@ const governancePlugin = {
         },
       },
       create(context) {
+        const isJsxRuntimeSource = (value) => typeof value === 'string'
+          && /^react\/jsx(?:-dev)?-runtime(?:\/|$)/u.test(value);
         const reportRestrictedSource = (node, value) => {
           if (typeof value === 'string'
               && /^(?:antd|@ant-design\/x|@ant-design\/icons)(?:\/|$)/u.test(value)) {
@@ -55,6 +58,9 @@ const governancePlugin = {
         return {
           ImportDeclaration(node) {
             reportRestrictedSource(node.source, node.source.value);
+            if (isJsxRuntimeSource(node.source.value)) {
+              context.report({ node: node.source, messageId: 'reactFactory' });
+            }
             if (node.source.value === 'react') {
               for (const specifier of node.specifiers) {
                 const importsElementFactory = specifier.type === 'ImportDefaultSpecifier'
@@ -66,6 +72,17 @@ const governancePlugin = {
                   context.report({ node: specifier, messageId: 'reactFactory' });
                 }
               }
+            }
+          },
+          ExportNamedDeclaration(node) {
+            if (node.source
+                && (node.source.value === 'react' || isJsxRuntimeSource(node.source.value))) {
+              context.report({ node: node.source, messageId: 'reactFactory' });
+            }
+          },
+          ExportAllDeclaration(node) {
+            if (node.source.value === 'react' || isJsxRuntimeSource(node.source.value)) {
+              context.report({ node: node.source, messageId: 'reactFactory' });
             }
           },
           ImportExpression(node) {
@@ -199,6 +216,34 @@ export default tseslint.config(
     ignores: ['src/**/*.test.{ts,tsx}'],
     rules: {
       'governance/no-native-visual-elements': 'error',
+      'no-restricted-properties': [
+        'error',
+        { object: 'document', property: 'createElement', message: DOM_FACTORY_MESSAGE },
+        { object: 'window', property: 'document', message: DOM_FACTORY_MESSAGE },
+        { object: 'globalThis', property: 'document', message: DOM_FACTORY_MESSAGE },
+      ],
+    },
+  },
+  {
+    files: ['src/**/*.{ts,tsx}'],
+    ignores: ['src/**/*.test.{ts,tsx}', 'src/main.tsx'],
+    rules: {
+      'no-restricted-globals': [
+        'error',
+        { name: 'document', message: DOM_FACTORY_MESSAGE },
+      ],
+    },
+  },
+  {
+    files: ['src/main.tsx'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "Identifier[name='document']:not(MemberExpression[object.name='document'][property.name='getElementById'] > Identifier.object)",
+          message: 'Only document.getElementById is allowed in the production entrypoint.',
+        },
+      ],
     },
   },
   {

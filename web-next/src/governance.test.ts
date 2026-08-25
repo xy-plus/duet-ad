@@ -111,6 +111,25 @@ describe('UI foundation contract', () => {
     expect(messages).toContainEqual(expect.stringContaining('named React hooks/types'));
   });
 
+  it('rejects React element factory re-exports', async () => {
+    const messages = await lintBusinessSource(
+      "export { createElement as h } from 'react';",
+    );
+
+    expect(messages).toContainEqual(expect.stringContaining('named React hooks/types'));
+  });
+
+  it.each([
+    "import { jsx as h } from 'react/jsx-runtime'; export { h };",
+    "import { jsxDEV as h } from 'react/jsx-dev-runtime'; export { h };",
+    "export { jsx as h } from 'react/jsx-runtime';",
+    "export { jsxDEV as h } from 'react/jsx-dev-runtime';",
+  ])('rejects direct jsx runtime imports and re-exports', async (source) => {
+    const messages = await lintBusinessSource(source);
+
+    expect(messages).toContainEqual(expect.stringContaining('named React hooks/types'));
+  });
+
   it.each(['button', 'form', 'input', 'select', 'textarea', 'img', 'svg', 'video'])(
     'rejects native <%s> from business source',
     async (element) => {
@@ -174,6 +193,26 @@ describe('UI foundation contract', () => {
   it('allows an unrelated local function named createElement', async () => {
     const messages = await lintBusinessSource(
       "const createElement = (value: string) => value; export const safe = createElement('safe');",
+    );
+
+    expect(messages).toEqual([]);
+  });
+
+  it.each([
+    "export const bad = document.createElement('button');",
+    "const dom = window.document; export const bad = dom.createElement('button');",
+    "const dom = globalThis.document; export const bad = dom.createElement('button');",
+    "const dom = document; export const bad = dom.createElement('button');",
+  ])('rejects DOM element factory access from business source', async (source) => {
+    const messages = await lintBusinessSource(source);
+
+    expect(messages).toContainEqual(expect.stringContaining('DOM element factory'));
+  });
+
+  it('allows only the root lookup document access in the production entrypoint', async () => {
+    const messages = await lintBusinessSource(
+      "export const root = document.getElementById('root');",
+      'src/main.tsx',
     );
 
     expect(messages).toEqual([]);
@@ -299,6 +338,14 @@ describe('UI foundation contract', () => {
       expect(messages).toContainEqual(expect.stringContaining('drop-shadow'));
     },
   );
+
+  it('rejects case-variant drop-shadow functions', async () => {
+    const messages = await lintStyles(
+      '.feature { --feature-shadow: DrOp-ShAdOw(0 1px 2px var(--ant-color-text)); }',
+    );
+
+    expect(messages).toContainEqual(expect.stringContaining('DrOp-ShAdOw'));
+  });
 
   it('rejects inline Stylelint disable directives', async () => {
     const messages = await lintStyles(
