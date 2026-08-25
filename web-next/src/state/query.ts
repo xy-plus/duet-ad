@@ -148,6 +148,7 @@ export function useConversationDetailQuery(api: ApiClient, id: string | null) {
   const options = conversationDetailQueryOptions({
     sessionKey,
     getConversation: api.getConversation.bind(api),
+    isSubmissionReconciling: (conversationId) => api.isSubmissionReconciling(conversationId),
   }, conversationId);
   const query = useQuery({ ...options, enabled: api.hasToken && Boolean(id) });
 
