@@ -136,7 +136,7 @@ npm run test:e2e
 ```
 
 - `npm run check` = TypeScript + ESLint + Stylelint + 全部 Vitest + production build。
-- Vitest 的 AntD/JSDOM 用例统一使用 10 秒单测预算；测试文件不得自行放宽。这个预算只解决并行渲染成本，不替代行为等待和 Playwright 浏览器契约。
+- Vitest 的 AntD/JSDOM 用例统一使用 10 秒单测预算；ESLint AST 规则拒绝 `it/test/it.each` 的数字超时参数和 `{ timeout }` 选项。这个预算只解决并行渲染成本，不替代行为等待和 Playwright 浏览器契约。
 - `npm run test:e2e` 启动本机 Vite `127.0.0.1:4173`，Chromium 拦截 `/api` 验证真实浏览器交互，并核对 desktop/mobile screenshot。它不是线上 API E2E。
 - `npm run dev` 不代理真实 `/api`；`npm run preview` 也只供本地静态检查。
 - 生产发布只使用构建后的 `web-next/dist` 和同一个 Caddy unit：3213 `/api/*` 反代 3212，其余路径 file server + SPA fallback；HTML/no-route `no-store`，hash asset `public,max-age=31536000,immutable`。

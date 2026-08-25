@@ -36,16 +36,30 @@ describe('UI foundation contract', () => {
     expect(instructions).toContain('npm run check');
   });
 
-  it('centralizes the AntD JSDOM test budget instead of hiding slow tests locally', () => {
+  it('centralizes the AntD JSDOM test budget', () => {
     const viteConfig = readFileSync(resolve(projectRoot, 'vite.config.ts'), 'utf8');
-    const testFiles = readdirSync(resolve(projectRoot, 'src'), { recursive: true })
-      .map(String)
-      .filter((file) => /\.test\.[cm]?[jt]sx?$/u.test(file) && file !== 'governance.test.ts');
 
     expect(viteConfig).toContain('testTimeout: 10_000');
-    expect(testFiles.filter((file) => (
-      readFileSync(resolve(projectRoot, 'src', file), 'utf8').includes('}, 10_000);')
-    ))).toEqual([]);
+  });
+
+  it.each([
+    "it('slow', () => undefined, 20_000);",
+    "test('slow', () => undefined, 10000);",
+    "it('slow', { timeout: 20_000 }, () => undefined);",
+    "it.each([['case']])('slow %s', () => undefined, 20_000);",
+  ])('rejects local Vitest timeout syntax regardless of formatting', async (source) => {
+    const messages = await lintBusinessSource(source, 'src/example.test.ts');
+
+    expect(messages).toContainEqual(expect.stringContaining('centralized Vitest timeout'));
+  });
+
+  it('allows numeric table data when no local timeout is declared', async () => {
+    const messages = await lintBusinessSource(
+      "it.each([[1, 2]])('adds numbers', () => undefined);",
+      'src/example.test.ts',
+    );
+
+    expect(messages).toEqual([]);
   });
 
   it('provides one component facade and one token/provider module', () => {

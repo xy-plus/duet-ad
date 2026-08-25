@@ -27,6 +27,43 @@ const RESTRICTED_NATIVE_ELEMENTS = new Set([
 
 const governancePlugin = {
   rules: {
+    'no-local-test-timeouts': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          forbidden: 'Use the centralized Vitest timeout; local test timeouts are forbidden.',
+        },
+      },
+      create(context) {
+        const rootCalleeName = (node) => {
+          if (node.type === 'Identifier') return node.name;
+          if (node.type === 'MemberExpression') return rootCalleeName(node.object);
+          if (node.type === 'CallExpression') return rootCalleeName(node.callee);
+          return undefined;
+        };
+        const isTimeoutOption = (node) => node.type === 'ObjectExpression'
+          && node.properties.some((property) => property.type === 'Property'
+            && ((property.key.type === 'Identifier' && property.key.name === 'timeout')
+              || (property.key.type === 'Literal' && property.key.value === 'timeout')));
+
+        return {
+          CallExpression(node) {
+            if (!['it', 'test'].includes(rootCalleeName(node.callee))) return;
+            const declaresTest = node.arguments.some((argument) => (
+              argument.type === 'ArrowFunctionExpression' || argument.type === 'FunctionExpression'
+            ));
+            if (!declaresTest) return;
+            for (const argument of node.arguments) {
+              if ((argument.type === 'Literal' && typeof argument.value === 'number')
+                  || isTimeoutOption(argument)) {
+                context.report({ node: argument, messageId: 'forbidden' });
+              }
+            }
+          },
+        };
+      },
+    },
     'no-direct-ui-imports': {
       meta: {
         type: 'problem',
@@ -176,6 +213,13 @@ export default tseslint.config(
       ...jsxA11y.flatConfigs.recommended.rules,
     },
     linterOptions: { noInlineConfig: true },
+  },
+  {
+    files: ['src/**/*.test.{ts,tsx}'],
+    plugins: { governance: governancePlugin },
+    rules: {
+      'governance/no-local-test-timeouts': 'error',
+    },
   },
   {
     files: ['src/**/*.{ts,tsx}'],
