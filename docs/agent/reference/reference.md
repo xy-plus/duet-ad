@@ -104,7 +104,17 @@ multipart 只允许表中字段及 `file`，未知或重复字段返回 422 `inv
   "has_video": false,
   "submit_enabled": true,
   "postprocess": null,
-  "postprocess_enabled": false
+  "postprocess_capabilities": {
+    "remove_subtitle": true,
+    "remove_brand": true,
+    "optimize_image": true
+  },
+  "postprocess_enabled": true,
+  "image_optimization_prompt": {
+    "text": "...",
+    "default_text": "...",
+    "sha256": "64-hex"
+  }
 }
 ```
 
@@ -247,21 +257,49 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 `submission_unknown` 是唯一完全锁死状态：前端隐藏操作，服务端对任何 id 返回 409，必须先在 AutoDL 侧核对原 POST 是否已创建任务。
 
+### `PATCH /api/conversations/{cid}/image-optimization-prompt`
+
+严格请求：
+
+```json
+{
+  "confirm": true,
+  "segment_index": 0,
+  "expected_sha256": "64-hex",
+  "prompt": "本段全部关键帧共享的图片优化提示词"
+}
+```
+
+短视频只能使用逻辑段 `0`；长视频使用连续正整数段 `1..N`。接口只允许 schema v2 分析已完成且 generation/postprocess 都尚未创建时调用，以 `expected_sha256` CAS 保存；未知字段、空白或超过 32 KiB 的提示词、非法段号在写入前拒绝。摘要漂移返回结构化 409 `image_optimization_prompt_changed`；输入已冻结返回 `image_optimization_prompt_frozen`。成功返回该段新的 `{text,default_text,sha256}`。恢复默认由客户端把 `default_text` 放入草稿，仍需调用本接口保存。
+
+项目在分析完成时已经冻结同一个 Seedream 模型、模式和模板，但这些内部字段不会出现在 detail。短视频在顶层返回 `image_optimization_prompt`；长视频把对应对象放入每个 `segments[]`。
+
 ### `POST /api/conversations/{cid}/postprocess`
 
-可选 MediaKit `erase-image` 后处理：
+可选三阶段关键帧后处理：
 
 ```json
 {
   "confirm": true,
   "options": {
     "remove_subtitle": true,
-    "remove_brand": false
+    "remove_brand": false,
+    "optimize_image": true
   }
 }
 ```
 
-顶层 key 必须恰为 `confirm/options`，未知或缺失返回 422 `invalid_postprocess_request`；至少一项为 true，未知 option 或非 bool 返回 422。已知旧页面 option `change_bg/face_hold` 返回纯文本中文刷新提示，不写状态、不调用供应商；若同时混入其他未知字段仍 fail closed。禁用返回 501，旧会话返回 409 `read_only`，输入未 done/正在运行返回 409；generation 已创建返回 409 `generation_already_started`；重跑改变锁定选项返回结构化 409 `postprocess_options_locked` 和中文提示。接受后返回 `{"status":"running","frames":[]}`，detail 的 `postprocess` 轮询到 done/failed。生成提交在后处理完成前返回 409 `postprocess_not_ready`；完成后优化帧进入 H3 冻结输入。
+顶层 key 必须恰为 `confirm/options`，canonical options 必须恰为三个 bool；精确旧两字段请求兼容为 `optimize_image=false`，其余未知、缺失或非 bool 返回 422。至少一项为 true。已知旧页面 option `change_bg/face_hold` 返回纯文本中文刷新提示，不写状态、不调用供应商；若同时混入其他未知字段仍 fail closed。每项还必须由 detail 的 `postprocess_capabilities` 允许：文字和品牌能力取决于 MediaKit 开关，图片优化能力取决于 `ARK_API_KEY`。
+
+接受后冻结选项、每段提示词与后端模型/模式/模板，返回 `{"status":"running","frames":[]}`。短视频按段 0，长视频按 1..N 并行；段内严格执行已选的 `full_screen_text_erase → full_screen_icon_erase → Seedream` 阶段屏障，帧请求受 MediaKit/Seedream 独立并发上限控制。图片模式为 `anchor_consistency` 时先用本段全部清理帧生成第一张锚帧，再并行处理剩余帧；`independent_parallel` 则每帧独立并行。供应商返回图统一转为源图精确尺寸 PNG，整段完成后才原子发布同名 canonical 文件。
+
+detail 的 `postprocess` 为 `{status,options,frames,segments,error}`；每段只公开 `{index,status,stage,completed_frames,total_frames,revision,error}`。任一段失败不取消其他段，但整体为 failed，生成返回 409 `postprocess_not_ready`；全部完成后优化帧进入 H3 冻结输入。禁用返回 501，旧会话返回 409 `read_only`，输入未 done/正在运行返回 409；generation 已创建返回 409 `generation_already_started`；重跑改变冻结选项返回结构化 409 `postprocess_options_locked`。
+
+### `POST /api/conversations/{cid}/postprocess/segments/{index}/retry`
+
+请求 key 必须恰为 `{"confirm":true,"expected_revision":N}`，仅允许重试当前 failed 段；revision 漂移返回结构化 409 `postprocess_revision_changed`。服务复用项目冻结的选项、提示词、模型、模式和已完成本地产物，不接受客户端覆盖。`submission_unknown` 同样必须由用户明确确认潜在重复计费后人工调用；旧 revision 的 attempt 保留，启动恢复不会替用户调用该接口。
+
+Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。自动重试硬上限为总计 3 次，并且只认完整 HTTP 429、精确 `QuotaExceeded`、响应无 `data`；网络、超时、取消及其他不明结果写为 `submission_unknown` 且不自动重发。确定性 4xx/协议错误不重试；成功响应 bytes 已落盘时，恢复只做本地 PNG 发布。
 
 `/`、`/index.html`、`/app.js`、`/styles.css` 的 GET/HEAD 响应（含条件请求的 304）均带 `Cache-Control: no-store`，避免 HTML、脚本和样式跨版本组合。
 
@@ -300,7 +338,9 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | `frozen_plan_receipt` | 长链首次提交确认的 plan SHA-256 |
 | `fit_mode` | `none/crop/pad`；随冻结画幅解释 |
 | `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含冻结 boolean `fast_mode`、内部 `segments` 与 `fit_layout`，failed 时公开 `retry_paid_segment_count`，status 含 resume_required；历史缺 fast_mode 等价 false |
-| `postprocess` | `{status,options,frames,error}`；存在时生成必须等待 done，并使用完整优化帧集合 |
+| `_image_optimization` | 私有项目冻结 receipt：同一模型/模式/模板及每段 default/current/SHA；只投影用户可编辑的提示词字段 |
+| `_postprocess_receipt` | 私有执行 receipt：冻结三选项与图片优化设置，不进入公开 detail |
+| `postprocess` | `{status,options,frames,segments,error}`；存在时生成必须等待全部段 done，并使用完整优化帧集合 |
 
 `≤15s` 的新 schema v2 使用顶层 keyframes/prompt；`>15s` 使用 `segments` 与 `long_video_plan.json`，每段独立工作目录和生成状态。历史 11–15 秒长链仍按已冻结计划恢复，两种契约不能互相降级或混用 receipt。
 
@@ -405,7 +445,9 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 - `app.long_video.plan_segments/write_plan_receipt` — 安全边界规划与 canonical plan 落盘。
 - `app.long_generation.freeze_plan/run` — fail-closed 冻结、默认最多两链编排、可选快速 fan-out 和分段恢复。
 - `app.stitch.stitch_video` — 本地确定性归一化、音轨选择、拼接与 receipt。
-- `app.postprocess.start/run_task/generation_keyframes` — 编辑、完整性门控并解析 H3 唯一可用的优化帧集合。
+- `app.image_optimization.freeze_prompts/replace/public_prompts` — 冻结每段共享提示词并执行 SHA CAS，只公开安全投影。
+- `app.seedream.edit` — 一输出图片编辑、精确尺寸 PNG、持久 attempt 与结果未知门控。
+- `app.postprocess.start/run_task/retry_segment/generation_keyframes/recover_running` — 三阶段分段编排、定向重试、启动恢复与 H3 完整性门控。
 
 ## 配置
 
@@ -435,6 +477,12 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `VOLC_MEDIAKIT_API_KEY` | 空 | AI MediaKit Bearer 凭据，不进入公开 API/meta/日志 |
 | `MEDIAKIT_CONCURRENCY` | `4` | 帧级并发，最小钳制为 1 |
 | `MEDIAKIT_TIMEOUT_S` | `180` | 上传、擦除和结果下载请求超时 |
+| `ARK_API_KEY` | 空 | 火山方舟 Seedream Bearer 凭据；留空关闭图片优化 capability，不进入 Settings repr、公开 API/meta/日志 |
+| `SEEDREAM_MODEL` | `doubao-seedream-5-0-260128` | 项目级图片模型；allowlist 另含 `doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828` |
+| `SEEDREAM_EDIT_MODE` | `anchor_consistency` | `anchor_consistency` 或 `independent_parallel`；按项目冻结，不暴露前端 |
+| `SEEDREAM_PROMPT_TEMPLATE` | `balanced` | `light/balanced/strong`；生成项目默认提示词时冻结 |
+| `SEEDREAM_CONCURRENCY` | `4` | Seedream 帧级进程内并发上限，必须为正整数 |
+| `SEEDREAM_TIMEOUT_S` | `180` | 单次 Seedream POST 超时秒数，必须为正有限数 |
 | `TIKTOK_PROXY` | 空 | TikTok/DoH 下载代理 |
 | `DOWNLOAD_TIMEOUT_S` | `120` | URL 下载整体时限 |
 | `HOST` / `PORT` | `0.0.0.0` / `3211` | `run.sh` 默认；生产 unit 必须覆盖为 `127.0.0.1/3212` |
@@ -445,5 +493,5 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 
 - Python：FastAPI、uvicorn、httpx、OpenCV、ai-edge-litert 等（以 `requirements.txt` 为准）。
 - 可执行：`ffmpeg`、`ffprobe`、已认证的 `codex` CLI。
-- 外部服务：AutoDL Art H3；可选 AI MediaKit 图像擦除。
+- 外部服务：AutoDL Art H3；可选 AI MediaKit 图像擦除与火山方舟 Seedream 图片编辑。
 - 运行约束：Linux `flock/fsync` 语义、单 uvicorn 进程、Caddy 本机反代。

@@ -144,6 +144,14 @@ VOLC_MEDIAKIT_API_KEY=
 MEDIAKIT_CONCURRENCY=4
 MEDIAKIT_TIMEOUT_S=180
 
+# Seedream 图片优化；ARK_API_KEY 留空即关闭该 capability
+ARK_API_KEY=
+SEEDREAM_MODEL=doubao-seedream-5-0-260128
+SEEDREAM_EDIT_MODE=anchor_consistency
+SEEDREAM_PROMPT_TEMPLATE=balanced
+SEEDREAM_CONCURRENCY=4
+SEEDREAM_TIMEOUT_S=180
+
 TIKTOK_PROXY=
 DOWNLOAD_TIMEOUT_S=120
 ```
@@ -183,7 +191,7 @@ systemctl --user is-active duet-ad1.service
 journalctl --user -u duet-ad1.service --since '-2 minutes' --no-pager
 ```
 
-服务必须是单进程；不要给 uvicorn 增加 `--workers`。重启时 schema v2 generation 默认只执行 GET-only resume；唯一补发供应商 POST 的例外是完整确认的 `h3_provider_failed` 仍有自动额度，或该失败后已落盘的 ready 自动 attempt。
+服务必须是单进程；不要给 uvicorn 增加 `--workers`。Seedream 的模型仅允许 `doubao-seedream-5-0-260128`（默认 5.0 Lite）、`doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828`；模式仅允许 `anchor_consistency|independent_parallel`，模板仅允许 `light|balanced|strong`，非法值会阻止服务启动。重启时 schema v2 generation 默认只执行 GET-only resume；唯一补发 H3 POST 的例外是完整确认的 `h3_provider_failed` 仍有自动额度，或该失败后已落盘的 ready 自动 attempt。后处理只恢复本地可证明安全的工作；Seedream `submitting/submission_unknown` 会标记失败并等待人工分段确认，绝不自动 POST。
 
 ## 5. 3213 静态前端与同一 Caddy unit 发布
 
@@ -368,3 +376,5 @@ done
 5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；完整确认的 `h3_provider_failed` 先等待服务按额度自动收敛，额度耗尽后才点“重试生成”并使用新 id。其他 H3 确定失败仍按人工新 id 处理，并以 detail API 的 `generation.retry_paid_segment_count` 为本次新增付费任务数。长链 `failed + stage=stitch` 点“重试拼接”，必须用原 id，只本地重拼且新增付费 H3 子任务为 0；半发布成片不会隐藏恢复入口。`submission_unknown` 不得继续或重试，先到 AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
 
 禁止以 Seedance 代码、旧 unit 或旧提交开关回退；它们不再属于生产契约。若 H3 仍不可用，保持服务可读、关闭 `ENABLE_H3_SUBMIT`，修复后再开启。
+
+图片后处理失败时还要保留 `work/.postprocess-private/` 与各段 `postprocessed/`；前者包含 Seedream/MediaKit 的 attempt 证据，后者只在整段完成后原子发布。`submission_unknown` 段不得靠重启或重复提交自动重发；若人工确认重试，必须在页面确认潜在重复计费并使用当前 `expected_revision`。不要打印 `service.env`、供应商响应或私有回执。

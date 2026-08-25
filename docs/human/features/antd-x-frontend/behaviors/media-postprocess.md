@@ -3,7 +3,7 @@ name: media-postprocess
 type: behavior
 status: done
 owner: human
-updated: 2026-08-25
+updated: 2026-08-26
 tdd: N/A
 links: [antd-x-frontend]
 ---
@@ -31,7 +31,7 @@ links: [antd-x-frontend]
 ## 边界
 
 - 唯一原生视觉控件是 `src/ui/video.tsx` 封装的 `<video controls>`；它只接收已认证 Blob URL。
-- 后处理图片永远不是 H3 输入，前端不提供把它们回灌生成的入口。
+- 后处理完整成功后，服务端自动把同名 `postprocessed/` 图片冻结为 H3 输入；前端不提供手工回灌或绕过完整性门控的入口。
 - 已锁定选项不可改；整体恢复沿用服务端冻结值，分段重试只提交服务端 revision。
 - 页面不展示图片优化供应商模型、模板 ID 或执行模式。
 - `postprocess_enabled=false`、只读会话或已有后处理记录时不显示新的配置入口。
