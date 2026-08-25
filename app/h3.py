@@ -180,7 +180,10 @@ class H3Request:
             raise H3Error("invalid_client_request_id")
         if not isinstance(self.prompt, str) or not self.prompt.strip():
             raise H3Error("invalid_prompt")
-        if not self.prompt.startswith(_H3_NO_SUBTITLES_PREFIX):
+        if (
+            self.prompt != _H3_NO_SUBTITLES_PREFIX
+            and not self.prompt.startswith(f"{_H3_NO_SUBTITLES_PREFIX}\n")
+        ):
             object.__setattr__(
                 self,
                 "prompt",
