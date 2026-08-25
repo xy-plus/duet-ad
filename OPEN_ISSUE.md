@@ -8,8 +8,6 @@
 
 ## 🚧 进行中
 
-- 使用 Ant Design / Ant Design X 重构完整前端，保留现有 API、付费恢复契约和旧 `web/`，并在 HTTPS 3213 与旧 UI 共享同一 3212 后端。（→ `docs/human/features/antd-x-frontend/`）
-
 ## 📌 待办与限制
 
 - 自动补交依赖 append-only attempt ledger；若带外删除最后一个已落盘 receipt，无独立高水位可识别。该磁盘状态破坏场景按要求不扩展实现。（→ `app/h3.py:_validated_attempt_ledger`）

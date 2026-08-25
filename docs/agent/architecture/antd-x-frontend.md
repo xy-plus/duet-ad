@@ -1,7 +1,7 @@
 ---
 name: antd-x-frontend
 type: architecture
-status: building
+status: done
 owner: agent
 updated: 2026-08-25
 tdd: N/A
@@ -12,7 +12,7 @@ links: [antd-x-frontend]
 
 ## 状态与运行边界
 
-当前候选分支已集成 `web-next`、双入口 Caddy 候选配置和自动化测试，但仓库实现不证明线上 3213 已生效。本架构在生产只读 smoke 完成前保持 `building`。
+`web-next`、双入口 Caddy 配置和自动化测试已集成；生产 3213 已通过本机与公网只读 smoke，并由现有 Caddy unit 提供服务。
 
 ```mermaid
 flowchart LR
@@ -74,7 +74,7 @@ flowchart LR
 
 ## 对外接口
 
-- 浏览器入口：候选 `https://<host>:3213/`；SPA 不使用 React Router，当前页面选择保存在 App 内存。
+- 浏览器入口：`https://8.166.140.227:3213/`；SPA 不使用 React Router，当前页面选择保存在 App 内存。
 - 后端入口：只使用同源相对 `/api`；完整清单见 [web-next reference](../reference/web-next.md)。
 - 现有后端 schema、receipt 与付费状态机不变，见 [后端 reference](../reference/reference.md)。
 - 发布与回滚只执行 [.deploy/runbook.md](../../../.deploy/runbook.md) 的 3213 合同；`vite dev/preview` 均不是生产入口。

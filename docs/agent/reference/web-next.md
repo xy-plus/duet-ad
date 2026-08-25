@@ -1,7 +1,7 @@
 ---
 name: web-next
 type: reference
-status: building
+status: done
 owner: agent
 updated: 2026-08-25
 tdd: N/A
@@ -125,4 +125,4 @@ npm run test:e2e
 - 生产发布只使用构建后的 `web-next/dist` 和同一个 Caddy unit：3213 `/api/*` 反代 3212，其余路径 file server + SPA fallback；HTML/no-route `no-store`，hash asset `public,max-age=31536000,immutable`。
 - 发布验证必须包含后端全量测试、`tests/test_caddy_dual_frontend.py`、Caddy validate、构建产物检查及 [.deploy/runbook.md](../../../.deploy/runbook.md) 第 6 节 GET/HEAD smoke。
 - 3213 smoke 禁止 POST/PUT/PATCH/DELETE、创建会话或运行付费 H3 smoke。真实付费验收必须另行授权。
-- 仓库候选配置、监听 socket 或本机 200 都不能单独证明公网发布；线上只读 smoke 通过后才把相关文档 `status` 改为 `done`。
+- 生产发布必须同时验证候选配置、监听 socket、本机 API/静态资源与公网 HTTPS；当前 3213 已完成这些只读 smoke，相关文档状态为 `done`。

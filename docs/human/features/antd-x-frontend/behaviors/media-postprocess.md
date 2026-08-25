@@ -1,7 +1,7 @@
 ---
 name: media-postprocess
 type: behavior
-status: building
+status: done
 owner: human
 updated: 2026-08-25
 tdd: N/A
