@@ -125,4 +125,10 @@ describe('UI foundation contract', () => {
 
     expect(messages).toEqual([]);
   });
+
+  it('rejects raw spacing values from feature CSS', async () => {
+    const messages = await lintStyles('.feature { padding: 13px; gap: 1rem; }');
+
+    expect(messages).toContainEqual(expect.stringContaining('Token'));
+  });
 });

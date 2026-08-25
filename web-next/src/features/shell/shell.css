@@ -1,7 +1,7 @@
 .login-view {
   display: grid;
   min-height: 100dvh;
-  padding: 24px;
+  padding: var(--ant-padding-lg);
   place-items: center;
 }
 
@@ -10,15 +10,15 @@
 }
 
 .login-view__heading {
-  margin-block-end: 24px;
+  margin-block-end: var(--ant-margin-lg);
 }
 
 .login-view__title {
-  margin-block-end: 4px;
+  margin-block-end: var(--ant-margin-xxs);
 }
 
 .login-view__alert {
-  margin-block-end: 20px;
+  margin-block-end: var(--ant-margin-lg);
 }
 
 .workspace-shell {
@@ -40,7 +40,7 @@
   align-items: center;
   justify-content: space-between;
   min-height: 64px;
-  padding-inline: 20px;
+  padding-inline: var(--ant-padding-lg);
 }
 
 .workspace-shell__title {
@@ -58,26 +58,26 @@
   display: flex;
   height: 100%;
   min-height: 0;
-  padding: 16px 12px 12px;
+  padding: var(--ant-padding) var(--ant-padding-sm) var(--ant-padding-sm);
   flex-direction: column;
 }
 
 .conversation-sidebar__brand {
   min-height: 40px;
-  padding-inline: 12px;
+  padding-inline: var(--ant-padding-sm);
 }
 
 .conversation-sidebar__conversations {
   flex: 1;
   min-height: 0;
-  margin-block-start: 12px;
+  margin-block-start: var(--ant-margin-sm);
   overflow: auto;
 }
 
 .conversation-sidebar__item-label {
   display: flex;
   min-width: 0;
-  gap: 2px;
+  gap: var(--ant-margin-xxs);
   flex-direction: column;
 }
 
@@ -92,6 +92,6 @@
 
 @media (max-width: 767px) {
   .workspace-shell__header {
-    padding-inline: 12px;
+    padding-inline: var(--ant-padding-sm);
   }
 }
