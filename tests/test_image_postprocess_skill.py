@@ -120,7 +120,7 @@ def test_skill_keeps_hard_to_abuse_input_output_and_prompt_boundaries():
 
     assert "人物除脸外、服装、手、玩具、商品" in skill
     assert "每段所有关键帧共享一份可直接提交给 Seedream 的提示词" in skill
-    assert "第一句只写唯一替换目标" in skill
+    assert "第一句只聚焦唯一替换目标及其原位条件" in skill
     assert "第二句写完整保护" in skill
     assert "保持简洁，但不得为缩短删除安全关系" in skill
     assert "禁止全景复述、画质美化或物体清单" in skill
@@ -133,8 +133,11 @@ def test_skill_keeps_hard_to_abuse_input_output_and_prompt_boundaries():
     assert "`anchor_consistency` 必须限制其他图的角色" in skill
     assert "其他图只提供目标设计" in skill
 
+    assert "任何组件只要背景路线和人物路线都不能证明安全" in skill
+    assert "输出两句不改动提示词，不建立 `global_elements`" in skill
+    assert "无人、人物不清晰且无稳定安全背景表面" in skill
     assert "高风险组件找不到合格表面时放弃去重" in skill
-    assert "输出两句不改动提示词" in skill
+    assert "不得退到人物路线" in skill
 
 
 def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
