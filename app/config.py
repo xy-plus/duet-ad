@@ -30,7 +30,7 @@ class Settings:
     mediakit_concurrency: int = 4
     mediakit_timeout_s: float = 180.0
     seedream_model: str = SEEDREAM_PRO_MODEL
-    seedream_edit_mode: str = "anchor_consistency"
+    seedream_edit_mode: str = "independent_parallel"
     seedream_prompt_template: str = "balanced"
     seedream_concurrency: int = 4
     seedream_timeout_s: float = 300.0
@@ -120,7 +120,7 @@ def get_settings() -> Settings:
             "SEEDREAM_MODEL", SEEDREAM_PRO_MODEL
         ).strip(),
         seedream_edit_mode=os.environ.get(
-            "SEEDREAM_EDIT_MODE", "anchor_consistency"
+            "SEEDREAM_EDIT_MODE", "independent_parallel"
         ).strip(),
         seedream_prompt_template=os.environ.get(
             "SEEDREAM_PROMPT_TEMPLATE", "balanced"

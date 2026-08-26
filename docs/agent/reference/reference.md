@@ -437,7 +437,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `MEDIAKIT_TIMEOUT_S` | `180` | 上传、擦除和结果下载请求超时 |
 | `ARK_API_KEY` | 空 | Seedream 凭据，只从环境读取，不进入 Settings repr、公开 API/meta 或日志 |
 | `SEEDREAM_MODEL` | `doubao-seedream-5-0-pro-260628` | 闭集为 Pro、Lite、4.5、4.0；Pro payload 省略 `sequential_image_generation`，其余固定为 `disabled` |
-| `SEEDREAM_EDIT_MODE` | `anchor_consistency` | `anchor_consistency` 或 `independent_parallel`；项目开始时私有冻结 |
+| `SEEDREAM_EDIT_MODE` | `independent_parallel` | `independent_parallel` 或 `anchor_consistency`；项目开始时私有冻结，显式配置仍可选择 anchor |
 | `SEEDREAM_PROMPT_TEMPLATE` | `balanced` | `light`、`balanced` 或 `strong`；只影响新项目 |
 | `SEEDREAM_TIMEOUT_S` | `300` | 单次 Seedream 请求超时秒数；可显式覆盖为正有限值 |
 | `TIKTOK_PROXY` | 空 | TikTok/DoH 下载代理 |
