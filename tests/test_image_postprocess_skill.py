@@ -302,8 +302,6 @@ def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
 
     assert "默认只改变一种低频外观属性，优先色相" in background_rules
     assert "只有色相不能安全获得明显差异时，才单独选择明暗、光泽或粗糙度之一" in background_rules
-    assert "只改色相时，保持原亮度、光照、阴影、反射、纹理图案、纹理相位、缺陷、光泽和粗糙度" in background_rules
-    assert "不得附加均匀、哑光或任何新表面处理" in background_rules
     assert "完整保留表面局部物理坐标中的原纹理图案、纹理相位、缺陷、边界、几何、方向、世界尺度和接触几何" in background_rules
     assert "透视仅服从当前源图投影" in background_rules
     assert "方向、透视、世界尺度" not in background_rules
@@ -324,12 +322,33 @@ def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
 
     assert "`SCENE replacement` 不直接提交给 Seedream" not in skill
     assert "`SCENE replacement` 本身就是项目级替换短语" in skill
-    assert "目标表面描述 + 实际改变的一种低频属性" in skill
+    assert "只由实际改变的一种低频属性及其目标值组成" in skill
+    assert "目标表面描述属于 `source` 和段内局部边界，不得混入 `replacement`" in skill
     assert "`SCENE replacement` 和项目级替换短语只写实际改变的一个属性" in skill
     assert "不得列出未改变属性或多个候选" in skill
     assert "每个相关段实际 `prompt` 的第一句必须逐字包含同一短语" in background_rules
     assert "其余关系保护可按本段可见关系写" in background_rules
     assert "不得改动项目级替换短语" in background_rules
+
+
+def test_hue_only_replacement_is_plain_and_preserves_each_source_frame():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    background_rules = skill.split("### 背景路线", maxsplit=1)[1].split(
+        "### 人物路线", maxsplit=1
+    )[0]
+
+    assert "只改色相时" in background_rules
+    assert "只能由“只改变目标域色相为”与紧随其后的单一朴素色相组成" in background_rules
+    assert "首句最前面必须逐字写入该短语" in background_rules
+    assert "不得带强度、明暗、饱和度、对比度、材质、光泽或风格修饰" in background_rules
+    assert "“鲜明”“明亮”“深/浅”“柔和”“均匀”“哑光”" in background_rules
+    assert "明显差异只能由所选色相本身提供" in background_rules
+    assert "以当前源图为逐帧基准保持原明度、原饱和度或色度、原空间渐变与局部对比" in background_rules
+    assert "不得把不同帧统一成同一亮度或饱和度" in background_rules
+
+    assert "CIELAB" not in skill
+    assert "LCh" not in skill
+    assert "HSV" not in skill
 
 
 def test_replacement_identity_is_frozen_across_frames_and_reappearances():
@@ -454,6 +473,11 @@ def test_human_behavior_documents_generic_replacement_stability_contract():
     assert "仅该段严格输出两句无条件不改动提示词" in behavior
     assert "跨段同一替换身份本身无法证明" in behavior
     assert "逐段资格过滤不得扩大 no-op 范围" in behavior
+    assert "单一朴素色相" in behavior
+    assert "只改变目标域色相为" in behavior
+    assert "当前源图为逐帧基准" in behavior
+    assert "原明度、原饱和度或色度、原空间渐变与局部对比" in behavior
+    assert "不得把不同帧统一成同一亮度或饱和度" in behavior
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
