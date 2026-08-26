@@ -340,11 +340,23 @@ def test_hue_only_replacement_is_plain_and_preserves_each_source_frame():
     assert "只改色相时" in background_rules
     assert "只能由“只改变目标域色相为”与紧随其后的单一朴素色相组成" in background_rules
     assert "首句最前面必须逐字写入该短语" in background_rules
-    assert "不得带强度、明暗、饱和度、对比度、材质、光泽或风格修饰" in background_rules
-    assert "“鲜明”“明亮”“深/浅”“柔和”“均匀”“哑光”" in background_rules
+    assert "色相身份不得附加任何会改变深浅、浓淡、质感或风格的修饰" in background_rules
     assert "明显差异只能由所选色相本身提供" in background_rules
-    assert "以当前源图为逐帧基准保持原明度、原饱和度或色度、原空间渐变与局部对比" in background_rules
-    assert "不得把不同帧统一成同一亮度或饱和度" in background_rules
+    assert "除色相外，目标域保持当前源图的深浅、浓淡、渐变和局部层次不变" in background_rules
+    assert "整图中目标域之外的内容保持当前源图不变" in background_rules
+
+    for old_wording in (
+        "逐帧基准",
+        "原明度",
+        "原饱和度或色度",
+        "原空间渐变",
+        "局部对比",
+        "不得把不同帧统一成同一亮度或饱和度",
+    ):
+        assert old_wording not in skill
+
+    for modifier in ("鲜明", "明亮", "深/浅", "柔和", "均匀", "哑光"):
+        assert modifier not in background_rules
 
     assert "CIELAB" not in skill
     assert "LCh" not in skill
@@ -475,9 +487,12 @@ def test_human_behavior_documents_generic_replacement_stability_contract():
     assert "逐段资格过滤不得扩大 no-op 范围" in behavior
     assert "单一朴素色相" in behavior
     assert "只改变目标域色相为" in behavior
-    assert "当前源图为逐帧基准" in behavior
-    assert "原明度、原饱和度或色度、原空间渐变与局部对比" in behavior
-    assert "不得把不同帧统一成同一亮度或饱和度" in behavior
+    assert "目标域保持当前源图的深浅、浓淡、渐变和局部层次不变" in behavior
+    assert "整图中目标域之外的内容保持当前源图不变" in behavior
+    assert "逐帧基准" not in behavior
+    assert "原明度" not in behavior
+    assert "原饱和度或色度" not in behavior
+    assert "局部对比" not in behavior
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
