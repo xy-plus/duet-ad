@@ -106,19 +106,64 @@ def test_skill_is_single_project_level_prompt_compiler():
     assert "work/image_optimization.json" in skill
     assert "global_elements" in skill and "segment_prompts" in skill
     assert "真实提交给 Seedream" in skill
-    assert "当前图是唯一目标" in skill
-    assert "其他图只提供所选目标的身份或背景设计参考" in skill
     assert "不复述全部构图或叙事" in skill
     assert len(skill.encode("utf-8")) < 12 * 1024
     assert not Path("skills/image-continuity/SKILL.md").exists()
+
+
+def test_skill_freezes_project_decisions_before_deriving_prompts():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    steps = [
+        "1. 全项目识别重复实体与高风险关系",
+        "2. 对每个跨段相关组件只冻结一次 `person` 或 `scene` 策略",
+        "3. 完成全部 `global_elements`",
+        "4. 最后派生全部 `segment_prompts`",
+    ]
+
+    positions = [skill.index(step) for step in steps]
+    assert positions == sorted(positions)
+    assert "四步必须按顺序完成，不得交错" in skill
+    assert "任何段级选择不得覆盖项目策略" in skill
+
+
+def test_skill_global_elements_are_complete_closed_project_decisions():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "所有真正被替换且跨段重复的元素都必须进入" in skill
+    assert "只能使用 `PERSON`、`OUTFIT`、`SCENE`" in skill
+    assert "不得遗漏" in skill
+    assert "完整 `id` 字典序" in skill
+
+
+def test_skill_uses_hard_two_level_priority_without_tradeoffs():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    first = skill.index("一级是最终视频连续性与现实合理性")
+    assert "任何扭曲、元素突变、物理或接触关系异常均一票否决" in skill
+    gate = skill.index("仅在通过一级后评价二级")
+    second = skill.index("人物或背景替换仅用于去重")
+    assert first < gate < second
+    assert "不得等权折中" in skill
+
+
+def test_skill_segment_prompts_are_exactly_two_sentences_and_at_most_140_chars():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "恰好两句" in skill
+    assert "Unicode 字符数不超过 140" in skill
+    assert "第一句只写唯一替换目标及冻结设计" in skill
+    assert "第二句只写本段最危险的一项关系和其余不变" in skill
+    assert "禁止画质增强、道具替换、构图叙事复述" in skill
+    assert "不超过 300 个字符" not in skill
+    assert "三部分语义" not in skill
 
 
 def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
     assert "Unicode 字符数" in skill
-    assert "不超过 300 个字符" in skill
-    assert "生成前自行计数" in skill
+    assert "不超过 140" in skill
+    assert "生成前计数" in skill
     assert "超长必须重写，不能截断" in skill
     assert "32KB" not in skill
 
@@ -137,13 +182,11 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "只点名目标帧中最容易误改的剧情核心物体和关系" in skill
     assert "画质、功能道具、玩具、商品、宠物不得作为差异化目标" in skill
 
-    assert "第一句先写唯一替换目标及具体新设计" in skill
-    assert "核心对象与关系保持" in skill
-    assert "简短禁止项和真实摄影要求" in skill
-    assert "当前图是唯一目标" in skill
-    assert "不能传递构图" in skill
+    assert "第一句只写唯一替换目标及冻结设计" in skill
+    assert "第二句只写本段最危险的一项关系和其余不变" in skill
+    assert "禁止画质增强、道具替换、构图叙事复述" in skill
 
-    assert "只有真正被替换且跨段重复的 PERSON、OUTFIT、SCENE" in skill
+    assert "所有真正被替换且跨段重复的元素都必须进入" in skill
     assert "PROP、PRODUCT、SUBJECT 不得建立新映射" in skill
     assert "相同替换描述必须跨段逐字复用" in skill
     assert "陀螺" not in skill and "发射器" not in skill
