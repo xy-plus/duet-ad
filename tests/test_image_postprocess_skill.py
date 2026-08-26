@@ -102,8 +102,41 @@ def test_skill_is_single_project_level_prompt_compiler():
     assert "work/image_optimization.json" in skill
     assert "global_elements" in skill and "segment_prompts" in skill
     assert "真实提交给 Seedream" in skill
-    assert len(skill.encode("utf-8")) < 12 * 1024
+    assert len(skill.encode("utf-8")) <= 8_281
     assert not Path("skills/image-continuity/SKILL.md").exists()
+
+
+def test_skill_keeps_hard_to_abuse_input_output_and_prompt_boundaries():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "本 Skill 只生成提示词，不编辑图片、不调用 Seedream" in skill
+    assert "不代表图片二次编辑一定执行、成功或被视频生成采用" in skill
+    assert "不得读取视频、视频生成提示词、台词、音频、项目目录、其他路径或未列出的文件" in skill
+
+    assert "短视频的 `segment_indices` 是 `[0]`" in skill
+    assert "`global_elements` 必须是空数组" in skill
+    assert "除规定字段外不得增加字段" in skill
+    assert "不得用 Markdown 代码围栏包裹 JSON" in skill
+
+    assert "画幅、裁切、机位、镜头、透视、景别、构图、光线、焦点、景深" in skill
+    assert "人物与动物数量、姿态、动作、视线" in skill
+    assert "非目标元素的位置、比例和可见部分" in skill
+    assert "禁止恢复或新增字幕、文字、Logo、水印、贴纸、界面元素、品牌标识或乱码" in skill
+
+    assert "同一 `chain_id` 的 `continue` 段优先视为连续画面" in skill
+    assert "`hard_cut` 不自动代表人物或场景变化" in skill
+
+    assert "人物除脸外、服装、手、玩具、商品" in skill
+    assert "每段所有关键帧共享一份可直接提交给 Seedream 的提示词" in skill
+    assert "超长必须重写，不能截断" in skill
+
+    assert "`independent_parallel` 无需写“当前图是唯一目标”" in skill
+    assert "不得写参考人物、参考角色或其他图" in skill
+    assert "`anchor_consistency` 必须限制其他图的角色" in skill
+    assert "其他图只提供目标设计" in skill
+
+    assert "高风险组件找不到合格表面时放弃去重" in skill
+    assert "输出两句不改动提示词" in skill
 
 
 def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
