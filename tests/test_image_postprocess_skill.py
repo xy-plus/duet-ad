@@ -22,17 +22,17 @@ def _png(value: int = 127) -> bytes:
 def _elements() -> list[dict]:
     return [
         {
+            "id": "OUTFIT_01",
+            "kind": "outfit",
+            "source": "反复出现的深蓝休闲上衣",
+            "replacement": "同色同风格的不同剪裁上衣",
+            "segments": [1, 2],
+        },
+        {
             "id": "PERSON_01",
             "kind": "person",
             "source": "反复出现的深发女性",
             "replacement": "椭圆脸、自然直眉的新人物",
-            "segments": [1, 2],
-        },
-        {
-            "id": "SCENE_01",
-            "kind": "scene",
-            "source": "两段重复出现的厨房",
-            "replacement": "同类但不重复的暖灰厨房",
             "segments": [1, 2],
         },
     ]
@@ -100,20 +100,53 @@ def test_skill_is_single_project_level_prompt_compiler():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
     assert "name: image-postprocess" in skill
     assert "为了降低素材重复度" in skill
-    assert "同性别呈现" in skill and "长相略有不同" in skill
+    assert "性别呈现" in skill and "长相略有不同" in skill
     assert "同类型但不重复" in skill
-    assert "同一个新元素或同一套新设计" in skill
+    assert "同一个新设计" in skill
     assert "work/image_optimization.json" in skill
     assert "global_elements" in skill and "segment_prompts" in skill
     assert "真实提交给 Seedream" in skill
-    assert "第一张输入是唯一目标帧" in skill
-    assert "锚点" in skill and "绝不作为构图或画面内容参考" in skill
-    assert "保持第一张图片的近距离俯拍机位" in skill
-    assert "手持玩具位于前景" in skill
-    assert "猫位于后方" in skill
-    assert "不得把动物归为人物" in skill
+    assert "当前图是唯一目标" in skill
+    assert "其他图只提供所选目标的身份或背景设计参考" in skill
+    assert "不复述全部构图或叙事" in skill
     assert len(skill.encode("utf-8")) < 12 * 1024
     assert not Path("skills/image-continuity/SKILL.md").exists()
+
+
+def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "Unicode 字符数" in skill
+    assert "不超过 300 个字符" in skill
+    assert "生成前自行计数" in skill
+    assert "超长必须重写，不能截断" in skill
+    assert "32KB" not in skill
+
+    assert "人物外观" in skill and "背景" in skill
+    assert "严格二选一" in skill
+    assert "人物脸部和服装" in skill and "稳定同一性" in skill
+    assert "优先选择人物外观" in skill
+    assert "选择人物外观时不得修改背景" in skill
+    assert "选择背景时不得修改人物或服装" in skill
+
+    assert "核心商品、功能道具、玩具、手部" in skill
+    assert "人与物/物与物的握持、接触、插入、对齐、连接、遮挡、前后顺序" in skill
+    assert "数量、结构、方向" in skill
+    assert "全部不可编辑" in skill
+    assert "不得同类改款" in skill
+    assert "只点名目标帧中最容易误改的剧情核心物体和关系" in skill
+    assert "画质、功能道具、玩具、商品、宠物不得作为差异化目标" in skill
+
+    assert "第一句先写唯一替换目标及具体新设计" in skill
+    assert "核心对象与关系保持" in skill
+    assert "简短禁止项和真实摄影要求" in skill
+    assert "当前图是唯一目标" in skill
+    assert "不能传递构图" in skill
+
+    assert "只有真正被替换且跨段重复的 PERSON、OUTFIT、SCENE" in skill
+    assert "PROP、PRODUCT、SUBJECT 不得建立新映射" in skill
+    assert "相同替换描述必须跨段逐字复用" in skill
+    assert "陀螺" not in skill and "发射器" not in skill
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
