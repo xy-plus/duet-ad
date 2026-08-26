@@ -22,13 +22,6 @@ def _png(value: int = 127) -> bytes:
 def _elements() -> list[dict]:
     return [
         {
-            "id": "OUTFIT_01",
-            "kind": "outfit",
-            "source": "反复出现的深蓝休闲上衣",
-            "replacement": "同色同风格的不同剪裁上衣",
-            "segments": [1, 2],
-        },
-        {
             "id": "PERSON_01",
             "kind": "person",
             "source": "反复出现的深发女性",
@@ -99,54 +92,147 @@ def _segments(session: Path) -> list[dict]:
 def test_skill_is_single_project_level_prompt_compiler():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
     assert "name: image-postprocess" in skill
-    assert "为了降低素材重复度" in skill
-    assert "性别呈现" in skill and "长相略有不同" in skill
-    assert "同类型但不重复" in skill
-    assert "同一个新设计" in skill
     assert "work/image_optimization.json" in skill
     assert "global_elements" in skill and "segment_prompts" in skill
     assert "真实提交给 Seedream" in skill
-    assert "当前图是唯一目标" in skill
-    assert "其他图只提供所选目标的身份或背景设计参考" in skill
-    assert "不复述全部构图或叙事" in skill
-    assert len(skill.encode("utf-8")) < 12 * 1024
     assert not Path("skills/image-continuity/SKILL.md").exists()
+
+
+def test_skill_keeps_hard_to_abuse_input_output_and_prompt_boundaries():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "本 Skill 只生成提示词，不编辑图片、不调用 Seedream" in skill
+    assert "不代表图片二次编辑一定执行、成功或被视频生成采用" in skill
+    assert "不得读取视频、视频生成提示词、台词、音频、项目目录、其他路径或未列出的文件" in skill
+
+    assert "短视频的 `segment_indices` 是 `[0]`" in skill
+    assert "`global_elements` 必须是空数组" in skill
+    assert "除规定字段外不得增加字段" in skill
+    assert "不得用 Markdown 代码围栏包裹 JSON" in skill
+
+    assert "画幅、裁切、机位、镜头、透视、景别、构图、光线、焦点、景深" in skill
+    assert "人物与动物数量、姿态、动作、视线" in skill
+    assert "非目标元素的位置、比例和可见部分" in skill
+    assert "禁止恢复或新增字幕、文字、Logo、水印、贴纸、界面元素、品牌标识或乱码" in skill
+
+    assert "同一 `chain_id` 的 `continue` 段优先视为连续画面" in skill
+    assert "`hard_cut` 不自动代表人物或场景变化" in skill
+
+    assert "人物除脸外、服装、手、玩具、商品" in skill
+    assert "每段所有关键帧共享一份可直接提交给 Seedream 的提示词" in skill
+    assert "第一句只聚焦唯一替换目标及其原位条件" in skill
+    assert "第二句写完整保护" in skill
+    assert "保持简洁，但不得为缩短删除安全关系" in skill
+    assert "禁止全景复述、画质美化或物体清单" in skill
+    assert "保持叙事内核和关系不变，只改变表象" in skill
+    assert "不超过 140 个 Unicode 字符" not in skill
+    assert "生成前计数" not in skill
+
+    assert "`independent_parallel` 无需写“当前图是唯一目标”" in skill
+    assert "不得写参考人物、参考角色或其他图" in skill
+    assert "`anchor_consistency` 必须限制其他图的角色" in skill
+    assert "其他图只提供目标设计" in skill
+
+    assert "任何组件只要背景路线和人物路线都不能证明安全" in skill
+    assert "输出两句不改动提示词，不建立 `global_elements`" in skill
+    assert "无人、人物不清晰且无稳定安全背景表面" in skill
+    assert "高风险组件找不到合格表面时放弃去重" in skill
+    assert "不得退到人物路线" in skill
+
+
+def test_segment_prompt_rules_forbid_internal_mapping_labels():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    prompt_rules = skill.split("## 每段 Seedream 提示词", maxsplit=1)[1]
+
+    assert '"id": "PERSON_01"' in skill
+    assert "必须直接写自然语言目标与替换设计" in prompt_rules
+    assert "绝不能包含内部 ID 或字段标签" in prompt_rules
+    for label in (
+        "PERSON_01", "SCENE_01", "source", "replacement", "global_elements"
+    ):
+        assert f"`{label}`" in prompt_rules
 
 
 def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
-    assert "Unicode 字符数" in skill
-    assert "不超过 300 个字符" in skill
-    assert "生成前自行计数" in skill
-    assert "超长必须重写，不能截断" in skill
-    assert "32KB" not in skill
+    assert "第一优先级是最终视频连续性和现实合理性" in skill
+    assert "扭曲、元素突变、物理或接触关系异常" in skill
+    assert "一票否决" in skill
+    assert "人物或背景替换仅是用于去重的第二优先级" in skill
+    assert "只有通过第一层才评价" in skill
 
-    assert "人物外观" in skill and "背景" in skill
-    assert "严格二选一" in skill
-    assert "人物脸部和服装" in skill and "稳定同一性" in skill
-    assert "优先选择人物外观" in skill
-    assert "选择人物外观时不得修改背景" in skill
-    assert "选择背景时不得修改人物或服装" in skill
+    assert "先检查全项目全部关键帧" in skill
+    assert "去重目标只能是 `人物外观` 或 `背景`" in skill
+    assert "功能道具、商品、玩具或人与物互动" in skill
+    assert "新脸长相略有不同" in skill
+    assert "优先选择人物外观" not in skill
 
     assert "核心商品、功能道具、玩具、手部" in skill
     assert "人与物/物与物的握持、接触、插入、对齐、连接、遮挡、前后顺序" in skill
     assert "数量、结构、方向" in skill
     assert "全部不可编辑" in skill
     assert "不得同类改款" in skill
-    assert "只点名目标帧中最容易误改的剧情核心物体和关系" in skill
     assert "画质、功能道具、玩具、商品、宠物不得作为差异化目标" in skill
 
-    assert "第一句先写唯一替换目标及具体新设计" in skill
-    assert "核心对象与关系保持" in skill
-    assert "简短禁止项和真实摄影要求" in skill
-    assert "当前图是唯一目标" in skill
-    assert "不能传递构图" in skill
+    assert "恰好两句" in skill
+    assert "文字或 Logo" in skill
+    assert "不传递人物、构图、动作、物体或关系" in skill
 
-    assert "只有真正被替换且跨段重复的 PERSON、OUTFIT、SCENE" in skill
-    assert "PROP、PRODUCT、SUBJECT 不得建立新映射" in skill
-    assert "相同替换描述必须跨段逐字复用" in skill
+    assert "本 Skill 的 `global_elements` 只允许 `PERSON`、`SCENE`" in skill
+    assert "按完整 `id` 的字典序" in skill
+    assert "不得输出 `OUTFIT`、`PROP`、`PRODUCT`、`SUBJECT`" in skill
     assert "陀螺" not in skill and "发射器" not in skill
+
+
+def test_skill_freezes_balanced_component_strategy_and_exact_two_sentence_routes():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "全项目构建跨段相关组件" in skill
+    assert "同一场景或同一稳定背景/固定建筑表面" in skill
+    assert "每个组件只做一次策略选择并冻结" in skill
+    assert "手—功能道具/玩具的高风险关系" in skill
+    assert "整个组件统一选择背景路线" in skill
+    assert "人物在所有相关段都稳定清晰" in skill
+
+    assert "同功能、同表面类别但明显不同的材质或色调" in skill
+    assert "墙地交界" in skill
+    assert "接触几何" in skill
+    assert "人物、服装、手、玩具、商品" in skill
+    assert "握持、插接、对齐、遮挡关系" in skill
+    assert "禁止增删文字或 Logo" in skill
+
+    assert "只替换同一人物的新脸" in skill
+    assert "头部位置、大小、朝向、裁切和遮挡" in skill
+    assert "同色同风格的不同款服装" not in skill
+
+    assert "其他图只提供目标设计" in skill
+
+    assert "只收录实际跨段替换" in skill
+    assert "完整 `id` 的字典序" in skill
+
+
+def test_final_j_uses_one_large_stable_surface_and_face_only_fallback():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "只选一个能在所有相关段稳定对应" in skill
+    assert "面积尽量大的安全背景表面类别" in skill
+    assert "优先地面，其次墙面" in skill
+    assert "允许个别关键帧因裁切不可见" in skill
+    assert "只编辑每张图中可见的目标表面；目标表面不可见的图片不做任何改变" in skill
+    assert "不得映射全部背景" in skill
+    assert "为每类冻结" not in skill
+
+    assert "原表面的边界、分块/拼缝、方向、透视和接触几何" in skill
+    assert "保持光线方向" in skill
+    assert "固定构件、家具、陈设不得新增、删除或移动" in skill
+    assert "该帧不做其他编辑" in skill
+
+    assert "找不到稳定安全背景表面" in skill
+    assert "只换脸，不换服装" in skill
+    assert "可见的性别呈现、肤色和整体风格、年龄和气质" in skill
+    assert "跨段 `PERSON replacement`" in skill
+    assert "不得输出 `OUTFIT`" in skill
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
@@ -392,3 +478,4 @@ def test_freeze_rejects_boolean_segment_key(tmp_path):
         image_optimization.freeze_prompts(
             settings, meta, {True: "not segment one"}
         )
+

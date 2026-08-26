@@ -77,7 +77,7 @@ links: [conversation-task, processing-state]
 
 ## 图片优化与 H3 门控
 
-- schema v2 的视觉关键帧冻结后，隔离 Codex 按段执行独立 `image-postprocess` Skill，只读取本段关键帧与后端编辑模式；输出原样成为用户可审阅的默认 Seedream 提示词，不复制 H3 提示词。短视频段号固定为 `0`，长视频段号从 `1` 连续递增。详情只公开 `{text, default_text, sha256}`；模型、编辑模式和供应商回执保持私有。提示词生成不代表可选的非确定性图片编辑一定执行或成功。
+- schema v2 的视觉关键帧冻结后，隔离 Codex 对整个项目只执行一次 `image-postprocess` Skill，只读取全部分段关键帧、段关系与后端编辑模式；它先统一冻结跨段人物或单一背景表面策略，再输出每段用户可审阅的默认 Seedream 提示词，不复制 H3 提示词。短视频段号固定为 `0`，长视频段号从 `1` 连续递增。详情只公开 `{text, default_text, sha256}`；模型、编辑模式和供应商回执保持私有。提示词生成不代表可选的非确定性图片编辑一定执行或成功。
 - `PATCH /api/conversations/{id}/image-optimization-prompt` 严格要求 `confirm:true`、`segment_index`、`expected_sha256` 和非空限长 `prompt`。它只允许在分析完成且 generation/postprocess 均未开始时 CAS 保存；摘要变化或已经冻结返回结构化 409，未知字段 fail closed。
 - 后处理选项 canonical 为 `remove_subtitle/remove_brand/optimize_image` 三个布尔值；精确旧两字段请求兼容为 `optimize_image:false`，其余缺字段、未知字段或非布尔值拒绝。实际执行对每段保持 `文字擦除 -> 品牌擦除 -> 图片优化` 阶段屏障，段之间并行；任一失败段不会阻止其他段完成，整体保持 failed，H3 不得静默回退原图。
 - `postprocess.segments[]` 仅公开 `index/status/stage/completed_frames/total_frames/revision/error`。失败段通过 `POST /api/conversations/{id}/postprocess/segments/{index}/retry` 重试，请求严格为 `{"confirm":true,"expected_revision":N}`；只复用该段已成功的阶段/帧与服务端冻结选项、模型、模式、提示词，不接受页面重新指定。

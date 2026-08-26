@@ -8,6 +8,7 @@
 
 ## 📌 待办与限制
 
+- 图片后处理 Skill 已定义 PERSON/SCENE、两句保护与 unsafe no-op，但运行时尚未机械验证这些语义，no-op 仍会提交 Seedream；后续工作流改造需增加校验与原帧回退门禁。（→ `app/image_optimization.py`, `app/postprocess.py`）
 - 自动补交依赖 append-only attempt ledger；若带外删除最后一个已落盘 receipt，无独立高水位可识别。该磁盘状态破坏场景按要求不扩展实现。（→ `app/h3.py:_validated_attempt_ledger`）
 - `stitch` 对受控 ffmpeg 产物的探测仍在视频流 duration 缺失时回退容器时长；后续一致性清理改用 `duration_ts × time_base` 并移除该容器兜底。（→ `app/stitch.py`）
 - `probe_stream_start_time(a:0)` 在部分 Opus WebM 上仍可返回约 -7ms 的 initial padding；现行 voice/stitch 只查询 `v:0`，若未来公开音轨调用需先校正该语义。（→ `app/storage.py`）
