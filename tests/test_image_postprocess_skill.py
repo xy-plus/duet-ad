@@ -326,6 +326,59 @@ def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
     assert "不得改动项目级替换短语" in background_rules
 
 
+def test_replacement_identity_is_frozen_across_frames_and_reappearances():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "对每个实际替换的元素，项目级只冻结一个“替换身份”" in skill
+    assert "复用现有的 `SCENE replacement`、`PERSON replacement` 和项目级替换短语" in skill
+    assert "替换身份只包含实际改变的低频属性及必须跨帧稳定的可观察特征" in skill
+    assert "未作为编辑目标的属性逐帧继承输入帧，不得重新设计" in skill
+
+    assert "跨帧不变量：类别、目标属性值或区间、表面响应、纹理族与尺度、原有特征相位、结构单元、接缝或重复拓扑" in skill
+    assert "逐帧投影变量：视角、裁切、连续受光、运动模糊和真实遮挡" in skill
+    assert "相机和光照只能解释投影变化，不能解释替换身份重生" in skill
+
+    assert "同一物理实例在遮挡后、跨段或 `hard_cut` 后再次出现" in skill
+    assert "映射回同一替换身份和拓扑" in skill
+    assert "不得独立重新设计或重新采样高频细节" in skill
+
+
+def test_replacement_domain_is_complete_hard_bounded_and_fail_closed():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "每帧完整覆盖全部可见的目标成员，不得留下旧外观孤岛" in skill
+    assert "目标域外像素硬保留" in skill
+    assert "逐帧保持轮廓、层级、可见性和运动模糊" in skill
+    assert "边界置信不足时保留输入像素" in skill
+    assert "无法从全部冻结帧证明同一替换身份和边界可稳定复用" in skill
+    assert "该段或组件不改动" in skill
+
+
+def test_two_sentence_prompts_execute_frozen_identity_without_false_references():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    prompt_rules = skill.split("## 每段 Seedream 提示词", maxsplit=1)[1]
+
+    assert "合并唯一目标、已冻结的项目级替换身份和各输入帧自身的投影条件" in prompt_rules
+    assert "合并完整覆盖、目标域外硬保留和核心关系保护" in prompt_rules
+    assert "`independent_parallel`" in prompt_rules
+    assert "只写当前图必须服从已冻结的项目级替换身份或短语" in prompt_rules
+    assert "不得声称基准帧或其他图片提供身份参考" in prompt_rules
+
+
+def test_human_behavior_documents_generic_replacement_stability_contract():
+    behavior = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    assert "项目级只冻结一个替换身份" in behavior
+    assert "跨帧不变量" in behavior and "逐帧投影变量" in behavior
+    assert "遮挡后、跨段或 hard cut 后再次出现" in behavior
+    assert "全部可见目标成员" in behavior and "目标域外像素硬保留" in behavior
+    assert "边界置信不足时保留输入像素" in behavior
+    assert "无法从全部冻结帧证明身份和边界可稳定复用时" in behavior
+    assert "该段或组件不改动" in behavior
+
+
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
     session = tmp_path / "session"
     segments = _segments(session)
