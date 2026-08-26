@@ -151,7 +151,9 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "不超过 140 个 Unicode 字符" in skill
 
     assert "先检查全项目全部关键帧" in skill
+    assert "去重目标只能是 `人物外观` 或 `背景`" in skill
     assert "功能道具、商品、玩具或人与物互动" in skill
+    assert "新脸长相略有不同" in skill
     assert "优先选择人物外观" not in skill
 
     assert "核心商品、功能道具、玩具、手部" in skill
