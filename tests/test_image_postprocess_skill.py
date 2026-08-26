@@ -30,6 +30,9 @@ def test_skill_keeps_anchor_element_only_and_forbids_frame_narration():
     assert "仅当目标帧本身存在某元素时" in skill
     assert "不得从锚点向目标帧新增" in skill
     assert "第一张输入是唯一目标帧" in skill
+    assert "work/continuity.json" in skill
+    assert "跨段冻结约束" in skill
+    assert "不得重新设计" in skill
     assert "保持第一张图片的近距离俯拍机位" in skill
     assert "手持玩具位于前景" in skill
     assert "猫位于后方" in skill
@@ -43,6 +46,149 @@ def test_skill_keeps_anchor_element_only_and_forbids_frame_narration():
     assert "work/image_optimization_prompt.txt" in skill
     assert "视频生成提示词" in skill and "不得读取" in skill
     assert len(skill.encode("utf-8")) < 12 * 1024
+
+
+def test_continuity_skill_is_compact_and_never_describes_frame_layout():
+    skill = Path("skills/image-continuity/SKILL.md").read_text(encoding="utf-8")
+    assert "name: image-continuity" in skill
+    assert "全局元素映射" in skill
+    assert "人物、服装、场景、道具和核心商品" in skill
+    assert "SUBJECT/subject" in skill
+    assert "不得把动物归为 `PERSON`" in skill
+    assert "不得描述" in skill and "构图" in skill and "位置" in skill
+    assert "continue" in skill and "hard_cut" in skill
+    assert "work/continuity.json" in skill
+    assert len(skill.encode("utf-8")) < 10 * 1024
+
+
+class _ContinuityRunner:
+    def __init__(self, output: object) -> None:
+        self.output = output
+        self.calls = []
+
+    def run_isolated(self, workdir, prompt, *, session_dir):
+        workdir = Path(workdir)
+        self.calls.append({
+            "files": sorted(
+                str(path.relative_to(workdir))
+                for path in workdir.rglob("*") if path.is_file()
+            ),
+            "request": json.loads((workdir / "work" / "request.json").read_text()),
+            "session_dir": Path(session_dir),
+        })
+        (workdir / "work" / "continuity.json").write_text(
+            json.dumps(self.output, ensure_ascii=False), encoding="utf-8"
+        )
+
+
+def _continuity_plan():
+    return {
+        "version": 1,
+        "segment_indices": [1, 2],
+        "elements": [
+            {
+                "id": "PERSON_01",
+                "kind": "person",
+                "source": "反复出现的深发女性",
+                "replacement": "椭圆脸、自然直眉的新人物",
+                "segments": [1, 2],
+            },
+            {
+                "id": "SCENE_01",
+                "kind": "scene",
+                "source": "两段重复出现的厨房",
+                "replacement": "暖灰墙面和浅橡木柜体",
+                "segments": [1, 2],
+            },
+        ],
+    }
+
+
+def test_global_continuity_generation_sees_all_segments_but_no_other_session_files(tmp_path):
+    session = tmp_path / "session"
+    first = session / "work" / "segments" / "1" / "work" / "keyframes"
+    second = session / "work" / "segments" / "2" / "work" / "keyframes"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "01.png").write_bytes(_png(10))
+    (second / "01.png").write_bytes(_png(20))
+    (session / "work" / "prompt.txt").write_text("H3 SECRET", encoding="utf-8")
+    runner = _ContinuityRunner(_continuity_plan())
+
+    plan = image_optimization.generate_continuity_plan(
+        runner,
+        [
+            {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut", "keyframes_dir": first},
+            {"index": 2, "chain_id": "chain-001", "join_mode": "continue", "keyframes_dir": second},
+        ],
+        session_dir=session,
+    )
+
+    assert plan == _continuity_plan()
+    assert runner.calls[0]["request"] == {
+        "segments": [
+            {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut"},
+            {"index": 2, "chain_id": "chain-001", "join_mode": "continue"},
+        ]
+    }
+    assert runner.calls[0]["files"] == [
+        "SKILL.md",
+        "work/request.json",
+        "work/segments/1/keyframes/01.png",
+        "work/segments/2/keyframes/01.png",
+    ]
+    assert runner.calls[0]["session_dir"] == session.resolve()
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        {},
+        {"version": 1, "segment_indices": [1, 2], "elements": [], "extra": True},
+        {"version": 1, "segment_indices": [1, 2], "elements": [{"id": "PERSON_01"}]},
+        {
+            "version": 1,
+            "segment_indices": [1, 2],
+            "elements": [{
+                "id": "PERSON_01", "kind": "person", "source": "x",
+                "replacement": "y", "segments": [2, 1],
+            }],
+        },
+        {
+            "version": 1,
+            "segment_indices": [1, 2],
+            "elements": [{
+                "id": "SCENE_01", "kind": "person", "source": "x",
+                "replacement": "y", "segments": [1, 2],
+            }],
+        },
+        {
+            "version": 1,
+            "segment_indices": [1, 2],
+            "elements": [{
+                "id": "SUBJECT_01", "kind": "person", "source": "猫",
+                "replacement": "另一只猫", "segments": [1, 2],
+            }],
+        },
+    ],
+)
+def test_global_continuity_rejects_noncanonical_output(tmp_path, output):
+    session = tmp_path / "session"
+    first = session / "work" / "segments" / "1" / "work" / "keyframes"
+    second = session / "work" / "segments" / "2" / "work" / "keyframes"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "01.png").write_bytes(_png())
+    (second / "01.png").write_bytes(_png())
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.generate_continuity_plan(
+            _ContinuityRunner(output),
+            [
+                {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut", "keyframes_dir": first},
+                {"index": 2, "chain_id": "chain-001", "join_mode": "continue", "keyframes_dir": second},
+            ],
+            session_dir=session,
+        )
 
 
 class _InspectingRunner:
@@ -62,6 +208,10 @@ class _InspectingRunner:
             "files": files,
             "prompt": prompt,
             "request": request,
+            "continuity": (
+                json.loads((workdir / "work" / "continuity.json").read_text())
+                if (workdir / "work" / "continuity.json").is_file() else None
+            ),
             "session_dir": Path(session_dir),
         })
         (workdir / "work" / "image_optimization_prompt.txt").write_text(
@@ -96,6 +246,65 @@ def test_codex_prompt_generation_sees_only_skill_frames_and_mode(tmp_path):
     ]
     assert "H3 SECRET PROMPT" not in runner.calls[0]["prompt"]
     assert runner.calls[0]["session_dir"] == session.resolve()
+
+
+def test_segment_prompt_receives_only_its_global_elements(tmp_path):
+    session = tmp_path / "session"
+    keyframes = session / "work" / "segments" / "2" / "work" / "keyframes"
+    keyframes.mkdir(parents=True)
+    (keyframes / "01.png").write_bytes(_png())
+    runner = _InspectingRunner("真实分段提示词")
+
+    continuity = {
+        "version": 1,
+        "segment_indices": [1, 2, 3],
+        "elements": [
+            {
+                "id": "OUTFIT_01", "kind": "outfit", "source": "外套",
+                "replacement": "灰色针织外套", "segments": [1, 3],
+            },
+            {
+                "id": "PERSON_01", "kind": "person", "source": "人物",
+                "replacement": "椭圆脸新人物", "segments": [1, 2],
+            },
+            {
+                "id": "SCENE_01", "kind": "scene", "source": "厨房",
+                "replacement": "暖灰厨房", "segments": [2, 3],
+            },
+        ],
+    }
+    result = image_optimization.generate_prompt(
+        runner,
+        keyframes,
+        "anchor_consistency",
+        session_dir=session,
+        segment_index=2,
+        continuity=continuity,
+    )
+
+    assert result == "真实分段提示词"
+    assert runner.calls[0]["request"] == {
+        "edit_mode": "anchor_consistency", "segment_index": 2,
+    }
+    assert runner.calls[0]["continuity"] == {
+        "version": 1,
+        "segment_index": 2,
+        "elements": continuity["elements"][1:],
+    }
+    assert "work/continuity.json" in runner.calls[0]["files"]
+
+
+def test_continuity_receipt_is_private_deterministic_and_exact():
+    frozen = image_optimization.freeze_continuity(_continuity_plan())
+    assert set(frozen) == {"_image_continuity"}
+    receipt = frozen["_image_continuity"]
+    assert set(receipt) == {"version", "segment_indices", "elements", "sha256"}
+    assert receipt["version"] == 1
+    assert receipt["elements"] == _continuity_plan()["elements"]
+    assert image_optimization.continuity_receipt(frozen) == receipt
+    tampered = json.loads(json.dumps(frozen))
+    tampered["_image_continuity"]["elements"][0]["replacement"] = "changed"
+    assert image_optimization.continuity_receipt(tampered) is None
 
 
 def test_generic_isolated_runner_wraps_stage_and_discards_last_message(tmp_path, monkeypatch):

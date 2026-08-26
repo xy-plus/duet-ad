@@ -65,7 +65,7 @@ def _freeze(settings, meta):
 def test_seedream_settings_are_closed_and_secret_is_not_a_setting(monkeypatch):
     monkeypatch.setenv("ARK_API_KEY", "super-secret")
     settings = Settings(access_token="x")
-    assert settings.seedream_model == "doubao-seedream-5-0-260128"
+    assert settings.seedream_model == "doubao-seedream-5-0-pro-260628"
     assert settings.seedream_edit_mode == "anchor_consistency"
     assert "super-secret" not in repr(settings)
     assert not hasattr(settings, "ark_api_key")
@@ -296,6 +296,21 @@ def test_prompt_patch_is_strict_cas_and_freezes_on_postprocess(tmp_path):
         )
         assert frozen.status_code == 409
         assert frozen.json()["detail"]["code"] == "image_optimization_prompt_frozen"
+
+
+def test_private_global_continuity_never_enters_detail(tmp_path):
+    settings = make_settings(tmp_path)
+    cid = _done(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _image_continuity={"private": "GLOBAL_CONTINUITY_SECRET"},
+    )
+    with TestClient(create_app(settings)) as client:
+        detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    encoded = json.dumps(detail, ensure_ascii=False)
+    assert "_image_continuity" not in encoded
+    assert "GLOBAL_CONTINUITY_SECRET" not in encoded
 
 
 def test_prompt_patch_cannot_cross_first_submit_claim_window(tmp_path, monkeypatch):

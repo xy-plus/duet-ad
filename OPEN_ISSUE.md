@@ -6,8 +6,6 @@
 
 - 旧人物策略资料包仍在根目录，但不进入现行直接 H3 运行链；需决定删除归档，还是只保留独立的授权/商标版权规则。（→ `seedance-cleaning-video-maker-中文完整资料包.zip`）
 
-## 🚧 进行中
-
 ## 📌 待办与限制
 
 - 自动补交依赖 append-only attempt ledger；若带外删除最后一个已落盘 receipt，无独立高水位可识别。该磁盘状态破坏场景按要求不扩展实现。（→ `app/h3.py:_validated_attempt_ledger`）

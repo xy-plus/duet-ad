@@ -541,6 +541,8 @@ def _generate_image_optimization_prompt(
     *,
     session_dir: Path,
     step: str,
+    segment_index: int | None = None,
+    continuity: dict | None = None,
 ) -> str:
     policy = _retry_policy(settings)
 
@@ -551,6 +553,8 @@ def _generate_image_optimization_prompt(
                 keyframes_dir,
                 settings.seedream_edit_mode,
                 session_dir=session_dir,
+                segment_index=segment_index,
+                continuity=continuity,
             )
         except image_optimization.ImageOptimizationOutputError as exc:
             raise PipelineError(str(exc), retryable=True) from None
@@ -561,6 +565,77 @@ def _generate_image_optimization_prompt(
         is_retryable=_retryable_operation_error,
         on_retry=_retry_logger(step, policy),
     )
+
+
+def _generate_image_continuity_plan(
+    settings: Settings,
+    runner,
+    segments: list[dict],
+    work: Path,
+    *,
+    session_dir: Path,
+) -> dict:
+    specs = [
+        {
+            "index": segment["index"],
+            "chain_id": segment["chain_id"],
+            "join_mode": segment["join_mode"],
+            "keyframes_dir": (
+                work / "segments" / str(segment["index"]) / "work" / "keyframes"
+            ),
+        }
+        for segment in segments
+    ]
+    policy = _retry_policy(settings)
+
+    def attempt() -> dict:
+        try:
+            return image_optimization.generate_continuity_plan(
+                runner, specs, session_dir=session_dir
+            )
+        except image_optimization.ImageOptimizationOutputError as exc:
+            raise PipelineError(str(exc), retryable=True) from None
+
+    return run_with_retry(
+        attempt,
+        policy=policy,
+        is_retryable=_retryable_operation_error,
+        on_retry=_retry_logger("image continuity codex", policy),
+    )
+
+
+def _generate_segmented_image_prompts(
+    settings: Settings,
+    runner,
+    segments: list[dict],
+    seg_metas: list[dict],
+    work: Path,
+    *,
+    session_dir: Path,
+    workers: int,
+) -> tuple[dict, dict[int, str]]:
+    continuity = _generate_image_continuity_plan(
+        settings, runner, segments, work, session_dir=session_dir
+    )
+
+    def generate(seg: dict) -> tuple[int, str]:
+        index = seg["index"]
+        segdir = work / "segments" / str(index)
+        prompt = _generate_image_optimization_prompt(
+            settings,
+            runner,
+            segdir / "work" / "keyframes",
+            session_dir=segdir,
+            step=f"segment {index} image postprocess codex",
+            segment_index=index,
+            continuity=continuity,
+        )
+        _write_image_optimization_prompt(segdir / "work", prompt)
+        return index, prompt
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        prompts = dict(pool.map(generate, seg_metas))
+    return continuity, prompts
 
 
 def _voice_prompt(_cdir: Path, voice_mode: str, target_language: str, duration_s: float) -> str:
@@ -1275,15 +1350,6 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             isolate_dialogue=new_input_contract,
             step=f"segment {index} visual codex",
         )
-        if new_input_contract:
-            image_prompt = _generate_image_optimization_prompt(
-                settings,
-                runner,
-                segwork / "keyframes",
-                session_dir=segdir,
-                step=f"segment {index} image postprocess codex",
-            )
-            _write_image_optimization_prompt(segwork, image_prompt)
         visual_prompt = prompt
         if new_input_contract:
             first_anchor, last_anchor = _write_segment_anchors(segwork, anchor_frames)
@@ -1641,6 +1707,18 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                         segments,
                     )
                 )
+            image_prompts: dict[int, str] | None = None
+            continuity: dict | None = None
+            if new_input_contract:
+                continuity, image_prompts = _generate_segmented_image_prompts(
+                    settings,
+                    runner,
+                    segments,
+                    seg_metas,
+                    work,
+                    session_dir=cdir,
+                    workers=workers,
+                )
             changes: dict = {"status": "done", "segments": seg_metas}
             if new_input_contract:
                 receipt_segments = []
@@ -1704,13 +1782,9 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 )
             # 新 schema 保留 segments；短视频仍只写顶层 keyframes/prompt。
             if new_input_contract:
-                image_prompts = {
-                    seg["index"]: (
-                        work / "segments" / str(seg["index"]) / "work"
-                        / "image_optimization_prompt.txt"
-                    ).read_text(encoding="utf-8").strip()
-                    for seg in seg_metas
-                }
+                if image_prompts is None or continuity is None:
+                    raise PipelineError("image continuity was not generated")
+                changes.update(image_optimization.freeze_continuity(continuity))
                 changes.update(image_optimization.freeze_prompts(
                     settings, {**meta, **changes}, image_prompts
                 ))

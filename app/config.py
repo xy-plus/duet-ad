@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SEEDREAM_MODELS = frozenset({
+    "doubao-seedream-5-0-pro-260628",
     "doubao-seedream-5-0-260128",
     "doubao-seedream-4-5-251128",
     "doubao-seedream-4-0-250828",
@@ -26,7 +27,7 @@ class Settings:
     # MediaKit 后处理逐帧并行提交的进程级并发上限（单进程内跨会话全局）
     mediakit_concurrency: int = 4
     mediakit_timeout_s: float = 180.0
-    seedream_model: str = "doubao-seedream-5-0-260128"
+    seedream_model: str = "doubao-seedream-5-0-pro-260628"
     seedream_edit_mode: str = "anchor_consistency"
     seedream_concurrency: int = 4
     seedream_timeout_s: float = 180.0
@@ -111,7 +112,7 @@ def get_settings() -> Settings:
         mediakit_concurrency=max(1, int(os.environ.get("MEDIAKIT_CONCURRENCY", "4"))),
         mediakit_timeout_s=float(os.environ.get("MEDIAKIT_TIMEOUT_S", "180")),
         seedream_model=os.environ.get(
-            "SEEDREAM_MODEL", "doubao-seedream-5-0-260128"
+            "SEEDREAM_MODEL", "doubao-seedream-5-0-pro-260628"
         ).strip(),
         seedream_edit_mode=os.environ.get(
             "SEEDREAM_EDIT_MODE", "anchor_consistency"

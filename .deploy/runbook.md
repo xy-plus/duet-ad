@@ -146,7 +146,7 @@ MEDIAKIT_TIMEOUT_S=180
 
 # Seedream 图片优化；ARK_API_KEY 留空即关闭该 capability
 ARK_API_KEY=
-SEEDREAM_MODEL=doubao-seedream-5-0-260128
+SEEDREAM_MODEL=doubao-seedream-5-0-pro-260628
 SEEDREAM_EDIT_MODE=anchor_consistency
 SEEDREAM_CONCURRENCY=4
 SEEDREAM_TIMEOUT_S=180
@@ -190,7 +190,7 @@ systemctl --user is-active duet-ad1.service
 journalctl --user -u duet-ad1.service --since '-2 minutes' --no-pager
 ```
 
-服务必须是单进程；不要给 uvicorn 增加 `--workers`。Seedream 的模型仅允许 `doubao-seedream-5-0-260128`（默认 5.0 Lite）、`doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828`；模式仅允许 `anchor_consistency|independent_parallel`，非法值会阻止服务启动。分析时隔离 Codex 按段执行 `skills/image-postprocess`，其输出经用户审阅后冻结为该段真实 Seedream 提示词。重启时 schema v2 generation 默认只执行 GET-only resume；唯一补发 H3 POST 的例外是完整确认的 `h3_provider_failed` 仍有自动额度，或该失败后已落盘的 ready 自动 attempt。后处理只恢复本地可证明安全的工作；Seedream `submitting/submission_unknown` 会标记失败并等待人工分段确认，绝不自动 POST。
+服务必须是单进程；不要给 uvicorn 增加 `--workers`。Seedream 的模型仅允许 `doubao-seedream-5-0-pro-260628`（默认 5.0 Pro）、`doubao-seedream-5-0-260128`、`doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828`；模式仅允许 `anchor_consistency|independent_parallel`，非法值会阻止服务启动。多段分析先隔离执行一次 `skills/image-continuity` 并冻结全局元素映射，再按段并行执行 `skills/image-postprocess`；短视频只执行后者。分段输出经用户审阅后冻结为真实 Seedream 提示词。重启时 schema v2 generation 默认只执行 GET-only resume；唯一补发 H3 POST 的例外是完整确认的 `h3_provider_failed` 仍有自动额度，或该失败后已落盘的 ready 自动 attempt。后处理只恢复本地可证明安全的工作；Seedream `submitting/submission_unknown` 会标记失败并等待人工分段确认，绝不自动 POST。
 
 ## 5. 3213 静态前端与同一 Caddy unit 发布
 

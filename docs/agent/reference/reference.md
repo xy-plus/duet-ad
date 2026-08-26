@@ -272,7 +272,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 短视频只能使用逻辑段 `0`；长视频使用连续正整数段 `1..N`。接口只允许 schema v2 分析已完成且 generation/postprocess 都尚未创建时调用，以 `expected_sha256` CAS 保存；未知字段、空白或超过 32 KiB 的提示词、非法段号在写入前拒绝。摘要漂移返回结构化 409 `image_optimization_prompt_changed`；输入已冻结返回 `image_optimization_prompt_frozen`。成功返回该段新的 `{text,default_text,sha256}`。恢复默认由客户端把 `default_text` 放入草稿，仍需调用本接口保存。
 
-视觉关键帧冻结后，隔离 Codex 按段执行 `skills/image-postprocess`，只接收本段关键帧和后端编辑模式；其输出原样成为默认提示词，不读取或复制 H3 提示词。项目在分析完成时冻结同一个 Seedream 模型和模式，但这些内部字段不会出现在 detail。短视频在顶层返回 `image_optimization_prompt`；长视频把对应对象放入每个 `segments[]`。
+视觉关键帧冻结后，多段项目先执行 `skills/image-continuity`：输入为全部分段关键帧与 `index/chain_id/join_mode`，输出严格 JSON 全局元素映射。后端只把适用于当前段的条目写入该段隔离区，再执行 `skills/image-postprocess`；该 Skill 看不到其他段图片。短视频跳过全局阶段。分段输出原样成为默认提示词，不读取或复制 H3 提示词。项目在分析完成时冻结同一个 Seedream 模型和模式，但这些内部字段不会出现在 detail。短视频在顶层返回 `image_optimization_prompt`；长视频把对应对象放入每个 `segments[]`。
 
 ### `POST /api/conversations/{cid}/postprocess`
 
@@ -339,6 +339,7 @@ Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。�
 | `fit_mode` | `none/crop/pad`；随冻结画幅解释 |
 | `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含冻结 boolean `fast_mode`、内部 `segments` 与 `fit_layout`，failed 时公开 `retry_paid_segment_count`，status 含 resume_required；历史缺 fast_mode 等价 false |
 | `_image_optimization` | 私有项目冻结 receipt：同一模型/模式及每段 Codex 产出的 default/current/SHA；只投影用户可编辑的提示词字段 |
+| `_image_continuity` | 多段项目私有全局元素映射：版本、完整段号、跨段元素及确定性 SHA；不进入 detail，短视频不存在 |
 | `_postprocess_receipt` | 私有执行 receipt：冻结三选项与图片优化设置，不进入公开 detail |
 | `postprocess` | `{status,options,frames,segments,error}`；存在时生成必须等待全部段 done，并使用完整优化帧集合 |
 
@@ -478,7 +479,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `MEDIAKIT_CONCURRENCY` | `4` | 帧级并发，最小钳制为 1 |
 | `MEDIAKIT_TIMEOUT_S` | `180` | 上传、擦除和结果下载请求超时 |
 | `ARK_API_KEY` | 空 | 火山方舟 Seedream Bearer 凭据；留空关闭图片优化 capability，不进入 Settings repr、公开 API/meta/日志 |
-| `SEEDREAM_MODEL` | `doubao-seedream-5-0-260128` | 项目级图片模型；allowlist 另含 `doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828` |
+| `SEEDREAM_MODEL` | `doubao-seedream-5-0-pro-260628` | 项目级图片模型；allowlist 另含 `doubao-seedream-5-0-260128`、`doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828` |
 | `SEEDREAM_EDIT_MODE` | `anchor_consistency` | `anchor_consistency` 或 `independent_parallel`；按项目冻结，不暴露前端 |
 | `SEEDREAM_CONCURRENCY` | `4` | Seedream 帧级进程内并发上限，必须为正整数 |
 | `SEEDREAM_TIMEOUT_S` | `180` | 单次 Seedream POST 超时秒数，必须为正有限数 |

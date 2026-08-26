@@ -30,9 +30,18 @@ def _stub_image_postprocess_codex(monkeypatch):
     monkeypatch.setattr(
         pipeline.image_optimization,
         "generate_prompt",
-        lambda _runner, _keyframes, mode, *, session_dir: (
+        lambda _runner, _keyframes, mode, **_kwargs: (
             f"Codex 生成的 {mode} 图片二次编辑提示词"
         ),
+    )
+    monkeypatch.setattr(
+        pipeline.image_optimization,
+        "generate_continuity_plan",
+        lambda _runner, segments, **_kwargs: {
+            "version": 1,
+            "segment_indices": [segment["index"] for segment in segments],
+            "elements": [],
+        },
     )
 
 # 1×1 真实 PNG（validate_work_dir 会用 cv2 解码校验）
@@ -261,7 +270,10 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
         calls["codex"].append(Path(workdir))
         _write_valid_package(Path(workdir) / "work", prompt=f"局部动作-{Path(workdir).name}")
 
-    def fake_image_prompt(_runner, _keyframes, mode, *, session_dir):
+    def fake_image_prompt(
+        _runner, _keyframes, mode, *, session_dir, segment_index, continuity
+    ):
+        assert segment_index in continuity["segment_indices"]
         image_calls.append(Path(session_dir).name)
         image_barrier.wait(timeout=5)
         return f"图片二次编辑提示词-{Path(session_dir).name}-{mode}"
@@ -318,6 +330,7 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
 
     stored = storage.load_meta(settings.data_dir, cid)
     assert stored["status"] == "done", stored["error"]
+    assert stored["_image_continuity"]["segment_indices"] == [1, 2, 3]
     assert (stored["aspect_ratio"], stored["resolution"], stored["fit_mode"]) == (
         "16:9", "480p", "crop"
     )

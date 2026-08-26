@@ -29,9 +29,18 @@ def _stub_image_postprocess_codex(monkeypatch):
     monkeypatch.setattr(
         pipeline.image_optimization,
         "generate_prompt",
-        lambda _runner, _keyframes, mode, *, session_dir: (
+        lambda _runner, _keyframes, mode, **_kwargs: (
             f"Codex 生成的 {mode} 图片二次编辑提示词"
         ),
+    )
+    monkeypatch.setattr(
+        pipeline.image_optimization,
+        "generate_continuity_plan",
+        lambda _runner, segments, **_kwargs: {
+            "version": 1,
+            "segment_indices": [segment["index"] for segment in segments],
+            "elements": [],
+        },
     )
 
 ROOT = Path(pipeline.__file__).resolve().parent.parent
@@ -65,6 +74,91 @@ def _make_conversation(settings, video_1s):
     # 本文件既有用例模拟旧 voice_mode 会话；新 prepared-input 用例会显式补
     # dialogue_mode + duration_s + 新 voice_mode。
     return storage.update_meta(settings.data_dir, meta["id"], voice_mode="none")
+
+
+def test_segmented_image_prompts_freeze_global_map_before_parallel_segments(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    work = tmp_path / "session" / "work"
+    segments = [
+        {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut"},
+        {"index": 2, "chain_id": "chain-001", "join_mode": "continue"},
+    ]
+    for segment in segments:
+        (work / "segments" / str(segment["index"]) / "work" / "keyframes").mkdir(
+            parents=True
+        )
+    global_plan = {
+        "version": 1,
+        "segment_indices": [1, 2],
+        "elements": [],
+    }
+    events = []
+
+    def fake_continuity(*_args, **_kwargs):
+        events.append("continuity")
+        return global_plan
+
+    def fake_prompt(_settings, _runner, keyframes, *, segment_index, continuity, **_kwargs):
+        assert events == ["continuity"] or events[0] == "continuity"
+        assert continuity is global_plan
+        assert keyframes == (
+            work / "segments" / str(segment_index) / "work" / "keyframes"
+        )
+        events.append(f"segment-{segment_index}")
+        return f"prompt-{segment_index}"
+
+    monkeypatch.setattr(pipeline, "_generate_image_continuity_plan", fake_continuity)
+    monkeypatch.setattr(pipeline, "_generate_image_optimization_prompt", fake_prompt)
+
+    frozen, prompts = pipeline._generate_segmented_image_prompts(
+        settings,
+        object(),
+        segments,
+        [dict(segment) for segment in segments],
+        work,
+        session_dir=work.parent,
+        workers=2,
+    )
+
+    assert frozen is global_plan
+    assert prompts == {1: "prompt-1", 2: "prompt-2"}
+    assert events[0] == "continuity"
+    assert set(events[1:]) == {"segment-1", "segment-2"}
+    assert (work / "segments" / "1" / "work" / "image_optimization_prompt.txt").read_text() == "prompt-1\n"
+    assert (work / "segments" / "2" / "work" / "image_optimization_prompt.txt").read_text() == "prompt-2\n"
+
+
+def test_invalid_global_continuity_stops_before_any_segment_prompt(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    prompt_calls = []
+
+    def fail_continuity(*_args, **_kwargs):
+        raise pipeline.PipelineError("image continuity output is missing or invalid")
+
+    monkeypatch.setattr(pipeline, "_generate_image_continuity_plan", fail_continuity)
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_image_optimization_prompt",
+        lambda *_args, **_kwargs: prompt_calls.append(True),
+    )
+
+    with pytest.raises(pipeline.PipelineError, match="image continuity"):
+        pipeline._generate_segmented_image_prompts(
+            settings,
+            object(),
+            [
+                {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut"},
+                {"index": 2, "chain_id": "chain-001", "join_mode": "continue"},
+            ],
+            [{"index": 1}, {"index": 2}],
+            tmp_path / "work",
+            session_dir=tmp_path,
+            workers=2,
+        )
+
+    assert prompt_calls == []
 
 
 def test_long_scene_bounds_normalize_detector_millisecond_rounding(tmp_path):
@@ -217,6 +311,9 @@ def test_run_converges_container_duration_to_visual_manifest_timeline(
     assert stored["duration_s"] == 16.766667
     assert captured["duration_s"] == 16.766667
     assert captured["segments"][-1]["end_s"] == 16.766667
+    assert stored["_image_continuity"]["segment_indices"] == [
+        segment["index"] for segment in captured["segments"]
+    ]
 
 
 def test_run_does_not_reprobe_or_rewrite_frozen_generation(tmp_path, monkeypatch):
@@ -1548,6 +1645,7 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_prepared_receipt(
     assert loaded.normalized_audio is None
     assert loaded.voice_texts == ()
     frozen = stored["_image_optimization"]
+    assert "_image_continuity" not in stored
     assert frozen["version"] == 2
     assert frozen["segments"][0]["current"] == (
         "Codex 生成的 anchor_consistency 图片二次编辑提示词"
