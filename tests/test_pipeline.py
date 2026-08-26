@@ -26,21 +26,23 @@ from app.main import create_app
 
 @pytest.fixture(autouse=True)
 def _stub_image_postprocess_codex(monkeypatch):
-    monkeypatch.setattr(
-        pipeline.image_optimization,
-        "generate_prompt",
-        lambda _runner, _keyframes, mode, **_kwargs: (
-            f"Codex 生成的 {mode} 图片二次编辑提示词"
-        ),
-    )
-    monkeypatch.setattr(
-        pipeline.image_optimization,
-        "generate_continuity_plan",
-        lambda _runner, segments, **_kwargs: {
+    def generate(_runner, segments, mode, **_kwargs):
+        indices = [segment["index"] for segment in segments]
+        continuity = None if indices == [0] else {
             "version": 1,
-            "segment_indices": [segment["index"] for segment in segments],
+            "segment_indices": indices,
             "elements": [],
-        },
+        }
+        return continuity, {
+            index: (
+                f"Codex 生成的 {mode} 图片二次编辑提示词"
+                + (f"-{index}" if indices != [0] else "")
+            )
+            for index in indices
+        }
+
+    monkeypatch.setattr(
+        pipeline.image_optimization, "generate_project_prompts", generate
     )
 
 ROOT = Path(pipeline.__file__).resolve().parent.parent
@@ -76,7 +78,7 @@ def _make_conversation(settings, video_1s):
     return storage.update_meta(settings.data_dir, meta["id"], voice_mode="none")
 
 
-def test_segmented_image_prompts_freeze_global_map_before_parallel_segments(
+def test_segmented_image_prompts_come_from_one_project_call(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path)
@@ -94,23 +96,15 @@ def test_segmented_image_prompts_freeze_global_map_before_parallel_segments(
         "segment_indices": [1, 2],
         "elements": [],
     }
-    events = []
+    calls = []
 
-    def fake_continuity(*_args, **_kwargs):
-        events.append("continuity")
-        return global_plan
+    def fake_project(_settings, _runner, specs, **_kwargs):
+        calls.append(specs)
+        return global_plan, {1: "prompt-1", 2: "prompt-2"}
 
-    def fake_prompt(_settings, _runner, keyframes, *, segment_index, continuity, **_kwargs):
-        assert events == ["continuity"] or events[0] == "continuity"
-        assert continuity is global_plan
-        assert keyframes == (
-            work / "segments" / str(segment_index) / "work" / "keyframes"
-        )
-        events.append(f"segment-{segment_index}")
-        return f"prompt-{segment_index}"
-
-    monkeypatch.setattr(pipeline, "_generate_image_continuity_plan", fake_continuity)
-    monkeypatch.setattr(pipeline, "_generate_image_optimization_prompt", fake_prompt)
+    monkeypatch.setattr(
+        pipeline, "_generate_image_optimization_project", fake_project
+    )
 
     frozen, prompts = pipeline._generate_segmented_image_prompts(
         settings,
@@ -119,32 +113,26 @@ def test_segmented_image_prompts_freeze_global_map_before_parallel_segments(
         [dict(segment) for segment in segments],
         work,
         session_dir=work.parent,
-        workers=2,
     )
 
     assert frozen is global_plan
     assert prompts == {1: "prompt-1", 2: "prompt-2"}
-    assert events[0] == "continuity"
-    assert set(events[1:]) == {"segment-1", "segment-2"}
+    assert len(calls) == 1
+    assert [item["index"] for item in calls[0]] == [1, 2]
     assert (work / "segments" / "1" / "work" / "image_optimization_prompt.txt").read_text() == "prompt-1\n"
     assert (work / "segments" / "2" / "work" / "image_optimization_prompt.txt").read_text() == "prompt-2\n"
 
 
-def test_invalid_global_continuity_stops_before_any_segment_prompt(tmp_path, monkeypatch):
+def test_invalid_project_output_stops_before_writing_segment_prompts(tmp_path, monkeypatch):
     settings = make_settings(tmp_path)
-    prompt_calls = []
+    def fail_project(*_args, **_kwargs):
+        raise pipeline.PipelineError("image optimization output is missing or invalid")
 
-    def fail_continuity(*_args, **_kwargs):
-        raise pipeline.PipelineError("image continuity output is missing or invalid")
-
-    monkeypatch.setattr(pipeline, "_generate_image_continuity_plan", fail_continuity)
     monkeypatch.setattr(
-        pipeline,
-        "_generate_image_optimization_prompt",
-        lambda *_args, **_kwargs: prompt_calls.append(True),
+        pipeline, "_generate_image_optimization_project", fail_project
     )
 
-    with pytest.raises(pipeline.PipelineError, match="image continuity"):
+    with pytest.raises(pipeline.PipelineError, match="image optimization"):
         pipeline._generate_segmented_image_prompts(
             settings,
             object(),
@@ -155,10 +143,9 @@ def test_invalid_global_continuity_stops_before_any_segment_prompt(tmp_path, mon
             [{"index": 1}, {"index": 2}],
             tmp_path / "work",
             session_dir=tmp_path,
-            workers=2,
         )
 
-    assert prompt_calls == []
+    assert not list((tmp_path / "work").rglob("image_optimization_prompt.txt"))
 
 
 def test_long_scene_bounds_normalize_detector_millisecond_rounding(tmp_path):

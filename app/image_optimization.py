@@ -1,4 +1,4 @@
-"""Frozen per-segment image-optimization prompts and strict CAS editing."""
+"""Project-level prompt generation, frozen segment prompts, and strict CAS editing."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ from app.config import (
 
 MAX_PROMPT_BYTES = 32 * 1024
 MAX_CONTINUITY_BYTES = 32 * 1024
+MAX_PROJECT_OUTPUT_OVERHEAD_BYTES = 64 * 1024
 _ROOT = Path(__file__).resolve().parents[1]
 _SKILL = _ROOT / "skills" / "image-postprocess" / "SKILL.md"
-_CONTINUITY_SKILL = _ROOT / "skills" / "image-continuity" / "SKILL.md"
 _ELEMENT_KINDS = {
     "PERSON": "person",
     "SUBJECT": "subject",
@@ -68,52 +68,29 @@ def _copy_regular(source: Path, destination: Path) -> None:
         os.close(fd)
 
 
-def _read_output(path: Path) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        raise ImageOptimizationOutputError("image optimization output is missing or invalid") from None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PROMPT_BYTES:
-            raise ImageOptimizationOutputError("image optimization output is missing or invalid")
-        with os.fdopen(fd, "rb", closefd=False) as stream:
-            raw = stream.read(MAX_PROMPT_BYTES + 1)
-    finally:
-        os.close(fd)
-    try:
-        text = raw.decode("utf-8").strip()
-    except UnicodeDecodeError:
-        raise ImageOptimizationOutputError("image optimization output is missing or invalid") from None
-    if not text or len(text.encode("utf-8")) > MAX_PROMPT_BYTES:
-        raise ImageOptimizationOutputError("image optimization output is missing or invalid")
-    return text
-
-
-def _read_json_output(path: Path) -> object:
+def _read_json_output(path: Path, max_bytes: int) -> object:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
     except OSError:
         raise ImageOptimizationOutputError(
-            "image continuity output is missing or invalid"
+            "image optimization output is missing or invalid"
         ) from None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONTINUITY_BYTES:
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
             raise ImageOptimizationOutputError(
-                "image continuity output is missing or invalid"
+                "image optimization output is missing or invalid"
             )
         with os.fdopen(fd, "rb", closefd=False) as stream:
-            raw = stream.read(MAX_CONTINUITY_BYTES + 1)
+            raw = stream.read(max_bytes + 1)
     finally:
         os.close(fd)
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ImageOptimizationOutputError(
-            "image continuity output is missing or invalid"
+            "image optimization output is missing or invalid"
         ) from None
 
 
@@ -186,36 +163,101 @@ def _validated_frames(source: Path) -> list[Path]:
     return frames
 
 
-def generate_continuity_plan(runner, segments: list[dict], *, session_dir: Path) -> dict:
-    """Generate one frozen cross-segment element map before per-segment prompts."""
+def _canonical_prompt(value: object) -> str:
+    if not isinstance(value, str):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    prompt = value.strip()
+    if not prompt or len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return prompt
+
+
+def _canonical_project_output(value: object, indices: list[int]) -> tuple[dict | None, dict[int, str]]:
+    if not isinstance(value, dict) or set(value) != {
+        "version", "segment_indices", "global_elements", "segment_prompts"
+    } or value.get("version") != 1 or value.get("segment_indices") != indices:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    elements = value.get("global_elements")
+    if indices == [0]:
+        if elements != []:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        continuity = None
+    else:
+        try:
+            continuity = _canonical_continuity({
+                "version": 1,
+                "segment_indices": indices,
+                "elements": elements,
+            }, indices)
+        except ImageOptimizationOutputError:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            ) from None
+    raw_prompts = value.get("segment_prompts")
+    if not isinstance(raw_prompts, list) or len(raw_prompts) != len(indices):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    prompts: dict[int, str] = {}
+    for expected, item in zip(indices, raw_prompts):
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"segment_index", "prompt"}
+            or item.get("segment_index") != expected
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        prompts[expected] = _canonical_prompt(item.get("prompt"))
+    return continuity, prompts
+
+
+def generate_project_prompts(
+    runner,
+    segments: list[dict],
+    edit_mode: str,
+    *,
+    session_dir: Path,
+) -> tuple[dict | None, dict[int, str]]:
+    """Run one project-level Skill that returns global mappings and real prompts."""
+    if edit_mode not in SEEDREAM_EDIT_MODES:
+        raise ValueError("unsupported image optimization edit mode")
     try:
         session = Path(session_dir).resolve(strict=True)
-        skill = _CONTINUITY_SKILL.resolve(strict=True)
+        skill = _SKILL.resolve(strict=True)
     except OSError:
-        raise ValueError("invalid image continuity input") from None
-    if not isinstance(segments, list) or len(segments) < 2 or not skill.is_file():
-        raise ValueError("invalid image continuity segments")
-    indices = [segment.get("index") for segment in segments if isinstance(segment, dict)]
-    if len(indices) != len(segments) or indices != list(range(1, len(segments) + 1)):
-        raise ValueError("invalid image continuity segments")
+        raise ValueError("invalid image optimization input") from None
+    if not skill.is_file() or not isinstance(segments, list) or not segments:
+        raise ValueError("invalid image optimization segments")
+    indices = [item.get("index") for item in segments if isinstance(item, dict)]
+    if len(indices) != len(segments) or indices not in ([0], list(range(1, len(segments) + 1))):
+        raise ValueError("invalid image optimization segments")
     prepared = []
     for segment in segments:
         if set(segment) != {"index", "chain_id", "join_mode", "keyframes_dir"}:
-            raise ValueError("invalid image continuity segments")
-        chain_id, join_mode = segment["chain_id"], segment["join_mode"]
+            raise ValueError("invalid image optimization segments")
         if (
-            not isinstance(chain_id, str) or not chain_id or len(chain_id) > 128
-            or join_mode not in {"hard_cut", "continue"}
+            not isinstance(segment["chain_id"], str) or not segment["chain_id"]
+            or len(segment["chain_id"]) > 128
+            or segment["join_mode"] not in {"hard_cut", "continue"}
         ):
-            raise ValueError("invalid image continuity segments")
+            raise ValueError("invalid image optimization segments")
         try:
             source = Path(segment["keyframes_dir"]).resolve(strict=True)
             source.relative_to(session)
         except (OSError, TypeError, ValueError):
-            raise ValueError("invalid image continuity segments") from None
+            raise ValueError("invalid image optimization segments") from None
         prepared.append((segment, _validated_frames(source)))
 
-    with tempfile.TemporaryDirectory(prefix="duet-image-continuity-", dir="/tmp") as raw:
+    with tempfile.TemporaryDirectory(prefix="duet-image-postprocess-", dir="/tmp") as raw:
         stage = Path(raw).resolve(strict=True)
         work = stage / "work"
         _copy_regular(skill, stage / "SKILL.md")
@@ -231,7 +273,10 @@ def generate_continuity_plan(runner, segments: list[dict], *, session_dir: Path)
                 "join_mode": segment["join_mode"],
             })
         (work / "request.json").write_text(
-            json.dumps({"segments": request_segments}, ensure_ascii=False, separators=(",", ":")) + "\n",
+            json.dumps({
+                "edit_mode": edit_mode,
+                "segments": request_segments,
+            }, ensure_ascii=False, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
         run_error: CodexError | None = None
@@ -244,87 +289,15 @@ def generate_continuity_plan(runner, segments: list[dict], *, session_dir: Path)
         except CodexError as error:
             run_error = error
         try:
-            return _canonical_continuity(
-                _read_json_output(work / "continuity.json"), indices
+            max_bytes = (
+                MAX_CONTINUITY_BYTES
+                + MAX_PROMPT_BYTES * len(indices)
+                + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES
             )
-        except ImageOptimizationOutputError:
-            if run_error is not None:
-                raise run_error from None
-            raise
-
-
-def generate_prompt(
-    runner,
-    keyframes_dir: Path,
-    edit_mode: str,
-    *,
-    session_dir: Path,
-    segment_index: int | None = None,
-    continuity: dict | None = None,
-) -> str:
-    """Run the independent Skill with only this segment's frames and edit mode."""
-    if edit_mode not in SEEDREAM_EDIT_MODES:
-        raise ValueError("unsupported image optimization edit mode")
-    try:
-        source = Path(keyframes_dir).resolve(strict=True)
-        session = Path(session_dir).resolve(strict=True)
-        skill = _SKILL.resolve(strict=True)
-        source.relative_to(session)
-    except (OSError, ValueError):
-        raise ValueError("invalid image optimization keyframes directory") from None
-    if not skill.is_file():
-        raise ValueError("invalid image optimization keyframes directory")
-    frames = _validated_frames(source)
-    if (continuity is None) != (segment_index is None):
-        raise ValueError("invalid image continuity binding")
-    segment_continuity = None
-    if continuity is not None:
-        canonical = _canonical_continuity(continuity)
-        if (
-            isinstance(segment_index, bool) or not isinstance(segment_index, int)
-            or segment_index not in canonical["segment_indices"]
-        ):
-            raise ValueError("invalid image continuity binding")
-        segment_continuity = {
-            "version": 1,
-            "segment_index": segment_index,
-            "elements": [
-                element for element in canonical["elements"]
-                if segment_index in element["segments"]
-            ],
-        }
-
-    with tempfile.TemporaryDirectory(prefix="duet-image-postprocess-", dir="/tmp") as raw:
-        stage = Path(raw).resolve(strict=True)
-        work = stage / "work"
-        staged_frames = work / "keyframes"
-        staged_frames.mkdir(parents=True, mode=0o700)
-        _copy_regular(skill, stage / "SKILL.md")
-        for frame in frames:
-            _copy_regular(frame, staged_frames / frame.name)
-        request = {"edit_mode": edit_mode}
-        if segment_continuity is not None:
-            request["segment_index"] = segment_index
-            (work / "continuity.json").write_text(
-                json.dumps(segment_continuity, ensure_ascii=False, separators=(",", ":")) + "\n",
-                encoding="utf-8",
+            return _canonical_project_output(
+                _read_json_output(work / "image_optimization.json", max_bytes),
+                indices,
             )
-        (work / "request.json").write_text(
-            json.dumps(request, ensure_ascii=False, separators=(",", ":"))
-            + "\n",
-            encoding="utf-8",
-        )
-        run_error: CodexError | None = None
-        try:
-            runner.run_isolated(
-                stage,
-                "严格执行当前目录 SKILL.md；只读取其中允许的输入，并写入规定的唯一输出文件。",
-                session_dir=session,
-            )
-        except CodexError as error:
-            run_error = error
-        try:
-            return _read_output(work / "image_optimization_prompt.txt")
         except ImageOptimizationOutputError:
             if run_error is not None:
                 raise run_error from None

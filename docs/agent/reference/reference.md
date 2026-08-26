@@ -272,7 +272,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 短视频只能使用逻辑段 `0`；长视频使用连续正整数段 `1..N`。接口只允许 schema v2 分析已完成且 generation/postprocess 都尚未创建时调用，以 `expected_sha256` CAS 保存；未知字段、空白或超过 32 KiB 的提示词、非法段号在写入前拒绝。摘要漂移返回结构化 409 `image_optimization_prompt_changed`；输入已冻结返回 `image_optimization_prompt_frozen`。成功返回该段新的 `{text,default_text,sha256}`。恢复默认由客户端把 `default_text` 放入草稿，仍需调用本接口保存。
 
-视觉关键帧冻结后，多段项目先执行 `skills/image-continuity`：输入为全部分段关键帧与 `index/chain_id/join_mode`，输出严格 JSON 全局元素映射。后端只把适用于当前段的条目写入该段隔离区，再执行 `skills/image-postprocess`；该 Skill 看不到其他段图片。短视频跳过全局阶段。分段输出原样成为默认提示词，不读取或复制 H3 提示词。项目在分析完成时冻结同一个 Seedream 模型和模式，但这些内部字段不会出现在 detail。短视频在顶层返回 `image_optimization_prompt`；长视频把对应对象放入每个 `segments[]`。
+视觉关键帧冻结后，项目只执行一次 `skills/image-postprocess`：短视频输入逻辑段 `0`，多段项目输入全部分段关键帧与 `index/chain_id/join_mode`。唯一严格 JSON 输出同时包含跨段元素映射和全部分段真实 Seedream 提示词；后端整体验证后再冻结，任一部分非法则全部拒绝。Skill 不读取或复制 H3 提示词。项目在分析完成时冻结同一个 Seedream 模型和模式，但这些内部字段不会出现在 detail。短视频在顶层返回 `image_optimization_prompt`；长视频把对应对象放入每个 `segments[]`。
 
 ### `POST /api/conversations/{cid}/postprocess`
 

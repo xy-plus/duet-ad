@@ -27,21 +27,23 @@ from app.main import create_app
 
 @pytest.fixture(autouse=True)
 def _stub_image_postprocess_codex(monkeypatch):
-    monkeypatch.setattr(
-        pipeline.image_optimization,
-        "generate_prompt",
-        lambda _runner, _keyframes, mode, **_kwargs: (
-            f"Codex 生成的 {mode} 图片二次编辑提示词"
-        ),
-    )
-    monkeypatch.setattr(
-        pipeline.image_optimization,
-        "generate_continuity_plan",
-        lambda _runner, segments, **_kwargs: {
+    def generate(_runner, segments, mode, **_kwargs):
+        indices = [segment["index"] for segment in segments]
+        continuity = None if indices == [0] else {
             "version": 1,
-            "segment_indices": [segment["index"] for segment in segments],
+            "segment_indices": indices,
             "elements": [],
-        },
+        }
+        return continuity, {
+            index: (
+                f"Codex 生成的 {mode} 图片二次编辑提示词"
+                + (f"-{index}" if indices != [0] else "")
+            )
+            for index in indices
+        }
+
+    monkeypatch.setattr(
+        pipeline.image_optimization, "generate_project_prompts", generate
     )
 
 # 1×1 真实 PNG（validate_work_dir 会用 cv2 解码校验）
@@ -261,7 +263,6 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     line = {"text": "局部台词", "start_s": 16.5, "end_s": 17.5}
     calls = {"cmd": [], "codex": []}
     image_calls = []
-    image_barrier = threading.Barrier(3)
 
     def fake_voice_step(*args, **kwargs):
         return [line]
@@ -270,13 +271,17 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
         calls["codex"].append(Path(workdir))
         _write_valid_package(Path(workdir) / "work", prompt=f"局部动作-{Path(workdir).name}")
 
-    def fake_image_prompt(
-        _runner, _keyframes, mode, *, session_dir, segment_index, continuity
-    ):
-        assert segment_index in continuity["segment_indices"]
-        image_calls.append(Path(session_dir).name)
-        image_barrier.wait(timeout=5)
-        return f"图片二次编辑提示词-{Path(session_dir).name}-{mode}"
+    def fake_image_project(_runner, segments, mode, *, session_dir):
+        indices = [segment["index"] for segment in segments]
+        image_calls.append((Path(session_dir), indices))
+        return {
+            "version": 1,
+            "segment_indices": indices,
+            "elements": [],
+        }, {
+            index: f"图片二次编辑提示词-{index}-{mode}"
+            for index in indices
+        }
 
     base_fake_cmd = _fake_cmd_segments(calls, SEGMENTS)
 
@@ -324,7 +329,11 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
     monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
     monkeypatch.setattr(CodexRunner, "run", fake_codex)
-    monkeypatch.setattr(pipeline.image_optimization, "generate_prompt", fake_image_prompt)
+    monkeypatch.setattr(
+        pipeline.image_optimization,
+        "generate_project_prompts",
+        fake_image_project,
+    )
 
     pipeline.run(settings, cid, CodexRunner(1, 1))
 
@@ -348,7 +357,7 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
         "chain-002",
         "chain-003",
     ]
-    assert sorted(image_calls) == ["1", "2", "3"]
+    assert image_calls == [(cdir, [1, 2, 3])]
     frozen_prompts = stored["_image_optimization"]["segments"]
     assert [item["current"] for item in frozen_prompts] == [
         f"图片二次编辑提示词-{index}-anchor_consistency"
