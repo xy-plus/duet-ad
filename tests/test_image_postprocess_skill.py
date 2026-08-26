@@ -116,12 +116,13 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
     assert "Unicode 字符数" in skill
-    assert "不超过 160 个字符" in skill
+    assert "不超过 120 个字符" in skill
     assert "恰好两句话" in skill
     assert "生成前自行计数" in skill
     assert "超长必须重写，不能截断" in skill
     assert "32KB" not in skill
 
+    assert "先检查项目全部片段的全部冻结关键帧" in skill
     assert "人物外观" in skill and "背景" in skill
     assert "严格二选一" in skill
     assert "人物脸部和服装" in skill and "稳定同一性" in skill
@@ -134,13 +135,16 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "目标人物的头部位置、大小、朝向和画面裁切" in skill
     assert "最危险的手与功能道具" in skill
     assert "接触、插入或对齐关系" in skill
+    assert "只点名一个最危险的手与功能道具关系" in skill
     assert "先删冗余词" in skill
     assert "不得省略上述锁定项" in skill
     assert "其余一切不变、真实摄影、无文字或 Logo" in skill
 
-    assert "第一句只写唯一替换目标和足够具体的新设计" in skill
+    assert "人物目标的第一句只写新面孔与同色同风格不同款服装" in skill
+    assert "避免堆砌长相细节" in skill
     assert "不得写任何保持项" in skill
-    assert "第二句只写不可变边界" in skill
+    assert "第二句明确只有人物外观和服装表面可变" in skill
+    assert "禁止画质优化、风格化、全场景复述或道具改款" in skill
     assert "independent_parallel" in skill and "不写参考图角色说明" in skill
     assert "anchor_consistency" in skill
     assert "参考图只认目标身份或设计，不参考构图" in skill
@@ -149,16 +153,27 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "global_elements 只允许 PERSON、OUTFIT、SCENE" in skill
     assert "同一人物跨段重复且选择人物时" in skill
     assert "所有安全可见的相关段都选择人物" in skill
-    assert "否则相关段一致选择背景" in skill
+    assert "相关段不得改背景" in skill
+    assert "人物不安全或不可见时，整个相关组件统一选择背景" in skill
     assert "PERSON、OUTFIT 的 replacement 逐字复用" in skill
     assert "相同替换描述必须跨段逐字复用" in skill
     assert "所有 ID 按完整字符串字典序输出" in skill
     assert "三部分语义" not in skill
     assert "四大段" not in skill
-    assert "画质优化" not in skill
     assert "模式说明保持简短" not in skill
     assert "人与物/物与物的握持、接触、插入、对齐、连接、遮挡、前后顺序" not in skill
     assert "陀螺" not in skill and "发射器" not in skill
+
+
+def test_skill_rejects_continuity_risk_before_deduplication():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "第一优先级是最终视频连续性和现实合理性" in skill
+    assert "任何扭曲、元素突变、物理或接触关系异常均一票否决" in skill
+    assert "人物或背景替换仅是第二优先级的去重手段" in skill
+    assert "只有通过第一层才评价" in skill
+    assert "人物替换风险高时，整个相关组件必须项目级统一回退背景" in skill
+    assert "不得为完成换人牺牲连续性" in skill
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
