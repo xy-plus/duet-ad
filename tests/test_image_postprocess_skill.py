@@ -19,14 +19,29 @@ def _png(value: int = 127) -> bytes:
     return encoded.tobytes()
 
 
-def test_independent_skill_is_compact_and_declares_optional_secondary_editing():
+def test_skill_keeps_anchor_element_only_and_forbids_frame_narration():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
     assert "name: image-postprocess" in skill
-    assert "可能选择" in skill
     assert "图片二次编辑" in skill
     assert "不代表" in skill and "一定" in skill
+    assert "原元素 → 新元素" in skill
+    assert "其他输入图片只是元素锚点" in skill
+    assert "锚点不提供内容、构图、动作、机位、景别、光线或位置参考" in skill
+    assert "仅当目标帧本身存在某元素时" in skill
+    assert "不得从锚点向目标帧新增" in skill
+    assert "第一张输入是唯一目标帧" in skill
+    assert "保持第一张图片的近距离俯拍机位" in skill
+    assert "手持玩具位于前景" in skill
+    assert "猫位于后方" in skill
+    assert "不得写某一帧特有的空间描述" in skill
+    assert "不得包含“原镜头语义参考”" in skill
+    assert "同性别呈现" in skill
+    assert "长相略有不同" in skill
+    assert "同类型但不重复的真实场景" in skill
+    assert "同一个新人物或同一套新设计" in skill
+    assert "必须逐字以下段开头" in skill
     assert "work/image_optimization_prompt.txt" in skill
-    assert "prompt.txt" in skill and "不得读取" in skill
+    assert "视频生成提示词" in skill and "不得读取" in skill
     assert len(skill.encode("utf-8")) < 12 * 1024
 
 

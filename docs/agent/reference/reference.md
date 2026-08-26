@@ -291,7 +291,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 顶层 key 必须恰为 `confirm/options`，canonical options 必须恰为三个 bool；精确旧两字段请求兼容为 `optimize_image=false`，其余未知、缺失或非 bool 返回 422。至少一项为 true。已知旧页面 option `change_bg/face_hold` 返回纯文本中文刷新提示，不写状态、不调用供应商；若同时混入其他未知字段仍 fail closed。每项还必须由 detail 的 `postprocess_capabilities` 允许：文字和品牌能力取决于 MediaKit 开关，图片优化能力取决于 `ARK_API_KEY`。
 
-接受后冻结选项、每段已审阅提示词与后端模型/模式，返回 `{"status":"running","frames":[]}`。短视频按段 0，长视频按 1..N 并行；段内严格执行已选的 `full_screen_text_erase → full_screen_icon_erase → Seedream` 阶段屏障，帧请求受 MediaKit/Seedream 独立并发上限控制。图片模式为 `anchor_consistency` 时先用本段全部清理帧生成第一张锚帧，再并行处理剩余帧；`independent_parallel` 则每帧独立并行。供应商返回图统一转为源图精确尺寸 PNG，整段完成后才原子发布同名 canonical 文件。
+接受后冻结选项、每段已审阅提示词与后端模型/模式，返回 `{"status":"running","frames":[]}`。短视频按段 0，长视频按 1..N 并行；段内严格执行已选的 `full_screen_text_erase → full_screen_icon_erase → Seedream` 阶段屏障，帧请求受 MediaKit/Seedream 独立并发上限控制。图片模式为 `anchor_consistency` 时先用本段全部清理帧生成第一张锚帧，再并行处理剩余帧；锚帧只约束目标帧中重复元素的替换身份和外观，不得成为构图或内容模板。`independent_parallel` 则每帧独立并行。供应商返回图统一转为源图精确尺寸 PNG，整段完成后才原子发布同名 canonical 文件。
 
 detail 的 `postprocess` 为 `{status,options,frames,segments,error}`；每段只公开 `{index,status,stage,completed_frames,total_frames,revision,error}`。任一段失败不取消其他段，但整体为 failed，生成返回 409 `postprocess_not_ready`；全部完成后优化帧进入 H3 冻结输入。禁用返回 501，旧会话返回 409 `read_only`，输入未 done/正在运行返回 409；generation 已创建返回 409 `generation_already_started`；done 后改变冻结选项返回结构化 409 `postprocess_options_locked`。既有 failed 状态拒绝普通 POST 并返回 `postprocess_segment_retry_required`，避免重置 revision 或绕过分段 CAS。
 

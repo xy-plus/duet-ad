@@ -33,7 +33,7 @@ links: [conversation-task, result-display]
 - 图片优化提示词提供保存、恢复默认、复制；短视频逻辑段固定使用 `segment_index=0`，长视频使用各自正整数段号。存在 dirty 草稿时，切换文本、分段、会话、新建会话、开始生成、打开或提交后处理、退出应用都会先要求“保存 / 丢弃 / 取消”；保存失败留在原处。刷新或关闭页面由 `beforeunload` 拦截，2 秒轮询不得覆盖 dirty 文本。
 - 当前选项为 `remove_subtitle`、`remove_brand`、`optimize_image`；`change_bg/face_hold` 已删除。旧页面请求只得到纯文本刷新提示，不会静默采用或自动重试。
 - `remove_subtitle` 映射 `full_screen_text_erase`；`remove_brand` 作为兼容字段映射 `full_screen_icon_erase`，只承诺清理常见 Logo/图标。双选会执行两个独立付费阶段。
-- 三个阶段在每段内严格按“文字/字幕 → Logo/图标 → 图片优化”执行；段之间并行，段内每个阶段的帧并行受服务端并发上限约束。锚帧一致性模式会先生成首张新锚帧，再以锚帧并行编辑其余帧；独立模式逐帧并行。两种内部模式都不显示在页面。
+- 三个阶段在每段内严格按“文字/字幕 → Logo/图标 → 图片优化”执行；段之间并行，段内每个阶段的帧并行受服务端并发上限约束。锚帧一致性模式会先生成首张新锚帧，再以它约束后续帧中重复人物、服装、道具和场景的替换结果；锚帧不能覆盖当前目标帧的内容、构图、机位、动作、光线或元素位置。共享提示词不得复述单帧布局。两种内部模式都不显示在页面。
 - 每个付费 POST 前持久化私有 receipt。只有完整 HTTP 429、`success=false`、精确 `RequestLimitExceeded` 时，才按 `AUTO_RETRY_COUNT/AUTO_RETRY_INTERVAL_S` 自动退避并追加新 attempt；网络异常、5xx、无效/不完整响应仍视为结果未知并禁止重发。已收到成功响应但下载失败时只恢复 GET。MediaKit WebP 结果经解码、尺寸校验和 PNG 转码后才进入 `frames`。
 - Seedream 每帧总计最多 3 次 POST，且只有完整 HTTP 429、精确 `QuotaExceeded`、响应无 `data` 才自动重试；网络/超时/取消一律记为 `submission_unknown`。重启只恢复可证明安全的本地阶段，不自动重发未知 POST。
 - 后处理一旦开始，H3 提交必须等待其 `done`；完成后每张 `postprocessed/` 优化帧都会替代同名原关键帧，进入冻结输入 receipt 和实际 H3 请求。缺帧或状态异常时 fail closed，不回退原图。
