@@ -117,7 +117,7 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
     assert "Unicode 字符数" in skill
-    assert "不超过 300 个字符" in skill
+    assert "不超过 220 个 Unicode 字符" in skill
     assert "生成前自行计数" in skill
     assert "超长必须重写，不能截断" in skill
     assert "32KB" not in skill
@@ -125,12 +125,12 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "人物外观" in skill and "背景" in skill
     assert "严格二选一" in skill
     assert "人物脸部和服装" in skill and "稳定同一性" in skill
-    assert "优先选择人物外观" in skill
-    assert "选择人物外观时不得修改背景" in skill
+    assert "唯一选择人物外观" in skill
+    assert "选择人物外观时背景不得改变" in skill
     assert "选择背景时不得修改人物或服装" in skill
 
-    assert "核心商品、功能道具、玩具、手部" in skill
-    assert "人与物/物与物的握持、接触、插入、对齐、连接、遮挡、前后顺序" in skill
+    assert "手部、核心商品、玩具、功能道具" in skill
+    assert "人与物/物与物的握持、接触、插入、对齐、连接、遮挡、前后关系" in skill
     assert "数量、结构、方向" in skill
     assert "全部不可编辑" in skill
     assert "不得同类改款" in skill
@@ -145,8 +145,41 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
 
     assert "只有真正被替换且跨段重复的 PERSON、OUTFIT、SCENE" in skill
     assert "PROP、PRODUCT、SUBJECT 不得建立新映射" in skill
-    assert "相同替换描述必须跨段逐字复用" in skill
+    assert "同一人物或服装的描述必须跨段逐字复用" in skill
     assert "陀螺" not in skill and "发射器" not in skill
+
+
+def test_skill_person_first_candidate_contract():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "只要整段存在足够可见且能跨帧认定的人物" in skill
+    assert "唯一选择人物外观" in skill
+    assert "自然新面孔" in skill
+    assert "服装可见时必须一并替换为同色、同用途、同风格但不同款的服装" in skill
+    assert "受保护物出现在画面中本身不是人物不可安全替换的理由" in skill
+    assert "选择人物外观时背景不得改变" in skill
+    assert "只有整段没有安全可替换人物时才选择背景" in skill
+
+    assert "手部、核心商品、玩具、功能道具" in skill
+    assert "绝不编辑或改款" in skill
+    for relation in ("握持", "插入", "对齐", "连接", "遮挡", "前后关系"):
+        assert relation in skill
+
+    assert "人物目标的第一短句直接写人物具体替换" in skill
+    assert "背景目标的第一短句直接写背景具体替换" in skill
+    assert "不得泛化目标" in skill
+    assert "画质清单" in skill
+    assert "固定开头" in skill
+    assert "长禁止列表" in skill
+    assert "第二句锁定最危险的核心对象和关系" in skill
+    assert "第三句说明非目标不变、真实摄影、无文字和 Logo" in skill
+
+    assert "同一人物或服装的描述必须跨段逐字复用" in skill
+    assert "`global_elements` 只允许 PERSON、OUTFIT、SCENE" in skill
+    assert "跨段可识别为同一人物且任一段选择人物时" in skill
+    assert "所有该人物安全可见的片段都必须选择人物外观" in skill
+    assert "不得在其他片段改选背景" in skill
+    assert "同一 PERSON、OUTFIT replacement" in skill
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
