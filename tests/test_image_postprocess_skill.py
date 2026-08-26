@@ -117,17 +117,24 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
     assert "Unicode 字符数" in skill
-    assert "不超过 300 个字符" in skill
+    assert "不超过 220 个字符" in skill
+    assert "不超过 300 个字符" not in skill
     assert "生成前自行计数" in skill
     assert "超长必须重写，不能截断" in skill
     assert "32KB" not in skill
 
     assert "人物外观" in skill and "背景" in skill
     assert "严格二选一" in skill
+    assert "先判断" in skill and "高风险" in skill
+    for relation in ("手持", "插入", "安装", "发射", "对齐", "连接", "遮挡"):
+        assert relation in skill
+    assert "即使人物稳定可见" in skill
+    assert "唯一选择背景" in skill
+    assert "没有高风险互动" in skill
     assert "人物脸部和服装" in skill and "稳定同一性" in skill
-    assert "优先选择人物外观" in skill
     assert "选择人物外观时不得修改背景" in skill
-    assert "选择背景时不得修改人物或服装" in skill
+    assert "人物、服装、手部、全部前景物及其关系" in skill
+    assert "选择背景时" in skill and "不得改变" in skill
 
     assert "核心商品、功能道具、玩具、手部" in skill
     assert "人与物/物与物的握持、接触、插入、对齐、连接、遮挡、前后顺序" in skill
@@ -137,9 +144,12 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "只点名目标帧中最容易误改的剧情核心物体和关系" in skill
     assert "画质、功能道具、玩具、商品、宠物不得作为差异化目标" in skill
 
-    assert "第一句先写唯一替换目标及具体新设计" in skill
-    assert "核心对象与关系保持" in skill
-    assert "简短禁止项和真实摄影要求" in skill
+    assert "第一短句直接写唯一替换目标及具体新设计" in skill
+    assert "第二句只锁最危险的对象或关系" in skill
+    assert "第三句只写极简禁止项" in skill
+    assert "不得写画质优化" in skill
+    assert "不得使用固定开头" in skill
+    assert "不得复述全场景" in skill
     assert "当前图是唯一目标" in skill
     assert "不能传递构图" in skill
 
@@ -147,6 +157,27 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "PROP、PRODUCT、SUBJECT 不得建立新映射" in skill
     assert "相同替换描述必须跨段逐字复用" in skill
     assert "陀螺" not in skill and "发射器" not in skill
+
+
+def test_skill_background_replacement_preserves_relation_boundaries():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "场景类别与功能" in skill
+    assert "透视" in skill and "光向" in skill
+    assert "地面与人物的接触边界" in skill
+    assert "真实的同类环境" in skill
+    assert "功能道具、玩具、商品" in skill
+    assert "不得同类改款" in skill
+
+    assert "PERSON、OUTFIT、SCENE" in skill
+    assert "PROP、PRODUCT、SUBJECT" in skill
+    assert "不得建立新映射" in skill
+    assert "任一相关段存在高风险互动" in skill
+    assert "相关各段统一选择背景" in skill
+    assert "同一重复背景" in skill
+    assert "SCENE replacement" in skill
+    assert "逐字复用" in skill
+    assert "规则适用于任何项目" in skill
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
