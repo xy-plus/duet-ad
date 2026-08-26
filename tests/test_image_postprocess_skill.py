@@ -101,12 +101,12 @@ def test_skill_is_single_project_level_prompt_compiler():
     assert "name: image-postprocess" in skill
     assert "为了降低素材重复度" in skill
     assert "性别呈现" in skill and "长相略有不同" in skill
-    assert "同类型但不重复" in skill
-    assert "同一个新设计" in skill
+    assert "同功能、同表面类别但明显不同" in skill
+    assert "冻结同一个新设计" in skill
     assert "work/image_optimization.json" in skill
     assert "global_elements" in skill and "segment_prompts" in skill
     assert "真实提交给 Seedream" in skill
-    assert "当前图是唯一目标" in skill
+    assert "无需写“当前图是唯一目标”" in skill
     assert "其他图只提供目标设计" in skill
     assert "不复述全部构图或叙事" in skill
     assert len(skill.encode("utf-8")) < 12 * 1024
@@ -133,7 +133,7 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "先检查全项目全部关键帧" in skill
     assert "功能道具、商品、玩具或人与物互动" in skill
     assert "整个相关组件统一只替换背景" in skill
-    assert "跨段同类背景" in skill and "SCENE replacement" in skill
+    assert "所有相关段逐字复用" in skill and "SCENE replacement" in skill
     assert "人物和服装不得变化" in skill
     assert "完全没有核心前景互动" in skill
     assert "人物在所有相关段都稳定清晰" in skill
@@ -149,22 +149,20 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "画质、功能道具、玩具、商品、宠物不得作为差异化目标" in skill
 
     assert "恰好两句" in skill
-    assert "只将目标帧已有的墙、地面或固定建筑表面" in skill
-    assert "保持透视、光线方向、墙地交界" in skill
+    assert "只将所选的一类墙、地面或固定建筑表面" in skill
+    assert "边界、分块/拼缝、方向、透视和接触几何" in skill
     assert "第二句保护全部前景像素语义" in skill
-    assert "只点名一个最危险关系" in skill
     assert "文字或 Logo" in skill
     assert "画质美化" in skill
     assert "全景复述" in skill
     assert "物体清单" in skill
     assert "人物重绘" in skill
-    assert "当前图是唯一目标" in skill
-    assert "不传递构图" in skill
+    assert "不传递人物、构图、动作、物体或关系" in skill
 
-    assert "global_elements` 只允许 `PERSON`、`OUTFIT`、`SCENE`" in skill
+    assert "global_elements` 的 schema 只允许 `PERSON`、`OUTFIT`、`SCENE`" in skill
     assert "按完整 `id` 的字典序" in skill
     assert "PROP、PRODUCT、SUBJECT 不得建立新映射" in skill
-    assert "逐字复用同一个 `SCENE replacement`" in skill
+    assert "逐字复用同一个材质或色调及 `SCENE replacement`" in skill
     assert "陀螺" not in skill and "发射器" not in skill
 
 
@@ -180,23 +178,22 @@ def test_skill_freezes_balanced_component_strategy_and_exact_two_sentence_routes
     assert "才可为整个组件统一选择人物路线" in skill
 
     assert "墙、地面或固定建筑表面" in skill
-    assert "同类别的不同设计" in skill
+    assert "同功能、同表面类别但明显不同的材质或色调" in skill
     assert "墙地交界" in skill
-    assert "人物和物体与地面的接触" in skill
+    assert "接触几何" in skill
     assert "游戏角" in skill and "诱导新增陈设" in skill
     assert "人物、服装、手、玩具、商品" in skill
     assert "握持、插接、对齐、遮挡关系" in skill
-    assert "不增删物体、文字或 Logo" in skill
+    assert "禁止增删文字或 Logo" in skill
 
     assert "只替换同一人物的新脸" in skill
-    assert "明确安全时" in skill
-    assert "同色同风格的不同款服装" in skill
-    assert "头部位置、大小、朝向和裁切" in skill
-    assert "只锁定最危险关系，其余内容不变" in skill
+    assert "只换脸，不换服装" in skill
+    assert "头部位置、大小、朝向、裁切和遮挡" in skill
+    assert "同色同风格的不同款服装" not in skill
 
-    assert "不得写参考人物或参考角色" in skill
+    assert "不得写参考人物、参考角色或其他图" in skill
     assert "其他图只提供目标设计" in skill
-    assert "不传递构图、动作、物体或关系" in skill
+    assert "不传递人物、构图、动作、物体或关系" in skill
 
     assert "只收录实际跨段替换" in skill
     assert "完整 `id` 的字典序" in skill
@@ -209,12 +206,41 @@ def test_high_risk_background_route_is_in_place_surface_mapping_not_a_new_room()
     assert "不得描述或生成新房间" in skill
     assert "跨帧稳定背景表面类别" in skill
     assert "灰石墙、原有砖墙、木格栅、地板" in skill
-    assert "同一新材质和颜色" in skill
+    assert "同一个材质或色调" in skill
     assert "所有相关段逐字复用" in skill
     assert "墙体、门窗、插座、踢脚线、墙地交界" in skill
     assert "建筑几何与位置" in skill
-    assert "禁止新增、删除或移动固定构件、家具、陈设" in skill
+    assert "固定构件、家具、陈设不得新增、删除或移动" in skill
     assert "原位表面替换" in skill
+
+
+def test_final_j_uses_one_large_stable_surface_and_face_only_fallback():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "只选一个在全部相关段稳定可见" in skill
+    assert "面积尽量大的安全背景表面类别" in skill
+    assert "优先地面，其次墙面" in skill
+    assert "不得映射全部背景" in skill
+    assert "为每类冻结" not in skill
+
+    assert "同功能、同表面类别但明显不同的材质或色调" in skill
+    assert "原表面的边界、分块/拼缝、方向、透视和接触几何" in skill
+    assert "保持光线方向" in skill
+    assert "固定构件、家具、陈设不得新增、删除或移动" in skill
+    assert "目标表面不可见" in skill
+    assert "该帧不做其他改变" in skill
+
+    assert "无需写“当前图是唯一目标”" in skill
+    assert "其他图只提供目标设计" in skill
+    assert "不传递人物、构图、动作、物体或关系" in skill
+
+    assert "找不到稳定安全背景表面" in skill
+    assert "只换脸，不换服装" in skill
+    assert "可见的性别呈现、肤色和整体风格、年龄和气质" in skill
+    assert "头部位置、大小、朝向、裁切和遮挡" in skill
+    assert "跨段 `PERSON replacement`" in skill
+    assert "所有相关段逐字复用" in skill
+    assert "不得输出 `OUTFIT`" in skill
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
