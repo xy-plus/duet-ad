@@ -116,18 +116,28 @@ def test_skill_is_single_project_level_prompt_compiler():
 def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
+    assert "第一优先级是最终视频连续性和现实合理性" in skill
+    assert "扭曲、元素突变、物理或接触关系异常" in skill
+    assert "一票否决" in skill
+    assert "人物或背景替换仅是用于去重的第二优先级" in skill
+    assert "只有通过第一层才评价" in skill
+
     assert "Unicode 字符数" in skill
-    assert "不超过 300 个字符" in skill
+    assert "不超过 120 个字符" in skill
     assert "生成前自行计数" in skill
     assert "超长必须重写，不能截断" in skill
-    assert "32KB" not in skill
+    assert "不超过 300 个字符" not in skill
 
     assert "人物外观" in skill and "背景" in skill
-    assert "严格二选一" in skill
-    assert "人物脸部和服装" in skill and "稳定同一性" in skill
-    assert "优先选择人物外观" in skill
-    assert "选择人物外观时不得修改背景" in skill
-    assert "选择背景时不得修改人物或服装" in skill
+    assert "先检查全项目全部关键帧" in skill
+    assert "功能道具、商品、玩具或人与物互动" in skill
+    assert "整个相关组件统一只替换背景" in skill
+    assert "跨段同类背景" in skill and "SCENE replacement" in skill
+    assert "人物和服装不得变化" in skill
+    assert "完全没有核心前景互动" in skill
+    assert "人物稳定清晰" in skill
+    assert "才允许项目级统一人物替换" in skill
+    assert "优先选择人物外观" not in skill
 
     assert "核心商品、功能道具、玩具、手部" in skill
     assert "人与物/物与物的握持、接触、插入、对齐、连接、遮挡、前后顺序" in skill
@@ -137,15 +147,23 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "只点名目标帧中最容易误改的剧情核心物体和关系" in skill
     assert "画质、功能道具、玩具、商品、宠物不得作为差异化目标" in skill
 
-    assert "第一句先写唯一替换目标及具体新设计" in skill
-    assert "核心对象与关系保持" in skill
-    assert "简短禁止项和真实摄影要求" in skill
+    assert "恰好两句" in skill
+    assert "第一句只写同类别、同功能但不同的背景" in skill
+    assert "透视、光线方向和地面接触" in skill
+    assert "第二句保护全部前景像素语义" in skill
+    assert "只点名一个最危险关系" in skill
+    assert "文字或 Logo" in skill
+    assert "画质美化" in skill
+    assert "全景复述" in skill
+    assert "物体清单" in skill
+    assert "人物重绘" in skill
     assert "当前图是唯一目标" in skill
     assert "不能传递构图" in skill
 
-    assert "只有真正被替换且跨段重复的 PERSON、OUTFIT、SCENE" in skill
+    assert "global_elements` 只允许 `PERSON`、`OUTFIT`、`SCENE`" in skill
+    assert "按完整 `id` 的字典序" in skill
     assert "PROP、PRODUCT、SUBJECT 不得建立新映射" in skill
-    assert "相同替换描述必须跨段逐字复用" in skill
+    assert "逐字复用同一个 `SCENE replacement`" in skill
     assert "陀螺" not in skill and "发射器" not in skill
 
 
