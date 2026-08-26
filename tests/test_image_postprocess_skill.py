@@ -223,10 +223,10 @@ def test_skill_freezes_balanced_component_strategy_and_exact_two_sentence_routes
 def test_uses_one_large_stable_surface_and_face_only_fallback():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
-    assert "只选一个在相关帧中稳定对应且可见" in skill
+    assert "只选一个在每张冻结帧中都稳定对应、完整可见且外边界可定位" in skill
     assert "面积尽量大的单一安全表面" in skill
-    assert "允许个别关键帧因裁切不可见" in skill
-    assert "只编辑可见的源表面，目标表面不可见的图片不做任何改变" in skill
+    assert "允许个别关键帧因裁切不可见" not in skill
+    assert "只编辑可见的源表面，目标表面不可见的图片不做任何改变" not in skill
     assert "不得映射全部背景" in skill
     assert "为每类冻结" not in skill
 
@@ -235,7 +235,7 @@ def test_uses_one_large_stable_surface_and_face_only_fallback():
     assert "接触几何" in skill
     assert "保持光线方向" in skill
     assert "固定构件和边界结构不得新增、删除或移动" in skill
-    assert "该帧不做其他编辑" in skill
+    assert "不得让孤立的目标不可见帧继续收到共享编辑提示词" in skill
 
     assert "找不到稳定安全背景表面" in skill
     assert "只换脸，不换服装" in skill
@@ -251,19 +251,19 @@ def test_scene_membership_requires_each_segment_own_clear_surface_evidence():
     assert "每个拟列入 `SCENE segments` 的段必须用该段自身关键帧独立举证" in skill
     assert "不得用其他段、场景名称、语义类别相同或相似材质补证" in skill
 
-    assert "目标表面的身份、全部目标成员、连续可编辑区域、完整边界和原纹理拓扑清晰可辨" in skill
+    assert "目标表面的身份、全部目标成员、连续可编辑区域、完整外边界和原纹理拓扑清晰可辨" in skill
     assert "足以按原位置保留" in skill
-    assert "仅见模糊、小面积、遮挡到无法判界或不同朝向局部且无法确认同一表面" in skill
-    assert "不得把该段列入 `SCENE segments`" in skill
-
     assert "同一物理表面，或同一场景内设计连续且可安全统一映射的同一表面" in skill
     assert "仅同类表面不够" in skill
     assert "`hard_cut` 不自动否定同一表面，但每个段必须独立举证" in skill
 
-    assert "单个段内目标偶尔因裁切不可见时，该帧可以不改动" in skill
-    assert "该段整体资格必须由该段自身其他清晰关键帧证明" in skill
-    assert "最终少于两个合格段时不得建立背景 `SCENE`" in skill
-    assert "继续按人物仅换脸或不改动决策" in skill
+    assert "候选 `SCENE` 在拟编辑段的任一冻结帧中" in skill
+    assert "目标不可见、仅见边缘碎片或局部窄条" in skill
+    assert "该段不得列入 `SCENE segments`" in skill
+    assert "必须严格输出两句无条件不改动提示词" in skill
+    assert "不得用该段其他清晰帧补证" in skill
+    assert "全帧资格过滤后" in skill
+    assert "不足两个合格段时不得建立该全局元素" in skill
 
 
 def test_scene_component_excludes_unqualified_segments_with_noop_prompts():
@@ -314,7 +314,7 @@ def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
     assert "差异必须明显可见" in background_rules
     assert "无法安全获得明显差异时允许不改动" in background_rules
 
-    assert "只编辑可见的源表面" in background_rules
+    assert "只编辑可见的源表面" not in background_rules
     assert "只有资格门通过后" in background_rules
     assert "在已证明的完整目标域内完整覆盖" in background_rules
     assert "边界不确定的像素保持不变" not in background_rules
@@ -358,10 +358,11 @@ def test_replacement_domain_is_complete_hard_bounded_and_fail_closed():
     prompt_rules = skill.split("## 每段 Seedream 提示词", maxsplit=1)[1]
 
     assert "编辑资格门先于提示词" in skill
-    assert "任一目标可见帧的全部目标成员或完整边界不能稳定定位" in skill
+    assert "候选 `SCENE` 任一冻结帧的全部目标成员或完整外边界不能稳定定位" in skill
     assert "该段或组件必须输出两句不改动提示词" in skill
-    assert "只有所有目标可见帧通过资格门" in skill
-    assert "目标完全不可见的帧不做任何改变" in skill
+    assert "只有段内所有冻结帧通过资格门" in skill
+    assert "目标完全不可见的帧不做任何改变" not in skill
+    assert "任一冻结帧不合格时整段严格两句无条件不改动" in skill
     assert "在已证明的完整目标域内完整覆盖全部可见目标成员" in skill
     assert "不得留下旧外观孤岛" in skill
     assert "目标域外像素硬保留" in skill
@@ -376,14 +377,16 @@ def test_two_sentence_prompts_execute_frozen_identity_without_false_references()
 
     assert "段级提示词会复用于该段每次以一张当前源图为编辑目标的请求" in prompt_rules
     assert "每次单图请求" not in prompt_rules
-    assert "只写对每次当前待编辑源图都成立的通用投影守恒" in prompt_rules
-    assert "不得逐帧描述条件" in prompt_rules
-    assert "不得声称同时看过多张输入图" in prompt_rules
+    assert "两句只写通用投影守恒" in prompt_rules
+    assert "不得逐帧描述条件或声称同时看过多张输入图" in prompt_rules
     assert "各输入帧自身" not in prompt_rules
     assert "该帧的投影条件" not in prompt_rules
     assert "`independent_parallel` 只依赖当前源图和已冻结的自然语言身份短语" in prompt_rules
     assert "`anchor_consistency` 必须限制其他图的角色" in prompt_rules
     assert "其他图只提供目标设计" in prompt_rules
+    assert "编辑提示词只能发送到所有冻结帧均通过资格门的段" in prompt_rules
+    assert "不得包含以目标不可见为前提的运行时条件句" in prompt_rules
+    assert "目标不可见的图片不做任何改变" not in prompt_rules
 
 
 def test_output_contract_freezes_short_and_long_identity_carriers():
@@ -392,7 +395,8 @@ def test_output_contract_freezes_short_and_long_identity_carriers():
     assert "segment 0 提示词中的自然语言项目身份短语" in skill
     assert "所有关键帧唯一的身份载体" in skill
     assert "不得声称存在 `PERSON` 或 `SCENE` 映射" in skill
-    assert "短视频背景或人物路线的第一句必须逐字写入该短语" in skill
+    assert "资格通过时" in skill
+    assert "背景或人物路线的第一句必须逐字写入该短语" in skill
 
     assert "长视频每个 `global_elements` 元素的 `replacement`" in skill
     assert "本身必须是可直接复用的自然语言冻结短语" in skill
@@ -403,6 +407,8 @@ def test_output_contract_freezes_short_and_long_identity_carriers():
     assert "同段有多个候选时，按既有安全门和已冻结策略只保留一个" in skill
     assert "其他候选不得进入该段映射或提示词" in skill
     assert "其他候选整段不改动" not in skill
+    assert "短视频唯一段的任一冻结帧不合格" in skill
+    assert "segment 0 必须严格输出两句无条件不改动提示词" in skill
 
 
 def test_human_behavior_documents_generic_replacement_stability_contract():
@@ -416,11 +422,14 @@ def test_human_behavior_documents_generic_replacement_stability_contract():
     assert "每次以一张当前源图为编辑目标的请求" in behavior
     assert "每次单图请求" not in behavior
     assert "遮挡后、跨段或 hard cut 后再次出现" in behavior
-    assert "任一目标可见帧" in behavior and "完整边界" in behavior
+    assert "任一冻结帧" in behavior and "完整外边界" in behavior
     assert "通过资格门" in behavior and "目标域外像素硬保留" in behavior
     assert "短视频" in behavior and "唯一身份载体" in behavior
     assert "长视频" in behavior and "replacement" in behavior
     assert "segments" in behavior and "两两不相交" in behavior
+    assert "任一冻结帧不合格" in behavior
+    assert "不得收到共享编辑提示词" in behavior
+    assert "不足两个合格段" in behavior
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
