@@ -101,13 +101,13 @@ def test_skill_is_single_project_level_prompt_compiler():
     assert "name: image-postprocess" in skill
     assert "为了降低素材重复度" in skill
     assert "性别呈现" in skill and "长相略有不同" in skill
-    assert "同类型但不重复" in skill
-    assert "同一个新设计" in skill
+    assert "原位表面材质映射" in skill
+    assert "同一替换材质与颜色" in skill
     assert "work/image_optimization.json" in skill
     assert "global_elements" in skill and "segment_prompts" in skill
     assert "真实提交给 Seedream" in skill
     assert "当前图是唯一目标" in skill
-    assert "其他图只提供所选目标的身份或背景设计参考" in skill
+    assert "其他图只提供目标材质或身份参考" in skill
     assert "不复述全部构图或叙事" in skill
     assert len(skill.encode("utf-8")) < 12 * 1024
     assert not Path("skills/image-continuity/SKILL.md").exists()
@@ -119,28 +119,29 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "第一优先级是最终视频连续性和现实合理性" in skill
     assert "扭曲、元素突变、物理或接触关系异常" in skill
     assert "一票否决" in skill
-    assert "人物或背景替换仅是用于去重的第二优先级" in skill
+    assert "人脸或原位表面材质替换仅是用于去重的第二优先级" in skill
     assert "只有通过第一层才评价" in skill
 
     assert "Unicode 字符数" in skill
-    assert "不超过 120 个字符" in skill
+    assert "不超过 140 个字符" in skill
     assert "生成前自行计数" in skill
     assert "超长必须重写，不能截断" in skill
+    assert "不超过 120 个字符" not in skill
     assert "不超过 300 个字符" not in skill
 
     assert "人物外观" in skill and "背景" in skill
     assert "先检查全项目全部关键帧" in skill
-    assert "功能道具、商品、玩具或人与物互动" in skill
-    assert "整个相关组件统一只替换背景" in skill
-    assert "跨段同类背景" in skill and "SCENE replacement" in skill
+    assert "手与玩具、商品或功能道具互动" in skill
+    assert "相关段只允许背景表面原位材质映射" in skill
+    assert "跨帧、跨段逐字复用" in skill and "SCENE replacement" in skill
     assert "人物和服装不得变化" in skill
-    assert "完全没有核心前景互动" in skill
+    assert "无高风险时保留既有人物路线" in skill
     assert "人物稳定清晰" in skill
-    assert "才允许项目级统一人物替换" in skill
+    assert "人物策略只换脸" in skill
     assert "优先选择人物外观" not in skill
 
     assert "核心商品、功能道具、玩具、手部" in skill
-    assert "人与物/物与物的握持、接触、插入、对齐、连接、遮挡、前后顺序" in skill
+    assert "人与物/物与物的握持、接触、插入、插接、对齐、连接、遮挡、前后顺序" in skill
     assert "数量、结构、方向" in skill
     assert "全部不可编辑" in skill
     assert "不得同类改款" in skill
@@ -148,23 +149,58 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "画质、功能道具、玩具、商品、宠物不得作为差异化目标" in skill
 
     assert "恰好两句" in skill
-    assert "第一句只写同类别、同功能但不同的背景" in skill
-    assert "透视、光线方向和地面接触" in skill
-    assert "第二句保护全部前景像素语义" in skill
-    assert "只点名一个最危险关系" in skill
+    assert "第一句必须逐一写明本段实际替换的原表面类别" in skill
+    assert "透视、光线方向及人物与物体的地面接触" in skill
+    assert "第二句必须保护人物、服装、手、玩具、商品" in skill
+    assert "只点名一个最危险的实际关系" in skill
     assert "文字或 Logo" in skill
     assert "画质美化" in skill
     assert "全景复述" in skill
     assert "物体清单" in skill
     assert "人物重绘" in skill
     assert "当前图是唯一目标" in skill
-    assert "不能传递构图" in skill
+    assert "不得传递构图" in skill
 
-    assert "global_elements` 只允许 `PERSON`、`OUTFIT`、`SCENE`" in skill
+    assert "global_elements` 只允许实际跨段替换的 `PERSON`、`SCENE`" in skill
     assert "按完整 `id` 的字典序" in skill
     assert "PROP、PRODUCT、SUBJECT 不得建立新映射" in skill
-    assert "逐字复用同一个 `SCENE replacement`" in skill
+    assert "跨帧、跨段逐字复用同一个 `SCENE replacement`" in skill
     assert "陀螺" not in skill and "发射器" not in skill
+
+
+def test_skill_surface_mapping_is_in_place_and_freezes_fixed_geometry():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "手与玩具、商品或功能道具互动" in skill
+    assert "相关段只允许背景表面原位材质映射" in skill
+    assert "不得生成新场景或新房间" in skill
+    assert "墙面、砖面、木格栅、地板" in skill
+    assert "全项目识别稳定的原表面类别" in skill
+    assert "每类冻结同一替换材质与颜色" in skill
+    assert "跨帧、跨段逐字复用" in skill
+
+    assert "每种原表面只在原位置变材质" in skill
+    assert "墙体、门窗、插座、踢脚线、墙地交界" in skill
+    assert "几何与位置、透视、光线方向" in skill
+    assert "人物与物体的地面接触" in skill
+    assert "不得新增、删除或移动固定构件、家具、陈设" in skill
+
+    assert "人物、服装、手、玩具、商品" in skill
+    assert "握持、插接、对齐、遮挡关系" in skill
+    assert "不得增删物体、文字或 Logo" in skill
+    assert "不超过 140 个字符" in skill
+
+    assert "人物策略只换脸" in skill
+    assert "人物稳定清晰" in skill
+    assert "全部相关组件统一" in skill
+    assert "只提供目标材质或身份参考" in skill
+    assert "不得传递构图、动作、物体或关系" in skill
+    assert "independent_parallel` 不写任何参考图语句" in skill
+
+    assert "只允许实际跨段替换的 `PERSON`、`SCENE`" in skill
+    assert "`OUTFIT` 仅在服装真实替换时允许" in skill
+    assert "默认不得替换服装" in skill
+    assert "按完整 `id` 的字典序" in skill
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
