@@ -140,6 +140,19 @@ def test_skill_keeps_hard_to_abuse_input_output_and_prompt_boundaries():
     assert "不得退到人物路线" in skill
 
 
+def test_segment_prompt_rules_forbid_internal_mapping_labels():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    prompt_rules = skill.split("## 每段 Seedream 提示词", maxsplit=1)[1]
+
+    assert '"id": "PERSON_01"' in skill
+    assert "必须直接写自然语言目标与替换设计" in prompt_rules
+    assert "绝不能包含内部 ID 或字段标签" in prompt_rules
+    for label in (
+        "PERSON_01", "SCENE_01", "source", "replacement", "global_elements"
+    ):
+        assert f"`{label}`" in prompt_rules
+
+
 def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
