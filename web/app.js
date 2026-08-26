@@ -1122,9 +1122,14 @@ async function submitGeneration(detail, card) {
   const action = generationAction(generation.status, generation.stage);
   if (!canOperate(detail) || state.generationSubmitting[detail.id]
       || !["new", "retry", "retry_stitch"].includes(action)) return;
+  const errorBox = card.querySelector(".generation-form-error");
+  if (!postprocessReadyForGeneration(detail)) {
+    errorBox.textContent = "素材优化尚未全部完成，不能生成最终视频";
+    errorBox.hidden = false;
+    return;
+  }
   const draft = generationDraft(detail);
   const longContract = longVideoContract(detail);
-  const errorBox = card.querySelector(".generation-form-error");
   let body;
   try {
     if (action === "retry_stitch") {
@@ -1226,11 +1231,7 @@ async function postGeneration(
   setGenerationCardBusy(card, true);
   let accepted = false;
   try {
-    await apiJSON("/api/conversations/" + encodeURIComponent(detail.id) + "/submit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    await requestGenerationSubmit(detail, body);
     accepted = true;
     await loadDetail(detail.id, true);
     // 极短暂的详情落盘延迟也不能开放第二次 POST；保持禁用并继续 GET 轮询。
@@ -1302,6 +1303,12 @@ function renderFinalSection(detail) {
 
   if (!canOperate(detail)) {
     card.appendChild(el("p", "final-caption", "此会话为只读状态，不能修改台词、画幅、后处理或再次生成。"));
+    sec.appendChild(card);
+    return published;
+  }
+
+  if (!postprocessReadyForGeneration(detail)) {
+    card.appendChild(el("p", "final-warning", "素材优化尚未全部完成，不能生成最终视频"));
     sec.appendChild(card);
     return published;
   }
@@ -2217,6 +2224,52 @@ function ppTotalFrames(detail) {
   return Array.isArray(detail.keyframes) ? detail.keyframes.length : 0;
 }
 
+function postprocessReadyForGeneration(detail) {
+  const pp = detail && detail.postprocess;
+  if (pp === null || pp === undefined) return true;
+  if (!pp || typeof pp !== "object" || pp.status !== "done"
+      || !Array.isArray(pp.segments) || pp.segments.length === 0) return false;
+  const duration = Number(detail && detail.duration_s);
+  if (!Number.isFinite(duration) || duration <= 0) return false;
+  const longContract = longVideoContract(detail);
+  const isLong = longContract.isLong;
+  const expectedIndexes = isLong
+    ? (Array.isArray(detail.segments) ? detail.segments.map((segment) => segment && segment.index) : [])
+    : [0];
+  if ((isLong && (!longContract.ready
+        || !Number.isInteger(longContract.segmentCount)
+        || expectedIndexes.length !== longContract.segmentCount))
+      || expectedIndexes.length === 0
+      || expectedIndexes.some((index) => !Number.isInteger(index) || (isLong ? index <= 0 : index !== 0))
+      || (isLong && expectedIndexes.some((index, position) => index !== position + 1))
+      || new Set(expectedIndexes).size !== expectedIndexes.length
+      || pp.segments.length !== expectedIndexes.length) return false;
+  const actualIndexes = new Set();
+  for (const segment of pp.segments) {
+    if (!segment || typeof segment !== "object" || segment.status !== "done"
+        || !Number.isInteger(segment.index) || !expectedIndexes.includes(segment.index)
+        || actualIndexes.has(segment.index)
+        || !Number.isInteger(segment.revision) || segment.revision < 1
+        || !Number.isInteger(segment.completed_frames) || segment.completed_frames < 0
+        || !Number.isInteger(segment.total_frames) || segment.total_frames <= 0
+        || segment.completed_frames !== segment.total_frames
+        || segment.stage !== "done" || segment.error !== null) return false;
+    actualIndexes.add(segment.index);
+  }
+  return actualIndexes.size === expectedIndexes.length;
+}
+
+async function requestGenerationSubmit(detail, body, request = apiJSON) {
+  if (!postprocessReadyForGeneration(detail)) {
+    throw new Error("素材优化尚未全部完成，不能生成最终视频");
+  }
+  return request("/api/conversations/" + encodeURIComponent(detail.id) + "/submit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 function postprocessSegmentStatus(status) {
   const labels = new Map([
     ["queued", "等待处理"],
@@ -2951,6 +3004,7 @@ if (typeof module !== "undefined" && module.exports) {
     mergeImagePromptDraft,
     normalizeDialogueLines,
     parseDialogueLines,
+    postprocessReadyForGeneration,
     postprocessSegmentStatus,
     postprocessAskDefault,
     promptSegmentIndex,
@@ -2959,6 +3013,7 @@ if (typeof module !== "undefined" && module.exports) {
     releaseTrackedURLs,
     releaseTrackedURL,
     resetSegmentProductsDisclosure,
+    requestGenerationSubmit,
     retryPostprocessSegment,
     restoreImagePromptDefault,
     recoverLockedPostprocess,
