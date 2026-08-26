@@ -117,7 +117,7 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
     assert "Unicode 字符数" in skill
-    assert "不超过 300 个字符" in skill
+    assert "不超过 140 个 Unicode 字符" in skill
     assert "生成前自行计数" in skill
     assert "超长必须重写，不能截断" in skill
     assert "32KB" not in skill
@@ -137,16 +137,55 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "只点名目标帧中最容易误改的剧情核心物体和关系" in skill
     assert "画质、功能道具、玩具、商品、宠物不得作为差异化目标" in skill
 
-    assert "第一句先写唯一替换目标及具体新设计" in skill
-    assert "核心对象与关系保持" in skill
-    assert "简短禁止项和真实摄影要求" in skill
+    assert "第一句只写替换目标及具体新设计" in skill
+    assert "第二句只锁定最危险关系和其余内容不变" in skill
+    assert "禁止画质美化、全场景复述、道具改款" in skill
     assert "当前图是唯一目标" in skill
     assert "不能传递构图" in skill
 
-    assert "只有真正被替换且跨段重复的 PERSON、OUTFIT、SCENE" in skill
+    assert "global_elements 只允许 PERSON、OUTFIT、SCENE" in skill
     assert "PROP、PRODUCT、SUBJECT 不得建立新映射" in skill
     assert "相同替换描述必须跨段逐字复用" in skill
     assert "陀螺" not in skill and "发射器" not in skill
+
+
+def test_skill_routes_project_risk_components_before_writing_prompts():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "先检查全项目全部关键帧" in skill
+    assert "跨段重复的 PERSON、OUTFIT、SCENE" in skill
+    assert "相关段闭包" in skill
+    assert "跨段相关组件" in skill and "一次性冻结唯一类别" in skill
+    assert "同一人物相关段" in skill
+    assert "一段换人物、一段换背景" in skill
+
+    assert "任一相关帧" in skill and "手部与功能道具" in skill
+    assert "握持、插入、安装、发射、遮挡" in skill
+    assert "整个相关组件统一选择背景" in skill
+    assert "人物清晰稳定" in skill
+    assert "整个相关组件统一选择人物外观" in skill
+    assert "段内仍只能有一个替换目标" in skill
+
+    assert "恰好两句" in skill
+    assert "不超过 140 个 Unicode 字符" in skill
+    assert "第一句只写替换目标" in skill
+    assert "第二句只锁定最危险关系和其余内容不变" in skill
+    assert "画质美化" in skill and "全场景复述" in skill and "道具改款" in skill
+
+    assert "global_elements 只允许 PERSON、OUTFIT、SCENE" in skill
+    assert "按完整 `id` 的字典序" in skill
+
+
+def test_skill_prioritizes_video_integrity_before_visual_deduplication():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "最终视频连续性和现实合理性是第一优先级" in skill
+    assert "人物或背景替换去重是第二优先级" in skill
+    assert "只有通过第一层硬门槛" in skill
+    assert "扭曲、元素突变、物理关系异常、接触关系异常" in skill
+    assert "一票否决" in skill
+    assert "不得增加输出字段" in skill
+    assert "不得放宽恰好两句和 140 字上限" in skill
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
