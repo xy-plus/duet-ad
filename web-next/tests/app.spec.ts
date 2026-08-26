@@ -434,6 +434,91 @@ test('generation evidence freezes drafts and every recovery action uses safe ids
   await expect(page.getByRole('button', { name: /确认生成|新建任务重试|继续原任务|继续拼接/u })).toHaveCount(0);
 });
 
+test('final generation is gated by complete postprocess segment evidence', async ({ page }) => {
+  const segment = (index: number, status: string) => ({
+    index, status, stage: status === 'done' ? 'done' : 'image', completed_frames: status === 'done' ? 1 : 0,
+    total_frames: 1, revision: 1, error: status === 'failed' ? '失败' : null,
+  });
+  const long = {
+    duration_s: 20, segment_count: 2, plan_receipt: receipt,
+    segments: [{ index: 1, keyframes: [] }, { index: 2, keyframes: [] }],
+  };
+  const details: Record<string, JsonRecord> = {
+    running: detail('running', {
+      title: '后处理仍在运行', ...long,
+      postprocess: { status: 'running', segments: [segment(1, 'done'), segment(2, 'running')] },
+    }),
+    failed: detail('failed', {
+      title: '后处理已经失败', ...long,
+      postprocess: { status: 'failed', segments: [segment(1, 'done'), segment(2, 'failed')] },
+    }),
+    incomplete: detail('incomplete', {
+      title: '后处理帧不完整', ...long,
+      postprocess: {
+        status: 'done',
+        segments: [segment(1, 'done'), { ...segment(2, 'done'), completed_frames: 0 }],
+      },
+    }),
+    stage: detail('stage', {
+      title: '后处理阶段未完成', ...long,
+      postprocess: {
+        status: 'done',
+        segments: [segment(1, 'done'), { ...segment(2, 'done'), stage: 'seedream' }],
+      },
+    }),
+    unknown: detail('unknown-evidence', {
+      title: '后处理提交未知', ...long,
+      postprocess: {
+        status: 'done',
+        segments: [segment(1, 'done'), { ...segment(2, 'done'), error: 'submission_unknown' }],
+      },
+    }),
+    missingSource: detail('missing-source', {
+      title: '长视频来源分段缺失', duration_s: 20, segment_count: 2,
+      plan_receipt: receipt, segments: undefined,
+      postprocess: { status: 'done', segments: [segment(1, 'done'), segment(2, 'done')] },
+    }),
+    emptySource: detail('empty-source', {
+      title: '长视频来源分段为空', duration_s: 20, segment_count: 2,
+      plan_receipt: receipt, segments: [],
+      postprocess: { status: 'done', segments: [segment(1, 'done'), segment(2, 'done')] },
+    }),
+    done: detail('done', {
+      title: '后处理全部完成', ...long,
+      postprocess: { status: 'done', segments: [segment(1, 'done'), segment(2, 'done')] },
+    }),
+    absent: detail('absent', { title: '未选择后处理' }),
+  };
+  const controller: ApiController = {
+    details, order: Object.keys(details), requests: [],
+    submit: async (route) => route.fulfill({ json: { status: 'queued', attempt: 1 } }),
+  };
+  await installApi(page, controller);
+  await login(page);
+
+  await expect(page.getByRole('button', { name: '确认生成' })).toHaveCount(0);
+  await page.getByText('后处理已经失败').first().click();
+  await expect(page.getByRole('button', { name: '确认生成' })).toHaveCount(0);
+  for (const title of [
+    '后处理帧不完整', '后处理阶段未完成', '后处理提交未知',
+    '长视频来源分段缺失', '长视频来源分段为空',
+  ]) {
+    await page.getByText(title).first().click();
+    await expect(page.getByRole('button', { name: '确认生成' })).toHaveCount(0);
+  }
+
+  await page.getByText('后处理全部完成').first().click();
+  await page.getByRole('button', { name: '确认生成' }).click();
+  await page.getByText('未选择后处理').first().click();
+  await page.getByRole('button', { name: '确认生成' }).click();
+
+  const submits = controller.requests.filter(({ method, path }) => method === 'POST' && path.endsWith('/submit'));
+  expect(submits.map(({ path }) => path)).toEqual([
+    '/api/conversations/done/submit',
+    '/api/conversations/absent/submit',
+  ]);
+});
+
 test('image optimization uses CAS and dirty navigation requires an explicit decision', async ({ page }) => {
   const image = detail('image', {
     title: '图片优化会话',

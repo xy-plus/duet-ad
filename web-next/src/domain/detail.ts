@@ -1,4 +1,5 @@
 import { isApiErrorCode } from '../api/errors';
+import { longVideoContract } from './generation';
 import type { PostprocessOptions } from './types';
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
@@ -38,6 +39,57 @@ function array(value: unknown): readonly unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
+function longSegmentIndexes(source: UnknownRecord): readonly number[] | null {
+  const contract = longVideoContract(source);
+  const sourceSegments = array(source.segments);
+  const hasLongEvidence = contract.isLong
+    || (Number.isInteger(source.segment_count) && Number(source.segment_count) > 0)
+    || (typeof source.plan_receipt === 'string' && source.plan_receipt.length > 0)
+    || sourceSegments.some((value) => {
+      const segment = record(value);
+      return segment && Number.isInteger(segment.index) && Number(segment.index) > 0;
+    });
+  if (!hasLongEvidence) return sourceSegments.length === 0 ? [0] : null;
+  if (!contract.isLong || !contract.ready || contract.segmentCount === null
+      || sourceSegments.length !== contract.segmentCount) return null;
+  const indexes = sourceSegments.map((value) => {
+    const segment = record(value);
+    return segment && Number.isInteger(segment.index) && Number(segment.index) > 0
+      ? Number(segment.index) : null;
+  });
+  const validIndexes = indexes.filter((index): index is number => index !== null);
+  if (validIndexes.length !== indexes.length) return null;
+  const sorted = validIndexes.sort((left, right) => left - right);
+  if (new Set(sorted).size !== sorted.length
+      || sorted.some((index, offset) => index !== offset + 1)) return null;
+  return sorted;
+}
+
+export function postprocessAllowsGeneration(value: unknown): boolean {
+  const source = record(value);
+  if (!source) return false;
+  if (source.postprocess === null || source.postprocess === undefined) return true;
+  const postprocess = record(source.postprocess);
+  if (!postprocess || postprocess.status !== 'done' || !Array.isArray(postprocess.segments)
+      || postprocess.segments.length === 0) return false;
+  const expectedIndexes = longSegmentIndexes(source);
+  if (!expectedIndexes) return false;
+  const seen = new Set<number>();
+  for (const value of postprocess.segments) {
+    const segment = record(value);
+    if (!segment || !Number.isInteger(segment.index) || seen.has(Number(segment.index))
+        || !expectedIndexes.includes(Number(segment.index)) || segment.status !== 'done'
+        || !Number.isInteger(segment.completed_frames) || Number(segment.completed_frames) < 0
+        || !Number.isInteger(segment.total_frames) || Number(segment.total_frames) < 1
+        || Number(segment.completed_frames) !== Number(segment.total_frames)
+        || !Number.isInteger(segment.revision) || Number(segment.revision) < 1
+        || segment.stage !== 'done' || segment.error !== null) return false;
+    seen.add(Number(segment.index));
+  }
+  return seen.size === expectedIndexes.length
+    && expectedIndexes.every((index) => seen.has(index));
+}
+
 export function adaptImageOptimizationPrompt(value: unknown): AdaptedImageOptimizationPrompt | null {
   const source = record(value);
   if (typeof source?.text !== 'string' || typeof source.default_text !== 'string'
@@ -48,12 +100,7 @@ export function adaptImageOptimizationPrompt(value: unknown): AdaptedImageOptimi
 export function adaptConversationDetail(value: unknown): AdaptedConversationDetail {
   const source = record(value) ?? {};
   const sourceSegments = array(source.segments);
-  const isLong = (Number.isInteger(source.segment_count) && Number(source.segment_count) > 0)
-    || (typeof source.plan_receipt === 'string' && source.plan_receipt.length > 0)
-    || sourceSegments.some((value) => {
-    const segment = record(value);
-    return segment && Number.isInteger(segment.index) && Number(segment.index) > 0;
-  });
+  const isLong = longSegmentIndexes(source)?.[0] !== 0;
   const capabilities = record(source.postprocess_capabilities);
   const postprocess = record(source.postprocess);
   return {

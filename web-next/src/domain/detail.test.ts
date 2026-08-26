@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   canOperate,
   detailSignature,
+  postprocessAllowsGeneration,
   recoverLockedPostprocess,
   recoverPromptChanged,
   shouldPollDetail,
@@ -46,6 +47,92 @@ describe('detail state contract', () => {
     expect(canOperate({ read_only: true, submit_enabled: true })).toBe(false);
     expect(canOperate({ submit_enabled: true })).toBe(false);
     expect(canOperate({ read_only: false })).toBe(false);
+  });
+
+  it('allows final generation only after every postprocess segment is done', () => {
+    const segment = (index: number, status: string) => ({
+      index, status, stage: status === 'done' ? 'done' : 'image', completed_frames: status === 'done' ? 1 : 0,
+      total_frames: 1, revision: 1, error: null,
+    });
+    const long = {
+      duration_s: 20, segment_count: 2, plan_receipt: 'e'.repeat(64),
+      segments: [{ index: 1 }, { index: 2 }],
+    };
+
+    expect(postprocessAllowsGeneration({ postprocess: null })).toBe(true);
+    expect(postprocessAllowsGeneration({
+      ...long,
+      postprocess: { status: 'running', segments: [segment(1, 'done'), segment(2, 'running')] },
+    })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      ...long,
+      postprocess: { status: 'failed', segments: [segment(1, 'done'), segment(2, 'failed')] },
+    })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      ...long,
+      postprocess: { status: 'done', segments: [segment(1, 'done'), segment(2, 'running')] },
+    })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      ...long,
+      postprocess: { status: 'done', segments: [segment(1, 'done'), segment(2, 'done')] },
+    })).toBe(true);
+  });
+
+  it('fails closed for done postprocess records with missing or malformed segments', () => {
+    const segment = (index: number, revision = 1) => ({
+      index, status: 'done', stage: 'image', completed_frames: 1,
+      total_frames: 1, revision, error: null,
+    });
+    expect(postprocessAllowsGeneration({ postprocess: { status: 'done' } })).toBe(false);
+    expect(postprocessAllowsGeneration({ postprocess: { status: 'done', segments: [] } })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      segment_count: 2,
+      segments: [{ index: 1 }, { index: 2 }],
+      postprocess: { status: 'done', segments: [{ index: 1, status: 'done' }] },
+    })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      postprocess: { status: 'done', segments: [{ index: 1, status: 'done' }] },
+    })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      segments: [{ index: 1 }, { index: 3 }],
+      postprocess: { status: 'done', segments: [segment(1), segment(3)] },
+    })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      segments: [{ index: 1 }, { index: 1 }],
+      postprocess: { status: 'done', segments: [segment(1)] },
+    })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      postprocess: { status: 'done', segments: [segment(0, 0)] },
+    })).toBe(false);
+  });
+
+  it('requires complete frame, terminal stage and empty error evidence for every done segment', () => {
+    const candidate = {
+      index: 0, status: 'done', stage: 'done', completed_frames: 1,
+      total_frames: 1, revision: 1, error: null,
+    };
+    expect(postprocessAllowsGeneration({
+      postprocess: { status: 'done', segments: [{ ...candidate, completed_frames: 0 }] },
+    })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      postprocess: { status: 'done', segments: [{ ...candidate, stage: 'seedream' }] },
+    })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      postprocess: { status: 'done', segments: [{ ...candidate, error: 'submission_unknown' }] },
+    })).toBe(false);
+  });
+
+  it('does not synthesize missing long source segments from segment_count', () => {
+    const postprocess = {
+      status: 'done',
+      segments: [1, 2].map((index) => ({
+        index, status: 'done', stage: 'done', completed_frames: 1,
+        total_frames: 1, revision: 1, error: null,
+      })),
+    };
+    const contract = { duration_s: 20, segment_count: 2, plan_receipt: 'f'.repeat(64) };
+    expect(postprocessAllowsGeneration({ ...contract, postprocess })).toBe(false);
+    expect(postprocessAllowsGeneration({ ...contract, segments: [], postprocess })).toBe(false);
   });
 
   it('maps authoritative navigation status without local inference', () => {
