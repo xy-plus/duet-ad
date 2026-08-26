@@ -201,7 +201,7 @@ def test_skill_freezes_balanced_component_strategy_and_exact_two_sentence_routes
     assert "每个组件只做一次策略选择并冻结" in skill
     assert "高风险交互关系" in skill
     assert "整个组件统一选择背景路线" in skill
-    assert "人物在所有相关段都稳定清晰" in skill
+    assert "候选 `PERSON` 在拟编辑段的任一冻结帧中" in skill
 
     assert "默认只改变一种低频外观属性，优先色相" in skill
     assert "固定构件和边界结构" in skill
@@ -358,8 +358,13 @@ def test_replacement_domain_is_complete_hard_bounded_and_fail_closed():
     prompt_rules = skill.split("## 每段 Seedream 提示词", maxsplit=1)[1]
 
     assert "编辑资格门先于提示词" in skill
-    assert "候选 `SCENE` 任一冻结帧的全部目标成员或完整外边界不能稳定定位" in skill
-    assert "该段或组件必须输出两句不改动提示词" in skill
+    assert "适用于每个实际替换目标（`PERSON` 或 `SCENE`）" in skill
+    assert "任一冻结帧的完整目标域或完整外边界不能稳定定位" in skill
+    assert "该段必须严格输出两句无条件不改动提示词" in skill
+    assert "该段或组件必须输出两句不改动提示词" not in skill
+    assert "单段资格不合格只冻结该段 no-op，其他合格段继续按既有路线过滤" in skill
+    assert "逐段资格过滤不得扩大 no-op 范围" in skill
+    assert "只有跨段同一替换身份本身无法证明时，资格门才把整个组件判为 no-op" in skill
     assert "只有段内所有冻结帧通过资格门" in skill
     assert "目标完全不可见的帧不做任何改变" not in skill
     assert "任一冻结帧不合格时整段严格两句无条件不改动" in skill
@@ -369,6 +374,20 @@ def test_replacement_domain_is_complete_hard_bounded_and_fail_closed():
     assert "保持轮廓、层级、可见性和运动模糊" in skill
     assert "边界不确定的像素保持不变" not in prompt_rules
     assert "边界置信不足时保留输入像素" not in skill
+
+
+def test_person_membership_requires_every_frozen_frame_to_qualify():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "候选 `PERSON` 在拟编辑段的任一冻结帧中" in skill
+    assert "脸部目标完整可见" in skill
+    assert "完整编辑域和完整外边界可稳定定位" in skill
+    assert "脸部目标不可见、严重遮挡或严重裁切" in skill
+    assert "该段不得列入 `PERSON segments`" in skill
+    assert "必须严格输出两句无条件不改动提示词" in skill
+    assert "不得收到共享编辑提示词" in skill
+    assert "不得用该段其他清晰帧补证" in skill
+    assert "同一候选 `PERSON` 不足两个合格段时不得建立该全局元素" in skill
 
 
 def test_two_sentence_prompts_execute_frozen_identity_without_false_references():
@@ -430,6 +449,11 @@ def test_human_behavior_documents_generic_replacement_stability_contract():
     assert "任一冻结帧不合格" in behavior
     assert "不得收到共享编辑提示词" in behavior
     assert "不足两个合格段" in behavior
+    assert "每个实际替换目标（`PERSON` 或 `SCENE`）" in behavior
+    assert "脸部目标不可见、严重遮挡或严重裁切" in behavior
+    assert "仅该段严格输出两句无条件不改动提示词" in behavior
+    assert "跨段同一替换身份本身无法证明" in behavior
+    assert "逐段资格过滤不得扩大 no-op 范围" in behavior
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
