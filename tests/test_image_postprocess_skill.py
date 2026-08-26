@@ -193,6 +193,18 @@ def test_skill_defines_observable_entities_and_high_risk_relations():
     assert "编辑对象变化可能破坏数量、结构、作用方向、接触点、遮挡或前后顺序" in skill
 
 
+def test_interaction_support_regions_are_high_risk_and_never_background_targets():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "交互支持区域：任何物理表面若直接承托核心实体" in skill
+    assert "接收核心实体或交互实体的落点" in skill
+    assert "承载可见动作轨迹" in skill
+    assert "被流体或颗粒接触、经过或扩散" in skill
+    assert "承载可见功能过程" in skill
+    assert "交互支持区域计入高风险关系" in skill
+    assert "不得作为背景候选或差异化目标" in skill
+
+
 def test_skill_freezes_balanced_component_strategy_and_exact_two_sentence_routes():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
@@ -201,7 +213,7 @@ def test_skill_freezes_balanced_component_strategy_and_exact_two_sentence_routes
     assert "每个组件只做一次策略选择并冻结" in skill
     assert "高风险交互关系" in skill
     assert "整个组件统一选择背景路线" in skill
-    assert "人物在所有相关段都稳定清晰" in skill
+    assert "同一人物在所有相关段稳定清晰且换脸安全" in skill
 
     assert "默认只改变一种低频外观属性，优先色相" in skill
     assert "固定构件和边界结构" in skill
@@ -220,13 +232,13 @@ def test_skill_freezes_balanced_component_strategy_and_exact_two_sentence_routes
     assert "完整 `id` 的字典序" in skill
 
 
-def test_uses_one_large_stable_surface_and_face_only_fallback():
+def test_uses_one_traceable_physical_background_element_and_face_only_fallback():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
-    assert "只选一个在相关帧中稳定对应且可见" in skill
-    assert "面积尽量大的单一安全表面" in skill
+    assert "只选一个可追踪的物理背景元素作为编辑域" in skill
+    assert "编辑域可以包含同一元素的多个可见部分或不同朝向面" in skill
     assert "允许个别关键帧因裁切不可见" in skill
-    assert "只编辑可见的源表面，目标表面不可见的图片不做任何改变" in skill
+    assert "每张图完整覆盖全部可见成员，不得局部应用" in skill
     assert "不得映射全部背景" in skill
     assert "为每类冻结" not in skill
 
@@ -255,14 +267,28 @@ def test_scene_membership_requires_each_segment_own_clear_surface_evidence():
     assert "仅见模糊、小面积、遮挡到无法判界或不同朝向局部且无法确认同一表面" in skill
     assert "不得把该段列入 `SCENE segments`" in skill
 
-    assert "同一物理表面，或同一场景内设计连续且可安全统一映射的同一表面" in skill
-    assert "仅同类表面不够" in skill
-    assert "`hard_cut` 不自动否定同一表面，但每个段必须独立举证" in skill
+    assert "同一 `SCENE` 要求各合格段的可见证据证明它们属于同一物理背景元素" in skill
+    assert "仅同类或同一局部平面不够" in skill
+    assert "`hard_cut` 不自动否定同一物理元素，但每个段必须独立举证" in skill
 
-    assert "单个段内目标偶尔因裁切不可见时，该帧可以不改动" in skill
-    assert "该段整体资格必须由该段自身其他清晰关键帧证明" in skill
+    assert "单个段内目标偶尔因裁切完全不可见时，该帧可以不改动" in skill
+    assert "该段整体资格必须由该段自身所有目标可见帧分别通过上述逐帧证据门禁" in skill
     assert "最终少于两个合格段时不得建立背景 `SCENE`" in skill
     assert "继续按人物仅换脸或不改动决策" in skill
+
+
+def test_each_target_visible_frame_proves_its_complete_outer_contour():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "每个目标可见帧都必须独立提供证据" in skill
+    assert "目标每个可见部分在图内的完整原外轮廓、外轮廓转折和遮挡边缘清晰可定位" in skill
+    assert "不得用段内其他帧补证" in skill
+    assert "任一目标可见帧不满足，该段的背景候选即不合格" in skill
+
+    assert "严格沿本图中冻结编辑域每个可见部分的原外轮廓、外轮廓转折和遮挡边缘停止" in skill
+    assert "保持轮廓几何" in skill
+    assert "禁止补全、拉直、平滑、扩张、收缩或改形" in skill
+    assert "内部几何折转和同一物理元素内部边界仍不作为停止线，不得与外轮廓混淆" in skill
 
 
 def test_scene_component_excludes_unqualified_segments_with_noop_prompts():
@@ -280,17 +306,50 @@ def test_surface_edit_domain_uses_visible_local_stop_boundaries():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
     assert "目标表面的定位不得只依赖语义名称" in skill
-    assert "存在相邻同类表面或连续平面时" in skill
-    assert "拟编辑段必须用该段自身可见且明确的边界拓扑或停止地标定义编辑域" in skill
-    assert "停止地标另一侧保持原样" in skill
-    assert "因编辑域无法稳定定位而判定不合格的段，必须输出两句不改动提示词" in skill
-    assert "不得在该段回退人物路线" in skill
-    assert "全组件人物或不改动决策，不得覆盖该段已冻结的不改动结论" in skill
+    assert "局部停止边界必须是冻结编辑域通向不同物理元素的外部边界" in skill
+    assert "内部几何折转或同一物理元素内部边界不得作为停止地标" in skill
+    assert "组件已经建立背景 `SCENE` 或因高风险交互冻结为背景路线后" in skill
+    assert "个别因编辑域无法稳定定位而不合格的段必须输出两句不改动提示词" in skill
+    assert "不得逐段改走人物路线" in skill
 
     assert "项目级替换短语在合格段间逐字一致" in skill
-    assert "每段 `prompt` 可写该段不同的局部停止边界" in skill
+    assert "每段 `prompt` 可写该段不同的局部可见外部边界" in skill
     assert "局部停止边界不属于项目级替换短语" in skill
     assert "不要求整段 `prompt` 或整句逐字相同" in skill
+
+
+def test_surface_domain_membership_is_frozen_across_target_visible_frames():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "冻结目标是一个可追踪的物理背景元素/编辑域" in skill
+    assert "在项目/组件级冻结编辑域成员关系" in skill
+    assert "同一物理部分在所有目标可见帧中必须统一纳入或排除" in skill
+    assert "不同视角下的局部可见边界只用于定位同一冻结编辑域，不能改变成员集合" in skill
+    assert "编辑域可以包含同一元素的多个可见部分或不同朝向面" in skill
+
+    assert "多平面或相邻连续部分只有在逐帧无歧义追踪同一成员集合时才合格" in skill
+    assert "对于已因高风险交互冻结为背景路线的组件，成员关系不确定时必须在规划阶段令整个相关组件输出两句不改动提示词" in skill
+    assert "不得逐帧漏改，也不得回退人物路线" in skill
+    assert "成员关系或成员边界不确定时必须在规划阶段不建立该域" in skill
+    assert "合格提示词必须完整覆盖已冻结成员" in skill
+
+    assert "第一句要求完整覆盖已冻结编辑域，不得只修改其中局部" in skill
+    assert "每张图完整覆盖全部可见成员，不得局部应用" in skill
+    assert "冻结编辑域边界外全部保持不变" in skill
+    assert "非目标前景及实体间空间与物理关系全不变" in skill
+
+
+def test_domain_membership_gate_preserves_the_safe_face_only_route():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "背景编辑域不合格不自动等于整个组件不改动" in skill
+    assert "背景候选尚未建立或整体失败" in skill
+    assert "组件无高风险交互关系、同一人物在所有相关段稳定清晰且换脸安全时" in skill
+    assert "统一走人物路线且仅换脸" in skill
+    assert "背景域收紧不得把该条件分支改为普遍不改动" in skill
+
+    assert "只换脸，不换服装、背景或身体其他部分" in skill
+    assert "人物除脸外、服装、核心实体、交互实体、非目标前景及实体间空间与物理关系全不变" in skill
 
 
 def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
@@ -312,7 +371,8 @@ def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
     assert "无法安全获得明显差异时允许不改动" in background_rules
 
     assert "只编辑可见的源表面" in background_rules
-    assert "边界不确定的像素保持不变" in background_rules
+    assert "成员关系或成员边界不确定时必须在规划阶段不建立该域" in background_rules
+    assert "完整覆盖已冻结成员" in background_rules
     assert "非目标前景继续遮挡目标表面" in background_rules
     assert "接触点、接触阴影、反射和边界结构不得改变" in background_rules
     assert "禁止编辑外溢到目标表面之外" in background_rules
@@ -324,6 +384,17 @@ def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
     assert "每个相关段实际 `prompt` 的第一句必须逐字包含同一短语" in background_rules
     assert "其余关系保护可按本段可见关系写" in background_rules
     assert "不得改动项目级替换短语" in background_rules
+
+
+def test_background_prompt_prevents_global_color_and_lighting_drift():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    background_rules = skill.split("### 背景路线", maxsplit=1)[1].split(
+        "### 人物路线", maxsplit=1
+    )[0]
+
+    assert "第二句要求仅目标域发生所选属性变化" in background_rules
+    assert "禁止全局调色、白平衡、曝光、对比度或重新布光" in background_rules
+    assert "目标域外保持原颜色与明暗" in background_rules
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
