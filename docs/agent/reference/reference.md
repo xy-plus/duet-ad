@@ -439,6 +439,7 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `SEEDREAM_MODEL` | `doubao-seedream-5-0-pro-260628` | 闭集为 Pro、Lite、4.5、4.0；Pro payload 省略 `sequential_image_generation`，其余固定为 `disabled` |
 | `SEEDREAM_EDIT_MODE` | `anchor_consistency` | `anchor_consistency` 或 `independent_parallel`；项目开始时私有冻结 |
 | `SEEDREAM_PROMPT_TEMPLATE` | `balanced` | `light`、`balanced` 或 `strong`；只影响新项目 |
+| `SEEDREAM_TIMEOUT_S` | `300` | 单次 Seedream 请求超时秒数；可显式覆盖为正有限值 |
 | `TIKTOK_PROXY` | 空 | TikTok/DoH 下载代理 |
 | `DOWNLOAD_TIMEOUT_S` | `120` | URL 下载整体时限 |
 | `HOST` / `PORT` | `0.0.0.0` / `3211` | `run.sh` 默认；生产 unit 必须覆盖为 `127.0.0.1/3212` |

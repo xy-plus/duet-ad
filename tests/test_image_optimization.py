@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import image_optimization, mediakit, postprocess, seedream, storage
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.main import create_app
 from conftest import AUTH, make_settings
 
@@ -55,6 +55,7 @@ def test_seedream_settings_are_closed_and_secret_is_not_a_setting(monkeypatch):
     assert settings.seedream_model == "doubao-seedream-5-0-pro-260628"
     assert settings.seedream_edit_mode == "anchor_consistency"
     assert settings.seedream_prompt_template == "balanced"
+    assert settings.seedream_timeout_s == 300.0
     assert "super-secret" not in repr(settings)
     assert not hasattr(settings, "ark_api_key")
     for field, value in (
@@ -66,6 +67,15 @@ def test_seedream_settings_are_closed_and_secret_is_not_a_setting(monkeypatch):
     ):
         with pytest.raises(ValueError):
             Settings(access_token="x", **{field: value})
+
+
+def test_seedream_timeout_environment_default_and_explicit_override(monkeypatch):
+    monkeypatch.setenv("ACCESS_TOKEN", "test-token")
+    monkeypatch.delenv("SEEDREAM_TIMEOUT_S", raising=False)
+    assert get_settings().seedream_timeout_s == 300.0
+
+    monkeypatch.setenv("SEEDREAM_TIMEOUT_S", "180")
+    assert get_settings().seedream_timeout_s == 180.0
 
 
 @pytest.mark.parametrize(("model", "has_sequential"), [

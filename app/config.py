@@ -33,7 +33,7 @@ class Settings:
     seedream_edit_mode: str = "anchor_consistency"
     seedream_prompt_template: str = "balanced"
     seedream_concurrency: int = 4
-    seedream_timeout_s: float = 180.0
+    seedream_timeout_s: float = 300.0
     data_dir: Path = Path("data")
     codex_timeout_s: int = 1800
     codex_concurrency: int = 10
@@ -126,7 +126,7 @@ def get_settings() -> Settings:
             "SEEDREAM_PROMPT_TEMPLATE", "balanced"
         ).strip(),
         seedream_concurrency=int(os.environ.get("SEEDREAM_CONCURRENCY", "4")),
-        seedream_timeout_s=float(os.environ.get("SEEDREAM_TIMEOUT_S", "180")),
+        seedream_timeout_s=float(os.environ.get("SEEDREAM_TIMEOUT_S", "300")),
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),
