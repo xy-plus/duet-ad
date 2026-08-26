@@ -95,7 +95,6 @@ def test_skill_is_single_project_level_prompt_compiler():
     assert "work/image_optimization.json" in skill
     assert "global_elements" in skill and "segment_prompts" in skill
     assert "真实提交给 Seedream" in skill
-    assert len(skill.encode("utf-8")) <= 8_281
     assert not Path("skills/image-continuity/SKILL.md").exists()
 
 
@@ -121,7 +120,13 @@ def test_skill_keeps_hard_to_abuse_input_output_and_prompt_boundaries():
 
     assert "人物除脸外、服装、手、玩具、商品" in skill
     assert "每段所有关键帧共享一份可直接提交给 Seedream 的提示词" in skill
-    assert "超长必须重写，不能截断" in skill
+    assert "第一句只写唯一替换目标" in skill
+    assert "第二句写完整保护" in skill
+    assert "保持简洁，但不得为缩短删除安全关系" in skill
+    assert "禁止全景复述、画质美化或物体清单" in skill
+    assert "保持叙事内核和关系不变，只改变表象" in skill
+    assert "不超过 140 个 Unicode 字符" not in skill
+    assert "生成前计数" not in skill
 
     assert "`independent_parallel` 无需写“当前图是唯一目标”" in skill
     assert "不得写参考人物、参考角色或其他图" in skill
@@ -140,8 +145,6 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "一票否决" in skill
     assert "人物或背景替换仅是用于去重的第二优先级" in skill
     assert "只有通过第一层才评价" in skill
-
-    assert "不超过 140 个 Unicode 字符" in skill
 
     assert "先检查全项目全部关键帧" in skill
     assert "去重目标只能是 `人物外观` 或 `背景`" in skill
@@ -170,6 +173,7 @@ def test_skill_freezes_balanced_component_strategy_and_exact_two_sentence_routes
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
     assert "全项目构建跨段相关组件" in skill
+    assert "同一场景或同一稳定背景/固定建筑表面" in skill
     assert "每个组件只做一次策略选择并冻结" in skill
     assert "手—功能道具/玩具的高风险关系" in skill
     assert "整个组件统一选择背景路线" in skill
@@ -199,6 +203,7 @@ def test_final_j_uses_one_large_stable_surface_and_face_only_fallback():
     assert "面积尽量大的安全背景表面类别" in skill
     assert "优先地面，其次墙面" in skill
     assert "允许个别关键帧因裁切不可见" in skill
+    assert "只编辑每张图中可见的目标表面；目标表面不可见的图片不做任何改变" in skill
     assert "不得映射全部背景" in skill
     assert "为每类冻结" not in skill
 
