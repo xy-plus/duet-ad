@@ -271,8 +271,8 @@ def test_closed_environment_background_domain_is_a_safe_background_candidate():
     assert "不得承载动作轨迹、流体或颗粒的接触、经过或扩散以及功能过程" in skill
     assert "任一部分属于交互支持区域，整个环境背景域即不合格" in skill
 
-    assert "环境背景域只允许上述 hue-only 映射" in skill
-    assert "逐帧继承原图的局部对比、亮度分布、渐变方向、渐变幅度和原有低频结构" in skill
+    assert "环境背景域只允许该操作，不启用其他属性备选" in skill
+    assert "只使用 CIELAB LCh 这一种感知色彩空间" in skill
     assert "禁止补全、拉直、平滑、扩张、收缩、改形或产生边缘光晕" in skill
 
 
@@ -364,9 +364,9 @@ def test_surface_edit_domain_uses_visible_local_stop_boundaries():
     assert "个别因编辑域无法稳定定位而不合格的段必须输出两句不改动提示词" in skill
     assert "不得逐段改走人物路线" in skill
 
-    assert "项目级替换短语在合格段间逐字一致" in skill
+    assert "每个相关段逐字复用同一项目级操作短语" in skill
     assert "每段 `prompt` 可写该段不同的局部可见外部边界" in skill
-    assert "局部停止边界不属于项目级替换短语" in skill
+    assert "局部停止边界不属于项目级操作短语" in skill
     assert "不要求整段 `prompt` 或整句逐字相同" in skill
 
 
@@ -383,9 +383,9 @@ def test_surface_domain_membership_is_frozen_across_target_visible_frames():
     assert "对于已因高风险交互冻结为背景路线的组件，成员关系不确定时必须在规划阶段令整个相关组件输出两句不改动提示词" in skill
     assert "不得逐帧漏改，也不得回退人物路线" in skill
     assert "成员关系或成员边界不确定时必须在规划阶段不建立该域" in skill
-    assert "合格提示词必须完整覆盖已冻结成员" in skill
+    assert "每张图完整覆盖全部可见成员，不得局部应用" in skill
 
-    assert "第一句要求完整覆盖已冻结编辑域，不得只修改其中局部" in skill
+    assert "随后写明编辑域，要求每张图完整覆盖全部可见成员，不得局部应用" in skill
     assert "每张图完整覆盖全部可见成员，不得局部应用" in skill
     assert "冻结编辑域边界外全部保持不变" in skill
     assert "非目标前景及实体间空间与物理关系全不变" in skill
@@ -412,30 +412,29 @@ def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
 
     assert "默认只改变一种低频外观属性，优先色相" in skill
     assert "只有色相不适合作为安全差异时，才单独选择明暗、光泽或粗糙度之一" in skill
-    assert "选择色相时遵守下述 hue-only 契约" in skill
-    assert "不得使用明亮、浅、深、鲜艳、柔和、均匀或哑光修饰目标色相" in background_rules
-    assert "原光照、阴影、反射、纹理图案、纹理相位、缺陷、光泽和粗糙度" in background_rules
-    assert "完整保留原边界与几何" in background_rules
+    assert "选择色相时严格使用下述 CIELAB LCh 单一操作" in skill
+    assert "不写颜色名称或任何亮度、彩度、表面处理修饰词" in skill
+    assert "原光照、阴影、反射、纹理图案、纹理相位、缺陷、光泽、粗糙度、边界与几何" in background_rules
+    assert "完整保留目标域" in background_rules
     assert "不得新增、删除或移动纹理图案、接缝、重复单元或高频细节" in background_rules
     assert "表面翻新" not in background_rules
     assert "生成新材质" not in background_rules
 
     assert "无法安全取得合规差异时允许不改动" in background_rules
 
-    assert "只编辑本图可见的冻结编辑域" in background_rules
+    assert "目标不可见的图片不做任何改变" in background_rules
     assert "成员关系或成员边界不确定时必须在规划阶段不建立该域" in background_rules
-    assert "完整覆盖已冻结成员" in background_rules
+    assert "每张图完整覆盖全部可见成员" in background_rules
     assert "非目标前景继续遮挡目标编辑域" in background_rules
     assert "接触点、接触阴影、反射和边界结构不得改变" in background_rules
     assert "禁止编辑外溢到目标编辑域之外" in background_rules
 
     assert "`SCENE replacement` 不直接提交给 Seedream" in skill
-    assert "目标背景描述 + 实际改变的一种低频属性" in skill
+    assert "`SCENE replacement` 由目标背景描述和该操作短语组成" in skill
     assert "`SCENE replacement` 和项目级替换短语只写实际改变的一个属性" in skill
     assert "不得列出未改变属性或多个候选" in skill
-    assert "每个相关段逐字复用，不得缩写、改写或使用同义词" in background_rules
-    assert "其余关系保护可按本段可见关系写" in background_rules
-    assert "不得改动项目级替换短语" in background_rules
+    assert "每个相关段逐字复用同一项目级操作短语，不得缩写、改写或使用同义词" in background_rules
+    assert "第二句合并非目标实体与关系保护" in background_rules
 
 
 def test_background_prompt_prevents_global_color_and_lighting_drift():
@@ -444,31 +443,59 @@ def test_background_prompt_prevents_global_color_and_lighting_drift():
         "### 人物路线", maxsplit=1
     )[0]
 
-    assert "第二句要求仅目标域发生所选属性变化" in background_rules
-    assert "禁止全局调色、白平衡、曝光、对比度或重新布光" in background_rules
-    assert "目标域外保持原颜色与明暗" in background_rules
+    assert "仅目标域执行项目级操作" in background_rules
+    assert "禁止全局调色、白平衡、曝光、对比度、重新布光和摄影增强" in background_rules
+    assert "冻结编辑域边界外全部保持不变" in background_rules
 
 
-def test_hue_mapping_is_channel_only_and_leads_each_real_prompt():
+def test_lch_mapping_replaces_legacy_channel_expansion_in_real_prompts():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
     background_rules = skill.split("### 背景路线", maxsplit=1)[1].split(
         "### 人物路线", maxsplit=1
     )[0]
 
-    assert "选择色相时，项目级替换短语和每段第一句必须明确写“只旋转色相”" in skill
-    assert "第一句最前面先写 hue-only 及其通道不变量，再写编辑域边界" in background_rules
-    assert "同一输入像素或同一物理区域的原明度或感知亮度与原饱和度保持不变" in background_rules
-    assert "不得抬亮暗部或压暗高光" in background_rules
+    assert "第一句按“操作 → 编辑域 → 边界”顺序" in background_rules
+    assert "以项目级操作短语开头且不得展开或另写其他通道约束" in background_rules
+    assert "只写本段可见且必要的编辑域与边界条件，不复述规划门禁" in background_rules
+    assert "环境背景域只允许该操作" in background_rules
 
-    assert "逐帧继承原图的局部对比、亮度分布、渐变方向、渐变幅度和原有低频结构" in background_rules
-    assert "跨帧同一原始明度必须映射为同一输出明度" in background_rules
-    assert "不得把目标域统一填充成固定亮度" in background_rules
+    for legacy_expansion in (
+        "hue-only",
+        "同一输入像素或同一物理区域的原明度或感知亮度",
+        "逐帧继承原图的局部对比、亮度分布、渐变方向、渐变幅度",
+        "跨帧同一原始明度必须映射为同一输出明度",
+        "不得把目标域统一填充成固定亮度",
+    ):
+        assert legacy_expansion not in background_rules
 
-    assert "目标色只使用不携带明度、感知亮度、饱和度或表面处理含义的色相类别" in background_rules
-    assert "不得使用明亮、浅、深、鲜艳、柔和、均匀或哑光修饰目标色相" in background_rules
-    assert "不得使用“明显”等程度修饰" in background_rules
-    assert "环境背景域只允许上述 hue-only 映射" in background_rules
-    assert "差异必须明显可见" not in background_rules
+
+def test_hue_mapping_uses_one_project_frozen_cielab_lch_operation():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    background_rules = skill.split("### 背景路线", maxsplit=1)[1].split(
+        "### 人物路线", maxsplit=1
+    )[0]
+
+    operation = "CIELAB LCh：仅将 h° 旋转到 h°=N，逐像素 L*=原值、C*=原值"
+    assert f"项目级操作短语固定为“{operation}”" in skill
+    assert "N 是 0..359 的项目级冻结整数，实际输出把 N 替换为该整数" in skill
+    assert "N 在全部相关段和目标可见帧中跨帧不变" in skill
+    assert "`SCENE replacement` 与每个相关段第一句逐字复用同一项目级操作短语" in skill
+    assert skill.count(operation) == 1
+
+    assert "目标角在实际短语中只写数值色相角" in skill
+    assert "不写颜色名称或任何亮度、彩度、表面处理修饰词" in skill
+    assert "与源主色相的圆周角差足以形成可辨别色相差异" in skill
+    assert "差异只来自 h°，不得调整 L* 或 C*" in skill
+
+    assert "只使用 CIELAB LCh 这一种感知色彩空间" in background_rules
+    assert "hue-only" not in background_rules
+    for conflicting_model in ("HSL", "HSV", "RGB"):
+        assert conflicting_model not in background_rules
+
+    assert "第一句按“操作 → 编辑域 → 边界”顺序" in background_rules
+    assert "不得展开或另写其他通道约束" in background_rules
+    assert "第二句合并非目标实体与关系保护" in background_rules
+    assert "全局调色、白平衡、曝光、对比度、重新布光和摄影增强" in background_rules
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
