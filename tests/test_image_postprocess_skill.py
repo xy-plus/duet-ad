@@ -203,7 +203,7 @@ def test_skill_freezes_balanced_component_strategy_and_exact_two_sentence_routes
     assert "整个组件统一选择背景路线" in skill
     assert "人物在所有相关段都稳定清晰" in skill
 
-    assert "默认只调整同一现有表面的均匀颜色、明暗、光泽或粗糙度" in skill
+    assert "默认只改变一种低频外观属性，优先色相" in skill
     assert "固定构件和边界结构" in skill
     assert "接触几何" in skill
     assert "人物、服装、核心实体、交互实体、非目标前景" in skill
@@ -276,20 +276,38 @@ def test_scene_component_excludes_unqualified_segments_with_noop_prompts():
     assert "不得改走人物路线" in skill
 
 
+def test_surface_edit_domain_uses_visible_local_stop_boundaries():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "目标表面的定位不得只依赖语义名称" in skill
+    assert "存在相邻同类表面或连续平面时" in skill
+    assert "拟编辑段必须用该段自身可见且明确的边界拓扑或停止地标定义编辑域" in skill
+    assert "停止地标另一侧保持原样" in skill
+    assert "因编辑域无法稳定定位而判定不合格的段，必须输出两句不改动提示词" in skill
+    assert "不得在该段回退人物路线" in skill
+    assert "全组件人物或不改动决策，不得覆盖该段已冻结的不改动结论" in skill
+
+    assert "项目级替换短语在合格段间逐字一致" in skill
+    assert "每段 `prompt` 可写该段不同的局部停止边界" in skill
+    assert "局部停止边界不属于项目级替换短语" in skill
+    assert "不要求整段 `prompt` 或整句逐字相同" in skill
+
+
 def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
     background_rules = skill.split("### 背景路线", maxsplit=1)[1].split(
         "### 人物路线", maxsplit=1
     )[0]
 
-    assert "默认只调整同一现有表面的均匀颜色、明暗、光泽或粗糙度" in background_rules
+    assert "默认只改变一种低频外观属性，优先色相" in background_rules
+    assert "只有色相不能安全获得明显差异时，才单独选择明暗、光泽或粗糙度之一" in background_rules
+    assert "只改色相时，保持原亮度、光照、阴影、反射、纹理图案、纹理相位、缺陷、光泽和粗糙度" in background_rules
+    assert "不得附加均匀、哑光或任何新表面处理" in background_rules
     assert "完整保留原纹理图案、纹理相位、缺陷、边界与几何" in background_rules
     assert "不得新增、删除或移动纹理图案、接缝、重复单元或高频细节" in background_rules
     assert "表面翻新" not in background_rules
     assert "生成新材质" not in background_rules
 
-    assert "外观属性优先均匀、哑光、低细节" in background_rules
-    assert "仅当原表面本就没有接缝时才可写无缝" in background_rules
     assert "差异必须明显可见" in background_rules
     assert "无法安全获得明显差异时允许不改动" in background_rules
 
@@ -300,7 +318,9 @@ def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
     assert "禁止编辑外溢到目标表面之外" in background_rules
 
     assert "`SCENE replacement` 不直接提交给 Seedream" in skill
-    assert "目标表面描述 + 新颜色/明暗/光泽/粗糙度" in background_rules
+    assert "目标表面描述 + 实际改变的一种低频属性" in background_rules
+    assert "`SCENE replacement` 和项目级替换短语只写实际改变的一个属性" in skill
+    assert "不得列出未改变属性或多个候选" in skill
     assert "每个相关段实际 `prompt` 的第一句必须逐字包含同一短语" in background_rules
     assert "其余关系保护可按本段可见关系写" in background_rules
     assert "不得改动项目级替换短语" in background_rules
