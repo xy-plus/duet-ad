@@ -33,6 +33,13 @@ description: 检查一个视频项目的冻结关键帧，选择单一人物外�
   "segment_indices": [1, 2],
   "global_elements": [
     {
+      "id": "OUTFIT_01",
+      "kind": "outfit",
+      "source": "跨段重复出现的原人物可见服装特征",
+      "replacement": "统一的同色同用途同风格不同款服装",
+      "segments": [1, 2]
+    },
+    {
       "id": "PERSON_01",
       "kind": "person",
       "source": "跨段重复出现的原人物可见特征",
@@ -77,7 +84,7 @@ description: 检查一个视频项目的冻结关键帧，选择单一人物外�
 ## 跨段一致性
 
 1. `global_elements` 只允许 PERSON、OUTFIT、SCENE；只有真正被替换且跨段重复的 PERSON、OUTFIT、SCENE 才进入其中，PROP、PRODUCT、SUBJECT 不得建立新映射。只出现于一段或仅被保持的元素不进入 `global_elements`。
-2. 人物使用 `PERSON/person`，人物目标中一并替换的服装使用 `OUTFIT/outfit`，背景使用 `SCENE/scene`。同类 ID 从 `01` 连续编号，按 ID 升序输出。
+2. 人物使用 `PERSON/person`，人物目标中一并替换的服装使用 `OUTFIT/outfit`，背景使用 `SCENE/scene`。同类 ID 从 `01` 连续编号；`global_elements` 跨类别也必须按完整 `id` 字符串的字典序排列，因此 `OUTFIT_01` 必须排在 `PERSON_01` 前，不得按人物、服装、背景的语义顺序排列。
 3. `source` 只写识别原目标所需的稳定可见特征；`replacement` 只写可直接复用的新身份或新设计，不写构图、动作、光线、位置或关系。
 4. `segments` 只列实际执行该替换的段号，升序、去重且至少包含两段。同一人物或服装的描述必须跨段逐字复用，包括 `global_elements` 与各段提示词中的具体替换用词，不得改写、缩写或添加同义修饰。
 5. 跨段可识别为同一人物且任一段选择人物时，所有该人物安全可见的片段都必须选择人物外观，并逐字复用同一 PERSON、OUTFIT replacement；在这些安全可见片段中不得在其他片段改选背景。

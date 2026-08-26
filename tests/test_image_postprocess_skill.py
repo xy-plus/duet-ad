@@ -182,6 +182,16 @@ def test_skill_person_first_candidate_contract():
     assert "同一 PERSON、OUTFIT replacement" in skill
 
 
+def test_skill_sorts_global_elements_across_kinds_by_full_id():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "跨类别也必须按完整 `id` 字符串的字典序排列" in skill
+    outfit = '"id": "OUTFIT_01"'
+    person = '"id": "PERSON_01"'
+    assert outfit in skill and person in skill
+    assert skill.index(outfit) < skill.index(person)
+
+
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
     session = tmp_path / "session"
     segments = _segments(session)
