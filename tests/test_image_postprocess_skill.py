@@ -22,13 +22,6 @@ def _png(value: int = 127) -> bytes:
 def _elements() -> list[dict]:
     return [
         {
-            "id": "OUTFIT_01",
-            "kind": "outfit",
-            "source": "反复出现的深蓝休闲上衣",
-            "replacement": "同色同风格的不同剪裁上衣",
-            "segments": [1, 2],
-        },
-        {
             "id": "PERSON_01",
             "kind": "person",
             "source": "反复出现的深发女性",
@@ -167,9 +160,9 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "文字或 Logo" in skill
     assert "不传递人物、构图、动作、物体或关系" in skill
 
-    assert "global_elements` 的 schema 只允许 `PERSON`、`OUTFIT`、`SCENE`" in skill
+    assert "本 Skill 的 `global_elements` 只允许 `PERSON`、`SCENE`" in skill
     assert "按完整 `id` 的字典序" in skill
-    assert "PROP、PRODUCT、SUBJECT 不得建立新映射" in skill
+    assert "不得输出 `OUTFIT`、`PROP`、`PRODUCT`、`SUBJECT`" in skill
     assert "陀螺" not in skill and "发射器" not in skill
 
 
@@ -202,17 +195,17 @@ def test_skill_freezes_balanced_component_strategy_and_exact_two_sentence_routes
 def test_final_j_uses_one_large_stable_surface_and_face_only_fallback():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
-    assert "只选一个在全部相关段稳定可见" in skill
+    assert "只选一个能在所有相关段稳定对应" in skill
     assert "面积尽量大的安全背景表面类别" in skill
     assert "优先地面，其次墙面" in skill
+    assert "允许个别关键帧因裁切不可见" in skill
     assert "不得映射全部背景" in skill
     assert "为每类冻结" not in skill
 
     assert "原表面的边界、分块/拼缝、方向、透视和接触几何" in skill
     assert "保持光线方向" in skill
     assert "固定构件、家具、陈设不得新增、删除或移动" in skill
-    assert "目标表面不可见" in skill
-    assert "该帧不做其他改变" in skill
+    assert "该帧不做其他编辑" in skill
 
     assert "找不到稳定安全背景表面" in skill
     assert "只换脸，不换服装" in skill
