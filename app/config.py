@@ -9,7 +9,6 @@ SEEDREAM_MODELS = frozenset({
     "doubao-seedream-4-0-250828",
 })
 SEEDREAM_EDIT_MODES = frozenset({"anchor_consistency", "independent_parallel"})
-SEEDREAM_PROMPT_TEMPLATES = frozenset({"light", "balanced", "strong"})
 
 
 @dataclass(frozen=True)
@@ -29,7 +28,6 @@ class Settings:
     mediakit_timeout_s: float = 180.0
     seedream_model: str = "doubao-seedream-5-0-260128"
     seedream_edit_mode: str = "anchor_consistency"
-    seedream_prompt_template: str = "balanced"
     seedream_concurrency: int = 4
     seedream_timeout_s: float = 180.0
     data_dir: Path = Path("data")
@@ -54,8 +52,6 @@ class Settings:
             raise ValueError("seedream_model is not supported")
         if self.seedream_edit_mode not in SEEDREAM_EDIT_MODES:
             raise ValueError("seedream_edit_mode is not supported")
-        if self.seedream_prompt_template not in SEEDREAM_PROMPT_TEMPLATES:
-            raise ValueError("seedream_prompt_template is not supported")
         if (
             isinstance(self.seedream_concurrency, bool)
             or not isinstance(self.seedream_concurrency, int)
@@ -119,9 +115,6 @@ def get_settings() -> Settings:
         ).strip(),
         seedream_edit_mode=os.environ.get(
             "SEEDREAM_EDIT_MODE", "anchor_consistency"
-        ).strip(),
-        seedream_prompt_template=os.environ.get(
-            "SEEDREAM_PROMPT_TEMPLATE", "balanced"
         ).strip(),
         seedream_concurrency=int(os.environ.get("SEEDREAM_CONCURRENCY", "4")),
         seedream_timeout_s=float(os.environ.get("SEEDREAM_TIMEOUT_S", "180")),

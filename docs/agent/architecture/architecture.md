@@ -111,7 +111,7 @@ flowchart LR
 
 `postprocess` 不存在表示用户跳过优化，使用原关键帧；一旦存在则提交必须等待 `done`，并逐一解析同名 `postprocessed/`。短视频统一作为逻辑段 `0`，长视频严格使用连续正整数 `1..N`。每段按已选阶段形成屏障：本段全部帧完成 MediaKit 文字擦除后才进入图标擦除，全部完成后才进入 Seedream；段之间并行，每个阶段的帧请求由供应商级信号量限流。
 
-图片优化设置在分析完成时按项目冻结，包含 allowlist 内的模型、`light|balanced|strong` 模板和 `anchor_consistency|independent_parallel` 模式；公开 detail 只投影每段 `{text,default_text,sha256}`。`anchor_consistency` 先以本段全部清理帧生成第一张锚帧，再把其余各帧与锚帧并行编辑；`independent_parallel` 每张清理帧独立并行编辑。两种模式都保持一入一出，不使用供应商多输出映射。
+视觉关键帧冻结后，隔离 Codex 按段执行 `skills/image-postprocess`：工作区只有 Skill、本段关键帧和 `edit_mode`，不含 H3 prompt、台词、视频或其他片段。Codex 输出就是用户看到并可 CAS 修改的真实 Seedream 提示词；分析完成时同时冻结 allowlist 内的模型和 `anchor_consistency|independent_parallel` 模式。`anchor_consistency` 先以本段全部清理帧生成第一张锚帧，再把其余各帧与锚帧并行编辑；`independent_parallel` 每张清理帧独立并行编辑。两种模式都保持一入一出，不使用供应商多输出映射。图片编辑是可选的非确定性步骤，提示词存在不表示该步骤一定执行或成功。
 
 每个 Seedream POST 前原子持久化绑定模型、模式、提示词摘要和输入摘要的 attempt。只有完整 HTTP 429、精确 `QuotaExceeded` 且没有 `data` 时才继续，单帧硬上限 3 次；网络/超时/取消等 POST 结果不明都写为 `submission_unknown`。服务启动仅恢复能由本地产物证明安全的阶段；当前 revision 存在 submitting/unknown attempt 时将该段和整体标为失败，不自动重发。人工重试用 revision CAS 创建下一 revision，旧 attempt 不删除。
 
@@ -189,7 +189,7 @@ data/<cid>/
 - 上传创建的查重/排队计数在进程锁内；pipeline 使用进程信号量；提交和后处理各有每会话 asyncio 锁。后处理并行调度所有逻辑段，MediaKit 与 Seedream 分别用进程级有界信号量限制帧请求；长视频提示词准备最多使用一半 Codex 并发槽，生成最多推进两条独立 chain。
 - H3 远程调用在后台线程中执行，状态先写 meta `queued`，再写 `running`。服务启动仅扫描 schema v2 且 generation 为 `queued/running` 的会话。
 - 应用必须单进程运行。内存锁和信号量不跨 worker；不要加 `--workers`。
-- 供应商凭据只从环境进入请求内存；`ARK_API_KEY` 不属于 Settings 数据模型，receipt、attempt、meta、API 与安全错误都不含密钥。模型、模板和图片编辑模式存私有冻结 receipt，但不投影到前端。
+- 供应商凭据只从环境进入请求内存；`ARK_API_KEY` 不属于 Settings 数据模型，receipt、attempt、meta、API 与安全错误都不含密钥。模型和图片编辑模式存私有冻结 receipt，但不投影到前端。
 - 自动台词依赖宿主 `bwrap` 与 Codex 内层 sandbox 能力；任一不可用都令该准备步骤失败，不退化为仅靠提示词禁止读取视觉输入。
 - Caddy 是唯一公网监听；uvicorn 固定 `127.0.0.1:3212`。systemd 使用 0077 umask 和外部 0600 EnvironmentFile。
 

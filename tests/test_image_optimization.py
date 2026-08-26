@@ -49,18 +49,29 @@ def _done(settings, *, segments=False):
     return cid
 
 
+def _codex_prompts(meta):
+    segments = meta.get("segments")
+    indices = [item["index"] for item in segments] if segments else [0]
+    return {
+        index: f"本段 {index} 的 Codex 图片二次编辑提示词，不得出现文字。"
+        for index in indices
+    }
+
+
+def _freeze(settings, meta):
+    return image_optimization.freeze_prompts(settings, meta, _codex_prompts(meta))
+
+
 def test_seedream_settings_are_closed_and_secret_is_not_a_setting(monkeypatch):
     monkeypatch.setenv("ARK_API_KEY", "super-secret")
     settings = Settings(access_token="x")
     assert settings.seedream_model == "doubao-seedream-5-0-260128"
     assert settings.seedream_edit_mode == "anchor_consistency"
-    assert settings.seedream_prompt_template == "balanced"
     assert "super-secret" not in repr(settings)
     assert not hasattr(settings, "ark_api_key")
     for field, value in (
         ("seedream_model", "unknown"),
         ("seedream_edit_mode", "all-at-once"),
-        ("seedream_prompt_template", "extreme"),
         ("seedream_concurrency", 0),
         ("seedream_timeout_s", float("nan")),
     ):
@@ -72,7 +83,7 @@ def test_prompt_freeze_and_projection_are_segment_scoped(tmp_path):
     settings = make_settings(tmp_path)
     cid = _done(settings, segments=True)
     meta = storage.load_meta(settings.data_dir, cid)
-    changes = image_optimization.freeze_prompts(settings, meta)
+    changes = _freeze(settings, meta)
     frozen = changes["_image_optimization"]
     assert [item["segment_index"] for item in frozen["segments"]] == [1, 2]
     assert frozen["model"] == settings.seedream_model
@@ -80,7 +91,7 @@ def test_prompt_freeze_and_projection_are_segment_scoped(tmp_path):
     for item in frozen["segments"]:
         assert item["default"] == item["current"]
         assert item["sha256"] == hashlib.sha256(item["current"].encode()).hexdigest()
-        assert "文字" in item["current"] and "同一套新设计" in item["current"]
+        assert item["current"] == _codex_prompts(meta)[item["segment_index"]]
 
 
 @pytest.mark.parametrize("indices", ([0, 1], [1, 3], [True, 2]))
@@ -91,13 +102,13 @@ def test_long_prompt_segments_must_be_positive_and_contiguous(tmp_path, indices)
         "segments": [{"index": index, "prompt": "p"} for index in indices],
     }
     with pytest.raises(ValueError):
-        image_optimization.freeze_prompts(settings, meta)
+        image_optimization.freeze_prompts(settings, meta, _codex_prompts(meta))
 
 
 def test_receipt_rejects_short_long_mixed_or_gapped_indices(tmp_path):
     settings = make_settings(tmp_path)
     meta = {"schema_version": 2, "status": "done", "prompt": "p"}
-    frozen = image_optimization.freeze_prompts(settings, meta)["_image_optimization"]
+    frozen = _freeze(settings, meta)["_image_optimization"]
     meta["_image_optimization"] = frozen
     assert image_optimization.receipt(meta, settings) is not None
     meta["segments"] = [{"index": 1, "prompt": "a"}, {"index": 2, "prompt": "b"}]
@@ -108,17 +119,17 @@ def test_postprocess_uses_project_frozen_provider_settings(tmp_path):
     analysis_settings = make_settings(
         tmp_path, enable_mediakit_erase=True,
         seedream_model="doubao-seedream-4-5-251128",
-        seedream_edit_mode="independent_parallel", seedream_prompt_template="strong",
+        seedream_edit_mode="independent_parallel",
     )
     cid = _done(analysis_settings)
     meta = storage.load_meta(analysis_settings.data_dir, cid)
     storage.update_meta(
         analysis_settings.data_dir, cid,
-        **image_optimization.freeze_prompts(analysis_settings, meta),
+        **_freeze(analysis_settings, meta),
     )
     runtime = replace(
         analysis_settings, seedream_model="doubao-seedream-5-0-260128",
-        seedream_edit_mode="anchor_consistency", seedream_prompt_template="light",
+        seedream_edit_mode="anchor_consistency",
         seedream_concurrency=99,
     )
     asyncio.run(postprocess.start(
@@ -127,8 +138,8 @@ def test_postprocess_uses_project_frozen_provider_settings(tmp_path):
         {},
     ))
     private = storage.load_meta(runtime.data_dir, cid)["_postprocess_receipt"]
-    assert (private["model"], private["edit_mode"], private["prompt_template"]) == (
-        "doubao-seedream-4-5-251128", "independent_parallel", "strong",
+    assert (private["model"], private["edit_mode"]) == (
+        "doubao-seedream-4-5-251128", "independent_parallel",
     )
     assert "concurrency" not in private
 
@@ -139,7 +150,7 @@ def test_public_options_tamper_cannot_skip_frozen_seedream_or_publish(tmp_path, 
     cid = _done(settings)
     meta = storage.load_meta(settings.data_dir, cid)
     storage.update_meta(
-        settings.data_dir, cid, **image_optimization.freeze_prompts(settings, meta)
+        settings.data_dir, cid, **_freeze(settings, meta)
     )
     asyncio.run(postprocess.start(
         settings, cid,
@@ -172,7 +183,7 @@ def test_private_receipt_must_match_project_frozen_optimization(tmp_path, monkey
     cid = _done(settings)
     meta = storage.load_meta(settings.data_dir, cid)
     storage.update_meta(
-        settings.data_dir, cid, **image_optimization.freeze_prompts(settings, meta)
+        settings.data_dir, cid, **_freeze(settings, meta)
     )
     asyncio.run(postprocess.start(
         settings, cid,
@@ -201,7 +212,7 @@ def test_all_false_private_options_fail_closed_in_run_retry_and_recovery(tmp_pat
     cid = _done(settings)
     meta = storage.load_meta(settings.data_dir, cid)
     storage.update_meta(
-        settings.data_dir, cid, **image_optimization.freeze_prompts(settings, meta)
+        settings.data_dir, cid, **_freeze(settings, meta)
     )
     asyncio.run(postprocess.start(
         settings, cid,
@@ -258,7 +269,7 @@ def test_prompt_patch_is_strict_cas_and_freezes_on_postprocess(tmp_path):
     settings = make_settings(tmp_path)
     cid = _done(settings)
     meta = storage.load_meta(settings.data_dir, cid)
-    storage.update_meta(settings.data_dir, cid, **image_optimization.freeze_prompts(settings, meta))
+    storage.update_meta(settings.data_dir, cid, **_freeze(settings, meta))
     with TestClient(create_app(settings)) as client:
         detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
         prompt = detail["image_optimization_prompt"]
@@ -291,7 +302,7 @@ def test_prompt_patch_cannot_cross_first_submit_claim_window(tmp_path, monkeypat
     settings = make_settings(tmp_path)
     cid = _done(settings)
     meta = storage.load_meta(settings.data_dir, cid)
-    frozen = image_optimization.freeze_prompts(settings, meta)["_image_optimization"]
+    frozen = _freeze(settings, meta)["_image_optimization"]
     storage.update_meta(settings.data_dir, cid, _image_optimization=frozen)
     current_sha = frozen["segments"][0]["sha256"]
     owner_writing = threading.Event()
@@ -520,7 +531,7 @@ def test_cancelled_postprocess_projects_unknown_and_failed_recovery_does_not_res
     cid = _done(settings)
     meta = storage.load_meta(settings.data_dir, cid)
     storage.update_meta(
-        settings.data_dir, cid, **image_optimization.freeze_prompts(settings, meta)
+        settings.data_dir, cid, **_freeze(settings, meta)
     )
     asyncio.run(postprocess.start(
         settings, cid,
@@ -566,7 +577,7 @@ def test_anchor_first_frame_real_timeout_projects_submission_unknown(tmp_path, m
     cid = _done(settings)
     meta = storage.load_meta(settings.data_dir, cid)
     storage.update_meta(
-        settings.data_dir, cid, **image_optimization.freeze_prompts(settings, meta)
+        settings.data_dir, cid, **_freeze(settings, meta)
     )
     asyncio.run(postprocess.start(
         settings, cid,
@@ -615,7 +626,7 @@ def test_postprocess_has_strict_stage_barriers_and_anchor_single_output(tmp_path
         (cdir / "work" / "keyframes" / f"{number:02d}.png").write_bytes(_png(value=number))
     meta = storage.load_meta(settings.data_dir, cid)
     storage.update_meta(settings.data_dir, cid, keyframes=["01.png", "02.png", "03.png"],
-                        **image_optimization.freeze_prompts(settings, meta))
+                        **_freeze(settings, meta))
     events = []
 
     async def erase(_settings, _cdir, source, output, confirm, scenes):
@@ -659,6 +670,8 @@ def test_postprocess_has_strict_stage_barriers_and_anchor_single_output(tmp_path
 def test_brand_only_never_calls_seedream_and_old_two_options_are_canonical(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, enable_mediakit_erase=True)
     cid = _done(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    storage.update_meta(settings.data_dir, cid, **_freeze(settings, meta))
 
     async def erase(_settings, _cdir, source, output, _confirm, _scenes):
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -684,7 +697,7 @@ def test_manual_segment_retry_preserves_unknown_attempt_while_recovery_never_pos
     settings = make_settings(tmp_path)
     cid = _done(settings)
     cdir = settings.data_dir / cid
-    prompt = image_optimization.freeze_prompts(settings, storage.load_meta(settings.data_dir, cid))[
+    prompt = _freeze(settings, storage.load_meta(settings.data_dir, cid))[
         "_image_optimization"
     ]
     attempts = cdir / "work" / ".postprocess-private" / "0" / "attempts"
@@ -694,10 +707,9 @@ def test_manual_segment_retry_preserves_unknown_attempt_while_recovery_never_pos
     storage.update_meta(
         settings.data_dir, cid, _image_optimization=prompt,
         _postprocess_receipt={
-            "version": 1,
+            "version": 2,
             "options": {"remove_subtitle": False, "remove_brand": False, "optimize_image": True},
             "model": settings.seedream_model, "edit_mode": settings.seedream_edit_mode,
-            "prompt_template": settings.seedream_prompt_template,
             "timeout_s": settings.seedream_timeout_s,
             "prompts": prompt["segments"],
         },
@@ -742,7 +754,7 @@ def test_recovery_ignores_old_unknown_revision_on_done_segment(tmp_path, monkeyp
     cid = _done(settings, segments=True)
     meta = storage.load_meta(settings.data_dir, cid)
     storage.update_meta(
-        settings.data_dir, cid, **image_optimization.freeze_prompts(settings, meta)
+        settings.data_dir, cid, **_freeze(settings, meta)
     )
     asyncio.run(postprocess.start(
         settings, cid,

@@ -34,7 +34,7 @@ links: [antd-x-frontend]
 - 唯一原生视觉控件是 `src/ui/video.tsx` 封装的 `<video controls>`；它只接收已认证 Blob URL。
 - 后处理完整成功后，服务端自动把同名 `postprocessed/` 图片冻结为 H3 输入；前端不提供手工回灌或绕过完整性门控的入口。
 - 已锁定选项不可改；失败恢复只允许带服务端 revision 的分段 CAS 重试。
-- 页面不展示图片优化供应商模型、模板 ID 或执行模式。
+- 页面不展示图片优化供应商模型或执行模式。
 - `postprocess_enabled=false`、只读会话或已有后处理记录时不显示新的配置入口。
 
 ## 例子

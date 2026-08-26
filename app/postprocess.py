@@ -139,10 +139,9 @@ def public_state(value: object) -> dict | None:
 def _private_receipt(meta: dict) -> dict:
     raw = meta.get("_postprocess_receipt")
     expected_keys = {
-        "version", "options", "model", "edit_mode", "prompt_template",
-        "timeout_s", "prompts",
+        "version", "options", "model", "edit_mode", "timeout_s", "prompts",
     }
-    if not isinstance(raw, dict) or set(raw) != expected_keys or raw.get("version") != 1:
+    if not isinstance(raw, dict) or set(raw) != expected_keys or raw.get("version") != 2:
         raise PostprocessError(409, "postprocess_receipt_invalid")
     options = raw.get("options")
     post = meta.get("postprocess")
@@ -165,8 +164,8 @@ def _private_receipt(meta: dict) -> dict:
     ):
         raise PostprocessError(409, "postprocess_receipt_invalid")
     private_frozen = {
-        "version": 1, "model": raw.get("model"), "edit_mode": raw.get("edit_mode"),
-        "prompt_template": raw.get("prompt_template"), "segments": raw.get("prompts"),
+        "version": 2, "model": raw.get("model"), "edit_mode": raw.get("edit_mode"),
+        "segments": raw.get("prompts"),
     }
     project_frozen = image_optimization.receipt(meta)
     if project_frozen is None or private_frozen != project_frozen:
@@ -351,10 +350,9 @@ async def start(settings: Settings, cid: str, payload: dict,
             if optimization is None:
                 raise PostprocessError(409, "image_optimization_prompt_invalid")
             private = {
-                "version": 1, "options": options,
+                "version": 2, "options": options,
                 "model": optimization["model"],
                 "edit_mode": optimization["edit_mode"],
-                "prompt_template": optimization["prompt_template"],
                 "timeout_s": settings.seedream_timeout_s,
                 "prompts": optimization["segments"],
             }

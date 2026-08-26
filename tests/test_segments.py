@@ -24,6 +24,17 @@ from app import long_video, pipeline, storage, vocal
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
+
+@pytest.fixture(autouse=True)
+def _stub_image_postprocess_codex(monkeypatch):
+    monkeypatch.setattr(
+        pipeline.image_optimization,
+        "generate_prompt",
+        lambda _runner, _keyframes, mode, *, session_dir: (
+            f"Codex 生成的 {mode} 图片二次编辑提示词"
+        ),
+    )
+
 # 1×1 真实 PNG（validate_work_dir 会用 cv2 解码校验）
 _PX_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -240,6 +251,8 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     )
     line = {"text": "局部台词", "start_s": 16.5, "end_s": 17.5}
     calls = {"cmd": [], "codex": []}
+    image_calls = []
+    image_barrier = threading.Barrier(3)
 
     def fake_voice_step(*args, **kwargs):
         return [line]
@@ -247,6 +260,11 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     def fake_codex(self, workdir, prompt):
         calls["codex"].append(Path(workdir))
         _write_valid_package(Path(workdir) / "work", prompt=f"局部动作-{Path(workdir).name}")
+
+    def fake_image_prompt(_runner, _keyframes, mode, *, session_dir):
+        image_calls.append(Path(session_dir).name)
+        image_barrier.wait(timeout=5)
+        return f"图片二次编辑提示词-{Path(session_dir).name}-{mode}"
 
     base_fake_cmd = _fake_cmd_segments(calls, SEGMENTS)
 
@@ -294,6 +312,7 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
     monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
     monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(pipeline.image_optimization, "generate_prompt", fake_image_prompt)
 
     pipeline.run(settings, cid, CodexRunner(1, 1))
 
@@ -316,6 +335,16 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
         "chain-002",
         "chain-003",
     ]
+    assert sorted(image_calls) == ["1", "2", "3"]
+    frozen_prompts = stored["_image_optimization"]["segments"]
+    assert [item["current"] for item in frozen_prompts] == [
+        f"图片二次编辑提示词-{index}-anchor_consistency"
+        for index in (1, 2, 3)
+    ]
+    assert all(
+        item["current"] != stored["segments"][item["segment_index"] - 1]["prompt"]
+        for item in frozen_prompts
+    )
     assert [s["join_mode"] for s in stored["segments"]] == ["hard_cut"] * 3
     assert stored["segments"][2]["dialogue"] == [
         {"text": "局部台词", "start_s": 0.5, "end_s": 1.5}

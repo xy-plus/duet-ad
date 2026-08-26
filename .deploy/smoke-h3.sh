@@ -199,6 +199,8 @@ receipt_version=$(json_get receipt_version <<<"$detail")
 plan_receipt=$(json_get plan_receipt <<<"$detail")
 segment_count=$(json_get segment_count <<<"$detail")
 fit_required=$(json_get fit_required <<<"$detail")
+aspect_ratio=$(json_get aspect_ratio <<<"$detail")
+resolution=$(json_get resolution <<<"$detail")
 video_kind=$("$python_bin" -c '
 import math, sys
 try:
@@ -206,10 +208,11 @@ try:
 except (TypeError, ValueError):
     print("invalid")
 else:
-    print("long" if math.isfinite(duration) and duration > 10 else
+    print("long" if math.isfinite(duration) and duration > 15 else
           "short" if math.isfinite(duration) and duration > 0 else "invalid")
 ' "$duration_s")
-if [[ "$read_only" != "false" || "$video_kind" == "invalid" ]]; then
+if [[ "$read_only" != "false" || "$video_kind" == "invalid" || \
+      -z "$aspect_ratio" || -z "$resolution" ]]; then
   echo "Conversation is not an operable schema-v2 frozen input: cid=$cid" >&2
   exit 1
 fi
@@ -237,7 +240,10 @@ else
 fi
 
 generation_id=$(new_request_id)
-payload_args=("$generation_id" "$dialogue_mode" "$selected_fit")
+payload_args=(
+  "$generation_id" "$dialogue_mode" "$selected_fit"
+  "$aspect_ratio" "$resolution"
+)
 if [[ "$video_kind" == "long" ]]; then
   payload_args+=("$plan_receipt")
 fi
@@ -248,9 +254,11 @@ payload = {
     "client_request_id": sys.argv[1],
     "dialogue_mode": sys.argv[2],
     "fit_mode": sys.argv[3],
+    "aspect_ratio": sys.argv[4],
+    "resolution": sys.argv[5],
 }
-if len(sys.argv) == 5:
-    payload["expected_plan_receipt"] = sys.argv[4]
+if len(sys.argv) == 7:
+    payload["expected_plan_receipt"] = sys.argv[6]
 print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 ' "${payload_args[@]}")
 

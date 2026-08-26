@@ -23,6 +23,17 @@ from app import codex_runner, h3, long_generation, long_video, pipeline, prepare
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
+
+@pytest.fixture(autouse=True)
+def _stub_image_postprocess_codex(monkeypatch):
+    monkeypatch.setattr(
+        pipeline.image_optimization,
+        "generate_prompt",
+        lambda _runner, _keyframes, mode, *, session_dir: (
+            f"Codex 生成的 {mode} 图片二次编辑提示词"
+        ),
+    )
+
 ROOT = Path(pipeline.__file__).resolve().parent.parent
 EXTRACT_SCRIPT = ROOT / "skills" / "video-maker" / "scripts" / "extract_keyframes.py"
 CROP_SCRIPT = ROOT / "skills" / "video-maker" / "scripts" / "crop_image.py"
@@ -171,12 +182,15 @@ def test_run_converges_container_duration_to_visual_manifest_timeline(
     def fake_process_segment(
         _settings, work, _source, seg, _runner, lines, _lang,
         new_input_contract,
-    ):
-        anchors = work / "segments" / str(seg["index"]) / "work" / "anchors"
-        anchors.mkdir(parents=True, exist_ok=True)
-        (anchors / "first.png").write_bytes(_PX_PNG)
-        (anchors / "last.png").write_bytes(_PX_PNG)
-        return {**seg, "keyframes": [], "prompt": "p", "dialogue": lines or []}
+        ):
+            anchors = work / "segments" / str(seg["index"]) / "work" / "anchors"
+            anchors.mkdir(parents=True, exist_ok=True)
+            (anchors / "first.png").write_bytes(_PX_PNG)
+            (anchors / "last.png").write_bytes(_PX_PNG)
+            (anchors.parent / "image_optimization_prompt.txt").write_text(
+                "Codex 分段图片二次编辑提示词", encoding="utf-8"
+            )
+            return {**seg, "keyframes": [], "prompt": "p", "dialogue": lines or []}
 
     monkeypatch.setattr(pipeline, "_process_segment", fake_process_segment)
     monkeypatch.setattr(long_video, "write_plan_receipt", fake_write)
@@ -713,7 +727,7 @@ class TestCodexRunner:
                 "codex", "sandbox", "-P", ":workspace", "-C", str(stage),
                 "bash", "-c", script,
             ]
-            argv = codex_runner._voice_outer_argv(stage, cdir, inner)
+            argv = codex_runner._isolated_outer_argv(stage, cdir, inner)
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
 
             assert proc.returncode == 0, proc.stderr
@@ -1024,7 +1038,6 @@ def test_run_voice_vocal_filter_records_bgm_and_dropped_count(
         {"text": "唱歌", "start_s": 0.3, "end_s": 0.6},
         {"text": "幻觉", "start_s": 0.6, "end_s": 0.9},
     ]
-
     def fake_extract_audio(cdir_arg):
         out = cdir_arg / "work" / "voice.mp3"
         out.write_bytes(b"mp3-bytes")
@@ -1066,6 +1079,55 @@ def test_run_voice_vocal_filter_records_bgm_and_dropped_count(
         {**lines[1], "classification": "sung", "provenance": "asr", "kept": True},
         {**lines[2], "classification": None, "provenance": "asr", "kept": False},
     ]
+
+
+def test_run_voice_drops_spoken_subtitle_credit_before_prompt(
+    tmp_path, video_1s, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+    credit = {"text": "(字幕製作:貝爾)", "start_s": 0.0, "end_s": 0.8}
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"mp3-bytes")
+        return out
+
+    def fake_codex(self, workdir, prompt):
+        work = Path(workdir) / "work"
+        if "voice.mp3" in prompt:
+            (work / "voice_lines.json").write_text(
+                json.dumps([credit]), encoding="utf-8"
+            )
+        else:
+            _write_valid_package(work)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        vocal,
+        "analyze",
+        lambda _audio: vocal.VocalAnalysis(
+            windows=[vocal.VocalWindow(0, 800, sung=0.0, spoken=0.8, music=0.0)],
+            has_bgm=False,
+        ),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done"
+    assert stored["voice_lines"] == []
+    assert stored["voice_lines_credit_dropped"] == 1
+    assert stored["voice_line_provenance"] == [{
+        **credit,
+        "classification": "spoken",
+        "provenance": "asr",
+        "kept": False,
+        "drop_reason": "subtitle_credit",
+    }]
 
 
 def test_run_voice_vocal_filter_off_bypasses_but_records_decisions(
@@ -1485,6 +1547,15 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_prepared_receipt(
     assert loaded.dialogue_mode == "auto"
     assert loaded.normalized_audio is None
     assert loaded.voice_texts == ()
+    frozen = stored["_image_optimization"]
+    assert frozen["version"] == 2
+    assert frozen["segments"][0]["current"] == (
+        "Codex 生成的 anchor_consistency 图片二次编辑提示词"
+    )
+    assert frozen["segments"][0]["current"] != stored["prompt"]
+    assert (cdir / "work" / "image_optimization_prompt.txt").read_text(
+        encoding="utf-8"
+    ).strip() == frozen["segments"][0]["current"]
 
 
 def test_run_dialogue_auto_ignores_external_lines_and_isolates_visual_codex(

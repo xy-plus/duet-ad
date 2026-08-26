@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -79,6 +80,17 @@ def _exact_quota(response: httpx.Response) -> bool:
         and isinstance(body.get("error"), dict)
         and body["error"].get("code") == "QuotaExceeded"
     )
+
+
+def _safe_provider_error_code(response: httpx.Response) -> str | None:
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    code = body.get("error", {}).get("code") if isinstance(body, dict) else None
+    if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", code):
+        return code
+    return None
 
 
 def _decode(payload: dict) -> bytes:
@@ -217,10 +229,14 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
                 continue
             if response.status_code >= 400:
                 attempts[-1]["status"] = "failed"
-                _atomic_json(receipt_path, {
+                failed_receipt = {
                     **current, "status": "failed", "http_status": response.status_code,
                     "attempts": attempts,
-                })
+                }
+                error_code = _safe_provider_error_code(response)
+                if error_code:
+                    failed_receipt["provider_error_code"] = error_code
+                _atomic_json(receipt_path, failed_receipt)
                 raise SeedreamError("provider_rejected")
             try:
                 raw = _decode(response.json())

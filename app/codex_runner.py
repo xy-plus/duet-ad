@@ -8,7 +8,7 @@
      （实证：0.147.0 的 shell 命令经 code-mode-host 执行，shell_environment_policy
      的 inherit/exclude 不能阻止宿主秘密泄漏进 agent shell，必须在本进程侧清洗）；
     b) codex 配置级：inherit="core" + exclude 兜底；
-- 视觉步骤使用 Codex 默认沙箱后端；voice 步骤额外由 bwrap 遮住 checkout、会话与其余 /tmp；
+- 视觉步骤使用 Codex 默认沙箱后端；隔离 Skill 与 voice 步骤额外由 bwrap 遮住 checkout、会话与其余 /tmp；
   宿主服务必须允许两层沙箱创建所需的 user namespace；
 - 硬超时 settings.codex_timeout_s；并发信号量 settings.codex_concurrency；
 - 超时/非零退出 → CodexError，stderr 先剔除环境变量行再截断 ≤500 字。
@@ -46,10 +46,10 @@ _CHECKOUT_BOUNDARY = (
 )
 _T = TypeVar("_T")
 
-# run_voice() 仍经由公开 run() 进入同一并发/超时/env 清洗路径；ContextVar 只把本次同步调用
-# 标为音频 stage，使 build_argv() 加上外层 bwrap。线程间不共享，视觉 run() 不会误继承。
-_ACTIVE_VOICE_STAGE: ContextVar[tuple[int, Path, Path] | None] = ContextVar(
-    "active_voice_stage", default=None
+# 隔离任务仍经由公开 run() 进入同一并发/超时/env 清洗路径；ContextVar 只把本次同步调用
+# 标为独立 stage，使 build_argv() 加上外层 bwrap。线程间不共享，普通视觉 run() 不会误继承。
+_ACTIVE_ISOLATED_STAGE: ContextVar[tuple[int, Path, Path] | None] = ContextVar(
+    "active_isolated_stage", default=None
 )
 
 
@@ -89,33 +89,33 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
 def _resolve_bwrap() -> Path:
     executable = shutil.which("bwrap")
     if not executable:
-        raise CodexError("bwrap executable not found on PATH; voice isolation unavailable")
+        raise CodexError("bwrap executable not found on PATH; isolated execution unavailable")
     try:
         resolved = Path(executable).resolve(strict=True)
     except OSError:
-        raise CodexError("bwrap executable path is invalid; voice isolation unavailable") from None
+        raise CodexError("bwrap executable path is invalid; isolated execution unavailable") from None
     if not resolved.is_file() or not resolved.is_absolute():
-        raise CodexError("bwrap executable path is invalid; voice isolation unavailable")
+        raise CodexError("bwrap executable path is invalid; isolated execution unavailable")
     return resolved
 
 
-def _voice_outer_argv(stage: Path, session_dir: Path, inner_argv: list[str]) -> list[str]:
-    """构造音频专用外层挂载沙箱；任一路径异常都拒绝运行。"""
+def _isolated_outer_argv(stage: Path, session_dir: Path, inner_argv: list[str]) -> list[str]:
+    """构造单次任务外层挂载沙箱；任一路径异常都拒绝运行。"""
     try:
         tmp_root = Path("/tmp").resolve(strict=True)
         stage = stage.resolve(strict=True)
         session_dir = session_dir.resolve(strict=True)
         checkout = _CHECKOUT_BOUNDARY.resolve(strict=True)
     except OSError:
-        raise CodexError("voice isolation path is missing or invalid") from None
+        raise CodexError("isolated execution path is missing or invalid") from None
     if stage.parent != tmp_root or not stage.is_dir():
-        raise CodexError("voice isolation stage must be a direct child of /tmp")
+        raise CodexError("isolated stage must be a direct child of /tmp")
     if not session_dir.is_dir() or session_dir in {Path("/"), tmp_root, checkout}:
-        raise CodexError("voice isolation session path is unsafe")
+        raise CodexError("isolated session path is unsafe")
     if _is_relative_to(stage, session_dir):
-        raise CodexError("voice isolation stage must be outside the source session")
+        raise CodexError("isolated stage must be outside the source session")
     if not inner_argv:
-        raise CodexError("voice isolation inner command is empty")
+        raise CodexError("isolated inner command is empty")
 
     argv = [
         str(_resolve_bwrap()),
@@ -179,16 +179,16 @@ class CodexRunner:
         self._sem = threading.Semaphore(concurrency)
 
     def build_argv(self, workdir: Path, prompt: str) -> list[str]:
-        active = _ACTIVE_VOICE_STAGE.get()
-        voice_stage: tuple[Path, Path] | None = None
+        active = _ACTIVE_ISOLATED_STAGE.get()
+        isolated_stage: tuple[Path, Path] | None = None
         if active is not None and active[0] == id(self):
-            voice_stage = (active[1], active[2])
+            isolated_stage = (active[1], active[2])
             try:
                 actual = Path(workdir).resolve(strict=True)
             except OSError:
-                raise CodexError("voice isolation workdir is invalid") from None
-            if actual != voice_stage[0]:
-                raise CodexError("voice isolation workdir mismatch")
+                raise CodexError("isolated workdir is invalid") from None
+            if actual != isolated_stage[0]:
+                raise CodexError("isolated workdir mismatch")
 
         argv = [
             "codex", "exec",
@@ -199,15 +199,15 @@ class CodexRunner:
             "--color", "never",
             "-o",
             "/dev/null"
-            if voice_stage is not None
+            if isolated_stage is not None
             else str(workdir / "codex_last_message.txt"),
         ]
         for cfg in _SANDBOX_CONFIGS:
             argv += ["-c", cfg]
         argv.append(prompt)
-        if voice_stage is None:
+        if isolated_stage is None:
             return argv
-        return _voice_outer_argv(voice_stage[0], voice_stage[1], argv)
+        return _isolated_outer_argv(isolated_stage[0], isolated_stage[1], argv)
 
     def run(self, workdir: Path, prompt: str) -> None:
         argv = self.build_argv(workdir, prompt)
@@ -231,6 +231,25 @@ class CodexRunner:
                 f"codex exit {proc.returncode}: {clean_stderr(proc.stderr)}",
                 retryable=True,
             )
+
+    def run_isolated(self, workdir: Path, prompt: str, *, session_dir: Path) -> None:
+        """Run Codex in a prebuilt, single-use /tmp stage hidden from the source session."""
+        _resolve_bwrap()
+        try:
+            tmp_root = Path("/tmp").resolve(strict=True)
+            stage = Path(workdir).resolve(strict=True)
+            session = Path(session_dir).resolve(strict=True)
+        except OSError:
+            raise CodexError("isolated execution path is missing or invalid") from None
+        if stage.parent != tmp_root or not stage.is_dir():
+            raise CodexError("isolated stage must be a direct child of /tmp")
+        if not session.is_dir():
+            raise CodexError("isolated session path is invalid")
+        token = _ACTIVE_ISOLATED_STAGE.set((id(self), stage, session))
+        try:
+            self.run(stage, prompt)
+        finally:
+            _ACTIVE_ISOLATED_STAGE.reset(token)
 
     def run_voice(
         self,
@@ -283,15 +302,11 @@ class CodexRunner:
                     encoding="utf-8",
                 )
 
-                token = _ACTIVE_VOICE_STAGE.set((id(self), stage, session_dir))
                 run_error: CodexError | None = None
                 try:
-                    try:
-                        self.run(stage, prompt)
-                    except CodexError as error:
-                        run_error = error
-                finally:
-                    _ACTIVE_VOICE_STAGE.reset(token)
+                    self.run_isolated(stage, prompt, session_dir=session_dir)
+                except CodexError as error:
+                    run_error = error
 
                 try:
                     result = validate_output(

@@ -27,11 +27,29 @@ _UNRECOGNIZED_ASR_RE = re.compile(
     r"\s*[.!。]?\s*(?:[\]\)\}）】]|$)",
     re.IGNORECASE,
 )
+_SUBTITLE_CREDIT_RE = re.compile(
+    r"^\s*[\[\(\{（【]?\s*(?:"
+    r"(?:字幕(?:制作|製作|翻译|翻譯|校对|校對|时间轴|時間軸)?|"
+    r"翻译|翻譯|校对|校對|时间轴|時間軸)\s*[:：]\s*\S.{0,80}|"
+    r"(?:subtitles?|captions?|translated|translation|timing|typeset)\s+"
+    r"(?:by|:)\s*\S.{0,80}"
+    r")\s*[\]\)\}）】]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def is_unrecognized_text(text: str) -> bool:
     """整句 ASR 失败哨兵不是源素材台词，不能进入后续 prompt。"""
     return isinstance(text, str) and _UNRECOGNIZED_ASR_RE.search(text.strip()) is not None
+
+
+def is_subtitle_credit_text(text: str) -> bool:
+    """Narrow credit signatures are visible text, never character dialogue."""
+    return (
+        isinstance(text, str)
+        and len(text.strip()) <= 120
+        and _SUBTITLE_CREDIT_RE.fullmatch(text.strip()) is not None
+    )
 
 
 def probe_audio_duration(path: Path) -> float | None:

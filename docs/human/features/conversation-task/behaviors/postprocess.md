@@ -14,7 +14,7 @@ links: [conversation-task, result-display]
 
 | 当 | 则 |
 | --- | --- |
-| schema v2 会话已 `done` | 按 `postprocess_capabilities` 分别显示“移除文字/字幕”“移除常见 Logo/图标”“优化图片质量”；不可用项不展示 |
+| schema v2 会话已 `done` | 按 `postprocess_capabilities` 分别显示“移除文字/字幕”“移除常见 Logo/图标”“进行图片优化”；不可用项不展示 |
 | 首次询问“是否优化素材？” | “否”初始高亮且仅在页面内记忆，不写后端；“是”打开弹窗，去字幕/去品牌默认选中，图片优化默认不选中 |
 | 至少选一项并严格确认 | `POST /postprocess` 返回 running，逐帧并行编辑并以 2 秒轮询展示进度 |
 | 图片优化提示词被编辑 | `PATCH /image-optimization-prompt` 携带 `confirm/segment_index/expected_sha256/prompt`，以 SHA CAS 保存 |
@@ -27,6 +27,7 @@ links: [conversation-task, result-display]
 
 ## 边界
 
+- 视觉关键帧冻结后，后端按段在隔离工作区执行独立 `image-postprocess` Skill；Codex 只看到本段关键帧与编辑模式，输出就是页面展示的默认 Seedream 提示词，不读取或复制视频生成提示词。该提示词只为用户可能选择的非确定性图片二次编辑做准备，不代表编辑一定执行、成功或被成片采用。
 - 页面将单段/多段提示词收敛为同一个三态工作区：“展开生成提示词 / 展开段台词 / 展开图片优化”。三个按钮等宽并排且窄屏允许文字换行；工作区共用一个文本区域。短视频生成提示词与图片优化可编辑，长视频的逐段生成提示词和段台词只读。
 - 图片优化编辑必须同时满足 `postprocess_capabilities.optimize_image=true`；即使异常详情带回提示词，能力为 false 时也只读且不能发 PATCH。短视频逻辑段号为 0，长视频段号必须为正整数，长视频出现 0 或非法段号时 fail closed。
 - 图片优化提示词提供保存、恢复默认、复制；短视频逻辑段固定使用 `segment_index=0`，长视频使用各自正整数段号。存在 dirty 草稿时，切换文本、分段、会话、新建会话、开始生成、打开或提交后处理、退出应用都会先要求“保存 / 丢弃 / 取消”；保存失败留在原处。刷新或关闭页面由 `beforeunload` 拦截，2 秒轮询不得覆盖 dirty 文本。

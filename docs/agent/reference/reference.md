@@ -272,7 +272,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 短视频只能使用逻辑段 `0`；长视频使用连续正整数段 `1..N`。接口只允许 schema v2 分析已完成且 generation/postprocess 都尚未创建时调用，以 `expected_sha256` CAS 保存；未知字段、空白或超过 32 KiB 的提示词、非法段号在写入前拒绝。摘要漂移返回结构化 409 `image_optimization_prompt_changed`；输入已冻结返回 `image_optimization_prompt_frozen`。成功返回该段新的 `{text,default_text,sha256}`。恢复默认由客户端把 `default_text` 放入草稿，仍需调用本接口保存。
 
-项目在分析完成时已经冻结同一个 Seedream 模型、模式和模板，但这些内部字段不会出现在 detail。短视频在顶层返回 `image_optimization_prompt`；长视频把对应对象放入每个 `segments[]`。
+视觉关键帧冻结后，隔离 Codex 按段执行 `skills/image-postprocess`，只接收本段关键帧和后端编辑模式；其输出原样成为默认提示词，不读取或复制 H3 提示词。项目在分析完成时冻结同一个 Seedream 模型和模式，但这些内部字段不会出现在 detail。短视频在顶层返回 `image_optimization_prompt`；长视频把对应对象放入每个 `segments[]`。
 
 ### `POST /api/conversations/{cid}/postprocess`
 
@@ -291,7 +291,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 顶层 key 必须恰为 `confirm/options`，canonical options 必须恰为三个 bool；精确旧两字段请求兼容为 `optimize_image=false`，其余未知、缺失或非 bool 返回 422。至少一项为 true。已知旧页面 option `change_bg/face_hold` 返回纯文本中文刷新提示，不写状态、不调用供应商；若同时混入其他未知字段仍 fail closed。每项还必须由 detail 的 `postprocess_capabilities` 允许：文字和品牌能力取决于 MediaKit 开关，图片优化能力取决于 `ARK_API_KEY`。
 
-接受后冻结选项、每段提示词与后端模型/模式/模板，返回 `{"status":"running","frames":[]}`。短视频按段 0，长视频按 1..N 并行；段内严格执行已选的 `full_screen_text_erase → full_screen_icon_erase → Seedream` 阶段屏障，帧请求受 MediaKit/Seedream 独立并发上限控制。图片模式为 `anchor_consistency` 时先用本段全部清理帧生成第一张锚帧，再并行处理剩余帧；`independent_parallel` 则每帧独立并行。供应商返回图统一转为源图精确尺寸 PNG，整段完成后才原子发布同名 canonical 文件。
+接受后冻结选项、每段已审阅提示词与后端模型/模式，返回 `{"status":"running","frames":[]}`。短视频按段 0，长视频按 1..N 并行；段内严格执行已选的 `full_screen_text_erase → full_screen_icon_erase → Seedream` 阶段屏障，帧请求受 MediaKit/Seedream 独立并发上限控制。图片模式为 `anchor_consistency` 时先用本段全部清理帧生成第一张锚帧，再并行处理剩余帧；`independent_parallel` 则每帧独立并行。供应商返回图统一转为源图精确尺寸 PNG，整段完成后才原子发布同名 canonical 文件。
 
 detail 的 `postprocess` 为 `{status,options,frames,segments,error}`；每段只公开 `{index,status,stage,completed_frames,total_frames,revision,error}`。任一段失败不取消其他段，但整体为 failed，生成返回 409 `postprocess_not_ready`；全部完成后优化帧进入 H3 冻结输入。禁用返回 501，旧会话返回 409 `read_only`，输入未 done/正在运行返回 409；generation 已创建返回 409 `generation_already_started`；done 后改变冻结选项返回结构化 409 `postprocess_options_locked`。既有 failed 状态拒绝普通 POST 并返回 `postprocess_segment_retry_required`，避免重置 revision 或绕过分段 CAS。
 
@@ -338,7 +338,7 @@ Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。�
 | `frozen_plan_receipt` | 长链首次提交确认的 plan SHA-256 |
 | `fit_mode` | `none/crop/pad`；随冻结画幅解释 |
 | `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含冻结 boolean `fast_mode`、内部 `segments` 与 `fit_layout`，failed 时公开 `retry_paid_segment_count`，status 含 resume_required；历史缺 fast_mode 等价 false |
-| `_image_optimization` | 私有项目冻结 receipt：同一模型/模式/模板及每段 default/current/SHA；只投影用户可编辑的提示词字段 |
+| `_image_optimization` | 私有项目冻结 receipt：同一模型/模式及每段 Codex 产出的 default/current/SHA；只投影用户可编辑的提示词字段 |
 | `_postprocess_receipt` | 私有执行 receipt：冻结三选项与图片优化设置，不进入公开 detail |
 | `postprocess` | `{status,options,frames,segments,error}`；存在时生成必须等待全部段 done，并使用完整优化帧集合 |
 
@@ -480,7 +480,6 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `ARK_API_KEY` | 空 | 火山方舟 Seedream Bearer 凭据；留空关闭图片优化 capability，不进入 Settings repr、公开 API/meta/日志 |
 | `SEEDREAM_MODEL` | `doubao-seedream-5-0-260128` | 项目级图片模型；allowlist 另含 `doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828` |
 | `SEEDREAM_EDIT_MODE` | `anchor_consistency` | `anchor_consistency` 或 `independent_parallel`；按项目冻结，不暴露前端 |
-| `SEEDREAM_PROMPT_TEMPLATE` | `balanced` | `light/balanced/strong`；生成项目默认提示词时冻结 |
 | `SEEDREAM_CONCURRENCY` | `4` | Seedream 帧级进程内并发上限，必须为正整数 |
 | `SEEDREAM_TIMEOUT_S` | `180` | 单次 Seedream POST 超时秒数，必须为正有限数 |
 | `TIKTOK_PROXY` | 空 | TikTok/DoH 下载代理 |

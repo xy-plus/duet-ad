@@ -318,3 +318,30 @@ def test_unrecognized_asr_sentinels_are_not_dialogue(text):
 
 def test_normal_foreign_language_dialogue_is_not_an_asr_sentinel():
     assert voice.is_unrecognized_text("¿Tu perro tiene nudos y demasiado pelo suelto?") is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "(字幕製作:貝爾)",
+        "字幕制作：小明",
+        "【翻译：Alice】",
+        "校对: Bob",
+        "Subtitles by Example Team",
+        "Translated by Alice",
+    ],
+)
+def test_subtitle_credit_text_is_not_dialogue(text):
+    assert voice.is_subtitle_credit_text(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我们今天来学习字幕制作。",
+        "请打开字幕。",
+        "I translated this sentence yesterday.",
+    ],
+)
+def test_normal_spoken_text_is_not_a_subtitle_credit(text):
+    assert voice.is_subtitle_credit_text(text) is False

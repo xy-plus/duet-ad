@@ -50,6 +50,8 @@ def test_runbook_checks_audio_and_visual_durations_without_full_audio_claim():
     ("duration_s", "receipt_version", "plan_receipt", "segment_count", "accepted"),
     [
         (10, 1, None, None, True),
+        (15, 1, None, None, True),
+        (15, None, None, None, False),
         (10, None, None, None, False),
         (30, None, "b" * 64, 2, True),
         (30, None, "b" * 64, None, False),
@@ -94,6 +96,8 @@ else:
                 if os.environ.get("MOCK_SEGMENT_COUNT") else None
             ),
             "fit_required": False,
+            "aspect_ratio": "9:16",
+            "resolution": "480p",
         }))
     else:
         print(json.dumps({
@@ -140,6 +144,8 @@ else:
     assert payload["confirm"] is True
     assert payload["dialogue_mode"] == "auto"
     assert payload["fit_mode"] == "none"
+    assert payload["aspect_ratio"] == "9:16"
+    assert payload["resolution"] == "480p"
     if plan_receipt is None:
         assert "expected_plan_receipt" not in payload
     else:

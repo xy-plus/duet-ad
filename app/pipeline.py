@@ -516,6 +516,53 @@ def _run_visual_with_retry(
     )
 
 
+def _write_image_optimization_prompt(work: Path, prompt: str) -> None:
+    target = work / "image_optimization_prompt.txt"
+    staged = work / ".image_optimization_prompt.tmp"
+    try:
+        with staged.open("w", encoding="utf-8") as stream:
+            stream.write(prompt + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staged, target)
+        directory = os.open(work, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def _generate_image_optimization_prompt(
+    settings: Settings,
+    runner,
+    keyframes_dir: Path,
+    *,
+    session_dir: Path,
+    step: str,
+) -> str:
+    policy = _retry_policy(settings)
+
+    def attempt() -> str:
+        try:
+            return image_optimization.generate_prompt(
+                runner,
+                keyframes_dir,
+                settings.seedream_edit_mode,
+                session_dir=session_dir,
+            )
+        except image_optimization.ImageOptimizationOutputError as exc:
+            raise PipelineError(str(exc), retryable=True) from None
+
+    return run_with_retry(
+        attempt,
+        policy=policy,
+        is_retryable=_retryable_operation_error,
+        on_retry=_retry_logger(step, policy),
+    )
+
+
 def _voice_prompt(_cdir: Path, voice_mode: str, target_language: str, duration_s: float) -> str:
     """口播步 codex prompt：只使用隔离区内的音频输入，不暴露原会话路径。"""
     if voice_mode == "keep":
@@ -751,6 +798,7 @@ def _voice_step(
             voice_warnings=[],
             voice_has_retryable_vocal_evidence=False,
             voice_lines_vocal_dropped=0,
+            voice_lines_credit_dropped=0,
             voice_text_normalizations=[],
         )
         return []
@@ -793,15 +841,20 @@ def _voice_step(
             analysis,
             only_line=len(lines) == 1,
         )
-        kept = not filter_enabled or classification in ("spoken", "sung")
-        decisions.append(
-            {
-                **line,
-                "classification": classification,
-                "provenance": "asr",
-                "kept": kept,
-            }
+        subtitle_credit = voice.is_subtitle_credit_text(line["text"])
+        kept = (
+            (not filter_enabled or classification in ("spoken", "sung"))
+            and not subtitle_credit
         )
+        decision = {
+            **line,
+            "classification": classification,
+            "provenance": "asr",
+            "kept": kept,
+        }
+        if subtitle_credit:
+            decision["drop_reason"] = "subtitle_credit"
+        decisions.append(decision)
     filtered_lines, decisions, timeline_warnings = _normalize_voice_timeline(
         decisions, duration_s
     )
@@ -810,6 +863,9 @@ def _voice_step(
         decision.get("classification") not in ("spoken", "sung")
         for decision in decisions
         if filter_enabled
+    )
+    credit_dropped = sum(
+        decision.get("drop_reason") == "subtitle_credit" for decision in decisions
     )
     # 后续视觉步骤看到的 voice_lines 也只能是最终有效集，不能重新收养已过滤行。
     (work / "voice_lines.json").write_text(
@@ -825,6 +881,7 @@ def _voice_step(
         "voice_warnings": warnings,
         "voice_has_retryable_vocal_evidence": has_vocal,
         "voice_lines_vocal_dropped": vocal_dropped,
+        "voice_lines_credit_dropped": credit_dropped,
         "voice_text_normalizations": [],
     }
     storage.update_meta(settings.data_dir, cid, **changes)
@@ -1218,6 +1275,15 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             isolate_dialogue=new_input_contract,
             step=f"segment {index} visual codex",
         )
+        if new_input_contract:
+            image_prompt = _generate_image_optimization_prompt(
+                settings,
+                runner,
+                segwork / "keyframes",
+                session_dir=segdir,
+                step=f"segment {index} image postprocess codex",
+            )
+            _write_image_optimization_prompt(segwork, image_prompt)
         visual_prompt = prompt
         if new_input_contract:
             first_anchor, last_anchor = _write_segment_anchors(segwork, anchor_frames)
@@ -1492,6 +1558,15 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 isolate_dialogue=new_input_contract,
                 step="visual codex",
             )
+            if new_input_contract:
+                image_prompt = _generate_image_optimization_prompt(
+                    settings,
+                    runner,
+                    work / "keyframes",
+                    session_dir=cdir,
+                    step="image postprocess codex",
+                )
+                _write_image_optimization_prompt(work, image_prompt)
             prompt = _apply_no_bgm_prefix(prompt, work / "prompt.txt", enabled=False)
             frame_paths = [work / "keyframes" / name for name in keyframes]
             profiles, aspect_ratio, resolution, default_fit_mode = (
@@ -1527,7 +1602,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             )
             if new_input_contract:
                 completion.update(image_optimization.freeze_prompts(
-                    settings, {**meta, **completion}
+                    settings, {**meta, **completion}, {0: image_prompt}
                 ))
             storage.finish_input_claim(
                 settings.data_dir,
@@ -1629,8 +1704,15 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 )
             # 新 schema 保留 segments；短视频仍只写顶层 keyframes/prompt。
             if new_input_contract:
+                image_prompts = {
+                    seg["index"]: (
+                        work / "segments" / str(seg["index"]) / "work"
+                        / "image_optimization_prompt.txt"
+                    ).read_text(encoding="utf-8").strip()
+                    for seg in seg_metas
+                }
                 changes.update(image_optimization.freeze_prompts(
-                    settings, {**meta, **changes}
+                    settings, {**meta, **changes}, image_prompts
                 ))
             storage.finish_input_claim(
                 settings.data_dir, cid, claim_owner, **changes

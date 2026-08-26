@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import mediakit, postprocess, storage
+from app import image_optimization, mediakit, postprocess, storage
 from app.main import create_app
 
 PNG = base64.b64decode(
@@ -56,6 +56,11 @@ def _make_conv(settings, status="done", segments=False):
         meta["keyframes"] = ["01.png", "02.png"]
         meta["prompt"] = "单段提示词"
     meta["status"] = status
+    prompts = (
+        {seg["index"]: f"第 {seg['index']} 段 Codex 图片优化提示词" for seg in meta["segments"]}
+        if segments else {0: "当前视频 Codex 图片优化提示词"}
+    )
+    meta.update(image_optimization.freeze_prompts(settings, meta, prompts))
     (cdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return cid
 

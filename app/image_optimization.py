@@ -3,30 +3,24 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import shutil
+import stat
+import tempfile
 from copy import deepcopy
+from pathlib import Path
 
+from app.codex_runner import CodexError
 from app.config import (
     SEEDREAM_EDIT_MODES,
     SEEDREAM_MODELS,
-    SEEDREAM_PROMPT_TEMPLATES,
     Settings,
 )
 
 MAX_PROMPT_BYTES = 32 * 1024
-
-_INTENSITY = {
-    "light": "轻度优化：尽量少改，只做满足下列约束所需的最小替换。",
-    "balanced": "均衡优化：在保持镜头叙事不变的前提下，清晰完成主体、服装和环境替换。",
-    "strong": "强力优化：明显重设计人物、服装、场景和道具，但严格保持镜头与动作语义。",
-}
-
-_RULES = (
-    "人物替换为同性别、同族裔、同风格、同年龄段、相近体型但完全不同的新面孔；"
-    "服装保持同色同风格但换成不同款式；场景和道具保持同类但换成不同具体设计。"
-    "锁定原画幅、构图、人物动作、机位、镜头语言和光线。"
-    "跨帧重复出现的同一元素必须保持同一套新设计。"
-    "画面中禁止出现任何文字、字幕、logo、watermark 或 icon。"
-)
+_ROOT = Path(__file__).resolve().parents[1]
+_SKILL = _ROOT / "skills" / "image-postprocess" / "SKILL.md"
 
 
 class ImageOptimizationError(ValueError):
@@ -36,16 +30,105 @@ class ImageOptimizationError(ValueError):
         self.detail = detail
 
 
+class ImageOptimizationOutputError(ValueError):
+    pass
+
+
 def sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def default_prompt(source_prompt: object, template: str) -> str:
-    if template not in _INTENSITY:
-        raise ValueError("unsupported prompt template")
-    context = source_prompt.strip() if isinstance(source_prompt, str) else ""
-    prefix = f"原镜头语义参考：{context}\n" if context else ""
-    return prefix + _INTENSITY[template] + _RULES + "只输出编辑后的图1。"
+def _copy_regular(source: Path, destination: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(source, flags)
+    except OSError:
+        raise ValueError("invalid image optimization keyframe") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("invalid image optimization keyframe")
+        with os.fdopen(fd, "rb", closefd=False) as src, destination.open("xb") as dst:
+            shutil.copyfileobj(src, dst)
+    finally:
+        os.close(fd)
+
+
+def _read_output(path: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        raise ImageOptimizationOutputError("image optimization output is missing or invalid") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PROMPT_BYTES:
+            raise ImageOptimizationOutputError("image optimization output is missing or invalid")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(MAX_PROMPT_BYTES + 1)
+    finally:
+        os.close(fd)
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise ImageOptimizationOutputError("image optimization output is missing or invalid") from None
+    if not text or len(text.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise ImageOptimizationOutputError("image optimization output is missing or invalid")
+    return text
+
+
+def generate_prompt(
+    runner,
+    keyframes_dir: Path,
+    edit_mode: str,
+    *,
+    session_dir: Path,
+) -> str:
+    """Run the independent Skill with only this segment's frames and edit mode."""
+    if edit_mode not in SEEDREAM_EDIT_MODES:
+        raise ValueError("unsupported image optimization edit mode")
+    try:
+        source = Path(keyframes_dir).resolve(strict=True)
+        session = Path(session_dir).resolve(strict=True)
+        skill = _SKILL.resolve(strict=True)
+        source.relative_to(session)
+    except (OSError, ValueError):
+        raise ValueError("invalid image optimization keyframes directory") from None
+    if not source.is_dir() or not skill.is_file():
+        raise ValueError("invalid image optimization keyframes directory")
+    frames = sorted(source.glob("[0-9][0-9].png"))
+    expected = [f"{index:02d}.png" for index in range(1, len(frames) + 1)]
+    if not frames or len(frames) > 9 or [frame.name for frame in frames] != expected:
+        raise ValueError("invalid image optimization keyframes")
+
+    with tempfile.TemporaryDirectory(prefix="duet-image-postprocess-", dir="/tmp") as raw:
+        stage = Path(raw).resolve(strict=True)
+        work = stage / "work"
+        staged_frames = work / "keyframes"
+        staged_frames.mkdir(parents=True, mode=0o700)
+        _copy_regular(skill, stage / "SKILL.md")
+        for frame in frames:
+            _copy_regular(frame, staged_frames / frame.name)
+        (work / "request.json").write_text(
+            json.dumps({"edit_mode": edit_mode}, ensure_ascii=False, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+        run_error: CodexError | None = None
+        try:
+            runner.run_isolated(
+                stage,
+                "严格执行当前目录 SKILL.md；只读取其中允许的输入，并写入规定的唯一输出文件。",
+                session_dir=session,
+            )
+        except CodexError as error:
+            run_error = error
+        try:
+            return _read_output(work / "image_optimization_prompt.txt")
+        except ImageOptimizationOutputError:
+            if run_error is not None:
+                raise run_error from None
+            raise
 
 
 def _segment_indices(meta: dict) -> list[int]:
@@ -65,20 +148,21 @@ def _segment_indices(meta: dict) -> list[int]:
     return indices
 
 
-def freeze_prompts(settings: Settings, meta: dict) -> dict:
+def freeze_prompts(settings: Settings, meta: dict, prompts: dict[int, str]) -> dict:
     """Build the private receipt to commit in the caller's existing atomic meta write."""
-    segments = meta.get("segments")
     indices = _segment_indices(meta)
-    sources = (
-        [(item.get("index"), item.get("prompt")) for item in segments]
-        if indices != [0]
-        else [(0, meta.get("prompt"))]
-    )
-    if [item[0] for item in sources] != indices:
-        raise ValueError("invalid image optimization segment indices")
+    if (
+        not isinstance(prompts, dict)
+        or any(isinstance(index, bool) or not isinstance(index, int) for index in prompts)
+        or set(prompts) != set(indices)
+    ):
+        raise ValueError("invalid image optimization prompt segments")
     frozen = []
-    for index, source in sources:
-        text = default_prompt(source, settings.seedream_prompt_template)
+    for index in indices:
+        source = prompts[index]
+        text = source.strip() if isinstance(source, str) else ""
+        if not text or len(text.encode("utf-8")) > MAX_PROMPT_BYTES:
+            raise ValueError("invalid image optimization prompt output")
         frozen.append({
             "segment_index": index,
             "default": text,
@@ -86,10 +170,9 @@ def freeze_prompts(settings: Settings, meta: dict) -> dict:
             "sha256": sha256(text),
         })
     return {"_image_optimization": {
-        "version": 1,
+        "version": 2,
         "model": settings.seedream_model,
         "edit_mode": settings.seedream_edit_mode,
-        "prompt_template": settings.seedream_prompt_template,
         "segments": frozen,
     }}
 
@@ -99,10 +182,10 @@ def receipt(meta: dict, settings: Settings | None = None) -> dict | None:
     if isinstance(raw, dict):
         segments = raw.get("segments")
         if (
-            raw.get("version") != 1
+            set(raw) != {"version", "model", "edit_mode", "segments"}
+            or raw.get("version") != 2
             or raw.get("model") not in SEEDREAM_MODELS
             or raw.get("edit_mode") not in SEEDREAM_EDIT_MODES
-            or raw.get("prompt_template") not in SEEDREAM_PROMPT_TEMPLATES
             or not isinstance(segments, list) or not segments
         ):
             return None
@@ -119,6 +202,8 @@ def receipt(meta: dict, settings: Settings | None = None) -> dict | None:
                 or index in seen
                 or not isinstance(item.get("default"), str) or not item["default"].strip()
                 or not isinstance(current, str) or not current.strip()
+                or len(item["default"].encode("utf-8")) > MAX_PROMPT_BYTES
+                or len(current.encode("utf-8")) > MAX_PROMPT_BYTES
                 or item.get("sha256") != sha256(current)
             ):
                 return None
@@ -130,11 +215,6 @@ def receipt(meta: dict, settings: Settings | None = None) -> dict | None:
         if seen != set(expected):
             return None
         return deepcopy(raw)
-    if meta.get("schema_version") == 2 and meta.get("status") == "done" and settings:
-        try:
-            return freeze_prompts(settings, meta)["_image_optimization"]
-        except ValueError:
-            return None
     return None
 
 

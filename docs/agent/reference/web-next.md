@@ -67,7 +67,7 @@ generation payload 固定包含：
 
 完整 response schema、HTTP 错误和 provider 状态机见 [后端 reference](reference.md)，这里不复制。
 
-详情的 `postprocess_capabilities` 是三个入口的唯一能力真源，`postprocess_enabled` 只是 `any(capabilities)` 兼容投影。短视频从顶层读取 `image_optimization_prompt`，长视频从每个 `segments[]` 读取；前端不得显示或提交 Seedream 模型、模板与执行模式。后处理 status 的 `segments[]` 用服务端 `revision` 驱动定向重试，不能由 frame 列表反推。
+详情的 `postprocess_capabilities` 是三个入口的唯一能力真源，`postprocess_enabled` 只是 `any(capabilities)` 兼容投影。短视频从顶层读取 `image_optimization_prompt`，长视频从每个 `segments[]` 读取；前端不得显示或提交 Seedream 模型与执行模式。后处理 status 的 `segments[]` 用服务端 `revision` 驱动定向重试，不能由 frame 列表反推。
 
 生成提示词、段台词、图片优化三个并排按钮绑定一个工作区。短视频生成提示词与图片优化可编辑，长视频生成提示词和台词只读；图片优化保存走 SHA CAS，“恢复默认”只替换本地草稿。所有应用内离开动作先完成保存/丢弃/取消，保存失败不离开；刷新/关闭由 `beforeunload` 保护，轮询不得覆盖 dirty 草稿。“是否优化素材？”默认高亮“否”且不持久化，选择“是”才打开三选项弹窗，其中文字/品牌默认开、图片优化默认关。
 

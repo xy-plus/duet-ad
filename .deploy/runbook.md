@@ -148,7 +148,6 @@ MEDIAKIT_TIMEOUT_S=180
 ARK_API_KEY=
 SEEDREAM_MODEL=doubao-seedream-5-0-260128
 SEEDREAM_EDIT_MODE=anchor_consistency
-SEEDREAM_PROMPT_TEMPLATE=balanced
 SEEDREAM_CONCURRENCY=4
 SEEDREAM_TIMEOUT_S=180
 
@@ -191,7 +190,7 @@ systemctl --user is-active duet-ad1.service
 journalctl --user -u duet-ad1.service --since '-2 minutes' --no-pager
 ```
 
-服务必须是单进程；不要给 uvicorn 增加 `--workers`。Seedream 的模型仅允许 `doubao-seedream-5-0-260128`（默认 5.0 Lite）、`doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828`；模式仅允许 `anchor_consistency|independent_parallel`，模板仅允许 `light|balanced|strong`，非法值会阻止服务启动。重启时 schema v2 generation 默认只执行 GET-only resume；唯一补发 H3 POST 的例外是完整确认的 `h3_provider_failed` 仍有自动额度，或该失败后已落盘的 ready 自动 attempt。后处理只恢复本地可证明安全的工作；Seedream `submitting/submission_unknown` 会标记失败并等待人工分段确认，绝不自动 POST。
+服务必须是单进程；不要给 uvicorn 增加 `--workers`。Seedream 的模型仅允许 `doubao-seedream-5-0-260128`（默认 5.0 Lite）、`doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828`；模式仅允许 `anchor_consistency|independent_parallel`，非法值会阻止服务启动。分析时隔离 Codex 按段执行 `skills/image-postprocess`，其输出经用户审阅后冻结为该段真实 Seedream 提示词。重启时 schema v2 generation 默认只执行 GET-only resume；唯一补发 H3 POST 的例外是完整确认的 `h3_provider_failed` 仍有自动额度，或该失败后已落盘的 ready 自动 attempt。后处理只恢复本地可证明安全的工作；Seedream `submitting/submission_unknown` 会标记失败并等待人工分段确认，绝不自动 POST。
 
 ## 5. 3213 静态前端与同一 Caddy unit 发布
 
@@ -326,7 +325,7 @@ export ACCESS_TOKEN
 # 第 1 次新建/付费：10s，原 Ref2VA 单任务
 RUN_PAID_SMOKE=1 .deploy/smoke-h3.sh "$SAMPLE_10"
 
-# 第 2 次新建/付费：15s，FL2VA 长链；冻结计划通常为 1 个子任务
+# 第 2 次新建/付费：15s，单次生成；必须使用 prepared receipt v1
 RUN_PAID_SMOKE=1 .deploy/smoke-h3.sh "$SAMPLE_15"
 
 # 第 3 次新建/付费：30s，FL2VA 长链；以脚本打印的 segment_count 为准
@@ -337,7 +336,7 @@ unset ACCESS_TOKEN
 
 非 9:16 样本默认使用 `pad`，可在人工确认内容可裁时加 `FIT_MODE=crop`。脚本默认台词模式为 `auto`；无音轨同样合法。长视频只允许 `DIALOGUE_MODE=auto|none`，其中 auto 复用源音轨：长于画面时裁剪、短于画面时补静音，画面时长不变；none 输出静音。
 
-成功标准：创建阶段到 `done`；10 秒输入通过 prepared receipt v1，15/30 秒输入通过 64 位 plan receipt 和正整数 `segment_count`；submit 返回 202；generation 到 `succeeded` 且 `has_video=true`。记录每次输出的 cid 和 `client_request_id`，不要复制 token、EnvironmentFile 或供应商响应。
+成功标准：创建阶段到 `done`；10/15 秒输入通过 prepared receipt v1，只有大于 15 秒的输入（本例 30 秒）才通过 64 位 plan receipt 和正整数 `segment_count`；submit 返回 202；generation 到 `succeeded` 且 `has_video=true`。记录每次输出的 cid 和 `client_request_id`，不要复制 token、EnvironmentFile 或供应商响应。
 
 把三次输出的 cid 人工填入以下变量，逐个验证最终文件。长链拼接目标是与源时长误差不超过 1/24 秒；同时确认视频编码/像素格式和音轨。若 `DIALOGUE_MODE=none`，音频 stream 查询应为空。
 
