@@ -271,8 +271,8 @@ def test_closed_environment_background_domain_is_a_safe_background_candidate():
     assert "不得承载动作轨迹、流体或颗粒的接触、经过或扩散以及功能过程" in skill
     assert "任一部分属于交互支持区域，整个环境背景域即不合格" in skill
 
-    assert "环境背景域只允许改变色相这一种低频属性" in skill
-    assert "保留域内原亮度、渐变、原有低频结构、阴影和反射" in skill
+    assert "环境背景域只允许上述 hue-only 映射" in skill
+    assert "逐帧继承原图的局部对比、亮度分布、渐变方向、渐变幅度和原有低频结构" in skill
     assert "禁止补全、拉直、平滑、扩张、收缩、改形或产生边缘光晕" in skill
 
 
@@ -410,17 +410,17 @@ def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
         "### 人物路线", maxsplit=1
     )[0]
 
-    assert "默认只改变一种低频外观属性，优先色相" in background_rules
-    assert "只有色相不能安全获得明显差异时，才单独选择明暗、光泽或粗糙度之一" in background_rules
-    assert "只改色相时，保持原亮度、光照、阴影、反射、纹理图案、纹理相位、缺陷、光泽和粗糙度" in background_rules
-    assert "不得附加均匀、哑光或任何新表面处理" in background_rules
-    assert "完整保留原纹理图案、纹理相位、缺陷、边界与几何" in background_rules
+    assert "默认只改变一种低频外观属性，优先色相" in skill
+    assert "只有色相不适合作为安全差异时，才单独选择明暗、光泽或粗糙度之一" in skill
+    assert "选择色相时遵守下述 hue-only 契约" in skill
+    assert "不得使用明亮、浅、深、鲜艳、柔和、均匀或哑光修饰目标色相" in background_rules
+    assert "原光照、阴影、反射、纹理图案、纹理相位、缺陷、光泽和粗糙度" in background_rules
+    assert "完整保留原边界与几何" in background_rules
     assert "不得新增、删除或移动纹理图案、接缝、重复单元或高频细节" in background_rules
     assert "表面翻新" not in background_rules
     assert "生成新材质" not in background_rules
 
-    assert "差异必须明显可见" in background_rules
-    assert "无法安全获得明显差异时允许不改动" in background_rules
+    assert "无法安全取得合规差异时允许不改动" in background_rules
 
     assert "只编辑本图可见的冻结编辑域" in background_rules
     assert "成员关系或成员边界不确定时必须在规划阶段不建立该域" in background_rules
@@ -430,10 +430,10 @@ def test_background_surface_edit_is_temporally_stable_and_mask_bounded():
     assert "禁止编辑外溢到目标编辑域之外" in background_rules
 
     assert "`SCENE replacement` 不直接提交给 Seedream" in skill
-    assert "目标背景描述 + 实际改变的一种低频属性" in background_rules
+    assert "目标背景描述 + 实际改变的一种低频属性" in skill
     assert "`SCENE replacement` 和项目级替换短语只写实际改变的一个属性" in skill
     assert "不得列出未改变属性或多个候选" in skill
-    assert "每个相关段实际 `prompt` 的第一句必须逐字包含同一短语" in background_rules
+    assert "每个相关段逐字复用，不得缩写、改写或使用同义词" in background_rules
     assert "其余关系保护可按本段可见关系写" in background_rules
     assert "不得改动项目级替换短语" in background_rules
 
@@ -447,6 +447,28 @@ def test_background_prompt_prevents_global_color_and_lighting_drift():
     assert "第二句要求仅目标域发生所选属性变化" in background_rules
     assert "禁止全局调色、白平衡、曝光、对比度或重新布光" in background_rules
     assert "目标域外保持原颜色与明暗" in background_rules
+
+
+def test_hue_mapping_is_channel_only_and_leads_each_real_prompt():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    background_rules = skill.split("### 背景路线", maxsplit=1)[1].split(
+        "### 人物路线", maxsplit=1
+    )[0]
+
+    assert "选择色相时，项目级替换短语和每段第一句必须明确写“只旋转色相”" in skill
+    assert "第一句最前面先写 hue-only 及其通道不变量，再写编辑域边界" in background_rules
+    assert "同一输入像素或同一物理区域的原明度或感知亮度与原饱和度保持不变" in background_rules
+    assert "不得抬亮暗部或压暗高光" in background_rules
+
+    assert "逐帧继承原图的局部对比、亮度分布、渐变方向、渐变幅度和原有低频结构" in background_rules
+    assert "跨帧同一原始明度必须映射为同一输出明度" in background_rules
+    assert "不得把目标域统一填充成固定亮度" in background_rules
+
+    assert "目标色只使用不携带明度、感知亮度、饱和度或表面处理含义的色相类别" in background_rules
+    assert "不得使用明亮、浅、深、鲜艳、柔和、均匀或哑光修饰目标色相" in background_rules
+    assert "不得使用“明显”等程度修饰" in background_rules
+    assert "环境背景域只允许上述 hue-only 映射" in background_rules
+    assert "差异必须明显可见" not in background_rules
 
 
 def test_one_project_call_returns_global_map_and_all_real_prompts(tmp_path):
