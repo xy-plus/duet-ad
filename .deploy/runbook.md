@@ -144,6 +144,13 @@ VOLC_MEDIAKIT_API_KEY=
 MEDIAKIT_CONCURRENCY=4
 MEDIAKIT_TIMEOUT_S=180
 
+ARK_API_KEY=
+SEEDREAM_MODEL=doubao-seedream-5-0-pro-260628
+SEEDREAM_EDIT_MODE=anchor_consistency
+SEEDREAM_PROMPT_TEMPLATE=balanced
+SEEDREAM_CONCURRENCY=4
+SEEDREAM_TIMEOUT_S=180
+
 TIKTOK_PROXY=
 DOWNLOAD_TIMEOUT_S=120
 ```
@@ -161,6 +168,11 @@ systemd-analyze --user verify ~/.config/systemd/user/duet-ad1.service
 
 不要将上述 namespace 限制作为 drop-in 加回去；如果需要改变 unit 硬化策略，
 必须先在同样的 user-service 属性下完成一次 bwrap 与 Codex 断网写入测试。
+
+Seedream 模型参数按能力生成：默认 Pro `doubao-seedream-5-0-pro-260628`
+不得发送 `sequential_image_generation`；Lite、4.5、4.0 必须发送
+`sequential_image_generation=disabled`。失败段不迁移模型或改旧回执，只能由用户按当前
+`expected_revision` 调用分段 retry；该确认会递增 revision 并使用新的 attempt 路径。
 
 新 unit 只有一个 `EnvironmentFile=`，没有任何 inline `Environment=`。在 `daemon-reload` 前删除仅指向旧 `h3.env` 的 drop-in 和旧环境文件，确保本次重启已经只有一个环境源：
 

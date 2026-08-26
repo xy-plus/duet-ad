@@ -9,7 +9,7 @@
 ## 🚧 进行中
 
 - [image-opt-contract] 为单段/多段会话增加每段独立、CAS 保存且可恢复默认的图片优化提示词；冻结模板、模型与执行模式。
-- [seedream-provider] 恢复 Seedream 单图输出适配器，支持锚帧/独立两模式、尺寸校验、持久 attempt 与最多 3 次安全重试。
+- [seedream-provider] 完成 Seedream Pro/Lite/4.5/4.0 能力分流：Pro 省略 `sequential_image_generation`，其余固定 `disabled`；保留冻结模型、持久 attempt 与人工分段重试。
 - [postprocess-orchestration] 实现文字 → Logo → 图片优化的分段屏障、双层有界并行、分段失败/定向重试、启动恢复与 H3 fail-closed。
 - [image-opt-frontends] 旧前端和 React 前端统一三按钮共享编辑器，默认高亮“否”，新增图片优化选项、未保存离开保护和分段重试。
 - [image-opt-docs-verification] 同步 human/agent/README/runbook，完成后端、双前端、E2E、简化与对抗审查。

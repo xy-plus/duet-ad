@@ -14,7 +14,7 @@ import cv2
 import httpx
 import numpy as np
 
-from app.config import Settings
+from app.config import SEEDREAM_PRO_MODEL, Settings
 
 ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
 MAX_POST_ATTEMPTS = 3
@@ -183,10 +183,11 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
         "model": settings.seedream_model,
         "prompt": prompt,
         "image": [_data_url(item) for item in images],
-        "sequential_image_generation": "disabled",
         "response_format": "b64_json",
         "watermark": False,
     }
+    if settings.seedream_model != SEEDREAM_PRO_MODEL:
+        payload["sequential_image_generation"] = "disabled"
     timeout = httpx.Timeout(settings.seedream_timeout_s)
     async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
         for attempt in range(start_attempt, MAX_POST_ATTEMPTS + 1):

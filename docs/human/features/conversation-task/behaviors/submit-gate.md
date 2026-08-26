@@ -82,3 +82,4 @@ links: [conversation-task, processing-state]
 - 后处理选项 canonical 为 `remove_subtitle/remove_brand/optimize_image` 三个布尔值；精确旧两字段请求兼容为 `optimize_image:false`，其余缺字段、未知字段或非布尔值拒绝。实际执行对每段保持 `文字擦除 -> 品牌擦除 -> 图片优化` 阶段屏障，段之间并行；任一失败段不会阻止其他段完成，整体保持 failed，H3 不得静默回退原图。
 - `postprocess.segments[]` 仅公开 `index/status/stage/completed_frames/total_frames/revision/error`。失败段通过 `POST /api/conversations/{id}/postprocess/segments/{index}/retry` 重试，请求严格为 `{"confirm":true,"expected_revision":N}`；只复用该段已成功的阶段/帧与服务端冻结选项、模型、模式、提示词，不接受页面重新指定。
 - Seedream 付费 POST 前先持久化 attempt 输入摘要；只有明确的 HTTP 429 `QuotaExceeded` 且响应无 `data` 才按统一预算重试。网络或读写超时记为 `submission_unknown`，自动恢复不得再次 POST；人工分段重试也必须保留旧 attempt 记录。
+- Seedream 默认模型为 `doubao-seedream-5-0-pro-260628`。Pro 请求不发送 `sequential_image_generation`；Lite、4.5、4.0 请求固定发送 `sequential_image_generation:"disabled"`。失败项目不改冻结模型，仍通过上述分段重试产生新 revision，旧 attempt 回执保留。

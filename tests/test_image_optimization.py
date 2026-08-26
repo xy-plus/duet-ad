@@ -52,7 +52,7 @@ def _done(settings, *, segments=False):
 def test_seedream_settings_are_closed_and_secret_is_not_a_setting(monkeypatch):
     monkeypatch.setenv("ARK_API_KEY", "super-secret")
     settings = Settings(access_token="x")
-    assert settings.seedream_model == "doubao-seedream-5-0-260128"
+    assert settings.seedream_model == "doubao-seedream-5-0-pro-260628"
     assert settings.seedream_edit_mode == "anchor_consistency"
     assert settings.seedream_prompt_template == "balanced"
     assert "super-secret" not in repr(settings)
@@ -66,6 +66,41 @@ def test_seedream_settings_are_closed_and_secret_is_not_a_setting(monkeypatch):
     ):
         with pytest.raises(ValueError):
             Settings(access_token="x", **{field: value})
+
+
+@pytest.mark.parametrize(("model", "has_sequential"), [
+    ("doubao-seedream-5-0-pro-260628", False),
+    ("doubao-seedream-5-0-260128", True),
+    ("doubao-seedream-4-5-251128", True),
+    ("doubao-seedream-4-0-250828", True),
+])
+def test_seedream_payload_is_model_capability_driven(
+    tmp_path, monkeypatch, model, has_sequential,
+):
+    monkeypatch.setenv("ARK_API_KEY", "secret")
+    settings = Settings(access_token="x", data_dir=tmp_path, seedream_model=model)
+    requests = []
+    output = base64.b64encode(_png()).decode()
+
+    async def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"data": [{"b64_json": output}]})
+
+    asyncio.run(seedream.edit(
+        settings, [_png()], "prompt", tmp_path / f"{model}.png",
+        receipt_path=tmp_path / f"{model}.json", transport=httpx.MockTransport(handler),
+    ))
+
+    assert len(requests) == 1
+    payload = requests[0]
+    assert payload["model"] == model
+    assert payload["prompt"] == "prompt"
+    assert len(payload["image"]) == 1 and payload["image"][0].startswith("data:image/png;base64,")
+    assert payload["response_format"] == "b64_json"
+    assert payload["watermark"] is False
+    assert ("sequential_image_generation" in payload) is has_sequential
+    if has_sequential:
+        assert payload["sequential_image_generation"] == "disabled"
 
 
 def test_prompt_freeze_and_projection_are_segment_scoped(tmp_path):

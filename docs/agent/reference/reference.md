@@ -435,6 +435,10 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `VOLC_MEDIAKIT_API_KEY` | 空 | AI MediaKit Bearer 凭据，不进入公开 API/meta/日志 |
 | `MEDIAKIT_CONCURRENCY` | `4` | 帧级并发，最小钳制为 1 |
 | `MEDIAKIT_TIMEOUT_S` | `180` | 上传、擦除和结果下载请求超时 |
+| `ARK_API_KEY` | 空 | Seedream 凭据，只从环境读取，不进入 Settings repr、公开 API/meta 或日志 |
+| `SEEDREAM_MODEL` | `doubao-seedream-5-0-pro-260628` | 闭集为 Pro、Lite、4.5、4.0；Pro payload 省略 `sequential_image_generation`，其余固定为 `disabled` |
+| `SEEDREAM_EDIT_MODE` | `anchor_consistency` | `anchor_consistency` 或 `independent_parallel`；项目开始时私有冻结 |
+| `SEEDREAM_PROMPT_TEMPLATE` | `balanced` | `light`、`balanced` 或 `strong`；只影响新项目 |
 | `TIKTOK_PROXY` | 空 | TikTok/DoH 下载代理 |
 | `DOWNLOAD_TIMEOUT_S` | `120` | URL 下载整体时限 |
 | `HOST` / `PORT` | `0.0.0.0` / `3211` | `run.sh` 默认；生产 unit 必须覆盖为 `127.0.0.1/3212` |
