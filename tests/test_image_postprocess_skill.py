@@ -130,8 +130,12 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "选择背景时不得修改人物或服装" in skill
 
     assert "玩具、商品、道具、宠物永不作为替换目标" in skill
-    assert "只写本段最危险的核心物体及其接触、插入或对齐关系" in skill
     assert "构图、机位、光线、人物动作" in skill
+    assert "目标人物的头部位置、大小、朝向和画面裁切" in skill
+    assert "最危险的手与功能道具" in skill
+    assert "接触、插入或对齐关系" in skill
+    assert "先删冗余词" in skill
+    assert "不得省略上述锁定项" in skill
     assert "其余一切不变、真实摄影、无文字或 Logo" in skill
 
     assert "第一句只写唯一替换目标和足够具体的新设计" in skill
@@ -148,6 +152,7 @@ def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     assert "否则相关段一致选择背景" in skill
     assert "PERSON、OUTFIT 的 replacement 逐字复用" in skill
     assert "相同替换描述必须跨段逐字复用" in skill
+    assert "所有 ID 按完整字符串字典序输出" in skill
     assert "三部分语义" not in skill
     assert "四大段" not in skill
     assert "画质优化" not in skill
