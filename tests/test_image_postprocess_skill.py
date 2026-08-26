@@ -113,6 +113,44 @@ def test_skill_is_single_project_level_prompt_compiler():
     assert not Path("skills/image-continuity/SKILL.md").exists()
 
 
+def test_compact_skill_retains_closed_world_and_fail_closed_contract():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    byte_count = len(skill.encode("utf-8"))
+
+    # Relative to the 9,202-byte balanced-safe baseline: compact, not gutted.
+    assert 7_362 <= byte_count <= 8_281
+
+    headings = [
+        "## 目标",
+        "## 输入",
+        "## 唯一输出",
+        "## 项目级安全决策",
+        "## 不可编辑内容",
+        "## 跨段一致性",
+        "## 每段 Seedream 提示词",
+        "### 背景路线",
+        "### 人物路线",
+    ]
+    offsets = [skill.index(heading) for heading in headings]
+    assert offsets == sorted(offsets)
+
+    required_contracts = {
+        "provider boundary": ("只生成提示词", "不调用 Seedream"),
+        "input closed set": ("只允许读取", "不得读取"),
+        "output closed set": ("只写 `work/image_optimization.json`", "不得写其他文件"),
+        "project routing": ("全项目构建跨段相关组件", "每个组件只做一次策略选择并冻结"),
+        "single surface": ("只选一个在全部相关段稳定可见", "原位材质映射"),
+        "face-only fallback": ("只替换同一人物的新脸", "只换脸，不换服装"),
+        "fail closed": ("放弃去重", "两句不改动提示词"),
+        "geometry and contact": ("保持目标帧自身的画幅", "握持、插接、对齐、遮挡关系全不变"),
+        "cross-segment map": ("global_elements", "所有相关段逐字复用"),
+        "prompt envelope": ("恰好两句", "不超过 140 个 Unicode 字符"),
+        "mode split": ("independent_parallel", "anchor_consistency"),
+    }
+    for label, clauses in required_contracts.items():
+        assert all(clause in skill for clause in clauses), label
+
+
 def test_skill_prompts_are_short_single_target_edits_with_locked_relations():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
