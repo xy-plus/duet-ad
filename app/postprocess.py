@@ -628,16 +628,17 @@ def _mark_plan_audit_failed(
 
 
 def _mark_image_verification_failed(
-    settings: Settings, cid: str, indices: set[int],
+    settings: Settings, cid: str, indices: set[int], *, error: str = "image_verification_failed",
 ) -> None:
+    public_error = error if error in _PUBLIC_ERROR_CODES else "image_verification_failed"
     def mutate(_meta: dict, post: dict) -> None:
         segments = [dict(item) for item in post.get("segments", [])]
         for item in segments:
             if item.get("index") in indices and item.get("status") != "done":
-                item.update(status="failed", error="image_verification_failed")
+                item.update(status="failed", error=public_error)
         post["segments"] = segments
         post["status"] = "failed"
-        post["error"] = "image_verification_failed"
+        post["error"] = public_error
         post["frames"] = sorted(
             _frame_ref(item["index"], path.name)
             for item in segments if item.get("status") == "done"
@@ -744,6 +745,20 @@ async def start(settings: Settings, cid: str, payload: dict,
                 and _options_match(previous.get("options"), options)
                 and all(_canonical_complete(frames) for frames in grouped.values())
             )
+            if reuse_done and private["version"] == 4 and options["optimize_image"]:
+                # Canonical PNGs are not a paid-output receipt.  A v4 same-
+                # options request can be a pure reuse only if the immutable
+                # project verification, semantic packs, typed anchors and
+                # H3 source gate remain completely replayable.
+                try:
+                    if _private_receipt(meta) != private:
+                        raise ValueError
+                    generation_keyframes(
+                        cdir, meta,
+                        [source for index in sorted(grouped) for source, _ in grouped[index]],
+                    )
+                except (PostprocessError, ValueError):
+                    raise PostprocessError(409, "postprocess_artifacts_invalid") from None
             if reuse_done:
                 for item in states:
                     item.update(
@@ -835,6 +850,10 @@ async def _mediakit_stage(settings: Settings, cdir: Path, index: int,
 
     async def one(source: Path, output: Path) -> None:
         if output.is_file():
+            # A PNG alone is never evidence that MediaKit did not reach an
+            # ambiguous paid state.  Reuse requires the provider's terminal
+            # receipt to bind this exact source and scene.
+            _v4_mediakit_success(source, output, scene)
             return
         async with sem:
             await mediakit.erase_image(settings, cdir, source, output, True, (scene,))
@@ -850,6 +869,247 @@ async def _mediakit_stage(settings: Settings, cdir: Path, index: int,
     if errors:
         raise PostprocessError(502, errors[0])
     return outputs
+
+
+def _sha256_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _v4_canvas_stage_path(cdir: Path, index: int, stage: str, name: str) -> Path:
+    """Keep v4 derived canvases out of legacy per-segment postprocess paths."""
+    return (
+        cdir / "work" / ".postprocess-private" / "v4-canvases"
+        / f"{index:04d}" / stage / name
+    )
+
+
+def _v4_mediakit_success(source: Path, output: Path, scene: str) -> dict | None:
+    """Return one replay-safe MediaKit stage receipt, never infer success from bytes."""
+    receipt_path = output.parent / ".mediakit" / f"{output.name}.json"
+    if not output.exists() and not receipt_path.exists():
+        return None
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        source_sha256 = _sha256_path(source)
+        output_sha256 = _sha256_path(output)
+        stages = receipt["stages"]
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("version") != mediakit.RECEIPT_VERSION
+            or receipt.get("state") != "succeeded"
+            or receipt.get("output") != output.name
+            or receipt.get("scenes") != [scene]
+            or not isinstance(receipt.get("source"), dict)
+            or receipt["source"].get("sha256") != source_sha256
+            or not isinstance(stages, list)
+            or len(stages) != 1
+            or stages[0].get("scene") != scene
+            or stages[0].get("state") != "succeeded"
+            or not _valid_png(output, source)
+        ):
+            raise ValueError
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        # A preexisting artifact without an exact terminal receipt may be a
+        # paid request in its crash window.  It is strictly GET-only.
+        raise PostprocessError(409, "submission_unknown") from None
+    return {
+        "scene": scene,
+        "input_sha256": source_sha256,
+        "output_sha256": output_sha256,
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": _sha256_path(receipt_path),
+    }
+
+
+def _v4_canvas_record(
+    cdir: Path, index: int, frame_index: int, source: Path, canvas: Path,
+    stages: list[dict],
+) -> dict:
+    try:
+        canvas_path = str(canvas.resolve().relative_to(cdir.resolve()))
+    except ValueError:
+        raise PostprocessError(409, "postprocess_receipt_invalid") from None
+    return {
+        "segment_index": index,
+        "frame_index": frame_index,
+        "frame_name": source.name,
+        "source_sha256": _sha256_path(source),
+        "canvas_path": canvas_path,
+        "canvas_sha256": _sha256_path(canvas),
+        "stages": stages,
+    }
+
+
+def _v4_derive_canvas_optimization(
+    settings: Settings, meta: dict, private: dict, records: list[dict],
+) -> dict:
+    """Re-freeze the same v4 plan against the deterministic derived canvases."""
+    plan = _v4_frozen_plan(meta, private)
+    record_by_key = {
+        (item["segment_index"], item["frame_index"]): item for item in records
+    }
+    inventory = []
+    for frame in private["execution_inputs"]["frames"]:
+        key = (frame["segment_index"], frame["frame_index"])
+        record = record_by_key.get(key)
+        if record is None or record["frame_name"] != frame["frame_name"]:
+            raise PostprocessError(409, "postprocess_receipt_invalid")
+        inventory.append({
+            "segment_index": frame["segment_index"],
+            "frame_index": frame["frame_index"],
+            "frame_name": frame["frame_name"],
+            "source_sha256": record["canvas_sha256"],
+            "source_transition_from_previous": frame["source_transition_from_previous"],
+            "source_transition_evidence_sha256": frame[
+                "source_transition_evidence_sha256"
+            ],
+        })
+    try:
+        execution = image_optimization.freeze_execution_inputs(
+            plan,
+            revision=private["execution_inputs"]["revision"],
+            profile=private["execution_inputs"]["profile"],
+            model=private["model"],
+            frame_inventory=inventory,
+        )
+        task_settings = replace(
+            settings, seedream_model=private["model"],
+            seedream_edit_mode=private["edit_mode"],
+        )
+        return image_optimization.freeze_frame_prompts(
+            task_settings,
+            execution,
+            image_optimization.compile_frame_prompts(plan, private["edit_mode"]),
+            plan=plan,
+        )["_image_optimization"]
+    except (
+        KeyError, TypeError, ValueError, image_optimization.ImageOptimizationOutputError,
+        image_optimization.ImageOptimizationIneligibleError,
+    ):
+        raise PostprocessError(409, "postprocess_receipt_invalid") from None
+
+
+def _v4_effective_private(private: dict, derived: dict, canvas_sha256: str) -> dict:
+    required = {
+        "version", "plan_sha256", "continuity_sha256", "execution_input_sha256",
+        "execution_inputs", "model", "edit_mode", "scene_anchor_schedule", "frames", "sha256",
+    }
+    payload = {key: value for key, value in derived.items() if key != "sha256"}
+    if (
+        not isinstance(derived, dict)
+        or set(derived) != required
+        or derived.get("version") != 4
+        or derived.get("plan_sha256") != private.get("plan_sha256")
+        or derived.get("model") != private.get("model")
+        or derived.get("edit_mode") != private.get("edit_mode")
+        or derived.get("sha256") != _receipt_sha256(payload)
+    ):
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    result = deepcopy(private)
+    for key in (
+        "continuity_sha256", "execution_input_sha256", "execution_inputs",
+        "scene_anchor_schedule", "frames",
+    ):
+        result[key] = deepcopy(derived[key])
+    result["canvas_execution_sha256"] = canvas_sha256
+    return result
+
+
+async def _v4_prepare_canvases(
+    settings: Settings, cdir: Path, cid: str, meta: dict, private: dict,
+    grouped: dict[int, list[tuple[Path, Path]]], sem: asyncio.Semaphore,
+) -> tuple[dict, dict[int, list[tuple[Path, Path]]]]:
+    """Complete and freeze all requested MediaKit stages before v4 audit/POSTs."""
+    if not (private["options"]["remove_subtitle"] or private["options"]["remove_brand"]):
+        return private, grouped
+    # This verifies the raw frozen source inventory before any MediaKit reuse
+    # or submission.  A partial segment retry cannot turn a project DAG into
+    # an independent image edit.
+    raw_sources = _v4_frame_sources(grouped, private)
+    stages = [
+        ("text", mediakit.TEXT_SCENE, private["options"]["remove_subtitle"]),
+        ("brand", mediakit.ICON_SCENE, private["options"]["remove_brand"]),
+    ]
+    existing = meta.get("_v4_canvas_execution")
+    expected_records: list[dict] = []
+    current = dict(raw_sources)
+    for stage, scene, enabled in stages:
+        if not enabled:
+            continue
+        next_current: dict[tuple[int, int], Path] = {}
+        for key in sorted(current):
+            index, frame_index = key
+            source = current[key]
+            output = _v4_canvas_stage_path(cdir, index, stage, source.name)
+            stage_receipt = _v4_mediakit_success(source, output, scene)
+            if stage_receipt is None:
+                async with sem:
+                    try:
+                        await mediakit.erase_image(
+                            settings, cdir, source, output, True, (scene,)
+                        )
+                    except mediakit.MediaKitError as exc:
+                        raise PostprocessError(exc.status, exc.detail) from None
+                stage_receipt = _v4_mediakit_success(source, output, scene)
+                if stage_receipt is None:
+                    raise PostprocessError(409, "submission_unknown")
+            next_current[key] = output
+            # Build records only after all stages are terminally receipt-bound.
+        current = next_current
+    for key in sorted(raw_sources):
+        index, frame_index = key
+        source = raw_sources[key]
+        canvas = current[key]
+        chain = []
+        stage_source = source
+        for stage, scene, enabled in stages:
+            if not enabled:
+                continue
+            output = _v4_canvas_stage_path(cdir, index, stage, source.name)
+            receipt = _v4_mediakit_success(stage_source, output, scene)
+            if receipt is None:
+                raise PostprocessError(409, "submission_unknown")
+            try:
+                receipt["receipt_path"] = str(
+                    Path(receipt["receipt_path"]).resolve().relative_to(cdir.resolve())
+                )
+            except ValueError:
+                raise PostprocessError(409, "postprocess_receipt_invalid") from None
+            chain.append(receipt)
+            stage_source = output
+        expected_records.append(_v4_canvas_record(
+            cdir, index, frame_index, source, canvas, chain,
+        ))
+    derived = _v4_derive_canvas_optimization(settings, meta, private, expected_records)
+    payload = {
+        "version": 1,
+        "postprocess_receipt_sha256": private["receipt_sha256"],
+        "options": deepcopy(private["options"]),
+        "frames": expected_records,
+        "derived_optimization": derived,
+    }
+    receipt = {**payload, "sha256": _receipt_sha256(payload)}
+    if existing is not None and existing != receipt:
+        # Existing receipts are immutable.  Drift is never repaired by a new
+        # MediaKit submission, because that would change paid input evidence.
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    if existing is None:
+        storage.update_meta(settings.data_dir, cid, _v4_canvas_execution=receipt)
+    effective = _v4_effective_private(private, derived, receipt["sha256"])
+    effective_grouped = {
+        index: [
+            (
+                (cdir / next(
+                    item["canvas_path"] for item in expected_records
+                    if item["segment_index"] == index and item["frame_name"] == source.name
+                )).resolve(),
+                target,
+            )
+            for source, target in targets
+        ]
+        for index, targets in grouped.items()
+    }
+    return effective, effective_grouped
 
 
 async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
@@ -1475,7 +1735,18 @@ async def _v4_anchor(
     if existing is not None and _valid_png(output, canvas):
         return output, existing
     attempts = receipt_path.parent / "attempts"
-    attempt_path = attempts / f"{anchor['order']:04d}-{label}-r1.json"
+    latest = storage.load_meta(settings.data_dir, cid) or {}
+    revisions = {
+        item.get("revision")
+        for item in (latest.get("postprocess") or {}).get("segments", [])
+        if isinstance(item, dict)
+    }
+    if len(revisions) != 1 or next(iter(revisions), 0) is None:
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    revision = next(iter(revisions))
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    attempt_path = attempts / f"{anchor['order']:04d}-{label}-r{revision}.json"
     task_settings = replace(
         settings,
         seedream_model=private["model"],
@@ -2071,6 +2342,7 @@ def _write_v4_verification_receipt(
             private["scene_anchor_schedule"], ensure_ascii=False, sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")).hexdigest(),
+        "canvas_execution_sha256": private.get("canvas_execution_sha256"),
         "semantic_receipts": [
             {"label": item["label"], "sha256": item["sha256"]}
             for item in semantic_receipts
@@ -2101,8 +2373,6 @@ async def _run_v4_task(
     grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
     audit_runner, verification_runner,
 ) -> None:
-    if private["options"]["remove_subtitle"] or private["options"]["remove_brand"]:
-        raise PostprocessError(409, "v4_anchor_preprocess_unavailable")
     plan = _v4_frozen_plan(meta, private)
     sources = _v4_frame_sources(grouped, private)
     _v4_preflight(plan, private, sources)
@@ -2169,6 +2439,11 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
     meta = storage.load_meta(settings.data_dir, cid)
     if meta is None:
         return
+    if isinstance(meta.get("postprocess"), dict) and meta["postprocess"].get("status") == "done":
+        # `start` may schedule a background task for an exact done reuse.  No
+        # worker may reinterpret canonical files as permission to replay a
+        # paid v4 DAG.
+        return
     try:
         private = _private_receipt(meta)
     except PostprocessError:
@@ -2198,24 +2473,45 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
             index: targets for index, targets in grouped.items()
             if states.get(index) != "done"
         }
-    if options["optimize_image"] and private["version"] in {3, 4} and grouped:
+    runtime_private = private
+    runtime_grouped = grouped
+    if v4_project_dag and (options["remove_subtitle"] or options["remove_brand"]):
+        try:
+            runtime_private, runtime_grouped = await _v4_prepare_canvases(
+                settings, cdir, cid, meta, private, grouped, mediakit_sem,
+            )
+        except asyncio.CancelledError:
+            raise
+        except PostprocessError as exc:
+            _mark_image_verification_failed(
+                settings, cid, set(grouped),
+                error=exc.detail if isinstance(exc.detail, str) else "image_verification_failed",
+            )
+            return
+        except Exception:
+            _mark_image_verification_failed(settings, cid, set(grouped))
+            return
+    if options["optimize_image"] and private["version"] in {3, 4} and runtime_grouped:
         try:
             await _run_v3_plan_audit(
-                audit_runner, cdir, meta, private, audit_grouped
+                audit_runner, cdir, meta, runtime_private, runtime_grouped
             )
         except PostprocessError:
             _mark_plan_audit_failed(settings, cid, set(grouped))
             return
-    if private["version"] == 4 and options["optimize_image"] and grouped:
+    if private["version"] == 4 and options["optimize_image"] and runtime_grouped:
         try:
             await _run_v4_task(
-                settings, cid, cdir, meta, private, grouped, seedream_sem,
+                settings, cid, cdir, meta, runtime_private, runtime_grouped, seedream_sem,
                 audit_runner, verification_runner,
             )
         except asyncio.CancelledError:
             raise
         except PostprocessError as exc:
-            _mark_image_verification_failed(settings, cid, set(grouped))
+            _mark_image_verification_failed(
+                settings, cid, set(grouped),
+                error=exc.detail if isinstance(exc.detail, str) else "image_verification_failed",
+            )
             _mutate_postprocess(
                 settings, cid,
                 lambda _meta, post: post.update(error=exc.detail),
@@ -2348,17 +2644,21 @@ async def retry_segment(settings: Settings, cid: str, index: int, payload: dict,
                 raise PostprocessError(409, _structured(
                     "postprocess_revision_changed", "分段状态已更新，请刷新页面后重试。"
                 ))
-            target.update(
-                status="running", error=None, revision=expected + 1,
-                stage=target.get("stage") or "queued",
-            )
             if v4_project_dag:
                 # The schedule is one project DAG.  A segment endpoint may
                 # start a retry, but the resumed run must revalidate/reuse the
                 # exact complete graph rather than isolate that segment.
+                if any(item.get("revision") != expected for item in segments):
+                    raise PostprocessError(409, "postprocess_revision_changed")
                 for item in segments:
-                    if item is not target:
-                        item.update(status="running", error=None, stage="queued")
+                    item.update(
+                        status="running", error=None, stage="queued", revision=expected + 1,
+                    )
+            else:
+                target.update(
+                    status="running", error=None, revision=expected + 1,
+                    stage=target.get("stage") or "queued",
+                )
             post.update(status="running", error=None, segments=segments)
             meta["postprocess"] = post
 
@@ -2367,9 +2667,149 @@ async def retry_segment(settings: Settings, cid: str, index: int, payload: dict,
             raise PostprocessError(404, "not found")
 
 
+def _v4_canvas_execution_for_h3(
+    cdir: Path, meta: dict, private: dict, originals: list[Path],
+) -> tuple[dict, dict[tuple[int, int], Path]]:
+    """Rebuild the only legal v4 canvas source map from terminal MediaKit receipts."""
+    combined = private["options"]["remove_subtitle"] or private["options"]["remove_brand"]
+    if not combined:
+        return private, {
+            (0 if len(path.resolve().relative_to(cdir / "work").parts) == 2
+             else int(path.resolve().relative_to(cdir / "work").parts[1]), int(path.stem)): path
+            for path in originals
+        }
+    raw = meta.get("_v4_canvas_execution")
+    if not isinstance(raw, dict):
+        raise PostprocessError(409, "postprocess_artifacts_invalid")
+    payload = {key: value for key, value in raw.items() if key != "sha256"}
+    if (
+        set(raw) != {
+            "version", "postprocess_receipt_sha256", "options", "frames",
+            "derived_optimization", "sha256",
+        }
+        or raw.get("version") != 1
+        or raw.get("sha256") != _receipt_sha256(payload)
+        or raw.get("postprocess_receipt_sha256") != private.get("receipt_sha256")
+        or raw.get("options") != private.get("options")
+        or not isinstance(raw.get("frames"), list)
+        or not isinstance(raw.get("derived_optimization"), dict)
+    ):
+        raise PostprocessError(409, "postprocess_artifacts_invalid")
+    raw_sources = {}
+    work = (cdir / "work").resolve()
+    for path in originals:
+        relative = path.resolve().relative_to(work)
+        index = 0 if len(relative.parts) == 2 else int(relative.parts[1])
+        raw_sources[(index, int(path.stem))] = path
+    expected_records = []
+    canvas_sources = {}
+    for index, frame_index in sorted(raw_sources):
+        source = raw_sources[(index, frame_index)]
+        matches = [
+            item for item in raw["frames"] if isinstance(item, dict)
+            and (item.get("segment_index"), item.get("frame_index")) == (index, frame_index)
+        ]
+        if len(matches) != 1:
+            raise PostprocessError(409, "postprocess_artifacts_invalid")
+        record = matches[0]
+        try:
+            canvas = (cdir / record["canvas_path"]).resolve()
+            if not canvas.is_relative_to(cdir.resolve()):
+                raise ValueError
+            stages = record["stages"]
+            if (
+                record.get("frame_name") != source.name
+                or record.get("source_sha256") != _sha256_path(source)
+                or record.get("canvas_sha256") != _sha256_path(canvas)
+                or not isinstance(stages, list)
+            ):
+                raise ValueError
+            stage_source = source
+            expected_stages = [
+                ("text", mediakit.TEXT_SCENE, private["options"]["remove_subtitle"]),
+                ("brand", mediakit.ICON_SCENE, private["options"]["remove_brand"]),
+            ]
+            rebuilt = []
+            for stage, scene, enabled in expected_stages:
+                if not enabled:
+                    continue
+                output = _v4_canvas_stage_path(cdir, index, stage, source.name)
+                entry = _v4_mediakit_success(stage_source, output, scene)
+                if entry is None:
+                    raise ValueError
+                entry["receipt_path"] = str(
+                    Path(entry["receipt_path"]).resolve().relative_to(cdir.resolve())
+                )
+                rebuilt.append(entry)
+                stage_source = output
+            if rebuilt != stages or canvas != stage_source:
+                raise ValueError
+            expected_records.append(_v4_canvas_record(
+                cdir, index, frame_index, source, canvas, rebuilt,
+            ))
+            canvas_sources[(index, frame_index)] = canvas
+        except (KeyError, OSError, TypeError, ValueError):
+            raise PostprocessError(409, "postprocess_artifacts_invalid") from None
+    if raw["frames"] != expected_records:
+        raise PostprocessError(409, "postprocess_artifacts_invalid")
+    # The execution/prompt/schedule receipt is rebuilt from precisely the
+    # canvas bytes above during runtime and has a stable self-hash here.
+    effective = _v4_effective_private(
+        private, raw["derived_optimization"], raw["sha256"],
+    )
+    execution_frames = effective["execution_inputs"]["frames"]
+    if [
+        (frame["segment_index"], frame["frame_index"], frame["source_sha256"])
+        for frame in execution_frames
+    ] != [
+        (record["segment_index"], record["frame_index"], record["canvas_sha256"])
+        for record in expected_records
+    ]:
+        raise PostprocessError(409, "postprocess_artifacts_invalid")
+    return effective, canvas_sources
+
+
+def _validate_mediakit_only_outputs(
+    cdir: Path, private: dict, originals: list[Path], selected: list[Path],
+) -> None:
+    """Keep MediaKit-only H3 reuse bound to its durable provider receipts."""
+    if private["options"]["optimize_image"]:
+        return
+    stages = [
+        ("text", mediakit.TEXT_SCENE, private["options"]["remove_subtitle"]),
+        ("brand", mediakit.ICON_SCENE, private["options"]["remove_brand"]),
+    ]
+    if not any(enabled for _stage, _scene, enabled in stages):
+        return
+    work = (cdir / "work").resolve()
+    try:
+        for original, canonical in zip(originals, selected):
+            relative = original.resolve().relative_to(work)
+            index = 0 if len(relative.parts) == 2 else int(relative.parts[1])
+            current = original
+            for stage, scene, enabled in stages:
+                if not enabled:
+                    continue
+                output = _private_dir(cdir, index) / stage / original.name
+                if _v4_mediakit_success(current, output, scene) is None:
+                    raise ValueError
+                current = output
+            if _sha256_path(canonical) != _sha256_path(current):
+                raise ValueError
+    except (OSError, ValueError, PostprocessError):
+        raise PostprocessError(409, "postprocess_artifacts_invalid") from None
+
+
 def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[Path]:
     state = meta.get("postprocess")
     if state is None:
+        frozen = meta.get("_postprocess_receipt")
+        if (
+            isinstance(frozen, dict) and frozen.get("version") == 4
+            and isinstance(frozen.get("options"), dict)
+            and frozen["options"].get("optimize_image") is True
+        ):
+            raise PostprocessError(409, "postprocess_artifacts_invalid")
         return originals
     if not isinstance(state, dict) or state.get("status") != "done":
         raise PostprocessError(409, "postprocess_not_ready")
@@ -2406,19 +2846,30 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
     if len({path.resolve() for path in selected}) != len(selected):
         raise PostprocessError(409, "postprocess_artifacts_invalid")
     frozen_intent = meta.get("_postprocess_receipt")
-    frozen_v4_intent = (
-        isinstance(frozen_intent, dict)
-        and frozen_intent.get("version") == 4
-        and isinstance(frozen_intent.get("options"), dict)
-        and frozen_intent["options"].get("optimize_image") is True
-    )
     optimization = image_optimization.receipt(meta)
-    expected_v4 = frozen_v4_intent or (
-        isinstance(optimization, dict) and optimization.get("version") == 4
+    public_options = state.get("options") if isinstance(state, dict) else None
+    intent_options = (
+        frozen_intent.get("options") if isinstance(frozen_intent, dict) else public_options
     )
+    expected_v4 = (
+        isinstance(intent_options, dict)
+        and intent_options.get("optimize_image") is True
+        and (
+            isinstance(frozen_intent, dict) and frozen_intent.get("version") == 4
+            or isinstance(optimization, dict) and optimization.get("version") == 4
+        )
+    )
+    try:
+        # `_postprocess_receipt` is immutable start intent.  Do not let a
+        # deleted image receipt or a copied PNG downgrade a media-only job.
+        media_private = _private_receipt(meta)
+        _validate_mediakit_only_outputs(cdir, media_private, originals, selected)
+    except PostprocessError:
+        raise PostprocessError(409, "postprocess_artifacts_invalid") from None
     if expected_v4:
         raw = meta.get("_image_verification")
         try:
+            base_private = _private_receipt(meta)
             if not isinstance(optimization, dict) or optimization.get("version") != 4:
                 raise ValueError
             plan = image_optimization.dual_target_plan_receipt(meta)
@@ -2426,10 +2877,13 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                 raise ValueError
             if not isinstance(raw, dict):
                 raise ValueError
+            runtime_private, runtime_sources = _v4_canvas_execution_for_h3(
+                cdir, meta, base_private, originals,
+            )
             payload = {key: value for key, value in raw.items() if key != "sha256"}
             expected_sha = _receipt_sha256(payload)
             expected_schedule_sha = _receipt_sha256(
-                optimization["scene_anchor_schedule"]
+                runtime_private["scene_anchor_schedule"]
             )
             verified = {
                 (item["segment_index"], item["frame_name"]): item
@@ -2439,14 +2893,16 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                 set(raw) != {
                     "version", "plan_sha256", "continuity_sha256",
                     "scene_anchor_schedule_sha256",
+                    "canvas_execution_sha256",
                     "semantic_receipts", "anchor_receipts", "source_palette_receipt_sha256",
                     "palette_metrics", "palette_metrics_sha256", "frames", "verdict", "sha256",
                 }
                 or raw["version"] != 1
                 or raw["sha256"] != expected_sha
-                or raw["plan_sha256"] != optimization["plan_sha256"]
-                or raw["continuity_sha256"] != optimization["continuity_sha256"]
+                or raw["plan_sha256"] != runtime_private["plan_sha256"]
+                or raw["continuity_sha256"] != runtime_private["continuity_sha256"]
                 or raw["scene_anchor_schedule_sha256"] != expected_schedule_sha
+                or raw["canvas_execution_sha256"] != runtime_private.get("canvas_execution_sha256")
                 or raw["verdict"].get("passed") is not True
                 or raw["palette_metrics_sha256"] != raw["palette_metrics"].get("sha256")
                 or len(verified) != len(selected)
@@ -2458,8 +2914,8 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
             if (
                 source_receipt is None
                 or source_receipt.get("sha256") != raw["source_palette_receipt_sha256"]
-                or source_receipt.get("plan_sha256") != optimization["plan_sha256"]
-                or source_receipt.get("continuity_sha256") != optimization["continuity_sha256"]
+                or source_receipt.get("plan_sha256") != runtime_private["plan_sha256"]
+                or source_receipt.get("continuity_sha256") != runtime_private["continuity_sha256"]
             ):
                 raise ValueError
             if not isinstance(raw["semantic_receipts"], list) or not raw["semantic_receipts"]:
@@ -2468,11 +2924,11 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
             for original in originals:
                 relative = original.resolve().relative_to(work)
                 segment_index = 0 if len(relative.parts) == 2 else int(relative.parts[1])
-                source_sha256s[(segment_index, int(original.stem))] = hashlib.sha256(
-                    original.read_bytes()
-                ).hexdigest()
+                source_sha256s[(segment_index, int(original.stem))] = _sha256_path(
+                    runtime_sources[(segment_index, int(original.stem))]
+                )
             anchors = _v4_anchor_receipt_index(
-                cdir, plan, optimization["scene_anchor_schedule"]
+                cdir, plan, runtime_private["scene_anchor_schedule"]
             )
             expected_anchor_manifest = [
                 {
@@ -2485,21 +2941,21 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                     ),
                 }
                 for descriptor in _v4_expected_anchor_descriptors(
-                    plan, optimization["scene_anchor_schedule"]
+                    plan, runtime_private["scene_anchor_schedule"]
                 )
             ]
             if raw["anchor_receipts"] != expected_anchor_manifest:
                 raise ValueError
             if not all(_valid_v4_anchor_receipt(
                 cdir, receipt,
-                plan_sha256=optimization["plan_sha256"],
-                continuity_sha256=optimization["continuity_sha256"],
+                plan_sha256=runtime_private["plan_sha256"],
+                continuity_sha256=runtime_private["continuity_sha256"],
                 source_sha256s=source_sha256s,
                 anchors=anchors,
             ) for receipt in anchors.values()):
                 raise ValueError
             if [item.get("label") for item in raw["semantic_receipts"]] != _v4_semantic_labels(
-                optimization["scene_anchor_schedule"]
+                runtime_private["scene_anchor_schedule"]
             ):
                 raise ValueError
             for item in raw["semantic_receipts"]:
@@ -2509,11 +2965,11 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                 if (
                     receipt is None or receipt.get("sha256") != item["sha256"]
                     or receipt.get("label") != item["label"]
-                    or receipt.get("plan_sha256") != optimization["plan_sha256"]
-                    or receipt.get("continuity_sha256") != optimization["continuity_sha256"]
+                    or receipt.get("plan_sha256") != runtime_private["plan_sha256"]
+                    or receipt.get("continuity_sha256") != runtime_private["continuity_sha256"]
                     or receipt.get("verdict", {}).get("passed") is not True
                     or not _valid_semantic_pack_bindings(
-                        cdir, plan, optimization["scene_anchor_schedule"],
+                        cdir, plan, runtime_private["scene_anchor_schedule"],
                         receipt, source_sha256s,
                     )
                 ):
@@ -2527,7 +2983,9 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                     segment_index = int(relative.parts[1])
                 item = verified[(segment_index, original.name)]
                 if (
-                    item["source_sha256"] != hashlib.sha256(original.read_bytes()).hexdigest()
+                    item["source_sha256"] != _sha256_path(
+                        runtime_sources[(segment_index, int(original.stem))]
+                    )
                     or item["output_sha256"] != hashlib.sha256(output.read_bytes()).hexdigest()
                 ):
                     raise ValueError
@@ -2537,7 +2995,7 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                     "source_sha256": item["source_sha256"],
                     "output_sha256": item["output_sha256"],
                 })
-                pairs.append((segment_index, original, output))
+                pairs.append((segment_index, runtime_sources[(segment_index, int(original.stem))], output))
             if raw["frames"] != expected_verified_frames:
                 raise ValueError
             if not _valid_palette_metrics_for_outputs(raw["palette_metrics"], pairs):
@@ -2548,9 +3006,6 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
 
 
 _ATTEMPT_RE = re.compile(r"^\d+-r([1-9]\d*)\.json$")
-_ANCHOR_ATTEMPT_RE = re.compile(
-    r"^[1-9]\d*-(?:global|pack-alternate|person-[A-Z0-9_]+-(?:primary|alternate)|layout-\d{4}|fanout-\d{4}-\d{4})-r1\.json$"
-)
 
 
 def _ambiguous_segments(cdir: Path, post: object) -> set[int]:
@@ -2580,19 +3035,54 @@ def _ambiguous_segments(cdir: Path, post: object) -> set[int]:
     return ambiguous
 
 
-def _ambiguous_v4_anchor_attempts(cdir: Path) -> bool:
-    root = cdir / "work" / ".postprocess-private" / "scene-anchors"
-    if not root.is_dir():
-        return False
-    for attempt in root.glob("*/attempts/*.json"):
-        if _ANCHOR_ATTEMPT_RE.match(attempt.name) is None:
+def _v4_project_revision(post: object) -> int:
+    if not isinstance(post, dict):
+        raise ValueError
+    segments = post.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise ValueError
+    revisions = {
+        item.get("revision") for item in segments if isinstance(item, dict)
+    }
+    if len(revisions) != 1:
+        raise ValueError
+    revision = next(iter(revisions))
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise ValueError
+    return revision
+
+
+def _ambiguous_v4_anchor_attempts(cdir: Path, private: dict, post: object) -> bool:
+    """Inspect only frozen typed DAG paths, never a permissive filename pattern."""
+    try:
+        revision = _v4_project_revision(post)
+        descriptors = _v4_expected_anchor_descriptors(
+            {}, private["scene_anchor_schedule"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return True
+    for descriptor in descriptors:
+        attempts = _anchor_receipt_path(
+            cdir, descriptor["scene_id"], descriptor["label"],
+        ).parent / "attempts"
+        order = descriptor["anchor"].get("order")
+        if isinstance(order, bool) or not isinstance(order, int) or order < 1:
             return True
-        try:
-            payload = json.loads(attempt.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return True
-        if payload.get("status") in {"submitting", "submission_unknown"}:
-            return True
+        # Revisions are append-only.  An unresolved older typed attempt is
+        # still ambiguous; an explicit retry can only follow a determinate
+        # provider rejection, never an unknown submission.
+        for attempt_revision in range(1, revision + 1):
+            attempt = attempts / (
+                f"{order:04d}-{descriptor['label']}-r{attempt_revision}.json"
+            )
+            if not attempt.is_file():
+                continue
+            try:
+                payload = json.loads(attempt.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return True
+            if payload.get("status") in {"submitting", "submission_unknown"}:
+                return True
     return False
 
 
@@ -2616,7 +3106,7 @@ def recover_running(settings: Settings) -> list[str]:
             continue
         ambiguous = _ambiguous_segments(settings.data_dir / cid, post)
         anchor_ambiguous = private["version"] == 4 and _ambiguous_v4_anchor_attempts(
-            settings.data_dir / cid
+            settings.data_dir / cid, private, post
         )
         if anchor_ambiguous:
             ambiguous.update(

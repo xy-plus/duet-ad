@@ -326,6 +326,42 @@ def test_v4_frame_inventory_derives_transition_from_lineage_and_frame_pair(tmp_p
     ]
 
 
+def test_v4_plan_input_receives_backend_transition_skeleton_before_codex(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    segments = [
+        {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut"},
+        {"index": 2, "chain_id": "chain-001", "join_mode": "continue"},
+    ]
+    metas = []
+    for segment in segments:
+        keyframes = ["01.png", "02.png"]
+        directory = work / "segments" / str(segment["index"]) / "work" / "keyframes"
+        directory.mkdir(parents=True)
+        for name in keyframes:
+            (directory / name).write_bytes(_PX_PNG)
+        metas.append({"index": segment["index"], "keyframes": keyframes})
+    captured = []
+
+    def generate(_settings, _runner, specs, **_kwargs):
+        captured.extend(specs)
+        return {"version": 1, "segment_indices": [1, 2], "elements": []}, {
+            1: "prompt-1", 2: "prompt-2",
+        }
+
+    monkeypatch.setattr(pipeline, "_generate_image_optimization_project", generate)
+    continuity, _prompts = pipeline._generate_segmented_image_prompts(
+        make_settings(tmp_path), object(), segments, metas, work, session_dir=tmp_path,
+    )
+
+    assert continuity["version"] == 1
+    assert [item["transition_skeleton"][0]["source_transition_from_previous"]
+            for item in captured] == ["start", "same_camera"]
+    assert all(
+        item["transition_skeleton"][-1]["source_transition_evidence_sha256"]
+        for item in captured
+    )
+
+
 def test_v4_pipeline_freezes_authoritative_transitions_and_anchor_schedule(tmp_path):
     settings = make_settings(tmp_path)
     frame_dir = tmp_path / "work" / "keyframes"

@@ -714,6 +714,31 @@ def _generate_segmented_image_prompts(
     *,
     session_dir: Path,
 ) -> tuple[dict, dict]:
+    frame_paths = {}
+    for segment, meta in zip(segments, seg_metas):
+        directory = work / "segments" / str(segment["index"]) / "work" / "keyframes"
+        names = meta.get("keyframes") if isinstance(meta, dict) else None
+        paths = (
+            [directory / name for name in names]
+            if isinstance(names, list) and all(isinstance(name, str) for name in names)
+            else sorted(path for path in directory.glob("*.png") if path.is_file())
+        )
+        frame_paths[segment["index"]] = paths
+    transitions_by_segment = {}
+    if all(frame_paths.values()):
+        transition_inventory = _frame_inventory(
+            frame_paths,
+            segment_lineage={
+                segment["index"]: {
+                    "chain_id": segment["chain_id"], "join_mode": segment["join_mode"],
+                }
+                for segment in segments
+            },
+        )
+        transitions_by_segment = {
+            index: [item for item in transition_inventory if item["segment_index"] == index]
+            for index in frame_paths
+        }
     specs = [{
         "index": segment["index"],
         "chain_id": segment["chain_id"],
@@ -721,6 +746,8 @@ def _generate_segmented_image_prompts(
         "keyframes_dir": (
             work / "segments" / str(segment["index"]) / "work" / "keyframes"
         ),
+        **({"transition_skeleton": transitions_by_segment[segment["index"]]}
+           if segment["index"] in transitions_by_segment else {}),
     } for segment in segments]
     continuity, prompts = _generate_image_optimization_project(
         settings,
@@ -1727,6 +1754,13 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 step="visual codex",
             )
             if new_input_contract:
+                frame_paths = [work / "keyframes" / name for name in keyframes]
+                transition_skeleton = _frame_inventory(
+                    {0: frame_paths},
+                    segment_lineage={
+                        0: {"chain_id": "short-000", "join_mode": "hard_cut"},
+                    },
+                )
                 continuity, image_prompts = _generate_image_optimization_project(
                     settings,
                     runner,
@@ -1735,6 +1769,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                         "chain_id": "short-000",
                         "join_mode": "hard_cut",
                         "keyframes_dir": work / "keyframes",
+                        "transition_skeleton": transition_skeleton,
                     }],
                     session_dir=cdir,
                     step="project image postprocess codex",

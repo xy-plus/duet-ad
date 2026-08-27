@@ -1838,7 +1838,7 @@ def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
         for segment in canonical["segments"]
     }
 
-    def visible_scene_alternate(scene_id: str, primary: tuple[int, int]) -> tuple[int, int]:
+    def visible_scene_alternate(scene_id: str, primary: tuple[int, int]) -> tuple[int, int] | None:
         candidates = [
             (frame["segment_index"], frame["frame_index"])
             for frame in frames
@@ -1847,11 +1847,9 @@ def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
             and any(item["visibility"] in {"full", "partial", "edge_fragment"}
                     for item in frame["scene_continuity_view"]["observations"])
         ]
-        if not candidates:
-            raise ValueError("invalid image optimization anchor schedule")
-        return min(candidates)
+        return min(candidates, default=None)
 
-    def person_alternate(person: dict) -> tuple[int, int]:
+    def person_alternate(person: dict) -> tuple[int, int] | None:
         reference = person["reference"]
         primary = (reference["segment_index"], reference["frame_index"])
         candidates = sorted(
@@ -1862,9 +1860,7 @@ def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
             for frame_index in instance["observable_frames"]
             if (segment["segment_index"], frame_index) != primary
         )
-        if not candidates:
-            raise ValueError("invalid image optimization anchor schedule")
-        return candidates[0]
+        return candidates[0] if candidates else None
 
     # Every paid node is ordered and named before runtime.  Runtime may only
     # replay this immutable DAG, never allocate an order with a dynamic max().
@@ -1877,13 +1873,16 @@ def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
         alternate = visible_scene_alternate(
             scene["id"], (reference["segment_index"], reference["frame_index"])
         )
-        node_specs.append((scene["id"], "pack-alternate", *alternate))
+        if alternate is not None:
+            node_specs.append((scene["id"], "pack-alternate", *alternate))
     for person in canonical["person_plans"]:
         reference = person["reference"]
-        node_specs.extend([
-            (scene_by_segment[reference["segment_index"]], f"person-{person['id']}-primary", reference["segment_index"], reference["frame_index"]),
-            (scene_by_segment[person_alternate(person)[0]], f"person-{person['id']}-alternate", *person_alternate(person)),
-        ])
+        alternate = person_alternate(person)
+        if alternate is not None:
+            node_specs.extend([
+                (scene_by_segment[reference["segment_index"]], f"person-{person['id']}-primary", reference["segment_index"], reference["frame_index"]),
+                (scene_by_segment[alternate[0]], f"person-{person['id']}-alternate", *alternate),
+            ])
     layout_keys = set()
     for scene in canonical["scene_plans"]:
         for segment_index in scene["segments"]:
@@ -2185,7 +2184,8 @@ def generate_project_prompts(
         raise ValueError("invalid image optimization segments")
     prepared = []
     for segment in segments:
-        if set(segment) != {"index", "chain_id", "join_mode", "keyframes_dir"}:
+        allowed = {"index", "chain_id", "join_mode", "keyframes_dir"}
+        if set(segment) != allowed and set(segment) != allowed | {"transition_skeleton"}:
             raise ValueError("invalid image optimization segments")
         if (
             not isinstance(segment["chain_id"], str) or not segment["chain_id"]
@@ -2198,7 +2198,34 @@ def generate_project_prompts(
             source.relative_to(session)
         except (OSError, TypeError, ValueError):
             raise ValueError("invalid image optimization segments") from None
-        prepared.append((segment, _validated_frames(source)))
+        frames = _validated_frames(source)
+        skeleton = segment.get("transition_skeleton")
+        if skeleton is not None:
+            if not isinstance(skeleton, list) or len(skeleton) != len(frames):
+                raise ValueError("invalid image optimization segments")
+            expected = [
+                {
+                    "segment_index": segment["index"],
+                    "frame_index": position,
+                    "frame_name": frame.name,
+                    "source_sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
+                    "source_transition_from_previous": item.get(
+                        "source_transition_from_previous"
+                    ) if isinstance(item, dict) else None,
+                    "source_transition_evidence_sha256": item.get(
+                        "source_transition_evidence_sha256"
+                    ) if isinstance(item, dict) else None,
+                }
+                for position, (frame, item) in enumerate(zip(frames, skeleton), 1)
+            ]
+            if skeleton != expected or any(
+                item["source_transition_from_previous"] not in _SCENE_CONTINUITY_TRANSITIONS
+                or not isinstance(item["source_transition_evidence_sha256"], str)
+                or _SHA256_RE.fullmatch(item["source_transition_evidence_sha256"]) is None
+                for item in skeleton
+            ):
+                raise ValueError("invalid image optimization segments")
+        prepared.append((segment, frames))
 
     with tempfile.TemporaryDirectory(prefix="duet-image-postprocess-", dir="/tmp") as raw:
         stage = Path(raw).resolve(strict=True)
@@ -2214,6 +2241,8 @@ def generate_project_prompts(
                 "index": segment["index"],
                 "chain_id": segment["chain_id"],
                 "join_mode": segment["join_mode"],
+                **({"transition_skeleton": segment["transition_skeleton"]}
+                   if "transition_skeleton" in segment else {}),
             })
         (work / "request.json").write_text(
             json.dumps({
@@ -2238,12 +2267,46 @@ def generate_project_prompts(
                 + MAX_PROMPT_BYTES * len(indices)
                 + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES
             )
-            return _canonical_project_output(
+            plan, prompts = _canonical_project_output(
                 _read_json_output(work / "image_optimization.json", max_bytes),
                 indices,
                 edit_mode,
                 {segment["index"]: len(frames) for segment, frames in prepared},
             )
+            skeletons = {
+                segment["index"]: segment.get("transition_skeleton")
+                for segment, _frames in prepared
+                if "transition_skeleton" in segment
+            }
+            if plan.get("version") == 4 and skeletons:
+                actual = {
+                    scene_view["segment_index"]: []
+                    for scene in plan["scene_plans"]
+                    for scene_view in scene["continuity_graph"]["views"]
+                }
+                for scene in plan["scene_plans"]:
+                    for view in scene["continuity_graph"]["views"]:
+                        actual[view["segment_index"]].append({
+                            "frame_index": view["frame_index"],
+                            "transition_from_previous": view["transition_from_previous"],
+                        })
+                expected = {
+                    index: [
+                        {
+                            "frame_index": item["frame_index"],
+                            "transition_from_previous": item[
+                                "source_transition_from_previous"
+                            ],
+                        }
+                        for item in skeleton
+                    ]
+                    for index, skeleton in skeletons.items()
+                }
+                if actual != expected:
+                    raise ImageOptimizationOutputError(
+                        "image optimization output is missing or invalid"
+                    )
+            return plan, prompts
         except ImageOptimizationIneligibleError:
             raise
         except ImageOptimizationOutputError:

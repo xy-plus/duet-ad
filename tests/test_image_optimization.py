@@ -1127,6 +1127,51 @@ def test_v4_schedule_freezes_unique_typed_paid_dag_order(tmp_path):
     ]
 
 
+def test_v4_plan_rejects_model_transition_that_differs_from_backend_skeleton(tmp_path):
+    settings = make_settings(tmp_path)
+    session = tmp_path / "session"
+    frames = session / "work" / "keyframes"
+    frames.mkdir(parents=True)
+    for number in (1, 2):
+        (frames / f"{number:02d}.png").write_bytes(_png(value=number))
+    skeleton = [
+        {
+            "segment_index": 0,
+            "frame_index": number,
+            "frame_name": f"{number:02d}.png",
+            "source_sha256": hashlib.sha256(
+                (frames / f"{number:02d}.png").read_bytes()
+            ).hexdigest(),
+            "source_transition_from_previous": "start" if number == 1 else "same_camera",
+            "source_transition_evidence_sha256": str(number + 7) * 64,
+        }
+        for number in (1, 2)
+    ]
+
+    class Runner:
+        def run_isolated(self, workdir, _prompt, *, session_dir):
+            request = json.loads((Path(workdir) / "work" / "request.json").read_text())
+            assert request["segments"][0]["transition_skeleton"] == skeleton
+            plan = _v4_frame_bound_plan()
+            plan["scene_plans"][0]["continuity_graph"]["views"][1][
+                "transition_from_previous"
+            ] = "camera_motion"
+            (Path(workdir) / "work" / "image_optimization.json").write_text(
+                json.dumps(plan), encoding="utf-8",
+            )
+
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.generate_project_prompts(
+            Runner(),
+            [{
+                "index": 0, "chain_id": "short-000", "join_mode": "hard_cut",
+                "keyframes_dir": frames, "transition_skeleton": skeleton,
+            }],
+            settings.seedream_edit_mode,
+            session_dir=session,
+        )
+
+
 class _PlanAuditRunner:
     def __init__(self, status: str, verify_status: str = "pass") -> None:
         self.status = status
@@ -1574,6 +1619,182 @@ def test_v4_plan_audit_failure_blocks_every_seedream_post(
     assert latest["postprocess"]["error"] == "image_plan_audit_failed"
 
 
+def test_v4_combined_mediakit_preprocesses_all_canvases_before_audit_or_seedream(
+    tmp_path, monkeypatch,
+):
+    """A v4 project may only enter its paid DAG after every canvas is frozen."""
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, enable_mediakit_erase=True, retry_interval_s=0)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(_png(value=62))
+    _freeze_v4_image_optimization(settings, cid, _v4_frame_bound_plan())
+    events = []
+
+    async def erase(_settings, _cdir, source, output, confirm, scenes):
+        assert confirm is True and len(scenes) == 1
+        events.append(("mediakit", scenes[0], source.name))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(source.read_bytes())
+        receipt = {
+            "version": 1,
+            "state": "succeeded",
+            "source": {"sha256": hashlib.sha256(source.read_bytes()).hexdigest()},
+            "scenes": [scenes[0]],
+            "stages": [{"scene": scenes[0], "state": "succeeded"}],
+            "output": output.name,
+        }
+        path = output.parent / ".mediakit" / f"{output.name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        return output
+
+    async def forbidden_seedream(*_args, **_kwargs):
+        events.append(("seedream",))
+        raise AssertionError("v4 must audit the complete derived canvas set first")
+
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", erase)
+    monkeypatch.setattr(postprocess.seedream, "edit", forbidden_seedream)
+    asyncio.run(postprocess.start(
+        settings, cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": True, "remove_brand": True, "optimize_image": True,
+        }},
+        {},
+    ))
+    runner = _PlanAuditRunner("fail")
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1), audit_runner=runner,
+    ))
+
+    assert events == [
+        ("mediakit", mediakit.TEXT_SCENE, "01.png"),
+        ("mediakit", mediakit.TEXT_SCENE, "02.png"),
+        ("mediakit", mediakit.ICON_SCENE, "01.png"),
+        ("mediakit", mediakit.ICON_SCENE, "02.png"),
+    ]
+    assert runner.calls == 1
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert latest["postprocess"]["error"] == "image_plan_audit_failed"
+    canvas = latest["_v4_canvas_execution"]
+    assert [item["canvas_sha256"] for item in canvas["frames"]]
+
+
+def test_v4_mediakit_only_keeps_legacy_publish_and_h3_selection_path(tmp_path, monkeypatch):
+    """A v4 image plan does not make a non-optimization MediaKit run an anchor DAG."""
+    settings = make_settings(tmp_path, enable_mediakit_erase=True, retry_interval_s=0)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(_png(value=62))
+    _freeze_v4_image_optimization(settings, cid, _v4_frame_bound_plan())
+    calls = []
+
+    async def erase(_settings, _cdir, source, output, _confirm, scenes):
+        calls.append((scenes[0], source.name))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(source.read_bytes())
+        receipt_path = output.parent / ".mediakit" / f"{output.name}.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({
+            "version": 1, "state": "succeeded", "output": output.name,
+            "source": {"sha256": hashlib.sha256(source.read_bytes()).hexdigest()},
+            "scenes": [scenes[0]],
+            "stages": [{"scene": scenes[0], "state": "succeeded"}],
+        }), encoding="utf-8")
+        return output
+
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", erase)
+    monkeypatch.setattr(postprocess.seedream, "edit", lambda *_a, **_k: pytest.fail("no Seedream"))
+    asyncio.run(postprocess.start(
+        settings, cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": True, "remove_brand": False, "optimize_image": False,
+        }},
+        {},
+    ))
+    asyncio.run(postprocess.run_task(settings, cid, asyncio.Semaphore(1)))
+
+    assert calls == [(mediakit.TEXT_SCENE, "01.png"), (mediakit.TEXT_SCENE, "02.png")]
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert latest["postprocess"]["status"] == "done"
+    assert postprocess.generation_keyframes(
+        cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
+    ) == sorted((cdir / "work" / "postprocessed").glob("*.png"))
+    receipt = cdir / "work" / ".postprocess-private" / "0" / "text" / ".mediakit" / "01.png.json"
+    original_receipt = receipt.read_text(encoding="utf-8")
+    drifted = json.loads(original_receipt)
+    drifted["source"]["sha256"] = "0" * 64
+    receipt.write_text(json.dumps(drifted), encoding="utf-8")
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )
+    receipt.write_text(original_receipt, encoding="utf-8")
+    receipt.unlink()
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )
+
+
+def test_mediakit_stage_never_reuses_an_output_without_its_provider_receipt(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
+    cdir = tmp_path / "project"
+    source = cdir / "work" / "keyframes" / "01.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(_png())
+    stale = cdir / "work" / ".postprocess-private" / "0" / "text" / "01.png"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(_png())
+    calls = []
+
+    async def forbidden(*_args, **_kwargs):
+        calls.append(True)
+        raise AssertionError("an output-only hit is an unknown paid state")
+
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", forbidden)
+    with pytest.raises(postprocess.PostprocessError, match="submission_unknown"):
+        asyncio.run(postprocess._mediakit_stage(
+            settings, cdir, 0, [source], "text", mediakit.TEXT_SCENE, asyncio.Semaphore(1),
+        ))
+    assert calls == []
+
+
+def test_v4_staged_canonical_outputs_are_not_visible_before_project_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(_png(value=62))
+    _freeze_v4_image_optimization(settings, cid, _v4_frame_bound_plan())
+    asyncio.run(postprocess.start(
+        settings, cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+    staged = cdir / "work" / "postprocessed"
+    staged.mkdir(parents=True)
+    (staged / "01.png").write_bytes(_png())
+    # The endpoint gate only depends on the project not being published.  Do
+    # not let TestClient startup launch this deliberately incomplete v4 DAG
+    # against its real Codex runner while checking a read-only files request.
+    state = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    storage.update_meta(
+        settings.data_dir, cid,
+        postprocess={**state, "status": "failed", "error": "test_unpublished"},
+    )
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get(
+            f"/api/conversations/{cid}/files/postprocessed/01.png", headers=AUTH,
+        )
+    assert response.status_code == 404
+
+
 def test_v4_source_palette_contract_mismatch_blocks_first_seedream_post(
     tmp_path, monkeypatch,
 ):
@@ -1812,6 +2033,94 @@ def test_v4_runtime_uses_anchor_dag_before_pack_then_fanout_and_publish(
         )
 
 
+def test_v4_combined_canvas_receipt_binds_anchor_and_h3_sources(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, enable_mediakit_erase=True, retry_interval_s=0)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(_png(value=62))
+    _freeze_v4_image_optimization(settings, cid, _v4_frame_bound_plan())
+
+    async def erase(_settings, _cdir, source, output, _confirm, scenes):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(_png(value=101))
+        receipt = {
+            "version": 1, "state": "succeeded",
+            "source": {"sha256": hashlib.sha256(source.read_bytes()).hexdigest()},
+            "scenes": [scenes[0]],
+            "stages": [{"scene": scenes[0], "state": "succeeded"}],
+            "output": output.name,
+        }
+        path = output.parent / ".mediakit" / f"{output.name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        return output
+
+    posts = []
+
+    async def edit(_settings, images, _prompt, output, *, receipt_path):
+        posts.append(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(images[0])
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(postprocess.mediakit, "erase_image", erase)
+    monkeypatch.setattr(postprocess.seedream, "edit", edit)
+    asyncio.run(postprocess.start(
+        settings, cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": True, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+    runner = _V4LifecycleRunner()
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
+        audit_runner=runner, verification_runner=runner,
+    ))
+
+    latest = storage.load_meta(settings.data_dir, cid)
+    canvas = latest["_v4_canvas_execution"]
+    assert latest["postprocess"]["status"] == "done"
+    assert latest["_image_verification"]["canvas_execution_sha256"] == canvas["sha256"]
+    assert canvas["frames"][0]["canvas_sha256"] != hashlib.sha256(
+        (cdir / "work" / "keyframes" / "01.png").read_bytes()
+    ).hexdigest()
+    generated = postprocess.generation_keyframes(
+        cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
+    )
+    assert [path.name for path in generated] == ["01.png", "02.png"]
+    post_count = len(posts)
+    asyncio.run(postprocess.start(
+        settings, cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": True, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
+        audit_runner=runner, verification_runner=runner,
+    ))
+    assert len(posts) == post_count
+    (cdir / "work" / ".postprocess-private" / "scene-anchors" / "SCENE_01" / "global.json").unlink()
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        asyncio.run(postprocess.start(
+            settings, cid,
+            {"confirm": True, "options": {
+                "remove_subtitle": True, "remove_brand": False, "optimize_image": True,
+            }},
+            {},
+        ))
+    tampered = deepcopy(latest)
+    tampered["_v4_canvas_execution"]["frames"][0]["canvas_sha256"] = "0" * 64
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, tampered, sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )
+
+
 def test_v4_invalid_global_anchor_blocks_layout_pack_and_fanout(
     tmp_path, monkeypatch,
 ):
@@ -1874,11 +2183,26 @@ def test_v4_preflight_requires_real_scene_and_person_alternates_before_post(
         raise AssertionError("v4 preflight must run before every paid POST")
 
     monkeypatch.setattr(postprocess.seedream, "edit", forbidden_seedream)
-    # The schedule is now frozen with every mandatory alternate before runtime;
-    # a one-view person/scene graph cannot reach `start`, much less Seedream.
-    with pytest.raises(ValueError, match="anchor schedule"):
-        _freeze_v4_image_optimization(settings, cid, plan)
+    # Freezing records only observable source facts.  Choosing image
+    # optimization later must fail closed before POST rather than making a
+    # legal MediaKit-only one-frame project impossible to freeze.
+    _freeze_v4_image_optimization(settings, cid, plan)
+    asyncio.run(postprocess.start(
+        settings, cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+    runner = _V4LifecycleRunner()
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
+        audit_runner=runner, verification_runner=runner,
+    ))
+    assert runner.phases == ["plan_audit"]
     assert calls == []
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert latest["postprocess"]["error"] == "scene_anchor_alternate_unavailable"
 
 
 def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(

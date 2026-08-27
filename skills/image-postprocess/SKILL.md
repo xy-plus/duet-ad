@@ -7,7 +7,7 @@ description: 为视频项目冻结关键帧生成或验收 v4 人物与真实新
 
 ## 边界
 
-`work/request.json` 的 `phase` 只能是 `plan`、`plan_audit`、`verify` 或 `verify_pack`。新计划只输出 v4；已有 v3 receipt 保持 exact 只读兼容，更旧 receipt 不回写、不升级或降级：
+`work/request.json` 的 `phase` 只能是 `plan`、`plan_audit`、`verify` 或 `verify_pack`。新计划只输出 v4；已有 v3 receipt 保持 exact 只读兼容，更旧 receipt 不回写、不升级或降级。`plan` 请求若含 `segments[].transition_skeleton`，它是后端以冻结源帧、chain 与 join evidence 先行计算的唯一权威：每个 view 的 `transition_from_previous` 必须逐字复制对应 skeleton，禁止猜测、重写或用 `camera_motion` 放宽；缺失或矛盾时输出空计划：
 
 | phase | 只读 | 只写 |
 | --- | --- | --- |

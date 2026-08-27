@@ -194,6 +194,34 @@ def test_v4_startup_marks_ambiguous_typed_anchor_attempt_get_only(tmp_path, monk
     assert latest["postprocess"]["error"] == "submission_unknown"
 
 
+def test_v4_anchor_recovery_reads_only_frozen_typed_schedule_paths(tmp_path):
+    cdir = tmp_path / "session"
+    schedule = {
+        "nodes": [{
+            "scene_id": "SCENE_01", "label": "global",
+            "anchor": {"order": 1},
+        }],
+    }
+    private = {"scene_anchor_schedule": schedule}
+    post = {"segments": [{"revision": 1}]}
+    attempts = (
+        cdir / "work" / ".postprocess-private" / "scene-anchors" / "SCENE_01"
+        / "attempts"
+    )
+    attempts.mkdir(parents=True)
+    # A non-scheduled filename is not a recoverable provider attempt and may
+    # not make startup infer a second paid submission.
+    (attempts / "99-unrelated-r1.json").write_text(
+        json.dumps({"status": "submission_unknown"}), encoding="utf-8"
+    )
+    assert not postprocess._ambiguous_v4_anchor_attempts(cdir, private, post)
+
+    (attempts / "0001-global-r1.json").write_text(
+        json.dumps({"status": "submission_unknown"}), encoding="utf-8"
+    )
+    assert postprocess._ambiguous_v4_anchor_attempts(cdir, private, post)
+
+
 def test_palette_metric_uses_area_weighted_lab_b_star_and_allows_local_change(tmp_path):
     yellow = tmp_path / "yellow.png"
     blue = tmp_path / "blue.png"
