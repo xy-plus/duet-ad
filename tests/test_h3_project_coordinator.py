@@ -441,8 +441,21 @@ def test_short_project_freezes_skill_audio_contract_and_stitches_only_h3_audio(
     assert "lips remain completely closed" in body["prompt"]
     assert "overall_soundscape" in body["prompt"]
     source_prompt = context_gateway.posts[0]["content"][0]["text"]
-    assert body["prompt"] != source_prompt
-    assert body["prompt"].endswith("Context IR retained the exact speech contract.")
+    full_prompt_sections = (
+        "references:\n",
+        "source_visual_semantics:\n",
+        "speaking_sequence:\n",
+        "overall_soundscape:\n",
+        "constraints:\n",
+    )
+    assert all(section in source_prompt for section in full_prompt_sections)
+    assert "<d>[Chinese]我会准时回来。</d>" in source_prompt
+    effective_prompt = (
+        source_prompt + "\nContext IR retained the exact speech contract."
+    )
+    assert body["prompt"] == effective_prompt
+    assert all(section in body["prompt"] for section in full_prompt_sections)
+    assert "<d>[Chinese]我会准时回来。</d>" in body["prompt"]
     assert [item["kind"] for item in body["audios"]] == ["voice", "sound"]
     samples = _decode_audio(root / "generated.mp4")
     assert _tone(samples, 440) > 20 * _tone(samples, 220)
