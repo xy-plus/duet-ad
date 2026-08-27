@@ -539,6 +539,64 @@ def test_failed_lf_output_can_publish_receipt_without_rerunning_skill(
     ).hexdigest()
 
 
+def test_done_receipt_survives_current_skill_source_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, cid, root, skill_path, output = _failed_lf_prompt_fusion(
+        tmp_path, monkeypatch,
+    )
+    assert pipeline.finalize_prompt_fusion_receipt(
+        settings,
+        cid,
+        expected_raw_output_sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
+    ) == "done"
+    committed = storage.load_meta(settings.data_dir, cid)
+
+    skill_path.write_text("upgraded current prompt fusion", encoding="utf-8")
+
+    assert long_generation.load_bound_prompt_fusion_manifest(
+        root=root,
+        meta=committed,
+    ).final_prompts == (
+        "<VISUAL>fused</VISUAL>\n"
+        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>",
+    )
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_manifest_invalid",
+    ):
+        long_generation.load_prompt_fusion_manifest(
+            root=root,
+            skill_source_path=skill_path,
+        )
+
+
+def test_done_receipt_rejects_frozen_skill_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
+        tmp_path, monkeypatch,
+    )
+    assert pipeline.finalize_prompt_fusion_receipt(
+        settings,
+        cid,
+        expected_raw_output_sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
+    ) == "done"
+    committed = storage.load_meta(settings.data_dir, cid)
+    (root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME).write_bytes(
+        b"tampered frozen prompt fusion"
+    )
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_manifest_invalid",
+    ):
+        long_generation.load_bound_prompt_fusion_manifest(
+            root=root,
+            meta=committed,
+        )
+
+
 @pytest.mark.parametrize(
     "expected_raw_output_sha256",
     [None, "0" * 64],
@@ -634,6 +692,60 @@ def test_producer_failure_binds_raw_sha_and_rejects_schema_valid_replacement(
 
     with pytest.raises(pipeline.PipelineError, match="raw output drifted"):
         pipeline.finalize_prompt_fusion_receipt(settings, cid)
+    assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
+
+
+def test_new_producer_rejects_current_skill_source_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings(tmp_path)
+    created = storage.new_conversation(
+        settings.data_dir, "fusion-skill-drift", "source.mp4"
+    )
+    cid = created["id"]
+    root = settings.data_dir / cid
+    acceptance_sha256 = "a" * 64
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _image_user_acceptance={"version": 1, "sha256": acceptance_sha256},
+    )
+    skill_path = tmp_path / "video-prompt-fusion-SKILL.md"
+    skill_path.write_text("initial prompt fusion Skill", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "PROMPT_FUSION_SKILL_MD", skill_path)
+    monkeypatch.setattr(
+        long_generation, "PROMPT_FUSION_SKILL_SOURCE", skill_path
+    )
+    input_data = _fusion_input(root, 1)
+    assert pipeline.queue_prompt_fusion(
+        settings,
+        cid,
+        input_data=input_data,
+        image_acceptance_sha256=acceptance_sha256,
+    ) == "queued"
+
+    class Runner:
+        def run(self, cwd: Path, _prompt: str) -> None:
+            skill_path.write_text("drifted prompt fusion Skill", encoding="utf-8")
+            (cwd / "work" / "h3_prompt_plan.json").write_bytes(_canonical({
+                "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+                "version": long_generation.PROMPT_FUSION_VERSION,
+                "input_sha256": hashlib.sha256(input_data).hexdigest(),
+                "segments": [{
+                    "index": 1,
+                    "final_prompt": (
+                        "<VISUAL>valid</VISUAL>"
+                        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>"
+                    ),
+                }],
+            }))
+
+    assert pipeline.produce_prompt_fusion(settings, cid, Runner()) == "failed"
+    failed = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+    assert failed["error"] == "prompt fusion Skill drifted"
+    assert failed["raw_output_sha256"] == hashlib.sha256(
+        (root / "work" / "h3_prompt_plan.json").read_bytes()
+    ).hexdigest()
     assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
 
 
@@ -747,7 +859,7 @@ def test_receipt_finalization_cleans_exact_manifest_after_publish_failure(
 def test_exact_crash_residue_is_unreadable_until_receipt_finalization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings, cid, root, skill_path, output = _failed_lf_prompt_fusion(
+    settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
         tmp_path, monkeypatch,
     )
     expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
@@ -765,7 +877,6 @@ def test_exact_crash_residue_is_unreadable_until_receipt_finalization(
         long_generation.load_bound_prompt_fusion_manifest(
             root=root,
             meta=meta,
-            skill_source_path=skill_path,
         )
 
     assert pipeline.finalize_prompt_fusion_receipt(
@@ -777,7 +888,6 @@ def test_exact_crash_residue_is_unreadable_until_receipt_finalization(
     assert long_generation.load_bound_prompt_fusion_manifest(
         root=root,
         meta=committed,
-        skill_source_path=skill_path,
     ).final_prompts == (
         "<VISUAL>fused</VISUAL>\n"
         "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>",

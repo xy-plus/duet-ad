@@ -1742,7 +1742,6 @@ def queue_prompt_fusion(
                 long_generation.load_bound_prompt_fusion_manifest(
                     root=root,
                     meta=current,
-                    skill_source_path=PROMPT_FUSION_SKILL_MD,
                 )
                 return "done"
             except long_generation.LongGenerationError:
