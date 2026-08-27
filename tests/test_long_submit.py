@@ -255,18 +255,18 @@ def test_fast_mode_prepares_all_segments_then_submits_before_any_poll(
 
     def prepare(request):
         prepared.append(request)
-        return h3.H3Result("not_started", "attempt")
+        return h3.H3Result("not_started", f"{int(request.workdir.name):06d}")
 
     def submit(request):
         assert len(prepared) == len(plan.segments)
         submitted.append(request)
-        return h3.H3Result("h3_running", "attempt")
+        return h3.H3Result("h3_running", f"{int(request.workdir.name):06d}")
 
     def resume(request):
         assert len(submitted) == len(plan.segments)
         polled.append(request)
         request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
-        return h3.H3Result("succeeded", "attempt")
+        return h3.H3Result("succeeded", f"{int(request.workdir.name):06d}")
 
     monkeypatch.setattr(h3, "prepare", prepare)
     monkeypatch.setattr(h3, "submit", submit)
@@ -288,6 +288,9 @@ def test_fast_mode_prepares_all_segments_then_submits_before_any_poll(
     stored = storage.load_meta(settings.data_dir, cid)["generation"]
     assert stored["status"] == "succeeded"
     assert stored["fast_mode"] is True
+    assert [item["h3_attempt_id"] for item in stored["segments"]] == [
+        "000001", "000002", "000003",
+    ]
 
 
 def test_long_reference_request_uses_complete_postprocessed_segment_set(
@@ -1173,11 +1176,11 @@ def test_pre_marker_recovery_rejects_ambiguous_complete_fit_layouts(tmp_path):
     assert raised.value.code == "frame_fit_failed"
 
 
-def _small_video(path: Path, color: str = "black") -> None:
+def _small_video(path: Path, color: str = "black", duration_s: float = 1.0) -> None:
     subprocess.run(
         [
             "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
-            f"color=c={color}:s=32x32:r=5:d=1", "-an", "-c:v", "libx264",
+            f"color=c={color}:s=32x32:r=5:d={duration_s}", "-an", "-c:v", "libx264",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y", str(path),
         ],
         check=True,
@@ -1260,7 +1263,7 @@ def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkey
     monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
     def start(request):
         request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
-        return h3.H3Result("succeeded", "provider-task-secret")
+        return h3.H3Result("succeeded", "000007")
     monkeypatch.setattr(h3, "start", start)
     assert client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload(receipt)
@@ -1270,7 +1273,10 @@ def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkey
         "index": 1, "chain_id": "chain-001", "join_mode": "hard_cut",
         "status": "succeeded", "attempt": 1, "error": None,
     }]
-    assert "provider-task-secret" not in str(generation)
+    assert "000007" not in str(generation)
+    private_generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert private_generation["segments"][0]["attempt"] == 1
+    assert private_generation["segments"][0]["h3_attempt_id"] == "000007"
 
 
 def test_legacy_long_detail_and_submit_derive_fit_from_frozen_h3_anchors(
@@ -2585,6 +2591,200 @@ def test_stitch_input_uses_receipt_version_segment_duration(
 
     assert len(calls) == 1
     assert calls[0]["segments"][0].target_duration_s == expected_duration_s
+    assert calls[0]["segments"][0].source_start_s == plan.segments[0].start_s
+    assert calls[0]["segments"][0].source_end_s == plan.segments[0].end_s
+
+
+def test_freeze_plan_projects_local_dialogue_to_global_edl(tmp_path):
+    settings = make_settings(tmp_path)
+    cid, receipt = _make_long(
+        settings, joins=("hard_cut", "continue"), dialogue_text="冻结台词"
+    )
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+
+    assert [
+        (anchor.kind, anchor.source_start_s, anchor.source_end_s)
+        for segment in plan.segments
+        for anchor in segment.dialogue_anchors
+    ] == [
+        ("dialogue", 1.0, 2.0),
+        ("dialogue", 15.0, 16.0),
+    ]
+    assert all(
+        len(anchor.anchor_id) == 64
+        for segment in plan.segments
+        for anchor in segment.dialogue_anchors
+    )
+    assert len({
+        anchor.anchor_id
+        for segment in plan.segments
+        for anchor in segment.dialogue_anchors
+    }) == 2
+
+
+def test_long_stitch_forwards_provider_generated_audio_mode(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    cid, receipt = _make_long(settings)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+    calls = []
+    evidence = stitch.ProviderMediaEvidence(
+        source="h3",
+        attempt_id="000001",
+        receipt_path=tmp_path / "attempt.json",
+        receipt_sha256="0" * 64,
+        media_sha256="0" * 64,
+        media_size=1,
+        media_timeline={},
+    )
+    monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch(calls))
+    monkeypatch.setattr(
+        long_generation,
+        "bound_h3_media_evidence",
+        lambda *_args: {1: evidence},
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "stitched_output_is_reusable",
+        lambda *_args, **_kwargs: True,
+    )
+
+    long_generation._stitch(
+        settings,
+        cid,
+        plan,
+        "auto",
+        audio_mode="provider_generated",
+        generation={"segments": []},
+    )
+
+    assert calls[0]["audio_mode"] == "provider_generated"
+    assert all(segment.dialogue_anchors for segment in calls[0]["segments"])
+    assert calls[0]["segments"][0].provider_evidence is evidence
+
+
+def test_bound_h3_media_evidence_uses_only_persisted_exact_attempt(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    cid, receipt = _make_long(settings)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 4
+    )
+    generation["segments"][0].update(
+        status="succeeded",
+        attempt=4,
+        child_request_id="child-1",
+        h3_attempt_id="000017",
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        dialogue_mode="auto",
+        generation=generation,
+    )
+    receipt_path = (
+        plan.segments[0].workdir
+        / ".h3"
+        / "attempts"
+        / "000017"
+        / "attempt.json"
+    )
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text('{"attempt_id":"000017"}\n', encoding="utf-8")
+    plan.segments[0].workdir.joinpath("generated.mp4").write_bytes(b"media")
+    calls = []
+    timeline = {
+        "schema": "duet.h3.media_timeline",
+        "version": 1,
+        "decode_complete": True,
+        "video": {},
+        "audio": {},
+    }
+
+    def load_exact(request, attempt_id):
+        calls.append((request.client_request_id, attempt_id))
+        return timeline
+
+    monkeypatch.setattr(
+        h3, "load_media_timeline_receipt", load_exact, raising=False
+    )
+
+    evidence = long_generation.bound_h3_media_evidence(
+        settings, cid, plan, generation
+    )
+
+    assert calls == [("child-1", "000017")]
+    assert evidence[1].attempt_id == "000017"
+    assert evidence[1].receipt_path == receipt_path.resolve()
+    assert evidence[1].receipt_sha256 == hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    assert evidence[1].media_sha256 == hashlib.sha256(b"media").hexdigest()
+    assert evidence[1].media_size == len(b"media")
+    assert evidence[1].media_timeline == timeline
+
+
+def test_bound_h3_media_evidence_never_guesses_latest_attempt(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    cid, receipt = _make_long(settings)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    generation["segments"][0].update(
+        status="succeeded",
+        attempt=1,
+        child_request_id="child-1",
+        h3_attempt_id=None,
+    )
+    storage.update_meta(settings.data_dir, cid, fit_mode="none")
+    latest = plan.segments[0].workdir / ".h3" / "attempts" / "999999"
+    latest.mkdir(parents=True)
+    latest.joinpath("attempt.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        h3,
+        "load_media_timeline_receipt",
+        lambda *_args: pytest.fail("missing exact id must fail before receipt load"),
+        raising=False,
+    )
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="long_video_segment_output_invalid",
+    ):
+        long_generation.bound_h3_media_evidence(
+            settings, cid, plan, generation
+        )
 
 
 @pytest.mark.parametrize(
@@ -3292,7 +3492,7 @@ def test_stitched_output_reuse_validates_receipt_bytes_and_target_duration(
     segment_root.mkdir(parents=True)
     source = root / "source.mp4"
     segment_video = segment_root / "generated.mp4"
-    _small_video(source)
+    _small_video(source, duration_s=11.0)
     _small_video(segment_video, "blue")
     anchor = segment_root / "anchor.png"
     anchor.write_bytes(b"unused")
@@ -3346,7 +3546,7 @@ def test_stitched_output_reuse_validates_receipt_bytes_and_target_duration(
         (long_video.LEGACY_PLAN_RECEIPT_VERSION, 37.52 - 27.52),
     ],
 )
-def test_stitched_receipt_and_success_validation_use_receipt_version_duration(
+def test_v1_stitched_receipt_is_audit_only_even_when_duration_matches(
     tmp_path, monkeypatch, receipt_version, expected_duration_s,
 ):
     monkeypatch.setattr(
@@ -3428,11 +3628,8 @@ def test_stitched_receipt_and_success_validation_use_receipt_version_duration(
     )
     monkeypatch.setattr(stitch, "_validate_output", validate_output)
 
-    assert _REAL_STITCHED_OUTPUT_IS_REUSABLE(plan, "none") is True
-    assert observed == {
-        "budgets": [[expected_duration_s]],
-        "validation": [(expected_duration_s, "mute", False)],
-    }
+    assert _REAL_STITCHED_OUTPUT_IS_REUSABLE(plan, "none") is False
+    assert observed == {"budgets": [], "validation": []}
 
 
 @pytest.mark.parametrize("entrypoint", ["startup", "submit"])
