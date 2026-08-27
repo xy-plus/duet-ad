@@ -75,6 +75,156 @@ def _make_conv(settings, status="done", segments=False):
     return cid
 
 
+def _completed_v4_project(settings, monkeypatch):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    frames = sorted((cdir / "work" / "keyframes").glob("*.png"))
+    skeleton = [{
+        "segment_index": 0,
+        "frame_index": index,
+        "frame_name": frame.name,
+        "source_sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
+        "source_transition_from_previous": "start" if index == 1 else "same_camera",
+        "source_transition_evidence_sha256": ("a" if index == 1 else "b") * 64,
+    } for index, frame in enumerate(frames, 1)]
+    plan, prompts = image_optimization.generic_project_prompts(
+        [{
+            "index": 0,
+            "chain_id": "short-000",
+            "join_mode": "hard_cut",
+            "keyframes_dir": frames[0].parent,
+            "transition_skeleton": skeleton,
+        }],
+        settings.seedream_edit_mode,
+        session_dir=cdir,
+    )
+    execution = image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={"id": "dual-target", "revision": 4},
+        model=settings.seedream_model,
+        frame_inventory=skeleton,
+    )
+    frozen = image_optimization.freeze_frame_prompts(
+        settings, execution, prompts, plan=plan,
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        **image_optimization.freeze_continuity(plan, frame_counts={0: len(frames)}),
+        **frozen,
+    )
+
+    async def edit(_settings, images, _prompt, output, *, receipt_path):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(images[0])
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(postprocess.seedream, "edit", edit)
+    asyncio.run(postprocess.start(
+        settings,
+        cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False,
+            "remove_brand": False,
+            "optimize_image": True,
+        }},
+        {},
+    ))
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
+    ))
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert latest["postprocess"]["status"] == "done"
+    return cid, cdir, frames
+
+
+def test_v4_manual_acceptance_receipt_enables_h3_without_image_verification(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid, cdir, originals = _completed_v4_project(settings, monkeypatch)
+    meta = storage.load_meta(settings.data_dir, cid)
+    before = postprocess.image_acceptance_status(settings, cid, meta)
+    assert before == {
+        "required": True,
+        "accepted": False,
+        "expected_meta_sha256": before["expected_meta_sha256"],
+    }
+    assert len(before["expected_meta_sha256"]) == 64
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(cdir, meta, originals, settings=settings)
+
+    accepted = postprocess.accept_images(settings, cid, {
+        "confirm": True,
+        "expected_meta_sha256": before["expected_meta_sha256"],
+    })
+
+    assert accepted["required"] is True and accepted["accepted"] is True
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert "_image_verification" not in latest
+    assert postprocess.generation_keyframes(
+        cdir, latest, originals, settings=settings,
+    ) == sorted((cdir / "work" / "postprocessed").glob("*.png"))
+
+
+def test_v4_manual_acceptance_rejects_stale_cas_and_generation_start(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid, _cdir, _originals = _completed_v4_project(settings, monkeypatch)
+    initial = storage.load_meta(settings.data_dir, cid)
+    stale = postprocess.image_acceptance_status(settings, cid, initial)[
+        "expected_meta_sha256"
+    ]
+    storage.update_meta(settings.data_dir, cid, note="changed after review")
+    with pytest.raises(postprocess.PostprocessError, match="image_acceptance_meta_changed"):
+        postprocess.accept_images(settings, cid, {
+            "confirm": True, "expected_meta_sha256": stale,
+        })
+    current = storage.load_meta(settings.data_dir, cid)
+    expected = postprocess.image_acceptance_status(settings, cid, current)[
+        "expected_meta_sha256"
+    ]
+    storage.update_meta(settings.data_dir, cid, generation={"status": "queued"})
+    with pytest.raises(postprocess.PostprocessError, match="generation_in_progress"):
+        postprocess.accept_images(settings, cid, {
+            "confirm": True, "expected_meta_sha256": expected,
+        })
+
+
+@pytest.mark.parametrize("drift", ["raw", "output", "anchor_receipt", "cid"])
+def test_v4_manual_acceptance_is_revoked_by_any_bound_byte_drift(
+    tmp_path, monkeypatch, drift,
+):
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid, cdir, originals = _completed_v4_project(settings, monkeypatch)
+    meta = storage.load_meta(settings.data_dir, cid)
+    status = postprocess.image_acceptance_status(settings, cid, meta)
+    postprocess.accept_images(settings, cid, {
+        "confirm": True,
+        "expected_meta_sha256": status["expected_meta_sha256"],
+    })
+    if drift == "raw":
+        originals[0].write_bytes(originals[0].read_bytes() + b"drift")
+    elif drift == "output":
+        output = cdir / "work" / "postprocessed" / originals[0].name
+        output.write_bytes(output.read_bytes() + b"drift")
+    elif drift == "anchor_receipt":
+        receipt = next((
+            cdir / "work" / ".postprocess-private" / "scene-anchors"
+        ).glob("SCENE_*/*.json"))
+        receipt.write_text("{}", encoding="utf-8")
+    latest = storage.load_meta(settings.data_dir, cid)
+    if drift == "cid":
+        latest["id"] = "0" * 32
+    assert postprocess.image_acceptance_status(settings, cid, latest)["accepted"] is False
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(cdir, latest, originals, settings=settings)
+
+
 def test_v4_generation_keyframes_require_an_intact_verified_output_receipt(
     tmp_path, monkeypatch,
 ):
