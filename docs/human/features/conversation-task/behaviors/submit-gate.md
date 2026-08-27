@@ -72,6 +72,7 @@ links: [conversation-task, processing-state, long-video, postprocess]
 - `video-maker` 第一次调用冻结 segments、每段 9 张原始关键帧、原始视频提示词、动作/镜头/时间和它已经能证明的结构化事实。
 - `image-postprocess` 已冻结，不再迭代；它只把每段 9 张原始关键帧变成 9 张优化关键帧，不做素材准入。
 - 用户确认后的 9 张优化图按 segment 和帧序进入统一 frozen receipt；随后 `video-prompt-fusion` 以有序新关键帧、旧视频提示词、图片优化提示词和音频内容为唯一四类输入生成最终视频提示词。
+- 第一次生成确认只冻结四类输入并项目级调用一次 `video-prompt-fusion`；完成后返回可刷新状态，Web 不自动重提。相同设置由用户再次明确确认后，才允许进入 Context IR 和 H3。
 - Context IR 与 H3 只能消费 `video-prompt-fusion` 输出及其绑定的四类输入；禁止旧视觉 prompt 直接覆盖新人物、新场景或新对象。
 
 ## 付费与恢复边界
