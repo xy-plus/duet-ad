@@ -26,8 +26,10 @@ from app import (
     pipeline,
     postprocess,
     prepared_input,
+    stitch,
     storage,
 )
+from app import main as main_module
 from app.codex_runner import CodexRunner
 from app.main import create_app
 
@@ -55,7 +57,7 @@ def enabled(tmp_path):
 
 def _make_conv(
     settings, status="done", segments=False, frame_count=2,
-    segment_frame_count=None,
+    segment_frame_count=None, segment_total=2,
 ):
     """造会话：单段 = work/keyframes + work/prompt.txt；多段 = meta.segments + 段目录产物。"""
     meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
@@ -66,14 +68,18 @@ def _make_conv(
             (segment_frame_count, segment_frame_count)
             if segment_frame_count is not None else (1, 2)
         )
-        segs = [
-            {"index": 1, "start_s": 0.0, "end_s": 8.0,
-             "keyframes": [f"{i:02d}.png" for i in range(1, counts[0] + 1)],
-             "prompt": "段一提示词", "lines": ["台词。"]},
-            {"index": 2, "start_s": 8.0, "end_s": 16.0,
-             "keyframes": [f"{i:02d}.png" for i in range(1, counts[1] + 1)],
-             "prompt": "段二提示词", "lines": []},
-        ]
+        if segment_total not in {1, 2}:
+            raise ValueError("test segment_total must be 1 or 2")
+        segs = [{
+            "index": index,
+            "start_s": 8.0 * (index - 1),
+            "end_s": 8.0 * index,
+            "keyframes": [
+                f"{i:02d}.png" for i in range(1, counts[index - 1] + 1)
+            ],
+            "prompt": f"段{index}提示词",
+            "lines": ["台词。"] if index == 1 else [],
+        } for index in range(1, segment_total + 1)]
         meta["segments"] = segs
         for seg in segs:
             segdir = cdir / "work" / "segments" / str(seg["index"])
@@ -100,6 +106,7 @@ def _make_conv(
 
 def _completed_v4_project(
     settings, monkeypatch, *, frame_count=2, segments=False,
+    postprocess_options=None, segment_total=2,
 ):
     monkeypatch.setenv("ARK_API_KEY", "test-key")
     cid = _make_conv(
@@ -107,6 +114,7 @@ def _completed_v4_project(
         segments=segments,
         frame_count=frame_count,
         segment_frame_count=frame_count if segments else None,
+        segment_total=segment_total,
     )
     cdir = settings.data_dir / cid
     grouped_frames = (
@@ -114,7 +122,7 @@ def _completed_v4_project(
             index: sorted(
                 (cdir / "work" / "segments" / str(index) / "work" / "keyframes").glob("*.png")
             )
-            for index in (1, 2)
+            for index in range(1, segment_total + 1)
         }
         if segments else {
             0: sorted((cdir / "work" / "keyframes").glob("*.png"))
@@ -189,14 +197,19 @@ def _completed_v4_project(
         receipt_path.write_text("{}", encoding="utf-8")
 
     monkeypatch.setattr(postprocess.seedream, "edit", edit)
+    options = postprocess_options or {
+        "remove_subtitle": False,
+        "remove_brand": False,
+        "optimize_image": True,
+    }
+    if options.get("remove_subtitle") or options.get("remove_brand"):
+        monkeypatch.setattr(
+            postprocess.mediakit, "erase_image", FakeEdit(receipts=True)
+        )
     asyncio.run(postprocess.start(
         settings,
         cid,
-        {"confirm": True, "options": {
-            "remove_subtitle": False,
-            "remove_brand": False,
-            "optimize_image": True,
-        }},
+        {"confirm": True, "options": options},
         {},
     ))
     asyncio.run(postprocess.run_task(
@@ -236,13 +249,21 @@ def test_v4_manual_acceptance_receipt_enables_h3_without_image_verification(
     ) == sorted((cdir / "work" / "postprocessed").glob("*.png"))
 
 
-@pytest.mark.parametrize("segment_count", [1, 2])
-def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
-    tmp_path, monkeypatch, segment_count,
+def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+    tmp_path, monkeypatch, segment_count, *, postprocess_options=None,
+    frozen_single_segment=False, forbid_legacy_short=False,
+    complete_generation=False,
 ):
     settings = make_settings(
         tmp_path,
         retry_interval_s=0,
+        enable_mediakit_erase=bool(
+            postprocess_options
+            and (
+                postprocess_options.get("remove_subtitle")
+                or postprocess_options.get("remove_brand")
+            )
+        ),
         enable_h3_submit=True,
         autodl_art_token="art",
         minimax_api_key="minimax",
@@ -252,7 +273,9 @@ def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
         settings,
         monkeypatch,
         frame_count=9,
-        segments=segment_count == 2,
+        segments=segment_count == 2 or frozen_single_segment,
+        postprocess_options=postprocess_options,
+        segment_total=segment_count,
     )
     (cdir / "source.mp4").write_bytes(b"source-video")
     old_visual_prompt = "九张已验收图片中的人物保持静默，歌声来自画外。"
@@ -290,10 +313,11 @@ def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
         }],
     )
     expected_receipt = None
-    if segment_count == 2:
+    has_frozen_segment_plan = segment_count == 2 or frozen_single_segment
+    if has_frozen_segment_plan:
         public_segments = []
         receipt_segments = []
-        for index in (1, 2):
+        for index in range(1, segment_count + 1):
             start_s = 14.0 * (index - 1)
             end_s = 14.0 * index
             segdir = cdir / "work" / "segments" / str(index)
@@ -358,13 +382,13 @@ def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
         receipt_path = long_video.write_plan_receipt(
             cdir,
             source=cdir / "source.mp4",
-            duration_s=28.0,
+            duration_s=14.0 * segment_count,
             segments=receipt_segments,
             workflow=h3.H3_WORKFLOW,
         )
         expected_receipt = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
         common_changes.update(
-            duration_s=28.0,
+            duration_s=14.0 * segment_count,
             segments=public_segments,
             long_video_plan_receipt=receipt_path.name,
             voice_line_provenance=[],
@@ -372,10 +396,11 @@ def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
     storage.update_meta(settings.data_dir, cid, **common_changes)
     current = storage.load_meta(settings.data_dir, cid)
     acceptance = postprocess.image_acceptance_status(settings, cid, current)
-    postprocess.accept_images(settings, cid, {
-        "confirm": True,
-        "expected_meta_sha256": acceptance["expected_meta_sha256"],
-    })
+    if acceptance["required"]:
+        postprocess.accept_images(settings, cid, {
+            "confirm": True,
+            "expected_meta_sha256": acceptance["expected_meta_sha256"],
+        })
 
     skill_file = tmp_path / "video-prompt-fusion-SKILL.md"
     skill_file.write_text("strict video prompt fusion", encoding="utf-8")
@@ -384,30 +409,36 @@ def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
         long_generation, "PROMPT_FUSION_SKILL_SOURCE", skill_file
     )
     fusion_calls = []
+    fusion_prompts = []
 
     def skill(self, scope, _prompt):
         fusion_calls.append(scope)
         input_data = (scope / "work" / "multimodal_input.json").read_bytes()
         input_payload = json.loads(input_data.decode("utf-8"))
+        output_segments = []
+        for segment in input_payload["segments"]:
+            final_prompt = (
+                "只使用九张已验收优化图片中的人物、场景与对象。\n"
+                f"<AUDIO_CONTENT_JSON>{segment['audio_content']['lines_json']}"
+                "</AUDIO_CONTENT_JSON>"
+            )
+            fusion_prompts.append(final_prompt)
+            output_segments.append({
+                "index": segment["index"], "final_prompt": final_prompt,
+            })
         plan = {
             "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
             "version": long_generation.PROMPT_FUSION_VERSION,
             "input_sha256": hashlib.sha256(input_data).hexdigest(),
-            "segments": [{
-                "index": segment["index"],
-                "final_prompt": (
-                    "只使用九张已验收优化图片中的人物、场景与对象。\n"
-                    f"<AUDIO_CONTENT_JSON>{segment['audio_content']['lines_json']}"
-                    "</AUDIO_CONTENT_JSON>"
-                ),
-            } for segment in input_payload["segments"]],
+            "segments": output_segments,
         }
         (scope / "work" / "h3_prompt_plan.json").write_text(
             json.dumps(plan, ensure_ascii=False), encoding="utf-8"
         )
 
     monkeypatch.setattr(CodexRunner, "run", skill)
-    context_tasks = {}
+    context_sources = []
+    context_effective = {}
 
     def context_gateway(request):
         if request.method == "POST" and request.url.path == "/v1/files/upload":
@@ -417,15 +448,19 @@ def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
             })
         if request.method == "POST" and request.url.path == "/v2/h3_context_ir":
             body = json.loads(request.content)
-            context_tasks["task"] = body["content"][0]["text"]
-            return httpx.Response(200, json={"task_id": "context-task-1"})
+            source_prompt = body["content"][0]["text"]
+            context_sources.append(source_prompt)
+            task_id = f"context-task-{len(context_sources)}"
+            context_effective[task_id] = f"EFFECTIVE::{source_prompt}"
+            return httpx.Response(200, json={"task_id": task_id})
         if request.method == "GET":
+            task_id = request.url.path.rsplit("/", 1)[-1]
             return httpx.Response(200, json={"task": {
-                "id": "context-task-1",
+                "id": task_id,
                 "task_type": "h3_context_ir",
                 "status": "succeeded",
                 "modality": "text",
-                "content": {"prompt": context_tasks["task"]},
+                "content": {"prompt": context_effective[task_id]},
             }})
         raise AssertionError(request.url)
 
@@ -439,12 +474,69 @@ def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
 
     monkeypatch.setattr(context_ir_bridge, "optimize_h3_prompt", optimize)
     h3_requests = []
-    monkeypatch.setattr(
-        h3,
-        "start",
-        lambda request: h3_requests.append(request)
-        or h3.H3Result("failed", "000001", error_code="stubbed"),
-    )
+    stitch_calls = []
+    reuse_calls = []
+    attempts = {}
+    if complete_generation:
+        def start_h3(request):
+            h3_requests.append(request)
+            attempt_id = f"{len(h3_requests):06d}"
+            attempts[request.client_request_id] = attempt_id
+            subprocess.run([
+                "/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=16x16:r=24",
+                "-t", "0.2", "-pix_fmt", "yuv420p", "-y",
+                str(request.workdir / "generated.mp4"),
+            ], check=True)
+            return h3.H3Result("succeeded", attempt_id)
+
+        monkeypatch.setattr(h3, "start", start_h3)
+        monkeypatch.setattr(h3, "output_is_reusable", lambda *_a, **_k: True)
+        monkeypatch.setattr(
+            h3,
+            "inspect",
+            lambda request: h3.H3Result(
+                "succeeded", attempts[request.client_request_id]
+            ),
+        )
+        monkeypatch.setattr(
+            h3,
+            "load_media_timeline_receipt",
+            lambda _request, attempt_id: {
+                "attempt_id": attempt_id,
+                "audio": {"mode": "provider_generated"},
+            },
+        )
+
+        def fake_stitch(**kwargs):
+            stitch_calls.append(kwargs)
+            kwargs["output"].write_bytes(b"provider-generated-stitch")
+
+        monkeypatch.setattr(stitch, "stitch_video", fake_stitch)
+
+        def reusable(plan, dialogue_mode, *, generation=None,
+                     provider_media=None):
+            reuse_calls.append((plan, dialogue_mode, generation, provider_media))
+            return True
+
+        monkeypatch.setattr(
+            long_generation, "stitched_output_is_reusable", reusable
+        )
+    else:
+        monkeypatch.setattr(
+            h3,
+            "start",
+            lambda request: h3_requests.append(request)
+            or h3.H3Result("failed", "000001", error_code="stubbed"),
+        )
+    if forbid_legacy_short:
+        monkeypatch.setattr(
+            main_module,
+            "_freeze_submission",
+            lambda *_args, **_kwargs: pytest.fail(
+                "current v4 segment project reached legacy short freeze"
+            ),
+        )
     payload = {
         "confirm": True,
         "client_request_id": "short-off-screen-123",
@@ -472,14 +564,14 @@ def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
         normalized = storage.load_meta(settings.data_dir, cid)
         assert postprocess.image_acceptance_status(
             settings, cid, normalized
-        )["accepted"] is True
+        )["accepted"] is acceptance["required"]
         assert postprocess.generation_keyframes(
             cdir, normalized, originals, settings=settings,
         ) == (
             sorted((cdir / "work" / "postprocessed").glob("*.png"))
-            if segment_count == 1 else [
+            if not has_frozen_segment_plan else [
                 path
-                for index in (1, 2)
+                for index in range(1, segment_count + 1)
                 for path in sorted((
                     cdir / "work" / "segments" / str(index)
                     / "work" / "postprocessed"
@@ -498,20 +590,104 @@ def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
 
     assert second.status_code == 202, second.json()
     assert fusion_calls == [cdir]
-    assert len(h3_requests) == 1
+    assert len(h3_requests) == (segment_count if complete_generation else 1)
     request = h3_requests[0]
+    assert context_sources == fusion_prompts[:len(context_sources)]
+    assert request.prompt == f"EFFECTIVE::{fusion_prompts[0]}"
+    assert "<AUDIO_CONTENT_JSON>" in request.prompt
+    assert "[AUDIO_CONTENT_JSON]" not in request.prompt
     assert request.on_screen_dialogue == ()
     assert len(request.keyframes) == 9
     assert len(request.reference_audios) == 1
     assert request.reference_audios[0].data == (
         cdir / "work" / (
-            "voice.mp3" if segment_count == 1 else "segments/1/work/voice.mp3"
+            "voice.mp3"
+            if not has_frozen_segment_plan else "segments/1/work/voice.mp3"
         )
     ).read_bytes()
     assert len(json.loads(
         (cdir / "work" / "multimodal_input.json").read_text(encoding="utf-8")
     )["segments"]) == segment_count
-    assert old_visual_prompt not in context_tasks.get("task", "")
+    assert all(old_visual_prompt not in prompt for prompt in context_sources)
+    if complete_generation:
+        assert [request.prompt for request in h3_requests] == [
+            f"EFFECTIVE::{prompt}" for prompt in fusion_prompts
+        ]
+        assert len(stitch_calls) == 1
+        assert stitch_calls[0]["audio_mode"] == "provider_generated"
+        assert len(reuse_calls) == 1
+        assert reuse_calls[0][1] == "auto"
+        assert set(reuse_calls[0][3]) == set(range(1, segment_count + 1))
+        completed = storage.load_meta(settings.data_dir, cid)
+        assert completed["generation"]["status"] == "succeeded"
+    for index in range(1, segment_count + 1):
+        segment_work = cdir / "work" / "segments" / str(index) / "work"
+        assert not (segment_work / "multimodal_input.json").exists()
+        assert not (segment_work / "h3_prompt_plan.json").exists()
+        assert not (segment_work / "h3_multimodal_source.json").exists()
+    if segment_count == 1 and postprocess_options is None:
+        frozen_meta = storage.load_meta(settings.data_dir, cid)
+        frozen_meta.pop("_prompt_fusion", None)
+        fusion_output = cdir / "work" / "h3_prompt_plan.json"
+        fusion_output.write_bytes(fusion_output.read_bytes() + b"\n")
+        with pytest.raises(
+            long_generation.LongGenerationError,
+            match="prompt_fusion_manifest_invalid",
+        ):
+            long_generation.freeze_plan(
+                cdir,
+                frozen_meta,
+                long_generation.plan_receipt(cdir, frozen_meta),
+                "none",
+                "auto",
+                dialogue_delivery="off_screen",
+                aspect_ratio="9:16",
+                resolution="768p",
+                prepare_fit=False,
+                settings=settings,
+            )
+
+
+@pytest.mark.parametrize("segment_count", [1, 2])
+def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
+    tmp_path, monkeypatch, segment_count,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path, monkeypatch, segment_count,
+    )
+
+
+def test_n2_off_screen_fusion_completes_context_h3_and_native_stitch(
+    tmp_path, monkeypatch,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path, monkeypatch, 2, complete_generation=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "postprocess_options",
+    [
+        {"remove_subtitle": True, "remove_brand": False,
+         "optimize_image": False},
+        {"remove_subtitle": False, "remove_brand": True,
+         "optimize_image": False},
+        {"remove_subtitle": True, "remove_brand": True,
+         "optimize_image": False},
+    ],
+    ids=("subtitle-only", "logo-only", "subtitle-then-logo"),
+)
+def test_n1_mediakit_only_v4_uses_unified_fusion_not_legacy_short(
+    tmp_path, monkeypatch, postprocess_options,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path,
+        monkeypatch,
+        1,
+        postprocess_options=postprocess_options,
+        frozen_single_segment=True,
+        forbid_legacy_short=True,
+    )
 
 
 def test_v4_manual_acceptance_rejects_stale_cas_and_generation_start(
@@ -764,9 +940,10 @@ def test_palette_metric_uses_area_weighted_lab_b_star_and_allows_local_change(tm
 class FakeEdit:
     """桩 mediakit.erase_image：记录场景并写 out；按 fail 名单抛 MediaKitError。"""
 
-    def __init__(self, fail=()):
+    def __init__(self, fail=(), *, receipts=False):
         self.calls = []
         self.fail = list(fail)
+        self.receipts = receipts
 
     async def __call__(self, settings, cdir, image, out, confirm, scenes):
         self.calls.append({
@@ -776,6 +953,22 @@ class FakeEdit:
             raise mediakit.MediaKitError(502, "stub failure")
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(PNG + b"edited")
+        if self.receipts:
+            receipt = out.parent / ".mediakit" / f"{out.name}.json"
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            receipt.write_text(json.dumps({
+                "version": mediakit.RECEIPT_VERSION,
+                "state": "succeeded",
+                "output": out.name,
+                "scenes": list(scenes),
+                "source": {
+                    "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+                },
+                "stages": [
+                    {"scene": scene, "state": "succeeded"}
+                    for scene in scenes
+                ],
+            }), encoding="utf-8")
         return out
 
 

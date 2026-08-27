@@ -1826,10 +1826,9 @@ def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
         frozen = long_generation.load_prompt_fusion(
             input_path=input_path, output_path=output_path, root=root,
         )
-        acceptance = meta.get("_image_user_acceptance")
         if (
-            not isinstance(acceptance, dict)
-            or acceptance.get("sha256") != state.get("image_acceptance_sha256")
+            long_generation.prompt_fusion_image_authority_sha256(meta)
+            != state.get("image_acceptance_sha256")
         ):
             raise PipelineError("image acceptance drifted during prompt fusion")
         manifest = {

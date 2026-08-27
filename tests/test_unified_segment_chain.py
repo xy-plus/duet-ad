@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from app import long_generation, main, pipeline, storage
+from app import h3_project, long_generation, long_video, main, pipeline, storage
 from conftest import make_settings
 
 
@@ -271,3 +271,97 @@ def test_frozen_current_v4_projects_publish_a_stable_n1_fusion_shape(
             "error": None,
         }],
     }
+
+
+def test_validation_fingerprint_binds_immutable_fusion_artifact_bytes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ("a" * 32)
+    work = root / "work"
+    work.mkdir(parents=True)
+    input_data = b'{"input":"frozen"}\n'
+    output_data = b'{"output":"fused"}\n'
+    input_path = work / h3_project.SKILL_INPUT_FILENAME
+    output_path = work / "h3_prompt_plan.json"
+    input_path.write_bytes(input_data)
+    output_path.write_bytes(output_data)
+    manifest = {
+        "input": {
+            "path": f"work/{h3_project.SKILL_INPUT_FILENAME}",
+            "sha256": hashlib.sha256(input_data).hexdigest(),
+        },
+        "output": {
+            "path": "work/h3_prompt_plan.json",
+            "sha256": hashlib.sha256(output_data).hexdigest(),
+        },
+    }
+    manifest_data = _canonical(manifest)
+    manifest_path = work / h3_project.SOURCE_FILENAME
+    manifest_path.write_bytes(manifest_data)
+    plan = {
+        "schema": "duet.long-video-plan",
+        "version": long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
+        "prompt_fusion": {
+            "path": f"work/{h3_project.SOURCE_FILENAME}",
+            "sha256": hashlib.sha256(manifest_data).hexdigest(),
+        },
+        "segments": [],
+    }
+    (root / long_video.PLAN_RECEIPT_FILENAME).write_bytes(_canonical(plan))
+    meta = {
+        "id": root.name,
+        "duration_s": 28.0,
+        "segments": [{"index": 1}],
+        "long_video_plan_receipt": long_video.PLAN_RECEIPT_FILENAME,
+        "_prompt_fusion": {"status": "done"},
+    }
+
+    paths = main._long_validation_paths(root, meta)
+    assert {manifest_path, input_path, output_path} <= paths
+    before_entries = main._prompt_fusion_fingerprint_entries(root, meta)
+    before = main._generated_video_validation_fingerprint(root, meta)
+    del meta["_prompt_fusion"]
+    assert main._prompt_fusion_fingerprint_entries(root, meta) == before_entries
+    assert main._generated_video_validation_fingerprint(root, meta) == before
+
+    output_path.write_bytes(b'{"output":"DRIFT"}\n')
+
+    after_entries = main._prompt_fusion_fingerprint_entries(root, meta)
+    after = main._generated_video_validation_fingerprint(root, meta)
+    assert after_entries != before_entries
+    assert after != before
+
+
+@pytest.mark.parametrize("dialogue_mode", ["auto", "none"])
+def test_legacy_v2_plan_does_not_bootstrap_prompt_fusion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dialogue_mode: str,
+) -> None:
+    root = tmp_path / ("b" * 32)
+    root.mkdir()
+    receipt_data = _canonical({
+        "schema": "duet.long-video-plan",
+        "version": long_video.PLAN_RECEIPT_VERSION,
+        "workflow": "legacy-read-only",
+    })
+    (root / long_video.PLAN_RECEIPT_FILENAME).write_bytes(receipt_data)
+    monkeypatch.setattr(
+        pipeline,
+        "queue_prompt_fusion",
+        lambda *_args, **_kwargs: pytest.fail(
+            "legacy v2 may not enter current prompt fusion"
+        ),
+    )
+
+    assert long_generation.finalize_multimodal_plan(
+        root,
+        {
+            "id": root.name,
+            "long_video_plan_receipt": long_video.PLAN_RECEIPT_FILENAME,
+        },
+        hashlib.sha256(receipt_data).hexdigest(),
+        "none",
+        dialogue_mode,
+        aspect_ratio="9:16",
+        resolution="768p",
+        settings=make_settings(tmp_path),
+    ) is None
