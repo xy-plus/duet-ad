@@ -86,6 +86,126 @@ def test_audio_phase_preserves_visual_facts_and_does_not_reselect_frames():
     assert "不得复制或补造台词文本、时间窗、语言或声音事件" in text
 
 
+def test_reconcile_is_a_third_isolated_phase_without_dialogue_or_frame_reselection():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "reconcile_after_image_optimization_input.json",
+        '"phase": "reconcile_after_image_optimization"',
+        "unified_visual_ir.json",
+        "第三阶段",
+        "existing dialogue 不得进入本阶段",
+        "不得重新选择、增删或重排关键帧",
+        "不得读取音频",
+    ):
+        assert required in text
+
+
+def test_reconcile_has_explicit_dynamic_and_static_authorities():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "原始源帧像素与 PTS 是动作、机位和时序的事实权威",
+        "旧视觉提示词仅是动作、机位和时序的低优先级检索证据",
+        "冲突时以原始源帧像素与 PTS 为准",
+        "canonical 图片计划是新人物和新场景的语义权威",
+        "已选优化图及其输出 receipt 是该计划已实现结果的权威",
+        "优化图不得反向改写动作、机位、时序或物理关系",
+        "旧人物、旧服装、旧场景、旧材质和旧静态外观只作负证据",
+        "不得复制 canonical 计划中的目标描述",
+    ):
+        assert required in text
+
+
+def test_reconcile_emits_exact_unified_visual_ir_with_receipt_bindings():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "所有字段必填，禁止额外字段",
+        "source_evidence_binding",
+        "target_static_plan_binding",
+        "frame_bindings",
+        "preserved_beats",
+        "conflicts",
+        "old_visual_prompt_sha256",
+        "image_plan_sha256",
+        "image_verification_sha256",
+        "output_receipt_file",
+        "output_receipt_sha256",
+        "action: { initial_state: NonEmpty; motion: NonEmpty; result_state: NonEmpty }",
+        "camera: { shot_scale: NonEmpty; angle: NonEmpty; movement: NonEmpty; composition: NonEmpty; focus: NonEmpty }",
+        "timing: { start_source_pts: Integer; end_source_pts: Integer; source_time_base: NonEmpty; pace: NonEmpty; transition: NonEmpty }",
+        '"eligible": true',
+        '"reason": null',
+        '"conflicts": []',
+    ):
+        assert required in text
+
+
+def test_reconcile_fails_closed_instead_of_legalizing_bad_optimized_images():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "frame_mapping_missing",
+        "optimized_action_changed",
+        "physical_support_unclosed",
+        "source_static_semantics_leaked",
+        "phase_input_conflict",
+        "unexpected_dialogue_input",
+        "receipt_binding_mismatch",
+        "reconciliation_unknown",
+        "ReconcileErrorCode =",
+        "任一源帧、PTS、优化图或输出 receipt 映射缺失",
+        "优化图改变姿态、动作状态、接触、遮挡或因果结果",
+        "新场景不能闭合原动作依赖的支撑、接触或可达关系",
+        "不得改写动态事实去迎合错误优化图",
+        "eligible plan 的 conflicts 必须为空",
+        "失败结构",
+    ):
+        assert required in text
+
+
+def test_reconcile_ir_does_not_duplicate_static_target_or_final_prompt_text():
+    text = SKILL.read_text(encoding="utf-8")
+    reconcile = text.split("## 4. 优化后语义协调阶段", maxsplit=1)[1]
+
+    for required in (
+        "禁止二次自由文本真源",
+        "人物、服装、场景、材质与光色只通过 target_static_plan_binding",
+        "只描述动态事实",
+    ):
+        assert required in reconcile
+    for forbidden in (
+        "visual_prompt:",
+        "replacement_identity:",
+        "replacement_scene:",
+        "final_prompt:",
+        "dialogue:",
+    ):
+        assert forbidden not in reconcile
+
+
+def test_reconcile_preserves_exact_source_pts_and_has_no_circular_output_receipt():
+    text = SKILL.read_text(encoding="utf-8")
+    reconcile = text.split("## 4. 优化后语义协调阶段", maxsplit=1)[1]
+
+    for required in (
+        "source_pts: Integer",
+        "source_time_base: NonEmpty",
+        "起止 PTS 必须逐字取自首尾 frame_refs",
+        "image verification receipt 绑定完整且有序的 output receipt SHA 集合",
+        "output receipt 只绑定 image plan、源帧和优化图",
+    ):
+        assert required in reconcile
+    for lossy_or_circular in (
+        "source_pts_ms",
+        "start_pts_ms",
+        "end_pts_ms",
+        "output receipt 逐字绑定同一 `image_verification_sha256`",
+    ):
+        assert lossy_or_circular not in reconcile
+
+
 def test_static_schema_matches_h3_multimodal_adapter_items():
     text = SKILL.read_text(encoding="utf-8")
 

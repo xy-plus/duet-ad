@@ -1,6 +1,6 @@
 ---
 name: video-maker
-description: 从预先抽取的参考视频帧理解叙事、选择最多 9 张有序关键帧并生成纯视觉叙事；当后端另行提供冻结的多模态输入时，只规划 H3 所需的人物、图片、现有台词行、语言、画内或画外发声、声线参考、环境声和音效绑定。用于视频分析的视觉阶段或 H3 音画联合生成前的音画阶段；不提交视频、不调用供应商。
+description: 从预先抽取的参考视频帧理解叙事、选择最多 9 张有序关键帧并生成纯视觉叙事；图片优化完成后，把原始动态事实与 receipt 绑定的新人物、新场景协调成统一视觉 IR；当后端另行提供冻结的多模态输入时，只规划 H3 所需的人物、图片、现有台词行、语言、画内或画外发声、声线参考、环境声和音效绑定。用于视频分析、图片优化后的视觉协调或 H3 音画联合生成前的音画阶段；不提交视频、不调用供应商。
 ---
 
 # video-maker
@@ -9,10 +9,12 @@ description: 从预先抽取的参考视频帧理解叙事、选择最多 9 张�
 
 只按文件选择一种阶段，不混用：
 
-- `work/multimodal_input.json` 不存在：执行**视觉阶段**。
-- `work/multimodal_input.json` 存在：执行**音画阶段**。
+- `work/reconcile_after_image_optimization_input.json` 与 `work/multimodal_input.json` 都不存在：执行**视觉阶段**。
+- 只有 `work/reconcile_after_image_optimization_input.json` 存在：执行第三阶段 **reconcile_after_image_optimization**。
+- 只有 `work/multimodal_input.json` 存在：执行**音画阶段**。
+- 两个阶段输入同时存在：只写 `work/unified_visual_ir.json` 的 `phase_input_conflict` 固定失败结构，不执行任一正常阶段，也不写 `work/h3_prompt_plan.json`。
 
-视觉阶段不得读取任何音频文件，只处理图片与文字。音画阶段只规划冻结输入的语义绑定，不重新分析原视频。
+视觉阶段不得读取任何音频文件，只处理图片与文字。第三阶段不得读取音频或台词，只协调已经选择的帧；音画阶段只规划冻结输入的语义绑定，不重新分析原视频。
 
 ## 2. 视觉阶段
 
@@ -132,3 +134,143 @@ Plan = {
 ```
 
 按上述结构写 UTF-8 严格 JSON。`line_index` 只绑定上游既有顺序；精确时间窗由后端从同一 dialogue receipt 投影，不是供应商 PTS 硬锁。人物、图片和声线关系不是未经确认的 speaker-face 推断。参考音频不是时间锁，只按 reference 语义使用，不是最终音轨；不得使用 `fully_copy`、`partially_copy` 或 `audio reuse`，不承诺完整或逐样本复制。媒体字节、哈希、格式、模式和供应商参数由后端处理，不进入语义计划。生成后仍须验收音轨、精确台词、发声顺序和人物发声关系。
+
+## 4. 优化后语义协调阶段
+
+### 边界与输入
+
+只读取 `work/reconcile_after_image_optimization_input.json` 指向的原始源帧、`work/original_visual_prompt.txt`、`work/frozen_image_plan.json`、`work/image_verification.json` 和已选优化图；只写 `work/unified_visual_ir.json`。这些文件由后端冻结并校验路径，Skill 不查找其他候选图。
+
+这是同一 Skill 的第三阶段，固定写 `"phase": "reconcile_after_image_optimization"`。existing dialogue 不得进入本阶段；输入出现 dialogue、speech、audio 或台词文件即以 `unexpected_dialogue_input` 失败关闭。不得读取音频，不得复制或推断台词、嘴型、发声人、语言或声音事件。不得重新选择、增删或重排关键帧，也不得改写帧号和 PTS。
+
+输入描述符所有字段必填，禁止额外字段：
+
+```text
+Sha256 = 64 位小写十六进制 SHA-256
+Integer = 整数
+NonNegativeInt = 大于等于 0 的整数
+Int1 = 从 1 开始的整数
+SegmentIndex = NonNegativeInt
+NonEmpty = 非空字符串
+
+ReconcileInput = {
+  version: 1;
+  phase: "reconcile_after_image_optimization";
+  source_evidence: {
+    frame_manifest_sha256: Sha256;
+    old_visual_prompt_sha256: Sha256;
+  };
+  target_static_plan: {
+    image_plan_sha256: Sha256;
+    image_verification_sha256: Sha256;
+  };
+  frames: NonEmptyArray<{
+    segment_index: SegmentIndex;
+    frame_index: Int1;
+    source_file: NonEmpty;
+    source_pts: Integer;
+    source_time_base: NonEmpty;
+    source_frame_sha256: Sha256;
+    optimized_file: NonEmpty;
+    optimized_image_sha256: Sha256;
+    output_receipt_file: NonEmpty;
+    output_receipt_sha256: Sha256;
+    image_plan_sha256: Sha256;
+  }>;
+}
+```
+
+数组按 `(segment_index, frame_index)` 升序，必须与原始帧 manifest、canonical 计划、通过的 image verification 和已选输出 receipt 一一覆盖且哈希互相闭合。`source_pts` 是未换算的源时间戳整数，`source_time_base` 是规约后的正整数分数；禁止换算为毫秒后再写回。只接受 verification 已整体通过的输入：output receipt 只绑定 image plan、源帧和优化图；后产生的 image verification receipt 绑定完整且有序的 output receipt SHA 集合，并逐字绑定同一 `image_plan_sha256`。
+
+### 事实权威
+
+- 原始源帧像素与 PTS 是动作、机位和时序的事实权威。旧视觉提示词仅是动作、机位和时序的低优先级检索证据；冲突时以原始源帧像素与 PTS 为准。
+- canonical 图片计划是新人物和新场景的语义权威。已选优化图及其输出 receipt 是该计划已实现结果的权威；两者冲突时失败，不能挑一个继续。
+- 优化图不得反向改写动作、机位、时序或物理关系。它改变这些动态事实时，判图片结果不合格；不得改写动态事实去迎合错误优化图。
+- 旧人物、旧服装、旧场景、旧材质和旧静态外观只作负证据，不得进入统一视觉 IR。不得复制 canonical 计划中的目标描述；人物、服装、场景、材质与光色只通过 target_static_plan_binding 和稳定 ID 引用，由后端从同一 receipt 确定性投影。
+
+### 资格门
+
+只有全部成立才输出 `eligible=true`：
+
+1. 每个原始帧恰有一个同段、同帧号、同 PTS 的已选优化图与输出 receipt；任一源帧、PTS、优化图或输出 receipt 映射缺失、重复、错序或哈希不闭合，失败为 `frame_mapping_missing`。
+2. 每张优化图保持原始源帧的可见身体部位、姿态、动作状态、尺度、接触、遮挡、裁切和因果结果；优化图改变姿态、动作状态、接触、遮挡或因果结果，失败为 `optimized_action_changed`。
+3. canonical 新场景和优化图保留原动作需要的功能等价支撑面、可操作物、间隙、通路、接触链和可达范围；新场景不能闭合原动作依赖的支撑、接触或可达关系，失败为 `physical_support_unclosed`，不能补造不可见过渡。
+4. 每个 beat 只引用 canonical 计划中的 `PERSON_*`、`SCENE_*` 和该帧 `ENTITY_*` ID；动作字段只描述姿态、运动、状态变化与因果，镜头字段只描述拍摄几何，时序字段只描述 PTS、节奏与转场。无法去除旧静态描述时失败为 `source_static_semantics_leaked`。
+5. 所有事实都能从列明证据唯一确认；任何未知或其他冲突失败为 `reconciliation_unknown`。
+
+错误码按 `phase_input_conflict`、`unexpected_dialogue_input`、`receipt_binding_mismatch`、`frame_mapping_missing`、`optimized_action_changed`、`physical_support_unclosed`、`source_static_semantics_leaked`、`reconciliation_unknown` 的顺序取首个成立项。receipt 未通过、未绑定同一计划或内容互相矛盾均为 `receipt_binding_mismatch`。
+
+### 严格统一视觉 IR
+
+禁止二次自由文本真源。只描述动态事实；不输出最终视频提示词，不复制新旧人物、服装、场景、材质或光色描述。统一 IR 的所有字段必填，禁止额外字段，成功固定为 `"version": 1`、`"eligible": true`、`"reason": null`、`"conflicts": []`：
+
+```text
+PersonId = canonical 计划中的 PERSON_* ID
+SceneId = canonical 计划中的 SCENE_* ID
+EntityId = canonical 计划对应帧中的 ENTITY_* ID
+ReconcileErrorCode = "phase_input_conflict" | "unexpected_dialogue_input" | "receipt_binding_mismatch" | "frame_mapping_missing" | "optimized_action_changed" | "physical_support_unclosed" | "source_static_semantics_leaked" | "reconciliation_unknown"
+
+Plan = {
+  version: 1;
+  phase: "reconcile_after_image_optimization";
+  eligible: true;
+  reason: null;
+  source_evidence_binding: {
+    frame_manifest_sha256: Sha256;
+    old_visual_prompt_sha256: Sha256;
+  };
+  target_static_plan_binding: {
+    image_plan_sha256: Sha256;
+    image_verification_sha256: Sha256;
+  };
+  frame_bindings: NonEmptyArray<{
+    segment_index: SegmentIndex;
+    frame_index: Int1;
+    source_frame_sha256: Sha256;
+    source_pts: Integer;
+    source_time_base: NonEmpty;
+    optimized_image_sha256: Sha256;
+    output_receipt_sha256: Sha256;
+  }>;
+  preserved_beats: NonEmptyArray<{
+    beat_index: Int1;
+    segment_index: SegmentIndex;
+    frame_refs: NonEmptyArray<Int1>;
+    actor_refs: Array<PersonId>;
+    scene_ref: SceneId;
+    entity_refs: Array<{ frame_index: Int1; entity_id: EntityId }>;
+    action: { initial_state: NonEmpty; motion: NonEmpty; result_state: NonEmpty };
+    camera: { shot_scale: NonEmpty; angle: NonEmpty; movement: NonEmpty; composition: NonEmpty; focus: NonEmpty };
+    timing: { start_source_pts: Integer; end_source_pts: Integer; source_time_base: NonEmpty; pace: NonEmpty; transition: NonEmpty };
+  }>;
+  conflicts: [];
+}
+```
+
+`frame_bindings` 与输入帧逐项相同并按同一顺序复制。`preserved_beats` 按源 PTS 和 `beat_index` 升序，覆盖原始可见叙事的初始状态、动作和结果；`frame_refs` 升序无重复且只能引用同段 `frame_bindings`。每个 beat 的起止 PTS 必须逐字取自首尾 frame_refs，同段使用同一 `source_time_base`，相邻 beat 不得颠倒源 PTS。所有人物、场景和物体只能以稳定 ID 出现在动态字段中，动作、camera 和 timing 文本不得承载任何静态目标设计。
+
+eligible plan 的 conflicts 必须为空。失败结构固定字段不变，两个 binding 为 `null`、两个正常数组为空；`conflicts` 至少一项且只写稳定错误码、可空帧定位和证据 receipt/SHA/ID 引用，不复制新旧静态描述：
+
+```text
+Conflict = {
+  code: ReconcileErrorCode;
+  segment_index: SegmentIndex | null;
+  frame_index: Int1 | null;
+  evidence_refs: NonEmptyArray<NonEmpty>;
+}
+
+FailurePlan = {
+  version: 1;
+  phase: "reconcile_after_image_optimization";
+  eligible: false;
+  reason: ReconcileErrorCode;
+  source_evidence_binding: null;
+  target_static_plan_binding: null;
+  frame_bindings: [];
+  preserved_beats: [];
+  conflicts: NonEmptyArray<Conflict>;
+}
+```
+
+按上述结构写 UTF-8 严格 JSON，无 Markdown 围栏或解释。该 IR 是后端将动态事实与 canonical 静态计划确定性合并的唯一协调输入；本阶段不编写供应商提示词、不调用 Context IR 或供应商。
