@@ -422,6 +422,9 @@ def test_v4_plan_protocol_error_replans_then_uses_backend_fallback(
 
     runner = Runner()
     monkeypatch.setattr(
+        image_optimization, "_source_has_observable_person", lambda _path: True,
+    )
+    monkeypatch.setattr(
         pipeline.image_optimization,
         "generate_project_prompts",
         _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
@@ -446,13 +449,14 @@ def test_v4_plan_protocol_error_replans_then_uses_backend_fallback(
     if model_recovers:
         assert plan["person_plans"]
     else:
-        assert plan["person_plans"] == []
-        assert plan["segments"][0]["persons"] == []
+        assert [item["id"] for item in plan["person_plans"]] == ["PERSON_01"]
+        assert plan["segments"][0]["persons"][0]["state"] == "replace"
+        assert plan["segments"][0]["persons"][0]["observable_frames"] == [1]
         assert plan["scene_plans"][0]["segments"] == [0]
         assert plan["scene_plans"][0]["continuity_graph"]["views"][0][
             "transition_from_previous"
         ] == skeleton[0]["source_transition_from_previous"]
-        assert "不得新增、删除或替换" in prompts[0][1]
+        assert "替换人物" in prompts[0][1]
 
 
 def test_v4_pipeline_freezes_authoritative_transitions_and_anchor_schedule(tmp_path):
@@ -2125,6 +2129,9 @@ def test_short_pipeline_invalid_plan_falls_back_and_reaches_seedream(
         "generate_project_prompts",
         _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
     )
+    monkeypatch.setattr(
+        image_optimization, "_source_has_observable_person", lambda _path: True,
+    )
 
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
 
@@ -2138,7 +2145,12 @@ def test_short_pipeline_invalid_plan_falls_back_and_reaches_seedream(
             "continuity_graph"
         ]["views"]
     ] == ["start", "same_camera"]
-    assert stored["_image_continuity"]["person_plans"] == []
+    assert [item["id"] for item in stored["_image_continuity"]["person_plans"]] == [
+        "PERSON_01"
+    ]
+    assert stored["_image_continuity"]["segments"][0]["persons"][0][
+        "observable_frames"
+    ] == [1, 2]
     source_sha256s = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted((settings.data_dir / meta["id"] / "work" / "keyframes").glob("*.png"))

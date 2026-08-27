@@ -1495,7 +1495,11 @@ def plan_sha256(plan: dict) -> str:
 
 
 def compile_segment_prompts(
-    plan: dict, edit_mode: str, *, allow_empty_people: bool = False,
+    plan: dict,
+    edit_mode: str,
+    *,
+    allow_empty_people: bool = False,
+    _observable_frame_by_segment: dict[int, int] | None = None,
 ) -> dict[int, str]:
     """Compile an eligible semantic v2 plan into immutable provider prompts."""
     if edit_mode not in SEEDREAM_EDIT_MODES:
@@ -1512,7 +1516,15 @@ def compile_segment_prompts(
         person_edits = []
         hidden_people = False
         for member in segment["persons"]:
-            if member["state"] == "not_observable":
+            selected_frame = (
+                _observable_frame_by_segment.get(segment["segment_index"])
+                if _observable_frame_by_segment is not None else None
+            )
+            if (
+                member["state"] == "not_observable"
+                or selected_frame is not None
+                and selected_frame not in member["observable_frames"]
+            ):
                 hidden_people = True
                 continue
             design = people[member["id"]]
@@ -1587,8 +1599,9 @@ def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str
     for segment in base_plan["segments"]:
         segment.pop("frame_constraints")
         segment.pop("photometric_contract")
-    segment_prompts = compile_segment_prompts(
-        base_plan, edit_mode, allow_empty_people=canonical["version"] == 4,
+    segment_prompts = (
+        compile_segment_prompts(base_plan, edit_mode)
+        if canonical["version"] == 3 else None
     )
     continuity_by_scene = {
         scene["id"]: scene.get("continuity_graph")
@@ -1602,6 +1615,17 @@ def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str
         )
         per_frame = {}
         for constraint in segment["frame_constraints"]:
+            base_prompt = (
+                segment_prompts[segment["segment_index"]]
+                if segment_prompts is not None else compile_segment_prompts(
+                    base_plan,
+                    edit_mode,
+                    allow_empty_people=True,
+                    _observable_frame_by_segment={
+                        segment["segment_index"]: constraint["frame_index"]
+                    },
+                )[segment["segment_index"]]
+            )
             frame_clause = "；".join(
                 f"{key}={constraint[key]}"
                 for key in ("frame_index", *_FRAME_TEXT_CONSTRAINT_KEYS)
@@ -1627,7 +1651,7 @@ def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str
                     f"{_plan_json(view)}"
                 )
             per_frame[constraint["frame_index"]] = _canonical_prompt(
-                f"{segment_prompts[segment['segment_index']]}。仅当前源帧硬约束："
+                f"{base_prompt}。仅当前源帧硬约束："
                 f"{frame_clause}。全局光色硬约束：{photo_clause}。"
                 f"{continuity_clause}"
                 "不得从其他帧补全，不得重布全局光线。"
@@ -2397,6 +2421,33 @@ def generate_project_prompts(
             raise
 
 
+def _source_has_observable_person(path: Path) -> bool:
+    """Return backend pixel evidence for an actually visible person."""
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None or image.size == 0:
+        raise ValueError("invalid image optimization source frame")
+    height, width = image.shape[:2]
+    if height < 128 or width < 64:
+        return False
+    longest = max(height, width)
+    if longest > 960:
+        scale = 960 / longest
+        image = cv2.resize(
+            image,
+            (max(64, round(width * scale)), max(128, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    detector = cv2.HOGDescriptor()
+    detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    try:
+        boxes, _weights = detector.detectMultiScale(
+            image, winStride=(8, 8), padding=(8, 8), scale=1.05,
+        )
+    except cv2.error:
+        return False
+    return len(boxes) > 0
+
+
 def generic_project_prompts(
     segments: list[dict], edit_mode: str, *, session_dir: Path,
 ) -> tuple[dict, dict]:
@@ -2406,10 +2457,51 @@ def generic_project_prompts(
     _session, indices, prepared = _project_segment_inputs(
         segments, session_dir, expected_version=4,
     )
-    reference = {"segment_index": indices[0], "frame_index": 1}
+    scene_reference = {"segment_index": indices[0], "frame_index": 1}
+    observable_frames = {
+        segment["index"]: [
+            frame_index
+            for frame_index, frame in enumerate(frames, 1)
+            if _source_has_observable_person(frame)
+        ]
+        for segment, frames in prepared
+    }
+    observable_segments = [
+        index for index in indices if observable_frames[index]
+    ]
+    person_reference = (
+        {
+            "segment_index": observable_segments[0],
+            "frame_index": observable_frames[observable_segments[0]][0],
+        }
+        if observable_segments else None
+    )
+    person_plans = ([{
+        "id": "PERSON_01",
+        "source_identity": "源图中实际可观察的主人物身份",
+        "replacement_identity": "与源身份明显不同且跨帧稳定的新人物身份",
+        "wardrobe_change": "保持服装用途与覆盖边界并改变款式细节",
+        "local_color_change": "仅改变人物服装局部固有色并保持源光照",
+        "reference": person_reference,
+        "observable_segments": observable_segments,
+    }] if person_reference is not None else [])
     views = []
     canonical_segments = []
     for segment, frames in prepared:
+        visible_frames = observable_frames[segment["index"]]
+        segment_people = ([{
+            "id": "PERSON_01",
+            "state": "replace",
+            "observable_frames": visible_frames,
+            "target_region": "源图中实际可观察的完整主人物区域",
+            "boundary": "严格保持源图可见姿态、轮廓、裁切与遮挡边界",
+        }] if visible_frames else ([{
+            "id": "PERSON_01",
+            "state": "not_observable",
+            "observable_frames": [],
+            "target_region": None,
+            "boundary": None,
+        }] if person_plans else []))
         constraints = []
         for frame, transition in zip(frames, segment["transition_skeleton"]):
             frame_index = transition["frame_index"]
@@ -2441,16 +2533,14 @@ def generic_project_prompts(
             })
         canonical_segments.append({
             "segment_index": segment["index"],
-            "persons": [],
+            "persons": segment_people,
             "scene": {
                 "scene_id": "SCENE_01",
                 "target_region": "源图中可见环境的完整区域",
-                "boundary": "仅环境边界；保护全部非目标前景与已有关系",
+                "boundary": "仅环境边界；排除人物目标并保持已有关系",
                 "layout_reference_frame_index": 1,
             },
-            "protected_non_target_people": [
-                "保留源图中实际存在的全部人物；不得新增、删除或替换"
-            ],
+            "protected_non_target_people": [],
             "protected_relations": [
                 "保留源图可证的全部空间、接触、遮挡与交互关系"
             ],
@@ -2470,7 +2560,7 @@ def generic_project_prompts(
         "segment_indices": indices,
         "eligible": True,
         "reason": None,
-        "person_plans": [],
+        "person_plans": person_plans,
         "scene_plans": [{
             "id": "SCENE_01",
             "source_scene": "源图原始环境",
@@ -2480,7 +2570,7 @@ def generic_project_prompts(
             "depth_changes": ["生成与新环境一致且连贯的空间深度"],
             "layout_changes": ["生成跨全部帧统一的新环境布局"],
             "local_color_change": "仅环境表面使用新环境一致的自然颜色",
-            "reference": reference,
+            "reference": scene_reference,
             "segments": indices,
             "continuity_graph": {
                 "components": [{
