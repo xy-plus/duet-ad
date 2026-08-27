@@ -987,8 +987,6 @@ def test_skill_requires_current_frame_visible_coverage_closure():
 
     for rule in (
         "人体、面部拓扑、服装边界与裁切碎片形成闭包",
-        "`contacts/occludes` 组合表达",
-        "不得遗漏其接触、遮挡或进入关系",
         "不同边界、法向、深度层或支撑链的物理面不得合并",
         "source-visible entity/relationship coverage closure",
         "任何未归属可见像素区域或缺关系都输出空计划",
@@ -997,13 +995,49 @@ def test_skill_requires_current_frame_visible_coverage_closure():
 
     for rule in (
         "人体、面部拓扑、服装边界与裁切碎片形成闭包",
-        "contacts/occludes 组合表达",
-        "不得遗漏其接触、遮挡或进入关系",
         "不同边界、法向、深度层或支撑链的物理面不得合并",
         "source-visible entity/relationship coverage closure",
         "任何未归属可见像素区域或缺关系都输出空计划",
     ):
         assert rule in human
+
+
+def test_skill_scopes_visible_relationships_and_fail_closed_reasons():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    for rule in (
+        "人物自身服装属于 `PERSON` target domain",
+        "`contact_points`/`contacts` 只记录双方边界同帧直接可见的接触",
+        "禁止从人体在服装边界消失推断衣内接触",
+        "`occlusion_order` + `occludes` 冻结可见的覆盖、开口、穿入穿出拓扑",
+        "拓扑无法唯一确定且影响替换则 `person_replacement_unsafe`",
+        "概括性总称不能覆盖可独立消失、融合或错位的内部可见子区域",
+        "遮挡关系不能替代可见的支撑、接触或分离关系",
+        "物理场景实体身份或必须关系不能闭合则 `scene_components_ambiguous`",
+        "已识别场景与 boundary/五维变化冲突则 `scene_structure_replacement_unsafe`",
+        "人物域闭包失败则 `person_replacement_unsafe`",
+    ):
+        assert rule in skill
+
+    for rule in (
+        "人物自身服装属于 PERSON target domain",
+        "contact_points/contacts 只记录双方边界同帧直接可见的接触",
+        "禁止从人体在服装边界消失推断衣内接触",
+        "occlusion_order + occludes 冻结可见的覆盖、开口、穿入穿出拓扑",
+        "拓扑无法唯一确定且影响替换则 person_replacement_unsafe",
+        "概括性总称不能覆盖可独立消失、融合或错位的内部可见子区域",
+        "遮挡关系不能替代可见的支撑、接触或分离关系",
+        "物理场景实体身份或必须关系不能闭合则 scene_components_ambiguous",
+        "已识别场景与 boundary/五维变化冲突则 scene_structure_replacement_unsafe",
+        "人物域闭包失败则 person_replacement_unsafe",
+    ):
+        assert rule in human
+
+    assert "人物与自身服装或容器式边界的接触、遮挡、进入只以" not in skill
+    assert "人物与自身服装或容器式边界的接触、遮挡、进入只以" not in human
 
 
 def _plan_v3() -> dict:
