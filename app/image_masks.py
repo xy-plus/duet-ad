@@ -66,6 +66,7 @@ _SAFE_CODES = frozenset(
         "project_root_invalid",
         "mask_receipt_invalid",
         "mask_receipt_mismatch",
+        "mask_artifact_mismatch",
         "submission_unknown",
         "provider_pending",
         "provider_query_failed",
@@ -261,6 +262,56 @@ class MaskResult:
     path: Path
     receipt_path: Path
     producer_receipt: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class MaskSourceExpectation:
+    path: str
+    sha256: str
+    width: int
+    height: int
+    frame_pts: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", _relative_path(self.path))
+        object.__setattr__(self, "frame_pts", _frame_pts(self.frame_pts))
+        if not isinstance(self.sha256, str) or not _SHA256_RE.fullmatch(self.sha256):
+            raise MaskError("invalid_source_image")
+        if (
+            isinstance(self.width, bool)
+            or isinstance(self.height, bool)
+            or not isinstance(self.width, int)
+            or not isinstance(self.height, int)
+            or self.width <= 0
+            or self.height <= 0
+        ):
+            raise MaskError("invalid_source_image")
+
+
+@dataclass(frozen=True)
+class MaskRosterExpectation:
+    path: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", _relative_path(self.path))
+        if not isinstance(self.sha256, str) or not _SHA256_RE.fullmatch(self.sha256):
+            raise MaskError("invalid_person_instance")
+
+
+@dataclass(frozen=True)
+class LoadedMaskArtifact:
+    """Fully revalidated consumer artifact with an immutable packed bool mask."""
+
+    canonical_receipt: bytes
+    canonical_receipt_sha256: str
+    project_relative_path: str
+    mask_sha256: str
+    width: int
+    height: int
+    foreground_pixels: int
+    packed_mask: bytes
+    packed_encoding: str = "row-major-alpha-gt-zero-packbits-little-v1"
 
 
 class MaskProvider(Protocol):
@@ -748,7 +799,9 @@ def _decode_source(payload: bytes) -> tuple[int, int]:
     return width, height
 
 
-def _validate_mask(payload: bytes, *, width: int, height: int) -> dict[str, Any]:
+def _validated_mask(
+    payload: bytes, *, width: int, height: int
+) -> tuple[dict[str, Any], np.ndarray]:
     png_width, png_height = _png_dimensions(payload)
     if png_width != width or png_height != height:
         raise MaskError("mask_dimensions_mismatch")
@@ -766,15 +819,23 @@ def _validate_mask(payload: bytes, *, width: int, height: int) -> dict[str, Any]
         raise MaskError("mask_alpha_empty")
     if nonzero == pixels:
         raise MaskError("mask_alpha_full_frame")
-    return {
-        "sha256": sha256_bytes(payload),
-        "size": len(payload),
-        "width": width,
-        "height": height,
-        "mime_type": "image/png",
-        "alpha_nonzero_pixels": nonzero,
-        "alpha_transparent_pixels": pixels - nonzero,
-    }
+    return (
+        {
+            "sha256": sha256_bytes(payload),
+            "size": len(payload),
+            "width": width,
+            "height": height,
+            "mime_type": "image/png",
+            "alpha_nonzero_pixels": nonzero,
+            "alpha_transparent_pixels": pixels - nonzero,
+        },
+        np.ascontiguousarray(alpha > 0),
+    )
+
+
+def _validate_mask(payload: bytes, *, width: int, height: int) -> dict[str, Any]:
+    metadata, _binary = _validated_mask(payload, width=width, height=height)
+    return metadata
 
 
 def _png_dimensions(payload: bytes) -> tuple[int, int]:
@@ -903,6 +964,200 @@ def _validate_person_roster_receipt(
     }
     if payload != expected:
         raise MaskError("person_roster_receipt_mismatch")
+
+
+def _producer_artifact(
+    root: Path, artifact: Mapping[str, Any] | str | Path
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    try:
+        if isinstance(artifact, Mapping):
+            payload = json.loads(_canonical_json(dict(artifact)).decode("utf-8"))
+        else:
+            relative = _relative_path(artifact)
+            raw = _read_project_file(root, relative, limit=4 * 1024 * 1024)
+            payload = json.loads(raw.decode("utf-8"))
+    except (MaskError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise MaskError("mask_artifact_mismatch") from None
+    if not isinstance(payload, dict):
+        raise MaskError("mask_artifact_mismatch")
+    if payload.get("schema") == ATTEMPT_SCHEMA:
+        producer = payload.get("producer_receipt")
+        if (
+            payload.get("version") != ATTEMPT_VERSION
+            or payload.get("status") != "succeeded"
+            or not isinstance(payload.get("history"), list)
+            or not payload["history"]
+            or payload["history"][-1] != "succeeded"
+            or not isinstance(producer, dict)
+        ):
+            raise MaskError("mask_artifact_mismatch")
+        return producer, payload
+    return payload, None
+
+
+def load_validated_mask(
+    project_root: Path,
+    artifact: Mapping[str, Any] | str | Path,
+    *,
+    expected_source: MaskSourceExpectation,
+    expected_person_id: str,
+    expected_visible_person_ids: tuple[str, ...],
+    expected_roster: MaskRosterExpectation,
+    expected_purpose: MaskPurpose,
+) -> LoadedMaskArtifact:
+    """Load one v2 producer/attempt receipt and fully revalidate its mask.
+
+    ``artifact`` may be the producer mapping or a project-relative path to a
+    producer/attempt receipt.  The returned bool mask is row-major, thresholded
+    as ``alpha > 0``, and packed with ``numpy.packbits(bitorder="little")``.
+    """
+    root = _project_root(Path(project_root))
+    if not isinstance(expected_source, MaskSourceExpectation) or not isinstance(
+        expected_roster, MaskRosterExpectation
+    ):
+        raise MaskError("mask_artifact_mismatch")
+    producer, attempt = _producer_artifact(root, artifact)
+    try:
+        if producer.get("schema") != PRODUCER_SCHEMA or producer.get(
+            "version"
+        ) != PRODUCER_VERSION:
+            raise MaskError("mask_artifact_mismatch")
+        descriptor_payload = producer["producer"]
+        if not isinstance(descriptor_payload, dict) or set(descriptor_payload) != {
+            "provider",
+            "action",
+            "model",
+        }:
+            raise MaskError("mask_artifact_mismatch")
+        descriptor = ProviderDescriptor(**descriptor_payload)
+        capability_payload = producer["provider_capability"]
+        if not isinstance(capability_payload, dict) or set(capability_payload) != {
+            "mask_scope",
+            "identity_binding",
+            "person_id_param",
+            "supported_purposes",
+        }:
+            raise MaskError("mask_artifact_mismatch")
+        purposes = capability_payload["supported_purposes"]
+        if not isinstance(purposes, list):
+            raise MaskError("mask_artifact_mismatch")
+        capability = ProviderCapabilities(
+            mask_scope=capability_payload["mask_scope"],
+            identity_binding=capability_payload["identity_binding"],
+            person_id_param=capability_payload["person_id_param"],
+            supported_purposes=tuple(purposes),
+        )
+        instance = PersonInstanceRequest(
+            person_id=expected_person_id,
+            visible_person_ids=expected_visible_person_ids,
+            person_roster_receipt_path=expected_roster.path,
+            person_roster_receipt_sha256=expected_roster.sha256,
+        )
+        params = _freeze_params(producer["params"])
+        expected_instance = _person_instance_receipt(
+            capability, expected_purpose, instance, params
+        )
+        if producer.get("purpose") != expected_purpose or producer.get(
+            "person_instance"
+        ) != expected_instance:
+            raise MaskError("mask_artifact_mismatch")
+        source = {
+            "path": expected_source.path,
+            "sha256": expected_source.sha256,
+            "width": expected_source.width,
+            "height": expected_source.height,
+            "frame_pts": expected_source.frame_pts,
+        }
+        if producer.get("source") != source:
+            raise MaskError("mask_artifact_mismatch")
+        request_hash = request_sha256(
+            provider=descriptor.provider,
+            action=descriptor.action,
+            model=descriptor.model,
+            purpose=expected_purpose,
+            provider_capability=capability,
+            person_instance=instance,
+            source_sha256=expected_source.sha256,
+            width=expected_source.width,
+            height=expected_source.height,
+            frame_pts=expected_source.frame_pts,
+            params=params,
+            cache_version=producer["cache_version"],
+        )
+        if producer.get("request_sha256") != request_hash:
+            raise MaskError("mask_artifact_mismatch")
+        mask_payload = producer["mask"]
+        if not isinstance(mask_payload, dict) or set(mask_payload) != {
+            "path",
+            "sha256",
+            "size",
+            "width",
+            "height",
+            "mime_type",
+            "alpha_nonzero_pixels",
+            "alpha_transparent_pixels",
+        }:
+            raise MaskError("mask_artifact_mismatch")
+        mask_path = _relative_path(mask_payload["path"])
+    except (KeyError, TypeError, ValueError, MaskError):
+        raise MaskError("mask_artifact_mismatch") from None
+
+    source_bytes = _read_project_file(root, expected_source.path, limit=MAX_SOURCE_BYTES)
+    if sha256_bytes(source_bytes) != expected_source.sha256 or _decode_source(
+        source_bytes
+    ) != (expected_source.width, expected_source.height):
+        raise MaskError("mask_artifact_mismatch")
+    _validate_person_roster_receipt(
+        root,
+        instance,
+        source_path=expected_source.path,
+        source_sha256=expected_source.sha256,
+        width=expected_source.width,
+        height=expected_source.height,
+        frame_pts=expected_source.frame_pts,
+    )
+    if mask_path in {expected_source.path, expected_roster.path}:
+        raise MaskError("mask_artifact_mismatch")
+    mask_bytes = _read_project_file(root, mask_path, limit=MAX_MASK_BYTES)
+    mask_metadata, binary = _validated_mask(
+        mask_bytes, width=expected_source.width, height=expected_source.height
+    )
+    request = {
+        "schema": REQUEST_SCHEMA,
+        "version": REQUEST_VERSION,
+        "provider": descriptor.provider,
+        "action": descriptor.action,
+        "model": descriptor.model,
+        "purpose": expected_purpose,
+        "provider_capability": _capability_receipt(capability),
+        "person_instance": expected_instance,
+        "source": {key: value for key, value in source.items() if key != "frame_pts"},
+        "frame_pts": expected_source.frame_pts,
+        "params": params,
+        "cache_version": producer["cache_version"],
+        "request_sha256": request_hash,
+    }
+    canonical = _producer_receipt(request, mask_path, mask_metadata)
+    if producer != canonical:
+        raise MaskError("mask_artifact_mismatch")
+    if attempt is not None and (
+        attempt.get("request") != request
+        or attempt.get("output_path") != mask_path
+        or attempt.get("producer_receipt") != canonical
+    ):
+        raise MaskError("mask_artifact_mismatch")
+    canonical_bytes = _canonical_json(canonical)
+    packed = np.packbits(binary.reshape(-1), bitorder="little").tobytes()
+    return LoadedMaskArtifact(
+        canonical_receipt=canonical_bytes,
+        canonical_receipt_sha256=sha256_bytes(canonical_bytes),
+        project_relative_path=mask_path,
+        mask_sha256=mask_metadata["sha256"],
+        width=expected_source.width,
+        height=expected_source.height,
+        foreground_pixels=mask_metadata["alpha_nonzero_pixels"],
+        packed_mask=packed,
+    )
 
 
 def _failed(

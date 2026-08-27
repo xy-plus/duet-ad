@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import stat
+from copy import deepcopy
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import cv2
@@ -829,3 +831,168 @@ def test_aliyun_result_url_is_provider_scoped_and_safe():
 
     assert raised.value.code == "provider_protocol_error"
     assert secret not in str(raised.value)
+
+
+def _consumer_expectations(root: Path, producer: dict):
+    source = producer["source"]
+    instance = producer["person_instance"]
+    return {
+        "expected_source": image_masks.MaskSourceExpectation(
+            path=source["path"],
+            sha256=source["sha256"],
+            width=source["width"],
+            height=source["height"],
+            frame_pts=source["frame_pts"],
+        ),
+        "expected_person_id": instance["person_id"],
+        "expected_visible_person_ids": tuple(instance["visible_person_ids"]),
+        "expected_roster": image_masks.MaskRosterExpectation(
+            path=instance["person_roster_receipt_path"],
+            sha256=instance["person_roster_receipt_sha256"],
+        ),
+        "expected_purpose": producer["purpose"],
+    }
+
+
+def test_consumer_loader_returns_immutable_canonical_receipt_and_packed_mask(tmp_path):
+    root, _source = _paths(tmp_path)
+    adapter = FakeAdapter(root / "work/masks/0001.attempt.json")
+    generated = _generate(root, adapter)
+
+    loaded = image_masks.load_validated_mask(
+        root,
+        generated.producer_receipt,
+        **_consumer_expectations(root, generated.producer_receipt),
+    )
+
+    assert json.loads(loaded.canonical_receipt) == generated.producer_receipt
+    assert loaded.canonical_receipt_sha256 == image_masks.sha256_bytes(
+        loaded.canonical_receipt
+    )
+    assert loaded.project_relative_path == "work/masks/0001.png"
+    assert loaded.mask_sha256 == generated.producer_receipt["mask"]["sha256"]
+    assert loaded.width == 6
+    assert loaded.height == 4
+    assert loaded.foreground_pixels == 8
+    assert loaded.packed_encoding == "row-major-alpha-gt-zero-packbits-little-v1"
+    unpacked = np.unpackbits(
+        np.frombuffer(loaded.packed_mask, dtype=np.uint8),
+        count=24,
+        bitorder="little",
+    ).reshape(4, 6)
+    assert unpacked.tolist() == [
+        [0, 0, 0, 0, 0, 0],
+        [0, 1, 1, 1, 1, 0],
+        [0, 1, 1, 1, 1, 0],
+        [0, 0, 0, 0, 0, 0],
+    ]
+    with pytest.raises(FrozenInstanceError):
+        loaded.width = 7
+
+
+def test_consumer_loader_accepts_project_relative_succeeded_attempt_path(tmp_path):
+    root, _source = _paths(tmp_path)
+    adapter = FakeAdapter(root / "work/masks/0001.attempt.json")
+    generated = _generate(root, adapter)
+
+    loaded = image_masks.load_validated_mask(
+        root,
+        str(generated.receipt_path.relative_to(root)),
+        **_consumer_expectations(root, generated.producer_receipt),
+    )
+
+    assert json.loads(loaded.canonical_receipt) == generated.producer_receipt
+    assert loaded.mask_sha256 == generated.producer_receipt["mask"]["sha256"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda artifact: artifact.update(version=1),
+        lambda artifact: artifact["person_instance"].update(person_id="person-2"),
+        lambda artifact: artifact["person_instance"].update(
+            visible_person_ids=["person-1", "person-2"]
+        ),
+        lambda artifact: artifact["provider_capability"].update(
+            mask_scope="person_instance"
+        ),
+        lambda artifact: artifact.update(request_sha256="f" * 64),
+        lambda artifact: artifact["source"].update(frame_pts="1.251"),
+        lambda artifact: artifact["mask"].update(alpha_nonzero_pixels=9),
+        lambda artifact: artifact.update(unexpected="private-response"),
+    ],
+)
+def test_consumer_loader_rejects_noncanonical_or_mismatched_artifact(
+    tmp_path, mutate
+):
+    root, _source = _paths(tmp_path)
+    adapter = FakeAdapter(root / "work/masks/0001.attempt.json")
+    generated = _generate(root, adapter)
+    artifact = deepcopy(generated.producer_receipt)
+    mutate(artifact)
+
+    with pytest.raises(image_masks.MaskError) as raised:
+        image_masks.load_validated_mask(
+            root,
+            artifact,
+            **_consumer_expectations(root, generated.producer_receipt),
+        )
+
+    assert raised.value.code == "mask_artifact_mismatch"
+    assert "private-response" not in str(raised.value)
+
+
+@pytest.mark.parametrize("target", ["source", "mask"])
+def test_consumer_loader_rejects_symlinked_bound_files(tmp_path, target):
+    root, _source = _paths(tmp_path)
+    adapter = FakeAdapter(root / "work/masks/0001.attempt.json")
+    generated = _generate(root, adapter)
+    producer = generated.producer_receipt
+    relative = producer["source"]["path"] if target == "source" else producer["mask"]["path"]
+    path = root / relative
+    backup = root / f"outside-{target}.bin"
+    backup.write_bytes(path.read_bytes())
+    path.unlink()
+    path.symlink_to(backup)
+
+    with pytest.raises(image_masks.MaskError) as raised:
+        image_masks.load_validated_mask(
+            root, producer, **_consumer_expectations(root, producer)
+        )
+
+    assert raised.value.code == "unsafe_project_path"
+
+
+def test_consumer_loader_rejects_roster_bytes_changed_after_generation(tmp_path):
+    root, _source = _paths(tmp_path)
+    adapter = FakeAdapter(root / "work/masks/0001.attempt.json")
+    generated = _generate(root, adapter)
+    producer = generated.producer_receipt
+    roster = root / producer["person_instance"]["person_roster_receipt_path"]
+    roster.write_bytes(roster.read_bytes() + b" ")
+
+    with pytest.raises(image_masks.MaskError) as raised:
+        image_masks.load_validated_mask(
+            root, producer, **_consumer_expectations(root, producer)
+        )
+
+    assert raised.value.code == "person_roster_receipt_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("replacement", "code"),
+    [(b"not-a-png", "mask_not_png"), (_png(alpha="full"), "mask_alpha_full_frame")],
+)
+def test_consumer_loader_revalidates_persisted_png_bytes(tmp_path, replacement, code):
+    root, _source = _paths(tmp_path)
+    adapter = FakeAdapter(root / "work/masks/0001.attempt.json")
+    generated = _generate(root, adapter)
+    producer = generated.producer_receipt
+    (root / producer["mask"]["path"]).write_bytes(replacement)
+
+    with pytest.raises(image_masks.MaskError) as raised:
+        image_masks.load_validated_mask(
+            root, producer, **_consumer_expectations(root, producer)
+        )
+
+    assert raised.value.code == code

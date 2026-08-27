@@ -118,6 +118,40 @@ mask {
 }
 ```
 
+### Consumer loader
+
+Consumers must not duplicate producer schema, path, request-SHA, roster, or PNG
+validation. The public boundary is:
+
+```python
+def load_validated_mask(
+    project_root: Path,
+    artifact: Mapping[str, Any] | str | Path,
+    *,
+    expected_source: MaskSourceExpectation,
+    expected_person_id: str,
+    expected_visible_person_ids: tuple[str, ...],
+    expected_roster: MaskRosterExpectation,
+    expected_purpose: MaskPurpose,
+) -> LoadedMaskArtifact
+```
+
+`artifact` may be an in-memory producer mapping or a project-relative path to
+the producer/succeeded-attempt receipt. The loader independently revalidates:
+
+- exact producer v2 schema and provider capability;
+- the complete request SHA and expected purpose/person identity;
+- source bytes, hash, dimensions, path, and frame PTS;
+- authoritative roster bytes, hash, source binding, and person list;
+- mask containment/nofollow, complete PNG structure, byte hash, dimensions,
+  alpha support, and canonical producer metadata.
+
+`LoadedMaskArtifact` is frozen. `canonical_receipt` is immutable canonical JSON
+bytes and may contain private provider parameters, so it must not be logged.
+`packed_mask` is an immutable row-major boolean mask encoded as
+`numpy.packbits(alpha > 0, bitorder="little")`; its exact encoding identifier is
+`row-major-alpha-gt-zero-packbits-little-v1`.
+
 The first adapter is `AliyunVIAPISegmentHDBody`. It normalizes the official
 `RequestId` and `Data.ImageURL` response while keeping the request client and
 result downloader injected. The provider documents that `SegmentHDBody`
