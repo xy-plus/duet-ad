@@ -263,6 +263,48 @@ def test_success_freezes_official_request_receipt_and_builds_h3_adapter(tmp_path
     h3._require_context_ir_receipt(final_request)
 
 
+def test_official_context_result_enters_h3_byte_for_byte_without_speech_rewrite(
+    tmp_path,
+):
+    frozen = _frozen(tmp_path)
+    provider_prompt = "\n".join(
+        line for line in frozen.source_prompt.splitlines()
+        if not line.lstrip().startswith("DUET_SPEECH_V1")
+    )
+    for token in frozen.dialogue_tokens:
+        provider_prompt = provider_prompt.replace(token, token.replace("]", "] ", 1))
+    assert "DUET_SPEECH_V1" not in provider_prompt
+    assert all(token not in provider_prompt for token in frozen.dialogue_tokens)
+
+    observed: list[httpx.Request] = []
+    with _client(_success_handler(
+        frozen,
+        effective_prompt=provider_prompt,
+        requests=observed,
+    )) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "succeeded"
+    assert result.receipt_path is not None
+    raw = json.loads(result.receipt_path.read_text(encoding="utf-8"))
+    assert raw["source_prompt_sha256"] == frozen.source_prompt_sha256
+    assert raw["effective_prompt"] == provider_prompt
+    assert raw["effective_prompt_sha256"] == hashlib.sha256(
+        provider_prompt.encode()
+    ).hexdigest()
+    submits = [
+        request for request in observed
+        if request.method == "POST" and request.url.path == "/v2/h3_context_ir"
+    ]
+    assert len(submits) == 1
+    assert json.loads(submits[0].content)["content"][0]["text"] == frozen.source_prompt
+    final_request = context_ir_bridge.apply_effective_prompt(
+        frozen, result.receipt_path
+    )
+    assert final_request.prompt.encode() == provider_prompt.encode()
+    assert final_request.prompt != frozen.source_prompt
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -284,22 +326,20 @@ def test_success_freezes_official_request_receipt_and_builds_h3_adapter(tmp_path
         "speaking_order_changed",
     ],
 )
-def test_semantic_drift_fails_closed_before_h3_request(tmp_path, mutate):
+def test_context_effective_prompt_is_not_blocked_or_rewritten_by_internal_syntax(
+    tmp_path, mutate,
+):
     frozen = _frozen(tmp_path)
     effective = mutate(frozen.source_prompt)
     with _client(_success_handler(frozen, effective_prompt=effective)) as client:
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
-    assert result.status == "failed"
-    assert result.error_code == "context_ir_semantic_mismatch"
-    assert result.receipt_path is None
-    source_request, _plan_value = _source_request(tmp_path)
-    with pytest.raises(
-        context_ir_bridge.ContextIrContractError,
-        match="context_ir_effective_prompt_unavailable",
-    ):
-        context_ir_bridge.apply_effective_prompt(frozen, result.receipt_path)
-    assert not (source_request.workdir / ".h3").exists()
+    assert result.status == "succeeded"
+    assert result.receipt_path is not None
+    final_request = context_ir_bridge.apply_effective_prompt(
+        frozen, result.receipt_path
+    )
+    assert final_request.prompt.encode() == effective.encode()
 
 
 def test_poll_transport_unknown_recovers_by_get_on_same_task_without_post(tmp_path):

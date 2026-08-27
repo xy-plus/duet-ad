@@ -749,7 +749,10 @@ def context_ir_progress_binding_matches(
     ) or (
         binding_status == "failed"
         and state_status == "failed"
-        and state.get("error") == "context_ir_result_invalid"
+        and state.get("error") in {
+            "context_ir_result_invalid",
+            "context_ir_semantic_mismatch",
+        }
     )
     if not status_matches:
         return False

@@ -615,7 +615,7 @@ def test_short_query_unknown_with_missing_context_attempt_never_posts(
     assert len(context_gateway.posts) == 1
 
 
-def test_short_submit_resumes_legacy_context_result_invalid_with_same_client_and_task(
+def test_short_submit_resumes_reconcilable_context_failure_with_same_client_and_task(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(
@@ -715,7 +715,7 @@ def test_short_submit_resumes_legacy_context_result_invalid_with_same_client_and
     )
     attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
     attempt["status"] = "failed"
-    attempt["error"] = "context_ir_result_invalid"
+    attempt["error"] = "context_ir_semantic_mismatch"
     attempt_path.write_text(
         json.dumps(attempt, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
@@ -739,7 +739,7 @@ def test_short_submit_resumes_legacy_context_result_invalid_with_same_client_and
         },
         generation={
             "status": "failed",
-            "error": "context_ir_result_invalid",
+            "error": "context_ir_semantic_mismatch",
             "attempt": 1,
             "client_request_id": request.client_request_id,
             "stage": "context_ir_native",
@@ -824,7 +824,7 @@ def test_short_submit_resumes_legacy_context_result_invalid_with_same_client_and
         storage.update_meta(
             settings.data_dir,
             cid,
-            generation={**stored, "error": "context_ir_result_invalid"},
+            generation={**stored, "error": "context_ir_semantic_mismatch"},
         )
 
         resumed = api.post(
