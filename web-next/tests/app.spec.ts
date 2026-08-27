@@ -668,7 +668,7 @@ test('optimized non-silent video requires explicit dialogue delivery and submits
   await installApi(page, controller);
   await login(page);
 
-  await expect(page.getByText('请选择声音呈现方式；未选择不会提交生成。')).toBeVisible();
+  await expect(page.getByText('请选择声音呈现方式后再生成视频')).toBeVisible();
   await expect(page.getByRole('button', { name: '确认生成' })).toBeDisabled();
   await page.getByRole('radio', { name: '画外' }).click();
   await expect(page.getByRole('button', { name: '确认生成' })).toBeEnabled();
