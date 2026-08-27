@@ -844,7 +844,7 @@ def test_skill_has_generic_per_frame_body_contact_and_photometry_contracts():
         "禁止全局重布光",
         "新几何只允许产生物理正确的局部阴影和反射，且仅与原光源一致",
         "每一帧的可见事实不得从相邻帧、reference 或编辑结果补全",
-        "新计划只输出 v3；已有 v2 receipt 只读兼容",
+        "新计划只输出 v4；已有 v3 receipt 保持 exact 只读兼容",
         "每段 `frame_constraints` 按帧号升序且一一覆盖全部冻结帧",
         "`non_person_entity_ledger`",
         "`entities` 与 `relations`",
@@ -1535,6 +1535,698 @@ def test_v3_frame_entity_ledger_roundtrips_without_cross_frame_identity():
         "ENTITY_01", "ENTITY_01"
     ]
     assert ledgers[1]["entities"][0]["visibility"] == "edge_fragment"
+
+
+def _generic_scene_continuity_plan() -> dict:
+    return {
+        "version": 4,
+        "phase": "plan",
+        "segment_indices": [1, 2],
+        "eligible": True,
+        "reason": None,
+        "person_plans": [{
+            "id": "PERSON_01",
+            "source_identity": "source-identity-spec",
+            "replacement_identity": "target-identity-spec",
+            "wardrobe_change": "target-wardrobe-spec",
+            "local_color_change": "target-local-appearance-spec",
+            "reference": {"segment_index": 1, "frame_index": 1},
+            "observable_segments": [1, 2],
+        }],
+        "scene_plans": [{
+            "id": "SCENE_01",
+            "source_scene": "source-scene-spec",
+            "replacement_scene": "target-scene-spec",
+            "semantic_change": "target-semantic-spec",
+            "geometry_changes": ["target-geometry-spec"],
+            "depth_changes": ["target-depth-spec"],
+            "layout_changes": ["target-layout-spec"],
+            "local_color_change": "target-local-surface-spec",
+            "reference": {"segment_index": 1, "frame_index": 1},
+            "segments": [1, 2],
+            "continuity_graph": {
+                "components": [
+                    {
+                        "component_id": "COMPONENT_01",
+                        "target_spec": "target-spec-01",
+                    },
+                    {
+                        "component_id": "COMPONENT_02",
+                        "target_spec": "target-spec-02",
+                    },
+                ],
+                "topology": [{
+                    "subject_id": "COMPONENT_01",
+                    "predicate": "supports",
+                    "object_id": "COMPONENT_02",
+                }],
+                "views": [
+                    {
+                        "segment_index": 1,
+                        "frame_index": 1,
+                        "transition_from_previous": "start",
+                        "observations": [
+                            {"component_id": "COMPONENT_01", "visibility": "full"},
+                            {"component_id": "COMPONENT_02", "visibility": "full"},
+                        ],
+                        "view_relations": [{
+                            "subject_id": "COMPONENT_01",
+                            "predicate": "in_front_of",
+                            "object_id": "COMPONENT_02",
+                        }],
+                    },
+                    {
+                        "segment_index": 2,
+                        "frame_index": 1,
+                        "transition_from_previous": "same_camera",
+                        "observations": [
+                            {"component_id": "COMPONENT_01", "visibility": "full"},
+                            {"component_id": "COMPONENT_02", "visibility": "full"},
+                        ],
+                        "view_relations": [{
+                            "subject_id": "COMPONENT_01",
+                            "predicate": "in_front_of",
+                            "object_id": "COMPONENT_02",
+                        }],
+                    },
+                ],
+            },
+        }],
+        "segments": [
+            {
+                "segment_index": segment_index,
+                "persons": [{
+                    "id": "PERSON_01",
+                    "state": "replace",
+                    "observable_frames": [1],
+                    "target_region": "target-region-spec",
+                    "boundary": "target-boundary-spec",
+                }],
+                "scene": {
+                    "scene_id": "SCENE_01",
+                    "target_region": "scene-region-spec",
+                    "boundary": "scene-boundary-spec",
+                    "layout_reference_frame_index": 1,
+                },
+                "protected_non_target_people": [],
+                "protected_relations": ["protected-relation-spec"],
+                "frame_constraints": [{
+                    "frame_index": 1,
+                    "visible_body_parts": "frame-body-spec",
+                    "pose_skeleton": "frame-pose-spec",
+                    "contact_points": "frame-contact-spec",
+                    "occlusion_order": "frame-occlusion-spec",
+                    "out_of_frame_crop": "frame-crop-spec",
+                    "non_person_entity_ledger": {
+                        "entities": [{
+                            "entity_id": "ENTITY_01",
+                            "description": f"source-region-{segment_index:02d}",
+                            "visibility": "full",
+                        }],
+                        "relations": [{
+                            "subject_id": "ENTITY_01",
+                            "predicate": "contacts",
+                            "object_id": "PERSON_01",
+                        }],
+                    },
+                    "dominant_palette_contract": {
+                        "area_weighted_warm_cool_family": "balanced",
+                        "saturation_style": "natural",
+                    },
+                }],
+                "photometric_contract": {
+                    "light_direction": "frame-light-direction-spec",
+                    "light_quality": "frame-light-quality-spec",
+                    "exposure_or_intensity": "frame-exposure-spec",
+                    "wb_cct": "frame-wb-spec",
+                    "global_contrast": "frame-contrast-spec",
+                    "tone_curve": "frame-tone-spec",
+                },
+            }
+            for segment_index in (1, 2)
+        ],
+    }
+
+
+def test_v4_graph_closes_identity_gap_accepted_by_historical_v3():
+    plan = _generic_scene_continuity_plan()
+    historical = deepcopy(plan)
+    historical["version"] = 3
+    historical["scene_plans"][0].pop("continuity_graph")
+
+    assert image_optimization.canonical_plan_v3(
+        historical, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+    ) == historical
+    assert image_optimization.canonical_plan_v4(
+        plan, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+    ) == plan
+
+
+def _add_redundant_view_pair_relation(value: dict) -> None:
+    value["scene_plans"][0]["continuity_graph"]["views"][0][
+        "view_relations"
+    ].append({
+        "subject_id": "COMPONENT_01",
+        "predicate": "occludes",
+        "object_id": "COMPONENT_02",
+    })
+
+
+def _make_view_relation_endpoint_out_of_view(value: dict) -> None:
+    value["scene_plans"][0]["continuity_graph"]["views"][0][
+        "observations"
+    ][1]["visibility"] = "out_of_view"
+
+
+def _make_occluding_subject_not_visible(value: dict) -> None:
+    view = value["scene_plans"][0]["continuity_graph"]["views"][0]
+    view["observations"][0]["visibility"] = "out_of_view"
+    view["view_relations"][0]["predicate"] = "occludes"
+
+
+def _add_redundant_topology_pair_relation(value: dict) -> None:
+    value["scene_plans"][0]["continuity_graph"]["topology"].insert(0, {
+        "subject_id": "COMPONENT_01",
+        "predicate": "contacts",
+        "object_id": "COMPONENT_02",
+    })
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _add_redundant_view_pair_relation,
+        _make_view_relation_endpoint_out_of_view,
+        _make_occluding_subject_not_visible,
+        _add_redundant_topology_pair_relation,
+    ],
+)
+def test_v4_graph_rejects_redundant_pairs_and_invisible_endpoints(mutate):
+    plan = _generic_scene_continuity_plan()
+    mutate(plan)
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_v4(
+            plan, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+        )
+
+
+def test_v4_same_camera_cannot_move_occluded_component_out_of_view():
+    plan = _generic_scene_continuity_plan()
+    second_constraint = deepcopy(plan["segments"][0]["frame_constraints"][0])
+    second_constraint["frame_index"] = 2
+    second_constraint["non_person_entity_ledger"]["entities"][0][
+        "description"
+    ] = "source-region-transition"
+    plan["segments"][0]["persons"][0]["observable_frames"] = [1, 2]
+    plan["segments"][0]["frame_constraints"].append(second_constraint)
+    graph = plan["scene_plans"][0]["continuity_graph"]
+    graph["views"] = [
+        graph["views"][0],
+        {
+            "segment_index": 1,
+            "frame_index": 2,
+            "transition_from_previous": "camera_motion",
+            "observations": [
+                {"component_id": "COMPONENT_01", "visibility": "full"},
+                {"component_id": "COMPONENT_02", "visibility": "occluded"},
+            ],
+            "view_relations": [{
+                "subject_id": "COMPONENT_01",
+                "predicate": "occludes",
+                "object_id": "COMPONENT_02",
+            }],
+        },
+        {
+            **graph["views"][1],
+            "observations": [
+                {"component_id": "COMPONENT_01", "visibility": "full"},
+                {"component_id": "COMPONENT_02", "visibility": "out_of_view"},
+            ],
+            "view_relations": [],
+        },
+    ]
+
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_v4(
+            plan, segment_indices=[1, 2], frame_counts={1: 2, 2: 1}
+        )
+
+
+def _make_topology_cycle(value: dict) -> None:
+    graph = value["scene_plans"][0]["continuity_graph"]
+    graph["components"].append({
+        "component_id": "COMPONENT_03",
+        "target_spec": "target-spec-03",
+    })
+    graph["topology"] = [
+        {
+            "subject_id": "COMPONENT_01",
+            "predicate": "supports",
+            "object_id": "COMPONENT_02",
+        },
+        {
+            "subject_id": "COMPONENT_02",
+            "predicate": "supports",
+            "object_id": "COMPONENT_03",
+        },
+        {
+            "subject_id": "COMPONENT_03",
+            "predicate": "supports",
+            "object_id": "COMPONENT_01",
+        },
+    ]
+    for view in graph["views"]:
+        view["observations"].append({
+            "component_id": "COMPONENT_03",
+            "visibility": "full",
+        })
+
+
+def _make_component_never_visible(value: dict) -> None:
+    for view in value["scene_plans"][0]["continuity_graph"]["views"]:
+        view["observations"][1]["visibility"] = "occluded"
+        view["view_relations"][0]["predicate"] = "occludes"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["scene_plans"][0]["continuity_graph"][
+            "components"
+        ][1].update(component_id="COMPONENT_03"),
+        lambda value: value["scene_plans"][0]["continuity_graph"][
+            "components"
+        ][1].update(target_spec="ENTITY_01"),
+        lambda value: value["scene_plans"][0]["continuity_graph"][
+            "topology"
+        ][0].update(object_id="COMPONENT_99"),
+        lambda value: value["scene_plans"][0]["continuity_graph"][
+            "topology"
+        ][0].update(predicate={}),
+        lambda value: value["scene_plans"][0]["continuity_graph"][
+            "topology"
+        ][0].update(subject_id=7),
+        lambda value: value["scene_plans"][0]["continuity_graph"][
+            "views"
+        ][0]["observations"].pop(),
+        lambda value: value["scene_plans"][0]["continuity_graph"][
+            "views"
+        ][0]["view_relations"][0].update(object_id="COMPONENT_99"),
+        lambda value: value["scene_plans"][0]["continuity_graph"][
+            "views"
+        ][0]["observations"][0].update(visibility=[]),
+        lambda value: value["scene_plans"][0]["continuity_graph"][
+            "views"
+        ][1].update(transition_from_previous="start"),
+        lambda value: value["scene_plans"][0]["continuity_graph"][
+            "views"
+        ][0]["observations"][1].update(visibility="occluded"),
+        _make_topology_cycle,
+        _make_component_never_visible,
+    ],
+)
+def test_v4_graph_is_exact_closed_sorted_and_target_only(mutate):
+    plan = _generic_scene_continuity_plan()
+    mutate(plan)
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_v4(
+            plan, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+        )
+
+
+def test_v4_allows_equal_target_specs_and_stable_isolated_components():
+    plan = _generic_scene_continuity_plan()
+    graph = plan["scene_plans"][0]["continuity_graph"]
+    graph["components"][1]["target_spec"] = graph["components"][0]["target_spec"]
+    graph["topology"] = []
+
+    assert image_optimization.canonical_plan_v4(
+        plan, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+    ) == plan
+
+
+@pytest.mark.parametrize("visibility", ["partial", "occluded"])
+def test_v4_partial_and_occluded_require_incoming_visible_occlusion(visibility):
+    plan = _generic_scene_continuity_plan()
+    view = plan["scene_plans"][0]["continuity_graph"]["views"][0]
+    view["observations"][1]["visibility"] = visibility
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_v4(
+            plan, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+        )
+
+
+def test_v4_incoming_occlusion_rejects_full_but_allows_edge_fragment_priority():
+    plan = _generic_scene_continuity_plan()
+    view = plan["scene_plans"][0]["continuity_graph"]["views"][0]
+    view["view_relations"][0]["predicate"] = "occludes"
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_v4(
+            plan, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+        )
+
+    view["observations"][1]["visibility"] = "edge_fragment"
+    assert image_optimization.canonical_plan_v4(
+        plan, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+    ) == plan
+
+
+def _split_generic_scene_continuity_plan() -> dict:
+    plan = _generic_scene_continuity_plan()
+    first = plan["scene_plans"][0]
+    second = deepcopy(first)
+    first["segments"] = [1]
+    first["continuity_graph"]["views"] = [
+        first["continuity_graph"]["views"][0]
+    ]
+    second["id"] = "SCENE_02"
+    second["reference"] = {"segment_index": 2, "frame_index": 1}
+    second["segments"] = [2]
+    second["continuity_graph"]["views"] = [
+        second["continuity_graph"]["views"][1]
+    ]
+    second["continuity_graph"]["views"][0][
+        "transition_from_previous"
+    ] = "hard_cut"
+    plan["scene_plans"].append(second)
+    plan["segments"][1]["scene"]["scene_id"] = "SCENE_02"
+    return plan
+
+
+def test_v4_different_scene_starts_fresh_across_hard_cut():
+    plan = _split_generic_scene_continuity_plan()
+    assert image_optimization.canonical_plan_v4(
+        plan, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+    ) == plan
+
+    plan["scene_plans"][1]["continuity_graph"]["views"][0][
+        "transition_from_previous"
+    ] = "same_camera"
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_v4(
+            plan, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+        )
+
+
+def _generic_frame_inventory(*, transition_evidence: bool = True) -> list[dict]:
+    inventory = [
+        {
+            "segment_index": segment_index,
+            "frame_index": 1,
+            "frame_name": "01.png",
+            "source_sha256": str(segment_index) * 64,
+        }
+        for segment_index in (1, 2)
+    ]
+    if transition_evidence:
+        for item, transition, digest in zip(
+            inventory, ("start", "same_camera"), ("a" * 64, "b" * 64)
+        ):
+            item["source_transition_from_previous"] = transition
+            item["source_transition_evidence_sha256"] = digest
+    return inventory
+
+
+def test_v4_freeze_rejects_missing_authoritative_transition_evidence():
+    with pytest.raises(ValueError, match="execution inputs"):
+        image_optimization.freeze_execution_inputs(
+            _generic_scene_continuity_plan(),
+            revision=1,
+            profile={"id": "generic-profile", "revision": 1},
+            model="doubao-seedream-5-0-pro-260628",
+            frame_inventory=_generic_frame_inventory(transition_evidence=False),
+        )
+
+
+def test_v4_compile_and_freeze_bind_one_shared_graph_and_exact_views(tmp_path):
+    settings = make_settings(tmp_path)
+    plan = _generic_scene_continuity_plan()
+    prompts = image_optimization.compile_frame_prompts(
+        plan, settings.seedream_edit_mode
+    )
+    assert set(prompts) == {1, 2}
+    for prompt in (prompts[1][1], prompts[2][1]):
+        assert '"component_id":"COMPONENT_01"' in prompt
+        assert '"target_spec":"target-spec-02"' in prompt
+        assert '"predicate":"supports"' in prompt
+    assert '"segment_index":1' in prompts[1][1]
+    assert '"segment_index":2' not in prompts[1][1]
+    assert '"segment_index":2' in prompts[2][1]
+    assert '"segment_index":1' not in prompts[2][1]
+
+    execution = image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={"id": "generic-profile", "revision": 1},
+        model=settings.seedream_model,
+        frame_inventory=_generic_frame_inventory(),
+    )
+    assert execution["version"] == 4
+    assert all(
+        "scene_continuity_graph" not in frame for frame in execution["frames"]
+    )
+    assert execution["continuity_sha256"]
+    assert execution["sha256"]
+    assert [
+        frame["scene_continuity_view"]["segment_index"]
+        for frame in execution["frames"]
+    ] == [1, 2]
+    frozen = image_optimization.freeze_frame_prompts(
+        settings, execution, prompts, plan=plan
+    )
+    assert frozen["_image_optimization"]["version"] == 4
+
+    continuity = image_optimization.freeze_continuity(
+        plan, frame_counts={1: 1, 2: 1}
+    )
+    meta = {**continuity, **frozen}
+    assert image_optimization.receipt(meta, settings) == frozen[
+        "_image_optimization"
+    ]
+    changed = deepcopy(plan)
+    changed["scene_plans"][0]["continuity_graph"]["components"][0][
+        "target_spec"
+    ] = "target-spec-revision"
+    assert image_optimization.plan_sha256(changed) != image_optimization.plan_sha256(
+        plan
+    )
+    assert image_optimization.freeze_continuity(
+        changed, frame_counts={1: 1, 2: 1}
+    )["_image_continuity"]["sha256"] != continuity["_image_continuity"][
+        "sha256"
+    ]
+
+    changed_target = deepcopy(plan)
+    changed_target["scene_plans"][0]["continuity_graph"]["components"][0][
+        "target_spec"
+    ] = "target-spec-execution-drift"
+    changed_execution = image_optimization.freeze_execution_inputs(
+        changed_target,
+        revision=1,
+        profile={"id": "generic-profile", "revision": 1},
+        model=settings.seedream_model,
+        frame_inventory=_generic_frame_inventory(),
+    )
+    with pytest.raises(ValueError, match="frame prompts"):
+        image_optimization.freeze_frame_prompts(
+            settings,
+            changed_execution,
+            image_optimization.compile_frame_prompts(
+                changed_target, settings.seedream_edit_mode
+            ),
+            plan=plan,
+        )
+
+    changed_view = deepcopy(plan)
+    changed_view["scene_plans"][0]["continuity_graph"]["views"][1][
+        "transition_from_previous"
+    ] = "camera_motion"
+    changed_view_inventory = _generic_frame_inventory()
+    changed_view_inventory[1]["source_transition_from_previous"] = "camera_motion"
+    changed_view_execution = image_optimization.freeze_execution_inputs(
+        changed_view,
+        revision=1,
+        profile={"id": "generic-profile", "revision": 1},
+        model=settings.seedream_model,
+        frame_inventory=changed_view_inventory,
+    )
+    with pytest.raises(ValueError, match="frame prompts"):
+        image_optimization.freeze_frame_prompts(
+            settings,
+            changed_view_execution,
+            image_optimization.compile_frame_prompts(
+                changed_view, settings.seedream_edit_mode
+            ),
+            plan=plan,
+        )
+
+
+def test_v4_plan_phase_canonicalizes_then_compiles_per_frame(tmp_path):
+    session = tmp_path / "session"
+    expected = _generic_scene_continuity_plan()
+    runner = _Runner(expected)
+
+    plan, prompts = image_optimization.generate_project_prompts(
+        runner,
+        _segments(session, indices=[1, 2]),
+        "independent_parallel",
+        session_dir=session,
+    )
+    assert plan == expected
+    assert set(prompts) == {1, 2}
+    assert set(prompts[1]) == {1}
+    assert set(prompts[2]) == {1}
+
+
+def _generic_plan_audit_verdict(
+    plan: dict, receipt: dict, status: str = "pass"
+) -> dict:
+    return {
+        "version": plan["version"],
+        "phase": "plan_audit",
+        "plan_sha256": receipt["plan_sha256"],
+        "continuity_sha256": receipt["continuity_sha256"],
+        "audit_input_sha256": receipt["sha256"],
+        "passed": status == "pass",
+        "reason": None if status == "pass" else (
+            "plan_audit_unknown" if status == "unknown" else "plan_audit_failed"
+        ),
+        "frame_checks": [
+            {
+                "segment_index": item["segment_index"],
+                "frame_index": item["frame_index"],
+                "source_sha256": item["source_sha256"],
+                "body_closure": _check(status),
+                "scene_closure": _check(status),
+                "entity_closure": _check(status),
+                "relation_closure": _check(status),
+                "scene_continuity_closure": _check(status),
+            }
+            for item in receipt["frames"]
+        ],
+    }
+
+
+def test_v4_plan_audit_adds_source_bound_scene_continuity_closure():
+    plan = _generic_scene_continuity_plan()
+    receipt = image_optimization.freeze_plan_audit_inputs(
+        plan, frame_inventory=_generic_frame_inventory()
+    )
+    verdict = _generic_plan_audit_verdict(plan, receipt)
+    assert image_optimization.canonical_plan_audit_verdict(
+        verdict, plan, receipt
+    ) == verdict
+
+    missing = deepcopy(verdict)
+    missing["frame_checks"][0].pop("scene_continuity_closure")
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_audit_verdict(missing, plan, receipt)
+
+    changed = deepcopy(plan)
+    changed["scene_plans"][0]["continuity_graph"]["views"][1][
+        "transition_from_previous"
+    ] = "camera_motion"
+    with pytest.raises(ValueError, match="audit inputs"):
+        image_optimization.freeze_plan_audit_inputs(
+            changed, frame_inventory=_generic_frame_inventory()
+        )
+    changed_inventory = _generic_frame_inventory()
+    changed_inventory[1]["source_transition_from_previous"] = "camera_motion"
+    changed_receipt = image_optimization.freeze_plan_audit_inputs(
+        changed, frame_inventory=changed_inventory
+    )
+    assert changed_receipt["plan_sha256"] != receipt["plan_sha256"]
+    assert changed_receipt["continuity_sha256"] != receipt["continuity_sha256"]
+
+
+def _generic_verdict_v4(plan: dict, status: str = "pass") -> dict:
+    verdict = _verdict_v3(plan, status=status)
+    verdict["version"] = 4
+    verdict["plan_sha256"] = image_optimization.plan_sha256(plan)
+    for segment in verdict["segments"]:
+        for frame in segment["frame_checks"]:
+            frame["scene_continuity_view"] = _check(status)
+    verdict["project_checks"]["scene_continuity"]["evidence"] = (
+        "SCENE_01/COMPONENT_01 SCENE_01/COMPONENT_02 "
+        "SCENE_01/COMPONENT_01 supports SCENE_01/COMPONENT_02"
+    )
+    return verdict
+
+
+def test_v4_verify_uses_project_graph_evidence_and_per_frame_view_only():
+    plan = _generic_scene_continuity_plan()
+    passed = _generic_verdict_v4(plan)
+    assert image_optimization.canonical_verification(passed, plan) == passed
+
+    missing = deepcopy(passed)
+    missing["segments"][0]["frame_checks"][0].pop("scene_continuity_view")
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_verification(missing, plan)
+
+    failed = deepcopy(passed)
+    failed["segments"][0]["frame_checks"][0]["scene_continuity_view"] = _check(
+        "fail"
+    )
+    failed["segments"][0]["passed"] = False
+    failed["passed"] = False
+    failed["reason"] = "scene_continuity_failed"
+    assert image_optimization.canonical_verification(failed, plan)[
+        "reason"
+    ] == "scene_continuity_failed"
+
+    incomplete = deepcopy(passed)
+    incomplete["project_checks"]["scene_continuity"]["evidence"] = (
+        "SCENE_01/COMPONENT_01"
+    )
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_verification(incomplete, plan)
+
+
+def test_v4_verify_pack_existing_checks_cover_graph_without_new_fields():
+    plan = _generic_scene_continuity_plan()
+    verdict = _pack_verdict(plan)
+    evidence = (
+        "SCENE_01/COMPONENT_01 SCENE_01/COMPONENT_02 "
+        "SCENE_01/COMPONENT_01 supports SCENE_01/COMPONENT_02"
+    )
+    verdict["scenes"][0]["checks"]["geometry"]["evidence"] = evidence
+    assert image_optimization.canonical_reference_pack_verdict(
+        verdict, plan
+    ) == verdict
+
+    verdict["scenes"][0]["checks"]["geometry"]["evidence"] = (
+        "SCENE_01/COMPONENT_01"
+    )
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_reference_pack_verdict(verdict, plan)
+
+
+def test_v4_skill_and_human_contract_define_target_authority_and_prepared_boundary():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    for text in (skill, human):
+        for rule in (
+            "scene_plans[].continuity_graph",
+            "COMPONENT_01",
+            "supports/contacts/separate_from",
+            "in_front_of/occludes",
+            "full/partial/edge_fragment/occluded/out_of_view",
+            "same_camera",
+            "out_of_view",
+            "scene_continuity_closure",
+            "scene_continuity_view",
+        ):
+            assert rule in text
+    assert "exact 九字段" in skill
+    assert "只增加 `scene_continuity_view`" in skill
+    assert "逐帧复制整图检查" in skill
+    assert "禁止在图中引用逐帧 source `ENTITY_ID`" in skill
+    assert "图内不得引用逐帧 source ENTITY_ID" in human
+    assert "PREPARED_ONLY" in human
+    assert "不改变 postprocess 运行控制" in human
 
 
 def test_v3_compiles_distinct_current_frame_prompts_and_execution_binding():

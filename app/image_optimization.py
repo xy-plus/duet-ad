@@ -38,6 +38,8 @@ _ELEMENT_ID_RE = re.compile(
 _PERSON_ID_RE = re.compile(r"^PERSON_([0-9]{2})$")
 _SCENE_ID_RE = re.compile(r"^SCENE_([0-9]{2})$")
 _ENTITY_ID_RE = re.compile(r"^ENTITY_([0-9]{2})$")
+_COMPONENT_ID_RE = re.compile(r"^COMPONENT_([0-9]{2})$")
+_ENTITY_ID_MENTION_RE = re.compile(r"(?<![A-Z0-9_])ENTITY_[0-9]{2}(?![A-Z0-9_])")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _INELIGIBLE_REASONS = {
     "no_observable_narrative_person",
@@ -694,6 +696,25 @@ _DOMINANT_PALETTE_CONTRACT_KEYS = (
 )
 _AREA_WEIGHTED_WARM_COOL_FAMILIES = {"warm", "cool", "balanced"}
 _SATURATION_STYLES = {"muted", "natural", "vivid"}
+_SCENE_CONTINUITY_GRAPH_KEYS = {"components", "topology", "views"}
+_SCENE_CONTINUITY_CORE_KEYS = {"components", "topology"}
+_SCENE_CONTINUITY_COMPONENT_KEYS = {"component_id", "target_spec"}
+_SCENE_CONTINUITY_TOPOLOGY_PREDICATES = {
+    "supports", "contacts", "separate_from",
+}
+_SCENE_CONTINUITY_VIEW_KEYS = {
+    "segment_index", "frame_index", "transition_from_previous",
+    "observations", "view_relations",
+}
+_SCENE_CONTINUITY_OBSERVATION_KEYS = {"component_id", "visibility"}
+_SCENE_CONTINUITY_TRANSITIONS = {
+    "start", "same_camera", "camera_motion", "hard_cut",
+}
+_SCENE_CONTINUITY_VISIBILITIES = {
+    "full", "partial", "edge_fragment", "occluded", "out_of_view",
+}
+_SCENE_CONTINUITY_VISIBLE = {"full", "partial", "edge_fragment"}
+_SCENE_CONTINUITY_VIEW_PREDICATES = {"in_front_of", "occludes"}
 
 
 def _contains_directed_cycle(edges: list[tuple[str, str]]) -> bool:
@@ -717,6 +738,286 @@ def _contains_directed_cycle(edges: list[tuple[str, str]]) -> bool:
         return False
 
     return any(visit(node) for node in graph)
+
+
+def _canonical_component_relations(
+    value: object,
+    component_ids: tuple[str, ...],
+    predicates: set[str],
+    *,
+    topology: bool,
+    visibility_by_component: dict[str, str] | None = None,
+) -> list[dict]:
+    if not isinstance(value, list) or len(value) > 60:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    allowed = set(component_ids)
+    pair_keys = set()
+    cycle_edges = []
+    relations = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != _ENTITY_LEDGER_RELATION_KEYS:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        subject = item.get("subject_id")
+        predicate = item.get("predicate")
+        object_ = item.get("object_id")
+        if (
+            not isinstance(subject, str)
+            or not isinstance(object_, str)
+            or subject == object_
+            or subject not in allowed
+            or object_ not in allowed
+            or not isinstance(predicate, str)
+            or predicate not in predicates
+            or (
+                topology
+                and predicate in {"contacts", "separate_from"}
+                and subject >= object_
+            )
+            or (
+                visibility_by_component is not None
+                and (
+                    visibility_by_component[subject] == "out_of_view"
+                    or visibility_by_component[object_] == "out_of_view"
+                    or (
+                        predicate == "occludes"
+                        and visibility_by_component[subject]
+                        not in _SCENE_CONTINUITY_VISIBLE
+                    )
+                )
+            )
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        pair = tuple(sorted((subject, object_))) if topology else (subject, object_)
+        if pair in pair_keys:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        pair_keys.add(pair)
+        if (topology and predicate == "supports") or not topology:
+            cycle_edges.append((subject, object_))
+        relations.append({
+            "subject_id": subject,
+            "predicate": predicate,
+            "object_id": object_,
+        })
+    if relations != sorted(
+        relations,
+        key=lambda item: (item["subject_id"], item["predicate"], item["object_id"]),
+    ) or _contains_directed_cycle(cycle_edges):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return relations
+
+
+def _canonical_scene_continuity_core(
+    value: object,
+) -> tuple[dict, tuple[str, ...]]:
+    if not isinstance(value, dict) or set(value) != _SCENE_CONTINUITY_CORE_KEYS:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    raw_components = value.get("components")
+    raw_topology = value.get("topology")
+    if (
+        not isinstance(raw_components, list)
+        or not raw_components
+        or len(raw_components) > 30
+        or not isinstance(raw_topology, list)
+        or len(raw_topology) > 60
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    components = []
+    for index, item in enumerate(raw_components, 1):
+        if (
+            not isinstance(item, dict)
+            or set(item) != _SCENE_CONTINUITY_COMPONENT_KEYS
+            or item.get("component_id") != f"COMPONENT_{index:02d}"
+            or _COMPONENT_ID_RE.fullmatch(item["component_id"]) is None
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        target_spec = _canonical_text(item.get("target_spec"), max_bytes=1024)
+        if _ENTITY_ID_MENTION_RE.search(target_spec) is not None:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        components.append({
+            "component_id": item["component_id"],
+            "target_spec": target_spec,
+        })
+    component_ids = tuple(item["component_id"] for item in components)
+    topology = _canonical_component_relations(
+        raw_topology,
+        component_ids,
+        _SCENE_CONTINUITY_TOPOLOGY_PREDICATES,
+        topology=True,
+    )
+    return {"components": components, "topology": topology}, component_ids
+
+
+def _canonical_scene_continuity_view(
+    value: object, component_ids: tuple[str, ...],
+) -> dict:
+    if not isinstance(value, dict) or set(value) != _SCENE_CONTINUITY_VIEW_KEYS:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    segment_index = value.get("segment_index")
+    frame_index = value.get("frame_index")
+    transition = value.get("transition_from_previous")
+    if (
+        isinstance(segment_index, bool)
+        or not isinstance(segment_index, int)
+        or segment_index < 0
+        or isinstance(frame_index, bool)
+        or not isinstance(frame_index, int)
+        or frame_index < 1
+        or not isinstance(transition, str)
+        or transition not in _SCENE_CONTINUITY_TRANSITIONS
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    raw_observations = value.get("observations")
+    if not isinstance(raw_observations, list) or len(raw_observations) != len(
+        component_ids
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    observations = []
+    visibility_by_component = {}
+    for expected, item in zip(component_ids, raw_observations):
+        if (
+            not isinstance(item, dict)
+            or set(item) != _SCENE_CONTINUITY_OBSERVATION_KEYS
+            or item.get("component_id") != expected
+            or not isinstance(item.get("visibility"), str)
+            or item.get("visibility") not in _SCENE_CONTINUITY_VISIBILITIES
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        visibility_by_component[expected] = item["visibility"]
+        observations.append({
+            "component_id": expected,
+            "visibility": item["visibility"],
+        })
+    raw_relations = value.get("view_relations")
+    relations = _canonical_component_relations(
+        raw_relations,
+        component_ids,
+        _SCENE_CONTINUITY_VIEW_PREDICATES,
+        topology=False,
+        visibility_by_component=visibility_by_component,
+    )
+    occluded_components = {
+        item["object_id"] for item in relations if item["predicate"] == "occludes"
+    }
+    if any(
+        (
+            visibility in {"partial", "occluded"}
+            and component_id not in occluded_components
+        )
+        or (
+            component_id in occluded_components
+            and visibility not in {"partial", "occluded", "edge_fragment"}
+        )
+        for component_id, visibility in visibility_by_component.items()
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return {
+        "segment_index": segment_index,
+        "frame_index": frame_index,
+        "transition_from_previous": transition,
+        "observations": observations,
+        "view_relations": relations,
+    }
+
+
+def _canonical_scene_continuity_graph(
+    value: object,
+    *,
+    expected_view_keys: list[tuple[int, int]],
+    previous_global_keys: dict[tuple[int, int], tuple[int, int] | None],
+) -> dict:
+    if not isinstance(value, dict) or set(value) != _SCENE_CONTINUITY_GRAPH_KEYS:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    core, component_ids = _canonical_scene_continuity_core({
+        "components": value.get("components"),
+        "topology": value.get("topology"),
+    })
+    raw_views = value.get("views")
+    if not isinstance(raw_views, list) or len(raw_views) != len(expected_view_keys):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    views = [
+        _canonical_scene_continuity_view(item, component_ids)
+        for item in raw_views
+    ]
+    view_keys = [
+        (item["segment_index"], item["frame_index"])
+        for item in views
+    ]
+    if view_keys != expected_view_keys:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    view_by_key = dict(zip(view_keys, views))
+    for key, view in view_by_key.items():
+        previous = previous_global_keys.get(key)
+        if (view["transition_from_previous"] == "start") != (previous is None):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        if view["transition_from_previous"] == "same_camera":
+            prior = view_by_key.get(previous)
+            if prior is None:
+                raise ImageOptimizationOutputError(
+                    "image optimization output is missing or invalid"
+                )
+            prior_visibility = {
+                item["component_id"]: item["visibility"]
+                for item in prior["observations"]
+            }
+            if any(
+                prior_visibility[item["component_id"]] != "out_of_view"
+                and item["visibility"] == "out_of_view"
+                for item in view["observations"]
+            ):
+                raise ImageOptimizationOutputError(
+                    "image optimization output is missing or invalid"
+                )
+    if any(
+        all(
+            next(
+                item["visibility"]
+                for item in view["observations"]
+                if item["component_id"] == component_id
+            ) not in _SCENE_CONTINUITY_VISIBLE
+            for view in views
+        )
+        for component_id in component_ids
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return {**core, "views": views}
 
 
 def _canonical_non_person_entity_ledger(
@@ -1004,11 +1305,81 @@ def canonical_plan_v3(
     return deepcopy(_canonical_plan_v3(value, segment_indices, frame_counts))
 
 
+def _canonical_plan_v4(
+    value: object,
+    expected_indices: list[int] | None = None,
+    frame_counts: dict[int, int] | None = None,
+) -> dict:
+    if not isinstance(value, dict) or value.get("version") != 4:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    raw_scenes = value.get("scene_plans")
+    if not isinstance(raw_scenes, list):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    v3_value = deepcopy(value)
+    v3_value["version"] = 3
+    v3_scenes = []
+    for scene in raw_scenes:
+        if not isinstance(scene, dict) or "continuity_graph" not in scene:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        projected = deepcopy(scene)
+        projected.pop("continuity_graph")
+        v3_scenes.append(projected)
+    v3_value["scene_plans"] = v3_scenes
+    canonical = _canonical_plan_v3(v3_value, expected_indices, frame_counts)
+    if not canonical["eligible"]:
+        return {**canonical, "version": 4}
+
+    global_view_keys = [
+        (segment["segment_index"], constraint["frame_index"])
+        for segment in canonical["segments"]
+        for constraint in segment["frame_constraints"]
+    ]
+    previous_global_keys = {
+        key: global_view_keys[index - 1] if index else None
+        for index, key in enumerate(global_view_keys)
+    }
+    scene_for_key = {
+        (segment["segment_index"], constraint["frame_index"]):
+        segment["scene"]["scene_id"]
+        for segment in canonical["segments"]
+        for constraint in segment["frame_constraints"]
+    }
+    scenes = []
+    for base, raw in zip(canonical["scene_plans"], raw_scenes):
+        expected_view_keys = [
+            key for key in global_view_keys if scene_for_key[key] == base["id"]
+        ]
+        graph = _canonical_scene_continuity_graph(
+            raw.get("continuity_graph"),
+            expected_view_keys=expected_view_keys,
+            previous_global_keys=previous_global_keys,
+        )
+        scenes.append({**base, "continuity_graph": graph})
+    return {**canonical, "version": 4, "scene_plans": scenes}
+
+
+def canonical_plan_v4(
+    value: object,
+    segment_indices: list[int] | None = None,
+    frame_counts: dict[int, int] | None = None,
+) -> dict:
+    """Return an isolated v4 plan with scene-level target continuity authority."""
+    return deepcopy(_canonical_plan_v4(value, segment_indices, frame_counts))
+
+
 def _canonical_plan(
     value: object,
     expected_indices: list[int] | None = None,
     frame_counts: dict[int, int] | None = None,
 ) -> dict:
+    if isinstance(value, dict) and value.get("version") == 4:
+        return _canonical_plan_v4(value, expected_indices, frame_counts)
     if isinstance(value, dict) and value.get("version") == 3:
         return _canonical_plan_v3(value, expected_indices, frame_counts)
     return _canonical_plan_v2(value, expected_indices, frame_counts)
@@ -1118,16 +1489,27 @@ def compile_segment_prompts(plan: dict, edit_mode: str) -> dict[int, str]:
 
 
 def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str]]:
-    """Compile an eligible v3 plan into one immutable prompt per source frame."""
-    canonical = _canonical_plan_v3(plan)
+    """Compile an eligible v3/v4 plan into one immutable prompt per source frame."""
+    canonical = (
+        _canonical_plan_v4(plan)
+        if isinstance(plan, dict) and plan.get("version") == 4
+        else _canonical_plan_v3(plan)
+    )
     if not canonical["eligible"]:
         raise ImageOptimizationIneligibleError(canonical["reason"])
     base_plan = deepcopy(canonical)
     base_plan["version"] = 2
+    if canonical["version"] == 4:
+        for scene in base_plan["scene_plans"]:
+            scene.pop("continuity_graph")
     for segment in base_plan["segments"]:
         segment.pop("frame_constraints")
         segment.pop("photometric_contract")
     segment_prompts = compile_segment_prompts(base_plan, edit_mode)
+    continuity_by_scene = {
+        scene["id"]: scene.get("continuity_graph")
+        for scene in canonical["scene_plans"]
+    }
     prompts: dict[int, dict[int, str]] = {}
     for segment in canonical["segments"]:
         photo = segment["photometric_contract"]
@@ -1146,9 +1528,24 @@ def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str
                 f"；dominant_palette_contract="
                 f"{_plan_json(constraint['dominant_palette_contract'])}"
             )
+            continuity_clause = ""
+            if canonical["version"] == 4:
+                graph = continuity_by_scene[segment["scene"]["scene_id"]]
+                view = next(
+                    item for item in graph["views"]
+                    if item["segment_index"] == segment["segment_index"]
+                    and item["frame_index"] == constraint["frame_index"]
+                )
+                continuity_clause = (
+                    "。冻结场景连续性目标图："
+                    f"{_plan_json({key: graph[key] for key in ('components', 'topology')})}"
+                    "。当前帧场景视图："
+                    f"{_plan_json(view)}"
+                )
             per_frame[constraint["frame_index"]] = _canonical_prompt(
                 f"{segment_prompts[segment['segment_index']]}。仅当前源帧硬约束："
                 f"{frame_clause}。全局光色硬约束：{photo_clause}。"
+                f"{continuity_clause}"
                 "不得从其他帧补全，不得重布全局光线。"
             )
         prompts[segment["segment_index"]] = per_frame
@@ -1237,9 +1634,15 @@ def _canonical_plan_with_frame_inventory(
     lookup: dict[tuple[int, int], dict] = {}
     prior: tuple[int, int] | None = None
     for item in frame_inventory:
-        if not isinstance(item, dict) or set(item) != {
+        inventory_keys = {
             "segment_index", "frame_index", "frame_name", "source_sha256"
-        }:
+        }
+        if canonical["version"] == 4:
+            inventory_keys |= {
+                "source_transition_from_previous",
+                "source_transition_evidence_sha256",
+            }
+        if not isinstance(item, dict) or set(item) != inventory_keys:
             raise ValueError("invalid image optimization execution inputs")
         segment_index = item.get("segment_index")
         frame_index = item.get("frame_index")
@@ -1254,6 +1657,22 @@ def _canonical_plan_with_frame_inventory(
             or item.get("frame_name") != f"{frame_index:02d}.png"
             or not isinstance(item.get("source_sha256"), str)
             or _SHA256_RE.fullmatch(item["source_sha256"]) is None
+            or (
+                canonical["version"] == 4
+                and (
+                    not isinstance(
+                        item.get("source_transition_from_previous"), str
+                    )
+                    or item["source_transition_from_previous"]
+                    not in _SCENE_CONTINUITY_TRANSITIONS
+                    or not isinstance(
+                        item.get("source_transition_evidence_sha256"), str
+                    )
+                    or _SHA256_RE.fullmatch(
+                        item["source_transition_evidence_sha256"]
+                    ) is None
+                )
+            )
             or key in lookup
             or (prior is not None and key <= prior)
         ):
@@ -1277,6 +1696,19 @@ def _canonical_plan_with_frame_inventory(
         )
     except ImageOptimizationOutputError:
         raise ValueError("invalid image optimization execution inputs") from None
+    if canonical["version"] == 4:
+        planned_transitions = {
+            (view["segment_index"], view["frame_index"]):
+            view["transition_from_previous"]
+            for scene in canonical["scene_plans"]
+            for view in scene["continuity_graph"]["views"]
+        }
+        if any(
+            item["source_transition_from_previous"]
+            != planned_transitions[(item["segment_index"], item["frame_index"])]
+            for item in inventory
+        ):
+            raise ValueError("invalid image optimization execution inputs")
     return canonical, inventory
 
 
@@ -1318,6 +1750,7 @@ def freeze_execution_inputs(
         return {**deepcopy(item), "source_sha256": source["source_sha256"]}
 
     segments = {item["segment_index"]: item for item in canonical["segments"]}
+    scene_plans = {item["id"]: item for item in canonical["scene_plans"]}
     frames = []
     for source in inventory:
         segment = segments[source["segment_index"]]
@@ -1331,7 +1764,7 @@ def freeze_execution_inputs(
             "observable_person_ids": observable,
             "scene_id": segment["scene"]["scene_id"],
         }
-        if canonical["version"] == 3:
+        if canonical["version"] in {3, 4}:
             constraint = next(
                 item
                 for item in segment["frame_constraints"]
@@ -1341,8 +1774,16 @@ def freeze_execution_inputs(
                 frame_constraint=deepcopy(constraint),
                 photometric_contract=deepcopy(segment["photometric_contract"]),
             )
+        if canonical["version"] == 4:
+            graph = scene_plans[segment["scene"]["scene_id"]]["continuity_graph"]
+            view = next(
+                item for item in graph["views"]
+                if item["segment_index"] == source["segment_index"]
+                and item["frame_index"] == source["frame_index"]
+            )
+            current["scene_continuity_view"] = deepcopy(view)
         frames.append(current)
-    return {
+    payload = {
         "version": canonical["version"],
         "plan_sha256": plan_sha256(canonical),
         "profile": deepcopy(profile),
@@ -1353,14 +1794,109 @@ def freeze_execution_inputs(
         "layout_slots": [freeze_slot(item) for item in slots["layout"]],
         "frames": frames,
     }
+    if canonical["version"] == 4:
+        frame_counts = {
+            index: sum(item["segment_index"] == index for item in inventory)
+            for index in canonical["segment_indices"]
+        }
+        payload["continuity_sha256"] = freeze_continuity(
+            canonical, frame_counts=frame_counts
+        )["_image_continuity"]["sha256"]
+        payload["sha256"] = sha256(_plan_json(payload))
+    return payload
+
+
+def _freeze_frame_prompts_v4(
+    settings: Settings,
+    execution_inputs: dict,
+    prompts: dict[int, dict[int, str]],
+    plan: dict | None,
+) -> dict:
+    expected_keys = {
+        "version", "plan_sha256", "profile", "revision", "model",
+        "identity_slots", "scene_slots", "layout_slots", "frames",
+        "continuity_sha256", "sha256",
+    }
+    if (
+        not isinstance(execution_inputs, dict)
+        or set(execution_inputs) != expected_keys
+        or execution_inputs.get("version") != 4
+        or execution_inputs.get("model") != settings.seedream_model
+        or not isinstance(plan, dict)
+        or not isinstance(prompts, dict)
+        or not isinstance(execution_inputs.get("frames"), list)
+        or not execution_inputs["frames"]
+    ):
+        raise ValueError("invalid image optimization frame prompts")
+    inventory = []
+    for frame in execution_inputs["frames"]:
+        if not isinstance(frame, dict) or set(frame) != {
+            "segment_index", "frame_index", "frame_name", "source_sha256",
+            "observable_person_ids", "scene_id", "frame_constraint",
+            "photometric_contract", "source_transition_from_previous",
+            "source_transition_evidence_sha256", "scene_continuity_view",
+        }:
+            raise ValueError("invalid image optimization frame prompts")
+        inventory.append({
+            key: frame[key] for key in (
+                "segment_index", "frame_index", "frame_name", "source_sha256",
+                "source_transition_from_previous",
+                "source_transition_evidence_sha256",
+            )
+        })
+    try:
+        expected_inputs = freeze_execution_inputs(
+            plan,
+            revision=execution_inputs["revision"],
+            profile=execution_inputs["profile"],
+            model=execution_inputs["model"],
+            frame_inventory=inventory,
+        )
+        expected_prompts = compile_frame_prompts(plan, settings.seedream_edit_mode)
+    except (
+        KeyError, TypeError, ValueError, ImageOptimizationOutputError,
+        ImageOptimizationIneligibleError,
+    ):
+        raise ValueError("invalid image optimization frame prompts") from None
+    if execution_inputs != expected_inputs or prompts != expected_prompts:
+        raise ValueError("invalid image optimization frame prompts")
+    frozen = []
+    for frame in execution_inputs["frames"]:
+        text = expected_prompts[frame["segment_index"]][frame["frame_index"]]
+        frozen.append({
+            "segment_index": frame["segment_index"],
+            "frame_name": frame["frame_name"],
+            "source_sha256": frame["source_sha256"],
+            "default": text,
+            "current": text,
+            "sha256": sha256(text),
+        })
+    receipt = {
+        "version": 4,
+        "plan_sha256": execution_inputs["plan_sha256"],
+        "continuity_sha256": execution_inputs["continuity_sha256"],
+        "execution_input_sha256": execution_inputs["sha256"],
+        "execution_inputs": deepcopy(execution_inputs),
+        "model": settings.seedream_model,
+        "edit_mode": settings.seedream_edit_mode,
+        "frames": frozen,
+    }
+    return {"_image_optimization": {
+        **receipt,
+        "sha256": sha256(_plan_json(receipt)),
+    }}
 
 
 def freeze_frame_prompts(
     settings: Settings,
     execution_inputs: dict,
     prompts: dict[int, dict[int, str]],
+    *,
+    plan: dict | None = None,
 ) -> dict:
-    """Freeze v3 prompts against one exact source frame identity per call."""
+    """Freeze v3/v4 prompts against one exact source frame identity per call."""
+    if isinstance(execution_inputs, dict) and execution_inputs.get("version") == 4:
+        return _freeze_frame_prompts_v4(settings, execution_inputs, prompts, plan)
     expected_keys = {
         "version", "plan_sha256", "profile", "revision", "model",
         "identity_slots", "scene_slots", "layout_slots", "frames",
@@ -1471,7 +2007,7 @@ def _canonical_project_output(
     plan = _canonical_plan(value, indices, frame_counts)
     if not plan["eligible"]:
         raise ImageOptimizationIneligibleError(plan["reason"])
-    if plan["version"] == 3:
+    if plan["version"] in {3, 4}:
         return plan, compile_frame_prompts(plan, edit_mode)
     return plan, compile_segment_prompts(plan, edit_mode)
 
@@ -1568,9 +2104,9 @@ def generate_project_prompts(
 def freeze_continuity(
     plan: dict, *, frame_counts: dict[int, int] | None = None
 ) -> dict:
-    if isinstance(plan, dict) and plan.get("version") in {2, 3}:
+    if isinstance(plan, dict) and plan.get("version") in {2, 3, 4}:
         canonical = _canonical_plan(plan, frame_counts=frame_counts)
-        if canonical["version"] == 3 and frame_counts is None:
+        if canonical["version"] in {3, 4} and frame_counts is None:
             raise ImageOptimizationOutputError(
                 "image optimization output is missing or invalid"
             )
@@ -1595,14 +2131,14 @@ def freeze_continuity(
 
 
 def freeze_plan_audit_inputs(plan: dict, *, frame_inventory: list[dict]) -> dict:
-    """Freeze the source-frame evidence a pre-provider v3 audit may inspect."""
+    """Freeze the source-frame evidence a pre-provider v3/v4 audit may inspect."""
     try:
         canonical, inventory = _canonical_plan_with_frame_inventory(
             plan, frame_inventory
         )
     except ValueError:
         raise ValueError("invalid image plan audit inputs") from None
-    if canonical["version"] != 3:
+    if canonical["version"] not in {3, 4}:
         raise ValueError("invalid image plan audit inputs")
     frame_counts = {
         index: sum(item["segment_index"] == index for item in inventory)
@@ -1643,7 +2179,7 @@ def _canonical_plan_audit_inputs(plan: dict, value: object) -> tuple[dict, dict]
         raise ImageOptimizationOutputError(
             "image plan audit input is missing or invalid"
         ) from None
-    if canonical["version"] != 3 or value != expected:
+    if canonical["version"] not in {3, 4} or value != expected:
         raise ImageOptimizationOutputError("image plan audit input is missing or invalid")
     return canonical, expected
 
@@ -1657,7 +2193,7 @@ def canonical_plan_audit_verdict(value: object, plan: dict, audit_inputs: dict) 
             "version", "phase", "plan_sha256", "continuity_sha256",
             "audit_input_sha256", "passed", "reason", "frame_checks",
         }
-        or value.get("version") != 3
+        or value.get("version") != canonical_plan["version"]
         or value.get("phase") != "plan_audit"
         or value.get("plan_sha256") != receipt["plan_sha256"]
         or value.get("continuity_sha256") != receipt["continuity_sha256"]
@@ -1669,13 +2205,18 @@ def canonical_plan_audit_verdict(value: object, plan: dict, audit_inputs: dict) 
         raise ImageOptimizationOutputError("image plan audit output is missing or invalid")
     checks = []
     statuses = []
+    closure_keys = (
+        "body_closure", "scene_closure", "entity_closure", "relation_closure",
+    )
+    if canonical_plan["version"] == 4:
+        closure_keys += ("scene_continuity_closure",)
     for expected, raw in zip(receipt["frames"], value["frame_checks"]):
+        frame_check_keys = {
+            "segment_index", "frame_index", "source_sha256", *closure_keys,
+        }
         if (
             not isinstance(raw, dict)
-            or set(raw) != {
-                "segment_index", "frame_index", "source_sha256", "body_closure",
-                "scene_closure", "entity_closure", "relation_closure",
-            }
+            or set(raw) != frame_check_keys
             or raw.get("segment_index") != expected["segment_index"]
             or raw.get("frame_index") != expected["frame_index"]
             or raw.get("source_sha256") != expected["source_sha256"]
@@ -1688,9 +2229,7 @@ def canonical_plan_audit_verdict(value: object, plan: dict, audit_inputs: dict) 
             "frame_index": expected["frame_index"],
             "source_sha256": expected["source_sha256"],
         }
-        for key in (
-            "body_closure", "scene_closure", "entity_closure", "relation_closure"
-        ):
+        for key in closure_keys:
             item[key] = _canonical_quality_check(raw.get(key))
             statuses.append(item[key]["status"])
         checks.append(item)
@@ -1701,7 +2240,7 @@ def canonical_plan_audit_verdict(value: object, plan: dict, audit_inputs: dict) 
     if value["passed"] != passed or value.get("reason") != reason:
         raise ImageOptimizationOutputError("image plan audit output is missing or invalid")
     return {
-        "version": 3,
+        "version": canonical_plan["version"],
         "phase": "plan_audit",
         "plan_sha256": receipt["plan_sha256"],
         "continuity_sha256": receipt["continuity_sha256"],
@@ -1734,6 +2273,10 @@ def generate_plan_audit_verdict(
         raise ValueError("invalid image plan audit input")
     prepared = []
     actual_inventory = []
+    receipt_by_frame = {
+        (item["segment_index"], item["frame_index"]): item
+        for item in receipt["frames"]
+    }
     for expected, segment in zip(canonical_plan["segment_indices"], segments):
         if (
             not isinstance(segment, dict)
@@ -1749,14 +2292,23 @@ def generate_plan_audit_verdict(
             raise ValueError("invalid image plan audit input") from None
         prepared.append((expected, frames))
         for frame_index, frame in enumerate(frames, 1):
-            actual_inventory.append(
-                {
-                    "segment_index": expected,
-                    "frame_index": frame_index,
-                    "frame_name": frame.name,
-                    "source_sha256": _sha256_regular(frame),
-                }
-            )
+            item = {
+                "segment_index": expected,
+                "frame_index": frame_index,
+                "frame_name": frame.name,
+                "source_sha256": _sha256_regular(frame),
+            }
+            if canonical_plan["version"] == 4:
+                frozen = receipt_by_frame.get((expected, frame_index), {})
+                item.update(
+                    source_transition_from_previous=frozen.get(
+                        "source_transition_from_previous"
+                    ),
+                    source_transition_evidence_sha256=frozen.get(
+                        "source_transition_evidence_sha256"
+                    ),
+                )
+            actual_inventory.append(item)
     if actual_inventory != receipt["frames"]:
         raise ValueError("invalid image plan audit input")
     frame_counts = {index: len(frames) for index, frames in prepared}
@@ -1816,7 +2368,9 @@ def generate_plan_audit_verdict(
                     work / "plan_audit.json",
                     MAX_CONTINUITY_BYTES
                     + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES
-                    + len(receipt["frames"]) * 4 * 2048,
+                    + len(receipt["frames"])
+                    * (5 if canonical_plan["version"] == 4 else 4)
+                    * 2048,
                 ),
                 canonical_plan,
                 receipt,
@@ -1839,7 +2393,7 @@ def continuity_receipt(meta: dict) -> dict | None:
             "segment_indices": raw.get("segment_indices"),
             "elements": raw.get("elements"),
         }
-    elif raw.get("version") in {2, 3}:
+    elif raw.get("version") in {2, 3, 4}:
         if set(raw) != {
             "version", "phase", "segment_indices", "eligible", "reason",
             "person_plans", "scene_plans", "segments", "sha256",
@@ -1850,7 +2404,7 @@ def continuity_receipt(meta: dict) -> dict | None:
         return None
     try:
         frame_counts = None
-        if candidate.get("version") == 3:
+        if candidate.get("version") in {3, 4}:
             raw_segments = candidate.get("segments")
             if not isinstance(raw_segments, list):
                 return None
@@ -1867,14 +2421,14 @@ def continuity_receipt(meta: dict) -> dict | None:
 
 
 def dual_target_plan_receipt(meta: dict) -> dict | None:
-    """Return a valid v2/v3 dual-target receipt; reject corrupt state fail-closed."""
+    """Return a valid v2/v3/v4 dual-target receipt; reject corrupt state fail-closed."""
     if "_image_continuity" not in meta:
         return None
     raw = meta.get("_image_continuity")
     valid = continuity_receipt(meta)
     if valid is not None and valid.get("version") == 1:
         return None
-    if valid is not None and valid.get("version") in {2, 3}:
+    if valid is not None and valid.get("version") in {2, 3, 4}:
         return valid
     raise ImageOptimizationOutputError("image continuity receipt is invalid")
 
@@ -2157,6 +2711,31 @@ def _reference_pack_verification_reason(
     return None
 
 
+def _scene_continuity_evidence_tokens(scene: dict) -> tuple[str, ...]:
+    graph = scene["continuity_graph"]
+    scene_id = scene["id"]
+    return tuple(
+        [
+            f"{scene_id}/{component['component_id']}"
+            for component in graph["components"]
+        ]
+        + [
+            f"{scene_id}/{relation['subject_id']} {relation['predicate']} "
+            f"{scene_id}/{relation['object_id']}"
+            for relation in graph["topology"]
+        ]
+    )
+
+
+def _require_scene_continuity_evidence(evidence: str, scene: dict) -> None:
+    if any(
+        token not in evidence for token in _scene_continuity_evidence_tokens(scene)
+    ):
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        )
+
+
 def canonical_reference_pack_verdict(value: object, plan: dict) -> dict:
     """Validate and derive the exact semantic replacement-pack verdict."""
     canonical_plan = _canonical_plan(plan)
@@ -2228,6 +2807,15 @@ def canonical_reference_pack_verdict(value: object, plan: dict) -> dict:
         "scene_id",
         _PACK_SCENE_CHECKS,
     )
+    if canonical_plan["version"] == 4:
+        for result, design in zip(scenes, canonical_plan["scene_plans"]):
+            _require_scene_continuity_evidence(
+                " ".join(
+                    result["checks"][key]["evidence"]
+                    for key in ("geometry", "depth", "layout")
+                ),
+                design,
+            )
     raw_project = value.get("project")
     if not isinstance(raw_project, dict) or set(raw_project) != set(
         _PACK_PROJECT_CHECKS
@@ -2353,7 +2941,19 @@ def generate_reference_pack_verdict(
         )
         (work / "frozen_plan.json").write_text(
             json.dumps(
-                freeze_continuity(canonical_plan)["_image_continuity"],
+                freeze_continuity(
+                    canonical_plan,
+                    frame_counts=(
+                        {
+                            segment["segment_index"]: len(
+                                segment["frame_constraints"]
+                            )
+                            for segment in canonical_plan["segments"]
+                        }
+                        if canonical_plan["version"] == 4
+                        else None
+                    ),
+                )["_image_continuity"],
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -2430,7 +3030,9 @@ def _v3_common_projection(value: dict, plan: dict) -> dict:
     return base, base_plan
 
 
-def _canonical_verification_v3(value: object, plan: dict) -> dict:
+def _canonical_verification_v3(
+    value: object, plan: dict, *, derive_claims: bool = False,
+) -> dict:
     canonical_plan = _canonical_plan_v3(plan)
     keys = {
         "version", "phase", "plan_sha256", "segment_indices", "passed", "reason",
@@ -2512,7 +3114,7 @@ def _canonical_verification_v3(value: object, plan: dict) -> dict:
             for key, check in frame.items()
             if key != "frame_index"
         )
-        if raw.get("passed") != segment_passed:
+        if not derive_claims and raw.get("passed") != segment_passed:
             raise ImageOptimizationOutputError(
                 "image verification output is missing or invalid"
             )
@@ -2529,7 +3131,9 @@ def _canonical_verification_v3(value: object, plan: dict) -> dict:
         reason = "dominant_palette_preservation_failed"
     if reason is None and any_photo_failure:
         reason = "lighting_preservation_failed"
-    if value["passed"] != passed or value.get("reason") != reason:
+    if not derive_claims and (
+        value["passed"] != passed or value.get("reason") != reason
+    ):
         raise ImageOptimizationOutputError(
             "image verification output is missing or invalid"
         )
@@ -2545,7 +3149,137 @@ def _canonical_verification_v3(value: object, plan: dict) -> dict:
     }
 
 
+def _v4_common_projection(value: dict, plan: dict) -> dict:
+    v3_plan = deepcopy(plan)
+    v3_plan["version"] = 3
+    for scene in v3_plan["scene_plans"]:
+        scene.pop("continuity_graph")
+    v3_value = deepcopy(value)
+    v3_value["version"] = 3
+    v3_value["plan_sha256"] = plan_sha256(v3_plan)
+    try:
+        for segment in v3_value["segments"]:
+            for frame in segment["frame_checks"]:
+                frame.pop("scene_continuity_view")
+        return _canonical_verification_v3(
+            v3_value, v3_plan, derive_claims=True
+        )
+    except (KeyError, TypeError, AttributeError, ImageOptimizationOutputError):
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        ) from None
+
+
+def _canonical_verification_v4(value: object, plan: dict) -> dict:
+    canonical_plan = _canonical_plan_v4(plan)
+    keys = {
+        "version", "phase", "plan_sha256", "segment_indices", "passed", "reason",
+        "segments", "project_checks",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get("version") != 4
+        or value.get("phase") != "verify"
+        or value.get("plan_sha256") != plan_sha256(canonical_plan)
+        or value.get("segment_indices") != canonical_plan["segment_indices"]
+        or not isinstance(value.get("passed"), bool)
+        or not isinstance(value.get("segments"), list)
+        or len(value["segments"]) != len(canonical_plan["segments"])
+    ):
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        )
+    common = _v4_common_projection(value, canonical_plan)
+    for scene in canonical_plan["scene_plans"]:
+        _require_scene_continuity_evidence(
+            common["project_checks"]["scene_continuity"]["evidence"], scene
+        )
+    segments = []
+    any_unknown = common["reason"] == "verification_unknown"
+    any_continuity_failure = False
+    for expected, raw, common_segment in zip(
+        canonical_plan["segments"], value["segments"], common["segments"]
+    ):
+        if not isinstance(raw, dict) or set(raw) != {
+            "segment_index", "passed", "person_checks", "scene_checks", "invariants",
+            "frame_checks",
+        } or raw.get("segment_index") != expected["segment_index"]:
+            raise ImageOptimizationOutputError(
+                "image verification output is missing or invalid"
+            )
+        raw_checks = raw.get("frame_checks")
+        if not isinstance(raw_checks, list) or len(raw_checks) != len(
+            expected["frame_constraints"]
+        ):
+            raise ImageOptimizationOutputError(
+                "image verification output is missing or invalid"
+            )
+        frame_checks = []
+        for constraint, raw_check, common_check in zip(
+            expected["frame_constraints"], raw_checks, common_segment["frame_checks"]
+        ):
+            expected_keys = {
+                "frame_index", *_FRAME_CONSTRAINT_KEYS[1:], "photometric_contract",
+                "scene_continuity_view",
+            }
+            if (
+                not isinstance(raw_check, dict)
+                or set(raw_check) != expected_keys
+                or raw_check.get("frame_index") != constraint["frame_index"]
+            ):
+                raise ImageOptimizationOutputError(
+                    "image verification output is missing or invalid"
+                )
+            continuity_checks = {
+                "scene_continuity_view": _canonical_quality_check(
+                    raw_check.get("scene_continuity_view")
+                )
+            }
+            statuses = [item["status"] for item in continuity_checks.values()]
+            any_unknown = any_unknown or "unknown" in statuses
+            any_continuity_failure = any_continuity_failure or "fail" in statuses
+            frame_checks.append({**common_check, **continuity_checks})
+        segment_passed = common_segment["passed"] and all(
+            check["status"] == "pass"
+            for frame in frame_checks
+            for key, check in frame.items()
+            if key != "frame_index"
+        )
+        if raw.get("passed") != segment_passed:
+            raise ImageOptimizationOutputError(
+                "image verification output is missing or invalid"
+            )
+        segments.append({
+            **common_segment,
+            "passed": segment_passed,
+            "frame_checks": frame_checks,
+        })
+    passed = all(segment["passed"] for segment in segments) and all(
+        check["status"] == "pass" for check in common["project_checks"].values()
+    )
+    reason = "verification_unknown" if any_unknown else common["reason"]
+    if reason is None and any_continuity_failure:
+        reason = "scene_continuity_failed"
+    if value["passed"] != passed or value.get("reason") != reason:
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        )
+    return {
+        "version": 4,
+        "phase": "verify",
+        "plan_sha256": plan_sha256(canonical_plan),
+        "segment_indices": list(canonical_plan["segment_indices"]),
+        "passed": passed,
+        "reason": reason,
+        "segments": segments,
+        "project_checks": common["project_checks"],
+    }
+
+
 def canonical_verification(value: object, plan: dict) -> dict:
+    if isinstance(plan, dict) and plan.get("version") == 4:
+        return _canonical_verification_v4(value, plan)
     if isinstance(plan, dict) and plan.get("version") == 3:
         return _canonical_verification_v3(value, plan)
     return _canonical_verification_v2(value, plan)
@@ -2713,9 +3447,88 @@ def freeze_prompts(settings: Settings, meta: dict, prompts: dict[int, str]) -> d
     }}
 
 
+def _receipt_v4(raw: dict, meta: dict) -> dict | None:
+    if (
+        set(raw) != {
+            "version", "plan_sha256", "continuity_sha256",
+            "execution_input_sha256", "execution_inputs", "model", "edit_mode",
+            "frames", "sha256",
+        }
+        or raw.get("model") not in SEEDREAM_MODELS
+        or raw.get("edit_mode") not in SEEDREAM_EDIT_MODES
+        or not isinstance(raw.get("execution_inputs"), dict)
+        or raw.get("execution_input_sha256")
+        != raw["execution_inputs"].get("sha256")
+        or raw.get("sha256") != sha256(_plan_json({
+            key: value for key, value in raw.items() if key != "sha256"
+        }))
+    ):
+        return None
+    try:
+        frozen_plan = dual_target_plan_receipt(meta)
+        if frozen_plan is None or frozen_plan.get("version") != 4:
+            return None
+        plan = {key: value for key, value in frozen_plan.items() if key != "sha256"}
+        execution = raw["execution_inputs"]
+        inventory = [
+            {
+                key: frame[key] for key in (
+                    "segment_index", "frame_index", "frame_name", "source_sha256",
+                    "source_transition_from_previous",
+                    "source_transition_evidence_sha256",
+                )
+            }
+            for frame in execution["frames"]
+        ]
+        expected_execution = freeze_execution_inputs(
+            plan,
+            revision=execution["revision"],
+            profile=execution["profile"],
+            model=execution["model"],
+            frame_inventory=inventory,
+        )
+        expected_prompts = compile_frame_prompts(plan, raw["edit_mode"])
+    except (
+        KeyError, TypeError, ValueError, ImageOptimizationOutputError,
+        ImageOptimizationIneligibleError,
+    ):
+        return None
+    if (
+        execution != expected_execution
+        or raw.get("plan_sha256") != expected_execution["plan_sha256"]
+        or raw.get("continuity_sha256") != frozen_plan["sha256"]
+        or raw["continuity_sha256"] != expected_execution["continuity_sha256"]
+        or not isinstance(raw.get("frames"), list)
+        or len(raw["frames"]) != len(execution["frames"])
+    ):
+        return None
+    for frozen, frame in zip(raw["frames"], execution["frames"]):
+        if not isinstance(frozen, dict) or set(frozen) != {
+            "segment_index", "frame_name", "source_sha256",
+            "default", "current", "sha256",
+        }:
+            return None
+        try:
+            text = expected_prompts[frame["segment_index"]][frame["frame_index"]]
+        except (KeyError, TypeError):
+            return None
+        if frozen != {
+            "segment_index": frame["segment_index"],
+            "frame_name": frame["frame_name"],
+            "source_sha256": frame["source_sha256"],
+            "default": text,
+            "current": text,
+            "sha256": sha256(text),
+        }:
+            return None
+    return deepcopy(raw)
+
+
 def receipt(meta: dict, settings: Settings | None = None) -> dict | None:
     raw = meta.get("_image_optimization")
     if isinstance(raw, dict):
+        if raw.get("version") == 4:
+            return _receipt_v4(raw, meta)
         if raw.get("version") == 3:
             if (
                 set(raw) != {
@@ -2737,7 +3550,7 @@ def receipt(meta: dict, settings: Settings | None = None) -> dict | None:
                 return None
             if (
                 plan is None
-                or plan.get("version") != 3
+                or plan.get("version") != raw.get("version")
                 or raw.get("plan_sha256") != plan_sha256(
                     {key: value for key, value in plan.items() if key != "sha256"}
                 )

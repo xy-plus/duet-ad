@@ -987,6 +987,116 @@ def _v3_frame_bound_plan() -> dict:
     }
 
 
+def _v4_frame_bound_plan() -> dict:
+    plan = _v3_frame_bound_plan()
+    plan["version"] = 4
+    plan["scene_plans"][0]["continuity_graph"] = {
+        "components": [{
+            "component_id": "COMPONENT_01",
+            "target_spec": "target-spec-01",
+        }],
+        "topology": [],
+        "views": [
+            {
+                "segment_index": 0,
+                "frame_index": 1,
+                "transition_from_previous": "start",
+                "observations": [{
+                    "component_id": "COMPONENT_01",
+                    "visibility": "full",
+                }],
+                "view_relations": [],
+            },
+            {
+                "segment_index": 0,
+                "frame_index": 2,
+                "transition_from_previous": "same_camera",
+                "observations": [{
+                    "component_id": "COMPONENT_01",
+                    "visibility": "full",
+                }],
+                "view_relations": [],
+            },
+        ],
+    }
+    return plan
+
+
+def test_v4_frame_receipt_deeply_binds_graph_view_plan_and_source(tmp_path):
+    settings = make_settings(tmp_path)
+    plan = _v4_frame_bound_plan()
+    inventory = [
+        {
+            "segment_index": 0,
+            "frame_index": frame_index,
+            "frame_name": f"{frame_index:02d}.png",
+            "source_sha256": str(frame_index) * 64,
+            "source_transition_from_previous": (
+                "start" if frame_index == 1 else "same_camera"
+            ),
+            "source_transition_evidence_sha256": (
+                "a" * 64 if frame_index == 1 else "b" * 64
+            ),
+        }
+        for frame_index in (1, 2)
+    ]
+    execution = image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={"id": "generic-profile", "revision": 1},
+        model=settings.seedream_model,
+        frame_inventory=inventory,
+    )
+    prompts = image_optimization.compile_frame_prompts(
+        plan, settings.seedream_edit_mode
+    )
+    frozen = image_optimization.freeze_frame_prompts(
+        settings, execution, prompts, plan=plan
+    )
+    meta = {
+        **image_optimization.freeze_continuity(
+            plan, frame_counts={0: 2}
+        ),
+        **frozen,
+    }
+    assert image_optimization.receipt(meta, settings) == frozen[
+        "_image_optimization"
+    ]
+
+    changed_view = deepcopy(execution)
+    changed_view["frames"][1]["scene_continuity_view"][
+        "transition_from_previous"
+    ] = "start"
+    with pytest.raises(ValueError, match="frame prompts"):
+        image_optimization.freeze_frame_prompts(
+            settings, changed_view, prompts, plan=plan
+        )
+
+    changed_target_plan = deepcopy(plan)
+    changed_target_plan["scene_plans"][0]["continuity_graph"]["components"][0][
+        "target_spec"
+    ] = "target-spec-revision"
+    changed_target_meta = {
+        **image_optimization.freeze_continuity(
+            changed_target_plan, frame_counts={0: 2}
+        ),
+        **frozen,
+    }
+    assert image_optimization.receipt(changed_target_meta, settings) is None
+
+    changed_view_plan = deepcopy(plan)
+    changed_view_plan["scene_plans"][0]["continuity_graph"]["views"][1][
+        "observations"
+    ][0]["visibility"] = "edge_fragment"
+    changed_view_meta = {
+        **image_optimization.freeze_continuity(
+            changed_view_plan, frame_counts={0: 2}
+        ),
+        **frozen,
+    }
+    assert image_optimization.receipt(changed_view_meta, settings) is None
+
+
 class _PlanAuditRunner:
     def __init__(self, status: str, verify_status: str = "pass") -> None:
         self.status = status
