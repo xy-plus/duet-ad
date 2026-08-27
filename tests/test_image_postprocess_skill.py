@@ -895,6 +895,37 @@ def test_skill_requires_a_current_frame_fragment_ledger_and_self_audit():
         assert rule in human
 
 
+def test_skill_requires_entity_chain_unique_contact_and_scene_boundary_audit():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    for rule in (
+        "全画面非人物实体及其边缘碎片账本",
+        "与人物或目标操作相关的可见非人物实体",
+        "支撑、接触、分离和遮挡链",
+        "段级 `protected_relations` 不能替代逐帧事实",
+        "`contact_points` 只能写当前帧唯一可观察关系",
+        "禁止候选表述",
+        "任何遮挡或裁切使接触双方边界不可同帧观察",
+        "scene boundary 与 semantic/geometry/depth/layout/local_color 必须逐项相容",
+        "新增结构不得越过声明边界",
+        "scene_structure_replacement_unsafe",
+    ):
+        assert rule in skill
+
+    for rule in (
+        "全画面非人物实体及其边缘碎片账本",
+        "段级 `protected_relations` 不能替代逐帧事实",
+        "当前帧唯一可观察关系",
+        "遮挡或裁切使接触双方边界不可同帧观察",
+        "scene boundary 与五维变化逐项相容",
+        "新增结构不得越过声明边界",
+    ):
+        assert rule in human
+
+
 def _plan_v3() -> dict:
     plan = _plan([0])
     plan["version"] = 3
