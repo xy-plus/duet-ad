@@ -299,10 +299,10 @@ def load_prompt_fusion(
     )
 
 
-def load_prompt_fusion_manifest(
-    *, root: Path, skill_source_path: Path,
+def _load_prompt_fusion_manifest(
+    *, root: Path, skill_source_path: Path | None,
 ) -> FrozenPromptFusion:
-    """Revalidate the manifest-last fusion production at a paid boundary."""
+    """Revalidate frozen production; optionally prove current Skill equality."""
     root = Path(root).resolve()
     manifest_path = root / "work" / h3_project.SOURCE_FILENAME
     manifest_data, manifest = _fusion_json(
@@ -353,17 +353,22 @@ def load_prompt_fusion_manifest(
         raise LongGenerationError("prompt_fusion_manifest_invalid")
     frozen_skill = root / skill["frozen_path"]
     try:
-        source_skill_data = Path(skill_source_path).read_bytes()
         frozen_skill_data = frozen_skill.read_bytes()
     except OSError:
         raise LongGenerationError("prompt_fusion_manifest_invalid") from None
     if (
         frozen_skill.is_symlink()
-        or not source_skill_data
-        or source_skill_data != frozen_skill_data
-        or hashlib.sha256(source_skill_data).hexdigest() != skill.get("sha256")
+        or not frozen_skill_data
+        or hashlib.sha256(frozen_skill_data).hexdigest() != skill.get("sha256")
     ):
         raise LongGenerationError("prompt_fusion_manifest_invalid")
+    if skill_source_path is not None:
+        try:
+            source_skill_data = Path(skill_source_path).read_bytes()
+        except OSError:
+            raise LongGenerationError("prompt_fusion_manifest_invalid") from None
+        if not source_skill_data or source_skill_data != frozen_skill_data:
+            raise LongGenerationError("prompt_fusion_manifest_invalid")
     frozen = load_prompt_fusion(
         input_path=input_path, output_path=output_path, root=root,
     )
@@ -384,8 +389,18 @@ def load_prompt_fusion_manifest(
     return frozen
 
 
+def load_prompt_fusion_manifest(
+    *, root: Path, skill_source_path: Path,
+) -> FrozenPromptFusion:
+    """Strict creation/recovery gate binding current and frozen Skill bytes."""
+    return _load_prompt_fusion_manifest(
+        root=root,
+        skill_source_path=skill_source_path,
+    )
+
+
 def load_bound_prompt_fusion_manifest(
-    *, root: Path, meta: Mapping, skill_source_path: Path,
+    *, root: Path, meta: Mapping,
 ) -> FrozenPromptFusion:
     """Load fusion only when durable project state binds this manifest."""
     root = Path(root).resolve()
@@ -414,8 +429,9 @@ def load_bound_prompt_fusion_manifest(
         != state.get("image_acceptance_sha256")
     ):
         raise LongGenerationError("prompt_fusion_manifest_invalid")
-    frozen = load_prompt_fusion_manifest(
-        root=root, skill_source_path=skill_source_path,
+    frozen = _load_prompt_fusion_manifest(
+        root=root,
+        skill_source_path=None,
     )
     if frozen.input_sha256 != state.get("input_sha256"):
         raise LongGenerationError("prompt_fusion_manifest_invalid")
@@ -1127,7 +1143,6 @@ def finalize_multimodal_plan(
             load_bound_prompt_fusion_manifest(
                 root=root,
                 meta=meta,
-                skill_source_path=PROMPT_FUSION_SKILL_SOURCE,
             )
         return None
     if receipt_version != long_video.PLAN_RECEIPT_VERSION:
@@ -1187,7 +1202,6 @@ def finalize_multimodal_plan(
     fusion = load_bound_prompt_fusion_manifest(
         root=root,
         meta=meta,
-        skill_source_path=pipeline.PROMPT_FUSION_SKILL_MD,
     )
     if fusion.input_data != input_data:
         raise LongGenerationError("prompt_fusion_input_invalid")
@@ -1457,7 +1471,6 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         frozen_fusion = load_bound_prompt_fusion_manifest(
             root=root,
             meta=meta,
-            skill_source_path=PROMPT_FUSION_SKILL_SOURCE,
         )
         if manifest_path != root / "work" / h3_project.SOURCE_FILENAME \
                 or len(frozen_fusion.segments) != len(payload.get("segments", [])):

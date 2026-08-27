@@ -346,7 +346,6 @@ def _public_prompt_fusion(meta: dict, cdir: Path) -> dict:
             frozen = long_generation.load_bound_prompt_fusion_manifest(
                 root=cdir,
                 meta=meta,
-                skill_source_path=pipeline.PROMPT_FUSION_SKILL_MD,
             )
             return {
                 "status": "done",
