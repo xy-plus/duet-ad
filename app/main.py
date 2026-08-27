@@ -2056,7 +2056,7 @@ def create_app(settings: Settings) -> FastAPI:
             task = asyncio.create_task(
                 postprocess.run_task(
                     settings, cid, mediakit_sem, seedream_sem,
-                    audit_runner=codex_runner,
+                    audit_runner=codex_runner, verification_runner=codex_runner,
                 ),
                 name=f"postprocess-recover-{cid[:8]}",
             )
@@ -2966,7 +2966,7 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=e.status, detail=e.detail) from e
         background_tasks.add_task(
             postprocess.run_task, settings, cid, mediakit_sem, seedream_sem,
-            audit_runner=codex_runner,
+            audit_runner=codex_runner, verification_runner=codex_runner,
         )
         return {"status": "running", "frames": []}
 
@@ -2985,7 +2985,7 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
         background_tasks.add_task(
             postprocess.run_task, settings, cid, mediakit_sem, seedream_sem, {index},
-            audit_runner=codex_runner,
+            audit_runner=codex_runner, verification_runner=codex_runner,
         )
         return {"status": "running", "segment_index": index}
 

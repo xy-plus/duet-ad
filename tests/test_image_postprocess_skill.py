@@ -1068,6 +1068,10 @@ def _plan_v3() -> dict:
                     "object_id": "PERSON_01",
                 }],
             },
+            "dominant_palette_contract": {
+                "area_weighted_warm_cool_family": "warm",
+                "saturation_style": "natural",
+            },
         },
         {
             "frame_index": 2,
@@ -1087,6 +1091,10 @@ def _plan_v3() -> dict:
                     "predicate": "contacts",
                     "object_id": "PERSON_01",
                 }],
+            },
+            "dominant_palette_contract": {
+                "area_weighted_warm_cool_family": "cool",
+                "saturation_style": "muted",
             },
         },
     ]
@@ -1542,6 +1550,9 @@ def test_v3_compiles_distinct_current_frame_prompts_and_execution_binding():
     assert '"description":"当前帧可见操作实体"' in prompts[0][1]
     assert '"description":"第二帧可见操作实体"' in prompts[0][2]
     assert '"description":"第二帧可见操作实体"' not in prompts[0][1]
+    assert '"area_weighted_warm_cool_family":"warm"' in prompts[0][1]
+    assert '"area_weighted_warm_cool_family":"cool"' in prompts[0][2]
+    assert '"area_weighted_warm_cool_family":"cool"' not in prompts[0][1]
     frozen = image_optimization.freeze_execution_inputs(
         plan,
         revision=1,
@@ -1576,6 +1587,7 @@ def _verdict_v3(plan: dict, *, status: str = "pass") -> dict:
                 "occlusion_order": _check(status),
                 "out_of_frame_crop": _check(status),
                 "non_person_entity_ledger": _check(status),
+                "dominant_palette_contract": _check(status),
                 "photometric_contract": _check(status),
             }
             for constraint in plan["segments"][0]["frame_constraints"]
@@ -1626,3 +1638,70 @@ def test_v3_verify_requires_and_evaluates_entity_ledger_check():
     canonical = image_optimization.canonical_verification(failed, plan)
     assert canonical["passed"] is False
     assert canonical["reason"] == "interaction_preservation_failed"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["segments"][0]["frame_constraints"][0].pop(
+            "dominant_palette_contract"
+        ),
+        lambda value: value["segments"][0]["frame_constraints"][0][
+            "dominant_palette_contract"
+        ].update(extra="forbidden"),
+        lambda value: value["segments"][0]["frame_constraints"][0][
+            "dominant_palette_contract"
+        ].update(area_weighted_warm_cool_family="unbounded"),
+        lambda value: value["segments"][0]["frame_constraints"][0][
+            "dominant_palette_contract"
+        ].update(saturation_style=[]),
+    ],
+)
+def test_v3_dominant_palette_contract_is_exact_and_fails_closed(mutate):
+    value = _plan_v3()
+    mutate(value)
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_v3(
+            value, segment_indices=[0], frame_counts={0: 2}
+        )
+
+
+def test_v3_verify_requires_and_evaluates_dominant_palette_check():
+    plan = _plan_v3()
+    missing = _verdict_v3(plan)
+    missing["segments"][0]["frame_checks"][0].pop("dominant_palette_contract")
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_verification(missing, plan)
+
+    unknown = _verdict_v3(plan)
+    unknown["segments"][0]["frame_checks"][0]["dominant_palette_contract"] = _check(
+        "unknown"
+    )
+    unknown["segments"][0]["passed"] = False
+    unknown["passed"] = False
+    unknown["reason"] = "verification_unknown"
+    assert image_optimization.canonical_verification(unknown, plan)["passed"] is False
+
+    failed = _verdict_v3(plan)
+    failed["segments"][0]["frame_checks"][0]["dominant_palette_contract"] = _check(
+        "fail"
+    )
+    failed["segments"][0]["passed"] = False
+    failed["passed"] = False
+    failed["reason"] = "dominant_palette_preservation_failed"
+    canonical = image_optimization.canonical_verification(failed, plan)
+    assert canonical["passed"] is False
+    assert canonical["reason"] == "dominant_palette_preservation_failed"
+
+
+def test_skill_requires_area_weighted_global_palette_preservation():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    for text in (skill, human):
+        assert "area_weighted_warm_cool_family" in text
+        assert "saturation_style" in text
+        assert "局部固有色" in text
+        assert "不得翻转整帧冷暖感知" in text

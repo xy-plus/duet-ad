@@ -28,7 +28,8 @@ _PUBLIC_ERROR_CODES = frozenset({
     "cancelled", "submission_unknown", "provider_rejected",
     "provider_protocol_error", "postprocess_artifacts_invalid",
     "postprocess_canonical_conflict", "image_optimization_prompt_invalid",
-    "postprocess_receipt_invalid", "image_plan_audit_failed", "segment_failed",
+    "postprocess_receipt_invalid", "image_plan_audit_failed",
+    "image_verification_failed", "segment_failed",
 })
 _FRAME_ERROR_RE = re.compile(r"^frame ([A-Za-z0-9_.-]{1,128}) failed(?:$|:)")
 _PUBLIC_FRAME_RE = re.compile(
@@ -383,6 +384,57 @@ async def _run_v3_plan_audit(
         raise PostprocessError(409, "image_plan_audit_failed")
 
 
+def _v3_verification_inputs(
+    cdir: Path, meta: dict, private: dict,
+    grouped: dict[int, list[tuple[Path, Path]]],
+) -> tuple[dict, list[dict]]:
+    """Bind verify to the same frozen v3 plan and unpublishable staged outputs."""
+    plan, _audit_inputs, _audit_segments = _v3_plan_audit_inputs(
+        meta, private, grouped
+    )
+    segments = []
+    for index in sorted(grouped):
+        targets = grouped[index]
+        if not targets:
+            raise PostprocessError(409, "image_verification_failed")
+        output = _private_dir(cdir, index) / "seedream"
+        expected = [canonical.name for _, canonical in targets]
+        actual = (
+            [path.name for path in sorted(output.glob("*.png"))]
+            if output.is_dir() else []
+        )
+        if actual != expected:
+            raise PostprocessError(409, "image_verification_failed")
+        segments.append({
+            "index": index,
+            "source_keyframes_dir": targets[0][0].parent,
+            "output_keyframes_dir": output,
+        })
+    return plan, segments
+
+
+async def _run_v3_verification(
+    runner, cdir: Path, meta: dict, private: dict,
+    grouped: dict[int, list[tuple[Path, Path]]],
+) -> None:
+    if not callable(getattr(runner, "run_isolated", None)):
+        raise PostprocessError(409, "image_verification_failed")
+    try:
+        plan, segments = _v3_verification_inputs(cdir, meta, private, grouped)
+        verdict = await asyncio.to_thread(
+            image_optimization.generate_project_verdict,
+            runner,
+            plan,
+            segments,
+            {},
+            session_dir=cdir,
+        )
+    except Exception:
+        raise PostprocessError(409, "image_verification_failed") from None
+    if verdict.get("passed") is not True:
+        raise PostprocessError(409, "image_verification_failed")
+
+
 def _mark_plan_audit_failed(
     settings: Settings, cid: str, indices: set[int],
 ) -> None:
@@ -394,6 +446,26 @@ def _mark_plan_audit_failed(
         post["segments"] = segments
         post["status"] = "failed"
         post["error"] = "image_plan_audit_failed"
+        post["frames"] = sorted(
+            _frame_ref(item["index"], path.name)
+            for item in segments if item.get("status") == "done"
+            for path in _canonical_files(settings.data_dir / cid, item["index"])
+        )
+
+    _mutate_postprocess(settings, cid, mutate)
+
+
+def _mark_image_verification_failed(
+    settings: Settings, cid: str, indices: set[int],
+) -> None:
+    def mutate(_meta: dict, post: dict) -> None:
+        segments = [dict(item) for item in post.get("segments", [])]
+        for item in segments:
+            if item.get("index") in indices and item.get("status") != "done":
+                item.update(status="failed", error="image_verification_failed")
+        post["segments"] = segments
+        post["status"] = "failed"
+        post["error"] = "image_verification_failed"
         post["frames"] = sorted(
             _frame_ref(item["index"], path.name)
             for item in segments if item.get("status") == "done"
@@ -698,7 +770,8 @@ def _publish_segment(outputs: list[Path], targets: list[tuple[Path, Path]]) -> N
 async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
                        targets: list[tuple[Path, Path]], options: dict[str, bool],
                        private: dict, mediakit_sem: asyncio.Semaphore,
-                       seedream_sem: asyncio.Semaphore) -> None:
+                       seedream_sem: asyncio.Semaphore,
+                       *, defer_publish: bool = False) -> None:
     inputs = [source for source, _ in targets]
     source_sha256s = {
         source.name: hashlib.sha256(source.read_bytes()).hexdigest()
@@ -725,6 +798,8 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
             )
             _update_segment(settings, cid, index, completed_frames=len(inputs))
         _update_segment(settings, cid, index, stage="publishing")
+        if defer_publish:
+            return
         _publish_segment(inputs, targets)
         _update_segment(
             settings, cid, index, status="done", stage="done",
@@ -745,7 +820,8 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
 
 async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore,
                    seedream_sem: asyncio.Semaphore | None = None,
-                   only_segments: set[int] | None = None, *, audit_runner=None) -> None:
+                   only_segments: set[int] | None = None, *, audit_runner=None,
+                   verification_runner=None) -> None:
     cdir = (settings.data_dir / cid).resolve()
     seedream_sem = seedream_sem or asyncio.Semaphore(settings.seedream_concurrency)
     meta = storage.load_meta(settings.data_dir, cid)
@@ -762,6 +838,7 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         )
         return
     options = private["options"]
+    defer_v3_publish = options["optimize_image"] and private["version"] == 3
     audit_grouped = _group_targets(cdir, meta)
     grouped = audit_grouped
     if only_segments is not None:
@@ -786,7 +863,7 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
     try:
         await asyncio.gather(*(
             _run_segment(settings, cid, cdir, index, targets, options, private,
-                         mediakit_sem, seedream_sem)
+                         mediakit_sem, seedream_sem, defer_publish=defer_v3_publish)
             for index, targets in grouped.items()
         ))
     except asyncio.CancelledError:
@@ -802,6 +879,41 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
 
         _mutate_postprocess(settings, cid, cancel)
         raise
+
+    if defer_v3_publish and grouped:
+        current = storage.load_meta(settings.data_dir, cid) or {}
+        current_states = {
+            item.get("index"): item.get("status")
+            for item in (current.get("postprocess") or {}).get("segments", [])
+            if isinstance(item, dict)
+        }
+        unpublished = {
+            index: targets for index, targets in audit_grouped.items()
+            if current_states.get(index) != "done"
+        }
+        if not any(current_states.get(index) == "failed" for index in grouped):
+            try:
+                await _run_v3_verification(
+                    verification_runner or audit_runner,
+                    cdir,
+                    current,
+                    private,
+                    audit_grouped,
+                )
+                for index in sorted(unpublished):
+                    targets = unpublished[index]
+                    outputs = [
+                        _private_dir(cdir, index) / "seedream" / canonical.name
+                        for _, canonical in targets
+                    ]
+                    _publish_segment(outputs, targets)
+                    _update_segment(
+                        settings, cid, index, status="done", stage="done",
+                        completed_frames=len(targets), error=None,
+                    )
+            except Exception:
+                _mark_image_verification_failed(settings, cid, set(unpublished))
+                return
 
     def finalize(_meta: dict, post: dict) -> None:
         segments = post.get("segments") or []
