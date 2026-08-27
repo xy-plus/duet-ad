@@ -407,7 +407,15 @@ def produce_multimodal_binding(settings: Settings, cid: str, runner) -> str:
                 workdir / h3_project.SOURCE_FILENAME,
                 _canonical_json_bytes(manifest),
             )
-            h3_project.freeze_optional(root, workdir)
+            try:
+                h3_project.freeze_optional(root, workdir)
+            except h3_project.ProjectMultimodalError as exc:
+                # The binding phase is complete even when an on-screen plan
+                # still needs the independent visibility/timing producer.
+                # Publishing this exact manifest lets the existing submit
+                # gate schedule that producer on the next request.
+                if exc.code != "speaker_timing_refresh_required":
+                    raise
             job.update(
                 status="done",
                 production=_multimodal_binding_artifact(root, receipt_path),
