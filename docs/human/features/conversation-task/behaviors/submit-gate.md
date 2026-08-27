@@ -3,37 +3,21 @@ name: submit-gate
 type: behavior
 status: done
 owner: human
-updated: 2026-08-25
+updated: 2026-08-28
 tdd: N/A
-links: [conversation-task, processing-state]
+links: [conversation-task, processing-state, long-video, postprocess]
 ---
 
-# H3 提交门控
+# H3 统一提交门控
 
-## 规则
-
-短视频的 `POST /api/conversations/{id}/submit` 只接受：
+当前 v4 项目只有一个提交合同。单段项目是 `segments.length=1`，不得选择独立 short 提交器；多段项目也不得复制另一套参数、音频或恢复逻辑。
 
 ```json
 {
   "confirm": true,
   "client_request_id": "request-123456",
   "dialogue_mode": "auto",
-  "fit_mode": "none",
-  "aspect_ratio": "9:16",
-  "resolution": "768p"
-}
-```
-
-`edit/custom` 还必须带非空 `lines`；`auto/none` 禁止带 `lines`。请求存在未知字段、无严格 `confirm:true`、id 不合规、台词时间越界或画幅选择不匹配时均拒绝。
-
-长视频严格接受：
-
-```json
-{
-  "confirm": true,
-  "client_request_id": "request-123456",
-  "dialogue_mode": "auto",
+  "dialogue_delivery": "off_screen",
   "fit_mode": "none",
   "aspect_ratio": "9:16",
   "resolution": "768p",
@@ -42,45 +26,59 @@ links: [conversation-task, processing-state]
 }
 ```
 
-长链只允许 `dialogue_mode=auto|none`，不允许 `lines/edit/custom`；`expected_plan_receipt` 必须与当前详情一致。当前页面新建长视频固定显式发送 `fast_mode=true`，确认页不显示快速模式开关或说明，结果参数摘要也不展示该模式；后端继续兼容显式 `false`，历史调用字段缺失等价于 `false`。
+- `edit/custom` 还必须带非空 `lines`；`auto/none` 禁止带 `lines`。
+- `dialogue_mode != none` 时必须由用户显式选择 `on_screen` 或 `off_screen`；`none` 不接受声音呈现和音频 reference。
+- `fast_mode` 使用统一执行器；`N=1` 时没有并行兄弟，字段不产生另一条业务路径。
+- `expected_plan_receipt` 对所有当前 v4 项目生效，用来防止旧页面、图片确认或生成参数覆盖新状态。
 
-如果旧标签页缺少 `expected_plan_receipt`，服务会提示“页面版本已更新，请刷新页面后重试”。此请求不会自动补 receipt、不会提交 H3，也不会产生付费任务；刷新页面后再确认即可。页面入口和 `app.js` 禁止缓存，确保刷新取得当前契约。
+## 唯一编译规则
+
+提交门内只允许普通后端纯函数做下列确定性投影，不调用 Skill：
+
+| 输入 | H3 冻结结果 |
+| --- | --- |
+| `dialogue_mode=none` | 零台词、零声音 reference |
+| `dialogue_delivery=off_screen` | 逐行保留冻结 text/start/end，`delivery=off_screen`、无画内 subject，绑定唯一 normalized voice reference |
+| `dialogue_delivery=on_screen` 且主分析已有同一行的画内人物/时间证据 | 逐行绑定既有证据与唯一 voice reference |
+| `dialogue_delivery=on_screen` 但证据缺失 | 409 `on_screen_authority_unavailable`，Context/H3 POST 为 0；不得调用额外 Skill 补证 |
+
+语言字段只复用上游已经冻结的权威值；没有权威值时使用格式占位 `und`，不得由后端按样本文字猜测语言。
+
+如果确定性投影更新了 plan receipt，服务可以返回既有的 409 refresh/CAS 提示；Web 只刷新详情并保留用户选择，不自动再次 POST。用户再次确认后继续同一统一链路。这是输入冻结，不是新的产品阶段或 Skill。
+
+## 门控规则
 
 | 条件 | 结果 |
 | --- | --- |
 | `ENABLE_H3_SUBMIT` 未开 | 501 `H3 submission is disabled.` |
 | 会话不存在 | 404 `not found` |
 | schema 不是 v2 | 409 `read_only` |
-| 精确旧版四键长视频提交 | 409 `client_refresh_required` + 中文刷新提示；不创建付费任务 |
+| 未完成图片后处理或每段不是恰好 9 张图 | 409 `postprocess_artifacts_invalid`；不回退原图 |
+| v4 图片尚未由用户确认，或确认绑定的图、顺序、计划已漂移 | 409 image acceptance 错误；不创建付费任务 |
 | 输入准备未 `done` | 409 `artifacts not ready` |
-| AutoDL 凭据缺失 | 503 `h3_credentials_missing` |
-| `aspect_ratio` / `resolution` 缺失或不在闭集 | 422 `invalid_aspect_ratio` / `invalid_resolution`；在 claim 和供应商 POST 前拒绝 |
-| 冻结输入、receipt 或画幅派生失败 | 409 `prepared_input_invalid` / `frame_fit_failed` |
-| 历史未冻结长会话的 anchors 缺失、损坏或路径越界 | 409 `fit_requirement_unknown`；不静默按 `none`，不创建付费任务 |
-| 长视频 plan receipt 缺失/格式非法或已变化 | 422 `invalid_plan_receipt` / 409 `long_video_plan_changed`；付费前拒绝 |
-| 同一 generation active/succeeded，或 H3 阶段确定失败后复用旧 id | 409；不创建新供应商任务。长链 `stage=stitch` 失败必须复用旧 id，只本地重拼 |
-| generation 为 `resume_required` | 只接受原 id、原台词、原画幅、原清晰度和原 fit；合法时返回 202 + 原 attempt，新 id/参数漂移分别 409 |
-| generation 为 `submission_unknown` | 任意 id 均 409 `submission_outcome_unknown`；先核对供应商 |
-| 全部门控通过 | 202 `{"status":"queued","attempt":N}`；后台异步执行 |
+| 请求缺字段、有未知字段、`confirm` 非 true、id 或枚举不合法 | 422；在状态写入和供应商调用前拒绝 |
+| plan receipt 缺失、格式非法或已变化 | 422/409；刷新后由用户再次确认，Web 不自动重发 |
+| 图片确认后缺少第二次 `video-maker` 最终提示词，或其绑定的优化图 SHA/顺序漂移 | 409；重新生成提示词，Context/H3 POST 为 0；禁止回退第一次旧视觉 prompt |
+| 画内声音缺少主分析权威 | 409 `on_screen_authority_unavailable`；不调用 Skill，不创建 H3 attempt |
+| Context IR 试图改变帧序、台词、时间、声音呈现或 voice reference | fail closed；不创建 H3 attempt |
+| generation active/succeeded，或参数与冻结输入不一致 | 409；不创建新供应商任务 |
+| generation 为 `resume_required` | 只接受原 id 和全部原冻结参数，继续原 attempt |
+| generation 为 `submission_unknown` | 任意提交均 409；只允许查询供应商已有任务 |
+| 全部门控通过 | 202 queued；统一 segment coordinator 异步执行 Context、H3 和拼接 |
 
-## 边界
+## 图片与 Skill 边界
 
-- 首次 start 和 H3 阶段确定失败后的 retry 会在锁内冻结画幅、清晰度、台词、适配方式和长链快速模式；长链所有 segment 共用同一选择。长链另冻结当前 plan receipt，新 id retry、原 id 拼接重试与 `resume_required` 均复用服务端冻结的 `fast_mode`，历史 generation 缺失时按 `false`；不会被页面草稿或缓存改变。长链拼接失败复用原 id 且不创建供应商任务。`resume_required` 只加载既有 receipt，不重写它、不递增 attempt。
-- 提交门控后的唯一自动新 POST 是完整确认的供应商终态 `h3_provider_failed`：沿用原 `client_request_id` 和同一 input receipt，新建顺序 attempt，累计不超过 `1 + AUTO_RETRY_COUNT`。已落盘的 `ready_to_submit/h3.ready` 自动 attempt 已占额度；`submission_unknown`、提交拒绝、结果缺失和输入/安全错误均不进入该例外。
-- “生成最终视频”点击后必须立即进入提交态或显示错误；前端异常不得表现为无响应。
-- 自动 H3 源提示词只允许在 H3 attempt 创建前通过 CAS 保存；attempt 创建后锁定，防止页面内容与实际生成输入不一致。
-- 未做素材优化时，短链和长链每段使用原关键帧；优化完成时必须使用对应 `postprocessed/`，需要 crop/pad 时再从所选帧产生画幅派生图。所有最终 bytes 在付费 POST 前冻结并进入 receipt，禁止缺帧时静默回退。
-- 新长链每个不超过 14 秒的 segment 固定使用多图参考 workflow，传入该段 1–9 张冻结关键帧。已有首尾帧付费 attempt 仅按原 receipt GET-only 恢复，不切换接口。
-- 已有 generation + frozen plan 的历史长会话沿用冻结 `fit_mode`；即使旧 meta 的 `fit_required` 为 null，也不重写 active/failed/resume 的 receipt、输入或重试参数。
-- 成片下载先验证全部 DNS 解析地址，再在读取 status/body 前验证实际 socket peer 为公网；拒绝 userinfo 和重定向，限制 200 MiB，并在原子落盘前通过 ffprobe 正时长视频流验证。
-- 旧 Seedance 提交实现和 `face_hold` 参数/提示词注入已删除，不是失败回退选项。
+- 全链仅解析并调用 `video-maker` 与 `image-postprocess` 两个 Skill；出现第三个 Skill 名、音频 Skill、Binding Skill 或 speaker-visibility phase，测试和启动门必须失败。
+- `video-maker` 第一次调用冻结 segments、每段 9 张原始关键帧、原始视频提示词、动作/镜头/时间和它已经能证明的结构化事实。
+- `image-postprocess` 已冻结，不再迭代；它只把每段 9 张原始关键帧变成 9 张优化关键帧，不做素材准入。
+- 用户确认后的 9 张优化图按 segment 和帧序进入统一 frozen receipt；随后同一个 `video-maker` 第二次调用，只重新生成视频提示词：视觉元素以优化图为准，动作/镜头/构图/节奏/时间轴以原视频为准。
+- Context IR 与 H3 只能消费第二次 `video-maker` 输出及其绑定的优化图 bytes；禁止第一次旧视觉 prompt 覆盖新人物、新场景或新对象。
 
-## 图片优化与 H3 门控
+## 付费与恢复边界
 
-- schema v2 的关键帧冻结后，同一 `image-postprocess` Skill 先执行 `phase=plan`，结构化冻结全部叙事主人物和全部场景组件的双目标替换。后端确定性编译提示词；任一主人物不可安全替换，或任一场景不能同时完成语义、形状、纵深、布局和局部颜色变化，均在付费前判 `eligible=false`。
-- v2 编译提示词不能自由 PATCH，避免删除人物、场景、光色或关系硬约束；旧 v1 receipt 只读兼容且不迁移。图片编辑后必须以同一 frozen plan 执行 `phase=verify`，人物身份、源身份残留、真实换景、局部颜色、全局光色、关系和跨帧/跨段连续性任一 `fail/unknown` 均阻止 H3 提交。
-- 后处理选项 canonical 为 `remove_subtitle/remove_brand/optimize_image` 三个布尔值；精确旧两字段请求兼容为 `optimize_image:false`，其余缺字段、未知字段或非布尔值拒绝。实际执行对每段保持 `文字擦除 -> 品牌擦除 -> 图片优化` 阶段屏障，段之间并行；任一失败段不会阻止其他段完成，整体保持 failed，H3 不得静默回退原图。
-- `postprocess.segments[]` 仅公开 `index/status/stage/completed_frames/total_frames/revision/error`。失败段通过 `POST /api/conversations/{id}/postprocess/segments/{index}/retry` 重试，请求严格为 `{"confirm":true,"expected_revision":N}`；只复用该段已成功的阶段/帧与服务端冻结选项、模型、模式、提示词，不接受页面重新指定。
-- Seedream 付费 POST 前先持久化 attempt 输入摘要；只有明确的 HTTP 429 `QuotaExceeded` 且响应无 `data` 才按统一预算重试。网络或读写超时记为 `submission_unknown`，自动恢复不得再次 POST；人工分段重试也必须保留旧 attempt 记录。
-- Seedream 默认模型为 `doubao-seedream-5-0-pro-260628`。Pro 请求不发送 `sequential_image_generation`；Lite、4.5、4.0 请求固定发送 `sequential_image_generation:"disabled"`。失败项目不改冻结模型，仍通过上述分段重试产生新 revision，旧 attempt 回执保留。
-- 图片优化默认采用逐帧独立并行模式；显式配置仍可选择锚帧一致性模式。模式在项目开始时私有冻结，历史项目与失败重试不会随服务缺省变化。
+- 每个供应商 POST 前必须先落 attempt receipt；输入 SHA、顺序、参数或上游 receipt 漂移时拒绝。
+- `submission_unknown` 永远 GET-only。
+- 已知供应商明确失败的自动 attempt 必须沿用同一冻结输入并受统一次数预算约束；成功 segment 不重提。
+- 本地拼接失败只重做拼接，不重新提交 H3。
+- H3 输出下载、ffprobe、PTS、时长、原生音轨和最终拼接验证通过后才原子发布 `generated.mp4`。
+- H3 原生输出音轨是成片唯一音频来源；源音和 conditioning voice 不得 overlay 或回挂。
