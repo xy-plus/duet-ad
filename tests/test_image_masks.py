@@ -40,10 +40,22 @@ class FakeAdapter:
     descriptor = image_masks.ProviderDescriptor(
         provider="fake", action="SegmentPerson", model="fake-v1"
     )
+    capabilities = image_masks.ProviderCapabilities(
+        mask_scope="all_people_union",
+        identity_binding="sole_visible_person",
+        supported_purposes=("person",),
+    )
 
-    def __init__(self, receipt: Path, result: bytes | None = None):
+    def __init__(
+        self,
+        receipt: Path,
+        result: bytes | None = None,
+        *,
+        expected_person_id: str = "person-1",
+    ):
         self.receipt = receipt
         self.result = result or _png()
+        self.expected_person_id = expected_person_id
         self.submit_calls = 0
         self.get_calls = 0
         self.download_calls = 0
@@ -57,6 +69,7 @@ class FakeAdapter:
     def submit(self, request: image_masks.ProviderMaskRequest):
         self.submit_calls += 1
         assert request.action == self.descriptor.action
+        assert request.person_instance.person_id == self.expected_person_id
         assert json.loads(self.receipt.read_text())["status"] == "submitting"
         result = self.submit_results.pop(0)
         if isinstance(result, BaseException):
@@ -80,6 +93,15 @@ class FakeAdapter:
         return self.result
 
 
+class FakeInstanceAdapter(FakeAdapter):
+    capabilities = image_masks.ProviderCapabilities(
+        mask_scope="person_instance",
+        identity_binding="provider_person_id",
+        person_id_param="PersonId",
+        supported_purposes=("person", "protected_non_target_people"),
+    )
+
+
 def _paths(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "project"
     root.mkdir()
@@ -89,7 +111,41 @@ def _paths(tmp_path: Path) -> tuple[Path, Path]:
     return root, source
 
 
+def _person_instance(
+    root: Path,
+    *,
+    person_id: str = "person-1",
+    visible_person_ids: tuple[str, ...] = ("person-1",),
+    frame_pts: str = "1.25",
+    roster_path: str = "work/person-rosters/0001.json",
+) -> image_masks.PersonInstanceRequest:
+    source = root / "frames/0001.png"
+    payload = {
+        "schema": "duet.person-roster",
+        "version": 1,
+        "source": {
+            "path": "frames/0001.png",
+            "sha256": image_masks.sha256_bytes(source.read_bytes()),
+            "width": 6,
+            "height": 4,
+            "frame_pts": frame_pts,
+        },
+        "person_ids": sorted(visible_person_ids),
+    }
+    encoded = json.dumps(payload, sort_keys=True).encode() + b"\n"
+    absolute = root / roster_path
+    absolute.parent.mkdir(parents=True, exist_ok=True)
+    absolute.write_bytes(encoded)
+    return image_masks.PersonInstanceRequest(
+        person_id=person_id,
+        visible_person_ids=visible_person_ids,
+        person_roster_receipt_path=roster_path,
+        person_roster_receipt_sha256=image_masks.sha256_bytes(encoded),
+    )
+
+
 def _generate(root: Path, adapter: FakeAdapter, **overrides):
+    person_instance = overrides.pop("person_instance", None) or _person_instance(root)
     values = dict(
         project_root=root,
         source_path="frames/0001.png",
@@ -97,6 +153,7 @@ def _generate(root: Path, adapter: FakeAdapter, **overrides):
         receipt_path="work/masks/0001.attempt.json",
         provider=adapter,
         purpose="person",
+        person_instance=person_instance,
         frame_pts="1.250000",
         params={"ImageURL": "https://private.invalid/source.png?signature=secret"},
         cache_version="mask-cache-v1",
@@ -105,26 +162,83 @@ def _generate(root: Path, adapter: FakeAdapter, **overrides):
     return image_masks.generate_mask(**values)
 
 
+def _direct_provider_request(adapter, *, action="SegmentHDBody"):
+    capability = adapter.capabilities
+    instance = image_masks.PersonInstanceRequest(
+        person_id="person-1",
+        visible_person_ids=("person-1",),
+        person_roster_receipt_path="work/person-rosters/0001.json",
+        person_roster_receipt_sha256="c" * 64,
+    )
+    params = {"ImageURL": "https://private.invalid/source.png"}
+    request_hash = image_masks.request_sha256(
+        provider="aliyun_viapi",
+        action=action,
+        model="imageseg-20191230",
+        purpose="person",
+        provider_capability=capability,
+        person_instance=instance,
+        source_sha256="b" * 64,
+        width=6,
+        height=4,
+        frame_pts="1.25",
+        params=params,
+        cache_version="mask-cache-v1",
+    )
+    return image_masks.ProviderMaskRequest(
+        provider="aliyun_viapi",
+        action=action,
+        model="imageseg-20191230",
+        request_sha256=request_hash,
+        purpose="person",
+        provider_capability=capability,
+        person_instance=instance,
+        source_sha256="b" * 64,
+        width=6,
+        height=4,
+        frame_pts="1.25",
+        params=params,
+        cache_version="mask-cache-v1",
+    )
+
+
 def test_success_freezes_request_and_publishes_consumer_dto(tmp_path):
     root, source = _paths(tmp_path)
     receipt = root / "work/masks/0001.attempt.json"
     adapter = FakeAdapter(receipt)
+    person_instance = _person_instance(root)
 
-    result = _generate(root, adapter)
+    result = _generate(root, adapter, person_instance=person_instance)
 
     assert result.path == root / "work/masks/0001.png"
     assert result.path.read_bytes() == adapter.result
     payload = json.loads(receipt.read_text())
     assert payload["status"] == "succeeded"
+    assert payload["version"] == 2
     assert payload["history"] == [
         "prepared", "submitting", "response_received", "downloaded",
         "validated", "succeeded",
     ]
     assert payload["request"] == {
+        "schema": "duet.image-mask-request",
+        "version": 2,
         "provider": "fake",
         "action": "SegmentPerson",
         "model": "fake-v1",
         "purpose": "person",
+        "provider_capability": {
+            "mask_scope": "all_people_union",
+            "identity_binding": "sole_visible_person",
+            "person_id_param": None,
+            "supported_purposes": ["person"],
+        },
+        "person_instance": {
+            "person_id": "person-1",
+            "visible_person_ids": ["person-1"],
+            "person_roster_receipt_path": "work/person-rosters/0001.json",
+            "person_roster_receipt_sha256": person_instance.person_roster_receipt_sha256,
+            "provider_person_id": None,
+        },
         "source": {
             "path": "frames/0001.png",
             "sha256": image_masks.sha256_bytes(source.read_bytes()),
@@ -143,6 +257,8 @@ def test_success_freezes_request_and_publishes_consumer_dto(tmp_path):
         action="SegmentPerson",
         model="fake-v1",
         purpose="person",
+        provider_capability=adapter.capabilities,
+        person_instance=person_instance,
         source_sha256=image_masks.sha256_bytes(source.read_bytes()),
         width=6,
         height=4,
@@ -153,10 +269,13 @@ def test_success_freezes_request_and_publishes_consumer_dto(tmp_path):
     producer = result.producer_receipt
     assert producer == payload["producer_receipt"]
     assert producer["schema"] == "duet.image-mask-producer"
+    assert producer["version"] == 2
     assert producer["producer"] == {
         "provider": "fake", "action": "SegmentPerson", "model": "fake-v1"
     }
     assert producer["purpose"] == "person"
+    assert producer["provider_capability"] == payload["request"]["provider_capability"]
+    assert producer["person_instance"] == payload["request"]["person_instance"]
     assert producer["source"]["frame_pts"] == "1.25"
     assert producer["mask"]["path"] == "work/masks/0001.png"
     assert producer["mask"]["width"] == 6
@@ -183,13 +302,167 @@ def test_rejects_scene_and_unknown_purposes_without_provider_call(tmp_path, purp
     assert adapter.submit_calls == adapter.get_calls == adapter.download_calls == 0
 
 
-def test_allows_protected_non_target_people_purpose(tmp_path):
+def test_union_provider_rejects_protected_non_target_people_before_post(tmp_path):
     root, _source = _paths(tmp_path)
     adapter = FakeAdapter(root / "work/masks/0001.attempt.json")
 
-    result = _generate(root, adapter, purpose="protected_non_target_people")
+    with pytest.raises(image_masks.MaskError) as raised:
+        _generate(root, adapter, purpose="protected_non_target_people")
 
-    assert result.producer_receipt["purpose"] == "protected_non_target_people"
+    assert raised.value.code == "person_instance_unavailable"
+    assert adapter.submit_calls == 0
+    assert not adapter.receipt.exists()
+
+
+def test_union_provider_rejects_multi_person_frame_before_post(tmp_path):
+    root, _source = _paths(tmp_path)
+    adapter = FakeAdapter(root / "work/masks/0001.attempt.json")
+    instance = _person_instance(
+        root,
+        person_id="person-1",
+        visible_person_ids=("person-1", "person-2"),
+    )
+
+    with pytest.raises(image_masks.MaskError) as raised:
+        _generate(root, adapter, person_instance=instance)
+
+    assert raised.value.code == "person_instance_unavailable"
+    assert adapter.submit_calls == 0
+    assert not adapter.receipt.exists()
+
+
+@pytest.mark.parametrize("damage", ["bytes", "source", "people"])
+def test_person_roster_must_be_authoritative_before_post(tmp_path, damage):
+    root, _source = _paths(tmp_path)
+    adapter = FakeAdapter(root / "work/masks/0001.attempt.json")
+    instance = _person_instance(root)
+    roster_path = root / instance.person_roster_receipt_path
+    payload = json.loads(roster_path.read_text())
+    if damage == "bytes":
+        roster_path.write_bytes(roster_path.read_bytes() + b" ")
+    elif damage == "source":
+        payload["source"]["sha256"] = "f" * 64
+        roster_path.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        instance = image_masks.PersonInstanceRequest(
+            person_id=instance.person_id,
+            visible_person_ids=instance.visible_person_ids,
+            person_roster_receipt_path=instance.person_roster_receipt_path,
+            person_roster_receipt_sha256=image_masks.sha256_bytes(
+                roster_path.read_bytes()
+            ),
+        )
+    else:
+        payload["person_ids"] = ["person-1", "person-2"]
+        roster_path.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        instance = image_masks.PersonInstanceRequest(
+            person_id=instance.person_id,
+            visible_person_ids=instance.visible_person_ids,
+            person_roster_receipt_path=instance.person_roster_receipt_path,
+            person_roster_receipt_sha256=image_masks.sha256_bytes(
+                roster_path.read_bytes()
+            ),
+        )
+
+    with pytest.raises(image_masks.MaskError) as raised:
+        _generate(root, adapter, person_instance=instance)
+
+    assert raised.value.code == "person_roster_receipt_mismatch"
+    assert adapter.submit_calls == 0
+    assert not adapter.receipt.exists()
+
+
+def test_instance_provider_binds_person_id_and_allows_protected_person(tmp_path):
+    root, _source = _paths(tmp_path)
+    adapter = FakeInstanceAdapter(root / "work/masks/0001.attempt.json")
+
+    result = _generate(
+        root,
+        adapter,
+        purpose="protected_non_target_people",
+        person_instance=_person_instance(
+            root,
+            person_id="person-1",
+            visible_person_ids=("person-1", "target-person"),
+        ),
+        params={
+            "ImageURL": "https://private.invalid/source.png?signature=secret",
+            "PersonId": "person-1",
+        },
+    )
+
+    instance = result.producer_receipt["person_instance"]
+    assert instance["person_id"] == instance["provider_person_id"] == "person-1"
+    assert instance["visible_person_ids"] == ["person-1", "target-person"]
+
+
+def test_instance_provider_produces_distinct_receipts_for_each_person(tmp_path):
+    root, _source = _paths(tmp_path)
+    first = np.zeros((4, 6, 4), dtype=np.uint8)
+    first[:, 1, 3] = 255
+    second = np.zeros((4, 6, 4), dtype=np.uint8)
+    second[:, 4, 3] = 255
+    ok_first, first_png = cv2.imencode(".png", first)
+    ok_second, second_png = cv2.imencode(".png", second)
+    assert ok_first and ok_second
+    first_instance = _person_instance(
+        root, person_id="person-1", visible_person_ids=("person-1", "person-2")
+    )
+    second_instance = image_masks.PersonInstanceRequest(
+        person_id="person-2",
+        visible_person_ids=("person-1", "person-2"),
+        person_roster_receipt_path=first_instance.person_roster_receipt_path,
+        person_roster_receipt_sha256=first_instance.person_roster_receipt_sha256,
+    )
+    first_adapter = FakeInstanceAdapter(
+        root / "work/masks/person-1.attempt.json", result=first_png.tobytes()
+    )
+    second_adapter = FakeInstanceAdapter(
+        root / "work/masks/person-2.attempt.json",
+        result=second_png.tobytes(),
+        expected_person_id="person-2",
+    )
+
+    first_result = _generate(
+        root,
+        first_adapter,
+        output_path="work/masks/person-1.png",
+        receipt_path="work/masks/person-1.attempt.json",
+        person_instance=first_instance,
+        params={"ImageURL": "https://private.invalid/source.png", "PersonId": "person-1"},
+    )
+    second_result = _generate(
+        root,
+        second_adapter,
+        output_path="work/masks/person-2.png",
+        receipt_path="work/masks/person-2.attempt.json",
+        person_instance=second_instance,
+        params={"ImageURL": "https://private.invalid/source.png", "PersonId": "person-2"},
+    )
+
+    first_receipt = first_result.producer_receipt
+    second_receipt = second_result.producer_receipt
+    assert first_receipt["person_instance"]["provider_person_id"] == "person-1"
+    assert second_receipt["person_instance"]["provider_person_id"] == "person-2"
+    assert first_receipt["request_sha256"] != second_receipt["request_sha256"]
+    assert first_receipt["mask"]["sha256"] != second_receipt["mask"]["sha256"]
+
+
+@pytest.mark.parametrize("provider_person_id", [None, "person-2"])
+def test_instance_provider_rejects_missing_or_wrong_identity_binding_before_post(
+    tmp_path, provider_person_id
+):
+    root, _source = _paths(tmp_path)
+    adapter = FakeInstanceAdapter(root / "work/masks/0001.attempt.json")
+    params = {"ImageURL": "https://private.invalid/source.png"}
+    if provider_person_id is not None:
+        params["PersonId"] = provider_person_id
+
+    with pytest.raises(image_masks.MaskError) as raised:
+        _generate(root, adapter, params=params)
+
+    assert raised.value.code == "provider_identity_binding_invalid"
+    assert adapter.submit_calls == 0
+    assert not adapter.receipt.exists()
 
 
 def test_post_timeout_without_identifier_is_terminal_and_never_resubmits(tmp_path):
@@ -443,8 +716,35 @@ def test_request_drift_fails_closed_without_network(tmp_path):
     adapter = FakeAdapter(receipt)
     _generate(root, adapter)
 
+    changed_instance = _person_instance(root, frame_pts="1.251")
     with pytest.raises(image_masks.MaskError) as raised:
-        _generate(root, adapter, frame_pts="1.251")
+        _generate(
+            root,
+            adapter,
+            frame_pts="1.251",
+            person_instance=changed_instance,
+        )
+
+    assert raised.value.code == "mask_receipt_mismatch"
+    assert adapter.submit_calls == adapter.download_calls == 1
+
+
+def test_person_roster_receipt_drift_fails_closed_without_network(tmp_path):
+    root, _source = _paths(tmp_path)
+    receipt = root / "work/masks/0001.attempt.json"
+    adapter = FakeAdapter(receipt)
+    _generate(root, adapter)
+    roster_path = root / "work/person-rosters/0001.json"
+    roster_path.write_bytes(roster_path.read_bytes() + b" ")
+    changed_instance = image_masks.PersonInstanceRequest(
+        person_id="person-1",
+        visible_person_ids=("person-1",),
+        person_roster_receipt_path="work/person-rosters/0001.json",
+        person_roster_receipt_sha256=image_masks.sha256_bytes(roster_path.read_bytes()),
+    )
+
+    with pytest.raises(image_masks.MaskError) as raised:
+        _generate(root, adapter, person_instance=changed_instance)
 
     assert raised.value.code == "mask_receipt_mismatch"
     assert adapter.submit_calls == adapter.download_calls == 1
@@ -466,19 +766,7 @@ def test_aliyun_segment_hd_body_adapter_maps_injected_request_and_dto():
         }
 
     adapter = image_masks.AliyunVIAPISegmentHDBody(request=request, download=lambda _url: b"png")
-    provider_request = image_masks.ProviderMaskRequest(
-        provider="aliyun_viapi",
-        action="SegmentHDBody",
-        model="imageseg-20191230",
-        request_sha256="a" * 64,
-        purpose="person",
-        source_sha256="b" * 64,
-        width=6,
-        height=4,
-        frame_pts="1.25",
-        params={"ImageURL": "https://private.invalid/source.png"},
-        cache_version="mask-cache-v1",
-    )
+    provider_request = _direct_provider_request(adapter)
 
     response = adapter.submit(provider_request)
 
@@ -496,25 +784,27 @@ def test_aliyun_segment_hd_body_adapter_maps_injected_request_and_dto():
     )
 
 
+def test_provider_request_rejects_hash_that_does_not_bind_instance():
+    adapter = image_masks.AliyunVIAPISegmentHDBody(
+        request=lambda _action, _params: {}, download=lambda _url: b"png"
+    )
+    good = _direct_provider_request(adapter)
+
+    with pytest.raises(image_masks.MaskError) as raised:
+        image_masks.ProviderMaskRequest(
+            **{**good.__dict__, "request_sha256": "f" * 64}
+        )
+
+    assert raised.value.code == "provider_request_invalid"
+
+
 def test_aliyun_protocol_errors_are_safe_and_do_not_echo_response():
     secret = "https://result.oss-cn-shanghai.aliyuncs.com/result.png?token=do-not-leak"
     adapter = image_masks.AliyunVIAPISegmentHDBody(
         request=lambda _action, _params: {"RequestId": "req-1", "Data": {"ImageURL": secret}},
         download=lambda _url: b"png",
     )
-    request = image_masks.ProviderMaskRequest(
-        provider="aliyun_viapi",
-        action="WrongAction",
-        model="imageseg-20191230",
-        request_sha256="a" * 64,
-        purpose="person",
-        source_sha256="b" * 64,
-        width=6,
-        height=4,
-        frame_pts="1.25",
-        params={"ImageURL": "https://private.invalid/source.png"},
-        cache_version="mask-cache-v1",
-    )
+    request = _direct_provider_request(adapter, action="WrongAction")
 
     with pytest.raises(image_masks.MaskError) as raised:
         adapter.submit(request)
@@ -532,19 +822,7 @@ def test_aliyun_result_url_is_provider_scoped_and_safe():
         },
         download=lambda _url: b"png",
     )
-    request = image_masks.ProviderMaskRequest(
-        provider="aliyun_viapi",
-        action="SegmentHDBody",
-        model="imageseg-20191230",
-        purpose="person",
-        source_sha256="b" * 64,
-        width=6,
-        height=4,
-        frame_pts="1.25",
-        request_sha256="a" * 64,
-        params={"ImageURL": "https://private.invalid/source.png"},
-        cache_version="mask-cache-v1",
-    )
+    request = _direct_provider_request(adapter)
 
     with pytest.raises(image_masks.MaskError) as raised:
         adapter.submit(request)
