@@ -24,6 +24,9 @@ class Settings:
     h3_poll_timeout_s: float = 1500.0
     h3_download_timeout_s: float = 180.0
     h3_poll_interval_s: float = 3.0
+    h3_gateway_storage_root: Path | None = None
+    h3_controlled_storage_retry_attempt_sha256: str = ""
+    h3_controlled_storage_retry_evidence_sha256: str = ""
     enable_mediakit_erase: bool = False
     mediakit_api_key: str = field(default="", repr=False)
     # MediaKit 后处理逐帧并行提交的进程级并发上限（单进程内跨会话全局）
@@ -51,6 +54,20 @@ class Settings:
     enable_pipeline: bool = False
 
     def __post_init__(self) -> None:
+        if self.h3_gateway_storage_root is not None:
+            root = Path(self.h3_gateway_storage_root)
+            if not root.is_absolute():
+                raise ValueError("h3_gateway_storage_root must be absolute")
+            object.__setattr__(self, "h3_gateway_storage_root", root)
+        for value in (
+            self.h3_controlled_storage_retry_attempt_sha256,
+            self.h3_controlled_storage_retry_evidence_sha256,
+        ):
+            if value and (
+                len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError("controlled storage retry hashes must be sha256")
         if self.seedream_model not in SEEDREAM_MODELS:
             raise ValueError("seedream_model is not supported")
         if self.seedream_edit_mode not in SEEDREAM_EDIT_MODES:
@@ -110,6 +127,15 @@ def get_settings() -> Settings:
         h3_poll_timeout_s=float(os.environ.get("H3_POLL_TIMEOUT_S", "1500")),
         h3_download_timeout_s=float(os.environ.get("H3_DOWNLOAD_TIMEOUT_S", "180")),
         h3_poll_interval_s=float(os.environ.get("H3_POLL_INTERVAL_S", "3")),
+        h3_gateway_storage_root=Path(os.environ.get(
+            "H3_GATEWAY_STORAGE_ROOT", "/data/duet/storage/duet-ad1-h3-inputs"
+        )),
+        h3_controlled_storage_retry_attempt_sha256=os.environ.get(
+            "H3_CONTROLLED_STORAGE_RETRY_ATTEMPT_SHA256", ""
+        ).strip(),
+        h3_controlled_storage_retry_evidence_sha256=os.environ.get(
+            "H3_CONTROLLED_STORAGE_RETRY_EVIDENCE_SHA256", ""
+        ).strip(),
         enable_mediakit_erase=os.environ.get("ENABLE_MEDIAKIT_ERASE", "").lower() in ("1", "true", "yes"),
         mediakit_api_key=os.environ.get("VOLC_MEDIAKIT_API_KEY", "").strip(),
         mediakit_concurrency=max(1, int(os.environ.get("MEDIAKIT_CONCURRENCY", "4"))),

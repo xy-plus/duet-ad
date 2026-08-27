@@ -20,6 +20,7 @@ def make_settings(tmp_path, **overrides):
         data_dir=tmp_path / "data",
         max_upload_mb=5,
         retry_interval_s=0,
+        h3_gateway_storage_root=tmp_path / "h3-gateway-storage",
     )
     base.update(overrides)
     return Settings(**base)

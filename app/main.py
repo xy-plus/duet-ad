@@ -9,6 +9,7 @@ import threading
 import time
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
@@ -831,7 +832,7 @@ def _make_h3_request(
         if engine_h3.get("workflow") != expected_workflow:
             raise _SubmitError(409, "prepared_input_invalid")
         try:
-            return h3_project.build_request(
+            return replace(h3_project.build_request(
                 frozen=frozen,
                 cid=cid,
                 workdir=(settings.data_dir / cid / "work" / "h3-native").resolve(),
@@ -841,7 +842,7 @@ def _make_h3_request(
                 aspect_ratio=aspect_ratio,
                 autodl_token=settings.autodl_art_token,
                 timeouts=_timeouts(settings),
-            )
+            ), gateway_storage_root=settings.h3_gateway_storage_root)
         except h3_project.ProjectMultimodalError:
             raise _SubmitError(409, "prepared_input_invalid") from None
     return h3.H3Request(
@@ -1239,7 +1240,7 @@ def _run_generation(
     request: h3.H3Request,
     action: str,
 ) -> None:
-    if action not in {"start", "resume", "retry"}:
+    if action not in {"start", "resume", "retry", "retry_controlled_storage"}:
         raise ValueError("invalid generation action")
     meta = storage.load_meta(settings.data_dir, cid)
     generation = meta.get("generation") if meta else None
@@ -1316,8 +1317,18 @@ def _run_generation(
             result = h3.start(request)
         elif h3_action == "resume":
             result = h3.resume(request)
-        else:
+        elif h3_action == "retry":
             result = h3.retry(request, request.client_request_id)
+        else:
+            result = h3.retry_controlled_storage_rejection(
+                request,
+                legacy_attempt_sha256=(
+                    settings.h3_controlled_storage_retry_attempt_sha256
+                ),
+                legacy_evidence_sha256=(
+                    settings.h3_controlled_storage_retry_evidence_sha256
+                ),
+            )
         if h3_action == "resume" and result.status == "not_started":
             _mark_submission_unknown(settings, cid, generation)
             return
@@ -2761,6 +2772,75 @@ def create_app(settings: Settings) -> FastAPI:
                     detail = "already submitted" if previous_status == "succeeded" else "generation in progress"
                     raise HTTPException(status_code=409, detail=detail)
                 if previous_status in _GENERATION_RETRYABLE and previous_id == request_id:
+                    if generation.get("error") == "h3_submit_rejected":
+                        if not _short_generation_parameters_match(
+                            meta,
+                            dialogue_mode=payload["dialogue_mode"],
+                            dialogue=dialogue,
+                            fit_mode=fit_mode,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="resume_parameters_changed",
+                            )
+                        try:
+                            source_request = await asyncio.to_thread(
+                                _load_h3_request, settings, cid, meta
+                            )
+                            frozen, _request_id = _load_short_frozen_input(
+                                settings, cid, meta
+                            )
+                            context = _freeze_short_context_ir(
+                                settings, frozen, source_request
+                            )
+                            request = h3_project.apply_bound_context_ir(
+                                context, generation.get("context_ir")
+                            )
+                        except (
+                            _SubmitError,
+                            h3.H3Error,
+                            h3_project.ProjectMultimodalError,
+                        ) as exc:
+                            _mark_submission_unknown(settings, cid, generation)
+                            raise HTTPException(
+                                status_code=409,
+                                detail="submission_outcome_unknown",
+                            ) from exc
+                        if not h3.controlled_storage_rejection_is_safely_retryable(
+                            request,
+                            legacy_attempt_sha256=(
+                                settings.h3_controlled_storage_retry_attempt_sha256
+                            ),
+                            legacy_evidence_sha256=(
+                                settings.h3_controlled_storage_retry_evidence_sha256
+                            ),
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="new client_request_id required",
+                            )
+                        updated = {
+                            **generation,
+                            "status": "queued",
+                            "error": None,
+                            "stage": "h3",
+                        }
+                        storage.update_meta(
+                            settings.data_dir, cid, generation=updated
+                        )
+                        background_tasks.add_task(
+                            _run_generation,
+                            settings,
+                            cid,
+                            source_request,
+                            "retry_controlled_storage",
+                        )
+                        return {
+                            "status": "queued",
+                            "attempt": generation.get("attempt"),
+                        }
                     if generation.get("error") not in {
                         "context_ir_result_invalid",
                         "context_ir_semantic_mismatch",

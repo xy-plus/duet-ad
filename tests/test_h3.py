@@ -1506,3 +1506,139 @@ def test_duration_over_provider_limit_is_rejected(tmp_path):
 def test_zero_duration_is_rejected(tmp_path):
     with pytest.raises(h3.H3Error, match="invalid_duration"):
         replace(_request(tmp_path), duration=0)
+
+
+def _controlled_multimodal_request(
+    tmp_path: Path, controlled_root: Path,
+) -> h3.H3Request:
+    base = _request(tmp_path)
+    audio_path = tmp_path / "voice.wav"
+    audio_path.write_bytes(b"frozen-voice-reference")
+    audio = h3.FrozenReferenceAudio(
+        path=audio_path,
+        data=audio_path.read_bytes(),
+        order=1,
+        purpose="voice",
+        format="wav",
+        sha256=hashlib.sha256(audio_path.read_bytes()).hexdigest(),
+        duration_s=2.0,
+    )
+    return replace(
+        base,
+        duration=4,
+        workflow=h3.H3_MULTIMODAL_WORKFLOW,
+        reference_audios=(audio,),
+        skill_plan_sha256="1" * 64,
+        multimodal_compiler_version="duet.h3-multimodal.v2",
+        upstream_dialogue_receipt_sha256="2" * 64,
+        audio_required=True,
+        context_ir_receipt_path=base.workdir / ".context-ir" / "attempts" / "000001" / "receipt.json",
+        context_ir_receipt_sha256="3" * 64,
+        gateway_storage_root=controlled_root,
+    )
+
+
+def test_controlled_gateway_projection_is_receipt_bound_and_idempotent(
+    tmp_path, monkeypatch,
+):
+    controlled_root = tmp_path / "controlled"
+    request = _controlled_multimodal_request(tmp_path, controlled_root)
+
+    h3._materialize_gateway_inputs(request)
+    manifest = h3._input_manifest(request)
+    bound = manifest["multimodal"]["gateway_inputs"]
+
+    assert [item["order"] for item in bound] == [1, 2, 1]
+    assert [item["role"] for item in bound] == [
+        "reference_image", "reference_image", "reference_audio",
+    ]
+    for item in bound:
+        provider = Path(item["provider_path"])
+        assert provider.resolve().is_relative_to(controlled_root.resolve())
+        assert item["source_sha256"] == item["provider_sha256"]
+        assert hashlib.sha256(provider.read_bytes()).hexdigest() == item["provider_sha256"]
+
+    monkeypatch.setattr(
+        h3,
+        "_atomic_write_bytes",
+        lambda *_args, **_kwargs: pytest.fail("exact projection must perform zero writes"),
+    )
+    h3._materialize_gateway_inputs(request)
+
+
+def test_controlled_gateway_projection_rejects_source_symlink_and_drift(tmp_path):
+    controlled_root = tmp_path / "controlled"
+    request = _controlled_multimodal_request(tmp_path, controlled_root)
+    source = request.keyframes[0][0]
+    source.unlink()
+    target = tmp_path / "real.png"
+    target.write_bytes(request.keyframes[0][1])
+    source.symlink_to(target)
+
+    with pytest.raises(h3.ReceiptError, match="gateway_input_symlink"):
+        h3._materialize_gateway_inputs(request)
+
+    source.unlink()
+    source.write_bytes(request.keyframes[0][1])
+    h3._materialize_gateway_inputs(request)
+    provider = Path(
+        h3._input_manifest(request)["multimodal"]["gateway_inputs"][0]["provider_path"]
+    )
+    provider.write_bytes(b"drifted")
+    with pytest.raises(h3.ReceiptError, match="receipt_mismatch"):
+        h3._materialize_gateway_inputs(request)
+
+
+def test_exact_legacy_storage_rejection_appends_same_client_attempt(
+    tmp_path, monkeypatch,
+):
+    request = _controlled_multimodal_request(tmp_path, tmp_path / "controlled")
+    request = replace(request, timeouts=replace(request.timeouts, retry_count=0))
+    monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
+    old = h3._new_state(request, "000001", request.client_request_id)
+    legacy = h3._pre_controlled_storage_input_manifest(request)
+    old.update({
+        "input": legacy,
+        "input_receipt": h3.canonical_json_sha256(legacy),
+        "status": "failed",
+        "retryable": False,
+        "h3": {"status": "failed"},
+        "error": {"code": "h3_submit_rejected"},
+    })
+    h3._attempt_path(request, "000001").parent.mkdir(parents=True, exist_ok=True)
+    h3._save_state(request, old)
+    old_bytes = h3._attempt_path(request, "000001").read_bytes()
+    old_sha = hashlib.sha256(old_bytes).hexdigest()
+    evidence_sha = hashlib.sha256(b"exact gateway 400 evidence").hexdigest()
+
+    calls = []
+
+    def gateway(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        if req.method == "POST":
+            return httpx.Response(201, json={"task_id": "new-task"})
+        return httpx.Response(200, json={"status": "failed"})
+
+    with _client(gateway) as client:
+        result = h3.retry_controlled_storage_rejection(
+            request,
+            legacy_attempt_sha256=old_sha,
+            legacy_evidence_sha256=evidence_sha,
+            client=client,
+        )
+
+    assert result.attempt_id == "000002"
+    assert h3._attempt_path(request, "000001").read_bytes() == old_bytes
+    assert len([call for call in calls if call.method == "POST"]) == 1
+    posted = json.loads(next(call for call in calls if call.method == "POST").content)
+    assert all(
+        Path(path).resolve().is_relative_to(request.gateway_storage_root.resolve())
+        for path in posted["images"]
+    )
+    with pytest.raises(h3.H3Error, match="controlled_storage_retry_not_allowed"):
+        h3.retry_controlled_storage_rejection(
+            request,
+            legacy_attempt_sha256=old_sha,
+            legacy_evidence_sha256=evidence_sha,
+            client=httpx.Client(transport=httpx.MockTransport(gateway)),
+        )
