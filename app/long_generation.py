@@ -101,6 +101,21 @@ def _fusion_audio_block(lines_json: str) -> str:
     )
 
 
+def _canonical_fusion_prompt(prompt: str, lines_json: str) -> str:
+    """Accept one exact audio block and freeze one canonical byte form."""
+    opening = "<AUDIO_CONTENT_JSON>"
+    closing = "</AUDIO_CONTENT_JSON>"
+    if prompt.count(opening) != 1 or prompt.count(closing) != 1:
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    canonical = _fusion_audio_block(lines_json)
+    if canonical in prompt:
+        return prompt
+    lf_envelope = f"{opening}\n{lines_json}\n{closing}"
+    if lf_envelope in prompt:
+        return prompt.replace(lf_envelope, canonical, 1)
+    raise LongGenerationError("prompt_fusion_output_invalid")
+
+
 def load_prompt_fusion(
     *, input_path: Path, output_path: Path, root: Path | None = None,
 ) -> FrozenPromptFusion:
@@ -266,11 +281,10 @@ def load_prompt_fusion(
             or not segment["final_prompt"].strip()
         ):
             raise LongGenerationError("prompt_fusion_output_invalid")
-        if segment["final_prompt"].count(_fusion_audio_block(
-            segments[index - 1]["audio_content"]["lines_json"]
-        )) != 1:
-            raise LongGenerationError("prompt_fusion_output_invalid")
-        final_prompts.append(segment["final_prompt"])
+        final_prompts.append(_canonical_fusion_prompt(
+            segment["final_prompt"],
+            segments[index - 1]["audio_content"]["lines_json"],
+        ))
     return FrozenPromptFusion(
         input_path=input_path,
         input_data=input_data,

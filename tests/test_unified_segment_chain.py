@@ -110,6 +110,113 @@ def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> No
     assert old_prompt not in frozen.final_prompts
 
 
+_CID_9533_LINES_JSON = (
+    '[{"order":1,"text":"تول جمالا بها القادم وقتك يا لدى عوصة اللوري تاب '
+    'البدري يبريزها بجمال يا شعوري","start_s":0.0,"end_s":14.44,'
+    '"delivery":"off_screen","voice_ref":1}]'
+)
+
+
+def _write_9533_fusion_fixture(
+    root: Path, *, audio_envelope: str,
+) -> tuple[Path, Path, str]:
+    (root / "work").mkdir(parents=True, exist_ok=True)
+    input_payload = json.loads(_fusion_input(root, 1).decode("utf-8"))
+    voice = root / "work" / "segments" / "1" / "work" / "voice.mp3"
+    voice.parent.mkdir(parents=True, exist_ok=True)
+    voice.write_bytes(b"9533-frozen-normalized-voice")
+    input_payload["segments"][0]["audio_content"] = {
+        "lines_json": _CID_9533_LINES_JSON,
+        "lines_sha256": hashlib.sha256(
+            _CID_9533_LINES_JSON.encode("utf-8")
+        ).hexdigest(),
+        "voice_references": [{
+            "voice_ref": 1,
+            "path": "work/segments/1/work/voice.mp3",
+            "sha256": hashlib.sha256(voice.read_bytes()).hexdigest(),
+            "purpose": "voice",
+        }],
+    }
+    input_data = _canonical(input_payload)
+    input_path = root / "work" / "multimodal_input.json"
+    output_path = root / "work" / "h3_prompt_plan.json"
+    input_path.write_bytes(input_data)
+    final_prompt = f"<VISUAL>9533 fused visual</VISUAL>\n{audio_envelope}"
+    output_path.write_bytes(_canonical({
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{"index": 1, "final_prompt": final_prompt}],
+    }))
+    return input_path, output_path, final_prompt
+
+
+def test_9533_lf_audio_envelope_is_canonicalized_without_rewriting_json(
+    tmp_path: Path,
+) -> None:
+    envelope = (
+        "<AUDIO_CONTENT_JSON>\n"
+        f"{_CID_9533_LINES_JSON}\n"
+        "</AUDIO_CONTENT_JSON>"
+    )
+    input_path, output_path, _raw_prompt = _write_9533_fusion_fixture(
+        tmp_path, audio_envelope=envelope,
+    )
+
+    frozen = long_generation.load_prompt_fusion(
+        input_path=input_path, output_path=output_path, root=tmp_path,
+    )
+
+    canonical_block = (
+        f"<AUDIO_CONTENT_JSON>{_CID_9533_LINES_JSON}"
+        "</AUDIO_CONTENT_JSON>"
+    )
+    assert frozen.final_prompts == (
+        f"<VISUAL>9533 fused visual</VISUAL>\n{canonical_block}",
+    )
+    assert frozen.output_data == output_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "audio_envelope",
+    [
+        (
+            "<AUDIO_CONTENT_JSON> " + _CID_9533_LINES_JSON
+            + " </AUDIO_CONTENT_JSON>"
+        ),
+        (
+            "<AUDIO_CONTENT_JSON>\r\n" + _CID_9533_LINES_JSON
+            + "\r\n</AUDIO_CONTENT_JSON>"
+        ),
+        (
+            "<AUDIO_CONTENT_JSON>"
+            + _CID_9533_LINES_JSON.replace("off_screen", "on_screen")
+            + "</AUDIO_CONTENT_JSON>"
+        ),
+        (
+            "<AUDIO_CONTENT_JSON>" + _CID_9533_LINES_JSON
+            + "</AUDIO_CONTENT_JSON><AUDIO_CONTENT_JSON>"
+            + _CID_9533_LINES_JSON + "</AUDIO_CONTENT_JSON>"
+        ),
+    ],
+    ids=("space", "crlf", "json-rewrite", "duplicate-block"),
+)
+def test_prompt_fusion_rejects_noncanonical_audio_envelopes(
+    tmp_path: Path, audio_envelope: str,
+) -> None:
+    input_path, output_path, _raw_prompt = _write_9533_fusion_fixture(
+        tmp_path, audio_envelope=audio_envelope,
+    )
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_output_invalid",
+    ):
+        long_generation.load_prompt_fusion(
+            input_path=input_path, output_path=output_path, root=tmp_path,
+        )
+
+
 def test_binding_skill_production_seams_are_absent() -> None:
     assert not hasattr(pipeline, "queue_multimodal_binding")
     assert not hasattr(pipeline, "produce_multimodal_binding")
@@ -253,6 +360,143 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
             "error": None,
         } for index in range(1, segment_count + 1)],
     }
+
+
+def _failed_lf_prompt_fusion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[object, str, Path, Path, Path]:
+    settings = make_settings(tmp_path)
+    created = storage.new_conversation(
+        settings.data_dir, "fusion-receipt-recovery", "source.mp4"
+    )
+    cid = created["id"]
+    root = settings.data_dir / cid
+    acceptance_sha256 = "a" * 64
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _image_user_acceptance={
+            "version": 1,
+            "sha256": acceptance_sha256,
+        },
+    )
+    skill_path = tmp_path / "video-prompt-fusion-SKILL.md"
+    skill_path.write_text("strict frozen prompt fusion", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "PROMPT_FUSION_SKILL_MD", skill_path)
+    monkeypatch.setattr(
+        long_generation, "PROMPT_FUSION_SKILL_SOURCE", skill_path
+    )
+    input_data = _fusion_input(root, 1)
+    assert pipeline.queue_prompt_fusion(
+        settings,
+        cid,
+        input_data=input_data,
+        image_acceptance_sha256=acceptance_sha256,
+    ) == "queued"
+    frozen_skill = root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME
+    frozen_skill.write_bytes(skill_path.read_bytes())
+    output = root / "work" / "h3_prompt_plan.json"
+    output.write_bytes(_canonical({
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{
+            "index": 1,
+            "final_prompt": (
+                "<VISUAL>fused</VISUAL>\n"
+                "<AUDIO_CONTENT_JSON>\n[]\n</AUDIO_CONTENT_JSON>"
+            ),
+        }],
+    }))
+    state = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _prompt_fusion={
+            **state,
+            "status": "failed",
+            "error": "prompt_fusion_output_invalid",
+            "manifest_sha256": None,
+        },
+    )
+    return settings, cid, root, skill_path, output
+
+
+def test_failed_lf_output_can_publish_receipt_without_rerunning_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, cid, root, skill_path, output = _failed_lf_prompt_fusion(
+        tmp_path, monkeypatch,
+    )
+    raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
+
+    assert pipeline.finalize_prompt_fusion_receipt(settings, cid) == "done"
+
+    assert hashlib.sha256(output.read_bytes()).hexdigest() == raw_output_sha256
+    frozen = long_generation.load_prompt_fusion_manifest(
+        root=root, skill_source_path=skill_path,
+    )
+    assert frozen.final_prompts == (
+        "<VISUAL>fused</VISUAL>\n"
+        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>",
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+    assert meta["_prompt_fusion"]["status"] == "done"
+    assert meta["_prompt_fusion"]["error"] is None
+    assert meta["_prompt_fusion"]["recovered_error"] == (
+        "prompt_fusion_output_invalid"
+    )
+    assert meta["_prompt_fusion"]["manifest_sha256"] == hashlib.sha256(
+        (root / "work" / h3_project.SOURCE_FILENAME).read_bytes()
+    ).hexdigest()
+    manifest = json.loads(
+        (root / "work" / h3_project.SOURCE_FILENAME).read_text(encoding="utf-8")
+    )
+    assert manifest["output"]["sha256"] == raw_output_sha256
+    assert manifest["skill"]["sha256"] == hashlib.sha256(
+        (root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME).read_bytes()
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "drift", ["input", "output", "skill", "acceptance", "generation", "h3"],
+)
+def test_receipt_only_finalization_rejects_any_frozen_authority_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str,
+) -> None:
+    settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
+        tmp_path, monkeypatch,
+    )
+    if drift == "input":
+        (root / "work" / h3_project.SKILL_INPUT_FILENAME).write_bytes(b"{}")
+    elif drift == "output":
+        output.write_bytes(b"{}")
+    elif drift == "skill":
+        (root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME).write_bytes(
+            b"drifted skill"
+        )
+    elif drift == "acceptance":
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            _image_user_acceptance={"version": 1, "sha256": "b" * 64},
+        )
+    elif drift == "generation":
+        storage.update_meta(
+            settings.data_dir, cid, generation={"status": "not_started"},
+        )
+    else:
+        (root / "work" / "segments" / "1" / ".h3").mkdir(
+            parents=True, exist_ok=True,
+        )
+
+    with pytest.raises(pipeline.PipelineError):
+        pipeline.finalize_prompt_fusion_receipt(settings, cid)
+
+    assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
+    assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
+        "status"
+    ] == "failed"
 
 
 def test_frozen_current_v4_projects_publish_a_stable_n1_fusion_shape(
