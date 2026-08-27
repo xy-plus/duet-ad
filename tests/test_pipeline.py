@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import codex_runner, h3, image_optimization, long_generation, long_video, pipeline, postprocess, prepared_input, seedream, storage, vocal, voice
+from app import codex_runner, h3, h3_project, image_optimization, long_generation, long_video, pipeline, postprocess, prepared_input, seedream, storage, vocal, voice
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
@@ -3743,3 +3743,158 @@ def test_run_voice_empty_lines_without_spoken_passes(tmp_path, video_1s, monkeyp
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done", stored.get("error")
     assert stored["voice_lines"] == []
+
+
+@pytest.mark.parametrize("producer_outcome", ["done", "submission_unknown"])
+def test_multimodal_binding_producer_freezes_skill_raw_and_manifest_last(
+    tmp_path, producer_outcome,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "binding", "source.mp4")
+    cid = meta["id"]
+    root = settings.data_dir / cid
+    work = root / "work"
+    frames = []
+    accepted_frames = []
+    for order in range(1, 10):
+        path = work / "postprocessed" / f"{order:02d}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = _PX_PNG + bytes([order])
+        path.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        frames.append(path)
+        accepted_frames.append({
+            "order": order,
+            "segment_index": 0,
+            "frame_index": order,
+            "frame_name": path.name,
+            "raw_sha256": str(order) * 64,
+            "canvas_sha256": digest,
+            "output_sha256": digest,
+        })
+    visual = work / "visual_prompt.txt"
+    visual.write_text("人物保持静默，画外歌声作为声音条件。", encoding="utf-8")
+    subprocess.run(
+        [
+            "/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+            "-t", "14.58", "-q:a", "9", "-y", str(work / "voice.mp3"),
+        ],
+        check=True,
+    )
+    acceptance_payload = {
+        "version": 1,
+        "cid": cid,
+        "meta_snapshot_sha256": "a" * 64,
+        "postprocess_receipt_sha256": "b" * 64,
+        "plan_sha256": "c" * 64,
+        "continuity_sha256": "d" * 64,
+        "execution_input_sha256": "e" * 64,
+        "canvas_execution_sha256": "f" * 64,
+        "scene_anchor_schedule_sha256": "1" * 64,
+        "source_palette_receipt_sha256": "2" * 64,
+        "anchor_receipt_sha256s": ["3" * 64],
+        "frames": accepted_frames,
+    }
+    acceptance = {
+        **acceptance_payload,
+        "sha256": h3.canonical_json_sha256(acceptance_payload),
+    }
+    storage.update_meta(
+        settings.data_dir, cid, _image_user_acceptance=acceptance,
+    )
+    dialogue = ({
+        "text": "تجربة غنائية",
+        "start_s": 0.0,
+        "end_s": 14.44,
+        "classification": "sung",
+        "provenance": "asr",
+    },)
+    dialogue_sha = h3.canonical_json_sha256(list(dialogue))
+
+    assert pipeline.queue_multimodal_binding(
+        settings,
+        cid,
+        workdir=work,
+        visual_prompt_path=visual,
+        keyframes=tuple(frames),
+        dialogue=dialogue,
+        dialogue_source_sha256=dialogue_sha,
+        dialogue_delivery="off_screen",
+    ) == "queued"
+
+    runner_calls = []
+
+    class Runner:
+        def run(self, scope, _prompt):
+            runner_calls.append(scope)
+            if producer_outcome == "submission_unknown":
+                raise RuntimeError("ambiguous Skill execution")
+            producer_input = json.loads(
+                (scope / "work" / "multimodal_input.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            plan = {
+                "version": 2,
+                "phase": "multimodal_audio",
+                "eligible": True,
+                "reason": None,
+                "visual_prompt": visual.read_text(encoding="utf-8"),
+                "dialogue_source_sha256": producer_input["dialogue_source_sha256"],
+                "subjects": [],
+                "audio_refs": [{
+                    "audio_index": 1, "purpose": "voice", "subject_id": None,
+                }],
+                "speech_bindings": [{
+                    "line_index": 1,
+                    "delivery": "off_screen_voiceover",
+                    "subject_id": None,
+                    "language": "Arabic",
+                    "voice_ref": 1,
+                }],
+                "sound_design": {"ambience_refs": [], "effects": []},
+            }
+            (scope / "work" / "h3_prompt_plan.json").write_text(
+                json.dumps(plan, ensure_ascii=False), encoding="utf-8"
+            )
+
+    produced = pipeline.produce_multimodal_binding(settings, cid, Runner())
+    if producer_outcome == "submission_unknown":
+        assert produced == "submission_unknown"
+        assert pipeline.queue_multimodal_binding(
+            settings,
+            cid,
+            workdir=work,
+            visual_prompt_path=visual,
+            keyframes=tuple(frames),
+            dialogue=dialogue,
+            dialogue_source_sha256=dialogue_sha,
+            dialogue_delivery="off_screen",
+        ) == "submission_unknown"
+        assert len(runner_calls) == 1
+        assert not (work / h3_project.SOURCE_FILENAME).exists()
+        return
+    assert produced == "done", storage.load_meta(settings.data_dir, cid).get(
+        "_multimodal_binding_producer"
+    )
+    frozen = h3_project.freeze_optional(root, work)
+    assert frozen is not None
+    assert len(frozen.reference_audios) == 1
+    assert frozen.skill_plan["speech_bindings"][0]["language"] == "Arabic"
+    assert frozen.skill_input["keyframes"] == [
+        {
+            "order": order,
+            "path": f"postprocessed/{order:02d}.png",
+            "sha256": accepted_frames[order - 1]["output_sha256"],
+        }
+        for order in range(1, 10)
+    ]
+    (work / pipeline.MULTIMODAL_BINDING_RAW_OUTPUT_FILENAME).write_text(
+        "{}\n", encoding="utf-8"
+    )
+    with pytest.raises(
+        h3_project.ProjectMultimodalError,
+        match="multimodal_binding_production_invalid",
+    ):
+        h3_project.freeze_optional(root, work)

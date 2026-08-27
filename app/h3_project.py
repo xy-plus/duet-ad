@@ -22,6 +22,8 @@ SKILL_INPUT_FILENAME = "multimodal_input.json"
 SPEAKER_TIMING_FILENAME = "speaker_timing.json"
 SPEAKER_TIMING_PRODUCTION_FILENAME = "speaker_timing_production.json"
 FINAL_ACCEPTANCE_FILENAME = "dialogue-av-acceptance.json"
+MULTIMODAL_BINDING_RECEIPT_FILENAME = "multimodal_binding_production.json"
+MULTIMODAL_BINDING_RECEIPT_SCHEMA = "duet.multimodal-binding-production"
 SOURCE_SCHEMA = "duet.h3-multimodal-source"
 SOURCE_VERSION = 3
 LEGACY_SOURCE_VERSION = 2
@@ -178,133 +180,6 @@ def _canonical_bytes(value: object) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError):
         _fail("multimodal_input_invalid")
-
-
-def _language_tag(text: str) -> str:
-    if any("\u0600" <= char <= "\u06ff" for char in text):
-        return "ar"
-    if any("\u4e00" <= char <= "\u9fff" for char in text):
-        return "zh"
-    return "und"
-
-
-def freeze_off_screen_conditioning_plan(
-    *,
-    root: Path,
-    workdir: Path,
-    visual_prompt_path: Path,
-    keyframes: tuple[Path, ...],
-    dialogue: tuple[Mapping[str, Any], ...],
-    dialogue_source_sha256: str,
-    normalized_audio_path: Path,
-) -> bool:
-    """Freeze an explicit off-screen plan from server-owned normalized audio."""
-    root = Path(root).resolve()
-    workdir = Path(workdir).resolve()
-    normalized_audio_path = Path(normalized_audio_path)
-    expected_audio_path = root / "work" / "voice.mp3"
-    if (
-        normalized_audio_path.name != "voice.mp3"
-        or normalized_audio_path.parent.resolve() != expected_audio_path.parent
-        or normalized_audio_path.is_symlink()
-        or normalized_audio_path.resolve() != expected_audio_path
-    ):
-        _fail("reference_audio_binding_invalid")
-    audio_data = _read(normalized_audio_path, "reference_audio_binding_invalid")
-    visual_data = _read(
-        Path(visual_prompt_path).resolve(), "multimodal_input_invalid"
-    )
-    try:
-        Path(visual_prompt_path).resolve().relative_to(workdir)
-        frozen_frames = tuple(
-            (
-                path.resolve().relative_to(workdir).as_posix(),
-                _sha256(_read(path.resolve(), "multimodal_input_invalid")),
-            )
-            for path in keyframes
-        )
-    except ValueError:
-        _fail("multimodal_input_invalid")
-    if not dialogue or not frozen_frames:
-        _fail("multimodal_input_invalid")
-
-    audio_path = workdir / "conditioning-voice.mp3"
-    audio_binding = {
-        "order": 1,
-        "path": audio_path.name,
-        "sha256": _sha256(audio_data),
-        "purpose": "voice",
-    }
-    visual_text = visual_data.decode("utf-8")
-    plan = {
-        "version": 2,
-        "phase": "multimodal_audio",
-        "eligible": True,
-        "reason": None,
-        "visual_prompt": visual_text,
-        "dialogue_source_sha256": dialogue_source_sha256,
-        "subjects": [],
-        "audio_refs": [{
-            "audio_index": 1, "purpose": "voice", "subject_id": None,
-        }],
-        "speech_bindings": [
-            {
-                "line_index": order,
-                "delivery": "off_screen_voiceover",
-                "subject_id": None,
-                "language": _language_tag(str(line.get("text", ""))),
-                "voice_ref": 1,
-            }
-            for order, line in enumerate(dialogue, 1)
-        ],
-        "sound_design": {"ambience_refs": [], "effects": []},
-    }
-    input_payload = {
-        "schema": SKILL_INPUT_SCHEMA,
-        "version": SKILL_INPUT_VERSION,
-        "visual_prompt": {
-            "path": Path(visual_prompt_path).resolve().relative_to(workdir).as_posix(),
-            "sha256": _sha256(visual_data),
-        },
-        "keyframes": [
-            {"order": order, "path": path, "sha256": digest}
-            for order, (path, digest) in enumerate(frozen_frames, 1)
-        ],
-        "dialogue_source_sha256": dialogue_source_sha256,
-        "reference_audios": [audio_binding],
-    }
-    plan_data = _canonical_bytes(plan)
-    input_data = _canonical_bytes(input_payload)
-    plan_path = workdir / "h3_prompt_plan.json"
-    input_path = workdir / SKILL_INPUT_FILENAME
-    manifest = {
-        "schema": SOURCE_SCHEMA,
-        "version": SOURCE_VERSION,
-        "mode": "multimodal",
-        "approved_skill_plan_sha256": h3.canonical_json_sha256(plan),
-        "multimodal_input": {
-            "path": input_path.name, "sha256": _sha256(input_data),
-        },
-        "skill_plan": {
-            "path": plan_path.name, "sha256": _sha256(plan_data),
-        },
-        "reference_audios": [audio_binding],
-    }
-    manifest_data = _canonical_bytes(manifest)
-    desired = {
-        audio_path: audio_data,
-        plan_path: plan_data,
-        input_path: input_data,
-        workdir / SOURCE_FILENAME: manifest_data,
-    }
-    changed = any(
-        not path.is_file() or path.read_bytes() != data
-        for path, data in desired.items()
-    )
-    if changed:
-        for path, data in desired.items():
-            _atomic_bytes(path, data)
-    return changed
 
 
 def _plan_has_on_screen_dialogue(plan: Mapping[str, Any]) -> bool:
@@ -480,6 +355,78 @@ def _speaker_timing_production_binding(
     )
 
 
+def _multimodal_binding_production(
+    *, root: Path, workdir: Path, manifest: Mapping[str, Any],
+    skill_input: Mapping[str, Any], skill_plan: Mapping[str, Any],
+) -> None:
+    binding = manifest.get("binding_producer")
+    if binding is None:
+        return
+    if not isinstance(binding, dict) or set(binding) != {"path", "sha256"}:
+        _fail("multimodal_binding_production_invalid")
+    receipt_path = _inside(
+        root, workdir, binding.get("path"),
+        "multimodal_binding_production_invalid",
+    )
+    receipt_data = _read(receipt_path, "multimodal_binding_production_invalid")
+    if (
+        receipt_path.name != MULTIMODAL_BINDING_RECEIPT_FILENAME
+        or _sha256(receipt_data) != binding.get("sha256")
+    ):
+        _fail("multimodal_binding_production_invalid")
+    receipt = _json_object(receipt_data, "multimodal_binding_production_invalid")
+    artifacts = receipt.get("artifacts")
+    expected_names = {
+        "producer_input": "multimodal_binding_input.json",
+        "raw_output": "h3_prompt_plan.raw.json",
+        "skill": "multimodal_binding_skill.md",
+        "multimodal_input": SKILL_INPUT_FILENAME,
+        "skill_plan": "h3_prompt_plan.json",
+    }
+    if (
+        receipt.get("schema") != MULTIMODAL_BINDING_RECEIPT_SCHEMA
+        or receipt.get("version") != 1
+        or not isinstance(receipt.get("image_acceptance_sha256"), str)
+        or not isinstance(artifacts, dict)
+        or set(artifacts) != set(expected_names)
+    ):
+        _fail("multimodal_binding_production_invalid")
+    loaded: dict[str, Any] = {}
+    for role, expected_name in expected_names.items():
+        artifact = artifacts.get(role)
+        if not isinstance(artifact, dict) or set(artifact) != {"path", "sha256"}:
+            _fail("multimodal_binding_production_invalid")
+        path = _relative_file(
+            root, workdir, artifact.get("path"),
+            "multimodal_binding_production_invalid",
+        )
+        data = _read(path, "multimodal_binding_production_invalid")
+        if path.name != expected_name or _sha256(data) != artifact.get("sha256"):
+            _fail("multimodal_binding_production_invalid")
+        loaded[role] = (
+            _json_object(data, "multimodal_binding_production_invalid")
+            if role != "skill" else data
+        )
+    producer_input = loaded["producer_input"]
+    if (
+        producer_input.get("schema") != "duet.multimodal-binding-input"
+        or producer_input.get("version") != 1
+        or producer_input.get("phase") != "multimodal_audio"
+        or producer_input.get("image_acceptance_sha256")
+        != receipt.get("image_acceptance_sha256")
+        or producer_input.get("visual_prompt") != skill_input.get("visual_prompt")
+        or producer_input.get("keyframes") != skill_input.get("keyframes")
+        or producer_input.get("dialogue_source_sha256")
+        != skill_input.get("dialogue_source_sha256")
+        or producer_input.get("reference_audios")
+        != skill_input.get("reference_audios")
+        or loaded["multimodal_input"] != skill_input
+        or loaded["skill_plan"] != skill_plan
+        or loaded["raw_output"] != skill_plan
+    ):
+        _fail("multimodal_binding_production_invalid")
+
+
 def refresh_skill_input(
     *,
     root: Path,
@@ -643,16 +590,21 @@ def freeze_optional(
         "skill_plan",
         "reference_audios",
     }
-    optional_manifest_keys = {"speaker_timing", "speaker_timing_producer"}
+    optional_manifest_keys = {
+        "speaker_timing", "speaker_timing_producer", "binding_producer",
+    }
+    manifest_keys = set(manifest)
+    manifest_extras = manifest_keys - base_manifest_keys
     if (
         manifest.get("schema") != SOURCE_SCHEMA
         or source_version not in {LEGACY_SOURCE_VERSION, SOURCE_VERSION}
         or manifest.get("mode") != "multimodal"
-        or set(manifest) not in {
-            frozenset(base_manifest_keys),
-            frozenset(base_manifest_keys | {"speaker_timing"}),
-            frozenset(base_manifest_keys | optional_manifest_keys),
-        }
+        or not base_manifest_keys.issubset(manifest_keys)
+        or not manifest_extras.issubset(optional_manifest_keys)
+        or (
+            "speaker_timing_producer" in manifest
+            and "speaker_timing" not in manifest
+        )
         or (
             source_version == LEGACY_SOURCE_VERSION
             and "speaker_timing" in manifest
@@ -745,6 +697,13 @@ def freeze_optional(
         _fail("speaker_timing_refresh_required")
     if skill_input.get("speaker_timing") != timing_binding:
         _fail("speaker_timing_binding_invalid")
+    _multimodal_binding_production(
+        root=root,
+        workdir=workdir,
+        manifest=manifest,
+        skill_input=skill_input,
+        skill_plan=skill_plan,
+    )
     (
         speaker_timing_path,
         speaker_timing_data,
