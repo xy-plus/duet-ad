@@ -91,6 +91,21 @@ def test_visual_authorities_are_explicit_and_non_overlapping():
     assert "如果新关键帧无法承载旧提示词" not in text
 
 
+def test_old_static_content_requires_positive_new_evidence_and_mapping():
+    text = _skill()
+
+    for required in (
+        "`old_video_prompt` 只允许贡献动作、镜头、构图、节奏和时间轴",
+        "即使旧静态与新关键帧不显式冲突",
+        "新关键帧中独立可见",
+        "同 `order` 的图片优化提示词明确映射",
+        "两个条件必须同时满足",
+        "否则不得进入 `final_prompt` 的 `<VISUAL>`",
+        "静态描述只能取自新关键帧",
+    ):
+        assert required in text
+
+
 def test_audio_is_copied_exactly_inside_the_final_prompt():
     text = _skill()
 
