@@ -1,4 +1,5 @@
 export type DialogueMode = 'auto' | 'edit' | 'custom' | 'none';
+export type DialogueDelivery = 'auto' | 'on_screen' | 'off_screen';
 export type AspectRatio = '16:9' | '9:16';
 export type Resolution = '480p' | '768p';
 export type FitMode = 'none' | 'crop' | 'pad';
@@ -6,6 +7,7 @@ export type VideoKind = 'short' | 'long';
 
 export interface GenerationSettingsValue {
   dialogueMode: DialogueMode;
+  dialogueDelivery: DialogueDelivery | null;
   dialogueText: string;
   aspectRatio: AspectRatio;
   resolution: Resolution;

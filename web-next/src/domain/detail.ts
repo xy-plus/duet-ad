@@ -16,7 +16,14 @@ export interface AdaptedImageOptimizationPrompt {
   readonly sha256: string;
 }
 
+export interface AdaptedImageAcceptance {
+  readonly required: boolean;
+  readonly accepted: boolean;
+  readonly expectedMetaSha256: string | null;
+}
+
 export interface AdaptedConversationDetail {
+  readonly imageAcceptance: AdaptedImageAcceptance | null;
   readonly imageOptimizationPrompt: AdaptedImageOptimizationPrompt | null;
   readonly postprocessCapabilities: PostprocessOptions;
   readonly postprocessSegments: readonly {
@@ -68,6 +75,10 @@ function longSegmentIndexes(source: UnknownRecord): readonly number[] | null {
 export function postprocessAllowsGeneration(value: unknown): boolean {
   const source = record(value);
   if (!source) return false;
+  if (source.image_acceptance !== undefined && source.image_acceptance !== null) {
+    const acceptance = adaptImageAcceptance(source.image_acceptance);
+    if (!acceptance || (acceptance.required && !acceptance.accepted)) return false;
+  }
   if (source.postprocess === null || source.postprocess === undefined) return true;
   const postprocess = record(source.postprocess);
   if (!postprocess || postprocess.status !== 'done' || !Array.isArray(postprocess.segments)
@@ -97,6 +108,19 @@ export function adaptImageOptimizationPrompt(value: unknown): AdaptedImageOptimi
   return { text: source.text, defaultText: source.default_text, sha256: source.sha256 };
 }
 
+export function adaptImageAcceptance(value: unknown): AdaptedImageAcceptance | null {
+  const source = record(value);
+  if (!source || typeof source.required !== 'boolean' || typeof source.accepted !== 'boolean'
+      || (source.expected_meta_sha256 !== null
+        && (typeof source.expected_meta_sha256 !== 'string'
+          || !/^[0-9a-f]{64}$/u.test(source.expected_meta_sha256)))) return null;
+  return {
+    required: source.required,
+    accepted: source.accepted,
+    expectedMetaSha256: source.expected_meta_sha256,
+  };
+}
+
 export function adaptConversationDetail(value: unknown): AdaptedConversationDetail {
   const source = record(value) ?? {};
   const sourceSegments = array(source.segments);
@@ -104,6 +128,7 @@ export function adaptConversationDetail(value: unknown): AdaptedConversationDeta
   const capabilities = record(source.postprocess_capabilities);
   const postprocess = record(source.postprocess);
   return {
+    imageAcceptance: adaptImageAcceptance(source.image_acceptance),
     imageOptimizationPrompt: adaptImageOptimizationPrompt(source.image_optimization_prompt),
     postprocessCapabilities: {
       remove_subtitle: capabilities ? capabilities.remove_subtitle === true : source.postprocess_enabled === true,
@@ -167,8 +192,10 @@ export function detailSignature(detail: unknown): DetailSignature {
     source.source_prompt ?? null,
     source.source_prompt_sha256 ?? null,
     source.image_optimization_prompt ?? null,
+    source.image_acceptance ?? null,
     source.postprocess_capabilities ?? null,
     source.dialogue ?? null,
+    source.dialogue_delivery ?? null,
     postprocess?.status ?? '',
     postprocess?.error ?? '',
     array(source.keyframes).join(','),

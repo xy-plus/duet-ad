@@ -18,6 +18,7 @@ import type {
 interface GenerationStatusProps {
   model: GenerationStatusModel;
   onAction?: (action: GenerationAction) => void;
+  actionDisabled?: boolean;
 }
 
 function segmentStatus(status: GenerationSegment['status']) {
@@ -40,6 +41,20 @@ function progressPercent(model: GenerationStatusModel) {
   if (model.segments.length === 0) return 0;
   const completed = model.segments.filter(({ status }) => status === 'succeeded').length;
   return Math.round((completed / model.segments.length) * 100);
+}
+
+function stageDescription(stage: string | undefined): string {
+  switch (stage) {
+    case 'context_ir':
+    case 'context_ir_native':
+      return '音频与 Context IR 准备中';
+    case 'h3':
+      return 'H3 视频生成中';
+    case 'stitch':
+      return '正在合成最终视频';
+    default:
+      return stage ?? '正在等待服务端更新任务状态。';
+  }
 }
 
 function actionFor(model: GenerationStatusModel): { label: string; command: GenerationAction; paid: boolean } | null {
@@ -93,7 +108,7 @@ function stateSurface(model: GenerationStatusModel, actionButton: React.ReactNod
           type="info"
           showIcon
           title="生成进行中"
-          description={model.stageLabel ?? '正在等待服务端更新任务状态。'}
+          description={stageDescription(model.stageLabel)}
         />
       );
     case 'failed':
@@ -145,7 +160,7 @@ function stateSurface(model: GenerationStatusModel, actionButton: React.ReactNod
   }
 }
 
-export function GenerationStatus({ model, onAction }: GenerationStatusProps) {
+export function GenerationStatus({ model, onAction, actionDisabled = false }: GenerationStatusProps) {
   const action = actionFor(model);
   const paidCountKnown = model.paidTaskCount !== null;
   const actionButton = action && onAction ? (
@@ -153,7 +168,7 @@ export function GenerationStatus({ model, onAction }: GenerationStatusProps) {
       type="primary"
       aria-label={model.actionPending ? '提交中' : action.label}
       loading={model.actionPending}
-      disabled={model.actionPending || (action.paid && !paidCountKnown)}
+      disabled={actionDisabled || model.actionPending || (action.paid && !paidCountKnown)}
       onClick={() => onAction(action.command)}
     >
       {model.actionPending ? '提交中' : action.label}

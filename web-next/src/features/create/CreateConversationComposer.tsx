@@ -176,7 +176,7 @@ export function CreateConversationComposer({
         </Form.Item>
       )}
 
-      <Form.Item className="create-composer__field" label="台词处理">
+      <Form.Item className="create-composer__field" label="音频/台词处理">
         <div className="create-composer__transcript-controls">
           <Radio.Group
             aria-disabled={submitting}

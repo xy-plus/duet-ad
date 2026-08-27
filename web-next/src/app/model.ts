@@ -64,6 +64,7 @@ export function generationSettingsValue(draft: GenerationDraft): GenerationSetti
       : '';
   return {
     dialogueMode: draft.dialogueMode,
+    dialogueDelivery: draft.dialogueDelivery,
     dialogueText,
     aspectRatio: draft.aspectRatio,
     resolution: draft.resolution,

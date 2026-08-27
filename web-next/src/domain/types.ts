@@ -2,6 +2,7 @@ export type AspectRatio = '16:9' | '9:16';
 export type Resolution = '480p' | '768p';
 export type FitMode = 'none' | 'crop' | 'pad';
 export type DialogueMode = 'auto' | 'edit' | 'custom' | 'none';
+export type DialogueDelivery = 'auto' | 'on_screen' | 'off_screen';
 
 export interface DialogueLine {
   readonly start_s: number;
@@ -75,6 +76,12 @@ export interface ImageOptimizationPrompt {
   readonly sha256: string;
 }
 
+export interface ImageAcceptanceDetail {
+  readonly required: boolean;
+  readonly accepted: boolean;
+  readonly expected_meta_sha256: string | null;
+}
+
 export type PostprocessCapabilities = PostprocessOptions;
 
 export interface PostprocessSegment {
@@ -130,6 +137,7 @@ export interface ConversationDetail {
   readonly resolution: Resolution | null;
   readonly fit_profiles: FitProfiles | null;
   readonly dialogue: DialogueDetail;
+  readonly dialogue_delivery?: DialogueDelivery | null;
   readonly receipt_version: number | null;
   readonly generation: GenerationDetail | null;
   readonly has_source: boolean;
@@ -139,6 +147,7 @@ export interface ConversationDetail {
   readonly postprocess_enabled: boolean;
   readonly postprocess_capabilities?: PostprocessCapabilities | null;
   readonly image_optimization_prompt?: ImageOptimizationPrompt | null;
+  readonly image_acceptance?: ImageAcceptanceDetail | null;
   readonly plan_receipt?: string | null;
   readonly segment_count?: number;
   readonly [compatibilityField: string]: unknown;
@@ -181,6 +190,7 @@ export interface GenerationSubmitPayload {
   readonly confirm: true;
   readonly client_request_id: string;
   readonly dialogue_mode: DialogueMode;
+  readonly dialogue_delivery?: DialogueDelivery;
   readonly fit_mode: FitMode;
   readonly aspect_ratio: AspectRatio;
   readonly resolution: Resolution;
@@ -202,4 +212,14 @@ export interface PostprocessPayload {
 export interface PostprocessResponse {
   readonly status: string;
   readonly frames: readonly string[];
+}
+
+export interface ImageAcceptancePayload {
+  readonly confirm: true;
+  readonly expected_meta_sha256: string;
+}
+
+export interface ImageAcceptanceResponse {
+  readonly status: 'accepted';
+  readonly image_acceptance: ImageAcceptanceDetail;
 }

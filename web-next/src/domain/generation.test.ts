@@ -89,6 +89,40 @@ describe('generation contract', () => {
     })).fastMode).toBe(false);
   });
 
+  it('requires an explicit sound delivery choice for an accepted v4 image flow', () => {
+    const detail = longDetail({
+      image_acceptance: {
+        required: true,
+        accepted: true,
+        expected_meta_sha256: 'b'.repeat(64),
+      },
+    });
+    expect(createGenerationDraft(detail).dialogueDelivery).toBeNull();
+    expect(() => buildSubmitPayload({
+      clientRequestId: 'request-v4',
+      dialogueMode: 'auto',
+      dialogueDelivery: null,
+      fitRequired: false,
+      aspectRatio: '16:9',
+      resolution: '480p',
+    })).toThrow('请选择声音呈现方式');
+  });
+
+  it('clears the untouched legacy delivery default when a v4 flow becomes confirmable', () => {
+    const pending = createGenerationDraft(longDetail());
+    expect(pending.dialogueDelivery).toBe('auto');
+
+    const confirmable = createGenerationDraft(longDetail({
+      image_acceptance: {
+        required: true,
+        accepted: false,
+        expected_meta_sha256: 'c'.repeat(64),
+      },
+    }), pending);
+
+    expect(confirmable.dialogueDelivery).toBeNull();
+  });
+
   it('server-frozen values replace a touched local draft', () => {
     const touched = {
       ...createGenerationDraft(longDetail()),
@@ -111,6 +145,7 @@ describe('generation contract', () => {
       resolution: '768p',
       fitMode: 'crop',
       dialogueMode: 'auto',
+      dialogueDelivery: 'auto',
       fastMode: false,
       frozen: true,
       parameterTouched: false,
@@ -121,6 +156,7 @@ describe('generation contract', () => {
     expect(buildSubmitPayload({
       clientRequestId: 'request-short',
       dialogueMode: 'custom',
+      dialogueDelivery: 'off_screen',
       linesText: '0 - 1 | hello',
       fitRequired: false,
       aspectRatio: '9:16',
@@ -130,6 +166,7 @@ describe('generation contract', () => {
       confirm: true,
       client_request_id: 'request-short',
       dialogue_mode: 'custom',
+      dialogue_delivery: 'off_screen',
       fit_mode: 'none',
       aspect_ratio: '9:16',
       resolution: '768p',
@@ -138,6 +175,7 @@ describe('generation contract', () => {
     expect(buildSubmitPayload({
       clientRequestId: 'request-long',
       dialogueMode: 'auto',
+      dialogueDelivery: 'auto',
       fitRequired: false,
       aspectRatio: '16:9',
       resolution: '480p',
@@ -159,6 +197,7 @@ describe('generation contract', () => {
       confirm: true,
       client_request_id: 'request-old',
       dialogue_mode: 'none',
+      dialogue_delivery: 'auto',
       fit_mode: 'none',
       aspect_ratio: '16:9',
       resolution: '480p',
@@ -243,6 +282,7 @@ describe('generation contract', () => {
       aspect_ratio: '16:9',
       resolution: '480p',
       dialogue_mode: 'auto',
+      dialogue_delivery: 'auto',
       fit_mode: 'crop',
       duration_s: 30,
       segment_count: 3,

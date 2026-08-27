@@ -5,6 +5,8 @@ import type {
   CreateConversationResponse,
   GenerationSubmitPayload,
   GenerationSubmitResponse,
+  ImageAcceptancePayload,
+  ImageAcceptanceResponse,
   ImageOptimizationPrompt,
   ImageOptimizationPromptPatchPayload,
   LoginResponse,
@@ -460,6 +462,19 @@ export class ApiClient {
     options: ApiRequestOptions = {},
   ): Promise<PostprocessResponse> {
     return this.requestJson(`/conversations/${encodePath(id)}/postprocess`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: options.signal,
+    });
+  }
+
+  acceptImageOptimization(
+    id: string,
+    payload: ImageAcceptancePayload,
+    options: ApiRequestOptions = {},
+  ): Promise<ImageAcceptanceResponse> {
+    return this.requestJson(`/conversations/${encodePath(id)}/image-acceptance`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),

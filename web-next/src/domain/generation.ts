@@ -1,6 +1,7 @@
 import { formatDialogueLines, normalizeDialogueLines, parseDialogueLines } from './dialogue';
 import type {
   AspectRatio,
+  DialogueDelivery,
   DialogueMode,
   FitMode,
   FitProfile,
@@ -12,6 +13,7 @@ export const GENERATION_ASPECT_RATIOS = Object.freeze(['16:9', '9:16'] as const)
 export const GENERATION_RESOLUTIONS = Object.freeze(['480p', '768p'] as const);
 
 const DIALOGUE_MODES = Object.freeze(['auto', 'edit', 'custom', 'none'] as const);
+const DIALOGUE_DELIVERIES = Object.freeze(['auto', 'on_screen', 'off_screen'] as const);
 const FIT_MODES = Object.freeze(['none', 'crop', 'pad'] as const);
 const GENERATION_STATUSES = Object.freeze([
   'queued',
@@ -41,6 +43,7 @@ export interface GenerationParameterDraft {
 
 export interface GenerationDraft extends GenerationParameterDraft {
   readonly dialogueMode: DialogueMode;
+  readonly dialogueDelivery: DialogueDelivery | null;
   readonly editLinesText: string;
   readonly customLinesText: string;
   readonly fastMode: boolean;
@@ -61,6 +64,7 @@ export interface GenerationRetryContract {
 export interface BuildSubmitInput {
   readonly clientRequestId: string;
   readonly dialogueMode: DialogueMode;
+  readonly dialogueDelivery: DialogueDelivery | null;
   readonly linesText?: string;
   readonly fitRequired: boolean;
   readonly fitMode?: FitMode;
@@ -166,6 +170,15 @@ function dialogueMode(detail: UnknownRecord): DialogueMode {
   return mode;
 }
 
+function dialogueDelivery(detail: UnknownRecord, requireExplicit = false): DialogueDelivery | null {
+  const delivery = detail.dialogue_delivery;
+  if (delivery === undefined || delivery === null) return requireExplicit ? null : 'auto';
+  if (!includes(DIALOGUE_DELIVERIES, delivery)) {
+    throw new Error('服务端声音呈现模式无效，请刷新页面后重试');
+  }
+  return delivery;
+}
+
 export function createGenerationDraft(
   detail: unknown,
   previous?: GenerationDraft,
@@ -173,10 +186,13 @@ export function createGenerationDraft(
   const source = record(detail);
   if (!source) throw new Error('会话详情无效，请刷新页面后重试');
   const parameters = generationParameterDraft(source);
-  const parameterVersion = `${source.aspect_ratio}|${source.resolution}|${JSON.stringify(source.fit_profiles)}`;
+  const imageAcceptanceRequired = record(source.image_acceptance)?.required === true;
+  const parameterVersion = `${source.aspect_ratio}|${source.resolution}|${source.dialogue_delivery ?? 'auto'}|${imageAcceptanceRequired}|${JSON.stringify(source.fit_profiles)}`;
   const generation = generationRecord(source);
+  const requireExplicitDelivery = imageAcceptanceRequired && dialogueMode(source) !== 'none';
   const base: GenerationDraft = previous ?? {
     dialogueMode: 'auto',
+    dialogueDelivery: dialogueDelivery(source, requireExplicitDelivery),
     editLinesText: formatDialogueLines(source.dialogue),
     customLinesText: '',
     fastMode: longVideoContract(source).isLong,
@@ -206,6 +222,7 @@ export function createGenerationDraft(
       resolution: frozenResolution,
       fitMode: frozenFitMode,
       dialogueMode: frozenDialogueMode,
+      dialogueDelivery: dialogueDelivery(source),
       editLinesText: frozenDialogueMode === 'edit' ? frozenLines : base.editLinesText,
       customLinesText: frozenDialogueMode === 'custom' ? frozenLines : base.customLinesText,
       fastMode: generationFastMode(source),
@@ -226,7 +243,12 @@ export function createGenerationDraft(
     };
   }
   if (base.parameterVersion !== parameterVersion && !base.parameterTouched) {
-    next = { ...next, ...parameters, parameterVersion };
+    next = {
+      ...next,
+      ...parameters,
+      dialogueDelivery: dialogueDelivery(source, requireExplicitDelivery),
+      parameterVersion,
+    };
   }
   return next;
 }
@@ -249,6 +271,7 @@ export function generationParameterSnapshot(detail: unknown) {
     aspect_ratio: source.aspect_ratio,
     resolution: source.resolution,
     dialogue_mode: record(source.dialogue)?.mode,
+    dialogue_delivery: dialogueDelivery(source),
     fit_mode: source.fit_mode,
     duration_s: source.duration_s,
     segment_count: source.segment_count,
@@ -259,6 +282,13 @@ export function generationParameterSnapshot(detail: unknown) {
 
 export function buildSubmitPayload(input: BuildSubmitInput): GenerationSubmitPayload {
   if (!includes(DIALOGUE_MODES, input.dialogueMode)) throw new Error('请选择台词模式');
+  if (input.dialogueMode !== 'none' && !includes(DIALOGUE_DELIVERIES, input.dialogueDelivery)) {
+    throw new Error('请选择声音呈现方式');
+  }
+  if (input.dialogueDelivery !== null
+      && !includes(DIALOGUE_DELIVERIES, input.dialogueDelivery)) {
+    throw new Error('声音呈现方式无效');
+  }
   const requestId = String(input.clientRequestId ?? '').trim();
   if (!requestId) throw new Error('缺少本次生成请求标识');
   if (input.isLong && !['auto', 'none'].includes(input.dialogueMode)) {
@@ -282,6 +312,7 @@ export function buildSubmitPayload(input: BuildSubmitInput): GenerationSubmitPay
     confirm: true;
     client_request_id: string;
     dialogue_mode: DialogueMode;
+    dialogue_delivery?: DialogueDelivery;
     fit_mode: FitMode;
     aspect_ratio: AspectRatio;
     resolution: Resolution;
@@ -296,6 +327,7 @@ export function buildSubmitPayload(input: BuildSubmitInput): GenerationSubmitPay
     aspect_ratio: input.aspectRatio,
     resolution: input.resolution,
   };
+  if (input.dialogueDelivery !== null) body.dialogue_delivery = input.dialogueDelivery;
   if (input.isLong) {
     body.expected_plan_receipt = input.planReceipt as string;
     body.fast_mode = input.fastMode === true;
@@ -353,7 +385,16 @@ function frozenGenerationInputs(detail: unknown) {
   if (!includes(FIT_MODES, fitMode)) throw new Error('既有任务画幅模式无效');
   const aspectRatio = requiredAspectRatio(source.aspect_ratio);
   const resolution = requiredResolution(source.resolution);
-  return { source, generation, dialogue, mode, fitMode, aspectRatio, resolution };
+  return {
+    source,
+    generation,
+    dialogue,
+    mode,
+    delivery: dialogueDelivery(source),
+    fitMode,
+    aspectRatio,
+    resolution,
+  };
 }
 
 export function buildResumePayload(detail: unknown): GenerationSubmitPayload {
@@ -371,6 +412,7 @@ export function buildResumePayload(detail: unknown): GenerationSubmitPayload {
     confirm: true,
     client_request_id: requestId,
     dialogue_mode: frozen.mode,
+    ...(frozen.delivery ? { dialogue_delivery: frozen.delivery } : {}),
     fit_mode: frozen.fitMode,
     aspect_ratio: frozen.aspectRatio,
     resolution: frozen.resolution,
@@ -406,6 +448,7 @@ export function buildStitchRetryPayload(detail: unknown): GenerationSubmitPayloa
     confirm: true,
     client_request_id: requestId,
     dialogue_mode: frozen.mode,
+    ...(frozen.delivery ? { dialogue_delivery: frozen.delivery } : {}),
     fit_mode: frozen.fitMode,
     aspect_ratio: frozen.aspectRatio,
     resolution: frozen.resolution,
@@ -429,6 +472,7 @@ export function buildLongFailedRetryPayload(
   return buildSubmitPayload({
     clientRequestId,
     dialogueMode: frozen.mode,
+    dialogueDelivery: frozen.delivery,
     fitRequired: profile.fit_required,
     fitMode: frozen.fitMode,
     aspectRatio: frozen.aspectRatio,
