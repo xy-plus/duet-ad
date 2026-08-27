@@ -122,10 +122,10 @@ def test_v4_generation_keyframes_require_an_intact_verified_output_receipt(
         postprocess.generation_keyframes(cdir, meta, [source])
 
 
-def test_v4_postprocess_global_pack_failure_prevents_layout_and_fanout(
+def test_v4_postprocess_never_calls_quality_pack_gate(
     tmp_path, monkeypatch,
 ):
-    """The v4 product coordinator cannot reach a dependent after global pack fail."""
+    """The generation DAG is global -> layout -> fanout, without verify_pack."""
     settings = make_settings(tmp_path)
     cdir = tmp_path / "session"
     cdir.mkdir()
@@ -151,26 +151,25 @@ def test_v4_postprocess_global_pack_failure_prevents_layout_and_fanout(
         calls.append("global-anchor")
         return {}, []
 
-    async def fail_global_pack(*_args, **_kwargs):
-        calls.append("global-pack")
-        raise postprocess.PostprocessError(409, "image_reference_pack_failed")
+    async def forbidden_pack(*_args, **_kwargs):
+        pytest.fail("verify_pack must not be called by runtime")
 
-    async def forbidden_layout(*_args, **_kwargs):
-        pytest.fail("layout must not run after global semantic failure")
+    async def layout(*_args, **_kwargs):
+        calls.append("layout")
 
-    async def forbidden_fanout(*_args, **_kwargs):
-        pytest.fail("fanout must not run after global semantic failure")
+    async def fanout(*_args, **_kwargs):
+        calls.append("fanout")
+        return []
 
     monkeypatch.setattr(postprocess, "_v4_bootstrap_scene_anchors", bootstrap)
-    monkeypatch.setattr(postprocess, "_v4_verify_bootstrap_packs", fail_global_pack)
-    monkeypatch.setattr(postprocess, "_v4_generate_layout_anchors", forbidden_layout)
-    monkeypatch.setattr(postprocess, "_v4_fan_out", forbidden_fanout)
+    monkeypatch.setattr(postprocess, "_v4_verify_bootstrap_packs", forbidden_pack)
+    monkeypatch.setattr(postprocess, "_v4_generate_layout_anchors", layout)
+    monkeypatch.setattr(postprocess, "_v4_fan_out", fanout)
 
-    with pytest.raises(postprocess.PostprocessError, match="image_reference_pack_failed"):
-        asyncio.run(postprocess._run_v4_task(
-            settings, "cid", cdir, {}, private, {}, asyncio.Semaphore(1), object(), object(),
-        ))
-    assert calls == ["global-anchor", "global-pack"]
+    asyncio.run(postprocess._run_v4_task(
+        settings, "cid", cdir, {}, private, {}, asyncio.Semaphore(1), object(), object(),
+    ))
+    assert calls == ["global-anchor", "layout", "fanout"]
 
 
 def test_v4_startup_marks_ambiguous_typed_anchor_attempt_get_only(tmp_path, monkeypatch):

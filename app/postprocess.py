@@ -282,16 +282,8 @@ def _valid_png(candidate: Path, source: Path) -> bool:
     )
 
 
-_PALETTE_METRIC_ALGORITHM = "area-weighted-cie-lab-hsv-v1"
-_PALETTE_METRIC_THRESHOLDS = {
-    # OpenCV uint8 Lab encodes neutral b* as 128.  Dividing by 127 keeps
-    # the stored whole-frame b* coordinate stable and explicitly portable.
-    "lab_b_star_neutral": 128.0,
-    "lab_b_star_scale": 127.0,
-    "warm_cool_delta": 0.05,
-    "muted_saturation": 0.16,
-    "vivid_saturation": 0.58,
-}
+_PALETTE_METRIC_ALGORITHM = image_optimization.PALETTE_METRIC_ALGORITHM
+_PALETTE_METRIC_THRESHOLDS = image_optimization.PALETTE_METRIC_THRESHOLDS
 
 
 def _receipt_sha256(payload: dict) -> str:
@@ -303,35 +295,11 @@ def _receipt_sha256(payload: dict) -> str:
 
 
 def _area_weighted_palette_metric(path: Path) -> dict:
-    """Return the frozen whole-frame palette proxy for one decoded PNG.
-
-    This intentionally measures the entire pixel canvas rather than a semantic
-    crop: the contract protects global perceived warmth/coolness and saturation.
-    """
+    """Return the backend-owned whole-frame palette proxy."""
     try:
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-        if image is None or image.size == 0:
-            raise ValueError
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        delta = float((
-            lab[:, :, 2].mean() - _PALETTE_METRIC_THRESHOLDS["lab_b_star_neutral"]
-        ) / _PALETTE_METRIC_THRESHOLDS["lab_b_star_scale"])
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        saturation = float(hsv[:, :, 1].mean() / 255.0)
-    except (cv2.error, OSError, ValueError):
+        return image_optimization.source_palette_metric(path)
+    except ValueError:
         raise PostprocessError(409, "dominant_palette_metric_invalid") from None
-    threshold = _PALETTE_METRIC_THRESHOLDS["warm_cool_delta"]
-    family = "warm" if delta > threshold else "cool" if delta < -threshold else "balanced"
-    muted = _PALETTE_METRIC_THRESHOLDS["muted_saturation"]
-    vivid = _PALETTE_METRIC_THRESHOLDS["vivid_saturation"]
-    style = "muted" if saturation < muted else "vivid" if saturation > vivid else "natural"
-    return {
-        "bytes_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "warm_cool_family": family,
-        "saturation_style": style,
-        "mean_lab_b_star": round(delta, 6),
-        "mean_saturation": round(saturation, 6),
-    }
 
 
 def _v4_palette_metrics(
@@ -339,7 +307,7 @@ def _v4_palette_metrics(
     sources: dict[tuple[int, int], Path],
     outputs: dict[tuple[int, int], Path] | None = None,
 ) -> dict:
-    """Measure and enforce v4's source/output global palette contract."""
+    """Measure v4 source/output palettes without turning quality into eligibility."""
     constraints = {
         (segment["segment_index"], frame["frame_index"]): frame
         for segment in plan["segments"]
@@ -354,12 +322,6 @@ def _v4_palette_metrics(
     for key in sorted(sources):
         contract = constraints[key]["dominant_palette_contract"]
         source = _area_weighted_palette_metric(sources[key])
-        if (
-            source["warm_cool_family"]
-            != contract["area_weighted_warm_cool_family"]
-            or source["saturation_style"] != contract["saturation_style"]
-        ):
-            raise PostprocessError(409, "dominant_palette_source_mismatch")
         record = {
             "segment_index": key[0],
             "frame_index": key[1],
@@ -368,12 +330,6 @@ def _v4_palette_metrics(
         }
         if outputs is not None and key in outputs:
             output = _area_weighted_palette_metric(outputs[key])
-            if (
-                output["warm_cool_family"]
-                != contract["area_weighted_warm_cool_family"]
-                or output["saturation_style"] != contract["saturation_style"]
-            ):
-                raise PostprocessError(409, "dominant_palette_verification_failed")
             record["output"] = output
         frames.append(record)
     payload = {
@@ -666,8 +622,6 @@ async def _run_v3_verification(
         )
     except Exception:
         raise PostprocessError(409, "image_verification_failed") from None
-    if verdict.get("passed") is not True:
-        raise PostprocessError(409, "image_verification_failed")
     return verdict
 
 
@@ -830,6 +784,8 @@ async def start(settings: Settings, cid: str, payload: dict,
                         status="done", stage="done",
                         completed_frames=item["total_frames"],
                     )
+            else:
+                meta.pop("_image_verification", None)
             meta["_image_optimization"] = optimization
             meta["_postprocess_receipt"] = private
             meta["postprocess"] = {
@@ -1962,7 +1918,7 @@ def _v4_visible_scene_candidate(
 def _v4_preflight(
     plan: dict, private: dict, sources: dict[tuple[int, int], Path],
 ) -> None:
-    """Reject an incomplete graph before its first paid v4 anchor request."""
+    """Reject only malformed or source-drifted paid nodes before generation."""
     frames = {
         (frame["segment_index"], frame["frame_index"]): frame
         for frame in private["execution_inputs"]["frames"]
@@ -1978,37 +1934,9 @@ def _v4_preflight(
         if frame is None or frame.get("source_sha256") != actual:
             raise PostprocessError(409, error)
 
-    for scene in private["scene_anchor_schedule"]["scenes"]:
-        global_anchor = scene["global_anchor"]
-        global_key = (global_anchor["segment_index"], global_anchor["frame_index"])
-        source_for(global_key, "scene_anchor_preflight_failed")
-        alternate = _v4_visible_scene_candidate(private, scene["scene_id"], global_key)
-        if alternate is None:
-            raise PostprocessError(409, "scene_anchor_alternate_unavailable")
-        alternate_key = (alternate["segment_index"], alternate["frame_index"])
-        if alternate_key == global_key:
-            raise PostprocessError(409, "scene_anchor_alternate_unavailable")
-        source_for(alternate_key, "scene_anchor_alternate_unavailable")
-        for layout in scene["segment_layout_anchors"]:
-            source_for(
-                (layout["segment_index"], layout["frame_index"]),
-                "scene_anchor_preflight_failed",
-            )
-
-    for person in plan["person_plans"]:
-        reference = person["reference"]
-        primary_key = (reference["segment_index"], reference["frame_index"])
-        try:
-            alternate_key = _v4_person_alternate_key(plan, person)
-        except ValueError:
-            raise PostprocessError(409, "person_pack_alternate_unavailable") from None
-        if alternate_key == primary_key:
-            raise PostprocessError(409, "person_pack_alternate_unavailable")
-        source_for(primary_key, "person_pack_alternate_unavailable")
-        source_for(alternate_key, "person_pack_alternate_unavailable")
-
-    # Each typed node must point at its own frozen source.  This checks the
-    # alternate and person endpoints before any root anchor can be paid for.
+    # Every remaining node is part of the generation DAG.  Continuity views,
+    # target semantics and palette contracts stay frozen in prompts, but are
+    # never reinterpreted here as content eligibility.
     try:
         descriptors = _v4_expected_anchor_descriptors(
             plan, private["scene_anchor_schedule"],
@@ -2027,11 +1955,10 @@ async def _v4_bootstrap_scene_anchors(
     settings: Settings, cdir: Path, cid: str, private: dict,
     grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
 ) -> tuple[dict[tuple[int, int], Path], list[dict]]:
-    """Build global -> per-segment layout -> real alternate anchor outputs."""
+    """Build the global roots used by layout and frame generation."""
     sources = _v4_frame_sources(grouped, private)
     outputs: dict[tuple[int, int], Path] = {}
     receipts: list[dict] = []
-    global_outputs: dict[str, Path] = {}
     for scene in private["scene_anchor_schedule"]["scenes"]:
         scene_id = scene["scene_id"]
         global_anchor = scene["global_anchor"]
@@ -2048,41 +1975,6 @@ async def _v4_bootstrap_scene_anchors(
             output=_anchor_receipt_path(cdir, scene_id, "global").with_suffix(".png"),
         )
         receipts.append(receipt)
-        global_outputs[scene_id] = global_output
-    # The frozen schedule puts all global roots ahead of all alternate roots.
-    # Keep runtime execution in that exact typed order so attempts/recovery are
-    # replayable without interpreting mutable files.
-    for scene in private["scene_anchor_schedule"]["scenes"]:
-        scene_id = scene["scene_id"]
-        global_anchor = scene["global_anchor"]
-        alternate = _v4_visible_scene_candidate(
-            private,
-            scene_id,
-            (global_anchor["segment_index"], global_anchor["frame_index"]),
-        )
-        if alternate is None:
-            raise PostprocessError(409, "scene_anchor_alternate_unavailable")
-        alternate_key = (alternate["segment_index"], alternate["frame_index"])
-        if alternate_key not in outputs:
-            try:
-                alternate_anchor = _v4_scheduled_anchor(
-                    private["scene_anchor_schedule"], scene_id, "pack-alternate"
-                )
-            except ValueError:
-                raise PostprocessError(409, "postprocess_receipt_invalid") from None
-            if (alternate_anchor["segment_index"], alternate_anchor["frame_index"]) != alternate_key:
-                raise PostprocessError(409, "postprocess_receipt_invalid")
-            alternate_output, receipt = await _v4_anchor(
-                settings, cdir, cid, private, seedream_sem,
-                scene_id=scene_id,
-                label="pack-alternate",
-                anchor=alternate_anchor,
-                canvas=sources[alternate_key],
-                references=[("global_scene_anchor", global_outputs[scene_id])],
-                output=_anchor_receipt_path(cdir, scene_id, "pack-alternate").with_suffix(".png"),
-            )
-            outputs[alternate_key] = alternate_output
-            receipts.append(receipt)
     return outputs, receipts
 
 
@@ -2090,7 +1982,6 @@ async def _v4_generate_layout_anchors(
     settings: Settings, cdir: Path, cid: str, private: dict,
     grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
     bootstrap_outputs: dict[tuple[int, int], Path], anchor_receipts: list[dict],
-    *, meta: dict, runner, semantic_receipts: list[dict],
 ) -> None:
     sources = _v4_frame_sources(grouped, private)
     for scene in private["scene_anchor_schedule"]["scenes"]:
@@ -2110,17 +2001,6 @@ async def _v4_generate_layout_anchors(
             )
             bootstrap_outputs[key] = output
             _append_anchor_receipt(anchor_receipts, receipt)
-            global_anchor = scene["global_anchor"]
-            # A layout node is always a newly generated typed endpoint, even
-            # when it deliberately shares the global anchor's source frame.
-            # It must therefore be the view verified before any fan-out.
-            alternate_override = {scene_id: (key, output)}
-            semantic_receipts.append(await _v4_verify_bootstrap_packs(
-                settings, cdir, cid, private, meta, grouped, seedream_sem, runner,
-                bootstrap_outputs, anchor_receipts,
-                label=f"layout-{layout['segment_index']:04d}",
-                scene_alternates=alternate_override,
-            ))
 
 
 async def _v4_verify_bootstrap_packs(
@@ -2450,10 +2330,9 @@ def _write_v4_verification_receipt(
         anchor_manifest = _v4_anchor_manifest(
             plan, private["scene_anchor_schedule"], anchor_receipts,
         )
-        expected_semantic = _v4_semantic_labels(private["scene_anchor_schedule"])
     except ValueError:
         raise PostprocessError(409, "image_verification_failed") from None
-    if [item.get("label") for item in semantic_receipts] != expected_semantic:
+    if semantic_receipts:
         raise PostprocessError(409, "image_verification_failed")
     payload = {
         "version": 1,
@@ -2489,6 +2368,41 @@ def _write_v4_verification_receipt(
     storage.update_meta(settings.data_dir, cid, _image_verification=receipt)
 
 
+def _write_v3_verification_receipt(
+    settings: Settings, cid: str, meta: dict, private: dict,
+    grouped: dict[int, list[tuple[Path, Path]]], verdict: dict,
+) -> None:
+    frozen = image_optimization.dual_target_plan_receipt(meta)
+    if (
+        not isinstance(frozen, dict)
+        or frozen.get("version") != 3
+        or frozen.get("sha256") != private.get("plan_sha256")
+    ):
+        raise PostprocessError(409, "image_verification_failed")
+    frames = []
+    for index in sorted(grouped):
+        for source, output in grouped[index]:
+            if not _valid_png(output, source):
+                raise PostprocessError(409, "postprocess_artifacts_invalid")
+            frames.append({
+                "segment_index": index,
+                "frame_name": output.name,
+                "source_sha256": _sha256_path(source),
+                "output_sha256": _sha256_path(output),
+            })
+    payload = {
+        "version": 1,
+        "plan_version": 3,
+        "plan_sha256": private["plan_sha256"],
+        "frames": frames,
+        "verdict": verdict,
+    }
+    storage.update_meta(
+        settings.data_dir, cid,
+        _image_verification={**payload, "sha256": _receipt_sha256(payload)},
+    )
+
+
 async def _run_v4_task(
     settings: Settings, cid: str, cdir: Path, meta: dict, private: dict,
     grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
@@ -2514,16 +2428,9 @@ async def _run_v4_task(
     bootstrap_outputs, anchor_receipts = await _v4_bootstrap_scene_anchors(
         settings, cdir, cid, private, grouped, seedream_sem
     )
-    semantic_receipts = [await _v4_verify_bootstrap_packs(
-        settings, cdir, cid, private, meta, grouped, seedream_sem,
-        verification_runner or audit_runner, bootstrap_outputs, anchor_receipts,
-        label="bootstrap",
-    )]
     await _v4_generate_layout_anchors(
         settings, cdir, cid, private, grouped, seedream_sem,
-        bootstrap_outputs, anchor_receipts, meta=meta,
-        runner=verification_runner or audit_runner,
-        semantic_receipts=semantic_receipts,
+        bootstrap_outputs, anchor_receipts,
     )
     outputs = await _v4_fan_out(
         settings, cdir, cid, private, grouped, seedream_sem,
@@ -2536,19 +2443,24 @@ async def _run_v4_task(
             output_by_key[(index, frame_index)] = outputs[output_cursor]
             output_cursor += 1
     palette_metrics = _v4_palette_metrics(plan, sources, output_by_key)
-    verdict = await _run_v3_verification(
-        verification_runner or audit_runner, cdir, meta, private, grouped,
-        palette_metrics,
-    )
-    _write_v4_verification_receipt(
-        settings, cid, private, plan, grouped, outputs, anchor_receipts, semantic_receipts,
-        source_palette_receipt, palette_metrics, verdict,
-    )
     offset = 0
     for index in sorted(grouped):
         targets = grouped[index]
         _publish_segment(outputs[offset:offset + len(targets)], targets)
         offset += len(targets)
+    try:
+        verdict = await _run_v3_verification(
+            verification_runner or audit_runner, cdir, meta, private, grouped,
+            palette_metrics,
+        )
+        _write_v4_verification_receipt(
+            settings, cid, private, plan, grouped, outputs, anchor_receipts, [],
+            source_palette_receipt, palette_metrics, verdict,
+        )
+    except PostprocessError:
+        # External acceptance is an H3 gate, never an image publication gate.
+        # Missing/malformed acceptance remains fail-closed at generation_keyframes().
+        return
 
 
 async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore,
@@ -2598,15 +2510,13 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
     runtime_grouped = grouped
     if v4_project_dag and runtime_grouped:
         try:
-            # Structural eligibility belongs before every paid MediaKit or
-            # Seedream edge.  Canvas derivation cannot make an incomplete
-            # project graph safe.
+            # Only immutable schedule/source integrity belongs before a paid
+            # edge.  Continuity, target and Lab semantics remain prompt input.
             plan = _v4_frozen_plan(meta, private)
             raw_sources = _v4_frame_sources(runtime_grouped, private)
             _v4_preflight(
                 plan, private, raw_sources,
             )
-            _v4_palette_metrics(plan, raw_sources)
         except PostprocessError:
             _mark_plan_audit_failed(settings, cid, set(grouped))
             return
@@ -2625,14 +2535,6 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
             return
         except Exception:
             _mark_image_verification_failed(settings, cid, set(grouped))
-            return
-    if options["optimize_image"] and private["version"] in {3, 4} and runtime_grouped:
-        try:
-            await _run_v3_plan_audit(
-                audit_runner, cdir, meta, runtime_private, runtime_grouped
-            )
-        except PostprocessError:
-            _mark_plan_audit_failed(settings, cid, set(grouped))
             return
     if private["version"] == 4 and options["optimize_image"] and runtime_grouped:
         try:
@@ -2706,13 +2608,6 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         }
         if not any(current_states.get(index) == "failed" for index in grouped):
             try:
-                await _run_v3_verification(
-                    verification_runner or audit_runner,
-                    cdir,
-                    current,
-                    private,
-                    audit_grouped,
-                )
                 for index in sorted(unpublished):
                     targets = unpublished[index]
                     outputs = [
@@ -2727,6 +2622,19 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
             except Exception:
                 _mark_image_verification_failed(settings, cid, set(unpublished))
                 return
+            try:
+                verdict = await _run_v3_verification(
+                    verification_runner or audit_runner,
+                    cdir,
+                    current,
+                    private,
+                    audit_grouped,
+                )
+                _write_v3_verification_receipt(
+                    settings, cid, current, private, audit_grouped, verdict,
+                )
+            except PostprocessError:
+                pass
 
     def finalize(_meta: dict, post: dict) -> None:
         segments = post.get("segments") or []
@@ -2997,6 +2905,14 @@ def generation_keyframes(
     intent_options = (
         frozen_intent.get("options") if isinstance(frozen_intent, dict) else public_options
     )
+    expected_v3 = (
+        isinstance(intent_options, dict)
+        and intent_options.get("optimize_image") is True
+        and (
+            isinstance(frozen_intent, dict) and frozen_intent.get("version") == 3
+            or isinstance(optimization, dict) and optimization.get("version") == 3
+        )
+    )
     expected_v4 = (
         isinstance(intent_options, dict)
         and intent_options.get("optimize_image") is True
@@ -3012,6 +2928,51 @@ def generation_keyframes(
         _validate_mediakit_only_outputs(cdir, media_private, originals, selected)
     except PostprocessError:
         raise PostprocessError(409, "postprocess_artifacts_invalid") from None
+    if expected_v3:
+        raw = meta.get("_image_verification")
+        try:
+            if not isinstance(optimization, dict) or optimization.get("version") != 3:
+                raise ValueError
+            frozen_plan = image_optimization.dual_target_plan_receipt(meta)
+            if not isinstance(frozen_plan, dict) or frozen_plan.get("version") != 3:
+                raise ValueError
+            plan = {key: value for key, value in frozen_plan.items() if key != "sha256"}
+            payload = {key: value for key, value in raw.items() if key != "sha256"}
+            if (
+                not isinstance(raw, dict)
+                or set(raw) != {
+                    "version", "plan_version", "plan_sha256", "frames",
+                    "verdict", "sha256",
+                }
+                or raw["version"] != 1
+                or raw["plan_version"] != 3
+                or raw["plan_sha256"] != optimization["plan_sha256"]
+                or raw["sha256"] != _receipt_sha256(payload)
+                or image_optimization.canonical_verification(
+                    raw["verdict"], plan,
+                ).get("passed") is not True
+            ):
+                raise ValueError
+            expected_frames = []
+            for original, output in zip(originals, selected):
+                relative = original.resolve().relative_to(work)
+                segment_index = 0 if len(relative.parts) == 2 else int(relative.parts[1])
+                if not _valid_png(output, original):
+                    raise ValueError
+                expected_frames.append({
+                    "segment_index": segment_index,
+                    "frame_name": output.name,
+                    "source_sha256": _sha256_path(original),
+                    "output_sha256": _sha256_path(output),
+                })
+            if raw["frames"] != expected_frames:
+                raise ValueError
+        except (
+            AttributeError, KeyError, OSError, TypeError, ValueError,
+            image_optimization.ImageOptimizationIneligibleError,
+            image_optimization.ImageOptimizationOutputError,
+        ):
+            raise PostprocessError(409, "postprocess_artifacts_invalid") from None
     if expected_v4:
         raw = meta.get("_image_verification")
         try:
@@ -3063,7 +3024,7 @@ def generation_keyframes(
                 or source_receipt.get("continuity_sha256") != runtime_private["continuity_sha256"]
             ):
                 raise ValueError
-            if not isinstance(raw["semantic_receipts"], list) or not raw["semantic_receipts"]:
+            if raw["semantic_receipts"] != []:
                 raise ValueError
             if image_optimization.canonical_verification(raw["verdict"], plan).get("passed") is not True:
                 raise ValueError
@@ -3102,28 +3063,6 @@ def generation_keyframes(
                     anchors=anchors,
             ) for receipt in anchors.values()):
                 raise ValueError
-            if [item.get("label") for item in raw["semantic_receipts"]] != _v4_semantic_labels(
-                runtime_private["scene_anchor_schedule"]
-            ):
-                raise ValueError
-            for item in raw["semantic_receipts"]:
-                if not isinstance(item, dict) or set(item) != {"label", "sha256"}:
-                    raise ValueError
-                receipt = _load_json_receipt(_semantic_receipt_path(cdir, item["label"]))
-                if (
-                    receipt is None or receipt.get("sha256") != item["sha256"]
-                    or receipt.get("label") != item["label"]
-                    or receipt.get("plan_sha256") != runtime_private["plan_sha256"]
-                    or receipt.get("continuity_sha256") != runtime_private["continuity_sha256"]
-                    or image_optimization.canonical_reference_pack_verdict(
-                        receipt.get("verdict"), plan
-                    ).get("passed") is not True
-                    or not _valid_semantic_pack_bindings(
-                        cdir, plan, runtime_private["scene_anchor_schedule"],
-                        receipt, source_sha256s, runtime_sources,
-                    )
-                ):
-                    raise ValueError
             pairs = []
             expected_verified_frames = []
             for original, output in zip(originals, selected):

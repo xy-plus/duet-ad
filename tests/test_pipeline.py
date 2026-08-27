@@ -362,6 +362,85 @@ def test_v4_plan_input_receives_backend_transition_skeleton_before_codex(tmp_pat
     )
 
 
+@pytest.mark.parametrize("eligible", [False, True])
+def test_v4_plan_protocol_error_gets_one_bounded_replan(
+    tmp_path, monkeypatch, eligible,
+):
+    settings = make_settings(tmp_path, retry_count=1, retry_interval_s=0)
+    keyframes = tmp_path / "keyframes"
+    keyframes.mkdir()
+    frame = keyframes / "01.png"
+    frame.write_bytes(_PX_PNG)
+    skeleton = pipeline._frame_inventory(
+        {0: [frame]},
+        segment_lineage={0: {"chain_id": "short-000", "join_mode": "hard_cut"}},
+    )
+    valid = _short_dual_target_plan_v3(frame_count=1)
+    valid["version"] = 4
+    valid["segments"][0]["frame_constraints"][0]["dominant_palette_contract"] = {
+        "area_weighted_warm_cool_family": "balanced",
+        "saturation_style": "muted",
+    }
+    valid["scene_plans"][0]["continuity_graph"] = {
+        "components": [{"component_id": "COMPONENT_01", "target_spec": "target"}],
+        "topology": [],
+        "views": [{
+            "segment_index": 0,
+            "frame_index": 1,
+            "transition_from_previous": "start",
+            "observations": [{
+                "component_id": "COMPONENT_01", "visibility": "full",
+            }],
+            "view_relations": [],
+        }],
+    }
+    refusal = {
+        "version": 4,
+        "phase": "plan",
+        "segment_indices": [0],
+        "eligible": eligible,
+        "reason": None if eligible else "scene_components_ambiguous",
+        "person_plans": [],
+        "scene_plans": [],
+        "segments": [],
+    }
+
+    class Runner:
+        def __init__(self):
+            self.calls = 0
+
+        def run_isolated(self, workdir, _prompt, *, session_dir):
+            self.calls += 1
+            output = Path(workdir) / "work" / "image_optimization.json"
+            output.write_text(
+                json.dumps(refusal if self.calls == 1 else valid), encoding="utf-8",
+            )
+
+    runner = Runner()
+    monkeypatch.setattr(
+        pipeline.image_optimization,
+        "generate_project_prompts",
+        _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
+    )
+    plan, prompts = pipeline._generate_image_optimization_project(
+        settings,
+        runner,
+        [{
+            "index": 0,
+            "chain_id": "short-000",
+            "join_mode": "hard_cut",
+            "keyframes_dir": keyframes,
+            "transition_skeleton": skeleton,
+        }],
+        session_dir=tmp_path,
+        step="project image plan",
+    )
+
+    assert runner.calls == 2
+    assert plan["version"] == 4
+    assert list(prompts) == [0]
+
+
 def test_v4_pipeline_freezes_authoritative_transitions_and_anchor_schedule(tmp_path):
     settings = make_settings(tmp_path)
     frame_dir = tmp_path / "work" / "keyframes"
