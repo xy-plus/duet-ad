@@ -106,6 +106,10 @@ def _short_dual_target_plan_v3(*, frame_count: int = 3):
                         "object_id": "PERSON_01",
                     }],
                 },
+                "dominant_palette_contract": {
+                    "area_weighted_warm_cool_family": "balanced",
+                    "saturation_style": "muted",
+                },
             }
             for index in range(1, frame_count + 1)
         ],
@@ -243,6 +247,140 @@ def test_segmented_image_prompts_come_from_one_project_call(
     assert [item["index"] for item in calls[0]] == [1, 2]
     assert (work / "segments" / "1" / "work" / "image_optimization_prompt.txt").read_text() == "prompt-1\n"
     assert (work / "segments" / "2" / "work" / "image_optimization_prompt.txt").read_text() == "prompt-2\n"
+
+
+def test_segmented_v4_prompts_remain_frame_dicts_and_are_not_written_as_text(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    work = tmp_path / "session" / "work"
+    segments = [
+        {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut"},
+        {"index": 2, "chain_id": "chain-001", "join_mode": "continue"},
+    ]
+    for segment in segments:
+        (work / "segments" / str(segment["index"]) / "work" / "keyframes").mkdir(
+            parents=True
+        )
+    prompts = {1: {1: "frame-one"}, 2: {1: "frame-two"}}
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_image_optimization_project",
+        lambda *_args, **_kwargs: ({"version": 4}, prompts),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_write_image_optimization_prompt",
+        lambda *_args: pytest.fail("v4 prompt dict must not be string-written"),
+    )
+
+    continuity, actual = pipeline._generate_segmented_image_prompts(
+        settings,
+        object(),
+        segments,
+        [dict(segment) for segment in segments],
+        work,
+        session_dir=work.parent,
+    )
+
+    assert continuity == {"version": 4}
+    assert actual == prompts
+    assert not list(work.rglob("image_optimization_prompt.txt"))
+
+
+def test_v4_frame_inventory_derives_transition_from_lineage_and_frame_pair(tmp_path):
+    frames = {}
+    for index, values in ((1, (b"one", b"two")), (2, (b"three",))):
+        directory = tmp_path / str(index)
+        directory.mkdir()
+        frames[index] = []
+        for frame_index, value in enumerate(values, 1):
+            path = directory / f"{frame_index:02d}.png"
+            path.write_bytes(value)
+            frames[index].append(path)
+
+    inventory = pipeline._frame_inventory(
+        frames,
+        segment_lineage={
+            1: {"chain_id": "chain-001", "join_mode": "hard_cut"},
+            2: {"chain_id": "chain-001", "join_mode": "continue"},
+        },
+    )
+
+    assert [item["source_transition_from_previous"] for item in inventory] == [
+        "start", "camera_motion", "camera_motion",
+    ]
+    assert all(re.fullmatch(r"[0-9a-f]{64}", item[
+        "source_transition_evidence_sha256"
+    ]) for item in inventory)
+    changed = pipeline._frame_inventory(
+        frames,
+        segment_lineage={
+            1: {"chain_id": "chain-001", "join_mode": "hard_cut"},
+            2: {"chain_id": "chain-001", "join_mode": "hard_cut"},
+        },
+    )
+    assert changed[-1]["source_transition_from_previous"] == "hard_cut"
+    assert changed[-1]["source_transition_evidence_sha256"] != inventory[-1][
+        "source_transition_evidence_sha256"
+    ]
+
+
+def test_v4_pipeline_freezes_authoritative_transitions_and_anchor_schedule(tmp_path):
+    settings = make_settings(tmp_path)
+    frame_dir = tmp_path / "work" / "keyframes"
+    frame_dir.mkdir(parents=True)
+    frames = []
+    for frame_index in (1, 2):
+        path = frame_dir / f"{frame_index:02d}.png"
+        path.write_bytes(_PX_PNG)
+        frames.append(path)
+    plan = _short_dual_target_plan_v3(frame_count=2)
+    plan["version"] = 4
+    for frame in plan["segments"][0]["frame_constraints"]:
+        frame["dominant_palette_contract"] = {
+            "area_weighted_warm_cool_family": "balanced",
+            "saturation_style": "muted",
+        }
+    plan["scene_plans"][0]["continuity_graph"] = {
+        "components": [{"component_id": "COMPONENT_01", "target_spec": "target"}],
+        "topology": [],
+        "views": [
+            {
+                "segment_index": 0,
+                "frame_index": 1,
+                "transition_from_previous": "start",
+                "observations": [{"component_id": "COMPONENT_01", "visibility": "full"}],
+                "view_relations": [],
+            },
+            {
+                "segment_index": 0,
+                "frame_index": 2,
+                "transition_from_previous": "camera_motion",
+                "observations": [{"component_id": "COMPONENT_01", "visibility": "full"}],
+                "view_relations": [],
+            },
+        ],
+    }
+    prompts = image_optimization.compile_frame_prompts(plan, settings.seedream_edit_mode)
+    meta = {"keyframes": [path.name for path in frames]}
+
+    continuity, frozen = pipeline._freeze_image_optimization(
+        settings, meta, plan, prompts, {0: frames}, require_dual_target=True,
+        segment_lineage={0: {"chain_id": "chain-001", "join_mode": "hard_cut"}},
+    )
+
+    assert continuity["_image_continuity"]["version"] == 4
+    private = frozen["_image_optimization"]
+    assert private["version"] == 4
+    assert private["execution_inputs"]["frames"][1][
+        "source_transition_from_previous"
+    ] == "camera_motion"
+    assert private["scene_anchor_schedule"]["scenes"][0]["global_anchor"][
+        "frame_index"
+    ] == 1
+    assert private["frames"][1]["frame_name"] == "02.png"
+    assert isinstance(private["frames"][1]["current"], str)
 
 
 def test_invalid_project_output_stops_before_writing_segment_prompts(tmp_path, monkeypatch):
@@ -1889,6 +2027,21 @@ def test_short_v3_pipeline_e2e_sends_each_source_frame_its_own_prompt(
         )
 
     monkeypatch.setattr(postprocess.seedream, "edit", capture_edit)
+    class PassingAuditRunner:
+        def run_isolated(self, *_args, **_kwargs):
+            return None
+
+    passing_audit_runner = PassingAuditRunner()
+    monkeypatch.setattr(
+        postprocess.image_optimization,
+        "generate_plan_audit_verdict",
+        lambda *_args, **_kwargs: {"passed": True},
+    )
+    monkeypatch.setattr(
+        postprocess.image_optimization,
+        "generate_project_verdict",
+        lambda *_args, **_kwargs: {"passed": True},
+    )
     asyncio.run(postprocess.start(
         settings,
         meta["id"],
@@ -1900,7 +2053,9 @@ def test_short_v3_pipeline_e2e_sends_each_source_frame_its_own_prompt(
         {},
     ))
     asyncio.run(postprocess.run_task(
-        settings, meta["id"], asyncio.Semaphore(1), asyncio.Semaphore(1)
+        settings, meta["id"], asyncio.Semaphore(1), asyncio.Semaphore(1),
+        audit_runner=passing_audit_runner,
+        verification_runner=passing_audit_runner,
     ))
 
     assert len(captured) == 2

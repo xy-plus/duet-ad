@@ -534,8 +534,13 @@ def _write_image_optimization_prompt(work: Path, prompt: str) -> None:
         staged.unlink(missing_ok=True)
 
 
-def _frame_inventory(frame_paths: dict[int, list[Path]]) -> list[dict]:
+def _frame_inventory(
+    frame_paths: dict[int, list[Path]],
+    *,
+    segment_lineage: dict[int, dict] | None = None,
+) -> list[dict]:
     inventory = []
+    previous: dict | None = None
     for segment_index in sorted(frame_paths):
         paths = frame_paths[segment_index]
         if (
@@ -545,6 +550,15 @@ def _frame_inventory(frame_paths: dict[int, list[Path]]) -> list[dict]:
             or not paths
         ):
             raise PipelineError("image optimization frame inventory is invalid")
+        lineage = None if segment_lineage is None else segment_lineage.get(segment_index)
+        if segment_lineage is not None and (
+            not isinstance(lineage, dict)
+            or set(lineage) != {"chain_id", "join_mode"}
+            or not isinstance(lineage["chain_id"], str)
+            or not lineage["chain_id"]
+            or lineage["join_mode"] not in {"hard_cut", "continue"}
+        ):
+            raise PipelineError("image optimization frame inventory is invalid")
         for frame_index, path in enumerate(paths, 1):
             if not isinstance(path, Path) or path.name != f"{frame_index:02d}.png":
                 raise PipelineError("image optimization frame inventory is invalid")
@@ -552,12 +566,46 @@ def _frame_inventory(frame_paths: dict[int, list[Path]]) -> list[dict]:
                 source_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError as exc:
                 raise PipelineError("image optimization frame inventory is invalid") from exc
-            inventory.append({
+            item = {
                 "segment_index": segment_index,
                 "frame_index": frame_index,
                 "frame_name": path.name,
                 "source_sha256": source_sha256,
-            })
+            }
+            if lineage is not None:
+                transition = (
+                    "start"
+                    if previous is None
+                    else (
+                        "hard_cut"
+                        if frame_index == 1 and lineage["join_mode"] == "hard_cut"
+                        else "camera_motion"
+                    )
+                )
+                evidence = {
+                    "chain_id": lineage["chain_id"],
+                    "join_mode": lineage["join_mode"],
+                    "previous": previous,
+                    "current": {
+                        "segment_index": segment_index,
+                        "frame_index": frame_index,
+                        "source_sha256": source_sha256,
+                    },
+                    "transition": transition,
+                }
+                item.update(
+                    source_transition_from_previous=transition,
+                    source_transition_evidence_sha256=hashlib.sha256(
+                        json.dumps(
+                            evidence, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                )
+                previous = evidence["current"]
+            inventory.append(item)
+    if segment_lineage is not None and set(segment_lineage) != set(frame_paths):
+        raise PipelineError("image optimization frame inventory is invalid")
     return inventory
 
 
@@ -569,11 +617,15 @@ def _freeze_image_optimization(
     frame_paths: dict[int, list[Path]],
     *,
     require_dual_target: bool,
+    segment_lineage: dict[int, dict] | None = None,
 ) -> tuple[dict, dict]:
     """Freeze either the legacy segment prompt or V3 source-frame prompts."""
     try:
-        if continuity.get("version") == 3:
-            inventory = _frame_inventory(frame_paths)
+        if continuity.get("version") in {3, 4}:
+            inventory = _frame_inventory(
+                frame_paths,
+                segment_lineage=segment_lineage if continuity.get("version") == 4 else None,
+            )
             frame_counts = {
                 index: len(paths) for index, paths in frame_paths.items()
             }
@@ -588,7 +640,10 @@ def _freeze_image_optimization(
                 frame_inventory=inventory,
             )
             frozen_prompts = image_optimization.freeze_frame_prompts(
-                settings, execution, prompts
+                settings,
+                execution,
+                prompts,
+                plan=continuity if continuity.get("version") == 4 else None,
             )
         else:
             frozen_continuity = image_optimization.freeze_continuity(continuity)
@@ -671,7 +726,7 @@ def _generate_segmented_image_prompts(
     )
     if continuity is None:
         raise PipelineError("image continuity was not generated")
-    if continuity.get("version") != 3:
+    if continuity.get("version") not in {3, 4}:
         for segment in seg_metas:
             index = segment["index"]
             _write_image_optimization_prompt(
@@ -1681,7 +1736,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 )
                 if continuity is None or set(image_prompts) != {0}:
                     raise PipelineError("image optimization output is missing or invalid")
-                if continuity.get("version") != 3:
+                if continuity.get("version") not in {3, 4}:
                     image_prompt = image_prompts[0]
                     _write_image_optimization_prompt(work, image_prompt)
             prompt = _apply_no_bgm_prefix(prompt, work / "prompt.txt", enabled=False)
@@ -1725,6 +1780,9 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     image_prompts,
                     {0: frame_paths},
                     require_dual_target=True,
+                    segment_lineage={
+                        0: {"chain_id": "short-000", "join_mode": "hard_cut"},
+                    },
                 )
                 completion.update(frozen_continuity)
                 completion.update(frozen_prompts)
@@ -1875,6 +1933,13 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                         for seg in seg_metas
                     },
                     require_dual_target=False,
+                    segment_lineage={
+                        seg["index"]: {
+                            "chain_id": seg["chain_id"],
+                            "join_mode": seg["join_mode"],
+                        }
+                        for seg in seg_metas
+                    },
                 )
                 changes.update(frozen_continuity)
                 changes.update(frozen_prompts)

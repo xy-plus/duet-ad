@@ -946,8 +946,8 @@ def _v3_frame_bound_plan() -> dict:
                         }],
                     },
                     "dominant_palette_contract": {
-                        "area_weighted_warm_cool_family": "warm",
-                        "saturation_style": "natural",
+                        "area_weighted_warm_cool_family": "balanced",
+                        "saturation_style": "muted",
                     },
                 },
                 {
@@ -970,8 +970,8 @@ def _v3_frame_bound_plan() -> dict:
                         }],
                     },
                     "dominant_palette_contract": {
-                        "area_weighted_warm_cool_family": "warm",
-                        "saturation_style": "natural",
+                        "area_weighted_warm_cool_family": "balanced",
+                        "saturation_style": "muted",
                     },
                 },
             ],
@@ -1239,6 +1239,160 @@ class _PlanAuditRunner:
         )
 
 
+class _V4LifecycleRunner:
+    def __init__(self, failed_phase: str | None = None) -> None:
+        self.failed_phase = failed_phase
+        self.phases = []
+        self.verification_error = None
+
+    @staticmethod
+    def _check(status: str = "pass", evidence: str = "generic evidence") -> dict:
+        return {"status": status, "evidence": evidence}
+
+    def run_isolated(self, workdir, _prompt, *, session_dir) -> None:
+        root = Path(workdir)
+        request = json.loads((root / "work" / "request.json").read_text(
+            encoding="utf-8"
+        ))
+        phase = request["phase"]
+        self.phases.append(phase)
+        frozen = json.loads((root / "work" / "frozen_plan.json").read_text(
+            encoding="utf-8"
+        ))
+        plan = {key: value for key, value in frozen.items() if key != "sha256"}
+        failed = phase == self.failed_phase
+        status = "fail" if failed else "pass"
+        if phase == "plan_audit":
+            receipt = json.loads((root / "work" / "audit_inputs.json").read_text(
+                encoding="utf-8"
+            ))
+            output = {
+                "version": 4,
+                "phase": "plan_audit",
+                "plan_sha256": receipt["plan_sha256"],
+                "continuity_sha256": receipt["continuity_sha256"],
+                "audit_input_sha256": receipt["sha256"],
+                "passed": not failed,
+                "reason": None if not failed else "plan_audit_failed",
+                "frame_checks": [{
+                    "segment_index": item["segment_index"],
+                    "frame_index": item["frame_index"],
+                    "source_sha256": item["source_sha256"],
+                    **{
+                        key: self._check(status)
+                        for key in (
+                            "body_closure", "scene_closure", "entity_closure",
+                            "relation_closure", "scene_continuity_closure",
+                        )
+                    },
+                } for item in receipt["frames"]],
+            }
+            target = root / "work" / "plan_audit.json"
+        elif phase == "verify_pack":
+            evidence = " ".join(
+                token
+                for scene in plan["scene_plans"]
+                for token in image_optimization._scene_continuity_evidence_tokens(scene)
+            )
+            output = {
+                "version": 4,
+                "phase": "verify_pack",
+                "plan_sha256": image_optimization.plan_sha256(plan),
+                "passed": not failed,
+                "reason": None if not failed else "scene_geometry_change_failed",
+                "persons": [{
+                    "person_id": item["id"],
+                    "passed": not failed,
+                    "checks": {
+                        key: self._check(status)
+                        for key in image_optimization._PACK_PERSON_CHECKS
+                    },
+                } for item in plan["person_plans"]],
+                "scenes": [{
+                    "scene_id": item["id"],
+                    "passed": not failed,
+                    "checks": {
+                        key: self._check(status, evidence)
+                        for key in image_optimization._PACK_SCENE_CHECKS
+                    },
+                } for item in plan["scene_plans"]],
+                "project": {
+                    key: self._check(status)
+                    for key in image_optimization._PACK_PROJECT_CHECKS
+                },
+            }
+            target = root / "work" / "reference_pack_verification.json"
+        elif phase == "verify":
+            base = self._check("pass")
+            segments = []
+            for segment in plan["segments"]:
+                segments.append({
+                    "segment_index": segment["segment_index"],
+                    "passed": not failed,
+                    "person_checks": [{
+                        "person_id": person["id"],
+                        "identity_changed": dict(base),
+                        "source_identity_absent": dict(base),
+                        "local_color_change": dict(base),
+                    } for person in segment["persons"]],
+                    "scene_checks": {
+                        key: dict(base) for key in (
+                            "semantic_change", "geometry_change", "depth_change",
+                            "layout_change", "local_color_change",
+                        )
+                    },
+                    "invariants": {
+                        key: dict(base) for key in (
+                            "lighting_preservation", "interaction_preservation",
+                            "cross_frame_continuity",
+                        )
+                    },
+                    "frame_checks": [{
+                        "frame_index": frame["frame_index"],
+                        **{key: dict(base) for key in (
+                            "visible_body_parts", "pose_skeleton", "contact_points",
+                            "occlusion_order", "out_of_frame_crop",
+                            "non_person_entity_ledger",
+                            "dominant_palette_contract", "photometric_contract",
+                        )},
+                        "scene_continuity_view": self._check(status),
+                    } for frame in segment["frame_constraints"]],
+                })
+            output = {
+                "version": 4,
+                "phase": "verify",
+                "plan_sha256": image_optimization.plan_sha256(plan),
+                "segment_indices": plan["segment_indices"],
+                "passed": not failed,
+                "reason": None if not failed else "scene_continuity_failed",
+                "segments": segments,
+                "project_checks": {
+                    key: (
+                        self._check(
+                            status,
+                            " ".join(
+                                token for scene in plan["scene_plans"]
+                                for token in image_optimization._scene_continuity_evidence_tokens(scene)
+                            ),
+                        )
+                        if key == "scene_continuity" else dict(base)
+                    ) for key in (
+                        "narrative_person_completeness", "no_identity_swap",
+                        "no_unplanned_person", "person_identity_continuity",
+                        "scene_continuity",
+                    )
+                },
+            }
+            try:
+                image_optimization.canonical_verification(output, plan)
+            except Exception as exc:
+                self.verification_error = repr(exc)
+            target = root / "work" / "image_verification.json"
+        else:
+            raise AssertionError(f"unexpected phase: {phase}")
+        target.write_text(json.dumps(output, ensure_ascii=False), encoding="utf-8")
+
+
 def _freeze_v3_image_optimization(settings, cid: str, plan: dict) -> None:
     cdir = settings.data_dir / cid
     frames = sorted((cdir / "work" / "keyframes").glob("*.png"))
@@ -1262,6 +1416,46 @@ def _freeze_v3_image_optimization(settings, cid: str, plan: dict) -> None:
         settings,
         execution,
         image_optimization.compile_frame_prompts(plan, settings.seedream_edit_mode),
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        keyframes=[frame.name for frame in frames],
+        **image_optimization.freeze_continuity(plan, frame_counts={0: len(frames)}),
+        **frozen,
+    )
+
+
+def _freeze_v4_image_optimization(settings, cid: str, plan: dict) -> None:
+    cdir = settings.data_dir / cid
+    frames = sorted((cdir / "work" / "keyframes").glob("*.png"))
+    inventory = [
+        {
+            "segment_index": 0,
+            "frame_index": index,
+            "frame_name": frame.name,
+            "source_sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
+            "source_transition_from_previous": (
+                "start" if index == 1 else "same_camera"
+            ),
+            "source_transition_evidence_sha256": (
+                "a" * 64 if index == 1 else "b" * 64
+            ),
+        }
+        for index, frame in enumerate(frames, 1)
+    ]
+    execution = image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={"id": "dual-target", "revision": 4},
+        model=settings.seedream_model,
+        frame_inventory=inventory,
+    )
+    frozen = image_optimization.freeze_frame_prompts(
+        settings,
+        execution,
+        image_optimization.compile_frame_prompts(plan, settings.seedream_edit_mode),
+        plan=plan,
     )
     storage.update_meta(
         settings.data_dir,
@@ -1309,6 +1503,263 @@ def test_v3_plan_audit_fail_closed_before_every_seedream_post(
     latest = storage.load_meta(settings.data_dir, cid)
     assert latest["postprocess"]["status"] == "failed"
     assert latest["postprocess"]["error"] == "image_plan_audit_failed"
+
+
+def test_v4_plan_audit_failure_blocks_every_seedream_post(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(_png(value=62))
+    _freeze_v4_image_optimization(settings, cid, _v4_frame_bound_plan())
+    calls = []
+
+    async def forbidden_seedream(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("Seedream must not run before a failed v4 plan audit")
+
+    monkeypatch.setattr(postprocess.seedream, "edit", forbidden_seedream)
+    asyncio.run(postprocess.start(
+        settings,
+        cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+
+    asyncio.run(postprocess.run_task(
+        settings,
+        cid,
+        asyncio.Semaphore(1),
+        asyncio.Semaphore(1),
+        audit_runner=_PlanAuditRunner("fail"),
+    ))
+
+    assert calls == []
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert latest["postprocess"]["status"] == "failed"
+    assert latest["postprocess"]["error"] == "image_plan_audit_failed"
+
+
+def test_v4_source_palette_contract_mismatch_blocks_first_seedream_post(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(_png(value=62))
+    plan = _v4_frame_bound_plan()
+    for frame in plan["segments"][0]["frame_constraints"]:
+        frame["dominant_palette_contract"] = {
+            "area_weighted_warm_cool_family": "warm",
+            "saturation_style": "natural",
+        }
+    _freeze_v4_image_optimization(settings, cid, plan)
+    calls = []
+
+    async def forbidden_seedream(*_args, **_kwargs):
+        calls.append(True)
+        raise AssertionError("palette source mismatch must stop before first POST")
+
+    monkeypatch.setattr(postprocess.seedream, "edit", forbidden_seedream)
+    asyncio.run(postprocess.start(
+        settings, cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+    runner = _V4LifecycleRunner()
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
+        audit_runner=runner, verification_runner=runner,
+    ))
+
+    assert runner.phases == ["plan_audit"]
+    assert calls == []
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert latest["postprocess"]["error"] == "dominant_palette_source_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("failed_phase", "expected_posts", "published"),
+    [
+        ("verify_pack", 4, False),
+        ("verify", 6, False),
+        (None, 6, True),
+    ],
+)
+def test_v4_runtime_uses_anchor_dag_before_pack_then_fanout_and_publish(
+    tmp_path, monkeypatch, failed_phase, expected_posts, published,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    source_two = _png(value=62)
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(source_two)
+    _freeze_v4_image_optimization(settings, cid, _v4_frame_bound_plan())
+    calls = []
+
+    async def staged_edit(_settings, images, _prompt, output, *, receipt_path):
+        calls.append(images)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(images[0])
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(postprocess.seedream, "edit", staged_edit)
+    asyncio.run(postprocess.start(
+        settings,
+        cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+    runner = _V4LifecycleRunner(failed_phase)
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
+        audit_runner=runner, verification_runner=runner,
+    ))
+
+    assert runner.phases[:2] == ["plan_audit", "verify_pack"]
+    assert len(calls) == expected_posts
+    assert [len(images) for images in calls] == [1, 2, 2, 2, 2, 2][:expected_posts]
+    private = cdir / "work" / ".postprocess-private" / "scene-anchors" / "SCENE_01"
+    assert json.loads((private / "global.json").read_text())["input_roles"] == ["canvas"]
+    assert json.loads((private / "pack-alternate.json").read_text())["input_roles"] == [
+        "canvas", "global_scene_anchor",
+    ]
+    if failed_phase == "verify_pack":
+        assert not (private / "layout-0000.json").exists()
+        assert not (cdir / "work" / "postprocessed").exists()
+        return
+    assert json.loads((private / "layout-0000.json").read_text())["input_roles"] == [
+        "canvas", "global_scene_anchor",
+    ]
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert ("verify" in runner.phases) is (failed_phase != "verify_pack"), runner.phases
+    assert runner.verification_error is None, runner.verification_error
+    assert (latest["postprocess"]["status"] == "done") is published, latest[
+        "postprocess"
+    ].get("error")
+    if not published:
+        assert not (cdir / "work" / "postprocessed").exists()
+        return
+    assert "verify" in runner.phases
+    generated = postprocess.generation_keyframes(
+        cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
+    )
+    assert [item.name for item in generated] == ["01.png", "02.png"]
+    metric_tamper = deepcopy(latest)
+    metric = metric_tamper["_image_verification"]["palette_metrics"]
+    metric["frames"][0]["output"]["mean_lab_b_star"] += 0.1
+    metric_payload = {key: value for key, value in metric.items() if key != "sha256"}
+    metric["sha256"] = postprocess._receipt_sha256(metric_payload)
+    metric_tamper["_image_verification"]["palette_metrics_sha256"] = metric["sha256"]
+    raw = metric_tamper["_image_verification"]
+    raw["sha256"] = postprocess._receipt_sha256({
+        key: value for key, value in raw.items() if key != "sha256"
+    })
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, metric_tamper,
+            sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )
+    semantic_path = postprocess._semantic_receipt_path(cdir, "bootstrap")
+    original_semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+    semantic_tamper = deepcopy(original_semantic)
+    semantic_tamper["pack_bindings"] = list(reversed(semantic_tamper["pack_bindings"]))
+    semantic_tamper["sha256"] = postprocess._receipt_sha256({
+        key: value for key, value in semantic_tamper.items() if key != "sha256"
+    })
+    postprocess._write_json_receipt(semantic_path, semantic_tamper)
+    receipt_tamper = deepcopy(latest)
+    receipt_tamper["_image_verification"]["semantic_receipts"][0]["sha256"] = (
+        semantic_tamper["sha256"]
+    )
+    raw = receipt_tamper["_image_verification"]
+    raw["sha256"] = postprocess._receipt_sha256({
+        key: value for key, value in raw.items() if key != "sha256"
+    })
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, receipt_tamper,
+            sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )
+    postprocess._write_json_receipt(semantic_path, original_semantic)
+    binding = original_semantic["pack_bindings"][0]["primary"]
+    anchor_index = postprocess._v4_anchor_receipt_index(
+        cdir, _v4_frame_bound_plan(), latest["_image_optimization"]["scene_anchor_schedule"],
+    )
+    anchor = anchor_index[binding["anchor_receipt_sha256"]]
+    anchor_path = postprocess._anchor_receipt_path(
+        cdir, anchor["scene_id"], anchor["label"],
+    )
+    original_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+    anchor_tamper = deepcopy(original_anchor)
+    anchor_tamper["output_sha256"] = "0" * 64
+    anchor_tamper["sha256"] = postprocess._receipt_sha256({
+        key: value for key, value in anchor_tamper.items() if key != "sha256"
+    })
+    postprocess._write_json_receipt(anchor_path, anchor_tamper)
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )
+    postprocess._write_json_receipt(anchor_path, original_anchor)
+    drift = deepcopy(latest)
+    drift["_image_verification"]["frames"][0]["output_sha256"] = "0" * 64
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, drift, sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )
+
+
+def test_v4_invalid_global_anchor_blocks_layout_pack_and_fanout(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(_png(value=62))
+    _freeze_v4_image_optimization(settings, cid, _v4_frame_bound_plan())
+    calls = []
+
+    async def invalid_anchor(_settings, images, _prompt, output, *, receipt_path):
+        calls.append(images)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"not-an-image")
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(postprocess.seedream, "edit", invalid_anchor)
+    asyncio.run(postprocess.start(
+        settings,
+        cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+    runner = _V4LifecycleRunner()
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
+        audit_runner=runner, verification_runner=runner,
+    ))
+
+    assert runner.phases == ["plan_audit"]
+    assert len(calls) == 1 and len(calls[0]) == 1
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert latest["postprocess"]["status"] == "failed"
+    assert latest["postprocess"]["error"] == "scene_anchor_verification_failed"
+    assert not (cdir / "work" / "postprocessed").exists()
 
 
 def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(

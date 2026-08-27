@@ -2,10 +2,13 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -20,6 +23,13 @@ PNG = base64.b64decode(
 
 OPTIONS_SUB = {"remove_subtitle": True, "remove_brand": False}
 OPTIONS_BRAND = {"remove_subtitle": False, "remove_brand": True}
+
+
+def _solid_png(path: Path, bgr: tuple[int, int, int], *, local_bgr=None) -> None:
+    image = np.full((100, 100, 3), bgr, dtype=np.uint8)
+    if local_bgr is not None:
+        image[:5, :5] = local_bgr
+    assert cv2.imwrite(str(path), image)
 
 
 @pytest.fixture
@@ -63,6 +73,212 @@ def _make_conv(settings, status="done", segments=False):
     meta.update(image_optimization.freeze_prompts(settings, meta, prompts))
     (cdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return cid
+
+
+def test_v4_generation_keyframes_require_an_intact_verified_output_receipt(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    source = cdir / "work" / "keyframes" / "01.png"
+    output_dir = cdir / "work" / "postprocessed"
+    output_dir.mkdir()
+    output = output_dir / "01.png"
+    output.write_bytes(source.read_bytes())
+    schedule = {"version": 4, "scenes": []}
+    optimization = {
+        "version": 4,
+        "plan_sha256": "a" * 64,
+        "continuity_sha256": "b" * 64,
+        "scene_anchor_schedule": schedule,
+    }
+    monkeypatch.setattr(
+        postprocess.image_optimization, "receipt", lambda _meta: optimization
+    )
+    monkeypatch.setattr(
+        postprocess.image_optimization,
+        "dual_target_plan_receipt",
+        lambda _meta: {"version": 4, "person_plans": [], "scene_plans": []},
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={
+            "status": "done", "options": {"remove_subtitle": False,
+            "remove_brand": False, "optimize_image": True},
+            "frames": ["01.png"], "segments": [], "error": None,
+        },
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(cdir, meta, [source])
+
+    source_metric = postprocess._area_weighted_palette_metric(source)
+    contract = {
+        "area_weighted_warm_cool_family": source_metric["warm_cool_family"],
+        "saturation_style": source_metric["saturation_style"],
+    }
+    palette_payload = {
+        "version": 1,
+        "algorithm": postprocess._PALETTE_METRIC_ALGORITHM,
+        "thresholds": postprocess._PALETTE_METRIC_THRESHOLDS,
+        "frames": [{
+            "segment_index": 0,
+            "frame_index": 1,
+            "contract": contract,
+            "source": source_metric,
+            "output": postprocess._area_weighted_palette_metric(output),
+        }],
+    }
+    palette_metrics = {
+        **palette_payload, "sha256": postprocess._receipt_sha256(palette_payload),
+    }
+    source_palette_payload = {
+        "version": 1,
+        "plan_sha256": optimization["plan_sha256"],
+        "continuity_sha256": optimization["continuity_sha256"],
+        "metrics": {
+            **{
+                key: value for key, value in palette_metrics.items()
+                if key != "sha256"
+            },
+            "frames": [{
+                key: value for key, value in palette_metrics["frames"][0].items()
+                if key != "output"
+            }],
+        },
+    }
+    source_palette_receipt = {
+        **source_palette_payload,
+        "sha256": postprocess._receipt_sha256(source_palette_payload),
+    }
+    semantic_payload = {
+        "version": 1,
+        "plan_sha256": optimization["plan_sha256"],
+        "continuity_sha256": optimization["continuity_sha256"],
+        "label": "bootstrap",
+        "pack_bindings": [],
+        "metrics_sha256": palette_metrics["sha256"],
+        "verdict": {"passed": True},
+    }
+    semantic_receipt = {
+        **semantic_payload, "sha256": postprocess._receipt_sha256(semantic_payload),
+    }
+    postprocess._write_json_receipt(
+        postprocess._semantic_receipt_path(cdir, "bootstrap"), semantic_receipt,
+    )
+    postprocess._write_json_receipt(
+        cdir / "work" / ".postprocess-private" / "scene-anchors" / "palette-source.json",
+        source_palette_receipt,
+    )
+    payload = {
+        "version": 1,
+        "plan_sha256": optimization["plan_sha256"],
+        "continuity_sha256": optimization["continuity_sha256"],
+        "scene_anchor_schedule_sha256": postprocess._receipt_sha256(schedule),
+        "semantic_receipts": [{"label": "bootstrap", "sha256": semantic_receipt["sha256"]}],
+        "source_palette_receipt_sha256": source_palette_receipt["sha256"],
+        "palette_metrics": palette_metrics,
+        "palette_metrics_sha256": palette_metrics["sha256"],
+        "frames": [{
+            "segment_index": 0,
+            "frame_name": "01.png",
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        }],
+        "verdict": {"passed": True},
+    }
+    receipt = {**payload, "sha256": postprocess._receipt_sha256(payload)}
+    storage.update_meta(settings.data_dir, cid, _image_verification=receipt)
+    meta = storage.load_meta(settings.data_dir, cid)
+    assert postprocess.generation_keyframes(cdir, meta, [source]) == [output]
+    output.write_bytes(PNG + b"drift")
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(cdir, meta, [source])
+
+
+def test_v4_postprocess_global_pack_failure_prevents_layout_and_fanout(
+    tmp_path, monkeypatch,
+):
+    """The v4 product coordinator cannot reach a dependent after global pack fail."""
+    settings = make_settings(tmp_path)
+    cdir = tmp_path / "session"
+    cdir.mkdir()
+    calls = []
+    private = {
+        "options": {"remove_subtitle": False, "remove_brand": False},
+        "plan_sha256": "a" * 64,
+        "continuity_sha256": "b" * 64,
+    }
+    metric = {
+        "version": 1,
+        "algorithm": postprocess._PALETTE_METRIC_ALGORITHM,
+        "thresholds": postprocess._PALETTE_METRIC_THRESHOLDS,
+        "frames": [],
+    }
+    metric["sha256"] = postprocess._receipt_sha256(metric)
+    monkeypatch.setattr(postprocess, "_v4_frozen_plan", lambda *_args: {"segments": []})
+    monkeypatch.setattr(postprocess, "_v4_frame_sources", lambda *_args: {})
+    monkeypatch.setattr(postprocess, "_v4_palette_metrics", lambda *_args: metric)
+
+    async def bootstrap(*_args, **_kwargs):
+        calls.append("global-anchor")
+        return {}, []
+
+    async def fail_global_pack(*_args, **_kwargs):
+        calls.append("global-pack")
+        raise postprocess.PostprocessError(409, "image_reference_pack_failed")
+
+    async def forbidden_layout(*_args, **_kwargs):
+        pytest.fail("layout must not run after global semantic failure")
+
+    async def forbidden_fanout(*_args, **_kwargs):
+        pytest.fail("fanout must not run after global semantic failure")
+
+    monkeypatch.setattr(postprocess, "_v4_bootstrap_scene_anchors", bootstrap)
+    monkeypatch.setattr(postprocess, "_v4_verify_bootstrap_packs", fail_global_pack)
+    monkeypatch.setattr(postprocess, "_v4_generate_layout_anchors", forbidden_layout)
+    monkeypatch.setattr(postprocess, "_v4_fan_out", forbidden_fanout)
+
+    with pytest.raises(postprocess.PostprocessError, match="image_reference_pack_failed"):
+        asyncio.run(postprocess._run_v4_task(
+            settings, "cid", cdir, {}, private, {}, asyncio.Semaphore(1), object(), object(),
+        ))
+    assert calls == ["global-anchor", "global-pack"]
+
+
+def test_palette_metric_uses_area_weighted_lab_b_star_and_allows_local_change(tmp_path):
+    yellow = tmp_path / "yellow.png"
+    blue = tmp_path / "blue.png"
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    _solid_png(yellow, (0, 255, 255))
+    _solid_png(blue, (255, 0, 0))
+    _solid_png(source, (127, 127, 127))
+    _solid_png(output, (127, 127, 127), local_bgr=(0, 0, 255))
+
+    warm = postprocess._area_weighted_palette_metric(yellow)
+    cool = postprocess._area_weighted_palette_metric(blue)
+    assert warm["warm_cool_family"] == "warm"
+    assert cool["warm_cool_family"] == "cool"
+    assert warm["mean_lab_b_star"] > 0 > cool["mean_lab_b_star"]
+
+    plan = {"segments": [{
+        "segment_index": 0,
+        "frame_constraints": [{
+            "frame_index": 1,
+            "dominant_palette_contract": {
+                "area_weighted_warm_cool_family": "balanced",
+                "saturation_style": "muted",
+            },
+        }],
+    }]}
+    metrics = postprocess._v4_palette_metrics(
+        plan, {(0, 1): source}, {(0, 1): output},
+    )
+    assert metrics["frames"][0]["source"]["warm_cool_family"] == "balanced"
+    assert metrics["frames"][0]["output"]["warm_cool_family"] == "balanced"
 
 
 class FakeEdit:

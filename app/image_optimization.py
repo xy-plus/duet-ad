@@ -1795,15 +1795,105 @@ def freeze_execution_inputs(
         "frames": frames,
     }
     if canonical["version"] == 4:
-        frame_counts = {
-            index: sum(item["segment_index"] == index for item in inventory)
-            for index in canonical["segment_indices"]
-        }
-        payload["continuity_sha256"] = freeze_continuity(
-            canonical, frame_counts=frame_counts
-        )["_image_continuity"]["sha256"]
+        payload["continuity_sha256"] = _scene_graph_digest(canonical, inventory)
         payload["sha256"] = sha256(_plan_json(payload))
     return payload
+
+
+def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
+    """Derive the only v4 scene-anchor DAG from frozen plan and frame inputs."""
+    canonical = _canonical_plan_v4(plan)
+    if not canonical["eligible"] or execution_inputs.get("version") != 4:
+        raise ValueError("invalid image optimization anchor schedule")
+    frames = execution_inputs.get("frames")
+    if not isinstance(frames, list):
+        raise ValueError("invalid image optimization anchor schedule")
+    frame_by_key = {
+        (frame.get("segment_index"), frame.get("frame_index")): frame
+        for frame in frames if isinstance(frame, dict)
+    }
+    if len(frame_by_key) != len(frames):
+        raise ValueError("invalid image optimization anchor schedule")
+
+    def frozen_anchor(segment_index: int, frame_index: int, order: int) -> dict:
+        frame = frame_by_key.get((segment_index, frame_index))
+        if not isinstance(frame, dict) or set(frame) != {
+            "segment_index", "frame_index", "frame_name", "source_sha256",
+            "observable_person_ids", "scene_id", "frame_constraint",
+            "photometric_contract", "source_transition_from_previous",
+            "source_transition_evidence_sha256", "scene_continuity_view",
+        }:
+            raise ValueError("invalid image optimization anchor schedule")
+        return {
+            "order": order,
+            "segment_index": segment_index,
+            "frame_index": frame_index,
+            "frame_name": frame["frame_name"],
+            "source_sha256": frame["source_sha256"],
+        }
+
+    segments = {item["segment_index"]: item for item in canonical["segments"]}
+    order = 1
+    scenes = []
+    for scene in canonical["scene_plans"]:
+        reference = scene["reference"]
+        global_anchor = frozen_anchor(
+            reference["segment_index"], reference["frame_index"], order
+        )
+        order += 1
+        layouts = []
+        for segment_index in scene["segments"]:
+            segment = segments.get(segment_index)
+            if segment is None or segment["scene"]["scene_id"] != scene["id"]:
+                raise ValueError("invalid image optimization anchor schedule")
+            layouts.append(frozen_anchor(
+                segment_index,
+                segment["scene"]["layout_reference_frame_index"],
+                order,
+            ))
+            order += 1
+        scenes.append({
+            "scene_id": scene["id"],
+            "global_anchor": global_anchor,
+            "segment_layout_anchors": layouts,
+        })
+    return {
+        "version": 4,
+        "plan_sha256": execution_inputs["plan_sha256"],
+        "execution_input_sha256": execution_inputs["sha256"],
+        "scenes": scenes,
+    }
+
+
+def _scene_graph_digest(plan: dict, inventory: list[dict]) -> str:
+    """Bind v4 graph/views to the authoritative source-transition evidence."""
+    canonical = _canonical_plan_v4(plan)
+    if not canonical["eligible"] or not isinstance(inventory, list):
+        raise ValueError("invalid image optimization scene graph")
+    transitions = []
+    for item in inventory:
+        if not isinstance(item, dict):
+            raise ValueError("invalid image optimization scene graph")
+        try:
+            transitions.append({
+                key: item[key]
+                for key in (
+                    "segment_index", "frame_index",
+                    "source_transition_from_previous",
+                    "source_transition_evidence_sha256",
+                )
+            })
+        except KeyError:
+            raise ValueError("invalid image optimization scene graph") from None
+    payload = {
+        "version": 4,
+        "scenes": [
+            {"scene_id": scene["id"], "continuity_graph": scene["continuity_graph"]}
+            for scene in canonical["scene_plans"]
+        ],
+        "transitions": transitions,
+    }
+    return sha256(_plan_json(payload))
 
 
 def _freeze_frame_prompts_v4(
@@ -1879,6 +1969,7 @@ def _freeze_frame_prompts_v4(
         "execution_inputs": deepcopy(execution_inputs),
         "model": settings.seedream_model,
         "edit_mode": settings.seedream_edit_mode,
+        "scene_anchor_schedule": _scene_anchor_schedule(plan, execution_inputs),
         "frames": frozen,
     }
     return {"_image_optimization": {
@@ -2144,13 +2235,17 @@ def freeze_plan_audit_inputs(plan: dict, *, frame_inventory: list[dict]) -> dict
         index: sum(item["segment_index"] == index for item in inventory)
         for index in canonical["segment_indices"]
     }
-    continuity = freeze_continuity(canonical, frame_counts=frame_counts)[
-        "_image_continuity"
-    ]
+    continuity_sha256 = (
+        _scene_graph_digest(canonical, inventory)
+        if canonical["version"] == 4
+        else freeze_continuity(canonical, frame_counts=frame_counts)[
+            "_image_continuity"
+        ]["sha256"]
+    )
     payload = {
         "version": 1,
         "plan_sha256": plan_sha256(canonical),
-        "continuity_sha256": continuity["sha256"],
+        "continuity_sha256": continuity_sha256,
         "frames": inventory,
     }
     return {**payload, "sha256": sha256(_plan_json(payload))}
@@ -3452,7 +3547,7 @@ def _receipt_v4(raw: dict, meta: dict) -> dict | None:
         set(raw) != {
             "version", "plan_sha256", "continuity_sha256",
             "execution_input_sha256", "execution_inputs", "model", "edit_mode",
-            "frames", "sha256",
+            "scene_anchor_schedule", "frames", "sha256",
         }
         or raw.get("model") not in SEEDREAM_MODELS
         or raw.get("edit_mode") not in SEEDREAM_EDIT_MODES
@@ -3488,6 +3583,7 @@ def _receipt_v4(raw: dict, meta: dict) -> dict | None:
             frame_inventory=inventory,
         )
         expected_prompts = compile_frame_prompts(plan, raw["edit_mode"])
+        expected_schedule = _scene_anchor_schedule(plan, expected_execution)
     except (
         KeyError, TypeError, ValueError, ImageOptimizationOutputError,
         ImageOptimizationIneligibleError,
@@ -3496,8 +3592,8 @@ def _receipt_v4(raw: dict, meta: dict) -> dict | None:
     if (
         execution != expected_execution
         or raw.get("plan_sha256") != expected_execution["plan_sha256"]
-        or raw.get("continuity_sha256") != frozen_plan["sha256"]
         or raw["continuity_sha256"] != expected_execution["continuity_sha256"]
+        or raw.get("scene_anchor_schedule") != expected_schedule
         or not isinstance(raw.get("frames"), list)
         or len(raw["frames"]) != len(execution["frames"])
     ):
