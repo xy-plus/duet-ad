@@ -42,13 +42,13 @@ def _plan(indices: list[int] | None = None) -> dict:
         "scene_plans": [
             {
                 "id": "SCENE_01",
-                "source_scene": "原室内工作空间",
-                "replacement_scene": "同用途但不同空间设计的新室内工作空间",
-                "semantic_change": "从原房间替换为另一处真实房间",
-                "geometry_changes": ["改变墙面转折与开口形状"],
-                "depth_changes": ["改变背景纵深与前后层级"],
-                "layout_changes": ["改变柜体与通道的空间布局"],
-                "local_color_change": "主要墙面改为冷灰蓝色",
+                "source_scene": "源叙事环境",
+                "replacement_scene": "同用途但不同设计的真实新环境",
+                "semantic_change": "替换为另一处真实叙事环境",
+                "geometry_changes": ["改变主要结构的形状与连接关系"],
+                "depth_changes": ["改变可见纵深与前后层级"],
+                "layout_changes": ["改变功能区域与通行关系"],
+                "local_color_change": "改变可见表面的局部固有色",
                 "reference": {"segment_index": first, "frame_index": 1},
                 "segments": indices,
             }
@@ -67,8 +67,8 @@ def _plan(indices: list[int] | None = None) -> dict:
                 ],
                 "scene": {
                     "scene_id": "SCENE_01",
-                    "target_region": "人物以外的完整可见室内背景",
-                    "boundary": "背景边界止于人物和前景物体轮廓",
+                    "target_region": "人物以外的完整可见场景",
+                    "boundary": "场景边界止于人物和前景实体轮廓",
                     "layout_reference_frame_index": 1,
                 },
                 "protected_non_target_people": [],
@@ -216,6 +216,51 @@ def test_skill_is_one_concise_plan_and_verify_skill():
         assert invariant in skill
     assert "不得出现素材特调" in skill
     assert "work/image_verification.json" in skill
+
+
+def test_skill_prioritizes_video_continuity_with_boundary_scoped_replacement_packs():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    for rule in (
+        "最终视频连续性与现实合理性是最高优先级",
+        "可见关系图",
+        "冻结新身份包",
+        "冻结新场景包",
+        "逐段复用",
+        "不得逐帧重新设计",
+        "`hard_cut` 是场景证据边界",
+        "不得把切前场景传播到切后",
+        "只能依据切后可见证据",
+        "不可观察时不得补入人物",
+        "语义、几何、纵深、布局和局部固有色",
+        "交互、接触、持握、支撑、遮挡、前后顺序、视线、姿态、动作目的",
+        "画幅、裁切、机位、镜头、透视、构图、焦点和景深",
+        "全局光源方向、曝光、白平衡/CCT、tone curve 和整体色彩风格",
+    ):
+        assert rule in skill
+
+    for rule in (
+        "最终视频连续性与现实合理性是最高优先级",
+        "冻结新身份包",
+        "冻结新场景包",
+        "`hard_cut` 是场景证据边界",
+        "不可观察时不得补入人物",
+        "可见关系图",
+    ):
+        assert rule in human
+
+    for sample_word in (
+        "\u73a9\u5177",
+        "\u5899\u9762",
+        "\u5899\u4f53",
+        "\u5730\u677f",
+        "\u67dc\u4f53",
+    ):
+        assert sample_word not in skill
+        assert sample_word not in human
 
 
 def test_plan_phase_returns_v2_plan_and_compiled_dual_target_prompts(tmp_path):
