@@ -435,19 +435,15 @@ def test_plan_phase_v3_compiles_one_prompt_for_each_frozen_source_frame(tmp_path
     assert "第二帧可见部位数量与边界保持当前源帧" in prompts[0][2]
 
 
-def test_ineligible_plan_is_a_stable_failure_not_successful_noop(tmp_path):
-    session = tmp_path / "session"
-    with pytest.raises(
-        image_optimization.ImageOptimizationIneligibleError,
-        match="no_observable_narrative_person",
-    ):
-        image_optimization.generate_project_prompts(
-            _Runner(_ineligible()),
-            _segments(session, [0]),
-            "independent_parallel",
-            session_dir=session,
-            expected_version=2,
-        )
+def test_legacy_ineligible_plan_is_runtime_protocol_correction_not_skill_failure():
+    legacy = _ineligible()
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    assert image_optimization.canonical_plan_v2(legacy) == legacy
+    assert "历史 v2/old `eligible=false` 响应" in human
+    assert "runtime protocol correction" in human
 
 
 @pytest.mark.parametrize(
@@ -1722,7 +1718,7 @@ def test_v4_graph_rejects_redundant_pairs_and_invisible_endpoints(mutate):
         )
 
 
-def test_v4_same_camera_cannot_move_occluded_component_out_of_view():
+def test_v4_visibility_transition_is_source_preservation_not_skill_rejection():
     plan = _generic_scene_continuity_plan()
     second_constraint = deepcopy(plan["segments"][0]["frame_constraints"][0])
     second_constraint["frame_index"] = 2
@@ -1758,10 +1754,16 @@ def test_v4_same_camera_cannot_move_occluded_component_out_of_view():
         },
     ]
 
-    with pytest.raises(image_optimization.ImageOptimizationOutputError):
-        image_optimization.canonical_plan_v4(
-            plan, segment_indices=[1, 2], frame_counts={1: 2, 2: 1}
-        )
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    assert graph["views"][1]["observations"][1]["visibility"] == "occluded"
+    assert graph["views"][2]["observations"][1]["visibility"] == "out_of_view"
+    for document in (skill, human):
+        assert "same_camera 的 `occluded`→`out_of_view`" in document
+        assert "不得作为内容 schema 拒绝" in document
 
 
 def _make_topology_cycle(value: dict) -> None:
@@ -2386,7 +2388,7 @@ def test_v3_verify_requires_and_evaluates_dominant_palette_check():
     assert canonical["reason"] == "dominant_palette_preservation_failed"
 
 
-def test_skill_requires_area_weighted_global_palette_preservation():
+def test_skill_requires_backend_pixel_authoritative_global_palette_contract():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
     human = Path(
         "docs/human/features/conversation-task/behaviors/postprocess.md"
@@ -2397,3 +2399,5 @@ def test_skill_requires_area_weighted_global_palette_preservation():
         assert "saturation_style" in text
         assert "局部固有色" in text
         assert "不得翻转整帧冷暖感知" in text
+        assert "后端从冻结 source 像素计算并覆盖" in text
+        assert "模型不得自报或决定精确 Lab 合同" in text
