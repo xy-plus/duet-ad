@@ -809,6 +809,11 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
             return replace(
                 h3_project.apply_bound_context_ir(context, context_ir_binding),
                 gateway_storage_root=settings.h3_gateway_storage_root,
+                speaker_timing_authority_root=(
+                    plan.root
+                    if source_request.speaker_timing_authority_version == 1
+                    else None
+                ),
             )
         except (h3.H3Error, h3_project.ProjectMultimodalError) as exc:
             raise LongGenerationError(

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -822,8 +822,19 @@ def revalidate_production_authority(
     expected_production_sha256: str | None,
 ) -> None:
     """Reload sampled speaker evidence immediately before an H3 boundary."""
-    if not request.on_screen_dialogue or expected_production_sha256 is None:
+    if not request.on_screen_dialogue:
         return
+    if request.speaker_timing_authority_version == 0:
+        if expected_production_sha256 is not None:
+            _fail("speaker_timing_production_authority_invalid")
+        return
+    if (
+        request.speaker_timing_authority_version != 1
+        or expected_production_sha256 is None
+        or request.speaker_timing_production_sha256
+        != expected_production_sha256
+    ):
+        _fail("speaker_timing_production_authority_invalid")
     frozen = freeze_optional(root, workdir)
     if (
         frozen is None
@@ -891,6 +902,115 @@ def build_request(
         seed=seed,
         request_factory=request_factory,
     )
+
+
+def _speaker_timing_request_authority(
+    multimodal: FrozenProjectMultimodal,
+) -> dict[str, Any]:
+    if multimodal.speaker_timing_production_path is None:
+        return {
+            "speaker_timing_authority_version": 0,
+            "speaker_timing_production_required": False,
+            "speaker_timing_production_path": None,
+            "speaker_timing_production_sha256": None,
+            "speaker_timing_authority_artifacts": (),
+            "speaker_timing_authority_root": None,
+        }
+    receipt = multimodal.speaker_timing_production
+    receipt_data = multimodal.speaker_timing_production_data
+    if not isinstance(receipt, Mapping) or not isinstance(receipt_data, bytes):
+        _fail("speaker_timing_production_authority_invalid")
+    artifacts = receipt.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        _fail("speaker_timing_production_authority_invalid")
+    root = multimodal.root
+    work = multimodal.speaker_timing_production_path.parent
+    frozen: dict[str, str] = {
+        _relative(root, multimodal.speaker_timing_production_path): _sha256(
+            receipt_data
+        ),
+    }
+    role_paths: dict[str, Path] = {}
+    for role in ("producer_input", "raw_output", "skill", "speaker_timing"):
+        artifact = artifacts.get(role)
+        if not isinstance(artifact, Mapping):
+            _fail("speaker_timing_production_authority_invalid")
+        path = _relative_file(
+            root, work, artifact.get("path"),
+            "speaker_timing_production_authority_invalid",
+        )
+        data = _read(path, "speaker_timing_production_authority_invalid")
+        digest = artifact.get("sha256")
+        if digest != _sha256(data):
+            _fail("speaker_timing_production_authority_invalid")
+        relative = _relative(root, path)
+        if relative in frozen and frozen[relative] != digest:
+            _fail("speaker_timing_production_authority_invalid")
+        frozen[relative] = str(digest)
+        role_paths[role] = path
+    producer_input = _json_object(
+        _read(
+            role_paths["producer_input"],
+            "speaker_timing_production_authority_invalid",
+        ),
+        "speaker_timing_production_authority_invalid",
+    )
+    source = producer_input.get("source")
+    source_path = (role_paths["producer_input"].parent.parent / "source.mp4").resolve()
+    try:
+        source_path.relative_to(root)
+    except ValueError:
+        _fail("speaker_timing_production_authority_invalid")
+    source_data = _read(source_path, "speaker_timing_production_authority_invalid")
+    source_digest = source.get("sha256") if isinstance(source, Mapping) else None
+    if source_digest != _sha256(source_data):
+        _fail("speaker_timing_production_authority_invalid")
+    frozen[_relative(root, source_path)] = str(source_digest)
+    evidence: list[object] = []
+    for key in ("frames", "contact_sheets"):
+        values = producer_input.get(key)
+        if not isinstance(values, list):
+            _fail("speaker_timing_production_authority_invalid")
+        evidence.extend(values)
+    persons = producer_input.get("persons")
+    if not isinstance(persons, list):
+        _fail("speaker_timing_production_authority_invalid")
+    for person in persons:
+        refs = person.get("identity_refs") if isinstance(person, Mapping) else None
+        if not isinstance(refs, list):
+            _fail("speaker_timing_production_authority_invalid")
+        evidence.extend(refs)
+    cut_source = producer_input.get("cut_source")
+    if not isinstance(cut_source, Mapping):
+        _fail("speaker_timing_production_authority_invalid")
+    evidence.append(cut_source)
+    for artifact in evidence:
+        if not isinstance(artifact, Mapping):
+            _fail("speaker_timing_production_authority_invalid")
+        path = _relative_file(
+            root, role_paths["producer_input"].parent,
+            artifact.get("path"),
+            "speaker_timing_production_authority_invalid",
+        )
+        data = _read(path, "speaker_timing_production_authority_invalid")
+        digest = artifact.get("sha256")
+        if digest != _sha256(data):
+            _fail("speaker_timing_production_authority_invalid")
+        relative = _relative(root, path)
+        if relative in frozen and frozen[relative] != digest:
+            _fail("speaker_timing_production_authority_invalid")
+        frozen[relative] = str(digest)
+    production_relative = _relative(
+        root, multimodal.speaker_timing_production_path
+    )
+    return {
+        "speaker_timing_authority_version": 1,
+        "speaker_timing_production_required": True,
+        "speaker_timing_production_path": production_relative,
+        "speaker_timing_production_sha256": frozen[production_relative],
+        "speaker_timing_authority_artifacts": tuple(sorted(frozen.items())),
+        "speaker_timing_authority_root": None,
+    }
 
 
 def build_request_from_parts(
@@ -988,6 +1108,8 @@ def build_request_from_parts(
             timeouts=timeouts,
             seed=seed,
         )
+    except h3.H3Error:
+        _fail("context_ir_request_authority_mismatch")
     except h3_multimodal.MultimodalContractError as exc:
         raise ProjectMultimodalError(exc.code) from None
     if not isinstance(request, h3.H3Request) or not h3.is_multimodal_request(request):
@@ -1009,6 +1131,14 @@ def build_request_from_parts(
         raise ProjectMultimodalError(
             getattr(exc, "code", "context_ir_request_authority_mismatch")
         ) from None
+    if request.on_screen_dialogue:
+        try:
+            request = replace(
+                request, **_speaker_timing_request_authority(multimodal)
+            )
+            h3.validate_request_authority(request)
+        except h3.H3Error as exc:
+            raise ProjectMultimodalError(exc.code) from None
     return request
 
 

@@ -778,7 +778,9 @@ def test_v2_on_screen_project_requires_timing_refresh(tmp_path):
         )
 
 
-def test_speaker_visibility_raw_output_drift_is_rejected_before_h3(tmp_path):
+def test_speaker_visibility_raw_output_drift_is_rejected_before_h3(
+    tmp_path, monkeypatch,
+):
     root = tmp_path / "producer-drift"
     work = root / "work"
     source = root / "source.mp4"
@@ -946,10 +948,82 @@ def test_speaker_visibility_raw_output_drift_is_rejected_before_h3(tmp_path):
         speaker_timing_sha256=dialogue_timing.canonical_sha256(
             frozen_production.speaker_timing
         ),
+        speaker_timing_authority_version=1,
+        speaker_timing_production_sha256=hashlib.sha256(
+            frozen_production.speaker_timing_production_data
+        ).hexdigest(),
     )
     expected_production_sha256 = hashlib.sha256(
         frozen_production.speaker_timing_production_data
     ).hexdigest()
+    built = h3_project.build_request_from_parts(
+        multimodal=frozen_production,
+        visual_prompt=visual.read_text(encoding="utf-8"),
+        keyframes=h3.freeze_keyframes((key,)),
+        upstream_dialogue=dialogue,
+        upstream_dialogue_receipt_sha256=h3.canonical_json_sha256(
+            list(dialogue)
+        ),
+        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        source_duration_s=4.0,
+        cid="producer-backed-short",
+        workdir=work / "h3-native",
+        client_request_id="producer-backed-short",
+        duration=4,
+        resolution="768p",
+        aspect_ratio="9:16",
+        autodl_token="not-sent",
+    )
+    assert built.speaker_timing_authority_version == 1
+    assert built.speaker_timing_production_required is True
+    assert built.speaker_timing_production_sha256 == expected_production_sha256
+    assert built.speaker_timing_authority_root is None
+    h3._require_speaker_timing_production_authority(replace(
+        built, speaker_timing_authority_root=root.resolve()
+    ))
+
+    settings = make_settings(tmp_path, autodl_art_token="not-sent")
+    plan = SimpleNamespace(
+        root=root.resolve(),
+        receipt="a" * 64,
+        receipt_version=long_video.PLAN_RECEIPT_VERSION,
+        workflow=h3.H3_MULTIMODAL_WORKFLOW,
+        resolution="768p",
+        aspect_ratio="9:16",
+    )
+    segment = SimpleNamespace(
+        index=1,
+        start_s=0.0,
+        end_s=4.0,
+        workdir=root.resolve(),
+        multimodal=frozen_production,
+        keyframes=h3.freeze_keyframes((key,)),
+        dialogue=dialogue,
+        dialogue_sha256=h3.canonical_json_sha256(list(dialogue)),
+    )
+    monkeypatch.setattr(
+        long_generation, "_freeze_segment_context_ir",
+        lambda _settings, _plan, _segment, source_request: source_request,
+    )
+    monkeypatch.setattr(
+        h3_project, "apply_bound_context_ir",
+        lambda source_request, _binding: source_request,
+    )
+    long_request = long_generation._request(
+        settings,
+        "producer-backed-long",
+        plan,
+        segment,
+        "producer-backed-long-parent",
+        "none",
+        context_ir_binding={"status": "succeeded"},
+    )
+    assert long_request.speaker_timing_authority_version == 1
+    assert long_request.speaker_timing_production_required is True
+    assert long_request.speaker_timing_authority_root == root.resolve()
+    assert long_request.gateway_storage_root == settings.h3_gateway_storage_root
+    h3._require_speaker_timing_production_authority(long_request)
+
     producer_output.write_text("{}", encoding="utf-8")
     with pytest.raises(
         h3_project.ProjectMultimodalError,
@@ -978,6 +1052,7 @@ def test_short_context_completion_revalidates_producer_before_first_h3_post(
     request = SimpleNamespace(
         client_request_id="short-producer-toctou",
         on_screen_dialogue=({"subject_id": "S1"},),
+        speaker_timing_authority_version=1,
     )
     storage.update_meta(
         settings.data_dir, cid,
@@ -1010,6 +1085,7 @@ def test_short_context_completion_revalidates_producer_before_first_h3_post(
         h3_project, "apply_bound_context_ir",
         lambda _context, _binding: request,
     )
+    monkeypatch.setattr(main_module, "replace", lambda value, **_changes: value)
     checks = []
 
     def reject_drift(*_args, **_kwargs):
@@ -1981,9 +2057,10 @@ def test_submission_unknown_has_zero_stitch_and_zero_followup_post(tmp_path, mon
         optimized = context_ir_bridge.optimize_h3_prompt(
             context, client=context_client
         )
-    request = context_ir_bridge.apply_effective_prompt(
-        context, optimized.receipt_path
-    )
+        request = context_ir_bridge.apply_effective_prompt(
+            context, optimized.receipt_path
+        )
+        request = replace(request, gateway_storage_root=root.resolve())
     context_receipt = Path(str(request.context_ir_receipt_path))
     context_receipt_bytes = context_receipt.read_bytes()
     context_receipt.write_text("{}", encoding="utf-8")

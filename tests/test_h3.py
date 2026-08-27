@@ -1538,6 +1538,177 @@ def _controlled_multimodal_request(
     )
 
 
+def _producer_authority_request(tmp_path: Path) -> tuple[h3.H3Request, Path]:
+    root = tmp_path / "speaker-authority"
+    work = root / "work"
+    source = root / "source.mp4"
+    sample = work / "speaker-visibility-frames" / "000001.png"
+    sheet = work / "speaker-visibility-contact-sheets" / "000001.png"
+    identity = work / "keyframes" / "speaker-visibility-identities" / "PERSON_01.png"
+    scenes = work / "scenes.json"
+    timing = work / "speaker_timing.json"
+    raw_output = work / "speaker_visibility_output.json"
+    skill = work / "speaker_visibility_skill.md"
+    for path, data in (
+        (sample, b"sample-a"), (sheet, b"sheet-a"),
+        (identity, b"identity-a"), (scenes, b"scenes-a"),
+        (timing, b"timing-a"), (raw_output, b"raw-a"),
+        (skill, b"skill-a"), (source, b"source-a"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+    def sha(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    producer_input = work / "speaker_visibility_input.json"
+    producer_input.write_text(json.dumps({
+        "source": {"sha256": sha(source)},
+        "frames": [{"path": sample.relative_to(work).as_posix(), "sha256": sha(sample)}],
+        "contact_sheets": [{"path": sheet.relative_to(work).as_posix(), "sha256": sha(sheet)}],
+        "persons": [{"identity_refs": [{
+            "path": identity.relative_to(work).as_posix(), "sha256": sha(identity),
+        }]}],
+        "cut_source": {"path": scenes.name, "sha256": sha(scenes)},
+    }), encoding="utf-8")
+    production = work / "speaker_timing_production.json"
+    production.write_text(json.dumps({
+        "schema": "duet.speaker-timing-production",
+        "version": 1,
+        "artifacts": {
+            "producer_input": {"path": producer_input.name, "sha256": sha(producer_input)},
+            "raw_output": {"path": raw_output.name, "sha256": sha(raw_output)},
+            "skill": {"path": skill.name, "sha256": sha(skill)},
+            "speaker_timing": {
+                "path": timing.name, "sha256": sha(timing),
+                "canonical_sha256": "8" * 64,
+            },
+        },
+    }), encoding="utf-8")
+    artifacts = tuple(sorted(
+        (
+            path.resolve().relative_to(root.resolve()).as_posix(),
+            sha(path),
+        )
+        for path in (
+            production, producer_input, raw_output, skill, timing,
+            sample, sheet, identity, scenes, source,
+        )
+    ))
+    base = _controlled_multimodal_request(tmp_path, tmp_path / "controlled")
+    dialogue = ({
+        "order": 1, "line_index": 1, "subject_id": "S1",
+        "text": "现在出发。", "start_s": 0.5, "end_s": 1.5,
+    },)
+    return replace(
+        base,
+        speaker_timing_sha256="8" * 64,
+        on_screen_dialogue=dialogue,
+        on_screen_dialogue_sha256=h3.canonical_json_sha256(list(dialogue)),
+        speaker_timing_authority_version=1,
+        speaker_timing_production_required=True,
+        speaker_timing_production_path=(
+            production.resolve().relative_to(root.resolve()).as_posix()
+        ),
+        speaker_timing_production_sha256=sha(production),
+        speaker_timing_authority_artifacts=artifacts,
+        speaker_timing_authority_root=root.resolve(),
+    ), sample
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["start", "prepare", "submit", "inspect", "resume", "output_is_reusable"],
+)
+def test_every_public_h3_boundary_reloads_producer_authority_before_state_or_post(
+    tmp_path, monkeypatch, boundary,
+):
+    request, sample = _producer_authority_request(tmp_path)
+    monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
+    posts = []
+
+    def transport(http_request):
+        posts.append(http_request)
+        return httpx.Response(500)
+
+    sample.write_bytes(b"sample-b")
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(
+            h3.ReceiptError, match="speaker_timing_production_authority"
+        ):
+            if boundary in {"start", "submit", "resume"}:
+                getattr(h3, boundary)(request, client=client)
+            else:
+                getattr(h3, boundary)(request)
+    assert posts == []
+    assert not request.workdir.joinpath(".h3").exists()
+
+
+def test_on_screen_authority_requires_explicit_producer_or_legacy_version(tmp_path):
+    request, _sample = _producer_authority_request(tmp_path)
+    with pytest.raises(h3.H3Error, match="speaker_timing_authority_required"):
+        replace(
+            request,
+            speaker_timing_authority_version=None,
+            speaker_timing_production_required=False,
+            speaker_timing_production_path=None,
+            speaker_timing_production_sha256=None,
+            speaker_timing_authority_artifacts=(),
+            speaker_timing_authority_root=None,
+        )
+    legacy = replace(
+        request,
+        speaker_timing_authority_version=0,
+        speaker_timing_production_required=False,
+        speaker_timing_production_path=None,
+        speaker_timing_production_sha256=None,
+        speaker_timing_authority_artifacts=(),
+        speaker_timing_authority_root=None,
+    )
+    assert legacy.speaker_timing_authority_version == 0
+
+
+def test_speaker_authority_root_is_operational_not_source_request_semantics(tmp_path):
+    effective, _sample = _producer_authority_request(tmp_path)
+    source = replace(effective, speaker_timing_authority_root=None)
+    source_receipt = h3._context_ir_source_request_receipt(
+        source,
+        source_prompt_sha256=hashlib.sha256(
+            source.prompt.encode("utf-8")
+        ).hexdigest(),
+        references_sha256=h3._context_ir_reference_receipt(source),
+    )
+    effective_receipt = h3._context_ir_source_request_receipt(
+        effective,
+        source_prompt_sha256=hashlib.sha256(
+            effective.prompt.encode("utf-8")
+        ).hexdigest(),
+        references_sha256=h3._context_ir_reference_receipt(effective),
+    )
+
+    assert effective_receipt == source_receipt
+    authority = h3.speaker_timing_authority_manifest(source)
+    assert authority["version"] == 1
+    assert authority["required"] is True
+    assert authority["production_path"] == source.speaker_timing_production_path
+    assert "root" not in authority
+    legacy = replace(
+        source,
+        speaker_timing_authority_version=0,
+        speaker_timing_production_required=False,
+        speaker_timing_production_path=None,
+        speaker_timing_production_sha256=None,
+        speaker_timing_authority_artifacts=(),
+    )
+    assert source_receipt != h3._context_ir_source_request_receipt(
+        legacy,
+        source_prompt_sha256=hashlib.sha256(
+            legacy.prompt.encode("utf-8")
+        ).hexdigest(),
+        references_sha256=h3._context_ir_reference_receipt(legacy),
+    )
+
+
 def test_controlled_gateway_projection_is_receipt_bound_and_idempotent(
     tmp_path, monkeypatch,
 ):

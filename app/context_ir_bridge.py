@@ -417,6 +417,15 @@ def _h3_request_manifest(
         "skill_plan_sha256": request.skill_plan_sha256,
         "multimodal_compiler_version": request.multimodal_compiler_version,
         "speaker_timing_sha256": request.speaker_timing_sha256,
+        **(
+            {
+                "speaker_timing_authority": (
+                    h3.speaker_timing_authority_manifest(request)
+                )
+            }
+            if request.speaker_timing_authority_version == 1
+            else {}
+        ),
         "on_screen_dialogue_sha256": request.on_screen_dialogue_sha256,
         "audio_required": request.audio_required,
         "reference_audio_metadata": [

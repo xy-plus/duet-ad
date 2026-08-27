@@ -588,6 +588,7 @@ def build_h3_request(
             )
             else None
         ),
+        speaker_timing_authority_version=(0 if on_screen_dialogue else None),
         on_screen_dialogue=on_screen_dialogue,
         on_screen_dialogue_sha256=(
             h3.canonical_json_sha256(list(on_screen_dialogue))

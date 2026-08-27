@@ -1330,6 +1330,13 @@ def _run_generation(
                 )
                 if action == "resume":
                     h3_action = "start"
+            if request.speaker_timing_authority_version == 1:
+                request = replace(
+                    request,
+                    speaker_timing_authority_root=(
+                        settings.data_dir / cid
+                    ).resolve(),
+                )
             h3_project.revalidate_production_authority(
                 (settings.data_dir / cid).resolve(),
                 (settings.data_dir / cid / "work").resolve(),
