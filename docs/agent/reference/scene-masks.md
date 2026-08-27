@@ -38,3 +38,26 @@ treat this schema/purpose as a person-protection mask.
 
 Worker bodies and exception text are never copied into receipt or public
 errors. Only stable `SceneMaskError.code` values cross the boundary.
+
+## Consumer loader
+
+Quality consumers must use the authoritative public loader instead of
+reimplementing path or receipt checks:
+
+```python
+load_validated_scene_mask(
+    project_root,
+    item,
+    *,
+    expected_plan_sha256,
+    expected_source_sha256,
+) -> ValidatedSceneMask
+```
+
+`item` may be a worker mapping or canonical `SceneMaskItem`. The two expected
+hashes must come from the consumer's frozen manifest, never from the item being
+checked. The loader repeats containment/nofollow, PNG bytes/hash/size/dimensions,
+nonempty/non-whole-frame, v1 producer semantics, output binding, and outer
+component/shot/frame binding. It returns a frozen canonical item with a deeply
+immutable receipt plus a row-major, little-bit-order packed boolean mask,
+`pixel_count`, and `active_pixels`.

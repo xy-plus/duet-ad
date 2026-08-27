@@ -1,7 +1,7 @@
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import cv2
@@ -358,6 +358,159 @@ def test_success_validates_complete_per_frame_masks_and_producer_receipts(tmp_pa
         raise AssertionError("validated local result should be reusable")
 
     assert _advance(tmp_path, receipt, plan, no_network) == result
+
+
+def test_public_consumer_loader_returns_canonical_item_and_immutable_packed_mask(
+    tmp_path,
+):
+    plan = _plan()
+    payload = scene_masks.request_payload(plan)
+    raw = _all_mask_items(tmp_path, plan, payload)[0]
+
+    loaded = scene_masks.load_validated_scene_mask(
+        tmp_path,
+        raw,
+        expected_plan_sha256=plan.plan_sha256,
+        expected_source_sha256=plan.frames[0].sha256,
+    )
+
+    assert isinstance(loaded, scene_masks.ValidatedSceneMask)
+    assert loaded.item == scene_masks.SceneMaskItem(
+        purpose="scene_component",
+        channel="grayscale_alpha",
+        component_id="wall",
+        shot_id="shot-a",
+        frame_id="f1",
+        path=raw["path"],
+        sha256=raw["sha256"],
+        byte_size=raw["byte_size"],
+        width=4,
+        height=3,
+        producer_receipt=raw["producer_receipt"],
+    )
+    assert loaded.pixel_count == 12
+    assert loaded.active_pixels == 1
+    unpacked = np.unpackbits(
+        np.frombuffer(loaded.packed_mask, dtype=np.uint8),
+        bitorder="little",
+        count=loaded.pixel_count,
+    )
+    assert unpacked.tolist() == [1] + [0] * 11
+    with pytest.raises(FrozenInstanceError):
+        loaded.active_pixels = 2
+    with pytest.raises(TypeError):
+        loaded.item.producer_receipt["output"]["sha256"] = "0" * 64
+    assert scene_masks.load_validated_scene_mask(
+        tmp_path,
+        loaded.item,
+        expected_plan_sha256=plan.plan_sha256,
+        expected_source_sha256=plan.frames[0].sha256,
+    ) == loaded
+
+
+@pytest.mark.parametrize("expected_field", ["plan", "source"])
+def test_public_consumer_loader_rejects_wrong_expected_provenance(
+    tmp_path, expected_field
+):
+    plan = _plan()
+    raw = _all_mask_items(tmp_path, plan, scene_masks.request_payload(plan))[0]
+    expected_plan = plan.plan_sha256
+    expected_source = plan.frames[0].sha256
+    if expected_field == "plan":
+        expected_plan = "0" * 64
+    else:
+        expected_source = "0" * 64
+
+    with pytest.raises(scene_masks.SceneMaskError) as caught:
+        scene_masks.load_validated_scene_mask(
+            tmp_path,
+            raw,
+            expected_plan_sha256=expected_plan,
+            expected_source_sha256=expected_source,
+        )
+    assert caught.value.code == "worker_output_invalid"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("component_id", "floor"), ("shot_id", "shot-b"), ("frame_id", "f2")],
+)
+def test_public_consumer_loader_binds_outer_component_shot_and_frame_to_receipt(
+    tmp_path, field, value
+):
+    plan = _plan()
+    raw = _all_mask_items(tmp_path, plan, scene_masks.request_payload(plan))[0]
+    raw[field] = value
+
+    with pytest.raises(scene_masks.SceneMaskError) as caught:
+        scene_masks.load_validated_scene_mask(
+            tmp_path,
+            raw,
+            expected_plan_sha256=plan.plan_sha256,
+            expected_source_sha256=plan.frames[0].sha256,
+        )
+    assert caught.value.code == "worker_output_invalid"
+
+
+def test_public_consumer_loader_reuses_nofollow_png_and_output_receipt_guards(tmp_path):
+    plan = _plan()
+    payload = scene_masks.request_payload(plan)
+    attacks = []
+
+    tampered = _all_mask_items(tmp_path, plan, payload)[0]
+    tampered["producer_receipt"]["output"]["byte_size"] += 1
+    attacks.append(tampered)
+
+    whole = _mask_item(
+        tmp_path,
+        plan,
+        payload,
+        component_id="wall",
+        shot_id="shot-a",
+        frame_id="f1",
+        fill="whole",
+    )
+    whole_path = tmp_path / "work/scene-masks/wall/f1-whole.png"
+    _write_mask(whole_path, fill="whole")
+    whole_bytes = whole_path.read_bytes()
+    whole.update(
+        path="work/scene-masks/wall/f1-whole.png",
+        sha256=hashlib.sha256(whole_bytes).hexdigest(),
+        byte_size=len(whole_bytes),
+    )
+    whole["producer_receipt"]["output"] = {
+        key: whole[key]
+        for key in ("path", "sha256", "byte_size", "width", "height")
+    }
+    attacks.append(whole)
+
+    outside = tmp_path.parent / f"consumer-outside-{tmp_path.name}.png"
+    _write_mask(outside)
+    symlinked = _all_mask_items(tmp_path, plan, payload)[0]
+    link = tmp_path / "work/scene-masks/wall/consumer-link.png"
+    link.symlink_to(outside)
+    external = outside.read_bytes()
+    symlinked["path"] = "work/scene-masks/wall/consumer-link.png"
+    symlinked["sha256"] = hashlib.sha256(external).hexdigest()
+    symlinked["byte_size"] = len(external)
+    symlinked["producer_receipt"]["output"] = {
+        key: symlinked[key]
+        for key in ("path", "sha256", "byte_size", "width", "height")
+    }
+    attacks.append(symlinked)
+
+    try:
+        for raw in attacks:
+            with pytest.raises(scene_masks.SceneMaskError) as caught:
+                scene_masks.load_validated_scene_mask(
+                    tmp_path,
+                    raw,
+                    expected_plan_sha256=plan.plan_sha256,
+                    expected_source_sha256=plan.frames[0].sha256,
+                )
+            assert caught.value.code == "worker_output_invalid"
+    finally:
+        outside.unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize("fill", ["empty", "whole"])
