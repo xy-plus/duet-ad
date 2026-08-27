@@ -2721,7 +2721,7 @@ def create_app(settings: Settings) -> FastAPI:
                         previous_id == request_id
                         and generation.get("error") == "source_prompt_too_long"
                         and generation.get("stage") == "context_ir_native"
-                        and generation.get("h3_attempt_id") is None
+                        and isinstance(generation.get("h3_attempt_id"), str)
                         and generation.get("audio_route") == h3_project.AUDIO_ROUTE
                         and _short_generation_parameters_match(
                             meta,
@@ -2749,7 +2749,8 @@ def create_app(settings: Settings) -> FastAPI:
                         else:
                             exact_paid_resume = (
                                 inspected.status == "h3_running"
-                                and isinstance(inspected.attempt_id, str)
+                                and inspected.attempt_id
+                                == generation.get("h3_attempt_id")
                             )
                     if exact_paid_resume:
                         updated = {
