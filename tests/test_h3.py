@@ -1642,3 +1642,35 @@ def test_exact_legacy_storage_rejection_appends_same_client_attempt(
             legacy_evidence_sha256=evidence_sha,
             client=httpx.Client(transport=httpx.MockTransport(gateway)),
         )
+
+
+def test_timeout_get_only_resume_is_bound_to_latest_running_task(
+    tmp_path, monkeypatch,
+):
+    request = _controlled_multimodal_request(tmp_path, tmp_path / "controlled")
+    monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
+    state = h3._new_state(request, "000002", request.client_request_id)
+    state.update({
+        "status": "retryable_failure",
+        "retryable": True,
+        "error": {"code": "h3_timeout"},
+        "h3": {
+            "status": "running",
+            "task_id": "exact-running-task",
+            "receipt": h3._h3_receipt(
+                request,
+                "exact-running-task",
+                workflow=h3.H3_MULTIMODAL_WORKFLOW,
+            ),
+        },
+    })
+    h3._attempt_path(request, "000002").parent.mkdir(parents=True, exist_ok=True)
+    h3._save_state(request, state)
+
+    assert h3.timeout_attempt_is_get_only_resumable(request, "000002") is True
+    assert h3.timeout_attempt_is_get_only_resumable(request, "000001") is False
+
+    newer = h3._new_state(request, "000003", request.client_request_id)
+    h3._attempt_path(request, "000003").parent.mkdir(parents=True, exist_ok=True)
+    h3._save_state(request, newer)
+    assert h3.timeout_attempt_is_get_only_resumable(request, "000002") is False

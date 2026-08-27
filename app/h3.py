@@ -813,6 +813,29 @@ def inspect(request: H3Request) -> H3Result:
     return _result(latest)
 
 
+def timeout_attempt_is_get_only_resumable(
+    request: H3Request, expected_attempt_id: str,
+) -> bool:
+    """Prove that the latest exact attempt still owns a running H3 task."""
+    _require_context_ir_receipt(request)
+    try:
+        state = _find_attempt(request, request.client_request_id)
+    except ReceiptError:
+        return False
+    h3_state = state.get("h3") if isinstance(state, Mapping) else None
+    return bool(
+        isinstance(expected_attempt_id, str)
+        and isinstance(state, Mapping)
+        and state.get("attempt_id") == expected_attempt_id
+        and state.get("status") == "retryable_failure"
+        and state.get("retryable") is True
+        and state.get("error") == {"code": "h3_timeout"}
+        and isinstance(h3_state, Mapping)
+        and h3_state.get("status") == "running"
+        and _task_id(h3_state.get("task_id"), required=False) is not None
+    )
+
+
 def _is_lower_sha256(value: object) -> bool:
     return (
         isinstance(value, str)
