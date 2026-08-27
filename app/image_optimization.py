@@ -2213,36 +2213,32 @@ def _canonical_project_output(
     return plan, compile_segment_prompts(plan, edit_mode)
 
 
-def generate_project_prompts(
-    runner,
-    segments: list[dict],
-    edit_mode: str,
-    *,
-    session_dir: Path,
-    expected_version: int = 4,
-) -> tuple[dict, dict]:
-    """Run the plan phase once, then compile immutable provider prompts."""
-    if edit_mode not in SEEDREAM_EDIT_MODES or expected_version not in {2, 3, 4}:
-        raise ValueError("unsupported image optimization edit mode")
+def _project_segment_inputs(
+    segments: list[dict], session_dir: Path, *, expected_version: int,
+) -> tuple[Path, list[int], list[tuple[dict, list[Path]]]]:
     try:
         session = Path(session_dir).resolve(strict=True)
-        skill = verification_skill_path()
     except OSError:
         raise ValueError("invalid image optimization input") from None
-    if not skill.is_file() or not isinstance(segments, list) or not segments:
+    if not isinstance(segments, list) or not segments:
         raise ValueError("invalid image optimization segments")
     indices = [item.get("index") for item in segments if isinstance(item, dict)]
-    if len(indices) != len(segments) or indices not in ([0], list(range(1, len(segments) + 1))):
+    if len(indices) != len(segments) or indices not in (
+        [0], list(range(1, len(segments) + 1))
+    ):
         raise ValueError("invalid image optimization segments")
     prepared = []
     for segment in segments:
         allowed = {"index", "chain_id", "join_mode", "keyframes_dir"}
-        if set(segment) != allowed and set(segment) != allowed | {"transition_skeleton"}:
+        if set(segment) != allowed and set(segment) != allowed | {
+            "transition_skeleton"
+        }:
             raise ValueError("invalid image optimization segments")
         if expected_version == 4 and "transition_skeleton" not in segment:
             raise ValueError("invalid image optimization segments")
         if (
-            not isinstance(segment["chain_id"], str) or not segment["chain_id"]
+            not isinstance(segment["chain_id"], str)
+            or not segment["chain_id"]
             or len(segment["chain_id"]) > 128
             or segment["join_mode"] not in {"hard_cut", "continue"}
         ):
@@ -2273,13 +2269,38 @@ def generate_project_prompts(
                 for position, (frame, item) in enumerate(zip(frames, skeleton), 1)
             ]
             if skeleton != expected or any(
-                item["source_transition_from_previous"] not in _SCENE_CONTINUITY_TRANSITIONS
-                or not isinstance(item["source_transition_evidence_sha256"], str)
-                or _SHA256_RE.fullmatch(item["source_transition_evidence_sha256"]) is None
+                item["source_transition_from_previous"]
+                not in _SCENE_CONTINUITY_TRANSITIONS
+                or not isinstance(
+                    item["source_transition_evidence_sha256"], str
+                )
+                or _SHA256_RE.fullmatch(
+                    item["source_transition_evidence_sha256"]
+                ) is None
                 for item in skeleton
             ):
                 raise ValueError("invalid image optimization segments")
         prepared.append((segment, frames))
+    return session, indices, prepared
+
+
+def generate_project_prompts(
+    runner,
+    segments: list[dict],
+    edit_mode: str,
+    *,
+    session_dir: Path,
+    expected_version: int = 4,
+) -> tuple[dict, dict]:
+    """Run the plan phase once, then compile immutable provider prompts."""
+    if edit_mode not in SEEDREAM_EDIT_MODES or expected_version not in {2, 3, 4}:
+        raise ValueError("unsupported image optimization edit mode")
+    session, indices, prepared = _project_segment_inputs(
+        segments, session_dir, expected_version=expected_version,
+    )
+    skill = verification_skill_path()
+    if not skill.is_file():
+        raise ValueError("invalid image optimization segments")
 
     with tempfile.TemporaryDirectory(prefix="duet-image-postprocess-", dir="/tmp") as raw:
         stage = Path(raw).resolve(strict=True)
@@ -2374,6 +2395,111 @@ def generate_project_prompts(
             if run_error is not None:
                 raise run_error from None
             raise
+
+
+def generic_project_prompts(
+    segments: list[dict], edit_mode: str, *, session_dir: Path,
+) -> tuple[dict, dict]:
+    """Compile the conservative backend fallback from frozen source facts only."""
+    if edit_mode not in SEEDREAM_EDIT_MODES:
+        raise ValueError("unsupported image optimization edit mode")
+    _session, indices, prepared = _project_segment_inputs(
+        segments, session_dir, expected_version=4,
+    )
+    reference = {"segment_index": indices[0], "frame_index": 1}
+    views = []
+    canonical_segments = []
+    for segment, frames in prepared:
+        constraints = []
+        for frame, transition in zip(frames, segment["transition_skeleton"]):
+            frame_index = transition["frame_index"]
+            constraints.append({
+                "frame_index": frame_index,
+                "visible_body_parts": (
+                    "保留源图中实际可见的全部身体区域；不得新增、补造或删除"
+                ),
+                "pose_skeleton": "保持源图姿态与骨架，不推断不可见结构",
+                "contact_points": "保持源图已有接触关系，不新增接触",
+                "occlusion_order": "保持源图可证的遮挡次序，不补造遮挡",
+                "out_of_frame_crop": "保持源图出画与裁切事实，不补全画外内容",
+                "non_person_entity_ledger": {"entities": [], "relations": []},
+                "dominant_palette_contract": {
+                    "area_weighted_warm_cool_family": "balanced",
+                    "saturation_style": "natural",
+                },
+            })
+            views.append({
+                "segment_index": segment["index"],
+                "frame_index": frame_index,
+                "transition_from_previous": transition[
+                    "source_transition_from_previous"
+                ],
+                "observations": [{
+                    "component_id": "COMPONENT_01", "visibility": "full",
+                }],
+                "view_relations": [],
+            })
+        canonical_segments.append({
+            "segment_index": segment["index"],
+            "persons": [],
+            "scene": {
+                "scene_id": "SCENE_01",
+                "target_region": "源图中可见环境的完整区域",
+                "boundary": "仅环境边界；保护全部非目标前景与已有关系",
+                "layout_reference_frame_index": 1,
+            },
+            "protected_non_target_people": [
+                "保留源图中实际存在的全部人物；不得新增、删除或替换"
+            ],
+            "protected_relations": [
+                "保留源图可证的全部空间、接触、遮挡与交互关系"
+            ],
+            "frame_constraints": constraints,
+            "photometric_contract": {
+                "light_direction": "保持源图光照方向",
+                "light_quality": "保持源图光线软硬",
+                "exposure_or_intensity": "保持源图曝光与强度",
+                "wb_cct": "保持源图白平衡与色温",
+                "global_contrast": "保持源图全局对比度",
+                "tone_curve": "保持源图整体明暗曲线",
+            },
+        })
+    value = {
+        "version": 4,
+        "phase": "plan",
+        "segment_indices": indices,
+        "eligible": True,
+        "reason": None,
+        "person_plans": [],
+        "scene_plans": [{
+            "id": "SCENE_01",
+            "source_scene": "源图原始环境",
+            "replacement_scene": "统一、真实且明显不同的新环境",
+            "semantic_change": "仅将环境替换为统一真实的新环境",
+            "geometry_changes": ["生成与新环境一致且物理可实现的结构"],
+            "depth_changes": ["生成与新环境一致且连贯的空间深度"],
+            "layout_changes": ["生成跨全部帧统一的新环境布局"],
+            "local_color_change": "仅环境表面使用新环境一致的自然颜色",
+            "reference": reference,
+            "segments": indices,
+            "continuity_graph": {
+                "components": [{
+                    "component_id": "COMPONENT_01",
+                    "target_spec": "跨全部帧统一的完整真实新环境",
+                }],
+                "topology": [],
+                "views": views,
+            },
+        }],
+        "segments": canonical_segments,
+    }
+    return _canonical_project_output(
+        value,
+        indices,
+        edit_mode,
+        {segment["index"]: len(frames) for segment, frames in prepared},
+        source_frames={segment["index"]: frames for segment, frames in prepared},
+    )
 
 
 def freeze_continuity(

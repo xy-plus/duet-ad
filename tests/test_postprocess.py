@@ -167,7 +167,7 @@ def test_v4_postprocess_never_calls_quality_pack_gate(
     monkeypatch.setattr(postprocess, "_v4_fan_out", fanout)
 
     asyncio.run(postprocess._run_v4_task(
-        settings, "cid", cdir, {}, private, {}, asyncio.Semaphore(1), object(), object(),
+        settings, "cid", cdir, {}, private, {}, asyncio.Semaphore(1),
     ))
     assert calls == ["global-anchor", "layout", "fanout"]
 
