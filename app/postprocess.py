@@ -2669,8 +2669,8 @@ _ACCEPTANCE_META_EXCLUDED = frozenset({
     "fit_mode",
     "dialogue_delivery",
     "resolved_dialogue_delivery",
-    "_multimodal_binding_producer",
     "_speaker_timing_producer",
+    "_prompt_fusion",
 })
 
 
@@ -2835,18 +2835,57 @@ def _v4_user_acceptance_receipt(settings: Settings, cid: str, meta: dict) -> dic
         raise PostprocessError(409, "postprocess_artifacts_invalid") from None
 
 
+def _v4_user_acceptance_matches(
+    settings: Settings, cid: str, meta: dict,
+) -> bool:
+    """Verify current v4 acceptance, including the exact frozen N=1 adapter."""
+    raw = meta.get(_IMAGE_ACCEPTANCE_KEY)
+    if not isinstance(raw, dict):
+        return False
+    try:
+        if raw == _v4_user_acceptance_receipt(settings, cid, meta):
+            return True
+    except PostprocessError:
+        pass
+    segments = meta.get("segments")
+    post = meta.get("postprocess")
+    private = meta.get("_postprocess_receipt")
+    frames = post.get("frames") if isinstance(post, dict) else None
+    private_frames = private.get("frames") if isinstance(private, dict) else None
+    if (
+        meta.get("long_video_plan_receipt") != "long_video_plan.json"
+        or not isinstance(segments, list)
+        or len(segments) != 1
+        or not isinstance(segments[0], dict)
+        or segments[0].get("index") != 1
+        or segments[0].get("start_s") != 0.0
+        or not isinstance(frames, list)
+        or not frames
+        or any(not isinstance(item, str) or "/" in item for item in frames)
+        or not isinstance(private_frames, list)
+        or not private_frames
+        or any(
+            not isinstance(item, dict) or item.get("segment_index") != 0
+            for item in private_frames
+        )
+    ):
+        return False
+    projected = dict(meta)
+    projected.pop("segments", None)
+    projected.pop("long_video_plan_receipt", None)
+    try:
+        return raw == _v4_user_acceptance_receipt(settings, cid, projected)
+    except PostprocessError:
+        return False
+
+
 def image_acceptance_status(
     settings: Settings, cid: str, meta: dict,
 ) -> dict:
     required = _image_acceptance_required(meta)
     expected = _image_acceptance_meta_sha256(meta) if required else None
     accepted = False
-    raw = meta.get(_IMAGE_ACCEPTANCE_KEY)
-    if isinstance(raw, dict):
-        try:
-            accepted = raw == _v4_user_acceptance_receipt(settings, cid, meta)
-        except PostprocessError:
-            accepted = False
+    accepted = _v4_user_acceptance_matches(settings, cid, meta)
     return {
         "required": required,
         "accepted": accepted,
@@ -3005,12 +3044,7 @@ def generation_keyframes(
         ):
             raise PostprocessError(409, "postprocess_artifacts_invalid") from None
     if expected_v4:
-        try:
-            if meta.get(_IMAGE_ACCEPTANCE_KEY) != _v4_user_acceptance_receipt(
-                settings, cdir.name, meta,
-            ):
-                raise ValueError
-        except (PostprocessError, TypeError, ValueError):
+        if not _v4_user_acceptance_matches(settings, cdir.name, meta):
             raise PostprocessError(409, "postprocess_artifacts_invalid") from None
     return selected
 

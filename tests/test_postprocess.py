@@ -16,7 +16,18 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import context_ir_bridge, h3, image_optimization, mediakit, postprocess, storage
+from app import (
+    context_ir_bridge,
+    h3,
+    image_optimization,
+    long_generation,
+    long_video,
+    mediakit,
+    pipeline,
+    postprocess,
+    prepared_input,
+    storage,
+)
 from app.codex_runner import CodexRunner
 from app.main import create_app
 
@@ -42,17 +53,26 @@ def enabled(tmp_path):
         yield settings, c
 
 
-def _make_conv(settings, status="done", segments=False, frame_count=2):
+def _make_conv(
+    settings, status="done", segments=False, frame_count=2,
+    segment_frame_count=None,
+):
     """造会话：单段 = work/keyframes + work/prompt.txt；多段 = meta.segments + 段目录产物。"""
     meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
     cid = meta["id"]
     cdir = settings.data_dir / cid
     if segments:
+        counts = (
+            (segment_frame_count, segment_frame_count)
+            if segment_frame_count is not None else (1, 2)
+        )
         segs = [
             {"index": 1, "start_s": 0.0, "end_s": 8.0,
-             "keyframes": ["01.png"], "prompt": "段一提示词", "lines": ["台词。"]},
+             "keyframes": [f"{i:02d}.png" for i in range(1, counts[0] + 1)],
+             "prompt": "段一提示词", "lines": ["台词。"]},
             {"index": 2, "start_s": 8.0, "end_s": 16.0,
-             "keyframes": ["01.png", "02.png"], "prompt": "段二提示词", "lines": []},
+             "keyframes": [f"{i:02d}.png" for i in range(1, counts[1] + 1)],
+             "prompt": "段二提示词", "lines": []},
         ]
         meta["segments"] = segs
         for seg in segs:
@@ -78,27 +98,60 @@ def _make_conv(settings, status="done", segments=False, frame_count=2):
     return cid
 
 
-def _completed_v4_project(settings, monkeypatch, *, frame_count=2):
+def _completed_v4_project(
+    settings, monkeypatch, *, frame_count=2, segments=False,
+):
     monkeypatch.setenv("ARK_API_KEY", "test-key")
-    cid = _make_conv(settings, frame_count=frame_count)
+    cid = _make_conv(
+        settings,
+        segments=segments,
+        frame_count=frame_count,
+        segment_frame_count=frame_count if segments else None,
+    )
     cdir = settings.data_dir / cid
-    frames = sorted((cdir / "work" / "keyframes").glob("*.png"))
-    skeleton = [{
-        "segment_index": 0,
-        "frame_index": index,
-        "frame_name": frame.name,
-        "source_sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
-        "source_transition_from_previous": "start" if index == 1 else "same_camera",
-        "source_transition_evidence_sha256": ("a" if index == 1 else "b") * 64,
-    } for index, frame in enumerate(frames, 1)]
+    grouped_frames = (
+        {
+            index: sorted(
+                (cdir / "work" / "segments" / str(index) / "work" / "keyframes").glob("*.png")
+            )
+            for index in (1, 2)
+        }
+        if segments else {
+            0: sorted((cdir / "work" / "keyframes").glob("*.png"))
+        }
+    )
+    frames = [frame for index in sorted(grouped_frames) for frame in grouped_frames[index]]
+    skeletons = {
+        segment_index: [{
+            "segment_index": segment_index,
+            "frame_index": index,
+            "frame_name": frame.name,
+            "source_sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
+            "source_transition_from_previous": (
+                "start"
+                if index == 1 and segment_index in {0, 1}
+                else "same_camera"
+            ),
+            "source_transition_evidence_sha256": (
+                (
+                    "a"
+                    if index == 1 and segment_index in {0, 1}
+                    else "b"
+                ) * 64
+            ),
+        } for index, frame in enumerate(segment_frames, 1)]
+        for segment_index, segment_frames in grouped_frames.items()
+    }
     plan, prompts = image_optimization.generic_project_prompts(
         [{
-            "index": 0,
-            "chain_id": "short-000",
-            "join_mode": "hard_cut",
-            "keyframes_dir": frames[0].parent,
-            "transition_skeleton": skeleton,
-        }],
+            "index": segment_index,
+            "chain_id": (
+                "short-000" if segment_index == 0 else "chain-001"
+            ),
+            "join_mode": "hard_cut" if segment_index in {0, 1} else "continue",
+            "keyframes_dir": segment_frames[0].parent,
+            "transition_skeleton": skeletons[segment_index],
+        } for segment_index, segment_frames in grouped_frames.items()],
         settings.seedream_edit_mode,
         session_dir=cdir,
     )
@@ -107,7 +160,11 @@ def _completed_v4_project(settings, monkeypatch, *, frame_count=2):
         revision=1,
         profile={"id": "dual-target", "revision": 4},
         model=settings.seedream_model,
-        frame_inventory=skeleton,
+        frame_inventory=[
+            item
+            for segment_index in sorted(skeletons)
+            for item in skeletons[segment_index]
+        ],
     )
     frozen = image_optimization.freeze_frame_prompts(
         settings, execution, prompts, plan=plan,
@@ -115,7 +172,13 @@ def _completed_v4_project(settings, monkeypatch, *, frame_count=2):
     storage.update_meta(
         settings.data_dir,
         cid,
-        **image_optimization.freeze_continuity(plan, frame_counts={0: len(frames)}),
+        **image_optimization.freeze_continuity(
+            plan,
+            frame_counts={
+                index: len(segment_frames)
+                for index, segment_frames in grouped_frames.items()
+            },
+        ),
         **frozen,
     )
 
@@ -173,8 +236,9 @@ def test_v4_manual_acceptance_receipt_enables_h3_without_image_verification(
     ) == sorted((cdir / "work" / "postprocessed").glob("*.png"))
 
 
-def test_short_off_screen_binding_bootstraps_then_enters_context_h3(
-    tmp_path, monkeypatch,
+@pytest.mark.parametrize("segment_count", [1, 2])
+def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
+    tmp_path, monkeypatch, segment_count,
 ):
     settings = make_settings(
         tmp_path,
@@ -184,12 +248,16 @@ def test_short_off_screen_binding_bootstraps_then_enters_context_h3(
         minimax_api_key="minimax",
         h3_poll_interval_s=0,
     )
-    cid, cdir, _originals = _completed_v4_project(
-        settings, monkeypatch, frame_count=9
+    cid, cdir, originals = _completed_v4_project(
+        settings,
+        monkeypatch,
+        frame_count=9,
+        segments=segment_count == 2,
     )
     (cdir / "source.mp4").write_bytes(b"source-video")
+    old_visual_prompt = "九张已验收图片中的人物保持静默，歌声来自画外。"
     (cdir / "work" / "visual_prompt.txt").write_text(
-        "九张已验收图片中的人物保持静默，歌声来自画外。", encoding="utf-8"
+        old_visual_prompt, encoding="utf-8"
     )
     subprocess.run(
         [
@@ -200,9 +268,7 @@ def test_short_off_screen_binding_bootstraps_then_enters_context_h3(
         ],
         check=True,
     )
-    storage.update_meta(
-        settings.data_dir,
-        cid,
+    common_changes = dict(
         duration_s=14.5,
         vocal_filter_enabled=True,
         voice_mode="keep",
@@ -223,6 +289,87 @@ def test_short_off_screen_binding_bootstraps_then_enters_context_h3(
             "kept": True,
         }],
     )
+    expected_receipt = None
+    if segment_count == 2:
+        public_segments = []
+        receipt_segments = []
+        for index in (1, 2):
+            start_s = 14.0 * (index - 1)
+            end_s = 14.0 * index
+            segdir = cdir / "work" / "segments" / str(index)
+            work = segdir / "work"
+            source = segdir / "source.mp4"
+            source.write_bytes(f"segment-{index}".encode())
+            visual_text = f"第{index}段九张优化图片视觉动作"
+            visual = work / "visual_prompt.txt"
+            visual.write_text(visual_text, encoding="utf-8")
+            dialogue = [{
+                "text": f"画外歌声{index}",
+                "start_s": 1.0,
+                "end_s": 2.0,
+                "classification": "sung",
+            }]
+            final_text = (
+                "不要生成背景音乐\n"
+                + prepared_input.compose_final_prompt(
+                    long_video.compose_segment_visual_prompt(visual_text),
+                    dialogue,
+                )
+            )
+            final = work / "prompt.txt"
+            final.write_text(final_text, encoding="utf-8")
+            (work / "voice.mp3").write_bytes(
+                (cdir / "work" / "voice.mp3").read_bytes()
+            )
+            segment_frames = sorted((work / "keyframes").glob("*.png"))
+            segment = {
+                "index": index,
+                "start_s": start_s,
+                "end_s": end_s,
+                "chain_id": "chain-001",
+                "join_mode": "hard_cut" if index == 1 else "continue",
+                "source": f"segments/{index}/source.mp4",
+                "keyframes": [path.name for path in segment_frames],
+                "keyframe_paths": [
+                    path.relative_to(cdir / "work").as_posix()
+                    for path in segment_frames
+                ],
+                "first_frame_path": segment_frames[0].relative_to(
+                    cdir / "work"
+                ).as_posix(),
+                "last_frame_path": segment_frames[-1].relative_to(
+                    cdir / "work"
+                ).as_posix(),
+                "visual_prompt": visual_text,
+                "prompt": final_text,
+                "dialogue": dialogue,
+                "lines": [dialogue[0]["text"]],
+            }
+            public_segments.append(segment)
+            receipt_segments.append({
+                **segment,
+                "source_path": source,
+                "keyframe_paths": segment_frames,
+                "first_frame_path": segment_frames[0],
+                "last_frame_path": segment_frames[-1],
+                "visual_prompt_path": visual,
+                "final_prompt_path": final,
+            })
+        receipt_path = long_video.write_plan_receipt(
+            cdir,
+            source=cdir / "source.mp4",
+            duration_s=28.0,
+            segments=receipt_segments,
+            workflow=h3.H3_WORKFLOW,
+        )
+        expected_receipt = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+        common_changes.update(
+            duration_s=28.0,
+            segments=public_segments,
+            long_video_plan_receipt=receipt_path.name,
+            voice_line_provenance=[],
+        )
+    storage.update_meta(settings.data_dir, cid, **common_changes)
     current = storage.load_meta(settings.data_dir, cid)
     acceptance = postprocess.image_acceptance_status(settings, cid, current)
     postprocess.accept_images(settings, cid, {
@@ -230,33 +377,30 @@ def test_short_off_screen_binding_bootstraps_then_enters_context_h3(
         "expected_meta_sha256": acceptance["expected_meta_sha256"],
     })
 
+    skill_file = tmp_path / "video-prompt-fusion-SKILL.md"
+    skill_file.write_text("strict video prompt fusion", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "PROMPT_FUSION_SKILL_MD", skill_file)
+    monkeypatch.setattr(
+        long_generation, "PROMPT_FUSION_SKILL_SOURCE", skill_file
+    )
+    fusion_calls = []
+
     def skill(self, scope, _prompt):
-        input_payload = json.loads(
-            (scope / "work" / "multimodal_input.json").read_text(
-                encoding="utf-8"
-            )
-        )
+        fusion_calls.append(scope)
+        input_data = (scope / "work" / "multimodal_input.json").read_bytes()
+        input_payload = json.loads(input_data.decode("utf-8"))
         plan = {
-            "version": 2,
-            "phase": "multimodal_audio",
-            "eligible": True,
-            "reason": None,
-            "visual_prompt": (
-                scope / "work" / input_payload["visual_prompt"]["path"]
-            ).read_text(encoding="utf-8"),
-            "dialogue_source_sha256": input_payload["dialogue_source_sha256"],
-            "subjects": [],
-            "audio_refs": [{
-                "audio_index": 1, "purpose": "voice", "subject_id": None,
-            }],
-            "speech_bindings": [{
-                "line_index": 1,
-                "delivery": "off_screen_voiceover",
-                "subject_id": None,
-                "language": "Arabic",
-                "voice_ref": 1,
-            }],
-            "sound_design": {"ambience_refs": [], "effects": []},
+            "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+            "version": long_generation.PROMPT_FUSION_VERSION,
+            "input_sha256": hashlib.sha256(input_data).hexdigest(),
+            "segments": [{
+                "index": segment["index"],
+                "final_prompt": (
+                    "只使用九张已验收优化图片中的人物、场景与对象。\n"
+                    f"<AUDIO_CONTENT_JSON>{segment['audio_content']['lines_json']}"
+                    "</AUDIO_CONTENT_JSON>"
+                ),
+            } for segment in input_payload["segments"]],
         }
         (scope / "work" / "h3_prompt_plan.json").write_text(
             json.dumps(plan, ensure_ascii=False), encoding="utf-8"
@@ -310,6 +454,11 @@ def test_short_off_screen_binding_bootstraps_then_enters_context_h3(
         "aspect_ratio": "9:16",
         "resolution": "768p",
     }
+    if expected_receipt is not None:
+        payload.update(
+            expected_plan_receipt=expected_receipt,
+            fast_mode=False,
+        )
     with TestClient(create_app(settings)) as client:
         missing_delivery = client.post(
             f"/api/conversations/{cid}/submit",
@@ -320,25 +469,49 @@ def test_short_off_screen_binding_bootstraps_then_enters_context_h3(
         assert missing_delivery.status_code == 409
         assert missing_delivery.json() == {"detail": "dialogue_delivery_required"}
         assert h3_requests == []
+        normalized = storage.load_meta(settings.data_dir, cid)
+        assert postprocess.image_acceptance_status(
+            settings, cid, normalized
+        )["accepted"] is True
+        assert postprocess.generation_keyframes(
+            cdir, normalized, originals, settings=settings,
+        ) == (
+            sorted((cdir / "work" / "postprocessed").glob("*.png"))
+            if segment_count == 1 else [
+                path
+                for index in (1, 2)
+                for path in sorted((
+                    cdir / "work" / "segments" / str(index)
+                    / "work" / "postprocessed"
+                ).glob("*.png"))
+            ]
+        )
         first = client.post(
             f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
         )
-        assert first.status_code == 409
-        assert first.json() == {"detail": "multimodal_input_refresh_required"}
+        assert first.status_code == 409, first.json()
+        assert first.json() == {"detail": "prompt_fusion_refresh_required"}
         assert h3_requests == []
         second = client.post(
             f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
         )
 
     assert second.status_code == 202, second.json()
+    assert fusion_calls == [cdir]
     assert len(h3_requests) == 1
     request = h3_requests[0]
     assert request.on_screen_dialogue == ()
     assert len(request.keyframes) == 9
     assert len(request.reference_audios) == 1
     assert request.reference_audios[0].data == (
-        cdir / "work" / "voice.mp3"
+        cdir / "work" / (
+            "voice.mp3" if segment_count == 1 else "segments/1/work/voice.mp3"
+        )
     ).read_bytes()
+    assert len(json.loads(
+        (cdir / "work" / "multimodal_input.json").read_text(encoding="utf-8")
+    )["segments"]) == segment_count
+    assert old_visual_prompt not in context_tasks.get("task", "")
 
 
 def test_v4_manual_acceptance_rejects_stale_cas_and_generation_start(
@@ -858,10 +1031,23 @@ def test_multi_segment_full_chain(enabled, monkeypatch):
     fake = FakeEdit()
     monkeypatch.setattr(postprocess.mediakit, "erase_image", fake)
 
-    r = _post(c, cid, OPTIONS_SUB)
+    r = _post(c, cid, {
+        "remove_subtitle": True,
+        "remove_brand": True,
+    })
     assert r.status_code == 200
 
-    assert sorted(call["image"] for call in fake.calls) == ["01.png", "01.png", "02.png"]
+    assert sorted(call["image"] for call in fake.calls) == [
+        "01.png", "01.png", "01.png", "01.png", "02.png", "02.png",
+    ]
+    assert [call["scenes"] for call in fake.calls] == [
+        (mediakit.TEXT_SCENE,),
+        (mediakit.TEXT_SCENE,),
+        (mediakit.TEXT_SCENE,),
+        (mediakit.ICON_SCENE,),
+        (mediakit.ICON_SCENE,),
+        (mediakit.ICON_SCENE,),
+    ]
     assert (cdir / "work" / "segments" / "1" / "work" / "postprocessed" / "01.png").is_file()
     assert (cdir / "work" / "segments" / "2" / "work" / "postprocessed" / "01.png").is_file()
     assert (cdir / "work" / "segments" / "2" / "work" / "postprocessed" / "02.png").is_file()

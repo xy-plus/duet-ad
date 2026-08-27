@@ -1551,58 +1551,6 @@ def test_long_v4_optimized_nine_frames_final_freeze_binds_settings(
     assert coordinator_calls == [(settings, cid, base_plan)]
 
 
-def test_long_on_screen_refresh_queues_project_speaker_producer(
-    enabled, monkeypatch,
-):
-    settings, client = enabled
-    cid, receipt = _make_long(settings)
-    calls = []
-
-    monkeypatch.setattr(
-        long_generation,
-        "finalize_multimodal_plan",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            long_generation.LongGenerationError(
-                "speaker_timing_refresh_required"
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "produce_speaker_timing",
-        lambda received_settings, received_cid, _runner: calls.append(
-            (received_settings, received_cid)
-        ) or "done",
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "queue_speaker_timing",
-        lambda received_settings, received_cid: (
-            storage.update_meta(
-                received_settings.data_dir,
-                received_cid,
-                _speaker_timing_producer={
-                    "status": "queued", "error": None, "jobs": [],
-                },
-            )
-            and "queued"
-        ),
-    )
-
-    response = client.post(
-        f"/api/conversations/{cid}/submit",
-        headers=AUTH,
-        json=_payload(receipt),
-    )
-
-    assert response.status_code == 409
-    assert response.json() == {"detail": "speaker_timing_refresh_required"}
-    assert calls == [(settings, cid)]
-    assert storage.load_meta(settings.data_dir, cid)[
-        "_speaker_timing_producer"
-    ]["status"] == "queued"
-
-
 def test_long_paid_boundary_revalidation_failure_makes_zero_h3_post(
     tmp_path, monkeypatch,
 ):

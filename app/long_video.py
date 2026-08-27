@@ -199,12 +199,19 @@ def plan_segments(
 ) -> list[dict]:
     """Plan provider-safe segments with hard cuts preferred over timed splits.
 
-    ``[]`` deliberately means the unchanged short-video path.  Every emitted
-    segment carries chain semantics so downstream code never has to infer it.
+    Current projects always return at least one segment.  A short video is the
+    one-element form of the same plan consumed by longer projects.
     """
     duration = _finite_duration(duration_s)
     if duration <= SHORT_VIDEO_MAX_S:
-        return []
+        _dialogue_intervals(dialogue, duration)
+        return [{
+            "index": 1,
+            "start_s": 0.0,
+            "end_s": round(duration, BOUNDARY_PRECISION),
+            "chain_id": "chain-001",
+            "join_mode": "hard_cut",
+        }]
     scene_bounds = _bounds(scenes, duration)
     dialogue_intervals = _dialogue_intervals(dialogue, duration)
     hard_cuts = {end for _start, end in scene_bounds[:-1]}
@@ -345,11 +352,12 @@ def write_plan_receipt(
     dialogue_mode: str = "auto",
     dialogue_delivery: str | None = None,
     resolved_dialogue_delivery: str | None = None,
+    prompt_fusion_manifest_path: Path | None = None,
 ) -> Path:
     """Write a canonical receipt binding the complete generated long-video plan."""
     root = root.resolve()
     duration = _finite_duration(duration_s)
-    if duration <= SHORT_VIDEO_MAX_S or not segments:
+    if not segments:
         raise LongVideoError("long_video_plan_requires_segments")
     if not isinstance(workflow, str) or not workflow.strip():
         raise LongVideoError("long_video_plan_invalid_workflow")
@@ -377,7 +385,10 @@ def write_plan_receipt(
             or abs(start_s - previous_end) > _EPS
             or frozen_duration < SEGMENT_MIN_S
             or provider_duration_s(start_s, end_s)
-            > SEGMENT_PROVIDER_MAX_DURATION_S
+            > (
+                LEGACY_PROVIDER_MAX_DURATION_S
+                if len(segments) == 1 else SEGMENT_PROVIDER_MAX_DURATION_S
+            )
             or not isinstance(chain_id, str)
             or not chain_id
             or join_mode not in {"hard_cut", "continue"}
@@ -462,6 +473,10 @@ def write_plan_receipt(
                 raise LongVideoError("long_video_plan_invalid_dialogue_delivery")
             receipt["dialogue_delivery"] = dialogue_delivery
             receipt["resolved_dialogue_delivery"] = resolved_dialogue_delivery
+        if prompt_fusion_manifest_path is not None:
+            receipt["prompt_fusion"] = _artifact(
+                root, prompt_fusion_manifest_path
+            )
     path = root / PLAN_RECEIPT_FILENAME
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_bytes(_canonical_bytes(receipt))

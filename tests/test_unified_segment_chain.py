@@ -1,0 +1,273 @@
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from app import long_generation, main, pipeline, storage
+from conftest import make_settings
+
+
+def _canonical(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _current_v4_meta(*, segments: list[dict] | None) -> dict:
+    meta = {
+        "schema_version": 2,
+        "duration_s": 14.5 if segments is None else 28.0,
+        "status": "done",
+        "_postprocess_receipt": {
+            "version": 4,
+            "options": {"optimize_image": True},
+        },
+        "_image_user_acceptance": {"version": 1, "sha256": "a" * 64},
+    }
+    if segments is not None:
+        meta["segments"] = segments
+        meta["long_video_plan_receipt"] = "long-video-plan.json"
+    return meta
+
+
+def test_current_v4_n1_and_n2_use_the_same_segment_coordinator() -> None:
+    single = _current_v4_meta(segments=None)
+    multiple = _current_v4_meta(
+        segments=[
+            {"index": 1, "start_s": 0.0, "end_s": 14.0},
+            {"index": 2, "start_s": 14.0, "end_s": 28.0},
+        ]
+    )
+
+    assert main._uses_segment_coordinator(single) is True
+    assert main._uses_segment_coordinator(multiple) is True
+
+
+def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> None:
+    old_prompt = "OLD_VISUAL_PROMPT_MUST_NOT_REACH_CONTEXT_OR_H3"
+    final_prompt = (
+        "FUSED_PROMPT_FROM_OPTIMIZED_IMAGES"
+        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>"
+    )
+    for order in range(1, 10):
+        (tmp_path / f"{order:02d}.png").write_bytes(f"frame-{order}".encode())
+    fusion_input = {
+        "schema": "duet.video-prompt-fusion-input",
+        "version": 1,
+        "segments": [{
+            "index": 1,
+            "new_keyframes": [
+                {
+                    "order": order,
+                    "path": f"{order:02d}.png",
+                    "sha256": hashlib.sha256(f"frame-{order}".encode()).hexdigest(),
+                }
+                for order in range(1, 10)
+            ],
+            "old_video_prompt": {
+                "text": old_prompt,
+                "sha256": hashlib.sha256(old_prompt.encode("utf-8")).hexdigest(),
+            },
+            "image_optimization_prompt": [{
+                "order": order,
+                "text": "replace person and scene",
+                "sha256": hashlib.sha256(b"replace person and scene").hexdigest(),
+            } for order in range(1, 10)],
+            "audio_content": {
+                "lines_json": "[]",
+                "voice_references": [],
+                "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
+            },
+        }],
+    }
+    input_data = _canonical(fusion_input)
+    fusion_output = {
+        "schema": "duet.video-prompt-fusion-output",
+        "version": 1,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{"index": 1, "final_prompt": final_prompt}],
+    }
+    input_path = tmp_path / "multimodal_input.json"
+    output_path = tmp_path / "h3_prompt_plan.json"
+    input_path.write_bytes(input_data)
+    output_path.write_bytes(_canonical(fusion_output))
+
+    frozen = long_generation.load_prompt_fusion(
+        input_path=input_path,
+        output_path=output_path,
+        root=tmp_path,
+    )
+
+    assert frozen.final_prompts == (final_prompt,)
+    assert old_prompt not in frozen.final_prompts
+
+
+def test_binding_skill_production_seams_are_absent() -> None:
+    assert not hasattr(pipeline, "queue_multimodal_binding")
+    assert not hasattr(pipeline, "produce_multimodal_binding")
+    source = Path(main.__file__).read_text(encoding="utf-8")
+    assert "queue_multimodal_binding" not in source
+    assert "produce_multimodal_binding" not in source
+
+
+def _fusion_input(root: Path, segment_count: int) -> bytes:
+    segments = []
+    for index in range(1, segment_count + 1):
+        frames = []
+        prompts = []
+        for order in range(1, 10):
+            relative = f"work/segment-{index}-{order:02d}.png"
+            data = f"segment-{index}-frame-{order}".encode()
+            (root / relative).write_bytes(data)
+            prompt = f"segment {index} optimized image {order}"
+            frames.append({
+                "order": order,
+                "path": relative,
+                "sha256": hashlib.sha256(data).hexdigest(),
+            })
+            prompts.append({
+                "order": order,
+                "text": prompt,
+                "sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            })
+        old_prompt = f"old visual prompt {index}"
+        segments.append({
+            "index": index,
+            "new_keyframes": frames,
+            "old_video_prompt": {
+                "text": old_prompt,
+                "sha256": hashlib.sha256(
+                    old_prompt.encode("utf-8")
+                ).hexdigest(),
+            },
+            "image_optimization_prompt": prompts,
+            "audio_content": {
+                "lines_json": "[]",
+                "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
+                "voice_references": [],
+            },
+        })
+    return _canonical({
+        "schema": long_generation.PROMPT_FUSION_INPUT_SCHEMA,
+        "version": long_generation.PROMPT_FUSION_VERSION,
+        "segments": segments,
+    })
+
+
+@pytest.mark.parametrize("segment_count", [1, 2])
+def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, segment_count: int,
+) -> None:
+    settings = make_settings(tmp_path)
+    created = storage.new_conversation(
+        settings.data_dir, "fusion", "source.mp4"
+    )
+    cid = created["id"]
+    root = settings.data_dir / cid
+    acceptance_sha256 = "a" * 64
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _image_user_acceptance={
+            "version": 1,
+            "sha256": acceptance_sha256,
+        },
+    )
+    input_data = _fusion_input(root, segment_count)
+    skill_path = tmp_path / "video-prompt-fusion-SKILL.md"
+    skill_path.write_text("strict project prompt fusion", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "PROMPT_FUSION_SKILL_MD", skill_path)
+    monkeypatch.setattr(
+        long_generation, "PROMPT_FUSION_SKILL_SOURCE", skill_path
+    )
+    calls: list[Path] = []
+
+    class Runner:
+        def run(self, cwd: Path, prompt: str) -> None:
+            calls.append(cwd)
+            assert "Binding" in prompt
+            frozen_input = (cwd / "work" / "multimodal_input.json").read_bytes()
+            payload = json.loads(frozen_input.decode("utf-8"))
+            output = {
+                "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+                "version": long_generation.PROMPT_FUSION_VERSION,
+                "input_sha256": hashlib.sha256(frozen_input).hexdigest(),
+                "segments": [{
+                    "index": item["index"],
+                    "final_prompt": (
+                        f"fused prompt {item['index']}"
+                        "<AUDIO_CONTENT_JSON>"
+                        f"{item['audio_content']['lines_json']}"
+                        "</AUDIO_CONTENT_JSON>"
+                    ),
+                } for item in payload["segments"]],
+            }
+            (cwd / "work" / "h3_prompt_plan.json").write_bytes(
+                _canonical(output)
+            )
+
+    assert pipeline.queue_prompt_fusion(
+        settings,
+        cid,
+        input_data=input_data,
+        image_acceptance_sha256=acceptance_sha256,
+    ) == "queued"
+    assert pipeline.produce_prompt_fusion(settings, cid, Runner()) == "done"
+    assert calls == [root]
+    frozen = long_generation.load_prompt_fusion_manifest(
+        root=root,
+        skill_source_path=skill_path,
+    )
+    assert frozen.final_prompts == tuple(
+        f"fused prompt {index}<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>"
+        for index in range(1, segment_count + 1)
+    )
+    assert pipeline.queue_prompt_fusion(
+        settings,
+        cid,
+        input_data=input_data,
+        image_acceptance_sha256=acceptance_sha256,
+    ) == "done"
+    assert pipeline.produce_prompt_fusion(settings, cid, Runner()) == "done"
+    assert calls == [root]
+    meta = storage.load_meta(settings.data_dir, cid)
+    assert meta is not None
+    assert main._public_prompt_fusion(meta, root) == {
+        "status": "done",
+        "error": None,
+        "segments": [{
+            "index": index,
+            "status": "done",
+            "final_prompt": (
+                f"fused prompt {index}"
+                "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>"
+            ),
+            "error": None,
+        } for index in range(1, segment_count + 1)],
+    }
+
+
+def test_frozen_current_v4_projects_publish_a_stable_n1_fusion_shape(
+    tmp_path: Path,
+) -> None:
+    meta = _current_v4_meta(segments=None)
+    meta["_prompt_fusion"] = {"status": "running"}
+
+    assert main._public_prompt_fusion(meta, tmp_path) == {
+        "status": "running",
+        "error": None,
+        "segments": [{
+            "index": 1,
+            "status": "running",
+            "final_prompt": None,
+            "error": None,
+        }],
+    }

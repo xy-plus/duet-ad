@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import subprocess
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
@@ -40,6 +41,15 @@ H3_NATIVE_AUDIO_ROUTE = {
     "version": AUDIO_ROUTE_VERSION,
     "mode": "h3_native",
 }
+PROMPT_FUSION_INPUT_SCHEMA = "duet.video-prompt-fusion-input"
+PROMPT_FUSION_OUTPUT_SCHEMA = "duet.video-prompt-fusion-output"
+PROMPT_FUSION_VERSION = 1
+PROMPT_FUSION_MANIFEST_SCHEMA = "duet.video-prompt-fusion-production"
+PROMPT_FUSION_MANIFEST_VERSION = 1
+PROMPT_FUSION_SKILL_SOURCE = (
+    Path(__file__).resolve().parents[1]
+    / "skills" / "video-prompt-fusion" / "SKILL.md"
+)
 
 
 class LongGenerationError(RuntimeError):
@@ -47,6 +57,329 @@ class LongGenerationError(RuntimeError):
         self.code = code
         self.status = status
         super().__init__(code)
+
+
+@dataclass(frozen=True)
+class FrozenPromptFusion:
+    input_path: Path
+    input_data: bytes
+    input_sha256: str
+    output_path: Path
+    output_data: bytes
+    output_sha256: str
+    segments: tuple[Mapping, ...]
+    final_prompts: tuple[str, ...]
+
+
+def _fusion_json(path: Path, code: str) -> tuple[bytes, dict]:
+    if path.is_symlink():
+        raise LongGenerationError(code)
+    try:
+        data = path.read_bytes()
+        value = json.loads(data.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise LongGenerationError(code) from None
+    if not data or not isinstance(value, dict):
+        raise LongGenerationError(code)
+    return data, value
+
+
+def _fusion_text_binding(value: object) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and set(value) == {"text", "sha256"}
+        and isinstance(value.get("text"), str)
+        and value["text"].strip()
+        and value.get("sha256")
+        == hashlib.sha256(value["text"].encode("utf-8")).hexdigest()
+    )
+
+
+def _fusion_audio_block(lines_json: str) -> str:
+    return (
+        f"<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>"
+    )
+
+
+def _h3_prompt_from_fusion(final_prompt: str, lines_json: str) -> str:
+    """Preserve the exact audio JSON while projecting XML markers safely."""
+    block = _fusion_audio_block(lines_json)
+    if final_prompt.count(block) != 1:
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    projected = final_prompt.replace(
+        block,
+        f"[AUDIO_CONTENT_JSON]{lines_json}[/AUDIO_CONTENT_JSON]",
+    )
+    if "<" in projected or ">" in projected:
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    return projected
+
+
+def load_prompt_fusion(
+    *, input_path: Path, output_path: Path, root: Path | None = None,
+) -> FrozenPromptFusion:
+    """Load one project-level fusion result and verify all ordered inputs."""
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    input_data, source = _fusion_json(input_path, "prompt_fusion_input_invalid")
+    output_data, output = _fusion_json(output_path, "prompt_fusion_output_invalid")
+    input_path = input_path.resolve()
+    output_path = output_path.resolve()
+    project_root = (
+        Path(root).resolve()
+        if root is not None else input_path.parent.parent.resolve()
+    )
+    try:
+        input_path.relative_to(project_root)
+        output_path.relative_to(project_root)
+    except ValueError:
+        raise LongGenerationError("prompt_fusion_input_invalid") from None
+    segments = source.get("segments")
+    if (
+        input_path.name != h3_project.SKILL_INPUT_FILENAME
+        or output_path.name != "h3_prompt_plan.json"
+        or set(source) != {"schema", "version", "segments"}
+        or source.get("schema") != PROMPT_FUSION_INPUT_SCHEMA
+        or source.get("version") != PROMPT_FUSION_VERSION
+        or not isinstance(segments, list)
+        or not segments
+    ):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    for index, segment in enumerate(segments, 1):
+        if (
+            not isinstance(segment, Mapping)
+            or set(segment) != {
+                "index", "new_keyframes", "old_video_prompt",
+                "image_optimization_prompt", "audio_content",
+            }
+            or segment.get("index") != index
+            or not _fusion_text_binding(segment.get("old_video_prompt"))
+        ):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        frames = segment.get("new_keyframes")
+        prompts = segment.get("image_optimization_prompt")
+        if (
+            not isinstance(frames, list)
+            or len(frames) != 9
+            or not isinstance(prompts, list)
+            or len(prompts) != 9
+        ):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        for order, (frame, prompt) in enumerate(zip(frames, prompts), 1):
+            if (
+                not isinstance(frame, Mapping)
+                or set(frame) != {"order", "path", "sha256"}
+                or frame.get("order") != order
+                or not isinstance(frame.get("path"), str)
+                or not frame["path"]
+                or not isinstance(frame.get("sha256"), str)
+                or len(frame["sha256"]) != 64
+                or not isinstance(prompt, Mapping)
+                or set(prompt) != {"order", "text", "sha256"}
+                or prompt.get("order") != order
+                or not _fusion_text_binding({
+                    "text": prompt.get("text"), "sha256": prompt.get("sha256")
+                })
+            ):
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            frame_candidate = project_root / frame["path"]
+            if frame_candidate.is_symlink():
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            frame_path = frame_candidate.resolve()
+            try:
+                frame_path.relative_to(project_root)
+                frame_data = frame_path.read_bytes()
+            except (OSError, ValueError):
+                raise LongGenerationError("prompt_fusion_input_invalid") from None
+            if (
+                not frame_data
+                or hashlib.sha256(frame_data).hexdigest() != frame["sha256"]
+            ):
+                raise LongGenerationError("prompt_fusion_input_invalid")
+        audio = segment.get("audio_content")
+        if (
+            not isinstance(audio, Mapping)
+            or set(audio) != {
+                "lines_json", "lines_sha256", "voice_references",
+            }
+            or not isinstance(audio.get("lines_json"), str)
+            or not isinstance(audio.get("voice_references"), list)
+            or audio.get("lines_sha256")
+            != hashlib.sha256(audio["lines_json"].encode("utf-8")).hexdigest()
+        ):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        try:
+            lines = json.loads(audio["lines_json"])
+        except json.JSONDecodeError:
+            raise LongGenerationError("prompt_fusion_input_invalid") from None
+        if not isinstance(lines, list):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        used_voice_refs: set[int] = set()
+        for order, line in enumerate(lines, 1):
+            if (
+                not isinstance(line, Mapping)
+                or set(line) != {
+                    "order", "text", "start_s", "end_s", "delivery", "voice_ref",
+                }
+                or line.get("order") != order
+                or not isinstance(line.get("text"), str)
+                or not line["text"].strip()
+                or line.get("delivery") not in {"on_screen", "off_screen"}
+                or line.get("voice_ref") not in {None, 1}
+            ):
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            if line["voice_ref"] is not None:
+                used_voice_refs.add(line["voice_ref"])
+        references = audio["voice_references"]
+        if len(references) != len(used_voice_refs):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        for voice_ref, reference in enumerate(references, 1):
+            if (
+                not isinstance(reference, Mapping)
+                or set(reference) != {"voice_ref", "path", "sha256", "purpose"}
+                or reference.get("voice_ref") != voice_ref
+                or reference.get("purpose") != "voice"
+                or voice_ref not in used_voice_refs
+                or not isinstance(reference.get("path"), str)
+                or not reference["path"]
+            ):
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            reference_candidate = project_root / reference["path"]
+            if reference_candidate.is_symlink():
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            reference_path = reference_candidate.resolve()
+            try:
+                reference_path.relative_to(project_root)
+                reference_data = reference_path.read_bytes()
+            except (OSError, ValueError):
+                raise LongGenerationError("prompt_fusion_input_invalid") from None
+            if (
+                not reference_data
+                or hashlib.sha256(reference_data).hexdigest()
+                != reference.get("sha256")
+            ):
+                raise LongGenerationError("prompt_fusion_input_invalid")
+    frozen_input_sha256 = hashlib.sha256(input_data).hexdigest()
+    output_segments = output.get("segments")
+    if (
+        set(output) != {"schema", "version", "input_sha256", "segments"}
+        or output.get("schema") != PROMPT_FUSION_OUTPUT_SCHEMA
+        or output.get("version") != PROMPT_FUSION_VERSION
+        or output.get("input_sha256") != frozen_input_sha256
+        or not isinstance(output_segments, list)
+        or len(output_segments) != len(segments)
+    ):
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    final_prompts: list[str] = []
+    for index, segment in enumerate(output_segments, 1):
+        if (
+            not isinstance(segment, Mapping)
+            or set(segment) != {"index", "final_prompt"}
+            or segment.get("index") != index
+            or not isinstance(segment.get("final_prompt"), str)
+            or not segment["final_prompt"].strip()
+        ):
+            raise LongGenerationError("prompt_fusion_output_invalid")
+        if segment["final_prompt"].count(_fusion_audio_block(
+            segments[index - 1]["audio_content"]["lines_json"]
+        )) != 1:
+            raise LongGenerationError("prompt_fusion_output_invalid")
+        final_prompts.append(segment["final_prompt"])
+    return FrozenPromptFusion(
+        input_path=input_path,
+        input_data=input_data,
+        input_sha256=frozen_input_sha256,
+        output_path=output_path,
+        output_data=output_data,
+        output_sha256=hashlib.sha256(output_data).hexdigest(),
+        segments=tuple(segments),
+        final_prompts=tuple(final_prompts),
+    )
+
+
+def load_prompt_fusion_manifest(
+    *, root: Path, skill_source_path: Path,
+) -> FrozenPromptFusion:
+    """Revalidate the manifest-last fusion production at a paid boundary."""
+    root = Path(root).resolve()
+    manifest_path = root / "work" / h3_project.SOURCE_FILENAME
+    manifest_data, manifest = _fusion_json(
+        manifest_path, "prompt_fusion_manifest_invalid"
+    )
+    if (
+        set(manifest) != {
+            "schema", "version", "image_acceptance_sha256", "input",
+            "output", "skill", "segments",
+        }
+        or manifest.get("schema") != PROMPT_FUSION_MANIFEST_SCHEMA
+        or manifest.get("version") != PROMPT_FUSION_MANIFEST_VERSION
+        or not isinstance(manifest.get("image_acceptance_sha256"), str)
+        or len(manifest["image_acceptance_sha256"]) != 64
+    ):
+        raise LongGenerationError("prompt_fusion_manifest_invalid")
+
+    def artifact(value: object, expected_path: str) -> Path:
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"path", "sha256"}
+            or value.get("path") != expected_path
+            or not isinstance(value.get("sha256"), str)
+        ):
+            raise LongGenerationError("prompt_fusion_manifest_invalid")
+        candidate = root / expected_path
+        if candidate.is_symlink():
+            raise LongGenerationError("prompt_fusion_manifest_invalid")
+        try:
+            data = candidate.read_bytes()
+        except OSError:
+            raise LongGenerationError("prompt_fusion_manifest_invalid") from None
+        if not data or hashlib.sha256(data).hexdigest() != value["sha256"]:
+            raise LongGenerationError("prompt_fusion_manifest_invalid")
+        return candidate
+
+    input_path = artifact(
+        manifest["input"], f"work/{h3_project.SKILL_INPUT_FILENAME}"
+    )
+    output_path = artifact(manifest["output"], "work/h3_prompt_plan.json")
+    skill = manifest["skill"]
+    if (
+        not isinstance(skill, Mapping)
+        or set(skill) != {"source_path", "frozen_path", "sha256"}
+        or skill.get("source_path") != "skills/video-prompt-fusion/SKILL.md"
+        or skill.get("frozen_path") != "work/video_prompt_fusion_skill.md"
+    ):
+        raise LongGenerationError("prompt_fusion_manifest_invalid")
+    frozen_skill = root / skill["frozen_path"]
+    try:
+        source_skill_data = Path(skill_source_path).read_bytes()
+        frozen_skill_data = frozen_skill.read_bytes()
+    except OSError:
+        raise LongGenerationError("prompt_fusion_manifest_invalid") from None
+    if (
+        frozen_skill.is_symlink()
+        or not source_skill_data
+        or source_skill_data != frozen_skill_data
+        or hashlib.sha256(source_skill_data).hexdigest() != skill.get("sha256")
+    ):
+        raise LongGenerationError("prompt_fusion_manifest_invalid")
+    frozen = load_prompt_fusion(
+        input_path=input_path, output_path=output_path, root=root,
+    )
+    segments = manifest.get("segments")
+    if not isinstance(segments, list) or len(segments) != len(frozen.final_prompts):
+        raise LongGenerationError("prompt_fusion_manifest_invalid")
+    for index, (binding, prompt) in enumerate(
+        zip(segments, frozen.final_prompts), 1
+    ):
+        if (
+            not isinstance(binding, Mapping)
+            or set(binding) != {"index", "final_prompt_sha256"}
+            or binding.get("index") != index
+            or binding.get("final_prompt_sha256")
+            != hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        ):
+            raise LongGenerationError("prompt_fusion_manifest_invalid")
+    return frozen
 
 
 @dataclass(frozen=True)
@@ -139,6 +472,379 @@ def _canonical_digest(value: object) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _canonical_json_bytes(value: object) -> bytes:
+    try:
+        return (
+            json.dumps(
+                value, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            ) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise LongGenerationError("prompt_fusion_input_invalid") from None
+
+
+def _atomic_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        descriptor = os.open(
+            path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def build_prompt_fusion_input(
+    *, root: Path, meta: Mapping, plan: FrozenPlan,
+    dialogue_mode: str, dialogue_delivery: str,
+) -> bytes:
+    """Compile the four frozen fusion inputs for all ordered segments."""
+    root = Path(root).resolve()
+    if plan.root != root or not plan.segments:
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    raw_segments = meta.get("segments")
+    if not isinstance(raw_segments, list) or len(raw_segments) != len(plan.segments):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    optimization = meta.get("_image_optimization")
+    optimization_frames = (
+        optimization.get("frames") if isinstance(optimization, Mapping) else None
+    )
+    if not isinstance(optimization_frames, list):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    try:
+        requested_delivery = dialogue_delivery_contract.parse(dialogue_delivery)
+        authoritative_dialogue = tuple(
+            line for segment in plan.segments for line in segment.dialogue
+        )
+        resolved_delivery = dialogue_delivery_contract.resolve(
+            requested_delivery, authoritative_dialogue
+        ).value
+    except ValueError:
+        raise LongGenerationError("invalid_dialogue_delivery", 422) from None
+    if dialogue_mode != "none" and authoritative_dialogue \
+            and resolved_delivery == "on_screen":
+        raise LongGenerationError("on_screen_authority_unavailable")
+
+    compiled_segments: list[dict] = []
+    optimization_indices = {
+        item.get("segment_index")
+        for item in optimization_frames if isinstance(item, Mapping)
+    }
+    top_level_short = len(plan.segments) == 1 and optimization_indices == {0}
+    if not top_level_short and optimization_indices != set(
+        range(1, len(plan.segments) + 1)
+    ):
+        raise LongGenerationError("image_optimization_prompt_invalid")
+    for index, (raw, segment) in enumerate(
+        zip(raw_segments, plan.segments), 1
+    ):
+        if not isinstance(raw, Mapping) or segment.index != index:
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        old_prompt = raw.get("visual_prompt")
+        if not isinstance(old_prompt, str) or not old_prompt.strip():
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        if len(segment.keyframes) != 9:
+            raise LongGenerationError("postprocess_artifacts_invalid")
+        keyframes: list[dict] = []
+        for order, (path, data) in enumerate(segment.keyframes, 1):
+            try:
+                relative = path.resolve().relative_to(root).as_posix()
+            except ValueError:
+                raise LongGenerationError("prompt_fusion_input_invalid") from None
+            if path.is_symlink():
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            try:
+                current_data = path.read_bytes()
+            except OSError:
+                raise LongGenerationError(
+                    "prompt_fusion_input_invalid"
+                ) from None
+            if (
+                not data
+                or current_data != data
+                or hashlib.sha256(current_data).hexdigest()
+                != hashlib.sha256(data).hexdigest()
+            ):
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            keyframes.append({
+                "order": order,
+                "path": relative,
+                "sha256": hashlib.sha256(data).hexdigest(),
+            })
+
+        source_index = 0 if top_level_short else index
+        prompts = [
+            item for item in optimization_frames
+            if isinstance(item, Mapping)
+            and item.get("segment_index") == source_index
+        ]
+        if len(prompts) != 9:
+            raise LongGenerationError("image_optimization_prompt_invalid")
+        prompt_bindings: list[dict] = []
+        for order, item in enumerate(prompts, 1):
+            text = item.get("current")
+            digest = item.get("sha256")
+            if (
+                not isinstance(text, str)
+                or not text.strip()
+                or digest != hashlib.sha256(text.encode("utf-8")).hexdigest()
+            ):
+                raise LongGenerationError("image_optimization_prompt_invalid")
+            prompt_bindings.append({
+                "order": order, "text": text, "sha256": digest,
+            })
+
+        dialogue = () if dialogue_mode == "none" else segment.dialogue
+        lines: list[dict] = []
+        for order, line in enumerate(dialogue, 1):
+            try:
+                text = line["text"]
+                start_s = line["start_s"]
+                end_s = line["end_s"]
+            except (KeyError, TypeError):
+                raise LongGenerationError("prompt_fusion_input_invalid") from None
+            if not isinstance(text, str) or not text.strip():
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            lines.append({
+                "order": order,
+                "text": text,
+                "start_s": start_s,
+                "end_s": end_s,
+                "delivery": resolved_delivery,
+                "voice_ref": 1,
+            })
+        voice_references: list[dict] = []
+        if lines:
+            audio_path = segment.workdir / "work" / "voice.mp3"
+            if len(plan.segments) == 1 and not audio_path.is_file():
+                audio_path = root / "work" / "voice.mp3"
+            if audio_path.is_symlink():
+                raise LongGenerationError("reference_audio_binding_invalid")
+            try:
+                audio_data = audio_path.read_bytes()
+                audio_relative = audio_path.resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                raise LongGenerationError("reference_audio_binding_invalid") from None
+            if not audio_data:
+                raise LongGenerationError("reference_audio_binding_invalid")
+            voice_references.append({
+                "voice_ref": 1,
+                "path": audio_relative,
+                "sha256": hashlib.sha256(audio_data).hexdigest(),
+                "purpose": "voice",
+            })
+        lines_json = json.dumps(
+            lines, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+        )
+        compiled_segments.append({
+            "index": index,
+            "new_keyframes": keyframes,
+            "old_video_prompt": {
+                "text": old_prompt,
+                "sha256": hashlib.sha256(old_prompt.encode("utf-8")).hexdigest(),
+            },
+            "image_optimization_prompt": prompt_bindings,
+            "audio_content": {
+                "lines_json": lines_json,
+                "lines_sha256": hashlib.sha256(
+                    lines_json.encode("utf-8")
+                ).hexdigest(),
+                "voice_references": voice_references,
+            },
+        })
+    return _canonical_json_bytes({
+        "schema": PROMPT_FUSION_INPUT_SCHEMA,
+        "version": PROMPT_FUSION_VERSION,
+        "segments": compiled_segments,
+    })
+
+
+def _publish_fusion_h3_segments(
+    *, root: Path, meta: Mapping, base: FrozenPlan,
+    fusion: FrozenPromptFusion, dialogue_mode: str,
+) -> tuple[list[dict], list[dict]]:
+    """Mechanically project one verified fusion result into existing H3 inputs."""
+    receipt_segments: list[dict] = []
+    updated_segments: list[dict] = []
+    raw_segments = meta.get("segments")
+    if not isinstance(raw_segments, list) or len(raw_segments) != len(base.segments):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    for source, segment, fusion_source, final_prompt in zip(
+        raw_segments, base.segments, fusion.segments, fusion.final_prompts
+    ):
+        if not isinstance(source, Mapping):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        h3_prompt = _h3_prompt_from_fusion(
+            final_prompt,
+            fusion_source["audio_content"]["lines_json"],
+        )
+        work = segment.workdir / "work"
+        visual_path = work / "fusion_prompt.txt"
+        h3_input_path = work / h3_project.SKILL_INPUT_FILENAME
+        h3_plan_path = work / "h3_prompt_plan.json"
+        h3_manifest_path = work / h3_project.SOURCE_FILENAME
+        _atomic_bytes(visual_path, h3_prompt.encode("utf-8"))
+
+        frozen_keyframes: list[dict] = []
+        for item in fusion_source["new_keyframes"]:
+            source_candidate = root / item["path"]
+            if source_candidate.is_symlink():
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            source_path = source_candidate.resolve()
+            try:
+                relative = Path(os.path.relpath(source_path, work)).as_posix()
+                source_path.relative_to(root)
+                source_data = source_path.read_bytes()
+            except (OSError, ValueError):
+                raise LongGenerationError("prompt_fusion_input_invalid") from None
+            if (
+                not source_data
+                or hashlib.sha256(source_data).hexdigest() != item["sha256"]
+            ):
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            frozen_keyframes.append({
+                "order": item["order"],
+                "path": relative,
+                "sha256": item["sha256"],
+            })
+
+        audio = fusion_source["audio_content"]
+        lines = json.loads(audio["lines_json"])
+        references: list[dict] = []
+        for item in audio["voice_references"]:
+            source_candidate = root / item["path"]
+            if source_candidate.is_symlink():
+                raise LongGenerationError("reference_audio_binding_invalid")
+            source_path = source_candidate.resolve()
+            try:
+                source_path.relative_to(root)
+                data = source_path.read_bytes()
+            except (OSError, ValueError):
+                raise LongGenerationError("reference_audio_binding_invalid") from None
+            if (
+                not data
+                or hashlib.sha256(data).hexdigest() != item["sha256"]
+            ):
+                raise LongGenerationError("reference_audio_binding_invalid")
+            frozen_path = work / f"conditioning-voice-{item['voice_ref']}.mp3"
+            _atomic_bytes(frozen_path, data)
+            references.append({
+                "order": item["voice_ref"],
+                "path": frozen_path.name,
+                "sha256": item["sha256"],
+                "purpose": "voice",
+            })
+        dialogue = () if dialogue_mode == "none" else segment.dialogue
+        if len(lines) != len(dialogue):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        speech_bindings: list[dict] = []
+        for order, (compiled, authoritative) in enumerate(
+            zip(lines, dialogue), 1
+        ):
+            if (
+                compiled["order"] != order
+                or compiled["text"] != authoritative.get("text")
+                or compiled["start_s"] != authoritative.get("start_s")
+                or compiled["end_s"] != authoritative.get("end_s")
+                or compiled["delivery"] != "off_screen"
+                or compiled["voice_ref"] != 1
+            ):
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            language = authoritative.get("language", "und")
+            if not isinstance(language, str) or not language.strip():
+                language = "und"
+            speech_bindings.append({
+                "line_index": order,
+                "delivery": "off_screen_voiceover",
+                "subject_id": None,
+                "language": language,
+                "voice_ref": 1,
+            })
+        dialogue_sha256 = _canonical_digest(dialogue)
+        h3_input = {
+            "schema": h3_project.SKILL_INPUT_SCHEMA,
+            "version": h3_project.SKILL_INPUT_VERSION,
+            "visual_prompt": {
+                "path": visual_path.name,
+                "sha256": hashlib.sha256(
+                    h3_prompt.encode("utf-8")
+                ).hexdigest(),
+            },
+            "keyframes": frozen_keyframes,
+            "dialogue_source_sha256": dialogue_sha256,
+            "reference_audios": references,
+        }
+        h3_plan = {
+            "version": 2,
+            "phase": "multimodal_audio",
+            "eligible": True,
+            "reason": None,
+            "visual_prompt": h3_prompt,
+            "dialogue_source_sha256": dialogue_sha256,
+            "subjects": [],
+            "audio_refs": [
+                {
+                    "audio_index": item["order"],
+                    "purpose": "voice",
+                    "subject_id": None,
+                }
+                for item in references
+            ],
+            "speech_bindings": speech_bindings,
+            "sound_design": {"ambience_refs": [], "effects": []},
+        }
+        h3_input_data = _canonical_json_bytes(h3_input)
+        h3_plan_data = _canonical_json_bytes(h3_plan)
+        _atomic_bytes(h3_input_path, h3_input_data)
+        _atomic_bytes(h3_plan_path, h3_plan_data)
+        manifest = {
+            "schema": h3_project.SOURCE_SCHEMA,
+            "version": h3_project.SOURCE_VERSION,
+            "mode": "multimodal",
+            "approved_skill_plan_sha256": h3.canonical_json_sha256(h3_plan),
+            "multimodal_input": {
+                "path": h3_input_path.name,
+                "sha256": hashlib.sha256(h3_input_data).hexdigest(),
+            },
+            "skill_plan": {
+                "path": h3_plan_path.name,
+                "sha256": hashlib.sha256(h3_plan_data).hexdigest(),
+            },
+            "reference_audios": references,
+        }
+        _atomic_bytes(h3_manifest_path, _canonical_json_bytes(manifest))
+        try:
+            h3_project.freeze_optional(root, work)
+        except h3_project.ProjectMultimodalError as exc:
+            raise LongGenerationError(exc.code) from None
+        updated = {**dict(source), "prompt": h3_prompt}
+        updated_segments.append(updated)
+        receipt_segments.append({
+            **updated,
+            "source_path": root / "work" / str(source["source"]),
+            "keyframe_paths": [
+                root / "work" / str(path) for path in source["keyframe_paths"]
+            ],
+            "first_frame_path": root / "work" / str(source["first_frame_path"]),
+            "last_frame_path": root / "work" / str(source["last_frame_path"]),
+            "visual_prompt_path": work / "visual_prompt.txt",
+            "final_prompt_path": visual_path,
+            "dialogue": list(dialogue),
+            "multimodal_manifest_path": h3_manifest_path,
+        })
+    return receipt_segments, updated_segments
+
+
 def plan_receipt(root: Path, meta: Mapping) -> str | None:
     name = meta.get("long_video_plan_receipt")
     if name != long_video.PLAN_RECEIPT_FILENAME:
@@ -150,6 +856,143 @@ def plan_receipt(root: Path, meta: Mapping) -> str | None:
         return _digest(path)
     except LongGenerationError:
         return None
+
+
+def normalize_single_segment_project(
+    settings: Settings, cid: str, meta: Mapping,
+) -> dict:
+    """Adapt a frozen pre-unification v4 N=1 project to segments[1]."""
+    root = (settings.data_dir / cid).resolve()
+    if (
+        meta.get("schema_version") != 2
+        or isinstance(meta.get("segments"), list)
+        or meta.get("long_video_plan_receipt") is not None
+    ):
+        return dict(meta)
+    private = meta.get("_postprocess_receipt")
+    if (
+        not isinstance(private, Mapping)
+        or private.get("version") != 4
+        or not isinstance(private.get("options"), Mapping)
+        or private["options"].get("optimize_image") is not True
+    ):
+        return dict(meta)
+    try:
+        duration = float(meta["duration_s"])
+    except (KeyError, TypeError, ValueError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    if not 0 < duration <= long_video.SHORT_VIDEO_MAX_S:
+        raise LongGenerationError("long_video_plan_invalid")
+    names = meta.get("keyframes")
+    if not isinstance(names, list) or len(names) != 9:
+        raise LongGenerationError("postprocess_artifacts_invalid")
+    originals = [root / "work" / "keyframes" / str(name) for name in names]
+    try:
+        selected = postprocess.generation_keyframes(
+            root, dict(meta), originals, settings=settings,
+        )
+    except postprocess.PostprocessError as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else exc.detail["code"]
+        raise LongGenerationError(detail, exc.status) from None
+    if len(selected) != 9:
+        raise LongGenerationError("postprocess_artifacts_invalid")
+    sources = sorted(root.glob("source.*"))
+    if len(sources) != 1:
+        raise LongGenerationError("long_video_plan_invalid")
+    segment_dir = root / "work" / "segments" / "1"
+    segment_work = segment_dir / "work"
+    if sources[0].is_symlink():
+        raise LongGenerationError("long_video_plan_invalid")
+    try:
+        source_data = sources[0].read_bytes()
+    except OSError:
+        raise LongGenerationError("long_video_plan_invalid") from None
+    if not source_data:
+        raise LongGenerationError("long_video_plan_invalid")
+    _atomic_bytes(segment_dir / "source.mp4", source_data)
+    segment_work.mkdir(parents=True, exist_ok=True)
+    visual_path = root / "work" / "visual_prompt.txt"
+    try:
+        visual = visual_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    frozen_visual = segment_work / "visual_prompt.txt"
+    _atomic_bytes(frozen_visual, visual.encode("utf-8"))
+    dialogue = []
+    raw_lines = meta.get("voice_line_provenance")
+    if isinstance(raw_lines, list):
+        for raw in raw_lines:
+            if not isinstance(raw, Mapping) or raw.get("kept") is not True:
+                continue
+            line = {
+                key: raw[key] for key in ("text", "start_s", "end_s")
+                if key in raw
+            }
+            for optional in ("classification", "language"):
+                if optional in raw:
+                    line[optional] = raw[optional]
+            dialogue.append(line)
+    try:
+        final = (
+            f"{_PIPELINE_NO_BGM}\n"
+            + prepared_input.compose_final_prompt(
+                long_video.compose_segment_visual_prompt(visual), dialogue,
+            )
+        )
+    except (prepared_input.PreparedInputError, long_video.LongVideoError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    final_path = segment_work / "prompt.txt"
+    _atomic_bytes(final_path, final.encode("utf-8"))
+    global_audio = root / "work" / "voice.mp3"
+    if dialogue and global_audio.is_file() and not global_audio.is_symlink():
+        _atomic_bytes(segment_work / "voice.mp3", global_audio.read_bytes())
+    segment = {
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": round(duration, long_video.BOUNDARY_PRECISION),
+        "chain_id": "chain-001",
+        "join_mode": "hard_cut",
+        "source": "segments/1/source.mp4",
+        "keyframes": list(names),
+        "keyframe_paths": [
+            path.resolve().relative_to(root / "work").as_posix()
+            for path in originals
+        ],
+        "first_frame_path": originals[0].resolve().relative_to(
+            root / "work"
+        ).as_posix(),
+        "last_frame_path": originals[-1].resolve().relative_to(
+            root / "work"
+        ).as_posix(),
+        "visual_prompt": visual,
+        "prompt": final,
+        "dialogue": dialogue,
+        "lines": [line["text"] for line in dialogue],
+    }
+    receipt_path = long_video.write_plan_receipt(
+        root,
+        source=sources[0],
+        duration_s=duration,
+        segments=[{
+            **segment,
+            "source_path": segment_dir / "source.mp4",
+            "keyframe_paths": originals,
+            "first_frame_path": originals[0],
+            "last_frame_path": originals[-1],
+            "visual_prompt_path": frozen_visual,
+            "final_prompt_path": final_path,
+        }],
+        workflow=h3.H3_WORKFLOW,
+    )
+    updated = storage.update_meta(
+        settings.data_dir,
+        cid,
+        segments=[segment],
+        long_video_plan_receipt=receipt_path.name,
+    )
+    if updated is None:
+        raise LongGenerationError("long_video_plan_invalid")
+    return updated
 
 
 def finalize_multimodal_plan(
@@ -164,13 +1007,7 @@ def finalize_multimodal_plan(
     dialogue_delivery: str = "auto",
     settings: Settings | None = None,
 ) -> str | None:
-    """Finalize staged per-segment audio plans before a paid submit.
-
-    A v2 plan remains the user-confirmed base.  If an independent audio phase
-    has atomically completed every segment manifest, this replaces it with a
-    v3 receipt and returns the new digest.  The current submit must stop and
-    require the caller to review/resubmit that exact digest.
-    """
+    """Freeze/consume the one project-level prompt fusion before H3."""
     root = Path(root).resolve()
     if isinstance(meta.get("generation"), Mapping):
         return None
@@ -184,83 +1021,17 @@ def finalize_multimodal_plan(
         raise LongGenerationError("long_video_plan_changed")
     receipt_version = payload.get("version") if isinstance(payload, Mapping) else None
     if receipt_version == long_video.MULTIMODAL_PLAN_RECEIPT_VERSION:
+        if settings is None:
+            raise LongGenerationError("prompt_fusion_manifest_invalid")
+        load_prompt_fusion_manifest(
+            root=root,
+            skill_source_path=PROMPT_FUSION_SKILL_SOURCE,
+        )
         return None
     if receipt_version != long_video.PLAN_RECEIPT_VERSION:
         return None
-    current_segments = meta.get("segments")
-    if not isinstance(current_segments, list) or not current_segments:
-        raise LongGenerationError("long_video_plan_invalid")
-    authoritative_dialogue = tuple(
-        dict(line)
-        for current in current_segments
-        if isinstance(current, Mapping)
-        for line in current.get("dialogue", [])
-        if isinstance(line, Mapping)
-    )
-    try:
-        requested_delivery = dialogue_delivery_contract.parse(dialogue_delivery)
-        resolved_delivery = dialogue_delivery_contract.resolve(
-            requested_delivery, authoritative_dialogue
-        )
-    except ValueError:
-        raise LongGenerationError("invalid_dialogue_delivery", 422) from None
-    postprocess_receipt = meta.get("_postprocess_receipt")
-    binding_required = bool(
-        dialogue_mode != "none"
-        and authoritative_dialogue
-        and isinstance(postprocess_receipt, Mapping)
-        and postprocess_receipt.get("version") == 4
-        and isinstance(postprocess_receipt.get("options"), Mapping)
-        and postprocess_receipt["options"].get("optimize_image") is True
-    )
-
-    intent: list[bool] = []
-    complete: list[bool] = []
-    receipt_segments: list[dict] = []
-    for expected_index, current in enumerate(current_segments, 1):
-        if not isinstance(current, Mapping) or current.get("index") != expected_index:
-            raise LongGenerationError("long_video_plan_invalid")
-        segdir = root / "work" / "segments" / str(expected_index)
-        segwork = segdir / "work"
-        manifest = segwork / h3_project.SOURCE_FILENAME
-        intent.append(any(
-            (segwork / name).exists()
-            for name in (
-                h3_project.SKILL_INPUT_FILENAME,
-                "h3_prompt_plan.json",
-                h3_project.SOURCE_FILENAME,
-            )
-        ))
-        complete.append(manifest.is_file())
-        try:
-            receipt_segments.append({
-                **dict(current),
-                "source_path": root / "work" / str(current["source"]),
-                "keyframe_paths": [
-                    root / "work" / str(path)
-                    for path in current["keyframe_paths"]
-                ],
-                "first_frame_path": (
-                    root / "work" / str(current["first_frame_path"])
-                ),
-                "last_frame_path": (
-                    root / "work" / str(current["last_frame_path"])
-                ),
-                "visual_prompt_path": segwork / "visual_prompt.txt",
-                "final_prompt_path": segwork / "prompt.txt",
-                "dialogue": (
-                    [] if dialogue_mode == "none" else list(current["dialogue"])
-                ),
-                "multimodal_manifest_path": manifest,
-            })
-        except (KeyError, TypeError):
-            raise LongGenerationError("long_video_plan_invalid") from None
-    if not any(intent):
-        if binding_required:
-            raise LongGenerationError("multimodal_input_refresh_required")
-        return None
-    if not all(complete):
-        raise LongGenerationError("long_video_multimodal_incomplete")
+    if settings is None:
+        raise LongGenerationError("prompt_fusion_refresh_required")
 
     base = freeze_plan(
         root,
@@ -274,6 +1045,50 @@ def finalize_multimodal_plan(
         prepare_fit=True,
         settings=settings,
     )
+    input_data = build_prompt_fusion_input(
+        root=root,
+        meta=meta,
+        plan=base,
+        dialogue_mode=dialogue_mode,
+        dialogue_delivery=dialogue_delivery,
+    )
+    acceptance = meta.get("_image_user_acceptance")
+    if (
+        not isinstance(acceptance, Mapping)
+        or not isinstance(acceptance.get("sha256"), str)
+    ):
+        raise LongGenerationError("image_acceptance_required")
+    from app import pipeline  # local import: pipeline owns the Codex runner seam
+
+    queued = pipeline.queue_prompt_fusion(
+        settings,
+        str(meta.get("id")),
+        input_data=input_data,
+        image_acceptance_sha256=acceptance["sha256"],
+    )
+    if queued == "failed":
+        raise LongGenerationError("prompt_fusion_failed")
+    if queued != "done":
+        raise LongGenerationError("prompt_fusion_refresh_required")
+    fusion = load_prompt_fusion_manifest(
+        root=root, skill_source_path=pipeline.PROMPT_FUSION_SKILL_MD,
+    )
+    if fusion.input_data != input_data:
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    try:
+        resolved_delivery = dialogue_delivery_contract.resolve(
+            dialogue_delivery_contract.parse(dialogue_delivery),
+            tuple(line for segment in base.segments for line in segment.dialogue),
+        ).value
+    except ValueError:
+        raise LongGenerationError("invalid_dialogue_delivery", 422) from None
+    receipt_segments, _updated_segments = _publish_fusion_h3_segments(
+        root=root,
+        meta=meta,
+        base=base,
+        fusion=fusion,
+        dialogue_mode=dialogue_mode,
+    )
     try:
         long_video.write_plan_receipt(
             root,
@@ -283,12 +1098,14 @@ def finalize_multimodal_plan(
             workflow=h3.H3_MULTIMODAL_WORKFLOW,
             dialogue_mode=dialogue_mode,
             dialogue_delivery=dialogue_delivery,
-            resolved_dialogue_delivery=resolved_delivery.value,
+            resolved_dialogue_delivery=resolved_delivery,
+            prompt_fusion_manifest_path=root / "work" / h3_project.SOURCE_FILENAME,
         )
         promoted = _digest(receipt_path)
+        promoted_meta = dict(meta)
         freeze_plan(
             root,
-            meta,
+            promoted_meta,
             promoted,
             fit_mode,
             dialogue_mode,
@@ -298,17 +1115,24 @@ def finalize_multimodal_plan(
             prepare_fit=True,
             settings=settings,
         )
-    except (OSError, KeyError, TypeError, ValueError, long_video.LongVideoError,
-            LongGenerationError) as exc:
-        temporary = receipt_path.with_name(receipt_path.name + ".rollback")
-        try:
-            temporary.write_bytes(previous_bytes)
-            temporary.replace(receipt_path)
-        except OSError:
-            pass
+        storage.update_meta(
+            settings.data_dir,
+            str(meta.get("id")),
+            long_video_plan_receipt=long_video.PLAN_RECEIPT_FILENAME,
+        )
+        return promoted
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        long_video.LongVideoError,
+        LongGenerationError,
+    ) as exc:
+        _atomic_bytes(receipt_path, previous_bytes)
         code = getattr(exc, "code", "long_video_multimodal_invalid")
         raise LongGenerationError(code) from None
-    return promoted
+
 
 
 def _bound_path(root: Path, artifact: object) -> Path:
@@ -487,6 +1311,22 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             raise LongGenerationError(
                 "long_video_multimodal_dialogue_refresh_required", 409
             )
+    if is_multimodal_receipt and isinstance(meta.get("_prompt_fusion"), Mapping):
+        fusion_binding = payload.get("prompt_fusion")
+        if (
+            not isinstance(fusion_binding, Mapping)
+            or set(fusion_binding) != {"path", "sha256"}
+            or fusion_binding.get("path") != f"work/{h3_project.SOURCE_FILENAME}"
+        ):
+            raise LongGenerationError("prompt_fusion_manifest_invalid")
+        manifest_path = _bound_path(root, fusion_binding)
+        frozen_fusion = load_prompt_fusion_manifest(
+            root=root,
+            skill_source_path=PROMPT_FUSION_SKILL_SOURCE,
+        )
+        if manifest_path != root / "work" / h3_project.SOURCE_FILENAME \
+                or len(frozen_fusion.segments) != len(payload.get("segments", [])):
+            raise LongGenerationError("prompt_fusion_manifest_invalid")
     generation = meta.get("generation")
     persisted_workflow = (
         generation.get("workflow") if isinstance(generation, Mapping) else None
@@ -511,9 +1351,14 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
     except (KeyError, TypeError, ValueError):
         raise LongGenerationError("long_video_plan_invalid") from None
     raw_segments, meta_segments = payload.get("segments"), meta.get("segments")
+    minimum_plan_duration = (
+        long_video.PREVIOUS_SHORT_VIDEO_MAX_S
+        if receipt_version == long_video.LEGACY_PLAN_RECEIPT_VERSION
+        else 0.0
+    )
     if (
         not math.isfinite(duration)
-        or duration <= long_video.PREVIOUS_SHORT_VIDEO_MAX_S
+        or duration <= minimum_plan_duration
         or duration > long_video.LONG_VIDEO_MAX_S
         or abs(duration - meta_duration) > _EPS
         or not isinstance(raw_segments, list)
@@ -523,12 +1368,43 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
     ):
         raise LongGenerationError("long_video_plan_invalid")
 
+    project_selected_paths: dict[int, tuple[Path, ...]] = {}
+    if workflow in h3.H3_REFERENCE_WORKFLOWS:
+        project_originals: list[Path] = []
+        project_counts: list[int] = []
+        for raw in raw_segments:
+            keys = raw.get("keyframes") if isinstance(raw, Mapping) else None
+            if not isinstance(keys, list) or not 1 <= len(keys) <= 9:
+                raise LongGenerationError("long_video_plan_invalid")
+            originals = [_bound_path(root, artifact) for artifact in keys]
+            project_originals.extend(originals)
+            project_counts.append(len(originals))
+        try:
+            selected_project = postprocess.generation_keyframes(
+                root, dict(meta), project_originals, settings=settings,
+            )
+        except postprocess.PostprocessError as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else exc.detail["code"]
+            raise LongGenerationError(detail, exc.status) from None
+        if len(selected_project) != len(project_originals):
+            raise LongGenerationError("postprocess_artifacts_invalid")
+        cursor = 0
+        for index, count in enumerate(project_counts, 1):
+            project_selected_paths[index] = tuple(
+                selected_project[cursor:cursor + count]
+            )
+            cursor += count
+
     frozen: list[FrozenSegment] = []
     authoritative_dialogue_for_delivery: list[dict] = []
     max_provider_duration = (
-        long_video.SEGMENT_PROVIDER_MAX_DURATION_S
-        if receipt_version == long_video.PLAN_RECEIPT_VERSION
-        else long_video.LEGACY_PROVIDER_MAX_DURATION_S
+        long_video.LEGACY_PROVIDER_MAX_DURATION_S
+        if len(raw_segments) == 1
+        else (
+            long_video.SEGMENT_PROVIDER_MAX_DURATION_S
+            if receipt_version == long_video.PLAN_RECEIPT_VERSION
+            else long_video.LEGACY_PROVIDER_MAX_DURATION_S
+        )
     )
     previous_end = 0.0
     previous_chain = None
@@ -629,28 +1505,37 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             or dialogue_binding.get("count") != len(dialogue)
             or dialogue_binding.get("sha256") != _canonical_digest(dialogue)
             or current.get("visual_prompt") != visual
-            or current.get("prompt") != final
+            or (
+                not is_multimodal_receipt
+                and current.get("prompt") != final
+            )
         ):
             raise LongGenerationError("long_video_plan_invalid")
-        try:
-            rebuilt_visual = long_video.compose_segment_visual_prompt(visual)
-            auto_prompt = f"{_PIPELINE_NO_BGM}\n" + prepared_input.compose_final_prompt(
-                rebuilt_visual, source_dialogue
-            )
-        except (prepared_input.PreparedInputError, long_video.LongVideoError):
-            raise LongGenerationError("long_video_plan_invalid") from None
-        if final != auto_prompt:
-            raise LongGenerationError("long_video_plan_invalid")
-        if dialogue_mode == "none":
+        if is_multimodal_receipt:
+            prompt = final
+        else:
             try:
-                rebuilt = prepared_input.compose_final_prompt(
-                    long_video.compose_segment_visual_prompt(visual), ()
+                rebuilt_visual = long_video.compose_segment_visual_prompt(visual)
+                auto_prompt = (
+                    f"{_PIPELINE_NO_BGM}\n"
+                    + prepared_input.compose_final_prompt(
+                        rebuilt_visual, source_dialogue
+                    )
                 )
             except (prepared_input.PreparedInputError, long_video.LongVideoError):
                 raise LongGenerationError("long_video_plan_invalid") from None
-            prompt = f"{_PIPELINE_NO_BGM}\n{rebuilt}"
-        else:
-            prompt = final
+            if final != auto_prompt:
+                raise LongGenerationError("long_video_plan_invalid")
+            if dialogue_mode == "none":
+                try:
+                    rebuilt = prepared_input.compose_final_prompt(
+                        long_video.compose_segment_visual_prompt(visual), ()
+                    )
+                except (prepared_input.PreparedInputError, long_video.LongVideoError):
+                    raise LongGenerationError("long_video_plan_invalid") from None
+                prompt = f"{_PIPELINE_NO_BGM}\n{rebuilt}"
+            else:
+                prompt = final
         segdir = root / "work" / "segments" / str(index)
         fit_base = segdir / "work" / "h3_frames"
         legacy_root = fit_base / fit_mode
@@ -686,13 +1571,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         )
         frozen_keyframes: tuple[h3.FrozenFrame, ...] = ()
         if workflow in h3.H3_REFERENCE_WORKFLOWS:
-            try:
-                selected_paths = postprocess.generation_keyframes(
-                    root, dict(meta), keyframe_paths, settings=settings,
-                )
-            except postprocess.PostprocessError as exc:
-                detail = exc.detail if isinstance(exc.detail, str) else exc.detail["code"]
-                raise LongGenerationError(detail, exc.status) from None
+            selected_paths = project_selected_paths[index]
             selected: list[h3.FrozenFrame] = []
             original_data = {path.resolve(): data for path, data in bound_keyframes}
             for selected_path in selected_paths:
@@ -735,7 +1614,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 # prepare or claim a paid H3 attempt.
                 h3_project.build_request_from_parts(
                     multimodal=frozen_multimodal,
-                    visual_prompt=visual,
+                    visual_prompt=final,
                     keyframes=frozen_keyframes,
                     upstream_dialogue=tuple(dict(line) for line in dialogue),
                     upstream_dialogue_receipt_sha256=dialogue_binding["sha256"],
