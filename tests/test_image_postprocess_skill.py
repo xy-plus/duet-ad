@@ -295,6 +295,37 @@ def test_skill_is_one_concise_plan_only_skill():
         assert retired not in skill
 
 
+def test_skill_and_human_plan_scope_only_define_source_to_target_image_editing():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+    human_plan = human.split("## 图片优化计划", 1)[1]
+
+    for document in (skill, human_plan):
+        for visual_rule in (
+            "人物与真实新场景",
+            "不得仅调色、换纹理或给原结构换皮",
+            "画幅、裁切、机位、镜头、透视、构图",
+            "source-preserve/no-invention",
+        ):
+            assert visual_rule in document
+
+        for out_of_scope in (
+            "素材准入",
+            "供应商",
+            "发布",
+            "H3",
+            "重试",
+            "验收",
+            "plan_audit",
+            "verify_pack",
+            "runtime protocol correction",
+            "内容失败 reason",
+        ):
+            assert out_of_scope not in document
+
+
 def test_verification_skill_path_is_strict_regular_non_symlink(tmp_path, monkeypatch):
     path = image_optimization.verification_skill_path()
     assert path == path.resolve(strict=True)
@@ -319,7 +350,7 @@ def test_public_plan_canonicalizer_is_authoritative_and_returns_a_copy():
     assert source["person_plans"][0]["replacement_identity"] != "mutated"
 
 
-def test_skill_synthesizes_continuity_target_separation_without_content_rejection():
+def test_skill_synthesizes_continuity_target_separation_from_source_evidence():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
     human = Path(
         "docs/human/features/conversation-task/behaviors/postprocess.md"
@@ -334,7 +365,7 @@ def test_skill_synthesizes_continuity_target_separation_without_content_rejectio
         "短视频 `[0]` 也执行人物与场景双替换",
         "不得仅调色、换纹理或给原结构换皮",
         "新几何只产生与原光源一致的局部阴影或反射",
-        "内容不确定不得转化为拒绝",
+        "source-preserve/no-invention 编辑指令",
     ):
         assert rule in skill
 
@@ -342,8 +373,8 @@ def test_skill_synthesizes_continuity_target_separation_without_content_rejectio
         "新人物与新场景跨帧/跨段复用",
         "当前源帧",
         "不从相邻帧、reference 或编辑结果补全",
-        "这些情况不会把计划改成不合格",
-        "外部评测",
+        "source-preserve/no-invention",
+        "未见部分不补造、不猜测",
     ):
         assert rule in human
 
@@ -435,15 +466,9 @@ def test_plan_phase_v3_compiles_one_prompt_for_each_frozen_source_frame(tmp_path
     assert "第二帧可见部位数量与边界保持当前源帧" in prompts[0][2]
 
 
-def test_legacy_ineligible_plan_is_runtime_protocol_correction_not_skill_failure():
+def test_legacy_ineligible_plan_remains_runtime_compatibility_only():
     legacy = _ineligible()
-    human = Path(
-        "docs/human/features/conversation-task/behaviors/postprocess.md"
-    ).read_text(encoding="utf-8")
-
     assert image_optimization.canonical_plan_v2(legacy) == legacy
-    assert "历史 v2/old `eligible=false` 响应" in human
-    assert "runtime protocol correction" in human
 
 
 @pytest.mark.parametrize(
@@ -881,7 +906,7 @@ def test_skill_requires_a_current_frame_fragment_ledger_and_schema_self_audit():
         "`partial/cropped` 不得写成 `absent/fully-in-frame`",
         "不从相邻帧、reference 或编辑结果补证",
         "输出前逐字段自校验",
-        "内容不确定不得转化为拒绝",
+        "source-preserve/no-invention 编辑指令",
     ):
         assert rule in skill
 
@@ -889,7 +914,7 @@ def test_skill_requires_a_current_frame_fragment_ledger_and_schema_self_audit():
         "可见身体部位数量、面部拓扑、姿态骨架、尺度",
         "partial/cropped",
         "同帧直接可见的确定事实",
-        "这些情况不会把计划改成不合格",
+        "未见部分不补造、不猜测",
     ):
         assert rule in human
 
@@ -971,14 +996,14 @@ def test_skill_requires_current_frame_visible_coverage_without_admission_gate():
         "人体、面部拓扑、服装边界与裁切碎片形成闭包",
         "不同边界、法向、深度层或支撑链的物理面不得合并",
         "所有可见碎片写入 `visible_body_parts`",
-        "内容不确定不得转化为拒绝",
+        "source-preserve/no-invention 编辑指令",
     ):
         assert rule in skill
 
     for rule in (
         "可见身体部位数量、面部拓扑、姿态骨架、尺度",
         "不同边界、法向、深度层或支撑链的物理面不得合并",
-        "这些情况不会把计划改成不合格",
+        "未见部分不补造、不猜测",
         "source-preserve/no-invention",
     ):
         assert rule in human
@@ -991,13 +1016,13 @@ def test_v4_skill_compiles_valid_frozen_inputs_and_preserves_ambiguous_regions()
     ).read_text(encoding="utf-8")
 
     for document in (skill, human):
-        assert "有效冻结输入固定输出 `eligible=true`、`reason=null`" in document
-        assert "人物、场景、关系或不可见区域的不确定性不是素材准入条件" in document
         assert "source-preserve/no-invention" in document
         assert "不补造、不猜测，也不输出候选关系" in document
+        assert "eligible=false" not in document
+        assert "素材准入" not in document
 
-    assert "仅当下表每项都闭合才输出 `eligible=true`" not in skill
-    assert "任何未归属可见像素区域或缺关系都输出空计划" not in skill
+    assert "eligible:true" in skill
+    assert "reason:null" in skill
 
 
 def test_skill_scopes_visible_relationships_without_content_failure_reasons():
@@ -1011,7 +1036,6 @@ def test_skill_scopes_visible_relationships_without_content_failure_reasons():
         "不从相邻帧、reference 或编辑结果补证",
         "不把候选关系写入合同",
         "source-preserve/no-invention 编辑指令",
-        "内容不确定不得转化为拒绝",
     ):
         assert rule in skill
 
@@ -1019,7 +1043,7 @@ def test_skill_scopes_visible_relationships_without_content_failure_reasons():
         "同帧直接可见的确定事实",
         "不从相邻帧、reference 或编辑结果补全",
         "source-preserve/no-invention",
-        "这些情况不会把计划改成不合格",
+        "未见部分不补造、不猜测",
     ):
         assert rule in human
 
@@ -1763,7 +1787,7 @@ def test_v4_visibility_transition_is_source_preservation_not_skill_rejection():
     assert graph["views"][2]["observations"][1]["visibility"] == "out_of_view"
     for document in (skill, human):
         assert "same_camera 的 `occluded`→`out_of_view`" in document
-        assert "不得作为内容 schema 拒绝" in document
+        assert "只按当前源帧可见性" in document
 
 
 def _make_topology_cycle(value: dict) -> None:
@@ -2238,7 +2262,6 @@ def test_v4_skill_and_human_contract_define_target_authority_without_audit_role(
     assert "不引用逐帧 source `ENTITY_ID`" in skill
     assert "图内不得引用逐帧 source ENTITY_ID" in human
     assert "只有 `phase=plan`" in human
-    assert "外部评测" in human
     assert "plan_audit" not in skill
     assert "verify_pack" not in skill
 
@@ -2411,5 +2434,4 @@ def test_skill_requires_backend_pixel_authoritative_global_palette_contract():
         assert "saturation_style" in text
         assert "局部固有色" in text
         assert "不得翻转整帧冷暖感知" in text
-        assert "后端从冻结 source 像素计算并覆盖" in text
-        assert "模型不得自报或决定精确 Lab 合同" in text
+        assert "全局光源方向" in text
