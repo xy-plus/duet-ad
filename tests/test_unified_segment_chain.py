@@ -414,6 +414,12 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
     assert calls == [root]
     meta = storage.load_meta(settings.data_dir, cid)
     assert meta is not None
+    assert meta["_prompt_fusion"]["raw_output_path"] == (
+        "work/h3_prompt_plan.json"
+    )
+    assert meta["_prompt_fusion"]["raw_output_sha256"] == hashlib.sha256(
+        (root / "work" / "h3_prompt_plan.json").read_bytes()
+    ).hexdigest()
     assert main._public_prompt_fusion(meta, root) == {
         "status": "done",
         "error": None,
@@ -497,7 +503,11 @@ def test_failed_lf_output_can_publish_receipt_without_rerunning_skill(
     )
     raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
 
-    assert pipeline.finalize_prompt_fusion_receipt(settings, cid) == "done"
+    assert pipeline.finalize_prompt_fusion_receipt(
+        settings,
+        cid,
+        expected_raw_output_sha256=raw_output_sha256,
+    ) == "done"
 
     assert hashlib.sha256(output.read_bytes()).hexdigest() == raw_output_sha256
     frozen = long_generation.load_prompt_fusion_manifest(
@@ -513,6 +523,10 @@ def test_failed_lf_output_can_publish_receipt_without_rerunning_skill(
     assert meta["_prompt_fusion"]["recovered_error"] == (
         "prompt_fusion_output_invalid"
     )
+    assert meta["_prompt_fusion"]["raw_output_path"] == (
+        "work/h3_prompt_plan.json"
+    )
+    assert meta["_prompt_fusion"]["raw_output_sha256"] == raw_output_sha256
     assert meta["_prompt_fusion"]["manifest_sha256"] == hashlib.sha256(
         (root / "work" / h3_project.SOURCE_FILENAME).read_bytes()
     ).hexdigest()
@@ -525,12 +539,111 @@ def test_failed_lf_output_can_publish_receipt_without_rerunning_skill(
     ).hexdigest()
 
 
+@pytest.mark.parametrize(
+    "expected_raw_output_sha256",
+    [None, "0" * 64],
+    ids=("missing", "wrong"),
+)
+def test_legacy_receipt_finalization_requires_exact_operator_audited_raw_sha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_raw_output_sha256: str | None,
+) -> None:
+    settings, cid, root, _skill_path, _output = _failed_lf_prompt_fusion(
+        tmp_path, monkeypatch,
+    )
+
+    with pytest.raises(pipeline.PipelineError):
+        pipeline.finalize_prompt_fusion_receipt(
+            settings,
+            cid,
+            expected_raw_output_sha256=expected_raw_output_sha256,
+        )
+
+    assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
+    assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
+        "status"
+    ] == "failed"
+
+
+def test_producer_failure_binds_raw_sha_and_rejects_schema_valid_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings(tmp_path)
+    created = storage.new_conversation(
+        settings.data_dir, "fusion-raw-binding", "source.mp4"
+    )
+    cid = created["id"]
+    root = settings.data_dir / cid
+    acceptance_sha256 = "a" * 64
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _image_user_acceptance={"version": 1, "sha256": acceptance_sha256},
+    )
+    skill_path = tmp_path / "video-prompt-fusion-SKILL.md"
+    skill_path.write_text("strict frozen prompt fusion", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "PROMPT_FUSION_SKILL_MD", skill_path)
+    monkeypatch.setattr(
+        long_generation, "PROMPT_FUSION_SKILL_SOURCE", skill_path
+    )
+    input_data = _fusion_input(root, 1)
+    assert pipeline.queue_prompt_fusion(
+        settings,
+        cid,
+        input_data=input_data,
+        image_acceptance_sha256=acceptance_sha256,
+    ) == "queued"
+
+    class Runner:
+        def run(self, cwd: Path, _prompt: str) -> None:
+            (cwd / "work" / "h3_prompt_plan.json").write_bytes(_canonical({
+                "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+                "version": long_generation.PROMPT_FUSION_VERSION,
+                "input_sha256": hashlib.sha256(input_data).hexdigest(),
+                "segments": [{
+                    "index": 1,
+                    "final_prompt": (
+                        "<VISUAL>original</VISUAL>"
+                        "<AUDIO_CONTENT_JSON> [] </AUDIO_CONTENT_JSON>"
+                    ),
+                }],
+            }))
+
+    assert pipeline.produce_prompt_fusion(settings, cid, Runner()) == "failed"
+    output = root / "work" / "h3_prompt_plan.json"
+    original_raw_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
+    failed = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+    assert failed["status"] == "failed"
+    assert failed["error"] == "prompt_fusion_output_invalid"
+    assert failed["raw_output_path"] == "work/h3_prompt_plan.json"
+    assert failed["raw_output_sha256"] == original_raw_sha256
+
+    output.write_bytes(_canonical({
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{
+            "index": 1,
+            "final_prompt": (
+                "<VISUAL>schema-valid replacement</VISUAL>"
+                "<AUDIO_CONTENT_JSON>\n[]\n</AUDIO_CONTENT_JSON>"
+            ),
+        }],
+    }))
+
+    with pytest.raises(pipeline.PipelineError, match="raw output drifted"):
+        pipeline.finalize_prompt_fusion_receipt(settings, cid)
+    assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
+
+
 def test_receipt_finalization_serializes_a_concurrent_generation_writer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings, cid, _root, _skill_path, _output = _failed_lf_prompt_fusion(
+    settings, cid, _root, _skill_path, output = _failed_lf_prompt_fusion(
         tmp_path, monkeypatch,
     )
+    expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     original_publish = pipeline._publish_prompt_fusion_manifest
     writer_started = threading.Event()
     writer_finished = threading.Event()
@@ -556,7 +669,11 @@ def test_receipt_finalization_serializes_a_concurrent_generation_writer(
 
     monkeypatch.setattr(pipeline, "_publish_prompt_fusion_manifest", publish)
 
-    assert pipeline.finalize_prompt_fusion_receipt(settings, cid) == "done"
+    assert pipeline.finalize_prompt_fusion_receipt(
+        settings,
+        cid,
+        expected_raw_output_sha256=expected_raw_output_sha256,
+    ) == "done"
     writer[0].join(1)
     assert writer_finished.is_set()
     meta = storage.load_meta(settings.data_dir, cid)
@@ -567,9 +684,10 @@ def test_receipt_finalization_serializes_a_concurrent_generation_writer(
 def test_receipt_finalization_rejects_publish_hook_cas_drift_without_orphan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings, cid, root, _skill_path, _output = _failed_lf_prompt_fusion(
+    settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
         tmp_path, monkeypatch,
     )
+    expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     original_publish = pipeline._publish_prompt_fusion_manifest
 
     def publish(**kwargs):
@@ -586,7 +704,11 @@ def test_receipt_finalization_rejects_publish_hook_cas_drift_without_orphan(
         pipeline.PipelineError,
         match="state drifted during finalization",
     ):
-        pipeline.finalize_prompt_fusion_receipt(settings, cid)
+        pipeline.finalize_prompt_fusion_receipt(
+            settings,
+            cid,
+            expected_raw_output_sha256=expected_raw_output_sha256,
+        )
 
     assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
     assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
@@ -597,9 +719,10 @@ def test_receipt_finalization_rejects_publish_hook_cas_drift_without_orphan(
 def test_receipt_finalization_cleans_exact_manifest_after_publish_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings, cid, root, _skill_path, _output = _failed_lf_prompt_fusion(
+    settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
         tmp_path, monkeypatch,
     )
+    expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     original_atomic = pipeline._atomic_bytes
 
     def write_then_fail(path: Path, data: bytes) -> None:
@@ -609,7 +732,11 @@ def test_receipt_finalization_cleans_exact_manifest_after_publish_failure(
     monkeypatch.setattr(pipeline, "_atomic_bytes", write_then_fail)
 
     with pytest.raises(OSError, match="simulated publish failure"):
-        pipeline.finalize_prompt_fusion_receipt(settings, cid)
+        pipeline.finalize_prompt_fusion_receipt(
+            settings,
+            cid,
+            expected_raw_output_sha256=expected_raw_output_sha256,
+        )
 
     assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
     assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
@@ -620,9 +747,10 @@ def test_receipt_finalization_cleans_exact_manifest_after_publish_failure(
 def test_exact_crash_residue_is_unreadable_until_receipt_finalization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings, cid, root, skill_path, _output = _failed_lf_prompt_fusion(
+    settings, cid, root, skill_path, output = _failed_lf_prompt_fusion(
         tmp_path, monkeypatch,
     )
+    expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     meta = storage.load_meta(settings.data_dir, cid)
     pipeline._publish_prompt_fusion_manifest(
         root=root,
@@ -640,7 +768,11 @@ def test_exact_crash_residue_is_unreadable_until_receipt_finalization(
             skill_source_path=skill_path,
         )
 
-    assert pipeline.finalize_prompt_fusion_receipt(settings, cid) == "done"
+    assert pipeline.finalize_prompt_fusion_receipt(
+        settings,
+        cid,
+        expected_raw_output_sha256=expected_raw_output_sha256,
+    ) == "done"
     committed = storage.load_meta(settings.data_dir, cid)
     assert long_generation.load_bound_prompt_fusion_manifest(
         root=root,
@@ -661,6 +793,7 @@ def test_receipt_only_finalization_rejects_any_frozen_authority_drift(
     settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
         tmp_path, monkeypatch,
     )
+    expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     if drift == "input":
         (root / "work" / h3_project.SKILL_INPUT_FILENAME).write_bytes(b"{}")
     elif drift == "output":
@@ -685,7 +818,11 @@ def test_receipt_only_finalization_rejects_any_frozen_authority_drift(
         )
 
     with pytest.raises(pipeline.PipelineError):
-        pipeline.finalize_prompt_fusion_receipt(settings, cid)
+        pipeline.finalize_prompt_fusion_receipt(
+            settings,
+            cid,
+            expected_raw_output_sha256=expected_raw_output_sha256,
+        )
 
     assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
     assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][

@@ -1865,7 +1865,12 @@ def _publish_prompt_fusion_manifest(
     return frozen, manifest_data
 
 
-def _recoverable_prompt_fusion_state(root: Path, meta: Mapping) -> dict:
+def _recoverable_prompt_fusion_state(
+    root: Path,
+    meta: Mapping,
+    *,
+    expected_raw_output_sha256: str | None,
+) -> dict:
     state = meta.get("_prompt_fusion")
     if (
         not isinstance(state, dict)
@@ -1884,7 +1889,48 @@ def _recoverable_prompt_fusion_state(root: Path, meta: Mapping) -> dict:
     )
     if any(path.exists() for path in downstream_roots):
         raise PipelineError("prompt fusion downstream state already exists")
-    return dict(state)
+    frozen_state = dict(state)
+    raw_output_path = state.get("raw_output_path")
+    raw_output_sha256 = state.get("raw_output_sha256")
+    legacy_recovery = raw_output_path is None and raw_output_sha256 is None
+    if legacy_recovery:
+        if (
+            not isinstance(expected_raw_output_sha256, str)
+            or len(expected_raw_output_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_raw_output_sha256
+            )
+        ):
+            raise PipelineError("prompt fusion raw output authority is required")
+        raw_output_path = "work/h3_prompt_plan.json"
+        raw_output_sha256 = expected_raw_output_sha256
+        frozen_state.update(
+            raw_output_path=raw_output_path,
+            raw_output_sha256=raw_output_sha256,
+        )
+    elif (
+        expected_raw_output_sha256 is not None
+        or raw_output_path != "work/h3_prompt_plan.json"
+        or not isinstance(raw_output_sha256, str)
+        or len(raw_output_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in raw_output_sha256
+        )
+    ):
+        raise PipelineError("prompt fusion raw output authority is invalid")
+    output_path = root / "work" / "h3_prompt_plan.json"
+    try:
+        raw_output_data = output_path.read_bytes()
+    except OSError:
+        raise PipelineError("prompt fusion raw output is missing") from None
+    if (
+        output_path.is_symlink()
+        or hashlib.sha256(raw_output_data).hexdigest() != raw_output_sha256
+    ):
+        raise PipelineError("prompt fusion raw output drifted")
+    return frozen_state
 
 
 def _unlink_exact_prompt_fusion_manifest(path: Path, data: bytes) -> None:
@@ -1895,14 +1941,23 @@ def _unlink_exact_prompt_fusion_manifest(path: Path, data: bytes) -> None:
         pass
 
 
-def finalize_prompt_fusion_receipt(settings: Settings, cid: str) -> str:
+def finalize_prompt_fusion_receipt(
+    settings: Settings,
+    cid: str,
+    *,
+    expected_raw_output_sha256: str | None = None,
+) -> str:
     """Finalize one exact terminal LF-envelope output without running a Skill."""
     root = (settings.data_dir / cid).resolve()
     manifest_path = root / "work" / h3_project.SOURCE_FILENAME
     publication: dict[str, object] = {}
 
     def commit(current: dict) -> None:
-        state = _recoverable_prompt_fusion_state(root, current)
+        state = _recoverable_prompt_fusion_state(
+            root,
+            current,
+            expected_raw_output_sha256=expected_raw_output_sha256,
+        )
         manifest_existed = manifest_path.exists()
         _frozen, manifest_data = _publish_prompt_fusion_manifest(
             root=root, meta=current, state=state,
@@ -1912,7 +1967,11 @@ def finalize_prompt_fusion_receipt(settings: Settings, cid: str) -> str:
             created=not manifest_existed,
         )
         try:
-            refreshed_state = _recoverable_prompt_fusion_state(root, current)
+            refreshed_state = _recoverable_prompt_fusion_state(
+                root,
+                current,
+                expected_raw_output_sha256=expected_raw_output_sha256,
+            )
         except PipelineError:
             raise PipelineError(
                 "prompt fusion state drifted during finalization"
@@ -1995,8 +2054,26 @@ def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
             "只读 work/multimodal_input.json 及其绑定的有序图片，只写 "
             "work/h3_prompt_plan.json。不得运行音频、Binding、Speaker 或其他 phase。",
         )
+        if output_path.is_symlink():
+            raise PipelineError("prompt fusion raw output is invalid")
+        try:
+            raw_output_data = output_path.read_bytes()
+        except OSError:
+            raise PipelineError("prompt fusion raw output is missing") from None
+        state = {
+            **state,
+            "raw_output_path": "work/h3_prompt_plan.json",
+            "raw_output_sha256": hashlib.sha256(raw_output_data).hexdigest(),
+        }
+        persisted_meta = storage.update_meta(
+            settings.data_dir,
+            cid,
+            _prompt_fusion=state,
+        )
+        if persisted_meta is None:
+            raise PipelineError("prompt fusion raw output receipt was not persisted")
         _frozen, manifest_data = _publish_prompt_fusion_manifest(
-            root=root, meta=meta, state=state,
+            root=root, meta=persisted_meta, state=state,
         )
         persist(
             "done",
