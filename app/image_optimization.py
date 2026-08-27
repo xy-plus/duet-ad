@@ -128,6 +128,24 @@ def _copy_regular(source: Path, destination: Path) -> None:
         os.close(fd)
 
 
+def _sha256_regular(source: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(source, flags)
+    except OSError:
+        raise ValueError("invalid image optimization keyframe") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("invalid image optimization keyframe")
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
 def _read_json_output(path: Path, max_bytes: int) -> object:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -1170,33 +1188,13 @@ def reference_slots(plan: dict) -> dict[str, list[dict]]:
     return {"identity": identity, "scene": scene, "layout": layout}
 
 
-def freeze_execution_inputs(
-    plan: dict,
-    *,
-    revision: int,
-    profile: dict,
-    model: str,
-    frame_inventory: list[dict],
-) -> dict:
+def _canonical_plan_with_frame_inventory(
+    plan: dict, frame_inventory: list[dict]
+) -> tuple[dict, list[dict]]:
     canonical = _canonical_plan(plan)
     if not canonical["eligible"]:
         raise ImageOptimizationIneligibleError(canonical["reason"])
-    if (
-        isinstance(revision, bool)
-        or not isinstance(revision, int)
-        or revision < 1
-        or not isinstance(profile, dict)
-        or set(profile) != {"id", "revision"}
-        or not isinstance(profile.get("id"), str)
-        or profile["id"] != profile["id"].strip()
-        or not profile["id"]
-        or isinstance(profile.get("revision"), bool)
-        or not isinstance(profile.get("revision"), int)
-        or profile["revision"] < 1
-        or model not in SEEDREAM_MODELS
-        or not isinstance(frame_inventory, list)
-        or not frame_inventory
-    ):
+    if not isinstance(frame_inventory, list) or not frame_inventory:
         raise ValueError("invalid image optimization execution inputs")
     inventory = []
     lookup: dict[tuple[int, int], dict] = {}
@@ -1242,6 +1240,37 @@ def freeze_execution_inputs(
         )
     except ImageOptimizationOutputError:
         raise ValueError("invalid image optimization execution inputs") from None
+    return canonical, inventory
+
+
+def freeze_execution_inputs(
+    plan: dict,
+    *,
+    revision: int,
+    profile: dict,
+    model: str,
+    frame_inventory: list[dict],
+) -> dict:
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(profile, dict)
+        or set(profile) != {"id", "revision"}
+        or not isinstance(profile.get("id"), str)
+        or profile["id"] != profile["id"].strip()
+        or not profile["id"]
+        or isinstance(profile.get("revision"), bool)
+        or not isinstance(profile.get("revision"), int)
+        or profile["revision"] < 1
+        or model not in SEEDREAM_MODELS
+    ):
+        raise ValueError("invalid image optimization execution inputs")
+    canonical, inventory = _canonical_plan_with_frame_inventory(plan, frame_inventory)
+    lookup = {
+        (item["segment_index"], item["frame_index"]): item
+        for item in inventory
+    }
 
     slots = reference_slots(canonical)
 
@@ -1526,6 +1555,239 @@ def freeze_continuity(
         **canonical,
         "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
     }}
+
+
+def freeze_plan_audit_inputs(plan: dict, *, frame_inventory: list[dict]) -> dict:
+    """Freeze the source-frame evidence a pre-provider v3 audit may inspect."""
+    try:
+        canonical, inventory = _canonical_plan_with_frame_inventory(
+            plan, frame_inventory
+        )
+    except ValueError:
+        raise ValueError("invalid image plan audit inputs") from None
+    if canonical["version"] != 3:
+        raise ValueError("invalid image plan audit inputs")
+    frame_counts = {
+        index: sum(item["segment_index"] == index for item in inventory)
+        for index in canonical["segment_indices"]
+    }
+    continuity = freeze_continuity(canonical, frame_counts=frame_counts)[
+        "_image_continuity"
+    ]
+    payload = {
+        "version": 1,
+        "plan_sha256": plan_sha256(canonical),
+        "continuity_sha256": continuity["sha256"],
+        "frames": inventory,
+    }
+    return {**payload, "sha256": sha256(_plan_json(payload))}
+
+
+def _canonical_plan_audit_inputs(plan: dict, value: object) -> tuple[dict, dict]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "version", "plan_sha256", "continuity_sha256", "frames", "sha256"
+        }
+        or value.get("version") != 1
+        or not isinstance(value.get("plan_sha256"), str)
+        or _SHA256_RE.fullmatch(value["plan_sha256"]) is None
+        or not isinstance(value.get("continuity_sha256"), str)
+        or _SHA256_RE.fullmatch(value["continuity_sha256"]) is None
+        or not isinstance(value.get("sha256"), str)
+        or _SHA256_RE.fullmatch(value["sha256"]) is None
+        or not isinstance(value.get("frames"), list)
+    ):
+        raise ImageOptimizationOutputError("image plan audit input is missing or invalid")
+    try:
+        canonical, _ = _canonical_plan_with_frame_inventory(plan, value["frames"])
+        expected = freeze_plan_audit_inputs(plan, frame_inventory=value["frames"])
+    except (ValueError, ImageOptimizationIneligibleError):
+        raise ImageOptimizationOutputError(
+            "image plan audit input is missing or invalid"
+        ) from None
+    if canonical["version"] != 3 or value != expected:
+        raise ImageOptimizationOutputError("image plan audit input is missing or invalid")
+    return canonical, expected
+
+
+def canonical_plan_audit_verdict(value: object, plan: dict, audit_inputs: dict) -> dict:
+    """Validate a source-bound, exact per-frame pre-provider audit verdict."""
+    canonical_plan, receipt = _canonical_plan_audit_inputs(plan, audit_inputs)
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "version", "phase", "plan_sha256", "continuity_sha256",
+            "audit_input_sha256", "passed", "reason", "frame_checks",
+        }
+        or value.get("version") != 3
+        or value.get("phase") != "plan_audit"
+        or value.get("plan_sha256") != receipt["plan_sha256"]
+        or value.get("continuity_sha256") != receipt["continuity_sha256"]
+        or value.get("audit_input_sha256") != receipt["sha256"]
+        or not isinstance(value.get("passed"), bool)
+        or not isinstance(value.get("frame_checks"), list)
+        or len(value["frame_checks"]) != len(receipt["frames"])
+    ):
+        raise ImageOptimizationOutputError("image plan audit output is missing or invalid")
+    checks = []
+    statuses = []
+    for expected, raw in zip(receipt["frames"], value["frame_checks"]):
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {
+                "segment_index", "frame_index", "source_sha256", "body_closure",
+                "scene_closure", "entity_closure", "relation_closure",
+            }
+            or raw.get("segment_index") != expected["segment_index"]
+            or raw.get("frame_index") != expected["frame_index"]
+            or raw.get("source_sha256") != expected["source_sha256"]
+        ):
+            raise ImageOptimizationOutputError(
+                "image plan audit output is missing or invalid"
+            )
+        item = {
+            "segment_index": expected["segment_index"],
+            "frame_index": expected["frame_index"],
+            "source_sha256": expected["source_sha256"],
+        }
+        for key in (
+            "body_closure", "scene_closure", "entity_closure", "relation_closure"
+        ):
+            item[key] = _canonical_quality_check(raw.get(key))
+            statuses.append(item[key]["status"])
+        checks.append(item)
+    passed = all(status == "pass" for status in statuses)
+    reason = None if passed else (
+        "plan_audit_unknown" if "unknown" in statuses else "plan_audit_failed"
+    )
+    if value["passed"] != passed or value.get("reason") != reason:
+        raise ImageOptimizationOutputError("image plan audit output is missing or invalid")
+    return {
+        "version": 3,
+        "phase": "plan_audit",
+        "plan_sha256": receipt["plan_sha256"],
+        "continuity_sha256": receipt["continuity_sha256"],
+        "audit_input_sha256": receipt["sha256"],
+        "passed": passed,
+        "reason": reason,
+        "frame_checks": checks,
+    }
+
+
+def generate_plan_audit_verdict(
+    runner,
+    plan: dict,
+    audit_inputs: dict,
+    segments: list[dict],
+    *,
+    session_dir: Path,
+) -> dict:
+    """Audit only frozen source frames before any provider submission."""
+    try:
+        session = Path(session_dir).resolve(strict=True)
+        skill = verification_skill_path()
+        canonical_plan, receipt = _canonical_plan_audit_inputs(plan, audit_inputs)
+    except (OSError, TypeError, ValueError, ImageOptimizationOutputError):
+        raise ValueError("invalid image plan audit input") from None
+    if (
+        not isinstance(segments, list)
+        or len(segments) != len(canonical_plan["segment_indices"])
+    ):
+        raise ValueError("invalid image plan audit input")
+    prepared = []
+    actual_inventory = []
+    for expected, segment in zip(canonical_plan["segment_indices"], segments):
+        if (
+            not isinstance(segment, dict)
+            or set(segment) != {"index", "source_keyframes_dir"}
+            or segment.get("index") != expected
+        ):
+            raise ValueError("invalid image plan audit input")
+        try:
+            source = Path(segment["source_keyframes_dir"]).resolve(strict=True)
+            source.relative_to(session)
+            frames = _validated_frames(source)
+        except (OSError, TypeError, ValueError):
+            raise ValueError("invalid image plan audit input") from None
+        prepared.append((expected, frames))
+        for frame_index, frame in enumerate(frames, 1):
+            actual_inventory.append(
+                {
+                    "segment_index": expected,
+                    "frame_index": frame_index,
+                    "frame_name": frame.name,
+                    "source_sha256": _sha256_regular(frame),
+                }
+            )
+    if actual_inventory != receipt["frames"]:
+        raise ValueError("invalid image plan audit input")
+    frame_counts = {index: len(frames) for index, frames in prepared}
+    with tempfile.TemporaryDirectory(prefix="duet-image-plan-audit-", dir="/tmp") as raw:
+        stage = Path(raw).resolve(strict=True)
+        work = stage / "work"
+        work.mkdir(parents=True, mode=0o700)
+        _copy_regular(skill, stage / "SKILL.md")
+        (work / "request.json").write_text(
+            json.dumps(
+                {
+                    "phase": "plan_audit",
+                    "plan_sha256": receipt["plan_sha256"],
+                    "continuity_sha256": receipt["continuity_sha256"],
+                    "audit_input_sha256": receipt["sha256"],
+                    "segment_indices": canonical_plan["segment_indices"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (work / "frozen_plan.json").write_text(
+            json.dumps(
+                freeze_continuity(
+                    canonical_plan, frame_counts=frame_counts
+                )["_image_continuity"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (work / "audit_inputs.json").write_text(
+            _plan_json(receipt) + "\n", encoding="utf-8"
+        )
+        for index, frames in prepared:
+            destination = work / "segments" / str(index) / "source"
+            destination.mkdir(parents=True, mode=0o700)
+            for frame in frames:
+                _copy_regular(frame, destination / frame.name)
+        run_error: CodexError | None = None
+        try:
+            runner.run_isolated(
+                stage,
+                "严格执行当前目录 SKILL.md 的 plan_audit 阶段；只读取允许的输入，"
+                "并写入规定的唯一输出文件。",
+                session_dir=session,
+            )
+        except CodexError as error:
+            run_error = error
+        try:
+            return canonical_plan_audit_verdict(
+                _read_json_output(
+                    work / "plan_audit.json",
+                    MAX_CONTINUITY_BYTES
+                    + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES
+                    + len(receipt["frames"]) * 4 * 2048,
+                ),
+                canonical_plan,
+                receipt,
+            )
+        except ImageOptimizationOutputError:
+            if run_error is not None:
+                raise run_error from None
+            raise
 
 
 def continuity_receipt(meta: dict) -> dict | None:
