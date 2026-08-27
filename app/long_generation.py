@@ -11,7 +11,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from app import frame_fit, h3, long_video, postprocess, prepared_input, stitch, storage
+from app import (
+    context_ir_bridge,
+    frame_fit,
+    h3,
+    h3_project,
+    long_video,
+    postprocess,
+    prepared_input,
+    stitch,
+    storage,
+)
 
 WORKFLOW = h3.H3_WORKFLOW
 _PLAN_WORKFLOWS = h3.H3_REFERENCE_WORKFLOWS | {h3.H3_BOUNDARY_WORKFLOW}
@@ -51,6 +61,9 @@ class FrozenSegment:
     last_frame_data: bytes
     prompt: str
     keyframes: tuple[h3.FrozenFrame, ...] = ()
+    multimodal: h3_project.FrozenProjectMultimodal | None = None
+    dialogue: tuple[dict, ...] = ()
+    dialogue_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +148,131 @@ def plan_receipt(root: Path, meta: Mapping) -> str | None:
         return _digest(path)
     except LongGenerationError:
         return None
+
+
+def finalize_multimodal_plan(
+    root: Path,
+    meta: Mapping,
+    expected_receipt: str,
+    fit_mode: str,
+    dialogue_mode: str,
+    *,
+    aspect_ratio: str,
+    resolution: str,
+) -> str | None:
+    """Finalize staged per-segment audio plans before a paid submit.
+
+    A v2 plan remains the user-confirmed base.  If an independent audio phase
+    has atomically completed every segment manifest, this replaces it with a
+    v3 receipt and returns the new digest.  The current submit must stop and
+    require the caller to review/resubmit that exact digest.
+    """
+    root = Path(root).resolve()
+    if isinstance(meta.get("generation"), Mapping):
+        return None
+    receipt_path = root / long_video.PLAN_RECEIPT_FILENAME
+    try:
+        previous_bytes = receipt_path.read_bytes()
+        payload = json.loads(previous_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    if hashlib.sha256(previous_bytes).hexdigest() != expected_receipt:
+        raise LongGenerationError("long_video_plan_changed")
+    receipt_version = payload.get("version") if isinstance(payload, Mapping) else None
+    if receipt_version == long_video.MULTIMODAL_PLAN_RECEIPT_VERSION:
+        return None
+    if receipt_version != long_video.PLAN_RECEIPT_VERSION:
+        return None
+    current_segments = meta.get("segments")
+    if not isinstance(current_segments, list) or not current_segments:
+        raise LongGenerationError("long_video_plan_invalid")
+    intent: list[bool] = []
+    complete: list[bool] = []
+    receipt_segments: list[dict] = []
+    for expected_index, current in enumerate(current_segments, 1):
+        if not isinstance(current, Mapping) or current.get("index") != expected_index:
+            raise LongGenerationError("long_video_plan_invalid")
+        segdir = root / "work" / "segments" / str(expected_index)
+        segwork = segdir / "work"
+        manifest = segwork / h3_project.SOURCE_FILENAME
+        intent.append(any(
+            (segwork / name).exists()
+            for name in (
+                h3_project.SKILL_INPUT_FILENAME,
+                "h3_prompt_plan.json",
+                h3_project.SOURCE_FILENAME,
+            )
+        ))
+        complete.append(manifest.is_file())
+        try:
+            receipt_segments.append({
+                **dict(current),
+                "source_path": root / "work" / str(current["source"]),
+                "keyframe_paths": [
+                    root / "work" / str(path)
+                    for path in current["keyframe_paths"]
+                ],
+                "first_frame_path": (
+                    root / "work" / str(current["first_frame_path"])
+                ),
+                "last_frame_path": (
+                    root / "work" / str(current["last_frame_path"])
+                ),
+                "visual_prompt_path": segwork / "visual_prompt.txt",
+                "final_prompt_path": segwork / "prompt.txt",
+                "dialogue": (
+                    [] if dialogue_mode == "none" else list(current["dialogue"])
+                ),
+                "multimodal_manifest_path": manifest,
+            })
+        except (KeyError, TypeError):
+            raise LongGenerationError("long_video_plan_invalid") from None
+    if not any(intent):
+        return None
+    if not all(complete):
+        raise LongGenerationError("long_video_multimodal_incomplete")
+
+    base = freeze_plan(
+        root,
+        meta,
+        expected_receipt,
+        fit_mode,
+        dialogue_mode,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        prepare_fit=True,
+    )
+    try:
+        long_video.write_plan_receipt(
+            root,
+            source=base.source,
+            duration_s=float(meta["duration_s"]),
+            segments=receipt_segments,
+            workflow=h3.H3_MULTIMODAL_WORKFLOW,
+            dialogue_mode=dialogue_mode,
+        )
+        promoted = _digest(receipt_path)
+        freeze_plan(
+            root,
+            meta,
+            promoted,
+            fit_mode,
+            dialogue_mode,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            prepare_fit=True,
+        )
+    except (OSError, KeyError, TypeError, ValueError, long_video.LongVideoError,
+            LongGenerationError) as exc:
+        temporary = receipt_path.with_name(receipt_path.name + ".rollback")
+        try:
+            temporary.write_bytes(previous_bytes)
+            temporary.replace(receipt_path)
+        except OSError:
+            pass
+        code = getattr(exc, "code", "long_video_multimodal_invalid")
+        raise LongGenerationError(code) from None
+    return promoted
 
 
 def _bound_path(root: Path, artifact: object) -> Path:
@@ -290,12 +428,22 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         or receipt_version not in {
             long_video.LEGACY_PLAN_RECEIPT_VERSION,
             long_video.PLAN_RECEIPT_VERSION,
+            long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
         }
         or payload.get("workflow") not in _PLAN_WORKFLOWS
     ):
         raise LongGenerationError("long_video_plan_invalid")
     source = _bound_path(root, payload.get("source"))
     receipt_workflow = payload["workflow"]
+    is_multimodal_receipt = (
+        receipt_version == long_video.MULTIMODAL_PLAN_RECEIPT_VERSION
+    )
+    if is_multimodal_receipt != (receipt_workflow in h3.H3_MULTIMODAL_WORKFLOWS):
+        raise LongGenerationError("long_video_plan_invalid")
+    if is_multimodal_receipt and payload.get("dialogue_mode") != dialogue_mode:
+        raise LongGenerationError(
+            "long_video_multimodal_dialogue_refresh_required", 409
+        )
     generation = meta.get("generation")
     persisted_workflow = (
         generation.get("workflow") if isinstance(generation, Mapping) else None
@@ -417,10 +565,16 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             final = final_data.decode("utf-8")
         except UnicodeDecodeError:
             raise LongGenerationError("long_video_plan_invalid") from None
-        dialogue = current.get("dialogue")
+        source_dialogue = current.get("dialogue")
+        dialogue = (
+            []
+            if is_multimodal_receipt and dialogue_mode == "none"
+            else source_dialogue
+        )
         dialogue_binding = raw.get("dialogue")
         if (
-            not isinstance(dialogue, list)
+            not isinstance(source_dialogue, list)
+            or not isinstance(dialogue, list)
             or not isinstance(dialogue_binding, dict)
             or set(dialogue_binding) != {"count", "sha256"}
             or dialogue_binding.get("count") != len(dialogue)
@@ -432,7 +586,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         try:
             rebuilt_visual = long_video.compose_segment_visual_prompt(visual)
             auto_prompt = f"{_PIPELINE_NO_BGM}\n" + prepared_input.compose_final_prompt(
-                rebuilt_visual, dialogue
+                rebuilt_visual, source_dialogue
             )
         except (prepared_input.PreparedInputError, long_video.LongVideoError):
             raise LongGenerationError("long_video_plan_invalid") from None
@@ -513,9 +667,60 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                     )
                 )
             frozen_keyframes = tuple(selected)
-        frozen.append(FrozenSegment(index, start_s, end_s, chain_id, join_mode,
-                                    segdir, first, first_data, last, last_data,
-                                    prompt, frozen_keyframes))
+        frozen_multimodal = None
+        if is_multimodal_receipt:
+            try:
+                frozen_multimodal = h3_project.load_bound(
+                    root, raw.get("multimodal")
+                )
+            except h3_project.ProjectMultimodalError as exc:
+                raise LongGenerationError(exc.code) from None
+            expected_workflow = {
+                "multimodal": h3.H3_MULTIMODAL_WORKFLOW,
+                "multimodal_hd": h3.H3_MULTIMODAL_HD_WORKFLOW,
+            }.get(frozen_multimodal.mode)
+            if expected_workflow != workflow:
+                raise LongGenerationError("long_video_plan_invalid")
+            try:
+                # Validate the exact Skill semantics before any caller can
+                # prepare or claim a paid H3 attempt.
+                h3_project.build_request_from_parts(
+                    multimodal=frozen_multimodal,
+                    visual_prompt=visual,
+                    keyframes=frozen_keyframes,
+                    upstream_dialogue=tuple(dict(line) for line in dialogue),
+                    upstream_dialogue_receipt_sha256=dialogue_binding["sha256"],
+                    cid=f"freeze-segment-{index}",
+                    workdir=segdir / "work" / "h3-native",
+                    client_request_id=f"freeze-segment-{index}",
+                    duration=long_video.provider_duration_s(
+                        start_s, end_s, receipt_version=receipt_version
+                    ),
+                    resolution=resolution,
+                    aspect_ratio=aspect_ratio,
+                    autodl_token="freeze-validation-only",
+                )
+            except (h3.H3Error, h3_project.ProjectMultimodalError):
+                raise LongGenerationError("long_video_multimodal_invalid") from None
+        elif raw.get("multimodal") is not None:
+            raise LongGenerationError("long_video_plan_invalid")
+        frozen.append(FrozenSegment(
+            index=index,
+            start_s=start_s,
+            end_s=end_s,
+            chain_id=chain_id,
+            join_mode=join_mode,
+            workdir=segdir,
+            first_frame=first,
+            first_frame_data=first_data,
+            last_frame=last,
+            last_frame_data=last_data,
+            prompt=prompt,
+            keyframes=frozen_keyframes,
+            multimodal=frozen_multimodal,
+            dialogue=tuple(dict(line) for line in dialogue),
+            dialogue_sha256=dialogue_binding["sha256"],
+        ))
         previous_end, previous_chain = end_s, chain_id
     if abs(previous_end - duration) > _EPS:
         raise LongGenerationError("long_video_plan_invalid")
@@ -555,7 +760,55 @@ def _extract_last_frame(video: Path, output: Path) -> Path:
 
 def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
              parent_id: str, fit_mode: str, *, frozen_child_id: str | None = None,
-             prepare_inputs: bool = True, fast_mode: bool = False) -> h3.H3Request:
+             prepare_inputs: bool = True, fast_mode: bool = False,
+             context_ir_binding: object = None) -> h3.H3Request:
+    if plan.workflow in h3.H3_MULTIMODAL_WORKFLOWS:
+        if segment.multimodal is None:
+            raise LongGenerationError("long_video_multimodal_invalid")
+        try:
+            source_request = h3_project.build_request_from_parts(
+                multimodal=segment.multimodal,
+                visual_prompt=segment.multimodal.skill_plan.get("visual_prompt"),
+                keyframes=segment.keyframes,
+                upstream_dialogue=segment.dialogue,
+                upstream_dialogue_receipt_sha256=(
+                    segment.dialogue_sha256 or ""
+                ),
+                cid=f"{cid}-segment-{segment.index}",
+                workdir=segment.workdir,
+                client_request_id=(
+                    frozen_child_id
+                    or child_request_id(parent_id, plan.receipt, segment.index)
+                ),
+                duration=long_video.provider_duration_s(
+                    segment.start_s,
+                    segment.end_s,
+                    receipt_version=plan.receipt_version,
+                ),
+                resolution=plan.resolution,
+                aspect_ratio=plan.aspect_ratio,
+                autodl_token=settings.autodl_art_token,
+                timeouts=h3.Timeouts(
+                    request_s=settings.h3_request_timeout_s,
+                    h3_poll_s=settings.h3_poll_timeout_s,
+                    download_s=settings.h3_download_timeout_s,
+                    poll_interval_s=settings.h3_poll_interval_s,
+                    retry_count=settings.retry_count,
+                    retry_interval_s=settings.retry_interval_s,
+                ),
+            )
+            if context_ir_binding is None:
+                return source_request
+            context = _freeze_segment_context_ir(
+                settings, plan, segment, source_request
+            )
+            return h3_project.apply_bound_context_ir(
+                context, context_ir_binding
+            )
+        except (h3.H3Error, h3_project.ProjectMultimodalError) as exc:
+            raise LongGenerationError(
+                getattr(exc, "code", "long_video_multimodal_invalid")
+            ) from None
     if plan.workflow in h3.H3_REFERENCE_WORKFLOWS:
         return h3.H3Request(
             cid=f"{cid}-segment-{segment.index}",
@@ -649,6 +902,86 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
     )
 
 
+def _freeze_segment_context_ir(
+    settings,
+    plan: FrozenPlan,
+    segment: FrozenSegment,
+    source_request: h3.H3Request,
+) -> context_ir_bridge.FrozenContextIrRequest:
+    if not getattr(settings, "minimax_api_key", ""):
+        raise LongGenerationError("context_ir_credential_missing", 503)
+    try:
+        return h3_project.freeze_context_ir(
+            source_request=source_request,
+            upstream_dialogue_sha256=segment.dialogue_sha256 or "",
+            upstream_artifact_path=(
+                plan.root / long_video.PLAN_RECEIPT_FILENAME
+            ),
+            upstream_artifact_sha256=plan.receipt,
+            upstream_dialogue_sha256_path=(
+                "segments", segment.index - 1, "dialogue", "sha256"
+            ),
+            minimax_api_key=settings.minimax_api_key,
+            request_timeout_s=settings.h3_request_timeout_s,
+            poll_timeout_s=settings.h3_poll_timeout_s,
+            poll_interval_s=settings.h3_poll_interval_s,
+        )
+    except h3_project.ProjectMultimodalError as exc:
+        raise LongGenerationError(exc.code) from None
+
+
+def _optimize_segment_context_ir(
+    settings,
+    plan: FrozenPlan,
+    segment: FrozenSegment,
+    source_request: h3.H3Request,
+) -> tuple[h3.H3Request | None, dict[str, object], str, str | None]:
+    context = _freeze_segment_context_ir(settings, plan, segment, source_request)
+    try:
+        result = context_ir_bridge.optimize_h3_prompt(context)
+        binding = h3_project.context_ir_binding(result)
+        if result.status == "succeeded":
+            return (
+                h3_project.apply_bound_context_ir(context, binding),
+                binding,
+                "succeeded",
+                None,
+            )
+    except (context_ir_bridge.ContextIrError,
+            h3_project.ProjectMultimodalError) as exc:
+        raise LongGenerationError(getattr(exc, "code", "context_ir_invalid")) from None
+    if result.status == "submission_unknown":
+        return None, binding, "submission_unknown", "submission_unknown"
+    if result.status in {"running", "query_unknown"}:
+        return (
+            None,
+            binding,
+            "resume_required",
+            result.error_code or "context_ir_query_unknown",
+        )
+    return None, binding, "failed", result.error_code or "context_ir_failed"
+
+
+def _context_ir_may_progress(
+    state: Mapping,
+    source_request: h3.H3Request,
+    *,
+    allow_create: bool = False,
+) -> bool:
+    binding = state.get("context_ir")
+    if binding is None:
+        return (
+            allow_create
+            and state.get("child_request_id") is None
+            and state.get("h3_attempt_id") is None
+        )
+    if not isinstance(binding, Mapping):
+        return False
+    return h3_project.context_ir_progress_binding_matches(
+        source_request, binding
+    )
+
+
 def public_segments(generation: Mapping) -> list[dict]:
     result = []
     for item in generation.get("segments", []):
@@ -708,7 +1041,15 @@ def generation_segments_are_valid(
         "index", "chain_id", "join_mode", "status", "attempt", "error",
         "child_request_id",
     }
-    native_keys = legacy_keys | {"h3_attempt_id"}
+    native_keys = legacy_keys | {"h3_attempt_id", "context_ir"}
+    audio_route = generation.get("audio_route")
+    native_required = audio_route == H3_NATIVE_AUDIO_ROUTE
+    if audio_route is None:
+        required_keys = legacy_keys
+    elif native_required:
+        required_keys = native_keys
+    else:
+        return False
     statuses = {
         "not_started", "queued", "running", "resume_required", "succeeded",
         "failed", "submission_unknown",
@@ -716,10 +1057,7 @@ def generation_segments_are_valid(
     for position, (expected, item) in enumerate(zip(expected_segments, raw), 1):
         if (
             not isinstance(item, dict)
-            or frozenset(item) not in {
-                frozenset(legacy_keys),
-                frozenset(native_keys),
-            }
+            or set(item) != required_keys
         ):
             return False
         if isinstance(expected, FrozenSegment):
@@ -735,6 +1073,7 @@ def generation_segments_are_valid(
         attempt = item.get("attempt")
         child_id = item.get("child_request_id")
         h3_attempt_id = item.get("h3_attempt_id")
+        context_ir = item.get("context_ir")
         if (
             expected_index != position
             or item.get("index") != expected_index
@@ -759,6 +1098,20 @@ def generation_segments_are_valid(
                     or len(h3_attempt_id) != 6
                     or not h3_attempt_id.isdigit()
                 )
+            )
+            or (
+                native_required
+                and item.get("status") == "succeeded"
+                and (
+                    h3_attempt_id is None
+                    or not isinstance(context_ir, Mapping)
+                    or context_ir.get("status") != "succeeded"
+                )
+            )
+            or (
+                native_required
+                and context_ir is not None
+                and not isinstance(context_ir, Mapping)
             )
         ):
             return False
@@ -820,7 +1173,15 @@ def bound_reusable_segment_indices(
                 frozen_child_id=child_id,
                 prepare_inputs=False,
                 fast_mode=fast_mode,
+                context_ir_binding=item.get("context_ir"),
             )
+            if _is_h3_multimodal_plan(plan):
+                inspected = h3.inspect(request)
+                if (
+                    inspected.status != "succeeded"
+                    or inspected.attempt_id != item.get("h3_attempt_id")
+                ):
+                    return False
             return h3.output_is_reusable(
                 request,
                 expected_duration_s=_segment_duration_s(plan, segment),
@@ -884,6 +1245,7 @@ def bound_h3_native_media(
                 frozen_child_id=child_id,
                 prepare_inputs=False,
                 fast_mode=fast_mode,
+                context_ir_binding=state.get("context_ir"),
             )
             if is_multimodal_request(request) is not True:
                 raise LongGenerationError("long_video_h3_native_audio_invalid")
@@ -926,6 +1288,9 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
         if h3_native_audio:
             item["h3_attempt_id"] = (
                 prior.get("h3_attempt_id") if succeeded else None
+            )
+            item["context_ir"] = (
+                prior.get("context_ir") if succeeded else None
             )
         items.append(item)
     generation = {
@@ -1223,12 +1588,61 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         def recover(segment: FrozenSegment):
             state = states[segment.index]
             try:
+                context_binding = state.get("context_ir")
                 request = _request(
                     settings, cid, plan, segment, parent_id, fit_mode,
                     prepare_inputs=False,
                     fast_mode=fast_mode,
                     frozen_child_id=state.get("child_request_id"),
+                    context_ir_binding=(
+                        context_binding
+                        if isinstance(context_binding, Mapping)
+                        and context_binding.get("status") == "succeeded"
+                        else None
+                    ),
                 )
+                if h3_native_audio and not (
+                    isinstance(context_binding, Mapping)
+                    and context_binding.get("status") == "succeeded"
+                ):
+                    if not isinstance(context_binding, Mapping):
+                        if (
+                            state.get("child_request_id") is not None
+                            or state.get("h3_attempt_id") is not None
+                        ):
+                            return (
+                                "submission_unknown",
+                                "submission_unknown",
+                                _exact_h3_attempt_id(state.get("h3_attempt_id")),
+                            )
+                        return (
+                            "resume_required",
+                            "context_ir_resume_required",
+                            _exact_h3_attempt_id(state.get("h3_attempt_id")),
+                        )
+                    if not _context_ir_may_progress(state, request):
+                        return (
+                            "submission_unknown",
+                            "submission_unknown",
+                            _exact_h3_attempt_id(state.get("h3_attempt_id")),
+                        )
+                    final_request, updated_binding, status, error = (
+                        _optimize_segment_context_ir(
+                            settings, plan, segment, request
+                        )
+                    )
+                    state["context_ir"] = updated_binding
+                    if status == "succeeded" and final_request is not None:
+                        return (
+                            "resume_required",
+                            "context_ir_ready",
+                            _exact_h3_attempt_id(state.get("h3_attempt_id")),
+                        )
+                    return (
+                        status,
+                        error,
+                        _exact_h3_attempt_id(state.get("h3_attempt_id")),
+                    )
                 result = h3.resume(request)
                 if result.status == "not_started":
                     return (
@@ -1340,6 +1754,78 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     prepare_inputs=False,
                     fast_mode=True,
                 )
+
+            if h3_native_audio:
+                context_targets = [
+                    segment for segment in plan.segments
+                    if segment.index in requests
+                ]
+
+                def prepare_context(segment: FrozenSegment):
+                    state = states[segment.index]
+                    binding = state.get("context_ir")
+                    source_request = requests[segment.index]
+                    if (
+                        isinstance(binding, Mapping)
+                        and binding.get("status") == "succeeded"
+                    ):
+                        context = _freeze_segment_context_ir(
+                            settings, plan, segment, source_request
+                        )
+                        return (
+                            h3_project.apply_bound_context_ir(context, binding),
+                            binding,
+                            "succeeded",
+                            None,
+                        )
+                    if not _context_ir_may_progress(
+                        state,
+                        source_request,
+                        allow_create=state.get("status") == "not_started",
+                    ):
+                        return (
+                            None,
+                            binding,
+                            "submission_unknown",
+                            "submission_unknown",
+                        )
+                    return _optimize_segment_context_ir(
+                        settings, plan, segment, source_request
+                    )
+
+                with ThreadPoolExecutor(
+                    max_workers=min(_FAST_MODE_WORKERS, len(context_targets))
+                ) as pool:
+                    futures = {
+                        pool.submit(prepare_context, segment): segment
+                        for segment in context_targets
+                    }
+                    for future in futures:
+                        segment = futures[future]
+                        final_request, binding, status, error = future.result()
+                        states[segment.index]["context_ir"] = binding
+                        if status == "succeeded" and final_request is not None:
+                            requests[segment.index] = final_request
+                        else:
+                            states[segment.index].update(
+                                status=status, error=error
+                            )
+                persist("running", None, "context_ir_native")
+                context_statuses = {
+                    states[segment.index].get("status")
+                    for segment in context_targets
+                    if states[segment.index].get("context_ir", {}).get("status")
+                    != "succeeded"
+                }
+                if "submission_unknown" in context_statuses:
+                    persist("submission_unknown", "submission_unknown", "context_ir_native")
+                    return
+                if "resume_required" in context_statuses:
+                    persist("resume_required", "context_ir_resume_required", "context_ir_native")
+                    return
+                if context_statuses:
+                    persist("failed", "long_video_context_ir_failed", "context_ir_native")
+                    return
 
             # Phase 2: persist every unpaid child receipt before the first POST.
             for segment in plan.segments:
@@ -1574,6 +2060,50 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 settings, cid, plan, segment, parent_id, fit_mode,
                 prepare_inputs=action == "start",
             )
+            h3_action = action
+            if h3_native_audio:
+                context_binding = states[segment.index].get("context_ir")
+                if (
+                    isinstance(context_binding, Mapping)
+                    and context_binding.get("status") == "succeeded"
+                ):
+                    context = _freeze_segment_context_ir(
+                        settings, plan, segment, request
+                    )
+                    request = h3_project.apply_bound_context_ir(
+                        context, context_binding
+                    )
+                else:
+                    if not _context_ir_may_progress(
+                        states[segment.index],
+                        request,
+                        allow_create=action == "start",
+                    ):
+                        return (
+                            states[segment.index].get("child_request_id"),
+                            (
+                                "submission_unknown",
+                                "submission_unknown",
+                                _exact_h3_attempt_id(previous_attempt),
+                            ),
+                        )
+                    request, context_binding, status, error = (
+                        _optimize_segment_context_ir(
+                            settings, plan, segment, request
+                        )
+                    )
+                    states[segment.index]["context_ir"] = context_binding
+                    if status != "succeeded" or request is None:
+                        return (
+                            states[segment.index].get("child_request_id"),
+                            (
+                                status,
+                                error,
+                                _exact_h3_attempt_id(previous_attempt),
+                            ),
+                        )
+                    if action == "resume":
+                        h3_action = "start"
         except LongGenerationError as exc:
             if action == "resume":
                 return existing_child_id, (
@@ -1594,8 +2124,8 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 _exact_h3_attempt_id(previous_attempt),
             )
         try:
-            result = h3.start(request) if action == "start" else h3.resume(request)
-            if action == "resume" and result.status == "not_started":
+            result = h3.start(request) if h3_action == "start" else h3.resume(request)
+            if h3_action == "resume" and result.status == "not_started":
                 return request.client_request_id, (
                     "submission_unknown", "submission_unknown",
                     _exact_h3_attempt_id(result.attempt_id, previous_attempt),

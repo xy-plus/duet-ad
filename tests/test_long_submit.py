@@ -1127,7 +1127,20 @@ def test_long_validation_fingerprint_tracks_selected_aspect_fit_outputs(tmp_path
         aspect_ratio="16:9",
         resolution="480p",
         fit_mode="crop",
+        postprocess={
+            "status": "done",
+            "frames": ["segments/1/work/postprocessed/01.png"],
+        },
         generation={"fit_layout": long_generation.FIT_LAYOUT_ASPECT},
+    )
+    selected = (
+        root / "work" / "segments" / "1" / "work"
+        / "postprocessed" / "01.png"
+    )
+    selected.parent.mkdir(parents=True, exist_ok=True)
+    selected.write_bytes(
+        (root / "work" / "segments" / "1" / "work" / "keyframes" / "01.png")
+        .read_bytes()
     )
 
     paths = _long_validation_paths(root, meta)
@@ -1135,6 +1148,8 @@ def test_long_validation_fingerprint_tracks_selected_aspect_fit_outputs(tmp_path
     expected_root = root / "work" / "segments" / "1" / "work" / "h3_frames"
     assert expected_root / "16x9" / "crop" / "first" / "first.png" in paths
     assert expected_root / "crop" / "first" / "first.png" not in paths
+    assert selected in paths
+    assert expected_root / "16x9" / "crop" / "keyframes" / "01.png" in paths
 
 
 def test_pre_marker_recovery_rejects_ambiguous_complete_fit_layouts(tmp_path):
@@ -3556,6 +3571,7 @@ def _native_audio_plan(settings, *, segment_count: int = 2):
             "error": None,
             "child_request_id": f"child-{index}",
             "h3_attempt_id": f"{index:06d}",
+            "context_ir": {"status": "succeeded"},
         })
     plan = long_generation.FrozenPlan(
         root=root,

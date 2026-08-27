@@ -12,6 +12,8 @@ import math
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from app import h3, h3_project
+
 SHORT_VIDEO_MAX_S = 15.0
 PREVIOUS_SHORT_VIDEO_MAX_S = 10.0
 LONG_VIDEO_MAX_S = 300.0
@@ -22,6 +24,7 @@ LEGACY_PROVIDER_MAX_DURATION_S = 15
 BOUNDARY_PRECISION = 6
 PLAN_RECEIPT_FILENAME = "long_video_plan.json"
 PLAN_RECEIPT_VERSION = 2
+MULTIMODAL_PLAN_RECEIPT_VERSION = 3
 LEGACY_PLAN_RECEIPT_VERSION = 1
 
 _EPS = 1e-6
@@ -78,6 +81,7 @@ def segment_duration_s(
         or receipt_version not in {
             LEGACY_PLAN_RECEIPT_VERSION,
             PLAN_RECEIPT_VERSION,
+            MULTIMODAL_PLAN_RECEIPT_VERSION,
         }
     ):
         raise LongVideoError("long_video_invalid_segment_duration")
@@ -338,6 +342,7 @@ def write_plan_receipt(
     duration_s: float,
     segments: Sequence[Mapping],
     workflow: str,
+    dialogue_mode: str = "auto",
 ) -> Path:
     """Write a canonical receipt binding the complete generated long-video plan."""
     root = root.resolve()
@@ -346,6 +351,9 @@ def write_plan_receipt(
         raise LongVideoError("long_video_plan_requires_segments")
     if not isinstance(workflow, str) or not workflow.strip():
         raise LongVideoError("long_video_plan_invalid_workflow")
+    has_multimodal = ["multimodal_manifest_path" in raw for raw in segments]
+    if any(has_multimodal) and not all(has_multimodal):
+        raise LongVideoError("long_video_multimodal_incomplete")
     receipt_segments = []
     previous_end = 0.0
     for expected_index, raw in enumerate(segments, start=1):
@@ -382,8 +390,7 @@ def write_plan_receipt(
         except (KeyError, TypeError):
             raise LongVideoError("long_video_plan_invalid_anchors") from None
         dialogue = list(raw.get("dialogue", []))
-        receipt_segments.append(
-            {
+        receipt_segment = {
                 "index": index,
                 "start_s": start_s,
                 "end_s": end_s,
@@ -404,18 +411,48 @@ def write_plan_receipt(
                     "sha256": hashlib.sha256(_canonical_bytes(dialogue)).hexdigest(),
                 },
             }
-        )
+        if all(has_multimodal):
+            try:
+                manifest_path = Path(raw["multimodal_manifest_path"]).resolve()
+                frozen_multimodal = h3_project.freeze_optional(
+                    root, manifest_path.parent
+                )
+                if (
+                    frozen_multimodal is None
+                    or frozen_multimodal.manifest_path != manifest_path
+                    or workflow.strip() != h3.H3_MULTIMODAL_WORKFLOW
+                ):
+                    raise h3_project.ProjectMultimodalError(
+                        "multimodal_source_invalid"
+                    )
+                receipt_segment["multimodal"] = h3_project.receipt_binding(
+                    root, frozen_multimodal
+                )
+            except (KeyError, h3_project.ProjectMultimodalError) as exc:
+                code = getattr(exc, "code", "multimodal_source_invalid")
+                raise LongVideoError(code) from None
+        receipt_segments.append(receipt_segment)
         previous_end = end_s
     if abs(previous_end - duration) > _EPS:
         raise LongVideoError("long_video_plan_invalid_segment")
     receipt = {
         "schema": "duet.long-video-plan",
-        "version": PLAN_RECEIPT_VERSION,
+        "version": (
+            MULTIMODAL_PLAN_RECEIPT_VERSION
+            if all(has_multimodal)
+            else PLAN_RECEIPT_VERSION
+        ),
         "source": _artifact(root, source),
         "video": {"duration_s": duration},
         "workflow": workflow.strip(),
         "segments": receipt_segments,
     }
+    if all(has_multimodal):
+        if dialogue_mode not in {"auto", "none"}:
+            raise LongVideoError("long_video_plan_invalid_dialogue_mode")
+        receipt["dialogue_mode"] = dialogue_mode
     path = root / PLAN_RECEIPT_FILENAME
-    path.write_bytes(_canonical_bytes(receipt))
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_bytes(_canonical_bytes(receipt))
+    temporary.replace(path)
     return path

@@ -13,11 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from app import voice
+from app import h3_project, voice
 
 
 RECEIPT_SCHEMA = "duet.prepared-input"
 RECEIPT_VERSION = 1
+MULTIMODAL_RECEIPT_VERSION = 2
 RECEIPT_FILENAME = "prepared_input.json"
 MAX_FINAL_PROMPT_BYTES = 32 * 1024
 _DIALOGUE_MODES = frozenset({"auto", "edit", "custom", "none"})
@@ -53,6 +54,7 @@ class PreparedInput:
     """供 H3 提交方使用的冻结输入，不要求提交方重新读取绑定文件。"""
 
     receipt_path: Path
+    receipt_sha256: str
     source: FrozenArtifact
     normalized_audio: FrozenArtifact | None
     keyframes: tuple[FrozenArtifact, ...]
@@ -60,12 +62,14 @@ class PreparedInput:
     final_prompt: FrozenArtifact
     dialogue_mode: str
     dialogue: tuple[dict, ...]
+    dialogue_sha256: str
     voice_texts: tuple[str, ...]
     vocal_filter_enabled: bool
     duration_s: float
     ratio: str
     fit_mode: str
     engine_request: dict
+    multimodal: h3_project.FrozenProjectMultimodal | None = None
 
     @property
     def prompt_text(self) -> str:
@@ -309,6 +313,7 @@ def write_prepared_input(
     fit_mode: str,
     engine_request: Mapping,
     receipt_path: Path | None = None,
+    multimodal: h3_project.FrozenProjectMultimodal | None = None,
 ) -> PreparedInput:
     """写最终 prompt 和 v1 receipt，随后经同一 fail-closed loader 返回冻结输入。"""
     root = root.resolve()
@@ -322,6 +327,10 @@ def write_prepared_input(
     if not isinstance(engine_request, Mapping):
         raise PreparedInputError("engine_request must be an object")
     normalized_request = json.loads(_canonical_json(dict(engine_request)))
+    if multimodal is not None and not isinstance(
+        multimodal, h3_project.FrozenProjectMultimodal
+    ):
+        raise PreparedInputError("multimodal input is invalid")
     normalized_dialogue = _normalize_effective_dialogue(
         dialogue_mode, dialogue, duration, vocal_filter_enabled
     )
@@ -369,7 +378,11 @@ def write_prepared_input(
     dialogue_hash = hashlib.sha256(_canonical_json(dialogue_payload)).hexdigest()
     receipt = {
         "schema": RECEIPT_SCHEMA,
-        "version": RECEIPT_VERSION,
+        "version": (
+            MULTIMODAL_RECEIPT_VERSION
+            if multimodal is not None
+            else RECEIPT_VERSION
+        ),
         "bindings": {
             "source": source_binding,
             "normalized_audio": audio_binding,
@@ -386,6 +399,11 @@ def write_prepared_input(
         "video": {"duration_s": duration, "ratio": ratio, "fit_mode": fit_mode},
         "engine_request": normalized_request,
     }
+    if multimodal is not None:
+        try:
+            receipt["multimodal"] = h3_project.receipt_binding(root, multimodal)
+        except h3_project.ProjectMultimodalError as exc:
+            raise PreparedInputError(exc.code) from None
     receipt = json.loads(_canonical_json(receipt))
     receipt_path = (receipt_path or root / RECEIPT_FILENAME).resolve()
     try:
@@ -445,14 +463,25 @@ def load_prepared_input(
             "legacy session has no prepared-input receipt and is incompatible"
         )
     try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt_data = receipt_path.read_bytes()
+        receipt = json.loads(receipt_data.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PreparedInputError(f"prepared-input receipt is invalid: {exc}") from None
-    if not isinstance(receipt, dict) or set(receipt) != {
-        "schema", "version", "bindings", "dialogue", "vocal_filter", "video", "engine_request"
-    }:
+    if not isinstance(receipt, dict):
         raise PreparedInputError("prepared-input receipt shape is invalid")
-    if receipt.get("schema") != RECEIPT_SCHEMA or receipt.get("version") != RECEIPT_VERSION:
+    version = receipt.get("version")
+    expected_keys = {
+        "schema", "version", "bindings", "dialogue", "vocal_filter", "video",
+        "engine_request",
+    }
+    if version == MULTIMODAL_RECEIPT_VERSION:
+        expected_keys.add("multimodal")
+    if set(receipt) != expected_keys:
+        raise PreparedInputError("prepared-input receipt shape is invalid")
+    if (
+        receipt.get("schema") != RECEIPT_SCHEMA
+        or version not in {RECEIPT_VERSION, MULTIMODAL_RECEIPT_VERSION}
+    ):
         raise PreparedInputError("prepared-input receipt schema/version is incompatible")
 
     bindings = receipt["bindings"]
@@ -518,10 +547,17 @@ def load_prepared_input(
     if not isinstance(receipt["engine_request"], dict):
         raise PreparedInputError("prepared-input engine_request is invalid")
     engine_request = json.loads(_canonical_json(receipt["engine_request"]))
+    multimodal = None
+    if version == MULTIMODAL_RECEIPT_VERSION:
+        try:
+            multimodal = h3_project.load_bound(root, receipt["multimodal"])
+        except h3_project.ProjectMultimodalError as exc:
+            raise PreparedInputError(exc.code) from None
 
     dialogue_tuple = tuple(dict(line) for line in normalized_lines)
     return PreparedInput(
         receipt_path=receipt_path,
+        receipt_sha256=hashlib.sha256(receipt_data).hexdigest(),
         source=source,
         normalized_audio=audio,
         keyframes=keyframes,
@@ -529,10 +565,12 @@ def load_prepared_input(
         final_prompt=final,
         dialogue_mode=mode,
         dialogue=dialogue_tuple,
+        dialogue_sha256=line_hash,
         voice_texts=tuple(line["text"] for line in dialogue_tuple),
         vocal_filter_enabled=enabled,
         duration_s=duration,
         ratio=ratio,
         fit_mode=fit_mode,
         engine_request=engine_request,
+        multimodal=multimodal,
     )

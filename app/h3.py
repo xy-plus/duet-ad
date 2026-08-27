@@ -238,7 +238,10 @@ class H3Request:
     reference_audios: FrozenReferenceAudios = ()
     skill_plan_sha256: str | None = None
     multimodal_compiler_version: str | None = None
+    upstream_dialogue_receipt_sha256: str | None = None
     audio_required: bool = False
+    context_ir_receipt_path: Path | None = None
+    context_ir_receipt_sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workdir", Path(self.workdir))
@@ -339,7 +342,10 @@ def _validate_request_audio_contract(
             audios
             or request.skill_plan_sha256 is not None
             or request.multimodal_compiler_version is not None
+            or request.upstream_dialogue_receipt_sha256 is not None
             or request.audio_required is not False
+            or request.context_ir_receipt_path is not None
+            or request.context_ir_receipt_sha256 is not None
         ):
             raise H3Error("mixed_h3_inputs")
         return
@@ -367,11 +373,171 @@ def _validate_request_audio_contract(
         raise H3Error("audio_required")
     if not _is_sha256(request.skill_plan_sha256):
         raise H3Error("invalid_skill_plan_receipt")
+    if not _is_sha256(request.upstream_dialogue_receipt_sha256):
+        raise H3Error("invalid_upstream_dialogue_receipt")
     if (
         not isinstance(request.multimodal_compiler_version, str)
         or not request.multimodal_compiler_version.strip()
     ):
         raise H3Error("invalid_multimodal_compiler")
+
+
+def _context_ir_reference_receipt(request: H3Request) -> str:
+    references: list[dict[str, Any]] = []
+    image_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }
+    audio_types = {".wav": "audio/wav", ".mp3": "audio/mpeg"}
+    for order, (path, data) in enumerate(request.keyframes, 1):
+        references.append({
+            "order": order,
+            "type": "image_url",
+            "role": "reference_image",
+            "name": path.name,
+            "mime_type": image_types.get(path.suffix.lower()),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+        })
+    for audio in request.reference_audios:
+        references.append({
+            "order": audio.order,
+            "type": "audio_url",
+            "role": "reference_audio",
+            "name": audio.path.name,
+            "mime_type": audio_types.get(audio.path.suffix.lower()),
+            "sha256": audio.sha256,
+            "size": len(audio.data),
+        })
+    if any(item["mime_type"] is None for item in references):
+        raise ReceiptError("context_ir_receipt_invalid")
+    return canonical_json_sha256(references)
+
+
+def _context_ir_source_request_receipt(
+    request: H3Request,
+    *,
+    source_prompt_sha256: str,
+    references_sha256: str,
+) -> str:
+    def frame_manifest(frame: FrozenFrame | None) -> dict[str, Any] | None:
+        if frame is None:
+            return None
+        path, data = frame
+        return {
+            "name": path.name,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+        }
+
+    return canonical_json_sha256({
+        "cid": request.cid,
+        "workdir": str(request.workdir.resolve()),
+        "client_request_id": request.client_request_id,
+        "source_prompt_sha256": source_prompt_sha256,
+        "references_sha256": references_sha256,
+        "voice_texts_sha256": request.voice_receipt,
+        "duration": request.duration,
+        "mode": request.mode,
+        "first_frame": frame_manifest(request.first_frame),
+        "last_frame": frame_manifest(request.last_frame),
+        "seed": request.seed,
+        "aspect_ratio": request.aspect_ratio,
+        "resolution": request.resolution,
+        "workflow": request.workflow,
+        "skill_plan_sha256": request.skill_plan_sha256,
+        "multimodal_compiler_version": request.multimodal_compiler_version,
+        "audio_required": request.audio_required,
+        "reference_audio_metadata": [
+            {
+                "order": audio.order,
+                "purpose": audio.purpose,
+                "format": audio.format,
+                "sha256": audio.sha256,
+                "duration_s": audio.duration_s,
+            }
+            for audio in request.reference_audios
+        ],
+    })
+
+
+def _require_context_ir_receipt(request: H3Request) -> None:
+    """Reject raw multimodal requests at every H3 provider boundary."""
+    if not is_multimodal_request(request):
+        return
+    path = request.context_ir_receipt_path
+    expected_sha256 = request.context_ir_receipt_sha256
+    if not isinstance(path, Path) or not _is_sha256(expected_sha256):
+        raise ReceiptError("context_ir_receipt_required")
+    resolved = path.resolve()
+    attempts = (request.workdir / ".context-ir" / "attempts").resolve()
+    try:
+        relative = resolved.relative_to(attempts)
+    except ValueError:
+        raise ReceiptError("context_ir_receipt_path_invalid") from None
+    if (
+        len(relative.parts) != 2
+        or relative.name != "receipt.json"
+        or len(relative.parts[0]) != 6
+        or not relative.parts[0].isdigit()
+    ):
+        raise ReceiptError("context_ir_receipt_path_invalid")
+    try:
+        receipt = _read_json(resolved)
+        attempt = _read_json(resolved.with_name("attempt.json"))
+    except H3Error:
+        raise ReceiptError("context_ir_receipt_invalid") from None
+    if not isinstance(receipt, dict) or not isinstance(attempt, dict):
+        raise ReceiptError("context_ir_receipt_invalid")
+    unhashed = dict(receipt)
+    receipt_sha256 = unhashed.pop("receipt_sha256", None)
+    source_prompt = receipt.get("source_prompt")
+    source_prompt_sha256 = receipt.get("source_prompt_sha256")
+    references_sha256 = _context_ir_reference_receipt(request)
+    if (
+        receipt.get("schema") != "duet.context-ir.effective-prompt"
+        or receipt.get("version") != 1
+        or receipt.get("cid") != request.cid
+        or receipt.get("client_request_id") != request.client_request_id
+        or receipt.get("attempt_id") != relative.parts[0]
+        or receipt_sha256 != expected_sha256
+        or receipt_sha256 != canonical_json_sha256(unhashed)
+        or not isinstance(source_prompt, str)
+        or hashlib.sha256(source_prompt.encode("utf-8")).hexdigest()
+        != source_prompt_sha256
+        or receipt.get("effective_prompt") != request.prompt
+        or hashlib.sha256(request.prompt.encode("utf-8")).hexdigest()
+        != receipt.get("effective_prompt_sha256")
+        or receipt.get("skill_plan_sha256") != request.skill_plan_sha256
+        or receipt.get("voice_texts_sha256") != request.voice_receipt
+        or receipt.get("upstream_dialogue_sha256")
+        != request.upstream_dialogue_receipt_sha256
+        or receipt.get("references_sha256") != references_sha256
+        or receipt.get("source_h3_request_sha256")
+        != _context_ir_source_request_receipt(
+            request,
+            source_prompt_sha256=str(source_prompt_sha256),
+            references_sha256=references_sha256,
+        )
+        or attempt.get("schema") != "duet.context-ir.attempt"
+        or attempt.get("version") != 1
+        or attempt.get("cid") != request.cid
+        or attempt.get("attempt_id") != relative.parts[0]
+        or attempt.get("client_request_id") != request.client_request_id
+        or attempt.get("status") != "succeeded"
+        or attempt.get("receipt")
+        != {"path": "receipt.json", "sha256": receipt_sha256}
+        or attempt.get("provider_task_id") != receipt.get("provider_task_id")
+        or attempt.get("context_ir_request_sha256")
+        != receipt.get("context_ir_request_sha256")
+        or attempt.get("context_ir_task_sha256")
+        != receipt.get("context_ir_task_sha256")
+        or attempt.get("context_ir_attempt_sha256")
+        != receipt.get("context_ir_attempt_sha256")
+    ):
+        raise ReceiptError("context_ir_receipt_mismatch")
 
 
 @dataclass(frozen=True)
@@ -551,6 +717,7 @@ def start(request: H3Request, *, client: httpx.Client | None = None) -> H3Result
     query an already persisted task, but never repeats a provider POST whose
     outcome is unknown.
     """
+    _require_context_ir_receipt(request)
     with _session_lease(request):
         existing = _find_attempt(request, request.client_request_id)
         if output_is_reusable(request, existing):
@@ -577,6 +744,7 @@ def prepare(request: H3Request) -> H3Result:
     Fast fan-out callers prepare every child first.  A persisted ``ready``
     state proves that no POST has started; ``submitting`` remains ambiguous.
     """
+    _require_context_ir_receipt(request)
     with _session_lease(request):
         existing = _find_attempt(request, request.client_request_id)
         if output_is_reusable(request, existing):
@@ -593,6 +761,7 @@ def prepare(request: H3Request) -> H3Result:
 
 def submit(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
     """POST one previously prepared attempt and return before any GET poll."""
+    _require_context_ir_receipt(request)
     with _session_lease(request):
         state = _find_attempt(request, request.client_request_id)
         if state is None:
@@ -615,6 +784,7 @@ def submit(request: H3Request, *, client: httpx.Client | None = None) -> H3Resul
 
 def inspect(request: H3Request) -> H3Result:
     """Read the latest attempt for UI/startup decisions, without any writes."""
+    _require_context_ir_receipt(request)
     root = _state_root(request)
     marker = root / "session.json"
     if not root.exists():
@@ -808,6 +978,7 @@ def legacy_h3_is_provably_unsubmitted(
 
 def resume(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
     """Recover existing work, including the strict provider-failure exception."""
+    _require_context_ir_receipt(request)
     with _session_lease(request):
         state = _find_attempt(request, request.client_request_id)
         if output_is_reusable(request, state):
@@ -832,6 +1003,7 @@ def retry(
 ) -> H3Result:
     """Explicitly create a paid retry, keyed by a new idempotency key."""
     retried = replace(request, client_request_id=client_request_id)
+    _require_context_ir_receipt(retried)
     with _session_lease(retried):
         existing = _find_attempt(retried, client_request_id)
         if output_is_reusable(retried, existing):
@@ -866,6 +1038,7 @@ def load_media_timeline_receipt(
     attempt.  The helper validates the frozen H3 input, the versioned timeline
     shape, and the exact output bytes before returning a detached JSON object.
     """
+    _require_context_ir_receipt(request)
     if (
         not isinstance(attempt_id, str)
         or len(attempt_id) != 6
@@ -918,6 +1091,7 @@ def output_is_reusable(
     allow_provider_duration_ceiling: bool = False,
 ) -> bool:
     """Validate a local output against its exact paid attempt and frozen input."""
+    _require_context_ir_receipt(request)
     if state is None:
         state = _find_attempt(request, request.client_request_id)
     if state is None:
@@ -1177,10 +1351,17 @@ def _input_manifest(
             )
             manifest["multimodal"] = {
                 "skill_plan_sha256": request.skill_plan_sha256,
+                "upstream_dialogue_receipt_sha256": (
+                    request.upstream_dialogue_receipt_sha256
+                ),
                 "compiler_version": request.multimodal_compiler_version,
                 "audio_required": request.audio_required,
                 "reference_audio_semantics": "conditioning_only",
                 "reference_audios": _reference_audio_manifest(request),
+                "context_ir": {
+                    "receipt_path": str(request.context_ir_receipt_path),
+                    "receipt_sha256": request.context_ir_receipt_sha256,
+                },
             }
         return manifest
     provider_request = {

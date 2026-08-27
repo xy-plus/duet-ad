@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from collections import OrderedDict, defaultdict, deque
+from collections.abc import Mapping
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
@@ -16,15 +17,18 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from app import (
+    context_ir_bridge,
     downloader,
     frame_fit,
     h3,
+    h3_project,
     image_optimization,
     long_generation,
     long_video,
     pipeline,
     postprocess,
     prepared_input,
+    stitch,
     storage,
     voice,
 )
@@ -515,6 +519,8 @@ def _replace_source_prompt(
         frozen = prepared_input.load_prepared_input(
             cdir, receipt_path, expected_dialogue=expected_dialogue
         )
+        if frozen.multimodal is not None:
+            raise _SubmitError(409, "multimodal_plan_refresh_required")
         prepared_input.compose_final_prompt(replacement, frozen.dialogue)
     except (OSError, KeyError, TypeError, json.JSONDecodeError, prepared_input.PreparedInputError):
         raise _SubmitError(409, "prepared_input_invalid") from None
@@ -548,7 +554,19 @@ def _receipt_version(cdir: Path, meta: dict) -> int | None:
     name = meta.get("prepared_input_receipt")
     if not isinstance(name, str) or not name or name != Path(name).name:
         return None
-    return prepared_input.RECEIPT_VERSION if (cdir / name).is_file() else None
+    try:
+        payload = json.loads((cdir / name).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    version = payload.get("version") if isinstance(payload, Mapping) else None
+    return (
+        version
+        if version in {
+            prepared_input.RECEIPT_VERSION,
+            prepared_input.MULTIMODAL_RECEIPT_VERSION,
+        }
+        else None
+    )
 
 
 def _timeouts(settings: Settings) -> h3.Timeouts:
@@ -805,6 +823,27 @@ def _make_h3_request(
     else:
         aspect_ratio = frozen.ratio
         resolution = engine_h3["resolution"]
+    if frozen.multimodal is not None:
+        expected_workflow = {
+            "multimodal": h3.H3_MULTIMODAL_WORKFLOW,
+            "multimodal_hd": h3.H3_MULTIMODAL_HD_WORKFLOW,
+        }.get(frozen.multimodal.mode)
+        if engine_h3.get("workflow") != expected_workflow:
+            raise _SubmitError(409, "prepared_input_invalid")
+        try:
+            return h3_project.build_request(
+                frozen=frozen,
+                cid=cid,
+                workdir=(settings.data_dir / cid / "work" / "h3-native").resolve(),
+                client_request_id=client_request_id,
+                duration=duration,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
+                autodl_token=settings.autodl_art_token,
+                timeouts=_timeouts(settings),
+            )
+        except h3_project.ProjectMultimodalError:
+            raise _SubmitError(409, "prepared_input_invalid") from None
     return h3.H3Request(
         cid=cid,
         workdir=(settings.data_dir / cid).resolve(),
@@ -858,9 +897,61 @@ def _freeze_submission(
         raise _SubmitError(409, "prepared_input_invalid")
     duration = float(meta["duration_s"])
     request_duration = long_video.provider_duration_s(0.0, duration)
-    engine_request = {
+    base_engine_request = {
         "h3": {
             "workflow": h3.H3_WORKFLOW,
+            "duration": request_duration,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "provider_resolution": h3.provider_resolution(
+                aspect_ratio, resolution
+            ),
+        },
+    }
+    try:
+        base_frozen = prepared_input.write_prepared_input(
+            root=cdir,
+            source=_source(cdir),
+            audio=(work / "voice.mp3") if (work / "voice.mp3").is_file() else None,
+            keyframes=keyframes,
+            visual=visual,
+            final=work / "prompt.txt",
+            dialogue_mode=dialogue_mode,
+            dialogue=dialogue,
+            vocal_filter_enabled=bool(meta.get("vocal_filter_enabled", True)),
+            duration_s=duration,
+            ratio=aspect_ratio,
+            fit_mode=fit_mode,
+            engine_request=base_engine_request,
+            multimodal=None,
+        )
+        if h3_project.refresh_skill_input(
+            root=cdir,
+            workdir=work,
+            visual_prompt_path=visual,
+            keyframes=tuple(keyframes),
+            dialogue_source_sha256=base_frozen.dialogue_sha256,
+        ):
+            raise _SubmitError(409, "multimodal_plan_refresh_required")
+    except prepared_input.PreparedInputError:
+        raise _SubmitError(409, "prepared_input_invalid") from None
+    except h3_project.ProjectMultimodalError as exc:
+        raise _SubmitError(409, exc.code) from None
+    try:
+        multimodal = h3_project.freeze_optional(cdir, work)
+    except h3_project.ProjectMultimodalError as exc:
+        raise _SubmitError(409, exc.code) from None
+    workflow = (
+        {
+            "multimodal": h3.H3_MULTIMODAL_WORKFLOW,
+            "multimodal_hd": h3.H3_MULTIMODAL_HD_WORKFLOW,
+        }[multimodal.mode]
+        if multimodal is not None
+        else h3.H3_WORKFLOW
+    )
+    engine_request = {
+        "h3": {
+            "workflow": workflow,
             "duration": request_duration,
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
@@ -884,13 +975,16 @@ def _freeze_submission(
             ratio=aspect_ratio,
             fit_mode=fit_mode,
             engine_request=engine_request,
+            multimodal=multimodal,
         )
     except prepared_input.PreparedInputError:
         raise _SubmitError(409, "prepared_input_invalid") from None
     return _make_h3_request(settings, cid, frozen, request_id)
 
 
-def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
+def _load_short_frozen_input(
+    settings: Settings, cid: str, meta: dict,
+) -> tuple[prepared_input.PreparedInput, str]:
     generation = meta.get("generation")
     request_id = generation.get("client_request_id") if isinstance(generation, dict) else None
     dialogue = meta.get("prepared_dialogue")
@@ -919,10 +1013,84 @@ def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
         or frozen.ratio != aspect_ratio
     ):
         raise _SubmitError(409, "prepared_input_invalid")
+    return frozen, request_id
+
+
+def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
+    frozen, request_id = _load_short_frozen_input(settings, cid, meta)
+    _aspect_ratio, resolution = _generation_semantics(meta)
     request = _make_h3_request(settings, cid, frozen, request_id)
     if request.resolution != resolution:
         raise _SubmitError(409, "prepared_input_invalid")
+    if h3.is_multimodal_request(request):
+        generation = meta.get("generation")
+        binding = generation.get("context_ir") if isinstance(generation, dict) else None
+        if isinstance(binding, Mapping) and binding.get("status") == "succeeded":
+            context = _freeze_short_context_ir(settings, frozen, request)
+            try:
+                request = h3_project.apply_bound_context_ir(context, binding)
+            except h3_project.ProjectMultimodalError:
+                raise _SubmitError(409, "prepared_input_invalid") from None
     return request
+
+
+def _freeze_short_context_ir(
+    settings: Settings,
+    frozen: prepared_input.PreparedInput,
+    source_request: h3.H3Request,
+) -> context_ir_bridge.FrozenContextIrRequest:
+    if not settings.minimax_api_key:
+        raise h3_project.ProjectMultimodalError("context_ir_credential_missing")
+    return h3_project.freeze_context_ir(
+        source_request=source_request,
+        upstream_dialogue_sha256=frozen.dialogue_sha256,
+        upstream_artifact_path=frozen.receipt_path,
+        upstream_artifact_sha256=frozen.receipt_sha256,
+        upstream_dialogue_sha256_path=("dialogue", "sha256"),
+        minimax_api_key=settings.minimax_api_key,
+        request_timeout_s=settings.h3_request_timeout_s,
+        poll_timeout_s=settings.h3_poll_timeout_s,
+        poll_interval_s=settings.h3_poll_interval_s,
+    )
+
+
+def _short_context_ir_may_progress(
+    generation: Mapping,
+    source_request: h3.H3Request,
+    action: str,
+) -> bool:
+    binding = generation.get("context_ir")
+    if binding is None:
+        return action == "start" and generation.get("h3_attempt_id") is None
+    if not isinstance(binding, Mapping):
+        return False
+    return h3_project.context_ir_progress_binding_matches(
+        source_request, binding
+    )
+
+
+def _short_bound_output_is_reusable(
+    settings: Settings, cid: str, meta: dict, request: h3.H3Request,
+) -> bool:
+    if not h3.output_is_reusable(request):
+        return False
+    if not h3.is_multimodal_request(request):
+        return True
+    generation = meta.get("generation")
+    if (
+        not isinstance(generation, dict)
+        or generation.get("audio_route") != h3_project.AUDIO_ROUTE
+        or not isinstance(generation.get("h3_attempt_id"), str)
+    ):
+        return False
+    frozen, _request_id = _load_short_frozen_input(settings, cid, meta)
+    return h3_project.short_output_is_reusable(
+        request=request,
+        expected_attempt_id=generation["h3_attempt_id"],
+        source_video=frozen.source.path,
+        output=(settings.data_dir / cid / "generated.mp4").resolve(),
+        target_duration_s=frozen.duration_s,
+    )
 
 
 def _claim_first_submission(
@@ -971,10 +1139,50 @@ def _finish_generation(settings: Settings, cid: str, request: h3.H3Request, resu
     if not isinstance(generation, dict) or generation.get("client_request_id") != request.client_request_id:
         return
     status, error = _result_fields(result)
+    updated = {**generation, "status": status, "error": error}
+    if h3.is_multimodal_request(request):
+        if generation.get("audio_route") != h3_project.AUDIO_ROUTE:
+            updated.update(
+                status="submission_unknown",
+                error="submission_unknown",
+            )
+        else:
+            attempt_id = result.attempt_id
+            if (
+                isinstance(attempt_id, str)
+                and len(attempt_id) == 6
+                and attempt_id.isdigit()
+            ):
+                updated["h3_attempt_id"] = attempt_id
+            if result.status == "succeeded":
+                try:
+                    frozen, _request_id = _load_short_frozen_input(
+                        settings, cid, meta
+                    )
+                    h3_project.stitch_short_native(
+                        request=request,
+                        result=result,
+                        source_video=frozen.source.path,
+                        output=(settings.data_dir / cid / "generated.mp4").resolve(),
+                        target_duration_s=frozen.duration_s,
+                    )
+                except (_SubmitError, h3_project.ProjectMultimodalError) as exc:
+                    code = getattr(exc, "code", "prepared_input_invalid")
+                    updated.update(
+                        status=(
+                            "resume_required"
+                            if code == "h3_native_stitch_failed"
+                            else "failed"
+                        ),
+                        error=code,
+                        stage="stitch",
+                    )
+                else:
+                    updated["stage"] = "stitch"
     storage.update_meta(
         settings.data_dir,
         cid,
-        generation={**generation, "status": status, "error": error},
+        generation=updated,
     )
 
 
@@ -1041,15 +1249,91 @@ def _run_generation(
         generation={**generation, "status": "running", "error": None},
     )
     try:
-        if action == "start":
+        h3_action = action
+        if h3.is_multimodal_request(request):
+            frozen, _request_id = _load_short_frozen_input(settings, cid, meta)
+            context = _freeze_short_context_ir(settings, frozen, request)
+            binding = generation.get("context_ir")
+            context_ready = (
+                isinstance(binding, Mapping)
+                and binding.get("status") == "succeeded"
+            )
+            if context_ready:
+                request = h3_project.apply_bound_context_ir(context, binding)
+            else:
+                if not _short_context_ir_may_progress(
+                    generation, request, action
+                ):
+                    raise h3_project.ProjectMultimodalError(
+                        "context_ir_binding_invalid"
+                    )
+                context_result = context_ir_bridge.optimize_h3_prompt(context)
+                binding = h3_project.context_ir_binding(context_result)
+                current = storage.load_meta(settings.data_dir, cid)
+                current_generation = (
+                    current.get("generation") if isinstance(current, dict) else None
+                )
+                if not isinstance(current_generation, dict):
+                    return
+                if context_result.status != "succeeded":
+                    if context_result.status == "submission_unknown":
+                        status, error = "submission_unknown", "submission_unknown"
+                    elif context_result.status in {"running", "query_unknown"}:
+                        status = "resume_required"
+                        error = context_result.error_code or "context_ir_query_unknown"
+                    else:
+                        status = "failed"
+                        error = context_result.error_code or "context_ir_failed"
+                    storage.update_meta(
+                        settings.data_dir,
+                        cid,
+                        generation={
+                            **current_generation,
+                            "status": status,
+                            "error": error,
+                            "stage": "context_ir_native",
+                            "context_ir": binding,
+                        },
+                    )
+                    return
+                request = h3_project.apply_bound_context_ir(context, binding)
+                storage.update_meta(
+                    settings.data_dir,
+                    cid,
+                    generation={
+                        **current_generation,
+                        "status": "running",
+                        "error": None,
+                        "stage": "h3",
+                        "context_ir": binding,
+                    },
+                )
+                if action == "resume":
+                    h3_action = "start"
+        if h3_action == "start":
             result = h3.start(request)
-        elif action == "resume":
+        elif h3_action == "resume":
             result = h3.resume(request)
         else:
             result = h3.retry(request, request.client_request_id)
-        if action == "resume" and result.status == "not_started":
+        if h3_action == "resume" and result.status == "not_started":
             _mark_submission_unknown(settings, cid, generation)
             return
+    except (context_ir_bridge.ContextIrError, h3_project.ProjectMultimodalError) as exc:
+        current = storage.load_meta(settings.data_dir, cid)
+        current_generation = current.get("generation") if current else generation
+        if isinstance(current_generation, dict):
+            storage.update_meta(
+                settings.data_dir,
+                cid,
+                generation={
+                    **current_generation,
+                    "status": "submission_unknown",
+                    "error": getattr(exc, "code", "context_ir_invalid"),
+                    "stage": "context_ir_native",
+                },
+            )
+        return
     except h3.H3Error as exc:
         if action == "resume" and isinstance(exc, h3.ReceiptError):
             _mark_submission_unknown(settings, cid, generation)
@@ -1102,6 +1386,24 @@ def _h3_validation_paths(workdir: Path) -> set[Path]:
     return paths
 
 
+def _context_ir_validation_paths(
+    workdir: Path, binding: object,
+) -> set[Path]:
+    """Fingerprint only the exact in-workdir Context IR attempt."""
+    attempts = workdir / ".context-ir" / "attempts"
+    if not isinstance(binding, Mapping):
+        return {attempts}
+    attempt_id = binding.get("attempt_id")
+    if (
+        not isinstance(attempt_id, str)
+        or len(attempt_id) != 6
+        or not attempt_id.isdigit()
+    ):
+        return {attempts}
+    attempt = attempts / attempt_id
+    return {attempt / "attempt.json", attempt / "receipt.json"}
+
+
 def _short_validation_paths(cdir: Path, meta: dict) -> set[Path]:
     paths = _h3_validation_paths(cdir)
     receipt_name = meta.get("prepared_input_receipt")
@@ -1125,6 +1427,26 @@ def _short_validation_paths(cdir: Path, meta: dict) -> set[Path]:
     keyframes = bindings.get("keyframes")
     if isinstance(keyframes, list):
         candidates.extend(keyframes)
+    multimodal = payload.get("multimodal") if isinstance(payload, dict) else None
+    if isinstance(multimodal, dict):
+        native_workdir = cdir / "work" / "h3-native"
+        paths.update(_h3_validation_paths(native_workdir))
+        paths.add(cdir / stitch.RECEIPT_FILENAME)
+        candidates.extend([
+            multimodal.get("manifest"),
+            multimodal.get("multimodal_input"),
+            multimodal.get("skill_plan"),
+        ])
+        reference_audios = multimodal.get("reference_audios")
+        if isinstance(reference_audios, list):
+            candidates.extend(reference_audios)
+        generation = meta.get("generation")
+        paths.update(_context_ir_validation_paths(
+            native_workdir,
+            generation.get("context_ir")
+            if isinstance(generation, Mapping)
+            else None,
+        ))
     paths.update(
         path for binding in candidates
         if (path := _bound_artifact_path(cdir, binding)) is not None
@@ -1182,6 +1504,8 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
             else h3.H3_DEFAULT_ASPECT_RATIO
         )
         layout_dirs = (None, semantic_dir.replace(":", "x"))
+    selected_sources: list[Path] = []
+    segment_selected: dict[int, list[Path]] = {}
     for raw in raw_segments:
         if not isinstance(raw, dict):
             continue
@@ -1193,13 +1517,41 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
         keyframes = raw.get("keyframes")
         if isinstance(keyframes, list):
             candidates.extend(keyframes)
+            selected_sources.extend(
+                path for binding in keyframes
+                if (path := _bound_artifact_path(cdir, binding)) is not None
+            )
         anchors = raw.get("anchors")
         if isinstance(anchors, list):
             candidates.extend(anchors)
+        multimodal = raw.get("multimodal")
+        if isinstance(multimodal, dict):
+            candidates.extend([
+                multimodal.get("manifest"),
+                multimodal.get("multimodal_input"),
+                multimodal.get("skill_plan"),
+            ])
+            reference_audios = multimodal.get("reference_audios")
+            if isinstance(reference_audios, list):
+                candidates.extend(reference_audios)
         index = raw.get("index")
         if isinstance(index, int) and not isinstance(index, bool) and index > 0:
             workdir = cdir / "work" / "segments" / str(index)
             paths.update(_h3_validation_paths(workdir))
+            generation_segment = next((
+                item for item in (
+                    generation.get("segments", [])
+                    if isinstance(generation, Mapping)
+                    else []
+                )
+                if isinstance(item, Mapping) and item.get("index") == index
+            ), None)
+            paths.update(_context_ir_validation_paths(
+                workdir,
+                generation_segment.get("context_ir")
+                if isinstance(generation_segment, Mapping)
+                else None,
+            ))
             tail = workdir / "work" / "generated_last.png"
             if not fast_mode:
                 paths.add(tail)
@@ -1216,6 +1568,49 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
                                 paths.add(fit_root / role / bound.name)
                     if not fast_mode:
                         paths.add(fit_root / "continued" / tail.name)
+    try:
+        selected_keyframes = postprocess.generation_keyframes(
+            cdir, meta, selected_sources
+        )
+    except postprocess.PostprocessError:
+        selected_keyframes = []
+        for source in selected_sources:
+            try:
+                relative = source.resolve().relative_to(cdir / "work")
+            except ValueError:
+                continue
+            if (
+                len(relative.parts) == 5
+                and relative.parts[0] == "segments"
+                and relative.parts[1].isdigit()
+                and relative.parts[2:4] == ("work", "keyframes")
+            ):
+                selected_keyframes.append(
+                    cdir / "work" / "segments" / relative.parts[1]
+                    / "work" / "postprocessed" / source.name
+                )
+    for selected in selected_keyframes:
+        paths.add(selected)
+        try:
+            relative = selected.resolve().relative_to(cdir / "work")
+        except ValueError:
+            continue
+        if (
+            len(relative.parts) == 5
+            and relative.parts[0] == "segments"
+            and relative.parts[1].isdigit()
+            and fit_mode in {"crop", "pad"}
+        ):
+            index = int(relative.parts[1])
+            segment_selected.setdefault(index, []).append(selected)
+    if fit_mode in {"crop", "pad"}:
+        for index, selected in segment_selected.items():
+            for layout_dir in layout_dirs:
+                fit_root = cdir / "work" / "segments" / str(index) / "work" / "h3_frames"
+                if layout_dir is not None:
+                    fit_root = fit_root / layout_dir
+                for path in selected:
+                    paths.add(fit_root / fit_mode / "keyframes" / path.name)
     paths.update(
         path for binding in candidates
         if (path := _bound_artifact_path(cdir, binding)) is not None
@@ -1234,6 +1629,10 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
                 "client_request_id": generation.get("client_request_id"),
                 "fit_layout": generation.get("fit_layout"),
                 "fast_mode": generation.get("fast_mode", False),
+                "audio_route": generation.get("audio_route"),
+                "workflow": generation.get("workflow"),
+                "h3_attempt_id": generation.get("h3_attempt_id"),
+                "context_ir": generation.get("context_ir"),
                 "segments": generation.get("segments"),
             }
             if isinstance(generation, dict)
@@ -1248,6 +1647,7 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
                 "resolution": meta.get("resolution"),
                 "dialogue_mode": meta.get("dialogue_mode"),
                 "segments": meta.get("segments"),
+                "postprocess": meta.get("postprocess"),
                 "frozen_plan_receipt": meta.get("frozen_plan_receipt"),
                 "long_video_plan_receipt": meta.get("long_video_plan_receipt"),
                 "generation": generation_binding,
@@ -1322,6 +1722,47 @@ def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
     )
 
 
+def _long_receipt_multimodal_intent(
+    cdir: Path, meta: dict,
+) -> bool | None:
+    """Return None when a frozen receipt exists but cannot be trusted."""
+    name = meta.get("long_video_plan_receipt")
+    expected = meta.get("frozen_plan_receipt")
+    has_expected = isinstance(expected, str) and bool(re.fullmatch(r"[0-9a-f]{64}", expected))
+    if not isinstance(name, str) or name != Path(name).name:
+        return None if has_expected else False
+    path = cdir / name
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None if has_expected else False
+    if has_expected and hashlib.sha256(data).hexdigest() != expected:
+        return None
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None if has_expected else False
+    if not isinstance(payload, Mapping):
+        return None if has_expected else False
+    version = payload.get("version")
+    workflow = payload.get("workflow")
+    if (
+        payload.get("schema") != "duet.long-video-plan"
+        or version not in {
+            long_video.LEGACY_PLAN_RECEIPT_VERSION,
+            long_video.PLAN_RECEIPT_VERSION,
+            long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
+        }
+        or workflow not in (
+            h3.H3_REFERENCE_WORKFLOWS | {h3.H3_BOUNDARY_WORKFLOW}
+        )
+    ):
+        return None if has_expected else False
+    if version == long_video.MULTIMODAL_PLAN_RECEIPT_VERSION:
+        return workflow in h3.H3_MULTIMODAL_WORKFLOWS
+    return False
+
+
 def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
     generation = meta.get("generation")
     if not isinstance(generation, dict) or generation.get("status") != "succeeded":
@@ -1330,6 +1771,9 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
     if not isinstance(cid, str):
         return False
     if _is_long_video(meta):
+        immutable_multimodal_intent = _long_receipt_multimodal_intent(
+            settings.data_dir / cid, meta
+        )
         expected = meta.get("frozen_plan_receipt")
         if (
             isinstance(expected, str)
@@ -1349,22 +1793,60 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
                 reusable = long_generation.bound_reusable_segment_indices(
                     settings, cid, plan, generation
                 )
-                if (
-                    reusable == frozenset(item.index for item in plan.segments)
-                    and long_generation.stitched_output_is_reusable(
+                provider_media = (
+                    long_generation.bound_h3_native_media(
+                        settings, cid, plan, generation
+                    )
+                    if getattr(plan, "workflow", None) in h3.H3_MULTIMODAL_WORKFLOWS
+                    else None
+                )
+                stitched_reusable = (
+                    long_generation.stitched_output_is_reusable(
+                        plan,
+                        meta.get("dialogue_mode"),
+                        generation=generation,
+                        provider_media=provider_media,
+                    )
+                    if provider_media is not None
+                    else long_generation.stitched_output_is_reusable(
                         plan, meta.get("dialogue_mode")
                     )
+                )
+                if (
+                    reusable == frozenset(item.index for item in plan.segments)
+                    and stitched_reusable
                 ):
                     return True
             except long_generation.LongGenerationError:
                 pass
+        if immutable_multimodal_intent is not False:
+            return False
     else:
         try:
             request = _load_h3_request(settings, cid, meta)
-            if h3.output_is_reusable(request):
+            if h3.is_multimodal_request(request):
+                if _short_bound_output_is_reusable(
+                    settings, cid, meta, request
+                ):
+                    return True
+                return False
+            if _short_bound_output_is_reusable(settings, cid, meta, request):
                 return True
-        except (_SubmitError, h3.H3Error):
+        except (
+            _SubmitError,
+            h3.H3Error,
+            h3_project.ProjectMultimodalError,
+            long_generation.LongGenerationError,
+        ):
             pass
+    if (
+        generation.get("audio_route") in (
+            h3_project.AUDIO_ROUTE,
+            long_generation.H3_NATIVE_AUDIO_ROUTE,
+        )
+        or generation.get("workflow") in h3.H3_MULTIMODAL_WORKFLOWS
+    ):
+        return False
     return h3.legacy_succeeded_output_is_valid(
         settings.data_dir / cid,
         cid=cid,
@@ -1979,6 +2461,38 @@ def create_app(settings: Settings) -> FastAPI:
                 old = meta.get("generation")
                 previous_status = old.get("status") if isinstance(old, dict) else None
                 previous_id = old.get("client_request_id") if isinstance(old, dict) else None
+                if not isinstance(old, dict):
+                    try:
+                        promoted_receipt = await asyncio.to_thread(
+                            long_generation.finalize_multimodal_plan,
+                            settings.data_dir / cid,
+                            meta,
+                            expected_receipt,
+                            fit_mode,
+                            dialogue_mode,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
+                        )
+                    except long_generation.LongGenerationError as exc:
+                        raise HTTPException(
+                            status_code=exc.status, detail=exc.code
+                        ) from exc
+                    if promoted_receipt is not None:
+                        storage.update_meta(
+                            settings.data_dir,
+                            cid,
+                            dialogue_mode=dialogue_mode,
+                            fit_mode=fit_mode,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
+                        )
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "long_video_plan_changed",
+                                "message": "音画计划已冻结，请刷新并确认后重试。",
+                            },
+                        )
                 if isinstance(old, dict) and not long_generation.generation_segments_are_valid(
                     meta.get("segments"), old
                 ):
@@ -2210,7 +2724,9 @@ def create_app(settings: Settings) -> FastAPI:
                                     status_code=409,
                                     detail="submission_outcome_unknown",
                                 ) from exc
-                            if h3.output_is_reusable(request):
+                            if _short_bound_output_is_reusable(
+                                settings, cid, meta, request
+                            ):
                                 return {
                                     "status": "succeeded",
                                     "attempt": generation.get("attempt"),
@@ -2355,7 +2871,30 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             except _SubmitError as exc:
                 if claim_owner:
-                    _finish_submission_claim(settings, cid, claim_owner)
+                    if exc.detail == "multimodal_plan_refresh_required":
+                        _finish_submission_claim(
+                            settings,
+                            cid,
+                            claim_owner,
+                            dialogue_mode=dialogue_mode,
+                            voice_lines=[
+                                {
+                                    key: line[key]
+                                    for key in ("text", "start_s", "end_s")
+                                }
+                                for line in dialogue
+                            ],
+                            prompt=(
+                                settings.data_dir / cid / "work" / "prompt.txt"
+                            ).read_text(encoding="utf-8"),
+                            prepared_dialogue=[dict(line) for line in dialogue],
+                            prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
+                            fit_mode=fit_mode,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
+                        )
+                    else:
+                        _finish_submission_claim(settings, cid, claim_owner)
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             except h3.H3Error as exc:
                 if claim_owner:
@@ -2376,6 +2915,19 @@ def create_app(settings: Settings) -> FastAPI:
                 "client_request_id": request_id,
                 "stage": "h3",
             }
+            if h3.is_multimodal_request(request):
+                if not settings.minimax_api_key:
+                    if claim_owner:
+                        _finish_submission_claim(settings, cid, claim_owner)
+                    raise HTTPException(
+                        status_code=503, detail="context_ir_credentials_missing"
+                    )
+                generation.update(
+                    audio_route=dict(h3_project.AUDIO_ROUTE),
+                    h3_attempt_id=None,
+                    context_ir=None,
+                    stage="context_ir_native",
+                )
             changes = dict(
                 dialogue_mode=dialogue_mode,
                 voice_lines=bare_lines,

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
 
-from app import storage
+from app import h3, storage
 
 
 FPS = 24
@@ -346,7 +346,122 @@ def _validate_output(path: Path, expected_duration_s: float, audio_mode: str,
     )
     if info.has_audio != expected_audio:
         raise StitchError("final audio streams do not match requested audio strategy")
+    if audio_mode == "provider_generated":
+        try:
+            timeline = h3._probe_media_timeline(
+                path,
+                30,
+                max_duration_s=expected_duration_s + FRAME_DURATION_S + 1e-6,
+            )
+        except (h3.H3Error, h3._ProbeUnavailable) as exc:
+            raise StitchError("final native-audio timeline invalid") from exc
+        if timeline.get("audio") is None or timeline.get("av_delta_s") is None:
+            raise StitchError("final native-audio timeline invalid")
     return info
+
+
+def output_is_reusable(
+    *,
+    segments: Sequence[StitchSegment],
+    source_video: Path,
+    output: Path,
+    audio_mode: AudioMode,
+    receipt_path: Path | None = None,
+) -> bool:
+    """Validate an existing output against the exact deterministic stitch input.
+
+    In provider-generated mode this rebinds every segment to its exact H3
+    attempt and media-timeline digest.  A merely playable output is never enough.
+    """
+    try:
+        normalized, source, destination = _validate_request(
+            segments, Path(source_video), Path(output), audio_mode
+        )
+        receipt = Path(
+            receipt_path or destination.with_name(RECEIPT_FILENAME)
+        ).resolve()
+        if receipt.parent != destination.parent or not receipt.is_file():
+            return False
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema", "version", "segments", "audio", "output"}
+            or payload.get("schema") != "duet.stitch"
+            or payload.get("version")
+            != (2 if audio_mode == "provider_generated" else 1)
+        ):
+            return False
+        budgets = _frame_budgets(normalized)
+        expected_segments = [
+            {
+                "index": index,
+                "path": str(segment.path),
+                "sha256": _sha256(segment.path),
+                "target_duration_s": segment.target_duration_s,
+                "output_frames": budgets[index - 1],
+                "join_mode": segment.join_mode,
+            }
+            for index, segment in enumerate(normalized, 1)
+        ]
+        if payload.get("segments") != expected_segments:
+            return False
+        source_info = _probe(source)
+        expected_audio: dict[str, object] = {
+            "mode": audio_mode,
+            "source": str(source),
+            "source_sha256": _sha256(source),
+            "source_has_audio": source_info.has_audio,
+        }
+        if audio_mode == "provider_generated":
+            expected_audio["provider_segments"] = [
+                _provider_binding(segment, index)
+                for index, segment in enumerate(normalized, 1)
+            ]
+            expected_audio["edl"] = {
+                "schema": "duet.av-edl",
+                "version": 1,
+                "fps": FPS,
+                "interval": "integer-half-open",
+            }
+        if payload.get("audio") != expected_audio:
+            return False
+        bound_output = payload.get("output")
+        stat = destination.stat()
+        if (
+            not destination.is_file()
+            or stat.st_size <= 0
+            or not isinstance(bound_output, dict)
+            or set(bound_output)
+            != {"name", "sha256", "size", "duration_s", "fps"}
+            or bound_output.get("name") != destination.name
+            or bound_output.get("sha256") != _sha256(destination)
+            or bound_output.get("size") != stat.st_size
+            or bound_output.get("fps") != FPS
+        ):
+            return False
+        requested_duration = sum(
+            segment.target_duration_s for segment in normalized
+        )
+        info = _validate_output(
+            destination,
+            requested_duration,
+            audio_mode,
+            source_info.has_audio,
+        )
+        receipt_duration = float(bound_output.get("duration_s"))
+        return (
+            math.isfinite(receipt_duration)
+            and abs(receipt_duration - info.duration_s) <= FRAME_DURATION_S + 1e-6
+        )
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        StitchError,
+    ):
+        return False
 
 
 def stitch_video(

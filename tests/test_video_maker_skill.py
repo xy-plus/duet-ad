@@ -40,10 +40,11 @@ def test_multimodal_phase_emits_structured_plan_not_provider_prompt():
         '"eligible": true',
         '"subjects"',
         '"audio_refs"',
-        '"dialogue"',
+        '"dialogue_source_sha256"',
+        '"speech_bindings"',
         '"sound_design"',
-        "subjects: Array<{ subject_id: SubjectId; picture_refs: NonEmptyArray<Int1>; voice_ref: Int1 }>",
-        "dialogue: Array<{ order: Int1; subject_id: SubjectId; language: NonEmpty; text: NonEmpty }>",
+        "subjects: Array<{ subject_id: SubjectId; picture_refs: NonEmptyArray<Int1>; voice_ref: Int1 | null }>",
+        'delivery: "on_screen" | "off_screen_voiceover"',
         "后端确定性编译",
     ):
         assert required in text
@@ -57,9 +58,9 @@ def test_multimodal_phase_binds_audio_semantics_and_fails_closed():
         "1–3 段",
         "说话人与人物映射",
         "声线参考",
-        "精确台词",
+        "现有 dialogue",
         "语言",
-        "旁白",
+        "画外发声",
         "环境声",
         "音效",
         "参考音频不是时间锁",
@@ -82,7 +83,7 @@ def test_audio_phase_preserves_visual_facts_and_does_not_reselect_frames():
 
     assert "不得改写视觉事实" in text
     assert "不得重新选关键帧" in text
-    assert "不得补造未提供的人物、台词、语言或声音事件" in text
+    assert "不得复制或补造台词文本、时间窗、语言或声音事件" in text
 
 
 def test_static_schema_matches_h3_multimodal_adapter_items():
@@ -91,12 +92,12 @@ def test_static_schema_matches_h3_multimodal_adapter_items():
     for required in (
         "所有字段必填，禁止额外字段",
         'audio_refs: Array<{ audio_index: Int1; purpose: "voice" | "ambience" | "effect"; subject_id: SubjectId | null }>',
-        "narration: Array<{ order: Int1; language: NonEmpty; text: NonEmpty; voice_ref: Int1 | null }>",
+        "speech_bindings: Array<",
         "ambience_refs: Array<{ audio_index: Int1; description: NonEmpty }>",
         "effects: Array<{ audio_index: Int1; description: NonEmpty }>",
-        "`dialogue[].order` 与 `narration[].order` 共用",
-        "两个数组各自按 `order` 升序",
-        "旁白不得出现 `subject_id`",
+        "`line_index` 从 1 开始连续无缺号",
+        "不得另写 `order/text/start_s/end_s/narration text`",
+        "画外发声不得出现 `subject_id`",
     ):
         assert required in text
     for incompatible in (
@@ -116,7 +117,7 @@ def test_static_schema_matches_adapter_reference_and_subject_guards():
         "`picture_refs` 是非空、升序、无重复的多值数组",
         "不同 `subject_id` 不得复用同一图片编号",
         "冻结输入必须已给出连续的 `S1…Sn`",
-        "不得输出没有人物台词的静默 subject",
+        "同画面的静默人物可以保留",
         "同一 `audio_index` 只能有一种 `purpose`",
     ):
         assert required in text
@@ -127,8 +128,8 @@ def test_audio_is_reference_only_and_backend_fields_stay_out_of_plan():
 
     for required in (
         "只按 reference 语义使用",
-        "不是精确 PTS",
-        "不是 speaker-face 绑定",
+        "不是供应商 PTS 硬锁",
+        "不是未经确认的 speaker-face 推断",
         "不是最终音轨",
         "不进入语义计划",
     ):
