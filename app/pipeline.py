@@ -1596,8 +1596,23 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     session_dir=cdir,
                     step="project image postprocess codex",
                 )
-                if continuity is not None or set(image_prompts) != {0}:
+                if continuity is None or set(image_prompts) != {0}:
                     raise PipelineError("image optimization output is missing or invalid")
+                try:
+                    frozen_continuity = image_optimization.freeze_continuity(
+                        continuity
+                    )
+                    if image_optimization.dual_target_plan_receipt(
+                        frozen_continuity
+                    ) is None:
+                        raise image_optimization.ImageOptimizationOutputError(
+                            "image optimization output is missing or invalid"
+                        )
+                except (
+                    image_optimization.ImageOptimizationIneligibleError,
+                    image_optimization.ImageOptimizationOutputError,
+                ) as exc:
+                    raise PipelineError(str(exc)) from None
                 image_prompt = image_prompts[0]
                 _write_image_optimization_prompt(work, image_prompt)
             prompt = _apply_no_bgm_prefix(prompt, work / "prompt.txt", enabled=False)
@@ -1634,6 +1649,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 fit_mode=default_fit_mode,
             )
             if new_input_contract:
+                completion.update(frozen_continuity)
                 completion.update(image_optimization.freeze_prompts(
                     settings, {**meta, **completion}, {0: image_prompt}
                 ))

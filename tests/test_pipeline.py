@@ -24,11 +24,60 @@ from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
 
+def _short_dual_target_plan():
+    return {
+        "version": 2,
+        "phase": "plan",
+        "segment_indices": [0],
+        "eligible": True,
+        "reason": None,
+        "person_plans": [{
+            "id": "PERSON_01",
+            "source_identity": "source person",
+            "replacement_identity": "replacement person",
+            "wardrobe_change": "different realistic wardrobe",
+            "local_color_change": "different local clothing colors",
+            "reference": {"segment_index": 0, "frame_index": 1},
+            "observable_segments": [0],
+        }],
+        "scene_plans": [{
+            "id": "SCENE_01",
+            "source_scene": "source environment",
+            "replacement_scene": "different realistic environment",
+            "semantic_change": "replace the environment semantics",
+            "geometry_changes": ["different structural geometry"],
+            "depth_changes": ["different spatial depth"],
+            "layout_changes": ["different spatial layout"],
+            "local_color_change": "different local surface colors",
+            "reference": {"segment_index": 0, "frame_index": 1},
+            "segments": [0],
+        }],
+        "segments": [{
+            "segment_index": 0,
+            "persons": [{
+                "id": "PERSON_01",
+                "state": "replace",
+                "observable_frames": [1],
+                "target_region": "the complete observable person",
+                "boundary": "the exact person boundary",
+            }],
+            "scene": {
+                "scene_id": "SCENE_01",
+                "target_region": "the complete observable environment",
+                "boundary": "all visible scene surfaces and boundaries",
+                "layout_reference_frame_index": 1,
+            },
+            "protected_non_target_people": [],
+            "protected_relations": ["all physical and interaction relations"],
+        }],
+    }
+
+
 @pytest.fixture(autouse=True)
 def _stub_image_postprocess_codex(monkeypatch):
     def generate(_runner, segments, mode, **_kwargs):
         indices = [segment["index"] for segment in segments]
-        continuity = None if indices == [0] else {
+        continuity = _short_dual_target_plan() if indices == [0] else {
             "version": 1,
             "segment_indices": indices,
             "elements": [],
@@ -1632,7 +1681,11 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_prepared_receipt(
     assert loaded.normalized_audio is None
     assert loaded.voice_texts == ()
     frozen = stored["_image_optimization"]
-    assert "_image_continuity" not in stored
+    continuity = stored["_image_continuity"]
+    assert continuity["version"] == 2
+    assert continuity["segment_indices"] == [0]
+    assert continuity["eligible"] is True
+    assert pipeline.image_optimization.dual_target_plan_receipt(stored) == continuity
     assert frozen["version"] == 2
     assert frozen["segments"][0]["current"] == (
         "Codex 生成的 independent_parallel 图片二次编辑提示词"
@@ -1641,6 +1694,59 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_prepared_receipt(
     assert (cdir / "work" / "image_optimization_prompt.txt").read_text(
         encoding="utf-8"
     ).strip() == frozen["segments"][0]["current"]
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        None,
+        {"version": 1, "segment_indices": [1], "elements": []},
+        {
+            "version": 2,
+            "phase": "plan",
+            "segment_indices": [0],
+            "eligible": False,
+            "reason": "person_replacement_unsafe",
+            "person_plans": [],
+            "scene_plans": [],
+            "segments": [],
+        },
+    ],
+    ids=["missing", "legacy-v1", "ineligible"],
+)
+def test_short_new_input_fails_closed_without_eligible_dual_target_plan(
+    tmp_path, video_1s, monkeypatch, plan,
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode="auto",
+        voice_mode="keep",
+        duration_s=10.0,
+        ratio="9:16",
+        fit_mode="none",
+    )
+
+    def fake_codex(self, workdir, prompt):
+        _write_valid_package(Path(workdir) / "work")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_image_optimization_project",
+        lambda *_args, **_kwargs: (plan, {0: "compiled prompt"}),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "failed"
+    assert "_image_continuity" not in stored
+    assert "_image_optimization" not in stored
 
 
 def test_run_dialogue_auto_ignores_external_lines_and_isolates_visual_codex(
