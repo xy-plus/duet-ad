@@ -1,144 +1,93 @@
 ---
 name: video-maker
-description: 从预先抽取的参考视频帧理解叙事、选择最多 9 张有序关键帧并生成纯视觉叙事；当后端另行提供冻结的多模态输入时，规划 H3 所需的人物、图片、声线参考、精确台词、语言、旁白、环境声和音效绑定。用于视频分析的视觉阶段或 H3 音画联合生成前的音画阶段；不提交视频、不调用供应商。
+description: 从参考帧选择关键帧并生成纯视觉叙事，或把后端冻结的 H3 多模态事实编排成可确定编译的音画计划；不提交任务、不调用供应商。
 ---
 
 # video-maker
 
-## 1. 选择阶段
-
-只按文件选择一种阶段，不混用：
+## 阶段路由
 
 - `work/multimodal_input.json` 不存在：执行**视觉阶段**。
 - `work/multimodal_input.json` 存在：执行**音画阶段**。
 
-视觉阶段只处理图片与文字，不读取、推断或编排音频。音画阶段只规划冻结输入的语义绑定，不重新分析原视频。
+两阶段不得混合。视觉阶段不得读取任何音频文件；音画阶段只读取该 JSON，不得重新分析媒体。
 
-## 2. 视觉阶段
+## 视觉阶段
 
-### 输入与输出
+输入是 `work/NN_frame_*.png`、`contact_sheet_*.jpg`、`manifest.json`；`scenes.json` 仅辅助分组。输出仅为：
 
-输入均在 `work/`：
+- `work/keyframes/01.png` 至 `09.png`：按源时间连续编号。
+- `work/prompt.txt`：用户语言的纯视觉叙事。
 
-- `NN_frame_*.png`：外部程序按时间抽取的帧。
-- `contact_sheet_*.jpg`：分页联系表。
-- `manifest.json`：源视频时长、尺寸、帧率和帧数。
-- `scenes.json`：辅助场景分组，不是事实真源。
+1. 查看联系表，必要时查看原始帧；只写已检查帧支持的事实。
+2. 选最多 9 张清晰稳定、主体可见、遮挡少的帧；每帧一个主导状态，每个结果有可见原因，不凑数。
+3. 按画面顺序描述构图、动作、镜头、结果和因果；保持接触、遮挡和未受作用内容。字幕或水印无法避开时才用 `scripts/crop_image.py`。
+4. 时长只写“与源片段时长一致”，不写具体秒数或截断后半段；不从画面文字推断台词，不生成 `voice_lines.json`，不写嘴型、声线、配乐或音效。
 
-输出固定为：
-
-- `work/keyframes/01.png` 至 `09.png`：按源时间排序的关键帧。
-- `work/prompt.txt`：纯视觉叙事提示词。
-
-### 约束
-
-- 眼见为实；每个细节都能对应检查过的帧。
-- 最多选择 9 张；一帧一个主导状态，不凑数。
-- 每个结果状态都有可见的原因状态；保持动作、接触、遮挡和因果关系。
-- 选择清晰稳定、主体可见、遮挡少的帧；字幕或水印无法避开时才使用 `scripts/crop_image.py`。
-- 提示词使用用户语言，只描述画面、动作、镜头、顺序和因果。
-- 时长只写“与源片段时长一致”，不写具体秒数，不截断后半段内容。
-- 不从画面文字推断台词，不生成 `voice_lines.json`，不写嘴型、声线、配乐或音效要求。
-
-### 步骤
-
-1. 按场景查看联系表，必要时打开原始帧，理清初始状态、动作和结果。
-2. 按时间选择关键帧，复制到 `work/keyframes/` 并从 `01.png` 连续编号。
-3. 写入 `work/prompt.txt`：
-
-```text
-生成一支与源片段时长一致、采用源视频[比例]、[分辨率，默认 720p]的[主题]短视频。
-
-拍摄风格：[已观察到的机位、运动、光线与质感]。无字幕、贴纸或水印等叠加元素。
-
-叙事：从图片1的状态开始，[动作与镜头如何依次推进]；最后到达图片N的[结果状态]。
-
-因果：[先看到动作，再看到变化；动作到哪里，变化到哪里；未受作用的内容保持原样。]
-```
-
-## 3. 音画阶段
+## 音画阶段
 
 ### 边界
 
-后端已把视觉事实和音频事实冻结在 `work/multimodal_input.json`。只读取该文件；不得改写视觉事实、不得重新选关键帧、不得补造未提供的人物、台词或声音事件。
+后端已在 `work/multimodal_input.json` 冻结事实。逐字保留视觉提示；不得改写视觉事实、不得重新选关键帧、不得补造未提供的人物、台词、语言或声音事件。
 
-音画阶段只写 `work/h3_prompt_plan.json`。不得直接写供应商最终提示词；后端确定性编译该计划为 H3 Context-IR，并冻结编译器版本和哈希。
+只写 `work/h3_prompt_plan.json`。不得直接写供应商最终提示词；后端确定性编译为 H3 Context-IR。
 
 ### 资格门
 
-只有同时满足下列条件才可令 `eligible=true`：
+仅当全部成立才输出 `"eligible": true`：
 
-- 有 1–3 段已冻结、有序且可读取的参考音频；每段的用途只能是声线参考、环境声或音效。
-- 每句精确台词都有明确的 `subject_id`、语言、文本和顺序。
-- 每个发声人物都有经过上游确认的说话人与人物映射，以及唯一声线参考。
-- 旁白明确标记为旁白，不绑定画面人物；重叠说话必须已由上游拆分或确认。
-- 图片、音频、人物和台词使用输入给出的稳定编号；没有缺号、重复或悬空引用。
+1. 有 1–3 段冻结参考音频；每个 `audio_index` 唯一且只有声线参考、环境声或音效一种用途。
+2. 每个发声人物都有上游确认的说话人与人物映射、稳定 `subject_id` 和唯一声线参考。
+3. 每句人物台词都有非空 `subject_id`、`language`、`text`、`order`；每句旁白都有非空 `voice_ref`、`language`、`text`、`order`，且不绑定画面人物。精确台词逐字来自输入。
+4. 图片、音频、人物、台词和声音事件无重复、悬空或跨用途引用；重叠说话已由上游拆分或确认。
 
-任一条件不成立时，输出 `eligible=false`、稳定 `reason`，其余绑定数组置空。不得根据时间重叠、嘴部外观或同框关系猜测说话人。
+任何必填事实缺失、未知、冲突或无法确认时，输出 `"eligible": false` 和稳定错误码。不得根据时间重叠、嘴部外观、同框或素材顺序猜测说话人、声音用途或素材关系。
 
-参考音频不是时间锁，也不等于最终音轨；它只提供声线、环境声或音效语义。不得声称保证逐样本复用原音、精确 PTS 或供应商一定服从。后续必须验收输出音轨、目标台词和人物发声关系。
+### 严格结构
 
-### 输出结构
+下列类型是输出契约：所有字段必填，禁止额外字段。成功计划固定写 `"version": 1`、`"phase": "multimodal_audio"`、`"eligible": true`。
 
-成功时输出严格 JSON；示例只说明字段，值必须来自输入：
+```text
+Int1 = 从 1 开始的整数
+NonEmpty = 冻结输入中的非空字符串
+SubjectId = 冻结输入中的非空稳定人物编号
+ErrorCode = 稳定非空错误码
 
-```json
-{
-  "version": 1,
-  "phase": "multimodal_audio",
-  "eligible": true,
-  "reason": null,
-  "visual_prompt": "逐字保留输入的视觉事实",
-  "subjects": [
-    {
-      "subject_id": "S1",
-      "picture_refs": [1],
-      "voice_ref": 1
-    }
-  ],
-  "audio_refs": [
-    {
-      "audio_index": 1,
-      "purpose": "voice",
-      "subject_id": "S1"
-    }
-  ],
-  "dialogue": [
-    {
-      "order": 1,
-      "subject_id": "S1",
-      "language": "Chinese",
-      "text": "输入提供的精确台词"
-    }
-  ],
-  "sound_design": {
-    "narration": [],
-    "ambience_refs": [],
-    "effects": []
-  }
+Plan = {
+  version: 1;
+  phase: "multimodal_audio";
+  eligible: true;
+  reason: null;
+  visual_prompt: NonEmpty;
+  subjects: Array<{ subject_id: SubjectId; picture_refs: NonEmptyArray<Int1>; voice_ref: Int1 }>;
+  audio_refs: Array<{ audio_index: Int1; purpose: "voice" | "ambience" | "effect"; subject_id: SubjectId | null }>;
+  dialogue: Array<{ order: Int1; subject_id: SubjectId; language: NonEmpty; text: NonEmpty }>;
+  sound_design: {
+    narration: Array<{ order: Int1; voice_ref: Int1; language: NonEmpty; text: NonEmpty }>;
+    ambience_refs: Array<{ order: Int1; audio_ref: Int1 }>;
+    effects: Array<{ order: Int1; audio_ref: Int1 | null; subject_id: SubjectId | null; text: NonEmpty }>;
+  };
 }
 ```
 
-失败时只输出：
+图片、音频沿用输入的 1-based 外部编号；`picture_refs` 是非空多值数组。所有 `order` 在 `dialogue` 和三个 `sound_design` 数组间构成唯一、连续的全局播放顺序。
 
-```json
+同一 `audio_index` 只能有一种 `purpose`：
+
+- `purpose=voice`：绑定人物时 `audio_refs.subject_id` 为该人物，供旁白时为 `null`；`subjects.voice_ref`、`narration.voice_ref` 只能引用此类音频。
+- `purpose=ambience`：`audio_refs.subject_id` 为 `null`；`ambience_refs` 只引用 `purpose=ambience`。
+- `purpose=effect`：`audio_refs.subject_id` 为 `null`；`effects.audio_ref` 只引用 `purpose=effect`。
+
+旁白用 voice_ref 明确发声者，不得出现 subject_id。`effects.audio_ref` 或 `effects.subject_id` 为 `null` 只表示输入明确“不绑定”，不表示未知。环境声、音效和声线不得互换或复用用途。
+
+失败结构固定为：
+
+```text
 {
-  "version": 1,
-  "phase": "multimodal_audio",
-  "eligible": false,
-  "reason": "稳定错误码",
-  "visual_prompt": "",
-  "subjects": [],
-  "audio_refs": [],
-  "dialogue": [],
+  "version": 1, "phase": "multimodal_audio", "eligible": false, "reason": ErrorCode,
+  "visual_prompt": "", "subjects": [], "audio_refs": [], "dialogue": [],
   "sound_design": {"narration": [], "ambience_refs": [], "effects": []}
 }
 ```
 
-### 自检
-
-- `visual_prompt` 与输入逐字一致。
-- `subject_id`、picture/audio 引用、台词顺序均唯一且完整。
-- 声线参考只绑定人物；旁白不绑定人物；环境声和音效不冒充声线。
-- 没有新增视觉动作、人物、台词、语言或声音事件。
-- JSON 以 UTF-8 写入唯一输出路径，未写其他文件。
+按上述结构写 UTF-8 严格 JSON。参考音频不是时间锁。参考音频不是最终音轨；只表达已声明的参考语义，不保证时间对齐、逐样本复用或供应商服从。生成后仍须验收输出音轨、精确台词和人物发声关系。
