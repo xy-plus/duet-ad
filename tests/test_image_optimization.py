@@ -6,6 +6,7 @@ import threading
 import time
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 
 import cv2
 import httpx
@@ -978,6 +979,127 @@ def _v3_frame_bound_plan() -> dict:
     }
 
 
+class _PlanAuditRunner:
+    def __init__(self, status: str) -> None:
+        self.status = status
+        self.calls = 0
+
+    def run_isolated(self, workdir, _prompt, *, session_dir) -> None:
+        self.calls += 1
+        root = Path(workdir)
+        receipt = json.loads((root / "work" / "audit_inputs.json").read_text(
+            encoding="utf-8"
+        ))
+        reason = None if self.status == "pass" else (
+            "plan_audit_unknown" if self.status == "unknown" else "plan_audit_failed"
+        )
+        (root / "work" / "plan_audit.json").write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "phase": "plan_audit",
+                    "plan_sha256": receipt["plan_sha256"],
+                    "continuity_sha256": receipt["continuity_sha256"],
+                    "audit_input_sha256": receipt["sha256"],
+                    "passed": self.status == "pass",
+                    "reason": reason,
+                    "frame_checks": [
+                        {
+                            "segment_index": item["segment_index"],
+                            "frame_index": item["frame_index"],
+                            "source_sha256": item["source_sha256"],
+                            **{
+                                key: {
+                                    "status": self.status,
+                                    "evidence": "current-frame audit evidence",
+                                }
+                                for key in (
+                                    "body_closure", "scene_closure",
+                                    "entity_closure", "relation_closure",
+                                )
+                            },
+                        }
+                        for item in receipt["frames"]
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+
+def _freeze_v3_image_optimization(settings, cid: str, plan: dict) -> None:
+    cdir = settings.data_dir / cid
+    frames = sorted((cdir / "work" / "keyframes").glob("*.png"))
+    inventory = [
+        {
+            "segment_index": 0,
+            "frame_index": index,
+            "frame_name": frame.name,
+            "source_sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
+        }
+        for index, frame in enumerate(frames, 1)
+    ]
+    execution = image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={"id": "dual-target", "revision": 3},
+        model=settings.seedream_model,
+        frame_inventory=inventory,
+    )
+    frozen = image_optimization.freeze_frame_prompts(
+        settings,
+        execution,
+        image_optimization.compile_frame_prompts(plan, settings.seedream_edit_mode),
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        keyframes=[frame.name for frame in frames],
+        **image_optimization.freeze_continuity(plan, frame_counts={0: len(frames)}),
+        **frozen,
+    )
+
+
+@pytest.mark.parametrize("status", ["fail", "unknown"])
+def test_v3_plan_audit_fail_closed_before_every_seedream_post(
+    tmp_path, monkeypatch, status,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid = _done(settings)
+    (settings.data_dir / cid / "work" / "keyframes" / "02.png").write_bytes(
+        _png(value=62)
+    )
+    _freeze_v3_image_optimization(settings, cid, _v3_frame_bound_plan())
+    calls = []
+
+    async def forbidden_seedream(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("Seedream must not be called after failed plan audit")
+
+    monkeypatch.setattr(postprocess.seedream, "edit", forbidden_seedream)
+    asyncio.run(postprocess.start(
+        settings,
+        cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+
+    runner = _PlanAuditRunner(status)
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1), audit_runner=runner,
+    ))
+
+    assert runner.calls == 1
+    assert calls == []
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert latest["postprocess"]["status"] == "failed"
+    assert latest["postprocess"]["error"] == "image_plan_audit_failed"
+
+
 def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
     tmp_path, monkeypatch,
 ):
@@ -1050,11 +1172,22 @@ def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
         }},
         {},
     ))
+    audit_meta = storage.load_meta(settings.data_dir, cid)
+    audit_plan, audit_inputs, audit_segments = postprocess._v3_plan_audit_inputs(
+        audit_meta,
+        postprocess._private_receipt(audit_meta),
+        postprocess._group_targets(cdir, audit_meta),
+    )
+    assert audit_inputs["plan_sha256"] == image_optimization.plan_sha256(audit_plan)
+    assert audit_segments == [{
+        "index": 0, "source_keyframes_dir": cdir / "work" / "keyframes",
+    }]
     asyncio.run(postprocess.run_task(
-        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1)
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
+        audit_runner=_PlanAuditRunner("pass"),
     ))
 
-    assert len(captured) == 2
+    assert len(captured) == 2, storage.load_meta(settings.data_dir, cid)["postprocess"]["error"]
     prompts = [body["prompt"] for body in captured]
     assert any("帧一身体可见部位数量保持" in prompt for prompt in prompts)
     assert any("帧二身体可见部位数量保持" in prompt for prompt in prompts)

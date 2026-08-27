@@ -28,7 +28,7 @@ _PUBLIC_ERROR_CODES = frozenset({
     "cancelled", "submission_unknown", "provider_rejected",
     "provider_protocol_error", "postprocess_artifacts_invalid",
     "postprocess_canonical_conflict", "image_optimization_prompt_invalid",
-    "postprocess_receipt_invalid", "segment_failed",
+    "postprocess_receipt_invalid", "image_plan_audit_failed", "segment_failed",
 })
 _FRAME_ERROR_RE = re.compile(r"^frame ([A-Za-z0-9_.-]{1,128}) failed(?:$|:)")
 _PUBLIC_FRAME_RE = re.compile(
@@ -307,6 +307,100 @@ def _group_targets(cdir: Path, meta: dict) -> dict[int, list[tuple[Path, Path]]]
             raise PostprocessError(409, "artifacts not ready")
         grouped[0] = [(path, cdir / "work" / "postprocessed" / path.name) for path in files]
     return grouped
+
+
+def _v3_plan_audit_inputs(
+    meta: dict, private: dict, grouped: dict[int, list[tuple[Path, Path]]],
+) -> tuple[dict, dict, list[dict]]:
+    """Bind an audit to the stored v3 plan receipt and current source frames."""
+    try:
+        frozen = image_optimization.dual_target_plan_receipt(meta)
+        if frozen is None or frozen.get("version") != 3:
+            raise ValueError
+        plan = {key: value for key, value in frozen.items() if key != "sha256"}
+        if image_optimization.plan_sha256(plan) != private.get("plan_sha256"):
+            raise ValueError
+        inventory = []
+        segments = []
+        for index in sorted(grouped):
+            targets = grouped[index]
+            if not targets or len({source.parent for source, _ in targets}) != 1:
+                raise ValueError
+            segments.append({
+                "index": index,
+                "source_keyframes_dir": targets[0][0].parent,
+            })
+            for frame_index, (source, _) in enumerate(targets, 1):
+                inventory.append({
+                    "segment_index": index,
+                    "frame_index": frame_index,
+                    "frame_name": source.name,
+                    "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                })
+        audit_inputs = image_optimization.freeze_plan_audit_inputs(
+            plan, frame_inventory=inventory
+        )
+        expected = sorted(
+            [{
+                "segment_index": item["segment_index"],
+                "frame_index": int(item["frame_name"][:2]),
+                "frame_name": item["frame_name"],
+                "source_sha256": item["source_sha256"],
+            } for item in private["frames"]],
+            key=lambda item: (item["segment_index"], item["frame_index"]),
+        )
+        if audit_inputs["frames"] != expected:
+            raise ValueError
+    except (
+        OSError,
+        ValueError,
+        image_optimization.ImageOptimizationIneligibleError,
+        image_optimization.ImageOptimizationOutputError,
+    ):
+        raise PostprocessError(409, "image_plan_audit_failed") from None
+    return plan, audit_inputs, segments
+
+
+async def _run_v3_plan_audit(
+    runner, cdir: Path, meta: dict, private: dict,
+    grouped: dict[int, list[tuple[Path, Path]]],
+) -> None:
+    if not callable(getattr(runner, "run_isolated", None)):
+        raise PostprocessError(409, "image_plan_audit_failed")
+    plan, audit_inputs, segments = _v3_plan_audit_inputs(meta, private, grouped)
+    try:
+        verdict = await asyncio.to_thread(
+            image_optimization.generate_plan_audit_verdict,
+            runner,
+            plan,
+            audit_inputs,
+            segments,
+            session_dir=cdir,
+        )
+    except Exception:
+        raise PostprocessError(409, "image_plan_audit_failed") from None
+    if verdict.get("passed") is not True:
+        raise PostprocessError(409, "image_plan_audit_failed")
+
+
+def _mark_plan_audit_failed(
+    settings: Settings, cid: str, indices: set[int],
+) -> None:
+    def mutate(_meta: dict, post: dict) -> None:
+        segments = [dict(item) for item in post.get("segments", [])]
+        for item in segments:
+            if item.get("index") in indices and item.get("status") != "done":
+                item.update(status="failed", error="image_plan_audit_failed")
+        post["segments"] = segments
+        post["status"] = "failed"
+        post["error"] = "image_plan_audit_failed"
+        post["frames"] = sorted(
+            _frame_ref(item["index"], path.name)
+            for item in segments if item.get("status") == "done"
+            for path in _canonical_files(settings.data_dir / cid, item["index"])
+        )
+
+    _mutate_postprocess(settings, cid, mutate)
 
 
 def _segment_state(index: int, total: int, revision: int = 1) -> dict:
@@ -651,7 +745,7 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
 
 async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore,
                    seedream_sem: asyncio.Semaphore | None = None,
-                   only_segments: set[int] | None = None) -> None:
+                   only_segments: set[int] | None = None, *, audit_runner=None) -> None:
     cdir = (settings.data_dir / cid).resolve()
     seedream_sem = seedream_sem or asyncio.Semaphore(settings.seedream_concurrency)
     meta = storage.load_meta(settings.data_dir, cid)
@@ -668,7 +762,8 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         )
         return
     options = private["options"]
-    grouped = _group_targets(cdir, meta)
+    audit_grouped = _group_targets(cdir, meta)
+    grouped = audit_grouped
     if only_segments is not None:
         grouped = {index: targets for index, targets in grouped.items() if index in only_segments}
     states = {
@@ -680,6 +775,14 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         index: targets for index, targets in grouped.items()
         if states.get(index) != "done"
     }
+    if options["optimize_image"] and private["version"] == 3 and grouped:
+        try:
+            await _run_v3_plan_audit(
+                audit_runner, cdir, meta, private, audit_grouped
+            )
+        except PostprocessError:
+            _mark_plan_audit_failed(settings, cid, set(grouped))
+            return
     try:
         await asyncio.gather(*(
             _run_segment(settings, cid, cdir, index, targets, options, private,
