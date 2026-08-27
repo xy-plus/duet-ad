@@ -43,11 +43,14 @@ def _audios(tmp_path: Path, purposes=("voice", "ambience")):
 
 def _plan(visual_prompt: str) -> dict:
     return {
-        "version": 1,
+        "version": 2,
         "phase": "multimodal_audio",
         "eligible": True,
         "reason": None,
         "visual_prompt": visual_prompt,
+        "dialogue_source_sha256": h3.canonical_json_sha256(
+            list(_dialogue("我会准时回来。"))
+        ),
         "subjects": [
             {"subject_id": "S1", "picture_refs": [1], "voice_ref": 1},
         ],
@@ -55,21 +58,47 @@ def _plan(visual_prompt: str) -> dict:
             {"audio_index": 1, "purpose": "voice", "subject_id": "S1"},
             {"audio_index": 2, "purpose": "ambience", "subject_id": None},
         ],
-        "dialogue": [
+        "speech_bindings": [
             {
-                "order": 1,
+                "line_index": 1,
+                "delivery": "on_screen",
                 "subject_id": "S1",
                 "language": "Chinese",
-                "text": "我会准时回来。",
+                "voice_ref": None,
             },
         ],
         "sound_design": {
-            "narration": [],
             "ambience_refs": [
                 {"audio_index": 2, "description": "远处雨声"},
             ],
             "effects": [],
         },
+    }
+
+
+def _dialogue(*texts: str) -> tuple[dict, ...]:
+    return tuple(
+        {
+            "text": text,
+            "start_s": float(index - 1) * 2,
+            "end_s": float(index) * 2,
+            "classification": "spoken",
+            "provenance": "asr",
+        }
+        for index, text in enumerate(texts, 1)
+    )
+
+
+def _dialogue_args(*texts: str) -> dict:
+    dialogue = _dialogue(*texts)
+    return {
+        "upstream_dialogue": dialogue,
+        "upstream_dialogue_receipt_sha256": h3.canonical_json_sha256(
+            list(dialogue)
+        ),
+        "upstream_dialogue_content_sha256": h3.canonical_json_sha256(
+            list(dialogue)
+        ),
     }
 
 
@@ -79,6 +108,7 @@ def _request(tmp_path: Path) -> h3.H3Request:
     return h3_multimodal.build_h3_request(
         skill_plan=plan,
         approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+        **_dialogue_args("我会准时回来。"),
         visual=visual,
         reference_audios=_audios(tmp_path),
         mode="multimodal",
@@ -121,6 +151,103 @@ def test_freeze_reference_audio_probes_exact_bytes_once(tmp_path):
     assert frozen[0].order == 1
 
 
+def test_dialogue_content_hash_mismatch_fails_before_attempt(tmp_path):
+    visual = _visual(tmp_path)
+    plan = _plan(visual.prompt)
+    dialogue_args = _dialogue_args("我会准时回来。")
+    dialogue_args["upstream_dialogue_content_sha256"] = "0" * 64
+
+    with pytest.raises(
+        h3_multimodal.MultimodalContractError,
+        match="upstream_dialogue_receipt_mismatch",
+    ):
+        h3_multimodal.build_h3_request(
+            skill_plan=plan,
+            approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+            **dialogue_args,
+            visual=visual,
+            reference_audios=_audios(tmp_path),
+            mode="multimodal",
+            cid="mismatch",
+            workdir=tmp_path / "mismatch",
+            client_request_id="mismatch",
+            duration=8,
+            resolution="768p",
+            aspect_ratio="9:16",
+            autodl_token="token",
+        )
+
+    assert not (tmp_path / "mismatch" / ".h3").exists()
+
+
+def test_on_screen_speaker_requires_subject_voice_reference(tmp_path):
+    visual = _visual(tmp_path)
+    plan = _plan(visual.prompt)
+    plan["subjects"][0]["voice_ref"] = None
+    plan["audio_refs"] = [
+        {"audio_index": 1, "purpose": "ambience", "subject_id": None},
+    ]
+
+    with pytest.raises(
+        h3_multimodal.MultimodalContractError,
+        match="dialogue_subject_invalid",
+    ):
+        h3_multimodal.build_h3_request(
+            skill_plan=plan,
+            approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+            **_dialogue_args("我会准时回来。"),
+            visual=visual,
+            reference_audios=_audios(tmp_path, purposes=("ambience",)),
+            mode="multimodal",
+            cid="missing-speaker-voice",
+            workdir=tmp_path / "missing-speaker-voice",
+            client_request_id="missing-speaker-voice",
+            duration=8,
+            resolution="768p",
+            aspect_ratio="9:16",
+            autodl_token="token",
+        )
+
+    assert not (tmp_path / "missing-speaker-voice" / ".h3").exists()
+
+
+@pytest.mark.parametrize("voice_ref", [2, 99])
+def test_speaker_voice_reference_must_resolve_to_frozen_voice_audio(
+    tmp_path, voice_ref,
+):
+    visual = _visual(tmp_path)
+    plan = _plan(visual.prompt)
+    plan["subjects"][0]["voice_ref"] = voice_ref
+    plan["audio_refs"] = [
+        {"audio_index": 1, "purpose": "ambience", "subject_id": None},
+    ]
+    plan["sound_design"]["ambience_refs"] = [
+        {"audio_index": 1, "description": "远处雨声"},
+    ]
+
+    with pytest.raises(
+        h3_multimodal.MultimodalContractError,
+        match="voice_reference_unbound",
+    ):
+        h3_multimodal.build_h3_request(
+            skill_plan=plan,
+            approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+            **_dialogue_args("我会准时回来。"),
+            visual=visual,
+            reference_audios=_audios(tmp_path, purposes=("ambience",)),
+            mode="multimodal",
+            cid=f"invalid-voice-{voice_ref}",
+            workdir=tmp_path / f"invalid-voice-{voice_ref}",
+            client_request_id=f"invalid-voice-{voice_ref}",
+            duration=8,
+            resolution="768p",
+            aspect_ratio="9:16",
+            autodl_token="token",
+        )
+
+    assert not (tmp_path / f"invalid-voice-{voice_ref}" / ".h3").exists()
+
+
 @pytest.mark.parametrize("count", [0, 4])
 def test_reference_audio_count_fails_before_attempt_claim(tmp_path, count):
     sources = []
@@ -157,23 +284,24 @@ def test_skill_consumer_compiles_exact_context_ir_and_rejects_old_blockers(tmp_p
 
     silent = copy.deepcopy(plan)
     silent["subjects"].append(
-        {"subject_id": "S2", "picture_refs": [2], "voice_ref": 1}
+        {"subject_id": "S2", "picture_refs": [2], "voice_ref": None}
     )
-    with pytest.raises(h3_multimodal.MultimodalContractError, match="silent_subject"):
-        h3_multimodal.build_h3_request(
-            skill_plan=silent,
-            approved_skill_plan_sha256=h3.canonical_json_sha256(silent),
-            visual=visual,
-            reference_audios=audios,
-            mode="multimodal",
-            cid="cid",
-            workdir=tmp_path / "silent",
-            client_request_id="silent",
-            duration=8,
-            resolution="768p",
-            aspect_ratio="9:16",
-            autodl_token="token",
-        )
+    silent_request = h3_multimodal.build_h3_request(
+        skill_plan=silent,
+        approved_skill_plan_sha256=h3.canonical_json_sha256(silent),
+        **_dialogue_args("我会准时回来。"),
+        visual=visual,
+        reference_audios=audios,
+        mode="multimodal",
+        cid="cid",
+        workdir=tmp_path / "silent",
+        client_request_id="silent",
+        duration=8,
+        resolution="768p",
+        aspect_ratio="9:16",
+        autodl_token="token",
+    )
+    assert "this visible subject remains silent" in silent_request.prompt
 
     reused = copy.deepcopy(plan)
     reused["subjects"].append(
@@ -184,14 +312,24 @@ def test_skill_consumer_compiles_exact_context_ir_and_rejects_old_blockers(tmp_p
         "purpose": "voice",
         "subject_id": "S2",
     }
-    reused["dialogue"].append(
-        {"order": 2, "subject_id": "S2", "language": "English", "text": "I am here."}
+    reused["speech_bindings"].append(
+        {
+            "line_index": 2,
+            "delivery": "on_screen",
+            "subject_id": "S2",
+            "language": "English",
+            "voice_ref": None,
+        }
+    )
+    reused["dialogue_source_sha256"] = h3.canonical_json_sha256(
+        list(_dialogue("我会准时回来。", "I am here."))
     )
     reused["sound_design"]["ambience_refs"] = []
     with pytest.raises(h3_multimodal.MultimodalContractError, match="picture_reused"):
         h3_multimodal.build_h3_request(
             skill_plan=reused,
             approved_skill_plan_sha256=h3.canonical_json_sha256(reused),
+            **_dialogue_args("我会准时回来。", "I am here."),
             visual=visual,
             reference_audios=_audios(tmp_path, purposes=("voice", "voice")),
             mode="multimodal",
@@ -215,26 +353,30 @@ def test_same_confirmed_voice_ref_can_continue_as_offscreen_narration(tmp_path):
     )
     audios = _audios(tmp_path, purposes=("voice",))
     plan = {
-        "version": 1,
+        "version": 2,
         "phase": "multimodal_audio",
         "eligible": True,
         "reason": None,
         "visual_prompt": visual.prompt,
+        "dialogue_source_sha256": h3.canonical_json_sha256(
+            list(_dialogue("我先在画内说话。", "随后仍用同一声线在画外说话。"))
+        ),
         "subjects": [{"subject_id": "S1", "picture_refs": [1, 2, 3], "voice_ref": 1}],
         "audio_refs": [{"audio_index": 1, "purpose": "voice", "subject_id": "S1"}],
-        "dialogue": [{
-            "order": 1,
+        "speech_bindings": [{
+            "line_index": 1,
+            "delivery": "on_screen",
             "subject_id": "S1",
             "language": "Chinese",
-            "text": "我先在画内说话。",
+            "voice_ref": None,
+        }, {
+            "line_index": 2,
+            "delivery": "off_screen_voiceover",
+            "subject_id": None,
+            "language": "Chinese",
+            "voice_ref": 1,
         }],
         "sound_design": {
-            "narration": [{
-                "order": 2,
-                "language": "Chinese",
-                "text": "随后仍用同一声线在画外说话。",
-                "voice_ref": 1,
-            }],
             "ambience_refs": [],
             "effects": [],
         },
@@ -243,6 +385,7 @@ def test_same_confirmed_voice_ref_can_continue_as_offscreen_narration(tmp_path):
     request = h3_multimodal.build_h3_request(
         skill_plan=plan,
         approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+        **_dialogue_args("我先在画内说话。", "随后仍用同一声线在画外说话。"),
         visual=visual,
         reference_audios=audios,
         mode="multimodal",
@@ -262,7 +405,10 @@ def test_same_confirmed_voice_ref_can_continue_as_offscreen_narration(tmp_path):
     assert "off-screen narrator using <Audio 1>" in request.prompt
 
 
-def test_real_submit_body_and_attempt_receipts_bind_all_multimodal_hashes(tmp_path):
+def test_real_submit_body_and_attempt_receipts_bind_all_multimodal_hashes(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
     request = _request(tmp_path)
     posts = []
     for path, _blob in request.keyframes:
@@ -303,6 +449,10 @@ def test_real_submit_body_and_attempt_receipts_bind_all_multimodal_hashes(tmp_pa
     multimodal = state["input"]["multimodal"]
     assert multimodal["audio_required"] is True
     assert multimodal["skill_plan_sha256"] == request.skill_plan_sha256
+    assert (
+        multimodal["upstream_dialogue_receipt_sha256"]
+        == request.upstream_dialogue_receipt_sha256
+    )
     assert [item["sha256"] for item in multimodal["reference_audios"]] == [
         item.sha256 for item in request.reference_audios
     ]
@@ -312,7 +462,10 @@ def test_real_submit_body_and_attempt_receipts_bind_all_multimodal_hashes(tmp_pa
     assert state["h3"]["receipt"]["input_receipt"] == state["input_receipt"]
 
 
-def test_duplicate_submit_and_submission_unknown_never_repeat_audio_post(tmp_path):
+def test_duplicate_submit_and_submission_unknown_never_repeat_audio_post(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
     request = _request(tmp_path)
     calls = 0
 
@@ -347,6 +500,7 @@ def test_duplicate_submit_and_submission_unknown_never_repeat_audio_post(tmp_pat
 def test_audio_required_missing_output_audio_is_deterministic_and_get_only(
     tmp_path, monkeypatch,
 ):
+    monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
     request = _request(tmp_path)
     calls = []
 

@@ -11,10 +11,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
-from app import h3
+from app import context_ir_bridge, h3
 
 
-COMPILER_VERSION = "duet.h3-context-ir.multimodal-audio.v1"
+COMPILER_VERSION = "duet.h3-context-ir.multimodal-audio.v2"
 MAX_PROMPT_CHARS = 7000
 _TOP_KEYS = {
     "version",
@@ -22,9 +22,10 @@ _TOP_KEYS = {
     "eligible",
     "reason",
     "visual_prompt",
+    "dialogue_source_sha256",
     "subjects",
     "audio_refs",
-    "dialogue",
+    "speech_bindings",
     "sound_design",
 }
 
@@ -112,14 +113,18 @@ class FrozenVisualInput:
 class _Subject:
     subject_id: str
     picture_refs: tuple[int, ...]
-    voice_ref: int
+    voice_ref: int | None
 
 
 @dataclass(frozen=True, slots=True)
 class _Speech:
     order: int
+    line_index: int
+    start_s: float
+    end_s: float
     language: str
     text: str
+    delivery: Literal["on_screen", "off_screen_voiceover"]
     subject_id: str | None
     voice_ref: int | None
 
@@ -136,14 +141,18 @@ def _consume_plan(
     *,
     visual: FrozenVisualInput,
     reference_audios: h3.FrozenReferenceAudios,
+    upstream_dialogue: Sequence[Mapping[str, Any]],
+    upstream_dialogue_receipt_sha256: str,
 ) -> tuple[tuple[_Subject, ...], tuple[_Speech, ...], tuple[_Sound, ...]]:
     plan = _object(skill_plan, _TOP_KEYS)
-    if plan["version"] != 1 or plan["phase"] != "multimodal_audio":
+    if plan["version"] != 2 or plan["phase"] != "multimodal_audio":
         _fail("skill_plan_shape_invalid")
     if plan["eligible"] is not True:
         _fail("skill_plan_ineligible")
     if plan["reason"] is not None or plan["visual_prompt"] != visual.prompt:
         _fail("skill_plan_visual_mismatch")
+    if plan["dialogue_source_sha256"] != upstream_dialogue_receipt_sha256:
+        _fail("upstream_dialogue_receipt_mismatch")
 
     subjects: list[_Subject] = []
     used_pictures: set[int] = set()
@@ -163,55 +172,81 @@ def _consume_plan(
             _Subject(
                 item["subject_id"],
                 pictures,
-                _positive_int(item["voice_ref"], "subject_voice_ref_invalid"),
+                (
+                    None
+                    if item["voice_ref"] is None
+                    else _positive_int(
+                        item["voice_ref"], "subject_voice_ref_invalid"
+                    )
+                ),
             )
         )
 
-    subject_ids = {subject.subject_id for subject in subjects}
+    subjects_by_id = {subject.subject_id: subject for subject in subjects}
+    subject_ids = set(subjects_by_id)
+    dialogue_source = list(upstream_dialogue)
     dialogue: list[_Speech] = []
-    for raw in _list(plan["dialogue"]):
-        item = _object(raw, {"order", "subject_id", "language", "text"})
+    for expected, raw in enumerate(_list(plan["speech_bindings"]), 1):
+        item = _object(
+            raw,
+            {
+                "line_index", "delivery", "subject_id", "language", "voice_ref",
+            },
+        )
+        line_index = _positive_int(
+            item["line_index"], "dialogue_line_index_invalid"
+        )
+        if line_index != expected:
+            _fail("dialogue_order_invalid")
+        try:
+            source = dialogue_source[line_index - 1]
+            text = source["text"]
+            start_s = float(source["start_s"])
+            end_s = float(source["end_s"])
+        except (IndexError, KeyError, TypeError, ValueError):
+            _fail("upstream_dialogue_invalid")
+        text = _text(text, "upstream_dialogue_invalid")
+        if not (0 <= start_s < end_s):
+            _fail("upstream_dialogue_invalid")
+        delivery = item["delivery"]
         subject_id = item["subject_id"]
-        if subject_id not in subject_ids:
-            _fail("dialogue_subject_invalid")
+        voice_ref = item["voice_ref"]
+        if delivery == "on_screen":
+            if (
+                subject_id not in subject_ids
+                or subjects_by_id[subject_id].voice_ref is None
+                or voice_ref is not None
+            ):
+                _fail("dialogue_subject_invalid")
+        elif delivery == "off_screen_voiceover":
+            if subject_id is not None:
+                _fail("dialogue_subject_invalid")
+            if voice_ref is not None:
+                voice_ref = _positive_int(
+                    voice_ref, "dialogue_voice_ref_invalid"
+                )
+        else:
+            _fail("dialogue_delivery_invalid")
         dialogue.append(
             _Speech(
-                _positive_int(item["order"], "dialogue_order_invalid"),
+                expected,
+                line_index,
+                start_s,
+                end_s,
                 _text(item["language"], "dialogue_language_invalid"),
-                _text(item["text"], "dialogue_text_invalid"),
+                text,
+                delivery,
                 subject_id,
-                None,
-            )
-        )
-    if [line.order for line in dialogue] != sorted(line.order for line in dialogue):
-        _fail("dialogue_order_invalid")
-    speaking_subjects = {line.subject_id for line in dialogue}
-    if any(subject.subject_id not in speaking_subjects for subject in subjects):
-        _fail("silent_subject")
-
-    sound_design = _object(
-        plan["sound_design"], {"narration", "ambience_refs", "effects"}
-    )
-    narration: list[_Speech] = []
-    for raw in _list(sound_design["narration"]):
-        item = _object(raw, {"order", "language", "text", "voice_ref"})
-        voice_ref = item["voice_ref"]
-        if voice_ref is not None:
-            voice_ref = _positive_int(voice_ref, "narration_voice_ref_invalid")
-        narration.append(
-            _Speech(
-                _positive_int(item["order"], "narration_order_invalid"),
-                _text(item["language"], "narration_language_invalid"),
-                _text(item["text"], "narration_text_invalid"),
-                None,
                 voice_ref,
             )
         )
-    if [line.order for line in narration] != sorted(line.order for line in narration):
-        _fail("narration_order_invalid")
-    speech = tuple(sorted(dialogue + narration, key=lambda line: line.order))
-    if [line.order for line in speech] != list(range(1, len(speech) + 1)):
-        _fail("speaking_order_invalid")
+    if len(dialogue) != len(dialogue_source):
+        _fail("upstream_dialogue_mismatch")
+
+    sound_design = _object(
+        plan["sound_design"], {"ambience_refs", "effects"}
+    )
+    speech = tuple(dialogue)
 
     sounds: list[_Sound] = []
     for field_name, purpose in (("ambience_refs", "ambience"), ("effects", "effect")):
@@ -228,10 +263,22 @@ def _consume_plan(
     audio_refs = _list(plan["audio_refs"])
     if len(audio_refs) != len(reference_audios):
         _fail("skill_audio_refs_mismatch")
-    subject_voice_refs = {subject.voice_ref: subject.subject_id for subject in subjects}
-    if len(subject_voice_refs) != len(subjects):
+    subject_voice_refs = {
+        subject.voice_ref: subject.subject_id
+        for subject in subjects
+        if subject.voice_ref is not None
+    }
+    if len(subject_voice_refs) != sum(
+        subject.voice_ref is not None for subject in subjects
+    ):
         _fail("voice_reference_reused")
-    narrator_voice_refs = {line.voice_ref for line in narration if line.voice_ref is not None}
+    narrator_voice_refs = {
+        line.voice_ref
+        for line in speech
+        if line.delivery == "off_screen_voiceover" and line.voice_ref is not None
+    }
+    claimed_voice_refs = set(subject_voice_refs).union(narrator_voice_refs)
+    actual_voice_refs: set[int] = set()
     sound_by_audio = {sound.audio_index: sound for sound in sounds}
     if len(sound_by_audio) != len(sounds):
         _fail("sound_reference_duplicate")
@@ -245,6 +292,7 @@ def _consume_plan(
         if audio.order != expected or audio.purpose != item["purpose"]:
             _fail("skill_audio_refs_mismatch")
         if item["purpose"] == "voice":
+            actual_voice_refs.add(expected)
             expected_subject = subject_voice_refs.get(expected)
             is_narrator = expected in narrator_voice_refs
             if expected_subject is None and not is_narrator:
@@ -255,6 +303,8 @@ def _consume_plan(
             sound = sound_by_audio.get(expected)
             if item["subject_id"] is not None or sound is None or sound.purpose != item["purpose"]:
                 _fail("sound_reference_unbound")
+    if claimed_voice_refs != actual_voice_refs:
+        _fail("voice_reference_unbound")
     if any(sound.audio_index > len(reference_audios) for sound in sounds):
         _fail("sound_reference_unbound")
     return tuple(subjects), speech, tuple(sounds)
@@ -273,9 +323,13 @@ def _compile_prompt(
     ]
     for subject in subjects:
         pictures = ", ".join(f"<Picture {value}>" for value in subject.picture_refs)
+        voice = (
+            f"; <Audio {subject.voice_ref}> is this subject's voice conditioning reference"
+            if subject.voice_ref is not None
+            else "; this visible subject remains silent"
+        )
         definitions.append(
-            f"<Subject {subject.subject_id[1:]}>({subject.subject_id}) appears only in {pictures}; "
-            f"<Audio {subject.voice_ref}> is this subject's voice conditioning reference."
+            f"<Subject {subject.subject_id[1:]}>({subject.subject_id}) appears only in {pictures}{voice}."
         )
     sound_by_audio = {sound.audio_index: sound for sound in sounds}
     narrator_refs = {line.voice_ref for line in speech if line.subject_id is None and line.voice_ref is not None}
@@ -290,16 +344,53 @@ def _compile_prompt(
                 f"<Audio {audio.order}> is the off-screen narrator's voice conditioning reference."
             )
     events: list[str] = []
+    subjects_by_id = {subject.subject_id: subject for subject in subjects}
     for line in speech:
-        if line.subject_id is not None:
+        if line.delivery == "on_screen":
             speaker = f"<Subject {line.subject_id[1:]}>({line.subject_id})"
+            marker_voice_ref = subjects_by_id[str(line.subject_id)].voice_ref
+            marker_delivery = "on_screen"
+            delivery = (
+                " The subject's visible lips articulate exactly this line in sync "
+                "with the jointly generated speech."
+            )
         elif line.voice_ref is None:
             speaker = "The off-screen narrator using the provider default voice"
+            marker_voice_ref = None
+            marker_delivery = "off_screen"
+            delivery = (
+                " This is an off-screen voiceover; every visible person's lips "
+                "remain completely closed during it."
+            )
         else:
             speaker = f"The off-screen narrator using <Audio {line.voice_ref}>"
+            marker_voice_ref = line.voice_ref
+            marker_delivery = "off_screen"
+            delivery = (
+                " This is an off-screen voiceover; every visible person's lips "
+                "remain completely closed during it."
+            )
+        events.extend((
+            context_ir_bridge.format_speech_marker(
+                order=line.order,
+                delivery=marker_delivery,
+                subject_id=line.subject_id,
+                voice_ref=marker_voice_ref,
+                language=line.language,
+                text=line.text,
+            ),
+            f"[{line.order}] [{line.start_s:.3f}-{line.end_s:.3f}s] "
+            f"{speaker}.{delivery}",
+        ))
+    if not events:
         events.append(
-            f"[{line.order}] {speaker} says exactly <d>[{line.language}]{line.text}</d>."
+            "No audible speech is specified; every visible person's lips remain "
+            "completely closed."
         )
+    soundscape = [
+        f"<Audio {sound.audio_index}> {sound.purpose}: {sound.description}."
+        for sound in sounds
+    ] or ["No ambience or effects are specified."]
     prompt = (
         "references:\n"
         + "\n".join(definitions)
@@ -307,10 +398,12 @@ def _compile_prompt(
         + visual.prompt
         + "\n\nspeaking_sequence:\n"
         + "\n".join(events)
+        + "\n\noverall_soundscape:\n"
+        + "\n".join(soundscape)
         + "\n\nconstraints:\nGenerate picture and native sound jointly. Preserve the exact "
         "1-based bindings and speaking order above. Audio inputs are conditioning references "
         "only, not target tracks or timing locks. Do not invent dialogue, speakers, subtitles, "
-        "music, or unlisted sounds."
+        "music, non-diegetic background music, or unlisted sounds."
     )
     if len(prompt) > MAX_PROMPT_CHARS:
         _fail("effective_prompt_too_large")
@@ -321,6 +414,9 @@ def build_h3_request(
     *,
     skill_plan: Mapping[str, Any],
     approved_skill_plan_sha256: str,
+    upstream_dialogue: Sequence[Mapping[str, Any]],
+    upstream_dialogue_receipt_sha256: str,
+    upstream_dialogue_content_sha256: str,
     visual: FrozenVisualInput,
     reference_audios: Sequence[h3.FrozenReferenceAudio],
     mode: Literal["multimodal", "multimodal_hd"],
@@ -341,8 +437,27 @@ def build_h3_request(
     if approved_skill_plan_sha256 != plan_sha256:
         _fail("skill_plan_approval_mismatch")
     audios = tuple(reference_audios)
+    dialogue = tuple(dict(line) for line in upstream_dialogue)
+    content_sha256 = h3.canonical_json_sha256(list(dialogue))
+    try:
+        valid_dialogue_receipt = (
+            isinstance(upstream_dialogue_receipt_sha256, str)
+            and len(upstream_dialogue_receipt_sha256) == 64
+            and int(upstream_dialogue_receipt_sha256, 16) >= 0
+            and upstream_dialogue_content_sha256 == content_sha256
+        )
+    except ValueError:
+        valid_dialogue_receipt = False
+    if not valid_dialogue_receipt:
+        _fail("upstream_dialogue_receipt_mismatch")
     subjects, speech, sounds = _consume_plan(
-        skill_plan, visual=visual, reference_audios=audios
+        skill_plan,
+        visual=visual,
+        reference_audios=audios,
+        upstream_dialogue=dialogue,
+        upstream_dialogue_receipt_sha256=(
+            upstream_dialogue_receipt_sha256
+        ),
     )
     prompt = _compile_prompt(visual, audios, subjects, speech, sounds)
     workflows = {
@@ -371,5 +486,6 @@ def build_h3_request(
         reference_audios=audios,
         skill_plan_sha256=plan_sha256,
         multimodal_compiler_version=COMPILER_VERSION,
+        upstream_dialogue_receipt_sha256=upstream_dialogue_receipt_sha256,
         audio_required=True,
     )

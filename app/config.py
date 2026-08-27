@@ -19,6 +19,7 @@ class Settings:
     max_upload_mb: int = 500
     enable_h3_submit: bool = False
     autodl_art_token: str = field(default="", repr=False)
+    minimax_api_key: str = field(default="", repr=False)
     h3_request_timeout_s: float = 30.0
     h3_poll_timeout_s: float = 1500.0
     h3_download_timeout_s: float = 180.0
@@ -104,6 +105,7 @@ def get_settings() -> Settings:
         max_upload_mb=int(os.environ.get("MAX_UPLOAD_MB", "500")),
         enable_h3_submit=os.environ.get("ENABLE_H3_SUBMIT", "").lower() in ("1", "true", "yes"),
         autodl_art_token=os.environ.get("AUTODL_ART_TOKEN", "").strip(),
+        minimax_api_key=os.environ.get("MINIMAX_API_KEY", "").strip(),
         h3_request_timeout_s=float(os.environ.get("H3_REQUEST_TIMEOUT_S", "30")),
         h3_poll_timeout_s=float(os.environ.get("H3_POLL_TIMEOUT_S", "1500")),
         h3_download_timeout_s=float(os.environ.get("H3_DOWNLOAD_TIMEOUT_S", "180")),

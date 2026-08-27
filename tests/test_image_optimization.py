@@ -932,6 +932,18 @@ def _v3_frame_bound_plan() -> dict:
                     "contact_points": "帧一接触点保持",
                     "occlusion_order": "帧一遮挡顺序保持",
                     "out_of_frame_crop": "帧一画外裁切保持",
+                    "non_person_entity_ledger": {
+                        "entities": [{
+                            "entity_id": "ENTITY_01",
+                            "description": "帧一可见非人物实体",
+                            "visibility": "full",
+                        }],
+                        "relations": [{
+                            "subject_id": "ENTITY_01",
+                            "predicate": "contacts",
+                            "object_id": "PERSON_01",
+                        }],
+                    },
                 },
                 {
                     "frame_index": 2,
@@ -940,6 +952,18 @@ def _v3_frame_bound_plan() -> dict:
                     "contact_points": "帧二接触点保持",
                     "occlusion_order": "帧二遮挡顺序保持",
                     "out_of_frame_crop": "帧二画外裁切保持",
+                    "non_person_entity_ledger": {
+                        "entities": [{
+                            "entity_id": "ENTITY_01",
+                            "description": "帧二可见非人物实体",
+                            "visibility": "edge_fragment",
+                        }],
+                        "relations": [{
+                            "subject_id": "ENTITY_01",
+                            "predicate": "contacts",
+                            "object_id": "PERSON_01",
+                        }],
+                    },
                 },
             ],
             "photometric_contract": {
@@ -981,6 +1005,11 @@ def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
         model=settings.seedream_model,
         frame_inventory=inventory,
     )
+    assert execution["frames"][0]["frame_constraint"][
+        "non_person_entity_ledger"
+    ] == plan["segments"][0]["frame_constraints"][0][
+        "non_person_entity_ledger"
+    ]
     frozen = image_optimization.freeze_frame_prompts(
         settings,
         execution,
@@ -1029,6 +1058,8 @@ def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
     prompts = [body["prompt"] for body in captured]
     assert any("帧一身体可见部位数量保持" in prompt for prompt in prompts)
     assert any("帧二身体可见部位数量保持" in prompt for prompt in prompts)
+    assert any("帧一可见非人物实体" in prompt for prompt in prompts)
+    assert any("帧二可见非人物实体" in prompt for prompt in prompts)
     assert all(len(body["image"]) == 1 for body in captured)
     latest = storage.load_meta(settings.data_dir, cid)
     assert latest["postprocess"]["status"] == "done"
@@ -1041,6 +1072,41 @@ def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
         (item["segment_index"], item["frame_name"], item["source_sha256"])
         for item in inventory
     }
+
+    tampered_continuity = deepcopy(latest)
+    tampered_continuity["_image_continuity"]["segments"][0][
+        "frame_constraints"
+    ][0]["non_person_entity_ledger"]["entities"][0][
+        "description"
+    ] = "被篡改的当前帧实体描述"
+    assert image_optimization.continuity_receipt(tampered_continuity) is None
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.dual_target_plan_receipt(tampered_continuity)
+
+    changed_plan = deepcopy(plan)
+    changed_plan["segments"][0]["frame_constraints"][0][
+        "non_person_entity_ledger"
+    ]["entities"][0]["description"] = "另一份合法当前帧实体描述"
+    mismatched_receipts = deepcopy(latest)
+    mismatched_receipts.update(
+        image_optimization.freeze_continuity(changed_plan, frame_counts={0: 2})
+    )
+    assert image_optimization.continuity_receipt(mismatched_receipts) is not None
+    assert image_optimization.receipt(mismatched_receipts, settings) is None
+
+    damaged_execution = deepcopy(execution)
+    damaged_execution["frames"][0]["frame_constraint"][
+        "non_person_entity_ledger"
+    ]["relations"][0]["object_id"] = "ENTITY_99"
+    with pytest.raises(ValueError):
+        image_optimization.freeze_frame_prompts(settings, damaged_execution, prompts)
+
+    malformed_observable_ids = deepcopy(execution)
+    malformed_observable_ids["frames"][0]["observable_person_ids"] = [[]]
+    with pytest.raises(ValueError, match="invalid image optimization frame prompts"):
+        image_optimization.freeze_frame_prompts(
+            settings, malformed_observable_ids, prompts
+        )
 
     for mutate in (
         lambda value: value["frames"].pop(),

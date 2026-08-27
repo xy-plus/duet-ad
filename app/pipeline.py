@@ -39,7 +39,7 @@ from pathlib import Path
 
 import cv2
 
-from app import asr, frame_fit, h3, image_optimization, long_generation, long_video, prepared_input, storage, vocal, voice
+from app import asr, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -1779,11 +1779,22 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             changes: dict = {"status": "done", "segments": seg_metas}
             if new_input_contract:
                 receipt_segments = []
+                multimodal_intent: list[bool] = []
+                multimodal_complete: list[bool] = []
                 for seg in seg_metas:
                     segdir = work / "segments" / str(seg["index"])
                     segwork = segdir / "work"
-                    receipt_segments.append(
-                        {
+                    manifest_path = segwork / h3_project.SOURCE_FILENAME
+                    multimodal_intent.append(any(
+                        (segwork / name).exists()
+                        for name in (
+                            h3_project.SKILL_INPUT_FILENAME,
+                            "h3_prompt_plan.json",
+                            h3_project.SOURCE_FILENAME,
+                        )
+                    ))
+                    multimodal_complete.append(manifest_path.is_file())
+                    receipt_segment = {
                             **seg,
                             "source_path": segdir / "source.mp4",
                             "keyframe_paths": [
@@ -1795,13 +1806,22 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                             "final_prompt_path": segwork / "prompt.txt",
                             "dialogue": seg["dialogue"],
                         }
-                    )
+                    if manifest_path.is_file():
+                        receipt_segment["multimodal_manifest_path"] = manifest_path
+                    receipt_segments.append(receipt_segment)
+                if any(multimodal_intent) and not all(multimodal_complete):
+                    raise PipelineError("long_video_multimodal_incomplete")
+                receipt_workflow = (
+                    h3.H3_MULTIMODAL_WORKFLOW
+                    if all(multimodal_complete)
+                    else H3_ENGINE_WORKFLOW
+                )
                 receipt_path = long_video.write_plan_receipt(
                     cdir,
                     source=source,
                     duration_s=duration_s,
                     segments=receipt_segments,
-                    workflow=H3_ENGINE_WORKFLOW,
+                    workflow=receipt_workflow,
                 )
                 changes["long_video_plan_receipt"] = receipt_path.name
                 try:

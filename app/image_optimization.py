@@ -37,6 +37,7 @@ _ELEMENT_ID_RE = re.compile(
 )
 _PERSON_ID_RE = re.compile(r"^PERSON_([0-9]{2})$")
 _SCENE_ID_RE = re.compile(r"^SCENE_([0-9]{2})$")
+_ENTITY_ID_RE = re.compile(r"^ENTITY_([0-9]{2})$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _INELIGIBLE_REASONS = {
     "no_observable_narrative_person",
@@ -638,14 +639,28 @@ def canonical_plan_v2(
     return deepcopy(_canonical_plan_v2(value, segment_indices, frame_counts))
 
 
-_FRAME_CONSTRAINT_KEYS = (
-    "frame_index",
+_FRAME_TEXT_CONSTRAINT_KEYS = (
     "visible_body_parts",
     "pose_skeleton",
     "contact_points",
     "occlusion_order",
     "out_of_frame_crop",
 )
+_FRAME_CONSTRAINT_KEYS = (
+    "frame_index",
+    *_FRAME_TEXT_CONSTRAINT_KEYS,
+    "non_person_entity_ledger",
+)
+_NON_PERSON_ENTITY_LEDGER_KEYS = {"entities", "relations"}
+_ENTITY_LEDGER_ENTITY_KEYS = {"entity_id", "description", "visibility"}
+_ENTITY_LEDGER_RELATION_KEYS = {"subject_id", "predicate", "object_id"}
+_ENTITY_VISIBILITIES = {"full", "partial", "edge_fragment"}
+_ENTITY_RELATION_PREDICATES = {
+    "supports", "contacts", "separate_from", "occludes",
+}
+_PHYSICAL_ENTITY_RELATION_PREDICATES = {
+    "supports", "contacts", "separate_from",
+}
 _PHOTOMETRIC_CONTRACT_KEYS = (
     "light_direction",
     "light_quality",
@@ -654,6 +669,175 @@ _PHOTOMETRIC_CONTRACT_KEYS = (
     "global_contrast",
     "tone_curve",
 )
+
+
+def _contains_directed_cycle(edges: list[tuple[str, str]]) -> bool:
+    graph: dict[str, set[str]] = {}
+    for source, target in edges:
+        graph.setdefault(source, set()).add(target)
+        graph.setdefault(target, set())
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> bool:
+        if node in visiting:
+            return True
+        if node in visited:
+            return False
+        visiting.add(node)
+        if any(visit(target) for target in graph[node]):
+            return True
+        visiting.remove(node)
+        visited.add(node)
+        return False
+
+    return any(visit(node) for node in graph)
+
+
+def _canonical_non_person_entity_ledger(
+    value: object, allowed_person_ids: set[str],
+) -> dict:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _NON_PERSON_ENTITY_LEDGER_KEYS
+        or any(
+            not isinstance(identifier, str)
+            or _PERSON_ID_RE.fullmatch(identifier) is None
+            for identifier in allowed_person_ids
+        )
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    raw_entities = value.get("entities")
+    raw_relations = value.get("relations")
+    if (
+        not isinstance(raw_entities, list)
+        or not raw_entities
+        or len(raw_entities) > 30
+        or not isinstance(raw_relations, list)
+        or not raw_relations
+        or len(raw_relations) > 60
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    entities = []
+    descriptions = set()
+    entity_ids = set()
+    for index, item in enumerate(raw_entities, 1):
+        if not isinstance(item, dict) or set(item) != _ENTITY_LEDGER_ENTITY_KEYS:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        entity_id = item.get("entity_id")
+        if entity_id != f"ENTITY_{index:02d}" or _ENTITY_ID_RE.fullmatch(entity_id) is None:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        description = _canonical_text(item.get("description"), max_bytes=512)
+        visibility = item.get("visibility")
+        if (
+            description in descriptions
+            or not isinstance(visibility, str)
+            or visibility not in _ENTITY_VISIBILITIES
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        descriptions.add(description)
+        entity_ids.add(entity_id)
+        entities.append({
+            "entity_id": entity_id,
+            "description": description,
+            "visibility": visibility,
+        })
+
+    identifiers = entity_ids | allowed_person_ids
+    relations = []
+    physical_pairs = set()
+    occlusion_pairs = set()
+    directed_edges = {"supports": [], "occludes": []}
+    for item in raw_relations:
+        if not isinstance(item, dict) or set(item) != _ENTITY_LEDGER_RELATION_KEYS:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        subject = item.get("subject_id")
+        predicate = item.get("predicate")
+        object_ = item.get("object_id")
+        if (
+            not isinstance(subject, str)
+            or not isinstance(object_, str)
+            or subject == object_
+            or subject not in identifiers
+            or object_ not in identifiers
+            or (subject not in entity_ids and object_ not in entity_ids)
+            or not isinstance(predicate, str)
+            or predicate not in _ENTITY_RELATION_PREDICATES
+            or (
+                predicate in {"contacts", "separate_from"}
+                and subject >= object_
+            )
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        pair = tuple(sorted((subject, object_)))
+        if predicate in _PHYSICAL_ENTITY_RELATION_PREDICATES:
+            if pair in physical_pairs:
+                raise ImageOptimizationOutputError(
+                    "image optimization output is missing or invalid"
+                )
+            physical_pairs.add(pair)
+        else:
+            if pair in occlusion_pairs:
+                raise ImageOptimizationOutputError(
+                    "image optimization output is missing or invalid"
+                )
+            occlusion_pairs.add(pair)
+        if predicate in directed_edges:
+            directed_edges[predicate].append((subject, object_))
+        relations.append({
+            "subject_id": subject,
+            "predicate": predicate,
+            "object_id": object_,
+        })
+    if relations != sorted(
+        relations,
+        key=lambda item: (item["subject_id"], item["predicate"], item["object_id"]),
+    ) or any(_contains_directed_cycle(edges) for edges in directed_edges.values()) or {
+        identifier
+        for relation in relations
+        for identifier in (relation["subject_id"], relation["object_id"])
+        if identifier in entity_ids
+    } != entity_ids:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return {"entities": entities, "relations": relations}
+
+
+def _canonical_frame_constraint(value: object, allowed_person_ids: set[str]) -> dict:
+    if not isinstance(value, dict) or set(value) != set(_FRAME_CONSTRAINT_KEYS):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    frame_index = value.get("frame_index")
+    if isinstance(frame_index, bool) or not isinstance(frame_index, int) or frame_index < 1:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return {
+        "frame_index": frame_index,
+        **{
+            key: _canonical_text(value.get(key))
+            for key in _FRAME_TEXT_CONSTRAINT_KEYS
+        },
+        "non_person_entity_ledger": _canonical_non_person_entity_ledger(
+            value.get("non_person_entity_ledger"), allowed_person_ids
+        ),
+    }
 
 
 def _canonical_plan_v3(
@@ -710,16 +894,16 @@ def _canonical_plan_v3(
         constraints = []
         seen = set()
         for item in raw_constraints:
-            if not isinstance(item, dict) or set(item) != set(_FRAME_CONSTRAINT_KEYS):
-                raise ImageOptimizationOutputError(
-                    "image optimization output is missing or invalid"
-                )
-            index = item.get("frame_index")
+            raw_index = item.get("frame_index") if isinstance(item, dict) else None
+            allowed_person_ids = {
+                person["id"]
+                for person in base["persons"]
+                if raw_index in person["observable_frames"]
+            }
+            constraint = _canonical_frame_constraint(item, allowed_person_ids)
+            index = constraint["frame_index"]
             if (
-                isinstance(index, bool)
-                or not isinstance(index, int)
-                or index < 1
-                or index in seen
+                index in seen
                 or (
                     frame_counts is not None
                     and index > frame_counts[base["segment_index"]]
@@ -729,13 +913,7 @@ def _canonical_plan_v3(
                     "image optimization output is missing or invalid"
                 )
             seen.add(index)
-            constraints.append({
-                "frame_index": index,
-                **{
-                    key: _canonical_text(item.get(key))
-                    for key in _FRAME_CONSTRAINT_KEYS[1:]
-                },
-            })
+            constraints.append(constraint)
         if [item["frame_index"] for item in constraints] != sorted(seen):
             raise ImageOptimizationOutputError(
                 "image optimization output is missing or invalid"
@@ -906,7 +1084,12 @@ def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str
         per_frame = {}
         for constraint in segment["frame_constraints"]:
             frame_clause = "；".join(
-                f"{key}={constraint[key]}" for key in _FRAME_CONSTRAINT_KEYS
+                f"{key}={constraint[key]}"
+                for key in ("frame_index", *_FRAME_TEXT_CONSTRAINT_KEYS)
+            )
+            frame_clause = (
+                f"{frame_clause}；non_person_entity_ledger="
+                f"{_plan_json(constraint['non_person_entity_ledger'])}"
             )
             per_frame[constraint["frame_index"]] = _canonical_prompt(
                 f"{segment_prompts[segment['segment_index']]}。仅当前源帧硬约束："
@@ -1146,10 +1329,29 @@ def freeze_frame_prompts(
             or frame.get("frame_name") != f"{number:02d}.png"
             or not isinstance(frame.get("source_sha256"), str)
             or _SHA256_RE.fullmatch(frame["source_sha256"]) is None
+            or not isinstance(frame.get("observable_person_ids"), list)
+            or any(
+                not isinstance(identifier, str)
+                or _PERSON_ID_RE.fullmatch(identifier) is None
+                for identifier in frame["observable_person_ids"]
+            )
+            or len(set(frame["observable_person_ids"])) != len(
+                frame["observable_person_ids"]
+            )
             or not isinstance(frame.get("frame_constraint"), dict)
-            or set(frame["frame_constraint"]) != set(_FRAME_CONSTRAINT_KEYS)
             or not isinstance(frame.get("photometric_contract"), dict)
             or set(frame["photometric_contract"]) != set(_PHOTOMETRIC_CONTRACT_KEYS)
+        ):
+            raise ValueError("invalid image optimization frame prompts")
+        try:
+            canonical_constraint = _canonical_frame_constraint(
+                frame["frame_constraint"], set(frame["observable_person_ids"])
+            )
+        except ImageOptimizationOutputError:
+            raise ValueError("invalid image optimization frame prompts") from None
+        if (
+            canonical_constraint != frame["frame_constraint"]
+            or canonical_constraint["frame_index"] != number
         ):
             raise ValueError("invalid image optimization frame prompts")
         expected[key] = frame
@@ -1976,7 +2178,8 @@ def _canonical_verification_v3(value: object, plan: dict) -> dict:
         for constraint, check in zip(expected["frame_constraints"], raw_checks):
             if not isinstance(check, dict) or set(check) != {
                 "frame_index", "visible_body_parts", "pose_skeleton", "contact_points",
-                "occlusion_order", "out_of_frame_crop", "photometric_contract",
+                "occlusion_order", "out_of_frame_crop", "non_person_entity_ledger",
+                "photometric_contract",
             } or check.get("frame_index") != constraint["frame_index"]:
                 raise ImageOptimizationOutputError(
                     "image verification output is missing or invalid"

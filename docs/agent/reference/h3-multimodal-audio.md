@@ -1,9 +1,11 @@
 # H3 原生多模态音频合同
 
 `app.h3_multimodal.build_h3_request` 严格消费 video-maker 的
-`h3_prompt_plan.json`：外部 Picture/Audio 编号保持 1-based，编译后的
-Context-IR 冻结精确台词、语言、人物、图片和声线关系。静默 subject、不同
-subject 复用 Picture、未绑定音频和不连续发声顺序均在任何 provider I/O 前失败。
+`h3_prompt_plan.json` v2：外部 Picture/Audio 编号保持 1-based。Skill 只写
+`dialogue_source_sha256` 和逐行 `speech_bindings`，不复制台词文本或时间窗；后端
+从已冻结的 `PreparedInput.dialogue` 或 `FrozenSegment.dialogue` 确定性投影精确
+文本、时间窗、语言、人物、画内/画外和声线关系。不同 subject 复用 Picture、
+发声人物无声线、未绑定音频、台词 SHA 或行号漂移均在任何 provider I/O 前失败。
 
 音频通过 `app.h3.freeze_reference_audios` 一次读取并用 ffprobe 探测。只接受
 1–3 段 MP3/WAV；每段 2–15 秒、总长不超过 15 秒。冻结 bytes、SHA-256、顺序、
