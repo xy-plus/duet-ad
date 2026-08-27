@@ -62,6 +62,7 @@ _SAFE_ERROR_CODES = frozenset(
         "context_ir_cancelled",
         "context_ir_unknown_status",
         "context_ir_result_invalid",
+        "context_ir_result_type_invalid",
         "context_ir_task_mismatch",
         "context_ir_semantic_mismatch",
         "context_ir_poll_timeout",
@@ -1419,12 +1420,16 @@ def _poll_once(
             error="context_ir_unknown_status",
         )
         return "stop"
-    if task.get("task_type") != "h3_context_ir" or task.get("modality") != "text":
+    modality = task.get("modality")
+    if (
+        task.get("task_type") != "h3_context_ir"
+        or (modality is not None and modality != "text")
+    ):
         _mark_terminal(
             path,
             state,
             status="failed",
-            error="context_ir_result_invalid",
+            error="context_ir_result_type_invalid",
         )
         return "stop"
     if status in {"queued", "running"}:
@@ -1519,6 +1524,19 @@ def optimize_h3_prompt(
     with _session_lease(request):
         state, path = _prepare(request)
         terminal = {"succeeded", "failed", "submission_unknown"}
+        if (
+            state["status"] == "failed"
+            and state.get("error") == "context_ir_result_invalid"
+            and isinstance(state.get("provider_task_id"), str)
+            and state.get("receipt") is None
+        ):
+            # V1 classified the provider's documented running response as
+            # invalid when its optional ``modality`` field was absent.  The
+            # paid task id is already frozen, so recovery may only poll that
+            # exact task; it must never rebuild uploads or issue another POST.
+            state["status"] = "polling"
+            state["error"] = None
+            _persist(path, state)
         if state["status"] in terminal:
             return _result(request, state, path)
         if state["status"] in {"uploading", "submitting"}:
