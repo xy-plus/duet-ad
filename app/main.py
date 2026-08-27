@@ -1056,7 +1056,7 @@ def _freeze_short_context_ir(
 
 def _short_context_ir_may_progress(
     generation: Mapping,
-    source_request: h3.H3Request,
+    context: context_ir_bridge.FrozenContextIrRequest,
     action: str,
 ) -> bool:
     binding = generation.get("context_ir")
@@ -1065,7 +1065,9 @@ def _short_context_ir_may_progress(
     if not isinstance(binding, Mapping):
         return False
     return h3_project.context_ir_progress_binding_matches(
-        source_request, binding
+        context.source_h3_request,
+        binding,
+        frozen_context=context,
     )
 
 
@@ -1262,7 +1264,7 @@ def _run_generation(
                 request = h3_project.apply_bound_context_ir(context, binding)
             else:
                 if not _short_context_ir_may_progress(
-                    generation, request, action
+                    generation, context, action
                 ):
                     raise h3_project.ProjectMultimodalError(
                         "context_ir_binding_invalid"
@@ -2759,7 +2761,81 @@ def create_app(settings: Settings) -> FastAPI:
                     detail = "already submitted" if previous_status == "succeeded" else "generation in progress"
                     raise HTTPException(status_code=409, detail=detail)
                 if previous_status in _GENERATION_RETRYABLE and previous_id == request_id:
-                    raise HTTPException(status_code=409, detail="new client_request_id required")
+                    if generation.get("error") != "context_ir_result_invalid":
+                        raise HTTPException(
+                            status_code=409,
+                            detail="new client_request_id required",
+                        )
+                    if not _short_generation_parameters_match(
+                        meta,
+                        dialogue_mode=payload["dialogue_mode"],
+                        dialogue=dialogue,
+                        fit_mode=fit_mode,
+                        aspect_ratio=aspect_ratio,
+                        resolution=resolution,
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="resume_parameters_changed",
+                        )
+                    previous_attempt = generation.get("attempt")
+                    if (
+                        isinstance(previous_attempt, bool)
+                        or not isinstance(previous_attempt, int)
+                        or previous_attempt <= 0
+                        or generation.get("stage") != "context_ir_native"
+                        or generation.get("audio_route") != h3_project.AUDIO_ROUTE
+                        or generation.get("h3_attempt_id") is not None
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="generation_state_invalid",
+                        )
+                    try:
+                        request = await asyncio.to_thread(
+                            _load_h3_request, settings, cid, meta
+                        )
+                        frozen, _request_id = _load_short_frozen_input(
+                            settings, cid, meta
+                        )
+                        context = _freeze_short_context_ir(
+                            settings, frozen, request
+                        )
+                    except (_SubmitError, h3.H3Error,
+                            h3_project.ProjectMultimodalError) as exc:
+                        _mark_submission_unknown(settings, cid, generation)
+                        raise HTTPException(
+                            status_code=409,
+                            detail="submission_outcome_unknown",
+                        ) from exc
+                    if (
+                        not h3.is_multimodal_request(request)
+                        or not _short_context_ir_may_progress(
+                            generation, context, "resume"
+                        )
+                    ):
+                        _mark_submission_unknown(settings, cid, generation)
+                        raise HTTPException(
+                            status_code=409,
+                            detail="submission_outcome_unknown",
+                        )
+                    storage.update_meta(
+                        settings.data_dir,
+                        cid,
+                        generation={
+                            **generation,
+                            "status": "queued",
+                            "error": None,
+                            "stage": "context_ir_native",
+                        },
+                    )
+                    background_tasks.add_task(
+                        _run_generation, settings, cid, request, "resume"
+                    )
+                    return {
+                        "status": "queued",
+                        "attempt": previous_attempt,
+                    }
                 legacy_pre_h3 = (
                     previous_status in _GENERATION_RETRYABLE
                     and _is_legacy_generation_contract(generation)
