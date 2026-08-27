@@ -27,7 +27,10 @@ producer_receipt.schema = duet.scene-mask.producer
 
 Every item binds its component, shot, frame SHA, request SHA, propagation-job
 SHA, backend/model/version/endpoint identity, project-relative PNG path, output
-SHA, byte size, and dimensions. The PNG must be a contained non-symlink regular
+SHA, byte size, and dimensions. The producer receipt itself repeats the exact
+`output={path,sha256,byte_size,width,height}` tuple, so it independently proves
+which validated bytes it produced instead of relying on the outer DTO. The PNG
+must be a contained non-symlink regular
 file with both background and foreground pixels. Producer receipts must declare
 `membership_engine=sam2`, hard-cut-only propagation, BiRefNet edge refinement
 only inside SAM2's uncertain edge band, and `fallback=none`. Consumers must not

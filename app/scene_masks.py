@@ -652,6 +652,13 @@ def _validate_masks(
             raise SceneMaskError("worker_output_invalid")
         producer = raw.get("producer_receipt")
         job = jobs.get((component_id, shot_id))
+        output_receipt = {
+            "path": path,
+            "sha256": sha256,
+            "byte_size": byte_size,
+            "width": width,
+            "height": height,
+        }
         if not _valid_producer_receipt(
             producer,
             plan,
@@ -660,6 +667,7 @@ def _validate_masks(
             shot_id,
             job,
             request_sha256,
+            output_receipt,
         ):
             raise SceneMaskError("worker_output_invalid")
         by_key[key] = SceneMaskItem(
@@ -688,6 +696,7 @@ def _valid_producer_receipt(
     shot_id: str,
     job: Mapping[str, Any] | None,
     request_sha256: str,
+    output: Mapping[str, Any],
 ) -> bool:
     expected_keys = {
         "schema",
@@ -710,6 +719,7 @@ def _valid_producer_receipt(
         "edge_refiner",
         "edge_refinement_scope",
         "fallback",
+        "output",
     }
     if not isinstance(producer, Mapping) or set(producer) != expected_keys or job is None:
         return False
@@ -734,6 +744,7 @@ def _valid_producer_receipt(
         "edge_refiner": "birefnet",
         "edge_refinement_scope": "sam2_uncertain_edges_only",
         "fallback": "none",
+        "output": dict(output),
     }
 
 
