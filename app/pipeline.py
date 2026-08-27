@@ -35,11 +35,13 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
 from pathlib import Path
 
 import cv2
+import numpy as np
 
-from app import asr, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, storage, vocal, voice
+from app import asr, dialogue_timing, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -75,6 +77,10 @@ VOICE_TIMELINE_WARNING = (
 H3_DEFAULT_RATIO = "9:16"
 H3_DEFAULT_FIT_MODE = "none"
 H3_ENGINE_WORKFLOW = "minimax_h3_lightx2v_v5_15s"
+SPEAKER_VISIBILITY_SAMPLE_FPS = 8
+SPEAKER_VISIBILITY_INPUT_FILENAME = "speaker_visibility_input.json"
+SPEAKER_VISIBILITY_OUTPUT_FILENAME = "speaker_visibility_output.json"
+SPEAKER_VISIBILITY_SKILL_FILENAME = "speaker_visibility_skill.md"
 
 
 def _remove_local_path(path: Path) -> None:
@@ -193,7 +199,7 @@ def _recover_prepared_input(cdir: Path, meta: dict) -> dict:
     }
 
 
-def _recover_long_plan(cdir: Path, meta: dict) -> dict:
+def _recover_long_plan(cdir: Path, meta: dict, settings: Settings) -> dict:
     receipt = cdir / long_video.PLAN_RECEIPT_FILENAME
     try:
         payload = json.loads(receipt.read_text(encoding="utf-8"))
@@ -253,7 +259,8 @@ def _recover_long_plan(cdir: Path, meta: dict) -> dict:
     }
     try:
         plan = long_generation.freeze_plan(
-            cdir, recovered_meta, digest, "none", meta.get("dialogue_mode", "auto")
+            cdir, recovered_meta, digest, "none", meta.get("dialogue_mode", "auto"),
+            settings=settings,
         )
         anchors = [
             anchor
@@ -304,7 +311,7 @@ def reconcile_stale_pipeline(settings: Settings, cid: str, owner: object) -> Non
         changes = (
             _recover_prepared_input(cdir, meta)
             if has_prepared
-            else _recover_long_plan(cdir, meta)
+            else _recover_long_plan(cdir, meta, settings)
         )
     except Exception:
         changes = {"status": "failed", "error": "input_recovery_required"}
@@ -1665,6 +1672,748 @@ def _write_prepared_receipt(
     return final_prompt
 
 
+def _atomic_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    try:
+        return (
+            json.dumps(
+                value, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            ) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise PipelineError("speaker visibility artifact is invalid") from None
+
+
+def _speaker_visibility_plan(work: Path) -> tuple[dict, list[str]]:
+    try:
+        manifest = json.loads(
+            (work / h3_project.SOURCE_FILENAME).read_text(encoding="utf-8")
+        )
+        binding = manifest["skill_plan"]
+        plan_path = (work / binding["path"]).resolve()
+        plan_path.relative_to(work.resolve())
+        plan_data = plan_path.read_bytes()
+        plan = json.loads(plan_data.decode("utf-8"))
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise PipelineError("speaker visibility plan is invalid") from None
+    if (
+        not isinstance(manifest, dict)
+        or not isinstance(binding, dict)
+        or set(binding) != {"path", "sha256"}
+        or hashlib.sha256(plan_data).hexdigest() != binding.get("sha256")
+        or not isinstance(plan, dict)
+        or not isinstance(plan.get("speech_bindings"), list)
+    ):
+        raise PipelineError("speaker visibility plan is invalid")
+    subjects = sorted({
+        item.get("subject_id")
+        for item in plan["speech_bindings"]
+        if isinstance(item, dict) and item.get("delivery") == "on_screen"
+    })
+    if any(not isinstance(value, str) or not value for value in subjects):
+        raise PipelineError("speaker visibility plan is invalid")
+    return manifest, subjects
+
+
+def _speaker_visibility_person_inventory(
+    meta: dict,
+    project_root: Path,
+    work: Path,
+    *,
+    segment_index: int = 0,
+) -> tuple[list[dict], dict[str, bytes]]:
+    try:
+        plan = image_optimization.dual_target_plan_receipt(meta)
+    except image_optimization.ImageOptimizationOutputError:
+        plan = None
+    people = plan.get("person_plans") if isinstance(plan, dict) else None
+    if not isinstance(people, list) or not people:
+        raise PipelineError("speaker visibility person inventory is missing")
+    inventory: list[dict] = []
+    identity_data: dict[str, bytes] = {}
+    for person in sorted(people, key=lambda item: str(item.get("id"))):
+        if not isinstance(person, dict) or not isinstance(person.get("reference"), dict):
+            raise PipelineError("speaker visibility person inventory is invalid")
+        person_id = person.get("id")
+        reference = person["reference"]
+        observable = person.get("observable_segments")
+        if isinstance(observable, list) and segment_index not in observable:
+            continue
+        reference_segment_index, frame_index = (
+            reference.get("segment_index"), reference.get("frame_index")
+        )
+        if (
+            not isinstance(person_id, str)
+            or not person_id.startswith("PERSON_")
+            or isinstance(reference_segment_index, bool)
+            or not isinstance(reference_segment_index, int)
+            or reference_segment_index < 0
+            or isinstance(frame_index, bool)
+            or not isinstance(frame_index, int)
+            or frame_index < 1
+        ):
+            raise PipelineError("speaker visibility person inventory is invalid")
+        reference_work = (
+            project_root / "work"
+            if reference_segment_index == 0
+            else project_root / "work" / "segments" / str(reference_segment_index) / "work"
+        )
+        path = reference_work / "keyframes" / f"{frame_index:02d}.png"
+        try:
+            data = path.read_bytes()
+            path.resolve().relative_to(project_root.resolve())
+        except (OSError, ValueError):
+            raise PipelineError("speaker visibility identity reference is missing") from None
+        relative = f"keyframes/speaker-visibility-identities/{person_id}.png"
+        _atomic_bytes(work / relative, data)
+        identity_data[relative] = data
+        inventory.append({
+            "person_id": person_id,
+            "identity_refs": [{
+                "path": relative,
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }],
+        })
+    if not inventory:
+        raise PipelineError("speaker visibility person inventory is missing")
+    return inventory, identity_data
+
+
+def _probe_speaker_visibility_timeline(source: Path, scenes_path: Path) -> dict:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=time_base,duration_ts",
+                "-show_entries", "frame=best_effort_timestamp",
+                "-of", "json", str(source),
+            ],
+            capture_output=True, text=True, timeout=120, check=True,
+        )
+        probe = json.loads(result.stdout)
+        stream = probe["streams"][0]
+        numerator_text, denominator_text = stream["time_base"].split("/", 1)
+        numerator, denominator = int(numerator_text), int(denominator_text)
+        duration_pts = int(stream["duration_ts"])
+        dense_pts = sorted({
+            int(frame["best_effort_timestamp"])
+            for frame in probe["frames"]
+            if frame.get("best_effort_timestamp") is not None
+        })
+        scenes_data = scenes_path.read_bytes()
+        scenes = json.loads(scenes_data.decode("utf-8"))["scenes"]
+    except (
+        OSError, subprocess.SubprocessError, UnicodeDecodeError,
+        json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError,
+    ):
+        raise PipelineError("speaker visibility decoded timeline is invalid") from None
+    if (
+        numerator < 1 or denominator < 1 or duration_pts < 1 or not dense_pts
+        or dense_pts[0] < 0 or dense_pts[-1] >= duration_pts
+        or not isinstance(scenes, list) or not scenes
+    ):
+        raise PipelineError("speaker visibility decoded timeline is invalid")
+    base = Fraction(numerator, denominator)
+    cut_pts: list[int] = []
+    for index, scene in enumerate(scenes):
+        if not isinstance(scene, dict):
+            raise PipelineError("speaker visibility cut inventory is invalid")
+        if index == 0:
+            continue
+        start = scene.get("start_s")
+        if isinstance(start, bool) or not isinstance(start, (int, float)):
+            raise PipelineError("speaker visibility cut inventory is invalid")
+        target = Fraction(str(start)) / base
+        nearest = min(dense_pts, key=lambda value: (abs(Fraction(value) - target), value))
+        if 0 < nearest < duration_pts and nearest not in cut_pts:
+            cut_pts.append(nearest)
+    return {
+        "time_base": {"numerator": numerator, "denominator": denominator},
+        "duration_pts": duration_pts,
+        "decoded_frame_pts": dense_pts,
+        "cut_pts": cut_pts,
+        "scenes_sha256": hashlib.sha256(scenes_data).hexdigest(),
+    }
+
+
+def _selected_speaker_visibility_frames(timeline: dict) -> list[tuple[int, int]]:
+    raw_base = timeline["time_base"]
+    base = Fraction(raw_base["numerator"], raw_base["denominator"])
+    duration_pts = timeline["duration_pts"]
+    dense_pts = timeline["decoded_frame_pts"]
+    selected: list[tuple[int, int]] = []
+    index = 0
+    while Fraction(index, SPEAKER_VISIBILITY_SAMPLE_FPS) < duration_pts * base:
+        target = Fraction(index, SPEAKER_VISIBILITY_SAMPLE_FPS) / base
+        dense_index, pts = min(
+            enumerate(dense_pts),
+            key=lambda item: (abs(Fraction(item[1]) - target), item[1]),
+        )
+        if not selected or pts != selected[-1][1]:
+            selected.append((dense_index, pts))
+        index += 1
+    if len(selected) < 4:
+        raise PipelineError("speaker visibility sample inventory is insufficient")
+    return selected
+
+
+def _extract_speaker_visibility_samples(
+    source: Path,
+    work: Path,
+    selected: list[tuple[int, int]],
+) -> tuple[list[dict], list[dict], dict[str, bytes]]:
+    frame_dir = work / "speaker-visibility-frames"
+    sheet_dir = work / "speaker-visibility-contact-sheets"
+    _remove_local_path(frame_dir)
+    _remove_local_path(sheet_dir)
+    frame_dir.mkdir(parents=True)
+    sheet_dir.mkdir(parents=True)
+    expression = "+".join(f"eq(n\\,{index})" for index, _pts in selected)
+    filters = (
+        f"select={expression},"
+        "scale=w='min(512,iw)':h='min(512,ih)':force_original_aspect_ratio=decrease"
+    )
+    _run_cmd(
+        [
+            "ffmpeg", "-v", "error", "-y", "-threads", "1", "-i", str(source),
+            "-vf", filters, "-fps_mode", "vfr", "-threads", "1",
+            str(frame_dir / "%06d.png"),
+        ],
+        timeout=120,
+        step="speaker visibility sample extraction",
+    )
+    paths = sorted(frame_dir.glob("*.png"))
+    if len(paths) != len(selected):
+        raise PipelineError("speaker visibility sample extraction mismatch")
+    media: dict[str, bytes] = {}
+    frames: list[dict] = []
+    for order, (path, (_dense_index, pts)) in enumerate(
+        zip(paths, selected, strict=True), 1
+    ):
+        data = path.read_bytes()
+        if cv2.imread(str(path)) is None:
+            raise PipelineError("speaker visibility sample is undecodable")
+        relative = path.relative_to(work).as_posix()
+        media[relative] = data
+        frames.append({
+            "order": order, "path": relative,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "pts": pts, "cut_before": False,
+        })
+    sheets: list[dict] = []
+    cv2.setNumThreads(1)
+    for sheet_order, offset in enumerate(range(0, len(paths), 16), 1):
+        batch = paths[offset:offset + 16]
+        tiles = []
+        for frame_order, path in enumerate(batch, offset + 1):
+            image = cv2.imread(str(path))
+            height, width = image.shape[:2]
+            scale = min(256 / width, 192 / height)
+            tile = cv2.resize(
+                image, (max(1, round(width * scale)), max(1, round(height * scale)))
+            )
+            canvas = np.zeros((224, 256, 3), dtype=np.uint8)
+            canvas[:tile.shape[0], :tile.shape[1]] = tile
+            cv2.putText(
+                canvas, str(frame_order), (8, 216), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (255, 255, 255), 1, cv2.LINE_AA,
+            )
+            tiles.append(canvas)
+        while len(tiles) < 16:
+            tiles.append(np.zeros((224, 256, 3), dtype=np.uint8))
+        rows = [cv2.hconcat(tiles[index:index + 4]) for index in range(0, 16, 4)]
+        sheet_path = sheet_dir / f"{sheet_order:06d}.png"
+        if not cv2.imwrite(str(sheet_path), cv2.vconcat(rows)):
+            raise PipelineError("speaker visibility contact sheet write failed")
+        data = sheet_path.read_bytes()
+        relative = sheet_path.relative_to(work).as_posix()
+        media[relative] = data
+        sheets.append({
+            "order": sheet_order, "path": relative,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "frame_orders": list(range(offset + 1, offset + len(batch) + 1)),
+        })
+    return frames, sheets, media
+
+
+def _speaker_timing_artifact(root: Path, relative: object) -> Path:
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise PipelineError("speaker visibility job is invalid")
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
+        raise PipelineError("speaker visibility job escapes project") from None
+    if not path.is_file():
+        raise PipelineError("speaker visibility job artifact is missing")
+    return path
+
+
+def _speaker_timing_binding(root: Path, path: Path) -> dict[str, str]:
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(root.resolve()).as_posix()
+        data = resolved.read_bytes()
+    except (OSError, ValueError):
+        raise PipelineError("speaker visibility job artifact is invalid") from None
+    return {"path": relative, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def _speaker_timing_job_scopes(root: Path, meta: dict) -> list[dict]:
+    raw_segments = meta.get("segments")
+    if isinstance(raw_segments, list) and raw_segments:
+        scopes = []
+        for expected_index, segment in enumerate(raw_segments, 1):
+            if not isinstance(segment, dict) or segment.get("index") != expected_index:
+                raise PipelineError("speaker visibility segment authority is invalid")
+            segdir = root / "work" / "segments" / str(expected_index)
+            scopes.append((f"segment:{expected_index}", expected_index, segdir, segdir / "work"))
+    else:
+        scopes = [("short", 0, root, root / "work")]
+    jobs: list[dict] = []
+    for scope, segment_index, scope_root, work in scopes:
+        manifest, subjects = _speaker_visibility_plan(work)
+        if not subjects or manifest.get("speaker_timing_producer") is not None:
+            continue
+        sources = sorted(path for path in scope_root.glob("source.*") if path.is_file())
+        if len(sources) != 1:
+            raise PipelineError("speaker visibility source is missing")
+        jobs.append({
+            "scope": scope,
+            "segment_index": segment_index,
+            "status": "queued",
+            "source": _speaker_timing_binding(root, sources[0]),
+            "manifest": _speaker_timing_binding(
+                root, work / h3_project.SOURCE_FILENAME
+            ),
+        })
+    return jobs
+
+
+def _speaker_timing_job_matches(root: Path, job: object) -> bool:
+    if not isinstance(job, dict):
+        return False
+    try:
+        for name in ("source", "manifest"):
+            binding = job[name]
+            if not isinstance(binding, dict) or set(binding) != {"path", "sha256"}:
+                return False
+            path = _speaker_timing_artifact(root, binding["path"])
+            if hashlib.sha256(path.read_bytes()).hexdigest() != binding["sha256"]:
+                return False
+        if job.get("status") == "running":
+            for name in ("producer_input", "skill"):
+                binding = job.get(name)
+                if not isinstance(binding, dict) or set(binding) != {"path", "sha256"}:
+                    return False
+                path = _speaker_timing_artifact(root, binding["path"])
+                if hashlib.sha256(path.read_bytes()).hexdigest() != binding["sha256"]:
+                    return False
+            authority = {
+                key: job[key]
+                for key in (
+                    "scope", "segment_index", "source", "manifest",
+                    "producer_input", "skill",
+                )
+            }
+            if job.get("job_receipt_sha256") != dialogue_timing.canonical_sha256(
+                authority
+            ):
+                return False
+        return True
+    except (KeyError, OSError, PipelineError):
+        return False
+
+
+def queue_speaker_timing(settings: Settings, cid: str) -> str:
+    """Freeze every missing on-screen short/long scope before background work."""
+    root = (settings.data_dir / cid).resolve()
+    meta = storage.load_meta(settings.data_dir, cid)
+    if meta is None:
+        return "missing"
+    try:
+        jobs = _speaker_timing_job_scopes(root, meta)
+    except PipelineError as exc:
+        storage.update_meta(
+            settings.data_dir, cid,
+            _speaker_timing_producer={"status": "failed", "error": str(exc), "jobs": []},
+        )
+        return "failed"
+    if not jobs:
+        return "skipped"
+    current = meta.get("_speaker_timing_producer")
+    if isinstance(current, dict) and current.get("status") in {
+        "queued", "running", "submission_unknown",
+    }:
+        return str(current["status"])
+    storage.update_meta(
+        settings.data_dir, cid,
+        _speaker_timing_producer={"status": "queued", "error": None, "jobs": jobs},
+    )
+    return "queued"
+
+
+def recover_speaker_timing_jobs(settings: Settings) -> list[str]:
+    """Return safe exact jobs; a crashed ambiguous Skill run is never rerun."""
+    recoverable: list[str] = []
+    for meta in storage.list_conversations(settings.data_dir):
+        cid = meta.get("id")
+        state = meta.get("_speaker_timing_producer")
+        if not isinstance(cid, str) or not isinstance(state, dict):
+            continue
+        jobs = state.get("jobs")
+        if not isinstance(jobs, list) or not jobs:
+            continue
+        root = (settings.data_dir / cid).resolve()
+        if not all(
+            isinstance(job, dict)
+            and _speaker_timing_job_matches(root, job)
+            for job in jobs
+            if not isinstance(job, dict) or job.get("status") != "done"
+        ):
+            storage.update_meta(
+                settings.data_dir, cid,
+                _speaker_timing_producer={**state, "status": "failed", "error": "speaker visibility job drifted"},
+            )
+            continue
+        running = [job for job in jobs if job.get("status") == "running"]
+        if running:
+            can_adopt = True
+            for job in running:
+                output = job.get("raw_output")
+                if output is None:
+                    try:
+                        manifest_path = _speaker_timing_artifact(
+                            root, job["manifest"]["path"]
+                        )
+                        output_path = manifest_path.parent / SPEAKER_VISIBILITY_OUTPUT_FILENAME
+                        output_data = output_path.read_bytes()
+                        output_value = json.loads(output_data.decode("utf-8"))
+                        if output_value.get("input_sha256") != job["producer_input"]["sha256"]:
+                            raise PipelineError("speaker visibility recovered output mismatch")
+                        output = _speaker_timing_binding(root, output_path)
+                        job["raw_output"] = output
+                    except (
+                        OSError, KeyError, TypeError, UnicodeDecodeError,
+                        json.JSONDecodeError, PipelineError,
+                    ):
+                        output = None
+                if not isinstance(output, dict) or set(output) != {"path", "sha256"}:
+                    can_adopt = False
+                    break
+                try:
+                    path = _speaker_timing_artifact(root, output["path"])
+                    can_adopt = hashlib.sha256(path.read_bytes()).hexdigest() == output["sha256"]
+                except (OSError, PipelineError):
+                    can_adopt = False
+                if not can_adopt:
+                    break
+            if can_adopt:
+                storage.update_meta(
+                    settings.data_dir, cid,
+                    _speaker_timing_producer={**state, "jobs": jobs},
+                )
+                recoverable.append(cid)
+            else:
+                locked = [
+                    {**job, "status": "submission_unknown"}
+                    if job.get("status") == "running" else job
+                    for job in jobs
+                ]
+                storage.update_meta(
+                    settings.data_dir, cid,
+                    _speaker_timing_producer={
+                        **state, "status": "submission_unknown",
+                        "error": "speaker visibility submission outcome unknown",
+                        "jobs": locked,
+                    },
+                )
+        elif state.get("status") in {"queued", "running"}:
+            recoverable.append(cid)
+    return recoverable
+
+
+def _speaker_timing_scope_paths(root: Path, job: dict) -> tuple[Path, Path, Path]:
+    source = _speaker_timing_artifact(root, job["source"]["path"])
+    manifest_path = _speaker_timing_artifact(root, job["manifest"]["path"])
+    return source.parent, manifest_path.parent, source
+
+
+def _speaker_timing_scenes(root: Path, meta: dict, job: dict, work: Path) -> Path:
+    if job["segment_index"] == 0:
+        return work / "scenes.json"
+    source_path = root / "work" / "scenes.json"
+    try:
+        source_data = source_path.read_bytes()
+        source_value = json.loads(source_data.decode("utf-8"))
+        scenes = source_value["scenes"]
+        segment = meta["segments"][job["segment_index"] - 1]
+        start_s, end_s = float(segment["start_s"]), float(segment["end_s"])
+        local = [{"index": 1, "start_s": 0.0, "end_s": end_s - start_s}]
+        for scene in scenes:
+            cut = float(scene["start_s"])
+            if start_s < cut < end_s:
+                local.append({
+                    "index": len(local) + 1,
+                    "start_s": cut - start_s,
+                    "end_s": end_s - start_s,
+                })
+    except (OSError, KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise PipelineError("speaker visibility segment cut authority is invalid") from None
+    path = work / "scenes.json"
+    _atomic_bytes(path, _canonical_json_bytes({
+        "source_sha256": hashlib.sha256(source_data).hexdigest(),
+        "scenes": local,
+    }))
+    return path
+
+
+def produce_speaker_timing(
+    settings: Settings,
+    cid: str,
+    runner,
+    *,
+    timeline_probe=_probe_speaker_visibility_timeline,
+    sample_extractor=_extract_speaker_visibility_samples,
+) -> str:
+    """Produce sampled on-screen evidence in background; never submits H3."""
+    root = (settings.data_dir / cid).resolve()
+    try:
+        meta = storage.load_meta(settings.data_dir, cid)
+        if meta is None:
+            return "missing"
+        state = meta.get("_speaker_timing_producer")
+        if not isinstance(state, dict) or not isinstance(state.get("jobs"), list):
+            queued = queue_speaker_timing(settings, cid)
+            if queued in {"missing", "failed", "skipped"}:
+                return queued
+            meta = storage.load_meta(settings.data_dir, cid)
+            state = meta.get("_speaker_timing_producer") if meta else None
+        if not isinstance(state, dict) or not isinstance(state.get("jobs"), list):
+            raise PipelineError("speaker visibility job state is invalid")
+        jobs = [dict(job) for job in state["jobs"]]
+
+        def persist(status: str, error: str | None = None) -> None:
+            storage.update_meta(
+                settings.data_dir, cid,
+                _speaker_timing_producer={
+                    "status": status, "error": error, "jobs": jobs,
+                },
+            )
+
+        persist("running")
+        for index, job in enumerate(jobs):
+            if job.get("status") == "done":
+                continue
+            if job.get("status") == "submission_unknown":
+                persist("submission_unknown", "speaker visibility submission outcome unknown")
+                return "submission_unknown"
+            if not _speaker_timing_job_matches(root, job):
+                raise PipelineError("speaker visibility job drifted")
+            scope_root, work, source = _speaker_timing_scope_paths(root, job)
+            manifest, subjects = _speaker_visibility_plan(work)
+            if not subjects:
+                raise PipelineError("speaker visibility job lost on-screen subjects")
+            input_path = work / SPEAKER_VISIBILITY_INPUT_FILENAME
+            output_path = work / SPEAKER_VISIBILITY_OUTPUT_FILENAME
+            skill_path = work / SPEAKER_VISIBILITY_SKILL_FILENAME
+            adopting = job.get("status") == "running"
+            if adopting:
+                input_binding = job.get("producer_input")
+                skill_binding = job.get("skill")
+                if not isinstance(input_binding, dict) or not isinstance(skill_binding, dict):
+                    raise PipelineError("speaker visibility running job is invalid")
+                input_path = _speaker_timing_artifact(root, input_binding.get("path"))
+                skill_path = _speaker_timing_artifact(root, skill_binding.get("path"))
+                input_data = input_path.read_bytes()
+                skill_data = skill_path.read_bytes()
+                if (
+                    hashlib.sha256(input_data).hexdigest() != input_binding.get("sha256")
+                    or hashlib.sha256(skill_data).hexdigest() != skill_binding.get("sha256")
+                ):
+                    raise PipelineError("speaker visibility running job drifted")
+                output_data = output_path.read_bytes()
+                producer_input = json.loads(input_data.decode("utf-8"))
+            else:
+                job["status"] = "preparing"
+                persist("running")
+                scenes_path = _speaker_timing_scenes(root, meta, job, work)
+                timeline = timeline_probe(source, scenes_path)
+                selected = _selected_speaker_visibility_frames(timeline)
+                frames, sheets, media = sample_extractor(source, work, selected)
+                scenes_data = scenes_path.read_bytes()
+                if hashlib.sha256(scenes_data).hexdigest() != timeline["scenes_sha256"]:
+                    raise PipelineError("speaker visibility cut inventory drifted")
+                media["scenes.json"] = scenes_data
+                cuts = set(timeline["cut_pts"])
+                previous_pts = -1
+                for frame in frames:
+                    frame["cut_before"] = any(
+                        previous_pts < cut <= frame["pts"] for cut in cuts
+                    )
+                    previous_pts = frame["pts"]
+                persons, identity_data = _speaker_visibility_person_inventory(
+                    meta, root, work, segment_index=int(job["segment_index"])
+                )
+                media.update(identity_data)
+                base = timeline["time_base"]
+                nominal_gap = math.ceil(
+                    Fraction(1, SPEAKER_VISIBILITY_SAMPLE_FPS)
+                    / Fraction(base["numerator"], base["denominator"])
+                )
+                producer_input = {
+                    "schema": dialogue_timing.SPEAKER_VISIBILITY_INPUT_SCHEMA,
+                    "version": 1,
+                    "phase": "speaker_visibility",
+                    "source": {
+                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                        "duration_pts": timeline["duration_pts"],
+                        "time_base": base,
+                    },
+                    "sampling": {
+                        "algorithm": dialogue_timing.SPEAKER_VISIBILITY_ALGORITHM,
+                        "cadence_fps": SPEAKER_VISIBILITY_SAMPLE_FPS,
+                        "max_unobserved_gap_pts": nominal_gap,
+                        "endpoint_shrink_intervals": 1,
+                    },
+                    "decoded_frame_pts": timeline["decoded_frame_pts"],
+                    "cut_pts": timeline["cut_pts"],
+                    "cut_source": {
+                        "path": "scenes.json",
+                        "sha256": timeline["scenes_sha256"],
+                    },
+                    "frames": frames,
+                    "contact_sheets": sheets,
+                    "persons": persons,
+                    "on_screen_subjects": subjects,
+                }
+                input_data = _canonical_json_bytes(producer_input)
+                skill_data = SKILL_MD.read_bytes()
+                _atomic_bytes(input_path, input_data)
+                _atomic_bytes(skill_path, skill_data)
+                output_path.unlink(missing_ok=True)
+                job.update(
+                    status="running",
+                    producer_input=_speaker_timing_binding(root, input_path),
+                    skill=_speaker_timing_binding(root, skill_path),
+                )
+                authority = {
+                    key: job[key]
+                    for key in ("scope", "segment_index", "source", "manifest", "producer_input", "skill")
+                }
+                job["job_receipt_sha256"] = dialogue_timing.canonical_sha256(authority)
+                persist("running")
+                try:
+                    runner.run(
+                        scope_root,
+                        "按 work/speaker_visibility_skill.md 执行 speaker_visibility 严格阶段；"
+                        "输入仅为 work/speaker_visibility_input.json 及其绑定的采样帧、联系表、"
+                        "身份参考；输出 work/speaker_visibility_output.json。"
+                        "不得读取台词或任何台词时间窗。",
+                    )
+                except Exception:
+                    if not output_path.is_file():
+                        job["status"] = "submission_unknown"
+                        persist("submission_unknown", "speaker visibility submission outcome unknown")
+                        return "submission_unknown"
+                try:
+                    output_data = output_path.read_bytes()
+                except OSError:
+                    job["status"] = "submission_unknown"
+                    persist("submission_unknown", "speaker visibility submission outcome unknown")
+                    return "submission_unknown"
+                job["raw_output"] = _speaker_timing_binding(root, output_path)
+                persist("running")
+
+            media = {}
+            for group in ("frames", "contact_sheets"):
+                for artifact in producer_input.get(group, []):
+                    path = _speaker_timing_artifact(work, artifact.get("path"))
+                    media[artifact["path"]] = path.read_bytes()
+            cut = producer_input.get("cut_source")
+            if isinstance(cut, dict):
+                path = _speaker_timing_artifact(work, cut.get("path"))
+                media[cut["path"]] = path.read_bytes()
+            for person in producer_input.get("persons", []):
+                for artifact in person.get("identity_refs", []):
+                    path = _speaker_timing_artifact(work, artifact.get("path"))
+                    media[artifact["path"]] = path.read_bytes()
+            production = dialogue_timing.freeze_speaker_visibility(
+                producer_input_data=input_data,
+                skill_output_data=output_data,
+                source_data=source.read_bytes(),
+                frame_data=media,
+                skill_data=skill_data,
+            )
+            timing_path = work / h3_project.SPEAKER_TIMING_FILENAME
+            receipt_path = work / h3_project.SPEAKER_TIMING_PRODUCTION_FILENAME
+            timing_data = _canonical_json_bytes(production.speaker_timing)
+            receipt_data = _canonical_json_bytes(production.receipt)
+            _atomic_bytes(timing_path, timing_data)
+            _atomic_bytes(receipt_path, receipt_data)
+            timing_binding = {
+                "path": timing_path.name,
+                "sha256": hashlib.sha256(timing_data).hexdigest(),
+            }
+            input_manifest_path = work / h3_project.SKILL_INPUT_FILENAME
+            input_manifest = json.loads(input_manifest_path.read_text(encoding="utf-8"))
+            input_manifest["version"] = h3_project.SKILL_INPUT_VERSION
+            input_manifest["speaker_timing"] = timing_binding
+            input_manifest_data = _canonical_json_bytes(input_manifest)
+            _atomic_bytes(input_manifest_path, input_manifest_data)
+            manifest["version"] = h3_project.SOURCE_VERSION
+            manifest["speaker_timing"] = timing_binding
+            manifest["speaker_timing_producer"] = {
+                "path": receipt_path.name,
+                "sha256": hashlib.sha256(receipt_data).hexdigest(),
+            }
+            manifest["multimodal_input"] = {
+                "path": input_manifest_path.name,
+                "sha256": hashlib.sha256(input_manifest_data).hexdigest(),
+            }
+            _atomic_bytes(
+                work / h3_project.SOURCE_FILENAME, _canonical_json_bytes(manifest)
+            )
+            h3_project.freeze_optional(root, work)
+            job.update(
+                status="done",
+                production=_speaker_timing_binding(root, receipt_path),
+            )
+            jobs[index] = job
+            persist("running")
+        persist("done")
+        return "done"
+    except Exception as exc:
+        current = storage.load_meta(settings.data_dir, cid)
+        current_state = current.get("_speaker_timing_producer") if current else None
+        storage.update_meta(
+            settings.data_dir, cid,
+            _speaker_timing_producer={
+                **(current_state if isinstance(current_state, dict) else {}),
+                "status": "failed", "error": str(exc),
+            },
+        )
+        return "failed"
+
+
 def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -> None:
     """后台任务入口；任何步骤失败 → status=failed + error，不抛异常。"""
     # data_dir 可能是相对路径（生产默认 "data"）：子进程带 cwd 时相对路径会错位，统一起点解析为绝对
@@ -1944,7 +2693,8 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 try:
                     digest = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
                     plan = long_generation.freeze_plan(
-                        cdir, {**meta, **changes}, digest, "none", dialogue_mode
+                        cdir, {**meta, **changes}, digest, "none", dialogue_mode,
+                        settings=settings,
                     )
                     anchors = [
                         anchor

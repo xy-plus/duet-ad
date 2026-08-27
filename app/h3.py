@@ -34,7 +34,7 @@ import httpx
 
 from app.retry import RetryPolicy, run_with_retry
 from app.sanitize import sanitize
-from app import storage, voice
+from app import dialogue_timing, storage, voice
 
 
 SCHEMA_VERSION = 1
@@ -239,10 +239,22 @@ class H3Request:
     skill_plan_sha256: str | None = None
     multimodal_compiler_version: str | None = None
     upstream_dialogue_receipt_sha256: str | None = None
+    speaker_timing_sha256: str | None = None
+    speaker_timing_authority_version: int | None = None
+    speaker_timing_production_required: bool = False
+    speaker_timing_legacy_source_version: int | None = None
+    speaker_timing_legacy_receipt_path: str | None = None
+    speaker_timing_legacy_receipt_sha256: str | None = None
+    speaker_timing_production_path: str | None = None
+    speaker_timing_production_sha256: str | None = None
+    speaker_timing_authority_artifacts: tuple[tuple[str, str], ...] = ()
+    on_screen_dialogue: tuple[Mapping[str, Any], ...] = ()
+    on_screen_dialogue_sha256: str | None = None
     audio_required: bool = False
     context_ir_receipt_path: Path | None = None
     context_ir_receipt_sha256: str | None = None
     gateway_storage_root: Path | None = None
+    speaker_timing_authority_root: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workdir", Path(self.workdir))
@@ -251,6 +263,13 @@ class H3Request:
             if not storage_root.is_absolute():
                 raise H3Error("invalid_gateway_storage_root")
             object.__setattr__(self, "gateway_storage_root", storage_root)
+        if self.speaker_timing_authority_root is not None:
+            authority_root = Path(self.speaker_timing_authority_root)
+            if not authority_root.is_absolute():
+                raise H3Error("invalid_speaker_timing_authority_root")
+            object.__setattr__(
+                self, "speaker_timing_authority_root", authority_root
+            )
         if not isinstance(self.cid, str) or not self.cid.strip():
             raise H3Error("invalid_cid")
         if not isinstance(self.client_request_id, str) or not self.client_request_id.strip():
@@ -349,6 +368,18 @@ def _validate_request_audio_contract(
             or request.skill_plan_sha256 is not None
             or request.multimodal_compiler_version is not None
             or request.upstream_dialogue_receipt_sha256 is not None
+            or request.speaker_timing_sha256 is not None
+            or request.speaker_timing_authority_version is not None
+            or request.speaker_timing_production_required is not False
+            or request.speaker_timing_legacy_source_version is not None
+            or request.speaker_timing_legacy_receipt_path is not None
+            or request.speaker_timing_legacy_receipt_sha256 is not None
+            or request.speaker_timing_production_path is not None
+            or request.speaker_timing_production_sha256 is not None
+            or request.speaker_timing_authority_artifacts
+            or request.speaker_timing_authority_root is not None
+            or request.on_screen_dialogue
+            or request.on_screen_dialogue_sha256 is not None
             or request.audio_required is not False
             or request.context_ir_receipt_path is not None
             or request.context_ir_receipt_sha256 is not None
@@ -382,11 +413,341 @@ def _validate_request_audio_contract(
         raise H3Error("invalid_skill_plan_receipt")
     if not _is_sha256(request.upstream_dialogue_receipt_sha256):
         raise H3Error("invalid_upstream_dialogue_receipt")
+    if request.on_screen_dialogue and not _is_sha256(request.speaker_timing_sha256):
+        raise H3Error("invalid_speaker_timing_receipt")
+    if not request.on_screen_dialogue and request.speaker_timing_sha256 is not None and not _is_sha256(request.speaker_timing_sha256):
+        raise H3Error("invalid_speaker_timing_receipt")
+    authority_values = (
+        request.speaker_timing_authority_version,
+        request.speaker_timing_production_required,
+        request.speaker_timing_legacy_source_version,
+        request.speaker_timing_legacy_receipt_path,
+        request.speaker_timing_legacy_receipt_sha256,
+        request.speaker_timing_production_path,
+        request.speaker_timing_production_sha256,
+        request.speaker_timing_authority_artifacts,
+        request.speaker_timing_authority_root,
+    )
+    if not request.on_screen_dialogue:
+        if authority_values != (
+            None, False, None, None, None, None, None, (), None,
+        ):
+            raise H3Error("mixed_speaker_timing_authority")
+    elif request.speaker_timing_authority_version == 0:
+        legacy_values = authority_values[2:5]
+        if (
+            authority_values[1] is not False
+            or authority_values[5:8] != (None, None, ())
+            or (
+                legacy_values != (None, None, None)
+                and (
+                    legacy_values[0] != 2
+                    or not _safe_relative_authority_path(legacy_values[1])
+                    or not _is_sha256(legacy_values[2])
+                )
+            )
+            or (legacy_values == (None, None, None) and authority_values[8] is not None)
+        ):
+            raise H3Error("invalid_legacy_speaker_timing_authority")
+    elif request.speaker_timing_authority_version == 1:
+        production_path = request.speaker_timing_production_path
+        artifacts = request.speaker_timing_authority_artifacts
+        if (
+            request.speaker_timing_production_required is not True
+            or authority_values[2:5] != (None, None, None)
+            or not isinstance(production_path, str)
+            or not _safe_relative_authority_path(production_path)
+            or not _is_sha256(request.speaker_timing_production_sha256)
+            or not isinstance(artifacts, tuple)
+            or not artifacts
+        ):
+            raise H3Error("invalid_speaker_timing_production_authority")
+        normalized: list[tuple[str, str]] = []
+        for artifact in artifacts:
+            if (
+                not isinstance(artifact, tuple)
+                or len(artifact) != 2
+                or not _safe_relative_authority_path(artifact[0])
+                or not _is_sha256(artifact[1])
+            ):
+                raise H3Error("invalid_speaker_timing_production_authority")
+            normalized.append((artifact[0], artifact[1]))
+        if (
+            tuple(sorted(normalized)) != tuple(normalized)
+            or len({path for path, _sha in normalized}) != len(normalized)
+            or (production_path, request.speaker_timing_production_sha256)
+            not in normalized
+        ):
+            raise H3Error("invalid_speaker_timing_production_authority")
+    else:
+        raise H3Error("speaker_timing_authority_required")
+    if not isinstance(request.on_screen_dialogue, tuple):
+        raise H3Error("invalid_on_screen_dialogue")
+    normalized_dialogue: list[dict[str, Any]] = []
+    for expected_order, line in enumerate(request.on_screen_dialogue, 1):
+        if (
+            not isinstance(line, Mapping)
+            or set(line) != {
+                "order", "line_index", "subject_id", "text",
+                "start_s", "end_s",
+            }
+            or line.get("order") != expected_order
+            or isinstance(line.get("line_index"), bool)
+            or not isinstance(line.get("line_index"), int)
+            or line["line_index"] < 1
+            or not isinstance(line.get("subject_id"), str)
+            or not line["subject_id"]
+            or not isinstance(line.get("text"), str)
+            or not line["text"]
+        ):
+            raise H3Error("invalid_on_screen_dialogue")
+        try:
+            start_s, end_s = float(line["start_s"]), float(line["end_s"])
+        except (TypeError, ValueError):
+            raise H3Error("invalid_on_screen_dialogue") from None
+        if not (math.isfinite(start_s) and math.isfinite(end_s) and 0 <= start_s < end_s):
+            raise H3Error("invalid_on_screen_dialogue")
+        normalized_dialogue.append({
+            "order": expected_order,
+            "line_index": line["line_index"],
+            "subject_id": line["subject_id"],
+            "text": line["text"],
+            "start_s": start_s,
+            "end_s": end_s,
+        })
+    object.__setattr__(request, "on_screen_dialogue", tuple(normalized_dialogue))
+    dialogue_sha256 = (
+        canonical_json_sha256(normalized_dialogue)
+        if normalized_dialogue
+        else None
+    )
+    if request.on_screen_dialogue_sha256 != dialogue_sha256:
+        raise ReceiptError("on_screen_dialogue_receipt_mismatch")
     if (
         not isinstance(request.multimodal_compiler_version, str)
         or not request.multimodal_compiler_version.strip()
     ):
         raise H3Error("invalid_multimodal_compiler")
+
+
+def validate_request_authority(request: H3Request) -> None:
+    """Revalidate nested multimodal authority at every paid/read boundary."""
+    if not isinstance(request, H3Request):
+        raise H3Error("invalid_request")
+    _validate_request_audio_contract(
+        request,
+        is_multimodal=_workflow(request) in H3_MULTIMODAL_WORKFLOWS,
+    )
+
+
+def speaker_timing_authority_manifest(request: H3Request) -> dict[str, Any] | None:
+    version = request.speaker_timing_authority_version
+    if version is None or (
+        version == 0 and request.speaker_timing_legacy_receipt_path is None
+    ):
+        return None
+    manifest = {
+        "version": version,
+        "required": request.speaker_timing_production_required,
+        "production_path": request.speaker_timing_production_path,
+        "production_sha256": request.speaker_timing_production_sha256,
+        "artifacts": [
+            {"path": path, "sha256": sha256}
+            for path, sha256 in request.speaker_timing_authority_artifacts
+        ],
+    }
+    if version == 0:
+        manifest["legacy_source"] = {
+            "version": request.speaker_timing_legacy_source_version,
+            "receipt_path": request.speaker_timing_legacy_receipt_path,
+            "receipt_sha256": request.speaker_timing_legacy_receipt_sha256,
+        }
+    return manifest
+
+
+def _require_speaker_timing_production_authority(request: H3Request) -> None:
+    if not request.on_screen_dialogue:
+        return
+    if request.speaker_timing_authority_version == 0:
+        # A v2 source manifest alone does not prove its nested input, skill
+        # plan, dialogue, keyframes, or audio still match this request.  Until
+        # an existing historical attempt can be fully rebound to those bytes,
+        # every public H3 paid/read/reuse boundary must fail closed.
+        raise ReceiptError("legacy_speaker_timing_authority_unverifiable")
+    if request.speaker_timing_authority_version != 1:
+        raise ReceiptError("speaker_timing_production_authority_required")
+    root = request.speaker_timing_authority_root
+    if not isinstance(root, Path):
+        raise ReceiptError("speaker_timing_production_authority_root_required")
+    root = root.resolve()
+    frozen = dict(request.speaker_timing_authority_artifacts)
+    loaded: dict[str, bytes] = {}
+    try:
+        for relative, expected_sha256 in frozen.items():
+            path = (root / relative).resolve()
+            path.relative_to(root)
+            data = path.read_bytes()
+            if hashlib.sha256(data).hexdigest() != expected_sha256:
+                raise ReceiptError(
+                    "speaker_timing_production_authority_mismatch"
+                )
+            loaded[relative] = data
+    except (OSError, ValueError):
+        raise ReceiptError(
+            "speaker_timing_production_authority_invalid"
+        ) from None
+    production_relative = request.speaker_timing_production_path
+    if not isinstance(production_relative, str):
+        raise ReceiptError("speaker_timing_production_authority_invalid")
+    try:
+        production = json.loads(loaded[production_relative].decode("utf-8"))
+        artifacts = production["artifacts"]
+    except (
+        KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError,
+    ):
+        raise ReceiptError(
+            "speaker_timing_production_authority_invalid"
+        ) from None
+    if (
+        not isinstance(production, Mapping)
+        or production.get("schema") != "duet.speaker-timing-production"
+        or production.get("version") != 1
+        or not isinstance(artifacts, Mapping)
+        or set(artifacts) != {
+        "producer_input", "raw_output", "skill", "speaker_timing",
+        }
+    ):
+        raise ReceiptError("speaker_timing_production_authority_invalid")
+
+    def bound(
+        base: str,
+        artifact: object,
+        *,
+        timing: bool = False,
+        exact: bool = True,
+    ) -> str:
+        keys = {"path", "sha256", "canonical_sha256"} if timing else {
+            "path", "sha256"
+        }
+        if (
+            not isinstance(artifact, Mapping)
+            or (set(artifact) != keys if exact else not keys <= set(artifact))
+        ):
+            raise ReceiptError("speaker_timing_production_authority_invalid")
+        relative = artifact.get("path")
+        if not _safe_relative_authority_path(relative):
+            raise ReceiptError("speaker_timing_production_authority_invalid")
+        joined = (Path(base).parent / str(relative)).as_posix()
+        if not _safe_relative_authority_path(joined):
+            raise ReceiptError("speaker_timing_production_authority_invalid")
+        return joined
+
+    expected = {
+        production_relative: str(request.speaker_timing_production_sha256),
+    }
+    role_paths: dict[str, str] = {}
+    for role in ("producer_input", "raw_output", "skill", "speaker_timing"):
+        artifact = artifacts[role]
+        path = bound(
+            production_relative, artifact, timing=role == "speaker_timing"
+        )
+        digest = artifact.get("sha256")
+        if not _is_sha256(digest) or (
+            path in expected and expected[path] != digest
+        ):
+            raise ReceiptError("speaker_timing_production_authority_invalid")
+        expected[path] = str(digest)
+        role_paths[role] = path
+        if (
+            role == "speaker_timing"
+            and artifact.get("canonical_sha256")
+            != request.speaker_timing_sha256
+        ):
+            raise ReceiptError("speaker_timing_production_authority_invalid")
+    try:
+        producer_input = json.loads(
+            loaded[role_paths["producer_input"]].decode("utf-8")
+        )
+    except (
+        KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError,
+    ):
+        raise ReceiptError(
+            "speaker_timing_production_authority_invalid"
+        ) from None
+    evidence: list[object] = []
+    for key in ("frames", "contact_sheets"):
+        values = producer_input.get(key) if isinstance(producer_input, Mapping) else None
+        if not isinstance(values, list):
+            raise ReceiptError("speaker_timing_production_authority_invalid")
+        evidence.extend(values)
+    persons = producer_input.get("persons") if isinstance(producer_input, Mapping) else None
+    if not isinstance(persons, list):
+        raise ReceiptError("speaker_timing_production_authority_invalid")
+    for person in persons:
+        refs = person.get("identity_refs") if isinstance(person, Mapping) else None
+        if not isinstance(refs, list):
+            raise ReceiptError("speaker_timing_production_authority_invalid")
+        evidence.extend(refs)
+    cut_source = producer_input.get("cut_source") if isinstance(producer_input, Mapping) else None
+    if not isinstance(cut_source, Mapping):
+        raise ReceiptError("speaker_timing_production_authority_invalid")
+    evidence.append(cut_source)
+    input_base = role_paths["producer_input"]
+    source = producer_input.get("source") if isinstance(producer_input, Mapping) else None
+    source_sha256 = source.get("sha256") if isinstance(source, Mapping) else None
+    source_relative = (
+        Path(input_base).parent.parent / "source.mp4"
+    ).as_posix()
+    if not _is_sha256(source_sha256) or not _safe_relative_authority_path(
+        source_relative
+    ):
+        raise ReceiptError("speaker_timing_production_authority_invalid")
+    expected[source_relative] = str(source_sha256)
+    frame_data: dict[str, bytes] = {}
+    for artifact in evidence:
+        path = bound(input_base, artifact, exact=False)
+        digest = artifact.get("sha256") if isinstance(artifact, Mapping) else None
+        if not _is_sha256(digest) or (
+            path in expected and expected[path] != digest
+        ):
+            raise ReceiptError("speaker_timing_production_authority_invalid")
+        expected[path] = str(digest)
+        frame_data[str(artifact["path"])] = loaded[path]
+    if expected != frozen or set(loaded) != set(expected):
+        raise ReceiptError("speaker_timing_production_authority_mismatch")
+    try:
+        projected = dialogue_timing.freeze_speaker_visibility(
+            producer_input_data=loaded[role_paths["producer_input"]],
+            skill_output_data=loaded[role_paths["raw_output"]],
+            source_data=loaded[source_relative],
+            frame_data=frame_data,
+            skill_data=loaded[role_paths["skill"]],
+        )
+        frozen_timing = json.loads(
+            loaded[role_paths["speaker_timing"]].decode("utf-8")
+        )
+    except (
+        KeyError,
+        TypeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        dialogue_timing.DialogueTimingError,
+    ):
+        raise ReceiptError(
+            "speaker_timing_production_authority_invalid"
+        ) from None
+    if (
+        projected.receipt != production
+        or projected.speaker_timing != frozen_timing
+        or dialogue_timing.canonical_sha256(projected.speaker_timing)
+        != request.speaker_timing_sha256
+    ):
+        raise ReceiptError("speaker_timing_production_authority_mismatch")
+
+
+def _require_h3_boundary(request: H3Request) -> None:
+    _require_context_ir_receipt(request)
+    _require_speaker_timing_production_authority(request)
 
 
 def _context_ir_reference_receipt(request: H3Request) -> str:
@@ -456,6 +817,13 @@ def _context_ir_source_request_receipt(
         "workflow": request.workflow,
         "skill_plan_sha256": request.skill_plan_sha256,
         "multimodal_compiler_version": request.multimodal_compiler_version,
+        "speaker_timing_sha256": request.speaker_timing_sha256,
+        **(
+            {"speaker_timing_authority": speaker_timing_authority_manifest(request)}
+            if speaker_timing_authority_manifest(request) is not None
+            else {}
+        ),
+        "on_screen_dialogue_sha256": request.on_screen_dialogue_sha256,
         "audio_required": request.audio_required,
         "reference_audio_metadata": [
             {
@@ -472,6 +840,7 @@ def _context_ir_source_request_receipt(
 
 def _require_context_ir_receipt(request: H3Request) -> None:
     """Reject raw multimodal requests at every H3 provider boundary."""
+    validate_request_authority(request)
     if not is_multimodal_request(request):
         return
     path = request.context_ir_receipt_path
@@ -724,7 +1093,7 @@ def start(request: H3Request, *, client: httpx.Client | None = None) -> H3Result
     query an already persisted task, but never repeats a provider POST whose
     outcome is unknown.
     """
-    _require_context_ir_receipt(request)
+    _require_h3_boundary(request)
     with _session_lease(request):
         existing = _find_attempt(request, request.client_request_id)
         if output_is_reusable(request, existing):
@@ -751,7 +1120,7 @@ def prepare(request: H3Request) -> H3Result:
     Fast fan-out callers prepare every child first.  A persisted ``ready``
     state proves that no POST has started; ``submitting`` remains ambiguous.
     """
-    _require_context_ir_receipt(request)
+    _require_h3_boundary(request)
     with _session_lease(request):
         existing = _find_attempt(request, request.client_request_id)
         if output_is_reusable(request, existing):
@@ -768,7 +1137,7 @@ def prepare(request: H3Request) -> H3Result:
 
 def submit(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
     """POST one previously prepared attempt and return before any GET poll."""
-    _require_context_ir_receipt(request)
+    _require_h3_boundary(request)
     with _session_lease(request):
         state = _find_attempt(request, request.client_request_id)
         if state is None:
@@ -791,7 +1160,7 @@ def submit(request: H3Request, *, client: httpx.Client | None = None) -> H3Resul
 
 def inspect(request: H3Request) -> H3Result:
     """Read the latest attempt for UI/startup decisions, without any writes."""
-    _require_context_ir_receipt(request)
+    _require_h3_boundary(request)
     root = _state_root(request)
     marker = root / "session.json"
     if not root.exists():
@@ -817,7 +1186,7 @@ def timeout_attempt_is_get_only_resumable(
     request: H3Request, expected_attempt_id: str,
 ) -> bool:
     """Prove that the latest exact attempt still owns a running H3 task."""
-    _require_context_ir_receipt(request)
+    _require_h3_boundary(request)
     try:
         state = _find_attempt(request, request.client_request_id)
     except ReceiptError:
@@ -1008,7 +1377,7 @@ def legacy_h3_is_provably_unsubmitted(
 
 def resume(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
     """Recover existing work, including the strict provider-failure exception."""
-    _require_context_ir_receipt(request)
+    _require_h3_boundary(request)
     with _session_lease(request):
         state = _find_attempt(request, request.client_request_id)
         if output_is_reusable(request, state):
@@ -1033,7 +1402,7 @@ def retry(
 ) -> H3Result:
     """Explicitly create a paid retry, keyed by a new idempotency key."""
     retried = replace(request, client_request_id=client_request_id)
-    _require_context_ir_receipt(retried)
+    _require_h3_boundary(retried)
     with _session_lease(retried):
         existing = _find_attempt(retried, client_request_id)
         if output_is_reusable(retried, existing):
@@ -1062,7 +1431,7 @@ def controlled_storage_rejection_is_safely_retryable(
     bytes plus an external rejection-evidence digest.  It is intentionally not
     inferred from the generic ``h3_submit_rejected`` code.
     """
-    _require_context_ir_receipt(request)
+    _require_h3_boundary(request)
     try:
         state = _find_attempt(request, request.client_request_id)
     except ReceiptError:
@@ -1083,7 +1452,7 @@ def retry_controlled_storage_rejection(
     client: httpx.Client | None = None,
 ) -> H3Result:
     """Append one same-client attempt after a proven local 400 rejection."""
-    _require_context_ir_receipt(request)
+    _require_h3_boundary(request)
     with _session_lease(request):
         previous = _find_attempt(request, request.client_request_id)
         if not _controlled_storage_retry_state_is_valid(
@@ -1122,7 +1491,7 @@ def load_media_timeline_receipt(
     attempt.  The helper validates the frozen H3 input, the versioned timeline
     shape, and the exact output bytes before returning a detached JSON object.
     """
-    _require_context_ir_receipt(request)
+    _require_h3_boundary(request)
     if (
         not isinstance(attempt_id, str)
         or len(attempt_id) != 6
@@ -1175,7 +1544,7 @@ def output_is_reusable(
     allow_provider_duration_ceiling: bool = False,
 ) -> bool:
     """Validate a local output against its exact paid attempt and frozen input."""
-    _require_context_ir_receipt(request)
+    _require_h3_boundary(request)
     if state is None:
         state = _find_attempt(request, request.client_request_id)
     if state is None:
@@ -1439,6 +1808,16 @@ def _input_manifest(
                     request.upstream_dialogue_receipt_sha256
                 ),
                 "compiler_version": request.multimodal_compiler_version,
+                "speaker_timing_sha256": request.speaker_timing_sha256,
+                **(
+                    {"speaker_timing_authority": speaker_timing_authority_manifest(request)}
+                    if speaker_timing_authority_manifest(request) is not None
+                    else {}
+                ),
+                "on_screen_dialogue": list(request.on_screen_dialogue),
+                "on_screen_dialogue_sha256": (
+                    request.on_screen_dialogue_sha256
+                ),
                 "audio_required": request.audio_required,
                 "reference_audio_semantics": "conditioning_only",
                 "reference_audios": _reference_audio_manifest(request),
@@ -3601,6 +3980,18 @@ def _is_sha256(value: Any) -> bool:
         isinstance(value, str)
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _safe_relative_authority_path(value: object) -> bool:
+    if not isinstance(value, str) or not value or "\\" in value:
+        return False
+    path = Path(value)
+    return (
+        not path.is_absolute()
+        and value == path.as_posix()
+        and value not in {".", ".."}
+        and ".." not in path.parts
     )
 
 

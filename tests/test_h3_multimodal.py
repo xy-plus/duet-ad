@@ -2,12 +2,14 @@ import copy
 import hashlib
 import json
 import wave
+from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
 
 import httpx
 import pytest
 
-from app import h3, h3_multimodal
+from app import dialogue_timing, h3, h3_multimodal
 
 
 def _write_wav(path: Path, seconds: int = 2, sample_value: int = 0) -> bytes:
@@ -99,13 +101,25 @@ def _dialogue_args(*texts: str) -> dict:
         "upstream_dialogue_content_sha256": h3.canonical_json_sha256(
             list(dialogue)
         ),
+        "speaker_timing": dialogue_timing.FrozenSpeakerTiming(
+            sha256="c" * 64,
+            source_sha256="a" * 64,
+            duration=Fraction(8),
+            windows={
+                "S1": (
+                    dialogue_timing.FrozenLipWindow(
+                        Fraction(0), Fraction(8)
+                    ),
+                )
+            },
+        ),
     }
 
 
 def _request(tmp_path: Path) -> h3.H3Request:
     visual = _visual(tmp_path)
     plan = _plan(visual.prompt)
-    return h3_multimodal.build_h3_request(
+    request = h3_multimodal.build_h3_request(
         skill_plan=plan,
         approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
         **_dialogue_args("我会准时回来。"),
@@ -126,6 +140,10 @@ def _request(tmp_path: Path) -> h3.H3Request:
             poll_interval_s=0,
             retry_interval_s=0,
         ),
+    )
+    return replace(
+        request,
+        gateway_storage_root=tmp_path.resolve(),
     )
 
 
@@ -178,6 +196,144 @@ def test_dialogue_content_hash_mismatch_fails_before_attempt(tmp_path):
         )
 
     assert not (tmp_path / "mismatch" / ".h3").exists()
+
+
+def test_on_screen_dialogue_requires_explicit_verified_speaker_timing(tmp_path):
+    visual = _visual(tmp_path)
+    plan = _plan(visual.prompt)
+    args = _dialogue_args("我会准时回来。")
+    args["speaker_timing"] = None
+
+    with pytest.raises(
+        h3_multimodal.MultimodalContractError,
+        match="speaker_timing_evidence_missing",
+    ):
+        h3_multimodal.build_h3_request(
+            skill_plan=plan,
+            approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+            **args,
+            visual=visual,
+            reference_audios=_audios(tmp_path),
+            mode="multimodal",
+            cid="missing-speaker-timing",
+            workdir=tmp_path / "missing-speaker-timing",
+            client_request_id="missing-speaker-timing",
+            duration=8,
+            resolution="768p",
+            aspect_ratio="9:16",
+            autodl_token="token",
+        )
+
+    assert not (tmp_path / "missing-speaker-timing" / ".h3").exists()
+
+
+def test_on_screen_dialogue_cannot_start_before_verified_lip_window(tmp_path):
+    visual = _visual(tmp_path)
+    plan = _plan(visual.prompt)
+    args = _dialogue_args("我会准时回来。")
+    args["speaker_timing"] = dialogue_timing.FrozenSpeakerTiming(
+        sha256="c" * 64,
+        source_sha256="a" * 64,
+        duration=Fraction(8),
+        windows={
+            "S1": (
+                dialogue_timing.FrozenLipWindow(
+                    Fraction("0.75"), Fraction(8)
+                ),
+            )
+        },
+    )
+
+    with pytest.raises(
+        h3_multimodal.MultimodalContractError,
+        match="dialogue_before_speaker_lip_window",
+    ):
+        h3_multimodal.build_h3_request(
+            skill_plan=plan,
+            approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+            **args,
+            visual=visual,
+            reference_audios=_audios(tmp_path),
+            mode="multimodal",
+            cid="early-dialogue",
+            workdir=tmp_path / "early-dialogue",
+            client_request_id="early-dialogue",
+            duration=8,
+            resolution="768p",
+            aspect_ratio="9:16",
+            autodl_token="token",
+        )
+
+    assert not (tmp_path / "early-dialogue" / ".h3").exists()
+
+
+def test_h3_paid_and_read_boundaries_revalidate_on_screen_dialogue_digest(
+    tmp_path,
+):
+    request = _request(tmp_path)
+    request.on_screen_dialogue[0]["start_s"] = 0.5
+
+    with pytest.raises(
+        h3.ReceiptError,
+        match="on_screen_dialogue_receipt_mismatch",
+    ):
+        h3.inspect(request)
+
+    assert not (request.workdir / ".h3").exists()
+
+
+def test_factory_authority_validator_rechecks_window_not_only_timing_hash(
+    tmp_path,
+):
+    visual = _visual(tmp_path)
+    plan = _plan(visual.prompt)
+    dialogue_args = _dialogue_args("我会准时回来。")
+    audios = _audios(tmp_path)
+    request = h3_multimodal.build_h3_request(
+        skill_plan=plan,
+        approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+        **dialogue_args,
+        visual=visual,
+        reference_audios=audios,
+        mode="multimodal",
+        cid="factory-ignored-window",
+        workdir=tmp_path / "factory-ignored-window",
+        client_request_id="factory-ignored-window",
+        duration=8,
+        resolution="768p",
+        aspect_ratio="9:16",
+        autodl_token="token",
+    )
+    restrictive = dialogue_timing.FrozenSpeakerTiming(
+        sha256="d" * 64,
+        source_sha256="a" * 64,
+        duration=Fraction(8),
+        windows={
+            "S1": (
+                dialogue_timing.FrozenLipWindow(
+                    Fraction("0.75"), Fraction(8)
+                ),
+            )
+        },
+    )
+    forged = replace(request, speaker_timing_sha256=restrictive.sha256)
+
+    with pytest.raises(
+        h3_multimodal.MultimodalContractError,
+        match="dialogue_before_speaker_lip_window",
+    ):
+        h3_multimodal.validate_h3_request_authority(
+            forged,
+            skill_plan=plan,
+            approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+            upstream_dialogue=dialogue_args["upstream_dialogue"],
+            upstream_dialogue_receipt_sha256=(
+                dialogue_args["upstream_dialogue_receipt_sha256"]
+            ),
+            visual=visual,
+            reference_audios=audios,
+            speaker_timing=restrictive,
+        )
 
 
 def test_on_screen_speaker_requires_subject_voice_reference(tmp_path):
@@ -409,6 +565,9 @@ def test_real_submit_body_and_attempt_receipts_bind_all_multimodal_hashes(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
+    monkeypatch.setattr(
+        h3, "_require_speaker_timing_production_authority", lambda _request: None,
+    )
     request = _request(tmp_path)
     posts = []
     for path, _blob in request.keyframes:
@@ -466,6 +625,9 @@ def test_duplicate_submit_and_submission_unknown_never_repeat_audio_post(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
+    monkeypatch.setattr(
+        h3, "_require_speaker_timing_production_authority", lambda _request: None,
+    )
     request = _request(tmp_path)
     calls = 0
 
@@ -501,6 +663,9 @@ def test_audio_required_missing_output_audio_is_deterministic_and_get_only(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
+    monkeypatch.setattr(
+        h3, "_require_speaker_timing_production_authority", lambda _request: None,
+    )
     request = _request(tmp_path)
     calls = []
 

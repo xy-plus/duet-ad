@@ -7,7 +7,7 @@ import json
 import math
 import subprocess
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -22,6 +22,7 @@ from app import (
     stitch,
     storage,
 )
+from app.config import Settings
 
 WORKFLOW = h3.H3_WORKFLOW
 _PLAN_WORKFLOWS = h3.H3_REFERENCE_WORKFLOWS | {h3.H3_BOUNDARY_WORKFLOW}
@@ -159,6 +160,7 @@ def finalize_multimodal_plan(
     *,
     aspect_ratio: str,
     resolution: str,
+    settings: Settings | None = None,
 ) -> str | None:
     """Finalize staged per-segment audio plans before a paid submit.
 
@@ -241,6 +243,7 @@ def finalize_multimodal_plan(
         aspect_ratio=aspect_ratio,
         resolution=resolution,
         prepare_fit=True,
+        settings=settings,
     )
     try:
         long_video.write_plan_receipt(
@@ -261,6 +264,7 @@ def finalize_multimodal_plan(
             aspect_ratio=aspect_ratio,
             resolution=resolution,
             prepare_fit=True,
+            settings=settings,
         )
     except (OSError, KeyError, TypeError, ValueError, long_video.LongVideoError,
             LongGenerationError) as exc:
@@ -369,7 +373,8 @@ def _fit_outputs_complete(paths: tuple[Path, Path], aspect_ratio: str) -> bool:
 def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 dialogue_mode: str, *, aspect_ratio: str | None = None,
                 resolution: str | None = None,
-                prepare_fit: bool = True) -> FrozenPlan:
+                prepare_fit: bool = True,
+                settings: Settings | None = None) -> FrozenPlan:
     """Validate every immutable plan fact and pre-fit every source anchor."""
     root = Path(root).resolve()
     if (aspect_ratio is None) != (resolution is None):
@@ -690,6 +695,8 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                     keyframes=frozen_keyframes,
                     upstream_dialogue=tuple(dict(line) for line in dialogue),
                     upstream_dialogue_receipt_sha256=dialogue_binding["sha256"],
+                    source_sha256=_digest(segdir / "source.mp4"),
+                    source_duration_s=end_s - start_s,
                     cid=f"freeze-segment-{index}",
                     workdir=segdir / "work" / "h3-native",
                     client_request_id=f"freeze-segment-{index}",
@@ -758,6 +765,22 @@ def _extract_last_frame(video: Path, output: Path) -> Path:
     return output
 
 
+def _bind_h3_operational_roots(
+    settings,
+    plan: FrozenPlan,
+    request: h3.H3Request,
+) -> h3.H3Request:
+    return replace(
+        request,
+        gateway_storage_root=settings.h3_gateway_storage_root,
+        speaker_timing_authority_root=(
+            plan.root
+            if request.speaker_timing_authority_version in {0, 1}
+            else None
+        ),
+    )
+
+
 def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
              parent_id: str, fit_mode: str, *, frozen_child_id: str | None = None,
              prepare_inputs: bool = True, fast_mode: bool = False,
@@ -774,6 +797,8 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
                 upstream_dialogue_receipt_sha256=(
                     segment.dialogue_sha256 or ""
                 ),
+                source_sha256=_digest(segment.workdir / "source.mp4"),
+                source_duration_s=segment.end_s - segment.start_s,
                 cid=f"{cid}-segment-{segment.index}",
                 workdir=segment.workdir,
                 client_request_id=(
@@ -802,8 +827,10 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
             context = _freeze_segment_context_ir(
                 settings, plan, segment, source_request
             )
-            return h3_project.apply_bound_context_ir(
-                context, context_ir_binding
+            return _bind_h3_operational_roots(
+                settings,
+                plan,
+                h3_project.apply_bound_context_ir(context, context_ir_binding),
             )
         except (h3.H3Error, h3_project.ProjectMultimodalError) as exc:
             raise LongGenerationError(
@@ -902,6 +929,29 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
     )
 
 
+def _revalidate_speaker_authority(
+    plan: FrozenPlan, segment: FrozenSegment, request: h3.H3Request,
+) -> None:
+    if plan.workflow not in h3.H3_MULTIMODAL_WORKFLOWS:
+        return
+    try:
+        h3_project.revalidate_production_authority(
+            plan.root,
+            segment.workdir / "work",
+            request,
+            expected_production_sha256=(
+                hashlib.sha256(
+                    segment.multimodal.speaker_timing_production_data
+                ).hexdigest()
+                if segment.multimodal is not None
+                and segment.multimodal.speaker_timing_production_data is not None
+                else None
+            ),
+        )
+    except h3_project.ProjectMultimodalError as exc:
+        raise LongGenerationError(exc.code) from None
+
+
 def _freeze_segment_context_ir(
     settings,
     plan: FrozenPlan,
@@ -942,7 +992,11 @@ def _optimize_segment_context_ir(
         binding = h3_project.context_ir_binding(result)
         if result.status == "succeeded":
             return (
-                h3_project.apply_bound_context_ir(context, binding),
+                _bind_h3_operational_roots(
+                    settings,
+                    plan,
+                    h3_project.apply_bound_context_ir(context, binding),
+                ),
                 binding,
                 "succeeded",
                 None,
@@ -1358,18 +1412,54 @@ def stitched_output_is_reusable(
     generation: Mapping | None = None,
     provider_media: Mapping[int, tuple[str, Mapping[str, object]]] | None = None,
 ) -> bool:
-    """Validate the published video against the exact local stitch receipt."""
+    """Validate legacy output or native output with exact attempt evidence."""
     if dialogue_mode not in {"auto", "none"}:
         return False
     output = plan.root / "generated.mp4"
     receipt_path = plan.root / stitch.RECEIPT_FILENAME
     native_audio = _is_h3_multimodal_plan(plan)
-    if generation is not None:
+    if native_audio:
+        if (
+            not isinstance(generation, Mapping)
+            or not generation
+            or not isinstance(provider_media, Mapping)
+            or not provider_media
+            or not generation_segments_are_valid(plan.segments, generation)
+        ):
+            return False
         try:
-            if _generation_uses_h3_native_audio(plan, generation) != native_audio:
+            if not _generation_uses_h3_native_audio(plan, generation):
                 return False
         except LongGenerationError:
             return False
+        states = {
+            item.get("index"): item
+            for item in generation.get("segments", [])
+            if isinstance(item, Mapping)
+        }
+        if set(provider_media) != {segment.index for segment in plan.segments}:
+            return False
+        for segment in plan.segments:
+            state = states.get(segment.index)
+            media = provider_media.get(segment.index)
+            if (
+                not isinstance(state, Mapping)
+                or state.get("status") != "succeeded"
+                or not isinstance(media, tuple)
+                or len(media) != 2
+                or media[0] != state.get("h3_attempt_id")
+                or not isinstance(media[1], Mapping)
+            ):
+                return False
+    else:
+        if provider_media is not None:
+            return False
+        if generation is not None:
+            try:
+                if _generation_uses_h3_native_audio(plan, generation):
+                    return False
+            except LongGenerationError:
+                return False
     audio_mode: stitch.AudioMode = (
         "provider_generated"
         if native_audio
@@ -1410,29 +1500,10 @@ def stitched_output_is_reusable(
             actual_audio = payload.get("audio")
             if not isinstance(actual_audio, dict):
                 return False
-            provider_segments = actual_audio.get("provider_segments")
-            if provider_media is not None:
-                expected_audio["provider_segments"] = [
-                    stitch._provider_binding(segment, index)
-                    for index, segment in enumerate(stitch_segments, 1)
-                ]
-            elif (
-                not isinstance(provider_segments, list)
-                or len(provider_segments) != len(plan.segments)
-                or any(
-                    not isinstance(item, dict)
-                    or set(item) != {
-                        "source", "attempt_id", "media_timeline_sha256",
-                        "decoded_audio_sha256",
-                    }
-                    or item.get("source") != "h3"
-                    or _exact_h3_attempt_id(item.get("attempt_id")) is None
-                    for item in provider_segments
-                )
-            ):
-                return False
-            else:
-                expected_audio["provider_segments"] = provider_segments
+            expected_audio["provider_segments"] = [
+                stitch._provider_binding(segment, index)
+                for index, segment in enumerate(stitch_segments, 1)
+            ]
             expected_audio["edl"] = {
                 "schema": "duet.av-edl",
                 "version": 1,
@@ -1643,6 +1714,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                         error,
                         _exact_h3_attempt_id(state.get("h3_attempt_id")),
                     )
+                _revalidate_speaker_authority(plan, segment, request)
                 result = h3.resume(request)
                 if result.status == "not_started":
                     return (
@@ -1773,7 +1845,11 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                             settings, plan, segment, source_request
                         )
                         return (
-                            h3_project.apply_bound_context_ir(context, binding),
+                            _bind_h3_operational_roots(
+                                settings,
+                                plan,
+                                h3_project.apply_bound_context_ir(context, binding),
+                            ),
                             binding,
                             "succeeded",
                             None,
@@ -1832,6 +1908,9 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 state = states[segment.index]
                 if state.get("status") != "not_started":
                     continue
+                _revalidate_speaker_authority(
+                    plan, segment, requests[segment.index]
+                )
                 result = h3.prepare(requests[segment.index])
                 if result.status == "not_started":
                     prepared_status, prepared_error = "queued", None
@@ -1887,6 +1966,9 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         def submit_one(segment: FrozenSegment):
             previous_attempt = states[segment.index].get("h3_attempt_id")
             try:
+                _revalidate_speaker_authority(
+                    plan, segment, requests[segment.index]
+                )
                 result = h3.submit(requests[segment.index])
                 if result.status == "h3_running":
                     return (
@@ -1947,6 +2029,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             request = requests[segment.index]
             previous_attempt = states[segment.index].get("h3_attempt_id")
             try:
+                _revalidate_speaker_authority(plan, segment, request)
                 result = h3.resume(request)
                 if result.status == "not_started":
                     return (
@@ -2070,8 +2153,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     context = _freeze_segment_context_ir(
                         settings, plan, segment, request
                     )
-                    request = h3_project.apply_bound_context_ir(
-                        context, context_binding
+                    request = _bind_h3_operational_roots(
+                        settings,
+                        plan,
+                        h3_project.apply_bound_context_ir(
+                            context, context_binding
+                        ),
                     )
                 else:
                     if not _context_ir_may_progress(
@@ -2124,6 +2211,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 _exact_h3_attempt_id(previous_attempt),
             )
         try:
+            _revalidate_speaker_authority(plan, segment, request)
             result = h3.start(request) if h3_action == "start" else h3.resume(request)
             if h3_action == "resume" and result.status == "not_started":
                 return request.client_request_id, (

@@ -13,7 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
@@ -320,6 +320,7 @@ def _public_generation(meta: dict, cdir: Path, settings: Settings) -> dict | Non
                             meta.get("fit_mode"),
                             meta.get("dialogue_mode"),
                             prepare_fit=False,
+                            settings=settings,
                         )
                         reusable = long_generation.bound_reusable_segment_indices(
                             settings, meta["id"], plan, generation
@@ -418,7 +419,9 @@ def _fit_required(meta: dict, aspect_ratio: str) -> bool:
     return bool(_validated_fit_profiles(meta)[aspect_ratio]["fit_required"])
 
 
-def _long_fit_required(cdir: Path, meta: dict) -> bool:
+def _long_fit_required(
+    cdir: Path, meta: dict, settings: Settings | None = None,
+) -> bool:
     """Resolve legacy-null long-video fit state from its immutable H3 anchors."""
     generation = meta.get("generation")
     if isinstance(generation, dict):
@@ -440,6 +443,7 @@ def _long_fit_required(cdir: Path, meta: dict) -> bool:
             "none",
             meta.get("dialogue_mode", "auto"),
             prepare_fit=False,
+            settings=settings,
         )
         return frame_fit.frame_bytes_require_fit(
             [
@@ -1021,6 +1025,24 @@ def _load_short_frozen_input(
     return frozen, request_id
 
 
+def _bind_short_h3_operational_roots(
+    settings: Settings,
+    cid: str,
+    request: h3.H3Request,
+) -> h3.H3Request:
+    if not h3.is_multimodal_request(request):
+        return request
+    return replace(
+        request,
+        gateway_storage_root=settings.h3_gateway_storage_root,
+        speaker_timing_authority_root=(
+            (settings.data_dir / cid).resolve()
+            if request.speaker_timing_authority_version in {0, 1}
+            else None
+        ),
+    )
+
+
 def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
     frozen, request_id = _load_short_frozen_input(settings, cid, meta)
     _aspect_ratio, resolution = _generation_semantics(meta)
@@ -1036,7 +1058,7 @@ def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
                 request = h3_project.apply_bound_context_ir(context, binding)
             except h3_project.ProjectMultimodalError:
                 raise _SubmitError(409, "prepared_input_invalid") from None
-    return request
+    return _bind_short_h3_operational_roots(settings, cid, request)
 
 
 def _load_controlled_storage_retry_requests(
@@ -1049,7 +1071,9 @@ def _load_controlled_storage_retry_requests(
     generation = meta.get("generation")
     binding = generation.get("context_ir") if isinstance(generation, dict) else None
     effective_request = h3_project.apply_bound_context_ir(context, binding)
-    return source_request, effective_request
+    return source_request, _bind_short_h3_operational_roots(
+        settings, cid, effective_request
+    )
 
 
 def _freeze_short_context_ir(
@@ -1330,6 +1354,22 @@ def _run_generation(
                 )
                 if action == "resume":
                     h3_action = "start"
+            request = _bind_short_h3_operational_roots(
+                settings, cid, request
+            )
+            h3_project.revalidate_production_authority(
+                (settings.data_dir / cid).resolve(),
+                (settings.data_dir / cid / "work").resolve(),
+                request,
+                expected_production_sha256=(
+                    hashlib.sha256(
+                        frozen.multimodal.speaker_timing_production_data
+                    ).hexdigest()
+                    if frozen.multimodal is not None
+                    and frozen.multimodal.speaker_timing_production_data is not None
+                    else None
+                ),
+            )
         if h3_action == "start":
             result = h3.start(request)
         elif h3_action == "resume":
@@ -1466,6 +1506,7 @@ def _short_validation_paths(cdir: Path, meta: dict) -> set[Path]:
             multimodal.get("manifest"),
             multimodal.get("multimodal_input"),
             multimodal.get("skill_plan"),
+            multimodal.get("speaker_timing"),
         ])
         reference_audios = multimodal.get("reference_audios")
         if isinstance(reference_audios, list):
@@ -1484,7 +1525,9 @@ def _short_validation_paths(cdir: Path, meta: dict) -> set[Path]:
     return paths
 
 
-def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
+def _long_validation_paths(
+    cdir: Path, meta: dict, settings: Settings | None = None,
+) -> set[Path]:
     # Historical single-output attempts above the previous 10-second limit also reach the
     # long-video validator before their strict legacy fallback. Keep those
     # root H3 receipts in the same fingerprint as modern segment receipts.
@@ -1560,6 +1603,7 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
                 multimodal.get("manifest"),
                 multimodal.get("multimodal_input"),
                 multimodal.get("skill_plan"),
+                multimodal.get("speaker_timing"),
             ])
             reference_audios = multimodal.get("reference_audios")
             if isinstance(reference_audios, list):
@@ -1648,7 +1692,130 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
     return paths
 
 
-def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | None:
+def _speaker_timing_fingerprint_entries(
+    cdir: Path, meta: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Hash the complete producer authority, independent of stat metadata."""
+    receipt_name = (
+        meta.get("long_video_plan_receipt")
+        if _is_long_video(meta)
+        else meta.get("prepared_input_receipt")
+    )
+    if (
+        not isinstance(receipt_name, str)
+        or receipt_name != Path(receipt_name).name
+    ):
+        return []
+    try:
+        payload = json.loads((cdir / receipt_name).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, Mapping):
+        return []
+    multimodals: list[object]
+    if _is_long_video(meta):
+        segments = payload.get("segments")
+        multimodals = (
+            [item.get("multimodal") for item in segments if isinstance(item, Mapping)]
+            if isinstance(segments, list)
+            else []
+        )
+    else:
+        multimodals = [payload.get("multimodal")]
+    entries: list[dict[str, object]] = []
+
+    def add(path: Path | None, expected: object = None) -> None:
+        raw_sha256 = None
+        relative = None
+        if path is not None:
+            try:
+                resolved = path.resolve()
+                relative = resolved.relative_to(cdir.resolve()).as_posix()
+                raw_sha256 = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            except (OSError, ValueError):
+                pass
+        entries.append({
+            "path": relative,
+            "expected_sha256": expected,
+            "raw_sha256": raw_sha256,
+        })
+
+    for multimodal in multimodals:
+        timing = (
+            multimodal.get("speaker_timing")
+            if isinstance(multimodal, Mapping)
+            else None
+        )
+        if timing is None:
+            continue
+        path = _bound_artifact_path(cdir, timing)
+        expected = timing.get("sha256") if isinstance(timing, Mapping) else None
+        add(path, expected)
+        producer = (
+            multimodal.get("speaker_timing_producer")
+            if isinstance(multimodal, Mapping) else None
+        )
+        if not isinstance(producer, Mapping):
+            continue
+        receipt_path = _bound_artifact_path(cdir, producer)
+        add(receipt_path, producer.get("sha256"))
+        if receipt_path is None:
+            continue
+        try:
+            production = json.loads(receipt_path.read_text(encoding="utf-8"))
+            artifacts = production["artifacts"]
+        except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(artifacts, Mapping):
+            continue
+        producer_input_path = None
+        for role in ("producer_input", "raw_output", "skill"):
+            artifact = artifacts.get(role)
+            if not isinstance(artifact, Mapping):
+                continue
+            relative = artifact.get("path")
+            candidate = None
+            if isinstance(relative, str) and not Path(relative).is_absolute():
+                candidate = receipt_path.parent / relative
+            add(candidate, artifact.get("sha256"))
+            if role == "producer_input":
+                producer_input_path = candidate
+        if producer_input_path is None:
+            continue
+        try:
+            producer_input = json.loads(
+                producer_input_path.read_text(encoding="utf-8")
+            )
+        except (OSError, TypeError, UnicodeError, json.JSONDecodeError):
+            continue
+        evidence: list[object] = []
+        for key in ("frames", "contact_sheets"):
+            values = producer_input.get(key) if isinstance(producer_input, Mapping) else None
+            if isinstance(values, list):
+                evidence.extend(values)
+        persons = producer_input.get("persons") if isinstance(producer_input, Mapping) else None
+        if isinstance(persons, list):
+            for person in persons:
+                refs = person.get("identity_refs") if isinstance(person, Mapping) else None
+                if isinstance(refs, list):
+                    evidence.extend(refs)
+        cut_source = producer_input.get("cut_source") if isinstance(producer_input, Mapping) else None
+        if isinstance(cut_source, Mapping):
+            evidence.append(cut_source)
+        for artifact in evidence:
+            if not isinstance(artifact, Mapping):
+                continue
+            relative = artifact.get("path")
+            candidate = None
+            if isinstance(relative, str) and not Path(relative).is_absolute():
+                candidate = producer_input_path.parent / relative
+            add(candidate, artifact.get("sha256"))
+    return sorted(entries, key=lambda item: str(item.get("path")))
+
+
+def _generated_video_validation_fingerprint(
+    cdir: Path, meta: dict, settings: Settings | None = None,
+) -> str | None:
     """Bind the cache only to fields and files read by strict validation."""
     try:
         generation = meta.get("generation")
@@ -1681,8 +1848,11 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
                 "frozen_plan_receipt": meta.get("frozen_plan_receipt"),
                 "long_video_plan_receipt": meta.get("long_video_plan_receipt"),
                 "generation": generation_binding,
+                "speaker_timing": _speaker_timing_fingerprint_entries(
+                    cdir, meta
+                ),
             }
-            paths = _long_validation_paths(cdir, meta)
+            paths = _long_validation_paths(cdir, meta, settings)
         else:
             binding = {
                 "id": meta.get("id"),
@@ -1694,6 +1864,9 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
                 "aspect_ratio": meta.get("aspect_ratio"),
                 "resolution": meta.get("resolution"),
                 "generation": generation_binding,
+                "speaker_timing": _speaker_timing_fingerprint_entries(
+                    cdir, meta
+                ),
             }
             paths = _short_validation_paths(cdir, meta)
         binding_bytes = json.dumps(
@@ -1739,7 +1912,7 @@ def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
     if not isinstance(cid, str):
         return False
     cdir = (settings.data_dir / cid).resolve()
-    fingerprint = _generated_video_validation_fingerprint(cdir, meta)
+    fingerprint = _generated_video_validation_fingerprint(cdir, meta, settings)
     if fingerprint is None:
         return _validate_generated_video_uncached(settings, meta)
     identity = (
@@ -1749,7 +1922,7 @@ def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
     return _GENERATED_VIDEO_VALIDATION_CACHE.get_or_validate(
         identity,
         fingerprint,
-        lambda: _generated_video_validation_fingerprint(cdir, meta),
+        lambda: _generated_video_validation_fingerprint(cdir, meta, settings),
         lambda: _validate_generated_video_uncached(settings, meta),
     )
 
@@ -1877,6 +2050,7 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
                     meta.get("fit_mode"),
                     meta.get("dialogue_mode"),
                     prepare_fit=False,
+                    settings=settings,
                 )
                 reusable = long_generation.bound_reusable_segment_indices(
                     settings, cid, plan, generation
@@ -2027,6 +2201,7 @@ def _resume_long_generation(settings: Settings, cid: str) -> None:
             settings.data_dir / cid, meta, expected,
             meta.get("fit_mode"), meta.get("dialogue_mode"),
             prepare_fit=False,
+            settings=settings,
         )
     except Exception:
         storage.update_meta(
@@ -2088,6 +2263,7 @@ def _reconcile_stale_submission(settings: Settings, cid: str, owner: object) -> 
                     expected,
                     "none",
                     meta.get("dialogue_mode", "auto"),
+                    settings=settings,
                 )
                 changes["frozen_plan_receipt"] = expected
             except long_generation.LongGenerationError:
@@ -2192,6 +2368,19 @@ def create_app(settings: Settings) -> FastAPI:
                     settings, cid, codex_runner, claimed_owner=claimed_owner
                 )
 
+    def run_speaker_timing_gated(cid: str) -> None:
+        with pipeline_sem:
+            pipeline.produce_speaker_timing(settings, cid, codex_runner)
+
+    def schedule_speaker_timing(
+        cid: str, background_tasks: BackgroundTasks,
+    ) -> bool:
+        status = pipeline.queue_speaker_timing(settings, cid)
+        if status == "queued":
+            background_tasks.add_task(run_speaker_timing_gated, cid)
+            return True
+        return status in {"running", "done"}
+
     @app.on_event("startup")
     async def recover_pipeline_inputs() -> None:
         for cid, owner in storage.claim_stale_input_reconciliations(
@@ -2201,6 +2390,14 @@ def create_app(settings: Settings) -> FastAPI:
                 pipeline.reconcile_stale_pipeline(settings, cid, owner)
             else:
                 _reconcile_stale_submission(settings, cid, owner)
+        for cid in pipeline.recover_speaker_timing_jobs(settings):
+            thread = threading.Thread(
+                target=run_speaker_timing_gated,
+                args=(cid,),
+                daemon=True,
+                name=f"speaker-timing-recover-{cid[:8]}",
+            )
+            thread.start()
         if not settings.enable_pipeline:
             return
         for cid, owner in storage.claim_stale_pipeline_inputs(settings.data_dir):
@@ -2348,7 +2545,7 @@ def create_app(settings: Settings) -> FastAPI:
             if _is_long_video(meta) and not isinstance(meta.get("fit_profiles"), dict):
                 effective_meta = {
                     **meta,
-                    "fit_required": _long_fit_required(cdir, meta),
+                    "fit_required": _long_fit_required(cdir, meta, settings),
                 }
             aspect_ratio, resolution = _generation_semantics(effective_meta)
             fit_profiles = _validated_fit_profiles(effective_meta)
@@ -2547,7 +2744,7 @@ def create_app(settings: Settings) -> FastAPI:
                 effective_meta = {
                     **meta,
                     "fit_required": _long_fit_required(
-                        settings.data_dir / cid, meta
+                        settings.data_dir / cid, meta, settings
                     ),
                 }
                 (
@@ -2599,6 +2796,13 @@ def create_app(settings: Settings) -> FastAPI:
                             resolution=resolution,
                         )
                     except long_generation.LongGenerationError as exc:
+                        if exc.code == "speaker_timing_refresh_required":
+                            schedule_speaker_timing(cid, background_tasks)
+                            return JSONResponse(
+                                status_code=exc.status,
+                                content={"detail": exc.code},
+                                background=background_tasks,
+                            )
                         raise HTTPException(
                             status_code=exc.status, detail=exc.code
                         ) from exc
@@ -2687,6 +2891,13 @@ def create_app(settings: Settings) -> FastAPI:
                 except long_generation.LongGenerationError as exc:
                     if claim_owner:
                         _finish_submission_claim(settings, cid, claim_owner)
+                    if exc.code == "speaker_timing_refresh_required":
+                        schedule_speaker_timing(cid, background_tasks)
+                        return JSONResponse(
+                            status_code=exc.status,
+                            content={"detail": exc.code},
+                            background=background_tasks,
+                        )
                     if previous_status in {"resume_required", "succeeded"} or (
                         previous_status == "failed"
                         and isinstance(old, dict)
@@ -3261,7 +3472,10 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             except _SubmitError as exc:
                 if claim_owner:
-                    if exc.detail == "multimodal_plan_refresh_required":
+                    if exc.detail in {
+                        "multimodal_plan_refresh_required",
+                        "speaker_timing_refresh_required",
+                    }:
                         _finish_submission_claim(
                             settings,
                             cid,
@@ -3285,6 +3499,13 @@ def create_app(settings: Settings) -> FastAPI:
                         )
                     else:
                         _finish_submission_claim(settings, cid, claim_owner)
+                if exc.detail == "speaker_timing_refresh_required":
+                    schedule_speaker_timing(cid, background_tasks)
+                    return JSONResponse(
+                        status_code=exc.status,
+                        content={"detail": exc.detail},
+                        background=background_tasks,
+                    )
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             except h3.H3Error as exc:
                 if claim_owner:

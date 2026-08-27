@@ -1,12 +1,13 @@
 import hashlib
 import json
 from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
 
 import httpx
 import pytest
 
-from app import context_ir_bridge, h3, h3_multimodal
+from app import context_ir_bridge, dialogue_timing, h3, h3_multimodal
 
 
 UPSTREAM_DIALOGUE_SHA256 = hashlib.sha256(
@@ -101,6 +102,18 @@ def _source_request(tmp_path: Path) -> tuple[h3.H3Request, dict]:
         upstream_dialogue=dialogue,
         upstream_dialogue_receipt_sha256=UPSTREAM_DIALOGUE_SHA256,
         upstream_dialogue_content_sha256=h3.canonical_json_sha256(list(dialogue)),
+        speaker_timing=dialogue_timing.FrozenSpeakerTiming(
+            sha256="c" * 64,
+            source_sha256="a" * 64,
+            duration=Fraction(8),
+            windows={
+                "S1": (
+                    dialogue_timing.FrozenLipWindow(
+                        Fraction(0), Fraction(8)
+                    ),
+                )
+            },
+        ),
         visual=visual,
         reference_audios=audios,
         mode="multimodal",

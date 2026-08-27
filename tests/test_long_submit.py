@@ -14,7 +14,8 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from app import h3, long_generation, long_video, prepared_input, stitch, storage
+from app import h3, long_generation, long_video, pipeline, prepared_input, stitch, storage
+from app import main as main_module
 from app.main import (
     _SubmitError,
     _long_fit_required,
@@ -1258,6 +1259,98 @@ def enabled(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     with TestClient(create_app(settings)) as client:
         yield settings, client
+
+
+def test_long_on_screen_refresh_queues_project_speaker_producer(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    calls = []
+
+    monkeypatch.setattr(
+        long_generation,
+        "finalize_multimodal_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            long_generation.LongGenerationError(
+                "speaker_timing_refresh_required"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "produce_speaker_timing",
+        lambda received_settings, received_cid, _runner: calls.append(
+            (received_settings, received_cid)
+        ) or "done",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "queue_speaker_timing",
+        lambda received_settings, received_cid: (
+            storage.update_meta(
+                received_settings.data_dir,
+                received_cid,
+                _speaker_timing_producer={
+                    "status": "queued", "error": None, "jobs": [],
+                },
+            )
+            and "queued"
+        ),
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "speaker_timing_refresh_required"}
+    assert calls == [(settings, cid)]
+    assert storage.load_meta(settings.data_dir, cid)[
+        "_speaker_timing_producer"
+    ]["status"] == "queued"
+
+
+def test_long_paid_boundary_revalidation_failure_makes_zero_h3_post(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, autodl_art_token="art")
+    cid, receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "long-producer-toctou", 1,
+    )
+    storage.update_meta(
+        settings.data_dir, cid,
+        dialogue_mode="auto", fit_mode="none", frozen_plan_receipt=receipt,
+        generation=generation,
+    )
+    checks = []
+
+    def reject(_plan, segment, _request):
+        checks.append(segment.index)
+        raise long_generation.LongGenerationError(
+            "speaker_visibility_output_hash_mismatch"
+        )
+
+    monkeypatch.setattr(
+        long_generation, "_revalidate_speaker_authority", reject
+    )
+    monkeypatch.setattr(
+        h3, "start", lambda _request: pytest.fail("drifted producer must make zero H3 POST")
+    )
+
+    long_generation.run(settings, cid, plan)
+
+    assert checks == [1]
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "submission_unknown"
+    assert stored["segments"][0]["error"] == "submission_unknown"
 
 
 def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkeypatch):
@@ -3701,6 +3794,51 @@ def test_run_h3_native_audio_never_restores_source_track(tmp_path, monkeypatch):
         "000001", "000002",
     ]
     assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+    exact_provider_media = {
+        index: (
+            f"{index:06d}",
+            {
+                "schema": "duet.h3.media_timeline",
+                "version": 1,
+                "decode_complete": True,
+                "video": {"index": 0},
+                "audio": {"index": 1, "decoded_sha256": f"{index:064x}"},
+            },
+        )
+        for index in (1, 2)
+    }
+    assert _REAL_STITCHED_OUTPUT_IS_REUSABLE(
+        plan,
+        "auto",
+        generation=generation,
+        provider_media=exact_provider_media,
+    )
+    assert not _REAL_STITCHED_OUTPUT_IS_REUSABLE(plan, "auto")
+    mismatched_generation = {
+        **generation,
+        "segments": [dict(item) for item in generation["segments"]],
+    }
+    mismatched_generation["segments"][0]["h3_attempt_id"] = "999999"
+    assert not _REAL_STITCHED_OUTPUT_IS_REUSABLE(
+        plan,
+        "auto",
+        generation=mismatched_generation,
+        provider_media=exact_provider_media,
+    )
+    mismatched_provider_media = dict(exact_provider_media)
+    mismatched_provider_media[1] = (
+        "000001",
+        {
+            **exact_provider_media[1][1],
+            "audio": {"index": 1, "decoded_sha256": "f" * 64},
+        },
+    )
+    assert not _REAL_STITCHED_OUTPUT_IS_REUSABLE(
+        plan,
+        "auto",
+        generation=generation,
+        provider_media=mismatched_provider_media,
+    )
 
 
 def test_h3_native_submission_unknown_never_calls_stitch(tmp_path, monkeypatch):

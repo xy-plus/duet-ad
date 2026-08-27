@@ -1,6 +1,6 @@
 ---
 name: video-maker
-description: 从预先抽取的参考视频帧理解叙事、选择最多 9 张有序关键帧并生成纯视觉叙事；图片优化完成后，把原始动态事实与 receipt 绑定的新人物、新场景协调成统一视觉 IR；当后端另行提供冻结的多模态输入时，只规划 H3 所需的人物、图片、现有台词行、语言、画内或画外发声、声线参考、环境声和音效绑定。用于视频分析、图片优化后的视觉协调或 H3 音画联合生成前的音画阶段；不提交视频、不调用供应商。
+description: 从预先抽取的参考视频帧理解叙事、选择最多 9 张有序关键帧并生成纯视觉叙事；图片优化完成后，把原始动态事实与 receipt 绑定的新人物、新场景协调成统一视觉 IR；对后端冻结的真实 PTS 样本逐帧判定 PERSON 可见性与嘴部可验性；当后端另行提供冻结的多模态输入时，只规划 H3 所需的人物、图片、现有台词行、语言、画内或画外发声、声线参考、环境声和音效绑定。用于视频分析、图片优化后的视觉协调、发声人物可见性取证或 H3 音画联合生成前的音画阶段；不提交视频、不调用供应商。
 ---
 
 # video-maker
@@ -9,12 +9,13 @@ description: 从预先抽取的参考视频帧理解叙事、选择最多 9 张�
 
 只按文件选择一种阶段，不混用：
 
-- `work/reconcile_after_image_optimization_input.json` 与 `work/multimodal_input.json` 都不存在：执行**视觉阶段**。
+- `work/speaker_visibility_input.json` 存在时严格优先执行 **speaker_visibility**；它在 production 中可与既有 `work/multimodal_input.json` 共存，但本阶段不得读取 `work/multimodal_input.json` 或 `work/reconcile_after_image_optimization_input.json`，也不执行其他阶段。
+- `work/speaker_visibility_input.json`、`work/reconcile_after_image_optimization_input.json` 与 `work/multimodal_input.json` 都不存在：执行**视觉阶段**。
 - 只有 `work/reconcile_after_image_optimization_input.json` 存在：执行第三阶段 **reconcile_after_image_optimization**。
 - 只有 `work/multimodal_input.json` 存在：执行**音画阶段**。
-- 两个阶段输入同时存在：只写 `work/unified_visual_ir.json` 的 `phase_input_conflict` 固定失败结构，不执行任一正常阶段，也不写 `work/h3_prompt_plan.json`。
+- speaker visibility 输入不存在但后两个阶段输入同时存在：只写 `work/unified_visual_ir.json` 的 `phase_input_conflict` 固定失败结构，不执行任一正常阶段，也不写 `work/h3_prompt_plan.json`。
 
-视觉阶段不得读取任何音频文件，只处理图片与文字。第三阶段不得读取音频或台词，只协调已经选择的帧；音画阶段只规划冻结输入的语义绑定，不重新分析原视频。
+视觉阶段不得读取任何音频文件，只处理图片与文字。第三阶段不得读取音频或台词，只协调已经选择的帧；音画阶段只规划冻结输入的语义绑定，不重新分析原视频。speaker_visibility 只读取描述符逐字绑定的采样帧、联系表和 PERSON identity refs，不读取音频、台词或其他阶段输入。
 
 ## 2. 视觉阶段
 
@@ -275,3 +276,82 @@ FailurePlan = {
 ```
 
 按上述结构写 UTF-8 严格 JSON，无 Markdown 围栏或解释。该 IR 是后端将动态事实与 canonical 静态计划确定性合并的唯一协调输入；本阶段不编写供应商提示词、不调用 Context IR 或供应商。
+
+## 5. 发声人物可见性阶段
+
+### 边界
+
+`work/speaker_visibility_input.json` 存在时，只读取它以及描述符逐字绑定的 cut source、采样帧、联系表和 PERSON identity refs；只写 `work/speaker_visibility_output.json`。不得读取 `work/multimodal_input.json`；不得读取 `work/reconcile_after_image_optimization_input.json`；不得读取音频、dialogue、speech、台词文本或台词时间窗，也不得读取未绑定的相邻帧或其他身份素材。
+
+本阶段只做冻结样本的身份可见性和嘴部可验性分类，不判断谁正在说话。none 或全部 offscreen 时，后端不得创建 `work/speaker_visibility_input.json`，不得调用本阶段 Skill。输入结构、媒体字节、哈希、顺序或证据不闭合时不得写 `work/speaker_visibility_output.json`；本阶段没有可猜测的失败输出。
+
+### 严格输入
+
+输入 JSON 所有字段必填，禁止额外字段：
+
+```text
+Sha256 = 64 位小写十六进制 SHA-256
+Pts = 大于等于 0 的整数
+PositivePts = 大于 0 的整数
+Int1 = 从 1 开始的整数
+NonEmpty = 非空字符串
+Boolean = true | false
+TimeBase = { numerator: Int1; denominator: Int1 }
+PersonId = PERSON_* 稳定 ID
+SubjectId = 上游冻结的非空 on-screen subject ID
+
+VisibilityInput = {
+  schema: "duet.speaker-visibility-input";
+  version: 1;
+  phase: "speaker_visibility";
+  source: { sha256: Sha256; duration_pts: PositivePts; time_base: TimeBase };
+  sampling: {
+    algorithm: "decoded_pts_nearest_v1";
+    cadence_fps: 8;
+    max_unobserved_gap_pts: PositivePts;
+    endpoint_shrink_intervals: 1;
+  };
+  decoded_frame_pts: NonEmptyArray<Pts>;
+  cut_pts: Array<PositivePts>;
+  cut_source: { path: "scenes.json"; sha256: Sha256 };
+  frames: NonEmptyArray<{ order: Int1; path: NonEmpty; sha256: Sha256; pts: Pts; cut_before: Boolean }>;
+  contact_sheets: NonEmptyArray<{ order: Int1; path: NonEmpty; sha256: Sha256; frame_orders: NonEmptyArray<Int1> }>;
+  persons: NonEmptyArray<{ person_id: PersonId; identity_refs: NonEmptyArray<{ path: NonEmpty; sha256: Sha256 }> }>;
+  on_screen_subjects: NonEmptyArray<SubjectId>;
+}
+```
+
+`source.sha256` 绑定源视频原始字节；`duration_pts`、所有 PTS 和互质正整数 `time_base` 都由后端冻结，禁止换算成浮点秒或毫秒。`decoded_frame_pts` 严格递增、无重复并位于 `[0,duration_pts)`；`cut_pts` 严格递增、无重复并位于 `(0,duration_pts)`。`cut_source` 逐字绑定产生这些 cut 的 `work/scenes.json` 原始字节，禁止另猜切镜。
+
+`frames` 至少 4 项，按 `order=1..N` 连续排列；`pts` 严格递增，且恰好是 `decoded_pts_nearest_v1` 按 8 FPS 目标节拍选中的真实 decoded frame PTS，不是合成时间戳。每项 `path/sha256` 必须与 `speaker-visibility-frames/` 中实际可读字节匹配。`cut_before` 必须逐字匹配从上一 sample PTS 到当前 sample PTS 之间是否存在 `cut_pts`。
+
+`contact_sheets` 按 `order=1..M` 连续排列，文件字节与 SHA 必须匹配；所有 `frame_orders` 串联后恰为 `1..N`，不重不漏。`persons` 的 `person_id` 唯一，每个 `identity_refs` 非空且绑定 `keyframes/` 中互不复用的实际字节与 SHA。`on_screen_subjects` 非空、升序、无重复。描述符绑定的 sample、contact sheet 和 identity ref 文件必须恰好闭合，不接受额外媒体。
+
+### 映射与逐样本判定
+
+subject_person_mapping 必须与 on_screen_subjects 等长且同序，PERSON 映射必须一对一。只有 subject 与 PERSON 身份能从冻结输入唯一证明时才允许映射；单一 on-screen subject 且 roster 只有一个 PERSON 是可机械唯一证明的情形。多人映射不能从冻结 identity refs 与采样证据唯一证明时，不得写 `work/speaker_visibility_output.json`。
+
+不得按 subject/PERSON 数组位置、命名序号或 PERSON 在画面中的位置推断映射；不得按嘴部运动、同框关系或出现频率推断映射；不得按台词文本或台词时间窗反推。`lip_verifiable_person_ids` 只表示该 sample 中 PERSON 身份、面部和完整嘴唇边界可直接验看，不表示正在发声。
+
+对 `frames` 逐样本穷举：每个输入 sample 恰有一个同 order 的输出项。visible_person_ids 只列该 sample 像素中可由 identity refs 唯一确认的 PERSON；lip_verifiable_person_ids 必须是 visible_person_ids 的子集，只列嘴唇边界在该 sample 自身清楚可验的 PERSON。两个数组均按 ID 升序、无重复；无法唯一确认时写空数组，不写 `unknown/maybe` 占位值。
+
+联系表只用于导航；只能以该 sample 自身图像字节作事实。不得用相邻 sample 补证，不得用同一 contact sheet 的其他格、identity ref 或 source 中未绑定的帧补证，不得跨 `cut_before=true` 补证，不得在未知空洞之间插值，也不得复制上一帧分类。
+
+### 严格输出
+
+成功输出所有字段必填、禁止额外字段：
+
+```text
+VisibilityOutput = {
+  schema: "duet.speaker-visibility-output";
+  version: 1;
+  phase: "speaker_visibility";
+  input_sha256: Sha256;
+  subject_person_mapping: NonEmptyArray<{ subject_id: SubjectId; person_id: PersonId }>;
+  frames: NonEmptyArray<{ order: Int1; visible_person_ids: Array<PersonId>; lip_verifiable_person_ids: Array<PersonId> }>;
+}
+```
+
+`input_sha256` 必须是 `work/speaker_visibility_input.json` 原始文件字节的逐字节 SHA-256，不得重排或重序列化 JSON 后再计算。后端另行冻结本次使用的 Skill 原始字节及 SHA；Skill 不复制或生成 `skill_sha256`。
+
+按上述结构写 UTF-8 严格 JSON，无 Markdown 围栏或解释。Skill 不生成时间窗、不合并区间、不收缩端点、不生成 timing 或 receipt。后端机械合并相邻 verified samples、按 cut/空洞断开并收缩窗端点；`max_unobserved_gap_pts` 与 `endpoint_shrink_intervals` 只供后端验证和投影，Skill 不执行这些规则。

@@ -398,6 +398,7 @@ def _h3_request_manifest(
     references_sha256: str,
 ) -> dict[str, Any]:
     """Bind every non-secret H3 field that may affect the provider request."""
+    h3.validate_request_authority(request)
     return {
         "cid": request.cid,
         "workdir": str(request.workdir.resolve()),
@@ -415,6 +416,17 @@ def _h3_request_manifest(
         "workflow": request.workflow,
         "skill_plan_sha256": request.skill_plan_sha256,
         "multimodal_compiler_version": request.multimodal_compiler_version,
+        "speaker_timing_sha256": request.speaker_timing_sha256,
+        **(
+            {
+                "speaker_timing_authority": (
+                    h3.speaker_timing_authority_manifest(request)
+                )
+            }
+            if h3.speaker_timing_authority_manifest(request) is not None
+            else {}
+        ),
+        "on_screen_dialogue_sha256": request.on_screen_dialogue_sha256,
         "audio_required": request.audio_required,
         "reference_audio_metadata": [
             {

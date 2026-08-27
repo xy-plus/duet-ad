@@ -19,6 +19,8 @@ links: [conversation-task, result-display]
 | 至少选一项并严格确认 | `POST /postprocess` 返回 running，逐帧并行编辑并以 2 秒轮询展示进度 |
 | 双目标图片计划已冻结 | 页面可查看后端确定性编译的提示词，但不能用自由文本改写；PATCH 返回 `image_optimization_prompt_compiled` |
 | 全部帧完成 | `postprocess.status=done`，展示 `postprocessed/` 对比图；外部评测结果不回收或隐藏这些已持久化图片 |
+| H3 计划包含画内台词 | 后台按真实 decoded PTS 以固定 8 FPS 取样，并由 `video-maker` Skill 独立验证 PERSON 可见性与嘴部可验性；证据冻结完成前不提交 H3 |
+| dialogue 为 none 或全部 off-screen | 不探测视频、不抽样，也不创建 speaker visibility 输入 |
 | 任一分段失败 | 保留成功帧；该段显示“重试本段”，请求携带 `confirm/expected_revision`，点击后立即禁用以防双击 |
 | 旧会话 | 409 `read_only` |
 
@@ -37,4 +39,6 @@ links: [conversation-task, result-display]
 
 - 图片优化主链只负责技术 freeze、计划/提示词编译、图片生成和持久化展示。图片生成后，连续性和全局 Lab 色调可由外部评测记录；评测失败仍可展示优化图，但不得放行 H3。
 - H3 只接受完整、匹配冻结输入的后处理与外部评测 authority；缺帧、状态异常或评测 authority 不完整时 fail closed，不回退原图。
+- `speaker_visibility` 不接收台词文本或台词时间窗；它只读取冻结的源视频、真实 PTS 样本、contact sheets、PERSON identity refs 与 on-screen subject IDs。subject→PERSON 无法由冻结证据唯一证明时失败，不能按数组顺序、画面位置、嘴动或台词反推。
+- 后端仅从连续、无 cut 且同时满足可见与嘴部可验的样本合并窗口，并在两端各收缩一个采样间隔。producer 输入、原始 Skill 输出、样本媒体与最终 timing receipt 均进入 H3 production authority；所有付费、读取和复用边界重新验证，证据漂移即 fail closed。
 - 请求顶层严格为 `confirm/options`；running 时不能重复提交，done 后改变选项返回结构化 409。页面只展示用户可理解的提示词、能力和分段进度，不展示内部模型、模板、供应商响应或堆栈。

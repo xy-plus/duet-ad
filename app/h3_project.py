@@ -9,21 +9,27 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from app import context_ir_bridge, h3, h3_multimodal, stitch
+from app import context_ir_bridge, dialogue_timing, h3, h3_multimodal, stitch
 
 
 SOURCE_FILENAME = "h3_multimodal_source.json"
 SKILL_INPUT_FILENAME = "multimodal_input.json"
+SPEAKER_TIMING_FILENAME = "speaker_timing.json"
+SPEAKER_TIMING_PRODUCTION_FILENAME = "speaker_timing_production.json"
+FINAL_ACCEPTANCE_FILENAME = "dialogue-av-acceptance.json"
 SOURCE_SCHEMA = "duet.h3-multimodal-source"
-SOURCE_VERSION = 2
+SOURCE_VERSION = 3
+LEGACY_SOURCE_VERSION = 2
 SKILL_INPUT_SCHEMA = "duet.h3-multimodal-input"
-SKILL_INPUT_VERSION = 1
+SKILL_INPUT_VERSION = 2
+LEGACY_SKILL_INPUT_VERSION = 1
 RECEIPT_SCHEMA = "duet.h3-project-multimodal"
-RECEIPT_VERSION = 2
+RECEIPT_VERSION = 3
+LEGACY_RECEIPT_VERSION = 2
 AUDIO_ROUTE = {
     "schema": "duet.h3-project.audio-route",
     "version": 1,
@@ -55,6 +61,7 @@ class FrozenProjectMultimodal:
     manifest_path: Path
     manifest_data: bytes
     manifest_sha256: str
+    source_version: int
     mode: str
     skill_input_path: Path
     skill_input_data: bytes
@@ -65,6 +72,14 @@ class FrozenProjectMultimodal:
     skill_plan_data_sha256: str
     skill_plan: Mapping[str, Any]
     skill_plan_sha256: str
+    speaker_timing_path: Path | None
+    speaker_timing_data: bytes | None
+    speaker_timing_data_sha256: str | None
+    speaker_timing: Mapping[str, Any] | None
+    speaker_timing_production_path: Path | None
+    speaker_timing_production_data: bytes | None
+    speaker_timing_production: Mapping[str, Any] | None
+    speaker_timing_frame_sha256s: tuple[str, ...] | None
     reference_audios: h3.FrozenReferenceAudios
 
 
@@ -134,6 +149,179 @@ def _json_object(data: bytes, code: str) -> dict[str, Any]:
     return value
 
 
+def _plan_has_on_screen_dialogue(plan: Mapping[str, Any]) -> bool:
+    bindings = plan.get("speech_bindings")
+    if not isinstance(bindings, list):
+        _fail("skill_plan_shape_invalid")
+    return any(
+        isinstance(item, Mapping) and item.get("delivery") == "on_screen"
+        for item in bindings
+    )
+
+
+def _timing_binding(
+    *, root: Path, workdir: Path, manifest: Mapping[str, Any],
+) -> tuple[Path | None, bytes | None, str | None, Mapping[str, Any] | None]:
+    binding = manifest.get("speaker_timing")
+    if binding is None:
+        return None, None, None, None
+    if not isinstance(binding, dict) or set(binding) != {"path", "sha256"}:
+        _fail("speaker_timing_binding_invalid")
+    path = _inside(
+        root, workdir, binding.get("path"), "speaker_timing_binding_invalid"
+    )
+    data = _read(path, "speaker_timing_binding_invalid")
+    digest = _sha256(data)
+    if path.name != SPEAKER_TIMING_FILENAME or digest != binding.get("sha256"):
+        _fail("speaker_timing_binding_invalid")
+    return (
+        path,
+        data,
+        digest,
+        _json_object(data, "speaker_timing_binding_invalid"),
+    )
+
+
+def _speaker_timing_production_binding(
+    *,
+    root: Path,
+    workdir: Path,
+    manifest: Mapping[str, Any],
+    timing: Mapping[str, Any] | None,
+) -> tuple[Path | None, bytes | None, Mapping[str, Any] | None, tuple[str, ...] | None]:
+    binding = manifest.get("speaker_timing_producer")
+    if binding is None:
+        return None, None, None, None
+    if (
+        timing is None
+        or not isinstance(binding, dict)
+        or set(binding) != {"path", "sha256"}
+    ):
+        _fail("speaker_timing_production_binding_invalid")
+    receipt_path = _inside(
+        root, workdir, binding.get("path"),
+        "speaker_timing_production_binding_invalid",
+    )
+    receipt_data = _read(
+        receipt_path, "speaker_timing_production_binding_invalid"
+    )
+    if (
+        receipt_path.name != SPEAKER_TIMING_PRODUCTION_FILENAME
+        or _sha256(receipt_data) != binding.get("sha256")
+    ):
+        _fail("speaker_timing_production_binding_invalid")
+    receipt = _json_object(receipt_data, "speaker_timing_production_invalid")
+    artifacts = receipt.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "producer_input", "raw_output", "skill", "speaker_timing",
+    }:
+        _fail("speaker_timing_production_invalid")
+
+    expected_names = {
+        "producer_input": "speaker_visibility_input.json",
+        "raw_output": "speaker_visibility_output.json",
+        "skill": "speaker_visibility_skill.md",
+        "speaker_timing": SPEAKER_TIMING_FILENAME,
+    }
+    loaded: dict[str, tuple[Path, bytes]] = {}
+    for role, expected_name in expected_names.items():
+        artifact = artifacts.get(role)
+        expected_keys = (
+            {"path", "sha256", "canonical_sha256"}
+            if role == "speaker_timing"
+            else {"path", "sha256"}
+        )
+        if not isinstance(artifact, dict) or set(artifact) != expected_keys:
+            _fail("speaker_timing_production_invalid")
+        path = _inside(
+            root, workdir, artifact.get("path"),
+            "speaker_timing_production_invalid",
+        )
+        data = _read(path, "speaker_timing_production_invalid")
+        if path.name != expected_name or _sha256(data) != artifact.get("sha256"):
+            if role == "raw_output":
+                _fail("speaker_visibility_output_hash_mismatch")
+            _fail(f"speaker_timing_{role}_hash_mismatch")
+        loaded[role] = (path, data)
+
+    producer_input = _json_object(
+        loaded["producer_input"][1], "speaker_visibility_input_invalid"
+    )
+    raw_frames = producer_input.get("frames")
+    raw_sheets = producer_input.get("contact_sheets")
+    raw_persons = producer_input.get("persons")
+    if (
+        not isinstance(raw_frames, list)
+        or not isinstance(raw_sheets, list)
+        or not isinstance(raw_persons, list)
+    ):
+        _fail("speaker_visibility_input_invalid")
+    frame_data: dict[str, bytes] = {}
+    raw_identity_refs = []
+    for person in raw_persons:
+        if not isinstance(person, dict) or not isinstance(
+            person.get("identity_refs"), list
+        ):
+            _fail("speaker_visibility_input_invalid")
+        raw_identity_refs.extend(person["identity_refs"])
+    raw_cut_source = producer_input.get("cut_source")
+    if not isinstance(raw_cut_source, dict):
+        _fail("speaker_visibility_input_invalid")
+    for item in [*raw_frames, *raw_sheets, *raw_identity_refs, raw_cut_source]:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            _fail("speaker_visibility_input_invalid")
+        path = _relative_file(
+            root, workdir, item["path"], "speaker_visibility_input_invalid"
+        )
+        frame_data[item["path"]] = _read(
+            path, "speaker_visibility_input_invalid"
+        )
+    if workdir.resolve() == (root / "work").resolve():
+        sources = sorted(
+            path for path in root.glob("source.*") if path.is_file()
+        )
+    else:
+        segment_root = workdir.resolve().parent
+        try:
+            relative_segment = segment_root.relative_to(
+                (root / "work" / "segments").resolve()
+            )
+        except ValueError:
+            _fail("speaker_visibility_source_mismatch")
+        source = segment_root / "source.mp4"
+        sources = (
+            [source]
+            if len(relative_segment.parts) == 1
+            and relative_segment.parts[0].isdigit()
+            and source.is_file()
+            else []
+        )
+    if len(sources) != 1:
+        _fail("speaker_visibility_source_mismatch")
+    try:
+        production = dialogue_timing.freeze_speaker_visibility(
+            producer_input_data=loaded["producer_input"][1],
+            skill_output_data=loaded["raw_output"][1],
+            source_data=_read(sources[0], "speaker_visibility_source_mismatch"),
+            frame_data=frame_data,
+            skill_data=loaded["skill"][1],
+        )
+    except dialogue_timing.DialogueTimingError as exc:
+        raise ProjectMultimodalError(exc.code) from None
+    if production.receipt != receipt or production.speaker_timing != timing:
+        _fail("speaker_timing_production_mismatch")
+    timeline = timing.get("timeline")
+    timeline_frames = timeline.get("keyframes") if isinstance(timeline, dict) else None
+    if not isinstance(timeline_frames, list):
+        _fail("speaker_timing_production_mismatch")
+    return (
+        receipt_path,
+        receipt_data,
+        receipt,
+        tuple(str(item.get("sha256")) for item in timeline_frames),
+    )
+
+
 def refresh_skill_input(
     *,
     root: Path,
@@ -159,10 +347,35 @@ def refresh_skill_input(
     )
     if (
         manifest.get("schema") != SOURCE_SCHEMA
-        or manifest.get("version") != SOURCE_VERSION
+        or manifest.get("version") not in {
+            LEGACY_SOURCE_VERSION, SOURCE_VERSION,
+        }
         or manifest.get("mode") != "multimodal"
     ):
         _fail("multimodal_source_invalid")
+    plan_binding = manifest.get("skill_plan")
+    if not isinstance(plan_binding, dict) or set(plan_binding) != {"path", "sha256"}:
+        _fail("skill_plan_binding_invalid")
+    plan_path = _inside(
+        root, workdir, plan_binding.get("path"), "skill_plan_binding_invalid"
+    )
+    plan_data = _read(plan_path, "skill_plan_binding_invalid")
+    if _sha256(plan_data) != plan_binding.get("sha256"):
+        _fail("skill_plan_hash_mismatch")
+    plan = _json_object(plan_data, "skill_plan_invalid")
+    on_screen_required = _plan_has_on_screen_dialogue(plan)
+    if on_screen_required and manifest.get("version") == LEGACY_SOURCE_VERSION:
+        _fail("speaker_timing_refresh_required")
+    timing_binding = manifest.get("speaker_timing")
+    if on_screen_required and timing_binding is None:
+        _fail("speaker_timing_refresh_required")
+    if timing_binding is not None:
+        _path, _data, _digest, timing = _timing_binding(
+            root=root, workdir=workdir, manifest=manifest
+        )
+        _speaker_timing_production_binding(
+            root=root, workdir=workdir, manifest=manifest, timing=timing
+        )
     raw_audios = manifest.get("reference_audios")
     if not isinstance(raw_audios, list) or not 1 <= len(raw_audios) <= 3:
         _fail("reference_audio_binding_invalid")
@@ -195,7 +408,11 @@ def refresh_skill_input(
     visual_data = _read(visual_prompt_path.resolve(), "multimodal_input_invalid")
     desired = {
         "schema": SKILL_INPUT_SCHEMA,
-        "version": SKILL_INPUT_VERSION,
+        "version": (
+            SKILL_INPUT_VERSION
+            if manifest.get("version") == SOURCE_VERSION
+            else LEGACY_SKILL_INPUT_VERSION
+        ),
         "visual_prompt": {
             "path": visual_relative,
             "sha256": _sha256(visual_data),
@@ -207,6 +424,8 @@ def refresh_skill_input(
         "dialogue_source_sha256": dialogue_source_sha256,
         "reference_audios": raw_audios,
     }
+    if timing_binding is not None:
+        desired["speaker_timing"] = timing_binding
     input_path = workdir / SKILL_INPUT_FILENAME
     if input_path.is_file():
         try:
@@ -226,11 +445,18 @@ def refresh_skill_input(
     return True
 
 
-def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None:
+def freeze_optional(
+    root: Path,
+    workdir: Path,
+    *,
+    allow_legacy_on_screen_read: bool = False,
+) -> FrozenProjectMultimodal | None:
     """Freeze an opt-in project source; partial intent fails closed.
 
     Absence of both source manifest and Skill output is the unchanged legacy
-    path.  Presence of either makes the multimodal contract mandatory.
+    path.  Presence of either makes the multimodal contract mandatory.  The
+    legacy exception only reloads an already-bound v2 receipt; request
+    construction still requires refresh before any new on-screen paid work.
     """
     root = Path(root).resolve()
     workdir = Path(workdir).resolve()
@@ -249,7 +475,8 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
         _fail("multimodal_source_missing")
     manifest_data = _read(manifest_path, "multimodal_source_invalid")
     manifest = _json_object(manifest_data, "multimodal_source_invalid")
-    if set(manifest) != {
+    source_version = manifest.get("version")
+    base_manifest_keys = {
         "schema",
         "version",
         "mode",
@@ -257,7 +484,22 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
         "multimodal_input",
         "skill_plan",
         "reference_audios",
-    }:
+    }
+    optional_manifest_keys = {"speaker_timing", "speaker_timing_producer"}
+    if (
+        manifest.get("schema") != SOURCE_SCHEMA
+        or source_version not in {LEGACY_SOURCE_VERSION, SOURCE_VERSION}
+        or manifest.get("mode") != "multimodal"
+        or set(manifest) not in {
+            frozenset(base_manifest_keys),
+            frozenset(base_manifest_keys | {"speaker_timing"}),
+            frozenset(base_manifest_keys | optional_manifest_keys),
+        }
+        or (
+            source_version == LEGACY_SOURCE_VERSION
+            and "speaker_timing" in manifest
+        )
+    ):
         _fail("multimodal_source_invalid")
 
     input_binding = manifest.get("multimodal_input")
@@ -278,24 +520,31 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
     if input_binding.get("sha256") != skill_input_sha256:
         _fail("multimodal_input_hash_mismatch")
     skill_input = _json_object(skill_input_data, "multimodal_input_invalid")
-    if set(skill_input) != {
+    expected_input_version = (
+        SKILL_INPUT_VERSION
+        if source_version == SOURCE_VERSION
+        else LEGACY_SKILL_INPUT_VERSION
+    )
+    base_input_keys = {
         "schema",
         "version",
         "visual_prompt",
         "keyframes",
         "dialogue_source_sha256",
         "reference_audios",
+    }
+    if set(skill_input) not in {
+        frozenset(base_input_keys),
+        frozenset(base_input_keys | {"speaker_timing"}),
     } or (
         skill_input.get("schema") != SKILL_INPUT_SCHEMA
-        or skill_input.get("version") != SKILL_INPUT_VERSION
+        or skill_input.get("version") != expected_input_version
+        or (
+            expected_input_version == LEGACY_SKILL_INPUT_VERSION
+            and "speaker_timing" in skill_input
+        )
     ):
         _fail("multimodal_input_invalid")
-    if (
-        manifest.get("schema") != SOURCE_SCHEMA
-        or manifest.get("version") != SOURCE_VERSION
-        or manifest.get("mode") != "multimodal"
-    ):
-        _fail("multimodal_source_invalid")
 
     plan_binding = manifest.get("skill_plan")
     if not isinstance(plan_binding, dict) or set(plan_binding) != {"path", "sha256"}:
@@ -318,6 +567,45 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
         "dialogue_source_sha256"
     ):
         _fail("multimodal_input_dialogue_mismatch")
+
+    timing_binding = manifest.get("speaker_timing")
+    on_screen_required = _plan_has_on_screen_dialogue(skill_plan)
+    if (
+        on_screen_required
+        and source_version == LEGACY_SOURCE_VERSION
+        and not allow_legacy_on_screen_read
+    ):
+        _fail("speaker_timing_refresh_required")
+    if (
+        on_screen_required
+        and timing_binding is None
+        and not (
+            source_version == LEGACY_SOURCE_VERSION
+            and allow_legacy_on_screen_read
+        )
+    ):
+        _fail("speaker_timing_refresh_required")
+    if skill_input.get("speaker_timing") != timing_binding:
+        _fail("speaker_timing_binding_invalid")
+    (
+        speaker_timing_path,
+        speaker_timing_data,
+        speaker_timing_data_sha256,
+        speaker_timing,
+    ) = _timing_binding(
+        root=root, workdir=workdir, manifest=manifest
+    )
+    (
+        speaker_timing_production_path,
+        speaker_timing_production_data,
+        speaker_timing_production,
+        speaker_timing_frame_sha256s,
+    ) = _speaker_timing_production_binding(
+        root=root,
+        workdir=workdir,
+        manifest=manifest,
+        timing=speaker_timing,
+    )
 
     visual_binding = skill_input.get("visual_prompt")
     if not isinstance(visual_binding, dict) or set(visual_binding) != {
@@ -387,6 +675,7 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
         manifest_path=manifest_path,
         manifest_data=manifest_data,
         manifest_sha256=_sha256(manifest_data),
+        source_version=int(source_version),
         mode=manifest["mode"],
         skill_input_path=skill_input_path,
         skill_input_data=skill_input_data,
@@ -397,6 +686,14 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
         skill_plan_data_sha256=skill_plan_data_sha256,
         skill_plan=skill_plan,
         skill_plan_sha256=skill_plan_sha256,
+        speaker_timing_path=speaker_timing_path,
+        speaker_timing_data=speaker_timing_data,
+        speaker_timing_data_sha256=speaker_timing_data_sha256,
+        speaker_timing=speaker_timing,
+        speaker_timing_production_path=speaker_timing_production_path,
+        speaker_timing_production_data=speaker_timing_production_data,
+        speaker_timing_production=speaker_timing_production,
+        speaker_timing_frame_sha256s=speaker_timing_frame_sha256s,
         reference_audios=audios,
     )
 
@@ -415,9 +712,13 @@ def receipt_binding(
     root = Path(root).resolve()
     if not isinstance(frozen, FrozenProjectMultimodal) or frozen.root != root:
         _fail("multimodal_receipt_invalid")
-    return {
+    binding = {
         "schema": RECEIPT_SCHEMA,
-        "version": RECEIPT_VERSION,
+        "version": (
+            RECEIPT_VERSION
+            if frozen.source_version == SOURCE_VERSION
+            else LEGACY_RECEIPT_VERSION
+        ),
         "mode": frozen.mode,
         "manifest": {
             "path": _relative(root, frozen.manifest_path),
@@ -445,15 +746,50 @@ def receipt_binding(
             for audio in frozen.reference_audios
         ],
     }
+    if frozen.speaker_timing_path is not None:
+        binding["speaker_timing"] = {
+            "path": _relative(root, frozen.speaker_timing_path),
+            "sha256": frozen.speaker_timing_data_sha256,
+            "canonical_sha256": dialogue_timing.canonical_sha256(
+                frozen.speaker_timing
+            ),
+        }
+    if frozen.speaker_timing_production_path is not None:
+        raw_output = frozen.speaker_timing_production["artifacts"]["raw_output"]
+        binding["speaker_timing_producer"] = {
+            "path": _relative(root, frozen.speaker_timing_production_path),
+            "sha256": _sha256(frozen.speaker_timing_production_data),
+            "raw_output_path": raw_output["path"],
+            "raw_output_sha256": raw_output["sha256"],
+        }
+    return binding
 
 
 def load_bound(root: Path, binding: object) -> FrozenProjectMultimodal:
     """Reload exact bound files and reject any path, bytes, hash, or order drift."""
     root = Path(root).resolve()
-    if not isinstance(binding, dict) or set(binding) != {
+    base_keys = {
         "schema", "version", "mode", "manifest", "multimodal_input",
         "skill_plan", "reference_audios"
-    }:
+    }
+    if (
+        not isinstance(binding, dict)
+        or binding.get("schema") != RECEIPT_SCHEMA
+        or binding.get("version") not in {
+            LEGACY_RECEIPT_VERSION, RECEIPT_VERSION,
+        }
+        or set(binding) not in {
+            frozenset(base_keys),
+            frozenset(base_keys | {"speaker_timing"}),
+            frozenset(base_keys | {
+                "speaker_timing", "speaker_timing_producer",
+            }),
+        }
+        or (
+            binding.get("version") == LEGACY_RECEIPT_VERSION
+            and "speaker_timing" in binding
+        )
+    ):
         _fail("multimodal_receipt_invalid")
     manifest = binding.get("manifest")
     if not isinstance(manifest, dict) or set(manifest) != {"path", "sha256"}:
@@ -468,10 +804,49 @@ def load_bound(root: Path, binding: object) -> FrozenProjectMultimodal:
         _fail("multimodal_receipt_invalid")
     if manifest_path.name != SOURCE_FILENAME:
         _fail("multimodal_receipt_invalid")
-    frozen = freeze_optional(root, manifest_path.parent)
+    frozen = freeze_optional(
+        root,
+        manifest_path.parent,
+        allow_legacy_on_screen_read=True,
+    )
     if frozen is None or receipt_binding(root, frozen) != binding:
         _fail("multimodal_receipt_mismatch")
     return frozen
+
+
+def revalidate_production_authority(
+    root: Path,
+    workdir: Path,
+    request: h3.H3Request,
+    *,
+    expected_production_sha256: str | None,
+) -> None:
+    """Reload sampled speaker evidence immediately before an H3 boundary."""
+    if not request.on_screen_dialogue:
+        return
+    if request.speaker_timing_authority_version == 0:
+        if expected_production_sha256 is not None:
+            _fail("speaker_timing_production_authority_invalid")
+        return
+    if (
+        request.speaker_timing_authority_version != 1
+        or expected_production_sha256 is None
+        or request.speaker_timing_production_sha256
+        != expected_production_sha256
+    ):
+        _fail("speaker_timing_production_authority_invalid")
+    frozen = freeze_optional(root, workdir)
+    if (
+        frozen is None
+        or frozen.speaker_timing_production is None
+        or frozen.speaker_timing_production_data is None
+        or _sha256(frozen.speaker_timing_production_data)
+        != expected_production_sha256
+        or frozen.speaker_timing is None
+        or dialogue_timing.canonical_sha256(frozen.speaker_timing)
+        != request.speaker_timing_sha256
+    ):
+        _fail("speaker_timing_refresh_required")
 
 
 def build_request(
@@ -514,6 +889,8 @@ def build_request(
         keyframes=keyframes,
         upstream_dialogue=frozen.dialogue,
         upstream_dialogue_receipt_sha256=frozen.dialogue_sha256,
+        source_sha256=frozen.source.sha256,
+        source_duration_s=frozen.duration_s,
         cid=cid,
         workdir=workdir,
         client_request_id=client_request_id,
@@ -527,6 +904,127 @@ def build_request(
     )
 
 
+def _speaker_timing_request_authority(
+    multimodal: FrozenProjectMultimodal,
+) -> dict[str, Any]:
+    if multimodal.speaker_timing_production_path is None:
+        if multimodal.source_version != LEGACY_SOURCE_VERSION:
+            _fail("speaker_timing_refresh_required")
+        return {
+            "speaker_timing_authority_version": 0,
+            "speaker_timing_production_required": False,
+            "speaker_timing_legacy_source_version": LEGACY_SOURCE_VERSION,
+            "speaker_timing_legacy_receipt_path": _relative(
+                multimodal.root, multimodal.manifest_path
+            ),
+            "speaker_timing_legacy_receipt_sha256": (
+                multimodal.manifest_sha256
+            ),
+            "speaker_timing_production_path": None,
+            "speaker_timing_production_sha256": None,
+            "speaker_timing_authority_artifacts": (),
+            "speaker_timing_authority_root": None,
+        }
+    receipt = multimodal.speaker_timing_production
+    receipt_data = multimodal.speaker_timing_production_data
+    if not isinstance(receipt, Mapping) or not isinstance(receipt_data, bytes):
+        _fail("speaker_timing_production_authority_invalid")
+    artifacts = receipt.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        _fail("speaker_timing_production_authority_invalid")
+    root = multimodal.root
+    work = multimodal.speaker_timing_production_path.parent
+    frozen: dict[str, str] = {
+        _relative(root, multimodal.speaker_timing_production_path): _sha256(
+            receipt_data
+        ),
+    }
+    role_paths: dict[str, Path] = {}
+    for role in ("producer_input", "raw_output", "skill", "speaker_timing"):
+        artifact = artifacts.get(role)
+        if not isinstance(artifact, Mapping):
+            _fail("speaker_timing_production_authority_invalid")
+        path = _relative_file(
+            root, work, artifact.get("path"),
+            "speaker_timing_production_authority_invalid",
+        )
+        data = _read(path, "speaker_timing_production_authority_invalid")
+        digest = artifact.get("sha256")
+        if digest != _sha256(data):
+            _fail("speaker_timing_production_authority_invalid")
+        relative = _relative(root, path)
+        if relative in frozen and frozen[relative] != digest:
+            _fail("speaker_timing_production_authority_invalid")
+        frozen[relative] = str(digest)
+        role_paths[role] = path
+    producer_input = _json_object(
+        _read(
+            role_paths["producer_input"],
+            "speaker_timing_production_authority_invalid",
+        ),
+        "speaker_timing_production_authority_invalid",
+    )
+    source = producer_input.get("source")
+    source_path = (role_paths["producer_input"].parent.parent / "source.mp4").resolve()
+    try:
+        source_path.relative_to(root)
+    except ValueError:
+        _fail("speaker_timing_production_authority_invalid")
+    source_data = _read(source_path, "speaker_timing_production_authority_invalid")
+    source_digest = source.get("sha256") if isinstance(source, Mapping) else None
+    if source_digest != _sha256(source_data):
+        _fail("speaker_timing_production_authority_invalid")
+    frozen[_relative(root, source_path)] = str(source_digest)
+    evidence: list[object] = []
+    for key in ("frames", "contact_sheets"):
+        values = producer_input.get(key)
+        if not isinstance(values, list):
+            _fail("speaker_timing_production_authority_invalid")
+        evidence.extend(values)
+    persons = producer_input.get("persons")
+    if not isinstance(persons, list):
+        _fail("speaker_timing_production_authority_invalid")
+    for person in persons:
+        refs = person.get("identity_refs") if isinstance(person, Mapping) else None
+        if not isinstance(refs, list):
+            _fail("speaker_timing_production_authority_invalid")
+        evidence.extend(refs)
+    cut_source = producer_input.get("cut_source")
+    if not isinstance(cut_source, Mapping):
+        _fail("speaker_timing_production_authority_invalid")
+    evidence.append(cut_source)
+    for artifact in evidence:
+        if not isinstance(artifact, Mapping):
+            _fail("speaker_timing_production_authority_invalid")
+        path = _relative_file(
+            root, role_paths["producer_input"].parent,
+            artifact.get("path"),
+            "speaker_timing_production_authority_invalid",
+        )
+        data = _read(path, "speaker_timing_production_authority_invalid")
+        digest = artifact.get("sha256")
+        if digest != _sha256(data):
+            _fail("speaker_timing_production_authority_invalid")
+        relative = _relative(root, path)
+        if relative in frozen and frozen[relative] != digest:
+            _fail("speaker_timing_production_authority_invalid")
+        frozen[relative] = str(digest)
+    production_relative = _relative(
+        root, multimodal.speaker_timing_production_path
+    )
+    return {
+        "speaker_timing_authority_version": 1,
+        "speaker_timing_production_required": True,
+        "speaker_timing_legacy_source_version": None,
+        "speaker_timing_legacy_receipt_path": None,
+        "speaker_timing_legacy_receipt_sha256": None,
+        "speaker_timing_production_path": production_relative,
+        "speaker_timing_production_sha256": frozen[production_relative],
+        "speaker_timing_authority_artifacts": tuple(sorted(frozen.items())),
+        "speaker_timing_authority_root": None,
+    }
+
+
 def build_request_from_parts(
     *,
     multimodal: FrozenProjectMultimodal,
@@ -534,6 +1032,8 @@ def build_request_from_parts(
     keyframes: h3.FrozenKeyframes,
     upstream_dialogue: tuple[dict, ...],
     upstream_dialogue_receipt_sha256: str,
+    source_sha256: str,
+    source_duration_s: float,
     cid: str,
     workdir: Path,
     client_request_id: str,
@@ -579,6 +1079,22 @@ def build_request_from_parts(
         prompt=visual_prompt,
         keyframes=keyframes,
     )
+    speaker_timing = None
+    if _plan_has_on_screen_dialogue(multimodal.skill_plan):
+        if multimodal.speaker_timing is None:
+            _fail("speaker_timing_refresh_required")
+        try:
+            speaker_timing = dialogue_timing.freeze_speaker_timing(
+                multimodal.speaker_timing,
+                source_sha256=source_sha256,
+                keyframe_sha256s=tuple(
+                    multimodal.speaker_timing_frame_sha256s
+                    or tuple(_sha256(data) for _path, data in keyframes)
+                ),
+                source_duration_s=source_duration_s,
+            )
+        except dialogue_timing.DialogueTimingError as exc:
+            raise ProjectMultimodalError(exc.code) from None
     try:
         request = request_factory(
             skill_plan=multimodal.skill_plan,
@@ -590,6 +1106,7 @@ def build_request_from_parts(
             upstream_dialogue_content_sha256=h3.canonical_json_sha256(
                 list(upstream_dialogue)
             ),
+            speaker_timing=speaker_timing,
             visual=visual,
             reference_audios=multimodal.reference_audios,
             mode=multimodal.mode,
@@ -603,10 +1120,37 @@ def build_request_from_parts(
             timeouts=timeouts,
             seed=seed,
         )
+    except h3.H3Error:
+        _fail("context_ir_request_authority_mismatch")
     except h3_multimodal.MultimodalContractError as exc:
         raise ProjectMultimodalError(exc.code) from None
     if not isinstance(request, h3.H3Request) or not h3.is_multimodal_request(request):
         _fail("context_ir_request_invalid")
+    try:
+        h3_multimodal.validate_h3_request_authority(
+            request,
+            skill_plan=multimodal.skill_plan,
+            approved_skill_plan_sha256=multimodal.skill_plan_sha256,
+            upstream_dialogue=upstream_dialogue,
+            upstream_dialogue_receipt_sha256=(
+                upstream_dialogue_receipt_sha256
+            ),
+            visual=visual,
+            reference_audios=multimodal.reference_audios,
+            speaker_timing=speaker_timing,
+        )
+    except (h3.H3Error, h3_multimodal.MultimodalContractError) as exc:
+        raise ProjectMultimodalError(
+            getattr(exc, "code", "context_ir_request_authority_mismatch")
+        ) from None
+    if request.on_screen_dialogue:
+        try:
+            request = replace(
+                request, **_speaker_timing_request_authority(multimodal)
+            )
+            h3.validate_request_authority(request)
+        except h3.H3Error as exc:
+            raise ProjectMultimodalError(exc.code) from None
     return request
 
 
@@ -823,6 +1367,47 @@ def _native_segment(
         attempt_id,
         timeline,
     )
+
+
+def validate_dialogue_acceptance(
+    *,
+    request: h3.H3Request,
+    output: Path,
+    timeline: Mapping[str, Any],
+) -> str | None:
+    """Bind independently produced ASR/lip evidence to exact H3 bytes."""
+    on_screen_dialogue = getattr(request, "on_screen_dialogue", ())
+    if not on_screen_dialogue:
+        return None
+    path = request.workdir / FINAL_ACCEPTANCE_FILENAME
+    data = _read(path, "final_dialogue_evidence_missing")
+    artifact = _json_object(data, "final_dialogue_evidence_invalid")
+    try:
+        stat = output.stat()
+        dialogue_timing.validate_final_acceptance(
+            artifact,
+            dialogue=tuple(
+                {
+                    "text": line["text"],
+                    "start_s": line["start_s"],
+                    "end_s": line["end_s"],
+                }
+                for line in on_screen_dialogue
+            ),
+            subjects=tuple(
+                str(line["subject_id"])
+                for line in on_screen_dialogue
+            ),
+            output_sha256=_sha256(output.read_bytes()),
+            output_size=stat.st_size,
+            media_timeline_sha256=h3.canonical_json_sha256(timeline),
+            dialogue_sha256=str(request.upstream_dialogue_receipt_sha256),
+            speaker_timing_sha256=str(request.speaker_timing_sha256),
+        )
+    except (OSError, dialogue_timing.DialogueTimingError) as exc:
+        code = getattr(exc, "code", "final_dialogue_evidence_invalid")
+        _fail(code)
+    return _sha256(data)
 
 
 def stitch_short_native(

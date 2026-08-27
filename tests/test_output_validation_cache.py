@@ -126,6 +126,139 @@ def test_generated_video_validation_cache_ignores_unrelated_files_and_meta(
     assert calls == 1
 
 
+def test_validation_fingerprint_hashes_bound_speaker_timing_raw_bytes(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = _succeeded_conversation(settings)
+    cdir = settings.data_dir / meta["id"]
+    timing = cdir / "work" / "speaker_timing.json"
+    timing.write_bytes(b'{"timing":"aaaa"}')
+    prepared = cdir / "prepared_input.json"
+    receipt = json.loads(prepared.read_text(encoding="utf-8"))
+    receipt["multimodal"] = {
+        "schema": "duet.h3-project-multimodal",
+        "version": 3,
+        "speaker_timing": {
+            "path": "work/speaker_timing.json",
+            "sha256": "expected-bound-sha",
+            "canonical_sha256": "expected-canonical-sha",
+        },
+    }
+    prepared.write_text(json.dumps(receipt), encoding="utf-8")
+
+    before_stat = timing.stat()
+    before = main_module._generated_video_validation_fingerprint(cdir, meta)
+    timing.write_bytes(b'{"timing":"bbbb"}')
+    real_stat = main_module.Path.stat
+
+    def stable_stat(path, *args, **kwargs):
+        if str(path) == str(timing):
+            return before_stat
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(main_module.Path, "stat", stable_stat)
+    after = main_module._generated_video_validation_fingerprint(cdir, meta)
+
+    assert before is not None
+    assert after is not None
+    assert after != before
+
+
+def test_validation_fingerprint_hashes_every_producer_evidence_byte(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = _succeeded_conversation(settings, cid="producer-cache")
+    cdir = settings.data_dir / meta["id"]
+    work = cdir / "work"
+    sample = work / "speaker-visibility-frames" / "000001.png"
+    sample.parent.mkdir(parents=True)
+    sample.write_bytes(b"sample-a")
+    producer_input = work / "speaker_visibility_input.json"
+    producer_input.write_text(json.dumps({
+        "frames": [{
+            "path": "speaker-visibility-frames/000001.png",
+            "sha256": "bound-sample-sha",
+        }],
+        "contact_sheets": [],
+        "persons": [],
+        "cut_source": None,
+    }), encoding="utf-8")
+    raw_output = work / "speaker_visibility_output.json"
+    raw_output.write_bytes(b"raw-output-a")
+    frozen_skill = work / "speaker_visibility_skill.md"
+    frozen_skill.write_bytes(b"skill-a")
+    timing = work / "speaker_timing.json"
+    timing.write_bytes(b"timing-a")
+    production_receipt = work / "speaker_timing_production.json"
+    production_receipt.write_text(json.dumps({
+        "artifacts": {
+            "producer_input": {
+                "path": producer_input.name,
+                "sha256": "bound-input-sha",
+            },
+            "raw_output": {
+                "path": raw_output.name,
+                "sha256": "bound-output-sha",
+            },
+            "skill": {
+                "path": frozen_skill.name,
+                "sha256": "bound-skill-sha",
+            },
+            "speaker_timing": {
+                "path": timing.name,
+                "sha256": "bound-timing-sha",
+                "canonical_sha256": "bound-canonical-sha",
+            },
+        },
+    }), encoding="utf-8")
+    prepared = cdir / "prepared_input.json"
+    receipt = json.loads(prepared.read_text(encoding="utf-8"))
+    receipt["multimodal"] = {
+        "speaker_timing": {
+            "path": "work/speaker_timing.json",
+            "sha256": "bound-timing-sha",
+            "canonical_sha256": "bound-canonical-sha",
+        },
+        "speaker_timing_producer": {
+            "path": "work/speaker_timing_production.json",
+            "sha256": "bound-production-sha",
+            "raw_output_path": raw_output.name,
+            "raw_output_sha256": "bound-output-sha",
+        },
+    }
+    prepared.write_text(json.dumps(receipt), encoding="utf-8")
+    paths = [production_receipt, producer_input, raw_output, frozen_skill, sample]
+    stable_stats = {str(path): path.stat() for path in paths}
+    real_stat = main_module.Path.stat
+
+    def stable_stat(path, *args, **kwargs):
+        return stable_stats.get(str(path), real_stat(path, *args, **kwargs))
+
+    monkeypatch.setattr(main_module.Path, "stat", stable_stat)
+    baseline = main_module._generated_video_validation_fingerprint(cdir, meta)
+    assert baseline is not None
+    replacements = {
+        production_receipt: production_receipt.read_bytes().replace(
+            b"bound-input", b"other-input"
+        ),
+        producer_input: producer_input.read_bytes().replace(
+            b"bound-sample", b"other-sample"
+        ),
+        raw_output: b"raw-output-b",
+        frozen_skill: b"skill-b",
+        sample: b"sample-b",
+    }
+    for path, replacement in replacements.items():
+        original = path.read_bytes()
+        path.write_bytes(replacement)
+        assert main_module._generated_video_validation_fingerprint(
+            cdir, meta
+        ) != baseline
+        path.write_bytes(original)
+
+
 def test_long_video_cache_invalidates_plan_segment_state_and_stitch_artifacts(
     tmp_path, monkeypatch
 ):
