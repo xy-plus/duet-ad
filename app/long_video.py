@@ -343,6 +343,8 @@ def write_plan_receipt(
     segments: Sequence[Mapping],
     workflow: str,
     dialogue_mode: str = "auto",
+    dialogue_delivery: str | None = None,
+    resolved_dialogue_delivery: str | None = None,
 ) -> Path:
     """Write a canonical receipt binding the complete generated long-video plan."""
     root = root.resolve()
@@ -451,6 +453,15 @@ def write_plan_receipt(
         if dialogue_mode not in {"auto", "none"}:
             raise LongVideoError("long_video_plan_invalid_dialogue_mode")
         receipt["dialogue_mode"] = dialogue_mode
+        if (dialogue_delivery is None) != (resolved_dialogue_delivery is None):
+            raise LongVideoError("long_video_plan_invalid_dialogue_delivery")
+        if dialogue_delivery is not None:
+            if dialogue_delivery not in {"auto", "on_screen", "off_screen"}:
+                raise LongVideoError("long_video_plan_invalid_dialogue_delivery")
+            if resolved_dialogue_delivery not in {"on_screen", "off_screen"}:
+                raise LongVideoError("long_video_plan_invalid_dialogue_delivery")
+            receipt["dialogue_delivery"] = dialogue_delivery
+            receipt["resolved_dialogue_delivery"] = resolved_dialogue_delivery
     path = root / PLAN_RECEIPT_FILENAME
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_bytes(_canonical_bytes(receipt))

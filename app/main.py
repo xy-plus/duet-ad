@@ -19,6 +19,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app import (
     context_ir_bridge,
+    dialogue_delivery,
     downloader,
     frame_fit,
     h3,
@@ -721,7 +722,7 @@ def _validate_submit_payload(
 
 def _validate_long_submit_payload(
     meta: dict, payload: dict,
-) -> tuple[str, str, str, str, str, str, bool]:
+) -> tuple[str, str, str, str, str, str, str, bool]:
     if payload.get("confirm") is not True:
         raise _SubmitError(409, "confirmation required")
     allowed = {
@@ -729,8 +730,9 @@ def _validate_long_submit_payload(
         "aspect_ratio", "resolution",
         "expected_plan_receipt",
         "fast_mode",
+        "dialogue_delivery",
     }
-    required = allowed - {"fast_mode"}
+    required = allowed - {"fast_mode", "dialogue_delivery"}
     if not required.issubset(payload) or set(payload) - allowed:
         if "lines" in payload or payload.get("dialogue_mode") in {"edit", "custom"}:
             raise _SubmitError(422, "long_video_audio_mode_unsupported")
@@ -772,6 +774,24 @@ def _validate_long_submit_payload(
         raise _SubmitError(422, "long_video_audio_mode_unsupported")
     if meta.get("voice_mode") != "keep":
         raise _SubmitError(422, "long_video_audio_mode_unsupported")
+    raw_delivery = payload.get("dialogue_delivery")
+    postprocess_receipt = meta.get("_postprocess_receipt")
+    requires_delivery = (
+        dialogue_mode != "none"
+        and isinstance(postprocess_receipt, Mapping)
+        and postprocess_receipt.get("version") == 4
+        and isinstance(postprocess_receipt.get("options"), Mapping)
+        and postprocess_receipt["options"].get("optimize_image") is True
+    )
+    if raw_delivery is None:
+        if requires_delivery:
+            raise _SubmitError(409, "dialogue_delivery_required")
+        requested_delivery = dialogue_delivery.DialogueDelivery.AUTO
+    else:
+        try:
+            requested_delivery = dialogue_delivery.parse(raw_delivery)
+        except ValueError:
+            raise _SubmitError(422, "invalid_dialogue_delivery") from None
     aspect_ratio = payload.get("aspect_ratio")
     if aspect_ratio not in _ASPECT_RATIOS:
         raise _SubmitError(422, "invalid_aspect_ratio")
@@ -797,7 +817,7 @@ def _validate_long_submit_payload(
         raise _SubmitError(422, "invalid_fast_mode")
     return (
         request_id, fit_mode, dialogue_mode, expected, aspect_ratio, resolution,
-        fast_mode,
+        requested_delivery.value, fast_mode,
     )
 
 
@@ -1843,6 +1863,10 @@ def _generated_video_validation_fingerprint(
                 "aspect_ratio": meta.get("aspect_ratio"),
                 "resolution": meta.get("resolution"),
                 "dialogue_mode": meta.get("dialogue_mode"),
+                "dialogue_delivery": meta.get("dialogue_delivery"),
+                "resolved_dialogue_delivery": meta.get(
+                    "resolved_dialogue_delivery"
+                ),
                 "segments": meta.get("segments"),
                 "postprocess": meta.get("postprocess"),
                 "frozen_plan_receipt": meta.get("frozen_plan_receipt"),
@@ -2785,10 +2809,24 @@ def create_app(settings: Settings) -> FastAPI:
                     expected_receipt,
                     aspect_ratio,
                     resolution,
+                    requested_dialogue_delivery,
                     fast_mode,
                 ) = (
                     _validate_long_submit_payload(effective_meta, payload)
                 )
+                requested_delivery = dialogue_delivery.parse(
+                    requested_dialogue_delivery
+                )
+                authoritative_dialogue = tuple(
+                    dict(line)
+                    for segment in effective_meta.get("segments", [])
+                    if isinstance(segment, Mapping)
+                    for line in segment.get("dialogue", [])
+                    if isinstance(line, Mapping)
+                )
+                resolved_dialogue_delivery = dialogue_delivery.resolve(
+                    requested_delivery, authoritative_dialogue
+                ).value
             except _SubmitError as exc:
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             if meta.get("status") != "done":
@@ -2825,6 +2863,7 @@ def create_app(settings: Settings) -> FastAPI:
                             dialogue_mode,
                             aspect_ratio=aspect_ratio,
                             resolution=resolution,
+                            dialogue_delivery=requested_dialogue_delivery,
                             settings=settings,
                         )
                     except long_generation.LongGenerationError as exc:
@@ -2843,10 +2882,17 @@ def create_app(settings: Settings) -> FastAPI:
                             settings.data_dir,
                             cid,
                             dialogue_mode=dialogue_mode,
+                            dialogue_delivery=requested_dialogue_delivery,
+                            resolved_dialogue_delivery=resolved_dialogue_delivery,
                             fit_mode=fit_mode,
                             aspect_ratio=aspect_ratio,
                             resolution=resolution,
                         )
+                        if resolved_dialogue_delivery == "off_screen":
+                            raise HTTPException(
+                                status_code=409,
+                                detail="multimodal_input_refresh_required",
+                            )
                         raise HTTPException(
                             status_code=409,
                             detail={
@@ -2863,6 +2909,10 @@ def create_app(settings: Settings) -> FastAPI:
                     )
                 same_parameters = (
                     meta.get("dialogue_mode") == dialogue_mode
+                    and meta.get("dialogue_delivery", "auto")
+                    == requested_dialogue_delivery
+                    and meta.get("resolved_dialogue_delivery")
+                    in {None, resolved_dialogue_delivery}
                     and meta.get("fit_mode") == fit_mode
                     and meta.get("frozen_plan_receipt") == expected_receipt
                     and _generation_semantics(meta)
@@ -2916,6 +2966,7 @@ def create_app(settings: Settings) -> FastAPI:
                         expected_receipt,
                         fit_mode,
                         dialogue_mode,
+                        dialogue_delivery=requested_dialogue_delivery,
                         aspect_ratio=aspect_ratio,
                         resolution=resolution,
                         prepare_fit=not isinstance(old, dict),
@@ -2999,6 +3050,8 @@ def create_app(settings: Settings) -> FastAPI:
                 )
                 changes = dict(
                     dialogue_mode=dialogue_mode,
+                    dialogue_delivery=requested_dialogue_delivery,
+                    resolved_dialogue_delivery=resolved_dialogue_delivery,
                     voice_lines=[],
                     prepared_dialogue=[],
                     fit_mode=fit_mode,
