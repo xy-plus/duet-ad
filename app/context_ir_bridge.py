@@ -1337,7 +1337,14 @@ def _complete(
             error="context_ir_result_invalid",
         )
         return
-    if not request.dialogue_tokens:
+    has_voice_authority = (
+        request.source_h3_request.audio_required is True
+        and any(
+            audio.purpose == "voice"
+            for audio in request.source_h3_request.reference_audios
+        )
+    )
+    if not request.dialogue_tokens and not has_voice_authority:
         try:
             _speech_contract(effective_prompt, ())
         except ContextIrContractError:

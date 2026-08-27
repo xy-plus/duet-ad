@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 from dataclasses import replace
@@ -173,6 +174,55 @@ def _no_audio_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest
         workflow=h3.H3_WORKFLOW,
         skill_plan_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
         upstream_dialogue_receipt_sha256=UPSTREAM_DIALOGUE_SHA256,
+        context_ir_required=True,
+    )
+    artifact_path, artifact_sha256 = _upstream_artifact(tmp_path)
+    return context_ir_bridge.freeze_context_ir_request(
+        source_h3_request=source,
+        upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
+        upstream_artifact_path=artifact_path,
+        upstream_artifact_sha256=artifact_sha256,
+        upstream_dialogue_sha256_path=("dialogue", "sha256"),
+        source_prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        minimax_api_key="minimax-secret",
+        timeouts=context_ir_bridge.ContextIrTimeouts(
+            request_s=0.1,
+            poll_total_s=0.2,
+            poll_interval_s=0,
+        ),
+    )
+
+
+def _reference_audio_frozen(
+    tmp_path: Path,
+    *,
+    purpose: h3.ReferenceAudioPurpose,
+) -> context_ir_bridge.FrozenContextIrRequest:
+    prompt = (
+        "final fusion visual prompt"
+        "\n<AUDIO_CONTENT_JSON>"
+        '[{"order":1,"text":"first half second half","start_s":0.0,'
+        '"end_s":8.0,"delivery":"off_screen","voice_ref":1}]'
+        "</AUDIO_CONTENT_JSON>"
+    )
+    source = h3.H3Request(
+        cid=f"{purpose}-segment-1",
+        workdir=tmp_path / f"{purpose}-segment-1",
+        client_request_id=f"{purpose}-h3-request-1",
+        prompt=prompt,
+        keyframes=((Path("01.png"), b"reference-frame-one"),),
+        voice_texts=(),
+        voice_receipt=h3.voice_texts_receipt(()),
+        duration=8,
+        autodl_token="autodl-secret",
+        workflow=h3.H3_MULTIMODAL_WORKFLOW,
+        reference_audios=(
+            _audio(tmp_path / f"{purpose}.wav", 1, purpose),
+        ),
+        skill_plan_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        multimodal_compiler_version="video-prompt-fusion-v1",
+        upstream_dialogue_receipt_sha256=UPSTREAM_DIALOGUE_SHA256,
+        audio_required=True,
         context_ir_required=True,
     )
     artifact_path, artifact_sha256 = _upstream_artifact(tmp_path)
@@ -738,27 +788,7 @@ def test_upstream_dialogue_receipt_is_required_and_frozen_into_final_receipt(tmp
 
 
 def test_dialogue_none_rejects_any_context_ir_speech(tmp_path):
-    source, _plan_value = _source_request(tmp_path)
-    source = replace(
-        source,
-        prompt="references and visual semantics only; no speech events.",
-        voice_texts=(),
-        voice_receipt=h3.voice_texts_receipt(()),
-        workdir=tmp_path / "none-segment",
-    )
-    artifact_path, artifact_sha256 = _upstream_artifact(tmp_path)
-    frozen = context_ir_bridge.freeze_context_ir_request(
-        source_h3_request=source,
-        upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
-        upstream_artifact_path=artifact_path,
-        upstream_artifact_sha256=artifact_sha256,
-        upstream_dialogue_sha256_path=("dialogue", "sha256"),
-        source_prompt_sha256=hashlib.sha256(source.prompt.encode()).hexdigest(),
-        minimax_api_key="minimax-secret",
-        timeouts=context_ir_bridge.ContextIrTimeouts(
-            request_s=0.1, poll_total_s=0.2, poll_interval_s=0
-        ),
-    )
+    frozen = _no_audio_frozen(tmp_path)
     with _client(
         _success_handler(
             frozen,
@@ -768,7 +798,161 @@ def test_dialogue_none_rejects_any_context_ir_speech(tmp_path):
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
     assert result.status == "failed"
     assert result.error_code == "context_ir_semantic_mismatch"
-    assert not (source.workdir / ".h3").exists()
+    assert not (frozen.workdir / ".h3").exists()
+
+
+def test_receipt_bound_voice_allows_context_to_split_off_screen_dialogue(tmp_path):
+    frozen = _reference_audio_frozen(tmp_path, purpose="voice")
+    effective = (
+        "final effective visual prompt; off-screen singer uses <Audio 1>.\n"
+        "<d>[English]first half</d>\n"
+        "the same off-screen singer continues from <Audio 1>.\n"
+        "<d>[English]second half</d>"
+    )
+    with _client(
+        _success_handler(frozen, effective_prompt=effective)
+    ) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "succeeded"
+    assert result.effective_prompt == effective
+    assert result.receipt_path is not None and result.receipt_path.is_file()
+
+
+@pytest.mark.parametrize("purpose", ["ambience", "effect"])
+def test_non_voice_audio_does_not_disable_zero_speech_gate(tmp_path, purpose):
+    frozen = _reference_audio_frozen(tmp_path, purpose=purpose)
+    effective = frozen.source_prompt + "\n<d>[English]invented speech</d>"
+    with _client(
+        _success_handler(frozen, effective_prompt=effective)
+    ) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "failed"
+    assert result.error_code == "context_ir_semantic_mismatch"
+    assert not (frozen.workdir / ".h3").exists()
+
+
+def test_voice_object_without_audio_required_does_not_disable_zero_speech_gate(
+    tmp_path,
+):
+    frozen = _reference_audio_frozen(tmp_path, purpose="voice")
+    source_without_audio_authority = copy.copy(frozen.source_h3_request)
+    object.__setattr__(source_without_audio_authority, "audio_required", False)
+    forged = replace(
+        frozen,
+        source_h3_request=source_without_audio_authority,
+    )
+    attempt_path = tmp_path / "forged-attempt" / "attempt.json"
+    attempt_path.parent.mkdir()
+    state: dict = {}
+
+    context_ir_bridge._complete(
+        forged,
+        state,
+        attempt_path,
+        "<d>[English]invented speech</d>",
+    )
+
+    assert state == {
+        "status": "failed",
+        "error": "context_ir_semantic_mismatch",
+    }
+    assert not (frozen.workdir / ".h3").exists()
+
+
+@pytest.mark.parametrize("drift", ["purpose", "hash", "order"])
+def test_receipt_bound_voice_authority_drift_fails_before_network(tmp_path, drift):
+    frozen = _reference_audio_frozen(tmp_path, purpose="voice")
+    if drift == "purpose":
+        audio = frozen.source_h3_request.reference_audios[0]
+        changed_source = replace(
+            frozen.source_h3_request,
+            reference_audios=(replace(audio, purpose="ambience"),),
+        )
+        changed = replace(frozen, source_h3_request=changed_source)
+    elif drift == "hash":
+        audio_index = next(
+            index
+            for index, reference in enumerate(frozen.references)
+            if reference.role == "reference_audio"
+        )
+        changed_references = list(frozen.references)
+        changed_references[audio_index] = replace(
+            changed_references[audio_index], sha256="0" * 64,
+        )
+        changed = replace(frozen, references=tuple(changed_references))
+    else:
+        audio_index = next(
+            index
+            for index, reference in enumerate(frozen.references)
+            if reference.role == "reference_audio"
+        )
+        changed_references = list(frozen.references)
+        changed_references[audio_index] = replace(
+            changed_references[audio_index], order=2,
+        )
+        changed = replace(frozen, references=tuple(changed_references))
+
+    with _client(
+        lambda request: pytest.fail(f"must not access network: {request}")
+    ) as client:
+        with pytest.raises((h3.H3Error, context_ir_bridge.ContextIrReceiptError)):
+            context_ir_bridge.optimize_h3_prompt(changed, client=client)
+
+
+def test_semantic_mismatch_voice_task_recovers_by_get_only_and_writes_receipt(
+    tmp_path,
+):
+    frozen = _reference_audio_frozen(tmp_path, purpose="voice")
+    initial_calls: list[httpx.Request] = []
+    base = _success_handler(frozen, requests=initial_calls)
+
+    def query_unknown(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/query/video_generation/context-task-1":
+            initial_calls.append(request)
+            raise httpx.ReadTimeout("ambiguous query", request=request)
+        return base(request)
+
+    with _client(query_unknown) as client:
+        first = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+    assert first.status == "query_unknown"
+    assert first.provider_task_id == "context-task-1"
+
+    attempt_path = (
+        frozen.workdir
+        / ".context-ir" / "attempts" / "000001" / "attempt.json"
+    )
+    state = json.loads(attempt_path.read_text(encoding="utf-8"))
+    state["status"] = "failed"
+    state["error"] = "context_ir_semantic_mismatch"
+    attempt_path.write_text(
+        json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    effective = (
+        "final effective visual prompt; off-screen singer uses <Audio 1>.\n"
+        "<d>[English]first half</d>\n"
+        "<d>[English]second half</d>"
+    )
+    resumed_calls: list[httpx.Request] = []
+    with _client(
+        _success_handler(
+            frozen,
+            effective_prompt=effective,
+            requests=resumed_calls,
+        )
+    ) as client:
+        recovered = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert recovered.status == "succeeded"
+    assert recovered.effective_prompt == effective
+    assert recovered.receipt_path is not None
+    assert recovered.receipt_path.is_file()
+    assert [(call.method, call.url.path) for call in resumed_calls] == [
+        ("GET", "/v2/query/video_generation/context-task-1")
+    ]
 
 
 def test_loaded_receipt_cannot_be_used_after_receipt_file_tampering(tmp_path):
