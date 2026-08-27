@@ -95,6 +95,10 @@ def _plan() -> dict:
                             "object_id": "PERSON_01",
                         }],
                     },
+                    "dominant_palette_contract": {
+                        "area_weighted_warm_cool_family": "balanced",
+                        "saturation_style": "natural",
+                    },
                 },
                 {
                     "frame_index": 2,
@@ -114,6 +118,10 @@ def _plan() -> dict:
                             "predicate": "contacts",
                             "object_id": "PERSON_01",
                         }],
+                    },
+                    "dominant_palette_contract": {
+                        "area_weighted_warm_cool_family": "balanced",
+                        "saturation_style": "natural",
                     },
                 },
             ],
