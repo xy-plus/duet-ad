@@ -39,6 +39,7 @@ links: [conversation-task, result-display]
 - `scene_plans` 对全部段无重叠全覆盖；每个所属段必须同时改变环境语义、可见形状与空间结构、纵深、空间布局和局部材质/固有色。纯调色、纯纹理、只换材质或原结构换皮均不算换景。
 - source identity、source scene 和 source reference 只作定位旧设计及验收其消失的负样本证据，不能成为 target pack；人物/场景目标由 frozen plan 的 replacement 与变化字段定义。后端继续绑定对应帧 SHA、模型、profile、revision 和 plan SHA。
 - 所有段固定保持画幅、裁切、机位、镜头、透视、构图、焦点、景深及全局光源方向、曝光、白平衡/CCT、tone curve。目标局部固有色按计划变化，新几何只产生物理正确的局部阴影和反射；交互、接触、持握、支撑、遮挡、前后顺序、视线、姿态、动作目的、数量、尺度与叙事关系不可破坏。
+- 人物和场景目标包生成后、任何逐帧付费 POST 前，同一 Skill 执行 `phase=verify_pack`：每个人物验身份变更、旧身份消失、双视图一致和局部颜色；每个场景验语义、几何、纵深、布局和局部颜色；项目级验全局光向、曝光、白平衡/CCT 和 tone curve。这一阶段只做语义判定，任一 `fail/unknown` 均 fail closed。
 - 生成结果进入 H3 前，同一 Skill 执行 `phase=verify`：逐人物、逐可观察帧验证新身份和源身份消失；逐场景、逐所属段验证五类真实变化；再验证相机、全局光色、可见关系及连续性。任何 `fail/unknown` 都使 `passed=false` 且不发布。
 - 每个付费 POST 前持久化私有 receipt。只有完整 HTTP 429、`success=false`、精确 `RequestLimitExceeded` 时，才按 `AUTO_RETRY_COUNT/AUTO_RETRY_INTERVAL_S` 自动退避并追加新 attempt；网络异常、5xx、无效/不完整响应仍视为结果未知并禁止重发。已收到成功响应但下载失败时只恢复 GET。MediaKit WebP 结果经解码、尺寸校验和 PNG 转码后才进入 `frames`。
 - Seedream 每帧总计最多 3 次 POST，且只有完整 HTTP 429、精确 `QuotaExceeded`、响应无 `data` 才自动重试；网络/超时/取消一律记为 `submission_unknown`。重启只恢复可证明安全的本地阶段，不自动重发未知 POST。
