@@ -68,6 +68,7 @@ interface ApiController {
   submit?: (route: Route, id: string, controller: ApiController) => Promise<void>;
   postprocess?: (route: Route, id: string, controller: ApiController) => Promise<void>;
   retryPostprocessSegment?: (route: Route, id: string, index: number, controller: ApiController) => Promise<void>;
+  acceptImages?: (route: Route, id: string, controller: ApiController) => Promise<void>;
 }
 
 async function installApi(page: Page, controller: ApiController) {
@@ -117,6 +118,11 @@ async function installApi(page: Page, controller: ApiController) {
     const retrySegmentMatch = path.match(/^\/api\/conversations\/([^/]+)\/postprocess\/segments\/(\d+)\/retry$/u);
     if (retrySegmentMatch && method === 'POST' && controller.retryPostprocessSegment) {
       await controller.retryPostprocessSegment(route, decodeURIComponent(retrySegmentMatch[1]), Number(retrySegmentMatch[2]), controller);
+      return;
+    }
+    const imageAcceptanceMatch = path.match(/^\/api\/conversations\/([^/]+)\/image-acceptance$/u);
+    if (imageAcceptanceMatch && method === 'POST' && controller.acceptImages) {
+      await controller.acceptImages(route, decodeURIComponent(imageAcceptanceMatch[1]), controller);
       return;
     }
     const detailMatch = path.match(/^\/api\/conversations\/([^/]+)$/u);
@@ -517,6 +523,147 @@ test('final generation is gated by complete postprocess segment evidence', async
     '/api/conversations/done/submit',
     '/api/conversations/absent/submit',
   ]);
+});
+
+test('accepts the exact optimized-image version before enabling final generation', async ({ page }) => {
+  const expectedMeta = 'd'.repeat(64);
+  const candidate = detail('image-acceptance-required', {
+    title: '等待确认优化图',
+    keyframes: ['one.png'],
+    postprocess: {
+      status: 'done',
+      options: { remove_subtitle: true, remove_brand: true, optimize_image: true },
+      frames: ['one.png'],
+      error: null,
+      segments: [{
+        index: 0, status: 'done', stage: 'done', completed_frames: 1,
+        total_frames: 1, revision: 1, error: null,
+      }],
+    },
+    image_acceptance: { required: true, accepted: false, expected_meta_sha256: expectedMeta },
+  });
+  const controller: ApiController = {
+    details: { 'image-acceptance-required': candidate },
+    order: ['image-acceptance-required'],
+    requests: [],
+    acceptImages: async (route, id, current) => {
+      current.details[id] = {
+        ...current.details[id],
+        image_acceptance: { required: true, accepted: true, expected_meta_sha256: expectedMeta },
+      };
+      await route.fulfill({
+        json: { required: true, accepted: true, expected_meta_sha256: expectedMeta },
+      });
+    },
+  };
+  await installApi(page, controller);
+  await login(page);
+
+  await expect(page.getByText('请先确认使用当前优化图，再生成视频')).toBeVisible();
+  await expect(page.getByRole('button', { name: '确认生成' })).toHaveCount(0);
+  await page.getByRole('button', { name: '确认使用当前优化图生成视频' }).click();
+  await expect(page.getByText('已确认使用当前优化图生成视频')).toBeVisible();
+  await expect(page.getByRole('button', { name: '确认生成' })).toBeVisible();
+
+  const acceptancePosts = controller.requests.filter(({ method, path }) => (
+    method === 'POST' && path.endsWith('/image-acceptance')
+  ));
+  expect(acceptancePosts).toHaveLength(1);
+  expect(JSON.parse(acceptancePosts[0].body ?? '{}')).toEqual({
+    confirm: true,
+    expected_meta_sha256: expectedMeta,
+  });
+});
+
+test('image acceptance CAS conflict warns once and never resubmits automatically', async ({ page }) => {
+  const expectedMeta = 'e'.repeat(64);
+  const candidate = detail('image-acceptance-conflict', {
+    title: '优化图版本冲突',
+    keyframes: ['one.png'],
+    postprocess: {
+      status: 'done',
+      options: { remove_subtitle: false, remove_brand: false, optimize_image: true },
+      frames: ['one.png'],
+      error: null,
+      segments: [{
+        index: 0, status: 'done', stage: 'done', completed_frames: 1,
+        total_frames: 1, revision: 2, error: null,
+      }],
+    },
+    image_acceptance: { required: true, accepted: false, expected_meta_sha256: expectedMeta },
+  });
+  const controller: ApiController = {
+    details: { 'image-acceptance-conflict': candidate },
+    order: ['image-acceptance-conflict'],
+    requests: [],
+    acceptImages: async (route) => route.fulfill({
+      status: 409,
+      json: { detail: 'image_acceptance_changed' },
+    }),
+  };
+  await installApi(page, controller);
+  await login(page);
+
+  await page.getByRole('button', { name: '确认使用当前优化图生成视频' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: '优化图版本已变化，请刷新后重新确认。' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '确认生成' })).toHaveCount(0);
+  await page.waitForTimeout(300);
+  expect(controller.requests.filter(({ method, path }) => (
+    method === 'POST' && path.endsWith('/image-acceptance')
+  ))).toHaveLength(1);
+});
+
+test('generation evidence freezes image acceptance and postprocess controls', async ({ page }) => {
+  const candidate = detail('generation-freezes-inputs', {
+    title: '生成后冻结上游',
+    generation: {
+      status: 'running', stage: 'h3', client_request_id: 'generation-freezes-inputs-request',
+      segments: [],
+    },
+    fit_mode: 'none',
+    postprocess: null,
+    image_acceptance: {
+      required: true, accepted: false, expected_meta_sha256: 'f'.repeat(64),
+    },
+  });
+  const controller: ApiController = {
+    details: { 'generation-freezes-inputs': candidate },
+    order: ['generation-freezes-inputs'],
+    requests: [],
+  };
+  await installApi(page, controller);
+  await login(page);
+
+  await expect(page.getByText('生成进行中')).toBeVisible();
+  await expect(page.getByRole('button', { name: '确认使用当前优化图生成视频' })).toHaveCount(0);
+  await expect(page.getByText('是否优化素材？')).toHaveCount(0);
+  await expect(page.getByRole('checkbox', { name: /移除文字|移除常见|进行图片优化/u })).toHaveCount(0);
+});
+
+test('has_video renders authenticated source and final videos together', async ({ page }) => {
+  const candidate = detail('final-video-visible', {
+    title: '最终视频可见',
+    has_source: true,
+    has_video: true,
+    fit_mode: 'none',
+    generation: {
+      status: 'succeeded', stage: 'done', client_request_id: 'final-video-request', segments: [],
+    },
+    image_acceptance: { required: false, accepted: false, expected_meta_sha256: null },
+  });
+  const controller: ApiController = {
+    details: { 'final-video-visible': candidate },
+    order: ['final-video-visible'],
+    requests: [],
+  };
+  await installApi(page, controller);
+  await login(page);
+
+  await expect(page.getByLabel('源视频')).toBeVisible();
+  await expect(page.getByLabel('最终成片')).toBeVisible();
+  await expect.poll(() => controller.requests.some(({ method, path }) => (
+    method === 'GET' && path.endsWith('/files/generated.mp4')
+  ))).toBe(true);
 });
 
 test('image optimization uses CAS and dirty navigation requires an explicit decision', async ({ page }) => {
