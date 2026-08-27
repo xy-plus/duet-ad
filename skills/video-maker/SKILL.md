@@ -152,6 +152,7 @@ NonNegativeInt = 大于等于 0 的整数
 Int1 = 从 1 开始的整数
 SegmentIndex = NonNegativeInt
 NonEmpty = 非空字符串
+TimeBase = { numerator: Int1; denominator: Int1 }
 
 ReconcileInput = {
   version: 1;
@@ -169,7 +170,7 @@ ReconcileInput = {
     frame_index: Int1;
     source_file: NonEmpty;
     source_pts: Integer;
-    source_time_base: NonEmpty;
+    source_time_base: TimeBase;
     source_frame_sha256: Sha256;
     optimized_file: NonEmpty;
     optimized_image_sha256: Sha256;
@@ -180,7 +181,7 @@ ReconcileInput = {
 }
 ```
 
-数组按 `(segment_index, frame_index)` 升序，必须与原始帧 manifest、canonical 计划、通过的 image verification 和已选输出 receipt 一一覆盖且哈希互相闭合。`source_pts` 是未换算的源时间戳整数，`source_time_base` 是规约后的正整数分数；禁止换算为毫秒后再写回。只接受 verification 已整体通过的输入：output receipt 只绑定 image plan、源帧和优化图；后产生的 image verification receipt 绑定完整且有序的 output receipt SHA 集合，并逐字绑定同一 `image_plan_sha256`。
+数组按 `(segment_index, frame_index)` 升序，必须与原始帧 manifest、canonical 计划、通过的 image verification 和已选输出 receipt 一一覆盖且哈希互相闭合。`source_pts` 是未换算的源时间戳整数；`source_time_base` 恰含互质的正整数 `numerator/denominator`，禁止使用浮点、字符串或换算为毫秒后再写回。只接受 verification 已整体通过的输入：output receipt 只绑定 image plan、源帧和优化图；后产生的 image verification receipt 绑定完整且有序的 output receipt SHA 集合，并逐字绑定同一 `image_plan_sha256`。
 
 ### 事实权威
 
@@ -229,7 +230,7 @@ Plan = {
     frame_index: Int1;
     source_frame_sha256: Sha256;
     source_pts: Integer;
-    source_time_base: NonEmpty;
+    source_time_base: TimeBase;
     optimized_image_sha256: Sha256;
     output_receipt_sha256: Sha256;
   }>;
@@ -242,7 +243,7 @@ Plan = {
     entity_refs: Array<{ frame_index: Int1; entity_id: EntityId }>;
     action: { initial_state: NonEmpty; motion: NonEmpty; result_state: NonEmpty };
     camera: { shot_scale: NonEmpty; angle: NonEmpty; movement: NonEmpty; composition: NonEmpty; focus: NonEmpty };
-    timing: { start_source_pts: Integer; end_source_pts: Integer; source_time_base: NonEmpty; pace: NonEmpty; transition: NonEmpty };
+    timing: { start_source_pts: Integer; end_source_pts: Integer; source_time_base: TimeBase; pace: NonEmpty; transition: NonEmpty };
   }>;
   conflicts: [];
 }

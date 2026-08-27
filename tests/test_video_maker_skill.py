@@ -134,7 +134,9 @@ def test_reconcile_emits_exact_unified_visual_ir_with_receipt_bindings():
         "output_receipt_sha256",
         "action: { initial_state: NonEmpty; motion: NonEmpty; result_state: NonEmpty }",
         "camera: { shot_scale: NonEmpty; angle: NonEmpty; movement: NonEmpty; composition: NonEmpty; focus: NonEmpty }",
-        "timing: { start_source_pts: Integer; end_source_pts: Integer; source_time_base: NonEmpty; pace: NonEmpty; transition: NonEmpty }",
+        "TimeBase = { numerator: Int1; denominator: Int1 }",
+        "source_time_base: TimeBase",
+        "timing: { start_source_pts: Integer; end_source_pts: Integer; source_time_base: TimeBase; pace: NonEmpty; transition: NonEmpty }",
         '"eligible": true',
         '"reason": null',
         '"conflicts": []',
@@ -191,7 +193,7 @@ def test_reconcile_preserves_exact_source_pts_and_has_no_circular_output_receipt
 
     for required in (
         "source_pts: Integer",
-        "source_time_base: NonEmpty",
+        "source_time_base: TimeBase",
         "起止 PTS 必须逐字取自首尾 frame_refs",
         "image verification receipt 绑定完整且有序的 output receipt SHA 集合",
         "output receipt 只绑定 image plan、源帧和优化图",
@@ -201,6 +203,7 @@ def test_reconcile_preserves_exact_source_pts_and_has_no_circular_output_receipt
         "source_pts_ms",
         "start_pts_ms",
         "end_pts_ms",
+        "source_time_base: NonEmpty",
         "output receipt 逐字绑定同一 `image_verification_sha256`",
     ):
         assert lossy_or_circular not in reconcile
