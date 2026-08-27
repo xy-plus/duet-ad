@@ -218,6 +218,30 @@ def test_skill_is_one_concise_plan_and_verify_skill():
     assert "work/image_verification.json" in skill
 
 
+def test_verification_skill_path_is_strict_regular_non_symlink(tmp_path, monkeypatch):
+    path = image_optimization.verification_skill_path()
+    assert path == path.resolve(strict=True)
+    assert path.is_file() and not path.is_symlink()
+
+    target = tmp_path / "skill.md"
+    target.write_text("x", encoding="utf-8")
+    link = tmp_path / "linked-skill.md"
+    link.symlink_to(target)
+    monkeypatch.setattr(image_optimization, "_SKILL", link)
+    with pytest.raises(ValueError, match="verification skill"):
+        image_optimization.verification_skill_path()
+
+
+def test_public_plan_canonicalizer_is_authoritative_and_returns_a_copy():
+    source = _plan()
+    canonical = image_optimization.canonical_plan_v2(
+        source, segment_indices=[1, 2], frame_counts={1: 1, 2: 1}
+    )
+    assert canonical == source
+    canonical["person_plans"][0]["replacement_identity"] = "mutated"
+    assert source["person_plans"][0]["replacement_identity"] != "mutated"
+
+
 def test_plan_phase_returns_v2_plan_and_compiled_dual_target_prompts(tmp_path):
     session = tmp_path / "session"
     runner = _Runner(_plan())
