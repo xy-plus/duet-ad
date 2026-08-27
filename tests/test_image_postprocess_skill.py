@@ -979,6 +979,33 @@ def test_skill_preflights_backend_exact_fields_and_current_frame_evidence():
         assert rule in human
 
 
+def test_skill_requires_current_frame_visible_coverage_closure():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    for rule in (
+        "人体、面部拓扑、服装边界与裁切碎片形成闭包",
+        "`contacts/occludes` 组合表达",
+        "不得遗漏其接触、遮挡或进入关系",
+        "不同边界、法向、深度层或支撑链的物理面不得合并",
+        "source-visible entity/relationship coverage closure",
+        "任何未归属可见像素区域或缺关系都输出空计划",
+    ):
+        assert rule in skill
+
+    for rule in (
+        "人体、面部拓扑、服装边界与裁切碎片形成闭包",
+        "contacts/occludes 组合表达",
+        "不得遗漏其接触、遮挡或进入关系",
+        "不同边界、法向、深度层或支撑链的物理面不得合并",
+        "source-visible entity/relationship coverage closure",
+        "任何未归属可见像素区域或缺关系都输出空计划",
+    ):
+        assert rule in human
+
+
 def _plan_v3() -> dict:
     plan = _plan([0])
     plan["version"] = 3
