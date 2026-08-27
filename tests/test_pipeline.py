@@ -363,8 +363,9 @@ def test_v4_plan_input_receives_backend_transition_skeleton_before_codex(tmp_pat
 
 
 @pytest.mark.parametrize("eligible", [False, True])
-def test_v4_plan_protocol_error_gets_one_bounded_replan(
-    tmp_path, monkeypatch, eligible,
+@pytest.mark.parametrize("model_recovers", [True, False])
+def test_v4_plan_protocol_error_replans_then_uses_backend_fallback(
+    tmp_path, monkeypatch, eligible, model_recovers,
 ):
     settings = make_settings(tmp_path, retry_count=1, retry_interval_s=0)
     keyframes = tmp_path / "keyframes"
@@ -413,7 +414,10 @@ def test_v4_plan_protocol_error_gets_one_bounded_replan(
             self.calls += 1
             output = Path(workdir) / "work" / "image_optimization.json"
             output.write_text(
-                json.dumps(refusal if self.calls == 1 else valid), encoding="utf-8",
+                json.dumps(
+                    valid if model_recovers and self.calls == 2 else refusal
+                ),
+                encoding="utf-8",
             )
 
     runner = Runner()
@@ -439,6 +443,16 @@ def test_v4_plan_protocol_error_gets_one_bounded_replan(
     assert runner.calls == 2
     assert plan["version"] == 4
     assert list(prompts) == [0]
+    if model_recovers:
+        assert plan["person_plans"]
+    else:
+        assert plan["person_plans"] == []
+        assert plan["segments"][0]["persons"] == []
+        assert plan["scene_plans"][0]["segments"] == [0]
+        assert plan["scene_plans"][0]["continuity_graph"]["views"][0][
+            "transition_from_previous"
+        ] == skeleton[0]["source_transition_from_previous"]
+        assert "不得新增、删除或替换" in prompts[0][1]
 
 
 def test_v4_pipeline_freezes_authoritative_transitions_and_anchor_schedule(tmp_path):
@@ -2074,7 +2088,7 @@ def test_short_v3_freezes_a_complete_frame_bound_prompt_receipt(
     ]
 
 
-def test_short_v3_pipeline_e2e_sends_each_source_frame_its_own_prompt(
+def test_short_pipeline_invalid_plan_falls_back_and_reaches_seedream(
     tmp_path, video_1s, monkeypatch
 ):
     monkeypatch.setenv("ARK_API_KEY", "test-key")
@@ -2117,7 +2131,14 @@ def test_short_v3_pipeline_e2e_sends_each_source_frame_its_own_prompt(
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done", stored.get("error")
     frozen = stored["_image_optimization"]
-    assert frozen["version"] == 3
+    assert frozen["version"] == 4
+    assert [
+        view["transition_from_previous"]
+        for view in stored["_image_continuity"]["scene_plans"][0][
+            "continuity_graph"
+        ]["views"]
+    ] == ["start", "same_camera"]
+    assert stored["_image_continuity"]["person_plans"] == []
     source_sha256s = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted((settings.data_dir / meta["id"] / "work" / "keyframes").glob("*.png"))
@@ -2142,21 +2163,7 @@ def test_short_v3_pipeline_e2e_sends_each_source_frame_its_own_prompt(
         )
 
     monkeypatch.setattr(postprocess.seedream, "edit", capture_edit)
-    class PassingAuditRunner:
-        def run_isolated(self, *_args, **_kwargs):
-            return None
-
-    passing_audit_runner = PassingAuditRunner()
-    monkeypatch.setattr(
-        postprocess.image_optimization,
-        "generate_plan_audit_verdict",
-        lambda *_args, **_kwargs: {"passed": True},
-    )
-    monkeypatch.setattr(
-        postprocess.image_optimization,
-        "generate_project_verdict",
-        lambda *_args, **_kwargs: {"passed": True},
-    )
+    passing_audit_runner = object()
     asyncio.run(postprocess.start(
         settings,
         meta["id"],
@@ -2173,11 +2180,10 @@ def test_short_v3_pipeline_e2e_sends_each_source_frame_its_own_prompt(
         verification_runner=passing_audit_runner,
     ))
 
-    assert len(captured) == 2
+    assert len(captured) == 3
     prompts = [body["prompt"] for body in captured]
-    assert any("frame 1 visible body parts" in prompt for prompt in prompts)
-    assert any("frame 2 visible body parts" in prompt for prompt in prompts)
-    assert all(len(body["image"]) == 1 for body in captured)
+    assert all("统一、真实且明显不同的新环境" in prompt for prompt in prompts)
+    assert [len(body["image"]) for body in captured] == [1, 2, 2]
     assert storage.load_meta(settings.data_dir, meta["id"])["postprocess"]["status"] == "done"
 
 

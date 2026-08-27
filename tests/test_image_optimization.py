@@ -1615,9 +1615,8 @@ def _freeze_v4_image_optimization(settings, cid: str, plan: dict) -> None:
     )
 
 
-@pytest.mark.parametrize("acceptance", ["verify", "unavailable"])
-def test_v4_quality_skill_observes_but_cannot_block_generation_or_web_publish(
-    tmp_path, monkeypatch, acceptance,
+def test_v4_plan_skill_is_never_called_after_generation_or_before_web_publish(
+    tmp_path, monkeypatch,
 ):
     monkeypatch.setenv("ARK_API_KEY", "test-key")
     settings = make_settings(tmp_path, retry_interval_s=0)
@@ -1641,6 +1640,18 @@ def test_v4_quality_skill_observes_but_cannot_block_generation_or_web_publish(
         receipt_path.write_text("{}", encoding="utf-8")
 
     monkeypatch.setattr(postprocess.seedream, "edit", edit)
+    for name in (
+        "generate_plan_audit_verdict",
+        "generate_reference_pack_verdict",
+        "generate_project_verdict",
+    ):
+        monkeypatch.setattr(
+            postprocess.image_optimization,
+            name,
+            lambda *_args, **_kwargs: pytest.fail(
+                "plan-only image Skill must not run during generation"
+            ),
+        )
     asyncio.run(postprocess.start(
         settings, cid,
         {"confirm": True, "options": {
@@ -1648,20 +1659,17 @@ def test_v4_quality_skill_observes_but_cannot_block_generation_or_web_publish(
         }},
         {},
     ))
-    runner = _V4LifecycleRunner(acceptance)
+    runner = _V4LifecycleRunner("verify")
     asyncio.run(postprocess.run_task(
         settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
         audit_runner=runner, verification_runner=runner,
     ))
 
     latest = storage.load_meta(settings.data_dir, cid)
-    assert runner.phases == ["verify"]
+    assert runner.phases == []
     assert len(posts) == 3
     assert latest["postprocess"]["status"] == "done"
-    if acceptance == "verify":
-        assert latest["_image_verification"]["verdict"]["passed"] is False
-    else:
-        assert "_image_verification" not in latest
+    assert "_image_verification" not in latest
     with TestClient(create_app(settings)) as client:
         response = client.get(
             f"/api/conversations/{cid}/files/postprocessed/01.png", headers=AUTH,
@@ -1681,18 +1689,27 @@ def test_v4_single_frame_valid_input_reaches_anchor_generation_without_quality_p
     settings = make_settings(tmp_path, retry_interval_s=0)
     cid = _done(settings)
     cdir = settings.data_dir / cid
-    plan = _v4_frame_bound_plan()
-    plan["person_plans"] = []
-    plan["segments"][0]["persons"] = []
-    plan["segments"][0]["frame_constraints"] = plan["segments"][0][
-        "frame_constraints"
-    ][:1]
-    plan["segments"][0]["frame_constraints"][0]["non_person_entity_ledger"] = {
-        "entities": [], "relations": [],
-    }
-    plan["scene_plans"][0]["continuity_graph"]["views"] = plan[
-        "scene_plans"
-    ][0]["continuity_graph"]["views"][:1]
+    source = cdir / "work" / "keyframes" / "01.png"
+    plan, prompts = image_optimization.generic_project_prompts(
+        [{
+            "index": 0,
+            "chain_id": "short-000",
+            "join_mode": "hard_cut",
+            "keyframes_dir": source.parent,
+            "transition_skeleton": [{
+                "segment_index": 0,
+                "frame_index": 1,
+                "frame_name": "01.png",
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "source_transition_from_previous": "start",
+                "source_transition_evidence_sha256": "a" * 64,
+            }],
+        }],
+        settings.seedream_edit_mode,
+        session_dir=cdir,
+    )
+    assert plan["person_plans"] == []
+    assert "不得新增、删除或替换" in prompts[0][1]
     _freeze_v4_image_optimization(settings, cid, plan)
     posts = []
 
@@ -1718,15 +1735,15 @@ def test_v4_single_frame_valid_input_reaches_anchor_generation_without_quality_p
     ))
 
     latest = storage.load_meta(settings.data_dir, cid)
-    assert runner.phases == ["verify"]
-    assert runner.verification_error is None
+    assert runner.phases == []
     assert len(posts) == 2
     assert latest["postprocess"]["status"] == "done"
-    assert latest["_image_verification"]["verdict"]["passed"] is True
-    assert postprocess.generation_keyframes(
-        cdir, latest, [cdir / "work" / "keyframes" / "01.png"],
-        settings=settings,
-    ) == [cdir / "work" / "postprocessed" / "01.png"]
+    assert "_image_verification" not in latest
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, latest, [cdir / "work" / "keyframes" / "01.png"],
+            settings=settings,
+        )
 
 
 def test_v3_failed_quality_acceptance_publishes_but_remains_blocked_from_h3(
@@ -1764,7 +1781,8 @@ def test_v3_failed_quality_acceptance_publishes_but_remains_blocked_from_h3(
     latest = storage.load_meta(settings.data_dir, cid)
     assert len(posts) == 2
     assert latest["postprocess"]["status"] == "done"
-    assert latest["_image_verification"]["verdict"]["passed"] is False
+    assert runner.calls == 0
+    assert "_image_verification" not in latest
     with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
         postprocess.generation_keyframes(
             cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
@@ -1807,9 +1825,8 @@ def test_v3_plan_audit_is_not_called_before_seedream(
         settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1), audit_runner=runner,
     ))
 
-    # The runner is invoked once for post-generation acceptance, never for
-    # plan_audit.  Its plan-audit status is therefore irrelevant.
-    assert runner.calls == 1
+    # A plan-only Skill is never invoked as either audit or acceptance.
+    assert runner.calls == 0
     assert calls == ["01.png", "02.png"]
     latest = storage.load_meta(settings.data_dir, cid)
     assert latest["postprocess"]["status"] == "done"
@@ -1872,7 +1889,7 @@ def test_v4_combined_mediakit_preprocesses_all_canvases_before_seedream(
         ("mediakit", mediakit.ICON_SCENE, "02.png"),
     ]
     assert events[4:] == [("seedream",)] * 3
-    assert runner.phases == ["verify"]
+    assert runner.phases == []
     latest = storage.load_meta(settings.data_dir, cid)
     assert latest["postprocess"]["status"] == "done"
     canvas = latest["_v4_canvas_execution"]
@@ -1994,12 +2011,7 @@ def test_v4_staged_canonical_outputs_are_not_visible_before_project_manifest(tmp
     assert response.status_code == 404
 
 
-@pytest.mark.parametrize(
-    "failed_phase", ["verify", None],
-)
-def test_v4_runtime_generates_then_records_advisory_acceptance(
-    tmp_path, monkeypatch, failed_phase,
-):
+def test_v4_runtime_publishes_without_in_band_acceptance(tmp_path, monkeypatch):
     monkeypatch.setenv("ARK_API_KEY", "test-key")
     settings = make_settings(tmp_path, retry_interval_s=0)
     cid = _done(settings)
@@ -2025,13 +2037,13 @@ def test_v4_runtime_generates_then_records_advisory_acceptance(
         }},
         {},
     ))
-    runner = _V4LifecycleRunner(failed_phase)
+    runner = _V4LifecycleRunner("verify")
     asyncio.run(postprocess.run_task(
         settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
         audit_runner=runner, verification_runner=runner,
     ))
 
-    assert runner.phases == ["verify"]
+    assert runner.phases == []
     assert len(calls) == 3
     assert [len(images) for images in calls] == [1, 2, 2]
     private = cdir / "work" / ".postprocess-private" / "scene-anchors" / "SCENE_01"
@@ -2041,81 +2053,19 @@ def test_v4_runtime_generates_then_records_advisory_acceptance(
         "canvas", "global_scene_anchor",
     ]
     latest = storage.load_meta(settings.data_dir, cid)
-    assert runner.verification_error is None, runner.verification_error
     assert latest["postprocess"]["status"] == "done"
-    verification = latest["_image_verification"]
-    assert verification["semantic_receipts"] == []
-    assert verification["verdict"]["passed"] is (failed_phase is None)
-    assert verification["anchor_receipts"]
+    assert "_image_verification" not in latest
     assert latest["postprocess"]["frames"] == ["01.png", "02.png"]
-    if failed_phase is None:
-        generated = postprocess.generation_keyframes(
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
             cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
             settings=settings,
         )
-        assert [item.name for item in generated] == ["01.png", "02.png"]
-    else:
-        with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
-            postprocess.generation_keyframes(
-                cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
-                settings=settings,
-            )
-        return
-    reordered = deepcopy(latest)
-    reordered["postprocess"]["frames"] = ["02.png", "01.png"]
-    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
-        postprocess.generation_keyframes(
-            cdir, reordered,
-            sorted((cdir / "work" / "keyframes").glob("*.png")),
-        )
-    dropped_anchor = deepcopy(latest)
-    dropped_anchor["_image_verification"]["anchor_receipts"].pop()
-    raw = dropped_anchor["_image_verification"]
-    raw["sha256"] = postprocess._receipt_sha256({
-        key: value for key, value in raw.items() if key != "sha256"
-    })
-    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
-        postprocess.generation_keyframes(
-            cdir, dropped_anchor,
-            sorted((cdir / "work" / "keyframes").glob("*.png")),
-        )
-    metric_tamper = deepcopy(latest)
-    metric = metric_tamper["_image_verification"]["palette_metrics"]
-    metric["frames"][0]["output"]["mean_lab_b_star"] += 0.1
-    metric_payload = {key: value for key, value in metric.items() if key != "sha256"}
-    metric["sha256"] = postprocess._receipt_sha256(metric_payload)
-    metric_tamper["_image_verification"]["palette_metrics_sha256"] = metric["sha256"]
-    raw = metric_tamper["_image_verification"]
-    raw["sha256"] = postprocess._receipt_sha256({
-        key: value for key, value in raw.items() if key != "sha256"
-    })
-    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
-        postprocess.generation_keyframes(
-            cdir, metric_tamper,
-            sorted((cdir / "work" / "keyframes").glob("*.png")),
-        )
-    anchor_path = postprocess._anchor_receipt_path(cdir, "SCENE_01", "global")
-    original_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
-    anchor_tamper = deepcopy(original_anchor)
-    anchor_tamper["output_sha256"] = "0" * 64
-    anchor_tamper["sha256"] = postprocess._receipt_sha256({
-        key: value for key, value in anchor_tamper.items() if key != "sha256"
-    })
-    postprocess._write_json_receipt(anchor_path, anchor_tamper)
-    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
-        postprocess.generation_keyframes(
-            cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
-        )
-    postprocess._write_json_receipt(anchor_path, original_anchor)
-    drift = deepcopy(latest)
-    drift["_image_verification"]["frames"][0]["output_sha256"] = "0" * 64
-    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
-        postprocess.generation_keyframes(
-            cdir, drift, sorted((cdir / "work" / "keyframes").glob("*.png")),
-        )
 
 
-def test_v4_combined_canvas_receipt_binds_anchor_and_h3_sources(tmp_path, monkeypatch):
+def test_v4_combined_canvas_receipt_binds_generated_sources_without_acceptance(
+    tmp_path, monkeypatch,
+):
     monkeypatch.setenv("ARK_API_KEY", "test-key")
     settings = make_settings(tmp_path, enable_mediakit_erase=True, retry_interval_s=0)
     cid = _done(settings)
@@ -2165,42 +2115,15 @@ def test_v4_combined_canvas_receipt_binds_anchor_and_h3_sources(tmp_path, monkey
     latest = storage.load_meta(settings.data_dir, cid)
     canvas = latest["_v4_canvas_execution"]
     assert latest["postprocess"]["status"] == "done"
-    assert latest["_image_verification"]["canvas_execution_sha256"] == canvas["sha256"]
+    assert runner.phases == []
+    assert "_image_verification" not in latest
     assert canvas["frames"][0]["canvas_sha256"] != hashlib.sha256(
         (cdir / "work" / "keyframes" / "01.png").read_bytes()
     ).hexdigest()
-    generated = postprocess.generation_keyframes(
-        cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
-        settings=settings,
-    )
-    assert [path.name for path in generated] == ["01.png", "02.png"]
-    post_count = len(posts)
-    asyncio.run(postprocess.start(
-        settings, cid,
-        {"confirm": True, "options": {
-            "remove_subtitle": True, "remove_brand": False, "optimize_image": True,
-        }},
-        {},
-    ))
-    asyncio.run(postprocess.run_task(
-        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
-        audit_runner=runner, verification_runner=runner,
-    ))
-    assert len(posts) == post_count
-    (cdir / "work" / ".postprocess-private" / "scene-anchors" / "SCENE_01" / "global.json").unlink()
-    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
-        asyncio.run(postprocess.start(
-            settings, cid,
-            {"confirm": True, "options": {
-                "remove_subtitle": True, "remove_brand": False, "optimize_image": True,
-            }},
-            {},
-        ))
-    tampered = deepcopy(latest)
-    tampered["_v4_canvas_execution"]["frames"][0]["canvas_sha256"] = "0" * 64
+    assert len(posts) == 3
     with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
         postprocess.generation_keyframes(
-            cdir, tampered, sorted((cdir / "work" / "keyframes").glob("*.png")),
+            cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
             settings=settings,
         )
 
@@ -2356,12 +2279,14 @@ def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
         (item["segment_index"], item["frame_name"], item["source_sha256"])
         for item in inventory
     }
-    assert [path.name for path in postprocess.generation_keyframes(
-        cdir,
-        latest,
-        sorted((cdir / "work" / "keyframes").glob("*.png")),
-        settings=settings,
-    )] == ["01.png", "02.png"]
+    assert "_image_verification" not in latest
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir,
+            latest,
+            sorted((cdir / "work" / "keyframes").glob("*.png")),
+            settings=settings,
+        )
 
     tampered_continuity = deepcopy(latest)
     tampered_continuity["_image_continuity"]["segments"][0][
@@ -2411,9 +2336,8 @@ def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
         assert image_optimization.receipt(damaged, settings) is None
 
 
-@pytest.mark.parametrize("verify_status", ["fail", "unknown"])
-def test_v3_output_acceptance_cannot_block_publish_but_blocks_h3(
-    tmp_path, monkeypatch, verify_status,
+def test_v3_publish_does_not_create_in_band_acceptance(
+    tmp_path, monkeypatch,
 ):
     monkeypatch.setenv("ARK_API_KEY", "test-key")
     settings = make_settings(tmp_path, retry_interval_s=0)
@@ -2437,16 +2361,16 @@ def test_v3_output_acceptance_cannot_block_publish_but_blocks_h3(
         }},
         {},
     ))
-    runner = _PlanAuditRunner("pass", verify_status=verify_status)
+    runner = _PlanAuditRunner("pass", verify_status="fail")
     asyncio.run(postprocess.run_task(
         settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
         audit_runner=runner,
     ))
 
     latest = storage.load_meta(settings.data_dir, cid)
-    assert runner.calls == 1, latest["postprocess"]["segments"][0]["error"]
+    assert runner.calls == 0, latest["postprocess"]["segments"][0]["error"]
     assert latest["postprocess"]["status"] == "done"
-    assert latest["_image_verification"]["verdict"]["passed"] is False
+    assert "_image_verification" not in latest
     assert (cdir / "work" / "postprocessed" / "01.png").is_file()
     assert (cdir / "work" / ".postprocess-private" / "0" / "seedream" / "01.png").is_file()
     with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):

@@ -697,13 +697,31 @@ def _generate_image_optimization_project(
             )
         except image_optimization.ImageOptimizationOutputError as exc:
             raise PipelineError(str(exc), retryable=True) from None
+        except ValueError:
+            raise
+        except Exception:
+            raise PipelineError(
+                "image optimization planner unavailable", retryable=True,
+            ) from None
 
-    return run_with_retry(
-        attempt,
-        policy=policy,
-        is_retryable=_retryable_operation_error,
-        on_retry=_retry_logger(step, policy),
-    )
+    try:
+        return run_with_retry(
+            attempt,
+            policy=policy,
+            is_retryable=_retryable_operation_error,
+            on_retry=_retry_logger(step, policy),
+        )
+    except ValueError:
+        raise
+    except Exception:
+        # The plan model is an optional compiler.  Once its bounded attempts
+        # are unavailable or protocol-invalid, valid frozen source input still
+        # receives the backend's conservative executable v4 plan.
+        return image_optimization.generic_project_prompts(
+            segments,
+            settings.seedream_edit_mode,
+            session_dir=session_dir,
+        )
 
 
 def _generate_segmented_image_prompts(

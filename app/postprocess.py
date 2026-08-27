@@ -553,78 +553,6 @@ def _v3_plan_audit_inputs(
     return plan, audit_inputs, segments
 
 
-async def _run_v3_plan_audit(
-    runner, cdir: Path, meta: dict, private: dict,
-    grouped: dict[int, list[tuple[Path, Path]]],
-) -> None:
-    if not callable(getattr(runner, "run_isolated", None)):
-        raise PostprocessError(409, "image_plan_audit_failed")
-    plan, audit_inputs, segments = _v3_plan_audit_inputs(meta, private, grouped)
-    try:
-        verdict = await asyncio.to_thread(
-            image_optimization.generate_plan_audit_verdict,
-            runner,
-            plan,
-            audit_inputs,
-            segments,
-            session_dir=cdir,
-        )
-    except Exception:
-        raise PostprocessError(409, "image_plan_audit_failed") from None
-    if verdict.get("passed") is not True:
-        raise PostprocessError(409, "image_plan_audit_failed")
-
-
-def _v3_verification_inputs(
-    cdir: Path, meta: dict, private: dict,
-    grouped: dict[int, list[tuple[Path, Path]]],
-) -> tuple[dict, list[dict]]:
-    """Bind verify to the same frozen v3 plan and unpublishable staged outputs."""
-    plan, _audit_inputs, _audit_segments = _v3_plan_audit_inputs(
-        meta, private, grouped
-    )
-    segments = []
-    for index in sorted(grouped):
-        targets = grouped[index]
-        if not targets:
-            raise PostprocessError(409, "image_verification_failed")
-        output = _private_dir(cdir, index) / "seedream"
-        expected = [canonical.name for _, canonical in targets]
-        actual = (
-            [path.name for path in sorted(output.glob("*.png"))]
-            if output.is_dir() else []
-        )
-        if actual != expected:
-            raise PostprocessError(409, "image_verification_failed")
-        segments.append({
-            "index": index,
-            "source_keyframes_dir": targets[0][0].parent,
-            "output_keyframes_dir": output,
-        })
-    return plan, segments
-
-
-async def _run_v3_verification(
-    runner, cdir: Path, meta: dict, private: dict,
-    grouped: dict[int, list[tuple[Path, Path]]], deterministic_metrics: dict | None = None,
-) -> dict:
-    if not callable(getattr(runner, "run_isolated", None)):
-        raise PostprocessError(409, "image_verification_failed")
-    try:
-        plan, segments = _v3_verification_inputs(cdir, meta, private, grouped)
-        verdict = await asyncio.to_thread(
-            image_optimization.generate_project_verdict,
-            runner,
-            plan,
-            segments,
-            {} if deterministic_metrics is None else deterministic_metrics,
-            session_dir=cdir,
-        )
-    except Exception:
-        raise PostprocessError(409, "image_verification_failed") from None
-    return verdict
-
-
 def _mark_plan_audit_failed(
     settings: Settings, cid: str, indices: set[int],
 ) -> None:
@@ -2313,100 +2241,9 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
         _update_segment(settings, cid, index, status="failed", error=detail)
 
 
-def _write_v4_verification_receipt(
-    settings: Settings, cid: str, private: dict, plan: dict,
-    grouped: dict[int, list[tuple[Path, Path]]], outputs: list[Path],
-    anchor_receipts: list[dict], semantic_receipts: list[dict],
-    source_palette_receipt: dict, palette_metrics: dict, verdict: dict,
-) -> None:
-    expected = [
-        (index, source, canonical)
-        for index in sorted(grouped)
-        for source, canonical in grouped[index]
-    ]
-    if len(expected) != len(outputs):
-        raise PostprocessError(409, "image_verification_failed")
-    try:
-        anchor_manifest = _v4_anchor_manifest(
-            plan, private["scene_anchor_schedule"], anchor_receipts,
-        )
-    except ValueError:
-        raise PostprocessError(409, "image_verification_failed") from None
-    if semantic_receipts:
-        raise PostprocessError(409, "image_verification_failed")
-    payload = {
-        "version": 1,
-        "plan_sha256": private["plan_sha256"],
-        "continuity_sha256": private["continuity_sha256"],
-        "scene_anchor_schedule_sha256": hashlib.sha256(json.dumps(
-            private["scene_anchor_schedule"], ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")).hexdigest(),
-        "canvas_execution_sha256": private.get("canvas_execution_sha256"),
-        "semantic_receipts": [
-            {"label": item["label"], "sha256": item["sha256"]}
-            for item in semantic_receipts
-        ],
-        "anchor_receipts": anchor_manifest,
-        "source_palette_receipt_sha256": source_palette_receipt["sha256"],
-        "palette_metrics": palette_metrics,
-        "palette_metrics_sha256": palette_metrics["sha256"],
-        "frames": [
-            {
-                "segment_index": index,
-                "frame_name": canonical.name,
-                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-                "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
-            }
-            for (index, source, canonical), output in zip(expected, outputs)
-        ],
-        "verdict": verdict,
-    }
-    receipt = {**payload, "sha256": hashlib.sha256(json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()}
-    storage.update_meta(settings.data_dir, cid, _image_verification=receipt)
-
-
-def _write_v3_verification_receipt(
-    settings: Settings, cid: str, meta: dict, private: dict,
-    grouped: dict[int, list[tuple[Path, Path]]], verdict: dict,
-) -> None:
-    frozen = image_optimization.dual_target_plan_receipt(meta)
-    if (
-        not isinstance(frozen, dict)
-        or frozen.get("version") != 3
-        or frozen.get("sha256") != private.get("plan_sha256")
-    ):
-        raise PostprocessError(409, "image_verification_failed")
-    frames = []
-    for index in sorted(grouped):
-        for source, output in grouped[index]:
-            if not _valid_png(output, source):
-                raise PostprocessError(409, "postprocess_artifacts_invalid")
-            frames.append({
-                "segment_index": index,
-                "frame_name": output.name,
-                "source_sha256": _sha256_path(source),
-                "output_sha256": _sha256_path(output),
-            })
-    payload = {
-        "version": 1,
-        "plan_version": 3,
-        "plan_sha256": private["plan_sha256"],
-        "frames": frames,
-        "verdict": verdict,
-    }
-    storage.update_meta(
-        settings.data_dir, cid,
-        _image_verification={**payload, "sha256": _receipt_sha256(payload)},
-    )
-
-
 async def _run_v4_task(
     settings: Settings, cid: str, cdir: Path, meta: dict, private: dict,
     grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
-    audit_runner, verification_runner,
 ) -> None:
     plan = _v4_frozen_plan(meta, private)
     sources = _v4_frame_sources(grouped, private)
@@ -2436,31 +2273,11 @@ async def _run_v4_task(
         settings, cdir, cid, private, grouped, seedream_sem,
         bootstrap_outputs, anchor_receipts,
     )
-    output_by_key: dict[tuple[int, int], Path] = {}
-    output_cursor = 0
-    for index in sorted(grouped):
-        for frame_index, _target in enumerate(grouped[index], 1):
-            output_by_key[(index, frame_index)] = outputs[output_cursor]
-            output_cursor += 1
-    palette_metrics = _v4_palette_metrics(plan, sources, output_by_key)
     offset = 0
     for index in sorted(grouped):
         targets = grouped[index]
         _publish_segment(outputs[offset:offset + len(targets)], targets)
         offset += len(targets)
-    try:
-        verdict = await _run_v3_verification(
-            verification_runner or audit_runner, cdir, meta, private, grouped,
-            palette_metrics,
-        )
-        _write_v4_verification_receipt(
-            settings, cid, private, plan, grouped, outputs, anchor_receipts, [],
-            source_palette_receipt, palette_metrics, verdict,
-        )
-    except PostprocessError:
-        # External acceptance is an H3 gate, never an image publication gate.
-        # Missing/malformed acceptance remains fail-closed at generation_keyframes().
-        return
 
 
 async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore,
@@ -2540,7 +2357,6 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         try:
             await _run_v4_task(
                 settings, cid, cdir, meta, runtime_private, runtime_grouped, seedream_sem,
-                audit_runner, verification_runner,
             )
         except asyncio.CancelledError:
             raise
@@ -2560,7 +2376,7 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         def finalize_v4(_meta: dict, post: dict) -> None:
             # Manifest-last: canonical directories may have been staged, but no
             # segment becomes observable as done until every v4 publish and the
-            # complete verification receipt have succeeded.
+            # complete technical generation DAG has succeeded.
             for item in post.get("segments", []):
                 if item.get("index") in audit_grouped:
                     item.update(
@@ -2622,19 +2438,6 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
             except Exception:
                 _mark_image_verification_failed(settings, cid, set(unpublished))
                 return
-            try:
-                verdict = await _run_v3_verification(
-                    verification_runner or audit_runner,
-                    cdir,
-                    current,
-                    private,
-                    audit_grouped,
-                )
-                _write_v3_verification_receipt(
-                    settings, cid, current, private, audit_grouped, verdict,
-                )
-            except PostprocessError:
-                pass
 
     def finalize(_meta: dict, post: dict) -> None:
         segments = post.get("segments") or []
