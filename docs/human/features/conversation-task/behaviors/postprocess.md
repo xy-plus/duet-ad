@@ -27,7 +27,7 @@ links: [conversation-task, result-display]
 
 ## 图片优化计划
 
-- 当前 `image-postprocess` Skill 已由用户预览并验收，自 2026-08-28 起冻结；不得继续修改 Skill 文件、提示词、规则、测试或职责。后续只允许把现有输出接入完整视频链路。
+- 当前 `image-postprocess` Skill 的生成效果、目标视觉和 A→B 提示词已由用户预览并验收。只允许删除与 A→B 无关的素材拒绝、流程控制、验收门和发布内容；清理不得改变生成目标或输出效果，完成后再次冻结 Skill 字节。后续只允许把该输出接入完整视频链路。
 - 当前 `image-postprocess` Skill 只有 `phase=plan`：读取冻结关键帧，输出 v4 结构化人物与真实新场景双替换计划。它不做素材准入、供应商调用、发布、H3 门禁或图片验收；历史 receipt 由后端只读兼容，Skill 不迁移或重写。
 - 所有项目统一为 `segments[N>=1]`，每段固定读取 9 张原始关键帧并输出 9 张优化关键帧。`N=1` 不选择独立 short 逻辑，segment 索引也不得用于切换业务实现。
 - 有效冻结输入固定输出 `eligible=true`、`reason=null`。人物、场景、关系或不可见区域的不确定性不是素材准入条件；技术输入、schema、哈希和冻结 transition skeleton 的错误由调用 Skill 前的后端处理。历史 v2/old `eligible=false` 响应只交给 runtime protocol correction，不是图片计划的内容失败。

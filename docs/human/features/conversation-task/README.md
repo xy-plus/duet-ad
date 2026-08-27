@@ -32,7 +32,7 @@ links: []
 
 - 全链只允许调用三个 Skill：`video-maker` 负责关键词/片段分析、每段 9 张关键帧和旧视频提示词；`image-postprocess` 只负责关键帧图片优化；`video-prompt-fusion` 只负责最终提示词融合。不得派生 Audio、Binding、Speaker 或其他 Skill/phase。
 - 收口后的 `video-maker` Skill 权威 SHA-256 为 `0bbb22baeb8f14fef737b279e2ab2e8f70bf8965d41b182f1987537e1e3e4785`；不得恢复已删除的音画绑定、说话人可见性或图片后融合 phase。
-- 已验收的 `image-postprocess` Skill 立即冻结；`skills/image-postprocess/SKILL.md` 的权威 SHA-256 为 `ca3efd2390b43b52fba6af121e61218f298d3ff2f6ebf1dd7898657e4370ad35`。不再修改其文件、提示词、规则或测试；后续工作只允许拼接已有链路。
+- 已验收的 `image-postprocess` 生成效果、目标视觉和 A→B 提示词立即冻结，不再迭代。当前只允许一次职责清理：删除素材拒绝、流程控制、验收门和发布逻辑，使 Skill 只负责把合法可解码的原始关键帧 A 生成优化关键帧 B；不得改变已验收的生成目标和提示词效果。清理验收后重新冻结其权威 SHA-256。
 - 除上述三个 Skill 外，不存在 Binding Skill、Audio Skill、Speaker Skill 或第四个 Skill。音频呈现由普通后端代码根据冻结台词、Web 的画内/画外选择和现有 voice reference 做确定性投影，再作为只读输入交给融合 Skill。
 - 单段和多段不是两条链。所有当前项目统一为 `segments[N>=1]`；所谓短视频只是 `N=1`，使用同一冻结、Context、H3、attempt、恢复、拼接和验收实现。
 - 图片 Skill 收到合法可解码关键帧就执行，不做素材资格审查，不因人物、场景、遮挡或内容复杂而拒绝开始。
@@ -41,6 +41,7 @@ links: []
 - Context IR 只优化 `video-prompt-fusion` 输出的文字表达，不得恢复旧视觉元素，也不得改变关键帧顺序、台词、时间、画内/画外选择或 voice reference；IR 完成后直接进入 H3，中间不得增加新阶段。
 - H3 最终音频以供应商原生输出为准；源音频或 conditioning audio 不得在拼接时覆盖、回挂或混入成片。
 - `submission_unknown` 只允许查询已有任务，不得自动或人工再次 POST。
+- 完整可用链最终只部署到 Web 端口 `3211`，以同端口可回滚替换旧版本；不得新建其他对外预览端口代替交付。
 
 ### 变更前对照门
 
