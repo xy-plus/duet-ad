@@ -1739,8 +1739,10 @@ def queue_prompt_fusion(
             return "failed"
         if state.get("status") == "done":
             try:
-                long_generation.load_prompt_fusion_manifest(
-                    root=root, skill_source_path=PROMPT_FUSION_SKILL_MD,
+                long_generation.load_bound_prompt_fusion_manifest(
+                    root=root,
+                    meta=current,
+                    skill_source_path=PROMPT_FUSION_SKILL_MD,
                 )
                 return "done"
             except long_generation.LongGenerationError:
@@ -1830,21 +1832,41 @@ def _publish_prompt_fusion_manifest(
         ],
     }
     manifest_data = _canonical_json_bytes(manifest)
-    _atomic_bytes(manifest_path, manifest_data)
+    manifest_existed = manifest_path.exists()
+    if manifest_existed:
+        try:
+            existing_manifest_data = manifest_path.read_bytes()
+        except OSError:
+            raise PipelineError("prompt fusion manifest is unreadable") from None
+        if manifest_path.is_symlink() or existing_manifest_data != manifest_data:
+            raise PipelineError("prompt fusion manifest drifted")
+    else:
+        try:
+            _atomic_bytes(manifest_path, manifest_data)
+        except Exception:
+            try:
+                if manifest_path.read_bytes() == manifest_data:
+                    manifest_path.unlink()
+            except OSError:
+                pass
+            raise
     try:
         long_generation.load_prompt_fusion_manifest(
             root=root, skill_source_path=PROMPT_FUSION_SKILL_MD,
         )
     except long_generation.LongGenerationError as exc:
+        if not manifest_existed:
+            try:
+                if manifest_path.read_bytes() == manifest_data:
+                    manifest_path.unlink()
+            except OSError:
+                pass
         raise PipelineError(exc.code) from None
     return frozen, manifest_data
 
 
-def finalize_prompt_fusion_receipt(settings: Settings, cid: str) -> str:
-    """Finalize one exact terminal LF-envelope output without running a Skill."""
-    root = (settings.data_dir / cid).resolve()
-    meta = storage.load_meta(settings.data_dir, cid)
-    state = meta.get("_prompt_fusion") if isinstance(meta, Mapping) else None
+def _recoverable_prompt_fusion_state(root: Path, meta: Mapping) -> dict:
+    state = meta.get("_prompt_fusion")
     if (
         not isinstance(state, dict)
         or state.get("version") != 1
@@ -1862,19 +1884,42 @@ def finalize_prompt_fusion_receipt(settings: Settings, cid: str) -> str:
     )
     if any(path.exists() for path in downstream_roots):
         raise PipelineError("prompt fusion downstream state already exists")
-    _frozen, manifest_data = _publish_prompt_fusion_manifest(
-        root=root, meta=meta, state=state,
-    )
-    manifest_sha256 = hashlib.sha256(manifest_data).hexdigest()
-    committed = {"value": False}
+    return dict(state)
+
+
+def _unlink_exact_prompt_fusion_manifest(path: Path, data: bytes) -> None:
+    try:
+        if not path.is_symlink() and path.read_bytes() == data:
+            path.unlink()
+    except OSError:
+        pass
+
+
+def finalize_prompt_fusion_receipt(settings: Settings, cid: str) -> str:
+    """Finalize one exact terminal LF-envelope output without running a Skill."""
+    root = (settings.data_dir / cid).resolve()
+    manifest_path = root / "work" / h3_project.SOURCE_FILENAME
+    publication: dict[str, object] = {}
 
     def commit(current: dict) -> None:
-        if (
-            current.get("_prompt_fusion") != state
-            or long_generation.prompt_fusion_image_authority_sha256(current)
-            != state.get("image_acceptance_sha256")
-        ):
-            return
+        state = _recoverable_prompt_fusion_state(root, current)
+        manifest_existed = manifest_path.exists()
+        _frozen, manifest_data = _publish_prompt_fusion_manifest(
+            root=root, meta=current, state=state,
+        )
+        publication.update(
+            data=manifest_data,
+            created=not manifest_existed,
+        )
+        try:
+            refreshed_state = _recoverable_prompt_fusion_state(root, current)
+        except PipelineError:
+            raise PipelineError(
+                "prompt fusion state drifted during finalization"
+            ) from None
+        if refreshed_state != state:
+            raise PipelineError("prompt fusion state drifted during finalization")
+        manifest_sha256 = hashlib.sha256(manifest_data).hexdigest()
         current["_prompt_fusion"] = {
             **state,
             "status": "done",
@@ -1882,11 +1927,19 @@ def finalize_prompt_fusion_receipt(settings: Settings, cid: str) -> str:
             "manifest_sha256": manifest_sha256,
             "recovered_error": state["error"],
         }
-        committed["value"] = True
 
-    storage.mutate_meta(settings.data_dir, cid, commit)
-    if not committed["value"]:
-        raise PipelineError("prompt fusion state drifted during finalization")
+    try:
+        committed = storage.mutate_meta(settings.data_dir, cid, commit)
+    except Exception:
+        if publication.get("created") is True and isinstance(
+            publication.get("data"), bytes
+        ):
+            _unlink_exact_prompt_fusion_manifest(
+                manifest_path, publication["data"],
+            )
+        raise
+    if committed is None:
+        raise PipelineError("prompt fusion receipt finalization is not allowed")
     return "done"
 
 
