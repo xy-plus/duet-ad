@@ -945,6 +945,10 @@ def _v3_frame_bound_plan() -> dict:
                             "object_id": "PERSON_01",
                         }],
                     },
+                    "dominant_palette_contract": {
+                        "area_weighted_warm_cool_family": "warm",
+                        "saturation_style": "natural",
+                    },
                 },
                 {
                     "frame_index": 2,
@@ -965,6 +969,10 @@ def _v3_frame_bound_plan() -> dict:
                             "object_id": "PERSON_01",
                         }],
                     },
+                    "dominant_palette_contract": {
+                        "area_weighted_warm_cool_family": "warm",
+                        "saturation_style": "natural",
+                    },
                 },
             ],
             "photometric_contract": {
@@ -980,13 +988,106 @@ def _v3_frame_bound_plan() -> dict:
 
 
 class _PlanAuditRunner:
-    def __init__(self, status: str) -> None:
+    def __init__(self, status: str, verify_status: str = "pass") -> None:
         self.status = status
+        self.verify_status = verify_status
         self.calls = 0
 
     def run_isolated(self, workdir, _prompt, *, session_dir) -> None:
         self.calls += 1
         root = Path(workdir)
+        request = json.loads((root / "work" / "request.json").read_text(
+            encoding="utf-8"
+        ))
+        if request["phase"] == "verify":
+            frozen = json.loads((root / "work" / "frozen_plan.json").read_text(
+                encoding="utf-8"
+            ))
+            plan = {key: value for key, value in frozen.items() if key != "sha256"}
+            status = self.verify_status
+            base_check = {
+                "status": "pass" if status == "fail" else status,
+                "evidence": "current-frame verification evidence",
+            }
+            palette_check = {
+                "status": status,
+                "evidence": "current-frame palette evidence",
+            }
+            reason = None if status == "pass" else (
+                "verification_unknown" if status == "unknown"
+                else "dominant_palette_preservation_failed"
+            )
+            segments = []
+            for segment in plan["segments"]:
+                frame_checks = [
+                    {
+                        "frame_index": frame["frame_index"],
+                        **{
+                            key: (
+                                dict(palette_check)
+                                if key == "dominant_palette_contract"
+                                else dict(base_check)
+                            )
+                            for key in (
+                                "visible_body_parts", "pose_skeleton",
+                                "contact_points", "occlusion_order",
+                                "out_of_frame_crop", "non_person_entity_ledger",
+                                "dominant_palette_contract",
+                                "photometric_contract",
+                            )
+                        },
+                    }
+                    for frame in segment["frame_constraints"]
+                ]
+                segments.append({
+                    "segment_index": segment["segment_index"],
+                    "passed": status == "pass",
+                    "person_checks": [{
+                        "person_id": person["id"],
+                        "identity_changed": dict(base_check),
+                        "source_identity_absent": dict(base_check),
+                        "local_color_change": dict(base_check),
+                    } for person in segment["persons"]],
+                    "scene_checks": {
+                        key: dict(base_check)
+                        for key in (
+                            "semantic_change", "geometry_change", "depth_change",
+                            "layout_change", "local_color_change",
+                        )
+                    },
+                    "invariants": {
+                        key: dict(base_check)
+                        for key in (
+                            "lighting_preservation", "interaction_preservation",
+                            "cross_frame_continuity",
+                        )
+                    },
+                    "frame_checks": frame_checks,
+                })
+            (root / "work" / "image_verification.json").write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "phase": "verify",
+                        "plan_sha256": image_optimization.plan_sha256(plan),
+                        "segment_indices": plan["segment_indices"],
+                        "passed": status == "pass",
+                        "reason": reason,
+                        "segments": segments,
+                        "project_checks": {
+                            key: dict(base_check)
+                            for key in (
+                                "narrative_person_completeness", "no_identity_swap",
+                                "no_unplanned_person", "person_identity_continuity",
+                                "scene_continuity",
+                            )
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            return
         receipt = json.loads((root / "work" / "audit_inputs.json").read_text(
             encoding="utf-8"
         ))
@@ -1132,6 +1233,11 @@ def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
     ] == plan["segments"][0]["frame_constraints"][0][
         "non_person_entity_ledger"
     ]
+    assert execution["frames"][0]["frame_constraint"][
+        "dominant_palette_contract"
+    ] == plan["segments"][0]["frame_constraints"][0][
+        "dominant_palette_contract"
+    ]
     frozen = image_optimization.freeze_frame_prompts(
         settings,
         execution,
@@ -1220,6 +1326,9 @@ def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
     changed_plan["segments"][0]["frame_constraints"][0][
         "non_person_entity_ledger"
     ]["entities"][0]["description"] = "另一份合法当前帧实体描述"
+    changed_plan["segments"][0]["frame_constraints"][0][
+        "dominant_palette_contract"
+    ]["saturation_style"] = "vivid"
     mismatched_receipts = deepcopy(latest)
     mismatched_receipts.update(
         image_optimization.freeze_continuity(changed_plan, frame_counts={0: 2})
@@ -1249,3 +1358,49 @@ def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
         damaged = deepcopy(latest)
         mutate(damaged["_image_optimization"])
         assert image_optimization.receipt(damaged, settings) is None
+
+
+@pytest.mark.parametrize("verify_status", ["fail", "unknown"])
+def test_v3_output_verification_blocks_publish_and_h3_inputs(
+    tmp_path, monkeypatch, verify_status,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(_png(value=62))
+    _freeze_v3_image_optimization(settings, cid, _v3_frame_bound_plan())
+
+    async def staged_edit(_settings, _images, _prompt, output, *, receipt_path):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(_png(value=99))
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(postprocess.seedream, "edit", staged_edit)
+    asyncio.run(postprocess.start(
+        settings,
+        cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+    runner = _PlanAuditRunner("pass", verify_status=verify_status)
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
+        audit_runner=runner,
+    ))
+
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert runner.calls == 2, latest["postprocess"]["segments"][0]["error"]
+    assert latest["postprocess"]["status"] == "failed"
+    assert latest["postprocess"]["error"] == "image_verification_failed"
+    assert not (cdir / "work" / "postprocessed").exists()
+    assert (cdir / "work" / ".postprocess-private" / "0" / "seedream" / "01.png").is_file()
+    with pytest.raises(postprocess.PostprocessError, match="postprocess_not_ready"):
+        postprocess.generation_keyframes(
+            cdir,
+            latest,
+            sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )

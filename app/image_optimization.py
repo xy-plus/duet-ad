@@ -668,6 +668,7 @@ _FRAME_CONSTRAINT_KEYS = (
     "frame_index",
     *_FRAME_TEXT_CONSTRAINT_KEYS,
     "non_person_entity_ledger",
+    "dominant_palette_contract",
 )
 _NON_PERSON_ENTITY_LEDGER_KEYS = {"entities", "relations"}
 _ENTITY_LEDGER_ENTITY_KEYS = {"entity_id", "description", "visibility"}
@@ -687,6 +688,12 @@ _PHOTOMETRIC_CONTRACT_KEYS = (
     "global_contrast",
     "tone_curve",
 )
+_DOMINANT_PALETTE_CONTRACT_KEYS = (
+    "area_weighted_warm_cool_family",
+    "saturation_style",
+)
+_AREA_WEIGHTED_WARM_COOL_FAMILIES = {"warm", "cool", "balanced"}
+_SATURATION_STYLES = {"muted", "natural", "vivid"}
 
 
 def _contains_directed_cycle(edges: list[tuple[str, str]]) -> bool:
@@ -836,6 +843,31 @@ def _canonical_non_person_entity_ledger(
     return {"entities": entities, "relations": relations}
 
 
+def _canonical_dominant_palette_contract(value: object) -> dict:
+    if (
+        not isinstance(value, dict)
+        or set(value) != set(_DOMINANT_PALETTE_CONTRACT_KEYS)
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    family = value.get("area_weighted_warm_cool_family")
+    saturation = value.get("saturation_style")
+    if (
+        not isinstance(family, str)
+        or family not in _AREA_WEIGHTED_WARM_COOL_FAMILIES
+        or not isinstance(saturation, str)
+        or saturation not in _SATURATION_STYLES
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return {
+        "area_weighted_warm_cool_family": family,
+        "saturation_style": saturation,
+    }
+
+
 def _canonical_frame_constraint(value: object, allowed_person_ids: set[str]) -> dict:
     if not isinstance(value, dict) or set(value) != set(_FRAME_CONSTRAINT_KEYS):
         raise ImageOptimizationOutputError(
@@ -854,6 +886,9 @@ def _canonical_frame_constraint(value: object, allowed_person_ids: set[str]) -> 
         },
         "non_person_entity_ledger": _canonical_non_person_entity_ledger(
             value.get("non_person_entity_ledger"), allowed_person_ids
+        ),
+        "dominant_palette_contract": _canonical_dominant_palette_contract(
+            value.get("dominant_palette_contract")
         ),
     }
 
@@ -1108,6 +1143,8 @@ def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str
             frame_clause = (
                 f"{frame_clause}；non_person_entity_ledger="
                 f"{_plan_json(constraint['non_person_entity_ledger'])}"
+                f"；dominant_palette_contract="
+                f"{_plan_json(constraint['dominant_palette_contract'])}"
             )
             per_frame[constraint["frame_index"]] = _canonical_prompt(
                 f"{segment_prompts[segment['segment_index']]}。仅当前源帧硬约束："
@@ -2419,6 +2456,7 @@ def _canonical_verification_v3(value: object, plan: dict) -> dict:
     any_unknown = common["reason"] == "verification_unknown"
     any_body_failure = False
     any_photo_failure = False
+    any_palette_failure = False
     for expected, raw, common_segment in zip(
         canonical_plan["segments"], value["segments"], common["segments"]
     ):
@@ -2441,6 +2479,7 @@ def _canonical_verification_v3(value: object, plan: dict) -> dict:
             if not isinstance(check, dict) or set(check) != {
                 "frame_index", "visible_body_parts", "pose_skeleton", "contact_points",
                 "occlusion_order", "out_of_frame_crop", "non_person_entity_ledger",
+                "dominant_palette_contract",
                 "photometric_contract",
             } or check.get("frame_index") != constraint["frame_index"]:
                 raise ImageOptimizationOutputError(
@@ -2454,7 +2493,12 @@ def _canonical_verification_v3(value: object, plan: dict) -> dict:
             any_unknown = any_unknown or "unknown" in statuses
             any_body_failure = any_body_failure or any(
                 canonical_checks[key]["status"] == "fail"
-                for key in _FRAME_CONSTRAINT_KEYS[1:]
+                for key in _FRAME_TEXT_CONSTRAINT_KEYS + (
+                    "non_person_entity_ledger",
+                )
+            )
+            any_palette_failure = any_palette_failure or (
+                canonical_checks["dominant_palette_contract"]["status"] == "fail"
             )
             any_photo_failure = any_photo_failure or (
                 canonical_checks["photometric_contract"]["status"] == "fail"
@@ -2481,6 +2525,8 @@ def _canonical_verification_v3(value: object, plan: dict) -> dict:
     )
     if reason is None and any_body_failure:
         reason = "interaction_preservation_failed"
+    if reason is None and any_palette_failure:
+        reason = "dominant_palette_preservation_failed"
     if reason is None and any_photo_failure:
         reason = "lighting_preservation_failed"
     if value["passed"] != passed or value.get("reason") != reason:
