@@ -276,9 +276,26 @@ def _speaker_timing_production_binding(
         frame_data[item["path"]] = _read(
             path, "speaker_visibility_input_invalid"
         )
-    sources = sorted(
-        path for path in root.glob("source.*") if path.is_file()
-    )
+    if workdir.resolve() == (root / "work").resolve():
+        sources = sorted(
+            path for path in root.glob("source.*") if path.is_file()
+        )
+    else:
+        segment_root = workdir.resolve().parent
+        try:
+            relative_segment = segment_root.relative_to(
+                (root / "work" / "segments").resolve()
+            )
+        except ValueError:
+            _fail("speaker_visibility_source_mismatch")
+        source = segment_root / "source.mp4"
+        sources = (
+            [source]
+            if len(relative_segment.parts) == 1
+            and relative_segment.parts[0].isdigit()
+            and source.is_file()
+            else []
+        )
     if len(sources) != 1:
         _fail("speaker_visibility_source_mismatch")
     try:
@@ -795,6 +812,30 @@ def load_bound(root: Path, binding: object) -> FrozenProjectMultimodal:
     if frozen is None or receipt_binding(root, frozen) != binding:
         _fail("multimodal_receipt_mismatch")
     return frozen
+
+
+def revalidate_production_authority(
+    root: Path,
+    workdir: Path,
+    request: h3.H3Request,
+    *,
+    expected_production_sha256: str | None,
+) -> None:
+    """Reload sampled speaker evidence immediately before an H3 boundary."""
+    if not request.on_screen_dialogue or expected_production_sha256 is None:
+        return
+    frozen = freeze_optional(root, workdir)
+    if (
+        frozen is None
+        or frozen.speaker_timing_production is None
+        or frozen.speaker_timing_production_data is None
+        or _sha256(frozen.speaker_timing_production_data)
+        != expected_production_sha256
+        or frozen.speaker_timing is None
+        or dialogue_timing.canonical_sha256(frozen.speaker_timing)
+        != request.speaker_timing_sha256
+    ):
+        _fail("speaker_timing_refresh_required")
 
 
 def build_request(

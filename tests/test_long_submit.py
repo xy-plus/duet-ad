@@ -14,7 +14,8 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from app import h3, long_generation, long_video, prepared_input, stitch, storage
+from app import h3, long_generation, long_video, pipeline, prepared_input, stitch, storage
+from app import main as main_module
 from app.main import (
     _SubmitError,
     _long_fit_required,
@@ -1258,6 +1259,98 @@ def enabled(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     with TestClient(create_app(settings)) as client:
         yield settings, client
+
+
+def test_long_on_screen_refresh_queues_project_speaker_producer(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    calls = []
+
+    monkeypatch.setattr(
+        long_generation,
+        "finalize_multimodal_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            long_generation.LongGenerationError(
+                "speaker_timing_refresh_required"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "produce_speaker_timing",
+        lambda received_settings, received_cid, _runner: calls.append(
+            (received_settings, received_cid)
+        ) or "done",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "queue_speaker_timing",
+        lambda received_settings, received_cid: (
+            storage.update_meta(
+                received_settings.data_dir,
+                received_cid,
+                _speaker_timing_producer={
+                    "status": "queued", "error": None, "jobs": [],
+                },
+            )
+            and "queued"
+        ),
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "speaker_timing_refresh_required"}
+    assert calls == [(settings, cid)]
+    assert storage.load_meta(settings.data_dir, cid)[
+        "_speaker_timing_producer"
+    ]["status"] == "queued"
+
+
+def test_long_paid_boundary_revalidation_failure_makes_zero_h3_post(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, autodl_art_token="art")
+    cid, receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "long-producer-toctou", 1,
+    )
+    storage.update_meta(
+        settings.data_dir, cid,
+        dialogue_mode="auto", fit_mode="none", frozen_plan_receipt=receipt,
+        generation=generation,
+    )
+    checks = []
+
+    def reject(_plan, segment, _request):
+        checks.append(segment.index)
+        raise long_generation.LongGenerationError(
+            "speaker_visibility_output_hash_mismatch"
+        )
+
+    monkeypatch.setattr(
+        long_generation, "_revalidate_speaker_authority", reject
+    )
+    monkeypatch.setattr(
+        h3, "start", lambda _request: pytest.fail("drifted producer must make zero H3 POST")
+    )
+
+    long_generation.run(settings, cid, plan)
+
+    assert checks == [1]
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "submission_unknown"
+    assert stored["segments"][0]["error"] == "submission_unknown"
 
 
 def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkeypatch):

@@ -326,6 +326,20 @@ def test_on_screen_refresh_schedules_real_background_producer(enabled, monkeypat
             (received_settings, received_cid)
         ) or "done",
     )
+    monkeypatch.setattr(
+        pipeline,
+        "queue_speaker_timing",
+        lambda received_settings, received_cid: (
+            storage.update_meta(
+                received_settings.data_dir,
+                received_cid,
+                _speaker_timing_producer={
+                    "status": "queued", "error": None, "jobs": [],
+                },
+            )
+            and "queued"
+        ),
+    )
 
     response = client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH,

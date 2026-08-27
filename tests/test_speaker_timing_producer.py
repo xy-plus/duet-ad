@@ -1,10 +1,13 @@
 import hashlib
 import json
 import subprocess
+import threading
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app import dialogue_timing, pipeline, storage
+from app.main import create_app
 from conftest import make_settings
 
 
@@ -305,6 +308,142 @@ def test_offscreen_project_skips_before_probe_extract_or_skill(tmp_path):
     assert not (root / "work" / "speaker_visibility_input.json").exists()
 
 
+def test_segment_person_inventory_uses_project_level_reference_authority(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "long-project"
+    segment_work = root / "work" / "segments" / "1" / "work"
+    identity = root / "work" / "segments" / "2" / "work" / "keyframes" / "03.png"
+    identity.parent.mkdir(parents=True)
+    identity.write_bytes(b"segment-two-authoritative-identity")
+    segment_work.mkdir(parents=True)
+    monkeypatch.setattr(
+        pipeline.image_optimization,
+        "dual_target_plan_receipt",
+        lambda _meta: {
+            "person_plans": [{
+                "id": "PERSON_01",
+                "reference": {"segment_index": 2, "frame_index": 3},
+                "observable_segments": [1, 2],
+            }],
+        },
+    )
+
+    persons, media = pipeline._speaker_visibility_person_inventory(
+        {}, root, segment_work, segment_index=1,
+    )
+
+    assert persons == [{
+        "person_id": "PERSON_01",
+        "identity_refs": [{
+            "path": "keyframes/speaker-visibility-identities/PERSON_01.png",
+            "sha256": _sha(identity.read_bytes()),
+        }],
+    }]
+    assert media == {
+        "keyframes/speaker-visibility-identities/PERSON_01.png": identity.read_bytes(),
+    }
+
+
+def test_startup_recovers_only_exact_queued_speaker_jobs_and_locks_running_unknown(
+    tmp_path,
+):
+    settings = make_settings(tmp_path)
+    created = storage.new_conversation(
+        settings.data_dir, "speaker-recovery", "source.mp4"
+    )
+    root = settings.data_dir / created["id"]
+    (root / "source.mp4").write_bytes(SOURCE_DATA)
+    _write_pipeline_plan(root, delivery="on_screen")
+
+    assert pipeline.queue_speaker_timing(settings, created["id"]) == "queued"
+    queued = storage.load_meta(settings.data_dir, created["id"])[
+        "_speaker_timing_producer"
+    ]
+    assert queued["status"] == "queued"
+    assert queued["jobs"] == [{
+        "scope": "short",
+        "segment_index": 0,
+        "status": "queued",
+        "source": {
+            "path": "source.mp4",
+            "sha256": _sha(SOURCE_DATA),
+        },
+        "manifest": {
+            "path": "work/h3_multimodal_source.json",
+            "sha256": _sha(
+                (root / "work" / "h3_multimodal_source.json").read_bytes()
+            ),
+        },
+    }]
+    assert pipeline.recover_speaker_timing_jobs(settings) == [created["id"]]
+
+    producer_input = root / "work" / "speaker_visibility_input.json"
+    frozen_skill = root / "work" / "speaker_visibility_skill.md"
+    producer_input.write_bytes(b"exact-running-input")
+    frozen_skill.write_bytes(b"exact-running-skill")
+    running_job = {
+        **queued["jobs"][0],
+        "status": "running",
+        "producer_input": {
+            "path": "work/speaker_visibility_input.json",
+            "sha256": _sha(producer_input.read_bytes()),
+        },
+        "skill": {
+            "path": "work/speaker_visibility_skill.md",
+            "sha256": _sha(frozen_skill.read_bytes()),
+        },
+    }
+    running_job["job_receipt_sha256"] = dialogue_timing.canonical_sha256({
+        key: running_job[key]
+        for key in (
+            "scope", "segment_index", "source", "manifest",
+            "producer_input", "skill",
+        )
+    })
+    running = {
+        **queued,
+        "status": "running",
+        "jobs": [running_job],
+    }
+    storage.update_meta(
+        settings.data_dir, created["id"],
+        _speaker_timing_producer=running,
+    )
+    assert pipeline.recover_speaker_timing_jobs(settings) == []
+    locked = storage.load_meta(settings.data_dir, created["id"])[
+        "_speaker_timing_producer"
+    ]
+    assert locked["status"] == "submission_unknown"
+    assert locked["jobs"][0]["status"] == "submission_unknown"
+
+
+def test_app_startup_runs_exact_queued_speaker_job_without_provider(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_pipeline=False)
+    created = storage.new_conversation(
+        settings.data_dir, "startup speaker", "source.mp4"
+    )
+    root = settings.data_dir / created["id"]
+    (root / "source.mp4").write_bytes(SOURCE_DATA)
+    _write_pipeline_plan(root, delivery="on_screen")
+    assert pipeline.queue_speaker_timing(settings, created["id"]) == "queued"
+    ran = threading.Event()
+    monkeypatch.setattr(
+        pipeline,
+        "produce_speaker_timing",
+        lambda received_settings, received_cid, _runner: (
+            ran.set()
+            if received_settings is settings and received_cid == created["id"]
+            else pytest.fail("startup recovered wrong speaker job")
+        ),
+    )
+
+    with TestClient(create_app(settings)):
+        assert ran.wait(2)
+
+
 def test_on_screen_background_worker_writes_production_receipt(tmp_path, monkeypatch):
     settings = make_settings(tmp_path)
     created = storage.new_conversation(
@@ -323,7 +462,7 @@ def test_on_screen_background_worker_writes_production_receipt(tmp_path, monkeyp
     monkeypatch.setattr(
         pipeline,
         "_speaker_visibility_person_inventory",
-        lambda _meta, _work: ([{
+        lambda _meta, _root, _work, **_kwargs: ([{
             "person_id": "PERSON_01",
             "identity_refs": [{
                 "path": "keyframes/01.png",
@@ -399,6 +538,116 @@ def test_on_screen_background_worker_writes_production_receipt(tmp_path, monkeyp
     assert manifest["speaker_timing_producer"]["path"] == (
         "speaker_timing_production.json"
     )
+
+
+def test_long_worker_uses_segment_source_and_cross_segment_identity_authority(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    created = storage.new_conversation(settings.data_dir, "long speaker", "source.mp4")
+    root = settings.data_dir / created["id"]
+    first = root / "work" / "segments" / "1"
+    second = root / "work" / "segments" / "2"
+    first.joinpath("source.mp4").parent.mkdir(parents=True)
+    first.joinpath("source.mp4").write_bytes(SOURCE_DATA)
+    second.joinpath("source.mp4").parent.mkdir(parents=True)
+    second.joinpath("source.mp4").write_bytes(b"second-segment")
+    _write_pipeline_plan(first, delivery="on_screen")
+    _write_pipeline_plan(second, delivery="off_screen_voiceover")
+    scenes = root / "work" / "scenes.json"
+    scenes.write_text(json.dumps({
+        "scenes": [
+            {"index": 1, "start_s": 0.0, "end_s": 1.0},
+            {"index": 2, "start_s": 1.0, "end_s": 2.0},
+        ],
+    }), encoding="utf-8")
+    identity = second / "work" / "keyframes" / "01.png"
+    identity.parent.mkdir(parents=True)
+    identity.write_bytes(b"identity-from-segment-two")
+    storage.update_meta(
+        settings.data_dir, created["id"], duration_s=2.0,
+        segments=[
+            {"index": 1, "start_s": 0.0, "end_s": 1.0},
+            {"index": 2, "start_s": 1.0, "end_s": 2.0},
+        ],
+    )
+    monkeypatch.setattr(
+        pipeline.image_optimization,
+        "dual_target_plan_receipt",
+        lambda _meta: {"person_plans": [{
+            "id": "PERSON_01",
+            "reference": {"segment_index": 2, "frame_index": 1},
+            "observable_segments": [1],
+        }]},
+    )
+    monkeypatch.setattr(pipeline.h3_project, "freeze_optional", lambda *_args: object())
+
+    def probe(source, local_scenes):
+        assert source == first / "source.mp4"
+        assert json.loads(local_scenes.read_text(encoding="utf-8"))[
+            "source_sha256"
+        ] == _sha(scenes.read_bytes())
+        return {
+            "time_base": {"numerator": 1, "denominator": 8},
+            "duration_pts": 8,
+            "decoded_frame_pts": list(range(8)),
+            "cut_pts": [],
+            "scenes_sha256": _sha(local_scenes.read_bytes()),
+        }
+
+    def extract(_source, target_work, selected):
+        frames, media = [], {}
+        for order, (_dense_index, pts) in enumerate(selected, 1):
+            path = target_work / "speaker-visibility-frames" / f"{order:06d}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"long-sample-{order}".encode())
+            relative = path.relative_to(target_work).as_posix()
+            media[relative] = path.read_bytes()
+            frames.append({
+                "order": order, "path": relative,
+                "sha256": _sha(path.read_bytes()), "pts": pts,
+                "cut_before": False,
+            })
+        sheet = target_work / "speaker-visibility-contact-sheets" / "000001.png"
+        sheet.parent.mkdir(parents=True, exist_ok=True)
+        sheet.write_bytes(b"long-sheet")
+        relative = sheet.relative_to(target_work).as_posix()
+        media[relative] = sheet.read_bytes()
+        return frames, [{
+            "order": 1, "path": relative, "sha256": _sha(sheet.read_bytes()),
+            "frame_orders": list(range(1, 9)),
+        }], media
+
+    class Runner:
+        def run(self, scope_root, _prompt):
+            assert scope_root == first
+            raw = first.joinpath(
+                "work", "speaker_visibility_input.json"
+            ).read_bytes()
+            first.joinpath(
+                "work", "speaker_visibility_output.json"
+            ).write_bytes(_json_bytes(_skill_output(json.loads(raw))))
+
+    assert pipeline.queue_speaker_timing(settings, created["id"]) == "queued"
+    queued = storage.load_meta(settings.data_dir, created["id"])[
+        "_speaker_timing_producer"
+    ]
+    assert [job["scope"] for job in queued["jobs"]] == ["segment:1"]
+    assert queued["jobs"][0]["source"]["path"] == "work/segments/1/source.mp4"
+    result = pipeline.produce_speaker_timing(
+        settings, created["id"], Runner(),
+        timeline_probe=probe, sample_extractor=extract,
+    )
+    assert result == "done", storage.load_meta(settings.data_dir, created["id"])[
+        "_speaker_timing_producer"
+    ]["error"]
+    produced = json.loads(first.joinpath(
+        "work", "speaker_visibility_input.json"
+    ).read_text(encoding="utf-8"))
+    assert produced["persons"][0]["identity_refs"][0]["path"] == (
+        "keyframes/speaker-visibility-identities/PERSON_01.png"
+    )
+    assert not second.joinpath("work", "speaker_visibility_input.json").exists()
 
 
 def test_real_sampler_selects_eight_real_decoded_pts_per_second(tmp_path):

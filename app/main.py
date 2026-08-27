@@ -1330,6 +1330,19 @@ def _run_generation(
                 )
                 if action == "resume":
                     h3_action = "start"
+            h3_project.revalidate_production_authority(
+                (settings.data_dir / cid).resolve(),
+                (settings.data_dir / cid / "work").resolve(),
+                request,
+                expected_production_sha256=(
+                    hashlib.sha256(
+                        frozen.multimodal.speaker_timing_production_data
+                    ).hexdigest()
+                    if frozen.multimodal is not None
+                    and frozen.multimodal.speaker_timing_production_data is not None
+                    else None
+                ),
+            )
         if h3_action == "start":
             result = h3.start(request)
         elif h3_action == "resume":
@@ -1653,7 +1666,7 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
 def _speaker_timing_fingerprint_entries(
     cdir: Path, meta: Mapping[str, object],
 ) -> list[dict[str, object]]:
-    """Hash small timing bytes, independent of mutable stat metadata."""
+    """Hash the complete producer authority, independent of stat metadata."""
     receipt_name = (
         meta.get("long_video_plan_receipt")
         if _is_long_video(meta)
@@ -1681,6 +1694,23 @@ def _speaker_timing_fingerprint_entries(
     else:
         multimodals = [payload.get("multimodal")]
     entries: list[dict[str, object]] = []
+
+    def add(path: Path | None, expected: object = None) -> None:
+        raw_sha256 = None
+        relative = None
+        if path is not None:
+            try:
+                resolved = path.resolve()
+                relative = resolved.relative_to(cdir.resolve()).as_posix()
+                raw_sha256 = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            except (OSError, ValueError):
+                pass
+        entries.append({
+            "path": relative,
+            "expected_sha256": expected,
+            "raw_sha256": raw_sha256,
+        })
+
     for multimodal in multimodals:
         timing = (
             multimodal.get("speaker_timing")
@@ -1691,20 +1721,67 @@ def _speaker_timing_fingerprint_entries(
             continue
         path = _bound_artifact_path(cdir, timing)
         expected = timing.get("sha256") if isinstance(timing, Mapping) else None
-        raw_sha256 = None
-        if path is not None:
-            try:
-                raw_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError:
-                pass
-        entries.append({
-            "path": (
-                path.relative_to(cdir).as_posix() if path is not None else None
-            ),
-            "expected_sha256": expected,
-            "raw_sha256": raw_sha256,
-        })
-    return entries
+        add(path, expected)
+        producer = (
+            multimodal.get("speaker_timing_producer")
+            if isinstance(multimodal, Mapping) else None
+        )
+        if not isinstance(producer, Mapping):
+            continue
+        receipt_path = _bound_artifact_path(cdir, producer)
+        add(receipt_path, producer.get("sha256"))
+        if receipt_path is None:
+            continue
+        try:
+            production = json.loads(receipt_path.read_text(encoding="utf-8"))
+            artifacts = production["artifacts"]
+        except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(artifacts, Mapping):
+            continue
+        producer_input_path = None
+        for role in ("producer_input", "raw_output", "skill"):
+            artifact = artifacts.get(role)
+            if not isinstance(artifact, Mapping):
+                continue
+            relative = artifact.get("path")
+            candidate = None
+            if isinstance(relative, str) and not Path(relative).is_absolute():
+                candidate = receipt_path.parent / relative
+            add(candidate, artifact.get("sha256"))
+            if role == "producer_input":
+                producer_input_path = candidate
+        if producer_input_path is None:
+            continue
+        try:
+            producer_input = json.loads(
+                producer_input_path.read_text(encoding="utf-8")
+            )
+        except (OSError, TypeError, UnicodeError, json.JSONDecodeError):
+            continue
+        evidence: list[object] = []
+        for key in ("frames", "contact_sheets"):
+            values = producer_input.get(key) if isinstance(producer_input, Mapping) else None
+            if isinstance(values, list):
+                evidence.extend(values)
+        persons = producer_input.get("persons") if isinstance(producer_input, Mapping) else None
+        if isinstance(persons, list):
+            for person in persons:
+                refs = person.get("identity_refs") if isinstance(person, Mapping) else None
+                if isinstance(refs, list):
+                    evidence.extend(refs)
+        cut_source = producer_input.get("cut_source") if isinstance(producer_input, Mapping) else None
+        if isinstance(cut_source, Mapping):
+            evidence.append(cut_source)
+        for artifact in evidence:
+            if not isinstance(artifact, Mapping):
+                continue
+            relative = artifact.get("path")
+            candidate = None
+            if isinstance(relative, str) and not Path(relative).is_absolute():
+                candidate = producer_input_path.parent / relative
+            add(candidate, artifact.get("sha256"))
+    return sorted(entries, key=lambda item: str(item.get("path")))
 
 
 def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | None:
@@ -2261,6 +2338,15 @@ def create_app(settings: Settings) -> FastAPI:
         with pipeline_sem:
             pipeline.produce_speaker_timing(settings, cid, codex_runner)
 
+    def schedule_speaker_timing(
+        cid: str, background_tasks: BackgroundTasks,
+    ) -> bool:
+        status = pipeline.queue_speaker_timing(settings, cid)
+        if status == "queued":
+            background_tasks.add_task(run_speaker_timing_gated, cid)
+            return True
+        return status in {"running", "done"}
+
     @app.on_event("startup")
     async def recover_pipeline_inputs() -> None:
         for cid, owner in storage.claim_stale_input_reconciliations(
@@ -2270,6 +2356,14 @@ def create_app(settings: Settings) -> FastAPI:
                 pipeline.reconcile_stale_pipeline(settings, cid, owner)
             else:
                 _reconcile_stale_submission(settings, cid, owner)
+        for cid in pipeline.recover_speaker_timing_jobs(settings):
+            thread = threading.Thread(
+                target=run_speaker_timing_gated,
+                args=(cid,),
+                daemon=True,
+                name=f"speaker-timing-recover-{cid[:8]}",
+            )
+            thread.start()
         if not settings.enable_pipeline:
             return
         for cid, owner in storage.claim_stale_pipeline_inputs(settings.data_dir):
@@ -2645,6 +2739,13 @@ def create_app(settings: Settings) -> FastAPI:
                             resolution=resolution,
                         )
                     except long_generation.LongGenerationError as exc:
+                        if exc.code == "speaker_timing_refresh_required":
+                            schedule_speaker_timing(cid, background_tasks)
+                            return JSONResponse(
+                                status_code=exc.status,
+                                content={"detail": exc.code},
+                                background=background_tasks,
+                            )
                         raise HTTPException(
                             status_code=exc.status, detail=exc.code
                         ) from exc
@@ -2733,6 +2834,13 @@ def create_app(settings: Settings) -> FastAPI:
                 except long_generation.LongGenerationError as exc:
                     if claim_owner:
                         _finish_submission_claim(settings, cid, claim_owner)
+                    if exc.code == "speaker_timing_refresh_required":
+                        schedule_speaker_timing(cid, background_tasks)
+                        return JSONResponse(
+                            status_code=exc.status,
+                            content={"detail": exc.code},
+                            background=background_tasks,
+                        )
                     if previous_status in {"resume_required", "succeeded"} or (
                         previous_status == "failed"
                         and isinstance(old, dict)
@@ -3335,22 +3443,7 @@ def create_app(settings: Settings) -> FastAPI:
                     else:
                         _finish_submission_claim(settings, cid, claim_owner)
                 if exc.detail == "speaker_timing_refresh_required":
-                    latest = storage.load_meta(settings.data_dir, cid)
-                    state = (
-                        latest.get("_speaker_timing_producer")
-                        if isinstance(latest, dict) else None
-                    )
-                    if not isinstance(state, dict) or state.get("status") not in {
-                        "queued", "running", "done",
-                    }:
-                        storage.update_meta(
-                            settings.data_dir,
-                            cid,
-                            _speaker_timing_producer={
-                                "status": "queued", "error": None,
-                            },
-                        )
-                        background_tasks.add_task(run_speaker_timing_gated, cid)
+                    schedule_speaker_timing(cid, background_tasks)
                     return JSONResponse(
                         status_code=exc.status,
                         content={"detail": exc.detail},

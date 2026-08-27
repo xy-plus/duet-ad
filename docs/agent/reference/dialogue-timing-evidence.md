@@ -32,13 +32,25 @@ one sample interval is removed from each end. This is sampled evidence, not a
 claim that every decoded frame was inspected. Ambiguous subject-to-person
 mapping fails closed.
 
+The project scheduler uses the same gate for a short project and for every
+long-video segment. Each segment binds its own source bytes while PERSON
+identity references remain bound to the exact segment/frame selected by the
+project-level continuity receipt. A queued job is restartable only while those
+bindings still match. A crashed running Skill job is adopted only when its
+receipt-bound input, frozen Skill, and exact output are present; otherwise it
+becomes `submission_unknown` and startup never reruns it.
+
 For every `on_screen` line, the full authoritative dialogue interval must be a
 subset of one verified window for the bound subject. Picture references and ASR
 timestamps are never accepted as speaker-visibility proof. Failure occurs in
 `h3_project.build_request_from_parts` before an H3 attempt can be created.
 Factory output, Context-IR boundaries, and H3 paid/read boundaries revalidate
-the same frozen on-screen-dialogue digest. Validation-cache fingerprints include
-the artifact path, expected hash, and current raw-byte hash.
+the same frozen on-screen-dialogue digest. Immediately before every H3
+paid/read boundary, the producer receipt and its raw/sample evidence are
+reloaded and compared with the pre-Context frozen receipt. Validation-cache
+fingerprints include the production receipt, producer input, raw output,
+frozen Skill, every sampled frame/contact sheet/identity reference/cut source,
+their expected hashes, and their current raw-byte hashes.
 
 ## After H3
 

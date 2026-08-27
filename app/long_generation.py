@@ -907,6 +907,29 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
     )
 
 
+def _revalidate_speaker_authority(
+    plan: FrozenPlan, segment: FrozenSegment, request: h3.H3Request,
+) -> None:
+    if plan.workflow not in h3.H3_MULTIMODAL_WORKFLOWS:
+        return
+    try:
+        h3_project.revalidate_production_authority(
+            plan.root,
+            segment.workdir / "work",
+            request,
+            expected_production_sha256=(
+                hashlib.sha256(
+                    segment.multimodal.speaker_timing_production_data
+                ).hexdigest()
+                if segment.multimodal is not None
+                and segment.multimodal.speaker_timing_production_data is not None
+                else None
+            ),
+        )
+    except h3_project.ProjectMultimodalError as exc:
+        raise LongGenerationError(exc.code) from None
+
+
 def _freeze_segment_context_ir(
     settings,
     plan: FrozenPlan,
@@ -1668,6 +1691,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                         error,
                         _exact_h3_attempt_id(state.get("h3_attempt_id")),
                     )
+                _revalidate_speaker_authority(plan, segment, request)
                 result = h3.resume(request)
                 if result.status == "not_started":
                     return (
@@ -1862,6 +1886,9 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 state = states[segment.index]
                 if state.get("status") != "not_started":
                     continue
+                _revalidate_speaker_authority(
+                    plan, segment, requests[segment.index]
+                )
                 result = h3.prepare(requests[segment.index])
                 if result.status == "not_started":
                     prepared_status, prepared_error = "queued", None
@@ -1917,6 +1944,9 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         def submit_one(segment: FrozenSegment):
             previous_attempt = states[segment.index].get("h3_attempt_id")
             try:
+                _revalidate_speaker_authority(
+                    plan, segment, requests[segment.index]
+                )
                 result = h3.submit(requests[segment.index])
                 if result.status == "h3_running":
                     return (
@@ -1977,6 +2007,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             request = requests[segment.index]
             previous_attempt = states[segment.index].get("h3_attempt_id")
             try:
+                _revalidate_speaker_authority(plan, segment, request)
                 result = h3.resume(request)
                 if result.status == "not_started":
                     return (
@@ -2157,6 +2188,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 _exact_h3_attempt_id(previous_attempt),
             )
         try:
+            _revalidate_speaker_authority(plan, segment, request)
             result = h3.start(request) if h3_action == "start" else h3.resume(request)
             if h3_action == "resume" and result.status == "not_started":
                 return request.client_request_id, (

@@ -5,6 +5,7 @@ import threading
 import wave
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import httpx
@@ -18,6 +19,7 @@ from app import (
     long_generation, long_video,
     prepared_input, stitch, storage,
 )
+from app import main as main_module
 from app.main import (
     _SubmitError,
     _finish_generation,
@@ -937,14 +939,98 @@ def test_speaker_visibility_raw_output_drift_is_rejected_before_h3(tmp_path):
         json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
     )
 
-    assert h3_project.freeze_optional(root, work) is not None
+    frozen_production = h3_project.freeze_optional(root, work)
+    assert frozen_production is not None
+    request = SimpleNamespace(
+        on_screen_dialogue=({"subject_id": "S1"},),
+        speaker_timing_sha256=dialogue_timing.canonical_sha256(
+            frozen_production.speaker_timing
+        ),
+    )
+    expected_production_sha256 = hashlib.sha256(
+        frozen_production.speaker_timing_production_data
+    ).hexdigest()
     producer_output.write_text("{}", encoding="utf-8")
     with pytest.raises(
         h3_project.ProjectMultimodalError,
         match="speaker_visibility_output_hash_mismatch",
     ):
         h3_project.freeze_optional(root, work)
+    with pytest.raises(
+        h3_project.ProjectMultimodalError,
+        match="speaker_visibility_output_hash_mismatch",
+    ):
+        h3_project.revalidate_production_authority(
+            root,
+            work,
+            request,
+            expected_production_sha256=expected_production_sha256,
+        )
     assert not (work / "h3-native" / ".h3").exists()
+
+
+def test_short_context_completion_revalidates_producer_before_first_h3_post(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    created = storage.new_conversation(settings.data_dir, "short toctou", "source.mp4")
+    cid = created["id"]
+    request = SimpleNamespace(
+        client_request_id="short-producer-toctou",
+        on_screen_dialogue=({"subject_id": "S1"},),
+    )
+    storage.update_meta(
+        settings.data_dir, cid,
+        generation={
+            "status": "queued", "client_request_id": request.client_request_id,
+            "context_ir": None,
+        },
+    )
+    frozen = SimpleNamespace(
+        multimodal=SimpleNamespace(
+            speaker_timing_production_data=b"frozen-production-receipt"
+        )
+    )
+    monkeypatch.setattr(h3, "is_multimodal_request", lambda _request: True)
+    monkeypatch.setattr(
+        main_module, "_load_short_frozen_input",
+        lambda *_args: (frozen, request.client_request_id),
+    )
+    monkeypatch.setattr(main_module, "_freeze_short_context_ir", lambda *_args: object())
+    monkeypatch.setattr(main_module, "_short_context_ir_may_progress", lambda *_args: True)
+    monkeypatch.setattr(
+        context_ir_bridge, "optimize_h3_prompt",
+        lambda _context: SimpleNamespace(status="succeeded"),
+    )
+    monkeypatch.setattr(
+        h3_project, "context_ir_binding",
+        lambda _result: {"status": "succeeded"},
+    )
+    monkeypatch.setattr(
+        h3_project, "apply_bound_context_ir",
+        lambda _context, _binding: request,
+    )
+    checks = []
+
+    def reject_drift(*_args, **_kwargs):
+        checks.append(True)
+        raise h3_project.ProjectMultimodalError(
+            "speaker_visibility_output_hash_mismatch"
+        )
+
+    monkeypatch.setattr(
+        h3_project, "revalidate_production_authority", reject_drift
+    )
+    monkeypatch.setattr(
+        h3, "start", lambda _request: pytest.fail("drifted producer must make zero H3 POST")
+    )
+
+    _run_generation(settings, cid, request, "start")
+
+    assert checks == [True]
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == (
+        "submission_unknown"
+    )
 
 
 def test_short_query_unknown_with_missing_context_attempt_never_posts(
