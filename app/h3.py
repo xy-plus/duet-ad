@@ -242,9 +242,15 @@ class H3Request:
     audio_required: bool = False
     context_ir_receipt_path: Path | None = None
     context_ir_receipt_sha256: str | None = None
+    gateway_storage_root: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workdir", Path(self.workdir))
+        if self.gateway_storage_root is not None:
+            storage_root = Path(self.gateway_storage_root)
+            if not storage_root.is_absolute():
+                raise H3Error("invalid_gateway_storage_root")
+            object.__setattr__(self, "gateway_storage_root", storage_root)
         if not isinstance(self.cid, str) or not self.cid.strip():
             raise H3Error("invalid_cid")
         if not isinstance(self.client_request_id, str) or not self.client_request_id.strip():
@@ -346,6 +352,7 @@ def _validate_request_audio_contract(
             or request.audio_required is not False
             or request.context_ir_receipt_path is not None
             or request.context_ir_receipt_sha256 is not None
+            or request.gateway_storage_root is not None
         ):
             raise H3Error("mixed_h3_inputs")
         return
@@ -1020,6 +1027,60 @@ def retry(
             )
 
 
+def controlled_storage_rejection_is_safely_retryable(
+    request: H3Request,
+    *,
+    legacy_attempt_sha256: str = "",
+    legacy_evidence_sha256: str = "",
+) -> bool:
+    """Recognize only a definite local Gateway storage rejection.
+
+    A legacy exception is operator-authorized by the exact immutable attempt
+    bytes plus an external rejection-evidence digest.  It is intentionally not
+    inferred from the generic ``h3_submit_rejected`` code.
+    """
+    _require_context_ir_receipt(request)
+    try:
+        state = _find_attempt(request, request.client_request_id)
+    except ReceiptError:
+        return False
+    return _controlled_storage_retry_state_is_valid(
+        request,
+        state,
+        legacy_attempt_sha256=legacy_attempt_sha256,
+        legacy_evidence_sha256=legacy_evidence_sha256,
+    )
+
+
+def retry_controlled_storage_rejection(
+    request: H3Request,
+    *,
+    legacy_attempt_sha256: str = "",
+    legacy_evidence_sha256: str = "",
+    client: httpx.Client | None = None,
+) -> H3Result:
+    """Append one same-client attempt after a proven local 400 rejection."""
+    _require_context_ir_receipt(request)
+    with _session_lease(request):
+        previous = _find_attempt(request, request.client_request_id)
+        if not _controlled_storage_retry_state_is_valid(
+            request,
+            previous,
+            legacy_attempt_sha256=legacy_attempt_sha256,
+            legacy_evidence_sha256=legacy_evidence_sha256,
+        ):
+            raise H3Error("controlled_storage_retry_not_allowed")
+        state = _create_attempt(request, request.client_request_id)
+        with _client(client) as active_client:
+            return _advance_with_provider_retry(
+                request,
+                state,
+                active_client,
+                allow_submit=True,
+                new_attempt=True,
+            )
+
+
 def _state_root(request: H3Request) -> Path:
     return request.workdir / ".h3"
 
@@ -1362,6 +1423,7 @@ def _input_manifest(
                     "receipt_path": str(request.context_ir_receipt_path),
                     "receipt_sha256": request.context_ir_receipt_sha256,
                 },
+                "gateway_inputs": _gateway_input_manifest(request),
             }
         return manifest
     provider_request = {
@@ -1378,6 +1440,92 @@ def _input_manifest(
         "voice_texts_sha256": request.voice_receipt,
         "request": provider_request,
     }
+
+
+def _pre_controlled_storage_input_manifest(
+    request: H3Request, *, workflow: str | None = None,
+) -> dict[str, Any] | None:
+    selected_workflow = workflow or _workflow(request)
+    if selected_workflow not in H3_MULTIMODAL_WORKFLOWS:
+        return None
+    manifest = _input_manifest(request, workflow=selected_workflow)
+    legacy_root = (
+        request.workdir / ".h3" / "multimodal-inputs"
+        / str(request.skill_plan_sha256)
+    )
+    images = tuple(
+        legacy_root
+        / f"image-{index}-{hashlib.sha256(blob).hexdigest()}{path.suffix.lower()}"
+        for index, (path, blob) in enumerate(request.keyframes, 1)
+    )
+    audios = tuple(
+        legacy_root / f"audio-{audio.order}-{audio.sha256}.{audio.format}"
+        for audio in request.reference_audios
+    )
+    body = {
+        "mode": (
+            "multimodal_hd"
+            if selected_workflow == H3_MULTIMODAL_HD_WORKFLOW
+            else "multimodal"
+        ),
+        "prompt": request.prompt,
+        "duration_sec": request.duration,
+        "aspect_ratio": request.aspect_ratio,
+        "resolution": request.resolution,
+        "images": [str(path) for path in images],
+        "audios": [
+            {
+                "path": str(path),
+                "kind": "voice" if audio.purpose == "voice" else "sound",
+                "label": f"{audio.purpose}-{audio.order}",
+            }
+            for audio, path in zip(request.reference_audios, audios, strict=True)
+        ],
+    }
+    manifest["request"]["payload_sha256"] = canonical_json_sha256(body)
+    del manifest["multimodal"]["gateway_inputs"]
+    return manifest
+
+
+def _controlled_storage_retry_state_is_valid(
+    request: H3Request,
+    state: Mapping[str, Any] | None,
+    *,
+    legacy_attempt_sha256: str,
+    legacy_evidence_sha256: str,
+) -> bool:
+    if not isinstance(state, Mapping) or request.gateway_storage_root is None:
+        return False
+    if (
+        state.get("status") != "failed"
+        or state.get("retryable") is not False
+        or state.get("client_request_id") != request.client_request_id
+        or state.get("h3") != {"status": "failed"}
+    ):
+        return False
+    error = state.get("error")
+    if error == {
+        "code": "h3_submit_rejected",
+        "gateway": {"http_status": 400, "reason": "controlled_storage"},
+    }:
+        return True
+    legacy_manifest = _pre_controlled_storage_input_manifest(request)
+    if (
+        not _is_sha256(legacy_attempt_sha256)
+        or not _is_sha256(legacy_evidence_sha256)
+        or state.get("error") != {"code": "h3_submit_rejected"}
+        or state.get("input") != legacy_manifest
+        or state.get("input_receipt") != canonical_json_sha256(legacy_manifest)
+    ):
+        return False
+    attempt_id = state.get("attempt_id")
+    if not isinstance(attempt_id, str):
+        return False
+    try:
+        raw = _attempt_path(request, attempt_id).read_bytes()
+    except OSError:
+        return False
+    return hashlib.sha256(raw).hexdigest() == legacy_attempt_sha256
 
 
 def _workflow(request: H3Request) -> str:
@@ -1464,7 +1612,13 @@ def _reference_audio_manifest(request: H3Request) -> list[dict[str, Any]]:
 
 def _gateway_media_paths(request: H3Request) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
     assert request.skill_plan_sha256 is not None
-    root = request.workdir / ".h3" / "multimodal-inputs" / request.skill_plan_sha256
+    if request.gateway_storage_root is None:
+        raise H3Error("gateway_storage_root_required")
+    root = (
+        request.gateway_storage_root
+        / hashlib.sha256(request.cid.encode("utf-8")).hexdigest()
+        / request.skill_plan_sha256
+    )
     images = tuple(
         root / f"image-{index}-{hashlib.sha256(blob).hexdigest()}{path.suffix.lower()}"
         for index, (path, blob) in enumerate(request.keyframes, 1)
@@ -1474,6 +1628,44 @@ def _gateway_media_paths(request: H3Request) -> tuple[tuple[Path, ...], tuple[Pa
         for audio in request.reference_audios
     )
     return images, audios
+
+
+def _reject_symlink_components(path: Path) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            raise ReceiptError("gateway_input_symlink")
+
+
+def _gateway_input_manifest(request: H3Request) -> list[dict[str, Any]]:
+    images, audios = _gateway_media_paths(request)
+    entries: list[dict[str, Any]] = []
+    for order, ((source, blob), provider) in enumerate(
+        zip(request.keyframes, images, strict=True), 1
+    ):
+        _reject_symlink_components(source.absolute())
+        digest = hashlib.sha256(blob).hexdigest()
+        entries.append({
+            "order": order,
+            "role": "reference_image",
+            "source_path": str(source.absolute()),
+            "source_sha256": digest,
+            "provider_path": str(provider),
+            "provider_sha256": digest,
+        })
+    for audio, provider in zip(request.reference_audios, audios, strict=True):
+        _reject_symlink_components(audio.path.absolute())
+        entries.append({
+            "order": audio.order,
+            "role": "reference_audio",
+            "purpose": audio.purpose,
+            "source_path": str(audio.path.absolute()),
+            "source_sha256": audio.sha256,
+            "provider_path": str(provider),
+            "provider_sha256": audio.sha256,
+        })
+    return entries
 
 
 def _provider_body(request: H3Request) -> dict[str, Any]:
@@ -1512,18 +1704,38 @@ def _provider_body(request: H3Request) -> dict[str, Any]:
 
 
 def _materialize_gateway_inputs(request: H3Request) -> None:
-    images, audios = _gateway_media_paths(request)
-    pairs = tuple(zip(images, (blob for _path, blob in request.keyframes))) + tuple(
-        zip(audios, (audio.data for audio in request.reference_audios))
+    root = request.gateway_storage_root
+    if root is None:
+        raise H3Error("gateway_storage_root_required")
+    _reject_symlink_components(root.absolute())
+    bound = _gateway_input_manifest(request)
+    blobs = tuple(blob for _path, blob in request.keyframes) + tuple(
+        audio.data for audio in request.reference_audios
     )
     try:
-        images[0].parent.mkdir(parents=True, exist_ok=True)
-        for path, blob in pairs:
+        root.mkdir(parents=True, exist_ok=True)
+        root_resolved = root.resolve(strict=True)
+        for item, blob in zip(bound, blobs, strict=True):
+            path = Path(item["provider_path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _reject_symlink_components(path.absolute())
+            try:
+                path.parent.resolve(strict=True).relative_to(root_resolved)
+            except ValueError:
+                raise ReceiptError("gateway_input_path_invalid") from None
             if path.exists():
+                if not path.is_file() or path.is_symlink():
+                    raise ReceiptError("gateway_input_symlink")
                 if path.read_bytes() != blob:
                     raise ReceiptError("receipt_mismatch") from None
                 continue
             _atomic_write_bytes(path, blob)
+            if (
+                path.resolve(strict=True).parent != path.parent.resolve(strict=True)
+                or hashlib.sha256(path.read_bytes()).hexdigest()
+                != item["provider_sha256"]
+            ):
+                raise ReceiptError("receipt_mismatch")
     except ReceiptError:
         raise
     except OSError:
@@ -1934,8 +2146,17 @@ def _validate_state(
     manifest = _input_manifest(request, workflow=stored_workflow)
     legacy_manifest = _legacy_input_manifest(request, workflow=stored_workflow)
     legacy = legacy_manifest is not None and state.get("input") == legacy_manifest
+    storage_legacy_manifest = _pre_controlled_storage_input_manifest(
+        request, workflow=stored_workflow
+    )
+    storage_legacy = (
+        storage_legacy_manifest is not None
+        and state.get("input") == storage_legacy_manifest
+    )
     if legacy:
         manifest = legacy_manifest
+    elif storage_legacy:
+        manifest = storage_legacy_manifest
     attempt_id = state.get("attempt_id")
     stored_request_id = state.get("client_request_id")
     if (
@@ -1992,6 +2213,12 @@ def _validate_state(
                 )
             )
         ):
+            raise ReceiptError("state_invalid")
+    if isinstance(error, dict) and "gateway" in error:
+        if error != {
+            "code": "h3_submit_rejected",
+            "gateway": {"http_status": 400, "reason": "controlled_storage"},
+        }:
             raise ReceiptError("state_invalid")
     h3_task_id = _task_id(h3_state.get("task_id"), required=False)
     if h3_task_id is not None:
@@ -2270,7 +2497,23 @@ def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) 
             response.status_code,
             detail or "no_safe_detail",
         )
-        _fail(request, state, "h3_submit_rejected", retryable=False)
+        gateway_diagnostic = None
+        if (
+            use_gateway
+            and response.status_code == 400
+            and payload.get("error") == "图片不在受控存储内"
+        ):
+            gateway_diagnostic = {
+                "http_status": 400,
+                "reason": "controlled_storage",
+            }
+        _fail(
+            request,
+            state,
+            "h3_submit_rejected",
+            retryable=False,
+            gateway_diagnostic=gateway_diagnostic,
+        )
         raise H3Error("h3_submit_rejected")
     task_id = str(task_value).strip()
     state["h3"] = {
@@ -3416,12 +3659,15 @@ def _fail(
     retryable: bool,
     keep_task: bool = False,
     provider_diagnostic: Mapping[str, str] | None = None,
+    gateway_diagnostic: Mapping[str, Any] | None = None,
 ) -> None:
     state["status"] = "retryable_failure" if retryable else "failed"
     state["retryable"] = retryable
     state["error"] = {"code": code}
     if provider_diagnostic is not None:
         state["error"]["provider"] = dict(provider_diagnostic)
+    if gateway_diagnostic is not None:
+        state["error"]["gateway"] = dict(gateway_diagnostic)
     if not keep_task:
         if state["h3"].get("status") == "submitting":
             state["h3"]["status"] = "failed"
