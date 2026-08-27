@@ -725,6 +725,34 @@ def test_skill_has_generic_per_frame_body_contact_and_photometry_contracts():
         assert case_word not in human
 
 
+def test_skill_requires_a_current_frame_fragment_ledger_and_self_audit():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    for rule in (
+        "全画面人体像素、服装和肢体碎片账本",
+        "任何可见碎片都必须写入 `visible_body_parts`",
+        "五个字段必须相互一致",
+        "不得把 `partial` 或 `cropped` 写成 `absent` 或 `fully-in-frame`",
+        "接触双方边界都在当前帧可见",
+        "不得从相邻帧、reference 或编辑结果补证",
+        "结束前逐帧自校验",
+        "任一矛盾返回空计划",
+    ):
+        assert rule in skill
+
+    for rule in (
+        "全画面人体像素、服装和肢体碎片账本",
+        "五个字段必须相互一致",
+        "partial/cropped",
+        "接触双方边界都在当前帧可见",
+        "结束前逐帧自校验",
+    ):
+        assert rule in human
+
+
 def _plan_v3() -> dict:
     plan = _plan([0])
     plan["version"] = 3
