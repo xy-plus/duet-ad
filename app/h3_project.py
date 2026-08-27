@@ -706,14 +706,19 @@ def apply_bound_context_ir(
 def context_ir_progress_binding_matches(
     source_request: h3.H3Request,
     binding: object,
+    *,
+    frozen_context: context_ir_bridge.FrozenContextIrRequest | None = None,
 ) -> bool:
     """Bind a resumable coordinator marker to its exact persisted attempt."""
+    allowed_binding_statuses = {"running", "query_unknown"}
+    if frozen_context is not None:
+        allowed_binding_statuses.add("failed")
     if (
         not isinstance(binding, Mapping)
         or set(binding) != _CONTEXT_IR_BINDING_KEYS
         or binding.get("schema") != CONTEXT_IR_BINDING_SCHEMA
         or binding.get("version") != CONTEXT_IR_BINDING_VERSION
-        or binding.get("status") not in {"running", "query_unknown"}
+        or binding.get("status") not in allowed_binding_statuses
     ):
         return False
     attempt_id = binding.get("attempt_id")
@@ -736,9 +741,52 @@ def context_ir_progress_binding_matches(
         return False
     if not isinstance(state, Mapping):
         return False
+    binding_status = binding.get("status")
+    state_status = state.get("status")
+    status_matches = (
+        binding_status in {"running", "query_unknown"}
+        and state_status in {"polling", "query_unknown"}
+    ) or (
+        binding_status == "failed"
+        and state_status == "failed"
+        and state.get("error") == "context_ir_result_invalid"
+    )
+    if not status_matches:
+        return False
+    if frozen_context is not None:
+        expected_input = {
+            "cid": frozen_context.cid,
+            "source_h3_client_request_id": (
+                frozen_context.source_h3_request.client_request_id
+            ),
+            "skill_plan_sha256": frozen_context.skill_plan_sha256,
+            "source_prompt_sha256": frozen_context.source_prompt_sha256,
+            "semantic_contract_sha256": frozen_context.semantic_contract_sha256,
+            "references_sha256": frozen_context.references_sha256,
+            "voice_texts_sha256": frozen_context.voice_texts_sha256,
+            "source_h3_request_sha256": frozen_context.source_h3_request_sha256,
+            "upstream_dialogue_sha256": frozen_context.upstream_dialogue_sha256,
+            "upstream_artifact_path": str(frozen_context.upstream_artifact_path),
+            "upstream_artifact_sha256": frozen_context.upstream_artifact_sha256,
+            "upstream_dialogue_sha256_path": list(
+                frozen_context.upstream_dialogue_sha256_path
+            ),
+            "duration": frozen_context.duration,
+            "ratio": frozen_context.ratio,
+        }
+        if (
+            frozen_context.source_h3_request != source_request
+            or state.get("schema") != context_ir_bridge.ATTEMPT_SCHEMA
+            or state.get("version") != context_ir_bridge.SCHEMA_VERSION
+            or state.get("cid") != source_request.cid
+            or state.get("client_request_id") != source_request.client_request_id
+            or state.get("input") != expected_input
+            or state.get("context_ir_attempt_sha256")
+            != frozen_context.context_ir_attempt_sha256
+        ):
+            return False
     return (
         state.get("attempt_id") == attempt_id
-        and state.get("status") in {"polling", "query_unknown"}
         and state.get("provider_task_id") == binding.get("provider_task_id")
         and state.get("context_ir_attempt_sha256")
         == binding.get("context_ir_attempt_sha256")

@@ -615,6 +615,231 @@ def test_short_query_unknown_with_missing_context_attempt_never_posts(
     assert len(context_gateway.posts) == 1
 
 
+def test_short_submit_resumes_legacy_context_result_invalid_with_same_client_and_task(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path,
+        enable_h3_submit=True,
+        autodl_art_token="not-sent",
+        minimax_api_key="not-sent-to-context",
+        h3_poll_interval_s=0,
+    )
+    created = storage.new_conversation(
+        settings.data_dir, "legacy Context recovery", "source.mp4"
+    )
+    cid = created["id"]
+    root = settings.data_dir / cid
+    work = root / "work"
+    source = root / "source.mp4"
+    key = work / "keyframes" / "01.png"
+    visual = work / "visual_prompt.txt"
+    final = work / "prompt.txt"
+    _video(source, frequency=220, duration=4)
+    _png(key, 40)
+    visual.parent.mkdir(parents=True, exist_ok=True)
+    visual.write_text("雨夜车站，人物面对镜头。", encoding="utf-8")
+    dialogue = prepared_input.prepare_dialogue(
+        "custom",
+        4,
+        supplied_lines=[
+            {"text": "准备好了。", "start_s": 0.4, "end_s": 2.2},
+        ],
+    )
+    _multimodal_source(
+        work,
+        visual.read_text(encoding="utf-8"),
+        plan=_projection_plan(
+            visual.read_text(encoding="utf-8"),
+            speech=True,
+            dialogue_source_sha256=h3.canonical_json_sha256(list(dialogue)),
+        ),
+    )
+    frozen = prepared_input.write_prepared_input(
+        root=root,
+        source=source,
+        audio=None,
+        keyframes=[key],
+        visual=visual,
+        final=final,
+        dialogue_mode="custom",
+        dialogue=dialogue,
+        vocal_filter_enabled=True,
+        duration_s=4,
+        ratio="9:16",
+        fit_mode="none",
+        engine_request={"h3": {
+            "workflow": h3.H3_MULTIMODAL_WORKFLOW,
+            "duration": 4,
+            "aspect_ratio": "9:16",
+            "resolution": "768p",
+            "provider_resolution": "768p竖",
+        }},
+        multimodal=h3_project.freeze_optional(root, work),
+    )
+    request = h3_project.build_request(
+        frozen=frozen,
+        cid=cid,
+        workdir=work / "h3-native",
+        client_request_id="legacy-context-recovery",
+        duration=4,
+        resolution="768p",
+        aspect_ratio="9:16",
+        autodl_token=settings.autodl_art_token,
+    )
+    context = h3_project.freeze_context_ir(
+        source_request=request,
+        upstream_dialogue_sha256=frozen.dialogue_sha256,
+        upstream_artifact_path=frozen.receipt_path,
+        upstream_artifact_sha256=frozen.receipt_sha256,
+        upstream_dialogue_sha256_path=("dialogue", "sha256"),
+        minimax_api_key=settings.minimax_api_key,
+        request_timeout_s=1,
+        poll_timeout_s=1,
+        poll_interval_s=0,
+    )
+    context_gateway = _ContextGateway()
+
+    def first_attempt(request_: httpx.Request) -> httpx.Response:
+        if request_.method == "GET":
+            raise httpx.ReadTimeout("ambiguous query", request=request_)
+        return context_gateway(request_)
+
+    with httpx.Client(transport=httpx.MockTransport(first_attempt)) as client:
+        first = context_ir_bridge.optimize_h3_prompt(context, client=client)
+    assert first.status == "query_unknown"
+    binding = h3_project.context_ir_binding(first)
+    binding["status"] = "failed"
+    attempt_path = (
+        request.workdir / ".context-ir" / "attempts" / "000001" / "attempt.json"
+    )
+    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+    attempt["status"] = "failed"
+    attempt["error"] = "context_ir_result_invalid"
+    attempt_path.write_text(
+        json.dumps(attempt, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status="done",
+        duration_s=4,
+        vocal_filter_enabled=True,
+        dialogue_mode="custom",
+        prepared_dialogue=[dict(line) for line in dialogue],
+        prepared_input_receipt=prepared_input.RECEIPT_FILENAME,
+        fit_mode="none",
+        aspect_ratio="9:16",
+        resolution="768p",
+        fit_required=False,
+        fit_profiles={
+            "9:16": {"fit_required": False, "default_fit_mode": "none"},
+            "16:9": {"fit_required": True, "default_fit_mode": "crop"},
+        },
+        generation={
+            "status": "failed",
+            "error": "context_ir_result_invalid",
+            "attempt": 1,
+            "client_request_id": request.client_request_id,
+            "stage": "context_ir_native",
+            "audio_route": dict(h3_project.AUDIO_ROUTE),
+            "h3_attempt_id": None,
+            "context_ir": binding,
+        },
+    )
+    events: list[str] = []
+    query_count = 0
+    source_prompt = context_gateway.tasks[str(first.provider_task_id)]
+
+    def recovery_gateway(request_: httpx.Request) -> httpx.Response:
+        nonlocal query_count
+        assert request_.method == "GET"
+        assert request_.url.path.endswith(f"/{first.provider_task_id}")
+        query_count += 1
+        status = "running" if query_count == 1 else "succeeded"
+        events.append(f"context-{status}")
+        return httpx.Response(200, json={"task": {
+            "id": first.provider_task_id,
+            "task_type": "h3_context_ir",
+            "status": status,
+            "content": {
+                "prompt": "" if status == "running" else (
+                    source_prompt + "\nContext IR preserved the complete prompt."
+                ),
+            },
+        }})
+
+    real_optimize = context_ir_bridge.optimize_h3_prompt
+
+    def optimize(frozen_context):
+        with httpx.Client(
+            transport=httpx.MockTransport(recovery_gateway)
+        ) as client:
+            return real_optimize(frozen_context, client=client)
+
+    monkeypatch.setattr(context_ir_bridge, "optimize_h3_prompt", optimize)
+
+    def start(effective_request):
+        events.append("h3")
+        assert "Context IR preserved the complete prompt." in effective_request.prompt
+        return h3.H3Result("h3_running", "000001")
+
+    monkeypatch.setattr(h3, "start", start)
+    payload = {
+        "confirm": True,
+        "client_request_id": request.client_request_id,
+        "dialogue_mode": "custom",
+        "fit_mode": "none",
+        "aspect_ratio": "9:16",
+        "resolution": "768p",
+        "lines": [
+            {key_: line[key_] for key_ in ("text", "start_s", "end_s")}
+            for line in dialogue
+        ],
+    }
+    with TestClient(create_app(settings)) as api:
+        drifted = {
+            **payload,
+            "lines": [{"text": "输入已漂移。", "start_s": 0.4, "end_s": 2.2}],
+        }
+        rejected = api.post(
+            f"/api/conversations/{cid}/submit", headers=AUTH, json=drifted
+        )
+        assert rejected.status_code == 409
+        assert events == []
+
+        stored = storage.load_meta(settings.data_dir, cid)["generation"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            generation={**stored, "error": "context_ir_provider_failed"},
+        )
+        unrelated = api.post(
+            f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+        )
+        assert unrelated.status_code == 409
+        assert unrelated.json() == {"detail": "new client_request_id required"}
+        assert events == []
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            generation={**stored, "error": "context_ir_result_invalid"},
+        )
+
+        resumed = api.post(
+            f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+        )
+        assert resumed.status_code == 202, resumed.text
+
+    assert events == ["context-running", "context-succeeded", "h3"]
+    assert query_count == 2
+    assert len(context_gateway.posts) == 1
+    recovered = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert recovered["context_ir"]["provider_task_id"] == first.provider_task_id
+    assert recovered["context_ir"]["attempt_id"] == "000001"
+
+
 @pytest.mark.parametrize("mutation", ["bytes", "order"])
 def test_skill_input_keyframe_binding_rejects_drift_before_h3(tmp_path, mutation):
     root = tmp_path / f"keyframe-{mutation}"
