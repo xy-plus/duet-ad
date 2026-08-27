@@ -569,46 +569,11 @@ def _require_speaker_timing_production_authority(request: H3Request) -> None:
     if not request.on_screen_dialogue:
         return
     if request.speaker_timing_authority_version == 0:
-        relative = request.speaker_timing_legacy_receipt_path
-        root = request.speaker_timing_authority_root
-        if (
-            request.speaker_timing_legacy_source_version != 2
-            or not isinstance(relative, str)
-            or not isinstance(root, Path)
-        ):
-            raise ReceiptError("legacy_speaker_timing_authority_required")
-        root = root.resolve()
-        try:
-            path = (root / relative).resolve()
-            path.relative_to(root)
-            data = path.read_bytes()
-            receipt = json.loads(data.decode("utf-8"))
-        except (
-            OSError,
-            ValueError,
-            TypeError,
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-        ):
-            raise ReceiptError("legacy_speaker_timing_authority_invalid") from None
-        if (
-            hashlib.sha256(data).hexdigest()
-            != request.speaker_timing_legacy_receipt_sha256
-            or not isinstance(receipt, Mapping)
-            or set(receipt) != {
-                "schema", "version", "mode", "approved_skill_plan_sha256",
-                "multimodal_input", "skill_plan", "reference_audios",
-            }
-            or receipt.get("schema") != "duet.h3-multimodal-source"
-            or receipt.get("version") != 2
-            or receipt.get("mode") != "multimodal"
-            or not _is_sha256(receipt.get("approved_skill_plan_sha256"))
-            or not isinstance(receipt.get("multimodal_input"), Mapping)
-            or not isinstance(receipt.get("skill_plan"), Mapping)
-            or not isinstance(receipt.get("reference_audios"), list)
-        ):
-            raise ReceiptError("legacy_speaker_timing_authority_invalid")
-        return
+        # A v2 source manifest alone does not prove its nested input, skill
+        # plan, dialogue, keyframes, or audio still match this request.  Until
+        # an existing historical attempt can be fully rebound to those bytes,
+        # every public H3 paid/read/reuse boundary must fail closed.
+        raise ReceiptError("legacy_speaker_timing_authority_unverifiable")
     if request.speaker_timing_authority_version != 1:
         raise ReceiptError("speaker_timing_production_authority_required")
     root = request.speaker_timing_authority_root

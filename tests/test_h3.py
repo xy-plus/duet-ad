@@ -1616,6 +1616,36 @@ def _producer_authority_request(tmp_path: Path) -> tuple[h3.H3Request, Path]:
     ), sample
 
 
+def _legacy_authority_masquerade(request: h3.H3Request) -> h3.H3Request:
+    authority_root = request.speaker_timing_authority_root
+    assert authority_root is not None
+    legacy_receipt = authority_root / "work" / "h3_multimodal_source.json"
+    legacy_receipt.write_text(json.dumps({
+        "schema": "duet.h3-multimodal-source",
+        "version": 2,
+        "mode": "multimodal",
+        "approved_skill_plan_sha256": "a" * 64,
+        "multimodal_input": {"path": "missing-input.json", "sha256": "b" * 64},
+        "skill_plan": {"path": "missing-plan.json", "sha256": "c" * 64},
+        "reference_audios": [],
+    }), encoding="utf-8")
+    return replace(
+        request,
+        speaker_timing_authority_version=0,
+        speaker_timing_production_required=False,
+        speaker_timing_legacy_source_version=2,
+        speaker_timing_legacy_receipt_path=(
+            legacy_receipt.relative_to(authority_root).as_posix()
+        ),
+        speaker_timing_legacy_receipt_sha256=hashlib.sha256(
+            legacy_receipt.read_bytes()
+        ).hexdigest(),
+        speaker_timing_production_path=None,
+        speaker_timing_production_sha256=None,
+        speaker_timing_authority_artifacts=(),
+    )
+
+
 @pytest.mark.parametrize(
     "boundary",
     ["start", "prepare", "submit", "inspect", "resume", "output_is_reusable"],
@@ -1644,9 +1674,7 @@ def test_every_public_h3_boundary_reloads_producer_authority_before_state_or_pos
     assert not request.workdir.joinpath(".h3").exists()
 
 
-def test_on_screen_authority_requires_explicit_producer_or_legacy_version(
-    tmp_path, monkeypatch,
-):
+def test_on_screen_authority_requires_explicit_version(tmp_path):
     request, _sample = _producer_authority_request(tmp_path)
     with pytest.raises(h3.H3Error, match="speaker_timing_authority_required"):
         replace(
@@ -1658,49 +1686,49 @@ def test_on_screen_authority_requires_explicit_producer_or_legacy_version(
             speaker_timing_authority_artifacts=(),
             speaker_timing_authority_root=None,
         )
-    legacy = replace(
-        request,
-        speaker_timing_authority_version=0,
-        speaker_timing_production_required=False,
-        speaker_timing_production_path=None,
-        speaker_timing_production_sha256=None,
-        speaker_timing_authority_artifacts=(),
-        speaker_timing_authority_root=None,
-    )
-    assert legacy.speaker_timing_authority_version == 0
-    monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
-    with pytest.raises(
-        h3.ReceiptError, match="legacy_speaker_timing_authority_required"
-    ):
-        h3.inspect(legacy)
 
-    authority_root = request.speaker_timing_authority_root
-    legacy_receipt = authority_root / "work" / "h3_multimodal_source.json"
-    legacy_receipt.write_text(json.dumps({
-        "schema": "duet.h3-multimodal-source",
-        "version": 2,
-        "mode": "multimodal",
-        "approved_skill_plan_sha256": "a" * 64,
-        "multimodal_input": {"path": "input.json", "sha256": "b" * 64},
-        "skill_plan": {"path": "plan.json", "sha256": "c" * 64},
-        "reference_audios": [],
-    }), encoding="utf-8")
-    relative = legacy_receipt.relative_to(authority_root).as_posix()
-    exact_legacy = replace(
-        legacy,
-        speaker_timing_legacy_source_version=2,
-        speaker_timing_legacy_receipt_path=relative,
-        speaker_timing_legacy_receipt_sha256=hashlib.sha256(
-            legacy_receipt.read_bytes()
-        ).hexdigest(),
-        speaker_timing_authority_root=authority_root,
-    )
-    assert h3.inspect(exact_legacy).status == "not_started"
-    legacy_receipt.write_text("{}", encoding="utf-8")
-    with pytest.raises(
-        h3.ReceiptError, match="legacy_speaker_timing_authority_invalid"
-    ):
-        h3.inspect(exact_legacy)
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "start", "prepare", "submit", "inspect", "resume", "retry",
+        "output_is_reusable", "timeout_attempt_is_get_only_resumable",
+        "controlled_storage_rejection_is_safely_retryable",
+        "retry_controlled_storage_rejection", "load_media_timeline_receipt",
+    ],
+)
+def test_current_on_screen_request_cannot_masquerade_as_legacy_authority(
+    tmp_path, monkeypatch, boundary,
+):
+    request, _sample = _producer_authority_request(tmp_path)
+    request = _legacy_authority_masquerade(request)
+    monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
+    posts = []
+
+    def transport(http_request):
+        posts.append(http_request)
+        return httpx.Response(400, json={"error": "must-not-post"})
+
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(
+            h3.ReceiptError,
+            match="legacy_speaker_timing_authority_unverifiable",
+        ):
+            if boundary in {"start", "submit", "resume"}:
+                getattr(h3, boundary)(request, client=client)
+            elif boundary == "retry":
+                h3.retry(request, "legacy-retry", client=client)
+            elif boundary == "retry_controlled_storage_rejection":
+                h3.retry_controlled_storage_rejection(request, client=client)
+            elif boundary in {
+                "timeout_attempt_is_get_only_resumable",
+                "load_media_timeline_receipt",
+            }:
+                getattr(h3, boundary)(request, "000001")
+            else:
+                getattr(h3, boundary)(request)
+    assert posts == []
+    assert not request.workdir.joinpath(".h3").exists()
 
 
 def test_speaker_authority_root_is_operational_not_source_request_semantics(tmp_path):
