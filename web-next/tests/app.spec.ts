@@ -598,7 +598,7 @@ test('image acceptance CAS conflict warns once and never resubmits automatically
     requests: [],
     acceptImages: async (route) => route.fulfill({
       status: 409,
-      json: { detail: 'image_acceptance_changed' },
+      json: { detail: 'image_acceptance_meta_changed' },
     }),
   };
   await installApi(page, controller);
@@ -635,7 +635,7 @@ test('generation evidence freezes image acceptance and postprocess controls', as
   await login(page);
 
   await expect(page.getByText('生成进行中')).toBeVisible();
-  await expect(page.getByRole('button', { name: '确认使用当前优化图生成视频' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '确认使用当前优化图生成视频' })).toBeDisabled();
   await expect(page.getByText('是否优化素材？')).toHaveCount(0);
   await expect(page.getByRole('checkbox', { name: /移除文字|移除常见|进行图片优化/u })).toHaveCount(0);
 });
@@ -670,7 +670,7 @@ test('optimized non-silent video requires explicit dialogue delivery and submits
 
   await expect(page.getByText('请选择声音呈现方式后再生成视频')).toBeVisible();
   await expect(page.getByRole('button', { name: '确认生成' })).toBeDisabled();
-  await page.getByRole('radio', { name: '画外' }).click();
+  await page.getByRole('radiogroup', { name: '声音呈现' }).getByText('画外', { exact: true }).click();
   await expect(page.getByRole('button', { name: '确认生成' })).toBeEnabled();
   await page.getByRole('button', { name: '确认生成' }).click();
 
@@ -722,7 +722,7 @@ test('a 409 refresh preserves explicit off-screen delivery and never resubmits b
   await installApi(page, controller);
   await login(page);
 
-  await page.getByRole('radio', { name: '画外' }).click();
+  await page.getByRole('radiogroup', { name: '声音呈现' }).getByText('画外', { exact: true }).click();
   await page.getByRole('button', { name: '确认生成' }).click();
   await expect(page.getByRole('alert').filter({
     hasText: '音频与画面输入需要刷新，请等待页面更新后再次确认生成。',
@@ -732,7 +732,7 @@ test('a 409 refresh preserves explicit off-screen delivery and never resubmits b
   )).length).toBeGreaterThan(1);
   await expect(page.getByRole('radio', { name: '画外' })).toBeChecked();
   await expect(page.getByRole('radio', { name: '画内' })).not.toBeChecked();
-  await expect(page.getByRole('radio', { name: '自动' })).not.toBeChecked();
+  await expect(page.getByRole('radio', { name: '自动', exact: true })).not.toBeChecked();
   await page.waitForTimeout(300);
   expect(controller.requests.filter(({ method, path }) => (
     method === 'POST' && path.endsWith('/submit')
