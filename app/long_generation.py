@@ -7,7 +7,7 @@ import json
 import math
 import subprocess
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -806,8 +806,9 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
             context = _freeze_segment_context_ir(
                 settings, plan, segment, source_request
             )
-            return h3_project.apply_bound_context_ir(
-                context, context_ir_binding
+            return replace(
+                h3_project.apply_bound_context_ir(context, context_ir_binding),
+                gateway_storage_root=settings.h3_gateway_storage_root,
             )
         except (h3.H3Error, h3_project.ProjectMultimodalError) as exc:
             raise LongGenerationError(
@@ -946,7 +947,10 @@ def _optimize_segment_context_ir(
         binding = h3_project.context_ir_binding(result)
         if result.status == "succeeded":
             return (
-                h3_project.apply_bound_context_ir(context, binding),
+                replace(
+                    h3_project.apply_bound_context_ir(context, binding),
+                    gateway_storage_root=settings.h3_gateway_storage_root,
+                ),
                 binding,
                 "succeeded",
                 None,
@@ -1362,18 +1366,54 @@ def stitched_output_is_reusable(
     generation: Mapping | None = None,
     provider_media: Mapping[int, tuple[str, Mapping[str, object]]] | None = None,
 ) -> bool:
-    """Validate the published video against the exact local stitch receipt."""
+    """Validate legacy output or native output with exact attempt evidence."""
     if dialogue_mode not in {"auto", "none"}:
         return False
     output = plan.root / "generated.mp4"
     receipt_path = plan.root / stitch.RECEIPT_FILENAME
     native_audio = _is_h3_multimodal_plan(plan)
-    if generation is not None:
+    if native_audio:
+        if (
+            not isinstance(generation, Mapping)
+            or not generation
+            or not isinstance(provider_media, Mapping)
+            or not provider_media
+            or not generation_segments_are_valid(plan.segments, generation)
+        ):
+            return False
         try:
-            if _generation_uses_h3_native_audio(plan, generation) != native_audio:
+            if not _generation_uses_h3_native_audio(plan, generation):
                 return False
         except LongGenerationError:
             return False
+        states = {
+            item.get("index"): item
+            for item in generation.get("segments", [])
+            if isinstance(item, Mapping)
+        }
+        if set(provider_media) != {segment.index for segment in plan.segments}:
+            return False
+        for segment in plan.segments:
+            state = states.get(segment.index)
+            media = provider_media.get(segment.index)
+            if (
+                not isinstance(state, Mapping)
+                or state.get("status") != "succeeded"
+                or not isinstance(media, tuple)
+                or len(media) != 2
+                or media[0] != state.get("h3_attempt_id")
+                or not isinstance(media[1], Mapping)
+            ):
+                return False
+    else:
+        if provider_media is not None:
+            return False
+        if generation is not None:
+            try:
+                if _generation_uses_h3_native_audio(plan, generation):
+                    return False
+            except LongGenerationError:
+                return False
     audio_mode: stitch.AudioMode = (
         "provider_generated"
         if native_audio
@@ -1414,29 +1454,10 @@ def stitched_output_is_reusable(
             actual_audio = payload.get("audio")
             if not isinstance(actual_audio, dict):
                 return False
-            provider_segments = actual_audio.get("provider_segments")
-            if provider_media is not None:
-                expected_audio["provider_segments"] = [
-                    stitch._provider_binding(segment, index)
-                    for index, segment in enumerate(stitch_segments, 1)
-                ]
-            elif (
-                not isinstance(provider_segments, list)
-                or len(provider_segments) != len(plan.segments)
-                or any(
-                    not isinstance(item, dict)
-                    or set(item) != {
-                        "source", "attempt_id", "media_timeline_sha256",
-                        "decoded_audio_sha256",
-                    }
-                    or item.get("source") != "h3"
-                    or _exact_h3_attempt_id(item.get("attempt_id")) is None
-                    for item in provider_segments
-                )
-            ):
-                return False
-            else:
-                expected_audio["provider_segments"] = provider_segments
+            expected_audio["provider_segments"] = [
+                stitch._provider_binding(segment, index)
+                for index, segment in enumerate(stitch_segments, 1)
+            ]
             expected_audio["edl"] = {
                 "schema": "duet.av-edl",
                 "version": 1,
@@ -1777,7 +1798,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                             settings, plan, segment, source_request
                         )
                         return (
-                            h3_project.apply_bound_context_ir(context, binding),
+                            replace(
+                                h3_project.apply_bound_context_ir(context, binding),
+                                gateway_storage_root=(
+                                    settings.h3_gateway_storage_root
+                                ),
+                            ),
                             binding,
                             "succeeded",
                             None,
@@ -2074,8 +2100,11 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     context = _freeze_segment_context_ir(
                         settings, plan, segment, request
                     )
-                    request = h3_project.apply_bound_context_ir(
-                        context, context_binding
+                    request = replace(
+                        h3_project.apply_bound_context_ir(
+                            context, context_binding
+                        ),
+                        gateway_storage_root=settings.h3_gateway_storage_root,
                     )
                 else:
                     if not _context_ir_may_progress(

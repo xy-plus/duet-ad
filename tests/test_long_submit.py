@@ -3701,6 +3701,51 @@ def test_run_h3_native_audio_never_restores_source_track(tmp_path, monkeypatch):
         "000001", "000002",
     ]
     assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+    exact_provider_media = {
+        index: (
+            f"{index:06d}",
+            {
+                "schema": "duet.h3.media_timeline",
+                "version": 1,
+                "decode_complete": True,
+                "video": {"index": 0},
+                "audio": {"index": 1, "decoded_sha256": f"{index:064x}"},
+            },
+        )
+        for index in (1, 2)
+    }
+    assert _REAL_STITCHED_OUTPUT_IS_REUSABLE(
+        plan,
+        "auto",
+        generation=generation,
+        provider_media=exact_provider_media,
+    )
+    assert not _REAL_STITCHED_OUTPUT_IS_REUSABLE(plan, "auto")
+    mismatched_generation = {
+        **generation,
+        "segments": [dict(item) for item in generation["segments"]],
+    }
+    mismatched_generation["segments"][0]["h3_attempt_id"] = "999999"
+    assert not _REAL_STITCHED_OUTPUT_IS_REUSABLE(
+        plan,
+        "auto",
+        generation=mismatched_generation,
+        provider_media=exact_provider_media,
+    )
+    mismatched_provider_media = dict(exact_provider_media)
+    mismatched_provider_media[1] = (
+        "000001",
+        {
+            **exact_provider_media[1][1],
+            "audio": {"index": 1, "decoded_sha256": "f" * 64},
+        },
+    )
+    assert not _REAL_STITCHED_OUTPUT_IS_REUSABLE(
+        plan,
+        "auto",
+        generation=generation,
+        provider_media=mismatched_provider_media,
+    )
 
 
 def test_h3_native_submission_unknown_never_calls_stitch(tmp_path, monkeypatch):

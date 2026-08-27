@@ -1417,7 +1417,25 @@ def test_two_segment_long_project_builds_each_exact_multimodal_request(
     ])
     context_gateway = _ContextGateway()
     _install_fake_context(monkeypatch, context_gateway)
+    frozen_context_requests = []
+    fake_context_optimize = context_ir_bridge.optimize_h3_prompt
+
+    def capture_context_request(frozen):
+        frozen_context_requests.append(frozen.source_h3_request)
+        return fake_context_optimize(frozen)
+
+    monkeypatch.setattr(
+        context_ir_bridge, "optimize_h3_prompt", capture_context_request
+    )
     _install_fake_h3(monkeypatch, gateway)
+    started_h3_requests = []
+    fake_h3_start = h3.start
+
+    def capture_h3_request(request):
+        started_h3_requests.append(request)
+        return fake_h3_start(request)
+
+    monkeypatch.setattr(h3, "start", capture_h3_request)
     payload = {
         "confirm": True,
         "client_request_id": "long-parent-request",
@@ -1442,6 +1460,17 @@ def test_two_segment_long_project_builds_each_exact_multimodal_request(
         assert submitted.status_code == 202, submitted.text
 
     assert len(gateway.posts) == 2
+    assert len(frozen_context_requests) == 2
+    assert all(
+        request.gateway_storage_root is None
+        for request in frozen_context_requests
+    )
+    assert len(started_h3_requests) == 2
+    assert all(
+        request.gateway_storage_root == settings.h3_gateway_storage_root
+        and request.context_ir_receipt_path is not None
+        for request in started_h3_requests
+    )
     assert len(context_gateway.posts) == 2
     assert all(set(body) == {
         "mode", "prompt", "duration_sec", "aspect_ratio", "resolution",
