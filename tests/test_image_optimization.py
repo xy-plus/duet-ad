@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 import time
+from copy import deepcopy
 from dataclasses import replace
 
 import cv2
@@ -876,3 +877,176 @@ def test_recovery_ignores_old_unknown_revision_on_done_segment(tmp_path, monkeyp
     assert latest["status"] == "done"
     assert len(calls) == 1 and "/segments/2/" in calls[0].as_posix()
     assert old.is_file()
+
+
+def _v3_frame_bound_plan() -> dict:
+    return {
+        "version": 3,
+        "phase": "plan",
+        "segment_indices": [0],
+        "eligible": True,
+        "reason": None,
+        "person_plans": [{
+            "id": "PERSON_01",
+            "source_identity": "源叙事主人物",
+            "replacement_identity": "不同的新人物设计",
+            "wardrobe_change": "保持用途并改变款式",
+            "local_color_change": "人物局部固有色明显改变",
+            "reference": {"segment_index": 0, "frame_index": 1},
+            "observable_segments": [0],
+        }],
+        "scene_plans": [{
+            "id": "SCENE_01",
+            "source_scene": "源环境",
+            "replacement_scene": "同用途的真实新环境",
+            "semantic_change": "环境语义明显改变",
+            "geometry_changes": ["主要形状与连接关系改变"],
+            "depth_changes": ["前后纵深改变"],
+            "layout_changes": ["功能区域布局改变"],
+            "local_color_change": "场景局部固有色明显改变",
+            "reference": {"segment_index": 0, "frame_index": 1},
+            "segments": [0],
+        }],
+        "segments": [{
+            "segment_index": 0,
+            "persons": [{
+                "id": "PERSON_01",
+                "state": "replace",
+                "observable_frames": [1, 2],
+                "target_region": "完整可见主人物",
+                "boundary": "人物可见轮廓",
+            }],
+            "scene": {
+                "scene_id": "SCENE_01",
+                "target_region": "人物以外完整场景",
+                "boundary": "人物与前景实体轮廓",
+                "layout_reference_frame_index": 1,
+            },
+            "protected_non_target_people": [],
+            "protected_relations": ["可见物理关系保持"],
+            "frame_constraints": [
+                {
+                    "frame_index": 1,
+                    "visible_body_parts": "帧一身体可见部位数量保持",
+                    "pose_skeleton": "帧一姿态骨架保持",
+                    "contact_points": "帧一接触点保持",
+                    "occlusion_order": "帧一遮挡顺序保持",
+                    "out_of_frame_crop": "帧一画外裁切保持",
+                },
+                {
+                    "frame_index": 2,
+                    "visible_body_parts": "帧二身体可见部位数量保持",
+                    "pose_skeleton": "帧二姿态骨架保持",
+                    "contact_points": "帧二接触点保持",
+                    "occlusion_order": "帧二遮挡顺序保持",
+                    "out_of_frame_crop": "帧二画外裁切保持",
+                },
+            ],
+            "photometric_contract": {
+                "light_direction": "全局光源方向保持",
+                "light_quality": "全局光线软硬保持",
+                "exposure_or_intensity": "全局曝光强度保持",
+                "wb_cct": "白平衡色温保持",
+                "global_contrast": "全局对比保持",
+                "tone_curve": "全局 tone curve 保持",
+            },
+        }],
+    }
+
+
+def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARK_API_KEY", "secret")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    sources = [_png(value=31), _png(value=62)]
+    (cdir / "work" / "keyframes" / "01.png").write_bytes(sources[0])
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(sources[1])
+    plan = _v3_frame_bound_plan()
+    inventory = [
+        {
+            "segment_index": 0,
+            "frame_index": index,
+            "frame_name": f"{index:02d}.png",
+            "source_sha256": hashlib.sha256(source).hexdigest(),
+        }
+        for index, source in enumerate(sources, 1)
+    ]
+    execution = image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={"id": "dual-target", "revision": 3},
+        model=settings.seedream_model,
+        frame_inventory=inventory,
+    )
+    frozen = image_optimization.freeze_frame_prompts(
+        settings,
+        execution,
+        image_optimization.compile_frame_prompts(plan, settings.seedream_edit_mode),
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        keyframes=["01.png", "02.png"],
+        **image_optimization.freeze_continuity(plan, frame_counts={0: 2}),
+        **frozen,
+    )
+    created = storage.load_meta(settings.data_dir, cid)
+    assert image_optimization.continuity_receipt(created) is not None
+    assert image_optimization.dual_target_plan_receipt(created) is not None
+    assert image_optimization.receipt(created, settings) is not None
+    captured = []
+    response_image = base64.b64encode(_png(value=99)).decode()
+
+    async def handler(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"data": [{"b64_json": response_image}]})
+
+    real_edit = seedream.edit
+
+    async def capture_edit(settings_, images, prompt, output, *, receipt_path, transport=None):
+        return await real_edit(
+            settings_, images, prompt, output, receipt_path=receipt_path,
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(postprocess.seedream, "edit", capture_edit)
+    asyncio.run(postprocess.start(
+        settings,
+        cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False, "remove_brand": False, "optimize_image": True,
+        }},
+        {},
+    ))
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1)
+    ))
+
+    assert len(captured) == 2
+    prompts = [body["prompt"] for body in captured]
+    assert any("帧一身体可见部位数量保持" in prompt for prompt in prompts)
+    assert any("帧二身体可见部位数量保持" in prompt for prompt in prompts)
+    assert all(len(body["image"]) == 1 for body in captured)
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert latest["postprocess"]["status"] == "done"
+    receipt = image_optimization.receipt(latest, settings)
+    assert receipt is not None and receipt["version"] == 3
+    assert {
+        (item["segment_index"], item["frame_name"], item["source_sha256"])
+        for item in receipt["frames"]
+    } == {
+        (item["segment_index"], item["frame_name"], item["source_sha256"])
+        for item in inventory
+    }
+
+    for mutate in (
+        lambda value: value["frames"].pop(),
+        lambda value: value["frames"].append(dict(value["frames"][0])),
+        lambda value: value["frames"][0].update(source_sha256="0" * 64),
+    ):
+        damaged = deepcopy(latest)
+        mutate(damaged["_image_optimization"])
+        assert image_optimization.receipt(damaged, settings) is None

@@ -1,13 +1,13 @@
 ---
 name: image-postprocess
-description: 为视频项目冻结关键帧生成或验收 v2 人物与真实新场景双替换计划；以完整性、连续性、物理关系和光色合同为硬门。用于图片后处理的 plan 与 verify 阶段。
+description: 为视频项目冻结关键帧生成或验收 v3 人物与真实新场景双替换计划；以逐帧完整性、连续性、物理关系和光色合同为硬门。用于图片后处理的 plan 与 verify 阶段。
 ---
 
 # image-postprocess
 
 ## 边界
 
-`work/request.json` 的 `phase` 只能是 `plan` 或 `verify`：
+`work/request.json` 的 `phase` 只能是 `plan` 或 `verify`。新计划只输出 v3；已有 v2 receipt 只读兼容，不回写或降级：
 
 | phase | 只读 | 只写 |
 | --- | --- | --- |
@@ -30,8 +30,9 @@ description: 为视频项目冻结关键帧生成或验收 v2 人物与真实新
 | 场景 | 同一物理环境建一个可独立生成且可冻结的场景目标包，各组件无重叠覆盖全部段，每段恰属一个组件。真实新环境保持叙事用途，但每个所属段的语义、几何、纵深、布局和局部材质或固有色都必须可见改变；局部固有色变化不等于全局调色，不得只改色相、材质或全局调色，也不能让原结构换皮冒充新场景。 |
 | 目标稳定 | 同一人物或场景的目标包逐段复用；不逐帧重设计，也不从编辑结果递推。`person_plans` 的新身份/服装/局部颜色字段与 `scene_plans` 的新环境/五类变化字段分别构成对应的冻结目标规格。 |
 | source/target | 源身份、源场景和源 `reference` 只作负样本证据，不得成为 target pack；它们定位应消失的旧设计和应保留的关系。target pack 只由新人物和真实新场景的设计字段定义。人物/场景 `reference` 须清晰、遮挡少且确属该轨道/组件；段布局引用须确属本段。 |
-| 当前帧事实 | 每帧只以当前源帧作为姿态、边界与关系的几何事实。把交互、接触、持握、装配、支撑、遮挡、前后顺序、视线、姿态、动作目的、数量、尺度和叙事关系写入 `protected_relations`。 |
-| 保持合同 | 保持画幅、裁切、机位、镜头、透视、构图、焦点、景深及全局光源方向、曝光、白平衡/CCT、tone curve、整体色彩风格；目标局部固有色按计划改变，新几何只允许产生物理正确的局部阴影和反射。避免扭曲、融合、穿模或违反现实规则。 |
+| 当前帧事实 | plan 与 verify 都逐帧核验，任一帧 unknown 或 fail 整体 fail-closed。每帧只以当前源帧作为姿态、边界与关系的几何事实；每一帧的可见事实不得从相邻帧、reference 或编辑结果补全，只以该帧源图确定可见身体部位数量、姿态骨架、尺度、手脚、道具、绳索、支撑面的接触点、遮挡前后顺序与画外裁切。把交互、接触、持握、装配、支撑、遮挡、前后顺序、视线、姿态、动作目的、数量、尺度和叙事关系写入 `protected_relations`。禁止补造画外身体或工具，禁止删除或新增肢体，禁止改变接触图。 |
+| v3 逐帧合同 | 每段 `frame_constraints` 按帧号升序且一一覆盖全部冻结帧，无重复或遗漏；每项恰含 `frame_index`、`visible_body_parts`、`pose_skeleton`、`contact_points`、`occlusion_order`、`out_of_frame_crop`。每段 `photometric_contract` 恰含 `light_direction`、`light_quality`、`exposure_or_intensity`、`wb_cct`、`global_contrast`、`tone_curve`。 |
+| 保持合同 | 保持画幅、裁切、机位、镜头、透视、构图、焦点、景深及全局光源方向、软硬、强度、曝光、白平衡、色温、整体色调、全局对比与 tone curve（即光源方向、曝光、白平衡/CCT、tone curve 的完整展开）；目标人物和新场景的局部固有色必须明显不同。新几何只允许产生物理正确的局部阴影和反射，且仅与原光源一致，禁止全局重布光。避免扭曲、融合、穿模或违反现实规则。 |
 | 画面洁净 | 不恢复或新增文字、字幕、Logo、水印、贴纸、界面、品牌标识或乱码。不得出现素材特调；不写只适用于特定素材的对象、环境、色值、构图或位置规则。 |
 
 执行合同：图1始终是唯一编辑画布；其他输入只承担后端声明的证据或布局角色，不传递构图、机位、动作、光线或实体关系，也不以某段首帧锚定其他帧。
@@ -39,7 +40,7 @@ description: 为视频项目冻结关键帧生成或验收 v2 人物与真实新
 失败 `reason` 取首个成立项：`no_observable_narrative_person`、`narrative_person_tracks_ambiguous`、`person_replacement_unsafe`、`scene_components_ambiguous`、`scene_structure_replacement_unsafe`。失败输出固定为：
 
 ```json
-{"version":2,"phase":"plan","segment_indices":[0],"eligible":false,"reason":"no_observable_narrative_person","person_plans":[],"scene_plans":[],"segments":[]}
+{"version":3,"phase":"plan","segment_indices":[0],"eligible":false,"reason":"no_observable_narrative_person","person_plans":[],"scene_plans":[],"segments":[]}
 ```
 
 ## plan 唯一输出
@@ -48,10 +49,10 @@ description: 为视频项目冻结关键帧生成或验收 v2 人物与真实新
 
 ```json
 {
-  "version":2,"phase":"plan","segment_indices":[0],"eligible":true,"reason":null,
+  "version":3,"phase":"plan","segment_indices":[0],"eligible":true,"reason":null,
   "person_plans":[{"id":"PERSON_01","source_identity":"源人物特征","replacement_identity":"不同的新人物设计","wardrobe_change":"服装变化","local_color_change":"人物局部固有色变化","reference":{"segment_index":0,"frame_index":1},"observable_segments":[0]}],
   "scene_plans":[{"id":"SCENE_01","source_scene":"源环境语义","replacement_scene":"同用途且设计不同的真实新环境","semantic_change":"环境语义变化","geometry_changes":["几何变化"],"depth_changes":["纵深变化"],"layout_changes":["布局变化"],"local_color_change":"场景局部材质或固有色变化","reference":{"segment_index":0,"frame_index":1},"segments":[0]}],
-  "segments":[{"segment_index":0,"persons":[{"id":"PERSON_01","state":"replace","observable_frames":[1],"target_region":"人物完整目标域","boundary":"人物可见边界"}],"scene":{"scene_id":"SCENE_01","target_region":"场景完整目标域","boundary":"场景停止边界","layout_reference_frame_index":1},"protected_non_target_people":[],"protected_relations":["需保持的可见关系"]}]
+  "segments":[{"segment_index":0,"persons":[{"id":"PERSON_01","state":"replace","observable_frames":[1],"target_region":"人物完整目标域","boundary":"人物可见边界"}],"scene":{"scene_id":"SCENE_01","target_region":"场景完整目标域","boundary":"场景停止边界","layout_reference_frame_index":1},"protected_non_target_people":[],"protected_relations":["需保持的可见关系"],"frame_constraints":[{"frame_index":1,"visible_body_parts":"当前帧可见部位数量","pose_skeleton":"当前帧姿态骨架","contact_points":"当前帧接触点","occlusion_order":"当前帧遮挡顺序","out_of_frame_crop":"当前帧画外裁切"}],"photometric_contract":{"light_direction":"当前帧全局光源方向","light_quality":"当前帧全局光线软硬","exposure_or_intensity":"当前帧全局曝光强度","wb_cct":"当前帧白平衡色温","global_contrast":"当前帧全局对比","tone_curve":"当前帧全局 tone curve"}}]
 }
 ```
 
@@ -59,13 +60,14 @@ description: 为视频项目冻结关键帧生成或验收 v2 人物与真实新
 
 ## verify 清单
 
-逐帧对照 source/output、冻结 plan 和 metrics：
+逐帧对照 source/output、冻结 plan 和 metrics；每项 `evidence` 必须覆盖该项逐帧可见事实，不能以段级印象补全帧级事实。
 
 | 范围 | 必须逐项检查 |
 | --- | --- |
 | 逐人物、逐可观察帧 | `identity_changed`：符合同一冻结人物目标包；`source_identity_absent`：源身份不可识别；`local_color_change`：计划颜色已改变。任一可观察主人物漏换、串人或仍像源人物即 `fail`。 |
 | 逐场景、逐所属段 | `semantic_change`、`geometry_change`、`depth_change`、`layout_change`、`local_color_change` 都符合同一冻结场景目标包；旧场景语义或空间骨架仍构成目标、纯调色或换皮即 `fail`。 |
-| 每段不变量 | `lighting_preservation`、`interaction_preservation`、`cross_frame_continuity`；逐帧核对相机、全局光色和可见关系。`hard_cut` 两侧不强求场景连续，但切后不能继承无切后证据的切前设计。 |
+| 每段不变量 | `lighting_preservation`、`interaction_preservation`、`cross_frame_continuity`；逐帧核对相机、全局光色、可见身体部位数量、姿态骨架、尺度、接触图、遮挡顺序与画外裁切。`hard_cut` 两侧不强求场景连续，但切后不能继承无切后证据的切前设计。 |
+| 逐帧合同 | `frame_checks` 按帧号一一对应 `frame_constraints`，每项恰含 `frame_index` 和 `visible_body_parts`、`pose_skeleton`、`contact_points`、`occlusion_order`、`out_of_frame_crop`、`photometric_contract` 七个检查；逐项依据该帧 source/output 与冻结约束验收。 |
 | 全项目 | 主人物无遗漏、无串人、无计划外人物；人物目标包与场景目标包在各自连续范围内保持一致。 |
 
 每项严格输出 `{status,evidence}`；`status` 只能是 `pass/not_applicable/fail/unknown`，`evidence` 只能来自可见证据或 metrics。证据不足为 `unknown`，证据相反为 `fail`；`not_applicable` 只用于计划中 `not_observable` 的人物，且须确认结果未新增该人物或身体部分。段 `passed=true` 当且仅当全部适用项为 `pass`；项目 `passed=true` 当且仅当全部段和项目项为 `pass`。任何 `fail` 或 `unknown` 都令 `passed=false`，不能用成功 no-op 代替双替换。只验收，不修图或建议重试。
@@ -74,12 +76,13 @@ description: 为视频项目冻结关键帧生成或验收 v2 人物与真实新
 
 ```json
 {
-  "version":2,"phase":"verify","plan_sha256":"逐字复制 frozen_plan.json 的 sha256","segment_indices":[0],"passed":false,"reason":"scene_semantic_change_failed",
+  "version":3,"phase":"verify","plan_sha256":"逐字复制 frozen_plan.json 的 sha256","segment_indices":[0],"passed":false,"reason":"scene_semantic_change_failed",
   "segments":[{
     "segment_index":0,"passed":false,
     "person_checks":[{"person_id":"PERSON_01","identity_changed":{"status":"pass","evidence":"可见证据"},"source_identity_absent":{"status":"pass","evidence":"可见证据"},"local_color_change":{"status":"pass","evidence":"可见证据"}}],
     "scene_checks":{"semantic_change":{"status":"fail","evidence":"可见证据"},"geometry_change":{"status":"pass","evidence":"可见证据"},"depth_change":{"status":"pass","evidence":"可见证据"},"layout_change":{"status":"pass","evidence":"可见证据"},"local_color_change":{"status":"pass","evidence":"可见证据"}},
-    "invariants":{"lighting_preservation":{"status":"pass","evidence":"可见证据"},"interaction_preservation":{"status":"pass","evidence":"可见证据"},"cross_frame_continuity":{"status":"pass","evidence":"可见证据"}}
+    "invariants":{"lighting_preservation":{"status":"pass","evidence":"可见证据"},"interaction_preservation":{"status":"pass","evidence":"可见证据"},"cross_frame_continuity":{"status":"pass","evidence":"可见证据"}},
+    "frame_checks":[{"frame_index":1,"visible_body_parts":{"status":"pass","evidence":"可见证据"},"pose_skeleton":{"status":"pass","evidence":"可见证据"},"contact_points":{"status":"pass","evidence":"可见证据"},"occlusion_order":{"status":"pass","evidence":"可见证据"},"out_of_frame_crop":{"status":"pass","evidence":"可见证据"},"photometric_contract":{"status":"pass","evidence":"可见证据"}}]
   }],
   "project_checks":{"narrative_person_completeness":{"status":"pass","evidence":"可见证据"},"no_identity_swap":{"status":"pass","evidence":"可见证据"},"no_unplanned_person":{"status":"pass","evidence":"可见证据"},"person_identity_continuity":{"status":"pass","evidence":"可见证据"},"scene_continuity":{"status":"pass","evidence":"可见证据"}}
 }

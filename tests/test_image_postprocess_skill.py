@@ -92,13 +92,18 @@ def _ineligible(reason: str = "no_observable_narrative_person") -> dict:
     }
 
 
-def _segments(session: Path, indices: list[int] | None = None) -> list[dict]:
+def _segments(
+    session: Path, indices: list[int] | None = None, *, frames: int = 1
+) -> list[dict]:
     indices = indices or [1, 2]
     result = []
     for index in indices:
         path = session / "work" / "segments" / str(index) / "work" / "keyframes"
         path.mkdir(parents=True)
-        (path / "01.png").write_bytes(_png(index))
+        for frame_index in range(1, frames + 1):
+            (path / f"{frame_index:02d}.png").write_bytes(
+                _png(index + frame_index)
+            )
         result.append(
             {
                 "index": index,
@@ -351,6 +356,24 @@ def test_short_video_can_express_both_targets_without_special_noop_contract(tmp_
     assert generated["segments"][0]["persons"][0]["state"] == "replace"
     assert "替换人物" in prompts[0] and "替换场景" in prompts[0]
     assert "图1始终是唯一编辑画布" in prompts[0]
+
+
+def test_plan_phase_v3_compiles_one_prompt_for_each_frozen_source_frame(tmp_path):
+    session = tmp_path / "session"
+    plan = _plan_v3()
+
+    generated, prompts = image_optimization.generate_project_prompts(
+        _Runner(plan),
+        _segments(session, [0], frames=2),
+        "independent_parallel",
+        session_dir=session,
+    )
+
+    assert generated["version"] == 3
+    assert set(prompts) == {0} and set(prompts[0]) == {1, 2}
+    assert prompts[0][1] != prompts[0][2]
+    assert "可见部位数量与边界保持当前源帧" in prompts[0][1]
+    assert "第二帧可见部位数量与边界保持当前源帧" in prompts[0][2]
 
 
 def test_ineligible_plan_is_a_stable_failure_not_successful_noop(tmp_path):
@@ -656,3 +679,173 @@ def test_verify_accepts_canonical_fail_closed_failure():
     plan = _plan()
     verdict = _verdict(plan, passed=False)
     assert image_optimization.canonical_verification(verdict, plan) == verdict
+
+
+def test_skill_has_generic_per_frame_body_contact_and_photometry_contracts():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    required_skill_rules = (
+        "plan 与 verify 都逐帧核验，任一帧 unknown 或 fail 整体 fail-closed",
+        "只以该帧源图确定可见身体部位数量、姿态骨架、尺度",
+        "手脚、道具、绳索、支撑面的接触点",
+        "遮挡前后顺序与画外裁切",
+        "禁止补造画外身体或工具，禁止删除或新增肢体，禁止改变接触图",
+        "全局光源方向、软硬、强度、曝光、白平衡、色温、整体色调、全局对比与 tone curve",
+        "目标人物和新场景的局部固有色必须明显不同",
+        "禁止全局重布光",
+        "新几何只允许产生物理正确的局部阴影和反射，且仅与原光源一致",
+        "每一帧的可见事实不得从相邻帧、reference 或编辑结果补全",
+        "新计划只输出 v3；已有 v2 receipt 只读兼容",
+        "每段 `frame_constraints` 按帧号升序且一一覆盖全部冻结帧",
+        "每段 `photometric_contract` 恰含",
+        "`frame_checks` 按帧号一一对应 `frame_constraints`",
+    )
+    for rule in required_skill_rules:
+        assert rule in skill
+
+    required_human_rules = (
+        "逐帧保留可见身体部位数量、姿态骨架、尺度",
+        "接触点、遮挡前后顺序与画外裁切",
+        "不得补造画外身体或工具，不得删除或新增肢体，不得改变接触图",
+        "光源方向、软硬、强度、曝光、白平衡、色温、整体色调、全局对比与 tone curve",
+        "局部固有色必须明显不同",
+        "禁止全局重布光",
+        "任一帧 unknown/fail 都使整项目 fail-closed",
+        "每个冻结帧各有独立提示词",
+        "供应商调用只能取自身帧的提示词",
+    )
+    for rule in required_human_rules:
+        assert rule in human
+
+    for case_word in ("CID", "厨房", "攀岩", "刷杆"):
+        assert case_word not in skill
+        assert case_word not in human
+
+
+def _plan_v3() -> dict:
+    plan = _plan([0])
+    plan["version"] = 3
+    plan["segments"][0]["persons"][0]["observable_frames"] = [1, 2]
+    plan["segments"][0]["frame_constraints"] = [
+        {
+            "frame_index": 1,
+            "visible_body_parts": "可见部位数量与边界保持当前源帧",
+            "pose_skeleton": "姿态骨架保持当前源帧",
+            "contact_points": "接触点保持当前源帧",
+            "occlusion_order": "遮挡前后顺序保持当前源帧",
+            "out_of_frame_crop": "画外裁切保持当前源帧",
+        },
+        {
+            "frame_index": 2,
+            "visible_body_parts": "第二帧可见部位数量与边界保持当前源帧",
+            "pose_skeleton": "第二帧姿态骨架保持当前源帧",
+            "contact_points": "第二帧接触点保持当前源帧",
+            "occlusion_order": "第二帧遮挡前后顺序保持当前源帧",
+            "out_of_frame_crop": "第二帧画外裁切保持当前源帧",
+        },
+    ]
+    plan["segments"][0]["photometric_contract"] = {
+        "light_direction": "全局光源方向保持当前源帧",
+        "light_quality": "全局光线软硬保持当前源帧",
+        "exposure_or_intensity": "全局曝光与强度保持当前源帧",
+        "wb_cct": "白平衡与色温保持当前源帧",
+        "global_contrast": "全局对比保持当前源帧",
+        "tone_curve": "全局 tone curve 保持当前源帧",
+    }
+    return plan
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["segments"][0]["frame_constraints"].pop(),
+        lambda value: value["segments"][0]["frame_constraints"].append(
+            deepcopy(value["segments"][0]["frame_constraints"][0])
+        ),
+        lambda value: value["segments"][0]["frame_constraints"][1].update(
+            frame_index=3
+        ),
+        lambda value: value["segments"][0]["photometric_contract"].pop(
+            "tone_curve"
+        ),
+    ],
+)
+def test_v3_frame_contract_fails_closed_on_missing_duplicate_or_tampered_constraints(
+    mutate,
+):
+    value = _plan_v3()
+    mutate(value)
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_v3(
+            value, segment_indices=[0], frame_counts={0: 2}
+        )
+
+
+def test_v3_compiles_distinct_current_frame_prompts_and_execution_binding():
+    plan = _plan_v3()
+    prompts = image_optimization.compile_frame_prompts(
+        plan, "independent_parallel"
+    )
+    assert set(prompts) == {0} and set(prompts[0]) == {1, 2}
+    assert prompts[0][1] != prompts[0][2]
+    assert "可见部位数量与边界保持当前源帧" in prompts[0][1]
+    assert "第二帧可见部位数量与边界保持当前源帧" in prompts[0][2]
+    assert "白平衡与色温保持当前源帧" in prompts[0][1]
+    frozen = image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={"id": "dual-target", "revision": 3},
+        model="doubao-seedream-5-0-pro-260628",
+        frame_inventory=[
+            {
+                "segment_index": 0,
+                "frame_index": index,
+                "frame_name": f"{index:02d}.png",
+                "source_sha256": str(index) * 64,
+            }
+            for index in (1, 2)
+        ],
+    )
+    assert frozen["version"] == 3
+    assert frozen["frames"][0]["frame_constraint"]["frame_index"] == 1
+    assert frozen["frames"][1]["frame_constraint"]["frame_index"] == 2
+
+
+def _verdict_v3(plan: dict, *, status: str = "pass") -> dict:
+    base = _verdict(plan)
+    base["version"] = 3
+    base["plan_sha256"] = image_optimization.plan_sha256(plan)
+    for segment in base["segments"]:
+        segment["frame_checks"] = [
+            {
+                "frame_index": constraint["frame_index"],
+                "visible_body_parts": _check(status),
+                "pose_skeleton": _check(status),
+                "contact_points": _check(status),
+                "occlusion_order": _check(status),
+                "out_of_frame_crop": _check(status),
+                "photometric_contract": _check(status),
+            }
+            for constraint in plan["segments"][0]["frame_constraints"]
+        ]
+        segment["passed"] = status == "pass"
+    base["passed"] = status == "pass"
+    base["reason"] = None if status == "pass" else "verification_unknown"
+    return base
+
+
+def test_v3_verify_requires_every_frame_constraint_and_fails_closed():
+    plan = _plan_v3()
+    passed = _verdict_v3(plan)
+    assert image_optimization.canonical_verification(passed, plan) == passed
+
+    missing = _verdict_v3(plan)
+    missing["segments"][0]["frame_checks"].pop()
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_verification(missing, plan)
+
+    unknown = _verdict_v3(plan, status="unknown")
+    assert image_optimization.canonical_verification(unknown, plan)["passed"] is False

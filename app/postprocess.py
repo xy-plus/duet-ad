@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -138,10 +139,16 @@ def public_state(value: object) -> dict | None:
 
 def _private_receipt(meta: dict) -> dict:
     raw = meta.get("_postprocess_receipt")
-    expected_keys = {
-        "version", "options", "model", "edit_mode", "timeout_s", "prompts",
-    }
-    if not isinstance(raw, dict) or set(raw) != expected_keys or raw.get("version") != 2:
+    if not isinstance(raw, dict) or raw.get("version") not in {2, 3}:
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    expected_keys = (
+        {"version", "options", "model", "edit_mode", "timeout_s", "prompts"}
+        if raw["version"] == 2 else {
+            "version", "options", "model", "edit_mode", "timeout_s",
+            "plan_sha256", "frames", "receipt_sha256",
+        }
+    )
+    if set(raw) != expected_keys:
         raise PostprocessError(409, "postprocess_receipt_invalid")
     options = raw.get("options")
     post = meta.get("postprocess")
@@ -163,18 +170,26 @@ def _private_receipt(meta: dict) -> dict:
         or not math.isfinite(float(timeout)) or timeout <= 0
     ):
         raise PostprocessError(409, "postprocess_receipt_invalid")
-    private_frozen = {
-        "version": 2, "model": raw.get("model"), "edit_mode": raw.get("edit_mode"),
-        "segments": raw.get("prompts"),
-    }
     project_frozen = image_optimization.receipt(meta)
+    private_frozen = (
+        {
+            "version": 2, "model": raw.get("model"),
+            "edit_mode": raw.get("edit_mode"), "segments": raw.get("prompts"),
+        }
+        if raw["version"] == 2 else {
+            "version": 3, "plan_sha256": raw.get("plan_sha256"),
+            "model": raw.get("model"), "edit_mode": raw.get("edit_mode"),
+            "frames": raw.get("frames"), "sha256": raw.get("receipt_sha256"),
+        }
+    )
     if project_frozen is None or private_frozen != project_frozen:
         raise PostprocessError(409, "postprocess_receipt_invalid")
-    return {
-        **raw,
-        "options": {key: options[key] for key in OPTION_KEYS},
-        "prompts": [dict(item) for item in project_frozen["segments"]],
-    }
+    result = {**raw, "options": {key: options[key] for key in OPTION_KEYS}}
+    if raw["version"] == 2:
+        result["prompts"] = [dict(item) for item in project_frozen["segments"]]
+    else:
+        result["frames"] = [dict(item) for item in project_frozen["frames"]]
+    return result
 
 
 def _parse_options(payload: dict) -> dict[str, bool]:
@@ -349,13 +364,24 @@ async def start(settings: Settings, cid: str, payload: dict,
             optimization = image_optimization.receipt(meta, settings)
             if optimization is None:
                 raise PostprocessError(409, "image_optimization_prompt_invalid")
-            private = {
-                "version": 2, "options": options,
-                "model": optimization["model"],
-                "edit_mode": optimization["edit_mode"],
-                "timeout_s": settings.seedream_timeout_s,
-                "prompts": optimization["segments"],
-            }
+            private = (
+                {
+                    "version": 2, "options": options,
+                    "model": optimization["model"],
+                    "edit_mode": optimization["edit_mode"],
+                    "timeout_s": settings.seedream_timeout_s,
+                    "prompts": optimization["segments"],
+                }
+                if optimization["version"] == 2 else {
+                    "version": 3, "options": options,
+                    "model": optimization["model"],
+                    "edit_mode": optimization["edit_mode"],
+                    "timeout_s": settings.seedream_timeout_s,
+                    "plan_sha256": optimization["plan_sha256"],
+                    "receipt_sha256": optimization["sha256"],
+                    "frames": optimization["frames"],
+                }
+            )
             states = [
                 _segment_state(index, len(frames)) for index, frames in grouped.items()
             ]
@@ -388,6 +414,17 @@ async def start(settings: Settings, cid: str, payload: dict,
 def _prompt(private: dict, index: int) -> str:
     for item in private.get("prompts", []):
         if item.get("segment_index") == index:
+            return item["current"]
+    raise PostprocessError(409, "image_optimization_prompt_invalid")
+
+
+def _frame_prompt(private: dict, index: int, name: str, source_sha256: str) -> str:
+    if private.get("version") == 2:
+        return _prompt(private, index)
+    for item in private.get("frames", []):
+        if item.get("segment_index") == index and item.get("frame_name") == name:
+            if item.get("source_sha256") != source_sha256:
+                break
             return item["current"]
     raise PostprocessError(409, "image_optimization_prompt_invalid")
 
@@ -462,8 +499,8 @@ async def _mediakit_stage(settings: Settings, cdir: Path, index: int,
 
 
 async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
-                          inputs: list[Path], prompt: str, model: str, mode: str,
-                          timeout_s: float,
+                          inputs: list[Path], private: dict,
+                          source_sha256s: dict[str, str],
                           sem: asyncio.Semaphore) -> list[Path]:
     root = _private_dir(cdir, index) / "seedream"
     attempts = _private_dir(cdir, index) / "attempts"
@@ -477,20 +514,25 @@ async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
         1,
     )
     task_settings = replace(
-        settings, seedream_model=model, seedream_edit_mode=mode,
-        seedream_timeout_s=timeout_s,
+        settings, seedream_model=private["model"], seedream_edit_mode=private["edit_mode"],
+        seedream_timeout_s=private["timeout_s"],
     )
 
     async def call(position: int, image_inputs: list[Path], output: Path) -> None:
         if output.is_file():
             return
+        source = image_inputs[0]
+        source_sha256 = source_sha256s.get(source.name)
+        if source_sha256 is None:
+            raise PostprocessError(409, "image_optimization_prompt_invalid")
+        prompt = _frame_prompt(private, index, source.name, source_sha256)
         async with sem:
             await seedream.edit(
                 task_settings, [path.read_bytes() for path in image_inputs], prompt, output,
                 receipt_path=attempts / f"{position:04d}-r{revision}.json",
             )
 
-    if mode == "independent_parallel":
+    if private["edit_mode"] == "independent_parallel":
         results = await asyncio.gather(
             *(call(i, [source], output) for i, (source, output) in enumerate(zip(inputs, outputs), 1)),
             return_exceptions=True,
@@ -564,6 +606,10 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
                        private: dict, mediakit_sem: asyncio.Semaphore,
                        seedream_sem: asyncio.Semaphore) -> None:
     inputs = [source for source, _ in targets]
+    source_sha256s = {
+        source.name: hashlib.sha256(source.read_bytes()).hexdigest()
+        for source in inputs
+    }
     try:
         if options["remove_subtitle"]:
             _update_segment(settings, cid, index, stage="text")
@@ -580,8 +626,8 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
         if options["optimize_image"]:
             _update_segment(settings, cid, index, stage="seedream", completed_frames=0)
             inputs = await _seedream_stage(
-                settings, cdir, cid, index, inputs, _prompt(private, index),
-                private["model"], private["edit_mode"], private["timeout_s"], seedream_sem,
+                settings, cdir, cid, index, inputs, private, source_sha256s,
+                seedream_sem,
             )
             _update_segment(settings, cid, index, completed_frames=len(inputs))
         _update_segment(settings, cid, index, stage="publishing")
