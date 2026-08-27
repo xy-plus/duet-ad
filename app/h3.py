@@ -21,10 +21,11 @@ import os
 import selectors
 import socket
 import subprocess
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping, Sequence, TypeVar
 from urllib.parse import urlsplit
@@ -33,12 +34,20 @@ import httpx
 
 from app.retry import RetryPolicy, run_with_retry
 from app.sanitize import sanitize
+from app import storage, voice
 
 
 SCHEMA_VERSION = 1
 H3_WORKFLOW = "minimax_h3_lightx2v_v5_15s"
 H3_PREVIOUS_WORKFLOW = "minimax_h3_lightx2v_v5"
-H3_REFERENCE_WORKFLOWS = frozenset({H3_WORKFLOW, H3_PREVIOUS_WORKFLOW})
+H3_MULTIMODAL_WORKFLOW = "minimax_h3_image_audio_to_video_v2_15s"
+H3_MULTIMODAL_HD_WORKFLOW = "minimax_h3_image_audio_to_video_v2"
+H3_MULTIMODAL_WORKFLOWS = frozenset(
+    {H3_MULTIMODAL_WORKFLOW, H3_MULTIMODAL_HD_WORKFLOW}
+)
+H3_REFERENCE_WORKFLOWS = frozenset(
+    {H3_WORKFLOW, H3_PREVIOUS_WORKFLOW, *H3_MULTIMODAL_WORKFLOWS}
+)
 H3_BOUNDARY_WORKFLOW = "minimax_h3_lightx2v"
 H3_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
 H3_RESOLUTIONS = frozenset({"480p", "768p"})
@@ -64,9 +73,11 @@ H3_MAX_DURATION_S = 15
 H3_PREVIOUS_MAX_DURATION_S = 10
 H3_BOUNDARY_MAX_DURATION_S = 15
 AUTODL_BASE_URL = "https://autodl.art"
+H3_GATEWAY_BASE_URL = "http://127.0.0.1:31000"
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
 MAX_MEDIA_PROBE_STDOUT_BYTES = 16 * 1024 * 1024
 MAX_MEDIA_TIMELINE_EVENTS = 20_000
+MAX_REFERENCE_AUDIO_BYTES = 15 * 1024 * 1024
 H3_OUTPUT_FRAME_DURATION_S = 1 / 24
 _DURATION_EPS_S = 1e-6
 
@@ -84,6 +95,7 @@ _SAFE_ERROR_CODES = {
     "download_too_large",
     "download_invalid_video",
     "output_probe_failed",
+    "output_audio_missing",
     "output_write_failed",
 }
 
@@ -94,6 +106,7 @@ FrozenKeyframes = tuple[tuple[Path, bytes], ...]
 FrozenFrame = tuple[Path, bytes]
 FrozenVoiceTexts = tuple[str, ...]
 H3Mode = Literal["reference", "boundary"]
+ReferenceAudioPurpose = Literal["voice", "ambience", "effect"]
 
 
 class H3Error(RuntimeError):
@@ -123,6 +136,48 @@ class _DNSLookupFailed(Exception):
 
 class _ProbeUnavailable(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenReferenceAudio:
+    """One probed, immutable conditioning reference for native H3 audio."""
+
+    path: Path
+    data: bytes = field(repr=False)
+    order: int
+    purpose: ReferenceAudioPurpose
+    format: Literal["mp3", "wav"]
+    sha256: str
+    duration_s: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", Path(self.path))
+        if (
+            isinstance(self.order, bool)
+            or not isinstance(self.order, int)
+            or self.order < 1
+        ):
+            raise H3Error("invalid_reference_audio_order")
+        if self.purpose not in {"voice", "ambience", "effect"}:
+            raise H3Error("invalid_reference_audio_purpose")
+        if self.format not in {"mp3", "wav"}:
+            raise H3Error("invalid_reference_audio_format")
+        if not isinstance(self.data, bytes) or not self.data:
+            raise H3Error("invalid_reference_audio")
+        if len(self.data) > MAX_REFERENCE_AUDIO_BYTES:
+            raise H3Error("reference_audio_too_large")
+        if self.sha256 != hashlib.sha256(self.data).hexdigest():
+            raise ReceiptError("reference_audio_hash_mismatch")
+        if (
+            isinstance(self.duration_s, bool)
+            or not isinstance(self.duration_s, (int, float))
+            or not math.isfinite(float(self.duration_s))
+            or not 2 - _DURATION_EPS_S <= float(self.duration_s) <= 15 + _DURATION_EPS_S
+        ):
+            raise H3Error("invalid_reference_audio_duration")
+
+
+FrozenReferenceAudios = tuple[FrozenReferenceAudio, ...]
 
 
 @dataclass(frozen=True)
@@ -180,6 +235,10 @@ class H3Request:
     aspect_ratio: str = H3_DEFAULT_ASPECT_RATIO
     resolution: str = H3_DEFAULT_RESOLUTION
     workflow: str | None = None
+    reference_audios: FrozenReferenceAudios = ()
+    skill_plan_sha256: str | None = None
+    multimodal_compiler_version: str | None = None
+    audio_required: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workdir", Path(self.workdir))
@@ -194,16 +253,21 @@ class H3Request:
         workflow = _workflow(self)
         if self.aspect_ratio not in H3_ASPECT_RATIOS:
             raise H3Error("invalid_aspect_ratio")
-        if self.resolution not in H3_RESOLUTIONS:
+        is_multimodal = workflow in H3_MULTIMODAL_WORKFLOWS
+        allowed_resolutions = (
+            {"1080p"}
+            if workflow == H3_MULTIMODAL_HD_WORKFLOW
+            else H3_RESOLUTIONS
+        )
+        if self.resolution not in allowed_resolutions:
             raise H3Error("invalid_resolution")
         if self.mode == "reference":
             if workflow not in H3_REFERENCE_WORKFLOWS:
                 raise H3Error("invalid_workflow")
-            max_duration = (
-                H3_MAX_DURATION_S
-                if workflow == H3_WORKFLOW
-                else H3_PREVIOUS_MAX_DURATION_S
-            )
+            if workflow in {H3_WORKFLOW, H3_MULTIMODAL_WORKFLOW}:
+                max_duration = H3_MAX_DURATION_S
+            else:
+                max_duration = H3_PREVIOUS_MAX_DURATION_S
         else:
             if workflow != H3_BOUNDARY_WORKFLOW:
                 raise H3Error("invalid_workflow")
@@ -250,6 +314,7 @@ class H3Request:
             raise H3Error("invalid_voice_texts")
         if self.voice_receipt != voice_texts_receipt(self.voice_texts):
             raise ReceiptError("voice_receipt_mismatch")
+        _validate_request_audio_contract(self, is_multimodal=is_multimodal)
 
 
 def _validate_frame(item: Any, code: str) -> FrozenFrame:
@@ -261,6 +326,52 @@ def _validate_frame(item: Any, code: str) -> FrozenFrame:
     if not path.name or path.name != Path(path.name).name:
         raise H3Error(code)
     return path, blob
+
+
+def _validate_request_audio_contract(
+    request: H3Request, *, is_multimodal: bool,
+) -> None:
+    audios = request.reference_audios
+    if not isinstance(audios, tuple):
+        raise H3Error("invalid_reference_audio")
+    if not is_multimodal:
+        if (
+            audios
+            or request.skill_plan_sha256 is not None
+            or request.multimodal_compiler_version is not None
+            or request.audio_required is not False
+        ):
+            raise H3Error("mixed_h3_inputs")
+        return
+    if request.mode != "reference":
+        raise H3Error("mixed_h3_inputs")
+    if not 4 <= request.duration:
+        raise H3Error("invalid_duration")
+    if not 1 <= len(audios) <= 3:
+        raise H3Error("invalid_reference_audio_count")
+    for expected_order, audio in enumerate(audios, 1):
+        if not isinstance(audio, FrozenReferenceAudio) or audio.order != expected_order:
+            raise H3Error("invalid_reference_audio_order")
+        if audio.sha256 != hashlib.sha256(audio.data).hexdigest():
+            raise ReceiptError("reference_audio_hash_mismatch")
+    if len({audio.sha256 for audio in audios}) != len(audios):
+        raise H3Error("duplicate_reference_audio")
+    if any(
+        path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}
+        for path, _blob in request.keyframes
+    ):
+        raise H3Error("invalid_keyframe_format")
+    if sum(float(audio.duration_s) for audio in audios) > 15 + _DURATION_EPS_S:
+        raise H3Error("invalid_reference_audio_duration")
+    if request.audio_required is not True:
+        raise H3Error("audio_required")
+    if not _is_sha256(request.skill_plan_sha256):
+        raise H3Error("invalid_skill_plan_receipt")
+    if (
+        not isinstance(request.multimodal_compiler_version, str)
+        or not request.multimodal_compiler_version.strip()
+    ):
+        raise H3Error("invalid_multimodal_compiler")
 
 
 @dataclass(frozen=True)
@@ -362,6 +473,61 @@ def freeze_keyframes(paths: Sequence[Path]) -> FrozenKeyframes:
     except OSError:
         raise H3Error("keyframe_read_failed") from None
     return frozen
+
+
+def freeze_reference_audios(
+    sources: Sequence[tuple[Path, ReferenceAudioPurpose]],
+) -> FrozenReferenceAudios:
+    """Read and probe 1–3 ordered MP3/WAV references exactly once."""
+    if not 1 <= len(sources) <= 3:
+        raise H3Error("invalid_reference_audio_count")
+    frozen: list[FrozenReferenceAudio] = []
+    for order, source in enumerate(sources, 1):
+        if not isinstance(source, tuple) or len(source) != 2:
+            raise H3Error("invalid_reference_audio")
+        path, purpose = source
+        path = Path(path)
+        audio_format = path.suffix.lower().lstrip(".")
+        if audio_format not in {"mp3", "wav"}:
+            raise H3Error("invalid_reference_audio_format")
+        if purpose not in {"voice", "ambience", "effect"}:
+            raise H3Error("invalid_reference_audio_purpose")
+        try:
+            data = path.read_bytes()
+        except OSError:
+            raise H3Error("reference_audio_read_failed") from None
+        if not data:
+            raise H3Error("invalid_reference_audio")
+        if len(data) > MAX_REFERENCE_AUDIO_BYTES:
+            raise H3Error("reference_audio_too_large")
+        try:
+            with tempfile.NamedTemporaryFile(suffix=f".{audio_format}") as probe_file:
+                probe_file.write(data)
+                probe_file.flush()
+                if not storage.probe_audio(Path(probe_file.name)):
+                    raise H3Error("invalid_reference_audio")
+                duration = voice.probe_audio_duration(Path(probe_file.name))
+        except (OSError, storage.UploadError):
+            raise H3Error("reference_audio_probe_failed") from None
+        if duration is None:
+            raise H3Error("reference_audio_probe_failed")
+        frozen.append(
+            FrozenReferenceAudio(
+                path=path,
+                data=data,
+                order=order,
+                purpose=purpose,
+                format=audio_format,
+                sha256=hashlib.sha256(data).hexdigest(),
+                duration_s=duration,
+            )
+        )
+    result = tuple(frozen)
+    if len({audio.sha256 for audio in result}) != len(result):
+        raise H3Error("duplicate_reference_audio")
+    if sum(audio.duration_s for audio in result) > 15 + _DURATION_EPS_S:
+        raise H3Error("invalid_reference_audio_duration")
+    return result
 
 
 def canonical_json_sha256(value: Any) -> str:
@@ -985,7 +1151,7 @@ def _input_manifest(
     request: H3Request, *, workflow: str | None = None,
 ) -> dict[str, Any]:
     selected_workflow = workflow or _workflow(request)
-    projected = provider_resolution(request.aspect_ratio, request.resolution)
+    projected = _provider_resolution(request)
     if request.mode == "reference":
         provider_request = {
             "h3_workflow": selected_workflow,
@@ -996,7 +1162,7 @@ def _input_manifest(
         }
         if request.seed is not None:
             provider_request["seed"] = request.seed
-        return {
+        manifest = {
             "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
             "keyframes": [
                 {"name": path.name, "sha256": hashlib.sha256(blob).hexdigest()}
@@ -1005,6 +1171,18 @@ def _input_manifest(
             "voice_texts_sha256": request.voice_receipt,
             "request": provider_request,
         }
+        if selected_workflow in H3_MULTIMODAL_WORKFLOWS:
+            provider_request["payload_sha256"] = canonical_json_sha256(
+                _provider_body(request)
+            )
+            manifest["multimodal"] = {
+                "skill_plan_sha256": request.skill_plan_sha256,
+                "compiler_version": request.multimodal_compiler_version,
+                "audio_required": request.audio_required,
+                "reference_audio_semantics": "conditioning_only",
+                "reference_audios": _reference_audio_manifest(request),
+            }
+        return manifest
     provider_request = {
         "mode": request.mode,
         "h3_workflow": selected_workflow,
@@ -1025,6 +1203,22 @@ def _workflow(request: H3Request) -> str:
     if request.workflow is not None:
         return request.workflow
     return H3_WORKFLOW if request.mode == "reference" else H3_BOUNDARY_WORKFLOW
+
+
+def is_multimodal_request(request: H3Request) -> bool:
+    """Return the receipt-stable discriminator for native H3 audio requests."""
+    return (
+        isinstance(request, H3Request)
+        and _workflow(request) in H3_MULTIMODAL_WORKFLOWS
+        and request.audio_required is True
+        and bool(request.reference_audios)
+    )
+
+
+def _provider_resolution(request: H3Request) -> str:
+    if _workflow(request) == H3_MULTIMODAL_HD_WORKFLOW:
+        return request.resolution + ("横" if request.aspect_ratio == "16:9" else "竖")
+    return provider_resolution(request.aspect_ratio, request.resolution)
 
 
 def _state_workflow(request: H3Request, state: Mapping[str, Any]) -> str:
@@ -1069,6 +1263,90 @@ def _image_manifest(request: H3Request) -> list[dict[str, str]]:
         }
         for role, (path, blob) in _image_inputs(request)
     ]
+
+
+def _reference_audio_manifest(request: H3Request) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": f"ref_audio_{audio.order - 1}",
+            "name": audio.path.name,
+            "order": audio.order,
+            "purpose": audio.purpose,
+            "format": audio.format,
+            "sha256": audio.sha256,
+            "size": len(audio.data),
+            "duration_s": audio.duration_s,
+        }
+        for audio in request.reference_audios
+    ]
+
+
+def _gateway_media_paths(request: H3Request) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    assert request.skill_plan_sha256 is not None
+    root = request.workdir / ".h3" / "multimodal-inputs" / request.skill_plan_sha256
+    images = tuple(
+        root / f"image-{index}-{hashlib.sha256(blob).hexdigest()}{path.suffix.lower()}"
+        for index, (path, blob) in enumerate(request.keyframes, 1)
+    )
+    audios = tuple(
+        root / f"audio-{audio.order}-{audio.sha256}.{audio.format}"
+        for audio in request.reference_audios
+    )
+    return images, audios
+
+
+def _provider_body(request: H3Request) -> dict[str, Any]:
+    if _workflow(request) in H3_MULTIMODAL_WORKFLOWS:
+        images, audios = _gateway_media_paths(request)
+        return {
+            "mode": (
+                "multimodal_hd"
+                if _workflow(request) == H3_MULTIMODAL_HD_WORKFLOW
+                else "multimodal"
+            ),
+            "prompt": request.prompt,
+            "duration_sec": request.duration,
+            "aspect_ratio": request.aspect_ratio,
+            "resolution": request.resolution,
+            "images": [str(path) for path in images],
+            "audios": [
+                {
+                    "path": str(path),
+                    "kind": "voice" if audio.purpose == "voice" else "sound",
+                    "label": f"{audio.purpose}-{audio.order}",
+                }
+                for audio, path in zip(request.reference_audios, audios, strict=True)
+            ],
+        }
+    body: dict[str, Any] = {
+        "prompt": request.prompt,
+        "duration": request.duration,
+        "resolution": _provider_resolution(request),
+    }
+    if request.seed is not None:
+        body["seed"] = request.seed
+    for role, (_path, blob) in _image_inputs(request):
+        body[role] = "data:image/png;base64," + base64.b64encode(blob).decode("ascii")
+    return body
+
+
+def _materialize_gateway_inputs(request: H3Request) -> None:
+    images, audios = _gateway_media_paths(request)
+    pairs = tuple(zip(images, (blob for _path, blob in request.keyframes))) + tuple(
+        zip(audios, (audio.data for audio in request.reference_audios))
+    )
+    try:
+        images[0].parent.mkdir(parents=True, exist_ok=True)
+        for path, blob in pairs:
+            if path.exists():
+                if path.read_bytes() != blob:
+                    raise ReceiptError("receipt_mismatch") from None
+                continue
+            _atomic_write_bytes(path, blob)
+    except ReceiptError:
+        raise
+    except OSError:
+        raise H3Error("state_unavailable") from None
 
 
 def _new_state(request: H3Request, attempt_id: str, client_request_id: str) -> dict[str, Any]:
@@ -1243,6 +1521,8 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _legacy_input_manifest(
     request: H3Request, *, workflow: str | None = None,
 ) -> dict[str, Any] | None:
+    if request.reference_audios:
+        return None
     selected_workflow = workflow or _workflow(request)
     if (
         request.aspect_ratio != H3_DEFAULT_ASPECT_RATIO
@@ -1590,7 +1870,7 @@ def _h3_receipt(
     projected = (
         H3_RESOLUTION
         if legacy
-        else provider_resolution(request.aspect_ratio, request.resolution)
+        else _provider_resolution(request)
     )
     if request.mode == "reference":
         provider_request = {
@@ -1605,13 +1885,19 @@ def _h3_receipt(
             )
         if request.seed is not None:
             provider_request["seed"] = request.seed
-        return {
+        receipt = {
             "task_id": task_id,
             "input_receipt": canonical_json_sha256(manifest),
             "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
             "keyframes": _input_manifest(request)["keyframes"],
             "request": provider_request,
         }
+        if selected_workflow in H3_MULTIMODAL_WORKFLOWS:
+            provider_request["payload_sha256"] = manifest["request"][
+                "payload_sha256"
+            ]
+            receipt["multimodal"] = manifest["multimodal"]
+        return receipt
     provider_request = {
         "mode": request.mode,
         "workflow": _workflow(request),
@@ -1764,25 +2050,22 @@ def _query_json_with_retry(
 
 def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) -> str:
     workflow = _state_workflow(request, state)
+    use_gateway = workflow in H3_MULTIMODAL_WORKFLOWS
+    body = _provider_body(request)
+    if use_gateway:
+        _materialize_gateway_inputs(request)
     state["h3"] = {"status": "submitting"}
     state["status"] = "h3_submitting"
     state["retryable"] = False
     _save_state(request, state)
-    body: dict[str, Any] = {
-        "prompt": request.prompt,
-        "duration": request.duration,
-        "resolution": provider_resolution(request.aspect_ratio, request.resolution),
-    }
-    if request.seed is not None:
-        body["seed"] = request.seed
-    for role, (_path, blob) in _image_inputs(request):
-        body[role] = (
-            "data:image/png;base64," + base64.b64encode(blob).decode("ascii")
-        )
     try:
         response = client.post(
-            f"{AUTODL_BASE_URL}/api/v1/comfyui/comfyui_workflow/{workflow}",
-            headers={"Authorization": request.autodl_token},
+            (
+                f"{H3_GATEWAY_BASE_URL}/v1/videos"
+                if use_gateway
+                else f"{AUTODL_BASE_URL}/api/v1/comfyui/comfyui_workflow/{workflow}"
+            ),
+            headers={} if use_gateway else {"Authorization": request.autodl_token},
             json=body,
             timeout=request.timeouts.request_s,
         )
@@ -1791,8 +2074,11 @@ def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) 
         _submission_unknown(request, state, "h3")
         raise H3Error("submission_unknown") from None
     data = payload.get("data")
-    task_value = data.get("task_id") if isinstance(data, dict) else None
-    if response.status_code != 200 or isinstance(task_value, bool) or not isinstance(
+    task_value = payload.get("task_id") if use_gateway else (
+        data.get("task_id") if isinstance(data, dict) else None
+    )
+    expected_status = 201 if use_gateway else 200
+    if response.status_code != expected_status or isinstance(task_value, bool) or not isinstance(
         task_value, (str, int)
     ) or not str(task_value).strip():
         detail = _provider_error_detail(payload, secret=request.autodl_token)
@@ -1831,6 +2117,8 @@ def _poll_h3(
         workflow=workflow,
     ):
         raise ReceiptError("receipt_mismatch")
+    if workflow in H3_MULTIMODAL_WORKFLOWS:
+        return _poll_gateway_h3(request, state, client, task_id)
     deadline = time.monotonic() + request.timeouts.h3_poll_s
     headers = {"Authorization": request.autodl_token}
     while True:
@@ -1899,16 +2187,80 @@ def _poll_h3(
         _pause(request.timeouts.poll_interval_s)
 
 
+def _poll_gateway_h3(
+    request: H3Request,
+    state: dict[str, Any],
+    client: httpx.Client,
+    task_id: str,
+) -> H3Result:
+    deadline = time.monotonic() + request.timeouts.h3_poll_s
+    while True:
+        try:
+            _, payload = _query_json_with_retry(
+                request,
+                lambda: client.get(
+                    f"{H3_GATEWAY_BASE_URL}/v1/videos/{task_id}",
+                    timeout=request.timeouts.request_s,
+                ),
+                code="h3_query_failed",
+                step="H3 gateway result query",
+                deadline=deadline,
+            )
+        except H3Error:
+            _fail(request, state, "h3_query_failed", retryable=True, keep_task=True)
+            raise H3Error("h3_query_failed", retryable=True) from None
+        provider_status = str(payload.get("status") or "").lower()
+        if provider_status == "succeeded":
+            output_receipt = _download(
+                request,
+                state,
+                client,
+                f"{H3_GATEWAY_BASE_URL}/v1/videos/{task_id}/content",
+                trusted_loopback=True,
+            )
+            state["h3"]["status"] = "succeeded"
+            state["h3"]["output"] = output_receipt
+            state["status"] = "succeeded"
+            state["retryable"] = False
+            _save_state(request, state)
+            return _result(state, output=request.workdir / "generated.mp4")
+        if provider_status == "failed":
+            diagnostic = _provider_failure_diagnostic(
+                payload, status="FAILED", secret=request.autodl_token
+            )
+            state["h3"]["status"] = "failed"
+            _fail(
+                request,
+                state,
+                "h3_provider_failed",
+                retryable=False,
+                keep_task=True,
+                provider_diagnostic=diagnostic,
+            )
+            return _result(state)
+        if provider_status not in {"queued", "running"}:
+            _fail(request, state, "h3_query_failed", retryable=True, keep_task=True)
+            raise H3Error("h3_query_failed", retryable=True)
+        if time.monotonic() >= deadline:
+            _fail(request, state, "h3_timeout", retryable=True, keep_task=True)
+            return _result(state)
+        _pause(request.timeouts.poll_interval_s)
+
+
 def _download(
     request: H3Request,
     state: dict[str, Any],
     client: httpx.Client,
     url: str,
+    *,
+    trusted_loopback: bool = False,
 ) -> dict[str, Any]:
     try:
         receipt = _run_automatic_retry(
             request.timeouts,
-            lambda: _download_once(request, client, url),
+            lambda: _download_once(
+                request, client, url, trusted_loopback=trusted_loopback
+            ),
             step="H3 result download",
         )
     except H3Error as exc:
@@ -1928,13 +2280,16 @@ def _download_once(
     request: H3Request,
     client: httpx.Client,
     url: str,
+    *,
+    trusted_loopback: bool = False,
 ) -> dict[str, Any]:
-    try:
-        public_url = _is_public_https_url(url)
-    except _DNSLookupFailed:
-        _raise_download_error("download_dns_failed", retryable=True)
-    if not public_url:
-        _raise_download_error("download_url_rejected", retryable=False)
+    if not trusted_loopback:
+        try:
+            public_url = _is_public_https_url(url)
+        except _DNSLookupFailed:
+            _raise_download_error("download_dns_failed", retryable=True)
+        if not public_url:
+            _raise_download_error("download_url_rejected", retryable=False)
 
     destination = request.workdir / "generated.mp4"
     temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
@@ -1951,17 +2306,18 @@ def _download_once(
                 timeout=request.timeouts.download_s,
                 follow_redirects=False,
             ) as response:
-                public_peer = _response_has_public_peer(response)
-                if public_peer is None:
-                    _raise_download_error(
-                        "download_peer_unverified",
-                        retryable=True,
-                    )
-                if not public_peer:
-                    _raise_download_error(
-                        "download_url_rejected",
-                        retryable=False,
-                    )
+                if not trusted_loopback:
+                    public_peer = _response_has_public_peer(response)
+                    if public_peer is None:
+                        _raise_download_error(
+                            "download_peer_unverified",
+                            retryable=True,
+                        )
+                    if not public_peer:
+                        _raise_download_error(
+                            "download_url_rejected",
+                            retryable=False,
+                        )
                 if 300 <= response.status_code < 400:
                     _raise_download_error(
                         "download_redirect_rejected",
@@ -2019,6 +2375,8 @@ def _download_once(
                 retryable=True,
                 automatic_retryable=False,
             )
+        if request.audio_required and media_timeline.get("audio") is None:
+            _raise_download_error("output_audio_missing", retryable=False)
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
     except OSError:
