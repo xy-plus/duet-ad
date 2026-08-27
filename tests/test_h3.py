@@ -100,6 +100,58 @@ def _request(tmp_path: Path, *, request_id: str = "request-1") -> h3.H3Request:
     )
 
 
+def _current_fusion_no_audio_request(tmp_path: Path) -> h3.H3Request:
+    prompt = "fusion final prompt without audio"
+    return replace(
+        _request(tmp_path),
+        prompt=prompt,
+        voice_texts=(),
+        voice_receipt=h3.voice_texts_receipt(()),
+        workflow=h3.H3_WORKFLOW,
+        skill_plan_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        upstream_dialogue_receipt_sha256="4" * 64,
+        context_ir_required=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "start", "prepare", "submit", "inspect", "resume", "retry",
+        "output_is_reusable", "timeout_attempt_is_get_only_resumable",
+        "controlled_storage_rejection_is_safely_retryable",
+        "retry_controlled_storage_rejection", "load_media_timeline_receipt",
+    ],
+)
+def test_current_fusion_no_audio_raw_request_is_rejected_at_every_h3_boundary(
+    tmp_path, boundary,
+):
+    request = _current_fusion_no_audio_request(tmp_path)
+    posts = []
+
+    def transport(http_request):
+        posts.append(http_request)
+        return httpx.Response(500)
+
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(h3.ReceiptError, match="context_ir_receipt_required"):
+            if boundary in {"start", "submit", "resume"}:
+                getattr(h3, boundary)(request, client=client)
+            elif boundary == "retry":
+                h3.retry(request, "fusion-no-audio-retry", client=client)
+            elif boundary == "retry_controlled_storage_rejection":
+                h3.retry_controlled_storage_rejection(request, client=client)
+            elif boundary in {
+                "timeout_attempt_is_get_only_resumable",
+                "load_media_timeline_receipt",
+            }:
+                getattr(h3, boundary)(request, "000001")
+            else:
+                getattr(h3, boundary)(request)
+    assert posts == []
+    assert not request.workdir.joinpath(".h3").exists()
+
+
 def _boundary_request(tmp_path: Path, *, request_id: str = "boundary-1") -> h3.H3Request:
     first = (Path("first.png"), b"first-boundary")
     last = (Path("last.png"), b"last-boundary")

@@ -158,6 +158,62 @@ def _frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
     )
 
 
+def _no_audio_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
+    prompt = "final fusion visual prompt; no dialogue and no source audio overlay"
+    source = h3.H3Request(
+        cid="silent-segment-1",
+        workdir=tmp_path / "silent-segment-1",
+        client_request_id="silent-h3-request-1",
+        prompt=prompt,
+        keyframes=((Path("01.png"), b"silent-frame-one"),),
+        voice_texts=(),
+        voice_receipt=h3.voice_texts_receipt(()),
+        duration=8,
+        autodl_token="autodl-secret",
+        workflow=h3.H3_WORKFLOW,
+        skill_plan_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        upstream_dialogue_receipt_sha256=UPSTREAM_DIALOGUE_SHA256,
+        context_ir_required=True,
+    )
+    artifact_path, artifact_sha256 = _upstream_artifact(tmp_path)
+    return context_ir_bridge.freeze_context_ir_request(
+        source_h3_request=source,
+        upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
+        upstream_artifact_path=artifact_path,
+        upstream_artifact_sha256=artifact_sha256,
+        upstream_dialogue_sha256_path=("dialogue", "sha256"),
+        source_prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        minimax_api_key="minimax-secret",
+        timeouts=context_ir_bridge.ContextIrTimeouts(
+            request_s=0.1,
+            poll_total_s=0.2,
+            poll_interval_s=0,
+        ),
+    )
+
+
+def test_current_fusion_no_audio_effective_request_binds_context_and_drift_fails(
+    tmp_path,
+):
+    frozen = _no_audio_frozen(tmp_path)
+    with _client(_success_handler(frozen)) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+    assert result.status == "succeeded"
+    assert result.receipt_path is not None
+
+    effective = context_ir_bridge.apply_effective_prompt(
+        frozen, result.receipt_path,
+    )
+    assert effective.context_ir_required is True
+    assert effective.context_ir_receipt_path == result.receipt_path
+    assert effective.context_ir_receipt_sha256 == result.receipt_sha256
+    h3._require_context_ir_receipt(effective)
+
+    result.receipt_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(h3.ReceiptError, match="context_ir_receipt"):
+        h3._require_context_ir_receipt(effective)
+
+
 def _response(payload: object, status: int = 200) -> httpx.Response:
     return httpx.Response(status, json=payload)
 

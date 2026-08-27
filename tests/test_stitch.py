@@ -119,6 +119,52 @@ def _probe(path: Path) -> dict:
     return json.loads(result.stdout)
 
 
+def _native_audio_timeline() -> dict:
+    return {
+        "schema": "duet.h3.media_timeline",
+        "version": 1,
+        "decode_complete": True,
+        "video": {"decoded_sha256": "1" * 64},
+        "audio": {"decoded_sha256": "2" * 64},
+    }
+
+
+def test_provider_generated_stitch_supports_native_then_explicit_mute_segment(
+    tmp_path,
+):
+    native = tmp_path / "native.mp4"
+    silent = tmp_path / "silent.mp4"
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "generated.mp4"
+    _make_video(native, "red", 1.0, codec="libx264", rate=24, audio=True)
+    _make_video(silent, "blue", 1.0, codec="libx264", rate=24)
+    _make_video(source, "black", 2.0, codec="libx264", rate=24, audio=True)
+    segments = [
+        stitch.StitchSegment(
+            native, 1.0, "hard_cut", "000001", _native_audio_timeline(),
+        ),
+        stitch.StitchSegment(silent, 1.0, "hard_cut"),
+    ]
+
+    result = stitch.stitch_video(
+        segments=segments,
+        source_video=source,
+        output=output,
+        audio_mode="provider_generated",
+    )
+
+    receipt = json.loads(result.receipt_path.read_text(encoding="utf-8"))
+    assert [item["source"] for item in receipt["audio"]["provider_segments"]] == [
+        "h3", "mute",
+    ]
+    assert stitch.output_is_reusable(
+        segments=segments,
+        source_video=source,
+        output=output,
+        audio_mode="provider_generated",
+    )
+
+
 @pytest.mark.parametrize("audio_duration", [0.35, 1.6])
 def test_keep_audio_is_trimmed_or_padded_to_visual_timeline(tmp_path, audio_duration):
     segment = tmp_path / "segment.mp4"

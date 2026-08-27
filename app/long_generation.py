@@ -424,6 +424,21 @@ def _requires_context_ir(plan: FrozenPlan) -> bool:
     return plan.prompt_fusion is not None or _is_h3_multimodal_plan(plan)
 
 
+def _segment_uses_h3_native_audio(
+    plan: FrozenPlan, segment: FrozenSegment,
+) -> bool:
+    if plan.prompt_fusion is not None:
+        return bool(segment.prompt_fusion_audio_paths)
+    return _is_h3_multimodal_plan(plan)
+
+
+def _native_audio_segment_indices(plan: FrozenPlan) -> frozenset[int]:
+    return frozenset(
+        segment.index for segment in plan.segments
+        if _segment_uses_h3_native_audio(plan, segment)
+    )
+
+
 def _generation_uses_h3_native_audio(plan: FrozenPlan, generation: Mapping) -> bool:
     expected = H3_NATIVE_AUDIO_ROUTE if _is_h3_multimodal_plan(plan) else None
     actual = generation.get("audio_route")
@@ -1830,11 +1845,9 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
     if plan.prompt_fusion is not None:
         try:
             native_audio = bool(segment.prompt_fusion_audio_paths)
-            expected_workflow = (
+            segment_workflow = (
                 h3.H3_MULTIMODAL_WORKFLOW if native_audio else h3.H3_WORKFLOW
             )
-            if plan.workflow != expected_workflow:
-                raise LongGenerationError("long_video_multimodal_invalid")
             reference_audios = (
                 h3.freeze_reference_audios(tuple(
                     (path, "voice")
@@ -1842,15 +1855,12 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
                 ))
                 if native_audio else ()
             )
+            fusion_prompt_sha256 = hashlib.sha256(
+                segment.prompt.encode("utf-8")
+            ).hexdigest()
             multimodal_fields = (
                 {
-                    "skill_plan_sha256": hashlib.sha256(
-                        segment.prompt.encode("utf-8")
-                    ).hexdigest(),
                     "multimodal_compiler_version": "video-prompt-fusion-v1",
-                    "upstream_dialogue_receipt_sha256": (
-                        segment.dialogue_sha256 or ""
-                    ),
                     "audio_required": True,
                 }
                 if native_audio else {}
@@ -1883,8 +1893,11 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
                 mode="reference",
                 aspect_ratio=plan.aspect_ratio,
                 resolution=plan.resolution,
-                workflow=plan.workflow,
+                workflow=segment_workflow,
                 reference_audios=reference_audios,
+                skill_plan_sha256=fusion_prompt_sha256,
+                upstream_dialogue_receipt_sha256=segment.dialogue_sha256,
+                context_ir_required=True,
                 **multimodal_fields,
             )
             if context_ir_binding is None:
@@ -2219,23 +2232,20 @@ def generation_segments_are_valid(
     audio_route = generation.get("audio_route")
     native_required = audio_route == H3_NATIVE_AUDIO_ROUTE
     if audio_route is None:
-        required_keys = None
+        allowed_keys = (legacy_keys, context_keys)
     elif native_required:
-        required_keys = native_keys
+        allowed_keys = (native_keys, context_keys)
     else:
         return False
     statuses = {
         "not_started", "queued", "running", "resume_required", "succeeded",
         "failed", "submission_unknown",
     }
+    native_items = 0
     for position, (expected, item) in enumerate(zip(expected_segments, raw), 1):
         if (
             not isinstance(item, dict)
-            or (
-                set(item) not in (legacy_keys, context_keys)
-                if required_keys is None
-                else set(item) != required_keys
-            )
+            or set(item) not in allowed_keys
         ):
             return False
         if isinstance(expected, FrozenSegment):
@@ -2253,6 +2263,8 @@ def generation_segments_are_valid(
         h3_attempt_id = item.get("h3_attempt_id")
         context_ir = item.get("context_ir")
         context_required = "context_ir" in item
+        item_native = "h3_attempt_id" in item
+        native_items += int(item_native)
         if (
             expected_index != position
             or item.get("index") != expected_index
@@ -2279,22 +2291,22 @@ def generation_segments_are_valid(
                 )
             )
             or (
-                (native_required or context_required)
+                context_required
                 and item.get("status") == "succeeded"
                 and (
-                    (native_required and h3_attempt_id is None)
+                    (item_native and h3_attempt_id is None)
                     or not isinstance(context_ir, Mapping)
                     or context_ir.get("status") != "succeeded"
                 )
             )
             or (
-                (native_required or context_required)
+                context_required
                 and context_ir is not None
                 and not isinstance(context_ir, Mapping)
             )
         ):
             return False
-    return True
+    return bool(native_items) == native_required
 
 
 def bound_reusable_segment_indices(
@@ -2354,7 +2366,7 @@ def bound_reusable_segment_indices(
                 fast_mode=fast_mode,
                 context_ir_binding=item.get("context_ir"),
             )
-            if _is_h3_multimodal_plan(plan):
+            if _segment_uses_h3_native_audio(plan, segment):
                 inspected = h3.inspect(request)
                 if (
                     inspected.status != "succeeded"
@@ -2381,7 +2393,7 @@ def bound_h3_native_media(
     plan: FrozenPlan,
     generation: Mapping,
 ) -> dict[int, tuple[str, Mapping[str, object]]]:
-    """Bind every segment to its persisted exact successful H3 attempt."""
+    """Bind each native-audio segment to its exact successful H3 attempt."""
     if not _generation_uses_h3_native_audio(plan, generation):
         raise LongGenerationError("long_video_audio_route_invalid")
     if not generation_segments_are_valid(plan.segments, generation):
@@ -2405,6 +2417,10 @@ def bound_h3_native_media(
         state = states.get(segment.index)
         if not isinstance(state, Mapping) or state.get("status") != "succeeded":
             raise LongGenerationError("long_video_h3_native_audio_invalid")
+        if not _segment_uses_h3_native_audio(plan, segment):
+            if state.get("h3_attempt_id") is not None:
+                raise LongGenerationError("long_video_h3_native_audio_invalid")
+            continue
         attempt_id = state.get("h3_attempt_id")
         child_id = state.get("child_request_id")
         if (
@@ -2451,7 +2467,7 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
         if isinstance(item, dict)
     }
     items = []
-    h3_native_audio = _is_h3_multimodal_plan(plan)
+    native_audio_indices = _native_audio_segment_indices(plan)
     context_ir_required = _requires_context_ir(plan)
     for segment in plan.segments:
         prior = old_by_index.get(segment.index, {})
@@ -2465,7 +2481,7 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
             "error": None,
             "child_request_id": prior.get("child_request_id") if succeeded else None,
         }
-        if h3_native_audio:
+        if segment.index in native_audio_indices:
             item["h3_attempt_id"] = (
                 prior.get("h3_attempt_id") if succeeded else None
             )
@@ -2487,7 +2503,7 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
         "workflow": plan.workflow,
         "segments": items,
     }
-    if h3_native_audio:
+    if native_audio_indices:
         generation["audio_route"] = dict(H3_NATIVE_AUDIO_ROUTE)
     return generation
 
@@ -2546,6 +2562,7 @@ def stitched_output_is_reusable(
     receipt_path = plan.root / stitch.RECEIPT_FILENAME
     native_audio = _is_h3_multimodal_plan(plan)
     if native_audio:
+        native_indices = _native_audio_segment_indices(plan)
         if (
             not isinstance(generation, Mapping)
             or not generation
@@ -2564,15 +2581,19 @@ def stitched_output_is_reusable(
             for item in generation.get("segments", [])
             if isinstance(item, Mapping)
         }
-        if set(provider_media) != {segment.index for segment in plan.segments}:
+        if set(provider_media) != set(native_indices):
             return False
         for segment in plan.segments:
             state = states.get(segment.index)
             media = provider_media.get(segment.index)
+            if not isinstance(state, Mapping) or state.get("status") != "succeeded":
+                return False
+            if segment.index not in native_indices:
+                if media is not None or state.get("h3_attempt_id") is not None:
+                    return False
+                continue
             if (
-                not isinstance(state, Mapping)
-                or state.get("status") != "succeeded"
-                or not isinstance(media, tuple)
+                not isinstance(media, tuple)
                 or len(media) != 2
                 or media[0] != state.get("h3_attempt_id")
                 or not isinstance(media[1], Mapping)
@@ -2628,7 +2649,7 @@ def stitched_output_is_reusable(
             if not isinstance(actual_audio, dict):
                 return False
             expected_audio["provider_segments"] = [
-                stitch._provider_binding(segment, index)
+                stitch._segment_audio_binding(segment, index)
                 for index, segment in enumerate(stitch_segments, 1)
             ]
             expected_audio["edl"] = {
@@ -2694,7 +2715,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         )
         return
     try:
-        h3_native_audio = _generation_uses_h3_native_audio(plan, generation)
+        _generation_uses_h3_native_audio(plan, generation)
     except LongGenerationError:
         storage.update_meta(
             settings.data_dir,
@@ -2712,9 +2733,13 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
     fit_mode = meta.get("fit_mode")
     dialogue_mode = meta.get("dialogue_mode")
     states = {item["index"]: dict(item) for item in generation.get("segments", [])}
+    native_audio_indices = _native_audio_segment_indices(plan)
     if any(
         ("context_ir" in state) != context_ir_required
         for state in states.values()
+    ) or any(
+        ("h3_attempt_id" in state) != (index in native_audio_indices)
+        for index, state in states.items()
     ):
         storage.update_meta(
             settings.data_dir,
@@ -2760,7 +2785,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     segment = futures.pop(future)
                     status, error, attempt_id = future.result()
                     changes = {"status": status, "error": error}
-                    if h3_native_audio:
+                    if segment.index in native_audio_indices:
                         changes["h3_attempt_id"] = attempt_id
                     states[segment.index].update(changes)
                     persist("running", None)
@@ -2910,7 +2935,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             for segment in recoverable:
                 status, error, attempt_id = recover(segment)
                 changes = {"status": status, "error": error}
-                if h3_native_audio:
+                if segment.index in native_audio_indices:
                     changes["h3_attempt_id"] = attempt_id
                 states[segment.index].update(changes)
         if any(item.get("status") == "submission_unknown" for item in states.values()):
@@ -3077,7 +3102,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     error=prepared_error,
                     child_request_id=requests[segment.index].client_request_id,
                 )
-                if h3_native_audio:
+                if segment.index in native_audio_indices:
                     changes["h3_attempt_id"] = _exact_h3_attempt_id(
                         result.attempt_id, state.get("h3_attempt_id")
                     )
@@ -3427,7 +3452,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     "error": error,
                     "child_request_id": child_id,
                 }
-                if h3_native_audio:
+                if segment.index in native_audio_indices:
                     changes["h3_attempt_id"] = attempt_id
                 states[segment.index].update(changes)
                 if status == "submission_unknown":
