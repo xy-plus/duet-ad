@@ -21,11 +21,11 @@ links: [conversation-task, submit-gate, result-display]
 | 两段属于同一镜头 | `continue` 只描述连续关系；两段仍各自使用 9 张冻结关键帧 |
 | 边界是硬切 | 开始新的 chain，但仍使用同一 segment 数据结构和执行器 |
 | 用户确认图片 | 每段必须恰有 9 张已确认优化图；确认后冻结其顺序和 bytes，缺帧、重排或漂移均在 H3 前拒绝，不回退原图 |
-| 图片确认完成 | 再次调用同一个 `video-maker` 的视频提示词生成职责：新人物、新场景、新对象和关系以优化图为准，原动作、镜头、节奏和时间轴以源视频为准；输出最终视频提示词并绑定 9 图 SHA |
+| 图片确认完成 | 调用 `video-prompt-fusion`：输入有序新关键帧、旧视频提示词、图片优化提示词和音频内容；新视觉元素以优化图为准，动作、镜头、节奏和时间轴沿用旧提示词；输出最终视频提示词并绑定全部输入 SHA |
 | 用户选择画外声音 | 纯后端确定性编译现有台词、时间和唯一 normalized voice reference；不要求嘴型，不调用任何 Skill |
 | 用户选择画内声音 | 只消费 `video-maker` 主分析已经冻结的画内人物/时间证据；证据缺失时付费前明确不可用，不额外调用 Skill 补证 |
 | 用户选择无台词 | 不传台词或声音 reference |
-| Context IR 完成 | 只优化第二次 `video-maker` 产生的最终视频提示词并直接交给 H3；不得恢复第一次提示词中的旧视觉元素，也不得改变帧序、台词、时间、声音呈现或 voice reference |
+| Context IR 完成 | 只优化 `video-prompt-fusion` 产生的最终视频提示词并直接交给 H3；不得恢复旧提示词中的旧视觉元素，也不得改变帧序、台词、时间、声音呈现或 voice reference |
 | 开始生成 | 所有 segment 共用冻结的画幅、清晰度和适配方式；每段读取自身 9 张图、提示词、台词和声音 reference |
 | 快速模式开启且 `N>1` | 所有分段输入先冻结，再并行提交；`N=1` 经过相同代码，实际只有一个任务 |
 | 某段供应商明确失败 | 完整持久化失败 attempt；成功兄弟不重提，后续是否重试服从统一预算和用户确认 |
@@ -36,11 +36,11 @@ links: [conversation-task, submit-gate, result-display]
 
 ## 不变量
 
-- 全链只有 `video-maker` 与 `image-postprocess` 两个 Skill；`video-maker` 在原视频分析和优化图确认后各履行一次已有的视频提示词职责，音频、Context、H3 和拼接都不是 Skill。
+- 全链只有 `video-maker`、`image-postprocess` 与 `video-prompt-fusion` 三个 Skill；音频、Context、H3 和拼接都不是 Skill。
 - `image-postprocess` 已经用户验收并冻结，不再迭代；它只接收关键帧并输出优化图，不拒绝合法可解码素材。
 - segment 索引在统一 plan 内连续；API、Web 和内部实现不得用索引规则选择另一套业务逻辑。
 - 每段原始关键帧和优化关键帧都固定为 9 张，顺序进入 frozen receipt 和 H3 请求。
-- H3 最终 prompt 必须绑定第二次 `video-maker` 输出及对应 9 张优化图 SHA；第一次生成的旧视觉 prompt 不得进入 Context 或 H3。
+- H3 最终 prompt 必须绑定 `video-prompt-fusion` 输出及四类输入 SHA；旧视觉 prompt 只能作为融合输入，不得直接进入 Context 或 H3。
 - H3 成片只使用 H3 原生输出音轨；源音和 conditioning voice 不得在拼接时回挂或 overlay。
 - 历史 short/long receipt 只允许兼容读取和安全恢复；所有新 v4 项目必须进入统一 segment coordinator。
 

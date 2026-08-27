@@ -41,8 +41,8 @@ links: [conversation-task, result-display]
 ## 生成与后续门
 
 - 图片优化主链只负责技术 freeze、计划/提示词编译、图片生成和持久化展示。图片生成后由用户在 Web 查看原图/优化图并明确确认；不得再增加模型评测 Skill 或隐藏已经生成的图片。
-- 用户确认后必须再次调用同一个 `video-maker` 的视频提示词生成职责：新人物、新场景、新对象、服装、材质和空间结构以优化图为视觉事实，原动作、镜头、构图、节奏和 segment 时间轴继续使用源视频冻结事实。该输出及 9 张优化图 SHA 一起冻结，第一次旧视觉 prompt 不得进入 Context 或 H3。
+- 用户确认后必须调用 `video-prompt-fusion`：输入有序新关键帧、旧视频提示词、图片优化提示词和音频内容；新人物、新场景、新对象、服装、材质和空间结构以优化图为视觉事实，动作、镜头、构图、节奏和 segment 时间轴沿用旧视频提示词。融合输出及四类输入 SHA 一起冻结，旧视觉 prompt 不得直接进入 Context 或 H3。
 - H3 只接受完整、匹配冻结输入且经用户确认的后处理 authority；缺帧、状态异常或确认漂移时 fail closed，不回退原图。
-- 全链只允许 `video-maker` 与 `image-postprocess` 两个 Skill。音频呈现是后端对冻结台词、Web 画内/画外选择和唯一 voice reference 的确定性投影，不存在 Binding、Audio、Speaker 或 speaker-visibility Skill/phase。
+- 全链只允许 `video-maker`、`image-postprocess` 与 `video-prompt-fusion` 三个 Skill。音频呈现是后端对冻结台词、Web 画内/画外选择和唯一 voice reference 的确定性投影，不存在 Binding、Audio、Speaker 或 speaker-visibility Skill/phase。
 - `dialogue_delivery=on_screen` 只消费 `video-maker` 主阶段已经产出的画内人物/时间证据；证据缺失时付费前明确不可用。`off_screen` 不需要嘴型证据；`none` 不发送台词或声音 reference。
 - 请求顶层严格为 `confirm/options`；running 时不能重复提交，done 后改变选项返回结构化 409。页面只展示用户可理解的提示词、能力和分段进度，不展示内部模型、模板、供应商响应或堆栈。

@@ -58,7 +58,7 @@ links: [conversation-task, processing-state, long-video, postprocess]
 | 输入准备未 `done` | 409 `artifacts not ready` |
 | 请求缺字段、有未知字段、`confirm` 非 true、id 或枚举不合法 | 422；在状态写入和供应商调用前拒绝 |
 | plan receipt 缺失、格式非法或已变化 | 422/409；刷新后由用户再次确认，Web 不自动重发 |
-| 图片确认后缺少第二次 `video-maker` 最终提示词，或其绑定的优化图 SHA/顺序漂移 | 409；重新生成提示词，Context/H3 POST 为 0；禁止回退第一次旧视觉 prompt |
+| 图片确认后缺少 `video-prompt-fusion` 最终提示词，或四类输入 SHA/顺序漂移 | 409；重新融合提示词，Context/H3 POST 为 0；禁止旧视觉 prompt 直达 Context/H3 |
 | 画内声音缺少主分析权威 | 409 `on_screen_authority_unavailable`；不调用 Skill，不创建 H3 attempt |
 | Context IR 试图改变帧序、台词、时间、声音呈现或 voice reference | fail closed；不创建 H3 attempt |
 | generation active/succeeded，或参数与冻结输入不一致 | 409；不创建新供应商任务 |
@@ -68,11 +68,11 @@ links: [conversation-task, processing-state, long-video, postprocess]
 
 ## 图片与 Skill 边界
 
-- 全链仅解析并调用 `video-maker` 与 `image-postprocess` 两个 Skill；出现第三个 Skill 名、音频 Skill、Binding Skill 或 speaker-visibility phase，测试和启动门必须失败。
+- 全链仅解析并调用 `video-maker`、`image-postprocess` 与 `video-prompt-fusion` 三个 Skill；出现第四个 Skill 名、音频 Skill、Binding Skill 或 speaker-visibility phase，测试和启动门必须失败。
 - `video-maker` 第一次调用冻结 segments、每段 9 张原始关键帧、原始视频提示词、动作/镜头/时间和它已经能证明的结构化事实。
 - `image-postprocess` 已冻结，不再迭代；它只把每段 9 张原始关键帧变成 9 张优化关键帧，不做素材准入。
-- 用户确认后的 9 张优化图按 segment 和帧序进入统一 frozen receipt；随后同一个 `video-maker` 第二次调用，只重新生成视频提示词：视觉元素以优化图为准，动作/镜头/构图/节奏/时间轴以原视频为准。
-- Context IR 与 H3 只能消费第二次 `video-maker` 输出及其绑定的优化图 bytes；禁止第一次旧视觉 prompt 覆盖新人物、新场景或新对象。
+- 用户确认后的 9 张优化图按 segment 和帧序进入统一 frozen receipt；随后 `video-prompt-fusion` 以有序新关键帧、旧视频提示词、图片优化提示词和音频内容为唯一四类输入生成最终视频提示词。
+- Context IR 与 H3 只能消费 `video-prompt-fusion` 输出及其绑定的四类输入；禁止旧视觉 prompt 直接覆盖新人物、新场景或新对象。
 
 ## 付费与恢复边界
 
