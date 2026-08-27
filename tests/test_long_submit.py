@@ -62,7 +62,8 @@ def _png(path: Path, value: int, *, width: int = 90, height: int = 160) -> None:
 def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
                segment_duration=14.000000000000004, duration=None,
                fit_required=False, landscape_first_indices=(),
-               landscape_end_indices=(), legacy=False):
+               landscape_end_indices=(), legacy=False,
+               dialogue_classification=None):
     planned = None
     if duration is None:
         duration = segment_duration * len(joins)
@@ -84,7 +85,10 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
             start_s = segment_duration * (index - 1)
             end_s = segment_duration * index
             chain_id = f"chain-{chain_no:03d}"
-            local_dialogue = ({"text": dialogue_text, "start_s": 1.0, "end_s": 2.0},)
+            line = {"text": dialogue_text, "start_s": 1.0, "end_s": 2.0}
+            if dialogue_classification is not None:
+                line["classification"] = dialogue_classification
+            local_dialogue = (line,)
         else:
             start_s = planned[index - 1]["start_s"]
             end_s = planned[index - 1]["end_s"]
@@ -201,6 +205,7 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
 def _payload(
     receipt, request_id="parent-request-123", mode="auto", fit="none",
     aspect_ratio="9:16", resolution="768p", fast_mode=None,
+    dialogue_delivery=None,
 ):
     payload = {
         "confirm": True,
@@ -213,7 +218,143 @@ def _payload(
     }
     if fast_mode is not None:
         payload["fast_mode"] = fast_mode
+    if dialogue_delivery is not None:
+        payload["dialogue_delivery"] = dialogue_delivery
     return payload
+
+
+def test_long_v4_optimized_dialogue_requires_explicit_delivery(tmp_path):
+    settings = make_settings(tmp_path)
+    cid, receipt = _make_long(settings)
+    root = settings.data_dir / cid
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _postprocess_receipt={
+            "version": 4,
+            "options": {
+                "remove_subtitle": True,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+        },
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+
+    with pytest.raises(_SubmitError) as caught:
+        _validate_long_submit_payload(meta, _payload(receipt))
+
+    assert caught.value.status == 409
+    assert caught.value.detail == "dialogue_delivery_required"
+    parsed = _validate_long_submit_payload(
+        meta, _payload(receipt, dialogue_delivery="off_screen")
+    )
+    assert parsed[-2] == "off_screen"
+
+
+def test_long_auto_sung_freezes_off_screen_voice_and_builds_h3_request(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(
+        settings,
+        joins=("hard_cut", "continue"),
+        segment_duration=8.0,
+        dialogue_text="غناء تجريبي",
+        dialogue_classification="sung",
+    )
+    root = settings.data_dir / cid
+    voice_path = root / "work" / "voice.mp3"
+    voice_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+            "-t", "14.58", "-q:a", "9", "-y", str(voice_path),
+        ],
+        check=True,
+    )
+    selected_by_segment = {}
+    for segment_index in (1, 2):
+        selected = []
+        for index in range(1, 10):
+            path = root / "work" / "segments" / str(segment_index) / "work" / "postprocessed" / f"{index:02d}.png"
+            _png(path, 100 + index + segment_index)
+            selected.append(path)
+        selected_by_segment[segment_index] = selected
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={
+            "status": "done",
+            "options": {
+                "remove_subtitle": True,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+            "frames": [
+                path.relative_to(root / "work").as_posix()
+                for selected in selected_by_segment.values()
+                for path in selected
+            ],
+        },
+        _postprocess_receipt={
+            "version": 4,
+            "options": {
+                "remove_subtitle": True,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        long_generation.postprocess,
+        "generation_keyframes",
+        lambda _root, _meta, originals, **_kwargs: list(
+            selected_by_segment[int(originals[0].parts[-4])]
+        ),
+    )
+    requests = []
+
+    def run(received_settings, received_cid, plan):
+        requests.append(long_generation._request(
+            received_settings,
+            received_cid,
+            plan,
+            plan.segments[0],
+            "parent-request-123",
+            "none",
+            context_ir_binding=None,
+        ))
+
+    monkeypatch.setattr(long_generation, "run", run)
+    first = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt, dialogue_delivery="auto"),
+    )
+
+    assert first.status_code == 409
+    assert first.json() == {"detail": "multimodal_input_refresh_required"}
+    assert requests == []
+    assert not list(root.glob("work/segments/*/work/speaker_visibility_input.json"))
+    refreshed = hashlib.sha256(
+        (root / long_video.PLAN_RECEIPT_FILENAME).read_bytes()
+    ).hexdigest()
+    second = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(refreshed, dialogue_delivery="auto"),
+    )
+
+    assert second.status_code == 202
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.on_screen_dialogue == ()
+    assert len(request.keyframes) == 9
+    assert len(request.reference_audios) == 1
+    assert request.reference_audios[0].path.name == "conditioning-voice.mp3"
+    assert request.reference_audios[0].data == voice_path.read_bytes()
 
 
 def test_long_submit_fast_mode_defaults_off_and_rejects_non_boolean(tmp_path):
@@ -1375,9 +1516,10 @@ def test_long_v4_optimized_nine_frames_final_freeze_binds_settings(
 
     def freeze(
         root_, meta, expected, fit_mode, dialogue_mode, *,
-        aspect_ratio, resolution, prepare_fit, settings,
+        aspect_ratio, resolution, dialogue_delivery, prepare_fit, settings,
     ):
         assert settings is expected_settings
+        assert dialogue_delivery == "auto"
         assert meta["postprocess"]["frames"] == frame_refs
         freeze_calls.append((
             root_, expected, fit_mode, dialogue_mode,

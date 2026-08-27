@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -147,6 +148,163 @@ def _json_object(data: bytes, code: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         _fail(code)
     return value
+
+
+def _atomic_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _canonical_bytes(value: object) -> bytes:
+    try:
+        return (
+            json.dumps(
+                value, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            ) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        _fail("multimodal_input_invalid")
+
+
+def _language_tag(text: str) -> str:
+    if any("\u0600" <= char <= "\u06ff" for char in text):
+        return "ar"
+    if any("\u4e00" <= char <= "\u9fff" for char in text):
+        return "zh"
+    return "und"
+
+
+def freeze_off_screen_conditioning_plan(
+    *,
+    root: Path,
+    workdir: Path,
+    visual_prompt_path: Path,
+    keyframes: tuple[Path, ...],
+    dialogue: tuple[Mapping[str, Any], ...],
+    dialogue_source_sha256: str,
+    normalized_audio_path: Path,
+) -> bool:
+    """Freeze an explicit off-screen plan from server-owned normalized audio."""
+    root = Path(root).resolve()
+    workdir = Path(workdir).resolve()
+    normalized_audio_path = Path(normalized_audio_path)
+    expected_audio_path = root / "work" / "voice.mp3"
+    if (
+        normalized_audio_path.name != "voice.mp3"
+        or normalized_audio_path.parent.resolve() != expected_audio_path.parent
+        or normalized_audio_path.is_symlink()
+        or normalized_audio_path.resolve() != expected_audio_path
+    ):
+        _fail("reference_audio_binding_invalid")
+    audio_data = _read(normalized_audio_path, "reference_audio_binding_invalid")
+    visual_data = _read(
+        Path(visual_prompt_path).resolve(), "multimodal_input_invalid"
+    )
+    try:
+        Path(visual_prompt_path).resolve().relative_to(workdir)
+        frozen_frames = tuple(
+            (
+                path.resolve().relative_to(workdir).as_posix(),
+                _sha256(_read(path.resolve(), "multimodal_input_invalid")),
+            )
+            for path in keyframes
+        )
+    except ValueError:
+        _fail("multimodal_input_invalid")
+    if not dialogue or not frozen_frames:
+        _fail("multimodal_input_invalid")
+
+    audio_path = workdir / "conditioning-voice.mp3"
+    audio_binding = {
+        "order": 1,
+        "path": audio_path.name,
+        "sha256": _sha256(audio_data),
+        "purpose": "voice",
+    }
+    visual_text = visual_data.decode("utf-8")
+    plan = {
+        "version": 2,
+        "phase": "multimodal_audio",
+        "eligible": True,
+        "reason": None,
+        "visual_prompt": visual_text,
+        "dialogue_source_sha256": dialogue_source_sha256,
+        "subjects": [],
+        "audio_refs": [{
+            "audio_index": 1, "purpose": "voice", "subject_id": None,
+        }],
+        "speech_bindings": [
+            {
+                "line_index": order,
+                "delivery": "off_screen_voiceover",
+                "subject_id": None,
+                "language": _language_tag(str(line.get("text", ""))),
+                "voice_ref": 1,
+            }
+            for order, line in enumerate(dialogue, 1)
+        ],
+        "sound_design": {"ambience_refs": [], "effects": []},
+    }
+    input_payload = {
+        "schema": SKILL_INPUT_SCHEMA,
+        "version": SKILL_INPUT_VERSION,
+        "visual_prompt": {
+            "path": Path(visual_prompt_path).resolve().relative_to(workdir).as_posix(),
+            "sha256": _sha256(visual_data),
+        },
+        "keyframes": [
+            {"order": order, "path": path, "sha256": digest}
+            for order, (path, digest) in enumerate(frozen_frames, 1)
+        ],
+        "dialogue_source_sha256": dialogue_source_sha256,
+        "reference_audios": [audio_binding],
+    }
+    plan_data = _canonical_bytes(plan)
+    input_data = _canonical_bytes(input_payload)
+    plan_path = workdir / "h3_prompt_plan.json"
+    input_path = workdir / SKILL_INPUT_FILENAME
+    manifest = {
+        "schema": SOURCE_SCHEMA,
+        "version": SOURCE_VERSION,
+        "mode": "multimodal",
+        "approved_skill_plan_sha256": h3.canonical_json_sha256(plan),
+        "multimodal_input": {
+            "path": input_path.name, "sha256": _sha256(input_data),
+        },
+        "skill_plan": {
+            "path": plan_path.name, "sha256": _sha256(plan_data),
+        },
+        "reference_audios": [audio_binding],
+    }
+    manifest_data = _canonical_bytes(manifest)
+    desired = {
+        audio_path: audio_data,
+        plan_path: plan_data,
+        input_path: input_data,
+        workdir / SOURCE_FILENAME: manifest_data,
+    }
+    changed = any(
+        not path.is_file() or path.read_bytes() != data
+        for path, data in desired.items()
+    )
+    if changed:
+        for path, data in desired.items():
+            _atomic_bytes(path, data)
+    return changed
 
 
 def _plan_has_on_screen_dialogue(plan: Mapping[str, Any]) -> bool:

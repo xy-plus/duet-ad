@@ -13,6 +13,7 @@ from typing import Mapping
 
 from app import (
     context_ir_bridge,
+    dialogue_delivery as dialogue_delivery_contract,
     frame_fit,
     h3,
     h3_project,
@@ -160,6 +161,7 @@ def finalize_multimodal_plan(
     *,
     aspect_ratio: str,
     resolution: str,
+    dialogue_delivery: str = "auto",
     settings: Settings | None = None,
 ) -> str | None:
     """Finalize staged per-segment audio plans before a paid submit.
@@ -188,6 +190,21 @@ def finalize_multimodal_plan(
     current_segments = meta.get("segments")
     if not isinstance(current_segments, list) or not current_segments:
         raise LongGenerationError("long_video_plan_invalid")
+    authoritative_dialogue = tuple(
+        dict(line)
+        for current in current_segments
+        if isinstance(current, Mapping)
+        for line in current.get("dialogue", [])
+        if isinstance(line, Mapping)
+    )
+    try:
+        requested_delivery = dialogue_delivery_contract.parse(dialogue_delivery)
+        resolved_delivery = dialogue_delivery_contract.resolve(
+            requested_delivery, authoritative_dialogue
+        )
+    except ValueError:
+        raise LongGenerationError("invalid_dialogue_delivery", 422) from None
+
     intent: list[bool] = []
     complete: list[bool] = []
     receipt_segments: list[dict] = []
@@ -197,6 +214,45 @@ def finalize_multimodal_plan(
         segdir = root / "work" / "segments" / str(expected_index)
         segwork = segdir / "work"
         manifest = segwork / h3_project.SOURCE_FILENAME
+        if (
+            dialogue_mode != "none"
+            and resolved_delivery
+            is dialogue_delivery_contract.DialogueDelivery.OFF_SCREEN
+        ):
+            try:
+                original_keyframes = [
+                    root / "work" / str(path)
+                    for path in current["keyframe_paths"]
+                ]
+                selected_keyframes = postprocess.generation_keyframes(
+                    root, dict(meta), original_keyframes, settings=settings,
+                )
+                h3_project.freeze_off_screen_conditioning_plan(
+                    root=root,
+                    workdir=segwork,
+                    visual_prompt_path=segwork / "visual_prompt.txt",
+                    keyframes=tuple(selected_keyframes),
+                    dialogue=tuple(dict(line) for line in current["dialogue"]),
+                    dialogue_source_sha256=_canonical_digest(
+                        list(current["dialogue"])
+                    ),
+                    normalized_audio_path=root / "work" / "voice.mp3",
+                )
+            except (
+                KeyError,
+                TypeError,
+                postprocess.PostprocessError,
+                h3_project.ProjectMultimodalError,
+            ) as exc:
+                code = getattr(exc, "code", None)
+                if code is None and isinstance(exc, postprocess.PostprocessError):
+                    code = (
+                        exc.detail if isinstance(exc.detail, str)
+                        else exc.detail.get("code")
+                    )
+                raise LongGenerationError(
+                    code or "long_video_multimodal_invalid"
+                ) from None
         intent.append(any(
             (segwork / name).exists()
             for name in (
@@ -240,6 +296,7 @@ def finalize_multimodal_plan(
         expected_receipt,
         fit_mode,
         dialogue_mode,
+        dialogue_delivery=dialogue_delivery,
         aspect_ratio=aspect_ratio,
         resolution=resolution,
         prepare_fit=True,
@@ -253,6 +310,8 @@ def finalize_multimodal_plan(
             segments=receipt_segments,
             workflow=h3.H3_MULTIMODAL_WORKFLOW,
             dialogue_mode=dialogue_mode,
+            dialogue_delivery=dialogue_delivery,
+            resolved_dialogue_delivery=resolved_delivery.value,
         )
         promoted = _digest(receipt_path)
         freeze_plan(
@@ -261,6 +320,7 @@ def finalize_multimodal_plan(
             promoted,
             fit_mode,
             dialogue_mode,
+            dialogue_delivery=dialogue_delivery,
             aspect_ratio=aspect_ratio,
             resolution=resolution,
             prepare_fit=True,
@@ -373,6 +433,7 @@ def _fit_outputs_complete(paths: tuple[Path, Path], aspect_ratio: str) -> bool:
 def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 dialogue_mode: str, *, aspect_ratio: str | None = None,
                 resolution: str | None = None,
+                dialogue_delivery: str = "auto",
                 prepare_fit: bool = True,
                 settings: Settings | None = None) -> FrozenPlan:
     """Validate every immutable plan fact and pre-fit every source anchor."""
@@ -449,6 +510,11 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         raise LongGenerationError(
             "long_video_multimodal_dialogue_refresh_required", 409
         )
+    if is_multimodal_receipt and "dialogue_delivery" in payload:
+        if payload.get("dialogue_delivery") != dialogue_delivery:
+            raise LongGenerationError(
+                "long_video_multimodal_dialogue_refresh_required", 409
+            )
     generation = meta.get("generation")
     persisted_workflow = (
         generation.get("workflow") if isinstance(generation, Mapping) else None
@@ -486,6 +552,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         raise LongGenerationError("long_video_plan_invalid")
 
     frozen: list[FrozenSegment] = []
+    authoritative_dialogue_for_delivery: list[dict] = []
     max_provider_duration = (
         long_video.SEGMENT_PROVIDER_MAX_DURATION_S
         if receipt_version == long_video.PLAN_RECEIPT_VERSION
@@ -571,6 +638,11 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         except UnicodeDecodeError:
             raise LongGenerationError("long_video_plan_invalid") from None
         source_dialogue = current.get("dialogue")
+        if isinstance(source_dialogue, list):
+            authoritative_dialogue_for_delivery.extend(
+                dict(line) for line in source_dialogue
+                if isinstance(line, Mapping)
+            )
         dialogue = (
             []
             if is_multimodal_receipt and dialogue_mode == "none"
@@ -731,6 +803,16 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         previous_end, previous_chain = end_s, chain_id
     if abs(previous_end - duration) > _EPS:
         raise LongGenerationError("long_video_plan_invalid")
+    if is_multimodal_receipt and "dialogue_delivery" in payload:
+        try:
+            resolved_delivery = dialogue_delivery_contract.resolve(
+                dialogue_delivery_contract.parse(payload["dialogue_delivery"]),
+                tuple(authoritative_dialogue_for_delivery),
+            ).value
+        except ValueError:
+            raise LongGenerationError("long_video_plan_invalid") from None
+        if payload.get("resolved_dialogue_delivery") != resolved_delivery:
+            raise LongGenerationError("long_video_plan_invalid")
     assert legacy_layout is not None
     return FrozenPlan(
         root=root,
