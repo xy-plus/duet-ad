@@ -2057,16 +2057,28 @@ def test_v4_compile_and_freeze_bind_one_shared_graph_and_exact_views(tmp_path):
 
 def test_v4_plan_phase_canonicalizes_then_compiles_per_frame(tmp_path):
     session = tmp_path / "session"
-    expected = _generic_scene_continuity_plan()
-    runner = _Runner(expected)
+    model_expected = _generic_scene_continuity_plan()
+    runner = _Runner(model_expected)
+    segments = _transition_skeleton(_segments(session, indices=[1, 2]))
 
     plan, prompts = image_optimization.generate_project_prompts(
         runner,
-        _transition_skeleton(_segments(session, indices=[1, 2])),
+        segments,
         "independent_parallel",
         session_dir=session,
     )
+    expected = deepcopy(model_expected)
+    for segment, source_segment in zip(expected["segments"], segments):
+        source_frames = sorted(Path(source_segment["keyframes_dir"]).glob("*.png"))
+        for constraint, source in zip(segment["frame_constraints"], source_frames):
+            metric = image_optimization.source_palette_metric(source)
+            constraint["dominant_palette_contract"] = {
+                "area_weighted_warm_cool_family": metric["warm_cool_family"],
+                "saturation_style": metric["saturation_style"],
+            }
+
     assert plan == expected
+    assert plan != model_expected
     assert set(prompts) == {1, 2}
     assert set(prompts[1]) == {1}
     assert set(prompts[2]) == {1}
