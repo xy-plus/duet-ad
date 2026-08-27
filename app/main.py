@@ -2794,6 +2794,7 @@ def create_app(settings: Settings) -> FastAPI:
                             dialogue_mode,
                             aspect_ratio=aspect_ratio,
                             resolution=resolution,
+                            settings=settings,
                         )
                     except long_generation.LongGenerationError as exc:
                         if exc.code == "speaker_timing_refresh_required":

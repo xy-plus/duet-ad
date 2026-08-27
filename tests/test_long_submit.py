@@ -1261,6 +1261,70 @@ def enabled(tmp_path):
         yield settings, client
 
 
+def test_long_v4_combined_first_promotion_binds_settings_and_is_unpaid(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={
+            "status": "done",
+            "options": {
+                "remove_subtitle": True,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+            "frames": ["segments/1/work/postprocessed/01.png"],
+        },
+        _image_optimization={"version": 4},
+        _v4_canvas_execution={"version": 1},
+    )
+    promotion_calls = []
+    provider_calls = []
+
+    def finalize(root, meta, expected, fit_mode, dialogue_mode, **kwargs):
+        assert kwargs["settings"] is settings
+        assert meta["postprocess"]["options"] == {
+            "remove_subtitle": True,
+            "remove_brand": False,
+            "optimize_image": True,
+        }
+        assert meta["_image_optimization"]["version"] == 4
+        assert meta["_v4_canvas_execution"]["version"] == 1
+        promotion_calls.append(
+            (root, expected, fit_mode, dialogue_mode)
+        )
+        return "f" * 64
+
+    monkeypatch.setattr(
+        long_generation, "finalize_multimodal_plan", finalize
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "run",
+        lambda *_args, **_kwargs: provider_calls.append("run"),
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {
+        "code": "long_video_plan_changed",
+        "message": "音画计划已冻结，请刷新并确认后重试。",
+    }}
+    assert promotion_calls == [(
+        settings.data_dir / cid, receipt, "none", "auto",
+    )]
+    assert provider_calls == []
+    assert storage.load_meta(settings.data_dir, cid).get("generation") is None
+
+
 def test_long_on_screen_refresh_queues_project_speaker_producer(
     enabled, monkeypatch,
 ):
