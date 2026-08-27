@@ -21,6 +21,8 @@ links: [conversation-task, result-display]
 | 历史 v1 图片提示词被编辑 | `PATCH /image-optimization-prompt` 仍以 SHA CAS 保存，不迁移或重写旧 continuity receipt |
 | 全部帧完成 | `postprocess.status=done`，展示 `postprocessed/` 对比图 |
 | 图片优化验收通过且已选输出完整 | 同一 `video-maker` Skill 执行第三阶段 `reconcile_after_image_optimization`，输出 receipt 绑定的统一视觉 IR；未通过协调资格门时不进入 H3 |
+| H3 计划存在画内 on-screen subject | 后台以真实 decoded frame PTS 按 8 FPS 取样，同一 `video-maker` Skill 执行 `speaker_visibility`，逐样本输出 PERSON 可见性和嘴部可验性；不接收 dialogue 文本或时间窗 |
+| dialogue mode 为 none 或计划全部 offscreen | none/offscreen 不调用 Skill，不探测视频、不抽样、不创建 speaker visibility 输入 |
 | 任一分段失败 | 保留成功帧；该段显示“重试本段”，请求携带 `confirm/expected_revision`，点击后立即禁用以防双击 |
 | 失败分段的 `error=submission_unknown` | 明确警告重复操作可能重复计费；用户再次明确确认后可按 `expected_revision` 人工重试本段；不得从 `status/stage` 推断 |
 | 旧会话 | 409 `read_only` |
@@ -47,6 +49,8 @@ links: [conversation-task, result-display]
 - 生成结果进入 H3 前，同一 Skill 执行 `phase=verify`：逐人物、逐可观察帧验证新身份和源身份消失；逐场景、逐所属段验证五类真实变化；v3 `frame_checks` 再一一对照每帧的身体、姿态、接触、遮挡、裁切、`non_person_entity_ledger`、`dominant_palette_contract` 与光色合同。`dominant_palette_contract` 逐帧以 source/output 的整帧面积加权主色盘验收冷暖家族与饱和度风格；局部固有色变化不得翻转整帧冷暖感知。所有 v3 输出先留在 staging，完整 verdict=`passed` 后才 publish；任何 `fail/unknown` 都使 `passed=false`，任一帧 unknown/fail 都使整项目 fail-closed、零 publish，`postprocess` 不会变为 `done`，H3 不可见。
 - 图片 `verify` 通过后，同一 `video-maker` Skill 执行第三阶段 `reconcile_after_image_optimization`，不得重新选帧。原始源帧像素与 PTS 决定动作、机位和时序；旧视觉提示词只提供这些动态事实的低优先级检索证据；canonical 图片计划及其已选优化图 output receipts 决定新人物与新场景。existing dialogue、音频和台词 receipt 不进入该阶段。
 - 第三阶段只输出 exact unified visual IR：动态 beat 结构化记录 action/camera/timing，PTS 固定为整数源时间戳并配套互质正整数 `time_base.numerator/denominator`，不接受浮点、字符串或毫秒换算；静态人物、服装、场景、材质和光色只绑定 canonical plan/image verification/output receipts 的 SHA 与稳定 ID，不再生成一份可漂移的新旧混合自由文本。优化图改变动作/姿态/接触/遮挡/因果、原始帧与优化图映射缺失，或新场景无法闭合原动作所需的支撑/接触/可达关系时一律 `eligible=false`；不能改写视频动态去迎合错误图片。
+- `speaker_visibility` 是独立严格 phase：输入绑定源视频 SHA、整数 duration/time_base、完整 decoded PTS、cut PTS、8 FPS 真实 PTS 样本、联系表字节/SHA/顺序、PERSON identity refs 和 on-screen subject IDs。Skill 不接收 dialogue 文本或时间窗，不读取音频；逐样本穷举 `visible_person_ids/lip_verifiable_person_ids`，未知即空数组，不跨 cut、不借相邻帧或联系表补证。
+- subject→PERSON 只有从冻结证据唯一证明时才输出；单 subject/单 PERSON 可机械唯一映射，多人不唯一时直接失败，不按数组顺序、画面位置、嘴动或台词反推。Skill 不生成 timing/receipt；后端机械合窗和收缩端点，并将 input 原始字节 SHA、Skill 原始字节 SHA、样本媒体 SHA 和最终 timing receipt 一起冻结。
 - 每个付费 POST 前持久化私有 receipt。只有完整 HTTP 429、`success=false`、精确 `RequestLimitExceeded` 时，才按 `AUTO_RETRY_COUNT/AUTO_RETRY_INTERVAL_S` 自动退避并追加新 attempt；网络异常、5xx、无效/不完整响应仍视为结果未知并禁止重发。已收到成功响应但下载失败时只恢复 GET。MediaKit WebP 结果经解码、尺寸校验和 PNG 转码后才进入 `frames`。
 - Seedream 每帧总计最多 3 次 POST，且只有完整 HTTP 429、精确 `QuotaExceeded`、响应无 `data` 才自动重试；网络/超时/取消一律记为 `submission_unknown`。重启只恢复可证明安全的本地阶段，不自动重发未知 POST。
 - 后处理一旦开始，H3 提交必须等待其 `done`；完成后每张 `postprocessed/` 优化帧都会替代同名原关键帧，进入冻结输入 receipt 和实际 H3 请求。缺帧或状态异常时 fail closed，不回退原图。

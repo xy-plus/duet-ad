@@ -4,6 +4,15 @@ from zipfile import ZipFile
 
 SKILL = Path(__file__).parents[1] / "skills" / "video-maker" / "SKILL.md"
 ARCHIVE = Path(__file__).parents[1] / "web" / "video-maker.zip"
+HUMAN = (
+    Path(__file__).parents[1]
+    / "docs"
+    / "human"
+    / "features"
+    / "conversation-task"
+    / "behaviors"
+    / "postprocess.md"
+)
 
 
 def test_skill_keeps_visual_phase_independent_from_audio_planning():
@@ -30,6 +39,130 @@ def test_skill_keeps_visual_phase_independent_from_audio_planning():
         "Seedance",
     ):
         assert retired not in text
+
+
+def test_speaker_visibility_is_a_strict_priority_phase_with_isolated_reads():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "speaker_visibility_input.json",
+        "speaker_visibility_output.json",
+        'phase: "speaker_visibility"',
+        "存在时严格优先执行",
+        "不得读取 `work/multimodal_input.json`",
+        "不得读取 `work/reconcile_after_image_optimization_input.json`",
+        "只读取描述符逐字绑定的采样帧、联系表和 PERSON identity refs",
+    ):
+        assert required in text
+
+
+def test_speaker_visibility_input_matches_the_backend_exact_schema():
+    text = SKILL.read_text(encoding="utf-8")
+    visibility = text.split("## 5. 发声人物可见性阶段", maxsplit=1)[1]
+
+    for required in (
+        'schema: "duet.speaker-visibility-input"',
+        "source: { sha256: Sha256; duration_pts: PositivePts; time_base: TimeBase }",
+        'algorithm: "decoded_pts_nearest_v1"',
+        "cadence_fps: 8",
+        "max_unobserved_gap_pts: PositivePts",
+        "endpoint_shrink_intervals: 1",
+        "decoded_frame_pts: NonEmptyArray<Pts>",
+        "cut_pts: Array<PositivePts>",
+        "frames: NonEmptyArray<{ order: Int1; path: NonEmpty; sha256: Sha256; pts: Pts; cut_before: Boolean }>",
+        "contact_sheets: NonEmptyArray<{ order: Int1; path: NonEmpty; sha256: Sha256; frame_orders: NonEmptyArray<Int1> }>",
+        "persons: NonEmptyArray<{ person_id: PersonId; identity_refs: NonEmptyArray<{ path: NonEmpty; sha256: Sha256 }> }>",
+        "on_screen_subjects: NonEmptyArray<SubjectId>",
+        "所有字段必填，禁止额外字段",
+    ):
+        assert required in visibility
+
+
+def test_speaker_visibility_output_is_exact_frame_classification_not_timing():
+    text = SKILL.read_text(encoding="utf-8")
+    visibility = text.split("## 5. 发声人物可见性阶段", maxsplit=1)[1]
+
+    for required in (
+        'schema: "duet.speaker-visibility-output"',
+        "input_sha256: Sha256",
+        "subject_person_mapping: NonEmptyArray<{ subject_id: SubjectId; person_id: PersonId }>",
+        "frames: NonEmptyArray<{ order: Int1; visible_person_ids: Array<PersonId>; lip_verifiable_person_ids: Array<PersonId> }>",
+        "逐字节 SHA-256",
+        "不得重排或重序列化 JSON 后再计算",
+        "后端另行冻结本次使用的 Skill 原始字节及 SHA",
+        "Skill 不生成时间窗、不合并区间、不收缩端点、不生成 timing 或 receipt",
+    ):
+        assert required in visibility
+    output_schema = visibility.split("VisibilityOutput = {", maxsplit=1)[1].split(
+        "```", maxsplit=1
+    )[0]
+    for forbidden in (
+        "eligible:",
+        "reason:",
+        "start_pts:",
+        "end_pts:",
+        "evidence_keyframes:",
+        "receipt:",
+    ):
+        assert forbidden not in output_schema
+
+
+def test_speaker_visibility_exhausts_real_samples_without_interpolation():
+    text = SKILL.read_text(encoding="utf-8")
+    visibility = text.split("## 5. 发声人物可见性阶段", maxsplit=1)[1]
+
+    for required in (
+        "8 FPS 目标节拍选中的真实 decoded frame PTS",
+        "每个输入 sample 恰有一个同 order 的输出项",
+        "逐样本穷举",
+        "lip_verifiable_person_ids 必须是 visible_person_ids 的子集",
+        "无法唯一确认时写空数组",
+        "联系表只用于导航",
+        "只能以该 sample 自身图像字节作事实",
+        "不得用相邻 sample 补证",
+        "不得跨 `cut_before=true` 补证",
+        "不得在未知空洞之间插值",
+    ):
+        assert required in visibility
+
+
+def test_speaker_mapping_fails_closed_when_subject_identity_is_not_unique():
+    text = SKILL.read_text(encoding="utf-8")
+    visibility = text.split("## 5. 发声人物可见性阶段", maxsplit=1)[1]
+
+    for required in (
+        "subject_person_mapping 必须与 on_screen_subjects 等长且同序",
+        "PERSON 映射必须一对一",
+        "单一 on-screen subject 且 roster 只有一个 PERSON",
+        "多人映射不能从冻结 identity refs 与采样证据唯一证明时",
+        "不得写 `work/speaker_visibility_output.json`",
+        "不得按 subject/PERSON 数组位置",
+        "不得按嘴部运动",
+        "不得按台词文本或台词时间窗反推",
+    ):
+        assert required in visibility
+
+
+def test_speaker_visibility_none_and_offscreen_skip_before_skill():
+    text = SKILL.read_text(encoding="utf-8")
+    human = HUMAN.read_text(encoding="utf-8")
+
+    for required in (
+        "none 或全部 offscreen",
+        "不得创建 `work/speaker_visibility_input.json`",
+        "不得调用本阶段 Skill",
+        "后端机械合并相邻 verified samples、按 cut/空洞断开并收缩窗端点",
+    ):
+        assert required in text
+    for required in (
+        "speaker_visibility",
+        "8 FPS",
+        "真实 decoded frame PTS",
+        "不接收 dialogue 文本或时间窗",
+        "none/offscreen 不调用 Skill",
+        "后端机械合窗和收缩端点",
+    ):
+        assert required in human
 
 
 def test_multimodal_phase_emits_structured_plan_not_provider_prompt():
