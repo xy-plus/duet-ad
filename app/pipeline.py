@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -1771,6 +1772,124 @@ def queue_prompt_fusion(
     return "queued"
 
 
+def _publish_prompt_fusion_manifest(
+    *, root: Path, meta: Mapping, state: Mapping,
+) -> tuple[long_generation.FrozenPromptFusion, bytes]:
+    """Revalidate frozen fusion authorities and publish the manifest last."""
+    work = root / "work"
+    input_path = work / h3_project.SKILL_INPUT_FILENAME
+    output_path = work / "h3_prompt_plan.json"
+    frozen_skill_path = work / PROMPT_FUSION_FROZEN_SKILL_FILENAME
+    manifest_path = work / h3_project.SOURCE_FILENAME
+    try:
+        input_data = input_path.read_bytes()
+        source_skill_data = PROMPT_FUSION_SKILL_MD.read_bytes()
+        frozen_skill_data = frozen_skill_path.read_bytes()
+    except OSError:
+        raise PipelineError("prompt fusion frozen authority is missing") from None
+    if hashlib.sha256(input_data).hexdigest() != state.get("input_sha256"):
+        raise PipelineError("prompt fusion input drifted")
+    if not source_skill_data or frozen_skill_data != source_skill_data:
+        raise PipelineError("prompt fusion Skill drifted")
+    try:
+        frozen = long_generation.load_prompt_fusion(
+            input_path=input_path, output_path=output_path, root=root,
+        )
+    except long_generation.LongGenerationError as exc:
+        raise PipelineError(exc.code) from None
+    if (
+        long_generation.prompt_fusion_image_authority_sha256(meta)
+        != state.get("image_acceptance_sha256")
+    ):
+        raise PipelineError("image acceptance drifted during prompt fusion")
+    manifest = {
+        "schema": long_generation.PROMPT_FUSION_MANIFEST_SCHEMA,
+        "version": long_generation.PROMPT_FUSION_MANIFEST_VERSION,
+        "image_acceptance_sha256": state["image_acceptance_sha256"],
+        "input": {
+            "path": f"work/{h3_project.SKILL_INPUT_FILENAME}",
+            "sha256": frozen.input_sha256,
+        },
+        "output": {
+            "path": "work/h3_prompt_plan.json",
+            "sha256": frozen.output_sha256,
+        },
+        "skill": {
+            "source_path": "skills/video-prompt-fusion/SKILL.md",
+            "frozen_path": f"work/{PROMPT_FUSION_FROZEN_SKILL_FILENAME}",
+            "sha256": hashlib.sha256(source_skill_data).hexdigest(),
+        },
+        "segments": [
+            {
+                "index": index,
+                "final_prompt_sha256": hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest(),
+            }
+            for index, prompt in enumerate(frozen.final_prompts, 1)
+        ],
+    }
+    manifest_data = _canonical_json_bytes(manifest)
+    _atomic_bytes(manifest_path, manifest_data)
+    try:
+        long_generation.load_prompt_fusion_manifest(
+            root=root, skill_source_path=PROMPT_FUSION_SKILL_MD,
+        )
+    except long_generation.LongGenerationError as exc:
+        raise PipelineError(exc.code) from None
+    return frozen, manifest_data
+
+
+def finalize_prompt_fusion_receipt(settings: Settings, cid: str) -> str:
+    """Finalize one exact terminal LF-envelope output without running a Skill."""
+    root = (settings.data_dir / cid).resolve()
+    meta = storage.load_meta(settings.data_dir, cid)
+    state = meta.get("_prompt_fusion") if isinstance(meta, Mapping) else None
+    if (
+        not isinstance(state, dict)
+        or state.get("version") != 1
+        or state.get("status") != "failed"
+        or state.get("error") != "prompt_fusion_output_invalid"
+        or state.get("manifest_sha256") is not None
+        or meta.get("generation") is not None
+    ):
+        raise PipelineError("prompt fusion receipt finalization is not allowed")
+    downstream_roots = (
+        root / ".context-ir",
+        root / ".h3",
+        *tuple((root / "work" / "segments").glob("*/.context-ir")),
+        *tuple((root / "work" / "segments").glob("*/.h3")),
+    )
+    if any(path.exists() for path in downstream_roots):
+        raise PipelineError("prompt fusion downstream state already exists")
+    _frozen, manifest_data = _publish_prompt_fusion_manifest(
+        root=root, meta=meta, state=state,
+    )
+    manifest_sha256 = hashlib.sha256(manifest_data).hexdigest()
+    committed = {"value": False}
+
+    def commit(current: dict) -> None:
+        if (
+            current.get("_prompt_fusion") != state
+            or long_generation.prompt_fusion_image_authority_sha256(current)
+            != state.get("image_acceptance_sha256")
+        ):
+            return
+        current["_prompt_fusion"] = {
+            **state,
+            "status": "done",
+            "error": None,
+            "manifest_sha256": manifest_sha256,
+            "recovered_error": state["error"],
+        }
+        committed["value"] = True
+
+    storage.mutate_meta(settings.data_dir, cid, commit)
+    if not committed["value"]:
+        raise PipelineError("prompt fusion state drifted during finalization")
+    return "done"
+
+
 def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
     """Run video-prompt-fusion once and publish its production manifest last."""
     root = (settings.data_dir / cid).resolve()
@@ -1823,45 +1942,8 @@ def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
             "只读 work/multimodal_input.json 及其绑定的有序图片，只写 "
             "work/h3_prompt_plan.json。不得运行音频、Binding、Speaker 或其他 phase。",
         )
-        frozen = long_generation.load_prompt_fusion(
-            input_path=input_path, output_path=output_path, root=root,
-        )
-        if (
-            long_generation.prompt_fusion_image_authority_sha256(meta)
-            != state.get("image_acceptance_sha256")
-        ):
-            raise PipelineError("image acceptance drifted during prompt fusion")
-        manifest = {
-            "schema": long_generation.PROMPT_FUSION_MANIFEST_SCHEMA,
-            "version": long_generation.PROMPT_FUSION_MANIFEST_VERSION,
-            "image_acceptance_sha256": state["image_acceptance_sha256"],
-            "input": {
-                "path": f"work/{h3_project.SKILL_INPUT_FILENAME}",
-                "sha256": frozen.input_sha256,
-            },
-            "output": {
-                "path": "work/h3_prompt_plan.json",
-                "sha256": frozen.output_sha256,
-            },
-            "skill": {
-                "source_path": "skills/video-prompt-fusion/SKILL.md",
-                "frozen_path": f"work/{PROMPT_FUSION_FROZEN_SKILL_FILENAME}",
-                "sha256": hashlib.sha256(skill_data).hexdigest(),
-            },
-            "segments": [
-                {
-                    "index": index,
-                    "final_prompt_sha256": hashlib.sha256(
-                        prompt.encode("utf-8")
-                    ).hexdigest(),
-                }
-                for index, prompt in enumerate(frozen.final_prompts, 1)
-            ],
-        }
-        manifest_data = _canonical_json_bytes(manifest)
-        _atomic_bytes(manifest_path, manifest_data)
-        long_generation.load_prompt_fusion_manifest(
-            root=root, skill_source_path=PROMPT_FUSION_SKILL_MD,
+        _frozen, manifest_data = _publish_prompt_fusion_manifest(
+            root=root, meta=meta, state=state,
         )
         persist(
             "done",
