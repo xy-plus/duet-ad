@@ -2654,6 +2654,226 @@ def _validate_mediakit_only_outputs(
         raise PostprocessError(409, "postprocess_artifacts_invalid") from None
 
 
+_IMAGE_ACCEPTANCE_KEY = "_image_user_acceptance"
+_ACCEPTANCE_META_EXCLUDED = frozenset({
+    _IMAGE_ACCEPTANCE_KEY,
+    "_image_verification",
+    "updated_at",
+    "_input_owner",
+    "generation",
+    "prepared_input_receipt",
+    "prepared_dialogue",
+})
+
+
+def _image_acceptance_meta_sha256(meta: dict) -> str:
+    return _receipt_sha256({
+        key: value for key, value in meta.items()
+        if key not in _ACCEPTANCE_META_EXCLUDED
+    })
+
+
+def _image_acceptance_required(meta: dict) -> bool:
+    post = meta.get("postprocess")
+    private = meta.get("_postprocess_receipt")
+    return bool(
+        isinstance(post, dict)
+        and post.get("status") == "done"
+        and isinstance(private, dict)
+        and private.get("version") == 4
+        and isinstance(private.get("options"), dict)
+        and private["options"].get("optimize_image") is True
+        and meta.get("generation") is None
+        and not meta.get("_input_owner")
+    )
+
+
+def _v4_user_acceptance_receipt(settings: Settings, cid: str, meta: dict) -> dict:
+    """Rebuild the complete technical v4 DAG accepted by one user action."""
+    try:
+        if meta.get("id") != cid:
+            raise ValueError
+        cdir = (settings.data_dir / cid).resolve()
+        private = _private_receipt(meta)
+        optimization = image_optimization.receipt(meta)
+        if (
+            private.get("version") != 4
+            or not isinstance(optimization, dict)
+            or optimization.get("version") != 4
+        ):
+            raise ValueError
+        plan = _v4_frozen_plan(meta, private)
+        grouped = _group_targets(cdir, meta)
+        post = meta.get("postprocess")
+        expected_refs = [
+            _frame_ref(index, source.name)
+            for index in sorted(grouped)
+            for source, _output in grouped[index]
+        ]
+        if (
+            not isinstance(post, dict)
+            or post.get("status") != "done"
+            or post.get("frames") != expected_refs
+        ):
+            raise ValueError
+        originals = [
+            source for index in sorted(grouped) for source, _output in grouped[index]
+        ]
+        outputs = [
+            output for index in sorted(grouped) for _source, output in grouped[index]
+        ]
+        runtime_private, canvas_sources = _v4_canvas_execution_for_h3(
+            settings, cdir, meta, private, originals,
+        )
+        source_palette_path = (
+            cdir / "work" / ".postprocess-private" / "scene-anchors"
+            / "palette-source.json"
+        )
+        source_palette = _load_json_receipt(source_palette_path)
+        expected_source_payload = {
+            "version": 1,
+            "plan_sha256": runtime_private["plan_sha256"],
+            "continuity_sha256": runtime_private["continuity_sha256"],
+            "metrics": _v4_palette_metrics(plan, canvas_sources),
+        }
+        expected_source_palette = {
+            **expected_source_payload,
+            "sha256": _receipt_sha256(expected_source_payload),
+        }
+        if source_palette != expected_source_palette:
+            raise ValueError
+        anchors = _v4_anchor_receipt_index(
+            cdir, plan, runtime_private["scene_anchor_schedule"],
+        )
+        canvas_sha256s = {
+            key: _sha256_path(path) for key, path in canvas_sources.items()
+        }
+        if not all(_valid_v4_anchor_receipt(
+            cdir,
+            receipt,
+            plan_sha256=runtime_private["plan_sha256"],
+            continuity_sha256=runtime_private["continuity_sha256"],
+            source_sha256s=canvas_sha256s,
+            source_paths=canvas_sources,
+            anchors=anchors,
+        ) for receipt in anchors.values()):
+            raise ValueError
+        layout_keys = {
+            (item["segment_index"], item["frame_index"])
+            for scene in runtime_private["scene_anchor_schedule"]["scenes"]
+            for item in scene["segment_layout_anchors"]
+        }
+        frames = []
+        cursor = 0
+        for index in sorted(grouped):
+            for frame_index, (raw, output) in enumerate(grouped[index], 1):
+                key = (index, frame_index)
+                label = (
+                    f"layout-{index:04d}" if key in layout_keys
+                    else f"fanout-{index:04d}-{frame_index:04d}"
+                )
+                matches = [
+                    item for item in anchors.values()
+                    if item.get("label") == label
+                    and (
+                        item.get("anchor", {}).get("segment_index"),
+                        item.get("anchor", {}).get("frame_index"),
+                    ) == key
+                ]
+                if (
+                    cursor >= len(outputs)
+                    or output != outputs[cursor]
+                    or len(matches) != 1
+                    or not _valid_png(output, canvas_sources[key])
+                    or _sha256_path(output) != matches[0]["output_sha256"]
+                ):
+                    raise ValueError
+                frames.append({
+                    "order": cursor + 1,
+                    "segment_index": index,
+                    "frame_index": frame_index,
+                    "frame_name": raw.name,
+                    "raw_sha256": _sha256_path(raw),
+                    "canvas_sha256": canvas_sha256s[key],
+                    "output_sha256": _sha256_path(output),
+                })
+                cursor += 1
+        if cursor != len(outputs):
+            raise ValueError
+        payload = {
+            "version": 1,
+            "cid": cid,
+            "meta_snapshot_sha256": _image_acceptance_meta_sha256(meta),
+            "postprocess_receipt_sha256": runtime_private["receipt_sha256"],
+            "plan_sha256": runtime_private["plan_sha256"],
+            "continuity_sha256": runtime_private["continuity_sha256"],
+            "execution_input_sha256": runtime_private["execution_input_sha256"],
+            "canvas_execution_sha256": runtime_private.get("canvas_execution_sha256"),
+            "scene_anchor_schedule_sha256": _receipt_sha256(
+                runtime_private["scene_anchor_schedule"]
+            ),
+            "source_palette_receipt_sha256": source_palette["sha256"],
+            "anchor_receipt_sha256s": [
+                receipt["sha256"] for receipt in anchors.values()
+            ],
+            "frames": frames,
+        }
+        return {**payload, "sha256": _receipt_sha256(payload)}
+    except (
+        AttributeError, KeyError, OSError, StopIteration, TypeError, ValueError,
+        image_optimization.ImageOptimizationIneligibleError,
+        image_optimization.ImageOptimizationOutputError,
+    ):
+        raise PostprocessError(409, "postprocess_artifacts_invalid") from None
+
+
+def image_acceptance_status(
+    settings: Settings, cid: str, meta: dict,
+) -> dict:
+    required = _image_acceptance_required(meta)
+    expected = _image_acceptance_meta_sha256(meta) if required else None
+    accepted = False
+    raw = meta.get(_IMAGE_ACCEPTANCE_KEY)
+    if isinstance(raw, dict):
+        try:
+            accepted = raw == _v4_user_acceptance_receipt(settings, cid, meta)
+        except PostprocessError:
+            accepted = False
+    return {
+        "required": required,
+        "accepted": accepted,
+        "expected_meta_sha256": expected,
+    }
+
+
+def accept_images(settings: Settings, cid: str, payload: dict) -> dict:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"confirm", "expected_meta_sha256"}
+        or not isinstance(payload.get("expected_meta_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", payload["expected_meta_sha256"]) is None
+    ):
+        raise PostprocessError(422, "invalid_image_acceptance_request")
+    if payload.get("confirm") is not True:
+        raise PostprocessError(409, "confirmation required")
+
+    def mutate(meta: dict) -> None:
+        if meta.get("generation") is not None or meta.get("_input_owner"):
+            raise PostprocessError(409, "generation_in_progress")
+        if not _image_acceptance_required(meta):
+            raise PostprocessError(409, "image_acceptance_not_ready")
+        if payload["expected_meta_sha256"] != _image_acceptance_meta_sha256(meta):
+            raise PostprocessError(409, "image_acceptance_meta_changed")
+        meta[_IMAGE_ACCEPTANCE_KEY] = _v4_user_acceptance_receipt(
+            settings, cid, meta,
+        )
+
+    updated = storage.mutate_meta(settings.data_dir, cid, mutate)
+    if updated is None:
+        raise PostprocessError(404, "not found")
+    return image_acceptance_status(settings, cid, updated)
+
+
 def generation_keyframes(
     cdir: Path, meta: dict, originals: list[Path], *, settings: Settings | None = None,
 ) -> list[Path]:
@@ -2777,127 +2997,12 @@ def generation_keyframes(
         ):
             raise PostprocessError(409, "postprocess_artifacts_invalid") from None
     if expected_v4:
-        raw = meta.get("_image_verification")
         try:
-            base_private = _private_receipt(meta)
-            if not isinstance(optimization, dict) or optimization.get("version") != 4:
-                raise ValueError
-            # The public continuity receipt carries its own SHA.  Canonical
-            # verifiers accept the exact plan payload, never that wrapper.
-            plan = _v4_frozen_plan(meta, base_private)
-            if not isinstance(raw, dict):
-                raise ValueError
-            runtime_private, runtime_sources = _v4_canvas_execution_for_h3(
-                settings, cdir, meta, base_private, originals,
-            )
-            payload = {key: value for key, value in raw.items() if key != "sha256"}
-            expected_sha = _receipt_sha256(payload)
-            expected_schedule_sha = _receipt_sha256(
-                runtime_private["scene_anchor_schedule"]
-            )
-            verified = {
-                (item["segment_index"], item["frame_name"]): item
-                for item in raw["frames"]
-            }
-            if (
-                set(raw) != {
-                    "version", "plan_sha256", "continuity_sha256",
-                    "scene_anchor_schedule_sha256",
-                    "canvas_execution_sha256",
-                    "semantic_receipts", "anchor_receipts", "source_palette_receipt_sha256",
-                    "palette_metrics", "palette_metrics_sha256", "frames", "verdict", "sha256",
-                }
-                or raw["version"] != 1
-                or raw["sha256"] != expected_sha
-                or raw["plan_sha256"] != runtime_private["plan_sha256"]
-                or raw["continuity_sha256"] != runtime_private["continuity_sha256"]
-                or raw["scene_anchor_schedule_sha256"] != expected_schedule_sha
-                or raw["canvas_execution_sha256"] != runtime_private.get("canvas_execution_sha256")
-                or raw["palette_metrics_sha256"] != raw["palette_metrics"].get("sha256")
-                or len(verified) != len(selected)
+            if meta.get(_IMAGE_ACCEPTANCE_KEY) != _v4_user_acceptance_receipt(
+                settings, cdir.name, meta,
             ):
                 raise ValueError
-            source_receipt = _load_json_receipt(
-                cdir / "work" / ".postprocess-private" / "scene-anchors" / "palette-source.json"
-            )
-            if (
-                source_receipt is None
-                or source_receipt.get("sha256") != raw["source_palette_receipt_sha256"]
-                or source_receipt.get("plan_sha256") != runtime_private["plan_sha256"]
-                or source_receipt.get("continuity_sha256") != runtime_private["continuity_sha256"]
-            ):
-                raise ValueError
-            if raw["semantic_receipts"] != []:
-                raise ValueError
-            if image_optimization.canonical_verification(raw["verdict"], plan).get("passed") is not True:
-                raise ValueError
-            source_sha256s = {}
-            for original in originals:
-                relative = original.resolve().relative_to(work)
-                segment_index = 0 if len(relative.parts) == 2 else int(relative.parts[1])
-                source_sha256s[(segment_index, int(original.stem))] = _sha256_path(
-                    runtime_sources[(segment_index, int(original.stem))]
-                )
-            anchors = _v4_anchor_receipt_index(
-                cdir, plan, runtime_private["scene_anchor_schedule"]
-            )
-            expected_anchor_manifest = [
-                {
-                    "scene_id": descriptor["scene_id"],
-                    "label": descriptor["label"],
-                    "sha256": next(
-                        receipt["sha256"] for receipt in anchors.values()
-                        if receipt["scene_id"] == descriptor["scene_id"]
-                        and receipt["label"] == descriptor["label"]
-                    ),
-                }
-                for descriptor in _v4_expected_anchor_descriptors(
-                    plan, runtime_private["scene_anchor_schedule"]
-                )
-            ]
-            if raw["anchor_receipts"] != expected_anchor_manifest:
-                raise ValueError
-            if not all(_valid_v4_anchor_receipt(
-                cdir, receipt,
-                plan_sha256=runtime_private["plan_sha256"],
-                continuity_sha256=runtime_private["continuity_sha256"],
-                    source_sha256s=source_sha256s,
-                    source_paths=runtime_sources,
-                    anchors=anchors,
-            ) for receipt in anchors.values()):
-                raise ValueError
-            pairs = []
-            expected_verified_frames = []
-            for original, output in zip(originals, selected):
-                segment_index = 0
-                relative = original.resolve().relative_to(work)
-                if len(relative.parts) == 5:
-                    segment_index = int(relative.parts[1])
-                item = verified[(segment_index, original.name)]
-                if (
-                    item["source_sha256"] != _sha256_path(
-                        runtime_sources[(segment_index, int(original.stem))]
-                    )
-                    or item["output_sha256"] != hashlib.sha256(output.read_bytes()).hexdigest()
-                    or not _valid_png(output, runtime_sources[(segment_index, int(original.stem))])
-                ):
-                    raise ValueError
-                expected_verified_frames.append({
-                    "segment_index": segment_index,
-                    "frame_name": original.name,
-                    "source_sha256": item["source_sha256"],
-                    "output_sha256": item["output_sha256"],
-                })
-                pairs.append((segment_index, runtime_sources[(segment_index, int(original.stem))], output))
-            if raw["frames"] != expected_verified_frames:
-                raise ValueError
-            if not _valid_palette_metrics_for_outputs(raw["palette_metrics"], pairs):
-                raise ValueError
-        except (
-            AttributeError, KeyError, OSError, StopIteration, TypeError, ValueError,
-            image_optimization.ImageOptimizationIneligibleError,
-            image_optimization.ImageOptimizationOutputError,
-        ):
+        except (PostprocessError, TypeError, ValueError):
             raise PostprocessError(409, "postprocess_artifacts_invalid") from None
     return selected
 
