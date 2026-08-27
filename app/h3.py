@@ -10,6 +10,7 @@ terminal failure while its bounded automatic-attempt budget remains.
 from __future__ import annotations
 
 import base64
+from bisect import bisect_right
 import fcntl
 import hashlib
 import ipaddress
@@ -17,6 +18,7 @@ import json
 import logging
 import math
 import os
+import selectors
 import socket
 import subprocess
 import time
@@ -42,6 +44,9 @@ H3_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
 H3_RESOLUTIONS = frozenset({"480p", "768p"})
 H3_DEFAULT_ASPECT_RATIO = "9:16"
 H3_DEFAULT_RESOLUTION = "768p"
+MEDIA_TIMELINE_SCHEMA = "duet.h3.media_timeline"
+MEDIA_TIMELINE_VERSION = 1
+MAX_AV_TIMELINE_DELTA_S = 0.1
 
 
 def provider_resolution(aspect_ratio: str, resolution: str) -> str:
@@ -60,6 +65,8 @@ H3_PREVIOUS_MAX_DURATION_S = 10
 H3_BOUNDARY_MAX_DURATION_S = 15
 AUTODL_BASE_URL = "https://autodl.art"
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
+MAX_MEDIA_PROBE_STDOUT_BYTES = 16 * 1024 * 1024
+MAX_MEDIA_TIMELINE_EVENTS = 20_000
 H3_OUTPUT_FRAME_DURATION_S = 1 / 24
 _DURATION_EPS_S = 1e-6
 
@@ -263,6 +270,7 @@ class H3Result:
     output: Path | None = None
     retryable: bool = False
     error_code: str | None = None
+    media_timeline: Mapping[str, Any] | None = None
 
 
 def _retryable_http_status(status: int) -> bool:
@@ -682,6 +690,60 @@ def _attempt_path(request: H3Request, attempt_id: str) -> Path:
     return _state_root(request) / "attempts" / attempt_id / "attempt.json"
 
 
+def load_media_timeline_receipt(
+    request: H3Request,
+    attempt_id: str,
+) -> dict[str, Any]:
+    """Load one exact successful attempt's provider media timeline.
+
+    Callers must persist ``attempt_id`` instead of inferring the newest
+    attempt.  The helper validates the frozen H3 input, the versioned timeline
+    shape, and the exact output bytes before returning a detached JSON object.
+    """
+    if (
+        not isinstance(attempt_id, str)
+        or len(attempt_id) != 6
+        or not attempt_id.isdigit()
+    ):
+        raise ReceiptError("state_invalid")
+    if _read_json(_state_root(request) / "session.json") != {
+        "schema_version": SCHEMA_VERSION,
+        "cid": request.cid,
+    }:
+        raise ReceiptError("state_invalid")
+    state = _read_json(_attempt_path(request, attempt_id))
+    _validate_state(request, state, require_client_request_id=False)
+    h3_state = state.get("h3")
+    output_receipt = h3_state.get("output") if isinstance(h3_state, dict) else None
+    task_id = (
+        _task_id(h3_state.get("task_id"), required=True)
+        if isinstance(h3_state, dict)
+        else None
+    )
+    if (
+        state.get("attempt_id") != attempt_id
+        or state.get("status") != "succeeded"
+        or not isinstance(h3_state, dict)
+        or h3_state.get("status") != "succeeded"
+        or h3_state.get("receipt")
+        != _h3_receipt(
+            request,
+            task_id,
+            legacy=_state_uses_legacy_generation_parameters(request, state),
+            workflow=_state_workflow(request, state),
+        )
+        or not isinstance(output_receipt, dict)
+        or not _output_receipt_matches_file(
+            request.workdir / "generated.mp4", output_receipt
+        )
+    ):
+        raise ReceiptError("state_invalid")
+    timeline = output_receipt.get("media_timeline")
+    if not _media_timeline_receipt_is_valid(timeline):
+        raise ReceiptError("media_timeline_missing")
+    return json.loads(json.dumps(timeline, ensure_ascii=False))
+
+
 def output_is_reusable(
     request: H3Request,
     state: Mapping[str, Any] | None = None,
@@ -710,18 +772,7 @@ def output_is_reusable(
         return False
     output = request.workdir / "generated.mp4"
     try:
-        stat = output.stat()
-        if (
-            not output.is_file()
-            or stat.st_size <= 0
-            or receipt.get("size") != stat.st_size
-        ):
-            return False
-        digest = hashlib.sha256()
-        with output.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-        if digest.hexdigest() != receipt.get("sha256"):
+        if not _output_receipt_matches_file(output, receipt):
             return False
         duration = _probe_video_duration(output, request.timeouts.probe_s)
         if duration is None:
@@ -745,6 +796,24 @@ def output_is_reusable(
     except OSError:
         return False
     except _ProbeUnavailable:
+        return False
+
+
+def _output_receipt_matches_file(path: Path, receipt: Mapping[str, Any]) -> bool:
+    try:
+        stat = path.stat()
+        if (
+            not path.is_file()
+            or stat.st_size <= 0
+            or receipt.get("size") != stat.st_size
+        ):
+            return False
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest() == receipt.get("sha256")
+    except OSError:
         return False
 
 
@@ -865,6 +934,7 @@ def _output_result(request: H3Request, state: Mapping[str, Any] | None) -> H3Res
         status="succeeded",
         attempt_id=attempt_id,
         output=request.workdir / "generated.mp4",
+        media_timeline=_state_media_timeline(state),
     )
 
 
@@ -1209,6 +1279,190 @@ def _legacy_input_manifest(
     }
 
 
+def _output_receipt_is_valid(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) not in (
+        {"name", "sha256", "size"},
+        {"name", "sha256", "size", "media_timeline"},
+    ):
+        return False
+    if (
+        value.get("name") != "generated.mp4"
+        or not _is_sha256(value.get("sha256"))
+        or isinstance(value.get("size"), bool)
+        or not isinstance(value.get("size"), int)
+        or value["size"] <= 0
+    ):
+        return False
+    return (
+        "media_timeline" not in value
+        or _media_timeline_receipt_is_valid(value["media_timeline"])
+    )
+
+
+def _media_timeline_receipt_is_valid(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "version",
+        "decode_complete",
+        "container",
+        "video",
+        "audio",
+        "av_delta_s",
+    }:
+        return False
+    if (
+        value.get("schema") != MEDIA_TIMELINE_SCHEMA
+        or value.get("version") != MEDIA_TIMELINE_VERSION
+        or value.get("decode_complete") is not True
+    ):
+        return False
+    container = value.get("container")
+    if (
+        not isinstance(container, dict)
+        or set(container) != {"format_name", "start_time_s", "duration_s"}
+        or not isinstance(container.get("format_name"), str)
+        or not container["format_name"].strip()
+        or not _optional_receipt_seconds(container.get("start_time_s"))
+        or not _optional_receipt_seconds(
+            container.get("duration_s"), positive=True
+        )
+        or not _stream_timeline_receipt_is_valid(value.get("video"), kind="video")
+    ):
+        return False
+    audio = value.get("audio")
+    av_delta = value.get("av_delta_s")
+    if audio is None:
+        return av_delta is None
+    if (
+        not _stream_timeline_receipt_is_valid(audio, kind="audio")
+        or not isinstance(av_delta, dict)
+        or set(av_delta) != {"start", "end"}
+        or not _finite_receipt_number(av_delta.get("start"))
+        or not _finite_receipt_number(av_delta.get("end"))
+    ):
+        return False
+    video = value["video"]
+    expected_start = _round_seconds(
+        audio["first_frame_pts_s"] - video["first_frame_pts_s"]
+    )
+    expected_end = _round_seconds(audio["frame_end_s"] - video["frame_end_s"])
+    return (
+        av_delta["start"] == expected_start
+        and av_delta["end"] == expected_end
+        and abs(expected_start) <= MAX_AV_TIMELINE_DELTA_S
+        and abs(expected_end) <= MAX_AV_TIMELINE_DELTA_S
+    )
+
+
+def _stream_timeline_receipt_is_valid(
+    value: Any,
+    *,
+    kind: Literal["video", "audio"],
+) -> bool:
+    common = {
+        "index",
+        "codec_name",
+        "time_base",
+        "start_time_s",
+        "duration_s",
+        "packet_count",
+        "first_packet_pts_s",
+        "last_packet_pts_s",
+        "packet_end_s",
+        "packet_dts_monotonic",
+        "frame_count",
+        "first_frame_pts_s",
+        "last_frame_pts_s",
+        "frame_end_s",
+        "presentation_monotonic",
+    }
+    expected = common | (
+        {"avg_frame_rate", "r_frame_rate"}
+        if kind == "video"
+        else {"sample_rate", "channels", "decoded_sha256"}
+    )
+    if not isinstance(value, dict) or set(value) != expected:
+        return False
+    if (
+        isinstance(value.get("index"), bool)
+        or not isinstance(value.get("index"), int)
+        or value["index"] < 0
+        or not isinstance(value.get("codec_name"), str)
+        or not value["codec_name"].strip()
+        or value.get("packet_dts_monotonic") is not True
+        or value.get("presentation_monotonic") is not True
+    ):
+        return False
+    try:
+        _positive_fraction(value.get("time_base"))
+        if kind == "video":
+            avg = _fraction_value(_positive_fraction(value.get("avg_frame_rate")))
+            nominal = _fraction_value(_positive_fraction(value.get("r_frame_rate")))
+            if avg > 240 or nominal > 240:
+                return False
+    except H3Error:
+        return False
+    if any(
+        isinstance(value.get(key), bool)
+        or not isinstance(value.get(key), int)
+        or value[key] <= 0
+        for key in ("packet_count", "frame_count")
+    ):
+        return False
+    numeric_keys = (
+        "start_time_s",
+        "duration_s",
+        "first_packet_pts_s",
+        "last_packet_pts_s",
+        "packet_end_s",
+        "first_frame_pts_s",
+        "last_frame_pts_s",
+        "frame_end_s",
+    )
+    if not all(_finite_receipt_number(value.get(key)) for key in numeric_keys):
+        return False
+    if (
+        value["duration_s"] <= 0
+        or value["first_packet_pts_s"] > value["last_packet_pts_s"]
+        or value["last_packet_pts_s"] >= value["packet_end_s"]
+        or value["first_frame_pts_s"] > value["last_frame_pts_s"]
+        or value["last_frame_pts_s"] >= value["frame_end_s"]
+        or abs(value["start_time_s"] - value["first_frame_pts_s"])
+        > MAX_AV_TIMELINE_DELTA_S
+        or abs(
+            value["start_time_s"] + value["duration_s"] - value["frame_end_s"]
+        )
+        > MAX_AV_TIMELINE_DELTA_S
+    ):
+        return False
+    if kind == "audio" and (
+        isinstance(value.get("sample_rate"), bool)
+        or not isinstance(value.get("sample_rate"), int)
+        or not 8000 <= value["sample_rate"] <= 384000
+        or isinstance(value.get("channels"), bool)
+        or not isinstance(value.get("channels"), int)
+        or not 1 <= value["channels"] <= 32
+        or not _is_sha256(value.get("decoded_sha256"))
+    ):
+        return False
+    return True
+
+
+def _finite_receipt_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _optional_receipt_seconds(value: Any, *, positive: bool = False) -> bool:
+    return value is None or (
+        _finite_receipt_number(value) and (not positive or value > 0)
+    )
+
+
 def _validate_state(
     request: H3Request,
     state: Mapping[str, Any],
@@ -1287,17 +1541,7 @@ def _validate_state(
     if "result_url" in h3_state:
         raise ReceiptError("state_invalid")
     output_receipt = h3_state.get("output")
-    if output_receipt is not None and (
-        not isinstance(output_receipt, dict)
-        or set(output_receipt) != {"name", "sha256", "size"}
-        or output_receipt.get("name") != "generated.mp4"
-        or not isinstance(output_receipt.get("sha256"), str)
-        or len(output_receipt["sha256"]) != 64
-        or any(character not in "0123456789abcdef" for character in output_receipt["sha256"])
-        or not isinstance(output_receipt.get("size"), int)
-        or isinstance(output_receipt.get("size"), bool)
-        or output_receipt["size"] <= 0
-    ):
+    if output_receipt is not None and not _output_receipt_is_valid(output_receipt):
         raise ReceiptError("state_invalid")
 
 
@@ -1755,19 +1999,19 @@ def _download_once(
         os.close(fd)
         fd = None
 
-        def probe_attempt() -> bool:
+        def probe_attempt() -> dict[str, Any]:
             try:
-                return _probe_video(temporary, request.timeouts.probe_s)
+                return _probe_media_timeline(temporary, request.timeouts.probe_s)
             except _ProbeUnavailable:
                 raise _AutomaticRetryH3Error(
                     "output_probe_failed", retryable=True
                 ) from None
 
         try:
-            valid_video = _run_automatic_retry(
+            media_timeline = _run_automatic_retry(
                 request.timeouts,
                 probe_attempt,
-                step="downloaded video probe",
+                step="downloaded media probe",
             )
         except _AutomaticRetryH3Error:
             _raise_download_error(
@@ -1775,8 +2019,6 @@ def _download_once(
                 retryable=True,
                 automatic_retryable=False,
             )
-        if not valid_video:
-            _raise_download_error("download_invalid_video", retryable=False)
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
     except OSError:
@@ -1788,7 +2030,12 @@ def _download_once(
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
-    return {"name": "generated.mp4", "sha256": digest.hexdigest(), "size": size}
+    return {
+        "name": "generated.mp4",
+        "sha256": digest.hexdigest(),
+        "size": size,
+        "media_timeline": media_timeline,
+    }
 
 
 def _raise_download_error(
@@ -1862,6 +2109,694 @@ def _response_has_public_peer(response: httpx.Response) -> bool | None:
     except ValueError:
         return None
     return address.is_global and not address.is_multicast
+
+
+def _probe_media_timeline(
+    path: Path,
+    timeout_s: float,
+    *,
+    max_duration_s: float = H3_MAX_DURATION_S + 1,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    probe_prefix = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-threads",
+        "1",
+        "-protocol_whitelist",
+        "file",
+    ]
+    summary_command = [
+        *probe_prefix,
+        "-show_entries",
+        (
+            "format=format_name,start_time,duration:"
+            "stream=index,codec_type,codec_name,width,height,time_base,start_pts,"
+            "start_time,duration,duration_ts,avg_frame_rate,r_frame_rate,"
+            "sample_rate,channels"
+        ),
+        "-of",
+        "json",
+        str(path),
+    ]
+    summary = _run_bounded_media_command(
+        summary_command,
+        deadline,
+        max_stdout_bytes=64 * 1024,
+    )
+    summary_payload = _decode_probe_json(summary)
+    has_audio = _validate_media_summary(
+        summary_payload,
+        max_duration_s=max_duration_s,
+    )
+    full_command = [
+        *probe_prefix,
+        "-show_entries",
+        (
+            "format=format_name,start_time,duration:"
+            "stream=index,codec_type,codec_name,time_base,start_pts,start_time,"
+            "duration,duration_ts,avg_frame_rate,r_frame_rate,sample_rate,channels:"
+            "packet=stream_index,pts,pts_time,dts,dts_time,duration,duration_time:"
+            "frame=stream_index,media_type,best_effort_timestamp,"
+            "best_effort_timestamp_time,pts,pts_time,duration,duration_time,"
+            "pkt_duration,pkt_duration_time,nb_samples"
+        ),
+        "-show_packets",
+        "-show_frames",
+        "-of",
+        "json",
+        str(path),
+    ]
+    payload = _decode_probe_json(
+        _run_bounded_media_command(
+            full_command,
+            deadline,
+            max_stdout_bytes=MAX_MEDIA_PROBE_STDOUT_BYTES,
+        )
+    )
+    if _validate_media_stream_inventory(payload) != has_audio:
+        raise H3Error("download_invalid_video", retryable=False)
+    decoded_audio_sha256 = _decode_media_and_hash_audio(
+        path,
+        deadline,
+        has_audio=has_audio,
+    )
+    return _parse_media_timeline(
+        payload,
+        decoded_audio_sha256=decoded_audio_sha256,
+    )
+
+
+def _run_bounded_media_command(
+    command: Sequence[str],
+    deadline: float,
+    *,
+    max_stdout_bytes: int,
+) -> bytes:
+    try:
+        process = subprocess.Popen(
+            list(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        raise _ProbeUnavailable from None
+    chunks: list[bytes] = []
+    total = 0
+    selector = selectors.DefaultSelector()
+    try:
+        if process.stdout is None:
+            raise _ProbeUnavailable
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while True:
+            remaining = _remaining_probe_timeout(deadline)
+            if not selector.select(remaining):
+                raise _ProbeUnavailable
+            chunk = os.read(process.stdout.fileno(), 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_stdout_bytes:
+                raise H3Error("download_invalid_video", retryable=False)
+            chunks.append(chunk)
+        try:
+            return_code = process.wait(timeout=_remaining_probe_timeout(deadline))
+        except subprocess.TimeoutExpired:
+            raise _ProbeUnavailable from None
+    except BaseException as exc:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        if isinstance(exc, OSError):
+            raise _ProbeUnavailable from None
+        raise
+    finally:
+        selector.close()
+        if process.stdout is not None:
+            process.stdout.close()
+    if return_code != 0:
+        raise H3Error("download_invalid_video", retryable=False)
+    return b"".join(chunks)
+
+
+def _remaining_probe_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _ProbeUnavailable
+    return remaining
+
+
+def _decode_probe_json(raw: bytes) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+        raise H3Error("download_invalid_video", retryable=False) from None
+    if not isinstance(payload, dict):
+        raise H3Error("download_invalid_video", retryable=False)
+    return payload
+
+
+def _validate_media_summary(payload: Any, *, max_duration_s: float) -> bool:
+    has_audio = _validate_media_stream_inventory(payload)
+    streams = payload["streams"]
+    video = next(stream for stream in streams if stream.get("codec_type") == "video")
+    width = video.get("width")
+    height = video.get("height")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or not 1 <= width <= 8192
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or not 1 <= height <= 8192
+    ):
+        raise H3Error("download_invalid_video", retryable=False)
+    time_base = _positive_fraction(video.get("time_base"))
+    duration = _stream_duration(video, time_base)
+    avg_rate = _fraction_value(_positive_fraction(video.get("avg_frame_rate")))
+    nominal_rate = _fraction_value(_positive_fraction(video.get("r_frame_rate")))
+    if (
+        duration is None
+        or duration > max_duration_s + _DURATION_EPS_S
+        or avg_rate > 240
+        or nominal_rate > 240
+    ):
+        raise H3Error("download_invalid_video", retryable=False)
+    return has_audio
+
+
+def _validate_media_stream_inventory(payload: Any) -> bool:
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    if not isinstance(streams, list):
+        raise H3Error("download_invalid_video", retryable=False)
+    videos = [
+        stream for stream in streams
+        if isinstance(stream, dict) and stream.get("codec_type") == "video"
+    ]
+    audios = [
+        stream for stream in streams
+        if isinstance(stream, dict) and stream.get("codec_type") == "audio"
+    ]
+    supported = len(videos) + len(audios)
+    if (
+        len(videos) != 1
+        or len(audios) > 1
+        or supported != len(streams)
+    ):
+        raise H3Error("download_invalid_video", retryable=False)
+    return bool(audios)
+
+
+def _decode_media_and_hash_audio(
+    path: Path,
+    deadline: float,
+    *,
+    has_audio: bool,
+) -> str | None:
+    decode_command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-xerror",
+        "-max_error_rate",
+        "0",
+        "-err_detect",
+        "explode",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-i",
+        str(path),
+        "-map",
+        "0:V:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+        "-abort_on",
+        "empty_output_stream",
+        "-f",
+        "null",
+        "-",
+    ]
+    _run_bounded_media_command(decode_command, deadline, max_stdout_bytes=1024)
+    if not has_audio:
+        return None
+    hash_command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-xerror",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-i",
+        str(path),
+        "-map",
+        "0:a:0",
+        "-f",
+        "hash",
+        "-hash",
+        "sha256",
+        "-",
+    ]
+    try:
+        output = _run_bounded_media_command(
+            hash_command,
+            deadline,
+            max_stdout_bytes=1024,
+        ).decode("ascii", "strict").strip()
+    except UnicodeDecodeError:
+        raise H3Error("download_invalid_video", retryable=False) from None
+    prefix = "SHA256="
+    digest = output[len(prefix):] if output.startswith(prefix) else ""
+    if not _is_sha256(digest):
+        raise H3Error("download_invalid_video", retryable=False)
+    return digest
+
+
+def _parse_media_timeline(
+    payload: Any,
+    *,
+    decoded_audio_sha256: str | None,
+) -> dict[str, Any]:
+    has_audio = _validate_media_stream_inventory(payload)
+    streams = payload["streams"]
+    events = _media_events(payload)
+    video_source = next(
+        stream for stream in streams if stream.get("codec_type") == "video"
+    )
+    audio_source = next(
+        (stream for stream in streams if stream.get("codec_type") == "audio"),
+        None,
+    )
+    if has_audio != (audio_source is not None):
+        raise H3Error("download_invalid_video", retryable=False)
+    video = _parse_stream_timeline(video_source, events, kind="video")
+    if audio_source is None:
+        if decoded_audio_sha256 is not None:
+            raise H3Error("download_invalid_video", retryable=False)
+        audio = None
+        av_delta = None
+    else:
+        if not _is_sha256(decoded_audio_sha256):
+            raise H3Error("download_invalid_video", retryable=False)
+        audio = _parse_stream_timeline(audio_source, events, kind="audio")
+        audio["decoded_sha256"] = decoded_audio_sha256
+        start_delta = _round_seconds(
+            audio["first_frame_pts_s"] - video["first_frame_pts_s"]
+        )
+        end_delta = _round_seconds(
+            audio["frame_end_s"] - video["frame_end_s"]
+        )
+        if (
+            abs(start_delta) > MAX_AV_TIMELINE_DELTA_S
+            or abs(end_delta) > MAX_AV_TIMELINE_DELTA_S
+        ):
+            raise H3Error("download_invalid_video", retryable=False)
+        av_delta = {"start": start_delta, "end": end_delta}
+    raw_format = payload.get("format")
+    if not isinstance(raw_format, dict):
+        raise H3Error("download_invalid_video", retryable=False)
+    format_name = raw_format.get("format_name")
+    if not isinstance(format_name, str) or not format_name.strip():
+        raise H3Error("download_invalid_video", retryable=False)
+    return {
+        "schema": MEDIA_TIMELINE_SCHEMA,
+        "version": MEDIA_TIMELINE_VERSION,
+        "decode_complete": True,
+        "container": {
+            "format_name": format_name,
+            "start_time_s": _optional_seconds(raw_format.get("start_time")),
+            "duration_s": _optional_positive_seconds(raw_format.get("duration")),
+        },
+        "video": video,
+        "audio": audio,
+        "av_delta_s": av_delta,
+    }
+
+
+def _media_events(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    combined = payload.get("packets_and_frames")
+    if isinstance(combined, list):
+        events = combined
+    else:
+        packets = payload.get("packets")
+        frames = payload.get("frames")
+        if not isinstance(packets, list) or not isinstance(frames, list):
+            raise H3Error("download_invalid_video", retryable=False)
+        if len(packets) + len(frames) > MAX_MEDIA_TIMELINE_EVENTS:
+            raise H3Error("download_invalid_video", retryable=False)
+        events = [
+            *({**event, "type": "packet"} for event in packets),
+            *({**event, "type": "frame"} for event in frames),
+        ]
+    if len(events) > MAX_MEDIA_TIMELINE_EVENTS or not all(
+        isinstance(event, dict) for event in events
+    ):
+        raise H3Error("download_invalid_video", retryable=False)
+    return events
+
+
+def _parse_stream_timeline(
+    source: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+    *,
+    kind: Literal["video", "audio"],
+) -> dict[str, Any]:
+    index = source.get("index")
+    codec_name = source.get("codec_name")
+    if (
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or index < 0
+        or not isinstance(codec_name, str)
+        or not codec_name.strip()
+    ):
+        raise H3Error("download_invalid_video", retryable=False)
+    time_base = _positive_fraction(source.get("time_base"))
+    packets = [
+        event for event in events
+        if event.get("type") == "packet" and event.get("stream_index") == index
+    ]
+    frames = [
+        event for event in events
+        if event.get("type") == "frame" and event.get("stream_index") == index
+    ]
+    if not packets or not frames:
+        raise H3Error("download_invalid_video", retryable=False)
+    packet_dts = [
+        _event_seconds(event, "dts", "dts_time", time_base)
+        for event in packets
+    ]
+    if not _monotonic_nondecreasing(packet_dts):
+        raise H3Error("download_invalid_video", retryable=False)
+    packet_pts = [
+        _event_seconds(event, "pts", "pts_time", time_base)
+        for event in packets
+    ]
+    frame_pts = [
+        _event_seconds(
+            event,
+            "best_effort_timestamp",
+            "best_effort_timestamp_time",
+            time_base,
+            fallback_tick_key="pts",
+            fallback_time_key="pts_time",
+        )
+        for event in frames
+    ]
+    if not _monotonic_nondecreasing(frame_pts):
+        raise H3Error("download_invalid_video", retryable=False)
+    frame_durations = [
+        _event_positive_duration(event, time_base, kind=kind, source=source)
+        for event in frames
+    ]
+    first_frame = frame_pts[0]
+    last_frame = frame_pts[-1]
+    frame_end = _round_seconds(last_frame + frame_durations[-1])
+    packet_durations = _derive_packet_durations(
+        packets,
+        packet_pts=packet_pts,
+        packet_dts=packet_dts,
+        time_base=time_base,
+        frame_end=frame_end,
+    )
+    start_time = _optional_seconds(source.get("start_time"))
+    if start_time is None:
+        start_time = first_frame
+    duration = _stream_duration(source, time_base)
+    if duration is None:
+        duration = _round_seconds(frame_end - first_frame)
+    if (
+        duration <= 0
+        or abs(start_time - first_frame) > MAX_AV_TIMELINE_DELTA_S
+        or abs((start_time + duration) - frame_end) > MAX_AV_TIMELINE_DELTA_S
+    ):
+        raise H3Error("download_invalid_video", retryable=False)
+    receipt: dict[str, Any] = {
+        "index": index,
+        "codec_name": codec_name,
+        "time_base": time_base,
+        "start_time_s": _round_seconds(start_time),
+        "duration_s": _round_seconds(duration),
+        "packet_count": len(packets),
+        "first_packet_pts_s": _round_seconds(min(packet_pts)),
+        "last_packet_pts_s": _round_seconds(max(packet_pts)),
+        "packet_end_s": _round_seconds(
+            max(pts + duration_s for pts, duration_s in zip(packet_pts, packet_durations))
+        ),
+        "packet_dts_monotonic": True,
+        "frame_count": len(frames),
+        "first_frame_pts_s": _round_seconds(first_frame),
+        "last_frame_pts_s": _round_seconds(last_frame),
+        "frame_end_s": frame_end,
+        "presentation_monotonic": True,
+    }
+    if kind == "video":
+        avg_frame_rate = _positive_fraction(source.get("avg_frame_rate"))
+        r_frame_rate = _positive_fraction(source.get("r_frame_rate"))
+        if (
+            _fraction_value(avg_frame_rate) > 240
+            or _fraction_value(r_frame_rate) > 240
+        ):
+            raise H3Error("download_invalid_video", retryable=False)
+        receipt.update(
+            avg_frame_rate=avg_frame_rate,
+            r_frame_rate=r_frame_rate,
+        )
+    else:
+        sample_rate = source.get("sample_rate")
+        channels = source.get("channels")
+        try:
+            normalized_rate = int(sample_rate)
+        except (TypeError, ValueError):
+            raise H3Error("download_invalid_video", retryable=False) from None
+        if (
+            isinstance(sample_rate, bool)
+            or not 8000 <= normalized_rate <= 384000
+            or isinstance(channels, bool)
+            or not isinstance(channels, int)
+            or not 1 <= channels <= 32
+        ):
+            raise H3Error("download_invalid_video", retryable=False)
+        receipt.update(sample_rate=normalized_rate, channels=channels)
+    return receipt
+
+
+def _stream_duration(
+    source: Mapping[str, Any],
+    time_base: str,
+) -> float | None:
+    direct = _optional_positive_seconds(source.get("duration"))
+    if direct is not None:
+        return direct
+    ticks = _optional_positive_seconds(source.get("duration_ts"))
+    if ticks is None:
+        return None
+    try:
+        duration = ticks * _fraction_value(time_base)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    return _round_seconds(duration) if math.isfinite(duration) else None
+
+
+def _positive_fraction(value: Any) -> str:
+    if not isinstance(value, str):
+        raise H3Error("download_invalid_video", retryable=False)
+    try:
+        numerator, denominator = value.split("/", 1)
+        normalized_numerator = int(numerator)
+        normalized_denominator = int(denominator)
+    except (TypeError, ValueError):
+        raise H3Error("download_invalid_video", retryable=False) from None
+    if normalized_numerator <= 0 or normalized_denominator <= 0:
+        raise H3Error("download_invalid_video", retryable=False)
+    return f"{normalized_numerator}/{normalized_denominator}"
+
+
+def _fraction_value(value: str) -> float:
+    try:
+        numerator, denominator = value.split("/", 1)
+        normalized = int(numerator) / int(denominator)
+    except (AttributeError, OverflowError, TypeError, ValueError, ZeroDivisionError):
+        raise H3Error("download_invalid_video", retryable=False) from None
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise H3Error("download_invalid_video", retryable=False)
+    return normalized
+
+
+def _monotonic_nondecreasing(values: Sequence[float]) -> bool:
+    return all(
+        current + _DURATION_EPS_S >= previous
+        for previous, current in zip(values, values[1:])
+    )
+
+
+def _event_seconds(
+    event: Mapping[str, Any],
+    tick_key: str,
+    time_key: str,
+    time_base: str,
+    *,
+    fallback_tick_key: str | None = None,
+    fallback_time_key: str | None = None,
+) -> float:
+    for candidate_tick, candidate_time in (
+        (tick_key, time_key),
+        (fallback_tick_key, fallback_time_key),
+    ):
+        if candidate_tick is not None:
+            ticks = event.get(candidate_tick)
+            if not isinstance(ticks, bool) and isinstance(ticks, int):
+                return _ticks_to_seconds(ticks, time_base)
+        if candidate_time is not None:
+            seconds = _optional_seconds(event.get(candidate_time))
+            if seconds is not None:
+                return seconds
+    raise H3Error("download_invalid_video", retryable=False)
+
+
+def _event_positive_duration(
+    event: Mapping[str, Any],
+    time_base: str,
+    *,
+    kind: Literal["video", "audio"] | None = None,
+    source: Mapping[str, Any] | None = None,
+) -> float:
+    duration = _event_optional_duration(
+        event,
+        time_base,
+        kind=kind,
+        source=source,
+    )
+    if duration is None:
+        raise H3Error("download_invalid_video", retryable=False)
+    return duration
+
+
+def _event_optional_duration(
+    event: Mapping[str, Any],
+    time_base: str,
+    *,
+    kind: Literal["video", "audio"] | None = None,
+    source: Mapping[str, Any] | None = None,
+) -> float | None:
+    for tick_key, time_key in (
+        ("duration", "duration_time"),
+        ("pkt_duration", "pkt_duration_time"),
+    ):
+        ticks = event.get(tick_key)
+        if not isinstance(ticks, bool) and isinstance(ticks, int) and ticks > 0:
+            return _ticks_to_seconds(ticks, time_base)
+        seconds = _optional_positive_seconds(event.get(time_key))
+        if seconds is not None:
+            return seconds
+    if kind == "audio" and source is not None:
+        samples = event.get("nb_samples")
+        sample_rate = source.get("sample_rate")
+        try:
+            normalized_samples = int(samples)
+            normalized_rate = int(sample_rate)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if normalized_samples > 0 and normalized_rate > 0:
+                return _round_seconds(normalized_samples / normalized_rate)
+    if kind == "video" and source is not None:
+        for rate_key in ("avg_frame_rate", "r_frame_rate"):
+            try:
+                rate = _fraction_value(_positive_fraction(source.get(rate_key)))
+            except H3Error:
+                continue
+            if rate > 0:
+                return _round_seconds(1 / rate)
+    return None
+
+
+def _derive_packet_durations(
+    packets: Sequence[Mapping[str, Any]],
+    *,
+    packet_pts: Sequence[float],
+    packet_dts: Sequence[float],
+    time_base: str,
+    frame_end: float,
+) -> list[float]:
+    durations = [
+        _event_optional_duration(packet, time_base) for packet in packets
+    ]
+    sorted_pts = sorted(set(packet_pts))
+    for index, duration in enumerate(durations):
+        if duration is not None:
+            continue
+        candidates: list[float] = []
+        if index + 1 < len(packet_dts):
+            candidates.append(packet_dts[index + 1] - packet_dts[index])
+        next_position = bisect_right(
+            sorted_pts,
+            packet_pts[index] + _DURATION_EPS_S,
+        )
+        if next_position < len(sorted_pts):
+            candidates.append(sorted_pts[next_position] - packet_pts[index])
+        candidates.append(frame_end - packet_pts[index])
+        inferred = next(
+            (
+                _round_seconds(candidate)
+                for candidate in candidates
+                if math.isfinite(candidate) and candidate > _DURATION_EPS_S
+            ),
+            None,
+        )
+        if inferred is None:
+            raise H3Error("download_invalid_video", retryable=False)
+        durations[index] = inferred
+    return [
+        duration
+        for duration in durations
+        if duration is not None
+    ]
+
+
+def _ticks_to_seconds(ticks: int, time_base: str) -> float:
+    try:
+        value = ticks * _fraction_value(time_base)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        raise H3Error("download_invalid_video", retryable=False) from None
+    if not math.isfinite(value):
+        raise H3Error("download_invalid_video", retryable=False)
+    return _round_seconds(value)
+
+
+def _optional_seconds(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return _round_seconds(normalized) if math.isfinite(normalized) else None
+
+
+def _optional_positive_seconds(value: Any) -> float | None:
+    normalized = _optional_seconds(value)
+    return normalized if normalized is not None and normalized > 0 else None
+
+
+def _round_seconds(value: float) -> float:
+    return round(float(value), 9)
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _probe_video_duration(path: Path, timeout_s: float) -> float | None:
@@ -1967,7 +2902,17 @@ def _result(
         output=output,
         retryable=bool(state.get("retryable")),
         error_code=error_code,
+        media_timeline=_state_media_timeline(state),
     )
+
+
+def _state_media_timeline(
+    state: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    h3_state = state.get("h3") if isinstance(state, Mapping) else None
+    output = h3_state.get("output") if isinstance(h3_state, Mapping) else None
+    timeline = output.get("media_timeline") if isinstance(output, Mapping) else None
+    return timeline if _media_timeline_receipt_is_valid(timeline) else None
 
 
 def _response_json(response: httpx.Response) -> dict[str, Any]:
