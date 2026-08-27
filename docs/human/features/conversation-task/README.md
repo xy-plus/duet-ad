@@ -31,6 +31,7 @@ links: []
 硬约束：
 
 - 全链只允许调用三个 Skill：`video-maker` 负责关键词/片段分析、每段 9 张关键帧和旧视频提示词；`image-postprocess` 只负责关键帧图片优化；`video-prompt-fusion` 只负责最终提示词融合。不得派生 Audio、Binding、Speaker 或其他 Skill/phase。
+- 收口后的 `video-maker` Skill 权威 SHA-256 为 `0bbb22baeb8f14fef737b279e2ab2e8f70bf8965d41b182f1987537e1e3e4785`；不得恢复已删除的音画绑定、说话人可见性或图片后融合 phase。
 - 已验收的 `image-postprocess` Skill 立即冻结；`skills/image-postprocess/SKILL.md` 的权威 SHA-256 为 `ca3efd2390b43b52fba6af121e61218f298d3ff2f6ebf1dd7898657e4370ad35`。不再修改其文件、提示词、规则或测试；后续工作只允许拼接已有链路。
 - 除上述三个 Skill 外，不存在 Binding Skill、Audio Skill、Speaker Skill 或第四个 Skill。音频呈现由普通后端代码根据冻结台词、Web 的画内/画外选择和现有 voice reference 做确定性投影，再作为只读输入交给融合 Skill。
 - 单段和多段不是两条链。所有当前项目统一为 `segments[N>=1]`；所谓短视频只是 `N=1`，使用同一冻结、Context、H3、attempt、恢复、拼接和验收实现。
