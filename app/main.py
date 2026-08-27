@@ -2748,9 +2748,12 @@ def create_app(settings: Settings) -> FastAPI:
                             exact_paid_resume = False
                         else:
                             exact_paid_resume = (
-                                inspected.status == "h3_running"
-                                and inspected.attempt_id
+                                inspected.attempt_id
                                 == generation.get("h3_attempt_id")
+                                and h3.timeout_attempt_is_get_only_resumable(
+                                    effective_request,
+                                    generation["h3_attempt_id"],
+                                )
                             )
                     if exact_paid_resume:
                         updated = {
