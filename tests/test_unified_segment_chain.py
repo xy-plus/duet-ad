@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -118,7 +119,7 @@ _CID_9533_LINES_JSON = (
 
 
 def _write_9533_fusion_fixture(
-    root: Path, *, audio_envelope: str,
+    root: Path, *, audio_envelope: str, lines_json: str = _CID_9533_LINES_JSON,
 ) -> tuple[Path, Path, str]:
     (root / "work").mkdir(parents=True, exist_ok=True)
     input_payload = json.loads(_fusion_input(root, 1).decode("utf-8"))
@@ -126,9 +127,9 @@ def _write_9533_fusion_fixture(
     voice.parent.mkdir(parents=True, exist_ok=True)
     voice.write_bytes(b"9533-frozen-normalized-voice")
     input_payload["segments"][0]["audio_content"] = {
-        "lines_json": _CID_9533_LINES_JSON,
+        "lines_json": lines_json,
         "lines_sha256": hashlib.sha256(
-            _CID_9533_LINES_JSON.encode("utf-8")
+            lines_json.encode("utf-8")
         ).hexdigest(),
         "voice_references": [{
             "voice_ref": 1,
@@ -175,6 +176,72 @@ def test_9533_lf_audio_envelope_is_canonicalized_without_rewriting_json(
         f"<VISUAL>9533 fused visual</VISUAL>\n{canonical_block}",
     )
     assert frozen.output_data == output_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "say <AUDIO_CONTENT_JSON> literally",
+        "say </AUDIO_CONTENT_JSON> literally",
+        "say <AUDIO_CONTENT_JSON> and </AUDIO_CONTENT_JSON> literally",
+    ],
+    ids=("opening-literal", "closing-literal", "both-literals"),
+)
+def test_audio_line_text_may_contain_outer_tag_literals(
+    tmp_path: Path, text: str,
+) -> None:
+    lines_json = json.dumps(
+        [{
+            "order": 1,
+            "text": text,
+            "start_s": 0.0,
+            "end_s": 14.44,
+            "delivery": "off_screen",
+            "voice_ref": 1,
+        }],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    canonical_block = (
+        f"<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>"
+    )
+    input_path, output_path, _raw_prompt = _write_9533_fusion_fixture(
+        tmp_path,
+        audio_envelope=canonical_block,
+        lines_json=lines_json,
+    )
+
+    frozen = long_generation.load_prompt_fusion(
+        input_path=input_path, output_path=output_path, root=tmp_path,
+    )
+
+    assert frozen.final_prompts == (
+        f"<VISUAL>9533 fused visual</VISUAL>\n{canonical_block}",
+    )
+
+
+def test_prompt_fusion_rejects_outer_tag_in_visual_prefix(
+    tmp_path: Path,
+) -> None:
+    canonical_block = (
+        f"<AUDIO_CONTENT_JSON>{_CID_9533_LINES_JSON}"
+        "</AUDIO_CONTENT_JSON>"
+    )
+    input_path, output_path, _raw_prompt = _write_9533_fusion_fixture(
+        tmp_path,
+        audio_envelope=(
+            "<AUDIO_CONTENT_JSON>visual-prefix-injection</AUDIO_CONTENT_JSON>"
+            + canonical_block
+        ),
+    )
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_output_invalid",
+    ):
+        long_generation.load_prompt_fusion(
+            input_path=input_path, output_path=output_path, root=tmp_path,
+        )
 
 
 @pytest.mark.parametrize(
@@ -456,6 +523,133 @@ def test_failed_lf_output_can_publish_receipt_without_rerunning_skill(
     assert manifest["skill"]["sha256"] == hashlib.sha256(
         (root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME).read_bytes()
     ).hexdigest()
+
+
+def test_receipt_finalization_serializes_a_concurrent_generation_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, cid, _root, _skill_path, _output = _failed_lf_prompt_fusion(
+        tmp_path, monkeypatch,
+    )
+    original_publish = pipeline._publish_prompt_fusion_manifest
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+    writer: list[threading.Thread] = []
+
+    def publish(**kwargs):
+        def write_generation() -> None:
+            writer_started.set()
+            storage.update_meta(
+                settings.data_dir,
+                cid,
+                generation={"status": "not_started"},
+            )
+            writer_finished.set()
+
+        thread = threading.Thread(target=write_generation)
+        writer.append(thread)
+        thread.start()
+        assert writer_started.wait(1)
+        result = original_publish(**kwargs)
+        assert not writer_finished.wait(0.2)
+        return result
+
+    monkeypatch.setattr(pipeline, "_publish_prompt_fusion_manifest", publish)
+
+    assert pipeline.finalize_prompt_fusion_receipt(settings, cid) == "done"
+    writer[0].join(1)
+    assert writer_finished.is_set()
+    meta = storage.load_meta(settings.data_dir, cid)
+    assert meta["_prompt_fusion"]["status"] == "done"
+    assert meta["generation"] == {"status": "not_started"}
+
+
+def test_receipt_finalization_rejects_publish_hook_cas_drift_without_orphan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, cid, root, _skill_path, _output = _failed_lf_prompt_fusion(
+        tmp_path, monkeypatch,
+    )
+    original_publish = pipeline._publish_prompt_fusion_manifest
+
+    def publish(**kwargs):
+        result = original_publish(**kwargs)
+        kwargs["meta"]["_prompt_fusion"] = {
+            **kwargs["state"],
+            "status": "running",
+        }
+        return result
+
+    monkeypatch.setattr(pipeline, "_publish_prompt_fusion_manifest", publish)
+
+    with pytest.raises(
+        pipeline.PipelineError,
+        match="state drifted during finalization",
+    ):
+        pipeline.finalize_prompt_fusion_receipt(settings, cid)
+
+    assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
+    assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
+        "status"
+    ] == "failed"
+
+
+def test_receipt_finalization_cleans_exact_manifest_after_publish_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, cid, root, _skill_path, _output = _failed_lf_prompt_fusion(
+        tmp_path, monkeypatch,
+    )
+    original_atomic = pipeline._atomic_bytes
+
+    def write_then_fail(path: Path, data: bytes) -> None:
+        original_atomic(path, data)
+        raise OSError("simulated publish failure")
+
+    monkeypatch.setattr(pipeline, "_atomic_bytes", write_then_fail)
+
+    with pytest.raises(OSError, match="simulated publish failure"):
+        pipeline.finalize_prompt_fusion_receipt(settings, cid)
+
+    assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
+    assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
+        "status"
+    ] == "failed"
+
+
+def test_exact_crash_residue_is_unreadable_until_receipt_finalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, cid, root, skill_path, _output = _failed_lf_prompt_fusion(
+        tmp_path, monkeypatch,
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+    pipeline._publish_prompt_fusion_manifest(
+        root=root,
+        meta=meta,
+        state=meta["_prompt_fusion"],
+    )
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_manifest_invalid",
+    ):
+        long_generation.load_bound_prompt_fusion_manifest(
+            root=root,
+            meta=meta,
+            skill_source_path=skill_path,
+        )
+
+    assert pipeline.finalize_prompt_fusion_receipt(settings, cid) == "done"
+    committed = storage.load_meta(settings.data_dir, cid)
+    assert long_generation.load_bound_prompt_fusion_manifest(
+        root=root,
+        meta=committed,
+        skill_source_path=skill_path,
+    ).final_prompts == (
+        "<VISUAL>fused</VISUAL>\n"
+        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>",
+    )
 
 
 @pytest.mark.parametrize(

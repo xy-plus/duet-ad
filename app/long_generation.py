@@ -105,15 +105,17 @@ def _canonical_fusion_prompt(prompt: str, lines_json: str) -> str:
     """Accept one exact audio block and freeze one canonical byte form."""
     opening = "<AUDIO_CONTENT_JSON>"
     closing = "</AUDIO_CONTENT_JSON>"
-    if prompt.count(opening) != 1 or prompt.count(closing) != 1:
-        raise LongGenerationError("prompt_fusion_output_invalid")
     canonical = _fusion_audio_block(lines_json)
-    if canonical in prompt:
-        return prompt
     lf_envelope = f"{opening}\n{lines_json}\n{closing}"
-    if lf_envelope in prompt:
-        return prompt.replace(lf_envelope, canonical, 1)
-    raise LongGenerationError("prompt_fusion_output_invalid")
+    if prompt.endswith(canonical):
+        prefix = prompt[:-len(canonical)]
+    elif prompt.endswith(lf_envelope):
+        prefix = prompt[:-len(lf_envelope)]
+    else:
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    if opening in prefix or closing in prefix:
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    return prefix + canonical
 
 
 def load_prompt_fusion(
@@ -379,6 +381,40 @@ def load_prompt_fusion_manifest(
             != hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         ):
             raise LongGenerationError("prompt_fusion_manifest_invalid")
+    return frozen
+
+
+def load_bound_prompt_fusion_manifest(
+    *, root: Path, meta: Mapping, skill_source_path: Path,
+) -> FrozenPromptFusion:
+    """Load fusion only when durable project state binds this manifest."""
+    root = Path(root).resolve()
+    manifest_path = root / "work" / h3_project.SOURCE_FILENAME
+    try:
+        manifest_data = manifest_path.read_bytes()
+        manifest = json.loads(manifest_data.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise LongGenerationError("prompt_fusion_manifest_invalid") from None
+    state = meta.get("_prompt_fusion")
+    if (
+        not isinstance(state, Mapping)
+        or state.get("version") != 1
+        or state.get("status") != "done"
+        or state.get("error") is not None
+        or state.get("manifest_sha256")
+        != hashlib.sha256(manifest_data).hexdigest()
+        or state.get("image_acceptance_sha256")
+        != prompt_fusion_image_authority_sha256(meta)
+        or not isinstance(manifest, Mapping)
+        or manifest.get("image_acceptance_sha256")
+        != state.get("image_acceptance_sha256")
+    ):
+        raise LongGenerationError("prompt_fusion_manifest_invalid")
+    frozen = load_prompt_fusion_manifest(
+        root=root, skill_source_path=skill_source_path,
+    )
+    if frozen.input_sha256 != state.get("input_sha256"):
+        raise LongGenerationError("prompt_fusion_manifest_invalid")
     return frozen
 
 
@@ -1084,8 +1120,9 @@ def finalize_multimodal_plan(
         if isinstance(payload, Mapping) and payload.get("prompt_fusion") is not None:
             if settings is None:
                 raise LongGenerationError("prompt_fusion_manifest_invalid")
-            load_prompt_fusion_manifest(
+            load_bound_prompt_fusion_manifest(
                 root=root,
+                meta=meta,
                 skill_source_path=PROMPT_FUSION_SKILL_SOURCE,
             )
         return None
@@ -1143,8 +1180,10 @@ def finalize_multimodal_plan(
         raise LongGenerationError("prompt_fusion_failed")
     if queued != "done":
         raise LongGenerationError("prompt_fusion_refresh_required")
-    fusion = load_prompt_fusion_manifest(
-        root=root, skill_source_path=pipeline.PROMPT_FUSION_SKILL_MD,
+    fusion = load_bound_prompt_fusion_manifest(
+        root=root,
+        meta=meta,
+        skill_source_path=pipeline.PROMPT_FUSION_SKILL_MD,
     )
     if fusion.input_data != input_data:
         raise LongGenerationError("prompt_fusion_input_invalid")
@@ -1411,8 +1450,9 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         ):
             raise LongGenerationError("prompt_fusion_manifest_invalid")
         manifest_path = _bound_path(root, fusion_binding)
-        frozen_fusion = load_prompt_fusion_manifest(
+        frozen_fusion = load_bound_prompt_fusion_manifest(
             root=root,
+            meta=meta,
             skill_source_path=PROMPT_FUSION_SKILL_SOURCE,
         )
         if manifest_path != root / "work" / h3_project.SOURCE_FILENAME \
