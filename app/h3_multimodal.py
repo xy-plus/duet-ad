@@ -11,10 +11,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
-from app import context_ir_bridge, h3
+from app import context_ir_bridge, dialogue_timing, h3
 
 
-COMPILER_VERSION = "duet.h3-context-ir.multimodal-audio.v2"
+COMPILER_VERSION = "duet.h3-context-ir.multimodal-audio.v3"
 MAX_PROMPT_CHARS = 7000
 _TOP_KEYS = {
     "version",
@@ -427,6 +427,7 @@ def build_h3_request(
     resolution: str,
     aspect_ratio: str,
     autodl_token: str,
+    speaker_timing: dialogue_timing.FrozenSpeakerTiming | None = None,
     timeouts: h3.Timeouts = h3.Timeouts(),
     seed: int | None = None,
 ) -> h3.H3Request:
@@ -459,6 +460,20 @@ def build_h3_request(
             upstream_dialogue_receipt_sha256
         ),
     )
+    for line in speech:
+        if line.delivery != "on_screen":
+            continue
+        if speaker_timing is None:
+            _fail("speaker_timing_evidence_missing")
+        try:
+            dialogue_timing.require_authoritative_window(
+                speaker_timing,
+                subject_id=str(line.subject_id),
+                start_s=line.start_s,
+                end_s=line.end_s,
+            )
+        except dialogue_timing.DialogueTimingError as exc:
+            _fail(exc.code)
     prompt = _compile_prompt(visual, audios, subjects, speech, sounds)
     workflows = {
         "multimodal": h3.H3_MULTIMODAL_WORKFLOW,
@@ -487,5 +502,23 @@ def build_h3_request(
         skill_plan_sha256=plan_sha256,
         multimodal_compiler_version=COMPILER_VERSION,
         upstream_dialogue_receipt_sha256=upstream_dialogue_receipt_sha256,
+        speaker_timing_sha256=(
+            speaker_timing.sha256
+            if isinstance(speaker_timing, dialogue_timing.FrozenSpeakerTiming)
+            else None
+        ),
+        on_screen_dialogue=tuple(
+            {
+                "order": order,
+                "line_index": line.line_index,
+                "subject_id": line.subject_id,
+                "text": line.text,
+                "start_s": line.start_s,
+                "end_s": line.end_s,
+            }
+            for order, line in enumerate(
+                (item for item in speech if item.delivery == "on_screen"), 1
+            )
+        ),
         audio_required=True,
     )

@@ -239,6 +239,8 @@ class H3Request:
     skill_plan_sha256: str | None = None
     multimodal_compiler_version: str | None = None
     upstream_dialogue_receipt_sha256: str | None = None
+    speaker_timing_sha256: str | None = None
+    on_screen_dialogue: tuple[Mapping[str, Any], ...] = ()
     audio_required: bool = False
     context_ir_receipt_path: Path | None = None
     context_ir_receipt_sha256: str | None = None
@@ -349,6 +351,8 @@ def _validate_request_audio_contract(
             or request.skill_plan_sha256 is not None
             or request.multimodal_compiler_version is not None
             or request.upstream_dialogue_receipt_sha256 is not None
+            or request.speaker_timing_sha256 is not None
+            or request.on_screen_dialogue
             or request.audio_required is not False
             or request.context_ir_receipt_path is not None
             or request.context_ir_receipt_sha256 is not None
@@ -382,6 +386,45 @@ def _validate_request_audio_contract(
         raise H3Error("invalid_skill_plan_receipt")
     if not _is_sha256(request.upstream_dialogue_receipt_sha256):
         raise H3Error("invalid_upstream_dialogue_receipt")
+    if request.on_screen_dialogue and not _is_sha256(request.speaker_timing_sha256):
+        raise H3Error("invalid_speaker_timing_receipt")
+    if not request.on_screen_dialogue and request.speaker_timing_sha256 is not None and not _is_sha256(request.speaker_timing_sha256):
+        raise H3Error("invalid_speaker_timing_receipt")
+    if not isinstance(request.on_screen_dialogue, tuple):
+        raise H3Error("invalid_on_screen_dialogue")
+    normalized_dialogue: list[dict[str, Any]] = []
+    for expected_order, line in enumerate(request.on_screen_dialogue, 1):
+        if (
+            not isinstance(line, Mapping)
+            or set(line) != {
+                "order", "line_index", "subject_id", "text",
+                "start_s", "end_s",
+            }
+            or line.get("order") != expected_order
+            or isinstance(line.get("line_index"), bool)
+            or not isinstance(line.get("line_index"), int)
+            or line["line_index"] < 1
+            or not isinstance(line.get("subject_id"), str)
+            or not line["subject_id"]
+            or not isinstance(line.get("text"), str)
+            or not line["text"]
+        ):
+            raise H3Error("invalid_on_screen_dialogue")
+        try:
+            start_s, end_s = float(line["start_s"]), float(line["end_s"])
+        except (TypeError, ValueError):
+            raise H3Error("invalid_on_screen_dialogue") from None
+        if not (math.isfinite(start_s) and math.isfinite(end_s) and 0 <= start_s < end_s):
+            raise H3Error("invalid_on_screen_dialogue")
+        normalized_dialogue.append({
+            "order": expected_order,
+            "line_index": line["line_index"],
+            "subject_id": line["subject_id"],
+            "text": line["text"],
+            "start_s": start_s,
+            "end_s": end_s,
+        })
+    object.__setattr__(request, "on_screen_dialogue", tuple(normalized_dialogue))
     if (
         not isinstance(request.multimodal_compiler_version, str)
         or not request.multimodal_compiler_version.strip()
@@ -456,6 +499,10 @@ def _context_ir_source_request_receipt(
         "workflow": request.workflow,
         "skill_plan_sha256": request.skill_plan_sha256,
         "multimodal_compiler_version": request.multimodal_compiler_version,
+        "speaker_timing_sha256": request.speaker_timing_sha256,
+        "on_screen_dialogue_sha256": canonical_json_sha256(
+            list(request.on_screen_dialogue)
+        ),
         "audio_required": request.audio_required,
         "reference_audio_metadata": [
             {
@@ -1439,6 +1486,8 @@ def _input_manifest(
                     request.upstream_dialogue_receipt_sha256
                 ),
                 "compiler_version": request.multimodal_compiler_version,
+                "speaker_timing_sha256": request.speaker_timing_sha256,
+                "on_screen_dialogue": list(request.on_screen_dialogue),
                 "audio_required": request.audio_required,
                 "reference_audio_semantics": "conditioning_only",
                 "reference_audios": _reference_audio_manifest(request),

@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import (
-    context_ir_bridge, h3, h3_project, long_generation, long_video,
+    context_ir_bridge, dialogue_timing, h3, h3_project, long_generation, long_video,
     prepared_input, stitch, storage,
 )
 from app.main import (
@@ -126,6 +126,57 @@ def _multimodal_source(
             "purpose": purpose,
         })
     selected_keyframes = keyframes or sorted((work / "keyframes").glob("*.png"))
+    keyframe_bindings = [
+        {
+            "order": order,
+            "path": path.resolve().relative_to(work.resolve()).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for order, path in enumerate(selected_keyframes, 1)
+    ]
+    source = work.parent / "source.mp4"
+    timeline = {
+        "time_base": {"numerator": 1, "denominator": 1000},
+        "keyframes": [
+            {
+                "order": item["order"],
+                "sha256": item["sha256"],
+                "pts": (item["order"] - 1) * 1000,
+            }
+            for item in keyframe_bindings
+        ],
+    }
+    speaker_timing = {
+        "schema": "duet.speaker-timing",
+        "version": 1,
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "timeline": timeline,
+        "timeline_sha256": h3.canonical_json_sha256(timeline),
+        "speakers": [
+            {
+                "subject_id": "S1",
+                "windows": [
+                    {
+                        "kind": "lip_verifiable",
+                        "status": "verified",
+                        "start_pts": 0,
+                        "end_pts": 15000,
+                        "evidence_keyframes": [
+                            item["order"] for item in keyframe_bindings
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    speaker_timing_path = work / h3_project.SPEAKER_TIMING_FILENAME
+    speaker_timing_path.write_text(
+        json.dumps(speaker_timing, ensure_ascii=False), encoding="utf-8"
+    )
+    speaker_timing_binding = {
+        "path": speaker_timing_path.name,
+        "sha256": hashlib.sha256(speaker_timing_path.read_bytes()).hexdigest(),
+    }
     skill_input = {
         "schema": h3_project.SKILL_INPUT_SCHEMA,
         "version": h3_project.SKILL_INPUT_VERSION,
@@ -133,16 +184,10 @@ def _multimodal_source(
             "path": "visual_prompt.txt",
             "sha256": hashlib.sha256(visual_prompt.encode("utf-8")).hexdigest(),
         },
-        "keyframes": [
-            {
-                "order": order,
-                "path": path.resolve().relative_to(work.resolve()).as_posix(),
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-            for order, path in enumerate(selected_keyframes, 1)
-        ],
+        "keyframes": keyframe_bindings,
         "dialogue_source_sha256": plan["dialogue_source_sha256"],
         "reference_audios": audio_bindings,
+        "speaker_timing": speaker_timing_binding,
     }
     skill_input_path = work / h3_project.SKILL_INPUT_FILENAME
     skill_input_path.write_text(
@@ -162,6 +207,7 @@ def _multimodal_source(
             "sha256": hashlib.sha256(plan_path.read_bytes()).hexdigest(),
         },
         "reference_audios": audio_bindings,
+        "speaker_timing": speaker_timing_binding,
     }
     path = work / h3_project.SOURCE_FILENAME
     path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
@@ -305,6 +351,67 @@ def _install_fake_h3(monkeypatch, gateway: _Gateway) -> None:
     monkeypatch.setattr(h3, "start", start)
 
 
+def _write_final_acceptance(
+    *,
+    workdir: Path,
+    provider_output: Path,
+    dialogue: tuple[dict, ...],
+    dialogue_sha256: str,
+    speaker_timing_path: Path,
+) -> None:
+    timeline = h3._probe_media_timeline(
+        provider_output, 30, max_duration_s=5
+    )
+    on_screen = dialogue[:1]
+    artifact = {
+        "schema": "duet.dialogue-av-acceptance",
+        "version": 1,
+        "output": {
+            "sha256": hashlib.sha256(provider_output.read_bytes()).hexdigest(),
+            "size": provider_output.stat().st_size,
+            "media_timeline_sha256": h3.canonical_json_sha256(timeline),
+        },
+        "authority": {
+            "dialogue_sha256": dialogue_sha256,
+            "speaker_timing_sha256": dialogue_timing.canonical_sha256(
+                json.loads(speaker_timing_path.read_text(encoding="utf-8"))
+            ),
+        },
+        "max_asr_boundary_drift_ms": 250,
+        "asr": {
+            "engine": "test-independent-asr",
+            "model_sha256": "a" * 64,
+            "transcript_sha256": "b" * 64,
+            "unmatched_speech_count": 0,
+        },
+        "lip": {
+            "engine": "test-independent-lip-verifier",
+            "model_sha256": "c" * 64,
+            "analysis_sha256": "d" * 64,
+        },
+        "lines": [
+            {
+                "line_index": 1,
+                "subject_id": "S1",
+                "text_sha256": hashlib.sha256(
+                    line["text"].encode("utf-8")
+                ).hexdigest(),
+                "time_base": {"numerator": 1, "denominator": 1000},
+                "asr_start_pts": round(float(line["start_s"]) * 1000),
+                "asr_end_pts": round(float(line["end_s"]) * 1000),
+                "lip_start_pts": round(float(line["start_s"]) * 1000),
+                "lip_end_pts": round(float(line["end_s"]) * 1000),
+                "lip_status": "verified",
+            }
+            for line in on_screen
+        ],
+    }
+    workdir.mkdir(parents=True, exist_ok=True)
+    (workdir / h3_project.FINAL_ACCEPTANCE_FILENAME).write_text(
+        json.dumps(artifact, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 def _decode_audio(path: Path) -> np.ndarray:
     result = subprocess.run(
         [
@@ -422,6 +529,13 @@ def test_short_project_freezes_skill_audio_contract_and_stitches_only_h3_audio(
                 visual.read_text(encoding="utf-8"),
                 refreshed.dialogue_sha256,
             ),
+        )
+        _write_final_acceptance(
+            workdir=work / "h3-native",
+            provider_output=provider,
+            dialogue=dialogue,
+            dialogue_sha256=refreshed.dialogue_sha256,
+            speaker_timing_path=work / h3_project.SPEAKER_TIMING_FILENAME,
         )
         response = client.post(
             f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
@@ -847,6 +961,8 @@ def test_skill_input_keyframe_binding_rejects_drift_before_h3(tmp_path, mutation
     visual = work / "visual_prompt.txt"
     first = work / "keyframes" / "01.png"
     second = work / "keyframes" / "02.png"
+    (root / "source.mp4").parent.mkdir(parents=True, exist_ok=True)
+    (root / "source.mp4").write_bytes(b"source-fixture")
     _png(first, 20)
     _png(second, 80)
     visual.parent.mkdir(parents=True, exist_ok=True)
@@ -886,6 +1002,9 @@ def test_skill_input_keyframe_binding_rejects_drift_before_h3(tmp_path, mutation
             keyframes=keyframes,
             upstream_dialogue=dialogue,
             upstream_dialogue_receipt_sha256=dialogue_sha256,
+            source_sha256=hashlib.sha256(
+                (work.parent / "source.mp4").read_bytes()
+            ).hexdigest(),
             cid=f"keyframe-{mutation}",
             workdir=work / "h3-native",
             client_request_id=f"keyframe-{mutation}",
