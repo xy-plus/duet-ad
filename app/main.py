@@ -29,6 +29,7 @@ from app import (
     pipeline,
     postprocess,
     prepared_input,
+    published_preview,
     stitch,
     storage,
     voice,
@@ -189,7 +190,10 @@ def _duration_exceeds_h3_limit(value) -> bool:
 
 
 def _is_read_only(meta: dict) -> bool:
-    return meta.get("schema_version") != 2
+    return (
+        meta.get("schema_version") != 2
+        or "published_preview_receipt" in meta
+    )
 
 
 def _public_lines(value) -> list[dict]:
@@ -1718,6 +1722,8 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
 
 
 def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
+    if "published_preview_receipt" in meta:
+        return _validate_published_preview(settings, meta)
     generation = meta.get("generation")
     # Pre-H3 legacy conversations have no receipt to validate. Preserve their
     # historical visibility; every receipt-aware generation is fail closed.
@@ -1745,6 +1751,62 @@ def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
         fingerprint,
         lambda: _generated_video_validation_fingerprint(cdir, meta),
         lambda: _validate_generated_video_uncached(settings, meta),
+    )
+
+
+def _validate_published_preview(settings: Settings, meta: dict) -> bool:
+    """Validate a portable display copy against its untouched source chain."""
+    cid = meta.get("id")
+    if not isinstance(cid, str):
+        return False
+    destination = (settings.data_dir / cid).resolve()
+    try:
+        source_root, _receipt = published_preview.load(destination, meta)
+        if source_root == destination or source_root.name != cid:
+            return False
+        source_meta = storage.load_meta(source_root.parent, cid)
+        if (
+            not isinstance(source_meta, dict)
+            or "published_preview_receipt" in source_meta
+        ):
+            return False
+        source_settings = replace(settings, data_dir=source_root.parent)
+        return _validate_generated_video_uncached(source_settings, source_meta)
+    except (OSError, TypeError, ValueError, published_preview.PublishedPreviewError):
+        return False
+
+
+def build_published_preview_receipt(
+    settings: Settings,
+    *,
+    source_root: Path,
+    target_root: Path,
+    target_meta: Mapping[str, object],
+) -> dict[str, object]:
+    """Build a display-only binding after validating the source in full."""
+    try:
+        source = Path(source_root).resolve(strict=True)
+    except OSError:
+        raise published_preview.PublishedPreviewError(
+            "published_preview_source_invalid"
+        ) from None
+    cid = source.name
+    source_meta = storage.load_meta(source.parent, cid)
+    if (
+        not isinstance(source_meta, dict)
+        or source_meta.get("id") != target_meta.get("id")
+        or "published_preview_receipt" in source_meta
+        or not _validate_generated_video_uncached(
+            replace(settings, data_dir=source.parent), source_meta
+        )
+    ):
+        raise published_preview.PublishedPreviewError(
+            "published_preview_source_invalid"
+        )
+    return published_preview._build(
+        source_root=source,
+        target_root=target_root,
+        target_meta=target_meta,
     )
 
 
@@ -2363,11 +2425,18 @@ def create_app(settings: Settings) -> FastAPI:
             or not isinstance(expected, str) or not isinstance(prompt, str)
         ):
             raise HTTPException(status_code=422, detail="invalid_image_optimization_prompt_request")
+        meta = storage.load_meta(settings.data_dir, cid)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="not found")
+        if _is_read_only(meta):
+            raise HTTPException(status_code=409, detail="read_only")
         lock = postprocess_locks.setdefault(cid, asyncio.Lock())
         async with lock:
             result: dict[str, str] = {}
 
             def mutate(meta: dict) -> None:
+                if _is_read_only(meta):
+                    raise HTTPException(status_code=409, detail="read_only")
                 frozen = image_optimization.replace(
                     meta, settings, segment_index, expected, prompt
                 )
@@ -3266,6 +3335,11 @@ def create_app(settings: Settings) -> FastAPI:
     async def retry_postprocess_segment(
         cid: str, index: int, payload: dict, background_tasks: BackgroundTasks
     ):
+        meta = storage.load_meta(settings.data_dir, cid)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="not found")
+        if _is_read_only(meta):
+            raise HTTPException(status_code=409, detail="read_only")
         try:
             await postprocess.retry_segment(
                 settings, cid, index, payload, postprocess_locks
