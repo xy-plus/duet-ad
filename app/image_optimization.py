@@ -53,6 +53,25 @@ _PROJECT_CHECKS = (
     "person_identity_continuity",
     "scene_continuity",
 )
+_PACK_PERSON_CHECKS = (
+    "identity_changed",
+    "source_identity_absent",
+    "multiview",
+    "local_color",
+)
+_PACK_SCENE_CHECKS = (
+    "semantic",
+    "geometry",
+    "depth",
+    "layout",
+    "local_color",
+)
+_PACK_PROJECT_CHECKS = (
+    "light_direction_preservation",
+    "exposure_preservation",
+    "wb_cct_preservation",
+    "tone_curve_preservation",
+)
 
 
 class ImageOptimizationError(ValueError):
@@ -1305,6 +1324,279 @@ def canonical_verification(value: object, plan: dict) -> dict:
         "segments": segments,
         "project_checks": project_checks,
     }
+
+
+def _reference_pack_verification_reason(
+    persons: list[dict], scenes: list[dict], project: dict
+) -> str | None:
+    checks = [
+        check
+        for item in [*persons, *scenes]
+        for check in item["checks"].values()
+    ] + list(project.values())
+    if any(check["status"] == "unknown" for check in checks):
+        return "pack_verification_unknown"
+    for key, reason in (
+        ("identity_changed", "person_identity_change_failed"),
+        ("source_identity_absent", "source_identity_residual"),
+        ("multiview", "person_multiview_failed"),
+        ("local_color", "person_local_color_failed"),
+    ):
+        if any(item["checks"][key]["status"] == "fail" for item in persons):
+            return reason
+    for key, reason in (
+        ("semantic", "scene_semantic_failed"),
+        ("geometry", "scene_geometry_failed"),
+        ("depth", "scene_depth_failed"),
+        ("layout", "scene_layout_failed"),
+        ("local_color", "scene_local_color_failed"),
+    ):
+        if any(item["checks"][key]["status"] == "fail" for item in scenes):
+            return reason
+    for key, reason in (
+        ("light_direction_preservation", "light_direction_preservation_failed"),
+        ("exposure_preservation", "exposure_preservation_failed"),
+        ("wb_cct_preservation", "wb_cct_preservation_failed"),
+        ("tone_curve_preservation", "tone_curve_preservation_failed"),
+    ):
+        if project[key]["status"] == "fail":
+            return reason
+    return None
+
+
+def canonical_reference_pack_verdict(value: object, plan: dict) -> dict:
+    """Validate and derive the exact semantic replacement-pack verdict."""
+    canonical_plan = _canonical_plan_v2(plan)
+    if not canonical_plan["eligible"]:
+        raise ImageOptimizationIneligibleError(canonical_plan["reason"])
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "version",
+            "phase",
+            "plan_sha256",
+            "passed",
+            "reason",
+            "persons",
+            "scenes",
+            "project",
+        }
+        or value.get("version") != 2
+        or value.get("phase") != "verify_pack"
+        or value.get("plan_sha256") != plan_sha256(canonical_plan)
+        or not isinstance(value.get("passed"), bool)
+    ):
+        raise ImageOptimizationOutputError(
+            "reference pack verification output is missing or invalid"
+        )
+
+    def canonical_entities(
+        raw: object, planned: list[dict], id_key: str, check_keys: tuple[str, ...]
+    ) -> list[dict]:
+        if not isinstance(raw, list) or len(raw) != len(planned):
+            raise ImageOptimizationOutputError(
+                "reference pack verification output is missing or invalid"
+            )
+        result = []
+        for item, design in zip(raw, planned):
+            if (
+                not isinstance(item, dict)
+                or set(item) != {id_key, "passed", "checks"}
+                or item.get(id_key) != design["id"]
+                or not isinstance(item.get("passed"), bool)
+                or not isinstance(item.get("checks"), dict)
+                or set(item["checks"]) != set(check_keys)
+            ):
+                raise ImageOptimizationOutputError(
+                    "reference pack verification output is missing or invalid"
+                )
+            checks = {
+                key: _canonical_quality_check(item["checks"].get(key))
+                for key in check_keys
+            }
+            passed = all(check["status"] == "pass" for check in checks.values())
+            if item["passed"] != passed:
+                raise ImageOptimizationOutputError(
+                    "reference pack verification output is missing or invalid"
+                )
+            result.append({id_key: design["id"], "passed": passed, "checks": checks})
+        return result
+
+    persons = canonical_entities(
+        value.get("persons"),
+        canonical_plan["person_plans"],
+        "person_id",
+        _PACK_PERSON_CHECKS,
+    )
+    scenes = canonical_entities(
+        value.get("scenes"),
+        canonical_plan["scene_plans"],
+        "scene_id",
+        _PACK_SCENE_CHECKS,
+    )
+    raw_project = value.get("project")
+    if not isinstance(raw_project, dict) or set(raw_project) != set(
+        _PACK_PROJECT_CHECKS
+    ):
+        raise ImageOptimizationOutputError(
+            "reference pack verification output is missing or invalid"
+        )
+    project = {
+        key: _canonical_quality_check(raw_project.get(key))
+        for key in _PACK_PROJECT_CHECKS
+    }
+    passed = (
+        all(item["passed"] for item in persons)
+        and all(item["passed"] for item in scenes)
+        and all(check["status"] == "pass" for check in project.values())
+    )
+    reason = _reference_pack_verification_reason(persons, scenes, project)
+    if value["passed"] != passed or value.get("reason") != reason:
+        raise ImageOptimizationOutputError(
+            "reference pack verification output is missing or invalid"
+        )
+    return {
+        "version": 2,
+        "phase": "verify_pack",
+        "plan_sha256": plan_sha256(canonical_plan),
+        "passed": passed,
+        "reason": reason,
+        "persons": persons,
+        "scenes": scenes,
+        "project": project,
+    }
+
+
+def _reference_pack_inputs(
+    raw: object,
+    planned: list[dict],
+    id_key: str,
+    session: Path,
+) -> list[tuple[str, tuple[Path, Path, Path]]]:
+    if not isinstance(raw, list) or len(raw) != len(planned):
+        raise ValueError("invalid reference pack verification input")
+    prepared = []
+    for item, design in zip(raw, planned):
+        if not isinstance(item, dict) or set(item) != {
+            id_key,
+            "source_path",
+            "primary_path",
+            "alternate_path",
+        } or item.get(id_key) != design["id"]:
+            raise ValueError("invalid reference pack verification input")
+        paths = []
+        for key in ("source_path", "primary_path", "alternate_path"):
+            try:
+                path = Path(item[key]).resolve(strict=True)
+                path.relative_to(session)
+            except (OSError, TypeError, ValueError):
+                raise ValueError("invalid reference pack verification input") from None
+            if path.suffix.lower() != ".png":
+                raise ValueError("invalid reference pack verification input")
+            paths.append(path)
+        prepared.append((design["id"], tuple(paths)))
+    return prepared
+
+
+def generate_reference_pack_verdict(
+    runner,
+    plan: dict,
+    person_packs: list[dict],
+    scene_packs: list[dict],
+    deterministic_metrics: dict,
+    *,
+    session_dir: Path,
+) -> dict:
+    """Run semantic replacement-pack verification in an isolated workspace."""
+    try:
+        session = Path(session_dir).resolve(strict=True)
+        skill = verification_skill_path()
+    except (OSError, TypeError, ValueError):
+        raise ValueError("invalid reference pack verification input") from None
+    canonical_plan = _canonical_plan_v2(plan)
+    if not canonical_plan["eligible"]:
+        raise ImageOptimizationIneligibleError(canonical_plan["reason"])
+    people = _reference_pack_inputs(
+        person_packs, canonical_plan["person_plans"], "person_id", session
+    )
+    scenes = _reference_pack_inputs(
+        scene_packs, canonical_plan["scene_plans"], "scene_id", session
+    )
+    if not isinstance(deterministic_metrics, dict):
+        raise ValueError("invalid reference pack verification metrics")
+    try:
+        metrics_raw = json.dumps(
+            deterministic_metrics,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        raise ValueError("invalid reference pack verification metrics") from None
+    if len(metrics_raw.encode("utf-8")) > MAX_PROJECT_OUTPUT_OVERHEAD_BYTES:
+        raise ValueError("invalid reference pack verification metrics")
+
+    with tempfile.TemporaryDirectory(prefix="duet-image-pack-verify-", dir="/tmp") as raw:
+        stage = Path(raw).resolve(strict=True)
+        work = stage / "work"
+        work.mkdir(parents=True, mode=0o700)
+        _copy_regular(skill, stage / "SKILL.md")
+        digest = plan_sha256(canonical_plan)
+        (work / "request.json").write_text(
+            json.dumps(
+                {
+                    "phase": "verify_pack",
+                    "plan_sha256": digest,
+                    "person_ids": [item[0] for item in people],
+                    "scene_ids": [item[0] for item in scenes],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (work / "frozen_plan.json").write_text(
+            json.dumps(
+                freeze_continuity(canonical_plan)["_image_continuity"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (work / "metrics.json").write_text(metrics_raw + "\n", encoding="utf-8")
+        for label, prepared in (("persons", people), ("scenes", scenes)):
+            for identifier, paths in prepared:
+                destination = work / "reference_packs" / label / identifier
+                destination.mkdir(parents=True, mode=0o700)
+                for name, source in zip(("source", "primary", "alternate"), paths):
+                    _copy_regular(source, destination / f"{name}.png")
+        run_error: CodexError | None = None
+        try:
+            runner.run_isolated(
+                stage,
+                "严格执行当前目录 SKILL.md 的 verify_pack 阶段；只读取允许的输入，"
+                "并写入规定的唯一输出文件。",
+                session_dir=session,
+            )
+        except CodexError as error:
+            run_error = error
+        try:
+            return canonical_reference_pack_verdict(
+                _read_json_output(
+                    work / "reference_pack_verification.json",
+                    MAX_CONTINUITY_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
+                ),
+                canonical_plan,
+            )
+        except ImageOptimizationOutputError:
+            if run_error is not None:
+                raise run_error from None
+            raise
 
 
 def generate_project_verdict(

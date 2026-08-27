@@ -131,11 +131,11 @@ class _Runner:
                 "session_dir": Path(session_dir),
             }
         )
-        name = (
-            "image_optimization.json"
-            if self.calls[-1]["request"]["phase"] == "plan"
-            else "image_verification.json"
-        )
+        name = {
+            "plan": "image_optimization.json",
+            "verify": "image_verification.json",
+            "verify_pack": "reference_pack_verification.json",
+        }[self.calls[-1]["request"]["phase"]]
         (root / "work" / name).write_text(
             json.dumps(self.output, ensure_ascii=False), encoding="utf-8"
         )
@@ -199,11 +199,56 @@ def _verdict(plan: dict, *, passed: bool = True) -> dict:
     }
 
 
-def test_skill_is_one_concise_plan_and_verify_skill():
+def _pack_verdict(plan: dict, *, passed: bool = True) -> dict:
+    person_status = "pass" if passed else "fail"
+    reason = None if passed else "person_identity_change_failed"
+    return {
+        "version": 2,
+        "phase": "verify_pack",
+        "plan_sha256": image_optimization.plan_sha256(plan),
+        "passed": passed,
+        "reason": reason,
+        "persons": [
+            {
+                "person_id": person["id"],
+                "passed": passed,
+                "checks": {
+                    "identity_changed": _check(person_status),
+                    "source_identity_absent": _check(),
+                    "multiview": _check(),
+                    "local_color": _check(),
+                },
+            }
+            for person in plan["person_plans"]
+        ],
+        "scenes": [
+            {
+                "scene_id": scene["id"],
+                "passed": True,
+                "checks": {
+                    "semantic": _check(),
+                    "geometry": _check(),
+                    "depth": _check(),
+                    "layout": _check(),
+                    "local_color": _check(),
+                },
+            }
+            for scene in plan["scene_plans"]
+        ],
+        "project": {
+            "light_direction_preservation": _check(),
+            "exposure_preservation": _check(),
+            "wb_cct_preservation": _check(),
+            "tone_curve_preservation": _check(),
+        },
+    }
+
+
+def test_skill_is_one_concise_three_phase_skill():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
     assert "name: image-postprocess" in skill
-    assert "`phase` 只能是 `plan` 或 `verify`" in skill
+    assert "`phase` 只能是 `plan`、`verify` 或 `verify_pack`" in skill
     assert "人物与真实新场景必须同时替换" in skill
     assert "`person_plans`" in skill and "`scene_plans`" in skill
     assert "只生成结构化设计，不直接编写 Seedream 提示词" in skill
@@ -216,6 +261,7 @@ def test_skill_is_one_concise_plan_and_verify_skill():
         assert invariant in skill
     assert "不得出现素材特调" in skill
     assert "work/image_verification.json" in skill
+    assert "work/reference_pack_verification.json" in skill
 
 
 def test_verification_skill_path_is_strict_regular_non_symlink(tmp_path, monkeypatch):
@@ -656,3 +702,155 @@ def test_verify_accepts_canonical_fail_closed_failure():
     plan = _plan()
     verdict = _verdict(plan, passed=False)
     assert image_optimization.canonical_verification(verdict, plan) == verdict
+
+
+def test_verify_pack_stages_exact_semantic_inputs_and_returns_verdict(tmp_path):
+    session = tmp_path / "session"
+    source = session / "source.png"
+    person_primary = session / "person-primary.png"
+    person_alternate = session / "person-alternate.png"
+    scene_primary = session / "scene-primary.png"
+    scene_alternate = session / "scene-alternate.png"
+    session.mkdir()
+    for index, path in enumerate(
+        (
+            source,
+            person_primary,
+            person_alternate,
+            scene_primary,
+            scene_alternate,
+        ),
+        start=1,
+    ):
+        path.write_bytes(_png(index))
+    plan = _plan([0])
+    verdict = _pack_verdict(plan)
+    runner = _Runner(verdict)
+
+    actual = image_optimization.generate_reference_pack_verdict(
+        runner,
+        plan,
+        [
+            {
+                "person_id": "PERSON_01",
+                "source_path": source,
+                "primary_path": person_primary,
+                "alternate_path": person_alternate,
+            }
+        ],
+        [
+            {
+                "scene_id": "SCENE_01",
+                "source_path": source,
+                "primary_path": scene_primary,
+                "alternate_path": scene_alternate,
+            }
+        ],
+        {"version": 1, "pack_metrics": []},
+        session_dir=session,
+    )
+
+    assert actual == verdict
+    assert runner.calls[0]["request"] == {
+        "phase": "verify_pack",
+        "plan_sha256": image_optimization.plan_sha256(plan),
+        "person_ids": ["PERSON_01"],
+        "scene_ids": ["SCENE_01"],
+    }
+    assert runner.calls[0]["files"] == [
+        "SKILL.md",
+        "work/frozen_plan.json",
+        "work/metrics.json",
+        "work/reference_packs/persons/PERSON_01/alternate.png",
+        "work/reference_packs/persons/PERSON_01/primary.png",
+        "work/reference_packs/persons/PERSON_01/source.png",
+        "work/reference_packs/scenes/SCENE_01/alternate.png",
+        "work/reference_packs/scenes/SCENE_01/primary.png",
+        "work/reference_packs/scenes/SCENE_01/source.png",
+        "work/request.json",
+    ]
+    assert not any(
+        key.endswith("_path")
+        for key in runner.calls[0]["request"]
+    )
+
+
+def test_verify_pack_accepts_canonical_fail_closed_failure():
+    plan = _plan()
+    verdict = _pack_verdict(plan, passed=False)
+    assert (
+        image_optimization.canonical_reference_pack_verdict(verdict, plan)
+        == verdict
+    )
+
+
+def test_verify_pack_accepts_unknown_as_fail_closed_with_stable_reason():
+    plan = _plan()
+    verdict = _pack_verdict(plan)
+    verdict["persons"][0]["checks"]["identity_changed"] = _check(
+        "unknown", "可见证据不足"
+    )
+    verdict["persons"][0]["passed"] = False
+    verdict["passed"] = False
+    verdict["reason"] = "pack_verification_unknown"
+
+    assert (
+        image_optimization.canonical_reference_pack_verdict(verdict, plan)
+        == verdict
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["persons"][0]["checks"]["identity_changed"].update(
+            status="unknown"
+        ),
+        lambda value: value["scenes"][0]["checks"]["layout"].update(
+            status="not_applicable"
+        ),
+        lambda value: value["persons"][0].update(person_id="PERSON_99"),
+        lambda value: value["project"].pop("wb_cct_preservation"),
+    ],
+)
+def test_verify_pack_rejects_unknown_or_inconsistent_success(mutate):
+    plan = _plan()
+    verdict = _pack_verdict(plan)
+    mutate(verdict)
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_reference_pack_verdict(verdict, plan)
+
+
+def test_verify_pack_rejects_paths_outside_session_before_runner(tmp_path):
+    session = tmp_path / "session"
+    session.mkdir()
+    inside = session / "inside.png"
+    outside = tmp_path / "outside.png"
+    inside.write_bytes(_png(1))
+    outside.write_bytes(_png(2))
+    runner = _Runner(_pack_verdict(_plan([0])))
+
+    with pytest.raises(ValueError, match="reference pack verification input"):
+        image_optimization.generate_reference_pack_verdict(
+            runner,
+            _plan([0]),
+            [
+                {
+                    "person_id": "PERSON_01",
+                    "source_path": outside,
+                    "primary_path": inside,
+                    "alternate_path": inside,
+                }
+            ],
+            [
+                {
+                    "scene_id": "SCENE_01",
+                    "source_path": inside,
+                    "primary_path": inside,
+                    "alternate_path": inside,
+                }
+            ],
+            {},
+            session_dir=session,
+        )
+    assert runner.calls == []
