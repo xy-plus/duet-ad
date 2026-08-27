@@ -1035,6 +1035,19 @@ def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
     return request
 
 
+def _load_controlled_storage_retry_requests(
+    settings: Settings, cid: str, meta: dict,
+) -> tuple[h3.H3Request, h3.H3Request]:
+    """Rebuild semantic source first; bind Context before execution routing."""
+    frozen, request_id = _load_short_frozen_input(settings, cid, meta)
+    source_request = _make_h3_request(settings, cid, frozen, request_id)
+    context = _freeze_short_context_ir(settings, frozen, source_request)
+    generation = meta.get("generation")
+    binding = generation.get("context_ir") if isinstance(generation, dict) else None
+    effective_request = h3_project.apply_bound_context_ir(context, binding)
+    return source_request, effective_request
+
+
 def _freeze_short_context_ir(
     settings: Settings,
     frozen: prepared_input.PreparedInput,
@@ -2704,7 +2717,65 @@ def create_app(settings: Settings) -> FastAPI:
                 previous_status = _effective_generation_status(generation)
                 previous_id = generation.get("client_request_id")
                 if previous_status == "submission_unknown":
-                    raise HTTPException(status_code=409, detail="submission_outcome_unknown")
+                    safe_storage_recovery = (
+                        previous_id == request_id
+                        and generation.get("stage") == "h3"
+                        and generation.get("h3_attempt_id") is None
+                        and _short_generation_parameters_match(
+                            meta,
+                            dialogue_mode=payload["dialogue_mode"],
+                            dialogue=dialogue,
+                            fit_mode=fit_mode,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
+                        )
+                    )
+                    if safe_storage_recovery:
+                        try:
+                            source_request, effective_request = (
+                                _load_controlled_storage_retry_requests(
+                                    settings, cid, meta
+                                )
+                            )
+                        except (
+                            _SubmitError,
+                            h3.H3Error,
+                            h3_project.ProjectMultimodalError,
+                        ):
+                            safe_storage_recovery = False
+                        else:
+                            safe_storage_recovery = (
+                                h3.controlled_storage_rejection_is_safely_retryable(
+                                    effective_request,
+                                    legacy_attempt_sha256=(
+                                        settings.h3_controlled_storage_retry_attempt_sha256
+                                    ),
+                                    legacy_evidence_sha256=(
+                                        settings.h3_controlled_storage_retry_evidence_sha256
+                                    ),
+                                )
+                            )
+                    if not safe_storage_recovery:
+                        raise HTTPException(
+                            status_code=409, detail="submission_outcome_unknown"
+                        )
+                    updated = {
+                        **generation,
+                        "status": "queued",
+                        "error": None,
+                    }
+                    storage.update_meta(settings.data_dir, cid, generation=updated)
+                    background_tasks.add_task(
+                        _run_generation,
+                        settings,
+                        cid,
+                        source_request,
+                        "retry_controlled_storage",
+                    )
+                    return {
+                        "status": "queued",
+                        "attempt": generation.get("attempt"),
+                    }
                 if previous_status not in (
                     _GENERATION_ACTIVE
                     | _GENERATION_RETRYABLE
@@ -2786,17 +2857,10 @@ def create_app(settings: Settings) -> FastAPI:
                                 detail="resume_parameters_changed",
                             )
                         try:
-                            source_request = await asyncio.to_thread(
-                                _load_h3_request, settings, cid, meta
-                            )
-                            frozen, _request_id = _load_short_frozen_input(
-                                settings, cid, meta
-                            )
-                            context = _freeze_short_context_ir(
-                                settings, frozen, source_request
-                            )
-                            request = h3_project.apply_bound_context_ir(
-                                context, generation.get("context_ir")
+                            source_request, request = (
+                                _load_controlled_storage_retry_requests(
+                                    settings, cid, meta
+                                )
                             )
                         except (
                             _SubmitError,
