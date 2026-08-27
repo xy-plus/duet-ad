@@ -331,6 +331,100 @@ def test_poll_transport_unknown_recovers_by_get_on_same_task_without_post(tmp_pa
     assert resumed_requests[0].url.path.endswith("/context-task-1")
 
 
+def test_official_running_response_without_modality_keeps_polling_same_task(tmp_path):
+    frozen = _frozen(tmp_path)
+    calls: list[httpx.Request] = []
+    base = _success_handler(frozen, requests=calls)
+    query_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal query_count
+        if request.url.path == "/v2/query/video_generation/context-task-1":
+            calls.append(request)
+            query_count += 1
+            return _response({
+                "task": {
+                    "id": "context-task-1",
+                    "task_type": "h3_context_ir",
+                    "status": "running" if query_count == 1 else "succeeded",
+                    "content": {
+                        "prompt": "" if query_count == 1 else (
+                            frozen.source_prompt
+                            + "\ncinematic lighting, restrained camera motion."
+                        ),
+                    },
+                },
+            })
+        return base(request)
+
+    with _client(handler) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "succeeded"
+    assert query_count == 2
+    assert sum(
+        request.method == "POST" and request.url.path == "/v2/h3_context_ir"
+        for request in calls
+    ) == 1
+
+
+def test_legacy_local_result_invalid_resumes_existing_task_with_get_only(tmp_path):
+    frozen = _frozen(tmp_path)
+    initial_calls: list[httpx.Request] = []
+    base = _success_handler(frozen, requests=initial_calls)
+
+    def query_unknown(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/query/video_generation/context-task-1":
+            initial_calls.append(request)
+            raise httpx.ReadTimeout("ambiguous query", request=request)
+        return base(request)
+
+    with _client(query_unknown) as client:
+        first = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+    assert first.status == "query_unknown"
+    attempt_path = (
+        frozen.source_h3_request.workdir
+        / ".context-ir" / "attempts" / "000001" / "attempt.json"
+    )
+    state = json.loads(attempt_path.read_text(encoding="utf-8"))
+    state["status"] = "failed"
+    state["error"] = "context_ir_result_invalid"
+    attempt_path.write_text(
+        json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    resumed_calls: list[httpx.Request] = []
+    query_count = 0
+
+    def resumed(request: httpx.Request) -> httpx.Response:
+        nonlocal query_count
+        resumed_calls.append(request)
+        assert request.method == "GET"
+        assert request.url.path == "/v2/query/video_generation/context-task-1"
+        query_count += 1
+        return _response({
+            "task": {
+                "id": "context-task-1",
+                "task_type": "h3_context_ir",
+                "status": "running" if query_count == 1 else "succeeded",
+                "content": {
+                    "prompt": "" if query_count == 1 else (
+                        frozen.source_prompt
+                        + "\ncinematic lighting, restrained camera motion."
+                    ),
+                },
+            },
+        })
+
+    with _client(resumed) as client:
+        recovered = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert recovered.status == "succeeded"
+    assert query_count == 2
+    assert all(request.method == "GET" for request in resumed_calls)
+
+
 def test_submission_unknown_never_reposts_without_task_id(tmp_path):
     frozen = _frozen(tmp_path)
     calls: list[httpx.Request] = []
@@ -395,6 +489,16 @@ def test_completed_duplicate_has_zero_network_and_exact_input_drift_is_rejected(
             {"task": {"id": "context-task-1", "task_type": "h3_context_ir", "modality": "text", "status": "succeeded", "content": {}}},
             "query_unknown",
             "context_ir_query_unknown",
+        ),
+        (
+            {"task": {"id": "context-task-1", "task_type": "another_task", "status": "running", "content": {}}},
+            "failed",
+            "context_ir_result_type_invalid",
+        ),
+        (
+            {"task": {"id": "context-task-1", "task_type": "h3_context_ir", "modality": "video", "status": "running", "content": {}}},
+            "failed",
+            "context_ir_result_type_invalid",
         ),
         (
             {"task": {"status": "succeeded", "content": {"prompt": "x"}}},
