@@ -479,10 +479,10 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 | `MEDIAKIT_CONCURRENCY` | `4` | 帧级并发，最小钳制为 1 |
 | `MEDIAKIT_TIMEOUT_S` | `180` | 上传、擦除和结果下载请求超时 |
 | `ARK_API_KEY` | 空 | 火山方舟 Seedream Bearer 凭据；留空关闭图片优化 capability，不进入 Settings repr、公开 API/meta/日志 |
-| `SEEDREAM_MODEL` | `doubao-seedream-5-0-pro-260628` | 项目级图片模型；allowlist 另含 `doubao-seedream-5-0-260128`、`doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828` |
-| `SEEDREAM_EDIT_MODE` | `anchor_consistency` | `anchor_consistency` 或 `independent_parallel`；按项目冻结，不暴露前端 |
+| `SEEDREAM_MODEL` | `doubao-seedream-5-0-pro-260628` | 项目级图片模型；allowlist 另含 Lite、4.5、4.0；Pro 请求省略 `sequential_image_generation`，其余固定为 `disabled` |
+| `SEEDREAM_EDIT_MODE` | `independent_parallel` | `independent_parallel` 或 `anchor_consistency`；按项目冻结，不暴露前端；显式配置仍可选择 anchor |
 | `SEEDREAM_CONCURRENCY` | `4` | Seedream 帧级进程内并发上限，必须为正整数 |
-| `SEEDREAM_TIMEOUT_S` | `180` | 单次 Seedream POST 超时秒数，必须为正有限数 |
+| `SEEDREAM_TIMEOUT_S` | `300` | 单次 Seedream 请求超时秒数；可显式覆盖为正有限值 |
 | `TIKTOK_PROXY` | 空 | TikTok/DoH 下载代理 |
 | `DOWNLOAD_TIMEOUT_S` | `120` | URL 下载整体时限 |
 | `HOST` / `PORT` | `0.0.0.0` / `3211` | `run.sh` 默认；生产 unit 必须覆盖为 `127.0.0.1/3212` |

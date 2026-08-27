@@ -1635,7 +1635,7 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_prepared_receipt(
     assert "_image_continuity" not in stored
     assert frozen["version"] == 2
     assert frozen["segments"][0]["current"] == (
-        "Codex 生成的 anchor_consistency 图片二次编辑提示词"
+        "Codex 生成的 independent_parallel 图片二次编辑提示词"
     )
     assert frozen["segments"][0]["current"] != stored["prompt"]
     assert (cdir / "work" / "image_optimization_prompt.txt").read_text(

@@ -360,7 +360,7 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     assert image_calls == [(cdir, [1, 2, 3])]
     frozen_prompts = stored["_image_optimization"]["segments"]
     assert [item["current"] for item in frozen_prompts] == [
-        f"图片二次编辑提示词-{index}-anchor_consistency"
+        f"图片二次编辑提示词-{index}-independent_parallel"
         for index in (1, 2, 3)
     ]
     assert all(

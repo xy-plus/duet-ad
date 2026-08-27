@@ -42,6 +42,7 @@ links: [conversation-task, result-display]
 - 每个付费 POST 前持久化私有 receipt。只有完整 HTTP 429、`success=false`、精确 `RequestLimitExceeded` 时，才按 `AUTO_RETRY_COUNT/AUTO_RETRY_INTERVAL_S` 自动退避并追加新 attempt；网络异常、5xx、无效/不完整响应仍视为结果未知并禁止重发。已收到成功响应但下载失败时只恢复 GET。MediaKit WebP 结果经解码、尺寸校验和 PNG 转码后才进入 `frames`。
 - Seedream 每帧总计最多 3 次 POST，且只有完整 HTTP 429、精确 `QuotaExceeded`、响应无 `data` 才自动重试；网络/超时/取消一律记为 `submission_unknown`。重启只恢复可证明安全的本地阶段，不自动重发未知 POST。
 - 后处理一旦开始，H3 提交必须等待其 `done`；完成后每张 `postprocessed/` 优化帧都会替代同名原关键帧，进入冻结输入 receipt 和实际 H3 请求。缺帧或状态异常时 fail closed，不回退原图。
+- “生成最终视频”的渲染门禁与 `/submit` 请求门禁共用同一判定：未开始后处理时允许使用原关键帧；后处理一旦存在，顶层必须为 `done`，且所有预期分段结构合法并逐段完整结束才放行。长视频 contract 必须 ready，段号必须严格连续为 `[1..segment_count]`，detail 与后处理段数也必须等于 `segment_count`；每段必须满足 `status=done`、`stage=done`、`error=null`、`revision>=1`、`total_frames>0` 且 `completed_frames=total_frames`。任一分段 running/failed、缺段、重复段、跳号、段数不符、残留错误或未完成帧均不显示生成操作且禁止请求。
 - H3 generation 已创建后禁止再启动后处理，避免已冻结的付费输入与页面展示分叉。
 - 请求顶层严格为 `confirm/options`，未知字段在写状态或调用供应商前拒绝。running 时不能重复提交；done 后改变选项返回结构化 409；failed 后普通 POST 一律拒绝，避免绕过分段 revision-CAS。
 - 该能力可关闭；关闭不影响直接 H3 主链路。

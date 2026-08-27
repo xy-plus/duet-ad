@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import image_optimization, mediakit, postprocess, seedream, storage
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.main import create_app
 from conftest import AUTH, make_settings
 
@@ -66,7 +66,8 @@ def test_seedream_settings_are_closed_and_secret_is_not_a_setting(monkeypatch):
     monkeypatch.setenv("ARK_API_KEY", "super-secret")
     settings = Settings(access_token="x")
     assert settings.seedream_model == "doubao-seedream-5-0-pro-260628"
-    assert settings.seedream_edit_mode == "anchor_consistency"
+    assert settings.seedream_edit_mode == "independent_parallel"
+    assert settings.seedream_timeout_s == 300.0
     assert "super-secret" not in repr(settings)
     assert not hasattr(settings, "ark_api_key")
     for field, value in (
@@ -79,6 +80,59 @@ def test_seedream_settings_are_closed_and_secret_is_not_a_setting(monkeypatch):
             Settings(access_token="x", **{field: value})
 
 
+def test_seedream_timeout_environment_default_and_explicit_override(monkeypatch):
+    monkeypatch.setenv("ACCESS_TOKEN", "test-token")
+    monkeypatch.delenv("SEEDREAM_TIMEOUT_S", raising=False)
+    assert get_settings().seedream_timeout_s == 300.0
+
+    monkeypatch.setenv("SEEDREAM_TIMEOUT_S", "180")
+    assert get_settings().seedream_timeout_s == 180.0
+
+
+def test_seedream_edit_mode_environment_default_and_explicit_anchor(monkeypatch):
+    monkeypatch.setenv("ACCESS_TOKEN", "test-token")
+    monkeypatch.delenv("SEEDREAM_EDIT_MODE", raising=False)
+    assert get_settings().seedream_edit_mode == "independent_parallel"
+
+    monkeypatch.setenv("SEEDREAM_EDIT_MODE", "anchor_consistency")
+    assert get_settings().seedream_edit_mode == "anchor_consistency"
+
+
+@pytest.mark.parametrize(("model", "has_sequential"), [
+    ("doubao-seedream-5-0-pro-260628", False),
+    ("doubao-seedream-5-0-260128", True),
+    ("doubao-seedream-4-5-251128", True),
+    ("doubao-seedream-4-0-250828", True),
+])
+def test_seedream_payload_is_model_capability_driven(
+    tmp_path, monkeypatch, model, has_sequential,
+):
+    monkeypatch.setenv("ARK_API_KEY", "secret")
+    settings = Settings(access_token="x", data_dir=tmp_path, seedream_model=model)
+    requests = []
+    output = base64.b64encode(_png()).decode()
+
+    async def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"data": [{"b64_json": output}]})
+
+    asyncio.run(seedream.edit(
+        settings, [_png()], "prompt", tmp_path / f"{model}.png",
+        receipt_path=tmp_path / f"{model}.json", transport=httpx.MockTransport(handler),
+    ))
+
+    assert len(requests) == 1
+    payload = requests[0]
+    assert payload["model"] == model
+    assert payload["prompt"] == "prompt"
+    assert len(payload["image"]) == 1 and payload["image"][0].startswith("data:image/png;base64,")
+    assert payload["response_format"] == "b64_json"
+    assert payload["watermark"] is False
+    assert ("sequential_image_generation" in payload) is has_sequential
+    if has_sequential:
+        assert payload["sequential_image_generation"] == "disabled"
+
+
 def test_prompt_freeze_and_projection_are_segment_scoped(tmp_path):
     settings = make_settings(tmp_path)
     cid = _done(settings, segments=True)
@@ -87,7 +141,7 @@ def test_prompt_freeze_and_projection_are_segment_scoped(tmp_path):
     frozen = changes["_image_optimization"]
     assert [item["segment_index"] for item in frozen["segments"]] == [1, 2]
     assert frozen["model"] == settings.seedream_model
-    assert frozen["edit_mode"] == "anchor_consistency"
+    assert frozen["edit_mode"] == "independent_parallel"
     for item in frozen["segments"]:
         assert item["default"] == item["current"]
         assert item["sha256"] == hashlib.sha256(item["current"].encode()).hexdigest()
@@ -588,7 +642,9 @@ def test_cancelled_postprocess_projects_unknown_and_failed_recovery_does_not_res
 
 def test_anchor_first_frame_real_timeout_projects_submission_unknown(tmp_path, monkeypatch):
     monkeypatch.setenv("ARK_API_KEY", "secret")
-    settings = make_settings(tmp_path, retry_interval_s=0)
+    settings = make_settings(
+        tmp_path, retry_interval_s=0, seedream_edit_mode="anchor_consistency"
+    )
     cid = _done(settings)
     meta = storage.load_meta(settings.data_dir, cid)
     storage.update_meta(
@@ -633,7 +689,9 @@ def test_anchor_first_frame_real_timeout_projects_submission_unknown(tmp_path, m
 
 def test_postprocess_has_strict_stage_barriers_and_anchor_single_output(tmp_path, monkeypatch):
     monkeypatch.setenv("ARK_API_KEY", "secret")
-    settings = make_settings(tmp_path, enable_mediakit_erase=True)
+    settings = make_settings(
+        tmp_path, enable_mediakit_erase=True, seedream_edit_mode="anchor_consistency"
+    )
     cid = _done(settings)
     cdir = settings.data_dir / cid
     # Add two more ordered frames.

@@ -293,6 +293,104 @@ def test_failed_postprocess_never_reopens_whole_project_post():
     assert 'pp.status === "failed"' not in ask
 
 
+def test_generation_waits_for_every_postprocess_segment_done():
+    result = _run_contract(
+        "(()=>{const base={id:'c1',duration_s:20,segment_count:2,plan_receipt:'a'.repeat(64),"
+        "segments:[{index:1},{index:2}]};"
+        "const seg=(index,status,completed=1,total=1,stage='done',error=null)=>({index,status,revision:1,"
+        "completed_frames:completed,total_frames:total,stage,error});"
+        "const pp=(status,segments)=>({...base,postprocess:{status,segments}});return {"
+        "partial:contract.postprocessReadyForGeneration(pp('done',["
+        "seg(1,'done'),seg(2,'running',0,1)])),"
+        "failed:contract.postprocessReadyForGeneration(pp('failed',["
+        "seg(1,'done'),seg(2,'failed',0,1)])),"
+        "allDone:contract.postprocessReadyForGeneration(pp('done',["
+        "seg(1,'done'),seg(2,'done')])),"
+        "absent:contract.postprocessReadyForGeneration({...base,postprocess:null})}})()"
+    )
+    assert result == {"partial": False, "failed": False, "allDone": True, "absent": True}
+
+
+def test_blocked_postprocess_never_calls_generation_submit_request():
+    result = _run_async_contract(
+        "(async()=>{let requests=0;const request=async()=>{requests+=1;return {ok:true}};"
+        "const base={id:'c1',duration_s:20,segment_count:2,plan_receipt:'a'.repeat(64),"
+        "segments:[{index:1},{index:2}]};"
+        "const blocked={...base,postprocess:{status:'done',segments:["
+        "{index:1,status:'done',revision:1,completed_frames:1,total_frames:1},"
+        "{index:2,status:'running',revision:1,completed_frames:0,total_frames:1,stage:'queued',error:null}]}};"
+        "let rejected=false;try{await contract.requestGenerationSubmit(blocked,{confirm:true},request)}"
+        "catch(error){rejected=error.message==='素材优化尚未全部完成，不能生成最终视频'}"
+        "const allowed=await contract.requestGenerationSubmit({...base,postprocess:null},{confirm:true},request);"
+        "return {requests,rejected,allowed}})()"
+    )
+    assert result == {"requests": 1, "rejected": True, "allowed": {"ok": True}}
+    js = APP_JS.read_text(encoding="utf-8")
+    submit = js.split("async function submitGeneration", 1)[1].split(
+        "function generationStageText", 1
+    )[0]
+    assert "postprocessReadyForGeneration(detail)" in submit
+    post = js.split("async function postGeneration", 1)[1].split(
+        "/* 最终视频区", 1
+    )[0]
+    assert "requestGenerationSubmit(detail, body)" in post
+    render = js.split("function renderFinalSection", 1)[1].split(
+        "function kfGrid", 1
+    )[0]
+    assert "postprocessReadyForGeneration(detail)" in render
+
+
+def test_generation_gate_rejects_non_contiguous_and_invalid_public_segment_fields():
+    result = _run_contract(
+        "(()=>{const seg=(index,revision=1,completed=1,total=1,stage='done',error=null)=>({index,status:'done',revision,"
+        "completed_frames:completed,total_frames:total,stage,error});"
+        "const ready=(detailSegments,ppSegments)=>contract.postprocessReadyForGeneration({"
+        "id:'c1',duration_s:20,segment_count:detailSegments.length,plan_receipt:'a'.repeat(64),"
+        "segments:detailSegments,postprocess:{status:'done',segments:ppSegments}});"
+        "return {gap:ready([{index:1},{index:3}],[seg(1),seg(3)]),"
+        "badRevision:ready([{index:1}],[seg(1,0)]),"
+        "overflow:ready([{index:1}],[seg(1,1,2,1)]),"
+        "negative:ready([{index:1}],[seg(1,1,-1,1)]),"
+        "missing:ready([{index:1}],[{index:1,status:'done'}])}})()"
+    )
+    assert result == {
+        "gap": False,
+        "badRevision": False,
+        "overflow": False,
+        "negative": False,
+        "missing": False,
+    }
+
+
+def test_generation_gate_requires_complete_done_terminal_fields_and_zero_requests():
+    result = _run_async_contract(
+        "(async()=>{let requests=0;const request=async()=>{requests+=1};"
+        "const detail=(segment)=>({id:'short',duration_s:8,segments:[],"
+        "postprocess:{status:'done',segments:[segment]}});"
+        "const seg=(completed,total,stage='done',error=null)=>({index:0,status:'done',revision:1,"
+        "completed_frames:completed,total_frames:total,stage,error});"
+        "const cases=[seg(0,1),seg(0,0),seg(1,1,'publishing'),seg(1,1,'done','submission_unknown')];"
+        "const ready=cases.map(value=>contract.postprocessReadyForGeneration(detail(value)));"
+        "for(const value of cases){try{await contract.requestGenerationSubmit(detail(value),{confirm:true},request)}"
+        "catch(_){}}return {ready,requests}})()"
+    )
+    assert result == {"ready": [False, False, False, False], "requests": 0}
+
+
+def test_generation_gate_rejects_segment_count_mismatch_without_request():
+    result = _run_async_contract(
+        "(async()=>{let requests=0;const request=async()=>{requests+=1};"
+        "const seg=index=>({index,status:'done',revision:1,completed_frames:1,total_frames:1,"
+        "stage:'done',error:null});"
+        "const detail={id:'long',duration_s:20,segment_count:3,plan_receipt:'a'.repeat(64),"
+        "segments:[{index:1},{index:2}],postprocess:{status:'done',segments:[seg(1),seg(2)]}};"
+        "const ready=contract.postprocessReadyForGeneration(detail);"
+        "try{await contract.requestGenerationSubmit(detail,{confirm:true},request)}catch(_){}"
+        "return {ready,requests}})()"
+    )
+    assert result == {"ready": False, "requests": 0}
+
+
 def test_short_segment_zero_uses_current_video_copy():
     js = APP_JS.read_text(encoding="utf-8")
     segments = js.split("function renderPostprocessSegments", 1)[1].split(

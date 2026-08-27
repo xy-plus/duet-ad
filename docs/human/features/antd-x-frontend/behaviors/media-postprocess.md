@@ -27,6 +27,7 @@ links: [antd-x-frontend]
 | 后处理运行、部分成功或失败 | 按 segment 展示供应商无关的中文阶段、完成帧/总帧、错误；index 0 显示“当前视频”，失败段只用 `expected_revision` 重试本段 |
 | segment `error` 为 `submission_unknown` | 明确警告重试可能重复计费，并要求二次确认；不根据 status 或 stage 猜测未知提交 |
 | 整体失败但缺少 failed segment/revision | 显示安全错误并允许刷新状态；不显示整项目重试，也不重新发送普通后处理 POST |
+| 最终视频准备提交 | 没有后处理记录时保持原图流程；存在后处理记录时，长视频还必须有有效 plan receipt 与数量、索引严格匹配的真实来源 segments；此后只有顶层为 `done`，且全部合法后处理 segment 均满足 `status/stage=done`、完成帧等于正数总帧、error 为空、revision 有效时才开放；运行中、失败、缺段或畸形数据一律禁止提交 |
 | 后处理有成功图片 | 通过认证 Blob URL 展示并允许 AntD 图片预览；失败项保留独立错误 |
 
 ## 边界

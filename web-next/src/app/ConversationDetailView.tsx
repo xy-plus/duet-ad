@@ -14,6 +14,7 @@ import {
   generationRetryContract,
   longVideoContract,
   newClientRequestId,
+  postprocessAllowsGeneration,
   recoverLockedPostprocess,
   recoverPromptChanged,
   safeGenerationDraft,
@@ -228,13 +229,15 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
   const settings = draft ? generationSettingsValue(draft) : undefined;
   const model = generationStatusModel(detail, mutation.isPending);
   const operationAllowed = canOperate(detail);
+  const postprocessReady = postprocessAllowsGeneration(detail);
   const actionContract = generationRetryContract(detail);
   const actionAuthorized = operationAllowed
+    && postprocessReady
     && draft !== null
     && !reconciling
     && actionContract.action !== 'none';
   const submit = async (action: GenerationAction) => {
-    if (!actionAuthorized || !draft) return;
+    if (!actionAuthorized || !postprocessAllowsGeneration(detail) || !draft) return;
     setError(undefined);
     try {
       await mutation.mutateAsync(payloadForAction(detail, draft, action));
@@ -268,6 +271,9 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
       ) : null}
       {!operationAllowed ? (
         <Alert type="warning" showIcon title="当前会话不可执行生成动作" />
+      ) : null}
+      {!postprocessReady ? (
+        <Alert type="warning" showIcon title="后处理尚未完整完成，已禁止生成最终视频" />
       ) : null}
       <GenerationStatus
         model={model}

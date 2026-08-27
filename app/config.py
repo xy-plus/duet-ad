@@ -3,8 +3,9 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+SEEDREAM_PRO_MODEL = "doubao-seedream-5-0-pro-260628"
 SEEDREAM_MODELS = frozenset({
-    "doubao-seedream-5-0-pro-260628",
+    SEEDREAM_PRO_MODEL,
     "doubao-seedream-5-0-260128",
     "doubao-seedream-4-5-251128",
     "doubao-seedream-4-0-250828",
@@ -27,10 +28,10 @@ class Settings:
     # MediaKit 后处理逐帧并行提交的进程级并发上限（单进程内跨会话全局）
     mediakit_concurrency: int = 4
     mediakit_timeout_s: float = 180.0
-    seedream_model: str = "doubao-seedream-5-0-pro-260628"
-    seedream_edit_mode: str = "anchor_consistency"
+    seedream_model: str = SEEDREAM_PRO_MODEL
+    seedream_edit_mode: str = "independent_parallel"
     seedream_concurrency: int = 4
-    seedream_timeout_s: float = 180.0
+    seedream_timeout_s: float = 300.0
     data_dir: Path = Path("data")
     codex_timeout_s: int = 1800
     codex_concurrency: int = 10
@@ -112,13 +113,13 @@ def get_settings() -> Settings:
         mediakit_concurrency=max(1, int(os.environ.get("MEDIAKIT_CONCURRENCY", "4"))),
         mediakit_timeout_s=float(os.environ.get("MEDIAKIT_TIMEOUT_S", "180")),
         seedream_model=os.environ.get(
-            "SEEDREAM_MODEL", "doubao-seedream-5-0-pro-260628"
+            "SEEDREAM_MODEL", SEEDREAM_PRO_MODEL
         ).strip(),
         seedream_edit_mode=os.environ.get(
-            "SEEDREAM_EDIT_MODE", "anchor_consistency"
+            "SEEDREAM_EDIT_MODE", "independent_parallel"
         ).strip(),
         seedream_concurrency=int(os.environ.get("SEEDREAM_CONCURRENCY", "4")),
-        seedream_timeout_s=float(os.environ.get("SEEDREAM_TIMEOUT_S", "180")),
+        seedream_timeout_s=float(os.environ.get("SEEDREAM_TIMEOUT_S", "300")),
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),
