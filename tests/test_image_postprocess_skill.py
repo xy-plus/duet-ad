@@ -937,6 +937,48 @@ def test_skill_requires_entity_chain_unique_contact_and_scene_boundary_audit():
         assert rule in human
 
 
+def test_scene_structure_failure_reason_matches_backend_plan_contract():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+    reason = "scene_structure_replacement_unsafe"
+
+    assert reason in image_optimization._INELIGIBLE_REASONS
+    assert image_optimization.canonical_plan_v2(_ineligible(reason)) == _ineligible(reason)
+    assert f"reason={reason}" in skill
+    assert f"eligible=false/{reason}" in human
+    assert "scene_replacement_unsafe" not in skill
+    assert "scene_replacement_unsafe" not in human
+
+
+def test_skill_preflights_backend_exact_fields_and_current_frame_evidence():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    for rule in (
+        "输出前逐字段自校验",
+        "scene 恰含 `scene_id`、`target_region`、`boundary`、`layout_reference_frame_index`",
+        "不同物理实体不得合并",
+        "每个画边碎片都必须登记",
+        "支撑、接触或遮挡只有双方边界与层次",
+        "可见人体裁切碎片必须写入 `visible_body_parts`",
+    ):
+        assert rule in skill
+
+    for rule in (
+        "输出前逐字段自校验",
+        "layout_reference_frame_index",
+        "不同物理实体不得合并",
+        "画边碎片都必须登记",
+        "双方边界与层次",
+        "人体裁切碎片必须写入 `visible_body_parts`",
+    ):
+        assert rule in human
+
+
 def _plan_v3() -> dict:
     plan = _plan([0])
     plan["version"] = 3
@@ -1170,6 +1212,28 @@ def test_v3_frame_entity_ledger_requires_visible_entities_and_relations(mutate):
     ],
 )
 def test_v3_frame_entity_ledger_rejects_unresolved_or_ambiguous_relations(mutate):
+    value = _plan_v3()
+    mutate(value)
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_v3(
+            value, segment_indices=[0], frame_counts={0: 2}
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["segments"][0]["scene"].pop(
+            "layout_reference_frame_index"
+        ),
+        lambda value: value["segments"][0]["frame_constraints"][0][
+            "non_person_entity_ledger"
+        ]["relations"][0].update(
+            subject_id="PERSON_01", object_id="ENTITY_01"
+        ),
+    ],
+)
+def test_v3_backend_exact_scene_and_symmetric_relation_order_fail_closed(mutate):
     value = _plan_v3()
     mutate(value)
     with pytest.raises(image_optimization.ImageOptimizationOutputError):
