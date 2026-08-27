@@ -26,7 +26,7 @@ interface Props {
 }
 
 const modeLabels: Record<TextMode, string> = {
-  prompt: '生成提示词', dialogue: '段台词', image: '图片优化',
+  prompt: '旧视频提示词（融合输入）', dialogue: '段台词', image: '图片优化',
 };
 
 export function ImageOptimizationPanel({
@@ -95,7 +95,7 @@ export function ImageOptimizationPanel({
   }, [currentImagePrompt, discardImage, draftId, guard, imageDirty, saveImage]);
   useEffect(() => {
     const id = `${draftId ?? 'prompt'}:prompt`;
-    guard.register(id, promptDirty ? { save: async () => { if (!await savePrompt()) throw new Error('生成提示词保存失败'); }, discard: discardPrompt } : null);
+    guard.register(id, promptDirty ? { save: async () => { if (!await savePrompt()) throw new Error('旧视频提示词保存失败'); }, discard: discardPrompt } : null);
     return () => guard.register(id, null);
   }, [discardPrompt, draftId, guard, promptDirty, savePrompt]);
   const chooseMode = (next: TextMode) => {
@@ -121,7 +121,7 @@ export function ImageOptimizationPanel({
           <>
             <Input.TextArea
               rows={6}
-              aria-label={mode === 'prompt' && promptEditable ? '提示词草稿' : modeLabels[mode]}
+              aria-label={modeLabels[mode]}
               value={value}
               disabled={!editable || saving || promptPending}
               onChange={(event) => mode === 'image' ? setDraft(event.target.value) : onPromptDraftChange?.(event.target.value)}
@@ -140,7 +140,7 @@ export function ImageOptimizationPanel({
         ) : null}
       </Space>
       <Modal
-        title={`${mode === 'prompt' ? '生成提示词' : '图片优化提示词'}尚未保存`}
+        title={`${mode === 'prompt' ? '旧视频提示词' : '图片优化提示词'}尚未保存`}
         open={pendingMode !== undefined}
         closable={false}
         footer={<Space><Button onClick={() => setPendingMode(undefined)}>取消</Button><Button danger onClick={() => { if (mode === 'prompt') discardPrompt(); else discardImage(); setMode(pendingMode); setPendingMode(undefined); }}>丢弃</Button><Button type="primary" loading={saving} onClick={() => { const save = mode === 'prompt' ? savePrompt : saveImage; void save().then((saved) => { if (saved) { setMode(pendingMode); setPendingMode(undefined); } }); }}>保存</Button></Space>}

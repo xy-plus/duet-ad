@@ -299,14 +299,15 @@ test('prompt CAS conflict sends exact PATCH, refetches, and displays the conflic
   };
   await installApi(page, controller);
   await login(page);
-  await page.getByRole('button', { name: '展开生成提示词' }).click();
-  await page.getByLabel('提示词草稿').fill('我的修改');
+  await page.getByRole('button', { name: '展开旧视频提示词（融合输入）' }).click();
+  await page.getByRole('textbox', { name: '旧视频提示词（融合输入）' }).fill('我的修改');
   await page.getByRole('button', { name: '确认保存' }).click();
 
   const conflict = page.getByRole('alert').filter({ hasText: 'prompt_changed' });
   await expect(conflict).toContainText('prompt_changed');
   await expect(conflict).toContainText('提示词已被其他请求修改');
-  await expect(page.getByLabel('提示词草稿')).toHaveValue('服务端更新后的提示词');
+  await expect(page.getByRole('textbox', { name: '旧视频提示词（融合输入）' }))
+    .toHaveValue('服务端更新后的提示词');
   const patch = controller.requests.find(({ method }) => method === 'PATCH');
   expect(JSON.parse(patch?.body ?? '{}')).toEqual({
     confirm: true,
@@ -330,10 +331,10 @@ test('prompt consecutive saves immediately use the sha returned by the previous 
   };
   await installApi(page, controller);
   await login(page);
-  await page.getByRole('button', { name: '展开生成提示词' }).click();
-  await page.getByRole('textbox', { name: '提示词草稿' }).fill('第一次');
+  await page.getByRole('button', { name: '展开旧视频提示词（融合输入）' }).click();
+  await page.getByRole('textbox', { name: '旧视频提示词（融合输入）' }).fill('第一次');
   await page.getByRole('button', { name: '确认保存' }).click();
-  await page.getByRole('textbox', { name: '提示词草稿' }).fill('第二次');
+  await page.getByRole('textbox', { name: '旧视频提示词（融合输入）' }).fill('第二次');
   await page.getByRole('button', { name: '确认保存' }).click();
   const patches = controller.requests.filter(({ method, path }) => method === 'PATCH' && path.endsWith('/prompt'));
   expect(patches.map(({ body }) => (JSON.parse(body ?? '{}') as JsonRecord).expected_sha256)).toEqual(['a'.repeat(64), '2'.repeat(64)]);
@@ -756,6 +757,121 @@ test('a 409 refresh preserves explicit off-screen delivery and never resubmits b
     .toEqual(['off_screen', 'off_screen']);
 });
 
+test('prompt fusion preserves settings and requires a second explicit submit before Context IR', async ({ page }) => {
+  const candidate = detail('prompt-fusion-refresh', {
+    title: '最终提示词融合',
+    duration_s: 20,
+    segment_count: 2,
+    plan_receipt: '3'.repeat(64),
+    has_source: true,
+    dialogue_delivery: null,
+    dialogue: { mode: 'auto', lines: [], auto_lines: [] },
+    segments: [
+      { index: 1, prompt: '片段一旧视频提示词', lines: [], keyframes: ['one.png'] },
+      { index: 2, prompt: '片段二旧视频提示词', lines: [], keyframes: ['two.png'] },
+    ],
+    postprocess: {
+      status: 'done',
+      options: { remove_subtitle: false, remove_brand: false, optimize_image: true },
+      frames: ['segments/1/postprocessed/one.png', 'segments/2/postprocessed/two.png'],
+      error: null,
+      segments: [1, 2].map((index) => ({
+        index, status: 'done', stage: 'done', completed_frames: 9,
+        total_frames: 9, revision: 1, error: null,
+      })),
+    },
+    image_acceptance: {
+      required: true, accepted: true, expected_meta_sha256: '4'.repeat(64),
+    },
+  });
+  let attempt = 0;
+  const controller: ApiController = {
+    details: { 'prompt-fusion-refresh': candidate },
+    order: ['prompt-fusion-refresh'],
+    requests: [],
+    submit: async (route, id, current) => {
+      attempt += 1;
+      if (attempt === 1) {
+        current.details[id] = {
+          ...current.details[id],
+          prompt_fusion: {
+            status: 'pending', error: null,
+            segments: [1, 2].map((index) => ({
+              index, status: 'pending', final_prompt: null, error: null,
+            })),
+          },
+        };
+        setTimeout(() => {
+          current.details[id] = {
+            ...current.details[id],
+            prompt_fusion: {
+              status: 'done', error: null,
+              segments: [1, 2].map((index) => ({
+                index, status: 'done', final_prompt: `片段${index}最终融合提示词`, error: null,
+              })),
+            },
+          };
+        }, 1_000);
+        await route.fulfill({ status: 409, json: { detail: 'prompt_fusion_refresh_required' } });
+        return;
+      }
+      current.details[id] = {
+        ...current.details[id],
+        navigation_status: 'generation_running',
+        generation: {
+          status: 'running', stage: 'context_ir', client_request_id: 'prompt-fusion-request',
+          fast_mode: false,
+          segments: [1, 2].map((index) => ({ index, status: 'running' })),
+        },
+      };
+      await route.fulfill({ json: { status: 'queued', attempt: 1 } });
+    },
+  };
+  await installApi(page, controller);
+  await login(page);
+
+  await expect(page.getByText('已确认使用当前优化图生成视频')).toBeVisible();
+  await page.getByRole('button', { name: '展开旧视频提示词（融合输入）' }).first().click();
+  await expect(page.getByRole('textbox', { name: '旧视频提示词（融合输入）' }))
+    .toHaveValue('片段一旧视频提示词');
+  await page.getByRole('radiogroup', { name: '声音呈现' })
+    .getByText('画外', { exact: true }).click();
+  await page.getByRole('button', { name: '确认生成' }).click();
+
+  await expect(page.getByText('最终提示词正在融合；完成后请再次确认生成。')).toBeVisible();
+  await expect(page.getByText('片段 1 · 等待融合')).toBeVisible();
+  await expect(page.getByRole('button', { name: '确认生成' })).toBeDisabled();
+  expect(controller.requests.filter(({ method, path }) => (
+    method === 'POST' && path.endsWith('/submit')
+  ))).toHaveLength(1);
+
+  await expect(page.getByLabel('片段 1 最终提示词')).toHaveText('片段1最终融合提示词');
+  await expect(page.getByLabel('片段 2 最终提示词')).toHaveText('片段2最终融合提示词');
+  await expect(page.getByRole('radio', { name: '画外' })).toBeChecked();
+  await expect(page.getByRole('button', { name: '确认生成' })).toBeEnabled();
+  expect(controller.requests.filter(({ method, path }) => (
+    method === 'POST' && path.endsWith('/submit')
+  ))).toHaveLength(1);
+
+  const orderedSections = await page.locator([
+    '[aria-label="源视频"]',
+    '[aria-label="长视频分段"]',
+    '[aria-label="关键帧后处理"]',
+    '[aria-label="最终提示词融合"]',
+    '[aria-label="视频生成"]',
+  ].join(',')).evaluateAll((elements) => elements.map((element) => element.getAttribute('aria-label')));
+  expect(orderedSections).toEqual(['源视频', '长视频分段', '关键帧后处理', '最终提示词融合', '视频生成']);
+
+  await page.getByRole('button', { name: '确认生成' }).click();
+  await expect(page.getByText('Context IR 正在优化最终提示词')).toBeVisible();
+  const submits = controller.requests.filter(({ method, path }) => (
+    method === 'POST' && path.endsWith('/submit')
+  ));
+  expect(submits).toHaveLength(2);
+  expect(submits.map(({ body }) => JSON.parse(body ?? '{}').dialogue_delivery))
+    .toEqual(['off_screen', 'off_screen']);
+});
+
 test('has_video renders authenticated source and final videos together', async ({ page }) => {
   const candidate = detail('final-video-visible', {
     title: '最终视频可见',
@@ -817,8 +933,8 @@ test('image optimization uses CAS and dirty navigation requires an explicit deci
   await expect.poll(() => controller.requests.some(({ path }) => path.endsWith('/image-optimization-prompt'))).toBe(true);
   const request = controller.requests.find(({ path }) => path.endsWith('/image-optimization-prompt'));
   expect(JSON.parse(request?.body ?? '{}')).toEqual({ confirm: true, segment_index: 0, expected_sha256: 'd'.repeat(64), prompt: '本地新稿' });
-  await page.getByRole('button', { name: '展开生成提示词' }).click();
-  await page.getByRole('textbox', { name: '提示词草稿' }).fill('未保存生成稿');
+  await page.getByRole('button', { name: '展开旧视频提示词（融合输入）' }).click();
+  await page.getByRole('textbox', { name: '旧视频提示词（融合输入）' }).fill('未保存生成稿');
   await page.getByText('图片优化切换目标').first().click();
   await expect(page.getByRole('dialog', { name: '文本草稿尚未保存' })).toContainText('请选择保存、丢弃或取消');
   await page.getByRole('button', { name: /取\s*消/u }).click();
@@ -833,11 +949,11 @@ test('long text workspace remains available when image optimization capability i
   const controller: ApiController = { details: { 'long-no-image': candidate }, order: ['long-no-image'], requests: [] };
   await installApi(page, controller);
   await login(page);
-  await expect(page.getByRole('button', { name: '展开生成提示词' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '展开旧视频提示词（融合输入）' })).toBeVisible();
   await expect(page.getByRole('button', { name: '展开段台词' })).toBeVisible();
   await expect(page.getByRole('button', { name: '展开图片优化' })).toBeDisabled();
-  await page.getByRole('button', { name: '展开生成提示词' }).click();
-  await expect(page.getByRole('textbox', { name: '生成提示词' })).toHaveValue('长段提示词');
+  await page.getByRole('button', { name: '展开旧视频提示词（融合输入）' }).click();
+  await expect(page.getByRole('textbox', { name: '旧视频提示词（融合输入）' })).toHaveValue('长段提示词');
 });
 
 test('postprocess submits exact options, closes to a background card, and survives conversation switching', async ({ page }) => {

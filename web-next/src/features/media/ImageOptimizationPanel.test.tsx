@@ -12,9 +12,9 @@ describe('ImageOptimizationPanel', () => {
     const user = userEvent.setup();
     render(<ImageOptimizationPanel prompt="长段生成提示词" dialogue="长段台词" imagePrompt={{ text: '优化稿', defaultText: '默认优化稿', sha256: 'a'.repeat(64) }} promptEditable={false} onSaveImagePrompt={vi.fn()} />);
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: '展开生成提示词' }));
-    expect(screen.getByRole('textbox', { name: '生成提示词' })).toHaveValue('长段生成提示词');
-    expect(screen.getByRole('textbox', { name: '生成提示词' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: '展开旧视频提示词（融合输入）' }));
+    expect(screen.getByRole('textbox', { name: '旧视频提示词（融合输入）' })).toHaveValue('长段生成提示词');
+    expect(screen.getByRole('textbox', { name: '旧视频提示词（融合输入）' })).toBeDisabled();
     await user.click(screen.getByRole('button', { name: '展开段台词' }));
     expect(screen.getByRole('textbox', { name: '段台词' })).toHaveValue('长段台词');
     await user.click(screen.getByRole('button', { name: '展开图片优化' }));
@@ -45,10 +45,10 @@ describe('ImageOptimizationPanel', () => {
       return <ImageOptimizationPanel prompt="已保存生成稿" promptDraft={promptDraft} dialogue="台词" imagePrompt={{ text: '图片', defaultText: '默认', sha256: 'd'.repeat(64) }} promptEditable onPromptDraftChange={setPromptDraft} onSavePrompt={vi.fn()} onSaveImagePrompt={vi.fn()} />;
     }
     render(<Harness />);
-    await user.click(screen.getByRole('button', { name: '展开生成提示词' }));
-    await user.type(screen.getByRole('textbox', { name: '提示词草稿' }), '未保存');
+    await user.click(screen.getByRole('button', { name: '展开旧视频提示词（融合输入）' }));
+    await user.type(screen.getByRole('textbox', { name: '旧视频提示词（融合输入）' }), '未保存');
     await user.click(screen.getByRole('button', { name: '展开段台词' }));
-    expect(screen.getByRole('dialog', { name: '生成提示词尚未保存' })).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: '旧视频提示词尚未保存' })).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: /丢\s*弃/u }));
     expect(screen.getByRole('textbox', { name: '段台词' })).toHaveValue('台词');
   });

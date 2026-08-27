@@ -34,7 +34,7 @@ describe('GenerationStatus', () => {
   });
 
   it.each([
-    ['context_ir_native', '音频与 Context IR 准备中'],
+    ['context_ir_native', 'Context IR 正在优化最终提示词'],
     ['h3', 'H3 视频生成中'],
     ['stitch', '正在合成最终视频'],
   ])('renders the server stage %s as a user-visible pipeline step', (stageLabel, expected) => {

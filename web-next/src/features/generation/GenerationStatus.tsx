@@ -47,7 +47,7 @@ function stageDescription(stage: string | undefined): string {
   switch (stage) {
     case 'context_ir':
     case 'context_ir_native':
-      return '音频与 Context IR 准备中';
+      return 'Context IR 正在优化最终提示词';
     case 'h3':
       return 'H3 视频生成中';
     case 'stitch':
