@@ -451,11 +451,20 @@ def test_fast_mode_http_to_real_stitched_video_is_fully_offline(
         assert attempt["h3"]["receipt"]["task_id"] == task_id
         segment_output = segment_root / "generated.mp4"
         output_receipt = attempt["h3"]["output"]
-        assert output_receipt == {
+        assert {
+            key: output_receipt[key]
+            for key in ("name", "sha256", "size")
+        } == {
             "name": "generated.mp4",
             "sha256": _sha256(segment_output),
             "size": segment_output.stat().st_size,
         }
+        assert output_receipt["media_timeline"]["schema"] == (
+            h3.MEDIA_TIMELINE_SCHEMA
+        )
+        assert output_receipt["media_timeline"]["version"] == (
+            h3.MEDIA_TIMELINE_VERSION
+        )
         segment_paths.append(segment_output)
     assert persisted_task_ids == task_ids
 
