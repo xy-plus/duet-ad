@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any, Iterator
 from urllib.parse import quote, urlsplit
 
@@ -35,6 +36,46 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 _TASK_ID = re.compile(r"[A-Za-z0-9_.:-]{1,256}")
 _SAFE_TEXT_MAX = 256
+_MASK_ITEM_KEYS = frozenset(
+    {
+        "purpose",
+        "channel",
+        "component_id",
+        "shot_id",
+        "frame_id",
+        "path",
+        "sha256",
+        "byte_size",
+        "width",
+        "height",
+        "producer_receipt",
+    }
+)
+_PRODUCER_RECEIPT_KEYS = frozenset(
+    {
+        "schema",
+        "version",
+        "backend",
+        "model",
+        "model_version",
+        "endpoint_identity",
+        "plan_sha256",
+        "scene_id",
+        "component_id",
+        "shot_id",
+        "frame_id",
+        "frame_sha256",
+        "reference_frame_id",
+        "request_sha256",
+        "propagation_job_sha256",
+        "propagation_scope",
+        "membership_engine",
+        "edge_refiner",
+        "edge_refinement_scope",
+        "fallback",
+        "output",
+    }
+)
 
 _PUBLIC_MESSAGES = {
     "invalid_input": "Scene mask input is invalid",
@@ -153,6 +194,17 @@ class SceneMaskResult:
     masks: tuple[SceneMaskItem, ...] = ()
 
 
+@dataclass(frozen=True)
+class ValidatedSceneMask:
+    """Isolated canonical item plus row-major, little-bit-order boolean mask."""
+
+    item: SceneMaskItem
+    packed_mask: bytes
+    pixel_count: int
+    active_pixels: int
+    bit_order: str = "little"
+
+
 def canonical_json_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
@@ -242,6 +294,31 @@ def request_payload(plan: SceneMaskPlan) -> dict[str, Any]:
             "fallback": "none",
         },
     }
+
+
+def load_validated_scene_mask(
+    project_root: Path,
+    item: SceneMaskItem | Mapping[str, Any],
+    *,
+    expected_plan_sha256: str,
+    expected_source_sha256: str,
+) -> ValidatedSceneMask:
+    """Load one scene mask through the authoritative consumer boundary.
+
+    The returned mask is bit-packed into immutable bytes in row-major order.
+    Both expected hashes must be supplied by the consumer's frozen manifest.
+    """
+
+    if not _is_sha256(expected_plan_sha256) or not _is_sha256(expected_source_sha256):
+        raise SceneMaskError("invalid_input")
+    root = _validated_project_root(project_root)
+    raw = _mask_item_payload(item) if isinstance(item, SceneMaskItem) else item
+    return _load_validated_scene_mask(
+        root,
+        raw,
+        expected_plan_sha256=expected_plan_sha256,
+        expected_source_sha256=expected_source_sha256,
+    )
 
 
 def advance(
@@ -581,6 +658,81 @@ def _valid_point_prompt(
     )
 
 
+def _load_validated_scene_mask(
+    root: Path,
+    raw: Any,
+    *,
+    expected_plan_sha256: str,
+    expected_source_sha256: str,
+) -> ValidatedSceneMask:
+    if not isinstance(raw, Mapping) or frozenset(raw) != _MASK_ITEM_KEYS:
+        raise SceneMaskError("worker_output_invalid")
+    component_id = raw.get("component_id")
+    shot_id = raw.get("shot_id")
+    frame_id = raw.get("frame_id")
+    path = raw.get("path")
+    sha256 = raw.get("sha256")
+    byte_size = raw.get("byte_size")
+    width = raw.get("width")
+    height = raw.get("height")
+    if (
+        raw.get("purpose") != "scene_component"
+        or raw.get("channel") != "grayscale_alpha"
+        or not all(_is_identifier(value) for value in (component_id, shot_id, frame_id))
+        or not isinstance(path, str)
+        or not path.endswith(".png")
+        or not _is_sha256(sha256)
+        or not _positive_int(byte_size)
+        or not _positive_int(width)
+        or not _positive_int(height)
+    ):
+        raise SceneMaskError("worker_output_invalid")
+    data = _read_contained_regular(root, path)
+    if byte_size != len(data) or hashlib.sha256(data).hexdigest() != sha256:
+        raise SceneMaskError("worker_output_invalid")
+    active = _decode_png_mask(data, width, height)
+    if active is None:
+        raise SceneMaskError("worker_output_invalid")
+    output = {
+        "path": path,
+        "sha256": sha256,
+        "byte_size": byte_size,
+        "width": width,
+        "height": height,
+    }
+    producer = raw.get("producer_receipt")
+    if not _valid_consumer_producer_receipt(
+        producer,
+        component_id=component_id,
+        shot_id=shot_id,
+        frame_id=frame_id,
+        output=output,
+        expected_plan_sha256=expected_plan_sha256,
+        expected_source_sha256=expected_source_sha256,
+    ):
+        raise SceneMaskError("worker_output_invalid")
+    canonical = SceneMaskItem(
+        purpose="scene_component",
+        channel="grayscale_alpha",
+        component_id=component_id,
+        shot_id=shot_id,
+        frame_id=frame_id,
+        path=path,
+        sha256=sha256,
+        byte_size=byte_size,
+        width=width,
+        height=height,
+        producer_receipt=_freeze_json(producer),
+    )
+    flat = active.reshape(-1)
+    return ValidatedSceneMask(
+        item=canonical,
+        packed_mask=np.packbits(flat, bitorder="little").tobytes(),
+        pixel_count=int(flat.size),
+        active_pixels=int(np.count_nonzero(flat)),
+    )
+
+
 def _validate_masks(
     root: Path,
     plan: SceneMaskPlan,
@@ -606,83 +758,44 @@ def _validate_masks(
     by_key: dict[tuple[str, str, str], SceneMaskItem] = {}
     seen_paths: set[str] = set()
     for raw in raw_masks:
-        if not isinstance(raw, Mapping) or set(raw) != {
-            "purpose",
-            "channel",
-            "component_id",
-            "shot_id",
-            "frame_id",
-            "path",
-            "sha256",
-            "byte_size",
-            "width",
-            "height",
-            "producer_receipt",
-        }:
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("frame_id"), str):
             raise SceneMaskError("worker_output_invalid")
-        component_id = raw.get("component_id")
-        shot_id = raw.get("shot_id")
-        frame_id = raw.get("frame_id")
-        if raw.get("purpose") != "scene_component" or raw.get("channel") != "grayscale_alpha":
+        frame = frame_by_id.get(raw["frame_id"])
+        if frame is None:
             raise SceneMaskError("worker_output_invalid")
-        if not all(isinstance(value, str) for value in (component_id, shot_id, frame_id)):
+        loaded = _load_validated_scene_mask(
+            root,
+            raw,
+            expected_plan_sha256=plan.plan_sha256,
+            expected_source_sha256=frame.sha256,
+        )
+        item = loaded.item
+        key = (item.component_id, item.shot_id, item.frame_id)
+        if key not in expected or key in by_key or item.path in seen_paths:
             raise SceneMaskError("worker_output_invalid")
-        key = (component_id, shot_id, frame_id)
-        if key not in expected or key in by_key:
+        if item.width != frame.width or item.height != frame.height:
             raise SceneMaskError("worker_output_invalid")
-        frame = frame_by_id[frame_id]
-        path = raw.get("path")
-        if not isinstance(path, str) or path in seen_paths or not path.endswith(".png"):
-            raise SceneMaskError("worker_output_invalid")
-        seen_paths.add(path)
-        data = _read_contained_regular(root, path)
-        byte_size = raw.get("byte_size")
-        width = raw.get("width")
-        height = raw.get("height")
-        sha256 = raw.get("sha256")
-        if (
-            not _positive_int(byte_size)
-            or byte_size != len(data)
-            or width != frame.width
-            or height != frame.height
-            or not _is_sha256(sha256)
-            or hashlib.sha256(data).hexdigest() != sha256
-            or not _valid_png_mask(data, frame.width, frame.height)
-        ):
-            raise SceneMaskError("worker_output_invalid")
-        producer = raw.get("producer_receipt")
-        job = jobs.get((component_id, shot_id))
+        seen_paths.add(item.path)
+        job = jobs.get((item.component_id, item.shot_id))
         output_receipt = {
-            "path": path,
-            "sha256": sha256,
-            "byte_size": byte_size,
-            "width": width,
-            "height": height,
+            "path": item.path,
+            "sha256": item.sha256,
+            "byte_size": item.byte_size,
+            "width": item.width,
+            "height": item.height,
         }
         if not _valid_producer_receipt(
-            producer,
+            item.producer_receipt,
             plan,
             frame,
-            component_id,
-            shot_id,
+            item.component_id,
+            item.shot_id,
             job,
             request_sha256,
             output_receipt,
         ):
             raise SceneMaskError("worker_output_invalid")
-        by_key[key] = SceneMaskItem(
-            purpose="scene_component",
-            channel="grayscale_alpha",
-            component_id=component_id,
-            shot_id=shot_id,
-            frame_id=frame_id,
-            path=path,
-            sha256=sha256,
-            byte_size=byte_size,
-            width=width,
-            height=height,
-            producer_receipt=dict(producer),
-        )
+        by_key[key] = item
     if set(by_key) != set(expected):
         raise SceneMaskError("worker_output_invalid")
     return tuple(by_key[key] for key in expected)
@@ -698,30 +811,7 @@ def _valid_producer_receipt(
     request_sha256: str,
     output: Mapping[str, Any],
 ) -> bool:
-    expected_keys = {
-        "schema",
-        "version",
-        "backend",
-        "model",
-        "model_version",
-        "endpoint_identity",
-        "plan_sha256",
-        "scene_id",
-        "component_id",
-        "shot_id",
-        "frame_id",
-        "frame_sha256",
-        "reference_frame_id",
-        "request_sha256",
-        "propagation_job_sha256",
-        "propagation_scope",
-        "membership_engine",
-        "edge_refiner",
-        "edge_refinement_scope",
-        "fallback",
-        "output",
-    }
-    if not isinstance(producer, Mapping) or set(producer) != expected_keys or job is None:
+    if not _valid_producer_receipt_envelope(producer, output) or job is None:
         return False
     return producer == {
         "schema": _PRODUCER_SCHEMA,
@@ -748,14 +838,75 @@ def _valid_producer_receipt(
     }
 
 
-def _valid_png_mask(data: bytes, width: int, height: int) -> bool:
-    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+def _valid_consumer_producer_receipt(
+    producer: Any,
+    *,
+    component_id: str,
+    shot_id: str,
+    frame_id: str,
+    output: Mapping[str, Any],
+    expected_plan_sha256: str,
+    expected_source_sha256: str,
+) -> bool:
+    return bool(
+        _valid_producer_receipt_envelope(producer, output)
+        and producer.get("plan_sha256") == expected_plan_sha256
+        and producer.get("frame_sha256") == expected_source_sha256
+        and producer.get("component_id") == component_id
+        and producer.get("shot_id") == shot_id
+        and producer.get("frame_id") == frame_id
+    )
+
+
+def _valid_producer_receipt_envelope(
+    producer: Any, output: Mapping[str, Any]
+) -> bool:
+    if not isinstance(producer, Mapping) or frozenset(producer) != _PRODUCER_RECEIPT_KEYS:
         return False
+    identities = (
+        producer.get("backend"),
+        producer.get("model"),
+        producer.get("model_version"),
+        producer.get("endpoint_identity"),
+    )
+    identifiers = (
+        producer.get("scene_id"),
+        producer.get("component_id"),
+        producer.get("shot_id"),
+        producer.get("frame_id"),
+        producer.get("reference_frame_id"),
+    )
+    return bool(
+        producer.get("schema") == _PRODUCER_SCHEMA
+        and type(producer.get("version")) is int
+        and producer.get("version") == _VERSION
+        and all(_is_safe_identity(value) for value in identities)
+        and all(_is_identifier(value) for value in identifiers)
+        and _is_sha256(producer.get("plan_sha256"))
+        and _is_sha256(producer.get("frame_sha256"))
+        and _is_sha256(producer.get("request_sha256"))
+        and _is_sha256(producer.get("propagation_job_sha256"))
+        and producer.get("propagation_scope") == "hard_cut_shot_only"
+        and producer.get("membership_engine") == "sam2"
+        and producer.get("edge_refiner") == "birefnet"
+        and producer.get("edge_refinement_scope") == "sam2_uncertain_edges_only"
+        and producer.get("fallback") == "none"
+        and isinstance(producer.get("output"), Mapping)
+        and frozenset(producer["output"]) == {
+            "path", "sha256", "byte_size", "width", "height"
+        }
+        and producer.get("output") == output
+    )
+
+
+def _decode_png_mask(data: bytes, width: int, height: int) -> np.ndarray | None:
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
     image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if image is None or image.ndim != 2 or image.shape != (height, width):
-        return False
+        return None
     active = image > 0
-    return bool(np.any(active) and not np.all(active))
+    return active if np.any(active) and not np.all(active) else None
 
 
 def _read_contained_regular(root: Path, relative: str) -> bytes:
@@ -913,13 +1064,8 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 
 def _validate_local_paths(output_root: Path, receipt_path: Path) -> tuple[Path, Path]:
+    root = _validated_project_root(output_root)
     try:
-        root_path = Path(output_root)
-        if root_path.is_symlink():
-            raise ValueError("symlink root")
-        root = root_path.resolve(strict=True)
-        if not root.is_dir():
-            raise ValueError("not directory")
         receipt = Path(os.path.abspath(receipt_path))
         relative = receipt.relative_to(root)
         current = root
@@ -935,6 +1081,19 @@ def _validate_local_paths(output_root: Path, receipt_path: Path) -> tuple[Path, 
     except (OSError, RuntimeError, ValueError):
         raise SceneMaskError("invalid_project_path") from None
     return root, receipt
+
+
+def _validated_project_root(project_root: Path) -> Path:
+    try:
+        root_path = Path(project_root)
+        if root_path.is_symlink():
+            raise ValueError("symlink root")
+        root = root_path.resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError("not directory")
+        return root
+    except (OSError, RuntimeError, ValueError, TypeError):
+        raise SceneMaskError("invalid_project_path") from None
 
 
 def _worker_tasks_url(endpoint: str) -> str:
@@ -1015,8 +1174,24 @@ def _mask_item_payload(item: SceneMaskItem) -> dict[str, Any]:
         "byte_size": item.byte_size,
         "width": item.width,
         "height": item.height,
-        "producer_receipt": dict(item.producer_receipt),
+        "producer_receipt": _mutable_json(item.producer_receipt),
     }
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _mutable_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _mutable_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_json(item) for item in value]
+    return value
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
