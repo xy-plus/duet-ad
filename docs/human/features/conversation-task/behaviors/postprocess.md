@@ -20,6 +20,7 @@ links: [conversation-task, result-display]
 | v2 双目标图片计划已冻结 | 页面可查看后端确定性编译的提示词，但不能用自由文本改写；PATCH 返回 `image_optimization_prompt_compiled` |
 | 历史 v1 图片提示词被编辑 | `PATCH /image-optimization-prompt` 仍以 SHA CAS 保存，不迁移或重写旧 continuity receipt |
 | 全部帧完成 | `postprocess.status=done`，展示 `postprocessed/` 对比图 |
+| 图片优化验收通过且已选输出完整 | 同一 `video-maker` Skill 执行第三阶段 `reconcile_after_image_optimization`，输出 receipt 绑定的统一视觉 IR；未通过协调资格门时不进入 H3 |
 | 任一分段失败 | 保留成功帧；该段显示“重试本段”，请求携带 `confirm/expected_revision`，点击后立即禁用以防双击 |
 | 失败分段的 `error=submission_unknown` | 明确警告重复操作可能重复计费；用户再次明确确认后可按 `expected_revision` 人工重试本段；不得从 `status/stage` 推断 |
 | 旧会话 | 409 `read_only` |
@@ -43,6 +44,8 @@ links: [conversation-task, result-display]
 - 所有段固定保持画幅、裁切、机位、镜头、透视、构图、焦点、景深及全局光源方向、软硬、强度、曝光、白平衡、色温、整体色调、全局对比与 tone curve。目标人物和新场景的局部固有色必须明显不同；新几何只产生与原光源一致的局部阴影或反射，禁止全局重布光；交互、接触、持握、支撑、遮挡、前后顺序、视线、姿态、动作目的、数量、尺度与叙事关系不可破坏。
 - 人物和场景目标包生成后、任何逐帧付费 POST 前，同一 Skill 执行 `phase=verify_pack`：每个人物验身份变更、旧身份消失、双视图一致和局部颜色；每个场景验语义、几何、纵深、布局和局部颜色；项目级验全局光向、曝光、白平衡/CCT 和 tone curve。这一阶段只做语义判定，任一 `fail/unknown` 均 fail closed。
 - 生成结果进入 H3 前，同一 Skill 执行 `phase=verify`：逐人物、逐可观察帧验证新身份和源身份消失；逐场景、逐所属段验证五类真实变化；v3 `frame_checks` 再一一对照每帧的身体、姿态、接触、遮挡、裁切、`non_person_entity_ledger` 与光色合同。任一帧 unknown/fail 都使整项目 fail-closed；任何 `fail/unknown` 都使 `passed=false` 且不发布。
+- 图片 `verify` 通过后，同一 `video-maker` Skill 执行第三阶段 `reconcile_after_image_optimization`，不得重新选帧。原始源帧像素与 PTS 决定动作、机位和时序；旧视觉提示词只提供这些动态事实的低优先级检索证据；canonical 图片计划及其已选优化图 output receipts 决定新人物与新场景。existing dialogue、音频和台词 receipt 不进入该阶段。
+- 第三阶段只输出 exact unified visual IR：动态 beat 结构化记录 action/camera/timing，静态人物、服装、场景、材质和光色只绑定 canonical plan/image verification/output receipts 的 SHA 与稳定 ID，不再生成一份可漂移的新旧混合自由文本。优化图改变动作/姿态/接触/遮挡/因果、原始帧与优化图映射缺失，或新场景无法闭合原动作所需的支撑/接触/可达关系时一律 `eligible=false`；不能改写视频动态去迎合错误图片。
 - 每个付费 POST 前持久化私有 receipt。只有完整 HTTP 429、`success=false`、精确 `RequestLimitExceeded` 时，才按 `AUTO_RETRY_COUNT/AUTO_RETRY_INTERVAL_S` 自动退避并追加新 attempt；网络异常、5xx、无效/不完整响应仍视为结果未知并禁止重发。已收到成功响应但下载失败时只恢复 GET。MediaKit WebP 结果经解码、尺寸校验和 PNG 转码后才进入 `frames`。
 - Seedream 每帧总计最多 3 次 POST，且只有完整 HTTP 429、精确 `QuotaExceeded`、响应无 `data` 才自动重试；网络/超时/取消一律记为 `submission_unknown`。重启只恢复可证明安全的本地阶段，不自动重发未知 POST。
 - 后处理一旦开始，H3 提交必须等待其 `done`；完成后每张 `postprocessed/` 优化帧都会替代同名原关键帧，进入冻结输入 receipt 和实际 H3 请求。缺帧或状态异常时 fail closed，不回退原图。
