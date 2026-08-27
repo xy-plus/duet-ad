@@ -242,6 +242,9 @@ class H3Request:
     speaker_timing_sha256: str | None = None
     speaker_timing_authority_version: int | None = None
     speaker_timing_production_required: bool = False
+    speaker_timing_legacy_source_version: int | None = None
+    speaker_timing_legacy_receipt_path: str | None = None
+    speaker_timing_legacy_receipt_sha256: str | None = None
     speaker_timing_production_path: str | None = None
     speaker_timing_production_sha256: str | None = None
     speaker_timing_authority_artifacts: tuple[tuple[str, str], ...] = ()
@@ -368,6 +371,9 @@ def _validate_request_audio_contract(
             or request.speaker_timing_sha256 is not None
             or request.speaker_timing_authority_version is not None
             or request.speaker_timing_production_required is not False
+            or request.speaker_timing_legacy_source_version is not None
+            or request.speaker_timing_legacy_receipt_path is not None
+            or request.speaker_timing_legacy_receipt_sha256 is not None
             or request.speaker_timing_production_path is not None
             or request.speaker_timing_production_sha256 is not None
             or request.speaker_timing_authority_artifacts
@@ -414,22 +420,41 @@ def _validate_request_audio_contract(
     authority_values = (
         request.speaker_timing_authority_version,
         request.speaker_timing_production_required,
+        request.speaker_timing_legacy_source_version,
+        request.speaker_timing_legacy_receipt_path,
+        request.speaker_timing_legacy_receipt_sha256,
         request.speaker_timing_production_path,
         request.speaker_timing_production_sha256,
         request.speaker_timing_authority_artifacts,
         request.speaker_timing_authority_root,
     )
     if not request.on_screen_dialogue:
-        if authority_values != (None, False, None, None, (), None):
+        if authority_values != (
+            None, False, None, None, None, None, None, (), None,
+        ):
             raise H3Error("mixed_speaker_timing_authority")
     elif request.speaker_timing_authority_version == 0:
-        if authority_values[1:] != (False, None, None, (), None):
+        legacy_values = authority_values[2:5]
+        if (
+            authority_values[1] is not False
+            or authority_values[5:8] != (None, None, ())
+            or (
+                legacy_values != (None, None, None)
+                and (
+                    legacy_values[0] != 2
+                    or not _safe_relative_authority_path(legacy_values[1])
+                    or not _is_sha256(legacy_values[2])
+                )
+            )
+            or (legacy_values == (None, None, None) and authority_values[8] is not None)
+        ):
             raise H3Error("invalid_legacy_speaker_timing_authority")
     elif request.speaker_timing_authority_version == 1:
         production_path = request.speaker_timing_production_path
         artifacts = request.speaker_timing_authority_artifacts
         if (
             request.speaker_timing_production_required is not True
+            or authority_values[2:5] != (None, None, None)
             or not isinstance(production_path, str)
             or not _safe_relative_authority_path(production_path)
             or not _is_sha256(request.speaker_timing_production_sha256)
@@ -517,9 +542,11 @@ def validate_request_authority(request: H3Request) -> None:
 
 def speaker_timing_authority_manifest(request: H3Request) -> dict[str, Any] | None:
     version = request.speaker_timing_authority_version
-    if version is None:
+    if version is None or (
+        version == 0 and request.speaker_timing_legacy_receipt_path is None
+    ):
         return None
-    return {
+    manifest = {
         "version": version,
         "required": request.speaker_timing_production_required,
         "production_path": request.speaker_timing_production_path,
@@ -529,12 +556,58 @@ def speaker_timing_authority_manifest(request: H3Request) -> dict[str, Any] | No
             for path, sha256 in request.speaker_timing_authority_artifacts
         ],
     }
+    if version == 0:
+        manifest["legacy_source"] = {
+            "version": request.speaker_timing_legacy_source_version,
+            "receipt_path": request.speaker_timing_legacy_receipt_path,
+            "receipt_sha256": request.speaker_timing_legacy_receipt_sha256,
+        }
+    return manifest
 
 
 def _require_speaker_timing_production_authority(request: H3Request) -> None:
     if not request.on_screen_dialogue:
         return
     if request.speaker_timing_authority_version == 0:
+        relative = request.speaker_timing_legacy_receipt_path
+        root = request.speaker_timing_authority_root
+        if (
+            request.speaker_timing_legacy_source_version != 2
+            or not isinstance(relative, str)
+            or not isinstance(root, Path)
+        ):
+            raise ReceiptError("legacy_speaker_timing_authority_required")
+        root = root.resolve()
+        try:
+            path = (root / relative).resolve()
+            path.relative_to(root)
+            data = path.read_bytes()
+            receipt = json.loads(data.decode("utf-8"))
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            raise ReceiptError("legacy_speaker_timing_authority_invalid") from None
+        if (
+            hashlib.sha256(data).hexdigest()
+            != request.speaker_timing_legacy_receipt_sha256
+            or not isinstance(receipt, Mapping)
+            or set(receipt) != {
+                "schema", "version", "mode", "approved_skill_plan_sha256",
+                "multimodal_input", "skill_plan", "reference_audios",
+            }
+            or receipt.get("schema") != "duet.h3-multimodal-source"
+            or receipt.get("version") != 2
+            or receipt.get("mode") != "multimodal"
+            or not _is_sha256(receipt.get("approved_skill_plan_sha256"))
+            or not isinstance(receipt.get("multimodal_input"), Mapping)
+            or not isinstance(receipt.get("skill_plan"), Mapping)
+            or not isinstance(receipt.get("reference_audios"), list)
+        ):
+            raise ReceiptError("legacy_speaker_timing_authority_invalid")
         return
     if request.speaker_timing_authority_version != 1:
         raise ReceiptError("speaker_timing_production_authority_required")
@@ -782,7 +855,7 @@ def _context_ir_source_request_receipt(
         "speaker_timing_sha256": request.speaker_timing_sha256,
         **(
             {"speaker_timing_authority": speaker_timing_authority_manifest(request)}
-            if request.speaker_timing_authority_version == 1
+            if speaker_timing_authority_manifest(request) is not None
             else {}
         ),
         "on_screen_dialogue_sha256": request.on_screen_dialogue_sha256,
@@ -1773,7 +1846,7 @@ def _input_manifest(
                 "speaker_timing_sha256": request.speaker_timing_sha256,
                 **(
                     {"speaker_timing_authority": speaker_timing_authority_manifest(request)}
-                    if request.speaker_timing_authority_version == 1
+                    if speaker_timing_authority_manifest(request) is not None
                     else {}
                 ),
                 "on_screen_dialogue": list(request.on_screen_dialogue),

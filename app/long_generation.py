@@ -760,6 +760,22 @@ def _extract_last_frame(video: Path, output: Path) -> Path:
     return output
 
 
+def _bind_h3_operational_roots(
+    settings,
+    plan: FrozenPlan,
+    request: h3.H3Request,
+) -> h3.H3Request:
+    return replace(
+        request,
+        gateway_storage_root=settings.h3_gateway_storage_root,
+        speaker_timing_authority_root=(
+            plan.root
+            if request.speaker_timing_authority_version in {0, 1}
+            else None
+        ),
+    )
+
+
 def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
              parent_id: str, fit_mode: str, *, frozen_child_id: str | None = None,
              prepare_inputs: bool = True, fast_mode: bool = False,
@@ -806,14 +822,10 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
             context = _freeze_segment_context_ir(
                 settings, plan, segment, source_request
             )
-            return replace(
+            return _bind_h3_operational_roots(
+                settings,
+                plan,
                 h3_project.apply_bound_context_ir(context, context_ir_binding),
-                gateway_storage_root=settings.h3_gateway_storage_root,
-                speaker_timing_authority_root=(
-                    plan.root
-                    if source_request.speaker_timing_authority_version == 1
-                    else None
-                ),
             )
         except (h3.H3Error, h3_project.ProjectMultimodalError) as exc:
             raise LongGenerationError(
@@ -975,9 +987,10 @@ def _optimize_segment_context_ir(
         binding = h3_project.context_ir_binding(result)
         if result.status == "succeeded":
             return (
-                replace(
+                _bind_h3_operational_roots(
+                    settings,
+                    plan,
                     h3_project.apply_bound_context_ir(context, binding),
-                    gateway_storage_root=settings.h3_gateway_storage_root,
                 ),
                 binding,
                 "succeeded",
@@ -1827,11 +1840,10 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                             settings, plan, segment, source_request
                         )
                         return (
-                            replace(
+                            _bind_h3_operational_roots(
+                                settings,
+                                plan,
                                 h3_project.apply_bound_context_ir(context, binding),
-                                gateway_storage_root=(
-                                    settings.h3_gateway_storage_root
-                                ),
                             ),
                             binding,
                             "succeeded",
@@ -2136,11 +2148,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     context = _freeze_segment_context_ir(
                         settings, plan, segment, request
                     )
-                    request = replace(
+                    request = _bind_h3_operational_roots(
+                        settings,
+                        plan,
                         h3_project.apply_bound_context_ir(
                             context, context_binding
                         ),
-                        gateway_storage_root=settings.h3_gateway_storage_root,
                     )
                 else:
                     if not _context_ir_may_progress(

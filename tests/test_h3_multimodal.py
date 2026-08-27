@@ -141,7 +141,27 @@ def _request(tmp_path: Path) -> h3.H3Request:
             retry_interval_s=0,
         ),
     )
-    return replace(request, gateway_storage_root=tmp_path.resolve())
+    authority_root = tmp_path.resolve()
+    legacy_receipt = authority_root / "legacy_h3_multimodal_source.json"
+    legacy_receipt.write_text(json.dumps({
+        "schema": "duet.h3-multimodal-source",
+        "version": 2,
+        "mode": "multimodal",
+        "approved_skill_plan_sha256": h3.canonical_json_sha256(plan),
+        "multimodal_input": {"path": "input.json", "sha256": "a" * 64},
+        "skill_plan": {"path": "plan.json", "sha256": "b" * 64},
+        "reference_audios": [],
+    }), encoding="utf-8")
+    return replace(
+        request,
+        gateway_storage_root=authority_root,
+        speaker_timing_legacy_source_version=2,
+        speaker_timing_legacy_receipt_path=legacy_receipt.name,
+        speaker_timing_legacy_receipt_sha256=hashlib.sha256(
+            legacy_receipt.read_bytes()
+        ).hexdigest(),
+        speaker_timing_authority_root=authority_root,
+    )
 
 
 def _attempt(request: h3.H3Request) -> dict:

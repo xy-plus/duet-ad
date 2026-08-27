@@ -423,7 +423,7 @@ def _h3_request_manifest(
                     h3.speaker_timing_authority_manifest(request)
                 )
             }
-            if request.speaker_timing_authority_version == 1
+            if h3.speaker_timing_authority_manifest(request) is not None
             else {}
         ),
         "on_screen_dialogue_sha256": request.on_screen_dialogue_sha256,

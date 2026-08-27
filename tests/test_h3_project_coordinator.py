@@ -25,6 +25,7 @@ from app.main import (
     _finish_generation,
     _freeze_submission,
     _has_valid_generated_video,
+    _load_h3_request,
     _replace_source_prompt,
     _run_generation,
     _validate_generated_video_uncached,
@@ -111,10 +112,177 @@ def _plan(visual_prompt: str, dialogue_source_sha256: str) -> dict:
     }
 
 
+def _write_speaker_visibility_production(
+    work: Path,
+    *,
+    source_duration_s: float,
+    identity_ref: Path,
+) -> None:
+    source = work.parent / "source.mp4"
+    duration_pts = round(source_duration_s * 8)
+    frame_data = {}
+    frames = []
+    for order in range(1, duration_pts + 1):
+        path = work / "speaker-visibility-frames" / f"{order:06d}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"sample-{order}".encode())
+        relative = path.relative_to(work).as_posix()
+        frame_data[relative] = path.read_bytes()
+        frames.append({
+            "order": order,
+            "path": relative,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "pts": order - 1,
+            "cut_before": False,
+        })
+    sheets = []
+    for sheet_order, start in enumerate(range(1, duration_pts + 1, 16), 1):
+        path = (
+            work / "speaker-visibility-contact-sheets"
+            / f"{sheet_order:06d}.png"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"sheet-{sheet_order}".encode())
+        relative = path.relative_to(work).as_posix()
+        frame_data[relative] = path.read_bytes()
+        sheets.append({
+            "order": sheet_order,
+            "path": relative,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "frame_orders": list(range(start, min(start + 16, duration_pts + 1))),
+        })
+    scenes = work / "scenes.json"
+    scenes.write_bytes(b"frozen-scenes")
+    frame_data["scenes.json"] = scenes.read_bytes()
+    identity_relative = identity_ref.relative_to(work).as_posix()
+    frame_data[identity_relative] = identity_ref.read_bytes()
+    producer_input = {
+        "schema": "duet.speaker-visibility-input",
+        "version": 1,
+        "phase": "speaker_visibility",
+        "source": {
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "duration_pts": duration_pts,
+            "time_base": {"numerator": 1, "denominator": 8},
+        },
+        "sampling": {
+            "algorithm": "decoded_pts_nearest_v1",
+            "cadence_fps": 8,
+            "max_unobserved_gap_pts": 1,
+            "endpoint_shrink_intervals": 1,
+        },
+        "decoded_frame_pts": list(range(duration_pts)),
+        "cut_pts": [],
+        "cut_source": {
+            "path": scenes.name,
+            "sha256": hashlib.sha256(scenes.read_bytes()).hexdigest(),
+        },
+        "frames": frames,
+        "contact_sheets": sheets,
+        "persons": [{
+            "person_id": "PERSON_01",
+            "identity_refs": [{
+                "path": identity_relative,
+                "sha256": hashlib.sha256(identity_ref.read_bytes()).hexdigest(),
+            }],
+        }],
+        "on_screen_subjects": ["S1"],
+    }
+    producer_input_data = (
+        json.dumps(
+            producer_input,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+    ).encode()
+    raw_output = {
+        "schema": "duet.speaker-visibility-output",
+        "version": 1,
+        "phase": "speaker_visibility",
+        "input_sha256": hashlib.sha256(producer_input_data).hexdigest(),
+        "subject_person_mapping": [{
+            "subject_id": "S1", "person_id": "PERSON_01",
+        }],
+        "frames": [{
+            "order": order,
+            "visible_person_ids": ["PERSON_01"],
+            "lip_verifiable_person_ids": ["PERSON_01"],
+        } for order in range(1, duration_pts + 1)],
+    }
+    raw_output_data = (
+        json.dumps(
+            raw_output,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+    ).encode()
+    skill_data = b"frozen-video-maker-speaker-visibility-skill"
+    production = dialogue_timing.freeze_speaker_visibility(
+        producer_input_data=producer_input_data,
+        skill_output_data=raw_output_data,
+        source_data=source.read_bytes(),
+        frame_data=frame_data,
+        skill_data=skill_data,
+    )
+    artifacts = {
+        "speaker_visibility_input.json": producer_input_data,
+        "speaker_visibility_output.json": raw_output_data,
+        "speaker_visibility_skill.md": skill_data,
+        h3_project.SPEAKER_TIMING_FILENAME: (
+            json.dumps(
+                production.speaker_timing,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n"
+        ).encode(),
+        "speaker_timing_production.json": (
+            json.dumps(
+                production.receipt,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n"
+        ).encode(),
+    }
+    for name, data in artifacts.items():
+        (work / name).write_bytes(data)
+    timing_binding = {
+        "path": h3_project.SPEAKER_TIMING_FILENAME,
+        "sha256": hashlib.sha256(
+            artifacts[h3_project.SPEAKER_TIMING_FILENAME]
+        ).hexdigest(),
+    }
+    input_path = work / h3_project.SKILL_INPUT_FILENAME
+    frozen_input = json.loads(input_path.read_text(encoding="utf-8"))
+    frozen_input["speaker_timing"] = timing_binding
+    input_path.write_text(
+        json.dumps(frozen_input, ensure_ascii=False), encoding="utf-8"
+    )
+    manifest_path = work / h3_project.SOURCE_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["speaker_timing"] = timing_binding
+    manifest["speaker_timing_producer"] = {
+        "path": "speaker_timing_production.json",
+        "sha256": hashlib.sha256(
+            artifacts["speaker_timing_production.json"]
+        ).hexdigest(),
+    }
+    manifest["multimodal_input"]["sha256"] = hashlib.sha256(
+        input_path.read_bytes()
+    ).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 def _multimodal_source(
     work: Path, visual_prompt: str, *, plan: dict,
     keyframes: list[Path] | None = None,
     source_duration_s: float = 4.0,
+    producer_backed: bool = True,
 ) -> Path:
     plan_path = work / "h3_prompt_plan.json"
     plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
@@ -217,6 +385,15 @@ def _multimodal_source(
     }
     path = work / h3_project.SOURCE_FILENAME
     path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    if producer_backed and any(
+        binding.get("delivery") == "on_screen"
+        for binding in plan["speech_bindings"]
+    ):
+        _write_speaker_visibility_production(
+            work,
+            source_duration_s=source_duration_s,
+            identity_ref=selected_keyframes[0],
+        )
     return path
 
 
@@ -234,6 +411,7 @@ def _downgrade_multimodal_source_to_v2(work: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["version"] = 2
     manifest.pop("speaker_timing", None)
+    manifest.pop("speaker_timing_producer", None)
     manifest["multimodal_input"]["sha256"] = hashlib.sha256(
         input_path.read_bytes()
     ).hexdigest()
@@ -252,6 +430,7 @@ def _remove_v3_speaker_timing(work: Path) -> None:
     manifest_path = work / h3_project.SOURCE_FILENAME
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest.pop("speaker_timing")
+    manifest.pop("speaker_timing_producer", None)
     manifest["multimodal_input"]["sha256"] = hashlib.sha256(
         input_path.read_bytes()
     ).hexdigest()
@@ -483,6 +662,14 @@ def test_short_project_freezes_skill_audio_contract_and_stitches_only_h3_audio(
     context_gateway = _ContextGateway()
     _install_fake_context(monkeypatch, context_gateway)
     _install_fake_h3(monkeypatch, gateway)
+    started_h3_requests = []
+    fake_h3_start = h3.start
+
+    def capture_h3_request(request):
+        started_h3_requests.append(request)
+        return fake_h3_start(request)
+
+    monkeypatch.setattr(h3, "start", capture_h3_request)
     payload = {
         "confirm": True,
         "client_request_id": "short-project-request",
@@ -521,6 +708,11 @@ def test_short_project_freezes_skill_audio_contract_and_stitches_only_h3_audio(
         assert response.status_code == 202
 
     assert len(gateway.posts) == 1
+    assert len(started_h3_requests) == 1
+    assert started_h3_requests[0].speaker_timing_authority_version == 1
+    assert started_h3_requests[0].speaker_timing_production_required is True
+    assert started_h3_requests[0].speaker_timing_authority_root == root.resolve()
+    assert started_h3_requests[0].context_ir_receipt_path is not None
     assert len(context_gateway.posts) == 1
     body = gateway.posts[0]
     assert set(body) == {
@@ -548,6 +740,9 @@ def test_short_project_freezes_skill_audio_contract_and_stitches_only_h3_audio(
     assert stored["context_ir"]["status"] == "succeeded"
     complete_meta = storage.load_meta(settings.data_dir, cid)
     assert _has_valid_generated_video(settings, complete_meta) is True
+    reloaded_request = _load_h3_request(settings, cid, complete_meta)
+    assert reloaded_request.speaker_timing_authority_root == root.resolve()
+    assert h3.inspect(reloaded_request).status == "succeeded"
     context_receipt = Path(str(stored["context_ir"]["receipt_path"]))
     context_receipt_bytes = context_receipt.read_bytes()
     context_receipt.write_text("{}", encoding="utf-8")
@@ -721,6 +916,7 @@ def test_v2_on_screen_project_requires_timing_refresh(tmp_path):
             speech=True,
             dialogue_source_sha256=h3.canonical_json_sha256(list(dialogue)),
         ),
+        producer_backed=False,
     )
     _remove_v3_speaker_timing(work)
     with pytest.raises(
@@ -778,6 +974,59 @@ def test_v2_on_screen_project_requires_timing_refresh(tmp_path):
         )
 
 
+def test_current_on_screen_project_cannot_downgrade_without_producer(tmp_path):
+    root = tmp_path / "current-without-producer"
+    work = root / "work"
+    source = root / "source.mp4"
+    key = work / "keyframes" / "01.png"
+    visual = work / "visual_prompt.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"current-source")
+    _png(key, 40)
+    visual.parent.mkdir(parents=True, exist_ok=True)
+    visual.write_text("人物面对镜头。", encoding="utf-8")
+    dialogue = prepared_input.prepare_dialogue(
+        "custom", 4,
+        supplied_lines=[{"text": "现在出发。", "start_s": 0.4, "end_s": 2.0}],
+    )
+    dialogue_sha256 = h3.canonical_json_sha256(list(dialogue))
+    _multimodal_source(
+        work,
+        visual.read_text(encoding="utf-8"),
+        plan=_projection_plan(
+            visual.read_text(encoding="utf-8"),
+            speech=True,
+            dialogue_source_sha256=dialogue_sha256,
+        ),
+        producer_backed=False,
+    )
+    frozen = h3_project.freeze_optional(root, work)
+    assert frozen is not None
+    assert frozen.source_version == h3_project.SOURCE_VERSION
+    assert frozen.speaker_timing_production is None
+
+    with pytest.raises(
+        h3_project.ProjectMultimodalError,
+        match="speaker_timing_refresh_required",
+    ):
+        h3_project.build_request_from_parts(
+            multimodal=frozen,
+            visual_prompt=visual.read_text(encoding="utf-8"),
+            keyframes=h3.freeze_keyframes((key,)),
+            upstream_dialogue=dialogue,
+            upstream_dialogue_receipt_sha256=dialogue_sha256,
+            source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            source_duration_s=4.0,
+            cid="current-without-producer",
+            workdir=work / "h3-native",
+            client_request_id="current-without-producer",
+            duration=4,
+            resolution="768p",
+            aspect_ratio="9:16",
+            autodl_token="not-sent",
+        )
+
+
 def test_speaker_visibility_raw_output_drift_is_rejected_before_h3(
     tmp_path, monkeypatch,
 ):
@@ -803,142 +1052,13 @@ def test_speaker_visibility_raw_output_drift_is_rejected_before_h3(
             speech=True,
             dialogue_source_sha256=h3.canonical_json_sha256(list(dialogue)),
         ),
+        producer_backed=False,
     )
-    producer_input = work / "speaker_visibility_input.json"
     producer_output = work / "speaker_visibility_output.json"
-    frozen_skill = work / "speaker_visibility_skill.md"
-    sample_dir = work / "speaker-visibility-frames"
-    sample_dir.mkdir()
-    frame_bindings = []
-    frame_data = {}
-    for order in range(1, 33):
-        path = sample_dir / f"{order:06d}.png"
-        path.write_bytes(f"sample-{order}".encode())
-        relative = path.relative_to(work).as_posix()
-        frame_data[relative] = path.read_bytes()
-        frame_bindings.append({
-            "order": order,
-            "path": relative,
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "pts": order - 1,
-            "cut_before": False,
-        })
-    sheet_dir = work / "speaker-visibility-contact-sheets"
-    sheet_dir.mkdir()
-    sheet_bindings = []
-    for sheet_order, start in enumerate((1, 17), 1):
-        sheet = sheet_dir / f"{sheet_order:06d}.png"
-        sheet.write_bytes(f"contact-sheet-{sheet_order}".encode())
-        frame_data[sheet.relative_to(work).as_posix()] = sheet.read_bytes()
-        sheet_bindings.append({
-            "order": sheet_order,
-            "path": sheet.relative_to(work).as_posix(),
-            "sha256": hashlib.sha256(sheet.read_bytes()).hexdigest(),
-            "frame_orders": list(range(start, start + 16)),
-        })
-    frame_data[key.relative_to(work).as_posix()] = key.read_bytes()
-    scenes = work / "scenes.json"
-    scenes.write_bytes(b"frozen-scenes")
-    frame_data["scenes.json"] = scenes.read_bytes()
-    input_value = {
-            "schema": "duet.speaker-visibility-input",
-            "version": 1,
-            "phase": "speaker_visibility",
-            "source": {
-                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-                "duration_pts": 32,
-                "time_base": {"numerator": 1, "denominator": 8},
-            },
-            "sampling": {
-                "algorithm": "decoded_pts_nearest_v1",
-                "cadence_fps": 8,
-                "max_unobserved_gap_pts": 1,
-                "endpoint_shrink_intervals": 1,
-            },
-            "decoded_frame_pts": list(range(32)),
-            "cut_pts": [],
-            "cut_source": {
-                "path": "scenes.json",
-                "sha256": hashlib.sha256(scenes.read_bytes()).hexdigest(),
-            },
-            "frames": frame_bindings,
-            "contact_sheets": sheet_bindings,
-            "persons": [{
-                "person_id": "PERSON_01",
-                "identity_refs": [{
-                    "path": key.relative_to(work).as_posix(),
-                    "sha256": hashlib.sha256(key.read_bytes()).hexdigest(),
-                }],
-            }],
-            "on_screen_subjects": ["S1"],
-    }
-    input_data = (
-        json.dumps(input_value, ensure_ascii=False, sort_keys=True,
-                   separators=(",", ":")) + "\n"
-    ).encode()
-    producer_input.write_bytes(input_data)
-    output_value = {
-        "schema": "duet.speaker-visibility-output",
-        "version": 1,
-        "phase": "speaker_visibility",
-        "input_sha256": hashlib.sha256(input_data).hexdigest(),
-        "subject_person_mapping": [{
-            "subject_id": "S1", "person_id": "PERSON_01",
-        }],
-        "frames": [{
-            "order": order,
-            "visible_person_ids": ["PERSON_01"],
-            "lip_verifiable_person_ids": ["PERSON_01"],
-        } for order in range(1, 33)],
-    }
-    output_data = (
-        json.dumps(output_value, ensure_ascii=False, sort_keys=True,
-                   separators=(",", ":")) + "\n"
-    ).encode()
-    producer_output.write_bytes(output_data)
-    frozen_skill.write_bytes(b"frozen-video-maker-skill")
-    production = dialogue_timing.freeze_speaker_visibility(
-        producer_input_data=input_data,
-        skill_output_data=output_data,
-        source_data=source.read_bytes(),
-        frame_data=frame_data,
-        skill_data=frozen_skill.read_bytes(),
-    )
-    timing_path = work / h3_project.SPEAKER_TIMING_FILENAME
-    timing_path.write_bytes(
-        json.dumps(production.speaker_timing, ensure_ascii=False, sort_keys=True,
-                   separators=(",", ":")).encode() + b"\n"
-    )
-    receipt = production.receipt
-    receipt_path = work / "speaker_timing_production.json"
-    receipt_path.write_bytes(
-        json.dumps(receipt, ensure_ascii=False, sort_keys=True,
-                   separators=(",", ":")).encode() + b"\n"
-    )
-    manifest_path = work / h3_project.SOURCE_FILENAME
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["speaker_timing"] = {
-        "path": timing_path.name,
-        "sha256": hashlib.sha256(timing_path.read_bytes()).hexdigest(),
-    }
-    manifest["speaker_timing_producer"] = {
-        "path": receipt_path.name,
-        "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
-    }
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
-    )
-    multimodal_input = work / h3_project.SKILL_INPUT_FILENAME
-    input_manifest = json.loads(multimodal_input.read_text(encoding="utf-8"))
-    input_manifest["speaker_timing"] = manifest["speaker_timing"]
-    multimodal_input.write_text(
-        json.dumps(input_manifest, ensure_ascii=False), encoding="utf-8"
-    )
-    manifest["multimodal_input"]["sha256"] = hashlib.sha256(
-        multimodal_input.read_bytes()
-    ).hexdigest()
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    _write_speaker_visibility_production(
+        work,
+        source_duration_s=4.0,
+        identity_ref=key,
     )
 
     frozen_production = h3_project.freeze_optional(root, work)
@@ -1023,6 +1143,27 @@ def test_speaker_visibility_raw_output_drift_is_rejected_before_h3(
     assert long_request.speaker_timing_authority_root == root.resolve()
     assert long_request.gateway_storage_root == settings.h3_gateway_storage_root
     h3._require_speaker_timing_production_authority(long_request)
+    monkeypatch.setattr(
+        context_ir_bridge,
+        "optimize_h3_prompt",
+        lambda _context: SimpleNamespace(status="succeeded", error_code=None),
+    )
+    monkeypatch.setattr(
+        h3_project,
+        "context_ir_binding",
+        lambda _result: {"status": "succeeded"},
+    )
+    optimized, _binding, status, error = (
+        long_generation._optimize_segment_context_ir(
+            settings, plan, segment, built
+        )
+    )
+    assert status == "succeeded" and error is None
+    assert optimized.speaker_timing_authority_root == root.resolve()
+    fast_existing = long_generation._bind_h3_operational_roots(
+        settings, plan, built
+    )
+    assert fast_existing.speaker_timing_authority_root == root.resolve()
 
     producer_output.write_text("{}", encoding="utf-8")
     with pytest.raises(
@@ -1804,6 +1945,24 @@ def test_two_segment_long_project_builds_each_exact_multimodal_request(
         and request.context_ir_receipt_path is not None
         for request in started_h3_requests
     )
+    if dialogue_mode == "auto":
+        assert all(
+            request.speaker_timing_authority_version == 1
+            and request.speaker_timing_production_required is True
+            and request.speaker_timing_authority_root == root.resolve()
+            for request in started_h3_requests
+        )
+        assert all(
+            request.speaker_timing_authority_version == 1
+            and request.speaker_timing_authority_root is None
+            for request in frozen_context_requests
+        )
+    else:
+        assert all(
+            request.speaker_timing_authority_version is None
+            and request.speaker_timing_authority_root is None
+            for request in started_h3_requests
+        )
     assert len(context_gateway.posts) == 2
     assert all(set(body) == {
         "mode", "prompt", "duration_sec", "aspect_ratio", "resolution",

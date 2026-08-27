@@ -908,9 +908,18 @@ def _speaker_timing_request_authority(
     multimodal: FrozenProjectMultimodal,
 ) -> dict[str, Any]:
     if multimodal.speaker_timing_production_path is None:
+        if multimodal.source_version != LEGACY_SOURCE_VERSION:
+            _fail("speaker_timing_refresh_required")
         return {
             "speaker_timing_authority_version": 0,
             "speaker_timing_production_required": False,
+            "speaker_timing_legacy_source_version": LEGACY_SOURCE_VERSION,
+            "speaker_timing_legacy_receipt_path": _relative(
+                multimodal.root, multimodal.manifest_path
+            ),
+            "speaker_timing_legacy_receipt_sha256": (
+                multimodal.manifest_sha256
+            ),
             "speaker_timing_production_path": None,
             "speaker_timing_production_sha256": None,
             "speaker_timing_authority_artifacts": (),
@@ -1006,6 +1015,9 @@ def _speaker_timing_request_authority(
     return {
         "speaker_timing_authority_version": 1,
         "speaker_timing_production_required": True,
+        "speaker_timing_legacy_source_version": None,
+        "speaker_timing_legacy_receipt_path": None,
+        "speaker_timing_legacy_receipt_sha256": None,
         "speaker_timing_production_path": production_relative,
         "speaker_timing_production_sha256": frozen[production_relative],
         "speaker_timing_authority_artifacts": tuple(sorted(frozen.items())),

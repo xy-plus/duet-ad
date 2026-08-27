@@ -1021,6 +1021,24 @@ def _load_short_frozen_input(
     return frozen, request_id
 
 
+def _bind_short_h3_operational_roots(
+    settings: Settings,
+    cid: str,
+    request: h3.H3Request,
+) -> h3.H3Request:
+    if not h3.is_multimodal_request(request):
+        return request
+    return replace(
+        request,
+        gateway_storage_root=settings.h3_gateway_storage_root,
+        speaker_timing_authority_root=(
+            (settings.data_dir / cid).resolve()
+            if request.speaker_timing_authority_version in {0, 1}
+            else None
+        ),
+    )
+
+
 def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
     frozen, request_id = _load_short_frozen_input(settings, cid, meta)
     _aspect_ratio, resolution = _generation_semantics(meta)
@@ -1036,7 +1054,7 @@ def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
                 request = h3_project.apply_bound_context_ir(context, binding)
             except h3_project.ProjectMultimodalError:
                 raise _SubmitError(409, "prepared_input_invalid") from None
-    return request
+    return _bind_short_h3_operational_roots(settings, cid, request)
 
 
 def _load_controlled_storage_retry_requests(
@@ -1049,7 +1067,9 @@ def _load_controlled_storage_retry_requests(
     generation = meta.get("generation")
     binding = generation.get("context_ir") if isinstance(generation, dict) else None
     effective_request = h3_project.apply_bound_context_ir(context, binding)
-    return source_request, effective_request
+    return source_request, _bind_short_h3_operational_roots(
+        settings, cid, effective_request
+    )
 
 
 def _freeze_short_context_ir(
@@ -1330,13 +1350,9 @@ def _run_generation(
                 )
                 if action == "resume":
                     h3_action = "start"
-            if request.speaker_timing_authority_version == 1:
-                request = replace(
-                    request,
-                    speaker_timing_authority_root=(
-                        settings.data_dir / cid
-                    ).resolve(),
-                )
+            request = _bind_short_h3_operational_roots(
+                settings, cid, request
+            )
             h3_project.revalidate_production_authority(
                 (settings.data_dir / cid).resolve(),
                 (settings.data_dir / cid / "work").resolve(),

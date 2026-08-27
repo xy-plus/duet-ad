@@ -1644,7 +1644,9 @@ def test_every_public_h3_boundary_reloads_producer_authority_before_state_or_pos
     assert not request.workdir.joinpath(".h3").exists()
 
 
-def test_on_screen_authority_requires_explicit_producer_or_legacy_version(tmp_path):
+def test_on_screen_authority_requires_explicit_producer_or_legacy_version(
+    tmp_path, monkeypatch,
+):
     request, _sample = _producer_authority_request(tmp_path)
     with pytest.raises(h3.H3Error, match="speaker_timing_authority_required"):
         replace(
@@ -1666,6 +1668,39 @@ def test_on_screen_authority_requires_explicit_producer_or_legacy_version(tmp_pa
         speaker_timing_authority_root=None,
     )
     assert legacy.speaker_timing_authority_version == 0
+    monkeypatch.setattr(h3, "_require_context_ir_receipt", lambda _request: None)
+    with pytest.raises(
+        h3.ReceiptError, match="legacy_speaker_timing_authority_required"
+    ):
+        h3.inspect(legacy)
+
+    authority_root = request.speaker_timing_authority_root
+    legacy_receipt = authority_root / "work" / "h3_multimodal_source.json"
+    legacy_receipt.write_text(json.dumps({
+        "schema": "duet.h3-multimodal-source",
+        "version": 2,
+        "mode": "multimodal",
+        "approved_skill_plan_sha256": "a" * 64,
+        "multimodal_input": {"path": "input.json", "sha256": "b" * 64},
+        "skill_plan": {"path": "plan.json", "sha256": "c" * 64},
+        "reference_audios": [],
+    }), encoding="utf-8")
+    relative = legacy_receipt.relative_to(authority_root).as_posix()
+    exact_legacy = replace(
+        legacy,
+        speaker_timing_legacy_source_version=2,
+        speaker_timing_legacy_receipt_path=relative,
+        speaker_timing_legacy_receipt_sha256=hashlib.sha256(
+            legacy_receipt.read_bytes()
+        ).hexdigest(),
+        speaker_timing_authority_root=authority_root,
+    )
+    assert h3.inspect(exact_legacy).status == "not_started"
+    legacy_receipt.write_text("{}", encoding="utf-8")
+    with pytest.raises(
+        h3.ReceiptError, match="legacy_speaker_timing_authority_invalid"
+    ):
+        h3.inspect(exact_legacy)
 
 
 def test_speaker_authority_root_is_operational_not_source_request_semantics(tmp_path):
