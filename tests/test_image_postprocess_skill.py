@@ -138,6 +138,7 @@ class _Runner:
         )
         name = {
             "plan": "image_optimization.json",
+            "plan_audit": "plan_audit.json",
             "verify": "image_verification.json",
             "verify_pack": "reference_pack_verification.json",
         }[self.calls[-1]["request"]["phase"]]
@@ -249,11 +250,11 @@ def _pack_verdict(plan: dict, *, passed: bool = True) -> dict:
     }
 
 
-def test_skill_is_one_concise_three_phase_skill():
+def test_skill_is_one_concise_four_phase_skill():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
     assert "name: image-postprocess" in skill
-    assert "`phase` 只能是 `plan`、`verify` 或 `verify_pack`" in skill
+    assert "`phase` 只能是 `plan`、`plan_audit`、`verify` 或 `verify_pack`" in skill
     assert "人物与真实新场景必须同时替换" in skill
     assert "`person_plans`" in skill and "`scene_plans`" in skill
     assert "只生成结构化设计，不直接编写 Seedream 提示词" in skill
@@ -267,6 +268,9 @@ def test_skill_is_one_concise_three_phase_skill():
     assert "不得出现素材特调" in skill
     assert "work/image_verification.json" in skill
     assert "work/reference_pack_verification.json" in skill
+    assert "work/plan_audit.json" in skill
+    assert "body_closure" in skill and "relation_closure" in skill
+    assert "plan_audit_unknown" in skill and "plan_audit_failed" in skill
 
 
 def test_verification_skill_path_is_strict_regular_non_symlink(tmp_path, monkeypatch):
@@ -1095,6 +1099,145 @@ def _plan_v3() -> dict:
         "tone_curve": "全局 tone curve 保持当前源帧",
     }
     return plan
+
+
+def test_plan_audit_is_source_bound_and_fails_closed_per_frame():
+    plan = _plan_v3()
+    inventory = [
+        {
+            "segment_index": 0,
+            "frame_index": index,
+            "frame_name": f"{index:02d}.png",
+            "source_sha256": str(index) * 64,
+        }
+        for index in (1, 2)
+    ]
+    receipt = image_optimization.freeze_plan_audit_inputs(
+        plan, frame_inventory=inventory
+    )
+    assert set(receipt) == {
+        "version", "plan_sha256", "continuity_sha256", "frames", "sha256"
+    }
+    assert receipt["plan_sha256"] == image_optimization.plan_sha256(plan)
+    assert receipt["frames"] == inventory
+
+    def verdict(status: str, reason: str | None) -> dict:
+        return {
+            "version": 3,
+            "phase": "plan_audit",
+            "plan_sha256": receipt["plan_sha256"],
+            "continuity_sha256": receipt["continuity_sha256"],
+            "audit_input_sha256": receipt["sha256"],
+            "passed": status == "pass",
+            "reason": reason,
+            "frame_checks": [
+                {
+                    "segment_index": item["segment_index"],
+                    "frame_index": item["frame_index"],
+                    "source_sha256": item["source_sha256"],
+                    "body_closure": _check(status),
+                    "scene_closure": _check(status),
+                    "entity_closure": _check(status),
+                    "relation_closure": _check(status),
+                }
+                for item in receipt["frames"]
+            ],
+        }
+
+    passed = verdict("pass", None)
+    assert image_optimization.canonical_plan_audit_verdict(
+        passed, plan, receipt
+    ) == passed
+
+    failed = verdict("fail", "plan_audit_failed")
+    assert image_optimization.canonical_plan_audit_verdict(
+        failed, plan, receipt
+    )["passed"] is False
+
+    unknown = verdict("unknown", "plan_audit_unknown")
+    assert image_optimization.canonical_plan_audit_verdict(
+        unknown, plan, receipt
+    )["reason"] == "plan_audit_unknown"
+
+    tampered = deepcopy(receipt)
+    tampered["frames"][0]["source_sha256"] = "3" * 64
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_audit_verdict(passed, plan, tampered)
+
+
+def test_plan_audit_stages_only_receipted_source_frames(tmp_path):
+    session = tmp_path / "session"
+    source = session / "source"
+    source.mkdir(parents=True)
+    frames = []
+    for index in (1, 2):
+        path = source / f"{index:02d}.png"
+        path.write_bytes(_png(index))
+        frames.append(path)
+    plan = _plan_v3()
+    inventory = [
+        {
+            "segment_index": 0,
+            "frame_index": index,
+            "frame_name": path.name,
+            "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for index, path in enumerate(frames, 1)
+    ]
+    receipt = image_optimization.freeze_plan_audit_inputs(
+        plan, frame_inventory=inventory
+    )
+    output = {
+        "version": 3,
+        "phase": "plan_audit",
+        "plan_sha256": receipt["plan_sha256"],
+        "continuity_sha256": receipt["continuity_sha256"],
+        "audit_input_sha256": receipt["sha256"],
+        "passed": True,
+        "reason": None,
+        "frame_checks": [
+            {
+                "segment_index": item["segment_index"],
+                "frame_index": item["frame_index"],
+                "source_sha256": item["source_sha256"],
+                "body_closure": _check(),
+                "scene_closure": _check(),
+                "entity_closure": _check(),
+                "relation_closure": _check(),
+            }
+            for item in inventory
+        ],
+    }
+    runner = _Runner(output)
+
+    assert image_optimization.generate_plan_audit_verdict(
+        runner,
+        plan,
+        receipt,
+        [{"index": 0, "source_keyframes_dir": source}],
+        session_dir=session,
+    ) == output
+    assert runner.calls[0]["request"] == {
+        "phase": "plan_audit",
+        "plan_sha256": receipt["plan_sha256"],
+        "continuity_sha256": receipt["continuity_sha256"],
+        "audit_input_sha256": receipt["sha256"],
+        "segment_indices": [0],
+    }
+    assert "work/segments/0/source/01.png" in runner.calls[0]["files"]
+    assert not any("output" in name for name in runner.calls[0]["files"])
+
+    frames[0].write_bytes(_png(9))
+    rejected = _Runner(output)
+    with pytest.raises(ValueError):
+        image_optimization.generate_plan_audit_verdict(
+            rejected,
+            plan,
+            receipt,
+            [{"index": 0, "source_keyframes_dir": source}],
+            session_dir=session,
+        )
+    assert rejected.calls == []
 
 
 @pytest.mark.parametrize(

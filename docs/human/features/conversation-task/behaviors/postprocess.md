@@ -31,6 +31,7 @@ links: [conversation-task, result-display]
 - 页面将单段/多段提示词收敛为同一个三态工作区：“展开生成提示词 / 展开段台词 / 展开图片优化”。三个按钮等宽并排且窄屏允许文字换行；工作区共用一个文本区域。短视频生成提示词与图片优化可编辑，长视频的逐段生成提示词和段台词只读。
 - 图片优化编辑必须同时满足 `postprocess_capabilities.optimize_image=true`；即使异常详情带回提示词，能力为 false 时也只读且不能发 PATCH。短视频逻辑段号为 0，长视频段号必须为正整数，长视频出现 0 或非法段号时 fail closed。
 - v3 双目标计划的编译提示词只提供查看和复制，且每个冻结帧各有独立提示词，不能由自由文本删除人物、场景、光色或关系硬约束；历史 v1/v2 提示词继续原 CAS 行为，receipt 不迁移、不重写。
+- v3 在任何 provider 提交前以同一 `image-postprocess` 执行 `phase=plan_audit`：只读取 canonical plan、冻结 audit receipt 与对应 source 帧，逐帧验 `body_closure/scene_closure/entity_closure/relation_closure`。审计输入、verdict 和每帧检查均绑定 plan SHA、continuity SHA、audit input SHA 与每帧 source SHA；任一 fail/unknown 为 `passed=false`，调用方不得提交 provider。该阶段不修图、不补写 plan、不自动 replan；若后续启用 replan，只能在 audit failed 后显式执行一次，并保留原 plan、原 source 和 audit receipt。
 - 当前选项为 `remove_subtitle`、`remove_brand`、`optimize_image`；`change_bg/face_hold` 已删除。旧页面请求只得到纯文本刷新提示，不会静默采用或自动重试。
 - `remove_subtitle` 映射 `full_screen_text_erase`；`remove_brand` 作为兼容字段映射 `full_screen_icon_erase`，只承诺清理常见 Logo/图标。双选会执行两个独立付费阶段。
 - 三个阶段在每段内严格按“文字/字幕 → Logo/图标 → 图片优化”执行。v3 `plan` 以连续性与现实合理性优先于替换幅度；人物与真实新场景仍是不可降级的双目标，任一目标与可见事实冲突时在付费前 `eligible=false`。短视频 `[0]` 使用相同结构，不能成功 no-op。
