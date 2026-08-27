@@ -17,7 +17,9 @@ description: 为冻结关键帧生成 v4 人物与真实新场景双替换的结
 
 人物与真实新场景必须同时替换，短视频 `[0]` 也执行人物与场景双替换；不可用成功 no-op 降级。新人物身份、服装款式和局部主色明显改变，但保留源帧可见的呈现范围、动作、姿态、尺度与叙事作用。新场景保持叙事用途，同时让语义、可见形状与空间结构、纵深、布局及局部材质或固有色发生真实变化；不得仅调色、换纹理或给原结构换皮。
 
-同一人物或场景的目标包逐段复用，不逐帧重设计、不由编辑结果递推。`scene_plans[].continuity_graph` 是同一 `SCENE` 跨段唯一的目标组件 registry：图恰含 `components/topology/views`，不引用逐帧 source `ENTITY_ID`。组件从 `COMPONENT_01` 连续升序，每项恰含非空 `component_id/target_spec`；topology 仅 `supports/contacts/separate_from`，端点闭合、排序、无自指/重复/环。views 按全项目 `(segment_index,frame_index)` 升序且覆盖所属场景的全部冻结帧；每项恰含 `segment_index/frame_index/transition_from_previous/observations/view_relations`。observations 对全部组件恰好一次，visibility 只许 `full/partial/edge_fragment/occluded/out_of_view`；view relations 仅 `in_front_of/occludes`，端点当前可见、排序、无自指/重复/环。`full` 是完整边界在画内，`partial` 是前景遮挡但不触画边，`edge_fragment` 是触及或被画边截断且优先，`occluded` 是完全遮挡。same_camera 的 `occluded`→`out_of_view` 只按当前 source 可见性写入 source-preserve/no-invention，不得作为内容 schema 拒绝。
+同一人物或场景的目标包逐段复用，不逐帧重设计、不由编辑结果递推。`scene_plans[].continuity_graph` 是同一 `SCENE` 跨段唯一的目标组件 registry：图恰含 `components/topology/views`，不引用逐帧 source `ENTITY_ID`。组件从 `COMPONENT_01` 连续升序，每项恰含非空 `component_id/target_spec`；topology 仅 `supports/contacts/separate_from`，端点闭合、排序、无自指/重复/环。views 按全项目 `(segment_index,frame_index)` 升序且覆盖所属场景的全部冻结帧；每项恰含 `segment_index/frame_index/transition_from_previous/observations/view_relations`。observations 必须按 `COMPONENT_01...` 顺序对全部组件恰好一次，visibility 只许 `full/partial/edge_fragment/occluded/out_of_view`；view relations 按 `(subject_id,predicate,object_id)` 升序，且仅 `in_front_of/occludes`，端点当前可见、无自指/重复/环。`full` 是完整边界在画内，`partial` 是前景遮挡但不触画边，`edge_fragment` 是触及或被画边截断且优先，`occluded` 是完全遮挡。
+
+`partial` 或 `occluded` 只能表示目标场景组件之间已知的遮挡：同一 view 的 `occludes` 必须以可见组件为 subject、该 `partial`/`occluded` 组件为 object。若没有这条目标组件关系，不得用 `partial` 或 `occluded` 表达人物遮挡、未知遮挡或画外裁切；画边使用 `edge_fragment`，其余情况在当前帧 `occlusion_order` 和 `source-preserve/no-invention` 写保留约束。same_camera 的 `occluded`→`out_of_view` 只按当前 source 可见性写入 source-preserve/no-invention，不得作为内容 schema 拒绝。
 
 每帧只写当前源帧直接可见的事实：人体、面部拓扑、服装边界与裁切碎片形成闭包，所有可见碎片写入 `visible_body_parts`；非人物实体、独立物理面及画边碎片逐一写入 `non_person_entity_ledger`，不同边界、法向、深度层或支撑链的物理面不得合并。`contact_points`、`contacts`、`supports`、`occludes` 只写双方边界和层次同帧直接可见的确定事实；不从相邻帧、reference 或编辑结果补证，不把候选关系写入合同。
 
@@ -25,7 +27,15 @@ description: 为冻结关键帧生成 v4 人物与真实新场景双替换的结
 
 每段 `frame_constraints` 按帧号升序且一一覆盖全部冻结帧，无重复遗漏；每项恰含 `frame_index`、`visible_body_parts`、`pose_skeleton`、`contact_points`、`occlusion_order`、`out_of_frame_crop`、`non_person_entity_ledger`、`dominant_palette_contract`。字段相互一致，`partial/cropped` 不得写成 `absent/fully-in-frame`。ledger 恰含 `entities/relations`：实体恰含 `entity_id/description/visibility`，当前帧从 `ENTITY_01` 连续升序，description 唯一且说明可见形态与画面位置；关系恰含 `subject_id/predicate/object_id`，端点只许当前帧实体或当前帧可观察 PERSON，predicate 只许 `supports/contacts/separate_from/occludes`。`supports`=subject 支撑 object，`occludes`=subject 位于前方并遮挡 object，`contacts/separate_from` 无向且端点字典序；关系按 `(subject_id,predicate,object_id)` 升序，禁止重复、冲突和有向环。
 
-`dominant_palette_contract` 恰含 `area_weighted_warm_cool_family` 与 `saturation_style`。后端从冻结 source 像素计算并覆盖此精确 Lab 合同；模型不得自报或决定精确 Lab 合同。每段 `photometric_contract` 恰含 `light_direction/light_quality/exposure_or_intensity/wb_cct/global_contrast/tone_curve`。所有帧保持画幅、裁切、机位、镜头、透视、构图、焦点、景深、全局光源方向/软硬/强度、曝光、白平衡、色温、整体色调、全局对比与 tone curve；目标人物和新场景的局部固有色必须明显不同，但大面积新区域保持 source 的整帧冷暖家族与饱和度风格，不得翻转整帧冷暖感知，新几何只产生与原光源一致的局部阴影或反射。
+`dominant_palette_contract` 恰含 `area_weighted_warm_cool_family` 与 `saturation_style`。为完成 v4 schema，一律写固定占位 `balanced`/`natural`；这不是测量值，只是完成 schema，模型不得自报或决定精确 Lab 合同，后端从冻结 source 像素计算并覆盖。每段 `photometric_contract` 恰含 `light_direction/light_quality/exposure_or_intensity/wb_cct/global_contrast/tone_curve`。所有帧保持画幅、裁切、机位、镜头、透视、构图、焦点、景深、全局光源方向/软硬/强度、曝光、白平衡、色温、整体色调、全局对比与 tone curve；目标人物和新场景的局部固有色必须明显不同，但大面积新区域保持 source 的整帧冷暖家族与饱和度风格，不得翻转整帧冷暖感知，新几何只产生与原光源一致的局部阴影或反射。
+
+## 机械构造顺序
+
+1. 从 request 原样取 `segment_indices`、每段真实帧号和 `transition_skeleton`；数组按段号、帧号和 ID 升序。每个 view 逐字复制对应的 `transition_from_previous`，绝不自行填写 transition。
+2. 先建立稳定的 `PERSON_01...` 与 `SCENE_01...` 目标包，再逐段写完整 persons、scene 和 `layout_reference_frame_index`。任何一帧只要人物有可见部分就把该人物写为 `replace` 并列入该帧；不可见才写完整的 `not_observable` 三元组。内容不清楚时描述可见范围和 `source-preserve/no-invention`，不删除轨道或计划。
+3. 为每帧写八个 `frame_constraints` 键。每帧都至少一个实体和一条关系：先登记当前帧最明确的非人物可见实体或环境区域；只在双方边界可见时写 `contacts`、`supports` 或 `occludes`，否则用真实可见的 `separate_from`。所有 ledger 实体必须恰好参与一条或多条已排序关系；不要用空 ledger、候选关系或未解析 ID。
+4. 为每个 `SCENE` 建一份连续图。components、observations 和 views 全量覆盖而不省略；若需要 `partial` 或 `occluded`，同一 view 同时写入满足上述端点规则的 `occludes`。没有可证实的目标组件遮挡时，使用 `full`、`edge_fragment` 或 `out_of_view`，并把源帧遮挡保留在 frame facts。
+5. 最后逐字段自校验顶层、计划项、段、帧、ledger、graph view 与关系的键集合、枚举、ID、引用、排序、无重复及覆盖数；不以内容疑问删字段。只输出一个 UTF-8 裸 JSON 到 `work/image_optimization.json`，没有 Markdown、解释或第二个文件。
 
 输出前逐字段自校验：顶层、段、帧与嵌套项键集合正确，ID/排序/帧覆盖/transition skeleton 精确，所有 `source-preserve/no-invention` 约束落实到已有字段。内容不确定不得转化为拒绝。
 

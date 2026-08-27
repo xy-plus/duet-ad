@@ -961,6 +961,28 @@ def test_skill_preflights_backend_exact_fields_and_current_frame_evidence():
         assert rule in human
 
 
+def test_skill_mechanically_constructs_a_v4_payload_without_protocol_gaps():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+
+    for document in (skill, human):
+        for rule in (
+            "机械构造顺序",
+            "逐字复制对应的 `transition_from_previous`",
+            "`partial` 或 `occluded`",
+            "同一 view 的 `occludes`",
+            "`balanced`/`natural`",
+            "每帧都至少一个实体和一条关系",
+            "只输出一个 UTF-8 裸 JSON",
+        ):
+            assert rule in document
+
+    assert "不是测量值，只是完成 schema" in skill
+    assert "不得用 `partial` 或 `occluded` 表达人物遮挡" in skill
+
+
 def test_skill_requires_current_frame_visible_coverage_without_admission_gate():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
     human = Path(
