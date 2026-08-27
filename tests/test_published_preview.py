@@ -180,10 +180,18 @@ def test_published_preview_is_read_only_on_every_mutating_route(
     tmp_path, monkeypatch
 ):
     source, target, meta, _receipt = _published_copy(tmp_path)
+    ordinary_cid = "b" * 32
+    ordinary_meta = dict(meta)
+    ordinary_meta["id"] = ordinary_cid
+    ordinary_meta.pop("published_preview_receipt")
+    _write(
+        target.parent / ordinary_cid / "meta.json",
+        json.dumps(ordinary_meta, sort_keys=True).encode(),
+    )
     settings = Settings(
         access_token="secret",
         data_dir=target.parent,
-        enable_h3_submit=True,
+        enable_h3_submit=False,
         enable_mediakit_erase=True,
     )
     monkeypatch.setattr(
@@ -231,6 +239,11 @@ def test_published_preview_is_read_only_on_every_mutating_route(
                 json={},
             ),
         )
+        ordinary_submit = client.post(
+            f"/api/conversations/{ordinary_cid}/submit",
+            headers=headers,
+            json={},
+        )
     assert [(response.status_code, response.json()) for response in requests] == [
         (409, {"detail": "read_only"}),
         (409, {"detail": "read_only"}),
@@ -238,3 +251,5 @@ def test_published_preview_is_read_only_on_every_mutating_route(
         (409, {"detail": "read_only"}),
         (409, {"detail": "read_only"}),
     ]
+    assert ordinary_submit.status_code == 501
+    assert ordinary_submit.json() == {"detail": "H3 submission is disabled."}
