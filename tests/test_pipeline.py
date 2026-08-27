@@ -82,6 +82,9 @@ def _short_dual_target_plan():
 def _short_dual_target_plan_v3(*, frame_count: int = 3):
     plan = deepcopy(_short_dual_target_plan())
     plan["version"] = 3
+    plan["segments"][0]["persons"][0]["observable_frames"] = list(
+        range(1, frame_count + 1)
+    )
     plan["segments"][0].update(
         frame_constraints=[
             {
@@ -91,6 +94,18 @@ def _short_dual_target_plan_v3(*, frame_count: int = 3):
                 "contact_points": f"frame {index} contact points",
                 "occlusion_order": f"frame {index} occlusion order",
                 "out_of_frame_crop": f"frame {index} out of frame crop",
+                "non_person_entity_ledger": {
+                    "entities": [{
+                        "entity_id": "ENTITY_01",
+                        "description": f"frame {index} visible non-person entity",
+                        "visibility": "full",
+                    }],
+                    "relations": [{
+                        "subject_id": "ENTITY_01",
+                        "predicate": "contacts",
+                        "object_id": "PERSON_01",
+                    }],
+                },
             }
             for index in range(1, frame_count + 1)
         ],
