@@ -2495,11 +2495,11 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/conversations/{cid}/files/{name:path}", dependencies=[Depends(require_auth)])
     async def get_file(cid: str, name: str):
-        # A v4 project writes canonical files only after final verification, but
+        # A v4 project writes canonical files only after technical generation, but
         # the filesystem endpoint is otherwise able to serve a staged path
         # before the public manifest is committed.  Keep those files private
-        # until the project-level manifest and verification receipt are both
-        # visible; MediaKit-only and legacy paths retain their old behavior.
+        # until the project-level manifest is visible.  External quality
+        # acceptance is advisory for the gallery and remains an H3-only gate.
         meta = storage.load_meta(settings.data_dir, cid)
         frozen = meta.get("_postprocess_receipt") if isinstance(meta, dict) else None
         post = meta.get("postprocess") if isinstance(meta, dict) else None
@@ -2516,7 +2516,6 @@ def create_app(settings: Settings) -> FastAPI:
         )
         if is_v4_optimized and is_canonical_postprocessed and (
             not isinstance(post, dict) or post.get("status") != "done"
-            or not isinstance(meta.get("_image_verification"), dict)
         ):
             raise HTTPException(status_code=404, detail="not found")
         path = storage.resolve_file(settings.data_dir, cid, name)

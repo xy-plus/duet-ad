@@ -12,6 +12,8 @@ import tempfile
 from copy import deepcopy
 from pathlib import Path
 
+import cv2
+
 from app.codex_runner import CodexError
 from app.config import (
     SEEDREAM_EDIT_MODES,
@@ -24,6 +26,14 @@ MAX_CONTINUITY_BYTES = 32 * 1024
 MAX_PROJECT_OUTPUT_OVERHEAD_BYTES = 64 * 1024
 _ROOT = Path(__file__).resolve().parents[1]
 _SKILL = _ROOT / "skills" / "image-postprocess" / "SKILL.md"
+PALETTE_METRIC_ALGORITHM = "area-weighted-cie-lab-hsv-v1"
+PALETTE_METRIC_THRESHOLDS = {
+    "lab_b_star_neutral": 128.0,
+    "lab_b_star_scale": 127.0,
+    "warm_cool_delta": 0.05,
+    "muted_saturation": 0.16,
+    "vivid_saturation": 0.58,
+}
 _ELEMENT_KINDS = {
     "PERSON": "person",
     "SUBJECT": "subject",
@@ -312,6 +322,8 @@ def _canonical_plan_v2(
     value: object,
     expected_indices: list[int] | None = None,
     frame_counts: dict[int, int] | None = None,
+    *,
+    allow_empty_people: bool = False,
 ) -> dict:
     keys = {
         "version",
@@ -364,7 +376,11 @@ def _canonical_plan_v2(
         )
 
     raw_people = value.get("person_plans")
-    if not isinstance(raw_people, list) or not 1 <= len(raw_people) <= 20:
+    if (
+        not isinstance(raw_people, list)
+        or len(raw_people) > 20
+        or not allow_empty_people and not raw_people
+    ):
         raise ImageOptimizationOutputError(
             "image optimization output is missing or invalid"
         )
@@ -985,24 +1001,13 @@ def _canonical_scene_continuity_graph(
             raise ImageOptimizationOutputError(
                 "image optimization output is missing or invalid"
             )
-        if view["transition_from_previous"] == "same_camera":
-            prior = view_by_key.get(previous)
-            if prior is None:
-                raise ImageOptimizationOutputError(
-                    "image optimization output is missing or invalid"
-                )
-            prior_visibility = {
-                item["component_id"]: item["visibility"]
-                for item in prior["observations"]
-            }
-            if any(
-                prior_visibility[item["component_id"]] != "out_of_view"
-                and item["visibility"] == "out_of_view"
-                for item in view["observations"]
-            ):
-                raise ImageOptimizationOutputError(
-                    "image optimization output is missing or invalid"
-                )
+        if (
+            view["transition_from_previous"] == "same_camera"
+            and previous not in view_by_key
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
     if any(
         all(
             next(
@@ -1021,7 +1026,7 @@ def _canonical_scene_continuity_graph(
 
 
 def _canonical_non_person_entity_ledger(
-    value: object, allowed_person_ids: set[str],
+    value: object, allowed_person_ids: set[str], *, allow_sparse: bool = False,
 ) -> dict:
     if (
         not isinstance(value, dict)
@@ -1039,11 +1044,10 @@ def _canonical_non_person_entity_ledger(
     raw_relations = value.get("relations")
     if (
         not isinstance(raw_entities, list)
-        or not raw_entities
         or len(raw_entities) > 30
         or not isinstance(raw_relations, list)
-        or not raw_relations
         or len(raw_relations) > 60
+        or not allow_sparse and (not raw_entities or not raw_relations)
     ):
         raise ImageOptimizationOutputError(
             "image optimization output is missing or invalid"
@@ -1132,12 +1136,14 @@ def _canonical_non_person_entity_ledger(
     if relations != sorted(
         relations,
         key=lambda item: (item["subject_id"], item["predicate"], item["object_id"]),
-    ) or any(_contains_directed_cycle(edges) for edges in directed_edges.values()) or {
-        identifier
-        for relation in relations
-        for identifier in (relation["subject_id"], relation["object_id"])
-        if identifier in entity_ids
-    } != entity_ids:
+    ) or any(_contains_directed_cycle(edges) for edges in directed_edges.values()) or (
+        not allow_sparse and {
+            identifier
+            for relation in relations
+            for identifier in (relation["subject_id"], relation["object_id"])
+            if identifier in entity_ids
+        } != entity_ids
+    ):
         raise ImageOptimizationOutputError(
             "image optimization output is missing or invalid"
         )
@@ -1169,7 +1175,9 @@ def _canonical_dominant_palette_contract(value: object) -> dict:
     }
 
 
-def _canonical_frame_constraint(value: object, allowed_person_ids: set[str]) -> dict:
+def _canonical_frame_constraint(
+    value: object, allowed_person_ids: set[str], *, allow_sparse: bool = False,
+) -> dict:
     if not isinstance(value, dict) or set(value) != set(_FRAME_CONSTRAINT_KEYS):
         raise ImageOptimizationOutputError(
             "image optimization output is missing or invalid"
@@ -1186,7 +1194,8 @@ def _canonical_frame_constraint(value: object, allowed_person_ids: set[str]) -> 
             for key in _FRAME_TEXT_CONSTRAINT_KEYS
         },
         "non_person_entity_ledger": _canonical_non_person_entity_ledger(
-            value.get("non_person_entity_ledger"), allowed_person_ids
+            value.get("non_person_entity_ledger"), allowed_person_ids,
+            allow_sparse=allow_sparse,
         ),
         "dominant_palette_contract": _canonical_dominant_palette_contract(
             value.get("dominant_palette_contract")
@@ -1198,6 +1207,8 @@ def _canonical_plan_v3(
     value: object,
     expected_indices: list[int] | None = None,
     frame_counts: dict[int, int] | None = None,
+    *,
+    allow_sparse_facts: bool = False,
 ) -> dict:
     if not isinstance(value, dict) or value.get("version") != 3:
         raise ImageOptimizationOutputError(
@@ -1235,7 +1246,10 @@ def _canonical_plan_v3(
             )
         })
     v2_value["segments"] = v2_segments
-    canonical = _canonical_plan_v2(v2_value, expected_indices, frame_counts)
+    canonical = _canonical_plan_v2(
+        v2_value, expected_indices, frame_counts,
+        allow_empty_people=allow_sparse_facts,
+    )
     if not canonical["eligible"]:
         return {**canonical, "version": 3}
     segments = []
@@ -1254,7 +1268,9 @@ def _canonical_plan_v3(
                 for person in base["persons"]
                 if raw_index in person["observable_frames"]
             }
-            constraint = _canonical_frame_constraint(item, allowed_person_ids)
+            constraint = _canonical_frame_constraint(
+                item, allowed_person_ids, allow_sparse=allow_sparse_facts,
+            )
             index = constraint["frame_index"]
             if (
                 index in seen
@@ -1331,7 +1347,9 @@ def _canonical_plan_v4(
         projected.pop("continuity_graph")
         v3_scenes.append(projected)
     v3_value["scene_plans"] = v3_scenes
-    canonical = _canonical_plan_v3(v3_value, expected_indices, frame_counts)
+    canonical = _canonical_plan_v3(
+        v3_value, expected_indices, frame_counts, allow_sparse_facts=True,
+    )
     if not canonical["eligible"]:
         return {**canonical, "version": 4}
 
@@ -1395,6 +1413,59 @@ def _validated_frames(source: Path) -> list[Path]:
     return frames
 
 
+def source_palette_metric(path: Path) -> dict:
+    """Measure one decoded source canvas for backend-owned prompt facts."""
+    try:
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None or image.size == 0:
+            raise ValueError
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        delta = float((
+            lab[:, :, 2].mean() - PALETTE_METRIC_THRESHOLDS["lab_b_star_neutral"]
+        ) / PALETTE_METRIC_THRESHOLDS["lab_b_star_scale"])
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        saturation = float(hsv[:, :, 1].mean() / 255.0)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except (cv2.error, OSError, ValueError):
+        raise ValueError("invalid image optimization source frame") from None
+    threshold = PALETTE_METRIC_THRESHOLDS["warm_cool_delta"]
+    family = "warm" if delta > threshold else "cool" if delta < -threshold else "balanced"
+    muted = PALETTE_METRIC_THRESHOLDS["muted_saturation"]
+    vivid = PALETTE_METRIC_THRESHOLDS["vivid_saturation"]
+    style = "muted" if saturation < muted else "vivid" if saturation > vivid else "natural"
+    return {
+        "bytes_sha256": digest,
+        "warm_cool_family": family,
+        "saturation_style": style,
+        "mean_lab_b_star": round(delta, 6),
+        "mean_saturation": round(saturation, 6),
+    }
+
+
+def _bind_source_palette_contracts(
+    plan: dict, source_frames: dict[int, list[Path]],
+) -> dict:
+    if plan.get("version") != 4:
+        return plan
+    bound = deepcopy(plan)
+    segments = {item["segment_index"]: item for item in bound["segments"]}
+    if set(source_frames) != set(segments):
+        raise ValueError("invalid image optimization source frames")
+    for index, frames in source_frames.items():
+        constraints = segments[index]["frame_constraints"]
+        if len(frames) != len(constraints):
+            raise ValueError("invalid image optimization source frames")
+        for position, (path, constraint) in enumerate(zip(frames, constraints), 1):
+            if path.name != f"{position:02d}.png" or constraint["frame_index"] != position:
+                raise ValueError("invalid image optimization source frames")
+            metric = source_palette_metric(path)
+            constraint["dominant_palette_contract"] = {
+                "area_weighted_warm_cool_family": metric["warm_cool_family"],
+                "saturation_style": metric["saturation_style"],
+            }
+    return bound
+
+
 def _canonical_prompt(value: object) -> str:
     if not isinstance(value, str):
         raise ImageOptimizationOutputError(
@@ -1414,16 +1485,24 @@ def _plan_json(plan: dict) -> str:
     )
 
 
-def plan_sha256(plan: dict) -> str:
-    canonical = _canonical_plan(plan)
+def _canonical_plan_sha256(canonical: dict) -> str:
     return hashlib.sha256(_plan_json(canonical).encode("utf-8")).hexdigest()
 
 
-def compile_segment_prompts(plan: dict, edit_mode: str) -> dict[int, str]:
+def plan_sha256(plan: dict) -> str:
+    canonical = _canonical_plan(plan)
+    return _canonical_plan_sha256(canonical)
+
+
+def compile_segment_prompts(
+    plan: dict, edit_mode: str, *, allow_empty_people: bool = False,
+) -> dict[int, str]:
     """Compile an eligible semantic v2 plan into immutable provider prompts."""
     if edit_mode not in SEEDREAM_EDIT_MODES:
         raise ValueError("unsupported image optimization edit mode")
-    canonical = _canonical_plan_v2(plan)
+    canonical = _canonical_plan_v2(
+        plan, allow_empty_people=allow_empty_people,
+    )
     if not canonical["eligible"]:
         raise ImageOptimizationIneligibleError(canonical["reason"])
     people = {item["id"]: item for item in canonical["person_plans"]}
@@ -1446,7 +1525,10 @@ def compile_segment_prompts(plan: dict, edit_mode: str) -> dict[int, str]:
                     boundary=member["boundary"],
                 )
             )
-        person_clause = "替换人物：" + "；".join(person_edits)
+        person_clause = (
+            "替换人物：" + "；".join(person_edits)
+            if person_edits else "不替换人物"
+        )
         if hidden_people:
             person_clause += "；本段不可观察的冻结主人物不得被新增或补造"
         scene_ref = segment["scene"]
@@ -1505,7 +1587,9 @@ def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str
     for segment in base_plan["segments"]:
         segment.pop("frame_constraints")
         segment.pop("photometric_contract")
-    segment_prompts = compile_segment_prompts(base_plan, edit_mode)
+    segment_prompts = compile_segment_prompts(
+        base_plan, edit_mode, allow_empty_people=canonical["version"] == 4,
+    )
     continuity_by_scene = {
         scene["id"]: scene.get("continuity_graph")
         for scene in canonical["scene_plans"]
@@ -1833,56 +1917,14 @@ def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
         }
 
     segments = {item["segment_index"]: item for item in canonical["segments"]}
-    scene_by_segment = {
-        segment["segment_index"]: segment["scene"]["scene_id"]
-        for segment in canonical["segments"]
-    }
-
-    def visible_scene_alternate(scene_id: str, primary: tuple[int, int]) -> tuple[int, int] | None:
-        candidates = [
-            (frame["segment_index"], frame["frame_index"])
-            for frame in frames
-            if frame["scene_id"] == scene_id
-            and (frame["segment_index"], frame["frame_index"]) != primary
-            and any(item["visibility"] in {"full", "partial", "edge_fragment"}
-                    for item in frame["scene_continuity_view"]["observations"])
-        ]
-        return min(candidates, default=None)
-
-    def person_alternate(person: dict) -> tuple[int, int] | None:
-        reference = person["reference"]
-        primary = (reference["segment_index"], reference["frame_index"])
-        candidates = sorted(
-            (segment["segment_index"], frame_index)
-            for segment in canonical["segments"]
-            for instance in segment["persons"]
-            if instance["id"] == person["id"] and instance["state"] == "replace"
-            for frame_index in instance["observable_frames"]
-            if (segment["segment_index"], frame_index) != primary
-        )
-        return candidates[0] if candidates else None
-
     # Every paid node is ordered and named before runtime.  Runtime may only
     # replay this immutable DAG, never allocate an order with a dynamic max().
+    # Quality-review-only alternate/person packs are deliberately excluded:
+    # valid generation must not depend on a model-facing acceptance topology.
     node_specs: list[tuple[str, str, int, int]] = []
     for scene in canonical["scene_plans"]:
         reference = scene["reference"]
         node_specs.append((scene["id"], "global", reference["segment_index"], reference["frame_index"]))
-    for scene in canonical["scene_plans"]:
-        reference = scene["reference"]
-        alternate = visible_scene_alternate(
-            scene["id"], (reference["segment_index"], reference["frame_index"])
-        )
-        if alternate is not None:
-            node_specs.append((scene["id"], "pack-alternate", *alternate))
-    for person in canonical["person_plans"]:
-        reference = person["reference"]
-        alternate = person_alternate(person)
-        if alternate is not None:
-            node_specs.extend([
-                (scene_by_segment[reference["segment_index"]], f"person-{person['id']}-primary", reference["segment_index"], reference["frame_index"]),
-                (scene_by_segment[alternate[0]], f"person-{person['id']}-alternate", *alternate),
-            ])
     layout_keys = set()
     for scene in canonical["scene_plans"]:
         for segment_index in scene["segments"]:
@@ -1894,10 +1936,11 @@ def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
             node_specs.append((scene["id"], f"layout-{segment_index:04d}", segment_index, frame_index))
     for segment in canonical["segments"]:
         index = segment["segment_index"]
+        scene_id = segment["scene"]["scene_id"]
         for frame in segment["frame_constraints"]:
             frame_index = frame["frame_index"]
             if (index, frame_index) not in layout_keys:
-                node_specs.append((scene_by_segment[index], f"fanout-{index:04d}-{frame_index:04d}", index, frame_index))
+                node_specs.append((scene_id, f"fanout-{index:04d}-{frame_index:04d}", index, frame_index))
     if len({(scene_id, label) for scene_id, label, _segment, _frame in node_specs}) != len(node_specs):
         raise ValueError("invalid image optimization anchor schedule")
     nodes = [
@@ -2153,10 +2196,18 @@ def _canonical_project_output(
     indices: list[int],
     edit_mode: str,
     frame_counts: dict[int, int],
+    *,
+    source_frames: dict[int, list[Path]] | None = None,
 ) -> tuple[dict, dict]:
     plan = _canonical_plan(value, indices, frame_counts)
     if not plan["eligible"]:
-        raise ImageOptimizationIneligibleError(plan["reason"])
+        # A plan-phase model is a compiler, not the product's content judge.
+        # Refusal-shaped legacy output is a retryable protocol violation.
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    if source_frames is not None:
+        plan = _bind_source_palette_contracts(plan, source_frames)
     if plan["version"] in {3, 4}:
         return plan, compile_frame_prompts(plan, edit_mode)
     return plan, compile_segment_prompts(plan, edit_mode)
@@ -2275,6 +2326,9 @@ def generate_project_prompts(
                 indices,
                 edit_mode,
                 {segment["index"]: len(frames) for segment, frames in prepared},
+                source_frames={
+                    segment["index"]: frames for segment, frames in prepared
+                },
             )
             if plan.get("version") != expected_version:
                 raise ImageOptimizationOutputError(
@@ -2735,8 +2789,12 @@ def _verification_reason(segments: list[dict], project_checks: dict) -> str | No
     return None
 
 
-def _canonical_verification_v2(value: object, plan: dict) -> dict:
-    canonical_plan = _canonical_plan(plan)
+def _canonical_verification_v2(
+    value: object, plan: dict, *, allow_empty_people: bool = False,
+) -> dict:
+    canonical_plan = _canonical_plan_v2(
+        plan, allow_empty_people=allow_empty_people,
+    )
     if not canonical_plan["eligible"]:
         raise ImageOptimizationIneligibleError(canonical_plan["reason"])
     if not isinstance(value, dict) or set(value) != {
@@ -2753,7 +2811,7 @@ def _canonical_verification_v2(value: object, plan: dict) -> dict:
             "image verification output is missing or invalid"
         )
     if (
-        value.get("plan_sha256") != plan_sha256(canonical_plan)
+        value.get("plan_sha256") != _canonical_plan_sha256(canonical_plan)
         or value.get("segment_indices") != canonical_plan["segment_indices"]
         or not isinstance(value.get("passed"), bool)
     ):
@@ -2889,7 +2947,7 @@ def _canonical_verification_v2(value: object, plan: dict) -> dict:
     return {
         "version": 2,
         "phase": "verify",
-        "plan_sha256": plan_sha256(canonical_plan),
+        "plan_sha256": _canonical_plan_sha256(canonical_plan),
         "segment_indices": list(canonical_plan["segment_indices"]),
         "passed": passed,
         "reason": reason,
@@ -3223,7 +3281,7 @@ def _v3_common_projection(value: dict, plan: dict) -> dict:
         segment.pop("photometric_contract")
     base = deepcopy(value)
     base["version"] = 2
-    base["plan_sha256"] = plan_sha256(base_plan)
+    base["plan_sha256"] = _canonical_plan_sha256(base_plan)
     try:
         for segment in base["segments"]:
             segment.pop("frame_checks")
@@ -3257,8 +3315,11 @@ def _v3_common_projection(value: dict, plan: dict) -> dict:
 
 def _canonical_verification_v3(
     value: object, plan: dict, *, derive_claims: bool = False,
+    allow_sparse_facts: bool = False,
 ) -> dict:
-    canonical_plan = _canonical_plan_v3(plan)
+    canonical_plan = _canonical_plan_v3(
+        plan, allow_sparse_facts=allow_sparse_facts,
+    )
     keys = {
         "version", "phase", "plan_sha256", "segment_indices", "passed", "reason",
         "segments", "project_checks",
@@ -3268,7 +3329,7 @@ def _canonical_verification_v3(
         or set(value) != keys
         or value.get("version") != 3
         or value.get("phase") != "verify"
-        or value.get("plan_sha256") != plan_sha256(canonical_plan)
+        or value.get("plan_sha256") != _canonical_plan_sha256(canonical_plan)
         or value.get("segment_indices") != canonical_plan["segment_indices"]
         or not isinstance(value.get("passed"), bool)
         or not isinstance(value.get("segments"), list)
@@ -3278,7 +3339,9 @@ def _canonical_verification_v3(
             "image verification output is missing or invalid"
         )
     common_value, common_plan = _v3_common_projection(value, canonical_plan)
-    common = _canonical_verification_v2(common_value, common_plan)
+    common = _canonical_verification_v2(
+        common_value, common_plan, allow_empty_people=allow_sparse_facts,
+    )
     segments = []
     any_unknown = common["reason"] == "verification_unknown"
     any_body_failure = False
@@ -3365,7 +3428,7 @@ def _canonical_verification_v3(
     return {
         "version": 3,
         "phase": "verify",
-        "plan_sha256": plan_sha256(canonical_plan),
+        "plan_sha256": _canonical_plan_sha256(canonical_plan),
         "segment_indices": list(canonical_plan["segment_indices"]),
         "passed": passed,
         "reason": reason,
@@ -3381,13 +3444,13 @@ def _v4_common_projection(value: dict, plan: dict) -> dict:
         scene.pop("continuity_graph")
     v3_value = deepcopy(value)
     v3_value["version"] = 3
-    v3_value["plan_sha256"] = plan_sha256(v3_plan)
+    v3_value["plan_sha256"] = _canonical_plan_sha256(v3_plan)
     try:
         for segment in v3_value["segments"]:
             for frame in segment["frame_checks"]:
                 frame.pop("scene_continuity_view")
         return _canonical_verification_v3(
-            v3_value, v3_plan, derive_claims=True
+            v3_value, v3_plan, derive_claims=True, allow_sparse_facts=True,
         )
     except (KeyError, TypeError, AttributeError, ImageOptimizationOutputError):
         raise ImageOptimizationOutputError(
