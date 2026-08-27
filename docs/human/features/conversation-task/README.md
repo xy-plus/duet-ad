@@ -18,6 +18,7 @@ links: []
 原视频
   -> video-maker Skill
   -> segments[N>=1]，每段 9 张原始关键帧 + 视频提示词
+  -> 可选 MediaKit 去字幕和/或去 Logo；保持帧数、顺序和 segment 归属不变
   -> image-postprocess Skill
   -> 每段 9 张优化关键帧
   -> Web 用户确认图片并设置台词、声音呈现、画幅、清晰度和适配方式
@@ -29,6 +30,8 @@ links: []
 ```
 
 硬约束：
+
+- 原有去字幕、去 Logo 能力必须保留。它们是 `image-postprocess` 前的可选关键帧预处理，不是新 Skill；未选择时原始关键帧直接进入图片优化。选择两项时固定按去字幕后去 Logo 执行，处理结果仍须每段恰好 9 张并保持原顺序。
 
 - 全链只允许调用三个 Skill：`video-maker` 负责关键词/片段分析、每段 9 张关键帧和旧视频提示词；`image-postprocess` 只负责关键帧图片优化；`video-prompt-fusion` 只负责最终提示词融合。不得派生 Audio、Binding、Speaker 或其他 Skill/phase。
 - 收口后的 `video-maker` Skill 权威 SHA-256 为 `0bbb22baeb8f14fef737b279e2ab2e8f70bf8965d41b182f1987537e1e3e4785`；不得恢复已删除的音画绑定、说话人可见性或图片后融合 phase。
