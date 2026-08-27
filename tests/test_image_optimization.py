@@ -1709,7 +1709,8 @@ def test_v4_single_frame_valid_input_reaches_anchor_generation_without_quality_p
         session_dir=cdir,
     )
     assert plan["person_plans"] == []
-    assert "不得新增、删除或替换" in prompts[0][1]
+    assert plan["segments"][0]["persons"] == []
+    assert "不替换人物" in prompts[0][1]
     _freeze_v4_image_optimization(settings, cid, plan)
     posts = []
 
@@ -1788,6 +1789,77 @@ def test_v3_failed_quality_acceptance_publishes_but_remains_blocked_from_h3(
             cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
             settings=settings,
         )
+
+
+def test_v4_generic_fallback_replaces_only_frames_with_backend_person_evidence(
+    tmp_path, monkeypatch,
+):
+    segment_dirs = []
+    for segment_index, frame_count in ((1, 2), (2, 1)):
+        directory = tmp_path / f"segment-{segment_index}" / "keyframes"
+        directory.mkdir(parents=True)
+        for frame_index in range(1, frame_count + 1):
+            (directory / f"{frame_index:02d}.png").write_bytes(_png())
+        segment_dirs.append(directory)
+
+    monkeypatch.setattr(
+        image_optimization,
+        "_source_has_observable_person",
+        lambda path: path.parent.parent.name == "segment-1" and path.name == "02.png",
+    )
+    segments = []
+    previous = None
+    for segment_index, directory in enumerate(segment_dirs, 1):
+        skeleton = []
+        for frame_index, source in enumerate(sorted(directory.glob("*.png")), 1):
+            transition = "start" if previous is None else (
+                "hard_cut" if frame_index == 1 else "same_camera"
+            )
+            skeleton.append({
+                "segment_index": segment_index,
+                "frame_index": frame_index,
+                "frame_name": source.name,
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "source_transition_from_previous": transition,
+                "source_transition_evidence_sha256": "a" * 64,
+            })
+            previous = source
+        segments.append({
+            "index": segment_index,
+            "chain_id": f"chain-{segment_index}",
+            "join_mode": "hard_cut",
+            "keyframes_dir": directory,
+            "transition_skeleton": skeleton,
+        })
+
+    plan, prompts = image_optimization.generic_project_prompts(
+        segments, "anchor_consistency", session_dir=tmp_path,
+    )
+
+    assert [person["id"] for person in plan["person_plans"]] == ["PERSON_01"]
+    assert plan["person_plans"][0]["reference"] == {
+        "segment_index": 1, "frame_index": 2,
+    }
+    assert plan["person_plans"][0]["observable_segments"] == [1]
+    assert plan["segments"][0]["persons"] == [{
+        "id": "PERSON_01",
+        "state": "replace",
+        "observable_frames": [2],
+        "target_region": "源图中实际可观察的完整主人物区域",
+        "boundary": "严格保持源图可见姿态、轮廓、裁切与遮挡边界",
+    }]
+    assert plan["segments"][1]["persons"] == [{
+        "id": "PERSON_01",
+        "state": "not_observable",
+        "observable_frames": [],
+        "target_region": None,
+        "boundary": None,
+    }]
+    assert all(segment["protected_non_target_people"] == [] for segment in plan["segments"])
+    assert "不替换人物" in prompts[1][1]
+    assert "不可观察的冻结主人物不得被新增或补造" in prompts[1][1]
+    assert "替换人物" in prompts[1][2]
+    assert "不可观察的冻结主人物不得被新增或补造" in prompts[2][1]
 
 
 @pytest.mark.parametrize("status", ["fail", "unknown"])
