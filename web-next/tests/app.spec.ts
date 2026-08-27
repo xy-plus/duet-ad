@@ -640,6 +640,113 @@ test('generation evidence freezes image acceptance and postprocess controls', as
   await expect(page.getByRole('checkbox', { name: /移除文字|移除常见|进行图片优化/u })).toHaveCount(0);
 });
 
+test('optimized non-silent video requires explicit dialogue delivery and submits off-screen exactly', async ({ page }) => {
+  const candidate = detail('delivery-required', {
+    title: '等待选择声音呈现',
+    dialogue_delivery: null,
+    dialogue: { mode: 'auto', lines: [], auto_lines: [] },
+    postprocess: {
+      status: 'done',
+      options: { remove_subtitle: false, remove_brand: false, optimize_image: true },
+      frames: ['one.png'],
+      error: null,
+      segments: [{
+        index: 0, status: 'done', stage: 'done', completed_frames: 1,
+        total_frames: 1, revision: 1, error: null,
+      }],
+    },
+    image_acceptance: {
+      required: true, accepted: true, expected_meta_sha256: '1'.repeat(64),
+    },
+  });
+  const controller: ApiController = {
+    details: { 'delivery-required': candidate },
+    order: ['delivery-required'],
+    requests: [],
+    submit: async (route) => route.fulfill({ json: { status: 'queued', attempt: 1 } }),
+  };
+  await installApi(page, controller);
+  await login(page);
+
+  await expect(page.getByText('请选择声音呈现方式；未选择不会提交生成。')).toBeVisible();
+  await expect(page.getByRole('button', { name: '确认生成' })).toBeDisabled();
+  await page.getByRole('radio', { name: '画外' }).click();
+  await expect(page.getByRole('button', { name: '确认生成' })).toBeEnabled();
+  await page.getByRole('button', { name: '确认生成' }).click();
+
+  const submits = controller.requests.filter(({ method, path }) => (
+    method === 'POST' && path.endsWith('/submit')
+  ));
+  expect(submits).toHaveLength(1);
+  expect(JSON.parse(submits[0].body ?? '{}')).toMatchObject({
+    confirm: true,
+    dialogue_mode: 'auto',
+    dialogue_delivery: 'off_screen',
+  });
+});
+
+test('a 409 refresh preserves explicit off-screen delivery and never resubmits by itself', async ({ page }) => {
+  const candidate = detail('delivery-refresh', {
+    title: '声音呈现刷新',
+    dialogue_delivery: null,
+    dialogue: { mode: 'auto', lines: [], auto_lines: [] },
+    postprocess: {
+      status: 'done',
+      options: { remove_subtitle: false, remove_brand: false, optimize_image: true },
+      frames: ['one.png'],
+      error: null,
+      segments: [{
+        index: 0, status: 'done', stage: 'done', completed_frames: 1,
+        total_frames: 1, revision: 1, error: null,
+      }],
+    },
+    image_acceptance: {
+      required: true, accepted: true, expected_meta_sha256: '2'.repeat(64),
+    },
+  });
+  let attempt = 0;
+  const controller: ApiController = {
+    details: { 'delivery-refresh': candidate },
+    order: ['delivery-refresh'],
+    requests: [],
+    submit: async (route, id, current) => {
+      attempt += 1;
+      if (attempt === 1) {
+        current.details[id] = { ...current.details[id], receipt_version: 2 };
+        await route.fulfill({ status: 409, json: { detail: 'multimodal_input_refresh_required' } });
+        return;
+      }
+      await route.fulfill({ json: { status: 'queued', attempt: 1 } });
+    },
+  };
+  await installApi(page, controller);
+  await login(page);
+
+  await page.getByRole('radio', { name: '画外' }).click();
+  await page.getByRole('button', { name: '确认生成' }).click();
+  await expect(page.getByRole('alert').filter({
+    hasText: '音频与画面输入需要刷新，请等待页面更新后再次确认生成。',
+  })).toBeVisible();
+  await expect.poll(() => controller.requests.filter(({ method, path }) => (
+    method === 'GET' && path.endsWith('/delivery-refresh')
+  )).length).toBeGreaterThan(1);
+  await expect(page.getByRole('radio', { name: '画外' })).toBeChecked();
+  await expect(page.getByRole('radio', { name: '画内' })).not.toBeChecked();
+  await expect(page.getByRole('radio', { name: '自动' })).not.toBeChecked();
+  await page.waitForTimeout(300);
+  expect(controller.requests.filter(({ method, path }) => (
+    method === 'POST' && path.endsWith('/submit')
+  ))).toHaveLength(1);
+
+  await page.getByRole('button', { name: '确认生成' }).click();
+  const submits = controller.requests.filter(({ method, path }) => (
+    method === 'POST' && path.endsWith('/submit')
+  ));
+  expect(submits).toHaveLength(2);
+  expect(submits.map(({ body }) => JSON.parse(body ?? '{}').dialogue_delivery))
+    .toEqual(['off_screen', 'off_screen']);
+});
+
 test('has_video renders authenticated source and final videos together', async ({ page }) => {
   const candidate = detail('final-video-visible', {
     title: '最终视频可见',
