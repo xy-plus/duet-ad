@@ -195,6 +195,257 @@ def valid_video_bytes(tmp_path_factory) -> bytes:
     return path.read_bytes()
 
 
+@pytest.fixture(scope="session")
+def valid_av_path(tmp_path_factory) -> Path:
+    path = tmp_path_factory.mktemp("h3-av") / "valid-av.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=32x32:r=24:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
+@pytest.fixture(scope="session")
+def valid_fragmented_av_path(tmp_path_factory) -> Path:
+    path = tmp_path_factory.mktemp("h3-fragmented-av") / "valid-fragmented.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=32x32:r=24:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "frag_keyframe+empty_moov",
+            "-y",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
+def _timeline_payload(*, audio_end_s: float = 1.0) -> dict:
+    return {
+        "streams": [
+            {
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "time_base": "1/24",
+                "start_time": "0.000000",
+                "duration": "1.000000",
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+            },
+            {
+                "index": 1,
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "time_base": "1/48000",
+                "start_time": "0.000000",
+                "duration": f"{audio_end_s:.6f}",
+                "sample_rate": "48000",
+                "channels": 2,
+            },
+        ],
+        "packets_and_frames": [
+            {
+                "type": "packet",
+                "stream_index": 0,
+                "pts_time": "0.000000",
+                "dts_time": "-0.041667",
+                "duration_time": "0.041667",
+            },
+            {
+                "type": "packet",
+                "stream_index": 0,
+                "pts_time": "0.958333",
+                "dts_time": "0.916667",
+                "duration_time": "0.041667",
+            },
+            {
+                "type": "frame",
+                "media_type": "video",
+                "stream_index": 0,
+                "best_effort_timestamp_time": "0.000000",
+                "duration_time": "0.041667",
+            },
+            {
+                "type": "frame",
+                "media_type": "video",
+                "stream_index": 0,
+                "best_effort_timestamp_time": "0.958333",
+                "duration_time": "0.041667",
+            },
+            {
+                "type": "packet",
+                "stream_index": 1,
+                "pts_time": "0.000000",
+                "dts_time": "0.000000",
+                "duration_time": "0.020000",
+            },
+            {
+                "type": "packet",
+                "stream_index": 1,
+                "pts_time": f"{audio_end_s - 0.02:.6f}",
+                "dts_time": f"{audio_end_s - 0.02:.6f}",
+                "duration_time": "0.020000",
+            },
+            {
+                "type": "frame",
+                "media_type": "audio",
+                "stream_index": 1,
+                "best_effort_timestamp_time": "0.000000",
+                "duration_time": "0.020000",
+            },
+            {
+                "type": "frame",
+                "media_type": "audio",
+                "stream_index": 1,
+                "best_effort_timestamp_time": f"{audio_end_s - 0.02:.6f}",
+                "duration_time": "0.020000",
+            },
+        ],
+        "format": {
+            "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+            "start_time": "0.000000",
+            "duration": "99.000000",
+        },
+    }
+
+
+def test_media_timeline_probe_records_decoded_audio_and_presented_timeline(
+    valid_av_path,
+):
+    receipt = h3._probe_media_timeline(valid_av_path, 5)
+
+    assert receipt["schema"] == "duet.h3.media_timeline"
+    assert receipt["version"] == 1
+    assert receipt["decode_complete"] is True
+    assert receipt["container"]["duration_s"] == 1.0
+    assert receipt["video"]["time_base"] == "1/12288"
+    assert receipt["video"]["avg_frame_rate"] == "24/1"
+    assert receipt["video"]["packet_dts_monotonic"] is True
+    assert receipt["video"]["presentation_monotonic"] is True
+    assert receipt["video"]["frame_count"] == 24
+    assert receipt["audio"]["sample_rate"] == 44100
+    assert receipt["audio"]["channels"] == 1
+    assert len(receipt["audio"]["decoded_sha256"]) == 64
+    assert abs(receipt["av_delta_s"]["start"]) <= 0.1
+    assert abs(receipt["av_delta_s"]["end"]) <= 0.1
+
+
+def test_media_timeline_accepts_decodable_fragmented_mp4_with_missing_packet_duration(
+    valid_fragmented_av_path,
+):
+    receipt = h3._probe_media_timeline(valid_fragmented_av_path, 5)
+
+    assert receipt["video"]["packet_count"] > 0
+    assert receipt["audio"]["packet_count"] > 0
+    assert receipt["audio"]["decoded_sha256"]
+
+
+def test_media_timeline_preflight_rejects_output_beyond_request_ceiling(valid_av_path):
+    with pytest.raises(h3.H3Error, match="download_invalid_video") as raised:
+        h3._probe_media_timeline(valid_av_path, 5, max_duration_s=0.5)
+
+    assert raised.value.retryable is False
+
+
+def test_media_timeline_probe_maps_non_utf8_output_to_stable_error():
+    with pytest.raises(h3.H3Error, match="download_invalid_video") as raised:
+        h3._decode_probe_json(b"\xff")
+
+    assert raised.value.retryable is False
+
+
+def test_media_timeline_rejects_event_count_above_resource_ceiling(monkeypatch):
+    monkeypatch.setattr(h3, "MAX_MEDIA_TIMELINE_EVENTS", 2)
+
+    with pytest.raises(h3.H3Error, match="download_invalid_video") as raised:
+        h3._media_events({"packets_and_frames": [{}, {}, {}]})
+
+    assert raised.value.retryable is False
+
+
+def test_media_timeline_does_not_use_container_duration_as_visual_duration():
+    receipt = h3._parse_media_timeline(
+        _timeline_payload(),
+        decoded_audio_sha256="a" * 64,
+    )
+
+    assert receipt["container"]["duration_s"] == 99.0
+    assert receipt["video"]["duration_s"] == 1.0
+    assert receipt["video"]["frame_end_s"] == 1.0
+
+
+def test_media_timeline_rejects_nonmonotonic_packet_dts():
+    payload = _timeline_payload()
+    payload["packets_and_frames"][1]["dts_time"] = "-0.050000"
+
+    with pytest.raises(h3.H3Error, match="download_invalid_video") as raised:
+        h3._parse_media_timeline(payload, decoded_audio_sha256="a" * 64)
+
+    assert raised.value.retryable is False
+
+
+def test_media_timeline_rejects_nonmonotonic_frame_presentation():
+    payload = _timeline_payload()
+    payload["packets_and_frames"][3]["best_effort_timestamp_time"] = "-0.010000"
+
+    with pytest.raises(h3.H3Error, match="download_invalid_video") as raised:
+        h3._parse_media_timeline(payload, decoded_audio_sha256="a" * 64)
+
+    assert raised.value.retryable is False
+
+
+def test_media_timeline_rejects_material_av_endpoint_skew():
+    with pytest.raises(h3.H3Error, match="download_invalid_video") as raised:
+        h3._parse_media_timeline(
+            _timeline_payload(audio_end_s=0.75),
+            decoded_audio_sha256="a" * 64,
+        )
+
+    assert raised.value.retryable is False
+
+
 @pytest.fixture(autouse=True)
 def public_download_host(monkeypatch, valid_video_bytes):
     HappyProvider.video_bytes = valid_video_bytes
@@ -236,13 +487,112 @@ def test_start_submits_source_prompt_directly_and_writes_state(tmp_path):
     assert state["status"] == "succeeded"
     assert "ir" not in state
     assert state["h3"]["task_id"] == "h3-task-local"
-    assert state["h3"]["output"] == {
+    assert {
+        key: state["h3"]["output"][key]
+        for key in ("name", "sha256", "size")
+    } == {
         "name": "generated.mp4",
         "sha256": hashlib.sha256(provider.video_bytes).hexdigest(),
         "size": len(provider.video_bytes),
     }
+    assert state["h3"]["output"]["media_timeline"]["audio"] is None
     assert "download.invalid" not in json.dumps(state)
     assert "art-secret" not in json.dumps(state)
+
+
+def test_success_exposes_and_persists_versioned_media_timeline(
+    tmp_path, valid_av_path,
+):
+    request = replace(_request(tmp_path), duration=1)
+    provider = HappyProvider()
+    provider.video_bytes = valid_av_path.read_bytes()
+
+    with _client(provider) as client:
+        result = h3.start(request, client=client)
+
+    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
+    persisted = state["h3"]["output"]["media_timeline"]
+    assert persisted["schema"] == "duet.h3.media_timeline"
+    assert persisted["version"] == 1
+    assert persisted["audio"]["decoded_sha256"]
+    assert result.media_timeline == persisted
+    assert h3.load_media_timeline_receipt(request, result.attempt_id) == persisted
+    assert h3.output_is_reusable(request) is True
+
+
+def test_timeline_failure_is_deterministic_and_does_not_repeat_download(
+    tmp_path, monkeypatch,
+):
+    request = replace(_request(tmp_path), duration=1)
+    provider = HappyProvider()
+    download_calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal download_calls
+        if req.url.path.endswith("/minimax_h3_lightx2v_v5_15s"):
+            return httpx.Response(200, json={"data": {"task_id": "h3-task-local"}})
+        if req.url.path.endswith("/result/h3-task-local"):
+            return httpx.Response(200, json={"data": {
+                "status": "SUCCESS",
+                "results": [{"url": "https://download.invalid/video.mp4"}],
+            }})
+        download_calls += 1
+        return _download_response(200, content=provider.video_bytes)
+
+    def invalid_timeline(*_args, **_kwargs):
+        raise h3.H3Error("download_invalid_video", retryable=False)
+
+    monkeypatch.setattr(h3, "_probe_media_timeline", invalid_timeline)
+    with _client(handler) as client:
+        with pytest.raises(h3.H3Error, match="download_invalid_video"):
+            h3.start(request, client=client)
+
+    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
+    assert state["retryable"] is False
+    assert download_calls == 1
+
+
+def test_media_timeline_loader_rejects_tampered_receipt(tmp_path, valid_av_path):
+    request = replace(_request(tmp_path), duration=1)
+    provider = HappyProvider()
+    provider.video_bytes = valid_av_path.read_bytes()
+    with _client(provider) as client:
+        result = h3.start(request, client=client)
+
+    path = _attempt_file(request)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["h3"]["output"]["media_timeline"]["audio"]["decoded_sha256"] = "0" * 63
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(h3.ReceiptError, match="state_invalid"):
+        h3.load_media_timeline_receipt(request, result.attempt_id)
+
+
+@pytest.mark.parametrize("damage", ["session", "task_id", "task_receipt"])
+def test_media_timeline_loader_requires_exact_session_and_provider_provenance(
+    tmp_path, valid_av_path, damage,
+):
+    request = replace(_request(tmp_path), duration=1)
+    provider = HappyProvider()
+    provider.video_bytes = valid_av_path.read_bytes()
+    with _client(provider) as client:
+        result = h3.start(request, client=client)
+
+    if damage == "session":
+        marker = request.workdir / ".h3" / "session.json"
+        marker.write_text(
+            json.dumps({"schema_version": h3.SCHEMA_VERSION, "cid": "wrong"}),
+            encoding="utf-8",
+        )
+    else:
+        path = _attempt_file(request)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["h3"].pop("task_id" if damage == "task_id" else "receipt")
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(h3.ReceiptError):
+        h3.load_media_timeline_receipt(request, result.attempt_id)
 
 
 def test_prepare_then_submit_persists_receipt_before_post_and_does_not_poll(tmp_path):
