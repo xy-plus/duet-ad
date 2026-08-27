@@ -2458,7 +2458,7 @@ def generic_project_prompts(
         segments, session_dir, expected_version=4,
     )
     scene_reference = {"segment_index": indices[0], "frame_index": 1}
-    observable_frames = {
+    detected_frames = {
         segment["index"]: [
             frame_index
             for frame_index, frame in enumerate(frames, 1)
@@ -2466,42 +2466,42 @@ def generic_project_prompts(
         ]
         for segment, frames in prepared
     }
-    observable_segments = [
-        index for index in indices if observable_frames[index]
-    ]
-    person_reference = (
-        {
-            "segment_index": observable_segments[0],
-            "frame_index": observable_frames[observable_segments[0]][0],
-        }
-        if observable_segments else None
-    )
-    person_plans = ([{
+    detected_reference = next((
+        {"segment_index": index, "frame_index": detected_frames[index][0]}
+        for index in indices if detected_frames[index]
+    ), None)
+    person_reference = detected_reference or {
+        "segment_index": indices[0], "frame_index": 1,
+    }
+    observable_frames = {
+        segment["index"]: list(range(1, len(frames) + 1))
+        for segment, frames in prepared
+    }
+    person_plans = [{
         "id": "PERSON_01",
-        "source_identity": "源图中实际可观察的主人物身份",
-        "replacement_identity": "与源身份明显不同且跨帧稳定的新人物身份",
+        "source_identity": "当前帧实际可见的主人物（若无则为空目标）",
+        "replacement_identity": (
+            "统一且与源身份明显不同的新人物；仅在当前帧确有可见人物时替换"
+        ),
         "wardrobe_change": "保持服装用途与覆盖边界并改变款式细节",
         "local_color_change": "仅改变人物服装局部固有色并保持源光照",
         "reference": person_reference,
-        "observable_segments": observable_segments,
-    }] if person_reference is not None else [])
+        "observable_segments": indices,
+    }]
     views = []
     canonical_segments = []
     for segment, frames in prepared:
         visible_frames = observable_frames[segment["index"]]
-        segment_people = ([{
+        segment_people = [{
             "id": "PERSON_01",
             "state": "replace",
             "observable_frames": visible_frames,
-            "target_region": "源图中实际可观察的完整主人物区域",
-            "boundary": "严格保持源图可见姿态、轮廓、裁切与遮挡边界",
-        }] if visible_frames else ([{
-            "id": "PERSON_01",
-            "state": "not_observable",
-            "observable_frames": [],
-            "target_region": None,
-            "boundary": None,
-        }] if person_plans else []))
+            "target_region": "当前帧实际可见的完整人物区域（若无可见人物则为空）",
+            "boundary": (
+                "若人物可见则保持姿态、轮廓、裁切与遮挡；"
+                "若无则不得新增或补造人物"
+            ),
+        }]
         constraints = []
         for frame, transition in zip(frames, segment["transition_skeleton"]):
             frame_index = transition["frame_index"]

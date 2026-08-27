@@ -422,9 +422,6 @@ def test_v4_plan_protocol_error_replans_then_uses_backend_fallback(
 
     runner = Runner()
     monkeypatch.setattr(
-        image_optimization, "_source_has_observable_person", lambda _path: True,
-    )
-    monkeypatch.setattr(
         pipeline.image_optimization,
         "generate_project_prompts",
         _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
@@ -2129,10 +2126,6 @@ def test_short_pipeline_invalid_plan_falls_back_and_reaches_seedream(
         "generate_project_prompts",
         _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
     )
-    monkeypatch.setattr(
-        image_optimization, "_source_has_observable_person", lambda _path: True,
-    )
-
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
 
     stored = storage.load_meta(settings.data_dir, meta["id"])

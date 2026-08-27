@@ -1708,9 +1708,10 @@ def test_v4_single_frame_valid_input_reaches_anchor_generation_without_quality_p
         settings.seedream_edit_mode,
         session_dir=cdir,
     )
-    assert plan["person_plans"] == []
-    assert plan["segments"][0]["persons"] == []
-    assert "不替换人物" in prompts[0][1]
+    assert [item["id"] for item in plan["person_plans"]] == ["PERSON_01"]
+    assert plan["segments"][0]["persons"][0]["observable_frames"] == [1]
+    assert "仅在当前帧确有可见人物时替换" in prompts[0][1]
+    assert "若无则不得新增或补造人物" in prompts[0][1]
     _freeze_v4_image_optimization(settings, cid, plan)
     posts = []
 
@@ -1791,7 +1792,7 @@ def test_v3_failed_quality_acceptance_publishes_but_remains_blocked_from_h3(
         )
 
 
-def test_v4_generic_fallback_replaces_only_frames_with_backend_person_evidence(
+def test_v4_generic_fallback_uses_detection_only_to_choose_person_reference(
     tmp_path, monkeypatch,
 ):
     segment_dirs = []
@@ -1840,26 +1841,28 @@ def test_v4_generic_fallback_replaces_only_frames_with_backend_person_evidence(
     assert plan["person_plans"][0]["reference"] == {
         "segment_index": 1, "frame_index": 2,
     }
-    assert plan["person_plans"][0]["observable_segments"] == [1]
+    assert plan["person_plans"][0]["observable_segments"] == [1, 2]
     assert plan["segments"][0]["persons"] == [{
         "id": "PERSON_01",
         "state": "replace",
-        "observable_frames": [2],
-        "target_region": "源图中实际可观察的完整主人物区域",
-        "boundary": "严格保持源图可见姿态、轮廓、裁切与遮挡边界",
+        "observable_frames": [1, 2],
+        "target_region": "当前帧实际可见的完整人物区域（若无可见人物则为空）",
+        "boundary": "若人物可见则保持姿态、轮廓、裁切与遮挡；若无则不得新增或补造人物",
     }]
     assert plan["segments"][1]["persons"] == [{
         "id": "PERSON_01",
-        "state": "not_observable",
-        "observable_frames": [],
-        "target_region": None,
-        "boundary": None,
+        "state": "replace",
+        "observable_frames": [1],
+        "target_region": "当前帧实际可见的完整人物区域（若无可见人物则为空）",
+        "boundary": "若人物可见则保持姿态、轮廓、裁切与遮挡；若无则不得新增或补造人物",
     }]
     assert all(segment["protected_non_target_people"] == [] for segment in plan["segments"])
-    assert "不替换人物" in prompts[1][1]
-    assert "不可观察的冻结主人物不得被新增或补造" in prompts[1][1]
-    assert "替换人物" in prompts[1][2]
-    assert "不可观察的冻结主人物不得被新增或补造" in prompts[2][1]
+    assert all(
+        "仅在当前帧确有可见人物时替换" in prompt
+        and "若无则不得新增或补造人物" in prompt
+        for segment_prompts in prompts.values()
+        for prompt in segment_prompts.values()
+    )
 
 
 @pytest.mark.parametrize("status", ["fail", "unknown"])
