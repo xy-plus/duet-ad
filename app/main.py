@@ -2565,6 +2565,9 @@ def create_app(settings: Settings) -> FastAPI:
             "remove_brand": bool(settings.enable_mediakit_erase),
             "optimize_image": bool(os.environ.get("ARK_API_KEY", "").strip()),
         }
+        image_acceptance = postprocess.image_acceptance_status(
+            settings, cid, meta
+        )
         result = {
             "id": meta["id"],
             "title": meta["title"],
@@ -2596,6 +2599,13 @@ def create_app(settings: Settings) -> FastAPI:
             "postprocess": postprocess.public_state(meta.get("postprocess")),
             "postprocess_capabilities": capabilities,
             "postprocess_enabled": any(capabilities.values()),
+            "image_acceptance": {
+                "required": image_acceptance.get("required"),
+                "accepted": image_acceptance.get("accepted"),
+                "expected_meta_sha256": image_acceptance.get(
+                    "expected_meta_sha256"
+                ),
+            },
         }
         if not _is_long_video(meta):
             result["image_optimization_prompt"] = optimization_prompts.get(0)
@@ -2604,6 +2614,27 @@ def create_app(settings: Settings) -> FastAPI:
             segments = meta.get("segments")
             result["segment_count"] = len(segments) if isinstance(segments, list) else 0
         return result
+
+    @app.post(
+        "/api/conversations/{cid}/image-acceptance",
+        dependencies=[Depends(require_auth)],
+    )
+    async def accept_conversation_images(cid: str, payload: dict):
+        try:
+            image_acceptance = await asyncio.to_thread(
+                postprocess.accept_images, settings, cid, payload
+            )
+        except postprocess.PostprocessError as exc:
+            raise HTTPException(
+                status_code=exc.status, detail=exc.detail
+            ) from exc
+        return {
+            "required": image_acceptance.get("required"),
+            "accepted": image_acceptance.get("accepted"),
+            "expected_meta_sha256": image_acceptance.get(
+                "expected_meta_sha256"
+            ),
+        }
 
     @app.patch(
         "/api/conversations/{cid}/image-optimization-prompt",
