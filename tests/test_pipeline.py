@@ -308,7 +308,7 @@ def test_v4_frame_inventory_derives_transition_from_lineage_and_frame_pair(tmp_p
     )
 
     assert [item["source_transition_from_previous"] for item in inventory] == [
-        "start", "camera_motion", "camera_motion",
+        "start", "same_camera", "same_camera",
     ]
     assert all(re.fullmatch(r"[0-9a-f]{64}", item[
         "source_transition_evidence_sha256"
@@ -356,7 +356,7 @@ def test_v4_pipeline_freezes_authoritative_transitions_and_anchor_schedule(tmp_p
             {
                 "segment_index": 0,
                 "frame_index": 2,
-                "transition_from_previous": "camera_motion",
+                    "transition_from_previous": "same_camera",
                 "observations": [{"component_id": "COMPONENT_01", "visibility": "full"}],
                 "view_relations": [],
             },
@@ -375,7 +375,7 @@ def test_v4_pipeline_freezes_authoritative_transitions_and_anchor_schedule(tmp_p
     assert private["version"] == 4
     assert private["execution_inputs"]["frames"][1][
         "source_transition_from_previous"
-    ] == "camera_motion"
+    ] == "same_camera"
     assert private["scene_anchor_schedule"]["scenes"][0]["global_anchor"][
         "frame_index"
     ] == 1

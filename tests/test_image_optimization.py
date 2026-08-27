@@ -1097,6 +1097,36 @@ def test_v4_frame_receipt_deeply_binds_graph_view_plan_and_source(tmp_path):
     assert image_optimization.receipt(changed_view_meta, settings) is None
 
 
+def test_v4_schedule_freezes_unique_typed_paid_dag_order(tmp_path):
+    settings = make_settings(tmp_path)
+    plan = _v4_frame_bound_plan()
+    inventory = [
+        {
+            "segment_index": 0,
+            "frame_index": frame_index,
+            "frame_name": f"{frame_index:02d}.png",
+            "source_sha256": str(frame_index) * 64,
+            "source_transition_from_previous": "start" if frame_index == 1 else "same_camera",
+            "source_transition_evidence_sha256": str(frame_index + 2) * 64,
+        }
+        for frame_index in (1, 2)
+    ]
+    execution = image_optimization.freeze_execution_inputs(
+        plan, revision=1, profile={"id": "image-postprocess", "revision": 1},
+        model=settings.seedream_model, frame_inventory=inventory,
+    )
+    nodes = image_optimization._scene_anchor_schedule(plan, execution)["nodes"]
+    assert [node["anchor"]["order"] for node in nodes] == list(range(1, len(nodes) + 1))
+    assert [(node["scene_id"], node["label"]) for node in nodes] == [
+        ("SCENE_01", "global"),
+        ("SCENE_01", "pack-alternate"),
+        ("SCENE_01", "person-PERSON_01-primary"),
+        ("SCENE_01", "person-PERSON_01-alternate"),
+        ("SCENE_01", "layout-0000"),
+        ("SCENE_01", "fanout-0000-0002"),
+    ]
+
+
 class _PlanAuditRunner:
     def __init__(self, status: str, verify_status: str = "pass") -> None:
         self.status = status
@@ -1652,10 +1682,46 @@ def test_v4_runtime_uses_anchor_dag_before_pack_then_fanout_and_publish(
         assert not (cdir / "work" / "postprocessed").exists()
         return
     assert "verify" in runner.phases
+    verification = latest["_image_verification"]
+    assert [item["label"] for item in verification["semantic_receipts"]] == [
+        "bootstrap", "layout-0000",
+    ]
+    assert verification["anchor_receipts"]
+    semantic = json.loads(
+        postprocess._semantic_receipt_path(cdir, "bootstrap").read_text(
+            encoding="utf-8"
+        )
+    )
+    for binding in semantic["pack_bindings"]:
+        for role in ("primary", "alternate"):
+                assert set(binding[role]) == {
+                    "scene_id", "label", "anchor", "input_roles",
+                    "input_sha256s", "anchor_receipt_sha256", "output_sha256",
+                    "palette_metric",
+                }
+    assert latest["postprocess"]["frames"] == ["01.png", "02.png"]
     generated = postprocess.generation_keyframes(
         cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
     )
     assert [item.name for item in generated] == ["01.png", "02.png"]
+    reordered = deepcopy(latest)
+    reordered["postprocess"]["frames"] = ["02.png", "01.png"]
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, reordered,
+            sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )
+    dropped_anchor = deepcopy(latest)
+    dropped_anchor["_image_verification"]["anchor_receipts"].pop()
+    raw = dropped_anchor["_image_verification"]
+    raw["sha256"] = postprocess._receipt_sha256({
+        key: value for key, value in raw.items() if key != "sha256"
+    })
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, dropped_anchor,
+            sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )
     metric_tamper = deepcopy(latest)
     metric = metric_tamper["_image_verification"]["palette_metrics"]
     metric["frames"][0]["output"]["mean_lab_b_star"] += 0.1
@@ -1675,6 +1741,31 @@ def test_v4_runtime_uses_anchor_dag_before_pack_then_fanout_and_publish(
     original_semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
     semantic_tamper = deepcopy(original_semantic)
     semantic_tamper["pack_bindings"] = list(reversed(semantic_tamper["pack_bindings"]))
+    semantic_tamper["sha256"] = postprocess._receipt_sha256({
+        key: value for key, value in semantic_tamper.items() if key != "sha256"
+    })
+    postprocess._write_json_receipt(semantic_path, semantic_tamper)
+    receipt_tamper = deepcopy(latest)
+    receipt_tamper["_image_verification"]["semantic_receipts"][0]["sha256"] = (
+        semantic_tamper["sha256"]
+    )
+    raw = receipt_tamper["_image_verification"]
+    raw["sha256"] = postprocess._receipt_sha256({
+        key: value for key, value in raw.items() if key != "sha256"
+    })
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir, receipt_tamper,
+            sorted((cdir / "work" / "keyframes").glob("*.png")),
+        )
+    postprocess._write_json_receipt(semantic_path, original_semantic)
+    semantic_tamper = deepcopy(original_semantic)
+    semantic_tamper["pack_bindings"][0]["primary"], semantic_tamper[
+        "pack_bindings"
+    ][0]["alternate"] = (
+        semantic_tamper["pack_bindings"][0]["alternate"],
+        semantic_tamper["pack_bindings"][0]["primary"],
+    )
     semantic_tamper["sha256"] = postprocess._receipt_sha256({
         key: value for key, value in semantic_tamper.items() if key != "sha256"
     })
@@ -1760,6 +1851,34 @@ def test_v4_invalid_global_anchor_blocks_layout_pack_and_fanout(
     assert latest["postprocess"]["status"] == "failed"
     assert latest["postprocess"]["error"] == "scene_anchor_verification_failed"
     assert not (cdir / "work" / "postprocessed").exists()
+
+
+def test_v4_preflight_requires_real_scene_and_person_alternates_before_post(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid = _done(settings)
+    plan = _v4_frame_bound_plan()
+    plan["segments"][0]["persons"][0]["observable_frames"] = [1]
+    plan["segments"][0]["frame_constraints"] = plan["segments"][0][
+        "frame_constraints"
+    ][:1]
+    plan["scene_plans"][0]["continuity_graph"]["views"] = plan[
+        "scene_plans"
+    ][0]["continuity_graph"]["views"][:1]
+    calls = []
+
+    async def forbidden_seedream(*_args, **_kwargs):
+        calls.append(True)
+        raise AssertionError("v4 preflight must run before every paid POST")
+
+    monkeypatch.setattr(postprocess.seedream, "edit", forbidden_seedream)
+    # The schedule is now frozen with every mandatory alternate before runtime;
+    # a one-view person/scene graph cannot reach `start`, much less Seedream.
+    with pytest.raises(ValueError, match="anchor schedule"):
+        _freeze_v4_image_optimization(settings, cid, plan)
+    assert calls == []
 
 
 def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(

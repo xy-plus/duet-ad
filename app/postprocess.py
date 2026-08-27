@@ -1050,9 +1050,19 @@ def _semantic_receipt(
             ]
             if len(matches) != 1:
                 raise PostprocessError(409, "image_reference_pack_failed")
+            match = matches[0]
+            # Keep a canonical snapshot of the exact typed input receipt in
+            # every semantic binding.  A receipt digest alone cannot prove
+            # that primary and alternate roles have not been interchanged.
             return {
-                "anchor_receipt_sha256": matches[0]["sha256"],
+                "scene_id": match["scene_id"],
+                "label": match["label"],
+                "anchor": deepcopy(match["anchor"]),
+                "input_roles": deepcopy(match["input_roles"]),
+                "input_sha256s": deepcopy(match["input_sha256s"]),
+                "anchor_receipt_sha256": match["sha256"],
                 "output_sha256": output_sha256,
+                "palette_metric": _area_weighted_palette_metric(path),
             }
         try:
             source_sha256 = hashlib.sha256(Path(pack["source_path"]).read_bytes()).hexdigest()
@@ -1125,35 +1135,164 @@ def _load_json_receipt(path: Path) -> dict | None:
     return value
 
 
+def _v4_person_alternate_key(plan: dict, person: dict) -> tuple[int, int]:
+    reference = person["reference"]
+    primary = (reference["segment_index"], reference["frame_index"])
+    candidates = sorted(
+        (segment["segment_index"], frame_index)
+        for segment in plan["segments"]
+        for instance in segment["persons"]
+        if instance["id"] == person["id"] and instance["state"] == "replace"
+        for frame_index in instance["observable_frames"]
+        if (segment["segment_index"], frame_index) != primary
+    )
+    if not candidates:
+        raise ValueError
+    return candidates[0]
+
+
+def _v4_expected_anchor_descriptors(plan: dict, schedule: dict) -> list[dict]:
+    """Derive the whole v4 DAG from frozen plan/schedule, never from files."""
+    nodes = schedule.get("nodes") if isinstance(schedule, dict) else None
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError
+    descriptors = [
+        {
+            "scene_id": item["scene_id"], "label": item["label"],
+            "anchor": item["anchor"],
+        }
+        for item in nodes
+        if isinstance(item, dict)
+    ]
+    if (
+        len(descriptors) != len(nodes)
+        or [item["anchor"].get("order") for item in descriptors]
+        != list(range(1, len(descriptors) + 1))
+        or len({(item["scene_id"], item["label"]) for item in descriptors})
+        != len(descriptors)
+    ):
+        raise ValueError
+    return descriptors
+
+
+def _v4_semantic_labels(schedule: dict) -> list[str]:
+    try:
+        return ["bootstrap", *[
+            f"layout-{layout['segment_index']:04d}"
+            for scene in schedule["scenes"]
+            for layout in scene["segment_layout_anchors"]
+        ]]
+    except (KeyError, TypeError):
+        raise ValueError from None
+
+
+def _v4_anchor_manifest(
+    plan: dict, schedule: dict, receipts: list[dict],
+) -> list[dict]:
+    """Return the only legal ordered, complete anchor receipt manifest."""
+    descriptors = _v4_expected_anchor_descriptors(plan, schedule)
+    if not isinstance(receipts, list) or len(receipts) != len(descriptors):
+        raise ValueError
+    manifest = []
+    for descriptor, receipt in zip(descriptors, receipts):
+        if not isinstance(receipt, dict) or (
+            receipt.get("scene_id"), receipt.get("label")
+        ) != (descriptor["scene_id"], descriptor["label"]):
+            raise ValueError
+        sha = receipt.get("sha256")
+        if not isinstance(sha, str):
+            raise ValueError
+        manifest.append({
+            "scene_id": descriptor["scene_id"],
+            "label": descriptor["label"],
+            "sha256": sha,
+        })
+    if len({item["sha256"] for item in manifest}) != len(manifest):
+        raise ValueError
+    return manifest
+
+
+def _v4_scheduled_anchor(schedule: dict, scene_id: str, label: str) -> dict:
+    matches = [
+        item["anchor"] for item in _v4_expected_anchor_descriptors({}, schedule)
+        if item["scene_id"] == scene_id and item["label"] == label
+    ]
+    if len(matches) != 1:
+        raise ValueError
+    return deepcopy(matches[0])
+
+
 def _v4_anchor_receipt_index(cdir: Path, plan: dict, schedule: dict) -> dict[str, dict]:
-    """Load only schedule-derived anchor receipts; never discover arbitrary files."""
-    labels: dict[str, set[str]] = {
-        scene["id"]: {"global", "pack-alternate"}
-        for scene in plan["scene_plans"]
-    }
-    for scene in schedule["scenes"]:
-        scene_id = scene["scene_id"]
-        labels.setdefault(scene_id, set()).update(
-            f"layout-{item['segment_index']:04d}"
-            for item in scene["segment_layout_anchors"]
-        )
-    for person in plan["person_plans"]:
-        for scene_id in labels:
-            labels[scene_id].update({
-                f"person-{person['id']}-primary",
-                f"person-{person['id']}-alternate",
-            })
+    """Load exactly the frozen DAG's receipts; PERSON labels never fan out by scene."""
     result = {}
-    for scene_id, scene_labels in labels.items():
-        for label in scene_labels:
-            receipt = _load_json_receipt(_anchor_receipt_path(cdir, scene_id, label))
-            if receipt is None:
-                continue
-            sha = receipt.get("sha256")
-            if not isinstance(sha, str) or sha in result:
-                raise ValueError
-            result[sha] = receipt
+    for descriptor in _v4_expected_anchor_descriptors(plan, schedule):
+        receipt = _load_json_receipt(_anchor_receipt_path(
+            cdir, descriptor["scene_id"], descriptor["label"]
+        ))
+        if receipt is None:
+            raise ValueError
+        sha = receipt.get("sha256")
+        if (
+            not isinstance(sha, str)
+            or sha in result
+            or receipt.get("scene_id") != descriptor["scene_id"]
+            or receipt.get("label") != descriptor["label"]
+            or receipt.get("anchor") != descriptor["anchor"]
+        ):
+            raise ValueError
+        result[sha] = receipt
     return result
+
+
+def _valid_v4_anchor_receipt(
+    cdir: Path, receipt: dict, *, plan_sha256: str, continuity_sha256: str,
+    source_sha256s: dict[tuple[int, int], str], anchors: dict[str, dict],
+) -> bool:
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "version", "plan_sha256", "continuity_sha256", "scene_id", "label",
+        "anchor", "input_roles", "input_sha256s", "output_sha256", "sha256",
+    } or receipt.get("version") != 1 or receipt.get("plan_sha256") != plan_sha256 \
+            or receipt.get("continuity_sha256") != continuity_sha256:
+        return False
+    try:
+        anchor = receipt["anchor"]
+        key = (anchor["segment_index"], anchor["frame_index"])
+        source_sha256 = source_sha256s[key]
+        if (
+            set(anchor) != {
+                "order", "segment_index", "frame_index", "frame_name", "source_sha256",
+            }
+            or anchor["source_sha256"] != source_sha256
+            or not isinstance(receipt["input_roles"], list)
+            or not isinstance(receipt["input_sha256s"], list)
+            or len(receipt["input_roles"]) != len(receipt["input_sha256s"])
+            or receipt["input_roles"][:1] != ["canvas"]
+            or receipt["input_sha256s"][:1] != [source_sha256]
+            or hashlib.sha256(_anchor_output_path(cdir, receipt).read_bytes()).hexdigest()
+            != receipt["output_sha256"]
+        ):
+            return False
+        roles = receipt["input_roles"]
+        if receipt["label"] == "global":
+            return roles == ["canvas"]
+        if receipt["label"].startswith("fanout-"):
+            layout_sha = next(
+                item["output_sha256"] for item in anchors.values()
+                if item["label"] == f"layout-{anchor['segment_index']:04d}"
+                and item["scene_id"] == receipt["scene_id"]
+            )
+            return roles == ["canvas", "segment_layout_anchor"] and receipt[
+                "input_sha256s"
+            ][1:] == [layout_sha]
+        global_sha = next(
+            item["output_sha256"] for item in anchors.values()
+            if item["label"] == "global" and item["scene_id"] == receipt["scene_id"]
+        )
+        return roles == ["canvas", "global_scene_anchor"] and receipt[
+            "input_sha256s"
+        ][1:] == [global_sha]
+    except (KeyError, OSError, StopIteration, TypeError, ValueError):
+        return False
 
 
 def _valid_semantic_pack_bindings(
@@ -1172,6 +1311,13 @@ def _valid_semantic_pack_bindings(
         return False
     try:
         anchors = _v4_anchor_receipt_index(cdir, plan, schedule)
+        scene_by_segment = {
+            segment["segment_index"]: segment["scene"]["scene_id"]
+            for segment in plan["segments"]
+        }
+        schedule_by_scene = {
+            item["scene_id"]: item for item in schedule["scenes"]
+        }
         endpoint_receipts = []
         for binding, (kind, identifier, reference) in zip(bindings, expected):
             if not isinstance(binding, dict) or set(binding) != {
@@ -1184,13 +1330,72 @@ def _valid_semantic_pack_bindings(
             for role in ("primary", "alternate"):
                 side = binding[role]
                 if not isinstance(side, dict) or set(side) != {
-                    "anchor_receipt_sha256", "output_sha256",
+                    "scene_id", "label", "anchor", "input_roles", "input_sha256s",
+                    "anchor_receipt_sha256", "output_sha256", "palette_metric",
                 }:
                     return False
                 anchor = anchors.get(side["anchor_receipt_sha256"])
-                if anchor is None or anchor.get("output_sha256") != side["output_sha256"]:
+                if (
+                    anchor is None
+                    or any(anchor.get(name) != side[name] for name in (
+                        "scene_id", "label", "anchor", "input_roles", "input_sha256s",
+                        "output_sha256",
+                    ))
+                    or _area_weighted_palette_metric(_anchor_output_path(cdir, anchor))
+                    != side["palette_metric"]
+                    or not _valid_v4_anchor_receipt(
+                        cdir, anchor,
+                        plan_sha256=receipt["plan_sha256"],
+                        continuity_sha256=receipt["continuity_sha256"],
+                        source_sha256s=source_sha256s,
+                        anchors=anchors,
+                    )
+                ):
                     return False
                 endpoint_receipts.append(side["anchor_receipt_sha256"])
+            primary = binding["primary"]
+            alternate = binding["alternate"]
+            if primary == alternate:
+                return False
+            if kind == "person":
+                alternate_key = _v4_person_alternate_key(
+                    plan, next(item for item in plan["person_plans"] if item["id"] == identifier)
+                )
+                primary_key = (reference["segment_index"], reference["frame_index"])
+                if (
+                    primary["label"] != f"person-{identifier}-primary"
+                    or alternate["label"] != f"person-{identifier}-alternate"
+                    or (primary["anchor"]["segment_index"], primary["anchor"]["frame_index"])
+                    != primary_key
+                    or (alternate["anchor"]["segment_index"], alternate["anchor"]["frame_index"])
+                    != alternate_key
+                    or primary["scene_id"] != scene_by_segment[primary_key[0]]
+                    or alternate["scene_id"] != scene_by_segment[alternate_key[0]]
+                ):
+                    return False
+            else:
+                scene_schedule = schedule_by_scene[identifier]
+                global_anchor = scene_schedule["global_anchor"]
+                global_key = (
+                    global_anchor["segment_index"], global_anchor["frame_index"]
+                )
+                alternate_key = (
+                    alternate["anchor"]["segment_index"],
+                    alternate["anchor"]["frame_index"],
+                )
+                if (
+                    primary["scene_id"] != identifier
+                    or alternate["scene_id"] != identifier
+                    or primary["label"] != "global"
+                    or (primary["anchor"]["segment_index"], primary["anchor"]["frame_index"])
+                    != global_key
+                    or alternate_key == global_key
+                    or not (
+                        alternate["label"] == "pack-alternate"
+                        or alternate["label"].startswith("layout-")
+                    )
+                ):
+                    return False
         return len(endpoint_receipts) == len(set(endpoint_receipts))
     except (KeyError, TypeError, ValueError):
         return False
@@ -1269,11 +1474,8 @@ async def _v4_anchor(
     )
     if existing is not None and _valid_png(output, canvas):
         return output, existing
-    if output.exists() or receipt_path.exists():
-        raise PostprocessError(409, "submission_unknown")
-    output.parent.mkdir(parents=True, exist_ok=True)
     attempts = receipt_path.parent / "attempts"
-    attempts.mkdir(parents=True, exist_ok=True)
+    attempt_path = attempts / f"{anchor['order']:04d}-{label}-r1.json"
     task_settings = replace(
         settings,
         seedream_model=private["model"],
@@ -1286,6 +1488,31 @@ async def _v4_anchor(
         anchor["frame_name"],
         anchor["source_sha256"],
     )
+    # The provider may have atomically persisted its exact succeeded attempt
+    # and output just before the business anchor receipt is written.  Replay
+    # that local attempt only; an absent/ambiguous attempt remains GET-only.
+    if output.exists():
+        if not attempt_path.is_file():
+            raise PostprocessError(409, "submission_unknown")
+        try:
+            await seedream.edit(
+                task_settings, [path.read_bytes() for path in inputs], prompt, output,
+                receipt_path=attempt_path,
+            )
+        except seedream.SeedreamError as exc:
+            raise PostprocessError(502, exc.code) from None
+        if not _valid_png(output, canvas):
+            raise PostprocessError(409, "scene_anchor_verification_failed")
+        receipt = _anchor_receipt_payload(
+            private=private, scene_id=scene_id, label=label, anchor=anchor,
+            input_roles=input_roles, inputs=inputs, output=output,
+        )
+        _write_anchor_receipt(receipt_path, receipt)
+        return output, receipt
+    if receipt_path.exists():
+        raise PostprocessError(409, "submission_unknown")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    attempts.mkdir(parents=True, exist_ok=True)
     try:
         async with seedream_sem:
             await seedream.edit(
@@ -1293,7 +1520,7 @@ async def _v4_anchor(
                 [path.read_bytes() for path in inputs],
                 prompt,
                 output,
-                receipt_path=attempts / f"{anchor['order']:04d}.json",
+                receipt_path=attempt_path,
             )
     except seedream.SeedreamError as exc:
         raise PostprocessError(502, exc.code) from None
@@ -1334,6 +1561,70 @@ def _v4_visible_scene_candidate(
     )
 
 
+def _v4_preflight(
+    plan: dict, private: dict, sources: dict[tuple[int, int], Path],
+) -> None:
+    """Reject an incomplete graph before its first paid v4 anchor request."""
+    frames = {
+        (frame["segment_index"], frame["frame_index"]): frame
+        for frame in private["execution_inputs"]["frames"]
+    }
+
+    def source_for(key: tuple[int, int], error: str) -> None:
+        frame = frames.get(key)
+        source = sources.get(key)
+        try:
+            actual = hashlib.sha256(source.read_bytes()).hexdigest()
+        except (AttributeError, OSError):
+            raise PostprocessError(409, error) from None
+        if frame is None or frame.get("source_sha256") != actual:
+            raise PostprocessError(409, error)
+
+    for scene in private["scene_anchor_schedule"]["scenes"]:
+        global_anchor = scene["global_anchor"]
+        global_key = (global_anchor["segment_index"], global_anchor["frame_index"])
+        source_for(global_key, "scene_anchor_preflight_failed")
+        alternate = _v4_visible_scene_candidate(private, scene["scene_id"], global_key)
+        if alternate is None:
+            raise PostprocessError(409, "scene_anchor_alternate_unavailable")
+        alternate_key = (alternate["segment_index"], alternate["frame_index"])
+        if alternate_key == global_key:
+            raise PostprocessError(409, "scene_anchor_alternate_unavailable")
+        source_for(alternate_key, "scene_anchor_alternate_unavailable")
+        for layout in scene["segment_layout_anchors"]:
+            source_for(
+                (layout["segment_index"], layout["frame_index"]),
+                "scene_anchor_preflight_failed",
+            )
+
+    for person in plan["person_plans"]:
+        reference = person["reference"]
+        primary_key = (reference["segment_index"], reference["frame_index"])
+        try:
+            alternate_key = _v4_person_alternate_key(plan, person)
+        except ValueError:
+            raise PostprocessError(409, "person_pack_alternate_unavailable") from None
+        if alternate_key == primary_key:
+            raise PostprocessError(409, "person_pack_alternate_unavailable")
+        source_for(primary_key, "person_pack_alternate_unavailable")
+        source_for(alternate_key, "person_pack_alternate_unavailable")
+
+    # Each typed node must point at its own frozen source.  This checks the
+    # alternate and person endpoints before any root anchor can be paid for.
+    try:
+        descriptors = _v4_expected_anchor_descriptors(
+            plan, private["scene_anchor_schedule"],
+        )
+    except ValueError:
+        raise PostprocessError(409, "scene_anchor_preflight_failed") from None
+    for descriptor in descriptors:
+        anchor = descriptor["anchor"]
+        key = (anchor["segment_index"], anchor["frame_index"])
+        source_for(key, "scene_anchor_preflight_failed")
+        if frames[key].get("source_sha256") != anchor.get("source_sha256"):
+            raise PostprocessError(409, "scene_anchor_preflight_failed")
+
+
 async def _v4_bootstrap_scene_anchors(
     settings: Settings, cdir: Path, cid: str, private: dict,
     grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
@@ -1342,6 +1633,7 @@ async def _v4_bootstrap_scene_anchors(
     sources = _v4_frame_sources(grouped, private)
     outputs: dict[tuple[int, int], Path] = {}
     receipts: list[dict] = []
+    global_outputs: dict[str, Path] = {}
     for scene in private["scene_anchor_schedule"]["scenes"]:
         scene_id = scene["scene_id"]
         global_anchor = scene["global_anchor"]
@@ -1358,6 +1650,13 @@ async def _v4_bootstrap_scene_anchors(
             output=_anchor_receipt_path(cdir, scene_id, "global").with_suffix(".png"),
         )
         receipts.append(receipt)
+        global_outputs[scene_id] = global_output
+    # The frozen schedule puts all global roots ahead of all alternate roots.
+    # Keep runtime execution in that exact typed order so attempts/recovery are
+    # replayable without interpreting mutable files.
+    for scene in private["scene_anchor_schedule"]["scenes"]:
+        scene_id = scene["scene_id"]
+        global_anchor = scene["global_anchor"]
         alternate = _v4_visible_scene_candidate(
             private,
             scene_id,
@@ -1367,19 +1666,21 @@ async def _v4_bootstrap_scene_anchors(
             raise PostprocessError(409, "scene_anchor_alternate_unavailable")
         alternate_key = (alternate["segment_index"], alternate["frame_index"])
         if alternate_key not in outputs:
+            try:
+                alternate_anchor = _v4_scheduled_anchor(
+                    private["scene_anchor_schedule"], scene_id, "pack-alternate"
+                )
+            except ValueError:
+                raise PostprocessError(409, "postprocess_receipt_invalid") from None
+            if (alternate_anchor["segment_index"], alternate_anchor["frame_index"]) != alternate_key:
+                raise PostprocessError(409, "postprocess_receipt_invalid")
             alternate_output, receipt = await _v4_anchor(
                 settings, cdir, cid, private, seedream_sem,
                 scene_id=scene_id,
                 label="pack-alternate",
-                anchor={
-                    "order": max(item["anchor"]["order"] for item in receipts) + 1,
-                    "segment_index": alternate["segment_index"],
-                    "frame_index": alternate["frame_index"],
-                    "frame_name": alternate["frame_name"],
-                    "source_sha256": alternate["source_sha256"],
-                },
+                anchor=alternate_anchor,
                 canvas=sources[alternate_key],
-                references=[("global_scene_anchor", global_output)],
+                references=[("global_scene_anchor", global_outputs[scene_id])],
                 output=_anchor_receipt_path(cdir, scene_id, "pack-alternate").with_suffix(".png"),
             )
             outputs[alternate_key] = alternate_output
@@ -1450,32 +1751,19 @@ async def _v4_verify_bootstrap_packs(
     }
     person_targets: dict[tuple[tuple[int, int], str], Path] = {}
 
-    def next_order() -> int:
-        return max(item["anchor"]["order"] for item in anchor_receipts) + 1
-
     async def target_for(key: tuple[int, int], label: str) -> Path:
         scene_id = scene_by_segment[key[0]]
         existing = person_targets.get((key, label))
         if existing is not None:
             return existing
-        frame = next(
-            item for item in private["execution_inputs"]["frames"]
-            if (item["segment_index"], item["frame_index"]) == key
-        )
-        anchor = {
-            "order": next_order(),
-            "segment_index": key[0], "frame_index": key[1],
-            "frame_name": frame["frame_name"],
-            "source_sha256": frame["source_sha256"],
-        }
-        prior = _load_json_receipt(_anchor_receipt_path(cdir, scene_id, label))
-        if isinstance(prior, dict) and isinstance(prior.get("anchor"), dict):
-            frozen_anchor = prior["anchor"]
-            if all(
-                frozen_anchor.get(field) == anchor[field]
-                for field in ("segment_index", "frame_index", "frame_name", "source_sha256")
-            ) and isinstance(frozen_anchor.get("order"), int):
-                anchor = frozen_anchor
+        try:
+            anchor = _v4_scheduled_anchor(
+                private["scene_anchor_schedule"], scene_id, label
+            )
+        except ValueError:
+            raise PostprocessError(409, "postprocess_receipt_invalid") from None
+        if (anchor["segment_index"], anchor["frame_index"]) != key:
+            raise PostprocessError(409, "postprocess_receipt_invalid")
         output, receipt = await _v4_anchor(
             settings, cdir, cid, private, seedream_sem,
             scene_id=scene_id,
@@ -1609,19 +1897,22 @@ async def _v4_fan_out(
         key for key in sorted(sources)
         if key not in layout_outputs
     ]
-    first_order = max(item["anchor"]["order"] for item in anchor_receipts) + 1
-
-    async def one(order: int, key: tuple[int, int]) -> dict:
+    async def one(key: tuple[int, int]) -> dict:
         index, frame_index = key
         frame = frame_by_key[key]
         scene_id = scene_by_segment[index]
-        anchor = {
-            "order": order,
-            "segment_index": index,
-            "frame_index": frame_index,
-            "frame_name": frame["frame_name"],
-            "source_sha256": frame["source_sha256"],
-        }
+        try:
+            anchor = _v4_scheduled_anchor(
+                private["scene_anchor_schedule"], scene_id,
+                f"fanout-{index:04d}-{frame_index:04d}",
+            )
+        except ValueError:
+            raise PostprocessError(409, "postprocess_receipt_invalid") from None
+        if (
+            anchor["segment_index"], anchor["frame_index"], anchor["frame_name"],
+            anchor["source_sha256"],
+        ) != (index, frame_index, frame["frame_name"], frame["source_sha256"]):
+            raise PostprocessError(409, "postprocess_receipt_invalid")
         output, receipt = await _v4_anchor(
             settings, cdir, cid, private, seedream_sem,
             scene_id=scene_id,
@@ -1636,7 +1927,7 @@ async def _v4_fan_out(
         return {"key": key, "output": output, "receipt": receipt}
 
     results = await asyncio.gather(
-        *(one(first_order + position, key) for position, key in enumerate(pending)),
+        *(one(key) for key in pending),
         return_exceptions=True,
     )
     errors = [item for item in results if isinstance(item, BaseException)]
@@ -1751,8 +2042,9 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
 
 
 def _write_v4_verification_receipt(
-    settings: Settings, cid: str, private: dict, grouped: dict[int, list[tuple[Path, Path]]],
-    outputs: list[Path], semantic_receipts: list[dict],
+    settings: Settings, cid: str, private: dict, plan: dict,
+    grouped: dict[int, list[tuple[Path, Path]]], outputs: list[Path],
+    anchor_receipts: list[dict], semantic_receipts: list[dict],
     source_palette_receipt: dict, palette_metrics: dict, verdict: dict,
 ) -> None:
     expected = [
@@ -1761,6 +2053,15 @@ def _write_v4_verification_receipt(
         for source, canonical in grouped[index]
     ]
     if len(expected) != len(outputs):
+        raise PostprocessError(409, "image_verification_failed")
+    try:
+        anchor_manifest = _v4_anchor_manifest(
+            plan, private["scene_anchor_schedule"], anchor_receipts,
+        )
+        expected_semantic = _v4_semantic_labels(private["scene_anchor_schedule"])
+    except ValueError:
+        raise PostprocessError(409, "image_verification_failed") from None
+    if [item.get("label") for item in semantic_receipts] != expected_semantic:
         raise PostprocessError(409, "image_verification_failed")
     payload = {
         "version": 1,
@@ -1774,6 +2075,7 @@ def _write_v4_verification_receipt(
             {"label": item["label"], "sha256": item["sha256"]}
             for item in semantic_receipts
         ],
+        "anchor_receipts": anchor_manifest,
         "source_palette_receipt_sha256": source_palette_receipt["sha256"],
         "palette_metrics": palette_metrics,
         "palette_metrics_sha256": palette_metrics["sha256"],
@@ -1803,6 +2105,7 @@ async def _run_v4_task(
         raise PostprocessError(409, "v4_anchor_preprocess_unavailable")
     plan = _v4_frozen_plan(meta, private)
     sources = _v4_frame_sources(grouped, private)
+    _v4_preflight(plan, private, sources)
     source_metrics = _v4_palette_metrics(plan, sources)
     source_payload = {
         "version": 1,
@@ -1847,7 +2150,7 @@ async def _run_v4_task(
         palette_metrics,
     )
     _write_v4_verification_receipt(
-        settings, cid, private, grouped, outputs, semantic_receipts,
+        settings, cid, private, plan, grouped, outputs, anchor_receipts, semantic_receipts,
         source_palette_receipt, palette_metrics, verdict,
     )
     offset = 0
@@ -1855,10 +2158,6 @@ async def _run_v4_task(
         targets = grouped[index]
         _publish_segment(outputs[offset:offset + len(targets)], targets)
         offset += len(targets)
-        _update_segment(
-            settings, cid, index, status="done", stage="done",
-            completed_frames=len(targets), error=None,
-        )
 
 
 async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore,
@@ -1886,17 +2185,19 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
     defer_v3_publish = options["optimize_image"] and private["version"] in {3, 4}
     audit_grouped = _group_targets(cdir, meta)
     grouped = audit_grouped
-    if only_segments is not None:
+    v4_project_dag = private["version"] == 4 and options["optimize_image"]
+    if only_segments is not None and not v4_project_dag:
         grouped = {index: targets for index, targets in grouped.items() if index in only_segments}
     states = {
         item.get("index"): item.get("status")
         for item in (meta.get("postprocess") or {}).get("segments", [])
         if isinstance(item, dict)
     }
-    grouped = {
-        index: targets for index, targets in grouped.items()
-        if states.get(index) != "done"
-    }
+    if not v4_project_dag:
+        grouped = {
+            index: targets for index, targets in grouped.items()
+            if states.get(index) != "done"
+        }
     if options["optimize_image"] and private["version"] in {3, 4} and grouped:
         try:
             await _run_v3_plan_audit(
@@ -1905,7 +2206,7 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         except PostprocessError:
             _mark_plan_audit_failed(settings, cid, set(grouped))
             return
-    if private["version"] == 4 and grouped:
+    if private["version"] == 4 and options["optimize_image"] and grouped:
         try:
             await _run_v4_task(
                 settings, cid, cdir, meta, private, grouped, seedream_sem,
@@ -1924,12 +2225,21 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
             _mark_image_verification_failed(settings, cid, set(grouped))
             return
         def finalize_v4(_meta: dict, post: dict) -> None:
+            # Manifest-last: canonical directories may have been staged, but no
+            # segment becomes observable as done until every v4 publish and the
+            # complete verification receipt have succeeded.
+            for item in post.get("segments", []):
+                if item.get("index") in audit_grouped:
+                    item.update(
+                        status="done", stage="done",
+                        completed_frames=item.get("total_frames"), error=None,
+                    )
             post.update(status="done", error=None)
-            post["frames"] = sorted(
+            post["frames"] = [
                 _frame_ref(item["index"], path.name)
                 for item in post.get("segments", []) if item.get("status") == "done"
                 for path in _canonical_files(settings.data_dir / cid, item["index"])
-            )
+            ]
         _mutate_postprocess(settings, cid, finalize_v4)
         return
     try:
@@ -2026,6 +2336,14 @@ async def retry_segment(settings: Settings, cid: str, index: int, payload: dict,
             target = next((item for item in segments if item.get("index") == index), None)
             if target is None or target.get("status") != "failed":
                 raise PostprocessError(409, "segment_not_retryable")
+            v4_project_dag = private["version"] == 4 and canonical["optimize_image"]
+            if v4_project_dag and target.get("error") == "submission_unknown":
+                # A paid anchor may have reached the provider.  This remains a
+                # GET/recovery case, never a retry that could create a second
+                # project DAG submission.
+                raise PostprocessError(409, "submission_unknown")
+            if v4_project_dag and target.get("error") != "provider_rejected":
+                raise PostprocessError(409, "segment_not_retryable")
             if target.get("revision") != expected:
                 raise PostprocessError(409, _structured(
                     "postprocess_revision_changed", "分段状态已更新，请刷新页面后重试。"
@@ -2034,6 +2352,13 @@ async def retry_segment(settings: Settings, cid: str, index: int, payload: dict,
                 status="running", error=None, revision=expected + 1,
                 stage=target.get("stage") or "queued",
             )
+            if v4_project_dag:
+                # The schedule is one project DAG.  A segment endpoint may
+                # start a retry, but the resumed run must revalidate/reuse the
+                # exact complete graph rather than isolate that segment.
+                for item in segments:
+                    if item is not target:
+                        item.update(status="running", error=None, stage="queued")
             post.update(status="running", error=None, segments=segments)
             meta["postprocess"] = post
 
@@ -2051,8 +2376,8 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
     frame_refs = state.get("frames")
     if not isinstance(frame_refs, list) or any(not isinstance(item, str) for item in frame_refs):
         raise PostprocessError(409, "postprocess_artifacts_invalid")
-    available = set(frame_refs)
     selected = []
+    expected_refs = []
     work = cdir.resolve() / "work"
     for original in originals:
         source = original.resolve()
@@ -2069,15 +2394,33 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
             ref = f"segments/{parts[1]}/work/postprocessed/{source.name}"
         else:
             raise PostprocessError(409, "postprocess_artifacts_invalid")
-        if ref not in available or not output.is_file():
+        if not output.is_file():
             raise PostprocessError(409, "postprocess_artifacts_invalid")
+        expected_refs.append(ref)
         selected.append(output)
+    # The public postprocess manifest is an ordered frozen input contract for
+    # H3, not a set membership hint.  Reordering, omitting, or adding frames
+    # must therefore be rejected before any generated image is exposed.
+    if frame_refs != expected_refs:
+        raise PostprocessError(409, "postprocess_artifacts_invalid")
     if len({path.resolve() for path in selected}) != len(selected):
         raise PostprocessError(409, "postprocess_artifacts_invalid")
+    frozen_intent = meta.get("_postprocess_receipt")
+    frozen_v4_intent = (
+        isinstance(frozen_intent, dict)
+        and frozen_intent.get("version") == 4
+        and isinstance(frozen_intent.get("options"), dict)
+        and frozen_intent["options"].get("optimize_image") is True
+    )
     optimization = image_optimization.receipt(meta)
-    if optimization is not None and optimization.get("version") == 4:
+    expected_v4 = frozen_v4_intent or (
+        isinstance(optimization, dict) and optimization.get("version") == 4
+    )
+    if expected_v4:
         raw = meta.get("_image_verification")
         try:
+            if not isinstance(optimization, dict) or optimization.get("version") != 4:
+                raise ValueError
             plan = image_optimization.dual_target_plan_receipt(meta)
             if not isinstance(plan, dict) or plan.get("version") != 4:
                 raise ValueError
@@ -2096,7 +2439,7 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                 set(raw) != {
                     "version", "plan_sha256", "continuity_sha256",
                     "scene_anchor_schedule_sha256",
-                    "semantic_receipts", "source_palette_receipt_sha256",
+                    "semantic_receipts", "anchor_receipts", "source_palette_receipt_sha256",
                     "palette_metrics", "palette_metrics_sha256", "frames", "verdict", "sha256",
                 }
                 or raw["version"] != 1
@@ -2128,12 +2471,44 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                 source_sha256s[(segment_index, int(original.stem))] = hashlib.sha256(
                     original.read_bytes()
                 ).hexdigest()
+            anchors = _v4_anchor_receipt_index(
+                cdir, plan, optimization["scene_anchor_schedule"]
+            )
+            expected_anchor_manifest = [
+                {
+                    "scene_id": descriptor["scene_id"],
+                    "label": descriptor["label"],
+                    "sha256": next(
+                        receipt["sha256"] for receipt in anchors.values()
+                        if receipt["scene_id"] == descriptor["scene_id"]
+                        and receipt["label"] == descriptor["label"]
+                    ),
+                }
+                for descriptor in _v4_expected_anchor_descriptors(
+                    plan, optimization["scene_anchor_schedule"]
+                )
+            ]
+            if raw["anchor_receipts"] != expected_anchor_manifest:
+                raise ValueError
+            if not all(_valid_v4_anchor_receipt(
+                cdir, receipt,
+                plan_sha256=optimization["plan_sha256"],
+                continuity_sha256=optimization["continuity_sha256"],
+                source_sha256s=source_sha256s,
+                anchors=anchors,
+            ) for receipt in anchors.values()):
+                raise ValueError
+            if [item.get("label") for item in raw["semantic_receipts"]] != _v4_semantic_labels(
+                optimization["scene_anchor_schedule"]
+            ):
+                raise ValueError
             for item in raw["semantic_receipts"]:
                 if not isinstance(item, dict) or set(item) != {"label", "sha256"}:
                     raise ValueError
                 receipt = _load_json_receipt(_semantic_receipt_path(cdir, item["label"]))
                 if (
                     receipt is None or receipt.get("sha256") != item["sha256"]
+                    or receipt.get("label") != item["label"]
                     or receipt.get("plan_sha256") != optimization["plan_sha256"]
                     or receipt.get("continuity_sha256") != optimization["continuity_sha256"]
                     or receipt.get("verdict", {}).get("passed") is not True
@@ -2144,6 +2519,7 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                 ):
                     raise ValueError
             pairs = []
+            expected_verified_frames = []
             for original, output in zip(originals, selected):
                 segment_index = 0
                 relative = original.resolve().relative_to(work)
@@ -2155,15 +2531,26 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                     or item["output_sha256"] != hashlib.sha256(output.read_bytes()).hexdigest()
                 ):
                     raise ValueError
+                expected_verified_frames.append({
+                    "segment_index": segment_index,
+                    "frame_name": original.name,
+                    "source_sha256": item["source_sha256"],
+                    "output_sha256": item["output_sha256"],
+                })
                 pairs.append((segment_index, original, output))
+            if raw["frames"] != expected_verified_frames:
+                raise ValueError
             if not _valid_palette_metrics_for_outputs(raw["palette_metrics"], pairs):
                 raise ValueError
-        except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        except (AttributeError, KeyError, OSError, StopIteration, TypeError, ValueError):
             raise PostprocessError(409, "postprocess_artifacts_invalid") from None
     return selected
 
 
 _ATTEMPT_RE = re.compile(r"^\d+-r([1-9]\d*)\.json$")
+_ANCHOR_ATTEMPT_RE = re.compile(
+    r"^[1-9]\d*-(?:global|pack-alternate|person-[A-Z0-9_]+-(?:primary|alternate)|layout-\d{4}|fanout-\d{4}-\d{4})-r1\.json$"
+)
 
 
 def _ambiguous_segments(cdir: Path, post: object) -> set[int]:
@@ -2193,6 +2580,22 @@ def _ambiguous_segments(cdir: Path, post: object) -> set[int]:
     return ambiguous
 
 
+def _ambiguous_v4_anchor_attempts(cdir: Path) -> bool:
+    root = cdir / "work" / ".postprocess-private" / "scene-anchors"
+    if not root.is_dir():
+        return False
+    for attempt in root.glob("*/attempts/*.json"):
+        if _ANCHOR_ATTEMPT_RE.match(attempt.name) is None:
+            return True
+        try:
+            payload = json.loads(attempt.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return True
+        if payload.get("status") in {"submitting", "submission_unknown"}:
+            return True
+    return False
+
+
 def recover_running(settings: Settings) -> list[str]:
     """Fail ambiguous Seedream submissions; return only locally safe jobs to resume."""
     jobs = []
@@ -2212,7 +2615,15 @@ def recover_running(settings: Settings) -> list[str]:
             )
             continue
         ambiguous = _ambiguous_segments(settings.data_dir / cid, post)
-        if ambiguous:
+        anchor_ambiguous = private["version"] == 4 and _ambiguous_v4_anchor_attempts(
+            settings.data_dir / cid
+        )
+        if anchor_ambiguous:
+            ambiguous.update(
+                item.get("index") for item in post.get("segments", [])
+                if isinstance(item, dict) and isinstance(item.get("index"), int)
+            )
+        if ambiguous or anchor_ambiguous:
             for index in ambiguous:
                 _update_segment(
                     settings, cid, index, status="failed", error="submission_unknown"

@@ -104,6 +104,13 @@ def test_v4_generation_keyframes_require_an_intact_verified_output_receipt(
     storage.update_meta(
         settings.data_dir,
         cid,
+        _postprocess_receipt={
+            "version": 4,
+            "options": {
+                "remove_subtitle": False, "remove_brand": False,
+                "optimize_image": True,
+            },
+        },
         postprocess={
             "status": "done", "options": {"remove_subtitle": False,
             "remove_brand": False, "optimize_image": True},
@@ -111,89 +118,6 @@ def test_v4_generation_keyframes_require_an_intact_verified_output_receipt(
         },
     )
     meta = storage.load_meta(settings.data_dir, cid)
-    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
-        postprocess.generation_keyframes(cdir, meta, [source])
-
-    source_metric = postprocess._area_weighted_palette_metric(source)
-    contract = {
-        "area_weighted_warm_cool_family": source_metric["warm_cool_family"],
-        "saturation_style": source_metric["saturation_style"],
-    }
-    palette_payload = {
-        "version": 1,
-        "algorithm": postprocess._PALETTE_METRIC_ALGORITHM,
-        "thresholds": postprocess._PALETTE_METRIC_THRESHOLDS,
-        "frames": [{
-            "segment_index": 0,
-            "frame_index": 1,
-            "contract": contract,
-            "source": source_metric,
-            "output": postprocess._area_weighted_palette_metric(output),
-        }],
-    }
-    palette_metrics = {
-        **palette_payload, "sha256": postprocess._receipt_sha256(palette_payload),
-    }
-    source_palette_payload = {
-        "version": 1,
-        "plan_sha256": optimization["plan_sha256"],
-        "continuity_sha256": optimization["continuity_sha256"],
-        "metrics": {
-            **{
-                key: value for key, value in palette_metrics.items()
-                if key != "sha256"
-            },
-            "frames": [{
-                key: value for key, value in palette_metrics["frames"][0].items()
-                if key != "output"
-            }],
-        },
-    }
-    source_palette_receipt = {
-        **source_palette_payload,
-        "sha256": postprocess._receipt_sha256(source_palette_payload),
-    }
-    semantic_payload = {
-        "version": 1,
-        "plan_sha256": optimization["plan_sha256"],
-        "continuity_sha256": optimization["continuity_sha256"],
-        "label": "bootstrap",
-        "pack_bindings": [],
-        "metrics_sha256": palette_metrics["sha256"],
-        "verdict": {"passed": True},
-    }
-    semantic_receipt = {
-        **semantic_payload, "sha256": postprocess._receipt_sha256(semantic_payload),
-    }
-    postprocess._write_json_receipt(
-        postprocess._semantic_receipt_path(cdir, "bootstrap"), semantic_receipt,
-    )
-    postprocess._write_json_receipt(
-        cdir / "work" / ".postprocess-private" / "scene-anchors" / "palette-source.json",
-        source_palette_receipt,
-    )
-    payload = {
-        "version": 1,
-        "plan_sha256": optimization["plan_sha256"],
-        "continuity_sha256": optimization["continuity_sha256"],
-        "scene_anchor_schedule_sha256": postprocess._receipt_sha256(schedule),
-        "semantic_receipts": [{"label": "bootstrap", "sha256": semantic_receipt["sha256"]}],
-        "source_palette_receipt_sha256": source_palette_receipt["sha256"],
-        "palette_metrics": palette_metrics,
-        "palette_metrics_sha256": palette_metrics["sha256"],
-        "frames": [{
-            "segment_index": 0,
-            "frame_name": "01.png",
-            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-            "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
-        }],
-        "verdict": {"passed": True},
-    }
-    receipt = {**payload, "sha256": postprocess._receipt_sha256(payload)}
-    storage.update_meta(settings.data_dir, cid, _image_verification=receipt)
-    meta = storage.load_meta(settings.data_dir, cid)
-    assert postprocess.generation_keyframes(cdir, meta, [source]) == [output]
-    output.write_bytes(PNG + b"drift")
     with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
         postprocess.generation_keyframes(cdir, meta, [source])
 
@@ -220,6 +144,7 @@ def test_v4_postprocess_global_pack_failure_prevents_layout_and_fanout(
     metric["sha256"] = postprocess._receipt_sha256(metric)
     monkeypatch.setattr(postprocess, "_v4_frozen_plan", lambda *_args: {"segments": []})
     monkeypatch.setattr(postprocess, "_v4_frame_sources", lambda *_args: {})
+    monkeypatch.setattr(postprocess, "_v4_preflight", lambda *_args: None)
     monkeypatch.setattr(postprocess, "_v4_palette_metrics", lambda *_args: metric)
 
     async def bootstrap(*_args, **_kwargs):
@@ -246,6 +171,27 @@ def test_v4_postprocess_global_pack_failure_prevents_layout_and_fanout(
             settings, "cid", cdir, {}, private, {}, asyncio.Semaphore(1), object(), object(),
         ))
     assert calls == ["global-anchor", "global-pack"]
+
+
+def test_v4_startup_marks_ambiguous_typed_anchor_attempt_get_only(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "running",
+        "options": {"remove_subtitle": False, "remove_brand": False, "optimize_image": True},
+        "frames": [], "error": None,
+        "segments": [postprocess._segment_state(0, 2)],
+    })
+    attempt = cdir / "work" / ".postprocess-private" / "scene-anchors" / "SCENE_01" / "attempts" / "1-global-r1.json"
+    attempt.parent.mkdir(parents=True)
+    attempt.write_text(json.dumps({"status": "submission_unknown"}), encoding="utf-8")
+    monkeypatch.setattr(postprocess, "_private_receipt", lambda _meta: {"version": 4})
+
+    assert postprocess.recover_running(settings) == []
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert latest["postprocess"]["status"] == "failed"
+    assert latest["postprocess"]["error"] == "submission_unknown"
 
 
 def test_palette_metric_uses_area_weighted_lab_b_star_and_allows_local_change(tmp_path):

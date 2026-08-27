@@ -579,7 +579,12 @@ def _frame_inventory(
                     else (
                         "hard_cut"
                         if frame_index == 1 and lineage["join_mode"] == "hard_cut"
-                        else "camera_motion"
+                        # Chain lineage proves continuity but contains no measured
+                        # camera transform.  It can therefore establish only the
+                        # conservative same-camera relation; motion needs a
+                        # versioned, source-bound measurement before it may be
+                        # frozen as evidence.
+                        else "same_camera"
                     )
                 )
                 evidence = {

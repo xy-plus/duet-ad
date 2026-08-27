@@ -1833,35 +1833,95 @@ def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
         }
 
     segments = {item["segment_index"]: item for item in canonical["segments"]}
-    order = 1
-    scenes = []
+    scene_by_segment = {
+        segment["segment_index"]: segment["scene"]["scene_id"]
+        for segment in canonical["segments"]
+    }
+
+    def visible_scene_alternate(scene_id: str, primary: tuple[int, int]) -> tuple[int, int]:
+        candidates = [
+            (frame["segment_index"], frame["frame_index"])
+            for frame in frames
+            if frame["scene_id"] == scene_id
+            and (frame["segment_index"], frame["frame_index"]) != primary
+            and any(item["visibility"] in {"full", "partial", "edge_fragment"}
+                    for item in frame["scene_continuity_view"]["observations"])
+        ]
+        if not candidates:
+            raise ValueError("invalid image optimization anchor schedule")
+        return min(candidates)
+
+    def person_alternate(person: dict) -> tuple[int, int]:
+        reference = person["reference"]
+        primary = (reference["segment_index"], reference["frame_index"])
+        candidates = sorted(
+            (segment["segment_index"], frame_index)
+            for segment in canonical["segments"]
+            for instance in segment["persons"]
+            if instance["id"] == person["id"] and instance["state"] == "replace"
+            for frame_index in instance["observable_frames"]
+            if (segment["segment_index"], frame_index) != primary
+        )
+        if not candidates:
+            raise ValueError("invalid image optimization anchor schedule")
+        return candidates[0]
+
+    # Every paid node is ordered and named before runtime.  Runtime may only
+    # replay this immutable DAG, never allocate an order with a dynamic max().
+    node_specs: list[tuple[str, str, int, int]] = []
     for scene in canonical["scene_plans"]:
         reference = scene["reference"]
-        global_anchor = frozen_anchor(
-            reference["segment_index"], reference["frame_index"], order
+        node_specs.append((scene["id"], "global", reference["segment_index"], reference["frame_index"]))
+    for scene in canonical["scene_plans"]:
+        reference = scene["reference"]
+        alternate = visible_scene_alternate(
+            scene["id"], (reference["segment_index"], reference["frame_index"])
         )
-        order += 1
-        layouts = []
+        node_specs.append((scene["id"], "pack-alternate", *alternate))
+    for person in canonical["person_plans"]:
+        reference = person["reference"]
+        node_specs.extend([
+            (scene_by_segment[reference["segment_index"]], f"person-{person['id']}-primary", reference["segment_index"], reference["frame_index"]),
+            (scene_by_segment[person_alternate(person)[0]], f"person-{person['id']}-alternate", *person_alternate(person)),
+        ])
+    layout_keys = set()
+    for scene in canonical["scene_plans"]:
         for segment_index in scene["segments"]:
             segment = segments.get(segment_index)
             if segment is None or segment["scene"]["scene_id"] != scene["id"]:
                 raise ValueError("invalid image optimization anchor schedule")
-            layouts.append(frozen_anchor(
-                segment_index,
-                segment["scene"]["layout_reference_frame_index"],
-                order,
-            ))
-            order += 1
+            frame_index = segment["scene"]["layout_reference_frame_index"]
+            layout_keys.add((segment_index, frame_index))
+            node_specs.append((scene["id"], f"layout-{segment_index:04d}", segment_index, frame_index))
+    for segment in canonical["segments"]:
+        index = segment["segment_index"]
+        for frame in segment["frame_constraints"]:
+            frame_index = frame["frame_index"]
+            if (index, frame_index) not in layout_keys:
+                node_specs.append((scene_by_segment[index], f"fanout-{index:04d}-{frame_index:04d}", index, frame_index))
+    if len({(scene_id, label) for scene_id, label, _segment, _frame in node_specs}) != len(node_specs):
+        raise ValueError("invalid image optimization anchor schedule")
+    nodes = [
+        {"scene_id": scene_id, "label": label, "anchor": frozen_anchor(segment_index, frame_index, order)}
+        for order, (scene_id, label, segment_index, frame_index) in enumerate(node_specs, 1)
+    ]
+    node_by_identity = {(item["scene_id"], item["label"]): item["anchor"] for item in nodes}
+    scenes = []
+    for scene in canonical["scene_plans"]:
         scenes.append({
             "scene_id": scene["id"],
-            "global_anchor": global_anchor,
-            "segment_layout_anchors": layouts,
+            "global_anchor": node_by_identity[(scene["id"], "global")],
+            "segment_layout_anchors": [
+                node_by_identity[(scene["id"], f"layout-{segment_index:04d}")]
+                for segment_index in scene["segments"]
+            ],
         })
     return {
         "version": 4,
         "plan_sha256": execution_inputs["plan_sha256"],
         "execution_input_sha256": execution_inputs["sha256"],
         "scenes": scenes,
+        "nodes": nodes,
     }
 
 
