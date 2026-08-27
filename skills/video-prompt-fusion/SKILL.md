@@ -72,12 +72,10 @@ VoiceReference = { voice_ref: Int1; path: NonEmpty; sha256: Sha256; purpose: "vo
 <VISUAL>
 融合后的单段视觉提示词
 </VISUAL>
-<AUDIO_CONTENT_JSON>
-audio_content.lines_json
-</AUDIO_CONTENT_JSON>
+<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>
 ```
 
-`<VISUAL>` 只写融合后的视觉内容。`<AUDIO_CONTENT_JSON>` 与 `</AUDIO_CONTENT_JSON>` 之间逐字复制 `audio_content.lines_json`；即使其值为 `[]` 也保留这两个标记。音频块之外不得再复述或改写音频内容。
+`<VISUAL>` 只写融合后的视觉内容。把示例中的 `{lines_json}` 替换为并逐字复制 `audio_content.lines_json`：opening tag 的下一 byte 必须是 `lines_json` 首 byte，closing tag 紧随 `lines_json` 末 byte，中间不得增加换行、空格或其他字符。即使其值为 `[]` 也保留这两个标记。音频块之外不得再复述或改写音频内容。
 
 ## 唯一输出
 
