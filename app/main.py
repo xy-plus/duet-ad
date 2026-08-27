@@ -881,7 +881,7 @@ def _freeze_submission(
     work = cdir / "work"
     originals = _original_keyframes(cdir, meta)
     try:
-        originals = postprocess.generation_keyframes(cdir, meta, originals)
+        originals = postprocess.generation_keyframes(cdir, meta, originals, settings=settings)
     except postprocess.PostprocessError as exc:
         detail = exc.detail if isinstance(exc.detail, str) else exc.detail["code"]
         raise _SubmitError(exc.status, detail) from None
@@ -1600,7 +1600,7 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
                         paths.add(fit_root / "continued" / tail.name)
     try:
         selected_keyframes = postprocess.generation_keyframes(
-            cdir, meta, selected_sources
+            cdir, meta, selected_sources, settings=settings,
         )
     except postprocess.PostprocessError:
         selected_keyframes = []

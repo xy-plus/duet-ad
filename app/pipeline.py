@@ -693,6 +693,7 @@ def _generate_image_optimization_project(
                 segments,
                 settings.seedream_edit_mode,
                 session_dir=session_dir,
+                expected_version=4,
             )
         except image_optimization.ImageOptimizationOutputError as exc:
             raise PipelineError(str(exc), retryable=True) from None

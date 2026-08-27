@@ -115,6 +115,33 @@ def _segments(
     return result
 
 
+def _transition_skeleton(segments: list[dict]) -> list[dict]:
+    return [
+        {
+            **segment,
+            "transition_skeleton": [
+                {
+                    "segment_index": segment["index"],
+                    "frame_index": frame_index,
+                    "frame_name": frame.name,
+                    "source_sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
+                    "source_transition_from_previous": (
+                        "start" if segment["index"] == segments[0]["index"]
+                        and frame_index == 1 else "same_camera"
+                    ),
+                    "source_transition_evidence_sha256": (
+                        str(frame_index) * 64
+                    ),
+                }
+                for frame_index, frame in enumerate(
+                    sorted(Path(segment["keyframes_dir"]).glob("*.png")), 1
+                )
+            ],
+        }
+        for segment in segments
+    ]
+
+
 class _Runner:
     def __init__(self, output: object) -> None:
         self.output = output
@@ -364,6 +391,7 @@ def test_plan_phase_returns_v2_plan_and_compiled_dual_target_prompts(tmp_path):
         _segments(session),
         "independent_parallel",
         session_dir=session,
+        expected_version=2,
     )
 
     assert plan == _plan()
@@ -400,6 +428,7 @@ def test_short_video_can_express_both_targets_without_special_noop_contract(tmp_
         _segments(session, [0]),
         "anchor_consistency",
         session_dir=session,
+        expected_version=2,
     )
 
     assert generated["person_plans"] and generated["scene_plans"]
@@ -417,6 +446,7 @@ def test_plan_phase_v3_compiles_one_prompt_for_each_frozen_source_frame(tmp_path
         _segments(session, [0], frames=2),
         "independent_parallel",
         session_dir=session,
+        expected_version=3,
     )
 
     assert generated["version"] == 3
@@ -437,6 +467,7 @@ def test_ineligible_plan_is_a_stable_failure_not_successful_noop(tmp_path):
             _segments(session, [0]),
             "independent_parallel",
             session_dir=session,
+            expected_version=2,
         )
 
 
@@ -2068,7 +2099,7 @@ def test_v4_plan_phase_canonicalizes_then_compiles_per_frame(tmp_path):
 
     plan, prompts = image_optimization.generate_project_prompts(
         runner,
-        _segments(session, indices=[1, 2]),
+        _transition_skeleton(_segments(session, indices=[1, 2])),
         "independent_parallel",
         session_dir=session,
     )
@@ -2076,6 +2107,17 @@ def test_v4_plan_phase_canonicalizes_then_compiles_per_frame(tmp_path):
     assert set(prompts) == {1, 2}
     assert set(prompts[1]) == {1}
     assert set(prompts[2]) == {1}
+
+
+def test_generate_project_prompts_rejects_v4_without_backend_transition_skeleton(tmp_path):
+    session = tmp_path / "session"
+    with pytest.raises(ValueError, match="image optimization segments"):
+        image_optimization.generate_project_prompts(
+            _Runner(_generic_scene_continuity_plan()),
+            _segments(session, indices=[1, 2]),
+            "independent_parallel",
+            session_dir=session,
+        )
 
 
 def _generic_plan_audit_verdict(

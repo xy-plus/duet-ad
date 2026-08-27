@@ -639,7 +639,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         if workflow in h3.H3_REFERENCE_WORKFLOWS:
             try:
                 selected_paths = postprocess.generation_keyframes(
-                    root, dict(meta), keyframe_paths
+                    root, dict(meta), keyframe_paths, settings=settings,
                 )
             except postprocess.PostprocessError as exc:
                 detail = exc.detail if isinstance(exc.detail, str) else exc.detail["code"]

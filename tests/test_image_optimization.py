@@ -1637,8 +1637,7 @@ def test_v4_combined_mediakit_preprocesses_all_canvases_before_audit_or_seedream
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(source.read_bytes())
         receipt = {
-            "version": 1,
-            "state": "succeeded",
+            "version": 1, "state": "succeeded",
             "source": {"sha256": hashlib.sha256(source.read_bytes()).hexdigest()},
             "scenes": [scenes[0]],
             "stages": [{"scene": scenes[0], "state": "succeeded"}],
@@ -1830,10 +1829,12 @@ def test_v4_source_palette_contract_mismatch_blocks_first_seedream_post(
         audit_runner=runner, verification_runner=runner,
     ))
 
-    assert runner.phases == ["plan_audit"]
+    # Raw source/contract preflight is authoritative and must reject before
+    # either MediaKit or the model-facing audit receives paid work.
+    assert runner.phases == []
     assert calls == []
     latest = storage.load_meta(settings.data_dir, cid)
-    assert latest["postprocess"]["error"] == "dominant_palette_source_mismatch"
+    assert latest["postprocess"]["error"] == "image_plan_audit_failed"
 
 
 @pytest.mark.parametrize(
@@ -1920,9 +1921,24 @@ def test_v4_runtime_uses_anchor_dag_before_pack_then_fanout_and_publish(
                     "input_sha256s", "anchor_receipt_sha256", "output_sha256",
                     "palette_metric",
                 }
+    layout_semantic = json.loads(
+        postprocess._semantic_receipt_path(cdir, "layout-0000").read_text(
+            encoding="utf-8"
+        )
+    )
+    scene_binding = next(
+        item for item in layout_semantic["pack_bindings"] if item["kind"] == "scene"
+    )
+    # The layout endpoint remains distinct even if it projects the same source
+    # view as the global anchor; it is the verified precondition for fan-out.
+    assert scene_binding["alternate"]["label"] == "layout-0000"
+    assert scene_binding["primary"]["anchor_receipt_sha256"] != scene_binding[
+        "alternate"
+    ]["anchor_receipt_sha256"]
     assert latest["postprocess"]["frames"] == ["01.png", "02.png"]
     generated = postprocess.generation_keyframes(
         cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
+        settings=settings,
     )
     assert [item.name for item in generated] == ["01.png", "02.png"]
     reordered = deepcopy(latest)
@@ -2089,6 +2105,7 @@ def test_v4_combined_canvas_receipt_binds_anchor_and_h3_sources(tmp_path, monkey
     ).hexdigest()
     generated = postprocess.generation_keyframes(
         cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
+        settings=settings,
     )
     assert [path.name for path in generated] == ["01.png", "02.png"]
     post_count = len(posts)
@@ -2118,6 +2135,7 @@ def test_v4_combined_canvas_receipt_binds_anchor_and_h3_sources(tmp_path, monkey
     with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
         postprocess.generation_keyframes(
             cdir, tampered, sorted((cdir / "work" / "keyframes").glob("*.png")),
+            settings=settings,
         )
 
 
@@ -2199,10 +2217,10 @@ def test_v4_preflight_requires_real_scene_and_person_alternates_before_post(
         settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
         audit_runner=runner, verification_runner=runner,
     ))
-    assert runner.phases == ["plan_audit"]
+    assert runner.phases == []
     assert calls == []
     latest = storage.load_meta(settings.data_dir, cid)
-    assert latest["postprocess"]["error"] == "scene_anchor_alternate_unavailable"
+    assert latest["postprocess"]["error"] == "image_plan_audit_failed"
 
 
 def test_v3_frame_receipt_binds_each_seedream_http_body_to_its_source_frame(

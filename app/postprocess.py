@@ -278,7 +278,7 @@ def _valid_png(candidate: Path, source: Path) -> bool:
         return False
     return (
         decoded is not None and original is not None
-        and decoded.shape[:2] == original.shape[:2]
+        and decoded.shape == original.shape
     )
 
 
@@ -381,6 +381,70 @@ def _v4_palette_metrics(
         "algorithm": _PALETTE_METRIC_ALGORITHM,
         "thresholds": _PALETTE_METRIC_THRESHOLDS,
         "frames": frames,
+    }
+    return {**payload, "sha256": _receipt_sha256(payload)}
+
+
+def _v4_endpoint_palette_metric(
+    plan: dict, sources: dict[tuple[int, int], Path], key: tuple[int, int], output: Path,
+) -> dict:
+    constraints = {
+        (segment["segment_index"], frame["frame_index"]): frame
+        for segment in plan["segments"]
+        for frame in segment["frame_constraints"]
+    }
+    source = sources.get(key)
+    constraint = constraints.get(key)
+    if source is None or not isinstance(constraint, dict):
+        raise PostprocessError(409, "dominant_palette_metric_invalid")
+    contract = constraint["dominant_palette_contract"]
+    source_metric = _area_weighted_palette_metric(source)
+    output_metric = _area_weighted_palette_metric(output)
+    if (
+        source_metric["warm_cool_family"] != contract["area_weighted_warm_cool_family"]
+        or source_metric["saturation_style"] != contract["saturation_style"]
+    ):
+        raise PostprocessError(409, "dominant_palette_source_mismatch")
+    if (
+        output_metric["warm_cool_family"] != contract["area_weighted_warm_cool_family"]
+        or output_metric["saturation_style"] != contract["saturation_style"]
+    ):
+        raise PostprocessError(409, "dominant_palette_verification_failed")
+    return {
+        "segment_index": key[0], "frame_index": key[1],
+        "contract": deepcopy(contract), "source": source_metric, "output": output_metric,
+    }
+
+
+def _v4_pack_palette_metrics(
+    plan: dict, sources: dict[tuple[int, int], Path], cdir: Path,
+    anchor_receipts: list[dict], person_packs: list[dict], scene_packs: list[dict],
+) -> dict:
+    """Freeze every semantic endpoint's Lab metrics against its own source view."""
+    endpoints = []
+    for kind, id_key, packs in (
+        ("person", "person_id", person_packs), ("scene", "scene_id", scene_packs),
+    ):
+        for pack in packs:
+            identifier = pack[id_key]
+            for role in ("primary", "alternate"):
+                output = Path(pack[f"{role}_path"]).resolve()
+                matches = [
+                    receipt for receipt in anchor_receipts
+                    if receipt.get("output_sha256") == _sha256_path(output)
+                    and _anchor_output_path(cdir, receipt) == output
+                ]
+                if len(matches) != 1:
+                    raise PostprocessError(409, "image_reference_pack_failed")
+                anchor = matches[0]["anchor"]
+                key = (anchor["segment_index"], anchor["frame_index"])
+                endpoints.append({
+                    "kind": kind, "id": identifier, "role": role,
+                    **_v4_endpoint_palette_metric(plan, sources, key, output),
+                })
+    payload = {
+        "version": 1, "algorithm": _PALETTE_METRIC_ALGORITHM,
+        "thresholds": _PALETTE_METRIC_THRESHOLDS, "endpoints": endpoints,
     }
     return {**payload, "sha256": _receipt_sha256(payload)}
 
@@ -756,6 +820,7 @@ async def start(settings: Settings, cid: str, payload: dict,
                     generation_keyframes(
                         cdir, meta,
                         [source for index in sorted(grouped) for source, _ in grouped[index]],
+                        settings=settings,
                     )
                 except (PostprocessError, ValueError):
                     raise PostprocessError(409, "postprocess_artifacts_invalid") from None
@@ -888,6 +953,28 @@ def _v4_mediakit_success(source: Path, output: Path, scene: str) -> dict | None:
     receipt_path = output.parent / ".mediakit" / f"{output.name}.json"
     if not output.exists() and not receipt_path.exists():
         return None
+    if not output.exists():
+        # A durable response_received receipt has already crossed the paid
+        # boundary.  Hand it back to MediaKit's own GET/download recovery
+        # rather than treating it as permission for a second erase POST.
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(receipt, dict)
+                and receipt.get("version") == mediakit.RECEIPT_VERSION
+                and receipt.get("state") == "response_received"
+                and receipt.get("scenes") == [scene]
+                and isinstance(receipt.get("source"), dict)
+                and receipt["source"].get("sha256") == _sha256_path(source)
+                and isinstance(receipt.get("stages"), list)
+                and len(receipt["stages"]) == 1
+                and receipt["stages"][0].get("state") == "response_received"
+                and receipt["stages"][0].get("scene") == scene
+            ):
+                return None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        raise PostprocessError(409, "submission_unknown")
     try:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         source_sha256 = _sha256_path(source)
@@ -1294,8 +1381,18 @@ def _semantic_receipt(
     metric_payload = {key: value for key, value in metrics.items() if key != "sha256"}
     if metrics.get("sha256") != _receipt_sha256(metric_payload):
         raise PostprocessError(409, "dominant_palette_metric_invalid")
+    try:
+        metric_by_endpoint = {
+            (item["kind"], item["id"], item["role"]): item
+            for item in metrics["endpoints"]
+        }
+        if len(metric_by_endpoint) != len(metrics["endpoints"]):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise PostprocessError(409, "dominant_palette_metric_invalid") from None
+
     def binding(kind: str, identifier: str, pack: dict) -> dict:
-        def output_binding(value: object) -> dict:
+        def output_binding(value: object, role: str) -> dict:
             try:
                 path = Path(value)
                 output_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1311,6 +1408,9 @@ def _semantic_receipt(
             if len(matches) != 1:
                 raise PostprocessError(409, "image_reference_pack_failed")
             match = matches[0]
+            metric = metric_by_endpoint.get((kind, identifier, role))
+            if not isinstance(metric, dict):
+                raise PostprocessError(409, "dominant_palette_metric_invalid")
             # Keep a canonical snapshot of the exact typed input receipt in
             # every semantic binding.  A receipt digest alone cannot prove
             # that primary and alternate roles have not been interchanged.
@@ -1322,12 +1422,12 @@ def _semantic_receipt(
                 "input_sha256s": deepcopy(match["input_sha256s"]),
                 "anchor_receipt_sha256": match["sha256"],
                 "output_sha256": output_sha256,
-                "palette_metric": _area_weighted_palette_metric(path),
+                "palette_metric": deepcopy(metric),
             }
         try:
             source_sha256 = hashlib.sha256(Path(pack["source_path"]).read_bytes()).hexdigest()
-            primary = output_binding(pack["primary_path"])
-            alternate = output_binding(pack["alternate_path"])
+            primary = output_binding(pack["primary_path"], "primary")
+            alternate = output_binding(pack["alternate_path"], "alternate")
         except KeyError:
             raise PostprocessError(409, "image_reference_pack_failed") from None
         if primary == alternate:
@@ -1506,7 +1606,8 @@ def _v4_anchor_receipt_index(cdir: Path, plan: dict, schedule: dict) -> dict[str
 
 def _valid_v4_anchor_receipt(
     cdir: Path, receipt: dict, *, plan_sha256: str, continuity_sha256: str,
-    source_sha256s: dict[tuple[int, int], str], anchors: dict[str, dict],
+    source_sha256s: dict[tuple[int, int], str],
+    source_paths: dict[tuple[int, int], Path], anchors: dict[str, dict],
 ) -> bool:
     if not isinstance(receipt, dict) or set(receipt) != {
         "version", "plan_sha256", "continuity_sha256", "scene_id", "label",
@@ -1530,6 +1631,7 @@ def _valid_v4_anchor_receipt(
             or receipt["input_sha256s"][:1] != [source_sha256]
             or hashlib.sha256(_anchor_output_path(cdir, receipt).read_bytes()).hexdigest()
             != receipt["output_sha256"]
+            or not _valid_png(_anchor_output_path(cdir, receipt), source_paths[key])
         ):
             return False
         roles = receipt["input_roles"]
@@ -1558,7 +1660,13 @@ def _valid_v4_anchor_receipt(
 def _valid_semantic_pack_bindings(
     cdir: Path, plan: dict, schedule: dict, receipt: dict,
     source_sha256s: dict[tuple[int, int], str],
+    source_paths: dict[tuple[int, int], Path],
 ) -> bool:
+    if set(receipt) != {
+        "version", "plan_sha256", "continuity_sha256", "label", "pack_bindings",
+        "metrics_sha256", "verdict", "sha256",
+    }:
+        return False
     bindings = receipt.get("pack_bindings")
     expected = [
         ("person", item["id"], item["reference"])
@@ -1579,6 +1687,7 @@ def _valid_semantic_pack_bindings(
             item["scene_id"]: item for item in schedule["scenes"]
         }
         endpoint_receipts = []
+        endpoint_metrics = []
         for binding, (kind, identifier, reference) in zip(bindings, expected):
             if not isinstance(binding, dict) or set(binding) != {
                 "kind", "id", "source_sha256", "primary", "alternate",
@@ -1601,17 +1710,26 @@ def _valid_semantic_pack_bindings(
                         "scene_id", "label", "anchor", "input_roles", "input_sha256s",
                         "output_sha256",
                     ))
-                    or _area_weighted_palette_metric(_anchor_output_path(cdir, anchor))
-                    != side["palette_metric"]
                     or not _valid_v4_anchor_receipt(
                         cdir, anchor,
                         plan_sha256=receipt["plan_sha256"],
                         continuity_sha256=receipt["continuity_sha256"],
                         source_sha256s=source_sha256s,
+                        source_paths=source_paths,
                         anchors=anchors,
                     )
                 ):
                     return False
+                key = (anchor["anchor"]["segment_index"], anchor["anchor"]["frame_index"])
+                metric = {
+                    "kind": kind, "id": identifier, "role": role,
+                    **_v4_endpoint_palette_metric(
+                        plan, source_paths, key, _anchor_output_path(cdir, anchor),
+                    ),
+                }
+                if side["palette_metric"] != metric:
+                    return False
+                endpoint_metrics.append(metric)
                 endpoint_receipts.append(side["anchor_receipt_sha256"])
             primary = binding["primary"]
             alternate = binding["alternate"]
@@ -1649,15 +1767,24 @@ def _valid_semantic_pack_bindings(
                     or primary["label"] != "global"
                     or (primary["anchor"]["segment_index"], primary["anchor"]["frame_index"])
                     != global_key
-                    or alternate_key == global_key
+                    or primary["anchor_receipt_sha256"] == alternate["anchor_receipt_sha256"]
                     or not (
                         alternate["label"] == "pack-alternate"
                         or alternate["label"].startswith("layout-")
                     )
                 ):
                     return False
-        return len(endpoint_receipts) == len(set(endpoint_receipts))
-    except (KeyError, TypeError, ValueError):
+        metrics_payload = {
+            "version": 1, "algorithm": _PALETTE_METRIC_ALGORITHM,
+            "thresholds": _PALETTE_METRIC_THRESHOLDS,
+            "endpoints": endpoint_metrics,
+        }
+        metrics = {**metrics_payload, "sha256": _receipt_sha256(metrics_payload)}
+        return (
+            len(endpoint_receipts) == len(set(endpoint_receipts))
+            and receipt.get("metrics_sha256") == metrics["sha256"]
+        )
+    except (KeyError, OSError, TypeError, ValueError):
         return False
 
 
@@ -1762,7 +1889,7 @@ async def _v4_anchor(
     # The provider may have atomically persisted its exact succeeded attempt
     # and output just before the business anchor receipt is written.  Replay
     # that local attempt only; an absent/ambiguous attempt remains GET-only.
-    if output.exists():
+    if output.exists() or receipt_path.exists() or attempt_path.exists():
         if not attempt_path.is_file():
             raise PostprocessError(409, "submission_unknown")
         try:
@@ -1984,11 +2111,10 @@ async def _v4_generate_layout_anchors(
             bootstrap_outputs[key] = output
             _append_anchor_receipt(anchor_receipts, receipt)
             global_anchor = scene["global_anchor"]
-            alternate_override = (
-                {} if key == (
-                    global_anchor["segment_index"], global_anchor["frame_index"]
-                ) else {scene_id: (key, output)}
-            )
+            # A layout node is always a newly generated typed endpoint, even
+            # when it deliberately shares the global anchor's source frame.
+            # It must therefore be the view verified before any fan-out.
+            alternate_override = {scene_id: (key, output)}
             semantic_receipts.append(await _v4_verify_bootstrap_packs(
                 settings, cdir, cid, private, meta, grouped, seedream_sem, runner,
                 bootstrap_outputs, anchor_receipts,
@@ -2103,14 +2229,9 @@ async def _v4_verify_bootstrap_packs(
             "primary_path": str(primary),
             "alternate_path": str(alternate_output),
         })
-    metric_outputs = dict(bootstrap_outputs)
-    for scene_id, schedule in schedules.items():
-        global_anchor = schedule["global_anchor"]
-        metric_outputs.setdefault(
-            (global_anchor["segment_index"], global_anchor["frame_index"]),
-            global_outputs[scene_id],
-        )
-    metrics = _v4_palette_metrics(plan, sources, metric_outputs)
+    metrics = _v4_pack_palette_metrics(
+        plan, sources, cdir, anchor_receipts, person_packs, scene_packs,
+    )
     try:
         verdict = await asyncio.to_thread(
             image_optimization.generate_reference_pack_verdict,
@@ -2475,6 +2596,20 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         }
     runtime_private = private
     runtime_grouped = grouped
+    if v4_project_dag and runtime_grouped:
+        try:
+            # Structural eligibility belongs before every paid MediaKit or
+            # Seedream edge.  Canvas derivation cannot make an incomplete
+            # project graph safe.
+            plan = _v4_frozen_plan(meta, private)
+            raw_sources = _v4_frame_sources(runtime_grouped, private)
+            _v4_preflight(
+                plan, private, raw_sources,
+            )
+            _v4_palette_metrics(plan, raw_sources)
+        except PostprocessError:
+            _mark_plan_audit_failed(settings, cid, set(grouped))
+            return
     if v4_project_dag and (options["remove_subtitle"] or options["remove_brand"]):
         try:
             runtime_private, runtime_grouped = await _v4_prepare_canvases(
@@ -2668,7 +2803,7 @@ async def retry_segment(settings: Settings, cid: str, index: int, payload: dict,
 
 
 def _v4_canvas_execution_for_h3(
-    cdir: Path, meta: dict, private: dict, originals: list[Path],
+    settings: Settings | None, cdir: Path, meta: dict, private: dict, originals: list[Path],
 ) -> tuple[dict, dict[tuple[int, int], Path]]:
     """Rebuild the only legal v4 canvas source map from terminal MediaKit receipts."""
     combined = private["options"]["remove_subtitle"] or private["options"]["remove_brand"]
@@ -2678,6 +2813,8 @@ def _v4_canvas_execution_for_h3(
              else int(path.resolve().relative_to(cdir / "work").parts[1]), int(path.stem)): path
             for path in originals
         }
+    if settings is None:
+        raise PostprocessError(409, "postprocess_artifacts_invalid")
     raw = meta.get("_v4_canvas_execution")
     if not isinstance(raw, dict):
         raise PostprocessError(409, "postprocess_artifacts_invalid")
@@ -2752,10 +2889,16 @@ def _v4_canvas_execution_for_h3(
             raise PostprocessError(409, "postprocess_artifacts_invalid") from None
     if raw["frames"] != expected_records:
         raise PostprocessError(409, "postprocess_artifacts_invalid")
-    # The execution/prompt/schedule receipt is rebuilt from precisely the
-    # canvas bytes above during runtime and has a stable self-hash here.
+    # Re-derive the entire execution/prompt/schedule receipt from the
+    # receipt-bound canvas records.  A self-consistent replacement JSON must
+    # not redirect H3 to a different graph, prompt, or transition view.
+    expected_derived = _v4_derive_canvas_optimization(
+        settings, meta, private, expected_records,
+    )
+    if raw["derived_optimization"] != expected_derived:
+        raise PostprocessError(409, "postprocess_artifacts_invalid")
     effective = _v4_effective_private(
-        private, raw["derived_optimization"], raw["sha256"],
+        private, expected_derived, raw["sha256"],
     )
     execution_frames = effective["execution_inputs"]["frames"]
     if [
@@ -2800,15 +2943,18 @@ def _validate_mediakit_only_outputs(
         raise PostprocessError(409, "postprocess_artifacts_invalid") from None
 
 
-def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[Path]:
+def generation_keyframes(
+    cdir: Path, meta: dict, originals: list[Path], *, settings: Settings | None = None,
+) -> list[Path]:
     state = meta.get("postprocess")
     if state is None:
-        frozen = meta.get("_postprocess_receipt")
-        if (
-            isinstance(frozen, dict) and frozen.get("version") == 4
-            and isinstance(frozen.get("options"), dict)
-            and frozen["options"].get("optimize_image") is True
-        ):
+        # Once any postprocess authority has been frozen, absence of its
+        # public state is corruption, not a reason to silently hand H3 the
+        # original inputs.  This also covers MediaKit-only selections.
+        if any(key in meta for key in (
+            "_postprocess_receipt", "_image_optimization",
+            "_v4_canvas_execution", "_image_verification",
+        )):
             raise PostprocessError(409, "postprocess_artifacts_invalid")
         return originals
     if not isinstance(state, dict) or state.get("status") != "done":
@@ -2872,13 +3018,13 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
             base_private = _private_receipt(meta)
             if not isinstance(optimization, dict) or optimization.get("version") != 4:
                 raise ValueError
-            plan = image_optimization.dual_target_plan_receipt(meta)
-            if not isinstance(plan, dict) or plan.get("version") != 4:
-                raise ValueError
+            # The public continuity receipt carries its own SHA.  Canonical
+            # verifiers accept the exact plan payload, never that wrapper.
+            plan = _v4_frozen_plan(meta, base_private)
             if not isinstance(raw, dict):
                 raise ValueError
             runtime_private, runtime_sources = _v4_canvas_execution_for_h3(
-                cdir, meta, base_private, originals,
+                settings, cdir, meta, base_private, originals,
             )
             payload = {key: value for key, value in raw.items() if key != "sha256"}
             expected_sha = _receipt_sha256(payload)
@@ -2903,7 +3049,6 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                 or raw["continuity_sha256"] != runtime_private["continuity_sha256"]
                 or raw["scene_anchor_schedule_sha256"] != expected_schedule_sha
                 or raw["canvas_execution_sha256"] != runtime_private.get("canvas_execution_sha256")
-                or raw["verdict"].get("passed") is not True
                 or raw["palette_metrics_sha256"] != raw["palette_metrics"].get("sha256")
                 or len(verified) != len(selected)
             ):
@@ -2919,6 +3064,8 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
             ):
                 raise ValueError
             if not isinstance(raw["semantic_receipts"], list) or not raw["semantic_receipts"]:
+                raise ValueError
+            if image_optimization.canonical_verification(raw["verdict"], plan).get("passed") is not True:
                 raise ValueError
             source_sha256s = {}
             for original in originals:
@@ -2950,8 +3097,9 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                 cdir, receipt,
                 plan_sha256=runtime_private["plan_sha256"],
                 continuity_sha256=runtime_private["continuity_sha256"],
-                source_sha256s=source_sha256s,
-                anchors=anchors,
+                    source_sha256s=source_sha256s,
+                    source_paths=runtime_sources,
+                    anchors=anchors,
             ) for receipt in anchors.values()):
                 raise ValueError
             if [item.get("label") for item in raw["semantic_receipts"]] != _v4_semantic_labels(
@@ -2967,10 +3115,12 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                     or receipt.get("label") != item["label"]
                     or receipt.get("plan_sha256") != runtime_private["plan_sha256"]
                     or receipt.get("continuity_sha256") != runtime_private["continuity_sha256"]
-                    or receipt.get("verdict", {}).get("passed") is not True
+                    or image_optimization.canonical_reference_pack_verdict(
+                        receipt.get("verdict"), plan
+                    ).get("passed") is not True
                     or not _valid_semantic_pack_bindings(
                         cdir, plan, runtime_private["scene_anchor_schedule"],
-                        receipt, source_sha256s,
+                        receipt, source_sha256s, runtime_sources,
                     )
                 ):
                     raise ValueError
@@ -2987,6 +3137,7 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                         runtime_sources[(segment_index, int(original.stem))]
                     )
                     or item["output_sha256"] != hashlib.sha256(output.read_bytes()).hexdigest()
+                    or not _valid_png(output, runtime_sources[(segment_index, int(original.stem))])
                 ):
                     raise ValueError
                 expected_verified_frames.append({
@@ -3000,7 +3151,11 @@ def generation_keyframes(cdir: Path, meta: dict, originals: list[Path]) -> list[
                 raise ValueError
             if not _valid_palette_metrics_for_outputs(raw["palette_metrics"], pairs):
                 raise ValueError
-        except (AttributeError, KeyError, OSError, StopIteration, TypeError, ValueError):
+        except (
+            AttributeError, KeyError, OSError, StopIteration, TypeError, ValueError,
+            image_optimization.ImageOptimizationIneligibleError,
+            image_optimization.ImageOptimizationOutputError,
+        ):
             raise PostprocessError(409, "postprocess_artifacts_invalid") from None
     return selected
 

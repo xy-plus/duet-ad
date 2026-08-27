@@ -2168,9 +2168,10 @@ def generate_project_prompts(
     edit_mode: str,
     *,
     session_dir: Path,
+    expected_version: int = 4,
 ) -> tuple[dict, dict]:
     """Run the plan phase once, then compile immutable provider prompts."""
-    if edit_mode not in SEEDREAM_EDIT_MODES:
+    if edit_mode not in SEEDREAM_EDIT_MODES or expected_version not in {2, 3, 4}:
         raise ValueError("unsupported image optimization edit mode")
     try:
         session = Path(session_dir).resolve(strict=True)
@@ -2186,6 +2187,8 @@ def generate_project_prompts(
     for segment in segments:
         allowed = {"index", "chain_id", "join_mode", "keyframes_dir"}
         if set(segment) != allowed and set(segment) != allowed | {"transition_skeleton"}:
+            raise ValueError("invalid image optimization segments")
+        if expected_version == 4 and "transition_skeleton" not in segment:
             raise ValueError("invalid image optimization segments")
         if (
             not isinstance(segment["chain_id"], str) or not segment["chain_id"]
@@ -2273,6 +2276,10 @@ def generate_project_prompts(
                 edit_mode,
                 {segment["index"]: len(frames) for segment, frames in prepared},
             )
+            if plan.get("version") != expected_version:
+                raise ImageOptimizationOutputError(
+                    "image optimization output is missing or invalid"
+                )
             skeletons = {
                 segment["index"]: segment.get("transition_skeleton")
                 for segment, _frames in prepared
