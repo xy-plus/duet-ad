@@ -31,14 +31,21 @@ import numpy as np
 
 
 ATTEMPT_SCHEMA = "duet.image-mask-attempt"
-ATTEMPT_VERSION = 1
+ATTEMPT_VERSION = 2
+REQUEST_SCHEMA = "duet.image-mask-request"
+REQUEST_VERSION = 2
+PERSON_ROSTER_SCHEMA = "duet.person-roster"
+PERSON_ROSTER_VERSION = 1
 PRODUCER_SCHEMA = "duet.image-mask-producer"
-PRODUCER_VERSION = 1
+PRODUCER_VERSION = 2
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 MAX_SOURCE_BYTES = 40 * 1024 * 1024
 MAX_MASK_BYTES = 64 * 1024 * 1024
 MASK_PURPOSES = frozenset({"person", "protected_non_target_people"})
 MaskPurpose = Literal["person", "protected_non_target_people"]
+MaskScope = Literal["all_people_union", "person_instance"]
+IdentityBinding = Literal["sole_visible_person", "provider_person_id"]
+_PURPOSE_ORDER: tuple[MaskPurpose, ...] = ("person", "protected_non_target_people")
 
 _SAFE_CODES = frozenset(
     {
@@ -46,7 +53,13 @@ _SAFE_CODES = frozenset(
         "invalid_frame_pts",
         "invalid_cache_version",
         "invalid_provider_descriptor",
+        "invalid_provider_capability",
         "invalid_provider_params",
+        "invalid_person_instance",
+        "person_roster_receipt_invalid",
+        "person_roster_receipt_mismatch",
+        "person_instance_unavailable",
+        "provider_identity_binding_invalid",
         "invalid_source_image",
         "source_image_too_large",
         "unsafe_project_path",
@@ -71,6 +84,7 @@ _SAFE_CODES = frozenset(
     }
 )
 _DESCRIPTOR_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+_PARAM_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -112,6 +126,84 @@ class ProviderDescriptor:
 
 
 @dataclass(frozen=True)
+class ProviderCapabilities:
+    """Identity guarantees a provider must satisfy before any paid POST."""
+
+    mask_scope: MaskScope
+    identity_binding: IdentityBinding
+    supported_purposes: tuple[MaskPurpose, ...]
+    person_id_param: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.supported_purposes, tuple)
+            or not self.supported_purposes
+            or len(self.supported_purposes) != len(set(self.supported_purposes))
+            or any(purpose not in MASK_PURPOSES for purpose in self.supported_purposes)
+        ):
+            raise MaskError("invalid_provider_capability")
+        ordered = tuple(
+            purpose for purpose in _PURPOSE_ORDER if purpose in self.supported_purposes
+        )
+        object.__setattr__(self, "supported_purposes", ordered)
+        if self.mask_scope == "all_people_union":
+            if (
+                self.identity_binding != "sole_visible_person"
+                or self.person_id_param is not None
+                or ordered != ("person",)
+            ):
+                raise MaskError("invalid_provider_capability")
+        elif self.mask_scope == "person_instance":
+            if (
+                self.identity_binding != "provider_person_id"
+                or not isinstance(self.person_id_param, str)
+                or not _PARAM_NAME_RE.fullmatch(self.person_id_param)
+            ):
+                raise MaskError("invalid_provider_capability")
+        else:
+            raise MaskError("invalid_provider_capability")
+
+
+@dataclass(frozen=True)
+class PersonInstanceRequest:
+    """Frozen upstream identity roster binding for one requested person."""
+
+    person_id: str
+    visible_person_ids: tuple[str, ...]
+    person_roster_receipt_path: str
+    person_roster_receipt_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.person_id, str) or not _DESCRIPTOR_RE.fullmatch(
+            self.person_id
+        ):
+            raise MaskError("invalid_person_instance")
+        if (
+            not isinstance(self.visible_person_ids, tuple)
+            or not self.visible_person_ids
+            or len(self.visible_person_ids) != len(set(self.visible_person_ids))
+            or any(
+                not isinstance(person_id, str)
+                or not _DESCRIPTOR_RE.fullmatch(person_id)
+                for person_id in self.visible_person_ids
+            )
+            or self.person_id not in self.visible_person_ids
+        ):
+            raise MaskError("invalid_person_instance")
+        object.__setattr__(self, "visible_person_ids", tuple(sorted(self.visible_person_ids)))
+        object.__setattr__(
+            self,
+            "person_roster_receipt_path",
+            _relative_path(self.person_roster_receipt_path),
+        )
+        if (
+            not isinstance(self.person_roster_receipt_sha256, str)
+            or not _SHA256_RE.fullmatch(self.person_roster_receipt_sha256)
+        ):
+            raise MaskError("invalid_person_instance")
+
+
+@dataclass(frozen=True)
 class ProviderMaskRequest:
     """Frozen, provider-neutral request presented to an adapter."""
 
@@ -119,6 +211,8 @@ class ProviderMaskRequest:
     action: str
     model: str
     purpose: MaskPurpose
+    provider_capability: ProviderCapabilities
+    person_instance: PersonInstanceRequest
     source_sha256: str
     width: int
     height: int
@@ -126,6 +220,31 @@ class ProviderMaskRequest:
     request_sha256: str
     params: Mapping[str, Any]
     cache_version: str
+
+    def __post_init__(self) -> None:
+        try:
+            frozen_params = _freeze_params(self.params)
+            normalized_pts = _frame_pts(self.frame_pts)
+            expected = request_sha256(
+                provider=self.provider,
+                action=self.action,
+                model=self.model,
+                purpose=self.purpose,
+                provider_capability=self.provider_capability,
+                person_instance=self.person_instance,
+                source_sha256=self.source_sha256,
+                width=self.width,
+                height=self.height,
+                frame_pts=normalized_pts,
+                params=frozen_params,
+                cache_version=self.cache_version,
+            )
+        except MaskError:
+            raise MaskError("provider_request_invalid") from None
+        if self.request_sha256 != expected:
+            raise MaskError("provider_request_invalid")
+        object.__setattr__(self, "frame_pts", normalized_pts)
+        object.__setattr__(self, "params", frozen_params)
 
 
 @dataclass(frozen=True)
@@ -148,6 +267,7 @@ class MaskProvider(Protocol):
     """Minimal adapter boundary used by :func:`generate_mask`."""
 
     descriptor: ProviderDescriptor
+    capabilities: ProviderCapabilities
 
     def submit(self, request: ProviderMaskRequest) -> ProviderResponse: ...
 
@@ -171,6 +291,11 @@ class AliyunVIAPISegmentHDBody:
         action="SegmentHDBody",
         model="imageseg-20191230",
     )
+    capabilities = ProviderCapabilities(
+        mask_scope="all_people_union",
+        identity_binding="sole_visible_person",
+        supported_purposes=("person",),
+    )
 
     def __init__(
         self,
@@ -190,11 +315,14 @@ class AliyunVIAPISegmentHDBody:
             request.provider != self.descriptor.provider
             or request.action != self.descriptor.action
             or request.model != self.descriptor.model
-            or request.purpose not in MASK_PURPOSES
+            or request.provider_capability != self.capabilities
             or not _SHA256_RE.fullmatch(request.request_sha256)
         ):
             raise MaskError("provider_request_invalid")
         params = _freeze_params(request.params)
+        _person_instance_receipt(
+            self.capabilities, request.purpose, request.person_instance, params
+        )
         if set(params) != {"ImageURL"}:
             raise MaskError("provider_request_invalid")
         _private_https_url(params["ImageURL"])
@@ -266,12 +394,54 @@ def _frame_pts(value: Any) -> str:
     return "0" if normalized in {"", "-0"} else normalized
 
 
+def _capability_receipt(capability: ProviderCapabilities) -> dict[str, Any]:
+    return {
+        "mask_scope": capability.mask_scope,
+        "identity_binding": capability.identity_binding,
+        "person_id_param": capability.person_id_param,
+        "supported_purposes": list(capability.supported_purposes),
+    }
+
+
+def _person_instance_receipt(
+    capability: ProviderCapabilities,
+    purpose: str,
+    instance: PersonInstanceRequest,
+    params: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(instance, PersonInstanceRequest):
+        raise MaskError("invalid_person_instance")
+    if purpose not in capability.supported_purposes:
+        raise MaskError("person_instance_unavailable")
+    provider_person_id: str | None = None
+    if capability.mask_scope == "all_people_union":
+        if (
+            purpose != "person"
+            or instance.visible_person_ids != (instance.person_id,)
+        ):
+            raise MaskError("person_instance_unavailable")
+    else:
+        parameter = capability.person_id_param
+        provider_person_id = params.get(parameter) if parameter is not None else None
+        if provider_person_id != instance.person_id:
+            raise MaskError("provider_identity_binding_invalid")
+    return {
+        "person_id": instance.person_id,
+        "visible_person_ids": list(instance.visible_person_ids),
+        "person_roster_receipt_path": instance.person_roster_receipt_path,
+        "person_roster_receipt_sha256": instance.person_roster_receipt_sha256,
+        "provider_person_id": provider_person_id,
+    }
+
+
 def request_sha256(
     *,
     provider: str,
     action: str,
     model: str,
     purpose: str,
+    provider_capability: ProviderCapabilities,
+    person_instance: PersonInstanceRequest,
     source_sha256: str,
     width: int,
     height: int,
@@ -296,16 +466,25 @@ def request_sha256(
         raise MaskError("invalid_source_image")
     if not isinstance(cache_version, str) or not cache_version or len(cache_version) > 128:
         raise MaskError("invalid_cache_version")
+    if not isinstance(provider_capability, ProviderCapabilities):
+        raise MaskError("invalid_provider_capability")
+    frozen_params = _freeze_params(params)
     frozen = {
+        "schema": REQUEST_SCHEMA,
+        "version": REQUEST_VERSION,
         "provider": provider,
         "action": action,
         "model": model,
         "purpose": purpose,
+        "provider_capability": _capability_receipt(provider_capability),
+        "person_instance": _person_instance_receipt(
+            provider_capability, purpose, person_instance, frozen_params
+        ),
         "source_sha256": source_sha256,
         "width": width,
         "height": height,
         "frame_pts": _frame_pts(frame_pts),
-        "params": _freeze_params(params),
+        "params": frozen_params,
         "cache_version": cache_version,
     }
     return sha256_bytes(_canonical_json(frozen))
@@ -668,6 +847,8 @@ def _producer_receipt(
             "model": request["model"],
         },
         "purpose": request["purpose"],
+        "provider_capability": request["provider_capability"],
+        "person_instance": request["person_instance"],
         "source": source,
         "request_sha256": request["request_sha256"],
         "params": request["params"],
@@ -689,6 +870,41 @@ def _load_receipt(root: Path, relative: str) -> dict[str, Any] | None:
     return payload
 
 
+def _validate_person_roster_receipt(
+    root: Path,
+    instance: PersonInstanceRequest,
+    *,
+    source_path: str,
+    source_sha256: str,
+    width: int,
+    height: int,
+    frame_pts: str,
+) -> None:
+    raw = _read_project_file(
+        root, instance.person_roster_receipt_path, limit=4 * 1024 * 1024
+    )
+    if sha256_bytes(raw) != instance.person_roster_receipt_sha256:
+        raise MaskError("person_roster_receipt_mismatch")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise MaskError("person_roster_receipt_invalid") from None
+    expected = {
+        "schema": PERSON_ROSTER_SCHEMA,
+        "version": PERSON_ROSTER_VERSION,
+        "source": {
+            "path": source_path,
+            "sha256": source_sha256,
+            "width": width,
+            "height": height,
+            "frame_pts": frame_pts,
+        },
+        "person_ids": list(instance.visible_person_ids),
+    }
+    if payload != expected:
+        raise MaskError("person_roster_receipt_mismatch")
+
+
 def _failed(
     root: Path,
     receipt_path: str,
@@ -705,13 +921,19 @@ def _failed(
     )
 
 
-def _provider_request(request: Mapping[str, Any]) -> ProviderMaskRequest:
+def _provider_request(
+    request: Mapping[str, Any],
+    provider_capability: ProviderCapabilities,
+    person_instance: PersonInstanceRequest,
+) -> ProviderMaskRequest:
     source = request["source"]
     return ProviderMaskRequest(
         provider=request["provider"],
         action=request["action"],
         model=request["model"],
         purpose=request["purpose"],
+        provider_capability=provider_capability,
+        person_instance=person_instance,
         source_sha256=source["sha256"],
         width=source["width"],
         height=source["height"],
@@ -730,6 +952,7 @@ def generate_mask(
     receipt_path: str | Path,
     provider: MaskProvider,
     purpose: MaskPurpose,
+    person_instance: PersonInstanceRequest,
     frame_pts: str | int | float | Decimal,
     params: Mapping[str, Any],
     cache_version: str,
@@ -743,6 +966,22 @@ def generate_mask(
     """
     if purpose not in MASK_PURPOSES:
         raise MaskError("invalid_mask_purpose")
+    descriptor = getattr(provider, "descriptor", None)
+    if not isinstance(descriptor, ProviderDescriptor):
+        raise MaskError("invalid_provider_descriptor")
+    capability = getattr(provider, "capabilities", None)
+    if not isinstance(capability, ProviderCapabilities):
+        raise MaskError("invalid_provider_capability")
+    for method in ("submit", "get", "download"):
+        if not callable(getattr(provider, method, None)):
+            raise MaskError("invalid_provider_descriptor")
+    normalized_pts = _frame_pts(frame_pts)
+    frozen_params = _freeze_params(params)
+    frozen_instance = _person_instance_receipt(
+        capability, purpose, person_instance, frozen_params
+    )
+    if not isinstance(cache_version, str) or not cache_version or len(cache_version) > 128:
+        raise MaskError("invalid_cache_version")
     root = _project_root(Path(project_root))
     source_relative = _relative_path(source_path)
     output_relative = _relative_path(output_path)
@@ -753,25 +992,31 @@ def generate_mask(
     )
     if len({source_relative, output_relative, receipt_relative, landing_relative}) != 4:
         raise MaskError("unsafe_project_path")
-    descriptor = getattr(provider, "descriptor", None)
-    if not isinstance(descriptor, ProviderDescriptor):
-        raise MaskError("invalid_provider_descriptor")
-    for method in ("submit", "get", "download"):
-        if not callable(getattr(provider, method, None)):
-            raise MaskError("invalid_provider_descriptor")
-    normalized_pts = _frame_pts(frame_pts)
-    frozen_params = _freeze_params(params)
-    if not isinstance(cache_version, str) or not cache_version or len(cache_version) > 128:
-        raise MaskError("invalid_cache_version")
 
     source_bytes = _read_project_file(root, source_relative, limit=MAX_SOURCE_BYTES)
     width, height = _decode_source(source_bytes)
     source_sha = sha256_bytes(source_bytes)
+    instance_path = person_instance.person_roster_receipt_path
+    if instance_path in {
+        source_relative, output_relative, receipt_relative, landing_relative
+    }:
+        raise MaskError("unsafe_project_path")
+    _validate_person_roster_receipt(
+        root,
+        person_instance,
+        source_path=source_relative,
+        source_sha256=source_sha,
+        width=width,
+        height=height,
+        frame_pts=normalized_pts,
+    )
     request_hash = request_sha256(
         provider=descriptor.provider,
         action=descriptor.action,
         model=descriptor.model,
         purpose=purpose,
+        provider_capability=capability,
+        person_instance=person_instance,
         source_sha256=source_sha,
         width=width,
         height=height,
@@ -780,10 +1025,14 @@ def generate_mask(
         cache_version=cache_version,
     )
     frozen_request = {
+        "schema": REQUEST_SCHEMA,
+        "version": REQUEST_VERSION,
         "provider": descriptor.provider,
         "action": descriptor.action,
         "model": descriptor.model,
         "purpose": purpose,
+        "provider_capability": _capability_receipt(capability),
+        "person_instance": frozen_instance,
         "source": {
             "path": source_relative,
             "sha256": source_sha,
@@ -857,7 +1106,9 @@ def generate_mask(
     if status == "prepared":
         receipt = _transition(root, receipt_relative, receipt, "submitting")
         try:
-            response = provider.submit(_provider_request(frozen_request))
+            response = provider.submit(
+                _provider_request(frozen_request, capability, person_instance)
+            )
             provider_state = _provider_state(response)
         except SubmissionUncertain as exc:
             request_id = _optional_private_identifier(exc.request_id)
