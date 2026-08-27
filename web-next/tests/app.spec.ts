@@ -670,7 +670,7 @@ test('optimized non-silent video requires explicit dialogue delivery and submits
 
   await expect(page.getByText('请选择声音呈现方式；未选择不会提交生成。')).toBeVisible();
   await expect(page.getByRole('button', { name: '确认生成' })).toBeDisabled();
-  await page.getByRole('radio', { name: '画外' }).click();
+  await page.getByRole('radiogroup', { name: '声音呈现' }).getByText('画外', { exact: true }).click();
   await expect(page.getByRole('button', { name: '确认生成' })).toBeEnabled();
   await page.getByRole('button', { name: '确认生成' }).click();
 
@@ -722,7 +722,7 @@ test('a 409 refresh preserves explicit off-screen delivery and never resubmits b
   await installApi(page, controller);
   await login(page);
 
-  await page.getByRole('radio', { name: '画外' }).click();
+  await page.getByRole('radiogroup', { name: '声音呈现' }).getByText('画外', { exact: true }).click();
   await page.getByRole('button', { name: '确认生成' }).click();
   await expect(page.getByRole('alert').filter({
     hasText: '音频与画面输入需要刷新，请等待页面更新后再次确认生成。',
@@ -732,7 +732,7 @@ test('a 409 refresh preserves explicit off-screen delivery and never resubmits b
   )).length).toBeGreaterThan(1);
   await expect(page.getByRole('radio', { name: '画外' })).toBeChecked();
   await expect(page.getByRole('radio', { name: '画内' })).not.toBeChecked();
-  await expect(page.getByRole('radio', { name: '自动' })).not.toBeChecked();
+  await expect(page.getByRole('radio', { name: '自动', exact: true })).not.toBeChecked();
   await page.waitForTimeout(300);
   expect(controller.requests.filter(({ method, path }) => (
     method === 'POST' && path.endsWith('/submit')
