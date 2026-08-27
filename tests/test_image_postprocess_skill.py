@@ -769,7 +769,7 @@ def test_skill_requires_entity_chain_unique_contact_and_scene_boundary_audit():
         "任何遮挡或裁切使接触双方边界不可同帧观察",
         "scene boundary 与 semantic/geometry/depth/layout/local_color 必须逐项相容",
         "新增结构不得越过声明边界",
-        "scene_replacement_unsafe",
+        "scene_structure_replacement_unsafe",
     ):
         assert rule in skill
 
@@ -782,6 +782,21 @@ def test_skill_requires_entity_chain_unique_contact_and_scene_boundary_audit():
         "新增结构不得越过声明边界",
     ):
         assert rule in human
+
+
+def test_scene_structure_failure_reason_matches_backend_plan_contract():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+    human = Path(
+        "docs/human/features/conversation-task/behaviors/postprocess.md"
+    ).read_text(encoding="utf-8")
+    reason = "scene_structure_replacement_unsafe"
+
+    assert reason in image_optimization._INELIGIBLE_REASONS
+    assert image_optimization.canonical_plan_v2(_ineligible(reason)) == _ineligible(reason)
+    assert f"reason={reason}" in skill
+    assert f"eligible=false/{reason}" in human
+    assert "scene_replacement_unsafe" not in skill
+    assert "scene_replacement_unsafe" not in human
 
 
 def _plan_v3() -> dict:
