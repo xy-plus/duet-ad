@@ -481,7 +481,8 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
       {imageAcceptance?.accepted ? (
         <Alert type="success" showIcon title="已确认使用当前优化图生成视频" />
       ) : null}
-      {imageAcceptance?.required && !imageAcceptance.accepted ? (
+      {imageAcceptance?.required && !imageAcceptance.accepted
+        && detail.generation === null && detail.postprocess?.status === 'done' ? (
         <Card title="确认优化图">
           <Space orientation="vertical">
             <Typography.Text>

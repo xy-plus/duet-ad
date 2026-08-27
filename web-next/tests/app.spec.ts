@@ -552,7 +552,14 @@ test('accepts the exact optimized-image version before enabling final generation
         image_acceptance: { required: true, accepted: true, expected_meta_sha256: expectedMeta },
       };
       await route.fulfill({
-        json: { required: true, accepted: true, expected_meta_sha256: expectedMeta },
+        json: {
+          status: 'accepted',
+          image_acceptance: {
+            required: true,
+            accepted: true,
+            expected_meta_sha256: expectedMeta,
+          },
+        },
       });
     },
   };
@@ -598,7 +605,7 @@ test('image acceptance CAS conflict warns once and never resubmits automatically
     requests: [],
     acceptImages: async (route) => route.fulfill({
       status: 409,
-      json: { detail: 'image_acceptance_changed' },
+      json: { detail: 'image_acceptance_meta_changed' },
     }),
   };
   await installApi(page, controller);
@@ -670,7 +677,8 @@ test('optimized non-silent video requires explicit dialogue delivery and submits
 
   await expect(page.getByText('请选择声音呈现方式；未选择不会提交生成。')).toBeVisible();
   await expect(page.getByRole('button', { name: '确认生成' })).toBeDisabled();
-  await page.getByRole('radiogroup', { name: '声音呈现' }).getByText('画外', { exact: true }).click();
+  await page.getByRole('radiogroup', { name: '声音呈现' })
+    .getByText('画外', { exact: true }).click();
   await expect(page.getByRole('button', { name: '确认生成' })).toBeEnabled();
   await page.getByRole('button', { name: '确认生成' }).click();
 
@@ -722,7 +730,8 @@ test('a 409 refresh preserves explicit off-screen delivery and never resubmits b
   await installApi(page, controller);
   await login(page);
 
-  await page.getByRole('radiogroup', { name: '声音呈现' }).getByText('画外', { exact: true }).click();
+  await page.getByRole('radiogroup', { name: '声音呈现' })
+    .getByText('画外', { exact: true }).click();
   await page.getByRole('button', { name: '确认生成' }).click();
   await expect(page.getByRole('alert').filter({
     hasText: '音频与画面输入需要刷新，请等待页面更新后再次确认生成。',
@@ -768,9 +777,21 @@ test('has_video renders authenticated source and final videos together', async (
 
   await expect(page.getByLabel('源视频')).toBeVisible();
   await expect(page.getByLabel('最终成片')).toBeVisible();
-  await expect.poll(() => controller.requests.some(({ method, path }) => (
-    method === 'GET' && path.endsWith('/files/generated.mp4')
-  ))).toBe(true);
+  await expect(page.getByLabel('源视频')).toHaveAttribute('src', /^blob:/u);
+  await expect(page.getByLabel('最终成片')).toHaveAttribute('src', /^blob:/u);
+  await expect.poll(() => new Set(controller.requests.flatMap(({ method, path }) => (
+    method === 'GET' && (path.endsWith('/files/source.mp4') || path.endsWith('/files/generated.mp4'))
+      ? [path]
+      : []
+  ))).size).toBe(2);
+  const videoRequests = controller.requests.filter(({ method, path }) => (
+    method === 'GET' && (path.endsWith('/files/source.mp4') || path.endsWith('/files/generated.mp4'))
+  ));
+  expect(new Set(videoRequests.map(({ path }) => path))).toEqual(new Set([
+    '/api/conversations/final-video-visible/files/source.mp4',
+    '/api/conversations/final-video-visible/files/generated.mp4',
+  ]));
+  expect(videoRequests.every(({ headers }) => headers.authorization === 'Bearer browser-token')).toBe(true);
 });
 
 test('image optimization uses CAS and dirty navigation requires an explicit decision', async ({ page }) => {
@@ -824,7 +845,7 @@ test('postprocess submits exact options, closes to a background card, and surviv
     title: '后处理会话',
     navigation_status: 'completed',
     keyframes: ['one.png', 'two.png'],
-    generation: { status: 'succeeded', stage: 'h3', client_request_id: 'generation-post' },
+    generation: null,
     fit_mode: 'none',
   });
   const other = detail('other', { title: '切换目标' });
@@ -884,7 +905,7 @@ test('postprocess submits exact options, closes to a background card, and surviv
 
 test('postprocess submission failure restores the default no decision', async ({ page }) => {
   const candidate = detail('post-failure', {
-    title: '后处理失败恢复否', generation: { status: 'succeeded', stage: 'h3', client_request_id: 'post-failure-generation' }, fit_mode: 'none', keyframes: ['one.png'],
+    title: '后处理失败恢复否', generation: null, fit_mode: 'none', keyframes: ['one.png'],
   });
   const controller: ApiController = {
     details: { 'post-failure': candidate }, order: ['post-failure'], requests: [],
@@ -928,7 +949,7 @@ test('submission_unknown segment requires billed-retry confirmation and revision
 test('postprocess_options_locked refetches and displays server-frozen options without automatic resend', async ({ page }) => {
   const candidate = detail('locked', {
     title: '锁定选项会话',
-    generation: { status: 'succeeded', client_request_id: 'generation-locked', stage: 'h3' },
+    generation: null,
     fit_mode: 'none',
     keyframes: ['one.png'],
   });

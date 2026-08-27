@@ -187,6 +187,46 @@ describe('production App integration', () => {
     expect(screen.getByRole('button', { name: '确认生成' })).toBeEnabled();
   });
 
+  it('does not render image confirmation after video generation has started', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    const detail = {
+      ...baseDetail,
+      navigation_status: 'generation_running',
+      generation: {
+        status: 'running', stage: 'h3', client_request_id: 'started-request', segments: [],
+      },
+      image_acceptance: {
+        required: true, accepted: false, expected_meta_sha256: 'd'.repeat(64),
+      },
+      postprocess: {
+        status: 'done',
+        options: { remove_subtitle: false, remove_brand: false, optimize_image: true },
+        frames: [], error: null,
+        segments: [{
+          index: 0, status: 'done', stage: 'done', completed_frames: 1,
+          total_frames: 1, revision: 1, error: null,
+        }],
+      },
+    };
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'generation-started-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([detail]);
+        if (url === '/api/conversations/cid-1') return Response.json(detail);
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+
+    expect(await screen.findByText('生成进行中')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '确认使用当前优化图生成视频' }))
+      .not.toBeInTheDocument();
+  });
+
   it('reports an image acceptance CAS conflict without automatically resending it', async () => {
     const storage = new MemoryStorage();
     storage.setItem('cvs_token', 'stored-token');
@@ -229,7 +269,11 @@ describe('production App integration', () => {
 
     render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: '确认使用当前优化图生成视频' }));
+    await user.click(await screen.findByRole(
+      'button',
+      { name: '确认使用当前优化图生成视频' },
+      { timeout: 5_000 },
+    ));
 
     expect(await screen.findByText('优化图版本已变化，请刷新后重新确认。')).toBeInTheDocument();
     await new Promise((resolve) => setTimeout(resolve, 0));
