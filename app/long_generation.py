@@ -403,9 +403,13 @@ def load_bound_prompt_fusion_manifest(
         or state.get("error") is not None
         or state.get("manifest_sha256")
         != hashlib.sha256(manifest_data).hexdigest()
+        or not isinstance(manifest, Mapping)
+        or state.get("raw_output_path") != "work/h3_prompt_plan.json"
+        or not isinstance(manifest.get("output"), Mapping)
+        or state.get("raw_output_sha256")
+        != manifest["output"].get("sha256")
         or state.get("image_acceptance_sha256")
         != prompt_fusion_image_authority_sha256(meta)
-        or not isinstance(manifest, Mapping)
         or manifest.get("image_acceptance_sha256")
         != state.get("image_acceptance_sha256")
     ):
