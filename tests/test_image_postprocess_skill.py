@@ -218,6 +218,22 @@ def test_skill_is_one_concise_plan_and_verify_skill():
     assert "work/image_verification.json" in skill
 
 
+def test_skill_states_the_adversarial_dual_target_contract_without_ambiguity():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "## plan 先决条件" in skill
+    assert "## verify 清单" in skill
+    assert "源身份与源场景只用于识别源内容，不得成为 target pack" in skill
+    assert "短视频 `[0]` 也执行人物与场景双替换" in skill
+    assert "每段 `persons` 按 ID 完整枚举全部主人物" in skill
+    assert "不可见时才标 `not_observable`，且不得新增该人物" in skill
+    assert "语义、几何、纵深、布局" in skill
+    assert "局部固有色变化不等于全局调色" in skill
+    assert "新几何只允许产生物理正确的局部阴影和反射" in skill
+    assert "任何 `fail` 或 `unknown` 都令 `passed=false`" in skill
+    assert "成功 no-op" in skill
+
+
 def test_plan_phase_returns_v2_plan_and_compiled_dual_target_prompts(tmp_path):
     session = tmp_path / "session"
     runner = _Runner(_plan())
