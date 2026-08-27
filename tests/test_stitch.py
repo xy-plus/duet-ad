@@ -247,7 +247,7 @@ def test_stitch_normalizes_order_duration_audio_and_receipt(tmp_path):
     assert abs(receipt["output"]["duration_s"] - 1.0) <= 1 / 24
 
 
-def test_continue_drops_first_decoded_frame_but_hard_cut_keeps_it(tmp_path):
+def test_continue_and_hard_cut_both_keep_first_decoded_frame(tmp_path):
     first = tmp_path / "first.mp4"
     second = tmp_path / "second.mp4"
     source = tmp_path / "source.mp4"
@@ -276,7 +276,7 @@ def test_continue_drops_first_decoded_frame_but_hard_cut_keeps_it(tmp_path):
         audio_mode="mute",
     )
 
-    assert _pixel(continued, 0.51)[2] > 200
+    assert _pixel(continued, 0.51)[0] > 200
     assert _pixel(hard, 0.51)[0] > 200
     assert all(s["codec_type"] != "audio" for s in _probe(continued)["streams"])
 
