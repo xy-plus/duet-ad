@@ -19,8 +19,14 @@ from app.long_video import (
 )
 
 
-def test_short_video_keeps_single_input_contract():
-    assert plan_segments(15.0, [(0.0, 15.0)], []) == []
+def test_short_video_is_the_single_segment_contract():
+    assert plan_segments(15.0, [(0.0, 15.0)], []) == [{
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 15.0,
+        "chain_id": "chain-001",
+        "join_mode": "hard_cut",
+    }]
 
 
 def test_provider_integer_duration_boundaries_do_not_hide_positive_overflow():
@@ -60,7 +66,7 @@ def test_long_scene_is_split_at_provider_safe_fourteen_seconds_and_continues_cha
 @pytest.mark.parametrize(
     "duration,expected,expected_join_modes",
     [
-        (15.0, [], []),
+        (15.0, [(0.0, 15.0)], ["hard_cut"]),
         (15.001, [(0.0, 14.0), (14.0, 15.001)], ["hard_cut", "continue"]),
         (
             30.0,

@@ -306,7 +306,7 @@ def _public_generation(meta: dict, cdir: Path, settings: Settings) -> dict | Non
     if isinstance(generation.get("segments"), list):
         public["fast_mode"] = generation.get("fast_mode", False)
         public["segments"] = long_generation.public_segments(generation)
-        if _is_long_video(meta) and status == "failed":
+        if _uses_segment_coordinator(meta) and status == "failed":
             frozen_segments = meta.get("segments")
             if isinstance(frozen_segments, list):
                 expected = tuple(range(1, len(frozen_segments) + 1))
@@ -332,6 +332,59 @@ def _public_generation(meta: dict, cdir: Path, settings: Settings) -> dict | Non
     return public
 
 
+def _public_prompt_fusion(meta: dict, cdir: Path) -> dict:
+    raw_segments = meta.get("segments")
+    count = len(raw_segments) if isinstance(raw_segments, list) else 0
+    if count == 0 and _uses_segment_coordinator(meta):
+        # Frozen pre-unification v4 projects are the N=1 subset even before
+        # their first submit persists the normalized segment plan.
+        count = 1
+    state = meta.get("_prompt_fusion")
+    status = state.get("status") if isinstance(state, dict) else None
+    if status == "done":
+        try:
+            frozen = long_generation.load_prompt_fusion_manifest(
+                root=cdir,
+                skill_source_path=pipeline.PROMPT_FUSION_SKILL_MD,
+            )
+            return {
+                "status": "done",
+                "error": None,
+                "segments": [
+                    {
+                        "index": index,
+                        "status": "done",
+                        "final_prompt": prompt,
+                        "error": None,
+                    }
+                    for index, prompt in enumerate(frozen.final_prompts, 1)
+                ],
+            }
+        except long_generation.LongGenerationError:
+            status = "failed"
+    public_status = (
+        status if status in {"running", "failed"} else "pending"
+    )
+    error = (
+        str(state.get("error") or "prompt_fusion_invalid")
+        if public_status == "failed" and isinstance(state, dict)
+        else None
+    )
+    return {
+        "status": public_status,
+        "error": error,
+        "segments": [
+            {
+                "index": index,
+                "status": public_status,
+                "final_prompt": None,
+                "error": error,
+            }
+            for index in range(1, count + 1)
+        ],
+    }
+
+
 def _is_long_video(meta: dict) -> bool:
     duration = meta.get("duration_s")
     valid_duration = (
@@ -355,6 +408,22 @@ def _is_long_video(meta: dict) -> bool:
             )
         )
     )
+
+
+def _is_current_v4_segment_project(meta: Mapping) -> bool:
+    postprocess_receipt = meta.get("_postprocess_receipt")
+    return bool(
+        meta.get("schema_version") == 2
+        and isinstance(postprocess_receipt, Mapping)
+        and postprocess_receipt.get("version") == 4
+        and isinstance(postprocess_receipt.get("options"), Mapping)
+        and postprocess_receipt["options"].get("optimize_image") is True
+    )
+
+
+def _uses_segment_coordinator(meta: dict) -> bool:
+    """Current v4 projects use one segment coordinator, including N=1."""
+    return _is_current_v4_segment_project(meta) or _is_long_video(meta)
 
 
 def _generation_semantics(meta: dict) -> tuple[str, str]:
@@ -982,36 +1051,7 @@ def _freeze_submission(
             engine_request=base_engine_request,
             multimodal=None,
         )
-        resolved_delivery = dialogue_delivery.resolve(
-            dialogue_delivery.parse(requested_dialogue_delivery), dialogue
-        )
-        delivery_contract_required = (
-            dialogue_mode != "none"
-            and dialogue
-            and isinstance(meta.get("_postprocess_receipt"), Mapping)
-            and meta["_postprocess_receipt"].get("version") == 4
-            and isinstance(meta["_postprocess_receipt"].get("options"), Mapping)
-            and meta["_postprocess_receipt"]["options"].get("optimize_image") is True
-        )
-        if delivery_contract_required:
-            try:
-                queued = pipeline.queue_multimodal_binding(
-                    settings,
-                    cid,
-                    workdir=work,
-                    visual_prompt_path=visual,
-                    keyframes=tuple(keyframes),
-                    dialogue=dialogue,
-                    dialogue_source_sha256=base_frozen.dialogue_sha256,
-                    dialogue_delivery=resolved_delivery.value,
-                )
-            except pipeline.PipelineError as exc:
-                raise _SubmitError(409, str(exc)) from None
-            if queued == "submission_unknown":
-                raise _SubmitError(409, "multimodal_binding_submission_unknown")
-            if queued != "done":
-                raise _SubmitError(409, "multimodal_input_refresh_required")
-        elif h3_project.refresh_skill_input(
+        if h3_project.refresh_skill_input(
             root=cdir,
             workdir=work,
             visual_prompt_path=visual,
@@ -1775,7 +1815,7 @@ def _speaker_timing_fingerprint_entries(
     """Hash the complete producer authority, independent of stat metadata."""
     receipt_name = (
         meta.get("long_video_plan_receipt")
-        if _is_long_video(meta)
+        if _uses_segment_coordinator(meta)
         else meta.get("prepared_input_receipt")
     )
     if (
@@ -1790,7 +1830,7 @@ def _speaker_timing_fingerprint_entries(
     if not isinstance(payload, Mapping):
         return []
     multimodals: list[object]
-    if _is_long_video(meta):
+    if _uses_segment_coordinator(meta):
         segments = payload.get("segments")
         multimodals = (
             [item.get("multimodal") for item in segments if isinstance(item, Mapping)]
@@ -1912,7 +1952,7 @@ def _generated_video_validation_fingerprint(
             if isinstance(generation, dict)
             else generation
         )
-        if _is_long_video(meta):
+        if _uses_segment_coordinator(meta):
             binding = {
                 "id": meta.get("id"),
                 "duration_s": meta.get("duration_s"),
@@ -2116,7 +2156,7 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
     cid = meta.get("id")
     if not isinstance(cid, str):
         return False
-    if _is_long_video(meta):
+    if _uses_segment_coordinator(meta):
         immutable_multimodal_intent = _long_receipt_multimodal_intent(
             settings.data_dir / cid, meta
         )
@@ -2453,19 +2493,6 @@ def create_app(settings: Settings) -> FastAPI:
                     settings, cid, codex_runner, claimed_owner=claimed_owner
                 )
 
-    def run_speaker_timing_gated(cid: str) -> None:
-        with pipeline_sem:
-            pipeline.produce_speaker_timing(settings, cid, codex_runner)
-
-    def schedule_speaker_timing(
-        cid: str, background_tasks: BackgroundTasks,
-    ) -> bool:
-        status = pipeline.queue_speaker_timing(settings, cid)
-        if status == "queued":
-            background_tasks.add_task(run_speaker_timing_gated, cid)
-            return True
-        return status in {"running", "done"}
-
     @app.on_event("startup")
     async def recover_pipeline_inputs() -> None:
         for cid, owner in storage.claim_stale_input_reconciliations(
@@ -2475,14 +2502,6 @@ def create_app(settings: Settings) -> FastAPI:
                 pipeline.reconcile_stale_pipeline(settings, cid, owner)
             else:
                 _reconcile_stale_submission(settings, cid, owner)
-        for cid in pipeline.recover_speaker_timing_jobs(settings):
-            thread = threading.Thread(
-                target=run_speaker_timing_gated,
-                args=(cid,),
-                daemon=True,
-                name=f"speaker-timing-recover-{cid[:8]}",
-            )
-            thread.start()
         if not settings.enable_pipeline:
             return
         for cid, owner in storage.claim_stale_pipeline_inputs(settings.data_dir):
@@ -2627,7 +2646,7 @@ def create_app(settings: Settings) -> FastAPI:
         source_prompt, source_prompt_sha256 = _source_prompt_snapshot(cdir)
         try:
             effective_meta = meta
-            if _is_long_video(meta) and not isinstance(meta.get("fit_profiles"), dict):
+            if _uses_segment_coordinator(meta) and not isinstance(meta.get("fit_profiles"), dict):
                 effective_meta = {
                     **meta,
                     "fit_required": _long_fit_required(cdir, meta, settings),
@@ -2692,12 +2711,13 @@ def create_app(settings: Settings) -> FastAPI:
                 ),
             },
         }
-        if not _is_long_video(meta):
+        if not _uses_segment_coordinator(meta):
             result["image_optimization_prompt"] = optimization_prompts.get(0)
-        if _is_long_video(meta):
+        if _uses_segment_coordinator(meta):
             result["plan_receipt"] = long_generation.plan_receipt(cdir, meta)
             segments = meta.get("segments")
             result["segment_count"] = len(segments) if isinstance(segments, list) else 0
+            result["prompt_fusion"] = _public_prompt_fusion(meta, cdir)
         return result
 
     @app.post(
@@ -2855,7 +2875,35 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail="not found")
         if _is_read_only(meta):
             raise HTTPException(status_code=409, detail="read_only")
-        if _is_long_video(meta):
+        if _uses_segment_coordinator(meta) and not isinstance(
+            meta.get("segments"), list
+        ):
+            try:
+                meta = await asyncio.to_thread(
+                    long_generation.normalize_single_segment_project,
+                    settings,
+                    cid,
+                    meta,
+                )
+            except long_generation.LongGenerationError as exc:
+                raise HTTPException(
+                    status_code=exc.status, detail=exc.code
+                ) from exc
+        if (
+            _is_current_v4_segment_project(meta)
+            and isinstance(meta.get("segments"), list)
+            and len(meta["segments"]) == 1
+        ):
+            # Compatibility projection for frozen pre-unification short
+            # projects.  The server-derived receipt is still revalidated by
+            # the same coordinator before any provider boundary.
+            payload = dict(payload)
+            payload.setdefault(
+                "expected_plan_receipt",
+                long_generation.plan_receipt(settings.data_dir / cid, meta),
+            )
+            payload.setdefault("fast_mode", False)
+        if _uses_segment_coordinator(meta):
             try:
                 effective_meta = {
                     **meta,
@@ -2928,8 +2976,22 @@ def create_app(settings: Settings) -> FastAPI:
                             settings=settings,
                         )
                     except long_generation.LongGenerationError as exc:
-                        if exc.code == "speaker_timing_refresh_required":
-                            schedule_speaker_timing(cid, background_tasks)
+                        if exc.code == "prompt_fusion_refresh_required":
+                            refreshed = storage.load_meta(settings.data_dir, cid)
+                            fusion_state = (
+                                refreshed.get("_prompt_fusion")
+                                if isinstance(refreshed, dict) else None
+                            )
+                            if (
+                                isinstance(fusion_state, Mapping)
+                                and fusion_state.get("status") == "queued"
+                            ):
+                                background_tasks.add_task(
+                                    pipeline.produce_prompt_fusion,
+                                    settings,
+                                    cid,
+                                    codex_runner,
+                                )
                             return JSONResponse(
                                 status_code=exc.status,
                                 content={"detail": exc.code},
@@ -2939,7 +3001,7 @@ def create_app(settings: Settings) -> FastAPI:
                             status_code=exc.status, detail=exc.code
                         ) from exc
                     if promoted_receipt is not None:
-                        storage.update_meta(
+                        updated = storage.update_meta(
                             settings.data_dir,
                             cid,
                             dialogue_mode=dialogue_mode,
@@ -2949,18 +3011,10 @@ def create_app(settings: Settings) -> FastAPI:
                             aspect_ratio=aspect_ratio,
                             resolution=resolution,
                         )
-                        if resolved_dialogue_delivery == "off_screen":
-                            raise HTTPException(
-                                status_code=409,
-                                detail="multimodal_input_refresh_required",
-                            )
-                        raise HTTPException(
-                            status_code=409,
-                            detail={
-                                "code": "long_video_plan_changed",
-                                "message": "音画计划已冻结，请刷新并确认后重试。",
-                            },
-                        )
+                        if updated is None:
+                            raise HTTPException(status_code=404, detail="not found")
+                        meta = updated
+                        expected_receipt = promoted_receipt
                 if isinstance(old, dict) and not long_generation.generation_segments_are_valid(
                     meta.get("segments"), old
                 ):
@@ -3036,13 +3090,6 @@ def create_app(settings: Settings) -> FastAPI:
                 except long_generation.LongGenerationError as exc:
                     if claim_owner:
                         _finish_submission_claim(settings, cid, claim_owner)
-                    if exc.code == "speaker_timing_refresh_required":
-                        schedule_speaker_timing(cid, background_tasks)
-                        return JSONResponse(
-                            status_code=exc.status,
-                            content={"detail": exc.code},
-                            background=background_tasks,
-                        )
                     if previous_status in {"resume_required", "succeeded"} or (
                         previous_status == "failed"
                         and isinstance(old, dict)
@@ -3668,25 +3715,6 @@ def create_app(settings: Settings) -> FastAPI:
                         )
                     else:
                         _finish_submission_claim(settings, cid, claim_owner)
-                if exc.detail == "speaker_timing_refresh_required":
-                    schedule_speaker_timing(cid, background_tasks)
-                    return JSONResponse(
-                        status_code=exc.status,
-                        content={"detail": exc.detail},
-                        background=background_tasks,
-                    )
-                if exc.detail == "multimodal_input_refresh_required":
-                    background_tasks.add_task(
-                        pipeline.produce_multimodal_binding,
-                        settings,
-                        cid,
-                        codex_runner,
-                    )
-                    return JSONResponse(
-                        status_code=exc.status,
-                        content={"detail": exc.detail},
-                        background=background_tasks,
-                    )
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             except h3.H3Error as exc:
                 if claim_owner:

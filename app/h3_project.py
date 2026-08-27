@@ -22,8 +22,6 @@ SKILL_INPUT_FILENAME = "multimodal_input.json"
 SPEAKER_TIMING_FILENAME = "speaker_timing.json"
 SPEAKER_TIMING_PRODUCTION_FILENAME = "speaker_timing_production.json"
 FINAL_ACCEPTANCE_FILENAME = "dialogue-av-acceptance.json"
-MULTIMODAL_BINDING_RECEIPT_FILENAME = "multimodal_binding_production.json"
-MULTIMODAL_BINDING_RECEIPT_SCHEMA = "duet.multimodal-binding-production"
 SOURCE_SCHEMA = "duet.h3-multimodal-source"
 SOURCE_VERSION = 3
 LEGACY_SOURCE_VERSION = 2
@@ -355,78 +353,6 @@ def _speaker_timing_production_binding(
     )
 
 
-def _multimodal_binding_production(
-    *, root: Path, workdir: Path, manifest: Mapping[str, Any],
-    skill_input: Mapping[str, Any], skill_plan: Mapping[str, Any],
-) -> None:
-    binding = manifest.get("binding_producer")
-    if binding is None:
-        return
-    if not isinstance(binding, dict) or set(binding) != {"path", "sha256"}:
-        _fail("multimodal_binding_production_invalid")
-    receipt_path = _inside(
-        root, workdir, binding.get("path"),
-        "multimodal_binding_production_invalid",
-    )
-    receipt_data = _read(receipt_path, "multimodal_binding_production_invalid")
-    if (
-        receipt_path.name != MULTIMODAL_BINDING_RECEIPT_FILENAME
-        or _sha256(receipt_data) != binding.get("sha256")
-    ):
-        _fail("multimodal_binding_production_invalid")
-    receipt = _json_object(receipt_data, "multimodal_binding_production_invalid")
-    artifacts = receipt.get("artifacts")
-    expected_names = {
-        "producer_input": "multimodal_binding_input.json",
-        "raw_output": "h3_prompt_plan.raw.json",
-        "skill": "multimodal_binding_skill.md",
-        "multimodal_input": SKILL_INPUT_FILENAME,
-        "skill_plan": "h3_prompt_plan.json",
-    }
-    if (
-        receipt.get("schema") != MULTIMODAL_BINDING_RECEIPT_SCHEMA
-        or receipt.get("version") != 1
-        or not isinstance(receipt.get("image_acceptance_sha256"), str)
-        or not isinstance(artifacts, dict)
-        or set(artifacts) != set(expected_names)
-    ):
-        _fail("multimodal_binding_production_invalid")
-    loaded: dict[str, Any] = {}
-    for role, expected_name in expected_names.items():
-        artifact = artifacts.get(role)
-        if not isinstance(artifact, dict) or set(artifact) != {"path", "sha256"}:
-            _fail("multimodal_binding_production_invalid")
-        path = _relative_file(
-            root, workdir, artifact.get("path"),
-            "multimodal_binding_production_invalid",
-        )
-        data = _read(path, "multimodal_binding_production_invalid")
-        if path.name != expected_name or _sha256(data) != artifact.get("sha256"):
-            _fail("multimodal_binding_production_invalid")
-        loaded[role] = (
-            _json_object(data, "multimodal_binding_production_invalid")
-            if role != "skill" else data
-        )
-    producer_input = loaded["producer_input"]
-    if (
-        producer_input.get("schema") != "duet.multimodal-binding-input"
-        or producer_input.get("version") != 1
-        or producer_input.get("phase") != "multimodal_audio"
-        or producer_input.get("image_acceptance_sha256")
-        != receipt.get("image_acceptance_sha256")
-        or producer_input.get("visual_prompt") != skill_input.get("visual_prompt")
-        or producer_input.get("keyframes") != skill_input.get("keyframes")
-        or producer_input.get("dialogue_source_sha256")
-        != skill_input.get("dialogue_source_sha256")
-        or producer_input.get("reference_audios")
-        != skill_input.get("reference_audios")
-        or loaded["multimodal_input"] != skill_input
-        or loaded["skill_plan"] != skill_plan
-        or loaded["raw_output"] != skill_plan
-    ):
-        _fail("multimodal_binding_production_invalid")
-
-
 def refresh_skill_input(
     *,
     root: Path,
@@ -482,7 +408,7 @@ def refresh_skill_input(
             root=root, workdir=workdir, manifest=manifest, timing=timing
         )
     raw_audios = manifest.get("reference_audios")
-    if not isinstance(raw_audios, list) or not 1 <= len(raw_audios) <= 3:
+    if not isinstance(raw_audios, list) or not 0 <= len(raw_audios) <= 3:
         _fail("reference_audio_binding_invalid")
     for expected_order, raw in enumerate(raw_audios, 1):
         if (
@@ -590,9 +516,7 @@ def freeze_optional(
         "skill_plan",
         "reference_audios",
     }
-    optional_manifest_keys = {
-        "speaker_timing", "speaker_timing_producer", "binding_producer",
-    }
+    optional_manifest_keys = {"speaker_timing", "speaker_timing_producer"}
     manifest_keys = set(manifest)
     manifest_extras = manifest_keys - base_manifest_keys
     if (
@@ -697,13 +621,6 @@ def freeze_optional(
         _fail("speaker_timing_refresh_required")
     if skill_input.get("speaker_timing") != timing_binding:
         _fail("speaker_timing_binding_invalid")
-    _multimodal_binding_production(
-        root=root,
-        workdir=workdir,
-        manifest=manifest,
-        skill_input=skill_input,
-        skill_plan=skill_plan,
-    )
     (
         speaker_timing_path,
         speaker_timing_data,
@@ -781,7 +698,9 @@ def freeze_optional(
         sources.append((path, purpose))
         expected_hashes.append(expected_sha)
     try:
-        audios = h3.freeze_reference_audios(tuple(sources))
+        audios = (
+            h3.freeze_reference_audios(tuple(sources)) if sources else ()
+        )
     except h3.H3Error as exc:
         raise ProjectMultimodalError(exc.code) from None
     if [audio.sha256 for audio in audios] != expected_hashes:
