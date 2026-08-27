@@ -204,6 +204,15 @@ def finalize_multimodal_plan(
         )
     except ValueError:
         raise LongGenerationError("invalid_dialogue_delivery", 422) from None
+    postprocess_receipt = meta.get("_postprocess_receipt")
+    binding_required = bool(
+        dialogue_mode != "none"
+        and authoritative_dialogue
+        and isinstance(postprocess_receipt, Mapping)
+        and postprocess_receipt.get("version") == 4
+        and isinstance(postprocess_receipt.get("options"), Mapping)
+        and postprocess_receipt["options"].get("optimize_image") is True
+    )
 
     intent: list[bool] = []
     complete: list[bool] = []
@@ -214,45 +223,6 @@ def finalize_multimodal_plan(
         segdir = root / "work" / "segments" / str(expected_index)
         segwork = segdir / "work"
         manifest = segwork / h3_project.SOURCE_FILENAME
-        if (
-            dialogue_mode != "none"
-            and resolved_delivery
-            is dialogue_delivery_contract.DialogueDelivery.OFF_SCREEN
-        ):
-            try:
-                original_keyframes = [
-                    root / "work" / str(path)
-                    for path in current["keyframe_paths"]
-                ]
-                selected_keyframes = postprocess.generation_keyframes(
-                    root, dict(meta), original_keyframes, settings=settings,
-                )
-                h3_project.freeze_off_screen_conditioning_plan(
-                    root=root,
-                    workdir=segwork,
-                    visual_prompt_path=segwork / "visual_prompt.txt",
-                    keyframes=tuple(selected_keyframes),
-                    dialogue=tuple(dict(line) for line in current["dialogue"]),
-                    dialogue_source_sha256=_canonical_digest(
-                        list(current["dialogue"])
-                    ),
-                    normalized_audio_path=root / "work" / "voice.mp3",
-                )
-            except (
-                KeyError,
-                TypeError,
-                postprocess.PostprocessError,
-                h3_project.ProjectMultimodalError,
-            ) as exc:
-                code = getattr(exc, "code", None)
-                if code is None and isinstance(exc, postprocess.PostprocessError):
-                    code = (
-                        exc.detail if isinstance(exc.detail, str)
-                        else exc.detail.get("code")
-                    )
-                raise LongGenerationError(
-                    code or "long_video_multimodal_invalid"
-                ) from None
         intent.append(any(
             (segwork / name).exists()
             for name in (
@@ -286,6 +256,8 @@ def finalize_multimodal_plan(
         except (KeyError, TypeError):
             raise LongGenerationError("long_video_plan_invalid") from None
     if not any(intent):
+        if binding_required:
+            raise LongGenerationError("multimodal_input_refresh_required")
         return None
     if not all(complete):
         raise LongGenerationError("long_video_multimodal_incomplete")

@@ -2661,8 +2661,16 @@ _ACCEPTANCE_META_EXCLUDED = frozenset({
     "updated_at",
     "_input_owner",
     "generation",
+    "error",
     "prepared_input_receipt",
     "prepared_dialogue",
+    "prompt",
+    "voice_lines",
+    "fit_mode",
+    "dialogue_delivery",
+    "resolved_dialogue_delivery",
+    "_multimodal_binding_producer",
+    "_speaker_timing_producer",
 })
 
 

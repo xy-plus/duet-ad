@@ -371,6 +371,8 @@ def _short_generation_parameters_match(
     *,
     dialogue_mode: str,
     dialogue: tuple[dict, ...],
+    requested_dialogue_delivery: str,
+    resolved_dialogue_delivery: str,
     fit_mode: str,
     aspect_ratio: str,
     resolution: str,
@@ -379,6 +381,10 @@ def _short_generation_parameters_match(
     expected_dialogue = meta.get("prepared_dialogue")
     return (
         meta.get("dialogue_mode") == dialogue_mode
+        and meta.get("dialogue_delivery", "auto")
+        == requested_dialogue_delivery
+        and meta.get("resolved_dialogue_delivery")
+        in {None, resolved_dialogue_delivery}
         and meta.get("fit_mode") == fit_mode
         and _generation_semantics(meta) == (aspect_ratio, resolution)
         and isinstance(expected_dialogue, list)
@@ -679,7 +685,7 @@ def _validated_dialogue(meta: dict, payload: dict) -> tuple[dict, ...]:
 
 def _validate_submit_payload(
     meta: dict, payload: dict
-) -> tuple[str, str, str, str, tuple[dict, ...]]:
+) -> tuple[str, str, str, str, tuple[dict, ...], str]:
     if payload.get("confirm") is not True:
         raise _SubmitError(409, "confirmation required")
     allowed = {
@@ -690,6 +696,7 @@ def _validate_submit_payload(
         "fit_mode",
         "aspect_ratio",
         "resolution",
+        "dialogue_delivery",
     }
     if set(payload) - allowed:
         raise _SubmitError(422, "invalid_submit_request")
@@ -711,12 +718,32 @@ def _validate_submit_payload(
             raise _SubmitError(422, "fit_mode_required")
     elif fit_mode != "none":
         raise _SubmitError(422, "fit_mode_not_allowed")
+    dialogue = _validated_dialogue(meta, payload)
+    raw_delivery = payload.get("dialogue_delivery")
+    postprocess_receipt = meta.get("_postprocess_receipt")
+    requires_delivery = (
+        payload.get("dialogue_mode") != "none"
+        and isinstance(postprocess_receipt, Mapping)
+        and postprocess_receipt.get("version") == 4
+        and isinstance(postprocess_receipt.get("options"), Mapping)
+        and postprocess_receipt["options"].get("optimize_image") is True
+    )
+    if raw_delivery is None:
+        if requires_delivery:
+            raise _SubmitError(409, "dialogue_delivery_required")
+        requested_delivery = dialogue_delivery.DialogueDelivery.AUTO
+    else:
+        try:
+            requested_delivery = dialogue_delivery.parse(raw_delivery)
+        except ValueError:
+            raise _SubmitError(422, "invalid_dialogue_delivery") from None
     return (
         request_id,
         fit_mode,
         aspect_ratio,
         resolution,
-        _validated_dialogue(meta, payload),
+        dialogue,
+        requested_delivery.value,
     )
 
 
@@ -900,6 +927,7 @@ def _freeze_submission(
     aspect_ratio: str,
     resolution: str,
     dialogue: tuple[dict, ...],
+    requested_dialogue_delivery: str,
 ) -> h3.H3Request:
     cdir = (settings.data_dir / cid).resolve()
     work = cdir / "work"
@@ -954,7 +982,36 @@ def _freeze_submission(
             engine_request=base_engine_request,
             multimodal=None,
         )
-        if h3_project.refresh_skill_input(
+        resolved_delivery = dialogue_delivery.resolve(
+            dialogue_delivery.parse(requested_dialogue_delivery), dialogue
+        )
+        delivery_contract_required = (
+            dialogue_mode != "none"
+            and dialogue
+            and isinstance(meta.get("_postprocess_receipt"), Mapping)
+            and meta["_postprocess_receipt"].get("version") == 4
+            and isinstance(meta["_postprocess_receipt"].get("options"), Mapping)
+            and meta["_postprocess_receipt"]["options"].get("optimize_image") is True
+        )
+        if delivery_contract_required:
+            try:
+                queued = pipeline.queue_multimodal_binding(
+                    settings,
+                    cid,
+                    workdir=work,
+                    visual_prompt_path=visual,
+                    keyframes=tuple(keyframes),
+                    dialogue=dialogue,
+                    dialogue_source_sha256=base_frozen.dialogue_sha256,
+                    dialogue_delivery=resolved_delivery.value,
+                )
+            except pipeline.PipelineError as exc:
+                raise _SubmitError(409, str(exc)) from None
+            if queued == "submission_unknown":
+                raise _SubmitError(409, "multimodal_binding_submission_unknown")
+            if queued != "done":
+                raise _SubmitError(409, "multimodal_input_refresh_required")
+        elif h3_project.refresh_skill_input(
             root=cdir,
             workdir=work,
             visual_prompt_path=visual,
@@ -1884,6 +1941,10 @@ def _generated_video_validation_fingerprint(
                 "prepared_dialogue": meta.get("prepared_dialogue"),
                 "prepared_input_receipt": meta.get("prepared_input_receipt"),
                 "dialogue_mode": meta.get("dialogue_mode"),
+                "dialogue_delivery": meta.get("dialogue_delivery"),
+                "resolved_dialogue_delivery": meta.get(
+                    "resolved_dialogue_delivery"
+                ),
                 "fit_mode": meta.get("fit_mode"),
                 "aspect_ratio": meta.get("aspect_ratio"),
                 "resolution": meta.get("resolution"),
@@ -3075,7 +3136,11 @@ def create_app(settings: Settings) -> FastAPI:
                 aspect_ratio,
                 resolution,
                 dialogue,
+                requested_dialogue_delivery,
             ) = _validate_submit_payload(meta, payload)
+            resolved_dialogue_delivery = dialogue_delivery.resolve(
+                dialogue_delivery.parse(requested_dialogue_delivery), dialogue
+            ).value
         except _SubmitError as exc:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
         if meta.get("status") != "done":
@@ -3123,6 +3188,8 @@ def create_app(settings: Settings) -> FastAPI:
                             meta,
                             dialogue_mode=payload["dialogue_mode"],
                             dialogue=dialogue,
+                            requested_dialogue_delivery=requested_dialogue_delivery,
+                            resolved_dialogue_delivery=resolved_dialogue_delivery,
                             fit_mode=fit_mode,
                             aspect_ratio=aspect_ratio,
                             resolution=resolution,
@@ -3180,6 +3247,8 @@ def create_app(settings: Settings) -> FastAPI:
                             meta,
                             dialogue_mode=payload["dialogue_mode"],
                             dialogue=dialogue,
+                            requested_dialogue_delivery=requested_dialogue_delivery,
+                            resolved_dialogue_delivery=resolved_dialogue_delivery,
                             fit_mode=fit_mode,
                             aspect_ratio=aspect_ratio,
                             resolution=resolution,
@@ -3244,6 +3313,8 @@ def create_app(settings: Settings) -> FastAPI:
                             meta,
                             dialogue_mode=payload["dialogue_mode"],
                             dialogue=dialogue,
+                            requested_dialogue_delivery=requested_dialogue_delivery,
+                            resolved_dialogue_delivery=resolved_dialogue_delivery,
                             fit_mode=fit_mode,
                             aspect_ratio=aspect_ratio,
                             resolution=resolution,
@@ -3309,6 +3380,8 @@ def create_app(settings: Settings) -> FastAPI:
                             meta,
                             dialogue_mode=payload["dialogue_mode"],
                             dialogue=dialogue,
+                            requested_dialogue_delivery=requested_dialogue_delivery,
+                            resolved_dialogue_delivery=resolved_dialogue_delivery,
                             fit_mode=fit_mode,
                             aspect_ratio=aspect_ratio,
                             resolution=resolution,
@@ -3378,6 +3451,8 @@ def create_app(settings: Settings) -> FastAPI:
                         meta,
                         dialogue_mode=payload["dialogue_mode"],
                         dialogue=dialogue,
+                        requested_dialogue_delivery=requested_dialogue_delivery,
+                        resolved_dialogue_delivery=resolved_dialogue_delivery,
                         fit_mode=fit_mode,
                         aspect_ratio=aspect_ratio,
                         resolution=resolution,
@@ -3468,6 +3543,8 @@ def create_app(settings: Settings) -> FastAPI:
                         meta,
                         dialogue_mode=payload["dialogue_mode"],
                         dialogue=dialogue,
+                        requested_dialogue_delivery=requested_dialogue_delivery,
+                        resolved_dialogue_delivery=resolved_dialogue_delivery,
                         fit_mode=fit_mode,
                         aspect_ratio=aspect_ratio,
                         resolution=resolution,
@@ -3483,6 +3560,8 @@ def create_app(settings: Settings) -> FastAPI:
                         meta,
                         dialogue_mode=payload["dialogue_mode"],
                         dialogue=dialogue,
+                        requested_dialogue_delivery=requested_dialogue_delivery,
+                        resolved_dialogue_delivery=resolved_dialogue_delivery,
                         fit_mode=fit_mode,
                         aspect_ratio=aspect_ratio,
                         resolution=resolution,
@@ -3555,11 +3634,13 @@ def create_app(settings: Settings) -> FastAPI:
                     aspect_ratio,
                     resolution,
                     dialogue,
+                    requested_dialogue_delivery,
                 )
             except _SubmitError as exc:
                 if claim_owner:
                     if exc.detail in {
                         "multimodal_plan_refresh_required",
+                        "multimodal_input_refresh_required",
                         "speaker_timing_refresh_required",
                     }:
                         _finish_submission_claim(
@@ -3567,6 +3648,8 @@ def create_app(settings: Settings) -> FastAPI:
                             cid,
                             claim_owner,
                             dialogue_mode=dialogue_mode,
+                            dialogue_delivery=requested_dialogue_delivery,
+                            resolved_dialogue_delivery=resolved_dialogue_delivery,
                             voice_lines=[
                                 {
                                     key: line[key]
@@ -3587,6 +3670,18 @@ def create_app(settings: Settings) -> FastAPI:
                         _finish_submission_claim(settings, cid, claim_owner)
                 if exc.detail == "speaker_timing_refresh_required":
                     schedule_speaker_timing(cid, background_tasks)
+                    return JSONResponse(
+                        status_code=exc.status,
+                        content={"detail": exc.detail},
+                        background=background_tasks,
+                    )
+                if exc.detail == "multimodal_input_refresh_required":
+                    background_tasks.add_task(
+                        pipeline.produce_multimodal_binding,
+                        settings,
+                        cid,
+                        codex_runner,
+                    )
                     return JSONResponse(
                         status_code=exc.status,
                         content={"detail": exc.detail},
@@ -3627,6 +3722,8 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             changes = dict(
                 dialogue_mode=dialogue_mode,
+                dialogue_delivery=requested_dialogue_delivery,
+                resolved_dialogue_delivery=resolved_dialogue_delivery,
                 voice_lines=bare_lines,
                 prompt=request.prompt,
                 prepared_dialogue=[dict(line) for line in dialogue],

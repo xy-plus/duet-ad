@@ -4,17 +4,20 @@ import asyncio
 import base64
 import hashlib
 import json
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
+import httpx
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import image_optimization, mediakit, postprocess, storage
+from app import context_ir_bridge, h3, image_optimization, mediakit, postprocess, storage
+from app.codex_runner import CodexRunner
 from app.main import create_app
 
 PNG = base64.b64decode(
@@ -39,7 +42,7 @@ def enabled(tmp_path):
         yield settings, c
 
 
-def _make_conv(settings, status="done", segments=False):
+def _make_conv(settings, status="done", segments=False, frame_count=2):
     """造会话：单段 = work/keyframes + work/prompt.txt；多段 = meta.segments + 段目录产物。"""
     meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
     cid = meta["id"]
@@ -60,10 +63,10 @@ def _make_conv(settings, status="done", segments=False):
             (segdir / "work" / "prompt.txt").write_text(seg["prompt"], encoding="utf-8")
     else:
         (cdir / "work" / "keyframes").mkdir(parents=True)
-        for i in (1, 2):
+        for i in range(1, frame_count + 1):
             (cdir / "work" / "keyframes" / f"{i:02d}.png").write_bytes(PNG)
         (cdir / "work" / "prompt.txt").write_text("单段提示词", encoding="utf-8")
-        meta["keyframes"] = ["01.png", "02.png"]
+        meta["keyframes"] = [f"{i:02d}.png" for i in range(1, frame_count + 1)]
         meta["prompt"] = "单段提示词"
     meta["status"] = status
     prompts = (
@@ -75,9 +78,9 @@ def _make_conv(settings, status="done", segments=False):
     return cid
 
 
-def _completed_v4_project(settings, monkeypatch):
+def _completed_v4_project(settings, monkeypatch, *, frame_count=2):
     monkeypatch.setenv("ARK_API_KEY", "test-key")
-    cid = _make_conv(settings)
+    cid = _make_conv(settings, frame_count=frame_count)
     cdir = settings.data_dir / cid
     frames = sorted((cdir / "work" / "keyframes").glob("*.png"))
     skeleton = [{
@@ -168,6 +171,174 @@ def test_v4_manual_acceptance_receipt_enables_h3_without_image_verification(
     assert postprocess.generation_keyframes(
         cdir, latest, originals, settings=settings,
     ) == sorted((cdir / "work" / "postprocessed").glob("*.png"))
+
+
+def test_short_off_screen_binding_bootstraps_then_enters_context_h3(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path,
+        retry_interval_s=0,
+        enable_h3_submit=True,
+        autodl_art_token="art",
+        minimax_api_key="minimax",
+        h3_poll_interval_s=0,
+    )
+    cid, cdir, _originals = _completed_v4_project(
+        settings, monkeypatch, frame_count=9
+    )
+    (cdir / "source.mp4").write_bytes(b"source-video")
+    (cdir / "work" / "visual_prompt.txt").write_text(
+        "九张已验收图片中的人物保持静默，歌声来自画外。", encoding="utf-8"
+    )
+    subprocess.run(
+        [
+            "/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+            "-t", "14.58", "-q:a", "9", "-y",
+            str(cdir / "work" / "voice.mp3"),
+        ],
+        check=True,
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        duration_s=14.5,
+        vocal_filter_enabled=True,
+        voice_mode="keep",
+        dialogue_mode="auto",
+        fit_required=False,
+        fit_profiles={
+            "9:16": {"fit_required": False, "default_fit_mode": "none"},
+            "16:9": {"fit_required": True, "default_fit_mode": "crop"},
+        },
+        aspect_ratio="9:16",
+        resolution="768p",
+        voice_line_provenance=[{
+            "text": "تجربة غنائية",
+            "start_s": 0.0,
+            "end_s": 14.44,
+            "classification": "sung",
+            "provenance": "asr",
+            "kept": True,
+        }],
+    )
+    current = storage.load_meta(settings.data_dir, cid)
+    acceptance = postprocess.image_acceptance_status(settings, cid, current)
+    postprocess.accept_images(settings, cid, {
+        "confirm": True,
+        "expected_meta_sha256": acceptance["expected_meta_sha256"],
+    })
+
+    def skill(self, scope, _prompt):
+        input_payload = json.loads(
+            (scope / "work" / "multimodal_input.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        plan = {
+            "version": 2,
+            "phase": "multimodal_audio",
+            "eligible": True,
+            "reason": None,
+            "visual_prompt": (
+                scope / "work" / input_payload["visual_prompt"]["path"]
+            ).read_text(encoding="utf-8"),
+            "dialogue_source_sha256": input_payload["dialogue_source_sha256"],
+            "subjects": [],
+            "audio_refs": [{
+                "audio_index": 1, "purpose": "voice", "subject_id": None,
+            }],
+            "speech_bindings": [{
+                "line_index": 1,
+                "delivery": "off_screen_voiceover",
+                "subject_id": None,
+                "language": "Arabic",
+                "voice_ref": 1,
+            }],
+            "sound_design": {"ambience_refs": [], "effects": []},
+        }
+        (scope / "work" / "h3_prompt_plan.json").write_text(
+            json.dumps(plan, ensure_ascii=False), encoding="utf-8"
+        )
+
+    monkeypatch.setattr(CodexRunner, "run", skill)
+    context_tasks = {}
+
+    def context_gateway(request):
+        if request.method == "POST" and request.url.path == "/v1/files/upload":
+            return httpx.Response(200, json={
+                "file": {"file_id": "427752006353318"},
+                "base_resp": {"status_code": 0, "status_msg": "success"},
+            })
+        if request.method == "POST" and request.url.path == "/v2/h3_context_ir":
+            body = json.loads(request.content)
+            context_tasks["task"] = body["content"][0]["text"]
+            return httpx.Response(200, json={"task_id": "context-task-1"})
+        if request.method == "GET":
+            return httpx.Response(200, json={"task": {
+                "id": "context-task-1",
+                "task_type": "h3_context_ir",
+                "status": "succeeded",
+                "modality": "text",
+                "content": {"prompt": context_tasks["task"]},
+            }})
+        raise AssertionError(request.url)
+
+    real_optimize = context_ir_bridge.optimize_h3_prompt
+
+    def optimize(frozen):
+        with httpx.Client(
+            transport=httpx.MockTransport(context_gateway)
+        ) as context_client:
+            return real_optimize(frozen, client=context_client)
+
+    monkeypatch.setattr(context_ir_bridge, "optimize_h3_prompt", optimize)
+    h3_requests = []
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda request: h3_requests.append(request)
+        or h3.H3Result("failed", "000001", error_code="stubbed"),
+    )
+    payload = {
+        "confirm": True,
+        "client_request_id": "short-off-screen-123",
+        "dialogue_mode": "auto",
+        "dialogue_delivery": "off_screen",
+        "fit_mode": "none",
+        "aspect_ratio": "9:16",
+        "resolution": "768p",
+    }
+    with TestClient(create_app(settings)) as client:
+        missing_delivery = client.post(
+            f"/api/conversations/{cid}/submit",
+            headers=AUTH,
+            json={key: value for key, value in payload.items()
+                  if key != "dialogue_delivery"},
+        )
+        assert missing_delivery.status_code == 409
+        assert missing_delivery.json() == {"detail": "dialogue_delivery_required"}
+        assert h3_requests == []
+        first = client.post(
+            f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+        )
+        assert first.status_code == 409
+        assert first.json() == {"detail": "multimodal_input_refresh_required"}
+        assert h3_requests == []
+        second = client.post(
+            f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+        )
+
+    assert second.status_code == 202, second.json()
+    assert len(h3_requests) == 1
+    request = h3_requests[0]
+    assert request.on_screen_dialogue == ()
+    assert len(request.keyframes) == 9
+    assert len(request.reference_audios) == 1
+    assert request.reference_audios[0].data == (
+        cdir / "work" / "voice.mp3"
+    ).read_bytes()
 
 
 def test_v4_manual_acceptance_rejects_stale_cas_and_generation_start(
