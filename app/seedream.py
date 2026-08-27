@@ -19,6 +19,15 @@ from app.config import Settings
 
 ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
 MAX_POST_ATTEMPTS = 3
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_INPUT_ROLE_RE = re.compile(
+    r"^(?:current_frame|"
+    r"identity:[A-Za-z0-9_.-]{1,128}(?::[A-Za-z0-9_.-]{1,64})?|"
+    r"scene:[A-Za-z0-9_.-]{1,128}(?::[A-Za-z0-9_.-]{1,64})?|"
+    r"source_negative:(?:person|scene):[A-Za-z0-9_.-]{1,128}:[1-9]\d{0,3}|"
+    r"target_reference:(?:person|scene):[A-Za-z0-9_.-]{1,128}:primary|"
+    r"layout:[A-Za-z0-9_.-]{1,128}|annotation)$"
+)
 
 
 class SeedreamError(RuntimeError):
@@ -102,6 +111,84 @@ def _decode(payload: dict) -> bytes:
     return raw
 
 
+def _execution_binding(binding: object, input_shas: list[str]) -> dict:
+    """Canonicalize the paid v2 request binding written before the provider POST."""
+    base_keys = {
+        "plan_sha256", "profile", "revision", "input_roles",
+    }
+    frame_keys = base_keys | {
+        "reference_pack_candidate_sha256", "mask_manifest_sha256",
+    }
+    poc_keys = base_keys | {"reference_pack_candidate_sha256"}
+    binding_keys = frozenset(binding) if isinstance(binding, dict) else frozenset()
+    if not isinstance(binding, dict) or binding_keys not in {
+        frozenset(base_keys), frozenset(poc_keys), frozenset(frame_keys),
+    }:
+        raise SeedreamError("invalid_input")
+    plan_sha = binding.get("plan_sha256")
+    profile = binding.get("profile")
+    revision = binding.get("revision")
+    roles = binding.get("input_roles")
+    if (
+        not isinstance(plan_sha, str) or _SHA256_RE.fullmatch(plan_sha) is None
+        or not isinstance(profile, dict) or set(profile) != {"id", "revision"}
+        or not isinstance(profile.get("id"), str)
+        or profile["id"] != profile["id"].strip()
+        or not profile["id"] or len(profile["id"].encode("utf-8")) > 128
+        or isinstance(profile.get("revision"), bool)
+        or not isinstance(profile.get("revision"), int) or profile["revision"] < 1
+        or isinstance(revision, bool) or not isinstance(revision, int) or revision < 1
+        or not isinstance(roles, list) or len(roles) != len(input_shas)
+        or not roles or roles[0] != "current_frame"
+        or any(
+            not isinstance(role, str) or _INPUT_ROLE_RE.fullmatch(role) is None
+            for role in roles
+        )
+        or len(set(roles)) != len(roles)
+        or (
+            binding_keys in {frozenset(poc_keys), frozenset(frame_keys)}
+            and (
+                _SHA256_RE.fullmatch(
+                    binding.get("reference_pack_candidate_sha256", "")
+                ) is None
+                or (
+                    binding_keys == frozenset(frame_keys)
+                    and _SHA256_RE.fullmatch(
+                        binding.get("mask_manifest_sha256", "")
+                    ) is None
+                )
+            )
+        )
+    ):
+        raise SeedreamError("invalid_input")
+    frozen = {
+        "plan_sha256": plan_sha,
+        "profile": {"id": profile["id"], "revision": profile["revision"]},
+        "revision": revision,
+        "input_order": [
+            {"position": position, "role": role, "sha256": digest}
+            for position, (role, digest) in enumerate(zip(roles, input_shas), 1)
+        ],
+        # Ark exposes ordered multi-reference inputs here, not hard mask/depth/pose
+        # controls. Production needs a downstream quality barrier; the isolated
+        # three-frame probe records soft control and never publishes production.
+        "soft_control": {
+            "mechanism": "ordered_multi_reference",
+            "annotation_image": "annotation" in roles,
+            "hard_mask": False,
+            "hard_depth": False,
+            "hard_pose": False,
+        },
+    }
+    if binding_keys in {frozenset(poc_keys), frozenset(frame_keys)}:
+        frozen["reference_pack_candidate_sha256"] = binding[
+            "reference_pack_candidate_sha256"
+        ]
+    if binding_keys == frozenset(frame_keys):
+        frozen["mask_manifest_sha256"] = binding["mask_manifest_sha256"]
+    return frozen
+
+
 def _write_exact_png(raw: bytes, out: Path, width: int, height: int) -> None:
     image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
     if image is None:
@@ -125,7 +212,8 @@ def _write_exact_png(raw: bytes, out: Path, width: int, height: int) -> None:
 
 
 async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, *,
-               receipt_path: Path, transport=None) -> Path:
+               receipt_path: Path, transport=None,
+               execution_binding: dict | None = None) -> Path:
     key = os.environ.get("ARK_API_KEY", "").strip()
     if not key:
         raise SeedreamError("seedream_not_configured")
@@ -138,22 +226,27 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     input_shas = [hashlib.sha256(item).hexdigest() for item in images]
     base_receipt = {
-        "version": 1, "status": "submitting", "attempt": 0,
+        "version": 2 if execution_binding is not None else 1,
+        "status": "submitting", "attempt": 0,
         "model": settings.seedream_model, "mode": settings.seedream_edit_mode,
         "prompt_sha256": prompt_sha, "input_sha256": input_shas, "attempts": [],
     }
+    if execution_binding is not None:
+        base_receipt.update(
+            prompt=prompt,
+            **_execution_binding(execution_binding, input_shas),
+        )
     start_attempt = 1
     if receipt_path.is_file():
         try:
             existing = json.loads(receipt_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raise SeedreamError("attempt_receipt_invalid") from None
-        bound = (
-            existing.get("model") == settings.seedream_model
-            and existing.get("mode") == settings.seedream_edit_mode
-            and existing.get("prompt_sha256") == prompt_sha
-            and existing.get("input_sha256") == input_shas
-        )
+        bound = all(
+            existing.get(key) == value
+            for key, value in base_receipt.items()
+            if key not in {"status", "attempt", "attempts"}
+        ) and existing.get("version") == base_receipt["version"]
         if not bound:
             raise SeedreamError("attempt_receipt_invalid")
         status = existing.get("status")
