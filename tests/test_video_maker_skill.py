@@ -4,6 +4,15 @@ from zipfile import ZipFile
 
 SKILL = Path(__file__).parents[1] / "skills" / "video-maker" / "SKILL.md"
 ARCHIVE = Path(__file__).parents[1] / "web" / "video-maker.zip"
+HUMAN_DOC = (
+    Path(__file__).parents[1]
+    / "docs"
+    / "human"
+    / "features"
+    / "conversation-task"
+    / "behaviors"
+    / "upload-create.md"
+)
 
 
 def test_skill_keeps_visual_phase_independent_from_audio_planning():
@@ -66,6 +75,69 @@ def test_multimodal_phase_binds_audio_semantics_and_fails_closed():
         "参考音频等于最终音轨",
     ):
         assert forbidden not in text
+
+
+def test_multimodal_plan_uses_stable_one_based_references():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "图片与音频的外部编号都从 1 开始",
+        "不得出现 0",
+        "不得按数组位置重新编号",
+        '"picture_refs": [1, 2]',
+        "一个人物可引用多张图片",
+    ):
+        assert required in text
+
+
+def test_multimodal_sound_items_have_a_strict_compiler_schema():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "`sound_design.narration[]` 每项严格只有 `order/language/text/voice_ref`",
+        "`sound_design.ambience_refs[]` 每项严格只有 `audio_index/description`",
+        "`sound_design.effects[]` 每项严格只有 `audio_index/description`",
+        "共用一条从 1 开始且无缺号的全局发声顺序",
+        '"voice_ref": null',
+        '"description": "逐字保留输入的声音描述"',
+    ):
+        assert required in text
+
+
+def test_multimodal_plan_does_not_claim_provider_level_audio_control():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "不是供应商的 speaker-face API",
+        "不是精确 PTS",
+        "不得使用 `fully_copy`、`partially_copy` 或 `audio reuse`",
+        "不得向计划加入媒体路径、字节、哈希、格式、模式或供应商参数",
+    ):
+        assert required in text
+    for forbidden in (
+        '"speaker_id"',
+        '"face_id"',
+        '"start_pts"',
+        '"end_pts"',
+        "我会准时回来",
+        "First batch of the morning",
+    ):
+        assert forbidden not in text
+
+
+def test_human_doc_explains_multimodal_semantic_plan_boundary():
+    text = HUMAN_DOC.read_text(encoding="utf-8")
+
+    for required in (
+        "H3 多模态语义计划",
+        "1-based",
+        "全局发声顺序",
+        "speaker-face",
+        "精确 PTS",
+        "样本级音频复用",
+        "字节、哈希、格式、模式",
+    ):
+        assert required in text
 
 
 def test_audio_phase_preserves_visual_facts_and_does_not_reselect_frames():
