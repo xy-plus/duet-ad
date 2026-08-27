@@ -3745,7 +3745,9 @@ def test_run_voice_empty_lines_without_spoken_passes(tmp_path, video_1s, monkeyp
     assert stored["voice_lines"] == []
 
 
-@pytest.mark.parametrize("producer_outcome", ["done", "submission_unknown"])
+@pytest.mark.parametrize(
+    "producer_outcome", ["done", "submission_unknown", "on_screen_pending_timing"]
+)
 def test_multimodal_binding_producer_freezes_skill_raw_and_manifest_last(
     tmp_path, producer_outcome,
 ):
@@ -3811,6 +3813,10 @@ def test_multimodal_binding_producer_freezes_skill_raw_and_manifest_last(
         "provenance": "asr",
     },)
     dialogue_sha = h3.canonical_json_sha256(list(dialogue))
+    delivery = (
+        "on_screen" if producer_outcome == "on_screen_pending_timing"
+        else "off_screen"
+    )
 
     assert pipeline.queue_multimodal_binding(
         settings,
@@ -3820,7 +3826,7 @@ def test_multimodal_binding_producer_freezes_skill_raw_and_manifest_last(
         keyframes=tuple(frames),
         dialogue=dialogue,
         dialogue_source_sha256=dialogue_sha,
-        dialogue_delivery="off_screen",
+        dialogue_delivery=delivery,
     ) == "queued"
 
     runner_calls = []
@@ -3835,6 +3841,7 @@ def test_multimodal_binding_producer_freezes_skill_raw_and_manifest_last(
                     encoding="utf-8"
                 )
             )
+            on_screen = producer_outcome == "on_screen_pending_timing"
             plan = {
                 "version": 2,
                 "phase": "multimodal_audio",
@@ -3842,16 +3849,20 @@ def test_multimodal_binding_producer_freezes_skill_raw_and_manifest_last(
                 "reason": None,
                 "visual_prompt": visual.read_text(encoding="utf-8"),
                 "dialogue_source_sha256": producer_input["dialogue_source_sha256"],
-                "subjects": [],
+                "subjects": ([{
+                    "subject_id": "S1", "picture_refs": [1], "voice_ref": 1,
+                }] if on_screen else []),
                 "audio_refs": [{
-                    "audio_index": 1, "purpose": "voice", "subject_id": None,
+                    "audio_index": 1,
+                    "purpose": "voice",
+                    "subject_id": "S1" if on_screen else None,
                 }],
                 "speech_bindings": [{
                     "line_index": 1,
-                    "delivery": "off_screen_voiceover",
-                    "subject_id": None,
+                    "delivery": "on_screen" if on_screen else "off_screen_voiceover",
+                    "subject_id": "S1" if on_screen else None,
                     "language": "Arabic",
-                    "voice_ref": 1,
+                    "voice_ref": None if on_screen else 1,
                 }],
                 "sound_design": {"ambience_refs": [], "effects": []},
             }
@@ -3870,10 +3881,28 @@ def test_multimodal_binding_producer_freezes_skill_raw_and_manifest_last(
             keyframes=tuple(frames),
             dialogue=dialogue,
             dialogue_source_sha256=dialogue_sha,
-            dialogue_delivery="off_screen",
+            dialogue_delivery=delivery,
         ) == "submission_unknown"
         assert len(runner_calls) == 1
         assert not (work / h3_project.SOURCE_FILENAME).exists()
+        return
+    if producer_outcome == "on_screen_pending_timing":
+        assert produced == "done"
+        assert pipeline.queue_multimodal_binding(
+            settings,
+            cid,
+            workdir=work,
+            visual_prompt_path=visual,
+            keyframes=tuple(frames),
+            dialogue=dialogue,
+            dialogue_source_sha256=dialogue_sha,
+            dialogue_delivery=delivery,
+        ) == "done"
+        with pytest.raises(
+            h3_project.ProjectMultimodalError,
+            match="speaker_timing_refresh_required",
+        ):
+            h3_project.freeze_optional(root, work)
         return
     assert produced == "done", storage.load_meta(settings.data_dir, cid).get(
         "_multimodal_binding_producer"
