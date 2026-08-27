@@ -272,6 +272,19 @@ def test_v4_generation_keyframes_require_an_intact_verified_output_receipt(
         postprocess.generation_keyframes(cdir, meta, [source])
 
 
+def test_generation_keyframes_rejects_orphaned_manual_acceptance_authority(tmp_path):
+    cdir = tmp_path / ("a" * 32)
+    source = cdir / "work" / "keyframes" / "01.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(PNG)
+    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
+        postprocess.generation_keyframes(
+            cdir,
+            {"_image_user_acceptance": {"version": 1, "sha256": "a" * 64}},
+            [source],
+        )
+
+
 def test_v4_postprocess_never_calls_quality_pack_gate(
     tmp_path, monkeypatch,
 ):

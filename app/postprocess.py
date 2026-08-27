@@ -2884,7 +2884,7 @@ def generation_keyframes(
         # original inputs.  This also covers MediaKit-only selections.
         if any(key in meta for key in (
             "_postprocess_receipt", "_image_optimization",
-            "_v4_canvas_execution", "_image_verification",
+            "_v4_canvas_execution", "_image_verification", _IMAGE_ACCEPTANCE_KEY,
         )):
             raise PostprocessError(409, "postprocess_artifacts_invalid")
         return originals
