@@ -111,7 +111,7 @@ flowchart LR
 
 `postprocess` 不存在表示用户跳过优化，使用原关键帧；一旦存在则提交必须等待 `done`，并逐一解析同名 `postprocessed/`。短视频统一作为逻辑段 `0`，长视频严格使用连续正整数 `1..N`。每段按已选阶段形成屏障：本段全部帧完成 MediaKit 文字擦除后才进入图标擦除，全部完成后才进入 Seedream；段之间并行，每个阶段的帧请求由供应商级信号量限流。
 
-视觉关键帧冻结后，隔离 Codex 只执行一次 `skills/image-postprocess`：工作区只有全部分段关键帧、`edit_mode` 及 `index/chain_id/join_mode`，不含 H3 prompt、台词、音频或视频。Skill 一次输出严格 JSON，其中包含跨至少两段的稳定元素 ID、统一替换设计及适用段号，以及每段直接提交给 Seedream 的真实提示词；短视频使用同一契约的逻辑段 `0`，且全局映射为空。后端原子校验整份输出后冻结私有 `_image_continuity` 和各段提示词，任一字段非法时不接受任何分段提示词。Codex 输出的分段提示词就是用户看到并可 CAS 修改的文本；分析完成时同时冻结 allowlist 内的模型和 `anchor_consistency|independent_parallel` 模式。`anchor_consistency` 先以本段全部清理帧生成第一张锚帧，再把其余各帧与锚帧并行编辑；锚帧只提供重复元素的替换身份和新设计，不提供内容、构图、机位、动作、光线或位置参考。`independent_parallel` 每张清理帧独立并行编辑。两种模式都保持一入一出，不使用供应商多输出映射。图片编辑是可选的非确定性步骤，提示词存在不表示该步骤一定执行或成功。
+视觉关键帧冻结后，同一 `skills/image-postprocess` 先执行 `phase=plan`：工作区只有全部分段关键帧、`edit_mode` 及 `index/chain_id/join_mode`，不含 H3 prompt、台词、音频或视频。严格 v2 JSON 为每个叙事主人物建立稳定轨道与 replacement，为每个场景组件建立语义、形状、纵深、布局和局部颜色都变化的真实新场景；每段完整枚举人物可观察帧并恰好引用一个场景。后端校验后冻结 `_image_continuity` v2 与 SHA，以确定性 compiler 生成不可自由改写的 Seedream prompt，并冻结 identity/scene/layout reference slots、源帧 SHA、model、profile 和 revision。旧 `_image_continuity` v1 只读兼容，不自动升级。图片编辑完成后同一 Skill 执行 `phase=verify`，只接收 source/output 帧、冻结 plan 和确定性指标，输出逐人物、逐场景和项目级结构化 verdict；任一 fail/unknown 均阻止发布与 H3 提交。
 
 每个 Seedream POST 前原子持久化绑定模型、模式、提示词摘要和输入摘要的 attempt。只有完整 HTTP 429、精确 `QuotaExceeded` 且没有 `data` 时才继续，单帧硬上限 3 次；网络/超时/取消等 POST 结果不明都写为 `submission_unknown`。服务启动仅恢复能由本地产物证明安全的阶段；当前 revision 存在 submitting/unknown attempt 时将该段和整体标为失败，不自动重发。人工重试用 revision CAS 创建下一 revision，旧 attempt 不删除。
 

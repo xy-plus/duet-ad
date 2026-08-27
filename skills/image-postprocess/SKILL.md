@@ -1,114 +1,189 @@
 ---
 name: image-postprocess
-description: 检查整个视频项目的冻结关键帧，以视频连续性和现实合理性为最高优先级，统一选择安全的背景或人物替换，并生成各片段真实提交给 Seedream 的简洁提示词。
+description: 分析或验收视频项目冻结关键帧，为全部叙事主人物与真实新场景的同时替换生成严格结构化计划，并以连续性、物理关系和光色守恒为门禁。用于图片后处理的项目级 plan 与 verify 阶段。
 ---
 
 # image-postprocess
 
-## 目标
+## 原则
 
-第一优先级是最终视频连续性和现实合理性；任何扭曲、元素突变、物理或接触关系异常都一票否决。保持叙事内核和关系不变，只改变表象。人物或背景替换仅是用于去重的第二优先级，只有通过第一层才评价。
+最终视频的连续性、现实合理性和叙事关系优先。人物与真实新场景必须同时替换，形成明显表象差异；画面内核、动作目的、相机和全局光色保持不变。任一必要目标无法安全完成时判项目不合格，不得输出成功 no-op。
 
-本 Skill 只生成提示词，不编辑图片、不调用 Seedream。生成提示词不代表图片二次编辑一定执行、成功或被视频生成采用。
+本 Skill 只生成结构化设计或结构化验收结论，不编辑图片、不调用供应商。`plan` 只生成结构化设计，不直接编写 Seedream 提示词；后端确定性编译器负责加入不可删除的执行约束。用户自由文本不得删除或覆盖硬约束。
 
-## 输入
+执行器逐帧并行编辑：图1始终是唯一编辑画布；其他输入图只提供冻结人物身份、场景设计和本段布局，不传递构图、机位、动作、光线或实体关系。不得使用首帧内容锚定其他帧。
 
-只允许读取：
+不得出现素材特调：不写只适用于某个测试视频的物体、房间、颜色、构图或位置规则；所有结论只来自本次允许读取的冻结图片。
 
-- `work/request.json`：`edit_mode` 只能是 `anchor_consistency` 或 `independent_parallel`；`segments` 按段号升序提供 `index`、`chain_id`、`join_mode`。
-- `work/segments/<段号>/keyframes/01.png、02.png …`：对应片段的全部冻结关键帧。
+## 输入边界
 
-不得读取视频、视频生成提示词、台词、音频、项目目录、其他路径或未列出的文件。
+`work/request.json` 的 `phase` 只能是 `plan` 或 `verify`。
 
-## 唯一输出
+### plan
 
-只写 UTF-8 `work/image_optimization.json`，不得写其他文件，结构严格如下：
+只读取：
+
+- `work/request.json`：含 `phase=plan`、`edit_mode`、按段号升序的 `index/chain_id/join_mode`。
+- `work/segments/<段号>/keyframes/01.png、02.png …`：每段全部冻结关键帧。
+
+只写 `work/image_optimization.json`。
+
+### verify
+
+只读取：
+
+- `work/request.json`：含 `phase=verify` 与 `segment_indices`。
+- `work/frozen_plan.json`：后端冻结的 v2 plan receipt。
+- `work/metrics.json`：确定性质量指标。
+- `work/segments/<段号>/source/NN.png` 与 `output/NN.png`：一一对应的源帧和结果帧。
+
+只写 `work/image_verification.json`。
+
+两个阶段均不得读取视频、音频、台词、视频生成提示词、项目目录、环境变量、其他路径或未列出的文件；不得联网，不得写其他文件。
+
+## plan 工作流
+
+1. 查看全项目全部冻结帧，先建立镜头、场景组件、人物轨道、遮挡和互动关系。`continue` 优先视为连续画面；`hard_cut` 不自动表示人物或场景改变。
+2. 找出全部叙事主人物。叙事主人物是持续承担动作、对白、演示或剧情作用的人；背景路人不是替换目标，写入 `protected_non_target_people`。不能可靠区分多位主人物或可能串人时，保守判不合格，不得错误合并。
+3. 为每个稳定叙事主人物建立一个 `person_plans` 项。替换人物保持源人物可见的性别呈现、肤色与族裔外观风格范围、年龄范围和整体气质，但不推断或命名敏感身份；使用长相略有不同的新脸。服装保持用途、颜色关系和整体风格，但款式与局部主色必须产生可见差异。
+4. 每段 `persons` 必须按 ID 完整枚举所有主人物。人物在本段任一帧可观察且边界可定位时写 `replace`，并列出所有可观察帧；确实不可观察时写 `not_observable`，不得新增人物。所有可观察主人物都必须替换，不能漏人或二选一。
+5. 按同一物理环境建立 `scene_plans`；每段恰好属于一个场景组件。每个场景方案必须同时包含：环境语义真实更换、形状/几何变化、纵深变化、空间布局变化、局部材质或颜色变化。不得只改色相、材质或全局调色，不得把原场景换皮后冒充新场景。
+6. 人物与新场景都保持画幅、裁切、机位、镜头、透视、构图、焦点和景深；固定全局光源方向、曝光、白平衡/CCT、tone curve 和整体色彩风格。新几何可以产生物理正确的局部阴影和反射变化，但不能改变全局照明。
+7. 冻结人物与核心实体之间的接触、持握、装配、支撑、遮挡、前后顺序、数量、姿态、动作目的和叙事关系。新人物和新场景不得扭曲、融合、穿模或违反现实规则。
+8. 每个人物和场景组件选一张目标完整、清晰、遮挡少的冻结帧作为 `reference`。每段选一张最能表达本段源构图与空间布局的帧作为 `layout_reference_frame_index`。引用只能指向对应人物可观察或场景所属的真实输入帧。
+9. 禁止恢复或新增字幕、文字、Logo、水印、贴纸、界面、品牌标识或乱码。
+
+### 不合格原因
+
+按下列顺序选择首个成立的稳定 `reason`：
+
+1. `no_observable_narrative_person`
+2. `narrative_person_tracks_ambiguous`
+3. `person_replacement_unsafe`
+4. `scene_components_ambiguous`
+5. `scene_structure_replacement_unsafe`
+
+不合格时必须输出 `eligible=false`、对应 reason，且 `person_plans/scene_plans/segments` 全为空。不得输出提示词或不改动方案。
+
+### plan 唯一输出
+
+结构必须严格如下；短视频使用 `segment_indices=[0]`，也必须完整表达人物与场景双目标。所有数组按段号或 ID 升序，ID 从 `01` 连续编号，除规定字段外不得增加字段：
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "phase": "plan",
   "segment_indices": [1, 2],
-  "global_elements": [
+  "eligible": true,
+  "reason": null,
+  "person_plans": [
     {
       "id": "PERSON_01",
-      "kind": "person",
-      "source": "跨段重复出现的原人物可见特征",
-      "replacement": "统一的新人物身份和可复用外观特征",
+      "source_identity": "源主人物的稳定可见特征",
+      "replacement_identity": "统一的新人物身份与不同脸部设计",
+      "wardrobe_change": "同用途同风格但不同款式的服装设计",
+      "local_color_change": "人物局部固有色的明确变化",
+      "reference": {"segment_index": 1, "frame_index": 1},
+      "observable_segments": [1, 2]
+    }
+  ],
+  "scene_plans": [
+    {
+      "id": "SCENE_01",
+      "source_scene": "源环境的稳定可见语义",
+      "replacement_scene": "同叙事用途但不同设计的真实新环境",
+      "semantic_change": "环境语义替换说明",
+      "geometry_changes": ["可见形状和几何变化"],
+      "depth_changes": ["纵深和前后层级变化"],
+      "layout_changes": ["空间布局变化"],
+      "local_color_change": "场景局部材质或固有色变化",
+      "reference": {"segment_index": 1, "frame_index": 1},
       "segments": [1, 2]
     }
   ],
-  "segment_prompts": [
-    {"segment_index": 1, "prompt": "本段真实提交给 Seedream 的完整提示词"},
-    {"segment_index": 2, "prompt": "本段真实提交给 Seedream 的完整提示词"}
+  "segments": [
+    {
+      "segment_index": 1,
+      "persons": [
+        {
+          "id": "PERSON_01",
+          "state": "replace",
+          "observable_frames": [1, 2],
+          "target_region": "本段人物完整目标域",
+          "boundary": "本段人物真实可见边界"
+        }
+      ],
+      "scene": {
+        "scene_id": "SCENE_01",
+        "target_region": "本段完整场景目标域",
+        "boundary": "场景与人物、前景物体的停止边界",
+        "layout_reference_frame_index": 1
+      },
+      "protected_non_target_people": [],
+      "protected_relations": ["必须保持的可见空间或物理关系"]
+    }
   ]
 }
 ```
 
-- `segment_indices` 必须与请求段号完全一致。
-- `segment_prompts` 必须覆盖全部段并按段号升序排列；每段提示词非空、恰好两句。
-- 短视频的 `segment_indices` 是 `[0]`，`global_elements` 必须是空数组；资格通过时，segment 0 提示词中的自然语言项目身份短语是其所有关键帧唯一的身份载体，背景或人物路线的第一句必须逐字写入该短语。短视频唯一段的任一冻结帧不合格时，segment 0 必须严格输出两句无条件不改动提示词；不得声称存在 `PERSON` 或 `SCENE` 映射。
-- 长视频每个 `global_elements` 元素的 `replacement` 本身必须是可直接复用的自然语言冻结短语；`PERSON` 和 `SCENE` 都必须把该短语逐字写入其 `segments` 所列每段提示词的第一句。
-- 除规定字段外不得增加字段；不得用 Markdown 代码围栏包裹 JSON。
+`not_observable` 项的 `observable_frames` 必须为 `[]`，`target_region` 与 `boundary` 必须为 `null`。`replace` 项必须至少列一个真实可观察帧。同一 `scene_plans.segments` 集合必须无重叠覆盖全部段；每个 `person_plans.observable_segments` 必须等于段内该人物为 `replace` 的段集合。
 
-## 项目级安全决策
+## verify 工作流
 
-### 可观察定义
+逐帧对照 source/output、冻结 plan 和确定性指标。不能确认即 `unknown`，不得把缺失证据写成 pass；不要修图或建议重试。
 
-- 核心实体：删除或修改后会改变动作目的、剧情含义或画面识别的可见实体。
-- 交互实体：与人物或核心实体存在持握、接触、装配、插入、连接、对齐或承托等可见关系的实体。
-- 非目标前景：遮挡目标表面，或建立景深、接触边界的可见实体。
-- 高风险关系：上述任一可见关系存在，且编辑对象变化可能破坏数量、结构、作用方向、接触点、遮挡或前后顺序。
+逐人物验证：目标身份确实改变、源身份不再可识别、冻结新身份与局部颜色在可观察帧保持一致；`not_observable` 只能为 `not_applicable`，并确认没有新增该人物。
 
-### 决策步骤
+逐场景验证：环境语义、形状、纵深和空间布局都真实改变，局部材质或固有色不同，不能只有调色或纹理变化。验证全局光源方向、曝光、WB/CCT、tone curve 保持；允许新几何产生合理局部阴影。验证接触、遮挡、动作和现实关系，检查段内连续性、跨段人物身份与场景组件连续性、漏人物、串人和计划外人物。
 
-1. 先检查全项目全部关键帧；去重目标只能是 `人物外观` 或 `背景`。全项目构建跨段相关组件：把同一 `chain_id`，或可见为同一人物、同一场景或同一稳定背景表面、核心实体、交互实体、非目标前景或互动关系的段连在一起；识别核心实体、交互实体及实体间互动，不得用不可见信息推断或虚构关联。
-2. 每个组件只做一次策略选择并冻结，不得逐段摇摆。逐帧检查核心实体与交互实体之间的空间与物理关系；任一相关段存在高风险交互关系，整个组件统一选择背景路线，只替换背景；人物、服装、核心实体、交互实体、非目标前景及其像素语义、空间与物理关系全不变。
-3. 背景路线只选一个在每张冻结帧中都稳定对应、完整可见且外边界可定位、面积尽量大的单一安全表面；不得映射全部背景或组合多个表面类别。
-4. 对所选表面只做原位外观映射，按“跨段一致性”冻结替换身份，再按背景路线生成两句提示词；不得描述或生成新环境。
-5. 只有组件无上述高风险关系、找不到稳定安全背景表面，且同一人物可确认、换脸不会降低连续性和现实合理性时，才统一选择人物路线。候选 `PERSON` 在拟编辑段的任一冻结帧中，都必须让脸部目标完整可见且完整编辑域和完整外边界可稳定定位；只要脸部目标不可见、严重遮挡或严重裁切，或完整编辑域或完整外边界不能稳定定位，该段不得列入 `PERSON segments`。全帧资格过滤后，长视频同一候选 `PERSON` 不足两个合格段时不得建立该全局元素。只替换同一人物的新脸，新脸长相略有不同；保持可见的性别呈现、肤色和整体风格、年龄和气质，不推断身份或具体族裔；只换脸，不换服装，锁定头部位置、大小、朝向、裁切和遮挡；跨段 `PERSON replacement` 必须逐字复用。
-6. 编辑资格门先于提示词且适用于每个实际替换目标（`PERSON` 或 `SCENE`）：任一冻结帧的完整目标域或完整外边界不能稳定定位时，该段必须严格输出两句无条件不改动提示词，两句都只能要求保持当前源图不变，不得进入该目标的 `segments`，不得收到共享编辑提示词，也不得用该段其他清晰帧补证；任一冻结帧不合格时整段严格两句无条件不改动。单段资格不合格只冻结该段 no-op，其他合格段继续按既有路线过滤；全帧资格过滤后，长视频同一候选不足两个合格段时不得建立对应 `global_elements`。逐段资格过滤不得扩大 no-op 范围；只有跨段同一替换身份本身无法证明时，资格门才把整个组件判为 no-op。任何组件只要背景路线和人物路线都不能证明安全，输出两句不改动提示词，不建立 `global_elements`；这包括无人、人物不清晰且无稳定安全背景表面的普通组件。高风险组件找不到合格表面时放弃去重，不得退到人物路线。画质、核心实体、交互实体、非目标前景不得作为差异化目标；没有人物时不得新增人物。
+每项检查严格输出 `{status,evidence}`；status 只能是 `pass/not_applicable/fail/unknown`，evidence 必须简短且来自可见证据或 metrics。任一 `fail` 或 `unknown` 均不得通过。
 
-### 背景 SCENE 逐段证据
+### verify 唯一输出
 
-- 背景 `SCENE` 规则中的“相关段”仅指列入该 `SCENE segments` 的合格段；`SCENE segments` 只包含通过逐段证据门禁的合格段。同一组件已有至少两个合格段并建立 `SCENE`，但另有一个或多个不合格段时，每个不合格整段必须输出两句不改动提示词，不得包含该 `SCENE` 的项目级替换短语，也不得改走人物路线。
-- “同一场景”只用于构建相关组件，不能证明可编辑表面跨段为同一表面。每个拟列入 `SCENE segments` 的段必须用该段自身关键帧独立举证；不得用其他段、场景名称、语义类别相同或相似材质补证。
-- 目标表面的定位不得只依赖语义名称。存在相邻同类表面或连续平面时，拟编辑段必须用该段自身可见且明确的边界拓扑或停止地标定义编辑域，停止地标另一侧保持原样；因编辑域无法稳定定位而判定不合格的段，必须输出两句不改动提示词，不得在该段回退人物路线；过滤后少于两个合格段时的全组件人物或不改动决策，不得覆盖该段已冻结的不改动结论。
-- 候选 `SCENE` 在拟编辑段的任一冻结帧中，都必须让目标表面的身份、全部目标成员、连续可编辑区域、完整外边界和原纹理拓扑清晰可辨，足以按原位置保留。只要目标完整成员或完整外边界不能稳定定位，或目标不可见、仅见边缘碎片或局部窄条，该段不得列入 `SCENE segments`，必须严格输出两句无条件不改动提示词。
-- 同一 `SCENE` 要求各合格段的可见证据证明它们是同一物理表面，或同一场景内设计连续且可安全统一映射的同一表面；仅同类表面不够。`hard_cut` 不自动否定同一表面，但每个段必须独立举证。
-- 不得用该段其他清晰帧补证，也不得让孤立的目标不可见帧继续收到共享编辑提示词。全帧资格过滤后，长视频同一候选 `SCENE` 不足两个合格段时不得建立该全局元素；不合格段的严格 no-op 结论不得被其他路线覆盖。
+```json
+{
+  "version": 2,
+  "phase": "verify",
+  "plan_sha256": "逐字复制 frozen_plan.json 的 sha256",
+  "segment_indices": [1, 2],
+  "passed": false,
+  "reason": "scene_replacement_failed",
+  "segments": [
+    {
+      "segment_index": 1,
+      "passed": false,
+      "person_checks": [
+        {
+          "person_id": "PERSON_01",
+          "identity_changed": {"status": "pass", "evidence": "可见证据"},
+          "source_identity_absent": {"status": "pass", "evidence": "可见证据"},
+          "local_color_change": {"status": "pass", "evidence": "可见证据"}
+        }
+      ],
+      "scene_checks": {
+        "semantic_change": {"status": "fail", "evidence": "可见证据"},
+        "geometry_change": {"status": "pass", "evidence": "可见证据"},
+        "depth_change": {"status": "pass", "evidence": "可见证据"},
+        "layout_change": {"status": "pass", "evidence": "可见证据"},
+        "local_color_change": {"status": "pass", "evidence": "可见证据"}
+      },
+      "invariants": {
+        "lighting_preservation": {"status": "pass", "evidence": "可见证据"},
+        "interaction_preservation": {"status": "pass", "evidence": "可见证据"},
+        "cross_frame_continuity": {"status": "pass", "evidence": "可见证据"}
+      }
+    }
+  ],
+  "project_checks": {
+    "narrative_person_completeness": {"status": "pass", "evidence": "可见证据"},
+    "no_identity_swap": {"status": "pass", "evidence": "可见证据"},
+    "no_unplanned_person": {"status": "pass", "evidence": "可见证据"},
+    "person_identity_continuity": {"status": "pass", "evidence": "可见证据"},
+    "scene_continuity": {"status": "pass", "evidence": "可见证据"}
+  }
+}
+```
 
-## 不可编辑内容
+reason 取首个成立项：存在 unknown 为 `verification_unknown`；然后依次为 `narrative_person_incomplete`、`identity_swap_detected`、`unplanned_person_detected`、`person_replacement_failed`、`scene_semantic_change_failed`、`scene_geometry_change_failed`、`scene_depth_change_failed`、`scene_layout_change_failed`、`local_color_change_failed`、`lighting_preservation_failed`、`interaction_preservation_failed`、`cross_frame_continuity_failed`、`person_identity_continuity_failed`、`scene_continuity_failed`。全部通过时 reason 为 null。
 
-- 核心实体、交互实体、非目标前景，以及实体间的空间与物理关系、数量、结构、方向，全部不可编辑；不得同类改款。
-- 保持目标帧自身的画幅、裁切、机位、镜头、透视、景别、构图、光线、焦点、景深、人物及其他实体的数量、姿态、动作、视线，以及非目标元素的位置、比例和可见部分。
-- 只有段内所有冻结帧通过资格门，才在已证明的完整目标域内完整覆盖全部可见目标成员，不得留下旧外观孤岛；目标域外像素硬保留，保持轮廓、层级、可见性和运动模糊，不得覆盖、删除或补造。
-- 禁止恢复或新增字幕、文字、Logo、水印、贴纸、界面元素、品牌标识或乱码。
-
-## 跨段一致性
-
-1. 本 Skill 的 `global_elements` 只允许 `PERSON`、`SCENE`；不得输出 `OUTFIT`、`PROP`、`PRODUCT`、`SUBJECT`。只收录实际跨段替换且跨至少两段重复的 PERSON 或 SCENE；单段或仅保持的元素不进入。
-2. 人物使用 `PERSON/person`，背景使用 `SCENE/scene`；同类 ID 从 `01` 连续编号，数组按完整 `id` 的字典序输出。
-3. 对每个实际替换的元素，项目级只冻结一个“替换身份”；通用替换身份只规定唯一性，不增加字段。`source` 只写原目标的稳定可见特征；`replacement` 不写构图、动作、光线、位置或关系。
-4. `PERSON` 只冻结同一新脸身份特征，未编辑的脸部属性和非脸部继承当前源图；`PERSON replacement` 本身是可直接复用的自然语言冻结短语，人物路线第一句必须逐字包含。
-5. `SCENE` 才冻结表面局部物理坐标中的实际目标属性值或区间、材料、表面响应、纹理族与世界尺度、原有特征相位、结构单元、接缝或重复拓扑；未作为编辑目标的属性继承当前源图，不得重新设计或重新采样高频细节。`SCENE replacement` 本身就是项目级替换短语，只由实际改变的一种低频属性及其目标值组成；目标表面描述属于 `source` 和段内局部边界，不得混入 `replacement`。
-6. 视角、裁切、透视、连续受光、运动模糊和真实遮挡仅是投影变量，相机和光照不能重生替换身份。同一物理实例在遮挡后、跨段或 `hard_cut` 后再次出现，必须映射回同一替换身份，不得独立重新设计；`SCENE` 还须映射回同一拓扑。
-7. `segments` 只列实际替换的段号，升序、去重且至少两段；实际替换元素的 `segments` 必须两两不相交，任一长视频 `segment_index` 最多属于一个 `global_elements` 元素。同段有多个候选时，按既有安全门和已冻结策略只保留一个，其他候选不得进入该段映射或提示词。每个背景组件只为选中的一个表面类别建立 `SCENE`；同一 `SCENE replacement` 或 `PERSON replacement` 必须逐字复用。
-8. 同一 `chain_id` 的 `continue` 段优先视为连续画面；`hard_cut` 不自动代表人物或场景变化，仍按可见证据判断。
-
-## 每段 Seedream 提示词
-
-段级提示词会复用于该段每次以一张当前源图为编辑目标的请求；编辑提示词只能发送到所有冻结帧均通过资格门的段。每段所有关键帧共享一份可直接提交给 Seedream 的提示词：第一句只聚焦唯一替换目标、冻结的自然语言身份短语及其原位条件，第二句写完整保护；两句只写通用投影守恒，不得包含以目标不可见为前提的运行时条件句，不得逐帧描述条件或声称同时看过多张输入图。保持简洁，但不得为缩短删除安全关系；禁止全景复述、画质美化或实体清单，不得包含 Markdown、解释或分析。
-
-每个 `segment_prompts.prompt` 必须直接写自然语言目标与替换设计，绝不能包含内部 ID 或字段标签，例如 `PERSON_01`、`SCENE_01`、`source`、`replacement`、`global_elements`；这些只属于 JSON 映射。
-
-### 背景路线
-
-1. 长视频第一句逐字写入 `SCENE replacement`，短视频第一句按唯一输出合同逐字写入自然语言项目身份短语：默认只改变一种低频外观属性，优先色相；只有色相不能安全获得明显差异时，才单独选择明暗、光泽或粗糙度之一，差异必须明显可见。`SCENE replacement` 和项目级替换短语只写实际改变的一个属性，不得列出未改变属性或多个候选。只改色相时，两种短语都只能由“只改变目标域色相为”与紧随其后的单一朴素色相组成；色相身份不得附加任何会改变深浅、浓淡、质感或风格的修饰，首句最前面必须逐字写入该短语，随后明确写“除色相外，目标域保持当前源图的深浅、浓淡、渐变和局部层次不变”，明显差异只能由所选色相本身提供，不得附加新表面处理。完整保留表面局部物理坐标中的原纹理图案、纹理相位、缺陷、边界、几何、方向、世界尺度和接触几何；透视仅服从当前源图投影，并保持光线方向；不得新增、删除或移动纹理图案、接缝、重复单元或高频细节；无法安全获得明显差异时允许不改动，不得强行复杂重画。每个相关段实际 `prompt` 的第一句必须逐字包含同一短语，项目级替换短语在合格段间逐字一致，不得缩写、改写或使用同义词；每段 `prompt` 可写该段不同的局部停止边界，局部停止边界不属于项目级替换短语，不要求整段 `prompt` 或整句逐字相同。第一句须直接写明本段局部停止边界并要求停止地标另一侧保持原样，只允许通用投影变化；不得描述新环境、诱导新增非目标实体、重绘人物或改变服装。
-2. 只有资格门通过后，第二句才要求在已证明的完整目标域内完整覆盖全部可见目标成员且不留旧外观孤岛；整图中目标域之外的内容保持当前源图不变，禁止编辑外溢到目标表面之外。固定构件和边界结构不得新增、删除或移动，非目标前景继续遮挡目标表面，接触点、接触阴影、反射和边界结构不得改变；人物、服装、核心实体、交互实体、非目标前景及实体间空间与物理关系全不变；禁止增删文字或 Logo，禁止真实摄影增强或其他编辑目标。其余关系保护可按本段可见关系写，但不得改动项目级替换短语。
-
-### 人物路线
-
-1. 长视频第一句逐字写入 `PERSON replacement`，短视频第一句按唯一输出合同逐字写入自然语言项目身份短语，只替换同一人物的新脸；保持未编辑的脸部属性和可见的性别呈现、肤色和整体风格、年龄和气质，锁定头部位置、大小、朝向、裁切和遮挡，只允许通用投影变化。只换脸，不换服装、背景或身体其他部分。
-2. 只有资格门通过后，第二句才要求在已证明的完整目标域内完整覆盖全部可见目标成员且不留旧外观孤岛；目标域外像素硬保留。固定构件和边界结构不得新增、删除或移动；人物除脸外、服装、核心实体、交互实体、非目标前景及实体间空间与物理关系全不变，并禁止增删文字或 Logo。
-
-把模式约束压入第二句，不得增加第三句：`independent_parallel` 只依赖当前源图和已冻结的自然语言身份短语，无需写“当前图是唯一目标”，不得写参考人物、参考角色或其他图；`anchor_consistency` 必须限制其他图的角色，说明其他图只提供目标设计，不传递人物、构图、动作、实体或关系。
+两个输出均写 UTF-8 裸 JSON，不得使用 Markdown 代码围栏，不得输出解释或其他字段。

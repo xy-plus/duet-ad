@@ -270,9 +270,9 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 }
 ```
 
-短视频只能使用逻辑段 `0`；长视频使用连续正整数段 `1..N`。接口只允许 schema v2 分析已完成且 generation/postprocess 都尚未创建时调用，以 `expected_sha256` CAS 保存；未知字段、空白或超过 32 KiB 的提示词、非法段号在写入前拒绝。摘要漂移返回结构化 409 `image_optimization_prompt_changed`；输入已冻结返回 `image_optimization_prompt_frozen`。成功返回该段新的 `{text,default_text,sha256}`。恢复默认由客户端把 `default_text` 放入草稿，仍需调用本接口保存。
+该接口只保留给历史 v1 continuity receipt：短视频使用逻辑段 `0`，长视频使用连续正整数段 `1..N`，并继续以 `expected_sha256` CAS 保存而不迁移旧 receipt。存在有效 v2 双目标 plan 时提示词由后端确定性编译，接口固定返回 409 `image_optimization_prompt_compiled`；v2 plan 损坏返回 `image_optimization_plan_invalid`，绝不回退 v1。未知字段、空白或超过 32 KiB 的旧提示词、非法段号在写入前拒绝。
 
-视觉关键帧冻结后，项目只执行一次 `skills/image-postprocess`：短视频输入逻辑段 `0`，多段项目输入全部分段关键帧与 `index/chain_id/join_mode`。唯一严格 JSON 输出同时包含跨段元素映射和全部分段真实 Seedream 提示词；后端整体验证后再冻结，任一部分非法则全部拒绝。Skill 不读取或复制 H3 提示词。项目在分析完成时冻结同一个 Seedream 模型和模式，但这些内部字段不会出现在 detail。短视频在顶层返回 `image_optimization_prompt`；长视频把对应对象放入每个 `segments[]`。
+视觉关键帧冻结后，同一 `skills/image-postprocess` 先以 `phase=plan` 输出 v2 双目标结构化计划：`person_plans[]` 覆盖全部叙事主人物，`scene_plans[]` 无重叠覆盖全部段，短视频逻辑段 `0` 也使用相同合同。后端校验并冻结 plan SHA、reference slots、源帧 SHA、model/profile/revision，再确定性编译每段 Seedream 提示词；v2 提示词不能由自由文本 PATCH。图片编辑后以 `phase=verify` 只读 source/output 帧、冻结 plan 和确定性指标，结构化检查人物替换及源身份残留、场景语义/形状/纵深/布局、局部颜色、全局光色、互动关系和时序连续性；fail/unknown 均 fail closed。旧 `_image_continuity` v1 可验证读取，但不会迁移或重写。
 
 ### `POST /api/conversations/{cid}/postprocess`
 

@@ -35,6 +35,24 @@ _ELEMENT_KINDS = {
 _ELEMENT_ID_RE = re.compile(
     r"^(PERSON|SUBJECT|OUTFIT|SCENE|PROP|PRODUCT)_([0-9]{2})$"
 )
+_PERSON_ID_RE = re.compile(r"^PERSON_([0-9]{2})$")
+_SCENE_ID_RE = re.compile(r"^SCENE_([0-9]{2})$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_INELIGIBLE_REASONS = {
+    "no_observable_narrative_person",
+    "narrative_person_tracks_ambiguous",
+    "person_replacement_unsafe",
+    "scene_components_ambiguous",
+    "scene_structure_replacement_unsafe",
+}
+_VERIFY_STATUSES = {"pass", "not_applicable", "fail", "unknown"}
+_PROJECT_CHECKS = (
+    "narrative_person_completeness",
+    "no_identity_swap",
+    "no_unplanned_person",
+    "person_identity_continuity",
+    "scene_continuity",
+)
 
 
 class ImageOptimizationError(ValueError):
@@ -46,6 +64,12 @@ class ImageOptimizationError(ValueError):
 
 class ImageOptimizationOutputError(ValueError):
     pass
+
+
+class ImageOptimizationIneligibleError(ValueError):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 def sha256(text: str) -> str:
@@ -94,7 +118,9 @@ def _read_json_output(path: Path, max_bytes: int) -> object:
         ) from None
 
 
-def _canonical_continuity(value: object, expected_indices: list[int] | None = None) -> dict:
+def _canonical_continuity_v1(
+    value: object, expected_indices: list[int] | None = None
+) -> dict:
     if not isinstance(value, dict) or set(value) != {
         "version", "segment_indices", "elements"
     } or value.get("version") != 1:
@@ -153,6 +179,421 @@ def _canonical_continuity(value: object, expected_indices: list[int] | None = No
     return {"version": 1, "segment_indices": list(indices), "elements": canonical}
 
 
+def _canonical_text(value: object, *, max_bytes: int = 2048) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or len(value.encode("utf-8")) > max_bytes
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return value
+
+
+def _canonical_text_list(
+    value: object, *, minimum: int = 0, maximum: int = 20
+) -> list[str]:
+    if not isinstance(value, list) or not minimum <= len(value) <= maximum:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    result = [_canonical_text(item, max_bytes=1024) for item in value]
+    if len(set(result)) != len(result):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return result
+
+
+def _canonical_plan_indices(
+    value: object, expected_indices: list[int] | None = None
+) -> list[int]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(isinstance(index, bool) or not isinstance(index, int) for index in value)
+        or value not in ([0], list(range(1, len(value) + 1)))
+        or (expected_indices is not None and value != expected_indices)
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return list(value)
+
+
+def _canonical_reference(
+    value: object,
+    indices: list[int],
+    frame_counts: dict[int, int] | None,
+) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != {"segment_index", "frame_index"}:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    segment_index = value.get("segment_index")
+    frame_index = value.get("frame_index")
+    if (
+        isinstance(segment_index, bool)
+        or not isinstance(segment_index, int)
+        or segment_index not in indices
+        or isinstance(frame_index, bool)
+        or not isinstance(frame_index, int)
+        or frame_index < 1
+        or (
+            frame_counts is not None
+            and frame_index > frame_counts.get(segment_index, 0)
+        )
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return {"segment_index": segment_index, "frame_index": frame_index}
+
+
+def _canonical_plan_v2(
+    value: object,
+    expected_indices: list[int] | None = None,
+    frame_counts: dict[int, int] | None = None,
+) -> dict:
+    keys = {
+        "version",
+        "phase",
+        "segment_indices",
+        "eligible",
+        "reason",
+        "person_plans",
+        "scene_plans",
+        "segments",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get("version") != 2
+        or value.get("phase") != "plan"
+        or not isinstance(value.get("eligible"), bool)
+    ):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    indices = _canonical_plan_indices(value.get("segment_indices"), expected_indices)
+    if frame_counts is not None and set(frame_counts) != set(indices):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    if not value["eligible"]:
+        if (
+            value.get("reason") not in _INELIGIBLE_REASONS
+            or value.get("person_plans") != []
+            or value.get("scene_plans") != []
+            or value.get("segments") != []
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        return {
+            "version": 2,
+            "phase": "plan",
+            "segment_indices": indices,
+            "eligible": False,
+            "reason": value["reason"],
+            "person_plans": [],
+            "scene_plans": [],
+            "segments": [],
+        }
+    if value.get("reason") is not None:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+
+    raw_people = value.get("person_plans")
+    if not isinstance(raw_people, list) or not 1 <= len(raw_people) <= 20:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    people = []
+    for number, item in enumerate(raw_people, 1):
+        if not isinstance(item, dict) or set(item) != {
+            "id",
+            "source_identity",
+            "replacement_identity",
+            "wardrobe_change",
+            "local_color_change",
+            "reference",
+            "observable_segments",
+        }:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        identifier = item.get("id")
+        matched = _PERSON_ID_RE.fullmatch(identifier) if isinstance(identifier, str) else None
+        observable = item.get("observable_segments")
+        if (
+            matched is None
+            or int(matched.group(1)) != number
+            or not isinstance(observable, list)
+            or not observable
+            or any(
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index not in indices
+                for index in observable
+            )
+            or observable != sorted(set(observable))
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        source = _canonical_text(item.get("source_identity"))
+        replacement = _canonical_text(item.get("replacement_identity"))
+        if source == replacement:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        people.append(
+            {
+                "id": identifier,
+                "source_identity": source,
+                "replacement_identity": replacement,
+                "wardrobe_change": _canonical_text(item.get("wardrobe_change")),
+                "local_color_change": _canonical_text(item.get("local_color_change")),
+                "reference": _canonical_reference(
+                    item.get("reference"), indices, frame_counts
+                ),
+                "observable_segments": list(observable),
+            }
+        )
+
+    raw_scenes = value.get("scene_plans")
+    if not isinstance(raw_scenes, list) or not 1 <= len(raw_scenes) <= 50:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    scenes = []
+    covered: list[int] = []
+    for number, item in enumerate(raw_scenes, 1):
+        if not isinstance(item, dict) or set(item) != {
+            "id",
+            "source_scene",
+            "replacement_scene",
+            "semantic_change",
+            "geometry_changes",
+            "depth_changes",
+            "layout_changes",
+            "local_color_change",
+            "reference",
+            "segments",
+        }:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        identifier = item.get("id")
+        matched = _SCENE_ID_RE.fullmatch(identifier) if isinstance(identifier, str) else None
+        members = item.get("segments")
+        if (
+            matched is None
+            or int(matched.group(1)) != number
+            or not isinstance(members, list)
+            or not members
+            or any(
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index not in indices
+                for index in members
+            )
+            or members != sorted(set(members))
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        source = _canonical_text(item.get("source_scene"))
+        replacement = _canonical_text(item.get("replacement_scene"))
+        reference = _canonical_reference(item.get("reference"), indices, frame_counts)
+        if source == replacement or reference["segment_index"] not in members:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        scenes.append(
+            {
+                "id": identifier,
+                "source_scene": source,
+                "replacement_scene": replacement,
+                "semantic_change": _canonical_text(item.get("semantic_change")),
+                "geometry_changes": _canonical_text_list(
+                    item.get("geometry_changes"), minimum=1, maximum=8
+                ),
+                "depth_changes": _canonical_text_list(
+                    item.get("depth_changes"), minimum=1, maximum=8
+                ),
+                "layout_changes": _canonical_text_list(
+                    item.get("layout_changes"), minimum=1, maximum=8
+                ),
+                "local_color_change": _canonical_text(item.get("local_color_change")),
+                "reference": reference,
+                "segments": list(members),
+            }
+        )
+        covered.extend(members)
+    if sorted(covered) != indices or len(covered) != len(set(covered)):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+
+    raw_segments = value.get("segments")
+    if not isinstance(raw_segments, list) or len(raw_segments) != len(indices):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    person_ids = [item["id"] for item in people]
+    scene_by_id = {item["id"]: item for item in scenes}
+    segments = []
+    observed_by_person = {identifier: [] for identifier in person_ids}
+    person_frames: dict[tuple[int, str], list[int]] = {}
+    for expected, item in zip(indices, raw_segments):
+        if not isinstance(item, dict) or set(item) != {
+            "segment_index",
+            "persons",
+            "scene",
+            "protected_non_target_people",
+            "protected_relations",
+        } or item.get("segment_index") != expected:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        raw_segment_people = item.get("persons")
+        if (
+            not isinstance(raw_segment_people, list)
+            or len(raw_segment_people) != len(person_ids)
+            or [person.get("id") for person in raw_segment_people if isinstance(person, dict)]
+            != person_ids
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        segment_people = []
+        for person in raw_segment_people:
+            if set(person) != {
+                "id",
+                "state",
+                "observable_frames",
+                "target_region",
+                "boundary",
+            }:
+                raise ImageOptimizationOutputError(
+                    "image optimization output is missing or invalid"
+                )
+            state = person.get("state")
+            frames = person.get("observable_frames")
+            if (
+                state not in {"replace", "not_observable"}
+                or not isinstance(frames, list)
+                or any(
+                    isinstance(frame, bool) or not isinstance(frame, int) or frame < 1
+                    for frame in frames
+                )
+                or frames != sorted(set(frames))
+                or (
+                    frame_counts is not None
+                    and any(frame > frame_counts[expected] for frame in frames)
+                )
+            ):
+                raise ImageOptimizationOutputError(
+                    "image optimization output is missing or invalid"
+                )
+            if state == "replace":
+                if not frames:
+                    raise ImageOptimizationOutputError(
+                        "image optimization output is missing or invalid"
+                    )
+                target = _canonical_text(person.get("target_region"))
+                boundary = _canonical_text(person.get("boundary"))
+                observed_by_person[person["id"]].append(expected)
+            else:
+                if frames or person.get("target_region") is not None or person.get("boundary") is not None:
+                    raise ImageOptimizationOutputError(
+                        "image optimization output is missing or invalid"
+                    )
+                target = None
+                boundary = None
+            person_frames[(expected, person["id"])] = list(frames)
+            segment_people.append(
+                {
+                    "id": person["id"],
+                    "state": state,
+                    "observable_frames": list(frames),
+                    "target_region": target,
+                    "boundary": boundary,
+                }
+            )
+        scene = item.get("scene")
+        if not isinstance(scene, dict) or set(scene) != {
+            "scene_id",
+            "target_region",
+            "boundary",
+            "layout_reference_frame_index",
+        }:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        scene_id = scene.get("scene_id")
+        layout_frame = scene.get("layout_reference_frame_index")
+        if (
+            scene_id not in scene_by_id
+            or expected not in scene_by_id[scene_id]["segments"]
+            or isinstance(layout_frame, bool)
+            or not isinstance(layout_frame, int)
+            or layout_frame < 1
+            or (
+                frame_counts is not None
+                and layout_frame > frame_counts[expected]
+            )
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        segments.append(
+            {
+                "segment_index": expected,
+                "persons": segment_people,
+                "scene": {
+                    "scene_id": scene_id,
+                    "target_region": _canonical_text(scene.get("target_region")),
+                    "boundary": _canonical_text(scene.get("boundary")),
+                    "layout_reference_frame_index": layout_frame,
+                },
+                "protected_non_target_people": _canonical_text_list(
+                    item.get("protected_non_target_people"), maximum=20
+                ),
+                "protected_relations": _canonical_text_list(
+                    item.get("protected_relations"), maximum=30
+                ),
+            }
+        )
+    for person in people:
+        if observed_by_person[person["id"]] != person["observable_segments"]:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        reference = person["reference"]
+        if reference["segment_index"] not in person["observable_segments"] or reference[
+            "frame_index"
+        ] not in person_frames[(reference["segment_index"], person["id"])]:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+    return {
+        "version": 2,
+        "phase": "plan",
+        "segment_indices": indices,
+        "eligible": True,
+        "reason": None,
+        "person_plans": people,
+        "scene_plans": scenes,
+        "segments": segments,
+    }
+
+
 def _validated_frames(source: Path) -> list[Path]:
     if not source.is_dir():
         raise ValueError("invalid image optimization keyframes directory")
@@ -176,48 +617,276 @@ def _canonical_prompt(value: object) -> str:
     return prompt
 
 
-def _canonical_project_output(value: object, indices: list[int]) -> tuple[dict | None, dict[int, str]]:
-    if not isinstance(value, dict) or set(value) != {
-        "version", "segment_indices", "global_elements", "segment_prompts"
-    } or value.get("version") != 1 or value.get("segment_indices") != indices:
-        raise ImageOptimizationOutputError(
-            "image optimization output is missing or invalid"
-        )
-    elements = value.get("global_elements")
-    if indices == [0]:
-        if elements != []:
-            raise ImageOptimizationOutputError(
-                "image optimization output is missing or invalid"
+def _plan_json(plan: dict) -> str:
+    return json.dumps(
+        plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def plan_sha256(plan: dict) -> str:
+    canonical = _canonical_plan_v2(plan)
+    return hashlib.sha256(_plan_json(canonical).encode("utf-8")).hexdigest()
+
+
+def compile_segment_prompts(plan: dict, edit_mode: str) -> dict[int, str]:
+    """Compile an eligible semantic v2 plan into immutable provider prompts."""
+    if edit_mode not in SEEDREAM_EDIT_MODES:
+        raise ValueError("unsupported image optimization edit mode")
+    canonical = _canonical_plan_v2(plan)
+    if not canonical["eligible"]:
+        raise ImageOptimizationIneligibleError(canonical["reason"])
+    people = {item["id"]: item for item in canonical["person_plans"]}
+    scenes = {item["id"]: item for item in canonical["scene_plans"]}
+    prompts = {}
+    for segment in canonical["segments"]:
+        person_edits = []
+        hidden_people = False
+        for member in segment["persons"]:
+            if member["state"] == "not_observable":
+                hidden_people = True
+                continue
+            design = people[member["id"]]
+            person_edits.append(
+                "将{target}完整替换为{identity}，{wardrobe}，{color}，编辑边界为{boundary}".format(
+                    target=member["target_region"],
+                    identity=design["replacement_identity"],
+                    wardrobe=design["wardrobe_change"],
+                    color=design["local_color_change"],
+                    boundary=member["boundary"],
+                )
             )
-        continuity = None
-    else:
-        try:
-            continuity = _canonical_continuity({
-                "version": 1,
-                "segment_indices": indices,
-                "elements": elements,
-            }, indices)
-        except ImageOptimizationOutputError:
-            raise ImageOptimizationOutputError(
-                "image optimization output is missing or invalid"
-            ) from None
-    raw_prompts = value.get("segment_prompts")
-    if not isinstance(raw_prompts, list) or len(raw_prompts) != len(indices):
-        raise ImageOptimizationOutputError(
-            "image optimization output is missing or invalid"
+        person_clause = "替换人物：" + "；".join(person_edits)
+        if hidden_people:
+            person_clause += "；本段不可观察的冻结主人物不得被新增或补造"
+        scene_ref = segment["scene"]
+        scene = scenes[scene_ref["scene_id"]]
+        scene_clause = (
+            "替换场景：将{target}完整替换为{replacement}；{semantic}；"
+            "形成不同空间结构和真实新环境，形状变化为{geometry}，"
+            "纵深变化为{depth}，布局变化为{layout}，{color}；"
+            "编辑边界为{boundary}，禁止仅调色、换材质或保留原场景结构"
+        ).format(
+            target=scene_ref["target_region"],
+            replacement=scene["replacement_scene"],
+            semantic=scene["semantic_change"],
+            geometry="、".join(scene["geometry_changes"]),
+            depth="、".join(scene["depth_changes"]),
+            layout="、".join(scene["layout_changes"]),
+            color=scene["local_color_change"],
+            boundary=scene_ref["boundary"],
         )
-    prompts: dict[int, str] = {}
-    for expected, item in zip(indices, raw_prompts):
+        protected = "、".join(segment["protected_relations"]) or "现有空间与物理关系"
+        non_targets = "、".join(segment["protected_non_target_people"])
+        non_target_clause = (
+            f"；背景非目标人物（{non_targets}）保持不变" if non_targets else ""
+        )
+        invariant_clause = (
+            "保持当前源图的画幅、裁切、机位、镜头、透视、构图、焦点、景深、"
+            "人物数量、姿态、动作、视线及核心实体不变；光源方向、曝光、白平衡、"
+            "色温、全局色调曲线保持与当前源图一致，只允许新几何产生物理正确的"
+            f"局部阴影；严格保持{protected}以及持握、接触、遮挡、前后关系和动作目的"
+            f"{non_target_clause}；禁止文字、Logo、水印、畸变、融合、增删实体或画质美化"
+        )
+        mode_clause = (
+            "图1始终是唯一编辑画布；其他输入图只提供冻结人物身份、场景设计和"
+            "本段布局，不传递构图、机位、动作、光线、实体关系。"
+        )
+        prompts[segment["segment_index"]] = _canonical_prompt(
+            f"{person_clause}。{scene_clause}。{invariant_clause}。{mode_clause}"
+        )
+    return prompts
+
+
+def semantic_context(plan: dict) -> dict:
+    canonical = _canonical_plan_v2(plan)
+    if not canonical["eligible"]:
+        raise ImageOptimizationIneligibleError(canonical["reason"])
+    people = {item["id"]: item for item in canonical["person_plans"]}
+    scenes = {item["id"]: item for item in canonical["scene_plans"]}
+    return {
+        "version": 2,
+        "plan_sha256": plan_sha256(canonical),
+        "person_plans": deepcopy(canonical["person_plans"]),
+        "segments": [
+            {
+                "segment_index": segment["segment_index"],
+                "observable_person_ids": [
+                    item["id"] for item in segment["persons"]
+                    if item["state"] == "replace"
+                ],
+                "persons": [
+                    {
+                        **deepcopy(item),
+                        "design": deepcopy(people[item["id"]]),
+                    }
+                    for item in segment["persons"]
+                ],
+                "scene": {
+                    **deepcopy(segment["scene"]),
+                    "design": deepcopy(scenes[segment["scene"]["scene_id"]]),
+                },
+                "protected_non_target_people": list(
+                    segment["protected_non_target_people"]
+                ),
+                "protected_relations": list(segment["protected_relations"]),
+            }
+            for segment in canonical["segments"]
+        ],
+    }
+
+
+def reference_slots(plan: dict) -> dict[str, list[dict]]:
+    canonical = _canonical_plan_v2(plan)
+    if not canonical["eligible"]:
+        raise ImageOptimizationIneligibleError(canonical["reason"])
+    identity = [
+        {
+            "role": f"identity:{person['id']}",
+            "person_id": person["id"],
+            **person["reference"],
+        }
+        for person in canonical["person_plans"]
+    ]
+    scene = [
+        {
+            "role": f"scene:{item['id']}",
+            "scene_id": item["id"],
+            **item["reference"],
+        }
+        for item in canonical["scene_plans"]
+    ]
+    layout = [
+        {
+            "segment_index": segment["segment_index"],
+            "role": f"layout:{segment['scene']['scene_id']}",
+            "scene_id": segment["scene"]["scene_id"],
+            "frame_index": segment["scene"]["layout_reference_frame_index"],
+        }
+        for segment in canonical["segments"]
+    ]
+    return {"identity": identity, "scene": scene, "layout": layout}
+
+
+def freeze_execution_inputs(
+    plan: dict,
+    *,
+    revision: int,
+    profile: dict,
+    model: str,
+    frame_inventory: list[dict],
+) -> dict:
+    canonical = _canonical_plan_v2(plan)
+    if not canonical["eligible"]:
+        raise ImageOptimizationIneligibleError(canonical["reason"])
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(profile, dict)
+        or set(profile) != {"id", "revision"}
+        or not isinstance(profile.get("id"), str)
+        or profile["id"] != profile["id"].strip()
+        or not profile["id"]
+        or isinstance(profile.get("revision"), bool)
+        or not isinstance(profile.get("revision"), int)
+        or profile["revision"] < 1
+        or model not in SEEDREAM_MODELS
+        or not isinstance(frame_inventory, list)
+        or not frame_inventory
+    ):
+        raise ValueError("invalid image optimization execution inputs")
+    inventory = []
+    lookup: dict[tuple[int, int], dict] = {}
+    prior: tuple[int, int] | None = None
+    for item in frame_inventory:
+        if not isinstance(item, dict) or set(item) != {
+            "segment_index", "frame_index", "frame_name", "source_sha256"
+        }:
+            raise ValueError("invalid image optimization execution inputs")
+        segment_index = item.get("segment_index")
+        frame_index = item.get("frame_index")
+        key = (segment_index, frame_index)
         if (
-            not isinstance(item, dict)
-            or set(item) != {"segment_index", "prompt"}
-            or item.get("segment_index") != expected
+            isinstance(segment_index, bool)
+            or not isinstance(segment_index, int)
+            or segment_index not in canonical["segment_indices"]
+            or isinstance(frame_index, bool)
+            or not isinstance(frame_index, int)
+            or frame_index < 1
+            or item.get("frame_name") != f"{frame_index:02d}.png"
+            or not isinstance(item.get("source_sha256"), str)
+            or _SHA256_RE.fullmatch(item["source_sha256"]) is None
+            or key in lookup
+            or (prior is not None and key <= prior)
         ):
-            raise ImageOptimizationOutputError(
-                "image optimization output is missing or invalid"
-            )
-        prompts[expected] = _canonical_prompt(item.get("prompt"))
-    return continuity, prompts
+            raise ValueError("invalid image optimization execution inputs")
+        current = deepcopy(item)
+        inventory.append(current)
+        lookup[key] = current
+        prior = key
+    for index in canonical["segment_indices"]:
+        frames = [item["frame_index"] for item in inventory if item["segment_index"] == index]
+        if frames != list(range(1, len(frames) + 1)):
+            raise ValueError("invalid image optimization execution inputs")
+    try:
+        canonical = _canonical_plan_v2(
+            canonical,
+            canonical["segment_indices"],
+            {
+                index: sum(item["segment_index"] == index for item in inventory)
+                for index in canonical["segment_indices"]
+            },
+        )
+    except ImageOptimizationOutputError:
+        raise ValueError("invalid image optimization execution inputs") from None
+
+    slots = reference_slots(canonical)
+
+    def freeze_slot(item: dict) -> dict:
+        source = lookup.get((item["segment_index"], item["frame_index"]))
+        if source is None:
+            raise ValueError("invalid image optimization execution inputs")
+        return {**deepcopy(item), "source_sha256": source["source_sha256"]}
+
+    segments = {item["segment_index"]: item for item in canonical["segments"]}
+    frames = []
+    for source in inventory:
+        segment = segments[source["segment_index"]]
+        observable = [
+            person["id"]
+            for person in segment["persons"]
+            if source["frame_index"] in person["observable_frames"]
+        ]
+        frames.append(
+            {
+                **deepcopy(source),
+                "observable_person_ids": observable,
+                "scene_id": segment["scene"]["scene_id"],
+            }
+        )
+    return {
+        "version": 2,
+        "plan_sha256": plan_sha256(canonical),
+        "profile": deepcopy(profile),
+        "revision": revision,
+        "model": model,
+        "identity_slots": [freeze_slot(item) for item in slots["identity"]],
+        "scene_slots": [freeze_slot(item) for item in slots["scene"]],
+        "layout_slots": [freeze_slot(item) for item in slots["layout"]],
+        "frames": frames,
+    }
+
+
+def _canonical_project_output(
+    value: object,
+    indices: list[int],
+    edit_mode: str,
+    frame_counts: dict[int, int],
+) -> tuple[dict, dict[int, str]]:
+    plan = _canonical_plan_v2(value, indices, frame_counts)
+    if not plan["eligible"]:
+        raise ImageOptimizationIneligibleError(plan["reason"])
+    return plan, compile_segment_prompts(plan, edit_mode)
 
 
 def generate_project_prompts(
@@ -226,8 +895,8 @@ def generate_project_prompts(
     edit_mode: str,
     *,
     session_dir: Path,
-) -> tuple[dict | None, dict[int, str]]:
-    """Run one project-level Skill that returns global mappings and real prompts."""
+) -> tuple[dict, dict[int, str]]:
+    """Run the plan phase once, then compile immutable provider prompts."""
     if edit_mode not in SEEDREAM_EDIT_MODES:
         raise ValueError("unsupported image optimization edit mode")
     try:
@@ -274,6 +943,7 @@ def generate_project_prompts(
             })
         (work / "request.json").write_text(
             json.dumps({
+                "phase": "plan",
                 "edit_mode": edit_mode,
                 "segments": request_segments,
             }, ensure_ascii=False, separators=(",", ":")) + "\n",
@@ -297,7 +967,11 @@ def generate_project_prompts(
             return _canonical_project_output(
                 _read_json_output(work / "image_optimization.json", max_bytes),
                 indices,
+                edit_mode,
+                {segment["index"]: len(frames) for segment, frames in prepared},
             )
+        except ImageOptimizationIneligibleError:
+            raise
         except ImageOptimizationOutputError:
             if run_error is not None:
                 raise run_error from None
@@ -305,16 +979,22 @@ def generate_project_prompts(
 
 
 def freeze_continuity(plan: dict) -> dict:
-    canonical = _canonical_continuity(plan)
-    raw = json.dumps(
-        {
-            "segment_indices": canonical["segment_indices"],
-            "elements": canonical["elements"],
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    if isinstance(plan, dict) and plan.get("version") == 2:
+        canonical = _canonical_plan_v2(plan)
+        if not canonical["eligible"]:
+            raise ImageOptimizationIneligibleError(canonical["reason"])
+        raw = _plan_json(canonical)
+    else:
+        canonical = _canonical_continuity_v1(plan)
+        raw = json.dumps(
+            {
+                "segment_indices": canonical["segment_indices"],
+                "elements": canonical["elements"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     return {"_image_continuity": {
         **canonical,
         "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
@@ -323,20 +1003,399 @@ def freeze_continuity(plan: dict) -> dict:
 
 def continuity_receipt(meta: dict) -> dict | None:
     raw = meta.get("_image_continuity")
-    if not isinstance(raw, dict) or set(raw) != {
-        "version", "segment_indices", "elements", "sha256"
-    }:
+    if not isinstance(raw, dict):
         return None
-    try:
-        canonical = _canonical_continuity({
+    if raw.get("version") == 1:
+        if set(raw) != {"version", "segment_indices", "elements", "sha256"}:
+            return None
+        candidate = {
             "version": raw.get("version"),
             "segment_indices": raw.get("segment_indices"),
             "elements": raw.get("elements"),
-        })
-    except ImageOptimizationOutputError:
+        }
+    elif raw.get("version") == 2:
+        if set(raw) != {
+            "version", "phase", "segment_indices", "eligible", "reason",
+            "person_plans", "scene_plans", "segments", "sha256",
+        }:
+            return None
+        candidate = {key: value for key, value in raw.items() if key != "sha256"}
+    else:
         return None
-    expected = freeze_continuity(canonical)["_image_continuity"]
+    try:
+        expected = freeze_continuity(candidate)["_image_continuity"]
+    except (ImageOptimizationOutputError, ImageOptimizationIneligibleError):
+        return None
     return deepcopy(raw) if raw == expected else None
+
+
+def dual_target_plan_receipt(meta: dict) -> dict | None:
+    """Return a valid v2 receipt; reject corrupt/non-legacy state fail-closed."""
+    if "_image_continuity" not in meta:
+        return None
+    raw = meta.get("_image_continuity")
+    valid = continuity_receipt(meta)
+    if valid is not None and valid.get("version") == 1:
+        return None
+    if valid is not None and valid.get("version") == 2:
+        return valid
+    raise ImageOptimizationOutputError("image continuity receipt is invalid")
+
+
+def _canonical_quality_check(value: object, *, allow_na: bool = False) -> dict:
+    if not isinstance(value, dict) or set(value) != {"status", "evidence"}:
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        )
+    status = value.get("status")
+    if status not in _VERIFY_STATUSES or (status == "not_applicable" and not allow_na):
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        )
+    return {
+        "status": status,
+        "evidence": _canonical_text(value.get("evidence"), max_bytes=2048),
+    }
+
+
+def _verification_reason(segments: list[dict], project_checks: dict) -> str | None:
+    checks = []
+    for segment in segments:
+        for person in segment["person_checks"]:
+            checks.extend(
+                [
+                    person["identity_changed"],
+                    person["source_identity_absent"],
+                    person["local_color_change"],
+                ]
+            )
+        checks.extend(segment["scene_checks"].values())
+        checks.extend(segment["invariants"].values())
+    checks.extend(project_checks.values())
+    if any(item["status"] == "unknown" for item in checks):
+        return "verification_unknown"
+    for key, reason in (
+        ("narrative_person_completeness", "narrative_person_incomplete"),
+        ("no_identity_swap", "identity_swap_detected"),
+        ("no_unplanned_person", "unplanned_person_detected"),
+    ):
+        if project_checks[key]["status"] == "fail":
+            return reason
+    for segment in segments:
+        if any(
+            person[key]["status"] == "fail"
+            for person in segment["person_checks"]
+            for key in ("identity_changed", "source_identity_absent")
+        ):
+            return "person_replacement_failed"
+    for key, reason in (
+        ("semantic_change", "scene_semantic_change_failed"),
+        ("geometry_change", "scene_geometry_change_failed"),
+        ("depth_change", "scene_depth_change_failed"),
+        ("layout_change", "scene_layout_change_failed"),
+    ):
+        if any(segment["scene_checks"][key]["status"] == "fail" for segment in segments):
+            return reason
+    if any(
+        check["status"] == "fail"
+        for segment in segments
+        for check in (
+            [person["local_color_change"] for person in segment["person_checks"]]
+            + [segment["scene_checks"]["local_color_change"]]
+        )
+    ):
+        return "local_color_change_failed"
+    for key, reason in (
+        ("lighting_preservation", "lighting_preservation_failed"),
+        ("interaction_preservation", "interaction_preservation_failed"),
+        ("cross_frame_continuity", "cross_frame_continuity_failed"),
+    ):
+        if any(segment["invariants"][key]["status"] == "fail" for segment in segments):
+            return reason
+    if project_checks["person_identity_continuity"]["status"] == "fail":
+        return "person_identity_continuity_failed"
+    if project_checks["scene_continuity"]["status"] == "fail":
+        return "scene_continuity_failed"
+    return None
+
+
+def canonical_verification(value: object, plan: dict) -> dict:
+    canonical_plan = _canonical_plan_v2(plan)
+    if not canonical_plan["eligible"]:
+        raise ImageOptimizationIneligibleError(canonical_plan["reason"])
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "phase",
+        "plan_sha256",
+        "segment_indices",
+        "passed",
+        "reason",
+        "segments",
+        "project_checks",
+    } or value.get("version") != 2 or value.get("phase") != "verify":
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        )
+    if (
+        value.get("plan_sha256") != plan_sha256(canonical_plan)
+        or value.get("segment_indices") != canonical_plan["segment_indices"]
+        or not isinstance(value.get("passed"), bool)
+    ):
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        )
+    raw_segments = value.get("segments")
+    if not isinstance(raw_segments, list) or len(raw_segments) != len(
+        canonical_plan["segments"]
+    ):
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        )
+    segments = []
+    for planned, item in zip(canonical_plan["segments"], raw_segments):
+        if not isinstance(item, dict) or set(item) != {
+            "segment_index",
+            "passed",
+            "person_checks",
+            "scene_checks",
+            "invariants",
+        } or item.get("segment_index") != planned["segment_index"] or not isinstance(
+            item.get("passed"), bool
+        ):
+            raise ImageOptimizationOutputError(
+                "image verification output is missing or invalid"
+            )
+        raw_people = item.get("person_checks")
+        if not isinstance(raw_people, list) or len(raw_people) != len(planned["persons"]):
+            raise ImageOptimizationOutputError(
+                "image verification output is missing or invalid"
+            )
+        people = []
+        for planned_person, check in zip(planned["persons"], raw_people):
+            if not isinstance(check, dict) or set(check) != {
+                "person_id",
+                "identity_changed",
+                "source_identity_absent",
+                "local_color_change",
+            } or check.get("person_id") != planned_person["id"]:
+                raise ImageOptimizationOutputError(
+                    "image verification output is missing or invalid"
+                )
+            allow_na = planned_person["state"] == "not_observable"
+            canonical_checks = {
+                key: _canonical_quality_check(check.get(key), allow_na=allow_na)
+                for key in (
+                    "identity_changed",
+                    "source_identity_absent",
+                    "local_color_change",
+                )
+            }
+            statuses = {entry["status"] for entry in canonical_checks.values()}
+            if (allow_na and statuses != {"not_applicable"}) or (
+                not allow_na and "not_applicable" in statuses
+            ):
+                raise ImageOptimizationOutputError(
+                    "image verification output is missing or invalid"
+                )
+            people.append({"person_id": planned_person["id"], **canonical_checks})
+        raw_scene = item.get("scene_checks")
+        raw_invariants = item.get("invariants")
+        if not isinstance(raw_scene, dict) or set(raw_scene) != {
+            "semantic_change",
+            "geometry_change",
+            "depth_change",
+            "layout_change",
+            "local_color_change",
+        } or not isinstance(raw_invariants, dict) or set(raw_invariants) != {
+            "lighting_preservation", "interaction_preservation", "cross_frame_continuity"
+        }:
+            raise ImageOptimizationOutputError(
+                "image verification output is missing or invalid"
+            )
+        scene_checks = {
+            key: _canonical_quality_check(raw_scene.get(key))
+            for key in (
+                "semantic_change",
+                "geometry_change",
+                "depth_change",
+                "layout_change",
+                "local_color_change",
+            )
+        }
+        invariants = {
+            key: _canonical_quality_check(raw_invariants.get(key))
+            for key in (
+                "lighting_preservation",
+                "interaction_preservation",
+                "cross_frame_continuity",
+            )
+        }
+        applicable = [
+            check
+            for person in people
+            for check in (
+                person["identity_changed"],
+                person["source_identity_absent"],
+                person["local_color_change"],
+            )
+            if check["status"] != "not_applicable"
+        ] + list(scene_checks.values()) + list(invariants.values())
+        segment_passed = all(check["status"] == "pass" for check in applicable)
+        if item["passed"] != segment_passed:
+            raise ImageOptimizationOutputError(
+                "image verification output is missing or invalid"
+            )
+        segments.append(
+            {
+                "segment_index": planned["segment_index"],
+                "passed": segment_passed,
+                "person_checks": people,
+                "scene_checks": scene_checks,
+                "invariants": invariants,
+            }
+        )
+    raw_project = value.get("project_checks")
+    if not isinstance(raw_project, dict) or set(raw_project) != set(_PROJECT_CHECKS):
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        )
+    project_checks = {
+        key: _canonical_quality_check(raw_project.get(key)) for key in _PROJECT_CHECKS
+    }
+    passed = all(segment["passed"] for segment in segments) and all(
+        check["status"] == "pass" for check in project_checks.values()
+    )
+    reason = _verification_reason(segments, project_checks)
+    if value["passed"] != passed or value.get("reason") != reason:
+        raise ImageOptimizationOutputError(
+            "image verification output is missing or invalid"
+        )
+    return {
+        "version": 2,
+        "phase": "verify",
+        "plan_sha256": plan_sha256(canonical_plan),
+        "segment_indices": list(canonical_plan["segment_indices"]),
+        "passed": passed,
+        "reason": reason,
+        "segments": segments,
+        "project_checks": project_checks,
+    }
+
+
+def generate_project_verdict(
+    runner,
+    plan: dict,
+    segments: list[dict],
+    deterministic_metrics: dict,
+    *,
+    session_dir: Path,
+) -> dict:
+    """Run verify in an isolated workspace and return a strict verdict."""
+    try:
+        session = Path(session_dir).resolve(strict=True)
+        skill = _SKILL.resolve(strict=True)
+    except OSError:
+        raise ValueError("invalid image verification input") from None
+    canonical_plan = _canonical_plan_v2(plan)
+    if not canonical_plan["eligible"]:
+        raise ImageOptimizationIneligibleError(canonical_plan["reason"])
+    if (
+        not skill.is_file()
+        or not isinstance(segments, list)
+        or len(segments) != len(canonical_plan["segment_indices"])
+        or not isinstance(deterministic_metrics, dict)
+    ):
+        raise ValueError("invalid image verification input")
+    try:
+        metrics_raw = json.dumps(
+            deterministic_metrics,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        raise ValueError("invalid image verification metrics") from None
+    if len(metrics_raw.encode("utf-8")) > MAX_PROJECT_OUTPUT_OVERHEAD_BYTES:
+        raise ValueError("invalid image verification metrics")
+    prepared = []
+    frame_counts = {}
+    for expected, segment in zip(canonical_plan["segment_indices"], segments):
+        if not isinstance(segment, dict) or set(segment) != {
+            "index", "source_keyframes_dir", "output_keyframes_dir"
+        } or segment.get("index") != expected:
+            raise ValueError("invalid image verification input")
+        pair = []
+        for key in ("source_keyframes_dir", "output_keyframes_dir"):
+            try:
+                path = Path(segment[key]).resolve(strict=True)
+                path.relative_to(session)
+            except (OSError, TypeError, ValueError):
+                raise ValueError("invalid image verification input") from None
+            pair.append(_validated_frames(path))
+        if [item.name for item in pair[0]] != [item.name for item in pair[1]]:
+            raise ValueError("invalid image verification frames")
+        prepared.append((expected, pair[0], pair[1]))
+        frame_counts[expected] = len(pair[0])
+    canonical_plan = _canonical_plan_v2(
+        canonical_plan, canonical_plan["segment_indices"], frame_counts
+    )
+    with tempfile.TemporaryDirectory(prefix="duet-image-verify-", dir="/tmp") as raw:
+        stage = Path(raw).resolve(strict=True)
+        work = stage / "work"
+        work.mkdir(parents=True, mode=0o700)
+        _copy_regular(skill, stage / "SKILL.md")
+        (work / "request.json").write_text(
+            json.dumps(
+                {
+                    "phase": "verify",
+                    "segment_indices": canonical_plan["segment_indices"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (work / "frozen_plan.json").write_text(
+            json.dumps(
+                freeze_continuity(canonical_plan)["_image_continuity"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (work / "metrics.json").write_text(metrics_raw + "\n", encoding="utf-8")
+        for index, source_frames, output_frames in prepared:
+            for label, frames in (("source", source_frames), ("output", output_frames)):
+                destination = work / "segments" / str(index) / label
+                destination.mkdir(parents=True, mode=0o700)
+                for frame in frames:
+                    _copy_regular(frame, destination / frame.name)
+        run_error: CodexError | None = None
+        try:
+            runner.run_isolated(
+                stage,
+                "严格执行当前目录 SKILL.md 的 verify 阶段；只读取允许的输入，"
+                "并写入规定的唯一输出文件。",
+                session_dir=session,
+            )
+        except CodexError as error:
+            run_error = error
+        try:
+            return canonical_verification(
+                _read_json_output(
+                    work / "image_verification.json",
+                    MAX_CONTINUITY_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
+                ),
+                canonical_plan,
+            )
+        except ImageOptimizationOutputError:
+            if run_error is not None:
+                raise run_error from None
+            raise
 
 
 def _segment_indices(meta: dict) -> list[int]:
@@ -447,6 +1506,14 @@ def replace(meta: dict, settings: Settings, segment_index: int,
         raise ImageOptimizationError(409, "read_only")
     if meta.get("status") != "done":
         raise ImageOptimizationError(409, "artifacts not ready")
+    try:
+        compiled_plan = dual_target_plan_receipt(meta)
+    except ImageOptimizationOutputError:
+        raise ImageOptimizationError(
+            409, "image_optimization_plan_invalid"
+        ) from None
+    if compiled_plan is not None:
+        raise ImageOptimizationError(409, "image_optimization_prompt_compiled")
     if (
         meta.get("_input_owner")
         or isinstance(meta.get("generation"), dict)
