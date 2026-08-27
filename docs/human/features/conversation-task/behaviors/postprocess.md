@@ -33,11 +33,11 @@ links: [conversation-task, result-display]
 - v2 双目标计划的编译提示词只提供查看和复制，不能由自由文本删除人物、场景、光色或关系硬约束；历史 v1 提示词继续原 CAS 行为，receipt 不迁移、不重写。
 - 当前选项为 `remove_subtitle`、`remove_brand`、`optimize_image`；`change_bg/face_hold` 已删除。旧页面请求只得到纯文本刷新提示，不会静默采用或自动重试。
 - `remove_subtitle` 映射 `full_screen_text_erase`；`remove_brand` 作为兼容字段映射 `full_screen_icon_erase`，只承诺清理常见 Logo/图标。双选会执行两个独立付费阶段。
-- 三个阶段在每段内严格按“文字/字幕 → Logo/图标 → 图片优化”执行。v2 图片优化对每个稳定叙事主人物建立独立 `person_plans`，每段完整枚举人物的 `replace/not_observable` 与可观察帧；所有可观察主人物都必须替换，背景路人只保护。漏主人物、人物轨道混淆或不安全时项目在付费前 `eligible=false`，不能成功 no-op。
-- v2 的 `scene_plans` 对全部段无重叠全覆盖；每个场景必须同时更换环境语义、可见形状、纵深、空间布局和局部材质/固有色。纯调色、纯纹理或原结构换皮不算换景。短视频 `[0]` 使用完全相同的双目标结构。
+- 三个阶段在每段内严格按“文字/字幕 → Logo/图标 → 图片优化”执行。v2 图片优化对每个稳定叙事主人物建立独立 `person_plans`，并将其目标字段作为唯一、可生成、可冻结且明显区别于源人物的 `new identity pack` 规格；每段完整枚举人物的 `replace/not_observable` 与可观察帧。漏人物、合并多人、轨道混淆或近似复制源身份时，项目在付费前 `eligible=false`，不能成功 no-op。
+- v2 的 `scene_plans` 对全部段无重叠全覆盖，并形成可跨所属段复用的 `new scene pack` 规格；每个所属段都必须同时更换环境语义、可见形状与空间结构、纵深、空间布局和局部材质/固有色。纯调色、纯纹理、只换材质或原结构换皮均不算换景。短视频 `[0]` 使用完全相同的双目标结构。
 - 所有段固定保持画幅、裁切、机位、镜头、透视、构图、焦点、景深，以及全局光源方向、曝光、白平衡/CCT、tone curve；允许新几何产生物理正确的局部阴影。持握、接触、遮挡、数量、姿态、动作目的与叙事关系不可破坏。
-- 每个主人物、场景组件和段布局都冻结来源明确的 reference slot；后端绑定对应帧 SHA、模型、profile、revision 和 plan SHA。执行层按当前源图、可观察主人物 identity refs、scene ref、layout ref 的固定顺序构造输入，不自行猜测。
-- 生成结果进入 H3 前，同一 Skill 执行 `phase=verify`，只读取源/输出帧、冻结 v2 plan 和确定性指标；逐人物验证身份已换且源身份无残留，并验证场景语义/结构、局部颜色、光色、互动关系、段内与跨段连续性。任一 `fail/unknown` 都不发布。
+- `person_plans/scene_plans.reference` 与段布局 reference slot 都指向来源明确的源帧，并绑定帧 SHA、模型、profile、revision 和 plan SHA；其中人物/场景 source reference 只用于定位旧目标和验收其消失，是负样本而不是 target reference。只有生成、冻结且逐项通过资格检查的新 identity/scene pack 可以作为目标 reference。
+- 生成结果进入 H3 前，同一 Skill 执行 `phase=verify`，只读取源/输出帧、冻结 v2 plan 和确定性指标；逐人物、逐可观察帧验证新身份与源身份消失，逐场景、逐所属段验证新语义及形状/纵深/布局/局部材质颜色改变，再验证全局光色、互动关系和连续性。任一 `fail/unknown` 都不发布。
 - 每个付费 POST 前持久化私有 receipt。只有完整 HTTP 429、`success=false`、精确 `RequestLimitExceeded` 时，才按 `AUTO_RETRY_COUNT/AUTO_RETRY_INTERVAL_S` 自动退避并追加新 attempt；网络异常、5xx、无效/不完整响应仍视为结果未知并禁止重发。已收到成功响应但下载失败时只恢复 GET。MediaKit WebP 结果经解码、尺寸校验和 PNG 转码后才进入 `frames`。
 - Seedream 每帧总计最多 3 次 POST，且只有完整 HTTP 429、精确 `QuotaExceeded`、响应无 `data` 才自动重试；网络/超时/取消一律记为 `submission_unknown`。重启只恢复可证明安全的本地阶段，不自动重发未知 POST。
 - 后处理一旦开始，H3 提交必须等待其 `done`；完成后每张 `postprocessed/` 优化帧都会替代同名原关键帧，进入冻结输入 receipt 和实际 H3 请求。缺帧或状态异常时 fail closed，不回退原图。

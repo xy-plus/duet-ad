@@ -77,8 +77,8 @@ links: [conversation-task, processing-state]
 
 ## 图片优化与 H3 门控
 
-- schema v2 的关键帧冻结后，同一 `image-postprocess` Skill 先执行 `phase=plan`，结构化冻结全部叙事主人物和全部场景组件的双目标替换。后端确定性编译提示词；任一主人物不可安全替换，或任一场景不能同时完成语义、形状、纵深、布局和局部颜色变化，均在付费前判 `eligible=false`。
-- v2 编译提示词不能自由 PATCH，避免删除人物、场景、光色或关系硬约束；旧 v1 receipt 只读兼容且不迁移。图片编辑后必须以同一 frozen plan 执行 `phase=verify`，人物身份、源身份残留、真实换景、局部颜色、全局光色、关系和跨帧/跨段连续性任一 `fail/unknown` 均阻止 H3 提交。
+- schema v2 的关键帧冻结后，同一 `image-postprocess` Skill 先执行 `phase=plan`，结构化冻结全部叙事主人物和全部场景组件的双目标替换。每个可观察主人物必须有唯一且明显区别于源人物的 `new identity pack` 规格；每个所属段必须有同时改变语义、形状与空间结构、纵深、布局和局部材质/固有色的 `new scene pack` 规格，否则在付费前判 `eligible=false`。
+- v2 编译提示词不能自由 PATCH，避免删除人物、场景、光色或关系硬约束；旧 v1 receipt 只读兼容且不迁移。source reference 只作定位旧目标及验收其消失的负样本，不得冒充 target reference；只有生成、冻结且通过资格检查的新 pack 可作目标 reference。图片编辑后必须以同一 frozen plan 逐人物、逐可观察帧及逐场景、逐所属段执行 `phase=verify`，任一 `fail/unknown` 均阻止 H3 提交。
 - 后处理选项 canonical 为 `remove_subtitle/remove_brand/optimize_image` 三个布尔值；精确旧两字段请求兼容为 `optimize_image:false`，其余缺字段、未知字段或非布尔值拒绝。实际执行对每段保持 `文字擦除 -> 品牌擦除 -> 图片优化` 阶段屏障，段之间并行；任一失败段不会阻止其他段完成，整体保持 failed，H3 不得静默回退原图。
 - `postprocess.segments[]` 仅公开 `index/status/stage/completed_frames/total_frames/revision/error`。失败段通过 `POST /api/conversations/{id}/postprocess/segments/{index}/retry` 重试，请求严格为 `{"confirm":true,"expected_revision":N}`；只复用该段已成功的阶段/帧与服务端冻结选项、模型、模式、提示词，不接受页面重新指定。
 - Seedream 付费 POST 前先持久化 attempt 输入摘要；只有明确的 HTTP 429 `QuotaExceeded` 且响应无 `data` 才按统一预算重试。网络或读写超时记为 `submission_unknown`，自动恢复不得再次 POST；人工分段重试也必须保留旧 attempt 记录。

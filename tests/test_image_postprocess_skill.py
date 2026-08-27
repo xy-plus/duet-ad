@@ -218,6 +218,21 @@ def test_skill_is_one_concise_plan_and_verify_skill():
     assert "work/image_verification.json" in skill
 
 
+def test_skill_qualifies_new_target_packs_and_rejects_source_copying():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    assert "`new identity pack`" in skill
+    assert "`new scene pack`" in skill
+    assert "源 `reference` 只作负样本证据，不是 target reference" in skill
+    assert "只有生成并冻结且逐项通过资格检查的新 pack" in skill
+    assert "每个所属段都必须可见地完成" in skill
+    assert "空间结构" in skill
+    assert "逐人物、逐可观察帧" in skill
+    assert "逐场景、逐所属段" in skill
+    assert "任一可观察主人物仍像源人物" in skill
+    assert "任一段仍是原场景改色、纯调色或纯纹理" in skill
+
+
 def test_plan_phase_returns_v2_plan_and_compiled_dual_target_prompts(tmp_path):
     session = tmp_path / "session"
     runner = _Runner(_plan())
