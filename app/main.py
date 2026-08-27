@@ -2761,7 +2761,10 @@ def create_app(settings: Settings) -> FastAPI:
                     detail = "already submitted" if previous_status == "succeeded" else "generation in progress"
                     raise HTTPException(status_code=409, detail=detail)
                 if previous_status in _GENERATION_RETRYABLE and previous_id == request_id:
-                    if generation.get("error") != "context_ir_result_invalid":
+                    if generation.get("error") not in {
+                        "context_ir_result_invalid",
+                        "context_ir_semantic_mismatch",
+                    }:
                         raise HTTPException(
                             status_code=409,
                             detail="new client_request_id required",

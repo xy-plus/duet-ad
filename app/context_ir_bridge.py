@@ -1261,31 +1261,6 @@ def _submit(
     _persist(path, state)
 
 
-def _semantic_contract_matches(request: FrozenContextIrRequest, prompt: str) -> bool:
-    if (
-        not isinstance(prompt, str)
-        or not prompt.strip()
-        or len(prompt.encode("utf-8")) > MAX_EFFECTIVE_PROMPT_BYTES
-    ):
-        return False
-    marker_lines = tuple(
-        line.strip()
-        for line in prompt.splitlines()
-        if line.lstrip().startswith(_SPEECH_PREFIX)
-    )
-    if (
-        marker_lines != request.speech_markers
-        or prompt.count(_SPEECH_PREFIX) != len(request.speech_markers)
-    ):
-        return False
-    dialogue_tokens = tuple(match.group(0) for match in _DIALOGUE_TOKEN.finditer(prompt))
-    return (
-        dialogue_tokens == request.dialogue_tokens
-        and prompt.count("<d>") == len(request.dialogue_tokens)
-        and prompt.count("</d>") == len(request.dialogue_tokens)
-    )
-
-
 def _receipt_payload(
     request: FrozenContextIrRequest,
     state: Mapping[str, Any],
@@ -1325,12 +1300,16 @@ def _complete(
     path: Path,
     effective_prompt: str,
 ) -> None:
-    if not _semantic_contract_matches(request, effective_prompt):
+    if (
+        not isinstance(effective_prompt, str)
+        or not effective_prompt.strip()
+        or len(effective_prompt.encode("utf-8")) > MAX_EFFECTIVE_PROMPT_BYTES
+    ):
         _mark_terminal(
             path,
             state,
             status="failed",
-            error="context_ir_semantic_mismatch",
+            error="context_ir_result_invalid",
         )
         return
     payload = _receipt_payload(request, state, effective_prompt)
@@ -1526,14 +1505,16 @@ def optimize_h3_prompt(
         terminal = {"succeeded", "failed", "submission_unknown"}
         if (
             state["status"] == "failed"
-            and state.get("error") == "context_ir_result_invalid"
+            and state.get("error") in {
+                "context_ir_result_invalid",
+                "context_ir_semantic_mismatch",
+            }
             and isinstance(state.get("provider_task_id"), str)
             and state.get("receipt") is None
         ):
-            # V1 classified the provider's documented running response as
-            # invalid when its optional ``modality`` field was absent.  The
-            # paid task id is already frozen, so recovery may only poll that
-            # exact task; it must never rebuild uploads or issue another POST.
+            # Older coordinators could reject a documented provider response
+            # before writing a receipt. The paid task id is already frozen, so
+            # recovery may only poll that exact task and can never resubmit.
             state["status"] = "polling"
             state["error"] = None
             _persist(path, state)
@@ -1650,7 +1631,6 @@ def load_effective_prompt_receipt(
         not isinstance(effective_prompt, str)
         or not effective_prompt.strip()
         or raw.get("effective_prompt_sha256") != _sha256_text(effective_prompt)
-        or not _semantic_contract_matches(request, effective_prompt)
     ):
         raise ContextIrReceiptError("context_ir_receipt_invalid")
     if raw.get("source_prompt_sha256") != _sha256_text(str(raw.get("source_prompt"))):
