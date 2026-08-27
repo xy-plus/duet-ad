@@ -364,6 +364,9 @@ def write_plan_receipt(
     has_multimodal = ["multimodal_manifest_path" in raw for raw in segments]
     if any(has_multimodal) and not all(has_multimodal):
         raise LongVideoError("long_video_multimodal_incomplete")
+    has_prompt_fusion = prompt_fusion_manifest_path is not None
+    if has_prompt_fusion and any(has_multimodal):
+        raise LongVideoError("long_video_multimodal_ambiguous")
     receipt_segments = []
     previous_end = 0.0
     for expected_index, raw in enumerate(segments, start=1):
@@ -452,7 +455,7 @@ def write_plan_receipt(
         "schema": "duet.long-video-plan",
         "version": (
             MULTIMODAL_PLAN_RECEIPT_VERSION
-            if all(has_multimodal)
+            if all(has_multimodal) or has_prompt_fusion
             else PLAN_RECEIPT_VERSION
         ),
         "source": _artifact(root, source),
@@ -460,7 +463,7 @@ def write_plan_receipt(
         "workflow": workflow.strip(),
         "segments": receipt_segments,
     }
-    if all(has_multimodal):
+    if all(has_multimodal) or has_prompt_fusion:
         if dialogue_mode not in {"auto", "none"}:
             raise LongVideoError("long_video_plan_invalid_dialogue_mode")
         receipt["dialogue_mode"] = dialogue_mode
@@ -473,7 +476,7 @@ def write_plan_receipt(
                 raise LongVideoError("long_video_plan_invalid_dialogue_delivery")
             receipt["dialogue_delivery"] = dialogue_delivery
             receipt["resolved_dialogue_delivery"] = resolved_dialogue_delivery
-        if prompt_fusion_manifest_path is not None:
+        if has_prompt_fusion:
             receipt["prompt_fusion"] = _artifact(
                 root, prompt_fusion_manifest_path
             )

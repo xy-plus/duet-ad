@@ -101,20 +101,6 @@ def _fusion_audio_block(lines_json: str) -> str:
     )
 
 
-def _h3_prompt_from_fusion(final_prompt: str, lines_json: str) -> str:
-    """Preserve the exact audio JSON while projecting XML markers safely."""
-    block = _fusion_audio_block(lines_json)
-    if final_prompt.count(block) != 1:
-        raise LongGenerationError("prompt_fusion_output_invalid")
-    projected = final_prompt.replace(
-        block,
-        f"[AUDIO_CONTENT_JSON]{lines_json}[/AUDIO_CONTENT_JSON]",
-    )
-    if "<" in projected or ">" in projected:
-        raise LongGenerationError("prompt_fusion_output_invalid")
-    return projected
-
-
 def load_prompt_fusion(
     *, input_path: Path, output_path: Path, root: Path | None = None,
 ) -> FrozenPromptFusion:
@@ -397,6 +383,7 @@ class FrozenSegment:
     prompt: str
     keyframes: tuple[h3.FrozenFrame, ...] = ()
     multimodal: h3_project.FrozenProjectMultimodal | None = None
+    prompt_fusion_audio_paths: tuple[Path, ...] = ()
     dialogue: tuple[dict, ...] = ()
     dialogue_sha256: str | None = None
 
@@ -412,6 +399,7 @@ class FrozenPlan:
     resolution: str = h3.H3_DEFAULT_RESOLUTION
     legacy_layout: bool = False
     workflow: str = h3.H3_WORKFLOW
+    prompt_fusion: FrozenPromptFusion | None = None
 
 
 def _segment_duration_s(plan: FrozenPlan, segment: FrozenSegment) -> float:
@@ -482,6 +470,30 @@ def _canonical_json_bytes(value: object) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError):
         raise LongGenerationError("prompt_fusion_input_invalid") from None
+
+
+def prompt_fusion_image_authority_sha256(meta: Mapping) -> str:
+    """Bind manual acceptance, or the exact v4 MediaKit-only receipt."""
+    acceptance = meta.get("_image_user_acceptance")
+    if (
+        isinstance(acceptance, Mapping)
+        and isinstance(acceptance.get("sha256"), str)
+        and len(acceptance["sha256"]) == 64
+    ):
+        return acceptance["sha256"]
+    private = meta.get("_postprocess_receipt")
+    post = meta.get("postprocess")
+    options = private.get("options") if isinstance(private, Mapping) else None
+    if (
+        isinstance(private, Mapping)
+        and private.get("version") == 4
+        and isinstance(options, Mapping)
+        and options.get("optimize_image") is False
+        and isinstance(post, Mapping)
+        and post.get("status") == "done"
+    ):
+        return h3.canonical_json_sha256(dict(private))
+    raise LongGenerationError("image_acceptance_required")
 
 
 def _atomic_bytes(path: Path, data: bytes) -> None:
@@ -673,7 +685,7 @@ def _publish_fusion_h3_segments(
     *, root: Path, meta: Mapping, base: FrozenPlan,
     fusion: FrozenPromptFusion, dialogue_mode: str,
 ) -> tuple[list[dict], list[dict]]:
-    """Mechanically project one verified fusion result into existing H3 inputs."""
+    """Freeze exact fusion prompts; Context IR is the sole later transformer."""
     receipt_segments: list[dict] = []
     updated_segments: list[dict] = []
     raw_segments = meta.get("segments")
@@ -684,25 +696,16 @@ def _publish_fusion_h3_segments(
     ):
         if not isinstance(source, Mapping):
             raise LongGenerationError("prompt_fusion_input_invalid")
-        h3_prompt = _h3_prompt_from_fusion(
-            final_prompt,
-            fusion_source["audio_content"]["lines_json"],
-        )
         work = segment.workdir / "work"
         visual_path = work / "fusion_prompt.txt"
-        h3_input_path = work / h3_project.SKILL_INPUT_FILENAME
-        h3_plan_path = work / "h3_prompt_plan.json"
-        h3_manifest_path = work / h3_project.SOURCE_FILENAME
-        _atomic_bytes(visual_path, h3_prompt.encode("utf-8"))
+        _atomic_bytes(visual_path, final_prompt.encode("utf-8"))
 
-        frozen_keyframes: list[dict] = []
         for item in fusion_source["new_keyframes"]:
             source_candidate = root / item["path"]
             if source_candidate.is_symlink():
                 raise LongGenerationError("prompt_fusion_input_invalid")
             source_path = source_candidate.resolve()
             try:
-                relative = Path(os.path.relpath(source_path, work)).as_posix()
                 source_path.relative_to(root)
                 source_data = source_path.read_bytes()
             except (OSError, ValueError):
@@ -712,15 +715,9 @@ def _publish_fusion_h3_segments(
                 or hashlib.sha256(source_data).hexdigest() != item["sha256"]
             ):
                 raise LongGenerationError("prompt_fusion_input_invalid")
-            frozen_keyframes.append({
-                "order": item["order"],
-                "path": relative,
-                "sha256": item["sha256"],
-            })
 
         audio = fusion_source["audio_content"]
         lines = json.loads(audio["lines_json"])
-        references: list[dict] = []
         for item in audio["voice_references"]:
             source_candidate = root / item["path"]
             if source_candidate.is_symlink():
@@ -736,18 +733,9 @@ def _publish_fusion_h3_segments(
                 or hashlib.sha256(data).hexdigest() != item["sha256"]
             ):
                 raise LongGenerationError("reference_audio_binding_invalid")
-            frozen_path = work / f"conditioning-voice-{item['voice_ref']}.mp3"
-            _atomic_bytes(frozen_path, data)
-            references.append({
-                "order": item["voice_ref"],
-                "path": frozen_path.name,
-                "sha256": item["sha256"],
-                "purpose": "voice",
-            })
         dialogue = () if dialogue_mode == "none" else segment.dialogue
         if len(lines) != len(dialogue):
             raise LongGenerationError("prompt_fusion_input_invalid")
-        speech_bindings: list[dict] = []
         for order, (compiled, authoritative) in enumerate(
             zip(lines, dialogue), 1
         ):
@@ -760,74 +748,7 @@ def _publish_fusion_h3_segments(
                 or compiled["voice_ref"] != 1
             ):
                 raise LongGenerationError("prompt_fusion_input_invalid")
-            language = authoritative.get("language", "und")
-            if not isinstance(language, str) or not language.strip():
-                language = "und"
-            speech_bindings.append({
-                "line_index": order,
-                "delivery": "off_screen_voiceover",
-                "subject_id": None,
-                "language": language,
-                "voice_ref": 1,
-            })
-        dialogue_sha256 = _canonical_digest(dialogue)
-        h3_input = {
-            "schema": h3_project.SKILL_INPUT_SCHEMA,
-            "version": h3_project.SKILL_INPUT_VERSION,
-            "visual_prompt": {
-                "path": visual_path.name,
-                "sha256": hashlib.sha256(
-                    h3_prompt.encode("utf-8")
-                ).hexdigest(),
-            },
-            "keyframes": frozen_keyframes,
-            "dialogue_source_sha256": dialogue_sha256,
-            "reference_audios": references,
-        }
-        h3_plan = {
-            "version": 2,
-            "phase": "multimodal_audio",
-            "eligible": True,
-            "reason": None,
-            "visual_prompt": h3_prompt,
-            "dialogue_source_sha256": dialogue_sha256,
-            "subjects": [],
-            "audio_refs": [
-                {
-                    "audio_index": item["order"],
-                    "purpose": "voice",
-                    "subject_id": None,
-                }
-                for item in references
-            ],
-            "speech_bindings": speech_bindings,
-            "sound_design": {"ambience_refs": [], "effects": []},
-        }
-        h3_input_data = _canonical_json_bytes(h3_input)
-        h3_plan_data = _canonical_json_bytes(h3_plan)
-        _atomic_bytes(h3_input_path, h3_input_data)
-        _atomic_bytes(h3_plan_path, h3_plan_data)
-        manifest = {
-            "schema": h3_project.SOURCE_SCHEMA,
-            "version": h3_project.SOURCE_VERSION,
-            "mode": "multimodal",
-            "approved_skill_plan_sha256": h3.canonical_json_sha256(h3_plan),
-            "multimodal_input": {
-                "path": h3_input_path.name,
-                "sha256": hashlib.sha256(h3_input_data).hexdigest(),
-            },
-            "skill_plan": {
-                "path": h3_plan_path.name,
-                "sha256": hashlib.sha256(h3_plan_data).hexdigest(),
-            },
-            "reference_audios": references,
-        }
-        _atomic_bytes(h3_manifest_path, _canonical_json_bytes(manifest))
-        try:
-            h3_project.freeze_optional(root, work)
-        except h3_project.ProjectMultimodalError as exc:
-            raise LongGenerationError(exc.code) from None
-        updated = {**dict(source), "prompt": h3_prompt}
+        updated = {**dict(source), "prompt": final_prompt}
         updated_segments.append(updated)
         receipt_segments.append({
             **updated,
@@ -840,7 +761,6 @@ def _publish_fusion_h3_segments(
             "visual_prompt_path": work / "visual_prompt.txt",
             "final_prompt_path": visual_path,
             "dialogue": list(dialogue),
-            "multimodal_manifest_path": h3_manifest_path,
         })
     return receipt_segments, updated_segments
 
@@ -1030,6 +950,15 @@ def finalize_multimodal_plan(
         return None
     if receipt_version != long_video.PLAN_RECEIPT_VERSION:
         return None
+    private_postprocess = meta.get("_postprocess_receipt")
+    if (
+        not isinstance(private_postprocess, Mapping)
+        or private_postprocess.get("version") != 4
+    ):
+        # Frozen v2 projects predate project-level prompt fusion.  They remain
+        # on their exact historical read/resume path and may not be silently
+        # promoted into a new authoring contract.
+        return None
     if settings is None:
         raise LongGenerationError("prompt_fusion_refresh_required")
 
@@ -1052,19 +981,14 @@ def finalize_multimodal_plan(
         dialogue_mode=dialogue_mode,
         dialogue_delivery=dialogue_delivery,
     )
-    acceptance = meta.get("_image_user_acceptance")
-    if (
-        not isinstance(acceptance, Mapping)
-        or not isinstance(acceptance.get("sha256"), str)
-    ):
-        raise LongGenerationError("image_acceptance_required")
+    image_authority_sha256 = prompt_fusion_image_authority_sha256(meta)
     from app import pipeline  # local import: pipeline owns the Codex runner seam
 
     queued = pipeline.queue_prompt_fusion(
         settings,
         str(meta.get("id")),
         input_data=input_data,
-        image_acceptance_sha256=acceptance["sha256"],
+        image_acceptance_sha256=image_authority_sha256,
     )
     if queued == "failed":
         raise LongGenerationError("prompt_fusion_failed")
@@ -1311,10 +1235,12 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             raise LongGenerationError(
                 "long_video_multimodal_dialogue_refresh_required", 409
             )
-    if is_multimodal_receipt and isinstance(meta.get("_prompt_fusion"), Mapping):
-        fusion_binding = payload.get("prompt_fusion")
+    frozen_fusion = None
+    fusion_binding = payload.get("prompt_fusion")
+    if fusion_binding is not None:
         if (
-            not isinstance(fusion_binding, Mapping)
+            not is_multimodal_receipt
+            or not isinstance(fusion_binding, Mapping)
             or set(fusion_binding) != {"path", "sha256"}
             or fusion_binding.get("path") != f"work/{h3_project.SOURCE_FILENAME}"
         ):
@@ -1596,7 +1522,48 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 )
             frozen_keyframes = tuple(selected)
         frozen_multimodal = None
-        if is_multimodal_receipt:
+        prompt_fusion_audio_paths: tuple[Path, ...] = ()
+        if frozen_fusion is not None:
+            if raw.get("multimodal") is not None:
+                raise LongGenerationError("long_video_plan_invalid")
+            fusion_segment = frozen_fusion.segments[position - 1]
+            if final != frozen_fusion.final_prompts[position - 1]:
+                raise LongGenerationError("prompt_fusion_output_invalid")
+            try:
+                fusion_lines = json.loads(
+                    fusion_segment["audio_content"]["lines_json"]
+                )
+                voice_references = fusion_segment["audio_content"][
+                    "voice_references"
+                ]
+            except (KeyError, TypeError, json.JSONDecodeError):
+                raise LongGenerationError("prompt_fusion_input_invalid") from None
+            if not isinstance(fusion_lines, list) or len(fusion_lines) != len(dialogue):
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            for line_order, (compiled, authoritative) in enumerate(
+                zip(fusion_lines, dialogue), 1
+            ):
+                if (
+                    compiled.get("order") != line_order
+                    or compiled.get("text") != authoritative.get("text")
+                    or compiled.get("start_s") != authoritative.get("start_s")
+                    or compiled.get("end_s") != authoritative.get("end_s")
+                    or compiled.get("delivery") != payload.get(
+                        "resolved_dialogue_delivery"
+                    )
+                    or compiled.get("voice_ref") != 1
+                ):
+                    raise LongGenerationError("prompt_fusion_input_invalid")
+            audio_paths: list[Path] = []
+            for reference in voice_references:
+                audio_paths.append(_bound_path(root, {
+                    "path": reference.get("path"),
+                    "sha256": reference.get("sha256"),
+                }))
+            prompt_fusion_audio_paths = tuple(audio_paths)
+            if bool(dialogue) != bool(prompt_fusion_audio_paths):
+                raise LongGenerationError("prompt_fusion_input_invalid")
+        elif is_multimodal_receipt:
             try:
                 frozen_multimodal = h3_project.load_bound(
                     root, raw.get("multimodal")
@@ -1648,6 +1615,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             prompt=prompt,
             keyframes=frozen_keyframes,
             multimodal=frozen_multimodal,
+            prompt_fusion_audio_paths=prompt_fusion_audio_paths,
             dialogue=tuple(dict(line) for line in dialogue),
             dialogue_sha256=dialogue_binding["sha256"],
         ))
@@ -1675,6 +1643,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         resolution=resolution,
         legacy_layout=legacy_layout,
         workflow=workflow,
+        prompt_fusion=frozen_fusion,
     )
 
 
@@ -1719,6 +1688,69 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
              prepare_inputs: bool = True, fast_mode: bool = False,
              context_ir_binding: object = None) -> h3.H3Request:
     if plan.workflow in h3.H3_MULTIMODAL_WORKFLOWS:
+        if plan.prompt_fusion is not None:
+            try:
+                reference_audios = h3.freeze_reference_audios(tuple(
+                    (path, "voice")
+                    for path in segment.prompt_fusion_audio_paths
+                ))
+                source_request = h3.H3Request(
+                    cid=f"{cid}-segment-{segment.index}",
+                    workdir=segment.workdir,
+                    client_request_id=(
+                        frozen_child_id
+                        or child_request_id(
+                            parent_id, plan.receipt, segment.index
+                        )
+                    ),
+                    prompt=segment.prompt,
+                    keyframes=segment.keyframes,
+                    voice_texts=(),
+                    voice_receipt=h3.voice_texts_receipt(()),
+                    duration=long_video.provider_duration_s(
+                        segment.start_s,
+                        segment.end_s,
+                        receipt_version=plan.receipt_version,
+                    ),
+                    autodl_token=settings.autodl_art_token,
+                    timeouts=h3.Timeouts(
+                        request_s=settings.h3_request_timeout_s,
+                        h3_poll_s=settings.h3_poll_timeout_s,
+                        download_s=settings.h3_download_timeout_s,
+                        poll_interval_s=settings.h3_poll_interval_s,
+                        retry_count=settings.retry_count,
+                        retry_interval_s=settings.retry_interval_s,
+                    ),
+                    mode="reference",
+                    aspect_ratio=plan.aspect_ratio,
+                    resolution=plan.resolution,
+                    workflow=plan.workflow,
+                    reference_audios=reference_audios,
+                    skill_plan_sha256=hashlib.sha256(
+                        segment.prompt.encode("utf-8")
+                    ).hexdigest(),
+                    multimodal_compiler_version="video-prompt-fusion-v1",
+                    upstream_dialogue_receipt_sha256=(
+                        segment.dialogue_sha256 or ""
+                    ),
+                    audio_required=True,
+                )
+                if context_ir_binding is None:
+                    return source_request
+                context = _freeze_segment_context_ir(
+                    settings, plan, segment, source_request
+                )
+                return _bind_h3_operational_roots(
+                    settings,
+                    plan,
+                    h3_project.apply_bound_context_ir(
+                        context, context_ir_binding
+                    ),
+                )
+            except (h3.H3Error, h3_project.ProjectMultimodalError) as exc:
+                raise LongGenerationError(
+                    getattr(exc, "code", "long_video_multimodal_invalid")
+                ) from None
         if segment.multimodal is None:
             raise LongGenerationError("long_video_multimodal_invalid")
         try:
@@ -1865,7 +1897,10 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
 def _revalidate_speaker_authority(
     plan: FrozenPlan, segment: FrozenSegment, request: h3.H3Request,
 ) -> None:
-    if plan.workflow not in h3.H3_MULTIMODAL_WORKFLOWS:
+    if (
+        plan.workflow not in h3.H3_MULTIMODAL_WORKFLOWS
+        or plan.prompt_fusion is not None
+    ):
         return
     try:
         h3_project.revalidate_production_authority(

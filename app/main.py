@@ -412,12 +412,25 @@ def _is_long_video(meta: dict) -> bool:
 
 def _is_current_v4_segment_project(meta: Mapping) -> bool:
     postprocess_receipt = meta.get("_postprocess_receipt")
+    options = (
+        postprocess_receipt.get("options")
+        if isinstance(postprocess_receipt, Mapping) else None
+    )
+    has_frozen_segments = bool(
+        isinstance(meta.get("segments"), list)
+        and meta["segments"]
+        and meta.get("long_video_plan_receipt")
+        == long_video.PLAN_RECEIPT_FILENAME
+    )
     return bool(
         meta.get("schema_version") == 2
         and isinstance(postprocess_receipt, Mapping)
         and postprocess_receipt.get("version") == 4
-        and isinstance(postprocess_receipt.get("options"), Mapping)
-        and postprocess_receipt["options"].get("optimize_image") is True
+        and isinstance(options, Mapping)
+        and (
+            has_frozen_segments
+            or options.get("optimize_image") is True
+        )
     )
 
 
@@ -795,7 +808,6 @@ def _validate_submit_payload(
         and isinstance(postprocess_receipt, Mapping)
         and postprocess_receipt.get("version") == 4
         and isinstance(postprocess_receipt.get("options"), Mapping)
-        and postprocess_receipt["options"].get("optimize_image") is True
     )
     if raw_delivery is None:
         if requires_delivery:
@@ -877,7 +889,6 @@ def _validate_long_submit_payload(
         and isinstance(postprocess_receipt, Mapping)
         and postprocess_receipt.get("version") == 4
         and isinstance(postprocess_receipt.get("options"), Mapping)
-        and postprocess_receipt["options"].get("optimize_image") is True
     )
     if raw_delivery is None:
         if requires_delivery:
@@ -1662,6 +1673,35 @@ def _long_validation_paths(
     if not isinstance(payload, dict):
         return paths
     candidates = [payload.get("source")]
+    prompt_fusion = payload.get("prompt_fusion")
+    prompt_fusion_manifest = _bound_artifact_path(cdir, prompt_fusion)
+    if prompt_fusion_manifest is not None:
+        paths.add(prompt_fusion_manifest)
+        try:
+            manifest = json.loads(
+                prompt_fusion_manifest.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            manifest = None
+        if isinstance(manifest, Mapping):
+            for artifact in (manifest.get("input"), manifest.get("output")):
+                path = _bound_artifact_path(cdir, artifact)
+                if path is not None:
+                    paths.add(path)
+            skill = manifest.get("skill")
+            if isinstance(skill, Mapping):
+                frozen_path = skill.get("frozen_path")
+                if (
+                    isinstance(frozen_path, str)
+                    and not Path(frozen_path).is_absolute()
+                ):
+                    candidate = (cdir / frozen_path).resolve()
+                    try:
+                        candidate.relative_to(cdir.resolve())
+                    except ValueError:
+                        pass
+                    else:
+                        paths.add(candidate)
     raw_segments = payload.get("segments")
     if not isinstance(raw_segments, list):
         return paths
@@ -1930,6 +1970,57 @@ def _speaker_timing_fingerprint_entries(
     return sorted(entries, key=lambda item: str(item.get("path")))
 
 
+def _prompt_fusion_fingerprint_entries(
+    cdir: Path, meta: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Hash immutable plan-bound fusion bytes, never mutable status metadata."""
+    receipt_name = meta.get("long_video_plan_receipt")
+    if receipt_name != long_video.PLAN_RECEIPT_FILENAME:
+        return []
+    try:
+        plan = json.loads((cdir / receipt_name).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    binding = plan.get("prompt_fusion") if isinstance(plan, Mapping) else None
+    if (
+        not isinstance(binding, Mapping)
+        or binding.get("path") != f"work/{h3_project.SOURCE_FILENAME}"
+    ):
+        return []
+    entries: list[dict[str, object]] = []
+
+    def add(relative: object, expected: object) -> bytes | None:
+        raw_sha256 = None
+        data = None
+        normalized = relative if isinstance(relative, str) else None
+        if normalized is not None and not Path(normalized).is_absolute():
+            candidate = (cdir / normalized).resolve()
+            try:
+                candidate.relative_to(cdir.resolve())
+                data = candidate.read_bytes()
+                raw_sha256 = hashlib.sha256(data).hexdigest()
+            except (OSError, ValueError):
+                data = None
+        entries.append({
+            "path": normalized,
+            "expected_sha256": expected,
+            "raw_sha256": raw_sha256,
+        })
+        return data
+
+    manifest_data = add(binding.get("path"), binding.get("sha256"))
+    try:
+        manifest = json.loads(manifest_data.decode("utf-8"))
+    except (AttributeError, UnicodeError, json.JSONDecodeError):
+        manifest = None
+    if isinstance(manifest, Mapping):
+        for key in ("input", "output"):
+            artifact = manifest.get(key)
+            if isinstance(artifact, Mapping):
+                add(artifact.get("path"), artifact.get("sha256"))
+    return sorted(entries, key=lambda item: str(item.get("path")))
+
+
 def _generated_video_validation_fingerprint(
     cdir: Path, meta: dict, settings: Settings | None = None,
 ) -> str | None:
@@ -1970,6 +2061,9 @@ def _generated_video_validation_fingerprint(
                 "long_video_plan_receipt": meta.get("long_video_plan_receipt"),
                 "generation": generation_binding,
                 "speaker_timing": _speaker_timing_fingerprint_entries(
+                    cdir, meta
+                ),
+                "prompt_fusion": _prompt_fusion_fingerprint_entries(
                     cdir, meta
                 ),
             }
