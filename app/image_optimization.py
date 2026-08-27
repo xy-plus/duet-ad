@@ -72,6 +72,22 @@ class ImageOptimizationIneligibleError(ValueError):
         self.reason = reason
 
 
+def verification_skill_path() -> Path:
+    """Resolve the shared plan/verify Skill without accepting a symlink."""
+    try:
+        info = _SKILL.lstat()
+        resolved = _SKILL.resolve(strict=True)
+    except OSError:
+        raise ValueError("invalid image verification skill") from None
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or resolved != _SKILL
+    ):
+        raise ValueError("invalid image verification skill")
+    return resolved
+
+
 def sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -594,6 +610,15 @@ def _canonical_plan_v2(
     }
 
 
+def canonical_plan_v2(
+    value: object,
+    segment_indices: list[int] | None = None,
+    frame_counts: dict[int, int] | None = None,
+) -> dict:
+    """Return an isolated canonical v2 plan for all downstream consumers."""
+    return deepcopy(_canonical_plan_v2(value, segment_indices, frame_counts))
+
+
 def _validated_frames(source: Path) -> list[Path]:
     if not source.is_dir():
         raise ValueError("invalid image optimization keyframes directory")
@@ -901,7 +926,7 @@ def generate_project_prompts(
         raise ValueError("unsupported image optimization edit mode")
     try:
         session = Path(session_dir).resolve(strict=True)
-        skill = _SKILL.resolve(strict=True)
+        skill = verification_skill_path()
     except OSError:
         raise ValueError("invalid image optimization input") from None
     if not skill.is_file() or not isinstance(segments, list) or not segments:
@@ -1293,7 +1318,7 @@ def generate_project_verdict(
     """Run verify in an isolated workspace and return a strict verdict."""
     try:
         session = Path(session_dir).resolve(strict=True)
-        skill = _SKILL.resolve(strict=True)
+        skill = verification_skill_path()
     except OSError:
         raise ValueError("invalid image verification input") from None
     canonical_plan = _canonical_plan_v2(plan)
