@@ -15,6 +15,14 @@ def test_skill_keeps_visual_phase_independent_from_audio_planning():
     assert "h3_prompt_plan.json" in text
     assert "视觉阶段" in text
     assert "音画阶段" in text
+    assert "视觉阶段不得读取任何音频文件" in text
+    for visual_contract in (
+        "生成一支与源片段时长一致、采用源视频[比例]、[分辨率，默认 720p]",
+        "无字幕、贴纸或水印等叠加元素",
+        "因果：[先看到动作，再看到变化",
+        "不从画面文字推断台词",
+    ):
+        assert visual_contract in text
     for retired in (
         "捂脸",
         "1秒内快速把手放下",
@@ -34,9 +42,8 @@ def test_multimodal_phase_emits_structured_plan_not_provider_prompt():
         '"audio_refs"',
         '"dialogue"',
         '"sound_design"',
-        '"subject_id": "S1"',
-        '"language"',
-        '"text"',
+        "subjects: Array<{ subject_id: SubjectId; picture_refs: NonEmptyArray<Int1>; voice_ref: Int1 }>",
+        "dialogue: Array<{ order: Int1; subject_id: SubjectId; language: NonEmpty; text: NonEmpty }>",
         "后端确定性编译",
     ):
         assert required in text
@@ -58,6 +65,8 @@ def test_multimodal_phase_binds_audio_semantics_and_fails_closed():
         "参考音频不是时间锁",
         '"eligible": false',
         '"reason"',
+        "任何必填事实缺失、未知、冲突或无法确认",
+        "其余字段固定置空",
     ):
         assert required in text
     for forbidden in (
@@ -73,7 +82,86 @@ def test_audio_phase_preserves_visual_facts_and_does_not_reselect_frames():
 
     assert "不得改写视觉事实" in text
     assert "不得重新选关键帧" in text
-    assert "不得补造未提供的人物、台词或声音事件" in text
+    assert "不得补造未提供的人物、台词、语言或声音事件" in text
+
+
+def test_static_schema_matches_h3_multimodal_adapter_items():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "所有字段必填，禁止额外字段",
+        'audio_refs: Array<{ audio_index: Int1; purpose: "voice" | "ambience" | "effect"; subject_id: SubjectId | null }>',
+        "narration: Array<{ order: Int1; language: NonEmpty; text: NonEmpty; voice_ref: Int1 | null }>",
+        "ambience_refs: Array<{ audio_index: Int1; description: NonEmpty }>",
+        "effects: Array<{ audio_index: Int1; description: NonEmpty }>",
+        "`dialogue[].order` 与 `narration[].order` 共用",
+        "两个数组各自按 `order` 升序",
+        "旁白不得出现 `subject_id`",
+    ):
+        assert required in text
+    for incompatible in (
+        "ambience_refs: Array<{ order:",
+        "effects: Array<{ order:",
+        "effects: Array<{ audio_ref:",
+    ):
+        assert incompatible not in text
+
+
+def test_static_schema_matches_adapter_reference_and_subject_guards():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "图片、音频外部编号从 1 开始",
+        "不得按数组位置重编号",
+        "`picture_refs` 是非空、升序、无重复的多值数组",
+        "不同 `subject_id` 不得复用同一图片编号",
+        "冻结输入必须已给出连续的 `S1…Sn`",
+        "不得输出没有人物台词的静默 subject",
+        "同一 `audio_index` 只能有一种 `purpose`",
+    ):
+        assert required in text
+
+
+def test_audio_is_reference_only_and_backend_fields_stay_out_of_plan():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for required in (
+        "只按 reference 语义使用",
+        "不是精确 PTS",
+        "不是 speaker-face 绑定",
+        "不是最终音轨",
+        "不进入语义计划",
+    ):
+        assert required in text
+    for forbidden in (
+        '"speaker_id"',
+        '"face_id"',
+        '"start_pts"',
+        '"end_pts"',
+        '"bytes"',
+        '"hash"',
+        '"format"',
+        '"fully_copy"',
+        '"partially_copy"',
+    ):
+        assert forbidden not in text
+
+
+def test_skill_contains_no_reusable_audio_sample_words_or_word_count_kpi():
+    text = SKILL.read_text(encoding="utf-8")
+
+    for forbidden in (
+        '"subject_id": "S1"',
+        '"language": "Chinese"',
+        "输入逐字原文",
+        "逐字保留输入的声音描述",
+        "我会准时回来",
+        "First batch of the morning",
+        "350-500",
+        "350–500",
+        "字数",
+    ):
+        assert forbidden not in text
 
 
 def test_download_archive_matches_skill_source():
