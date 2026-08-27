@@ -119,6 +119,14 @@ def test_audio_is_copied_exactly_inside_the_final_prompt():
     ):
         assert required in text
 
+    assert "<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>" in text
+    assert "opening tag 的下一 byte 必须是 `lines_json` 首 byte" in text
+    assert "closing tag 紧随 `lines_json` 末 byte" in text
+    assert (
+        "<AUDIO_CONTENT_JSON>\naudio_content.lines_json\n</AUDIO_CONTENT_JSON>"
+        not in text
+    )
+
 
 def test_output_is_one_ordered_final_prompt_per_input_segment():
     text = _skill()
