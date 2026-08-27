@@ -22,9 +22,25 @@ export interface AdaptedImageAcceptance {
   readonly expectedMetaSha256: string | null;
 }
 
+export type AdaptedPromptFusionStatus = 'pending' | 'running' | 'done' | 'failed';
+
+export interface AdaptedPromptFusionSegment {
+  readonly index: number;
+  readonly status: AdaptedPromptFusionStatus;
+  readonly finalPrompt: string | null;
+  readonly error: string | null;
+}
+
+export interface AdaptedPromptFusion {
+  readonly status: AdaptedPromptFusionStatus;
+  readonly error: string | null;
+  readonly segments: readonly AdaptedPromptFusionSegment[];
+}
+
 export interface AdaptedConversationDetail {
   readonly imageAcceptance: AdaptedImageAcceptance | null;
   readonly imageOptimizationPrompt: AdaptedImageOptimizationPrompt | null;
+  readonly promptFusion: AdaptedPromptFusion | null;
   readonly postprocessCapabilities: PostprocessOptions;
   readonly postprocessSegments: readonly {
     readonly index: number;
@@ -44,6 +60,15 @@ function record(value: unknown): UnknownRecord | null {
 
 function array(value: unknown): readonly unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+const PROMPT_FUSION_STATUSES = new Set<AdaptedPromptFusionStatus>([
+  'pending', 'running', 'done', 'failed',
+]);
+
+function promptFusionStatus(value: unknown): value is AdaptedPromptFusionStatus {
+  return typeof value === 'string'
+    && PROMPT_FUSION_STATUSES.has(value as AdaptedPromptFusionStatus);
 }
 
 function longSegmentIndexes(source: UnknownRecord): readonly number[] | null {
@@ -121,15 +146,61 @@ export function adaptImageAcceptance(value: unknown): AdaptedImageAcceptance | n
   };
 }
 
+export function adaptPromptFusion(value: unknown): AdaptedPromptFusion | null {
+  const source = record(value);
+  if (!source || !promptFusionStatus(source.status)
+      || (source.error !== null && typeof source.error !== 'string')
+      || !Array.isArray(source.segments) || source.segments.length === 0) return null;
+  const seen = new Set<number>();
+  const segments = source.segments.flatMap((value) => {
+    const segment = record(value);
+    if (!segment || !Number.isInteger(segment.index) || Number(segment.index) < 1
+        || seen.has(Number(segment.index)) || !promptFusionStatus(segment.status)
+        || (segment.final_prompt !== null && typeof segment.final_prompt !== 'string')
+        || (segment.error !== null && typeof segment.error !== 'string')) return [];
+    seen.add(Number(segment.index));
+    return [{
+      index: Number(segment.index),
+      status: segment.status,
+      finalPrompt: segment.final_prompt,
+      error: segment.error,
+    }];
+  });
+  if (segments.length !== source.segments.length) return null;
+  segments.sort((left, right) => left.index - right.index);
+  if (segments.some((segment, offset) => segment.index !== offset + 1)
+      || segments.some((segment) => segment.status === 'done' && !segment.finalPrompt?.trim())
+      || (source.status === 'done' && segments.some((segment) => segment.status !== 'done'))) {
+    return null;
+  }
+  return {
+    status: source.status,
+    error: source.error,
+    segments,
+  };
+}
+
 export function adaptConversationDetail(value: unknown): AdaptedConversationDetail {
   const source = record(value) ?? {};
   const sourceSegments = array(source.segments);
   const isLong = longSegmentIndexes(source)?.[0] !== 0;
   const capabilities = record(source.postprocess_capabilities);
   const postprocess = record(source.postprocess);
+  const adaptedPromptFusion = adaptPromptFusion(source.prompt_fusion);
+  const plannedIndexes = sourceSegments.flatMap((value) => {
+    const segment = record(value);
+    return segment && Number.isInteger(segment.index) && Number(segment.index) > 0
+      ? [Number(segment.index)] : [];
+  }).sort((left, right) => left - right);
+  const promptFusion = adaptedPromptFusion
+    && (plannedIndexes.length === 0
+      || (plannedIndexes.length === adaptedPromptFusion.segments.length
+        && plannedIndexes.every((index, offset) => adaptedPromptFusion.segments[offset]?.index === index)))
+    ? adaptedPromptFusion : null;
   return {
     imageAcceptance: adaptImageAcceptance(source.image_acceptance),
     imageOptimizationPrompt: adaptImageOptimizationPrompt(source.image_optimization_prompt),
+    promptFusion,
     postprocessCapabilities: {
       remove_subtitle: capabilities ? capabilities.remove_subtitle === true : source.postprocess_enabled === true,
       remove_brand: capabilities ? capabilities.remove_brand === true : source.postprocess_enabled === true,
@@ -162,11 +233,14 @@ export function shouldPollDetail(detail: unknown): boolean {
   if (!source) return false;
   const generationStatus = record(source.generation)?.status;
   const postprocessStatus = record(source.postprocess)?.status;
+  const fusionStatus = record(source.prompt_fusion)?.status;
   return source.status === 'queued'
     || source.status === 'processing'
     || generationStatus === 'queued'
     || generationStatus === 'running'
-    || postprocessStatus === 'running';
+    || postprocessStatus === 'running'
+    || fusionStatus === 'pending'
+    || fusionStatus === 'running';
 }
 
 export function canOperate(detail: unknown): boolean {
@@ -193,6 +267,7 @@ export function detailSignature(detail: unknown): DetailSignature {
     source.source_prompt_sha256 ?? null,
     source.image_optimization_prompt ?? null,
     source.image_acceptance ?? null,
+    source.prompt_fusion ?? null,
     source.postprocess_capabilities ?? null,
     source.dialogue ?? null,
     source.dialogue_delivery ?? null,

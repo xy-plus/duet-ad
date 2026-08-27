@@ -227,6 +227,68 @@ describe('production App integration', () => {
       .not.toBeInTheDocument();
   });
 
+  it('shows partial prompt fusion through the same ordered segment model', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    const detail = {
+      ...baseDetail,
+      duration_s: 20,
+      segment_count: 2,
+      plan_receipt: 'e'.repeat(64),
+      navigation_status: 'analysis_complete',
+      segments: [
+        { index: 1, prompt: '片段一旧视频提示词', lines: [], keyframes: [] },
+        { index: 2, prompt: '片段二旧视频提示词', lines: [], keyframes: [] },
+      ],
+      generation: null,
+      image_acceptance: {
+        required: true, accepted: true, expected_meta_sha256: 'f'.repeat(64),
+      },
+      postprocess: {
+        status: 'done',
+        options: { remove_subtitle: false, remove_brand: false, optimize_image: true },
+        frames: [], error: null,
+        segments: [1, 2].map((index) => ({
+          index, status: 'done', stage: 'done', completed_frames: 9,
+          total_frames: 9, revision: 1, error: null,
+        })),
+      },
+      prompt_fusion: {
+        status: 'running', error: null,
+        segments: [
+          { index: 2, status: 'running', final_prompt: '未完成提示词不得显示', error: null },
+          { index: 1, status: 'done', final_prompt: '片段一最终融合提示词', error: null },
+        ],
+      },
+    };
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'prompt-fusion-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([detail]);
+        if (url === '/api/conversations/cid-1') return Response.json(detail);
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+
+    const fusion = await screen.findByRole('region', { name: '最终提示词融合' });
+    const generation = screen.getByRole('region', { name: '视频生成' });
+    expect(fusion.compareDocumentPosition(generation) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(screen.getByText('片段 1 · 融合完成')).toBeInTheDocument();
+    expect(screen.getByText('片段 2 · 融合中')).toBeInTheDocument();
+    expect(screen.getByLabelText('片段 1 最终提示词')).toHaveTextContent('片段一最终融合提示词');
+    expect(screen.queryByText('未完成提示词不得显示')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '确认生成' })).toBeDisabled();
+
+    const user = userEvent.setup();
+    await user.click(screen.getAllByRole('button', { name: '展开旧视频提示词（融合输入）' })[0]);
+    expect(screen.getByRole('textbox', { name: '旧视频提示词（融合输入）' }))
+      .toHaveValue('片段一旧视频提示词');
+  });
+
   it('reports an image acceptance CAS conflict without automatically resending it', async () => {
     const storage = new MemoryStorage();
     storage.setItem('cvs_token', 'stored-token');
@@ -341,6 +403,94 @@ describe('production App integration', () => {
     await user.click(screen.getByRole('button', { name: '确认生成' }));
     await waitFor(() => expect(submitPayloads).toHaveLength(2));
     expect(submitPayloads[1]).toMatchObject({ dialogue_delivery: 'off_screen' });
+  });
+
+  it('polls prompt fusion after the first 409 and requires a second explicit submit', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    const submitPayloads: unknown[] = [];
+    let fusionStatus: 'missing' | 'pending' | 'done' = 'missing';
+    const currentDetail = () => ({
+      ...baseDetail,
+      navigation_status: 'analysis_complete',
+      duration_s: 12,
+      segment_count: 1,
+      plan_receipt: '1'.repeat(64),
+      segments: [{ index: 1, prompt: '旧视频提示词', lines: [], keyframes: [] }],
+      generation: null,
+      dialogue_delivery: null,
+      image_acceptance: {
+        required: true, accepted: true, expected_meta_sha256: '2'.repeat(64),
+      },
+      postprocess: {
+        status: 'done',
+        options: { remove_subtitle: false, remove_brand: false, optimize_image: true },
+        frames: [], error: null,
+        segments: [{
+          index: 1, status: 'done', stage: 'done', completed_frames: 9,
+          total_frames: 9, revision: 1, error: null,
+        }],
+      },
+      ...(fusionStatus === 'missing' ? {} : {
+        prompt_fusion: {
+          status: fusionStatus,
+          error: null,
+          segments: [{
+            index: 1,
+            status: fusionStatus,
+            final_prompt: fusionStatus === 'done' ? '最终融合提示词' : null,
+            error: null,
+          }],
+        },
+      }),
+    });
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'prompt-fusion-refresh-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([currentDetail()]);
+        if (url === '/api/conversations/cid-1') return Response.json(currentDetail());
+        if (url === '/api/conversations/cid-1/submit') {
+          submitPayloads.push(JSON.parse(String(init?.body)));
+          if (submitPayloads.length === 1) {
+            fusionStatus = 'pending';
+            return Response.json(
+              { detail: 'prompt_fusion_refresh_required' },
+              { status: 409 },
+            );
+          }
+          return Response.json({ status: 'queued', attempt: 1 });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+    const user = userEvent.setup();
+    await user.click(await screen.findByText('画外', { exact: true }));
+    await user.click(screen.getByRole('button', { name: '确认生成' }));
+
+    expect(await screen.findByText('最终提示词正在融合；完成后请再次确认生成。'))
+      .toBeInTheDocument();
+    expect(await screen.findByText('片段 1 · 等待融合')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '确认生成' })).toBeDisabled();
+    expect(screen.getByRole('radio', { name: '画外' })).toBeChecked();
+    expect(submitPayloads).toHaveLength(1);
+
+    fusionStatus = 'done';
+    await queryClient.invalidateQueries();
+    expect(await screen.findByLabelText('片段 1 最终提示词')).toHaveTextContent('最终融合提示词');
+    expect(screen.getByRole('radio', { name: '画外' })).toBeChecked();
+    expect(screen.getByRole('button', { name: '确认生成' })).toBeEnabled();
+    expect(submitPayloads).toHaveLength(1);
+
+    await user.click(screen.getByRole('button', { name: '确认生成' }));
+    await waitFor(() => expect(submitPayloads).toHaveLength(2));
+    expect(submitPayloads).toEqual([
+      expect.objectContaining({ dialogue_delivery: 'off_screen' }),
+      expect.objectContaining({ dialogue_delivery: 'off_screen' }),
+    ]);
   });
 
   it.each([

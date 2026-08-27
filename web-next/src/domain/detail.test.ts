@@ -105,6 +105,67 @@ describe('detail state contract', () => {
     })).toBe(false);
   });
 
+  it('adapts one or many prompt-fusion segments through the same ordered contract', () => {
+    const promptFusion = {
+      status: 'running',
+      error: null,
+      segments: [
+        { index: 2, status: 'running', final_prompt: null, error: null },
+        { index: 1, status: 'done', final_prompt: '片段一最终提示词', error: null },
+      ],
+    };
+    const adapted = adaptConversationDetail({
+      segments: [{ index: 1 }, { index: 2 }],
+      prompt_fusion: promptFusion,
+    }).promptFusion;
+
+    expect(adapted).toEqual({
+      status: 'running',
+      error: null,
+      segments: [
+        { index: 1, status: 'done', finalPrompt: '片段一最终提示词', error: null },
+        { index: 2, status: 'running', finalPrompt: null, error: null },
+      ],
+    });
+    expect(adaptConversationDetail({
+      segments: [{ index: 1 }],
+      prompt_fusion: {
+        status: 'done', error: null,
+        segments: [{ index: 1, status: 'done', final_prompt: '单段最终提示词', error: null }],
+      },
+    }).promptFusion?.segments).toHaveLength(1);
+  });
+
+  it('rejects malformed, incomplete or wrong-segment prompt-fusion projections', () => {
+    expect(adaptConversationDetail({
+      segments: [{ index: 1 }],
+      prompt_fusion: {
+        status: 'done', error: null,
+        segments: [{ index: 1, status: 'done', final_prompt: null, error: null }],
+      },
+    }).promptFusion).toBeNull();
+    expect(adaptConversationDetail({
+      segments: [{ index: 1 }, { index: 2 }],
+      prompt_fusion: {
+        status: 'running', error: null,
+        segments: [{ index: 1, status: 'running', final_prompt: null, error: null }],
+      },
+    }).promptFusion).toBeNull();
+    expect(adaptConversationDetail({
+      prompt_fusion: {
+        status: 'future', error: null,
+        segments: [{ index: 1, status: 'running', final_prompt: null, error: null }],
+      },
+    }).promptFusion).toBeNull();
+    expect(adaptConversationDetail({
+      segments: [],
+      prompt_fusion: {
+        status: 'done', error: null,
+        segments: [{ index: 2, status: 'done', final_prompt: '跳号提示词', error: null }],
+      },
+    }).promptFusion).toBeNull();
+  });
+
   it('fails closed for done postprocess records with missing or malformed segments', () => {
     const segment = (index: number, revision = 1) => ({
       index, status: 'done', stage: 'image', completed_frames: 1,
@@ -179,6 +240,9 @@ describe('detail state contract', () => {
     expect(shouldPollDetail({ status: 'done', generation: { status: 'running' } })).toBe(true);
     expect(shouldPollDetail({ status: 'done', generation: { status: 'queued' } })).toBe(true);
     expect(shouldPollDetail({ status: 'done', postprocess: { status: 'running' } })).toBe(true);
+    expect(shouldPollDetail({ status: 'done', prompt_fusion: { status: 'pending' } })).toBe(true);
+    expect(shouldPollDetail({ status: 'done', prompt_fusion: { status: 'running' } })).toBe(true);
+    expect(shouldPollDetail({ status: 'done', prompt_fusion: { status: 'done' } })).toBe(false);
     expect(shouldPollDetail({ status: 'done', generation: { status: 'submission_unknown' } }))
       .toBe(false);
     expect(shouldPollDetail({ status: 'done', generation: { status: 'failed' } })).toBe(false);

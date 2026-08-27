@@ -82,6 +82,21 @@ export interface ImageAcceptanceDetail {
   readonly expected_meta_sha256: string | null;
 }
 
+export type PromptFusionStatus = 'pending' | 'running' | 'done' | 'failed';
+
+export interface PromptFusionSegmentDetail {
+  readonly index: number;
+  readonly status: PromptFusionStatus;
+  readonly final_prompt: string | null;
+  readonly error: string | null;
+}
+
+export interface PromptFusionDetail {
+  readonly status: PromptFusionStatus;
+  readonly error: string | null;
+  readonly segments: readonly PromptFusionSegmentDetail[];
+}
+
 export type PostprocessCapabilities = PostprocessOptions;
 
 export interface PostprocessSegment {
@@ -148,6 +163,7 @@ export interface ConversationDetail {
   readonly postprocess_capabilities?: PostprocessCapabilities | null;
   readonly image_optimization_prompt?: ImageOptimizationPrompt | null;
   readonly image_acceptance?: ImageAcceptanceDetail | null;
+  readonly prompt_fusion?: PromptFusionDetail | null;
   readonly plan_receipt?: string | null;
   readonly segment_count?: number;
   readonly [compatibilityField: string]: unknown;

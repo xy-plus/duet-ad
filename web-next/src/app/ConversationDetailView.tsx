@@ -49,7 +49,7 @@ import {
   type PostprocessOptions,
   type PostprocessTask,
 } from '../features/postprocess';
-import { Alert, Button, Card, Space, Typography } from '../ui/antd';
+import { Alert, Button, Card, Space, ThoughtChain, Typography } from '../ui/antd';
 import {
   AuthenticatedImageGrid,
   AuthenticatedSegments,
@@ -239,6 +239,8 @@ function payloadForAction(
   return newGenerationPayload(detail, draft);
 }
 
+const PROMPT_FUSION_REFRESH_MESSAGE = '最终提示词正在融合；完成后请再次确认生成。';
+
 function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail: ConversationDetail }) {
   const [draft, setDraft] = useState(() => safeGenerationDraft(detail));
   const [error, setError] = useState<string>();
@@ -255,7 +257,12 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
   const model = generationStatusModel(detail, mutation.isPending);
   const operationAllowed = canOperate(detail);
   const postprocessReady = postprocessAllowsGeneration(detail);
-  const imageAcceptance = adaptConversationDetail(detail).imageAcceptance;
+  const adapted = adaptConversationDetail(detail);
+  const imageAcceptance = adapted.imageAcceptance;
+  const promptFusionPresent = detail.prompt_fusion !== undefined && detail.prompt_fusion !== null;
+  const promptFusionPending = adapted.promptFusion?.status === 'pending'
+    || adapted.promptFusion?.status === 'running';
+  const promptFusionInvalid = promptFusionPresent && adapted.promptFusion === null;
   const actionContract = generationRetryContract(detail);
   const actionAvailable = operationAllowed
     && postprocessReady
@@ -263,8 +270,15 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
     && !reconciling
     && actionContract.action !== 'none';
   const deliveryMissing = draft?.dialogueMode !== 'none' && draft?.dialogueDelivery === null;
+  const actionBlocked = deliveryMissing || promptFusionPending || promptFusionInvalid
+    || error === PROMPT_FUSION_REFRESH_MESSAGE;
+  useEffect(() => {
+    if (adapted.promptFusion?.status === 'done' || adapted.promptFusion?.status === 'failed') {
+      setError((current) => current === PROMPT_FUSION_REFRESH_MESSAGE ? undefined : current);
+    }
+  }, [adapted.promptFusion?.status]);
   const submit = async (action: GenerationAction) => {
-    if (!actionAvailable || deliveryMissing || !postprocessAllowsGeneration(detail) || !draft) return;
+    if (!actionAvailable || actionBlocked || !postprocessAllowsGeneration(detail) || !draft) return;
     setError(undefined);
     try {
       await mutation.mutateAsync(payloadForAction(detail, draft, action));
@@ -273,6 +287,8 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
         setReconciling(true);
       } else if (apiErrorMatches(submitError, 'multimodal_input_refresh_required')) {
         setError('音频与画面输入需要刷新，请等待页面更新后再次确认生成。');
+      } else if (apiErrorMatches(submitError, 'prompt_fusion_refresh_required')) {
+        setError(PROMPT_FUSION_REFRESH_MESSAGE);
       } else {
         setError(errorMessage(submitError, '生成请求提交失败'));
       }
@@ -313,9 +329,15 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
       {deliveryMissing ? (
         <Alert type="warning" showIcon title="请选择声音呈现方式后再生成视频" />
       ) : null}
+      {promptFusionPending ? (
+        <Alert type="info" showIcon title="最终提示词正在融合，完成后请再次确认生成" />
+      ) : null}
+      {promptFusionInvalid ? (
+        <Alert type="error" showIcon title="服务端最终提示词融合状态无效，已禁止生成" />
+      ) : null}
       <GenerationStatus
         model={model}
-        actionDisabled={deliveryMissing}
+        actionDisabled={actionBlocked}
         onAction={actionAvailable ? (action) => { draftGuard.run(() => { void submit(action); }); } : undefined}
       />
     </section>
@@ -508,6 +530,52 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
   );
 }
 
+const promptFusionStatus = {
+  pending: { label: '等待融合', chainStatus: undefined },
+  running: { label: '融合中', chainStatus: 'loading' as const },
+  done: { label: '融合完成', chainStatus: 'success' as const },
+  failed: { label: '融合失败', chainStatus: 'error' as const },
+};
+
+function PromptFusionSection({ detail }: { detail: ConversationDetail }) {
+  if (detail.prompt_fusion === undefined || detail.prompt_fusion === null) return null;
+  const fusion = adaptConversationDetail(detail).promptFusion;
+  if (!fusion) {
+    return (
+      <section aria-label="最终提示词融合">
+        <Alert type="error" showIcon title="服务端最终提示词融合状态无效" />
+      </section>
+    );
+  }
+  const overall = promptFusionStatus[fusion.status];
+  return (
+    <section aria-label="最终提示词融合" className="app-detail-stack">
+      <Card title="最终提示词融合">
+        <Space orientation="vertical" size="middle">
+          <Typography.Text type="secondary">{overall.label}</Typography.Text>
+          {fusion.error ? <Alert type="error" showIcon title={fusion.error} /> : null}
+          <ThoughtChain
+            items={fusion.segments.map((segment) => {
+              const presentation = promptFusionStatus[segment.status];
+              const finalPrompt = segment.finalPrompt?.trim();
+              return {
+                key: `prompt-fusion-${segment.index}`,
+                title: `片段 ${segment.index} · ${presentation.label}`,
+                status: presentation.chainStatus,
+                description: segment.status === 'done' && finalPrompt ? (
+                  <Typography.Paragraph aria-label={`片段 ${segment.index} 最终提示词`}>
+                    {finalPrompt}
+                  </Typography.Paragraph>
+                ) : (segment.error ?? undefined),
+              };
+            })}
+          />
+        </Space>
+      </Card>
+    </section>
+  );
+}
+
 function LoadedConversationDetail({ apiClient, detail }: { apiClient: ApiClient; detail: ConversationDetail }) {
   const dialogue = detail.voice_lines.map((line, index) => ({
     id: `${detail.id}-line-${index}`,
@@ -541,6 +609,7 @@ function LoadedConversationDetail({ apiClient, detail }: { apiClient: ApiClient;
         <>
           {detail.segments.length === 0 ? <PromptSection apiClient={apiClient} detail={detail} /> : null}
           <PostprocessSection apiClient={apiClient} detail={detail} />
+          <PromptFusionSection detail={detail} />
           <GenerationSection apiClient={apiClient} detail={detail} />
         </>
       ) : null}
