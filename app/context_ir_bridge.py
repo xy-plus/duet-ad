@@ -428,6 +428,7 @@ def _h3_request_manifest(
         ),
         "on_screen_dialogue_sha256": request.on_screen_dialogue_sha256,
         "audio_required": request.audio_required,
+        "context_ir_required": request.context_ir_required,
         "reference_audio_metadata": [
             {
                 "order": audio.order,
@@ -1728,7 +1729,10 @@ def apply_effective_prompt(
     if receipt_path is None:
         raise ContextIrContractError("context_ir_effective_prompt_unavailable")
     receipt = load_effective_prompt_receipt(request, Path(receipt_path))
-    if h3.is_multimodal_request(request.source_h3_request):
+    if (
+        h3.is_multimodal_request(request.source_h3_request)
+        or request.source_h3_request.context_ir_required
+    ):
         return replace(
             request.source_h3_request,
             prompt=receipt.effective_prompt,

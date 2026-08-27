@@ -253,6 +253,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     tmp_path, monkeypatch, segment_count, *, postprocess_options=None,
     frozen_single_segment=False, forbid_legacy_short=False,
     complete_generation=False, dialogue_mode="auto",
+    silent_segment_indices=(),
 ):
     settings = make_settings(
         tmp_path,
@@ -327,12 +328,12 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             visual_text = f"第{index}段九张优化图片视觉动作"
             visual = work / "visual_prompt.txt"
             visual.write_text(visual_text, encoding="utf-8")
-            dialogue = [{
+            dialogue = ([] if index in silent_segment_indices else [{
                 "text": f"画外歌声{index}",
                 "start_s": 1.0,
                 "end_s": 2.0,
                 "classification": "sung",
-            }]
+            }])
             final_text = (
                 "不要生成背景音乐\n"
                 + prepared_input.compose_final_prompt(
@@ -367,7 +368,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                 "visual_prompt": visual_text,
                 "prompt": final_text,
                 "dialogue": dialogue,
-                "lines": [dialogue[0]["text"]],
+                "lines": [line["text"] for line in dialogue],
             }
             public_segments.append(segment)
             receipt_segments.append({
@@ -477,6 +478,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     stitch_calls = []
     reuse_calls = []
     attempts = {}
+    timeline_calls = []
     if complete_generation:
         def start_h3(request):
             h3_requests.append(request)
@@ -499,14 +501,14 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                 "succeeded", attempts[request.client_request_id]
             ),
         )
-        monkeypatch.setattr(
-            h3,
-            "load_media_timeline_receipt",
-            lambda _request, attempt_id: {
+        def timeline_receipt(request, attempt_id):
+            timeline_calls.append((request, attempt_id))
+            return {
                 "attempt_id": attempt_id,
                 "audio": {"mode": "provider_generated"},
-            },
-        )
+            }
+
+        monkeypatch.setattr(h3, "load_media_timeline_receipt", timeline_receipt)
 
         def fake_stitch(**kwargs):
             stitch_calls.append(kwargs)
@@ -594,6 +596,11 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     assert second.status_code == 202, second.json()
     assert fusion_calls == [cdir]
     assert len(h3_requests) == (segment_count if complete_generation else 1)
+    for bound_request in h3_requests:
+        assert bound_request.context_ir_required is True
+        assert bound_request.context_ir_receipt_path is not None
+        assert bound_request.context_ir_receipt_sha256 is not None
+        h3._require_context_ir_receipt(bound_request)
     request = h3_requests[0]
     assert context_sources == fusion_prompts[:len(context_sources)]
     assert request.prompt == f"EFFECTIVE::{fusion_prompts[0]}"
@@ -601,12 +608,12 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     assert "[AUDIO_CONTENT_JSON]" not in request.prompt
     assert request.on_screen_dialogue == ()
     assert len(request.keyframes) == 9
-    assert len(request.reference_audios) == (0 if dialogue_mode == "none" else 1)
+    first_has_audio = dialogue_mode != "none" and 1 not in silent_segment_indices
+    assert len(request.reference_audios) == (1 if first_has_audio else 0)
     assert request.workflow == (
-        h3.H3_WORKFLOW
-        if dialogue_mode == "none" else h3.H3_MULTIMODAL_WORKFLOW
+        h3.H3_MULTIMODAL_WORKFLOW if first_has_audio else h3.H3_WORKFLOW
     )
-    if dialogue_mode != "none":
+    if first_has_audio:
         assert request.reference_audios[0].data == (
             cdir / "work" / (
                 "voice.mp3"
@@ -622,17 +629,26 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             f"EFFECTIVE::{prompt}" for prompt in fusion_prompts
         ]
         assert len(stitch_calls) == 1
+        native_indices = {
+            index for index in range(1, segment_count + 1)
+            if dialogue_mode != "none" and index not in silent_segment_indices
+        }
         assert stitch_calls[0]["audio_mode"] == (
-            "mute" if dialogue_mode == "none" else "provider_generated"
+            "provider_generated" if native_indices else "mute"
         )
         assert len(reuse_calls) == 1
         assert reuse_calls[0][1] == dialogue_mode
-        if dialogue_mode == "none":
+        if not native_indices:
             assert reuse_calls[0][3] is None
         else:
-            assert set(reuse_calls[0][3]) == set(range(1, segment_count + 1))
+            assert set(reuse_calls[0][3]) == native_indices
+        assert len(timeline_calls) == len(native_indices)
         completed = storage.load_meta(settings.data_dir, cid)
         assert completed["generation"]["status"] == "succeeded"
+        for state in completed["generation"]["segments"]:
+            assert ("h3_attempt_id" in state) == (
+                state["index"] in native_indices
+            )
     for index in range(1, segment_count + 1):
         segment_work = cdir / "work" / "segments" / str(index) / "work"
         assert not (segment_work / "multimodal_input.json").exists()
@@ -688,6 +704,18 @@ def test_n1_n2_none_fusion_enters_context_h3_without_audio(
         segment_count,
         complete_generation=True,
         dialogue_mode="none",
+    )
+
+
+def test_n2_mixed_fusion_uses_native_audio_then_mute_without_source_overlay(
+    tmp_path, monkeypatch,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path,
+        monkeypatch,
+        2,
+        complete_generation=True,
+        silent_segment_indices=(2,),
     )
 
 

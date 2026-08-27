@@ -251,6 +251,7 @@ class H3Request:
     on_screen_dialogue: tuple[Mapping[str, Any], ...] = ()
     on_screen_dialogue_sha256: str | None = None
     audio_required: bool = False
+    context_ir_required: bool = False
     context_ir_receipt_path: Path | None = None
     context_ir_receipt_sha256: str | None = None
     gateway_storage_root: Path | None = None
@@ -365,9 +366,7 @@ def _validate_request_audio_contract(
     if not is_multimodal:
         if (
             audios
-            or request.skill_plan_sha256 is not None
             or request.multimodal_compiler_version is not None
-            or request.upstream_dialogue_receipt_sha256 is not None
             or request.speaker_timing_sha256 is not None
             or request.speaker_timing_authority_version is not None
             or request.speaker_timing_production_required is not False
@@ -381,12 +380,26 @@ def _validate_request_audio_contract(
             or request.on_screen_dialogue
             or request.on_screen_dialogue_sha256 is not None
             or request.audio_required is not False
-            or request.context_ir_receipt_path is not None
-            or request.context_ir_receipt_sha256 is not None
             or request.gateway_storage_root is not None
         ):
             raise H3Error("mixed_h3_inputs")
+        if not isinstance(request.context_ir_required, bool):
+            raise H3Error("invalid_context_ir_authority")
+        if not request.context_ir_required and (
+            request.skill_plan_sha256 is not None
+            or request.upstream_dialogue_receipt_sha256 is not None
+            or request.context_ir_receipt_path is not None
+            or request.context_ir_receipt_sha256 is not None
+        ):
+            raise H3Error("mixed_h3_inputs")
+        if request.context_ir_required and (
+            not _is_sha256(request.skill_plan_sha256)
+            or not _is_sha256(request.upstream_dialogue_receipt_sha256)
+        ):
+            raise H3Error("invalid_context_ir_authority")
         return
+    if not isinstance(request.context_ir_required, bool):
+        raise H3Error("invalid_context_ir_authority")
     if request.mode != "reference":
         raise H3Error("mixed_h3_inputs")
     if not 4 <= request.duration:
@@ -825,6 +838,7 @@ def _context_ir_source_request_receipt(
         ),
         "on_screen_dialogue_sha256": request.on_screen_dialogue_sha256,
         "audio_required": request.audio_required,
+        "context_ir_required": request.context_ir_required,
         "reference_audio_metadata": [
             {
                 "order": audio.order,
@@ -839,9 +853,9 @@ def _context_ir_source_request_receipt(
 
 
 def _require_context_ir_receipt(request: H3Request) -> None:
-    """Reject raw multimodal requests at every H3 provider boundary."""
+    """Reject raw Context-required requests at every H3 provider boundary."""
     validate_request_authority(request)
-    if not is_multimodal_request(request):
+    if not is_multimodal_request(request) and not request.context_ir_required:
         return
     path = request.context_ir_receipt_path
     expected_sha256 = request.context_ir_receipt_sha256
@@ -1826,6 +1840,12 @@ def _input_manifest(
                     "receipt_sha256": request.context_ir_receipt_sha256,
                 },
                 "gateway_inputs": _gateway_input_manifest(request),
+            }
+        elif request.context_ir_required:
+            manifest["context_ir"] = {
+                "required": True,
+                "receipt_path": str(request.context_ir_receipt_path),
+                "receipt_sha256": request.context_ir_receipt_sha256,
             }
         return manifest
     provider_request = {

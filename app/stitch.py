@@ -181,6 +181,18 @@ def _provider_binding(segment: StitchSegment, index: int) -> dict[str, object]:
     }
 
 
+def _segment_audio_binding(
+    segment: StitchSegment, index: int,
+) -> dict[str, object]:
+    """Bind native provider audio, or an explicitly evidence-free mute segment."""
+    if (
+        segment.provider_attempt_id is None
+        and segment.provider_media_timeline is None
+    ):
+        return {"source": "mute"}
+    return _provider_binding(segment, index)
+
+
 def _validate_request(
     segments: Sequence[StitchSegment], source_video: Path, output: Path, audio_mode: str,
 ) -> tuple[tuple[StitchSegment, ...], Path, Path]:
@@ -193,6 +205,7 @@ def _validate_request(
         raise ValueError("segments must not be empty")
     normalized: list[StitchSegment] = []
     total_duration_s = 0.0
+    provider_audio_segments = 0
     for index, segment in enumerate(frozen):
         if not isinstance(segment, StitchSegment):
             raise TypeError("segments must contain StitchSegment values")
@@ -216,7 +229,8 @@ def _validate_request(
         if not path.is_file():
             raise ValueError(f"segment {index + 1} does not exist: {path}")
         if audio_mode == "provider_generated":
-            _provider_binding(segment, index + 1)
+            binding = _segment_audio_binding(segment, index + 1)
+            provider_audio_segments += int(binding["source"] == "h3")
         elif (
             segment.provider_attempt_id is not None
             or segment.provider_media_timeline is not None
@@ -233,6 +247,8 @@ def _validate_request(
                 segment.provider_media_timeline,
             )
         )
+    if audio_mode == "provider_generated" and provider_audio_segments == 0:
+        raise ValueError("provider_generated audio requires H3 evidence")
     if total_duration_s > MAX_TOTAL_DURATION_S:
         raise ValueError(
             f"total target duration must not exceed {MAX_TOTAL_DURATION_S:g}s"
@@ -293,35 +309,48 @@ def _normalize_segment(
         "-video_track_timescale", str(FPS),
     ]
     if audio_mode == "provider_generated":
-        try:
-            video_start = storage.probe_stream_start_time(segment.path, "v:0")
-            audio_start = storage.probe_stream_start_time(segment.path, "a:0")
-        except storage.UploadError as exc:
-            raise StitchError(
-                f"provider_generated_audio_missing: segment {index + 1}: {exc}"
-            ) from None
-        relative_audio_start = audio_start - video_start
-        if relative_audio_start >= 0:
-            align = (
-                "asetpts=PTS-STARTPTS,"
-                f"adelay={relative_audio_start * 1000:.6f}:all=1"
-            )
-        else:
-            align = (
-                f"atrim=start={-relative_audio_start:.9f},"
-                "asetpts=PTS-STARTPTS"
-            )
         duration_s = frames / FPS
-        audio_filter = (
-            f"{align},atrim=start=0:end={duration_s:.9f},"
-            f"apad=whole_dur={duration_s:.9f},"
-            f"atrim=start=0:end={duration_s:.9f},asetpts=PTS-STARTPTS"
-        )
-        argv += [
-            "-map", "0:a:0", "-af", audio_filter,
-            "-c:a", "aac", "-ar", "48000", "-ac", "2",
-            "-t", f"{duration_s:.9f}",
-        ]
+        binding = _segment_audio_binding(segment, index + 1)
+        if binding["source"] == "mute":
+            audio_filter = (
+                "anullsrc=r=48000:cl=stereo,"
+                f"atrim=start=0:end={duration_s:.9f},"
+                "asetpts=PTS-STARTPTS[a]"
+            )
+            argv += [
+                "-filter_complex", audio_filter,
+                "-map", "[a]", "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                "-t", f"{duration_s:.9f}",
+            ]
+        else:
+            try:
+                video_start = storage.probe_stream_start_time(segment.path, "v:0")
+                audio_start = storage.probe_stream_start_time(segment.path, "a:0")
+            except storage.UploadError as exc:
+                raise StitchError(
+                    f"provider_generated_audio_missing: segment {index + 1}: {exc}"
+                ) from None
+            relative_audio_start = audio_start - video_start
+            if relative_audio_start >= 0:
+                align = (
+                    "asetpts=PTS-STARTPTS,"
+                    f"adelay={relative_audio_start * 1000:.6f}:all=1"
+                )
+            else:
+                align = (
+                    f"atrim=start={-relative_audio_start:.9f},"
+                    "asetpts=PTS-STARTPTS"
+                )
+            audio_filter = (
+                f"{align},atrim=start=0:end={duration_s:.9f},"
+                f"apad=whole_dur={duration_s:.9f},"
+                f"atrim=start=0:end={duration_s:.9f},asetpts=PTS-STARTPTS"
+            )
+            argv += [
+                "-map", "0:a:0", "-af", audio_filter,
+                "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                "-t", f"{duration_s:.9f}",
+            ]
     else:
         argv += ["-an"]
     argv.append(str(destination))
@@ -414,7 +443,7 @@ def output_is_reusable(
         }
         if audio_mode == "provider_generated":
             expected_audio["provider_segments"] = [
-                _provider_binding(segment, index)
+                _segment_audio_binding(segment, index)
                 for index, segment in enumerate(normalized, 1)
             ]
             expected_audio["edl"] = {
@@ -596,7 +625,7 @@ def stitch_video(
         }
         if audio_mode == "provider_generated":
             payload["audio"]["provider_segments"] = [
-                _provider_binding(segment, index)
+                _segment_audio_binding(segment, index)
                 for index, segment in enumerate(normalized, 1)
             ]
             payload["audio"]["edl"] = {
