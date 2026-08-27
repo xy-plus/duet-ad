@@ -534,6 +534,88 @@ def _write_image_optimization_prompt(work: Path, prompt: str) -> None:
         staged.unlink(missing_ok=True)
 
 
+def _frame_inventory(frame_paths: dict[int, list[Path]]) -> list[dict]:
+    inventory = []
+    for segment_index in sorted(frame_paths):
+        paths = frame_paths[segment_index]
+        if (
+            isinstance(segment_index, bool)
+            or not isinstance(segment_index, int)
+            or not isinstance(paths, list)
+            or not paths
+        ):
+            raise PipelineError("image optimization frame inventory is invalid")
+        for frame_index, path in enumerate(paths, 1):
+            if not isinstance(path, Path) or path.name != f"{frame_index:02d}.png":
+                raise PipelineError("image optimization frame inventory is invalid")
+            try:
+                source_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise PipelineError("image optimization frame inventory is invalid") from exc
+            inventory.append({
+                "segment_index": segment_index,
+                "frame_index": frame_index,
+                "frame_name": path.name,
+                "source_sha256": source_sha256,
+            })
+    return inventory
+
+
+def _freeze_image_optimization(
+    settings: Settings,
+    meta: dict,
+    continuity: dict,
+    prompts: dict,
+    frame_paths: dict[int, list[Path]],
+    *,
+    require_dual_target: bool,
+) -> tuple[dict, dict]:
+    """Freeze either the legacy segment prompt or V3 source-frame prompts."""
+    try:
+        if continuity.get("version") == 3:
+            inventory = _frame_inventory(frame_paths)
+            frame_counts = {
+                index: len(paths) for index, paths in frame_paths.items()
+            }
+            frozen_continuity = image_optimization.freeze_continuity(
+                continuity, frame_counts=frame_counts
+            )
+            execution = image_optimization.freeze_execution_inputs(
+                continuity,
+                revision=1,
+                profile={"id": "image-postprocess", "revision": 1},
+                model=settings.seedream_model,
+                frame_inventory=inventory,
+            )
+            frozen_prompts = image_optimization.freeze_frame_prompts(
+                settings, execution, prompts
+            )
+        else:
+            frozen_continuity = image_optimization.freeze_continuity(continuity)
+            frozen_prompts = image_optimization.freeze_prompts(
+                settings, meta, prompts
+            )
+        candidate = {**meta, **frozen_continuity, **frozen_prompts}
+        if (
+            require_dual_target
+            and image_optimization.dual_target_plan_receipt(candidate) is None
+        ):
+            raise image_optimization.ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        if image_optimization.receipt(candidate) is None:
+            raise image_optimization.ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        return frozen_continuity, frozen_prompts
+    except (
+        ValueError,
+        image_optimization.ImageOptimizationIneligibleError,
+        image_optimization.ImageOptimizationOutputError,
+    ) as exc:
+        raise PipelineError(str(exc)) from None
+
+
 def _generate_image_optimization_project(
     settings: Settings,
     runner,
@@ -541,10 +623,10 @@ def _generate_image_optimization_project(
     *,
     session_dir: Path,
     step: str,
-) -> tuple[dict | None, dict[int, str]]:
+) -> tuple[dict | None, dict]:
     policy = _retry_policy(settings)
 
-    def attempt() -> tuple[dict | None, dict[int, str]]:
+    def attempt() -> tuple[dict | None, dict]:
         try:
             return image_optimization.generate_project_prompts(
                 runner,
@@ -571,7 +653,7 @@ def _generate_segmented_image_prompts(
     work: Path,
     *,
     session_dir: Path,
-) -> tuple[dict, dict[int, str]]:
+) -> tuple[dict, dict]:
     specs = [{
         "index": segment["index"],
         "chain_id": segment["chain_id"],
@@ -589,11 +671,12 @@ def _generate_segmented_image_prompts(
     )
     if continuity is None:
         raise PipelineError("image continuity was not generated")
-    for segment in seg_metas:
-        index = segment["index"]
-        _write_image_optimization_prompt(
-            work / "segments" / str(index) / "work", prompts[index]
-        )
+    if continuity.get("version") != 3:
+        for segment in seg_metas:
+            index = segment["index"]
+            _write_image_optimization_prompt(
+                work / "segments" / str(index) / "work", prompts[index]
+            )
     return continuity, prompts
 
 
@@ -1598,23 +1681,9 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 )
                 if continuity is None or set(image_prompts) != {0}:
                     raise PipelineError("image optimization output is missing or invalid")
-                try:
-                    frozen_continuity = image_optimization.freeze_continuity(
-                        continuity
-                    )
-                    if image_optimization.dual_target_plan_receipt(
-                        frozen_continuity
-                    ) is None:
-                        raise image_optimization.ImageOptimizationOutputError(
-                            "image optimization output is missing or invalid"
-                        )
-                except (
-                    image_optimization.ImageOptimizationIneligibleError,
-                    image_optimization.ImageOptimizationOutputError,
-                ) as exc:
-                    raise PipelineError(str(exc)) from None
-                image_prompt = image_prompts[0]
-                _write_image_optimization_prompt(work, image_prompt)
+                if continuity.get("version") != 3:
+                    image_prompt = image_prompts[0]
+                    _write_image_optimization_prompt(work, image_prompt)
             prompt = _apply_no_bgm_prefix(prompt, work / "prompt.txt", enabled=False)
             frame_paths = [work / "keyframes" / name for name in keyframes]
             profiles, aspect_ratio, resolution, default_fit_mode = (
@@ -1649,10 +1718,16 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 fit_mode=default_fit_mode,
             )
             if new_input_contract:
+                frozen_continuity, frozen_prompts = _freeze_image_optimization(
+                    settings,
+                    {**meta, **completion},
+                    continuity,
+                    image_prompts,
+                    {0: frame_paths},
+                    require_dual_target=True,
+                )
                 completion.update(frozen_continuity)
-                completion.update(image_optimization.freeze_prompts(
-                    settings, {**meta, **completion}, {0: image_prompt}
-                ))
+                completion.update(frozen_prompts)
             storage.finish_input_claim(
                 settings.data_dir,
                 cid,
@@ -1766,10 +1841,23 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             if new_input_contract:
                 if image_prompts is None or continuity is None:
                     raise PipelineError("image continuity was not generated")
-                changes.update(image_optimization.freeze_continuity(continuity))
-                changes.update(image_optimization.freeze_prompts(
-                    settings, {**meta, **changes}, image_prompts
-                ))
+                frozen_continuity, frozen_prompts = _freeze_image_optimization(
+                    settings,
+                    {**meta, **changes},
+                    continuity,
+                    image_prompts,
+                    {
+                        seg["index"]: [
+                            work / "segments" / str(seg["index"]) / "work"
+                            / "keyframes" / name
+                            for name in seg["keyframes"]
+                        ]
+                        for seg in seg_metas
+                    },
+                    require_dual_target=False,
+                )
+                changes.update(frozen_continuity)
+                changes.update(frozen_prompts)
             storage.finish_input_claim(
                 settings.data_dir, cid, claim_owner, **changes
             )

@@ -27,20 +27,21 @@ links: [conversation-task, result-display]
 
 ## 边界
 
-- 视觉关键帧冻结后，隔离 Codex 以同一个 `image-postprocess` Skill 执行 `phase=plan`：短视频读取逻辑段 `0`，多段项目读取全部分段关键帧。输出只含结构化 v2 设计；后端确定性编译每段 Seedream 提示词，Skill 不读取或复制 H3 提示词。
+- 视觉关键帧冻结后，隔离 Codex 以同一个 `image-postprocess` Skill 执行 `phase=plan`：短视频读取逻辑段 `0`，多段项目读取全部分段关键帧。新输出只含结构化 v3 设计；后端确定性编译每个冻结帧的 Seedream 提示词，Skill 不读取或复制 H3 提示词。历史 v2 receipt 只读兼容。
 - 页面将单段/多段提示词收敛为同一个三态工作区：“展开生成提示词 / 展开段台词 / 展开图片优化”。三个按钮等宽并排且窄屏允许文字换行；工作区共用一个文本区域。短视频生成提示词与图片优化可编辑，长视频的逐段生成提示词和段台词只读。
 - 图片优化编辑必须同时满足 `postprocess_capabilities.optimize_image=true`；即使异常详情带回提示词，能力为 false 时也只读且不能发 PATCH。短视频逻辑段号为 0，长视频段号必须为正整数，长视频出现 0 或非法段号时 fail closed。
-- v2 双目标计划的编译提示词只提供查看和复制，不能由自由文本删除人物、场景、光色或关系硬约束；历史 v1 提示词继续原 CAS 行为，receipt 不迁移、不重写。
+- v3 双目标计划的编译提示词只提供查看和复制，且每个冻结帧各有独立提示词，不能由自由文本删除人物、场景、光色或关系硬约束；历史 v1/v2 提示词继续原 CAS 行为，receipt 不迁移、不重写。
 - 当前选项为 `remove_subtitle`、`remove_brand`、`optimize_image`；`change_bg/face_hold` 已删除。旧页面请求只得到纯文本刷新提示，不会静默采用或自动重试。
 - `remove_subtitle` 映射 `full_screen_text_erase`；`remove_brand` 作为兼容字段映射 `full_screen_icon_erase`，只承诺清理常见 Logo/图标。双选会执行两个独立付费阶段。
-- 三个阶段在每段内严格按“文字/字幕 → Logo/图标 → 图片优化”执行。v2 `plan` 以连续性与现实合理性优先于替换幅度；人物与真实新场景仍是不可降级的双目标，任一目标与可见事实冲突时在付费前 `eligible=false`。短视频 `[0]` 使用相同结构，不能成功 no-op。
+- 三个阶段在每段内严格按“文字/字幕 → Logo/图标 → 图片优化”执行。v3 `plan` 以连续性与现实合理性优先于替换幅度；人物与真实新场景仍是不可降级的双目标，任一目标与可见事实冲突时在付费前 `eligible=false`。短视频 `[0]` 使用相同结构，不能成功 no-op。
 - 每个稳定主人物和物理场景各有一个冻结目标包；目标包逐段复用，不逐帧重设计，也不从编辑结果递推。每段按 ID 完整枚举全部主人物；不可见者标 `not_observable`，不得依据相邻段或 reference 补造人物或身体部分。
-- `hard_cut` 是场景证据边界：切后场景只依据切后证据，不能继承无切后证据的切前设计。每帧姿态、边界与关系只以当前源帧为事实；`continue` 才优先作为连续画面分析。
+- `hard_cut` 是场景证据边界：切后场景只依据切后证据，不能继承无切后证据的切前设计。逐帧先做全画面人体像素、服装和肢体碎片账本；逐帧保留可见身体部位数量、姿态骨架、尺度、手脚/道具/绳索/支撑面的接触点、遮挡前后顺序与画外裁切。每一帧只以当前源帧为事实，不从相邻帧、reference 或编辑结果补全。接触只有接触双方边界都在当前帧可见才能肯定；证据不足则 `eligible=false/person_replacement_unsafe`，不得补证。不得补造画外身体或工具，不得删除或新增肢体，不得改变接触图；`continue` 才优先作为连续画面分析。
+- v3 `frame_constraints` 按帧号一一覆盖全部冻结帧，字段固定为 `frame_index/visible_body_parts/pose_skeleton/contact_points/occlusion_order/out_of_frame_crop`，五个字段必须相互一致；`partial/cropped` 不得写成 `absent/fully-in-frame`，结束前逐帧自校验，任一矛盾返回空计划。段级 `photometric_contract` 固定为 `light_direction/light_quality/exposure_or_intensity/wb_cct/global_contrast/tone_curve`。冻结 receipt 以段号、帧名、源 SHA 和该帧提示词绑定，供应商调用只能取自身帧的提示词。
 - `scene_plans` 对全部段无重叠全覆盖；每个所属段必须同时改变环境语义、可见形状与空间结构、纵深、空间布局和局部材质/固有色。纯调色、纯纹理、只换材质或原结构换皮均不算换景。
 - source identity、source scene 和 source reference 只作定位旧设计及验收其消失的负样本证据，不能成为 target pack；人物/场景目标由 frozen plan 的 replacement 与变化字段定义。后端继续绑定对应帧 SHA、模型、profile、revision 和 plan SHA。
-- 所有段固定保持画幅、裁切、机位、镜头、透视、构图、焦点、景深及全局光源方向、曝光、白平衡/CCT、tone curve。目标局部固有色按计划变化，新几何只产生物理正确的局部阴影和反射；交互、接触、持握、支撑、遮挡、前后顺序、视线、姿态、动作目的、数量、尺度与叙事关系不可破坏。
+- 所有段固定保持画幅、裁切、机位、镜头、透视、构图、焦点、景深及全局光源方向、软硬、强度、曝光、白平衡、色温、整体色调、全局对比与 tone curve。目标人物和新场景的局部固有色必须明显不同；新几何只产生与原光源一致的局部阴影或反射，禁止全局重布光；交互、接触、持握、支撑、遮挡、前后顺序、视线、姿态、动作目的、数量、尺度与叙事关系不可破坏。
 - 人物和场景目标包生成后、任何逐帧付费 POST 前，同一 Skill 执行 `phase=verify_pack`：每个人物验身份变更、旧身份消失、双视图一致和局部颜色；每个场景验语义、几何、纵深、布局和局部颜色；项目级验全局光向、曝光、白平衡/CCT 和 tone curve。这一阶段只做语义判定，任一 `fail/unknown` 均 fail closed。
-- 生成结果进入 H3 前，同一 Skill 执行 `phase=verify`：逐人物、逐可观察帧验证新身份和源身份消失；逐场景、逐所属段验证五类真实变化；再验证相机、全局光色、可见关系及连续性。任何 `fail/unknown` 都使 `passed=false` 且不发布。
+- 生成结果进入 H3 前，同一 Skill 执行 `phase=verify`：逐人物、逐可观察帧验证新身份和源身份消失；逐场景、逐所属段验证五类真实变化；v3 `frame_checks` 再一一对照每帧的身体、姿态、接触、遮挡、裁切与光色合同。任一帧 unknown/fail 都使整项目 fail-closed；任何 `fail/unknown` 都使 `passed=false` 且不发布。
 - 每个付费 POST 前持久化私有 receipt。只有完整 HTTP 429、`success=false`、精确 `RequestLimitExceeded` 时，才按 `AUTO_RETRY_COUNT/AUTO_RETRY_INTERVAL_S` 自动退避并追加新 attempt；网络异常、5xx、无效/不完整响应仍视为结果未知并禁止重发。已收到成功响应但下载失败时只恢复 GET。MediaKit WebP 结果经解码、尺寸校验和 PNG 转码后才进入 `frames`。
 - Seedream 每帧总计最多 3 次 POST，且只有完整 HTTP 429、精确 `QuotaExceeded`、响应无 `data` 才自动重试；网络/超时/取消一律记为 `submission_unknown`。重启只恢复可证明安全的本地阶段，不自动重发未知 POST。
 - 后处理一旦开始，H3 提交必须等待其 `done`；完成后每张 `postprocessed/` 优化帧都会替代同名原关键帧，进入冻结输入 receipt 和实际 H3 请求。缺帧或状态异常时 fail closed，不回退原图。

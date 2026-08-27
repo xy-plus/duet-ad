@@ -1,5 +1,7 @@
 """任务 B：处理流水线（extract --fps 4 → codex 沙箱 → 白名单校验 → meta 落盘）。"""
+import asyncio
 import base64
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -15,13 +17,17 @@ import time
 from pathlib import Path
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import codex_runner, h3, long_generation, long_video, pipeline, prepared_input, storage, vocal, voice
+from app import codex_runner, h3, image_optimization, long_generation, long_video, pipeline, postprocess, prepared_input, seedream, storage, vocal, voice
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
+
+
+_GENERATE_IMAGE_OPTIMIZATION_PROJECT = image_optimization.generate_project_prompts
 
 
 def _short_dual_target_plan():
@@ -71,6 +77,58 @@ def _short_dual_target_plan():
             "protected_relations": ["all physical and interaction relations"],
         }],
     }
+
+
+def _short_dual_target_plan_v3(*, frame_count: int = 3):
+    plan = deepcopy(_short_dual_target_plan())
+    plan["version"] = 3
+    plan["segments"][0].update(
+        frame_constraints=[
+            {
+                "frame_index": index,
+                "visible_body_parts": f"frame {index} visible body parts",
+                "pose_skeleton": f"frame {index} pose skeleton",
+                "contact_points": f"frame {index} contact points",
+                "occlusion_order": f"frame {index} occlusion order",
+                "out_of_frame_crop": f"frame {index} out of frame crop",
+            }
+            for index in range(1, frame_count + 1)
+        ],
+        photometric_contract={
+            "light_direction": "preserve source light direction",
+            "light_quality": "preserve source light quality",
+            "exposure_or_intensity": "preserve source exposure",
+            "wb_cct": "preserve source white balance",
+            "global_contrast": "preserve source contrast",
+            "tone_curve": "preserve source tone curve",
+        },
+    )
+    return plan
+
+
+def _long_dual_target_plan_v3(*, frame_count: int = 3):
+    plan = _short_dual_target_plan_v3(frame_count=frame_count)
+    plan["segment_indices"] = [1, 2]
+    plan["person_plans"][0].update(
+        reference={"segment_index": 1, "frame_index": 1},
+        observable_segments=[1, 2],
+    )
+    plan["scene_plans"][0].update(
+        reference={"segment_index": 1, "frame_index": 1},
+        segments=[1, 2],
+    )
+    plan["segments"] = [
+        {
+            **deepcopy(plan["segments"][0]),
+            "segment_index": index,
+            "persons": [{
+                **deepcopy(plan["segments"][0]["persons"][0]),
+                "observable_frames": list(range(1, frame_count + 1)),
+            }],
+        }
+        for index in (1, 2)
+    ]
+    return plan
 
 
 @pytest.fixture(autouse=True)
@@ -1696,6 +1754,148 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_prepared_receipt(
     ).strip() == frozen["segments"][0]["current"]
 
 
+def test_short_v3_freezes_a_complete_frame_bound_prompt_receipt(
+    tmp_path, video_1s, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode="auto",
+        voice_mode="keep",
+        duration_s=10.0,
+        ratio="9:16",
+        fit_mode="none",
+    )
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
+    monkeypatch.setattr(
+        CodexRunner,
+        "run",
+        lambda self, workdir, prompt: _write_valid_package(Path(workdir) / "work"),
+    )
+    plan = _short_dual_target_plan_v3()
+    prompts = {
+        0: {
+            index: f"frame {index} own immutable prompt"
+            for index in (1, 2, 3)
+        }
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_image_optimization_project",
+        lambda *_args, **_kwargs: (plan, prompts),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["_image_continuity"]["version"] == 3
+    frozen = stored["_image_optimization"]
+    assert frozen["version"] == 3
+    assert [item["frame_name"] for item in frozen["frames"]] == [
+        "01.png", "02.png", "03.png"
+    ]
+    assert [item["current"] for item in frozen["frames"]] == [
+        "frame 1 own immutable prompt",
+        "frame 2 own immutable prompt",
+        "frame 3 own immutable prompt",
+    ]
+
+
+def test_short_v3_pipeline_e2e_sends_each_source_frame_its_own_prompt(
+    tmp_path, video_1s, monkeypatch
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    meta = _make_conversation(settings, video_1s)
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode="auto",
+        voice_mode="keep",
+        duration_s=10.0,
+        ratio="9:16",
+        fit_mode="none",
+    )
+    plan = _short_dual_target_plan_v3(frame_count=2)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
+    monkeypatch.setattr(
+        CodexRunner,
+        "run",
+        lambda self, workdir, prompt: _write_valid_package(
+            Path(workdir) / "work", frames=2
+        ),
+    )
+
+    def write_v3_plan(self, workdir, prompt, *, session_dir):
+        output = Path(workdir) / "work" / "image_optimization.json"
+        output.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+    monkeypatch.setattr(CodexRunner, "run_isolated", write_v3_plan)
+    monkeypatch.setattr(
+        pipeline.image_optimization,
+        "generate_project_prompts",
+        _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    frozen = stored["_image_optimization"]
+    assert frozen["version"] == 3
+    source_sha256s = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted((settings.data_dir / meta["id"] / "work" / "keyframes").glob("*.png"))
+    }
+    assert {
+        item["frame_name"]: item["source_sha256"] for item in frozen["frames"]
+    } == source_sha256s
+
+    captured = []
+    output = base64.b64encode(_PX_PNG).decode()
+
+    async def handler(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"data": [{"b64_json": output}]})
+
+    real_edit = seedream.edit
+
+    async def capture_edit(settings_, images, prompt, output_path, *, receipt_path, transport=None):
+        return await real_edit(
+            settings_, images, prompt, output_path, receipt_path=receipt_path,
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(postprocess.seedream, "edit", capture_edit)
+    asyncio.run(postprocess.start(
+        settings,
+        meta["id"],
+        {"confirm": True, "options": {
+            "remove_subtitle": False,
+            "remove_brand": False,
+            "optimize_image": True,
+        }},
+        {},
+    ))
+    asyncio.run(postprocess.run_task(
+        settings, meta["id"], asyncio.Semaphore(1), asyncio.Semaphore(1)
+    ))
+
+    assert len(captured) == 2
+    prompts = [body["prompt"] for body in captured]
+    assert any("frame 1 visible body parts" in prompt for prompt in prompts)
+    assert any("frame 2 visible body parts" in prompt for prompt in prompts)
+    assert all(len(body["image"]) == 1 for body in captured)
+    assert storage.load_meta(settings.data_dir, meta["id"])["postprocess"]["status"] == "done"
+
+
 @pytest.mark.parametrize(
     "plan",
     [
@@ -1971,6 +2171,93 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
         long_video.provider_duration_s(item.start_s, item.end_s)
         for item in frozen.segments
     ] == [14, 2]
+
+
+def test_long_v3_freezes_every_segment_source_frame_before_postprocess(
+    tmp_path, video_1s, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode="auto",
+        voice_mode="keep",
+        duration_s=15.4,
+        ratio="9:16",
+        fit_mode="pad",
+    )
+
+    def fake_steps(argv, *, timeout, step, cwd=None):
+        if step == "extract":
+            work = Path(argv[argv.index("--out-dir") + 1])
+            (work / "contact_sheet.jpg").write_bytes(b"sheet")
+            (work / "manifest.json").write_text(
+                json.dumps({"duration_seconds": 15.4}), encoding="utf-8"
+            )
+        elif step == "scenes":
+            work = Path(argv[argv.index("--work-dir") + 1])
+            (work / "scenes.json").write_text(
+                json.dumps({"duration_s": 15.4, "scenes": [], "segments": []}),
+                encoding="utf-8",
+            )
+        elif step.startswith("segment ") and step.endswith(" extract"):
+            work = Path(argv[argv.index("--out-dir") + 1])
+            work.mkdir(parents=True, exist_ok=True)
+            (work / "001_frame_000.000s.png").write_bytes(_PX_PNG)
+            (work / "002_frame_015.400s.png").write_bytes(_PX_PNG)
+            (work / "manifest.json").write_text(
+                json.dumps({
+                    "frames": [
+                        {"index": 1, "time_seconds": 0.0, "file": "001_frame_000.000s.png"},
+                        {"index": 2, "time_seconds": 15.4, "file": "002_frame_015.400s.png"},
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+    plan = _long_dual_target_plan_v3(frame_count=3)
+    prompts = image_optimization.compile_frame_prompts(
+        plan, settings.seedream_edit_mode
+    )
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_steps)
+    monkeypatch.setattr(
+        pipeline,
+        "_cut_segment",
+        lambda _source, _start, _end, segdir: (
+            segdir.mkdir(parents=True, exist_ok=True),
+            (segdir / "source.mp4").write_bytes(b"segment"),
+        ),
+    )
+    monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
+    monkeypatch.setattr(
+        CodexRunner,
+        "run",
+        lambda self, workdir, prompt: _write_valid_package(
+            Path(workdir) / "work", frames=3
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_image_optimization_project",
+        lambda *_args, **_kwargs: (plan, prompts),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["_image_continuity"]["version"] == 3
+    frozen = stored["_image_optimization"]
+    assert frozen["version"] == 3
+    assert {
+        (item["segment_index"], item["frame_name"])
+        for item in frozen["frames"]
+    } == {
+        (segment_index, f"{frame_index:02d}.png")
+        for segment_index in (1, 2)
+        for frame_index in (1, 2, 3)
+    }
 
 
 def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
