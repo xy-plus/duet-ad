@@ -13,7 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
@@ -2257,6 +2257,10 @@ def create_app(settings: Settings) -> FastAPI:
                     settings, cid, codex_runner, claimed_owner=claimed_owner
                 )
 
+    def run_speaker_timing_gated(cid: str) -> None:
+        with pipeline_sem:
+            pipeline.produce_speaker_timing(settings, cid, codex_runner)
+
     @app.on_event("startup")
     async def recover_pipeline_inputs() -> None:
         for cid, owner in storage.claim_stale_input_reconciliations(
@@ -3303,7 +3307,10 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             except _SubmitError as exc:
                 if claim_owner:
-                    if exc.detail == "multimodal_plan_refresh_required":
+                    if exc.detail in {
+                        "multimodal_plan_refresh_required",
+                        "speaker_timing_refresh_required",
+                    }:
                         _finish_submission_claim(
                             settings,
                             cid,
@@ -3327,6 +3334,28 @@ def create_app(settings: Settings) -> FastAPI:
                         )
                     else:
                         _finish_submission_claim(settings, cid, claim_owner)
+                if exc.detail == "speaker_timing_refresh_required":
+                    latest = storage.load_meta(settings.data_dir, cid)
+                    state = (
+                        latest.get("_speaker_timing_producer")
+                        if isinstance(latest, dict) else None
+                    )
+                    if not isinstance(state, dict) or state.get("status") not in {
+                        "queued", "running", "done",
+                    }:
+                        storage.update_meta(
+                            settings.data_dir,
+                            cid,
+                            _speaker_timing_producer={
+                                "status": "queued", "error": None,
+                            },
+                        )
+                        background_tasks.add_task(run_speaker_timing_gated, cid)
+                    return JSONResponse(
+                        status_code=exc.status,
+                        content={"detail": exc.detail},
+                        background=background_tasks,
+                    )
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             except h3.H3Error as exc:
                 if claim_owner:

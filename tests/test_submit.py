@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
+import app.main as main_module
 from app import h3, pipeline, prepared_input, storage
 from app.main import (
     _freeze_submission,
@@ -307,6 +308,38 @@ def recovery_video_bytes(tmp_path_factory):
         )
         result[name] = path.read_bytes()
     return result
+
+
+def test_on_screen_refresh_schedules_real_background_producer(enabled, monkeypatch):
+    settings, client = enabled
+    cid, _ = _make_conv(settings, duration_s=4)
+    calls = []
+
+    def refresh_required(*_args, **_kwargs):
+        raise main_module._SubmitError(409, "speaker_timing_refresh_required")
+
+    monkeypatch.setattr(main_module, "_freeze_submission", refresh_required)
+    monkeypatch.setattr(
+        pipeline,
+        "produce_speaker_timing",
+        lambda received_settings, received_cid, _runner: calls.append(
+            (received_settings, received_cid)
+        ) or "done",
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH,
+        json=_payload(mode="custom", lines=[{
+            "text": "现在出发。", "start_s": 0.4, "end_s": 2.0,
+        }]),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "speaker_timing_refresh_required"}
+    assert calls == [(settings, cid)]
+    assert storage.load_meta(settings.data_dir, cid)[
+        "_speaker_timing_producer"
+    ]["status"] == "queued"
 
 
 def test_source_prompt_can_be_cas_edited_before_h3(enabled, monkeypatch):

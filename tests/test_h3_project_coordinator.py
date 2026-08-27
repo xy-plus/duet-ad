@@ -14,7 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import (
-    context_ir_bridge, h3, h3_multimodal, h3_project,
+    context_ir_bridge, dialogue_timing, h3, h3_multimodal, h3_project,
     long_generation, long_video,
     prepared_input, stitch, storage,
 )
@@ -774,6 +774,177 @@ def test_v2_on_screen_project_requires_timing_refresh(tmp_path):
             aspect_ratio="9:16",
             autodl_token="not-sent",
         )
+
+
+def test_speaker_visibility_raw_output_drift_is_rejected_before_h3(tmp_path):
+    root = tmp_path / "producer-drift"
+    work = root / "work"
+    source = root / "source.mp4"
+    key = work / "keyframes" / "01.png"
+    visual = work / "visual_prompt.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"producer-bound-source")
+    _png(key, 40)
+    visual.parent.mkdir(parents=True, exist_ok=True)
+    visual.write_text("人物面对镜头。", encoding="utf-8")
+    dialogue = prepared_input.prepare_dialogue(
+        "custom", 4,
+        supplied_lines=[{"text": "现在出发。", "start_s": 0.4, "end_s": 2.0}],
+    )
+    _multimodal_source(
+        work,
+        visual.read_text(encoding="utf-8"),
+        plan=_projection_plan(
+            visual.read_text(encoding="utf-8"),
+            speech=True,
+            dialogue_source_sha256=h3.canonical_json_sha256(list(dialogue)),
+        ),
+    )
+    producer_input = work / "speaker_visibility_input.json"
+    producer_output = work / "speaker_visibility_output.json"
+    frozen_skill = work / "speaker_visibility_skill.md"
+    sample_dir = work / "speaker-visibility-frames"
+    sample_dir.mkdir()
+    frame_bindings = []
+    frame_data = {}
+    for order in range(1, 33):
+        path = sample_dir / f"{order:06d}.png"
+        path.write_bytes(f"sample-{order}".encode())
+        relative = path.relative_to(work).as_posix()
+        frame_data[relative] = path.read_bytes()
+        frame_bindings.append({
+            "order": order,
+            "path": relative,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "pts": order - 1,
+            "cut_before": False,
+        })
+    sheet_dir = work / "speaker-visibility-contact-sheets"
+    sheet_dir.mkdir()
+    sheet_bindings = []
+    for sheet_order, start in enumerate((1, 17), 1):
+        sheet = sheet_dir / f"{sheet_order:06d}.png"
+        sheet.write_bytes(f"contact-sheet-{sheet_order}".encode())
+        frame_data[sheet.relative_to(work).as_posix()] = sheet.read_bytes()
+        sheet_bindings.append({
+            "order": sheet_order,
+            "path": sheet.relative_to(work).as_posix(),
+            "sha256": hashlib.sha256(sheet.read_bytes()).hexdigest(),
+            "frame_orders": list(range(start, start + 16)),
+        })
+    frame_data[key.relative_to(work).as_posix()] = key.read_bytes()
+    scenes = work / "scenes.json"
+    scenes.write_bytes(b"frozen-scenes")
+    frame_data["scenes.json"] = scenes.read_bytes()
+    input_value = {
+            "schema": "duet.speaker-visibility-input",
+            "version": 1,
+            "phase": "speaker_visibility",
+            "source": {
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "duration_pts": 32,
+                "time_base": {"numerator": 1, "denominator": 8},
+            },
+            "sampling": {
+                "algorithm": "decoded_pts_nearest_v1",
+                "cadence_fps": 8,
+                "max_unobserved_gap_pts": 1,
+                "endpoint_shrink_intervals": 1,
+            },
+            "decoded_frame_pts": list(range(32)),
+            "cut_pts": [],
+            "cut_source": {
+                "path": "scenes.json",
+                "sha256": hashlib.sha256(scenes.read_bytes()).hexdigest(),
+            },
+            "frames": frame_bindings,
+            "contact_sheets": sheet_bindings,
+            "persons": [{
+                "person_id": "PERSON_01",
+                "identity_refs": [{
+                    "path": key.relative_to(work).as_posix(),
+                    "sha256": hashlib.sha256(key.read_bytes()).hexdigest(),
+                }],
+            }],
+            "on_screen_subjects": ["S1"],
+    }
+    input_data = (
+        json.dumps(input_value, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")) + "\n"
+    ).encode()
+    producer_input.write_bytes(input_data)
+    output_value = {
+        "schema": "duet.speaker-visibility-output",
+        "version": 1,
+        "phase": "speaker_visibility",
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "subject_person_mapping": [{
+            "subject_id": "S1", "person_id": "PERSON_01",
+        }],
+        "frames": [{
+            "order": order,
+            "visible_person_ids": ["PERSON_01"],
+            "lip_verifiable_person_ids": ["PERSON_01"],
+        } for order in range(1, 33)],
+    }
+    output_data = (
+        json.dumps(output_value, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")) + "\n"
+    ).encode()
+    producer_output.write_bytes(output_data)
+    frozen_skill.write_bytes(b"frozen-video-maker-skill")
+    production = dialogue_timing.freeze_speaker_visibility(
+        producer_input_data=input_data,
+        skill_output_data=output_data,
+        source_data=source.read_bytes(),
+        frame_data=frame_data,
+        skill_data=frozen_skill.read_bytes(),
+    )
+    timing_path = work / h3_project.SPEAKER_TIMING_FILENAME
+    timing_path.write_bytes(
+        json.dumps(production.speaker_timing, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")).encode() + b"\n"
+    )
+    receipt = production.receipt
+    receipt_path = work / "speaker_timing_production.json"
+    receipt_path.write_bytes(
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")).encode() + b"\n"
+    )
+    manifest_path = work / h3_project.SOURCE_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["speaker_timing"] = {
+        "path": timing_path.name,
+        "sha256": hashlib.sha256(timing_path.read_bytes()).hexdigest(),
+    }
+    manifest["speaker_timing_producer"] = {
+        "path": receipt_path.name,
+        "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+    multimodal_input = work / h3_project.SKILL_INPUT_FILENAME
+    input_manifest = json.loads(multimodal_input.read_text(encoding="utf-8"))
+    input_manifest["speaker_timing"] = manifest["speaker_timing"]
+    multimodal_input.write_text(
+        json.dumps(input_manifest, ensure_ascii=False), encoding="utf-8"
+    )
+    manifest["multimodal_input"]["sha256"] = hashlib.sha256(
+        multimodal_input.read_bytes()
+    ).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert h3_project.freeze_optional(root, work) is not None
+    producer_output.write_text("{}", encoding="utf-8")
+    with pytest.raises(
+        h3_project.ProjectMultimodalError,
+        match="speaker_visibility_output_hash_mismatch",
+    ):
+        h3_project.freeze_optional(root, work)
+    assert not (work / "h3-native" / ".h3").exists()
 
 
 def test_short_query_unknown_with_missing_context_attempt_never_posts(
