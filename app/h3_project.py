@@ -22,10 +22,13 @@ SPEAKER_TIMING_FILENAME = "speaker_timing.json"
 FINAL_ACCEPTANCE_FILENAME = "dialogue-av-acceptance.json"
 SOURCE_SCHEMA = "duet.h3-multimodal-source"
 SOURCE_VERSION = 3
+LEGACY_SOURCE_VERSION = 2
 SKILL_INPUT_SCHEMA = "duet.h3-multimodal-input"
 SKILL_INPUT_VERSION = 2
+LEGACY_SKILL_INPUT_VERSION = 1
 RECEIPT_SCHEMA = "duet.h3-project-multimodal"
 RECEIPT_VERSION = 3
+LEGACY_RECEIPT_VERSION = 2
 AUDIO_ROUTE = {
     "schema": "duet.h3-project.audio-route",
     "version": 1,
@@ -57,6 +60,7 @@ class FrozenProjectMultimodal:
     manifest_path: Path
     manifest_data: bytes
     manifest_sha256: str
+    source_version: int
     mode: str
     skill_input_path: Path
     skill_input_data: bytes
@@ -67,10 +71,10 @@ class FrozenProjectMultimodal:
     skill_plan_data_sha256: str
     skill_plan: Mapping[str, Any]
     skill_plan_sha256: str
-    speaker_timing_path: Path
-    speaker_timing_data: bytes
-    speaker_timing_data_sha256: str
-    speaker_timing: Mapping[str, Any]
+    speaker_timing_path: Path | None
+    speaker_timing_data: bytes | None
+    speaker_timing_data_sha256: str | None
+    speaker_timing: Mapping[str, Any] | None
     reference_audios: h3.FrozenReferenceAudios
 
 
@@ -140,6 +144,39 @@ def _json_object(data: bytes, code: str) -> dict[str, Any]:
     return value
 
 
+def _plan_has_on_screen_dialogue(plan: Mapping[str, Any]) -> bool:
+    bindings = plan.get("speech_bindings")
+    if not isinstance(bindings, list):
+        _fail("skill_plan_shape_invalid")
+    return any(
+        isinstance(item, Mapping) and item.get("delivery") == "on_screen"
+        for item in bindings
+    )
+
+
+def _timing_binding(
+    *, root: Path, workdir: Path, manifest: Mapping[str, Any],
+) -> tuple[Path | None, bytes | None, str | None, Mapping[str, Any] | None]:
+    binding = manifest.get("speaker_timing")
+    if binding is None:
+        return None, None, None, None
+    if not isinstance(binding, dict) or set(binding) != {"path", "sha256"}:
+        _fail("speaker_timing_binding_invalid")
+    path = _inside(
+        root, workdir, binding.get("path"), "speaker_timing_binding_invalid"
+    )
+    data = _read(path, "speaker_timing_binding_invalid")
+    digest = _sha256(data)
+    if path.name != SPEAKER_TIMING_FILENAME or digest != binding.get("sha256"):
+        _fail("speaker_timing_binding_invalid")
+    return (
+        path,
+        data,
+        digest,
+        _json_object(data, "speaker_timing_binding_invalid"),
+    )
+
+
 def refresh_skill_input(
     *,
     root: Path,
@@ -164,31 +201,31 @@ def refresh_skill_input(
         "multimodal_source_invalid",
     )
     if (
-        manifest.get("schema") == SOURCE_SCHEMA
-        and manifest.get("version") != SOURCE_VERSION
-    ):
-        _fail("speaker_timing_refresh_required")
-    if (
         manifest.get("schema") != SOURCE_SCHEMA
-        or manifest.get("version") != SOURCE_VERSION
+        or manifest.get("version") not in {
+            LEGACY_SOURCE_VERSION, SOURCE_VERSION,
+        }
         or manifest.get("mode") != "multimodal"
     ):
         _fail("multimodal_source_invalid")
-    timing_binding = manifest.get("speaker_timing")
-    if not isinstance(timing_binding, dict) or set(timing_binding) != {
-        "path", "sha256"
-    }:
-        _fail("speaker_timing_binding_invalid")
-    timing_path = _inside(
-        root, workdir, timing_binding.get("path"),
-        "speaker_timing_binding_invalid",
+    plan_binding = manifest.get("skill_plan")
+    if not isinstance(plan_binding, dict) or set(plan_binding) != {"path", "sha256"}:
+        _fail("skill_plan_binding_invalid")
+    plan_path = _inside(
+        root, workdir, plan_binding.get("path"), "skill_plan_binding_invalid"
     )
-    timing_data = _read(timing_path, "speaker_timing_binding_invalid")
-    if (
-        timing_path.name != SPEAKER_TIMING_FILENAME
-        or _sha256(timing_data) != timing_binding.get("sha256")
-    ):
-        _fail("speaker_timing_binding_invalid")
+    plan_data = _read(plan_path, "skill_plan_binding_invalid")
+    if _sha256(plan_data) != plan_binding.get("sha256"):
+        _fail("skill_plan_hash_mismatch")
+    plan = _json_object(plan_data, "skill_plan_invalid")
+    on_screen_required = _plan_has_on_screen_dialogue(plan)
+    if on_screen_required and manifest.get("version") == LEGACY_SOURCE_VERSION:
+        _fail("speaker_timing_refresh_required")
+    timing_binding = manifest.get("speaker_timing")
+    if on_screen_required and timing_binding is None:
+        _fail("speaker_timing_refresh_required")
+    if timing_binding is not None:
+        _timing_binding(root=root, workdir=workdir, manifest=manifest)
     raw_audios = manifest.get("reference_audios")
     if not isinstance(raw_audios, list) or not 1 <= len(raw_audios) <= 3:
         _fail("reference_audio_binding_invalid")
@@ -221,7 +258,11 @@ def refresh_skill_input(
     visual_data = _read(visual_prompt_path.resolve(), "multimodal_input_invalid")
     desired = {
         "schema": SKILL_INPUT_SCHEMA,
-        "version": SKILL_INPUT_VERSION,
+        "version": (
+            SKILL_INPUT_VERSION
+            if manifest.get("version") == SOURCE_VERSION
+            else LEGACY_SKILL_INPUT_VERSION
+        ),
         "visual_prompt": {
             "path": visual_relative,
             "sha256": _sha256(visual_data),
@@ -232,8 +273,9 @@ def refresh_skill_input(
         ],
         "dialogue_source_sha256": dialogue_source_sha256,
         "reference_audios": raw_audios,
-        "speaker_timing": timing_binding,
     }
+    if timing_binding is not None:
+        desired["speaker_timing"] = timing_binding
     input_path = workdir / SKILL_INPUT_FILENAME
     if input_path.is_file():
         try:
@@ -253,11 +295,18 @@ def refresh_skill_input(
     return True
 
 
-def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None:
+def freeze_optional(
+    root: Path,
+    workdir: Path,
+    *,
+    allow_legacy_on_screen_read: bool = False,
+) -> FrozenProjectMultimodal | None:
     """Freeze an opt-in project source; partial intent fails closed.
 
     Absence of both source manifest and Skill output is the unchanged legacy
-    path.  Presence of either makes the multimodal contract mandatory.
+    path.  Presence of either makes the multimodal contract mandatory.  The
+    legacy exception only reloads an already-bound v2 receipt; request
+    construction still requires refresh before any new on-screen paid work.
     """
     root = Path(root).resolve()
     workdir = Path(workdir).resolve()
@@ -276,12 +325,8 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
         _fail("multimodal_source_missing")
     manifest_data = _read(manifest_path, "multimodal_source_invalid")
     manifest = _json_object(manifest_data, "multimodal_source_invalid")
-    if (
-        manifest.get("schema") == SOURCE_SCHEMA
-        and manifest.get("version") != SOURCE_VERSION
-    ):
-        _fail("speaker_timing_refresh_required")
-    if set(manifest) != {
+    source_version = manifest.get("version")
+    base_manifest_keys = {
         "schema",
         "version",
         "mode",
@@ -289,10 +334,20 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
         "multimodal_input",
         "skill_plan",
         "reference_audios",
-        "speaker_timing",
-    }:
-        if "speaker_timing" not in manifest:
-            _fail("speaker_timing_refresh_required")
+    }
+    if (
+        manifest.get("schema") != SOURCE_SCHEMA
+        or source_version not in {LEGACY_SOURCE_VERSION, SOURCE_VERSION}
+        or manifest.get("mode") != "multimodal"
+        or set(manifest) not in {
+            frozenset(base_manifest_keys),
+            frozenset(base_manifest_keys | {"speaker_timing"}),
+        }
+        or (
+            source_version == LEGACY_SOURCE_VERSION
+            and "speaker_timing" in manifest
+        )
+    ):
         _fail("multimodal_source_invalid")
 
     input_binding = manifest.get("multimodal_input")
@@ -313,30 +368,31 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
     if input_binding.get("sha256") != skill_input_sha256:
         _fail("multimodal_input_hash_mismatch")
     skill_input = _json_object(skill_input_data, "multimodal_input_invalid")
-    if (
-        skill_input.get("schema") == SKILL_INPUT_SCHEMA
-        and skill_input.get("version") != SKILL_INPUT_VERSION
-    ):
-        _fail("speaker_timing_refresh_required")
-    if set(skill_input) != {
+    expected_input_version = (
+        SKILL_INPUT_VERSION
+        if source_version == SOURCE_VERSION
+        else LEGACY_SKILL_INPUT_VERSION
+    )
+    base_input_keys = {
         "schema",
         "version",
         "visual_prompt",
         "keyframes",
         "dialogue_source_sha256",
         "reference_audios",
-        "speaker_timing",
+    }
+    if set(skill_input) not in {
+        frozenset(base_input_keys),
+        frozenset(base_input_keys | {"speaker_timing"}),
     } or (
         skill_input.get("schema") != SKILL_INPUT_SCHEMA
-        or skill_input.get("version") != SKILL_INPUT_VERSION
+        or skill_input.get("version") != expected_input_version
+        or (
+            expected_input_version == LEGACY_SKILL_INPUT_VERSION
+            and "speaker_timing" in skill_input
+        )
     ):
         _fail("multimodal_input_invalid")
-    if (
-        manifest.get("schema") != SOURCE_SCHEMA
-        or manifest.get("version") != SOURCE_VERSION
-        or manifest.get("mode") != "multimodal"
-    ):
-        _fail("multimodal_source_invalid")
 
     plan_binding = manifest.get("skill_plan")
     if not isinstance(plan_binding, dict) or set(plan_binding) != {"path", "sha256"}:
@@ -361,26 +417,31 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
         _fail("multimodal_input_dialogue_mismatch")
 
     timing_binding = manifest.get("speaker_timing")
+    on_screen_required = _plan_has_on_screen_dialogue(skill_plan)
     if (
-        not isinstance(timing_binding, dict)
-        or set(timing_binding) != {"path", "sha256"}
-        or skill_input.get("speaker_timing") != timing_binding
+        on_screen_required
+        and source_version == LEGACY_SOURCE_VERSION
+        and not allow_legacy_on_screen_read
     ):
+        _fail("speaker_timing_refresh_required")
+    if (
+        on_screen_required
+        and timing_binding is None
+        and not (
+            source_version == LEGACY_SOURCE_VERSION
+            and allow_legacy_on_screen_read
+        )
+    ):
+        _fail("speaker_timing_refresh_required")
+    if skill_input.get("speaker_timing") != timing_binding:
         _fail("speaker_timing_binding_invalid")
-    speaker_timing_path = _inside(
-        root, workdir, timing_binding.get("path"),
-        "speaker_timing_binding_invalid",
-    )
-    if speaker_timing_path.name != SPEAKER_TIMING_FILENAME:
-        _fail("speaker_timing_binding_invalid")
-    speaker_timing_data = _read(
-        speaker_timing_path, "speaker_timing_binding_invalid"
-    )
-    speaker_timing_data_sha256 = _sha256(speaker_timing_data)
-    if timing_binding.get("sha256") != speaker_timing_data_sha256:
-        _fail("speaker_timing_binding_invalid")
-    speaker_timing = _json_object(
-        speaker_timing_data, "speaker_timing_binding_invalid"
+    (
+        speaker_timing_path,
+        speaker_timing_data,
+        speaker_timing_data_sha256,
+        speaker_timing,
+    ) = _timing_binding(
+        root=root, workdir=workdir, manifest=manifest
     )
 
     visual_binding = skill_input.get("visual_prompt")
@@ -451,6 +512,7 @@ def freeze_optional(root: Path, workdir: Path) -> FrozenProjectMultimodal | None
         manifest_path=manifest_path,
         manifest_data=manifest_data,
         manifest_sha256=_sha256(manifest_data),
+        source_version=int(source_version),
         mode=manifest["mode"],
         skill_input_path=skill_input_path,
         skill_input_data=skill_input_data,
@@ -483,9 +545,13 @@ def receipt_binding(
     root = Path(root).resolve()
     if not isinstance(frozen, FrozenProjectMultimodal) or frozen.root != root:
         _fail("multimodal_receipt_invalid")
-    return {
+    binding = {
         "schema": RECEIPT_SCHEMA,
-        "version": RECEIPT_VERSION,
+        "version": (
+            RECEIPT_VERSION
+            if frozen.source_version == SOURCE_VERSION
+            else LEGACY_RECEIPT_VERSION
+        ),
         "mode": frozen.mode,
         "manifest": {
             "path": _relative(root, frozen.manifest_path),
@@ -500,13 +566,6 @@ def receipt_binding(
             "sha256": frozen.skill_plan_data_sha256,
             "canonical_sha256": frozen.skill_plan_sha256,
         },
-        "speaker_timing": {
-            "path": _relative(root, frozen.speaker_timing_path),
-            "sha256": frozen.speaker_timing_data_sha256,
-            "canonical_sha256": dialogue_timing.canonical_sha256(
-                frozen.speaker_timing
-            ),
-        },
         "reference_audios": [
             {
                 "order": audio.order,
@@ -520,15 +579,39 @@ def receipt_binding(
             for audio in frozen.reference_audios
         ],
     }
+    if frozen.speaker_timing_path is not None:
+        binding["speaker_timing"] = {
+            "path": _relative(root, frozen.speaker_timing_path),
+            "sha256": frozen.speaker_timing_data_sha256,
+            "canonical_sha256": dialogue_timing.canonical_sha256(
+                frozen.speaker_timing
+            ),
+        }
+    return binding
 
 
 def load_bound(root: Path, binding: object) -> FrozenProjectMultimodal:
     """Reload exact bound files and reject any path, bytes, hash, or order drift."""
     root = Path(root).resolve()
-    if not isinstance(binding, dict) or set(binding) != {
+    base_keys = {
         "schema", "version", "mode", "manifest", "multimodal_input",
-        "skill_plan", "speaker_timing", "reference_audios"
-    }:
+        "skill_plan", "reference_audios"
+    }
+    if (
+        not isinstance(binding, dict)
+        or binding.get("schema") != RECEIPT_SCHEMA
+        or binding.get("version") not in {
+            LEGACY_RECEIPT_VERSION, RECEIPT_VERSION,
+        }
+        or set(binding) not in {
+            frozenset(base_keys),
+            frozenset(base_keys | {"speaker_timing"}),
+        }
+        or (
+            binding.get("version") == LEGACY_RECEIPT_VERSION
+            and "speaker_timing" in binding
+        )
+    ):
         _fail("multimodal_receipt_invalid")
     manifest = binding.get("manifest")
     if not isinstance(manifest, dict) or set(manifest) != {"path", "sha256"}:
@@ -543,7 +626,11 @@ def load_bound(root: Path, binding: object) -> FrozenProjectMultimodal:
         _fail("multimodal_receipt_invalid")
     if manifest_path.name != SOURCE_FILENAME:
         _fail("multimodal_receipt_invalid")
-    frozen = freeze_optional(root, manifest_path.parent)
+    frozen = freeze_optional(
+        root,
+        manifest_path.parent,
+        allow_legacy_on_screen_read=True,
+    )
     if frozen is None or receipt_binding(root, frozen) != binding:
         _fail("multimodal_receipt_mismatch")
     return frozen
@@ -590,6 +677,7 @@ def build_request(
         upstream_dialogue=frozen.dialogue,
         upstream_dialogue_receipt_sha256=frozen.dialogue_sha256,
         source_sha256=frozen.source.sha256,
+        source_duration_s=frozen.duration_s,
         cid=cid,
         workdir=workdir,
         client_request_id=client_request_id,
@@ -611,6 +699,7 @@ def build_request_from_parts(
     upstream_dialogue: tuple[dict, ...],
     upstream_dialogue_receipt_sha256: str,
     source_sha256: str,
+    source_duration_s: float,
     cid: str,
     workdir: Path,
     client_request_id: str,
@@ -656,16 +745,21 @@ def build_request_from_parts(
         prompt=visual_prompt,
         keyframes=keyframes,
     )
-    try:
-        speaker_timing = dialogue_timing.freeze_speaker_timing(
-            multimodal.speaker_timing,
-            source_sha256=source_sha256,
-            keyframe_sha256s=tuple(
-                _sha256(data) for _path, data in keyframes
-            ),
-        )
-    except dialogue_timing.DialogueTimingError as exc:
-        raise ProjectMultimodalError(exc.code) from None
+    speaker_timing = None
+    if _plan_has_on_screen_dialogue(multimodal.skill_plan):
+        if multimodal.speaker_timing is None:
+            _fail("speaker_timing_refresh_required")
+        try:
+            speaker_timing = dialogue_timing.freeze_speaker_timing(
+                multimodal.speaker_timing,
+                source_sha256=source_sha256,
+                keyframe_sha256s=tuple(
+                    _sha256(data) for _path, data in keyframes
+                ),
+                source_duration_s=source_duration_s,
+            )
+        except dialogue_timing.DialogueTimingError as exc:
+            raise ProjectMultimodalError(exc.code) from None
     try:
         request = request_factory(
             skill_plan=multimodal.skill_plan,
@@ -695,6 +789,23 @@ def build_request_from_parts(
         raise ProjectMultimodalError(exc.code) from None
     if not isinstance(request, h3.H3Request) or not h3.is_multimodal_request(request):
         _fail("context_ir_request_invalid")
+    try:
+        h3_multimodal.validate_h3_request_authority(
+            request,
+            skill_plan=multimodal.skill_plan,
+            approved_skill_plan_sha256=multimodal.skill_plan_sha256,
+            upstream_dialogue=upstream_dialogue,
+            upstream_dialogue_receipt_sha256=(
+                upstream_dialogue_receipt_sha256
+            ),
+            visual=visual,
+            reference_audios=multimodal.reference_audios,
+            speaker_timing=speaker_timing,
+        )
+    except (h3.H3Error, h3_multimodal.MultimodalContractError) as exc:
+        raise ProjectMultimodalError(
+            getattr(exc, "code", "context_ir_request_authority_mismatch")
+        ) from None
     return request
 
 
@@ -904,18 +1015,12 @@ def _native_segment(
     output = request.workdir / "generated.mp4"
     if not output.is_file():
         _fail("h3_native_output_missing")
-    acceptance_sha256 = validate_dialogue_acceptance(
-        request=request,
-        output=output,
-        timeline=timeline,
-    )
     return stitch.StitchSegment(
         output,
         target_duration_s,
         "hard_cut",
         attempt_id,
         timeline,
-        acceptance_sha256,
     )
 
 

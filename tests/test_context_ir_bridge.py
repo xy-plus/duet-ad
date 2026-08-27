@@ -105,6 +105,7 @@ def _source_request(tmp_path: Path) -> tuple[h3.H3Request, dict]:
         speaker_timing=dialogue_timing.FrozenSpeakerTiming(
             sha256="c" * 64,
             source_sha256="a" * 64,
+            duration=Fraction(8),
             windows={
                 "S1": (
                     dialogue_timing.FrozenLipWindow(

@@ -106,9 +106,7 @@ def _generation_uses_h3_native_audio(plan: FrozenPlan, generation: Mapping) -> b
 
 def _stitch_segments(
     plan: FrozenPlan,
-    provider_media: Mapping[
-        int, tuple[str, Mapping[str, object], str | None]
-    ] | None = None,
+    provider_media: Mapping[int, tuple[str, Mapping[str, object]]] | None = None,
 ) -> list[stitch.StitchSegment]:
     media = provider_media or {}
     return [
@@ -116,9 +114,8 @@ def _stitch_segments(
             item.workdir / "generated.mp4",
             _segment_duration_s(plan, item),
             item.join_mode,
-            media.get(item.index, (None, None, None))[0],
-            media.get(item.index, (None, None, None))[1],
-            media.get(item.index, (None, None, None))[2],
+            media.get(item.index, (None, None))[0],
+            media.get(item.index, (None, None))[1],
         )
         for item in plan.segments
     ]
@@ -694,6 +691,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                     upstream_dialogue=tuple(dict(line) for line in dialogue),
                     upstream_dialogue_receipt_sha256=dialogue_binding["sha256"],
                     source_sha256=_digest(segdir / "source.mp4"),
+                    source_duration_s=end_s - start_s,
                     cid=f"freeze-segment-{index}",
                     workdir=segdir / "work" / "h3-native",
                     client_request_id=f"freeze-segment-{index}",
@@ -779,6 +777,7 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
                     segment.dialogue_sha256 or ""
                 ),
                 source_sha256=_digest(segment.workdir / "source.mp4"),
+                source_duration_s=segment.end_s - segment.start_s,
                 cid=f"{cid}-segment-{segment.index}",
                 workdir=segment.workdir,
                 client_request_id=(
@@ -1206,7 +1205,7 @@ def bound_h3_native_media(
     cid: str,
     plan: FrozenPlan,
     generation: Mapping,
-) -> dict[int, tuple[str, Mapping[str, object], str | None]]:
+) -> dict[int, tuple[str, Mapping[str, object]]]:
     """Bind every segment to its persisted exact successful H3 attempt."""
     if not _generation_uses_h3_native_audio(plan, generation):
         raise LongGenerationError("long_video_audio_route_invalid")
@@ -1226,7 +1225,7 @@ def bound_h3_native_media(
         for item in generation.get("segments", [])
         if isinstance(item, Mapping)
     }
-    result: dict[int, tuple[str, Mapping[str, object], str | None]] = {}
+    result: dict[int, tuple[str, Mapping[str, object]]] = {}
     for segment in plan.segments:
         state = states.get(segment.index)
         if not isinstance(state, Mapping) or state.get("status") != "succeeded":
@@ -1259,15 +1258,7 @@ def bound_h3_native_media(
             raise LongGenerationError("long_video_h3_native_audio_invalid") from None
         if not isinstance(timeline.get("audio"), Mapping):
             raise LongGenerationError("long_video_h3_native_audio_invalid")
-        try:
-            acceptance_sha256 = h3_project.validate_dialogue_acceptance(
-                request=request,
-                output=segment.workdir / "generated.mp4",
-                timeline=timeline,
-            )
-        except h3_project.ProjectMultimodalError as exc:
-            raise LongGenerationError(exc.code) from None
-        result[segment.index] = (attempt_id, timeline, acceptance_sha256)
+        result[segment.index] = (attempt_id, timeline)
     return result
 
 
@@ -1369,9 +1360,7 @@ def stitched_output_is_reusable(
     dialogue_mode: str,
     *,
     generation: Mapping | None = None,
-    provider_media: Mapping[
-        int, tuple[str, Mapping[str, object], str | None]
-    ] | None = None,
+    provider_media: Mapping[int, tuple[str, Mapping[str, object]]] | None = None,
 ) -> bool:
     """Validate the published video against the exact local stitch receipt."""
     if dialogue_mode not in {"auto", "none"}:

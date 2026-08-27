@@ -241,6 +241,7 @@ class H3Request:
     upstream_dialogue_receipt_sha256: str | None = None
     speaker_timing_sha256: str | None = None
     on_screen_dialogue: tuple[Mapping[str, Any], ...] = ()
+    on_screen_dialogue_sha256: str | None = None
     audio_required: bool = False
     context_ir_receipt_path: Path | None = None
     context_ir_receipt_sha256: str | None = None
@@ -353,6 +354,7 @@ def _validate_request_audio_contract(
             or request.upstream_dialogue_receipt_sha256 is not None
             or request.speaker_timing_sha256 is not None
             or request.on_screen_dialogue
+            or request.on_screen_dialogue_sha256 is not None
             or request.audio_required is not False
             or request.context_ir_receipt_path is not None
             or request.context_ir_receipt_sha256 is not None
@@ -425,11 +427,28 @@ def _validate_request_audio_contract(
             "end_s": end_s,
         })
     object.__setattr__(request, "on_screen_dialogue", tuple(normalized_dialogue))
+    dialogue_sha256 = (
+        canonical_json_sha256(normalized_dialogue)
+        if normalized_dialogue
+        else None
+    )
+    if request.on_screen_dialogue_sha256 != dialogue_sha256:
+        raise ReceiptError("on_screen_dialogue_receipt_mismatch")
     if (
         not isinstance(request.multimodal_compiler_version, str)
         or not request.multimodal_compiler_version.strip()
     ):
         raise H3Error("invalid_multimodal_compiler")
+
+
+def validate_request_authority(request: H3Request) -> None:
+    """Revalidate nested multimodal authority at every paid/read boundary."""
+    if not isinstance(request, H3Request):
+        raise H3Error("invalid_request")
+    _validate_request_audio_contract(
+        request,
+        is_multimodal=_workflow(request) in H3_MULTIMODAL_WORKFLOWS,
+    )
 
 
 def _context_ir_reference_receipt(request: H3Request) -> str:
@@ -500,9 +519,7 @@ def _context_ir_source_request_receipt(
         "skill_plan_sha256": request.skill_plan_sha256,
         "multimodal_compiler_version": request.multimodal_compiler_version,
         "speaker_timing_sha256": request.speaker_timing_sha256,
-        "on_screen_dialogue_sha256": canonical_json_sha256(
-            list(request.on_screen_dialogue)
-        ),
+        "on_screen_dialogue_sha256": request.on_screen_dialogue_sha256,
         "audio_required": request.audio_required,
         "reference_audio_metadata": [
             {
@@ -519,6 +536,7 @@ def _context_ir_source_request_receipt(
 
 def _require_context_ir_receipt(request: H3Request) -> None:
     """Reject raw multimodal requests at every H3 provider boundary."""
+    validate_request_authority(request)
     if not is_multimodal_request(request):
         return
     path = request.context_ir_receipt_path
@@ -1488,6 +1506,9 @@ def _input_manifest(
                 "compiler_version": request.multimodal_compiler_version,
                 "speaker_timing_sha256": request.speaker_timing_sha256,
                 "on_screen_dialogue": list(request.on_screen_dialogue),
+                "on_screen_dialogue_sha256": (
+                    request.on_screen_dialogue_sha256
+                ),
                 "audio_required": request.audio_required,
                 "reference_audio_semantics": "conditioning_only",
                 "reference_audios": _reference_audio_manifest(request),

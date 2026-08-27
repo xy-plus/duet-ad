@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import dialogue_timing, h3, h3_project, stitch
+from app import dialogue_timing, h3, h3_project
 
 
 def _sha(value: object) -> str:
@@ -21,10 +21,11 @@ def _sha(value: object) -> str:
 def _speaker_timing(*, start_pts: int = 750, end_pts: int = 4000) -> dict:
     timeline = {
         "time_base": {"numerator": 1, "denominator": 1000},
+        "duration_pts": 4000,
         "keyframes": [
             {"order": 1, "sha256": "1" * 64, "pts": 0},
             {"order": 2, "sha256": "2" * 64, "pts": 750},
-            {"order": 3, "sha256": "3" * 64, "pts": 4000},
+            {"order": 3, "sha256": "3" * 64, "pts": 3999},
         ],
     }
     return {
@@ -55,6 +56,7 @@ def test_authoritative_dialogue_must_be_inside_verified_lip_window():
         _speaker_timing(),
         source_sha256="a" * 64,
         keyframe_sha256s=("1" * 64, "2" * 64, "3" * 64),
+        source_duration_s=4.0,
     )
 
     dialogue_timing.require_authoritative_window(
@@ -98,6 +100,34 @@ def test_speaker_timing_never_accepts_unbound_or_inferred_evidence(mutation, cod
             artifact,
             source_sha256="a" * 64,
             keyframe_sha256s=("1" * 64, "2" * 64, "3" * 64),
+            source_duration_s=4.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value["timeline"].update(duration_pts=3999),
+        lambda value: value["speakers"][0]["windows"][0].update(end_pts=4001),
+        lambda value: value["timeline"]["keyframes"][-1].update(pts=4001),
+    ],
+)
+def test_speaker_timing_binds_source_duration_and_rejects_out_of_range_pts(
+    mutation,
+):
+    artifact = _speaker_timing()
+    mutation(artifact)
+    artifact["timeline_sha256"] = _sha(artifact["timeline"])
+
+    with pytest.raises(
+        dialogue_timing.DialogueTimingError,
+        match="speaker_timing_duration_mismatch|speaker_timing_pts_out_of_range",
+    ):
+        dialogue_timing.freeze_speaker_timing(
+            artifact,
+            source_sha256="a" * 64,
+            keyframe_sha256s=("1" * 64, "2" * 64, "3" * 64),
+            source_duration_s=4.0,
         )
 
 
@@ -227,7 +257,7 @@ def test_final_acceptance_rejects_missing_lines_extra_speech_and_unverified_lips
             )
 
 
-def test_h3_project_native_gate_requires_and_binds_exact_acceptance_file(tmp_path):
+def test_prepared_only_final_acceptance_validator_binds_exact_file(tmp_path):
     output = tmp_path / "generated.mp4"
     output.write_bytes(b"exact-h3-output")
     timeline = {
@@ -267,17 +297,6 @@ def test_h3_project_native_gate_requires_and_binds_exact_acceptance_file(tmp_pat
         timeline=timeline,
     )
     assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
-    segment = stitch.StitchSegment(
-        output,
-        4.0,
-        "hard_cut",
-        "000001",
-        timeline,
-        digest,
-    )
-    assert stitch._provider_binding(segment, 1)[
-        "dialogue_acceptance_sha256"
-    ] == digest
 
     path.unlink()
     with pytest.raises(
@@ -289,3 +308,38 @@ def test_h3_project_native_gate_requires_and_binds_exact_acceptance_file(tmp_pat
             output=output,
             timeline=timeline,
         )
+
+
+def test_production_native_segment_does_not_require_unproduced_acceptance(
+    tmp_path, monkeypatch,
+):
+    output = tmp_path / "generated.mp4"
+    output.write_bytes(b"exact-h3-output")
+    timeline = {
+        "schema": "duet.h3.media_timeline",
+        "version": 1,
+        "decode_complete": True,
+        "video": {"frame_end_s": 4.0},
+        "audio": {"frame_end_s": 4.0, "decoded_sha256": "6" * 64},
+        "av_delta_s": {"start": 0.0, "end": 0.0},
+        "container": {"duration_s": 4.0},
+    }
+    request = SimpleNamespace(
+        workdir=tmp_path,
+        on_screen_dialogue=({"text": "必须不依赖假验收。"},),
+    )
+    monkeypatch.setattr(
+        h3,
+        "load_media_timeline_receipt",
+        lambda *_args, **_kwargs: timeline,
+    )
+
+    segment = h3_project._native_segment(
+        request=request,
+        attempt_id="000001",
+        target_duration_s=4.0,
+    )
+
+    assert segment.provider_attempt_id == "000001"
+    assert segment.provider_media_timeline == timeline
+    assert not hasattr(segment, "dialogue_acceptance_sha256")

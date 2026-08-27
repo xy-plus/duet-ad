@@ -104,6 +104,7 @@ def _dialogue_args(*texts: str) -> dict:
         "speaker_timing": dialogue_timing.FrozenSpeakerTiming(
             sha256="c" * 64,
             source_sha256="a" * 64,
+            duration=Fraction(8),
             windows={
                 "S1": (
                     dialogue_timing.FrozenLipWindow(
@@ -230,6 +231,7 @@ def test_on_screen_dialogue_cannot_start_before_verified_lip_window(tmp_path):
     args["speaker_timing"] = dialogue_timing.FrozenSpeakerTiming(
         sha256="c" * 64,
         source_sha256="a" * 64,
+        duration=Fraction(8),
         windows={
             "S1": (
                 dialogue_timing.FrozenLipWindow(
@@ -260,6 +262,75 @@ def test_on_screen_dialogue_cannot_start_before_verified_lip_window(tmp_path):
         )
 
     assert not (tmp_path / "early-dialogue" / ".h3").exists()
+
+
+def test_h3_paid_and_read_boundaries_revalidate_on_screen_dialogue_digest(
+    tmp_path,
+):
+    request = _request(tmp_path)
+    request.on_screen_dialogue[0]["start_s"] = 0.5
+
+    with pytest.raises(
+        h3.ReceiptError,
+        match="on_screen_dialogue_receipt_mismatch",
+    ):
+        h3.inspect(request)
+
+    assert not (request.workdir / ".h3").exists()
+
+
+def test_factory_authority_validator_rechecks_window_not_only_timing_hash(
+    tmp_path,
+):
+    visual = _visual(tmp_path)
+    plan = _plan(visual.prompt)
+    dialogue_args = _dialogue_args("我会准时回来。")
+    audios = _audios(tmp_path)
+    request = h3_multimodal.build_h3_request(
+        skill_plan=plan,
+        approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+        **dialogue_args,
+        visual=visual,
+        reference_audios=audios,
+        mode="multimodal",
+        cid="factory-ignored-window",
+        workdir=tmp_path / "factory-ignored-window",
+        client_request_id="factory-ignored-window",
+        duration=8,
+        resolution="768p",
+        aspect_ratio="9:16",
+        autodl_token="token",
+    )
+    restrictive = dialogue_timing.FrozenSpeakerTiming(
+        sha256="d" * 64,
+        source_sha256="a" * 64,
+        duration=Fraction(8),
+        windows={
+            "S1": (
+                dialogue_timing.FrozenLipWindow(
+                    Fraction("0.75"), Fraction(8)
+                ),
+            )
+        },
+    )
+    forged = replace(request, speaker_timing_sha256=restrictive.sha256)
+
+    with pytest.raises(
+        h3_multimodal.MultimodalContractError,
+        match="dialogue_before_speaker_lip_window",
+    ):
+        h3_multimodal.validate_h3_request_authority(
+            forged,
+            skill_plan=plan,
+            approved_skill_plan_sha256=h3.canonical_json_sha256(plan),
+            upstream_dialogue=dialogue_args["upstream_dialogue"],
+            upstream_dialogue_receipt_sha256=(
+                dialogue_args["upstream_dialogue_receipt_sha256"]
+            ),
+            visual=visual,
+            reference_audios=audios,
+            speaker_timing=restrictive,
+        )
 
 
 def test_on_screen_speaker_requires_subject_voice_reference(tmp_path):

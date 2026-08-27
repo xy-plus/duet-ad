@@ -101,6 +101,7 @@ class FrozenLipWindow:
 class FrozenSpeakerTiming:
     sha256: str
     source_sha256: str
+    duration: Fraction
     windows: Mapping[str, tuple[FrozenLipWindow, ...]]
 
 
@@ -114,6 +115,7 @@ def freeze_speaker_timing(
     *,
     source_sha256: str,
     keyframe_sha256s: Sequence[str],
+    source_duration_s: float,
 ) -> FrozenSpeakerTiming:
     """Validate an authoritative source/keyframe/PTS-bound speaker artifact."""
     raw = _object(
@@ -129,10 +131,18 @@ def freeze_speaker_timing(
     if not _is_sha256(source_sha256) or raw["source_sha256"] != source_sha256:
         _fail("speaker_timing_source_mismatch")
     timeline = _object(
-        raw["timeline"], {"time_base", "keyframes"},
+        raw["timeline"], {"time_base", "duration_pts", "keyframes"},
         "speaker_timing_timeline_mismatch",
     )
     base = _time_base(timeline["time_base"], "speaker_timing_timeline_mismatch")
+    duration_pts = _pts(
+        timeline["duration_pts"], "speaker_timing_timeline_mismatch"
+    )
+    duration = _second(
+        source_duration_s, "speaker_timing_duration_mismatch"
+    )
+    if duration_pts < 1 or duration_pts * base != duration:
+        _fail("speaker_timing_duration_mismatch")
     keyframes = timeline["keyframes"]
     expected_hashes = tuple(keyframe_sha256s)
     if (
@@ -157,8 +167,9 @@ def freeze_speaker_timing(
             bound["order"] != order
             or bound["sha256"] != expected_hash
             or pts <= previous_pts
+            or pts >= duration_pts
         ):
-            _fail("speaker_timing_timeline_mismatch")
+            _fail("speaker_timing_pts_out_of_range")
         keyframe_pts[order] = pts
         previous_pts = pts
 
@@ -198,6 +209,7 @@ def freeze_speaker_timing(
             evidence = bound["evidence_keyframes"]
             if (
                 start_pts >= end_pts
+                or end_pts > duration_pts
                 or not isinstance(evidence, list)
                 or not evidence
                 or any(
@@ -209,7 +221,7 @@ def freeze_speaker_timing(
                 )
                 or evidence != sorted(set(evidence))
             ):
-                _fail("speaker_timing_artifact_invalid")
+                _fail("speaker_timing_pts_out_of_range")
             start, end = start_pts * base, end_pts * base
             if start < previous_end:
                 _fail("speaker_timing_artifact_invalid")
@@ -217,7 +229,7 @@ def freeze_speaker_timing(
             previous_end = end
         frozen[subject_id] = tuple(values)
     return FrozenSpeakerTiming(
-        canonical_sha256(raw), str(source_sha256), frozen
+        canonical_sha256(raw), str(source_sha256), duration, frozen
     )
 
 

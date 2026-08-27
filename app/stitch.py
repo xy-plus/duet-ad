@@ -42,7 +42,6 @@ class StitchSegment:
     join_mode: JoinMode
     provider_attempt_id: str | None = None
     provider_media_timeline: Mapping[str, object] | None = None
-    dialogue_acceptance_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -174,24 +173,12 @@ def _provider_binding(segment: StitchSegment, index: int) -> dict[str, object]:
         raise ValueError(
             f"segment {index} requires exact H3 native-audio evidence"
         )
-    binding = {
+    return {
         "source": "h3",
         "attempt_id": attempt_id,
         "media_timeline_sha256": _canonical_sha256(timeline),
         "decoded_audio_sha256": timeline["audio"].get("decoded_sha256"),
     }
-    if segment.dialogue_acceptance_sha256 is not None:
-        digest = segment.dialogue_acceptance_sha256
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
-            raise ValueError(
-                f"segment {index} dialogue acceptance evidence is invalid"
-            )
-        binding["dialogue_acceptance_sha256"] = digest
-    return binding
 
 
 def _validate_request(
@@ -233,7 +220,6 @@ def _validate_request(
         elif (
             segment.provider_attempt_id is not None
             or segment.provider_media_timeline is not None
-            or segment.dialogue_acceptance_sha256 is not None
         ):
             raise ValueError(
                 f"segment {index + 1} provider evidence requires provider_generated audio"
@@ -245,7 +231,6 @@ def _validate_request(
                 segment.join_mode,
                 segment.provider_attempt_id,
                 segment.provider_media_timeline,
-                segment.dialogue_acceptance_sha256,
             )
         )
     if total_duration_s > MAX_TOTAL_DURATION_S:

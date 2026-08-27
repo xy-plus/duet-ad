@@ -410,6 +410,81 @@ def _compile_prompt(
     return prompt
 
 
+def _on_screen_contract(speech: Sequence[_Speech]) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        {
+            "order": order,
+            "line_index": line.line_index,
+            "subject_id": line.subject_id,
+            "text": line.text,
+            "start_s": line.start_s,
+            "end_s": line.end_s,
+        }
+        for order, line in enumerate(
+            (item for item in speech if item.delivery == "on_screen"), 1
+        )
+    )
+
+
+def validate_h3_request_authority(
+    request: h3.H3Request,
+    *,
+    skill_plan: Mapping[str, Any],
+    approved_skill_plan_sha256: str,
+    upstream_dialogue: Sequence[Mapping[str, Any]],
+    upstream_dialogue_receipt_sha256: str,
+    visual: FrozenVisualInput,
+    reference_audios: Sequence[h3.FrozenReferenceAudio],
+    speaker_timing: dialogue_timing.FrozenSpeakerTiming | None,
+) -> None:
+    """Recompute the authoritative speech projection around factory seams."""
+    if approved_skill_plan_sha256 != h3.canonical_json_sha256(skill_plan):
+        _fail("skill_plan_approval_mismatch")
+    subjects, speech, _sounds = _consume_plan(
+        skill_plan,
+        visual=visual,
+        reference_audios=tuple(reference_audios),
+        upstream_dialogue=tuple(dict(line) for line in upstream_dialogue),
+        upstream_dialogue_receipt_sha256=upstream_dialogue_receipt_sha256,
+    )
+    del subjects
+    expected_on_screen = _on_screen_contract(speech)
+    for line in speech:
+        if line.delivery != "on_screen":
+            continue
+        if speaker_timing is None:
+            _fail("speaker_timing_evidence_missing")
+        try:
+            dialogue_timing.require_authoritative_window(
+                speaker_timing,
+                subject_id=str(line.subject_id),
+                start_s=line.start_s,
+                end_s=line.end_s,
+            )
+        except dialogue_timing.DialogueTimingError as exc:
+            _fail(exc.code)
+    expected_timing_sha256 = (
+        speaker_timing.sha256 if expected_on_screen else None
+    )
+    expected_dialogue_sha256 = (
+        h3.canonical_json_sha256(list(expected_on_screen))
+        if expected_on_screen
+        else None
+    )
+    if (
+        not isinstance(request, h3.H3Request)
+        or request.skill_plan_sha256 != approved_skill_plan_sha256
+        or request.upstream_dialogue_receipt_sha256
+        != upstream_dialogue_receipt_sha256
+        or request.voice_texts != tuple(line.text for line in speech)
+        or request.on_screen_dialogue != expected_on_screen
+        or request.speaker_timing_sha256 != expected_timing_sha256
+        or request.on_screen_dialogue_sha256 != expected_dialogue_sha256
+    ):
+        _fail("context_ir_request_authority_mismatch")
+    h3.validate_request_authority(request)
+
+
 def build_h3_request(
     *,
     skill_plan: Mapping[str, Any],
@@ -482,6 +557,7 @@ def build_h3_request(
     if mode not in workflows:
         _fail("invalid_multimodal_mode")
     voice_texts = tuple(line.text for line in speech)
+    on_screen_dialogue = _on_screen_contract(speech)
     return h3.H3Request(
         cid=cid,
         workdir=Path(workdir),
@@ -504,21 +580,19 @@ def build_h3_request(
         upstream_dialogue_receipt_sha256=upstream_dialogue_receipt_sha256,
         speaker_timing_sha256=(
             speaker_timing.sha256
-            if isinstance(speaker_timing, dialogue_timing.FrozenSpeakerTiming)
+            if (
+                on_screen_dialogue
+                and isinstance(
+                    speaker_timing, dialogue_timing.FrozenSpeakerTiming
+                )
+            )
             else None
         ),
-        on_screen_dialogue=tuple(
-            {
-                "order": order,
-                "line_index": line.line_index,
-                "subject_id": line.subject_id,
-                "text": line.text,
-                "start_s": line.start_s,
-                "end_s": line.end_s,
-            }
-            for order, line in enumerate(
-                (item for item in speech if item.delivery == "on_screen"), 1
-            )
+        on_screen_dialogue=on_screen_dialogue,
+        on_screen_dialogue_sha256=(
+            h3.canonical_json_sha256(list(on_screen_dialogue))
+            if on_screen_dialogue
+            else None
         ),
         audio_required=True,
     )

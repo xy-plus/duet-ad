@@ -1466,6 +1466,7 @@ def _short_validation_paths(cdir: Path, meta: dict) -> set[Path]:
             multimodal.get("manifest"),
             multimodal.get("multimodal_input"),
             multimodal.get("skill_plan"),
+            multimodal.get("speaker_timing"),
         ])
         reference_audios = multimodal.get("reference_audios")
         if isinstance(reference_audios, list):
@@ -1560,6 +1561,7 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
                 multimodal.get("manifest"),
                 multimodal.get("multimodal_input"),
                 multimodal.get("skill_plan"),
+                multimodal.get("speaker_timing"),
             ])
             reference_audios = multimodal.get("reference_audios")
             if isinstance(reference_audios, list):
@@ -1648,6 +1650,63 @@ def _long_validation_paths(cdir: Path, meta: dict) -> set[Path]:
     return paths
 
 
+def _speaker_timing_fingerprint_entries(
+    cdir: Path, meta: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Hash small timing bytes, independent of mutable stat metadata."""
+    receipt_name = (
+        meta.get("long_video_plan_receipt")
+        if _is_long_video(meta)
+        else meta.get("prepared_input_receipt")
+    )
+    if (
+        not isinstance(receipt_name, str)
+        or receipt_name != Path(receipt_name).name
+    ):
+        return []
+    try:
+        payload = json.loads((cdir / receipt_name).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, Mapping):
+        return []
+    multimodals: list[object]
+    if _is_long_video(meta):
+        segments = payload.get("segments")
+        multimodals = (
+            [item.get("multimodal") for item in segments if isinstance(item, Mapping)]
+            if isinstance(segments, list)
+            else []
+        )
+    else:
+        multimodals = [payload.get("multimodal")]
+    entries: list[dict[str, object]] = []
+    for multimodal in multimodals:
+        timing = (
+            multimodal.get("speaker_timing")
+            if isinstance(multimodal, Mapping)
+            else None
+        )
+        if timing is None:
+            continue
+        path = _bound_artifact_path(cdir, timing)
+        expected = timing.get("sha256") if isinstance(timing, Mapping) else None
+        raw_sha256 = None
+        if path is not None:
+            try:
+                raw_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                pass
+        entries.append({
+            "path": (
+                path.relative_to(cdir).as_posix() if path is not None else None
+            ),
+            "expected_sha256": expected,
+            "raw_sha256": raw_sha256,
+        })
+    return entries
+
+
 def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | None:
     """Bind the cache only to fields and files read by strict validation."""
     try:
@@ -1681,6 +1740,9 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
                 "frozen_plan_receipt": meta.get("frozen_plan_receipt"),
                 "long_video_plan_receipt": meta.get("long_video_plan_receipt"),
                 "generation": generation_binding,
+                "speaker_timing": _speaker_timing_fingerprint_entries(
+                    cdir, meta
+                ),
             }
             paths = _long_validation_paths(cdir, meta)
         else:
@@ -1694,6 +1756,9 @@ def _generated_video_validation_fingerprint(cdir: Path, meta: dict) -> str | Non
                 "aspect_ratio": meta.get("aspect_ratio"),
                 "resolution": meta.get("resolution"),
                 "generation": generation_binding,
+                "speaker_timing": _speaker_timing_fingerprint_entries(
+                    cdir, meta
+                ),
             }
             paths = _short_validation_paths(cdir, meta)
         binding_bytes = json.dumps(
