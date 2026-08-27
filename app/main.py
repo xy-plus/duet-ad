@@ -2717,6 +2717,61 @@ def create_app(settings: Settings) -> FastAPI:
                 previous_status = _effective_generation_status(generation)
                 previous_id = generation.get("client_request_id")
                 if previous_status == "submission_unknown":
+                    exact_paid_resume = (
+                        previous_id == request_id
+                        and generation.get("error") == "source_prompt_too_long"
+                        and generation.get("stage") == "context_ir_native"
+                        and generation.get("h3_attempt_id") is None
+                        and generation.get("audio_route") == h3_project.AUDIO_ROUTE
+                        and _short_generation_parameters_match(
+                            meta,
+                            dialogue_mode=payload["dialogue_mode"],
+                            dialogue=dialogue,
+                            fit_mode=fit_mode,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
+                        )
+                    )
+                    if exact_paid_resume:
+                        try:
+                            source_request, effective_request = (
+                                _load_controlled_storage_retry_requests(
+                                    settings, cid, meta
+                                )
+                            )
+                            inspected = h3.inspect(effective_request)
+                        except (
+                            _SubmitError,
+                            h3.H3Error,
+                            h3_project.ProjectMultimodalError,
+                        ):
+                            exact_paid_resume = False
+                        else:
+                            exact_paid_resume = (
+                                inspected.status == "h3_running"
+                                and isinstance(inspected.attempt_id, str)
+                            )
+                    if exact_paid_resume:
+                        updated = {
+                            **generation,
+                            "status": "queued",
+                            "error": None,
+                            "stage": "h3",
+                        }
+                        storage.update_meta(
+                            settings.data_dir, cid, generation=updated
+                        )
+                        background_tasks.add_task(
+                            _run_generation,
+                            settings,
+                            cid,
+                            source_request,
+                            "resume",
+                        )
+                        return {
+                            "status": "queued",
+                            "attempt": generation.get("attempt"),
+                        }
                     safe_storage_recovery = (
                         previous_id == request_id
                         and generation.get("stage") == "h3"
@@ -2825,11 +2880,17 @@ def create_app(settings: Settings) -> FastAPI:
                                     "stage": "h3",
                                 },
                             )
+                            frozen, frozen_request_id = _load_short_frozen_input(
+                                settings, cid, meta
+                            )
+                            source_request = _make_h3_request(
+                                settings, cid, frozen, frozen_request_id
+                            )
                             background_tasks.add_task(
                                 _run_generation,
                                 settings,
                                 cid,
-                                request,
+                                source_request,
                                 "resume",
                             )
                             return {
@@ -2939,8 +3000,11 @@ def create_app(settings: Settings) -> FastAPI:
                             detail="generation_state_invalid",
                         )
                     try:
-                        request = await asyncio.to_thread(
-                            _load_h3_request, settings, cid, meta
+                        frozen, frozen_request_id = _load_short_frozen_input(
+                            settings, cid, meta
+                        )
+                        request = _make_h3_request(
+                            settings, cid, frozen, frozen_request_id
                         )
                         frozen, _request_id = _load_short_frozen_input(
                             settings, cid, meta
