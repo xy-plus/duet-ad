@@ -21,6 +21,13 @@ FIT_LAYOUT_LEGACY = "legacy-v0"
 FIT_LAYOUT_ASPECT = "aspect-v1"
 _FIT_LAYOUTS = frozenset({FIT_LAYOUT_LEGACY, FIT_LAYOUT_ASPECT})
 _FAST_MODE_WORKERS = 8
+AUDIO_ROUTE_SCHEMA = "duet.long-generation.audio-route"
+AUDIO_ROUTE_VERSION = 1
+H3_NATIVE_AUDIO_ROUTE = {
+    "schema": AUDIO_ROUTE_SCHEMA,
+    "version": AUDIO_ROUTE_VERSION,
+    "mode": "h3_native",
+}
 
 
 class LongGenerationError(RuntimeError):
@@ -71,12 +78,31 @@ def _segment_duration_s(plan: FrozenPlan, segment: FrozenSegment) -> float:
         raise LongGenerationError("long_video_plan_invalid") from None
 
 
-def _stitch_segments(plan: FrozenPlan) -> list[stitch.StitchSegment]:
+def _is_h3_multimodal_plan(plan: FrozenPlan) -> bool:
+    workflows = getattr(h3, "H3_MULTIMODAL_WORKFLOWS", frozenset())
+    return isinstance(workflows, (set, frozenset)) and plan.workflow in workflows
+
+
+def _generation_uses_h3_native_audio(plan: FrozenPlan, generation: Mapping) -> bool:
+    expected = H3_NATIVE_AUDIO_ROUTE if _is_h3_multimodal_plan(plan) else None
+    actual = generation.get("audio_route")
+    if actual != expected:
+        raise LongGenerationError("long_video_audio_route_invalid")
+    return expected is not None
+
+
+def _stitch_segments(
+    plan: FrozenPlan,
+    provider_media: Mapping[int, tuple[str, Mapping[str, object]]] | None = None,
+) -> list[stitch.StitchSegment]:
+    media = provider_media or {}
     return [
         stitch.StitchSegment(
             item.workdir / "generated.mp4",
             _segment_duration_s(plan, item),
             item.join_mode,
+            media.get(item.index, (None, None))[0],
+            media.get(item.index, (None, None))[1],
         )
         for item in plan.segments
     ]
@@ -645,6 +671,27 @@ def _result_status(result: h3.H3Result) -> tuple[str, str | None]:
     return "failed", result.error_code or "h3_failed"
 
 
+def _exact_h3_attempt_id(value: object, fallback: object = None) -> str | None:
+    for candidate in (value, fallback):
+        if (
+            isinstance(candidate, str)
+            and len(candidate) == 6
+            and candidate.isdigit()
+        ):
+            return candidate
+    return None
+
+
+def _result_state(
+    result: h3.H3Result,
+    fallback_attempt_id: object = None,
+) -> tuple[str, str | None, str | None]:
+    status, error = _result_status(result)
+    return status, error, _exact_h3_attempt_id(
+        result.attempt_id, fallback_attempt_id
+    )
+
+
 def generation_segments_are_valid(
     expected_segments: object,
     generation: Mapping,
@@ -657,16 +704,23 @@ def generation_segments_are_valid(
         return False
     if len(raw) != len(expected_segments) or not raw:
         return False
-    keys = {
+    legacy_keys = {
         "index", "chain_id", "join_mode", "status", "attempt", "error",
         "child_request_id",
     }
+    native_keys = legacy_keys | {"h3_attempt_id"}
     statuses = {
         "not_started", "queued", "running", "resume_required", "succeeded",
         "failed", "submission_unknown",
     }
     for position, (expected, item) in enumerate(zip(expected_segments, raw), 1):
-        if not isinstance(item, dict) or set(item) != keys:
+        if (
+            not isinstance(item, dict)
+            or frozenset(item) not in {
+                frozenset(legacy_keys),
+                frozenset(native_keys),
+            }
+        ):
             return False
         if isinstance(expected, FrozenSegment):
             expected_index = expected.index
@@ -680,6 +734,7 @@ def generation_segments_are_valid(
             return False
         attempt = item.get("attempt")
         child_id = item.get("child_request_id")
+        h3_attempt_id = item.get("h3_attempt_id")
         if (
             expected_index != position
             or item.get("index") != expected_index
@@ -696,6 +751,14 @@ def generation_segments_are_valid(
             or (
                 child_id is not None
                 and (not isinstance(child_id, str) or not child_id)
+            )
+            or (
+                h3_attempt_id is not None
+                and (
+                    not isinstance(h3_attempt_id, str)
+                    or len(h3_attempt_id) != 6
+                    or not h3_attempt_id.isdigit()
+                )
             )
         ):
             return False
@@ -772,6 +835,67 @@ def bound_reusable_segment_indices(
     return frozenset(reusable)
 
 
+def bound_h3_native_media(
+    settings,
+    cid: str,
+    plan: FrozenPlan,
+    generation: Mapping,
+) -> dict[int, tuple[str, Mapping[str, object]]]:
+    """Bind every segment to its persisted exact successful H3 attempt."""
+    if not _generation_uses_h3_native_audio(plan, generation):
+        raise LongGenerationError("long_video_audio_route_invalid")
+    if not generation_segments_are_valid(plan.segments, generation):
+        raise LongGenerationError("long_video_h3_native_audio_invalid")
+    meta = storage.load_meta(settings.data_dir, cid)
+    fit_mode = meta.get("fit_mode") if isinstance(meta, Mapping) else None
+    parent_id = generation.get("client_request_id")
+    fast_mode = generation.get("fast_mode", False)
+    is_multimodal_request = getattr(h3, "is_multimodal_request", None)
+    if fit_mode not in {"none", "crop", "pad"} or not isinstance(parent_id, str):
+        raise LongGenerationError("long_video_h3_native_audio_invalid")
+    if not callable(is_multimodal_request):
+        raise LongGenerationError("long_video_h3_native_audio_invalid")
+    states = {
+        item.get("index"): item
+        for item in generation.get("segments", [])
+        if isinstance(item, Mapping)
+    }
+    result: dict[int, tuple[str, Mapping[str, object]]] = {}
+    for segment in plan.segments:
+        state = states.get(segment.index)
+        if not isinstance(state, Mapping) or state.get("status") != "succeeded":
+            raise LongGenerationError("long_video_h3_native_audio_invalid")
+        attempt_id = state.get("h3_attempt_id")
+        child_id = state.get("child_request_id")
+        if (
+            _exact_h3_attempt_id(attempt_id) is None
+            or not isinstance(child_id, str)
+            or not child_id
+        ):
+            raise LongGenerationError("long_video_h3_native_audio_invalid")
+        try:
+            request = _request(
+                settings,
+                cid,
+                plan,
+                segment,
+                parent_id,
+                fit_mode,
+                frozen_child_id=child_id,
+                prepare_inputs=False,
+                fast_mode=fast_mode,
+            )
+            if is_multimodal_request(request) is not True:
+                raise LongGenerationError("long_video_h3_native_audio_invalid")
+            timeline = h3.load_media_timeline_receipt(request, attempt_id)
+        except (OSError, TypeError, ValueError, h3.H3Error, LongGenerationError):
+            raise LongGenerationError("long_video_h3_native_audio_invalid") from None
+        if not isinstance(timeline.get("audio"), Mapping):
+            raise LongGenerationError("long_video_h3_native_audio_invalid")
+        result[segment.index] = (attempt_id, timeline)
+    return result
+
+
 def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, attempt: int,
                        old: Mapping | None = None, *, fast_mode: bool = False) -> dict:
     if not isinstance(fast_mode, bool):
@@ -786,10 +910,11 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
         if isinstance(item, dict)
     }
     items = []
+    h3_native_audio = _is_h3_multimodal_plan(plan)
     for segment in plan.segments:
         prior = old_by_index.get(segment.index, {})
         succeeded = segment.index in reusable
-        items.append({
+        item = {
             "index": segment.index,
             "chain_id": segment.chain_id,
             "join_mode": segment.join_mode,
@@ -797,8 +922,13 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
             "attempt": prior.get("attempt", 0) if succeeded else int(prior.get("attempt", 0) or 0),
             "error": None,
             "child_request_id": prior.get("child_request_id") if succeeded else None,
-        })
-    return {
+        }
+        if h3_native_audio:
+            item["h3_attempt_id"] = (
+                prior.get("h3_attempt_id") if succeeded else None
+            )
+        items.append(item)
+    generation = {
         "status": "queued",
         "error": None,
         "attempt": attempt,
@@ -811,36 +941,85 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
         "workflow": plan.workflow,
         "segments": items,
     }
+    if h3_native_audio:
+        generation["audio_route"] = dict(H3_NATIVE_AUDIO_ROUTE)
+    return generation
 
 
-def _stitch(settings, cid: str, plan: FrozenPlan, dialogue_mode: str) -> None:
+def _stitch(
+    settings,
+    cid: str,
+    plan: FrozenPlan,
+    dialogue_mode: str,
+    *,
+    generation: Mapping | None = None,
+) -> None:
+    provider_media = None
+    if _is_h3_multimodal_plan(plan):
+        if generation is None:
+            raise LongGenerationError("long_video_h3_native_audio_invalid")
+        provider_media = bound_h3_native_media(settings, cid, plan, generation)
+        audio_mode: stitch.AudioMode = "provider_generated"
+    else:
+        if generation is not None:
+            _generation_uses_h3_native_audio(plan, generation)
+        if dialogue_mode not in {"auto", "none"}:
+            raise LongGenerationError("invalid_dialogue_mode", 422)
+        audio_mode = "keep" if dialogue_mode == "auto" else "mute"
     stitch.stitch_video(
-        segments=_stitch_segments(plan),
+        segments=_stitch_segments(plan, provider_media),
         source_video=plan.source,
         output=plan.root / "generated.mp4",
-        audio_mode="keep" if dialogue_mode == "auto" else "mute",
+        audio_mode=audio_mode,
     )
-    if not stitched_output_is_reusable(plan, dialogue_mode):
+    reusable = (
+        stitched_output_is_reusable(
+            plan,
+            dialogue_mode,
+            generation=generation,
+            provider_media=provider_media,
+        )
+        if provider_media is not None
+        else stitched_output_is_reusable(plan, dialogue_mode)
+    )
+    if not reusable:
         raise LongGenerationError("long_video_stitch_output_invalid")
 
 
-def stitched_output_is_reusable(plan: FrozenPlan, dialogue_mode: str) -> bool:
+def stitched_output_is_reusable(
+    plan: FrozenPlan,
+    dialogue_mode: str,
+    *,
+    generation: Mapping | None = None,
+    provider_media: Mapping[int, tuple[str, Mapping[str, object]]] | None = None,
+) -> bool:
     """Validate the published video against the exact local stitch receipt."""
     if dialogue_mode not in {"auto", "none"}:
         return False
     output = plan.root / "generated.mp4"
     receipt_path = plan.root / stitch.RECEIPT_FILENAME
-    audio_mode = "keep" if dialogue_mode == "auto" else "mute"
+    native_audio = _is_h3_multimodal_plan(plan)
+    if generation is not None:
+        try:
+            if _generation_uses_h3_native_audio(plan, generation) != native_audio:
+                return False
+        except LongGenerationError:
+            return False
+    audio_mode: stitch.AudioMode = (
+        "provider_generated"
+        if native_audio
+        else ("keep" if dialogue_mode == "auto" else "mute")
+    )
     try:
         payload = json.loads(receipt_path.read_text(encoding="utf-8"))
         if (
             not isinstance(payload, dict)
             or set(payload) != {"schema", "version", "segments", "audio", "output"}
             or payload.get("schema") != "duet.stitch"
-            or payload.get("version") != 1
+            or payload.get("version") != (2 if native_audio else 1)
         ):
             return False
-        stitch_segments = _stitch_segments(plan)
+        stitch_segments = _stitch_segments(plan, provider_media)
         budgets = stitch._frame_budgets(stitch_segments)
         expected_segments = [
             {
@@ -862,6 +1041,39 @@ def stitched_output_is_reusable(plan: FrozenPlan, dialogue_mode: str) -> bool:
             "source_sha256": stitch._sha256(plan.source),
             "source_has_audio": source_info.has_audio,
         }
+        if native_audio:
+            actual_audio = payload.get("audio")
+            if not isinstance(actual_audio, dict):
+                return False
+            provider_segments = actual_audio.get("provider_segments")
+            if provider_media is not None:
+                expected_audio["provider_segments"] = [
+                    stitch._provider_binding(segment, index)
+                    for index, segment in enumerate(stitch_segments, 1)
+                ]
+            elif (
+                not isinstance(provider_segments, list)
+                or len(provider_segments) != len(plan.segments)
+                or any(
+                    not isinstance(item, dict)
+                    or set(item) != {
+                        "source", "attempt_id", "media_timeline_sha256",
+                        "decoded_audio_sha256",
+                    }
+                    or item.get("source") != "h3"
+                    or _exact_h3_attempt_id(item.get("attempt_id")) is None
+                    for item in provider_segments
+                )
+            ):
+                return False
+            else:
+                expected_audio["provider_segments"] = provider_segments
+            expected_audio["edl"] = {
+                "schema": "duet.av-edl",
+                "version": 1,
+                "fps": stitch.FPS,
+                "interval": "integer-half-open",
+            }
         if payload.get("audio") != expected_audio:
             return False
         output_receipt = payload.get("output")
@@ -918,6 +1130,19 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             },
         )
         return
+    try:
+        h3_native_audio = _generation_uses_h3_native_audio(plan, generation)
+    except LongGenerationError:
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            generation={
+                **generation,
+                "status": "submission_unknown",
+                "error": "submission_unknown",
+            },
+        )
+        return
     parent_id = generation.get("client_request_id")
     fast_mode = generation.get("fast_mode", False)
     fit_mode = meta.get("fit_mode")
@@ -940,6 +1165,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                       "status": status or generation.get("status"), "error": error, "stage": stage}
         storage.update_meta(settings.data_dir, cid, generation=generation)
 
+    def exact_generation() -> dict:
+        return {
+            **generation,
+            "segments": [states[item.index] for item in plan.segments],
+        }
+
     def parallel_update(segments, operation) -> None:
         with ThreadPoolExecutor(
             max_workers=min(_FAST_MODE_WORKERS, len(segments))
@@ -949,8 +1180,11 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
                 for future in done:
                     segment = futures.pop(future)
-                    status, error = future.result()
-                    states[segment.index].update(status=status, error=error)
+                    status, error, attempt_id = future.result()
+                    changes = {"status": status, "error": error}
+                    if h3_native_audio:
+                        changes["h3_attempt_id"] = attempt_id
+                    states[segment.index].update(changes)
                     persist("running", None)
 
     reusable = bound_reusable_segment_indices(settings, cid, plan, generation)
@@ -998,16 +1232,28 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 result = h3.resume(request)
                 if result.status == "not_started":
                     return (
-                        ("queued", None)
+                        (
+                            "queued",
+                            None,
+                            _exact_h3_attempt_id(
+                                result.attempt_id, state.get("h3_attempt_id")
+                            ),
+                        )
                         if (
                             fast_mode
                             and state.get("status") == "queued"
                             and isinstance(result.attempt_id, str)
                             and bool(result.attempt_id)
                         )
-                        else ("submission_unknown", "submission_unknown")
+                        else (
+                            "submission_unknown",
+                            "submission_unknown",
+                            _exact_h3_attempt_id(
+                                result.attempt_id, state.get("h3_attempt_id")
+                            ),
+                        )
                     )
-                status = _result_status(result)
+                status = _result_state(result, state.get("h3_attempt_id"))
                 if (
                     fast_mode
                     and status[0] == "succeeded"
@@ -1017,23 +1263,42 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                         allow_provider_duration_ceiling=True,
                     )
                 ):
-                    return "failed", "long_video_segment_output_invalid"
+                    return (
+                        "failed",
+                        "long_video_segment_output_invalid",
+                        status[2],
+                    )
                 return status
             except Exception:
-                return "submission_unknown", "submission_unknown"
+                return (
+                    "submission_unknown",
+                    "submission_unknown",
+                    _exact_h3_attempt_id(state.get("h3_attempt_id")),
+                )
 
         if recoverable and fast_mode:
             parallel_update(recoverable, recover)
         elif recoverable:
             for segment in recoverable:
-                status, error = recover(segment)
-                states[segment.index].update(status=status, error=error)
+                status, error, attempt_id = recover(segment)
+                changes = {"status": status, "error": error}
+                if h3_native_audio:
+                    changes["h3_attempt_id"] = attempt_id
+                states[segment.index].update(changes)
         if any(item.get("status") == "submission_unknown" for item in states.values()):
             persist("submission_unknown", "submission_unknown")
             return
         elif all(item.get("status") == "succeeded" for item in states.values()):
             try:
-                _stitch(settings, cid, plan, dialogue_mode)
+                _stitch(
+                    settings,
+                    cid,
+                    plan,
+                    dialogue_mode,
+                    generation=exact_generation(),
+                )
+            except LongGenerationError as exc:
+                persist("failed", exc.code, "stitch")
             except Exception:
                 persist("failed", "long_video_stitch_failed", "stitch")
             else:
@@ -1099,12 +1364,17 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                         prepared_status, prepared_error = "succeeded", None
                 else:
                     prepared_status, prepared_error = _result_status(result)
-                state.update(
+                changes = dict(
                     status=prepared_status,
                     attempt=int(state.get("attempt", 0) or 0) + 1,
                     error=prepared_error,
                     child_request_id=requests[segment.index].client_request_id,
                 )
+                if h3_native_audio:
+                    changes["h3_attempt_id"] = _exact_h3_attempt_id(
+                        result.attempt_id, state.get("h3_attempt_id")
+                    )
+                state.update(changes)
             persist("running", None)
         except (h3.H3Error, LongGenerationError, OSError, ValueError) as exc:
             code = exc.code if isinstance(exc, (h3.H3Error, LongGenerationError)) else "long_video_request_invalid"
@@ -1129,33 +1399,54 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             return
 
         def submit_one(segment: FrozenSegment):
+            previous_attempt = states[segment.index].get("h3_attempt_id")
             try:
                 result = h3.submit(requests[segment.index])
                 if result.status == "h3_running":
-                    return "running", None
-                status = _result_status(result)
+                    return (
+                        "running",
+                        None,
+                        _exact_h3_attempt_id(result.attempt_id, previous_attempt),
+                    )
+                status = _result_state(result, previous_attempt)
                 if status[0] == "succeeded" and not h3.output_is_reusable(
                     requests[segment.index],
                     expected_duration_s=_segment_duration_s(plan, segment),
                     allow_provider_duration_ceiling=True,
                 ):
-                    return "failed", "long_video_segment_output_invalid"
+                    return (
+                        "failed",
+                        "long_video_segment_output_invalid",
+                        status[2],
+                    )
                 return status
             except h3.H3Error as exc:
                 if exc.code == "attempt_not_prepared":
-                    return "submission_unknown", "submission_unknown"
+                    return (
+                        "submission_unknown",
+                        "submission_unknown",
+                        _exact_h3_attempt_id(previous_attempt),
+                    )
                 try:
                     inspected = h3.inspect(requests[segment.index])
-                    status = _result_status(inspected)
+                    status = _result_state(inspected, previous_attempt)
                 except Exception:
-                    status = ("submission_unknown", "submission_unknown")
+                    status = (
+                        "submission_unknown",
+                        "submission_unknown",
+                        _exact_h3_attempt_id(previous_attempt),
+                    )
                 if status[0] == "failed" and exc.code in {
                     "submission_unknown", "state_persist_failed", "h3_internal_error",
                 }:
-                    return "submission_unknown", "submission_unknown"
+                    return "submission_unknown", "submission_unknown", status[2]
                 return status
             except Exception:
-                return "submission_unknown", "submission_unknown"
+                return (
+                    "submission_unknown",
+                    "submission_unknown",
+                    _exact_h3_attempt_id(previous_attempt),
+                )
 
         # Phase 3: fan out only the short POST boundary. No worker waits for a
         # provider result, so every queued child is submitted before polling.
@@ -1168,26 +1459,45 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
 
         def poll_one(segment: FrozenSegment):
             request = requests[segment.index]
+            previous_attempt = states[segment.index].get("h3_attempt_id")
             try:
                 result = h3.resume(request)
                 if result.status == "not_started":
-                    return "submission_unknown", "submission_unknown"
-                status = _result_status(result)
+                    return (
+                        "submission_unknown",
+                        "submission_unknown",
+                        _exact_h3_attempt_id(result.attempt_id, previous_attempt),
+                    )
+                status = _result_state(result, previous_attempt)
                 if status[0] == "succeeded" and not h3.output_is_reusable(
                     request,
                     expected_duration_s=_segment_duration_s(plan, segment),
                     allow_provider_duration_ceiling=True,
                 ):
-                    return "failed", "long_video_segment_output_invalid"
+                    return (
+                        "failed",
+                        "long_video_segment_output_invalid",
+                        status[2],
+                    )
                 return status
             except h3.H3Error as exc:
                 return (
-                    "submission_unknown", "submission_unknown"
+                    "submission_unknown",
+                    "submission_unknown",
+                    _exact_h3_attempt_id(previous_attempt),
                 ) if exc.code in {
                     "submission_unknown", "state_persist_failed", "h3_internal_error",
-                } else ("resume_required", exc.code)
+                } else (
+                    "resume_required",
+                    exc.code,
+                    _exact_h3_attempt_id(previous_attempt),
+                )
             except Exception:
-                return "submission_unknown", "submission_unknown"
+                return (
+                    "submission_unknown",
+                    "submission_unknown",
+                    _exact_h3_attempt_id(previous_attempt),
+                )
 
         # Phase 4: bounded long-lived GET polling. Unknown children never get a
         # second POST, while known siblings are still allowed to finish.
@@ -1201,7 +1511,15 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         statuses = {item.get("status") for item in states.values()}
         if statuses == {"succeeded"}:
             try:
-                _stitch(settings, cid, plan, dialogue_mode)
+                _stitch(
+                    settings,
+                    cid,
+                    plan,
+                    dialogue_mode,
+                    generation=exact_generation(),
+                )
+            except LongGenerationError as exc:
+                persist("failed", exc.code, "stitch")
             except Exception:
                 persist("failed", "long_video_stitch_failed", "stitch")
             else:
@@ -1248,8 +1566,9 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             )
             > long_video.PREVIOUS_SEGMENT_PROVIDER_MAX_DURATION_S
         ):
-            return None, ("failed", "long_video_legacy_plan_read_only")
+            return None, ("failed", "long_video_legacy_plan_read_only", None)
         existing_child_id = states[segment.index].get("child_request_id")
+        previous_attempt = states[segment.index].get("h3_attempt_id")
         try:
             request = _request(
                 settings, cid, plan, segment, parent_id, fit_mode,
@@ -1258,40 +1577,62 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         except LongGenerationError as exc:
             if action == "resume":
                 return existing_child_id, (
-                    "submission_unknown", "submission_unknown"
+                    "submission_unknown", "submission_unknown",
+                    _exact_h3_attempt_id(previous_attempt),
                 )
-            return None, ("failed", exc.code)
+            return None, (
+                "failed", exc.code, _exact_h3_attempt_id(previous_attempt)
+            )
         except Exception:
             if action == "resume":
                 return existing_child_id, (
-                    "submission_unknown", "submission_unknown"
+                    "submission_unknown", "submission_unknown",
+                    _exact_h3_attempt_id(previous_attempt),
                 )
-            return None, ("failed", "long_video_request_invalid")
+            return None, (
+                "failed", "long_video_request_invalid",
+                _exact_h3_attempt_id(previous_attempt),
+            )
         try:
             result = h3.start(request) if action == "start" else h3.resume(request)
             if action == "resume" and result.status == "not_started":
                 return request.client_request_id, (
-                    "submission_unknown", "submission_unknown"
+                    "submission_unknown", "submission_unknown",
+                    _exact_h3_attempt_id(result.attempt_id, previous_attempt),
                 )
-            status = _result_status(result)
+            status = _result_state(result, previous_attempt)
             if status[0] == "succeeded" and not h3.output_is_reusable(
                 request,
                 expected_duration_s=_segment_duration_s(plan, segment),
                 allow_provider_duration_ceiling=True,
             ):
-                status = ("failed", "long_video_segment_output_invalid")
+                status = (
+                    "failed",
+                    "long_video_segment_output_invalid",
+                    status[2],
+                )
             return request.client_request_id, status
         except h3.H3Error as exc:
             try:
                 inspected = h3.inspect(request)
-                status = _result_status(inspected)
+                status = _result_state(inspected, previous_attempt)
             except Exception:
-                status = ("submission_unknown", "submission_unknown")
+                status = (
+                    "submission_unknown",
+                    "submission_unknown",
+                    _exact_h3_attempt_id(previous_attempt),
+                )
             if status[0] == "failed" and exc.code in {"submission_unknown", "state_persist_failed", "h3_internal_error"}:
-                status = ("submission_unknown", "submission_unknown")
+                status = (
+                    "submission_unknown", "submission_unknown", status[2]
+                )
             return request.client_request_id, status
         except Exception:
-            return request.client_request_id, ("submission_unknown", "submission_unknown")
+            return request.client_request_id, (
+                "submission_unknown",
+                "submission_unknown",
+                _exact_h3_attempt_id(previous_attempt),
+            )
 
     active = {}
     locked = False
@@ -1320,10 +1661,15 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             done, _pending = wait(tuple(active), return_when=FIRST_COMPLETED)
             for future in done:
                 segment = active.pop(future)
-                child_id, (status, error) = future.result()
-                states[segment.index].update(
-                    status=status, error=error, child_request_id=child_id
-                )
+                child_id, (status, error, attempt_id) = future.result()
+                changes = {
+                    "status": status,
+                    "error": error,
+                    "child_request_id": child_id,
+                }
+                if h3_native_audio:
+                    changes["h3_attempt_id"] = attempt_id
+                states[segment.index].update(changes)
                 if status == "submission_unknown":
                     locked = True
                 persist("submission_unknown" if locked else "running",
@@ -1335,7 +1681,15 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
     statuses = {item.get("status") for item in states.values()}
     if statuses == {"succeeded"}:
         try:
-            _stitch(settings, cid, plan, dialogue_mode)
+            _stitch(
+                settings,
+                cid,
+                plan,
+                dialogue_mode,
+                generation=exact_generation(),
+            )
+        except LongGenerationError as exc:
+            persist("failed", exc.code, "stitch")
         except Exception:
             persist("failed", "long_video_stitch_failed", "stitch")
         else:

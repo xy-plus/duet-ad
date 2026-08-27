@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal, Mapping, Sequence
 
 from app import storage
 
@@ -28,7 +28,7 @@ RECEIPT_FILENAME = "stitch-receipt.json"
 _TIMEOUT_S = 300
 
 JoinMode = Literal["continue", "hard_cut"]
-AudioMode = Literal["keep", "mute"]
+AudioMode = Literal["keep", "mute", "provider_generated"]
 
 
 class StitchError(RuntimeError):
@@ -40,6 +40,8 @@ class StitchSegment:
     path: Path
     target_duration_s: float
     join_mode: JoinMode
+    provider_attempt_id: str | None = None
+    provider_media_timeline: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -140,11 +142,52 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_sha256(value: object) -> str:
+    try:
+        data = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ValueError("provider media timeline is invalid") from None
+    return hashlib.sha256(data).hexdigest()
+
+
+def _provider_binding(segment: StitchSegment, index: int) -> dict[str, object]:
+    attempt_id = segment.provider_attempt_id
+    timeline = segment.provider_media_timeline
+    if (
+        not isinstance(attempt_id, str)
+        or len(attempt_id) != 6
+        or not attempt_id.isdigit()
+        or not isinstance(timeline, Mapping)
+        or timeline.get("schema") != "duet.h3.media_timeline"
+        or timeline.get("version") != 1
+        or timeline.get("decode_complete") is not True
+        or not isinstance(timeline.get("video"), Mapping)
+        or not isinstance(timeline.get("audio"), Mapping)
+    ):
+        raise ValueError(
+            f"segment {index} requires exact H3 native-audio evidence"
+        )
+    return {
+        "source": "h3",
+        "attempt_id": attempt_id,
+        "media_timeline_sha256": _canonical_sha256(timeline),
+        "decoded_audio_sha256": timeline["audio"].get("decoded_sha256"),
+    }
+
+
 def _validate_request(
     segments: Sequence[StitchSegment], source_video: Path, output: Path, audio_mode: str,
 ) -> tuple[tuple[StitchSegment, ...], Path, Path]:
-    if audio_mode not in {"keep", "mute"}:
-        raise ValueError("audio_mode must be 'keep' or 'mute'")
+    if audio_mode not in {"keep", "mute", "provider_generated"}:
+        raise ValueError(
+            "audio_mode must be 'keep', 'mute', or 'provider_generated'"
+        )
     frozen = tuple(segments)
     if not frozen:
         raise ValueError("segments must not be empty")
@@ -172,7 +215,24 @@ def _validate_request(
             raise ValueError("first segment join_mode must be 'hard_cut'")
         if not path.is_file():
             raise ValueError(f"segment {index + 1} does not exist: {path}")
-        normalized.append(StitchSegment(path, duration, segment.join_mode))
+        if audio_mode == "provider_generated":
+            _provider_binding(segment, index + 1)
+        elif (
+            segment.provider_attempt_id is not None
+            or segment.provider_media_timeline is not None
+        ):
+            raise ValueError(
+                f"segment {index + 1} provider evidence requires provider_generated audio"
+            )
+        normalized.append(
+            StitchSegment(
+                path,
+                duration,
+                segment.join_mode,
+                segment.provider_attempt_id,
+                segment.provider_media_timeline,
+            )
+        )
     if total_duration_s > MAX_TOTAL_DURATION_S:
         raise ValueError(
             f"total target duration must not exceed {MAX_TOTAL_DURATION_S:g}s"
@@ -212,27 +272,60 @@ def _normalize_segment(
     width: int,
     height: int,
     index: int,
+    audio_mode: AudioMode,
 ) -> None:
-    drop = 1 if index > 0 and segment.join_mode == "continue" else 0
-    # trim before fps so `continue` removes exactly one decoded supplier frame.
+    # ``continue`` describes generation continuity.  It is not proof that the
+    # first decoded supplier frame duplicates the previous segment, so the EDL
+    # never deletes visual content merely because the boundary is continuous.
     video_filter = (
-        f"trim=start_frame={drop},setpts=PTS-STARTPTS,"
+        "trim=start_frame=0,setpts=PTS-STARTPTS,"
         f"fps={FPS},"
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
         f"tpad=stop_mode=clone:stop_duration={frames / FPS + 1:.9f},"
         f"trim=end_frame={frames},setpts=N/({FPS}*TB),format=yuv420p"
     )
-    _run(
-        [
-            "ffmpeg", "-v", "error", "-y", "-i", str(segment.path),
-            "-map", "0:v:0", "-an", "-vf", video_filter,
-            "-frames:v", str(frames), "-r", str(FPS),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-video_track_timescale", str(FPS), str(destination),
-        ],
-        step=f"normalizing segment {index + 1}",
-    )
+    argv = [
+        "ffmpeg", "-v", "error", "-y", "-i", str(segment.path),
+        "-map", "0:v:0", "-vf", video_filter,
+        "-frames:v", str(frames), "-r", str(FPS),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-video_track_timescale", str(FPS),
+    ]
+    if audio_mode == "provider_generated":
+        try:
+            video_start = storage.probe_stream_start_time(segment.path, "v:0")
+            audio_start = storage.probe_stream_start_time(segment.path, "a:0")
+        except storage.UploadError as exc:
+            raise StitchError(
+                f"provider_generated_audio_missing: segment {index + 1}: {exc}"
+            ) from None
+        relative_audio_start = audio_start - video_start
+        if relative_audio_start >= 0:
+            align = (
+                "asetpts=PTS-STARTPTS,"
+                f"adelay={relative_audio_start * 1000:.6f}:all=1"
+            )
+        else:
+            align = (
+                f"atrim=start={-relative_audio_start:.9f},"
+                "asetpts=PTS-STARTPTS"
+            )
+        duration_s = frames / FPS
+        audio_filter = (
+            f"{align},atrim=start=0:end={duration_s:.9f},"
+            f"apad=whole_dur={duration_s:.9f},"
+            f"atrim=start=0:end={duration_s:.9f},asetpts=PTS-STARTPTS"
+        )
+        argv += [
+            "-map", "0:a:0", "-af", audio_filter,
+            "-c:a", "aac", "-ar", "48000", "-ac", "2",
+            "-t", f"{duration_s:.9f}",
+        ]
+    else:
+        argv += ["-an"]
+    argv.append(str(destination))
+    _run(argv, step=f"normalizing segment {index + 1}")
 
 
 def _validate_output(path: Path, expected_duration_s: float, audio_mode: str,
@@ -247,7 +340,10 @@ def _validate_output(path: Path, expected_duration_s: float, audio_mode: str,
             f"final video duration {info.duration_s:.6f}s differs from "
             f"target {expected_duration_s:.6f}s by more than one frame"
         )
-    expected_audio = audio_mode == "keep" and source_has_audio
+    expected_audio = (
+        audio_mode == "provider_generated"
+        or (audio_mode == "keep" and source_has_audio)
+    )
     if info.has_audio != expected_audio:
         raise StitchError("final audio streams do not match requested audio strategy")
     return info
@@ -304,7 +400,15 @@ def stitch_video(
         normalized_paths: list[Path] = []
         for index, (segment, frames) in enumerate(zip(normalized, budgets), 1):
             segment_output = tmp / f"segment-{index:04d}.mp4"
-            _normalize_segment(segment, segment_output, frames, width, height, index - 1)
+            _normalize_segment(
+                segment,
+                segment_output,
+                frames,
+                width,
+                height,
+                index - 1,
+                audio_mode,
+            )
             normalized_paths.append(segment_output)
 
         concat_file = tmp / "concat.txt"
@@ -313,12 +417,18 @@ def stitch_video(
             encoding="utf-8",
         )
         joined = tmp / "joined.mp4"
+        concat_argv = [
+            "ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "1",
+            "-i", concat_file.name, "-map", "0:v:0",
+        ]
+        if audio_mode == "provider_generated":
+            concat_argv += ["-map", "0:a:0"]
+        concat_argv += ["-c", "copy"]
+        if audio_mode != "provider_generated":
+            concat_argv += ["-an"]
+        concat_argv += ["-movflags", "+faststart", joined.name]
         _run(
-            [
-                "ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "1",
-                "-i", concat_file.name, "-map", "0:v:0", "-c:v", "copy", "-an",
-                "-movflags", "+faststart", joined.name,
-            ],
+            concat_argv,
             cwd=tmp,
             step="concatenating normalized segments",
         )
@@ -353,7 +463,7 @@ def stitch_video(
         output_size = candidate.stat().st_size
         payload = {
             "schema": "duet.stitch",
-            "version": 1,
+            "version": 2 if audio_mode == "provider_generated" else 1,
             "segments": segment_bindings,
             "audio": {
                 "mode": audio_mode,
@@ -369,6 +479,17 @@ def stitch_video(
                 "fps": FPS,
             },
         }
+        if audio_mode == "provider_generated":
+            payload["audio"]["provider_segments"] = [
+                _provider_binding(segment, index)
+                for index, segment in enumerate(normalized, 1)
+            ]
+            payload["audio"]["edl"] = {
+                "schema": "duet.av-edl",
+                "version": 1,
+                "fps": FPS,
+                "interval": "integer-half-open",
+            }
         temporary_receipt = tmp / "receipt.json"
         temporary_receipt.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

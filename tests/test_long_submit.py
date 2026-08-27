@@ -43,7 +43,7 @@ def _mock_provider_bound_segment_outputs(monkeypatch):
     monkeypatch.setattr(
         long_generation,
         "stitched_output_is_reusable",
-        lambda plan, _dialogue_mode: (
+        lambda plan, _dialogue_mode, **_kwargs: (
             plan.root.joinpath("generated.mp4").is_file()
             and plan.root.joinpath("generated.mp4").stat().st_size > 0
         ),
@@ -3520,3 +3520,245 @@ def test_long_invalid_top_output_is_hidden_and_restitched_without_provider(
     assert client.get(f"/api/conversations/{cid}", headers=AUTH).json()["has_video"] is True
     listed = client.get("/api/conversations", headers=AUTH).json()
     assert next(item for item in listed if item["id"] == cid)["has_video"] is True
+
+
+def _native_audio_plan(settings, *, segment_count: int = 2):
+    meta = storage.new_conversation(settings.data_dir, "native audio", "source.mp4")
+    cid = meta["id"]
+    root = settings.data_dir / cid
+    source = root / "source.mp4"
+    source.write_bytes(b"source")
+    segments = []
+    states = []
+    for index in range(1, segment_count + 1):
+        workdir = root / "work" / "segments" / str(index)
+        workdir.mkdir(parents=True, exist_ok=True)
+        anchor = workdir / "anchor.png"
+        segments.append(long_generation.FrozenSegment(
+            index=index,
+            start_s=float(index - 1),
+            end_s=float(index),
+            chain_id="chain-001",
+            join_mode="hard_cut" if index == 1 else "continue",
+            workdir=workdir,
+            first_frame=anchor,
+            first_frame_data=b"frame",
+            last_frame=anchor,
+            last_frame_data=b"frame",
+            prompt=f"segment {index}",
+        ))
+        states.append({
+            "index": index,
+            "chain_id": "chain-001",
+            "join_mode": "hard_cut" if index == 1 else "continue",
+            "status": "succeeded",
+            "attempt": 1,
+            "error": None,
+            "child_request_id": f"child-{index}",
+            "h3_attempt_id": f"{index:06d}",
+        })
+    plan = long_generation.FrozenPlan(
+        root=root,
+        source=source,
+        receipt="frozen-plan",
+        segments=tuple(segments),
+        workflow="test-h3-multimodal",
+    )
+    generation = {
+        "status": "succeeded",
+        "error": None,
+        "attempt": 1,
+        "client_request_id": "parent-request",
+        "stage": "h3",
+        "fit_layout": long_generation.FIT_LAYOUT_ASPECT,
+        "fast_mode": False,
+        "workflow": plan.workflow,
+        "audio_route": dict(long_generation.H3_NATIVE_AUDIO_ROUTE),
+        "segments": states,
+    }
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        dialogue_mode="auto",
+        aspect_ratio="9:16",
+        resolution="768p",
+        generation=generation,
+    )
+    return cid, plan, generation
+
+
+def _make_tone_video(path: Path, *, color: str, frequency: int, duration: float):
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i",
+            f"color=c={color}:s=160x120:r=24:d={duration}",
+            "-f", "lavfi", "-i",
+            f"sine=frequency={frequency}:sample_rate=48000:duration={duration}",
+            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _tone_amplitude(samples: np.ndarray, frequency: int) -> float:
+    windowed = samples * np.hanning(len(samples))
+    spectrum = np.abs(np.fft.rfft(windowed))
+    frequencies = np.fft.rfftfreq(len(samples), 1 / 48000)
+    return float(spectrum[np.argmin(np.abs(frequencies - frequency))])
+
+
+def test_run_h3_native_audio_never_restores_source_track(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, plan, generation = _native_audio_plan(settings)
+    _make_tone_video(plan.source, color="black", frequency=220, duration=2)
+    _make_tone_video(
+        plan.segments[0].workdir / "generated.mp4",
+        color="red",
+        frequency=440,
+        duration=1,
+    )
+    _make_tone_video(
+        plan.segments[1].workdir / "generated.mp4",
+        color="blue",
+        frequency=880,
+        duration=1,
+    )
+    monkeypatch.setattr(
+        h3, "H3_MULTIMODAL_WORKFLOWS", frozenset({plan.workflow}), raising=False
+    )
+    monkeypatch.setattr(h3, "is_multimodal_request", lambda _request: True, raising=False)
+    monkeypatch.setattr(
+        long_generation,
+        "bound_reusable_segment_indices",
+        lambda *_args, **_kwargs: frozenset({1, 2}),
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "_request",
+        lambda _settings, _cid, _plan, segment, *_args, **_kwargs: SimpleNamespace(
+            segment_index=segment.index
+        ),
+    )
+    timeline_calls = []
+
+    def load_timeline(request, attempt_id):
+        timeline_calls.append((request.segment_index, attempt_id))
+        return {
+            "schema": "duet.h3.media_timeline",
+            "version": 1,
+            "decode_complete": True,
+            "video": {"index": 0},
+            "audio": {"index": 1, "decoded_sha256": f"{request.segment_index:064x}"},
+        }
+
+    monkeypatch.setattr(h3, "load_media_timeline_receipt", load_timeline)
+    monkeypatch.setattr(
+        long_generation, "stitched_output_is_reusable",
+        _REAL_STITCHED_OUTPUT_IS_REUSABLE,
+    )
+
+    long_generation.run(settings, cid, plan)
+
+    assert timeline_calls == [(1, "000001"), (2, "000002")]
+    output = plan.root / "generated.mp4"
+    decoded = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", str(output), "-map", "0:a:0",
+            "-f", "f32le", "-ac", "1", "-ar", "48000", "-",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    samples = np.frombuffer(decoded, dtype=np.float32)
+    first = samples[int(0.15 * 48000):int(0.85 * 48000)]
+    second = samples[int(1.15 * 48000):int(1.85 * 48000)]
+    assert _tone_amplitude(first, 440) > 20 * _tone_amplitude(first, 220)
+    assert _tone_amplitude(second, 880) > 20 * _tone_amplitude(second, 220)
+    receipt = json.loads((plan.root / stitch.RECEIPT_FILENAME).read_text())
+    assert receipt["version"] == 2
+    assert receipt["audio"]["mode"] == "provider_generated"
+    assert [item["attempt_id"] for item in receipt["audio"]["provider_segments"]] == [
+        "000001", "000002",
+    ]
+    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+
+
+def test_h3_native_submission_unknown_never_calls_stitch(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, plan, generation = _native_audio_plan(settings, segment_count=1)
+    generation["status"] = "running"
+    generation["segments"][0]["status"] = "running"
+    storage.update_meta(settings.data_dir, cid, generation=generation)
+    monkeypatch.setattr(
+        h3, "H3_MULTIMODAL_WORKFLOWS", frozenset({plan.workflow}), raising=False
+    )
+    monkeypatch.setattr(
+        long_generation, "bound_reusable_segment_indices", lambda *_args: frozenset()
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "_request",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        h3,
+        "resume",
+        lambda _request: h3.H3Result("submission_unknown", "000001"),
+    )
+    monkeypatch.setattr(
+        stitch,
+        "stitch_video",
+        lambda **_kwargs: pytest.fail("unknown H3 attempt must not stitch"),
+    )
+
+    long_generation.run(settings, cid, plan, startup=True)
+
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "submission_unknown"
+    assert stored["segments"][0]["h3_attempt_id"] == "000001"
+
+
+@pytest.mark.parametrize("damage", ["missing_timeline", "missing_audio"])
+def test_h3_native_missing_audio_evidence_never_falls_back_to_source(
+    tmp_path, monkeypatch, damage,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, plan, _generation = _native_audio_plan(settings, segment_count=1)
+    monkeypatch.setattr(
+        h3, "H3_MULTIMODAL_WORKFLOWS", frozenset({plan.workflow}), raising=False
+    )
+    monkeypatch.setattr(h3, "is_multimodal_request", lambda _request: True, raising=False)
+    monkeypatch.setattr(
+        long_generation, "bound_reusable_segment_indices", lambda *_args: frozenset({1})
+    )
+    monkeypatch.setattr(
+        long_generation, "_request", lambda *_args, **_kwargs: SimpleNamespace()
+    )
+
+    def damaged_timeline(_request, _attempt_id):
+        if damage == "missing_timeline":
+            raise h3.ReceiptError("media_timeline_missing")
+        return {
+            "schema": "duet.h3.media_timeline",
+            "version": 1,
+            "decode_complete": True,
+            "video": {"index": 0},
+            "audio": None,
+        }
+
+    monkeypatch.setattr(h3, "load_media_timeline_receipt", damaged_timeline)
+    monkeypatch.setattr(
+        stitch,
+        "stitch_video",
+        lambda **_kwargs: pytest.fail("missing H3 audio must not stitch"),
+    )
+
+    long_generation.run(settings, cid, plan)
+
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "failed"
+    assert stored["error"] == "long_video_h3_native_audio_invalid"
