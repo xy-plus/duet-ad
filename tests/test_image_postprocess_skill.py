@@ -326,6 +326,29 @@ def test_skill_and_human_plan_scope_only_define_source_to_target_image_editing()
             assert out_of_scope not in document
 
 
+def test_skill_preserves_the_accepted_v4_generation_contract_in_full():
+    skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
+
+    for rule in (
+        "图恰含 `components/topology/views`",
+        "非空 `component_id/target_spec`",
+        "端点闭合、排序、无自指/重复/环",
+        "observations 对全部组件恰好一次",
+        "端点当前可见、排序、无自指/重复/环",
+        "`full` 是完整边界在画内",
+        "description 唯一且说明可见形态与画面位置",
+        "端点只许当前帧实体或当前帧可观察 PERSON",
+        "禁止重复、冲突和有向环",
+        "后端从冻结 source 像素计算并覆盖此精确 Lab 合同",
+        "模型不得自报或决定精确 Lab 合同",
+        "此类约束不改变人物与场景双替换目标，也不降低现有可见事实的保留要求",
+        "内容不确定不得转化为拒绝",
+        "`not_observable` 的 `observable_frames=[]`",
+        "`scene_plans.segments` 无重叠覆盖 `segment_indices`",
+    ):
+        assert rule in skill
+
+
 def test_verification_skill_path_is_strict_regular_non_symlink(tmp_path, monkeypatch):
     path = image_optimization.verification_skill_path()
     assert path == path.resolve(strict=True)
@@ -366,6 +389,7 @@ def test_skill_synthesizes_continuity_target_separation_from_source_evidence():
         "不得仅调色、换纹理或给原结构换皮",
         "新几何只产生与原光源一致的局部阴影或反射",
         "source-preserve/no-invention 编辑指令",
+        "内容不确定不得转化为拒绝",
     ):
         assert rule in skill
 
@@ -906,7 +930,7 @@ def test_skill_requires_a_current_frame_fragment_ledger_and_schema_self_audit():
         "`partial/cropped` 不得写成 `absent/fully-in-frame`",
         "不从相邻帧、reference 或编辑结果补证",
         "输出前逐字段自校验",
-        "source-preserve/no-invention 编辑指令",
+        "内容不确定不得转化为拒绝",
     ):
         assert rule in skill
 
@@ -996,7 +1020,7 @@ def test_skill_requires_current_frame_visible_coverage_without_admission_gate():
         "人体、面部拓扑、服装边界与裁切碎片形成闭包",
         "不同边界、法向、深度层或支撑链的物理面不得合并",
         "所有可见碎片写入 `visible_body_parts`",
-        "source-preserve/no-invention 编辑指令",
+        "内容不确定不得转化为拒绝",
     ):
         assert rule in skill
 
@@ -1021,8 +1045,8 @@ def test_v4_skill_compiles_valid_frozen_inputs_and_preserves_ambiguous_regions()
         assert "eligible=false" not in document
         assert "素材准入" not in document
 
-    assert "eligible:true" in skill
-    assert "reason:null" in skill
+    assert '"eligible":true' in skill
+    assert '"reason":null' in skill
 
 
 def test_skill_scopes_visible_relationships_without_content_failure_reasons():
@@ -1036,6 +1060,7 @@ def test_skill_scopes_visible_relationships_without_content_failure_reasons():
         "不从相邻帧、reference 或编辑结果补证",
         "不把候选关系写入合同",
         "source-preserve/no-invention 编辑指令",
+        "内容不确定不得转化为拒绝",
     ):
         assert rule in skill
 
@@ -1787,7 +1812,7 @@ def test_v4_visibility_transition_is_source_preservation_not_skill_rejection():
     assert graph["views"][2]["observations"][1]["visibility"] == "out_of_view"
     for document in (skill, human):
         assert "same_camera 的 `occluded`→`out_of_view`" in document
-        assert "只按当前源帧可见性" in document
+        assert "不得作为内容 schema 拒绝" in document
 
 
 def _make_topology_cycle(value: dict) -> None:
@@ -2434,4 +2459,5 @@ def test_skill_requires_backend_pixel_authoritative_global_palette_contract():
         assert "saturation_style" in text
         assert "局部固有色" in text
         assert "不得翻转整帧冷暖感知" in text
-        assert "全局光源方向" in text
+        assert "后端从冻结 source 像素计算并覆盖" in text
+        assert "模型不得自报或决定精确 Lab 合同" in text
