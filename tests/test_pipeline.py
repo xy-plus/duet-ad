@@ -668,7 +668,12 @@ def test_run_converges_container_duration_to_visual_manifest_timeline(
 
     monkeypatch.setattr(pipeline, "_process_segment", fake_process_segment)
     monkeypatch.setattr(long_video, "write_plan_receipt", fake_write)
-    def fake_freeze(root, meta, receipt, fit_mode, dialogue_mode):
+    expected_settings = settings
+
+    def fake_freeze(
+        root, meta, receipt, fit_mode, dialogue_mode, *, settings,
+    ):
+        assert settings is expected_settings
         seg = meta["segments"][0]
         segdir = Path(root) / "work" / "segments" / "1"
         first = segdir / "work" / "anchors" / "first.png"

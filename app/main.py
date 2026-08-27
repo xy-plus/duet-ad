@@ -2888,6 +2888,7 @@ def create_app(settings: Settings) -> FastAPI:
                         aspect_ratio=aspect_ratio,
                         resolution=resolution,
                         prepare_fit=not isinstance(old, dict),
+                        settings=settings,
                     )
                 except long_generation.LongGenerationError as exc:
                     if claim_owner:

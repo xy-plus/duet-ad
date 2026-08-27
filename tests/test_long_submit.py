@@ -1325,6 +1325,90 @@ def test_long_v4_combined_first_promotion_binds_settings_and_is_unpaid(
     assert storage.load_meta(settings.data_dir, cid).get("generation") is None
 
 
+def test_long_v4_optimized_nine_frames_final_freeze_binds_settings(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    root = settings.data_dir / cid
+    base_plan = long_generation.freeze_plan(
+        root,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+        settings=settings,
+    )
+    frame_refs = []
+    for index in range(1, 10):
+        relative = f"segments/1/work/postprocessed/{index:02d}.png"
+        _png(root / "work" / relative, 100 + index)
+        frame_refs.append(relative)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={
+            "status": "done",
+            "options": {
+                "remove_subtitle": True,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+            "frames": frame_refs,
+        },
+        _image_optimization={"version": 4},
+        _v4_canvas_execution={"version": 1},
+    )
+    freeze_calls = []
+    coordinator_calls = []
+    expected_settings = settings
+
+    def finalize(root_, meta, expected, fit_mode, dialogue_mode, **kwargs):
+        assert kwargs["settings"] is settings
+        assert root_ == root
+        assert expected == receipt
+        assert fit_mode == "none"
+        assert dialogue_mode == "auto"
+        assert meta["postprocess"]["frames"] == frame_refs
+        assert all((root / "work" / relative).is_file() for relative in frame_refs)
+        return None
+
+    def freeze(
+        root_, meta, expected, fit_mode, dialogue_mode, *,
+        aspect_ratio, resolution, prepare_fit, settings,
+    ):
+        assert settings is expected_settings
+        assert meta["postprocess"]["frames"] == frame_refs
+        freeze_calls.append((
+            root_, expected, fit_mode, dialogue_mode,
+            aspect_ratio, resolution, prepare_fit,
+        ))
+        return base_plan
+
+    monkeypatch.setattr(
+        long_generation, "finalize_multimodal_plan", finalize
+    )
+    monkeypatch.setattr(long_generation, "freeze_plan", freeze)
+    monkeypatch.setattr(
+        long_generation,
+        "run",
+        lambda *args: coordinator_calls.append(args),
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt),
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {"status": "queued", "attempt": 1}
+    assert freeze_calls == [(
+        root, receipt, "none", "auto", "9:16", "768p", True,
+    )]
+    assert coordinator_calls == [(settings, cid, base_plan)]
+
+
 def test_long_on_screen_refresh_queues_project_speaker_producer(
     enabled, monkeypatch,
 ):
