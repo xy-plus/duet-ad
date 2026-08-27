@@ -129,6 +129,7 @@ describe('ApiClient', () => {
       confirm: true,
       client_request_id: 'request-1',
       dialogue_mode: 'auto',
+      dialogue_delivery: 'auto',
       fit_mode: 'none',
       aspect_ratio: '16:9',
       resolution: '480p',
@@ -136,6 +137,10 @@ describe('ApiClient', () => {
     await client.postprocessConversation('c1', {
       confirm: true,
       options: { remove_subtitle: true, remove_brand: false, optimize_image: false },
+    });
+    await client.acceptImageOptimization('c1', {
+      confirm: true,
+      expected_meta_sha256: 'c'.repeat(64),
     });
     await client.retryPostprocessSegment('c1', 2, { confirm: true, expected_revision: 4 });
 
@@ -148,11 +153,16 @@ describe('ApiClient', () => {
       '/api/conversations/c1/image-optimization-prompt',
       '/api/conversations/c1/submit',
       '/api/conversations/c1/postprocess',
+      '/api/conversations/c1/image-acceptance',
       '/api/conversations/c1/postprocess/segments/2/retry',
     ]);
     expect(new Headers(requests[1].init?.headers).get('Authorization')).toBe('Bearer secret');
     expect(requests.slice(2).map(({ init }) => init?.method ?? 'GET'))
-      .toEqual(['GET', 'PATCH', 'PATCH', 'POST', 'POST', 'POST']);
+      .toEqual(['GET', 'PATCH', 'PATCH', 'POST', 'POST', 'POST', 'POST']);
+    expect(JSON.parse(String(requests[7].init?.body))).toEqual({
+      confirm: true,
+      expected_meta_sha256: 'c'.repeat(64),
+    });
   });
 
   it('uses the default fetch without binding it to globalThis', async () => {
@@ -259,6 +269,7 @@ describe('ApiClient', () => {
       confirm: true as const,
       client_request_id: 'request-1',
       dialogue_mode: 'auto' as const,
+      dialogue_delivery: 'auto' as const,
       fit_mode: 'none' as const,
       aspect_ratio: '16:9' as const,
       resolution: '480p' as const,
@@ -297,6 +308,7 @@ describe('ApiClient', () => {
       confirm: true as const,
       client_request_id: 'request-ambiguous',
       dialogue_mode: 'auto' as const,
+      dialogue_delivery: 'auto' as const,
       fit_mode: 'none' as const,
       aspect_ratio: '16:9' as const,
       resolution: '480p' as const,
@@ -350,6 +362,7 @@ describe('ApiClient', () => {
       confirm: true as const,
       client_request_id: 'request-resume',
       dialogue_mode: 'auto' as const,
+      dialogue_delivery: 'auto' as const,
       fit_mode: 'none' as const,
       aspect_ratio: '16:9' as const,
       resolution: '480p' as const,
@@ -395,6 +408,7 @@ describe('ApiClient', () => {
       confirm: true as const,
       client_request_id: 'request-new',
       dialogue_mode: 'auto' as const,
+      dialogue_delivery: 'auto' as const,
       fit_mode: 'none' as const,
       aspect_ratio: '16:9' as const,
       resolution: '480p' as const,
@@ -428,6 +442,7 @@ describe('ApiClient', () => {
       confirm: true as const,
       client_request_id: 'request-persisted',
       dialogue_mode: 'auto' as const,
+      dialogue_delivery: 'auto' as const,
       fit_mode: 'none' as const,
       aspect_ratio: '16:9' as const,
       resolution: '480p' as const,
@@ -468,6 +483,7 @@ describe('ApiClient', () => {
         confirm: true as const,
         client_request_id: 'request-survives-session',
         dialogue_mode: 'auto' as const,
+        dialogue_delivery: 'auto' as const,
         fit_mode: 'none' as const,
         aspect_ratio: '16:9' as const,
         resolution: '480p' as const,
@@ -512,6 +528,7 @@ describe('ApiClient', () => {
       confirm: true,
       client_request_id: 'request-storage-failure',
       dialogue_mode: 'auto',
+      dialogue_delivery: 'auto',
       fit_mode: 'none',
       aspect_ratio: '16:9',
       resolution: '480p',

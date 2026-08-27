@@ -34,6 +34,26 @@ describe('GenerationStatus', () => {
   });
 
   it.each([
+    ['context_ir_native', '音频与 Context IR 准备中'],
+    ['h3', 'H3 视频生成中'],
+    ['stitch', '正在合成最终视频'],
+  ])('renders the server stage %s as a user-visible pipeline step', (stageLabel, expected) => {
+    render(
+      <GenerationStatus
+        model={{
+          phase: 'running',
+          generationId: 'generation-running',
+          paidTaskCount: 1,
+          segments: [],
+          stageLabel,
+        }}
+      />,
+    );
+
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+
+  it.each([
     [
       'new',
       { phase: 'new', paidTaskCount: 2, segments: [] } satisfies GenerationStatusModel,
@@ -112,6 +132,18 @@ describe('GenerationStatus', () => {
     );
 
     expect(screen.getByText('付费任务数：未知')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '确认生成' })).toBeDisabled();
+  });
+
+  it('keeps the paid action visible but disabled while required settings are missing', () => {
+    render(
+      <GenerationStatus
+        model={{ phase: 'new', paidTaskCount: 1, segments: [] }}
+        actionDisabled
+        onAction={vi.fn()}
+      />,
+    );
+
     expect(screen.getByRole('button', { name: '确认生成' })).toBeDisabled();
   });
 

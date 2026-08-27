@@ -2,6 +2,7 @@ import { Card, Descriptions, Form, Input, Radio, Select, Typography } from '../.
 import './generation.css';
 import type {
   DialogueMode,
+  DialogueDelivery,
   FitMode,
   GenerationEvidence,
   GenerationSettingsValue,
@@ -13,6 +14,18 @@ const dialogueLabels: Record<DialogueMode, string> = {
   edit: '编辑识别台词',
   custom: '自定义台词',
   none: '无台词',
+};
+
+const dialogueDeliveryLabels: Record<DialogueDelivery, string> = {
+  auto: '自动',
+  on_screen: '画内',
+  off_screen: '画外',
+};
+
+const dialogueDeliveryDescriptions: Record<DialogueDelivery, string> = {
+  auto: '由服务端根据音频内容自动选择；歌唱内容会自动采用画外呈现。',
+  on_screen: '要求可验证的画面说话人，必要时会先刷新说话人证据。',
+  off_screen: '保留音频条件，不要求画面人物嘴型。',
 };
 
 const fitLabels: Record<FitMode, string> = {
@@ -40,6 +53,11 @@ function frozenItems(evidence: GenerationEvidence) {
   const missing = '未提供';
   const items = [
     { key: 'dialogue', label: '台词模式', children: values ? dialogueLabels[values.dialogueMode] : missing },
+    {
+      key: 'dialogue-delivery',
+      label: '声音呈现',
+      children: values?.dialogueDelivery ? dialogueDeliveryLabels[values.dialogueDelivery] : missing,
+    },
     { key: 'aspect', label: '画幅', children: values?.aspectRatio ?? missing },
     { key: 'resolution', label: '清晰度', children: values?.resolution ?? missing },
     { key: 'fit', label: '画面适配', children: values ? fitLabels[values.fitMode] : missing },
@@ -116,6 +134,26 @@ export function GenerationSettings({
                 </Radio.Button>
               ))}
             </Radio.Group>
+          </Form.Item>
+
+          <Form.Item label="声音呈现" className="generation-settings-wide">
+            <Radio.Group
+              aria-label="声音呈现"
+              name="generation-dialogue-delivery"
+              value={current.dialogueDelivery ?? undefined}
+              onChange={(event) => emit('dialogueDelivery', event.target.value as DialogueDelivery)}
+            >
+              {(Object.keys(dialogueDeliveryLabels) as DialogueDelivery[]).map((delivery) => (
+                <Radio.Button key={delivery} value={delivery}>
+                  {dialogueDeliveryLabels[delivery]}
+                </Radio.Button>
+              ))}
+            </Radio.Group>
+            <Typography.Paragraph type="secondary" className="generation-dialogue-delivery-help">
+              {current.dialogueDelivery
+                ? dialogueDeliveryDescriptions[current.dialogueDelivery]
+                : '请选择声音呈现方式；未选择不会提交生成。'}
+            </Typography.Paragraph>
           </Form.Item>
 
           {dialogueEditable && videoKind === 'short' && (

@@ -76,6 +76,33 @@ describe('detail state contract', () => {
       ...long,
       postprocess: { status: 'done', segments: [segment(1, 'done'), segment(2, 'done')] },
     })).toBe(true);
+    expect(postprocessAllowsGeneration({
+      ...long,
+      image_acceptance: { required: true, accepted: false, expected_meta_sha256: 'a'.repeat(64) },
+      postprocess: { status: 'done', segments: [segment(1, 'done'), segment(2, 'done')] },
+    })).toBe(false);
+    expect(postprocessAllowsGeneration({
+      ...long,
+      image_acceptance: { required: true, accepted: true, expected_meta_sha256: 'a'.repeat(64) },
+      postprocess: { status: 'done', segments: [segment(1, 'done'), segment(2, 'done')] },
+    })).toBe(true);
+  });
+
+  it('adapts the image acceptance CAS contract and rejects malformed evidence', () => {
+    expect(adaptConversationDetail({
+      image_acceptance: { required: true, accepted: false, expected_meta_sha256: 'a'.repeat(64) },
+    }).imageAcceptance).toEqual({
+      required: true,
+      accepted: false,
+      expectedMetaSha256: 'a'.repeat(64),
+    });
+    expect(adaptConversationDetail({
+      image_acceptance: { required: true, accepted: false, expected_meta_sha256: 'bad' },
+    }).imageAcceptance).toBeNull();
+    expect(postprocessAllowsGeneration({
+      image_acceptance: { required: true, accepted: false, expected_meta_sha256: 'bad' },
+      postprocess: null,
+    })).toBe(false);
   });
 
   it('fails closed for done postprocess records with missing or malformed segments', () => {

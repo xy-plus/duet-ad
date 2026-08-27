@@ -13,6 +13,7 @@ import type {
   ConversationDetail,
   ConversationSummary,
   GenerationSubmitPayload,
+  ImageAcceptancePayload,
   ImageOptimizationPromptPatchPayload,
   PostprocessPayload,
   PostprocessSegmentRetryPayload,
@@ -236,6 +237,17 @@ export function usePostprocessConversationMutation(api: ApiClient, id: string) {
     mutationFn: (payload: PostprocessPayload) => api.postprocessConversation(id, payload),
     retry: false,
     onSettled: () => invalidateConversation(queryClient, sessionKey, id),
+  });
+}
+
+export function useAcceptImageOptimizationMutation(api: ApiClient, id: string) {
+  const queryClient = useQueryClient();
+  const sessionKey = useApiSessionKey(api);
+  return useMutation({
+    mutationKey: [...queryKeys.detail(sessionKey, id), 'image-acceptance'],
+    mutationFn: (payload: ImageAcceptancePayload) => api.acceptImageOptimization(id, payload),
+    retry: false,
+    onSuccess: () => invalidateConversation(queryClient, sessionKey, id),
   });
 }
 

@@ -124,6 +124,181 @@ describe('production App integration', () => {
       .toEqual(expect.objectContaining({}));
   });
 
+  it('requires one CAS-bound user confirmation before optimized images can be submitted', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    let acceptanceCalls = 0;
+    let acceptancePayload: unknown;
+    let accepted = false;
+    const acceptance = () => ({
+      required: true,
+      accepted,
+      expected_meta_sha256: (accepted ? 'c' : 'b').repeat(64),
+    });
+    const currentDetail = () => ({
+      ...baseDetail,
+      navigation_status: 'analysis_complete',
+      generation: null,
+      image_acceptance: acceptance(),
+      postprocess: {
+        status: 'done',
+        options: { remove_subtitle: false, remove_brand: false, optimize_image: true },
+        frames: [],
+        error: null,
+        segments: [{
+          index: 0, status: 'done', stage: 'done', completed_frames: 1,
+          total_frames: 1, revision: 1, error: null,
+        }],
+      },
+    });
+    const fetchImplementation = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/conversations') return Response.json([currentDetail()]);
+      if (url === '/api/conversations/cid-1') return Response.json(currentDetail());
+      if (url === '/api/conversations/cid-1/image-acceptance') {
+        acceptanceCalls += 1;
+        acceptancePayload = JSON.parse(String(init?.body));
+        accepted = true;
+        return Response.json({ status: 'accepted', image_acceptance: acceptance() });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      fetchImplementation,
+      sessionKeyFactory: () => 'acceptance-session',
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+
+    expect(await screen.findByText('请先确认使用当前优化图，再生成视频')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '确认生成' })).not.toBeInTheDocument();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: '确认使用当前优化图生成视频' }));
+
+    await waitFor(() => expect(acceptanceCalls).toBe(1));
+    expect(acceptancePayload).toEqual({
+      confirm: true,
+      expected_meta_sha256: 'b'.repeat(64),
+    });
+    expect(await screen.findByText('已确认使用当前优化图生成视频')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '确认生成' })).toBeDisabled();
+    await user.click(screen.getByText('画外', { exact: true }));
+    expect(screen.getByRole('button', { name: '确认生成' })).toBeEnabled();
+  });
+
+  it('reports an image acceptance CAS conflict without automatically resending it', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    let acceptanceCalls = 0;
+    const detail = {
+      ...baseDetail,
+      navigation_status: 'analysis_complete',
+      generation: null,
+      image_acceptance: {
+        required: true, accepted: false, expected_meta_sha256: 'b'.repeat(64),
+      },
+      postprocess: {
+        status: 'done',
+        options: { remove_subtitle: false, remove_brand: false, optimize_image: true },
+        frames: [],
+        error: null,
+        segments: [{
+          index: 0, status: 'done', stage: 'done', completed_frames: 1,
+          total_frames: 1, revision: 1, error: null,
+        }],
+      },
+    };
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'acceptance-conflict-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([detail]);
+        if (url === '/api/conversations/cid-1') return Response.json(detail);
+        if (url === '/api/conversations/cid-1/image-acceptance') {
+          acceptanceCalls += 1;
+          return Response.json(
+            { detail: 'image_acceptance_meta_changed' },
+            { status: 409 },
+          );
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: '确认使用当前优化图生成视频' }));
+
+    expect(await screen.findByText('优化图版本已变化，请刷新后重新确认。')).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(acceptanceCalls).toBe(1);
+  });
+
+  it('keeps an explicit off-screen choice across multimodal refresh without automatic resubmit', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem('cvs_token', 'stored-token');
+    const submitPayloads: unknown[] = [];
+    const detail = {
+      ...baseDetail,
+      navigation_status: 'analysis_complete',
+      generation: null,
+      dialogue_delivery: null,
+      image_acceptance: {
+        required: true, accepted: true, expected_meta_sha256: 'c'.repeat(64),
+      },
+      postprocess: {
+        status: 'done',
+        options: { remove_subtitle: false, remove_brand: false, optimize_image: true },
+        frames: [],
+        error: null,
+        segments: [{
+          index: 0, status: 'done', stage: 'done', completed_frames: 1,
+          total_frames: 1, revision: 1, error: null,
+        }],
+      },
+    };
+    const { apiClient, queryClient } = createApiRuntime({
+      storage,
+      sessionKeyFactory: () => 'delivery-refresh-session',
+      fetchImplementation: vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === '/api/conversations') return Response.json([detail]);
+        if (url === '/api/conversations/cid-1') return Response.json(detail);
+        if (url === '/api/conversations/cid-1/submit') {
+          submitPayloads.push(JSON.parse(String(init?.body)));
+          if (submitPayloads.length === 1) {
+            return Response.json({
+              detail: {
+                code: 'multimodal_input_refresh_required',
+                message: '需要刷新多模态输入',
+              },
+            }, { status: 409 });
+          }
+          return Response.json({ status: 'queued', attempt: 1 });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    });
+
+    render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
+    const user = userEvent.setup();
+    expect(await screen.findByRole('button', { name: '确认生成' })).toBeDisabled();
+    await user.click(screen.getByText('画外', { exact: true }));
+    await user.click(screen.getByRole('button', { name: '确认生成' }));
+
+    expect(await screen.findByText('音频与画面输入需要刷新，请等待页面更新后再次确认生成。'))
+      .toBeInTheDocument();
+    expect(submitPayloads).toHaveLength(1);
+    expect(submitPayloads[0]).toMatchObject({ dialogue_delivery: 'off_screen' });
+    expect(screen.getByRole('radio', { name: '画外' })).toBeChecked();
+
+    await user.click(screen.getByRole('button', { name: '确认生成' }));
+    await waitFor(() => expect(submitPayloads).toHaveLength(2));
+    expect(submitPayloads[1]).toMatchObject({ dialogue_delivery: 'off_screen' });
+  });
+
   it.each([
     ['read_only', { read_only: true, submit_enabled: true }],
     ['submit_disabled', { read_only: false, submit_enabled: false }],

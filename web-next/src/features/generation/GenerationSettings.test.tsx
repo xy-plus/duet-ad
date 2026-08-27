@@ -7,6 +7,7 @@ import type { GenerationSettingsValue } from './types';
 
 const recommended: GenerationSettingsValue = {
   dialogueMode: 'auto',
+  dialogueDelivery: 'auto',
   dialogueText: '',
   aspectRatio: '16:9',
   resolution: '768p',
@@ -32,6 +33,40 @@ describe('GenerationSettings', () => {
     expect(screen.getByRole('radio', { name: '自定义台词' })).toBeEnabled();
     expect(screen.getByRole('radio', { name: '无台词' })).toBeEnabled();
     expect(screen.getByText('768p')).toBeInTheDocument();
+  });
+
+  it('shows all sound delivery choices and explains the selected contract', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <GenerationSettings
+        videoKind="short"
+        initialValues={recommended}
+        value={recommended}
+        onChange={onChange}
+      />,
+    );
+
+    expect(screen.getByRole('radio', { name: '自动' })).toBeChecked();
+    expect(screen.getByText(/歌唱内容会自动采用画外呈现/u)).toBeInTheDocument();
+    await user.click(screen.getByText('画外', { exact: true }));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ dialogueDelivery: 'off_screen' }));
+  });
+
+  it('does not silently select sound delivery when the caller requires a choice', () => {
+    render(
+      <GenerationSettings
+        videoKind="short"
+        initialValues={{ ...recommended, dialogueDelivery: null }}
+        value={{ ...recommended, dialogueDelivery: null }}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('请选择声音呈现方式；未选择不会提交生成。')).toBeInTheDocument();
+    for (const name of ['自动', '画内', '画外']) {
+      expect(screen.getByRole('radio', { name })).not.toBeChecked();
+    }
   });
 
   it('shows the dialogue editor for edit and custom values', () => {
@@ -100,6 +135,7 @@ describe('GenerationSettings', () => {
       segmentCount: 3,
       parameters: {
         dialogueMode: 'custom' as const,
+        dialogueDelivery: 'off_screen' as const,
         dialogueText: '服务端冻结台词',
         aspectRatio: '9:16' as const,
         resolution: '480p' as const,
@@ -121,6 +157,7 @@ describe('GenerationSettings', () => {
     expect(screen.getByText('9:16')).toBeInTheDocument();
     expect(screen.getByText('480p')).toBeInTheDocument();
     expect(screen.getByText('完整留白')).toBeInTheDocument();
+    expect(screen.getByText('画外')).toBeInTheDocument();
     expect(screen.getByText('30 秒')).toBeInTheDocument();
     expect(screen.getByText('3 段')).toBeInTheDocument();
     expect(screen.queryByRole('radio')).not.toBeInTheDocument();

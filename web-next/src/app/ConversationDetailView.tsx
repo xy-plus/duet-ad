@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import type { ApiClient } from '../api';
-import { isApiErrorCode } from '../api';
+import { ApiError, isApiErrorCode } from '../api';
 import {
   buildLongFailedRetryPayload,
   buildResumePayload,
@@ -26,6 +26,7 @@ import {
 import {
   queryKeys,
   useApiSessionKey,
+  useAcceptImageOptimizationMutation,
   useConversationDetailQuery,
   usePatchPromptMutation,
   usePatchImageOptimizationPromptMutation,
@@ -67,6 +68,27 @@ import {
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
+}
+
+function apiErrorMatches(error: unknown, code: string): boolean {
+  return isApiErrorCode(error, code)
+    || (error instanceof ApiError && error.detail === code);
+}
+
+function imageAcceptanceErrorMessage(error: unknown): string {
+  const detail = error instanceof ApiError ? error.detail : undefined;
+  const code = error instanceof ApiError
+    ? (typeof detail === 'string' ? detail : error.code)
+    : undefined;
+  if (code === 'image_acceptance_meta_changed') return '优化图版本已变化，请刷新后重新确认。';
+  if (code === 'generation_in_progress') return '视频生成已开始，不能再次确认优化图。';
+  if (code === 'image_acceptance_not_ready' || code === 'postprocess_artifacts_invalid') {
+    return '优化图尚未完整就绪，请刷新后重试。';
+  }
+  if (code === 'confirmation required' || code === 'invalid_image_acceptance_request') {
+    return '图片确认请求无效，请刷新后重试。';
+  }
+  return errorMessage(error, '优化图确认失败，请刷新后重试。');
 }
 
 function PromptSection({ apiClient, detail }: { apiClient: ApiClient; detail: ConversationDetail }) {
@@ -165,6 +187,7 @@ function updateGenerationDraft(
   value: GenerationSettingsValue,
 ): GenerationDraft {
   const parameterTouched = previous.parameterTouched
+    || previous.dialogueDelivery !== value.dialogueDelivery
     || previous.aspectRatio !== value.aspectRatio
     || previous.resolution !== value.resolution
     || previous.fitMode !== value.fitMode;
@@ -174,6 +197,7 @@ function updateGenerationDraft(
   return {
     ...previous,
     dialogueMode: value.dialogueMode,
+    dialogueDelivery: value.dialogueDelivery,
     aspectRatio: value.aspectRatio,
     resolution: value.resolution,
     fitMode: value.fitMode,
@@ -190,6 +214,7 @@ function newGenerationPayload(detail: ConversationDetail, draft: GenerationDraft
   return buildSubmitPayload({
     clientRequestId: newClientRequestId(),
     dialogueMode: draft.dialogueMode,
+    dialogueDelivery: draft.dialogueDelivery,
     linesText: draft.dialogueMode === 'edit' ? draft.editLinesText : draft.customLinesText,
     fitRequired: profile.fit_required,
     fitMode: draft.fitMode,
@@ -230,20 +255,24 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
   const model = generationStatusModel(detail, mutation.isPending);
   const operationAllowed = canOperate(detail);
   const postprocessReady = postprocessAllowsGeneration(detail);
+  const imageAcceptance = adaptConversationDetail(detail).imageAcceptance;
   const actionContract = generationRetryContract(detail);
-  const actionAuthorized = operationAllowed
+  const actionAvailable = operationAllowed
     && postprocessReady
     && draft !== null
     && !reconciling
     && actionContract.action !== 'none';
+  const deliveryMissing = draft?.dialogueMode !== 'none' && draft?.dialogueDelivery === null;
   const submit = async (action: GenerationAction) => {
-    if (!actionAuthorized || !postprocessAllowsGeneration(detail) || !draft) return;
+    if (!actionAvailable || deliveryMissing || !postprocessAllowsGeneration(detail) || !draft) return;
     setError(undefined);
     try {
       await mutation.mutateAsync(payloadForAction(detail, draft, action));
     } catch (submitError) {
       if (apiClient.isSubmissionReconciling(detail.id)) {
         setReconciling(true);
+      } else if (apiErrorMatches(submitError, 'multimodal_input_refresh_required')) {
+        setError('音频与画面输入需要刷新，请等待页面更新后再次确认生成。');
       } else {
         setError(errorMessage(submitError, '生成请求提交失败'));
       }
@@ -273,11 +302,21 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
         <Alert type="warning" showIcon title="当前会话不可执行生成动作" />
       ) : null}
       {!postprocessReady ? (
-        <Alert type="warning" showIcon title="后处理尚未完整完成，已禁止生成最终视频" />
+        <Alert
+          type="warning"
+          showIcon
+          title={imageAcceptance?.required && !imageAcceptance.accepted
+            ? '请先确认使用当前优化图，再生成视频'
+            : '后处理尚未完整完成，已禁止生成最终视频'}
+        />
+      ) : null}
+      {deliveryMissing ? (
+        <Alert type="warning" showIcon title="请选择声音呈现方式后再生成视频" />
       ) : null}
       <GenerationStatus
         model={model}
-        onAction={actionAuthorized ? (action) => { draftGuard.run(() => { void submit(action); }); } : undefined}
+        actionDisabled={deliveryMissing}
+        onAction={actionAvailable ? (action) => { draftGuard.run(() => { void submit(action); }); } : undefined}
       />
     </section>
   );
@@ -307,6 +346,7 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
   const queryClient = useQueryClient();
   const sessionKey = useApiSessionKey(apiClient);
   const mutation = usePostprocessConversationMutation(apiClient, detail.id);
+  const acceptanceMutation = useAcceptImageOptimizationMutation(apiClient, detail.id);
   const segmentRetryMutation = useRetryPostprocessSegmentMutation(apiClient, detail.id);
   const serverOptions = postprocessOptions(detail) ?? undefined;
   const serverTask = postprocessTask(detail);
@@ -317,6 +357,8 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
   const [error, setError] = useState<string>();
   const [retryingSegment, setRetryingSegment] = useState<number>();
   const operationAllowed = canOperate(detail);
+  const adapted = adaptConversationDetail(detail);
+  const imageAcceptance = adapted.imageAcceptance;
   const draftGuard = useUnsavedDraftGuard();
   const retrySegment = async (index: number, expectedRevision: number) => {
     if (retryingSegment !== undefined) return;
@@ -326,6 +368,24 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
     } catch (retryError) {
       setError(errorMessage(retryError, '分段后处理重试失败'));
     } finally { setRetryingSegment(undefined); }
+  };
+  const acceptImages = async () => {
+    if (!operationAllowed || detail.generation !== null || detail.postprocess?.status !== 'done'
+        || !imageAcceptance?.required || imageAcceptance.accepted
+        || typeof imageAcceptance.expectedMetaSha256 !== 'string') return;
+    setError(undefined);
+    try {
+      const response = await acceptanceMutation.mutateAsync({
+        confirm: true,
+        expected_meta_sha256: imageAcceptance.expectedMetaSha256,
+      });
+      queryClient.setQueryData<ConversationDetail>(
+        queryKeys.detail(sessionKey, detail.id),
+        { ...detail, image_acceptance: response.image_acceptance },
+      );
+    } catch (acceptanceError) {
+      setError(imageAcceptanceErrorMessage(acceptanceError));
+    }
   };
 
   useEffect(() => {
@@ -370,6 +430,7 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
   const unknownShape = Boolean(detail.postprocess?.status) && !serverTask;
   const canConfigure = detail.postprocess === null
     && detail.postprocess_enabled
+    && detail.generation === null
     && operationAllowed;
 
   return (
@@ -414,6 +475,34 @@ function PostprocessSection({ apiClient, detail }: { apiClient: ApiClient; detai
         }))}
         title={frames.length > 0 ? '优化后关键帧' : undefined}
       />
+      {detail.image_acceptance !== undefined && detail.image_acceptance !== null && !imageAcceptance ? (
+        <Alert type="error" showIcon title="服务端图片确认状态无效，已禁止生成视频" />
+      ) : null}
+      {imageAcceptance?.accepted ? (
+        <Alert type="success" showIcon title="已确认使用当前优化图生成视频" />
+      ) : null}
+      {imageAcceptance?.required && !imageAcceptance.accepted ? (
+        <Card title="确认优化图">
+          <Space orientation="vertical">
+            <Typography.Text>
+              请先查看上方优化后的关键帧，确认后才可使用当前版本生成视频。
+            </Typography.Text>
+            {imageAcceptance.expectedMetaSha256 === null ? (
+              <Alert type="error" showIcon title="图片确认凭据不可用，请刷新页面" />
+            ) : null}
+            <Button
+              type="primary"
+              loading={acceptanceMutation.isPending}
+              disabled={!operationAllowed || detail.generation !== null
+                || detail.postprocess?.status !== 'done'
+                || imageAcceptance.expectedMetaSha256 === null}
+              onClick={() => { void acceptImages(); }}
+            >
+              确认使用当前优化图生成视频
+            </Button>
+          </Space>
+        </Card>
+      ) : null}
     </section>
   );
 }
@@ -450,8 +539,8 @@ function LoadedConversationDetail({ apiClient, detail }: { apiClient: ApiClient;
       {detail.status === 'done' ? (
         <>
           {detail.segments.length === 0 ? <PromptSection apiClient={apiClient} detail={detail} /> : null}
-          <GenerationSection apiClient={apiClient} detail={detail} />
           <PostprocessSection apiClient={apiClient} detail={detail} />
+          <GenerationSection apiClient={apiClient} detail={detail} />
         </>
       ) : null}
       {detail.has_video ? (
