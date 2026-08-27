@@ -67,7 +67,7 @@ def _write_mask(path: Path, width: int = 4, height: int = 3, *, fill: str = "par
     assert cv2.imwrite(str(path), pixels)
 
 
-def _producer_receipt(plan, payload, *, component_id, shot_id, frame_id):
+def _producer_receipt(plan, payload, *, component_id, shot_id, frame_id, output):
     job = next(
         item
         for item in payload["propagation_jobs"]
@@ -95,6 +95,7 @@ def _producer_receipt(plan, payload, *, component_id, shot_id, frame_id):
         "edge_refiner": "birefnet",
         "edge_refinement_scope": "sam2_uncertain_edges_only",
         "fallback": "none",
+        "output": dict(output),
     }
 
 
@@ -103,23 +104,27 @@ def _mask_item(root, plan, payload, *, component_id, shot_id, frame_id, fill="pa
     path = root / relative
     _write_mask(path, fill=fill)
     raw = path.read_bytes()
+    output = {
+        "path": relative,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "byte_size": len(raw),
+        "width": 4,
+        "height": 3,
+    }
     return {
         "purpose": "scene_component",
         "channel": "grayscale_alpha",
         "component_id": component_id,
         "shot_id": shot_id,
         "frame_id": frame_id,
-        "path": relative,
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        "byte_size": len(raw),
-        "width": 4,
-        "height": 3,
+        **output,
         "producer_receipt": _producer_receipt(
             plan,
             payload,
             component_id=component_id,
             shot_id=shot_id,
             frame_id=frame_id,
+            output=output,
         ),
     }
 
@@ -336,6 +341,14 @@ def test_success_validates_complete_per_frame_masks_and_producer_receipts(tmp_pa
     assert {(item.purpose, item.channel) for item in result.masks} == {
         ("scene_component", "grayscale_alpha")
     }
+    for item in result.masks:
+        assert item.producer_receipt["output"] == {
+            "path": item.path,
+            "sha256": item.sha256,
+            "byte_size": item.byte_size,
+            "width": item.width,
+            "height": item.height,
+        }
     assert [item.path for item in result.masks] == [item["path"] for item in masks]
     state = json.loads(receipt.read_text())
     assert state["status"] == "succeeded"
@@ -415,6 +428,36 @@ def test_birefnet_cannot_define_membership_and_fallbacks_are_rejected(
         if request.method == "POST":
             return httpx.Response(202, json={"task_id": "unsafe-producer"})
         return httpx.Response(200, json={"status": "succeeded", "result": {"masks": masks}})
+
+    with pytest.raises(scene_masks.SceneMaskError) as caught:
+        _advance(tmp_path, tmp_path / "receipt.json", plan, handler)
+    assert caught.value.code == "worker_output_invalid"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("path", "work/scene-masks/wall/other.png"),
+        ("sha256", "0" * 64),
+        ("byte_size", 1),
+        ("width", 3),
+        ("height", 2),
+    ],
+)
+def test_producer_receipt_must_independently_bind_exact_output_item(
+    tmp_path, field, value
+):
+    plan = _plan()
+    payload = scene_masks.request_payload(plan)
+    masks = _all_mask_items(tmp_path, plan, payload)
+    masks[0]["producer_receipt"]["output"][field] = value
+
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(202, json={"task_id": "unbound-output"})
+        return httpx.Response(
+            200, json={"status": "succeeded", "result": {"masks": masks}}
+        )
 
     with pytest.raises(scene_masks.SceneMaskError) as caught:
         _advance(tmp_path, tmp_path / "receipt.json", plan, handler)
