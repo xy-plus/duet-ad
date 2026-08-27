@@ -419,6 +419,11 @@ def _is_h3_multimodal_plan(plan: FrozenPlan) -> bool:
     return isinstance(workflows, (set, frozenset)) and plan.workflow in workflows
 
 
+def _requires_context_ir(plan: FrozenPlan) -> bool:
+    """Current fusion prompts and historical multimodal prompts use Context IR."""
+    return plan.prompt_fusion is not None or _is_h3_multimodal_plan(plan)
+
+
 def _generation_uses_h3_native_audio(plan: FrozenPlan, generation: Mapping) -> bool:
     expected = H3_NATIVE_AUDIO_ROUTE if _is_h3_multimodal_plan(plan) else None
     actual = generation.get("audio_route")
@@ -794,7 +799,6 @@ def normalize_single_segment_project(
         not isinstance(private, Mapping)
         or private.get("version") != 4
         or not isinstance(private.get("options"), Mapping)
-        or private["options"].get("optimize_image") is not True
     ):
         return dict(meta)
     try:
@@ -915,6 +919,113 @@ def normalize_single_segment_project(
     return updated
 
 
+def _promote_legacy_segment_multimodal_intent(
+    *, root: Path, meta: Mapping, expected_receipt: str,
+    previous_bytes: bytes, fit_mode: str, dialogue_mode: str,
+    dialogue_delivery: str, aspect_ratio: str, resolution: str,
+    settings: Settings | None,
+) -> str | None:
+    """Preserve the exact historical v2 per-segment multimodal promotion."""
+    current_segments = meta.get("segments")
+    if not isinstance(current_segments, list) or not current_segments:
+        return None
+    intent: list[bool] = []
+    complete: list[bool] = []
+    receipt_segments: list[dict] = []
+    authoritative_dialogue: list[dict] = []
+    for expected_index, current in enumerate(current_segments, 1):
+        if not isinstance(current, Mapping) or current.get("index") != expected_index:
+            raise LongGenerationError("long_video_plan_invalid")
+        segdir = root / "work" / "segments" / str(expected_index)
+        segwork = segdir / "work"
+        manifest = segwork / h3_project.SOURCE_FILENAME
+        intent.append(any(
+            (segwork / name).exists()
+            for name in (
+                h3_project.SKILL_INPUT_FILENAME,
+                "h3_prompt_plan.json",
+                h3_project.SOURCE_FILENAME,
+            )
+        ))
+        complete.append(manifest.is_file())
+        raw_dialogue = current.get("dialogue")
+        if not isinstance(raw_dialogue, list):
+            raise LongGenerationError("long_video_plan_invalid")
+        authoritative_dialogue.extend(
+            dict(line) for line in raw_dialogue if isinstance(line, Mapping)
+        )
+        try:
+            receipt_segments.append({
+                **dict(current),
+                "source_path": root / "work" / str(current["source"]),
+                "keyframe_paths": [
+                    root / "work" / str(path)
+                    for path in current["keyframe_paths"]
+                ],
+                "first_frame_path": root / "work" / str(
+                    current["first_frame_path"]
+                ),
+                "last_frame_path": root / "work" / str(
+                    current["last_frame_path"]
+                ),
+                "visual_prompt_path": segwork / "visual_prompt.txt",
+                "final_prompt_path": segwork / "prompt.txt",
+                "dialogue": [] if dialogue_mode == "none" else raw_dialogue,
+                "multimodal_manifest_path": manifest,
+            })
+        except (KeyError, TypeError):
+            raise LongGenerationError("long_video_plan_invalid") from None
+    if not any(intent):
+        return None
+    if not all(complete):
+        raise LongGenerationError("long_video_multimodal_incomplete")
+    try:
+        resolved_delivery = dialogue_delivery_contract.resolve(
+            dialogue_delivery_contract.parse(dialogue_delivery),
+            tuple(authoritative_dialogue),
+        ).value
+    except ValueError:
+        raise LongGenerationError("invalid_dialogue_delivery", 422) from None
+    base = freeze_plan(
+        root, meta, expected_receipt, fit_mode, dialogue_mode,
+        dialogue_delivery=dialogue_delivery,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        prepare_fit=True,
+        settings=settings,
+    )
+    receipt_path = root / long_video.PLAN_RECEIPT_FILENAME
+    try:
+        long_video.write_plan_receipt(
+            root,
+            source=base.source,
+            duration_s=float(meta["duration_s"]),
+            segments=receipt_segments,
+            workflow=h3.H3_MULTIMODAL_WORKFLOW,
+            dialogue_mode=dialogue_mode,
+            dialogue_delivery=dialogue_delivery,
+            resolved_dialogue_delivery=resolved_delivery,
+        )
+        promoted = _digest(receipt_path)
+        freeze_plan(
+            root, meta, promoted, fit_mode, dialogue_mode,
+            dialogue_delivery=dialogue_delivery,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            prepare_fit=True,
+            settings=settings,
+        )
+        return promoted
+    except (
+        OSError, KeyError, TypeError, ValueError,
+        long_video.LongVideoError, LongGenerationError,
+    ) as exc:
+        _atomic_bytes(receipt_path, previous_bytes)
+        raise LongGenerationError(
+            getattr(exc, "code", "long_video_multimodal_invalid")
+        ) from None
+
+
 def finalize_multimodal_plan(
     root: Path,
     meta: Mapping,
@@ -941,12 +1052,13 @@ def finalize_multimodal_plan(
         raise LongGenerationError("long_video_plan_changed")
     receipt_version = payload.get("version") if isinstance(payload, Mapping) else None
     if receipt_version == long_video.MULTIMODAL_PLAN_RECEIPT_VERSION:
-        if settings is None:
-            raise LongGenerationError("prompt_fusion_manifest_invalid")
-        load_prompt_fusion_manifest(
-            root=root,
-            skill_source_path=PROMPT_FUSION_SKILL_SOURCE,
-        )
+        if isinstance(payload, Mapping) and payload.get("prompt_fusion") is not None:
+            if settings is None:
+                raise LongGenerationError("prompt_fusion_manifest_invalid")
+            load_prompt_fusion_manifest(
+                root=root,
+                skill_source_path=PROMPT_FUSION_SKILL_SOURCE,
+            )
         return None
     if receipt_version != long_video.PLAN_RECEIPT_VERSION:
         return None
@@ -955,10 +1067,18 @@ def finalize_multimodal_plan(
         not isinstance(private_postprocess, Mapping)
         or private_postprocess.get("version") != 4
     ):
-        # Frozen v2 projects predate project-level prompt fusion.  They remain
-        # on their exact historical read/resume path and may not be silently
-        # promoted into a new authoring contract.
-        return None
+        return _promote_legacy_segment_multimodal_intent(
+            root=root,
+            meta=meta,
+            expected_receipt=expected_receipt,
+            previous_bytes=previous_bytes,
+            fit_mode=fit_mode,
+            dialogue_mode=dialogue_mode,
+            dialogue_delivery=dialogue_delivery,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            settings=settings,
+        )
     if settings is None:
         raise LongGenerationError("prompt_fusion_refresh_required")
 
@@ -1014,12 +1134,22 @@ def finalize_multimodal_plan(
         dialogue_mode=dialogue_mode,
     )
     try:
+        fusion_has_audio = any(
+            bool(segment["audio_content"]["voice_references"])
+            for segment in fusion.segments
+        )
+    except (KeyError, TypeError):
+        raise LongGenerationError("prompt_fusion_input_invalid") from None
+    promoted_workflow = (
+        h3.H3_MULTIMODAL_WORKFLOW if fusion_has_audio else h3.H3_WORKFLOW
+    )
+    try:
         long_video.write_plan_receipt(
             root,
             source=base.source,
             duration_s=float(meta["duration_s"]),
             segments=receipt_segments,
-            workflow=h3.H3_MULTIMODAL_WORKFLOW,
+            workflow=promoted_workflow,
             dialogue_mode=dialogue_mode,
             dialogue_delivery=dialogue_delivery,
             resolved_dialogue_delivery=resolved_delivery,
@@ -1224,7 +1354,13 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
     is_multimodal_receipt = (
         receipt_version == long_video.MULTIMODAL_PLAN_RECEIPT_VERSION
     )
-    if is_multimodal_receipt != (receipt_workflow in h3.H3_MULTIMODAL_WORKFLOWS):
+    if (
+        is_multimodal_receipt
+        and receipt_workflow not in h3.H3_REFERENCE_WORKFLOWS
+    ) or (
+        not is_multimodal_receipt
+        and receipt_workflow in h3.H3_MULTIMODAL_WORKFLOWS
+    ):
         raise LongGenerationError("long_video_plan_invalid")
     if is_multimodal_receipt and payload.get("dialogue_mode") != dialogue_mode:
         raise LongGenerationError(
@@ -1581,7 +1717,9 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 # prepare or claim a paid H3 attempt.
                 h3_project.build_request_from_parts(
                     multimodal=frozen_multimodal,
-                    visual_prompt=final,
+                    visual_prompt=frozen_multimodal.skill_plan.get(
+                        "visual_prompt"
+                    ),
                     keyframes=frozen_keyframes,
                     upstream_dialogue=tuple(dict(line) for line in dialogue),
                     upstream_dialogue_receipt_sha256=dialogue_binding["sha256"],
@@ -1672,6 +1810,8 @@ def _bind_h3_operational_roots(
     plan: FrozenPlan,
     request: h3.H3Request,
 ) -> h3.H3Request:
+    if not h3.is_multimodal_request(request):
+        return request
     return replace(
         request,
         gateway_storage_root=settings.h3_gateway_storage_root,
@@ -1687,70 +1827,81 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
              parent_id: str, fit_mode: str, *, frozen_child_id: str | None = None,
              prepare_inputs: bool = True, fast_mode: bool = False,
              context_ir_binding: object = None) -> h3.H3Request:
-    if plan.workflow in h3.H3_MULTIMODAL_WORKFLOWS:
-        if plan.prompt_fusion is not None:
-            try:
-                reference_audios = h3.freeze_reference_audios(tuple(
+    if plan.prompt_fusion is not None:
+        try:
+            native_audio = bool(segment.prompt_fusion_audio_paths)
+            expected_workflow = (
+                h3.H3_MULTIMODAL_WORKFLOW if native_audio else h3.H3_WORKFLOW
+            )
+            if plan.workflow != expected_workflow:
+                raise LongGenerationError("long_video_multimodal_invalid")
+            reference_audios = (
+                h3.freeze_reference_audios(tuple(
                     (path, "voice")
                     for path in segment.prompt_fusion_audio_paths
                 ))
-                source_request = h3.H3Request(
-                    cid=f"{cid}-segment-{segment.index}",
-                    workdir=segment.workdir,
-                    client_request_id=(
-                        frozen_child_id
-                        or child_request_id(
-                            parent_id, plan.receipt, segment.index
-                        )
-                    ),
-                    prompt=segment.prompt,
-                    keyframes=segment.keyframes,
-                    voice_texts=(),
-                    voice_receipt=h3.voice_texts_receipt(()),
-                    duration=long_video.provider_duration_s(
-                        segment.start_s,
-                        segment.end_s,
-                        receipt_version=plan.receipt_version,
-                    ),
-                    autodl_token=settings.autodl_art_token,
-                    timeouts=h3.Timeouts(
-                        request_s=settings.h3_request_timeout_s,
-                        h3_poll_s=settings.h3_poll_timeout_s,
-                        download_s=settings.h3_download_timeout_s,
-                        poll_interval_s=settings.h3_poll_interval_s,
-                        retry_count=settings.retry_count,
-                        retry_interval_s=settings.retry_interval_s,
-                    ),
-                    mode="reference",
-                    aspect_ratio=plan.aspect_ratio,
-                    resolution=plan.resolution,
-                    workflow=plan.workflow,
-                    reference_audios=reference_audios,
-                    skill_plan_sha256=hashlib.sha256(
+                if native_audio else ()
+            )
+            multimodal_fields = (
+                {
+                    "skill_plan_sha256": hashlib.sha256(
                         segment.prompt.encode("utf-8")
                     ).hexdigest(),
-                    multimodal_compiler_version="video-prompt-fusion-v1",
-                    upstream_dialogue_receipt_sha256=(
+                    "multimodal_compiler_version": "video-prompt-fusion-v1",
+                    "upstream_dialogue_receipt_sha256": (
                         segment.dialogue_sha256 or ""
                     ),
-                    audio_required=True,
-                )
-                if context_ir_binding is None:
-                    return source_request
-                context = _freeze_segment_context_ir(
-                    settings, plan, segment, source_request
-                )
-                return _bind_h3_operational_roots(
-                    settings,
-                    plan,
-                    h3_project.apply_bound_context_ir(
-                        context, context_ir_binding
-                    ),
-                )
-            except (h3.H3Error, h3_project.ProjectMultimodalError) as exc:
-                raise LongGenerationError(
-                    getattr(exc, "code", "long_video_multimodal_invalid")
-                ) from None
+                    "audio_required": True,
+                }
+                if native_audio else {}
+            )
+            source_request = h3.H3Request(
+                cid=f"{cid}-segment-{segment.index}",
+                workdir=segment.workdir,
+                client_request_id=(
+                    frozen_child_id
+                    or child_request_id(parent_id, plan.receipt, segment.index)
+                ),
+                prompt=segment.prompt,
+                keyframes=segment.keyframes,
+                voice_texts=(),
+                voice_receipt=h3.voice_texts_receipt(()),
+                duration=long_video.provider_duration_s(
+                    segment.start_s,
+                    segment.end_s,
+                    receipt_version=plan.receipt_version,
+                ),
+                autodl_token=settings.autodl_art_token,
+                timeouts=h3.Timeouts(
+                    request_s=settings.h3_request_timeout_s,
+                    h3_poll_s=settings.h3_poll_timeout_s,
+                    download_s=settings.h3_download_timeout_s,
+                    poll_interval_s=settings.h3_poll_interval_s,
+                    retry_count=settings.retry_count,
+                    retry_interval_s=settings.retry_interval_s,
+                ),
+                mode="reference",
+                aspect_ratio=plan.aspect_ratio,
+                resolution=plan.resolution,
+                workflow=plan.workflow,
+                reference_audios=reference_audios,
+                **multimodal_fields,
+            )
+            if context_ir_binding is None:
+                return source_request
+            context = _freeze_segment_context_ir(
+                settings, plan, segment, source_request
+            )
+            return _bind_h3_operational_roots(
+                settings,
+                plan,
+                h3_project.apply_bound_context_ir(context, context_ir_binding),
+            )
+        except (h3.H3Error, h3_project.ProjectMultimodalError) as exc:
+            raise LongGenerationError(
+                getattr(exc, "code", "long_video_multimodal_invalid")
+            ) from None
+    if plan.workflow in h3.H3_MULTIMODAL_WORKFLOWS:
         if segment.multimodal is None:
             raise LongGenerationError("long_video_multimodal_invalid")
         try:
@@ -2064,10 +2215,11 @@ def generation_segments_are_valid(
         "child_request_id",
     }
     native_keys = legacy_keys | {"h3_attempt_id", "context_ir"}
+    context_keys = legacy_keys | {"context_ir"}
     audio_route = generation.get("audio_route")
     native_required = audio_route == H3_NATIVE_AUDIO_ROUTE
     if audio_route is None:
-        required_keys = legacy_keys
+        required_keys = None
     elif native_required:
         required_keys = native_keys
     else:
@@ -2079,7 +2231,11 @@ def generation_segments_are_valid(
     for position, (expected, item) in enumerate(zip(expected_segments, raw), 1):
         if (
             not isinstance(item, dict)
-            or set(item) != required_keys
+            or (
+                set(item) not in (legacy_keys, context_keys)
+                if required_keys is None
+                else set(item) != required_keys
+            )
         ):
             return False
         if isinstance(expected, FrozenSegment):
@@ -2096,6 +2252,7 @@ def generation_segments_are_valid(
         child_id = item.get("child_request_id")
         h3_attempt_id = item.get("h3_attempt_id")
         context_ir = item.get("context_ir")
+        context_required = "context_ir" in item
         if (
             expected_index != position
             or item.get("index") != expected_index
@@ -2122,16 +2279,16 @@ def generation_segments_are_valid(
                 )
             )
             or (
-                native_required
+                (native_required or context_required)
                 and item.get("status") == "succeeded"
                 and (
-                    h3_attempt_id is None
+                    (native_required and h3_attempt_id is None)
                     or not isinstance(context_ir, Mapping)
                     or context_ir.get("status") != "succeeded"
                 )
             )
             or (
-                native_required
+                (native_required or context_required)
                 and context_ir is not None
                 and not isinstance(context_ir, Mapping)
             )
@@ -2295,6 +2452,7 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
     }
     items = []
     h3_native_audio = _is_h3_multimodal_plan(plan)
+    context_ir_required = _requires_context_ir(plan)
     for segment in plan.segments:
         prior = old_by_index.get(segment.index, {})
         succeeded = segment.index in reusable
@@ -2311,6 +2469,7 @@ def initial_generation(settings, cid: str, plan: FrozenPlan, parent_id: str, att
             item["h3_attempt_id"] = (
                 prior.get("h3_attempt_id") if succeeded else None
             )
+        if context_ir_required:
             item["context_ir"] = (
                 prior.get("context_ir") if succeeded else None
             )
@@ -2547,11 +2706,26 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             },
         )
         return
+    context_ir_required = _requires_context_ir(plan)
     parent_id = generation.get("client_request_id")
     fast_mode = generation.get("fast_mode", False)
     fit_mode = meta.get("fit_mode")
     dialogue_mode = meta.get("dialogue_mode")
     states = {item["index"]: dict(item) for item in generation.get("segments", [])}
+    if any(
+        ("context_ir" in state) != context_ir_required
+        for state in states.values()
+    ):
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            generation={
+                **generation,
+                "status": "submission_unknown",
+                "error": "submission_unknown",
+            },
+        )
+        return
     if (
         not isinstance(parent_id, str)
         or fit_mode not in {"none", "crop", "pad"}
@@ -2640,7 +2814,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                         else None
                     ),
                 )
-                if h3_native_audio and not (
+                if context_ir_required and not (
                     isinstance(context_binding, Mapping)
                     and context_binding.get("status") == "succeeded"
                 ):
@@ -2795,7 +2969,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     fast_mode=True,
                 )
 
-            if h3_native_audio:
+            if context_ir_required:
                 context_targets = [
                     segment for segment in plan.segments
                     if segment.index in requests
@@ -3112,7 +3286,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 prepare_inputs=action == "start",
             )
             h3_action = action
-            if h3_native_audio:
+            if context_ir_required:
                 context_binding = states[segment.index].get("context_ir")
                 if (
                     isinstance(context_binding, Mapping)

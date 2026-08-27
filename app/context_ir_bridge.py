@@ -540,9 +540,16 @@ def freeze_context_ir_request(
     timeouts: ContextIrTimeouts = ContextIrTimeouts(),
 ) -> FrozenContextIrRequest:
     """Bind a coordinator-verified dialogue artifact to the exact H3 request."""
-    if not isinstance(source_h3_request, h3.H3Request) or not h3.is_multimodal_request(
-        source_h3_request
-    ):
+    if not isinstance(source_h3_request, h3.H3Request):
+        raise ContextIrContractError("source_h3_request_invalid")
+    is_multimodal = h3.is_multimodal_request(source_h3_request)
+    is_no_audio_reference = (
+        source_h3_request.mode == "reference"
+        and source_h3_request.workflow in {None, h3.H3_WORKFLOW}
+        and source_h3_request.reference_audios == ()
+        and source_h3_request.audio_required is False
+    )
+    if not is_multimodal and not is_no_audio_reference:
         raise ContextIrContractError("source_h3_request_invalid")
     if not isinstance(minimax_api_key, str) or not minimax_api_key.strip():
         raise ContextIrContractError("context_ir_credential_missing")
@@ -551,8 +558,13 @@ def freeze_context_ir_request(
         or source_prompt_sha256 != _sha256_text(source_h3_request.prompt)
     ):
         raise ContextIrContractError("source_prompt_sha256_mismatch")
+    skill_plan_sha256 = (
+        str(source_h3_request.skill_plan_sha256)
+        if is_multimodal
+        else source_prompt_sha256
+    )
     if (
-        not _is_sha256(source_h3_request.skill_plan_sha256)
+        not _is_sha256(skill_plan_sha256)
         or not _is_sha256(upstream_dialogue_sha256)
         or source_h3_request.voice_receipt
         != h3.voice_texts_receipt(source_h3_request.voice_texts)
@@ -613,7 +625,7 @@ def freeze_context_ir_request(
     input_manifest = _source_input_manifest(
         cid=source_h3_request.cid,
         source_h3_client_request_id=source_h3_request.client_request_id,
-        skill_plan_sha256=str(source_h3_request.skill_plan_sha256),
+        skill_plan_sha256=skill_plan_sha256,
         source_prompt_sha256=source_prompt_sha256,
         semantic_contract_sha256=semantic_contract_sha256,
         references_sha256=references_sha256,
@@ -636,7 +648,7 @@ def freeze_context_ir_request(
     )
     frozen = FrozenContextIrRequest(
         source_h3_request=source_h3_request,
-        skill_plan_sha256=str(source_h3_request.skill_plan_sha256),
+        skill_plan_sha256=skill_plan_sha256,
         source_prompt=source_h3_request.prompt,
         source_prompt_sha256=source_prompt_sha256,
         semantic_contract_sha256=semantic_contract_sha256,
@@ -1324,6 +1336,17 @@ def _complete(
             error="context_ir_result_invalid",
         )
         return
+    if not request.dialogue_tokens:
+        try:
+            _speech_contract(effective_prompt, ())
+        except ContextIrContractError:
+            _mark_terminal(
+                path,
+                state,
+                status="failed",
+                error="context_ir_semantic_mismatch",
+            )
+            return
     payload = _receipt_payload(request, state, effective_prompt)
     receipt_sha256 = _canonical_sha256(payload)
     receipt = dict(payload, receipt_sha256=receipt_sha256)
@@ -1705,9 +1728,11 @@ def apply_effective_prompt(
     if receipt_path is None:
         raise ContextIrContractError("context_ir_effective_prompt_unavailable")
     receipt = load_effective_prompt_receipt(request, Path(receipt_path))
-    return replace(
-        request.source_h3_request,
-        prompt=receipt.effective_prompt,
-        context_ir_receipt_path=receipt.receipt_path,
-        context_ir_receipt_sha256=receipt.receipt_sha256,
-    )
+    if h3.is_multimodal_request(request.source_h3_request):
+        return replace(
+            request.source_h3_request,
+            prompt=receipt.effective_prompt,
+            context_ir_receipt_path=receipt.receipt_path,
+            context_ir_receipt_sha256=receipt.receipt_sha256,
+        )
+    return replace(request.source_h3_request, prompt=receipt.effective_prompt)

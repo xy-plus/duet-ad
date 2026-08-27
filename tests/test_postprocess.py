@@ -252,7 +252,7 @@ def test_v4_manual_acceptance_receipt_enables_h3_without_image_verification(
 def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     tmp_path, monkeypatch, segment_count, *, postprocess_options=None,
     frozen_single_segment=False, forbid_legacy_short=False,
-    complete_generation=False,
+    complete_generation=False, dialogue_mode="auto",
 ):
     settings = make_settings(
         tmp_path,
@@ -295,7 +295,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         duration_s=14.5,
         vocal_filter_enabled=True,
         voice_mode="keep",
-        dialogue_mode="auto",
+        dialogue_mode=dialogue_mode,
         fit_required=False,
         fit_profiles={
             "9:16": {"fit_required": False, "default_fit_mode": "none"},
@@ -540,7 +540,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     payload = {
         "confirm": True,
         "client_request_id": "short-off-screen-123",
-        "dialogue_mode": "auto",
+        "dialogue_mode": dialogue_mode,
         "dialogue_delivery": "off_screen",
         "fit_mode": "none",
         "aspect_ratio": "9:16",
@@ -552,15 +552,18 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             fast_mode=False,
         )
     with TestClient(create_app(settings)) as client:
-        missing_delivery = client.post(
-            f"/api/conversations/{cid}/submit",
-            headers=AUTH,
-            json={key: value for key, value in payload.items()
-                  if key != "dialogue_delivery"},
-        )
-        assert missing_delivery.status_code == 409
-        assert missing_delivery.json() == {"detail": "dialogue_delivery_required"}
-        assert h3_requests == []
+        if dialogue_mode != "none":
+            missing_delivery = client.post(
+                f"/api/conversations/{cid}/submit",
+                headers=AUTH,
+                json={key: value for key, value in payload.items()
+                      if key != "dialogue_delivery"},
+            )
+            assert missing_delivery.status_code == 409
+            assert missing_delivery.json() == {
+                "detail": "dialogue_delivery_required"
+            }
+            assert h3_requests == []
         normalized = storage.load_meta(settings.data_dir, cid)
         assert postprocess.image_acceptance_status(
             settings, cid, normalized
@@ -598,13 +601,18 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     assert "[AUDIO_CONTENT_JSON]" not in request.prompt
     assert request.on_screen_dialogue == ()
     assert len(request.keyframes) == 9
-    assert len(request.reference_audios) == 1
-    assert request.reference_audios[0].data == (
-        cdir / "work" / (
-            "voice.mp3"
-            if not has_frozen_segment_plan else "segments/1/work/voice.mp3"
-        )
-    ).read_bytes()
+    assert len(request.reference_audios) == (0 if dialogue_mode == "none" else 1)
+    assert request.workflow == (
+        h3.H3_WORKFLOW
+        if dialogue_mode == "none" else h3.H3_MULTIMODAL_WORKFLOW
+    )
+    if dialogue_mode != "none":
+        assert request.reference_audios[0].data == (
+            cdir / "work" / (
+                "voice.mp3"
+                if not has_frozen_segment_plan else "segments/1/work/voice.mp3"
+            )
+        ).read_bytes()
     assert len(json.loads(
         (cdir / "work" / "multimodal_input.json").read_text(encoding="utf-8")
     )["segments"]) == segment_count
@@ -614,10 +622,15 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             f"EFFECTIVE::{prompt}" for prompt in fusion_prompts
         ]
         assert len(stitch_calls) == 1
-        assert stitch_calls[0]["audio_mode"] == "provider_generated"
+        assert stitch_calls[0]["audio_mode"] == (
+            "mute" if dialogue_mode == "none" else "provider_generated"
+        )
         assert len(reuse_calls) == 1
-        assert reuse_calls[0][1] == "auto"
-        assert set(reuse_calls[0][3]) == set(range(1, segment_count + 1))
+        assert reuse_calls[0][1] == dialogue_mode
+        if dialogue_mode == "none":
+            assert reuse_calls[0][3] is None
+        else:
+            assert set(reuse_calls[0][3]) == set(range(1, segment_count + 1))
         completed = storage.load_meta(settings.data_dir, cid)
         assert completed["generation"]["status"] == "succeeded"
     for index in range(1, segment_count + 1):
@@ -639,7 +652,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                 frozen_meta,
                 long_generation.plan_receipt(cdir, frozen_meta),
                 "none",
-                "auto",
+                dialogue_mode,
                 dialogue_delivery="off_screen",
                 aspect_ratio="9:16",
                 resolution="768p",
@@ -665,6 +678,19 @@ def test_n2_off_screen_fusion_completes_context_h3_and_native_stitch(
     )
 
 
+@pytest.mark.parametrize("segment_count", [1, 2])
+def test_n1_n2_none_fusion_enters_context_h3_without_audio(
+    tmp_path, monkeypatch, segment_count,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path,
+        monkeypatch,
+        segment_count,
+        complete_generation=True,
+        dialogue_mode="none",
+    )
+
+
 @pytest.mark.parametrize(
     "postprocess_options",
     [
@@ -685,7 +711,6 @@ def test_n1_mediakit_only_v4_uses_unified_fusion_not_legacy_short(
         monkeypatch,
         1,
         postprocess_options=postprocess_options,
-        frozen_single_segment=True,
         forbid_legacy_short=True,
     )
 

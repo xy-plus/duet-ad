@@ -279,7 +279,20 @@ def test_validation_fingerprint_binds_immutable_fusion_artifact_bytes(
     root = tmp_path / ("a" * 32)
     work = root / "work"
     work.mkdir(parents=True)
-    input_data = b'{"input":"frozen"}\n'
+    voice_path = work / "voice.mp3"
+    voice_path.write_bytes(b"frozen-voice")
+    input_data = _canonical({
+        "segments": [{
+            "audio_content": {
+                "voice_references": [{
+                    "path": "work/voice.mp3",
+                    "sha256": hashlib.sha256(
+                        voice_path.read_bytes()
+                    ).hexdigest(),
+                }],
+            },
+        }],
+    })
     output_data = b'{"output":"fused"}\n'
     input_path = work / h3_project.SKILL_INPUT_FILENAME
     output_path = work / "h3_prompt_plan.json"
@@ -317,7 +330,7 @@ def test_validation_fingerprint_binds_immutable_fusion_artifact_bytes(
     }
 
     paths = main._long_validation_paths(root, meta)
-    assert {manifest_path, input_path, output_path} <= paths
+    assert {manifest_path, input_path, output_path, voice_path} <= paths
     before_entries = main._prompt_fusion_fingerprint_entries(root, meta)
     before = main._generated_video_validation_fingerprint(root, meta)
     del meta["_prompt_fusion"]
@@ -330,6 +343,73 @@ def test_validation_fingerprint_binds_immutable_fusion_artifact_bytes(
     after = main._generated_video_validation_fingerprint(root, meta)
     assert after_entries != before_entries
     assert after != before
+
+    output_path.write_bytes(output_data)
+    before_voice = main._generated_video_validation_fingerprint(root, meta)
+    voice_path.write_bytes(b"drifted-voice")
+    assert main._generated_video_validation_fingerprint(root, meta) != before_voice
+
+
+def test_warm_validation_cache_invalidates_when_fusion_voice_bytes_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings(tmp_path)
+    cid = "c" * 32
+    root = settings.data_dir / cid
+    work = root / "work"
+    work.mkdir(parents=True)
+    voice = work / "voice.mp3"
+    voice.write_bytes(b"voice-one")
+    input_data = _canonical({
+        "segments": [{"audio_content": {"voice_references": [{
+            "path": "work/voice.mp3",
+            "sha256": hashlib.sha256(voice.read_bytes()).hexdigest(),
+        }]}}],
+    })
+    output_data = b'{"output":"fused"}\n'
+    (work / h3_project.SKILL_INPUT_FILENAME).write_bytes(input_data)
+    (work / "h3_prompt_plan.json").write_bytes(output_data)
+    manifest_data = _canonical({
+        "input": {
+            "path": f"work/{h3_project.SKILL_INPUT_FILENAME}",
+            "sha256": hashlib.sha256(input_data).hexdigest(),
+        },
+        "output": {
+            "path": "work/h3_prompt_plan.json",
+            "sha256": hashlib.sha256(output_data).hexdigest(),
+        },
+    })
+    (work / h3_project.SOURCE_FILENAME).write_bytes(manifest_data)
+    (root / long_video.PLAN_RECEIPT_FILENAME).write_bytes(_canonical({
+        "schema": "duet.long-video-plan",
+        "version": long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
+        "prompt_fusion": {
+            "path": f"work/{h3_project.SOURCE_FILENAME}",
+            "sha256": hashlib.sha256(manifest_data).hexdigest(),
+        },
+        "segments": [],
+    }))
+    meta = {
+        "id": cid,
+        "duration_s": 28.0,
+        "segments": [{"index": 1}],
+        "long_video_plan_receipt": long_video.PLAN_RECEIPT_FILENAME,
+        "generation": {"status": "succeeded"},
+    }
+    calls = 0
+
+    def validate(_settings, _meta):
+        nonlocal calls
+        calls += 1
+        return True
+
+    monkeypatch.setattr(main, "_validate_generated_video_uncached", validate)
+    assert main._has_valid_generated_video(settings, meta) is True
+    assert main._has_valid_generated_video(settings, meta) is True
+    assert calls == 1
+    voice.write_bytes(b"voice-two")
+    assert main._has_valid_generated_video(settings, meta) is True
+    assert calls == 2
 
 
 @pytest.mark.parametrize("dialogue_mode", ["auto", "none"])

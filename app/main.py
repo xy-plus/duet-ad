@@ -416,21 +416,11 @@ def _is_current_v4_segment_project(meta: Mapping) -> bool:
         postprocess_receipt.get("options")
         if isinstance(postprocess_receipt, Mapping) else None
     )
-    has_frozen_segments = bool(
-        isinstance(meta.get("segments"), list)
-        and meta["segments"]
-        and meta.get("long_video_plan_receipt")
-        == long_video.PLAN_RECEIPT_FILENAME
-    )
     return bool(
         meta.get("schema_version") == 2
         and isinstance(postprocess_receipt, Mapping)
         and postprocess_receipt.get("version") == 4
         and isinstance(options, Mapping)
-        and (
-            has_frozen_segments
-            or options.get("optimize_image") is True
-        )
     )
 
 
@@ -1571,6 +1561,27 @@ def _bound_artifact_path(root: Path, binding: object) -> Path | None:
     return root / relative
 
 
+def _prompt_fusion_voice_bindings(input_data: bytes | None) -> list[Mapping]:
+    try:
+        payload = json.loads(input_data.decode("utf-8"))
+    except (AttributeError, UnicodeError, json.JSONDecodeError):
+        return []
+    segments = payload.get("segments") if isinstance(payload, Mapping) else None
+    if not isinstance(segments, list):
+        return []
+    bindings: list[Mapping] = []
+    for segment in segments:
+        audio = segment.get("audio_content") if isinstance(segment, Mapping) else None
+        references = audio.get("voice_references") if isinstance(audio, Mapping) else None
+        if not isinstance(references, list):
+            return []
+        for reference in references:
+            if not isinstance(reference, Mapping):
+                return []
+            bindings.append(reference)
+    return bindings
+
+
 def _h3_validation_paths(workdir: Path) -> set[Path]:
     paths = {
         workdir / "generated.mp4",
@@ -1684,10 +1695,24 @@ def _long_validation_paths(
         except (OSError, UnicodeError, json.JSONDecodeError):
             manifest = None
         if isinstance(manifest, Mapping):
-            for artifact in (manifest.get("input"), manifest.get("output")):
+            input_path = None
+            for key in ("input", "output"):
+                artifact = manifest.get(key)
                 path = _bound_artifact_path(cdir, artifact)
                 if path is not None:
                     paths.add(path)
+                    if key == "input":
+                        input_path = path
+            if input_path is not None:
+                try:
+                    input_data = input_path.read_bytes()
+                except OSError:
+                    input_data = None
+                paths.update(
+                    path for binding in _prompt_fusion_voice_bindings(input_data)
+                    if (path := _bound_artifact_path(cdir, dict(binding)))
+                    is not None
+                )
             skill = manifest.get("skill")
             if isinstance(skill, Mapping):
                 frozen_path = skill.get("frozen_path")
@@ -2014,10 +2039,15 @@ def _prompt_fusion_fingerprint_entries(
     except (AttributeError, UnicodeError, json.JSONDecodeError):
         manifest = None
     if isinstance(manifest, Mapping):
+        input_data = None
         for key in ("input", "output"):
             artifact = manifest.get(key)
             if isinstance(artifact, Mapping):
-                add(artifact.get("path"), artifact.get("sha256"))
+                data = add(artifact.get("path"), artifact.get("sha256"))
+                if key == "input":
+                    input_data = data
+        for reference in _prompt_fusion_voice_bindings(input_data):
+            add(reference.get("path"), reference.get("sha256"))
     return sorted(entries, key=lambda item: str(item.get("path")))
 
 
@@ -3025,6 +3055,9 @@ def create_app(settings: Settings) -> FastAPI:
                 previous_status = old.get("status") if isinstance(old, dict) else None
                 previous_id = old.get("client_request_id") if isinstance(old, dict) else None
                 if not isinstance(old, dict):
+                    legacy_multimodal_promotion = not _is_current_v4_segment_project(
+                        meta
+                    )
                     try:
                         promoted_receipt = await asyncio.to_thread(
                             long_generation.finalize_multimodal_plan,
@@ -3078,6 +3111,14 @@ def create_app(settings: Settings) -> FastAPI:
                             raise HTTPException(status_code=404, detail="not found")
                         meta = updated
                         expected_receipt = promoted_receipt
+                        if legacy_multimodal_promotion:
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": "long_video_plan_changed",
+                                    "message": "音画计划已冻结，请刷新并确认后重试。",
+                                },
+                            )
                 if isinstance(old, dict) and not long_generation.generation_segments_are_valid(
                     meta.get("segments"), old
                 ):
