@@ -2505,9 +2505,15 @@ def create_app(settings: Settings) -> FastAPI:
         dependencies=[Depends(require_auth)],
     )
     async def submit_conversation(cid: str, payload: dict, background_tasks: BackgroundTasks):
+        preview_meta = storage.load_meta(settings.data_dir, cid)
+        if (
+            isinstance(preview_meta, dict)
+            and "published_preview_receipt" in preview_meta
+        ):
+            raise HTTPException(status_code=409, detail="read_only")
         if not settings.enable_h3_submit:
             raise HTTPException(status_code=501, detail="H3 submission is disabled.")
-        meta = storage.load_meta(settings.data_dir, cid)
+        meta = preview_meta
         if meta is None:
             raise HTTPException(status_code=404, detail="not found")
         if _is_read_only(meta):
