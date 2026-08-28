@@ -8,6 +8,7 @@ import pytest
 
 from app import (
     context_ir_bridge,
+    dialogue_delivery,
     h3,
     h3_project,
     long_generation,
@@ -881,7 +882,7 @@ def test_spoken_lines_never_turn_source_audio_into_a_reference(
         assert audio["voice_references"] == []
 
 
-def test_current_fusion_request_has_one_workflow_and_zero_audio_references(
+def test_current_auto_spoken_planner_fusion_h3_uses_off_screen_narrator(
     tmp_path: Path,
 ) -> None:
     settings = replace(make_settings(tmp_path), autodl_art_token="test-token")
@@ -890,15 +891,47 @@ def test_current_fusion_request_has_one_workflow_and_zero_audio_references(
     meta, base = _audio_compile_fixture(
         root, segment_count=1, classification="spoken",
     )
+    planner_dialogue = pipeline._planner_dialogue(
+        {
+            "dialogue_mode": "auto",
+            "voice_line_provenance": meta["voice_line_provenance"],
+        },
+        meta["voice_line_provenance"],
+    )
+    assert dialogue_delivery.resolve(
+        dialogue_delivery.parse("auto"), planner_dialogue
+    ).value == "off_screen"
+    assert dialogue_delivery.resolve(
+        dialogue_delivery.parse("on_screen"), planner_dialogue
+    ).value == "on_screen"
+    base_segment = replace(
+        base.segments[0],
+        dialogue=tuple(planner_dialogue),
+        dialogue_sha256=hashlib.sha256(
+            _canonical(planner_dialogue)
+        ).hexdigest(),
+    )
+    base = replace(base, segments=(base_segment,))
     fusion_input = json.loads(long_generation.build_prompt_fusion_input(
         root=root,
         meta=meta,
         plan=base,
         dialogue_mode="auto",
-        dialogue_delivery="off_screen",
+        dialogue_delivery="auto",
     ))
+    lines = json.loads(
+        fusion_input["segments"][0]["audio_content"]["lines_json"]
+    )
+    assert lines == [{
+        "order": 1,
+        "text": "spoken authority",
+        "start_s": 0.0,
+        "end_s": 1.0,
+        "delivery": "off_screen",
+        "voice_ref": None,
+    }]
     segment = replace(
-        base.segments[0],
+        base_segment,
         prompt=_fusion_v2_final_prompt(
             fusion_input["segments"][0], "fused visual",
         ),
@@ -935,8 +968,12 @@ def test_current_fusion_request_has_one_workflow_and_zero_audio_references(
     assert request.workflow == h3.H3_WORKFLOW
     assert request.reference_audios == ()
     assert request.audio_required is False
-    assert request.voice_texts == ("line 1",)
+    assert request.voice_texts == ("spoken authority",)
     assert request.context_ir_required is True
+    assert (
+        "From 00:00.000 to 00:01.000, the off-screen narrator (S1) says"
+        in request.prompt
+    )
 
 
 @pytest.mark.parametrize("dialogue_mode", ["edit", "custom"])

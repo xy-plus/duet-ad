@@ -2060,7 +2060,7 @@ def _make_automatic_pre_fusion_claim(
         _input_owner=owner,
         dialogue_mode="auto",
         dialogue_delivery="auto",
-        resolved_dialogue_delivery="on_screen",
+        resolved_dialogue_delivery="off_screen",
         fit_mode="none",
         aspect_ratio="9:16",
         resolution="768p",

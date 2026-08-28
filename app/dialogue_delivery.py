@@ -21,13 +21,9 @@ def parse(value: object) -> DialogueDelivery:
 
 def resolve(
     requested: DialogueDelivery,
-    authoritative_lines: Sequence[Mapping[str, object]],
+    _authoritative_lines: Sequence[Mapping[str, object]],
 ) -> DialogueDelivery:
-    """Resolve project-level auto without guessing a speaker from pictures."""
+    """Resolve unbound auto dialogue without inventing on-screen authority."""
     if requested is not DialogueDelivery.AUTO:
         return requested
-    lines = tuple(authoritative_lines)
-    if lines and all(line.get("classification") == "sung" for line in lines):
-        return DialogueDelivery.OFF_SCREEN
-    return DialogueDelivery.ON_SCREEN
-
+    return DialogueDelivery.OFF_SCREEN
