@@ -67,6 +67,9 @@ _KNOWN_TASK_ERRORS = frozenset(
 _NO_STORE_WEB_PATHS = frozenset({"/", "/index.html", "/app.js", "/styles.css"})
 _CLIENT_REFRESH_MESSAGE = "页面版本已更新，请刷新页面后重试。"
 _GENERATED_VIDEO_VALIDATION_CACHE_SIZE = 256
+_PROMPT_FUSION_CONTINUATION_INTERVAL_S = 1.0
+_PROMPT_FUSION_TIMER_LOCK = threading.Lock()
+_PROMPT_FUSION_TIMERS: dict[tuple[str, str, str, str], threading.Timer] = {}
 
 
 def _short_provider_failure_is_recoverable(generation: object) -> bool:
@@ -2717,45 +2720,146 @@ def _continue_after_prompt_fusion(
     return True
 
 
+def _prompt_fusion_technical_failure_is_retryable(state: object) -> bool:
+    """Recognize only errors that the Codex runner explicitly marks retryable."""
+    if not isinstance(state, Mapping) or state.get("status") != "failed":
+        return False
+    error = state.get("error")
+    return bool(
+        isinstance(error, str)
+        and (
+            re.fullmatch(r"codex timed out after [0-9]+(?:\.[0-9]+)?s", error)
+            or re.match(r"^codex exit -?[0-9]+:", error)
+        )
+    )
+
+
+def _prompt_fusion_continuation_step(
+    settings: Settings, cid: str, runner, owner: object,
+) -> bool:
+    """Run one owner-bound step; return whether the same owner needs polling."""
+    meta = storage.load_submission_claim(settings.data_dir, cid, owner)
+    if meta is None or not _prompt_fusion_continuation_claim(meta, owner):
+        return False
+    fusion = meta["_prompt_fusion"]
+    status = fusion.get("status")
+    if status == "running":
+        # The current producer owns the exact frozen invocation. Observers
+        # only poll its durable state; they must never create another producer.
+        return True
+    if status == "failed":
+        if not _prompt_fusion_technical_failure_is_retryable(fusion):
+            return False
+        reset: dict[str, bool] = {}
+
+        def requeue(current: dict) -> None:
+            state = current.get("_prompt_fusion")
+            if (
+                current.get("_input_owner") == owner
+                and state == fusion
+                and _prompt_fusion_technical_failure_is_retryable(state)
+            ):
+                current["_prompt_fusion"] = {
+                    **state,
+                    "status": "queued",
+                    "error": None,
+                }
+                reset["value"] = True
+
+        storage.mutate_meta(settings.data_dir, cid, requeue)
+        # A separate scheduled step owns the new producer claim. This keeps a
+        # failed observer from falling through into an immediate duplicate.
+        return bool(reset.get("value"))
+    if status == "queued":
+        status = pipeline.produce_prompt_fusion(settings, cid, runner)
+    if status in {"queued", "running"}:
+        return True
+    if status == "failed":
+        current = storage.load_submission_claim(settings.data_dir, cid, owner)
+        state = current.get("_prompt_fusion") if current else None
+        return _prompt_fusion_technical_failure_is_retryable(state)
+    if status != "done":
+        return False
+    try:
+        completed = _continue_after_prompt_fusion(settings, cid, owner)
+    except Exception:
+        # Finalization is local and receipt-bound. Keep polling this exact
+        # owner; never make a second Fusion invocation or provider operation.
+        return True
+    if completed:
+        return False
+    current = storage.load_submission_claim(settings.data_dir, cid, owner)
+    return bool(
+        current is not None
+        and _prompt_fusion_continuation_claim(current, owner)
+    )
+
+
+def _prompt_fusion_timer_key(
+    settings: Settings, cid: str, owner: object,
+) -> tuple[str, str, str, str] | None:
+    if not isinstance(owner, Mapping):
+        return None
+    request_id = owner.get("request_id")
+    process_generation = owner.get("process_generation")
+    if not isinstance(request_id, str) or not isinstance(process_generation, str):
+        return None
+    return (
+        str(settings.data_dir.resolve()),
+        cid,
+        request_id,
+        process_generation,
+    )
+
+
+def _schedule_prompt_fusion_continuation(
+    settings: Settings, cid: str, runner, owner: object,
+) -> None:
+    """Ensure at most one delayed observer exists for this persisted owner."""
+    key = _prompt_fusion_timer_key(settings, cid, owner)
+    if key is None:
+        return
+    with _PROMPT_FUSION_TIMER_LOCK:
+        existing = _PROMPT_FUSION_TIMERS.get(key)
+        if existing is not None and existing.is_alive():
+            return
+
+    def run_scheduled() -> None:
+        retry = False
+        try:
+            retry = _prompt_fusion_continuation_step(
+                settings, cid, runner, owner
+            )
+        finally:
+            with _PROMPT_FUSION_TIMER_LOCK:
+                if _PROMPT_FUSION_TIMERS.get(key) is timer:
+                    _PROMPT_FUSION_TIMERS.pop(key, None)
+        if retry:
+            _schedule_prompt_fusion_continuation(
+                settings, cid, runner, owner
+            )
+
+    timer = threading.Timer(
+        _PROMPT_FUSION_CONTINUATION_INTERVAL_S,
+        run_scheduled,
+    )
+    timer.daemon = True
+    with _PROMPT_FUSION_TIMER_LOCK:
+        existing = _PROMPT_FUSION_TIMERS.get(key)
+        if existing is not None and existing.is_alive():
+            return
+        _PROMPT_FUSION_TIMERS[key] = timer
+        timer.start()
+
+
 def _produce_prompt_fusion_and_continue(
     settings: Settings, cid: str, runner, owner: object,
 ) -> None:
-    """Drive the same accepted claim from Fusion to H3 without another HTTP."""
-    meta = storage.load_submission_claim(settings.data_dir, cid, owner)
-    if meta is None or not _prompt_fusion_continuation_claim(meta, owner):
-        return
-    fusion = meta["_prompt_fusion"]
-    status = fusion.get("status")
-    if status in {"running", "failed"}:
-        updated = storage.update_meta(
-            settings.data_dir,
-            cid,
-            _prompt_fusion={**fusion, "status": "queued"},
+    """Drive one step now, then keep the same durable owner scheduled."""
+    if _prompt_fusion_continuation_step(settings, cid, runner, owner):
+        _schedule_prompt_fusion_continuation(
+            settings, cid, runner, owner
         )
-        if updated is None:
-            return
-        status = "queued"
-    if status == "queued":
-        status = pipeline.produce_prompt_fusion(settings, cid, runner)
-    if status != "done":
-        # Fusion is an unpaid operational step. Keep the exact accepted claim
-        # schedulable; never turn its output shape/score into a public failure.
-        current = storage.load_submission_claim(settings.data_dir, cid, owner)
-        state = current.get("_prompt_fusion") if current else None
-        if isinstance(state, Mapping) and state.get("status") == "failed":
-            storage.update_meta(
-                settings.data_dir,
-                cid,
-                _prompt_fusion={**state, "status": "queued"},
-            )
-        return
-    try:
-        _continue_after_prompt_fusion(settings, cid, owner)
-    except Exception:
-        # The submit claim and frozen Fusion receipt are the durable work item.
-        # Startup or a same-operation ensure call may resume it; no alternative
-        # generation or provider POST is created here.
-        return
 
 
 def _start_automatic_v4_generation(
