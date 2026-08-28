@@ -2594,6 +2594,126 @@ def _prompt_fusion_continuation_claim(
     )
 
 
+def _automatic_v4_pre_fusion_claim(
+    settings: Settings, cid: str, meta: Mapping, owner: object,
+) -> bool:
+    """Recognize the exact durable auto claim immediately before Fusion."""
+    if (
+        not _is_current_v4_segment_project(meta)
+        or meta.get("status") != "done"
+        or meta.get("generation") is not None
+        or meta.get("_prompt_fusion") is not None
+        or not isinstance(owner, dict)
+        or set(owner) != {
+            "kind",
+            "process_generation",
+            "frozen_input_snapshot",
+            "request_id",
+            "fast_mode",
+        }
+        or owner.get("kind") != "submit"
+        or owner.get("request_id") != f"auto-{cid}"
+        or owner.get("fast_mode") is not False
+        or not isinstance(owner.get("process_generation"), str)
+        or not isinstance(owner.get("frozen_input_snapshot"), dict)
+    ):
+        return False
+    post = meta.get("postprocess")
+    if not isinstance(post, Mapping) or post.get("status") != "done":
+        return False
+    try:
+        acceptance = postprocess.image_acceptance_status(
+            settings, cid, dict(meta)
+        )
+        if acceptance.get("required") and not acceptance.get("accepted"):
+            return False
+        aspect_ratio, resolution = _generation_semantics(dict(meta))
+        dialogue_mode = meta.get("dialogue_mode")
+        authoritative_dialogue = tuple(
+            dict(line)
+            for segment in meta.get("segments", [])
+            if isinstance(segment, Mapping)
+            for line in segment.get("dialogue", [])
+            if isinstance(line, Mapping)
+        )
+        resolved_delivery = dialogue_delivery.resolve(
+            dialogue_delivery.parse("auto"),
+            authoritative_dialogue,
+        ).value
+        fit_mode = (
+            "crop"
+            if _long_fit_required(settings.data_dir / cid, dict(meta), settings)
+            else "none"
+        )
+        expected_receipt = long_generation.plan_receipt(
+            settings.data_dir / cid, meta
+        )
+        input_unchanged = not storage._stale_owner_has_new_frozen_input(
+            settings.data_dir / cid, dict(meta), owner
+        )
+    except (
+        _SubmitError,
+        postprocess.PostprocessError,
+        long_generation.LongGenerationError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    return bool(
+        meta.get("dialogue_mode") in {"auto", "none"}
+        and meta.get("dialogue_delivery") == "auto"
+        and meta.get("resolved_dialogue_delivery") == resolved_delivery
+        and meta.get("fit_mode") == fit_mode
+        and meta.get("aspect_ratio") == aspect_ratio
+        and meta.get("resolution") == resolution
+        and expected_receipt is not None
+        # Storage owns the snapshot schema, so recovery cannot reinterpret a
+        # changed plan, prompt, or H3 frame.
+        and input_unchanged
+    )
+
+
+def _claim_stale_automatic_v4_pre_fusion_continuations(
+    settings: Settings,
+) -> list[tuple[str, dict]]:
+    """Atomically move exact pre-Fusion auto claims to this boot."""
+    claimed: list[tuple[str, dict]] = []
+    for listed in storage.list_conversations(settings.data_dir):
+        cid = listed.get("id")
+        observed = listed.get("_input_owner")
+        if (
+            not isinstance(cid, str)
+            or not _automatic_v4_pre_fusion_claim(
+                settings, cid, listed, observed
+            )
+            or observed.get("process_generation")
+            == storage.PROCESS_GENERATION
+        ):
+            continue
+        replacement = {
+            **observed,
+            "process_generation": storage.PROCESS_GENERATION,
+        }
+        acquired: dict[str, bool] = {}
+
+        def claim(meta: dict) -> None:
+            if (
+                meta.get("_input_owner") == observed
+                and _automatic_v4_pre_fusion_claim(
+                    settings, cid, meta, observed
+                )
+            ):
+                meta["_input_owner"] = replacement
+                acquired["value"] = True
+
+        storage.mutate_meta(settings.data_dir, cid, claim)
+        if acquired.get("value"):
+            claimed.append((cid, replacement))
+    return claimed
+
+
 def _claim_stale_prompt_fusion_continuations(
     settings: Settings,
 ) -> list[tuple[str, dict]]:
@@ -2745,7 +2865,37 @@ def _prompt_fusion_continuation_step(
 ) -> bool:
     """Run one owner-bound step; return whether the same owner needs polling."""
     meta = storage.load_submission_claim(settings.data_dir, cid, owner)
-    if meta is None or not _prompt_fusion_continuation_claim(meta, owner):
+    if meta is None:
+        return False
+    if _automatic_v4_pre_fusion_claim(settings, cid, meta, owner):
+        try:
+            long_generation.finalize_multimodal_plan(
+                settings.data_dir / cid,
+                meta,
+                long_generation.plan_receipt(settings.data_dir / cid, meta),
+                meta["fit_mode"],
+                meta["dialogue_mode"],
+                aspect_ratio=meta["aspect_ratio"],
+                resolution=meta["resolution"],
+                dialogue_delivery=meta["dialogue_delivery"],
+                settings=settings,
+            )
+        except long_generation.LongGenerationError as exc:
+            if exc.code not in {
+                "prompt_fusion_refresh_required",
+                "prompt_fusion_failed",
+            }:
+                return False
+        except Exception:
+            # This is still the same local, receipt-bound operation. Preserve
+            # its owner and retry locally; no provider boundary has been hit.
+            return True
+        meta = storage.load_submission_claim(settings.data_dir, cid, owner)
+        if meta is None:
+            return False
+        if _automatic_v4_pre_fusion_claim(settings, cid, meta, owner):
+            return True
+    if not _prompt_fusion_continuation_claim(meta, owner):
         return False
     fusion = meta["_prompt_fusion"]
     status = fusion.get("status")
@@ -2884,8 +3034,16 @@ def _start_automatic_v4_generation(
     if isinstance(meta.get("generation"), Mapping):
         return
     owner = meta.get("_input_owner")
-    if _prompt_fusion_continuation_claim(meta, owner):
-        _produce_prompt_fusion_and_continue(settings, cid, runner, owner)
+    if owner is not None:
+        if (
+            _prompt_fusion_continuation_claim(meta, owner)
+            or _automatic_v4_pre_fusion_claim(
+                settings, cid, meta, owner
+            )
+        ):
+            _produce_prompt_fusion_and_continue(
+                settings, cid, runner, owner
+            )
         return
     post = meta.get("postprocess")
     if not isinstance(post, Mapping) or post.get("status") != "done":
@@ -2943,26 +3101,6 @@ def _start_automatic_v4_generation(
         resolution=resolution,
     )
     if accepted is None:
-        return
-    try:
-        long_generation.finalize_multimodal_plan(
-            settings.data_dir / cid,
-            accepted,
-            expected_receipt,
-            fit_mode,
-            dialogue_mode,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-            dialogue_delivery=requested_delivery,
-            settings=settings,
-        )
-    except long_generation.LongGenerationError as exc:
-        if exc.code not in {
-            "prompt_fusion_refresh_required",
-            "prompt_fusion_failed",
-        }:
-            return
-    except Exception:
         return
     _produce_prompt_fusion_and_continue(settings, cid, runner, owner)
 
@@ -3273,11 +3411,35 @@ def create_app(settings: Settings) -> FastAPI:
                 name=f"postprocess-recover-{cid[:8]}",
             )
             app.state.postprocess_recovery_tasks.append(task)
+        automatic_pre_fusion = {
+            cid
+            for cid, _owner
+            in _claim_stale_automatic_v4_pre_fusion_continuations(settings)
+        }
+        for meta in storage.list_conversations(settings.data_dir):
+            cid = meta.get("id")
+            owner = meta.get("_input_owner")
+            if (
+                not isinstance(cid, str)
+                or not isinstance(owner, Mapping)
+                or owner.get("process_generation")
+                != storage.PROCESS_GENERATION
+            ):
+                continue
+            if _automatic_v4_pre_fusion_claim(settings, cid, meta, owner):
+                automatic_pre_fusion.add(cid)
+        for cid in automatic_pre_fusion:
+            task = asyncio.create_task(
+                advance_v4_operation(cid),
+                name=f"operation-recover-{cid[:8]}",
+            )
+            app.state.operation_recovery_tasks.append(task)
         for meta in storage.list_conversations(settings.data_dir):
             cid = meta.get("id")
             if (
                 not isinstance(cid, str)
                 or cid in recovering
+                or cid in automatic_pre_fusion
                 or meta.get("schema_version") != 2
                 or meta.get("status") != "done"
                 or isinstance(meta.get("generation"), Mapping)

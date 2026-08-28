@@ -2021,6 +2021,297 @@ def test_technical_acceptance_auto_claim_reaches_fusion_and_h3_once(
     assert coordinator_calls == [True]
 
 
+def _make_automatic_pre_fusion_claim(
+    settings, monkeypatch, *, request_id: str | None = None,
+):
+    cid, _receipt = _make_long(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={"status": "done", "segments": []},
+        _postprocess_receipt={
+            "version": 4,
+            "options": {
+                "remove_subtitle": False,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        postprocess,
+        "image_acceptance_status",
+        lambda *_args, **_kwargs: {
+            "required": True,
+            "accepted": True,
+            "expected_meta_sha256": "a" * 64,
+        },
+    )
+    claimed = storage.claim_submission_input(
+        settings.data_dir,
+        cid,
+        request_id or f"auto-{cid}",
+    )
+    assert claimed is not None
+    owner = {**claimed["_input_owner"], "fast_mode": False}
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _input_owner=owner,
+        dialogue_mode="auto",
+        dialogue_delivery="auto",
+        resolved_dialogue_delivery="on_screen",
+        fit_mode="none",
+        aspect_ratio="9:16",
+        resolution="768p",
+    )
+    return cid, owner
+
+
+def _install_automatic_pre_fusion_harness(
+    settings, cid, monkeypatch,
+):
+    finalize_process_generations = []
+    fusion_calls = []
+    coordinator_calls = []
+    frozen_plan = object()
+
+    def finalize(*_args, **_kwargs):
+        current = storage.load_meta(settings.data_dir, cid)
+        finalize_process_generations.append(
+            current["_input_owner"]["process_generation"]
+        )
+        if current.get("_prompt_fusion") is None:
+            storage.update_meta(
+                settings.data_dir,
+                cid,
+                _prompt_fusion={
+                    "version": long_generation.PROMPT_FUSION_VERSION,
+                    "status": "queued",
+                    "error": None,
+                    "input_sha256": "a" * 64,
+                    "image_acceptance_sha256": "b" * 64,
+                    "manifest_sha256": None,
+                },
+            )
+            raise long_generation.LongGenerationError(
+                "prompt_fusion_refresh_required"
+            )
+        return "c" * 64
+
+    def produce(_settings, received_cid, _runner):
+        fusion_calls.append(received_cid)
+        current = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            _prompt_fusion={**current, "status": "done"},
+        )
+        return "done"
+
+    monkeypatch.setattr(
+        long_generation, "finalize_multimodal_plan", finalize
+    )
+    monkeypatch.setattr(pipeline, "produce_prompt_fusion", produce)
+    monkeypatch.setattr(
+        long_generation,
+        "freeze_plan",
+        lambda *_args, **_kwargs: frozen_plan,
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "initial_generation",
+        lambda _settings, _cid, plan, request_id, attempt, _old,
+        *, fast_mode=False: {
+            "status": "queued",
+            "error": None,
+            "attempt": attempt,
+            "client_request_id": request_id,
+            "stage": "h3",
+            "fast_mode": fast_mode,
+            "segments": [],
+        } if plan is frozen_plan else pytest.fail("wrong frozen plan"),
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "run",
+        lambda *_args, **_kwargs: coordinator_calls.append(True),
+    )
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda *_args, **_kwargs: pytest.fail("provider must not start"),
+    )
+    return finalize_process_generations, fusion_calls, coordinator_calls
+
+
+def test_automatic_pre_fusion_claim_reuses_owner_and_one_producer(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    cid, owner = _make_automatic_pre_fusion_claim(
+        settings, monkeypatch
+    )
+    finalize_generations, fusion_calls, coordinator_calls = (
+        _install_automatic_pre_fusion_harness(
+            settings, cid, monkeypatch
+        )
+    )
+    monkeypatch.setattr(
+        storage,
+        "claim_submission_input",
+        lambda *_args, **_kwargs: pytest.fail("must reuse durable owner"),
+    )
+
+    main_module._start_automatic_v4_generation(settings, cid, object())
+    main_module._start_automatic_v4_generation(settings, cid, object())
+
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert owner["request_id"] == f"auto-{cid}"
+    assert recovered["_input_owner"] is None
+    assert recovered["generation"]["client_request_id"] == f"auto-{cid}"
+    assert finalize_generations == [
+        storage.PROCESS_GENERATION,
+        storage.PROCESS_GENERATION,
+    ]
+    assert fusion_calls == [cid]
+    assert coordinator_calls == [True]
+
+
+def test_startup_atomically_resumes_automatic_pre_fusion_claim(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    cid, old_owner = _make_automatic_pre_fusion_claim(
+        settings, monkeypatch
+    )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    finalize_generations, fusion_calls, coordinator_calls = (
+        _install_automatic_pre_fusion_harness(
+            settings, cid, monkeypatch
+        )
+    )
+    monkeypatch.setattr(
+        storage,
+        "claim_submission_input",
+        lambda *_args, **_kwargs: pytest.fail("restart must reuse owner"),
+    )
+
+    with TestClient(create_app(settings)) as client:
+        deadline = time.monotonic() + 5
+        while (
+            storage.load_meta(settings.data_dir, cid).get("generation") is None
+            and time.monotonic() < deadline
+        ):
+            client.get("/api/health", headers=AUTH)
+            time.sleep(0.01)
+        assert len(client.app.state.operation_recovery_tasks) == 1
+
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert old_owner["process_generation"] == "boot-old"
+    assert recovered["_input_owner"] is None
+    assert recovered["generation"]["client_request_id"] == f"auto-{cid}"
+    assert finalize_generations == ["boot-new", "boot-new"]
+    assert fusion_calls == [cid]
+    assert coordinator_calls == [True]
+
+
+@pytest.mark.parametrize("drift", ["snapshot", "nonauto"])
+def test_automatic_pre_fusion_recovery_rejects_drift_and_nonauto_owner(
+    tmp_path, monkeypatch, drift,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    cid, owner = _make_automatic_pre_fusion_claim(
+        settings,
+        monkeypatch,
+        request_id="manual-request-123" if drift == "nonauto" else None,
+    )
+    if drift == "snapshot":
+        plan_path = settings.data_dir / cid / long_video.PLAN_RECEIPT_FILENAME
+        plan_path.write_bytes(plan_path.read_bytes() + b"\n")
+    monkeypatch.setattr(
+        storage,
+        "claim_submission_input",
+        lambda *_args, **_kwargs: pytest.fail("must not create a new owner"),
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "finalize_multimodal_plan",
+        lambda *_args, **_kwargs: pytest.fail("invalid claim must not resume"),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "produce_prompt_fusion",
+        lambda *_args, **_kwargs: pytest.fail("Fusion must not start"),
+    )
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda *_args, **_kwargs: pytest.fail("provider must not start"),
+    )
+
+    main_module._start_automatic_v4_generation(settings, cid, object())
+    assert not main_module._prompt_fusion_continuation_step(
+        settings, cid, object(), owner
+    )
+
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert recovered["_input_owner"] == owner
+    assert recovered.get("_prompt_fusion") is None
+    assert recovered.get("generation") is None
+
+
+def test_automatic_pre_fusion_local_error_retries_same_owner_only(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    cid, owner = _make_automatic_pre_fusion_claim(
+        settings, monkeypatch
+    )
+    monkeypatch.setattr(
+        storage,
+        "claim_submission_input",
+        lambda *_args, **_kwargs: pytest.fail("must not create a new owner"),
+    )
+
+    def fail_locally(*_args, **_kwargs):
+        raise OSError("local interruption")
+
+    monkeypatch.setattr(
+        long_generation,
+        "finalize_multimodal_plan",
+        fail_locally,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "produce_prompt_fusion",
+        lambda *_args, **_kwargs: pytest.fail("Fusion producer not queued"),
+    )
+    monkeypatch.setattr(
+        h3,
+        "start",
+        lambda *_args, **_kwargs: pytest.fail("provider must not start"),
+    )
+
+    assert main_module._prompt_fusion_continuation_step(
+        settings, cid, object(), owner
+    )
+
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert recovered["_input_owner"] == owner
+    assert recovered.get("_prompt_fusion") is None
+    assert recovered.get("generation") is None
+
+
 def test_current_operation_replay_ignores_new_id_and_never_reposts_unknown(
     enabled, monkeypatch,
 ):
