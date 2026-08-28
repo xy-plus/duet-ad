@@ -28,11 +28,13 @@ MAX_DURATION_S = 10
 _FFMPEG_TIMEOUT_S = 120
 _FFPROBE_TIMEOUT_S = 60
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+FFMPEG_PATH = Path("/usr/bin/ffmpeg")
+FFPROBE_PATH = Path("/usr/bin/ffprobe")
 
 # Paths are placeholders so the command recorded in every receipt is stable.
 # The runtime substitutes private snapshot/candidate paths only.
 FFMPEG_COMMAND = (
-    "ffmpeg",
+    "/usr/bin/ffmpeg",
     "-v",
     "error",
     "-nostdin",
@@ -100,6 +102,29 @@ class _Probe:
     video: dict[str, object]
 
 
+@dataclass(frozen=True)
+class _ToolIdentity:
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True)
+class _FrozenTool:
+    path: Path
+    sha256: str
+    identity: _ToolIdentity
+
+    def receipt(self) -> dict[str, object]:
+        return {
+            "path": str(self.path),
+            "sha256": self.sha256,
+            "size": self.identity.size,
+        }
+
+
 def _canonical_json(value: object) -> bytes:
     try:
         return json.dumps(
@@ -127,6 +152,111 @@ def _sha256(path: Path) -> str:
 def _clean_error(stderr: str) -> str:
     text = " ".join(stderr.strip().split())
     return text[-600:] if text else "no diagnostic output"
+
+
+def _tool_identity(value: os.stat_result) -> _ToolIdentity:
+    return _ToolIdentity(
+        device=value.st_dev,
+        inode=value.st_ino,
+        size=value.st_size,
+        mtime_ns=value.st_mtime_ns,
+        ctime_ns=value.st_ctime_ns,
+    )
+
+
+def _tool_is_executable(value: os.stat_result) -> bool:
+    execute_bits = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    return stat.S_ISREG(value.st_mode) and bool(value.st_mode & execute_bits)
+
+
+def _open_tool(path: Path, *, changed: bool) -> tuple[int, _ToolIdentity]:
+    code = "reference_video_tool_changed" if changed else "reference_video_tool_invalid"
+    if not path.is_absolute():
+        raise ReferenceVideoError(code)
+    descriptor = -1
+    try:
+        linked = path.lstat()
+        if (
+            stat.S_ISLNK(linked.st_mode)
+            or not _tool_is_executable(linked)
+            or not os.access(path, os.X_OK, follow_symlinks=False)
+        ):
+            raise ReferenceVideoError(code)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        if (
+            not _tool_is_executable(opened)
+            or _tool_identity(linked) != _tool_identity(opened)
+        ):
+            raise ReferenceVideoError(code)
+        return descriptor, _tool_identity(opened)
+    except ReferenceVideoError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise ReferenceVideoError(code) from None
+
+
+def _verify_open_tool(tool: _FrozenTool, descriptor: int) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        linked = tool.path.lstat()
+    except OSError:
+        raise ReferenceVideoError("reference_video_tool_changed") from None
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not _tool_is_executable(linked)
+        or not _tool_is_executable(opened)
+        or _tool_identity(linked) != tool.identity
+        or _tool_identity(opened) != tool.identity
+    ):
+        raise ReferenceVideoError("reference_video_tool_changed")
+
+
+def _freeze_tool(path: Path) -> _FrozenTool:
+    descriptor, identity = _open_tool(path, changed=False)
+    digest = hashlib.sha256()
+    try:
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        tool = _FrozenTool(path=path, sha256=digest.hexdigest(), identity=identity)
+        _verify_open_tool(tool, descriptor)
+        return tool
+    finally:
+        os.close(descriptor)
+
+
+def _run_checked(
+    tool: _FrozenTool, argv: list[str], *, timeout: int
+) -> subprocess.CompletedProcess[str]:
+    if not argv or argv[0] != str(tool.path):
+        raise ReferenceVideoError("reference_video_tool_invalid")
+    descriptor, identity = _open_tool(tool.path, changed=True)
+    if identity != tool.identity:
+        os.close(descriptor)
+        raise ReferenceVideoError("reference_video_tool_changed")
+    try:
+        # Execute the already verified inode while retaining the absolute path
+        # as argv[0]. This closes the replace-between-check-and-exec window.
+        return subprocess.run(
+            argv,
+            executable=f"/proc/self/fd/{descriptor}",
+            pass_fds=(descriptor,),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    finally:
+        try:
+            _verify_open_tool(tool, descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _root_path(value: str | Path) -> Path:
@@ -250,14 +380,9 @@ def _snapshot_source(source: Path, snapshot: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _run_json(argv: list[str]) -> dict[str, Any]:
+def _run_json(tool: _FrozenTool, argv: list[str]) -> dict[str, Any]:
     try:
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=_FFPROBE_TIMEOUT_S,
-        )
+        result = _run_checked(tool, argv, timeout=_FFPROBE_TIMEOUT_S)
     except FileNotFoundError:
         raise ReferenceVideoError("reference_video_ffprobe_not_found") from None
     except subprocess.TimeoutExpired:
@@ -322,10 +447,11 @@ def _timeline(
     }
 
 
-def _probe(path: Path) -> _Probe:
+def _probe(path: Path, ffprobe: _FrozenTool) -> _Probe:
     inventory = _run_json(
+        ffprobe,
         [
-            "ffprobe",
+            str(ffprobe.path),
             "-v",
             "error",
             "-show_entries",
@@ -352,8 +478,9 @@ def _probe(path: Path) -> _Probe:
     format_name = _nonempty_string(raw_format.get("format_name"))
 
     packet_payload = _run_json(
+        ffprobe,
         [
-            "ffprobe",
+            str(ffprobe.path),
             "-v",
             "error",
             "-select_streams",
@@ -372,8 +499,9 @@ def _probe(path: Path) -> _Probe:
         ]
     )
     frame_payload = _run_json(
+        ffprobe,
         [
-            "ffprobe",
+            str(ffprobe.path),
             "-v",
             "error",
             "-select_streams",
@@ -459,18 +587,14 @@ def _probe(path: Path) -> _Probe:
     return _Probe(tuple(streams), format_name, video)
 
 
-def _run_ffmpeg(source: Path, output: Path) -> None:
+def _run_ffmpeg(source: Path, output: Path, ffmpeg: _FrozenTool) -> None:
+    command = (str(ffmpeg.path), *FFMPEG_COMMAND[1:])
     argv = [
         str(source) if item == "{source}" else str(output) if item == "{output}" else item
-        for item in FFMPEG_COMMAND
+        for item in command
     ]
     try:
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=_FFMPEG_TIMEOUT_S,
-        )
+        result = _run_checked(ffmpeg, argv, timeout=_FFMPEG_TIMEOUT_S)
     except FileNotFoundError:
         raise ReferenceVideoError("reference_video_ffmpeg_not_found") from None
     except subprocess.TimeoutExpired:
@@ -546,6 +670,8 @@ def derive_reference_video(
         raise ReferenceVideoError("reference_video_path_invalid")
     output = _checked_target(output_parent, output_posix.name)
     receipt = _checked_target(receipt_parent, receipt_posix.name)
+    ffmpeg = _freeze_tool(FFMPEG_PATH)
+    ffprobe = _freeze_tool(FFPROBE_PATH)
 
     with tempfile.TemporaryDirectory(
         prefix=".reference-video-", dir=output_parent
@@ -558,10 +684,10 @@ def derive_reference_video(
         source_sha256, source_size = _snapshot_source(source, snapshot)
         if source_sha256 != expected_source_sha256:
             raise ReferenceVideoError("reference_video_source_hash_mismatch")
-        source_probe = _probe(snapshot)
+        source_probe = _probe(snapshot, ffprobe)
 
-        _run_ffmpeg(snapshot, candidate)
-        output_probe = _probe(candidate)
+        _run_ffmpeg(snapshot, candidate, ffmpeg)
+        output_probe = _probe(candidate, ffprobe)
         if output_probe.streams != ("video",):
             raise ReferenceVideoError("reference_video_audio_contract_mismatch")
         if "mp4" not in output_probe.format_name.split(","):
@@ -582,7 +708,13 @@ def derive_reference_video(
                 "timestamp_basis": "stream_start_pts",
                 "video_mode": "stream_copy",
             },
-            "derivation": {"argv": list(FFMPEG_COMMAND)},
+            "derivation": {
+                "argv": [str(ffmpeg.path), *FFMPEG_COMMAND[1:]],
+            },
+            "tools": {
+                "ffmpeg": ffmpeg.receipt(),
+                "ffprobe": ffprobe.receipt(),
+            },
             "source": {
                 "path": source_relative,
                 "sha256": source_sha256,

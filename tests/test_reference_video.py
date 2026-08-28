@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -168,6 +169,19 @@ def test_derives_canonical_receipt_and_preserves_the_complete_video_timeline(
         "video_mode": "stream_copy",
     }
     assert receipt["derivation"]["argv"] == list(reference_video.FFMPEG_COMMAND)
+    assert receipt["derivation"]["argv"][0] == "/usr/bin/ffmpeg"
+    assert receipt["tools"] == {
+        "ffmpeg": {
+            "path": "/usr/bin/ffmpeg",
+            "sha256": _sha256(Path("/usr/bin/ffmpeg")),
+            "size": Path("/usr/bin/ffmpeg").stat().st_size,
+        },
+        "ffprobe": {
+            "path": "/usr/bin/ffprobe",
+            "sha256": _sha256(Path("/usr/bin/ffprobe")),
+            "size": Path("/usr/bin/ffprobe").stat().st_size,
+        },
+    }
     assert result.source_sha256 == receipt["source"]["sha256"]
     assert result.output_sha256 == receipt["output"]["sha256"]
     assert result.receipt_sha256 == hashlib.sha256(receipt_bytes).hexdigest()
@@ -293,3 +307,89 @@ def test_derivation_failure_does_not_replace_published_files(
         _derive(tmp_path, source)
     assert output.read_bytes() == b"published-output"
     assert receipt.read_bytes() == b"published-receipt"
+
+
+def test_malicious_path_shims_are_never_executed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "frozen" / "segment.mp4"
+    artifacts = tmp_path / "artifacts"
+    shims = tmp_path / "shims"
+    marker = tmp_path / "shim-was-called"
+    artifacts.mkdir()
+    shims.mkdir()
+    _make_source(source)
+    for name in ("ffmpeg", "ffprobe"):
+        shim = shims / name
+        shim.write_text(
+            "#!/bin/sh\n/usr/bin/touch \"$REFERENCE_VIDEO_SHIM_MARKER\"\nexit 99\n",
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shims))
+    monkeypatch.setenv("REFERENCE_VIDEO_SHIM_MARKER", str(marker))
+
+    result = _derive(tmp_path, source)
+
+    assert result.output_path.is_file()
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("constant", "target"),
+    [
+        ("FFMPEG_PATH", "/usr/bin/ffmpeg"),
+        ("FFPROBE_PATH", "/usr/bin/ffprobe"),
+    ],
+)
+def test_rejects_symlinked_tool_before_any_media_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constant: str,
+    target: str,
+) -> None:
+    source = tmp_path / "frozen" / "segment.mp4"
+    (tmp_path / "artifacts").mkdir()
+    _make_source(source)
+    linked_tool = tmp_path / Path(target).name
+    linked_tool.symlink_to(target)
+    monkeypatch.setattr(reference_video, constant, linked_tool)
+
+    with pytest.raises(reference_video.ReferenceVideoError, match="tool_invalid"):
+        _derive(tmp_path, source)
+    assert not (tmp_path / "artifacts" / "reference.mp4").exists()
+    assert not (tmp_path / "artifacts" / "reference_video.json").exists()
+
+
+def test_rejects_ffprobe_identity_drift_during_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "frozen" / "segment.mp4"
+    (tmp_path / "artifacts").mkdir()
+    _make_source(source)
+    copied_probe = tmp_path / "ffprobe"
+    shutil.copy2("/usr/bin/ffprobe", copied_probe)
+    copied_probe.chmod(0o755)
+    monkeypatch.setattr(reference_video, "FFPROBE_PATH", copied_probe)
+    real_run = reference_video.subprocess.run
+    changed = False
+
+    def run_then_change(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+        nonlocal changed
+        result = real_run(*args, **kwargs)
+        argv = args[0]
+        if not changed and isinstance(argv, list) and argv[0] == str(copied_probe):
+            with copied_probe.open("ab") as handle:
+                handle.write(b"\0")
+                handle.flush()
+                os.fsync(handle.fileno())
+            changed = True
+        return result
+
+    monkeypatch.setattr(reference_video.subprocess, "run", run_then_change)
+
+    with pytest.raises(reference_video.ReferenceVideoError, match="tool_changed"):
+        _derive(tmp_path, source)
+    assert changed
+    assert not (tmp_path / "artifacts" / "reference.mp4").exists()
+    assert not (tmp_path / "artifacts" / "reference_video.json").exists()
