@@ -1529,6 +1529,9 @@ def test_upload_single_operation_continues_despite_nonblocking_quality_scores(
     )
     monkeypatch.setattr(postprocess, "accept_images", accept)
     monkeypatch.setattr(
+        long_generation, "plan_receipt", lambda *_args, **_kwargs: "a" * 64,
+    )
+    monkeypatch.setattr(
         main_module, "_start_automatic_v4_generation", generate
     )
 
