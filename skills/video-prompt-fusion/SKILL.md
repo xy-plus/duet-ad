@@ -51,7 +51,7 @@ VoiceReference = { voice_ref: Int1; path: NonEmpty; sha256: Sha256; purpose: "vo
 - `voice_references` 按 `voice_ref` 连续升序且没有重复；每个非 null `voice_ref` 必须唯一解析到同值 `voice_references[].voice_ref`，也不得保留未被行引用的 reference。不要读取或分析 reference 音频；这里只原样绑定其 1-based index、路径、bytes SHA 和用途。
 - `music_policy` 必须是 exact 字符串 `"forbid"`；缺失或其他值都不合法。它仍属于第四类 `audio_content`，不是第五类输入。
 - clean reference 的资格证明只由后端 frozen receipt 负责；本 Skill 不接收证明字段，也不判断 reference 是否 clean。
-- 所有 SHA-256 都是 64 位小写十六进制。路径必须解析到当前工作目录内已列出的普通文件。
+- 所有 SHA-256 都是 64 位小写十六进制。只有 `new_keyframes[].path` 是本 Skill 可读取的文件路径，必须解析到当前工作目录内已列出的普通图片并与 SHA-256 匹配。`voice_references[].path` 只是后端已冻结的 receipt 元数据；本 Skill 不读取、不解析，也不要求该音频文件出现在隔离工作目录中。
 - 四类输入只能服务同一段，不得跨 segment 借用、补证或传播内容。
 
 任一 schema、数量、索引、顺序、路径或哈希不匹配时，不写输出文件。不要猜测缺失值，也不要用其他文件修复输入。

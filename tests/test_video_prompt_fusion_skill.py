@@ -92,6 +92,9 @@ def test_hash_order_and_segment_scope_are_closed_world():
         "UTF-8 `text` bytes 的 SHA-256",
         "UTF-8 `audio_content.lines_json` exact bytes 的 SHA-256",
         "每个非 null `voice_ref` 必须唯一解析到同值 `voice_references[].voice_ref`",
+        "只有 `new_keyframes[].path` 是本 Skill 可读取的文件路径",
+        "`voice_references[].path` 只是后端已冻结的 receipt 元数据",
+        "不要求该音频文件出现在隔离工作目录中",
         '`lines_json="[]"`',
         "不得跨 segment 借用",
         "任一 schema、数量、索引、顺序、路径或哈希不匹配时，不写输出文件",
@@ -100,6 +103,7 @@ def test_hash_order_and_segment_scope_are_closed_world():
 
     assert '"same_camera"' not in text
     assert '"camera_motion"' not in text
+    assert "路径必须解析到当前工作目录内已列出的普通文件" not in text
 
 
 def test_visual_authorities_are_explicit_and_non_overlapping():
