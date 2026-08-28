@@ -43,7 +43,7 @@ def test_input_contract_has_only_the_four_content_classes():
         "old_video_prompt: FrozenText",
         "image_optimization_prompt: NineOrdered<FrozenFramePrompt>",
         "audio_content: FrozenAudioContent",
-        'KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256; source_time_s: Number; source_scene_id: NonEmpty; transition: { type: "start" | "same_camera" | "camera_motion" | "hard_cut"; at_s: Number | null } }',
+        'KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256; source_time_s: Number; source_scene_id: NonEmpty; transition: { type: "start" | "continuous" | "hard_cut"; at_s: Number | null } }',
         "FrozenText = { text: NonEmpty; sha256: Sha256 }",
         "FrozenFramePrompt = { order: Int1; text: NonEmpty; sha256: Sha256 }",
         'FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice_references: Array<VoiceReference>; music_policy: "forbid" }',
@@ -79,10 +79,14 @@ def test_hash_order_and_segment_scope_are_closed_world():
         "只有项目第一张",
         '`type="start"` 且 `at_s=source_time_s`',
         "其余关键帧禁止 `start`",
-        '`same_camera` 和 `camera_motion` 的 `at_s` 必须为 `null`',
+        '`continuous` 的 `at_s` 必须为 `null`',
+        '`continuous` 只表示没有 source hard cut',
+        '`continuous` 不授权静态机位、构图或 camera movement',
         '`hard_cut` 的 `at_s` 必须是有限非负数',
         "前一张 `source_time_s < at_s <=` 当前张 `source_time_s`",
         "source scene 改变时必须是 `hard_cut`",
+        "source scene 不变时必须是 `continuous`",
+        "硬切前后 scene ids 必须逐值等于相邻关键帧的 `source_scene_id`",
         "硬切后的当前关键帧是新 anchor",
         "图片原始 bytes 的 SHA-256",
         "UTF-8 `text` bytes 的 SHA-256",
@@ -93,6 +97,9 @@ def test_hash_order_and_segment_scope_are_closed_world():
         "任一 schema、数量、索引、顺序、路径或哈希不匹配时，不写输出文件",
     ):
         assert required in text
+
+    assert '"same_camera"' not in text
+    assert '"camera_motion"' not in text
 
 
 def test_visual_authorities_are_explicit_and_non_overlapping():

@@ -26,7 +26,7 @@ SegmentInput = {
   image_optimization_prompt: NineOrdered<FrozenFramePrompt>;
   audio_content: FrozenAudioContent;
 }
-KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256; source_time_s: Number; source_scene_id: NonEmpty; transition: { type: "start" | "same_camera" | "camera_motion" | "hard_cut"; at_s: Number | null } }
+KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256; source_time_s: Number; source_scene_id: NonEmpty; transition: { type: "start" | "continuous" | "hard_cut"; at_s: Number | null } }
 FrozenText = { text: NonEmpty; sha256: Sha256 }
 FrozenFramePrompt = { order: Int1; text: NonEmpty; sha256: Sha256 }
 FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice_references: Array<VoiceReference>; music_policy: "forbid" }
@@ -42,8 +42,8 @@ VoiceReference = { voice_ref: Int1; path: NonEmpty; sha256: Sha256; purpose: "vo
 
 - segment `index` 从 1 连续升序；每段恰好 9 张新关键帧，`order` 从 1 连续升序。不得选帧、删帧、补帧或重排。
 - `source_time_s` 必须是有限非负数，并按 `(segment index, keyframe order)` 全局严格递增。只有项目第一张，即 segment 1/order 1，必须为 `type="start"` 且 `at_s=source_time_s`；其余关键帧禁止 `start`。
-- `same_camera` 和 `camera_motion` 的 `at_s` 必须为 `null`。`hard_cut` 的 `at_s` 必须是有限非负数：同一 segment 内须满足前一张 `source_time_s < at_s <=` 当前张 `source_time_s`；后续 segment/order 1 的值必须是后端冻结的该 segment 起点且不得晚于当前张 `source_time_s`。不得从图片、旧提示词或文件名推断、移动或补写切点。
-- 按全局顺序比较相邻关键帧，source scene 改变时必须是 `hard_cut`；硬切后的当前关键帧是新 anchor，不得与切前帧描述为连续 zoom、morph 或同镜头运动。`hard_cut.at_s` 不得改写为其他关键帧的 `source_time_s`；硬切记录及切后当前 anchor 必须逐值保持。
+- `continuous` 的 `at_s` 必须为 `null`。`continuous` 只表示没有 source hard cut；`continuous` 不授权静态机位、构图或 camera movement。`hard_cut` 的 `at_s` 必须是有限非负数：同一 segment 内须满足前一张 `source_time_s < at_s <=` 当前张 `source_time_s`；后续 segment/order 1 的值必须是后端冻结的该 segment 起点且不得晚于当前张 `source_time_s`。不得从图片、旧提示词或文件名推断、移动或补写切点。
+- 按全局顺序比较相邻关键帧，source scene 改变时必须是 `hard_cut`，source scene 不变时必须是 `continuous`；硬切前后 scene ids 必须逐值等于相邻关键帧的 `source_scene_id`。硬切后的当前关键帧是新 anchor，不得与切前帧描述为连续 zoom、morph 或同镜头运动。`hard_cut.at_s` 不得改写为其他关键帧的 `source_time_s`；硬切记录及切后当前 anchor 必须逐值保持。
 - `image_optimization_prompt` 也恰好 9 条并按 `order` 从 1 连续升序；每条图片优化提示词与同 `order` 新关键帧一一对应。
 - `new_keyframes[].sha256` 是对应图片原始 bytes 的 SHA-256；`old_video_prompt.sha256` 和每条图片优化提示词的 `sha256` 都是 UTF-8 `text` bytes 的 SHA-256。
 - `audio_content.lines_sha256` 是 UTF-8 `audio_content.lines_json` exact bytes 的 SHA-256。可以把 `lines_json` 解析为 `Array<AudioLine>` 以理解内容，但不得重新序列化、规范化数字或改写其字符。
