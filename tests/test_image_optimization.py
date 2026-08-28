@@ -689,7 +689,9 @@ def test_anchor_first_frame_real_timeout_projects_submission_unknown(tmp_path, m
     assert public["error"] == "submission_unknown"
 
 
-def test_postprocess_has_strict_stage_barriers_and_anchor_single_output(tmp_path, monkeypatch):
+def test_single_postprocess_operation_has_strict_stage_barriers_and_anchor_output(
+    tmp_path, monkeypatch,
+):
     monkeypatch.setenv("ARK_API_KEY", "secret")
     settings = make_settings(
         tmp_path, enable_mediakit_erase=True, seedream_edit_mode="anchor_consistency"
@@ -721,14 +723,19 @@ def test_postprocess_has_strict_stage_barriers_and_anchor_single_output(tmp_path
 
     monkeypatch.setattr(postprocess.mediakit, "erase_image", erase)
     monkeypatch.setattr(postprocess.seedream, "edit", edit)
-    with TestClient(create_app(settings)) as client:
-        response = client.post(
-            f"/api/conversations/{cid}/postprocess", headers=AUTH,
-            json={"confirm": True, "options": {
-                "remove_subtitle": True, "remove_brand": True, "optimize_image": True,
-            }},
-        )
-        assert response.status_code == 200
+    asyncio.run(postprocess.start(
+        settings,
+        cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": True,
+            "remove_brand": True,
+            "optimize_image": True,
+        }},
+        {},
+    ))
+    asyncio.run(postprocess.run_task(
+        settings, cid, asyncio.Semaphore(1), asyncio.Semaphore(1),
+    ))
     stages = [item[1] for item in events if item[0] == "media"]
     assert stages == [mediakit.TEXT_SCENE] * 3 + [mediakit.ICON_SCENE] * 3
     seedream_calls = [item for item in events if item[0] == "seedream"]
@@ -1954,7 +1961,7 @@ def test_v4_single_frame_valid_input_reaches_anchor_generation_without_quality_p
         )
 
 
-def test_v3_failed_quality_acceptance_publishes_but_remains_blocked_from_h3(
+def test_v3_quality_failure_is_nonblocking_and_never_invokes_acceptance_skill(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setenv("ARK_API_KEY", "test-key")
@@ -1991,11 +1998,6 @@ def test_v3_failed_quality_acceptance_publishes_but_remains_blocked_from_h3(
     assert latest["postprocess"]["status"] == "done"
     assert runner.calls == 0
     assert "_image_verification" not in latest
-    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
-        postprocess.generation_keyframes(
-            cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
-            settings=settings,
-        )
 
 
 @pytest.mark.parametrize("status", ["fail", "unknown"])

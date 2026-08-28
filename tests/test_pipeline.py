@@ -210,6 +210,48 @@ _PX_PNG = base64.b64decode(
 )
 
 
+def _semantic_image_output(request: dict, *, omit_wardrobe: bool = False) -> dict:
+    people = {
+        "subject": {
+            "source_identity": "当前可见源人物",
+            "replacement_identity": "明显不同且跨帧稳定的新人物",
+            "wardrobe_change": "不同款式且保持用途的服装",
+            "local_color_change": "人物局部固有色明显变化",
+        }
+    }
+    if omit_wardrobe:
+        people["subject"].pop("wardrobe_change")
+    return {
+        "people": people,
+        "scenes": {
+            slot["key"]: {
+                "source_scene": "当前可见源环境",
+                "replacement_scene": "同用途且设计不同的真实新环境",
+                "semantic_change": "环境语义明显变化",
+                "geometry_change": "可见形状和空间结构明显变化",
+                "depth_change": "前中后景纵深明显变化",
+                "layout_change": "功能区域和实体布局明显变化",
+                "local_color_change": "局部材质固有色明显变化",
+            }
+            for slot in request["semantic_slots"]["scenes"]
+        },
+        "frames": {
+            slot["key"]: {
+                "people": {"subject": {
+                    "visible_region": f"{slot['key']} 当前可见人物区域",
+                    "boundary": f"{slot['key']} 当前可见边界",
+                    "body_and_pose": f"{slot['key']} 当前可见身体与姿态",
+                }},
+                "relationships": f"{slot['key']} 当前可见接触与遮挡关系",
+                "entities": f"{slot['key']} 当前可见非人物实体",
+                "crop": f"{slot['key']} 当前画外裁切",
+                "palette_description": "warm-neutral and natural-muted",
+            }
+            for slot in request["semantic_slots"]["frames"]
+        },
+    }
+
+
 def _write_valid_package(work: Path, frames: int = 3, prompt: str = PROMPT_TEXT):
     """按约定文件名造一套合法产物，返回关键帧文件名列表。"""
     kdir = work / "keyframes"
@@ -700,10 +742,8 @@ def test_v4_plan_input_receives_backend_transition_skeleton_before_codex(tmp_pat
     )
 
 
-@pytest.mark.parametrize("eligible", [False, True])
-@pytest.mark.parametrize("model_recovers", [True, False])
-def test_v4_plan_protocol_error_replans_then_uses_backend_fallback(
-    tmp_path, monkeypatch, eligible, model_recovers,
+def test_v4_semantic_diagnostics_do_not_retry_or_switch_compilers(
+    tmp_path, monkeypatch, caplog,
 ):
     settings = make_settings(tmp_path, retry_count=1, retry_interval_s=0)
     keyframes = tmp_path / "keyframes"
@@ -714,59 +754,32 @@ def test_v4_plan_protocol_error_replans_then_uses_backend_fallback(
         {0: [frame]},
         segment_lineage={0: {"chain_id": "short-000", "join_mode": "hard_cut"}},
     )
-    valid = _short_dual_target_plan_v3(frame_count=1)
-    valid["version"] = 4
-    valid["segments"][0]["frame_constraints"][0]["dominant_palette_contract"] = {
-        "area_weighted_warm_cool_family": "balanced",
-        "saturation_style": "muted",
-    }
-    valid["scene_plans"][0]["continuity_graph"] = {
-        "components": [{"component_id": "COMPONENT_01", "target_spec": "target"}],
-        "topology": [],
-        "views": [{
-            "segment_index": 0,
-            "frame_index": 1,
-            "transition_from_previous": "start",
-            "observations": [{
-                "component_id": "COMPONENT_01", "visibility": "full",
-            }],
-            "view_relations": [],
-        }],
-    }
-    refusal = {
-        "version": 4,
-        "phase": "plan",
-        "segment_indices": [0],
-        "eligible": eligible,
-        "reason": None if eligible else "scene_components_ambiguous",
-        "person_plans": [],
-        "scene_plans": [],
-        "segments": [],
-    }
-
     class Runner:
         def __init__(self):
             self.calls = 0
 
         def run_isolated(self, workdir, _prompt, *, session_dir):
             self.calls += 1
+            request = json.loads(
+                (Path(workdir) / "work" / "request.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             output = Path(workdir) / "work" / "image_optimization.json"
             output.write_text(
-                json.dumps(
-                    valid if model_recovers and self.calls == 2 else refusal
-                ),
+                json.dumps(_semantic_image_output(
+                    request, omit_wardrobe=True,
+                )),
                 encoding="utf-8",
             )
 
     runner = Runner()
     monkeypatch.setattr(
-        image_optimization, "_source_has_observable_person", lambda _path: True,
-    )
-    monkeypatch.setattr(
         pipeline.image_optimization,
         "generate_project_prompts",
         _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
     )
+    caplog.set_level("INFO", logger="app.image_optimization")
     plan, prompts = pipeline._generate_image_optimization_project(
         settings,
         runner,
@@ -781,20 +794,20 @@ def test_v4_plan_protocol_error_replans_then_uses_backend_fallback(
         step="project image plan",
     )
 
-    assert runner.calls == 2
+    assert runner.calls == 1
+    assert not hasattr(image_optimization, "generic_project_prompts")
     assert plan["version"] == 4
     assert list(prompts) == [0]
-    if model_recovers:
-        assert plan["person_plans"]
-    else:
-        assert [item["id"] for item in plan["person_plans"]] == ["PERSON_01"]
-        assert plan["segments"][0]["persons"][0]["state"] == "replace"
-        assert plan["segments"][0]["persons"][0]["observable_frames"] == [1]
-        assert plan["scene_plans"][0]["segments"] == [0]
-        assert plan["scene_plans"][0]["continuity_graph"]["views"][0][
-            "transition_from_previous"
-        ] == skeleton[0]["source_transition_from_previous"]
-        assert "替换人物" in prompts[0][1]
+    assert [item["id"] for item in plan["person_plans"]] == ["PERSON_01"]
+    assert plan["segments"][0]["persons"][0]["state"] == "replace"
+    assert plan["segments"][0]["persons"][0]["observable_frames"] == [1]
+    assert plan["scene_plans"][0]["continuity_graph"]["views"][0][
+        "transition_from_previous"
+    ] == skeleton[0]["source_transition_from_previous"]
+    assert "替换人物" in prompts[0][1]
+    assert "score=" in caplog.text
+    assert "missing:people.subject.wardrobe_change" in caplog.text
+    assert "palette_description" in caplog.text
 
 
 def test_v4_pipeline_freezes_authoritative_transitions_and_anchor_schedule(tmp_path):
@@ -2592,111 +2605,85 @@ def test_short_v3_freezes_a_complete_frame_bound_prompt_receipt(
     ]
 
 
-def test_short_pipeline_invalid_plan_falls_back_and_reaches_seedream(
-    tmp_path, video_1s, monkeypatch
+def test_short_pipeline_semantic_compiler_continues_to_frozen_v4(
+    tmp_path, monkeypatch,
 ):
-    monkeypatch.setenv("ARK_API_KEY", "test-key")
     settings = make_settings(tmp_path, retry_interval_s=0)
-    meta = _make_conversation(settings, video_1s)
-    storage.update_meta(
-        settings.data_dir,
-        meta["id"],
-        dialogue_mode="auto",
-        voice_mode="keep",
-        duration_s=10.0,
-        ratio="9:16",
-        fit_mode="none",
+    keyframes = tmp_path / "keyframes"
+    keyframes.mkdir()
+    frames = []
+    for index in (1, 2):
+        frame = keyframes / f"{index:02d}.png"
+        frame.write_bytes(_PX_PNG)
+        frames.append(frame)
+    skeleton = pipeline._frame_inventory(
+        {0: frames},
+        segment_lineage={
+            0: {"chain_id": "short-000", "join_mode": "hard_cut"}
+        },
     )
-    plan = _short_dual_target_plan_v3(frame_count=2)
+    segment_specs = [{
+        "index": 0,
+        "chain_id": "short-000",
+        "join_mode": "hard_cut",
+        "keyframes_dir": keyframes,
+        "transition_skeleton": skeleton,
+    }]
 
-    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
-    monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
-    monkeypatch.setattr(
-        CodexRunner,
-        "run",
-        lambda self, workdir, prompt: _write_valid_package(
-            Path(workdir) / "work", frames=2
-        ),
-    )
+    class Runner:
+        def __init__(self):
+            self.calls = 0
 
-    def write_v3_plan(self, workdir, prompt, *, session_dir):
-        output = Path(workdir) / "work" / "image_optimization.json"
-        output.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+        def run_isolated(self, workdir, _prompt, *, session_dir):
+            self.calls += 1
+            request = json.loads(
+                (Path(workdir) / "work" / "request.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            (Path(workdir) / "work" / "image_optimization.json").write_text(
+                json.dumps(_semantic_image_output(
+                    request, omit_wardrobe=True,
+                )),
+                encoding="utf-8",
+            )
 
-    monkeypatch.setattr(CodexRunner, "run_isolated", write_v3_plan)
+    runner = Runner()
     monkeypatch.setattr(
         pipeline.image_optimization,
         "generate_project_prompts",
         _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
     )
-    monkeypatch.setattr(
-        image_optimization, "_source_has_observable_person", lambda _path: True,
+    plan, prompts = pipeline._generate_image_optimization_project(
+        settings,
+        runner,
+        segment_specs,
+        session_dir=tmp_path,
+        step="project image plan",
+    )
+    continuity, frozen = pipeline._freeze_image_optimization(
+        settings,
+        {"keyframes": [frame.name for frame in frames]},
+        plan,
+        prompts,
+        {0: frames},
+        require_dual_target=True,
+        segment_lineage={
+            0: {"chain_id": "short-000", "join_mode": "hard_cut"}
+        },
     )
 
-    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
-
-    stored = storage.load_meta(settings.data_dir, meta["id"])
-    assert stored["status"] == "done", stored.get("error")
-    frozen = stored["_image_optimization"]
-    assert frozen["version"] == 4
-    assert [
-        view["transition_from_previous"]
-        for view in stored["_image_continuity"]["scene_plans"][0][
-            "continuity_graph"
-        ]["views"]
-    ] == ["start", "same_camera"]
-    assert [item["id"] for item in stored["_image_continuity"]["person_plans"]] == [
-        "PERSON_01"
+    assert runner.calls == 1
+    assert continuity["_image_continuity"]["version"] == 4
+    receipt = frozen["_image_optimization"]
+    assert receipt["version"] == 4
+    assert [item["frame_name"] for item in receipt["frames"]] == [
+        "01.png", "02.png"
     ]
-    assert stored["_image_continuity"]["segments"][0]["persons"][0][
-        "observable_frames"
-    ] == [1, 2]
-    source_sha256s = {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted((settings.data_dir / meta["id"] / "work" / "keyframes").glob("*.png"))
-    }
-    assert {
-        item["frame_name"]: item["source_sha256"] for item in frozen["frames"]
-    } == source_sha256s
-
-    captured = []
-    output = base64.b64encode(_PX_PNG).decode()
-
-    async def handler(request):
-        captured.append(json.loads(request.content))
-        return httpx.Response(200, json={"data": [{"b64_json": output}]})
-
-    real_edit = seedream.edit
-
-    async def capture_edit(settings_, images, prompt, output_path, *, receipt_path, transport=None):
-        return await real_edit(
-            settings_, images, prompt, output_path, receipt_path=receipt_path,
-            transport=httpx.MockTransport(handler),
-        )
-
-    monkeypatch.setattr(postprocess.seedream, "edit", capture_edit)
-    passing_audit_runner = object()
-    asyncio.run(postprocess.start(
-        settings,
-        meta["id"],
-        {"confirm": True, "options": {
-            "remove_subtitle": False,
-            "remove_brand": False,
-            "optimize_image": True,
-        }},
-        {},
-    ))
-    asyncio.run(postprocess.run_task(
-        settings, meta["id"], asyncio.Semaphore(1), asyncio.Semaphore(1),
-        audit_runner=passing_audit_runner,
-        verification_runner=passing_audit_runner,
-    ))
-
-    assert len(captured) == 3
-    prompts = [body["prompt"] for body in captured]
-    assert all("统一、真实且明显不同的新环境" in prompt for prompt in prompts)
-    assert [len(body["image"]) for body in captured] == [1, 2, 2]
-    assert storage.load_meta(settings.data_dir, meta["id"])["postprocess"]["status"] == "done"
+    assert [
+        item["source_transition_from_previous"]
+        for item in receipt["execution_inputs"]["frames"]
+    ] == ["start", "same_camera"]
 
 
 @pytest.mark.parametrize(

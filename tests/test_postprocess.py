@@ -151,8 +151,7 @@ def _completed_v4_project(
         } for index, frame in enumerate(segment_frames, 1)]
         for segment_index, segment_frames in grouped_frames.items()
     }
-    plan, prompts = image_optimization.generic_project_prompts(
-        [{
+    segment_specs = [{
             "index": segment_index,
             "chain_id": (
                 "short-000" if segment_index == 0 else "chain-001"
@@ -160,9 +159,50 @@ def _completed_v4_project(
             "join_mode": "hard_cut" if segment_index in {0, 1} else "continue",
             "keyframes_dir": segment_frames[0].parent,
             "transition_skeleton": skeletons[segment_index],
-        } for segment_index, segment_frames in grouped_frames.items()],
-        settings.seedream_edit_mode,
-        session_dir=cdir,
+        } for segment_index, segment_frames in grouped_frames.items()]
+    slots = image_optimization.semantic_slot_manifest(segment_specs)
+    semantic = {
+        "people": {"subject": {
+            "source_identity": "当前可见源人物",
+            "replacement_identity": "明显不同且跨帧稳定的新人物",
+            "wardrobe_change": "不同款式且保持用途的服装",
+            "local_color_change": "人物局部固有色明显变化",
+        }},
+        "scenes": {
+            slot["key"]: {
+                "source_scene": "当前可见源环境",
+                "replacement_scene": "同用途且设计不同的真实新环境",
+                "semantic_change": "环境语义明显变化",
+                "geometry_change": "可见形状和空间结构明显变化",
+                "depth_change": "前中后景纵深明显变化",
+                "layout_change": "功能区域和实体布局明显变化",
+                "local_color_change": "局部材质固有色明显变化",
+            }
+            for slot in slots["scenes"]
+        },
+        "frames": {
+            slot["key"]: {
+                "people": {"subject": {
+                    "visible_region": f"{slot['key']} 当前可见人物区域",
+                    "boundary": f"{slot['key']} 当前可见边界",
+                    "body_and_pose": f"{slot['key']} 当前可见身体与姿态",
+                }},
+                "relationships": f"{slot['key']} 当前可见接触与遮挡关系",
+                "entities": f"{slot['key']} 当前可见非人物实体",
+                "crop": f"{slot['key']} 当前画外裁切",
+            }
+            for slot in slots["frames"]
+        },
+    }
+    plan, diagnostics = image_optimization.compile_semantic_plan(
+        semantic,
+        segment_specs,
+        source_frames=grouped_frames,
+    )
+    assert diagnostics["score"] == 1.0
+    assert "blocking" not in diagnostics
+    prompts = image_optimization.compile_frame_prompts(
+        plan, settings.seedream_edit_mode,
     )
     execution = image_optimization.freeze_execution_inputs(
         plan,
@@ -1624,7 +1664,7 @@ def _file_snapshot(root: Path) -> dict[str, bytes]:
 
 # ---------- 门控矩阵 ----------
 
-def test_upload_pipeline_done_auto_advances_postprocess_acceptance_and_generation(
+def test_upload_single_operation_continues_despite_nonblocking_quality_scores(
     tmp_path, video_1s, monkeypatch,
 ):
     settings = make_settings(tmp_path, enable_pipeline=True)
@@ -1659,6 +1699,12 @@ def test_upload_pipeline_done_auto_advances_postprocess_acceptance_and_generatio
             settings.data_dir,
             cid,
             postprocess={**current, "status": "done"},
+            _image_optimization={
+                "quality_scores": {
+                    "score": 0.0,
+                    "issues": ["visual_continuity_low_confidence"],
+                }
+            },
         )
 
     def acceptance_status(_settings, cid, meta):
@@ -1669,7 +1715,7 @@ def test_upload_pipeline_done_auto_advances_postprocess_acceptance_and_generatio
         }
 
     def accept(_settings, cid, payload):
-        events.append(("technical_acceptance", cid, payload))
+        events.append(("receipt_commit", cid, payload))
         storage.update_meta(
             settings.data_dir, cid, test_technical_acceptance=True,
         )
@@ -1678,6 +1724,10 @@ def test_upload_pipeline_done_auto_advances_postprocess_acceptance_and_generatio
         )
 
     def generate(_settings, cid, _runner):
+        diagnostics = storage.load_meta(settings.data_dir, cid)[
+            "_image_optimization"
+        ]["quality_scores"]
+        assert diagnostics["score"] == 0.0
         events.append(("generation", cid))
 
     monkeypatch.setattr(pipeline, "run", run_pipeline)
@@ -1705,7 +1755,7 @@ def test_upload_pipeline_done_auto_advances_postprocess_acceptance_and_generatio
         "pipeline",
         "postprocess_start",
         "postprocess_done",
-        "technical_acceptance",
+        "receipt_commit",
         "generation",
     ]
     assert all(event[1] == cid for event in events)
