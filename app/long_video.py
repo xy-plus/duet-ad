@@ -670,7 +670,7 @@ def freeze_keyframe_sources(
     return frozen, prior
 
 
-def write_plan_receipt(
+def _write_plan_receipt(
     root: Path,
     *,
     source: Path,
@@ -681,6 +681,7 @@ def write_plan_receipt(
     dialogue_delivery: str | None = None,
     resolved_dialogue_delivery: str | None = None,
     prompt_fusion_manifest_path: Path | None = None,
+    provider_max_duration_s: int,
 ) -> Path:
     """Write a canonical receipt binding the complete generated long-video plan."""
     root = root.resolve()
@@ -720,7 +721,7 @@ def write_plan_receipt(
             or abs(start_s - previous_end) > _EPS
             or frozen_duration < SEGMENT_MIN_S
             or provider_duration_s(start_s, end_s)
-            > SEGMENT_PROVIDER_MAX_DURATION_S
+            > provider_max_duration_s
             or not isinstance(chain_id, str)
             or not chain_id
             or join_mode not in {"hard_cut", "continue"}
@@ -829,3 +830,87 @@ def write_plan_receipt(
     temporary.write_bytes(_canonical_bytes(receipt))
     temporary.replace(path)
     return path
+
+
+def write_plan_receipt(
+    root: Path,
+    *,
+    source: Path,
+    duration_s: float,
+    segments: Sequence[Mapping],
+    workflow: str,
+    dialogue_mode: str = "auto",
+    dialogue_delivery: str | None = None,
+    resolved_dialogue_delivery: str | None = None,
+    prompt_fusion_manifest_path: Path | None = None,
+) -> Path:
+    """Write a new canonical plan; every provider segment is at most 10s."""
+    return _write_plan_receipt(
+        root,
+        source=source,
+        duration_s=duration_s,
+        segments=segments,
+        workflow=workflow,
+        dialogue_mode=dialogue_mode,
+        dialogue_delivery=dialogue_delivery,
+        resolved_dialogue_delivery=resolved_dialogue_delivery,
+        prompt_fusion_manifest_path=prompt_fusion_manifest_path,
+        provider_max_duration_s=SEGMENT_PROVIDER_MAX_DURATION_S,
+    )
+
+
+def _write_frozen_v4_n1_plan_receipt(
+    root: Path,
+    *,
+    source: Path,
+    duration_s: float,
+    segments: Sequence[Mapping],
+    workflow: str,
+    dialogue_mode: str = "auto",
+    dialogue_delivery: str | None = None,
+    resolved_dialogue_delivery: str | None = None,
+    prompt_fusion_manifest_path: Path | None = None,
+) -> Path:
+    """Migrate one authority-validated pre-unification v4 N=1 plan.
+
+    The orchestration caller must first validate the frozen private v4
+    postprocess authority.  This private seam deliberately has no configurable
+    limit and cannot write a general legacy multi-segment or non-H3 plan.
+    """
+    duration = _finite_duration(duration_s)
+    if (
+        not SHORT_VIDEO_MAX_S < duration <= LEGACY_PROVIDER_MAX_DURATION_S
+        or workflow != h3.H3_WORKFLOW
+        or len(segments) != 1
+    ):
+        raise LongVideoError("long_video_plan_invalid_segment")
+    raw = segments[0]
+    try:
+        index = int(raw["index"])
+        start_s = float(raw["start_s"])
+        end_s = float(raw["end_s"])
+        keyframe_paths = list(raw["keyframe_paths"])
+        keyframe_sources = list(raw["keyframe_sources"])
+    except (KeyError, TypeError, ValueError):
+        raise LongVideoError("long_video_plan_invalid_segment") from None
+    if (
+        index != 1
+        or start_s != 0.0
+        or abs(end_s - duration) > _EPS
+        or len(keyframe_paths) != 9
+        or len(keyframe_sources) != 9
+        or "multimodal_manifest_path" in raw
+    ):
+        raise LongVideoError("long_video_plan_invalid_segment")
+    return _write_plan_receipt(
+        root,
+        source=source,
+        duration_s=duration,
+        segments=segments,
+        workflow=workflow,
+        dialogue_mode=dialogue_mode,
+        dialogue_delivery=dialogue_delivery,
+        resolved_dialogue_delivery=resolved_dialogue_delivery,
+        prompt_fusion_manifest_path=prompt_fusion_manifest_path,
+        provider_max_duration_s=LEGACY_PROVIDER_MAX_DURATION_S,
+    )

@@ -498,7 +498,7 @@ def test_v4_manual_acceptance_receipt_enables_h3_without_image_verification(
 
 def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     tmp_path, monkeypatch, segment_count, *, postprocess_options=None,
-    frozen_single_segment=False, forbid_legacy_short=False,
+    historical_pre_unification=False, forbid_legacy_short=False,
     complete_generation=False, dialogue_mode="auto",
     silent_segment_indices=(),
     web_output_validation=False, dialogue_classification="spoken",
@@ -523,13 +523,17 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         settings,
         monkeypatch,
         frame_count=9,
-        segments=segment_count == 2 or frozen_single_segment,
+        segments=not historical_pre_unification,
         postprocess_options=postprocess_options,
         segment_total=segment_count,
     )
     (cdir / "source.mp4").write_bytes(b"source-video")
-    if segment_count == 1 and not frozen_single_segment:
+    if historical_pre_unification:
+        assert segment_count == 1
         _write_root_timeline_authority(cdir, originals, duration_s=14.5)
+    project_duration = (
+        14.5 if historical_pre_unification else 10.0 * segment_count
+    )
     old_visual_prompt = "九张已验收图片中的人物保持静默，歌声来自画外。"
     (cdir / "work" / "visual_prompt.txt").write_text(
         old_visual_prompt, encoding="utf-8"
@@ -556,7 +560,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             [
                 "/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
-                "-t", "14.58", "-q:a", "9", "-y",
+                "-t", str(project_duration + 0.08), "-q:a", "9", "-y",
                 str(cdir / "work" / "voice.mp3"),
             ],
             check=True,
@@ -567,7 +571,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         provenance = [{
             "text": "تجربة صوتية",
             "start_s": 0.0,
-            "end_s": 14.44,
+            "end_s": project_duration - 0.06,
             "classification": dialogue_classification,
             "provenance": "asr",
             "kept": True,
@@ -579,7 +583,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             decisions=provenance,
         )
     common_changes = dict(
-        duration_s=14.5,
+        duration_s=project_duration,
         vocal_filter_enabled=True,
         voice_mode="keep",
         dialogue_mode=dialogue_mode,
@@ -601,7 +605,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         has_bgm=has_bgm,
     )
     expected_receipt = None
-    has_frozen_segment_plan = segment_count == 2 or frozen_single_segment
+    has_frozen_segment_plan = not historical_pre_unification
     if has_frozen_segment_plan:
         public_segments = []
         receipt_segments = []
@@ -1006,6 +1010,17 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     if final_submit is not None:
         assert final_submit.status_code == 202, final_submit.json()
     assert fusion_calls == [cdir]
+    if historical_pre_unification:
+        migrated = storage.load_meta(settings.data_dir, cid)
+        assert migrated["generation"]["status"] == "failed"
+        assert migrated["generation"]["segments"][0]["error"] == (
+            "long_video_legacy_plan_read_only"
+        )
+        assert h3_requests == []
+        assert json.loads(
+            (cdir / long_video.PLAN_RECEIPT_FILENAME).read_text(encoding="utf-8")
+        )["version"] == long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION
+        return
     assert len(h3_requests) == (segment_count if complete_generation else 1)
     for bound_request in h3_requests:
         assert bound_request.context_ir_required is True
@@ -1041,9 +1056,12 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         validation_passes = 1 + int(web_output_validation)
         assert len(reuse_calls) == validation_passes
         assert all(call[1] == dialogue_mode for call in reuse_calls)
-        assert set(reuse_calls[0][3]) == provider_generated_indices
-        assert all(call[3] is None for call in reuse_calls[1:])
-        assert len(timeline_calls) == len(provider_generated_indices)
+        assert all(
+            set(call[3]) == provider_generated_indices for call in reuse_calls
+        )
+        assert len(timeline_calls) == (
+            len(provider_generated_indices) * validation_passes
+        )
         completed = storage.load_meta(settings.data_dir, cid)
         assert completed["generation"]["status"] == "succeeded"
         for state in completed["generation"]["segments"]:
@@ -1082,6 +1100,17 @@ def test_n1_n2_off_screen_fusion_bootstraps_then_enters_context_h3(
 ):
     _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         tmp_path, monkeypatch, segment_count,
+    )
+
+
+def test_historical_pre_unification_n1_migrates_but_never_starts_provider(
+    tmp_path, monkeypatch,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path,
+        monkeypatch,
+        1,
+        historical_pre_unification=True,
     )
 
 

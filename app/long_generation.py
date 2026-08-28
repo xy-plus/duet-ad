@@ -1500,7 +1500,7 @@ def normalize_single_segment_project(
         duration = float(meta["duration_s"])
     except (KeyError, TypeError, ValueError):
         raise LongGenerationError("long_video_plan_invalid") from None
-    if not 0 < duration <= long_video.SHORT_VIDEO_MAX_S:
+    if not 0 < duration <= long_video.LEGACY_PROVIDER_MAX_DURATION_S:
         raise LongGenerationError("long_video_plan_invalid")
     names = meta.get("keyframes")
     if not isinstance(names, list) or len(names) != 9:
@@ -1605,7 +1605,12 @@ def normalize_single_segment_project(
         "dialogue": dialogue,
         "lines": [line["text"] for line in dialogue],
     }
-    receipt_path = long_video.write_plan_receipt(
+    receipt_writer = (
+        long_video._write_frozen_v4_n1_plan_receipt
+        if duration > long_video.SHORT_VIDEO_MAX_S
+        else long_video.write_plan_receipt
+    )
+    receipt_path = receipt_writer(
         root,
         source=sources[0],
         duration_s=duration,
@@ -1869,10 +1874,28 @@ def finalize_multimodal_plan(
         raise LongGenerationError("prompt_fusion_input_invalid")
     promoted_workflow = h3.H3_WORKFLOW
     try:
-        long_video.write_plan_receipt(
+        duration = float(meta["duration_s"])
+    except (KeyError, TypeError, ValueError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    historical_v4_n1 = (
+        receipt_version == long_video.VISUAL_PLAN_RECEIPT_VERSION
+        and payload.get("workflow") == h3.H3_WORKFLOW
+        and isinstance(private_postprocess.get("options"), Mapping)
+        and len(base.segments) == 1
+        and long_video.SHORT_VIDEO_MAX_S
+        < duration
+        <= long_video.LEGACY_PROVIDER_MAX_DURATION_S
+    )
+    receipt_writer = (
+        long_video._write_frozen_v4_n1_plan_receipt
+        if historical_v4_n1
+        else long_video.write_plan_receipt
+    )
+    try:
+        receipt_writer(
             root,
             source=base.source,
-            duration_s=float(meta["duration_s"]),
+            duration_s=duration,
             segments=receipt_segments,
             workflow=promoted_workflow,
             dialogue_mode=dialogue_mode,
