@@ -788,6 +788,7 @@ def _validated_dialogue(meta: dict, payload: dict) -> tuple[dict, ...]:
                 if (
                     not isinstance(item, dict)
                     or item.get("kept") is not True
+                    or item.get("classification") != "spoken"
                     or voice.is_unrecognized_text(item.get("text"))
                 ):
                     continue

@@ -64,23 +64,27 @@ def test_current_v4_n1_and_n2_use_the_same_segment_coordinator() -> None:
 
 def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> None:
     old_prompt = "OLD_VISUAL_PROMPT_MUST_NOT_REACH_CONTEXT_OR_H3"
-    final_prompt = (
-        "FUSED_PROMPT_FROM_OPTIMIZED_IMAGES"
-        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>"
-    )
+    final_visual = "FUSED_PROMPT_FROM_OPTIMIZED_IMAGES"
     for order in range(1, 10):
         (tmp_path / f"{order:02d}.png").write_bytes(f"frame-{order}".encode())
     fusion_input = {
         "schema": "duet.video-prompt-fusion-input",
-        "version": 1,
+        "version": 2,
         "segments": [{
             "index": 1,
             "new_keyframes": [
-                {
-                    "order": order,
-                    "path": f"{order:02d}.png",
-                    "sha256": hashlib.sha256(f"frame-{order}".encode()).hexdigest(),
-                }
+                    {
+                        "order": order,
+                        "path": f"{order:02d}.png",
+                        "sha256": hashlib.sha256(f"frame-{order}".encode()).hexdigest(),
+                        "source_time_s": float(order - 1),
+                        "source_scene_id": "SCENE_01",
+                        "transition": (
+                            {"type": "start", "at_s": 0.0}
+                            if order == 1 else
+                            {"type": "continuous", "at_s": None}
+                        ),
+                    }
                 for order in range(1, 10)
             ],
             "old_video_prompt": {
@@ -96,15 +100,21 @@ def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> No
                 "lines_json": "[]",
                 "voice_references": [],
                 "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
+                "music_policy": "forbid",
             },
         }],
     }
     input_data = _canonical(fusion_input)
     fusion_output = {
         "schema": "duet.video-prompt-fusion-output",
-        "version": 1,
+        "version": 2,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
-        "segments": [{"index": 1, "final_prompt": final_prompt}],
+        "segments": [{
+            "index": 1,
+            "final_prompt": _fusion_v2_final_prompt(
+                fusion_input["segments"][0], final_visual,
+            ),
+        }],
     }
     input_path = tmp_path / "multimodal_input.json"
     output_path = tmp_path / "h3_prompt_plan.json"
@@ -117,7 +127,9 @@ def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> No
         root=tmp_path,
     )
 
-    assert frozen.final_prompts == (final_prompt,)
+    assert frozen.final_prompts == (_fusion_v2_final_prompt(
+        fusion_input["segments"][0], final_visual,
+    ),)
     assert old_prompt not in frozen.final_prompts
 
 
@@ -611,6 +623,242 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
     assert hard_cuts == [cut_at_s]
 
 
+def _audio_compile_fixture(
+    root: Path, *, segment_count: int, classification: str,
+) -> tuple[dict, long_generation.FrozenPlan]:
+    (root / "source.mp4").write_bytes(b"source")
+    raw_segments = []
+    frozen_segments = []
+    optimization_frames = []
+    for index in range(1, segment_count + 1):
+        segment_work = root / "work" / "segments" / str(index) / "work"
+        frames = []
+        sources = []
+        for order in range(1, 10):
+            path = segment_work / "postprocessed" / f"{order:02d}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = f"segment-{index}-frame-{order}".encode()
+            path.write_bytes(data)
+            frames.append((path, data))
+            prompt = f"optimization {index}-{order}"
+            optimization_frames.append({
+                "segment_index": 0 if segment_count == 1 else index,
+                "frame_index": order,
+                "current": prompt,
+                "sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            })
+            source_time_s = float((index - 1) * 8 + order - 1)
+            sources.append({
+                "order": order,
+                "source_time_s": source_time_s,
+                "source_scene_id": "SCENE_01",
+                "transition": (
+                    {"type": "start", "at_s": 0.0}
+                    if index == order == 1 else
+                    {"type": "continuous", "at_s": None}
+                ),
+            })
+        line = {
+            "text": f"line {index}",
+            "start_s": 0.5,
+            "end_s": 1.5,
+            "classification": classification,
+        }
+        raw_segments.append({"index": index, "visual_prompt": f"visual {index}"})
+        frozen_segments.append(long_generation.FrozenSegment(
+            index=index,
+            start_s=float(index - 1) * 8.0,
+            end_s=float(index) * 8.0,
+            chain_id="chain-001",
+            join_mode="hard_cut" if index == 1 else "continue",
+            workdir=root / "work" / "segments" / str(index),
+            first_frame=frames[0][0],
+            first_frame_data=frames[0][1],
+            last_frame=frames[-1][0],
+            last_frame_data=frames[-1][1],
+            prompt=f"prompt {index}",
+            keyframes=tuple(frames),
+            keyframe_sources=tuple(sources),
+            dialogue=(line,),
+            dialogue_sha256=hashlib.sha256(_canonical([line])).hexdigest(),
+        ))
+    voice = root / "work" / "voice.mp3"
+    voice.parent.mkdir(parents=True, exist_ok=True)
+    voice.write_bytes(b"whole-source-mix")
+    return ({
+        "segments": raw_segments,
+        "_image_optimization": {"frames": optimization_frames},
+        "has_bgm": False,
+        "voice_line_provenance": [{
+            "text": "spoken authority",
+            "start_s": 0.0,
+            "end_s": 1.0,
+            "classification": "spoken",
+            "provenance": "asr",
+            "kept": True,
+        }],
+    }, long_generation.FrozenPlan(
+        root=root,
+        source=root / "source.mp4",
+        receipt="a" * 64,
+        segments=tuple(frozen_segments),
+        receipt_version=long_video.VISUAL_PLAN_RECEIPT_VERSION,
+    ))
+
+
+@pytest.mark.parametrize("segment_count", [1, 2], ids=("n1", "n2"))
+@pytest.mark.parametrize("has_bgm", [False, True, None], ids=("no-bgm", "bgm", "unknown"))
+def test_auto_sung_compiles_empty_audio_with_forbid_music_policy(
+    tmp_path: Path, segment_count: int, has_bgm: bool | None,
+) -> None:
+    meta, plan = _audio_compile_fixture(
+        tmp_path, segment_count=segment_count, classification="sung",
+    )
+    meta["has_bgm"] = has_bgm
+
+    payload = json.loads(long_generation.build_prompt_fusion_input(
+        root=tmp_path,
+        meta=meta,
+        plan=plan,
+        dialogue_mode="auto",
+        dialogue_delivery="off_screen",
+    ))
+
+    assert payload["version"] == 2
+    assert [segment["audio_content"] for segment in payload["segments"]] == [
+        {
+            "lines_json": "[]",
+            "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
+            "voice_references": [],
+            "music_policy": "forbid",
+        }
+        for _ in range(segment_count)
+    ]
+
+
+@pytest.mark.parametrize("dialogue_mode", ["auto", "edit", "custom"])
+@pytest.mark.parametrize("has_bgm", [True, None], ids=("bgm", "unknown"))
+def test_unverified_source_mix_cannot_be_compiled_as_voice_reference(
+    tmp_path: Path, dialogue_mode: str, has_bgm: bool | None,
+) -> None:
+    meta, plan = _audio_compile_fixture(
+        tmp_path, segment_count=1, classification="spoken",
+    )
+    meta["has_bgm"] = has_bgm
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="clean_voice_reference_required",
+    ):
+        long_generation.build_prompt_fusion_input(
+            root=tmp_path,
+            meta=meta,
+            plan=plan,
+            dialogue_mode=dialogue_mode,
+            dialogue_delivery="off_screen",
+        )
+
+
+@pytest.mark.parametrize("dialogue_mode", ["auto", "edit", "custom"])
+def test_no_bgm_without_spoken_asr_authority_cannot_bind_source_mix(
+    tmp_path: Path, dialogue_mode: str,
+) -> None:
+    meta, plan = _audio_compile_fixture(
+        tmp_path, segment_count=1, classification="spoken",
+    )
+    meta["voice_line_provenance"] = [{
+        "text": "song",
+        "start_s": 0.0,
+        "end_s": 1.0,
+        "classification": "sung",
+        "provenance": "asr",
+        "kept": True,
+    }]
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="clean_voice_reference_required",
+    ):
+        long_generation.build_prompt_fusion_input(
+            root=tmp_path,
+            meta=meta,
+            plan=plan,
+            dialogue_mode=dialogue_mode,
+            dialogue_delivery="off_screen",
+        )
+
+
+@pytest.mark.parametrize("segment_count", [1, 2], ids=("n1", "n2"))
+def test_verified_spoken_no_bgm_compiles_one_bound_conditioning_reference(
+    tmp_path: Path, segment_count: int,
+) -> None:
+    meta, plan = _audio_compile_fixture(
+        tmp_path, segment_count=segment_count, classification="spoken",
+    )
+
+    payload = json.loads(long_generation.build_prompt_fusion_input(
+        root=tmp_path,
+        meta=meta,
+        plan=plan,
+        dialogue_mode="auto",
+        dialogue_delivery="off_screen",
+    ))
+
+    for segment in payload["segments"]:
+        audio = segment["audio_content"]
+        assert audio["music_policy"] == "forbid"
+        assert json.loads(audio["lines_json"])[0]["voice_ref"] == 1
+        assert audio["voice_references"] == [{
+            "voice_ref": 1,
+            "path": "work/voice.mp3",
+            "sha256": hashlib.sha256(b"whole-source-mix").hexdigest(),
+            "purpose": "voice",
+        }]
+
+
+@pytest.mark.parametrize("dialogue_mode", ["edit", "custom"])
+def test_manual_dialogue_is_not_reclassified_when_clean_authority_exists(
+    tmp_path: Path, dialogue_mode: str,
+) -> None:
+    meta, plan = _audio_compile_fixture(
+        tmp_path, segment_count=1, classification="sung",
+    )
+
+    payload = json.loads(long_generation.build_prompt_fusion_input(
+        root=tmp_path,
+        meta=meta,
+        plan=plan,
+        dialogue_mode=dialogue_mode,
+        dialogue_delivery="off_screen",
+    ))
+
+    audio = payload["segments"][0]["audio_content"]
+    assert json.loads(audio["lines_json"])[0]["text"] == "line 1"
+    assert audio["voice_references"][0]["purpose"] == "voice"
+
+
+def test_explicit_none_discards_spoken_even_when_bgm_is_unknown(
+    tmp_path: Path,
+) -> None:
+    meta, plan = _audio_compile_fixture(
+        tmp_path, segment_count=1, classification="spoken",
+    )
+    meta["has_bgm"] = None
+
+    payload = json.loads(long_generation.build_prompt_fusion_input(
+        root=tmp_path,
+        meta=meta,
+        plan=plan,
+        dialogue_mode="none",
+        dialogue_delivery="auto",
+    ))
+
+    audio = payload["segments"][0]["audio_content"]
+    assert audio["lines_json"] == "[]"
+    assert audio["voice_references"] == []
+    assert audio["music_policy"] == "forbid"
+
+
 _CID_9533_LINES_JSON = (
     '[{"order":1,"text":"تول جمالا بها القادم وقتك يا لدى عوصة اللوري تاب '
     'البدري يبريزها بجمال يا شعوري","start_s":0.0,"end_s":14.44,'
@@ -622,7 +870,9 @@ def _write_9533_fusion_fixture(
     root: Path, *, audio_envelope: str, lines_json: str = _CID_9533_LINES_JSON,
 ) -> tuple[Path, Path, str]:
     (root / "work").mkdir(parents=True, exist_ok=True)
-    input_payload = json.loads(_fusion_v1_input(root, 1).decode("utf-8"))
+    input_payload = json.loads(_fusion_input(
+        root, 1, version=long_generation.PROMPT_FUSION_LEGACY_VERSION,
+    ).decode("utf-8"))
     voice = root / "work" / "segments" / "1" / "work" / "voice.mp3"
     voice.parent.mkdir(parents=True, exist_ok=True)
     voice.write_bytes(b"9533-frozen-normalized-voice")
@@ -645,7 +895,7 @@ def _write_9533_fusion_fixture(
     final_prompt = f"<VISUAL>9533 fused visual</VISUAL>\n{audio_envelope}"
     output_path.write_bytes(_canonical({
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
-        "version": long_generation.PROMPT_FUSION_VERSION,
+        "version": input_payload["version"],
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
         "segments": [{"index": 1, "final_prompt": final_prompt}],
     }))
@@ -792,7 +1042,10 @@ def test_binding_skill_production_seams_are_absent() -> None:
     assert "produce_multimodal_binding" not in source
 
 
-def _fusion_input(root: Path, segment_count: int) -> bytes:
+def _fusion_input(
+    root: Path, segment_count: int, *,
+    version: int = long_generation.PROMPT_FUSION_VERSION,
+) -> bytes:
     segments = []
     for index in range(1, segment_count + 1):
         frames = []
@@ -803,24 +1056,35 @@ def _fusion_input(root: Path, segment_count: int) -> bytes:
             (root / relative).write_bytes(data)
             prompt = f"segment {index} optimized image {order}"
             source_time_s = float((index - 1) * 20 + order - 1)
-            frames.append({
+            frame = {
                 "order": order,
                 "path": relative,
                 "sha256": hashlib.sha256(data).hexdigest(),
-                "source_time_s": source_time_s,
-                "source_scene_id": "SCENE_01",
-                "transition": (
+            }
+            if version == long_generation.PROMPT_FUSION_VERSION:
+                frame.update({
+                    "source_time_s": source_time_s,
+                    "source_scene_id": "SCENE_01",
+                    "transition": (
                     {"type": "start", "at_s": source_time_s}
                     if index == order == 1 else
                     {"type": "continuous", "at_s": None}
-                ),
-            })
+                    ),
+                })
+            frames.append(frame)
             prompts.append({
                 "order": order,
                 "text": prompt,
                 "sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             })
         old_prompt = f"old visual prompt {index}"
+        audio_content = {
+            "lines_json": "[]",
+            "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
+            "voice_references": [],
+        }
+        if version == long_generation.PROMPT_FUSION_VERSION:
+            audio_content["music_policy"] = "forbid"
         segments.append({
             "index": index,
             "new_keyframes": frames,
@@ -831,30 +1095,28 @@ def _fusion_input(root: Path, segment_count: int) -> bytes:
                 ).hexdigest(),
             },
             "image_optimization_prompt": prompts,
-            "audio_content": {
-                "lines_json": "[]",
-                "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
-                "voice_references": [],
-                "music_policy": "forbid",
-            },
+            "audio_content": audio_content,
         })
     return _canonical({
         "schema": long_generation.PROMPT_FUSION_INPUT_SCHEMA,
-        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "version": version,
         "segments": segments,
     })
 
 
 def _fusion_v1_input(root: Path, segment_count: int) -> bytes:
     """Build an exact historical artifact for load/recovery-only coverage."""
-    payload = json.loads(_fusion_input(root, segment_count))
-    payload["version"] = long_generation.PROMPT_FUSION_VERSION
+    payload = json.loads(_fusion_input(
+        root,
+        segment_count,
+        version=long_generation.PROMPT_FUSION_LEGACY_VERSION,
+    ))
     for segment in payload["segments"]:
         for frame in segment["new_keyframes"]:
-            frame.pop("source_time_s")
-            frame.pop("source_scene_id")
-            frame.pop("transition")
-        segment["audio_content"].pop("music_policy")
+            frame.pop("source_time_s", None)
+            frame.pop("source_scene_id", None)
+            frame.pop("transition", None)
+        segment["audio_content"].pop("music_policy", None)
     return _canonical(payload)
 
 
@@ -981,7 +1243,7 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
 
     if segment_count == 1:
         legacy = json.loads(input_data)
-        legacy["version"] = long_generation.PROMPT_FUSION_VERSION
+        legacy["version"] = long_generation.PROMPT_FUSION_LEGACY_VERSION
         with pytest.raises(
             pipeline.PipelineError,
             match="prompt fusion input is invalid",
@@ -1053,9 +1315,7 @@ def test_prompt_fusion_runner_refuses_historical_v1_queue(tmp_path: Path) -> Non
     )
     cid = created["id"]
     root = settings.data_dir / cid
-    current_input = json.loads(_fusion_input(root, 1))
-    current_input["version"] = long_generation.PROMPT_FUSION_VERSION
-    input_data = _canonical(current_input)
+    input_data = _fusion_v1_input(root, 1)
     input_path = root / "work" / h3_project.SKILL_INPUT_FILENAME
     input_path.write_bytes(input_data)
     storage.update_meta(
@@ -1079,6 +1339,30 @@ def test_prompt_fusion_runner_refuses_historical_v1_queue(tmp_path: Path) -> Non
     assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
         "error"
     ] == "prompt fusion input is invalid"
+
+
+def test_new_prompt_fusion_queue_rejects_legacy_v1_input(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    created = storage.new_conversation(
+        settings.data_dir, "legacy-fusion-input", "source.mp4"
+    )
+    cid = created["id"]
+    root = settings.data_dir / cid
+    legacy = _fusion_input(
+        root, 1, version=long_generation.PROMPT_FUSION_LEGACY_VERSION,
+    )
+
+    with pytest.raises(pipeline.PipelineError, match="input is invalid"):
+        pipeline.queue_prompt_fusion(
+            settings,
+            cid,
+            input_data=legacy,
+            image_acceptance_sha256="a" * 64,
+        )
+
+    assert storage.load_meta(settings.data_dir, cid).get("_prompt_fusion") is None
 
 
 def _failed_lf_prompt_fusion(
@@ -1107,13 +1391,14 @@ def _failed_lf_prompt_fusion(
     )
     input_data = _fusion_v1_input(root, 1)
     input_path = root / "work" / h3_project.SKILL_INPUT_FILENAME
+    input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_bytes(input_data)
     frozen_skill = root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME
     frozen_skill.write_bytes(skill_path.read_bytes())
     output = root / "work" / "h3_prompt_plan.json"
     output.write_bytes(_canonical({
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
-        "version": long_generation.PROMPT_FUSION_VERSION,
+        "version": long_generation.PROMPT_FUSION_LEGACY_VERSION,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
         "segments": [{
             "index": 1,

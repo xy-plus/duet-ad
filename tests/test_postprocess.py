@@ -362,7 +362,8 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     frozen_single_segment=False, forbid_legacy_short=False,
     complete_generation=False, dialogue_mode="auto",
     silent_segment_indices=(), context_semantic_recovery=False,
-    web_output_validation=False,
+    web_output_validation=False, dialogue_classification="spoken",
+    has_bgm=False,
 ):
     settings = make_settings(
         tmp_path,
@@ -414,13 +415,14 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         aspect_ratio="9:16",
         resolution="768p",
         voice_line_provenance=[{
-            "text": "تجربة غنائية",
+            "text": "تجربة صوتية",
             "start_s": 0.0,
             "end_s": 14.44,
-            "classification": "sung",
+            "classification": dialogue_classification,
             "provenance": "asr",
             "kept": True,
         }],
+        has_bgm=has_bgm,
     )
     expected_receipt = None
     has_frozen_segment_plan = segment_count == 2 or frozen_single_segment
@@ -438,10 +440,10 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             visual = work / "visual_prompt.txt"
             visual.write_text(visual_text, encoding="utf-8")
             dialogue = ([] if index in silent_segment_indices else [{
-                "text": f"画外歌声{index}",
+                "text": f"画外口播{index}",
                 "start_s": 1.0,
                 "end_s": 2.0,
-                "classification": "sung",
+                "classification": dialogue_classification,
             }])
             final_text = (
                 "不要生成背景音乐\n"
@@ -452,9 +454,6 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             )
             final = work / "prompt.txt"
             final.write_text(final_text, encoding="utf-8")
-            (work / "voice.mp3").write_bytes(
-                (cdir / "work" / "voice.mp3").read_bytes()
-            )
             segment_frames = sorted((work / "keyframes").glob("*.png"))
             segment = {
                 "index": index,
@@ -501,7 +500,6 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             duration_s=14.0 * segment_count,
             segments=public_segments,
             long_video_plan_receipt=receipt_path.name,
-            voice_line_provenance=[],
         )
     storage.update_meta(settings.data_dir, cid, **common_changes)
     current = storage.load_meta(settings.data_dir, cid)
@@ -531,6 +529,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                 "只使用九张已验收优化图片中的人物、场景与对象。\n"
                 f"<AUDIO_CONTENT_JSON>{segment['audio_content']['lines_json']}"
                 "</AUDIO_CONTENT_JSON>"
+                "\n<MUSIC_POLICY>forbid</MUSIC_POLICY>"
             )
             fusion_prompts.append(final_prompt)
             output_segments.append({
@@ -728,6 +727,14 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         first = client.post(
             f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
         )
+        if dialogue_mode != "none" and dialogue_classification == "spoken" \
+                and has_bgm is not False:
+            assert first.status_code == 409, first.json()
+            assert first.json() == {"detail": "clean_voice_reference_required"}
+            assert fusion_calls == []
+            assert context_requests == []
+            assert h3_requests == []
+            return
         assert first.status_code == 409, first.json()
         assert first.json() == {"detail": "prompt_fusion_refresh_required"}
         assert h3_requests == []
@@ -960,17 +967,20 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     assert "[AUDIO_CONTENT_JSON]" not in request.prompt
     assert request.on_screen_dialogue == ()
     assert len(request.keyframes) == 9
-    first_has_audio = dialogue_mode != "none" and 1 not in silent_segment_indices
+    first_has_audio = (
+        dialogue_mode != "none"
+        and dialogue_classification == "spoken"
+        and 1 not in silent_segment_indices
+    )
     assert len(request.reference_audios) == (1 if first_has_audio else 0)
     assert request.workflow == (
         h3.H3_MULTIMODAL_WORKFLOW if first_has_audio else h3.H3_WORKFLOW
     )
     if first_has_audio:
+        assert request.multimodal_compiler_version == "video-prompt-fusion-v2"
+        assert request.reference_audios[0].path == cdir / "work" / "voice.mp3"
         assert request.reference_audios[0].data == (
-            cdir / "work" / (
-                "voice.mp3"
-                if not has_frozen_segment_plan else "segments/1/work/voice.mp3"
-            )
+            cdir / "work" / "voice.mp3"
         ).read_bytes()
     assert len(json.loads(
         (cdir / "work" / "multimodal_input.json").read_text(encoding="utf-8")
@@ -983,7 +993,9 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         assert len(stitch_calls) == 1
         native_indices = {
             index for index in range(1, segment_count + 1)
-            if dialogue_mode != "none" and index not in silent_segment_indices
+            if dialogue_mode != "none"
+            and dialogue_classification == "spoken"
+            and index not in silent_segment_indices
         }
         assert stitch_calls[0]["audio_mode"] == (
             "provider_generated" if native_indices else "mute"
@@ -1062,6 +1074,33 @@ def test_n2_off_screen_fusion_completes_context_h3_and_native_stitch(
 ):
     _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         tmp_path, monkeypatch, 2, complete_generation=True,
+    )
+
+
+@pytest.mark.parametrize("segment_count", [1, 2], ids=("n1", "n2"))
+def test_current_sung_only_uses_no_audio_h3_and_publishes_mute(
+    tmp_path, monkeypatch, segment_count,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path,
+        monkeypatch,
+        segment_count,
+        complete_generation=True,
+        dialogue_classification="sung",
+        has_bgm=True,
+    )
+
+
+@pytest.mark.parametrize("has_bgm", [True, None], ids=("bgm", "unknown"))
+def test_current_spoken_without_no_bgm_proof_fails_before_fusion_context_h3(
+    tmp_path, monkeypatch, has_bgm,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path,
+        monkeypatch,
+        1,
+        dialogue_classification="spoken",
+        has_bgm=has_bgm,
     )
 
 

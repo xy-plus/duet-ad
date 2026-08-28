@@ -1913,8 +1913,7 @@ def _require_prompt_fusion_v2_input(input_data: bytes) -> dict:
         not isinstance(payload, dict)
         or set(payload) != {"schema", "version", "segments"}
         or payload.get("schema") != long_generation.PROMPT_FUSION_INPUT_SCHEMA
-        or payload.get("version")
-        != long_generation.VISUAL_PROMPT_FUSION_VERSION
+        or payload.get("version") != long_generation.PROMPT_FUSION_VERSION
         or not isinstance(segments, list)
         or not segments
     ):
@@ -2075,7 +2074,7 @@ def queue_prompt_fusion(
         settings.data_dir,
         cid,
         _prompt_fusion={
-            "version": 1,
+            "version": long_generation.PROMPT_FUSION_VERSION,
             "status": "queued",
             "error": None,
             "input_sha256": input_sha256,
@@ -2186,7 +2185,10 @@ def _recoverable_prompt_fusion_state(
     state = meta.get("_prompt_fusion")
     if (
         not isinstance(state, dict)
-        or state.get("version") != 1
+        or state.get("version") not in {
+            long_generation.PROMPT_FUSION_LEGACY_VERSION,
+            long_generation.PROMPT_FUSION_VERSION,
+        }
         or state.get("status") != "failed"
         or state.get("error") != "prompt_fusion_output_invalid"
         or state.get("manifest_sha256") is not None

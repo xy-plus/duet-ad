@@ -43,8 +43,11 @@ H3_NATIVE_AUDIO_ROUTE = {
 }
 PROMPT_FUSION_INPUT_SCHEMA = "duet.video-prompt-fusion-input"
 PROMPT_FUSION_OUTPUT_SCHEMA = "duet.video-prompt-fusion-output"
-PROMPT_FUSION_VERSION = 1
-VISUAL_PROMPT_FUSION_VERSION = 2
+PROMPT_FUSION_LEGACY_VERSION = 1
+PROMPT_FUSION_VERSION = 2
+# Compatibility name retained for the visual-v2 callers and receipts.  Audio
+# policy and the source timeline are one indivisible v2 contract.
+VISUAL_PROMPT_FUSION_VERSION = PROMPT_FUSION_VERSION
 PROMPT_FUSION_MANIFEST_SCHEMA = "duet.video-prompt-fusion-production"
 PROMPT_FUSION_MANIFEST_VERSION = 1
 PROMPT_FUSION_SKILL_SOURCE = (
@@ -110,7 +113,7 @@ def _fusion_timeline_block(timeline_json: str) -> str:
     )
 
 
-def _fusion_music_block() -> str:
+def _fusion_music_policy_block() -> str:
     return "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
 
 
@@ -118,19 +121,22 @@ def _canonical_fusion_prompt(
     prompt: str,
     lines_json: str,
     *,
+    version: int,
     timeline_json: str | None = None,
 ) -> str:
-    """Accept one exact audio block and freeze one canonical byte form."""
+    """Freeze the exact versioned visual/timeline/audio/music envelope."""
     opening = "<AUDIO_CONTENT_JSON>"
     closing = "</AUDIO_CONTENT_JSON>"
     canonical = _fusion_audio_block(lines_json)
-    if timeline_json is not None:
+    if version == PROMPT_FUSION_VERSION:
+        if timeline_json is None:
+            raise LongGenerationError("prompt_fusion_output_invalid")
         suffix = (
             _fusion_timeline_block(timeline_json)
             + "\n"
             + canonical
             + "\n"
-            + _fusion_music_block()
+            + _fusion_music_policy_block()
         )
         if not prompt.endswith(suffix):
             raise LongGenerationError("prompt_fusion_output_invalid")
@@ -152,17 +158,23 @@ def _canonical_fusion_prompt(
         visual = prefix[len("<VISUAL>\n"):-len("\n</VISUAL>\n")]
         if any(tag in visual for tag in reserved):
             raise LongGenerationError("prompt_fusion_output_invalid")
-        return prefix + suffix
-    lf_envelope = f"{opening}\n{lines_json}\n{closing}"
-    if prompt.endswith(canonical):
-        prefix = prompt[:-len(canonical)]
-    elif prompt.endswith(lf_envelope):
-        prefix = prompt[:-len(lf_envelope)]
+        canonical_prompt = prefix + suffix
+    elif version == PROMPT_FUSION_LEGACY_VERSION:
+        if timeline_json is not None:
+            raise LongGenerationError("prompt_fusion_output_invalid")
+        lf_envelope = f"{opening}\n{lines_json}\n{closing}"
+        if prompt.endswith(canonical):
+            prefix = prompt[:-len(canonical)]
+        elif prompt.endswith(lf_envelope):
+            prefix = prompt[:-len(lf_envelope)]
+        else:
+            raise LongGenerationError("prompt_fusion_output_invalid")
+        canonical_prompt = prefix + canonical
     else:
         raise LongGenerationError("prompt_fusion_output_invalid")
     if opening in prefix or closing in prefix:
         raise LongGenerationError("prompt_fusion_output_invalid")
-    return prefix + canonical
+    return canonical_prompt
 
 
 def load_prompt_fusion(
@@ -192,7 +204,7 @@ def load_prompt_fusion(
         or set(source) != {"schema", "version", "segments"}
         or source.get("schema") != PROMPT_FUSION_INPUT_SCHEMA
         or source_version not in {
-            PROMPT_FUSION_VERSION, VISUAL_PROMPT_FUSION_VERSION,
+            PROMPT_FUSION_LEGACY_VERSION, PROMPT_FUSION_VERSION,
         }
         or not isinstance(segments, list)
         or not segments
@@ -223,7 +235,7 @@ def load_prompt_fusion(
         for order, (frame, prompt) in enumerate(zip(frames, prompts), 1):
             expected_frame_keys = (
                 {"order", "path", "sha256"}
-                if source_version == PROMPT_FUSION_VERSION
+                if source_version == PROMPT_FUSION_LEGACY_VERSION
                 else {
                     "order", "path", "sha256", "source_time_s",
                     "source_scene_id", "transition",
@@ -259,7 +271,7 @@ def load_prompt_fusion(
                 or hashlib.sha256(frame_data).hexdigest() != frame["sha256"]
             ):
                 raise LongGenerationError("prompt_fusion_input_invalid")
-        if source_version == VISUAL_PROMPT_FUSION_VERSION:
+        if source_version == PROMPT_FUSION_VERSION:
             try:
                 frozen_sources, previous_keyframe_source = (
                     long_video.freeze_keyframe_sources(
@@ -285,20 +297,20 @@ def load_prompt_fusion(
         else:
             timeline_jsons.append(None)
         audio = segment.get("audio_content")
-        expected_audio_keys = {
+        audio_keys = {
             "lines_json", "lines_sha256", "voice_references",
         }
-        if source_version == VISUAL_PROMPT_FUSION_VERSION:
-            expected_audio_keys.add("music_policy")
+        if source_version == PROMPT_FUSION_VERSION:
+            audio_keys.add("music_policy")
         if (
             not isinstance(audio, Mapping)
-            or set(audio) != expected_audio_keys
+            or set(audio) != audio_keys
             or not isinstance(audio.get("lines_json"), str)
             or not isinstance(audio.get("voice_references"), list)
             or audio.get("lines_sha256")
             != hashlib.sha256(audio["lines_json"].encode("utf-8")).hexdigest()
             or (
-                source_version == VISUAL_PROMPT_FUSION_VERSION
+                source_version == PROMPT_FUSION_VERSION
                 and audio.get("music_policy") != "forbid"
             )
         ):
@@ -378,6 +390,7 @@ def load_prompt_fusion(
         final_prompts.append(_canonical_fusion_prompt(
             segment["final_prompt"],
             segments[index - 1]["audio_content"]["lines_json"],
+            version=source_version,
             timeline_json=timeline_jsons[index - 1],
         ))
     return FrozenPromptFusion(
@@ -507,7 +520,9 @@ def load_bound_prompt_fusion_manifest(
     state = meta.get("_prompt_fusion")
     if (
         not isinstance(state, Mapping)
-        or state.get("version") != 1
+        or state.get("version") not in {
+            PROMPT_FUSION_LEGACY_VERSION, PROMPT_FUSION_VERSION,
+        }
         or state.get("status") != "done"
         or state.get("error") is not None
         or state.get("manifest_sha256")
@@ -527,7 +542,10 @@ def load_bound_prompt_fusion_manifest(
         root=root,
         skill_source_path=None,
     )
-    if frozen.input_sha256 != state.get("input_sha256"):
+    if (
+        frozen.version != state.get("version")
+        or frozen.input_sha256 != state.get("input_sha256")
+    ):
         raise LongGenerationError("prompt_fusion_manifest_invalid")
     return frozen
 
@@ -657,6 +675,34 @@ def _canonical_json_bytes(value: object) -> bytes:
         raise LongGenerationError("prompt_fusion_input_invalid") from None
 
 
+def _compiled_dialogue(
+    dialogue_mode: str, dialogue: tuple[dict, ...],
+) -> tuple[dict, ...]:
+    """Project current dialogue without reclassifying upstream evidence."""
+    if dialogue_mode == "none":
+        return ()
+    if dialogue_mode == "auto":
+        return tuple(
+            line for line in dialogue
+            if isinstance(line, Mapping) and line.get("classification") == "spoken"
+        )
+    if dialogue_mode in {"edit", "custom"}:
+        return tuple(dialogue)
+    raise LongGenerationError("invalid_dialogue_mode", 422)
+
+
+def _has_spoken_voice_authority(meta: Mapping) -> bool:
+    """Require the existing ASR/YAMNet receipt to prove real speech."""
+    provenance = meta.get("voice_line_provenance")
+    return isinstance(provenance, list) and any(
+        isinstance(line, Mapping)
+        and line.get("kept") is True
+        and line.get("classification") == "spoken"
+        and line.get("provenance") == "asr"
+        for line in provenance
+    )
+
+
 def prompt_fusion_image_authority_sha256(meta: Mapping) -> str:
     """Bind manual acceptance, or the exact v4 MediaKit-only receipt."""
     acceptance = meta.get("_image_user_acceptance")
@@ -721,7 +767,9 @@ def build_prompt_fusion_input(
     try:
         requested_delivery = dialogue_delivery_contract.parse(dialogue_delivery)
         authoritative_dialogue = tuple(
-            line for segment in plan.segments for line in segment.dialogue
+            line
+            for segment in plan.segments
+            for line in _compiled_dialogue(dialogue_mode, segment.dialogue)
         )
         resolved_delivery = dialogue_delivery_contract.resolve(
             requested_delivery, authoritative_dialogue
@@ -739,7 +787,7 @@ def build_prompt_fusion_input(
         raise LongGenerationError("prompt_fusion_input_invalid")
     if not all(has_visual_timeline):
         raise LongGenerationError("prompt_fusion_refresh_required")
-    fusion_version = VISUAL_PROMPT_FUSION_VERSION
+    fusion_version = PROMPT_FUSION_VERSION
 
     compiled_segments: list[dict] = []
     optimization_indices = {
@@ -787,7 +835,7 @@ def build_prompt_fusion_input(
                 "path": relative,
                 "sha256": hashlib.sha256(data).hexdigest(),
             }
-            if fusion_version == VISUAL_PROMPT_FUSION_VERSION:
+            if fusion_version == PROMPT_FUSION_VERSION:
                 source = segment.keyframe_sources[order - 1]
                 binding.update({
                     key: source[key]
@@ -819,7 +867,7 @@ def build_prompt_fusion_input(
                 "order": order, "text": text, "sha256": digest,
             })
 
-        dialogue = () if dialogue_mode == "none" else segment.dialogue
+        dialogue = _compiled_dialogue(dialogue_mode, segment.dialogue)
         lines: list[dict] = []
         for order, line in enumerate(dialogue, 1):
             try:
@@ -840,9 +888,15 @@ def build_prompt_fusion_input(
             })
         voice_references: list[dict] = []
         if lines:
-            audio_path = segment.workdir / "work" / "voice.mp3"
-            if len(plan.segments) == 1 and not audio_path.is_file():
-                audio_path = root / "work" / "voice.mp3"
+            # The existing ASR/YAMNet result is the only authority allowed to
+            # qualify the source-derived conditioning track.  Unknown is not
+            # equivalent to no BGM.
+            if (
+                meta.get("has_bgm") is not False
+                or not _has_spoken_voice_authority(meta)
+            ):
+                raise LongGenerationError("clean_voice_reference_required")
+            audio_path = root / "work" / "voice.mp3"
             if audio_path.is_symlink():
                 raise LongGenerationError("reference_audio_binding_invalid")
             try:
@@ -875,10 +929,7 @@ def build_prompt_fusion_input(
                     lines_json.encode("utf-8")
                 ).hexdigest(),
                 "voice_references": voice_references,
-                **(
-                    {"music_policy": "forbid"}
-                    if fusion_version == VISUAL_PROMPT_FUSION_VERSION else {}
-                ),
+                "music_policy": "forbid",
             },
         })
     return _canonical_json_bytes({
@@ -924,6 +975,8 @@ def _publish_fusion_h3_segments(
                 raise LongGenerationError("prompt_fusion_input_invalid")
 
         audio = fusion_source["audio_content"]
+        if audio.get("music_policy") != "forbid":
+            raise LongGenerationError("prompt_fusion_input_invalid")
         lines = json.loads(audio["lines_json"])
         for item in audio["voice_references"]:
             source_candidate = root / item["path"]
@@ -940,8 +993,11 @@ def _publish_fusion_h3_segments(
                 or hashlib.sha256(data).hexdigest() != item["sha256"]
             ):
                 raise LongGenerationError("reference_audio_binding_invalid")
-        dialogue = () if dialogue_mode == "none" else segment.dialogue
+        dialogue = _compiled_dialogue(dialogue_mode, segment.dialogue)
         if len(lines) != len(dialogue):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        expected_voice_ref = 1 if audio["voice_references"] else None
+        if bool(lines) != bool(audio["voice_references"]):
             raise LongGenerationError("prompt_fusion_input_invalid")
         for order, (compiled, authoritative) in enumerate(
             zip(lines, dialogue), 1
@@ -952,10 +1008,15 @@ def _publish_fusion_h3_segments(
                 or compiled["start_s"] != authoritative.get("start_s")
                 or compiled["end_s"] != authoritative.get("end_s")
                 or compiled["delivery"] != "off_screen"
-                or compiled["voice_ref"] != 1
+                or compiled["voice_ref"] != expected_voice_ref
             ):
                 raise LongGenerationError("prompt_fusion_input_invalid")
-        updated = {**dict(source), "prompt": final_prompt}
+        updated = {
+            **dict(source),
+            "prompt": final_prompt,
+            "dialogue": list(dialogue),
+            "lines": [line["text"] for line in dialogue],
+        }
         updated_segments.append(updated)
         receipt_segments.append({
             **updated,
@@ -1069,9 +1130,6 @@ def normalize_single_segment_project(
         raise LongGenerationError("long_video_plan_invalid") from None
     final_path = segment_work / "prompt.txt"
     _atomic_bytes(final_path, final.encode("utf-8"))
-    global_audio = root / "work" / "voice.mp3"
-    if dialogue and global_audio.is_file() and not global_audio.is_symlink():
-        _atomic_bytes(segment_work / "voice.mp3", global_audio.read_bytes())
     segment = {
         "index": 1,
         "start_s": 0.0,
@@ -1331,11 +1389,15 @@ def finalize_multimodal_plan(
     try:
         resolved_delivery = dialogue_delivery_contract.resolve(
             dialogue_delivery_contract.parse(dialogue_delivery),
-            tuple(line for segment in base.segments for line in segment.dialogue),
+            tuple(
+                line
+                for segment in base.segments
+                for line in _compiled_dialogue(dialogue_mode, segment.dialogue)
+            ),
         ).value
     except ValueError:
         raise LongGenerationError("invalid_dialogue_delivery", 422) from None
-    receipt_segments, _updated_segments = _publish_fusion_h3_segments(
+    receipt_segments, updated_segments = _publish_fusion_h3_segments(
         root=root,
         meta=meta,
         base=base,
@@ -1365,7 +1427,7 @@ def finalize_multimodal_plan(
             prompt_fusion_manifest_path=root / "work" / h3_project.SOURCE_FILENAME,
         )
         promoted = _digest(receipt_path)
-        promoted_meta = dict(meta)
+        promoted_meta = {**dict(meta), "segments": updated_segments}
         freeze_plan(
             root,
             promoted_meta,
@@ -1381,6 +1443,7 @@ def finalize_multimodal_plan(
         storage.update_meta(
             settings.data_dir,
             str(meta.get("id")),
+            segments=updated_segments,
             long_video_plan_receipt=long_video.PLAN_RECEIPT_FILENAME,
         )
         return promoted
@@ -1661,7 +1724,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 for order, frame in enumerate(frames, 1):
                     expected_keys = (
                         {"order", "path", "sha256"}
-                        if frozen_fusion.version == PROMPT_FUSION_VERSION
+                        if frozen_fusion.version == PROMPT_FUSION_LEGACY_VERSION
                         else {
                             "order", "path", "sha256", "source_time_s",
                             "source_scene_id", "transition",
@@ -1946,7 +2009,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             fusion_segment = frozen_fusion.segments[position - 1]
             if final != frozen_fusion.final_prompts[position - 1]:
                 raise LongGenerationError("prompt_fusion_output_invalid")
-            if frozen_fusion.version == VISUAL_PROMPT_FUSION_VERSION:
+            if frozen_fusion.version == PROMPT_FUSION_VERSION:
                 fusion_sources = [{
                     key: frame[key]
                     for key in (
@@ -1966,6 +2029,9 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 raise LongGenerationError("prompt_fusion_input_invalid") from None
             if not isinstance(fusion_lines, list) or len(fusion_lines) != len(dialogue):
                 raise LongGenerationError("prompt_fusion_input_invalid")
+            expected_voice_ref = 1 if voice_references else None
+            if bool(dialogue) != bool(voice_references):
+                raise LongGenerationError("prompt_fusion_input_invalid")
             for line_order, (compiled, authoritative) in enumerate(
                 zip(fusion_lines, dialogue), 1
             ):
@@ -1977,7 +2043,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                     or compiled.get("delivery") != payload.get(
                         "resolved_dialogue_delivery"
                     )
-                    or compiled.get("voice_ref") != 1
+                    or compiled.get("voice_ref") != expected_voice_ref
                 ):
                     raise LongGenerationError("prompt_fusion_input_invalid")
             audio_paths: list[Path] = []
@@ -2942,7 +3008,11 @@ def _stitch(
             _generation_uses_h3_native_audio(plan, generation)
         if dialogue_mode not in {"auto", "none"}:
             raise LongGenerationError("invalid_dialogue_mode", 422)
-        audio_mode = "keep" if dialogue_mode == "auto" else "mute"
+        audio_mode = (
+            "mute"
+            if plan.prompt_fusion is not None
+            else ("keep" if dialogue_mode == "auto" else "mute")
+        )
     stitch.stitch_video(
         segments=_stitch_segments(plan, provider_media),
         source_video=plan.source,
@@ -3026,7 +3096,11 @@ def stitched_output_is_reusable(
     audio_mode: stitch.AudioMode = (
         "provider_generated"
         if native_audio
-        else ("keep" if dialogue_mode == "auto" else "mute")
+        else (
+            "mute"
+            if plan.prompt_fusion is not None
+            else ("keep" if dialogue_mode == "auto" else "mute")
+        )
     )
     try:
         payload = json.loads(receipt_path.read_text(encoding="utf-8"))

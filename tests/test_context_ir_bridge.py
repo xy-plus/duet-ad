@@ -159,8 +159,10 @@ def _frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
     )
 
 
-def _no_audio_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
-    prompt = "final fusion visual prompt; no dialogue and no source audio overlay"
+def _no_audio_frozen(
+    tmp_path: Path, *, prompt: str | None = None,
+) -> context_ir_bridge.FrozenContextIrRequest:
+    prompt = prompt or "final fusion visual prompt; no dialogue and no source audio overlay"
     source = h3.H3Request(
         cid="silent-segment-1",
         workdir=tmp_path / "silent-segment-1",
@@ -218,10 +220,12 @@ def _timeline_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest
         allow_nan=False,
     )
     prompt = (
-        base.source_h3_request.prompt
-        + "\n<KEYFRAME_TIMELINE_JSON>"
+        "<VISUAL>\nsource visual\n</VISUAL>\n"
+        + "<KEYFRAME_TIMELINE_JSON>"
         + timeline_json
-        + "</KEYFRAME_TIMELINE_JSON>"
+        + "</KEYFRAME_TIMELINE_JSON>\n"
+        + "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
+        + "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
     )
     source = replace(
         base.source_h3_request,
@@ -238,6 +242,93 @@ def _timeline_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest
         minimax_api_key="minimax-secret",
         timeouts=base.timeouts,
     )
+
+
+def test_current_fusion_no_bgm_suffix_is_bound_and_must_survive_context(
+    tmp_path: Path,
+) -> None:
+    suffix = (
+        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
+        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+    )
+    frozen = _no_audio_frozen(
+        tmp_path, prompt=f"<VISUAL>source</VISUAL>\n{suffix}",
+    )
+    effective = f"<VISUAL>optimized</VISUAL>\n{suffix}"
+
+    with _client(
+        _success_handler(frozen, effective_prompt=effective)
+    ) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "succeeded"
+    assert result.effective_prompt == effective
+
+
+def test_legacy_context_semantic_hash_is_unchanged_without_music_marker(
+    tmp_path: Path,
+) -> None:
+    frozen = _no_audio_frozen(tmp_path)
+
+    assert frozen.semantic_contract_sha256 == context_ir_bridge._canonical_sha256({
+        "speech_markers": [],
+        "dialogue_tokens": [],
+    })
+
+
+def test_legacy_audio_json_may_contain_music_marker_literal(
+    tmp_path: Path,
+) -> None:
+    prompt = (
+        'visual\n<AUDIO_CONTENT_JSON>[{"text":"literal '
+        '<MUSIC_POLICY>forbid</MUSIC_POLICY>"}]'
+        '</AUDIO_CONTENT_JSON>'
+    )
+    frozen = _no_audio_frozen(tmp_path, prompt=prompt)
+
+    assert frozen.semantic_contract_sha256 == context_ir_bridge._canonical_sha256({
+        "speech_markers": [],
+        "dialogue_tokens": [],
+    })
+
+
+@pytest.mark.parametrize(
+    "effective_suffix",
+    [
+        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>",
+        (
+            "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
+            "<MUSIC_POLICY>allow</MUSIC_POLICY>"
+        ),
+        (
+            "<AUDIO_CONTENT_JSON>[ ]</AUDIO_CONTENT_JSON>\n"
+            "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+        ),
+    ],
+    ids=("missing-policy", "changed-policy", "rewritten-audio"),
+)
+def test_context_rejects_fusion_audio_or_music_policy_drift(
+    tmp_path: Path, effective_suffix: str,
+) -> None:
+    source_suffix = (
+        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
+        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+    )
+    frozen = _no_audio_frozen(
+        tmp_path, prompt=f"<VISUAL>source</VISUAL>\n{source_suffix}",
+    )
+
+    with _client(
+        _success_handler(
+            frozen,
+            effective_prompt=f"<VISUAL>optimized</VISUAL>\n{effective_suffix}",
+        )
+    ) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "failed"
+    assert result.error_code == "context_ir_semantic_mismatch"
+    assert not (frozen.workdir / ".h3").exists()
 
 
 def _reference_audio_frozen(
@@ -850,7 +941,27 @@ def test_dialogue_none_rejects_any_context_ir_speech(tmp_path):
 
 def test_context_ir_preserves_frozen_keyframe_timeline(tmp_path):
     frozen = _timeline_frozen(tmp_path)
-    effective = "rewritten visual prose\n" + frozen.source_prompt.split("\n", 1)[1]
+    suffix = context_ir_bridge._fusion_policy_suffix(frozen.source_prompt)
+    assert suffix is not None
+    assert frozen.semantic_contract_sha256 == context_ir_bridge._canonical_sha256({
+        "speech_markers": [],
+        "dialogue_tokens": [],
+        "keyframe_timeline_json": frozen.keyframe_timeline_json,
+        "fusion_policy_suffix_sha256": hashlib.sha256(suffix.encode()).hexdigest(),
+    })
+    block_positions = tuple(
+        frozen.source_prompt.index(marker)
+        for marker in (
+            "<VISUAL>",
+            "<KEYFRAME_TIMELINE_JSON>",
+            "<AUDIO_CONTENT_JSON>",
+            "<MUSIC_POLICY>",
+        )
+    )
+    assert block_positions == tuple(sorted(block_positions))
+    effective = frozen.source_prompt.replace(
+        "source visual", "rewritten visual prose", 1
+    )
     with _client(
         _success_handler(frozen, effective_prompt=effective)
     ) as client:

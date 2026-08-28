@@ -20,12 +20,62 @@ from app.main import (
     _load_h3_request,
     _result_fields,
     _resume_generation,
+    _validated_dialogue,
     create_app,
 )
 
 
 PROMPT = "镜头从整洁的房间缓慢推进。"
 REQUEST_ID = "request-123456"
+
+
+def test_auto_dialogue_keeps_only_verified_spoken_but_manual_modes_are_verbatim() -> None:
+    meta = {
+        "duration_s": 10.0,
+        "vocal_filter_enabled": True,
+        "voice_line_provenance": [
+            {
+                "text": "spoken line",
+                "start_s": 0.5,
+                "end_s": 1.5,
+                "classification": "spoken",
+                "kept": True,
+            },
+            {
+                "text": "sung line",
+                "start_s": 2.0,
+                "end_s": 3.0,
+                "classification": "sung",
+                "kept": True,
+            },
+            {
+                "text": "unclassified line",
+                "start_s": 4.0,
+                "end_s": 5.0,
+                "classification": None,
+                "kept": True,
+            },
+        ],
+    }
+
+    assert _validated_dialogue(meta, {"dialogue_mode": "auto"}) == ({
+        "text": "spoken line",
+        "start_s": 0.5,
+        "end_s": 1.5,
+        "classification": "spoken",
+        "provenance": "asr",
+    },)
+    manual = [{"text": "manual sung wording", "start_s": 2.0, "end_s": 3.0}]
+    for mode, provenance in (("edit", "asr+edited"), ("custom", "manual")):
+        assert _validated_dialogue(
+            meta, {"dialogue_mode": mode, "lines": manual}
+        ) == ({
+            "text": "manual sung wording",
+            "start_s": 2.0,
+            "end_s": 3.0,
+            "classification": None,
+            "provenance": provenance,
+        },)
 
 
 def _png(path: Path, width: int = 90, height: int = 160, value: int = 127) -> bytes:

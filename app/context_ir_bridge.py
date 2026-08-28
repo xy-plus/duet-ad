@@ -442,6 +442,50 @@ def _speech_contract(
     return markers, tokens
 
 
+def _fusion_policy_suffix(prompt: str) -> str | None:
+    """Return the exact current Fusion audio/music suffix, if present."""
+    audio_open = "<AUDIO_CONTENT_JSON>"
+    audio_close = "</AUDIO_CONTENT_JSON>"
+    music_open = "<MUSIC_POLICY>"
+    music_close = "</MUSIC_POLICY>"
+    music = f"{music_open}forbid{music_close}"
+    policy_tail = f"\n{music}"
+    # Historical v1 dialogue may legally contain either marker as text inside
+    # its JSON payload. Only the v2 outer marker at the exact prompt tail
+    # activates this contract; the v2 loader rejects malformed outer blocks.
+    if not prompt.endswith(policy_tail):
+        return None
+    marker_start = prompt.find(audio_open)
+    if marker_start < 0:
+        raise ContextIrContractError("source_music_policy_invalid")
+    suffix = prompt[marker_start:]
+    if not suffix.endswith(f"{audio_close}\n{music}"):
+        raise ContextIrContractError("source_music_policy_invalid")
+    prefix = prompt[:marker_start]
+    if (
+        audio_open in prefix
+        or audio_close in prefix
+        or music_open in prefix
+        or music_close in prefix
+    ):
+        raise ContextIrContractError("source_music_policy_invalid")
+    return suffix
+
+
+def _effective_preserves_fusion_policy(
+    effective_prompt: str, expected_suffix: str,
+) -> bool:
+    if not effective_prompt.endswith(expected_suffix):
+        return False
+    prefix = effective_prompt[:-len(expected_suffix)]
+    return not any(marker in prefix for marker in (
+        "<AUDIO_CONTENT_JSON>",
+        "</AUDIO_CONTENT_JSON>",
+        "<MUSIC_POLICY>",
+        "</MUSIC_POLICY>",
+    ))
+
+
 def _mime_type(path: Path, *, audio: bool) -> str:
     suffix = path.suffix.lower()
     types = (
@@ -682,6 +726,7 @@ def freeze_context_ir_request(
     keyframe_timeline_json = _keyframe_timeline_contract(
         source_h3_request.prompt
     )
+    fusion_policy_suffix = _fusion_policy_suffix(source_h3_request.prompt)
 
     references: list[FrozenContextIrReference] = []
     for order, (path, data) in enumerate(source_h3_request.keyframes, 1):
@@ -723,6 +768,10 @@ def freeze_context_ir_request(
     }
     if keyframe_timeline_json is not None:
         semantic_contract["keyframe_timeline_json"] = keyframe_timeline_json
+    if fusion_policy_suffix is not None:
+        semantic_contract["fusion_policy_suffix_sha256"] = _sha256_text(
+            fusion_policy_suffix
+        )
     semantic_contract_sha256 = _canonical_sha256(semantic_contract)
     input_manifest = _source_input_manifest(
         cid=source_h3_request.cid,
@@ -1470,6 +1519,29 @@ def _complete(
                 error="context_ir_semantic_mismatch",
             )
             return
+    try:
+        fusion_policy_suffix = _fusion_policy_suffix(request.source_prompt)
+    except ContextIrContractError:
+        _mark_terminal(
+            path,
+            state,
+            status="failed",
+            error="context_ir_semantic_mismatch",
+        )
+        return
+    if (
+        fusion_policy_suffix is not None
+        and not _effective_preserves_fusion_policy(
+            effective_prompt, fusion_policy_suffix,
+        )
+    ):
+        _mark_terminal(
+            path,
+            state,
+            status="failed",
+            error="context_ir_semantic_mismatch",
+        )
+        return
     payload = _receipt_payload(request, state, effective_prompt)
     receipt_sha256 = _canonical_sha256(payload)
     receipt = dict(payload, receipt_sha256=receipt_sha256)
