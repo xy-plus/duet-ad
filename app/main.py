@@ -2556,7 +2556,305 @@ def _resume_long_generation(settings: Settings, cid: str) -> None:
                         "error": "submission_unknown"},
         )
         return
-    long_generation.run(settings, cid, plan, startup=True)
+    pristine_accepted_operation = (
+        _is_current_v4_segment_project(meta)
+        and generation.get("status") == "queued"
+        and bool(generation["segments"])
+        and all(
+            isinstance(item, Mapping)
+            and item.get("status") == "not_started"
+            and item.get("child_request_id") is None
+            and item.get("h3_attempt_id") is None
+            for item in generation["segments"]
+        )
+    )
+    # This is the only startup state that proves the paid boundary has not
+    # been entered: the accepted generation is durable, while every child is
+    # still pristine.  Once run starts it persists running/child receipts
+    # before a provider POST, so every other startup path remains GET-only.
+    long_generation.run(
+        settings, cid, plan, startup=not pristine_accepted_operation
+    )
+
+
+def _prompt_fusion_continuation_claim(
+    meta: Mapping, owner: object,
+) -> bool:
+    return bool(
+        _is_current_v4_segment_project(meta)
+        and isinstance(owner, Mapping)
+        and owner.get("kind") == "submit"
+        and isinstance(owner.get("request_id"), str)
+        and _CLIENT_REQUEST_ID_RE.fullmatch(owner["request_id"])
+        and isinstance(meta.get("_prompt_fusion"), Mapping)
+        and not isinstance(meta.get("generation"), Mapping)
+    )
+
+
+def _claim_stale_prompt_fusion_continuations(
+    settings: Settings,
+) -> list[tuple[str, dict]]:
+    """Take exact old-boot Fusion submit claims even without snapshot drift."""
+    claimed: list[tuple[str, dict]] = []
+    for listed in storage.list_conversations(settings.data_dir):
+        cid = listed.get("id")
+        observed = listed.get("_input_owner")
+        if (
+            not isinstance(cid, str)
+            or not _prompt_fusion_continuation_claim(listed, observed)
+            or observed.get("process_generation")
+            == storage.PROCESS_GENERATION
+        ):
+            continue
+        replacement = {
+            **observed,
+            "process_generation": storage.PROCESS_GENERATION,
+        }
+        acquired: dict[str, bool] = {}
+
+        def claim(meta: dict) -> None:
+            if (
+                meta.get("_input_owner") == observed
+                and _prompt_fusion_continuation_claim(meta, observed)
+            ):
+                meta["_input_owner"] = replacement
+                acquired["value"] = True
+
+        storage.mutate_meta(settings.data_dir, cid, claim)
+        if acquired.get("value"):
+            claimed.append((cid, replacement))
+    return claimed
+
+
+def _continue_after_prompt_fusion(
+    settings: Settings, cid: str, owner: object,
+) -> bool:
+    """Commit the accepted submit claim and enter its one H3 coordinator."""
+    meta = storage.load_submission_claim(settings.data_dir, cid, owner)
+    if meta is None or not _prompt_fusion_continuation_claim(meta, owner):
+        return False
+    fusion = meta["_prompt_fusion"]
+    if fusion.get("status") != "done":
+        return False
+    request_id = owner["request_id"]
+    fit_mode = meta.get("fit_mode")
+    dialogue_mode = meta.get("dialogue_mode")
+    requested_delivery = meta.get("dialogue_delivery", "auto")
+    aspect_ratio = meta.get("aspect_ratio")
+    resolution = meta.get("resolution")
+    fast_mode = owner.get("fast_mode", False)
+    expected_receipt = long_generation.plan_receipt(
+        settings.data_dir / cid, meta
+    )
+    if (
+        fit_mode not in _FIT_MODES
+        or dialogue_mode not in {"auto", "none"}
+        or requested_delivery not in {"auto", "on_screen", "off_screen"}
+        or aspect_ratio not in _ASPECT_RATIOS
+        or resolution not in _RESOLUTIONS
+        or not isinstance(fast_mode, bool)
+        or expected_receipt is None
+    ):
+        return False
+    promoted = long_generation.finalize_multimodal_plan(
+        settings.data_dir / cid,
+        meta,
+        expected_receipt,
+        fit_mode,
+        dialogue_mode,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        dialogue_delivery=requested_delivery,
+        settings=settings,
+    )
+    meta = storage.load_submission_claim(settings.data_dir, cid, owner)
+    if meta is None:
+        return False
+    expected_receipt = promoted or long_generation.plan_receipt(
+        settings.data_dir / cid, meta
+    )
+    if expected_receipt is None:
+        return False
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        meta,
+        expected_receipt,
+        fit_mode,
+        dialogue_mode,
+        dialogue_delivery=requested_delivery,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        prepare_fit=True,
+        settings=settings,
+    )
+    generation = long_generation.initial_generation(
+        settings,
+        cid,
+        plan,
+        request_id,
+        1,
+        None,
+        fast_mode=fast_mode,
+    )
+    committed = storage.finish_input_claim(
+        settings.data_dir,
+        cid,
+        owner,
+        dialogue_mode=dialogue_mode,
+        dialogue_delivery=requested_delivery,
+        resolved_dialogue_delivery=meta.get("resolved_dialogue_delivery"),
+        voice_lines=[],
+        prepared_dialogue=[],
+        fit_mode=fit_mode,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        frozen_plan_receipt=expected_receipt,
+        generation=generation,
+    )
+    if committed is None:
+        return False
+    long_generation.run(settings, cid, plan)
+    return True
+
+
+def _produce_prompt_fusion_and_continue(
+    settings: Settings, cid: str, runner, owner: object,
+) -> None:
+    """Drive the same accepted claim from Fusion to H3 without another HTTP."""
+    meta = storage.load_submission_claim(settings.data_dir, cid, owner)
+    if meta is None or not _prompt_fusion_continuation_claim(meta, owner):
+        return
+    fusion = meta["_prompt_fusion"]
+    status = fusion.get("status")
+    if status in {"running", "failed"}:
+        updated = storage.update_meta(
+            settings.data_dir,
+            cid,
+            _prompt_fusion={**fusion, "status": "queued"},
+        )
+        if updated is None:
+            return
+        status = "queued"
+    if status == "queued":
+        status = pipeline.produce_prompt_fusion(settings, cid, runner)
+    if status != "done":
+        # Fusion is an unpaid operational step. Keep the exact accepted claim
+        # schedulable; never turn its output shape/score into a public failure.
+        current = storage.load_submission_claim(settings.data_dir, cid, owner)
+        state = current.get("_prompt_fusion") if current else None
+        if isinstance(state, Mapping) and state.get("status") == "failed":
+            storage.update_meta(
+                settings.data_dir,
+                cid,
+                _prompt_fusion={**state, "status": "queued"},
+            )
+        return
+    try:
+        _continue_after_prompt_fusion(settings, cid, owner)
+    except Exception:
+        # The submit claim and frozen Fusion receipt are the durable work item.
+        # Startup or a same-operation ensure call may resume it; no alternative
+        # generation or provider POST is created here.
+        return
+
+
+def _start_automatic_v4_generation(
+    settings: Settings, cid: str, runner,
+) -> None:
+    """Turn one technically accepted v4 project into its only generation."""
+    meta = storage.load_meta(settings.data_dir, cid)
+    if (
+        meta is None
+        or not _is_current_v4_segment_project(meta)
+        or meta.get("status") != "done"
+        or not settings.enable_h3_submit
+        or not _credentials_ready(settings)
+    ):
+        return
+    if isinstance(meta.get("generation"), Mapping):
+        return
+    owner = meta.get("_input_owner")
+    if _prompt_fusion_continuation_claim(meta, owner):
+        _produce_prompt_fusion_and_continue(settings, cid, runner, owner)
+        return
+    post = meta.get("postprocess")
+    if not isinstance(post, Mapping) or post.get("status") != "done":
+        return
+    acceptance = postprocess.image_acceptance_status(settings, cid, meta)
+    if acceptance.get("required") and not acceptance.get("accepted"):
+        return
+    expected_receipt = long_generation.plan_receipt(
+        settings.data_dir / cid, meta
+    )
+    if expected_receipt is None:
+        return
+    try:
+        aspect_ratio, resolution = _generation_semantics(meta)
+        fit_mode = (
+            "crop"
+            if _long_fit_required(settings.data_dir / cid, meta, settings)
+            else "none"
+        )
+        dialogue_mode = (
+            meta.get("dialogue_mode")
+            if meta.get("dialogue_mode") in {"auto", "none"}
+            else "auto"
+        )
+        requested_delivery = "auto"
+        authoritative_dialogue = tuple(
+            dict(line)
+            for segment in meta.get("segments", [])
+            if isinstance(segment, Mapping)
+            for line in segment.get("dialogue", [])
+            if isinstance(line, Mapping)
+        )
+        resolved_delivery = dialogue_delivery.resolve(
+            dialogue_delivery.parse(requested_delivery),
+            authoritative_dialogue,
+        ).value
+    except (_SubmitError, ValueError):
+        return
+    request_id = f"auto-{cid}"
+    claimed = storage.claim_submission_input(
+        settings.data_dir, cid, request_id
+    )
+    if claimed is None:
+        return
+    owner = {**claimed["_input_owner"], "fast_mode": False}
+    accepted = storage.update_meta(
+        settings.data_dir,
+        cid,
+        _input_owner=owner,
+        dialogue_mode=dialogue_mode,
+        dialogue_delivery=requested_delivery,
+        resolved_dialogue_delivery=resolved_delivery,
+        fit_mode=fit_mode,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+    )
+    if accepted is None:
+        return
+    try:
+        long_generation.finalize_multimodal_plan(
+            settings.data_dir / cid,
+            accepted,
+            expected_receipt,
+            fit_mode,
+            dialogue_mode,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            dialogue_delivery=requested_delivery,
+            settings=settings,
+        )
+    except long_generation.LongGenerationError as exc:
+        if exc.code not in {
+            "prompt_fusion_refresh_required",
+            "prompt_fusion_failed",
+        }:
+            return
+    except Exception:
+        return
+    _produce_prompt_fusion_and_continue(settings, cid, runner, owner)
 
 
 def _operation_stage(meta: Mapping, override: str | None = None) -> str:
@@ -2757,19 +3055,129 @@ def create_app(settings: Settings) -> FastAPI:
     mediakit_sem = asyncio.Semaphore(settings.mediakit_concurrency)
     seedream_sem = asyncio.Semaphore(settings.seedream_concurrency)
     app.state.h3_resume_threads = []
+    app.state.prompt_fusion_recovery_threads = []
     app.state.postprocess_recovery_tasks = []
+    app.state.operation_recovery_tasks = []
+
+    async def advance_v4_operation(cid: str) -> None:
+        """Ensure the accepted A keeps advancing on the one existing CID."""
+        meta = storage.load_meta(settings.data_dir, cid)
+        if (
+            meta is None
+            or meta.get("schema_version") != 2
+            or meta.get("status") != "done"
+            or isinstance(meta.get("generation"), Mapping)
+        ):
+            return
+        post = meta.get("postprocess")
+        should_run = False
+        if not isinstance(post, Mapping):
+            if not os.environ.get("ARK_API_KEY", "").strip():
+                return
+            try:
+                await postprocess.start(
+                    settings,
+                    cid,
+                    {
+                        "confirm": True,
+                        "options": {
+                            "remove_subtitle": False,
+                            "remove_brand": False,
+                            "optimize_image": True,
+                        },
+                    },
+                    postprocess_locks,
+                )
+            except postprocess.PostprocessError:
+                return
+            should_run = True
+        elif post.get("status") == "running":
+            should_run = True
+        elif post.get("status") == "failed":
+            failed = next(
+                (
+                    item for item in post.get("segments", [])
+                    if isinstance(item, Mapping)
+                    and item.get("status") == "failed"
+                    and item.get("error") == "provider_rejected"
+                ),
+                None,
+            )
+            if failed is None:
+                return
+            try:
+                await postprocess.retry_segment(
+                    settings,
+                    cid,
+                    int(failed["index"]),
+                    {
+                        "confirm": True,
+                        "expected_revision": failed["revision"],
+                    },
+                    postprocess_locks,
+                )
+            except (postprocess.PostprocessError, KeyError, TypeError, ValueError):
+                return
+            should_run = True
+        if should_run:
+            await postprocess.run_task(
+                settings,
+                cid,
+                mediakit_sem,
+                seedream_sem,
+                audit_runner=codex_runner,
+                verification_runner=codex_runner,
+            )
+        meta = storage.load_meta(settings.data_dir, cid)
+        post = meta.get("postprocess") if isinstance(meta, Mapping) else None
+        if not isinstance(post, Mapping) or post.get("status") != "done":
+            return
+        acceptance = postprocess.image_acceptance_status(settings, cid, meta)
+        if acceptance.get("required") and not acceptance.get("accepted"):
+            expected = acceptance.get("expected_meta_sha256")
+            if not isinstance(expected, str):
+                return
+            try:
+                await asyncio.to_thread(
+                    postprocess.accept_images,
+                    settings,
+                    cid,
+                    {"confirm": True, "expected_meta_sha256": expected},
+                )
+            except postprocess.PostprocessError:
+                return
+        await asyncio.to_thread(
+            _start_automatic_v4_generation,
+            settings,
+            cid,
+            codex_runner,
+        )
 
     @app.on_event("startup")
     async def resume_postprocessing() -> None:
-        for cid in postprocess.recover_running(settings):
+        recovering = set(postprocess.recover_running(settings))
+        for cid in recovering:
             task = asyncio.create_task(
-                postprocess.run_task(
-                    settings, cid, mediakit_sem, seedream_sem,
-                    audit_runner=codex_runner, verification_runner=codex_runner,
-                ),
+                advance_v4_operation(cid),
                 name=f"postprocess-recover-{cid[:8]}",
             )
             app.state.postprocess_recovery_tasks.append(task)
+        for meta in storage.list_conversations(settings.data_dir):
+            cid = meta.get("id")
+            if (
+                not isinstance(cid, str)
+                or cid in recovering
+                or meta.get("schema_version") != 2
+                or meta.get("status") != "done"
+                or isinstance(meta.get("generation"), Mapping)
+                or isinstance(meta.get("_input_owner"), Mapping)
+            ):
+                continue
+            task = asyncio.create_task(
+                advance_v4_operation(cid),
+                name=f"operation-recover-{cid[:8]}",
+            )
+            app.state.operation_recovery_tasks.append(task)
 
     @app.on_event("startup")
     async def resume_h3_generations() -> None:
@@ -2812,16 +3220,40 @@ def create_app(settings: Settings) -> FastAPI:
                 pipeline.run(
                     settings, cid, codex_runner, claimed_owner=claimed_owner
                 )
+        asyncio.run(advance_v4_operation(cid))
 
     @app.on_event("startup")
     async def recover_pipeline_inputs() -> None:
+        def start_prompt_fusion_continuation(
+            cid: str, owner: object,
+        ) -> None:
+            thread = threading.Thread(
+                target=_produce_prompt_fusion_and_continue,
+                args=(settings, cid, codex_runner, owner),
+                daemon=True,
+                name=f"prompt-fusion-recover-{cid[:8]}",
+            )
+            app.state.prompt_fusion_recovery_threads.append(thread)
+            thread.start()
+
         for cid, owner in storage.claim_stale_input_reconciliations(
             settings.data_dir
         ):
             if owner["kind"] == "pipeline":
                 pipeline.reconcile_stale_pipeline(settings, cid, owner)
             else:
-                _reconcile_stale_submission(settings, cid, owner)
+                meta = storage.load_submission_claim(
+                    settings.data_dir, cid, owner
+                )
+                if (
+                    isinstance(meta, Mapping)
+                    and _prompt_fusion_continuation_claim(meta, owner)
+                ):
+                    start_prompt_fusion_continuation(cid, owner)
+                else:
+                    _reconcile_stale_submission(settings, cid, owner)
+        for cid, owner in _claim_stale_prompt_fusion_continuations(settings):
+            start_prompt_fusion_continuation(cid, owner)
         if not settings.enable_pipeline:
             return
         for cid, owner in storage.claim_stale_pipeline_inputs(settings.data_dir):
@@ -3415,6 +3847,25 @@ def create_app(settings: Settings) -> FastAPI:
                         content=content,
                         background=background_tasks,
                     )
+                continuation_owner = meta.get("_input_owner")
+                if _prompt_fusion_continuation_claim(
+                    meta, continuation_owner
+                ):
+                    background_tasks.add_task(
+                        _produce_prompt_fusion_and_continue,
+                        settings,
+                        cid,
+                        codex_runner,
+                        continuation_owner,
+                    )
+                    status_code, content = _operation_view(
+                        settings, cid, meta, stage="prompt_fusion"
+                    )
+                    return JSONResponse(
+                        status_code=status_code,
+                        content=content,
+                        background=background_tasks,
+                    )
                 post_state = meta.get("postprocess")
                 if isinstance(post_state, dict) and post_state.get("status") != "done":
                     status_code, content = _operation_view(
@@ -3426,6 +3877,32 @@ def create_app(settings: Settings) -> FastAPI:
                 old = meta.get("generation")
                 previous_status = old.get("status") if isinstance(old, dict) else None
                 previous_id = old.get("client_request_id") if isinstance(old, dict) else None
+                claim_owner = None
+                if (
+                    not isinstance(old, dict)
+                    and _is_current_v4_segment_project(meta)
+                ):
+                    meta, claimed_owner = _claim_first_submission(
+                        settings, cid, request_id
+                    )
+                    claim_owner = {
+                        **claimed_owner,
+                        "fast_mode": fast_mode,
+                    }
+                    accepted = storage.update_meta(
+                        settings.data_dir,
+                        cid,
+                        _input_owner=claim_owner,
+                        dialogue_mode=dialogue_mode,
+                        dialogue_delivery=requested_dialogue_delivery,
+                        resolved_dialogue_delivery=resolved_dialogue_delivery,
+                        fit_mode=fit_mode,
+                        aspect_ratio=aspect_ratio,
+                        resolution=resolution,
+                    )
+                    if accepted is None:
+                        raise HTTPException(status_code=404, detail="not found")
+                    meta = accepted
                 if not isinstance(old, dict):
                     legacy_multimodal_promotion = not _is_current_v4_segment_project(
                         meta
@@ -3444,7 +3921,10 @@ def create_app(settings: Settings) -> FastAPI:
                             settings=settings,
                         )
                     except long_generation.LongGenerationError as exc:
-                        if exc.code == "prompt_fusion_refresh_required":
+                        if exc.code in {
+                            "prompt_fusion_refresh_required",
+                            "prompt_fusion_failed",
+                        }:
                             refreshed = storage.load_meta(settings.data_dir, cid)
                             fusion_state = (
                                 refreshed.get("_prompt_fusion")
@@ -3452,13 +3932,14 @@ def create_app(settings: Settings) -> FastAPI:
                             )
                             if (
                                 isinstance(fusion_state, Mapping)
-                                and fusion_state.get("status") == "queued"
+                                and claim_owner is not None
                             ):
                                 background_tasks.add_task(
-                                    pipeline.produce_prompt_fusion,
+                                    _produce_prompt_fusion_and_continue,
                                     settings,
                                     cid,
                                     codex_runner,
+                                    claim_owner,
                                 )
                             # Persist the one accepted submit intent. A later
                             # coordinator continuation must consume these
@@ -3485,6 +3966,10 @@ def create_app(settings: Settings) -> FastAPI:
                                 content=content,
                                 background=background_tasks,
                             )
+                        if claim_owner:
+                            _finish_submission_claim(
+                                settings, cid, claim_owner
+                            )
                         if single_operation and exc.status == 409:
                             status_code, content = _operation_view(
                                 settings, cid, meta, stage="plan"
@@ -3495,6 +3980,12 @@ def create_app(settings: Settings) -> FastAPI:
                         raise HTTPException(
                             status_code=exc.status, detail=exc.code
                         ) from exc
+                    except BaseException:
+                        if claim_owner:
+                            _finish_submission_claim(
+                                settings, cid, claim_owner
+                            )
+                        raise
                     if promoted_receipt is not None:
                         updated = storage.update_meta(
                             settings.data_dir,
@@ -3614,8 +4105,7 @@ def create_app(settings: Settings) -> FastAPI:
                         raise HTTPException(status_code=409, detail="already submitted")
                 if previous_status == "failed" and not same_parameters:
                     raise HTTPException(status_code=409, detail="resume_parameters_changed")
-                claim_owner = None
-                if not isinstance(old, dict):
+                if not isinstance(old, dict) and claim_owner is None:
                     meta, claim_owner = _claim_first_submission(
                         settings, cid, request_id
                     )

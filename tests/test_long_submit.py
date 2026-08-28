@@ -14,7 +14,16 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from app import h3, long_generation, long_video, pipeline, prepared_input, stitch, storage
+from app import (
+    h3,
+    long_generation,
+    long_video,
+    pipeline,
+    postprocess,
+    prepared_input,
+    stitch,
+    storage,
+)
 from app import main as main_module
 from app.main import (
     _SubmitError,
@@ -1317,8 +1326,13 @@ def test_prompt_fusion_refresh_is_one_202_operation_without_second_submit_job(
     )
     fusion_calls = []
     coordinator_calls = []
+    finalize_calls = []
+    frozen_plan = object()
 
     def finalize(*_args, **_kwargs):
+        finalize_calls.append(True)
+        if len(finalize_calls) > 1:
+            return "c" * 64
         storage.update_meta(
             settings.data_dir,
             cid,
@@ -1351,6 +1365,25 @@ def test_prompt_fusion_refresh_is_one_202_operation_without_second_submit_job(
     monkeypatch.setattr(pipeline, "produce_prompt_fusion", produce)
     monkeypatch.setattr(
         long_generation,
+        "freeze_plan",
+        lambda *_args, **_kwargs: frozen_plan,
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "initial_generation",
+        lambda _settings, _cid, plan, request_id, attempt, _old,
+        *, fast_mode=False: {
+            "status": "queued",
+            "error": None,
+            "attempt": attempt,
+            "client_request_id": request_id,
+            "stage": "h3",
+            "fast_mode": fast_mode,
+            "segments": [],
+        } if plan is frozen_plan else pytest.fail("wrong frozen plan"),
+    )
+    monkeypatch.setattr(
+        long_generation,
         "run",
         lambda *_args, **_kwargs: coordinator_calls.append(True),
     )
@@ -1359,25 +1392,287 @@ def test_prompt_fusion_refresh_is_one_202_operation_without_second_submit_job(
     first = client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
     )
+    stored_after_first = storage.load_meta(settings.data_dir, cid)
     replay = client.post(
         f"/api/conversations/{cid}/submit",
         headers=AUTH,
         json={**payload, "client_request_id": "different-request-456"},
     )
 
-    expected = {
+    accepted = {
         "operation_id": cid,
         "status": "running",
         "stage": "prompt_fusion",
     }
     assert first.status_code == 202, first.json()
     assert replay.status_code == 202, replay.json()
-    assert first.json() == replay.json() == expected
+    assert first.json() == accepted
+    assert replay.json() == {
+        "operation_id": cid,
+        "status": "running",
+        "stage": "h3",
+        "attempt": 1,
+    }
     assert fusion_calls == [cid]
-    # Explicit main-only seam: Fusion completion must be consumed by the
-    # durable coordinator; HTTP replay must neither create H3 work nor become
-    # the continuation mechanism.
-    assert coordinator_calls == []
+    assert finalize_calls == [True, True]
+    assert coordinator_calls == [True]
+    assert stored_after_first["_input_owner"] is None
+    assert stored_after_first["frozen_plan_receipt"] == "c" * 64
+    assert stored_after_first["generation"]["client_request_id"] == (
+        payload["client_request_id"]
+    )
+
+
+def test_startup_continues_done_fusion_claim_into_same_generation(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    cid, _receipt = _make_long(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={"status": "done", "segments": []},
+        _postprocess_receipt={
+            "version": 4,
+            "options": {
+                "remove_subtitle": False,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+        },
+    )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    claimed = storage.claim_submission_input(
+        settings.data_dir, cid, "durable-request-123"
+    )
+    assert claimed is not None
+    owner = {**claimed["_input_owner"], "fast_mode": False}
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _input_owner=owner,
+        _prompt_fusion={
+            "version": long_generation.PROMPT_FUSION_VERSION,
+            "status": "done",
+            "error": None,
+            "input_sha256": "a" * 64,
+            "image_acceptance_sha256": "b" * 64,
+            "manifest_sha256": "d" * 64,
+        },
+        dialogue_mode="auto",
+        dialogue_delivery="auto",
+        resolved_dialogue_delivery="off_screen",
+        fit_mode="none",
+        aspect_ratio="9:16",
+        resolution="768p",
+    )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+
+    frozen_plan = object()
+    coordinator_calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "produce_prompt_fusion",
+        lambda *_args, **_kwargs: pytest.fail("done Fusion must be reused"),
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "finalize_multimodal_plan",
+        lambda *_args, **_kwargs: "c" * 64,
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "freeze_plan",
+        lambda *_args, **_kwargs: frozen_plan,
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "initial_generation",
+        lambda _settings, _cid, plan, request_id, attempt, _old,
+        *, fast_mode=False: {
+            "status": "queued",
+            "error": None,
+            "attempt": attempt,
+            "client_request_id": request_id,
+            "stage": "h3",
+            "fast_mode": fast_mode,
+            "segments": [],
+        } if plan is frozen_plan else pytest.fail("wrong frozen plan"),
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "run",
+        lambda *_args, **_kwargs: coordinator_calls.append(True),
+    )
+
+    with TestClient(create_app(settings)) as client:
+        for thread in client.app.state.prompt_fusion_recovery_threads:
+            thread.join(timeout=5)
+
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert recovered["_input_owner"] is None
+    assert recovered["frozen_plan_receipt"] == "c" * 64
+    assert recovered["generation"]["client_request_id"] == (
+        "durable-request-123"
+    )
+    assert coordinator_calls == [True]
+
+
+def test_startup_starts_only_pristine_durable_v4_generation(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    cid, receipt = _make_long(settings)
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "durable-request-123", 1
+    )
+    assert all(
+        item["status"] == "not_started"
+        and item["child_request_id"] is None
+        for item in generation["segments"]
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _postprocess_receipt={
+            "version": 4,
+            "options": {
+                "remove_subtitle": False,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+        },
+        dialogue_mode="auto",
+        dialogue_delivery="auto",
+        fit_mode="none",
+        aspect_ratio=plan.aspect_ratio,
+        resolution=plan.resolution,
+        frozen_plan_receipt=receipt,
+        generation=generation,
+    )
+    calls = []
+    monkeypatch.setattr(
+        long_generation, "freeze_plan", lambda *_args, **_kwargs: plan
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "run",
+        lambda *_args, **kwargs: calls.append(kwargs.get("startup")),
+    )
+
+    _resume_long_generation(settings, cid)
+
+    assert calls == [False]
+
+
+def test_technical_acceptance_auto_claim_reaches_fusion_and_h3_once(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    cid, _receipt = _make_long(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={"status": "done", "segments": []},
+        _postprocess_receipt={
+            "version": 4,
+            "options": {
+                "remove_subtitle": False,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        postprocess,
+        "image_acceptance_status",
+        lambda *_args, **_kwargs: {
+            "required": True,
+            "accepted": True,
+            "expected_meta_sha256": "a" * 64,
+        },
+    )
+    finalize_calls = []
+
+    def finalize(*_args, **_kwargs):
+        finalize_calls.append(True)
+        if len(finalize_calls) > 1:
+            return "c" * 64
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            _prompt_fusion={
+                "version": long_generation.PROMPT_FUSION_VERSION,
+                "status": "queued",
+                "error": None,
+                "input_sha256": "a" * 64,
+                "image_acceptance_sha256": "b" * 64,
+                "manifest_sha256": None,
+            },
+        )
+        raise long_generation.LongGenerationError(
+            "prompt_fusion_refresh_required"
+        )
+
+    def produce(_settings, _cid, _runner):
+        current = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            _prompt_fusion={**current, "status": "done"},
+        )
+        return "done"
+
+    frozen_plan = object()
+    coordinator_calls = []
+    monkeypatch.setattr(
+        long_generation, "finalize_multimodal_plan", finalize
+    )
+    monkeypatch.setattr(pipeline, "produce_prompt_fusion", produce)
+    monkeypatch.setattr(
+        long_generation,
+        "freeze_plan",
+        lambda *_args, **_kwargs: frozen_plan,
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "initial_generation",
+        lambda _settings, _cid, plan, request_id, attempt, _old,
+        *, fast_mode=False: {
+            "status": "queued",
+            "error": None,
+            "attempt": attempt,
+            "client_request_id": request_id,
+            "stage": "h3",
+            "fast_mode": fast_mode,
+            "segments": [],
+        } if plan is frozen_plan else pytest.fail("wrong frozen plan"),
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "run",
+        lambda *_args, **_kwargs: coordinator_calls.append(True),
+    )
+
+    main_module._start_automatic_v4_generation(
+        settings, cid, object()
+    )
+
+    stored = storage.load_meta(settings.data_dir, cid)
+    assert stored["_input_owner"] is None
+    assert stored["generation"]["client_request_id"] == f"auto-{cid}"
+    assert finalize_calls == [True, True]
+    assert coordinator_calls == [True]
 
 
 def test_current_operation_replay_ignores_new_id_and_never_reposts_unknown(

@@ -891,15 +891,10 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             assert context_requests == []
             assert h3_requests == []
             return
-        assert first.status_code == 409, first.json()
-        assert first.json() == {"detail": "prompt_fusion_refresh_required"}
-        assert h3_requests == []
-        second = client.post(
-            f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
-        )
-        final_submit = second
+        assert first.status_code == 202, first.json()
+        final_submit = first
         if context_semantic_recovery:
-            assert second.status_code == 202, second.json()
+            assert first.status_code == 202, first.json()
             assert h3_requests == []
             failed_meta = storage.load_meta(settings.data_dir, cid)
             failed_generation = failed_meta["generation"]
@@ -1628,6 +1623,101 @@ def _file_snapshot(root: Path) -> dict[str, bytes]:
 
 
 # ---------- 门控矩阵 ----------
+
+def test_upload_pipeline_done_auto_advances_postprocess_acceptance_and_generation(
+    tmp_path, video_1s, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_pipeline=True)
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    events = []
+
+    def run_pipeline(_settings, cid, _runner, *, claimed_owner=None):
+        assert claimed_owner is None
+        events.append(("pipeline", cid))
+        storage.update_meta(
+            settings.data_dir, cid, status="done", error=None,
+        )
+
+    async def start_postprocess(_settings, cid, payload, _locks):
+        events.append(("postprocess_start", cid, payload))
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            postprocess={
+                "status": "running",
+                "error": None,
+                "options": payload["options"],
+                "segments": [],
+                "frames": [],
+            },
+        )
+
+    async def run_postprocess(_settings, cid, *_args, **_kwargs):
+        events.append(("postprocess_done", cid))
+        current = storage.load_meta(settings.data_dir, cid)["postprocess"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            postprocess={**current, "status": "done"},
+        )
+
+    def acceptance_status(_settings, cid, meta):
+        return {
+            "required": True,
+            "accepted": meta.get("test_technical_acceptance") is True,
+            "expected_meta_sha256": "a" * 64,
+        }
+
+    def accept(_settings, cid, payload):
+        events.append(("technical_acceptance", cid, payload))
+        storage.update_meta(
+            settings.data_dir, cid, test_technical_acceptance=True,
+        )
+        return acceptance_status(
+            settings, cid, storage.load_meta(settings.data_dir, cid)
+        )
+
+    def generate(_settings, cid, _runner):
+        events.append(("generation", cid))
+
+    monkeypatch.setattr(pipeline, "run", run_pipeline)
+    monkeypatch.setattr(postprocess, "start", start_postprocess)
+    monkeypatch.setattr(postprocess, "run_task", run_postprocess)
+    monkeypatch.setattr(
+        postprocess, "image_acceptance_status", acceptance_status
+    )
+    monkeypatch.setattr(postprocess, "accept_images", accept)
+    monkeypatch.setattr(
+        main_module, "_start_automatic_v4_generation", generate
+    )
+
+    with TestClient(create_app(settings)) as client:
+        with video_1s.open("rb") as source:
+            response = client.post(
+                "/api/conversations",
+                headers=AUTH,
+                files={"file": ("clip.mp4", source, "video/mp4")},
+            )
+
+    assert response.status_code == 201, response.json()
+    cid = response.json()["id"]
+    assert [event[0] for event in events] == [
+        "pipeline",
+        "postprocess_start",
+        "postprocess_done",
+        "technical_acceptance",
+        "generation",
+    ]
+    assert all(event[1] == cid for event in events)
+    assert events[1][2] == {
+        "confirm": True,
+        "options": {
+            "remove_subtitle": False,
+            "remove_brand": False,
+            "optimize_image": True,
+        },
+    }
+
 
 def test_requires_auth(client, video_1s):
     with open(video_1s, "rb") as f:
