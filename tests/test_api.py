@@ -63,6 +63,7 @@ def test_detail_shape_has_no_context_ir_contract(client, video_1s):
         "dialogue", "receipt_version", "generation", "has_source", "has_video",
         "navigation_status", "submit_enabled", "postprocess", "postprocess_enabled",
         "postprocess_capabilities", "image_optimization_prompt",
+        "image_acceptance",
     }
     assert body["generation"] is None
     assert body["has_source"] is True

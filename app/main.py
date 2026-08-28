@@ -2559,6 +2559,102 @@ def _resume_long_generation(settings: Settings, cid: str) -> None:
     long_generation.run(settings, cid, plan, startup=True)
 
 
+def _operation_stage(meta: Mapping, override: str | None = None) -> str:
+    """Project one accepted conversation onto the single public operation."""
+    if override is not None:
+        return override
+    generation = meta.get("generation")
+    if isinstance(generation, Mapping):
+        stage = generation.get("stage")
+        return stage if isinstance(stage, str) and stage else "generation"
+    fusion = meta.get("_prompt_fusion")
+    if isinstance(fusion, Mapping):
+        return "prompt_fusion"
+    post = meta.get("postprocess")
+    if isinstance(post, Mapping) and post.get("status") != "done":
+        return "postprocess"
+    return "analysis" if meta.get("status") != "done" else "generation"
+
+
+def _uses_single_operation_contract(meta: Mapping) -> bool:
+    """Limit the rollout to the current v4 chain and its frozen Fusion seam."""
+    return _is_current_v4_segment_project(meta) or isinstance(
+        meta.get("_prompt_fusion"), Mapping
+    )
+
+
+def _operation_view(
+    settings: Settings,
+    cid: str,
+    meta: Mapping,
+    *,
+    stage: str | None = None,
+) -> tuple[int, dict[str, object]]:
+    """Return the only public terminal: a receipt-bound B, otherwise running."""
+    generation = meta.get("generation")
+    succeeded = (
+        isinstance(generation, dict)
+        and _effective_generation_status(generation) == "succeeded"
+        and _has_valid_generated_video(settings, dict(meta))
+    )
+    body: dict[str, object] = {
+        "operation_id": cid,
+        "status": "succeeded" if succeeded else "running",
+        "stage": "commit_b" if succeeded else _operation_stage(meta, stage),
+    }
+    attempt = generation.get("attempt") if isinstance(generation, Mapping) else None
+    if isinstance(attempt, int) and not isinstance(attempt, bool):
+        body["attempt"] = attempt
+    return (200 if succeeded else 202), body
+
+
+def _ensure_existing_generation(
+    settings: Settings,
+    cid: str,
+    meta: dict,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """Ensure one frozen operation is scheduled without creating a new attempt.
+
+    Ambiguous submissions deliberately remain untouched.  The current H3
+    recovery functions are GET-only for an existing attempt; provider-declared
+    failures may use their receipt-proven automatic retry path.
+    """
+    generation = meta.get("generation")
+    if not isinstance(generation, dict):
+        return meta
+    status = _effective_generation_status(generation)
+    has_output = _has_valid_generated_video(settings, meta)
+    recoverable = (
+        status == "resume_required"
+        or _short_provider_failure_is_recoverable(generation)
+        or _long_provider_failure_is_recoverable(generation)
+        or (
+            status == "failed"
+            and generation.get("stage") == "stitch"
+        )
+        or (status == "succeeded" and not has_output)
+    )
+    if not recoverable:
+        # queued/running already owns a worker. submission_unknown must not be
+        # converted into a new POST, and quality failures await the single
+        # code-constructed continuation rather than a quality-driven retry.
+        return meta
+    queued = {**generation, "status": "queued", "error": None}
+    updated = storage.update_meta(
+        settings.data_dir, cid, generation=queued
+    )
+    if updated is None:
+        return meta
+    target = (
+        _resume_long_generation
+        if isinstance(queued.get("segments"), list)
+        else _resume_generation
+    )
+    background_tasks.add_task(target, settings, cid)
+    return updated
+
+
 def _reconcile_stale_submission(settings: Settings, cid: str, owner: object) -> None:
     """Release a half-frozen first submit without creating paid generation evidence."""
     meta = storage.load_submission_claim(settings.data_dir, cid, owner)
@@ -2980,22 +3076,52 @@ def create_app(settings: Settings) -> FastAPI:
         "/api/conversations/{cid}/image-acceptance",
         dependencies=[Depends(require_auth)],
     )
-    async def accept_conversation_images(cid: str, payload: dict):
+    async def accept_conversation_images(
+        cid: str, payload: dict, background_tasks: BackgroundTasks
+    ):
+        meta = storage.load_meta(settings.data_dir, cid)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="not found")
+        if _is_read_only(meta):
+            raise HTTPException(status_code=409, detail="read_only")
+        single_operation = _uses_single_operation_contract(meta)
+        if single_operation and isinstance(meta.get("generation"), dict):
+            meta = _ensure_existing_generation(
+                settings, cid, meta, background_tasks
+            )
+            status_code, content = _operation_view(settings, cid, meta)
+            return JSONResponse(
+                status_code=status_code,
+                content=content,
+                background=background_tasks,
+            )
         try:
             image_acceptance = await asyncio.to_thread(
                 postprocess.accept_images, settings, cid, payload
             )
         except postprocess.PostprocessError as exc:
+            if single_operation and exc.status == 409:
+                status_code, content = _operation_view(
+                    settings, cid, meta, stage="postprocess"
+                )
+                return JSONResponse(
+                    status_code=status_code, content=content
+                )
             raise HTTPException(
                 status_code=exc.status, detail=exc.detail
             ) from exc
-        return {
-            "required": image_acceptance.get("required"),
-            "accepted": image_acceptance.get("accepted"),
-            "expected_meta_sha256": image_acceptance.get(
-                "expected_meta_sha256"
-            ),
-        }
+        if not single_operation:
+            return {
+                "required": image_acceptance.get("required"),
+                "accepted": image_acceptance.get("accepted"),
+                "expected_meta_sha256": image_acceptance.get(
+                    "expected_meta_sha256"
+                ),
+            }
+        status_code, content = _operation_view(
+            settings, cid, meta, stage="postprocess"
+        )
+        return JSONResponse(status_code=status_code, content=content)
 
     @app.patch(
         "/api/conversations/{cid}/image-optimization-prompt",
@@ -3131,6 +3257,55 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail="not found")
         if _is_read_only(meta):
             raise HTTPException(status_code=409, detail="read_only")
+        single_operation = _uses_single_operation_contract(meta)
+        if single_operation and isinstance(meta.get("generation"), dict):
+            # A conversation owns exactly one generation operation. Replays
+            # never reinterpret a new request id or mutable payload as a new
+            # job; they only ensure the frozen operation is scheduled.
+            meta = _ensure_existing_generation(
+                settings, cid, meta, background_tasks
+            )
+            status_code, content = _operation_view(settings, cid, meta)
+            return JSONResponse(
+                status_code=status_code,
+                content=content,
+                background=background_tasks,
+            )
+        fusion = meta.get("_prompt_fusion")
+        if isinstance(fusion, Mapping):
+            if fusion.get("status") == "queued":
+                background_tasks.add_task(
+                    pipeline.produce_prompt_fusion,
+                    settings,
+                    cid,
+                    codex_runner,
+                )
+            # Main cannot safely synthesize the generation after Fusion: that
+            # continuation belongs to the durable coordinator. Keep the same
+            # operation running instead of requiring a second submit.
+            status_code, content = _operation_view(
+                settings, cid, meta, stage="prompt_fusion"
+            )
+            return JSONResponse(
+                status_code=status_code,
+                content=content,
+                background=background_tasks,
+            )
+        if single_operation and meta.get("status") != "done":
+            status_code, content = _operation_view(
+                settings, cid, meta, stage="analysis"
+            )
+            return JSONResponse(status_code=status_code, content=content)
+        post_state = meta.get("postprocess")
+        if (
+            single_operation
+            and isinstance(post_state, dict)
+            and post_state.get("status") != "done"
+        ):
+            status_code, content = _operation_view(
+                settings, cid, meta, stage="postprocess"
+            )
+            return JSONResponse(status_code=status_code, content=content)
         if _uses_segment_coordinator(meta) and not isinstance(
             meta.get("segments"), list
         ):
@@ -3142,6 +3317,13 @@ def create_app(settings: Settings) -> FastAPI:
                     meta,
                 )
             except long_generation.LongGenerationError as exc:
+                if single_operation and exc.status == 409:
+                    status_code, content = _operation_view(
+                        settings, cid, meta, stage="plan"
+                    )
+                    return JSONResponse(
+                        status_code=status_code, content=content
+                    )
                 raise HTTPException(
                     status_code=exc.status, detail=exc.code
                 ) from exc
@@ -3205,15 +3387,42 @@ def create_app(settings: Settings) -> FastAPI:
                     detail=_duration_limit_detail(float(meta["duration_s"])),
                 )
             if not _credentials_ready(settings):
+                if single_operation:
+                    status_code, content = _operation_view(
+                        settings, cid, meta, stage="generation"
+                    )
+                    return JSONResponse(
+                        status_code=status_code, content=content
+                    )
                 raise HTTPException(status_code=503, detail="h3_credentials_missing")
             lock = submit_locks.setdefault(cid, asyncio.Lock())
             async with lock:
                 meta = storage.load_meta(settings.data_dir, cid)
                 if meta is None:
                     raise HTTPException(status_code=404, detail="not found")
+                if (
+                    _uses_single_operation_contract(meta)
+                    and isinstance(meta.get("generation"), dict)
+                ):
+                    meta = _ensure_existing_generation(
+                        settings, cid, meta, background_tasks
+                    )
+                    status_code, content = _operation_view(
+                        settings, cid, meta
+                    )
+                    return JSONResponse(
+                        status_code=status_code,
+                        content=content,
+                        background=background_tasks,
+                    )
                 post_state = meta.get("postprocess")
                 if isinstance(post_state, dict) and post_state.get("status") != "done":
-                    raise HTTPException(status_code=409, detail="postprocess_not_ready")
+                    status_code, content = _operation_view(
+                        settings, cid, meta, stage="postprocess"
+                    )
+                    return JSONResponse(
+                        status_code=status_code, content=content
+                    )
                 old = meta.get("generation")
                 previous_status = old.get("status") if isinstance(old, dict) else None
                 previous_id = old.get("client_request_id") if isinstance(old, dict) else None
@@ -3251,10 +3460,37 @@ def create_app(settings: Settings) -> FastAPI:
                                     cid,
                                     codex_runner,
                                 )
+                            # Persist the one accepted submit intent. A later
+                            # coordinator continuation must consume these
+                            # frozen values; a second HTTP submit is never a
+                            # source of alternate parameters.
+                            refreshed = storage.update_meta(
+                                settings.data_dir,
+                                cid,
+                                dialogue_mode=dialogue_mode,
+                                dialogue_delivery=requested_dialogue_delivery,
+                                resolved_dialogue_delivery=resolved_dialogue_delivery,
+                                fit_mode=fit_mode,
+                                aspect_ratio=aspect_ratio,
+                                resolution=resolution,
+                            ) or refreshed or meta
+                            status_code, content = _operation_view(
+                                settings,
+                                cid,
+                                refreshed,
+                                stage="prompt_fusion",
+                            )
                             return JSONResponse(
-                                status_code=exc.status,
-                                content={"detail": exc.code},
+                                status_code=status_code,
+                                content=content,
                                 background=background_tasks,
+                            )
+                        if single_operation and exc.status == 409:
+                            status_code, content = _operation_view(
+                                settings, cid, meta, stage="plan"
+                            )
+                            return JSONResponse(
+                                status_code=status_code, content=content
                             )
                         raise HTTPException(
                             status_code=exc.status, detail=exc.code
@@ -3275,6 +3511,13 @@ def create_app(settings: Settings) -> FastAPI:
                         meta = updated
                         expected_receipt = promoted_receipt
                         if legacy_multimodal_promotion:
+                            if single_operation:
+                                status_code, content = _operation_view(
+                                    settings, cid, meta, stage="plan"
+                                )
+                                return JSONResponse(
+                                    status_code=status_code, content=content
+                                )
                             raise HTTPException(
                                 status_code=409,
                                 detail={
@@ -3421,6 +3664,13 @@ def create_app(settings: Settings) -> FastAPI:
                 ):
                     if claim_owner:
                         _finish_submission_claim(settings, cid, claim_owner)
+                    if single_operation:
+                        status_code, content = _operation_view(
+                            settings, cid, meta, stage="prompt_fusion"
+                        )
+                        return JSONResponse(
+                            status_code=status_code, content=content
+                        )
                     raise HTTPException(
                         status_code=409,
                         detail="prompt_fusion_v2_refresh_required",
@@ -3530,6 +3780,16 @@ def create_app(settings: Settings) -> FastAPI:
                 else:
                     storage.update_meta(settings.data_dir, cid, **changes)
                 background_tasks.add_task(long_generation.run, settings, cid, plan)
+            if single_operation:
+                operation_meta = storage.load_meta(settings.data_dir, cid) or meta
+                status_code, content = _operation_view(
+                    settings, cid, operation_meta
+                )
+                return JSONResponse(
+                    status_code=status_code,
+                    content=content,
+                    background=background_tasks,
+                )
             return {"status": "queued", "attempt": attempt}
         try:
             (
@@ -3563,9 +3823,27 @@ def create_app(settings: Settings) -> FastAPI:
             meta = storage.load_meta(settings.data_dir, cid)
             if meta is None:
                 raise HTTPException(status_code=404, detail="not found")
+            if (
+                _uses_single_operation_contract(meta)
+                and isinstance(meta.get("generation"), dict)
+            ):
+                meta = _ensure_existing_generation(
+                    settings, cid, meta, background_tasks
+                )
+                status_code, content = _operation_view(settings, cid, meta)
+                return JSONResponse(
+                    status_code=status_code,
+                    content=content,
+                    background=background_tasks,
+                )
             post_state = meta.get("postprocess")
             if isinstance(post_state, dict) and post_state.get("status") != "done":
-                raise HTTPException(status_code=409, detail="postprocess_not_ready")
+                status_code, content = _operation_view(
+                    settings, cid, meta, stage="postprocess"
+                )
+                return JSONResponse(
+                    status_code=status_code, content=content
+                )
             generation = meta.get("generation")
             if (
                 (settings.data_dir / cid / "generated.mp4").is_file()
@@ -4125,26 +4403,137 @@ def create_app(settings: Settings) -> FastAPI:
             background_tasks.add_task(_run_generation, settings, cid, request, action)
         return {"status": "queued", "attempt": attempt}
 
-    @app.post("/api/conversations/{cid}/postprocess", dependencies=[Depends(require_auth)])
+    @app.post(
+        "/api/conversations/{cid}/postprocess",
+        dependencies=[Depends(require_auth)],
+    )
     async def postprocess_conversation(
         cid: str, payload: dict, background_tasks: BackgroundTasks
     ):
-        if not settings.enable_mediakit_erase and not os.environ.get("ARK_API_KEY", "").strip():
-            raise HTTPException(status_code=501, detail="MediaKit erase is disabled.")
+        capability_disabled = (
+            not settings.enable_mediakit_erase
+            and not os.environ.get("ARK_API_KEY", "").strip()
+        )
         meta = storage.load_meta(settings.data_dir, cid)
         if meta is None:
+            if capability_disabled:
+                raise HTTPException(
+                    status_code=501,
+                    detail="MediaKit erase is disabled.",
+                )
             raise HTTPException(status_code=404, detail="not found")
         if _is_read_only(meta):
             raise HTTPException(status_code=409, detail="read_only")
+        single_operation = _uses_single_operation_contract(meta)
+        if not single_operation:
+            if capability_disabled:
+                raise HTTPException(
+                    status_code=501,
+                    detail="MediaKit erase is disabled.",
+                )
+            try:
+                await postprocess.start(
+                    settings, cid, payload, postprocess_locks
+                )
+            except postprocess.PostprocessError as exc:
+                raise HTTPException(
+                    status_code=exc.status, detail=exc.detail
+                ) from exc
+            background_tasks.add_task(
+                postprocess.run_task,
+                settings,
+                cid,
+                mediakit_sem,
+                seedream_sem,
+                audit_runner=codex_runner,
+                verification_runner=codex_runner,
+            )
+            return {"status": "running", "frames": []}
+        if isinstance(meta.get("generation"), dict):
+            meta = _ensure_existing_generation(
+                settings, cid, meta, background_tasks
+            )
+            status_code, content = _operation_view(settings, cid, meta)
+            return JSONResponse(
+                status_code=status_code,
+                content=content,
+                background=background_tasks,
+            )
+        if capability_disabled:
+            status_code, content = _operation_view(
+                settings, cid, meta, stage="postprocess"
+            )
+            return JSONResponse(status_code=status_code, content=content)
+        existing = meta.get("postprocess")
+        if isinstance(existing, Mapping):
+            if existing.get("status") == "failed":
+                failed = next(
+                    (
+                        item for item in existing.get("segments", [])
+                        if isinstance(item, Mapping)
+                        and item.get("status") == "failed"
+                    ),
+                    None,
+                )
+                if isinstance(failed, Mapping):
+                    try:
+                        await postprocess.retry_segment(
+                            settings,
+                            cid,
+                            int(failed.get("index")),
+                            {
+                                "confirm": True,
+                                "expected_revision": failed.get("revision"),
+                            },
+                            postprocess_locks,
+                        )
+                    except (postprocess.PostprocessError, TypeError, ValueError):
+                        # Ambiguous and quality failures remain on the same
+                        # operation; this API never turns them into a new job.
+                        pass
+                    else:
+                        background_tasks.add_task(
+                            postprocess.run_task,
+                            settings,
+                            cid,
+                            mediakit_sem,
+                            seedream_sem,
+                            audit_runner=codex_runner,
+                            verification_runner=codex_runner,
+                        )
+            current = storage.load_meta(settings.data_dir, cid) or meta
+            status_code, content = _operation_view(
+                settings, cid, current, stage="postprocess"
+            )
+            return JSONResponse(
+                status_code=status_code,
+                content=content,
+                background=background_tasks,
+            )
         try:
             await postprocess.start(settings, cid, payload, postprocess_locks)
         except postprocess.PostprocessError as e:
+            if e.status == 409:
+                status_code, content = _operation_view(
+                    settings, cid, meta, stage="postprocess"
+                )
+                return JSONResponse(
+                    status_code=status_code, content=content
+                )
             raise HTTPException(status_code=e.status, detail=e.detail) from e
         background_tasks.add_task(
             postprocess.run_task, settings, cid, mediakit_sem, seedream_sem,
             audit_runner=codex_runner, verification_runner=codex_runner,
         )
-        return {"status": "running", "frames": []}
+        current = storage.load_meta(settings.data_dir, cid) or meta
+        status_code, content = _operation_view(
+            settings, cid, current, stage="postprocess"
+        )
+        return JSONResponse(
+            status_code=status_code,
+            content=content,
+            background=background_tasks,
+        )
 
     @app.post(
         "/api/conversations/{cid}/postprocess/segments/{index}/retry",
@@ -4158,17 +4547,35 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail="not found")
         if _is_read_only(meta):
             raise HTTPException(status_code=409, detail="read_only")
+        single_operation = _uses_single_operation_contract(meta)
         try:
             await postprocess.retry_segment(
                 settings, cid, index, payload, postprocess_locks
             )
         except postprocess.PostprocessError as exc:
+            if single_operation and exc.status == 409:
+                status_code, content = _operation_view(
+                    settings, cid, meta, stage="postprocess"
+                )
+                return JSONResponse(
+                    status_code=status_code, content=content
+                )
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
         background_tasks.add_task(
             postprocess.run_task, settings, cid, mediakit_sem, seedream_sem, {index},
             audit_runner=codex_runner, verification_runner=codex_runner,
         )
-        return {"status": "running", "segment_index": index}
+        if not single_operation:
+            return {"status": "running", "segment_index": index}
+        current = storage.load_meta(settings.data_dir, cid) or meta
+        status_code, content = _operation_view(
+            settings, cid, current, stage="postprocess"
+        )
+        return JSONResponse(
+            status_code=status_code,
+            content=content,
+            background=background_tasks,
+        )
 
     web = Path(__file__).resolve().parent.parent / "web"
     if web.is_dir():

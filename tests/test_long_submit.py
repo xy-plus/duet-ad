@@ -1297,6 +1297,148 @@ def enabled(tmp_path):
         yield settings, client
 
 
+def test_prompt_fusion_refresh_is_one_202_operation_without_second_submit_job(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        postprocess={"status": "done", "segments": []},
+        _postprocess_receipt={
+            "version": 4,
+            "options": {
+                "remove_subtitle": False,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+        },
+    )
+    fusion_calls = []
+    coordinator_calls = []
+
+    def finalize(*_args, **_kwargs):
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            _prompt_fusion={
+                "version": long_generation.PROMPT_FUSION_VERSION,
+                "status": "queued",
+                "error": None,
+                "input_sha256": "a" * 64,
+                "image_acceptance_sha256": "b" * 64,
+                "manifest_sha256": None,
+            },
+        )
+        raise long_generation.LongGenerationError(
+            "prompt_fusion_refresh_required"
+        )
+
+    def produce(_settings, received_cid, _runner):
+        fusion_calls.append(received_cid)
+        current = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            _prompt_fusion={**current, "status": "done"},
+        )
+        return "done"
+
+    monkeypatch.setattr(
+        long_generation, "finalize_multimodal_plan", finalize
+    )
+    monkeypatch.setattr(pipeline, "produce_prompt_fusion", produce)
+    monkeypatch.setattr(
+        long_generation,
+        "run",
+        lambda *_args, **_kwargs: coordinator_calls.append(True),
+    )
+    payload = _payload(receipt, dialogue_delivery="auto")
+
+    first = client.post(
+        f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+    )
+    replay = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json={**payload, "client_request_id": "different-request-456"},
+    )
+
+    expected = {
+        "operation_id": cid,
+        "status": "running",
+        "stage": "prompt_fusion",
+    }
+    assert first.status_code == 202, first.json()
+    assert replay.status_code == 202, replay.json()
+    assert first.json() == replay.json() == expected
+    assert fusion_calls == [cid]
+    # Explicit main-only seam: Fusion completion must be consumed by the
+    # durable coordinator; HTTP replay must neither create H3 work nor become
+    # the continuation mechanism.
+    assert coordinator_calls == []
+
+
+def test_current_operation_replay_ignores_new_id_and_never_reposts_unknown(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _postprocess_receipt={
+            "version": 4,
+            "options": {
+                "remove_subtitle": False,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+        },
+        generation={
+            "status": "submission_unknown",
+            "error": "submission_unknown",
+            "attempt": 1,
+            "client_request_id": "parent-request-123",
+            "stage": "h3",
+            "segments": [],
+        },
+    )
+    monkeypatch.setattr(
+        h3, "start", lambda *_args, **_kwargs: pytest.fail("must not POST")
+    )
+    monkeypatch.setattr(
+        h3, "retry", lambda *_args, **_kwargs: pytest.fail("must not retry")
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("unknown is GET-only"),
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(
+            receipt,
+            request_id="another-request-456",
+            resolution="480p",
+        ),
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "operation_id": cid,
+        "status": "running",
+        "stage": "h3",
+        "attempt": 1,
+    }
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "submission_unknown"
+    assert stored["client_request_id"] == "parent-request-123"
+
+
 def test_long_v4_combined_first_promotion_binds_settings_and_is_unpaid(
     enabled, monkeypatch,
 ):

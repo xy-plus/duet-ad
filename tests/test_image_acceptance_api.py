@@ -1,4 +1,4 @@
-"""Manual image acceptance HTTP projection and command seam."""
+"""Image acceptance compatibility calls project onto one operation."""
 
 from fastapi.testclient import TestClient
 import pytest
@@ -13,7 +13,19 @@ def _conversation(settings) -> tuple[str, dict]:
     created = storage.new_conversation(
         settings.data_dir, "manual image acceptance", "source.mp4"
     )
-    storage.update_meta(settings.data_dir, created["id"], status="done")
+    storage.update_meta(
+        settings.data_dir,
+        created["id"],
+        status="done",
+        _postprocess_receipt={
+            "version": 4,
+            "options": {
+                "remove_subtitle": False,
+                "remove_brand": False,
+                "optimize_image": True,
+            },
+        },
+    )
     return created["id"], storage.load_meta(settings.data_dir, created["id"])
 
 
@@ -47,7 +59,7 @@ def test_detail_projects_only_fixed_image_acceptance_shape(tmp_path, monkeypatch
     assert calls == [(settings, cid, expected_meta)]
 
 
-def test_accept_images_forwards_exact_payload_and_returns_public_shape(
+def test_accept_images_forwards_exact_payload_and_returns_same_operation(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path)
@@ -73,11 +85,11 @@ def test_accept_images_forwards_exact_payload_and_returns_public_shape(
             json=payload,
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert response.json() == {
-        "required": True,
-        "accepted": True,
-        "expected_meta_sha256": "c" * 64,
+        "operation_id": cid,
+        "status": "running",
+        "stage": "postprocess",
     }
     assert calls == [(settings, cid, payload)]
 
@@ -103,7 +115,7 @@ def test_accept_images_requires_auth_before_calling_core(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_accept_images_preserves_generation_started_rejection(
+def test_accept_images_generation_started_is_idempotent_operation_read(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path)
@@ -114,13 +126,11 @@ def test_accept_images_preserves_generation_started_rejection(
         generation={"status": "queued", "client_request_id": "frozen"},
     )
 
-    def reject(received_settings, received_cid, _payload):
-        assert received_settings is settings
-        assert received_cid == cid
-        assert isinstance(
-            storage.load_meta(settings.data_dir, cid).get("generation"), dict
-        )
-        raise postprocess.PostprocessError(409, "image_acceptance_frozen")
+    calls = []
+
+    def reject(*_args):
+        calls.append(True)
+        raise AssertionError("existing operation must bypass acceptance")
 
     monkeypatch.setattr(postprocess, "accept_images", reject, raising=False)
 
@@ -131,24 +141,23 @@ def test_accept_images_preserves_generation_started_rejection(
             json={"confirm": True, "expected_meta_sha256": "a" * 64},
         )
 
-    assert response.status_code == 409
-    assert response.json() == {"detail": "image_acceptance_frozen"}
+    assert response.status_code == 202
+    assert response.json() == {
+        "operation_id": cid,
+        "status": "running",
+        "stage": "generation",
+    }
+    assert calls == []
 
 
 @pytest.mark.parametrize(
     ("payload", "status", "detail"),
     [
         ({"confirm": True}, 422, "invalid_image_acceptance_request"),
-        (
-            {"confirm": False, "expected_meta_sha256": "a" * 64},
-            409,
-            "confirmation required",
-        ),
-        (
-            {"confirm": True, "expected_meta_sha256": "0" * 64},
-            409,
-            "image_acceptance_changed",
-        ),
+        ({"confirm": False, "expected_meta_sha256": "a" * 64}, 409,
+         "confirmation required"),
+        ({"confirm": True, "expected_meta_sha256": "0" * 64}, 409,
+         "image_acceptance_changed"),
     ],
 )
 def test_accept_images_preserves_core_validation_and_cas_errors(
@@ -169,5 +178,13 @@ def test_accept_images_preserves_core_validation_and_cas_errors(
             json=payload,
         )
 
-    assert response.status_code == status
-    assert response.json() == {"detail": detail}
+    if status == 422:
+        assert response.status_code == status
+        assert response.json() == {"detail": detail}
+    else:
+        assert response.status_code == 202
+        assert response.json() == {
+            "operation_id": cid,
+            "status": "running",
+            "stage": "postprocess",
+        }
