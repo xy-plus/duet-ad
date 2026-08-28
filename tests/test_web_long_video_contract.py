@@ -56,6 +56,14 @@ def test_create_dialogue_ui_and_formdata_are_bound_before_creation_only():
     assert "buildSubmitPayload" not in send_source
 
 
+def test_upload_hint_uses_the_single_ten_second_segmentation_contract():
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+
+    assert "超过 10 秒会拆分为单次不超过 10 秒的视频生成子任务" in html
+    assert "超过 15 秒" not in html
+    assert "不超过 14 秒" not in html
+
+
 def test_long_video_task_count_comes_from_frozen_plan():
     result = _run_contract(
         "["
