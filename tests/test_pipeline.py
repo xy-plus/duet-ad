@@ -955,6 +955,170 @@ def test_long_scene_bounds_include_the_one_millisecond_limit(tmp_path):
     ]
 
 
+def _planner_test_scenes(duration_s: int) -> list[dict]:
+    scenes = []
+    for index, start_s in enumerate(range(0, duration_s, 10), 1):
+        end_s = min(start_s + 10, duration_s)
+        scenes.append({
+            "index": index,
+            "start_s": float(start_s),
+            "end_s": float(end_s),
+            "start_time": {
+                "pts": start_s,
+                "time_base_num": 1,
+                "time_base_den": 1,
+            },
+            "end_time": {
+                "pts": end_s,
+                "time_base_num": 1,
+                "time_base_den": 1,
+            },
+            "frames": [{
+                "decode_frame_index": index,
+                "pts": start_s + 1,
+                "pts_origin": 0,
+                "time_base_num": 1,
+                "time_base_den": 1,
+            }],
+        })
+    return scenes
+
+
+@pytest.mark.parametrize(
+    "planner",
+    (long_video.plan_segments, scene_planner.plan_segments),
+    ids=("provider", "exact-scene"),
+)
+def test_auto_planner_ignores_source_spanning_sung_and_keeps_scene_cuts(planner):
+    sung = {
+        "text": "sung lyrics",
+        "start_s": 0.0,
+        "end_s": 20.0,
+        "classification": "sung",
+        "kept": True,
+    }
+    dialogue = pipeline._planner_dialogue({
+        "dialogue_mode": "auto",
+        "voice_line_provenance": [sung],
+    }, [sung])
+
+    segments = planner(20.0, _planner_test_scenes(20), dialogue)
+
+    assert dialogue == []
+    assert [(item["start_s"], item["end_s"]) for item in segments] == [
+        (0.0, 10.0),
+        (10.0, 20.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    "planner",
+    (long_video.plan_segments, scene_planner.plan_segments),
+    ids=("provider", "exact-scene"),
+)
+def test_auto_planner_keeps_source_spanning_spoken_as_safe_boundary(planner):
+    spoken = {
+        "text": "spoken line",
+        "start_s": 0.0,
+        "end_s": 20.0,
+        "classification": "spoken",
+        "kept": True,
+    }
+    dialogue = pipeline._planner_dialogue({
+        "dialogue_mode": "auto",
+        "voice_line_provenance": [spoken],
+    }, [spoken])
+
+    with pytest.raises(long_video.LongVideoError) as caught:
+        planner(20.0, _planner_test_scenes(20), dialogue)
+
+    assert caught.value.code == "long_video_no_safe_dialogue_boundary"
+
+
+@pytest.mark.parametrize(
+    "planner",
+    (long_video.plan_segments, scene_planner.plan_segments),
+    ids=("provider", "exact-scene"),
+)
+def test_auto_planner_mixed_vocals_only_protects_spoken_boundaries(planner):
+    sung = {
+        "text": "sung lyrics",
+        "start_s": 0.0,
+        "end_s": 20.0,
+        "classification": "sung",
+        "kept": True,
+    }
+    spoken = {
+        "text": "spoken line",
+        "start_s": 2.0,
+        "end_s": 3.0,
+        "classification": "spoken",
+        "kept": True,
+    }
+    dialogue = pipeline._planner_dialogue({
+        "dialogue_mode": "auto",
+        "voice_line_provenance": [sung, spoken],
+    }, [sung, spoken])
+
+    segments = planner(20.0, _planner_test_scenes(20), dialogue)
+
+    assert dialogue == [{
+        "text": "spoken line",
+        "start_s": 2.0,
+        "end_s": 3.0,
+        "classification": "spoken",
+    }]
+    assert [(item["start_s"], item["end_s"]) for item in segments] == [
+        (0.0, 10.0),
+        (10.0, 20.0),
+    ]
+
+
+@pytest.mark.parametrize("duration_s", (10, 20), ids=("n1", "n2"))
+def test_planner_projection_keeps_final_dialogue_consistent_for_n1_n2(duration_s):
+    sung = {
+        "text": "sung lyrics",
+        "start_s": 0.0,
+        "end_s": float(duration_s),
+        "classification": "sung",
+        "kept": True,
+    }
+    spoken = {
+        "text": "spoken line",
+        "start_s": 2.0,
+        "end_s": 3.0,
+        "classification": "spoken",
+        "kept": True,
+    }
+    meta = {
+        "dialogue_mode": "auto",
+        "voice_line_provenance": [sung, spoken],
+    }
+    dialogue = pipeline._planner_dialogue(meta, [sung, spoken])
+    segments = long_video.plan_segments(
+        float(duration_s), _planner_test_scenes(duration_s), dialogue
+    )
+
+    localized = [
+        line
+        for segment in segments
+        for line in long_video.localize_dialogue(dialogue, segment)
+    ]
+    assert localized == [{
+        "text": "spoken line",
+        "start_s": 2.0,
+        "end_s": 3.0,
+        "classification": "spoken",
+    }]
+    assert pipeline._planner_dialogue(
+        {"dialogue_mode": "none"}, [spoken]
+    ) == []
+    for mode in ("edit", "custom"):
+        assert pipeline._planner_dialogue(
+            {"dialogue_mode": mode}, [spoken]
+        ) == [spoken]
+
+
 def test_long_scene_bounds_reject_just_over_one_millisecond(tmp_path):
     work = tmp_path / "work"
     work.mkdir()
@@ -1023,7 +1187,13 @@ def test_run_converges_container_duration_to_visual_manifest_timeline(
         lambda _path: storage.VideoProbe(16.766667, 1080, 1920),
     )
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
-    monkeypatch.setattr(pipeline, "_voice_step", lambda *_a, **_kw: [])
+    def fake_voice_step(_settings, cid, *_args, **_kwargs):
+        storage.update_meta(
+            _settings.data_dir, cid, voice_line_provenance=[]
+        )
+        return []
+
+    monkeypatch.setattr(pipeline, "_voice_step", fake_voice_step)
     monkeypatch.setattr(pipeline, "_detect_segments", lambda *_a, **_kw: [])
     (cdir / "work" / "scenes.json").write_text(
         json.dumps({
@@ -2905,7 +3075,9 @@ def test_run_dialogue_auto_ignores_external_lines_and_isolates_visual_codex(
     assert '说出台词："真实口播。"，嘴型与画面同步' in segment_prompt
     assert '说出台词："OCR ONLY"' not in segment_prompt
     assert "外部伪台词" not in segment_prompt
-    assert stored["segments"][0]["dialogue"] == [asr_line]
+    assert stored["segments"][0]["dialogue"] == [
+        {**asr_line, "classification": "spoken"}
+    ]
     assert (cdir / "work" / "voice.mp3").read_bytes() == b"normalized-audio"
 
 
@@ -3033,7 +3205,12 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
     ] == [14, 2]
     assert stored["segments"][0]["dialogue"] == []
     assert stored["segments"][1]["dialogue"] == [
-        {"text": "第十六秒台词。", "start_s": 1.1, "end_s": 1.4}
+        {
+            "text": "第十六秒台词。",
+            "start_s": 1.1,
+            "end_s": 1.4,
+            "classification": "spoken",
+        }
     ]
     assert all(
         len(segment["keyframe_sampling"]["keyframes"]) == 9
@@ -3222,7 +3399,9 @@ def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
     receipt = json.loads((cdir / "long_video_plan.json").read_text(encoding="utf-8"))
     assert receipt["video"]["duration_s"] == 10.0
     assert receipt["segments"][0]["dialogue"]["count"] == 1
-    assert stored["segments"][0]["dialogue"] == [normalized]
+    assert stored["segments"][0]["dialogue"] == [
+        {**normalized, "classification": "spoken"}
+    ]
 
 
 def test_run_voice_drops_lines_starting_in_mp3_only_tail(tmp_path, video_1s, monkeypatch):

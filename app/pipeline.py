@@ -2048,6 +2048,32 @@ def _dialogue_for_prepared_input(
     raise PipelineError(f"unknown dialogue_mode: {mode}")
 
 
+def _planner_dialogue(meta: Mapping, supplied_lines: list[dict]) -> list[dict]:
+    """Project the one dialogue authority used by planning and frozen segments."""
+    mode = meta.get("dialogue_mode")
+    if mode == "none":
+        return []
+    if mode in {"edit", "custom"}:
+        return [dict(line) for line in supplied_lines]
+    if mode != "auto":
+        raise PipelineError(f"unknown dialogue_mode: {mode}")
+    provenance = meta.get("voice_line_provenance")
+    if not isinstance(provenance, list):
+        raise PipelineError("automatic dialogue provenance is missing")
+    return [
+        {
+            "text": line.get("text"),
+            "start_s": line.get("start_s"),
+            "end_s": line.get("end_s"),
+            "classification": "spoken",
+        }
+        for line in provenance
+        if isinstance(line, Mapping)
+        and line.get("kept") is True
+        and line.get("classification") == "spoken"
+    ]
+
+
 def _prepared_durations(meta: dict) -> tuple[float, int]:
     """返回 receipt 的实际时长与统一换算的 H3 整秒请求时长。"""
     raw = meta.get("duration_s")
@@ -2767,7 +2793,13 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
         duration_s = float(meta["duration_s"]) if new_input_contract else None
         source_scenes: list[dict] | None = None
         backend_keyframe_selections: dict[int, list[dict]] = {}
+        planner_dialogue = voice_lines or []
         if new_input_contract:
+            refreshed = storage.load_meta(settings.data_dir, cid)
+            if refreshed is None:
+                raise PipelineError("conversation disappeared during dialogue planning")
+            meta = refreshed
+            planner_dialogue = _planner_dialogue(meta, voice_lines or [])
             source_scenes = _source_scenes_for_timeline(work, duration_s)
             exact_inventory = all(
                 isinstance(scene.get("frames"), list)
@@ -2786,7 +2818,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 segments = scene_planner.plan_segments(
                     duration_s,
                     source_scenes,
-                    voice_lines or [],
+                    planner_dialogue,
                 )
                 backend_keyframe_selections = {
                     segment["index"]: scene_planner.select_segment_keyframes(
@@ -2800,7 +2832,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 segments = long_video.plan_segments(
                     duration_s,
                     source_scenes,
-                    voice_lines or [],
+                    planner_dialogue,
                 )
         if not segments:
             # 单段模式：work/keyframes + work/prompt.txt，不注入 workaround 前缀；
@@ -2899,7 +2931,9 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             # lines_by_seg 为 None = 无口播：段目录不写 voice_lines.json
             if new_input_contract:
                 lines_by_seg = {
-                    seg["index"]: long_video.localize_dialogue(voice_lines or [], seg)
+                    seg["index"]: long_video.localize_dialogue(
+                        planner_dialogue, seg
+                    )
                     for seg in segments
                 }
             else:
@@ -2908,7 +2942,9 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 )
             if lines_by_seg is not None:
                 # 越界台词不归段：计数留痕（meta 内部字段，不静默丢失）
-                dropped = len(voice_lines) - sum(len(v) for v in lines_by_seg.values())
+                dropped = len(planner_dialogue) - sum(
+                    len(v) for v in lines_by_seg.values()
+                )
                 if dropped:
                     storage.update_meta(settings.data_dir, cid, voice_lines_dropped=dropped)
             # 段并发上限 = codex_concurrency 的一半：一条长视频不得占满全部 codex 槽饿死其他会话
