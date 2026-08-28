@@ -175,6 +175,91 @@ def test_old_meta_remains_readable_but_is_derived_read_only(tmp_path):
     assert detail["dialogue"] == {"mode": "auto", "lines": [], "auto_lines": []}
 
 
+def test_detail_auto_dialogue_only_publishes_spoken_with_scoped_legacy_compat(
+    tmp_path,
+):
+    settings = make_settings(tmp_path)
+    lines = [
+        {
+            "text": "spoken line",
+            "start_s": 0.0,
+            "end_s": 1.0,
+            "classification": "spoken",
+            "kept": True,
+        },
+        {
+            "text": "sung lyrics",
+            "start_s": 1.0,
+            "end_s": 2.0,
+            "classification": "sung",
+            "kept": True,
+        },
+        {
+            "text": "unclassified current line",
+            "start_s": 2.0,
+            "end_s": 3.0,
+            "kept": True,
+        },
+        {
+            "text": "discarded spoken line",
+            "start_s": 3.0,
+            "end_s": 4.0,
+            "classification": "spoken",
+            "kept": False,
+        },
+    ]
+    current = storage.new_conversation(
+        settings.data_dir, note="", orig_name="current.mp4"
+    )
+    storage.update_meta(
+        settings.data_dir,
+        current["id"],
+        dialogue_mode="auto",
+        voice_line_provenance=lines,
+    )
+
+    legacy = storage.new_conversation(
+        settings.data_dir, note="", orig_name="legacy.mp4"
+    )
+    legacy_stored = storage.load_meta(settings.data_dir, legacy["id"])
+    legacy_stored.pop("schema_version")
+    legacy_stored["dialogue_mode"] = "auto"
+    legacy_stored["voice_line_provenance"] = lines
+    (settings.data_dir / legacy["id"] / "meta.json").write_text(
+        json.dumps(legacy_stored), encoding="utf-8"
+    )
+
+    with TestClient(create_app(settings)) as client:
+        current_detail = client.get(
+            f"/api/conversations/{current['id']}", headers=AUTH
+        ).json()
+        legacy_detail = client.get(
+            f"/api/conversations/{legacy['id']}", headers=AUTH
+        ).json()
+
+    spoken = [{"text": "spoken line", "start_s": 0.0, "end_s": 1.0}]
+    assert current_detail["read_only"] is False
+    assert current_detail["dialogue"] == {
+        "mode": "auto",
+        "lines": spoken,
+        "auto_lines": spoken,
+    }
+    legacy_lines = [
+        *spoken,
+        {
+            "text": "unclassified current line",
+            "start_s": 2.0,
+            "end_s": 3.0,
+        },
+    ]
+    assert legacy_detail["read_only"] is True
+    assert legacy_detail["dialogue"] == {
+        "mode": "auto",
+        "lines": legacy_lines,
+        "auto_lines": legacy_lines,
+    }
+
+
 def test_creation_preserves_voice_modes_and_translate_requires_language(tmp_path, video_1s):
     settings = make_settings(tmp_path)
     with TestClient(create_app(settings)) as client:

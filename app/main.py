@@ -219,10 +219,18 @@ def _public_lines(value) -> list[dict]:
 def _automatic_public_lines(meta: dict) -> list[dict]:
     provenance = meta.get("voice_line_provenance")
     if isinstance(provenance, list):
+        allow_legacy_unclassified = _is_read_only(meta)
         return _public_lines([
             line for line in provenance
             if isinstance(line, dict)
             and line.get("kept") is True
+            and (
+                line.get("classification") == "spoken"
+                or (
+                    allow_legacy_unclassified
+                    and line.get("classification") is None
+                )
+            )
             and not voice.is_unrecognized_text(line.get("text"))
         ])
     if _is_read_only(meta):
