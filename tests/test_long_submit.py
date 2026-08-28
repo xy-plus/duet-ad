@@ -3085,10 +3085,15 @@ def test_new_receipt_rejects_true_six_decimal_subsecond_segment(tmp_path):
         _make_long(settings, joins=joins, segment_duration=0.999999)
 
 
-def test_freeze_rejects_new_receipt_with_over_fourteen_provider_duration(tmp_path):
+def test_freeze_rejects_new_multisegment_receipt_with_over_fourteen_provider_duration(
+    tmp_path,
+):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, _receipt = _make_long(
-        settings, segment_duration=15.0, legacy=True
+        settings,
+        joins=("hard_cut", "hard_cut"),
+        segment_duration=15.0,
+        legacy=True,
     )
     root = settings.data_dir / cid
     path = root / long_video.PLAN_RECEIPT_FILENAME
@@ -3107,6 +3112,27 @@ def test_freeze_rejects_new_receipt_with_over_fourteen_provider_duration(tmp_pat
             "none",
             "auto",
         )
+
+
+def test_freeze_accepts_new_single_segment_at_fifteen_seconds(tmp_path):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, segment_duration=15.0)
+    root = settings.data_dir / cid
+
+    frozen = long_generation.freeze_plan(
+        root,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+
+    assert len(frozen.segments) == 1
+    assert long_video.provider_duration_s(
+        frozen.segments[0].start_s,
+        frozen.segments[0].end_s,
+        receipt_version=frozen.receipt_version,
+    ) == 15
 
 
 @pytest.mark.parametrize(

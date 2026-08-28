@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 import app.main as main_module
-from app import h3, pipeline, prepared_input, storage
+from app import h3, pipeline, postprocess, prepared_input, storage
 from app.main import (
     _freeze_submission,
     _load_h3_request,
@@ -568,6 +568,79 @@ def test_submit_freezes_postprocessed_keyframe_bytes_when_optimization_done(
         expected_dialogue=storage.load_meta(settings.data_dir, cid)["prepared_dialogue"],
     )
     assert frozen.keyframes[0].path == cdir / "work" / "postprocessed" / "01.png"
+    latest = storage.load_meta(settings.data_dir, cid)
+    assert "_postprocess_receipt" not in latest
+    assert "_image_optimization" not in latest
+
+
+@pytest.mark.parametrize(
+    "incompatible_state",
+    [
+        "current_options",
+        "top_level_segments",
+        "public_segments",
+        "private_receipt",
+        "image_optimization_receipt",
+        "image_continuity_receipt",
+        "reordered_frames",
+        "invalid_original",
+        "invalid_output",
+    ],
+)
+def test_released_legacy_postprocess_compatibility_is_fail_closed(
+    tmp_path, incompatible_state,
+):
+    settings = make_settings(tmp_path)
+    cid, _ = _make_conv(settings, duration_s=9.2)
+    cdir = settings.data_dir / cid
+    originals = [
+        cdir / "work" / "keyframes" / "01.png",
+        cdir / "work" / "keyframes" / "02.png",
+    ]
+    _png(originals[1], value=79)
+    selected = [
+        cdir / "work" / "postprocessed" / "01.png",
+        cdir / "work" / "postprocessed" / "02.png",
+    ]
+    _png(selected[0], value=179)
+    _png(selected[1], value=180)
+    state = {
+        "status": "done",
+        "options": {"remove_subtitle": True, "remove_brand": False},
+        "frames": ["01.png", "02.png"],
+        "error": None,
+    }
+    meta = storage.load_meta(settings.data_dir, cid)
+
+    if incompatible_state == "current_options":
+        state["options"] = {
+            **state["options"],
+            "optimize_image": False,
+        }
+    elif incompatible_state == "top_level_segments":
+        meta["segments"] = []
+    elif incompatible_state == "public_segments":
+        state["segments"] = []
+    elif incompatible_state == "private_receipt":
+        meta["_postprocess_receipt"] = {}
+    elif incompatible_state == "image_optimization_receipt":
+        meta["_image_optimization"] = {}
+    elif incompatible_state == "image_continuity_receipt":
+        meta["_image_continuity"] = {}
+    elif incompatible_state == "reordered_frames":
+        state["frames"].reverse()
+    elif incompatible_state == "invalid_original":
+        originals[0].write_bytes(b"not-a-png")
+    elif incompatible_state == "invalid_output":
+        selected[0].write_bytes(b"not-a-png")
+    meta["postprocess"] = state
+
+    with pytest.raises(
+        postprocess.PostprocessError, match="postprocess_artifacts_invalid"
+    ):
+        postprocess.generation_keyframes(
+            cdir, meta, originals, settings=settings,
+        )
 
 
 @pytest.mark.parametrize("postprocess_status", ["running", "failed"])
@@ -863,7 +936,7 @@ def test_startup_reconciles_half_frozen_short_submit_without_provider(
     assert claimed
     _freeze_submission(
         settings, cid, claimed, "request-old-123", "none", "none",
-        "9:16", "768p", (),
+        "9:16", "768p", (), requested_dialogue_delivery="auto",
     )
     cdir = settings.data_dir / cid
     before = {

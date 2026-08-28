@@ -2969,6 +2969,31 @@ def generation_keyframes(
         raise PostprocessError(409, "postprocess_artifacts_invalid")
     if len({path.resolve() for path in selected}) != len(selected):
         raise PostprocessError(409, "postprocess_artifacts_invalid")
+    legacy_options = state.get("options")
+    released_legacy = (
+        set(state) == {"status", "options", "frames", "error"}
+        and state.get("error") is None
+        and bool(originals)
+        and isinstance(legacy_options, dict)
+        and set(legacy_options) == _OLD_OPTION_KEYS
+        and all(
+            isinstance(legacy_options[key], bool) for key in _OLD_OPTION_KEYS
+        )
+        and any(legacy_options.values())
+        and "segments" not in meta
+        and not any(key in meta for key in (
+            "_postprocess_receipt", "_image_optimization",
+            "_image_continuity", "_v4_canvas_execution", "_image_verification",
+            _IMAGE_ACCEPTANCE_KEY,
+        ))
+    )
+    if released_legacy:
+        if not all(
+            _valid_png(output, original)
+            for original, output in zip(originals, selected)
+        ):
+            raise PostprocessError(409, "postprocess_artifacts_invalid")
+        return selected
     frozen_intent = meta.get("_postprocess_receipt")
     optimization = image_optimization.receipt(meta)
     public_options = state.get("options") if isinstance(state, dict) else None
