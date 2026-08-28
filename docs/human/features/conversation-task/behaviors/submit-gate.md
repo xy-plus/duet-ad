@@ -38,7 +38,7 @@ links: [conversation-task, processing-state, long-video, postprocess]
 | 输入 | H3 冻结结果 |
 | --- | --- |
 | `dialogue_mode=none` | 零台词、零声音 reference |
-| `dialogue_mode=auto` | 仅保留 `classification=spoken` 的 ASR 行；`sung/chant/rap/humming` 全部排除。没有真实口播时冻结零台词、零声音 reference |
+| `dialogue_mode=auto` | 仅保留 `classification=spoken` 的 ASR 行；既有 `sung`（包含 YAMNet 归并的 singing/chant/rap/humming）全部排除。没有真实口播时冻结零台词、零声音 reference |
 | `dialogue_delivery=off_screen` | 逐行保留冻结 text/start/end，`delivery=off_screen`、无画内 subject，只能绑定已证明为 clean voice 的唯一 reference；完整源混音禁止作为 reference |
 | `dialogue_delivery=on_screen` 且主分析已有同一行的画内人物/时间证据 | 逐行绑定既有证据与唯一 voice reference |
 | `dialogue_delivery=on_screen` 但证据缺失 | 409 `on_screen_authority_unavailable`，Context/H3 POST 为 0；不得调用额外 Skill 补证 |
@@ -57,7 +57,8 @@ links: [conversation-task, processing-state, long-video, postprocess]
 | 未完成图片后处理或每段不是恰好 9 张图 | 409 `postprocess_artifacts_invalid`；不回退原图 |
 | v4 图片尚未由用户确认，或确认绑定的图、顺序、计划已漂移 | 409 image acceptance 错误；不创建付费任务 |
 | 自动模式只检测到歌词或歌唱 | 按无台词冻结，完整源混音不进入 Fusion/H3；无音频 H3 输出在拼接时静音 |
-| 台词非空但只有完整源混音可作为声音参考 | 409 clean voice reference 错误；Context/H3 POST 为 0，不得回退整轨混音 |
+| 既有 YAMNet 检测到 BGM，或无法给当前完整混音证明无 BGM | 该混音禁止成为 voice reference；不调用替代分类器或新 Skill，无法走无台词路径时付费前拒绝 |
+| `spoken/edit/custom` 台词非空但 YAMNet 检测到或无法排除 BGM | 409 clean voice reference 错误；Context/H3 POST 为 0，不得回退整轨混音。只有用户显式 `none` 才能丢弃真实口播 |
 | 输入准备未 `done` | 409 `artifacts not ready` |
 | 请求缺字段、有未知字段、`confirm` 非 true、id 或枚举不合法 | 422；在状态写入和供应商调用前拒绝 |
 | plan receipt 缺失、格式非法或已变化 | 422/409；刷新后由用户再次确认，Web 不自动重发 |
@@ -76,7 +77,7 @@ links: [conversation-task, processing-state, long-video, postprocess]
 - `image-postprocess` 已冻结，不再迭代；它只把每段 9 张原始关键帧变成 9 张优化关键帧，不做素材准入。
 - 用户确认后的 9 张优化图按 segment 和帧序进入统一 frozen receipt；随后 `video-prompt-fusion` 以有序新关键帧、旧视频提示词、图片优化提示词和音频内容为唯一四类输入生成最终视频提示词。
 - `new_keyframes` 仍属于第一类输入，但每项必须同时绑定源时间、source scene 与 transition；扩充字段不是第五类输入，也不是新阶段。
-- 音频内容必须冻结真实口播筛选结果、clean-reference 证明与 `music_policy=forbid`；整轨 `work/voice.mp3` 只可用于分析，不得出现在 Fusion/H3 references 中。
+- 音频内容必须冻结既有 ASR/YAMNet 的真实口播筛选结果、BGM 判定与 `music_policy=forbid`；`work/voice.mp3` 只可用于分析，只有既有节点证明 `spoken` 且无 BGM 时才可成为 reference。
 - 第一次生成确认只冻结四类输入并项目级调用一次 `video-prompt-fusion`；完成后返回可刷新状态，Web 不自动重提。相同设置由用户再次明确确认后，才允许进入 Context IR 和 H3。
 - Context IR 与 H3 只能消费 `video-prompt-fusion` 输出及其绑定的四类输入；禁止旧视觉 prompt 直接覆盖新人物、新场景或新对象。
 

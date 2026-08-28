@@ -18,6 +18,7 @@ links: []
 原视频
   -> video-maker Skill
   -> segments[N>=1]，每段 9 张原始关键帧 + 视频提示词
+  -> 既有 ASR + YAMNet 音频语义分析，区分真实口播、歌唱和背景音乐（非 Skill）
   -> 可选 MediaKit 去字幕和/或去 Logo；保持帧数、顺序和 segment 归属不变
   -> image-postprocess Skill
   -> 每段 9 张优化关键帧
@@ -41,12 +42,12 @@ links: []
 - 除上述三个 Skill 外，不存在 Binding Skill、Audio Skill、Speaker Skill 或第四个 Skill。音频呈现由普通后端代码根据冻结台词、Web 的画内/画外选择和现有 voice reference 做确定性投影，再作为只读输入交给融合 Skill。
 - 单段和多段不是两条链。所有当前项目统一为 `segments[N>=1]`；所谓短视频只是 `N=1`，使用同一冻结、Context、H3、attempt、恢复、拼接和验收实现。
 - 图片 Skill 收到合法可解码关键帧就执行，不做素材资格审查，不因人物、场景、遮挡或内容复杂而拒绝开始。
-- `video-prompt-fusion` 的四类输入固定为：有序新关键帧、旧视频提示词、图片优化提示词、音频相关内容。新人物、新场景、新对象、服装、材质和空间结构以新关键帧为准；动作、镜头、构图、节奏和 segment 时间轴沿用旧视频提示词；图片优化提示词只解释替换目标和保持约束；音频文本、时间、画内/画外和 voice reference 逐字保持。
-- 自动台词只接受经现有声学分类确认的真实口播。`sung`、`chant`、`rap`、`humming` 及歌曲歌词均不得作为 dialogue；仅有此类内容时必须冻结 `lines=[]`、`voice_references=[]`，不得把歌词改名为画外台词。
-- 从源视频抽取的 `work/voice.mp3` 是完整混音，只能用于分析，绝不能作为 clean voice reference。只有能够以源字节、时间范围、生成实现和输出字节收据证明为干净口播的音频，才允许以 `purpose=voice` 进入 H3；证明不足时必须在付费前拒绝或走无台词路径，不得静默降级为整轨混音。
+- `video-prompt-fusion` 的四类输入固定为：有序新关键帧、旧视频提示词、图片优化提示词、音频相关内容。新人物、新场景、新对象、服装、材质、空间结构、锚点景别和裁切以新关键帧为准；旧视频提示词只负责同一硬切区间内的动作顺序、因果、镜头运动类型和相对节奏；源时间、source scene 与硬切以既有分析产物为准；图片优化提示词只解释替换目标和保持约束；音频文本、时间、画内/画外和 voice reference 逐字保持。
+- 音频分类只复用已经存在并经过验证的 ASR + YAMNet 节点，不引入替代分类器、声源分离器或新 Skill。当前冻结枚举仍只有 `spoken/sung/null`；YAMNet 检出的 singing、chant、rap、humming 等歌唱类统一归入既有 `sung`，不新增分类值。自动台词只接受 `spoken`；仅有 `sung` 时必须冻结 `lines=[]`、`voice_references=[]`，不得把歌词改名为画外台词。
+- 从源视频抽取的 `work/voice.mp3` 是完整混音，只能用于既有 ASR/YAMNet 分析。只有 YAMNet 冻结结果确认存在真实口播且不存在 BGM 的当前音轨才可继续作为 voice reference。`spoken/edit/custom` 需要声音但检测到或无法排除 BGM 时必须在付费前明确拒绝；只有用户显式选择 `dialogue_mode=none` 才能丢弃真实口播，不得由 `auto` 静默降级。
 - 默认不生成背景音乐是贯穿 Fusion、Context IR 和最终发布的合同，不是一个可丢失的旧提示词前缀。无真实口播的 segment 使用现有无音频 H3 路径并在拼接时输出静音；不得仅依靠 `no music` 自然语言承诺消除模型生成的音乐。
 - 每张冻结关键帧必须同时绑定源时间、源 scene 和与前一帧的转场类型。源视频的硬切是时间轴权威：不得被后端误标为 `same_camera`，不得被 Fusion 或 Context IR 改到其他时刻，也不得让单个 H3 请求跨该硬切连续变形。
-- 遇到源硬切时，继续复用现有 `segments[N>=1]` 与 stitch：切点两侧分别进入不同 generation segment，参考图不得跨切点混用。逻辑 segment 可短于供应商最短请求时长；供应商请求按其合法最短时长生成，最终仍按冻结的逻辑帧预算裁切和硬拼，二者必须用版本化 receipt 分别绑定。
+- 首轮先修复现有 transition、anchor、Fusion 与 Context 合同，在同一请求中明确冻结硬切而非连续 morph；若真实 A/B 仍出现跨切点变形，再复用现有 `segments[N>=1]` 与 stitch 做物理隔离。物理拆分上线前必须证明短逻辑段仍有 9 个唯一源帧、供应商合法时长不会丢动作、台词不跨边界，且逻辑/供应商时长由版本化 receipt 分别绑定；证明不足时付费前拒绝。
 - 用户第一次确认生成时，后端冻结包括声音呈现在内的四类输入，并以一次项目级 `video-prompt-fusion` 调用覆盖全部 `segments[N>=1]`；完成后 Web 只刷新展示，不自动再次提交。用户使用相同设置再次明确确认后，才进入 Context IR 和 H3。
 - Context IR 只优化 `video-prompt-fusion` 输出的文字表达，不得恢复旧视觉元素，也不得改变关键帧顺序、台词、时间、画内/画外选择或 voice reference；IR 完成后直接进入 H3，中间不得增加新阶段。
 - 有真实口播且存在合法 clean voice reference 时，H3 最终音频以供应商原生输出为准；源混音或 conditioning audio 不得在拼接时覆盖、回挂或混入成片。无真实口播时丢弃 H3 音轨并输出静音，确保模型新生背景音乐不会进入成片。
@@ -64,7 +65,7 @@ links: []
 5. 图片确认后是否只由 `video-prompt-fusion` 使用四类冻结输入生成最终提示词，并禁止旧视觉 prompt 直接进入 H3？
 6. 是否由 Web 明确控制图片确认、台词、画内/画外、画幅、清晰度和适配方式？
 7. 是否让 Context IR 后的冻结输入直接进入 H3？
-8. 是否保留 H3 原生音频并阻止源音回挂？
+8. 是否对有真实口播的 segment 保留 H3 原生音频、对无台词 segment 强制静音，并始终阻止源音回挂？
 9. 是否没有新增产品阶段、状态机、Skill 或用户概念？
 10. 是否只把真实口播作为 dialogue，并在付费前阻止完整源混音成为 voice reference？
 11. 是否冻结并逐值保持每张图的源时间、scene 和硬切，且 H3 请求不跨源硬切？
