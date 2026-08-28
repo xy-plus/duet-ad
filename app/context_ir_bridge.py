@@ -443,7 +443,12 @@ def _speech_contract(
 
 
 def _fusion_policy_suffix(prompt: str) -> str | None:
-    """Return the exact current Fusion audio/music suffix, if present."""
+    """Return the exact current Fusion contract suffix, if present.
+
+    Current v2 prompts bind timeline, audio, and music as one adjacent tail so
+    Context cannot keep the bytes while moving a block to another position.
+    The audio/music-only form remains readable for historical fixtures.
+    """
     audio_open = "<AUDIO_CONTENT_JSON>"
     audio_close = "</AUDIO_CONTENT_JSON>"
     music_open = "<MUSIC_POLICY>"
@@ -455,15 +460,27 @@ def _fusion_policy_suffix(prompt: str) -> str | None:
     # activates this contract; the v2 loader rejects malformed outer blocks.
     if not prompt.endswith(policy_tail):
         return None
-    marker_start = prompt.find(audio_open)
-    if marker_start < 0:
+    audio_start = prompt.find(audio_open)
+    if audio_start < 0:
         raise ContextIrContractError("source_music_policy_invalid")
+    timeline_start = prompt.find(_TIMELINE_OPEN)
+    marker_start = timeline_start if timeline_start >= 0 else audio_start
     suffix = prompt[marker_start:]
     if not suffix.endswith(f"{audio_close}\n{music}"):
         raise ContextIrContractError("source_music_policy_invalid")
+    if timeline_start >= 0:
+        timeline_end = prompt.find(_TIMELINE_CLOSE, timeline_start)
+        if (
+            timeline_end < timeline_start
+            or timeline_end + len(_TIMELINE_CLOSE) + 1 != audio_start
+            or prompt[timeline_end + len(_TIMELINE_CLOSE):audio_start] != "\n"
+        ):
+            raise ContextIrContractError("source_music_policy_invalid")
     prefix = prompt[:marker_start]
     if (
-        audio_open in prefix
+        _TIMELINE_OPEN in prefix
+        or _TIMELINE_CLOSE in prefix
+        or audio_open in prefix
         or audio_close in prefix
         or music_open in prefix
         or music_close in prefix
@@ -479,6 +496,8 @@ def _effective_preserves_fusion_policy(
         return False
     prefix = effective_prompt[:-len(expected_suffix)]
     return not any(marker in prefix for marker in (
+        _TIMELINE_OPEN,
+        _TIMELINE_CLOSE,
         "<AUDIO_CONTENT_JSON>",
         "</AUDIO_CONTENT_JSON>",
         "<MUSIC_POLICY>",

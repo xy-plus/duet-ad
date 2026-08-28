@@ -985,6 +985,34 @@ def test_context_ir_rejects_hard_cut_time_drift_before_h3(tmp_path):
     assert not (frozen.workdir / ".h3").exists()
 
 
+@pytest.mark.parametrize("mutation", ["reordered", "separated"])
+def test_context_ir_rejects_moved_fusion_contract_blocks_before_h3(
+    tmp_path, mutation,
+):
+    frozen = _timeline_frozen(tmp_path)
+    timeline_start = frozen.source_prompt.index("<KEYFRAME_TIMELINE_JSON>")
+    audio_start = frozen.source_prompt.index("<AUDIO_CONTENT_JSON>")
+    music_start = frozen.source_prompt.index("<MUSIC_POLICY>")
+    visual = frozen.source_prompt[:timeline_start]
+    timeline = frozen.source_prompt[timeline_start:audio_start].rstrip("\n")
+    audio = frozen.source_prompt[audio_start:music_start].rstrip("\n")
+    music = frozen.source_prompt[music_start:]
+    effective = (
+        f"{visual}{audio}\n{timeline}\n{music}"
+        if mutation == "reordered"
+        else f"{visual}{timeline}\nContext inserted prose.\n{audio}\n{music}"
+    )
+    with _client(
+        _success_handler(frozen, effective_prompt=effective)
+    ) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "failed"
+    assert result.error_code == "context_ir_semantic_mismatch"
+    assert result.receipt_path is None
+    assert not (frozen.workdir / ".h3").exists()
+
+
 def test_context_ir_rejects_non_nine_keyframe_timeline():
     timeline = [{
         "order": 1,
