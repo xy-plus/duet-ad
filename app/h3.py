@@ -1408,6 +1408,44 @@ def resume(request: H3Request, *, client: httpx.Client | None = None) -> H3Resul
             )
 
 
+def resume_exact_attempt(
+    request: H3Request,
+    attempt_id: str,
+    *,
+    client: httpx.Client | None = None,
+) -> H3Result:
+    """Resume one persisted provider task without any provider-POST path.
+
+    This recovery boundary is for local work after H3 has already accepted a
+    task. It loads only ``attempt_id``, requires that attempt's frozen task and
+    request receipts, and may only query or materialize that same task.
+    """
+    _require_h3_boundary(request)
+    if (
+        not isinstance(attempt_id, str)
+        or len(attempt_id) != 6
+        or not attempt_id.isdigit()
+    ):
+        raise ReceiptError("state_invalid")
+    with _session_lease(request):
+        state = _read_json(_attempt_path(request, attempt_id))
+        _validate_state(request, state)
+        if state.get("attempt_id") != attempt_id:
+            raise ReceiptError("state_invalid")
+        h3_state = state.get("h3")
+        if not isinstance(h3_state, dict):
+            raise ReceiptError("state_invalid")
+        task_id = _task_id(h3_state.get("task_id"), required=True)
+        if task_id is None:
+            raise ReceiptError("state_invalid")
+        if output_is_reusable(request, state):
+            return _output_result(request, state)
+        if state.get("status") in {"submission_unknown", "failed"}:
+            return _result(state)
+        with _client(client) as active_client:
+            return _poll_h3(request, state, active_client, task_id)
+
+
 def retry(
     request: H3Request,
     client_request_id: str,

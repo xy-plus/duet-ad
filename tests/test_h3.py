@@ -118,6 +118,7 @@ def _current_fusion_no_audio_request(tmp_path: Path) -> h3.H3Request:
     "boundary",
     [
         "start", "prepare", "submit", "inspect", "resume", "retry",
+        "resume_exact_attempt",
         "output_is_reusable", "timeout_attempt_is_get_only_resumable",
         "controlled_storage_rejection_is_safely_retryable",
         "retry_controlled_storage_rejection", "load_media_timeline_receipt",
@@ -137,6 +138,8 @@ def test_current_fusion_no_audio_raw_request_is_rejected_at_every_h3_boundary(
         with pytest.raises(h3.ReceiptError, match="context_ir_receipt_required"):
             if boundary in {"start", "submit", "resume"}:
                 getattr(h3, boundary)(request, client=client)
+            elif boundary == "resume_exact_attempt":
+                h3.resume_exact_attempt(request, "000001", client=client)
             elif boundary == "retry":
                 h3.retry(request, "fusion-no-audio-retry", client=client)
             elif boundary == "retry_controlled_storage_rejection":
@@ -1287,6 +1290,159 @@ def test_succeeded_attempt_with_missing_output_redownloads_by_get_only(tmp_path)
     assert h3.output_is_reusable(request) is True
 
 
+def test_resume_exact_attempt_queries_only_named_task_without_post(tmp_path):
+    request = _request(tmp_path)
+    with _client(HappyProvider(result_status="RUNNING")) as client:
+        assert h3.start(request, client=client).status == "retryable_failure"
+    assert h3.prepare(
+        replace(request, client_request_id="newer-request")
+    ).attempt_id == "000002"
+
+    calls = []
+
+    def recover(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        assert req.method == "GET"
+        if req.url.path.endswith("/result/h3-task-local"):
+            return httpx.Response(200, json={"data": {
+                "status": "SUCCESS",
+                "results": [{"url": "https://download.invalid/video.mp4"}],
+            }})
+        return _download_response(200, content=HappyProvider.video_bytes)
+
+    with _client(recover) as client:
+        result = h3.resume_exact_attempt(
+            request, "000001", client=client,
+        )
+
+    assert result.status == "succeeded"
+    assert result.attempt_id == "000001"
+    assert calls
+    assert all(call.method == "GET" for call in calls)
+    assert len([call for call in calls if call.method == "POST"]) == 0
+    assert calls[0].url.path.endswith("/result/h3-task-local")
+    assert not _attempt_file(request, 3).exists()
+
+
+def test_resume_exact_attempt_redownloads_missing_output_in_same_receipt(
+    tmp_path,
+):
+    request = _request(tmp_path)
+    with _client(HappyProvider()) as client:
+        original = h3.start(request, client=client)
+    path = _attempt_file(request)
+    before = json.loads(path.read_text(encoding="utf-8"))
+    (request.workdir / "generated.mp4").unlink()
+    calls = []
+
+    def recover(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        assert req.method == "GET"
+        if req.url.path.endswith("/result/h3-task-local"):
+            return httpx.Response(200, json={"data": {
+                "status": "SUCCESS",
+                "results": [{"url": "https://download.invalid/video.mp4"}],
+            }})
+        return _download_response(200, content=HappyProvider.video_bytes)
+
+    with _client(recover) as client:
+        recovered = h3.resume_exact_attempt(
+            request, original.attempt_id, client=client,
+        )
+
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert recovered.status == "succeeded"
+    assert recovered.attempt_id == original.attempt_id == "000001"
+    assert calls and all(call.method == "GET" for call in calls)
+    assert len([call for call in calls if call.method == "POST"]) == 0
+    assert after["client_request_id"] == before["client_request_id"]
+    assert after["input_receipt"] == before["input_receipt"]
+    assert after["h3"]["receipt"] == before["h3"]["receipt"]
+    assert (
+        after["h3"]["output"]["media_timeline"]
+        == before["h3"]["output"]["media_timeline"]
+    )
+    assert not _attempt_file(request, 2).exists()
+
+
+@pytest.mark.parametrize(
+    ("status", "h3_status", "error"),
+    [
+        ("ready_to_submit", "ready", None),
+        ("h3_submitting", "submitting", None),
+        ("submission_unknown", "submission_unknown", None),
+        ("failed", "failed", {"code": "h3_provider_failed"}),
+    ],
+)
+def test_resume_exact_attempt_requires_persisted_task_without_network(
+    tmp_path, status, h3_status, error,
+):
+    request = _request(tmp_path)
+    assert h3.prepare(request).attempt_id == "000001"
+    path = _attempt_file(request)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["status"] = status
+    state["h3"] = {"status": h3_status}
+    if error is not None:
+        state["error"] = error
+    path.write_text(json.dumps(state), encoding="utf-8")
+    calls = []
+
+    with _client(
+        lambda req: calls.append(req) or pytest.fail("must stay offline")
+    ) as client:
+        with pytest.raises(h3.ReceiptError, match="state_invalid"):
+            h3.resume_exact_attempt(request, "000001", client=client)
+
+    assert calls == []
+    assert len([call for call in calls if call.method == "POST"]) == 0
+    assert not _attempt_file(request, 2).exists()
+
+
+@pytest.mark.parametrize("terminal", ["submission_unknown", "provider_failed"])
+def test_resume_exact_attempt_never_reposts_unknown_or_failed_attempt(
+    tmp_path, terminal,
+):
+    request = _request(tmp_path)
+    request = replace(
+        request, timeouts=replace(request.timeouts, retry_count=0),
+    )
+
+    def terminal_provider(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST":
+            if terminal == "submission_unknown":
+                raise httpx.ReadTimeout("unknown", request=req)
+            return httpx.Response(
+                200, json={"data": {"task_id": "confirmed-failed-task"}},
+            )
+        return httpx.Response(200, json={
+            "request_id": "confirmed-failure",
+            "data": {"status": "FAILED"},
+        })
+
+    with _client(terminal_provider) as client:
+        if terminal == "submission_unknown":
+            with pytest.raises(h3.H3Error, match="submission_unknown"):
+                h3.start(request, client=client)
+        else:
+            assert h3.start(request, client=client).status == "failed"
+
+    calls = []
+    with _client(
+        lambda req: calls.append(req) or pytest.fail("must stay offline")
+    ) as client:
+        if terminal == "submission_unknown":
+            with pytest.raises(h3.ReceiptError, match="state_invalid"):
+                h3.resume_exact_attempt(request, "000001", client=client)
+        else:
+            result = h3.resume_exact_attempt(request, "000001", client=client)
+            assert result.status == "failed"
+
+    assert calls == []
+    assert len([call for call in calls if call.method == "POST"]) == 0
+    assert not _attempt_file(request, 2).exists()
+
+
 def test_empty_voice_texts_are_valid_and_bound(tmp_path):
     request = replace(
         _request(tmp_path),
@@ -1700,7 +1856,10 @@ def _legacy_authority_masquerade(request: h3.H3Request) -> h3.H3Request:
 
 @pytest.mark.parametrize(
     "boundary",
-    ["start", "prepare", "submit", "inspect", "resume", "output_is_reusable"],
+    [
+        "start", "prepare", "submit", "inspect", "resume",
+        "resume_exact_attempt", "output_is_reusable",
+    ],
 )
 def test_every_public_h3_boundary_reloads_producer_authority_before_state_or_post(
     tmp_path, monkeypatch, boundary,
@@ -1720,6 +1879,8 @@ def test_every_public_h3_boundary_reloads_producer_authority_before_state_or_pos
         ):
             if boundary in {"start", "submit", "resume"}:
                 getattr(h3, boundary)(request, client=client)
+            elif boundary == "resume_exact_attempt":
+                h3.resume_exact_attempt(request, "000001", client=client)
             else:
                 getattr(h3, boundary)(request)
     assert posts == []
@@ -1744,6 +1905,7 @@ def test_on_screen_authority_requires_explicit_version(tmp_path):
     "boundary",
     [
         "start", "prepare", "submit", "inspect", "resume", "retry",
+        "resume_exact_attempt",
         "output_is_reusable", "timeout_attempt_is_get_only_resumable",
         "controlled_storage_rejection_is_safely_retryable",
         "retry_controlled_storage_rejection", "load_media_timeline_receipt",
@@ -1768,6 +1930,8 @@ def test_current_on_screen_request_cannot_masquerade_as_legacy_authority(
         ):
             if boundary in {"start", "submit", "resume"}:
                 getattr(h3, boundary)(request, client=client)
+            elif boundary == "resume_exact_attempt":
+                h3.resume_exact_attempt(request, "000001", client=client)
             elif boundary == "retry":
                 h3.retry(request, "legacy-retry", client=client)
             elif boundary == "retry_controlled_storage_rejection":
