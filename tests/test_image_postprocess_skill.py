@@ -348,7 +348,7 @@ def test_skill_is_one_concise_plan_only_skill():
 
     assert "name: image-postprocess" in skill
     assert '`phase="plan"' in skill
-    assert set(example) == {"people", "scenes", "frames"}
+    assert set(example) == {"people", "entities", "scenes", "frames"}
     assert "只填写视觉语义" in skill
     assert "后端据此确定性编译" in skill
     assert "人物与场景同时替换" in skill
@@ -384,7 +384,7 @@ def test_skill_and_human_plan_scope_only_define_source_to_target_image_editing()
 def test_skill_delegates_the_exact_v4_generation_contract_to_backend():
     skill, example = _skill_contract()
 
-    assert "这些全部由后端从冻结 request 和 source 构造" in skill
+    assert "实体 ID、关系图和完整机械字段由后端构造" in skill
     assert "不要输出版本、段号、帧号、连续编号 ID、哈希、transition、枚举 palette、实体图、组件图或流程判断" in skill
     encoded = json.dumps(example, ensure_ascii=False)
     for mechanical in (
@@ -2202,7 +2202,7 @@ def test_v4_skill_defines_semantic_target_authority_without_audit_role():
     skill, example = _skill_contract()
     encoded = json.dumps(example, ensure_ascii=False)
 
-    assert set(example) == {"people", "scenes", "frames"}
+    assert set(example) == {"people", "entities", "scenes", "frames"}
     assert set(next(iter(example["scenes"].values()))) == {
         "source_scene", "replacement_scene", "semantic_change",
         "geometry_change", "depth_change", "layout_change",
