@@ -362,7 +362,9 @@ def test_long_segment_prompt_workspace_and_keyframes_are_accessible():
     branch = source.split("function renderSegments(detail)", 1)[1]
     branch = branch.split("/* 关键帧放大查看", 1)[0]
     assert "promptWorkspace(detail, seg)" in branch
-    assert "compact: true, expandable: true" in branch
+    assert "compact: true" in branch
+    assert "expandable: true" in branch
+    assert "authoritativeSegmentKeyframePaths(detail, seg)" in branch
     assert "onURL: (url) => mediaURLs.push(url)" in branch
 
     grid = source.split("function kfGrid", 1)[1]

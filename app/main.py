@@ -432,6 +432,71 @@ def _uses_segment_coordinator(meta: dict) -> bool:
     return _is_current_v4_segment_project(meta) or _is_long_video(meta)
 
 
+def _is_normalized_single_segment_layout(cdir: Path, meta: dict) -> bool:
+    """Recognize only the frozen v4 N=1 adapter that retains root media."""
+    segments = meta.get("segments")
+    if (
+        not _is_current_v4_segment_project(meta)
+        or not isinstance(segments, list)
+        or len(segments) != 1
+        or not isinstance(segments[0], dict)
+        or segments[0].get("index") != 1
+        or long_generation.plan_receipt(cdir, meta) is None
+    ):
+        return False
+    segment = segments[0]
+    names = segment.get("keyframes")
+    paths = segment.get("keyframe_paths")
+    if (
+        not isinstance(names, list)
+        or not names
+        or names != meta.get("keyframes")
+        or not all(
+            isinstance(name, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name)
+            and name not in {".", ".."}
+            for name in names
+        )
+        or paths != [f"keyframes/{name}" for name in names]
+    ):
+        return False
+    return (
+        segment.get("first_frame_path") == paths[0]
+        and segment.get("last_frame_path") == paths[-1]
+    )
+
+
+def _public_image_frame_prompts(
+    meta: dict, settings: Settings,
+) -> dict[int, list[dict[str, str]]]:
+    """Project validated v4 frame prompts without exposing the private receipt."""
+    raw = image_optimization.receipt(meta, settings)
+    if not isinstance(raw, dict) or raw.get("version") != 4:
+        return {}
+    result: dict[int, list[dict[str, str]]] = {}
+    for item in raw.get("frames", []):
+        if not isinstance(item, dict):
+            return {}
+        index = item.get("segment_index")
+        values = (
+            item.get("frame_name"), item.get("current"),
+            item.get("default"), item.get("sha256"),
+        )
+        if (
+            isinstance(index, bool) or not isinstance(index, int)
+            or not all(isinstance(value, str) for value in values)
+        ):
+            return {}
+        frame_name, current, default, digest = values
+        result.setdefault(index, []).append({
+            "frame_name": frame_name,
+            "text": current,
+            "default_text": default,
+            "sha256": digest,
+        })
+    return result
+
+
 def _generation_semantics(meta: dict) -> tuple[str, str]:
     """Read frozen/recommended values; missing historical fields are exact legacy defaults."""
     aspect_ratio = meta.get("aspect_ratio", h3.H3_DEFAULT_ASPECT_RATIO)
@@ -2793,11 +2858,43 @@ def create_app(settings: Settings) -> FastAPI:
             aspect_ratio = resolution = fit_profiles = None
             effective_fit_required = None
         optimization_prompts = image_optimization.public_prompts(meta, settings)
+        optimization_frame_prompts = _public_image_frame_prompts(meta, settings)
+        normalized_single = _is_normalized_single_segment_layout(cdir, meta)
+        if normalized_single and not optimization_prompts:
+            compatibility_meta = {**meta, "segments": []}
+            internal_prompts = image_optimization.public_prompts(
+                compatibility_meta, settings
+            )
+            if set(internal_prompts) == {0}:
+                optimization_prompts = {1: internal_prompts[0]}
+        raw_segments = meta.get("segments", [])
+        public_indices = {
+            item.get("index") for item in raw_segments
+            if isinstance(item, dict)
+        }
+        if normalized_single:
+            if set(optimization_frame_prompts) == {0}:
+                optimization_frame_prompts = {
+                    1: optimization_frame_prompts[0]
+                }
+            else:
+                optimization_frame_prompts = {}
+        elif set(optimization_frame_prompts) != public_indices:
+            optimization_frame_prompts = {}
         public_segments = []
-        for raw_segment in meta.get("segments", []):
+        for raw_segment in raw_segments:
             segment = dict(raw_segment) if isinstance(raw_segment, dict) else raw_segment
             if isinstance(segment, dict) and segment.get("index") in optimization_prompts:
                 segment["image_optimization_prompt"] = optimization_prompts[segment["index"]]
+            if isinstance(segment, dict) and segment.get("index") in optimization_frame_prompts:
+                prompts = optimization_frame_prompts[segment["index"]]
+                names = segment.get("keyframes")
+                if (
+                    isinstance(names, list)
+                    and len(prompts) == len(names)
+                    and [item.get("frame_name") for item in prompts] == names
+                ):
+                    segment["image_optimization_prompts"] = prompts
             public_segments.append(segment)
         capabilities = {
             "remove_subtitle": bool(settings.enable_mediakit_erase),
