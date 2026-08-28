@@ -304,6 +304,170 @@ def localize_dialogue(lines: Iterable[Mapping], segment: Mapping) -> list[dict]:
     return local
 
 
+def localize_keyframe_sources(
+    value: object,
+    *,
+    segment_start_s: object,
+    segment_end_s: object,
+    provider_duration_s: object,
+) -> tuple[list[dict], list[dict]]:
+    """Project nine frozen global frame receipts onto one H3-local timeline.
+
+    Paths, hashes and source-scene ids remain receipt authorities.  Timing and
+    transitions are a deterministic backend projection: source coordinates are
+    rounded to the plan precision, clamped to the segment, made strictly
+    increasing, then shifted by the frozen segment start.  Recoverable timing
+    anomalies never become a quality rejection; every normalization is returned
+    as an ordered diagnostic for the coordinator to expose or persist.
+    """
+    if not isinstance(value, list) or len(value) != 9:
+        raise LongVideoError("long_video_plan_invalid_keyframe_sources")
+    try:
+        duration = segment_duration_s(segment_start_s, segment_end_s)
+        start_s = round(float(segment_start_s), BOUNDARY_PRECISION)
+        end_s = round(float(segment_end_s), BOUNDARY_PRECISION)
+    except (TypeError, ValueError, LongVideoError):
+        raise LongVideoError("long_video_invalid_segment_duration") from None
+
+    diagnostics: list[dict] = []
+    canonical_provider_duration = max(1, math.ceil(duration))
+    if not (
+        isinstance(provider_duration_s, int)
+        and not isinstance(provider_duration_s, bool)
+        and provider_duration_s == canonical_provider_duration
+    ):
+        diagnostics.append({
+            "order": 0,
+            "code": "provider_duration_normalized",
+            "from": provider_duration_s,
+            "to": canonical_provider_duration,
+        })
+
+    quantum = 10 ** -BOUNDARY_PRECISION
+    if duration < quantum * 8:
+        raise LongVideoError("long_video_invalid_segment_duration")
+    required = {
+        "order", "path", "sha256", "source_time_s",
+        "source_scene_id", "transition",
+    }
+    localized: list[dict] = []
+    for order, raw in enumerate(value, 1):
+        if not isinstance(raw, Mapping) or not required.issubset(raw):
+            raise LongVideoError("long_video_plan_invalid_keyframe_sources")
+        path, digest = raw.get("path"), raw.get("sha256")
+        scene_id = raw.get("source_scene_id")
+        if (
+            not isinstance(path, str) or not path
+            or not isinstance(digest, str) or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or not isinstance(scene_id, str) or not scene_id.strip()
+        ):
+            raise LongVideoError("long_video_plan_invalid_keyframe_sources")
+        if raw.get("order") != order:
+            diagnostics.append({
+                "order": order, "code": "keyframe_order_normalized",
+                "from": raw.get("order"), "to": order,
+            })
+
+        source_value = raw.get("source_time_s")
+        if (
+            isinstance(source_value, bool)
+            or not isinstance(source_value, (int, float))
+            or not math.isfinite(float(source_value))
+        ):
+            source_time = round(
+                start_s + duration * (order - 1) / 8, BOUNDARY_PRECISION
+            )
+            diagnostics.append({
+                "order": order, "code": "source_time_reconstructed",
+                "from": None, "to": source_time,
+            })
+        else:
+            original = round(float(source_value), BOUNDARY_PRECISION)
+            source_time = min(end_s, max(start_s, original))
+            if source_time != original:
+                diagnostics.append({
+                    "order": order, "code": "source_time_clamped",
+                    "from": original, "to": source_time,
+                })
+
+        raw_local = round(source_time - start_s, BOUNDARY_PRECISION)
+        previous = localized[-1] if localized else None
+        lower = 0.0 if previous is None else round(
+            previous["segment_time_s"] + quantum, BOUNDARY_PRECISION
+        )
+        upper = round(duration - quantum * (9 - order), BOUNDARY_PRECISION)
+        local_time = round(min(upper, max(lower, raw_local)), BOUNDARY_PRECISION)
+        local_time = 0.0 if local_time == -0.0 else local_time
+        if local_time != raw_local:
+            diagnostics.append({
+                "order": order, "code": "source_time_order_normalized",
+                "from": raw_local, "to": local_time,
+            })
+
+        source_transition = raw.get("transition")
+        transition = source_transition if isinstance(source_transition, Mapping) else {}
+        if previous is None:
+            local_transition = {"type": "start", "at_segment_s": local_time}
+        else:
+            raw_type = transition.get("type")
+            local_type = (
+                raw_type
+                if raw_type in {"continuous", "hard_cut"}
+                else (
+                    "hard_cut"
+                    if scene_id != previous["source_scene_id"]
+                    else "continuous"
+                )
+            )
+            if raw_type != local_type:
+                diagnostics.append({
+                    "order": order, "code": "transition_type_normalized",
+                    "from": raw_type, "to": local_type,
+                })
+            raw_at_s = transition.get("at_s")
+            if local_type == "continuous":
+                if raw_at_s is not None:
+                    diagnostics.append({
+                        "order": order, "code": "continuous_cut_removed",
+                        "from": raw_at_s, "to": None,
+                    })
+                local_transition = {
+                    "type": "continuous", "at_segment_s": None,
+                }
+            else:
+                raw_at_local = (
+                    round(float(raw_at_s) - start_s, BOUNDARY_PRECISION)
+                    if not isinstance(raw_at_s, bool)
+                    and isinstance(raw_at_s, (int, float))
+                    and math.isfinite(float(raw_at_s))
+                    else None
+                )
+                at_local = (
+                    raw_at_local
+                    if raw_at_local is not None
+                    and previous["segment_time_s"] < raw_at_local <= local_time
+                    else local_time
+                )
+                if raw_at_local != at_local:
+                    diagnostics.append({
+                        "order": order, "code": "hard_cut_time_normalized",
+                        "from": raw_at_local, "to": at_local,
+                    })
+                local_transition = {
+                    "type": "hard_cut", "at_segment_s": at_local,
+                }
+        localized.append({
+            "order": order,
+            "path": path,
+            "sha256": digest,
+            "segment_time_s": local_time,
+            "source_scene_id": scene_id,
+            "transition": local_transition,
+        })
+    return localized, diagnostics
+
+
 def build_continuity_block() -> str:
     """Return the server-owned block injected byte-for-byte into every segment."""
     return _CONTINUITY_BLOCK

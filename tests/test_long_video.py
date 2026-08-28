@@ -13,10 +13,42 @@ from app.long_video import (
     LongVideoError,
     build_continuity_block,
     localize_dialogue,
+    localize_keyframe_sources,
     plan_segments,
     provider_duration_s,
     write_plan_receipt,
 )
+
+
+def _global_keyframe_receipts(
+    source_times: list[float], *, cut_order: int | None = None,
+    cut_at_s: float | None = None, first_transition: str = "start",
+) -> list[dict]:
+    receipts = []
+    for order, source_time_s in enumerate(source_times, 1):
+        scene_id = (
+            "SCENE_01"
+            if cut_order is None or order < cut_order
+            else "SCENE_02"
+        )
+        if order == 1:
+            transition = {
+                "type": first_transition,
+                "at_s": source_time_s if first_transition == "start" else None,
+            }
+        elif order == cut_order:
+            transition = {"type": "hard_cut", "at_s": cut_at_s}
+        else:
+            transition = {"type": "continuous", "at_s": None}
+        receipts.append({
+            "order": order,
+            "path": f"work/keyframes/{order:02d}.png",
+            "sha256": f"{order:x}" * 64,
+            "source_time_s": source_time_s,
+            "source_scene_id": scene_id,
+            "transition": transition,
+        })
+    return receipts
 
 
 def test_short_video_is_the_single_segment_contract():
@@ -227,6 +259,107 @@ def test_local_dialogue_is_shifted_and_strictly_inside_segment():
             {"start_s": 10.0, "end_s": 15.0},
         )
     assert exc.value.code == "long_video_no_safe_dialogue_boundary"
+
+
+def test_n1_keyframe_sources_are_projected_to_exact_h3_local_receipts():
+    source = _global_keyframe_receipts(
+        [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0],
+        cut_order=4,
+        cut_at_s=2.267,
+    )
+
+    localized, diagnostics = localize_keyframe_sources(
+        source,
+        segment_start_s=0.0,
+        segment_end_s=14.5,
+        provider_duration_s=15,
+    )
+
+    assert diagnostics == []
+    assert [item["segment_time_s"] for item in localized] == [
+        0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0,
+    ]
+    assert localized[0]["transition"] == {
+        "type": "start", "at_segment_s": 0.0,
+    }
+    assert localized[3] == {
+        "order": 4,
+        "path": "work/keyframes/04.png",
+        "sha256": "4" * 64,
+        "segment_time_s": 2.5,
+        "source_scene_id": "SCENE_02",
+        "transition": {"type": "hard_cut", "at_segment_s": 2.267},
+    }
+    assert all(
+        set(item) == {
+            "order", "path", "sha256", "segment_time_s",
+            "source_scene_id", "transition",
+        }
+        for item in localized
+    )
+
+
+def test_n2_keyframe_sources_reset_origin_and_preserve_inner_hard_cut():
+    source = _global_keyframe_receipts(
+        [14.0, 14.75, 16.0, 16.5, 18.0, 20.0, 22.0, 25.0, 28.0],
+        cut_order=4,
+        cut_at_s=16.267,
+        first_transition="continuous",
+    )
+
+    localized, diagnostics = localize_keyframe_sources(
+        source,
+        segment_start_s=14.0,
+        segment_end_s=28.0,
+        provider_duration_s=14,
+    )
+
+    assert diagnostics == []
+    assert [item["segment_time_s"] for item in localized] == [
+        0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0,
+    ]
+    assert localized[0]["transition"] == {
+        "type": "start", "at_segment_s": 0.0,
+    }
+    assert localized[3]["transition"] == {
+        "type": "hard_cut", "at_segment_s": 2.267,
+    }
+    assert 16.267 not in {
+        item["transition"]["at_segment_s"]
+        for item in localized
+        if item["transition"]["at_segment_s"] is not None
+    }
+
+
+def test_local_timeline_normalizes_bad_cut_without_quality_rejection():
+    source = _global_keyframe_receipts(
+        [14.0, 14.75, 16.0, 16.5, 18.0, 20.0, 22.0, 25.0, 28.0],
+        cut_order=4,
+        cut_at_s=13.0,
+        first_transition="continuous",
+    )
+
+    localized, diagnostics = localize_keyframe_sources(
+        source,
+        segment_start_s=14.0,
+        segment_end_s=28.0,
+        provider_duration_s=14,
+    )
+
+    assert len(localized) == 9
+    assert localized[3]["transition"] == {
+        "type": "hard_cut", "at_segment_s": 2.5,
+    }
+    assert diagnostics == [{
+        "order": 4,
+        "code": "hard_cut_time_normalized",
+        "from": -1.0,
+        "to": 2.5,
+    }]
+    json.dumps(
+        {"timeline": localized, "diagnostics": diagnostics},
+        allow_nan=False,
+    )
 
 
 def test_continuity_block_is_identical_and_does_not_promote_ocr():
