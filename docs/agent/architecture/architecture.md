@@ -115,7 +115,7 @@ current v4 的每个 segment 都使用本段 exact 9 张冻结 Picture reference
 
 `postprocess` 不存在表示用户跳过优化，使用原关键帧；一旦存在则提交必须等待 `done`，并逐一解析同名 `postprocessed/`。短视频统一作为逻辑段 `0`，长视频严格使用连续正整数 `1..N`。每段按已选阶段形成屏障：本段全部帧完成 MediaKit 文字擦除后才进入图标擦除，全部完成后才进入 Seedream；段之间并行，每个阶段的帧请求由供应商级信号量限流。
 
-视觉关键帧冻结后，`skills/image-postprocess` current 只执行 `phase=plan`，输出人物/场景替换的视觉语义。后端补齐 v4 结构、冻结 source/scene/transition 与 SHA，再确定性生成逐帧 Seedream prompt。semantic compiler 的 `score/issues/ignored_mechanical_fields` 只写日志、测试断言和迭代分析；current v4 不运行 plan audit/verify，不持久化 `_image_verification`，也不因质量 fail/unknown 阻断发布、重试或选择 fallback。schema、exact-9、索引、路径与 SHA 无效仍是技术合同错误。旧 `_image_continuity` 和 quality-verdict receipt 只读，不升级。
+视觉关键帧冻结后，`skills/image-postprocess` current 只执行 `phase=plan`，以通用 stable keys 输出人物、持久实体、场景和逐帧可见状态的视觉语义。后端补齐 v4 实体 ID、所有权关系图及其他结构，冻结 source/scene/transition 与 SHA，再确定性生成逐帧 Seedream prompt；缺失语义使用 `source_preserve` 继续并记录 diagnostics。semantic compiler 的 `score/issues/ignored_mechanical_fields` 只写日志、测试断言和迭代分析，不参与生产控制流。旧 `_image_continuity` 和 quality-verdict receipt 只读，不升级。
 
 每个 Seedream POST 前原子持久化绑定模型、模式、提示词摘要和输入摘要的 attempt。只有完整 HTTP 429、精确 `QuotaExceeded` 且没有 `data` 时才继续，单帧硬上限 3 次；网络/超时/取消等 POST 结果不明都写为 `submission_unknown`。服务启动仅恢复能由本地产物证明安全的阶段；当前 revision 存在 submitting/unknown attempt 时将该段和整体标为失败，不自动重发。人工重试用 revision CAS 创建下一 revision，旧 attempt 不删除。
 

@@ -289,7 +289,7 @@ current v4 请求严格为：
 
 该接口只保留给历史 v1 continuity receipt：短视频使用逻辑段 `0`，长视频使用连续正整数段 `1..N`，并继续以 `expected_sha256` CAS 保存而不迁移旧 receipt。存在有效 v2 双目标 plan 时提示词由后端确定性编译，接口固定返回 409 `image_optimization_prompt_compiled`；v2 plan 损坏返回 `image_optimization_plan_invalid`，绝不回退 v1。未知字段、空白或超过 32 KiB 的旧提示词、非法段号在写入前拒绝。
 
-current v4 的 `skills/image-postprocess` 只以 `phase=plan` 输出人物/场景替换视觉语义；后端补齐结构字段、绑定 source scene/time/transition 与 SHA，并确定性编译逐帧 Seedream prompt。semantic compiler 的 `score/issues/ignored_mechanical_fields` 只进入日志、测试断言和 Skill 迭代；current 不运行 plan audit/verify，不写 `_image_verification`，也不因质量 fail/unknown 阻断发布、重试或 fallback。schema、exact-9、索引、路径与 SHA 不完整仍是技术合同错误。旧 `_image_continuity` 与 quality-verdict receipt 只读，不迁移或重写。
+current v4 的 `skills/image-postprocess` 只以 `phase=plan` 输出通用人物、持久实体、场景和逐帧可见状态语义；后端补齐实体 ID、所有权关系图及其他结构字段，绑定 source scene/time/transition 与 SHA，并确定性编译逐帧 Seedream prompt。缺失语义使用 `source_preserve` 继续并写 diagnostics；semantic compiler 的 `score/issues/ignored_mechanical_fields` 只进入日志、测试断言和 Skill 迭代，不参与生产控制流。旧 `_image_continuity` 与 quality-verdict receipt 只读，不迁移或重写。
 
 ### `POST /api/conversations/{cid}/postprocess`
 

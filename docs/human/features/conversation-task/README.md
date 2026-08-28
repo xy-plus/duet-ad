@@ -38,11 +38,11 @@ links: []
 - 全链只调用三个 Skill：`video-maker` 负责分段分析和 exact-9 原始关键帧；`image-postprocess` 只负责图片替换语义；`video-prompt-fusion` 只负责视觉融合。Audio、Binding、Speaker、Context、Ref2VA compiler、H3 和拼接都不是 Skill。
 - 当前 tree 三个 Skill 的权威 SHA-256 分别是：
   - `video-maker`：`0bbb22baeb8f14fef737b279e2ab2e8f70bf8965d41b182f1987537e1e3e4785`
-  - `image-postprocess`：`126508628d8923fa2b179bc347c2cacf6973a6ed5e96ed62d8007042f6743e8c`
+  - `image-postprocess`：`dc69c2f1ecc86470481150da98ba17ca214e47db9b3c8841224030165957db9f`
   - `video-prompt-fusion`：`34145f90532ec65a45d029d62b09e9ef60516721df47d6aa83ea649699a8e16c`
 - 每个当前 segment 的原始关键帧、优化关键帧、Fusion `new_keyframes` 和 H3 `<Picture 1>`…`<Picture 9>` 都必须恰好为 9 张并保持顺序。极短连续 scene 可重复最近的已解码源帧来满足 exact-9；同 scene 的相同 PTS 是有 provenance 的合法 receipt，不得把“9 张”误写为“9 个唯一源帧”。
 - 每张帧同时绑定 segment-local time、source scene 和 transition。scene 改变必须是冻结时点的 `hard_cut`，scene 不变必须是 `continuous`；切后帧是新 anchor。Fusion 的视觉文字无权改写这些机械字段。
-- `image-postprocess` 当前只执行 `phase=plan`。后端补齐并编译结构字段；图片质量 score、compiler diagnostics、Fusion 语义检查和 A/B 观察只用于测试与下一轮 Skill 迭代，不阻断生产发布、不触发重试、不选择备用 prompt、旧视觉或另一 workflow。schema、数量、顺序、路径和 SHA 不匹配仍属于技术输入无效，不是质量评分。
+- `image-postprocess` 当前只执行 `phase=plan`，以通用 stable keys 描述人物、持久实体、场景和逐帧可见状态。后端补齐实体 ID、所有权关系图与其他结构字段；缺失语义使用 `source_preserve` 继续并记录 diagnostics。图片质量 score、compiler diagnostics、Fusion 语义检查和 A/B 观察只用于测试与下一轮 Skill 迭代，不阻断生产发布、不触发重试、不选择备用 prompt、旧视觉或另一 workflow。
 - `video-prompt-fusion` v2 每段只输出 `{index,visual[]}`。它不能写 `[Shot]`、时间戳、Picture/Audio/Subject 标签、台词、music policy 或任何 provider 字段；后端是 Ref2VA prompt 的唯一 compiler 和发送权威。
 - Fusion 的四类冻结输入仍是 exact-9 新关键帧、旧视频动态骨架、逐帧图片优化提示词和音频语义。`audio_content` 只含冻结 spoken 文本/时间/呈现方式与 `music_policy=forbid`；`voice_references=[]`，每行 `voice_ref=null`。
 - 当前 Context 不优化或改写提示词。它为后端编译的 Ref2VA prompt 生成 `local:identity:<sha256>` receipt，effective prompt 与 source prompt 同 SHA，同路径 HTTP 调用数为 0；语义 score 固定为 identity 证明，不是生产门禁。
