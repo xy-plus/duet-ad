@@ -671,16 +671,16 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                 "detail": "resume_parameters_changed"
             }
 
-            for mutation in ("task", "error"):
+            for mutation in ("task", "attempt"):
                 drifted_generation = json.loads(json.dumps(baseline_generation))
                 if mutation == "task":
                     drifted_generation["segments"][0]["context_ir"][
                         "provider_task_id"
                     ] = "another-context-task"
                 else:
-                    drifted_generation["segments"][0]["error"] = (
-                        "context_ir_provider_failed"
-                    )
+                    drifted_generation["segments"][0]["context_ir"][
+                        "attempt_id"
+                    ] = "000002"
                 storage.update_meta(
                     settings.data_dir, cid, generation=drifted_generation,
                 )
@@ -691,11 +691,62 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                 )
                 assert rejected.status_code == 409
                 assert rejected.json() == {
-                    "detail": "new client_request_id required"
+                    "detail": "submission_outcome_unknown"
                 }
+                assert storage.load_meta(
+                    settings.data_dir, cid,
+                )["generation"]["status"] == "submission_unknown"
                 storage.update_meta(
                     settings.data_dir, cid, generation=baseline_generation,
                 )
+
+            unrelated = json.loads(json.dumps(baseline_generation))
+            unrelated["segments"][0]["error"] = "context_ir_provider_failed"
+            storage.update_meta(
+                settings.data_dir, cid, generation=unrelated,
+            )
+            real_freeze_plan = long_generation.freeze_plan
+            monkeypatch.setattr(
+                long_generation,
+                "freeze_plan",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "ordinary failed replay reached freeze_plan"
+                ),
+            )
+            unrelated_replay = client.post(
+                f"/api/conversations/{cid}/submit",
+                headers=AUTH,
+                json=payload,
+            )
+            assert unrelated_replay.status_code == 409
+            assert unrelated_replay.json() == {
+                "detail": "new client_request_id required"
+            }
+            monkeypatch.setattr(
+                long_generation, "freeze_plan", real_freeze_plan
+            )
+            storage.update_meta(
+                settings.data_dir, cid, generation=baseline_generation,
+            )
+
+            context_receipt = (
+                cdir / "work" / "segments" / "1" / ".context-ir"
+                / "attempts" / "000001" / "receipt.json"
+            )
+            context_receipt.write_text("{}\n", encoding="utf-8")
+            receipt_drift = client.post(
+                f"/api/conversations/{cid}/submit",
+                headers=AUTH,
+                json=payload,
+            )
+            assert receipt_drift.status_code == 409
+            assert receipt_drift.json() == {
+                "detail": "submission_outcome_unknown"
+            }
+            context_receipt.unlink()
+            storage.update_meta(
+                settings.data_dir, cid, generation=baseline_generation,
+            )
 
             h3_root = cdir / "work" / "segments" / "1" / ".h3"
             h3_root.mkdir()
@@ -706,9 +757,12 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             )
             assert h3_drift.status_code == 409
             assert h3_drift.json() == {
-                "detail": "new client_request_id required"
+                "detail": "submission_outcome_unknown"
             }
             h3_root.rmdir()
+            storage.update_meta(
+                settings.data_dir, cid, generation=baseline_generation,
+            )
 
             plan_path = cdir / long_video.PLAN_RECEIPT_FILENAME
             plan_bytes = plan_path.read_bytes()
@@ -719,8 +773,13 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                 json=payload,
             )
             assert plan_drift.status_code == 409
-            assert plan_drift.json() == {"detail": "resume_parameters_changed"}
+            assert plan_drift.json() == {
+                "detail": "submission_outcome_unknown"
+            }
             plan_path.write_bytes(plan_bytes)
+            storage.update_meta(
+                settings.data_dir, cid, generation=baseline_generation,
+            )
 
             assert h3_requests == []
             assert sum(
