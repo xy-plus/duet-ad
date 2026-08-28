@@ -23,7 +23,7 @@ links: []
   -> image-postprocess Skill
   -> 每段 9 张优化关键帧
   -> Web 用户确认图片并设置台词、声音呈现、画幅、清晰度和适配方式
-  -> 后端只保留真实口播并拒绝把源混音冒充人声参考
+  -> 后端只保留真实口播，并拒绝未经既有 YAMNet 收据证明无 BGM 的源混音
   -> video-prompt-fusion Skill 融合优化图、旧视频提示词、图片优化提示词和音频内容
   -> Context IR 只优化最终提示词
   -> H3 按 segment 生成原生音视频
@@ -44,7 +44,7 @@ links: []
 - 图片 Skill 收到合法可解码关键帧就执行，不做素材资格审查，不因人物、场景、遮挡或内容复杂而拒绝开始。
 - `video-prompt-fusion` 的四类输入固定为：有序新关键帧、旧视频提示词、图片优化提示词、音频相关内容。新人物、新场景、新对象、服装、材质、空间结构、锚点景别和裁切以新关键帧为准；旧视频提示词只负责同一硬切区间内的动作顺序、因果、镜头运动类型和相对节奏；源时间、source scene 与硬切以既有分析产物为准；图片优化提示词只解释替换目标和保持约束；音频文本、时间、画内/画外和 voice reference 逐字保持。
 - 音频分类只复用已经存在并经过验证的 ASR + YAMNet 节点，不引入替代分类器、声源分离器或新 Skill。当前冻结枚举仍只有 `spoken/sung/null`；YAMNet 检出的 singing、chant、rap、humming 等歌唱类统一归入既有 `sung`，不新增分类值。自动台词只接受 `spoken`；仅有 `sung` 时必须冻结 `lines=[]`、`voice_references=[]`，不得把歌词改名为画外台词。
-- 从源视频抽取的 `work/voice.mp3` 是完整混音，只能用于既有 ASR/YAMNet 分析。只有 YAMNet 冻结结果确认存在真实口播且不存在 BGM 的当前音轨才可继续作为 voice reference。`spoken/edit/custom` 需要声音但检测到或无法排除 BGM 时必须在付费前明确拒绝；只有用户显式选择 `dialogue_mode=none` 才能丢弃真实口播，不得由 `auto` 静默降级。
+- 从源视频抽取的 `work/voice.mp3` 默认只用于既有 ASR/YAMNet 分析。只有同一冻结收据同时确认存在 `spoken` 且 `has_bgm=false` 时，这份原字节才可作为唯一 conditioning voice reference；`spoken/edit/custom` 需要声音但 `has_bgm=true` 或结果未知时必须在付费前明确拒绝。只有用户显式选择 `dialogue_mode=none` 才能丢弃真实口播，不得由 `auto` 静默降级。
 - 默认不生成背景音乐是贯穿 Fusion、Context IR 和最终发布的合同，不是一个可丢失的旧提示词前缀。无真实口播的 segment 使用现有无音频 H3 路径并在拼接时输出静音；不得仅依靠 `no music` 自然语言承诺消除模型生成的音乐。
 - 每张冻结关键帧必须同时绑定源时间、源 scene 和与前一帧的转场类型。源视频的硬切是时间轴权威：不得被后端误标为 `same_camera`，不得被 Fusion 或 Context IR 改到其他时刻，也不得让单个 H3 请求跨该硬切连续变形。
 - 首轮先修复现有 transition、anchor、Fusion 与 Context 合同，在同一请求中明确冻结硬切而非连续 morph；若真实 A/B 仍出现跨切点变形，再复用现有 `segments[N>=1]` 与 stitch 做物理隔离。物理拆分上线前必须证明短逻辑段仍有 9 个唯一源帧、供应商合法时长不会丢动作、台词不跨边界，且逻辑/供应商时长由版本化 receipt 分别绑定；证明不足时付费前拒绝。
@@ -67,7 +67,7 @@ links: []
 7. 是否让 Context IR 后的冻结输入直接进入 H3？
 8. 是否对有真实口播的 segment 保留 H3 原生音频、对无台词 segment 强制静音，并始终阻止源音回挂？
 9. 是否没有新增产品阶段、状态机、Skill 或用户概念？
-10. 是否只把真实口播作为 dialogue，并在付费前阻止完整源混音成为 voice reference？
+10. 是否只把真实口播作为 dialogue，并在付费前阻止任何没有同一 YAMNet 收据证明 `spoken && has_bgm=false` 的完整源混音成为 voice reference？
 11. 是否冻结并逐值保持每张图的源时间、scene、硬切、切后 anchor 和 Picture 映射，并禁止 H3 把硬切执行为连续 morph？只有通过物理拆分 A/B 四项前置门后，才进一步要求请求不跨硬切。
 
 任一回答为否，变更即停止，不以补丁、兼容分支或额外收据绕过。
@@ -90,7 +90,7 @@ links: []
 - [x] 上传后以首个视频流的视觉时长校验；音频/容器尾巴不影响 300 秒门禁，超过 300 秒时拒绝，其余统一规划为 `segments[N>=1]`，每段 provider 整秒时长不超过 14 秒
 - [ ] 每个片段固定使用自身 9 张有序关键帧；关键帧源时间与 scene 逐项冻结，首轮同一 H3 请求必须保留精确 hard cut、切后 anchor 与 Picture 映射并禁止连续 morph；`N=1` 使用完全相同的实现
 - [ ] Fusion 与 Context IR 逐值保持源硬切时点、图片顺序和镜头角色；任一漂移在 H3 POST 前拒绝
-- [ ] 完整源混音不得成为 voice reference；仅有歌曲歌词的 segment 冻结为空台词、零音频参考，并发布静音成片
+- [ ] 只有同一 YAMNet 收据证明 `spoken && has_bgm=false` 的完整源混音可成为 voice reference；仅有歌曲歌词的 segment 冻结为空台词、零音频参考，并发布静音成片
 - [x] 用户提交前看到本次准确新增的付费子任务数；确定失败时复用成功段，只重做失败段及同链下游，拼接失败则零付费本地重拼
 - [x] VFR/CFR 都按视频时间戳批量抽帧；台词、声音呈现与 voice reference 由单一确定性编译器冻结，画内才要求说话人时序，画外不要求嘴型，`none` 不发送台词或声音参考
 - [x] 提交冻结版本化 receipt，随后异步执行 H3，并持续显示 `queued/running/resume_required/succeeded/failed/submission_unknown`

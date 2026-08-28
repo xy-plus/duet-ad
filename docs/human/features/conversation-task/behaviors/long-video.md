@@ -26,7 +26,7 @@ links: [conversation-task, submit-gate, result-display]
 | 用户确认图片 | 每段必须恰有 9 张已确认优化图；确认后冻结其顺序和 bytes，缺帧、重排或漂移均在 H3 前拒绝，不回退原图 |
 | 图片确认完成 | 调用 `video-prompt-fusion`：输入有序新关键帧及其源时间/scene/transition、旧视频提示词、图片优化提示词和音频内容；新视觉元素以优化图为准，动作与相对节奏沿用旧提示词，源硬切时间以冻结分析为准；输出最终视频提示词并绑定全部输入 SHA |
 | 自动台词分析 | 只保留 `spoken`；`sung/chant/rap/humming` 不进入 dialogue。仅有歌词时等同无台词，不发送音频 reference |
-| 用户选择画外声音 | 纯后端确定性编译现有真实口播、时间和已证明为 clean voice 的唯一 reference；不要求嘴型，不调用任何 Skill；完整源混音不具备该资格 |
+| 用户选择画外声音 | 纯后端确定性编译现有真实口播、时间和已证明为 clean voice 的唯一 reference；不要求嘴型，不调用任何 Skill；完整源混音只有在同一既有 YAMNet 收据证明 `spoken && has_bgm=false` 时具备该资格 |
 | 用户选择画内声音 | 只消费 `video-maker` 主分析已经冻结的画内人物/时间证据；证据缺失时付费前明确不可用，不额外调用 Skill 补证 |
 | 用户选择无台词，或自动分析没有真实口播 | 不传台词或声音 reference；丢弃 H3 音轨并由现有拼接器发布静音成片 |
 | Context IR 完成 | 只优化 `video-prompt-fusion` 产生的最终视频提示词并直接交给 H3；不得恢复旧提示词中的旧视觉元素，也不得改变帧序、台词、时间、声音呈现或 voice reference |

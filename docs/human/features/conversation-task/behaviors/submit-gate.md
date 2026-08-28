@@ -39,7 +39,7 @@ links: [conversation-task, processing-state, long-video, postprocess]
 | --- | --- |
 | `dialogue_mode=none` | 零台词、零声音 reference |
 | `dialogue_mode=auto` | 仅保留 `classification=spoken` 的 ASR 行；既有 `sung`（包含 YAMNet 归并的 singing/chant/rap/humming）全部排除。没有真实口播时冻结零台词、零声音 reference |
-| `dialogue_delivery=off_screen` | 逐行保留冻结 text/start/end，`delivery=off_screen`、无画内 subject，只能绑定已证明为 clean voice 的唯一 reference；完整源混音禁止作为 reference |
+| `dialogue_delivery=off_screen` | 逐行保留冻结 text/start/end，`delivery=off_screen`、无画内 subject，只能绑定已证明为 clean voice 的唯一 reference；完整源混音必须由同一既有 YAMNet 收据证明 `spoken && has_bgm=false` |
 | `dialogue_delivery=on_screen` 且主分析已有同一行的画内人物/时间证据 | 逐行绑定既有证据与唯一 voice reference |
 | `dialogue_delivery=on_screen` 但证据缺失 | 409 `on_screen_authority_unavailable`，Context/H3 POST 为 0；不得调用额外 Skill 补证 |
 
@@ -77,7 +77,7 @@ links: [conversation-task, processing-state, long-video, postprocess]
 - `image-postprocess` 已冻结，不再迭代；它只把每段 9 张原始关键帧变成 9 张优化关键帧，不做素材准入。
 - 用户确认后的 9 张优化图按 segment 和帧序进入统一 frozen receipt；随后 `video-prompt-fusion` 以有序新关键帧、旧视频提示词、图片优化提示词和音频内容为唯一四类输入生成最终视频提示词。
 - `new_keyframes` 仍属于第一类输入，但每项必须同时绑定源时间、source scene 与 transition；扩充字段不是第五类输入，也不是新阶段。
-- 音频内容必须冻结既有 ASR/YAMNet 的真实口播筛选结果、BGM 判定与 `music_policy=forbid`；`work/voice.mp3` 只可用于分析，只有既有节点证明 `spoken` 且无 BGM 时才可成为 reference。
+- 音频内容必须冻结既有 ASR/YAMNet 的真实口播筛选结果、BGM 判定与 `music_policy=forbid`；`work/voice.mp3` 默认只用于分析，只有同一收据证明 `spoken && has_bgm=false` 时才可成为 reference。
 - 第一次生成确认只冻结四类输入并项目级调用一次 `video-prompt-fusion`；完成后返回可刷新状态，Web 不自动重提。相同设置由用户再次明确确认后，才允许进入 Context IR 和 H3。
 - Context IR 与 H3 只能消费 `video-prompt-fusion` 输出及其绑定的四类输入；禁止旧视觉 prompt 直接覆盖新人物、新场景或新对象。
 
