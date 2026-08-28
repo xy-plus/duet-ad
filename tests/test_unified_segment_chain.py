@@ -1643,6 +1643,122 @@ def test_completed_v1_fusion_remains_local_read_only_without_h3_revalidation(
     assert main._validate_generated_video_uncached(settings, meta) is True
 
 
+def test_current_v2_h3_native_output_binds_provider_media_before_acceptance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings(tmp_path)
+    cid = "e" * 32
+    root = settings.data_dir / cid
+    root.mkdir(parents=True)
+    _meta, base = _audio_compile_fixture(
+        root, segment_count=1, classification="spoken",
+    )
+    fusion = long_generation.FrozenPromptFusion(
+        version=long_generation.PROMPT_FUSION_VERSION,
+        input_path=root / "work" / "multimodal_input.json",
+        input_data=b"current-input",
+        input_sha256=hashlib.sha256(b"current-input").hexdigest(),
+        output_path=root / "work" / "h3_prompt_plan.json",
+        output_data=b"current-output",
+        output_sha256=hashlib.sha256(b"current-output").hexdigest(),
+        segments=({},),
+        final_prompts=(base.segments[0].prompt,),
+    )
+    plan = replace(base, workflow=h3.H3_WORKFLOW, prompt_fusion=fusion)
+    generation = {
+        "status": "succeeded",
+        "workflow": h3.H3_WORKFLOW,
+        "audio_route": dict(long_generation.H3_NATIVE_AUDIO_ROUTE),
+        "segments": [{"index": 1}],
+    }
+    meta = {
+        "id": cid,
+        "segments": [{"index": 1}],
+        "frozen_plan_receipt": "a" * 64,
+        "fit_mode": "none",
+        "dialogue_mode": "auto",
+        "generation": generation,
+    }
+    provider_media = {1: ("000001", {"decode_complete": True})}
+    calls: list[object] = []
+    monkeypatch.setattr(main, "_uses_segment_coordinator", lambda _meta: True)
+    monkeypatch.setattr(
+        main, "_long_receipt_multimodal_intent", lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        long_generation, "generation_segments_are_valid", lambda *_args: True,
+    )
+    monkeypatch.setattr(long_generation, "freeze_plan", lambda *_a, **_k: plan)
+    monkeypatch.setattr(
+        long_generation,
+        "bound_reusable_segment_indices",
+        lambda *_args: frozenset({1}),
+    )
+
+    def bind_media(*_args, **_kwargs):
+        calls.append("bound")
+        return provider_media
+
+    def validate_stitch(*_args, **kwargs):
+        calls.append(kwargs)
+        return (
+            kwargs.get("generation") is generation
+            and kwargs.get("provider_media") is provider_media
+        )
+
+    monkeypatch.setattr(long_generation, "bound_h3_native_media", bind_media)
+    monkeypatch.setattr(
+        long_generation, "stitched_output_is_reusable", validate_stitch,
+    )
+    monkeypatch.setattr(
+        h3,
+        "legacy_succeeded_output_is_valid",
+        lambda *_args, **_kwargs: pytest.fail(
+            "current native-audio output must not use legacy validation"
+        ),
+    )
+
+    assert main._validate_generated_video_uncached(settings, meta) is True
+    assert calls == [
+        "bound",
+        {"generation": generation, "provider_media": provider_media},
+    ]
+
+    def invalid(code: str):
+        raise long_generation.LongGenerationError(code)
+
+    monkeypatch.setattr(
+        long_generation,
+        "freeze_plan",
+        lambda *_args, **_kwargs: invalid("long_video_plan_invalid"),
+    )
+    assert main._validate_generated_video_uncached(settings, meta) is False
+
+    monkeypatch.setattr(long_generation, "freeze_plan", lambda *_a, **_k: plan)
+    for code in (
+        "long_video_h3_native_media_invalid",
+        "long_video_context_ir_invalid",
+    ):
+        monkeypatch.setattr(
+            long_generation,
+            "bound_h3_native_media",
+            lambda *_args, _code=code, **_kwargs: invalid(_code),
+        )
+        assert main._validate_generated_video_uncached(settings, meta) is False
+
+    monkeypatch.setattr(
+        long_generation,
+        "bound_h3_native_media",
+        lambda *_args, **_kwargs: provider_media,
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "stitched_output_is_reusable",
+        lambda *_args, **_kwargs: False,
+    )
+    assert main._validate_generated_video_uncached(settings, meta) is False
+
+
 def _failed_lf_prompt_fusion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

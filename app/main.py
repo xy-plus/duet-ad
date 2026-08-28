@@ -2407,7 +2407,8 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
                         generation,
                         legacy_terminal_read=legacy_fusion_read,
                     )
-                    if getattr(plan, "workflow", None) in h3.H3_MULTIMODAL_WORKFLOWS
+                    if generation.get("audio_route")
+                    == long_generation.H3_NATIVE_AUDIO_ROUTE
                     else None
                 )
                 stitched_reusable = (
