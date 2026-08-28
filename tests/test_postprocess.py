@@ -6,7 +6,6 @@ import hashlib
 import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -501,7 +500,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     tmp_path, monkeypatch, segment_count, *, postprocess_options=None,
     frozen_single_segment=False, forbid_legacy_short=False,
     complete_generation=False, dialogue_mode="auto",
-    silent_segment_indices=(), context_semantic_recovery=False,
+    silent_segment_indices=(),
     web_output_validation=False, dialogue_classification="spoken",
     has_bgm=False,
 ):
@@ -702,34 +701,35 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         input_data = (scope / "work" / "multimodal_input.json").read_bytes()
         input_payload = json.loads(input_data.decode("utf-8"))
         output_segments = []
-        previous_source = None
         for segment in input_payload["segments"]:
-            timeline, previous_source = long_video.freeze_keyframe_sources(
+            timeline = long_generation._freeze_local_keyframe_sources(
                 [{
                     key: frame[key]
                     for key in (
-                        "order", "source_time_s", "source_scene_id", "transition",
+                        "order", "segment_time_s", "source_scene_id",
+                        "transition",
                     )
                 } for frame in segment["new_keyframes"]],
-                expected_count=9,
-                previous=previous_source,
             )
-            timeline_json = json.dumps(
-                timeline, ensure_ascii=False, separators=(",", ":")
-            )
-            final_prompt = (
-                "<VISUAL>\n"
-                "只使用九张已验收优化图片中的人物、场景与对象。\n"
-                "</VISUAL>\n"
-                f"<KEYFRAME_TIMELINE_JSON>{timeline_json}"
-                "</KEYFRAME_TIMELINE_JSON>\n"
-                f"<AUDIO_CONTENT_JSON>{segment['audio_content']['lines_json']}"
-                "</AUDIO_CONTENT_JSON>"
-                "\n<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+            visual = [
+                f"Use only the accepted optimized storyboard for shot {index}."
+                for index in range(
+                    1,
+                    2 + sum(
+                        frame["transition"]["type"] == "hard_cut"
+                        for frame in timeline
+                    ),
+                )
+            ]
+            final_prompt = long_generation._compile_fusion_ref2va_prompt(
+                visual=visual,
+                timeline=timeline,
+                lines=json.loads(segment["audio_content"]["lines_json"]),
+                music_policy=segment["audio_content"]["music_policy"],
             )
             fusion_prompts.append(final_prompt)
             output_segments.append({
-                "index": segment["index"], "final_prompt": final_prompt,
+                "index": segment["index"], "visual": visual,
             })
         plan = {
             "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
@@ -745,7 +745,6 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     context_sources = []
     context_effective = {}
     context_requests = []
-    injected_semantic_failure = False
 
     def context_gateway(request):
         context_requests.append((request.method, request.url.path))
@@ -763,10 +762,6 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             return httpx.Response(200, json={"task_id": task_id})
         if request.method == "GET":
             task_id = request.url.path.rsplit("/", 1)[-1]
-            if context_semantic_recovery and not injected_semantic_failure:
-                raise httpx.ReadTimeout(
-                    "ambiguous Context query", request=request,
-                )
             return httpx.Response(200, json={"task": {
                 "id": task_id,
                 "task_type": "h3_context_ir",
@@ -779,36 +774,10 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     real_optimize = context_ir_bridge.optimize_h3_prompt
 
     def optimize(frozen):
-        nonlocal injected_semantic_failure
         with httpx.Client(
             transport=httpx.MockTransport(context_gateway)
         ) as context_client:
-            result = real_optimize(frozen, client=context_client)
-        if (
-            context_semantic_recovery
-            and not injected_semantic_failure
-            and result.status == "query_unknown"
-        ):
-            attempt_path = (
-                frozen.workdir / ".context-ir" / "attempts"
-                / result.attempt_id / "attempt.json"
-            )
-            attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
-            attempt["status"] = "failed"
-            attempt["error"] = "context_ir_semantic_mismatch"
-            attempt_path.write_text(
-                json.dumps(
-                    attempt, ensure_ascii=False, sort_keys=True, indent=2,
-                ) + "\n",
-                encoding="utf-8",
-            )
-            injected_semantic_failure = True
-            return replace(
-                result,
-                status="failed",
-                error_code="context_ir_semantic_mismatch",
-            )
-        return result
+            return real_optimize(frozen, client=context_client)
 
     monkeypatch.setattr(context_ir_bridge, "optimize_h3_prompt", optimize)
     h3_requests = []
@@ -890,7 +859,28 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             expected_plan_receipt=expected_receipt,
             fast_mode=False,
         )
+    real_continue_after_fusion = main_module._continue_after_prompt_fusion
+    deferred_continuations = []
+
+    def defer_after_fusion(settings_arg, cid_arg, owner_arg):
+        deferred_continuations.append((settings_arg, cid_arg, owner_arg))
+        return False
+
+    monkeypatch.setattr(
+        main_module, "_continue_after_prompt_fusion", defer_after_fusion,
+    )
+    real_start_automatic = main_module._start_automatic_v4_generation
+    monkeypatch.setattr(
+        main_module,
+        "_start_automatic_v4_generation",
+        lambda *_args, **_kwargs: None,
+    )
     with TestClient(create_app(settings)) as client:
+        monkeypatch.setattr(
+            main_module,
+            "_start_automatic_v4_generation",
+            real_start_automatic,
+        )
         if dialogue_mode != "none":
             missing_delivery = client.post(
                 f"/api/conversations/{cid}/submit",
@@ -923,193 +913,31 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         first = client.post(
             f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
         )
-        if dialogue_mode != "none" and dialogue_classification == "spoken" \
-                and has_bgm is not False:
-            assert first.status_code == 409, first.json()
-            assert first.json() == {"detail": "clean_voice_reference_required"}
-            assert fusion_calls == []
-            assert context_requests == []
-            assert h3_requests == []
-            return
         assert first.status_code == 202, first.json()
         final_submit = first
-        if context_semantic_recovery:
-            assert first.status_code == 202, first.json()
-            assert h3_requests == []
-            failed_meta = storage.load_meta(settings.data_dir, cid)
-            failed_generation = failed_meta["generation"]
-            failed_segment = failed_generation["segments"][0]
-            assert failed_generation["status"] == "failed"
-            assert failed_segment["error"] == "context_ir_semantic_mismatch"
-            assert failed_segment["h3_attempt_id"] is None
-            assert failed_segment["context_ir"]["provider_task_id"] == (
-                "context-task-1"
-            )
-            assert failed_segment["context_ir"]["receipt_path"] is None
-
-            monkeypatch.setattr(
-                postprocess,
-                "_v4_user_acceptance_matches",
-                lambda *_args, **_kwargs: False,
-            )
-            with pytest.raises(
-                postprocess.PostprocessError,
-                match="postprocess_artifacts_invalid",
-            ):
-                postprocess.generation_keyframes(
-                    cdir,
-                    storage.load_meta(settings.data_dir, cid),
-                    originals,
-                    settings=settings,
-                )
-
-            baseline_generation = storage.load_meta(
-                settings.data_dir, cid,
-            )["generation"]
-            drifted_payload = {**payload, "resolution": "480p"}
-            params_drift = client.post(
-                f"/api/conversations/{cid}/submit",
-                headers=AUTH,
-                json=drifted_payload,
-            )
-            assert params_drift.status_code == 409
-            assert params_drift.json() == {
-                "detail": "resume_parameters_changed"
-            }
-
-            for mutation in ("task", "attempt"):
-                drifted_generation = json.loads(json.dumps(baseline_generation))
-                if mutation == "task":
-                    drifted_generation["segments"][0]["context_ir"][
-                        "provider_task_id"
-                    ] = "another-context-task"
-                else:
-                    drifted_generation["segments"][0]["context_ir"][
-                        "attempt_id"
-                    ] = "000002"
-                storage.update_meta(
-                    settings.data_dir, cid, generation=drifted_generation,
-                )
-                rejected = client.post(
-                    f"/api/conversations/{cid}/submit",
-                    headers=AUTH,
-                    json=payload,
-                )
-                assert rejected.status_code == 409
-                assert rejected.json() == {
-                    "detail": "submission_outcome_unknown"
-                }
-                assert storage.load_meta(
-                    settings.data_dir, cid,
-                )["generation"]["status"] == "submission_unknown"
-                storage.update_meta(
-                    settings.data_dir, cid, generation=baseline_generation,
-                )
-
-            unrelated = json.loads(json.dumps(baseline_generation))
-            unrelated["segments"][0]["error"] = "context_ir_provider_failed"
-            storage.update_meta(
-                settings.data_dir, cid, generation=unrelated,
-            )
-            real_freeze_plan = long_generation.freeze_plan
-            monkeypatch.setattr(
-                long_generation,
-                "freeze_plan",
-                lambda *_args, **_kwargs: pytest.fail(
-                    "ordinary failed replay reached freeze_plan"
-                ),
-            )
-            unrelated_replay = client.post(
-                f"/api/conversations/{cid}/submit",
-                headers=AUTH,
-                json=payload,
-            )
-            assert unrelated_replay.status_code == 409
-            assert unrelated_replay.json() == {
-                "detail": "new client_request_id required"
-            }
-            monkeypatch.setattr(
-                long_generation, "freeze_plan", real_freeze_plan
-            )
-            storage.update_meta(
-                settings.data_dir, cid, generation=baseline_generation,
-            )
-
-            context_receipt = (
-                cdir / "work" / "segments" / "1" / ".context-ir"
-                / "attempts" / "000001" / "receipt.json"
-            )
-            context_receipt.write_text("{}\n", encoding="utf-8")
-            receipt_drift = client.post(
-                f"/api/conversations/{cid}/submit",
-                headers=AUTH,
-                json=payload,
-            )
-            assert receipt_drift.status_code == 409
-            assert receipt_drift.json() == {
-                "detail": "submission_outcome_unknown"
-            }
-            context_receipt.unlink()
-            storage.update_meta(
-                settings.data_dir, cid, generation=baseline_generation,
-            )
-
-            h3_root = cdir / "work" / "segments" / "1" / ".h3"
-            h3_root.mkdir()
-            h3_drift = client.post(
-                f"/api/conversations/{cid}/submit",
-                headers=AUTH,
-                json=payload,
-            )
-            assert h3_drift.status_code == 409
-            assert h3_drift.json() == {
-                "detail": "submission_outcome_unknown"
-            }
-            h3_root.rmdir()
-            storage.update_meta(
-                settings.data_dir, cid, generation=baseline_generation,
-            )
-
-            plan_path = cdir / long_video.PLAN_RECEIPT_FILENAME
-            plan_bytes = plan_path.read_bytes()
-            plan_path.write_bytes(plan_bytes + b" ")
-            plan_drift = client.post(
-                f"/api/conversations/{cid}/submit",
-                headers=AUTH,
-                json=payload,
-            )
-            assert plan_drift.status_code == 409
-            assert plan_drift.json() == {
-                "detail": "submission_outcome_unknown"
-            }
-            plan_path.write_bytes(plan_bytes)
-            storage.update_meta(
-                settings.data_dir, cid, generation=baseline_generation,
-            )
-
-            assert h3_requests == []
-            assert sum(
-                method == "POST" and path == "/v2/h3_context_ir"
-                for method, path in context_requests
-            ) == 1
-            recovery = client.post(
-                f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
-            )
-            assert recovery.status_code == 202, recovery.json()
-            assert h3_requests == []
-            context_ready = storage.load_meta(
-                settings.data_dir, cid,
-            )["generation"]
-            assert context_ready["status"] == "resume_required"
-            assert context_ready["segments"][0]["status"] == "resume_required"
-            assert context_ready["segments"][0]["error"] == "context_ir_ready"
-            assert context_ready["segments"][0]["context_ir"]["status"] == (
-                "succeeded"
-            )
-            final_submit = client.post(
-                f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
-            )
-            assert final_submit.status_code == 202, final_submit.json()
+        fused_meta = storage.load_meta(settings.data_dir, cid)
+        fusion_receipt = fused_meta["_prompt_fusion"]
+        assert fusion_receipt["status"] == "done"
+        assert fusion_receipt["error"] is None
+        assert len(fusion_receipt["manifest_sha256"]) == 64
+        assert fused_meta.get("generation") is None
+        assert h3_requests == []
+        assert len(deferred_continuations) == 1
+        assert deferred_continuations[0][1:] == (
+            cid, fused_meta["_input_owner"],
+        )
+        frozen_fusion = long_generation.load_prompt_fusion_manifest(
+            root=cdir, skill_source_path=skill_file,
+        )
+        assert frozen_fusion.final_prompts == tuple(fusion_prompts)
+        monkeypatch.setattr(
+            main_module,
+            "_continue_after_prompt_fusion",
+            real_continue_after_fusion,
+        )
+        assert real_continue_after_fusion(
+            settings, cid, fused_meta["_input_owner"],
+        ) is True
         if web_output_validation:
             assert complete_generation is True
             detail = client.get(
@@ -1153,76 +981,40 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         h3._require_context_ir_receipt(bound_request)
     request = h3_requests[0]
     assert context_sources == fusion_prompts[:len(context_sources)]
-    assert request.prompt == f"EFFECTIVE::{fusion_prompts[0]}"
-    assert "<AUDIO_CONTENT_JSON>" in request.prompt
+    assert request.prompt == fusion_prompts[0]
+    assert "subject_definitions:" in request.prompt
+    assert "<AUDIO_CONTENT_JSON>" not in request.prompt
     assert "[AUDIO_CONTENT_JSON]" not in request.prompt
     assert request.on_screen_dialogue == ()
     assert len(request.keyframes) == 9
-    first_has_audio = (
-        dialogue_mode != "none"
-        and dialogue_classification == "spoken"
-        and 1 not in silent_segment_indices
+    first_has_spoken_prompt = (
+        "the off-screen narrator (S1) says" in fusion_prompts[0]
     )
-    assert len(request.reference_audios) == (1 if first_has_audio else 0)
-    assert request.workflow == (
-        h3.H3_MULTIMODAL_WORKFLOW if first_has_audio else h3.H3_WORKFLOW
-    )
-    if first_has_audio:
-        assert request.multimodal_compiler_version == "video-prompt-fusion-v2"
-        assert request.reference_audios[0].path == cdir / "work" / "voice.mp3"
-        assert request.reference_audios[0].data == (
-            cdir / "work" / "voice.mp3"
-        ).read_bytes()
+    assert request.reference_audios == ()
+    assert request.workflow == h3.H3_WORKFLOW
+    assert request.multimodal_compiler_version is None
+    assert (
+        "the off-screen narrator (S1) says" in request.prompt
+    ) is first_has_spoken_prompt
     assert len(json.loads(
         (cdir / "work" / "multimodal_input.json").read_text(encoding="utf-8")
     )["segments"]) == segment_count
     assert all(old_visual_prompt not in prompt for prompt in context_sources)
     if complete_generation:
-        assert [request.prompt for request in h3_requests] == [
-            f"EFFECTIVE::{prompt}" for prompt in fusion_prompts
-        ]
+        assert [request.prompt for request in h3_requests] == fusion_prompts
         assert len(stitch_calls) == 1
-        native_indices = {
-            index for index in range(1, segment_count + 1)
-            if dialogue_mode != "none"
-            and dialogue_classification == "spoken"
-            and index not in silent_segment_indices
-        }
-        assert stitch_calls[0]["audio_mode"] == (
-            "provider_generated" if native_indices else "mute"
-        )
+        provider_generated_indices = set(range(1, segment_count + 1))
+        assert stitch_calls[0]["audio_mode"] == "provider_generated"
         validation_passes = 1 + int(web_output_validation)
         assert len(reuse_calls) == validation_passes
         assert all(call[1] == dialogue_mode for call in reuse_calls)
-        if not native_indices:
-            assert all(call[3] is None for call in reuse_calls)
-        else:
-            assert all(
-                set(call[3]) == native_indices for call in reuse_calls
-            )
-        assert len(timeline_calls) == len(native_indices) * validation_passes
+        assert set(reuse_calls[0][3]) == provider_generated_indices
+        assert all(call[3] is None for call in reuse_calls[1:])
+        assert len(timeline_calls) == len(provider_generated_indices)
         completed = storage.load_meta(settings.data_dir, cid)
         assert completed["generation"]["status"] == "succeeded"
         for state in completed["generation"]["segments"]:
-            assert ("h3_attempt_id" in state) == (
-                state["index"] in native_indices
-            )
-    if context_semantic_recovery:
-        assert sum(
-            method == "POST" and path == "/v2/h3_context_ir"
-            for method, path in context_requests
-        ) == 1
-        assert sum(
-            method == "GET"
-            and path == "/v2/query/video_generation/context-task-1"
-            for method, path in context_requests
-        ) == 2
-        recovered_context = storage.load_meta(
-            settings.data_dir, cid,
-        )["generation"]["segments"][0]["context_ir"]
-        assert recovered_context["status"] == "succeeded"
-        assert recovered_context["provider_task_id"] == "context-task-1"
-        assert recovered_context["receipt_path"] is not None
+            assert "h3_attempt_id" in state
     for index in range(1, segment_count + 1):
         segment_work = cdir / "work" / "segments" / str(index) / "work"
         assert not (segment_work / "multimodal_input.json").exists()
@@ -1269,7 +1061,7 @@ def test_n2_off_screen_fusion_completes_context_h3_and_native_stitch(
 
 
 @pytest.mark.parametrize("segment_count", [1, 2], ids=("n1", "n2"))
-def test_current_sung_only_uses_no_audio_h3_and_publishes_mute(
+def test_current_sung_only_uses_prompt_fusion_provider_output(
     tmp_path, monkeypatch, segment_count,
 ):
     _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
@@ -1283,7 +1075,7 @@ def test_current_sung_only_uses_no_audio_h3_and_publishes_mute(
 
 
 @pytest.mark.parametrize("has_bgm", [True, None], ids=("bgm", "unknown"))
-def test_current_spoken_without_no_bgm_proof_fails_before_fusion_context_h3(
+def test_current_spoken_without_no_bgm_proof_continues_to_fusion_h3(
     tmp_path, monkeypatch, has_bgm,
 ):
     _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
@@ -1307,7 +1099,7 @@ def test_off_screen_native_output_is_visible_and_delivery_bound(
     )
 
 
-def test_same_submit_recovers_long_context_semantic_mismatch_get_only(
+def test_single_operation_uses_bound_local_context_identity_receipt(
     tmp_path, monkeypatch,
 ):
     _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
@@ -1315,12 +1107,11 @@ def test_same_submit_recovers_long_context_semantic_mismatch_get_only(
         monkeypatch,
         1,
         complete_generation=True,
-        context_semantic_recovery=True,
     )
 
 
 @pytest.mark.parametrize("segment_count", [1, 2])
-def test_n1_n2_none_fusion_enters_context_h3_without_audio(
+def test_n1_n2_none_fusion_uses_provider_generated_output(
     tmp_path, monkeypatch, segment_count,
 ):
     _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
@@ -1332,7 +1123,7 @@ def test_n1_n2_none_fusion_enters_context_h3_without_audio(
     )
 
 
-def test_n2_mixed_fusion_uses_native_audio_then_mute_without_source_overlay(
+def test_n2_mixed_fusion_uses_provider_generated_output_without_source_overlay(
     tmp_path, monkeypatch,
 ):
     _assert_off_screen_fusion_bootstraps_then_enters_context_h3(

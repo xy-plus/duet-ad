@@ -180,19 +180,30 @@ def _long_dual_target_plan_v3(*, frame_count: int = 3):
 @pytest.fixture(autouse=True)
 def _stub_image_postprocess_codex(monkeypatch):
     def generate(_runner, segments, mode, **_kwargs):
-        indices = [segment["index"] for segment in segments]
-        continuity = _short_dual_target_plan() if indices == [0] else {
-            "version": 1,
-            "segment_indices": indices,
-            "elements": [],
+        segment_specs = [
+            {
+                "index": segment["index"],
+                "chain_id": segment["chain_id"],
+                "join_mode": segment["join_mode"],
+                "transition_skeleton": segment["transition_skeleton"],
+            }
+            for segment in segments
+        ]
+        source_frames = {
+            segment["index"]: sorted(segment["keyframes_dir"].glob("*.png"))
+            for segment in segments
         }
-        return continuity, {
-            index: (
-                f"Codex 生成的 {mode} 图片二次编辑提示词"
-                + (f"-{index}" if indices != [0] else "")
+        request = {
+            "semantic_slots": image_optimization.semantic_slot_manifest(
+                segment_specs
             )
-            for index in indices
         }
+        plan, _diagnostics = image_optimization.compile_semantic_plan(
+            _semantic_image_output(request),
+            segment_specs,
+            source_frames=source_frames,
+        )
+        return plan, image_optimization.compile_frame_prompts(plan, mode)
 
     monkeypatch.setattr(
         pipeline.image_optimization, "generate_project_prompts", generate
@@ -271,6 +282,23 @@ def _make_conversation(settings, video_1s):
     # 本文件既有用例模拟旧 voice_mode 会话；新 prepared-input 用例会显式补
     # dialogue_mode + duration_s + 新 voice_mode。
     return storage.update_meta(settings.data_dir, meta["id"], voice_mode="none")
+
+
+def _replace_source_with_duration(settings, cid: str, duration_s: float) -> Path:
+    source = settings.data_dir / cid / "source.mp4"
+    subprocess.run(
+        [
+            "/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=black:s=16x16:r=24",
+            "-t", str(duration_s), "-pix_fmt", "yuv420p", "-an", "-y",
+            str(source),
+        ],
+        check=True,
+    )
+    assert storage.probe_video(source).duration_s == pytest.approx(
+        duration_s, abs=0.05,
+    )
+    return source
 
 
 def test_backend_materializes_exact_nine_in_frozen_order_with_repeat_receipt(
@@ -1015,7 +1043,13 @@ def test_run_converges_container_duration_to_visual_manifest_timeline(
             (anchors.parent / "image_optimization_prompt.txt").write_text(
                 "Codex 分段图片二次编辑提示词", encoding="utf-8"
             )
-            return {**seg, "keyframes": [], "prompt": "p", "dialogue": lines or []}
+            keyframes = _write_valid_package(anchors.parent, frames=9, prompt="p")
+            return {
+                **seg,
+                "keyframes": keyframes,
+                "prompt": "p",
+                "dialogue": lines or [],
+            }
 
     monkeypatch.setattr(pipeline, "_process_segment", fake_process_segment)
     monkeypatch.setattr(
@@ -1192,21 +1226,28 @@ def fake_steps(monkeypatch):
 
     def fake_cmd(argv, *, timeout, step, cwd=None):
         calls["cmd"].append({"argv": list(argv), "timeout": timeout, "step": step, "cwd": cwd})
+        if _run_fake_media_step(argv, step):
+            return
         if step == "extract":
+            duration_s = storage.probe_video(Path(argv[2])).duration_s
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
             (work / "manifest.json").write_text(
-                json.dumps({"duration_seconds": 1.0})
+                json.dumps({"duration_seconds": duration_s})
             )
         elif step == "scenes":
             work = Path(argv[argv.index("--work-dir") + 1])
-            (work / "scenes.json").write_text(
-                json.dumps({"duration_s": 1.0, "scenes": [], "segments": []})
-            )
+            duration_s = json.loads(
+                (work / "manifest.json").read_text(encoding="utf-8")
+            )["duration_seconds"]
+            _write_exact_scene_inventory(work, Path(argv[2]), duration_s)
 
     def fake_codex(self, workdir, prompt):
         calls["codex"].append({"workdir": Path(workdir), "prompt": prompt})
-        _write_valid_package(Path(workdir) / "work")
+        _write_valid_package(
+            Path(workdir) / "work",
+            frames=9 if "最终台词由后端" in prompt else 3,
+        )
 
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
     monkeypatch.setattr(CodexRunner, "run", fake_codex)
@@ -1931,19 +1972,104 @@ VOICE_LINES = [
 ]
 
 
+def _write_exact_nine_extract_manifest(work: Path, duration_s: float) -> None:
+    work.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for index in range(1, 10):
+        time_s = duration_s * (index - 1) / 8
+        name = f"{index:03d}_frame_{time_s:07.3f}s.png"
+        (work / name).write_bytes(_PX_PNG)
+        frames.append({
+            "index": index,
+            "time_seconds": round(time_s, 6),
+            "file": name,
+        })
+    (work / "manifest.json").write_text(
+        json.dumps({"duration_seconds": duration_s, "frames": frames}),
+        encoding="utf-8",
+    )
+
+
+def _write_exact_scene_inventory(
+    work: Path, source: Path, duration_s: float,
+) -> None:
+    """Freeze the exact decode inventory emitted by the current scene detector."""
+    capture = pipeline.cv2.VideoCapture(str(source))
+    assert capture.isOpened()
+    frame_count = 0
+    try:
+        while True:
+            ok, _frame = capture.read()
+            if not ok:
+                break
+            frame_count += 1
+    finally:
+        capture.release()
+    assert frame_count > 0
+    frames = [
+        {
+            "decode_frame_index": index,
+            "pts": index,
+            "time_base_num": round(duration_s * 1_000_000),
+            "time_base_den": frame_count * 1_000_000,
+        }
+        for index in range(frame_count)
+    ]
+    effective_scene = {
+        "index": 1,
+        "source_scene_indices": [1],
+        "start_decode_frame_index": 0,
+        "end_decode_frame_index": frame_count,
+        "start_s": 0.0,
+        "end_s": duration_s,
+        "frames": frames,
+    }
+    (work / "scenes.json").write_text(
+        json.dumps({
+            "duration_s": duration_s,
+            "scenes": [{
+                "index": 1,
+                "start_s": 0.0,
+                "end_s": duration_s,
+            }],
+            "effective_scenes": [effective_scene],
+            "segments": [],
+        }),
+        encoding="utf-8",
+    )
+
+
+def _run_fake_media_step(argv, step: str) -> bool:
+    if step == "segment cut":
+        subprocess.run(argv, check=True, capture_output=True)
+        return True
+    if step.startswith("segment ") and step.endswith(" extract"):
+        source = Path(argv[2])
+        work = Path(argv[argv.index("--out-dir") + 1])
+        _write_exact_nine_extract_manifest(
+            work, storage.probe_video(source).duration_s,
+        )
+        return True
+    return False
+
+
 def _fake_extract_ok(argv, *, timeout, step, cwd=None):
     """extract/scenes 假子进程：写 manifest（含 duration_seconds，口播步要读）与空拆段 scenes.json。"""
+    if _run_fake_media_step(argv, step):
+        return
     if step == "extract":
+        duration_s = storage.probe_video(Path(argv[2])).duration_s
         work = Path(argv[argv.index("--out-dir") + 1])
         (work / "contact_sheet.jpg").write_bytes(b"sheet")
         (work / "manifest.json").write_text(
-            json.dumps({"duration_seconds": 1.0}), encoding="utf-8"
+            json.dumps({"duration_seconds": duration_s}), encoding="utf-8"
         )
     elif step == "scenes":
         work = Path(argv[argv.index("--work-dir") + 1])
-        (work / "scenes.json").write_text(
-            json.dumps({"duration_s": 1.0, "scenes": [], "segments": []})
-        )
+        duration_s = json.loads(
+            (work / "manifest.json").read_text(encoding="utf-8")
+        )["duration_seconds"]
+        _write_exact_scene_inventory(work, Path(argv[2]), duration_s)
 
 
 def _set_voice_mode(settings, meta, voice_mode, target_language=""):
@@ -2495,14 +2621,14 @@ def test_run_voice_no_audio_track_fails(tmp_path, video_1s, monkeypatch):
     assert "audio" in m["error"]
 
 
-def test_run_dialogue_auto_no_audio_is_valid_and_writes_prepared_receipt(
+def test_run_dialogue_auto_no_audio_is_valid_and_writes_visual_plan_receipt(
     tmp_path, video_1s, monkeypatch
 ):
-    """新 H3 auto：无音轨等价于空台词，视觉产物完成后必须冻结 receipt。"""
-    from app import prepared_input
+    """新 H3 auto：无音轨等价于空台词，exact-nine 视觉计划仍会冻结。"""
 
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
+    _replace_source_with_duration(settings, meta["id"], 10.0)
     storage.update_meta(
         settings.data_dir,
         meta["id"],
@@ -2514,7 +2640,7 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_prepared_receipt(
     )
 
     def fake_codex(self, workdir, prompt):
-        _write_valid_package(Path(workdir) / "work")
+        _write_valid_package(Path(workdir) / "work", frames=9)
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
     monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
@@ -2528,36 +2654,35 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_prepared_receipt(
     assert stored["voice_lines"] == []
     assert stored["voice_line_provenance"] == []
     assert stored["vocal_filter_enabled"] is True
-    assert stored["prepared_input_receipt"] == prepared_input.RECEIPT_FILENAME
-    receipt_path = cdir / prepared_input.RECEIPT_FILENAME
+    assert stored["long_video_plan_receipt"] == long_video.PLAN_RECEIPT_FILENAME
+    receipt_path = cdir / long_video.PLAN_RECEIPT_FILENAME
     assert receipt_path.is_file()
-    loaded = prepared_input.load_prepared_input(
-        cdir, receipt_path, expected_dialogue=()
-    )
-    assert loaded.dialogue_mode == "auto"
-    assert loaded.normalized_audio is None
-    assert loaded.voice_texts == ()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["video"]["duration_s"] == 10.0
+    assert len(receipt["segments"]) == 1
+    assert receipt["segments"][0]["dialogue"]["count"] == 0
+    assert stored["segments"][0]["keyframes"] == [
+        f"{index:02d}.png" for index in range(1, 10)
+    ]
     frozen = stored["_image_optimization"]
     continuity = stored["_image_continuity"]
-    assert continuity["version"] == 2
-    assert continuity["segment_indices"] == [0]
+    assert continuity["version"] == 4
+    assert continuity["segment_indices"] == [1]
     assert continuity["eligible"] is True
     assert pipeline.image_optimization.dual_target_plan_receipt(stored) == continuity
-    assert frozen["version"] == 2
-    assert frozen["segments"][0]["current"] == (
-        "Codex 生成的 independent_parallel 图片二次编辑提示词"
-    )
-    assert frozen["segments"][0]["current"] != stored["prompt"]
-    assert (cdir / "work" / "image_optimization_prompt.txt").read_text(
-        encoding="utf-8"
-    ).strip() == frozen["segments"][0]["current"]
+    assert frozen["version"] == 4
+    assert [(item["segment_index"], item["frame_name"])
+            for item in frozen["frames"]] == [
+        (1, f"{index:02d}.png") for index in range(1, 10)
+    ]
 
 
-def test_short_v3_freezes_a_complete_frame_bound_prompt_receipt(
+def test_exact_nine_freezes_a_complete_v4_frame_bound_prompt_receipt(
     tmp_path, video_1s, monkeypatch
 ):
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
+    _replace_source_with_duration(settings, meta["id"], 10.0)
     storage.update_meta(
         settings.data_dir,
         meta["id"],
@@ -2573,36 +2698,22 @@ def test_short_v3_freezes_a_complete_frame_bound_prompt_receipt(
     monkeypatch.setattr(
         CodexRunner,
         "run",
-        lambda self, workdir, prompt: _write_valid_package(Path(workdir) / "work"),
+        lambda self, workdir, prompt: _write_valid_package(
+            Path(workdir) / "work", frames=9,
+        ),
     )
-    plan = _short_dual_target_plan_v3()
-    prompts = {
-        0: {
-            index: f"frame {index} own immutable prompt"
-            for index in (1, 2, 3)
-        }
-    }
-    monkeypatch.setattr(
-        pipeline,
-        "_generate_image_optimization_project",
-        lambda *_args, **_kwargs: (plan, prompts),
-    )
-
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
 
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done", stored.get("error")
-    assert stored["_image_continuity"]["version"] == 3
+    assert stored["_image_continuity"]["version"] == 4
     frozen = stored["_image_optimization"]
-    assert frozen["version"] == 3
+    assert frozen["version"] == 4
     assert [item["frame_name"] for item in frozen["frames"]] == [
-        "01.png", "02.png", "03.png"
+        f"{index:02d}.png" for index in range(1, 10)
     ]
-    assert [item["current"] for item in frozen["frames"]] == [
-        "frame 1 own immutable prompt",
-        "frame 2 own immutable prompt",
-        "frame 3 own immutable prompt",
-    ]
+    assert all(item["segment_index"] == 1 for item in frozen["frames"])
+    assert all(item["current"].strip() for item in frozen["frames"])
 
 
 def test_short_pipeline_semantic_compiler_continues_to_frozen_v4(
@@ -2743,10 +2854,9 @@ def test_run_dialogue_auto_ignores_external_lines_and_isolates_visual_codex(
     tmp_path, video_1s, monkeypatch
 ):
     """auto 只收养 _voice_step：外部/OCR 文字不能进入唯一发声块。"""
-    from app import prepared_input
-
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
+    _replace_source_with_duration(settings, meta["id"], 10.0)
     storage.update_meta(
         settings.data_dir,
         meta["id"],
@@ -2774,7 +2884,9 @@ def test_run_dialogue_auto_ignores_external_lines_and_isolates_visual_codex(
             return
         maker_saw_voice_file.append((work / "voice_lines.json").exists())
         assert "最终台词由后端" in prompt
-        _write_valid_package(work, prompt="画面包装上可见 OCR ONLY。")
+        _write_valid_package(
+            work, frames=9, prompt="画面包装上可见 OCR ONLY。",
+        )
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
@@ -2787,21 +2899,12 @@ def test_run_dialogue_auto_ignores_external_lines_and_isolates_visual_codex(
     assert stored["status"] == "done", stored.get("error")
     assert maker_saw_voice_file == [False]
     assert stored["voice_lines"] == [asr_line]
-    assert '说出台词："真实口播。"，嘴型与画面同步' in stored["prompt"]
-    assert '说出台词："OCR ONLY"' not in stored["prompt"]
-    assert "外部伪台词" not in stored["prompt"]
-    expected = prepared_input.prepare_dialogue(
-        "auto",
-        duration_s=10,
-        automatic_lines=[{**asr_line, "classification": "spoken"}],
-    )
-    loaded = prepared_input.load_prepared_input(
-        cdir,
-        cdir / prepared_input.RECEIPT_FILENAME,
-        expected_dialogue=expected,
-    )
-    assert loaded.normalized_audio.data == b"normalized-audio"
-    assert loaded.voice_texts == ("真实口播。",)
+    segment_prompt = stored["segments"][0]["prompt"]
+    assert '说出台词："真实口播。"，嘴型与画面同步' in segment_prompt
+    assert '说出台词："OCR ONLY"' not in segment_prompt
+    assert "外部伪台词" not in segment_prompt
+    assert stored["segments"][0]["dialogue"] == [asr_line]
+    assert (cdir / "work" / "voice.mp3").read_bytes() == b"normalized-audio"
 
 
 @pytest.mark.parametrize(
@@ -2816,6 +2919,7 @@ def test_run_dialogue_auto_preserves_requested_voice_processing_mode(
 ):
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
+    _replace_source_with_duration(settings, meta["id"], 10.0)
     storage.update_meta(
         settings.data_dir,
         meta["id"],
@@ -2842,7 +2946,7 @@ def test_run_dialogue_auto_preserves_requested_voice_processing_mode(
                 encoding="utf-8",
             )
         else:
-            _write_valid_package(work)
+            _write_valid_package(work, frames=9)
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
@@ -2861,6 +2965,7 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
 ):
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
+    _replace_source_with_duration(settings, meta["id"], 15.4)
     storage.update_meta(
         settings.data_dir,
         meta["id"],
@@ -2873,6 +2978,8 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
     line = {"text": "第十六秒台词。", "start_s": 15.1, "end_s": 15.4}
 
     def fake_steps(argv, *, timeout, step, cwd=None):
+        if _run_fake_media_step(argv, step):
+            return
         if step == "extract":
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
@@ -2881,28 +2988,7 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
             )
         elif step == "scenes":
             work = Path(argv[argv.index("--work-dir") + 1])
-            (work / "scenes.json").write_text(
-                json.dumps({"duration_s": 15.4, "scenes": [], "segments": []}),
-                encoding="utf-8",
-            )
-        elif step.startswith("segment ") and step.endswith(" extract"):
-            work = Path(argv[argv.index("--out-dir") + 1])
-            work.mkdir(parents=True, exist_ok=True)
-            (work / "001_frame_000.000s.png").write_bytes(_PX_PNG)
-            (work / "002_frame_015.400s.png").write_bytes(_PX_PNG)
-            (work / "manifest.json").write_text(
-                json.dumps(
-                    {
-                        "frames": [
-                            {"index": 1, "time_seconds": 0.0,
-                             "file": "001_frame_000.000s.png"},
-                            {"index": 2, "time_seconds": 15.4,
-                             "file": "002_frame_015.400s.png"},
-                        ]
-                    }
-                ),
-                encoding="utf-8",
-            )
+            _write_exact_scene_inventory(work, Path(argv[2]), 15.4)
 
     def fake_extract_audio(cdir_arg):
         out = cdir_arg / "work" / "voice.mp3"
@@ -2914,17 +3000,9 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
         if "voice.mp3" in prompt:
             (work / "voice_lines.json").write_text(json.dumps([line]), encoding="utf-8")
         else:
-            _write_valid_package(work)
+            _write_valid_package(work, frames=9)
 
     monkeypatch.setattr(pipeline, "_run_cmd", fake_steps)
-    monkeypatch.setattr(
-        pipeline,
-        "_cut_segment",
-        lambda _source, _start, _end, segdir: (
-            segdir.mkdir(parents=True, exist_ok=True),
-            (segdir / "source.mp4").write_bytes(b"segment"),
-        ),
-    )
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(voice, "probe_audio_duration", lambda _path: 15.4)
     monkeypatch.setattr(CodexRunner, "run", fake_codex)
@@ -2955,12 +3033,19 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
     assert stored["segments"][1]["dialogue"] == [
         {"text": "第十六秒台词。", "start_s": 1.1, "end_s": 1.4}
     ]
-    digest = hashlib.sha256((cdir / "long_video_plan.json").read_bytes()).hexdigest()
-    frozen = long_generation.freeze_plan(cdir, stored, digest, "none", "auto")
+    assert all(
+        len(segment["keyframe_sampling"]["keyframes"]) == 9
+        for segment in stored["segments"]
+    )
     assert [
-        long_video.provider_duration_s(item.start_s, item.end_s)
-        for item in frozen.segments
-    ] == [14, 2]
+        item["source_time_s"]
+        for segment in stored["segments"]
+        for item in segment["keyframe_sources"]
+    ] == sorted(
+        item["source_time_s"]
+        for segment in stored["segments"]
+        for item in segment["keyframe_sources"]
+    )
 
 
 def test_long_v3_freezes_every_segment_source_frame_before_postprocess(
@@ -3061,6 +3146,7 @@ def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
     """线上复现：10.080s MP3 不能把 10.000s 视频 receipt 的台词时间轴撑长。"""
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
+    _replace_source_with_duration(settings, meta["id"], 10.0)
     storage.update_meta(
         settings.data_dir,
         meta["id"],
@@ -3074,6 +3160,8 @@ def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
     normalized = {"text": "完整十秒口播。", "start_s": 0.0, "end_s": 10.0}
 
     def fake_steps(argv, *, timeout, step, cwd=None):
+        if _run_fake_media_step(argv, step):
+            return
         if step == "extract":
             work = Path(argv[argv.index("--out-dir") + 1])
             (work / "contact_sheet.jpg").write_bytes(b"sheet")
@@ -3082,10 +3170,7 @@ def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
             )
         elif step == "scenes":
             work = Path(argv[argv.index("--work-dir") + 1])
-            (work / "scenes.json").write_text(
-                json.dumps({"duration_s": 10.0, "scenes": [], "segments": []}),
-                encoding="utf-8",
-            )
+            _write_exact_scene_inventory(work, Path(argv[2]), 10.0)
 
     def fake_extract_audio(cdir_arg):
         out = cdir_arg / "work" / "voice.mp3"
@@ -3099,7 +3184,7 @@ def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
                 json.dumps([asr_line]), encoding="utf-8"
             )
         else:
-            _write_valid_package(work)
+            _write_valid_package(work, frames=9)
 
     monkeypatch.setattr(pipeline, "_run_cmd", fake_steps)
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
@@ -3132,9 +3217,10 @@ def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
         }
     ], audio=b"normalized-audio", has_bgm=False)
     assert any("video duration 10.000s" in item for item in stored["voice_warnings"])
-    receipt = json.loads((cdir / "prepared_input.json").read_text(encoding="utf-8"))
+    receipt = json.loads((cdir / "long_video_plan.json").read_text(encoding="utf-8"))
     assert receipt["video"]["duration_s"] == 10.0
-    assert receipt["dialogue"]["lines"][0]["end_s"] == 10.0
+    assert receipt["segments"][0]["dialogue"]["count"] == 1
+    assert stored["segments"][0]["dialogue"] == [normalized]
 
 
 def test_run_voice_drops_lines_starting_in_mp3_only_tail(tmp_path, video_1s, monkeypatch):
@@ -3587,9 +3673,9 @@ def test_startup_pipeline_recovery_replaces_stale_segment_scripts(
     segment = {"index": 1, "start_s": 0.0, "end_s": 1.0}
     monkeypatch.setattr(pipeline, "_detect_segments", lambda *_args: [segment])
 
-    def fake_cut(_source, _start_s, _end_s, segdir):
+    def fake_cut(source, _start_s, _end_s, segdir):
         segdir.mkdir(parents=True, exist_ok=True)
-        (segdir / "source.mp4").write_bytes(b"segment")
+        shutil.copy(source, segdir / "source.mp4")
 
     monkeypatch.setattr(pipeline, "_cut_segment", fake_cut)
     monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
@@ -3801,9 +3887,11 @@ def test_post_triggers_pipeline_and_detail_filled(tmp_path, video_1s, fake_steps
         cid = r.json()["id"]
         r = c.get(f"/api/conversations/{cid}", headers=AUTH)
     body = r.json()
-    assert body["status"] == "done"
-    assert body["keyframes"] == ["01.png", "02.png", "03.png"]
-    assert body["prompt"] == prepared_input.compose_final_prompt(PROMPT_TEXT, ())
+    assert body["status"] == "done", body.get("error")
+    assert body["segments"][0]["keyframes"] == [
+        f"{index:02d}.png" for index in range(1, 10)
+    ]
+    assert body["segments"][0]["visual_prompt"] == PROMPT_TEXT
     assert body["aspect_ratio"] == "16:9"
     assert body["resolution"] == "480p"
     assert body["fit_profiles"] == {
@@ -3831,7 +3919,7 @@ def test_done_fit_requirement_uses_actual_keyframes_not_source_dimensions(
             f"/api/conversations/{created.json()['id']}", headers=AUTH
         ).json()
 
-    assert detail["status"] == "done"
+    assert detail["status"] == "done", detail.get("error")
     assert detail["fit_required"] is True  # fake Codex 产出 1x1 关键帧
     assert detail["aspect_ratio"] == "9:16"
     assert detail["resolution"] == "480p"
