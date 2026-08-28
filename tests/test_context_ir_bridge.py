@@ -195,20 +195,22 @@ def _no_audio_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest
 
 def _timeline_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
     base = _no_audio_frozen(tmp_path)
-    timeline = [
-        {
-            "order": 1,
-            "source_time_s": 0.0,
-            "source_scene_id": "SCENE_01",
-            "transition": {"type": "start", "at_s": 0.0},
-        },
-        {
-            "order": 2,
-            "source_time_s": 2.5,
-            "source_scene_id": "SCENE_02",
-            "transition": {"type": "hard_cut", "at_s": 2.267},
-        },
-    ]
+    timeline = []
+    for order, source_time_s in enumerate(
+        [0.0, 1.0, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0], 1
+    ):
+        timeline.append({
+            "order": order,
+            "source_time_s": source_time_s,
+            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "transition": (
+                {"type": "start", "at_s": 0.0}
+                if order == 1 else
+                {"type": "hard_cut", "at_s": 2.267}
+                if order == 4 else
+                {"type": "continuous", "at_s": None}
+            ),
+        })
     timeline_json = json.dumps(
         timeline,
         ensure_ascii=False,
@@ -870,6 +872,26 @@ def test_context_ir_rejects_hard_cut_time_drift_before_h3(tmp_path):
     assert result.error_code == "context_ir_semantic_mismatch"
     assert result.receipt_path is None
     assert not (frozen.workdir / ".h3").exists()
+
+
+def test_context_ir_rejects_non_nine_keyframe_timeline():
+    timeline = [{
+        "order": 1,
+        "source_time_s": 0.0,
+        "source_scene_id": "SCENE_01",
+        "transition": {"type": "start", "at_s": 0.0},
+    }]
+    prompt = (
+        "<KEYFRAME_TIMELINE_JSON>"
+        + json.dumps(timeline, separators=(",", ":"))
+        + "</KEYFRAME_TIMELINE_JSON>"
+    )
+
+    with pytest.raises(
+        context_ir_bridge.ContextIrContractError,
+        match="context_ir_semantic_mismatch",
+    ):
+        context_ir_bridge._keyframe_timeline_contract(prompt)
 
 
 def test_receipt_bound_voice_allows_context_to_split_off_screen_dialogue(tmp_path):

@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -546,7 +547,6 @@ def _frame_inventory(
     frame_paths: dict[int, list[Path]],
     *,
     segment_lineage: dict[int, dict] | None = None,
-    keyframe_sources: dict[int, list[dict]] | None = None,
 ) -> list[dict]:
     inventory = []
     previous: dict | None = None
@@ -560,17 +560,12 @@ def _frame_inventory(
         ):
             raise PipelineError("image optimization frame inventory is invalid")
         lineage = None if segment_lineage is None else segment_lineage.get(segment_index)
-        sources = None if keyframe_sources is None else keyframe_sources.get(segment_index)
         if segment_lineage is not None and (
             not isinstance(lineage, dict)
             or set(lineage) != {"chain_id", "join_mode"}
             or not isinstance(lineage["chain_id"], str)
             or not lineage["chain_id"]
             or lineage["join_mode"] not in {"hard_cut", "continue"}
-        ):
-            raise PipelineError("image optimization frame inventory is invalid")
-        if keyframe_sources is not None and (
-            not isinstance(sources, list) or len(sources) != len(paths)
         ):
             raise PipelineError("image optimization frame inventory is invalid")
         for frame_index, path in enumerate(paths, 1):
@@ -587,39 +582,20 @@ def _frame_inventory(
                 "source_sha256": source_sha256,
             }
             if lineage is not None:
-                source = None if sources is None else sources[frame_index - 1]
-                if source is not None:
-                    if (
-                        not isinstance(source, dict)
-                        or source.get("order") != frame_index
-                        or not isinstance(source.get("source_time_s"), (int, float))
-                        or not isinstance(source.get("source_scene_id"), str)
-                        or not source["source_scene_id"]
-                        or not isinstance(source.get("transition"), dict)
-                        or set(source["transition"]) != {"type", "at_s"}
-                        or source["transition"].get("type") not in {
-                            "start", "same_camera", "camera_motion", "hard_cut",
-                        }
-                    ):
-                        raise PipelineError(
-                            "image optimization frame inventory is invalid"
-                        )
-                    transition = source["transition"]["type"]
-                else:
-                    transition = (
-                        "start"
-                        if previous is None
-                        else (
-                            "hard_cut"
-                            if frame_index == 1 and lineage["join_mode"] == "hard_cut"
-                            # Chain lineage proves continuity but contains no measured
-                            # camera transform.  It can therefore establish only the
-                            # conservative same-camera relation; motion needs a
-                            # versioned, source-bound measurement before it may be
-                            # frozen as evidence.
-                            else "same_camera"
-                        )
+                transition = (
+                    "start"
+                    if previous is None
+                    else (
+                        "hard_cut"
+                        if frame_index == 1 and lineage["join_mode"] == "hard_cut"
+                        # Chain lineage proves continuity but contains no measured
+                        # camera transform.  It can therefore establish only the
+                        # conservative same-camera relation; motion needs a
+                        # versioned, source-bound measurement before it may be
+                        # frozen as evidence.
+                        else "same_camera"
                     )
+                )
                 evidence = {
                     "chain_id": lineage["chain_id"],
                     "join_mode": lineage["join_mode"],
@@ -631,8 +607,6 @@ def _frame_inventory(
                     },
                     "transition": transition,
                 }
-                if source is not None:
-                    evidence["source"] = source
                 item.update(
                     source_transition_from_previous=transition,
                     source_transition_evidence_sha256=hashlib.sha256(
@@ -646,8 +620,6 @@ def _frame_inventory(
             inventory.append(item)
     if segment_lineage is not None and set(segment_lineage) != set(frame_paths):
         raise PipelineError("image optimization frame inventory is invalid")
-    if keyframe_sources is not None and set(keyframe_sources) != set(frame_paths):
-        raise PipelineError("image optimization frame inventory is invalid")
     return inventory
 
 
@@ -660,7 +632,6 @@ def _freeze_image_optimization(
     *,
     require_dual_target: bool,
     segment_lineage: dict[int, dict] | None = None,
-    keyframe_sources: dict[int, list[dict]] | None = None,
 ) -> tuple[dict, dict]:
     """Freeze either the legacy segment prompt or V3 source-frame prompts."""
     try:
@@ -668,7 +639,6 @@ def _freeze_image_optimization(
             inventory = _frame_inventory(
                 frame_paths,
                 segment_lineage=segment_lineage if continuity.get("version") == 4 else None,
-                keyframe_sources=keyframe_sources if continuity.get("version") == 4 else None,
             )
             frame_counts = {
                 index: len(paths) for index, paths in frame_paths.items()
@@ -773,8 +743,6 @@ def _generate_segmented_image_prompts(
     session_dir: Path,
 ) -> tuple[dict, dict]:
     frame_paths = {}
-    keyframe_sources = {}
-    has_keyframe_source_declaration = False
     for segment, meta in zip(segments, seg_metas):
         directory = work / "segments" / str(segment["index"]) / "work" / "keyframes"
         names = meta.get("keyframes") if isinstance(meta, dict) else None
@@ -784,18 +752,6 @@ def _generate_segmented_image_prompts(
             else sorted(path for path in directory.glob("*.png") if path.is_file())
         )
         frame_paths[segment["index"]] = paths
-        sources = meta.get("keyframe_sources") if isinstance(meta, dict) else None
-        has_keyframe_source_declaration = (
-            has_keyframe_source_declaration
-            or isinstance(meta, dict) and "keyframe_sources" in meta
-        )
-        if isinstance(sources, list):
-            keyframe_sources[segment["index"]] = sources
-    if (
-        has_keyframe_source_declaration
-        and set(keyframe_sources) != set(frame_paths)
-    ):
-        raise PipelineError("keyframe source timeline is invalid")
     transitions_by_segment = {}
     if all(frame_paths.values()):
         transition_inventory = _frame_inventory(
@@ -806,9 +762,6 @@ def _generate_segmented_image_prompts(
                 }
                 for segment in segments
             },
-            keyframe_sources=(
-                keyframe_sources if has_keyframe_source_declaration else None
-            ),
         )
         transitions_by_segment = {
             index: [item for item in transition_inventory if item["segment_index"] == index]
@@ -1306,17 +1259,10 @@ def _source_scenes_for_timeline(work: Path, duration_s: float) -> list[dict]:
         )
         if source_index != position:
             raise PipelineError("source scene timeline is invalid")
-        frames = source.get("frames") if source is not None else None
-        if frames is not None and (
-            not isinstance(frames, list)
-            or not all(isinstance(name, str) and name for name in frames)
-        ):
-            raise PipelineError("source scene timeline is invalid")
         result.append({
             "index": position,
             "start_s": bound["start_s"],
             "end_s": bound["end_s"],
-            "has_source_frames": frames is None or bool(frames),
         })
     return result
 
@@ -1345,7 +1291,6 @@ def _bind_keyframe_source_timeline(
             index = raw["index"]
             start_s = float(raw["start_s"])
             end_s = float(raw["end_s"])
-            has_source_frames = raw.get("has_source_frames", True)
         except (KeyError, TypeError, ValueError):
             raise PipelineError("keyframe source timeline is invalid") from None
         if (
@@ -1353,7 +1298,6 @@ def _bind_keyframe_source_timeline(
             or not math.isfinite(start_s)
             or not math.isfinite(end_s)
             or start_s >= end_s
-            or isinstance(has_source_frames, bool) is False
             or (previous_end is not None and abs(start_s - previous_end) > _FLOAT_COMPARISON_EPS_S)
         ):
             raise PipelineError("keyframe source timeline is invalid")
@@ -1362,7 +1306,6 @@ def _bind_keyframe_source_timeline(
             "id": f"SCENE_{index:02d}",
             "start_s": round(start_s, long_video.BOUNDARY_PRECISION),
             "end_s": round(end_s, long_video.BOUNDARY_PRECISION),
-            "has_source_frames": has_source_frames,
         })
         previous_end = end_s
 
@@ -1455,8 +1398,7 @@ def _bind_keyframe_source_timeline(
                 raise PipelineError("keyframe source timeline is invalid")
             crossed = [
                 candidate for candidate in scenes[1:]
-                if candidate["has_source_frames"]
-                and previous_time < candidate["start_s"] <= source_time_s
+                if previous_time < candidate["start_s"] <= source_time_s
             ]
             if len(crossed) > 1:
                 raise PipelineError("keyframe source timeline misses scene anchor")
@@ -1469,7 +1411,7 @@ def _bind_keyframe_source_timeline(
             else:
                 if previous[3]["id"] != scene["id"]:
                     raise PipelineError("keyframe source timeline is invalid")
-                transition = {"type": "same_camera", "at_s": None}
+                transition = {"type": "continuous", "at_s": None}
         per_segment[segment_index].append({
             "order": order,
             "source_time_s": source_time_s,
@@ -1954,6 +1896,120 @@ def _canonical_json_bytes(value: object) -> bytes:
         raise PipelineError("prompt fusion artifact is invalid") from None
 
 
+def _require_prompt_fusion_v2_input(input_data: bytes) -> dict:
+    """Creation may consume only the current source-timeline contract."""
+    try:
+        payload = json.loads(input_data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise PipelineError("prompt fusion input is invalid") from None
+    segments = payload.get("segments") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema", "version", "segments"}
+        or payload.get("schema") != long_generation.PROMPT_FUSION_INPUT_SCHEMA
+        or payload.get("version")
+        != long_generation.VISUAL_PROMPT_FUSION_VERSION
+        or not isinstance(segments, list)
+        or not segments
+    ):
+        raise PipelineError("prompt fusion input is invalid")
+    previous: dict | None = None
+    for index, segment in enumerate(segments, 1):
+        frames = segment.get("new_keyframes") if isinstance(segment, dict) else None
+        if (
+            not isinstance(segment, dict)
+            or segment.get("index") != index
+            or not isinstance(frames, list)
+            or len(frames) != 9
+        ):
+            raise PipelineError("prompt fusion input is invalid")
+        try:
+            _frozen, previous = long_video.freeze_keyframe_sources(
+                [{
+                    key: frame[key]
+                    for key in (
+                        "order", "source_time_s", "source_scene_id", "transition",
+                    )
+                } for frame in frames],
+                expected_count=9,
+                previous=previous,
+            )
+        except (KeyError, TypeError, long_video.LongVideoError):
+            raise PipelineError("prompt fusion input is invalid") from None
+    return payload
+
+
+def _copy_prompt_fusion_frame(
+    *, root: Path, stage: Path, frame: Mapping,
+) -> None:
+    """Copy one receipt-bound regular image into an otherwise empty stage."""
+    raw_path = frame.get("path")
+    expected_sha256 = frame.get("sha256")
+    if (
+        not isinstance(raw_path, str)
+        or not raw_path
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+    ):
+        raise PipelineError("prompt fusion input is invalid")
+    relative = Path(raw_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise PipelineError("prompt fusion input is invalid")
+    source_candidate = root / relative
+    if source_candidate.is_symlink():
+        raise PipelineError("prompt fusion input is invalid")
+    try:
+        source = source_candidate.resolve(strict=True)
+        source.relative_to(root)
+        descriptor = os.open(
+            source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except (OSError, ValueError):
+        raise PipelineError("prompt fusion input is invalid") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise PipelineError("prompt fusion input is invalid")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read()
+    finally:
+        os.close(descriptor)
+    if not data or hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise PipelineError("prompt fusion input is invalid")
+    destination = stage / relative
+    try:
+        destination.resolve().relative_to(stage)
+    except ValueError:
+        raise PipelineError("prompt fusion input is invalid") from None
+    destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        with destination.open("xb") as stream:
+            stream.write(data)
+    except OSError:
+        raise PipelineError("prompt fusion input is invalid") from None
+
+
+def _read_prompt_fusion_stage_output(path: Path, *, segment_count: int) -> bytes:
+    max_bytes = 64 * 1024 + MAX_PROMPT_BYTES * segment_count
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError:
+        raise PipelineError("prompt fusion raw output is missing") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+            raise PipelineError("prompt fusion raw output is invalid")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read(max_bytes + 1)
+    finally:
+        os.close(descriptor)
+    if not data or len(data) > max_bytes:
+        raise PipelineError("prompt fusion raw output is invalid")
+    return data
+
+
 def queue_prompt_fusion(
     settings: Settings,
     cid: str,
@@ -1970,6 +2026,7 @@ def queue_prompt_fusion(
         or len(image_acceptance_sha256) != 64
     ):
         raise PipelineError("prompt fusion input is invalid")
+    _require_prompt_fusion_v2_input(input_data)
     input_path = work / h3_project.SKILL_INPUT_FILENAME
     output_path = work / "h3_prompt_plan.json"
     manifest_path = work / h3_project.SOURCE_FILENAME
@@ -2291,24 +2348,39 @@ def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
         input_data = input_path.read_bytes()
         if hashlib.sha256(input_data).hexdigest() != state.get("input_sha256"):
             raise PipelineError("prompt fusion input drifted")
+        input_payload = _require_prompt_fusion_v2_input(input_data)
         skill_data = PROMPT_FUSION_SKILL_MD.read_bytes()
         if not skill_data:
             raise PipelineError("prompt fusion Skill is missing")
+        if not callable(getattr(runner, "run_isolated", None)):
+            raise PipelineError("prompt fusion isolation unavailable")
         _atomic_bytes(frozen_skill_path, skill_data)
         output_path.unlink(missing_ok=True)
         manifest_path.unlink(missing_ok=True)
-        runner.run(
-            root,
-            "按 work/video_prompt_fusion_skill.md 执行一次项目级视频提示词融合；"
-            "只读 work/multimodal_input.json 及其绑定的有序图片，只写 "
-            "work/h3_prompt_plan.json。不得运行音频、Binding、Speaker 或其他 phase。",
-        )
-        if output_path.is_symlink():
-            raise PipelineError("prompt fusion raw output is invalid")
-        try:
-            raw_output_data = output_path.read_bytes()
-        except OSError:
-            raise PipelineError("prompt fusion raw output is missing") from None
+        with tempfile.TemporaryDirectory(
+            prefix="duet-prompt-fusion-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            stage_work = stage / "work"
+            stage_work.mkdir(mode=0o700)
+            (stage / "SKILL.md").write_bytes(skill_data)
+            (stage_work / h3_project.SKILL_INPUT_FILENAME).write_bytes(input_data)
+            for segment in input_payload["segments"]:
+                for frame in segment["new_keyframes"]:
+                    _copy_prompt_fusion_frame(
+                        root=root, stage=stage, frame=frame,
+                    )
+            runner.run_isolated(
+                stage,
+                "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json "
+                "及其中 SHA 绑定的有序图片，只写 work/h3_prompt_plan.json。",
+                session_dir=root,
+            )
+            raw_output_data = _read_prompt_fusion_stage_output(
+                stage_work / "h3_prompt_plan.json",
+                segment_count=len(input_payload["segments"]),
+            )
+        _atomic_bytes(output_path, raw_output_data)
         state = {
             **state,
             "raw_output_path": "work/h3_prompt_plan.json",
@@ -2673,14 +2745,6 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                         }
                         for seg in seg_metas
                     },
-                    keyframe_sources=(
-                        {
-                            seg["index"]: seg["keyframe_sources"]
-                            for seg in seg_metas
-                        }
-                        if all("keyframe_sources" in seg for seg in seg_metas)
-                        else None
-                    ),
                 )
                 changes.update(frozen_continuity)
                 changes.update(frozen_prompts)

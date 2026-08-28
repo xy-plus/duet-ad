@@ -238,7 +238,7 @@ def _keyframe_timeline_contract(prompt: str) -> str | None:
         value = json.loads(raw_json)
     except json.JSONDecodeError:
         raise ContextIrContractError("context_ir_semantic_mismatch") from None
-    if not isinstance(value, list) or not value:
+    if not isinstance(value, list) or len(value) != 9:
         raise ContextIrContractError("context_ir_semantic_mismatch")
     frozen: list[dict[str, Any]] = []
     previous: dict[str, Any] | None = None
@@ -262,9 +262,7 @@ def _keyframe_timeline_contract(prompt: str) -> str | None:
         source_time_s = float(item["source_time_s"])
         transition_type = item["transition"].get("type")
         at_s = item["transition"].get("at_s")
-        if transition_type not in {
-            "start", "same_camera", "camera_motion", "hard_cut",
-        }:
+        if transition_type not in {"start", "continuous", "hard_cut"}:
             raise ContextIrContractError("context_ir_semantic_mismatch")
         if previous is None:
             if transition_type == "start":

@@ -737,11 +737,9 @@ def build_prompt_fusion_input(
     ]
     if any(has_visual_timeline) and not all(has_visual_timeline):
         raise LongGenerationError("prompt_fusion_input_invalid")
-    fusion_version = (
-        VISUAL_PROMPT_FUSION_VERSION
-        if all(has_visual_timeline)
-        else PROMPT_FUSION_VERSION
-    )
+    if not all(has_visual_timeline):
+        raise LongGenerationError("prompt_fusion_refresh_required")
+    fusion_version = VISUAL_PROMPT_FUSION_VERSION
 
     compiled_segments: list[dict] = []
     optimization_indices = {
@@ -2138,7 +2136,9 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
             ).hexdigest()
             multimodal_fields = (
                 {
-                    "multimodal_compiler_version": "video-prompt-fusion-v1",
+                    "multimodal_compiler_version": (
+                        f"video-prompt-fusion-v{plan.prompt_fusion.version}"
+                    ),
                     "audio_required": True,
                 }
                 if native_audio else {}

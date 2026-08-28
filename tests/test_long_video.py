@@ -357,7 +357,7 @@ def test_visual_plan_receipt_binds_keyframe_source_timeline(tmp_path):
                 if order == 1 else
                 {"type": "hard_cut", "at_s": 2.267}
                 if order == 4 else
-                {"type": "same_camera", "at_s": None}
+                {"type": "continuous", "at_s": None}
             ),
         })
     first = anchors / "first.png"
@@ -394,6 +394,56 @@ def test_visual_plan_receipt_binds_keyframe_source_timeline(tmp_path):
     receipt = json.loads(path.read_text(encoding="utf-8"))
     assert receipt["version"] == long_video_module.VISUAL_PLAN_RECEIPT_VERSION
     assert receipt["segments"][0]["keyframe_sources"] == keyframe_sources
+
+    with pytest.raises(
+        long_video_module.LongVideoError,
+        match="long_video_plan_invalid_keyframe_sources",
+    ):
+        write_plan_receipt(
+            tmp_path,
+            source=source,
+            duration_s=14.5,
+            segments=[{
+                "index": 1,
+                "start_s": 0.0,
+                "end_s": 14.5,
+                "chain_id": "chain-001",
+                "join_mode": "hard_cut",
+                "source_path": segment_source,
+                "keyframe_paths": frame_paths[:8],
+                "keyframe_sources": keyframe_sources[:8],
+                "first_frame_path": first,
+                "last_frame_path": last,
+                "visual_prompt_path": visual,
+                "final_prompt_path": final,
+                "dialogue": [],
+            }],
+            workflow="minimax_h3_lightx2v",
+        )
+
+
+@pytest.mark.parametrize("invented_type", ["same_camera", "camera_motion"])
+def test_visual_timeline_rejects_backend_invented_camera_facts(invented_type):
+    timeline = []
+    for order in range(1, 10):
+        timeline.append({
+            "order": order,
+            "source_time_s": float(order - 1),
+            "source_scene_id": "SCENE_01",
+            "transition": (
+                {"type": "start", "at_s": 0.0}
+                if order == 1 else
+                {"type": invented_type, "at_s": None}
+            ),
+        })
+
+    with pytest.raises(
+        long_video_module.LongVideoError,
+        match="long_video_plan_invalid_keyframe_sources",
+    ):
+        long_video_module.freeze_keyframe_sources(
+            timeline, expected_count=9,
+        )
 
 
 @pytest.mark.parametrize("duration", [30.0])

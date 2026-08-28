@@ -1,11 +1,21 @@
 import hashlib
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from app import h3_project, long_generation, long_video, main, pipeline, storage
+from app import (
+    context_ir_bridge,
+    h3,
+    h3_project,
+    long_generation,
+    long_video,
+    main,
+    pipeline,
+    storage,
+)
 from conftest import make_settings
 
 
@@ -126,7 +136,7 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
             if order == 1 else
             {"type": "hard_cut", "at_s": 2.267}
             if order == 4 else
-            {"type": "same_camera", "at_s": None}
+            {"type": "continuous", "at_s": None}
         )
         source = {
             "order": order,
@@ -238,7 +248,7 @@ def test_prompt_fusion_v2_rejects_output_hard_cut_time_drift(tmp_path: Path) -> 
             if order == 1 else
             {"type": "hard_cut", "at_s": 2.267}
             if order == 4 else
-            {"type": "same_camera", "at_s": None}
+            {"type": "continuous", "at_s": None}
         )
         source = {
             "order": order,
@@ -344,7 +354,7 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
                 if order == 1 else
                 {"type": "hard_cut", "at_s": 2.267}
                 if order == 4 else
-                {"type": "same_camera", "at_s": None}
+                {"type": "continuous", "at_s": None}
             ),
         })
         current = f"optimized frame {order}"
@@ -403,6 +413,203 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
     }
     assert payload["segments"][0]["audio_content"]["music_policy"] == "forbid"
 
+    legacy_plan = replace(
+        plan,
+        receipt_version=long_video.PLAN_RECEIPT_VERSION,
+        segments=(replace(segment, keyframe_sources=()),),
+    )
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_refresh_required",
+    ):
+        long_generation.build_prompt_fusion_input(
+            root=tmp_path,
+            meta=meta,
+            plan=legacy_plan,
+            dialogue_mode="none",
+            dialogue_delivery="auto",
+        )
+
+
+@pytest.mark.parametrize("segment_count", [1, 2])
+def test_real_source_binding_reaches_fusion_v2_and_context_contract(
+    tmp_path: Path, segment_count: int,
+) -> None:
+    root = tmp_path / "project"
+    work = root / "work"
+    root.mkdir()
+    (root / "source.mp4").write_bytes(b"source-video")
+    segments = []
+    metas = []
+    local_times = [float(value) for value in range(9)]
+    for segment_index in range(1, segment_count + 1):
+        start_s = float((segment_index - 1) * 10)
+        segwork = work / "segments" / str(segment_index) / "work"
+        selected_dir = segwork / "keyframes"
+        frames_dir = segwork / "frames"
+        selected_dir.mkdir(parents=True)
+        frames_dir.mkdir()
+        names = []
+        manifest_frames = []
+        for order, local_time in enumerate(local_times, 1):
+            data = f"segment-{segment_index}-source-{order}".encode()
+            raw_name = f"frames/{order:03d}.png"
+            (segwork / raw_name).write_bytes(data)
+            name = f"{order:02d}.png"
+            (selected_dir / name).write_bytes(data)
+            names.append(name)
+            manifest_frames.append({
+                "index": order,
+                "time_seconds": local_time,
+                "file": raw_name,
+            })
+        (segwork / "manifest.json").write_text(
+            json.dumps({"frames": manifest_frames}), encoding="utf-8"
+        )
+        segment = {
+            "index": segment_index,
+            "start_s": start_s,
+            "end_s": start_s + 10.0,
+            "chain_id": "chain-001",
+            "join_mode": "hard_cut" if segment_index == 1 else "continue",
+        }
+        segments.append(segment)
+        metas.append({**segment, "keyframes": names})
+
+    cut_at_s = 2.267 if segment_count == 1 else 12.267
+    bound = pipeline._bind_keyframe_source_timeline(
+        work,
+        segments,
+        metas,
+        [
+            {"index": 1, "start_s": 0.0, "end_s": cut_at_s},
+            {
+                "index": 2,
+                "start_s": cut_at_s,
+                "end_s": float(segment_count * 10),
+            },
+        ],
+    )
+
+    optimization_frames = []
+    frozen_segments = []
+    for segment, meta in zip(segments, bound):
+        selected_dir = (
+            work / "segments" / str(segment["index"]) / "work" / "keyframes"
+        )
+        keyframes = tuple(
+            (selected_dir / name, (selected_dir / name).read_bytes())
+            for name in meta["keyframes"]
+        )
+        for order in range(1, 10):
+            prompt = f"optimized segment {segment['index']} frame {order}"
+            optimization_frames.append({
+                "segment_index": segment["index"],
+                "frame_index": order,
+                "current": prompt,
+                "sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            })
+        frozen_segments.append(long_generation.FrozenSegment(
+            index=segment["index"],
+            start_s=segment["start_s"],
+            end_s=segment["end_s"],
+            chain_id=segment["chain_id"],
+            join_mode=segment["join_mode"],
+            workdir=work / "segments" / str(segment["index"]),
+            first_frame=keyframes[0][0],
+            first_frame_data=keyframes[0][1],
+            last_frame=keyframes[-1][0],
+            last_frame_data=keyframes[-1][1],
+            prompt="frozen visual",
+            keyframes=keyframes,
+            keyframe_sources=tuple(meta["keyframe_sources"]),
+            dialogue=(),
+            dialogue_sha256=hashlib.sha256(b"[]\n").hexdigest(),
+        ))
+    plan = long_generation.FrozenPlan(
+        root=root,
+        source=root / "source.mp4",
+        receipt="a" * 64,
+        segments=tuple(frozen_segments),
+        receipt_version=long_video.VISUAL_PLAN_RECEIPT_VERSION,
+    )
+    meta = {
+        "segments": [{
+            "index": segment["index"],
+            "visual_prompt": f"source action {segment['index']}",
+        } for segment in segments],
+        "_image_optimization": {"frames": optimization_frames},
+    }
+    input_data = long_generation.build_prompt_fusion_input(
+        root=root,
+        meta=meta,
+        plan=plan,
+        dialogue_mode="none",
+        dialogue_delivery="auto",
+    )
+    input_payload = json.loads(input_data)
+    input_path = work / h3_project.SKILL_INPUT_FILENAME
+    output_path = work / "h3_prompt_plan.json"
+    input_path.write_bytes(input_data)
+    output_path.write_bytes(_canonical({
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{
+            "index": segment["index"],
+            "final_prompt": _fusion_v2_final_prompt(
+                segment, f"fused visual {segment['index']}"
+            ),
+        } for segment in input_payload["segments"]],
+    }))
+    frozen = long_generation.load_prompt_fusion(
+        input_path=input_path, output_path=output_path, root=root,
+    )
+
+    dialogue_sha256 = "d" * 64
+    artifact_path = work / "prepared_input.json"
+    artifact_data = json.dumps(
+        {"dialogue": {"sha256": dialogue_sha256}},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    artifact_path.write_bytes(artifact_data)
+    for segment, prompt in zip(frozen_segments, frozen.final_prompts):
+        request = h3.H3Request(
+            cid=f"segment-{segment.index}",
+            workdir=segment.workdir,
+            client_request_id=f"context-{segment.index}",
+            prompt=prompt,
+            keyframes=segment.keyframes,
+            voice_texts=(),
+            voice_receipt=h3.voice_texts_receipt(()),
+            duration=10,
+            autodl_token="autodl-secret",
+            workflow=h3.H3_WORKFLOW,
+            skill_plan_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+            upstream_dialogue_receipt_sha256=dialogue_sha256,
+            context_ir_required=True,
+        )
+        context = context_ir_bridge.freeze_context_ir_request(
+            source_h3_request=request,
+            upstream_dialogue_sha256=dialogue_sha256,
+            upstream_artifact_path=artifact_path,
+            upstream_artifact_sha256=hashlib.sha256(artifact_data).hexdigest(),
+            upstream_dialogue_sha256_path=("dialogue", "sha256"),
+            source_prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+            minimax_api_key="minimax-secret",
+        )
+        assert context.keyframe_timeline_json is not None
+        assert len(json.loads(context.keyframe_timeline_json)) == 9
+
+    hard_cuts = [
+        frame["transition"]["at_s"]
+        for segment in input_payload["segments"]
+        for frame in segment["new_keyframes"]
+        if frame["transition"]["type"] == "hard_cut"
+    ]
+    assert hard_cuts == [cut_at_s]
+
 
 _CID_9533_LINES_JSON = (
     '[{"order":1,"text":"تول جمالا بها القادم وقتك يا لدى عوصة اللوري تاب '
@@ -415,7 +622,7 @@ def _write_9533_fusion_fixture(
     root: Path, *, audio_envelope: str, lines_json: str = _CID_9533_LINES_JSON,
 ) -> tuple[Path, Path, str]:
     (root / "work").mkdir(parents=True, exist_ok=True)
-    input_payload = json.loads(_fusion_input(root, 1).decode("utf-8"))
+    input_payload = json.loads(_fusion_v1_input(root, 1).decode("utf-8"))
     voice = root / "work" / "segments" / "1" / "work" / "voice.mp3"
     voice.parent.mkdir(parents=True, exist_ok=True)
     voice.write_bytes(b"9533-frozen-normalized-voice")
@@ -595,10 +802,18 @@ def _fusion_input(root: Path, segment_count: int) -> bytes:
             data = f"segment-{index}-frame-{order}".encode()
             (root / relative).write_bytes(data)
             prompt = f"segment {index} optimized image {order}"
+            source_time_s = float((index - 1) * 20 + order - 1)
             frames.append({
                 "order": order,
                 "path": relative,
                 "sha256": hashlib.sha256(data).hexdigest(),
+                "source_time_s": source_time_s,
+                "source_scene_id": "SCENE_01",
+                "transition": (
+                    {"type": "start", "at_s": source_time_s}
+                    if index == order == 1 else
+                    {"type": "continuous", "at_s": None}
+                ),
             })
             prompts.append({
                 "order": order,
@@ -620,13 +835,51 @@ def _fusion_input(root: Path, segment_count: int) -> bytes:
                 "lines_json": "[]",
                 "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
                 "voice_references": [],
+                "music_policy": "forbid",
             },
         })
     return _canonical({
         "schema": long_generation.PROMPT_FUSION_INPUT_SCHEMA,
-        "version": long_generation.PROMPT_FUSION_VERSION,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
         "segments": segments,
     })
+
+
+def _fusion_v1_input(root: Path, segment_count: int) -> bytes:
+    """Build an exact historical artifact for load/recovery-only coverage."""
+    payload = json.loads(_fusion_input(root, segment_count))
+    payload["version"] = long_generation.PROMPT_FUSION_VERSION
+    for segment in payload["segments"]:
+        for frame in segment["new_keyframes"]:
+            frame.pop("source_time_s")
+            frame.pop("source_scene_id")
+            frame.pop("transition")
+        segment["audio_content"].pop("music_policy")
+    return _canonical(payload)
+
+
+def _fusion_v2_final_prompt(segment: dict, visual: str) -> str:
+    timeline = [{
+        "order": frame["order"],
+        "source_time_s": frame["source_time_s"],
+        "source_scene_id": frame["source_scene_id"],
+        "transition": {
+            "type": frame["transition"]["type"],
+            "at_s": frame["transition"]["at_s"],
+        },
+    } for frame in segment["new_keyframes"]]
+    timeline_json = json.dumps(
+        timeline, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    )
+    return (
+        f"<VISUAL>\n{visual}\n</VISUAL>\n"
+        f"<KEYFRAME_TIMELINE_JSON>{timeline_json}"
+        "</KEYFRAME_TIMELINE_JSON>\n"
+        "<AUDIO_CONTENT_JSON>"
+        f"{segment['audio_content']['lines_json']}"
+        "</AUDIO_CONTENT_JSON>\n"
+        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+    )
 
 
 @pytest.mark.parametrize("segment_count", [1, 2])
@@ -649,6 +902,30 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
         },
     )
     input_data = _fusion_input(root, segment_count)
+    (root / "work" / "unrelated-project-secret.txt").write_text(
+        "must stay outside the fusion stage", encoding="utf-8",
+    )
+    if segment_count == 1:
+        voice = root / "work" / "segments" / "1" / "work" / "voice.mp3"
+        voice.parent.mkdir(parents=True, exist_ok=True)
+        voice.write_bytes(b"voice-reference-must-not-be-staged")
+        payload = json.loads(input_data)
+        lines_json = (
+            '[{"order":1,"text":"spoken","start_s":0.0,"end_s":1.0,'
+            '"delivery":"off_screen","voice_ref":1}]'
+        )
+        payload["segments"][0]["audio_content"] = {
+            "lines_json": lines_json,
+            "lines_sha256": hashlib.sha256(lines_json.encode()).hexdigest(),
+            "voice_references": [{
+                "voice_ref": 1,
+                "path": "work/segments/1/work/voice.mp3",
+                "sha256": hashlib.sha256(voice.read_bytes()).hexdigest(),
+                "purpose": "voice",
+            }],
+            "music_policy": "forbid",
+        }
+        input_data = _canonical(payload)
     skill_path = tmp_path / "video-prompt-fusion-SKILL.md"
     skill_path.write_text("strict project prompt fusion", encoding="utf-8")
     monkeypatch.setattr(pipeline, "PROMPT_FUSION_SKILL_MD", skill_path)
@@ -658,27 +935,59 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
     calls: list[Path] = []
 
     class Runner:
-        def run(self, cwd: Path, prompt: str) -> None:
-            calls.append(cwd)
-            assert "Binding" in prompt
+        def run(self, _cwd: Path, _prompt: str) -> None:
+            raise AssertionError("prompt fusion must not see the project root")
+
+        def run_isolated(
+            self, cwd: Path, prompt: str, *, session_dir: Path,
+        ) -> None:
+            calls.append(session_dir)
+            assert session_dir == root
+            assert cwd != root
+            assert "multimodal_input.json" in prompt
             frozen_input = (cwd / "work" / "multimodal_input.json").read_bytes()
             payload = json.loads(frozen_input.decode("utf-8"))
+            expected_files = {
+                "SKILL.md",
+                "work/multimodal_input.json",
+                *(
+                    frame["path"]
+                    for segment in payload["segments"]
+                    for frame in segment["new_keyframes"]
+                ),
+            }
+            assert {
+                path.relative_to(cwd).as_posix()
+                for path in cwd.rglob("*")
+                if path.is_file()
+            } == expected_files
             output = {
                 "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
-                "version": long_generation.PROMPT_FUSION_VERSION,
+                "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
                 "input_sha256": hashlib.sha256(frozen_input).hexdigest(),
                 "segments": [{
                     "index": item["index"],
-                    "final_prompt": (
-                        f"fused prompt {item['index']}"
-                        "<AUDIO_CONTENT_JSON>"
-                        f"{item['audio_content']['lines_json']}"
-                        "</AUDIO_CONTENT_JSON>"
+                    "final_prompt": _fusion_v2_final_prompt(
+                        item, f"fused prompt {item['index']}"
                     ),
                 } for item in payload["segments"]],
             }
             (cwd / "work" / "h3_prompt_plan.json").write_bytes(
                 _canonical(output)
+            )
+
+    if segment_count == 1:
+        legacy = json.loads(input_data)
+        legacy["version"] = long_generation.PROMPT_FUSION_VERSION
+        with pytest.raises(
+            pipeline.PipelineError,
+            match="prompt fusion input is invalid",
+        ):
+            pipeline.queue_prompt_fusion(
+                settings,
+                cid,
+                input_data=_canonical(legacy),
+                image_acceptance_sha256=acceptance_sha256,
             )
 
     assert pipeline.queue_prompt_fusion(
@@ -687,14 +996,20 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
         input_data=input_data,
         image_acceptance_sha256=acceptance_sha256,
     ) == "queued"
-    assert pipeline.produce_prompt_fusion(settings, cid, Runner()) == "done"
+    produced = pipeline.produce_prompt_fusion(settings, cid, Runner())
+    assert produced == "done", storage.load_meta(
+        settings.data_dir, cid
+    )["_prompt_fusion"]
     assert calls == [root]
     frozen = long_generation.load_prompt_fusion_manifest(
         root=root,
         skill_source_path=skill_path,
     )
     assert frozen.final_prompts == tuple(
-        f"fused prompt {index}<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>"
+        _fusion_v2_final_prompt(
+            json.loads(input_data)["segments"][index - 1],
+            f"fused prompt {index}",
+        )
         for index in range(1, segment_count + 1)
     )
     assert pipeline.queue_prompt_fusion(
@@ -719,13 +1034,48 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
         "segments": [{
             "index": index,
             "status": "done",
-            "final_prompt": (
-                f"fused prompt {index}"
-                "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>"
+            "final_prompt": _fusion_v2_final_prompt(
+                json.loads(input_data)["segments"][index - 1],
+                f"fused prompt {index}",
             ),
             "error": None,
         } for index in range(1, segment_count + 1)],
     }
+
+
+def test_prompt_fusion_runner_refuses_historical_v1_queue(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    created = storage.new_conversation(
+        settings.data_dir, "fusion-v1-runner", "source.mp4"
+    )
+    cid = created["id"]
+    root = settings.data_dir / cid
+    current_input = json.loads(_fusion_input(root, 1))
+    current_input["version"] = long_generation.PROMPT_FUSION_VERSION
+    input_data = _canonical(current_input)
+    input_path = root / "work" / h3_project.SKILL_INPUT_FILENAME
+    input_path.write_bytes(input_data)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _prompt_fusion={
+            "version": 1,
+            "status": "queued",
+            "error": None,
+            "input_sha256": hashlib.sha256(input_data).hexdigest(),
+            "image_acceptance_sha256": "a" * 64,
+            "manifest_sha256": None,
+        },
+    )
+
+    class Runner:
+        def run(self, _cwd: Path, _prompt: str) -> None:
+            raise AssertionError("v1 must not reach the prompt fusion runner")
+
+    assert pipeline.produce_prompt_fusion(settings, cid, Runner()) == "failed"
+    assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
+        "error"
+    ] == "prompt fusion input is invalid"
 
 
 def _failed_lf_prompt_fusion(
@@ -752,13 +1102,9 @@ def _failed_lf_prompt_fusion(
     monkeypatch.setattr(
         long_generation, "PROMPT_FUSION_SKILL_SOURCE", skill_path
     )
-    input_data = _fusion_input(root, 1)
-    assert pipeline.queue_prompt_fusion(
-        settings,
-        cid,
-        input_data=input_data,
-        image_acceptance_sha256=acceptance_sha256,
-    ) == "queued"
+    input_data = _fusion_v1_input(root, 1)
+    input_path = root / "work" / h3_project.SKILL_INPUT_FILENAME
+    input_path.write_bytes(input_data)
     frozen_skill = root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME
     frozen_skill.write_bytes(skill_path.read_bytes())
     output = root / "work" / "h3_prompt_plan.json"
@@ -774,14 +1120,15 @@ def _failed_lf_prompt_fusion(
             ),
         }],
     }))
-    state = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
     storage.update_meta(
         settings.data_dir,
         cid,
         _prompt_fusion={
-            **state,
+            "version": 1,
             "status": "failed",
             "error": "prompt_fusion_output_invalid",
+            "input_sha256": hashlib.sha256(input_data).hexdigest(),
+            "image_acceptance_sha256": acceptance_sha256,
             "manifest_sha256": None,
         },
     )
@@ -944,13 +1291,16 @@ def test_producer_failure_binds_raw_sha_and_rejects_schema_valid_replacement(
         cid,
         input_data=input_data,
         image_acceptance_sha256=acceptance_sha256,
-    ) == "queued"
+        ) == "queued"
 
     class Runner:
-        def run(self, cwd: Path, _prompt: str) -> None:
+        def run_isolated(
+            self, cwd: Path, _prompt: str, *, session_dir: Path,
+        ) -> None:
+            assert session_dir == root
             (cwd / "work" / "h3_prompt_plan.json").write_bytes(_canonical({
                 "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
-                "version": long_generation.PROMPT_FUSION_VERSION,
+                "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
                 "input_sha256": hashlib.sha256(input_data).hexdigest(),
                 "segments": [{
                     "index": 1,
@@ -972,7 +1322,7 @@ def test_producer_failure_binds_raw_sha_and_rejects_schema_valid_replacement(
 
     output.write_bytes(_canonical({
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
-        "version": long_generation.PROMPT_FUSION_VERSION,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
         "segments": [{
             "index": 1,
@@ -1015,21 +1365,22 @@ def test_new_producer_rejects_current_skill_source_drift(
         cid,
         input_data=input_data,
         image_acceptance_sha256=acceptance_sha256,
-    ) == "queued"
+        ) == "queued"
 
     class Runner:
-        def run(self, cwd: Path, _prompt: str) -> None:
+        def run_isolated(
+            self, cwd: Path, _prompt: str, *, session_dir: Path,
+        ) -> None:
+            assert session_dir == root
             skill_path.write_text("drifted prompt fusion Skill", encoding="utf-8")
+            segment = json.loads(input_data)["segments"][0]
             (cwd / "work" / "h3_prompt_plan.json").write_bytes(_canonical({
                 "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
-                "version": long_generation.PROMPT_FUSION_VERSION,
+                "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
                 "input_sha256": hashlib.sha256(input_data).hexdigest(),
                 "segments": [{
                     "index": 1,
-                    "final_prompt": (
-                        "<VISUAL>valid</VISUAL>"
-                        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>"
-                    ),
+                    "final_prompt": _fusion_v2_final_prompt(segment, "valid"),
                 }],
             }))
 

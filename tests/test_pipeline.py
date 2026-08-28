@@ -3,6 +3,7 @@ import asyncio
 import base64
 from copy import deepcopy
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -261,12 +262,32 @@ def test_source_scene_cut_is_frozen_on_the_first_post_cut_keyframe(tmp_path):
         "type": "hard_cut", "at_s": 2.267,
     }
     assert all(
-        item["transition"] == {"type": "same_camera", "at_s": None}
+        item["transition"] == {"type": "continuous", "at_s": None}
         for item in timeline[1:3] + timeline[4:]
     )
 
+    with pytest.raises(
+        pipeline.PipelineError,
+        match="keyframe source timeline misses scene anchor",
+    ):
+        pipeline._bind_keyframe_source_timeline(
+            work,
+            segments,
+            metas,
+            [
+                {"index": 1, "start_s": 0.0, "end_s": 1.0},
+                {
+                    "index": 2,
+                    "start_s": 1.0,
+                    "end_s": 2.0,
+                    "has_source_frames": False,
+                },
+                {"index": 3, "start_s": 2.0, "end_s": 14.5},
+            ],
+        )
 
-def test_two_generation_segments_without_source_cut_keep_one_camera_timeline(
+
+def test_two_generation_segments_without_source_cut_remain_continuous(
     tmp_path,
 ):
     work = tmp_path / "work"
@@ -322,7 +343,7 @@ def test_two_generation_segments_without_source_cut_keep_one_camera_timeline(
     }
     assert all(
         source["source_scene_id"] == "SCENE_01"
-        and source["transition"] == {"type": "same_camera", "at_s": None}
+        and source["transition"] == {"type": "continuous", "at_s": None}
         for source in (
             bound[0]["keyframe_sources"][1:]
             + bound[1]["keyframe_sources"]
@@ -331,40 +352,13 @@ def test_two_generation_segments_without_source_cut_keep_one_camera_timeline(
     assert bound[1]["keyframe_sources"][0]["source_time_s"] == 14.5
 
 
-def test_source_timeline_drives_existing_v4_transition_skeleton(tmp_path):
-    frames = []
-    sources = []
-    for order in range(1, 6):
-        path = tmp_path / f"{order:02d}.png"
-        path.write_bytes(f"frame-{order}".encode())
-        frames.append(path)
-        sources.append({
-            "order": order,
-            "source_time_s": float(order - 1),
-            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
-            "transition": (
-                {"type": "start", "at_s": 0.0}
-                if order == 1 else
-                {"type": "hard_cut", "at_s": 2.267}
-                if order == 4 else
-                {"type": "same_camera", "at_s": None}
-            ),
-        })
-
-    inventory = pipeline._frame_inventory(
-        {1: frames},
-        segment_lineage={
-            1: {"chain_id": "chain-001", "join_mode": "hard_cut"},
-        },
-        keyframe_sources={1: sources},
-    )
-
-    assert [item["source_transition_from_previous"] for item in inventory] == [
-        "start", "same_camera", "same_camera", "hard_cut", "same_camera",
-    ]
-    assert len({
-        item["source_transition_evidence_sha256"] for item in inventory
-    }) == len(inventory)
+def test_source_timeline_is_not_an_image_optimization_input():
+    assert "keyframe_sources" not in inspect.signature(
+        pipeline._frame_inventory
+    ).parameters
+    assert "keyframe_sources" not in inspect.signature(
+        pipeline._freeze_image_optimization
+    ).parameters
 
 
 def test_segmented_image_prompts_come_from_one_project_call(

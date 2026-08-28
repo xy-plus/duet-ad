@@ -353,7 +353,11 @@ def freeze_keyframe_sources(
     previous: Mapping | None = None,
 ) -> tuple[list[dict], dict]:
     """Validate one ordered source timeline without guessing visual facts."""
-    if not isinstance(value, list) or len(value) != expected_count:
+    if (
+        expected_count != 9
+        or not isinstance(value, list)
+        or len(value) != expected_count
+    ):
         raise LongVideoError("long_video_plan_invalid_keyframe_sources")
     frozen: list[dict] = []
     prior = dict(previous) if isinstance(previous, Mapping) else None
@@ -379,9 +383,7 @@ def freeze_keyframe_sources(
         )
         transition_type = raw["transition"].get("type")
         at_s = raw["transition"].get("at_s")
-        if transition_type not in {
-            "start", "same_camera", "camera_motion", "hard_cut",
-        }:
+        if transition_type not in {"start", "continuous", "hard_cut"}:
             raise LongVideoError("long_video_plan_invalid_keyframe_sources")
         if prior is None:
             if transition_type != "start" or at_s != source_time_s:
