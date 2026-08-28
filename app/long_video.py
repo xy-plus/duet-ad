@@ -393,15 +393,31 @@ def localize_keyframe_sources(
 
         raw_local = round(source_time - start_s, BOUNDARY_PRECISION)
         previous = localized[-1] if localized else None
-        lower = 0.0 if previous is None else round(
-            previous["segment_time_s"] + quantum, BOUNDARY_PRECISION
-        )
-        upper = round(duration - quantum * (9 - order), BOUNDARY_PRECISION)
-        local_time = round(min(upper, max(lower, raw_local)), BOUNDARY_PRECISION)
+        if previous is None:
+            # The first selected frame is the segment's visual origin even
+            # when its decoded PTS lands after the frozen cut.
+            # Keep the global source receipt intact and normalize only the
+            # provider-facing segment-local coordinate.
+            local_time = 0.0
+        else:
+            lower = round(
+                previous["segment_time_s"] + quantum, BOUNDARY_PRECISION
+            )
+            upper = round(
+                duration - quantum * (9 - order), BOUNDARY_PRECISION
+            )
+            local_time = round(
+                min(upper, max(lower, raw_local)), BOUNDARY_PRECISION
+            )
         local_time = 0.0 if local_time == -0.0 else local_time
         if local_time != raw_local:
             diagnostics.append({
-                "order": order, "code": "source_time_order_normalized",
+                "order": order,
+                "code": (
+                    "segment_origin_normalized"
+                    if previous is None
+                    else "source_time_order_normalized"
+                ),
                 "from": raw_local, "to": local_time,
             })
 

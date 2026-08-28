@@ -499,6 +499,11 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
         names = []
         manifest_frames = []
         for order, local_time in enumerate(local_times, 1):
+            sampled_time = (
+                0.033333
+                if segment_index > 1 and order == 1
+                else local_time
+            )
             data = f"segment-{segment_index}-source-{order}".encode()
             raw_name = f"frames/{order:03d}.png"
             (segwork / raw_name).write_bytes(data)
@@ -507,7 +512,7 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
             names.append(name)
             manifest_frames.append({
                 "index": order,
-                "time_seconds": local_time,
+                "time_seconds": sampled_time,
                 "file": raw_name,
             })
         (segwork / "manifest.json").write_text(
@@ -601,6 +606,15 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
         assert first["transition"] == {
             "type": "start", "at_segment_s": 0.0,
         }
+    if segment_count == 2:
+        source = bound[1]["keyframe_sources"][0]
+        compiled = input_payload["segments"][1]["new_keyframes"][0]
+        assert source["source_time_s"] == 10.033333
+        assert compiled["path"].endswith("/segments/2/work/keyframes/01.png")
+        assert compiled["sha256"] == hashlib.sha256(
+            b"segment-2-source-1"
+        ).hexdigest()
+        assert compiled["source_scene_id"] == source["source_scene_id"]
     assert "source_time_s" not in input_data.decode("utf-8")
     assert '"at_s"' not in input_data.decode("utf-8")
     input_path = work / h3_project.SKILL_INPUT_FILENAME

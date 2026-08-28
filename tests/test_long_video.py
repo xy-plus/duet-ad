@@ -331,6 +331,40 @@ def test_n2_keyframe_sources_reset_origin_and_preserve_inner_hard_cut():
     }
 
 
+def test_local_timeline_anchors_first_sample_after_segment_start_to_zero():
+    source = _global_keyframe_receipts(
+        [
+            2.3, 3.5, 4.75, 6.0, 7.25,
+            8.5, 9.75, 11.0, 12.1,
+        ],
+        first_transition="continuous",
+    )
+    first_authority = {
+        key: source[0][key]
+        for key in ("path", "sha256", "source_scene_id")
+    }
+
+    localized, diagnostics = localize_keyframe_sources(
+        source,
+        segment_start_s=2.266667,
+        segment_end_s=12.133333,
+        provider_duration_s=10,
+    )
+
+    assert localized[0] == {
+        "order": 1,
+        **first_authority,
+        "segment_time_s": 0.0,
+        "transition": {"type": "start", "at_segment_s": 0.0},
+    }
+    assert diagnostics == [{
+        "order": 1,
+        "code": "segment_origin_normalized",
+        "from": 0.033333,
+        "to": 0.0,
+    }]
+
+
 def test_local_timeline_normalizes_bad_cut_without_quality_rejection():
     source = _global_keyframe_receipts(
         [14.0, 14.75, 16.0, 16.5, 18.0, 20.0, 22.0, 25.0, 28.0],
