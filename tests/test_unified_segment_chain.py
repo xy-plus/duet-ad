@@ -109,12 +109,9 @@ def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> No
         "schema": "duet.video-prompt-fusion-output",
         "version": 2,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
-        "segments": [{
-            "index": 1,
-            "final_prompt": _fusion_v2_final_prompt(
-                fusion_input["segments"][0], final_visual,
-            ),
-        }],
+        "segments": [
+            _fusion_v2_output(fusion_input["segments"][0], final_visual)
+        ],
     }
     input_path = tmp_path / "multimodal_input.json"
     output_path = tmp_path / "h3_prompt_plan.json"
@@ -192,20 +189,8 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
         }],
     }
     input_data = _canonical(input_payload)
-    timeline_json = json.dumps(
-        timeline,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    final_prompt = (
-        "<VISUAL>\n"
-        "hard cut at the frozen source boundary\n"
-        "</VISUAL>\n"
-        f"<KEYFRAME_TIMELINE_JSON>{timeline_json}"
-        "</KEYFRAME_TIMELINE_JSON>\n"
-        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
-        "<MUSIC_POLICY>\nnon_diegetic_music: N/A\n</MUSIC_POLICY>"
+    final_prompt = _fusion_v2_final_prompt(
+        input_payload["segments"][0], "hard cut at the frozen source boundary",
     )
     input_path = tmp_path / "multimodal_input.json"
     output_path = tmp_path / "h3_prompt_plan.json"
@@ -214,7 +199,9 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
         "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
-        "segments": [{"index": 1, "final_prompt": final_prompt}],
+        "segments": [_fusion_v2_output(
+            input_payload["segments"][0], "hard cut at the frozen source boundary",
+        )],
     }))
 
     frozen = long_generation.load_prompt_fusion(
@@ -232,10 +219,7 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
         "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
-        "segments": [{
-            "index": 1,
-            "final_prompt": final_prompt.replace("<VISUAL>\n", "<VISUAL>", 1),
-        }],
+        "segments": [{"index": 1, "visual": []}],
     }))
     with pytest.raises(
         long_generation.LongGenerationError,
@@ -248,7 +232,7 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
         )
 
 
-def test_prompt_fusion_v2_rejects_output_hard_cut_time_drift(tmp_path: Path) -> None:
+def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
     frames = []
     timeline = []
     for order in range(1, 10):
@@ -304,11 +288,6 @@ def test_prompt_fusion_v2_rejects_output_hard_cut_time_drift(tmp_path: Path) -> 
         }],
     }
     input_data = _canonical(input_payload)
-    drifted = json.loads(json.dumps(timeline))
-    drifted[3]["transition"]["at_segment_s"] = 3.5
-    drifted_json = json.dumps(
-        drifted, separators=(",", ":"),
-    )
     input_path = tmp_path / "multimodal_input.json"
     output_path = tmp_path / "h3_prompt_plan.json"
     input_path.write_bytes(input_data)
@@ -318,27 +297,83 @@ def test_prompt_fusion_v2_rejects_output_hard_cut_time_drift(tmp_path: Path) -> 
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
         "segments": [{
             "index": 1,
-            "final_prompt": (
-                "<VISUAL>\n"
-                "drifted hard cut\n"
-                "</VISUAL>\n"
-                f"<KEYFRAME_TIMELINE_JSON>{drifted_json}"
-                "</KEYFRAME_TIMELINE_JSON>\n"
-                "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
-                "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
-            ),
+            "visual": [
+                "the cut happens at 99 seconds",
+                "the second visual interval continues",
+            ],
         }],
     }))
 
-    with pytest.raises(
-        long_generation.LongGenerationError,
-        match="prompt_fusion_output_invalid",
-    ):
-        long_generation.load_prompt_fusion(
-            input_path=input_path,
-            output_path=output_path,
-            root=tmp_path,
-        )
+    frozen = long_generation.load_prompt_fusion(
+        input_path=input_path,
+        output_path=output_path,
+        root=tmp_path,
+    )
+    assert "[Shot 2] At 00:02.267" in frozen.final_prompts[0]
+    assert "99 seconds" in frozen.final_prompts[0]
+
+
+def test_backend_ref2va_compiler_has_one_exact_provider_prompt() -> None:
+    timeline = [{
+        "order": order,
+        "segment_time_s": float(order - 1),
+        "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+        "transition": (
+            {"type": "start", "at_segment_s": 0.0}
+            if order == 1 else
+            {"type": "hard_cut", "at_segment_s": 2.5}
+            if order == 4 else
+            {"type": "continuous", "at_segment_s": None}
+        ),
+    } for order in range(1, 10)]
+    prompt = long_generation._compile_fusion_ref2va_prompt(
+        visual=["first <Picture 99> visual", "second visual"],
+        timeline=timeline,
+        lines=[{
+            "order": 1,
+            "text": "spoken exactly",
+            "start_s": 1.0,
+            "end_s": 2.0,
+            "delivery": "off_screen",
+            "voice_ref": None,
+        }],
+        music_policy="forbid",
+    )
+
+    assert prompt == "\n".join([
+        "subject_definitions:",
+        "<Picture 1> is the storyboard keyframe anchor for [Shot 1] at 00:00.000, defining its ordered visual state and composition.",
+        "<Picture 2> is the storyboard keyframe anchor for [Shot 1] at 00:01.000, defining its ordered visual state and composition.",
+        "<Picture 3> is the storyboard keyframe anchor for [Shot 1] at 00:02.000, defining its ordered visual state and composition.",
+        "<Picture 4> is the storyboard keyframe anchor for [Shot 2] at 00:03.000, defining its ordered visual state and composition.",
+        "<Picture 5> is the storyboard keyframe anchor for [Shot 2] at 00:04.000, defining its ordered visual state and composition.",
+        "<Picture 6> is the storyboard keyframe anchor for [Shot 2] at 00:05.000, defining its ordered visual state and composition.",
+        "<Picture 7> is the storyboard keyframe anchor for [Shot 2] at 00:06.000, defining its ordered visual state and composition.",
+        "<Picture 8> is the storyboard keyframe anchor for [Shot 2] at 00:07.000, defining its ordered visual state and composition.",
+        "<Picture 9> is the storyboard keyframe anchor for [Shot 2] at 00:08.000, defining its ordered visual state and composition.",
+        "summary:",
+        "[keyframe completion] The target video follows <Picture 1> through <Picture 9> as ordered storyboard keyframe anchors.",
+        "retention_analysis:",
+        "<Picture 1> ([Shot 1] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "<Picture 2> ([Shot 1] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "<Picture 3> ([Shot 1] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "<Picture 4> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "<Picture 5> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "<Picture 6> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "<Picture 7> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "<Picture 8> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "<Picture 9> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "detailed_description:",
+        "[Shot 1] The shot follows the ordered storyboard anchors <Picture 1>, <Picture 2>, and <Picture 3>. first ‹Picture 99› visual",
+        "From 00:01.000 to 00:02.000, the off-screen narrator (S1) says in an off-screen voiceover: <d>[Undetermined]spoken exactly</d> while every visible person's lips remain completely closed.",
+        "[Shot 2] At 00:02.500, the shot cuts to <Picture 4>. The shot then follows the ordered storyboard anchors <Picture 4>, <Picture 5>, <Picture 6>, <Picture 7>, <Picture 8>, and <Picture 9>. second visual",
+        "overall_soundscape:",
+        "The frozen spoken events described above are the only specified audible layer; no additional ambience, physical-action sounds, or non-verbal human sounds are added.",
+        "non_diegetic_music:",
+        "N/A",
+    ])
+    assert "<Audio " not in prompt
+    assert not prompt.endswith("\n")
 
 
 def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
@@ -575,12 +610,10 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
         "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
-        "segments": [{
-            "index": segment["index"],
-            "final_prompt": _fusion_v2_final_prompt(
-                segment, f"fused visual {segment['index']}"
-            ),
-        } for segment in input_payload["segments"]],
+        "segments": [
+            _fusion_v2_output(segment, f"fused visual {segment['index']}")
+            for segment in input_payload["segments"]
+        ],
     }))
     frozen = long_generation.load_prompt_fusion(
         input_path=input_path, output_path=output_path, root=root,
@@ -594,6 +627,14 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
         separators=(",", ":"),
     ).encode()
     artifact_path.write_bytes(artifact_data)
+
+    class NoHttp:
+        def get(self, *_args, **_kwargs):
+            raise AssertionError("current Fusion Context must perform zero HTTP")
+
+        def post(self, *_args, **_kwargs):
+            raise AssertionError("current Fusion Context must perform zero HTTP")
+
     for segment, prompt in zip(frozen_segments, frozen.final_prompts):
         request = h3.H3Request(
             cid=f"segment-{segment.index}",
@@ -617,10 +658,15 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
             upstream_artifact_sha256=hashlib.sha256(artifact_data).hexdigest(),
             upstream_dialogue_sha256_path=("dialogue", "sha256"),
             source_prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
-            minimax_api_key="minimax-secret",
+            minimax_api_key="",
         )
-        assert context.keyframe_timeline_json is not None
-        assert len(json.loads(context.keyframe_timeline_json)) == 9
+        assert context.keyframe_timeline_json is None
+        result = context_ir_bridge.optimize_h3_prompt(context, client=NoHttp())
+        assert result.status == "succeeded"
+        assert result.effective_prompt == prompt
+        assert result.provider_task_id == (
+            "local:identity:" + hashlib.sha256(prompt.encode()).hexdigest()
+        )
 
     hard_cuts = [
         frame["transition"]["at_segment_s"]
@@ -851,7 +897,7 @@ def test_current_fusion_request_has_one_workflow_and_zero_audio_references(
         output_path=root / "work" / "h3_prompt_plan.json",
         output_data=b"output",
         output_sha256=hashlib.sha256(b"output").hexdigest(),
-        segments=({},),
+        segments=(fusion_input["segments"][0],),
         final_prompts=(segment.prompt,),
     )
     plan = long_generation.FrozenPlan(
@@ -1184,6 +1230,21 @@ def _fusion_v1_input(root: Path, segment_count: int) -> bytes:
     return _canonical(payload)
 
 
+def _fusion_v2_visual(segment: dict, visual: str) -> list[str]:
+    shot_count = 1 + sum(
+        frame["transition"]["type"] == "hard_cut"
+        for frame in segment["new_keyframes"][1:]
+    )
+    return [f"{visual} shot {index}" for index in range(1, shot_count + 1)]
+
+
+def _fusion_v2_output(segment: dict, visual: str) -> dict:
+    return {
+        "index": segment["index"],
+        "visual": _fusion_v2_visual(segment, visual),
+    }
+
+
 def _fusion_v2_final_prompt(segment: dict, visual: str) -> str:
     timeline = [{
         "order": frame["order"],
@@ -1194,17 +1255,11 @@ def _fusion_v2_final_prompt(segment: dict, visual: str) -> str:
             "at_segment_s": frame["transition"]["at_segment_s"],
         },
     } for frame in segment["new_keyframes"]]
-    timeline_json = json.dumps(
-        timeline, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
-    )
-    return (
-        f"<VISUAL>\n{visual}\n</VISUAL>\n"
-        f"<KEYFRAME_TIMELINE_JSON>{timeline_json}"
-        "</KEYFRAME_TIMELINE_JSON>\n"
-        "<AUDIO_CONTENT_JSON>"
-        f"{segment['audio_content']['lines_json']}"
-        "</AUDIO_CONTENT_JSON>\n"
-        "<MUSIC_POLICY>\nnon_diegetic_music: N/A\n</MUSIC_POLICY>"
+    return long_generation._compile_fusion_ref2va_prompt(
+        visual=_fusion_v2_visual(segment, visual),
+        timeline=timeline,
+        lines=json.loads(segment["audio_content"]["lines_json"]),
+        music_policy=segment["audio_content"]["music_policy"],
     )
 
 
@@ -1288,12 +1343,10 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
                 "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
                 "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
                 "input_sha256": hashlib.sha256(frozen_input).hexdigest(),
-                "segments": [{
-                    "index": item["index"],
-                    "final_prompt": _fusion_v2_final_prompt(
-                        item, f"fused prompt {item['index']}"
-                    ),
-                } for item in payload["segments"]],
+                "segments": [
+                    _fusion_v2_output(item, f"fused prompt {item['index']}")
+                    for item in payload["segments"]
+                ],
             }
             output_path.write_bytes(_canonical(output))
 
@@ -1595,23 +1648,22 @@ def _failed_lf_prompt_fusion(
     frozen_skill.write_bytes(skill_path.read_bytes())
     output = root / "work" / "h3_prompt_plan.json"
     if version == long_generation.PROMPT_FUSION_VERSION:
-        final_prompt = _fusion_v2_final_prompt(
-            json.loads(input_data)["segments"][0],
-            "fused",
+        output_segment = _fusion_v2_output(
+            json.loads(input_data)["segments"][0], "fused",
         )
     else:
-        final_prompt = (
-            "<VISUAL>fused</VISUAL>\n"
-            "<AUDIO_CONTENT_JSON>\n[]\n</AUDIO_CONTENT_JSON>"
-        )
+        output_segment = {
+            "index": 1,
+            "final_prompt": (
+                "<VISUAL>fused</VISUAL>\n"
+                "<AUDIO_CONTENT_JSON>\n[]\n</AUDIO_CONTENT_JSON>"
+            ),
+        }
     output.write_bytes(_canonical({
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
         "version": version,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
-        "segments": [{
-            "index": 1,
-            "final_prompt": final_prompt,
-        }],
+        "segments": [output_segment],
     }))
     storage.update_meta(
         settings.data_dir,
@@ -1881,10 +1933,7 @@ def test_new_producer_rejects_current_skill_source_drift(
                 "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
                 "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
                 "input_sha256": hashlib.sha256(input_data).hexdigest(),
-                "segments": [{
-                    "index": 1,
-                    "final_prompt": _fusion_v2_final_prompt(segment, "valid"),
-                }],
+                "segments": [_fusion_v2_output(segment, "valid")],
             }))
 
     assert pipeline.produce_prompt_fusion(settings, cid, Runner()) == "failed"

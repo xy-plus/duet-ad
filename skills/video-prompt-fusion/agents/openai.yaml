@@ -1,4 +1,4 @@
 interface:
   display_name: "Video Prompt Fusion"
-  short_description: "Fuse confirmed frames and frozen audio into final prompts"
-  default_prompt: "Use $video-prompt-fusion to fuse the four frozen input classes into ordered final video prompts."
+  short_description: "Fuse confirmed frames into ordered visual prose"
+  default_prompt: "Use $video-prompt-fusion to fuse the four frozen input classes into ordered visual prose per frozen shot."

@@ -107,13 +107,6 @@ def _fusion_audio_block(lines_json: str) -> str:
     )
 
 
-def _fusion_timeline_block(timeline_json: str) -> str:
-    return (
-        f"<KEYFRAME_TIMELINE_JSON>{timeline_json}"
-        "</KEYFRAME_TIMELINE_JSON>"
-    )
-
-
 def _freeze_local_keyframe_sources(value: object) -> list[dict]:
     """Validate one provider-segment-local nine-frame timeline."""
     if not isinstance(value, list) or len(value) != 9:
@@ -180,12 +173,145 @@ def _freeze_local_keyframe_sources(value: object) -> list[dict]:
     return frozen
 
 
-def _fusion_music_policy_block() -> str:
-    return (
-        "<MUSIC_POLICY>\n"
-        "non_diegetic_music: N/A\n"
-        "</MUSIC_POLICY>"
-    )
+def _h3_timecode(value: object) -> str:
+    """Render one frozen segment-local second value as official MM:SS.mmm."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0
+    ):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    milliseconds = int(float(value) * 1000 + 0.5)
+    minutes, remainder = divmod(milliseconds, 60_000)
+    seconds, millis = divmod(remainder, 1000)
+    return f"{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def _h3_picture_list(orders: list[int]) -> str:
+    labels = [f"<Picture {order}>" for order in orders]
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return " and ".join(labels)
+    return ", ".join(labels[:-1]) + f", and {labels[-1]}"
+
+
+def _provider_neutral_visual(value: object) -> str:
+    """Keep visual prose usable while reserving all H3 markup for backend."""
+    if not isinstance(value, str) or not value.strip():
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    visual = value.replace("\r\n", " ").replace("\r", " ")
+    visual = visual.replace("\n", " ").replace("\t", " ")
+    visual = visual.replace("<", "‹").replace(">", "›").strip()
+    if not visual:
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    return visual
+
+
+def _compile_fusion_ref2va_prompt(
+    *, visual: object, timeline: object, lines: object, music_policy: object,
+) -> str:
+    """Compile the only provider-sendable current Fusion prompt."""
+    if music_policy != "forbid" or not isinstance(lines, list):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    frozen_timeline = _freeze_local_keyframe_sources(timeline)
+    shots: list[list[dict]] = []
+    for frame in frozen_timeline:
+        transition_type = frame["transition"]["type"]
+        if not shots or transition_type == "hard_cut":
+            shots.append([])
+        shots[-1].append(frame)
+    if not isinstance(visual, list) or len(visual) != len(shots):
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    visual_by_shot = [_provider_neutral_visual(item) for item in visual]
+
+    subject_definitions = ["subject_definitions:"]
+    retention = ["retention_analysis:"]
+    details: list[list[str]] = []
+    cut_times: list[float] = []
+    for shot_index, frames in enumerate(shots, 1):
+        if shot_index > 1:
+            cut_times.append(float(frames[0]["transition"]["at_segment_s"]))
+        for frame in frames:
+            order = int(frame["order"])
+            subject_definitions.append(
+                f"<Picture {order}> is the storyboard keyframe anchor for "
+                f"[Shot {shot_index}] at "
+                f"{_h3_timecode(frame['segment_time_s'])}, defining its "
+                "ordered visual state and composition."
+            )
+            retention.append(
+                f"<Picture {order}> ([Shot {shot_index}] storyboard "
+                "keyframe): fully_preserved - its role as an ordered "
+                "visual-state and composition anchor is retained."
+            )
+        orders = [int(frame["order"]) for frame in frames]
+        anchors = _h3_picture_list(orders)
+        if shot_index == 1:
+            opening = f"[Shot 1] The shot follows the ordered storyboard anchors {anchors}."
+        else:
+            cut = frames[0]["transition"]["at_segment_s"]
+            opening = (
+                f"[Shot {shot_index}] At {_h3_timecode(cut)}, the shot cuts "
+                f"to <Picture {orders[0]}>. The shot then follows the ordered "
+                f"storyboard anchors {anchors}."
+            )
+        details.append([f"{opening} {visual_by_shot[shot_index - 1]}"])
+
+    for expected_order, line in enumerate(lines, 1):
+        if (
+            not isinstance(line, Mapping)
+            or set(line) != {
+                "order", "text", "start_s", "end_s", "delivery", "voice_ref",
+            }
+            or line.get("order") != expected_order
+            or not isinstance(line.get("text"), str)
+            or not line["text"].strip()
+            or line.get("delivery") != "off_screen"
+            or line.get("voice_ref") is not None
+            or isinstance(line.get("start_s"), bool)
+            or isinstance(line.get("end_s"), bool)
+            or not isinstance(line.get("start_s"), (int, float))
+            or not isinstance(line.get("end_s"), (int, float))
+            or not math.isfinite(float(line["start_s"]))
+            or not math.isfinite(float(line["end_s"]))
+            or not 0 <= float(line["start_s"]) < float(line["end_s"])
+        ):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        shot_index = 1
+        for index, cut in enumerate(cut_times, 2):
+            if float(line["start_s"]) + _EPS >= cut:
+                shot_index = index
+        details[shot_index - 1].append(
+            f"From {_h3_timecode(line['start_s'])} to "
+            f"{_h3_timecode(line['end_s'])}, the off-screen narrator (S1) "
+            "says in an off-screen voiceover: "
+            f"<d>[Undetermined]{line['text']}</d> while every visible "
+            "person's lips remain completely closed."
+        )
+
+    prompt_lines = subject_definitions + [
+        "summary:",
+        "[keyframe completion] The target video follows <Picture 1> through "
+        "<Picture 9> as ordered storyboard keyframe anchors.",
+    ] + retention + ["detailed_description:"]
+    for shot in details:
+        prompt_lines.extend(shot)
+    prompt_lines.extend([
+        "overall_soundscape:",
+        (
+            "The frozen spoken events described above are the only specified "
+            "audible layer; no additional ambience, physical-action sounds, "
+            "or non-verbal human sounds are added."
+            if lines else
+            "No dialogue, ambience, physical-action sounds, or non-verbal "
+            "human sounds are specified."
+        ),
+        "non_diegetic_music:",
+        "N/A",
+    ])
+    return "\n".join(prompt_lines)
 
 
 def _canonical_fusion_prompt(
@@ -193,46 +319,12 @@ def _canonical_fusion_prompt(
     lines_json: str,
     *,
     version: int,
-    timeline_json: str | None = None,
 ) -> str:
-    """Freeze the exact versioned visual/timeline/audio/music envelope."""
+    """Read the historical v1 prompt envelope; v2 is backend-compiled."""
     opening = "<AUDIO_CONTENT_JSON>"
     closing = "</AUDIO_CONTENT_JSON>"
     canonical = _fusion_audio_block(lines_json)
-    if version == PROMPT_FUSION_VERSION:
-        if timeline_json is None:
-            raise LongGenerationError("prompt_fusion_output_invalid")
-        suffix = (
-            _fusion_timeline_block(timeline_json)
-            + "\n"
-            + canonical
-            + "\n"
-            + _fusion_music_policy_block()
-        )
-        if not prompt.endswith(suffix):
-            raise LongGenerationError("prompt_fusion_output_invalid")
-        prefix = prompt[:-len(suffix)]
-        if (
-            not prefix.startswith("<VISUAL>\n")
-            or not prefix.endswith("\n</VISUAL>\n")
-            or not prefix[len("<VISUAL>\n"):-len("\n</VISUAL>\n")].strip()
-            or prefix.count("<VISUAL>") != 1
-            or prefix.count("</VISUAL>") != 1
-        ):
-            raise LongGenerationError("prompt_fusion_output_invalid")
-        reserved = (
-            "<VISUAL>", "</VISUAL>",
-            "<KEYFRAME_TIMELINE_JSON>", "</KEYFRAME_TIMELINE_JSON>",
-            "<AUDIO_CONTENT_JSON>", "</AUDIO_CONTENT_JSON>",
-            "<MUSIC_POLICY>", "</MUSIC_POLICY>",
-        )
-        visual = prefix[len("<VISUAL>\n"):-len("\n</VISUAL>\n")]
-        if any(tag in visual for tag in reserved):
-            raise LongGenerationError("prompt_fusion_output_invalid")
-        canonical_prompt = prefix + suffix
-    elif version == PROMPT_FUSION_LEGACY_VERSION:
-        if timeline_json is not None:
-            raise LongGenerationError("prompt_fusion_output_invalid")
+    if version == PROMPT_FUSION_LEGACY_VERSION:
         lf_envelope = f"{opening}\n{lines_json}\n{closing}"
         if prompt.endswith(canonical):
             prefix = prompt[:-len(canonical)]
@@ -281,7 +373,7 @@ def load_prompt_fusion(
         or not segments
     ):
         raise LongGenerationError("prompt_fusion_input_invalid")
-    timeline_jsons: list[str | None] = []
+    timelines: list[list[dict] | None] = []
     for index, segment in enumerate(segments, 1):
         if (
             not isinstance(segment, Mapping)
@@ -350,16 +442,11 @@ def load_prompt_fusion(
                         "transition",
                     )
                 } for frame in frames])
-                timeline_jsons.append(json.dumps(
-                    frozen_sources,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                ))
+                timelines.append(frozen_sources)
             except (KeyError, TypeError, ValueError, long_video.LongVideoError):
                 raise LongGenerationError("prompt_fusion_input_invalid") from None
         else:
-            timeline_jsons.append(None)
+            timelines.append(None)
         audio = segment.get("audio_content")
         audio_keys = {
             "lines_json", "lines_sha256", "voice_references",
@@ -447,20 +534,33 @@ def load_prompt_fusion(
         raise LongGenerationError("prompt_fusion_output_invalid")
     final_prompts: list[str] = []
     for index, segment in enumerate(output_segments, 1):
-        if (
-            not isinstance(segment, Mapping)
-            or set(segment) != {"index", "final_prompt"}
-            or segment.get("index") != index
-            or not isinstance(segment.get("final_prompt"), str)
-            or not segment["final_prompt"].strip()
-        ):
+        if not isinstance(segment, Mapping) or segment.get("index") != index:
             raise LongGenerationError("prompt_fusion_output_invalid")
-        final_prompts.append(_canonical_fusion_prompt(
-            segment["final_prompt"],
-            segments[index - 1]["audio_content"]["lines_json"],
-            version=source_version,
-            timeline_json=timeline_jsons[index - 1],
-        ))
+        audio = segments[index - 1]["audio_content"]
+        if source_version == PROMPT_FUSION_VERSION:
+            if set(segment) != {"index", "visual"}:
+                raise LongGenerationError("prompt_fusion_output_invalid")
+            timeline = timelines[index - 1]
+            if timeline is None:
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            final_prompts.append(_compile_fusion_ref2va_prompt(
+                visual=segment.get("visual"),
+                timeline=timeline,
+                lines=json.loads(audio["lines_json"]),
+                music_policy=audio["music_policy"],
+            ))
+        else:
+            if (
+                set(segment) != {"index", "final_prompt"}
+                or not isinstance(segment.get("final_prompt"), str)
+                or not segment["final_prompt"].strip()
+            ):
+                raise LongGenerationError("prompt_fusion_output_invalid")
+            final_prompts.append(_canonical_fusion_prompt(
+                segment["final_prompt"],
+                audio["lines_json"],
+                version=source_version,
+            ))
     return FrozenPromptFusion(
         version=source_version,
         input_path=input_path,
@@ -2595,18 +2695,25 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
                     ),
                 )
             )
-            timeline_json = json.dumps(
-                [{
-                    key: frame[key]
-                    for key in (
-                        "order", "segment_time_s", "source_scene_id", "transition",
-                    )
-                } for frame in localized_sources],
-                ensure_ascii=False,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-            if _fusion_timeline_block(timeline_json) not in segment.prompt:
+            frozen_input_sources = _freeze_local_keyframe_sources([{
+                key: frame[key]
+                for key in (
+                    "order", "segment_time_s", "source_scene_id", "transition",
+                )
+            } for frame in localized_sources])
+            frozen_fusion_sources = _freeze_local_keyframe_sources([{
+                key: frame[key]
+                for key in (
+                    "order", "segment_time_s", "source_scene_id", "transition",
+                )
+            } for frame in plan.prompt_fusion.segments[segment.index - 1][
+                "new_keyframes"
+            ]])
+            if (
+                frozen_input_sources != frozen_fusion_sources
+                or segment.prompt
+                != plan.prompt_fusion.final_prompts[segment.index - 1]
+            ):
                 raise LongGenerationError("prompt_fusion_input_invalid")
             fusion_prompt_sha256 = hashlib.sha256(
                 segment.prompt.encode("utf-8")
@@ -2848,7 +2955,13 @@ def _freeze_segment_context_ir(
     segment: FrozenSegment,
     source_request: h3.H3Request,
 ) -> context_ir_bridge.FrozenContextIrRequest:
-    if not getattr(settings, "minimax_api_key", ""):
+    if (
+        not getattr(settings, "minimax_api_key", "")
+        and (
+            plan.prompt_fusion is None
+            or plan.prompt_fusion.version != PROMPT_FUSION_VERSION
+        )
+    ):
         raise LongGenerationError("context_ir_credential_missing", 503)
     try:
         return h3_project.freeze_context_ir(

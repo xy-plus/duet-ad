@@ -19,7 +19,7 @@ def test_skill_has_minimal_identity_and_invocation_metadata():
     assert "TODO" not in text
     assert 'display_name: "Video Prompt Fusion"' in agent
     assert (
-        'short_description: "Fuse confirmed frames and frozen audio into final prompts"'
+        'short_description: "Fuse confirmed frames into ordered visual prose"'
         in agent
     )
     assert "$video-prompt-fusion" in agent
@@ -122,7 +122,7 @@ def test_visual_authorities_are_explicit_and_non_overlapping():
         "不得从静态关键帧反推或改写动作顺序、因果关系、camera movement type 或相对节奏",
         "不得引入四类输入均未支持的新事实",
         "内容冲突和语义评分都不构成拒绝",
-        "技术可读取的四类输入必须为每个 segment 产出一个最终提示词",
+        "技术可读取的四类输入必须为每个 segment 的每个冻结 hard-cut 区间产出一条视觉文本",
         "不得据此拒绝、重试、改走另一 workflow 或不写输出",
     ):
         assert required in text
@@ -139,7 +139,7 @@ def test_old_static_content_requires_positive_new_evidence_and_mapping():
         "新关键帧中独立可见",
         "同 `order` 的图片优化提示词明确映射",
         "两个条件必须同时满足",
-        "否则不得进入 `final_prompt` 的 `<VISUAL>`",
+        "否则不得进入 `visual`",
         "静态描述只能取自新关键帧",
     ):
         assert required in text
@@ -172,58 +172,37 @@ def test_old_dynamic_is_confined_to_each_hard_cut_interval():
     assert "必须在切点终止，不得在切后自动续写" not in text
 
 
-def test_audio_is_copied_exactly_inside_the_final_prompt():
+def test_audio_and_provider_syntax_stay_out_of_skill_output():
     text = _skill()
 
     for required in (
-        "音频文本、时间、delivery 和 `voice_ref=null` 逐值原样保持",
-        "不得翻译、润色、纠错、合并、拆分、重排或补写音频行",
-        "<AUDIO_CONTENT_JSON>",
-        "</AUDIO_CONTENT_JSON>",
-        "逐字复制 `audio_content.lines_json`",
-        "音频块之外不得再复述或改写音频内容",
-        "non_diegetic_music: N/A",
-        "恰好一次",
-        "Context 只贡献 `<VISUAL>` 语义",
-        "只降低语义评分，不阻断同一 H3 链",
+        "`audio_content` 只用于避免视觉叙事与冻结 spoken timeline 冲突",
+        "不得在输出中复述台词",
+        "写 `<d>`",
+        "后端会从冻结 audio/music 机械编译",
+        "不要写 `[Shot N]`、时间戳、`<Picture N>`、`<Audio N>`",
+        "这些 provider-facing 字段全部由后端",
     ):
         assert required in text
 
-    assert (
-        "<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>\n"
-        "<MUSIC_POLICY>\n"
-        "non_diegetic_music: N/A\n"
-        "</MUSIC_POLICY>"
-    ) in text
-    assert "opening tag 的下一 byte 必须是 `lines_json` 首 byte" in text
-    assert "closing tag 紧随 `lines_json` 末 byte" in text
-    assert (
-        "<AUDIO_CONTENT_JSON>\naudio_content.lines_json\n</AUDIO_CONTENT_JSON>"
-        not in text
-    )
+    assert "<AUDIO_CONTENT_JSON>{lines_json}" not in text
+    assert "<MUSIC_POLICY>" not in text
 
 
-def test_keyframe_timeline_is_canonical_and_context_immutable():
+def test_hard_cut_intervals_are_positional_visual_only():
     text = _skill()
 
     for required in (
-        "<KEYFRAME_TIMELINE_JSON>{keyframe_timeline_json}</KEYFRAME_TIMELINE_JSON>",
-        "逐项投影 `order/segment_time_s/source_scene_id/transition`",
-        "字段顺序固定为",
-        "UTF-8 compact JSON",
-        "不得加入 `path`、`sha256` 或其他字段",
-        "后端从冻结输入机械重建 timeline",
+        "每段只输出一个 `visual` 数组",
+        "每个 `hard_cut` 开始下一个区间",
+        "`continuous` 留在当前区间",
+        "`visual` 长度必须等于区间数",
+        "数组第 N 项只描述第 N 个区间",
+        "provider-facing 字段全部由后端从冻结 timeline/audio/music 机械编译",
     ):
         assert required in text
 
-    assert (
-        "</VISUAL>\n"
-        "<KEYFRAME_TIMELINE_JSON>{keyframe_timeline_json}</KEYFRAME_TIMELINE_JSON>\n"
-        "<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>\n"
-        "<MUSIC_POLICY>\n"
-        "non_diegetic_music: N/A\n"
-        "</MUSIC_POLICY>"
-    ) in text
+    assert "<KEYFRAME_TIMELINE_JSON>" not in text
 
 
 def test_clean_reference_proof_stays_out_of_the_skill_schema():
@@ -239,7 +218,7 @@ def test_clean_reference_proof_stays_out_of_the_skill_schema():
         assert forbidden_field not in text
 
 
-def test_output_is_one_ordered_final_prompt_per_input_segment():
+def test_output_is_one_ordered_visual_vector_per_input_segment():
     text = _skill()
 
     for required in (
@@ -250,11 +229,11 @@ def test_output_is_one_ordered_final_prompt_per_input_segment():
         'schema: "duet.video-prompt-fusion-output"',
         "version: 2",
         "input_sha256: Sha256",
-        "segments: NonEmptyArray<{ index: Int1; final_prompt: NonEmpty }>",
+        "visual: NonEmptyArray<NonEmptyText>",
         "输入描述符 exact bytes 的 SHA-256",
         "输出 segments 与输入 segments 一一对应且顺序相同",
         "不得增加、删除、合并或拆分 segment",
-        "最终提示词",
+        "每段恰有 `index/visual` 两个字段",
     ):
         assert required in text
 

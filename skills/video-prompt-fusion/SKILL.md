@@ -1,11 +1,11 @@
 ---
 name: video-prompt-fusion
-description: Fuse confirmed optimized keyframes with the frozen old video prompt, image-optimization prompt, and audio content to produce one ordered final video prompt per segment. Use after image confirmation and before Context IR or H3 when all four frozen input classes are available.
+description: Fuse confirmed optimized keyframes with the frozen old video prompt and image-optimization prompt to produce visual prose per frozen shot. Use after image confirmation and before backend H3 prompt compilation when all four frozen input classes are available.
 ---
 
 # Video Prompt Fusion
 
-只把四类冻结输入融合成按 segment 排序的最终视频提示词。整个 ordered segments 数组只执行一次项目级调用；`N=1` 与 `N>1` 使用同一合同。不要重新选帧、重新设计动作或改变音频内容及音乐策略。
+只把四类冻结输入融合成按 segment、按冻结 hard-cut 区间排序的视觉文本。整个 ordered segments 数组只执行一次项目级调用；`N=1` 与 `N>1` 使用同一合同。不要重新选帧、重新设计动作或改变音频内容及音乐策略。输出不是 H3 prompt，不能写 provider 字段。
 
 ## 读取边界
 
@@ -63,32 +63,19 @@ AudioLine = { order: Int1; text: NonEmpty; start_s: Number; end_s: Number; deliv
 3. 把同 `order` 的图片优化提示词仅作为对应关键帧的替换解释。图片优化提示词只解释替换目标和保持约束，帮助识别旧视觉称谓对应的新视觉元素；它不能覆盖关键帧视觉事实，也不能覆盖旧提示词的动态骨架。
 4. 删除旧视频提示词中与新关键帧冲突的旧人物、旧场景、旧对象、旧服装、旧材质和旧空间结构，也删除全部旧构图、取景、裁切、景别、机位和静态镜头属性。不要把这些旧静态描述以别名、背景补充或否定式约束带入最终提示词。
 5. 每个 hard-cut 区间独立融合：只保留起止证据均落在同一 hard-cut 区间内的旧动态，再用图片优化提示词给出的替换对应关系，把本区间旧动作尽可能落到本区间新关键帧中的对应新元素上。不得跨越 `hard_cut` 传播动作、因果或 camera movement；跨越硬切的连续 zoom、push、pan、tracking 或 morph 必须整体删除，不得截断、拆分或重分配到切点任一侧。含多个 hard-cut 区间且缺少可定位边界的旧动态也删除；任何旧动态若无法唯一归属一个 hard-cut 区间，就删除。不得把切前主体、构图或运动状态延续到切后。不得引入四类输入均未支持的新事实，不得借用其他段或其他 hard-cut 区间的角色、场景或事件。
-6. 最后附加音频与音乐策略合同块。音频文本、时间、delivery 和 `voice_ref=null` 逐值原样保持；不得翻译、润色、纠错、合并、拆分、重排或补写音频行。输入 `music_policy=forbid` 只允许机械投影为下述唯一 provider 表达，不生成第二种同义措辞。
+6. `audio_content` 只用于避免视觉叙事与冻结 spoken timeline 冲突。不得在输出中复述台词、推断声音、写 `<d>`、写音乐或序列化任何音频字段；后端会从冻结 audio/music 机械编译。
 
-旧静态采用闭世界白名单：`old_video_prompt` 的闭世界白名单只有同一 hard-cut 区间内的动作顺序、因果关系、camera movement type 和相对节奏，不允许贡献任何静态视觉或静态视角属性。即使旧静态与新关键帧不显式冲突，也不能据此保留。某个替换后的静态元素要进入最终视觉，两个条件必须同时满足：该元素在新关键帧中独立可见，并且同 `order` 的图片优化提示词明确映射旧替换目标到该新元素；否则不得进入 `final_prompt` 的 `<VISUAL>`。条件满足时，静态描述只能取自新关键帧，图片优化提示词只用于确认对应关系，仍不得复制旧静态属性或措辞。
+旧静态采用闭世界白名单：`old_video_prompt` 的闭世界白名单只有同一 hard-cut 区间内的动作顺序、因果关系、camera movement type 和相对节奏，不允许贡献任何静态视觉或静态视角属性。即使旧静态与新关键帧不显式冲突，也不能据此保留。某个替换后的静态元素要进入最终视觉，两个条件必须同时满足：该元素在新关键帧中独立可见，并且同 `order` 的图片优化提示词明确映射旧替换目标到该新元素；否则不得进入 `visual`。条件满足时，静态描述只能取自新关键帧，图片优化提示词只用于确认对应关系，仍不得复制旧静态属性或措辞。
 
-内容冲突和语义评分都不构成拒绝：技术可读取的四类输入必须为每个 segment 产出一个最终提示词。发生冲突时，新关键帧的静态事实仍优先，尽可能保留同一 hard-cut 区间内受支持的旧动态骨架；如果某个旧动作片段只依赖已经消失且没有替换对应证据的旧静态元素，只删除该最小的不受支持片段，继续保留本区间其他动作顺序、因果关系、camera movement type 和相对节奏。不得回退旧视觉元素，也不得编造替代事实。人物、背景、穿帮、台词和音乐等检查只记录为后续 Skill 迭代评分，不得据此拒绝、重试、改走另一 workflow 或不写输出。
+内容冲突和语义评分都不构成拒绝：技术可读取的四类输入必须为每个 segment 的每个冻结 hard-cut 区间产出一条视觉文本。发生冲突时，新关键帧的静态事实仍优先，尽可能保留同一区间内受支持的旧动态骨架；如果某个旧动作片段只依赖已经消失且没有替换对应证据的旧静态元素，只删除该最小的不受支持片段，继续保留本区间其他动作顺序、因果关系、camera movement type 和相对节奏。不得回退旧视觉元素，也不得编造替代事实。人物、背景、穿帮、台词和音乐等检查只记录为后续 Skill 迭代评分，不得据此拒绝、重试、改走另一 workflow 或不写输出。
 
-## 最终提示词格式
+## 视觉字段格式
 
-每个 `final_prompt` 必须恰含以下四个有序块：
+每段只输出一个 `visual` 数组。后端根据 `new_keyframes[].transition` 计算区间：第一张开始区间 1；每个 `hard_cut` 开始下一个区间；`continuous` 留在当前区间。`visual` 长度必须等于区间数，数组第 N 项只描述第 N 个区间。
 
-```text
-<VISUAL>
-融合后的单段视觉提示词
-</VISUAL>
-<KEYFRAME_TIMELINE_JSON>{keyframe_timeline_json}</KEYFRAME_TIMELINE_JSON>
-<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>
-<MUSIC_POLICY>
-non_diegetic_music: N/A
-</MUSIC_POLICY>
-```
+每项只写英文视觉 prose；画面内可见文字保持原文。不要写 `[Shot N]`、时间戳、`<Picture N>`、`<Audio N>`、`<Subject N>`、`<Video N>`、`<d>`、`subject_definitions:`、`summary:`、`retention_analysis:`、`detailed_description:`、`overall_soundscape:` 或 `non_diegetic_music:`。这些 provider-facing 字段全部由后端从冻结 timeline/audio/music 机械编译。
 
-`<VISUAL>` 只写融合后的视觉内容。把示例中的 `{lines_json}` 替换为并逐字复制 `audio_content.lines_json`：opening tag 的下一 byte 必须是 `lines_json` 首 byte，closing tag 紧随 `lines_json` 末 byte，中间不得增加换行、空格或其他字符。即使其值为 `[]` 也保留这两个标记。音频块之外不得再复述或改写音频内容。
-
-对当前 segment 的 9 张 `new_keyframes` 逐项投影 `order/segment_time_s/source_scene_id/transition` 生成 `{keyframe_timeline_json}`。字段顺序固定为 `order`、`segment_time_s`、`source_scene_id`、`transition`，其中 transition 字段顺序固定为 `type`、`at_segment_s`；使用 UTF-8 compact JSON（`ensure_ascii=false`，分隔符为 `,` 与 `:`，无额外空白或换行），不得加入 `path`、`sha256` 或其他字段。把该 canonical array 紧贴 timeline opening/closing tag，标签与 JSON 之间不得增加任何 byte。
-
-exact 三行 `<MUSIC_POLICY>\nnon_diegetic_music: N/A\n</MUSIC_POLICY>` 必须在 `final_prompt` 中恰好一次，紧随音频块后的单个换行；不得增加同义词或说明。下游后端从冻结输入机械重建 timeline、audio 和 music policy，Context 只贡献 `<VISUAL>` 语义；Context 对这些块的偏移只降低语义评分，不阻断同一 H3 链。
+旧静态泄漏、hard-cut 描述偏差等质量检查只用于评分和后续 Skill 迭代，不是拒绝、重试、回退或产生另一份 prompt 的依据。
 
 ## 唯一输出
 
@@ -99,10 +86,13 @@ VideoPromptFusionOutput = {
   schema: "duet.video-prompt-fusion-output";
   version: 2;
   input_sha256: Sha256;
-  segments: NonEmptyArray<{ index: Int1; final_prompt: NonEmpty }>;
+  segments: NonEmptyArray<{
+    index: Int1;
+    visual: NonEmptyArray<NonEmptyText>;
+  }>;
 }
 ```
 
-`input_sha256` 是输入描述符 exact bytes 的 SHA-256。输出 segments 与输入 segments 一一对应且顺序相同；不得增加、删除、合并或拆分 segment。每段 `final_prompt` 必须是符合上述固定格式的最终提示词，禁止额外字段。
+`input_sha256` 是输入描述符 exact bytes 的 SHA-256。输出 segments 与输入 segments 一一对应且顺序相同；不得增加、删除、合并或拆分 segment。每段恰有 `index/visual` 两个字段，禁止额外字段。
 
-写入前重新检查输入 SHA、输入顺序和输出索引等技术完整性。视觉语义、旧静态残留、动态骨架、timeline、音频或音乐策略表现只进入结果评分；无论评分高低都写完整输出，供下一轮迭代 Skill。
+写入前重新检查输入 SHA、输入顺序、输出索引和每段 visual 数量等技术完整性。视觉语义、旧静态残留、动态骨架、timeline、音频或音乐策略表现只进入结果评分；无论评分高低都写完整输出，供下一轮迭代 Skill。不得写旧提示词回退结果或任何可直接提交 provider 的 prompt。

@@ -1,9 +1,9 @@
-"""Minimal receipt-first MiniMax H3 Context IR bridge.
+"""Receipt-first MiniMax H3 Context IR bridge.
 
 The module has no database, queue, billing, UI, or H3 submission concerns.  It
-freezes one already-compiled multimodal H3 prompt, submits Context IR at most
-once for a stable client request id, recovers only through GET on the accepted
-task id, and exposes a receipt-revalidating adapter for the existing H3 request.
+freezes one already-compiled multimodal H3 prompt. Current backend-compiled
+Fusion v2 prompts receive a local same-byte receipt and perform no Context HTTP;
+historical requests and receipts retain their provider recovery behavior.
 
 The upstream coordinator is the trusted boundary that proves its authoritative
 dialogue artifact produced the H3 request.  This bridge rechecks the artifact
@@ -48,6 +48,15 @@ _SPEECH_PREFIX = "DUET_SPEECH_V1"
 _DIALOGUE_TOKEN = re.compile(r"<d>\[[^\]\r\n]+\][\s\S]*?</d>")
 _TIMELINE_OPEN = "<KEYFRAME_TIMELINE_JSON>"
 _TIMELINE_CLOSE = "</KEYFRAME_TIMELINE_JSON>"
+_REF2VA_SECTIONS = (
+    "subject_definitions:",
+    "summary:",
+    "retention_analysis:",
+    "detailed_description:",
+    "overall_soundscape:",
+    "non_diegetic_music:",
+)
+_LOCAL_IDENTITY_TASK_PREFIX = "local:identity:"
 _DIALOGUE_PARTS = re.compile(r"^<d>\[([^\]\r\n]+)\]([^\r\n<>]+)</d>$")
 _MARKER_PARTS = re.compile(
     r"^DUET_SPEECH_V1 order=([1-9]\d*) mode=(on_screen|off_screen) "
@@ -220,6 +229,40 @@ def _canonical_json(value: Any) -> str:
 
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _uses_local_identity(request: FrozenContextIrRequest | h3.H3Request) -> bool:
+    source = (
+        request.source_h3_request
+        if isinstance(request, FrozenContextIrRequest)
+        else request
+    )
+    if (
+        not isinstance(source, h3.H3Request)
+        or source.mode != "reference"
+        or source.workflow != h3.H3_WORKFLOW
+        or source.context_ir_required is not True
+        or len(source.keyframes) != 9
+        or source.reference_audios != ()
+        or source.skill_plan_sha256 != _sha256_text(source.prompt)
+    ):
+        return False
+    positions: list[int] = []
+    for section in _REF2VA_SECTIONS:
+        if source.prompt.count(section) != 1:
+            return False
+        positions.append(source.prompt.index(section))
+    pictures = {
+        int(value) for value in re.findall(r"<Picture ([1-9]\d*)>", source.prompt)
+    }
+    return (
+        positions == sorted(positions)
+        and positions[0] == 0
+        and pictures == set(range(1, 10))
+        and "<Audio " not in source.prompt
+        and "<Video " not in source.prompt
+        and "<Subject " not in source.prompt
+    )
 
 
 def _keyframe_timeline_contract(prompt: str) -> str | None:
@@ -437,6 +480,24 @@ def _speech_contract(
         ):
             raise ContextIrContractError("source_speech_contract_invalid")
     return markers, tokens
+
+
+def _ref2va_speech_contract(
+    prompt: str, voice_texts: Sequence[str],
+) -> tuple[str, ...]:
+    """Bind backend-compiled Ref2VA dialogue without a second prompt grammar."""
+    tokens = tuple(match.group(0) for match in _DIALOGUE_TOKEN.finditer(prompt))
+    if (
+        prompt.count("<d>") != len(tokens)
+        or prompt.count("</d>") != len(tokens)
+        or len(tokens) != len(voice_texts)
+    ):
+        raise ContextIrContractError("source_speech_contract_invalid")
+    for token, text in zip(tokens, voice_texts, strict=True):
+        parts = _DIALOGUE_PARTS.fullmatch(token)
+        if parts is None or parts.group(2) != text:
+            raise ContextIrContractError("source_speech_contract_invalid")
+    return tokens
 
 
 def _fusion_policy_suffix(prompt: str) -> str | None:
@@ -814,6 +875,7 @@ def freeze_context_ir_request(
     """Bind a coordinator-verified dialogue artifact to the exact H3 request."""
     if not isinstance(source_h3_request, h3.H3Request):
         raise ContextIrContractError("source_h3_request_invalid")
+    local_identity = _uses_local_identity(source_h3_request)
     is_multimodal = h3.is_multimodal_request(source_h3_request)
     is_no_audio_reference = (
         source_h3_request.mode == "reference"
@@ -823,7 +885,9 @@ def freeze_context_ir_request(
     )
     if not is_multimodal and not is_no_audio_reference:
         raise ContextIrContractError("source_h3_request_invalid")
-    if not isinstance(minimax_api_key, str) or not minimax_api_key.strip():
+    if not isinstance(minimax_api_key, str) or (
+        not local_identity and not minimax_api_key.strip()
+    ):
         raise ContextIrContractError("context_ir_credential_missing")
     if (
         not _is_sha256(source_prompt_sha256)
@@ -842,7 +906,10 @@ def freeze_context_ir_request(
         != h3.voice_texts_receipt(source_h3_request.voice_texts)
     ):
         raise ContextIrContractError("source_speech_receipt_invalid")
-    if len(source_h3_request.prompt) > MAX_SOURCE_PROMPT_CHARS:
+    if (
+        not local_identity
+        and len(source_h3_request.prompt) > MAX_SOURCE_PROMPT_CHARS
+    ):
         raise ContextIrContractError("source_prompt_too_long")
     verified_artifact_path = _verified_upstream_artifact(
         upstream_artifact_path,
@@ -850,12 +917,24 @@ def freeze_context_ir_request(
         upstream_dialogue_sha256,
         upstream_dialogue_sha256_path,
     )
-    keyframe_timeline_json = _keyframe_timeline_contract(
-        source_h3_request.prompt
+    keyframe_timeline_json = (
+        None if local_identity
+        else _keyframe_timeline_contract(source_h3_request.prompt)
     )
-    fusion_policy_suffix = _fusion_policy_suffix(source_h3_request.prompt)
-    fusion_voice_texts = _fusion_voice_texts(source_h3_request.prompt)
-    if fusion_voice_texts is None:
+    fusion_policy_suffix = (
+        None if local_identity
+        else _fusion_policy_suffix(source_h3_request.prompt)
+    )
+    fusion_voice_texts = (
+        None if local_identity
+        else _fusion_voice_texts(source_h3_request.prompt)
+    )
+    if local_identity:
+        speech_markers = ()
+        dialogue_tokens = _ref2va_speech_contract(
+            source_h3_request.prompt, source_h3_request.voice_texts
+        )
+    elif fusion_voice_texts is None:
         speech_markers, dialogue_tokens = _speech_contract(
             source_h3_request.prompt, source_h3_request.voice_texts
         )
@@ -1195,6 +1274,14 @@ def _request_body_from_state(state: Mapping[str, Any], source_prompt: str) -> di
     }
 
 
+def _identity_request_body(request: FrozenContextIrRequest) -> dict[str, Any]:
+    return {
+        "mode": "local_identity",
+        "source_prompt_sha256": request.source_prompt_sha256,
+        "source_h3_request_sha256": request.source_h3_request_sha256,
+    }
+
+
 def _validate_state(
     request: FrozenContextIrRequest, state: Mapping[str, Any], path: Path
 ) -> None:
@@ -1244,7 +1331,16 @@ def _validate_state(
             or int(file_id) <= 0
         ):
             raise ContextIrReceiptError("context_ir_state_invalid")
-    body = _request_body_from_state(state, request.source_prompt)
+    local_identity = _uses_local_identity(request)
+    if local_identity and any(
+        item.get("file_id") is not None for item in stored_references
+    ):
+        raise ContextIrReceiptError("context_ir_state_invalid")
+    body = (
+        _identity_request_body(request)
+        if local_identity
+        else _request_body_from_state(state, request.source_prompt)
+    )
     stored_body = state.get("context_ir_request")
     stored_request_sha = state.get("context_ir_request_sha256")
     if stored_body is None:
@@ -1265,6 +1361,11 @@ def _validate_state(
     elif (
         not isinstance(task_id, str)
         or not task_id.strip()
+        or (
+            local_identity
+            and task_id
+            != _LOCAL_IDENTITY_TASK_PREFIX + request.source_prompt_sha256
+        )
         or not _is_sha256(task_sha)
         or not isinstance(stored_request_sha, str)
         or task_sha
@@ -1289,7 +1390,10 @@ def _validate_state(
         raise ContextIrReceiptError("context_ir_state_invalid")
     status = state["status"]
     all_uploaded = all(item.get("file_id") is not None for item in stored_references)
+    references_ready = all_uploaded or local_identity
     if (
+        (local_identity and status not in {"ready", "succeeded"})
+        or
         (
             status == "ready"
             and (
@@ -1302,7 +1406,7 @@ def _validate_state(
         or (
             status in {"ready_to_submit", "submitting"}
             and (
-                not all_uploaded
+                not references_ready
                 or stored_body is None
                 or task_id is not None
                 or error is not None
@@ -1310,7 +1414,7 @@ def _validate_state(
         )
         or (
             status in {"polling", "query_unknown", "succeeded"}
-            and (not all_uploaded or stored_body is None or task_id is None)
+            and (not references_ready or stored_body is None or task_id is None)
         )
         or (
             status == "query_unknown"
@@ -1621,7 +1725,11 @@ def _complete(
     if (
         not isinstance(effective_prompt, str)
         or not effective_prompt.strip()
-        or len(effective_prompt.encode("utf-8")) > MAX_EFFECTIVE_PROMPT_BYTES
+        or (
+            not _uses_local_identity(request)
+            and len(effective_prompt.encode("utf-8"))
+            > MAX_EFFECTIVE_PROMPT_BYTES
+        )
     ):
         _mark_terminal(
             path,
@@ -1821,11 +1929,35 @@ def _client(client: httpx.Client | None) -> Iterator[httpx.Client]:
         yield owned
 
 
+def _bind_local_identity(request: FrozenContextIrRequest) -> ContextIrResult:
+    """Write an idempotent same-byte receipt without provider interaction."""
+    with _session_lease(request):
+        state, path = _prepare(request)
+        if state["status"] == "succeeded":
+            return _result(request, state, path)
+        if state["status"] != "ready":
+            raise ContextIrReceiptError("context_ir_state_invalid")
+        body = _identity_request_body(request)
+        request_sha256 = _canonical_sha256(body)
+        task_id = _LOCAL_IDENTITY_TASK_PREFIX + request.source_prompt_sha256
+        state["context_ir_request"] = body
+        state["context_ir_request_sha256"] = request_sha256
+        state["provider_task_id"] = task_id
+        state["context_ir_task_sha256"] = _canonical_sha256({
+            "context_ir_request_sha256": request_sha256,
+            "provider_task_id": task_id,
+        })
+        _complete(request, state, path, request.source_prompt)
+        return _result(request, state, path)
+
+
 def optimize_h3_prompt(
     request: FrozenContextIrRequest, *, client: httpx.Client | None = None
 ) -> ContextIrResult:
     """Start or resume exactly one Context IR attempt for this frozen request."""
     _validate_frozen_request(request)
+    if _uses_local_identity(request):
+        return _bind_local_identity(request)
     with _session_lease(request):
         state, path = _prepare(request)
         terminal = {"succeeded", "failed", "submission_unknown"}
@@ -2007,6 +2139,23 @@ def load_effective_prompt_receipt(
             raise ContextIrReceiptError("context_ir_receipt_invalid")
     provider_task_id = raw.get("provider_task_id")
     if not isinstance(provider_task_id, str) or not provider_task_id:
+        raise ContextIrReceiptError("context_ir_receipt_invalid")
+    if _uses_local_identity(request) and (
+        legacy_receipt
+        or provider_task_id
+        != _LOCAL_IDENTITY_TASK_PREFIX + request.source_prompt_sha256
+        or effective_prompt != request.source_prompt
+        or raw.get("effective_prompt_sha256") != request.source_prompt_sha256
+        or raw.get("context_output_prompt") != request.source_prompt
+        or raw.get("context_output_prompt_sha256")
+        != request.source_prompt_sha256
+        or any(
+            semantic_score.get(key) != 1.0
+            for key in (
+                "speech", "keyframe_timeline", "music_policy", "overall"
+            )
+        )
+    ):
         raise ContextIrReceiptError("context_ir_receipt_invalid")
     attempt_path = path.with_name("attempt.json")
     state = _read_json(attempt_path)
