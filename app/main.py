@@ -3157,14 +3157,13 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(
                         status_code=409, detail="submission_outcome_unknown"
                     )
-                same_parameters = (
+                same_runtime_parameters = (
                     meta.get("dialogue_mode") == dialogue_mode
                     and meta.get("dialogue_delivery", "auto")
                     == requested_dialogue_delivery
                     and meta.get("resolved_dialogue_delivery")
                     in {None, resolved_dialogue_delivery}
                     and meta.get("fit_mode") == fit_mode
-                    and meta.get("frozen_plan_receipt") == expected_receipt
                     and _generation_semantics(meta)
                     == (aspect_ratio, resolution)
                     and (
@@ -3173,6 +3172,8 @@ def create_app(settings: Settings) -> FastAPI:
                         else True
                     )
                 )
+                same_plan = meta.get("frozen_plan_receipt") == expected_receipt
+                same_parameters = same_runtime_parameters and same_plan
                 # Active replays are pure idempotent reads.  In particular they
                 # must not rewrite fitted inputs or enqueue a second coordinator.
                 if previous_status in {"queued", "running"}:
@@ -3183,6 +3184,35 @@ def create_app(settings: Settings) -> FastAPI:
                     return {"status": previous_status, "attempt": old.get("attempt")}
                 if previous_status == "submission_unknown":
                     raise HTTPException(status_code=409, detail="submission_outcome_unknown")
+                semantic_recovery_intent = (
+                    previous_status == "failed"
+                    and previous_id == request_id
+                    and long_generation.has_context_ir_semantic_failure_intent(
+                        old
+                    )
+                )
+                if (
+                    previous_status == "failed"
+                    and previous_id == request_id
+                    and old.get("stage") != "stitch"
+                    and not semantic_recovery_intent
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="new client_request_id required",
+                    )
+                if semantic_recovery_intent:
+                    if not same_runtime_parameters:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="resume_parameters_changed",
+                        )
+                    if not same_plan:
+                        _mark_submission_unknown(settings, cid, old)
+                        raise HTTPException(
+                            status_code=409,
+                            detail="submission_outcome_unknown",
+                        )
                 stitch_retry = (
                     previous_status == "failed"
                     and old.get("stage") == "stitch"
@@ -3190,6 +3220,12 @@ def create_app(settings: Settings) -> FastAPI:
                     and same_parameters
                 )
                 if _has_valid_generated_video(settings, meta):
+                    if semantic_recovery_intent:
+                        _mark_submission_unknown(settings, cid, old)
+                        raise HTTPException(
+                            status_code=409,
+                            detail="submission_outcome_unknown",
+                        )
                     if previous_status == "succeeded":
                         if previous_id != request_id or not same_parameters:
                             raise HTTPException(
@@ -3225,6 +3261,12 @@ def create_app(settings: Settings) -> FastAPI:
                 except long_generation.LongGenerationError as exc:
                     if claim_owner:
                         _finish_submission_claim(settings, cid, claim_owner)
+                    if semantic_recovery_intent:
+                        _mark_submission_unknown(settings, cid, old)
+                        raise HTTPException(
+                            status_code=409,
+                            detail="submission_outcome_unknown",
+                        ) from exc
                     if previous_status in {"resume_required", "succeeded"} or (
                         previous_status == "failed"
                         and isinstance(old, dict)
@@ -3240,6 +3282,41 @@ def create_app(settings: Settings) -> FastAPI:
                     if claim_owner:
                         _finish_submission_claim(settings, cid, claim_owner)
                     raise
+                if semantic_recovery_intent:
+                    if not long_generation.context_ir_semantic_failure_is_recoverable(
+                        settings, cid, plan, old, fit_mode
+                    ):
+                        _mark_submission_unknown(settings, cid, old)
+                        raise HTTPException(
+                            status_code=409,
+                            detail="submission_outcome_unknown",
+                        )
+                    segments = [
+                        {
+                            **item,
+                            "status": "queued",
+                            "error": None,
+                        }
+                        if item.get("status") == "failed"
+                        else item
+                        for item in old["segments"]
+                    ]
+                    updated = {
+                        **old,
+                        "segments": segments,
+                        "status": "queued",
+                        "error": None,
+                    }
+                    storage.update_meta(
+                        settings.data_dir, cid, generation=updated
+                    )
+                    background_tasks.add_task(
+                        long_generation.run, settings, cid, plan
+                    )
+                    return {
+                        "status": "queued",
+                        "attempt": old.get("attempt"),
+                    }
                 if previous_status == "resume_required":
                     if previous_id != request_id:
                         raise HTTPException(status_code=409, detail="resume_request_id_mismatch")
@@ -3280,39 +3357,6 @@ def create_app(settings: Settings) -> FastAPI:
                     storage.update_meta(settings.data_dir, cid, generation=updated)
                     background_tasks.add_task(long_generation.run, settings, cid, plan)
                     return {"status": "queued", "attempt": old.get("attempt")}
-                if (
-                    previous_status == "failed"
-                    and previous_id == request_id
-                    and long_generation.context_ir_semantic_failure_is_recoverable(
-                        settings, cid, plan, old, fit_mode
-                    )
-                ):
-                    segments = [
-                        {
-                            **item,
-                            "status": "queued",
-                            "error": None,
-                        }
-                        if item.get("status") == "failed"
-                        else item
-                        for item in old["segments"]
-                    ]
-                    updated = {
-                        **old,
-                        "segments": segments,
-                        "status": "queued",
-                        "error": None,
-                    }
-                    storage.update_meta(
-                        settings.data_dir, cid, generation=updated
-                    )
-                    background_tasks.add_task(
-                        long_generation.run, settings, cid, plan
-                    )
-                    return {
-                        "status": "queued",
-                        "attempt": old.get("attempt"),
-                    }
                 if previous_status == "failed" and previous_id == request_id:
                     raise HTTPException(status_code=409, detail="new client_request_id required")
                 previous_attempt = old.get("attempt", 0) if isinstance(old, dict) else 0

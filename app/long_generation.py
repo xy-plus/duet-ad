@@ -2414,6 +2414,31 @@ def generation_segments_are_valid(
     return bool(native_items) == native_required
 
 
+def has_context_ir_semantic_failure_intent(generation: object) -> bool:
+    """Classify the persisted coordinator state without reading artifacts."""
+    if (
+        not isinstance(generation, Mapping)
+        or generation.get("status") != "failed"
+        or generation.get("error") != "long_video_segment_failed"
+        or generation.get("stage") != "h3"
+        or not isinstance(generation.get("segments"), list)
+    ):
+        return False
+    failed = [
+        item for item in generation["segments"]
+        if isinstance(item, Mapping) and item.get("status") == "failed"
+    ]
+    return (
+        len(failed) == 1
+        and failed[0].get("error") == "context_ir_semantic_mismatch"
+        and all(
+            isinstance(item, Mapping)
+            and item.get("status") in {"succeeded", "failed"}
+            for item in generation["segments"]
+        )
+    )
+
+
 def context_ir_semantic_failure_is_recoverable(
     settings,
     cid: str,
