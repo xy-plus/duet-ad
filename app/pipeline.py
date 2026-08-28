@@ -776,7 +776,7 @@ def _freeze_image_optimization(
             execution = image_optimization.freeze_execution_inputs(
                 continuity,
                 revision=1,
-                profile={"id": "image-postprocess", "revision": 1},
+                profile={"id": "image-postprocess", "revision": 2},
                 model=settings.seedream_model,
                 frame_inventory=inventory,
             )

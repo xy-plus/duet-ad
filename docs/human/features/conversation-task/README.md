@@ -38,7 +38,7 @@ links: []
 - 全链只调用三个 Skill：`video-maker` 负责分段分析和 exact-9 原始关键帧；`image-postprocess` 只负责图片替换语义；`video-prompt-fusion` 只负责视觉融合。Audio、Binding、Speaker、Context、Ref2VA compiler、H3 和拼接都不是 Skill。
 - 当前 tree 三个 Skill 的权威 SHA-256 分别是：
   - `video-maker`：`0bbb22baeb8f14fef737b279e2ab2e8f70bf8965d41b182f1987537e1e3e4785`
-  - `image-postprocess`：`dc69c2f1ecc86470481150da98ba17ca214e47db9b3c8841224030165957db9f`
+  - `image-postprocess`：`efe4e57a4d912e8548f8037efe5d4b55c5460a5719f6d9417c5e2fc78e71c7f0`
   - `video-prompt-fusion`：`34145f90532ec65a45d029d62b09e9ef60516721df47d6aa83ea649699a8e16c`
 - 每个当前 segment 的原始关键帧、优化关键帧、Fusion `new_keyframes` 和 H3 `<Picture 1>`…`<Picture 9>` 都必须恰好为 9 张并保持顺序。极短连续 scene 可重复最近的已解码源帧来满足 exact-9；同 scene 的相同 PTS 是有 provenance 的合法 receipt，不得把“9 张”误写为“9 个唯一源帧”。
 - 每张帧同时绑定 segment-local time、source scene 和 transition。scene 改变必须是冻结时点的 `hard_cut`，scene 不变必须是 `continuous`；切后帧是新 anchor。Fusion 的视觉文字无权改写这些机械字段。

@@ -1236,6 +1236,72 @@ def test_semantic_compiler_backend_completes_people_for_every_segment(tmp_path):
     assert "blocking" not in diagnostics
 
 
+def test_v4_frame_prompt_uses_only_the_current_person_observation(tmp_path):
+    segments, source_frames = _semantic_compiler_input(
+        tmp_path, frame_count=2,
+    )
+    semantic = {
+        "people": {"narrator": {
+            "source_identity": "source narrator",
+            "replacement_identity": "distinct replacement narrator",
+            "wardrobe_change": "different practical wardrobe",
+            "local_color_change": "different local wardrobe colors",
+        }},
+        "entities": {},
+        "scenes": {"scene-001": {
+            "source_scene": "source room",
+            "replacement_scene": "different real room",
+            "semantic_change": "same use with a different environment",
+            "geometry_change": "different visible structures",
+            "depth_change": "different foreground and background depth",
+            "layout_change": "different functional layout",
+            "local_color_change": "different local material colors",
+        }},
+        "frames": {
+            "frame-001": {
+                "people": {"narrator": {
+                    "visible_region": "frame-one-exclusive-region",
+                    "boundary": "frame-one-exclusive-boundary",
+                    "body_and_pose": "frame-one-exclusive-pose",
+                }},
+                "relationships": "frame-one-visible-relations",
+                "entities": {},
+                "crop": "frame-one-visible-crop",
+            },
+            "frame-002": {
+                "people": {"narrator": {
+                    "visible_region": "frame-two-exclusive-region",
+                    "boundary": "frame-two-exclusive-boundary",
+                    "body_and_pose": "frame-two-exclusive-pose",
+                }},
+                "relationships": "frame-two-visible-relations",
+                "entities": {},
+                "crop": "frame-two-visible-crop",
+            },
+        },
+    }
+
+    plan, diagnostics = image_optimization.compile_semantic_plan(
+        semantic, segments, source_frames=source_frames,
+    )
+    prompts = image_optimization.compile_frame_prompts(
+        plan, "anchor_consistency",
+    )[1]
+
+    assert diagnostics["score"] == 1.0
+    assert "frame-one-exclusive-region" in prompts[1]
+    assert "frame-one-exclusive-boundary" in prompts[1]
+    assert "frame-two-exclusive-region" not in prompts[1]
+    assert "frame-two-exclusive-boundary" not in prompts[1]
+    assert "frame-two-exclusive-region" in prompts[2]
+    assert "frame-two-exclusive-boundary" in prompts[2]
+    assert "frame-one-exclusive-region" not in prompts[2]
+    assert "frame-one-exclusive-boundary" not in prompts[2]
+    for prompt in prompts.values():
+        assert "非物理成像派生" in prompt
+        assert "不得实例化为新的物理人物或人体结构" in prompt
+
+
 def test_semantic_compiler_ignores_model_palette_wording_and_uses_source(
     tmp_path,
 ):
@@ -1365,6 +1431,58 @@ def test_v4_frame_receipt_deeply_binds_graph_view_plan_and_source(tmp_path):
         **frozen,
     }
     assert image_optimization.receipt(changed_view_meta, settings) is None
+
+
+@pytest.mark.parametrize("compiler_revision", [1, 2])
+def test_v4_frame_receipt_binds_prompt_compiler_revision_without_invalidating_history(
+    tmp_path,
+    compiler_revision,
+):
+    settings = make_settings(tmp_path)
+    plan = _v4_frame_bound_plan()
+    inventory = [
+        {
+            "segment_index": 0,
+            "frame_index": frame_index,
+            "frame_name": f"{frame_index:02d}.png",
+            "source_sha256": str(frame_index) * 64,
+            "source_transition_from_previous": (
+                "start" if frame_index == 1 else "same_camera"
+            ),
+            "source_transition_evidence_sha256": str(frame_index + 2) * 64,
+        }
+        for frame_index in (1, 2)
+    ]
+    execution = image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={
+            "id": "image-postprocess",
+            "revision": compiler_revision,
+        },
+        model=settings.seedream_model,
+        frame_inventory=inventory,
+    )
+    prompts = image_optimization.compile_frame_prompts(
+        plan,
+        settings.seedream_edit_mode,
+        _compiler_revision=compiler_revision,
+    )
+    frozen = image_optimization.freeze_frame_prompts(
+        settings, execution, prompts, plan=plan,
+    )
+    meta = {
+        **image_optimization.freeze_continuity(plan, frame_counts={0: 2}),
+        **frozen,
+    }
+
+    assert image_optimization.receipt(meta, settings) == frozen[
+        "_image_optimization"
+    ]
+    if compiler_revision == 1:
+        assert "非物理成像派生" not in prompts[0][1]
+    else:
+        assert "非物理成像派生" in prompts[0][1]
 
 
 def test_v4_schedule_freezes_unique_typed_paid_dag_order(tmp_path):

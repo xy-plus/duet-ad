@@ -207,6 +207,7 @@ def _semantic_output(request: dict, *, sparse: bool = False) -> dict:
                     "visible_region": f"{slot['key']} 当前可见人物区域",
                     "boundary": f"{slot['key']} 当前可见边界",
                     "body_and_pose": f"{slot['key']} 当前可见身体与姿态",
+                    "derived_observations": {},
                 }},
                 "relationships": f"{slot['key']} 当前可见接触与遮挡关系",
                 "entities": f"{slot['key']} 当前可见非人物实体",
@@ -388,10 +389,11 @@ def test_skill_delegates_the_exact_v4_generation_contract_to_backend():
     assert "不要输出版本、段号、帧号、连续编号 ID、哈希、transition、枚举 palette、实体图、组件图或流程判断" in skill
     encoded = json.dumps(example, ensure_ascii=False)
     for mechanical in (
-        "component_id", "target_spec", "topology", "observations",
+        "component_id", "target_spec", "topology",
         "not_observable", "observable_frames", "area_weighted_warm_cool_family",
     ):
         assert mechanical not in encoded
+    assert '"observations":' not in encoded
 
 
 def test_verification_skill_path_is_strict_regular_non_symlink(tmp_path, monkeypatch):
@@ -928,7 +930,9 @@ def test_skill_describes_per_frame_semantics_while_backend_builds_contracts(
     frame = next(iter(example["frames"].values()))
     assert set(frame) == {"people", "relationships", "entities", "crop"}
     person = next(iter(frame["people"].values()))
-    assert set(person) == {"visible_region", "boundary", "body_and_pose"}
+    assert set(person) == {
+        "visible_region", "boundary", "body_and_pose", "derived_observations",
+    }
     assert "每帧只描述当前帧直接可见" in skill
     plan, diagnostics = _compiled_semantic(tmp_path, frames=2)
     segment = plan["segments"][0]
@@ -950,6 +954,30 @@ def test_skill_uses_current_frame_descriptions_not_backend_fragment_enums():
     ):
         assert mechanical not in encoded
     assert "不从其他帧补造" in skill
+
+
+def test_skill_keeps_derived_person_observations_nested_and_semantic_only():
+    skill, example = _skill_contract()
+    person = next(iter(next(iter(example["frames"].values()))["people"].values()))
+    observation = next(iter(person["derived_observations"].values()))
+
+    assert set(observation) == {
+        "mode", "source_carrier", "visible_region", "boundary", "relationship",
+    }
+    for mode in ("optical_projection", "temporal_residual", "source-preserve"):
+        assert mode in skill
+    for contract in (
+        "不代表独立物理人物",
+        "不新增顶层人物或实体",
+        "不把该观测实例化到新场景",
+        "source-preserve/non-physical",
+        "不拒绝、不 retry、不 fallback",
+    ):
+        assert contract in skill
+    for mechanical in (
+        "observation_id", "physicality", "instantiation", "frame_constraints",
+    ):
+        assert mechanical not in json.dumps(example, ensure_ascii=False)
 
 
 def test_skill_keeps_entity_relationships_semantic_and_non_refusing():

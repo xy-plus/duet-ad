@@ -744,6 +744,16 @@ _SEMANTIC_ENTITY_VISIBILITIES = {
     "occluded": "occluded",
     "out_of_frame": "out_of_frame",
 }
+_SEMANTIC_DERIVED_APPEARANCE_MODES = {
+    "optical_projection",
+    "temporal_residual",
+}
+_NON_PHYSICAL_APPEARANCE_CLAUSE = (
+    "源帧中的光学投影、屏幕成像、阴影、时间采样残影、运动拖影和失焦回波，"
+    "都只是已冻结主实体的非物理成像派生，不得实例化为新的物理人物或人体结构；"
+    "其源载体随场景替换而消失时不得复制，只保持当前帧直接可见主实体的数量、"
+    "区域、边界和物理关系"
+)
 
 
 def _contains_directed_cycle(edges: list[tuple[str, str]]) -> bool:
@@ -1641,6 +1651,8 @@ def compile_semantic_plan(
     issues: list[str] = []
     ignored_mechanical_fields: list[str] = []
     entity_source_preserve_defaults: list[str] = []
+    appearance_source_preserve_defaults: list[str] = []
+    classified_derived_appearances = 0
 
     def field(
         container: object,
@@ -1690,6 +1702,27 @@ def compile_semantic_plan(
                     ignored_mechanical_fields.append(
                         f"frames.{frame_key}.entities.{entity_key}.{key}"
                     )
+        frame_people = frame.get("people")
+        if not isinstance(frame_people, dict):
+            continue
+        for person_key, person in frame_people.items():
+            if not isinstance(person, dict):
+                continue
+            derived = person.get("derived_observations")
+            if not isinstance(derived, dict):
+                continue
+            for observation_key, observation in derived.items():
+                if not isinstance(observation, dict):
+                    continue
+                for key in observation:
+                    if key in {
+                        "observation_id", "person_id", "physicality",
+                        "instantiation",
+                    }:
+                        ignored_mechanical_fields.append(
+                            f"frames.{frame_key}.people.{person_key}."
+                            f"derived_observations.{observation_key}.{key}"
+                        )
 
     observations: dict[str, dict[str, dict]] = {}
     person_keys = {
@@ -2095,6 +2128,7 @@ def compile_semantic_plan(
             )
             visible_parts = []
             poses = []
+            derived_appearances = []
             for person_key in observed_person_keys:
                 detail = observations[person_key].get(frame["key"])
                 if detail is None:
@@ -2107,10 +2141,99 @@ def compile_semantic_plan(
                     detail.get("visible_region") if isinstance(detail, dict) else None,
                     "当前帧可见人物区域",
                 )
+                boundary = _semantic_text(
+                    detail.get("boundary") if isinstance(detail, dict) else None,
+                    "当前帧人物、服装、遮挡与画边共同形成的可见边界",
+                )
                 visible_parts.append(
-                    f"{person_id_by_key[person_key]}：{visible_region}"
+                    f"{person_id_by_key[person_key]}：{visible_region}；"
+                    f"当前可见边界={boundary}"
                 )
                 poses.append(f"{person_id_by_key[person_key]}：{body_pose}")
+                derived_path = (
+                    f"frames.{frame['key']}.people.{person_key}."
+                    "derived_observations"
+                )
+                raw_derived = (
+                    detail.get("derived_observations")
+                    if isinstance(detail, dict) else None
+                )
+                if not isinstance(raw_derived, dict):
+                    appearance_source_preserve_defaults.append(derived_path)
+                    raw_derived = {}
+                for observation_key in sorted(raw_derived):
+                    observation = raw_derived[observation_key]
+                    observation_path = f"{derived_path}.{observation_key}"
+                    if not isinstance(observation, dict):
+                        appearance_source_preserve_defaults.append(
+                            observation_path
+                        )
+                        continue
+                    raw_mode = observation.get("mode")
+                    mode = (
+                        raw_mode.strip().lower()
+                        if isinstance(raw_mode, str) else ""
+                    )
+                    if mode not in _SEMANTIC_DERIVED_APPEARANCE_MODES:
+                        mode = "source_preserve"
+                        appearance_source_preserve_defaults.append(
+                            f"{observation_path}.mode"
+                        )
+                    source_carrier = observation.get("source_carrier")
+                    if not isinstance(source_carrier, str) or not source_carrier.strip():
+                        appearance_source_preserve_defaults.append(
+                            f"{observation_path}.source_carrier"
+                        )
+                    derived_region = observation.get("visible_region")
+                    if not isinstance(derived_region, str) or not derived_region.strip():
+                        appearance_source_preserve_defaults.append(
+                            f"{observation_path}.visible_region"
+                        )
+                    derived_boundary = observation.get("boundary")
+                    if not isinstance(derived_boundary, str) or not derived_boundary.strip():
+                        appearance_source_preserve_defaults.append(
+                            f"{observation_path}.boundary"
+                        )
+                    relationship = observation.get("relationship")
+                    if not isinstance(relationship, str) or not relationship.strip():
+                        appearance_source_preserve_defaults.append(
+                            f"{observation_path}.relationship"
+                        )
+                    derived_appearances.append({
+                        "observation_id": (
+                            f"OBSERVATION_{len(derived_appearances) + 1:02d}"
+                        ),
+                        "mode": mode,
+                        "source_person": person_id_by_key[person_key],
+                        "source_carrier": _semantic_text(
+                            source_carrier,
+                            "source-preserve/non-physical",
+                            max_bytes=512,
+                        ),
+                        "visible_region": _semantic_text(
+                            derived_region,
+                            "source-preserve/non-physical",
+                            max_bytes=512,
+                        ),
+                        "boundary": _semantic_text(
+                            derived_boundary,
+                            "source-preserve/non-physical",
+                            max_bytes=512,
+                        ),
+                        "relationship": _semantic_text(
+                            relationship,
+                            "source-preserve/non-physical",
+                            max_bytes=512,
+                        ),
+                        "physicality": "non_physical",
+                        "instantiation": "source_carrier_bound",
+                    })
+                    classified_derived_appearances += 1
+            derived_clause = (
+                f"derived_observations={_plan_json(derived_appearances)}"
+                if derived_appearances else
+                "derived_observations=source-preserve/non-physical"
+            )
             constraints.append({
                 "frame_index": frame["frame_index"],
                 "visible_body_parts": _semantic_text(
@@ -2126,10 +2249,14 @@ def compile_semantic_plan(
                         relationships,
                         entity_notes,
                         *entity_relation_notes,
+                        derived_clause,
                     )),
                     "保持当前源帧可见接触与实体关系",
                 ),
-                "occlusion_order": relationships,
+                "occlusion_order": _semantic_text(
+                    f"{relationships}；{derived_clause}",
+                    "保持当前源帧可见遮挡与成像派生关系",
+                ),
                 "out_of_frame_crop": crop,
                 "non_person_entity_ledger": {
                     "entities": ledger_entities,
@@ -2192,6 +2319,12 @@ def compile_semantic_plan(
                 entity_source_preserve_defaults
             )),
         },
+        "person_observation_continuity": {
+            "classified_derived_count": classified_derived_appearances,
+            "source_preserve_defaults": sorted(set(
+                appearance_source_preserve_defaults
+            )),
+        },
     }
     return plan, diagnostics
 
@@ -2230,10 +2363,13 @@ def compile_segment_prompts(
     *,
     allow_empty_people: bool = False,
     _observable_frame_by_segment: dict[int, int] | None = None,
+    _compiler_revision: int = 2,
 ) -> dict[int, str]:
     """Compile an eligible semantic v2 plan into immutable provider prompts."""
     if edit_mode not in SEEDREAM_EDIT_MODES:
         raise ValueError("unsupported image optimization edit mode")
+    if _compiler_revision not in {1, 2}:
+        raise ValueError("unsupported image optimization prompt compiler revision")
     canonical = _canonical_plan_v2(
         plan, allow_empty_people=allow_empty_people,
     )
@@ -2258,13 +2394,23 @@ def compile_segment_prompts(
                 hidden_people = True
                 continue
             design = people[member["id"]]
+            target = member["target_region"]
+            boundary = member["boundary"]
+            if selected_frame is not None and _compiler_revision >= 2:
+                target = (
+                    f"当前帧中由 {member['id']} 标识的直接可见唯一物理人物区域"
+                )
+                boundary = (
+                    "仅限当前帧硬约束中冻结的人物、服装、遮挡与画边共同形成的"
+                    "直接可见边界"
+                )
             person_edits.append(
                 "将{target}完整替换为{identity}，{wardrobe}，{color}，编辑边界为{boundary}".format(
-                    target=member["target_region"],
+                    target=target,
                     identity=design["replacement_identity"],
                     wardrobe=design["wardrobe_change"],
                     color=design["local_color_change"],
-                    boundary=member["boundary"],
+                    boundary=boundary,
                 )
             )
         person_clause = (
@@ -2295,12 +2441,17 @@ def compile_segment_prompts(
         non_target_clause = (
             f"；背景非目标人物（{non_targets}）保持不变" if non_targets else ""
         )
+        appearance_clause = (
+            f"；{_NON_PHYSICAL_APPEARANCE_CLAUSE}"
+            if _compiler_revision >= 2 else ""
+        )
         invariant_clause = (
             "保持当前源图的画幅、裁切、机位、镜头、透视、构图、焦点、景深、"
             "人物数量、姿态、动作、视线及核心实体不变；光源方向、曝光、白平衡、"
             "色温、全局色调曲线保持与当前源图一致，只允许新几何产生物理正确的"
             f"局部阴影；严格保持{protected}以及持握、接触、遮挡、前后关系和动作目的"
-            f"{non_target_clause}；禁止文字、Logo、水印、畸变、融合、增删实体或画质美化"
+            f"{non_target_clause}{appearance_clause}；"
+            "禁止文字、Logo、水印、畸变、融合、增删实体或画质美化"
         )
         mode_clause = (
             "图1始终是唯一编辑画布；其他输入图只提供冻结人物身份、场景设计和"
@@ -2312,7 +2463,12 @@ def compile_segment_prompts(
     return prompts
 
 
-def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str]]:
+def compile_frame_prompts(
+    plan: dict,
+    edit_mode: str,
+    *,
+    _compiler_revision: int = 2,
+) -> dict[int, dict[int, str]]:
     """Compile an eligible v3/v4 plan into one immutable prompt per source frame."""
     canonical = (
         _canonical_plan_v4(plan)
@@ -2330,7 +2486,11 @@ def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str
         segment.pop("frame_constraints")
         segment.pop("photometric_contract")
     segment_prompts = (
-        compile_segment_prompts(base_plan, edit_mode)
+        compile_segment_prompts(
+            base_plan,
+            edit_mode,
+            _compiler_revision=_compiler_revision,
+        )
         if canonical["version"] == 3 else None
     )
     continuity_by_scene = {
@@ -2354,6 +2514,7 @@ def compile_frame_prompts(plan: dict, edit_mode: str) -> dict[int, dict[int, str
                     _observable_frame_by_segment={
                         segment["segment_index"]: constraint["frame_index"]
                     },
+                    _compiler_revision=_compiler_revision,
                 )[segment["segment_index"]]
             )
             frame_clause = "；".join(
@@ -2752,6 +2913,12 @@ def _scene_graph_digest(plan: dict, inventory: list[dict]) -> str:
     return sha256(_plan_json(payload))
 
 
+def _frame_prompt_compiler_revision(profile: object) -> int:
+    if profile == {"id": "image-postprocess", "revision": 1}:
+        return 1
+    return 2
+
+
 def _freeze_frame_prompts_v4(
     settings: Settings,
     execution_inputs: dict,
@@ -2798,7 +2965,13 @@ def _freeze_frame_prompts_v4(
             model=execution_inputs["model"],
             frame_inventory=inventory,
         )
-        expected_prompts = compile_frame_prompts(plan, settings.seedream_edit_mode)
+        expected_prompts = compile_frame_prompts(
+            plan,
+            settings.seedream_edit_mode,
+            _compiler_revision=_frame_prompt_compiler_revision(
+                execution_inputs["profile"]
+            ),
+        )
     except (
         KeyError, TypeError, ValueError, ImageOptimizationOutputError,
         ImageOptimizationIneligibleError,
@@ -4571,7 +4744,13 @@ def _receipt_v4(raw: dict, meta: dict) -> dict | None:
             model=execution["model"],
             frame_inventory=inventory,
         )
-        expected_prompts = compile_frame_prompts(plan, raw["edit_mode"])
+        expected_prompts = compile_frame_prompts(
+            plan,
+            raw["edit_mode"],
+            _compiler_revision=_frame_prompt_compiler_revision(
+                execution["profile"]
+            ),
+        )
         expected_schedule = _scene_anchor_schedule(plan, expected_execution)
     except (
         KeyError, TypeError, ValueError, ImageOptimizationOutputError,

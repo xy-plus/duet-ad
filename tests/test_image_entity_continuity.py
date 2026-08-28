@@ -340,6 +340,119 @@ def test_entity_owner_graph_rejects_multiple_owners():
         )
 
 
+def test_provider_prompt_uses_only_the_current_frame_person_observation():
+    frames = _semantic_frames()
+    first = frames["frame-001"]["people"]["narrative-person"]
+    first.update({
+        "visible_region": "frame-one-exclusive-person-domain",
+        "boundary": "frame-one-exclusive-person-boundary",
+    })
+    second = frames["frame-002"]["people"]["narrative-person"]
+    second.update({
+        "visible_region": "frame-two-exclusive-person-domain",
+        "boundary": "frame-two-exclusive-person-boundary",
+    })
+    semantic = {
+        "people": {"narrative-person": _person_design()},
+        "entities": _semantic_entities(),
+        "scenes": {"scene-001": _scene_design()},
+        "frames": frames,
+    }
+
+    plan, _ = image_optimization.compile_semantic_plan(semantic, _segments())
+    prompts = image_optimization.compile_frame_prompts(
+        plan, "anchor_consistency",
+    )
+
+    assert "frame-one-exclusive-person-domain" in prompts[1][1]
+    assert "frame-one-exclusive-person-boundary" in prompts[1][1]
+    assert "frame-two-exclusive-person-domain" not in prompts[1][1]
+    assert "frame-two-exclusive-person-boundary" not in prompts[1][1]
+    assert "frame-two-exclusive-person-domain" in prompts[1][2]
+    assert "frame-two-exclusive-person-boundary" in prompts[1][2]
+    assert "frame-one-exclusive-person-domain" not in prompts[1][2]
+    assert "frame-one-exclusive-person-boundary" not in prompts[1][2]
+
+
+@pytest.mark.parametrize("mode", ["optical_projection", "temporal_residual"])
+def test_derived_person_observation_compiles_as_source_carrier_bound_nonphysical(
+    mode,
+):
+    frames = _semantic_frames()
+    frames["frame-001"]["people"]["narrative-person"][
+        "derived_observations"
+    ] = {
+        "derived-view": {
+            "mode": mode,
+            "source_carrier": "source-carrier-alpha",
+            "visible_region": "derived-observation-region-alpha",
+            "boundary": "derived-observation-boundary-alpha",
+            "relationship": "derived from the stable person through its source carrier",
+        }
+    }
+    semantic = {
+        "people": {"narrative-person": _person_design()},
+        "entities": _semantic_entities(),
+        "scenes": {"scene-001": _scene_design()},
+        "frames": frames,
+    }
+
+    plan, _ = image_optimization.compile_semantic_plan(semantic, _segments())
+    constraint = plan["segments"][0]["frame_constraints"][0]
+    compiled = "；".join(
+        constraint[key]
+        for key in image_optimization._FRAME_TEXT_CONSTRAINT_KEYS
+    )
+    prompt = image_optimization.compile_frame_prompts(
+        plan, "anchor_consistency",
+    )[1][1]
+
+    for expected in (
+        f'"mode":"{mode}"',
+        '"physicality":"non_physical"',
+        '"source_person":"PERSON_01"',
+        '"source_carrier":"source-carrier-alpha"',
+        '"instantiation":"source_carrier_bound"',
+        "derived-observation-region-alpha",
+        "derived-observation-boundary-alpha",
+    ):
+        assert expected in compiled
+        assert expected in prompt
+
+
+def test_missing_derived_person_semantics_are_source_preserve_diagnostics_only():
+    frames = _semantic_frames()
+    semantic = {
+        "people": {"narrative-person": _person_design()},
+        "entities": _semantic_entities(),
+        "scenes": {"scene-001": _scene_design()},
+        "frames": frames,
+    }
+
+    plan, diagnostics = image_optimization.compile_semantic_plan(
+        semantic, _segments(),
+    )
+    constraint = plan["segments"][0]["frame_constraints"][0]
+    compiled = "；".join(
+        constraint[key]
+        for key in image_optimization._FRAME_TEXT_CONSTRAINT_KEYS
+    )
+
+    assert diagnostics["person_observation_continuity"][
+        "source_preserve_defaults"
+    ] == [
+        "frames.frame-001.people.narrative-person.derived_observations",
+        "frames.frame-002.people.narrative-person.derived_observations",
+        "frames.frame-003.people.narrative-person.derived_observations",
+        "frames.frame-004.people.narrative-person.derived_observations",
+    ]
+    assert "derived_observations=source-preserve/non-physical" in compiled
+    assert plan["eligible"] is True
+    assert "blocking" not in diagnostics
+    assert "retry" not in diagnostics
+    assert "fallback" not in diagnostics
+
+
 def test_skill_assigns_semantics_only_and_requires_persistent_entity_states():
     skill = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
 
@@ -349,6 +462,11 @@ def test_skill_assigns_semantics_only_and_requires_persistent_entity_states():
         "visible/occluded/out_of_frame",
         "source-preserve",
         "hard_cut",
+        "derived_observations",
+        "optical_projection",
+        "temporal_residual",
+        "source-preserve/non-physical",
+        "派生观测始终嵌套在来源人物下",
         "实体 ID、关系图和完整机械字段由后端构造",
     ):
         assert text in skill

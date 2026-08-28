@@ -13,9 +13,11 @@ description: 读取冻结关键帧，为人物与真实新场景双替换填写�
 
 同一人物使用一个简短、稳定、通用的语义 key，并在 `people` 与所有 `frames.*.people` 中复用。每帧只描述当前帧直接可见的人物区域、身体与姿态、实体关系和画外裁切；不可见或无法唯一判断的内容写成 `source-preserve/no-invention` 描述，不从其他帧补造。
 
+当前帧中由既有人物与源载体形成、但不代表独立物理人物的派生观测，只写在该人物的 `derived_observations` 中。为每种可区分观测使用简短稳定的语义 key，`mode` 使用 `optical_projection`、`temporal_residual`，无法唯一判断时使用 `source-preserve`；同时描述当前源载体、可见区域、边界和依附关系。派生观测不新增顶层人物或实体；源载体属于被替换场景时，不把该观测实例化到新场景，也不把它升级为独立物理人物。当前帧没有派生观测时写空对象；语义缺失时由后端按 `source-preserve/non-physical` 继续并写 diagnostics，不拒绝、不 retry、不 fallback。
+
 为跨帧持续出现、由项目级或人物归属且持有或穿戴的持久可见非人物实体建立 `stable entity key`。在 `entities` 中只写稳定外观身份、归属和持续性语义；在每帧复用同一 key，并按当前帧证据写 `visible/occluded/out_of_frame` 状态与关系。状态暂时不可判断时写 `source-preserve`，不要把未见解释成删除，也不要从相邻帧补造可见状态。`hard_cut` 后可依据新帧重新观察；只有新帧证据支持同一物理实体时才复用原 key，不得无依据新增、删除或改换身份。
 
-只填写视觉语义。不要输出版本、段号、帧号、连续编号 ID、哈希、transition、枚举 palette、实体图、组件图或流程判断；实体 ID、关系图和完整机械字段由后端构造，缺失实体语义也由后端使用 `source-preserve` 默认继续并写 diagnostics。不要编写 provider prompt。
+只填写视觉语义。不要输出版本、段号、帧号、连续编号 ID、哈希、transition、枚举 palette、实体图、组件图或流程判断；也不要输出派生观测 ID、物理性或实例化策略。实体 ID、关系图和完整机械字段由后端构造，派生观测 ID 与其物理性、实例化策略也由后端构造，缺失语义也由后端使用 `source-preserve` 默认继续并写 diagnostics。不要编写 provider prompt。
 
 ## 唯一输出
 
@@ -56,7 +58,16 @@ description: 读取冻结关键帧，为人物与真实新场景双替换填写�
         "stable-person-key": {
           "visible_region": "当前帧直接可见的人物目标域",
           "boundary": "当前帧人物、服装、遮挡与画边共同形成的可见边界",
-          "body_and_pose": "当前帧直接可见的身体部位与姿态"
+          "body_and_pose": "当前帧直接可见的身体部位与姿态",
+          "derived_observations": {
+            "stable-derived-observation-key": {
+              "mode": "optical_projection/temporal_residual；无法唯一判断时为 source-preserve",
+              "source_carrier": "形成该观测的当前源载体；无法唯一判断时为 source-preserve",
+              "visible_region": "该派生观测在当前帧的可见区域",
+              "boundary": "该派生观测在当前帧的可见边界",
+              "relationship": "该观测如何依附 stable-person-key 与当前源载体"
+            }
+          }
         }
       },
       "relationships": "当前帧直接可见的接触、支撑、遮挡与前后关系；未知部分保持 source-preserve/no-invention",
@@ -72,4 +83,4 @@ description: 读取冻结关键帧，为人物与真实新场景双替换填写�
 }
 ```
 
-`scenes` 和 `frames` 必须逐字使用 `semantic_slots` 提供的全部 key。`people` 收录全项目实际可见的叙事人物；每个 frame 的 `people` 只列该帧实际可见的人物，同一人物 key 不随段或帧改变。`entities` 只收录源帧有证据支持的持久实体；同一 continuity chain 内同一实体始终复用一个 key，各帧只改变观察状态和关系。无人或无持久实体可见时使用空对象。输出 JSON，不写解释或其他文件。
+`scenes` 和 `frames` 必须逐字使用 `semantic_slots` 提供的全部 key。`people` 收录全项目实际可见的叙事人物；每个 frame 的 `people` 只列该帧实际可见的人物，同一人物 key 不随段或帧改变。派生观测始终嵌套在来源人物下，不计作额外人物。`entities` 只收录源帧有证据支持的持久实体；同一 continuity chain 内同一实体始终复用一个 key，各帧只改变观察状态和关系。无人或无持久实体可见时使用空对象。输出 JSON，不写解释或其他文件。
