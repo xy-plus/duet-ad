@@ -6,6 +6,7 @@ import hashlib
 import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -253,7 +254,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     tmp_path, monkeypatch, segment_count, *, postprocess_options=None,
     frozen_single_segment=False, forbid_legacy_short=False,
     complete_generation=False, dialogue_mode="auto",
-    silent_segment_indices=(),
+    silent_segment_indices=(), context_semantic_recovery=False,
 ):
     settings = make_settings(
         tmp_path,
@@ -440,8 +441,11 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     monkeypatch.setattr(CodexRunner, "run", skill)
     context_sources = []
     context_effective = {}
+    context_requests = []
+    injected_semantic_failure = False
 
     def context_gateway(request):
+        context_requests.append((request.method, request.url.path))
         if request.method == "POST" and request.url.path == "/v1/files/upload":
             return httpx.Response(200, json={
                 "file": {"file_id": "427752006353318"},
@@ -456,6 +460,10 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             return httpx.Response(200, json={"task_id": task_id})
         if request.method == "GET":
             task_id = request.url.path.rsplit("/", 1)[-1]
+            if context_semantic_recovery and not injected_semantic_failure:
+                raise httpx.ReadTimeout(
+                    "ambiguous Context query", request=request,
+                )
             return httpx.Response(200, json={"task": {
                 "id": task_id,
                 "task_type": "h3_context_ir",
@@ -468,10 +476,36 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     real_optimize = context_ir_bridge.optimize_h3_prompt
 
     def optimize(frozen):
+        nonlocal injected_semantic_failure
         with httpx.Client(
             transport=httpx.MockTransport(context_gateway)
         ) as context_client:
-            return real_optimize(frozen, client=context_client)
+            result = real_optimize(frozen, client=context_client)
+        if (
+            context_semantic_recovery
+            and not injected_semantic_failure
+            and result.status == "query_unknown"
+        ):
+            attempt_path = (
+                frozen.workdir / ".context-ir" / "attempts"
+                / result.attempt_id / "attempt.json"
+            )
+            attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+            attempt["status"] = "failed"
+            attempt["error"] = "context_ir_semantic_mismatch"
+            attempt_path.write_text(
+                json.dumps(
+                    attempt, ensure_ascii=False, sort_keys=True, indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            injected_semantic_failure = True
+            return replace(
+                result,
+                status="failed",
+                error_code="context_ir_semantic_mismatch",
+            )
+        return result
 
     monkeypatch.setattr(context_ir_bridge, "optimize_h3_prompt", optimize)
     h3_requests = []
@@ -592,8 +626,127 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         second = client.post(
             f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
         )
+        final_submit = second
+        if context_semantic_recovery:
+            assert second.status_code == 202, second.json()
+            assert h3_requests == []
+            failed_meta = storage.load_meta(settings.data_dir, cid)
+            failed_generation = failed_meta["generation"]
+            failed_segment = failed_generation["segments"][0]
+            assert failed_generation["status"] == "failed"
+            assert failed_segment["error"] == "context_ir_semantic_mismatch"
+            assert failed_segment["h3_attempt_id"] is None
+            assert failed_segment["context_ir"]["provider_task_id"] == (
+                "context-task-1"
+            )
+            assert failed_segment["context_ir"]["receipt_path"] is None
 
-    assert second.status_code == 202, second.json()
+            monkeypatch.setattr(
+                postprocess,
+                "_v4_user_acceptance_matches",
+                lambda *_args, **_kwargs: False,
+            )
+            with pytest.raises(
+                postprocess.PostprocessError,
+                match="postprocess_artifacts_invalid",
+            ):
+                postprocess.generation_keyframes(
+                    cdir,
+                    storage.load_meta(settings.data_dir, cid),
+                    originals,
+                    settings=settings,
+                )
+
+            baseline_generation = storage.load_meta(
+                settings.data_dir, cid,
+            )["generation"]
+            drifted_payload = {**payload, "resolution": "480p"}
+            params_drift = client.post(
+                f"/api/conversations/{cid}/submit",
+                headers=AUTH,
+                json=drifted_payload,
+            )
+            assert params_drift.status_code == 409
+            assert params_drift.json() == {
+                "detail": "resume_parameters_changed"
+            }
+
+            for mutation in ("task", "error"):
+                drifted_generation = json.loads(json.dumps(baseline_generation))
+                if mutation == "task":
+                    drifted_generation["segments"][0]["context_ir"][
+                        "provider_task_id"
+                    ] = "another-context-task"
+                else:
+                    drifted_generation["segments"][0]["error"] = (
+                        "context_ir_provider_failed"
+                    )
+                storage.update_meta(
+                    settings.data_dir, cid, generation=drifted_generation,
+                )
+                rejected = client.post(
+                    f"/api/conversations/{cid}/submit",
+                    headers=AUTH,
+                    json=payload,
+                )
+                assert rejected.status_code == 409
+                assert rejected.json() == {
+                    "detail": "new client_request_id required"
+                }
+                storage.update_meta(
+                    settings.data_dir, cid, generation=baseline_generation,
+                )
+
+            h3_root = cdir / "work" / "segments" / "1" / ".h3"
+            h3_root.mkdir()
+            h3_drift = client.post(
+                f"/api/conversations/{cid}/submit",
+                headers=AUTH,
+                json=payload,
+            )
+            assert h3_drift.status_code == 409
+            assert h3_drift.json() == {
+                "detail": "new client_request_id required"
+            }
+            h3_root.rmdir()
+
+            plan_path = cdir / long_video.PLAN_RECEIPT_FILENAME
+            plan_bytes = plan_path.read_bytes()
+            plan_path.write_bytes(plan_bytes + b" ")
+            plan_drift = client.post(
+                f"/api/conversations/{cid}/submit",
+                headers=AUTH,
+                json=payload,
+            )
+            assert plan_drift.status_code == 409
+            assert plan_drift.json() == {"detail": "resume_parameters_changed"}
+            plan_path.write_bytes(plan_bytes)
+
+            assert h3_requests == []
+            assert sum(
+                method == "POST" and path == "/v2/h3_context_ir"
+                for method, path in context_requests
+            ) == 1
+            recovery = client.post(
+                f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+            )
+            assert recovery.status_code == 202, recovery.json()
+            assert h3_requests == []
+            context_ready = storage.load_meta(
+                settings.data_dir, cid,
+            )["generation"]
+            assert context_ready["status"] == "resume_required"
+            assert context_ready["segments"][0]["status"] == "resume_required"
+            assert context_ready["segments"][0]["error"] == "context_ir_ready"
+            assert context_ready["segments"][0]["context_ir"]["status"] == (
+                "succeeded"
+            )
+            final_submit = client.post(
+                f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+            )
+            assert final_submit.status_code == 202, final_submit.json()
+
+    assert final_submit.status_code == 202, final_submit.json()
     assert fusion_calls == [cdir]
     assert len(h3_requests) == (segment_count if complete_generation else 1)
     for bound_request in h3_requests:
@@ -649,6 +802,22 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             assert ("h3_attempt_id" in state) == (
                 state["index"] in native_indices
             )
+    if context_semantic_recovery:
+        assert sum(
+            method == "POST" and path == "/v2/h3_context_ir"
+            for method, path in context_requests
+        ) == 1
+        assert sum(
+            method == "GET"
+            and path == "/v2/query/video_generation/context-task-1"
+            for method, path in context_requests
+        ) == 2
+        recovered_context = storage.load_meta(
+            settings.data_dir, cid,
+        )["generation"]["segments"][0]["context_ir"]
+        assert recovered_context["status"] == "succeeded"
+        assert recovered_context["provider_task_id"] == "context-task-1"
+        assert recovered_context["receipt_path"] is not None
     for index in range(1, segment_count + 1):
         segment_work = cdir / "work" / "segments" / str(index) / "work"
         assert not (segment_work / "multimodal_input.json").exists()
@@ -691,6 +860,18 @@ def test_n2_off_screen_fusion_completes_context_h3_and_native_stitch(
 ):
     _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         tmp_path, monkeypatch, 2, complete_generation=True,
+    )
+
+
+def test_same_submit_recovers_long_context_semantic_mismatch_get_only(
+    tmp_path, monkeypatch,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path,
+        monkeypatch,
+        1,
+        complete_generation=True,
+        context_semantic_recovery=True,
     )
 
 

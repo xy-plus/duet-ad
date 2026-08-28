@@ -1517,31 +1517,62 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         raise LongGenerationError("long_video_plan_invalid")
 
     project_selected_paths: dict[int, tuple[Path, ...]] = {}
+    frozen_fusion_frame_data: dict[Path, bytes] = {}
     if workflow in h3.H3_REFERENCE_WORKFLOWS:
-        project_originals: list[Path] = []
-        project_counts: list[int] = []
-        for raw in raw_segments:
-            keys = raw.get("keyframes") if isinstance(raw, Mapping) else None
-            if not isinstance(keys, list) or not 1 <= len(keys) <= 9:
-                raise LongGenerationError("long_video_plan_invalid")
-            originals = [_bound_path(root, artifact) for artifact in keys]
-            project_originals.extend(originals)
-            project_counts.append(len(originals))
-        try:
-            selected_project = postprocess.generation_keyframes(
-                root, dict(meta), project_originals, settings=settings,
-            )
-        except postprocess.PostprocessError as exc:
-            detail = exc.detail if isinstance(exc.detail, str) else exc.detail["code"]
-            raise LongGenerationError(detail, exc.status) from None
-        if len(selected_project) != len(project_originals):
-            raise LongGenerationError("postprocess_artifacts_invalid")
-        cursor = 0
-        for index, count in enumerate(project_counts, 1):
-            project_selected_paths[index] = tuple(
-                selected_project[cursor:cursor + count]
-            )
-            cursor += count
+        if frozen_fusion is not None:
+            for index, fusion_segment in enumerate(frozen_fusion.segments, 1):
+                frames = fusion_segment.get("new_keyframes")
+                if not isinstance(frames, list) or len(frames) != 9:
+                    raise LongGenerationError("prompt_fusion_input_invalid")
+                selected_paths: list[Path] = []
+                for order, frame in enumerate(frames, 1):
+                    if (
+                        not isinstance(frame, Mapping)
+                        or set(frame) != {"order", "path", "sha256"}
+                        or frame.get("order") != order
+                    ):
+                        raise LongGenerationError("prompt_fusion_input_invalid")
+                    try:
+                        resolved, data = _bound_bytes(
+                            root,
+                            {key: frame[key] for key in ("path", "sha256")},
+                        )
+                    except LongGenerationError:
+                        raise LongGenerationError(
+                            "prompt_fusion_input_invalid"
+                        ) from None
+                    selected_paths.append(resolved)
+                    frozen_fusion_frame_data[resolved] = data
+                project_selected_paths[index] = tuple(selected_paths)
+        else:
+            project_originals: list[Path] = []
+            project_counts: list[int] = []
+            for raw in raw_segments:
+                keys = raw.get("keyframes") if isinstance(raw, Mapping) else None
+                if not isinstance(keys, list) or not 1 <= len(keys) <= 9:
+                    raise LongGenerationError("long_video_plan_invalid")
+                originals = [_bound_path(root, artifact) for artifact in keys]
+                project_originals.extend(originals)
+                project_counts.append(len(originals))
+            try:
+                selected_project = postprocess.generation_keyframes(
+                    root, dict(meta), project_originals, settings=settings,
+                )
+            except postprocess.PostprocessError as exc:
+                detail = (
+                    exc.detail
+                    if isinstance(exc.detail, str)
+                    else exc.detail["code"]
+                )
+                raise LongGenerationError(detail, exc.status) from None
+            if len(selected_project) != len(project_originals):
+                raise LongGenerationError("postprocess_artifacts_invalid")
+            cursor = 0
+            for index, count in enumerate(project_counts, 1):
+                project_selected_paths[index] = tuple(
+                    selected_project[cursor:cursor + count]
+                )
+                cursor += count
 
     frozen: list[FrozenSegment] = []
     authoritative_dialogue_for_delivery: list[dict] = []
@@ -1724,7 +1755,9 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             original_data = {path.resolve(): data for path, data in bound_keyframes}
             for selected_path in selected_paths:
                 resolved = selected_path.resolve()
-                data = original_data.get(resolved)
+                data = frozen_fusion_frame_data.get(resolved)
+                if data is None:
+                    data = original_data.get(resolved)
                 if data is None:
                     try:
                         data = resolved.read_bytes()
@@ -2224,6 +2257,7 @@ def _context_ir_may_progress(
     source_request: h3.H3Request,
     *,
     allow_create: bool = False,
+    frozen_context: context_ir_bridge.FrozenContextIrRequest | None = None,
 ) -> bool:
     binding = state.get("context_ir")
     if binding is None:
@@ -2235,7 +2269,7 @@ def _context_ir_may_progress(
     if not isinstance(binding, Mapping):
         return False
     return h3_project.context_ir_progress_binding_matches(
-        source_request, binding
+        source_request, binding, frozen_context=frozen_context
     )
 
 
@@ -2378,6 +2412,117 @@ def generation_segments_are_valid(
         ):
             return False
     return bool(native_items) == native_required
+
+
+def context_ir_semantic_failure_is_recoverable(
+    settings,
+    cid: str,
+    plan: FrozenPlan,
+    generation: Mapping,
+    fit_mode: str,
+) -> bool:
+    """Prove one current Fusion Context failure can resume its exact GET."""
+    if (
+        plan.prompt_fusion is None
+        or fit_mode not in {"none", "crop", "pad"}
+        or generation.get("status") != "failed"
+        or generation.get("error") != "long_video_segment_failed"
+        or generation.get("stage") != "h3"
+        or generation.get("fast_mode", False) is not False
+        or generation.get("workflow") != plan.workflow
+        or not isinstance(generation.get("client_request_id"), str)
+        or not generation_segments_are_valid(plan.segments, generation)
+    ):
+        return False
+    try:
+        _generation_uses_h3_native_audio(plan, generation)
+    except LongGenerationError:
+        return False
+    states = generation.get("segments")
+    failed = [
+        item for item in states
+        if isinstance(item, Mapping) and item.get("status") == "failed"
+    ]
+    if (
+        len(failed) != 1
+        or any(
+            item.get("status") not in {"succeeded", "failed"}
+            for item in states
+        )
+    ):
+        return False
+    state = failed[0]
+    index = state.get("index")
+    if (
+        not isinstance(index, int)
+        or isinstance(index, bool)
+        or index < 1
+        or index > len(plan.segments)
+        or state.get("error") != "context_ir_semantic_mismatch"
+        or state.get("child_request_id") is not None
+        or state.get("h3_attempt_id") is not None
+        or not isinstance(state.get("attempt"), int)
+        or isinstance(state.get("attempt"), bool)
+        or state.get("attempt") <= 0
+    ):
+        return False
+    binding = state.get("context_ir")
+    if (
+        not isinstance(binding, Mapping)
+        or binding.get("status") != "failed"
+        or not isinstance(binding.get("provider_task_id"), str)
+        or not binding["provider_task_id"]
+        or binding.get("effective_prompt_sha256") is not None
+        or binding.get("receipt_path") is not None
+        or binding.get("receipt_sha256") is not None
+    ):
+        return False
+    segment = plan.segments[index - 1]
+    if (segment.workdir / ".h3").exists():
+        return False
+    attempt_id = binding.get("attempt_id")
+    if (
+        not isinstance(attempt_id, str)
+        or len(attempt_id) != 6
+        or not attempt_id.isdigit()
+    ):
+        return False
+    attempt_dir = segment.workdir / ".context-ir" / "attempts" / attempt_id
+    if (attempt_dir / "receipt.json").exists():
+        return False
+    try:
+        attempt_state = json.loads(
+            (attempt_dir / "attempt.json").read_text(encoding="utf-8")
+        )
+        if (
+            not isinstance(attempt_state, Mapping)
+            or attempt_state.get("status") != "failed"
+            or attempt_state.get("error") != "context_ir_semantic_mismatch"
+            or attempt_state.get("provider_task_id")
+            != binding.get("provider_task_id")
+            or attempt_state.get("receipt") is not None
+        ):
+            return False
+        source_request = _request(
+            settings,
+            cid,
+            plan,
+            segment,
+            generation["client_request_id"],
+            fit_mode,
+            prepare_inputs=False,
+            fast_mode=False,
+        )
+        frozen_context = _freeze_segment_context_ir(
+            settings, plan, segment, source_request
+        )
+        return h3_project.context_ir_progress_binding_matches(
+            source_request,
+            binding,
+            frozen_context=frozen_context,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, LongGenerationError):
+        return False
 
 
 def bound_reusable_segment_indices(
@@ -2929,7 +3074,16 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                             "context_ir_resume_required",
                             _exact_h3_attempt_id(state.get("h3_attempt_id")),
                         )
-                    if not _context_ir_may_progress(state, request):
+                    frozen_context = (
+                        _freeze_segment_context_ir(
+                            settings, plan, segment, request
+                        )
+                        if context_binding.get("status") == "failed"
+                        else None
+                    )
+                    if not _context_ir_may_progress(
+                        state, request, frozen_context=frozen_context
+                    ):
                         return (
                             "submission_unknown",
                             "submission_unknown",
@@ -3092,10 +3246,19 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                             "succeeded",
                             None,
                         )
+                    frozen_context = (
+                        _freeze_segment_context_ir(
+                            settings, plan, segment, source_request
+                        )
+                        if isinstance(binding, Mapping)
+                        and binding.get("status") == "failed"
+                        else None
+                    )
                     if not _context_ir_may_progress(
                         state,
                         source_request,
                         allow_create=state.get("status") == "not_started",
+                        frozen_context=frozen_context,
                     ):
                         return (
                             None,
@@ -3384,6 +3547,17 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             h3_action = action
             if context_ir_required:
                 context_binding = states[segment.index].get("context_ir")
+                recovering_failed_context = (
+                    isinstance(context_binding, Mapping)
+                    and context_binding.get("status") == "failed"
+                )
+                recovering_context_only = (
+                    action == "resume"
+                    and isinstance(context_binding, Mapping)
+                    and context_binding.get("status") != "succeeded"
+                    and existing_child_id is None
+                    and previous_attempt is None
+                )
                 if (
                     isinstance(context_binding, Mapping)
                     and context_binding.get("status") == "succeeded"
@@ -3398,11 +3572,26 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                             context, context_binding
                         ),
                     )
+                    if (
+                        action == "resume"
+                        and plan.prompt_fusion is not None
+                        and existing_child_id is None
+                        and previous_attempt is None
+                    ):
+                        h3_action = "start"
                 else:
+                    frozen_context = (
+                        _freeze_segment_context_ir(
+                            settings, plan, segment, request
+                        )
+                        if recovering_failed_context
+                        else None
+                    )
                     if not _context_ir_may_progress(
                         states[segment.index],
                         request,
                         allow_create=action == "start",
+                        frozen_context=frozen_context,
                     ):
                         return (
                             states[segment.index].get("child_request_id"),
@@ -3424,6 +3613,15 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                             (
                                 status,
                                 error,
+                                _exact_h3_attempt_id(previous_attempt),
+                            ),
+                        )
+                    if recovering_context_only:
+                        return (
+                            existing_child_id,
+                            (
+                                "resume_required",
+                                "context_ir_ready",
                                 _exact_h3_attempt_id(previous_attempt),
                             ),
                         )
