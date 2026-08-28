@@ -1280,7 +1280,7 @@ def _voice_step(
 def _load_scenes(work: Path) -> list[dict]:
     """读并校验 work/scenes.json；返回 segments（空 = 单段模式）。缺失/非法 → PipelineError。
 
-    结构不变量（与 scenes.py 同口径）：每段 provider 请求不超过 14s、相邻无缝（1e-6 容差，
+    结构不变量（与 scenes.py 同口径）：每段 provider 请求不超过当前生产上限、相邻无缝（1e-6 容差，
     隐含单调有序）、首段 0 起且覆盖 [0, duration_s]。
     """
     try:
@@ -1316,7 +1316,8 @@ def _load_scenes(work: Path) -> list[dict]:
             )
         except long_video.LongVideoError:
             raise PipelineError(
-                f"scenes.json segments[{i}] provider duration not in 1..14s"
+                f"scenes.json segments[{i}] provider duration not in "
+                f"1..{long_video.SEGMENT_PROVIDER_MAX_DURATION_S}s"
             ) from None
         if (
             frozen_duration < long_video.SEGMENT_MIN_S
@@ -1324,7 +1325,8 @@ def _load_scenes(work: Path) -> list[dict]:
             > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
         ):
             raise PipelineError(
-                f"scenes.json segments[{i}] provider duration not in 1..14s"
+                f"scenes.json segments[{i}] provider duration not in "
+                f"1..{long_video.SEGMENT_PROVIDER_MAX_DURATION_S}s"
             )
         if abs(seg["start_s"] - prev_end) > 1e-6:
             raise PipelineError(f"scenes.json segments[{i}] not contiguous with previous")
@@ -2932,7 +2934,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             if new_input_contract:
                 lines_by_seg = {
                     seg["index"]: long_video.localize_dialogue(
-                        planner_dialogue, seg
+                        planner_dialogue, seg, segments=segments
                     )
                     for seg in segments
                 }
@@ -2941,12 +2943,20 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     attribute_lines(voice_lines, segments) if voice_lines is not None else None
                 )
             if lines_by_seg is not None:
-                # 越界台词不归段：计数留痕（meta 内部字段，不静默丢失）
-                dropped = len(planner_dialogue) - sum(
-                    len(v) for v in lines_by_seg.values()
+                # 新合约保证每条有效台词按交集完整分片；旧合约仍记录未归段源行。
+                dropped = (
+                    0
+                    if new_input_contract
+                    else max(
+                        0,
+                        len(voice_lines or []) - sum(
+                            len(value) for value in lines_by_seg.values()
+                        ),
+                    )
                 )
-                if dropped:
-                    storage.update_meta(settings.data_dir, cid, voice_lines_dropped=dropped)
+                storage.update_meta(
+                    settings.data_dir, cid, voice_lines_dropped=dropped
+                )
             # 段并发上限 = codex_concurrency 的一半：一条长视频不得占满全部 codex 槽饿死其他会话
             workers = min(len(segments), max(1, settings.codex_concurrency // 2))
             with ThreadPoolExecutor(max_workers=workers) as pool:

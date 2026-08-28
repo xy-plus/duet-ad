@@ -153,7 +153,7 @@ def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
             "visual_prompt_path": visual,
             "final_prompt_path": final,
         })
-    if legacy or duration <= long_video.SHORT_VIDEO_MAX_S:
+    if legacy or planned is None and segment_duration >= long_video.SEGMENT_MIN_S:
         def artifact(path):
             path = Path(path)
             return {
@@ -4138,14 +4138,22 @@ def test_long_resume_required_missing_attempt_locks_batch_without_post(tmp_path,
     assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "submission_unknown"
 
 
-def test_new_receipt_rejects_segment_whose_provider_duration_exceeds_fourteen(tmp_path):
+def test_new_plan_writer_keeps_every_segment_within_ten_seconds(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
-    with pytest.raises(long_video.LongVideoError, match="long_video_plan_invalid_segment"):
-        _make_long(
-            settings,
-            joins=("hard_cut", "continue"),
-            segment_duration=14.000001,
-        )
+    cid, receipt = _make_long(settings, duration=20.000002)
+    frozen = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+
+    assert all(
+        long_video.provider_duration_s(segment.start_s, segment.end_s)
+        <= long_video.SEGMENT_PROVIDER_MAX_DURATION_S
+        for segment in frozen.segments
+    )
 
 
 def test_new_receipt_rejects_true_six_decimal_subsecond_segment(tmp_path):
@@ -4159,7 +4167,7 @@ def test_new_receipt_rejects_true_six_decimal_subsecond_segment(tmp_path):
         _make_long(settings, joins=joins, segment_duration=0.999999)
 
 
-def test_freeze_rejects_new_multisegment_receipt_with_over_fourteen_provider_duration(
+def test_freeze_preserves_existing_multisegment_receipt_at_h3_limit(
     tmp_path,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
@@ -4176,19 +4184,21 @@ def test_freeze_rejects_new_multisegment_receipt_with_over_fourteen_provider_dur
     path.write_bytes(long_video._canonical_bytes(payload))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
 
-    with pytest.raises(
-        long_generation.LongGenerationError, match="long_video_plan_invalid"
-    ):
-        long_generation.freeze_plan(
-            root,
-            storage.load_meta(settings.data_dir, cid),
-            digest,
-            "none",
-            "auto",
-        )
+    frozen = long_generation.freeze_plan(
+        root,
+        storage.load_meta(settings.data_dir, cid),
+        digest,
+        "none",
+        "auto",
+    )
+
+    assert all(
+        long_video.provider_duration_s(segment.start_s, segment.end_s) == 15
+        for segment in frozen.segments
+    )
 
 
-def test_freeze_accepts_new_single_segment_at_fifteen_seconds(tmp_path):
+def test_freeze_preserves_existing_single_segment_at_fifteen_seconds(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, receipt = _make_long(settings, segment_duration=15.0)
     root = settings.data_dir / cid
@@ -4228,12 +4238,13 @@ def test_positive_float_boundary_overflow_plans_and_freezes_provider_safe_segmen
 
     assert frozen.segments
     assert all(
-        long_video.provider_duration_s(item.start_s, item.end_s) <= 14
+        long_video.provider_duration_s(item.start_s, item.end_s)
+        <= long_video.SEGMENT_PROVIDER_MAX_DURATION_S
         for item in frozen.segments
     )
 
 
-def test_every_new_long_generation_request_is_at_most_fourteen_seconds(
+def test_every_new_long_generation_request_is_at_most_ten_seconds(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
@@ -4269,7 +4280,10 @@ def test_every_new_long_generation_request_is_at_most_fourteen_seconds(
     long_generation.run(settings, cid, plan)
 
     assert requests
-    assert all(request.duration <= 14 for request in requests)
+    assert all(
+        request.duration <= long_video.SEGMENT_PROVIDER_MAX_DURATION_S
+        for request in requests
+    )
 
 
 def test_legacy_binary_float_duration_rebuilds_original_thirteen_second_request(

@@ -955,32 +955,35 @@ def test_long_scene_bounds_include_the_one_millisecond_limit(tmp_path):
     ]
 
 
-def _planner_test_scenes(duration_s: int) -> list[dict]:
+def _planner_test_scenes(duration_s: float) -> list[dict]:
     scenes = []
-    for index, start_s in enumerate(range(0, duration_s, 10), 1):
-        end_s = min(start_s + 10, duration_s)
+    start_s = 0.0
+    while start_s < duration_s:
+        index = len(scenes) + 1
+        end_s = min(start_s + long_video.SEGMENT_PROVIDER_MAX_DURATION_S, duration_s)
         scenes.append({
             "index": index,
             "start_s": float(start_s),
             "end_s": float(end_s),
             "start_time": {
-                "pts": start_s,
+                "pts": int(round(start_s * 1000)),
                 "time_base_num": 1,
-                "time_base_den": 1,
+                "time_base_den": 1000,
             },
             "end_time": {
-                "pts": end_s,
+                "pts": int(round(end_s * 1000)),
                 "time_base_num": 1,
-                "time_base_den": 1,
+                "time_base_den": 1000,
             },
             "frames": [{
                 "decode_frame_index": index,
-                "pts": start_s + 1,
+                "pts": int(round((start_s + 1) * 1000)),
                 "pts_origin": 0,
                 "time_base_num": 1,
-                "time_base_den": 1,
+                "time_base_den": 1000,
             }],
         })
+        start_s = end_s
     return scenes
 
 
@@ -993,7 +996,7 @@ def test_auto_planner_ignores_source_spanning_sung_and_keeps_scene_cuts(planner)
     sung = {
         "text": "sung lyrics",
         "start_s": 0.0,
-        "end_s": 20.0,
+        "end_s": 14.5,
         "classification": "sung",
         "kept": True,
     }
@@ -1002,12 +1005,12 @@ def test_auto_planner_ignores_source_spanning_sung_and_keeps_scene_cuts(planner)
         "voice_line_provenance": [sung],
     }, [sung])
 
-    segments = planner(20.0, _planner_test_scenes(20), dialogue)
+    segments = planner(14.5, _planner_test_scenes(14.5), dialogue)
 
     assert dialogue == []
     assert [(item["start_s"], item["end_s"]) for item in segments] == [
         (0.0, 10.0),
-        (10.0, 20.0),
+        (10.0, 14.5),
     ]
 
 
@@ -1016,7 +1019,7 @@ def test_auto_planner_ignores_source_spanning_sung_and_keeps_scene_cuts(planner)
     (long_video.plan_segments, scene_planner.plan_segments),
     ids=("provider", "exact-scene"),
 )
-def test_auto_planner_keeps_source_spanning_spoken_as_safe_boundary(planner):
+def test_auto_planner_assigns_source_spanning_spoken_without_blocking(planner):
     spoken = {
         "text": "spoken line",
         "start_s": 0.0,
@@ -1029,10 +1032,27 @@ def test_auto_planner_keeps_source_spanning_spoken_as_safe_boundary(planner):
         "voice_line_provenance": [spoken],
     }, [spoken])
 
-    with pytest.raises(long_video.LongVideoError) as caught:
-        planner(20.0, _planner_test_scenes(20), dialogue)
+    segments = planner(20.0, _planner_test_scenes(20), dialogue)
 
-    assert caught.value.code == "long_video_no_safe_dialogue_boundary"
+    assert [(item["start_s"], item["end_s"]) for item in segments] == [
+        (0.0, 10.0), (10.0, 20.0),
+    ]
+    assert long_video.localize_dialogue(
+        dialogue, segments[0], segments=segments
+    ) == [{
+        "text": "spoken",
+        "start_s": 0.0,
+        "end_s": 10.0,
+        "classification": "spoken",
+    }]
+    assert long_video.localize_dialogue(
+        dialogue, segments[1], segments=segments
+    ) == [{
+        "text": " line",
+        "start_s": 0.0,
+        "end_s": 10.0,
+        "classification": "spoken",
+    }]
 
 
 @pytest.mark.parametrize(
@@ -1040,7 +1060,7 @@ def test_auto_planner_keeps_source_spanning_spoken_as_safe_boundary(planner):
     (long_video.plan_segments, scene_planner.plan_segments),
     ids=("provider", "exact-scene"),
 )
-def test_auto_planner_mixed_vocals_only_protects_spoken_boundaries(planner):
+def test_auto_planner_mixed_vocals_only_delivers_spoken_dialogue(planner):
     sung = {
         "text": "sung lyrics",
         "start_s": 0.0,
@@ -1102,7 +1122,9 @@ def test_planner_projection_keeps_final_dialogue_consistent_for_n1_n2(duration_s
     localized = [
         line
         for segment in segments
-        for line in long_video.localize_dialogue(dialogue, segment)
+        for line in long_video.localize_dialogue(
+            dialogue, segment, segments=segments
+        )
     ]
     assert localized == [{
         "text": "spoken line",
@@ -1339,7 +1361,7 @@ def test_run_rejects_rewrite_when_source_probe_crosses_long_threshold(
     assert operations == []
 
 
-def test_run_rejects_translate_when_manifest_crosses_long_threshold_before_voice(
+def test_run_rejects_translate_when_manifest_crosses_ten_second_threshold_before_voice(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path)
@@ -1347,7 +1369,7 @@ def test_run_rejects_translate_when_manifest_crosses_long_threshold_before_voice
     cdir = settings.data_dir / meta["id"]
     (cdir / "source.mp4").write_bytes(b"fake")
     storage.update_meta(
-        settings.data_dir, meta["id"], duration_s=13.9, voice_mode="translate",
+            settings.data_dir, meta["id"], duration_s=9.9, voice_mode="translate",
         target_language="English",
     )
     operations = []
@@ -1356,12 +1378,12 @@ def test_run_rejects_translate_when_manifest_crosses_long_threshold_before_voice
         operations.append(step)
         work = Path(argv[argv.index("--out-dir") + 1])
         (work / "manifest.json").write_text(
-            json.dumps({"duration_seconds": 15.001}), encoding="utf-8"
+                json.dumps({"duration_seconds": 10.001}), encoding="utf-8"
         )
 
     monkeypatch.setattr(
         storage, "probe_video",
-        lambda _path: storage.VideoProbe(13.9, 320, 240),
+            lambda _path: storage.VideoProbe(9.9, 320, 240),
     )
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
     monkeypatch.setattr(
@@ -3149,7 +3171,7 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
         ratio="9:16",
         fit_mode="pad",
     )
-    line = {"text": "第十六秒台词。", "start_s": 15.1, "end_s": 15.4}
+    line = {"text": "第十六秒台词。", "start_s": 9.5, "end_s": 10.5}
 
     def fake_steps(argv, *, timeout, step, cwd=None):
         if _run_fake_media_step(argv, step):
@@ -3202,16 +3224,29 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
     assert [
         long_video.provider_duration_s(item["start_s"], item["end_s"])
         for item in receipt["segments"]
-    ] == [14, 2]
-    assert stored["segments"][0]["dialogue"] == []
-    assert stored["segments"][1]["dialogue"] == [
+    ] == [10, 6]
+    assert stored["segments"][0]["dialogue"] == [
         {
-            "text": "第十六秒台词。",
-            "start_s": 1.1,
-            "end_s": 1.4,
+            "text": "第十六秒",
+            "start_s": 9.5,
+            "end_s": 10.0,
             "classification": "spoken",
         }
     ]
+    assert stored["segments"][1]["dialogue"] == [
+        {
+            "text": "台词。",
+            "start_s": 0.0,
+            "end_s": 0.5,
+            "classification": "spoken",
+        }
+    ]
+    assert "".join(
+        item["text"]
+        for segment in stored["segments"]
+        for item in segment["dialogue"]
+    ) == line["text"]
+    assert stored["voice_lines_dropped"] == 0
     assert all(
         len(segment["keyframe_sampling"]["keyframes"]) == 9
         for segment in stored["segments"]
@@ -3985,6 +4020,7 @@ def test_startup_reconciles_half_committed_long_plan_without_rewrite(
     assert storage.claim_pipeline_input(settings.data_dir, meta["id"])
     with monkeypatch.context() as historical:
         historical.setattr(long_video, "SHORT_VIDEO_MAX_S", 14.0)
+        historical.setattr(long_video, "SEGMENT_PROVIDER_MAX_DURATION_S", 14)
         receipt = long_video.write_plan_receipt(
             cdir, source=cdir / "source.mp4", duration_s=duration,
             segments=[{

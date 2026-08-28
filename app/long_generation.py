@@ -2243,18 +2243,10 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
 
     frozen: list[FrozenSegment] = []
     authoritative_dialogue_for_delivery: list[dict] = []
-    max_provider_duration = (
-        long_video.LEGACY_PROVIDER_MAX_DURATION_S
-        if len(raw_segments) == 1
-        else (
-            long_video.SEGMENT_PROVIDER_MAX_DURATION_S
-            if receipt_version in {
-                long_video.PLAN_RECEIPT_VERSION,
-                long_video.VISUAL_PLAN_RECEIPT_VERSION,
-            }
-            else long_video.LEGACY_PROVIDER_MAX_DURATION_S
-        )
-    )
+    # New receipts are written against the current production limit.  Frozen
+    # receipts remain readable up to the unchanged H3 capability so an already
+    # paid or confirmed project cannot be invalidated by a later planner limit.
+    max_provider_duration = long_video.LEGACY_PROVIDER_MAX_DURATION_S
     previous_end = 0.0
     previous_chain = None
     previous_keyframe_source: dict | None = None

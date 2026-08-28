@@ -14,11 +14,11 @@ from typing import Iterable, Mapping, Sequence
 
 from app import h3, h3_project
 
-SHORT_VIDEO_MAX_S = 15.0
+SHORT_VIDEO_MAX_S = 10.0
 PREVIOUS_SHORT_VIDEO_MAX_S = 10.0
 LONG_VIDEO_MAX_S = 300.0
 SEGMENT_MIN_S = 1.0
-SEGMENT_PROVIDER_MAX_DURATION_S = 14
+SEGMENT_PROVIDER_MAX_DURATION_S = 10
 PREVIOUS_SEGMENT_PROVIDER_MAX_DURATION_S = 10
 LEGACY_PROVIDER_MAX_DURATION_S = 15
 BOUNDARY_PRECISION = 6
@@ -172,30 +172,6 @@ def _dialogue_intervals(lines: Iterable[Mapping], duration_s: float) -> list[tup
     return intervals
 
 
-def _is_safe_boundary(value: float, dialogue: Sequence[tuple[float, float]]) -> bool:
-    return not any(start + _EPS < value < end - _EPS for start, end in dialogue)
-
-
-def _safe_at_or_before(
-    target: float,
-    minimum: float,
-    dialogue: Sequence[tuple[float, float]],
-) -> float | None:
-    """Return the latest safe point in ``[minimum, target]``.
-
-    A sentence occupies an open interval for cut purposes: cutting exactly at
-    its start or end keeps that whole sentence on one side.
-    """
-    candidate = target
-    while True:
-        containing = [(start, end) for start, end in dialogue if start < candidate < end]
-        if not containing:
-            return candidate if candidate >= minimum - _EPS else None
-        candidate = min(start for start, _end in containing)
-        if candidate < minimum - _EPS:
-            return None
-
-
 def plan_segments(
     duration_s: float,
     scenes: Iterable[Mapping | Sequence[float]],
@@ -217,7 +193,7 @@ def plan_segments(
             "join_mode": "hard_cut",
         }]
     scene_bounds = _bounds(scenes, duration)
-    dialogue_intervals = _dialogue_intervals(dialogue, duration)
+    _dialogue_intervals(dialogue, duration)
     hard_cuts = {end for _start, end in scene_bounds[:-1]}
 
     cuts = [0.0]
@@ -233,13 +209,10 @@ def plan_segments(
             for cut in hard_cuts
             if minimum <= cut <= target
             and segment_duration_s(cut, duration) >= SEGMENT_MIN_S
-            and _is_safe_boundary(cut, dialogue_intervals)
             and provider_duration_s(start, cut) <= SEGMENT_PROVIDER_MAX_DURATION_S
         ]
-        boundary = max(eligible_hard_cuts) if eligible_hard_cuts else _safe_at_or_before(
-            target, minimum, dialogue_intervals
-        )
-        if boundary is None or boundary <= start + _EPS:
+        boundary = max(eligible_hard_cuts) if eligible_hard_cuts else target
+        if boundary <= start + _EPS:
             raise LongVideoError("long_video_no_safe_dialogue_boundary")
         cuts.append(round(boundary, 6))
     cuts.append(duration)
@@ -250,10 +223,9 @@ def plan_segments(
         cuts.pop(-2)
         start = cuts[-2]
         target = duration - SEGMENT_MIN_S
-        boundary = _safe_at_or_before(target, start + SEGMENT_MIN_S, dialogue_intervals)
+        boundary = target
         if (
-            boundary is None
-            or provider_duration_s(boundary, duration)
+            provider_duration_s(boundary, duration)
             > SEGMENT_PROVIDER_MAX_DURATION_S
         ):
             raise LongVideoError("long_video_no_safe_dialogue_boundary")
@@ -282,25 +254,114 @@ def plan_segments(
     return segments
 
 
-def localize_dialogue(lines: Iterable[Mapping], segment: Mapping) -> list[dict]:
-    """Return dialogue wholly contained in a segment, shifted to local time."""
-    start = float(segment["start_s"])
-    end = float(segment["end_s"])
+def localize_dialogue(
+    lines: Iterable[Mapping],
+    segment: Mapping,
+    *,
+    segments: Sequence[Mapping],
+) -> list[dict]:
+    """Split dialogue text by timed overlap and shift it to segment-local time.
+
+    A boundary-spanning line is partitioned into consecutive Unicode codepoint
+    ranges proportional to cumulative overlap duration.  Concatenating the
+    fragments in segment order reproduces the original text exactly, while
+    dialogue never changes the visual cut plan.
+    """
+    try:
+        current_index = int(segment["index"])
+        normalized_segments = [
+            (
+                int(item["index"]),
+                float(item["start_s"]),
+                float(item["end_s"]),
+            )
+            for item in segments
+        ]
+    except (KeyError, TypeError, ValueError):
+        raise LongVideoError("long_video_invalid_dialogue") from None
+    if (
+        not normalized_segments
+        or any(
+            not (math.isfinite(start) and math.isfinite(end) and start < end)
+            for _index, start, end in normalized_segments
+        )
+        or [index for index, _start, _end in normalized_segments]
+        != list(range(1, len(normalized_segments) + 1))
+        or abs(normalized_segments[0][1]) > _EPS
+        or any(
+            abs(left[2] - right[1]) > _EPS
+            for left, right in zip(normalized_segments, normalized_segments[1:])
+        )
+    ):
+        raise LongVideoError("long_video_invalid_dialogue")
+    try:
+        current_index, start, end = next(
+            item for item in normalized_segments if item[0] == current_index
+        )
+    except StopIteration:
+        raise LongVideoError("long_video_invalid_dialogue") from None
     local: list[dict] = []
     for raw in lines:
-        line_start = float(raw["start_s"])
-        line_end = float(raw["end_s"])
-        overlaps = line_start < end - _EPS and line_end > start + _EPS
-        contained = line_start >= start - _EPS and line_end <= end + _EPS
-        if overlaps and not contained:
-            raise LongVideoError("long_video_no_safe_dialogue_boundary")
-        if contained and line_end > start + _EPS and line_start < end - _EPS:
+        try:
+            line_start = float(raw["start_s"])
+            line_end = float(raw["end_s"])
+        except (KeyError, TypeError, ValueError):
+            raise LongVideoError("long_video_invalid_dialogue") from None
+        if not (
+            math.isfinite(line_start)
+            and math.isfinite(line_end)
+            and 0 <= line_start < line_end
+            and line_end <= normalized_segments[-1][2] + _EPS
+            and isinstance(raw.get("text"), str)
+            and raw["text"]
+        ):
+            raise LongVideoError("long_video_invalid_dialogue")
+        intersections = [
+            (
+                item_index,
+                max(line_start, item_start),
+                min(line_end, item_end),
+            )
+            for item_index, item_start, item_end in normalized_segments
+            if min(line_end, item_end) > max(line_start, item_start)
+        ]
+        if not intersections:
+            raise LongVideoError("long_video_invalid_dialogue")
+        total_overlap = sum(
+            overlap_end - overlap_start
+            for _index, overlap_start, overlap_end in intersections
+        )
+        text = raw["text"]
+        codepoint_start = 0
+        cumulative_overlap = 0.0
+        for position, (owner_index, overlap_start, overlap_end) in enumerate(
+            intersections, 1
+        ):
+            cumulative_overlap += overlap_end - overlap_start
+            codepoint_end = (
+                len(text)
+                if position == len(intersections)
+                else min(
+                    len(text),
+                    max(
+                        codepoint_start,
+                        int(math.floor(
+                            len(text) * cumulative_overlap / total_overlap + 0.5
+                        )),
+                    ),
+                )
+            )
+            if owner_index != current_index or codepoint_end == codepoint_start:
+                codepoint_start = codepoint_end
+                continue
             item = dict(raw)
-            item["start_s"] = round(max(0.0, line_start - start), 6)
-            item["end_s"] = round(min(end - start, line_end - start), 6)
+            item["text"] = text[codepoint_start:codepoint_end]
+            item["start_s"] = round(overlap_start - start, BOUNDARY_PRECISION)
+            item["end_s"] = round(overlap_end - start, BOUNDARY_PRECISION)
             if not 0 <= item["start_s"] < item["end_s"] <= end - start + _EPS:
-                raise LongVideoError("long_video_no_safe_dialogue_boundary")
+                raise LongVideoError("long_video_invalid_dialogue")
             local.append(item)
+            codepoint_start = codepoint_end
     return local
 
 
@@ -659,10 +720,7 @@ def write_plan_receipt(
             or abs(start_s - previous_end) > _EPS
             or frozen_duration < SEGMENT_MIN_S
             or provider_duration_s(start_s, end_s)
-            > (
-                LEGACY_PROVIDER_MAX_DURATION_S
-                if len(segments) == 1 else SEGMENT_PROVIDER_MAX_DURATION_S
-            )
+            > SEGMENT_PROVIDER_MAX_DURATION_S
             or not isinstance(chain_id, str)
             or not chain_id
             or join_mode not in {"hard_cut", "continue"}
