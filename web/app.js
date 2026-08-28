@@ -1542,11 +1542,94 @@ function keyframeDisclosureLabels(alt) {
   return { expand: "展开查看" + alt, collapse: "关闭" + alt + "大图" };
 }
 
+function safeMediaBasename(value) {
+  return typeof value === "string"
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)
+    && value !== "." && value !== "..";
+}
+
+function encodedMediaPath(path) {
+  return path.split("/").map((part) => encodeURIComponent(part)).join("/");
+}
+
+/* 分段图片只接受详情接口发布的权威路径；布局不完整时不猜目录。 */
+function authoritativeSegmentKeyframePaths(detail, segment) {
+  const segments = Array.isArray(detail && detail.segments) ? detail.segments : [];
+  const count = detail && detail.segment_count;
+  const index = segment && segment.index;
+  const names = segment && segment.keyframes;
+  const paths = segment && segment.keyframe_paths;
+  if (
+    !Number.isInteger(count) || count < 1 || count !== segments.length
+    || !Number.isInteger(index) || index < 1 || segments[index - 1] !== segment
+    || !Array.isArray(names) || !names.length
+    || !Array.isArray(paths) || paths.length !== names.length
+    || names.some((name) => !safeMediaBasename(name))
+  ) return [];
+  const rootLayout = count === 1 && index === 1
+    && paths.every((path, offset) => path === "keyframes/" + names[offset]);
+  const segmentLayout = paths.every(
+    (path, offset) => path === "segments/" + index + "/work/keyframes/" + names[offset],
+  );
+  return rootLayout || segmentLayout ? paths.slice() : [];
+}
+
+function authoritativePostprocessFrameGroups(detail, frames) {
+  if (!Array.isArray(frames) || frames.some((frame) => typeof frame !== "string")) return [];
+  const segments = Array.isArray(detail && detail.segments) ? detail.segments : [];
+  if (!segments.length) {
+    if (frames.some((frame) => !safeMediaBasename(frame))) return [];
+    return frames.length ? [{ index: null, names: frames.slice(), paths: frames.map(
+      (name) => "postprocessed/" + name,
+    ) }] : [];
+  }
+  const count = detail && detail.segment_count;
+  if (!Number.isInteger(count) || count !== segments.length || count < 1) return [];
+  const groups = [];
+  const consumed = new Set();
+  for (const segment of segments) {
+    const index = segment && segment.index;
+    const names = segment && segment.keyframes;
+    if (
+      !Number.isInteger(index) || index < 1 || segments[index - 1] !== segment
+      || !Array.isArray(names) || names.some((name) => !safeMediaBasename(name))
+    ) return [];
+    const keyframePaths = authoritativeSegmentKeyframePaths(detail, segment);
+    if (!keyframePaths.length) return [];
+    const rootLayout = count === 1
+      && keyframePaths.every((path, offset) => path === "keyframes/" + names[offset]);
+    const selected = [];
+    for (const name of names) {
+      const reference = rootLayout
+        ? name
+        : "segments/" + index + "/work/postprocessed/" + name;
+      const position = frames.indexOf(reference);
+      if (position < 0 || consumed.has(position)) continue;
+      consumed.add(position);
+      selected.push({ name, path: rootLayout ? "postprocessed/" + name : reference });
+    }
+    if (selected.length) groups.push({
+      index,
+      names: selected.map((item) => item.name),
+      paths: selected.map((item) => item.path),
+    });
+  }
+  return consumed.size === frames.length ? groups : [];
+}
+
 /* 关键帧网格：长视频分段用小缩略图按钮，其他结果保持现有网格。 */
 function kfGrid(detail, names, pathPrefix, altPrefix, options = {}) {
   const grid = el("div", "kf-grid");
   if (options.compact) grid.classList.add("kf-grid-compact");
-  for (const name of names) {
+  const hasAuthoritativePaths = Object.prototype.hasOwnProperty.call(options, "paths");
+  if (hasAuthoritativePaths && (
+    !Array.isArray(options.paths) || options.paths.length !== names.length
+  )) return grid;
+  for (let offset = 0; offset < names.length; offset += 1) {
+    const name = names[offset];
+    const path = hasAuthoritativePaths
+      ? options.paths[offset]
+      : pathPrefix + "/" + name;
     const fig = el("figure", "kf-card shimmer");
     const img = el("img");
     img.alt = altPrefix + name;
@@ -1563,7 +1646,7 @@ function kfGrid(detail, names, pathPrefix, altPrefix, options = {}) {
       fig.appendChild(img);
     }
     grid.appendChild(fig);
-    apiBlobURL("/api/conversations/" + detail.id + "/files/" + pathPrefix + "/" + encodeURIComponent(name))
+    apiBlobURL("/api/conversations/" + detail.id + "/files/" + encodedMediaPath(path))
       .then((url) => {
         if (fig.isConnected === false) {
           releaseTrackedURL(url);
@@ -1649,6 +1732,27 @@ function imagePromptEditable(detail, segmentIndex) {
     && canOperate(detail) && !generationStarted && !postprocessStarted;
 }
 
+function readOnlyImageFramePromptText(value) {
+  if (!Array.isArray(value) || value.length !== 9) return null;
+  const seen = new Set();
+  const sections = [];
+  for (const item of value) {
+    const name = item && item.frame_name;
+    const text = item && item.text;
+    const defaultText = item && item.default_text;
+    const digest = item && item.sha256;
+    if (
+      !safeMediaBasename(name) || seen.has(name)
+      || typeof text !== "string" || !text.trim()
+      || typeof defaultText !== "string" || !defaultText.trim()
+      || typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)
+    ) return null;
+    seen.add(name);
+    sections.push(name + "\n" + text);
+  }
+  return sections.join("\n\n");
+}
+
 function promptWorkspace(detail, segment = null) {
   const segmentIndex = promptSegmentIndex(segment);
   const scope = promptScopeKey(detail.id, segmentIndex);
@@ -1656,6 +1760,9 @@ function promptWorkspace(detail, segment = null) {
   const generationText = String(segment ? segment.prompt || "" : detail.source_prompt || detail.prompt || "");
   const lines = segment ? segment.lines : detail.dialogue;
   const imagePrompt = segment ? segment.image_optimization_prompt : detail.image_optimization_prompt;
+  const imageFramePromptText = readOnlyImageFramePromptText(
+    segment && segment.image_optimization_prompts,
+  );
   const wrap = el("div", "prompt-workspace");
   const tabs = el("div", "prompt-workspace-tabs");
   tabs.setAttribute("role", "tablist");
@@ -1722,6 +1829,10 @@ function promptWorkspace(detail, segment = null) {
           return payload.prompt;
         },
       }));
+      return;
+    }
+    if (imageFramePromptText !== null) {
+      panel.appendChild(promptCard(imageFramePromptText));
       return;
     }
     if (!imagePrompt || typeof imagePrompt.text !== "string") {
@@ -1903,13 +2014,19 @@ function renderSegments(detail) {
     sh.appendChild(el("span", "res-count", fmtSec(seg.start_s) + "s – " + fmtSec(seg.end_s) + "s"));
     card.appendChild(sh);
     const names = Array.isArray(seg.keyframes) ? seg.keyframes : [];
-    if (names.length) {
+    const paths = authoritativeSegmentKeyframePaths(detail, seg);
+    if (paths.length) {
       card.appendChild(kfGrid(
         detail,
         names,
-        "segments/" + n + "/work/keyframes",
+        null,
         "第 " + n + " 段关键帧 ",
-        { compact: true, expandable: true, onURL: (url) => mediaURLs.push(url) },
+        {
+          compact: true,
+          expandable: true,
+          paths,
+          onURL: (url) => mediaURLs.push(url),
+        },
       ));
     }
     card.appendChild(promptWorkspace(detail, seg));
@@ -2176,19 +2293,14 @@ function renderPpUserBubble(pp) {
 /* 「优化后」结果区（done）：多段逐段分组；单段按一个虚拟段统一处理 */
 function ppFramesSection(detail, frames) {
   const wrap = el("div");
-  const segs = (Array.isArray(detail.segments) && detail.segments.length > 0)
-    ? detail.segments
-    : [{ index: null }]; // 单段：帧名为裸文件名，路径前缀为空
-  for (const seg of segs) {
-    const n = seg.index;
-    const prefix = n == null ? "" : "segments/" + n + "/work/postprocessed/";
-    const own = frames.filter((f) => f.startsWith(prefix)).map((f) => f.slice(prefix.length));
-    if (!own.length) continue;
+  for (const group of authoritativePostprocessFrameGroups(detail, frames)) {
+    const n = group.index;
     const title = n == null ? "优化后" : "第 " + n + " 段优化后";
-    const pathPrefix = n == null ? "postprocessed" : "segments/" + n + "/work/postprocessed";
     const block = el("div", "pp-seg");
     block.appendChild(el("h4", "res-sub", title));
-    block.appendChild(kfGrid(detail, own, pathPrefix, title + " "));
+    block.appendChild(kfGrid(detail, group.names, null, title + " ", {
+      paths: group.paths,
+    }));
     wrap.appendChild(block);
   }
   return wrap;
@@ -2981,6 +3093,8 @@ if (typeof module !== "undefined" && module.exports) {
     buildResumePayload,
     buildSubmitPayload,
     apiErrorFromPayload,
+    authoritativePostprocessFrameGroups,
+    authoritativeSegmentKeyframePaths,
     canOperate,
     createImagePromptDraft,
     clearStream,
@@ -3012,6 +3126,7 @@ if (typeof module !== "undefined" && module.exports) {
     openLightbox,
     releaseTrackedURLs,
     releaseTrackedURL,
+    readOnlyImageFramePromptText,
     resetSegmentProductsDisclosure,
     requestGenerationSubmit,
     retryPostprocessSegment,

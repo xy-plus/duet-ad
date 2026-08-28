@@ -23,7 +23,9 @@ def test_featured_keyframe_keeps_intrinsic_height_for_single_image_results():
     postprocess = source.split("function ppFramesSection", 1)[1].split(
         "function ppResultDisclosure", 1
     )[0]
-    assert "kfGrid(detail, own, pathPrefix" in postprocess
+    assert "authoritativePostprocessFrameGroups(detail, frames)" in postprocess
+    assert "kfGrid(detail, group.names, null" in postprocess
+    assert "paths: group.paths" in postprocess
 
 
 def test_keyframe_grid_tracks_cannot_overflow_narrow_result_cards():
