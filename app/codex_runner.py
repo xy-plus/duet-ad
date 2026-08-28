@@ -124,6 +124,29 @@ def _isolated_writable_paths(
     return tuple(resolved_paths)
 
 
+def _isolated_readonly_inputs(
+    stage: Path, writable_paths: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    """Return every staged input file that must remain immutable in the sandbox."""
+    writable = set(writable_paths)
+    readonly: list[Path] = []
+    for candidate in sorted(stage.rglob("*"), key=lambda path: str(path)):
+        if candidate.is_symlink():
+            raise CodexError("isolated stage contains an invalid input")
+        if candidate.is_dir():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(stage)
+        except (OSError, ValueError):
+            raise CodexError("isolated stage contains an invalid input") from None
+        if not resolved.is_file():
+            raise CodexError("isolated stage contains an invalid input")
+        if resolved not in writable:
+            readonly.append(resolved)
+    return tuple(readonly)
+
+
 def _isolated_outer_argv(
     stage: Path,
     session_dir: Path,
@@ -148,6 +171,7 @@ def _isolated_outer_argv(
     if not inner_argv:
         raise CodexError("isolated inner command is empty")
     writable = _isolated_writable_paths(stage, writable_paths)
+    readonly_inputs = _isolated_readonly_inputs(stage, writable)
 
     argv = [
         str(_resolve_bwrap()),
@@ -162,9 +186,13 @@ def _isolated_outer_argv(
         argv += ["--tmpfs", str(session_dir)]
     argv += ["--tmpfs", str(tmp_root)]
     if writable:
-        argv += ["--ro-bind", str(stage), str(stage)]
-        for path in writable:
-            argv += ["--bind", str(path), str(path)]
+        # Keep the stage directories writable so tools that publish atomically
+        # (temporary file + rename) can replace the declared output.  Overlay
+        # every staged input as a read-only file mount; those mount points
+        # cannot be modified, removed, or replaced from inside the namespace.
+        argv += ["--bind", str(stage), str(stage)]
+        for path in readonly_inputs:
+            argv += ["--ro-bind", str(path), str(path)]
     else:
         argv += ["--bind", str(stage), str(stage)]
     argv += ["--chdir", str(stage), *inner_argv]

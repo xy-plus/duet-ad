@@ -1612,8 +1612,8 @@ class TestCodexRunner:
             assert proc.returncode == 0, proc.stderr
             assert (stage / "work" / "voice_lines.json").read_text() == "[]"
 
-    def test_real_readonly_stage_allows_only_exact_output_file(self, tmp_path):
-        """真实 bwrap 权限探针：冻结输入不可写，唯一声明输出可写。"""
+    def test_real_readonly_stage_allows_atomic_exact_output_publish(self, tmp_path):
+        """真实 bwrap 探针：冻结输入不可写，声明输出可原子替换。"""
         if not shutil.which("bwrap"):
             pytest.skip("bwrap unavailable")
         cdir = tmp_path / "conversation"
@@ -1637,7 +1637,8 @@ class TestCodexRunner:
                 "work/selected/01.png; do "
                 "if printf tampered > \"$target\" 2>/dev/null; then exit 41; fi; "
                 "done; "
-                "printf generated > work/h3_prompt_plan.json"
+                "printf generated > work/.h3_prompt_plan.tmp && "
+                "mv -f work/.h3_prompt_plan.tmp work/h3_prompt_plan.json"
             )
             argv = codex_runner._isolated_outer_argv(
                 stage,
@@ -1648,16 +1649,17 @@ class TestCodexRunner:
 
             assert any(
                 argv[index:index + 3]
-                == ["--ro-bind", str(stage), str(stage)]
+                == ["--bind", str(stage), str(stage)]
                 for index in range(len(argv) - 2)
             )
-            assert any(
-                argv[index:index + 3]
-                == ["--bind", str(output), str(output)]
-                for index in range(len(argv) - 2)
-            )
+            for frozen in (skill, descriptor, image):
+                assert any(
+                    argv[index:index + 3]
+                    == ["--ro-bind", str(frozen), str(frozen)]
+                    for index in range(len(argv) - 2)
+                )
             assert not any(
-                argv[index:index + 3] == ["--bind", str(stage), str(stage)]
+                argv[index:index + 3] == ["--bind", str(output), str(output)]
                 for index in range(len(argv) - 2)
             )
             proc = subprocess.run(
@@ -1694,10 +1696,10 @@ class TestCodexRunner:
         (call,) = captured_codex
         argv = call["argv"]
         assert any(
-            argv[index:index + 3] == ["--ro-bind", str(stage), str(stage)]
+            argv[index:index + 3] == ["--bind", str(stage), str(stage)]
             for index in range(len(argv) - 2)
         )
-        assert any(
+        assert not any(
             argv[index:index + 3] == ["--bind", str(output), str(output)]
             for index in range(len(argv) - 2)
         )
