@@ -695,9 +695,12 @@ _FRAME_CONSTRAINT_KEYS = (
 _NON_PERSON_ENTITY_LEDGER_KEYS = {"entities", "relations"}
 _ENTITY_LEDGER_ENTITY_KEYS = {"entity_id", "description", "visibility"}
 _ENTITY_LEDGER_RELATION_KEYS = {"subject_id", "predicate", "object_id"}
-_ENTITY_VISIBILITIES = {"full", "partial", "edge_fragment"}
+_ENTITY_VISIBILITIES = {
+    "full", "partial", "edge_fragment", "occluded", "out_of_frame",
+    "source_preserve",
+}
 _ENTITY_RELATION_PREDICATES = {
-    "supports", "contacts", "separate_from", "occludes",
+    "supports", "contacts", "separate_from", "occludes", "owned_by",
 }
 _PHYSICAL_ENTITY_RELATION_PREDICATES = {
     "supports", "contacts", "separate_from",
@@ -735,6 +738,12 @@ _SCENE_CONTINUITY_VISIBILITIES = {
 }
 _SCENE_CONTINUITY_VISIBLE = {"full", "partial", "edge_fragment"}
 _SCENE_CONTINUITY_VIEW_PREDICATES = {"in_front_of", "occludes"}
+_PROJECT_ENTITY_OWNER_ID = "PROJECT"
+_SEMANTIC_ENTITY_VISIBILITIES = {
+    "visible": "full",
+    "occluded": "occluded",
+    "out_of_frame": "out_of_frame",
+}
 
 
 def _contains_directed_cycle(edges: list[tuple[str, str]]) -> bool:
@@ -1087,10 +1096,11 @@ def _canonical_non_person_entity_ledger(
             "visibility": visibility,
         })
 
-    identifiers = entity_ids | allowed_person_ids
+    identifiers = entity_ids | allowed_person_ids | {_PROJECT_ENTITY_OWNER_ID}
     relations = []
     physical_pairs = set()
     occlusion_pairs = set()
+    ownership_subjects = set()
     directed_edges = {"supports": [], "occludes": []}
     for item in raw_relations:
         if not isinstance(item, dict) or set(item) != _ENTITY_LEDGER_RELATION_KEYS:
@@ -1110,6 +1120,19 @@ def _canonical_non_person_entity_ledger(
             or not isinstance(predicate, str)
             or predicate not in _ENTITY_RELATION_PREDICATES
             or (
+                predicate == "owned_by"
+                and (
+                    subject not in entity_ids
+                    or object_ not in (
+                        allowed_person_ids | {_PROJECT_ENTITY_OWNER_ID}
+                    )
+                )
+            )
+            or (
+                predicate != "owned_by"
+                and _PROJECT_ENTITY_OWNER_ID in {subject, object_}
+            )
+            or (
                 predicate in {"contacts", "separate_from"}
                 and subject >= object_
             )
@@ -1124,12 +1147,18 @@ def _canonical_non_person_entity_ledger(
                     "image optimization output is missing or invalid"
                 )
             physical_pairs.add(pair)
-        else:
+        elif predicate == "occludes":
             if pair in occlusion_pairs:
                 raise ImageOptimizationOutputError(
                     "image optimization output is missing or invalid"
                 )
             occlusion_pairs.add(pair)
+        else:
+            if subject in ownership_subjects:
+                raise ImageOptimizationOutputError(
+                    "image optimization output is missing or invalid"
+                )
+            ownership_subjects.add(subject)
         if predicate in directed_edges:
             directed_edges[predicate].append((subject, object_))
         relations.append({
@@ -1597,6 +1626,9 @@ def compile_semantic_plan(
     slots = _semantic_slots(segment_specs, source_frames=source_frames)
     raw = value if isinstance(value, dict) else {}
     raw_people = raw.get("people") if isinstance(raw.get("people"), dict) else {}
+    raw_entities = (
+        raw.get("entities") if isinstance(raw.get("entities"), dict) else {}
+    )
     raw_scenes = raw.get("scenes") if isinstance(raw.get("scenes"), dict) else {}
     raw_frames = raw.get("frames") if isinstance(raw.get("frames"), dict) else {}
     frame_by_key = {item["key"]: item for item in slots["frames"]}
@@ -1608,6 +1640,7 @@ def compile_semantic_plan(
     present_fields = 0
     issues: list[str] = []
     ignored_mechanical_fields: list[str] = []
+    entity_source_preserve_defaults: list[str] = []
 
     def field(
         container: object,
@@ -1628,6 +1661,14 @@ def compile_semantic_plan(
     for key in ("version", "phase", "segment_indices", "eligible", "reason"):
         if key in raw:
             ignored_mechanical_fields.append(key)
+    if not isinstance(raw.get("entities"), dict):
+        entity_source_preserve_defaults.append("entities")
+    for entity_key, design in raw_entities.items():
+        if not isinstance(design, dict):
+            continue
+        for key in design:
+            if key in {"entity_id", "relations", "graph", "visibility"}:
+                ignored_mechanical_fields.append(f"entities.{entity_key}.{key}")
     for frame_key, frame in raw_frames.items():
         if not isinstance(frame, dict):
             continue
@@ -1636,12 +1677,25 @@ def compile_semantic_plan(
                 "frame_index", "segment_index", "transition_from_previous",
             }:
                 ignored_mechanical_fields.append(f"frames.{frame_key}.{key}")
+        frame_entities = frame.get("entities")
+        if not isinstance(frame_entities, dict):
+            continue
+        for entity_key, observation in frame_entities.items():
+            if not isinstance(observation, dict):
+                continue
+            for key in observation:
+                if key in {
+                    "entity_id", "relations", "graph", "predicate", "owner_id",
+                }:
+                    ignored_mechanical_fields.append(
+                        f"frames.{frame_key}.entities.{entity_key}.{key}"
+                    )
 
     observations: dict[str, dict[str, dict]] = {}
     person_keys = {
         key for key in raw_people if isinstance(key, str) and key.strip()
     }
-    for frame_key, slot in frame_by_key.items():
+    for frame_key in frame_by_key:
         frame = raw_frames.get(frame_key)
         frame_people = frame.get("people") if isinstance(frame, dict) else None
         if not isinstance(frame_people, dict):
@@ -1651,6 +1705,19 @@ def compile_semantic_plan(
                 continue
             person_keys.add(person_key)
             observations.setdefault(person_key, {})[frame_key] = (
+                observation if isinstance(observation, dict) else {}
+            )
+
+    entity_observations: dict[str, dict[str, dict]] = {}
+    for frame_key in frame_by_key:
+        frame = raw_frames.get(frame_key)
+        frame_entities = frame.get("entities") if isinstance(frame, dict) else None
+        if not isinstance(frame_entities, dict):
+            continue
+        for entity_key, observation in frame_entities.items():
+            if not isinstance(entity_key, str) or not entity_key.strip():
+                continue
+            entity_observations.setdefault(entity_key, {})[frame_key] = (
                 observation if isinstance(observation, dict) else {}
             )
 
@@ -1708,6 +1775,90 @@ def compile_semantic_plan(
             },
             "observable_segments": observable_segments,
         })
+
+    entity_keys_by_scene: dict[str, list[str]] = {}
+    for entity_key, frame_observations in entity_observations.items():
+        for scene_key in {
+            frame_by_key[frame_key]["scene_key"]
+            for frame_key in frame_observations
+            if frame_key in frame_by_key
+        }:
+            entity_keys_by_scene.setdefault(scene_key, []).append(entity_key)
+    for entity_key in sorted(set(raw_entities) - set(entity_observations)):
+        issues.append(f"unused_entity:{entity_key}")
+    for scene_key, entity_keys in entity_keys_by_scene.items():
+        ordered = sorted(set(entity_keys))
+        if len(ordered) > 30:
+            issues.append(f"entity_limit:{scene_key}")
+        entity_keys_by_scene[scene_key] = ordered[:30]
+
+    entity_designs: dict[str, dict] = {}
+    compiled_entity_keys = sorted({
+        entity_key
+        for entity_keys in entity_keys_by_scene.values()
+        for entity_key in entity_keys
+    })
+    for entity_key in compiled_entity_keys:
+        design = raw_entities.get(entity_key)
+        path = f"entities.{entity_key}"
+        if not isinstance(design, dict):
+            entity_source_preserve_defaults.append(path)
+            design = {}
+        description = design.get("description")
+        if not isinstance(description, str) or not description.strip():
+            entity_source_preserve_defaults.append(f"{path}.description")
+        owner = design.get("owner")
+        if not isinstance(owner, str) or not owner.strip():
+            entity_source_preserve_defaults.append(f"{path}.owner")
+            owner = "source-preserve"
+        persistence = design.get("persistence")
+        if not isinstance(persistence, str) or not persistence.strip():
+            entity_source_preserve_defaults.append(f"{path}.persistence")
+        association = design.get("association")
+        if not isinstance(association, str) or not association.strip():
+            entity_source_preserve_defaults.append(f"{path}.association")
+        owner_id = (
+            _PROJECT_ENTITY_OWNER_ID if owner.strip() == "project"
+            else person_id_by_key.get(owner.strip())
+        )
+        if owner_id is None:
+            issues.append(f"source_preserve:{path}.owner")
+        entity_designs[entity_key] = {
+            "description": _semantic_text(
+                description,
+                "source-preserve/no-invention：保持源帧中该持久实体的外观身份",
+                max_bytes=512,
+            ),
+            "owner_id": owner_id,
+            "association": _semantic_text(
+                association,
+                "source-preserve/no-invention：保持源帧中该实体的归属方式",
+                max_bytes=512,
+            ),
+            "persistence": _semantic_text(
+                persistence,
+                "source-preserve/no-invention：不因暂时不可见而新增、删除或替换实体",
+                max_bytes=512,
+            ),
+        }
+
+    entity_ids_by_scene: dict[str, dict[str, str]] = {}
+    entity_descriptions_by_scene: dict[str, dict[str, str]] = {}
+    for scene_key, entity_keys in entity_keys_by_scene.items():
+        entity_ids_by_scene[scene_key] = {
+            entity_key: f"ENTITY_{position:02d}"
+            for position, entity_key in enumerate(entity_keys, 1)
+        }
+        descriptions = {}
+        seen_descriptions = set()
+        for position, entity_key in enumerate(entity_keys, 1):
+            description = entity_designs[entity_key]["description"]
+            if description in seen_descriptions:
+                description = f"{description}；独立持久实体 {position}"
+                issues.append(f"duplicate_entity_description:{scene_key}")
+            seen_descriptions.add(description)
+            descriptions[entity_key] = description
+        entity_descriptions_by_scene[scene_key] = descriptions
 
     scene_id_by_key = {
         item["key"]: f"SCENE_{position:02d}"
@@ -1844,6 +1995,12 @@ def compile_semantic_plan(
                 "boundary": boundary,
             })
 
+        scene_key = segment_scene_key[index]
+        scene_entity_keys = entity_keys_by_scene.get(scene_key, [])
+        scene_entity_ids = entity_ids_by_scene.get(scene_key, {})
+        scene_entity_descriptions = entity_descriptions_by_scene.get(
+            scene_key, {}
+        )
         constraints = []
         for frame in segment_frames:
             frame_value = raw_frames.get(frame["key"])
@@ -1859,8 +2016,82 @@ def compile_semantic_plan(
                 path=frame_path,
             )
             entity_notes = _semantic_text(
-                frame_value.get("entities") if isinstance(frame_value, dict) else None,
+                frame_value.get("entities")
+                if isinstance(frame_value, dict)
+                and isinstance(frame_value.get("entities"), str)
+                else None,
                 "保持当前源帧可见非人物实体的数量、位置与边界",
+            )
+            frame_entity_semantics = (
+                frame_value.get("entities")
+                if isinstance(frame_value, dict)
+                and isinstance(frame_value.get("entities"), dict)
+                else {}
+            )
+            current_person_ids = {
+                person_id_by_key[person_key]
+                for person_key in observed_person_keys
+                if frame["key"] in observations[person_key]
+            }
+            ledger_entities = []
+            ledger_relations = []
+            entity_relation_notes = []
+            for entity_key in scene_entity_keys:
+                observation = frame_entity_semantics.get(entity_key)
+                observation_path = f"{frame_path}.entities.{entity_key}"
+                missing_observation = not isinstance(observation, dict)
+                if missing_observation:
+                    entity_source_preserve_defaults.append(observation_path)
+                    observation = {}
+                raw_visibility = observation.get("visibility")
+                visibility = (
+                    _SEMANTIC_ENTITY_VISIBILITIES.get(
+                        raw_visibility.strip().lower()
+                    )
+                    if isinstance(raw_visibility, str)
+                    else None
+                )
+                if visibility is None:
+                    visibility = "source_preserve"
+                    if not missing_observation:
+                        entity_source_preserve_defaults.append(
+                            f"{observation_path}.visibility"
+                        )
+                relationship = observation.get("relationship")
+                if not isinstance(relationship, str) or not relationship.strip():
+                    relationship = (
+                        "source-preserve/no-invention：保持当前源帧中该实体的可见关系"
+                    )
+                    if not missing_observation:
+                        entity_source_preserve_defaults.append(
+                            f"{observation_path}.relationship"
+                        )
+                entity_id = scene_entity_ids[entity_key]
+                ledger_entities.append({
+                    "entity_id": entity_id,
+                    "description": scene_entity_descriptions[entity_key],
+                    "visibility": visibility,
+                })
+                owner_id = entity_designs[entity_key]["owner_id"]
+                if owner_id == _PROJECT_ENTITY_OWNER_ID or owner_id in current_person_ids:
+                    ledger_relations.append({
+                        "subject_id": entity_id,
+                        "predicate": "owned_by",
+                        "object_id": owner_id,
+                    })
+                elif owner_id is not None:
+                    entity_source_preserve_defaults.append(
+                        f"{observation_path}.owner_relation"
+                    )
+                entity_relation_notes.append(
+                    f"{entity_id}：{entity_designs[entity_key]['association']}；"
+                    f"{_semantic_text(relationship, '')}；"
+                    f"{entity_designs[entity_key]['persistence']}"
+                )
+            ledger_relations.sort(
+                key=lambda item: (
+                    item["subject_id"], item["predicate"], item["object_id"]
+                )
             )
             visible_parts = []
             poses = []
@@ -1890,16 +2121,25 @@ def compile_semantic_plan(
                     "；".join(poses),
                     "不从其他帧补造当前源帧不可见的人体或姿态",
                 ),
-                "contact_points": f"{relationships}；{entity_notes}",
+                "contact_points": _semantic_text(
+                    "；".join((
+                        relationships,
+                        entity_notes,
+                        *entity_relation_notes,
+                    )),
+                    "保持当前源帧可见接触与实体关系",
+                ),
                 "occlusion_order": relationships,
                 "out_of_frame_crop": crop,
-                "non_person_entity_ledger": {"entities": [], "relations": []},
+                "non_person_entity_ledger": {
+                    "entities": ledger_entities,
+                    "relations": ledger_relations,
+                },
                 "dominant_palette_contract": {
                     "area_weighted_warm_cool_family": "balanced",
                     "saturation_style": "natural",
                 },
             })
-        scene_key = segment_scene_key[index]
         segments.append({
             "segment_index": index,
             "persons": segment_people,
@@ -1946,6 +2186,12 @@ def compile_semantic_plan(
         ),
         "issues": sorted(set(issues)),
         "ignored_mechanical_fields": sorted(set(ignored_mechanical_fields)),
+        "entity_continuity": {
+            "stable_entity_count": len(compiled_entity_keys),
+            "source_preserve_defaults": sorted(set(
+                entity_source_preserve_defaults
+            )),
+        },
     }
     return plan, diagnostics
 
@@ -2716,10 +2962,12 @@ def _canonical_project_output(
             value, segment_specs, source_frames=source_frames,
         )
         _LOGGER.info(
-            "image semantic compiler score=%s issues=%s ignored=%s",
+            "image semantic compiler score=%s issues=%s ignored=%s "
+            "entity_continuity=%s",
             diagnostics["score"],
             diagnostics["issues"],
             diagnostics["ignored_mechanical_fields"],
+            diagnostics["entity_continuity"],
         )
     else:
         # Frozen v2-v4 plans remain readable; current generation uses only the
