@@ -320,6 +320,9 @@ def _public_generation(meta: dict, cdir: Path, settings: Settings) -> dict | Non
                             receipt,
                             meta.get("fit_mode"),
                             meta.get("dialogue_mode"),
+                            dialogue_delivery=meta.get(
+                                "dialogue_delivery", "auto"
+                            ),
                             prepare_fit=False,
                             settings=settings,
                         )
@@ -521,6 +524,7 @@ def _long_fit_required(
             expected,
             "none",
             meta.get("dialogue_mode", "auto"),
+            dialogue_delivery=meta.get("dialogue_delivery", "auto"),
             prepare_fit=False,
             settings=settings,
         )
@@ -2298,6 +2302,9 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
                     expected,
                     meta.get("fit_mode"),
                     meta.get("dialogue_mode"),
+                    dialogue_delivery=meta.get(
+                        "dialogue_delivery", "auto"
+                    ),
                     prepare_fit=False,
                     settings=settings,
                 )
@@ -2449,6 +2456,7 @@ def _resume_long_generation(settings: Settings, cid: str) -> None:
         plan = long_generation.freeze_plan(
             settings.data_dir / cid, meta, expected,
             meta.get("fit_mode"), meta.get("dialogue_mode"),
+            dialogue_delivery=meta.get("dialogue_delivery", "auto"),
             prepare_fit=False,
             settings=settings,
         )
@@ -2512,6 +2520,9 @@ def _reconcile_stale_submission(settings: Settings, cid: str, owner: object) -> 
                     expected,
                     "none",
                     meta.get("dialogue_mode", "auto"),
+                    dialogue_delivery=meta.get(
+                        "dialogue_delivery", "auto"
+                    ),
                     settings=settings,
                 )
                 changes["frozen_plan_receipt"] = expected
