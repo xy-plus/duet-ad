@@ -685,18 +685,34 @@ def _audio_compile_fixture(
     voice = root / "work" / "voice.mp3"
     voice.parent.mkdir(parents=True, exist_ok=True)
     voice.write_bytes(b"whole-source-mix")
+    provenance = [{
+        "text": "spoken authority",
+        "start_s": 0.0,
+        "end_s": 1.0,
+        "classification": "spoken",
+        "provenance": "asr",
+        "kept": True,
+    }]
+    evidence = long_generation.classification_evidence_sha256(
+        audio_path="work/voice.mp3",
+        audio_sha256=hashlib.sha256(b"whole-source-mix").hexdigest(),
+        has_bgm=False,
+        decisions=provenance,
+    )
+    provenance = [{
+        **line,
+        "analysis_audio_path": "work/voice.mp3",
+        "analysis_audio_sha256": hashlib.sha256(
+            b"whole-source-mix"
+        ).hexdigest(),
+        "analysis_has_bgm": False,
+        "classification_evidence_sha256": evidence,
+    } for line in provenance]
     return ({
         "segments": raw_segments,
         "_image_optimization": {"frames": optimization_frames},
         "has_bgm": False,
-        "voice_line_provenance": [{
-            "text": "spoken authority",
-            "start_s": 0.0,
-            "end_s": 1.0,
-            "classification": "spoken",
-            "provenance": "asr",
-            "kept": True,
-        }],
+        "voice_line_provenance": provenance,
     }, long_generation.FrozenPlan(
         root=root,
         source=root / "source.mp4",
@@ -785,6 +801,125 @@ def test_no_bgm_without_spoken_asr_authority_cannot_bind_source_mix(
             plan=plan,
             dialogue_mode=dialogue_mode,
             dialogue_delivery="off_screen",
+        )
+
+
+def test_legacy_unbound_spoken_provenance_cannot_bind_current_voice_bytes(
+    tmp_path: Path,
+) -> None:
+    meta, plan = _audio_compile_fixture(
+        tmp_path, segment_count=1, classification="spoken",
+    )
+    meta["voice_line_provenance"] = [{
+        key: value
+        for key, value in meta["voice_line_provenance"][0].items()
+        if not key.startswith("analysis_")
+        and key != "classification_evidence_sha256"
+    }]
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="clean_voice_reference_required",
+    ):
+        long_generation.build_prompt_fusion_input(
+            root=tmp_path,
+            meta=meta,
+            plan=plan,
+            dialogue_mode="auto",
+            dialogue_delivery="off_screen",
+        )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ("audio", "path", "audio_sha256", "has_bgm", "decision", "evidence"),
+)
+def test_spoken_voice_authority_rejects_any_analysis_provenance_drift(
+    tmp_path: Path, drift: str,
+) -> None:
+    meta, plan = _audio_compile_fixture(
+        tmp_path, segment_count=1, classification="spoken",
+    )
+    line = meta["voice_line_provenance"][0]
+    if drift == "audio":
+        (tmp_path / "work" / "voice.mp3").write_bytes(b"replaced mix")
+    elif drift == "path":
+        line["analysis_audio_path"] = "work/other.mp3"
+    elif drift == "audio_sha256":
+        line["analysis_audio_sha256"] = "0" * 64
+    elif drift == "has_bgm":
+        line["analysis_has_bgm"] = True
+    elif drift == "decision":
+        line["classification"] = "sung"
+    else:
+        line["classification_evidence_sha256"] = "0" * 64
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="clean_voice_reference_required",
+    ):
+        long_generation.build_prompt_fusion_input(
+            root=tmp_path,
+            meta=meta,
+            plan=plan,
+            dialogue_mode="auto",
+            dialogue_delivery="off_screen",
+        )
+
+
+def test_paid_request_revalidates_frozen_voice_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings(tmp_path)
+    root = settings.data_dir / "voice-authority-paid-gate"
+    root.mkdir(parents=True)
+    meta, base = _audio_compile_fixture(
+        root, segment_count=1, classification="spoken",
+    )
+    _path, _data, authority_sha256 = long_generation._clean_voice_authority(
+        root, meta,
+    )
+    segment = base.segments[0]
+    segment = long_generation.FrozenSegment(
+        **{
+            **segment.__dict__,
+            "prompt_fusion_audio_paths": (root / "work" / "voice.mp3",),
+        }
+    )
+    fusion = long_generation.FrozenPromptFusion(
+        version=long_generation.PROMPT_FUSION_VERSION,
+        input_path=root / "work" / "multimodal_input.json",
+        input_data=b"input",
+        input_sha256=hashlib.sha256(b"input").hexdigest(),
+        output_path=root / "work" / "h3_prompt_plan.json",
+        output_data=b"output",
+        output_sha256=hashlib.sha256(b"output").hexdigest(),
+        segments=({},),
+        final_prompts=(segment.prompt,),
+    )
+    plan = long_generation.FrozenPlan(
+        **{
+            **base.__dict__,
+            "segments": (segment,),
+            "workflow": h3.H3_MULTIMODAL_WORKFLOW,
+            "prompt_fusion": fusion,
+            "voice_authority_sha256": authority_sha256,
+        }
+    )
+    monkeypatch.setattr(storage, "load_meta", lambda *_args: meta)
+    (root / "work" / "voice.mp3").write_bytes(b"post-freeze replacement")
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="clean_voice_reference_required",
+    ):
+        long_generation._request(
+            settings,
+            "voice-authority-paid-gate",
+            plan,
+            segment,
+            "parent-request",
+            "none",
         )
 
 
@@ -1365,8 +1500,136 @@ def test_new_prompt_fusion_queue_rejects_legacy_v1_input(
     assert storage.load_meta(settings.data_dir, cid).get("_prompt_fusion") is None
 
 
-def _failed_lf_prompt_fusion(
+def test_legacy_v1_fusion_cannot_build_a_new_h3_request(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    root = settings.data_dir / "legacy-v1-paid-gate"
+    workdir = root / "work" / "segments" / "1"
+    frame = workdir / "work" / "frame.png"
+    frame.parent.mkdir(parents=True, exist_ok=True)
+    frame.write_bytes(b"frame")
+    source = root / "source.mp4"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"source")
+    input_path = root / "work" / "multimodal_input.json"
+    output_path = root / "work" / "h3_prompt_plan.json"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_bytes(b"legacy-input")
+    output_path.write_bytes(b"legacy-output")
+    fusion = long_generation.FrozenPromptFusion(
+        version=long_generation.PROMPT_FUSION_LEGACY_VERSION,
+        input_path=input_path,
+        input_data=b"legacy-input",
+        input_sha256=hashlib.sha256(b"legacy-input").hexdigest(),
+        output_path=output_path,
+        output_data=b"legacy-output",
+        output_sha256=hashlib.sha256(b"legacy-output").hexdigest(),
+        segments=({},),
+        final_prompts=("legacy prompt",),
+    )
+    segment = long_generation.FrozenSegment(
+        index=1,
+        start_s=0.0,
+        end_s=8.0,
+        chain_id="chain-001",
+        join_mode="hard_cut",
+        workdir=workdir,
+        first_frame=frame,
+        first_frame_data=b"frame",
+        last_frame=frame,
+        last_frame_data=b"frame",
+        prompt="legacy prompt",
+        keyframes=((frame, b"frame"),),
+        dialogue=(),
+        dialogue_sha256=hashlib.sha256(b"[]").hexdigest(),
+    )
+    plan = long_generation.FrozenPlan(
+        root=root,
+        source=source,
+        receipt="a" * 64,
+        segments=(segment,),
+        receipt_version=long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
+        workflow=h3.H3_WORKFLOW,
+        prompt_fusion=fusion,
+    )
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_v2_refresh_required",
+    ):
+        long_generation._request(
+            settings,
+            "legacy-v1-paid-gate",
+            plan,
+            segment,
+            "legacy-parent-request",
+            "none",
+            context_ir_binding=None,
+        )
+
+
+def test_completed_v1_fusion_remains_local_read_only_without_h3_revalidation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings(tmp_path)
+    cid = "f" * 32
+    root = settings.data_dir / cid
+    root.mkdir(parents=True)
+    _meta, base = _audio_compile_fixture(
+        root, segment_count=1, classification="sung",
+    )
+    fusion = long_generation.FrozenPromptFusion(
+        version=long_generation.PROMPT_FUSION_LEGACY_VERSION,
+        input_path=root / "work" / "multimodal_input.json",
+        input_data=b"legacy-input",
+        input_sha256=hashlib.sha256(b"legacy-input").hexdigest(),
+        output_path=root / "work" / "h3_prompt_plan.json",
+        output_data=b"legacy-output",
+        output_sha256=hashlib.sha256(b"legacy-output").hexdigest(),
+        segments=({},),
+        final_prompts=(base.segments[0].prompt,),
+    )
+    plan = long_generation.FrozenPlan(
+        **{
+            **base.__dict__,
+            "prompt_fusion": fusion,
+            "receipt_version": long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
+        }
+    )
+    meta = {
+        "id": cid,
+        "segments": [{"index": 1}],
+        "frozen_plan_receipt": "a" * 64,
+        "fit_mode": "none",
+        "dialogue_mode": "none",
+        "generation": {"status": "succeeded", "segments": []},
+    }
+    monkeypatch.setattr(main, "_uses_segment_coordinator", lambda _meta: True)
+    monkeypatch.setattr(
+        main, "_long_receipt_multimodal_intent", lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        long_generation, "generation_segments_are_valid", lambda *_args: True,
+    )
+    monkeypatch.setattr(long_generation, "freeze_plan", lambda *_a, **_k: plan)
+    monkeypatch.setattr(
+        long_generation,
+        "bound_reusable_segment_indices",
+        lambda *_args: pytest.fail("historical read must not inspect H3"),
+    )
+    monkeypatch.setattr(
+        long_generation, "stitched_output_is_reusable", lambda *_a, **_k: True,
+    )
+
+    assert main._validate_generated_video_uncached(settings, meta) is True
+
+
+def _failed_lf_prompt_fusion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    version: int = long_generation.PROMPT_FUSION_LEGACY_VERSION,
 ) -> tuple[object, str, Path, Path, Path]:
     settings = make_settings(tmp_path)
     created = storage.new_conversation(
@@ -1389,30 +1652,51 @@ def _failed_lf_prompt_fusion(
     monkeypatch.setattr(
         long_generation, "PROMPT_FUSION_SKILL_SOURCE", skill_path
     )
-    input_data = _fusion_v1_input(root, 1)
+    input_data = _fusion_input(
+        root, 1, version=version,
+    )
     input_path = root / "work" / h3_project.SKILL_INPUT_FILENAME
     input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_bytes(input_data)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _prompt_fusion={
+            "version": version,
+            "status": "queued",
+            "error": None,
+            "input_sha256": hashlib.sha256(input_data).hexdigest(),
+            "image_acceptance_sha256": acceptance_sha256,
+            "manifest_sha256": None,
+        },
+    )
     frozen_skill = root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME
     frozen_skill.write_bytes(skill_path.read_bytes())
     output = root / "work" / "h3_prompt_plan.json"
+    if version == long_generation.PROMPT_FUSION_VERSION:
+        final_prompt = _fusion_v2_final_prompt(
+            json.loads(input_data)["segments"][0],
+            "fused",
+        )
+    else:
+        final_prompt = (
+            "<VISUAL>fused</VISUAL>\n"
+            "<AUDIO_CONTENT_JSON>\n[]\n</AUDIO_CONTENT_JSON>"
+        )
     output.write_bytes(_canonical({
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
-        "version": long_generation.PROMPT_FUSION_LEGACY_VERSION,
+        "version": version,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
         "segments": [{
             "index": 1,
-            "final_prompt": (
-                "<VISUAL>fused</VISUAL>\n"
-                "<AUDIO_CONTENT_JSON>\n[]\n</AUDIO_CONTENT_JSON>"
-            ),
+            "final_prompt": final_prompt,
         }],
     }))
     storage.update_meta(
         settings.data_dir,
         cid,
         _prompt_fusion={
-            "version": 1,
+            "version": version,
             "status": "failed",
             "error": "prompt_fusion_output_invalid",
             "input_sha256": hashlib.sha256(input_data).hexdigest(),
@@ -1423,48 +1707,56 @@ def _failed_lf_prompt_fusion(
     return settings, cid, root, skill_path, output
 
 
-def test_failed_lf_output_can_publish_receipt_without_rerunning_skill(
+def _commit_historical_v1_prompt_fusion(
+    settings, cid: str, root: Path, output: Path,
+) -> dict:
+    """Represent a v1 done receipt written by an older accepted release."""
+    meta = storage.load_meta(settings.data_dir, cid)
+    state = meta["_prompt_fusion"]
+    _frozen, manifest_data = pipeline._publish_prompt_fusion_manifest(
+        root=root,
+        meta=meta,
+        state=state,
+    )
+    raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
+    committed_state = {
+        **state,
+        "status": "done",
+        "error": None,
+        "raw_output_path": "work/h3_prompt_plan.json",
+        "raw_output_sha256": raw_output_sha256,
+        "manifest_sha256": hashlib.sha256(manifest_data).hexdigest(),
+    }
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _prompt_fusion=committed_state,
+    )
+    return storage.load_meta(settings.data_dir, cid)
+
+
+def test_failed_v1_output_cannot_publish_a_new_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings, cid, root, skill_path, output = _failed_lf_prompt_fusion(
+    settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
         tmp_path, monkeypatch,
     )
     raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
 
-    assert pipeline.finalize_prompt_fusion_receipt(
-        settings,
-        cid,
-        expected_raw_output_sha256=raw_output_sha256,
-    ) == "done"
+    with pytest.raises(
+        pipeline.PipelineError,
+        match="receipt finalization is not allowed",
+    ):
+        pipeline.finalize_prompt_fusion_receipt(
+            settings,
+            cid,
+            expected_raw_output_sha256=raw_output_sha256,
+        )
 
-    assert hashlib.sha256(output.read_bytes()).hexdigest() == raw_output_sha256
-    frozen = long_generation.load_prompt_fusion_manifest(
-        root=root, skill_source_path=skill_path,
-    )
-    assert frozen.final_prompts == (
-        "<VISUAL>fused</VISUAL>\n"
-        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>",
-    )
-    meta = storage.load_meta(settings.data_dir, cid)
-    assert meta["_prompt_fusion"]["status"] == "done"
-    assert meta["_prompt_fusion"]["error"] is None
-    assert meta["_prompt_fusion"]["recovered_error"] == (
-        "prompt_fusion_output_invalid"
-    )
-    assert meta["_prompt_fusion"]["raw_output_path"] == (
-        "work/h3_prompt_plan.json"
-    )
-    assert meta["_prompt_fusion"]["raw_output_sha256"] == raw_output_sha256
-    assert meta["_prompt_fusion"]["manifest_sha256"] == hashlib.sha256(
-        (root / "work" / h3_project.SOURCE_FILENAME).read_bytes()
-    ).hexdigest()
-    manifest = json.loads(
-        (root / "work" / h3_project.SOURCE_FILENAME).read_text(encoding="utf-8")
-    )
-    assert manifest["output"]["sha256"] == raw_output_sha256
-    assert manifest["skill"]["sha256"] == hashlib.sha256(
-        (root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME).read_bytes()
-    ).hexdigest()
+    assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
+    assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
+        "status"
+    ] == "failed"
 
 
 def test_done_receipt_survives_current_skill_source_upgrade(
@@ -1473,12 +1765,9 @@ def test_done_receipt_survives_current_skill_source_upgrade(
     settings, cid, root, skill_path, output = _failed_lf_prompt_fusion(
         tmp_path, monkeypatch,
     )
-    assert pipeline.finalize_prompt_fusion_receipt(
-        settings,
-        cid,
-        expected_raw_output_sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
-    ) == "done"
-    committed = storage.load_meta(settings.data_dir, cid)
+    committed = _commit_historical_v1_prompt_fusion(
+        settings, cid, root, output,
+    )
 
     skill_path.write_text("upgraded current prompt fusion", encoding="utf-8")
 
@@ -1505,12 +1794,9 @@ def test_done_receipt_rejects_frozen_skill_tamper(
     settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
         tmp_path, monkeypatch,
     )
-    assert pipeline.finalize_prompt_fusion_receipt(
-        settings,
-        cid,
-        expected_raw_output_sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
-    ) == "done"
-    committed = storage.load_meta(settings.data_dir, cid)
+    committed = _commit_historical_v1_prompt_fusion(
+        settings, cid, root, output,
+    )
     (root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME).write_bytes(
         b"tampered frozen prompt fusion"
     )
@@ -1693,7 +1979,9 @@ def test_receipt_finalization_serializes_a_concurrent_generation_writer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings, cid, _root, _skill_path, output = _failed_lf_prompt_fusion(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
+        version=long_generation.PROMPT_FUSION_VERSION,
     )
     expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     original_publish = pipeline._publish_prompt_fusion_manifest
@@ -1737,7 +2025,9 @@ def test_receipt_finalization_rejects_publish_hook_cas_drift_without_orphan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
+        version=long_generation.PROMPT_FUSION_VERSION,
     )
     expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     original_publish = pipeline._publish_prompt_fusion_manifest
@@ -1772,7 +2062,9 @@ def test_receipt_finalization_cleans_exact_manifest_after_publish_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
+        version=long_generation.PROMPT_FUSION_VERSION,
     )
     expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     original_atomic = pipeline._atomic_bytes
@@ -1800,7 +2092,9 @@ def test_exact_crash_residue_is_unreadable_until_receipt_finalization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
+        version=long_generation.PROMPT_FUSION_VERSION,
     )
     expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     meta = storage.load_meta(settings.data_dir, cid)
@@ -1825,12 +2119,14 @@ def test_exact_crash_residue_is_unreadable_until_receipt_finalization(
         expected_raw_output_sha256=expected_raw_output_sha256,
     ) == "done"
     committed = storage.load_meta(settings.data_dir, cid)
+    input_payload = json.loads(
+        (root / "work" / h3_project.SKILL_INPUT_FILENAME).read_bytes()
+    )
     assert long_generation.load_bound_prompt_fusion_manifest(
         root=root,
         meta=committed,
     ).final_prompts == (
-        "<VISUAL>fused</VISUAL>\n"
-        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>",
+        _fusion_v2_final_prompt(input_payload["segments"][0], "fused"),
     )
 
 
@@ -1841,7 +2137,9 @@ def test_receipt_only_finalization_rejects_any_frozen_authority_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str,
 ) -> None:
     settings, cid, root, _skill_path, output = _failed_lf_prompt_fusion(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
+        version=long_generation.PROMPT_FUSION_VERSION,
     )
     expected_raw_output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     if drift == "input":

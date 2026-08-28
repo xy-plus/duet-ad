@@ -402,6 +402,23 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         ],
         check=True,
     )
+    voice_sha256 = hashlib.sha256(
+        (cdir / "work" / "voice.mp3").read_bytes()
+    ).hexdigest()
+    provenance = [{
+        "text": "تجربة صوتية",
+        "start_s": 0.0,
+        "end_s": 14.44,
+        "classification": dialogue_classification,
+        "provenance": "asr",
+        "kept": True,
+    }]
+    evidence = long_generation.classification_evidence_sha256(
+        audio_path="work/voice.mp3",
+        audio_sha256=voice_sha256,
+        has_bgm=has_bgm,
+        decisions=provenance,
+    )
     common_changes = dict(
         duration_s=14.5,
         vocal_filter_enabled=True,
@@ -415,13 +432,12 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         aspect_ratio="9:16",
         resolution="768p",
         voice_line_provenance=[{
-            "text": "تجربة صوتية",
-            "start_s": 0.0,
-            "end_s": 14.44,
-            "classification": dialogue_classification,
-            "provenance": "asr",
-            "kept": True,
-        }],
+            **line,
+            "analysis_audio_path": "work/voice.mp3",
+            "analysis_audio_sha256": voice_sha256,
+            "analysis_has_bgm": has_bgm,
+            "classification_evidence_sha256": evidence,
+        } for line in provenance],
         has_bgm=has_bgm,
     )
     expected_receipt = None

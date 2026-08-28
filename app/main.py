@@ -2155,6 +2155,8 @@ def _generated_video_validation_fingerprint(
                 "resolved_dialogue_delivery": meta.get(
                     "resolved_dialogue_delivery"
                 ),
+                "has_bgm": meta.get("has_bgm"),
+                "voice_line_provenance": meta.get("voice_line_provenance"),
                 "segments": meta.get("segments"),
                 "postprocess": meta.get("postprocess"),
                 "frozen_plan_receipt": meta.get("frozen_plan_receipt"),
@@ -2374,12 +2376,25 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
                     prepare_fit=False,
                     settings=settings,
                 )
-                reusable = long_generation.bound_reusable_segment_indices(
-                    settings, cid, plan, generation
+                legacy_fusion_read = (
+                    plan.prompt_fusion is not None
+                    and plan.prompt_fusion.version
+                    == long_generation.PROMPT_FUSION_LEGACY_VERSION
+                )
+                reusable = (
+                    frozenset(item.index for item in plan.segments)
+                    if legacy_fusion_read
+                    else long_generation.bound_reusable_segment_indices(
+                        settings, cid, plan, generation
+                    )
                 )
                 provider_media = (
                     long_generation.bound_h3_native_media(
-                        settings, cid, plan, generation
+                        settings,
+                        cid,
+                        plan,
+                        generation,
+                        legacy_terminal_read=legacy_fusion_read,
                     )
                     if getattr(plan, "workflow", None) in h3.H3_MULTIMODAL_WORKFLOWS
                     else None
@@ -3391,6 +3406,17 @@ def create_app(settings: Settings) -> FastAPI:
                     if claim_owner:
                         _finish_submission_claim(settings, cid, claim_owner)
                     raise
+                if (
+                    plan.prompt_fusion is not None
+                    and plan.prompt_fusion.version
+                    == long_generation.PROMPT_FUSION_LEGACY_VERSION
+                ):
+                    if claim_owner:
+                        _finish_submission_claim(settings, cid, claim_owner)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="prompt_fusion_v2_refresh_required",
+                    )
                 if semantic_recovery_intent:
                     if not long_generation.context_ir_semantic_failure_is_recoverable(
                         settings, cid, plan, old, fit_mode

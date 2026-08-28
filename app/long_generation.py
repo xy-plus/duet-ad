@@ -23,6 +23,7 @@ from app import (
     prepared_input,
     stitch,
     storage,
+    vocal,
 )
 from app.config import Settings
 
@@ -54,8 +55,6 @@ PROMPT_FUSION_SKILL_SOURCE = (
     Path(__file__).resolve().parents[1]
     / "skills" / "video-prompt-fusion" / "SKILL.md"
 )
-
-
 class LongGenerationError(RuntimeError):
     def __init__(self, code: str, status: int = 409) -> None:
         self.code = code
@@ -583,6 +582,7 @@ class FrozenPlan:
     legacy_layout: bool = False
     workflow: str = h3.H3_WORKFLOW
     prompt_fusion: FrozenPromptFusion | None = None
+    voice_authority_sha256: str | None = None
 
 
 def _segment_duration_s(plan: FrozenPlan, segment: FrozenSegment) -> float:
@@ -675,6 +675,37 @@ def _canonical_json_bytes(value: object) -> bytes:
         raise LongGenerationError("prompt_fusion_input_invalid") from None
 
 
+_ANALYSIS_PROVENANCE_FIELDS = frozenset({
+    "analysis_audio_path",
+    "analysis_audio_sha256",
+    "analysis_has_bgm",
+    "classification_evidence_sha256",
+})
+
+
+def classification_evidence_sha256(
+    *, audio_path: str, audio_sha256: str, has_bgm: bool,
+    decisions: list[Mapping],
+) -> str:
+    """Hash the existing classifier version and its complete decision summary."""
+    stripped = [
+        {
+            key: value for key, value in decision.items()
+            if key not in _ANALYSIS_PROVENANCE_FIELDS
+        }
+        for decision in decisions
+    ]
+    return hashlib.sha256(_canonical_json_bytes({
+        "schema": "duet.yamnet-classification-evidence",
+        "version": 1,
+        "analysis_audio_path": audio_path,
+        "analysis_audio_sha256": audio_sha256,
+        "yamnet_sha256": vocal.YAMNET_SHA256,
+        "has_bgm": has_bgm,
+        "decisions": stripped,
+    })).hexdigest()
+
+
 def _compiled_dialogue(
     dialogue_mode: str, dialogue: tuple[dict, ...],
 ) -> tuple[dict, ...]:
@@ -691,16 +722,71 @@ def _compiled_dialogue(
     raise LongGenerationError("invalid_dialogue_mode", 422)
 
 
-def _has_spoken_voice_authority(meta: Mapping) -> bool:
-    """Require the existing ASR/YAMNet receipt to prove real speech."""
+def _clean_voice_authority(
+    root: Path, meta: Mapping,
+) -> tuple[Path, bytes, str]:
+    """Bind one existing ASR/YAMNet provenance to its exact analyzed bytes."""
+    root = Path(root).resolve()
+    audio_path = root / "work" / "voice.mp3"
+    if audio_path.is_symlink():
+        raise LongGenerationError("clean_voice_reference_required")
+    try:
+        audio_data = audio_path.read_bytes()
+        relative = audio_path.resolve().relative_to(root).as_posix()
+    except (OSError, ValueError):
+        raise LongGenerationError("clean_voice_reference_required") from None
+    audio_sha256 = hashlib.sha256(audio_data).hexdigest()
     provenance = meta.get("voice_line_provenance")
-    return isinstance(provenance, list) and any(
-        isinstance(line, Mapping)
-        and line.get("kept") is True
-        and line.get("classification") == "spoken"
-        and line.get("provenance") == "asr"
-        for line in provenance
+    has_bgm = meta.get("has_bgm")
+    if (
+        not audio_data
+        or relative != "work/voice.mp3"
+        or has_bgm is not False
+        or not isinstance(provenance, list)
+        or not provenance
+    ):
+        raise LongGenerationError("clean_voice_reference_required")
+    has_spoken = False
+    for line in provenance:
+        if not isinstance(line, Mapping):
+            raise LongGenerationError("clean_voice_reference_required")
+        if (
+            line.get("analysis_audio_path") != relative
+            or line.get("analysis_audio_sha256") != audio_sha256
+            or line.get("analysis_has_bgm") is not has_bgm
+        ):
+            raise LongGenerationError("clean_voice_reference_required")
+        evidence = line.get("classification_evidence_sha256")
+        if (
+            not isinstance(evidence, str)
+            or len(evidence) != 64
+            or any(character not in "0123456789abcdef" for character in evidence)
+        ):
+            raise LongGenerationError("clean_voice_reference_required")
+        has_spoken = has_spoken or (
+            line.get("kept") is True
+            and line.get("classification") == "spoken"
+            and line.get("provenance") == "asr"
+        )
+    expected_evidence = classification_evidence_sha256(
+        audio_path=relative,
+        audio_sha256=audio_sha256,
+        has_bgm=has_bgm,
+        decisions=provenance,
     )
+    if not has_spoken or any(
+        line.get("classification_evidence_sha256") != expected_evidence
+        for line in provenance
+    ):
+        raise LongGenerationError("clean_voice_reference_required")
+    authority_sha256 = hashlib.sha256(_canonical_json_bytes({
+        "analysis_audio_path": relative,
+        "analysis_audio_sha256": audio_sha256,
+        "classification_evidence_sha256": expected_evidence,
+        "has_bgm": has_bgm,
+        "voice_line_provenance": provenance,
+    })).hexdigest()
+    return audio_path, audio_data, authority_sha256
 
 
 def prompt_fusion_image_authority_sha256(meta: Mapping) -> str:
@@ -788,6 +874,10 @@ def build_prompt_fusion_input(
     if not all(has_visual_timeline):
         raise LongGenerationError("prompt_fusion_refresh_required")
     fusion_version = PROMPT_FUSION_VERSION
+    clean_voice = (
+        _clean_voice_authority(root, meta)
+        if authoritative_dialogue else None
+    )
 
     compiled_segments: list[dict] = []
     optimization_indices = {
@@ -888,24 +978,10 @@ def build_prompt_fusion_input(
             })
         voice_references: list[dict] = []
         if lines:
-            # The existing ASR/YAMNet result is the only authority allowed to
-            # qualify the source-derived conditioning track.  Unknown is not
-            # equivalent to no BGM.
-            if (
-                meta.get("has_bgm") is not False
-                or not _has_spoken_voice_authority(meta)
-            ):
+            if clean_voice is None:
                 raise LongGenerationError("clean_voice_reference_required")
-            audio_path = root / "work" / "voice.mp3"
-            if audio_path.is_symlink():
-                raise LongGenerationError("reference_audio_binding_invalid")
-            try:
-                audio_data = audio_path.read_bytes()
-                audio_relative = audio_path.resolve().relative_to(root).as_posix()
-            except (OSError, ValueError):
-                raise LongGenerationError("reference_audio_binding_invalid") from None
-            if not audio_data:
-                raise LongGenerationError("reference_audio_binding_invalid")
+            audio_path, audio_data, _authority_sha256 = clean_voice
+            audio_relative = audio_path.resolve().relative_to(root).as_posix()
             voice_references.append({
                 "voice_ref": 1,
                 "path": audio_relative,
@@ -1318,10 +1394,12 @@ def finalize_multimodal_plan(
         if isinstance(payload, Mapping) and payload.get("prompt_fusion") is not None:
             if settings is None:
                 raise LongGenerationError("prompt_fusion_manifest_invalid")
-            load_bound_prompt_fusion_manifest(
+            frozen = load_bound_prompt_fusion_manifest(
                 root=root,
                 meta=meta,
             )
+            if frozen.version == PROMPT_FUSION_LEGACY_VERSION:
+                raise LongGenerationError("prompt_fusion_v2_refresh_required")
         return None
     if receipt_version not in {
         long_video.PLAN_RECEIPT_VERSION,
@@ -1651,6 +1729,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 "long_video_multimodal_dialogue_refresh_required", 409
             )
     frozen_fusion = None
+    voice_authority_sha256 = None
     fusion_binding = payload.get("prompt_fusion")
     if fusion_binding is not None:
         if (
@@ -1668,7 +1747,23 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         if manifest_path != root / "work" / h3_project.SOURCE_FILENAME \
                 or len(frozen_fusion.segments) != len(payload.get("segments", [])):
             raise LongGenerationError("prompt_fusion_manifest_invalid")
+        if frozen_fusion.version == PROMPT_FUSION_VERSION and any(
+            segment["audio_content"]["voice_references"]
+            for segment in frozen_fusion.segments
+        ):
+            _audio_path, _audio_data, voice_authority_sha256 = (
+                _clean_voice_authority(root, meta)
+            )
     generation = meta.get("generation")
+    if (
+        frozen_fusion is not None
+        and frozen_fusion.version == PROMPT_FUSION_LEGACY_VERSION
+        and (
+            not isinstance(generation, Mapping)
+            or generation.get("status") != "succeeded"
+        )
+    ):
+        raise LongGenerationError("prompt_fusion_v2_refresh_required")
     persisted_workflow = (
         generation.get("workflow") if isinstance(generation, Mapping) else None
     )
@@ -2139,6 +2234,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         legacy_layout=legacy_layout,
         workflow=workflow,
         prompt_fusion=frozen_fusion,
+        voice_authority_sha256=voice_authority_sha256,
     )
 
 
@@ -2183,10 +2279,25 @@ def _bind_h3_operational_roots(
 def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
              parent_id: str, fit_mode: str, *, frozen_child_id: str | None = None,
              prepare_inputs: bool = True, fast_mode: bool = False,
-             context_ir_binding: object = None) -> h3.H3Request:
+             context_ir_binding: object = None,
+             legacy_terminal_read: bool = False) -> h3.H3Request:
     if plan.prompt_fusion is not None:
+        if (
+            plan.prompt_fusion.version == PROMPT_FUSION_LEGACY_VERSION
+            and not legacy_terminal_read
+        ):
+            raise LongGenerationError("prompt_fusion_v2_refresh_required")
         try:
             native_audio = bool(segment.prompt_fusion_audio_paths)
+            if native_audio and plan.prompt_fusion.version == PROMPT_FUSION_VERSION:
+                current = storage.load_meta(settings.data_dir, cid)
+                if not isinstance(current, Mapping):
+                    raise LongGenerationError("clean_voice_reference_required")
+                _path, _data, current_authority = _clean_voice_authority(
+                    plan.root, current,
+                )
+                if current_authority != plan.voice_authority_sha256:
+                    raise LongGenerationError("clean_voice_reference_required")
             segment_workflow = (
                 h3.H3_MULTIMODAL_WORKFLOW if native_audio else h3.H3_WORKFLOW
             )
@@ -2873,6 +2984,8 @@ def bound_h3_native_media(
     cid: str,
     plan: FrozenPlan,
     generation: Mapping,
+    *,
+    legacy_terminal_read: bool = False,
 ) -> dict[int, tuple[str, Mapping[str, object]]]:
     """Bind each native-audio segment to its exact successful H3 attempt."""
     if not _generation_uses_h3_native_audio(plan, generation):
@@ -2922,6 +3035,7 @@ def bound_h3_native_media(
                 prepare_inputs=False,
                 fast_mode=fast_mode,
                 context_ir_binding=state.get("context_ir"),
+                legacy_terminal_read=legacy_terminal_read,
             )
             if is_multimodal_request(request) is not True:
                 raise LongGenerationError("long_video_h3_native_audio_invalid")

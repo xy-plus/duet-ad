@@ -1046,11 +1046,35 @@ def _voice_step(
         raise PipelineError(f"manifest.json invalid duration: {duration_s}")
     # 台词校验基准 = 音频实际时长；probe 失败回退容器时长（旧行为）
     audio_duration_s = voice.probe_audio_duration(audio) or duration_s
-    # 声学分析提前到听写前：空台词数组时区分「音轨无口播（合法无台词）」与「codex 摆烂（重试兜底）」
+    if audio.is_symlink():
+        raise PipelineError("vocal analysis audio is invalid")
+    try:
+        audio_data = audio.read_bytes()
+        analysis_audio_path = (
+            audio.resolve().relative_to(cdir.resolve()).as_posix()
+        )
+    except (OSError, ValueError):
+        raise PipelineError("vocal analysis audio is invalid") from None
+    if not audio_data or analysis_audio_path != "work/voice.mp3":
+        raise PipelineError("vocal analysis audio is invalid")
+    analysis_audio_sha256 = hashlib.sha256(audio_data).hexdigest()
+    # 声学分析提前到听写前：空台词数组时区分「音轨无口播（合法无台词）」与「codex 摆烂（重试兜底）」。
+    # 分析前后重读同一路径，避免 receipt 绑定到分析期间被替换的另一份 bytes。
     try:
         analysis = vocal.analyze(audio)
     except Exception as e:
         raise PipelineError(f"vocal classification unavailable: {e}") from None
+    try:
+        analyzed_data = audio.read_bytes()
+        analyzed_path = audio.resolve().relative_to(cdir.resolve()).as_posix()
+    except (OSError, ValueError):
+        raise PipelineError("vocal analysis audio is invalid") from None
+    if (
+        audio.is_symlink()
+        or analyzed_path != analysis_audio_path
+        or analyzed_data != audio_data
+    ):
+        raise PipelineError("vocal analysis audio drifted")
     has_vocal = _has_retryable_vocal_evidence(analysis)
     prompt = _voice_prompt(cdir, voice_mode, target_language, audio_duration_s)
     lines, unrecognized = _transcribe_voice_with_retry(
@@ -1090,6 +1114,22 @@ def _voice_step(
     filtered_lines, decisions, timeline_warnings = _normalize_voice_timeline(
         decisions, duration_s
     )
+    try:
+        classification_evidence = long_generation.classification_evidence_sha256(
+            audio_path=analysis_audio_path,
+            audio_sha256=analysis_audio_sha256,
+            has_bgm=bool(analysis.has_bgm),
+            decisions=decisions,
+        )
+    except long_generation.LongGenerationError:
+        raise PipelineError("vocal classification evidence is invalid") from None
+    decisions = [{
+        **decision,
+        "analysis_audio_path": analysis_audio_path,
+        "analysis_audio_sha256": analysis_audio_sha256,
+        "analysis_has_bgm": bool(analysis.has_bgm),
+        "classification_evidence_sha256": classification_evidence,
+    } for decision in decisions]
     warnings.extend(timeline_warnings)
     vocal_dropped = sum(
         decision.get("classification") not in ("spoken", "sung")
@@ -2185,10 +2225,7 @@ def _recoverable_prompt_fusion_state(
     state = meta.get("_prompt_fusion")
     if (
         not isinstance(state, dict)
-        or state.get("version") not in {
-            long_generation.PROMPT_FUSION_LEGACY_VERSION,
-            long_generation.PROMPT_FUSION_VERSION,
-        }
+        or state.get("version") != long_generation.PROMPT_FUSION_VERSION
         or state.get("status") != "failed"
         or state.get("error") != "prompt_fusion_output_invalid"
         or state.get("manifest_sha256") is not None

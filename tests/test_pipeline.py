@@ -29,6 +29,32 @@ from app.main import create_app
 
 
 _GENERATE_IMAGE_OPTIMIZATION_PROJECT = image_optimization.generate_project_prompts
+_ANALYSIS_PROVENANCE_KEYS = {
+    "analysis_audio_path",
+    "analysis_audio_sha256",
+    "analysis_has_bgm",
+    "classification_evidence_sha256",
+}
+
+
+def _assert_analysis_bound_provenance(
+    actual: list[dict], expected: list[dict], *, audio: bytes, has_bgm: bool,
+) -> None:
+    assert [
+        {key: value for key, value in line.items()
+         if key not in _ANALYSIS_PROVENANCE_KEYS}
+        for line in actual
+    ] == expected
+    assert actual
+    evidence = {line["classification_evidence_sha256"] for line in actual}
+    assert len(evidence) == 1
+    assert all(
+        line["analysis_audio_path"] == "work/voice.mp3"
+        and line["analysis_audio_sha256"] == hashlib.sha256(audio).hexdigest()
+        and line["analysis_has_bgm"] is has_bgm
+        and len(line["classification_evidence_sha256"]) == 64
+        for line in actual
+    )
 
 
 def _short_dual_target_plan():
@@ -1900,11 +1926,11 @@ def test_run_voice_vocal_filter_records_bgm_and_dropped_count(
     assert stored["has_bgm"] is True
     assert stored["voice_lines_vocal_dropped"] == 1
     assert stored["vocal_filter_enabled"] is True
-    assert stored["voice_line_provenance"] == [
+    _assert_analysis_bound_provenance(stored["voice_line_provenance"], [
         {**lines[0], "classification": "spoken", "provenance": "asr", "kept": True},
         {**lines[1], "classification": "sung", "provenance": "asr", "kept": True},
         {**lines[2], "classification": None, "provenance": "asr", "kept": False},
-    ]
+    ], audio=b"mp3-bytes", has_bgm=True)
 
 
 def test_run_voice_drops_spoken_subtitle_credit_before_prompt(
@@ -1947,13 +1973,13 @@ def test_run_voice_drops_spoken_subtitle_credit_before_prompt(
     assert stored["status"] == "done"
     assert stored["voice_lines"] == []
     assert stored["voice_lines_credit_dropped"] == 1
-    assert stored["voice_line_provenance"] == [{
+    _assert_analysis_bound_provenance(stored["voice_line_provenance"], [{
         **credit,
         "classification": "spoken",
         "provenance": "asr",
         "kept": False,
         "drop_reason": "subtitle_credit",
-    }]
+    }], audio=b"mp3-bytes", has_bgm=False)
 
 
 def test_run_voice_vocal_filter_off_bypasses_but_records_decisions(
@@ -2001,10 +2027,10 @@ def test_run_voice_vocal_filter_off_bypasses_but_records_decisions(
     assert stored["status"] == "done", stored.get("error")
     assert stored["voice_lines"] == lines
     assert stored["vocal_filter_enabled"] is False
-    assert stored["voice_line_provenance"] == [
+    _assert_analysis_bound_provenance(stored["voice_line_provenance"], [
         {**lines[0], "classification": "spoken", "provenance": "asr", "kept": True},
         {**lines[1], "classification": None, "provenance": "asr", "kept": True},
-    ]
+    ], audio=b"mp3-bytes", has_bgm=True)
 
 
 def test_run_voice_vocal_failure_fails_pipeline(tmp_path, video_1s, monkeypatch):
@@ -2037,6 +2063,33 @@ def test_run_voice_vocal_failure_fails_pipeline(tmp_path, video_1s, monkeypatch)
     assert stored["status"] == "failed"
     assert "vocal classification unavailable" in stored["error"]
     assert "模型校验失败" in stored["error"]
+
+
+def test_run_voice_rejects_audio_replaced_during_vocal_analysis(
+    tmp_path, video_1s, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _set_voice_mode(settings, meta, "keep")
+
+    def fake_extract_audio(cdir_arg):
+        out = cdir_arg / "work" / "voice.mp3"
+        out.write_bytes(b"analyzed-bytes")
+        return out
+
+    def replace_during_analysis(audio):
+        audio.write_bytes(b"replacement-bytes")
+        return _spoken_analysis(False)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(vocal, "analyze", replace_during_analysis)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "failed"
+    assert stored["error"] == "vocal analysis audio drifted"
 
 
 def test_run_voice_audio_longer_than_container(tmp_path, video_1s, monkeypatch):
@@ -2982,7 +3035,7 @@ def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done", stored.get("error")
     assert stored["voice_lines"] == [normalized]
-    assert stored["voice_line_provenance"] == [
+    _assert_analysis_bound_provenance(stored["voice_line_provenance"], [
         {
             **normalized,
             "classification": "spoken",
@@ -2992,7 +3045,7 @@ def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
             "asr_end_s": 10.08,
             "time_adjustment": "clipped_to_video_duration",
         }
-    ]
+    ], audio=b"normalized-audio", has_bgm=False)
     assert any("video duration 10.000s" in item for item in stored["voice_warnings"])
     receipt = json.loads((cdir / "prepared_input.json").read_text(encoding="utf-8"))
     assert receipt["video"]["duration_s"] == 10.0
@@ -3052,13 +3105,21 @@ def test_run_voice_drops_lines_starting_in_mp3_only_tail(tmp_path, video_1s, mon
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done", stored.get("error")
     assert stored["voice_lines"] == [kept]
-    assert stored["voice_line_provenance"][1] == {
+    _assert_analysis_bound_provenance(stored["voice_line_provenance"], [
+        {
+            **kept,
+            "classification": "spoken",
+            "provenance": "asr",
+            "kept": True,
+        },
+        {
         **tail,
         "classification": "spoken",
         "provenance": "asr",
         "kept": False,
         "drop_reason": "starts_at_or_after_video_duration",
-    }
+        },
+    ], audio=b"normalized-audio", has_bgm=False)
     assert any("dropped 1" in item for item in stored["voice_warnings"])
 
 
