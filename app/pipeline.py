@@ -2183,7 +2183,6 @@ def _require_prompt_fusion_v2_input(input_data: bytes) -> dict:
         or not segments
     ):
         raise PipelineError("prompt fusion input is invalid")
-    previous: dict | None = None
     for index, segment in enumerate(segments, 1):
         frames = segment.get("new_keyframes") if isinstance(segment, dict) else None
         if (
@@ -2194,17 +2193,19 @@ def _require_prompt_fusion_v2_input(input_data: bytes) -> dict:
         ):
             raise PipelineError("prompt fusion input is invalid")
         try:
-            _frozen, previous = long_video.freeze_keyframe_sources(
+            long_generation._freeze_local_keyframe_sources(
                 [{
                     key: frame[key]
                     for key in (
-                        "order", "source_time_s", "source_scene_id", "transition",
+                        "order", "segment_time_s", "source_scene_id", "transition",
                     )
                 } for frame in frames],
-                expected_count=9,
-                previous=previous,
             )
-        except (KeyError, TypeError, long_video.LongVideoError):
+        except (
+            KeyError,
+            TypeError,
+            long_generation.LongGenerationError,
+        ):
             raise PipelineError("prompt fusion input is invalid") from None
     return payload
 
