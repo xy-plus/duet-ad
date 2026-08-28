@@ -220,6 +220,49 @@ def _write_startup_h3_attempt(settings, cid, *, generation_status="running"):
     return request, state_root / "session.json", attempt_path
 
 
+def test_startup_does_not_adopt_legacy_v4_without_a_frozen_segment_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings(
+        tmp_path, enable_pipeline=True, enable_h3_submit=True,
+    )
+    meta = storage.new_conversation(settings.data_dir, "legacy-v4", "source.mp4")
+    cid = meta["id"]
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status="done",
+        error=None,
+        _postprocess_receipt={
+            "version": 4,
+            "options": {"optimize_image": True},
+        },
+        postprocess={"status": "done", "error": None},
+        generation=None,
+        _input_owner=None,
+    )
+    acceptance_calls: list[str] = []
+    monkeypatch.setattr(postprocess, "recover_running", lambda _settings: [])
+    monkeypatch.setattr(
+        postprocess,
+        "image_acceptance_status",
+        lambda *_args, **_kwargs: acceptance_calls.append(cid) or {
+            "required": True,
+            "accepted": False,
+            "expected_meta_sha256": "a" * 64,
+        },
+    )
+
+    application = create_app(settings)
+    with TestClient(application) as client:
+        assert client.get("/api/health").status_code == 200
+
+    assert acceptance_calls == []
+    assert storage.load_meta(settings.data_dir, cid).get(
+        "_image_user_acceptance"
+    ) is None
+
+
 def _write_legacy_pre_h3_attempt(
     settings, cid, *, attempt=1, request_id=REQUEST_ID, h3_state=None,
 ):

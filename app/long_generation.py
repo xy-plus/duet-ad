@@ -2520,7 +2520,10 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 raise LongGenerationError("prompt_fusion_input_invalid") from None
             if not isinstance(fusion_lines, list) or len(fusion_lines) != len(dialogue):
                 raise LongGenerationError("prompt_fusion_input_invalid")
-            if voice_references:
+            if (
+                frozen_fusion.version == PROMPT_FUSION_VERSION
+                and voice_references
+            ):
                 raise LongGenerationError("prompt_fusion_input_invalid")
             for line_order, (compiled, authoritative) in enumerate(
                 zip(fusion_lines, dialogue), 1
@@ -2533,7 +2536,10 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                     or compiled.get("delivery") != payload.get(
                         "resolved_dialogue_delivery"
                     )
-                    or compiled.get("voice_ref") is not None
+                    or (
+                        frozen_fusion.version == PROMPT_FUSION_VERSION
+                        and compiled.get("voice_ref") is not None
+                    )
                 ):
                     raise LongGenerationError("prompt_fusion_input_invalid")
         elif is_multimodal_receipt:
@@ -2671,6 +2677,86 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
             and not legacy_terminal_read
         ):
             raise LongGenerationError("prompt_fusion_v2_refresh_required")
+        if plan.prompt_fusion.version == PROMPT_FUSION_LEGACY_VERSION:
+            try:
+                frozen_audio = plan.prompt_fusion.segments[
+                    segment.index - 1
+                ]["audio_content"]["voice_references"]
+                reference_audios = h3.freeze_reference_audios(tuple(
+                    (plan.root / reference["path"], "voice")
+                    for reference in frozen_audio
+                ))
+                native_audio = bool(reference_audios)
+                source_request = h3.H3Request(
+                    cid=f"{cid}-segment-{segment.index}",
+                    workdir=segment.workdir,
+                    client_request_id=(
+                        frozen_child_id
+                        or child_request_id(parent_id, plan.receipt, segment.index)
+                    ),
+                    prompt=segment.prompt,
+                    keyframes=segment.keyframes,
+                    voice_texts=(),
+                    voice_receipt=h3.voice_texts_receipt(()),
+                    duration=long_video.provider_duration_s(
+                        segment.start_s,
+                        segment.end_s,
+                        receipt_version=plan.receipt_version,
+                    ),
+                    autodl_token=settings.autodl_art_token,
+                    timeouts=h3.Timeouts(
+                        request_s=settings.h3_request_timeout_s,
+                        h3_poll_s=settings.h3_poll_timeout_s,
+                        download_s=settings.h3_download_timeout_s,
+                        poll_interval_s=settings.h3_poll_interval_s,
+                        retry_count=settings.retry_count,
+                        retry_interval_s=settings.retry_interval_s,
+                    ),
+                    mode="reference",
+                    aspect_ratio=plan.aspect_ratio,
+                    resolution=plan.resolution,
+                    workflow=(
+                        h3.H3_MULTIMODAL_WORKFLOW
+                        if native_audio else h3.H3_WORKFLOW
+                    ),
+                    reference_audios=reference_audios,
+                    skill_plan_sha256=hashlib.sha256(
+                        segment.prompt.encode("utf-8")
+                    ).hexdigest(),
+                    upstream_dialogue_receipt_sha256=segment.dialogue_sha256,
+                    context_ir_required=True,
+                    **(
+                        {
+                            "multimodal_compiler_version": (
+                                "video-prompt-fusion-v1"
+                            ),
+                            "audio_required": True,
+                        }
+                        if native_audio else {}
+                    ),
+                )
+                if context_ir_binding is None:
+                    return source_request
+                context = _freeze_segment_context_ir(
+                    settings, plan, segment, source_request
+                )
+                return _bind_h3_operational_roots(
+                    settings,
+                    plan,
+                    h3_project.apply_bound_context_ir(
+                        context, context_ir_binding
+                    ),
+                )
+            except (
+                KeyError,
+                IndexError,
+                TypeError,
+                h3.H3Error,
+                h3_project.ProjectMultimodalError,
+            ) as exc:
+                raise LongGenerationError(
+                    getattr(exc, "code", "prompt_fusion_input_invalid")
+                ) from None
         try:
             if (
                 len(segment.keyframes) != 9

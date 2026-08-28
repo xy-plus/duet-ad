@@ -3177,6 +3177,7 @@ def create_app(settings: Settings) -> FastAPI:
             or meta.get("schema_version") != 2
             or meta.get("status") != "done"
             or isinstance(meta.get("generation"), Mapping)
+            or long_generation.plan_receipt(settings.data_dir / cid, meta) is None
         ):
             return
         post = meta.get("postprocess")

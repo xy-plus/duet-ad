@@ -1475,9 +1475,9 @@ def test_new_prompt_fusion_queue_rejects_legacy_v1_input(
 
 
 def test_legacy_v1_fusion_cannot_build_a_new_h3_request(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = make_settings(tmp_path)
+    settings = replace(make_settings(tmp_path), autodl_art_token="test-token")
     root = settings.data_dir / "legacy-v1-paid-gate"
     workdir = root / "work" / "segments" / "1"
     frame = workdir / "work" / "frame.png"
@@ -1491,6 +1491,8 @@ def test_legacy_v1_fusion_cannot_build_a_new_h3_request(
     input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_bytes(b"legacy-input")
     output_path.write_bytes(b"legacy-output")
+    voice = root / "work" / "voice.wav"
+    voice.write_bytes(b"receipt-bound-legacy-voice")
     fusion = long_generation.FrozenPromptFusion(
         version=long_generation.PROMPT_FUSION_LEGACY_VERSION,
         input_path=input_path,
@@ -1499,7 +1501,16 @@ def test_legacy_v1_fusion_cannot_build_a_new_h3_request(
         output_path=output_path,
         output_data=b"legacy-output",
         output_sha256=hashlib.sha256(b"legacy-output").hexdigest(),
-        segments=({},),
+        segments=({
+            "audio_content": {
+                "voice_references": [{
+                    "voice_ref": 1,
+                    "path": "work/voice.wav",
+                    "sha256": hashlib.sha256(voice.read_bytes()).hexdigest(),
+                    "purpose": "voice",
+                }],
+            },
+        },),
         final_prompts=("legacy prompt",),
     )
     segment = long_generation.FrozenSegment(
@@ -1541,6 +1552,25 @@ def test_legacy_v1_fusion_cannot_build_a_new_h3_request(
             "none",
             context_ir_binding=None,
         )
+
+    monkeypatch.setattr(h3.storage, "probe_audio", lambda _path: True)
+    monkeypatch.setattr(h3.voice, "probe_audio_duration", lambda _path: 4.0)
+    historical = long_generation._request(
+        settings,
+        "legacy-v1-paid-gate",
+        plan,
+        segment,
+        "legacy-parent-request",
+        "none",
+        context_ir_binding=None,
+        legacy_terminal_read=True,
+    )
+
+    assert historical.workflow == h3.H3_MULTIMODAL_WORKFLOW
+    assert historical.multimodal_compiler_version == "video-prompt-fusion-v1"
+    assert historical.audio_required is True
+    assert len(historical.reference_audios) == 1
+    assert historical.reference_audios[0].data == voice.read_bytes()
 
 
 def test_completed_v1_fusion_remains_local_read_only_without_h3_revalidation(
