@@ -41,7 +41,7 @@ from pathlib import Path
 
 import cv2
 
-from app import asr, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, storage, vocal, voice
+from app import asr, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -383,13 +383,19 @@ def _run_cmd(argv: list[str], *, timeout: int, step: str, cwd: Path | None = Non
         raise PipelineError(f"{step} exit {proc.returncode}: {clean_stderr(proc.stderr)}")
 
 
-def validate_work_dir(work: Path) -> tuple[list[str], str]:
+def validate_work_dir(
+    work: Path, *, expected_keyframe_count: int | None = None
+) -> tuple[list[str], str]:
     """产物白名单校验；返回 (关键帧文件名列表, prompt 文本)。任一不过 → PipelineError。"""
     frames = (
         sorted(p.name for p in (work / "keyframes").glob("*.png"))
         if (work / "keyframes").is_dir()
         else []
     )
+    if expected_keyframe_count is not None and len(frames) != expected_keyframe_count:
+        raise PipelineError(
+            f"keyframe count {len(frames)} does not equal {expected_keyframe_count}"
+        )
     if not 1 <= len(frames) <= 9:
         raise PipelineError(f"keyframe count {len(frames)} not in 1..9")
     for name in frames:
@@ -406,6 +412,103 @@ def validate_work_dir(work: Path) -> tuple[list[str], str]:
         raise PipelineError(f"prompt.txt exceeds {MAX_PROMPT_BYTES} bytes")
     prompt = raw.decode("utf-8", errors="replace")
     return frames, prompt
+
+
+def _materialize_backend_keyframes(
+    source: Path,
+    work: Path,
+    selection: list[dict],
+) -> tuple[list[str], dict, tuple[bytes, ...]]:
+    """Decode and freeze the backend planner's exact ordered nine frames."""
+    if (
+        not isinstance(selection, list)
+        or len(selection) != scene_planner.KEYFRAMES_PER_SEGMENT
+    ):
+        raise PipelineError("backend keyframe selection must contain exactly nine frames")
+    indices: list[int] = []
+    for order, item in enumerate(selection, 1):
+        decode_index = item.get("decode_frame_index") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or item.get("order") != order
+            or isinstance(decode_index, bool)
+            or not isinstance(decode_index, int)
+            or decode_index < 0
+        ):
+            raise PipelineError("backend keyframe selection is invalid")
+        indices.append(decode_index)
+
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        raise PipelineError("source video cannot be decoded for backend keyframes")
+    wanted = set(indices)
+    encoded: dict[int, bytes] = {}
+    decode_index = 0
+    try:
+        while wanted - set(encoded):
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if decode_index in wanted:
+                success, png = cv2.imencode(".png", frame)
+                if not success:
+                    raise PipelineError("backend keyframe PNG encoding failed")
+                encoded[decode_index] = png.tobytes()
+            decode_index += 1
+    finally:
+        capture.release()
+    missing = sorted(wanted - set(encoded))
+    if missing:
+        raise PipelineError(
+            f"source decode inventory changed before keyframe freeze: {missing}"
+        )
+
+    frozen = tuple(encoded[index] for index in indices)
+    names = [f"{order:02d}.png" for order in range(1, 10)]
+    stage_root = Path(tempfile.mkdtemp(prefix=".keyframes-stage-", dir=work))
+    staged = stage_root / "keyframes"
+    target = work / "keyframes"
+    staged.mkdir()
+    try:
+        for name, data in zip(names, frozen):
+            (staged / name).write_bytes(data)
+        _remove_local_path(target)
+        staged.replace(target)
+    finally:
+        _remove_local_path(stage_root)
+
+    receipt_items = []
+    for name, item, data in zip(names, selection, frozen):
+        receipt_items.append({
+            **item,
+            "path": f"keyframes/{name}",
+            "sha256": hashlib.sha256(data).hexdigest(),
+        })
+    receipt = {
+        "schema": "duet.backend-keyframe-sampling",
+        "version": 1,
+        "selection_method": "scene-anchor-capacity-hamilton-v1",
+        "keyframes": receipt_items,
+    }
+    staged_receipt = work / ".keyframe_sampling.tmp"
+    staged_receipt.write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(staged_receipt, work / "keyframe_sampling.json")
+    return names, receipt, frozen
+
+
+def _restore_backend_keyframes(work: Path, frozen: tuple[bytes, ...]) -> None:
+    if len(frozen) != scene_planner.KEYFRAMES_PER_SEGMENT or any(
+        not isinstance(data, bytes) or not data for data in frozen
+    ):
+        raise PipelineError("backend frozen keyframes are invalid")
+    target = work / "keyframes"
+    _remove_local_path(target)
+    target.mkdir()
+    for order, data in enumerate(frozen, 1):
+        (target / f"{order:02d}.png").write_bytes(data)
 
 
 def _hard_rules(cdir: Path) -> str:
@@ -462,11 +565,18 @@ def _run_visual_codex(
                 voice_path.write_bytes(frozen_voice)
 
 
-def _clear_visual_outputs(cdir: Path, work: Path) -> None:
+def _clear_visual_outputs(
+    cdir: Path,
+    work: Path,
+    *,
+    frozen_keyframes: tuple[bytes, ...] | None = None,
+) -> None:
     """Start every visual attempt without outputs from an earlier attempt."""
     keyframes = work / "keyframes"
     if keyframes.exists():
         shutil.rmtree(keyframes)
+    if frozen_keyframes is not None:
+        _restore_backend_keyframes(work, frozen_keyframes)
     (work / "prompt.txt").unlink(missing_ok=True)
     (cdir / "codex_last_message.txt").unlink(missing_ok=True)
 
@@ -478,9 +588,12 @@ def _run_visual_attempt(
     work: Path,
     *,
     isolate_dialogue: bool,
+    frozen_keyframes: tuple[bytes, ...] | None = None,
 ) -> tuple[list[str], str]:
     """Run once, adopting complete outputs even when Codex exits abnormally."""
-    _clear_visual_outputs(cdir, work)
+    _clear_visual_outputs(
+        cdir, work, frozen_keyframes=frozen_keyframes
+    )
     run_error: CodexError | None = None
     try:
         _run_visual_codex(
@@ -492,8 +605,20 @@ def _run_visual_attempt(
         )
     except CodexError as exc:
         run_error = exc
+    finally:
+        if frozen_keyframes is not None:
+            # The model can analyze the server-owned frames but has no authority
+            # over their bytes, count, numbering or order.
+            _restore_backend_keyframes(work, frozen_keyframes)
     try:
-        return validate_work_dir(work)
+        return validate_work_dir(
+            work,
+            expected_keyframe_count=(
+                scene_planner.KEYFRAMES_PER_SEGMENT
+                if frozen_keyframes is not None
+                else None
+            ),
+        )
     except PipelineError:
         if run_error is not None:
             raise run_error from None
@@ -509,6 +634,7 @@ def _run_visual_with_retry(
     *,
     isolate_dialogue: bool,
     step: str,
+    frozen_keyframes: tuple[bytes, ...] | None = None,
 ) -> tuple[list[str], str]:
     policy = _retry_policy(settings)
     return run_with_retry(
@@ -518,6 +644,7 @@ def _run_visual_with_retry(
             prompt,
             work,
             isolate_dialogue=isolate_dialogue,
+            frozen_keyframes=frozen_keyframes,
         ),
         policy=policy,
         is_retryable=_retryable_operation_error,
@@ -1279,11 +1406,25 @@ def _scene_bounds_for_long_plan(work: Path, duration_s: float) -> list[dict]:
 
 def _source_scenes_for_timeline(work: Path, duration_s: float) -> list[dict]:
     """Return the detector-owned scene ids and exact normalized boundaries."""
-    bounds = _scene_bounds_for_long_plan(work, duration_s)
     try:
         raw = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         raw = None
+    exact_scenes = raw.get("effective_scenes") if isinstance(raw, dict) else None
+    if isinstance(exact_scenes, list) and exact_scenes:
+        result = []
+        for position, scene in enumerate(exact_scenes, 1):
+            if (
+                not isinstance(scene, dict)
+                or scene.get("index") != position
+                or not isinstance(scene.get("frames"), list)
+                or not scene["frames"]
+            ):
+                raise PipelineError("source scene timeline is invalid")
+            result.append(dict(scene))
+        return result
+
+    bounds = _scene_bounds_for_long_plan(work, duration_s)
     raw_scenes = raw.get("scenes") if isinstance(raw, dict) else None
     result: list[dict] = []
     for position, bound in enumerate(bounds, 1):
@@ -1324,6 +1465,84 @@ def _bind_keyframe_source_timeline(
         or not source_scenes
     ):
         raise PipelineError("keyframe source timeline is invalid")
+    if all(isinstance(meta.get("keyframe_sampling"), dict) for meta in segment_metas):
+        updated = [dict(meta) for meta in segment_metas]
+        previous: dict | None = None
+        seen_scenes: set[str] = set()
+        for expected_index, (segment, meta) in enumerate(zip(segments, updated), 1):
+            receipt = meta["keyframe_sampling"]
+            items = receipt.get("keyframes")
+            names = meta.get("keyframes")
+            if (
+                segment.get("index") != expected_index
+                or meta.get("index") != expected_index
+                or receipt.get("schema") != "duet.backend-keyframe-sampling"
+                or receipt.get("version") != 1
+                or not isinstance(items, list)
+                or len(items) != scene_planner.KEYFRAMES_PER_SEGMENT
+                or names != [f"{order:02d}.png" for order in range(1, 10)]
+            ):
+                raise PipelineError("backend keyframe source timeline is invalid")
+            sources = []
+            segwork = work / "segments" / str(expected_index) / "work"
+            for order, item in enumerate(items, 1):
+                name = names[order - 1]
+                if (
+                    not isinstance(item, dict)
+                    or item.get("order") != order
+                    or item.get("path") != f"keyframes/{name}"
+                    or not isinstance(item.get("source_scene_id"), str)
+                    or not item["source_scene_id"]
+                    or isinstance(item.get("source_time_s"), bool)
+                    or not isinstance(item.get("source_time_s"), (int, float))
+                    or not math.isfinite(float(item["source_time_s"]))
+                    or isinstance(item.get("repeated"), bool) is False
+                ):
+                    raise PipelineError("backend keyframe source timeline is invalid")
+                try:
+                    data = (segwork / "keyframes" / name).read_bytes()
+                except OSError:
+                    raise PipelineError("backend keyframe source timeline is invalid") from None
+                if hashlib.sha256(data).hexdigest() != item.get("sha256"):
+                    raise PipelineError("backend frozen keyframe changed")
+                source_time_s = float(item["source_time_s"])
+                if previous is None:
+                    transition = {"type": "start", "at_s": source_time_s}
+                elif item["source_scene_id"] != previous["source_scene_id"]:
+                    at_s = item.get("source_scene_start_s")
+                    if (
+                        isinstance(at_s, bool)
+                        or not isinstance(at_s, (int, float))
+                        or not math.isfinite(float(at_s))
+                    ):
+                        raise PipelineError("backend keyframe source timeline is invalid")
+                    transition = {"type": "hard_cut", "at_s": float(at_s)}
+                else:
+                    transition = {"type": "continuous", "at_s": None}
+                if previous is not None and source_time_s < previous["source_time_s"]:
+                    raise PipelineError("backend keyframe source timeline is invalid")
+                if (
+                    previous is not None
+                    and source_time_s == previous["source_time_s"]
+                    and not item["repeated"]
+                ):
+                    raise PipelineError("backend keyframe repeat provenance is invalid")
+                source = {
+                    "order": order,
+                    "source_time_s": source_time_s,
+                    "source_scene_id": item["source_scene_id"],
+                    "transition": transition,
+                }
+                sources.append(source)
+                seen_scenes.add(item["source_scene_id"])
+                previous = source
+            meta["keyframe_sources"] = sources
+        expected_scenes = {
+            f"SCENE_{scene['index']:02d}" for scene in source_scenes
+        }
+        if seen_scenes != expected_scenes:
+            raise PipelineError("backend keyframe source timeline misses scene anchor")
+        return updated
     scenes: list[dict] = []
     previous_end: float | None = None
     for position, raw in enumerate(source_scenes, 1):
@@ -1699,7 +1918,8 @@ def _write_segment_anchors(work: Path, anchors: tuple[bytes, bytes]) -> tuple[Pa
 
 def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, runner,
                      lines: list[dict] | None, target_language: str = "",
-                     *, new_input_contract: bool = False) -> dict:
+                     *, new_input_contract: bool = False,
+                     keyframe_selection: list[dict] | None = None) -> dict:
     """单段完整流程：切段 → 抽帧 → 写该段台词 → codex（cwd=段目录）→ 校验 → 后端加前缀。
 
     段目录内嵌套 work/：帧/台词/产物都在 segdir/work/，SKILL.md 的 work/ 路径逐字适用，
@@ -1724,6 +1944,12 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             timeout=120,
             step=f"segment {index} extract",
         )
+        sampling_receipt = None
+        frozen_keyframes = None
+        if keyframe_selection is not None:
+            _names, sampling_receipt, frozen_keyframes = (
+                _materialize_backend_keyframes(source, segwork, keyframe_selection)
+            )
         anchor_frames = _read_segment_anchor_frames(segwork) if new_input_contract else None
         # 该段台词（白名单净化后；lines 为 None = 无口播，不写文件）
         if lines is not None:
@@ -1732,18 +1958,25 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             )
         # 裁剪工具按 scripts/crop_image.py 相对 cwd 引用：scripts/ 拷入段目录
         _replace_scripts(work.parent, segdir)
+        visual_request = _codex_prompt(
+            segdir,
+            target_language,
+            visual_only=new_input_contract,
+        )
+        if frozen_keyframes is not None:
+            visual_request += (
+                "\n后端已按唯一场景采样算法冻结 work/keyframes/01.png 至 09.png。"
+                "逐张读取这九帧并据其既定顺序写 prompt.txt；禁止增删、替换、重排或修改任何关键帧。\n"
+            )
         keyframes, prompt = _run_visual_with_retry(
             settings,
             runner,
             segdir,
-            _codex_prompt(
-                segdir,
-                target_language,
-                visual_only=new_input_contract,
-            ),
+            visual_request,
             segwork,
             isolate_dialogue=new_input_contract,
             step=f"segment {index} visual codex",
+            frozen_keyframes=frozen_keyframes,
         )
         visual_prompt = prompt
         if new_input_contract:
@@ -1776,6 +2009,8 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
                 visual_prompt=visual_prompt,
                 dialogue=list(lines or []),
             )
+            if sampling_receipt is not None:
+                result["keyframe_sampling"] = sampling_receipt
         return result
     except Exception as e:
         raise PipelineError(f"segment {index} failed: {e}") from None
@@ -2540,13 +2775,42 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
         segments = _detect_segments(settings, cid, source, work)
         duration_s = float(meta["duration_s"]) if new_input_contract else None
         source_scenes: list[dict] | None = None
+        backend_keyframe_selections: dict[int, list[dict]] = {}
         if new_input_contract:
             source_scenes = _source_scenes_for_timeline(work, duration_s)
-            segments = long_video.plan_segments(
-                duration_s,
-                source_scenes,
-                voice_lines or [],
+            exact_inventory = all(
+                isinstance(scene.get("frames"), list)
+                and scene["frames"]
+                and all(
+                    isinstance(frame, dict)
+                    and isinstance(frame.get("decode_frame_index"), int)
+                    and not isinstance(frame.get("decode_frame_index"), bool)
+                    and isinstance(frame.get("pts"), int)
+                    and not isinstance(frame.get("pts"), bool)
+                    for frame in scene["frames"]
+                )
+                for scene in source_scenes
             )
+            if exact_inventory:
+                segments = scene_planner.plan_segments(
+                    duration_s,
+                    source_scenes,
+                    voice_lines or [],
+                )
+                backend_keyframe_selections = {
+                    segment["index"]: scene_planner.select_segment_keyframes(
+                        source_scenes, segment
+                    )
+                    for segment in segments
+                }
+            else:
+                # Read-only compatibility for pre-exact scene receipts.  New
+                # scenes.py output always carries the exact inventory above.
+                segments = long_video.plan_segments(
+                    duration_s,
+                    source_scenes,
+                    voice_lines or [],
+                )
         if not segments:
             # 单段模式：work/keyframes + work/prompt.txt，不注入 workaround 前缀；
             # 裁剪工具以 scripts/crop_image.py 相对工作目录引用，scripts/ 拷进会话目录
@@ -2666,6 +2930,11 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                             lines_by_seg.get(seg["index"]) if lines_by_seg is not None else None,
                             translate_lang,
                             new_input_contract=new_input_contract,
+                            **(
+                                {"keyframe_selection": backend_keyframe_selections[seg["index"]]}
+                                if seg["index"] in backend_keyframe_selections
+                                else {}
+                            ),
                         ),
                         segments,
                     )

@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from app.scenes import build_segments
+from app import scenes as scenes_module
+from app.scenes import (
+    build_segments,
+    normalize_scene_inventory,
+    plan_segments,
+    select_segment_keyframes,
+)
 from app.long_video import provider_duration_s
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -355,3 +361,210 @@ def test_build_segments_exhaustive_invariants():
         assert_segments_valid(build_segments(bounds, duration), duration)
         count += 1
     assert count == 59865
+
+
+def _decoded_frame(index: int, pts: int, *, denominator: int = 1) -> dict:
+    return {
+        "decode_frame_index": index,
+        "pts": pts,
+        "time_base_num": 1,
+        "time_base_den": denominator,
+    }
+
+
+def _exact_scene(index: int, start: int, end: int) -> dict:
+    return {
+        "index": index,
+        "start_decode_frame_index": start,
+        "end_decode_frame_index": end,
+    }
+
+
+def test_scene_inventory_uses_decode_indices_and_merges_empty_scenes_deterministically():
+    frames = [
+        _decoded_frame(1, 1001, denominator=30000),
+        _decoded_frame(2, 2002, denominator=30000),
+        _decoded_frame(4, 4004, denominator=30000),
+        _decoded_frame(5, 5005, denominator=30000),
+    ]
+    bounds = [
+        _exact_scene(1, 0, 1),       # leading empty -> merge into following
+        _exact_scene(2, 1, 3),
+        _exact_scene(3, 3, 4),       # later empty -> merge into preceding
+        _exact_scene(4, 4, 6),
+    ]
+
+    scenes = normalize_scene_inventory(bounds, frames)
+
+    assert [scene["source_scene_indices"] for scene in scenes] == [[1, 2, 3], [4]]
+    assert [
+        [frame["decode_frame_index"] for frame in scene["frames"]]
+        for scene in scenes
+    ] == [[1, 2], [4, 5]]
+    assert scenes[0]["start_decode_frame_index"] == 0
+    assert scenes[0]["end_decode_frame_index"] == 4
+    # Display seconds may round; exact ownership remains the integer frame interval.
+    assert scenes[0]["frames"][0]["source_time_s"] == round(1001 / 30000, 6)
+
+
+def test_detector_exception_becomes_diagnostic_and_keeps_same_scene_algorithm(
+    tmp_path, monkeypatch,
+):
+    frames = [_decoded_frame(index, index, denominator=10) for index in range(3)]
+    monkeypatch.setattr(
+        scenes_module,
+        "detect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("detector")),
+    )
+
+    bounds = scenes_module.detect_exact_scene_bounds(
+        tmp_path / "source.mp4", 27.0, frames
+    )
+    normalized = normalize_scene_inventory(bounds, frames)
+
+    assert len(normalized) == 1
+    assert [frame["decode_frame_index"] for frame in normalized[0]["frames"]] == [0, 1, 2]
+    assert bounds[0]["diagnostics"] == [
+        "scene_detector_error_normalized",
+        "scene_detector_no_cut_normalized",
+    ]
+
+
+def test_unified_planner_splits_more_than_nine_effective_scenes_on_hard_cut():
+    scenes = []
+    for index in range(12):
+        scenes.append({
+            "index": index + 1,
+            "start_decode_frame_index": index,
+            "end_decode_frame_index": index + 1,
+            "start_s": float(index),
+            "end_s": float(index + 1),
+            "frames": [_decoded_frame(index, index)],
+        })
+
+    segments = plan_segments(12.0, scenes, [])
+
+    assert [(segment["start_s"], segment["end_s"]) for segment in segments] == [
+        (0.0, 9.0),
+        (9.0, 12.0),
+    ]
+    assert [segment["join_mode"] for segment in segments] == ["hard_cut", "hard_cut"]
+    assert [segment["scene_indices"] for segment in segments] == [
+        list(range(1, 10)),
+        [10, 11, 12],
+    ]
+
+
+def test_keyframe_sampler_uses_anchor_then_capacity_hamilton_and_ordinal_spacing():
+    capacities = (1, 2, 10)
+    scenes = []
+    decode_index = 0
+    for scene_index, capacity in enumerate(capacities, 1):
+        frames = [
+            _decoded_frame(decode_index + offset, decode_index + offset)
+            for offset in range(capacity)
+        ]
+        scenes.append({
+            "index": scene_index,
+            "start_decode_frame_index": decode_index,
+            "end_decode_frame_index": decode_index + capacity,
+            "start_s": float(decode_index),
+            "end_s": float(decode_index + capacity),
+            "frames": frames,
+        })
+        decode_index += capacity
+
+    selected = select_segment_keyframes(
+        scenes,
+        {"index": 1, "start_s": 0.0, "end_s": 13.0},
+    )
+
+    assert len(selected) == 9
+    assert [
+        sum(item["source_scene_id"] == f"SCENE_{index:02d}" for item in selected)
+        for index in range(1, 4)
+    ] == [1, 2, 6]
+    assert [
+        item["decode_frame_index"]
+        for item in selected
+        if item["source_scene_id"] == "SCENE_03"
+    ] == [3, 5, 7, 8, 10, 12]
+    assert selected[1]["transition"] == {
+        "type": "hard_cut",
+        "at_s": 1.0,
+    }
+    assert selected[3]["transition"] == {
+        "type": "hard_cut",
+        "at_s": 3.0,
+    }
+    assert not any(item["repeated"] for item in selected)
+
+
+def test_single_scene_anchor_uses_lower_median_actual_frame():
+    scenes = []
+    decode_index = 0
+    for scene_index, capacity in enumerate((68, 257, 39, 70, 1), 1):
+        frames = [
+            _decoded_frame(decode_index + offset, decode_index + offset)
+            for offset in range(capacity)
+        ]
+        scenes.append({
+            "index": scene_index,
+            "start_decode_frame_index": decode_index,
+            "end_decode_frame_index": decode_index + capacity,
+            "start_s": float(decode_index),
+            "end_s": float(decode_index + capacity),
+            "frames": frames,
+        })
+        decode_index += capacity
+
+    selected = select_segment_keyframes(
+        scenes,
+        {"index": 1, "start_s": 0.0, "end_s": 435.0},
+    )
+
+    assert [
+        sum(item["source_scene_id"] == f"SCENE_{index:02d}" for item in selected)
+        for index in range(1, 6)
+    ] == [2, 3, 1, 2, 1]
+    scene_three = next(
+        item for item in selected if item["source_scene_id"] == "SCENE_03"
+    )
+    assert scene_three["decode_frame_index"] == 325 + 19
+    assert selected[-1]["decode_frame_index"] == 434
+
+
+def test_keyframe_sampler_repeats_nearest_pts_when_source_has_under_nine_frames():
+    scenes = [{
+        "index": 1,
+        "start_decode_frame_index": 0,
+        "end_decode_frame_index": 3,
+        "start_s": 0.0,
+        "end_s": 1.001,
+        "frames": [
+            _decoded_frame(0, 0, denominator=10),
+            _decoded_frame(1, 3, denominator=10),
+            _decoded_frame(2, 10, denominator=10),
+        ],
+    }]
+
+    selected = select_segment_keyframes(
+        scenes,
+        {"index": 1, "start_s": 0.0, "end_s": 1.001},
+    )
+
+    assert len(selected) == 9
+    assert [item["decode_frame_index"] for item in selected] == [
+        0, 0, 1, 1, 1, 1, 2, 2, 2,
+    ]
+    assert [item["repeated"] for item in selected] == [
+        False, True, False, True, True, True, False, True, True,
+    ]
+    assert [item["repeat_of_decode_frame_index"] for item in selected] == [
+        None, 0, None, 1, 1, 1, None, 2, 2,
+    ]
+    assert selected[0]["transition"] == {"type": "start", "at_s": 0.0}
+    assert all(
+        item["transition"] == {"type": "continuous", "at_s": None}
+        for item in selected[1:]
+    )

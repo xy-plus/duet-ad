@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
 
-from app import codex_runner, h3, h3_project, image_optimization, long_generation, long_video, pipeline, postprocess, prepared_input, seedream, storage, vocal, voice
+from app import codex_runner, h3, h3_project, image_optimization, long_generation, long_video, pipeline, postprocess, prepared_input, scenes as scene_planner, seedream, storage, vocal, voice
 from app.codex_runner import CodexError, CodexRunner
 from app.main import create_app
 
@@ -229,6 +229,104 @@ def _make_conversation(settings, video_1s):
     # 本文件既有用例模拟旧 voice_mode 会话；新 prepared-input 用例会显式补
     # dialogue_mode + duration_s + 新 voice_mode。
     return storage.update_meta(settings.data_dir, meta["id"], voice_mode="none")
+
+
+def test_backend_materializes_exact_nine_in_frozen_order_with_repeat_receipt(
+    tmp_path, video_1s,
+):
+    work = tmp_path / "work"
+    work.mkdir()
+    scenes = [{
+        "index": 1,
+        "start_decode_frame_index": 0,
+        "end_decode_frame_index": 3,
+        "start_s": 0.0,
+        "end_s": 0.201,
+        "frames": [
+            {
+                "decode_frame_index": index,
+                "pts": index,
+                "time_base_num": 1,
+                "time_base_den": 10,
+            }
+            for index in range(3)
+        ],
+    }]
+    selection = scene_planner.select_segment_keyframes(
+        scenes,
+        {"index": 1, "start_s": 0.0, "end_s": 0.201},
+    )
+
+    names, receipt, frozen = pipeline._materialize_backend_keyframes(
+        video_1s, work, selection
+    )
+
+    assert names == [f"{index:02d}.png" for index in range(1, 10)]
+    assert len(frozen) == 9
+    assert [item["decode_frame_index"] for item in receipt["keyframes"]] == [
+        item["decode_frame_index"] for item in selection
+    ]
+    assert [item["repeated"] for item in receipt["keyframes"]] == [
+        item["repeated"] for item in selection
+    ]
+    assert receipt["keyframes"][0]["sha256"] == receipt["keyframes"][1]["sha256"]
+    assert receipt["keyframes"][0]["path"] == "keyframes/01.png"
+    assert receipt["keyframes"][1]["path"] == "keyframes/02.png"
+    persisted = json.loads((work / "keyframe_sampling.json").read_text(encoding="utf-8"))
+    assert persisted == receipt
+    segment = {
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 0.201,
+        "chain_id": "chain-001",
+        "join_mode": "hard_cut",
+    }
+    segwork = work / "segments" / "1" / "work"
+    segwork.mkdir(parents=True)
+    shutil.copytree(work / "keyframes", segwork / "keyframes")
+    bound_receipt = deepcopy(receipt)
+    for item in bound_receipt["keyframes"]:
+        item["path"] = f"keyframes/{Path(item['path']).name}"
+    bound = pipeline._bind_keyframe_source_timeline(
+        work,
+        [segment],
+        [{
+            **segment,
+            "keyframes": names,
+            "keyframe_sampling": bound_receipt,
+        }],
+        scenes,
+    )
+    assert len(bound[0]["keyframe_sources"]) == 9
+    assert [item["source_time_s"] for item in bound[0]["keyframe_sources"]] == [
+        item["source_time_s"] for item in selection
+    ]
+
+
+def test_visual_attempt_restores_backend_frozen_frames_after_codex_mutation(tmp_path):
+    cdir = tmp_path / "conversation"
+    work = cdir / "work"
+    keyframes = work / "keyframes"
+    keyframes.mkdir(parents=True)
+    frozen = tuple(_PX_PNG for _index in range(9))
+
+    class MutatingRunner:
+        def run(self, _cdir, _prompt):
+            (keyframes / "01.png").write_bytes(b"mutated")
+            (keyframes / "09.png").unlink()
+            (work / "prompt.txt").write_text(PROMPT_TEXT, encoding="utf-8")
+
+    names, _prompt = pipeline._run_visual_attempt(
+        MutatingRunner(),
+        cdir,
+        "backend frozen",
+        work,
+        isolate_dialogue=False,
+        frozen_keyframes=frozen,
+    )
+
+    assert names == [f"{index:02d}.png" for index in range(1, 10)]
+    assert tuple((keyframes / name).read_bytes() for name in names) == frozen
 
 
 def test_source_scene_cut_is_frozen_on_the_first_post_cut_keyframe(tmp_path):
