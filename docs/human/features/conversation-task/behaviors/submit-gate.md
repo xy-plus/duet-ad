@@ -38,7 +38,8 @@ links: [conversation-task, processing-state, long-video, postprocess]
 | 输入 | H3 冻结结果 |
 | --- | --- |
 | `dialogue_mode=none` | 零台词、零声音 reference |
-| `dialogue_delivery=off_screen` | 逐行保留冻结 text/start/end，`delivery=off_screen`、无画内 subject，绑定唯一 normalized voice reference |
+| `dialogue_mode=auto` | 仅保留 `classification=spoken` 的 ASR 行；`sung/chant/rap/humming` 全部排除。没有真实口播时冻结零台词、零声音 reference |
+| `dialogue_delivery=off_screen` | 逐行保留冻结 text/start/end，`delivery=off_screen`、无画内 subject，只能绑定已证明为 clean voice 的唯一 reference；完整源混音禁止作为 reference |
 | `dialogue_delivery=on_screen` 且主分析已有同一行的画内人物/时间证据 | 逐行绑定既有证据与唯一 voice reference |
 | `dialogue_delivery=on_screen` 但证据缺失 | 409 `on_screen_authority_unavailable`，Context/H3 POST 为 0；不得调用额外 Skill 补证 |
 
@@ -55,12 +56,14 @@ links: [conversation-task, processing-state, long-video, postprocess]
 | schema 不是 v2 | 409 `read_only` |
 | 未完成图片后处理或每段不是恰好 9 张图 | 409 `postprocess_artifacts_invalid`；不回退原图 |
 | v4 图片尚未由用户确认，或确认绑定的图、顺序、计划已漂移 | 409 image acceptance 错误；不创建付费任务 |
+| 自动模式只检测到歌词或歌唱 | 按无台词冻结，完整源混音不进入 Fusion/H3；无音频 H3 输出在拼接时静音 |
+| 台词非空但只有完整源混音可作为声音参考 | 409 clean voice reference 错误；Context/H3 POST 为 0，不得回退整轨混音 |
 | 输入准备未 `done` | 409 `artifacts not ready` |
 | 请求缺字段、有未知字段、`confirm` 非 true、id 或枚举不合法 | 422；在状态写入和供应商调用前拒绝 |
 | plan receipt 缺失、格式非法或已变化 | 422/409；刷新后由用户再次确认，Web 不自动重发 |
 | 图片确认后缺少 `video-prompt-fusion` 最终提示词，或四类输入 SHA/顺序漂移 | 409；重新融合提示词，Context/H3 POST 为 0；禁止旧视觉 prompt 直达 Context/H3 |
 | 画内声音缺少主分析权威 | 409 `on_screen_authority_unavailable`；不调用 Skill，不创建 H3 attempt |
-| Context IR 试图改变帧序、台词、时间、声音呈现或 voice reference | fail closed；不创建 H3 attempt |
+| Context IR 试图改变帧序、源硬切时点、台词、声音呈现、music policy 或 voice reference | fail closed；不创建 H3 attempt |
 | generation active/succeeded，或参数与冻结输入不一致 | 409；不创建新供应商任务 |
 | generation 为 `resume_required` | 只接受原 id 和全部原冻结参数，继续原 attempt |
 | generation 为 `submission_unknown` | 任意提交均 409；只允许查询供应商已有任务 |
@@ -72,6 +75,8 @@ links: [conversation-task, processing-state, long-video, postprocess]
 - `video-maker` 第一次调用冻结 segments、每段 9 张原始关键帧、原始视频提示词、动作/镜头/时间和它已经能证明的结构化事实。
 - `image-postprocess` 已冻结，不再迭代；它只把每段 9 张原始关键帧变成 9 张优化关键帧，不做素材准入。
 - 用户确认后的 9 张优化图按 segment 和帧序进入统一 frozen receipt；随后 `video-prompt-fusion` 以有序新关键帧、旧视频提示词、图片优化提示词和音频内容为唯一四类输入生成最终视频提示词。
+- `new_keyframes` 仍属于第一类输入，但每项必须同时绑定源时间、source scene 与 transition；扩充字段不是第五类输入，也不是新阶段。
+- 音频内容必须冻结真实口播筛选结果、clean-reference 证明与 `music_policy=forbid`；整轨 `work/voice.mp3` 只可用于分析，不得出现在 Fusion/H3 references 中。
 - 第一次生成确认只冻结四类输入并项目级调用一次 `video-prompt-fusion`；完成后返回可刷新状态，Web 不自动重提。相同设置由用户再次明确确认后，才允许进入 Context IR 和 H3。
 - Context IR 与 H3 只能消费 `video-prompt-fusion` 输出及其绑定的四类输入；禁止旧视觉 prompt 直接覆盖新人物、新场景或新对象。
 
@@ -82,4 +87,4 @@ links: [conversation-task, processing-state, long-video, postprocess]
 - 已知供应商明确失败的自动 attempt 必须沿用同一冻结输入并受统一次数预算约束；成功 segment 不重提。
 - 本地拼接失败只重做拼接，不重新提交 H3。
 - H3 输出下载、ffprobe、PTS、时长、原生音轨和最终拼接验证通过后才原子发布 `generated.mp4`。
-- H3 原生输出音轨是成片唯一音频来源；源音和 conditioning voice 不得 overlay 或回挂。
+- 有合法口播的段以 H3 原生输出音轨为成片音频；源混音和 conditioning voice 不得 overlay 或回挂。无真实口播的段丢弃 H3 音轨并输出静音。
