@@ -2006,6 +2006,42 @@ def _fit_outputs_complete(paths: tuple[Path, Path], aspect_ratio: str) -> bool:
         return False
 
 
+def _validate_frozen_dialogue_delivery(
+    payload: Mapping,
+    meta: Mapping,
+    authoritative_lines: Sequence[Mapping[str, object]],
+) -> None:
+    """Validate frozen delivery facts without replaying today's auto policy."""
+    requested = payload.get("dialogue_delivery")
+    resolved = payload.get("resolved_dialogue_delivery")
+    try:
+        parsed = dialogue_delivery_contract.parse(requested)
+    except ValueError:
+        raise LongGenerationError("long_video_plan_invalid") from None
+    if resolved not in {"on_screen", "off_screen"}:
+        raise LongGenerationError("long_video_plan_invalid")
+    has_meta_requested = "dialogue_delivery" in meta
+    has_meta_resolved = "resolved_dialogue_delivery" in meta
+    if has_meta_requested or has_meta_resolved:
+        if (
+            not (has_meta_requested and has_meta_resolved)
+            or meta.get("dialogue_delivery") != requested
+            or meta.get("resolved_dialogue_delivery") != resolved
+        ):
+            raise LongGenerationError("long_video_plan_invalid")
+    else:
+        current = dialogue_delivery_contract.resolve(
+            parsed, authoritative_lines
+        ).value
+        if resolved != current:
+            raise LongGenerationError("long_video_plan_invalid")
+    if (
+        parsed is not dialogue_delivery_contract.DialogueDelivery.AUTO
+        and parsed.value != resolved
+    ):
+        raise LongGenerationError("long_video_plan_invalid")
+
+
 def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 dialogue_mode: str, *, aspect_ratio: str | None = None,
                 resolution: str | None = None,
@@ -2087,6 +2123,11 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         long_video.VISUAL_PLAN_RECEIPT_VERSION,
         long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
     }
+    if is_multimodal_receipt and (
+        ("dialogue_delivery" in payload)
+        != ("resolved_dialogue_delivery" in payload)
+    ):
+        raise LongGenerationError("long_video_plan_invalid")
     if (
         is_multimodal_receipt
         and receipt_workflow not in h3.H3_REFERENCE_WORKFLOWS
@@ -2596,15 +2637,9 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
     if abs(previous_end - duration) > _EPS:
         raise LongGenerationError("long_video_plan_invalid")
     if is_multimodal_receipt and "dialogue_delivery" in payload:
-        try:
-            resolved_delivery = dialogue_delivery_contract.resolve(
-                dialogue_delivery_contract.parse(payload["dialogue_delivery"]),
-                tuple(authoritative_dialogue_for_delivery),
-            ).value
-        except ValueError:
-            raise LongGenerationError("long_video_plan_invalid") from None
-        if payload.get("resolved_dialogue_delivery") != resolved_delivery:
-            raise LongGenerationError("long_video_plan_invalid")
+        _validate_frozen_dialogue_delivery(
+            payload, meta, authoritative_dialogue_for_delivery
+        )
     assert legacy_layout is not None
     return FrozenPlan(
         root=root,
@@ -4392,13 +4427,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
     def worker(segment: FrozenSegment, action: str):
         if (
             action == "start"
-            and plan.receipt_version == long_video.LEGACY_PLAN_RECEIPT_VERSION
             and long_video.provider_duration_s(
                 segment.start_s,
                 segment.end_s,
                 receipt_version=plan.receipt_version,
             )
-            > long_video.PREVIOUS_SEGMENT_PROVIDER_MAX_DURATION_S
+            > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
         ):
             return None, ("failed", "long_video_legacy_plan_read_only", None)
         existing_child_id = states[segment.index].get("child_request_id")

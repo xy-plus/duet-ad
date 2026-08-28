@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import (
+    dialogue_delivery,
     h3,
     long_generation,
     long_video,
@@ -4058,8 +4059,15 @@ def test_startup_revalidates_previous_output_invalid_without_new_provider_call(
     assert stored["status"] == "succeeded"
 
 
-def test_legacy_over_ten_segment_never_starts_a_new_paid_attempt(
-    tmp_path, monkeypatch,
+@pytest.mark.parametrize(
+    "receipt_version",
+    [
+        long_video.LEGACY_PLAN_RECEIPT_VERSION,
+        long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+    ],
+)
+def test_historical_over_ten_segment_never_starts_a_new_paid_attempt(
+    tmp_path, monkeypatch, receipt_version,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, receipt = _make_long(settings, segment_duration=11.0, legacy=True)
@@ -4067,6 +4075,7 @@ def test_legacy_over_ten_segment_never_starts_a_new_paid_attempt(
     plan = long_generation.freeze_plan(
         root, storage.load_meta(settings.data_dir, cid), receipt, "none", "auto"
     )
+    plan = replace(plan, receipt_version=receipt_version)
     generation = long_generation.initial_generation(
         settings, cid, plan, "parent-request-123", 1
     )
@@ -4154,6 +4163,72 @@ def test_new_plan_writer_keeps_every_segment_within_ten_seconds(tmp_path):
         <= long_video.SEGMENT_PROVIDER_MAX_DURATION_S
         for segment in frozen.segments
     )
+
+
+def test_current_auto_delivery_still_resolves_off_screen_for_new_receipts():
+    assert dialogue_delivery.resolve(
+        dialogue_delivery.parse("auto"),
+        ({"text": "source dialogue", "classification": "spoken"},),
+    ).value == "off_screen"
+
+
+def test_historical_v5_auto_on_screen_delivery_is_read_as_frozen_fact():
+    payload = {
+        "version": long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+        "dialogue_delivery": "auto",
+        "resolved_dialogue_delivery": "on_screen",
+    }
+    meta = {
+        "dialogue_delivery": "auto",
+        "resolved_dialogue_delivery": "on_screen",
+    }
+
+    long_generation._validate_frozen_dialogue_delivery(payload, meta, ())
+
+
+def test_new_frozen_auto_receipt_without_meta_uses_current_resolution():
+    payload = {
+        "dialogue_delivery": "auto",
+        "resolved_dialogue_delivery": "off_screen",
+    }
+
+    long_generation._validate_frozen_dialogue_delivery(payload, {}, ())
+
+
+@pytest.mark.parametrize(
+    ("payload_changes", "meta_changes"),
+    [
+        ({"resolved_dialogue_delivery": "speaker_guess"}, {}),
+        ({}, {"resolved_dialogue_delivery": "off_screen"}),
+        (
+            {
+                "dialogue_delivery": "off_screen",
+                "resolved_dialogue_delivery": "on_screen",
+            },
+            {"dialogue_delivery": "off_screen"},
+        ),
+    ],
+)
+def test_frozen_dialogue_delivery_rejects_invalid_or_drifted_facts(
+    payload_changes, meta_changes,
+):
+    payload = {
+        "version": long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+        "dialogue_delivery": "auto",
+        "resolved_dialogue_delivery": "on_screen",
+        **payload_changes,
+    }
+    meta = {
+        "dialogue_delivery": "auto",
+        "resolved_dialogue_delivery": "on_screen",
+        **meta_changes,
+    }
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="long_video_plan_invalid",
+    ):
+        long_generation._validate_frozen_dialogue_delivery(payload, meta, ())
 
 
 def test_new_receipt_rejects_true_six_decimal_subsecond_segment(tmp_path):
