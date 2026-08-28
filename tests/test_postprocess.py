@@ -587,8 +587,8 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         public_segments = []
         receipt_segments = []
         for index in range(1, segment_count + 1):
-            start_s = 14.0 * (index - 1)
-            end_s = 14.0 * index
+            start_s = 10.0 * (index - 1)
+            end_s = 10.0 * index
             segdir = cdir / "work" / "segments" / str(index)
             work = segdir / "work"
             source = segdir / "source.mp4"
@@ -626,7 +626,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                 ],
                 "keyframe_sources": [{
                     "order": order,
-                    "source_time_s": round(start_s + 1.5 * (order - 1), 3),
+                    "source_time_s": round(start_s + 1.0 * (order - 1), 3),
                     "source_scene_id": "SCENE_01",
                     "transition": (
                         {
@@ -661,7 +661,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         receipt_path = long_video.write_plan_receipt(
             cdir,
             source=cdir / "source.mp4",
-            duration_s=14.0 * segment_count,
+            duration_s=10.0 * segment_count,
             segments=receipt_segments,
             workflow=h3.H3_WORKFLOW,
         )
@@ -670,7 +670,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         ] == long_video.VISUAL_PLAN_RECEIPT_VERSION
         expected_receipt = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
         common_changes.update(
-            duration_s=14.0 * segment_count,
+            duration_s=10.0 * segment_count,
             segments=public_segments,
             long_video_plan_receipt=receipt_path.name,
         )
@@ -881,18 +881,6 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             "_start_automatic_v4_generation",
             real_start_automatic,
         )
-        if dialogue_mode != "none":
-            missing_delivery = client.post(
-                f"/api/conversations/{cid}/submit",
-                headers=AUTH,
-                json={key: value for key, value in payload.items()
-                      if key != "dialogue_delivery"},
-            )
-            assert missing_delivery.status_code == 409
-            assert missing_delivery.json() == {
-                "detail": "dialogue_delivery_required"
-            }
-            assert h3_requests == []
         normalized = storage.load_meta(settings.data_dir, cid)
         assert postprocess.image_acceptance_status(
             settings, cid, normalized

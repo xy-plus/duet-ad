@@ -167,9 +167,9 @@ def test_segments_empty_for_short_video(video_10s, tmp_path):
     assert data["scenes"]  # 场景照常输出
 
 
-def test_build_segments_starts_immediately_above_fifteen_seconds():
-    segments = build_segments([(0.0, 15.001)], 15.001)
-    assert segments == [(0.0, 14.0), (14.0, 15.001)]
+def test_build_segments_starts_immediately_above_ten_seconds():
+    segments = build_segments([(0.0, 10.001)], 10.001)
+    assert segments == [(0.0, 9.001), (9.001, 10.001)]
 
 
 def test_missing_manifest_fails(video_10s, tmp_path):
@@ -271,8 +271,9 @@ def test_e2e_manifest_duration_frame_quantized(video_24s, tmp_path):
 def test_build_segments_splits_long_scene_at_provider_safe_boundaries():
     assert build_segments([(0.0, 10.0), (10.0, 32.0)], 32.0) == [
         (0.0, 10.0),
-        (10.0, 24.0),
-        (24.0, 32.0),
+        (10.0, 20.0),
+        (20.0, 30.0),
+        (30.0, 32.0),
     ]
 
 
@@ -446,12 +447,16 @@ def test_unified_planner_splits_more_than_nine_effective_scenes_on_hard_cut():
 
     assert [(segment["start_s"], segment["end_s"]) for segment in segments] == [
         (0.0, 9.0),
-        (9.0, 12.0),
+        (9.0, 10.0),
+        (10.0, 12.0),
     ]
-    assert [segment["join_mode"] for segment in segments] == ["hard_cut", "hard_cut"]
+    assert [segment["join_mode"] for segment in segments] == [
+        "hard_cut", "hard_cut", "hard_cut",
+    ]
     assert [segment["scene_indices"] for segment in segments] == [
         list(range(1, 10)),
-        [10, 11, 12],
+        [10],
+        [11, 12],
     ]
 
 
