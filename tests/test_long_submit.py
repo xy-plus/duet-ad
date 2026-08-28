@@ -69,8 +69,8 @@ def _png(path: Path, value: int, *, width: int = 90, height: int = 160) -> None:
     path.write_bytes(encoded.tobytes())
 
 
-def _make_long(settings, *, joins=("hard_cut",), dialogue_text="源台词",
-               segment_duration=14.000000000000004, duration=None,
+def _make_long(settings, *, joins=("hard_cut", "continue"), dialogue_text="源台词",
+               segment_duration=10.0, duration=None,
                fit_required=False, landscape_first_indices=(),
                landscape_end_indices=(), legacy=False,
                dialogue_classification=None):
@@ -1020,6 +1020,10 @@ def test_fast_explicit_resume_missing_or_corrupt_attempt_becomes_unknown(
     generation["segments"][0].update(
         status="queued", attempt=1, child_request_id=child_id
     )
+    generation["segments"][1].update(
+        status="succeeded", attempt=1, child_request_id="paid-child-2"
+    )
+    plan.segments[1].workdir.joinpath("generated.mp4").write_bytes(b"paid-segment-2")
     storage.update_meta(
         settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
         aspect_ratio="9:16", resolution="768p",
@@ -1073,6 +1077,10 @@ def test_fast_explicit_resume_submits_provably_prepared_child(enabled, monkeypat
     generation["segments"][0].update(
         status="queued", attempt=1, child_request_id=child_id
     )
+    generation["segments"][1].update(
+        status="succeeded", attempt=1, child_request_id="paid-child-2"
+    )
+    plan.segments[1].workdir.joinpath("generated.mp4").write_bytes(b"paid-segment-2")
     storage.update_meta(
         settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
         aspect_ratio="9:16", resolution="768p",
@@ -2566,7 +2574,7 @@ def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkey
     cid, receipt = _make_long(settings)
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
     assert detail["plan_receipt"] == receipt
-    assert detail["segment_count"] == 1
+    assert detail["segment_count"] == 2
     wrong = client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH,
         json=_payload("0" * 64),
@@ -2582,10 +2590,16 @@ def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkey
         f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload(receipt)
     ).status_code == 202
     generation = client.get(f"/api/conversations/{cid}", headers=AUTH).json()["generation"]
-    assert generation["segments"] == [{
-        "index": 1, "chain_id": "chain-001", "join_mode": "hard_cut",
-        "status": "succeeded", "attempt": 1, "error": None,
-    }]
+    assert generation["segments"] == [
+        {
+            "index": 1, "chain_id": "chain-001", "join_mode": "hard_cut",
+            "status": "succeeded", "attempt": 1, "error": None,
+        },
+        {
+            "index": 2, "chain_id": "chain-001", "join_mode": "continue",
+            "status": "succeeded", "attempt": 1, "error": None,
+        },
+    ]
     assert "provider-task-secret" not in str(generation)
 
 
@@ -2621,7 +2635,7 @@ def test_legacy_long_detail_and_submit_derive_fit_from_frozen_h3_anchors(
     assert rejected.status_code == 422
     assert rejected.json() == {"detail": "fit_mode_required"}
     assert accepted.status_code == 202
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert storage.load_meta(settings.data_dir, cid)["fit_required"] is None
 
 
@@ -2901,7 +2915,7 @@ def test_malformed_long_payloads_are_not_misclassified_as_stale_page(
     assert response.json() == {"detail": expected_detail}
 
 
-def test_15_seconds_one_post_and_none_rebuilds_prompt_without_source_dialogue(
+def test_20_seconds_two_posts_and_none_rebuilds_prompt_without_source_dialogue(
     enabled, monkeypatch
 ):
     settings, client = enabled
@@ -2923,15 +2937,18 @@ def test_15_seconds_one_post_and_none_rebuilds_prompt_without_source_dialogue(
         f"/api/conversations/{none_cid}/submit", headers=AUTH,
         json=_payload(none_receipt, request_id="parent-request-456", mode="none"),
     ).status_code == 202
-    assert len(seen) == 2
-    assert "源台词" in seen[0].prompt
-    assert "源台词" not in seen[1].prompt
-    assert "无台词" in seen[1].prompt
-    assert seen[1].prompt.startswith("不要生成背景音乐\n")
+    assert len(seen) == 4
+    assert all("源台词" in request.prompt for request in seen[:2])
+    assert all("源台词" not in request.prompt for request in seen[2:])
+    assert all("无台词" in request.prompt for request in seen[2:])
+    assert all(
+        request.prompt.startswith("不要生成背景音乐\n")
+        for request in seen[2:]
+    )
     assert [call["audio_mode"] for call in stitch_calls] == ["mute", "mute"]
 
 
-def test_30_second_continue_uses_each_segments_reference_frames(enabled, monkeypatch):
+def test_20_second_continue_uses_each_segments_reference_frames(enabled, monkeypatch):
     settings, client = enabled
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
     seen = []
@@ -3242,7 +3259,7 @@ def test_anchor_swap_after_bound_read_cannot_replace_reference_request_bytes(
 
     assert response.status_code == 202
     assert swapped is True
-    assert len(seen) == 1
+    assert len(seen) == 2
     assert seen[0].mode == "reference"
     assert seen[0].first_frame is None and seen[0].last_frame is None
     assert seen[0].keyframes[0] == (keyframe, keyframe_bytes)
@@ -3352,7 +3369,7 @@ def test_stitch_failure_retry_is_local_only(enabled, monkeypatch):
     assert client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload(receipt)
     ).status_code == 202
-    assert len(posts) == 1
+    assert len(posts) == 2
 
 
 def test_stitch_receipt_publish_failure_can_rebuild_over_existing_output_without_h3(
@@ -3390,7 +3407,7 @@ def test_stitch_receipt_publish_failure_can_rebuild_over_existing_output_without
     )
     assert retried.status_code == 202
     assert len(stitch_attempts) == 2
-    assert len(posts) == 1
+    assert len(posts) == 2
     assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
 
 
@@ -3783,6 +3800,10 @@ def test_resume_same_child_does_not_increment_segment_attempt(tmp_path, monkeypa
     )
     generation["status"] = "resume_required"
     generation["segments"][0].update(status="resume_required", attempt=1)
+    generation["segments"][1].update(
+        status="succeeded", attempt=1, child_request_id="paid-child-2"
+    )
+    plan.segments[1].workdir.joinpath("generated.mp4").write_bytes(b"paid-segment-2")
     storage.update_meta(settings.data_dir, cid, fit_mode="none", dialogue_mode="auto",
                         frozen_plan_receipt=receipt, generation=generation)
     monkeypatch.setattr(long_generation.stitch, "stitch_video", _fake_stitch([]))
@@ -4017,7 +4038,7 @@ def test_startup_revalidates_previous_output_invalid_without_new_provider_call(
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, receipt = _make_long(
-        settings, segment_duration=10.84, legacy=True
+        settings, joins=("hard_cut",), segment_duration=10.84, legacy=True
     )
     root = settings.data_dir / cid
     plan = long_generation.freeze_plan(
@@ -4275,7 +4296,9 @@ def test_freeze_preserves_existing_multisegment_receipt_at_h3_limit(
 
 def test_freeze_preserves_existing_single_segment_at_fifteen_seconds(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
-    cid, receipt = _make_long(settings, segment_duration=15.0)
+    cid, receipt = _make_long(
+        settings, joins=("hard_cut",), segment_duration=15.0
+    )
     root = settings.data_dir / cid
 
     frozen = long_generation.freeze_plan(
@@ -4604,7 +4627,10 @@ def test_stitch_retry_with_invalid_segments_requires_new_paid_confirmation(
     settings, client = enabled
     cid, receipt = _make_long(settings)
     root = settings.data_dir / cid
-    (root / "work" / "segments" / "1" / "generated.mp4").write_bytes(b"broken")
+    for index in (1, 2):
+        (root / "work" / "segments" / str(index) / "generated.mp4").write_bytes(
+            b"broken"
+        )
     storage.update_meta(
         settings.data_dir,
         cid,
@@ -4617,15 +4643,26 @@ def test_stitch_retry_with_invalid_segments_requires_new_paid_confirmation(
             "attempt": 1,
             "client_request_id": "parent-request-123",
             "stage": "stitch",
-            "segments": [{
-                "index": 1,
-                "chain_id": "chain-001",
-                "join_mode": "hard_cut",
-                "status": "succeeded",
-                "attempt": 1,
-                "error": None,
-                "child_request_id": "child-1",
-            }],
+            "segments": [
+                {
+                    "index": 1,
+                    "chain_id": "chain-001",
+                    "join_mode": "hard_cut",
+                    "status": "succeeded",
+                    "attempt": 1,
+                    "error": None,
+                    "child_request_id": "child-1",
+                },
+                {
+                    "index": 2,
+                    "chain_id": "chain-001",
+                    "join_mode": "continue",
+                    "status": "succeeded",
+                    "attempt": 1,
+                    "error": None,
+                    "child_request_id": "child-2",
+                },
+            ],
         },
     )
     monkeypatch.setattr(h3, "output_is_reusable", lambda *_a, **_kw: False)
@@ -4923,9 +4960,15 @@ def test_long_invalid_top_output_is_hidden_and_restitched_without_provider(
         settings, cid, plan, "parent-request-123", 1
     )
     generation.update(status="succeeded", stage="stitch")
-    segment = generation["segments"][0]
-    segment.update(status="succeeded", attempt=1, child_request_id="child-1")
-    plan.segments[0].workdir.joinpath("generated.mp4").write_bytes(b"segment")
+    for segment, frozen in zip(generation["segments"], plan.segments):
+        segment.update(
+            status="succeeded",
+            attempt=1,
+            child_request_id=f"child-{segment['index']}",
+        )
+        frozen.workdir.joinpath("generated.mp4").write_bytes(
+            f"segment-{segment['index']}".encode()
+        )
     output = root / "generated.mp4"
     top_receipt = root / long_generation.stitch.RECEIPT_FILENAME
     output.write_bytes(b"valid-top")
