@@ -1,6 +1,61 @@
 from test_web_h3_contract import APP_JS, ROOT, _run_contract
 
 
+def test_create_dialogue_fields_accept_all_modes_and_serialize_canonical_lines():
+    result = _run_contract(
+        "['auto','none'].map(mode=>contract.buildCreateDialogueFields(mode,''))"
+        ".concat(['edit','custom'].map(mode=>contract.buildCreateDialogueFields("
+        "mode,'0 - 1.5 | hello\\n1.5 - 3 | world')))"
+    )
+    assert result == [
+        {"dialogue_mode": "auto"},
+        {"dialogue_mode": "none"},
+        {
+            "dialogue_mode": "edit",
+            "lines": (
+                '[{"start_s":0,"end_s":1.5,"text":"hello"},'
+                '{"start_s":1.5,"end_s":3,"text":"world"}]'
+            ),
+        },
+        {
+            "dialogue_mode": "custom",
+            "lines": (
+                '[{"start_s":0,"end_s":1.5,"text":"hello"},'
+                '{"start_s":1.5,"end_s":3,"text":"world"}]'
+            ),
+        },
+    ]
+
+
+def test_create_dialogue_fields_reject_missing_manual_lines_locally():
+    result = _run_contract(
+        "['edit','custom'].map(mode=>{try{contract.buildCreateDialogueFields(mode,'  ');"
+        "return null}catch(error){return error.message}})"
+    )
+    assert result == [
+        "编辑台词模式请至少填写一行台词",
+        "自定义台词模式请至少填写一行台词",
+    ]
+
+
+def test_create_dialogue_ui_and_formdata_are_bound_before_creation_only():
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    upload_source = source.split("function uploadConversation", 1)[1]
+    upload_source = upload_source.split("async function handleSend", 1)[0]
+    send_source = source.split("async function handleSend", 1)[1]
+    send_source = send_source.split("/* ===== 事件绑定与启动 ===== */", 1)[0]
+
+    assert html.count('name="dialogue-mode"') == 4
+    for mode in ("auto", "none", "edit", "custom"):
+        assert f'name="dialogue-mode" value="{mode}"' in html
+    assert 'id="create-dialogue-lines"' in html
+    assert 'fd.append("dialogue_mode", dialogue.dialogue_mode)' in upload_source
+    assert 'fd.append("lines", dialogue.lines)' in upload_source
+    assert "buildCreateDialogueFields" in send_source
+    assert "buildSubmitPayload" not in send_source
+
+
 def test_long_video_task_count_comes_from_frozen_plan():
     result = _run_contract(
         "["

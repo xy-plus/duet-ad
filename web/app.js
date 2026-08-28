@@ -295,6 +295,23 @@ function parseDialogueLines(text) {
   });
 }
 
+function buildCreateDialogueFields(mode, linesText) {
+  if (!["auto", "none", "edit", "custom"].includes(mode)) {
+    throw new Error("请选择台词模式");
+  }
+  const fields = { dialogue_mode: mode };
+  if (mode === "edit" || mode === "custom") {
+    const lines = parseDialogueLines(linesText);
+    if (lines.length === 0) {
+      throw new Error(mode === "edit"
+        ? "编辑台词模式请至少填写一行台词"
+        : "自定义台词模式请至少填写一行台词");
+    }
+    fields.lines = JSON.stringify(lines);
+  }
+  return fields;
+}
+
 function longVideoContract(detail) {
   const duration = Number(detail && detail.duration_s);
   const segmentCount = Number.isInteger(detail && detail.segment_count)
@@ -2785,12 +2802,26 @@ function voiceMode() {
   return checked ? checked.value : "keep";
 }
 
+function dialogueMode() {
+  const checked = document.querySelector('input[name="dialogue-mode"]:checked');
+  return checked ? checked.value : "auto";
+}
+
 // 口播转换切换：翻译模式才显示语言填空（必填）
 function setVoiceMode() {
   const translate = voiceMode() === "translate";
   $("lang-input").hidden = !translate;
   $("lang-input").required = translate;
   state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
+  setComposerError(null);
+  updateSendBtn();
+}
+
+function setDialogueMode() {
+  const manual = dialogueMode() === "edit" || dialogueMode() === "custom";
+  $("create-dialogue-editor").hidden = !manual;
+  $("create-dialogue-lines").required = manual;
+  state.clientRequestId = newRequestId();
   setComposerError(null);
   updateSendBtn();
 }
@@ -2854,17 +2885,21 @@ function setUploading(on) {
   $("url-input").disabled = on;
   $("file-remove").disabled = on;
   $("lang-input").disabled = on;
+  $("create-dialogue-lines").disabled = on;
   document.querySelectorAll('input[name="source-mode"]').forEach((r) => {
     r.disabled = on;
   });
   document.querySelectorAll('input[name="voice-mode"]').forEach((r) => {
     r.disabled = on;
   });
+  document.querySelectorAll('input[name="dialogue-mode"]').forEach((r) => {
+    r.disabled = on;
+  });
   updateSendBtn();
   if (!on) $("upload-progress").hidden = true;
 }
 
-function uploadConversation({ file, url, note, requestId, voiceMode: mode, targetLanguage }, onProgress) {
+function uploadConversation({ file, url, note, requestId, voiceMode: mode, targetLanguage, dialogue }, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/conversations");
@@ -2903,6 +2938,8 @@ function uploadConversation({ file, url, note, requestId, voiceMode: mode, targe
     if (requestId) fd.append("client_request_id", requestId);
     fd.append("voice_mode", mode || "keep");
     if (mode === "translate" && targetLanguage) fd.append("target_language", targetLanguage);
+    fd.append("dialogue_mode", dialogue.dialogue_mode);
+    if (dialogue.lines) fd.append("lines", dialogue.lines);
     xhr.send(fd);
   });
 }
@@ -2917,12 +2954,22 @@ async function handleSend(event) {
   const note = $("note-input").value.trim();
   const vMode = voiceMode();
   const targetLanguage = $("lang-input").value.trim();
+  let dialogue;
   if (!file && !url) {
     setComposerError(mode === "upload" ? "请先选择视频文件" : "请先粘贴视频链接");
     return;
   }
   if (vMode === "translate" && !targetLanguage) {
     setComposerError("请填写翻译目标语言");
+    return;
+  }
+  try {
+    dialogue = buildCreateDialogueFields(dialogueMode(), $("create-dialogue-lines").value);
+  } catch (err) {
+    setComposerError(err.message);
+    if (dialogueMode() === "edit" || dialogueMode() === "custom") {
+      $("create-dialogue-lines").focus();
+    }
     return;
   }
 
@@ -2938,7 +2985,10 @@ async function handleSend(event) {
 
   try {
     const created = await uploadConversation(
-      { file, url, note, requestId: state.clientRequestId, voiceMode: vMode, targetLanguage },
+      {
+        file, url, note, requestId: state.clientRequestId,
+        voiceMode: vMode, targetLanguage, dialogue,
+      },
       (ratio) => {
         if (url) return;
         const pct = Math.round(ratio * 100);
@@ -2956,6 +3006,11 @@ async function handleSend(event) {
     $("lang-input").value = "";
     $("lang-input").hidden = true;
     $("lang-input").required = false;
+    const autoDialogue = document.querySelector('input[name="dialogue-mode"][value="auto"]');
+    autoDialogue.checked = true;
+    $("create-dialogue-lines").value = "";
+    $("create-dialogue-lines").required = false;
+    $("create-dialogue-editor").hidden = true;
     setUploading(false);
     await refreshList(false);
     if (created && created.id) {
@@ -3025,6 +3080,13 @@ function bindEvents() {
   document.querySelectorAll('input[name="voice-mode"]').forEach((radio) => {
     radio.addEventListener("change", setVoiceMode);
   });
+  document.querySelectorAll('input[name="dialogue-mode"]').forEach((radio) => {
+    radio.addEventListener("change", setDialogueMode);
+  });
+  $("create-dialogue-lines").addEventListener("input", () => {
+    state.clientRequestId = newRequestId();
+    setComposerError(null);
+  });
   $("lang-input").addEventListener("input", () => {
     state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
     setComposerError(null);
@@ -3076,6 +3138,7 @@ function boot() {
   state.clientRequestId = newRequestId();
   bindEvents();
   setSourceMode(sourceMode());
+  setDialogueMode();
   const saved = localStorage.getItem(TOKEN_KEY);
   if (saved) {
     state.token = saved;
@@ -3088,6 +3151,7 @@ function boot() {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildLongRetryPayload,
+    buildCreateDialogueFields,
     buildImagePromptPatch,
     buildStitchRetryPayload,
     buildResumePayload,

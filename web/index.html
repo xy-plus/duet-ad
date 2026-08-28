@@ -109,6 +109,31 @@
             <label class="sr-only" for="lang-input">翻译目标语言</label>
             <input id="lang-input" class="lang-input" type="text" placeholder="目标语言，如：日语" autocomplete="off" hidden>
           </div>
+          <div class="voice-row" role="radiogroup" aria-label="台词模式">
+            <span class="voice-label">台词模式</span>
+            <label class="voice-option">
+              <input type="radio" name="dialogue-mode" value="auto" checked>
+              <span>自动识别</span>
+            </label>
+            <label class="voice-option">
+              <input type="radio" name="dialogue-mode" value="none">
+              <span>无台词</span>
+            </label>
+            <label class="voice-option">
+              <input type="radio" name="dialogue-mode" value="edit">
+              <span>编辑台词</span>
+            </label>
+            <label class="voice-option">
+              <input type="radio" name="dialogue-mode" value="custom">
+              <span>自定义台词</span>
+            </label>
+          </div>
+          <div id="create-dialogue-editor" class="dialogue-editor" hidden>
+            <label class="sr-only" for="create-dialogue-lines">台词，每行格式为开始 - 结束 | 文本</label>
+            <textarea id="create-dialogue-lines" class="dialogue-textarea" rows="5"
+                      placeholder="0 - 1.5 | 第一行台词&#10;1.5 - 3 | 第二行台词"></textarea>
+            <p class="final-help">每行格式：开始秒 - 结束秒 | 台词。</p>
+          </div>
           <p id="file-hint" class="file-hint" hidden>最长 300 秒 · 最大 500MB · MP4/MOV/WebM；超过 15 秒会拆分为单次不超过 14 秒的视频生成子任务</p>
           <div class="composer-row note-row">
             <button type="button" id="attach-btn" class="icon-btn" aria-label="选择视频文件" hidden>
