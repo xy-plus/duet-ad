@@ -48,7 +48,9 @@ _T = TypeVar("_T")
 
 # 隔离任务仍经由公开 run() 进入同一并发/超时/env 清洗路径；ContextVar 只把本次同步调用
 # 标为独立 stage，使 build_argv() 加上外层 bwrap。线程间不共享，普通视觉 run() 不会误继承。
-_ACTIVE_ISOLATED_STAGE: ContextVar[tuple[int, Path, Path] | None] = ContextVar(
+_ACTIVE_ISOLATED_STAGE: ContextVar[
+    tuple[int, Path, Path, tuple[Path, ...]] | None
+] = ContextVar(
     "active_isolated_stage", default=None
 )
 
@@ -99,7 +101,36 @@ def _resolve_bwrap() -> Path:
     return resolved
 
 
-def _isolated_outer_argv(stage: Path, session_dir: Path, inner_argv: list[str]) -> list[str]:
+def _isolated_writable_paths(
+    stage: Path, writable_paths: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    resolved_paths: list[Path] = []
+    for raw in writable_paths:
+        requested = Path(raw)
+        try:
+            resolved = requested.resolve(strict=True)
+            resolved.relative_to(stage)
+        except (OSError, ValueError):
+            raise CodexError("isolated writable path is invalid") from None
+        if (
+            not requested.is_absolute()
+            or requested != resolved
+            or requested.is_symlink()
+            or not resolved.is_file()
+            or resolved in resolved_paths
+        ):
+            raise CodexError("isolated writable path is invalid")
+        resolved_paths.append(resolved)
+    return tuple(resolved_paths)
+
+
+def _isolated_outer_argv(
+    stage: Path,
+    session_dir: Path,
+    inner_argv: list[str],
+    *,
+    writable_paths: tuple[Path, ...] = (),
+) -> list[str]:
     """构造单次任务外层挂载沙箱；任一路径异常都拒绝运行。"""
     try:
         tmp_root = Path("/tmp").resolve(strict=True)
@@ -116,6 +147,7 @@ def _isolated_outer_argv(stage: Path, session_dir: Path, inner_argv: list[str]) 
         raise CodexError("isolated stage must be outside the source session")
     if not inner_argv:
         raise CodexError("isolated inner command is empty")
+    writable = _isolated_writable_paths(stage, writable_paths)
 
     argv = [
         str(_resolve_bwrap()),
@@ -128,12 +160,14 @@ def _isolated_outer_argv(stage: Path, session_dir: Path, inner_argv: list[str]) 
     # 才需额外遮住会话叶目录。避免在 tmpfs 父挂载后再引用已经消失的子挂载点。
     if not _is_relative_to(session_dir, checkout) and not _is_relative_to(session_dir, tmp_root):
         argv += ["--tmpfs", str(session_dir)]
-    argv += [
-        "--tmpfs", str(tmp_root),
-        "--bind", str(stage), str(stage),
-        "--chdir", str(stage),
-        *inner_argv,
-    ]
+    argv += ["--tmpfs", str(tmp_root)]
+    if writable:
+        argv += ["--ro-bind", str(stage), str(stage)]
+        for path in writable:
+            argv += ["--bind", str(path), str(path)]
+    else:
+        argv += ["--bind", str(stage), str(stage)]
+    argv += ["--chdir", str(stage), *inner_argv]
     return argv
 
 
@@ -180,9 +214,9 @@ class CodexRunner:
 
     def build_argv(self, workdir: Path, prompt: str) -> list[str]:
         active = _ACTIVE_ISOLATED_STAGE.get()
-        isolated_stage: tuple[Path, Path] | None = None
+        isolated_stage: tuple[Path, Path, tuple[Path, ...]] | None = None
         if active is not None and active[0] == id(self):
-            isolated_stage = (active[1], active[2])
+            isolated_stage = (active[1], active[2], active[3])
             try:
                 actual = Path(workdir).resolve(strict=True)
             except OSError:
@@ -207,7 +241,12 @@ class CodexRunner:
         argv.append(prompt)
         if isolated_stage is None:
             return argv
-        return _isolated_outer_argv(isolated_stage[0], isolated_stage[1], argv)
+        return _isolated_outer_argv(
+            isolated_stage[0],
+            isolated_stage[1],
+            argv,
+            writable_paths=isolated_stage[2],
+        )
 
     def run(self, workdir: Path, prompt: str) -> None:
         argv = self.build_argv(workdir, prompt)
@@ -232,7 +271,14 @@ class CodexRunner:
                 retryable=True,
             )
 
-    def run_isolated(self, workdir: Path, prompt: str, *, session_dir: Path) -> None:
+    def run_isolated(
+        self,
+        workdir: Path,
+        prompt: str,
+        *,
+        session_dir: Path,
+        writable_paths: tuple[Path, ...] = (),
+    ) -> None:
         """Run Codex in a prebuilt, single-use /tmp stage hidden from the source session."""
         _resolve_bwrap()
         try:
@@ -245,7 +291,8 @@ class CodexRunner:
             raise CodexError("isolated stage must be a direct child of /tmp")
         if not session.is_dir():
             raise CodexError("isolated session path is invalid")
-        token = _ACTIVE_ISOLATED_STAGE.set((id(self), stage, session))
+        writable = _isolated_writable_paths(stage, writable_paths)
+        token = _ACTIVE_ISOLATED_STAGE.set((id(self), stage, session, writable))
         try:
             self.run(stage, prompt)
         finally:

@@ -287,6 +287,63 @@ def test_source_scene_cut_is_frozen_on_the_first_post_cut_keyframe(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("source_times", "cut_at_s"),
+    [
+        ([0.0, 0.75, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0], 14.25),
+        ([0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0], 0.25),
+    ],
+    ids=("trailing-cut-14.25", "leading-cut-0.25"),
+)
+def test_source_timeline_rejects_any_scene_without_selected_anchor(
+    tmp_path, source_times, cut_at_s,
+):
+    work = tmp_path / "work"
+    segwork = work / "segments" / "1" / "work"
+    raw_dir = segwork / "frames"
+    selected_dir = segwork / "keyframes"
+    raw_dir.mkdir(parents=True)
+    selected_dir.mkdir()
+    manifest_frames = []
+    names = []
+    for order, source_time_s in enumerate(source_times, 1):
+        data = f"source-frame-{order}".encode()
+        raw_name = f"frames/{order:03d}.png"
+        (segwork / raw_name).write_bytes(data)
+        selected_name = f"{order:02d}.png"
+        (selected_dir / selected_name).write_bytes(data)
+        manifest_frames.append({
+            "index": order,
+            "time_seconds": source_time_s,
+            "file": raw_name,
+        })
+        names.append(selected_name)
+    (segwork / "manifest.json").write_text(
+        json.dumps({"frames": manifest_frames}), encoding="utf-8",
+    )
+    segment = {
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 14.5,
+        "chain_id": "chain-001",
+        "join_mode": "hard_cut",
+    }
+
+    with pytest.raises(
+        pipeline.PipelineError,
+        match="keyframe source timeline misses scene anchor",
+    ):
+        pipeline._bind_keyframe_source_timeline(
+            work,
+            [segment],
+            [{**segment, "keyframes": names}],
+            [
+                {"index": 1, "start_s": 0.0, "end_s": cut_at_s},
+                {"index": 2, "start_s": cut_at_s, "end_s": 14.5},
+            ],
+        )
+
+
 def test_two_generation_segments_without_source_cut_remain_continuous(
     tmp_path,
 ):
@@ -1376,6 +1433,131 @@ class TestCodexRunner:
 
             assert proc.returncode == 0, proc.stderr
             assert (stage / "work" / "voice_lines.json").read_text() == "[]"
+
+    def test_real_readonly_stage_allows_only_exact_output_file(self, tmp_path):
+        """真实 bwrap 权限探针：冻结输入不可写，唯一声明输出可写。"""
+        if not shutil.which("bwrap"):
+            pytest.skip("bwrap unavailable")
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        with tempfile.TemporaryDirectory(
+            prefix="duet-fusion-permission-probe-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            image = work / "selected" / "01.png"
+            image.parent.mkdir(parents=True)
+            skill = stage / "SKILL.md"
+            descriptor = work / "multimodal_input.json"
+            output = work / "h3_prompt_plan.json"
+            skill.write_text("frozen-skill", encoding="utf-8")
+            descriptor.write_text("frozen-input", encoding="utf-8")
+            image.write_bytes(b"frozen-png")
+            output.touch(mode=0o600)
+            script = (
+                "for target in SKILL.md work/multimodal_input.json "
+                "work/selected/01.png; do "
+                "if printf tampered > \"$target\" 2>/dev/null; then exit 41; fi; "
+                "done; "
+                "printf generated > work/h3_prompt_plan.json"
+            )
+            argv = codex_runner._isolated_outer_argv(
+                stage,
+                cdir,
+                ["/usr/bin/bash", "-c", script],
+                writable_paths=(output,),
+            )
+
+            assert any(
+                argv[index:index + 3]
+                == ["--ro-bind", str(stage), str(stage)]
+                for index in range(len(argv) - 2)
+            )
+            assert any(
+                argv[index:index + 3]
+                == ["--bind", str(output), str(output)]
+                for index in range(len(argv) - 2)
+            )
+            assert not any(
+                argv[index:index + 3] == ["--bind", str(stage), str(stage)]
+                for index in range(len(argv) - 2)
+            )
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=20,
+            )
+
+            assert proc.returncode == 0, proc.stderr
+            assert skill.read_text(encoding="utf-8") == "frozen-skill"
+            assert descriptor.read_text(encoding="utf-8") == "frozen-input"
+            assert image.read_bytes() == b"frozen-png"
+            assert output.read_text(encoding="utf-8") == "generated"
+
+    def test_run_isolated_threads_exact_writable_file_into_bwrap_argv(
+        self, captured_codex, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        with tempfile.TemporaryDirectory(
+            prefix="duet-fusion-argv-probe-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            work.mkdir()
+            output = work / "h3_prompt_plan.json"
+            output.touch(mode=0o600)
+
+            CodexRunner(timeout_s=3, concurrency=1).run_isolated(
+                stage,
+                "fusion prompt",
+                session_dir=cdir,
+                writable_paths=(output,),
+            )
+
+        (call,) = captured_codex
+        argv = call["argv"]
+        assert any(
+            argv[index:index + 3] == ["--ro-bind", str(stage), str(stage)]
+            for index in range(len(argv) - 2)
+        )
+        assert any(
+            argv[index:index + 3] == ["--bind", str(output), str(output)]
+            for index in range(len(argv) - 2)
+        )
+        assert argv[argv.index("-C") + 1] == str(stage)
+
+    def test_readonly_isolated_fails_closed_on_namespace_error(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        monkeypatch.setattr(
+            codex_runner.subprocess,
+            "run",
+            lambda argv, **_kwargs: subprocess.CompletedProcess(
+                argv, 1, "", "bwrap: Creating new namespace failed"
+            ),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="duet-fusion-namespace-probe-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            work.mkdir()
+            output = work / "h3_prompt_plan.json"
+            output.touch(mode=0o600)
+
+            with pytest.raises(CodexError, match="namespace failed"):
+                CodexRunner(timeout_s=3, concurrency=1).run_isolated(
+                    stage,
+                    "fusion prompt",
+                    session_dir=cdir,
+                    writable_paths=(output,),
+                )
+
+            assert output.read_bytes() == b""
 
 
 # ---------- 流水线编排（状态机） ----------

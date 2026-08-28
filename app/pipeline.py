@@ -1387,6 +1387,12 @@ def _bind_keyframe_source_timeline(
             resolved.append((expected_index, order, source_time_s, scene))
         updated.append(dict(meta))
 
+    if (
+        {scene["id"] for _segment, _order, _time, scene in resolved}
+        != {scene["id"] for scene in scenes}
+    ):
+        raise PipelineError("keyframe source timeline misses scene anchor")
+
     previous: tuple[int, int, float, dict] | None = None
     per_segment: dict[int, list[dict]] = {item["index"]: [] for item in segments}
     for segment_index, order, source_time_s, scene in resolved:
@@ -2365,6 +2371,8 @@ def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
             stage_work.mkdir(mode=0o700)
             (stage / "SKILL.md").write_bytes(skill_data)
             (stage_work / h3_project.SKILL_INPUT_FILENAME).write_bytes(input_data)
+            stage_output = stage_work / "h3_prompt_plan.json"
+            stage_output.touch(mode=0o600, exist_ok=False)
             for segment in input_payload["segments"]:
                 for frame in segment["new_keyframes"]:
                     _copy_prompt_fusion_frame(
@@ -2375,9 +2383,10 @@ def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
                 "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json "
                 "及其中 SHA 绑定的有序图片，只写 work/h3_prompt_plan.json。",
                 session_dir=root,
+                writable_paths=(stage_output,),
             )
             raw_output_data = _read_prompt_fusion_stage_output(
-                stage_work / "h3_prompt_plan.json",
+                stage_output,
                 segment_count=len(input_payload["segments"]),
             )
         _atomic_bytes(output_path, raw_output_data)

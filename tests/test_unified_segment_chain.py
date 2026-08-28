@@ -940,16 +940,21 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
 
         def run_isolated(
             self, cwd: Path, prompt: str, *, session_dir: Path,
+            writable_paths: tuple[Path, ...],
         ) -> None:
             calls.append(session_dir)
             assert session_dir == root
             assert cwd != root
             assert "multimodal_input.json" in prompt
+            output_path = cwd / "work" / "h3_prompt_plan.json"
+            assert writable_paths == (output_path,)
+            assert output_path.read_bytes() == b""
             frozen_input = (cwd / "work" / "multimodal_input.json").read_bytes()
             payload = json.loads(frozen_input.decode("utf-8"))
             expected_files = {
                 "SKILL.md",
                 "work/multimodal_input.json",
+                "work/h3_prompt_plan.json",
                 *(
                     frame["path"]
                     for segment in payload["segments"]
@@ -972,9 +977,7 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
                     ),
                 } for item in payload["segments"]],
             }
-            (cwd / "work" / "h3_prompt_plan.json").write_bytes(
-                _canonical(output)
-            )
+            output_path.write_bytes(_canonical(output))
 
     if segment_count == 1:
         legacy = json.loads(input_data)
@@ -1296,8 +1299,12 @@ def test_producer_failure_binds_raw_sha_and_rejects_schema_valid_replacement(
     class Runner:
         def run_isolated(
             self, cwd: Path, _prompt: str, *, session_dir: Path,
+            writable_paths: tuple[Path, ...],
         ) -> None:
             assert session_dir == root
+            assert writable_paths == (
+                cwd / "work" / "h3_prompt_plan.json",
+            )
             (cwd / "work" / "h3_prompt_plan.json").write_bytes(_canonical({
                 "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
                 "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
@@ -1370,8 +1377,12 @@ def test_new_producer_rejects_current_skill_source_drift(
     class Runner:
         def run_isolated(
             self, cwd: Path, _prompt: str, *, session_dir: Path,
+            writable_paths: tuple[Path, ...],
         ) -> None:
             assert session_dir == root
+            assert writable_paths == (
+                cwd / "work" / "h3_prompt_plan.json",
+            )
             skill_path.write_text("drifted prompt fusion Skill", encoding="utf-8")
             segment = json.loads(input_data)["segments"][0]
             (cwd / "work" / "h3_prompt_plan.json").write_bytes(_canonical({
