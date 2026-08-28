@@ -7,6 +7,8 @@ import json
 import math
 import os
 import subprocess
+import sys
+import tempfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1122,6 +1124,277 @@ def plan_receipt(root: Path, meta: Mapping) -> str | None:
         return None
 
 
+def _derive_normalized_n1_keyframe_sources(
+    *,
+    authority_work: Path,
+    root: Path,
+    source: Path,
+    source_data: bytes,
+    originals: list[Path],
+    private: Mapping,
+    duration: float,
+) -> list[dict]:
+    """Bind legacy root selections to measured source time and scene facts."""
+    manifest_path = authority_work / "manifest.json"
+    scenes_path = authority_work / "scenes.json"
+    if manifest_path.is_symlink() or scenes_path.is_symlink():
+        raise LongGenerationError("long_video_plan_invalid")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        scene_authority = json.loads(scenes_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    manifest_frames = manifest.get("frames") if isinstance(manifest, Mapping) else None
+    raw_scenes = (
+        scene_authority.get("scenes")
+        if isinstance(scene_authority, Mapping) else None
+    )
+    try:
+        manifest_source = Path(manifest["source"]).resolve()
+        manifest_size = manifest["file_size_bytes"]
+        manifest_duration = float(manifest["duration_seconds"])
+        scene_duration = float(scene_authority["duration_s"])
+    except (KeyError, TypeError, ValueError, OSError):
+        raise LongGenerationError("long_video_plan_invalid") from None
+    if (
+        manifest_source != source
+        or isinstance(manifest_size, bool)
+        or not isinstance(manifest_size, int)
+        or manifest_size != len(source_data)
+        or not math.isfinite(manifest_duration)
+        or not math.isfinite(scene_duration)
+        or abs(manifest_duration - duration) > _EPS
+        or abs(scene_duration - duration) > 0.001 + _EPS
+        or not isinstance(manifest_frames, list)
+        or not manifest_frames
+        or not isinstance(raw_scenes, list)
+        or not raw_scenes
+    ):
+        raise LongGenerationError("long_video_plan_invalid")
+
+    work_root = authority_work.resolve()
+    candidates: list[dict] = []
+    candidate_names: set[str] = set()
+    previous_time = -1.0
+    for position, raw in enumerate(manifest_frames, 1):
+        if not isinstance(raw, Mapping):
+            raise LongGenerationError("long_video_plan_invalid")
+        try:
+            name = raw["file"]
+            time_s = round(
+                float(raw["time_seconds"]), long_video.BOUNDARY_PRECISION
+            )
+        except (KeyError, TypeError, ValueError):
+            raise LongGenerationError("long_video_plan_invalid") from None
+        if (
+            raw.get("index") != position
+            or not isinstance(name, str)
+            or not name
+            or name in candidate_names
+            or not math.isfinite(time_s)
+            or time_s < 0
+            or time_s > duration + _EPS
+            or time_s <= previous_time
+        ):
+            raise LongGenerationError("long_video_plan_invalid")
+        candidate = (authority_work / name)
+        if candidate.is_symlink():
+            raise LongGenerationError("long_video_plan_invalid")
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(work_root)
+            data = resolved.read_bytes()
+        except (OSError, ValueError):
+            raise LongGenerationError("long_video_plan_invalid") from None
+        if not data:
+            raise LongGenerationError("long_video_plan_invalid")
+        candidates.append({
+            "name": name,
+            "time_s": time_s,
+            "sha256": hashlib.sha256(data).hexdigest(),
+        })
+        candidate_names.add(name)
+        previous_time = time_s
+
+    scenes: list[dict] = []
+    prior_end = 0.0
+    classified_names: set[str] = set()
+    for position, raw in enumerate(raw_scenes, 1):
+        if not isinstance(raw, Mapping):
+            raise LongGenerationError("long_video_plan_invalid")
+        try:
+            start_s = round(
+                float(raw["start_s"]), long_video.BOUNDARY_PRECISION
+            )
+            end_s = round(float(raw["end_s"]), long_video.BOUNDARY_PRECISION)
+        except (KeyError, TypeError, ValueError):
+            raise LongGenerationError("long_video_plan_invalid") from None
+        names = raw.get("frames")
+        if (
+            raw.get("index") != position
+            or not math.isfinite(start_s)
+            or not math.isfinite(end_s)
+            or start_s >= end_s
+            or abs(start_s - prior_end) > 0.001 + _EPS
+            or not isinstance(names, list)
+            or not all(isinstance(name, str) for name in names)
+            or len(set(names)) != len(names)
+            or classified_names.intersection(names)
+            or any(name not in candidate_names for name in names)
+        ):
+            raise LongGenerationError("long_video_plan_invalid")
+        scene = {
+            "id": f"SCENE_{position:02d}",
+            "start_s": start_s,
+            "end_s": end_s,
+            "frames": set(names),
+        }
+        for candidate in candidates:
+            if candidate["name"] in scene["frames"] and not (
+                start_s <= candidate["time_s"] < end_s
+                or (
+                    position == len(raw_scenes)
+                    and abs(candidate["time_s"] - end_s) <= 0.001 + _EPS
+                )
+            ):
+                raise LongGenerationError("long_video_plan_invalid")
+        scenes.append(scene)
+        classified_names.update(names)
+        prior_end = end_s
+    if (
+        abs(prior_end - duration) > 0.001 + _EPS
+        or classified_names != candidate_names
+    ):
+        raise LongGenerationError("long_video_plan_invalid")
+
+    receipt_frames = private.get("frames")
+    if not isinstance(receipt_frames, list) or len(receipt_frames) != len(originals):
+        raise LongGenerationError("postprocess_receipt_invalid")
+    selected: list[dict] = []
+    used_candidates: set[int] = set()
+    selected_time = -1.0
+    for order, (path, frozen) in enumerate(zip(originals, receipt_frames), 1):
+        if not isinstance(frozen, Mapping) or path.is_symlink():
+            raise LongGenerationError("postprocess_receipt_invalid")
+        try:
+            selected_data = path.read_bytes()
+            selected_relative = path.resolve().relative_to(root / "work").as_posix()
+        except (OSError, ValueError):
+            raise LongGenerationError("postprocess_receipt_invalid") from None
+        selected_sha256 = hashlib.sha256(selected_data).hexdigest()
+        if (
+            not selected_data
+            or frozen.get("segment_index") != 0
+            or frozen.get("frame_name") != path.name
+            or frozen.get("source_sha256") != selected_sha256
+        ):
+            raise LongGenerationError("postprocess_receipt_invalid")
+        exact = [
+            index for index, candidate in enumerate(candidates)
+            if index not in used_candidates
+            and candidate["sha256"] == selected_sha256
+            and candidate["time_s"] > selected_time
+            and candidate["name"] in {selected_relative, path.name}
+        ]
+        matches = exact or [
+            index for index, candidate in enumerate(candidates)
+            if index not in used_candidates
+            and candidate["sha256"] == selected_sha256
+            and candidate["time_s"] > selected_time
+        ]
+        if not matches:
+            raise LongGenerationError("postprocess_artifacts_invalid")
+        candidate_index = matches[0]
+        candidate = candidates[candidate_index]
+        scene_matches = [
+            scene for scene in scenes if candidate["name"] in scene["frames"]
+        ]
+        if len(scene_matches) != 1:
+            raise LongGenerationError("long_video_plan_invalid")
+        scene = scene_matches[0]
+        transition = (
+            {"type": "start", "at_s": candidate["time_s"]}
+            if not selected else (
+                {
+                    "type": "hard_cut",
+                    "at_s": scene["start_s"],
+                }
+                if scene["id"] != selected[-1]["source_scene_id"]
+                else {"type": "continuous", "at_s": None}
+            )
+        )
+        selected.append({
+            "order": order,
+            "source_time_s": candidate["time_s"],
+            "source_scene_id": scene["id"],
+            "transition": transition,
+        })
+        used_candidates.add(candidate_index)
+        selected_time = candidate["time_s"]
+    try:
+        frozen, _last = long_video.freeze_keyframe_sources(
+            selected, expected_count=9
+        )
+    except long_video.LongVideoError:
+        raise LongGenerationError("long_video_plan_invalid") from None
+    return frozen
+
+
+def _regenerate_normalized_n1_keyframe_sources(
+    *,
+    root: Path,
+    source: Path,
+    source_data: bytes,
+    originals: list[Path],
+    private: Mapping,
+    duration: float,
+) -> list[dict]:
+    """Rebuild missing/stale root authority from the exact uploaded source."""
+    repository = Path(__file__).resolve().parents[1]
+    extract_script = repository / "skills" / "video-maker" / "scripts" / (
+        "extract_keyframes.py"
+    )
+    scenes_script = repository / "app" / "scenes.py"
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="duet-n1-timeline-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            subprocess.run(
+                [
+                    sys.executable, str(extract_script), str(source),
+                    "--out-dir", str(stage), "--fps", "4",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            subprocess.run(
+                [
+                    sys.executable, str(scenes_script), str(source),
+                    "--work-dir", str(stage),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            return _derive_normalized_n1_keyframe_sources(
+                authority_work=stage,
+                root=root,
+                source=source,
+                source_data=source_data,
+                originals=originals,
+                private=private,
+                duration=duration,
+            )
+    except (
+        OSError, subprocess.SubprocessError, LongGenerationError,
+    ):
+        raise LongGenerationError("long_video_plan_invalid") from None
+
+
 def normalize_single_segment_project(
     settings: Settings, cid: str, meta: Mapping,
 ) -> dict:
@@ -1172,6 +1445,25 @@ def normalize_single_segment_project(
         raise LongGenerationError("long_video_plan_invalid") from None
     if not source_data:
         raise LongGenerationError("long_video_plan_invalid")
+    try:
+        keyframe_sources = _derive_normalized_n1_keyframe_sources(
+            authority_work=root / "work",
+            root=root,
+            source=sources[0].resolve(),
+            source_data=source_data,
+            originals=originals,
+            private=private,
+            duration=duration,
+        )
+    except LongGenerationError:
+        keyframe_sources = _regenerate_normalized_n1_keyframe_sources(
+            root=root,
+            source=sources[0].resolve(),
+            source_data=source_data,
+            originals=originals,
+            private=private,
+            duration=duration,
+        )
     _atomic_bytes(segment_dir / "source.mp4", source_data)
     segment_work.mkdir(parents=True, exist_ok=True)
     visual_path = root / "work" / "visual_prompt.txt"
@@ -1218,6 +1510,7 @@ def normalize_single_segment_project(
             path.resolve().relative_to(root / "work").as_posix()
             for path in originals
         ],
+        "keyframe_sources": keyframe_sources,
         "first_frame_path": originals[0].resolve().relative_to(
             root / "work"
         ).as_posix(),

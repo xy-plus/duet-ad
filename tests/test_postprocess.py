@@ -221,6 +221,42 @@ def _completed_v4_project(
     return cid, cdir, frames
 
 
+def _write_root_timeline_authority(
+    cdir, originals, *, duration_s, authority_work=None,
+):
+    authority_work = authority_work or cdir / "work"
+    times = [round(1.5 * index, 3) for index in range(9)]
+    samples = []
+    for index, (source, time_s) in enumerate(zip(originals, times), 1):
+        name = f"source-frame-{index:02d}.png"
+        (authority_work / name).write_bytes(source.read_bytes())
+        samples.append({"index": index, "time_seconds": time_s, "file": name})
+    source = cdir / "source.mp4"
+    (authority_work / "manifest.json").write_text(json.dumps({
+        "source": str(source),
+        "file_size_bytes": source.stat().st_size,
+        "duration_seconds": duration_s,
+        "frames": samples,
+    }), encoding="utf-8")
+    split = 7.0
+    (authority_work / "scenes.json").write_text(json.dumps({
+        "duration_s": duration_s,
+        "scenes": [
+            {
+                "index": 1, "start_s": 0.0, "end_s": split,
+                "frames": [item["file"] for item in samples
+                           if item["time_seconds"] < split],
+            },
+            {
+                "index": 2, "start_s": split, "end_s": duration_s,
+                "frames": [item["file"] for item in samples
+                           if item["time_seconds"] >= split],
+            },
+        ],
+        "segments": [],
+    }), encoding="utf-8")
+
+
 def test_normalized_n1_detail_projects_root_media_and_all_frame_prompts(
     tmp_path, monkeypatch,
 ):
@@ -232,6 +268,7 @@ def test_normalized_n1_detail_projects_root_media_and_all_frame_prompts(
     (cdir / "work" / "visual_prompt.txt").write_text(
         "冻结的旧视频提示词", encoding="utf-8"
     )
+    _write_root_timeline_authority(cdir, originals, duration_s=14.5)
     storage.update_meta(
         settings.data_dir,
         cid,
@@ -252,6 +289,22 @@ def test_normalized_n1_detail_projects_root_media_and_all_frame_prompts(
     assert normalized["segments"][0]["keyframe_paths"] == [
         f"keyframes/{path.name}" for path in originals
     ]
+    keyframe_sources = normalized["segments"][0]["keyframe_sources"]
+    assert len(keyframe_sources) == 9
+    assert [item["source_time_s"] for item in keyframe_sources] == [
+        round(1.5 * index, 3) for index in range(9)
+    ]
+    assert keyframe_sources[0]["transition"] == {
+        "type": "start", "at_s": 0.0,
+    }
+    assert keyframe_sources[5]["transition"] == {
+        "type": "hard_cut", "at_s": 7.0,
+    }
+    receipt = json.loads(
+        (cdir / long_video.PLAN_RECEIPT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert receipt["version"] == long_video.VISUAL_PLAN_RECEIPT_VERSION
+    assert receipt["segments"][0]["keyframe_sources"] == keyframe_sources
 
     private_frames = normalized["_image_optimization"]["frames"]
     assert {item["segment_index"] for item in private_frames} == {0}
@@ -292,6 +345,53 @@ def test_normalized_n1_detail_projects_root_media_and_all_frame_prompts(
         "sha256": item["sha256"],
     } for item in private_frames]
     assert "_image_optimization" not in json.dumps(detail)
+
+
+def test_normalized_n1_rebuilds_missing_root_timeline_authority(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid, cdir, originals = _completed_v4_project(
+        settings, monkeypatch, frame_count=9,
+    )
+    (cdir / "source.mp4").write_bytes(b"source-video")
+    (cdir / "work" / "visual_prompt.txt").write_text(
+        "冻结的旧视频提示词", encoding="utf-8"
+    )
+    storage.update_meta(
+        settings.data_dir, cid, duration_s=14.5, voice_line_provenance=[],
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+    acceptance = postprocess.image_acceptance_status(settings, cid, meta)
+    postprocess.accept_images(settings, cid, {
+        "confirm": True,
+        "expected_meta_sha256": acceptance["expected_meta_sha256"],
+    })
+    calls = []
+
+    def rebuild(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        if str(argv[1]).endswith("extract_keyframes.py"):
+            authority_work = Path(argv[argv.index("--out-dir") + 1])
+            _write_root_timeline_authority(
+                cdir, originals, duration_s=14.5,
+                authority_work=authority_work,
+            )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(long_generation.subprocess, "run", rebuild)
+    normalized = long_generation.normalize_single_segment_project(
+        settings, cid, storage.load_meta(settings.data_dir, cid),
+    )
+
+    assert [Path(call[0][1]).name for call in calls] == [
+        "extract_keyframes.py", "scenes.py",
+    ]
+    assert len(normalized["segments"][0]["keyframe_sources"]) == 9
+    receipt = json.loads(
+        (cdir / long_video.PLAN_RECEIPT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert receipt["version"] == long_video.VISUAL_PLAN_RECEIPT_VERSION
 
 
 def test_n2_frame_prompt_projection_is_exact_and_fails_closed_on_index_drift(
@@ -389,6 +489,8 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         segment_total=segment_count,
     )
     (cdir / "source.mp4").write_bytes(b"source-video")
+    if segment_count == 1 and not frozen_single_segment:
+        _write_root_timeline_authority(cdir, originals, duration_s=14.5)
     old_visual_prompt = "九张已验收图片中的人物保持静默，歌声来自画外。"
     (cdir / "work" / "visual_prompt.txt").write_text(
         old_visual_prompt, encoding="utf-8"
@@ -483,6 +585,19 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                     path.relative_to(cdir / "work").as_posix()
                     for path in segment_frames
                 ],
+                "keyframe_sources": [{
+                    "order": order,
+                    "source_time_s": round(start_s + 1.5 * (order - 1), 3),
+                    "source_scene_id": "SCENE_01",
+                    "transition": (
+                        {
+                            "type": "start",
+                            "at_s": round(start_s, 3),
+                        }
+                        if index == 1 and order == 1
+                        else {"type": "continuous", "at_s": None}
+                    ),
+                } for order in range(1, 10)],
                 "first_frame_path": segment_frames[0].relative_to(
                     cdir / "work"
                 ).as_posix(),
@@ -511,6 +626,9 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             segments=receipt_segments,
             workflow=h3.H3_WORKFLOW,
         )
+        assert json.loads(receipt_path.read_text(encoding="utf-8"))[
+            "version"
+        ] == long_video.VISUAL_PLAN_RECEIPT_VERSION
         expected_receipt = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
         common_changes.update(
             duration_s=14.0 * segment_count,
@@ -535,14 +653,36 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     fusion_calls = []
     fusion_prompts = []
 
-    def skill(self, scope, _prompt):
-        fusion_calls.append(scope)
+    def skill(
+        self, scope, _prompt, *, session_dir, writable_paths=(),
+    ):
+        fusion_calls.append(session_dir)
+        assert session_dir == cdir
+        assert writable_paths == (scope / "work" / "h3_prompt_plan.json",)
         input_data = (scope / "work" / "multimodal_input.json").read_bytes()
         input_payload = json.loads(input_data.decode("utf-8"))
         output_segments = []
+        previous_source = None
         for segment in input_payload["segments"]:
+            timeline, previous_source = long_video.freeze_keyframe_sources(
+                [{
+                    key: frame[key]
+                    for key in (
+                        "order", "source_time_s", "source_scene_id", "transition",
+                    )
+                } for frame in segment["new_keyframes"]],
+                expected_count=9,
+                previous=previous_source,
+            )
+            timeline_json = json.dumps(
+                timeline, ensure_ascii=False, separators=(",", ":")
+            )
             final_prompt = (
+                "<VISUAL>\n"
                 "只使用九张已验收优化图片中的人物、场景与对象。\n"
+                "</VISUAL>\n"
+                f"<KEYFRAME_TIMELINE_JSON>{timeline_json}"
+                "</KEYFRAME_TIMELINE_JSON>\n"
                 f"<AUDIO_CONTENT_JSON>{segment['audio_content']['lines_json']}"
                 "</AUDIO_CONTENT_JSON>"
                 "\n<MUSIC_POLICY>forbid</MUSIC_POLICY>"
@@ -561,7 +701,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             json.dumps(plan, ensure_ascii=False), encoding="utf-8"
         )
 
-    monkeypatch.setattr(CodexRunner, "run", skill)
+    monkeypatch.setattr(CodexRunner, "run_isolated", skill)
     context_sources = []
     context_effective = {}
     context_requests = []
