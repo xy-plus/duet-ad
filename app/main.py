@@ -3280,6 +3280,39 @@ def create_app(settings: Settings) -> FastAPI:
                     storage.update_meta(settings.data_dir, cid, generation=updated)
                     background_tasks.add_task(long_generation.run, settings, cid, plan)
                     return {"status": "queued", "attempt": old.get("attempt")}
+                if (
+                    previous_status == "failed"
+                    and previous_id == request_id
+                    and long_generation.context_ir_semantic_failure_is_recoverable(
+                        settings, cid, plan, old, fit_mode
+                    )
+                ):
+                    segments = [
+                        {
+                            **item,
+                            "status": "queued",
+                            "error": None,
+                        }
+                        if item.get("status") == "failed"
+                        else item
+                        for item in old["segments"]
+                    ]
+                    updated = {
+                        **old,
+                        "segments": segments,
+                        "status": "queued",
+                        "error": None,
+                    }
+                    storage.update_meta(
+                        settings.data_dir, cid, generation=updated
+                    )
+                    background_tasks.add_task(
+                        long_generation.run, settings, cid, plan
+                    )
+                    return {
+                        "status": "queued",
+                        "attempt": old.get("attempt"),
+                    }
                 if previous_status == "failed" and previous_id == request_id:
                     raise HTTPException(status_code=409, detail="new client_request_id required")
                 previous_attempt = old.get("attempt", 0) if isinstance(old, dict) else 0
