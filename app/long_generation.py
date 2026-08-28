@@ -3673,7 +3673,7 @@ def stitched_output_is_reusable(
     provider_media: Mapping[int, tuple[str, Mapping[str, object]]] | None = None,
 ) -> bool:
     """Validate legacy output or native output with exact attempt evidence."""
-    if dialogue_mode not in {"auto", "none"}:
+    if dialogue_mode not in {"auto", "edit", "custom", "none"}:
         return False
     output = plan.root / "generated.mp4"
     receipt_path = plan.root / stitch.RECEIPT_FILENAME

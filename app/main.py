@@ -836,6 +836,38 @@ def _validated_dialogue(meta: dict, payload: dict) -> tuple[dict, ...]:
         raise _SubmitError(422, "invalid_dialogue") from None
 
 
+def _create_dialogue_payload(
+    dialogue_mode: str,
+    raw_lines: str,
+    *,
+    has_lines: bool,
+) -> dict:
+    """Parse the multipart dialogue authority before creating a project."""
+    if dialogue_mode not in _DIALOGUE_MODES:
+        raise HTTPException(status_code=422, detail="invalid_dialogue")
+    if dialogue_mode in {"auto", "none"}:
+        if has_lines:
+            raise HTTPException(status_code=422, detail="invalid_dialogue")
+        return {"dialogue_mode": dialogue_mode}
+    if not has_lines:
+        raise HTTPException(status_code=422, detail="invalid_dialogue")
+    try:
+        lines = json.loads(raw_lines)
+    except (TypeError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail="invalid_dialogue") from None
+    if (
+        not isinstance(lines, list)
+        or not lines
+        or any(
+            not isinstance(line, dict)
+            or set(line) != {"text", "start_s", "end_s"}
+            for line in lines
+        )
+    ):
+        raise HTTPException(status_code=422, detail="invalid_dialogue")
+    return {"dialogue_mode": dialogue_mode, "lines": lines}
+
+
 def _validate_submit_payload(
     meta: dict, payload: dict
 ) -> tuple[str, str, str, str, tuple[dict, ...], str]:
@@ -2663,7 +2695,7 @@ def _automatic_v4_pre_fusion_claim(
     ):
         return False
     return bool(
-        meta.get("dialogue_mode") in {"auto", "none"}
+        meta.get("dialogue_mode") in _DIALOGUE_MODES
         and meta.get("dialogue_delivery") == "auto"
         and meta.get("resolved_dialogue_delivery") == resolved_delivery
         and meta.get("fit_mode") == fit_mode
@@ -2772,7 +2804,7 @@ def _continue_after_prompt_fusion(
     )
     if (
         fit_mode not in _FIT_MODES
-        or dialogue_mode not in {"auto", "none"}
+        or dialogue_mode not in _DIALOGUE_MODES
         or requested_delivery not in {"auto", "on_screen", "off_screen"}
         or aspect_ratio not in _ASPECT_RATIOS
         or resolution not in _RESOLUTIONS
@@ -2827,7 +2859,11 @@ def _continue_after_prompt_fusion(
         dialogue_mode=dialogue_mode,
         dialogue_delivery=requested_delivery,
         resolved_dialogue_delivery=meta.get("resolved_dialogue_delivery"),
-        voice_lines=[],
+        voice_lines=(
+            [dict(line) for line in meta.get("voice_lines", [])]
+            if isinstance(meta.get("voice_lines"), list)
+            else []
+        ),
         prepared_dialogue=[],
         fit_mode=fit_mode,
         aspect_ratio=aspect_ratio,
@@ -3064,11 +3100,9 @@ def _start_automatic_v4_generation(
             if _long_fit_required(settings.data_dir / cid, meta, settings)
             else "none"
         )
-        dialogue_mode = (
-            meta.get("dialogue_mode")
-            if meta.get("dialogue_mode") in {"auto", "none"}
-            else "auto"
-        )
+        dialogue_mode = meta.get("dialogue_mode")
+        if dialogue_mode not in _DIALOGUE_MODES:
+            return
         requested_delivery = "auto"
         authoritative_dialogue = tuple(
             dict(line)
@@ -3579,6 +3613,8 @@ def create_app(settings: Settings) -> FastAPI:
         client_request_id: str = Form(""),
         voice_mode: str = Form("keep"),
         target_language: str = Form(""),
+        dialogue_mode: str = Form("auto"),
+        lines: str = Form(""),
     ):
         ip = request.client.host if request.client else "unknown"
         if not limiter.allow(ip):
@@ -3586,7 +3622,7 @@ def create_app(settings: Settings) -> FastAPI:
         form = await request.form()
         allowed_form_fields = {
             "file", "reference_url", "note", "client_request_id",
-            "voice_mode", "target_language",
+            "voice_mode", "target_language", "dialogue_mode", "lines",
         }
         if set(form) - allowed_form_fields or any(
             len(form.getlist(key)) != 1 for key in form
@@ -3598,6 +3634,9 @@ def create_app(settings: Settings) -> FastAPI:
         client_request_id = client_request_id.strip()
         if client_request_id and not _CLIENT_REQUEST_ID_RE.match(client_request_id):
             raise HTTPException(status_code=400, detail="invalid client_request_id")
+        dialogue_payload = _create_dialogue_payload(
+            dialogue_mode.strip(), lines, has_lines="lines" in form
+        )
         # 口播转换：模式白名单 + 翻译必填目标语言；非 translate 忽略 target_language
         voice_mode = voice_mode.strip()
         target_language = target_language.strip()
@@ -3648,12 +3687,27 @@ def create_app(settings: Settings) -> FastAPI:
                     status_code=422,
                     detail="long_video_audio_mode_unsupported",
                 )
+            try:
+                frozen_dialogue = _validated_dialogue(
+                    {
+                        "duration_s": video.duration_s,
+                        "vocal_filter_enabled": True,
+                    },
+                    dialogue_payload,
+                )
+            except _SubmitError as exc:
+                storage.remove_conversation(settings.data_dir, meta["id"])
+                raise HTTPException(
+                    status_code=exc.status, detail=exc.detail
+                ) from None
             storage.update_meta(
                 settings.data_dir,
                 meta["id"],
                 duration_s=video.duration_s,
                 source_width=video.width,
                 source_height=video.height,
+                dialogue_mode=dialogue_payload["dialogue_mode"],
+                voice_lines=[dict(line) for line in frozen_dialogue],
             )
         except (storage.UploadError, downloader.DownloadError) as e:
             storage.remove_conversation(settings.data_dir, meta["id"])

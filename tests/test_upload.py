@@ -26,6 +26,127 @@ def test_upload_ok(client, video_1s, settings):
     assert meta["status"] == "queued"
 
 
+@pytest.mark.parametrize(
+    ("dialogue_mode", "expected_provenance"),
+    [("edit", "asr+edited"), ("custom", "manual")],
+)
+def test_upload_freezes_manual_dialogue_before_pipeline(
+    client, video_1s, settings, dialogue_mode, expected_provenance
+):
+    lines = [
+        {"start_s": 0, "end_s": 0.4, "text": "  用户台词一  "},
+        {"text": "用户台词二", "start_s": 0.5, "end_s": 0.9},
+    ]
+    with open(video_1s, "rb") as source:
+        response = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            files={"file": ("clip.mp4", source, "video/mp4")},
+            data={
+                "dialogue_mode": dialogue_mode,
+                "lines": json.dumps(lines, ensure_ascii=False),
+            },
+        )
+
+    assert response.status_code == 201, response.json()
+    cid = response.json()["id"]
+    meta = json.loads(
+        (settings.data_dir / cid / "meta.json").read_text(encoding="utf-8")
+    )
+    assert meta["status"] == "queued"
+    assert meta["dialogue_mode"] == dialogue_mode
+    assert meta["voice_lines"] == [
+        {
+            "text": "用户台词一",
+            "start_s": 0.0,
+            "end_s": 0.4,
+            "classification": None,
+            "provenance": expected_provenance,
+        },
+        {
+            "text": "用户台词二",
+            "start_s": 0.5,
+            "end_s": 0.9,
+            "classification": None,
+            "provenance": expected_provenance,
+        },
+    ]
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+    assert detail.status_code == 200
+    assert detail.json()["dialogue"] == {
+        "mode": dialogue_mode,
+        "lines": [
+            {"text": "用户台词一", "start_s": 0.0, "end_s": 0.4},
+            {"text": "用户台词二", "start_s": 0.5, "end_s": 0.9},
+        ],
+        "auto_lines": [],
+    }
+
+
+def test_upload_none_freezes_empty_dialogue_without_lines(
+    client, video_1s, settings
+):
+    with open(video_1s, "rb") as source:
+        response = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            files={"file": ("clip.mp4", source, "video/mp4")},
+            data={"dialogue_mode": "none"},
+        )
+
+    assert response.status_code == 201, response.json()
+    meta = json.loads(
+        (settings.data_dir / response.json()["id"] / "meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert meta["dialogue_mode"] == "none"
+    assert meta["voice_lines"] == []
+
+
+@pytest.mark.parametrize(
+    ("data", "detail"),
+    [
+        ({"dialogue_mode": "edit"}, "invalid_dialogue"),
+        ({"dialogue_mode": "custom", "lines": "not-json"}, "invalid_dialogue"),
+        ({"dialogue_mode": "custom", "lines": "[]"}, "invalid_dialogue"),
+        (
+            {
+                "dialogue_mode": "custom",
+                "lines": json.dumps([
+                    {"text": "越界", "start_s": 0.0, "end_s": 2.0}
+                ]),
+            },
+            "invalid_dialogue",
+        ),
+        (
+            {
+                "dialogue_mode": "auto",
+                "lines": json.dumps([
+                    {"text": "迟到输入", "start_s": 0.0, "end_s": 0.5}
+                ]),
+            },
+            "invalid_dialogue",
+        ),
+        ({"dialogue_mode": "none", "lines": "[]"}, "invalid_dialogue"),
+    ],
+)
+def test_upload_rejects_noncanonical_dialogue_without_keeping_project(
+    client, video_1s, settings, data, detail
+):
+    with open(video_1s, "rb") as source:
+        response = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            files={"file": ("clip.mp4", source, "video/mp4")},
+            data=data,
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": detail}
+    assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
+
+
 def test_stale_none_voice_mode_requires_refresh_without_creating_upload(
     client, video_1s, settings
 ):
@@ -177,8 +298,8 @@ def test_upload_accepts_exact_h3_limit(client, video_1s, monkeypatch, settings):
 @pytest.mark.parametrize(
     "video_duration,format_duration,voice_mode,expected_status",
     [
-        (15.0, 15.1, "rewrite", 201),
-        (15.001, 14.9, "rewrite", 422),
+        (10.0, 10.1, "rewrite", 201),
+        (10.001, 9.9, "rewrite", 422),
         (300.0, 300.2, "keep", 201),
         (300.001, 299.9, "keep", 422),
     ],
@@ -203,7 +324,7 @@ def test_upload_gates_use_video_stream_duration_only(
             files={"file": ("clip.mp4", file, "video/mp4")},
             data={"voice_mode": voice_mode},
         )
-    assert response.status_code == expected_status
+    assert response.status_code == expected_status, response.json()
 
 
 def test_upload_requires_auth(client, video_1s):

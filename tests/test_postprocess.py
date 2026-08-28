@@ -502,7 +502,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     complete_generation=False, dialogue_mode="auto",
     silent_segment_indices=(),
     web_output_validation=False, dialogue_classification="spoken",
-    has_bgm=False,
+    has_bgm=False, automatic_operation=False,
 ):
     settings = make_settings(
         tmp_path,
@@ -534,32 +534,50 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     (cdir / "work" / "visual_prompt.txt").write_text(
         old_visual_prompt, encoding="utf-8"
     )
-    subprocess.run(
-        [
-            "/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
-            "-t", "14.58", "-q:a", "9", "-y",
-            str(cdir / "work" / "voice.mp3"),
-        ],
-        check=True,
-    )
-    voice_sha256 = hashlib.sha256(
-        (cdir / "work" / "voice.mp3").read_bytes()
-    ).hexdigest()
-    provenance = [{
-        "text": "تجربة صوتية",
-        "start_s": 0.0,
-        "end_s": 14.44,
-        "classification": dialogue_classification,
-        "provenance": "asr",
-        "kept": True,
-    }]
-    evidence = long_generation.classification_evidence_sha256(
-        audio_path="work/voice.mp3",
-        audio_sha256=voice_sha256,
-        has_bgm=has_bgm,
-        decisions=provenance,
-    )
+    manual_mode = dialogue_mode in {"edit", "custom"}
+    manual_provenance = "asr+edited" if dialogue_mode == "edit" else "manual"
+    global_manual_lines = [
+        {
+            "text": f"用户冻结台词{index}",
+            "start_s": 10.0 * (index - 1) + 1.0,
+            "end_s": 10.0 * (index - 1) + 2.0,
+            "classification": None,
+            "provenance": manual_provenance,
+        }
+        for index in range(1, segment_count + 1)
+        if index not in silent_segment_indices
+    ]
+    if manual_mode:
+        provenance = []
+        voice_sha256 = None
+        evidence = None
+    else:
+        subprocess.run(
+            [
+                "/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+                "-t", "14.58", "-q:a", "9", "-y",
+                str(cdir / "work" / "voice.mp3"),
+            ],
+            check=True,
+        )
+        voice_sha256 = hashlib.sha256(
+            (cdir / "work" / "voice.mp3").read_bytes()
+        ).hexdigest()
+        provenance = [{
+            "text": "تجربة صوتية",
+            "start_s": 0.0,
+            "end_s": 14.44,
+            "classification": dialogue_classification,
+            "provenance": "asr",
+            "kept": True,
+        }]
+        evidence = long_generation.classification_evidence_sha256(
+            audio_path="work/voice.mp3",
+            audio_sha256=voice_sha256,
+            has_bgm=has_bgm,
+            decisions=provenance,
+        )
     common_changes = dict(
         duration_s=14.5,
         vocal_filter_enabled=True,
@@ -572,6 +590,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         },
         aspect_ratio="9:16",
         resolution="768p",
+        voice_lines=global_manual_lines if manual_mode else [],
         voice_line_provenance=[{
             **line,
             "analysis_audio_path": "work/voice.mp3",
@@ -596,12 +615,24 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             visual_text = f"第{index}段九张优化图片视觉动作"
             visual = work / "visual_prompt.txt"
             visual.write_text(visual_text, encoding="utf-8")
-            dialogue = ([] if index in silent_segment_indices else [{
-                "text": f"画外口播{index}",
-                "start_s": 1.0,
-                "end_s": 2.0,
-                "classification": dialogue_classification,
-            }])
+            dialogue = (
+                []
+                if index in silent_segment_indices
+                else (
+                    [{
+                        **global_manual_lines[index - 1],
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                    }]
+                    if manual_mode
+                    else [{
+                        "text": f"画外口播{index}",
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                        "classification": dialogue_classification,
+                    }]
+                )
+            )
             final_text = (
                 "不要生成背景音乐\n"
                 + prepared_input.compose_final_prompt(
@@ -898,11 +929,15 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                 ).glob("*.png"))
             ]
         )
-        first = client.post(
-            f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
-        )
-        assert first.status_code == 202, first.json()
-        final_submit = first
+        if automatic_operation:
+            real_start_automatic(settings, cid, CodexRunner(1, 1))
+            final_submit = None
+        else:
+            first = client.post(
+                f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
+            )
+            assert first.status_code == 202, first.json()
+            final_submit = first
         fused_meta = storage.load_meta(settings.data_dir, cid)
         fusion_receipt = fused_meta["_prompt_fusion"]
         assert fusion_receipt["status"] == "done"
@@ -933,6 +968,15 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             )
             assert detail.status_code == 200
             assert detail.json()["has_video"] is True
+            if manual_mode:
+                assert detail.json()["dialogue"]["lines"] == [
+                    {
+                        "text": line["text"],
+                        "start_s": line["start_s"],
+                        "end_s": line["end_s"],
+                    }
+                    for line in global_manual_lines
+                ]
             generated = client.get(
                 f"/api/conversations/{cid}/files/generated.mp4", headers=AUTH
             )
@@ -959,7 +1003,8 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
             assert tampered.json()["has_video"] is False
             fusion_output.write_bytes(fusion_output_data)
 
-    assert final_submit.status_code == 202, final_submit.json()
+    if final_submit is not None:
+        assert final_submit.status_code == 202, final_submit.json()
     assert fusion_calls == [cdir]
     assert len(h3_requests) == (segment_count if complete_generation else 1)
     for bound_request in h3_requests:
@@ -1008,7 +1053,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         assert not (segment_work / "multimodal_input.json").exists()
         assert not (segment_work / "h3_prompt_plan.json").exists()
         assert not (segment_work / "h3_multimodal_source.json").exists()
-    if segment_count == 1 and postprocess_options is None:
+    if segment_count == 1 and postprocess_options is None and not automatic_operation:
         frozen_meta = storage.load_meta(settings.data_dir, cid)
         frozen_meta.pop("_prompt_fusion", None)
         fusion_output = cdir / "work" / "h3_prompt_plan.json"
@@ -1045,6 +1090,20 @@ def test_n2_off_screen_fusion_completes_context_h3_and_native_stitch(
 ):
     _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         tmp_path, monkeypatch, 2, complete_generation=True,
+    )
+
+
+def test_current_custom_dialogue_uses_one_automatic_fusion_h3_native_stitch(
+    tmp_path, monkeypatch,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path,
+        monkeypatch,
+        1,
+        complete_generation=True,
+        dialogue_mode="custom",
+        automatic_operation=True,
+        web_output_validation=True,
     )
 
 

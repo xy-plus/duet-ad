@@ -1925,11 +1925,6 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
     try:
         _cut_segment(source, seg["start_s"], seg["end_s"], segdir)
         segwork.mkdir(parents=True, exist_ok=True)
-        if new_input_contract and lines:
-            if voice.extract_audio(segdir) is None:
-                raise PipelineError(
-                    f"segment {index} normalized voice reference is missing"
-                )
         _run_cmd(
             [sys.executable, str(EXTRACT_SCRIPT), str(segdir / "source.mp4"),
              "--out-dir", str(segwork), "--fps", "4"],
@@ -2766,23 +2761,42 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
         voice_mode = meta.get("voice_mode", "none")
         voice_lines: list[dict] | None = None
         if new_input_contract:
-            if dialogue_mode != "auto":
-                raise PipelineError(f"unknown initial dialogue_mode: {dialogue_mode}")
-            auto_voice_mode = meta.get("voice_mode")
-            if auto_voice_mode in (None, ""):
-                auto_voice_mode = "keep"
-            if auto_voice_mode not in ("keep", "rewrite", "translate"):
-                raise PipelineError(f"unknown voice_mode for auto dialogue: {auto_voice_mode}")
-            voice_lines = _voice_step(
-                settings,
-                cid,
-                cdir,
-                work,
-                runner,
-                auto_voice_mode,
-                meta.get("target_language") or "",
-                allow_no_audio=True,
-            )
+            if dialogue_mode == "auto":
+                auto_voice_mode = meta.get("voice_mode")
+                if auto_voice_mode in (None, ""):
+                    auto_voice_mode = "keep"
+                if auto_voice_mode not in ("keep", "rewrite", "translate"):
+                    raise PipelineError(
+                        f"unknown voice_mode for auto dialogue: {auto_voice_mode}"
+                    )
+                voice_lines = _voice_step(
+                    settings,
+                    cid,
+                    cdir,
+                    work,
+                    runner,
+                    auto_voice_mode,
+                    meta.get("target_language") or "",
+                    allow_no_audio=True,
+                )
+            elif dialogue_mode in {"edit", "custom"}:
+                supplied = meta.get("voice_lines")
+                if not isinstance(supplied, list) or not supplied:
+                    raise PipelineError("manual dialogue lines are missing")
+                frozen_dialogue = _dialogue_for_prepared_input(
+                    meta, dialogue_mode, supplied
+                )
+                voice_lines = [dict(line) for line in frozen_dialogue]
+                if supplied != voice_lines:
+                    raise PipelineError("manual dialogue lines are not canonical")
+            elif dialogue_mode == "none":
+                if meta.get("voice_lines") not in (None, []):
+                    raise PipelineError("none dialogue requires empty lines")
+                voice_lines = []
+            else:
+                raise PipelineError(
+                    f"unknown initial dialogue_mode: {dialogue_mode}"
+                )
         elif voice_mode != "none":
             voice_lines = _voice_step(
                 settings, cid, cdir, work, runner, voice_mode,

@@ -2884,6 +2884,18 @@ def test_structured_submit_error_rejects_non_public_fields():
         (
             {
                 "confirm": True,
+                "client_request_id": "stale-page-request",
+                "dialogue_mode": "custom",
+                "lines": [
+                    {"text": "迟到台词", "start_s": 0.0, "end_s": 1.0}
+                ],
+                "fit_mode": "none",
+            },
+            "long_video_audio_mode_unsupported",
+        ),
+        (
+            {
+                "confirm": True,
                 "client_request_id": "bad",
                 "dialogue_mode": "none",
                 "fit_mode": "none",
@@ -5129,9 +5141,15 @@ def _tone_amplitude(samples: np.ndarray, frequency: int) -> float:
     return float(spectrum[np.argmin(np.abs(frequencies - frequency))])
 
 
-def test_run_h3_native_audio_never_restores_source_track(tmp_path, monkeypatch):
+@pytest.mark.parametrize("dialogue_mode", ["auto", "custom"])
+def test_run_h3_native_audio_never_restores_source_track(
+    tmp_path, monkeypatch, dialogue_mode
+):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, plan, generation = _native_audio_plan(settings)
+    storage.update_meta(
+        settings.data_dir, cid, dialogue_mode=dialogue_mode
+    )
     _make_tone_video(plan.source, color="black", frequency=220, duration=2)
     _make_tone_video(
         plan.segments[0].workdir / "generated.mp4",
@@ -5218,11 +5236,11 @@ def test_run_h3_native_audio_never_restores_source_track(tmp_path, monkeypatch):
     }
     assert _REAL_STITCHED_OUTPUT_IS_REUSABLE(
         plan,
-        "auto",
+        dialogue_mode,
         generation=generation,
         provider_media=exact_provider_media,
     )
-    assert not _REAL_STITCHED_OUTPUT_IS_REUSABLE(plan, "auto")
+    assert not _REAL_STITCHED_OUTPUT_IS_REUSABLE(plan, dialogue_mode)
     mismatched_generation = {
         **generation,
         "segments": [dict(item) for item in generation["segments"]],
@@ -5230,7 +5248,7 @@ def test_run_h3_native_audio_never_restores_source_track(tmp_path, monkeypatch):
     mismatched_generation["segments"][0]["h3_attempt_id"] = "999999"
     assert not _REAL_STITCHED_OUTPUT_IS_REUSABLE(
         plan,
-        "auto",
+        dialogue_mode,
         generation=mismatched_generation,
         provider_media=exact_provider_media,
     )
@@ -5244,7 +5262,7 @@ def test_run_h3_native_audio_never_restores_source_track(tmp_path, monkeypatch):
     )
     assert not _REAL_STITCHED_OUTPUT_IS_REUSABLE(
         plan,
-        "auto",
+        dialogue_mode,
         generation=generation,
         provider_media=mismatched_provider_media,
     )

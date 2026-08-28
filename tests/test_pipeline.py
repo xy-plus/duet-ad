@@ -2871,6 +2871,101 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_visual_plan_receipt(
     ]
 
 
+@pytest.mark.parametrize(
+    ("dialogue_mode", "provenance"),
+    [("edit", "asr+edited"), ("custom", "manual")],
+)
+def test_run_manual_dialogue_uses_frozen_lines_without_source_audio(
+    tmp_path, video_1s, monkeypatch, dialogue_mode, provenance
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _replace_source_with_duration(settings, meta["id"], 10.0)
+    frozen_lines = [{
+        "text": "用户冻结台词。",
+        "start_s": 0.25,
+        "end_s": 1.25,
+        "classification": None,
+        "provenance": provenance,
+    }]
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode=dialogue_mode,
+        voice_mode="keep",
+        voice_lines=frozen_lines,
+        duration_s=10.0,
+        ratio="9:16",
+        fit_mode="none",
+    )
+
+    def fake_codex(self, workdir, prompt):
+        assert "voice.mp3" not in prompt
+        _write_valid_package(Path(workdir) / "work", frames=9)
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(
+        voice,
+        "extract_audio",
+        lambda *_args, **_kwargs: pytest.fail(
+            "manual dialogue must not extract source audio"
+        ),
+    )
+    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    cdir = settings.data_dir / meta["id"]
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == frozen_lines
+    assert stored["segments"][0]["dialogue"] == frozen_lines
+    assert "用户冻结台词。" in stored["segments"][0]["prompt"]
+    receipt = json.loads(
+        (cdir / long_video.PLAN_RECEIPT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert receipt["segments"][0]["dialogue"]["count"] == 1
+
+
+def test_run_none_dialogue_skips_asr_and_source_audio(tmp_path, video_1s, monkeypatch):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+    _replace_source_with_duration(settings, meta["id"], 10.0)
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        dialogue_mode="none",
+        voice_mode="keep",
+        voice_lines=[],
+        duration_s=10.0,
+        ratio="9:16",
+        fit_mode="none",
+    )
+
+    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
+    monkeypatch.setattr(
+        voice,
+        "extract_audio",
+        lambda *_args, **_kwargs: pytest.fail(
+            "none dialogue must not extract source audio"
+        ),
+    )
+    monkeypatch.setattr(
+        CodexRunner,
+        "run",
+        lambda self, workdir, prompt: _write_valid_package(
+            Path(workdir) / "work", frames=9
+        ),
+    )
+
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "done", stored.get("error")
+    assert stored["voice_lines"] == []
+    assert stored["segments"][0]["dialogue"] == []
+
+
 def test_exact_nine_freezes_a_complete_v4_frame_bound_prompt_receipt(
     tmp_path, video_1s, monkeypatch
 ):

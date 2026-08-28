@@ -808,7 +808,7 @@ def write_plan_receipt(
         "segments": receipt_segments,
     }
     if all(has_multimodal) or has_prompt_fusion:
-        if dialogue_mode not in {"auto", "none"}:
+        if dialogue_mode not in {"auto", "edit", "custom", "none"}:
             raise LongVideoError("long_video_plan_invalid_dialogue_mode")
         receipt["dialogue_mode"] = dialogue_mode
         if (dialogue_delivery is None) != (resolved_dialogue_delivery is None):
