@@ -25,9 +25,30 @@ def _scores(values):
 class TestGroupScores:
     def test_collapses_521_classes(self):
         got = vocal.group_scores(
-            _scores({0: 0.11, 5: 0.42, 12: 0.31, 24: 0.17, 32: 0.53, 132: 0.29})
+            _scores({
+                0: 0.11, 5: 0.42, 12: 0.31,
+                24: 0.17, 32: 0.53,
+                132: 0.29, 261: 0.37, 265: 0.31,
+            })
         )
-        assert got == vocal.WindowScores(sung=0.53, spoken=0.42, music=0.29)
+        assert got == vocal.WindowScores(sung=0.53, spoken=0.42, music=0.37)
+
+    @pytest.mark.parametrize(
+        "index",
+        [132, 261, 262, 263, 264, 265],
+        ids=[
+            "Music", "Song", "Background-music", "Theme-music", "Jingle",
+            "Soundtrack-music",
+        ],
+    )
+    def test_each_verified_music_class_contributes_to_window_max(self, index):
+        got = vocal.group_scores(_scores({index: 0.61}))
+        assert got.music == pytest.approx(0.61)
+        assert got.sung == 0.0
+        assert got.spoken == 0.0
+        assert vocal.detect_background_music(
+            [_window(0, 1000, music=got.music)]
+        ) is True
 
     @pytest.mark.parametrize("scores", [[0.0] * 520, [0.0] * 522])
     def test_rejects_wrong_dimension(self, scores):
@@ -59,6 +80,25 @@ class TestBackgroundMusic:
             [_window(0, 100, music=0.1), _window(100, 200, music=0.1),
              _window(200, 300, music=0.0), _window(300, 400, music=0.0)]
         ) is True
+
+    @pytest.mark.parametrize(
+        ("sung", "spoken", "expected"),
+        [
+            (0.08, 0.02, "sung"),
+            (0.01, 0.30, "spoken"),
+            (0.01, 0.01, None),
+        ],
+    )
+    def test_music_score_and_has_bgm_do_not_change_vocal_decision(
+        self, sung, spoken, expected,
+    ):
+        without_music = [_window(0, 1000, sung=sung, spoken=spoken, music=0.0)]
+        with_music = [_window(0, 1000, sung=sung, spoken=spoken, music=1.0)]
+
+        assert vocal.detect_background_music(without_music) is False
+        assert vocal.detect_background_music(with_music) is True
+        assert vocal.classify_segment(0, 1000, without_music) == expected
+        assert vocal.classify_segment(0, 1000, with_music) == expected
 
 
 class TestClassifySegment:

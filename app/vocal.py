@@ -23,9 +23,9 @@ _FFMPEG_TIMEOUT_S = 120
 YAMNET_SHA256 = "4d8b4a53282dc83ef04e3e7dbc4fbc98082e34e44ed798e16c3a0cdd4c584faf"
 SPOKEN_INDICES = (0, 1, 2, 3, 4, 5, 12)
 SUNG_INDICES = tuple(range(24, 33))
-MUSIC_INDEX = 132
+MUSIC_INDICES = (132, 261, 262, 263, 264, 265)
 
-# 校准依据：TrendScout 2026-07-28 盘上 7 支素材实测。Music 分达到 0.1
+# 校准依据：TrendScout 2026-07-28 盘上 7 支素材实测。音乐组分达到 0.1
 # 的窗口占比在无 BGM/有 BGM 两簇之间留有余量，因此沿用 0.1 与 0.5。
 MUSIC_SCORE_MIN = 0.1
 MUSIC_WINDOW_RATIO = 0.5
@@ -84,7 +84,7 @@ def group_scores(scores: Sequence[float]) -> WindowScores:
     return WindowScores(
         sung=max(values[index] for index in SUNG_INDICES),
         spoken=max(values[index] for index in SPOKEN_INDICES),
-        music=values[MUSIC_INDEX],
+        music=max(values[index] for index in MUSIC_INDICES),
     )
 
 
