@@ -1,8 +1,10 @@
 """Deterministic local assembly for ordered H3 segment outputs.
 
 This module has no provider dependency.  It normalizes paid segment artifacts,
-joins them, optionally restores the original source audio, validates the result,
-and only then atomically replaces the conversation-level output.
+joins them with native provider audio (or same-EDL silence when the provider
+track is absent), validates the result, and only then atomically replaces the
+conversation-level output.  Source audio is analysis evidence, never an output
+input.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ RECEIPT_FILENAME = "stitch-receipt.json"
 _TIMEOUT_S = 300
 
 JoinMode = Literal["continue", "hard_cut"]
-AudioMode = Literal["keep", "mute", "provider_generated"]
+AudioMode = Literal["mute", "provider_generated"]
 
 
 class StitchError(RuntimeError):
@@ -168,7 +170,10 @@ def _provider_binding(segment: StitchSegment, index: int) -> dict[str, object]:
         or timeline.get("version") != 1
         or timeline.get("decode_complete") is not True
         or not isinstance(timeline.get("video"), Mapping)
-        or not isinstance(timeline.get("audio"), Mapping)
+        or (
+            timeline.get("audio") is not None
+            and not isinstance(timeline.get("audio"), Mapping)
+        )
     ):
         raise ValueError(
             f"segment {index} requires exact H3 native-audio evidence"
@@ -177,35 +182,33 @@ def _provider_binding(segment: StitchSegment, index: int) -> dict[str, object]:
         "source": "h3",
         "attempt_id": attempt_id,
         "media_timeline_sha256": _canonical_sha256(timeline),
-        "decoded_audio_sha256": timeline["audio"].get("decoded_sha256"),
+        "decoded_audio_sha256": (
+            timeline["audio"].get("decoded_sha256")
+            if isinstance(timeline.get("audio"), Mapping)
+            else None
+        ),
     }
 
 
 def _segment_audio_binding(
     segment: StitchSegment, index: int,
 ) -> dict[str, object]:
-    """Bind native provider audio, or an explicitly evidence-free mute segment."""
-    if (
-        segment.provider_attempt_id is None
-        and segment.provider_media_timeline is None
-    ):
-        return {"source": "mute"}
+    """Bind one exact H3 result, including an evidenced missing audio track."""
     return _provider_binding(segment, index)
 
 
 def _validate_request(
     segments: Sequence[StitchSegment], source_video: Path, output: Path, audio_mode: str,
 ) -> tuple[tuple[StitchSegment, ...], Path, Path]:
-    if audio_mode not in {"keep", "mute", "provider_generated"}:
+    if audio_mode not in {"mute", "provider_generated"}:
         raise ValueError(
-            "audio_mode must be 'keep', 'mute', or 'provider_generated'"
+            "audio_mode must be 'mute' or 'provider_generated'"
         )
     frozen = tuple(segments)
     if not frozen:
         raise ValueError("segments must not be empty")
     normalized: list[StitchSegment] = []
     total_duration_s = 0.0
-    provider_audio_segments = 0
     for index, segment in enumerate(frozen):
         if not isinstance(segment, StitchSegment):
             raise TypeError("segments must contain StitchSegment values")
@@ -229,8 +232,7 @@ def _validate_request(
         if not path.is_file():
             raise ValueError(f"segment {index + 1} does not exist: {path}")
         if audio_mode == "provider_generated":
-            binding = _segment_audio_binding(segment, index + 1)
-            provider_audio_segments += int(binding["source"] == "h3")
+            _segment_audio_binding(segment, index + 1)
         elif (
             segment.provider_attempt_id is not None
             or segment.provider_media_timeline is not None
@@ -247,8 +249,6 @@ def _validate_request(
                 segment.provider_media_timeline,
             )
         )
-    if audio_mode == "provider_generated" and provider_audio_segments == 0:
-        raise ValueError("provider_generated audio requires H3 evidence")
     if total_duration_s > MAX_TOTAL_DURATION_S:
         raise ValueError(
             f"total target duration must not exceed {MAX_TOTAL_DURATION_S:g}s"
@@ -311,7 +311,7 @@ def _normalize_segment(
     if audio_mode == "provider_generated":
         duration_s = frames / FPS
         binding = _segment_audio_binding(segment, index + 1)
-        if binding["source"] == "mute":
+        if binding["decoded_audio_sha256"] is None:
             audio_filter = (
                 "anullsrc=r=48000:cl=stereo,"
                 f"atrim=start=0:end={duration_s:.9f},"
@@ -371,7 +371,6 @@ def _validate_output(path: Path, expected_duration_s: float, audio_mode: str,
         )
     expected_audio = (
         audio_mode == "provider_generated"
-        or (audio_mode == "keep" and source_has_audio)
     )
     if info.has_audio != expected_audio:
         raise StitchError("final audio streams do not match requested audio strategy")
@@ -525,7 +524,6 @@ def stitch_video(
     width = first_info.width - first_info.width % 2
     height = first_info.height - first_info.height % 2
     source_info = _probe(source)
-    encoded_duration = sum(budgets) / FPS
     requested_duration = sum(segment.target_duration_s for segment in normalized)
     segment_bindings = [
         {
@@ -578,27 +576,6 @@ def stitch_video(
         )
 
         candidate = joined
-        if audio_mode == "keep" and source_info.has_audio:
-            candidate = tmp / "candidate.mp4"
-            try:
-                video_start = storage.probe_stream_start_time(source, "v:0")
-            except storage.UploadError as exc:
-                raise StitchError(f"source timeline probe failed: {exc}") from None
-            audio_filter = (
-                f"[1:a:0]asetpts=PTS-({video_start:.9f})/TB,"
-                "aresample=async=1:first_pts=0,apad,"
-                f"atrim=duration={encoded_duration:.9f}[a]"
-            )
-            _run(
-                [
-                    "ffmpeg", "-v", "error", "-y", "-i", str(joined),
-                    "-i", str(source), "-filter_complex", audio_filter,
-                    "-map", "0:v:0", "-map", "[a]",
-                    "-c:v", "copy", "-c:a", "aac", "-t", f"{encoded_duration:.9f}",
-                    "-movflags", "+faststart", str(candidate),
-                ],
-                step="restoring source audio",
-            )
 
         final_info = _validate_output(
             candidate, requested_duration, audio_mode, source_info.has_audio

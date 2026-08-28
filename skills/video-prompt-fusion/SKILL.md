@@ -26,12 +26,11 @@ SegmentInput = {
   image_optimization_prompt: NineOrdered<FrozenFramePrompt>;
   audio_content: FrozenAudioContent;
 }
-KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256; source_time_s: Number; source_scene_id: NonEmpty; transition: { type: "start" | "continuous" | "hard_cut"; at_s: Number | null } }
+KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256; segment_time_s: Number; source_scene_id: NonEmpty; transition: { type: "start" | "continuous" | "hard_cut"; at_segment_s: Number | null } }
 FrozenText = { text: NonEmpty; sha256: Sha256 }
 FrozenFramePrompt = { order: Int1; text: NonEmpty; sha256: Sha256 }
-FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice_references: Array<VoiceReference>; music_policy: "forbid" }
-AudioLine = { order: Int1; text: NonEmpty; start_s: Number; end_s: Number; delivery: NonEmpty; voice_ref: Int1 | null }
-VoiceReference = { voice_ref: Int1; path: NonEmpty; sha256: Sha256; purpose: "voice" }
+FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice_references: []; music_policy: "forbid" }
+AudioLine = { order: Int1; text: NonEmpty; start_s: Number; end_s: Number; delivery: NonEmpty; voice_ref: null }
 ```
 
 除结构字段 `schema/version/segments/index` 外，段内恰好只有上述四类输入：`new_keyframes`、`old_video_prompt`、`image_optimization_prompt`、`audio_content`。
@@ -41,17 +40,16 @@ VoiceReference = { voice_ref: Int1; path: NonEmpty; sha256: Sha256; purpose: "vo
 先验证输入，再看图或融合：
 
 - segment `index` 从 1 连续升序；每段恰好 9 张新关键帧，`order` 从 1 连续升序。不得选帧、删帧、补帧或重排。
-- `source_time_s` 必须是有限非负数，并按 `(segment index, keyframe order)` 全局严格递增。只有项目第一张，即 segment 1/order 1，必须为 `type="start"` 且 `at_s=source_time_s`；其余关键帧禁止 `start`。
-- `continuous` 的 `at_s` 必须为 `null`。`continuous` 只表示没有 source hard cut；`continuous` 不授权静态机位、构图或 camera movement。`hard_cut` 的 `at_s` 必须是有限非负数：同一 segment 内须满足前一张 `source_time_s < at_s <=` 当前张 `source_time_s`；后续 segment/order 1 的值必须是后端冻结的该 segment 起点且不得晚于当前张 `source_time_s`。不得从图片、旧提示词或文件名推断、移动或补写切点。
-- 按全局顺序比较相邻关键帧，source scene 改变时必须是 `hard_cut`，source scene 不变时必须是 `continuous`；硬切前后 scene ids 必须逐值等于相邻关键帧的 `source_scene_id`。硬切后的当前关键帧是新 anchor，不得与切前帧描述为连续 zoom、morph 或同镜头运动。`hard_cut.at_s` 不得改写为其他关键帧的 `source_time_s`；硬切记录及切后当前 anchor 必须逐值保持。
+- 每段 `segment_time_s` 必须是有限非负数，并在该段按 keyframe `order` 严格递增；每段 order 1 都必须为 exact `segment_time_s=0`、`type="start"`、`at_segment_s=0`。时间是当前 H3 segment 的局部坐标，输入和输出中禁止出现全局 `source_time_s` 或 `at_s`。
+- `continuous` 的 `at_segment_s` 必须为 `null`。`continuous` 只表示没有 source hard cut；`continuous` 不授权静态机位、构图或 camera movement。`hard_cut` 的 `at_segment_s` 必须是有限非负数，且在同一 segment 内满足前一张 `segment_time_s < at_segment_s <=` 当前张 `segment_time_s`。不得从图片、旧提示词或文件名推断、移动或补写切点。
+- 只在每个 segment 内比较相邻关键帧：source scene 改变时必须是 `hard_cut`，source scene 不变时必须是 `continuous`。硬切后的当前关键帧是新 anchor，不得与切前帧描述为连续 zoom、morph 或同镜头运动。`hard_cut.at_segment_s` 及切后当前 anchor 必须逐值保持，不得跨 segment 传播时间或 scene 连续性。
 - `image_optimization_prompt` 也恰好 9 条并按 `order` 从 1 连续升序；每条图片优化提示词与同 `order` 新关键帧一一对应。
 - `new_keyframes[].sha256` 是对应图片原始 bytes 的 SHA-256；`old_video_prompt.sha256` 和每条图片优化提示词的 `sha256` 都是 UTF-8 `text` bytes 的 SHA-256。
 - `audio_content.lines_sha256` 是 UTF-8 `audio_content.lines_json` exact bytes 的 SHA-256。可以把 `lines_json` 解析为 `Array<AudioLine>` 以理解内容，但不得重新序列化、规范化数字或改写其字符。
 - `lines_json` 解码后的音频行字段必须精确符合 `AudioLine`，`order` 从 1 连续升序；`start_s`、`end_s` 是有限非负数且 `start_s < end_s`。空音频只表示为 exact `lines_json="[]"` 且 `voice_references=[]`。
-- `voice_references` 按 `voice_ref` 连续升序且没有重复；每个非 null `voice_ref` 必须唯一解析到同值 `voice_references[].voice_ref`，也不得保留未被行引用的 reference。不要读取或分析 reference 音频；这里只原样绑定其 1-based index、路径、bytes SHA 和用途。
+- `voice_ref` 必须逐行保持为 `null`，`voice_references` 必须是 `[]`。source audio 只属于上游 ASR/YAMNet 分析证据，绝不作为当前 H3 reference，也不由本 Skill 读取、复制或解释。
 - `music_policy` 必须是 exact 字符串 `"forbid"`；缺失或其他值都不合法。它仍属于第四类 `audio_content`，不是第五类输入。
-- clean reference 的资格证明只由后端 frozen receipt 负责；本 Skill 不接收证明字段，也不判断 reference 是否 clean。
-- 所有 SHA-256 都是 64 位小写十六进制。只有 `new_keyframes[].path` 是本 Skill 可读取的文件路径，必须解析到当前工作目录内已列出的普通图片并与 SHA-256 匹配。`voice_references[].path` 只是后端已冻结的 receipt 元数据；本 Skill 不读取、不解析，也不要求该音频文件出现在隔离工作目录中。
+- 所有 SHA-256 都是 64 位小写十六进制。只有 `new_keyframes[].path` 是本 Skill 可读取的文件路径，必须解析到当前工作目录内已列出的普通图片并与 SHA-256 匹配。输入不存在可读音频路径。
 - 四类输入只能服务同一段，不得跨 segment 借用、补证或传播内容。
 
 任一 schema、数量、索引、顺序、路径或哈希不匹配时，不写输出文件。不要猜测缺失值，也不要用其他文件修复输入。
@@ -65,11 +63,11 @@ VoiceReference = { voice_ref: Int1; path: NonEmpty; sha256: Sha256; purpose: "vo
 3. 把同 `order` 的图片优化提示词仅作为对应关键帧的替换解释。图片优化提示词只解释替换目标和保持约束，帮助识别旧视觉称谓对应的新视觉元素；它不能覆盖关键帧视觉事实，也不能覆盖旧提示词的动态骨架。
 4. 删除旧视频提示词中与新关键帧冲突的旧人物、旧场景、旧对象、旧服装、旧材质和旧空间结构，也删除全部旧构图、取景、裁切、景别、机位和静态镜头属性。不要把这些旧静态描述以别名、背景补充或否定式约束带入最终提示词。
 5. 每个 hard-cut 区间独立融合：只保留起止证据均落在同一 hard-cut 区间内的旧动态，再用图片优化提示词给出的替换对应关系，把本区间旧动作尽可能落到本区间新关键帧中的对应新元素上。不得跨越 `hard_cut` 传播动作、因果或 camera movement；跨越硬切的连续 zoom、push、pan、tracking 或 morph 必须整体删除，不得截断、拆分或重分配到切点任一侧。含多个 hard-cut 区间且缺少可定位边界的旧动态也删除；任何旧动态若无法唯一归属一个 hard-cut 区间，就删除。不得把切前主体、构图或运动状态延续到切后。不得引入四类输入均未支持的新事实，不得借用其他段或其他 hard-cut 区间的角色、场景或事件。
-6. 最后附加音频与音乐策略合同块。音频文本、时间、delivery 和 voice_ref 逐值原样保持；不得翻译、润色、纠错、合并、拆分、重排或补写音频行。音乐策略只逐值投影固定的 `forbid`，不得改写或解释。
+6. 最后附加音频与音乐策略合同块。音频文本、时间、delivery 和 `voice_ref=null` 逐值原样保持；不得翻译、润色、纠错、合并、拆分、重排或补写音频行。输入 `music_policy=forbid` 只允许机械投影为下述唯一 provider 表达，不生成第二种同义措辞。
 
 旧静态采用闭世界白名单：`old_video_prompt` 的闭世界白名单只有同一 hard-cut 区间内的动作顺序、因果关系、camera movement type 和相对节奏，不允许贡献任何静态视觉或静态视角属性。即使旧静态与新关键帧不显式冲突，也不能据此保留。某个替换后的静态元素要进入最终视觉，两个条件必须同时满足：该元素在新关键帧中独立可见，并且同 `order` 的图片优化提示词明确映射旧替换目标到该新元素；否则不得进入 `final_prompt` 的 `<VISUAL>`。条件满足时，静态描述只能取自新关键帧，图片优化提示词只用于确认对应关系，仍不得复制旧静态属性或措辞。
 
-内容冲突不构成拒绝：技术有效的四类输入必须为每个 segment 产出一个最终提示词。发生冲突时，新关键帧的静态事实仍优先，尽可能保留同一 hard-cut 区间内受支持的旧动态骨架；如果某个旧动作片段只依赖已经消失且没有替换对应证据的旧静态元素，只删除该最小的不受支持片段，继续保留本区间其他动作顺序、因果关系、camera movement type 和相对节奏。不得回退旧视觉元素，也不得编造替代事实。
+内容冲突和语义评分都不构成拒绝：技术可读取的四类输入必须为每个 segment 产出一个最终提示词。发生冲突时，新关键帧的静态事实仍优先，尽可能保留同一 hard-cut 区间内受支持的旧动态骨架；如果某个旧动作片段只依赖已经消失且没有替换对应证据的旧静态元素，只删除该最小的不受支持片段，继续保留本区间其他动作顺序、因果关系、camera movement type 和相对节奏。不得回退旧视觉元素，也不得编造替代事实。人物、背景、穿帮、台词和音乐等检查只记录为后续 Skill 迭代评分，不得据此拒绝、重试、改走另一 workflow 或不写输出。
 
 ## 最终提示词格式
 
@@ -81,14 +79,16 @@ VoiceReference = { voice_ref: Int1; path: NonEmpty; sha256: Sha256; purpose: "vo
 </VISUAL>
 <KEYFRAME_TIMELINE_JSON>{keyframe_timeline_json}</KEYFRAME_TIMELINE_JSON>
 <AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>
-<MUSIC_POLICY>forbid</MUSIC_POLICY>
+<MUSIC_POLICY>
+non_diegetic_music: N/A
+</MUSIC_POLICY>
 ```
 
 `<VISUAL>` 只写融合后的视觉内容。把示例中的 `{lines_json}` 替换为并逐字复制 `audio_content.lines_json`：opening tag 的下一 byte 必须是 `lines_json` 首 byte，closing tag 紧随 `lines_json` 末 byte，中间不得增加换行、空格或其他字符。即使其值为 `[]` 也保留这两个标记。音频块之外不得再复述或改写音频内容。
 
-对当前 segment 的 9 张 `new_keyframes` 逐项投影 `order/source_time_s/source_scene_id/transition` 生成 `{keyframe_timeline_json}`。字段顺序固定为 `order`、`source_time_s`、`source_scene_id`、`transition`，其中 transition 字段顺序固定为 `type`、`at_s`；使用 UTF-8 compact JSON（`ensure_ascii=false`，分隔符为 `,` 与 `:`，无额外空白或换行），不得加入 `path`、`sha256` 或其他字段。把该 canonical array 紧贴 timeline opening/closing tag，标签与 JSON 之间不得增加任何 byte。
+对当前 segment 的 9 张 `new_keyframes` 逐项投影 `order/segment_time_s/source_scene_id/transition` 生成 `{keyframe_timeline_json}`。字段顺序固定为 `order`、`segment_time_s`、`source_scene_id`、`transition`，其中 transition 字段顺序固定为 `type`、`at_segment_s`；使用 UTF-8 compact JSON（`ensure_ascii=false`，分隔符为 `,` 与 `:`，无额外空白或换行），不得加入 `path`、`sha256` 或其他字段。把该 canonical array 紧贴 timeline opening/closing tag，标签与 JSON 之间不得增加任何 byte。
 
-exact `<MUSIC_POLICY>forbid</MUSIC_POLICY>` 必须在 `final_prompt` 中恰好一次，紧随音频块后的单个换行；标签内不得增加空白、换行、同义词或说明。下游 Context 只允许改写 `<VISUAL>`，必须让 timeline 块逐 byte 保持，也必须让音频和音乐策略两个合同块都逐 byte 保持；缺失、重复、重排或任一 byte 改变都必须拒绝，不得继续使用改写结果。
+exact 三行 `<MUSIC_POLICY>\nnon_diegetic_music: N/A\n</MUSIC_POLICY>` 必须在 `final_prompt` 中恰好一次，紧随音频块后的单个换行；不得增加同义词或说明。下游后端从冻结输入机械重建 timeline、audio 和 music policy，Context 只贡献 `<VISUAL>` 语义；Context 对这些块的偏移只降低语义评分，不阻断同一 H3 链。
 
 ## 唯一输出
 
@@ -105,4 +105,4 @@ VideoPromptFusionOutput = {
 
 `input_sha256` 是输入描述符 exact bytes 的 SHA-256。输出 segments 与输入 segments 一一对应且顺序相同；不得增加、删除、合并或拆分 segment。每段 `final_prompt` 必须是符合上述固定格式的最终提示词，禁止额外字段。
 
-写入前重新检查输入 SHA、输入顺序、输出索引、旧静态残留、动态骨架、timeline 块、音频块和音乐策略合同块。任何检查失败都不写部分结果或旧提示词回退结果。
+写入前重新检查输入 SHA、输入顺序和输出索引等技术完整性。视觉语义、旧静态残留、动态骨架、timeline、音频或音乐策略表现只进入结果评分；无论评分高低都写完整输出，供下一轮迭代 Skill。

@@ -1995,7 +1995,7 @@ def test_15_seconds_one_post_and_none_rebuilds_prompt_without_source_dialogue(
     assert "源台词" not in seen[1].prompt
     assert "无台词" in seen[1].prompt
     assert seen[1].prompt.startswith("不要生成背景音乐\n")
-    assert [call["audio_mode"] for call in stitch_calls] == ["keep", "mute"]
+    assert [call["audio_mode"] for call in stitch_calls] == ["mute", "mute"]
 
 
 def test_30_second_continue_uses_each_segments_reference_frames(enabled, monkeypatch):
@@ -4250,14 +4250,20 @@ def test_h3_native_missing_audio_evidence_never_falls_back_to_source(
         }
 
     monkeypatch.setattr(h3, "load_media_timeline_receipt", damaged_timeline)
-    monkeypatch.setattr(
-        stitch,
-        "stitch_video",
-        lambda **_kwargs: pytest.fail("missing H3 audio must not stitch"),
-    )
+    stitch_calls = []
+    monkeypatch.setattr(stitch, "stitch_video", _fake_stitch(stitch_calls))
 
     long_generation.run(settings, cid, plan)
 
     stored = storage.load_meta(settings.data_dir, cid)["generation"]
-    assert stored["status"] == "failed"
-    assert stored["error"] == "long_video_h3_native_audio_invalid"
+    if damage == "missing_timeline":
+        assert stitch_calls == []
+        assert stored["status"] == "failed"
+        assert stored["error"] == "long_video_h3_native_audio_invalid"
+    else:
+        assert stored["status"] == "succeeded"
+        assert len(stitch_calls) == 1
+        assert stitch_calls[0]["audio_mode"] == "provider_generated"
+        timeline = stitch_calls[0]["segments"][0].provider_media_timeline
+        assert timeline is not None
+        assert timeline["audio"] is None

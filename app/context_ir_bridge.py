@@ -179,6 +179,7 @@ class EffectivePromptReceipt:
     provider_task_id: str
     context_ir_task_sha256: str
     context_ir_attempt_sha256: str
+    semantic_score: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,61 +247,57 @@ def _keyframe_timeline_contract(prompt: str) -> str | None:
         if (
             not isinstance(item, Mapping)
             or set(item) != {
-                "order", "source_time_s", "source_scene_id", "transition",
+                "order", "segment_time_s", "source_scene_id", "transition",
             }
             or item.get("order") != order
-            or isinstance(item.get("source_time_s"), bool)
-            or not isinstance(item.get("source_time_s"), (int, float))
-            or not math.isfinite(float(item["source_time_s"]))
-            or float(item["source_time_s"]) < 0
+            or isinstance(item.get("segment_time_s"), bool)
+            or not isinstance(item.get("segment_time_s"), (int, float))
+            or not math.isfinite(float(item["segment_time_s"]))
+            or float(item["segment_time_s"]) < 0
             or not isinstance(item.get("source_scene_id"), str)
             or not item["source_scene_id"].strip()
             or not isinstance(item.get("transition"), Mapping)
-            or set(item["transition"]) != {"type", "at_s"}
+            or set(item["transition"]) != {"type", "at_segment_s"}
         ):
             raise ContextIrContractError("context_ir_semantic_mismatch")
-        source_time_s = float(item["source_time_s"])
+        segment_time_s = float(item["segment_time_s"])
         transition_type = item["transition"].get("type")
-        at_s = item["transition"].get("at_s")
+        at_segment_s = item["transition"].get("at_segment_s")
         if transition_type not in {"start", "continuous", "hard_cut"}:
             raise ContextIrContractError("context_ir_semantic_mismatch")
         if previous is None:
-            if transition_type == "start":
-                if at_s != source_time_s:
-                    raise ContextIrContractError("context_ir_semantic_mismatch")
-            elif transition_type == "hard_cut":
-                if (
-                    isinstance(at_s, bool)
-                    or not isinstance(at_s, (int, float))
-                    or not math.isfinite(float(at_s))
-                    or float(at_s) > source_time_s
-                ):
-                    raise ContextIrContractError("context_ir_semantic_mismatch")
-            elif at_s is not None:
+            if (
+                segment_time_s != 0.0
+                or transition_type != "start"
+                or at_segment_s != 0.0
+            ):
                 raise ContextIrContractError("context_ir_semantic_mismatch")
         else:
-            previous_time_s = float(previous["source_time_s"])
-            if source_time_s <= previous_time_s or transition_type == "start":
+            previous_time_s = float(previous["segment_time_s"])
+            if segment_time_s <= previous_time_s or transition_type == "start":
                 raise ContextIrContractError("context_ir_semantic_mismatch")
             if transition_type == "hard_cut":
                 if (
-                    isinstance(at_s, bool)
-                    or not isinstance(at_s, (int, float))
-                    or not math.isfinite(float(at_s))
-                    or not previous_time_s < float(at_s) <= source_time_s
+                    isinstance(at_segment_s, bool)
+                    or not isinstance(at_segment_s, (int, float))
+                    or not math.isfinite(float(at_segment_s))
+                    or not previous_time_s < float(at_segment_s) <= segment_time_s
                     or item["source_scene_id"] == previous["source_scene_id"]
                 ):
                     raise ContextIrContractError("context_ir_semantic_mismatch")
             elif (
-                at_s is not None
+                at_segment_s is not None
                 or item["source_scene_id"] != previous["source_scene_id"]
             ):
                 raise ContextIrContractError("context_ir_semantic_mismatch")
         normalized = {
             "order": order,
-            "source_time_s": source_time_s,
+            "segment_time_s": segment_time_s,
             "source_scene_id": item["source_scene_id"],
-            "transition": {"type": transition_type, "at_s": at_s},
+            "transition": {
+                "type": transition_type,
+                "at_segment_s": at_segment_s,
+            },
         }
         frozen.append(normalized)
         previous = normalized
@@ -453,7 +450,11 @@ def _fusion_policy_suffix(prompt: str) -> str | None:
     audio_close = "</AUDIO_CONTENT_JSON>"
     music_open = "<MUSIC_POLICY>"
     music_close = "</MUSIC_POLICY>"
-    music = f"{music_open}forbid{music_close}"
+    music = (
+        f"{music_open}\n"
+        "non_diegetic_music: N/A\n"
+        f"{music_close}"
+    )
     policy_tail = f"\n{music}"
     # Historical v1 dialogue may legally contain either marker as text inside
     # its JSON payload. Only the v2 outer marker at the exact prompt tail
@@ -503,6 +504,116 @@ def _effective_preserves_fusion_policy(
         "<MUSIC_POLICY>",
         "</MUSIC_POLICY>",
     ))
+
+
+def _fusion_voice_texts(prompt: str) -> tuple[str, ...] | None:
+    """Read the exact deterministic audio block used by current Fusion."""
+    suffix = _fusion_policy_suffix(prompt)
+    if suffix is None:
+        return None
+    audio_open = "<AUDIO_CONTENT_JSON>"
+    audio_close = "</AUDIO_CONTENT_JSON>"
+    start = suffix.find(audio_open)
+    end = suffix.find(audio_close, start + len(audio_open))
+    if start < 0 or end < 0:
+        raise ContextIrContractError("source_music_policy_invalid")
+    try:
+        lines = json.loads(suffix[start + len(audio_open):end])
+    except json.JSONDecodeError:
+        raise ContextIrContractError("source_speech_contract_invalid") from None
+    if not isinstance(lines, list):
+        raise ContextIrContractError("source_speech_contract_invalid")
+    texts: list[str] = []
+    for line in lines:
+        text = line.get("text") if isinstance(line, Mapping) else None
+        if not isinstance(text, str) or not text:
+            raise ContextIrContractError("source_speech_contract_invalid")
+        texts.append(text)
+    return tuple(texts)
+
+
+def _semantic_score(
+    request: FrozenContextIrRequest, context_output_prompt: str,
+) -> dict[str, object]:
+    """Score Context semantics for iteration; never select or stop a chain."""
+    expected_voice_texts = tuple(request.source_h3_request.voice_texts)
+    if expected_voice_texts:
+        speech = float(all(
+            text in context_output_prompt for text in expected_voice_texts
+        ))
+    else:
+        speech = float(
+            "<d>" not in context_output_prompt
+            and "</d>" not in context_output_prompt
+        )
+    timeline = 1.0
+    if request.keyframe_timeline_json is not None:
+        try:
+            actual_timeline = _keyframe_timeline_contract(
+                context_output_prompt
+            )
+        except ContextIrContractError:
+            actual_timeline = None
+        timeline = float(actual_timeline == request.keyframe_timeline_json)
+    try:
+        suffix = _fusion_policy_suffix(request.source_prompt)
+    except ContextIrContractError:
+        suffix = None
+    music_policy = float(
+        suffix is None
+        or _effective_preserves_fusion_policy(context_output_prompt, suffix)
+    )
+    values = (speech, timeline, music_policy)
+    return {
+        "speech_expected": bool(expected_voice_texts),
+        "speech": speech,
+        "keyframe_timeline": timeline,
+        "music_policy": music_policy,
+        "overall": sum(values) / len(values),
+    }
+
+
+def _compile_effective_prompt(
+    request: FrozenContextIrRequest, context_output_prompt: str,
+) -> str:
+    """Mechanically restore immutable Fusion fields around Context semantics."""
+    suffix = _fusion_policy_suffix(request.source_prompt)
+    if suffix is None:
+        return context_output_prompt
+    visual = context_output_prompt
+    opening = "<VISUAL>"
+    closing = "</VISUAL>"
+    if visual.startswith(opening):
+        end = visual.find(closing, len(opening))
+        if end >= 0:
+            visual = visual[len(opening):end]
+    else:
+        positions = [
+            visual.find(marker)
+            for marker in (
+                _TIMELINE_OPEN,
+                "<AUDIO_CONTENT_JSON>",
+                "<MUSIC_POLICY>",
+            )
+            if visual.find(marker) >= 0
+        ]
+        if positions:
+            visual = visual[:min(positions)]
+    for marker in (
+        opening,
+        closing,
+        _TIMELINE_OPEN,
+        _TIMELINE_CLOSE,
+        "<AUDIO_CONTENT_JSON>",
+        "</AUDIO_CONTENT_JSON>",
+        "<MUSIC_POLICY>",
+        "</MUSIC_POLICY>",
+    ):
+        visual = visual.replace(marker, "")
+    visual = visual.strip()
+    if not visual:
+        visual = context_output_prompt.strip()
+    return f"<VISUAL>\n{visual}\n</VISUAL>\n{suffix}"
 
 
 def _mime_type(path: Path, *, audio: bool) -> str:
@@ -739,13 +850,20 @@ def freeze_context_ir_request(
         upstream_dialogue_sha256,
         upstream_dialogue_sha256_path,
     )
-    speech_markers, dialogue_tokens = _speech_contract(
-        source_h3_request.prompt, source_h3_request.voice_texts
-    )
     keyframe_timeline_json = _keyframe_timeline_contract(
         source_h3_request.prompt
     )
     fusion_policy_suffix = _fusion_policy_suffix(source_h3_request.prompt)
+    fusion_voice_texts = _fusion_voice_texts(source_h3_request.prompt)
+    if fusion_voice_texts is None:
+        speech_markers, dialogue_tokens = _speech_contract(
+            source_h3_request.prompt, source_h3_request.voice_texts
+        )
+    else:
+        if fusion_voice_texts != tuple(source_h3_request.voice_texts):
+            raise ContextIrContractError("source_speech_receipt_invalid")
+        speech_markers = ()
+        dialogue_tokens = fusion_voice_texts
 
     references: list[FrozenContextIrReference] = []
     for order, (path, data) in enumerate(source_h3_request.keyframes, 1):
@@ -1460,6 +1578,8 @@ def _receipt_payload(
     request: FrozenContextIrRequest,
     state: Mapping[str, Any],
     effective_prompt: str,
+    context_output_prompt: str,
+    semantic_score: Mapping[str, object],
 ) -> dict[str, Any]:
     return {
         "schema": RECEIPT_SCHEMA,
@@ -1471,6 +1591,9 @@ def _receipt_payload(
         "source_prompt_sha256": request.source_prompt_sha256,
         "effective_prompt": effective_prompt,
         "effective_prompt_sha256": _sha256_text(effective_prompt),
+        "context_output_prompt": context_output_prompt,
+        "context_output_prompt_sha256": _sha256_text(context_output_prompt),
+        "semantic_score": dict(semantic_score),
         "skill_plan_sha256": request.skill_plan_sha256,
         "semantic_contract_sha256": request.semantic_contract_sha256,
         "references_sha256": request.references_sha256,
@@ -1507,61 +1630,15 @@ def _complete(
             error="context_ir_result_invalid",
         )
         return
-    has_voice_authority = (
-        request.source_h3_request.audio_required is True
-        and any(
-            audio.purpose == "voice"
-            for audio in request.source_h3_request.reference_audios
-        )
+    semantic_score = _semantic_score(request, effective_prompt)
+    compiled_prompt = _compile_effective_prompt(request, effective_prompt)
+    payload = _receipt_payload(
+        request,
+        state,
+        compiled_prompt,
+        effective_prompt,
+        semantic_score,
     )
-    if not request.dialogue_tokens and not has_voice_authority:
-        try:
-            _speech_contract(effective_prompt, ())
-        except ContextIrContractError:
-            _mark_terminal(
-                path,
-                state,
-                status="failed",
-                error="context_ir_semantic_mismatch",
-            )
-            return
-    if request.keyframe_timeline_json is not None:
-        try:
-            effective_timeline = _keyframe_timeline_contract(effective_prompt)
-        except ContextIrContractError:
-            effective_timeline = None
-        if effective_timeline != request.keyframe_timeline_json:
-            _mark_terminal(
-                path,
-                state,
-                status="failed",
-                error="context_ir_semantic_mismatch",
-            )
-            return
-    try:
-        fusion_policy_suffix = _fusion_policy_suffix(request.source_prompt)
-    except ContextIrContractError:
-        _mark_terminal(
-            path,
-            state,
-            status="failed",
-            error="context_ir_semantic_mismatch",
-        )
-        return
-    if (
-        fusion_policy_suffix is not None
-        and not _effective_preserves_fusion_policy(
-            effective_prompt, fusion_policy_suffix,
-        )
-    ):
-        _mark_terminal(
-            path,
-            state,
-            status="failed",
-            error="context_ir_semantic_mismatch",
-        )
-        return
-    payload = _receipt_payload(request, state, effective_prompt)
     receipt_sha256 = _canonical_sha256(payload)
     receipt = dict(payload, receipt_sha256=receipt_sha256)
     receipt_path = path.with_name("receipt.json")
@@ -1815,6 +1892,9 @@ _RECEIPT_KEYS = frozenset(
         "source_prompt_sha256",
         "effective_prompt",
         "effective_prompt_sha256",
+        "context_output_prompt",
+        "context_output_prompt_sha256",
+        "semantic_score",
         "skill_plan_sha256",
         "semantic_contract_sha256",
         "references_sha256",
@@ -1847,7 +1927,12 @@ def load_effective_prompt_receipt(
     if len(relative.parts) != 2 or relative.name != "receipt.json":
         raise ContextIrReceiptError("context_ir_receipt_path_invalid")
     raw = _read_json(path)
-    if set(raw) != _RECEIPT_KEYS:
+    legacy_receipt = set(raw) == _RECEIPT_KEYS - {
+        "context_output_prompt",
+        "context_output_prompt_sha256",
+        "semantic_score",
+    }
+    if set(raw) != _RECEIPT_KEYS and not legacy_receipt:
         raise ContextIrReceiptError("context_ir_receipt_invalid")
     unhashed = dict(raw)
     receipt_sha256 = unhashed.pop("receipt_sha256", None)
@@ -1884,6 +1969,35 @@ def load_effective_prompt_receipt(
         raise ContextIrReceiptError("context_ir_receipt_invalid")
     if raw.get("source_prompt_sha256") != _sha256_text(str(raw.get("source_prompt"))):
         raise ContextIrReceiptError("context_ir_receipt_invalid")
+    if legacy_receipt:
+        semantic_score: Mapping[str, object] = {}
+    else:
+        context_output_prompt = raw.get("context_output_prompt")
+        semantic_score = raw.get("semantic_score")
+        if (
+            not isinstance(context_output_prompt, str)
+            or not context_output_prompt.strip()
+            or raw.get("context_output_prompt_sha256")
+            != _sha256_text(context_output_prompt)
+            or not isinstance(semantic_score, Mapping)
+            or set(semantic_score) != {
+                "speech_expected",
+                "speech",
+                "keyframe_timeline",
+                "music_policy",
+                "overall",
+            }
+            or not isinstance(semantic_score.get("speech_expected"), bool)
+            or any(
+                isinstance(semantic_score.get(key), bool)
+                or not isinstance(semantic_score.get(key), (int, float))
+                or not 0.0 <= float(semantic_score[key]) <= 1.0
+                for key in (
+                    "speech", "keyframe_timeline", "music_policy", "overall"
+                )
+            )
+        ):
+            raise ContextIrReceiptError("context_ir_receipt_invalid")
     for key in (
         "context_ir_request_sha256",
         "context_ir_task_sha256",
@@ -1930,6 +2044,7 @@ def load_effective_prompt_receipt(
         provider_task_id=provider_task_id,
         context_ir_task_sha256=str(raw["context_ir_task_sha256"]),
         context_ir_attempt_sha256=request.context_ir_attempt_sha256,
+        semantic_score=dict(semantic_score),
     )
 
 

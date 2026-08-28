@@ -77,12 +77,12 @@ def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> No
                         "order": order,
                         "path": f"{order:02d}.png",
                         "sha256": hashlib.sha256(f"frame-{order}".encode()).hexdigest(),
-                        "source_time_s": float(order - 1),
+                        "segment_time_s": float(order - 1),
                         "source_scene_id": "SCENE_01",
                         "transition": (
-                            {"type": "start", "at_s": 0.0}
+                            {"type": "start", "at_segment_s": 0.0}
                             if order == 1 else
-                            {"type": "continuous", "at_s": None}
+                            {"type": "continuous", "at_segment_s": None}
                         ),
                     }
                 for order in range(1, 10)
@@ -139,20 +139,20 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
     frames = []
     timeline = []
     source_times = [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0]
-    for order, source_time_s in enumerate(source_times, 1):
+    for order, segment_time_s in enumerate(source_times, 1):
         data = f"frame-{order}".encode()
         path = tmp_path / f"{order:02d}.png"
         path.write_bytes(data)
         transition = (
-            {"type": "start", "at_s": 0.0}
+            {"type": "start", "at_segment_s": 0.0}
             if order == 1 else
-            {"type": "hard_cut", "at_s": 2.267}
+            {"type": "hard_cut", "at_segment_s": 2.267}
             if order == 4 else
-            {"type": "continuous", "at_s": None}
+            {"type": "continuous", "at_segment_s": None}
         )
         source = {
             "order": order,
-            "source_time_s": source_time_s,
+            "segment_time_s": segment_time_s,
             "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
             "transition": transition,
         }
@@ -162,7 +162,7 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
             "path": path.name,
             "sha256": hashlib.sha256(data).hexdigest(),
             **{key: source[key] for key in (
-                "source_time_s", "source_scene_id", "transition",
+                "segment_time_s", "source_scene_id", "transition",
             )},
         })
     old_prompt = "source action order"
@@ -205,7 +205,7 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
         f"<KEYFRAME_TIMELINE_JSON>{timeline_json}"
         "</KEYFRAME_TIMELINE_JSON>\n"
         "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
-        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+        "<MUSIC_POLICY>\nnon_diegetic_music: N/A\n</MUSIC_POLICY>"
     )
     input_path = tmp_path / "multimodal_input.json"
     output_path = tmp_path / "h3_prompt_plan.json"
@@ -225,7 +225,7 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
 
     assert frozen.final_prompts == (final_prompt,)
     assert frozen.segments[0]["new_keyframes"][3]["transition"] == {
-        "type": "hard_cut", "at_s": 2.267,
+        "type": "hard_cut", "at_segment_s": 2.267,
     }
 
     output_path.write_bytes(_canonical({
@@ -256,15 +256,15 @@ def test_prompt_fusion_v2_rejects_output_hard_cut_time_drift(tmp_path: Path) -> 
         path = tmp_path / f"{order:02d}.png"
         path.write_bytes(data)
         transition = (
-            {"type": "start", "at_s": 0.0}
+            {"type": "start", "at_segment_s": 0.0}
             if order == 1 else
-            {"type": "hard_cut", "at_s": 2.267}
+            {"type": "hard_cut", "at_segment_s": 2.267}
             if order == 4 else
-            {"type": "continuous", "at_s": None}
+            {"type": "continuous", "at_segment_s": None}
         )
         source = {
             "order": order,
-            "source_time_s": (
+            "segment_time_s": (
                 0.0 if order == 1 else float(order - 1)
                 if order < 4 else float(order)
             ),
@@ -276,7 +276,7 @@ def test_prompt_fusion_v2_rejects_output_hard_cut_time_drift(tmp_path: Path) -> 
             "order": order,
             "path": path.name,
             "sha256": hashlib.sha256(data).hexdigest(),
-            "source_time_s": source["source_time_s"],
+            "segment_time_s": source["segment_time_s"],
             "source_scene_id": source["source_scene_id"],
             "transition": transition,
         })
@@ -305,7 +305,7 @@ def test_prompt_fusion_v2_rejects_output_hard_cut_time_drift(tmp_path: Path) -> 
     }
     input_data = _canonical(input_payload)
     drifted = json.loads(json.dumps(timeline))
-    drifted[3]["transition"]["at_s"] = 3.5
+    drifted[3]["transition"]["at_segment_s"] = 3.5
     drifted_json = json.dumps(
         drifted, separators=(",", ":"),
     )
@@ -419,9 +419,9 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
         "order": 4,
         "path": "work/segments/1/work/keyframes/04.png",
         "sha256": hashlib.sha256(b"frame-4").hexdigest(),
-        "source_time_s": 2.5,
+        "segment_time_s": 2.5,
         "source_scene_id": "SCENE_02",
-        "transition": {"type": "hard_cut", "at_s": 2.267},
+        "transition": {"type": "hard_cut", "at_segment_s": 2.267},
     }
     assert payload["segments"][0]["audio_content"]["music_policy"] == "forbid"
 
@@ -560,6 +560,14 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
         dialogue_delivery="auto",
     )
     input_payload = json.loads(input_data)
+    for compiled_segment in input_payload["segments"]:
+        first = compiled_segment["new_keyframes"][0]
+        assert first["segment_time_s"] == 0.0
+        assert first["transition"] == {
+            "type": "start", "at_segment_s": 0.0,
+        }
+    assert "source_time_s" not in input_data.decode("utf-8")
+    assert '"at_s"' not in input_data.decode("utf-8")
     input_path = work / h3_project.SKILL_INPUT_FILENAME
     output_path = work / "h3_prompt_plan.json"
     input_path.write_bytes(input_data)
@@ -615,12 +623,12 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
         assert len(json.loads(context.keyframe_timeline_json)) == 9
 
     hard_cuts = [
-        frame["transition"]["at_s"]
+        frame["transition"]["at_segment_s"]
         for segment in input_payload["segments"]
         for frame in segment["new_keyframes"]
         if frame["transition"]["type"] == "hard_cut"
     ]
-    assert hard_cuts == [cut_at_s]
+    assert hard_cuts == [2.267]
 
 
 def _audio_compile_fixture(
@@ -752,89 +760,11 @@ def test_auto_sung_compiles_empty_audio_with_forbid_music_policy(
     ]
 
 
-@pytest.mark.parametrize("dialogue_mode", ["auto", "edit", "custom"])
-@pytest.mark.parametrize("has_bgm", [True, None], ids=("bgm", "unknown"))
-def test_unverified_source_mix_cannot_be_compiled_as_voice_reference(
-    tmp_path: Path, dialogue_mode: str, has_bgm: bool | None,
-) -> None:
-    meta, plan = _audio_compile_fixture(
-        tmp_path, segment_count=1, classification="spoken",
-    )
-    meta["has_bgm"] = has_bgm
-
-    with pytest.raises(
-        long_generation.LongGenerationError,
-        match="clean_voice_reference_required",
-    ):
-        long_generation.build_prompt_fusion_input(
-            root=tmp_path,
-            meta=meta,
-            plan=plan,
-            dialogue_mode=dialogue_mode,
-            dialogue_delivery="off_screen",
-        )
-
-
-@pytest.mark.parametrize("dialogue_mode", ["auto", "edit", "custom"])
-def test_no_bgm_without_spoken_asr_authority_cannot_bind_source_mix(
-    tmp_path: Path, dialogue_mode: str,
-) -> None:
-    meta, plan = _audio_compile_fixture(
-        tmp_path, segment_count=1, classification="spoken",
-    )
-    meta["voice_line_provenance"] = [{
-        "text": "song",
-        "start_s": 0.0,
-        "end_s": 1.0,
-        "classification": "sung",
-        "provenance": "asr",
-        "kept": True,
-    }]
-
-    with pytest.raises(
-        long_generation.LongGenerationError,
-        match="clean_voice_reference_required",
-    ):
-        long_generation.build_prompt_fusion_input(
-            root=tmp_path,
-            meta=meta,
-            plan=plan,
-            dialogue_mode=dialogue_mode,
-            dialogue_delivery="off_screen",
-        )
-
-
-def test_legacy_unbound_spoken_provenance_cannot_bind_current_voice_bytes(
-    tmp_path: Path,
-) -> None:
-    meta, plan = _audio_compile_fixture(
-        tmp_path, segment_count=1, classification="spoken",
-    )
-    meta["voice_line_provenance"] = [{
-        key: value
-        for key, value in meta["voice_line_provenance"][0].items()
-        if not key.startswith("analysis_")
-        and key != "classification_evidence_sha256"
-    }]
-
-    with pytest.raises(
-        long_generation.LongGenerationError,
-        match="clean_voice_reference_required",
-    ):
-        long_generation.build_prompt_fusion_input(
-            root=tmp_path,
-            meta=meta,
-            plan=plan,
-            dialogue_mode="auto",
-            dialogue_delivery="off_screen",
-        )
-
-
 @pytest.mark.parametrize(
     "drift",
     ("audio", "path", "audio_sha256", "has_bgm", "decision", "evidence"),
 )
-def test_spoken_voice_authority_rejects_any_analysis_provenance_drift(
+def test_analysis_provenance_drift_never_selects_a_generation_chain(
     tmp_path: Path, drift: str,
 ) -> None:
     meta, plan = _audio_compile_fixture(
@@ -854,37 +784,64 @@ def test_spoken_voice_authority_rejects_any_analysis_provenance_drift(
     else:
         line["classification_evidence_sha256"] = "0" * 64
 
-    with pytest.raises(
-        long_generation.LongGenerationError,
-        match="clean_voice_reference_required",
-    ):
-        long_generation.build_prompt_fusion_input(
-            root=tmp_path,
-            meta=meta,
-            plan=plan,
-            dialogue_mode="auto",
-            dialogue_delivery="off_screen",
-        )
+    payload = json.loads(long_generation.build_prompt_fusion_input(
+        root=tmp_path,
+        meta=meta,
+        plan=plan,
+        dialogue_mode="auto",
+        dialogue_delivery="off_screen",
+    ))
+    audio = payload["segments"][0]["audio_content"]
+    assert audio["voice_references"] == []
+    assert json.loads(audio["lines_json"])[0]["voice_ref"] is None
 
 
-def test_paid_request_revalidates_frozen_voice_authority(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("segment_count", [1, 2], ids=("n1", "n2"))
+@pytest.mark.parametrize("has_bgm", [False, True, None])
+def test_spoken_lines_never_turn_source_audio_into_a_reference(
+    tmp_path: Path, segment_count: int, has_bgm: bool | None,
 ) -> None:
-    settings = make_settings(tmp_path)
-    root = settings.data_dir / "voice-authority-paid-gate"
+    meta, plan = _audio_compile_fixture(
+        tmp_path, segment_count=segment_count, classification="spoken",
+    )
+    meta["has_bgm"] = has_bgm
+
+    payload = json.loads(long_generation.build_prompt_fusion_input(
+        root=tmp_path,
+        meta=meta,
+        plan=plan,
+        dialogue_mode="auto",
+        dialogue_delivery="off_screen",
+    ))
+
+    for segment in payload["segments"]:
+        audio = segment["audio_content"]
+        assert audio["music_policy"] == "forbid"
+        assert json.loads(audio["lines_json"])[0]["voice_ref"] is None
+        assert audio["voice_references"] == []
+
+
+def test_current_fusion_request_has_one_workflow_and_zero_audio_references(
+    tmp_path: Path,
+) -> None:
+    settings = replace(make_settings(tmp_path), autodl_art_token="test-token")
+    root = settings.data_dir / "single-audio-chain"
     root.mkdir(parents=True)
     meta, base = _audio_compile_fixture(
         root, segment_count=1, classification="spoken",
     )
-    _path, _data, authority_sha256 = long_generation._clean_voice_authority(
-        root, meta,
-    )
-    segment = base.segments[0]
-    segment = long_generation.FrozenSegment(
-        **{
-            **segment.__dict__,
-            "prompt_fusion_audio_paths": (root / "work" / "voice.mp3",),
-        }
+    fusion_input = json.loads(long_generation.build_prompt_fusion_input(
+        root=root,
+        meta=meta,
+        plan=base,
+        dialogue_mode="auto",
+        dialogue_delivery="off_screen",
+    ))
+    segment = replace(
+        base.segments[0],
+        prompt=_fusion_v2_final_prompt(
+            fusion_input["segments"][0], "fused visual",
+        ),
     )
     fusion = long_generation.FrozenPromptFusion(
         version=long_generation.PROMPT_FUSION_VERSION,
@@ -901,54 +858,25 @@ def test_paid_request_revalidates_frozen_voice_authority(
         **{
             **base.__dict__,
             "segments": (segment,),
-            "workflow": h3.H3_MULTIMODAL_WORKFLOW,
+            "workflow": h3.H3_WORKFLOW,
             "prompt_fusion": fusion,
-            "voice_authority_sha256": authority_sha256,
         }
     )
-    monkeypatch.setattr(storage, "load_meta", lambda *_args: meta)
-    (root / "work" / "voice.mp3").write_bytes(b"post-freeze replacement")
 
-    with pytest.raises(
-        long_generation.LongGenerationError,
-        match="clean_voice_reference_required",
-    ):
-        long_generation._request(
-            settings,
-            "voice-authority-paid-gate",
-            plan,
-            segment,
-            "parent-request",
-            "none",
-        )
-
-
-@pytest.mark.parametrize("segment_count", [1, 2], ids=("n1", "n2"))
-def test_verified_spoken_no_bgm_compiles_one_bound_conditioning_reference(
-    tmp_path: Path, segment_count: int,
-) -> None:
-    meta, plan = _audio_compile_fixture(
-        tmp_path, segment_count=segment_count, classification="spoken",
+    request = long_generation._request(
+        settings,
+        "single-audio-chain",
+        plan,
+        segment,
+        "parent-request",
+        "none",
     )
 
-    payload = json.loads(long_generation.build_prompt_fusion_input(
-        root=tmp_path,
-        meta=meta,
-        plan=plan,
-        dialogue_mode="auto",
-        dialogue_delivery="off_screen",
-    ))
-
-    for segment in payload["segments"]:
-        audio = segment["audio_content"]
-        assert audio["music_policy"] == "forbid"
-        assert json.loads(audio["lines_json"])[0]["voice_ref"] == 1
-        assert audio["voice_references"] == [{
-            "voice_ref": 1,
-            "path": "work/voice.mp3",
-            "sha256": hashlib.sha256(b"whole-source-mix").hexdigest(),
-            "purpose": "voice",
-        }]
+    assert request.workflow == h3.H3_WORKFLOW
+    assert request.reference_audios == ()
+    assert request.audio_required is False
+    assert request.voice_texts == ("line 1",)
+    assert request.context_ir_required is True
 
 
 @pytest.mark.parametrize("dialogue_mode", ["edit", "custom"])
@@ -969,7 +897,8 @@ def test_manual_dialogue_is_not_reclassified_when_clean_authority_exists(
 
     audio = payload["segments"][0]["audio_content"]
     assert json.loads(audio["lines_json"])[0]["text"] == "line 1"
-    assert audio["voice_references"][0]["purpose"] == "voice"
+    assert json.loads(audio["lines_json"])[0]["voice_ref"] is None
+    assert audio["voice_references"] == []
 
 
 def test_explicit_none_discards_spoken_even_when_bgm_is_unknown(
@@ -1190,7 +1119,7 @@ def _fusion_input(
             data = f"segment-{index}-frame-{order}".encode()
             (root / relative).write_bytes(data)
             prompt = f"segment {index} optimized image {order}"
-            source_time_s = float((index - 1) * 20 + order - 1)
+            segment_time_s = float(order - 1)
             frame = {
                 "order": order,
                 "path": relative,
@@ -1198,12 +1127,12 @@ def _fusion_input(
             }
             if version == long_generation.PROMPT_FUSION_VERSION:
                 frame.update({
-                    "source_time_s": source_time_s,
+                    "segment_time_s": segment_time_s,
                     "source_scene_id": "SCENE_01",
                     "transition": (
-                    {"type": "start", "at_s": source_time_s}
-                    if index == order == 1 else
-                    {"type": "continuous", "at_s": None}
+                    {"type": "start", "at_segment_s": 0.0}
+                    if order == 1 else
+                    {"type": "continuous", "at_segment_s": None}
                     ),
                 })
             frames.append(frame)
@@ -1248,7 +1177,7 @@ def _fusion_v1_input(root: Path, segment_count: int) -> bytes:
     ))
     for segment in payload["segments"]:
         for frame in segment["new_keyframes"]:
-            frame.pop("source_time_s", None)
+            frame.pop("segment_time_s", None)
             frame.pop("source_scene_id", None)
             frame.pop("transition", None)
         segment["audio_content"].pop("music_policy", None)
@@ -1258,11 +1187,11 @@ def _fusion_v1_input(root: Path, segment_count: int) -> bytes:
 def _fusion_v2_final_prompt(segment: dict, visual: str) -> str:
     timeline = [{
         "order": frame["order"],
-        "source_time_s": frame["source_time_s"],
+        "segment_time_s": frame["segment_time_s"],
         "source_scene_id": frame["source_scene_id"],
         "transition": {
             "type": frame["transition"]["type"],
-            "at_s": frame["transition"]["at_s"],
+            "at_segment_s": frame["transition"]["at_segment_s"],
         },
     } for frame in segment["new_keyframes"]]
     timeline_json = json.dumps(
@@ -1275,7 +1204,7 @@ def _fusion_v2_final_prompt(segment: dict, visual: str) -> str:
         "<AUDIO_CONTENT_JSON>"
         f"{segment['audio_content']['lines_json']}"
         "</AUDIO_CONTENT_JSON>\n"
-        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+        "<MUSIC_POLICY>\nnon_diegetic_music: N/A\n</MUSIC_POLICY>"
     )
 
 
@@ -1303,23 +1232,15 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
         "must stay outside the fusion stage", encoding="utf-8",
     )
     if segment_count == 1:
-        voice = root / "work" / "segments" / "1" / "work" / "voice.mp3"
-        voice.parent.mkdir(parents=True, exist_ok=True)
-        voice.write_bytes(b"voice-reference-must-not-be-staged")
         payload = json.loads(input_data)
         lines_json = (
             '[{"order":1,"text":"spoken","start_s":0.0,"end_s":1.0,'
-            '"delivery":"off_screen","voice_ref":1}]'
+            '"delivery":"off_screen","voice_ref":null}]'
         )
         payload["segments"][0]["audio_content"] = {
             "lines_json": lines_json,
             "lines_sha256": hashlib.sha256(lines_json.encode()).hexdigest(),
-            "voice_references": [{
-                "voice_ref": 1,
-                "path": "work/segments/1/work/voice.mp3",
-                "sha256": hashlib.sha256(voice.read_bytes()).hexdigest(),
-                "purpose": "voice",
-            }],
+            "voice_references": [],
             "music_policy": "forbid",
         }
         input_data = _canonical(payload)

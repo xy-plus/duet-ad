@@ -37,20 +37,20 @@ links: []
 
 - 全链只允许调用三个 Skill：`video-maker` 负责关键词/片段分析、每段 9 张关键帧和旧视频提示词；`image-postprocess` 只负责关键帧图片优化；`video-prompt-fusion` 只负责最终提示词融合。不得派生 Audio、Binding、Speaker 或其他 Skill/phase。
 - 收口后的 `video-maker` Skill 权威 SHA-256 为 `0bbb22baeb8f14fef737b279e2ab2e8f70bf8965d41b182f1987537e1e3e4785`；不得恢复已删除的音画绑定、说话人可见性或图片后融合 phase。
-- `video-prompt-fusion` Skill 权威 SHA-256 为 `0c1db0fc03a1a0121f5c57a3b391d2c65e95c9ed5272d1e84d3719e736eaa09c`；只允许一次项目级调用并只消费四类冻结输入。v2 必须同时冻结逐帧源时间/scene/transition 与 `music_policy=forbid`；音频块必须采用标签与 `lines_json` 字节紧邻的单行包络。Skill 只读取 SHA 绑定的新关键帧图片，voice reference 路径只作为后端 receipt 元数据，不得扩展为新的分析、评测或供应商阶段。
+- `video-prompt-fusion` Skill 权威 SHA-256 为 `3433e24c6747b4ddd4f8f345353a61d6646715aae2d4f8dc4213595cec17e9b2`；只允许一次项目级调用并只消费四类冻结输入。v2 必须把逐帧源时间/scene/transition 机械投影为每段从零开始的 `segment_time_s/at_segment_s`，并冻结 `music_policy=forbid`；音频块必须采用标签与 `lines_json` 字节紧邻的单行包络，并固定 `voice_references=[]`、每条 `voice_ref=null`。Skill 只读取 SHA 绑定的新关键帧图片；源音频不得成为 Skill 或供应商的 reference。
 - 已验收的 `image-postprocess` 生成效果、目标视觉和 A→B 提示词已经冻结，不再迭代。职责清理已经完成：只删除素材拒绝、流程控制、验收门和发布逻辑，完整保留原验收版 A→B 生成合同。最终权威 Skill SHA-256 为 `4839f0f0673a9e05cc44f2938c1068a63a142c8c31a9f6b2b2f138842b68cd03`。
-- 除上述三个 Skill 外，不存在 Binding Skill、Audio Skill、Speaker Skill 或第四个 Skill。音频呈现由普通后端代码根据冻结台词、Web 的画内/画外选择和现有 voice reference 做确定性投影，再作为只读输入交给融合 Skill。
+- 除上述三个 Skill 外，不存在 Binding Skill、Audio Skill、Speaker Skill 或第四个 Skill。源音频只供既有 ASR + YAMNet 分析；后端只把 `spoken` 文本及其冻结时间/呈现方式投影给融合 Skill，不传递音频路径或 reference。
 - 单段和多段不是两条链。所有当前项目统一为 `segments[N>=1]`；所谓短视频只是 `N=1`，使用同一冻结、Context、H3、attempt、恢复、拼接和验收实现。
 - 图片 Skill 收到合法可解码关键帧就执行，不做素材资格审查，不因人物、场景、遮挡或内容复杂而拒绝开始。
-- `video-prompt-fusion` 的四类输入固定为：有序新关键帧、旧视频提示词、图片优化提示词、音频相关内容。新人物、新场景、新对象、服装、材质、空间结构、锚点景别和裁切以新关键帧为准；旧视频提示词只负责同一硬切区间内的动作顺序、因果、镜头运动类型和相对节奏；源时间、source scene 与硬切以既有分析产物为准；图片优化提示词只解释替换目标和保持约束；音频文本、时间、画内/画外和 voice reference 逐字保持。
+- `video-prompt-fusion` 的四类输入固定为：有序新关键帧、旧视频提示词、图片优化提示词、音频相关内容。新人物、新场景、新对象、服装、材质、空间结构、锚点景别和裁切以新关键帧为准；旧视频提示词只负责同一硬切区间内的动作顺序、因果、镜头运动类型和相对节奏；源时间、source scene 与硬切以既有分析产物为准；图片优化提示词只解释替换目标和保持约束；自动音频只逐字保持 `spoken` 文本、时间和画内/画外，reference 永远为空。
 - 音频分类只复用已经存在并经过验证的 ASR + YAMNet 节点，不引入替代分类器、声源分离器或新 Skill。当前冻结枚举仍只有 `spoken/sung/null`；YAMNet 检出的 singing、chant、rap、humming 等歌唱类统一归入既有 `sung`，不新增分类值。自动台词只接受 `spoken`；仅有 `sung` 时必须冻结 `lines=[]`、`voice_references=[]`，不得把歌词改名为画外台词。
-- 从源视频抽取的 `work/voice.mp3` 默认只用于既有 ASR/YAMNet 分析。只有同一冻结收据同时确认存在 `spoken` 且 `has_bgm=false` 时，这份原字节才可作为唯一 conditioning voice reference；`spoken/edit/custom` 需要声音但 `has_bgm=true` 或结果未知时必须在付费前明确拒绝。只有用户显式选择 `dialogue_mode=none` 才能丢弃真实口播，不得由 `auto` 静默降级。
-- 默认不生成背景音乐是贯穿 Fusion、Context IR 和最终发布的合同，不是一个可丢失的旧提示词前缀。无真实口播的 segment 使用现有无音频 H3 路径并在拼接时输出静音；不得仅依靠 `no music` 自然语言承诺消除模型生成的音乐。
+- 从源视频抽取的 `work/voice.mp3` 永远只用于既有 ASR/YAMNet 分析。`has_bgm=true/false/unknown` 只写入指标与 receipt，不得拒绝、重试或切换 workflow；`auto` 只投影 `spoken` 为台词，固定零 reference。
+- `music_policy=forbid` 必须机械投影为精确的三行 `<MUSIC_POLICY>\nnon_diegetic_music: N/A\n</MUSIC_POLICY>`，并贯穿 Fusion、Context IR 与 H3；不得存在第二种当前表达。它是生成约束，但相关语义检查只评分，不阻断输出或选择另一条链。
 - 每张冻结关键帧必须同时绑定源时间、源 scene 和与前一帧的转场类型。源视频的硬切是时间轴权威：不得被后端误标为 `same_camera`，不得被 Fusion 或 Context IR 改到其他时刻，也不得让单个 H3 请求跨该硬切连续变形。
 - 首轮先修复现有 transition、anchor、Fusion 与 Context 合同，在同一请求中明确冻结硬切而非连续 morph；若真实 A/B 仍出现跨切点变形，再复用现有 `segments[N>=1]` 与 stitch 做物理隔离。物理拆分上线前必须证明短逻辑段仍有 9 个唯一源帧、供应商合法时长不会丢动作、台词不跨边界，且逻辑/供应商时长由版本化 receipt 分别绑定；证明不足时付费前拒绝。
 - 用户第一次确认生成时，后端冻结包括声音呈现在内的四类输入，并以一次项目级 `video-prompt-fusion` 调用覆盖全部 `segments[N>=1]`；完成后 Web 只刷新展示，不自动再次提交。用户使用相同设置再次明确确认后，才进入 Context IR 和 H3。
-- Context IR 只优化 `video-prompt-fusion` 输出的文字表达，不得恢复旧视觉元素，也不得改变关键帧顺序、台词、时间、画内/画外选择或 voice reference；IR 完成后直接进入 H3，中间不得增加新阶段。
-- 有真实口播且存在合法 clean voice reference 时，H3 最终音频以供应商原生输出为准；源混音或 conditioning audio 不得在拼接时覆盖、回挂或混入成片。无真实口播时丢弃 H3 音轨并输出静音，确保模型新生背景音乐不会进入成片。
+- Context IR 只优化 `video-prompt-fusion` 输出的视觉文字表达；后端机械恢复冻结的关键帧顺序、台词、时间、画内/画外和唯一音乐策略表达。`speech_expected=bool(voice_texts)` 与其他语义结果只记分，IR 完成后仍直接进入同一 H3 workflow。
+- 所有当前 segment 固定零 reference、同一 H3 workflow、Context 与 H3 原生音频，再以 `provider_generated` 模式拼接。某段 H3 无音轨时在同一 EDL 为该段补有限静音；源音频绝不覆盖、回挂或混入成片。
 - `submission_unknown` 只允许查询已有任务，不得自动或人工再次 POST。
 - 完整可用链最终只部署到 Web 端口 `3211`，以同端口可回滚替换旧版本；不得新建其他对外预览端口代替交付。
 

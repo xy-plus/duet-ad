@@ -43,12 +43,11 @@ def test_input_contract_has_only_the_four_content_classes():
         "old_video_prompt: FrozenText",
         "image_optimization_prompt: NineOrdered<FrozenFramePrompt>",
         "audio_content: FrozenAudioContent",
-        'KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256; source_time_s: Number; source_scene_id: NonEmpty; transition: { type: "start" | "continuous" | "hard_cut"; at_s: Number | null } }',
+        'KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256; segment_time_s: Number; source_scene_id: NonEmpty; transition: { type: "start" | "continuous" | "hard_cut"; at_segment_s: Number | null } }',
         "FrozenText = { text: NonEmpty; sha256: Sha256 }",
         "FrozenFramePrompt = { order: Int1; text: NonEmpty; sha256: Sha256 }",
-        'FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice_references: Array<VoiceReference>; music_policy: "forbid" }',
-        "AudioLine = { order: Int1; text: NonEmpty; start_s: Number; end_s: Number; delivery: NonEmpty; voice_ref: Int1 | null }",
-        'VoiceReference = { voice_ref: Int1; path: NonEmpty; sha256: Sha256; purpose: "voice" }',
+        'FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice_references: []; music_policy: "forbid" }',
+        "AudioLine = { order: Int1; text: NonEmpty; start_s: Number; end_s: Number; delivery: NonEmpty; voice_ref: null }",
         "除结构字段 `schema/version/segments/index` 外，段内恰好只有上述四类输入",
         '`music_policy` 必须是 exact 字符串 `"forbid"`',
     ):
@@ -75,26 +74,27 @@ def test_hash_order_and_segment_scope_are_closed_world():
         "每段恰好 9 张",
         "每条图片优化提示词与同 `order` 新关键帧一一对应",
         "不得选帧、删帧、补帧或重排",
-        "按 `(segment index, keyframe order)` 全局严格递增",
-        "只有项目第一张",
-        '`type="start"` 且 `at_s=source_time_s`',
-        "其余关键帧禁止 `start`",
-        '`continuous` 的 `at_s` 必须为 `null`',
+        "在该段按 keyframe `order` 严格递增",
+        "每段 order 1",
+        '`segment_time_s=0`、`type="start"`、`at_segment_s=0`',
+        "输入和输出中禁止出现全局 `source_time_s` 或 `at_s`",
+        '`continuous` 的 `at_segment_s` 必须为 `null`',
         '`continuous` 只表示没有 source hard cut',
         '`continuous` 不授权静态机位、构图或 camera movement',
-        '`hard_cut` 的 `at_s` 必须是有限非负数',
-        "前一张 `source_time_s < at_s <=` 当前张 `source_time_s`",
+        '`hard_cut` 的 `at_segment_s` 必须是有限非负数',
+        "前一张 `segment_time_s < at_segment_s <=` 当前张 `segment_time_s`",
         "source scene 改变时必须是 `hard_cut`",
         "source scene 不变时必须是 `continuous`",
-        "硬切前后 scene ids 必须逐值等于相邻关键帧的 `source_scene_id`",
+        "只在每个 segment 内比较相邻关键帧",
         "硬切后的当前关键帧是新 anchor",
         "图片原始 bytes 的 SHA-256",
         "UTF-8 `text` bytes 的 SHA-256",
         "UTF-8 `audio_content.lines_json` exact bytes 的 SHA-256",
-        "每个非 null `voice_ref` 必须唯一解析到同值 `voice_references[].voice_ref`",
+        "`voice_ref` 必须逐行保持为 `null`",
+        "`voice_references` 必须是 `[]`",
+        "source audio 只属于上游 ASR/YAMNet 分析证据",
         "只有 `new_keyframes[].path` 是本 Skill 可读取的文件路径",
-        "`voice_references[].path` 只是后端已冻结的 receipt 元数据",
-        "不要求该音频文件出现在隔离工作目录中",
+        "输入不存在可读音频路径",
         '`lines_json="[]"`',
         "不得跨 segment 借用",
         "任一 schema、数量、索引、顺序、路径或哈希不匹配时，不写输出文件",
@@ -121,8 +121,9 @@ def test_visual_authorities_are_explicit_and_non_overlapping():
         "删除旧视频提示词中与新关键帧冲突的旧人物、旧场景、旧对象、旧服装、旧材质和旧空间结构",
         "不得从静态关键帧反推或改写动作顺序、因果关系、camera movement type 或相对节奏",
         "不得引入四类输入均未支持的新事实",
-        "内容冲突不构成拒绝",
-        "技术有效的四类输入必须为每个 segment 产出一个最终提示词",
+        "内容冲突和语义评分都不构成拒绝",
+        "技术可读取的四类输入必须为每个 segment 产出一个最终提示词",
+        "不得据此拒绝、重试、改走另一 workflow 或不写输出",
     ):
         assert required in text
 
@@ -164,8 +165,7 @@ def test_old_dynamic_is_confined_to_each_hard_cut_interval():
         "含多个 hard-cut 区间且缺少可定位边界的旧动态也删除",
         "无法唯一归属一个 hard-cut 区间",
         "不得把切前主体、构图或运动状态延续到切后",
-        "`hard_cut.at_s` 不得改写为其他关键帧的 `source_time_s`",
-        "硬切记录及切后当前 anchor",
+        "`hard_cut.at_segment_s` 及切后当前 anchor 必须逐值保持",
     ):
         assert required in text
 
@@ -176,22 +176,24 @@ def test_audio_is_copied_exactly_inside_the_final_prompt():
     text = _skill()
 
     for required in (
-        "音频文本、时间、delivery 和 voice_ref 逐值原样保持",
+        "音频文本、时间、delivery 和 `voice_ref=null` 逐值原样保持",
         "不得翻译、润色、纠错、合并、拆分、重排或补写音频行",
         "<AUDIO_CONTENT_JSON>",
         "</AUDIO_CONTENT_JSON>",
         "逐字复制 `audio_content.lines_json`",
         "音频块之外不得再复述或改写音频内容",
-        "<MUSIC_POLICY>forbid</MUSIC_POLICY>",
+        "non_diegetic_music: N/A",
         "恰好一次",
-        "只允许改写 `<VISUAL>`",
-        "两个合同块都逐 byte 保持",
+        "Context 只贡献 `<VISUAL>` 语义",
+        "只降低语义评分，不阻断同一 H3 链",
     ):
         assert required in text
 
     assert (
         "<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>\n"
-        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+        "<MUSIC_POLICY>\n"
+        "non_diegetic_music: N/A\n"
+        "</MUSIC_POLICY>"
     ) in text
     assert "opening tag 的下一 byte 必须是 `lines_json` 首 byte" in text
     assert "closing tag 紧随 `lines_json` 末 byte" in text
@@ -206,11 +208,11 @@ def test_keyframe_timeline_is_canonical_and_context_immutable():
 
     for required in (
         "<KEYFRAME_TIMELINE_JSON>{keyframe_timeline_json}</KEYFRAME_TIMELINE_JSON>",
-        "逐项投影 `order/source_time_s/source_scene_id/transition`",
+        "逐项投影 `order/segment_time_s/source_scene_id/transition`",
         "字段顺序固定为",
         "UTF-8 compact JSON",
         "不得加入 `path`、`sha256` 或其他字段",
-        "timeline 块逐 byte 保持",
+        "后端从冻结输入机械重建 timeline",
     ):
         assert required in text
 
@@ -218,14 +220,17 @@ def test_keyframe_timeline_is_canonical_and_context_immutable():
         "</VISUAL>\n"
         "<KEYFRAME_TIMELINE_JSON>{keyframe_timeline_json}</KEYFRAME_TIMELINE_JSON>\n"
         "<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>\n"
-        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+        "<MUSIC_POLICY>\n"
+        "non_diegetic_music: N/A\n"
+        "</MUSIC_POLICY>"
     ) in text
 
 
 def test_clean_reference_proof_stays_out_of_the_skill_schema():
     text = _skill()
 
-    assert "clean reference 的资格证明只由后端 frozen receipt 负责" in text
+    assert "source audio 只属于上游 ASR/YAMNet 分析证据" in text
+    assert "绝不作为当前 H3 reference" in text
     for forbidden_field in (
         "clean_reference_proof:",
         "clean_voice_proof:",

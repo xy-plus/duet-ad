@@ -129,7 +129,17 @@ def _native_audio_timeline() -> dict:
     }
 
 
-def test_provider_generated_stitch_supports_native_then_explicit_mute_segment(
+def _native_silent_timeline() -> dict:
+    return {
+        "schema": "duet.h3.media_timeline",
+        "version": 1,
+        "decode_complete": True,
+        "video": {"decoded_sha256": "3" * 64},
+        "audio": None,
+    }
+
+
+def test_provider_generated_stitch_supports_native_then_missing_audio_segment(
     tmp_path,
 ):
     native = tmp_path / "native.mp4"
@@ -143,7 +153,9 @@ def test_provider_generated_stitch_supports_native_then_explicit_mute_segment(
         stitch.StitchSegment(
             native, 1.0, "hard_cut", "000001", _native_audio_timeline(),
         ),
-        stitch.StitchSegment(silent, 1.0, "hard_cut"),
+        stitch.StitchSegment(
+            silent, 1.0, "hard_cut", "000002", _native_silent_timeline(),
+        ),
     ]
 
     result = stitch.stitch_video(
@@ -155,7 +167,7 @@ def test_provider_generated_stitch_supports_native_then_explicit_mute_segment(
 
     receipt = json.loads(result.receipt_path.read_text(encoding="utf-8"))
     assert [item["source"] for item in receipt["audio"]["provider_segments"]] == [
-        "h3", "mute",
+        "h3", "h3",
     ]
     assert stitch.output_is_reusable(
         segments=segments,
@@ -165,68 +177,89 @@ def test_provider_generated_stitch_supports_native_then_explicit_mute_segment(
     )
 
 
+def test_provider_generated_stitch_fills_missing_h3_audio_on_same_edl(
+    tmp_path,
+):
+    silent = tmp_path / "h3-without-audio.mp4"
+    source = tmp_path / "source-with-audio.mp4"
+    output = tmp_path / "generated.mp4"
+    _make_video(silent, "blue", 1.0, codec="libx264", rate=24)
+    _make_video(source, "black", 1.0, codec="libx264", rate=24, audio=True)
+    segments = [stitch.StitchSegment(
+        silent, 1.0, "hard_cut", "000001", _native_silent_timeline(),
+    )]
+
+    result = stitch.stitch_video(
+        segments=segments,
+        source_video=source,
+        output=output,
+        audio_mode="provider_generated",
+    )
+
+    receipt = json.loads(result.receipt_path.read_text(encoding="utf-8"))
+    assert receipt["audio"]["provider_segments"] == [{
+        "source": "h3",
+        "attempt_id": "000001",
+        "media_timeline_sha256": stitch._canonical_sha256(
+            _native_silent_timeline()
+        ),
+        "decoded_audio_sha256": None,
+    }]
+    assert len([
+        stream for stream in _probe(output)["streams"]
+        if stream["codec_type"] == "audio"
+    ]) == 1
+
+
 @pytest.mark.parametrize("audio_duration", [0.35, 1.6])
-def test_keep_audio_is_trimmed_or_padded_to_visual_timeline(tmp_path, audio_duration):
+def test_source_audio_overlay_mode_is_not_supported(tmp_path, audio_duration):
     segment = tmp_path / "segment.mp4"
     source = tmp_path / "source.mp4"
     output = tmp_path / "generated.mp4"
     _make_video(segment, "red", 1.0, codec="libx264", rate=24)
     _make_video_with_audio_duration(source, 1.0, audio_duration)
 
-    stitch.stitch_video(
-        segments=[stitch.StitchSegment(segment, 1.0, "hard_cut")],
-        source_video=source,
-        output=output,
-        audio_mode="keep",
-    )
-
-    probe = _probe(output)
-    video = next(stream for stream in probe["streams"] if stream["codec_type"] == "video")
-    audio = next(stream for stream in probe["streams"] if stream["codec_type"] == "audio")
-    assert abs(float(video["duration"]) - 1.0) <= 1 / 24
-    assert abs(float(audio["duration"]) - float(video["duration"])) <= 0.05
+    with pytest.raises(ValueError, match="mute.*provider_generated"):
+        stitch.stitch_video(
+            segments=[stitch.StitchSegment(segment, 1.0, "hard_cut")],
+            source_video=source,
+            output=output,
+            audio_mode="keep",  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize("offset", [-0.5, 0.0, 0.5])
-def test_keep_audio_preserves_relative_source_offset(tmp_path, offset):
+def test_source_audio_offset_never_enables_overlay(tmp_path, offset):
     segment = tmp_path / "segment.mp4"
     source = tmp_path / f"source-{offset}.mp4"
     output = tmp_path / f"generated-{offset}.mp4"
     _make_video(segment, "red", 2.0, codec="libx264", rate=24)
     _make_offset_video(source, offset)
 
-    stitch.stitch_video(
-        segments=[stitch.StitchSegment(segment, 2.0, "hard_cut")],
-        source_video=source,
-        output=output,
-        audio_mode="keep",
-    )
-
-    onset = _audible_start(output)
-    if offset > 0:
-        assert onset == pytest.approx(0.5, abs=0.08)
-    else:
-        assert onset < 0.08
-    video = next(s for s in _probe(output)["streams"] if s["codec_type"] == "video")
-    assert float(video["duration"]) == pytest.approx(2.0, abs=1 / 24)
+    with pytest.raises(ValueError, match="mute.*provider_generated"):
+        stitch.stitch_video(
+            segments=[stitch.StitchSegment(segment, 2.0, "hard_cut")],
+            source_video=source,
+            output=output,
+            audio_mode="keep",  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(("suffix", "audio_codec"), [(".mp4", "aac"), (".webm", "libopus")])
-def test_keep_audio_does_not_trim_codec_priming_twice(tmp_path, suffix, audio_codec):
+def test_source_codec_never_enables_overlay(tmp_path, suffix, audio_codec):
     segment = tmp_path / "segment.mp4"
     source = tmp_path / f"source{suffix}"
     output = tmp_path / f"generated-{audio_codec}.mp4"
     _make_video(segment, "red", 2.0, codec="libx264", rate=24)
     _make_priming_video(source, audio_codec)
 
-    stitch.stitch_video(
-        segments=[stitch.StitchSegment(segment, 2.0, "hard_cut")],
-        source_video=source,
-        output=output,
-        audio_mode="keep",
-    )
-
-    assert _initial_peak(output) > 3_000
+    with pytest.raises(ValueError, match="mute.*provider_generated"):
+        stitch.stitch_video(
+            segments=[stitch.StitchSegment(segment, 2.0, "hard_cut")],
+            source_video=source,
+            output=output,
+            audio_mode="keep",  # type: ignore[arg-type]
+        )
 
 
 def _pixel(path: Path, timestamp: float) -> tuple[int, int, int]:
@@ -260,7 +293,7 @@ def test_stitch_normalizes_order_duration_audio_and_receipt(tmp_path):
         ],
         source_video=source,
         output=output,
-        audio_mode="keep",
+        audio_mode="mute",
     )
 
     probe = _probe(output)
@@ -268,8 +301,7 @@ def test_stitch_normalizes_order_duration_audio_and_receipt(tmp_path):
     assert video["codec_name"] == "h264"
     assert video["pix_fmt"] == "yuv420p"
     assert video["avg_frame_rate"] == "24/1"
-    assert any(s["codec_type"] == "audio" and s["codec_name"] == "aac"
-               for s in probe["streams"])
+    assert all(s["codec_type"] != "audio" for s in probe["streams"])
     assert abs(float(video["duration"]) - 1.0) <= 1 / 24
     assert _pixel(output, 0.20)[0] > 200
     assert _pixel(output, 0.70)[2] > 200
@@ -279,7 +311,7 @@ def test_stitch_normalizes_order_duration_audio_and_receipt(tmp_path):
     assert receipt["schema"] == "duet.stitch"
     assert receipt["version"] == 1
     assert receipt["audio"] == {
-        "mode": "keep", "source": str(source.resolve()),
+        "mode": "mute", "source": str(source.resolve()),
         "source_sha256": _sha256(source), "source_has_audio": True,
     }
     assert [item["sha256"] for item in receipt["segments"]] == [
@@ -346,7 +378,7 @@ def test_single_15_second_segment_keeps_its_first_frame(tmp_path):
     assert abs(float(video["duration"]) - 15.0) <= 1 / 24
 
 
-def test_keep_without_source_audio_is_valid_silent_output(tmp_path):
+def test_mute_without_source_audio_is_valid_silent_output(tmp_path):
     segment = tmp_path / "segment.mp4"
     source = tmp_path / "source.mp4"
     output = tmp_path / "generated.mp4"
@@ -357,7 +389,7 @@ def test_keep_without_source_audio_is_valid_silent_output(tmp_path):
         segments=[stitch.StitchSegment(segment, 0.5, "hard_cut")],
         source_video=source,
         output=output,
-        audio_mode="keep",
+        audio_mode="mute",
     )
 
     assert all(s["codec_type"] != "audio" for s in _probe(output)["streams"])

@@ -198,19 +198,19 @@ def _no_audio_frozen(
 def _timeline_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
     base = _no_audio_frozen(tmp_path)
     timeline = []
-    for order, source_time_s in enumerate(
+    for order, segment_time_s in enumerate(
         [0.0, 1.0, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0], 1
     ):
         timeline.append({
             "order": order,
-            "source_time_s": source_time_s,
+            "segment_time_s": segment_time_s,
             "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
             "transition": (
-                {"type": "start", "at_s": 0.0}
+                {"type": "start", "at_segment_s": 0.0}
                 if order == 1 else
-                {"type": "hard_cut", "at_s": 2.267}
+                {"type": "hard_cut", "at_segment_s": 2.267}
                 if order == 4 else
-                {"type": "continuous", "at_s": None}
+                {"type": "continuous", "at_segment_s": None}
             ),
         })
     timeline_json = json.dumps(
@@ -225,7 +225,7 @@ def _timeline_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest
         + timeline_json
         + "</KEYFRAME_TIMELINE_JSON>\n"
         + "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
-        + "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+        + "<MUSIC_POLICY>\nnon_diegetic_music: N/A\n</MUSIC_POLICY>"
     )
     source = replace(
         base.source_h3_request,
@@ -249,7 +249,7 @@ def test_current_fusion_no_bgm_suffix_is_bound_and_must_survive_context(
 ) -> None:
     suffix = (
         "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
-        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+        "<MUSIC_POLICY>\nnon_diegetic_music: N/A\n</MUSIC_POLICY>"
     )
     frozen = _no_audio_frozen(
         tmp_path, prompt=f"<VISUAL>source</VISUAL>\n{suffix}",
@@ -262,7 +262,9 @@ def test_current_fusion_no_bgm_suffix_is_bound_and_must_survive_context(
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
     assert result.status == "succeeded"
-    assert result.effective_prompt == effective
+    assert result.effective_prompt == context_ir_bridge._compile_effective_prompt(
+        frozen, effective
+    )
 
 
 def test_legacy_context_semantic_hash_is_unchanged_without_music_marker(
@@ -307,12 +309,12 @@ def test_legacy_audio_json_may_contain_music_marker_literal(
     ],
     ids=("missing-policy", "changed-policy", "rewritten-audio"),
 )
-def test_context_rejects_fusion_audio_or_music_policy_drift(
+def test_context_scores_fusion_audio_or_music_policy_drift(
     tmp_path: Path, effective_suffix: str,
 ) -> None:
     source_suffix = (
         "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
-        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+        "<MUSIC_POLICY>\nnon_diegetic_music: N/A\n</MUSIC_POLICY>"
     )
     frozen = _no_audio_frozen(
         tmp_path, prompt=f"<VISUAL>source</VISUAL>\n{source_suffix}",
@@ -326,8 +328,12 @@ def test_context_rejects_fusion_audio_or_music_policy_drift(
     ) as client:
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
-    assert result.status == "failed"
-    assert result.error_code == "context_ir_semantic_mismatch"
+    assert result.status == "succeeded"
+    receipt = context_ir_bridge.load_effective_prompt_receipt(
+        frozen, result.receipt_path
+    )
+    assert receipt.semantic_score["music_policy"] == 0.0
+    assert receipt.effective_prompt.endswith(source_suffix)
     assert not (frozen.workdir / ".h3").exists()
 
 
@@ -925,7 +931,7 @@ def test_upstream_dialogue_receipt_is_required_and_frozen_into_final_receipt(tmp
     )
 
 
-def test_dialogue_none_rejects_any_context_ir_speech(tmp_path):
+def test_dialogue_none_scores_context_ir_speech_without_blocking_output(tmp_path):
     frozen = _no_audio_frozen(tmp_path)
     with _client(
         _success_handler(
@@ -934,8 +940,12 @@ def test_dialogue_none_rejects_any_context_ir_speech(tmp_path):
         )
     ) as client:
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
-    assert result.status == "failed"
-    assert result.error_code == "context_ir_semantic_mismatch"
+    assert result.status == "succeeded"
+    receipt = context_ir_bridge.load_effective_prompt_receipt(
+        frozen, result.receipt_path
+    )
+    assert receipt.semantic_score["speech_expected"] is False
+    assert receipt.semantic_score["speech"] == 0.0
     assert not (frozen.workdir / ".h3").exists()
 
 
@@ -971,22 +981,27 @@ def test_context_ir_preserves_frozen_keyframe_timeline(tmp_path):
     assert result.effective_prompt == effective
 
 
-def test_context_ir_rejects_hard_cut_time_drift_before_h3(tmp_path):
+def test_context_ir_scores_hard_cut_time_drift_without_blocking_h3(tmp_path):
     frozen = _timeline_frozen(tmp_path)
-    effective = frozen.source_prompt.replace('"at_s":2.267', '"at_s":3.5')
+    effective = frozen.source_prompt.replace('"at_segment_s":2.267', '"at_segment_s":3.5')
     with _client(
         _success_handler(frozen, effective_prompt=effective)
     ) as client:
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
-    assert result.status == "failed"
-    assert result.error_code == "context_ir_semantic_mismatch"
-    assert result.receipt_path is None
+    assert result.status == "succeeded"
+    receipt = context_ir_bridge.load_effective_prompt_receipt(
+        frozen, result.receipt_path
+    )
+    assert receipt.semantic_score["keyframe_timeline"] == 0.0
+    assert receipt.effective_prompt.endswith(
+        context_ir_bridge._fusion_policy_suffix(frozen.source_prompt)
+    )
     assert not (frozen.workdir / ".h3").exists()
 
 
 @pytest.mark.parametrize("mutation", ["reordered", "separated"])
-def test_context_ir_rejects_moved_fusion_contract_blocks_before_h3(
+def test_context_ir_scores_moved_fusion_contract_blocks_without_blocking_h3(
     tmp_path, mutation,
 ):
     frozen = _timeline_frozen(tmp_path)
@@ -1007,18 +1022,23 @@ def test_context_ir_rejects_moved_fusion_contract_blocks_before_h3(
     ) as client:
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
-    assert result.status == "failed"
-    assert result.error_code == "context_ir_semantic_mismatch"
-    assert result.receipt_path is None
+    assert result.status == "succeeded"
+    receipt = context_ir_bridge.load_effective_prompt_receipt(
+        frozen, result.receipt_path
+    )
+    assert receipt.semantic_score["music_policy"] == 0.0
+    assert receipt.effective_prompt.endswith(
+        context_ir_bridge._fusion_policy_suffix(frozen.source_prompt)
+    )
     assert not (frozen.workdir / ".h3").exists()
 
 
 def test_context_ir_rejects_non_nine_keyframe_timeline():
     timeline = [{
         "order": 1,
-        "source_time_s": 0.0,
+        "segment_time_s": 0.0,
         "source_scene_id": "SCENE_01",
-        "transition": {"type": "start", "at_s": 0.0},
+        "transition": {"type": "start", "at_segment_s": 0.0},
     }]
     prompt = (
         "<KEYFRAME_TIMELINE_JSON>"
@@ -1052,7 +1072,7 @@ def test_receipt_bound_voice_allows_context_to_split_off_screen_dialogue(tmp_pat
 
 
 @pytest.mark.parametrize("purpose", ["ambience", "effect"])
-def test_non_voice_audio_does_not_disable_zero_speech_gate(tmp_path, purpose):
+def test_non_voice_audio_does_not_change_zero_speech_score(tmp_path, purpose):
     frozen = _reference_audio_frozen(tmp_path, purpose=purpose)
     effective = frozen.source_prompt + "\n<d>[English]invented speech</d>"
     with _client(
@@ -1060,12 +1080,16 @@ def test_non_voice_audio_does_not_disable_zero_speech_gate(tmp_path, purpose):
     ) as client:
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
-    assert result.status == "failed"
-    assert result.error_code == "context_ir_semantic_mismatch"
+    assert result.status == "succeeded"
+    receipt = context_ir_bridge.load_effective_prompt_receipt(
+        frozen, result.receipt_path
+    )
+    assert receipt.semantic_score["speech_expected"] is False
+    assert receipt.semantic_score["speech"] == 0.0
     assert not (frozen.workdir / ".h3").exists()
 
 
-def test_voice_object_without_audio_required_does_not_disable_zero_speech_gate(
+def test_voice_object_without_audio_required_does_not_change_speech_score(
     tmp_path,
 ):
     frozen = _reference_audio_frozen(tmp_path, purpose="voice")
@@ -1075,21 +1099,13 @@ def test_voice_object_without_audio_required_does_not_disable_zero_speech_gate(
         frozen,
         source_h3_request=source_without_audio_authority,
     )
-    attempt_path = tmp_path / "forged-attempt" / "attempt.json"
-    attempt_path.parent.mkdir()
-    state: dict = {}
-
-    context_ir_bridge._complete(
+    score = context_ir_bridge._semantic_score(
         forged,
-        state,
-        attempt_path,
         "<d>[English]invented speech</d>",
     )
 
-    assert state == {
-        "status": "failed",
-        "error": "context_ir_semantic_mismatch",
-    }
+    assert score["speech_expected"] is False
+    assert score["speech"] == 0.0
     assert not (frozen.workdir / ".h3").exists()
 
 
