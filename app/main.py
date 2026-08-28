@@ -2298,6 +2298,7 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
                     expected,
                     meta.get("fit_mode"),
                     meta.get("dialogue_mode"),
+                    dialogue_delivery=meta.get("dialogue_delivery", "auto"),
                     prepare_fit=False,
                     settings=settings,
                 )

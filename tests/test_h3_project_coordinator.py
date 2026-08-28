@@ -1184,6 +1184,61 @@ def test_speaker_visibility_raw_output_drift_is_rejected_before_h3(
     assert not (work / "h3-native" / ".h3").exists()
 
 
+def test_long_output_validation_uses_frozen_dialogue_delivery(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    workflow = next(iter(h3.H3_MULTIMODAL_WORKFLOWS))
+    plan = SimpleNamespace(
+        workflow=workflow,
+        segments=(SimpleNamespace(index=1),),
+    )
+    observed = []
+
+    def freeze_plan(
+        _root, _meta, _receipt, _fit_mode, _dialogue_mode, *,
+        dialogue_delivery="auto", **_kwargs,
+    ):
+        observed.append(dialogue_delivery)
+        return plan
+
+    monkeypatch.setattr(long_generation, "freeze_plan", freeze_plan)
+    monkeypatch.setattr(
+        long_generation, "generation_segments_are_valid", lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "bound_reusable_segment_indices",
+        lambda *_args: frozenset({1}),
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "bound_h3_native_media",
+        lambda *_args: {1: ("000001", {})},
+    )
+    monkeypatch.setattr(
+        long_generation, "stitched_output_is_reusable", lambda *_args, **_kwargs: True,
+    )
+    meta = {
+        "id": "off-screen-output",
+        "schema_version": 2,
+        "_postprocess_receipt": {"version": 4, "options": {}},
+        "frozen_plan_receipt": "f" * 64,
+        "fit_mode": "none",
+        "dialogue_mode": "auto",
+        "dialogue_delivery": "off_screen",
+        "segments": [{"index": 1}],
+        "generation": {
+            "status": "succeeded",
+            "workflow": workflow,
+            "segments": [{"index": 1, "status": "succeeded"}],
+        },
+    }
+
+    assert _validate_generated_video_uncached(settings, meta) is True
+    assert observed == ["off_screen"]
+
+
 def test_short_context_completion_revalidates_producer_before_first_h3_post(
     tmp_path, monkeypatch,
 ):
