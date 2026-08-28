@@ -1469,11 +1469,66 @@ def test_retryable_technical_fusion_failure_auto_continues_same_owner(
     "error",
     [
         "prompt_fusion_output_invalid",
-        "prompt fusion input is invalid",
-        "prompt fusion Skill drifted",
+        "prompt fusion raw output is missing",
+        "prompt fusion raw output is invalid",
     ],
 )
-def test_quality_or_structure_fusion_failure_never_retries(
+def test_invalid_or_missing_fusion_output_auto_continues_same_operation(
+    tmp_path, monkeypatch, error,
+):
+    settings = make_settings(tmp_path)
+    cid, owner = _make_prompt_fusion_claim(
+        settings, status="failed", error=error
+    )
+    producer_calls = []
+    continuation_calls = []
+    scheduled = []
+
+    def produce(_settings, received_cid, _runner):
+        producer_calls.append(received_cid)
+        current = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            _prompt_fusion={**current, "status": "done", "error": None},
+        )
+        return "done"
+
+    def schedule(*args):
+        scheduled.append(args[1])
+        main_module._produce_prompt_fusion_and_continue(*args)
+
+    monkeypatch.setattr(pipeline, "produce_prompt_fusion", produce)
+    monkeypatch.setattr(
+        main_module,
+        "_continue_after_prompt_fusion",
+        lambda _settings, received_cid, received_owner: (
+            continuation_calls.append((received_cid, received_owner)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        main_module, "_schedule_prompt_fusion_continuation", schedule
+    )
+
+    main_module._produce_prompt_fusion_and_continue(
+        settings, cid, object(), owner
+    )
+
+    assert scheduled == [cid]
+    assert producer_calls == [cid]
+    assert continuation_calls == [(cid, owner)]
+    assert storage.load_meta(settings.data_dir, cid)["_input_owner"] == owner
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "prompt fusion input drifted",
+        "prompt fusion Skill drifted",
+        "prompt fusion manifest drifted",
+    ],
+)
+def test_fusion_evidence_drift_never_reposts(
     tmp_path, monkeypatch, error,
 ):
     settings = make_settings(tmp_path)
@@ -1484,12 +1539,12 @@ def test_quality_or_structure_fusion_failure_never_retries(
     monkeypatch.setattr(
         pipeline,
         "produce_prompt_fusion",
-        lambda *_args, **_kwargs: pytest.fail("quality must not produce"),
+        lambda *_args, **_kwargs: pytest.fail("drift must not produce"),
     )
     monkeypatch.setattr(
         main_module,
         "_schedule_prompt_fusion_continuation",
-        lambda *_args, **_kwargs: pytest.fail("quality must not schedule"),
+        lambda *_args, **_kwargs: pytest.fail("drift must not schedule"),
     )
 
     main_module._produce_prompt_fusion_and_continue(
@@ -1497,6 +1552,40 @@ def test_quality_or_structure_fusion_failure_never_retries(
     )
 
     assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"] == before
+
+
+def test_quality_score_does_not_trigger_fusion_retry(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    cid, owner = _make_prompt_fusion_claim(
+        settings, status="done", error=None
+    )
+    current = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _prompt_fusion={**current, "quality_score": 0.0},
+    )
+    continuation_calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "produce_prompt_fusion",
+        lambda *_args, **_kwargs: pytest.fail("score must not produce"),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_continue_after_prompt_fusion",
+        lambda _settings, received_cid, received_owner: (
+            continuation_calls.append((received_cid, received_owner)) or True
+        ),
+    )
+
+    main_module._produce_prompt_fusion_and_continue(
+        settings, cid, object(), owner
+    )
+
+    assert continuation_calls == [(cid, owner)]
 
 
 def test_finalize_exception_auto_continues_done_fusion_without_new_producer(

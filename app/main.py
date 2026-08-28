@@ -2720,8 +2720,8 @@ def _continue_after_prompt_fusion(
     return True
 
 
-def _prompt_fusion_technical_failure_is_retryable(state: object) -> bool:
-    """Recognize only errors that the Codex runner explicitly marks retryable."""
+def _prompt_fusion_failure_is_retryable(state: object) -> bool:
+    """Recognize operational or generated-output failures safe to rerun."""
     if not isinstance(state, Mapping) or state.get("status") != "failed":
         return False
     error = state.get("error")
@@ -2730,6 +2730,12 @@ def _prompt_fusion_technical_failure_is_retryable(state: object) -> bool:
         and (
             re.fullmatch(r"codex timed out after [0-9]+(?:\.[0-9]+)?s", error)
             or re.match(r"^codex exit -?[0-9]+:", error)
+            or error
+            in {
+                "prompt_fusion_output_invalid",
+                "prompt fusion raw output is missing",
+                "prompt fusion raw output is invalid",
+            }
         )
     )
 
@@ -2748,7 +2754,7 @@ def _prompt_fusion_continuation_step(
         # only poll its durable state; they must never create another producer.
         return True
     if status == "failed":
-        if not _prompt_fusion_technical_failure_is_retryable(fusion):
+        if not _prompt_fusion_failure_is_retryable(fusion):
             return False
         reset: dict[str, bool] = {}
 
@@ -2757,7 +2763,7 @@ def _prompt_fusion_continuation_step(
             if (
                 current.get("_input_owner") == owner
                 and state == fusion
-                and _prompt_fusion_technical_failure_is_retryable(state)
+                and _prompt_fusion_failure_is_retryable(state)
             ):
                 current["_prompt_fusion"] = {
                     **state,
@@ -2777,7 +2783,7 @@ def _prompt_fusion_continuation_step(
     if status == "failed":
         current = storage.load_submission_claim(settings.data_dir, cid, owner)
         state = current.get("_prompt_fusion") if current else None
-        return _prompt_fusion_technical_failure_is_retryable(state)
+        return _prompt_fusion_failure_is_retryable(state)
     if status != "done":
         return False
     try:
