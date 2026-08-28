@@ -1097,6 +1097,194 @@ def test_v4_backend_freezes_source_pixel_palette_into_provider_prompts(tmp_path)
     assert '"area_weighted_warm_cool_family":"balanced"' in prompts[0][1]
 
 
+def _semantic_compiler_input(tmp_path, segment_count=1, frame_count=1):
+    segments = []
+    source_frames = {}
+    prior = None
+    for segment_index in range(1, segment_count + 1):
+        directory = tmp_path / f"segment-{segment_index}" / "keyframes"
+        directory.mkdir(parents=True)
+        paths = []
+        skeleton = []
+        for frame_index in range(1, frame_count + 1):
+            path = directory / f"{frame_index:02d}.png"
+            path.write_bytes(_png(value=31 + segment_index + frame_index))
+            transition = (
+                "start" if prior is None
+                else "hard_cut" if frame_index == 1
+                else "same_camera"
+            )
+            skeleton.append({
+                "segment_index": segment_index,
+                "frame_index": frame_index,
+                "frame_name": path.name,
+                "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "source_transition_from_previous": transition,
+                "source_transition_evidence_sha256": (
+                    f"{segment_index:x}" * 64
+                )[:64],
+            })
+            paths.append(path)
+            prior = path
+        segments.append({
+            "index": segment_index,
+            "chain_id": f"chain-{segment_index:03d}",
+            "join_mode": "hard_cut",
+            "transition_skeleton": skeleton,
+        })
+        source_frames[segment_index] = paths
+    return segments, source_frames
+
+
+def test_semantic_compiler_backend_completes_people_for_every_segment(tmp_path):
+    segments, source_frames = _semantic_compiler_input(
+        tmp_path, segment_count=3,
+    )
+    semantic = {
+        "people": {
+            "guide": {
+                "source_identity": "source guide",
+                "replacement_identity": "new guide identity",
+                "wardrobe_change": "new practical wardrobe",
+                "local_color_change": "new local wardrobe colors",
+            },
+            "maker": {
+                "source_identity": "source maker",
+                "replacement_identity": "new maker identity",
+                "wardrobe_change": "new work wardrobe",
+                "local_color_change": "new local work colors",
+            },
+            "visitor": {
+                "source_identity": "source visitor",
+                "replacement_identity": "new visitor identity",
+                "wardrobe_change": "new casual wardrobe",
+                "local_color_change": "new local casual colors",
+            },
+        },
+        "scenes": {
+            f"scene-{index:03d}": {
+                "source_scene": f"source setting {index}",
+                "replacement_scene": f"new real setting {index}",
+                "semantic_change": "new setting with the same narrative use",
+                "geometry_change": "different visible geometry",
+                "depth_change": "different depth organization",
+                "layout_change": "different spatial layout",
+                "local_color_change": "different local material colors",
+            }
+            for index in range(1, 4)
+        },
+        "frames": {
+            "frame-001": {
+                "people": {"guide": {
+                    "visible_region": "visible guide region",
+                    "boundary": "visible guide boundary",
+                    "body_and_pose": "visible guide body and pose",
+                }},
+                "relationships": "preserve visible contacts and occlusions",
+                "crop": "preserve source crop",
+            },
+            "frame-002": {
+                "people": {"maker": {
+                    "visible_region": "visible maker region",
+                    "boundary": "visible maker boundary",
+                    "body_and_pose": "visible maker body and pose",
+                }},
+                "relationships": "preserve visible contacts and occlusions",
+                "crop": "preserve source crop",
+            },
+            "frame-003": {
+                "people": {"visitor": {
+                    "visible_region": "visible visitor region",
+                    "boundary": "visible visitor boundary",
+                    "body_and_pose": "visible visitor body and pose",
+                }},
+                "relationships": "preserve visible contacts and occlusions",
+                "crop": "preserve source crop",
+            },
+        },
+    }
+
+    plan, diagnostics = image_optimization.compile_semantic_plan(
+        semantic, segments, source_frames=source_frames,
+    )
+
+    canonical = image_optimization.canonical_plan_v4(
+        plan, [1, 2, 3], frame_counts={1: 1, 2: 1, 3: 1},
+    )
+    person_ids = [item["id"] for item in canonical["person_plans"]]
+    assert person_ids == ["PERSON_01", "PERSON_02", "PERSON_03"]
+    assert all(
+        [item["id"] for item in segment["persons"]] == person_ids
+        for segment in canonical["segments"]
+    )
+    assert [
+        [item["state"] for item in segment["persons"]]
+        for segment in canonical["segments"]
+    ] == [
+        ["replace", "not_observable", "not_observable"],
+        ["not_observable", "replace", "not_observable"],
+        ["not_observable", "not_observable", "replace"],
+    ]
+    assert diagnostics["score"] == 1.0
+    assert "blocking" not in diagnostics
+
+
+def test_semantic_compiler_ignores_model_palette_wording_and_uses_source(
+    tmp_path,
+):
+    segments, source_frames = _semantic_compiler_input(
+        tmp_path, frame_count=2,
+    )
+    semantic = {
+        "people": {},
+        "scenes": {"scene-001": {
+            "source_scene": "source room",
+            "replacement_scene": "different real room",
+            "semantic_change": "same use with a different environment",
+            "geometry_change": "different visible structures",
+            "depth_change": "different foreground and background depth",
+            "layout_change": "different functional layout",
+            "local_color_change": "different local material colors",
+        }},
+        "frames": {
+            "frame-001": {
+                "relationships": "preserve current visible relationships",
+                "crop": "preserve current crop",
+                "palette_description": "warm-neutral and natural-muted",
+            },
+            "frame-002": {
+                "relationships": "preserve current visible relationships",
+                "crop": "preserve current crop",
+                "palette_description": "cool-neutral and very-muted",
+            },
+        },
+    }
+
+    plan, diagnostics = image_optimization.compile_semantic_plan(
+        semantic, segments, source_frames=source_frames,
+    )
+
+    expected = [{
+        "area_weighted_warm_cool_family": metric["warm_cool_family"],
+        "saturation_style": metric["saturation_style"],
+    } for metric in (
+        image_optimization.source_palette_metric(path)
+        for path in source_frames[1]
+    )]
+    assert [
+        frame["dominant_palette_contract"]
+        for frame in plan["segments"][0]["frame_constraints"]
+    ] == expected
+    assert image_optimization.canonical_plan_v4(
+        plan, [1], frame_counts={1: 2},
+    ) == plan
+    assert diagnostics["score"] == 1.0
+    assert diagnostics["ignored_mechanical_fields"] == [
+        "frames.frame-001.palette_description",
+        "frames.frame-002.palette_description",
+    ]
+
+
 def test_v4_frame_receipt_deeply_binds_graph_view_plan_and_source(tmp_path):
     settings = make_settings(tmp_path)
     plan = _v4_frame_bound_plan()
@@ -1690,12 +1878,10 @@ def test_v4_single_frame_valid_input_reaches_anchor_generation_without_quality_p
     cid = _done(settings)
     cdir = settings.data_dir / cid
     source = cdir / "work" / "keyframes" / "01.png"
-    plan, prompts = image_optimization.generic_project_prompts(
-        [{
+    segment_specs = [{
             "index": 0,
             "chain_id": "short-000",
             "join_mode": "hard_cut",
-            "keyframes_dir": source.parent,
             "transition_skeleton": [{
                 "segment_index": 0,
                 "frame_index": 1,
@@ -1704,10 +1890,31 @@ def test_v4_single_frame_valid_input_reaches_anchor_generation_without_quality_p
                 "source_transition_from_previous": "start",
                 "source_transition_evidence_sha256": "a" * 64,
             }],
-        }],
-        settings.seedream_edit_mode,
-        session_dir=cdir,
+        }]
+    plan, diagnostics = image_optimization.compile_semantic_plan(
+        {
+            "people": {},
+            "scenes": {"scene-001": {
+                "source_scene": "source setting",
+                "replacement_scene": "different real setting",
+                "semantic_change": "same use with a different setting",
+                "geometry_change": "different visible geometry",
+                "depth_change": "different visible depth",
+                "layout_change": "different visible layout",
+                "local_color_change": "different local material colors",
+            }},
+            "frames": {"frame-001": {
+                "relationships": "preserve visible source relationships",
+                "crop": "preserve source crop",
+            }},
+        },
+        segment_specs,
+        source_frames={0: [source]},
     )
+    prompts = image_optimization.compile_frame_prompts(
+        plan, settings.seedream_edit_mode,
+    )
+    assert diagnostics["score"] == 1.0
     assert plan["person_plans"] == []
     assert plan["segments"][0]["persons"] == []
     assert "不替换人物" in prompts[0][1]
@@ -1789,77 +1996,6 @@ def test_v3_failed_quality_acceptance_publishes_but_remains_blocked_from_h3(
             cdir, latest, sorted((cdir / "work" / "keyframes").glob("*.png")),
             settings=settings,
         )
-
-
-def test_v4_generic_fallback_replaces_only_frames_with_backend_person_evidence(
-    tmp_path, monkeypatch,
-):
-    segment_dirs = []
-    for segment_index, frame_count in ((1, 2), (2, 1)):
-        directory = tmp_path / f"segment-{segment_index}" / "keyframes"
-        directory.mkdir(parents=True)
-        for frame_index in range(1, frame_count + 1):
-            (directory / f"{frame_index:02d}.png").write_bytes(_png())
-        segment_dirs.append(directory)
-
-    monkeypatch.setattr(
-        image_optimization,
-        "_source_has_observable_person",
-        lambda path: path.parent.parent.name == "segment-1" and path.name == "02.png",
-    )
-    segments = []
-    previous = None
-    for segment_index, directory in enumerate(segment_dirs, 1):
-        skeleton = []
-        for frame_index, source in enumerate(sorted(directory.glob("*.png")), 1):
-            transition = "start" if previous is None else (
-                "hard_cut" if frame_index == 1 else "same_camera"
-            )
-            skeleton.append({
-                "segment_index": segment_index,
-                "frame_index": frame_index,
-                "frame_name": source.name,
-                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-                "source_transition_from_previous": transition,
-                "source_transition_evidence_sha256": "a" * 64,
-            })
-            previous = source
-        segments.append({
-            "index": segment_index,
-            "chain_id": f"chain-{segment_index}",
-            "join_mode": "hard_cut",
-            "keyframes_dir": directory,
-            "transition_skeleton": skeleton,
-        })
-
-    plan, prompts = image_optimization.generic_project_prompts(
-        segments, "anchor_consistency", session_dir=tmp_path,
-    )
-
-    assert [person["id"] for person in plan["person_plans"]] == ["PERSON_01"]
-    assert plan["person_plans"][0]["reference"] == {
-        "segment_index": 1, "frame_index": 2,
-    }
-    assert plan["person_plans"][0]["observable_segments"] == [1]
-    assert plan["segments"][0]["persons"] == [{
-        "id": "PERSON_01",
-        "state": "replace",
-        "observable_frames": [2],
-        "target_region": "源图中实际可观察的完整主人物区域",
-        "boundary": "严格保持源图可见姿态、轮廓、裁切与遮挡边界",
-    }]
-    assert plan["segments"][1]["persons"] == [{
-        "id": "PERSON_01",
-        "state": "not_observable",
-        "observable_frames": [],
-        "target_region": None,
-        "boundary": None,
-    }]
-    assert all(segment["protected_non_target_people"] == [] for segment in plan["segments"])
-    assert "不替换人物" in prompts[1][1]
-    assert "不可观察的冻结主人物不得被新增或补造" in prompts[1][1]
-    assert "替换人物" in prompts[1][2]
-    assert "不可观察的冻结主人物不得被新增或补造" in prompts[2][1]
 
 
 @pytest.mark.parametrize("status", ["fail", "unknown"])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,9 @@ from app.config import (
     SEEDREAM_MODELS,
     Settings,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 MAX_PROMPT_BYTES = 32 * 1024
 MAX_CONTINUITY_BYTES = 32 * 1024
@@ -1466,6 +1470,486 @@ def _bind_source_palette_contracts(
     return bound
 
 
+def _semantic_text(value: object, default: str, *, max_bytes: int = 1000) -> str:
+    """Return bounded model semantics without turning incompleteness into control flow."""
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
+        text = default
+    raw = text.encode("utf-8")
+    if len(raw) > max_bytes:
+        text = raw[:max_bytes].decode("utf-8", errors="ignore").rstrip()
+    return text or default
+
+
+def _semantic_slots(
+    segment_specs: list[dict],
+    *,
+    source_frames: dict[int, list[Path]] | None = None,
+) -> dict:
+    """Construct every stable scene/frame key and transition from backend input."""
+    if not isinstance(segment_specs, list) or not segment_specs:
+        raise ValueError("invalid image semantic compiler input")
+    scene_key_by_chain: dict[str, str] = {}
+    scene_slots: list[dict] = []
+    frame_slots: list[dict] = []
+    frame_ordinal = 0
+    prior_exists = False
+    for segment in segment_specs:
+        if not isinstance(segment, dict):
+            raise ValueError("invalid image semantic compiler input")
+        index = segment.get("index")
+        chain_id = segment.get("chain_id")
+        join_mode = segment.get("join_mode")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not isinstance(chain_id, str)
+            or not chain_id
+            or join_mode not in {"hard_cut", "continue"}
+        ):
+            raise ValueError("invalid image semantic compiler input")
+        scene_key = scene_key_by_chain.get(chain_id)
+        if scene_key is None:
+            scene_key = f"scene-{len(scene_slots) + 1:03d}"
+            scene_key_by_chain[chain_id] = scene_key
+            scene_slots.append({
+                "key": scene_key,
+                "chain_id": chain_id,
+                "segment_indices": [],
+            })
+        next(
+            item for item in scene_slots if item["key"] == scene_key
+        )["segment_indices"].append(index)
+
+        skeleton = segment.get("transition_skeleton")
+        paths = None if source_frames is None else source_frames.get(index)
+        if not isinstance(skeleton, list) or not skeleton:
+            if not isinstance(paths, list) or not paths:
+                raise ValueError("invalid image semantic compiler input")
+            skeleton = [
+                {
+                    "frame_index": position,
+                    "frame_name": path.name,
+                    "source_transition_from_previous": (
+                        "start" if not prior_exists and position == 1
+                        else "hard_cut" if position == 1 and join_mode == "hard_cut"
+                        else "same_camera"
+                    ),
+                }
+                for position, path in enumerate(paths, 1)
+            ]
+        if paths is not None and len(paths) != len(skeleton):
+            raise ValueError("invalid image semantic compiler input")
+        for position, item in enumerate(skeleton, 1):
+            if not isinstance(item, dict):
+                raise ValueError("invalid image semantic compiler input")
+            transition = item.get("source_transition_from_previous")
+            if transition not in _SCENE_CONTINUITY_TRANSITIONS:
+                raise ValueError("invalid image semantic compiler input")
+            frame_ordinal += 1
+            frame_slots.append({
+                "key": f"frame-{frame_ordinal:03d}",
+                "scene_key": scene_key,
+                "segment_index": index,
+                "frame_index": position,
+                "frame_name": item.get("frame_name", f"{position:02d}.png"),
+                "transition_from_previous": transition,
+            })
+            prior_exists = True
+    indices = [item.get("index") for item in segment_specs]
+    if indices not in ([0], list(range(1, len(indices) + 1))):
+        raise ValueError("invalid image semantic compiler input")
+    return {
+        "scenes": scene_slots,
+        "frames": frame_slots,
+    }
+
+
+def semantic_slot_manifest(segment_specs: list[dict]) -> dict:
+    """Expose backend-owned stable keys that the Skill associates with semantics."""
+    slots = _semantic_slots(segment_specs)
+    return {
+        "scenes": [
+            {"key": item["key"], "chain_id": item["chain_id"]}
+            for item in slots["scenes"]
+        ],
+        "frames": [
+            {
+                "key": item["key"],
+                "scene_key": item["scene_key"],
+                "path": (
+                    f"work/segments/{item['segment_index']}/keyframes/"
+                    f"{item['frame_name']}"
+                ),
+            }
+            for item in slots["frames"]
+        ],
+    }
+
+
+def compile_semantic_plan(
+    value: object,
+    segment_specs: list[dict],
+    *,
+    source_frames: dict[int, list[Path]] | None = None,
+) -> tuple[dict, dict]:
+    """Compile tolerant visual semantics into the one canonical executable v4 plan."""
+    slots = _semantic_slots(segment_specs, source_frames=source_frames)
+    raw = value if isinstance(value, dict) else {}
+    raw_people = raw.get("people") if isinstance(raw.get("people"), dict) else {}
+    raw_scenes = raw.get("scenes") if isinstance(raw.get("scenes"), dict) else {}
+    raw_frames = raw.get("frames") if isinstance(raw.get("frames"), dict) else {}
+    frame_by_key = {item["key"]: item for item in slots["frames"]}
+    frames_by_segment: dict[int, list[dict]] = {}
+    for slot in slots["frames"]:
+        frames_by_segment.setdefault(slot["segment_index"], []).append(slot)
+
+    expected_fields = 0
+    present_fields = 0
+    issues: list[str] = []
+    ignored_mechanical_fields: list[str] = []
+
+    def field(
+        container: object,
+        key: str,
+        default: str,
+        *,
+        path: str,
+    ) -> str:
+        nonlocal expected_fields, present_fields
+        expected_fields += 1
+        candidate = container.get(key) if isinstance(container, dict) else None
+        if isinstance(candidate, str) and candidate.strip():
+            present_fields += 1
+        else:
+            issues.append(f"missing:{path}.{key}")
+        return _semantic_text(candidate, default)
+
+    for key in ("version", "phase", "segment_indices", "eligible", "reason"):
+        if key in raw:
+            ignored_mechanical_fields.append(key)
+    for frame_key, frame in raw_frames.items():
+        if not isinstance(frame, dict):
+            continue
+        for key in frame:
+            if "palette" in key.lower() or key in {
+                "frame_index", "segment_index", "transition_from_previous",
+            }:
+                ignored_mechanical_fields.append(f"frames.{frame_key}.{key}")
+
+    observations: dict[str, dict[str, dict]] = {}
+    person_keys = {
+        key for key in raw_people if isinstance(key, str) and key.strip()
+    }
+    for frame_key, slot in frame_by_key.items():
+        frame = raw_frames.get(frame_key)
+        frame_people = frame.get("people") if isinstance(frame, dict) else None
+        if not isinstance(frame_people, dict):
+            continue
+        for person_key, observation in frame_people.items():
+            if not isinstance(person_key, str) or not person_key.strip():
+                continue
+            person_keys.add(person_key)
+            observations.setdefault(person_key, {})[frame_key] = (
+                observation if isinstance(observation, dict) else {}
+            )
+
+    observed_person_keys = sorted(
+        key for key in person_keys if observations.get(key)
+    )
+    for key in sorted(person_keys - set(observed_person_keys)):
+        issues.append(f"unused_person:{key}")
+    person_id_by_key = {
+        key: f"PERSON_{position:02d}"
+        for position, key in enumerate(observed_person_keys, 1)
+    }
+    person_plans = []
+    for key in observed_person_keys:
+        design = raw_people.get(key)
+        path = f"people.{key}"
+        source_identity = field(
+            design, "source_identity", f"源帧中由 {key} 标识的可见叙事人物",
+            path=path,
+        )
+        replacement_identity = field(
+            design, "replacement_identity", "与源身份明显不同且跨帧稳定的新人物",
+            path=path,
+        )
+        if replacement_identity == source_identity:
+            replacement_identity = f"与源身份不同的新人物：{replacement_identity}"
+            issues.append(f"unchanged_identity:{key}")
+        first_key = next(
+            slot["key"] for slot in slots["frames"]
+            if slot["key"] in observations[key]
+        )
+        first = frame_by_key[first_key]
+        observable_segments = sorted({
+            frame_by_key[frame_key]["segment_index"]
+            for frame_key in observations[key]
+            if frame_key in frame_by_key
+        })
+        person_plans.append({
+            "id": person_id_by_key[key],
+            "source_identity": source_identity,
+            "replacement_identity": replacement_identity,
+            "wardrobe_change": field(
+                design, "wardrobe_change",
+                "保持源可见覆盖边界并使用明显不同的新服装设计",
+                path=path,
+            ),
+            "local_color_change": field(
+                design, "local_color_change",
+                "改变人物局部固有色并保持当前源帧全局光色",
+                path=path,
+            ),
+            "reference": {
+                "segment_index": first["segment_index"],
+                "frame_index": first["frame_index"],
+            },
+            "observable_segments": observable_segments,
+        })
+
+    scene_id_by_key = {
+        item["key"]: f"SCENE_{position:02d}"
+        for position, item in enumerate(slots["scenes"], 1)
+    }
+    scene_plans = []
+    for scene_slot in slots["scenes"]:
+        key = scene_slot["key"]
+        design = raw_scenes.get(key)
+        path = f"scenes.{key}"
+        source_scene = field(
+            design, "source_scene", "当前源帧可见的真实环境", path=path,
+        )
+        replacement_scene = field(
+            design, "replacement_scene",
+            "叙事用途相同、结构和设计明显不同的真实新环境",
+            path=path,
+        )
+        if replacement_scene == source_scene:
+            replacement_scene = f"结构与源环境不同的真实新环境：{replacement_scene}"
+            issues.append(f"unchanged_scene:{key}")
+        semantic_change = field(
+            design, "semantic_change", "保持叙事用途并改变环境语义", path=path,
+        )
+        geometry_change = field(
+            design, "geometry_change", "改变可见环境形状与空间结构", path=path,
+        )
+        depth_change = field(
+            design, "depth_change", "改变前中后景的纵深组织", path=path,
+        )
+        layout_change = field(
+            design, "layout_change", "改变功能区域和实体的布局", path=path,
+        )
+        local_color_change = field(
+            design, "local_color_change",
+            "改变场景局部材质固有色并保持源帧全局光色", path=path,
+        )
+        members = list(scene_slot["segment_indices"])
+        scene_frames = [
+            item for item in slots["frames"] if item["scene_key"] == key
+        ]
+        reference = scene_frames[0]
+        component_spec = _semantic_text(
+            "；".join((
+                replacement_scene,
+                semantic_change,
+                geometry_change,
+                depth_change,
+                layout_change,
+                local_color_change,
+            )),
+            "跨帧稳定的真实新环境",
+        )
+        scene_plans.append({
+            "id": scene_id_by_key[key],
+            "source_scene": source_scene,
+            "replacement_scene": replacement_scene,
+            "semantic_change": semantic_change,
+            "geometry_changes": [geometry_change],
+            "depth_changes": [depth_change],
+            "layout_changes": [layout_change],
+            "local_color_change": local_color_change,
+            "reference": {
+                "segment_index": reference["segment_index"],
+                "frame_index": reference["frame_index"],
+            },
+            "segments": members,
+            "continuity_graph": {
+                "components": [{
+                    "component_id": "COMPONENT_01",
+                    "target_spec": component_spec,
+                }],
+                "topology": [],
+                "views": [{
+                    "segment_index": frame["segment_index"],
+                    "frame_index": frame["frame_index"],
+                    "transition_from_previous": frame["transition_from_previous"],
+                    "observations": [{
+                        "component_id": "COMPONENT_01",
+                        "visibility": "edge_fragment",
+                    }],
+                    "view_relations": [],
+                } for frame in scene_frames],
+            },
+        })
+
+    segment_scene_key = {
+        index: item["key"]
+        for item in slots["scenes"]
+        for index in item["segment_indices"]
+    }
+    segments = []
+    for segment_spec in segment_specs:
+        index = segment_spec["index"]
+        segment_frames = frames_by_segment[index]
+        segment_people = []
+        for person_key in observed_person_keys:
+            observed = [
+                frame["frame_index"] for frame in segment_frames
+                if frame["key"] in observations[person_key]
+            ]
+            if observed:
+                regions = []
+                boundaries = []
+                for frame in segment_frames:
+                    detail = observations[person_key].get(frame["key"])
+                    if detail is None:
+                        continue
+                    detail_path = f"frames.{frame['key']}.people.{person_key}"
+                    regions.append(field(
+                        detail, "visible_region", "当前帧可见人物区域",
+                        path=detail_path,
+                    ))
+                    boundaries.append(field(
+                        detail, "boundary", "当前帧可见人物边界与裁切",
+                        path=detail_path,
+                    ))
+                    field(
+                        detail, "body_and_pose", "保持当前帧可见身体和姿态",
+                        path=detail_path,
+                    )
+                target_region = _semantic_text("；".join(dict.fromkeys(regions)), "可见人物区域")
+                boundary = _semantic_text("；".join(dict.fromkeys(boundaries)), "可见人物边界")
+                state = "replace"
+            else:
+                target_region = None
+                boundary = None
+                state = "not_observable"
+            segment_people.append({
+                "id": person_id_by_key[person_key],
+                "state": state,
+                "observable_frames": observed,
+                "target_region": target_region,
+                "boundary": boundary,
+            })
+
+        constraints = []
+        for frame in segment_frames:
+            frame_value = raw_frames.get(frame["key"])
+            frame_path = f"frames.{frame['key']}"
+            relationships = field(
+                frame_value, "relationships",
+                "保持当前源帧可见的接触、支撑、遮挡与前后关系；不补造未知关系",
+                path=frame_path,
+            )
+            crop = field(
+                frame_value, "crop",
+                "保持当前源帧画幅、出画裁切和可见边界；不补全画外内容",
+                path=frame_path,
+            )
+            entity_notes = _semantic_text(
+                frame_value.get("entities") if isinstance(frame_value, dict) else None,
+                "保持当前源帧可见非人物实体的数量、位置与边界",
+            )
+            visible_parts = []
+            poses = []
+            for person_key in observed_person_keys:
+                detail = observations[person_key].get(frame["key"])
+                if detail is None:
+                    continue
+                body_pose = _semantic_text(
+                    detail.get("body_and_pose") if isinstance(detail, dict) else None,
+                    "保持当前帧可见身体和姿态",
+                )
+                visible_region = _semantic_text(
+                    detail.get("visible_region") if isinstance(detail, dict) else None,
+                    "当前帧可见人物区域",
+                )
+                visible_parts.append(
+                    f"{person_id_by_key[person_key]}：{visible_region}"
+                )
+                poses.append(f"{person_id_by_key[person_key]}：{body_pose}")
+            constraints.append({
+                "frame_index": frame["frame_index"],
+                "visible_body_parts": _semantic_text(
+                    "；".join(visible_parts),
+                    "当前源帧没有明确可观察的目标人物；不得新增人物",
+                ),
+                "pose_skeleton": _semantic_text(
+                    "；".join(poses),
+                    "不从其他帧补造当前源帧不可见的人体或姿态",
+                ),
+                "contact_points": f"{relationships}；{entity_notes}",
+                "occlusion_order": relationships,
+                "out_of_frame_crop": crop,
+                "non_person_entity_ledger": {"entities": [], "relations": []},
+                "dominant_palette_contract": {
+                    "area_weighted_warm_cool_family": "balanced",
+                    "saturation_style": "natural",
+                },
+            })
+        scene_key = segment_scene_key[index]
+        segments.append({
+            "segment_index": index,
+            "persons": segment_people,
+            "scene": {
+                "scene_id": scene_id_by_key[scene_key],
+                "target_region": "当前源帧中人物目标以外的完整可见环境区域",
+                "boundary": "在人物、非目标前景实体和画框的当前可见边界处停止",
+                "layout_reference_frame_index": 1,
+            },
+            "protected_non_target_people": [],
+            "protected_relations": [
+                "source-preserve/no-invention：保持每帧可见构图、实体边界和物理关系；未见部分不补造"
+            ],
+            "frame_constraints": constraints,
+            "photometric_contract": {
+                "light_direction": "逐帧保持当前源帧全局光源方向",
+                "light_quality": "逐帧保持当前源帧全局光线软硬",
+                "exposure_or_intensity": "逐帧保持当前源帧全局曝光与强度",
+                "wb_cct": "逐帧保持当前源帧白平衡与色温",
+                "global_contrast": "逐帧保持当前源帧全局对比",
+                "tone_curve": "逐帧保持当前源帧整体明暗曲线",
+            },
+        })
+
+    indices = [item["index"] for item in segment_specs]
+    frame_counts = {
+        index: len(items) for index, items in frames_by_segment.items()
+    }
+    plan = _canonical_plan_v4({
+        "version": 4,
+        "phase": "plan",
+        "segment_indices": indices,
+        "eligible": True,
+        "reason": None,
+        "person_plans": person_plans,
+        "scene_plans": scene_plans,
+        "segments": segments,
+    }, indices, frame_counts)
+    if source_frames is not None:
+        plan = _bind_source_palette_contracts(plan, source_frames)
+    diagnostics = {
+        "score": round(
+            present_fields / expected_fields if expected_fields else 1.0, 6
+        ),
+        "issues": sorted(set(issues)),
+        "ignored_mechanical_fields": sorted(set(ignored_mechanical_fields)),
+    }
+    return plan, diagnostics
+
+
 def _canonical_prompt(value: object) -> str:
     if not isinstance(value, str):
         raise ImageOptimizationOutputError(
@@ -2222,15 +2706,32 @@ def _canonical_project_output(
     frame_counts: dict[int, int],
     *,
     source_frames: dict[int, list[Path]] | None = None,
+    segment_specs: list[dict] | None = None,
 ) -> tuple[dict, dict]:
-    plan = _canonical_plan(value, indices, frame_counts)
+    semantic_output = isinstance(value, dict) and value.get("version") is None
+    if semantic_output:
+        if segment_specs is None:
+            raise ValueError("image semantic compiler requires backend segment input")
+        plan, diagnostics = compile_semantic_plan(
+            value, segment_specs, source_frames=source_frames,
+        )
+        _LOGGER.info(
+            "image semantic compiler score=%s issues=%s ignored=%s",
+            diagnostics["score"],
+            diagnostics["issues"],
+            diagnostics["ignored_mechanical_fields"],
+        )
+    else:
+        # Frozen v2-v4 plans remain readable; current generation uses only the
+        # semantic compiler above.
+        plan = _canonical_plan(value, indices, frame_counts)
     if not plan["eligible"]:
         # A plan-phase model is a compiler, not the product's content judge.
         # Refusal-shaped legacy output is a retryable protocol violation.
         raise ImageOptimizationOutputError(
             "image optimization output is missing or invalid"
         )
-    if source_frames is not None:
+    if source_frames is not None and not semantic_output:
         plan = _bind_source_palette_contracts(plan, source_frames)
     if plan["version"] in {3, 4}:
         return plan, compile_frame_prompts(plan, edit_mode)
@@ -2348,6 +2849,7 @@ def generate_project_prompts(
                 "phase": "plan",
                 "edit_mode": edit_mode,
                 "segments": request_segments,
+                "semantic_slots": semantic_slot_manifest(request_segments),
             }, ensure_ascii=False, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
@@ -2374,6 +2876,7 @@ def generate_project_prompts(
                 source_frames={
                     segment["index"]: frames for segment, frames in prepared
                 },
+                segment_specs=[segment for segment, _frames in prepared],
             )
             if plan.get("version") != expected_version:
                 raise ImageOptimizationOutputError(
@@ -2419,177 +2922,6 @@ def generate_project_prompts(
             if run_error is not None:
                 raise run_error from None
             raise
-
-
-def _source_has_observable_person(path: Path) -> bool:
-    """Return backend pixel evidence for an actually visible person."""
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if image is None or image.size == 0:
-        raise ValueError("invalid image optimization source frame")
-    height, width = image.shape[:2]
-    if height < 128 or width < 64:
-        return False
-    longest = max(height, width)
-    if longest > 960:
-        scale = 960 / longest
-        image = cv2.resize(
-            image,
-            (max(64, round(width * scale)), max(128, round(height * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-    detector = cv2.HOGDescriptor()
-    detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-    try:
-        boxes, _weights = detector.detectMultiScale(
-            image, winStride=(8, 8), padding=(8, 8), scale=1.05,
-        )
-    except cv2.error:
-        return False
-    return len(boxes) > 0
-
-
-def generic_project_prompts(
-    segments: list[dict], edit_mode: str, *, session_dir: Path,
-) -> tuple[dict, dict]:
-    """Compile the conservative backend fallback from frozen source facts only."""
-    if edit_mode not in SEEDREAM_EDIT_MODES:
-        raise ValueError("unsupported image optimization edit mode")
-    _session, indices, prepared = _project_segment_inputs(
-        segments, session_dir, expected_version=4,
-    )
-    scene_reference = {"segment_index": indices[0], "frame_index": 1}
-    observable_frames = {
-        segment["index"]: [
-            frame_index
-            for frame_index, frame in enumerate(frames, 1)
-            if _source_has_observable_person(frame)
-        ]
-        for segment, frames in prepared
-    }
-    observable_segments = [
-        index for index in indices if observable_frames[index]
-    ]
-    person_reference = (
-        {
-            "segment_index": observable_segments[0],
-            "frame_index": observable_frames[observable_segments[0]][0],
-        }
-        if observable_segments else None
-    )
-    person_plans = ([{
-        "id": "PERSON_01",
-        "source_identity": "源图中实际可观察的主人物身份",
-        "replacement_identity": "与源身份明显不同且跨帧稳定的新人物身份",
-        "wardrobe_change": "保持服装用途与覆盖边界并改变款式细节",
-        "local_color_change": "仅改变人物服装局部固有色并保持源光照",
-        "reference": person_reference,
-        "observable_segments": observable_segments,
-    }] if person_reference is not None else [])
-    views = []
-    canonical_segments = []
-    for segment, frames in prepared:
-        visible_frames = observable_frames[segment["index"]]
-        segment_people = ([{
-            "id": "PERSON_01",
-            "state": "replace",
-            "observable_frames": visible_frames,
-            "target_region": "源图中实际可观察的完整主人物区域",
-            "boundary": "严格保持源图可见姿态、轮廓、裁切与遮挡边界",
-        }] if visible_frames else ([{
-            "id": "PERSON_01",
-            "state": "not_observable",
-            "observable_frames": [],
-            "target_region": None,
-            "boundary": None,
-        }] if person_plans else []))
-        constraints = []
-        for frame, transition in zip(frames, segment["transition_skeleton"]):
-            frame_index = transition["frame_index"]
-            constraints.append({
-                "frame_index": frame_index,
-                "visible_body_parts": (
-                    "保留源图中实际可见的全部身体区域；不得新增、补造或删除"
-                ),
-                "pose_skeleton": "保持源图姿态与骨架，不推断不可见结构",
-                "contact_points": "保持源图已有接触关系，不新增接触",
-                "occlusion_order": "保持源图可证的遮挡次序，不补造遮挡",
-                "out_of_frame_crop": "保持源图出画与裁切事实，不补全画外内容",
-                "non_person_entity_ledger": {"entities": [], "relations": []},
-                "dominant_palette_contract": {
-                    "area_weighted_warm_cool_family": "balanced",
-                    "saturation_style": "natural",
-                },
-            })
-            views.append({
-                "segment_index": segment["index"],
-                "frame_index": frame_index,
-                "transition_from_previous": transition[
-                    "source_transition_from_previous"
-                ],
-                "observations": [{
-                    "component_id": "COMPONENT_01", "visibility": "full",
-                }],
-                "view_relations": [],
-            })
-        canonical_segments.append({
-            "segment_index": segment["index"],
-            "persons": segment_people,
-            "scene": {
-                "scene_id": "SCENE_01",
-                "target_region": "源图中可见环境的完整区域",
-                "boundary": "仅环境边界；排除人物目标并保持已有关系",
-                "layout_reference_frame_index": 1,
-            },
-            "protected_non_target_people": [],
-            "protected_relations": [
-                "保留源图可证的全部空间、接触、遮挡与交互关系"
-            ],
-            "frame_constraints": constraints,
-            "photometric_contract": {
-                "light_direction": "保持源图光照方向",
-                "light_quality": "保持源图光线软硬",
-                "exposure_or_intensity": "保持源图曝光与强度",
-                "wb_cct": "保持源图白平衡与色温",
-                "global_contrast": "保持源图全局对比度",
-                "tone_curve": "保持源图整体明暗曲线",
-            },
-        })
-    value = {
-        "version": 4,
-        "phase": "plan",
-        "segment_indices": indices,
-        "eligible": True,
-        "reason": None,
-        "person_plans": person_plans,
-        "scene_plans": [{
-            "id": "SCENE_01",
-            "source_scene": "源图原始环境",
-            "replacement_scene": "统一、真实且明显不同的新环境",
-            "semantic_change": "仅将环境替换为统一真实的新环境",
-            "geometry_changes": ["生成与新环境一致且物理可实现的结构"],
-            "depth_changes": ["生成与新环境一致且连贯的空间深度"],
-            "layout_changes": ["生成跨全部帧统一的新环境布局"],
-            "local_color_change": "仅环境表面使用新环境一致的自然颜色",
-            "reference": scene_reference,
-            "segments": indices,
-            "continuity_graph": {
-                "components": [{
-                    "component_id": "COMPONENT_01",
-                    "target_spec": "跨全部帧统一的完整真实新环境",
-                }],
-                "topology": [],
-                "views": views,
-            },
-        }],
-        "segments": canonical_segments,
-    }
-    return _canonical_project_output(
-        value,
-        indices,
-        edit_mode,
-        {segment["index"]: len(frames) for segment, frames in prepared},
-        source_frames={segment["index"]: frames for segment, frames in prepared},
-    )
 
 
 def freeze_continuity(
