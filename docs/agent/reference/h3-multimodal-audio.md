@@ -1,35 +1,22 @@
-# H3 原生多模态音频合同
+# H3 current 音频合同
 
-`app.h3_multimodal.build_h3_request` 严格消费 video-maker 的
-`h3_prompt_plan.json` v2：外部 Picture/Audio 编号保持 1-based。Skill 只写
-`dialogue_source_sha256` 和逐行 `speech_bindings`，不复制台词文本或时间窗；后端
-从已冻结的 `PreparedInput.dialogue` 或 `FrozenSegment.dialogue` 确定性投影精确
-文本、时间窗、语言、人物、画内/画外和声线关系。不同 subject 复用 Picture、
-发声人物无声线、未绑定音频、台词 SHA 或行号漂移均在任何 provider I/O 前失败。
+current v4 不是 source-audio multimodal。每个 segment 的 `H3Request` 固定满足：
 
-音频通过 `app.h3.freeze_reference_audios` 一次读取并用 ffprobe 探测。只接受
-1–3 段 MP3/WAV；每段 2–15 秒、总长不超过 15 秒。冻结 bytes、SHA-256、顺序、
-用途和时长进入现有 H3 input/attempt/provider receipt。提交不重读源路径，而是将
-冻结 bytes 物化到会话受控目录，再调用本机 Gateway：
+- `mode=reference`，使用后端编译的唯一 Ref2VA prompt；
+- exactly 9 张有序 Picture reference，并逐值绑定 source scene/time/transition；
+- `reference_audios=()`，Fusion 输入 `voice_references=[]`，逐行 `voice_ref=null`；
+- Context 为 `local:identity:<source_prompt_sha256>` 同字节 receipt，HTTP 调用数为 0。
 
-```text
-POST http://127.0.0.1:31000/v1/videos
-{mode,prompt,duration_sec,aspect_ratio,resolution,images,audios}
-```
+源视频音轨和 `work/voice.mp3` 只供既有 ASR/YAMNet 分析。后端把冻结 `spoken` 文本、时间和 off-screen 呈现方式机械编译进 Ref2VA prompt；音频 path/bytes 不进入 Fusion workspace、Context request、H3 request 或 stitch source。
 
-`mode=multimodal` 由 Gateway 映射到
-`minimax_h3_image_audio_to_video_v2_15s`；`multimodal_hd` 映射到
-`minimax_h3_image_audio_to_video_v2`。应用不复制 Gateway 内部的 `ref_image_N` /
-`ref_audio_N` 编码逻辑，也不把 `audio_required` 发给 Gateway。后者只绑定内部请求
-receipt，并在下载后通过媒体 timeline/ffprobe 硬性要求 H3 成片含音轨。
+H3 输出音轨是成片声音的唯一真源。统一 EDL 对每个 segment：
 
-付费安全沿用 `app.h3` 的 prepare/attempt/submitting/task-id 状态机：同一 request
-重复 submit 不产生第二次 POST；`submission_unknown` 只能恢复为 GET，不会重发。
-参考音频仅是 conditioning，不是目标音轨或 PTS 锁；H3 输出音轨才是成品真源。
+- H3 有音轨：按该 segment 的视频帧预算裁补原生 H3 音频；
+- H3 无音轨：在同一 EDL 插入等长有限静音；
+- 任一情况都不回挂、覆盖、混入或 overlay 源音频/conditioning audio。
 
-限制来源：
+semantic score、speech/music diagnostics 和外部 A/B 观察只用于测试与 Skill 迭代；它们不阻断生产、不触发 retry，也不选择 source-audio 或其他 workflow 作为 fallback。媒体文件、PTS、时长、SHA 和 receipt 的技术完整性验证仍然有效。
 
-- MiniMax 官方 V2 创建接口：<https://platform.minimax.io/docs/api-reference/video-generation-v2-create>
-- MiniMax 官方视频生成指南：<https://platform.minimax.io/docs/guides/video-generation>
-- 本机 Gateway HTTP 合同：`/home/xy/duet-video-v2/server/src/services/h3Client.service.ts`
-- Gateway mode/workflow 投影：`/home/xy/duet-video-v2/deploy/h3-gateway/gateway.js`
+## 历史只读
+
+旧 `app.h3_multimodal`、`ref_audio_N`、Gateway `multimodal|multimodal_hd`、speaker/binding 与 source-audio receipt 只为历史已知 task 的原 receipt GET 恢复保留。它们不得用于 current create、迁移、重写 Ref2VA prompt、覆盖成片或备用 POST。

@@ -1,16 +1,17 @@
 # Dialogue timing evidence gate
 
-Status: the pre-H3 on-screen timing gate and sampled visibility producer are
-wired into production. A new on-screen project without evidence returns
-refresh-required and schedules the producer; it is never inferred valid. The
-post-H3 validator remains `PREPARED_ONLY` research.
+Status: historical read-only. Current v4 fixes spoken delivery in the backend
+Ref2VA compiler, sends zero source audio references, and does not run a
+speaker-visibility Skill/producer. This receipt family may be inspected for an
+existing historical task but cannot create, migrate, refresh, retry, or block a
+current A→B operation. The post-H3 validator remains `PREPARED_ONLY` research.
 
 ## Before H3
 
-`work/speaker_timing.json` is required only when authoritative dialogue contains
-an `on_screen` line. `none` and purely off-screen projects keep their original
-path and skip probing/extraction. Historical v2 receipts remain readable; a new
-paid on-screen request from such a receipt is refresh-required.
+The following contract describes historical on-screen receipts only.
+`work/speaker_timing.json` was required when authoritative dialogue contained
+an `on_screen` line. `none` and purely off-screen projects skipped it.
+Historical v2 receipts remain readable and never enter the current create path.
 `h3_multimodal_source.json`, `multimodal_input.json`, and
 `speaker_timing_production.json` bind the exact artifacts. The producer
 enumerates exact decoded PTS, deterministically samples real frames at 8 fps

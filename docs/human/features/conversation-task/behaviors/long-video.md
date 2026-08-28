@@ -9,49 +9,41 @@ links: [conversation-task, submit-gate, result-display]
 
 # 统一分段生成
 
-本文件不得定义独立的“短链”和“长链”。当前项目统一表示为 `segments[N>=1]`；单段视频只是 `N=1`，多段视频只是 `N>1`。
+当前 v4 只使用 `segments[N>=1]`。`N=1` 是单元素列表，`N>1` 是多元素列表；两者进入同一个 A→B operation 和同一个 segment coordinator。
 
 ## 规则
 
 | 当 | 则 |
 | --- | --- |
-| 原视频完成分析 | `video-maker` 规划连续 `segments[N>=1]`；既有 scene 分析冻结 segment 内硬切，每段固定冻结 9 张原始关键帧、源时间、scene、视频提示词、动作/镜头/时间关系 |
-| 音频分析 | 只复用既有 ASR + YAMNet：ASR 负责文本，YAMNet 将歌唱类归入既有 `sung` 并冻结 `has_bgm`；只有 `spoken` 可进入自动台词，不增加新分类枚举 |
-| `N=1` | 使用与 `N>1` 完全相同的 plan、提交、Context、H3、attempt、恢复、拼接和验收代码；不得转入独立 short 实现 |
-| `N>1` | 各段使用同一合同独立冻结输入，可在服务端并发预算内并行提交，最终按 segment 顺序和源时间轴拼接 |
-| 两段属于同一镜头 | `continue` 只描述连续关系；两段仍各自使用 9 张冻结关键帧 |
-| segment 内存在源硬切 | transition 必须冻结为 `hard_cut`，切后关键帧成为新的 layout anchor；Fusion/Context 必须保留切点，不得描述为连续 zoom/morph |
-| 物理拆分 A/B 被启用 | 仍使用同一 segment 数据结构和执行器；切点两侧参考图不得混用。上线前必须证明每段 9 个唯一源帧、供应商时长与逻辑时长转换、完整动作和跨界台词均可审计 |
-| 用户选择去字幕和/或去 Logo | 在图片优化前复用既有 MediaKit 预处理；顺序固定为去字幕后去 Logo，未选择的阶段跳过。预处理不得改变每段 9 张帧的数量、顺序或 segment 归属，也不得派生新 Skill |
-| 用户确认图片 | 每段必须恰有 9 张已确认优化图；确认后冻结其顺序和 bytes，缺帧、重排或漂移均在 H3 前拒绝，不回退原图 |
-| 图片确认完成 | 调用 `video-prompt-fusion`：输入有序新关键帧及其源时间/scene/transition、旧视频提示词、图片优化提示词和音频内容；新视觉元素以优化图为准，动作与相对节奏沿用旧提示词，源硬切时间以冻结分析为准；输出最终视频提示词并绑定全部输入 SHA |
-| 自动台词分析 | 只保留 `spoken`；`sung/chant/rap/humming` 不进入 dialogue。仅有歌词时等同无台词，不发送音频 reference |
-| 用户选择画外声音 | 纯后端确定性编译现有真实口播、时间和已证明为 clean voice 的唯一 reference；不要求嘴型，不调用任何 Skill；完整源混音只有在同一既有 YAMNet 收据证明 `spoken && has_bgm=false` 时具备该资格 |
-| 用户选择画内声音 | 只消费 `video-maker` 主分析已经冻结的画内人物/时间证据；证据缺失时付费前明确不可用，不额外调用 Skill 补证 |
-| 用户选择无台词，或自动分析没有真实口播 | 不传台词或声音 reference；丢弃 H3 音轨并由现有拼接器发布静音成片 |
-| Context IR 完成 | 只优化 `video-prompt-fusion` 产生的最终视频提示词并直接交给 H3；不得恢复旧提示词中的旧视觉元素，也不得改变帧序、台词、时间、声音呈现或 voice reference |
-| 开始生成 | 所有 segment 共用冻结的画幅、清晰度和适配方式；每段读取自身 9 张图、提示词、台词和声音 reference |
-| 快速模式开启且 `N>1` | 所有分段输入先冻结，再并行提交；`N=1` 经过相同代码，实际只有一个任务 |
-| 某段供应商明确失败 | 完整持久化失败 attempt；成功兄弟不重提，后续是否重试服从统一预算和用户确认 |
-| 某段提交结果未知 | 整个项目停止新 POST，只查询已有任务；自动和人工均不得重提 |
-| 所有分段成功 | 使用同一拼接器按冻结逻辑时长和顺序处理：有合法口播的段保留 H3 原生音频，无真实口播的段丢弃 H3 音轨并静音；全项目无台词时最终文件无音频流，mixed 项目中的无台词段使用静音音轨维持统一时间轴；`N=1` 不调用另一个短片拼接器 |
-| 拼接失败 | 只重做本地拼接，不重新提交 H3 |
-| 最终输出 | 校验 receipt、输入/输出 SHA、帧数、PTS、音画起止和总时长后原子写入会话级 `generated.mp4` |
+| `video-maker` 完成分析 | 为每个 segment 冻结 exact 9 张原始关键帧及其 source time、source scene、transition 和旧视频动态骨架 |
+| scene 很短、可用解码帧不足 9 张 | 重复最近的合法源帧并保留 provenance；仍产出 exact 9 个有序槽位。相同 scene 的相同 PTS 合法，不把 exact-9 误写成 9 个唯一源帧 |
+| source scene 改变 | 冻结为精确 `hard_cut`；切后帧开始新视觉区间并成为新 anchor。scene 不变机械映射为 `continuous` |
+| MediaKit 被选择 | 在图片优化前按去字幕、去 Logo 顺序执行；不得改变 exact-9、帧序或 segment 归属 |
+| `image-postprocess` 执行 | Skill 只给替换视觉语义，后端确定性编译 Seedream prompts；每段发布 exact 9 张优化图 |
+| 图片技术验收 A 落盘 | 同一 operation 自动继续 Fusion、Ref2VA、Context、H3 和拼接；不等待刷新、第二次确认或另一个 POST |
+| `video-prompt-fusion` 执行 | 一次项目级调用读取四类冻结输入，每个 hard-cut 区间只输出一条 visual prose；不输出 provider prompt |
+| Fusion visual prose 可读 | 后端机械编译唯一 Ref2VA prompt：Picture 1…9、scene/cut 时间、冻结 spoken 台词、`non_diegetic_music: N/A` 均由 receipt 真源写入 |
+| Context 执行 | 当前 v2 Ref2VA prompt 走 local identity：effective prompt 同字节、task id 为 `local:identity:<sha256>`、HTTP 0 |
+| H3 执行 | 每段发送 exact 9 张 Picture reference、零 source audio reference；H3 prompt 和图片 bytes 均受 receipt 绑定 |
+| 某段 H3 返回音轨 | 保留 H3 原生音频并按同一 segment EDL 裁补 |
+| 某段 H3 无音轨 | 在同一 EDL 为该段补有限静音；不读取、回挂或 overlay 源音频 |
+| 全部分段成功 | 按冻结顺序、帧预算和 PTS 用同一拼接器输出 `generated.mp4`；`N=1` 也处理单元素 EDL |
+| 质量 score 或 diagnostics 较低 | 仅记录给测试和下一轮 Skill 迭代；不阻断、重试、选择备用 prompt、回退旧图片或切换 workflow |
+| 历史 v1 / old multimodal receipt | 只读或对既有 task 做原 receipt GET 恢复；不得新建、迁移或作为 current fallback |
 
 ## 不变量
 
-- 全链只有 `video-maker`、`image-postprocess` 与 `video-prompt-fusion` 三个 Skill；音频、Context、H3 和拼接都不是 Skill。
-- `image-postprocess` 已经用户验收并冻结，不再迭代；它只接收关键帧并输出优化图，不拒绝合法可解码素材。
-- segment 索引在统一 plan 内连续；API、Web 和内部实现不得用索引规则选择另一套业务逻辑。
-- 每段原始关键帧和优化关键帧都固定为 9 张，顺序进入 frozen receipt 和 H3 请求。
-- 每张关键帧的源时间、source scene 与 transition 都进入 frozen receipt；源硬切时点不得由 Fusion 或 Context 改写。若启用物理拆分，供应商请求不得跨硬切复用参考图。
-- 物理拆分不得用“请求最短时长后直接截前半段”冒充完整动作保留；逻辑时长、供应商时长、帧预算与转换方式必须分别冻结并通过真实 A/B 后才能上线。
-- H3 最终 prompt 必须绑定 `video-prompt-fusion` 输出及四类输入 SHA；旧视觉 prompt 只能作为融合输入，不得直接进入 Context 或 H3。
-- 有合法 clean voice reference 的段只使用 H3 原生输出音轨；源混音和 conditioning voice 不得在拼接时回挂或 overlay。无真实口播的段必须静音，不能发布 H3 新生音乐。
-- 历史 short/long receipt 只允许兼容读取和安全恢复；所有新 v4 项目必须进入统一 segment coordinator。
+- 全链只有 `video-maker`、`image-postprocess`、`video-prompt-fusion` 三个 Skill；Ref2VA compiler、Context、H3 和 EDL 都属于后端。
+- Fusion v2 输出只有 `{index,visual[]}`；Picture、Shot、时间码、台词和 music policy 只由后端编译。
+- 技术合同要求 schema、数量、顺序、路径和 SHA 完整；视觉质量和语义评分不是生产门禁。
+- 每段原始图、优化图、Fusion 输入和 H3 Picture 都是 exact 9 个有序槽位，并逐值绑定 source scene/time/transition。
+- 当前音频始终 `voice_references=[]`、逐行 `voice_ref=null`；源音频只供 ASR/YAMNet 分析。
+- H3 原生音频与同 EDL 静音是唯二成片音频来源；源混音和任何 conditioning audio 都不得 overlay。
+- A 接受后只存在一个 operation；内部阶段失败保留同一 durable work item，不向用户暴露 refresh/409 作为推进步骤。
+- `submission_unknown` 维持 GET-only，不因此创建第二个 operation 或另一条 workflow。
 
 ## 例子
 
-- 输入：14.5 秒且没有源硬切的视频，规划为一个 segment → `segments.length=1`，执行一次统一 H3 segment 任务，再由统一拼接器处理单元素列表。
-- 输入：14.5 秒视频在 2.267 秒存在源硬切 → 首轮在现有 segment 内冻结精确 hard cut、切后新 anchor 与 Picture 映射；若 A/B 仍出现 morph，再评估用两个现有 segment 物理隔离，不直接假设裁短供应商输出是等价动作。
-- 输入：30 秒视频，规划为三个 segment → 三段使用同一输入合同并行生成，最后按冻结顺序拼接。
+- 2 秒连续 scene 只有少量不同解码帧：为当前 segment 重复最近合法帧填满 Picture 1…9，并绑定重复 provenance；仍走同一 H3 task。
+- 14.5 秒视频在 2.267 秒存在 source hard cut：仍是一个 exact-9 segment；后端按冻结 timeline 把 visual prose 编译成两个 Shot，第二个 Shot 在 `00:02.267` 切到对应 Picture。
+- 30 秒视频规划为三个 segment：每段 exact 9 Picture、零 source audio reference；三段 H3 成功后按同一 EDL 拼接。

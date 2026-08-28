@@ -8,9 +8,9 @@ tdd: N/A
 links: [conversation-task, processing-state, long-video, postprocess]
 ---
 
-# H3 统一提交门控
+# H3 统一提交合同
 
-当前 v4 项目只有一个提交合同。单段项目是 `segments.length=1`，不得选择独立 short 提交器；多段项目也不得复制另一套参数、音频或恢复逻辑。
+当前 v4 只有一个 A→B operation。请求在技术验收 A 前校验 shape、receipt 和付费参数；一旦 A 被接受，同一 CID 自动推进到 receipt 绑定的成片 B，不再要求刷新、二次确认或第二个 submit。
 
 ```json
 {
@@ -26,66 +26,51 @@ links: [conversation-task, processing-state, long-video, postprocess]
 }
 ```
 
-- `edit/custom` 还必须带非空 `lines`；`auto/none` 禁止带 `lines`。
-- `dialogue_mode != none` 时必须由用户显式选择 `on_screen` 或 `off_screen`；`none` 不接受声音呈现和音频 reference。
-- `fast_mode` 使用统一执行器；`N=1` 时没有并行兄弟，字段不产生另一条业务路径。
-- `expected_plan_receipt` 对所有当前 v4 项目生效，用来防止旧页面、图片确认或生成参数覆盖新状态。
+当前 v4 接受后公开结果固定为：
+
+```text
+202 {operation_id:<cid>,status:"running",stage:<current-stage>}
+  -> 同一 durable operation 自动继续
+200 {operation_id:<cid>,status:"succeeded",stage:"commit_b"}
+```
+
+重放或兼容 image-acceptance 调用只读取/确保同一个 operation，不接受另一组参数创建竞争生成。内部 `prompt_fusion_refresh_required`、图片 acceptance CAS 或质量诊断不构成 current 的公开 refresh/409 步骤。
 
 ## 唯一编译规则
 
-提交门内只允许普通后端纯函数做下列确定性投影，不调用 Skill：
-
-| 输入 | H3 冻结结果 |
+| 冻结输入 | 后端结果 |
 | --- | --- |
-| `dialogue_mode=none` | 零台词、零声音 reference |
-| `dialogue_mode=auto` | 仅保留 `classification=spoken` 的 ASR 行；既有 `sung`（包含 YAMNet 归并的 singing/chant/rap/humming）全部排除。没有真实口播时冻结零台词、零声音 reference |
-| `dialogue_delivery=off_screen` | 逐行保留冻结 text/start/end，`delivery=off_screen`、无画内 subject，只能绑定已证明为 clean voice 的唯一 reference；完整源混音必须由同一既有 YAMNet 收据证明 `spoken && has_bgm=false` |
-| `dialogue_delivery=on_screen` 且主分析已有同一行的画内人物/时间证据 | 逐行绑定既有证据与唯一 voice reference |
-| `dialogue_delivery=on_screen` 但证据缺失 | 409 `on_screen_authority_unavailable`，Context/H3 POST 为 0；不得调用额外 Skill 补证 |
+| 每段 source timeline | exact 9 个有序 Picture 槽位；scene 改变机械编译为 hard cut，scene 不变为 continuous |
+| Fusion v2 `visual[]` | 只作为每个冻结 hard-cut 区间的视觉 prose；无 provider 标签解释权 |
+| `dialogue_mode=none` | 零台词、零 source audio reference |
+| `dialogue_mode=auto` | 只投影冻结的 `spoken` 文本和时间；逐行 `voice_ref=null`，项目 `voice_references=[]` |
+| `dialogue_delivery` | 当前 Ref2VA compiler 固定投影为 off-screen voiceover；不新增 speaker/binding Skill |
+| `music_policy=forbid` | 后端机械编译 `non_diegetic_music:` / `N/A` |
+| Fusion visual + timeline + dialogue + music | 后端确定性编译唯一 Ref2VA prompt |
+| 后端 Ref2VA prompt | Context local identity 原样绑定，同字节 effective prompt，HTTP 0 |
+| H3 输出 | 成片使用 H3 native audio；缺音轨的 segment 在同一 EDL 补静音 |
 
-语言字段只复用上游已经冻结的权威值；没有权威值时使用格式占位 `und`，不得由后端按样本文字猜测语言。
+## A 前技术校验
 
-如果确定性投影更新了 plan receipt，服务可以返回既有的 409 refresh/CAS 提示；Web 只刷新详情并保留用户选择，不自动再次 POST。用户再次确认后继续同一统一链路。这是输入冻结，不是新的产品阶段或 Skill。
+- schema、字段闭集、`confirm`、client id、枚举和 receipt 必须合法。
+- 每个 segment 必须具备 exact 9 张确认图片及其有序 SHA、source scene/time/transition；极短 scene 的受 receipt 证明重复帧合法。
+- Fusion 四类输入、Skill SHA、input/output SHA 和 segment 顺序必须一致；Fusion v2 输出只能是 `{index,visual[]}`。
+- Ref2VA compiler 必须从冻结机械字段生成 Picture 1…9、Shot/cut 时间、台词和 music policy；Skill 文本不能覆盖这些字段。
+- H3 request 必须为零 source audio reference；源音频路径和 bytes 不能出现在 Fusion、Context、H3 或 stitch 输入中。
+- 付费 attempt 必须先落 exact input receipt；`submission_unknown` 仍是 GET-only。
 
-## 门控规则
+这些是技术完整性校验。人物、背景、旧静态残留、动作表现、画面质量、semantic score 和 diagnostics 只进入测试与 Skill 迭代，不得阻断 A→B、不触发 retry、不生成备用 prompt，也不得选择另一 workflow。
 
-| 条件 | 结果 |
-| --- | --- |
-| `ENABLE_H3_SUBMIT` 未开 | 501 `H3 submission is disabled.` |
-| 会话不存在 | 404 `not found` |
-| schema 不是 v2 | 409 `read_only` |
-| 未完成图片后处理或每段不是恰好 9 张图 | 409 `postprocess_artifacts_invalid`；不回退原图 |
-| v4 图片尚未由用户确认，或确认绑定的图、顺序、计划已漂移 | 409 image acceptance 错误；不创建付费任务 |
-| 自动模式只检测到歌词或歌唱 | 按无台词冻结，完整源混音不进入 Fusion/H3；无音频 H3 输出在拼接时静音 |
-| 既有 YAMNet 检测到 BGM，或无法给当前完整混音证明无 BGM | 该混音禁止成为 voice reference；不调用替代分类器或新 Skill，无法走无台词路径时付费前拒绝 |
-| `spoken/edit/custom` 台词非空但 YAMNet 检测到或无法排除 BGM | 409 clean voice reference 错误；Context/H3 POST 为 0，不得回退整轨混音。只有用户显式 `none` 才能丢弃真实口播 |
-| 输入准备未 `done` | 409 `artifacts not ready` |
-| 请求缺字段、有未知字段、`confirm` 非 true、id 或枚举不合法 | 422；在状态写入和供应商调用前拒绝 |
-| plan receipt 缺失、格式非法或已变化 | 422/409；刷新后由用户再次确认，Web 不自动重发 |
-| 图片确认后缺少 `video-prompt-fusion` 最终提示词，或四类输入 SHA/顺序漂移 | 409；重新融合提示词，Context/H3 POST 为 0；禁止旧视觉 prompt 直达 Context/H3 |
-| 画内声音缺少主分析权威 | 409 `on_screen_authority_unavailable`；不调用 Skill，不创建 H3 attempt |
-| Context IR 试图改变帧序、源硬切时点、台词、声音呈现、music policy 或 voice reference | fail closed；不创建 H3 attempt |
-| generation active/succeeded，或参数与冻结输入不一致 | 409；不创建新供应商任务 |
-| generation 为 `resume_required` | 只接受原 id 和全部原冻结参数，继续原 attempt |
-| generation 为 `submission_unknown` | 任意提交均 409；只允许查询供应商已有任务 |
-| 全部门控通过 | 202 queued；统一 segment coordinator 异步执行 Context、H3 和拼接 |
+## A 后自动延续
 
-## 图片与 Skill 边界
+- A 与 B 共用同一个 `operation_id=cid`、冻结请求 id 和输入 owner。
+- Fusion 是未付费的内部阶段；输出暂不可用时保留同一 accepted claim 并继续调度，不公开失败终态或要求重提。
+- Fusion done 后后端自动 finalize plan、创建唯一 generation，并进入 Context local identity、H3 和 EDL。
+- 进程重启会认领同一 stale continuation；已进入 provider 边界的 attempt 仍按 receipt 安全恢复。
+- 已知 provider task 的恢复和确定 provider failure 的预算内 retry 沿用既有 attempt 规则；不会派生备用 current path。
 
-- 全链仅解析并调用 `video-maker`、`image-postprocess` 与 `video-prompt-fusion` 三个 Skill；出现第四个 Skill 名、音频 Skill、Binding Skill 或 speaker-visibility phase，测试和启动门必须失败。
-- `video-maker` 第一次调用冻结 segments、每段 9 张原始关键帧、原始视频提示词、动作/镜头/时间和它已经能证明的结构化事实。
-- `image-postprocess` 已冻结，不再迭代；它只把每段 9 张原始关键帧变成 9 张优化关键帧，不做素材准入。
-- 用户确认后的 9 张优化图按 segment 和帧序进入统一 frozen receipt；随后 `video-prompt-fusion` 以有序新关键帧、旧视频提示词、图片优化提示词和音频内容为唯一四类输入生成最终视频提示词。
-- `new_keyframes` 仍属于第一类输入，但每项必须同时绑定源时间、source scene 与 transition；扩充字段不是第五类输入，也不是新阶段。
-- 音频内容必须冻结既有 ASR/YAMNet 的真实口播筛选结果、BGM 判定与 `music_policy=forbid`；`work/voice.mp3` 默认只用于分析，只有同一收据证明 `spoken && has_bgm=false` 时才可成为 reference。
-- 第一次生成确认只冻结四类输入并项目级调用一次 `video-prompt-fusion`；完成后返回可刷新状态，Web 不自动重提。相同设置由用户再次明确确认后，才允许进入 Context IR 和 H3。
-- Context IR 与 H3 只能消费 `video-prompt-fusion` 输出及其绑定的四类输入；禁止旧视觉 prompt 直接覆盖新人物、新场景或新对象。
+## Current / history 边界
 
-## 付费与恢复边界
-
-- 每个供应商 POST 前必须先落 attempt receipt；输入 SHA、顺序、参数或上游 receipt 漂移时拒绝。
-- `submission_unknown` 永远 GET-only。
-- 已知供应商明确失败的自动 attempt 必须沿用同一冻结输入并受统一次数预算约束；成功 segment 不重提。
-- 本地拼接失败只重做拼接，不重新提交 H3。
-- H3 输出下载、ffprobe、PTS、时长、原生音轨和最终拼接验证通过后才原子发布 `generated.mp4`。
-- 有合法口播的段以 H3 原生输出音轨为成片音频；源混音和 conditioning voice 不得 overlay 或回挂。无真实口播的段丢弃 H3 音轨并输出静音。
+- current create contract 只有 v4 + Fusion v2 + backend Ref2VA + Context local identity。
+- Fusion v1、旧 Context HTTP、多模态 source-audio reference、旧 short/long、speaker visibility 与 quality-verdict receipt 均只读。
+- 历史已知 task 只按原 receipt GET；历史成片可查看，但不得迁移为 current、覆盖输出或作为 fallback 新 POST。

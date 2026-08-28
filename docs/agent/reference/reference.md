@@ -3,7 +3,7 @@ name: h3-runtime
 type: reference
 status: done
 owner: agent
-updated: 2026-08-25
+updated: 2026-08-28
 tdd: N/A
 links: [conversation-task, app/main.py, app/h3.py, app/prepared_input.py, app/long_generation.py]
 ---
@@ -15,6 +15,22 @@ links: [conversation-task, app/main.py, app/h3.py, app/prepared_input.py, app/lo
 - `/api/health`、`/api/login` 无需鉴权；其余 `/api/conversations*` 使用 `Authorization: Bearer <ACCESS_TOKEN>`。
 - JSON 错误 detail 为安全字符串或 `{code,message}`。结构化冲突只公开固定 code/中文提示；供应商响应正文、URL、token 和本机路径不作为公开错误。
 - H3 提交是 202 + 轮询；`POST /submit` 不等待最终视频。
+
+### Current v4 single operation
+
+current v4 的唯一 create path 是 `segments[N>=1] + Fusion v2 + backend Ref2VA compiler + Context local identity + H3 + EDL`。技术验收 A 接受后，所有阶段共用同一 `operation_id=cid` 并自动延续：
+
+```text
+202 {operation_id:<cid>,status:"running",stage:<current-stage>}
+  -> same accepted claim, no refresh or second submit
+200 {operation_id:<cid>,status:"succeeded",stage:"commit_b"}
+```
+
+内部 Fusion refresh/CAS、image acceptance 冲突和质量诊断不会成为 current 的公开 409/刷新步骤；重放只确保同一 operation。Fusion v2 每段只输出 `{index,visual[]}`，后端独占 Ref2VA provider prompt 的编译权。Context 将该 prompt 原样绑定为 `local:identity:<sha256>`，effective prompt 同 SHA，HTTP 调用数为 0。
+
+current 每段固定 exact 9 个 Picture reference，允许极短连续 scene 重复最近合法源帧并绑定 provenance；H3 `reference_audios=()`，源音频只供 ASR/YAMNet 分析。成片音频只取 H3 原生音轨，缺音轨的 segment 在同一 EDL 补静音，源音频不回挂或 overlay。quality score/diagnostics 只用于测试和 Skill 迭代，不阻断、不重试、不产生 fallback。
+
+Fusion v1、旧 Context HTTP、多模态 source-audio reference、旧 short/long、speaker visibility 与 quality-verdict receipt 均只读；历史已知 provider task 只按原 receipt GET 恢复，不能迁移为 current 或新建 fallback POST。
 
 ### `GET /api/health`
 
@@ -161,11 +177,11 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 }
 ```
 
-`generation`、短链 `receipt_version` 和 `fit_mode` 在尚未创建时为 null。长链 `generation.fast_mode` 是首次提交冻结的 boolean，历史 generation 缺失时公开为 `false`；恢复和重试参数比较都以冻结值为准。当前浏览器对尚未创建 generation 的长链固定初始化 `fastMode=true`，确认页不显示模式开关或说明，生成结果参数摘要也不展示该模式；一旦详情出现 generation，浏览器必须丢弃本地可编辑草稿，以详情中的画幅、清晰度、台词、fit 和快速模式重新同步并锁定参数控件，跨标签页提交不能继续显示另一个草稿值。`aspect_ratio/resolution` 是服务端推荐值，首次提交后即为冻结值；闭集分别为 `16:9|9:16` 和 `480p|768p`。`fit_profiles` 同时公开两个画幅的 `fit_required/default_fit_mode`，浏览器改变画幅时只能据此切换适配选项。历史 meta 缺少新字段时精确投影为 `9:16 + 768p`，不会改写旧 receipt。长链 `plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；`generation.segments` 只公开 `index/chain_id/join_mode/status/attempt/error`，不公开供应商 task id、内部 child request id 或文件路径。长链当前为 `failed` 时，`generation.retry_paid_segment_count` 以冻结 `meta.segments` 的完整索引集合为基数，由服务端结合持久化状态与分段 `generated.mp4` 文件实况计算：缺项计入，重复、未知或乱序状态整批不复用；快速模式成功段彼此独立，默认模式仍要求 `continue` 上游可复用；`stage=stitch` 固定为 0。该复用判定与 retry 初始化共用，前端不得从公开 segment status 再次推断费用。`source_prompt` 来自受 receipt 绑定的 `work/visual_prompt.txt`，配套 SHA-256 用于首次 H3 attempt 前的编辑 CAS；`prompt` 是机械追加结构化台词后的最终输入。`dialogue.lines` 是当前 mode 的有效公开台词；`auto_lines` 永远保留自动有效台词供短链 edit 预填。`read_only` 由 `schema_version != 2` 派生，不相信旧 meta 自报。`has_source` 按源文件实况计算；`has_video` 与 `navigation_status` 共用当前服务端最终输出验收结果。成功页继续播放成片，并从这些服务端冻结值生成只读参数摘要。
+current v4 detail 统一投影 `segments[N>=1]`、current plan receipt、Fusion production binding、operation stage 和最终媒体状态。`N=1` 也不公开历史 short prompt 编辑合同。`plan_receipt` 是 canonical `long_video_plan.json` 的 SHA-256，`segment_count` 来自冻结计划；公开 segment 只含安全状态投影，不泄漏 task id、内部 child id 或文件路径。`read_only` 由历史 schema/receipt 派生；历史详情和成片可读，但不能创建或迁移为 current。成功页只从服务端冻结值生成摘要。
 
 ### `PATCH /api/conversations/{cid}/prompt`
 
-请求严格为 `{confirm:true, expected_sha256:"...", prompt:"..."}`。该接口只适用于 `≤15s` 短链：在 schema v2、输入准备完成且生成 attempt 尚未创建时，以 SHA-256 CAS 更新 `work/visual_prompt.txt`，重新机械组合结构化台词并重写 prepared receipt。CAS 不一致返回结构化 409 `prompt_changed` 和中文刷新提示，不改写 prompt/meta/receipt；attempt 已创建后返回 409 `prompt_frozen`。长链的分段提示词已由 plan receipt 逐段绑定，不提供此顶层编辑接口。
+该接口只属于历史 prepared-input/short receipt；current v4 不允许用它改写 Fusion visual 或 backend Ref2VA prompt。历史 CAS 结果只供诊断，不是 current A→B 的刷新推进步骤。
 
 ### `GET /api/conversations/{cid}/files/{name}`
 
@@ -173,7 +189,9 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 ### `POST /api/conversations/{cid}/submit`
 
-短视频直接提交 frozen prepared input：
+current v4 使用下方带 `expected_plan_receipt` 的统一分段请求；`N=1` 也不进入独立 short 实现。请求 shape、枚举和 receipt 在 A 前校验；A 一旦接受，响应投影为上文 single operation，不再以 refresh/409 要求客户端推动内部阶段。
+
+以下 short prepared-input 请求仅用于历史只读合同说明，不是 current create path：
 
 ```json
 {
@@ -196,7 +214,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 - `aspect_ratio` 只允许 `16:9|9:16`，`resolution` 只允许 `480p|768p`；两者都必须显式提交。
 - 所选画幅的 `fit_required=false` 时只允许 `fit_mode=none`；为 true 时只允许 `crop` 或 `pad`。该值只在 pipeline `done` 时按实际 H3 输入帧计算，浏览器不能从源媒体自行推断。
 
-长视频请求严格为：
+current v4 请求严格为：
 
 ```json
 {
@@ -211,13 +229,13 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 }
 ```
 
-长视频允许上述八个键；当前网页新建长视频固定发送 `fast_mode=true` 且不提供选择控件。后端契约不变：`fast_mode` 可缺失且安全等价 `false`，显式 `false` 仍受支持，出现时必须是 JSON boolean，非法类型返回 422 `invalid_fast_mode`。`dialogue_mode` 只能为 `auto`（复用源音轨；长于画面时裁剪、短于画面时补静音，画面时长不变）或 `none`（静音）；不接受 `lines`、`edit/custom`，也不接受创建阶段的 rewrite/translate。`expected_plan_receipt` 必须是 detail 当前返回的 64 位小写十六进制值。服务在任何付费 POST 前用它做 CAS，并重新校验 plan、meta、关键帧、提示词和文件哈希；SHA 校验、优化帧选择、画幅派生与 H3 请求消费同一份不可变 bytes，不会在校验后重新读取路径。所有段共用冻结的画幅、清晰度和 fit。历史未冻结 null 会话从安全 plan 纯派生，无法派生时付费前拒绝；已有冻结提交继续以原参数和 workflow 为准。
+统一分段请求允许上述八个键；`fast_mode` 缺失等价 `false`，显式值必须是 JSON boolean。`dialogue_mode` 当前只允许 `auto|none`：`auto` 只把冻结 spoken 文本/时间投影进 Ref2VA，`none` 使用空台词；两者都固定 `voice_references=[]`，不会复用源音轨或发送 source audio reference。`expected_plan_receipt` 是当前 canonical plan 的 64 位小写 SHA-256。服务在任何付费 POST 前重新校验 plan、meta、exact-9 图片、Fusion input/output、Ref2VA prompt 和文件哈希；所有段共用冻结画幅、清晰度和 fit。
 
-旧标签页可能仍按四键长视频契约提交，缺少 `expected_plan_receipt`。服务仅对这个精确旧请求返回结构化 `409 client_refresh_required`，提示刷新页面；不会自动采用服务端当前 receipt，也不会创建付费任务。`/`、`/index.html` 和 `/app.js` 均使用 `Cache-Control: no-store`，刷新后会取得当前提交契约。
+旧标签页的四键请求和 `client_refresh_required` 只属于历史兼容诊断，不是 current 推进方式。历史项目/receipt 只读；current v4 的 accepted A 由同一后台 continuation 自动推进。
 
-接受后返回 `202 {"status":"queued","attempt":N}`。后台状态写入 `generation`，客户端轮询 detail。
+接受后返回 `202 {"operation_id":"<cid>","status":"running","stage":"..."}`。后台在同一 accepted claim 上继续；最终成片有效后同一接口读取得到 `200 succeeded / commit_b`。
 
-门控和错误：
+下表是底层技术/历史诊断，不是 current A→B 的客户端推进状态；current operation 对内部 refresh/CAS 保持 `running`：
 
 | HTTP | detail | 条件 |
 | --- | --- | --- |
@@ -225,7 +243,6 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 | 404 | `not found` | cid 不存在/非法 |
 | 409 | `read_only` | 非 schema v2 |
 | 409 | `confirmation required` | 非严格 true |
-| 409 | `client_refresh_required` + 中文 `message` | 精确旧版四键长视频请求；刷新页面，不产生付费任务 |
 | 422 | `invalid_submit_request` | 出现未知键 |
 | 422 | `invalid_client_request_id` | id 不合规 |
 | 422 | `invalid_dialogue` | mode、lines 形状或台词内容不合规 |
@@ -249,7 +266,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 相同 id 在 `queued/running/succeeded` 时返回现有 `{status,attempt}`，不重复 POST。确定 `failed` 的短链或长链 H3 阶段只有新 id 才进入人工 retry。长链 retry 从冻结的 `generation.segments` 复用状态和文件均完整的 `succeeded` 段，把其余段重置为待生成；前端直接展示服务端 `retry_paid_segment_count`。若长链为 `failed + stage=stitch`，必须复用原 `client_request_id` 和冻结参数，只重新执行本地拼接，attempt 不递增且新增付费 H3 子任务数为 0。即使半发布留下可播放的会话级 `generated.mp4`，详情仍同时公开 `has_video=true` 与拼接恢复状态。
 
-旧 Context IR 契约下未完成的 generation 对外固定映射为 `failed / generation_path_removed`；历史成片保持可读。用户用新 id 重试时重写为当前直接 H3 receipt，不再恢复或查询 MiniMax task。
+旧 Context HTTP、旧 multimodal audio 与 Fusion v1 receipt 只读；历史成片保持可读，已有 task 只按原 receipt GET 恢复。它们不得用新 id 迁移成 current、覆盖 prompt 或创建 fallback POST。current v4 Context 始终是同字节 local identity。
 
 `resume_required` 表示 H3 provider task 已知：只接受原 `client_request_id`，且 dialogue mode、标准化 lines、`fit_mode`、画幅、清晰度及长链 plan receipt 必须与冻结输入完全一致。合法继续返回 `202 {"status":"queued","attempt":<原值>}`，不重写 receipt、不递增 attempt。已知 task 错误包括 `h3_query_failed/h3_timeout/download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed`；`h3_running` 也进入此状态。长链启动恢复只 GET 已持久化子任务，不会 POST 尚未开始的段。
 
@@ -272,7 +289,7 @@ analysis 的非终态/失败优先于所有 generation/postprocess 状态。投�
 
 该接口只保留给历史 v1 continuity receipt：短视频使用逻辑段 `0`，长视频使用连续正整数段 `1..N`，并继续以 `expected_sha256` CAS 保存而不迁移旧 receipt。存在有效 v2 双目标 plan 时提示词由后端确定性编译，接口固定返回 409 `image_optimization_prompt_compiled`；v2 plan 损坏返回 `image_optimization_plan_invalid`，绝不回退 v1。未知字段、空白或超过 32 KiB 的旧提示词、非法段号在写入前拒绝。
 
-视觉关键帧冻结后，同一 `skills/image-postprocess` 先以 `phase=plan` 输出 v2 双目标结构化计划：`person_plans[]` 覆盖全部叙事主人物，`scene_plans[]` 无重叠覆盖全部段，短视频逻辑段 `0` 也使用相同合同。后端校验并冻结 plan SHA、reference slots、源帧 SHA、model/profile/revision，再确定性编译每段 Seedream 提示词；v2 提示词不能由自由文本 PATCH。图片编辑后以 `phase=verify` 只读 source/output 帧、冻结 plan 和确定性指标，结构化检查人物替换及源身份残留、场景语义/形状/纵深/布局、局部颜色、全局光色、互动关系和时序连续性；fail/unknown 均 fail closed。旧 `_image_continuity` v1 可验证读取，但不会迁移或重写。
+current v4 的 `skills/image-postprocess` 只以 `phase=plan` 输出人物/场景替换视觉语义；后端补齐结构字段、绑定 source scene/time/transition 与 SHA，并确定性编译逐帧 Seedream prompt。semantic compiler 的 `score/issues/ignored_mechanical_fields` 只进入日志、测试断言和 Skill 迭代；current 不运行 plan audit/verify，不写 `_image_verification`，也不因质量 fail/unknown 阻断发布、重试或 fallback。schema、exact-9、索引、路径与 SHA 不完整仍是技术合同错误。旧 `_image_continuity` 与 quality-verdict receipt 只读，不迁移或重写。
 
 ### `POST /api/conversations/{cid}/postprocess`
 
@@ -322,7 +339,7 @@ Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。�
 | `aspect_ratio`, `resolution` | str/null | pipeline 推荐，提交后冻结；闭集为 `16:9|9:16`、`480p|768p` |
 | `dialogue_mode` | str | 默认 auto；最终提交选择 |
 | `generation` | object/null | coarse H3 attempt 状态 |
-| `segments` | list | 长链分段计划；短链为空 |
+| `segments` | list | current v4 固定非空；`N=1` 与 `N>1` 共用统一分段计划 |
 
 准备/提交后可增加：
 
@@ -334,8 +351,8 @@ Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。�
 | `vocal_filter_enabled`, `voice_warnings`, `voice_lines_vocal_dropped` | 声学过滤留痕 |
 | `prepared_dialogue` | 本次提交冻结的完整有效台词（含 classification/provenance） |
 | `prepared_input_receipt` / `receipt_version` | `prepared_input.json` / 1 |
-| `long_video_plan_receipt` | 长链固定为 `long_video_plan.json` |
-| `frozen_plan_receipt` | 长链首次提交确认的 plan SHA-256 |
+| `long_video_plan_receipt` | current v4 固定为 `long_video_plan.json` |
+| `frozen_plan_receipt` | accepted A 绑定的 current plan SHA-256 |
 | `fit_mode` | `none/crop/pad`；随冻结画幅解释 |
 | `generation` | `{status,error,attempt,client_request_id,stage}`；长链另含冻结 boolean `fast_mode`、内部 `segments` 与 `fit_layout`，failed 时公开 `retry_paid_segment_count`，status 含 resume_required；历史缺 fast_mode 等价 false |
 | `_image_optimization` | 私有项目冻结 receipt：同一模型/模式及每段 Codex 产出的 default/current/SHA；只投影用户可编辑的提示词字段 |
@@ -343,9 +360,9 @@ Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。�
 | `_postprocess_receipt` | 私有执行 receipt：冻结三选项与图片优化设置，不进入公开 detail |
 | `postprocess` | `{status,options,frames,segments,error}`；存在时生成必须等待全部段 done，并使用完整优化帧集合 |
 
-`≤15s` 的新 schema v2 使用顶层 keyframes/prompt；`>15s` 使用 `segments` 与 `long_video_plan.json`，每段独立工作目录和生成状态。历史 11–15 秒长链仍按已冻结计划恢复，两种契约不能互相降级或混用 receipt。
+current v4 不按 15 秒复制合同：`≤15s` 是 `segments.length=1`，更长输入是 `segments.length>1`，都使用 v5 `long_video_plan.json`。顶层 keyframes/prompt、prepared input 和 v1-v4 plan 都是历史只读，不能混用或降级。
 
-## Prepared input receipt v1
+## Prepared input receipt v1（历史只读）
 
 固定顶层形状：
 
@@ -379,22 +396,22 @@ Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。�
 
 `normalized_audio=null` 是无音轨的合法表示。无需适配时，优化后的 keyframe binding 可直接指向 `work/postprocessed/`；crop/pad 时则指向由所选原图或优化图生成的 `work/h3_frames/<aspect>/<mode>/`。历史 receipt 缺少语义参数时仅按原 `ratio=9:16`、`resolution=768p竖` 精确恢复，loader 不重写文件。
 
-## Long-video plan receipt v2（兼容只读恢复 v1）
+## Long-video plan receipt v5（current；v1-v4 只读）
 
-`data/<cid>/long_video_plan.json` 是 canonical JSON。新计划固定 `schema=duet.long-video-plan`、`version=2`；顶层绑定完整 source 的路径/SHA-256、实际总时长、`workflow=minimax_h3_lightx2v_v5_15s` 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，六位小数边界归一后的长度至少 1 秒，provider 整秒时长不得超过 14 秒，并绑定：
+`data/<cid>/long_video_plan.json` 是 canonical JSON。current Fusion v2 promotion 固定 `schema=duet.long-video-plan`、`version=5`；顶层绑定完整 source、实际总时长、统一 H3 workflow、Fusion production manifest 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，provider 整秒时长不得超过 14 秒，并绑定：
 
 - `index/start_s/end_s/chain_id/join_mode`；首段必须 `hard_cut`，后续为 `hard_cut` 或 `continue`；
-- 分段 source、1–9 张关键帧、`first/end` 两张锚点及其 SHA-256；
-- `visual_prompt`、最终 `prompt` 的路径/SHA-256；
+- 分段 source、exact 9 张关键帧及各自 source time/scene/transition、兼容锚点和 SHA-256；
+- Fusion visual prose、后端编译的最终 Ref2VA prompt 及 production manifest 的路径/SHA-256；
 - 本段局部台词的 canonical 数量与 SHA-256。
 
 detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字段。提交时服务同时比对该摘要、meta 分段和全部 artifact；`fit_mode=crop/pad` 时冻结请求使用由本段最终选中关键帧派生的 `16:9/9:16` 输入。每段工作目录为 `work/segments/<N>/`，其中 `.h3/` 只归该子任务所有。当前 generation 在任何供应商 POST 前持久化内部 `workflow` 与 `fit_layout=legacy-v0|aspect-v1`，恢复只按冻结值读取。旧 boundary attempt 没有 workflow marker 时按 plan 中的首尾帧模式恢复，不切换接口。
 
-历史 `version=1` receipt 仍可读取并按其原始浮点换算重建最长 15 秒的已知 attempt；超过 10 秒的历史段只能 GET 恢复，绝不创建新 POST，也不改写原 receipt。
+`version=1..4` 及 Fusion v1 receipt 均只读；已有 task 只按原输入与 workflow GET 恢复，不创建、迁移或改写为 v5，也不作为 current fallback。
 
 ## H3 attempt state v1
 
-短链路径 `.h3/attempts/<六位递增号>/attempt.json`；长链路径 `work/segments/<N>/.h3/attempts/<六位递增号>/attempt.json`。最小形状：
+current v4 路径为 `work/segments/<N>/.h3/attempts/<六位递增号>/attempt.json`；顶层 `.h3/` 是历史 short 布局。最小形状：
 
 ```json
 {
@@ -423,11 +440,11 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 
 `start/resume/retry` 共用同一私有自动推进器；`submit` 始终只提交当前 prepared attempt 一次。自动额度只统计同 `client_request_id + input_receipt` 的有效 attempt 链，已创建的 ready attempt 已占额度，总上限为 `1 + retry_count`。每个新 attempt 先原子写 receipt 再 POST；配置降低只停止新增，提高后可从最新完整 provider failure 继续。`h3_submit_rejected/h3_result_missing`、输入与下载安全拒绝不创建新 attempt；查询、超时和下载传输失败继续同 task；`submission_unknown` 永不重复 POST。
 
-短链供应商顺序固定：把 1–9 张冻结帧以 data URL 和冻结源提示词一起 `POST /api/v1/comfyui/comfyui_workflow/minimax_h3_lightx2v_v5_15s` → GET 结果 → 安全下载并原子写会话级 `generated.mp4`。新长链每段同样使用 `minimax_h3_lightx2v_v5_15s`，传该段冻结的 1–9 张 `ref_image_N`；历史 `minimax_h3_lightx2v_v5` 多图回执和 `minimax_h3_lightx2v` 首尾帧回执均保持原工作流恢复，不迁移付费提交。
+current v5 每段把 exact 9 张冻结 Picture 与后端编译的 Ref2VA prompt 提交同一 H3 workflow；`reference_audios=()`，Context receipt 是同字节 local identity。历史 1–9 图、多模态 source-audio 或首尾帧 receipt 只按原 workflow GET 恢复，不迁移付费提交。
 
-默认长链同一 `chain_id` 严格串行，最多并发两条 chain；每段请求只使用本段冻结参考图。快速长链先预构造并 prepare 全部分段，随后最多 8 个短生命周期 worker fan-out POST，再最多 8 个 worker GET 轮询；队列可以超过 8，但不会创建无界长生命周期线程。单段确定失败只重做该段，已成功下游独立复用；任一子任务 `submission_unknown` 锁住整批且该段不再 POST，快速模式仍让已知兄弟 task 完成 GET。全部成功后 ffmpeg 移除 H3 子片段音轨、归一为 24fps H.264/yuv420p 并按顺序拼接；`continue` 边界去除后一段首个解码帧。`auto` 复用 source 音轨，以视频 presentation start 归零并由解码器处理 AAC/Opus priming，再按解码后的音频时间戳补前置静音或裁视频零点前音频，最后在画面终点裁剪或补静音，画面时长不变；`none` 为静音。拼接失败以同一父请求仅重跑本地拼接。
+默认同一 `chain_id` 严格串行，快速模式先预构造并 prepare 全部分段，再有界 fan-out POST/GET。成功兄弟独立复用，`submission_unknown` 段不再 POST。全部成功后按统一 EDL 归一 24fps H.264/yuv420p：有音轨段使用 H3 原生音频，无音轨段补有限静音；源音频、source reference 与 conditioning audio 从不回挂或 overlay。拼接失败只重做本地 EDL。
 
-短链 reference 输出仍要求目标时长 ±0.5 秒。长链分段无论 reference 或历史 boundary，在 attempt receipt、输入和输出 hash 完整匹配后，都按供应商整秒请求验收：不得比源片段目标短超过一帧，也不得比整秒请求长超过 1 秒。该容差不改变最终时长契约，stitch 仍按每个 source segment 的 24fps 帧预算精确裁剪或补齐并验证全片。
+current 每个 segment 在 attempt/input/output receipt 完整匹配后按供应商整秒请求验收，并由 EDL 按 source segment 的 24fps 帧预算精确裁补；历史 short/boundary 输出只按其冻结容差读取。
 
 输出下载门禁：只接受无 userinfo 的 HTTPS；hostname/IP 预解析必须全为公网地址，私网、loopback、local、reserved、multicast 均确定拒绝。owned httpx client 使用 `trust_env=false`；响应后在读取 status/body 前通过 `extensions.network_stream.get_extra_info("server_addr")` 验证实际 socket peer 也是公网地址。实际 peer 为私网仍是 `download_url_rejected`；DNS 临时失败为 `download_dns_failed`，缺失/异常/非 IP peer 为 `download_peer_unverified`，后二者同 id 恢复。
 
@@ -438,15 +455,13 @@ detail 的 `plan_receipt` 是整个文件的 SHA-256，而不是 receipt 内字�
 - `app.main.create_app(settings) -> FastAPI` — 应用工厂；启动时扫描可恢复 generation。
 - `app.storage.new_conversation(...) -> dict` — 创建 schema v2 meta 和 `work/`。
 - `app.pipeline.run(settings,cid,runner) -> None` — 输入准备；失败只写 meta，不向调用者抛。
-- `app.prepared_input.prepare_dialogue(...) -> tuple[dict,...]` — 规范化 auto/edit/custom/none 来源。
-- `app.prepared_input.write_prepared_input(...) -> PreparedInput` — 原子写 receipt 并复用 loader 验证。
-- `app.prepared_input.load_prepared_input(...) -> PreparedInput` — 读取冻结 bytes，漂移即拒绝。
+- `app.prepared_input.*` — 历史 short receipt 只读接口，不参与 current v4 create。
 - `app.frame_fit.fit_frames(paths,output_dir,mode,aspect_ratio) -> tuple[Path,...]` — 调用方必须显式传 `16:9|9:16` 目标；crop/pad 都严格输出该比例，没有隐藏的固定 9:16 默认值。
 - `app.h3.prepare/submit/start/inspect/resume/retry` — 可恢复状态机；prepare/submit 为快速 fan-out 分离 unpaid receipt 与单次 POST；resume 默认 GET-only，唯一新 POST 例外是严格验证且有额度的 provider terminal failure；runtime 对 resume_required 暴露同 id 继续，对其他确定 failed 暴露新 id retry，不对 submission_unknown 暴露操作。
 - `app.long_video.plan_segments/write_plan_receipt` — 安全边界规划与 canonical plan 落盘。
 - `app.long_generation.freeze_plan/run` — fail-closed 冻结、默认最多两链编排、可选快速 fan-out 和分段恢复。
 - `app.stitch.stitch_video` — 本地确定性归一化、音轨选择、拼接与 receipt。
-- `app.image_optimization.freeze_prompts/replace/public_prompts` — 冻结每段共享提示词并执行 SHA CAS，只公开安全投影。
+- `app.image_optimization.compile_semantic_plan/compile_frame_prompts` — current v4 后端结构补齐与确定性 Seedream compiler；diagnostics 只供日志/测试迭代。
 - `app.seedream.edit` — 一输出图片编辑、精确尺寸 PNG、持久 attempt 与结果未知门控。
 - `app.postprocess.start/run_task/retry_segment/generation_keyframes/recover_running` — 三阶段分段编排、定向重试、启动恢复与 H3 完整性门控。
 
