@@ -255,6 +255,7 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     frozen_single_segment=False, forbid_legacy_short=False,
     complete_generation=False, dialogue_mode="auto",
     silent_segment_indices=(), context_semantic_recovery=False,
+    web_output_validation=False,
 ):
     settings = make_settings(
         tmp_path,
@@ -804,6 +805,38 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
                 f"/api/conversations/{cid}/submit", headers=AUTH, json=payload
             )
             assert final_submit.status_code == 202, final_submit.json()
+        if web_output_validation:
+            assert complete_generation is True
+            detail = client.get(
+                f"/api/conversations/{cid}", headers=AUTH
+            )
+            assert detail.status_code == 200
+            assert detail.json()["has_video"] is True
+            generated = client.get(
+                f"/api/conversations/{cid}/files/generated.mp4", headers=AUTH
+            )
+            assert generated.status_code == 200
+            assert generated.content == b"provider-generated-stitch"
+
+            storage.update_meta(
+                settings.data_dir, cid, dialogue_delivery="on_screen"
+            )
+            wrong_delivery = client.get(
+                f"/api/conversations/{cid}", headers=AUTH
+            )
+            assert wrong_delivery.json()["has_video"] is False
+            storage.update_meta(
+                settings.data_dir, cid, dialogue_delivery="off_screen"
+            )
+
+            fusion_output = cdir / "work" / "h3_prompt_plan.json"
+            fusion_output_data = fusion_output.read_bytes()
+            fusion_output.write_bytes(fusion_output_data + b" ")
+            tampered = client.get(
+                f"/api/conversations/{cid}", headers=AUTH
+            )
+            assert tampered.json()["has_video"] is False
+            fusion_output.write_bytes(fusion_output_data)
 
     assert final_submit.status_code == 202, final_submit.json()
     assert fusion_calls == [cdir]
@@ -848,13 +881,16 @@ def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         assert stitch_calls[0]["audio_mode"] == (
             "provider_generated" if native_indices else "mute"
         )
-        assert len(reuse_calls) == 1
-        assert reuse_calls[0][1] == dialogue_mode
+        validation_passes = 1 + int(web_output_validation)
+        assert len(reuse_calls) == validation_passes
+        assert all(call[1] == dialogue_mode for call in reuse_calls)
         if not native_indices:
-            assert reuse_calls[0][3] is None
+            assert all(call[3] is None for call in reuse_calls)
         else:
-            assert set(reuse_calls[0][3]) == native_indices
-        assert len(timeline_calls) == len(native_indices)
+            assert all(
+                set(call[3]) == native_indices for call in reuse_calls
+            )
+        assert len(timeline_calls) == len(native_indices) * validation_passes
         completed = storage.load_meta(settings.data_dir, cid)
         assert completed["generation"]["status"] == "succeeded"
         for state in completed["generation"]["segments"]:
@@ -919,6 +955,18 @@ def test_n2_off_screen_fusion_completes_context_h3_and_native_stitch(
 ):
     _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
         tmp_path, monkeypatch, 2, complete_generation=True,
+    )
+
+
+def test_off_screen_native_output_is_visible_and_delivery_bound(
+    tmp_path, monkeypatch,
+):
+    _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
+        tmp_path,
+        monkeypatch,
+        1,
+        complete_generation=True,
+        web_output_validation=True,
     )
 
 

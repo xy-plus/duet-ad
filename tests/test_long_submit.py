@@ -2825,6 +2825,50 @@ def test_resume_same_child_does_not_increment_segment_attempt(tmp_path, monkeypa
     assert storage.load_meta(settings.data_dir, cid)["generation"]["segments"][0]["attempt"] == 1
 
 
+@pytest.mark.parametrize(
+    ("persisted_delivery", "expected_delivery"),
+    [("off_screen", "off_screen"), (None, "auto")],
+)
+def test_long_startup_freeze_uses_persisted_dialogue_delivery(
+    tmp_path, monkeypatch, persisted_delivery, expected_delivery,
+):
+    settings = make_settings(tmp_path)
+    cid, receipt = _make_long(settings)
+    root = settings.data_dir / cid
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(root, meta, receipt, "none", "auto")
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1
+    )
+    generation["status"] = "resume_required"
+    generation["segments"][0]["status"] = "resume_required"
+    changes = {
+        "fit_mode": "none",
+        "dialogue_mode": "auto",
+        "frozen_plan_receipt": receipt,
+        "generation": generation,
+    }
+    if persisted_delivery is not None:
+        changes["dialogue_delivery"] = persisted_delivery
+    storage.update_meta(settings.data_dir, cid, **changes)
+    observed = []
+
+    def freeze(*_args, **kwargs):
+        observed.append(kwargs.get("dialogue_delivery"))
+        return plan
+
+    monkeypatch.setattr(long_generation, "freeze_plan", freeze)
+    monkeypatch.setattr(
+        long_generation,
+        "run",
+        lambda *_args, **kwargs: observed.append(kwargs.get("startup")),
+    )
+
+    _resume_long_generation(settings, cid)
+
+    assert observed == [expected_delivery, True]
+
+
 def test_boundary_reuse_validation_receives_original_segment_target(
     tmp_path, monkeypatch,
 ):
