@@ -36,20 +36,33 @@ def test_input_contract_has_only_the_four_content_classes():
     for required in (
         "`work/multimodal_input.json`",
         'schema: "duet.video-prompt-fusion-input"',
-        "version: 1",
+        "version: 2",
         "segments: NonEmptyArray<SegmentInput>",
         "index: Int1",
         "new_keyframes: NineOrdered<KeyframeReceipt>",
         "old_video_prompt: FrozenText",
         "image_optimization_prompt: NineOrdered<FrozenFramePrompt>",
         "audio_content: FrozenAudioContent",
-        "KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256 }",
+        'KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256; source_time_s: Number; source_scene_id: NonEmpty; transition: { type: "start" | "same_camera" | "camera_motion" | "hard_cut"; at_s: Number | null } }',
         "FrozenText = { text: NonEmpty; sha256: Sha256 }",
         "FrozenFramePrompt = { order: Int1; text: NonEmpty; sha256: Sha256 }",
-        "FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice_references: Array<VoiceReference> }",
+        'FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice_references: Array<VoiceReference>; music_policy: "forbid" }',
         "AudioLine = { order: Int1; text: NonEmpty; start_s: Number; end_s: Number; delivery: NonEmpty; voice_ref: Int1 | null }",
         'VoiceReference = { voice_ref: Int1; path: NonEmpty; sha256: Sha256; purpose: "voice" }',
         "除结构字段 `schema/version/segments/index` 外，段内恰好只有上述四类输入",
+        '`music_policy` 必须是 exact 字符串 `"forbid"`',
+    ):
+        assert required in text
+
+
+def test_v1_is_read_only_and_v2_is_the_only_create_contract():
+    text = _skill()
+
+    for required in (
+        "`version=1` 仅允许历史只读",
+        "不得用 v1 创建或覆盖输出",
+        "`version=2` 是唯一可创建合同",
+        "不得迁移、补写或猜测 `music_policy`",
     ):
         assert required in text
 
@@ -62,6 +75,15 @@ def test_hash_order_and_segment_scope_are_closed_world():
         "每段恰好 9 张",
         "每条图片优化提示词与同 `order` 新关键帧一一对应",
         "不得选帧、删帧、补帧或重排",
+        "按 `(segment index, keyframe order)` 全局严格递增",
+        "只有项目第一张",
+        '`type="start"` 且 `at_s=source_time_s`',
+        "其余关键帧禁止 `start`",
+        '`same_camera` 和 `camera_motion` 的 `at_s` 必须为 `null`',
+        '`hard_cut` 的 `at_s` 必须是有限非负数',
+        "前一张 `source_time_s < at_s <=` 当前张 `source_time_s`",
+        "source scene 改变时必须是 `hard_cut`",
+        "硬切后的当前关键帧是新 anchor",
         "图片原始 bytes 的 SHA-256",
         "UTF-8 `text` bytes 的 SHA-256",
         "UTF-8 `audio_content.lines_json` exact bytes 的 SHA-256",
@@ -78,10 +100,11 @@ def test_visual_authorities_are_explicit_and_non_overlapping():
 
     for required in (
         "新人物、新场景、新对象、服装、材质和空间结构只以新关键帧为准",
-        "动作、镜头、构图、节奏和 segment 时间轴只以旧视频提示词为准",
+        "动作、镜头、构图、相对节奏和非硬切时间关系只以旧视频提示词为准",
+        "源硬切类型和绝对时点只以 `new_keyframes[].transition` 为准",
         "图片优化提示词只解释替换目标和保持约束",
         "删除旧视频提示词中与新关键帧冲突的旧人物、旧场景、旧对象、旧服装、旧材质和旧空间结构",
-        "不得从静态关键帧反推或改写动作、镜头、构图、节奏或时间轴",
+        "不得从静态关键帧反推或改写动作、镜头、构图、相对节奏或非硬切时间关系",
         "不得引入四类输入均未支持的新事实",
         "内容冲突不构成拒绝",
         "技术有效的四类输入必须为每个 segment 产出一个最终提示词",
@@ -95,7 +118,7 @@ def test_old_static_content_requires_positive_new_evidence_and_mapping():
     text = _skill()
 
     for required in (
-        "`old_video_prompt` 只允许贡献动作、镜头、构图、节奏和时间轴",
+        "`old_video_prompt` 只允许贡献动作、镜头、构图、相对节奏和非硬切时间关系",
         "即使旧静态与新关键帧不显式冲突",
         "新关键帧中独立可见",
         "同 `order` 的图片优化提示词明确映射",
@@ -116,16 +139,56 @@ def test_audio_is_copied_exactly_inside_the_final_prompt():
         "</AUDIO_CONTENT_JSON>",
         "逐字复制 `audio_content.lines_json`",
         "音频块之外不得再复述或改写音频内容",
+        "<MUSIC_POLICY>forbid</MUSIC_POLICY>",
+        "恰好一次",
+        "只允许改写 `<VISUAL>`",
+        "两个合同块都逐 byte 保持",
     ):
         assert required in text
 
-    assert "<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>" in text
+    assert (
+        "<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>\n"
+        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+    ) in text
     assert "opening tag 的下一 byte 必须是 `lines_json` 首 byte" in text
     assert "closing tag 紧随 `lines_json` 末 byte" in text
     assert (
         "<AUDIO_CONTENT_JSON>\naudio_content.lines_json\n</AUDIO_CONTENT_JSON>"
         not in text
     )
+
+
+def test_keyframe_timeline_is_canonical_and_context_immutable():
+    text = _skill()
+
+    for required in (
+        "<KEYFRAME_TIMELINE_JSON>{keyframe_timeline_json}</KEYFRAME_TIMELINE_JSON>",
+        "逐项投影 `order/source_time_s/source_scene_id/transition`",
+        "字段顺序固定为",
+        "UTF-8 compact JSON",
+        "不得加入 `path`、`sha256` 或其他字段",
+        "timeline 块逐 byte 保持",
+    ):
+        assert required in text
+
+    assert (
+        "</VISUAL>\n"
+        "<KEYFRAME_TIMELINE_JSON>{keyframe_timeline_json}</KEYFRAME_TIMELINE_JSON>\n"
+        "<AUDIO_CONTENT_JSON>{lines_json}</AUDIO_CONTENT_JSON>\n"
+        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+    ) in text
+
+
+def test_clean_reference_proof_stays_out_of_the_skill_schema():
+    text = _skill()
+
+    assert "clean reference 的资格证明只由后端 frozen receipt 负责" in text
+    for forbidden_field in (
+        "clean_reference_proof:",
+        "clean_voice_proof:",
+        "reference_receipt:",
+    ):
+        assert forbidden_field not in text
 
 
 def test_output_is_one_ordered_final_prompt_per_input_segment():
@@ -137,6 +200,7 @@ def test_output_is_one_ordered_final_prompt_per_input_segment():
         "`N=1` 与 `N>1` 使用同一合同",
         "`work/h3_prompt_plan.json`",
         'schema: "duet.video-prompt-fusion-output"',
+        "version: 2",
         "input_sha256: Sha256",
         "segments: NonEmptyArray<{ index: Int1; final_prompt: NonEmpty }>",
         "输入描述符 exact bytes 的 SHA-256",
