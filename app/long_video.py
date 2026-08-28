@@ -555,7 +555,11 @@ def freeze_keyframe_sources(
         else:
             previous_time_s = float(prior["source_time_s"])
             previous_scene_id = prior["source_scene_id"]
-            if source_time_s <= previous_time_s or transition_type == "start":
+            # The scene sampler may deliberately repeat the nearest decoded
+            # source frame when a valid segment contains fewer than nine
+            # distinct frames.  Equal PTS within the same continuous scene is
+            # therefore a canonical receipt, not a reason to stop A -> B.
+            if source_time_s < previous_time_s or transition_type == "start":
                 raise LongVideoError("long_video_plan_invalid_keyframe_sources")
             if transition_type == "hard_cut":
                 if (

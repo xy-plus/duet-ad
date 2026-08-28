@@ -579,6 +579,28 @@ def test_visual_timeline_rejects_backend_invented_camera_facts(invented_type):
         )
 
 
+def test_visual_timeline_accepts_deterministic_repeated_pts_fill():
+    timeline = []
+    for order in range(1, 10):
+        timeline.append({
+            "order": order,
+            "source_time_s": 0.0,
+            "source_scene_id": "SCENE_01",
+            "transition": (
+                {"type": "start", "at_s": 0.0}
+                if order == 1 else
+                {"type": "continuous", "at_s": None}
+            ),
+        })
+
+    frozen, previous = long_video_module.freeze_keyframe_sources(
+        timeline, expected_count=9,
+    )
+
+    assert [item["source_time_s"] for item in frozen] == [0.0] * 9
+    assert previous == frozen[-1]
+
+
 @pytest.mark.parametrize("duration", [30.0])
 def test_exact_planner_receipts_bind_source_anchors_not_codex_keyframes(tmp_path, duration):
     source = tmp_path / "source.mp4"
