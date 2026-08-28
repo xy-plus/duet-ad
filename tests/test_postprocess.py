@@ -221,6 +221,113 @@ def _completed_v4_project(
     return cid, cdir, frames
 
 
+def test_normalized_n1_detail_projects_root_media_and_all_frame_prompts(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid, cdir, originals = _completed_v4_project(
+        settings, monkeypatch, frame_count=9,
+    )
+    (cdir / "source.mp4").write_bytes(b"source-video")
+    (cdir / "work" / "visual_prompt.txt").write_text(
+        "冻结的旧视频提示词", encoding="utf-8"
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        duration_s=14.5,
+        voice_line_provenance=[],
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+    acceptance = postprocess.image_acceptance_status(settings, cid, meta)
+    postprocess.accept_images(settings, cid, {
+        "confirm": True,
+        "expected_meta_sha256": acceptance["expected_meta_sha256"],
+    })
+    normalized = long_generation.normalize_single_segment_project(
+        settings,
+        cid,
+        storage.load_meta(settings.data_dir, cid),
+    )
+    assert normalized["segments"][0]["keyframe_paths"] == [
+        f"keyframes/{path.name}" for path in originals
+    ]
+
+    private_frames = normalized["_image_optimization"]["frames"]
+    assert {item["segment_index"] for item in private_frames} == {0}
+    with TestClient(create_app(settings)) as client:
+        detail_response = client.get(
+            f"/api/conversations/{cid}", headers=AUTH
+        )
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert client.get(
+            f"/api/conversations/{cid}/files/keyframes/01.png"
+        ).status_code == 401
+        assert client.get(
+            f"/api/conversations/{cid}/files/keyframes/01.png", headers=AUTH
+        ).content == PNG
+        assert client.get(
+            f"/api/conversations/{cid}/files/postprocessed/01.png", headers=AUTH
+        ).content == PNG
+        assert client.get(
+            f"/api/conversations/{cid}/files/keyframes/..%2Fmeta.json", headers=AUTH
+        ).status_code == 404
+
+    assert detail["segment_count"] == 1
+    segment = detail["segments"][0]
+    assert segment["index"] == 1
+    assert segment["keyframe_paths"] == [
+        f"keyframes/{path.name}" for path in originals
+    ]
+    assert detail["postprocess"]["frames"] == [
+        path.name for path in originals
+    ]
+    projected = segment["image_optimization_prompts"]
+    assert len(projected) == 9
+    assert projected == [{
+        "frame_name": item["frame_name"],
+        "text": item["current"],
+        "default_text": item["default"],
+        "sha256": item["sha256"],
+    } for item in private_frames]
+    assert "_image_optimization" not in json.dumps(detail)
+
+
+def test_n2_frame_prompt_projection_is_exact_and_fails_closed_on_index_drift(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid, _cdir, _originals = _completed_v4_project(
+        settings,
+        monkeypatch,
+        frame_count=9,
+        segments=True,
+        segment_total=2,
+    )
+    with TestClient(create_app(settings)) as client:
+        detail = client.get(
+            f"/api/conversations/{cid}", headers=AUTH
+        ).json()
+        assert [
+            len(segment["image_optimization_prompts"])
+            for segment in detail["segments"]
+        ] == [9, 9]
+
+        current = storage.load_meta(settings.data_dir, cid)
+        storage.update_meta(
+            settings.data_dir, cid, segments=current["segments"][:1]
+        )
+        drifted = client.get(
+            f"/api/conversations/{cid}", headers=AUTH
+        ).json()
+
+    assert all(
+        "image_optimization_prompts" not in segment
+        for segment in drifted["segments"]
+    )
+
+
 def test_v4_manual_acceptance_receipt_enables_h3_without_image_verification(
     tmp_path, monkeypatch,
 ):
