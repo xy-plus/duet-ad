@@ -336,21 +336,19 @@ def test_fast_mode_prepares_all_segments_then_submits_before_any_poll(
     assert stored["fast_mode"] is True
 
 
-def test_long_reference_request_uses_complete_postprocessed_segment_set(
-    tmp_path,
+def test_receiptless_legacy_postprocess_keeps_operation_and_never_starts_h3(
+    tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, receipt = _make_long(settings, joins=("hard_cut", "continue"))
     root = settings.data_dir / cid
     frame_refs = []
-    optimized = []
     for index in (1, 2):
         output = (
             root / "work" / "segments" / str(index) / "work"
             / "postprocessed" / "01.png"
         )
         _png(output, 220 + index)
-        optimized.append(output.read_bytes())
         frame_refs.append(f"segments/{index}/work/postprocessed/01.png")
     meta = storage.update_meta(
         settings.data_dir,
@@ -363,18 +361,41 @@ def test_long_reference_request_uses_complete_postprocessed_segment_set(
         },
     )
 
-    plan = long_generation.freeze_plan(root, meta, receipt, "none", "auto")
-    requests = [
-        long_generation._request(
-            settings, cid, plan, segment, "parent-request-123", "none"
+    before = storage.load_meta(settings.data_dir, cid)
+    assert before == meta
+    assert all(key not in before for key in (
+        "_postprocess_receipt",
+        "_image_optimization",
+        "_prompt_fusion",
+    ))
+    assert before.get("generation") is None
+    provider_calls = []
+    monkeypatch.setattr(
+        long_generation,
+        "run",
+        lambda *_args, **_kwargs: provider_calls.append("coordinator"),
+    )
+    for method in ("prepare", "submit", "resume", "retry"):
+        monkeypatch.setattr(
+            h3,
+            method,
+            lambda *_args, _method=method, **_kwargs: provider_calls.append(
+                _method
+            ),
         )
-        for segment in plan.segments
-    ]
 
-    assert plan.workflow == h3.H3_WORKFLOW
-    assert [request.mode for request in requests] == ["reference", "reference"]
-    assert [request.keyframes[0][1] for request in requests] == optimized
-    assert all(request.first_frame is None and request.last_frame is None for request in requests)
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="postprocess_artifacts_invalid",
+    ):
+        long_generation.freeze_plan(root, meta, receipt, "none", "auto")
+
+    after = storage.load_meta(settings.data_dir, cid)
+    assert after == before
+    assert after["id"] == cid
+    assert after["postprocess"]["status"] == "done"
+    assert after.get("generation") is None
+    assert provider_calls == []
 
 
 def test_existing_unmarked_boundary_attempt_keeps_boundary_recovery(tmp_path):
