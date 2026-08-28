@@ -100,11 +100,15 @@ def test_visual_authorities_are_explicit_and_non_overlapping():
 
     for required in (
         "新人物、新场景、新对象、服装、材质和空间结构只以新关键帧为准",
-        "动作、镜头、构图、相对节奏和非硬切时间关系只以旧视频提示词为准",
+        "锚点取景、裁切、构图、景别、机位和静态镜头属性只以新关键帧为准",
+        "人物、项链、背景、景别、裁切和静态机位等静态事实由新关键帧独占权威",
+        "旧视频提示词只允许在同一 `hard_cut` 区间内贡献动作顺序、因果关系、camera movement type 和相对节奏",
+        "不得贡献构图、取景、裁切、景别、机位或任何静态镜头属性",
+        "泛化的“镜头”或“摄影”措辞不构成权限",
         "源硬切类型和绝对时点只以 `new_keyframes[].transition` 为准",
         "图片优化提示词只解释替换目标和保持约束",
         "删除旧视频提示词中与新关键帧冲突的旧人物、旧场景、旧对象、旧服装、旧材质和旧空间结构",
-        "不得从静态关键帧反推或改写动作、镜头、构图、相对节奏或非硬切时间关系",
+        "不得从静态关键帧反推或改写动作顺序、因果关系、camera movement type 或相对节奏",
         "不得引入四类输入均未支持的新事实",
         "内容冲突不构成拒绝",
         "技术有效的四类输入必须为每个 segment 产出一个最终提示词",
@@ -118,7 +122,7 @@ def test_old_static_content_requires_positive_new_evidence_and_mapping():
     text = _skill()
 
     for required in (
-        "`old_video_prompt` 只允许贡献动作、镜头、构图、相对节奏和非硬切时间关系",
+        "`old_video_prompt` 的闭世界白名单只有同一 hard-cut 区间内的动作顺序、因果关系、camera movement type 和相对节奏",
         "即使旧静态与新关键帧不显式冲突",
         "新关键帧中独立可见",
         "同 `order` 的图片优化提示词明确映射",
@@ -127,6 +131,34 @@ def test_old_static_content_requires_positive_new_evidence_and_mapping():
         "静态描述只能取自新关键帧",
     ):
         assert required in text
+
+    for forbidden_authority in (
+        "`old_video_prompt` 只允许贡献动作、镜头、构图",
+        "动作、镜头、构图、相对节奏和非硬切时间关系只以旧视频提示词为准",
+        "继续保留其他动作、镜头、构图、节奏和时间关系",
+    ):
+        assert forbidden_authority not in text
+
+
+def test_old_dynamic_is_confined_to_each_hard_cut_interval():
+    text = _skill()
+
+    for required in (
+        "不得跨越 `hard_cut` 传播动作、因果或 camera movement",
+        "每个 hard-cut 区间独立融合",
+        "只保留起止证据均落在同一 hard-cut 区间内的旧动态",
+        "跨越硬切的连续 zoom、push、pan、tracking 或 morph",
+        "必须整体删除",
+        "不得截断、拆分或重分配到切点任一侧",
+        "含多个 hard-cut 区间且缺少可定位边界的旧动态也删除",
+        "无法唯一归属一个 hard-cut 区间",
+        "不得把切前主体、构图或运动状态延续到切后",
+        "`hard_cut.at_s` 不得改写为其他关键帧的 `source_time_s`",
+        "硬切记录及切后当前 anchor",
+    ):
+        assert required in text
+
+    assert "必须在切点终止，不得在切后自动续写" not in text
 
 
 def test_audio_is_copied_exactly_inside_the_final_prompt():
