@@ -46,6 +46,8 @@ MAX_SOURCE_PROMPT_CHARS = 7_000
 MAX_UPSTREAM_ARTIFACT_BYTES = 16 * 1024 * 1024
 _SPEECH_PREFIX = "DUET_SPEECH_V1"
 _DIALOGUE_TOKEN = re.compile(r"<d>\[[^\]\r\n]+\][\s\S]*?</d>")
+_TIMELINE_OPEN = "<KEYFRAME_TIMELINE_JSON>"
+_TIMELINE_CLOSE = "</KEYFRAME_TIMELINE_JSON>"
 _DIALOGUE_PARTS = re.compile(r"^<d>\[([^\]\r\n]+)\]([^\r\n<>]+)</d>$")
 _MARKER_PARTS = re.compile(
     r"^DUET_SPEECH_V1 order=([1-9]\d*) mode=(on_screen|off_screen) "
@@ -134,6 +136,7 @@ class FrozenContextIrRequest:
     semantic_contract_sha256: str
     speech_markers: tuple[str, ...]
     dialogue_tokens: tuple[str, ...]
+    keyframe_timeline_json: str | None
     references: tuple[FrozenContextIrReference, ...] = field(repr=False)
     references_sha256: str
     voice_texts_sha256: str
@@ -216,6 +219,102 @@ def _canonical_json(value: Any) -> str:
 
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _keyframe_timeline_contract(prompt: str) -> str | None:
+    """Extract one canonical timeline block; absence preserves v1 recovery."""
+    opening_count = prompt.count(_TIMELINE_OPEN)
+    closing_count = prompt.count(_TIMELINE_CLOSE)
+    if opening_count == closing_count == 0:
+        return None
+    if opening_count != 1 or closing_count != 1:
+        raise ContextIrContractError("context_ir_semantic_mismatch")
+    start = prompt.find(_TIMELINE_OPEN) + len(_TIMELINE_OPEN)
+    end = prompt.find(_TIMELINE_CLOSE, start)
+    if end < start:
+        raise ContextIrContractError("context_ir_semantic_mismatch")
+    raw_json = prompt[start:end]
+    try:
+        value = json.loads(raw_json)
+    except json.JSONDecodeError:
+        raise ContextIrContractError("context_ir_semantic_mismatch") from None
+    if not isinstance(value, list) or not value:
+        raise ContextIrContractError("context_ir_semantic_mismatch")
+    frozen: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
+    for order, item in enumerate(value, 1):
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {
+                "order", "source_time_s", "source_scene_id", "transition",
+            }
+            or item.get("order") != order
+            or isinstance(item.get("source_time_s"), bool)
+            or not isinstance(item.get("source_time_s"), (int, float))
+            or not math.isfinite(float(item["source_time_s"]))
+            or float(item["source_time_s"]) < 0
+            or not isinstance(item.get("source_scene_id"), str)
+            or not item["source_scene_id"].strip()
+            or not isinstance(item.get("transition"), Mapping)
+            or set(item["transition"]) != {"type", "at_s"}
+        ):
+            raise ContextIrContractError("context_ir_semantic_mismatch")
+        source_time_s = float(item["source_time_s"])
+        transition_type = item["transition"].get("type")
+        at_s = item["transition"].get("at_s")
+        if transition_type not in {
+            "start", "same_camera", "camera_motion", "hard_cut",
+        }:
+            raise ContextIrContractError("context_ir_semantic_mismatch")
+        if previous is None:
+            if transition_type == "start":
+                if at_s != source_time_s:
+                    raise ContextIrContractError("context_ir_semantic_mismatch")
+            elif transition_type == "hard_cut":
+                if (
+                    isinstance(at_s, bool)
+                    or not isinstance(at_s, (int, float))
+                    or not math.isfinite(float(at_s))
+                    or float(at_s) > source_time_s
+                ):
+                    raise ContextIrContractError("context_ir_semantic_mismatch")
+            elif at_s is not None:
+                raise ContextIrContractError("context_ir_semantic_mismatch")
+        else:
+            previous_time_s = float(previous["source_time_s"])
+            if source_time_s <= previous_time_s or transition_type == "start":
+                raise ContextIrContractError("context_ir_semantic_mismatch")
+            if transition_type == "hard_cut":
+                if (
+                    isinstance(at_s, bool)
+                    or not isinstance(at_s, (int, float))
+                    or not math.isfinite(float(at_s))
+                    or not previous_time_s < float(at_s) <= source_time_s
+                    or item["source_scene_id"] == previous["source_scene_id"]
+                ):
+                    raise ContextIrContractError("context_ir_semantic_mismatch")
+            elif (
+                at_s is not None
+                or item["source_scene_id"] != previous["source_scene_id"]
+            ):
+                raise ContextIrContractError("context_ir_semantic_mismatch")
+        normalized = {
+            "order": order,
+            "source_time_s": source_time_s,
+            "source_scene_id": item["source_scene_id"],
+            "transition": {"type": transition_type, "at_s": at_s},
+        }
+        frozen.append(normalized)
+        previous = normalized
+    canonical = json.dumps(
+        frozen,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if raw_json != canonical:
+        raise ContextIrContractError("context_ir_semantic_mismatch")
+    return canonical
 
 
 def _is_sha256(value: object) -> bool:
@@ -582,6 +681,9 @@ def freeze_context_ir_request(
     speech_markers, dialogue_tokens = _speech_contract(
         source_h3_request.prompt, source_h3_request.voice_texts
     )
+    keyframe_timeline_json = _keyframe_timeline_contract(
+        source_h3_request.prompt
+    )
 
     references: list[FrozenContextIrReference] = []
     for order, (path, data) in enumerate(source_h3_request.keyframes, 1):
@@ -617,12 +719,13 @@ def freeze_context_ir_request(
             references_sha256=references_sha256,
         )
     )
-    semantic_contract_sha256 = _canonical_sha256(
-        {
-            "speech_markers": list(speech_markers),
-            "dialogue_tokens": list(dialogue_tokens),
-        }
-    )
+    semantic_contract = {
+        "speech_markers": list(speech_markers),
+        "dialogue_tokens": list(dialogue_tokens),
+    }
+    if keyframe_timeline_json is not None:
+        semantic_contract["keyframe_timeline_json"] = keyframe_timeline_json
+    semantic_contract_sha256 = _canonical_sha256(semantic_contract)
     input_manifest = _source_input_manifest(
         cid=source_h3_request.cid,
         source_h3_client_request_id=source_h3_request.client_request_id,
@@ -655,6 +758,7 @@ def freeze_context_ir_request(
         semantic_contract_sha256=semantic_contract_sha256,
         speech_markers=speech_markers,
         dialogue_tokens=dialogue_tokens,
+        keyframe_timeline_json=keyframe_timeline_json,
         references=frozen_references,
         references_sha256=references_sha256,
         voice_texts_sha256=source_h3_request.voice_receipt,
@@ -1348,6 +1452,19 @@ def _complete(
         try:
             _speech_contract(effective_prompt, ())
         except ContextIrContractError:
+            _mark_terminal(
+                path,
+                state,
+                status="failed",
+                error="context_ir_semantic_mismatch",
+            )
+            return
+    if request.keyframe_timeline_json is not None:
+        try:
+            effective_timeline = _keyframe_timeline_contract(effective_prompt)
+        except ContextIrContractError:
+            effective_timeline = None
+        if effective_timeline != request.keyframe_timeline_json:
             _mark_terminal(
                 path,
                 state,

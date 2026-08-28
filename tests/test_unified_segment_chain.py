@@ -111,6 +111,299 @@ def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> No
     assert old_prompt not in frozen.final_prompts
 
 
+def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
+    tmp_path: Path,
+) -> None:
+    frames = []
+    timeline = []
+    source_times = [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0]
+    for order, source_time_s in enumerate(source_times, 1):
+        data = f"frame-{order}".encode()
+        path = tmp_path / f"{order:02d}.png"
+        path.write_bytes(data)
+        transition = (
+            {"type": "start", "at_s": 0.0}
+            if order == 1 else
+            {"type": "hard_cut", "at_s": 2.267}
+            if order == 4 else
+            {"type": "same_camera", "at_s": None}
+        )
+        source = {
+            "order": order,
+            "source_time_s": source_time_s,
+            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "transition": transition,
+        }
+        timeline.append(source)
+        frames.append({
+            "order": order,
+            "path": path.name,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            **{key: source[key] for key in (
+                "source_time_s", "source_scene_id", "transition",
+            )},
+        })
+    old_prompt = "source action order"
+    input_payload = {
+        "schema": long_generation.PROMPT_FUSION_INPUT_SCHEMA,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "segments": [{
+            "index": 1,
+            "new_keyframes": frames,
+            "old_video_prompt": {
+                "text": old_prompt,
+                "sha256": hashlib.sha256(old_prompt.encode()).hexdigest(),
+            },
+            "image_optimization_prompt": [{
+                "order": order,
+                "text": "replace person and scene",
+                "sha256": hashlib.sha256(
+                    b"replace person and scene"
+                ).hexdigest(),
+            } for order in range(1, 10)],
+            "audio_content": {
+                "lines_json": "[]",
+                "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
+                "voice_references": [],
+                "music_policy": "forbid",
+            },
+        }],
+    }
+    input_data = _canonical(input_payload)
+    timeline_json = json.dumps(
+        timeline,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    final_prompt = (
+        "<VISUAL>\n"
+        "hard cut at the frozen source boundary\n"
+        "</VISUAL>\n"
+        f"<KEYFRAME_TIMELINE_JSON>{timeline_json}"
+        "</KEYFRAME_TIMELINE_JSON>\n"
+        "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
+        "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+    )
+    input_path = tmp_path / "multimodal_input.json"
+    output_path = tmp_path / "h3_prompt_plan.json"
+    input_path.write_bytes(input_data)
+    output_path.write_bytes(_canonical({
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{"index": 1, "final_prompt": final_prompt}],
+    }))
+
+    frozen = long_generation.load_prompt_fusion(
+        input_path=input_path,
+        output_path=output_path,
+        root=tmp_path,
+    )
+
+    assert frozen.final_prompts == (final_prompt,)
+    assert frozen.segments[0]["new_keyframes"][3]["transition"] == {
+        "type": "hard_cut", "at_s": 2.267,
+    }
+
+    output_path.write_bytes(_canonical({
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{
+            "index": 1,
+            "final_prompt": final_prompt.replace("<VISUAL>\n", "<VISUAL>", 1),
+        }],
+    }))
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_output_invalid",
+    ):
+        long_generation.load_prompt_fusion(
+            input_path=input_path,
+            output_path=output_path,
+            root=tmp_path,
+        )
+
+
+def test_prompt_fusion_v2_rejects_output_hard_cut_time_drift(tmp_path: Path) -> None:
+    frames = []
+    timeline = []
+    for order in range(1, 10):
+        data = f"frame-{order}".encode()
+        path = tmp_path / f"{order:02d}.png"
+        path.write_bytes(data)
+        transition = (
+            {"type": "start", "at_s": 0.0}
+            if order == 1 else
+            {"type": "hard_cut", "at_s": 2.267}
+            if order == 4 else
+            {"type": "same_camera", "at_s": None}
+        )
+        source = {
+            "order": order,
+            "source_time_s": (
+                0.0 if order == 1 else float(order - 1)
+                if order < 4 else float(order)
+            ),
+            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "transition": transition,
+        }
+        timeline.append(source)
+        frames.append({
+            "order": order,
+            "path": path.name,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "source_time_s": source["source_time_s"],
+            "source_scene_id": source["source_scene_id"],
+            "transition": transition,
+        })
+    input_payload = {
+        "schema": long_generation.PROMPT_FUSION_INPUT_SCHEMA,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "segments": [{
+            "index": 1,
+            "new_keyframes": frames,
+            "old_video_prompt": {
+                "text": "old",
+                "sha256": hashlib.sha256(b"old").hexdigest(),
+            },
+            "image_optimization_prompt": [{
+                "order": order,
+                "text": "replace",
+                "sha256": hashlib.sha256(b"replace").hexdigest(),
+            } for order in range(1, 10)],
+            "audio_content": {
+                "lines_json": "[]",
+                "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
+                "voice_references": [],
+                "music_policy": "forbid",
+            },
+        }],
+    }
+    input_data = _canonical(input_payload)
+    drifted = json.loads(json.dumps(timeline))
+    drifted[3]["transition"]["at_s"] = 3.5
+    drifted_json = json.dumps(
+        drifted, separators=(",", ":"),
+    )
+    input_path = tmp_path / "multimodal_input.json"
+    output_path = tmp_path / "h3_prompt_plan.json"
+    input_path.write_bytes(input_data)
+    output_path.write_bytes(_canonical({
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{
+            "index": 1,
+            "final_prompt": (
+                "<VISUAL>\n"
+                "drifted hard cut\n"
+                "</VISUAL>\n"
+                f"<KEYFRAME_TIMELINE_JSON>{drifted_json}"
+                "</KEYFRAME_TIMELINE_JSON>\n"
+                "<AUDIO_CONTENT_JSON>[]</AUDIO_CONTENT_JSON>\n"
+                "<MUSIC_POLICY>forbid</MUSIC_POLICY>"
+            ),
+        }],
+    }))
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_output_invalid",
+    ):
+        long_generation.load_prompt_fusion(
+            input_path=input_path,
+            output_path=output_path,
+            root=tmp_path,
+        )
+
+
+def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
+    tmp_path: Path,
+) -> None:
+    workdir = tmp_path / "work" / "segments" / "1"
+    keyframe_dir = workdir / "work" / "keyframes"
+    keyframe_dir.mkdir(parents=True)
+    keyframes = []
+    sources = []
+    optimization_frames = []
+    for order, source_time_s in enumerate(
+        [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0], 1
+    ):
+        path = keyframe_dir / f"{order:02d}.png"
+        data = f"frame-{order}".encode()
+        path.write_bytes(data)
+        keyframes.append((path, data))
+        sources.append({
+            "order": order,
+            "source_time_s": source_time_s,
+            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "transition": (
+                {"type": "start", "at_s": 0.0}
+                if order == 1 else
+                {"type": "hard_cut", "at_s": 2.267}
+                if order == 4 else
+                {"type": "same_camera", "at_s": None}
+            ),
+        })
+        current = f"optimized frame {order}"
+        optimization_frames.append({
+            "segment_index": 1,
+            "frame_index": order,
+            "current": current,
+            "sha256": hashlib.sha256(current.encode()).hexdigest(),
+        })
+    anchor = keyframe_dir / "01.png"
+    segment = long_generation.FrozenSegment(
+        index=1,
+        start_s=0.0,
+        end_s=14.5,
+        chain_id="chain-001",
+        join_mode="hard_cut",
+        workdir=workdir,
+        first_frame=anchor,
+        first_frame_data=keyframes[0][1],
+        last_frame=keyframe_dir / "09.png",
+        last_frame_data=keyframes[-1][1],
+        prompt="final",
+        keyframes=tuple(keyframes),
+        keyframe_sources=tuple(sources),
+        dialogue=(),
+        dialogue_sha256=hashlib.sha256(b"[]\n").hexdigest(),
+    )
+    plan = long_generation.FrozenPlan(
+        root=tmp_path,
+        source=tmp_path / "source.mp4",
+        receipt="a" * 64,
+        segments=(segment,),
+        receipt_version=long_video.VISUAL_PLAN_RECEIPT_VERSION,
+    )
+    meta = {
+        "segments": [{"index": 1, "visual_prompt": "source actions"}],
+        "_image_optimization": {"frames": optimization_frames},
+    }
+
+    payload = json.loads(long_generation.build_prompt_fusion_input(
+        root=tmp_path,
+        meta=meta,
+        plan=plan,
+        dialogue_mode="none",
+        dialogue_delivery="auto",
+    ))
+
+    assert payload["version"] == long_generation.VISUAL_PROMPT_FUSION_VERSION
+    assert payload["segments"][0]["new_keyframes"][3] == {
+        "order": 4,
+        "path": "work/segments/1/work/keyframes/04.png",
+        "sha256": hashlib.sha256(b"frame-4").hexdigest(),
+        "source_time_s": 2.5,
+        "source_scene_id": "SCENE_02",
+        "transition": {"type": "hard_cut", "at_s": 2.267},
+    }
+    assert payload["segments"][0]["audio_content"]["music_policy"] == "forbid"
+
+
 _CID_9533_LINES_JSON = (
     '[{"order":1,"text":"تول جمالا بها القادم وقتك يا لدى عوصة اللوري تاب '
     'البدري يبريزها بجمال يا شعوري","start_s":0.0,"end_s":14.44,'

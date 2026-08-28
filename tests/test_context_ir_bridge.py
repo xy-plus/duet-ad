@@ -193,6 +193,51 @@ def _no_audio_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest
     )
 
 
+def _timeline_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
+    base = _no_audio_frozen(tmp_path)
+    timeline = [
+        {
+            "order": 1,
+            "source_time_s": 0.0,
+            "source_scene_id": "SCENE_01",
+            "transition": {"type": "start", "at_s": 0.0},
+        },
+        {
+            "order": 2,
+            "source_time_s": 2.5,
+            "source_scene_id": "SCENE_02",
+            "transition": {"type": "hard_cut", "at_s": 2.267},
+        },
+    ]
+    timeline_json = json.dumps(
+        timeline,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    prompt = (
+        base.source_h3_request.prompt
+        + "\n<KEYFRAME_TIMELINE_JSON>"
+        + timeline_json
+        + "</KEYFRAME_TIMELINE_JSON>"
+    )
+    source = replace(
+        base.source_h3_request,
+        prompt=prompt,
+        skill_plan_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+    )
+    return context_ir_bridge.freeze_context_ir_request(
+        source_h3_request=source,
+        upstream_dialogue_sha256=base.upstream_dialogue_sha256,
+        upstream_artifact_path=base.upstream_artifact_path,
+        upstream_artifact_sha256=base.upstream_artifact_sha256,
+        upstream_dialogue_sha256_path=base.upstream_dialogue_sha256_path,
+        source_prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        minimax_api_key="minimax-secret",
+        timeouts=base.timeouts,
+    )
+
+
 def _reference_audio_frozen(
     tmp_path: Path,
     *,
@@ -798,6 +843,32 @@ def test_dialogue_none_rejects_any_context_ir_speech(tmp_path):
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
     assert result.status == "failed"
     assert result.error_code == "context_ir_semantic_mismatch"
+    assert not (frozen.workdir / ".h3").exists()
+
+
+def test_context_ir_preserves_frozen_keyframe_timeline(tmp_path):
+    frozen = _timeline_frozen(tmp_path)
+    effective = "rewritten visual prose\n" + frozen.source_prompt.split("\n", 1)[1]
+    with _client(
+        _success_handler(frozen, effective_prompt=effective)
+    ) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "succeeded"
+    assert result.effective_prompt == effective
+
+
+def test_context_ir_rejects_hard_cut_time_drift_before_h3(tmp_path):
+    frozen = _timeline_frozen(tmp_path)
+    effective = frozen.source_prompt.replace('"at_s":2.267', '"at_s":3.5')
+    with _client(
+        _success_handler(frozen, effective_prompt=effective)
+    ) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "failed"
+    assert result.error_code == "context_ir_semantic_mismatch"
+    assert result.receipt_path is None
     assert not (frozen.workdir / ".h3").exists()
 
 

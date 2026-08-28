@@ -204,6 +204,169 @@ def _make_conversation(settings, video_1s):
     return storage.update_meta(settings.data_dir, meta["id"], voice_mode="none")
 
 
+def test_source_scene_cut_is_frozen_on_the_first_post_cut_keyframe(tmp_path):
+    work = tmp_path / "work"
+    segwork = work / "segments" / "1" / "work"
+    raw_dir = segwork / "frames"
+    selected_dir = segwork / "keyframes"
+    raw_dir.mkdir(parents=True)
+    selected_dir.mkdir()
+    source_times = [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0]
+    manifest_frames = []
+    names = []
+    for order, source_time_s in enumerate(source_times, 1):
+        data = f"source-frame-{order}".encode()
+        raw_name = f"frames/{order:03d}.png"
+        (segwork / raw_name).write_bytes(data)
+        selected_name = f"{order:02d}.png"
+        (selected_dir / selected_name).write_bytes(data)
+        manifest_frames.append({
+            "index": order,
+            "time_seconds": source_time_s,
+            "file": raw_name,
+        })
+        names.append(selected_name)
+    (segwork / "manifest.json").write_text(
+        json.dumps({"duration_seconds": 14.5, "frames": manifest_frames}),
+        encoding="utf-8",
+    )
+    segments = [{
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 14.5,
+        "chain_id": "chain-001",
+        "join_mode": "hard_cut",
+    }]
+    metas = [{**segments[0], "keyframes": names}]
+
+    bound = pipeline._bind_keyframe_source_timeline(
+        work,
+        segments,
+        metas,
+        [
+            {"index": 1, "start_s": 0.0, "end_s": 2.267},
+            {"index": 2, "start_s": 2.267, "end_s": 14.5},
+        ],
+    )
+
+    timeline = bound[0]["keyframe_sources"]
+    assert [item["source_time_s"] for item in timeline] == source_times
+    assert [item["source_scene_id"] for item in timeline] == [
+        "SCENE_01", "SCENE_01", "SCENE_01",
+        "SCENE_02", "SCENE_02", "SCENE_02",
+        "SCENE_02", "SCENE_02", "SCENE_02",
+    ]
+    assert timeline[0]["transition"] == {"type": "start", "at_s": 0.0}
+    assert timeline[3]["transition"] == {
+        "type": "hard_cut", "at_s": 2.267,
+    }
+    assert all(
+        item["transition"] == {"type": "same_camera", "at_s": None}
+        for item in timeline[1:3] + timeline[4:]
+    )
+
+
+def test_two_generation_segments_without_source_cut_keep_one_camera_timeline(
+    tmp_path,
+):
+    work = tmp_path / "work"
+    local_times = [0.0, 1.75, 3.5, 5.25, 7.0, 8.75, 10.5, 12.25, 14.0]
+    segments = []
+    metas = []
+    for segment_index, start_s in enumerate((0.0, 14.5), 1):
+        segwork = work / "segments" / str(segment_index) / "work"
+        raw_dir = segwork / "frames"
+        selected_dir = segwork / "keyframes"
+        raw_dir.mkdir(parents=True)
+        selected_dir.mkdir()
+        manifest_frames = []
+        names = []
+        for order, local_time in enumerate(local_times, 1):
+            data = f"segment-{segment_index}-frame-{order}".encode()
+            raw_name = f"frames/{order:03d}.png"
+            (segwork / raw_name).write_bytes(data)
+            selected_name = f"{order:02d}.png"
+            (selected_dir / selected_name).write_bytes(data)
+            manifest_frames.append({
+                "index": order,
+                "time_seconds": local_time,
+                "file": raw_name,
+            })
+            names.append(selected_name)
+        (segwork / "manifest.json").write_text(
+            json.dumps({
+                "duration_seconds": 14.5,
+                "frames": manifest_frames,
+            }),
+            encoding="utf-8",
+        )
+        segment = {
+            "index": segment_index,
+            "start_s": start_s,
+            "end_s": start_s + 14.5,
+            "chain_id": "chain-001",
+            "join_mode": "hard_cut" if segment_index == 1 else "continue",
+        }
+        segments.append(segment)
+        metas.append({**segment, "keyframes": names})
+
+    bound = pipeline._bind_keyframe_source_timeline(
+        work,
+        segments,
+        metas,
+        [{"index": 1, "start_s": 0.0, "end_s": 29.0}],
+    )
+
+    assert bound[0]["keyframe_sources"][0]["transition"] == {
+        "type": "start", "at_s": 0.0,
+    }
+    assert all(
+        source["source_scene_id"] == "SCENE_01"
+        and source["transition"] == {"type": "same_camera", "at_s": None}
+        for source in (
+            bound[0]["keyframe_sources"][1:]
+            + bound[1]["keyframe_sources"]
+        )
+    )
+    assert bound[1]["keyframe_sources"][0]["source_time_s"] == 14.5
+
+
+def test_source_timeline_drives_existing_v4_transition_skeleton(tmp_path):
+    frames = []
+    sources = []
+    for order in range(1, 6):
+        path = tmp_path / f"{order:02d}.png"
+        path.write_bytes(f"frame-{order}".encode())
+        frames.append(path)
+        sources.append({
+            "order": order,
+            "source_time_s": float(order - 1),
+            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "transition": (
+                {"type": "start", "at_s": 0.0}
+                if order == 1 else
+                {"type": "hard_cut", "at_s": 2.267}
+                if order == 4 else
+                {"type": "same_camera", "at_s": None}
+            ),
+        })
+
+    inventory = pipeline._frame_inventory(
+        {1: frames},
+        segment_lineage={
+            1: {"chain_id": "chain-001", "join_mode": "hard_cut"},
+        },
+        keyframe_sources={1: sources},
+    )
+
+    assert [item["source_transition_from_previous"] for item in inventory] == [
+        "start", "same_camera", "same_camera", "hard_cut", "same_camera",
+    ]
+    assert len({
+        item["source_transition_evidence_sha256"] for item in inventory
+    }) == len(inventory)
+
+
 def test_segmented_image_prompts_come_from_one_project_call(
     tmp_path, monkeypatch,
 ):
@@ -667,6 +830,11 @@ def test_run_converges_container_duration_to_visual_manifest_timeline(
             return {**seg, "keyframes": [], "prompt": "p", "dialogue": lines or []}
 
     monkeypatch.setattr(pipeline, "_process_segment", fake_process_segment)
+    monkeypatch.setattr(
+        pipeline,
+        "_bind_keyframe_source_timeline",
+        lambda _work, _segments, metas, _scenes: metas,
+    )
     monkeypatch.setattr(long_video, "write_plan_receipt", fake_write)
     expected_settings = settings
 
@@ -2550,6 +2718,11 @@ def test_long_v3_freezes_every_segment_source_frame_before_postprocess(
         "_generate_image_optimization_project",
         lambda *_args, **_kwargs: (plan, prompts),
     )
+    monkeypatch.setattr(
+        pipeline,
+        "_bind_keyframe_source_timeline",
+        lambda _work, _segments, metas, _scenes: metas,
+    )
 
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
 
@@ -3743,4 +3916,3 @@ def test_run_voice_empty_lines_without_spoken_passes(tmp_path, video_1s, monkeyp
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "done", stored.get("error")
     assert stored["voice_lines"] == []
-

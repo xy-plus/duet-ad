@@ -241,6 +241,10 @@ def _recover_long_plan(cdir: Path, meta: dict, settings: Settings) -> dict:
             "keyframe_paths": [
                 Path(path).relative_to("work").as_posix() for path in key_paths
             ],
+            **(
+                {"keyframe_sources": raw["keyframe_sources"]}
+                if "keyframe_sources" in raw else {}
+            ),
             "first_frame_path": Path(first_path).relative_to("work").as_posix(),
             "last_frame_path": Path(last_path).relative_to("work").as_posix(),
             "visual_prompt": visual,
@@ -542,6 +546,7 @@ def _frame_inventory(
     frame_paths: dict[int, list[Path]],
     *,
     segment_lineage: dict[int, dict] | None = None,
+    keyframe_sources: dict[int, list[dict]] | None = None,
 ) -> list[dict]:
     inventory = []
     previous: dict | None = None
@@ -555,12 +560,17 @@ def _frame_inventory(
         ):
             raise PipelineError("image optimization frame inventory is invalid")
         lineage = None if segment_lineage is None else segment_lineage.get(segment_index)
+        sources = None if keyframe_sources is None else keyframe_sources.get(segment_index)
         if segment_lineage is not None and (
             not isinstance(lineage, dict)
             or set(lineage) != {"chain_id", "join_mode"}
             or not isinstance(lineage["chain_id"], str)
             or not lineage["chain_id"]
             or lineage["join_mode"] not in {"hard_cut", "continue"}
+        ):
+            raise PipelineError("image optimization frame inventory is invalid")
+        if keyframe_sources is not None and (
+            not isinstance(sources, list) or len(sources) != len(paths)
         ):
             raise PipelineError("image optimization frame inventory is invalid")
         for frame_index, path in enumerate(paths, 1):
@@ -577,20 +587,39 @@ def _frame_inventory(
                 "source_sha256": source_sha256,
             }
             if lineage is not None:
-                transition = (
-                    "start"
-                    if previous is None
-                    else (
-                        "hard_cut"
-                        if frame_index == 1 and lineage["join_mode"] == "hard_cut"
-                        # Chain lineage proves continuity but contains no measured
-                        # camera transform.  It can therefore establish only the
-                        # conservative same-camera relation; motion needs a
-                        # versioned, source-bound measurement before it may be
-                        # frozen as evidence.
-                        else "same_camera"
+                source = None if sources is None else sources[frame_index - 1]
+                if source is not None:
+                    if (
+                        not isinstance(source, dict)
+                        or source.get("order") != frame_index
+                        or not isinstance(source.get("source_time_s"), (int, float))
+                        or not isinstance(source.get("source_scene_id"), str)
+                        or not source["source_scene_id"]
+                        or not isinstance(source.get("transition"), dict)
+                        or set(source["transition"]) != {"type", "at_s"}
+                        or source["transition"].get("type") not in {
+                            "start", "same_camera", "camera_motion", "hard_cut",
+                        }
+                    ):
+                        raise PipelineError(
+                            "image optimization frame inventory is invalid"
+                        )
+                    transition = source["transition"]["type"]
+                else:
+                    transition = (
+                        "start"
+                        if previous is None
+                        else (
+                            "hard_cut"
+                            if frame_index == 1 and lineage["join_mode"] == "hard_cut"
+                            # Chain lineage proves continuity but contains no measured
+                            # camera transform.  It can therefore establish only the
+                            # conservative same-camera relation; motion needs a
+                            # versioned, source-bound measurement before it may be
+                            # frozen as evidence.
+                            else "same_camera"
+                        )
                     )
-                )
                 evidence = {
                     "chain_id": lineage["chain_id"],
                     "join_mode": lineage["join_mode"],
@@ -602,6 +631,8 @@ def _frame_inventory(
                     },
                     "transition": transition,
                 }
+                if source is not None:
+                    evidence["source"] = source
                 item.update(
                     source_transition_from_previous=transition,
                     source_transition_evidence_sha256=hashlib.sha256(
@@ -615,6 +646,8 @@ def _frame_inventory(
             inventory.append(item)
     if segment_lineage is not None and set(segment_lineage) != set(frame_paths):
         raise PipelineError("image optimization frame inventory is invalid")
+    if keyframe_sources is not None and set(keyframe_sources) != set(frame_paths):
+        raise PipelineError("image optimization frame inventory is invalid")
     return inventory
 
 
@@ -627,6 +660,7 @@ def _freeze_image_optimization(
     *,
     require_dual_target: bool,
     segment_lineage: dict[int, dict] | None = None,
+    keyframe_sources: dict[int, list[dict]] | None = None,
 ) -> tuple[dict, dict]:
     """Freeze either the legacy segment prompt or V3 source-frame prompts."""
     try:
@@ -634,6 +668,7 @@ def _freeze_image_optimization(
             inventory = _frame_inventory(
                 frame_paths,
                 segment_lineage=segment_lineage if continuity.get("version") == 4 else None,
+                keyframe_sources=keyframe_sources if continuity.get("version") == 4 else None,
             )
             frame_counts = {
                 index: len(paths) for index, paths in frame_paths.items()
@@ -738,6 +773,8 @@ def _generate_segmented_image_prompts(
     session_dir: Path,
 ) -> tuple[dict, dict]:
     frame_paths = {}
+    keyframe_sources = {}
+    has_keyframe_source_declaration = False
     for segment, meta in zip(segments, seg_metas):
         directory = work / "segments" / str(segment["index"]) / "work" / "keyframes"
         names = meta.get("keyframes") if isinstance(meta, dict) else None
@@ -747,6 +784,18 @@ def _generate_segmented_image_prompts(
             else sorted(path for path in directory.glob("*.png") if path.is_file())
         )
         frame_paths[segment["index"]] = paths
+        sources = meta.get("keyframe_sources") if isinstance(meta, dict) else None
+        has_keyframe_source_declaration = (
+            has_keyframe_source_declaration
+            or isinstance(meta, dict) and "keyframe_sources" in meta
+        )
+        if isinstance(sources, list):
+            keyframe_sources[segment["index"]] = sources
+    if (
+        has_keyframe_source_declaration
+        and set(keyframe_sources) != set(frame_paths)
+    ):
+        raise PipelineError("keyframe source timeline is invalid")
     transitions_by_segment = {}
     if all(frame_paths.values()):
         transition_inventory = _frame_inventory(
@@ -757,6 +806,9 @@ def _generate_segmented_image_prompts(
                 }
                 for segment in segments
             },
+            keyframe_sources=(
+                keyframe_sources if has_keyframe_source_declaration else None
+            ),
         )
         transitions_by_segment = {
             index: [item for item in transition_inventory if item["segment_index"] == index]
@@ -1230,6 +1282,204 @@ def _scene_bounds_for_long_plan(work: Path, duration_s: float) -> list[dict]:
     if abs(bounds[-1]["end_s"] - duration_s) <= tolerance:
         bounds[-1]["end_s"] = duration_s
     return bounds
+
+
+def _source_scenes_for_timeline(work: Path, duration_s: float) -> list[dict]:
+    """Return the detector-owned scene ids and exact normalized boundaries."""
+    bounds = _scene_bounds_for_long_plan(work, duration_s)
+    try:
+        raw = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = None
+    raw_scenes = raw.get("scenes") if isinstance(raw, dict) else None
+    result: list[dict] = []
+    for position, bound in enumerate(bounds, 1):
+        source = (
+            raw_scenes[position - 1]
+            if isinstance(raw_scenes, list)
+            and len(raw_scenes) == len(bounds)
+            and isinstance(raw_scenes[position - 1], dict)
+            else None
+        )
+        source_index = (
+            source.get("index", position) if source is not None else position
+        )
+        if source_index != position:
+            raise PipelineError("source scene timeline is invalid")
+        frames = source.get("frames") if source is not None else None
+        if frames is not None and (
+            not isinstance(frames, list)
+            or not all(isinstance(name, str) and name for name in frames)
+        ):
+            raise PipelineError("source scene timeline is invalid")
+        result.append({
+            "index": position,
+            "start_s": bound["start_s"],
+            "end_s": bound["end_s"],
+            "has_source_frames": frames is None or bool(frames),
+        })
+    return result
+
+
+def _bind_keyframe_source_timeline(
+    work: Path,
+    segments: list[dict],
+    segment_metas: list[dict],
+    source_scenes: list[dict],
+) -> list[dict]:
+    """Bind selected frame bytes to source time, scene and exact hard cuts.
+
+    The video-maker contract copies selected frames byte-for-byte.  Hash
+    ambiguity is therefore a contract failure, never a reason to guess a time.
+    """
+    if (
+        not segments
+        or len(segments) != len(segment_metas)
+        or not source_scenes
+    ):
+        raise PipelineError("keyframe source timeline is invalid")
+    scenes: list[dict] = []
+    previous_end: float | None = None
+    for position, raw in enumerate(source_scenes, 1):
+        try:
+            index = raw["index"]
+            start_s = float(raw["start_s"])
+            end_s = float(raw["end_s"])
+            has_source_frames = raw.get("has_source_frames", True)
+        except (KeyError, TypeError, ValueError):
+            raise PipelineError("keyframe source timeline is invalid") from None
+        if (
+            index != position
+            or not math.isfinite(start_s)
+            or not math.isfinite(end_s)
+            or start_s >= end_s
+            or isinstance(has_source_frames, bool) is False
+            or (previous_end is not None and abs(start_s - previous_end) > _FLOAT_COMPARISON_EPS_S)
+        ):
+            raise PipelineError("keyframe source timeline is invalid")
+        scenes.append({
+            "index": index,
+            "id": f"SCENE_{index:02d}",
+            "start_s": round(start_s, long_video.BOUNDARY_PRECISION),
+            "end_s": round(end_s, long_video.BOUNDARY_PRECISION),
+            "has_source_frames": has_source_frames,
+        })
+        previous_end = end_s
+
+    def source_scene(time_s: float) -> dict:
+        for scene in scenes:
+            if scene["start_s"] <= time_s < scene["end_s"]:
+                return scene
+        if abs(time_s - scenes[-1]["end_s"]) <= _FLOAT_COMPARISON_EPS_S:
+            return scenes[-1]
+        raise PipelineError("keyframe source timeline is invalid")
+
+    resolved: list[tuple[int, int, float, dict]] = []
+    updated: list[dict] = []
+    for expected_index, (segment, meta) in enumerate(
+        zip(segments, segment_metas), 1
+    ):
+        if (
+            not isinstance(segment, dict)
+            or not isinstance(meta, dict)
+            or segment.get("index") != expected_index
+            or meta.get("index") != expected_index
+        ):
+            raise PipelineError("keyframe source timeline is invalid")
+        names = meta.get("keyframes")
+        if (
+            not isinstance(names, list)
+            or len(names) != 9
+            or names != [f"{order:02d}.png" for order in range(1, 10)]
+        ):
+            raise PipelineError("keyframe source timeline is invalid")
+        segwork = work / "segments" / str(expected_index) / "work"
+        try:
+            manifest = json.loads(
+                (segwork / "manifest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise PipelineError("keyframe source timeline is invalid") from None
+        manifest_frames = manifest.get("frames") if isinstance(manifest, dict) else None
+        if not isinstance(manifest_frames, list) or not manifest_frames:
+            raise PipelineError("keyframe source timeline is invalid")
+        candidates: dict[str, list[float]] = {}
+        segroot = segwork.resolve()
+        for raw_frame in manifest_frames:
+            try:
+                relative = raw_frame["file"]
+                local_time = float(raw_frame["time_seconds"])
+            except (KeyError, TypeError, ValueError):
+                raise PipelineError("keyframe source timeline is invalid") from None
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or not math.isfinite(local_time)
+                or local_time < 0
+            ):
+                raise PipelineError("keyframe source timeline is invalid")
+            candidate = (segwork / relative).resolve()
+            try:
+                candidate.relative_to(segroot)
+                data = candidate.read_bytes()
+            except (OSError, ValueError):
+                raise PipelineError("keyframe source timeline is invalid") from None
+            if not data:
+                raise PipelineError("keyframe source timeline is invalid")
+            digest = hashlib.sha256(data).hexdigest()
+            candidates.setdefault(digest, []).append(local_time)
+        start_s = float(segment["start_s"])
+        for order, name in enumerate(names, 1):
+            try:
+                selected_data = (segwork / "keyframes" / name).read_bytes()
+            except OSError:
+                raise PipelineError("keyframe source timeline is invalid") from None
+            matches = candidates.get(hashlib.sha256(selected_data).hexdigest(), [])
+            if len(matches) != 1:
+                raise PipelineError("keyframe source timeline is ambiguous")
+            source_time_s = round(
+                start_s + matches[0], long_video.BOUNDARY_PRECISION
+            )
+            scene = source_scene(source_time_s)
+            resolved.append((expected_index, order, source_time_s, scene))
+        updated.append(dict(meta))
+
+    previous: tuple[int, int, float, dict] | None = None
+    per_segment: dict[int, list[dict]] = {item["index"]: [] for item in segments}
+    for segment_index, order, source_time_s, scene in resolved:
+        if previous is None:
+            transition = {"type": "start", "at_s": source_time_s}
+        else:
+            previous_time = previous[2]
+            if source_time_s <= previous_time:
+                raise PipelineError("keyframe source timeline is invalid")
+            crossed = [
+                candidate for candidate in scenes[1:]
+                if candidate["has_source_frames"]
+                and previous_time < candidate["start_s"] <= source_time_s
+            ]
+            if len(crossed) > 1:
+                raise PipelineError("keyframe source timeline misses scene anchor")
+            if crossed:
+                if crossed[0]["id"] != scene["id"]:
+                    raise PipelineError("keyframe source timeline misses scene anchor")
+                transition = {
+                    "type": "hard_cut", "at_s": crossed[0]["start_s"],
+                }
+            else:
+                if previous[3]["id"] != scene["id"]:
+                    raise PipelineError("keyframe source timeline is invalid")
+                transition = {"type": "same_camera", "at_s": None}
+        per_segment[segment_index].append({
+            "order": order,
+            "source_time_s": source_time_s,
+            "source_scene_id": scene["id"],
+            "transition": transition,
+        })
+        previous = (segment_index, order, source_time_s, scene)
+    for item in updated:
+        item["keyframe_sources"] = per_segment[item["index"]]
+    return updated
 
 
 def _probe_duration(path: Path) -> float:
@@ -2169,10 +2419,12 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             translate_lang = (meta.get("target_language") or "").strip()
         segments = _detect_segments(settings, cid, source, work)
         duration_s = float(meta["duration_s"]) if new_input_contract else None
+        source_scenes: list[dict] | None = None
         if new_input_contract:
+            source_scenes = _source_scenes_for_timeline(work, duration_s)
             segments = long_video.plan_segments(
                 duration_s,
-                _scene_bounds_for_long_plan(work, duration_s),
+                source_scenes,
                 voice_lines or [],
             )
         if not segments:
@@ -2298,6 +2550,11 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                         segments,
                     )
                 )
+            if new_input_contract:
+                assert source_scenes is not None
+                seg_metas = _bind_keyframe_source_timeline(
+                    work, segments, seg_metas, source_scenes,
+                )
             image_prompts: dict[int, str] | None = None
             continuity: dict | None = None
             if new_input_contract:
@@ -2416,6 +2673,14 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                         }
                         for seg in seg_metas
                     },
+                    keyframe_sources=(
+                        {
+                            seg["index"]: seg["keyframe_sources"]
+                            for seg in seg_metas
+                        }
+                        if all("keyframe_sources" in seg for seg in seg_metas)
+                        else None
+                    ),
                 )
                 changes.update(frozen_continuity)
                 changes.update(frozen_prompts)

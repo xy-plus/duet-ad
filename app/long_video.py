@@ -25,6 +25,8 @@ BOUNDARY_PRECISION = 6
 PLAN_RECEIPT_FILENAME = "long_video_plan.json"
 PLAN_RECEIPT_VERSION = 2
 MULTIMODAL_PLAN_RECEIPT_VERSION = 3
+VISUAL_PLAN_RECEIPT_VERSION = 4
+VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION = 5
 LEGACY_PLAN_RECEIPT_VERSION = 1
 
 _EPS = 1e-6
@@ -82,6 +84,8 @@ def segment_duration_s(
             LEGACY_PLAN_RECEIPT_VERSION,
             PLAN_RECEIPT_VERSION,
             MULTIMODAL_PLAN_RECEIPT_VERSION,
+            VISUAL_PLAN_RECEIPT_VERSION,
+            VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
         }
     ):
         raise LongVideoError("long_video_invalid_segment_duration")
@@ -342,6 +346,83 @@ def _artifact(root: Path, path: Path) -> dict:
     return {"path": relative, "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def freeze_keyframe_sources(
+    value: object,
+    *,
+    expected_count: int,
+    previous: Mapping | None = None,
+) -> tuple[list[dict], dict]:
+    """Validate one ordered source timeline without guessing visual facts."""
+    if not isinstance(value, list) or len(value) != expected_count:
+        raise LongVideoError("long_video_plan_invalid_keyframe_sources")
+    frozen: list[dict] = []
+    prior = dict(previous) if isinstance(previous, Mapping) else None
+    for order, raw in enumerate(value, 1):
+        if (
+            not isinstance(raw, Mapping)
+            or set(raw) != {
+                "order", "source_time_s", "source_scene_id", "transition",
+            }
+            or raw.get("order") != order
+            or isinstance(raw.get("source_time_s"), bool)
+            or not isinstance(raw.get("source_time_s"), (int, float))
+            or not math.isfinite(float(raw["source_time_s"]))
+            or float(raw["source_time_s"]) < 0
+            or not isinstance(raw.get("source_scene_id"), str)
+            or not raw["source_scene_id"].strip()
+            or not isinstance(raw.get("transition"), Mapping)
+            or set(raw["transition"]) != {"type", "at_s"}
+        ):
+            raise LongVideoError("long_video_plan_invalid_keyframe_sources")
+        source_time_s = round(
+            float(raw["source_time_s"]), BOUNDARY_PRECISION
+        )
+        transition_type = raw["transition"].get("type")
+        at_s = raw["transition"].get("at_s")
+        if transition_type not in {
+            "start", "same_camera", "camera_motion", "hard_cut",
+        }:
+            raise LongVideoError("long_video_plan_invalid_keyframe_sources")
+        if prior is None:
+            if transition_type != "start" or at_s != source_time_s:
+                raise LongVideoError("long_video_plan_invalid_keyframe_sources")
+        else:
+            previous_time_s = float(prior["source_time_s"])
+            previous_scene_id = prior["source_scene_id"]
+            if source_time_s <= previous_time_s or transition_type == "start":
+                raise LongVideoError("long_video_plan_invalid_keyframe_sources")
+            if transition_type == "hard_cut":
+                if (
+                    isinstance(at_s, bool)
+                    or not isinstance(at_s, (int, float))
+                    or not math.isfinite(float(at_s))
+                ):
+                    raise LongVideoError(
+                        "long_video_plan_invalid_keyframe_sources"
+                    )
+                at_s = round(float(at_s), BOUNDARY_PRECISION)
+                if not previous_time_s < at_s <= source_time_s:
+                    raise LongVideoError(
+                        "long_video_plan_invalid_keyframe_sources"
+                    )
+                if raw["source_scene_id"] == previous_scene_id:
+                    raise LongVideoError(
+                        "long_video_plan_invalid_keyframe_sources"
+                    )
+            elif at_s is not None or raw["source_scene_id"] != previous_scene_id:
+                raise LongVideoError("long_video_plan_invalid_keyframe_sources")
+        item = {
+            "order": order,
+            "source_time_s": source_time_s,
+            "source_scene_id": raw["source_scene_id"],
+            "transition": {"type": transition_type, "at_s": at_s},
+        }
+        frozen.append(item)
+        prior = item
+    assert prior is not None
+    return frozen, prior
+
+
 def write_plan_receipt(
     root: Path,
     *,
@@ -369,6 +450,10 @@ def write_plan_receipt(
         raise LongVideoError("long_video_multimodal_ambiguous")
     receipt_segments = []
     previous_end = 0.0
+    previous_keyframe_source: dict | None = None
+    has_keyframe_sources = ["keyframe_sources" in raw for raw in segments]
+    if any(has_keyframe_sources) and not all(has_keyframe_sources):
+        raise LongVideoError("long_video_plan_invalid_keyframe_sources")
     for expected_index, raw in enumerate(segments, start=1):
         try:
             index = int(raw["index"])
@@ -427,6 +512,13 @@ def write_plan_receipt(
                     "sha256": hashlib.sha256(_canonical_bytes(dialogue)).hexdigest(),
                 },
             }
+        if all(has_keyframe_sources):
+            keyframe_sources, previous_keyframe_source = freeze_keyframe_sources(
+                raw.get("keyframe_sources"),
+                expected_count=len(keyframe_paths),
+                previous=previous_keyframe_source,
+            )
+            receipt_segment["keyframe_sources"] = keyframe_sources
         if all(has_multimodal):
             try:
                 manifest_path = Path(raw["multimodal_manifest_path"]).resolve()
@@ -454,9 +546,17 @@ def write_plan_receipt(
     receipt = {
         "schema": "duet.long-video-plan",
         "version": (
-            MULTIMODAL_PLAN_RECEIPT_VERSION
+            (
+                VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION
+                if all(has_keyframe_sources)
+                else MULTIMODAL_PLAN_RECEIPT_VERSION
+            )
             if all(has_multimodal) or has_prompt_fusion
-            else PLAN_RECEIPT_VERSION
+            else (
+                VISUAL_PLAN_RECEIPT_VERSION
+                if all(has_keyframe_sources)
+                else PLAN_RECEIPT_VERSION
+            )
         ),
         "source": _artifact(root, source),
         "video": {"duration_s": duration},
