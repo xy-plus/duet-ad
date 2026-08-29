@@ -195,6 +195,71 @@ def _no_audio_frozen(
     )
 
 
+def _reference_fusion_frozen(
+    tmp_path: Path, *, dialogue: bool = True,
+) -> context_ir_bridge.FrozenContextIrRequest:
+    """Freeze the current nine-frame Ref2VA/reference prompt shape."""
+    base = _no_audio_frozen(tmp_path)
+    line = (
+        "From 00:01.000 to 00:02.000, the off-screen narrator says: "
+        "<d>[Undetermined]这是严格冻结的台词</d> while all visible lips "
+        "remain closed."
+        if dialogue else
+        "No person speaks in this visual interval."
+    )
+    prompt = "\n".join([
+        "subject_definitions:",
+        *[
+            f"<Picture {order}> is the storyboard anchor for ordered visual state."
+            for order in range(1, 10)
+        ],
+        "summary:",
+        "The target follows all ordered storyboard anchors.",
+        "retention_analysis:",
+        "All ordered visual anchors are retained.",
+        "detailed_description:",
+        "A restrained visual interval preserves the source composition.",
+        line,
+        "overall_soundscape:",
+        "The specified sound layer is the only audible layer.",
+        "non_diegetic_music:",
+        "N/A",
+    ])
+    keyframes = tuple(
+        (tmp_path / f"fusion-{order:02d}.png", f"fusion-frame-{order}".encode())
+        for order in range(1, 10)
+    )
+    voice_texts = ("这是严格冻结的台词",) if dialogue else ()
+    source = replace(
+        base.source_h3_request,
+        cid="fusion-reference-segment-1" if dialogue else "fusion-silent-segment-1",
+        client_request_id=(
+            "fusion-reference-request-1"
+            if dialogue else "fusion-silent-request-1"
+        ),
+        prompt=prompt,
+        keyframes=keyframes,
+        voice_texts=voice_texts,
+        voice_receipt=h3.voice_texts_receipt(voice_texts),
+        skill_plan_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+    )
+    artifact_path, artifact_sha256 = _upstream_artifact(tmp_path)
+    return context_ir_bridge.freeze_context_ir_request(
+        source_h3_request=source,
+        upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
+        upstream_artifact_path=artifact_path,
+        upstream_artifact_sha256=artifact_sha256,
+        upstream_dialogue_sha256_path=("dialogue", "sha256"),
+        source_prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        minimax_api_key="minimax-secret",
+        timeouts=context_ir_bridge.ContextIrTimeouts(
+            request_s=0.1,
+            poll_total_s=0.2,
+            poll_interval_s=0,
+        ),
+    )
+
+
 def _timeline_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
     base = _no_audio_frozen(tmp_path)
     timeline = []
@@ -265,6 +330,132 @@ def test_current_fusion_no_bgm_suffix_is_bound_and_must_survive_context(
     assert result.effective_prompt == context_ir_bridge._compile_effective_prompt(
         frozen, effective
     )
+
+
+def test_reference_ref2va_uses_context_ir_and_binds_optimized_prompt(
+    tmp_path: Path,
+) -> None:
+    frozen = _reference_fusion_frozen(tmp_path, dialogue=True)
+    before = context_ir_bridge._dialogue_policy_score(
+        frozen, frozen.source_prompt,
+    )
+    optimized = frozen.source_prompt.replace(
+        "[Undetermined]", "[Chinese]", 1,
+    )
+    observed: list[httpx.Request] = []
+    with _client(
+        _success_handler(
+            frozen, effective_prompt=optimized, requests=observed,
+        )
+    ) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "succeeded"
+    assert result.provider_task_id == "context-task-1"
+    assert sum(
+        request.method == "POST" and request.url.path == "/v1/files/upload"
+        for request in observed
+    ) == 9
+    assert sum(
+        request.method == "POST" and request.url.path == "/v2/h3_context_ir"
+        for request in observed
+    ) == 1
+    assert sum(
+        request.method == "GET"
+        and request.url.path.endswith("/context-task-1")
+        for request in observed
+    ) == 1
+    submit = next(
+        request for request in observed
+        if request.method == "POST" and request.url.path == "/v2/h3_context_ir"
+    )
+    body = json.loads(submit.content)
+    assert body["model"] == "MiniMax-H3"
+    assert body["content"][0]["text"] == context_ir_bridge._with_dialogue_policy(
+        frozen.source_prompt
+    )
+    assert "<DUET_DIALOGUE_POLICY_V1>" in body["content"][0]["text"]
+
+    assert before["overall"] < 1.0
+    assert result.receipt_path is not None
+    receipt = context_ir_bridge.load_effective_prompt_receipt(
+        frozen, result.receipt_path,
+    )
+    raw_receipt = json.loads(result.receipt_path.read_text(encoding="utf-8"))
+    assert raw_receipt["context_output_prompt"] == optimized
+    assert receipt.effective_prompt == context_ir_bridge._compile_effective_prompt(
+        frozen, optimized,
+    )
+    after = receipt.semantic_score["dialogue_policy"]
+    assert isinstance(after, dict)
+    assert after == {
+        "language_explicit": 1.0,
+        "exact_text": 1.0,
+        "stop_after_line": 1.0,
+        "no_repeat_or_improvise": 1.0,
+        "no_extra_speech": 1.0,
+        "overall": 1.0,
+    }
+    final_request = context_ir_bridge.apply_effective_prompt(
+        frozen, result.receipt_path,
+    )
+    assert "<d>[Chinese]这是严格冻结的台词</d>" in final_request.prompt
+    assert "<d>[Undetermined]这是严格冻结的台词</d>" not in final_request.prompt
+    assert final_request.prompt == receipt.effective_prompt
+    assert hashlib.sha256(final_request.prompt.encode()).hexdigest() == (
+        receipt.effective_prompt_sha256
+    )
+    assert h3._input_manifest(final_request)["prompt_sha256"] == (
+        receipt.effective_prompt_sha256
+    )
+    h3._require_context_ir_receipt(final_request)
+
+
+def test_reference_no_dialogue_prompt_explicitly_forbids_human_voice(
+    tmp_path: Path,
+) -> None:
+    frozen = _reference_fusion_frozen(tmp_path, dialogue=False)
+    before = context_ir_bridge._dialogue_policy_score(
+        frozen, frozen.source_prompt,
+    )
+    optimized = frozen.source_prompt.replace(
+        "restrained visual interval", "optimized visual interval", 1,
+    )
+    observed: list[httpx.Request] = []
+    with _client(
+        _success_handler(
+            frozen, effective_prompt=optimized, requests=observed,
+        )
+    ) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "succeeded"
+    assert sum(
+        request.method == "POST" and request.url.path == "/v2/h3_context_ir"
+        for request in observed
+    ) == 1
+    submit = next(
+        request for request in observed
+        if request.method == "POST" and request.url.path == "/v2/h3_context_ir"
+    )
+    assert "no human voice" in json.loads(submit.content)["content"][0]["text"].lower()
+    assert result.receipt_path is not None
+    receipt = context_ir_bridge.load_effective_prompt_receipt(
+        frozen, result.receipt_path,
+    )
+    after = receipt.semantic_score["dialogue_policy"]
+    assert before["overall"] < after["overall"]
+    assert isinstance(after, dict)
+    assert after["language_explicit"] == 1.0
+    assert after["exact_text"] == 1.0
+    assert after["no_extra_speech"] == 1.0
+    assert after["overall"] == 1.0
+    final_request = context_ir_bridge.apply_effective_prompt(
+        frozen, result.receipt_path,
+    )
+    assert "no human voice" in final_request.prompt.lower()
+    assert "closed lips" in final_request.prompt.lower()
+    h3._require_context_ir_receipt(final_request)
 
 
 def test_legacy_context_semantic_hash_is_unchanged_without_music_marker(
@@ -490,7 +681,12 @@ def test_success_freezes_official_request_receipt_and_builds_h3_adapter(tmp_path
     assert body == {
         "model": "MiniMax-H3",
         "content": [
-            {"type": "text", "text": frozen.source_prompt},
+            {
+                "type": "text",
+                "text": context_ir_bridge._with_dialogue_policy(
+                    frozen.source_prompt
+                ),
+            },
             {
                 "type": "image_url",
                 "image_url": {"url": "mm_file://427752006353318"},
@@ -526,7 +722,7 @@ def test_success_freezes_official_request_receipt_and_builds_h3_adapter(tmp_path
     h3._require_context_ir_receipt(final_request)
 
 
-def test_official_context_result_enters_h3_byte_for_byte_without_speech_rewrite(
+def test_official_context_result_enters_h3_with_compiled_dialogue_policy(
     tmp_path,
 ):
     frozen = _frozen(tmp_path)
@@ -551,20 +747,25 @@ def test_official_context_result_enters_h3_byte_for_byte_without_speech_rewrite(
     assert result.receipt_path is not None
     raw = json.loads(result.receipt_path.read_text(encoding="utf-8"))
     assert raw["source_prompt_sha256"] == frozen.source_prompt_sha256
-    assert raw["effective_prompt"] == provider_prompt
+    compiled_prompt = context_ir_bridge._compile_effective_prompt(
+        frozen, provider_prompt
+    )
+    assert raw["effective_prompt"] == compiled_prompt
     assert raw["effective_prompt_sha256"] == hashlib.sha256(
-        provider_prompt.encode()
+        compiled_prompt.encode()
     ).hexdigest()
     submits = [
         request for request in observed
         if request.method == "POST" and request.url.path == "/v2/h3_context_ir"
     ]
     assert len(submits) == 1
-    assert json.loads(submits[0].content)["content"][0]["text"] == frozen.source_prompt
+    assert json.loads(submits[0].content)["content"][0]["text"] == (
+        context_ir_bridge._with_dialogue_policy(frozen.source_prompt)
+    )
     final_request = context_ir_bridge.apply_effective_prompt(
         frozen, result.receipt_path
     )
-    assert final_request.prompt.encode() == provider_prompt.encode()
+    assert final_request.prompt.encode() == compiled_prompt.encode()
     assert final_request.prompt != frozen.source_prompt
 
 
@@ -602,7 +803,9 @@ def test_context_effective_prompt_is_not_blocked_or_rewritten_by_internal_syntax
     final_request = context_ir_bridge.apply_effective_prompt(
         frozen, result.receipt_path
     )
-    assert final_request.prompt.encode() == effective.encode()
+    assert final_request.prompt.encode() == context_ir_bridge._with_dialogue_policy(
+        effective
+    ).encode()
 
 
 def test_poll_transport_unknown_recovers_by_get_on_same_task_without_post(tmp_path):
@@ -978,7 +1181,9 @@ def test_context_ir_preserves_frozen_keyframe_timeline(tmp_path):
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
     assert result.status == "succeeded"
-    assert result.effective_prompt == effective
+    assert result.effective_prompt == context_ir_bridge._compile_effective_prompt(
+        frozen, effective
+    )
 
 
 def test_context_ir_scores_hard_cut_time_drift_without_blocking_h3(tmp_path):
@@ -1067,7 +1272,9 @@ def test_receipt_bound_voice_allows_context_to_split_off_screen_dialogue(tmp_pat
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
     assert result.status == "succeeded"
-    assert result.effective_prompt == effective
+    assert result.effective_prompt == context_ir_bridge._with_dialogue_policy(
+        effective
+    )
     assert result.receipt_path is not None and result.receipt_path.is_file()
 
 
@@ -1195,7 +1402,9 @@ def test_semantic_mismatch_voice_task_recovers_by_get_only_and_writes_receipt(
         recovered = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
     assert recovered.status == "succeeded"
-    assert recovered.effective_prompt == effective
+    assert recovered.effective_prompt == context_ir_bridge._with_dialogue_policy(
+        effective
+    )
     assert recovered.receipt_path is not None
     assert recovered.receipt_path.is_file()
     assert [(call.method, call.url.path) for call in resumed_calls] == [

@@ -1,9 +1,10 @@
 """Receipt-first MiniMax H3 Context IR bridge.
 
 The module has no database, queue, billing, UI, or H3 submission concerns.  It
-freezes one already-compiled multimodal H3 prompt. Current backend-compiled
-Fusion v2 prompts receive a local same-byte receipt and perform no Context HTTP;
-historical requests and receipts retain their provider recovery behavior.
+freezes one already-compiled multimodal H3 prompt, submits it to Context IR at
+most once for a stable client request id, recovers only through GET on the
+accepted task id, and exposes a receipt-revalidating adapter for the existing
+H3 request.
 
 The upstream coordinator is the trusted boundary that proves its authoritative
 dialogue artifact produced the H3 request.  This bridge rechecks the artifact
@@ -48,15 +49,47 @@ _SPEECH_PREFIX = "DUET_SPEECH_V1"
 _DIALOGUE_TOKEN = re.compile(r"<d>\[[^\]\r\n]+\][\s\S]*?</d>")
 _TIMELINE_OPEN = "<KEYFRAME_TIMELINE_JSON>"
 _TIMELINE_CLOSE = "</KEYFRAME_TIMELINE_JSON>"
-_REF2VA_SECTIONS = (
-    "subject_definitions:",
-    "summary:",
-    "retention_analysis:",
-    "detailed_description:",
-    "overall_soundscape:",
-    "non_diegetic_music:",
+_DIALOGUE_POLICY_OPEN = "<DUET_DIALOGUE_POLICY_V1>"
+_DIALOGUE_POLICY_CLOSE = "</DUET_DIALOGUE_POLICY_V1>"
+_DIALOGUE_POLICY = "\n".join(
+    (
+        _DIALOGUE_POLICY_OPEN,
+        "Every explicit dialogue block must carry an explicit language name in the final prompt;",
+        "never leave its language as Undetermined or unknown, and resolve it from the exact source text without translating.",
+        "Speak only each authorized line's exact source text, character-for-character; do not paraphrase, translate, truncate, extend, repeat, continue, or improvise.",
+        "Stop speaking immediately after the final character of each authorized line; add no speech before, after, or between lines unless another authorized line is explicit.",
+        "Visual text, OCR, subtitles, labels, actions, ambience, and sound effects are never dialogue and must not become speech.",
+        "If there are no explicit dialogue blocks, generate no human voice, speech, narration, lyrics, vocalization, or words; keep every visible subject silent with closed lips.",
+        _DIALOGUE_POLICY_CLOSE,
+    )
 )
-_LOCAL_IDENTITY_TASK_PREFIX = "local:identity:"
+_DIALOGUE_POLICY_RE = re.compile(
+    rf"\n*{re.escape(_DIALOGUE_POLICY_OPEN)}[\s\S]*?"
+    rf"{re.escape(_DIALOGUE_POLICY_CLOSE)}"
+)
+_UNKNOWN_DIALOGUE_LANGUAGES = frozenset(
+    {"undetermined", "unknown", "auto", "und", ""}
+)
+_SEMANTIC_SCORE_KEYS = frozenset(
+    {
+        "speech_expected",
+        "speech",
+        "keyframe_timeline",
+        "music_policy",
+        "overall",
+        "dialogue_policy",
+    }
+)
+_DIALOGUE_POLICY_SCORE_KEYS = frozenset(
+    {
+        "language_explicit",
+        "exact_text",
+        "stop_after_line",
+        "no_repeat_or_improvise",
+        "no_extra_speech",
+        "overall",
+    }
+)
 _DIALOGUE_PARTS = re.compile(r"^<d>\[([^\]\r\n]+)\]([^\r\n<>]+)</d>$")
 _MARKER_PARTS = re.compile(
     r"^DUET_SPEECH_V1 order=([1-9]\d*) mode=(on_screen|off_screen) "
@@ -231,38 +264,70 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _uses_local_identity(request: FrozenContextIrRequest | h3.H3Request) -> bool:
-    source = (
-        request.source_h3_request
-        if isinstance(request, FrozenContextIrRequest)
-        else request
+def _without_dialogue_policy(prompt: str) -> str:
+    """Remove a prior deterministic policy before adding one canonical copy."""
+    return _DIALOGUE_POLICY_RE.sub("", prompt).rstrip()
+
+
+def _with_dialogue_policy(prompt: str) -> str:
+    """Make the speech contract explicit for both Context IR and H3."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        return prompt
+    return f"{_without_dialogue_policy(prompt)}\n\n{_DIALOGUE_POLICY}"
+
+
+def _dialogue_policy_score(
+    request: FrozenContextIrRequest, prompt: str,
+) -> dict[str, object]:
+    """Record before/after dialogue evidence without making a quality gate."""
+    expected_texts = tuple(request.source_h3_request.voice_texts)
+    tokens = tuple(_DIALOGUE_TOKEN.finditer(prompt))
+    parsed: list[tuple[str, str]] = []
+    for token in tokens:
+        parts = _DIALOGUE_PARTS.fullmatch(token.group(0))
+        if parts is not None:
+            parsed.append((parts.group(1), parts.group(2)))
+    actual_text = "".join(text for _language, text in parsed)
+    expected_text = "".join(expected_texts)
+    language_explicit = float(
+        bool(parsed)
+        and all(
+            language.strip().lower() not in _UNKNOWN_DIALOGUE_LANGUAGES
+            for language, _text in parsed
+        )
+    ) if expected_texts else float(not tokens)
+    exact_text = float(actual_text == expected_text) if expected_texts else float(
+        not tokens
     )
-    if (
-        not isinstance(source, h3.H3Request)
-        or source.mode != "reference"
-        or source.workflow != h3.H3_WORKFLOW
-        or source.context_ir_required is not True
-        or len(source.keyframes) != 9
-        or source.reference_audios != ()
-        or source.skill_plan_sha256 != _sha256_text(source.prompt)
-    ):
-        return False
-    positions: list[int] = []
-    for section in _REF2VA_SECTIONS:
-        if source.prompt.count(section) != 1:
-            return False
-        positions.append(source.prompt.index(section))
-    pictures = {
-        int(value) for value in re.findall(r"<Picture ([1-9]\d*)>", source.prompt)
+    no_extra_speech = exact_text
+    policy_present = (
+        _DIALOGUE_POLICY_OPEN in prompt
+        and _DIALOGUE_POLICY_CLOSE in prompt
+    )
+    stop_after_line = float(
+        policy_present and "Stop speaking immediately" in prompt
+    )
+    no_repeat_or_improvise = float(
+        policy_present
+        and "repeat, continue, or improvise" in prompt
+    )
+    if not expected_texts:
+        no_extra_speech = float(not tokens)
+    values = (
+        language_explicit,
+        exact_text,
+        stop_after_line,
+        no_repeat_or_improvise,
+        no_extra_speech,
+    )
+    return {
+        "language_explicit": language_explicit,
+        "exact_text": exact_text,
+        "stop_after_line": stop_after_line,
+        "no_repeat_or_improvise": no_repeat_or_improvise,
+        "no_extra_speech": no_extra_speech,
+        "overall": sum(values) / len(values),
     }
-    return (
-        positions == sorted(positions)
-        and positions[0] == 0
-        and pictures == set(range(1, 10))
-        and "<Audio " not in source.prompt
-        and "<Video " not in source.prompt
-        and "<Subject " not in source.prompt
-    )
 
 
 def _keyframe_timeline_contract(prompt: str) -> str | None:
@@ -631,6 +696,7 @@ def _semantic_score(
         "keyframe_timeline": timeline,
         "music_policy": music_policy,
         "overall": sum(values) / len(values),
+        "dialogue_policy": _dialogue_policy_score(request, context_output_prompt),
     }
 
 
@@ -640,8 +706,8 @@ def _compile_effective_prompt(
     """Mechanically restore immutable Fusion fields around Context semantics."""
     suffix = _fusion_policy_suffix(request.source_prompt)
     if suffix is None:
-        return context_output_prompt
-    visual = context_output_prompt
+        return _with_dialogue_policy(context_output_prompt)
+    visual = _without_dialogue_policy(context_output_prompt)
     opening = "<VISUAL>"
     closing = "</VISUAL>"
     if visual.startswith(opening):
@@ -673,8 +739,8 @@ def _compile_effective_prompt(
         visual = visual.replace(marker, "")
     visual = visual.strip()
     if not visual:
-        visual = context_output_prompt.strip()
-    return f"<VISUAL>\n{visual}\n</VISUAL>\n{suffix}"
+        visual = _without_dialogue_policy(context_output_prompt.strip())
+    return f"<VISUAL>\n{visual}\n</VISUAL>\n{_DIALOGUE_POLICY}\n{suffix}"
 
 
 def _mime_type(path: Path, *, audio: bool) -> str:
@@ -875,7 +941,6 @@ def freeze_context_ir_request(
     """Bind a coordinator-verified dialogue artifact to the exact H3 request."""
     if not isinstance(source_h3_request, h3.H3Request):
         raise ContextIrContractError("source_h3_request_invalid")
-    local_identity = _uses_local_identity(source_h3_request)
     is_multimodal = h3.is_multimodal_request(source_h3_request)
     is_no_audio_reference = (
         source_h3_request.mode == "reference"
@@ -885,9 +950,7 @@ def freeze_context_ir_request(
     )
     if not is_multimodal and not is_no_audio_reference:
         raise ContextIrContractError("source_h3_request_invalid")
-    if not isinstance(minimax_api_key, str) or (
-        not local_identity and not minimax_api_key.strip()
-    ):
+    if not isinstance(minimax_api_key, str) or not minimax_api_key.strip():
         raise ContextIrContractError("context_ir_credential_missing")
     if (
         not _is_sha256(source_prompt_sha256)
@@ -906,10 +969,7 @@ def freeze_context_ir_request(
         != h3.voice_texts_receipt(source_h3_request.voice_texts)
     ):
         raise ContextIrContractError("source_speech_receipt_invalid")
-    if (
-        not local_identity
-        and len(source_h3_request.prompt) > MAX_SOURCE_PROMPT_CHARS
-    ):
+    if len(source_h3_request.prompt) > MAX_SOURCE_PROMPT_CHARS:
         raise ContextIrContractError("source_prompt_too_long")
     verified_artifact_path = _verified_upstream_artifact(
         upstream_artifact_path,
@@ -917,19 +977,16 @@ def freeze_context_ir_request(
         upstream_dialogue_sha256,
         upstream_dialogue_sha256_path,
     )
-    keyframe_timeline_json = (
-        None if local_identity
-        else _keyframe_timeline_contract(source_h3_request.prompt)
+    keyframe_timeline_json = _keyframe_timeline_contract(
+        source_h3_request.prompt
     )
-    fusion_policy_suffix = (
-        None if local_identity
-        else _fusion_policy_suffix(source_h3_request.prompt)
-    )
-    fusion_voice_texts = (
-        None if local_identity
-        else _fusion_voice_texts(source_h3_request.prompt)
-    )
-    if local_identity:
+    fusion_policy_suffix = _fusion_policy_suffix(source_h3_request.prompt)
+    fusion_voice_texts = _fusion_voice_texts(source_h3_request.prompt)
+    if (
+        fusion_voice_texts is None
+        and source_h3_request.mode == "reference"
+        and source_h3_request.workflow == h3.H3_WORKFLOW
+    ):
         speech_markers = ()
         dialogue_tokens = _ref2va_speech_contract(
             source_h3_request.prompt, source_h3_request.voice_texts
@@ -1244,7 +1301,10 @@ def _request_body_from_state(state: Mapping[str, Any], source_prompt: str) -> di
         for item in references
     ):
         return None
-    content: list[dict[str, Any]] = [{"type": "text", "text": source_prompt}]
+    content: list[dict[str, Any]] = [{
+        "type": "text",
+        "text": _with_dialogue_policy(source_prompt),
+    }]
     for item in references:
         url = f"mm_file://{item['file_id']}"
         if item["type"] == "image_url":
@@ -1271,14 +1331,6 @@ def _request_body_from_state(state: Mapping[str, Any], source_prompt: str) -> di
         "content": content,
         "duration": input_manifest["duration"],
         "ratio": input_manifest["ratio"],
-    }
-
-
-def _identity_request_body(request: FrozenContextIrRequest) -> dict[str, Any]:
-    return {
-        "mode": "local_identity",
-        "source_prompt_sha256": request.source_prompt_sha256,
-        "source_h3_request_sha256": request.source_h3_request_sha256,
     }
 
 
@@ -1331,16 +1383,7 @@ def _validate_state(
             or int(file_id) <= 0
         ):
             raise ContextIrReceiptError("context_ir_state_invalid")
-    local_identity = _uses_local_identity(request)
-    if local_identity and any(
-        item.get("file_id") is not None for item in stored_references
-    ):
-        raise ContextIrReceiptError("context_ir_state_invalid")
-    body = (
-        _identity_request_body(request)
-        if local_identity
-        else _request_body_from_state(state, request.source_prompt)
-    )
+    body = _request_body_from_state(state, request.source_prompt)
     stored_body = state.get("context_ir_request")
     stored_request_sha = state.get("context_ir_request_sha256")
     if stored_body is None:
@@ -1361,11 +1404,6 @@ def _validate_state(
     elif (
         not isinstance(task_id, str)
         or not task_id.strip()
-        or (
-            local_identity
-            and task_id
-            != _LOCAL_IDENTITY_TASK_PREFIX + request.source_prompt_sha256
-        )
         or not _is_sha256(task_sha)
         or not isinstance(stored_request_sha, str)
         or task_sha
@@ -1390,10 +1428,8 @@ def _validate_state(
         raise ContextIrReceiptError("context_ir_state_invalid")
     status = state["status"]
     all_uploaded = all(item.get("file_id") is not None for item in stored_references)
-    references_ready = all_uploaded or local_identity
+    references_ready = all_uploaded
     if (
-        (local_identity and status not in {"ready", "succeeded"})
-        or
         (
             status == "ready"
             and (
@@ -1725,11 +1761,7 @@ def _complete(
     if (
         not isinstance(effective_prompt, str)
         or not effective_prompt.strip()
-        or (
-            not _uses_local_identity(request)
-            and len(effective_prompt.encode("utf-8"))
-            > MAX_EFFECTIVE_PROMPT_BYTES
-        )
+        or len(effective_prompt.encode("utf-8")) > MAX_EFFECTIVE_PROMPT_BYTES
     ):
         _mark_terminal(
             path,
@@ -1738,8 +1770,11 @@ def _complete(
             error="context_ir_result_invalid",
         )
         return
-    semantic_score = _semantic_score(request, effective_prompt)
     compiled_prompt = _compile_effective_prompt(request, effective_prompt)
+    semantic_score = _semantic_score(request, effective_prompt)
+    semantic_score["dialogue_policy"] = _dialogue_policy_score(
+        request, compiled_prompt
+    )
     payload = _receipt_payload(
         request,
         state,
@@ -1929,35 +1964,11 @@ def _client(client: httpx.Client | None) -> Iterator[httpx.Client]:
         yield owned
 
 
-def _bind_local_identity(request: FrozenContextIrRequest) -> ContextIrResult:
-    """Write an idempotent same-byte receipt without provider interaction."""
-    with _session_lease(request):
-        state, path = _prepare(request)
-        if state["status"] == "succeeded":
-            return _result(request, state, path)
-        if state["status"] != "ready":
-            raise ContextIrReceiptError("context_ir_state_invalid")
-        body = _identity_request_body(request)
-        request_sha256 = _canonical_sha256(body)
-        task_id = _LOCAL_IDENTITY_TASK_PREFIX + request.source_prompt_sha256
-        state["context_ir_request"] = body
-        state["context_ir_request_sha256"] = request_sha256
-        state["provider_task_id"] = task_id
-        state["context_ir_task_sha256"] = _canonical_sha256({
-            "context_ir_request_sha256": request_sha256,
-            "provider_task_id": task_id,
-        })
-        _complete(request, state, path, request.source_prompt)
-        return _result(request, state, path)
-
-
 def optimize_h3_prompt(
     request: FrozenContextIrRequest, *, client: httpx.Client | None = None
 ) -> ContextIrResult:
     """Start or resume exactly one Context IR attempt for this frozen request."""
     _validate_frozen_request(request)
-    if _uses_local_identity(request):
-        return _bind_local_identity(request)
     with _session_lease(request):
         state, path = _prepare(request)
         terminal = {"succeeded", "failed", "submission_unknown"}
@@ -2112,13 +2123,7 @@ def load_effective_prompt_receipt(
             or raw.get("context_output_prompt_sha256")
             != _sha256_text(context_output_prompt)
             or not isinstance(semantic_score, Mapping)
-            or set(semantic_score) != {
-                "speech_expected",
-                "speech",
-                "keyframe_timeline",
-                "music_policy",
-                "overall",
-            }
+            or set(semantic_score) != _SEMANTIC_SCORE_KEYS
             or not isinstance(semantic_score.get("speech_expected"), bool)
             or any(
                 isinstance(semantic_score.get(key), bool)
@@ -2127,6 +2132,22 @@ def load_effective_prompt_receipt(
                 for key in (
                     "speech", "keyframe_timeline", "music_policy", "overall"
                 )
+            )
+            or not isinstance(semantic_score.get("dialogue_policy"), Mapping)
+            or set(semantic_score["dialogue_policy"])
+            != _DIALOGUE_POLICY_SCORE_KEYS
+            or any(
+                isinstance(
+                    semantic_score["dialogue_policy"].get(key), bool
+                )
+                or not isinstance(
+                    semantic_score["dialogue_policy"].get(key),
+                    (int, float),
+                )
+                or not 0.0 <= float(
+                    semantic_score["dialogue_policy"][key]
+                ) <= 1.0
+                for key in _DIALOGUE_POLICY_SCORE_KEYS
             )
         ):
             raise ContextIrReceiptError("context_ir_receipt_invalid")
@@ -2139,23 +2160,6 @@ def load_effective_prompt_receipt(
             raise ContextIrReceiptError("context_ir_receipt_invalid")
     provider_task_id = raw.get("provider_task_id")
     if not isinstance(provider_task_id, str) or not provider_task_id:
-        raise ContextIrReceiptError("context_ir_receipt_invalid")
-    if _uses_local_identity(request) and (
-        legacy_receipt
-        or provider_task_id
-        != _LOCAL_IDENTITY_TASK_PREFIX + request.source_prompt_sha256
-        or effective_prompt != request.source_prompt
-        or raw.get("effective_prompt_sha256") != request.source_prompt_sha256
-        or raw.get("context_output_prompt") != request.source_prompt
-        or raw.get("context_output_prompt_sha256")
-        != request.source_prompt_sha256
-        or any(
-            semantic_score.get(key) != 1.0
-            for key in (
-                "speech", "keyframe_timeline", "music_policy", "overall"
-            )
-        )
-    ):
         raise ContextIrReceiptError("context_ir_receipt_invalid")
     attempt_path = path.with_name("attempt.json")
     state = _read_json(attempt_path)
