@@ -330,6 +330,78 @@ def _dialogue_policy_score(
     }
 
 
+def _explicit_dialogue_language(
+    source_language: str, provider_language: str | None, text: str,
+) -> str:
+    """Resolve a language label without giving the provider text authority."""
+    if source_language.strip().lower() not in _UNKNOWN_DIALOGUE_LANGUAGES:
+        return source_language.strip()
+    if re.search(r"[\u3400-\u9fff]", text):
+        return "Chinese"
+    if re.search(r"[A-Za-z]", text):
+        return "English"
+    if (
+        isinstance(provider_language, str)
+        and provider_language.strip().lower() not in _UNKNOWN_DIALOGUE_LANGUAGES
+    ):
+        return provider_language.strip()
+    return "OriginalLanguage"
+
+
+def _bind_exact_dialogue(
+    request: FrozenContextIrRequest, prompt: str,
+) -> str:
+    """Give Context IR prosody authority, never dialogue-text authority."""
+    source_parts = []
+    for token in request.dialogue_tokens:
+        parts = _DIALOGUE_PARTS.fullmatch(token)
+        if parts is None:
+            raise ContextIrContractError("source_speech_contract_invalid")
+        source_parts.append((parts.group(1), parts.group(2)))
+    provider_tokens = list(_DIALOGUE_TOKEN.finditer(prompt))
+    provider_languages = []
+    for token in provider_tokens:
+        parts = _DIALOGUE_PARTS.fullmatch(token.group(0))
+        provider_languages.append(parts.group(1) if parts is not None else None)
+
+    replacements = []
+    for index, (source_language, exact_text) in enumerate(source_parts):
+        provider_language = (
+            provider_languages[index]
+            if index < len(provider_languages)
+            else None
+        )
+        language = _explicit_dialogue_language(
+            source_language, provider_language, exact_text,
+        )
+        replacements.append(f"<d>[{language}]{exact_text}</d>")
+
+    position = 0
+    pieces: list[str] = []
+    for index, token in enumerate(provider_tokens):
+        pieces.append(prompt[position:token.start()])
+        if index < len(replacements):
+            pieces.append(replacements[index])
+        position = token.end()
+    pieces.append(prompt[position:])
+    compiled = "".join(pieces).rstrip()
+    if len(provider_tokens) < len(replacements):
+        missing = replacements[len(provider_tokens):]
+        compiled = "\n".join((compiled, *missing)).strip()
+    return compiled
+
+
+def _is_current_ref2va(request: FrozenContextIrRequest) -> bool:
+    source = request.source_h3_request
+    return (
+        source.mode == "reference"
+        and source.workflow == h3.H3_WORKFLOW
+        and source.context_ir_required is True
+        and len(source.keyframes) == 9
+        and source.reference_audios == ()
+    )
+
+
 def _keyframe_timeline_contract(prompt: str) -> str | None:
     """Extract one canonical timeline block; absence preserves v1 recovery."""
     opening_count = prompt.count(_TIMELINE_OPEN)
@@ -704,6 +776,10 @@ def _compile_effective_prompt(
     request: FrozenContextIrRequest, context_output_prompt: str,
 ) -> str:
     """Mechanically restore immutable Fusion fields around Context semantics."""
+    if _is_current_ref2va(request):
+        context_output_prompt = _bind_exact_dialogue(
+            request, context_output_prompt,
+        )
     suffix = _fusion_policy_suffix(request.source_prompt)
     if suffix is None:
         return _with_dialogue_policy(context_output_prompt)

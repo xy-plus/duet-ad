@@ -411,6 +411,31 @@ def test_reference_ref2va_uses_context_ir_and_binds_optimized_prompt(
     h3._require_context_ir_receipt(final_request)
 
 
+def test_reference_ref2va_restores_exact_dialogue_and_removes_extra_dialogue(
+    tmp_path: Path,
+) -> None:
+    frozen = _reference_fusion_frozen(tmp_path, dialogue=True)
+    optimized = frozen.source_prompt.replace(
+        "<d>[Undetermined]这是严格冻结的台词</d>",
+        "<d>[English]provider changed the line</d>",
+    ) + "\n<d>[English]provider invented another line</d>"
+    with _client(
+        _success_handler(frozen, effective_prompt=optimized)
+    ) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "succeeded"
+    assert result.receipt_path is not None
+    final_request = context_ir_bridge.apply_effective_prompt(
+        frozen, result.receipt_path,
+    )
+    assert final_request.prompt.count("<d>") == 1
+    assert "<d>[Chinese]这是严格冻结的台词</d>" in final_request.prompt
+    assert "provider changed" not in final_request.prompt
+    assert "provider invented" not in final_request.prompt
+    assert final_request.voice_texts == ("这是严格冻结的台词",)
+
+
 def test_reference_no_dialogue_prompt_explicitly_forbids_human_voice(
     tmp_path: Path,
 ) -> None:
