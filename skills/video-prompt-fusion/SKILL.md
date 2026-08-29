@@ -112,3 +112,5 @@ VideoPromptFusionOutput = {
 `input_sha256` 是输入描述符 exact bytes 的 SHA-256。输出 segments 与输入 segments 一一对应且顺序相同；不得增加、删除、合并或拆分 segment。每段恰有 `index/visual` 两个字段，禁止额外字段。
 
 写入前重新检查输入 SHA、输入顺序、输出索引和每段 visual 数量等技术完整性。视觉语义、旧静态残留、动态骨架、timeline、音频或音乐策略表现只进入结果评分；无论评分高低都写包含精确素材绑定的完整输出，供 Context IR 优化，之后由后端按已冻结绑定逐段独立生成视频。不得写旧提示词回退结果或任何可直接提交 provider 的 prompt。
+
+输出是最后一个动作：先把完整 JSON 写入 `work` 下的临时文件，完成后原子替换 `work/h3_prompt_plan.json`；替换成功立即退出，不再重读图片、不再解释、不再总结，也不写其他文件。

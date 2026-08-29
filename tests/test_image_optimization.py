@@ -26,6 +26,27 @@ def _png(width=5, height=3, value=127):
     return encoded.tobytes()
 
 
+def test_global_contact_sheet_is_bounded_navigation_without_mutating_frames(
+    tmp_path,
+):
+    frames = []
+    for index, value in enumerate((31, 62, 93), 1):
+        frame = tmp_path / f"{index:02d}.png"
+        frame.write_bytes(_png(width=8, height=6, value=value))
+        frames.append(frame)
+    source_digests = [hashlib.sha256(frame.read_bytes()).hexdigest() for frame in frames]
+    sheet = tmp_path / "segment-0001.jpg"
+
+    image_optimization._contact_sheet(frames, sheet)
+
+    decoded = cv2.imread(str(sheet), cv2.IMREAD_COLOR)
+    assert decoded is not None and decoded.shape[:2] == (756, 1344)
+    assert sheet.read_bytes()[:2] == b"\xff\xd8"
+    assert [
+        hashlib.sha256(frame.read_bytes()).hexdigest() for frame in frames
+    ] == source_digests
+
+
 def _done(settings, *, segments=False):
     meta = storage.new_conversation(settings.data_dir, "x", "x.mp4")
     cid = meta["id"]

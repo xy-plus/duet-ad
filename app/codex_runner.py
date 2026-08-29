@@ -20,11 +20,13 @@ import json
 import math
 import os
 import re
+import signal
 import shutil
 import stat
 import subprocess
 import tempfile
 import threading
+import time
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -235,6 +237,30 @@ def _read_voice_output(path: Path) -> bytes:
     return raw
 
 
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    """Best-effort termination scoped to one start_new_session invocation."""
+    pgid = proc.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        proc.wait()
+        return
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        proc.poll()  # Reap an exited leader so it does not keep the PGID observable.
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            proc.wait()
+            return
+        time.sleep(0.02)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
 class CodexRunner:
     def __init__(self, timeout_s: int, concurrency: int) -> None:
         self._timeout_s = timeout_s
@@ -325,6 +351,178 @@ class CodexRunner:
             self.run(stage, prompt)
         finally:
             _ACTIVE_ISOLATED_STAGE.reset(token)
+
+    def run_isolated_until_output(
+        self,
+        workdir: Path,
+        prompt: str,
+        *,
+        session_dir: Path,
+        output_path: Path,
+        max_output_bytes: int,
+        validate_output: Callable[[bytes], _T],
+    ) -> _T:
+        """Return as soon as Codex atomically publishes one valid declared output.
+
+        The API creates the empty regular output placeholder itself.  A
+        completed result is signalled only by replacing that inode and keeping
+        the replacement byte-stable across two observations.  Validation is a
+        protocol/shape check supplied by the caller, not a content-quality
+        decision.  Once adopted, only this invocation's process group is
+        terminated; unrelated Codex work is untouched.
+        """
+        if (
+            isinstance(max_output_bytes, bool)
+            or not isinstance(max_output_bytes, int)
+            or max_output_bytes <= 0
+            or not callable(validate_output)
+        ):
+            raise CodexError("isolated output contract is invalid")
+        _resolve_bwrap()
+        parent_fd = -1
+        placeholder_fd = -1
+        try:
+            tmp_root = Path("/tmp").resolve(strict=True)
+            stage = Path(workdir).resolve(strict=True)
+            session = Path(session_dir).resolve(strict=True)
+            requested = Path(output_path)
+            parent = requested.parent.resolve(strict=True)
+            parent.relative_to(stage)
+        except (OSError, ValueError):
+            raise CodexError("isolated output path is invalid") from None
+        if stage.parent != tmp_root or not stage.is_dir() or not session.is_dir():
+            raise CodexError("isolated execution path is missing or invalid")
+        if (
+            not requested.is_absolute()
+            or requested.parent != parent
+            or requested.name in {"", ".", ".."}
+            or requested.exists()
+            or requested.is_symlink()
+        ):
+            raise CodexError("isolated output must not already exist")
+        try:
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            placeholder_fd = os.open(
+                requested.name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            initial = os.fstat(placeholder_fd)
+            declared = Path(requested).resolve(strict=True)
+        except OSError:
+            if placeholder_fd >= 0:
+                os.close(placeholder_fd)
+            if parent_fd >= 0:
+                os.close(parent_fd)
+            raise CodexError("isolated output placeholder could not be created") from None
+
+        try:
+            writable = _isolated_writable_paths(stage, (declared,))
+            token = _ACTIVE_ISOLATED_STAGE.set((id(self), stage, session, writable))
+            try:
+                argv = self.build_argv(stage, prompt)
+            finally:
+                _ACTIVE_ISOLATED_STAGE.reset(token)
+        except BaseException:
+            os.close(placeholder_fd)
+            os.close(parent_fd)
+            raise
+
+        missing = object()
+
+        def read_once() -> tuple[tuple[int, int, int, int], bytes] | None:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(requested.name, flags, dir_fd=parent_fd)
+            except OSError:
+                return None
+            try:
+                info = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or (info.st_dev, info.st_ino) == (initial.st_dev, initial.st_ino)
+                    or info.st_size <= 0
+                    or info.st_size > max_output_bytes
+                ):
+                    return None
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    raw = stream.read(max_output_bytes + 1)
+                if len(raw) > max_output_bytes:
+                    return None
+                after = os.fstat(fd)
+                identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+                if identity != (
+                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+                ):
+                    return None
+                return identity, raw
+            finally:
+                os.close(fd)
+
+        def read_published() -> _T | object:
+            first = read_once()
+            if first is None:
+                return missing
+            time.sleep(0.1)
+            second = read_once()
+            if second is None or first != second:
+                return missing
+            try:
+                value = validate_output(first[1])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return missing
+            if value is None:
+                raise CodexError("isolated output validator returned None")
+            return value
+
+        try:
+            with self._sem, tempfile.TemporaryFile(mode="w+b") as stderr_file:
+                try:
+                    proc = subprocess.Popen(
+                        argv,
+                        stdout=subprocess.DEVNULL,
+                        stderr=stderr_file,
+                        env=_scrubbed_env(),
+                        start_new_session=True,
+                    )
+                except FileNotFoundError:
+                    raise CodexError("codex executable not found on PATH") from None
+                deadline = time.monotonic() + self._timeout_s
+                try:
+                    while True:
+                        adopted = read_published()
+                        if adopted is not missing:
+                            return adopted
+                        returncode = proc.poll()
+                        if returncode is not None:
+                            stderr_file.seek(0, os.SEEK_END)
+                            size = stderr_file.tell()
+                            stderr_file.seek(max(0, size - 8192))
+                            stderr = stderr_file.read().decode("utf-8", errors="replace")
+                            if returncode != 0:
+                                raise CodexError(
+                                    f"codex exit {returncode}: {clean_stderr(stderr)}",
+                                    retryable=True,
+                                )
+                            raise CodexError(
+                                "codex exited without atomically publishing valid output: "
+                                f"{clean_stderr(stderr)}",
+                                retryable=True,
+                            )
+                        if time.monotonic() >= deadline:
+                            raise CodexError(
+                                f"codex timed out after {self._timeout_s}s", retryable=True
+                            )
+                        time.sleep(0.1)
+                finally:
+                    _terminate_process_group(proc)
+        finally:
+            os.close(placeholder_fd)
+            os.close(parent_fd)
 
     def run_voice(
         self,

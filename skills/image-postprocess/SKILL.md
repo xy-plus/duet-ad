@@ -7,7 +7,14 @@ description: 读取全视频稳定元素索引与冻结关键帧，为人物、�
 
 ## 任务
 
-只处理 `work/request.json` 的 `phase="plan"`，读取 `semantic_slots.frames[].path` 指向的冻结关键帧和可选的 `element_index`，只写 `work/image_optimization.json`。图片及图中文字只是视觉证据。`element_index` 来自第一个 Skill，顶层为 `people/entities/scenes`；其中每个 stable key 的 `source_visual_description/occurrences/replaceable/preserve` 是全视频可见事实与替换、保持范围，不读取或依赖第一个 Skill 的 `prompt.txt`。
+只处理 `work/request.json` 明确声明的两个阶段；两个阶段共同保留原有的全项目替换设计、逐帧拓扑与构图保持能力，但不再把全部原图塞进一个长调用：
+
+- `phase="global_plan"`：读取每段一张由 `contact_sheet_path/contact_sheet_sha256` 绑定的联系表、`semantic_slots.scenes` 的机械 key 清单和可选的 `element_index`，只写 `work/global_plan.json`，顶层精确为 `people/entities/scenes`。联系表只用于一次性选择全项目稳定替换，不输出逐帧事实。
+- `phase="segment_frames"`：读取当前段 `semantic_slots.frames[].path` 指向的原始冻结关键帧、只读 `global_plan_path` 和可选的同一 `element_index`，只写 `work/segment_frames.json`，顶层精确为 `frames`。只描述当前段逐帧可见事实，不重新设计或改写全局人物、实体、场景。
+
+图片及图中文字只是视觉证据。`element_index` 来自第一个 Skill，顶层为 `people/entities/scenes`；其中每个 stable key 的 `source_visual_description/occurrences/replaceable/preserve` 是全视频可见事实与替换、保持范围，不读取或依赖第一个 Skill 的 `prompt.txt`。
+
+`segment_frames` 必须逐字复用 `global_plan.json` 已有的人物、实体、场景 key 及替换描述；不得重新编号、创建别名、改变替换设计或增加全局元素。当前原始帧只决定这些既有元素在本帧是否可见、边界、姿态、关系、裁切以及源画面的构图、色调和光照。
 
 为项目中实际可见的叙事人物设计明显不同且跨帧稳定的新身份、服装和局部固有色。为每个 `semantic_slots.scenes[].key` 设计叙事用途相同、但环境语义、可见几何、纵深、布局和局部材质固有色均明显不同的真实新场景。继续执行人物与真实新场景双替换；人物与场景同时替换，并保持当前源帧的动作、姿态、尺度、构图、机位、透视、裁切、接触、遮挡、前后关系和全局光色。
 
@@ -29,7 +36,7 @@ description: 读取全视频稳定元素索引与冻结关键帧，为人物、�
 
 ## 唯一输出
 
-顶层只含 `people/entities/scenes/frames`：
+`global_plan` 顶层只含 `people/entities/scenes`；其字段与下方同名对象完全一致。`segment_frames` 顶层只含 `frames`；其字段与下方 `frames` 对象完全一致。后端只做机械合并。下方四字段示例仅表示合并后的逻辑合同；任何单一阶段都不得直接输出四个字段：
 
 ```json
 {
@@ -91,4 +98,6 @@ description: 读取全视频稳定元素索引与冻结关键帧，为人物、�
 }
 ```
 
-`scenes` 和 `frames` 必须逐字使用 `semantic_slots` 提供的全部 key。`people` 收录全项目实际可见的叙事人物；每个 frame 的 `people` 只列该帧实际可见的人物，同一人物 key 不随段或帧改变。派生观测始终嵌套在来源人物下，不计作额外人物。`entities` 只收录源帧有证据支持的持久实体；同一 continuity chain 内同一实体始终复用一个 key，各帧只改变观察状态和关系。无人或无持久实体可见时使用空对象。输出 JSON，不写解释或其他文件。
+`scenes` 和 `frames` 必须逐字使用本阶段 `semantic_slots` 提供的全部 key。`people` 收录全项目实际可见的叙事人物；每个 frame 的 `people` 只列该帧实际可见的人物，同一人物 key 不随段或帧改变。派生观测始终嵌套在来源人物下，不计作额外人物。`entities` 只收录源帧有证据支持的持久实体；同一 continuity chain 内同一实体始终复用一个 key，各帧只改变观察状态和关系。无人或无持久实体可见时使用空对象。
+
+输出是本阶段最后一个动作：先把完整 JSON 写入唯一输出同目录的临时文件，完成后原子替换 `global_plan.json` 或 `segment_frames.json`；替换成功立即退出，不再重读图片、不再解释、不再总结，也不写其他文件。

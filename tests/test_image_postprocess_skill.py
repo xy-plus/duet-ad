@@ -1,5 +1,7 @@
 import hashlib
 import json
+import re
+import threading
 from copy import deepcopy
 from pathlib import Path
 
@@ -152,6 +154,7 @@ class _Runner:
         request = json.loads(
             (root / "work" / "request.json").read_text(encoding="utf-8")
         )
+        global_plan_path = root / "work" / "global_plan.json"
         self.calls.append(
             {
                 "files": sorted(
@@ -160,20 +163,65 @@ class _Runner:
                     if path.is_file()
                 ),
                 "request": request,
+                "global_plan": (
+                    json.loads(global_plan_path.read_text(encoding="utf-8"))
+                    if global_plan_path.is_file()
+                    and global_plan_path.stat().st_size else None
+                ),
                 "prompt": prompt,
                 "session_dir": Path(session_dir),
             }
         )
         name = {
-            "plan": "image_optimization.json",
+            "global_plan": "global_plan.json",
+            "segment_frames": "segment_frames.json",
             "plan_audit": "plan_audit.json",
             "verify": "image_verification.json",
             "verify_pack": "reference_pack_verification.json",
         }[self.calls[-1]["request"]["phase"]]
         output = self.output(request) if callable(self.output) else self.output
+        if request["phase"] == "global_plan":
+            output = {key: output.get(key, {}) for key in ("people", "entities", "scenes")}
+        elif request["phase"] == "segment_frames":
+            output = {"frames": output.get("frames", {})}
         (root / "work" / name).write_text(
             json.dumps(output, ensure_ascii=False), encoding="utf-8"
         )
+
+
+class _ParallelRunner(_Runner):
+    def __init__(self, output: object, segment_count: int) -> None:
+        super().__init__(output)
+        self.barrier = threading.Barrier(segment_count)
+        self.lock = threading.Lock()
+        self.active_segments = 0
+        self.max_active_segments = 0
+        self.entered_segments: list[int] = []
+
+    def run_isolated(self, workdir, prompt, *, session_dir):
+        request = json.loads(
+            (Path(workdir) / "work" / "request.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        if request["phase"] != "segment_frames":
+            return super().run_isolated(
+                workdir, prompt, session_dir=session_dir
+            )
+        with self.lock:
+            self.active_segments += 1
+            self.max_active_segments = max(
+                self.max_active_segments, self.active_segments
+            )
+            self.entered_segments.append(request["segment"]["index"])
+        try:
+            self.barrier.wait(timeout=5)
+            return super().run_isolated(
+                workdir, prompt, session_dir=session_dir
+            )
+        finally:
+            with self.lock:
+                self.active_segments -= 1
 
 
 def _skill_contract() -> tuple[str, dict]:
@@ -225,7 +273,7 @@ def _semantic_output(request: dict, *, sparse: bool = False) -> dict:
                 "local_color_change": "局部材质固有色明显变化",
             }
         )
-        for slot in slots["scenes"]
+        for slot in slots.get("scenes", [])
     }
     frames = {
         slot["key"]: (
@@ -242,7 +290,7 @@ def _semantic_output(request: dict, *, sparse: bool = False) -> dict:
                 "crop": f"{slot['key']} 当前画外裁切",
             }
         )
-        for slot in slots["frames"]
+        for slot in slots.get("frames", [])
     }
     people = {} if sparse else {"subject": {
         "source_identity": "当前可见源人物",
@@ -372,11 +420,12 @@ def _pack_verdict(plan: dict, *, passed: bool = True) -> dict:
     }
 
 
-def test_skill_is_one_concise_plan_only_skill():
+def test_skill_uses_one_global_plan_and_parallel_segment_frame_contracts():
     skill, example = _skill_contract()
 
     assert "name: image-postprocess" in skill
-    assert '`phase="plan"' in skill
+    assert '`phase="global_plan"' in skill
+    assert '`phase="segment_frames"' in skill
     assert set(example) == {"people", "entities", "scenes", "frames"}
     assert "只填写视觉语义" in skill
     assert "后端据此确定性编译" in skill
@@ -415,6 +464,10 @@ def test_skill_additively_consumes_element_index_without_changing_output_schema(
     )
 
     assert runner.calls[0]["request"]["element_index"] == element_index
+    assert runner.calls[0]["request"]["phase"] == "global_plan"
+    assert {call["request"]["phase"] for call in runner.calls[1:]} == {
+        "segment_frames"
+    }
     assert [
         (tile["stable_key"], tile["tile_id"])
         for tile in image_optimization.composite_replacement_board_spec(plan)["tiles"]
@@ -572,7 +625,7 @@ def test_skill_synthesizes_continuity_target_separation_from_source_evidence():
         assert sample_word not in skill
 
 
-def test_plan_phase_uses_one_semantic_compiler_for_exact_v4_prompts(tmp_path):
+def test_two_phase_inputs_are_minimal_and_merge_into_exact_v4_prompts(tmp_path):
     session = tmp_path / "session"
     runner = _Runner(_semantic_output)
     segments = _transition_skeleton(_segments(session))
@@ -597,27 +650,72 @@ def test_plan_phase_uses_one_semantic_compiler_for_exact_v4_prompts(tmp_path):
         assert "替换人物" in prompt
         assert "替换场景" in prompt
         assert "source-preserve/no-invention" in prompt
-    request = runner.calls[0]["request"]
-    assert request["phase"] == "plan"
-    assert request["segments"] == [
+    global_call = next(
+        call for call in runner.calls
+        if call["request"]["phase"] == "global_plan"
+    )
+    request = global_call["request"]
+    assert [
+        {
+            key: value for key, value in item.items()
+            if key not in {"contact_sheet_path", "contact_sheet_sha256"}
+        }
+        for item in request["segments"]
+    ] == [
         {key: value for key, value in segment.items() if key != "keyframes_dir"}
         for segment in segments
     ]
+    assert [item["contact_sheet_path"] for item in request["segments"]] == [
+        "work/contact_sheets/segment-0001.jpg",
+        "work/contact_sheets/segment-0002.jpg",
+    ]
+    assert all(
+        re.fullmatch(r"[0-9a-f]{64}", item["contact_sheet_sha256"])
+        for item in request["segments"]
+    )
     assert [item["key"] for item in request["semantic_slots"]["scenes"]] == [
         "scene-001"
     ]
-    assert [item["key"] for item in request["semantic_slots"]["frames"]] == [
-        "frame-001", "frame-002"
-    ]
-    assert runner.calls[0]["files"] == [
+    assert set(request["semantic_slots"]) == {"scenes"}
+    assert global_call["files"] == [
         "SKILL.md",
+        "work/contact_sheets/segment-0001.jpg",
+        "work/contact_sheets/segment-0002.jpg",
+        "work/global_plan.json",
         "work/request.json",
-        "work/segments/1/keyframes/01.png",
-        "work/segments/2/keyframes/01.png",
     ]
+    assert not any(name.endswith(".png") for name in global_call["files"])
+
+    segment_calls = sorted(
+        (
+            call for call in runner.calls
+            if call["request"]["phase"] == "segment_frames"
+        ),
+        key=lambda call: call["request"]["segment"]["index"],
+    )
+    assert len(segment_calls) == 2
+    assert segment_calls[0]["global_plan"] == segment_calls[1]["global_plan"]
+    assert set(segment_calls[0]["global_plan"]) == {
+        "people", "entities", "scenes"
+    }
+    for index, call in enumerate(segment_calls, 1):
+        segment_request = call["request"]
+        assert segment_request["segment"]["index"] == index
+        assert segment_request["global_plan_path"] == "work/global_plan.json"
+        assert set(segment_request["semantic_slots"]) == {"frames"}
+        assert [
+            item["key"] for item in segment_request["semantic_slots"]["frames"]
+        ] == [f"frame-{index:03d}"]
+        assert call["files"] == [
+            "SKILL.md",
+            "work/global_plan.json",
+            "work/keyframes/01.png",
+            "work/request.json",
+            "work/segment_frames.json",
+        ]
 
 
-def test_short_video_semantics_compile_to_both_targets_in_one_call(tmp_path):
+def test_short_video_semantics_compile_to_both_targets_in_two_phases(tmp_path):
     session = tmp_path / "session"
     runner = _Runner(_semantic_output)
     segments = _transition_skeleton(_segments(session, [0]))
@@ -629,10 +727,37 @@ def test_short_video_semantics_compile_to_both_targets_in_one_call(tmp_path):
         expected_version=4,
     )
 
-    assert len(runner.calls) == 1
+    assert [call["request"]["phase"] for call in runner.calls] == [
+        "global_plan", "segment_frames"
+    ]
     assert generated["person_plans"] and generated["scene_plans"]
     assert generated["segments"][0]["persons"][0]["state"] == "replace"
     assert "替换人物" in prompts[0][1] and "替换场景" in prompts[0][1]
+
+
+def test_segment_frame_skill_calls_overlap_and_mechanically_merge_to_v4(tmp_path):
+    session = tmp_path / "session"
+    segments = _transition_skeleton(_segments(session, [1, 2, 3]))
+    runner = _ParallelRunner(_semantic_output, segment_count=3)
+
+    plan, prompts = image_optimization.generate_project_prompts(
+        runner,
+        segments,
+        "independent_parallel",
+        session_dir=session,
+        expected_version=4,
+    )
+
+    assert runner.max_active_segments == 3
+    assert set(runner.entered_segments) == {1, 2, 3}
+    assert plan["version"] == 4 and plan["eligible"] is True
+    assert image_optimization.canonical_plan_v4(
+        plan,
+        segment_indices=[1, 2, 3],
+        frame_counts={1: 1, 2: 1, 3: 1},
+    ) == plan
+    assert set(prompts) == {1, 2, 3}
+    assert all(set(frames) == {1} for frames in prompts.values())
 
 
 def test_plan_phase_v4_compiles_one_prompt_for_each_frozen_source_frame(tmp_path):
@@ -648,7 +773,9 @@ def test_plan_phase_v4_compiles_one_prompt_for_each_frozen_source_frame(tmp_path
         expected_version=4,
     )
 
-    assert len(runner.calls) == 1
+    assert [call["request"]["phase"] for call in runner.calls] == [
+        "global_plan", "segment_frames"
+    ]
     assert generated["version"] == 4
     assert set(prompts) == {0} and set(prompts[0]) == {1, 2}
     assert prompts[0][1] != prompts[0][2]
@@ -2227,10 +2354,9 @@ def test_v4_compile_and_freeze_bind_one_shared_graph_and_exact_views(tmp_path):
         )
 
 
-def test_v4_plan_phase_canonicalizes_then_compiles_per_frame(tmp_path):
+def test_two_phase_semantics_are_mechanically_canonicalized_per_frame(tmp_path):
     session = tmp_path / "session"
-    model_expected = _generic_scene_continuity_plan()
-    runner = _Runner(model_expected)
+    runner = _Runner(_semantic_output)
     segments = _transition_skeleton(_segments(session, indices=[1, 2]))
 
     plan, prompts = image_optimization.generate_project_prompts(
@@ -2239,18 +2365,19 @@ def test_v4_plan_phase_canonicalizes_then_compiles_per_frame(tmp_path):
         "independent_parallel",
         session_dir=session,
     )
-    expected = deepcopy(model_expected)
-    for segment, source_segment in zip(expected["segments"], segments):
-        source_frames = sorted(Path(source_segment["keyframes_dir"]).glob("*.png"))
-        for constraint, source in zip(segment["frame_constraints"], source_frames):
-            metric = image_optimization.source_palette_metric(source)
-            constraint["dominant_palette_contract"] = {
-                "area_weighted_warm_cool_family": metric["warm_cool_family"],
-                "saturation_style": metric["saturation_style"],
-            }
 
-    assert plan == expected
-    assert plan != model_expected
+    assert plan["version"] == 4
+    assert image_optimization.canonical_plan_v4(
+        plan,
+        segment_indices=[1, 2],
+        frame_counts={1: 1, 2: 1},
+    ) == plan
+    assert plan["person_plans"] and plan["scene_plans"]
+    assert [
+        frame["frame_index"]
+        for segment in plan["segments"]
+        for frame in segment["frame_constraints"]
+    ] == [1, 1]
     assert set(prompts) == {1, 2}
     assert set(prompts[1]) == {1}
     assert set(prompts[2]) == {1}

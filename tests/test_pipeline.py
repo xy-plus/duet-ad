@@ -255,7 +255,7 @@ def _semantic_image_output(request: dict, *, omit_wardrobe: bool = False) -> dic
                 "layout_change": "功能区域和实体布局明显变化",
                 "local_color_change": "局部材质固有色明显变化",
             }
-            for slot in request["semantic_slots"]["scenes"]
+            for slot in request["semantic_slots"].get("scenes", [])
         },
         "frames": {
             slot["key"]: {
@@ -269,7 +269,7 @@ def _semantic_image_output(request: dict, *, omit_wardrobe: bool = False) -> dic
                 "crop": f"{slot['key']} 当前画外裁切",
                 "palette_description": "warm-neutral and natural-muted",
             }
-            for slot in request["semantic_slots"]["frames"]
+            for slot in request["semantic_slots"].get("frames", [])
         },
     }
 
@@ -811,11 +811,18 @@ def test_v4_semantic_diagnostics_do_not_retry_or_switch_compilers(
                     encoding="utf-8"
                 )
             )
-            output = work / "image_optimization.json"
+            semantic = _semantic_image_output(request, omit_wardrobe=True)
+            if request["phase"] == "global_plan":
+                output = work / "global_plan.json"
+                semantic = {
+                    key: semantic.get(key, {})
+                    for key in ("people", "entities", "scenes")
+                }
+            else:
+                output = work / "segment_frames.json"
+                semantic = {"frames": semantic["frames"]}
             output.write_text(
-                json.dumps(_semantic_image_output(
-                    request, omit_wardrobe=True,
-                )),
+                json.dumps(semantic),
                 encoding="utf-8",
             )
 
@@ -843,7 +850,7 @@ def test_v4_semantic_diagnostics_do_not_retry_or_switch_compilers(
         step="project image plan",
     )
 
-    assert runner.calls == 2
+    assert runner.calls == 3
     assert not hasattr(image_optimization, "generic_project_prompts")
     assert plan["version"] == 4
     assert list(prompts) == [0]
@@ -1917,6 +1924,151 @@ class TestCodexRunner:
             for index in range(len(argv) - 2)
         )
         assert argv[argv.index("-C") + 1] == str(stage)
+
+    def test_isolated_atomic_output_is_completion_signal_before_process_exit(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="duet-output-completion-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            work.mkdir()
+            output = work / "result.json"
+            runner = CodexRunner(timeout_s=10, concurrency=1)
+            monkeypatch.setattr(
+                runner,
+                "build_argv",
+                lambda _workdir, _prompt: [
+                    "/usr/bin/bash", "-c",
+                    f"printf '{{\"ok\":true}}' > '{work / '.result.tmp'}'; "
+                    f"mv -f '{work / '.result.tmp'}' '{output}'; /usr/bin/sleep 8",
+                ],
+            )
+
+            started = time.monotonic()
+            result = runner.run_isolated_until_output(
+                stage,
+                "prompt",
+                session_dir=cdir,
+                output_path=output,
+                max_output_bytes=1024,
+                validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+            )
+
+            assert result == {"ok": True}
+            assert time.monotonic() - started < 3
+
+    def test_isolated_direct_partial_write_is_not_a_completion_signal(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="duet-output-partial-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            work.mkdir()
+            output = work / "result.json"
+            runner = CodexRunner(timeout_s=3, concurrency=1)
+            monkeypatch.setattr(
+                runner,
+                "build_argv",
+                lambda _workdir, _prompt: [
+                    "/usr/bin/bash", "-c", f"printf '{{\"ok\":true}}' > '{output}'",
+                ],
+            )
+
+            with pytest.raises(CodexError, match="atomically publishing"):
+                runner.run_isolated_until_output(
+                    stage,
+                    "prompt",
+                    session_dir=cdir,
+                    output_path=output,
+                    max_output_bytes=1024,
+                    validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                )
+
+    def test_isolated_completion_kills_term_ignoring_descendants(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        marker = tmp_path / "descendant-survived"
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="duet-output-descendant-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            work.mkdir()
+            output = work / "result.json"
+            runner = CodexRunner(timeout_s=5, concurrency=1)
+            monkeypatch.setattr(
+                runner,
+                "build_argv",
+                lambda _workdir, _prompt: [
+                    "/usr/bin/bash", "-c",
+                    "trap '' TERM; "
+                    f"(trap '' TERM; /usr/bin/sleep 2; /usr/bin/touch '{marker}') & "
+                    f"printf '{{\"ok\":true}}' > '{work / '.result.tmp'}'; "
+                    f"mv -f '{work / '.result.tmp'}' '{output}'; wait",
+                ],
+            )
+
+            assert runner.run_isolated_until_output(
+                stage,
+                "prompt",
+                session_dir=cdir,
+                output_path=output,
+                max_output_bytes=1024,
+                validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+            ) == {"ok": True}
+            time.sleep(1.2)
+            assert not marker.exists()
+
+    def test_isolated_completion_rejects_symlinked_output_parent(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="duet-output-parent-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            (stage / "work").symlink_to(outside, target_is_directory=True)
+            runner = CodexRunner(timeout_s=3, concurrency=1)
+            monkeypatch.setattr(
+                runner,
+                "build_argv",
+                lambda *_args: (_ for _ in ()).throw(AssertionError("must not spawn")),
+            )
+
+            with pytest.raises(CodexError, match="output path"):
+                runner.run_isolated_until_output(
+                    stage,
+                    "prompt",
+                    session_dir=cdir,
+                    output_path=stage / "work" / "result.json",
+                    max_output_bytes=1024,
+                    validate_output=lambda raw: raw,
+                )
 
     def test_readonly_isolated_fails_closed_on_namespace_error(
         self, monkeypatch, tmp_path,
@@ -3062,10 +3214,17 @@ def test_short_pipeline_semantic_compiler_continues_to_frozen_v4(
                     encoding="utf-8"
                 )
             )
-            (Path(workdir) / "work" / "image_optimization.json").write_text(
-                json.dumps(_semantic_image_output(
-                    request, omit_wardrobe=True,
-                )),
+            semantic = _semantic_image_output(request, omit_wardrobe=True)
+            output = Path(workdir) / "work" / (
+                "global_plan.json"
+                if request["phase"] == "global_plan" else "segment_frames.json"
+            )
+            output.write_text(
+                json.dumps(
+                    {key: semantic.get(key, {}) for key in ("people", "entities", "scenes")}
+                    if request["phase"] == "global_plan"
+                    else {"frames": semantic["frames"]}
+                ),
                 encoding="utf-8",
             )
 
@@ -3094,7 +3253,7 @@ def test_short_pipeline_semantic_compiler_continues_to_frozen_v4(
         },
     )
 
-    assert runner.calls == 1
+    assert runner.calls == 2
     assert continuity["_image_continuity"]["version"] == 4
     receipt = frozen["_image_optimization"]
     assert receipt["version"] == 4

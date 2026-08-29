@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
 
@@ -3469,6 +3470,89 @@ def _project_segment_inputs(
     return session, indices, prepared
 
 
+def _contact_sheet(frames: list[Path], output: Path) -> None:
+    """Build one bounded 3x3 navigation sheet without replacing source evidence."""
+    cells = []
+    for number, frame in enumerate(frames, 1):
+        image = cv2.imread(str(frame), cv2.IMREAD_COLOR)
+        if image is None or image.size == 0:
+            raise ValueError("invalid image optimization segments")
+        height, width = image.shape[:2]
+        scale = min(448 / width, 252 / height)
+        resized = cv2.resize(
+            image,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        vertical = 252 - resized.shape[0]
+        horizontal = 448 - resized.shape[1]
+        cell = cv2.copyMakeBorder(
+            resized,
+            vertical // 2,
+            vertical - vertical // 2,
+            horizontal // 2,
+            horizontal - horizontal // 2,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
+        cv2.putText(
+            cell, f"F{number:02d}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+            0.7, (255, 255, 255), 2, cv2.LINE_AA,
+        )
+        cells.append(cell)
+    if not cells or len(cells) > 9:
+        raise ValueError("invalid image optimization segments")
+    cells.extend([cells[0] * 0 for _ in range(9 - len(cells))])
+    sheet = cv2.vconcat([
+        cv2.hconcat(cells[offset:offset + 3]) for offset in range(0, 9, 3)
+    ])
+    if not cv2.imwrite(str(output), sheet, [cv2.IMWRITE_JPEG_QUALITY, 88]):
+        raise ValueError("invalid image optimization segments")
+
+
+def _phase_output(raw: bytes, expected_keys: set[str]) -> dict:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("invalid image optimization phase output") from None
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("invalid image optimization phase output")
+    return value
+
+
+def _run_image_skill_phase(
+    runner,
+    *,
+    stage: Path,
+    session: Path,
+    output_name: str,
+    expected_keys: set[str],
+    max_bytes: int,
+) -> dict:
+    output = stage / "work" / output_name
+    prompt = (
+        "严格执行当前目录 SKILL.md；只读取允许的输入；用同目录临时文件完整写出"
+        "规定 JSON，再原子替换唯一输出文件，并立即退出。"
+    )
+    if hasattr(runner, "run_isolated_until_output"):
+        return runner.run_isolated_until_output(
+            stage,
+            prompt,
+            session_dir=session,
+            output_path=output,
+            max_output_bytes=max_bytes,
+            validate_output=lambda raw: _phase_output(raw, expected_keys),
+        )
+    output.touch(mode=0o600)
+    runner.run_isolated(stage, prompt, session_dir=session)
+    value = _read_json_output(output, max_bytes)
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return value
+
+
 def generate_project_prompts(
     runner,
     segments: list[dict],
@@ -3478,7 +3562,7 @@ def generate_project_prompts(
     expected_version: int = 4,
     element_index_path: Path | None = None,
 ) -> tuple[dict, dict]:
-    """Run the plan phase once, then compile immutable provider prompts."""
+    """Plan globally from contact sheets, then describe source frames per segment."""
     if edit_mode not in SEEDREAM_EDIT_MODES or expected_version not in {2, 3, 4}:
         raise ValueError("unsupported image optimization edit mode")
     session, indices, prepared = _project_segment_inputs(
@@ -3496,107 +3580,167 @@ def generate_project_prompts(
         except ImageOptimizationOutputError:
             element_index = _canonical_element_index(None)
 
-    with tempfile.TemporaryDirectory(prefix="duet-image-postprocess-", dir="/tmp") as raw:
+    request_segments = [{
+        "index": segment["index"],
+        "chain_id": segment["chain_id"],
+        "join_mode": segment["join_mode"],
+        **({"transition_skeleton": segment["transition_skeleton"]}
+           if "transition_skeleton" in segment else {}),
+    } for segment, _frames in prepared]
+    raw_slots = _semantic_slots(request_segments, element_index=element_index)
+    scene_slots = [
+        {"key": item["key"], "chain_id": item["chain_id"]}
+        for item in raw_slots["scenes"]
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="duet-image-global-", dir="/tmp") as raw:
         stage = Path(raw).resolve(strict=True)
         work = stage / "work"
         _copy_regular(skill, stage / "SKILL.md")
-        request_segments = []
         for segment, frames in prepared:
-            destination = work / "segments" / str(segment["index"]) / "keyframes"
-            destination.mkdir(parents=True, mode=0o700)
-            for frame in frames:
-                _copy_regular(frame, destination / frame.name)
-            request_segments.append({
-                "index": segment["index"],
-                "chain_id": segment["chain_id"],
-                "join_mode": segment["join_mode"],
-                **({"transition_skeleton": segment["transition_skeleton"]}
-                   if "transition_skeleton" in segment else {}),
-            })
+            destination = work / "contact_sheets" / f"segment-{segment['index']:04d}.jpg"
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _contact_sheet(frames, destination)
         request = {
-                "phase": "plan",
-                "edit_mode": edit_mode,
-                "segments": request_segments,
-                "semantic_slots": semantic_slot_manifest(
-                    request_segments, element_index=element_index,
+            "phase": "global_plan",
+            "edit_mode": edit_mode,
+            "segments": [{
+                **segment,
+                "contact_sheet_path": (
+                    f"work/contact_sheets/segment-{segment['index']:04d}.jpg"
                 ),
+                "contact_sheet_sha256": _sha256_regular(
+                    work / "contact_sheets" / f"segment-{segment['index']:04d}.jpg"
+                ),
+            } for segment in request_segments],
+            "semantic_slots": {"scenes": scene_slots},
         }
         if element_index is not None:
             request["element_index"] = element_index
+        work.mkdir(parents=True, exist_ok=True)
         (work / "request.json").write_text(
             json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
-        run_error: CodexError | None = None
-        try:
-            runner.run_isolated(
-                stage,
-                "严格执行当前目录 SKILL.md；只读取允许的输入，并写入规定的唯一输出文件。",
-                session_dir=session,
+        global_plan = _run_image_skill_phase(
+            runner,
+            stage=stage,
+            session=session,
+            output_name="global_plan.json",
+            expected_keys={"people", "entities", "scenes"},
+            max_bytes=MAX_CONTINUITY_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
+        )
+
+    frames_by_segment: dict[int, list[dict]] = {}
+
+    def describe_segment(item: tuple[dict, list[Path]]) -> tuple[int, dict]:
+        segment, frames = item
+        with tempfile.TemporaryDirectory(
+            prefix=f"duet-image-segment-{segment['index']}-", dir="/tmp",
+        ) as raw:
+            stage = Path(raw).resolve(strict=True)
+            work = stage / "work"
+            destination = work / "keyframes"
+            destination.mkdir(parents=True, mode=0o700)
+            _copy_regular(skill, stage / "SKILL.md")
+            for frame in frames:
+                _copy_regular(frame, destination / frame.name)
+            (work / "global_plan.json").write_text(
+                json.dumps(global_plan, ensure_ascii=False, separators=(",", ":")) + "\n",
+                encoding="utf-8",
             )
-        except CodexError as error:
-            run_error = error
-        try:
-            max_bytes = (
-                MAX_CONTINUITY_BYTES
-                + MAX_PROMPT_BYTES * len(indices)
-                + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES
-            )
-            plan, prompts = _canonical_project_output(
-                _read_json_output(work / "image_optimization.json", max_bytes),
-                indices,
-                edit_mode,
-                {segment["index"]: len(frames) for segment, frames in prepared},
-                source_frames={
-                    segment["index"]: frames for segment, frames in prepared
-                },
-                segment_specs=[segment for segment, _frames in prepared],
-                element_index=element_index,
-            )
-            if plan.get("version") != expected_version:
-                raise ImageOptimizationOutputError(
-                    "image optimization output is missing or invalid"
-                )
-            skeletons = {
-                segment["index"]: segment.get("transition_skeleton")
-                for segment, _frames in prepared
-                if "transition_skeleton" in segment
+            segment_slots = [
+                {"key": slot["key"], "scene_key": slot["scene_key"],
+                 "path": f"work/keyframes/{slot['frame_name']}"}
+                for slot in raw_slots["frames"]
+                if slot["segment_index"] == segment["index"]
+            ]
+            request = {
+                "phase": "segment_frames",
+                "edit_mode": edit_mode,
+                "segment": next(
+                    value for value in request_segments
+                    if value["index"] == segment["index"]
+                ),
+                "semantic_slots": {"frames": segment_slots},
+                "global_plan_path": "work/global_plan.json",
             }
-            if plan.get("version") == 4 and skeletons:
-                actual = {
-                    scene_view["segment_index"]: []
-                    for scene in plan["scene_plans"]
-                    for scene_view in scene["continuity_graph"]["views"]
-                }
-                for scene in plan["scene_plans"]:
-                    for view in scene["continuity_graph"]["views"]:
-                        actual[view["segment_index"]].append({
-                            "frame_index": view["frame_index"],
-                            "transition_from_previous": view["transition_from_previous"],
-                        })
-                expected = {
-                    index: [
-                        {
-                            "frame_index": item["frame_index"],
-                            "transition_from_previous": item[
-                                "source_transition_from_previous"
-                            ],
-                        }
-                        for item in skeleton
-                    ]
-                    for index, skeleton in skeletons.items()
-                }
-                if actual != expected:
-                    raise ImageOptimizationOutputError(
-                        "image optimization output is missing or invalid"
-                    )
-            return plan, prompts
-        except ImageOptimizationIneligibleError:
-            raise
-        except ImageOptimizationOutputError:
-            if run_error is not None:
-                raise run_error from None
-            raise
+            if element_index is not None:
+                request["element_index"] = element_index
+            (work / "request.json").write_text(
+                json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            result = _run_image_skill_phase(
+                runner,
+                stage=stage,
+                session=session,
+                output_name="segment_frames.json",
+                expected_keys={"frames"},
+                max_bytes=MAX_PROMPT_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
+            )
+            return segment["index"], result["frames"]
+
+    with ThreadPoolExecutor(max_workers=len(prepared)) as executor:
+        futures = [executor.submit(describe_segment, item) for item in prepared]
+        for future in as_completed(futures):
+            index, segment_frames = future.result()
+            frames_by_segment[index] = segment_frames
+
+    merged_frames = {}
+    for segment, _frames in prepared:
+        merged_frames.update(frames_by_segment[segment["index"]])
+    semantic_output = {**global_plan, "frames": merged_frames}
+    max_bytes = (
+        MAX_CONTINUITY_BYTES
+        + MAX_PROMPT_BYTES * len(indices)
+        + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES
+    )
+    if len(json.dumps(semantic_output, ensure_ascii=False).encode("utf-8")) > max_bytes:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    plan, prompts = _canonical_project_output(
+        semantic_output,
+        indices,
+        edit_mode,
+        {segment["index"]: len(frames) for segment, frames in prepared},
+        source_frames={segment["index"]: frames for segment, frames in prepared},
+        segment_specs=[segment for segment, _frames in prepared],
+        element_index=element_index,
+    )
+    if plan.get("version") != expected_version:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    skeletons = {
+        segment["index"]: segment.get("transition_skeleton")
+        for segment, _frames in prepared if "transition_skeleton" in segment
+    }
+    if plan.get("version") == 4 and skeletons:
+        actual = {
+            scene_view["segment_index"]: []
+            for scene in plan["scene_plans"]
+            for scene_view in scene["continuity_graph"]["views"]
+        }
+        for scene in plan["scene_plans"]:
+            for view in scene["continuity_graph"]["views"]:
+                actual[view["segment_index"]].append({
+                    "frame_index": view["frame_index"],
+                    "transition_from_previous": view["transition_from_previous"],
+                })
+        expected = {
+            index: [{
+                "frame_index": item["frame_index"],
+                "transition_from_previous": item["source_transition_from_previous"],
+            } for item in skeleton]
+            for index, skeleton in skeletons.items()
+        }
+        if actual != expected:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+    return plan, prompts
 
 
 def freeze_continuity(

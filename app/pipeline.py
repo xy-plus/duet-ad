@@ -603,14 +603,37 @@ def _generate_project_element_index(
             ) + "\n",
             encoding="utf-8",
         )
-        runner.run_isolated(
-            isolated_root,
-            _project_index_codex_prompt(isolated_root),
-            session_dir=cdir,
-        )
+        isolated_output = isolated_work / "element_index.json"
+        if hasattr(runner, "run_isolated_until_output"):
+            def validate(raw_output: bytes) -> bytes:
+                try:
+                    value = json.loads(raw_output.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    raise ValueError("project index output is invalid") from None
+                if not isinstance(value, dict) or set(value) != {
+                    "people", "entities", "scenes"
+                }:
+                    raise ValueError("project index output is invalid")
+                return raw_output
+
+            staged_data = runner.run_isolated_until_output(
+                isolated_root,
+                _project_index_codex_prompt(isolated_root),
+                session_dir=cdir,
+                output_path=isolated_output,
+                max_output_bytes=256 * 1024,
+                validate_output=validate,
+            )
+        else:
+            runner.run_isolated(
+                isolated_root,
+                _project_index_codex_prompt(isolated_root),
+                session_dir=cdir,
+            )
+            staged_data = isolated_output.read_bytes()
         staged = target.with_name(".element_index.tmp")
         try:
-            staged.write_bytes((isolated_work / "element_index.json").read_bytes())
+            staged.write_bytes(staged_data)
             os.replace(staged, target)
         finally:
             staged.unlink(missing_ok=True)
@@ -2402,6 +2425,40 @@ def _read_prompt_fusion_stage_output(path: Path, *, segment_count: int) -> bytes
     return data
 
 
+def _prompt_fusion_early_output(
+    data: bytes, *, input_sha256: str, segment_count: int,
+) -> bytes:
+    """Validate the bounded output envelope before adopting its atomic publish."""
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("prompt fusion raw output is invalid") from None
+    segments = value.get("segments") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "version", "input_sha256", "segments"}
+        or value.get("schema") != long_generation.PROMPT_FUSION_OUTPUT_SCHEMA
+        or value.get("version") != long_generation.PROMPT_FUSION_VERSION
+        or value.get("input_sha256") != input_sha256
+        or not isinstance(segments, list)
+        or len(segments) != segment_count
+        or any(
+            not isinstance(segment, dict)
+            or set(segment) != {"index", "visual"}
+            or segment.get("index") != index
+            or not isinstance(segment.get("visual"), list)
+            or not segment["visual"]
+            or any(
+                not isinstance(text, str) or not text.strip()
+                for text in segment["visual"]
+            )
+            for index, segment in enumerate(segments, 1)
+        )
+    ):
+        raise ValueError("prompt fusion raw output is invalid")
+    return data
+
+
 def queue_prompt_fusion(
     settings: Settings,
     cid: str,
@@ -2758,23 +2815,43 @@ def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
             (stage / "SKILL.md").write_bytes(skill_data)
             (stage_work / h3_project.SKILL_INPUT_FILENAME).write_bytes(input_data)
             stage_output = stage_work / "h3_prompt_plan.json"
-            stage_output.touch(mode=0o600, exist_ok=False)
             for segment in input_payload["segments"]:
                 for frame in segment["new_keyframes"]:
                     _copy_prompt_fusion_frame(
                         root=root, stage=stage, frame=frame,
                     )
-            runner.run_isolated(
-                stage,
+            fusion_prompt = (
                 "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json "
-                "及其中 SHA 绑定的有序图片，只写 work/h3_prompt_plan.json。",
-                session_dir=root,
-                writable_paths=(stage_output,),
+                "及其中 SHA 绑定的有序图片；原子发布 work/h3_prompt_plan.json 后立即退出。"
             )
-            raw_output_data = _read_prompt_fusion_stage_output(
-                stage_output,
-                segment_count=len(input_payload["segments"]),
-            )
+            if hasattr(runner, "run_isolated_until_output"):
+                raw_output_data = runner.run_isolated_until_output(
+                    stage,
+                    fusion_prompt,
+                    session_dir=root,
+                    output_path=stage_output,
+                    max_output_bytes=(
+                        64 * 1024
+                        + MAX_PROMPT_BYTES * len(input_payload["segments"])
+                    ),
+                    validate_output=lambda data: _prompt_fusion_early_output(
+                        data,
+                        input_sha256=state["input_sha256"],
+                        segment_count=len(input_payload["segments"]),
+                    ),
+                )
+            else:
+                stage_output.touch(mode=0o600, exist_ok=False)
+                runner.run_isolated(
+                    stage,
+                    fusion_prompt,
+                    session_dir=root,
+                    writable_paths=(stage_output,),
+                )
+                raw_output_data = _read_prompt_fusion_stage_output(
+                    stage_output,
+                    segment_count=len(input_payload["segments"]),
+                )
         _atomic_bytes(output_path, raw_output_data)
         state = {
             **state,
