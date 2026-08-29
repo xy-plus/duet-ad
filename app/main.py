@@ -3353,6 +3353,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.prompt_fusion_recovery_threads = []
     app.state.postprocess_recovery_tasks = []
     app.state.operation_recovery_tasks = []
+    app.state.operation_loop = None
 
     async def advance_v4_operation(cid: str) -> None:
         """Ensure the accepted A keeps advancing on the one existing CID."""
@@ -3426,6 +3427,14 @@ def create_app(settings: Settings) -> FastAPI:
             cid,
             codex_runner,
         )
+
+    @app.on_event("startup")
+    async def bind_operation_loop() -> None:
+        # Pipeline workers are synchronous thread-pool jobs.  Their automatic
+        # postprocess continuation must return to this one application loop;
+        # asyncio synchronization primitives cannot be shared across the
+        # private loops created by multiple worker threads.
+        app.state.operation_loop = asyncio.get_running_loop()
 
     @app.on_event("startup")
     async def resume_postprocessing() -> None:
@@ -3518,7 +3527,15 @@ def create_app(settings: Settings) -> FastAPI:
                 pipeline.run(
                     settings, cid, codex_runner, claimed_owner=claimed_owner
                 )
-        asyncio.run(advance_v4_operation(cid))
+        operation_loop = app.state.operation_loop
+        if (
+            not isinstance(operation_loop, asyncio.AbstractEventLoop)
+            or not operation_loop.is_running()
+        ):
+            raise RuntimeError("application operation loop is unavailable")
+        asyncio.run_coroutine_threadsafe(
+            advance_v4_operation(cid), operation_loop
+        ).result()
 
     @app.on_event("startup")
     async def recover_pipeline_inputs() -> None:

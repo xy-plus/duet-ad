@@ -4173,6 +4173,66 @@ def test_startup_recovers_stale_unfrozen_pipeline_claim_without_h3(
         assert called.wait(timeout=1)
 
 
+def test_parallel_pipeline_continuations_share_application_event_loop(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path,
+        enable_pipeline=True,
+        enable_h3_submit=False,
+        codex_concurrency=3,
+        seedream_concurrency=1,
+    )
+    metas = [
+        storage.new_conversation(settings.data_dir, f"n-{index}", "a.mp4")
+        for index in range(3)
+    ]
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    assert all(
+        storage.claim_pipeline_input(settings.data_dir, meta["id"])
+        for meta in metas
+    )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+
+    def fake_pipeline_run(_settings, cid, _runner, **kwargs):
+        owner = kwargs["claimed_owner"]
+        assert storage.finish_input_claim(
+            settings.data_dir,
+            cid,
+            owner,
+            status="done",
+            error=None,
+            postprocess={"status": "running", "segments": []},
+        )
+
+    loop_ids = []
+    completed = threading.Event()
+    completed_count = 0
+    completed_lock = threading.Lock()
+
+    async def fake_postprocess_run_task(
+        _settings, _cid, _mediakit_sem, seedream_sem, **_kwargs,
+    ):
+        nonlocal completed_count
+        loop_ids.append(id(asyncio.get_running_loop()))
+        async with seedream_sem:
+            await asyncio.sleep(0.03)
+        with completed_lock:
+            completed_count += 1
+            if completed_count == len(metas):
+                completed.set()
+
+    monkeypatch.setattr(pipeline, "run", fake_pipeline_run)
+    monkeypatch.setattr(long_generation, "plan_receipt", lambda *_args: {})
+    monkeypatch.setattr(postprocess, "run_task", fake_postprocess_run_task)
+
+    with TestClient(create_app(settings)):
+        assert completed.wait(timeout=3)
+
+    assert len(loop_ids) == len(metas)
+    assert len(set(loop_ids)) == 1
+
+
 @pytest.mark.parametrize("frozen", ["generation", "receipt", "plan", "fit"])
 def test_startup_does_not_resume_stale_pipeline_after_input_freezes(
     tmp_path, monkeypatch, frozen,
