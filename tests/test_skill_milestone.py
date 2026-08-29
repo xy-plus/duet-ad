@@ -206,15 +206,10 @@ def test_pipeline_video_and_image_calls_consume_same_frozen_bytes(
     )
     assert seen_video == [frozen.read_bytes("video-maker")]
 
-    drifted_image_skill = tmp_path / "drifted-image-postprocess.md"
-    drifted_image_skill.write_bytes(b"drifted image-postprocess")
-    monkeypatch.setattr(image_optimization, "_SKILL", drifted_image_skill)
     seen_image = []
 
     def generate_project_prompts(*_args, **_kwargs):
-        seen_image.append(
-            image_optimization.verification_skill_path().read_bytes()
-        )
+        seen_image.append(_kwargs["skill_bytes"])
         return {"version": 4}, {}
 
     monkeypatch.setattr(

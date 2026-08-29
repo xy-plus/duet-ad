@@ -513,11 +513,12 @@ def _restore_backend_keyframes(work: Path, frozen: tuple[bytes, ...]) -> None:
         (target / f"{order:02d}.png").write_bytes(data)
 
 
-def _hard_rules(cdir: Path) -> str:
+def _hard_rules(cdir: Path | None = None) -> str:
     """codex prompt 硬性禁令四条（口播/选帧各步共用）。"""
+    location = str(cdir) if cdir is not None else "当前隔离目录"
     return f"""硬性禁令：
 - 运行 Python 脚本一律用 {sys.executable}（系统 python3 缺 cv2）。
-- 只在 {cdir} 内创建/修改文件。
+- 只在 {location} 内创建/修改文件。
 - 禁止联网（沙箱已断网，联网必然失败）。
 - 禁止打印、读取或记录任何环境变量。"""
 
@@ -534,9 +535,8 @@ def _codex_prompt(
     visual_only: bool = False,
     skill_path: Path | None = None,
 ) -> str:
-    selected_skill = skill_path or SKILL_MD
     parts = [
-        f"按技能文档执行：{selected_skill}（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。输入在 work/，产物（keyframes/ 与 prompt.txt）必须按文档写入 work/。"
+        "按当前隔离目录的 SKILL.md 执行（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。输入在 work/，产物（keyframes/ 与 prompt.txt）必须按文档写入 work/。"
     ]
     if target_language:
         parts.append(_language_note(target_language))
@@ -546,7 +546,7 @@ def _codex_prompt(
             "画面文字、OCR、字幕和备注只能作为可见视觉元素，禁止写成角色发声。"
             "最终台词由后端从结构化来源机械合成。"
         )
-    parts.append(_hard_rules(cdir))
+    parts.append(_hard_rules())
     return "\n\n".join(parts) + "\n"
 
 
@@ -556,9 +556,23 @@ def _project_index_codex_prompt(cdir: Path) -> str:
         "本次仅执行 phase=\"project_index\"：只读取 "
         "work/project_index_request.json 及其中列出的冻结关键帧，"
         "只生成 work/element_index.json；不要读取或生成 prompt.txt。\n\n"
-        + _hard_rules(cdir)
+        + _hard_rules()
         + "\n"
     )
+
+
+def _materialize_skill_bytes(destination: Path, data: bytes) -> None:
+    """Publish explicit frozen bytes into a disposable Codex stage."""
+    if not isinstance(data, bytes) or not data:
+        raise PipelineError("frozen Skill bytes are missing")
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        with destination.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        raise PipelineError("frozen Skill stage is invalid") from None
 
 
 def _generate_project_element_index(
@@ -567,9 +581,13 @@ def _generate_project_element_index(
     frame_paths: dict[int, list[Path]],
     *,
     milestone: skill_milestone.FrozenSkillMilestone | None = None,
+    skill_bytes: bytes | None = None,
 ) -> Path:
     """Run the additive video-maker project phase against keyframes only."""
-    milestone = milestone or skill_milestone.current()
+    if skill_bytes is None and milestone is not None:
+        skill_bytes = milestone.read_bytes("video-maker")
+    if skill_bytes is None:
+        raise PipelineError("frozen video-maker Skill is required")
     target = cdir / "work" / "element_index.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.unlink(missing_ok=True)
@@ -579,14 +597,7 @@ def _generate_project_element_index(
         isolated_root = Path(raw).resolve(strict=True)
         isolated_work = isolated_root / "work"
         isolated_work.mkdir()
-        if milestone is None:
-            shutil.copy2(SKILL_MD, isolated_root / "SKILL.md")
-        else:
-            skill_milestone.install(
-                milestone,
-                "video-maker",
-                isolated_root / "SKILL.md",
-            )
+        _materialize_skill_bytes(isolated_root / "SKILL.md", skill_bytes)
         segments = []
         for segment_index in sorted(frame_paths):
             frames = []
@@ -655,6 +666,47 @@ def _generate_project_element_index(
         return target
 
 
+def _copy_visual_regular(source: Path, destination: Path) -> None:
+    """Copy one immutable visual input without following a source symlink."""
+    fd = -1
+    try:
+        fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with os.fdopen(fd, "rb", closefd=False) as source_stream, destination.open("xb") as target:
+            shutil.copyfileobj(source_stream, target)
+            target.flush()
+            os.fsync(target.fileno())
+    except OSError:
+        raise PipelineError("visual isolated input is invalid") from None
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _copy_visual_tree(source: Path, destination: Path, *, skip: set[str]) -> None:
+    """Copy work/scripts inputs into a disposable stage; reject symlink entries."""
+    if not source.is_dir():
+        return
+    for candidate in sorted(source.rglob("*"), key=lambda item: str(item)):
+        relative = candidate.relative_to(source)
+        if relative.parts and relative.parts[0] in skip:
+            continue
+        if candidate.is_symlink():
+            raise PipelineError("visual isolated input contains a symlink")
+        target = destination / relative
+        if candidate.is_dir():
+            target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        elif candidate.is_file():
+            _copy_visual_regular(candidate, target)
+        else:
+            raise PipelineError("visual isolated input is invalid")
+
+
 def _run_visual_codex(
     runner,
     cdir: Path,
@@ -662,19 +714,67 @@ def _run_visual_codex(
     work: Path,
     *,
     isolate_dialogue: bool,
+    skill_bytes: bytes,
+    frozen_keyframes: tuple[bytes, ...] | None = None,
 ) -> None:
-    """新 H3 契约下让视觉 Codex 看不到 voice_lines，并丢弃它越权创建的同名文件。"""
-    voice_path = work / "voice_lines.json"
-    frozen_voice = voice_path.read_bytes() if isolate_dialogue and voice_path.is_file() else None
-    if isolate_dialogue:
-        voice_path.unlink(missing_ok=True)
-    try:
-        runner.run(cdir, prompt)
-    finally:
+    """Run visual Codex in a single-use /tmp stage and adopt only its outputs."""
+    if not callable(getattr(runner, "run_isolated", None)):
+        raise PipelineError("visual Codex isolation unavailable")
+    with tempfile.TemporaryDirectory(prefix="duet-visual-", dir="/tmp") as raw:
+        stage = Path(raw).resolve(strict=True)
+        stage_work = stage / "work"
+        stage_work.mkdir(mode=0o700)
+        _materialize_skill_bytes(stage / "SKILL.md", skill_bytes)
+        skip = {"keyframes", "prompt.txt", "codex_last_message.txt"}
         if isolate_dialogue:
-            voice_path.unlink(missing_ok=True)
-            if frozen_voice is not None:
-                voice_path.write_bytes(frozen_voice)
+            skip.add("voice_lines.json")
+        _copy_visual_tree(work, stage_work, skip=skip)
+        _copy_visual_tree(cdir / "scripts", stage / "scripts", skip=set())
+        stage_keyframes = stage_work / "keyframes"
+        stage_keyframes.mkdir(mode=0o700)
+        writable: list[Path] = []
+        if frozen_keyframes is not None:
+            if len(frozen_keyframes) != scene_planner.KEYFRAMES_PER_SEGMENT:
+                raise PipelineError("backend frozen keyframes are invalid")
+            for order, data in enumerate(frozen_keyframes, 1):
+                _materialize_skill_bytes(
+                    stage_keyframes / f"{order:02d}.png", data
+                )
+        else:
+            for order in range(1, scene_planner.KEYFRAMES_PER_SEGMENT + 1):
+                path = stage_keyframes / f"{order:02d}.png"
+                path.touch(mode=0o600)
+                writable.append(path)
+        stage_prompt = stage_work / "prompt.txt"
+        stage_prompt.touch(mode=0o600)
+        writable.insert(0, stage_prompt)
+        run_error: CodexError | None = None
+        try:
+            runner.run_isolated(
+                stage,
+                prompt,
+                session_dir=cdir,
+                writable_paths=tuple(writable),
+            )
+        except CodexError as error:
+            run_error = error
+        try:
+            names, text = validate_work_dir(
+                stage_work,
+                expected_keyframe_count=(
+                    scene_planner.KEYFRAMES_PER_SEGMENT
+                    if frozen_keyframes is not None else None
+                ),
+            )
+        except PipelineError:
+            if run_error is not None:
+                raise run_error from None
+            raise
+        _remove_local_path(work / "keyframes")
+        (work / "keyframes").mkdir(mode=0o700)
+        for name in names:
+            _copy_visual_regular(stage_work / "keyframes" / name, work / "keyframes" / name)
+        _materialize_skill_bytes(work / "prompt.txt", text.encode("utf-8"))
 
 
 def _clear_visual_outputs(
@@ -701,6 +801,7 @@ def _run_visual_attempt(
     *,
     isolate_dialogue: bool,
     frozen_keyframes: tuple[bytes, ...] | None = None,
+    skill_bytes: bytes | None = None,
 ) -> tuple[list[str], str]:
     """Run once, adopting complete outputs even when Codex exits abnormally."""
     _clear_visual_outputs(
@@ -714,6 +815,8 @@ def _run_visual_attempt(
             prompt,
             work,
             isolate_dialogue=isolate_dialogue,
+            skill_bytes=skill_bytes,
+            frozen_keyframes=frozen_keyframes,
         )
     except CodexError as exc:
         run_error = exc
@@ -747,6 +850,7 @@ def _run_visual_with_retry(
     isolate_dialogue: bool,
     step: str,
     frozen_keyframes: tuple[bytes, ...] | None = None,
+    skill_bytes: bytes | None = None,
 ) -> tuple[list[str], str]:
     policy = _retry_policy(settings)
     return run_with_retry(
@@ -757,6 +861,7 @@ def _run_visual_with_retry(
             work,
             isolate_dialogue=isolate_dialogue,
             frozen_keyframes=frozen_keyframes,
+            skill_bytes=skill_bytes,
         ),
         policy=policy,
         is_retryable=_retryable_operation_error,
@@ -986,8 +1091,15 @@ def _generate_image_optimization_project(
     step: str,
     element_index_path: Path | None = None,
     milestone: skill_milestone.FrozenSkillMilestone | None = None,
+    skill_bytes: bytes | None = None,
+    video_skill_bytes: bytes | None = None,
 ) -> tuple[dict | None, dict]:
-    milestone = milestone or skill_milestone.current()
+    if skill_bytes is None and milestone is not None:
+        skill_bytes = milestone.read_bytes("image-postprocess")
+    if video_skill_bytes is None and milestone is not None:
+        video_skill_bytes = milestone.read_bytes("video-maker")
+    if skill_bytes is None:
+        raise PipelineError("frozen image-postprocess Skill is required")
     if element_index_path is None:
         frame_paths = {
             segment["index"]: sorted(
@@ -997,17 +1109,11 @@ def _generate_image_optimization_project(
             )
             for segment in segments
         }
-        if milestone is None:
-            element_index_path = _generate_project_element_index(
-                runner, session_dir, frame_paths,
-            )
-        else:
-            # Keep this seam callable by existing narrow test/worker adapters
-            # while explicitly carrying the same milestone through context.
-            with skill_milestone.activate(milestone):
-                element_index_path = _generate_project_element_index(
-                    runner, session_dir, frame_paths,
-                )
+        if video_skill_bytes is None:
+            raise PipelineError("frozen video-maker Skill is required")
+        element_index_path = _generate_project_element_index(
+            runner, session_dir, frame_paths, skill_bytes=video_skill_bytes,
+        )
     policy = _retry_policy(settings)
 
     def attempt() -> tuple[dict | None, dict]:
@@ -1017,24 +1123,13 @@ def _generate_image_optimization_project(
                 "expected_version": 4,
             }
             kwargs["element_index_path"] = element_index_path
-            if milestone is None:
-                return image_optimization.generate_project_prompts(
-                    runner,
-                    segments,
-                    settings.seedream_edit_mode,
-                    **kwargs,
-                )
-            with skill_milestone.bind_module_skill(
-                milestone,
-                "image-postprocess",
-                image_optimization,
-            ):
-                return image_optimization.generate_project_prompts(
-                    runner,
-                    segments,
-                    settings.seedream_edit_mode,
-                    **kwargs,
-                )
+            return image_optimization.generate_project_prompts(
+                runner,
+                segments,
+                settings.seedream_edit_mode,
+                skill_bytes=skill_bytes,
+                **kwargs,
+            )
         except image_optimization.ImageOptimizationOutputError as exc:
             raise PipelineError(str(exc), retryable=True) from None
         except ValueError:
@@ -1064,8 +1159,12 @@ def _generate_segmented_image_prompts(
     session_dir: Path,
     element_index_path: Path | None = None,
     milestone: skill_milestone.FrozenSkillMilestone | None = None,
+    skill_bytes: bytes | None = None,
 ) -> tuple[dict, dict]:
-    milestone = milestone or skill_milestone.current()
+    if skill_bytes is None and milestone is not None:
+        skill_bytes = milestone.read_bytes("image-postprocess")
+    if skill_bytes is None:
+        raise PipelineError("frozen image-postprocess Skill is required")
     frame_paths = {}
     for segment, meta in zip(segments, seg_metas):
         directory = work / "segments" / str(segment["index"]) / "work" / "keyframes"
@@ -1117,15 +1216,9 @@ def _generate_segmented_image_prompts(
     }
     if element_index_path is not None:
         kwargs["element_index_path"] = element_index_path
-    if milestone is None:
-        continuity, prompts = _generate_image_optimization_project(
-            settings, runner, specs, **kwargs,
-        )
-    else:
-        with skill_milestone.activate(milestone):
-            continuity, prompts = _generate_image_optimization_project(
-                settings, runner, specs, **kwargs,
-            )
+    continuity, prompts = _generate_image_optimization_project(
+        settings, runner, specs, skill_bytes=skill_bytes, **kwargs,
+    )
     if continuity is None:
         raise PipelineError("image continuity was not generated")
     if continuity.get("version") not in {3, 4}:
@@ -2138,6 +2231,7 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
                      *, new_input_contract: bool = False,
                      keyframe_selection: list[dict] | None = None,
                      milestone: skill_milestone.FrozenSkillMilestone | None = None,
+                     skill_bytes: bytes | None = None,
                      ) -> dict:
     """单段完整流程：切段 → 抽帧 → 写该段台词 → codex（cwd=段目录）→ 校验 → 后端加前缀。
 
@@ -2146,7 +2240,10 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
     段外内容）；scripts/ 拷入段目录（裁剪工具按相对路径引用），scenes.json 不拷入。
     任一失败包装为 PipelineError 并指明段号；返回 meta.segments 条目。
     """
-    milestone = milestone or skill_milestone.current()
+    if skill_bytes is None and milestone is not None:
+        skill_bytes = milestone.read_bytes("video-maker")
+    if skill_bytes is None:
+        raise PipelineError("frozen video-maker Skill is required")
     index = seg["index"]
     segdir = work / "segments" / str(index)
     segwork = segdir / "work"
@@ -2177,9 +2274,6 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             segdir,
             target_language,
             visual_only=new_input_contract,
-            skill_path=(
-                milestone.path("video-maker") if milestone is not None else None
-            ),
         )
         if frozen_keyframes is not None:
             visual_request += (
@@ -2195,6 +2289,7 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             isolate_dialogue=new_input_contract,
             step=f"segment {index} visual codex",
             frozen_keyframes=frozen_keyframes,
+            skill_bytes=skill_bytes,
         )
         visual_prompt = prompt
         if new_input_contract:
@@ -2645,6 +2740,7 @@ def _publish_prompt_fusion_manifest(
     meta: Mapping,
     state: Mapping,
     milestone: skill_milestone.FrozenSkillMilestone | None = None,
+    skill_bytes: bytes | None = None,
 ) -> tuple[long_generation.FrozenPromptFusion, bytes]:
     """Revalidate frozen fusion authorities and publish the manifest last."""
     work = root / "work"
@@ -2653,20 +2749,21 @@ def _publish_prompt_fusion_manifest(
     frozen_skill_path = work / PROMPT_FUSION_FROZEN_SKILL_FILENAME
     manifest_path = work / h3_project.SOURCE_FILENAME
     if milestone is None:
-        milestone_manifest = root / skill_milestone.MANIFEST_RELATIVE_PATH
-        if milestone_manifest.exists():
+        try:
             milestone = skill_milestone.load(root)
+        except skill_milestone.SkillMilestoneError as exc:
+            raise PipelineError(f"skill milestone unavailable: {exc}") from None
+    frozen_skill_bytes = milestone.read_bytes("video-prompt-fusion")
+    if skill_bytes is not None and skill_bytes != frozen_skill_bytes:
+        raise PipelineError("prompt fusion Skill bytes do not match CID milestone")
+    skill_bytes = frozen_skill_bytes
     try:
         input_data = input_path.read_bytes()
-        if milestone is None:
-            source_skill_data = PROMPT_FUSION_SKILL_MD.read_bytes()
-            frozen_skill_data = frozen_skill_path.read_bytes()
-        else:
-            source_skill_data = milestone.read_bytes("video-prompt-fusion")
-            # Keep the existing prompt-fusion manifest's local binding, while
-            # sourcing its bytes from the common CID milestone.
-            _atomic_bytes(frozen_skill_path, source_skill_data)
-            frozen_skill_data = frozen_skill_path.read_bytes()
+        source_skill_data = skill_bytes
+        # Keep the existing prompt-fusion manifest's local binding, while
+        # sourcing its bytes from the common CID milestone.
+        _atomic_bytes(frozen_skill_path, source_skill_data)
+        frozen_skill_data = frozen_skill_path.read_bytes()
     except OSError:
         raise PipelineError("prompt fusion frozen authority is missing") from None
     if hashlib.sha256(input_data).hexdigest() != state.get("input_sha256"):
@@ -2733,7 +2830,7 @@ def _publish_prompt_fusion_manifest(
     try:
         long_generation.load_prompt_fusion_manifest(
             root=root,
-            skill_source_path=(None if milestone is not None else PROMPT_FUSION_SKILL_MD),
+            skill_source_path=None,
         )
     except long_generation.LongGenerationError as exc:
         if not manifest_existed:
@@ -2748,26 +2845,14 @@ def _publish_prompt_fusion_manifest(
 
 def _project_skill_milestone(
     root: Path,
-) -> skill_milestone.FrozenSkillMilestone | None:
-    """Load the CID Skill milestone, creating it only for the live pipeline.
-
-    ``produce_prompt_fusion`` is also callable as a narrow worker entry point,
-    so it cannot assume that ``run`` already performed the pre-Skill freeze.
-    A project manifest is authoritative whenever present.  The canonical
-    source tree is used only when this worker is the first Skill entry point;
-    test/operator-supplied Skill paths retain the legacy isolated behavior.
-    """
-    manifest_path = root / skill_milestone.MANIFEST_RELATIVE_PATH
-    if manifest_path.exists():
-        try:
-            return skill_milestone.load(root)
-        except skill_milestone.SkillMilestoneError as exc:
-            raise PipelineError(f"skill milestone invalid: {exc}") from None
-    canonical = (ROOT / "skills" / "video-prompt-fusion" / "SKILL.md").resolve()
-    if PROMPT_FUSION_SKILL_MD.resolve() != canonical:
-        return None
+    *, ensure: bool = False,
+) -> skill_milestone.FrozenSkillMilestone:
+    """Use the CID freeze; only the first research entry point may publish it."""
     try:
-        return skill_milestone.ensure(root, repository_root=ROOT)
+        return (
+            skill_milestone.ensure(root, repository_root=ROOT)
+            if ensure else skill_milestone.load(root)
+        )
     except skill_milestone.SkillMilestoneError as exc:
         raise PipelineError(f"skill milestone unavailable: {exc}") from None
 
@@ -2909,7 +2994,13 @@ def finalize_prompt_fusion_receipt(
     return "done"
 
 
-def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
+def produce_prompt_fusion(
+    settings: Settings,
+    cid: str,
+    runner,
+    *,
+    skill_bytes: bytes | None = None,
+) -> str:
     """Run video-prompt-fusion once and publish its production manifest last."""
     root = (settings.data_dir / cid).resolve()
     work = root / "work"
@@ -2946,22 +3037,20 @@ def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
     frozen_skill_path = work / PROMPT_FUSION_FROZEN_SKILL_FILENAME
     manifest_path = work / h3_project.SOURCE_FILENAME
     try:
-        milestone = _project_skill_milestone(root)
-        if milestone is not None:
-            storage.update_meta(
-                settings.data_dir,
-                cid,
-                skill_milestone=milestone.public_summary(),
-            )
+        milestone = _project_skill_milestone(root, ensure=True)
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            skill_milestone=milestone.public_summary(),
+        )
         input_data = input_path.read_bytes()
         if hashlib.sha256(input_data).hexdigest() != state.get("input_sha256"):
             raise PipelineError("prompt fusion input drifted")
         input_payload = _require_prompt_fusion_v2_input(input_data)
-        skill_data = (
-            milestone.read_bytes("video-prompt-fusion")
-            if milestone is not None
-            else PROMPT_FUSION_SKILL_MD.read_bytes()
-        )
+        frozen_skill_data = milestone.read_bytes("video-prompt-fusion")
+        if skill_bytes is not None and skill_bytes != frozen_skill_data:
+            raise PipelineError("prompt fusion Skill bytes do not match CID milestone")
+        skill_data = frozen_skill_data
         if not skill_data:
             raise PipelineError("prompt fusion Skill is missing")
         if not callable(getattr(runner, "run_isolated", None)):
@@ -3033,6 +3122,7 @@ def produce_prompt_fusion(settings: Settings, cid: str, runner) -> str:
             meta=persisted_meta,
             state=state,
             milestone=milestone,
+            skill_bytes=skill_data,
         )
         persist(
             "done",
@@ -3065,21 +3155,21 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
         if not sources:
             raise PipelineError("source video missing")
         source = sources[0]
+        # Every research pipeline entry point publishes the CID freeze before
+        # any Skill call.  Extraction and probing are backend operations and
+        # do not alter this ordering.
+        milestone = skill_milestone.ensure(cdir, repository_root=ROOT)
+        meta = storage.update_meta(
+            settings.data_dir,
+            cid,
+            skill_milestone=milestone.public_summary(),
+        ) or meta
+        video_skill_bytes = milestone.read_bytes("video-maker")
+        image_skill_bytes = milestone.read_bytes("image-postprocess")
         # Reject an invalid/oversized new contract before extraction, ASR, Codex,
         # or any later provider can observe the input.
         new_input_contract = "dialogue_mode" in meta and meta.get("duration_s") is not None
         if new_input_contract:
-            # Freeze all three research Skills before the first Skill call.
-            # Extraction below is a backend operation, not a Skill call.
-            milestone = skill_milestone.ensure(
-                cdir,
-                repository_root=ROOT,
-            )
-            meta = storage.update_meta(
-                settings.data_dir,
-                cid,
-                skill_milestone=milestone.public_summary(),
-            ) or meta
             try:
                 source_probe = storage.probe_video(source)
                 probed_duration = source_probe.duration_s
@@ -3207,25 +3297,20 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             # 单段模式：work/keyframes + work/prompt.txt，不注入 workaround 前缀；
             # 裁剪工具以 scripts/crop_image.py 相对工作目录引用，scripts/ 拷进会话目录
             _replace_scripts(cdir, cdir)
-            with skill_milestone.activate(milestone):
-                keyframes, prompt = _run_visual_with_retry(
-                    settings,
-                    runner,
+            keyframes, prompt = _run_visual_with_retry(
+                settings,
+                runner,
+                cdir,
+                _codex_prompt(
                     cdir,
-                    _codex_prompt(
-                        cdir,
-                        translate_lang,
-                        visual_only=new_input_contract,
-                        skill_path=(
-                            milestone.path("video-maker")
-                            if milestone is not None
-                            else None
-                        ),
-                    ),
-                    work,
-                    isolate_dialogue=new_input_contract,
-                    step="visual codex",
-                )
+                    translate_lang,
+                    visual_only=new_input_contract,
+                ),
+                work,
+                isolate_dialogue=new_input_contract,
+                step="visual codex",
+                skill_bytes=video_skill_bytes,
+            )
             if new_input_contract:
                 frame_paths = [work / "keyframes" / name for name in keyframes]
                 transition_skeleton = _frame_inventory(
@@ -3234,20 +3319,21 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                         0: {"chain_id": "short-000", "join_mode": "hard_cut"},
                     },
                 )
-                with skill_milestone.activate(milestone):
-                    continuity, image_prompts = _generate_image_optimization_project(
-                        settings,
-                        runner,
-                        [{
-                            "index": 0,
-                            "chain_id": "short-000",
-                            "join_mode": "hard_cut",
-                            "keyframes_dir": work / "keyframes",
-                            "transition_skeleton": transition_skeleton,
-                        }],
-                        session_dir=cdir,
-                        step="project image postprocess codex",
-                    )
+                continuity, image_prompts = _generate_image_optimization_project(
+                    settings,
+                    runner,
+                    [{
+                        "index": 0,
+                        "chain_id": "short-000",
+                        "join_mode": "hard_cut",
+                        "keyframes_dir": work / "keyframes",
+                        "transition_skeleton": transition_skeleton,
+                    }],
+                    session_dir=cdir,
+                    step="project image postprocess codex",
+                    skill_bytes=image_skill_bytes,
+                    video_skill_bytes=video_skill_bytes,
+                )
                 if continuity is None or set(image_prompts) != {0}:
                     raise PipelineError("image optimization output is missing or invalid")
                 if continuity.get("version") not in {3, 4}:
@@ -3339,26 +3425,24 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             workers = min(len(segments), max(1, settings.codex_concurrency // 2))
 
             def process_segment(seg: dict) -> dict:
-                # Context variables do not propagate into new executor threads;
-                # bind the same CID milestone explicitly for each worker.
-                with skill_milestone.activate(milestone):
-                    return _process_segment(
-                        settings,
-                        work,
-                        source,
-                        seg,
-                        runner,
-                        lines_by_seg.get(seg["index"])
-                        if lines_by_seg is not None
-                        else None,
-                        translate_lang,
-                        new_input_contract=new_input_contract,
-                        **(
-                            {"keyframe_selection": backend_keyframe_selections[seg["index"]]}
-                            if seg["index"] in backend_keyframe_selections
-                            else {}
-                        ),
-                    )
+                return _process_segment(
+                    settings,
+                    work,
+                    source,
+                    seg,
+                    runner,
+                    lines_by_seg.get(seg["index"])
+                    if lines_by_seg is not None
+                    else None,
+                    translate_lang,
+                    new_input_contract=new_input_contract,
+                    skill_bytes=video_skill_bytes,
+                    **(
+                        {"keyframe_selection": backend_keyframe_selections[seg["index"]]}
+                        if seg["index"] in backend_keyframe_selections
+                        else {}
+                    ),
+                )
 
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 seg_metas = list(pool.map(process_segment, segments))
@@ -3370,15 +3454,16 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             image_prompts: dict[int, str] | None = None
             continuity: dict | None = None
             if new_input_contract:
-                with skill_milestone.activate(milestone):
-                    continuity, image_prompts = _generate_segmented_image_prompts(
-                        settings,
-                        runner,
-                        segments,
-                        seg_metas,
-                        work,
-                        session_dir=cdir,
-                    )
+                continuity, image_prompts = _generate_segmented_image_prompts(
+                    settings,
+                    runner,
+                    segments,
+                    seg_metas,
+                    work,
+                    session_dir=cdir,
+                    skill_bytes=image_skill_bytes,
+                    milestone=milestone,
+                )
             changes: dict = {"status": "done", "segments": seg_metas}
             if new_input_contract:
                 receipt_segments = []

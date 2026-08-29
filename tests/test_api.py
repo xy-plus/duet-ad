@@ -100,10 +100,13 @@ def test_detail_skill_milestone_reads_cid_frozen_manifest_after_live_source_drif
     assert response.status_code == 200
     summary = response.json()["skill_milestone"]
     assert summary == frozen.public_summary()
-    assert summary["milestone_id"] == frozen.milestone_id
+    assert summary["id"] == frozen.milestone_id
     assert [item["name"] for item in summary["skills"]] == list(
         skill_milestone.SKILL_NAMES
     )
+    assert all(set(item) == {"name", "sha256", "size"} for item in summary["skills"])
+    assert "source_path" not in json.dumps(summary)
+    assert "frozen_path" not in json.dumps(summary)
 
 
 @pytest.mark.parametrize(

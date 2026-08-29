@@ -29,8 +29,6 @@ _LOGGER = logging.getLogger(__name__)
 MAX_PROMPT_BYTES = 32 * 1024
 MAX_CONTINUITY_BYTES = 32 * 1024
 MAX_PROJECT_OUTPUT_OVERHEAD_BYTES = 64 * 1024
-_ROOT = Path(__file__).resolve().parents[1]
-_SKILL = _ROOT / "skills" / "image-postprocess" / "SKILL.md"
 PALETTE_METRIC_ALGORITHM = "area-weighted-cie-lab-hsv-v1"
 PALETTE_METRIC_THRESHOLDS = {
     "lab_b_star_neutral": 128.0,
@@ -110,20 +108,54 @@ class ImageOptimizationIneligibleError(ValueError):
         self.reason = reason
 
 
-def verification_skill_path() -> Path:
-    """Resolve the shared plan/verify Skill without accepting a symlink."""
+def _skill_bytes(
+    *, skill_bytes: bytes | None = None, skill_path: Path | None = None
+) -> bytes:
+    """Return an explicitly supplied frozen Skill, never the live worktree."""
+    if (skill_bytes is None) == (skill_path is None):
+        raise ValueError("frozen image verification skill is required")
+    if skill_bytes is not None:
+        if not isinstance(skill_bytes, bytes) or not skill_bytes:
+            raise ValueError("invalid image verification skill")
+        return skill_bytes
+    assert skill_path is not None
+    path = Path(skill_path)
     try:
-        info = _SKILL.lstat()
-        resolved = _SKILL.resolve(strict=True)
+        info = path.lstat()
+        resolved = path.resolve(strict=True)
+        if (
+            not path.is_absolute()
+            or resolved != path
+            or stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+        ):
+            raise ValueError("invalid image verification skill")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except (AttributeError, OSError, ValueError):
+        raise ValueError("invalid image verification skill") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("invalid image verification skill")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read()
+    except (OSError, ValueError):
+        raise ValueError("invalid image verification skill") from None
+    finally:
+        os.close(fd)
+    if not data:
+        raise ValueError("invalid image verification skill")
+    return data
+
+
+def _write_skill_stage(data: bytes, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        with destination.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
     except OSError:
         raise ValueError("invalid image verification skill") from None
-    if (
-        stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISREG(info.st_mode)
-        or resolved != _SKILL
-    ):
-        raise ValueError("invalid image verification skill")
-    return resolved
 
 
 def sha256(text: str) -> str:
@@ -3641,6 +3673,8 @@ def generate_project_prompts(
     session_dir: Path,
     expected_version: int = 4,
     element_index_path: Path | None = None,
+    skill_bytes: bytes | None = None,
+    skill_path: Path | None = None,
 ) -> tuple[dict, dict]:
     """Plan globally from contact sheets, then describe source frames per segment."""
     if edit_mode not in SEEDREAM_EDIT_MODES or expected_version not in {2, 3, 4}:
@@ -3648,9 +3682,7 @@ def generate_project_prompts(
     session, indices, prepared = _project_segment_inputs(
         segments, session_dir, expected_version=expected_version,
     )
-    skill = verification_skill_path()
-    if not skill.is_file():
-        raise ValueError("invalid image optimization segments")
+    skill = _skill_bytes(skill_bytes=skill_bytes, skill_path=skill_path)
     element_index = None
     if element_index_path is not None:
         try:
@@ -3676,7 +3708,7 @@ def generate_project_prompts(
     with tempfile.TemporaryDirectory(prefix="duet-image-global-", dir="/tmp") as raw:
         stage = Path(raw).resolve(strict=True)
         work = stage / "work"
-        _copy_regular(skill, stage / "SKILL.md")
+        _write_skill_stage(skill, stage / "SKILL.md")
         for segment, frames in prepared:
             destination = work / "contact_sheets" / f"segment-{segment['index']:04d}.jpg"
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -3722,7 +3754,7 @@ def generate_project_prompts(
             work = stage / "work"
             destination = work / "keyframes"
             destination.mkdir(parents=True, mode=0o700)
-            _copy_regular(skill, stage / "SKILL.md")
+            _write_skill_stage(skill, stage / "SKILL.md")
             for frame in frames:
                 _copy_regular(frame, destination / frame.name)
             (work / "global_plan.json").write_text(
@@ -3984,11 +4016,13 @@ def generate_plan_audit_verdict(
     segments: list[dict],
     *,
     session_dir: Path,
+    skill_bytes: bytes | None = None,
+    skill_path: Path | None = None,
 ) -> dict:
     """Audit only frozen source frames before any provider submission."""
     try:
         session = Path(session_dir).resolve(strict=True)
-        skill = verification_skill_path()
+        skill = _skill_bytes(skill_bytes=skill_bytes, skill_path=skill_path)
         canonical_plan, receipt = _canonical_plan_audit_inputs(plan, audit_inputs)
     except (OSError, TypeError, ValueError, ImageOptimizationOutputError):
         raise ValueError("invalid image plan audit input") from None
@@ -4042,7 +4076,7 @@ def generate_plan_audit_verdict(
         stage = Path(raw).resolve(strict=True)
         work = stage / "work"
         work.mkdir(parents=True, mode=0o700)
-        _copy_regular(skill, stage / "SKILL.md")
+        _write_skill_stage(skill, stage / "SKILL.md")
         (work / "request.json").write_text(
             json.dumps(
                 {
@@ -4618,11 +4652,13 @@ def generate_reference_pack_verdict(
     deterministic_metrics: dict,
     *,
     session_dir: Path,
+    skill_bytes: bytes | None = None,
+    skill_path: Path | None = None,
 ) -> dict:
     """Run semantic replacement-pack verification in an isolated workspace."""
     try:
         session = Path(session_dir).resolve(strict=True)
-        skill = verification_skill_path()
+        skill = _skill_bytes(skill_bytes=skill_bytes, skill_path=skill_path)
     except (OSError, TypeError, ValueError):
         raise ValueError("invalid reference pack verification input") from None
     canonical_plan = _canonical_plan(plan)
@@ -4653,7 +4689,7 @@ def generate_reference_pack_verdict(
         stage = Path(raw).resolve(strict=True)
         work = stage / "work"
         work.mkdir(parents=True, mode=0o700)
-        _copy_regular(skill, stage / "SKILL.md")
+        _write_skill_stage(skill, stage / "SKILL.md")
         digest = plan_sha256(canonical_plan)
         (work / "request.json").write_text(
             json.dumps(
@@ -5025,11 +5061,13 @@ def generate_project_verdict(
     deterministic_metrics: dict,
     *,
     session_dir: Path,
+    skill_bytes: bytes | None = None,
+    skill_path: Path | None = None,
 ) -> dict:
     """Run verify in an isolated workspace and return a strict verdict."""
     try:
         session = Path(session_dir).resolve(strict=True)
-        skill = verification_skill_path()
+        skill = _skill_bytes(skill_bytes=skill_bytes, skill_path=skill_path)
     except OSError:
         raise ValueError("invalid image verification input") from None
     canonical_plan = _canonical_plan(plan)
@@ -5080,7 +5118,7 @@ def generate_project_verdict(
         stage = Path(raw).resolve(strict=True)
         work = stage / "work"
         work.mkdir(parents=True, mode=0o700)
-        _copy_regular(skill, stage / "SKILL.md")
+        _write_skill_stage(skill, stage / "SKILL.md")
         (work / "request.json").write_text(
             json.dumps(
                 {

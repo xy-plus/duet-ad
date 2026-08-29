@@ -15,7 +15,7 @@ from pathlib import Path
 
 import cv2
 
-from app import image_optimization, mediakit, seedream, storage
+from app import image_optimization, mediakit, seedream, skill_milestone, storage
 from app.config import Settings
 from app.sanitize import sanitize
 
@@ -2124,7 +2124,10 @@ async def _v4_verify_bootstrap_packs(
     grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
     runner, bootstrap_outputs: dict[tuple[int, int], Path],
     anchor_receipts: list[dict],
-    *, label: str, scene_alternates: dict[str, tuple[tuple[int, int], Path]] | None = None,
+    *,
+    label: str,
+    scene_alternates: dict[str, tuple[tuple[int, int], Path]] | None = None,
+    skill_bytes: bytes,
 ) -> dict:
     """Use independently generated target views; never duplicate one image as a pack."""
     if not callable(getattr(runner, "run_isolated", None)):
@@ -2237,6 +2240,7 @@ async def _v4_verify_bootstrap_packs(
             scene_packs,
             metrics,
             session_dir=cdir,
+            skill_bytes=skill_bytes,
         )
     except Exception:
         raise PostprocessError(409, "image_reference_pack_failed") from None
@@ -2439,6 +2443,7 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
 async def _run_v4_task(
     settings: Settings, cid: str, cdir: Path, meta: dict, private: dict,
     grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
+    *, skill_bytes: bytes,
 ) -> None:
     plan = _v4_frozen_plan(meta, private)
     sources = _v4_frame_sources(grouped, private)
@@ -2503,6 +2508,14 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         )
         return
     options = private["options"]
+    frozen_image_skill: bytes | None = None
+    if options["optimize_image"]:
+        try:
+            milestone = skill_milestone.load(cdir)
+            frozen_image_skill = milestone.read_bytes("image-postprocess")
+        except skill_milestone.SkillMilestoneError:
+            _mark_image_verification_failed(settings, cid, set())
+            return
     # Both V3 and V4 are receipt-bound verification contracts.  Only legacy
     # V2 may use the old immediate per-frame publication path.
     defer_v3_publish = options["optimize_image"] and private["version"] in {3, 4}
@@ -2555,6 +2568,7 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         try:
             await _run_v4_task(
                 settings, cid, cdir, meta, runtime_private, runtime_grouped, seedream_sem,
+                skill_bytes=frozen_image_skill,
             )
         except asyncio.CancelledError:
             raise

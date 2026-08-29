@@ -1015,6 +1015,26 @@ function videoSection(detail, file, title, sub) {
   return sec;
 }
 
+/* 研究链路只展示 CID 已冻结的只读 Skill 摘要；不渲染任何本机路径。 */
+function skillMilestoneSection(detail) {
+  const milestone = detail && detail.skill_milestone;
+  if (!milestone || typeof milestone.id !== "string" || !milestone.id) return null;
+  const skills = Array.isArray(milestone.skills) ? milestone.skills : [];
+  if (skills.length !== 3) return null;
+  const section = el("section", "res-section");
+  section.dataset.testid = "skill-milestone";
+  section.appendChild(el("h3", "res-h3", "Skill 里程碑"));
+  section.appendChild(el("p", "milestone-id", milestone.id));
+  const list = el("ul", "milestone-skills");
+  for (const skill of skills) {
+    if (!skill || typeof skill.name !== "string"
+        || typeof skill.sha256 !== "string" || !Number.isInteger(skill.size)) return null;
+    list.appendChild(el("li", null, skill.name + " · " + skill.sha256 + " · " + skill.size + " B"));
+  }
+  section.appendChild(list);
+  return section;
+}
+
 function renderResults(detail) {
   const frag = document.createDocumentFragment();
 
@@ -1025,6 +1045,9 @@ function renderResults(detail) {
   doneCard.appendChild(el("p", "ac-sub", "关键帧与提示词已生成，可直接复制使用"));
   headRow.appendChild(doneCard);
   frag.appendChild(headRow);
+
+  const milestone = skillMilestoneSection(detail);
+  if (milestone) frag.appendChild(milestone);
 
   // 原始视频（上传即存在，与生成物明确分区）
   if (detail.has_source) {
