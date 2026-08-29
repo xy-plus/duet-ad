@@ -3091,13 +3091,7 @@ def _freeze_segment_context_ir(
     segment: FrozenSegment,
     source_request: h3.H3Request,
 ) -> context_ir_bridge.FrozenContextIrRequest:
-    if (
-        not getattr(settings, "minimax_api_key", "")
-        and (
-            plan.prompt_fusion is None
-            or plan.prompt_fusion.version != PROMPT_FUSION_VERSION
-        )
-    ):
+    if not getattr(settings, "minimax_api_key", ""):
         raise LongGenerationError("context_ir_credential_missing", 503)
     try:
         return h3_project.freeze_context_ir(
