@@ -750,6 +750,15 @@ def _run_visual_codex(
         stage_work.mkdir(mode=0o700)
         _materialize_skill_bytes(stage / "SKILL.md", skill_bytes)
         skip = {"keyframes", "prompt.txt", "codex_last_message.txt"}
+        if frozen_keyframes is not None:
+            # Current projects arrive with nine server-selected keyframes.
+            # Keep the contact sheets as a cheap overview, but do not expose
+            # every 4-fps extraction to the visual model as a second image set.
+            skip.update(
+                candidate.name
+                for candidate in work.glob("*_frame_*.png")
+                if candidate.is_file()
+            )
         if isolate_dialogue:
             skip.add("voice_lines.json")
         _copy_visual_tree(work, stage_work, skip=skip)

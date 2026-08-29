@@ -429,12 +429,16 @@ def test_visual_analyzer_receives_half_resolution_proxies_and_restores_originals
     ok, encoded = cv2.imencode(".png", source)
     assert ok
     frozen = tuple(encoded.tobytes() for _index in range(9))
+    (work / "01_frame_000.000s.png").write_bytes(encoded.tobytes())
+    (work / "contact_sheet_01.jpg").write_bytes(b"overview")
 
     class InspectingRunner:
         def run_isolated(
             self, stage, _prompt, *, session_dir, writable_paths,
         ):
             assert session_dir == cdir
+            assert not list((stage / "work").glob("*_frame_*.png"))
+            assert (stage / "work" / "contact_sheet_01.jpg").read_bytes() == b"overview"
             for order in range(1, 10):
                 data = (stage / "work" / "keyframes" / f"{order:02d}.png").read_bytes()
                 image = cv2.imdecode(
