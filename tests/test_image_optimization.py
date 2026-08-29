@@ -2933,3 +2933,56 @@ def test_v3_publish_does_not_create_in_band_acceptance(
             latest,
             sorted((cdir / "work" / "keyframes").glob("*.png")),
         )
+def test_semantic_scene_uses_dominant_segment_occurrence_not_lexical_first(
+    tmp_path,
+):
+    frames = []
+    skeleton = []
+    for order in range(1, 10):
+        path = tmp_path / f"{order:02d}.png"
+        path.write_bytes(_png(value=order))
+        frames.append(path)
+        skeleton.append({
+            "segment_index": 1,
+            "frame_index": order,
+            "frame_name": path.name,
+            "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "source_transition_from_previous": "start" if order == 1 else "same_camera",
+            "source_transition_evidence_sha256": "a" * 64,
+        })
+    specs = [{
+        "index": 1,
+        "chain_id": "chain-001",
+        "join_mode": "hard_cut",
+        "transition_skeleton": skeleton,
+    }]
+    element_index = {
+        "people": {},
+        "entities": {},
+        "scenes": {
+            "a-local-detail": {
+                "occurrences": [{"segment_index": 1, "frame_orders": [7]}],
+            },
+            "z-dominant-room": {
+                "occurrences": [{
+                    "segment_index": 1,
+                    "frame_orders": [1, 2, 3, 4, 5, 6, 8, 9],
+                }],
+            },
+        },
+    }
+
+    slots = image_optimization._semantic_slots(
+        specs, source_frames={1: frames}, element_index=element_index,
+    )
+    assert [scene["key"] for scene in slots["scenes"]] == ["z-dominant-room"]
+    assert {frame["scene_key"] for frame in slots["frames"]} == {
+        "z-dominant-room"
+    }
+    plan, _diagnostics = image_optimization.compile_semantic_plan(
+        {"people": {}, "entities": {}, "scenes": {}, "frames": {}},
+        specs,
+        source_frames={1: frames},
+        element_index=element_index,
+    )
+    assert plan["eligible"] is True

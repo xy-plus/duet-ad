@@ -1659,16 +1659,21 @@ def _semantic_slots(
     )
 
     def indexed_scene_key(segment_index: int) -> str | None:
-        matches = [
-            stable_key
-            for stable_key, item in indexed_scenes.items()
-            if any(
-                occurrence.get("segment_index") == segment_index
-                for occurrence in item.get("occurrences", [])
-                if isinstance(occurrence, dict)
-            )
-        ]
-        return sorted(matches)[0] if matches else None
+        matches: list[tuple[int, str]] = []
+        for stable_key, item in indexed_scenes.items():
+            segment_frames = 0
+            for occurrence in item.get("occurrences", []):
+                if not isinstance(occurrence, dict):
+                    continue
+                frame_orders = occurrence.get("frame_orders")
+                if (
+                    occurrence.get("segment_index") == segment_index
+                    and isinstance(frame_orders, list)
+                ):
+                    segment_frames += len(frame_orders)
+            if segment_frames:
+                matches.append((segment_frames, stable_key))
+        return sorted(matches, key=lambda item: (-item[0], item[1]))[0][1] if matches else None
 
     for segment in segment_specs:
         if not isinstance(segment, dict):
@@ -1697,7 +1702,6 @@ def _semantic_slots(
         next(
             item for item in scene_slots if item["key"] == scene_key
         )["segment_indices"].append(index)
-
         skeleton = segment.get("transition_skeleton")
         paths = None if source_frames is None else source_frames.get(index)
         if not isinstance(skeleton, list) or not skeleton:
