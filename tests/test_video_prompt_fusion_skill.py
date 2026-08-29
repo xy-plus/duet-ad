@@ -290,6 +290,17 @@ def test_interval_ledger_closes_current_bindings_and_audio_scope():
         assert required in text
 
 
+def test_terminal_state_requires_last_frame_evidence():
+    text = _skill()
+
+    for required in (
+        "终态只在区间最后帧直接可见且上一帧支持方向时写",
+        "不得由旧提示词补出",
+        "末帧仍有运动/残留时停在最后可见状态",
+    ):
+        assert required in text
+
+
 def test_people_and_entity_instance_counts_are_closed_by_new_frames():
     text = _skill()
 
