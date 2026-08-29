@@ -325,6 +325,25 @@ def test_skill_matches_runtime_semantic_enum_boundary_and_stays_short():
     assert len(skill.encode("utf-8")) <= 7 * 1024
 
 
+def test_skill_scopes_hard_cut_blur_and_edge_fragments_to_current_pixels():
+    skill, _example = _skill_contract()
+
+    for rule in (
+        "transition_skeleton",
+        "hard_cut",
+        "相邻帧",
+        "强运动模糊",
+        "edge_fragment",
+        "全局参考",
+        "补头",
+        "补人",
+        "补衣服",
+        "本帧直接可见像素",
+    ):
+        assert rule in skill
+    assert len(skill.splitlines()) <= 52
+
+
 def _element_index() -> dict:
     return {
         "people": {

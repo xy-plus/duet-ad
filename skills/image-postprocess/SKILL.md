@@ -9,7 +9,7 @@ description: 读取冻结关键帧和全视频稳定元素索引，生成跨段�
 
 ## `phase="global_plan"`：全项目设计
 
-输入只读：`work/request.json`、当前 `SKILL.md`、每个 `segments[].contact_sheet_path` 及对应 `contact_sheet_sha256`，以及可选 `element_index`；不要读取逐帧关键帧。联系表只用于一次性统一选择替换设计。
+输入只读：`work/request.json`、当前 `SKILL.md`、每个 `segments[].contact_sheet_path` 及对应 `contact_sheet_sha256`，以及可选 `element_index`；不要读取逐帧关键帧。联系表只用于一次性统一选择替换设计；全局参考只定义统一替换，不提供逐帧可见性或几何证据。
 
 唯一输出 `work/global_plan.json` 的顶层 key 闭集为 `people/entities/scenes`；模型不得合并两个阶段输出，后端可机械合并，任何单一阶段不得直接输出四个字段。叶值均为非空 string，无对应对象写 `{}`，不得出现 `null`、数组、数字或布尔值：
 
@@ -25,7 +25,7 @@ description: 读取冻结关键帧和全视频稳定元素索引，生成跨段�
 
 ## `phase="segment_frames"`：当前段事实
 
-输入只读：`work/request.json`、当前 `SKILL.md`、`semantic_slots.frames[].path` 指向的冻结关键帧、`global_plan_path` 指向的 `work/global_plan.json`，以及可选的同一 `element_index`；不得改写全局设计。
+输入只读：`work/request.json`、当前 `SKILL.md`、`semantic_slots.frames[].path` 指向的冻结关键帧、`global_plan_path` 指向的 `work/global_plan.json`，以及可选的同一 `element_index`；按 `transition_skeleton` 识别 `hard_cut` 及其相邻帧；不得改写全局设计。
 
 唯一输出 `work/segment_frames.json` 的顶层 key 闭集只有 `frames`；其 key 集必须等于 `semantic_slots.frames[].key` 的全部 key，逐字复用、无缺失无额外。叶值均为非空 string：
 
@@ -35,9 +35,9 @@ description: 读取冻结关键帧和全视频稳定元素索引，生成跨段�
 }
 ```
 
-`people` 只列当前帧有直接证据的物理人物；其 key 集就是物理人物全集，人物数量闭合，且同一人物 key 不随段或帧改变。每帧只描述当前帧直接可见内容；核对头、躯干和手并唯一归属；反射、残影、边缘碎片、遮挡碎片、运动模糊不得升级为新物理人物、实体或人体。无人物或无派生观测写 `{}`。派生观测只嵌套来源人物下，不代表独立物理人物、不新增顶层人物或实体、不把该观测实例化到新场景；`mode` 只能是 `optical_projection`、`temporal_residual` 或 `source-preserve`。不可见或无法唯一判断时不新增 key、不补造肢体，在 string 中写 `source-preserve/no-invention`，不从其他帧补造；缺失语义由后端按 `source-preserve/non-physical` 继续，不拒绝、不 retry、不 fallback。
+`people` 只列当前帧有直接证据的物理人物；其 key 集就是物理人物全集，人物数量闭合，且同一人物 key 不随段或帧改变，wardrobe 设计也一致。`element_index`/`global_plan` 只提供稳定 key 与统一替换设计，不是当前可见性证据。每帧只描述当前帧直接可见内容；`transition_skeleton` 标出的 `hard_cut` 及其相邻帧、强运动模糊和 `edge_fragment` 只能绑定本帧直接可见像素，禁止从全局参考、索引或邻帧补头、补人、补衣服或补肢体。核对头、躯干和手并唯一归属；反射、残影、边缘碎片、遮挡碎片、运动模糊不得升级为新物理人物、实体或人体。无人物或无派生观测写 `{}`。派生观测只嵌套来源人物下，不代表独立物理人物、不新增顶层人物或实体、不把该观测实例化到新场景；`mode` 只能是 `optical_projection`、`temporal_residual` 或 `source-preserve`。不可见或无法唯一判断时不新增 key、不补造肢体，在 string 中写 `source-preserve/no-invention`，不从其他帧补造；缺失语义由后端按 `source-preserve/non-physical` 继续，不拒绝、不 retry、不 fallback。
 
-`entities` 只列当前帧有直接像素证据的全局持久非人物实体：`visible` 是直接可见，`occluded` 是仍有部分直接可见；完全出画、完全不可见或仅由邻帧推知时省略 key，不写 `out_of_frame` 占位。`visibility` 只能是 `visible`/`occluded`；source-preserve 是 mode 的第三个值，不是 visibility 的枚举值。实体关系、`relationships`、`crop` 只描述当前帧；未知部分写 `source-preserve/no-invention`，跨段同一物理实体复用同一 key，`hard_cut` 后须由当前帧证据重新确认。
+`entities` 只列当前帧有直接像素证据的全局持久非人物实体：`visible` 是直接可见，`occluded` 是仍有部分直接可见；完全出画、完全不可见或仅由邻帧推知时省略 key，不写 `out_of_frame` 占位。`hard_cut` 及其相邻帧、强模糊或 `edge_fragment` 也只能依据当前帧直接像素，不能用全局参考补实体、补衣服或补关系；`visibility` 只能是 `visible`/`occluded`；source-preserve 是 mode 的第三个值，不是 visibility 的枚举值。实体关系、`relationships`、`crop` 只描述当前帧；未知部分写 `source-preserve/no-invention`，跨段同一物理实体复用同一 key，`hard_cut` 后须由当前帧证据重新确认。
 
 ## 发布前自检与结束条件（两阶段均适用）
 
