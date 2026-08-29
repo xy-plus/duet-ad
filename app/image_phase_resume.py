@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,87 @@ class ResumeRejected(ValueError):
 
 class ResumeExecutionError(RuntimeError):
     """The image phase failed after all preconditions were proven."""
+
+
+class _DiagnosticRunner:
+    """Delegate execution while preserving exact phase protocol artifacts."""
+
+    def __init__(self, inner: object, destination: Path) -> None:
+        self._inner = inner
+        self._destination = destination
+        if destination.exists() or destination.is_symlink():
+            raise ResumeRejected("diagnostics directory already exists")
+        destination.mkdir(parents=True, mode=0o700)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    @staticmethod
+    def _label(stage: Path, output: Path) -> str:
+        if output.name == "global_plan.json":
+            return "global-plan"
+        matched = re.fullmatch(r"duet-image-segment-(\d+)-.+", stage.name)
+        if output.name == "segment_frames.json" and matched is not None:
+            return f"segment-{int(matched.group(1)):04d}"
+        raise ResumeExecutionError("unexpected image diagnostic phase")
+
+    @staticmethod
+    def _read_regular(path: Path, maximum: int) -> bytes | None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError:
+            return None
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
+                return None
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                value = stream.read(maximum + 1)
+            return value if len(value) <= maximum else None
+        finally:
+            os.close(descriptor)
+
+    def _capture(
+        self, stage: Path, output: Path, maximum: int, error: BaseException | None,
+    ) -> None:
+        label = self._label(stage, output)
+        request = self._read_regular(stage / "work" / "request.json", _JSON_BYTES)
+        raw_output = self._read_regular(output, maximum)
+        if request is not None:
+            _publish_bytes(self._destination / f"{label}.request.json", request)
+        if raw_output is not None:
+            _publish_bytes(self._destination / f"{label}.output.json", raw_output)
+        if error is not None:
+            _publish_bytes(
+                self._destination / f"{label}.error.txt",
+                (f"{type(error).__name__}: {error}\n").encode("utf-8"),
+            )
+
+    def run_isolated_until_output(
+        self,
+        workdir: Path,
+        prompt: str,
+        *,
+        session_dir: Path,
+        output_path: Path,
+        max_output_bytes: int,
+        validate_output,
+    ):
+        try:
+            result = self._inner.run_isolated_until_output(
+                workdir,
+                prompt,
+                session_dir=session_dir,
+                output_path=output_path,
+                max_output_bytes=max_output_bytes,
+                validate_output=validate_output,
+            )
+        except BaseException as exc:
+            self._capture(workdir, output_path, max_output_bytes, exc)
+            raise
+        self._capture(workdir, output_path, max_output_bytes, None)
+        return result
 
 
 @dataclass(frozen=True)
@@ -601,6 +683,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seedream-edit-mode", default="independent_parallel")
     parser.add_argument("--codex-timeout-s", type=int, default=3600)
     parser.add_argument("--codex-concurrency", type=int, default=4)
+    parser.add_argument("--diagnostics-dir", type=_absolute)
     return parser
 
 
@@ -621,6 +704,27 @@ def _publish_manifest(path: Path, payload: dict) -> None:
         os.replace(temporary, path)
     except FileExistsError:
         raise ResumeRejected("manifest staging path already exists") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_bytes(path: Path, payload: bytes) -> None:
+    if path.exists() or path.is_symlink():
+        raise ResumeExecutionError("diagnostic output already exists")
+    temporary = path.with_name(f".{path.name}.tmp")
+    descriptor = None
+    try:
+        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except FileExistsError:
+        raise ResumeExecutionError("diagnostic staging path already exists") from None
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -654,6 +758,8 @@ def main(argv: list[str] | None = None) -> int:
     runner = CodexRunner(
         timeout_s=settings.codex_timeout_s, concurrency=settings.codex_concurrency,
     )
+    if args.diagnostics_dir is not None:
+        runner = _DiagnosticRunner(runner, args.diagnostics_dir)
     result = execute(settings, args.cid, expected, runner=runner)
     print(json.dumps({"id": args.cid, "status": result.get("status")}, ensure_ascii=False))
     return 0

@@ -227,3 +227,62 @@ def test_artifact_drift_during_image_generation_is_not_committed(
         image_phase_resume.execute(settings, CID, manifest, runner=object())
     assert (cdir / "meta.json").read_bytes() == before
     assert not (cdir / "long_video_plan.json").exists()
+
+
+def test_diagnostic_runner_preserves_successful_phase_protocol(tmp_path):
+    stage = tmp_path / "duet-image-segment-2-test"
+    work = stage / "work"
+    work.mkdir(parents=True)
+    request = b'{"phase":"segment_frames"}\n'
+    output = b'{"frames":{}}\n'
+    (work / "request.json").write_bytes(request)
+
+    class Inner:
+        def run_isolated_until_output(self, *args, **kwargs):
+            kwargs["output_path"].write_bytes(output)
+            return {"frames": {}}
+
+    destination = tmp_path / "diagnostics"
+    runner = image_phase_resume._DiagnosticRunner(Inner(), destination)
+    result = runner.run_isolated_until_output(
+        stage,
+        "prompt",
+        session_dir=tmp_path,
+        output_path=work / "segment_frames.json",
+        max_output_bytes=1024,
+        validate_output=lambda raw: json.loads(raw),
+    )
+    assert result == {"frames": {}}
+    assert (destination / "segment-0002.request.json").read_bytes() == request
+    assert (destination / "segment-0002.output.json").read_bytes() == output
+    assert not (destination / "segment-0002.error.txt").exists()
+
+
+def test_diagnostic_runner_preserves_invalid_output_and_error(tmp_path):
+    stage = tmp_path / "duet-image-global-test"
+    work = stage / "work"
+    work.mkdir(parents=True)
+    (work / "request.json").write_text('{"phase":"global_plan"}\n')
+
+    class Inner:
+        def run_isolated_until_output(self, *args, **kwargs):
+            kwargs["output_path"].write_bytes(b'{"unexpected":true}\n')
+            raise RuntimeError("invalid phase shape")
+
+    destination = tmp_path / "diagnostics"
+    runner = image_phase_resume._DiagnosticRunner(Inner(), destination)
+    with pytest.raises(RuntimeError, match="invalid phase shape"):
+        runner.run_isolated_until_output(
+            stage,
+            "prompt",
+            session_dir=tmp_path,
+            output_path=work / "global_plan.json",
+            max_output_bytes=1024,
+            validate_output=lambda raw: json.loads(raw),
+        )
+    assert (destination / "global-plan.output.json").read_bytes() == (
+        b'{"unexpected":true}\n'
+    )
+    assert (destination / "global-plan.error.txt").read_text() == (
+        "RuntimeError: invalid phase shape\n"
+    )
