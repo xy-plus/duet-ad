@@ -1519,24 +1519,32 @@ def _valid_v4_anchor_receipt(
         ):
             return False
         roles = receipt["input_roles"]
+        board = _replacement_board_path(cdir)
+        board_roles = ["composite_replacement_board"] if board.is_file() else []
+        board_sha256s = [hashlib.sha256(board.read_bytes()).hexdigest()] if board_roles else []
         if receipt["label"] == "global":
-            return roles == ["canvas"]
+            return (
+                roles == ["canvas", *board_roles]
+                and receipt["input_sha256s"][1:] == board_sha256s
+            )
         if receipt["label"].startswith("fanout-"):
             layout_sha = next(
                 item["output_sha256"] for item in anchors.values()
                 if item["label"] == f"layout-{anchor['segment_index']:04d}"
                 and item["scene_id"] == receipt["scene_id"]
             )
-            return roles == ["canvas", "segment_layout_anchor"] and receipt[
-                "input_sha256s"
-            ][1:] == [layout_sha]
+            return (
+                roles == ["canvas", "segment_layout_anchor", *board_roles]
+                and receipt["input_sha256s"][1:] == [layout_sha, *board_sha256s]
+            )
         global_sha = next(
             item["output_sha256"] for item in anchors.values()
             if item["label"] == "global" and item["scene_id"] == receipt["scene_id"]
         )
-        return roles == ["canvas", "global_scene_anchor"] and receipt[
-            "input_sha256s"
-        ][1:] == [global_sha]
+        return (
+            roles == ["canvas", "global_scene_anchor", *board_roles]
+            and receipt["input_sha256s"][1:] == [global_sha, *board_sha256s]
+        )
     except (KeyError, OSError, StopIteration, TypeError, ValueError):
         return False
 
@@ -1724,12 +1732,177 @@ def _valid_palette_metrics_for_outputs(
     return len(seen) == len(expected)
 
 
+def _replacement_board_path(cdir: Path) -> Path:
+    return (
+        cdir / "work" / ".postprocess-private" / "replacement-board"
+        / "composite.png"
+    )
+
+
+def _v4_shared_references(
+    cdir: Path, references: list[tuple[str, Path]],
+) -> list[tuple[str, Path]]:
+    """Append the one project board to every existing v4 anchor input list."""
+    board = _replacement_board_path(cdir)
+    if not board.is_file() or any(path == board for _role, path in references):
+        return list(references)
+    return [*references, ("composite_replacement_board", board)]
+
+
+def _draw_replacement_board_labels(
+    source: Path, output: Path, tile_count: int,
+) -> None:
+    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    if image is None or tile_count < 1:
+        raise PostprocessError(502, "postprocess_artifacts_invalid")
+    height, width = image.shape[:2]
+    columns = max(1, math.ceil(math.sqrt(tile_count)))
+    rows = max(1, math.ceil(tile_count / columns))
+    cell_width = max(1, width // columns)
+    cell_height = max(1, height // rows)
+    for index in range(tile_count):
+        row, column = divmod(index, columns)
+        left, top = column * cell_width, row * cell_height
+        right = width - 1 if column == columns - 1 else (column + 1) * cell_width
+        bottom = height - 1 if row == rows - 1 else (row + 1) * cell_height
+        cv2.rectangle(image, (left, top), (right, bottom), (255, 255, 255), 2)
+        cv2.putText(
+            image,
+            f"TILE_{index + 1:02d}",
+            (left + 8, min(bottom - 8, top + 28)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            f"TILE_{index + 1:02d}",
+            (left + 8, min(bottom - 8, top + 28)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output), image):
+        raise PostprocessError(502, "postprocess_artifacts_invalid")
+
+
+def _compose_replacement_evidence_sheet(
+    reference_paths: list[Path], output: Path,
+) -> None:
+    """Collapse all element evidence into one numbered provider reference image."""
+    if not reference_paths:
+        raise PostprocessError(502, "postprocess_artifacts_invalid")
+    images = [cv2.imread(str(path), cv2.IMREAD_COLOR) for path in reference_paths]
+    if any(image is None for image in images):
+        raise PostprocessError(502, "postprocess_artifacts_invalid")
+    height, width = images[0].shape[:2]
+    columns = max(1, math.ceil(math.sqrt(len(images))))
+    rows = max(1, math.ceil(len(images) / columns))
+    cells = []
+    for index, image in enumerate(images):
+        cell = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+        cv2.putText(
+            cell,
+            f"TILE_{index + 1:02d}",
+            (8, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            cell,
+            f"TILE_{index + 1:02d}",
+            (8, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+        cells.append(cell)
+    blank = images[0].copy()
+    blank[:] = 245
+    cells.extend(blank.copy() for _ in range(rows * columns - len(cells)))
+    sheet = cv2.vconcat([
+        cv2.hconcat(cells[row * columns:(row + 1) * columns])
+        for row in range(rows)
+    ])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output), sheet):
+        raise PostprocessError(502, "postprocess_artifacts_invalid")
+
+
+async def _v4_generate_composite_replacement_board(
+    settings: Settings, cdir: Path, cid: str, private: dict,
+    grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
+    plan: dict,
+) -> Path | None:
+    """Generate the one shared replacement board before any segment anchor."""
+    board = image_optimization.composite_replacement_board_spec(plan)
+    tiles = board["tiles"]
+    if not tiles:
+        return None
+    sources = _v4_frame_sources(grouped, private)
+    reference_paths = [
+        sources[(tile["reference"]["segment_index"], tile["reference"]["frame_index"])]
+        for tile in tiles
+    ]
+    root = _replacement_board_path(cdir).parent
+    canvas = root / "canvas.png"
+    evidence_sheet = root / "source-evidence.png"
+    raw_output = root / "provider.png"
+    output = _replacement_board_path(cdir)
+    root.mkdir(parents=True, exist_ok=True)
+    _compose_replacement_evidence_sheet(reference_paths, evidence_sheet)
+    blank = cv2.imread(str(evidence_sheet), cv2.IMREAD_COLOR)
+    if blank is None:
+        raise PostprocessError(502, "postprocess_artifacts_invalid")
+    blank[:] = 245
+    if not cv2.imwrite(str(canvas), blank):
+        raise PostprocessError(502, "postprocess_artifacts_invalid")
+    try:
+        revision = _v4_project_revision(
+            (storage.load_meta(settings.data_dir, cid) or {}).get("postprocess")
+        )
+        attempt = _private_dir(cdir, min(grouped)) / "attempts" / (
+            f"00-r{revision}.json"
+        )
+        task_settings = replace(
+            settings,
+            seedream_model=private["model"],
+            seedream_edit_mode=private["edit_mode"],
+            seedream_timeout_s=private["timeout_s"],
+        )
+        async with seedream_sem:
+            await seedream.edit(
+                task_settings,
+                [canvas.read_bytes(), evidence_sheet.read_bytes()],
+                image_optimization.composite_replacement_board_prompt(plan),
+                raw_output,
+                receipt_path=attempt,
+            )
+        _draw_replacement_board_labels(raw_output, output, len(tiles))
+    except seedream.SeedreamError as exc:
+        raise PostprocessError(502, exc.code) from None
+    except OSError as exc:
+        raise PostprocessError(502, sanitize(str(exc))) from None
+    return output
+
+
 async def _v4_anchor(
     settings: Settings, cdir: Path, cid: str, private: dict,
     seedream_sem: asyncio.Semaphore, *, scene_id: str, label: str,
     anchor: dict, canvas: Path, references: list[tuple[str, Path]], output: Path,
 ) -> tuple[Path, dict]:
     """Generate one typed anchor; no dependent may use an unverified result."""
+    references = _v4_shared_references(cdir, references)
     input_roles = ["canvas", *[role for role, _ in references]]
     inputs = [canvas, *[path for _, path in references]]
     receipt_path = _anchor_receipt_path(cdir, scene_id, label)
@@ -2261,6 +2434,9 @@ async def _run_v4_task(
     _write_json_receipt(
         cdir / "work" / ".postprocess-private" / "scene-anchors" / "palette-source.json",
         source_palette_receipt,
+    )
+    await _v4_generate_composite_replacement_board(
+        settings, cdir, cid, private, grouped, seedream_sem, plan,
     )
     bootstrap_outputs, anchor_receipts = await _v4_bootstrap_scene_anchors(
         settings, cdir, cid, private, grouped, seedream_sem

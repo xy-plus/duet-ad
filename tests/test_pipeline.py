@@ -29,6 +29,7 @@ from app.main import create_app
 
 
 _GENERATE_IMAGE_OPTIMIZATION_PROJECT = image_optimization.generate_project_prompts
+_GENERATE_PROJECT_ELEMENT_INDEX = pipeline._generate_project_element_index
 _ANALYSIS_PROVENANCE_KEYS = {
     "analysis_audio_path",
     "analysis_audio_sha256",
@@ -179,6 +180,15 @@ def _long_dual_target_plan_v3(*, frame_count: int = 3):
 
 @pytest.fixture(autouse=True)
 def _stub_image_postprocess_codex(monkeypatch):
+    def project_index(_runner, cdir, _frame_paths):
+        path = Path(cdir) / "work" / "element_index.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"people": {}, "entities": {}, "scenes": {}}),
+            encoding="utf-8",
+        )
+        return path
+
     def generate(_runner, segments, mode, **_kwargs):
         segment_specs = [
             {
@@ -208,6 +218,7 @@ def _stub_image_postprocess_codex(monkeypatch):
     monkeypatch.setattr(
         pipeline.image_optimization, "generate_project_prompts", generate
     )
+    monkeypatch.setattr(pipeline, "_generate_project_element_index", project_index)
 
 ROOT = Path(pipeline.__file__).resolve().parent.parent
 EXTRACT_SCRIPT = ROOT / "skills" / "video-maker" / "scripts" / "extract_keyframes.py"
@@ -788,12 +799,19 @@ def test_v4_semantic_diagnostics_do_not_retry_or_switch_compilers(
 
         def run_isolated(self, workdir, _prompt, *, session_dir):
             self.calls += 1
+            work = Path(workdir) / "work"
+            if (work / "project_index_request.json").is_file():
+                (work / "element_index.json").write_text(
+                    json.dumps({"people": {}, "entities": {}, "scenes": {}}),
+                    encoding="utf-8",
+                )
+                return
             request = json.loads(
-                (Path(workdir) / "work" / "request.json").read_text(
+                (work / "request.json").read_text(
                     encoding="utf-8"
                 )
             )
-            output = Path(workdir) / "work" / "image_optimization.json"
+            output = work / "image_optimization.json"
             output.write_text(
                 json.dumps(_semantic_image_output(
                     request, omit_wardrobe=True,
@@ -806,6 +824,9 @@ def test_v4_semantic_diagnostics_do_not_retry_or_switch_compilers(
         pipeline.image_optimization,
         "generate_project_prompts",
         _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
+    )
+    monkeypatch.setattr(
+        pipeline, "_generate_project_element_index", _GENERATE_PROJECT_ELEMENT_INDEX,
     )
     caplog.set_level("INFO", logger="app.image_optimization")
     plan, prompts = pipeline._generate_image_optimization_project(
@@ -822,7 +843,7 @@ def test_v4_semantic_diagnostics_do_not_retry_or_switch_compilers(
         step="project image plan",
     )
 
-    assert runner.calls == 1
+    assert runner.calls == 2
     assert not hasattr(image_optimization, "generic_project_prompts")
     assert plan["version"] == 4
     assert list(prompts) == [0]

@@ -182,6 +182,34 @@ def _skill_contract() -> tuple[str, dict]:
     return text, example
 
 
+def _element_index() -> dict:
+    return {
+        "people": {
+            "subject": {
+                "source_visual_description": "跨段可见的主人物",
+                "occurrences": [
+                    {"segment_index": 1, "frame_orders": [1]},
+                    {"segment_index": 2, "frame_orders": [1]},
+                ],
+                "replaceable": ["identity", "wardrobe", "local_color"],
+                "preserve": ["pose", "action", "relationships"],
+            }
+        },
+        "entities": {},
+        "scenes": {
+            "scene-001": {
+                "source_visual_description": "跨段连续的源环境",
+                "occurrences": [
+                    {"segment_index": 1, "frame_orders": [1]},
+                    {"segment_index": 2, "frame_orders": [1]},
+                ],
+                "replaceable": ["environment_design"],
+                "preserve": ["composition", "lighting", "tone"],
+            }
+        },
+    }
+
+
 def _semantic_output(request: dict, *, sparse: bool = False) -> dict:
     slots = request["semantic_slots"]
     scenes = {
@@ -362,6 +390,104 @@ def test_skill_is_one_concise_plan_only_skill():
         assert backend_field not in encoded
     for retired in ("plan_audit", "verify_pack", "work/image_verification.json"):
         assert retired not in skill
+
+
+def test_skill_additively_consumes_element_index_without_changing_output_schema(
+    tmp_path,
+):
+    skill, example = _skill_contract()
+    session = tmp_path / "session"
+    segments = _transition_skeleton(_segments(session))
+    element_index = _element_index()
+    index_path = session / "work" / "element_index.json"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(
+        json.dumps(element_index, ensure_ascii=False), encoding="utf-8"
+    )
+    runner = _Runner(_semantic_output)
+
+    plan, prompts = image_optimization.generate_project_prompts(
+        runner,
+        segments,
+        "anchor_consistency",
+        session_dir=session,
+        element_index_path=index_path,
+    )
+
+    assert runner.calls[0]["request"]["element_index"] == element_index
+    assert [
+        (tile["stable_key"], tile["tile_id"])
+        for tile in image_optimization.composite_replacement_board_spec(plan)["tiles"]
+    ] == [("subject", "TILE_01"), ("scene-001", "TILE_02")]
+    assert "subject -> TILE_01" in prompts[1][1]
+    assert "scene-001 -> TILE_02" in prompts[2][1]
+    assert set(example) == {"people", "entities", "scenes", "frames"}
+    for contract in (
+        "element_index",
+        "stable key",
+        "逐字复用",
+        "合并参考图",
+        "每个被替换元素恰好一个编号 tile",
+        "所有片段共享",
+        "video-prompt-fusion",
+    ):
+        assert contract in skill
+    assert "不要输出版本、段号、帧号" in skill
+
+
+def test_skill_adds_no_content_gate_retry_or_fallback_for_element_index():
+    skill, example = _skill_contract()
+    encoded = json.dumps(example, ensure_ascii=False)
+
+    for control_field in ('"eligible"', '"reason"', '"gate"', '"reject"'):
+        assert control_field not in encoded
+    assert "不新增质量门禁" in skill
+    assert "不新增 reject、retry 或 fallback" in skill
+
+
+def test_element_index_semantic_damage_is_non_blocking_normalization(tmp_path):
+    session = tmp_path / "session"
+    segments = _transition_skeleton(_segments(session))
+    index_path = session / "work" / "element_index.json"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(json.dumps({
+        "people": {
+            "subject": {
+                "source_visual_description": "跨段主人物",
+                "occurrences": [
+                    {"segment_index": 1, "frame_orders": [1]},
+                    {"segment_index": "bad", "frame_orders": []},
+                ],
+                "replaceable": ["identity", None],
+                "preserve": "bad",
+            },
+            "broken": "bad",
+        },
+        "entities": "bad",
+    }, ensure_ascii=False), encoding="utf-8")
+    runner = _Runner(_semantic_output)
+
+    plan, _prompts = image_optimization.generate_project_prompts(
+        runner,
+        segments,
+        "anchor_consistency",
+        session_dir=session,
+        element_index_path=index_path,
+    )
+
+    assert runner.calls[0]["request"]["element_index"] == {
+        "people": {
+            "subject": {
+                "source_visual_description": "跨段主人物",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+                "replaceable": ["identity"],
+                "preserve": [],
+            }
+        },
+        "entities": {},
+        "scenes": {},
+    }
+    assert plan["eligible"] is True
 
 
 def test_skill_and_human_plan_scope_only_define_source_to_target_image_editing():

@@ -55,6 +55,7 @@ _ENTITY_ID_RE = re.compile(r"^ENTITY_([0-9]{2})$")
 _COMPONENT_ID_RE = re.compile(r"^COMPONENT_([0-9]{2})$")
 _ENTITY_ID_MENTION_RE = re.compile(r"(?<![A-Z0-9_])ENTITY_[0-9]{2}(?![A-Z0-9_])")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_STABLE_KEY_PREFIX = "stable_key="
 _INELIGIBLE_REASONS = {
     "no_observable_narrative_person",
     "narrative_person_tracks_ambiguous",
@@ -1520,10 +1521,93 @@ def _semantic_text(value: object, default: str, *, max_bytes: int = 1000) -> str
     return text or default
 
 
+def _canonical_element_index(value: object) -> dict:
+    """Keep valid first-Skill facts without turning missing semantics into control flow."""
+    raw_index = value if isinstance(value, dict) else {}
+    result = {"people": {}, "entities": {}, "scenes": {}}
+    for category in ("people", "entities", "scenes"):
+        raw_items = raw_index.get(category)
+        if not isinstance(raw_items, dict):
+            continue
+        items = {}
+        for stable_key, raw in raw_items.items():
+            if (
+                not isinstance(stable_key, str)
+                or not stable_key.strip()
+                or stable_key != stable_key.strip()
+                or not isinstance(raw, dict)
+                or not isinstance(raw.get("source_visual_description"), str)
+                or not raw["source_visual_description"].strip()
+            ):
+                continue
+            raw_occurrences = raw.get("occurrences")
+            raw_replaceable = raw.get("replaceable")
+            raw_preserve = raw.get("preserve")
+            if not isinstance(raw_occurrences, list):
+                raw_occurrences = []
+            if not isinstance(raw_replaceable, list):
+                raw_replaceable = []
+            if not isinstance(raw_preserve, list):
+                raw_preserve = []
+            occurrences = []
+            seen_segments = set()
+            for occurrence in raw_occurrences:
+                if (
+                    not isinstance(occurrence, dict)
+                    or isinstance(occurrence.get("segment_index"), bool)
+                    or not isinstance(occurrence.get("segment_index"), int)
+                    or occurrence["segment_index"] < 0
+                    or occurrence["segment_index"] in seen_segments
+                    or not isinstance(occurrence.get("frame_orders"), list)
+                    or not occurrence["frame_orders"]
+                    or any(
+                        isinstance(order, bool) or not isinstance(order, int)
+                        or order < 1 for order in occurrence["frame_orders"]
+                    )
+                    or occurrence["frame_orders"]
+                    != sorted(set(occurrence["frame_orders"]))
+                ):
+                    continue
+                seen_segments.add(occurrence["segment_index"])
+                occurrences.append({
+                    "segment_index": occurrence["segment_index"],
+                    "frame_orders": list(occurrence["frame_orders"]),
+                })
+            occurrences.sort(key=lambda item: item["segment_index"])
+            items[stable_key] = {
+                "source_visual_description": raw["source_visual_description"].strip(),
+                "occurrences": occurrences,
+                "replaceable": [
+                    text.strip() for text in raw_replaceable
+                    if isinstance(text, str) and text.strip()
+                ],
+                "preserve": [
+                    text.strip() for text in raw_preserve
+                    if isinstance(text, str) and text.strip()
+                ],
+            }
+        result[category] = items
+    return result
+
+
+def _tag_stable_key(stable_key: str, text: str) -> str:
+    return f"{_STABLE_KEY_PREFIX}{stable_key}；{text}"
+
+
+def _split_stable_key(value: object) -> tuple[str | None, str]:
+    text = value.strip() if isinstance(value, str) else ""
+    if not text.startswith(_STABLE_KEY_PREFIX) or "；" not in text:
+        return None, text
+    tagged, description = text.split("；", 1)
+    stable_key = tagged[len(_STABLE_KEY_PREFIX):].strip()
+    return (stable_key or None), description.strip()
+
+
 def _semantic_slots(
     segment_specs: list[dict],
     *,
     source_frames: dict[int, list[Path]] | None = None,
+    element_index: dict | None = None,
 ) -> dict:
     """Construct every stable scene/frame key and transition from backend input."""
     if not isinstance(segment_specs, list) or not segment_specs:
@@ -1533,6 +1617,23 @@ def _semantic_slots(
     frame_slots: list[dict] = []
     frame_ordinal = 0
     prior_exists = False
+    indexed_scenes = (
+        element_index.get("scenes", {})
+        if isinstance(element_index, dict) else {}
+    )
+
+    def indexed_scene_key(segment_index: int) -> str | None:
+        matches = [
+            stable_key
+            for stable_key, item in indexed_scenes.items()
+            if any(
+                occurrence.get("segment_index") == segment_index
+                for occurrence in item.get("occurrences", [])
+                if isinstance(occurrence, dict)
+            )
+        ]
+        return sorted(matches)[0] if matches else None
+
     for segment in segment_specs:
         if not isinstance(segment, dict):
             raise ValueError("invalid image semantic compiler input")
@@ -1547,10 +1648,11 @@ def _semantic_slots(
             or join_mode not in {"hard_cut", "continue"}
         ):
             raise ValueError("invalid image semantic compiler input")
-        scene_key = scene_key_by_chain.get(chain_id)
+        scene_key = indexed_scene_key(index) or scene_key_by_chain.get(chain_id)
         if scene_key is None:
             scene_key = f"scene-{len(scene_slots) + 1:03d}"
-            scene_key_by_chain[chain_id] = scene_key
+        scene_key_by_chain[chain_id] = scene_key
+        if not any(item["key"] == scene_key for item in scene_slots):
             scene_slots.append({
                 "key": scene_key,
                 "chain_id": chain_id,
@@ -1604,9 +1706,11 @@ def _semantic_slots(
     }
 
 
-def semantic_slot_manifest(segment_specs: list[dict]) -> dict:
+def semantic_slot_manifest(
+    segment_specs: list[dict], *, element_index: dict | None = None,
+) -> dict:
     """Expose backend-owned stable keys that the Skill associates with semantics."""
-    slots = _semantic_slots(segment_specs)
+    slots = _semantic_slots(segment_specs, element_index=element_index)
     return {
         "scenes": [
             {"key": item["key"], "chain_id": item["chain_id"]}
@@ -1631,9 +1735,14 @@ def compile_semantic_plan(
     segment_specs: list[dict],
     *,
     source_frames: dict[int, list[Path]] | None = None,
+    element_index: dict | None = None,
 ) -> tuple[dict, dict]:
     """Compile tolerant visual semantics into the one canonical executable v4 plan."""
-    slots = _semantic_slots(segment_specs, source_frames=source_frames)
+    slots = _semantic_slots(
+        segment_specs,
+        source_frames=source_frames,
+        element_index=element_index,
+    )
     raw = value if isinstance(value, dict) else {}
     raw_people = raw.get("people") if isinstance(raw.get("people"), dict) else {}
     raw_entities = (
@@ -1641,6 +1750,9 @@ def compile_semantic_plan(
     )
     raw_scenes = raw.get("scenes") if isinstance(raw.get("scenes"), dict) else {}
     raw_frames = raw.get("frames") if isinstance(raw.get("frames"), dict) else {}
+    indexed_people = set((element_index or {}).get("people", {}))
+    indexed_entities = set((element_index or {}).get("entities", {}))
+    indexed_scenes = set((element_index or {}).get("scenes", {}))
     frame_by_key = {item["key"]: item for item in slots["frames"]}
     frames_by_segment: dict[int, list[dict]] = {}
     for slot in slots["frames"]:
@@ -1778,6 +1890,8 @@ def compile_semantic_plan(
         if replacement_identity == source_identity:
             replacement_identity = f"与源身份不同的新人物：{replacement_identity}"
             issues.append(f"unchanged_identity:{key}")
+        if key in indexed_people:
+            replacement_identity = _tag_stable_key(key, replacement_identity)
         first_key = next(
             slot["key"] for slot in slots["frames"]
             if slot["key"] in observations[key]
@@ -1858,7 +1972,12 @@ def compile_semantic_plan(
             issues.append(f"source_preserve:{path}.owner")
         entity_designs[entity_key] = {
             "description": _semantic_text(
-                description,
+                (
+                    _tag_stable_key(entity_key, description.strip())
+                    if entity_key in indexed_entities
+                    and isinstance(description, str) and description.strip()
+                    else description
+                ),
                 "source-preserve/no-invention：保持源帧中该持久实体的外观身份",
                 max_bytes=512,
             ),
@@ -1913,6 +2032,8 @@ def compile_semantic_plan(
         if replacement_scene == source_scene:
             replacement_scene = f"结构与源环境不同的真实新环境：{replacement_scene}"
             issues.append(f"unchanged_scene:{key}")
+        if key in indexed_scenes:
+            replacement_scene = _tag_stable_key(key, replacement_scene)
         semantic_change = field(
             design, "semantic_change", "保持叙事用途并改变环境语义", path=path,
         )
@@ -2497,6 +2618,16 @@ def compile_frame_prompts(
         scene["id"]: scene.get("continuity_graph")
         for scene in canonical["scene_plans"]
     }
+    board = composite_replacement_board_spec(canonical)
+    tile_by_key = {tile["stable_key"]: tile for tile in board["tiles"]}
+    person_key_by_id = {
+        person["id"]: _split_stable_key(person["replacement_identity"])[0]
+        for person in canonical["person_plans"]
+    }
+    scene_key_by_id = {
+        scene["id"]: _split_stable_key(scene["replacement_scene"])[0]
+        for scene in canonical["scene_plans"]
+    }
     prompts: dict[int, dict[int, str]] = {}
     for segment in canonical["segments"]:
         photo = segment["photometric_contract"]
@@ -2505,6 +2636,36 @@ def compile_frame_prompts(
         )
         per_frame = {}
         for constraint in segment["frame_constraints"]:
+            visible_keys = [
+                person_key_by_id.get(member["id"])
+                for member in segment["persons"]
+                if member["state"] == "replace"
+                and constraint["frame_index"] in member["observable_frames"]
+            ]
+            visible_keys.extend(
+                _split_stable_key(entity["description"])[0]
+                for entity in constraint["non_person_entity_ledger"]["entities"]
+                if entity["visibility"] != "out_of_frame"
+            )
+            visible_keys.append(scene_key_by_id.get(segment["scene"]["scene_id"]))
+            frame_tiles = [
+                tile_by_key[stable_key]
+                for stable_key in dict.fromkeys(visible_keys)
+                if stable_key in tile_by_key
+            ]
+            board_clause = ""
+            if frame_tiles:
+                bindings = "；".join(
+                    f"{tile['stable_key']} -> {tile['tile_id']} -> "
+                    f"{tile['replacement_description']}"
+                    for tile in frame_tiles
+                )
+                board_clause = (
+                    f"。全项目共享替换参考板绑定：{bindings}。"
+                    "所有片段使用同一张参考板和同一替换描述；只替换当前源帧直接"
+                    "可见的已绑定元素，严格保持当前源帧构图、表现形式、色调、光照、"
+                    "动作和关系不变"
+                )
             base_prompt = (
                 segment_prompts[segment["segment_index"]]
                 if segment_prompts is not None else compile_segment_prompts(
@@ -2545,10 +2706,84 @@ def compile_frame_prompts(
                 f"{base_prompt}。仅当前源帧硬约束："
                 f"{frame_clause}。全局光色硬约束：{photo_clause}。"
                 f"{continuity_clause}"
-                "不得从其他帧补全，不得重布全局光线。"
+                f"不得从其他帧补全，不得重布全局光线。{board_clause}"
             )
         prompts[segment["segment_index"]] = per_frame
     return prompts
+
+
+def composite_replacement_board_spec(plan: dict) -> dict:
+    """Derive one numbered project board from existing v4 plan fields only."""
+    canonical = _canonical_plan(plan)
+    if not canonical["eligible"]:
+        raise ImageOptimizationIneligibleError(canonical["reason"])
+    candidates = []
+    for person in canonical["person_plans"]:
+        stable_key, description = _split_stable_key(
+            person["replacement_identity"]
+        )
+        if stable_key is not None:
+            candidates.append({
+                "stable_key": stable_key,
+                "kind": "person",
+                "replacement_description": description,
+                "reference": deepcopy(person["reference"]),
+            })
+
+    seen_entities = set()
+    for segment in canonical["segments"]:
+        for frame in segment.get("frame_constraints", []):
+            for entity in frame["non_person_entity_ledger"]["entities"]:
+                stable_key, description = _split_stable_key(
+                    entity["description"]
+                )
+                if stable_key is None or stable_key in seen_entities:
+                    continue
+                seen_entities.add(stable_key)
+                candidates.append({
+                    "stable_key": stable_key,
+                    "kind": "entity",
+                    "replacement_description": description,
+                    "reference": {
+                        "segment_index": segment["segment_index"],
+                        "frame_index": frame["frame_index"],
+                    },
+                })
+
+    for scene in canonical["scene_plans"]:
+        stable_key, description = _split_stable_key(scene["replacement_scene"])
+        if stable_key is not None:
+            candidates.append({
+                "stable_key": stable_key,
+                "kind": "scene",
+                "replacement_description": description,
+                "reference": deepcopy(scene["reference"]),
+            })
+
+    tiles = [
+        {"tile_id": f"TILE_{position:02d}", **candidate}
+        for position, candidate in enumerate(candidates, 1)
+    ]
+    return {"tiles": tiles}
+
+
+def composite_replacement_board_prompt(plan: dict) -> str:
+    board = composite_replacement_board_spec(plan)
+    columns = max(1, int(len(board["tiles"]) ** 0.5 + 0.999999))
+    rows = max(1, (len(board["tiles"]) + columns - 1) // columns)
+    bindings = "；".join(
+        f"{tile['tile_id']}={tile['stable_key']}："
+        f"{tile['replacement_description']}"
+        for tile in board["tiles"]
+    )
+    return _canonical_prompt(
+        "在图1的空白画布上生成一张全项目共享的合并替换参考图；"
+        f"按 {columns} 列 {rows} 行的固定网格编号分块，且每个元素恰好一个 tile："
+        f"{bindings}。"
+        "图2是按相同 tile 顺序合成的唯一源视觉证据图。每个 tile 只需一块能清晰展示"
+        "对应替换元素特征的代表图，不生成三视图或四视图，不重复、不遗漏、"
+        "不合并不同 stable key。"
+    )
 
 
 def semantic_context(plan: dict) -> dict:
@@ -3126,13 +3361,17 @@ def _canonical_project_output(
     *,
     source_frames: dict[int, list[Path]] | None = None,
     segment_specs: list[dict] | None = None,
+    element_index: dict | None = None,
 ) -> tuple[dict, dict]:
     semantic_output = isinstance(value, dict) and value.get("version") is None
     if semantic_output:
         if segment_specs is None:
             raise ValueError("image semantic compiler requires backend segment input")
         plan, diagnostics = compile_semantic_plan(
-            value, segment_specs, source_frames=source_frames,
+            value,
+            segment_specs,
+            source_frames=source_frames,
+            element_index=element_index,
         )
         _LOGGER.info(
             "image semantic compiler score=%s issues=%s ignored=%s "
@@ -3237,6 +3476,7 @@ def generate_project_prompts(
     *,
     session_dir: Path,
     expected_version: int = 4,
+    element_index_path: Path | None = None,
 ) -> tuple[dict, dict]:
     """Run the plan phase once, then compile immutable provider prompts."""
     if edit_mode not in SEEDREAM_EDIT_MODES or expected_version not in {2, 3, 4}:
@@ -3247,6 +3487,14 @@ def generate_project_prompts(
     skill = verification_skill_path()
     if not skill.is_file():
         raise ValueError("invalid image optimization segments")
+    element_index = None
+    if element_index_path is not None:
+        try:
+            element_index = _canonical_element_index(
+                _read_json_output(Path(element_index_path), MAX_CONTINUITY_BYTES)
+            )
+        except ImageOptimizationOutputError:
+            element_index = _canonical_element_index(None)
 
     with tempfile.TemporaryDirectory(prefix="duet-image-postprocess-", dir="/tmp") as raw:
         stage = Path(raw).resolve(strict=True)
@@ -3265,13 +3513,18 @@ def generate_project_prompts(
                 **({"transition_skeleton": segment["transition_skeleton"]}
                    if "transition_skeleton" in segment else {}),
             })
-        (work / "request.json").write_text(
-            json.dumps({
+        request = {
                 "phase": "plan",
                 "edit_mode": edit_mode,
                 "segments": request_segments,
-                "semantic_slots": semantic_slot_manifest(request_segments),
-            }, ensure_ascii=False, separators=(",", ":")) + "\n",
+                "semantic_slots": semantic_slot_manifest(
+                    request_segments, element_index=element_index,
+                ),
+        }
+        if element_index is not None:
+            request["element_index"] = element_index
+        (work / "request.json").write_text(
+            json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
         run_error: CodexError | None = None
@@ -3298,6 +3551,7 @@ def generate_project_prompts(
                     segment["index"]: frames for segment, frames in prepared
                 },
                 segment_specs=[segment for segment, _frames in prepared],
+                element_index=element_index,
             )
             if plan.get("version") != expected_version:
                 raise ImageOptimizationOutputError(

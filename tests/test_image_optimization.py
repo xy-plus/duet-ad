@@ -1512,6 +1512,51 @@ def test_v4_schedule_freezes_unique_typed_paid_dag_order(tmp_path):
     ]
 
 
+def test_v4_composite_board_and_frame_prompts_share_one_stable_tile_mapping():
+    plan = _v4_frame_bound_plan()
+    plan["person_plans"][0]["replacement_identity"] = (
+        "stable_key=hero；短发、清晰颧骨的新人物身份"
+    )
+    plan["scene_plans"][0]["replacement_scene"] = (
+        "stable_key=studio；同用途但空间结构不同的新摄影棚"
+    )
+    for frame in plan["segments"][0]["frame_constraints"]:
+        frame["non_person_entity_ledger"]["entities"][0]["description"] = (
+            "stable_key=hero-prop；替换为银色金属手持道具"
+        )
+    plan["segments"][0]["frame_constraints"][1][
+        "non_person_entity_ledger"
+    ]["entities"][0]["visibility"] = "out_of_frame"
+
+    board = image_optimization.composite_replacement_board_spec(plan)
+    prompts = image_optimization.compile_frame_prompts(
+        plan, "anchor_consistency",
+    )
+
+    assert [(item["tile_id"], item["stable_key"], item["kind"]) for item in board["tiles"]] == [
+        ("TILE_01", "hero", "person"),
+        ("TILE_02", "hero-prop", "entity"),
+        ("TILE_03", "studio", "scene"),
+    ]
+    assert len({item["stable_key"] for item in board["tiles"]}) == len(board["tiles"])
+    for text in prompts[0].values():
+        assert "全项目共享替换参考板绑定" in text
+        assert "hero -> TILE_01 -> 短发、清晰颧骨的新人物身份" in text
+        assert "studio -> TILE_03 -> 同用途但空间结构不同的新摄影棚" in text
+        assert "严格保持当前源帧构图、表现形式、色调、光照、动作和关系不变" in text
+    assert "hero-prop -> TILE_02 -> 替换为银色金属手持道具" in prompts[0][1]
+    assert "hero-prop -> TILE_02 -> 替换为银色金属手持道具" not in prompts[0][2]
+
+
+def test_legacy_plan_keeps_existing_prompt_without_composite_board_binding():
+    plan = _v4_frame_bound_plan()
+
+    assert image_optimization.composite_replacement_board_spec(plan)["tiles"] == []
+    assert "全项目共享替换参考板绑定" not in image_optimization.compile_frame_prompts(
+        plan, "anchor_consistency",
+    )[0][1]
+
+
 def test_v4_plan_rejects_model_transition_that_differs_from_backend_skeleton(tmp_path):
     settings = make_settings(tmp_path)
     session = tmp_path / "session"

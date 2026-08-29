@@ -20,6 +20,8 @@ scenes 检测失败或 scenes.json 非法（含拆段不变量违规）→ 回�
 的目标语言由后端写进 prompt（codex 不从台词反推）。
 codex 超时/非零退出时先校验已落盘产物，完整则收养，不完整才判失败。
 codex 运行前把 skill 的 scripts/ 拷进 codex 工作目录（单段=会话目录、多段=段目录；裁剪工具按 scripts/crop_image.py 相对引用）。
+新输入合约在 N=1/N>1 的全部逐段关键帧和 prompt 产物完成后，以只含冻结关键帧的隔离输入额外执行一次
+video-maker project_index，并把 work/element_index.json 直接交给项目级 image-postprocess。
 流水线复用 skills/video-maker 的脚本，不重造。
 """
 
@@ -543,6 +545,78 @@ def _codex_prompt(
     return "\n\n".join(parts) + "\n"
 
 
+def _project_index_codex_prompt(cdir: Path) -> str:
+    return (
+        "严格执行当前目录 SKILL.md（该文档只读，禁止修改）。"
+        "本次仅执行 phase=\"project_index\"：只读取 "
+        "work/project_index_request.json 及其中列出的冻结关键帧，"
+        "只生成 work/element_index.json；不要读取或生成 prompt.txt。\n\n"
+        + _hard_rules(cdir)
+        + "\n"
+    )
+
+
+def _generate_project_element_index(
+    runner,
+    cdir: Path,
+    frame_paths: dict[int, list[Path]],
+) -> Path:
+    """Run the additive video-maker project phase against keyframes only."""
+    target = cdir / "work" / "element_index.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="duet-video-maker-project-index-", dir="/tmp"
+    ) as raw:
+        isolated_root = Path(raw).resolve(strict=True)
+        isolated_work = isolated_root / "work"
+        isolated_work.mkdir()
+        shutil.copy2(SKILL_MD, isolated_root / "SKILL.md")
+        segments = []
+        for segment_index in sorted(frame_paths):
+            frames = []
+            destination = (
+                isolated_work / "segments" / str(segment_index) / "keyframes"
+            )
+            destination.mkdir(parents=True)
+            for frame_order, source in enumerate(frame_paths[segment_index], 1):
+                data = source.read_bytes()
+                relative = Path(
+                    "work", "segments", str(segment_index), "keyframes",
+                    f"{frame_order:02d}.png",
+                )
+                (isolated_root / relative).write_bytes(data)
+                frames.append({
+                    "frame_order": frame_order,
+                    "path": relative.as_posix(),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                })
+            segments.append({
+                "segment_index": segment_index,
+                "frames": frames,
+            })
+        (isolated_work / "project_index_request.json").write_text(
+            json.dumps(
+                {"phase": "project_index", "segments": segments},
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        runner.run_isolated(
+            isolated_root,
+            _project_index_codex_prompt(isolated_root),
+            session_dir=cdir,
+        )
+        staged = target.with_name(".element_index.tmp")
+        try:
+            staged.write_bytes((isolated_work / "element_index.json").read_bytes())
+            os.replace(staged, target)
+        finally:
+            staged.unlink(missing_ok=True)
+        return target
+
+
 def _run_visual_codex(
     runner,
     cdir: Path,
@@ -819,17 +893,35 @@ def _generate_image_optimization_project(
     *,
     session_dir: Path,
     step: str,
+    element_index_path: Path | None = None,
 ) -> tuple[dict | None, dict]:
+    if element_index_path is None:
+        element_index_path = _generate_project_element_index(
+            runner,
+            session_dir,
+            {
+                segment["index"]: sorted(
+                    path
+                    for path in segment["keyframes_dir"].glob("*.png")
+                    if path.is_file()
+                )
+                for segment in segments
+            },
+        )
     policy = _retry_policy(settings)
 
     def attempt() -> tuple[dict | None, dict]:
         try:
+            kwargs = {
+                "session_dir": session_dir,
+                "expected_version": 4,
+            }
+            kwargs["element_index_path"] = element_index_path
             return image_optimization.generate_project_prompts(
                 runner,
                 segments,
                 settings.seedream_edit_mode,
-                session_dir=session_dir,
-                expected_version=4,
+                **kwargs,
             )
         except image_optimization.ImageOptimizationOutputError as exc:
             raise PipelineError(str(exc), retryable=True) from None
@@ -858,6 +950,7 @@ def _generate_segmented_image_prompts(
     work: Path,
     *,
     session_dir: Path,
+    element_index_path: Path | None = None,
 ) -> tuple[dict, dict]:
     frame_paths = {}
     for segment, meta in zip(segments, seg_metas):
@@ -894,12 +987,17 @@ def _generate_segmented_image_prompts(
         **({"transition_skeleton": transitions_by_segment[segment["index"]]}
            if segment["index"] in transitions_by_segment else {}),
     } for segment in segments]
+    kwargs = {
+        "session_dir": session_dir,
+        "step": "project image postprocess codex",
+    }
+    if element_index_path is not None:
+        kwargs["element_index_path"] = element_index_path
     continuity, prompts = _generate_image_optimization_project(
         settings,
         runner,
         specs,
-        session_dir=session_dir,
-        step="project image postprocess codex",
+        **kwargs,
     )
     if continuity is None:
         raise PipelineError("image continuity was not generated")

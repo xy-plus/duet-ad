@@ -1,21 +1,21 @@
 ---
 name: video-maker
-description: 从参考视频预先抽取的图片和文字做关键词与片段分析；对每个 segment 选择恰好 9 张按源时间排序、未经修改的原始关键帧，并编写还原旧视频可见事实的视频提示词。用于原视频拆段后的视觉分析和旧视频提示词提取；输出仅供后续链路使用，不承担图片优化或最终提示词融合。
+description: 从参考视频预先抽取的图片和文字做关键词与片段分析；对每个 segment 选择恰好 9 张按源时间排序、未经修改的原始关键帧，并编写还原旧视频可见事实的视频提示词；在全部逐段工作完成后，可从全项目冻结关键帧额外建立可替换人物、实体和场景的稳定语义索引。用于原视频拆段后的视觉分析、旧视频提示词提取和后续图片替换的项目级源元素对齐；不承担图片优化或最终提示词融合。
 ---
 
 # video-maker
 
 ## 单一职责
 
-只分析原视频。项目统一表示为 `segments[N>=1]`；`N=1` 与 `N>1` 使用同一套规则，不建立两套流程。后端把每个 segment 放进独立工作目录后调用本 Skill；每次只处理当前 segment，不跨目录取帧或补叙事。
+只分析原视频。项目统一表示为 `segments[N>=1]`；`N=1` 与 `N>1` 使用同一套规则，不建立两套流程。后端把每个 segment 放进独立工作目录后调用本 Skill；逐 segment 阶段每次只处理当前 segment，不跨目录取帧或补叙事。全部 segment 原功能完成后，后端可在隔离工作目录以 `phase="project_index"` 额外调用同一个 Skill 一次；该阶段只读取调用方明确冻结的全项目关键帧清单，不改变逐 segment 阶段的任何既有输入、输出或规则。
 
-对当前 segment 完成三件事：
+对当前 segment 完成原有的逐段视觉分析三件事：
 
 1. 做关键词和片段分析，理清可见主体、场景、对象、动作、镜头、转场和因果。
 2. 从预抽取帧中选出每段恰好 9 张原始关键帧。
 3. 根据原始帧编写旧视频提示词。
 
-不要执行图片优化、内容替换或最终提示词融合。不要产生额外计划、绑定或分类产物。
+不要执行图片优化、内容替换或最终提示词融合。逐 segment 阶段不要产生额外计划、绑定或分类产物；`project_index` 只增加下文规定的源元素索引。
 
 ## 输入与输出
 
@@ -28,10 +28,12 @@ description: 从参考视频预先抽取的图片和文字做关键词与片段�
 - `work/manifest.json`：当前 segment 的源视频时长、尺寸、帧率和帧数。
 - `work/scenes.json`：可选的场景边界辅助信息；与已查看原始帧冲突时，以原始帧为准。
 
-输出只有：
+在逐 segment 阶段，输出只有：
 
 - `work/keyframes/01.png` 至 `09.png`：9 张原始关键帧。
 - `work/prompt.txt`：当前 segment 的旧视频提示词。
+
+`project_index` 的输入与输出单独遵循“项目级可替换元素索引”；不得读取或改写上述逐 segment 产物。
 
 ## 关键词与片段分析
 
@@ -71,3 +73,70 @@ description: 从参考视频预先抽取的图片和文字做关键词与片段�
 ```
 
 每个细节都必须能对应至少一张已查看的原始帧。写完后检查图片编号、叙事顺序和提示词中的图片引用严格一致。
+
+## 项目级可替换元素索引
+
+仅当 `work/project_index_request.json` 明确声明 `phase="project_index"` 时执行本阶段，并且每个项目只执行一次。它发生在所有 segment 的逐段视觉分析、9 张原始关键帧选择和旧视频提示词生成之后，是对既有能力的增量补充。
+
+输入 `work/project_index_request.json` 只包含所有 segment 的冻结关键帧：
+
+```json
+{
+  "phase": "project_index",
+  "segments": [
+    {
+      "segment_index": 1,
+      "frames": [
+        {
+          "frame_order": 1,
+          "path": "work/segments/1/keyframes/01.png",
+          "sha256": "调用方冻结的原始字节哈希"
+        }
+      ]
+    }
+  ]
+}
+```
+
+严格按 `segments` 与 `frames` 的既定顺序查看全部冻结帧。project_index 不读取 `work/prompt.txt`，也不从字幕、文件名、常识或片段提示词补造视觉事实。
+
+汇总全视频直接可见、可能在后续图片处理中被替换的人物、持久非人物实体和场景。为同一个可见元素建立一个简短的稳定语义 key；该元素跨 segment、跨帧再次出现时逐字复用同一 key，不因服装局部遮挡、镜头尺度、姿态或视角改变而另建 key。无法由画面确认是同一元素时保持为不同语义 key，不猜测合并。
+
+只写 `work/element_index.json`，顶层精确为 `people/entities/scenes`。三类中每个稳定语义 key 使用完全相同的 `source_visual_description`、`occurrences`、`replaceable`、`preserve` 字段；每条 occurrence 使用 `segment_index` 和 `frame_orders`：
+
+```json
+{
+  "people": {
+    "stable-person-key": {
+      "source_visual_description": "源帧直接可见的稳定视觉特征",
+      "occurrences": [
+        {"segment_index": 1, "frame_orders": [1, 2]}
+      ],
+      "replaceable": ["后续允许替换的可见属性"],
+      "preserve": ["替换时必须保持一致的身份、形态、关系或连续性"]
+    }
+  },
+  "entities": {
+    "stable-entity-key": {
+      "source_visual_description": "持久非人物实体的直接可见外观",
+      "occurrences": [
+        {"segment_index": 1, "frame_orders": [3]}
+      ],
+      "replaceable": ["后续允许替换的可见属性"],
+      "preserve": ["实体归属、形态、接触关系或跨帧连续性"]
+    }
+  },
+  "scenes": {
+    "stable-scene-key": {
+      "source_visual_description": "源环境语义、布局和直接可见结构",
+      "occurrences": [
+        {"segment_index": 1, "frame_orders": [1, 2, 3]}
+      ],
+      "replaceable": ["后续允许替换的环境属性"],
+      "preserve": ["构图、机位、空间关系、光色或环境连续性"]
+    }
+  }
+}
+```
+
+`occurrences` 只记录该元素直接可见的帧，按 `segment_index` 升序排列，每组 `frame_orders` 按升序且不重复。`replaceable` 只描述可以换掉什么；`preserve` 只描述替换后仍须与源视频或跨段身份一致什么。无人、无持久实体或无可识别场景时，对应类别使用空对象。该文件直接作为 `image-postprocess` 的 `element_index` 输入；不要生成替换设计、参考图、图片提示词或其他文件。

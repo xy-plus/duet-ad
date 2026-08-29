@@ -30,7 +30,7 @@ def test_skill_has_minimal_identity_and_invocation_metadata():
     ) == ["SKILL.md", "agents/openai.yaml"]
 
 
-def test_input_contract_has_only_the_four_content_classes():
+def test_input_contract_keeps_the_existing_four_content_classes():
     text = _skill()
 
     for required in (
@@ -50,6 +50,71 @@ def test_input_contract_has_only_the_four_content_classes():
         "AudioLine = { order: Int1; text: NonEmpty; start_s: Number; end_s: Number; delivery: NonEmpty; voice_ref: null }",
         "除结构字段 `schema/version/segments/index` 外，段内恰好只有上述四类输入",
         '`music_policy` 必须是 exact 字符串 `"forbid"`',
+    ):
+        assert required in text
+
+    for forbidden_new_field in (
+        "global_element_index:",
+        "global_replacement_mapping:",
+        "composite_reference_image:",
+        "reference_board:",
+    ):
+        assert forbidden_new_field not in text
+
+
+def test_global_replacement_binding_is_carried_inside_existing_frame_prompts():
+    text = _skill()
+
+    for required in (
+        "四类冻结输入和输入输出 schema 保持不变",
+        "不得新增第五类输入",
+        "`image_optimization_prompt[].text`",
+        "全项目共享替换参考板绑定：{stable_key} -> TILE_XX -> {replacement_description}",
+        "同一帧实际需要替换的所有人物、实体和场景",
+        "`stable_key`、`tile_id` 与 `replacement_description`",
+        "`new_keyframes` 已落实该绑定的视觉结果",
+        "不得读取合并参考图或其他新增文件",
+    ):
+        assert required in text
+
+
+def test_shared_identity_context_never_propagates_actions_or_cuts():
+    text = _skill()
+
+    for required in (
+        "同一 `stable_key` 跨 segment 复用同一人物身份、对象设计或环境设计",
+        "跨段共享只约束稳定身份、对象和环境设计",
+        "不得跨 segment 传播动作、动作阶段、因果、camera movement、hard-cut 切点或无证据剧情",
+        "每段动作和剧情仍只来自该段 `old_video_prompt`",
+        "每段 hard-cut 仍只来自该段 `new_keyframes[].transition`",
+    ):
+        assert required in text
+
+
+def test_fusion_explicitly_preserves_five_continuities_and_material_binding():
+    text = _skill()
+
+    for required in (
+        "连续性、剧情连贯性、人物一致性、动作一致性、环境一致性",
+        "`old_video_prompt` 的段内动态骨架",
+        "`new_keyframes` 的冻结视觉事实",
+        "`image_optimization_prompt` 的逐帧替换绑定",
+        "`audio_content` 的冻结台词时间线",
+        "按 segment、frame order 和 hard-cut 区间精确对齐",
+        "输出 schema 和 `visual` 字段保持不变",
+        "供 Context IR 优化",
+        "逐段独立生成视频",
+    ):
+        assert required in text
+
+
+def test_global_binding_adds_no_gate_retry_or_fallback():
+    text = _skill()
+
+    for required in (
+        "全局绑定不增加新的技术校验条件",
+        "不产生新的门禁、拒绝、重试、回退或 workflow 分支",
+        "继续使用现有单次融合路径",
     ):
         assert required in text
 

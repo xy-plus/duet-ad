@@ -1350,7 +1350,7 @@ def test_generation_keyframes_rejects_orphaned_manual_acceptance_authority(tmp_p
         )
 
 
-def test_v4_postprocess_never_calls_quality_pack_gate(
+def test_v4_postprocess_builds_board_before_existing_dag_without_quality_pack_gate(
     tmp_path, monkeypatch,
 ):
     """The generation DAG is global -> layout -> fanout, without verify_pack."""
@@ -1375,6 +1375,10 @@ def test_v4_postprocess_never_calls_quality_pack_gate(
     monkeypatch.setattr(postprocess, "_v4_preflight", lambda *_args: None)
     monkeypatch.setattr(postprocess, "_v4_palette_metrics", lambda *_args: metric)
 
+    async def board(*_args, **_kwargs):
+        calls.append("replacement-board")
+        return cdir / "work" / ".postprocess-private" / "replacement-board" / "composite.png"
+
     async def bootstrap(*_args, **_kwargs):
         calls.append("global-anchor")
         return {}, []
@@ -1390,6 +1394,7 @@ def test_v4_postprocess_never_calls_quality_pack_gate(
         return []
 
     monkeypatch.setattr(postprocess, "_v4_bootstrap_scene_anchors", bootstrap)
+    monkeypatch.setattr(postprocess, "_v4_generate_composite_replacement_board", board)
     monkeypatch.setattr(postprocess, "_v4_verify_bootstrap_packs", forbidden_pack)
     monkeypatch.setattr(postprocess, "_v4_generate_layout_anchors", layout)
     monkeypatch.setattr(postprocess, "_v4_fan_out", fanout)
@@ -1397,7 +1402,116 @@ def test_v4_postprocess_never_calls_quality_pack_gate(
     asyncio.run(postprocess._run_v4_task(
         settings, "cid", cdir, {}, private, {}, asyncio.Semaphore(1),
     ))
-    assert calls == ["global-anchor", "layout", "fanout"]
+    assert calls == ["replacement-board", "global-anchor", "layout", "fanout"]
+
+
+def test_v4_every_segment_anchor_reuses_the_same_composite_board_path(tmp_path):
+    cdir = tmp_path / "session"
+    board = (
+        cdir / "work" / ".postprocess-private" / "replacement-board"
+        / "composite.png"
+    )
+    board.parent.mkdir(parents=True)
+    board.write_bytes(PNG)
+
+    assert postprocess._v4_shared_references(cdir, []) == [
+        ("composite_replacement_board", board)
+    ]
+    assert postprocess._v4_shared_references(
+        cdir, [("segment_layout_anchor", cdir / "layout.png")]
+    ) == [
+        ("segment_layout_anchor", cdir / "layout.png"),
+        ("composite_replacement_board", board),
+    ]
+
+
+def test_v4_element_evidence_is_locally_collapsed_to_one_numbered_sheet(tmp_path):
+    sources = []
+    for index, value in enumerate((31, 62, 93), 1):
+        source = tmp_path / f"{index:02d}.png"
+        ok, encoded = cv2.imencode(
+            ".png", np.full((4, 6, 3), value, dtype=np.uint8)
+        )
+        assert ok
+        source.write_bytes(encoded.tobytes())
+        sources.append(source)
+    sheet = tmp_path / "source-evidence.png"
+
+    postprocess._compose_replacement_evidence_sheet(sources, sheet)
+
+    decoded = cv2.imread(str(sheet), cv2.IMREAD_COLOR)
+    assert decoded is not None
+    assert decoded.shape[:2] == (8, 12)
+
+
+def test_v4_board_provider_call_uses_only_blank_canvas_and_one_evidence_sheet(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    cdir = tmp_path / "session"
+    source = cdir / "work" / "keyframes" / "01.png"
+    source.parent.mkdir(parents=True)
+    ok, encoded = cv2.imencode(
+        ".png", np.full((4, 6, 3), 63, dtype=np.uint8)
+    )
+    assert ok
+    source.write_bytes(encoded.tobytes())
+    plan = {}
+    private = {
+        "model": settings.seedream_model,
+        "edit_mode": settings.seedream_edit_mode,
+        "timeout_s": settings.seedream_timeout_s,
+    }
+    calls = []
+
+    monkeypatch.setattr(postprocess, "_v4_project_revision", lambda *_args: 1)
+    monkeypatch.setattr(
+        image_optimization,
+        "composite_replacement_board_spec",
+        lambda _plan: {"tiles": [
+            {
+                "tile_id": f"TILE_{index:02d}",
+                "stable_key": stable_key,
+                "kind": kind,
+                "replacement_description": description,
+                "reference": {"segment_index": 0, "frame_index": 1},
+            }
+            for index, (stable_key, kind, description) in enumerate((
+                ("hero", "person", "新人物"),
+                ("prop", "entity", "新道具"),
+                ("studio", "scene", "新场景"),
+            ), 1)
+        ]},
+    )
+    monkeypatch.setattr(
+        image_optimization,
+        "composite_replacement_board_prompt",
+        lambda _plan: "TILE_01=hero；TILE_02=prop；TILE_03=studio",
+    )
+    monkeypatch.setattr(
+        postprocess, "_v4_frame_sources", lambda *_args: {(0, 1): source, (0, 2): source}
+    )
+
+    async def edit(_settings, images, prompt, output, *, receipt_path):
+        calls.append((len(images), prompt, receipt_path))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(images[0])
+
+    monkeypatch.setattr(postprocess.seedream, "edit", edit)
+    output = asyncio.run(postprocess._v4_generate_composite_replacement_board(
+        settings,
+        cdir,
+        "cid",
+        private,
+        {0: [(source, cdir / "canonical" / "01.png")]},
+        asyncio.Semaphore(1),
+        plan,
+    ))
+
+    assert output == postprocess._replacement_board_path(cdir)
+    assert output.is_file()
+    assert calls and calls[0][0] == 2
+    assert "TILE_01=hero" in calls[0][1]
 
 
 def test_v4_startup_marks_ambiguous_typed_anchor_attempt_get_only(tmp_path, monkeypatch):

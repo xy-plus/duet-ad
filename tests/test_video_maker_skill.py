@@ -107,6 +107,55 @@ def test_skill_emits_no_extra_downstream_artifacts():
         assert artifact not in text
 
 
+def test_project_index_phase_adds_one_optional_output_without_replacing_segment_work():
+    text = _skill_text()
+
+    for preserved in (
+        "逐段视觉分析",
+        "每段恰好 9 张",
+        "`work/keyframes/01.png` 至 `09.png`",
+        "`work/prompt.txt`",
+        "旧视频提示词",
+    ):
+        assert preserved in text
+
+    for added in (
+        '`phase="project_index"`',
+        "`work/project_index_request.json`",
+        "`work/element_index.json`",
+        "所有 segment 的冻结关键帧",
+        "`people/entities/scenes`",
+        "`source_visual_description`",
+        "`occurrences`",
+        "`segment_index`",
+        "`frame_orders`",
+        "`replaceable`",
+        "`preserve`",
+        "稳定语义 key",
+    ):
+        assert added in text
+
+    assert "project_index 不读取 `work/prompt.txt`" in text
+    assert "不改变逐 segment 阶段的任何既有输入、输出或规则" in text
+
+
+def test_project_index_is_a_single_additive_phase_without_quality_control_flow():
+    text = _skill_text()
+    section = text.split("## 项目级可替换元素索引", 1)[1]
+
+    assert "只执行一次" in section
+    assert "只写 `work/element_index.json`" in section
+    for forbidden in (
+        "质量门禁",
+        "重试",
+        "fallback",
+        "回退",
+        "候选版本",
+        "二次确认",
+    ):
+        assert forbidden not in section
+
+
 def test_download_archive_matches_source_with_deterministic_metadata():
     source = SKILL.parent
     files = sorted(path for path in source.rglob("*") if path.is_file())
