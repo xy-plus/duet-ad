@@ -114,6 +114,7 @@ _SAFE_ERROR_CODES = frozenset(
         "context_ir_submission_unknown",
     }
 )
+_SAFE_PROVIDER_ERROR_CODE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 
 
 class ContextIrError(RuntimeError):
@@ -1239,6 +1240,8 @@ def _new_state(request: FrozenContextIrRequest, attempt_id: str) -> dict[str, An
         "context_ir_request_sha256": None,
         "provider_task_id": None,
         "context_ir_task_sha256": None,
+        "http_status": None,
+        "provider_error_code": None,
         "receipt": None,
         "error": None,
     }
@@ -1259,6 +1262,8 @@ _STATE_KEYS = frozenset(
         "context_ir_request_sha256",
         "provider_task_id",
         "context_ir_task_sha256",
+        "http_status",
+        "provider_error_code",
         "receipt",
         "error",
     }
@@ -1491,6 +1496,29 @@ def _validate_state(
         )
     ):
         raise ContextIrReceiptError("context_ir_state_invalid")
+    http_status = state.get("http_status")
+    provider_error_code = state.get("provider_error_code")
+    if (
+        http_status is not None
+        and (
+            isinstance(http_status, bool)
+            or not isinstance(http_status, int)
+            or not 100 <= http_status <= 599
+        )
+    ):
+        raise ContextIrReceiptError("context_ir_state_invalid")
+    if provider_error_code is not None and (
+        not isinstance(provider_error_code, str)
+        or _SAFE_PROVIDER_ERROR_CODE.fullmatch(provider_error_code) is None
+    ):
+        raise ContextIrReceiptError("context_ir_state_invalid")
+    if (
+        provider_error_code is not None and http_status is None
+    ) or (
+        http_status is not None
+        and state.get("status") not in {"failed", "submission_unknown"}
+    ):
+        raise ContextIrReceiptError("context_ir_state_invalid")
     error = state.get("error")
     if error is not None and error not in _SAFE_ERROR_CODES:
         raise ContextIrReceiptError("context_ir_state_invalid")
@@ -1626,6 +1654,33 @@ def _parse_json(response: httpx.Response) -> Mapping[str, Any] | None:
     return payload if isinstance(payload, Mapping) else None
 
 
+def _safe_provider_error_code(payload: Mapping[str, Any] | None) -> str | None:
+    """Extract only a bounded provider code; never persist provider messages."""
+    if payload is None:
+        return None
+    candidates: list[Any] = []
+    error = payload.get("error")
+    if isinstance(error, Mapping):
+        candidates.append(error.get("code"))
+    candidates.extend((payload.get("error_code"), payload.get("code")))
+    base_resp = payload.get("base_resp")
+    if isinstance(base_resp, Mapping):
+        candidates.extend((base_resp.get("code"), base_resp.get("status_code")))
+    for candidate in candidates:
+        if isinstance(candidate, bool):
+            continue
+        if isinstance(candidate, int):
+            if candidate == 0:
+                continue
+            candidate = str(candidate)
+        if (
+            isinstance(candidate, str)
+            and _SAFE_PROVIDER_ERROR_CODE.fullmatch(candidate) is not None
+        ):
+            return candidate
+    return None
+
+
 def _normalized_file_id(payload: Mapping[str, Any] | None) -> str | None:
     if payload is None:
         return None
@@ -1653,9 +1708,13 @@ def _mark_terminal(
     *,
     status: Literal["failed", "submission_unknown", "query_unknown"],
     error: str,
+    http_status: int | None = None,
+    provider_error_code: str | None = None,
 ) -> None:
     state["status"] = status
     state["error"] = error
+    state["http_status"] = http_status
+    state["provider_error_code"] = provider_error_code
     _persist(path, state)
 
 
@@ -1710,6 +1769,12 @@ def _upload_references(
                 state,
                 status="submission_unknown" if error.endswith("submission_unknown") else "failed",
                 error=error,
+                http_status=response.status_code if not response.is_success else None,
+                provider_error_code=(
+                    _safe_provider_error_code(payload)
+                    if not response.is_success
+                    else None
+                ),
             )
             return False
         state["references"][index]["file_id"] = file_id
@@ -1764,12 +1829,20 @@ def _submit(
     payload = _parse_json(response)
     task_id = _task_id(payload)
     if not response.is_success or task_id is None:
+        http_status = response.status_code if not response.is_success else None
+        provider_error_code = (
+            _safe_provider_error_code(payload)
+            if not response.is_success
+            else None
+        )
         if response.status_code >= 500 or response.is_success:
             _mark_terminal(
                 path,
                 state,
                 status="submission_unknown",
                 error="context_ir_submission_unknown",
+                http_status=http_status,
+                provider_error_code=provider_error_code,
             )
         else:
             _mark_terminal(
@@ -1777,6 +1850,8 @@ def _submit(
                 state,
                 status="failed",
                 error="context_ir_submit_rejected",
+                http_status=http_status,
+                provider_error_code=provider_error_code,
             )
         return
     state["provider_task_id"] = task_id

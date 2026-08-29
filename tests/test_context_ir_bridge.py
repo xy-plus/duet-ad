@@ -1476,6 +1476,119 @@ def test_success_response_without_task_id_is_unknown_and_never_reposted(tmp_path
     assert submit_count == 1
 
 
+def test_upload_http_rejection_persists_private_provider_diagnostics(tmp_path):
+    frozen = _frozen(tmp_path)
+    secret_body = "provider-private-secret"
+
+    def rejected(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/files/upload"
+        return _response(
+            {
+                "base_resp": {
+                    "status_code": 1004,
+                    "status_msg": secret_body,
+                },
+            },
+            status=422,
+        )
+
+    with _client(rejected) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "failed"
+    assert result.error_code == "context_ir_upload_rejected"
+    attempt_path = (
+        frozen.workdir
+        / ".context-ir"
+        / "attempts"
+        / "000001"
+        / "attempt.json"
+    )
+    raw = attempt_path.read_text(encoding="utf-8")
+    state = json.loads(raw)
+    assert state["http_status"] == 422
+    assert state["provider_error_code"] == "1004"
+    assert secret_body not in raw
+    assert "provider_body" not in state
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "expected_status", "expected_error", "expected_code"),
+    [
+        (
+            400,
+            {"code": "InvalidParameter", "msg": "provider-private-secret"},
+            "failed",
+            "context_ir_submit_rejected",
+            "InvalidParameter",
+        ),
+        (
+            503,
+            {
+                "base_resp": {
+                    "status_code": 2013,
+                    "status_msg": "provider-private-secret",
+                },
+            },
+            "submission_unknown",
+            "context_ir_submission_unknown",
+            "2013",
+        ),
+    ],
+)
+def test_submit_http_rejection_persists_private_provider_diagnostics(
+    tmp_path,
+    status,
+    payload,
+    expected_status,
+    expected_error,
+    expected_code,
+):
+    frozen = _frozen(tmp_path)
+    calls: list[httpx.Request] = []
+    base = _success_handler(frozen, requests=calls)
+
+    def rejected(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path == "/v1/files/upload":
+            return _response(
+                {
+                    "file": {
+                        "file_id": str(427752006353317 + len(
+                            [
+                                call
+                                for call in calls
+                                if call.url.path == "/v1/files/upload"
+                            ]
+                        )),
+                    },
+                    "base_resp": {"status_code": 0, "status_msg": "success"},
+                }
+            )
+        if request.url.path == "/v2/h3_context_ir":
+            return _response(payload, status=status)
+        return base(request)
+
+    with _client(rejected) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == expected_status
+    assert result.error_code == expected_error
+    attempt_path = (
+        frozen.workdir
+        / ".context-ir"
+        / "attempts"
+        / "000001"
+        / "attempt.json"
+    )
+    raw = attempt_path.read_text(encoding="utf-8")
+    state = json.loads(raw)
+    assert state["http_status"] == status
+    assert state["provider_error_code"] == expected_code
+    assert "provider-private-secret" not in raw
+    assert "provider_body" not in state
+
+
 def test_forged_frozen_request_and_changed_upstream_artifact_fail_before_network(
     tmp_path,
 ):
