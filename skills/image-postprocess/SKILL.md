@@ -13,7 +13,9 @@ description: 读取冻结关键帧，为人物与真实新场景双替换填写�
 
 同一人物使用一个简短、稳定、通用的语义 key，并在 `people` 与所有 `frames.*.people` 中复用。每帧只描述当前帧直接可见的人物区域、身体与姿态、实体关系和画外裁切；不可见或无法唯一判断的内容写成 `source-preserve/no-invention` 描述，不从其他帧补造。
 
-当前帧中由既有人物与源载体形成、但不代表独立物理人物的派生观测，只写在该人物的 `derived_observations` 中。为每种可区分观测使用简短稳定的语义 key，`mode` 使用 `optical_projection`、`temporal_residual`，无法唯一判断时使用 `source-preserve`；同时描述当前源载体、可见区域、边界和依附关系。派生观测不新增顶层人物或实体；源载体属于被替换场景时，不把该观测实例化到新场景，也不把它升级为独立物理人物。当前帧没有派生观测时写空对象；语义缺失时由后端按 `source-preserve/non-physical` 继续并写 diagnostics，不拒绝、不 retry、不 fallback。
+把每帧 `frames.*.people` 的 key 集合作为该帧物理人物全集，使人物数量闭合；只根据当前帧直接证据纳入物理人物，不因替换或含混边缘增减。逐一核对每个当前可见的头、躯干和手，并唯一归属到该帧已有的一个 stable person；可确认只是既有人物的非物理派生观测时，嵌套为该人物的 non-physical derived observation。反射、残影、边缘碎片、遮挡碎片和运动模糊不得升级为新物理人物、顶层人物或实体，也不得据此补全新的头、手或身体。无法唯一判断物理性或人物归属时写 `source-preserve/no-invention`，不新增 key，不补造肢体。
+
+当前帧中由既有人物与源载体形成、但不代表独立物理人物的派生观测，只写在该人物的 `derived_observations` 中。为每种可区分观测使用简短稳定的语义 key，`mode` 只能使用 `optical_projection`、`temporal_residual` 或 `source-preserve`；同时描述当前源载体、可见区域、边界和依附关系。派生观测不新增顶层人物或实体；源载体属于被替换场景时，不把该观测实例化到新场景，也不把它升级为独立物理人物。当前帧没有派生观测时写空对象；语义缺失时由后端按 `source-preserve/non-physical` 继续并写 diagnostics，不拒绝、不 retry、不 fallback。
 
 为跨帧持续出现、由项目级或人物归属且持有或穿戴的持久可见非人物实体建立 `stable entity key`。在 `entities` 中只写稳定外观身份、归属和持续性语义；在每帧复用同一 key，并按当前帧证据写 `visible/occluded/out_of_frame` 状态与关系。状态暂时不可判断时写 `source-preserve`，不要把未见解释成删除，也不要从相邻帧补造可见状态。`hard_cut` 后可依据新帧重新观察；只有新帧证据支持同一物理实体时才复用原 key，不得无依据新增、删除或改换身份。
 

@@ -980,6 +980,44 @@ def test_skill_keeps_derived_person_observations_nested_and_semantic_only():
         assert mechanical not in json.dumps(example, ensure_ascii=False)
 
 
+def test_skill_closes_each_frame_person_count_and_body_part_ownership():
+    skill, example = _skill_contract()
+    frame = next(iter(example["frames"].values()))
+    person = next(iter(frame["people"].values()))
+    observation = next(iter(person["derived_observations"].values()))
+
+    assert set(example) == {"people", "entities", "scenes", "frames"}
+    assert set(frame) == {"people", "relationships", "entities", "crop"}
+    assert set(person) == {
+        "visible_region", "boundary", "body_and_pose", "derived_observations",
+    }
+    assert set(observation) == {
+        "mode", "source_carrier", "visible_region", "boundary", "relationship",
+    }
+    assert observation["mode"] == (
+        "optical_projection/temporal_residual；无法唯一判断时为 source-preserve"
+    )
+    for rule in (
+        "物理人物全集",
+        "人物数量闭合",
+        "头、躯干和手",
+        "唯一归属",
+        "反射",
+        "残影",
+        "边缘碎片",
+        "遮挡碎片",
+        "运动模糊",
+        "不得升级为新物理人物",
+        "source-preserve/no-invention",
+    ):
+        assert rule in skill
+    encoded = json.dumps(example, ensure_ascii=False)
+    for forbidden_field in (
+        "physical_person_count", "body_part_ledger", "ambiguity_gate",
+    ):
+        assert forbidden_field not in encoded
+
+
 def test_skill_keeps_entity_relationships_semantic_and_non_refusing():
     skill, example = _skill_contract()
     frame = next(iter(example["frames"].values()))
