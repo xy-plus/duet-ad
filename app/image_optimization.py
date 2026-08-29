@@ -738,6 +738,8 @@ _DIRECTLY_VISIBLE_ENTITY_VISIBILITIES = {
 }
 _ENTITY_RELATION_PREDICATES = {
     "supports", "contacts", "separate_from", "occludes", "owned_by",
+    "attached_to", "loaded_in", "held_by", "drives", "releases",
+    "inside", "part_of",
 }
 _PHYSICAL_ENTITY_RELATION_PREDICATES = {
     "supports", "contacts", "separate_from",
@@ -1200,7 +1202,7 @@ def _canonical_non_person_entity_ledger(
                     "image optimization output is missing or invalid"
                 )
             occlusion_pairs.add(pair)
-        else:
+        elif predicate == "owned_by":
             if subject in ownership_subjects:
                 raise ImageOptimizationOutputError(
                     "image optimization output is missing or invalid"
@@ -1560,7 +1562,7 @@ def _semantic_text(value: object, default: str, *, max_bytes: int = 1000) -> str
 def _canonical_element_index(value: object) -> dict:
     """Keep valid first-Skill facts without turning missing semantics into control flow."""
     raw_index = value if isinstance(value, dict) else {}
-    result = {"people": {}, "entities": {}, "scenes": {}}
+    result = {"people": {}, "entities": {}, "scenes": {}, "relations": {}}
     for category in ("people", "entities", "scenes"):
         raw_items = raw_index.get(category)
         if not isinstance(raw_items, dict):
@@ -1623,6 +1625,71 @@ def _canonical_element_index(value: object) -> dict:
                 ],
             }
         result[category] = items
+    known_keys = set().union(*(set(result[key]) for key in ("people", "entities", "scenes")))
+    raw_relations = raw_index.get("relations")
+    if isinstance(raw_relations, dict):
+        for relation_key, raw in raw_relations.items():
+            if (
+                not isinstance(relation_key, str) or not relation_key.strip()
+                or relation_key != relation_key.strip() or not isinstance(raw, dict)
+            ):
+                continue
+            subject = raw.get("subject_key")
+            predicate = raw.get("predicate")
+            object_key = raw.get("object_key")
+            if (
+                subject not in known_keys or object_key not in known_keys
+                or subject == object_key or not isinstance(predicate, str)
+                or not predicate.strip()
+            ):
+                continue
+            occurrences = []
+            for occurrence in raw.get("occurrences", []):
+                if not isinstance(occurrence, dict):
+                    continue
+                segment_index = occurrence.get("segment_index")
+                frames = occurrence.get("frames")
+                if (
+                    isinstance(segment_index, bool) or not isinstance(segment_index, int)
+                    or segment_index < 0 or not isinstance(frames, list)
+                ):
+                    continue
+                normalized_frames = []
+                for frame in frames:
+                    if not isinstance(frame, dict):
+                        continue
+                    order = frame.get("frame_order")
+                    state = frame.get("state")
+                    geometry = frame.get("geometry")
+                    if (
+                        isinstance(order, bool) or not isinstance(order, int) or order < 1
+                        or not isinstance(state, str) or not state.strip()
+                        or not isinstance(geometry, str) or not geometry.strip()
+                    ):
+                        continue
+                    normalized_frames.append({
+                        "frame_order": order,
+                        "state": state.strip(),
+                        "geometry": geometry.strip(),
+                    })
+                normalized_frames.sort(key=lambda item: item["frame_order"])
+                if normalized_frames:
+                    occurrences.append({
+                        "segment_index": segment_index,
+                        "frames": normalized_frames,
+                    })
+            occurrences.sort(key=lambda item: item["segment_index"])
+            result["relations"][relation_key] = {
+                "subject_key": subject,
+                "predicate": predicate.strip(),
+                "object_key": object_key,
+                "occurrences": occurrences,
+                "preserve": [
+                    text.strip() for text in raw.get("preserve", [])
+                    if isinstance(text, str) and text.strip()
+                ],
+                "replace_together": raw.get("replace_together") is True,
+            }
     return result
 
 
@@ -1788,11 +1855,15 @@ def compile_semantic_plan(
     raw_entities = (
         raw.get("entities") if isinstance(raw.get("entities"), dict) else {}
     )
+    raw_relations = (
+        raw.get("relations") if isinstance(raw.get("relations"), dict) else {}
+    )
     raw_scenes = raw.get("scenes") if isinstance(raw.get("scenes"), dict) else {}
     raw_frames = raw.get("frames") if isinstance(raw.get("frames"), dict) else {}
     indexed_people = set((element_index or {}).get("people", {}))
     indexed_entities = set((element_index or {}).get("entities", {}))
     indexed_scenes = set((element_index or {}).get("scenes", {}))
+    indexed_relations = (element_index or {}).get("relations", {})
     frame_by_key = {item["key"]: item for item in slots["frames"]}
     frames_by_segment: dict[int, list[dict]] = {}
     for slot in slots["frames"]:
@@ -1805,6 +1876,40 @@ def compile_semantic_plan(
     entity_source_preserve_defaults: list[str] = []
     appearance_source_preserve_defaults: list[str] = []
     classified_derived_appearances = 0
+
+    relation_designs: dict[str, dict] = {}
+    relation_systems_by_member: dict[str, list[str]] = {}
+    for relation_key, indexed in indexed_relations.items():
+        if not isinstance(indexed, dict):
+            continue
+        design = raw_relations.get(relation_key)
+        if not isinstance(design, dict):
+            design = {}
+        subject = indexed["subject_key"]
+        object_key = indexed["object_key"]
+        predicate = _semantic_text(
+            design.get("predicate"), indexed["predicate"], max_bytes=128,
+        )
+        replacement_system = _semantic_text(
+            design.get("replacement_system"),
+            "保持两个替换元素的功能接口、尺度和配合方式",
+            max_bytes=512,
+        )
+        preserve = _semantic_text(
+            design.get("preserve"),
+            "保持源帧直接可见的角色分工、接触几何和状态",
+            max_bytes=512,
+        )
+        relation_designs[relation_key] = {
+            "subject_key": subject,
+            "predicate": predicate,
+            "object_key": object_key,
+            "replacement_system": replacement_system,
+            "preserve": preserve,
+        }
+        system = f"关系 {relation_key}：{subject} {predicate} {object_key}；{replacement_system}"
+        relation_systems_by_member.setdefault(subject, []).append(system)
+        relation_systems_by_member.setdefault(object_key, []).append(system)
 
     def field(
         container: object,
@@ -1930,6 +2035,8 @@ def compile_semantic_plan(
         if replacement_identity == source_identity:
             replacement_identity = f"与源身份不同的新人物：{replacement_identity}"
             issues.append(f"unchanged_identity:{key}")
+        if relation_systems_by_member.get(key):
+            replacement_identity += "；" + "；".join(relation_systems_by_member[key])
         if key in indexed_people:
             replacement_identity = _tag_stable_key(key, replacement_identity)
         first_key = next(
@@ -2013,7 +2120,13 @@ def compile_semantic_plan(
         entity_designs[entity_key] = {
             "description": _semantic_text(
                 (
-                    _tag_stable_key(entity_key, description.strip())
+                    _tag_stable_key(
+                        entity_key,
+                        description.strip() + (
+                            "；" + "；".join(relation_systems_by_member[entity_key])
+                            if relation_systems_by_member.get(entity_key) else ""
+                        ),
+                    )
                     if entity_key in indexed_entities
                     and isinstance(description, str) and description.strip()
                     else description
@@ -2282,6 +2395,74 @@ def compile_semantic_plan(
                     f"{_semantic_text(relationship, '')}；"
                     f"{entity_designs[entity_key]['persistence']}"
                 )
+            frame_relation_semantics = (
+                frame_value.get("relations")
+                if isinstance(frame_value, dict)
+                and isinstance(frame_value.get("relations"), dict)
+                else {}
+            )
+            stable_to_runtime = {
+                **{
+                    key: identifier for key, identifier in person_id_by_key.items()
+                    if identifier in current_person_ids
+                },
+                **scene_entity_ids,
+            }
+            directly_visible_stable_keys = {
+                person_key for person_key in observed_person_keys
+                if frame["key"] in observations[person_key]
+            } | {
+                entity_key for entity_key, observation in frame_entity_semantics.items()
+                if isinstance(observation, dict)
+                and observation.get("visibility") in {"visible", "occluded"}
+            }
+            for relation_key, design in relation_designs.items():
+                observation = frame_relation_semantics.get(relation_key)
+                if not isinstance(observation, dict):
+                    continue
+                if not {
+                    design["subject_key"], design["object_key"]
+                }.issubset(directly_visible_stable_keys):
+                    continue
+                subject_id = stable_to_runtime.get(design["subject_key"])
+                object_id = stable_to_runtime.get(design["object_key"])
+                if subject_id is None or object_id is None:
+                    continue
+                state = _semantic_text(
+                    observation.get("state"), "source-preserve/no-invention",
+                    max_bytes=256,
+                )
+                geometry = _semantic_text(
+                    observation.get("geometry"), "保持当前帧直接可见的相对几何",
+                    max_bytes=256,
+                )
+                evidence = _semantic_text(
+                    observation.get("evidence"), "当前帧直接可见像素",
+                    max_bytes=256,
+                )
+                predicate = design["predicate"].strip().lower().replace(" ", "_")
+                if predicate not in _ENTITY_RELATION_PREDICATES:
+                    predicate = "contacts"
+                    if subject_id > object_id:
+                        subject_id, object_id = object_id, subject_id
+                ledger_relations.append({
+                    "subject_id": subject_id,
+                    "predicate": predicate,
+                    "object_id": object_id,
+                })
+                entity_relation_notes.append(
+                    "全项目共享关系绑定："
+                    f"{relation_key} -> {design['subject_key']} -> {design['predicate']} -> "
+                    f"{design['object_key']} -> {design['replacement_system']}；"
+                    f"当前状态={state}；当前几何={geometry}；证据={evidence}；"
+                    f"保持={design['preserve']}"
+                )
+            ledger_relations = [
+                dict(item) for item in {
+                    (item["subject_id"], item["predicate"], item["object_id"]): item
+                    for item in ledger_relations
+                }.values()
+            ]
             ledger_relations.sort(
                 key=lambda item: (
                     item["subject_id"], item["predicate"], item["object_id"]
@@ -3743,7 +3924,7 @@ def generate_project_prompts(
             stage=stage,
             session=session,
             output_name="global_plan.json",
-            expected_keys={"people", "entities", "scenes"},
+            expected_keys={"people", "entities", "scenes", "relations"},
             max_bytes=MAX_CONTINUITY_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
         )
 

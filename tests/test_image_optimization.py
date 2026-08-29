@@ -1454,6 +1454,120 @@ def test_v4_frame_prompt_uses_only_the_current_person_observation(tmp_path):
         assert "不得实例化为新的物理人物或人体结构" in prompt
 
 
+def test_relation_index_compiles_joint_design_and_frame_state_into_prompt(tmp_path):
+    segments, source_frames = _semantic_compiler_input(tmp_path, frame_count=2)
+    element_index = {
+        "people": {},
+        "entities": {
+            "entity-01": {
+                "source_visual_description": "first visible component",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1, 2]}],
+                "replaceable": ["appearance"], "preserve": ["function"],
+            },
+            "entity-02": {
+                "source_visual_description": "second visible component",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1, 2]}],
+                "replaceable": ["appearance"], "preserve": ["function"],
+            },
+        },
+        "scenes": {},
+        "relations": {
+            "relation-01": {
+                "subject_key": "entity-01", "predicate": "loaded_in",
+                "object_key": "entity-02",
+                "occurrences": [{"segment_index": 1, "frames": [
+                    {"frame_order": 1, "state": "engaged", "geometry": "aligned"},
+                    {"frame_order": 2, "state": "released", "geometry": "separated"},
+                ]}],
+                "preserve": ["roles", "interface"], "replace_together": True,
+            }
+        },
+    }
+    semantic = {
+        "people": {},
+        "entities": {
+            "entity-01": {"description": "replacement component A", "owner": "project", "association": "system member", "persistence": "same design"},
+            "entity-02": {"description": "replacement component B", "owner": "project", "association": "system member", "persistence": "same design"},
+        },
+        "relations": {
+            "relation-01": {
+                "subject_key": "entity-01", "predicate": "loaded_in",
+                "object_key": "entity-02", "replacement_system": "matched interface and scale",
+                "preserve": "keep roles and current state",
+            }
+        },
+        "scenes": {"scene-001": {
+            "source_scene": "source setting", "replacement_scene": "different setting",
+            "semantic_change": "same use", "geometry_change": "different geometry",
+            "depth_change": "different depth", "layout_change": "different layout",
+            "local_color_change": "different local color",
+        }},
+        "frames": {
+            f"frame-{number:03d}": {
+                "people": {},
+                "entities": {
+                    "entity-01": {"visibility": "visible", "relationship": "directly visible"},
+                    "entity-02": {"visibility": "visible", "relationship": "directly visible"},
+                },
+                "relations": {"relation-01": {
+                    "state": "engaged" if number == 1 else "released",
+                    "geometry": "aligned" if number == 1 else "separated",
+                    "evidence": "current pixels",
+                }},
+                "relationships": "preserve visible relations", "crop": "preserve crop",
+            } for number in (1, 2)
+        },
+    }
+
+    plan, _diagnostics = image_optimization.compile_semantic_plan(
+        semantic, segments, source_frames=source_frames, element_index=element_index,
+    )
+    prompts = image_optimization.compile_frame_prompts(plan, "anchor_consistency")[1]
+
+    assert "matched interface and scale" in image_optimization.composite_replacement_board_prompt(plan)
+    assert "全项目共享关系绑定：relation-01" in prompts[1]
+    assert "当前状态=engaged" in prompts[1]
+    assert "当前状态=released" in prompts[2]
+    assert any(
+        relation["predicate"] == "loaded_in"
+        for relation in plan["segments"][0]["frame_constraints"][0]["non_person_entity_ledger"]["relations"]
+    )
+
+
+def test_relation_index_normalization_is_tolerant_and_preserves_valid_edges():
+    value = {
+        "people": {},
+        "entities": {
+            key: {
+                "source_visual_description": key,
+                "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+                "replaceable": [], "preserve": [],
+            } for key in ("entity-01", "entity-02")
+        },
+        "scenes": {},
+        "relations": {
+            "relation-01": {
+                "subject_key": "entity-01", "predicate": "attached_to",
+                "object_key": "entity-02",
+                "occurrences": [{"segment_index": 1, "frames": [{
+                    "frame_order": 1, "state": "connected", "geometry": "aligned",
+                }]}],
+                "preserve": ["roles"], "replace_together": True,
+            },
+            "relation-invalid": {
+                "subject_key": "missing", "predicate": "contacts",
+                "object_key": "entity-02",
+            },
+        },
+    }
+
+    normalized = image_optimization._canonical_element_index(value)
+
+    assert set(normalized) == {"people", "entities", "scenes", "relations"}
+    assert set(normalized["relations"]) == {"relation-01"}
+    assert normalized["relations"]["relation-01"]["replace_together"] is True
+
+
 def test_semantic_compiler_ignores_model_palette_wording_and_uses_source(
     tmp_path,
 ):

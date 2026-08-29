@@ -67,8 +67,28 @@ def _element_index() -> dict:
                 "preserve": ["one identity", "body shape", "relationships"],
             }
         },
-        "entities": {},
+        "entities": {
+            "entity-01": {
+                "source_visual_description": "handheld component",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1, 2]}],
+                "replaceable": ["appearance"],
+                "preserve": ["function", "interface"],
+            }
+        },
         "scenes": {},
+        "relations": {
+            "relation-01": {
+                "subject_key": "entity-01",
+                "predicate": "held_by",
+                "object_key": "woman-red-coat",
+                "occurrences": [{"segment_index": 1, "frames": [
+                    {"frame_order": 1, "state": "held", "geometry": "inside hand"},
+                    {"frame_order": 2, "state": "released", "geometry": "apart"},
+                ]}],
+                "preserve": ["roles", "state sequence"],
+                "replace_together": True,
+            }
+        },
     }
 
 

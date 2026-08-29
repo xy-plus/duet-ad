@@ -248,7 +248,7 @@ def test_skill_exposes_closed_global_and_segment_json_contracts():
 
     assert len(contracts) == 2
     global_plan, segment_frames = contracts
-    assert set(global_plan) == {"people", "entities", "scenes"}
+    assert set(global_plan) == {"people", "entities", "scenes", "relations"}
     assert set(segment_frames) == {"frames"}
     assert set(next(iter(global_plan["people"].values()))) == {
         "source_identity", "replacement_identity", "wardrobe_change",
@@ -263,7 +263,7 @@ def test_skill_exposes_closed_global_and_segment_json_contracts():
         "local_color_change",
     }
     frame = next(iter(segment_frames["frames"].values()))
-    assert set(frame) == {"people", "relationships", "entities", "crop"}
+    assert set(frame) == {"people", "relationships", "entities", "relations", "crop"}
     person = next(iter(frame["people"].values()))
     assert set(person) == {
         "visible_region", "boundary", "body_and_pose",
@@ -275,12 +275,18 @@ def test_skill_exposes_closed_global_and_segment_json_contracts():
         "relationship",
     }
     entity = next(iter(frame["entities"].values()))
+    relation = next(iter(global_plan["relations"].values()))
+    frame_relation = next(iter(frame["relations"].values()))
     assert set(entity) == {"visibility", "relationship"}
-    assert global_plan["entities"]["<stable-entity-key>"]["owner"] == "project"
+    assert next(iter(global_plan["entities"].values()))["owner"] == "project"
     assert observation["mode"] in {
         "optical_projection", "temporal_residual", "source-preserve",
     }
     assert entity["visibility"] in {"visible", "occluded"}
+    assert set(relation) == {
+        "subject_key", "predicate", "object_key", "replacement_system", "preserve",
+    }
+    assert set(frame_relation) == {"state", "geometry", "evidence"}
 
 
 def test_skill_frame_entities_are_direct_evidence_only_and_omit_out_of_frame():

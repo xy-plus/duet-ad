@@ -661,7 +661,7 @@ def _generate_project_element_index(
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     raise ValueError("project index output is invalid") from None
                 if not isinstance(value, dict) or set(value) != {
-                    "people", "entities", "scenes"
+                    "people", "entities", "scenes", "relations"
                 }:
                     raise ValueError("project index output is invalid")
                 return raw_output
