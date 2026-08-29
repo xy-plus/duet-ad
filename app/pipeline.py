@@ -1217,7 +1217,12 @@ def _generate_segmented_image_prompts(
     if element_index_path is not None:
         kwargs["element_index_path"] = element_index_path
     continuity, prompts = _generate_image_optimization_project(
-        settings, runner, specs, skill_bytes=skill_bytes, **kwargs,
+        settings,
+        runner,
+        specs,
+        skill_bytes=skill_bytes,
+        milestone=milestone,
+        **kwargs,
     )
     if continuity is None:
         raise PipelineError("image continuity was not generated")

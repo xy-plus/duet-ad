@@ -142,3 +142,35 @@ def test_postprocess_verdict_requires_explicit_frozen_skill_bytes():
     assert signature.parameters["skill_bytes"].default is inspect.Parameter.empty
     source = inspect.getsource(postprocess._v4_verify_bootstrap_packs)
     assert "skill_bytes=skill_bytes" in source
+
+
+def test_segmented_image_project_keeps_milestone_for_element_index(
+    tmp_path, monkeypatch,
+):
+    work = tmp_path / "cid" / "work"
+    segments = [
+        {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut"},
+    ]
+    (work / "segments" / "1" / "work" / "keyframes").mkdir(parents=True)
+    milestone = object()
+    observed = {}
+
+    def fake_project(*_args, **kwargs):
+        observed.update(kwargs)
+        return {"version": 4}, {1: {}}
+
+    monkeypatch.setattr(
+        pipeline, "_generate_image_optimization_project", fake_project,
+    )
+    pipeline._generate_segmented_image_prompts(
+        object(),
+        object(),
+        segments,
+        [dict(segments[0])],
+        work,
+        session_dir=work.parent,
+        milestone=milestone,
+        skill_bytes=b"frozen image skill",
+    )
+
+    assert observed["milestone"] is milestone
