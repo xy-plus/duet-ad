@@ -30,7 +30,7 @@ description: 读取冻结关键帧和全视频稳定元素索引，生成跨段�
 }
 ```
 
-`people` 只列当前帧有直接证据的物理人物；key 集为物理人物全集，人物数量闭合；同一人物 key 不随段或帧改变且跨帧稳定，wardrobe 设计一致。`global_plan` 只给替换设计；`element_index.occurrences` 只限候选帧，仍须当前像素确认；同一人物及服装跨段只复用该 key，不建别名。必须逐张按顺序检查（含末帧）；每帧只描述当前帧直接可见内容。`transition_skeleton` 标出的 `hard_cut` 及其相邻帧、强运动模糊和 `edge_fragment` 只能绑定本帧直接可见像素，禁止从全局参考、索引或邻帧补头、补人、补衣服或补肢体；不可见部分不继承上一帧。核对头、躯干和手并唯一归属；反射、残影、边缘碎片、遮挡碎片、运动模糊不得升级为新物理人物、实体或人体。无人物或无派生观测写 `{}`。派生观测只嵌套来源人物下，不代表独立物理人物、不新增顶层人物或实体、不把该观测实例化到新场景；`mode` 只能是 `optical_projection`、`temporal_residual` 或 `source-preserve`。不可见或无法唯一判断时不新增 key、不补造肢体，在 string 中写 `source-preserve/no-invention`，不从其他帧补造；缺失语义由后端按 `source-preserve/non-physical` 继续，不拒绝、不 retry、不 fallback。
+`people` 只列当前帧有直接证据的物理人物；key 集为物理人物全集，人物数量闭合；同一人物 key 不随段或帧改变且跨帧稳定，wardrobe 设计一致。`global_plan`只给替换；`element_index.occurrences`定唯一候选帧：逐一核验并复用 key，未列帧省略；同一人物及服装跨段只用该 key，不建别名。逐张顺序检查含末帧；每帧只写当前直接可见内容。`transition_skeleton` 标出的 `hard_cut` 及其相邻帧、强运动模糊和 `edge_fragment` 只能绑定本帧直接可见像素，禁止从全局参考、索引或邻帧补头、补人、补衣服或补肢体；不可见部分不继承上一帧。核对头、躯干和手并唯一归属；反射、残影、边缘碎片、遮挡碎片、运动模糊不得升级为新物理人物、实体或人体。无人物或无派生观测写 `{}`。派生观测只嵌套来源人物下，不代表独立物理人物、不新增顶层人物或实体、不把该观测实例化到新场景；`mode` 只能是 `optical_projection`、`temporal_residual` 或 `source-preserve`。不可见或无法唯一判断时不新增 key、不补造肢体，在 string 中写 `source-preserve/no-invention`，不从其他帧补造；缺失语义由后端按 `source-preserve/non-physical` 继续，不拒绝、不 retry、不 fallback。
 
 `entities` 只列当前帧有直接像素证据的全局持久非人物实体：`visible`=直接可见、`occluded`=部分可见；完全出画、完全不可见或仅由邻帧推知时省略 key，不写 `out_of_frame` 占位。`element_index`/`global_plan`存在不等于本帧可见；实体跨段复用 stable key，颜色/款式/材质/归属/关系不得漂移。`hard_cut`及其相邻帧、强模糊、`edge_fragment`只能据当前帧像素，不能用全局参考补实体、补衣服或补关系；`visibility`只能是`visible`/`occluded`；source-preserve 是 mode 的第三个值，不是 visibility 的枚举值。实体关系、`relationships`、`crop`只写当前帧；未知写`source-preserve/no-invention`，`hard_cut`后由当前帧证据重新确认。
 
