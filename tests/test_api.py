@@ -3,7 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
-from app import main as main_module, storage
+from app import main as main_module, skill_milestone, storage
 from app.main import create_app
 
 
@@ -63,11 +63,47 @@ def test_detail_shape_has_no_context_ir_contract(client, video_1s):
         "dialogue", "receipt_version", "generation", "has_source", "has_video",
         "navigation_status", "submit_enabled", "postprocess", "postprocess_enabled",
         "postprocess_capabilities", "image_optimization_prompt",
-        "image_acceptance",
+        "image_acceptance", "skill_milestone",
     }
     assert body["generation"] is None
     assert body["has_source"] is True
     assert 0.9 <= body["duration_s"] <= 1.1
+    assert body["skill_milestone"] is None
+
+
+def test_detail_skill_milestone_reads_cid_frozen_manifest_after_live_source_drift(
+    tmp_path,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(
+        settings.data_dir, note="frozen", orig_name="a.mp4",
+    )
+    root = settings.data_dir / meta["id"]
+    source_root = tmp_path / "skill-repo"
+    for name in skill_milestone.SKILL_NAMES:
+        source = source_root / "skills" / name / "SKILL.md"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(f"initial {name}\n".encode())
+    frozen = skill_milestone.freeze(
+        root, repository_root=source_root, git_commit=None,
+    )
+    for name in skill_milestone.SKILL_NAMES:
+        (source_root / "skills" / name / "SKILL.md").write_bytes(
+            f"drifted {name}\n".encode()
+        )
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get(
+            f"/api/conversations/{meta['id']}", headers=AUTH,
+        )
+
+    assert response.status_code == 200
+    summary = response.json()["skill_milestone"]
+    assert summary == frozen.public_summary()
+    assert summary["milestone_id"] == frozen.milestone_id
+    assert [item["name"] for item in summary["skills"]] == list(
+        skill_milestone.SKILL_NAMES
+    )
 
 
 @pytest.mark.parametrize(

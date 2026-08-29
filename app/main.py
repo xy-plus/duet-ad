@@ -31,6 +31,7 @@ from app import (
     postprocess,
     prepared_input,
     published_preview,
+    skill_milestone,
     stitch,
     storage,
     voice,
@@ -217,6 +218,17 @@ def _public_lines(value) -> list[dict]:
         ):
             lines.append({"text": text, "start_s": float(start_s), "end_s": float(end_s)})
     return lines
+
+
+def _public_skill_milestone(cdir: Path) -> dict | None:
+    """Expose only the validated CID-local Skill freeze, never live sources."""
+    manifest_path = cdir / skill_milestone.MANIFEST_RELATIVE_PATH
+    if not manifest_path.exists():
+        return None
+    try:
+        return skill_milestone.load(cdir).public_summary()
+    except skill_milestone.SkillMilestoneError:
+        return None
 
 
 def _automatic_public_lines(meta: dict) -> list[dict]:
@@ -3807,6 +3819,7 @@ def create_app(settings: Settings) -> FastAPI:
             "resolution": resolution,
             "fit_profiles": fit_profiles,
             "dialogue": _public_dialogue(meta),
+            "skill_milestone": _public_skill_milestone(cdir),
             "receipt_version": _receipt_version(cdir, meta),
             "generation": _public_generation(meta, cdir, settings),
             "has_source": any(cdir.glob("source.*")),
