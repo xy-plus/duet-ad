@@ -62,6 +62,7 @@ def test_short_video_is_the_single_segment_contract():
 
 
 def test_provider_integer_duration_boundaries_do_not_hide_positive_overflow():
+    assert provider_duration_s(0.0, 2.58) == 4
     assert provider_duration_s(37.52, 47.52) == 10
     assert provider_duration_s(0.0, 10.000001) == 11
     assert provider_duration_s(

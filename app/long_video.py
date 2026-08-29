@@ -18,6 +18,7 @@ SHORT_VIDEO_MAX_S = 10.0
 PREVIOUS_SHORT_VIDEO_MAX_S = 10.0
 LONG_VIDEO_MAX_S = 300.0
 SEGMENT_MIN_S = 1.0
+SEGMENT_PROVIDER_MIN_DURATION_S = 4
 SEGMENT_PROVIDER_MAX_DURATION_S = 10
 PREVIOUS_SEGMENT_PROVIDER_MAX_DURATION_S = 10
 LEGACY_PROVIDER_MAX_DURATION_S = 15
@@ -102,6 +103,10 @@ def segment_duration_s(
     return duration
 
 
+def _provider_duration_for_duration(duration: float) -> int:
+    return max(SEGMENT_PROVIDER_MIN_DURATION_S, math.ceil(duration))
+
+
 def provider_duration_s(
     start_s: object,
     end_s: object,
@@ -119,7 +124,7 @@ def provider_duration_s(
         end_s,
         receipt_version=receipt_version,
     )
-    return max(1, math.ceil(duration))
+    return _provider_duration_for_duration(duration)
 
 
 def _bounds(
@@ -391,7 +396,7 @@ def localize_keyframe_sources(
         raise LongVideoError("long_video_invalid_segment_duration") from None
 
     diagnostics: list[dict] = []
-    canonical_provider_duration = max(1, math.ceil(duration))
+    canonical_provider_duration = _provider_duration_for_duration(duration)
     if not (
         isinstance(provider_duration_s, int)
         and not isinstance(provider_duration_s, bool)
