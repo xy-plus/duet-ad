@@ -311,6 +311,37 @@ def test_generation_waits_for_every_postprocess_segment_done():
     assert result == {"partial": False, "failed": False, "allDone": True, "absent": True}
 
 
+def test_live_image_progress_uses_receipt_projected_segment_counts():
+    result = _run_contract(
+        "(()=>{const states=[];for(let completed=0;completed<=9;completed+=1){"
+        "states.push(contract.ppCompletedFrames({postprocess:{frames:[],segments:["
+        "{index:0,status:'running',stage:'seedream',completed_frames:completed,"
+        "total_frames:9,revision:1,error:null}]}}));}return states})()"
+    )
+    assert result == list(range(10))
+
+
+def test_detail_polling_covers_every_nonterminal_backend_phase_and_stops_terminal():
+    result = _run_contract(
+        "(()=>({analysis:contract.shouldPollDetail({status:'processing'}),"
+        "postprocess:contract.shouldPollDetail({status:'done',postprocess:{status:'queued'}}),"
+        "fusion:contract.shouldPollDetail({status:'done',prompt_fusion:{status:'running'}}),"
+        "contextIr:contract.shouldPollDetail({status:'done',generation:{status:'running',stage:'context_ir'}}),"
+        "h3:contract.shouldPollDetail({status:'done',generation:{status:'running',stage:'h3'}}),"
+        "stitch:contract.shouldPollDetail({status:'done',generation:{status:'running',stage:'stitch'}}),"
+        "projected:contract.shouldPollDetail({status:'done',navigation_status:'postprocessing'}),"
+        "done:contract.shouldPollDetail({status:'done',postprocess:{status:'done'},"
+        "prompt_fusion:{status:'done'},generation:{status:'succeeded',stage:'stitch'}}),"
+        "failed:contract.shouldPollDetail({status:'done',generation:{status:'failed'}}),"
+        "unknown:contract.shouldPollDetail({status:'done',generation:{status:'submission_unknown'}})}))()"
+    )
+    assert result == {
+        "analysis": True, "postprocess": True, "fusion": True,
+        "contextIr": True, "h3": True, "stitch": True, "projected": True,
+        "done": False, "failed": False, "unknown": False,
+    }
+
+
 def test_blocked_postprocess_never_calls_generation_submit_request():
     result = _run_async_contract(
         "(async()=>{let requests=0;const request=async()=>{requests+=1;return {ok:true}};"

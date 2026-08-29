@@ -234,18 +234,22 @@ describe('detail state contract', () => {
       .toEqual({ className: 'failed', text: '状态异常' });
   });
 
-  it('polls analysis, generation and postprocess running states only', () => {
+  it('polls every nonterminal detail phase and stops at terminal states', () => {
     expect(shouldPollDetail({ status: 'queued' })).toBe(true);
     expect(shouldPollDetail({ status: 'processing' })).toBe(true);
     expect(shouldPollDetail({ status: 'done', generation: { status: 'running' } })).toBe(true);
     expect(shouldPollDetail({ status: 'done', generation: { status: 'queued' } })).toBe(true);
     expect(shouldPollDetail({ status: 'done', postprocess: { status: 'running' } })).toBe(true);
+    expect(shouldPollDetail({ status: 'done', postprocess: { status: 'queued' } })).toBe(true);
     expect(shouldPollDetail({ status: 'done', prompt_fusion: { status: 'pending' } })).toBe(true);
     expect(shouldPollDetail({ status: 'done', prompt_fusion: { status: 'running' } })).toBe(true);
     expect(shouldPollDetail({ status: 'done', prompt_fusion: { status: 'done' } })).toBe(false);
     expect(shouldPollDetail({ status: 'done', generation: { status: 'submission_unknown' } }))
       .toBe(false);
     expect(shouldPollDetail({ status: 'done', generation: { status: 'failed' } })).toBe(false);
+    expect(shouldPollDetail({ status: 'done', navigation_status: 'analysis_processing' })).toBe(true);
+    expect(shouldPollDetail({ status: 'done', navigation_status: 'postprocessing' })).toBe(true);
+    expect(shouldPollDetail({ status: 'done', navigation_status: 'completed' })).toBe(false);
   });
 
   it('separates stable, postprocess progress and generation signatures', () => {
@@ -261,6 +265,13 @@ describe('detail state contract', () => {
       ...base,
       postprocess: { status: 'running', frames: ['frame.png'] },
     });
+    const receiptProgress = detailSignature({
+      ...base,
+      postprocess: { status: 'running', frames: [], segments: [{
+        index: 0, status: 'running', stage: 'seedream',
+        completed_frames: 1, total_frames: 9, revision: 1, error: null,
+      }] },
+    });
     const generation = detailSignature({
       ...base,
       generation: { status: 'running', segments: [{ index: 1, status: 'succeeded' }] },
@@ -268,6 +279,8 @@ describe('detail state contract', () => {
 
     expect(frame.stable).toBe(original.stable);
     expect(frame.dyn).not.toBe(original.dyn);
+    expect(receiptProgress.stable).toBe(original.stable);
+    expect(receiptProgress.dyn).not.toBe(original.dyn);
     expect(generation.stable).toBe(original.stable);
     expect(generation.generation).not.toBe(original.generation);
   });

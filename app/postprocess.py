@@ -1109,8 +1109,19 @@ async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
         seedream_timeout_s=private["timeout_s"],
     )
 
+    def publish_progress() -> None:
+        # The provider receipt and output are written before edit() returns.
+        # Project only those durable per-frame successes; canonical publication
+        # remains manifest-last and is intentionally unchanged.
+        completed = sum(
+            output.is_file() and (attempts / f"{position:04d}-r{revision}.json").is_file()
+            for position, output in enumerate(outputs, 1)
+        )
+        _update_segment(settings, cid, index, completed_frames=completed)
+
     async def call(position: int, image_inputs: list[Path], output: Path) -> None:
         if output.is_file():
+            publish_progress()
             return
         source = image_inputs[0]
         source_sha256 = source_sha256s.get(source.name)
@@ -1122,6 +1133,7 @@ async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
                 task_settings, [path.read_bytes() for path in image_inputs], prompt, output,
                 receipt_path=attempts / f"{position:04d}-r{revision}.json",
             )
+        publish_progress()
 
     if private["edit_mode"] == "independent_parallel":
         results = await asyncio.gather(
@@ -1383,6 +1395,57 @@ def _load_json_receipt(path: Path) -> dict | None:
     except (AttributeError, OSError, TypeError, ValueError):
         return None
     return value
+
+
+def _record_v4_completed_frames(
+    settings: Settings, cid: str, cdir: Path, private: dict,
+) -> None:
+    """Project receipt-proven final-frame progress without publishing outputs."""
+    try:
+        descriptors = _v4_expected_anchor_descriptors(
+            {}, private["scene_anchor_schedule"]
+        )
+    except (KeyError, TypeError, ValueError):
+        return
+    completed: dict[int, set[int]] = {}
+    for descriptor in descriptors:
+        label = descriptor["label"]
+        if not (
+            label.startswith("layout-interval-")
+            or label.startswith("fanout-")
+        ):
+            continue
+        receipt = _load_json_receipt(_anchor_receipt_path(
+            cdir, descriptor["scene_id"], label
+        ))
+        if (
+            receipt is None
+            or receipt.get("plan_sha256") != private.get("plan_sha256")
+            or receipt.get("continuity_sha256") != private.get("continuity_sha256")
+            or receipt.get("scene_id") != descriptor["scene_id"]
+            or receipt.get("label") != label
+            or receipt.get("anchor") != descriptor["anchor"]
+        ):
+            continue
+        anchor = descriptor["anchor"]
+        completed.setdefault(anchor["segment_index"], set()).add(
+            anchor["frame_index"]
+        )
+
+    def mutate(_meta: dict, post: dict) -> None:
+        if post.get("status") != "running":
+            return
+        segments = [dict(item) for item in post.get("segments", [])]
+        for item in segments:
+            count = len(completed.get(item.get("index"), set()))
+            total = item.get("total_frames")
+            if isinstance(total, int) and not isinstance(total, bool):
+                item["completed_frames"] = min(total, max(
+                    item.get("completed_frames", 0), count
+                ))
+        post["segments"] = segments
+
+    _mutate_postprocess(settings, cid, mutate)
 
 
 def _v4_person_alternate_key(plan: dict, person: dict) -> tuple[int, int]:
@@ -1937,6 +2000,7 @@ async def _v4_anchor(
         output=output,
     )
     if existing is not None and _valid_png(output, canvas):
+        _record_v4_completed_frames(settings, cid, cdir, private)
         return output, existing
     attempts = receipt_path.parent / "attempts"
     latest = storage.load_meta(settings.data_dir, cid) or {}
@@ -1983,6 +2047,7 @@ async def _v4_anchor(
             input_roles=input_roles, inputs=inputs, output=output,
         )
         _write_anchor_receipt(receipt_path, receipt)
+        _record_v4_completed_frames(settings, cid, cdir, private)
         return output, receipt
     if receipt_path.exists():
         raise PostprocessError(409, "submission_unknown")
@@ -2013,6 +2078,7 @@ async def _v4_anchor(
         output=output,
     )
     _write_anchor_receipt(receipt_path, receipt)
+    _record_v4_completed_frames(settings, cid, cdir, private)
     return output, receipt
 
 

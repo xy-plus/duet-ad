@@ -6,7 +6,7 @@ type UnknownRecord = Readonly<Record<string, unknown>>;
 
 export interface DetailSignature {
   readonly stable: string;
-  readonly dyn: number;
+  readonly dyn: string;
   readonly generation: string;
 }
 
@@ -234,13 +234,20 @@ export function shouldPollDetail(detail: unknown): boolean {
   const generationStatus = record(source.generation)?.status;
   const postprocessStatus = record(source.postprocess)?.status;
   const fusionStatus = record(source.prompt_fusion)?.status;
+  const navigationStatus = source.navigation_status;
   return source.status === 'queued'
     || source.status === 'processing'
     || generationStatus === 'queued'
     || generationStatus === 'running'
+    || postprocessStatus === 'queued'
     || postprocessStatus === 'running'
     || fusionStatus === 'pending'
-    || fusionStatus === 'running';
+    || fusionStatus === 'running'
+    || navigationStatus === 'analysis_queued'
+    || navigationStatus === 'analysis_processing'
+    || navigationStatus === 'generation_queued'
+    || navigationStatus === 'generation_running'
+    || navigationStatus === 'postprocessing';
 }
 
 export function canOperate(detail: unknown): boolean {
@@ -287,7 +294,10 @@ export function detailSignature(detail: unknown): DetailSignature {
     }),
     source.has_video ? 1 : 0,
   ]);
-  const dyn = array(postprocess?.frames).length;
+  const dyn = JSON.stringify([
+    array(postprocess?.frames).length,
+    array(postprocess?.segments),
+  ]);
   const generation = JSON.stringify([
     source.plan_receipt ?? null,
     Number.isInteger(source.segment_count) ? source.segment_count : null,

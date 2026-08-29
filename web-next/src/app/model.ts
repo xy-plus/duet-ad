@@ -190,8 +190,22 @@ export function postprocessTotalFrames(detail: ConversationDetail): number {
   return detail.keyframes.length;
 }
 
+export function postprocessCompletedFrames(detail: ConversationDetail): number {
+  const segments = adaptConversationDetail(detail).postprocessSegments;
+  if (segments.length > 0) {
+    return segments.reduce(
+      (total, segment) => total + Math.min(
+        Math.max(0, segment.completedFrames),
+        Math.max(0, segment.totalFrames),
+      ),
+      0,
+    );
+  }
+  return detail.postprocess?.frames?.length ?? 0;
+}
+
 export function postprocessTask(detail: ConversationDetail): PostprocessTask | null {
-  const completedFrames = detail.postprocess?.frames?.length ?? 0;
+  const completedFrames = postprocessCompletedFrames(detail);
   const status = postprocessStatus(detail.postprocess?.status, completedFrames);
   const options = postprocessOptions(detail);
   if (!status || !options) return null;

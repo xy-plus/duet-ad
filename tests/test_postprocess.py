@@ -2521,6 +2521,59 @@ def test_parallel_segment_updates_use_atomic_storage_mutation(tmp_path, monkeypa
     assert (by_index[2]["stage"], by_index[2]["completed_frames"]) == ("seedream", 2)
 
 
+def test_v4_receipts_project_real_frame_progress_one_through_nine(tmp_path):
+    settings = make_settings(tmp_path)
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    nodes = [
+        {
+            "scene_id": "scene-1",
+            "label": f"fanout-0001-{frame_index:04d}",
+            "anchor": {
+                "order": frame_index,
+                "segment_index": 0,
+                "frame_index": frame_index,
+                "frame_name": f"{frame_index:02d}.png",
+            },
+        }
+        for frame_index in range(1, 10)
+    ]
+    private = {
+        "plan_sha256": "a" * 64,
+        "continuity_sha256": "b" * 64,
+        "scene_anchor_schedule": {"nodes": nodes},
+    }
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "status": "running", "frames": [], "error": None,
+        "segments": [{
+            "index": 0, "status": "running", "stage": "seedream",
+            "completed_frames": 0, "total_frames": 9, "revision": 1,
+            "error": None,
+        }],
+    })
+
+    observed = []
+    for node in nodes:
+        payload = {
+            "plan_sha256": private["plan_sha256"],
+            "continuity_sha256": private["continuity_sha256"],
+            "scene_id": node["scene_id"],
+            "label": node["label"],
+            "anchor": node["anchor"],
+        }
+        receipt = {**payload, "sha256": postprocess._receipt_sha256(payload)}
+        postprocess._write_json_receipt(
+            postprocess._anchor_receipt_path(cdir, node["scene_id"], node["label"]),
+            receipt,
+        )
+        postprocess._record_v4_completed_frames(settings, cid, cdir, private)
+        current = storage.load_meta(settings.data_dir, cid)["postprocess"]
+        observed.append(current["segments"][0]["completed_frames"])
+
+    assert observed == list(range(1, 10))
+    assert storage.load_meta(settings.data_dir, cid)["postprocess"]["frames"] == []
+
+
 def test_public_state_maps_untrusted_status_stage_and_error_to_safe_closed_values():
     public = postprocess.public_state({
         "status": "provider-secret-status", "options": OPTIONS_SUB,

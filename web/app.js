@@ -2376,6 +2376,20 @@ function ppTotalFrames(detail) {
   return Array.isArray(detail.keyframes) ? detail.keyframes.length : 0;
 }
 
+/* 运行中 canonical frames 仍按 manifest-last 发布；真实进度来自后端逐 receipt
+   投影的 segment.completed_frames。旧记录没有 segments 时才回退 frames。 */
+function ppCompletedFrames(detail) {
+  const pp = detail && detail.postprocess;
+  const segments = pp && Array.isArray(pp.segments) ? pp.segments : [];
+  if (segments.length > 0 && segments.every((segment) =>
+    Number.isInteger(segment.completed_frames) && segment.completed_frames >= 0
+    && Number.isInteger(segment.total_frames) && segment.total_frames >= 0)) {
+    return segments.reduce((sum, segment) =>
+      sum + Math.min(segment.completed_frames, segment.total_frames), 0);
+  }
+  return pp && Array.isArray(pp.frames) ? pp.frames.length : 0;
+}
+
 function postprocessReadyForGeneration(detail) {
   const pp = detail && detail.postprocess;
   if (pp === null || pp === undefined) return true;
@@ -2532,10 +2546,10 @@ function renderPpAssistant(detail, pp) {
   if (pp.status === "running") {
     const card = el("div", "activity-card");
     card.appendChild(el("p", "ac-title", "正在优化素材…"));
-    // 实时进度：n = postprocess.frames 已完成数（后端逐帧写回）；m = 目标帧总数
+    // 实时进度：n = receipt 投影的逐帧完成数；m = 目标帧总数
     const total = ppTotalFrames(detail);
     if (total > 0) {
-      const done = Array.isArray(pp.frames) ? pp.frames.length : 0;
+      const done = ppCompletedFrames(detail);
       card.appendChild(el("p", "ac-sub", `已完成 ${done}/${total} 帧（每帧约需 1 分钟）`));
     }
     const track = el("div", "progress-track");
@@ -2670,7 +2684,7 @@ function renderGenerationDynamic(detail) {
    仅 dyn 变（后处理 running 时 frames 逐帧增长）→ 只刷新后处理动态区；
    generation 变 → 只刷新最终视频区，保留原视频 DOM；
    完全不变 → 什么都不做（连 DOM 都不碰，杜绝每 2s 清空重建媒体引发的闪烁）。
-   dyn 取 postprocess.frames 长度：只有它会在 stable 不变时随轮询增长。 */
+   dyn 取逐帧进度和分段阶段：它们在 stable 不变时随轮询增长。 */
 function detailSignature(detail) {
   // stable 覆盖稳定区渲染消费的全部字段（未覆盖字段如 title/note 由创建后不变兜底，
   // pp.options 与 status 原子落盘——见审查记录）；dyn 只跟后处理进度（frames 单调增长）。
@@ -2694,7 +2708,6 @@ function detailSignature(detail) {
     detail.dialogue || null,
     pp ? pp.status : "",
     pp && pp.error ? pp.error : "",
-    pp && pp.segments ? pp.segments : null,
     Array.isArray(detail.keyframes) ? detail.keyframes.join(",") : "",
     detail.prompt || "",
     segments.map((seg) => [
@@ -2706,7 +2719,10 @@ function detailSignature(detail) {
     ]),
     detail.has_video ? 1 : 0,
   ]);
-  const dyn = pp && Array.isArray(pp.frames) ? pp.frames.length : 0;
+  const dyn = JSON.stringify([
+    ppCompletedFrames(detail),
+    pp && Array.isArray(pp.segments) ? pp.segments : null,
+  ]);
   const generation = JSON.stringify([
     detail.plan_receipt || null,
     Number.isInteger(detail.segment_count) ? detail.segment_count : null,
@@ -2746,11 +2762,7 @@ async function loadDetail(id, silent) {
     }
     // 签名完全不变 → 不碰 DOM（根治轮询闪烁的关键）
     state.detailSig = sig;
-    const ppRunning = !!(detail.postprocess && detail.postprocess.status === "running");
-    const generationRunning = !!(detail.generation
-      && (detail.generation.status === "queued" || detail.generation.status === "running"));
-    if (detail.status === "queued" || detail.status === "processing" || ppRunning
-        || generationRunning || state.generationSubmitting[id]) {
+    if (shouldPollDetail(detail) || state.generationSubmitting[id]) {
       startPolling(id);
     } else {
       stopPolling();
@@ -2764,6 +2776,24 @@ async function loadDetail(id, silent) {
     if (silent && state.currentId === id) startPolling(id);
     else stopPolling();
   }
+}
+
+function shouldPollDetail(detail) {
+  if (!detail || typeof detail !== "object") return false;
+  const ppStatus = detail.postprocess && detail.postprocess.status;
+  const fusionStatus = detail.prompt_fusion && detail.prompt_fusion.status;
+  const generationStatus = detail.generation && detail.generation.status;
+  const navigationStatus = detail.navigation_status;
+  return detail.status === "queued"
+    || detail.status === "processing"
+    || ppStatus === "queued"
+    || ppStatus === "running"
+    || fusionStatus === "pending"
+    || fusionStatus === "running"
+    || generationStatus === "queued"
+    || generationStatus === "running"
+    || ["analysis_queued", "analysis_processing", "generation_queued",
+      "generation_running", "postprocessing"].includes(navigationStatus);
 }
 
 async function selectConversation(id) {
@@ -3206,6 +3236,7 @@ if (typeof module !== "undefined" && module.exports) {
     normalizeDialogueLines,
     parseDialogueLines,
     postprocessReadyForGeneration,
+    ppCompletedFrames,
     postprocessSegmentStatus,
     postprocessAskDefault,
     promptSegmentIndex,
@@ -3227,6 +3258,7 @@ if (typeof module !== "undefined" && module.exports) {
     setDisclosureState,
     showActionError,
     shouldRenderPostprocessAsk,
+    shouldPollDetail,
     syncConversationDetail,
   };
 }
