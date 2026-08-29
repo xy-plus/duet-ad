@@ -66,6 +66,7 @@ interface ApiController {
   patchPrompt?: (route: Route, id: string, controller: ApiController) => Promise<void>;
   patchImagePrompt?: (route: Route, id: string, controller: ApiController) => Promise<void>;
   submit?: (route: Route, id: string, controller: ApiController) => Promise<void>;
+  detailRead?: (id: string, controller: ApiController) => void;
   postprocess?: (route: Route, id: string, controller: ApiController) => Promise<void>;
   retryPostprocessSegment?: (route: Route, id: string, index: number, controller: ApiController) => Promise<void>;
   acceptImages?: (route: Route, id: string, controller: ApiController) => Promise<void>;
@@ -127,7 +128,9 @@ async function installApi(page: Page, controller: ApiController) {
     }
     const detailMatch = path.match(/^\/api\/conversations\/([^/]+)$/u);
     if (detailMatch && method === 'GET') {
-      const found = controller.details[decodeURIComponent(detailMatch[1])];
+      const id = decodeURIComponent(detailMatch[1]);
+      const found = controller.details[id];
+      controller.detailRead?.(id, controller);
       await route.fulfill(found ? { json: found } : { status: 404, json: { detail: 'not found' } });
       return;
     }
@@ -694,7 +697,7 @@ test('optimized non-silent video requires explicit dialogue delivery and submits
   });
 });
 
-test('a 409 refresh preserves explicit off-screen delivery and never resubmits by itself', async ({ page }) => {
+test('a legacy 409 continues the accepted operation through GET without another submit', async ({ page }) => {
   const candidate = detail('delivery-refresh', {
     title: '声音呈现刷新',
     dialogue_delivery: null,
@@ -713,19 +716,35 @@ test('a 409 refresh preserves explicit off-screen delivery and never resubmits b
       required: true, accepted: true, expected_meta_sha256: '2'.repeat(64),
     },
   });
-  let attempt = 0;
+  let operationRequestId: string | null = null;
+  const detailOperationRequestIds: string[] = [];
   const controller: ApiController = {
     details: { 'delivery-refresh': candidate },
     order: ['delivery-refresh'],
     requests: [],
     submit: async (route, id, current) => {
-      attempt += 1;
-      if (attempt === 1) {
-        current.details[id] = { ...current.details[id], receipt_version: 2 };
-        await route.fulfill({ status: 409, json: { detail: 'multimodal_input_refresh_required' } });
-        return;
+      const payload = JSON.parse(route.request().postData() ?? '{}') as {
+        client_request_id: string;
+        dialogue_delivery: string;
+      };
+      operationRequestId = payload.client_request_id;
+      current.details[id] = {
+        ...current.details[id],
+        receipt_version: 2,
+        navigation_status: 'generation_running',
+        dialogue_delivery: payload.dialogue_delivery,
+        generation: {
+          status: 'running', stage: 'context_ir', attempt: 1,
+          client_request_id: payload.client_request_id, segments: [],
+        },
+      };
+      await route.fulfill({ status: 409, json: { detail: 'multimodal_input_refresh_required' } });
+    },
+    detailRead: (id, current) => {
+      const generation = current.details[id].generation as JsonRecord | null;
+      if (typeof generation?.client_request_id === 'string') {
+        detailOperationRequestIds.push(generation.client_request_id);
       }
-      await route.fulfill({ json: { status: 'queued', attempt: 1 } });
     },
   };
   await installApi(page, controller);
@@ -735,29 +754,28 @@ test('a 409 refresh preserves explicit off-screen delivery and never resubmits b
     .getByText('画外', { exact: true }).click();
   await page.getByRole('button', { name: '确认生成' }).click();
   await expect(page.getByRole('alert').filter({
-    hasText: '音频与画面输入需要刷新，请等待页面更新后再次确认生成。',
+    hasText: '音频与画面输入正在同一任务内刷新，完成后将自动继续生成。',
   })).toBeVisible();
   await expect.poll(() => controller.requests.filter(({ method, path }) => (
     method === 'GET' && path.endsWith('/delivery-refresh')
   )).length).toBeGreaterThan(1);
-  await expect(page.getByRole('radio', { name: '画外' })).toBeChecked();
-  await expect(page.getByRole('radio', { name: '画内' })).not.toBeChecked();
-  await expect(page.getByRole('radio', { name: '自动', exact: true })).not.toBeChecked();
-  await page.waitForTimeout(300);
-  expect(controller.requests.filter(({ method, path }) => (
-    method === 'POST' && path.endsWith('/submit')
-  ))).toHaveLength(1);
-
-  await page.getByRole('button', { name: '确认生成' }).click();
+  await expect(page.getByText('生成进行中')).toBeVisible();
+  await expect(page.getByRole('button', { name: '确认生成' })).toHaveCount(0);
   const submits = controller.requests.filter(({ method, path }) => (
     method === 'POST' && path.endsWith('/submit')
   ));
-  expect(submits).toHaveLength(2);
-  expect(submits.map(({ body }) => JSON.parse(body ?? '{}').dialogue_delivery))
-    .toEqual(['off_screen', 'off_screen']);
+  expect(submits).toHaveLength(1);
+  const submitted = JSON.parse(submits[0].body ?? '{}') as {
+    client_request_id: string;
+    dialogue_delivery: string;
+  };
+  expect(submitted.dialogue_delivery).toBe('off_screen');
+  expect(operationRequestId).toBe(submitted.client_request_id);
+  expect(detailOperationRequestIds.length).toBeGreaterThanOrEqual(1);
+  expect(new Set(detailOperationRequestIds)).toEqual(new Set([submitted.client_request_id]));
 });
 
-test('prompt fusion preserves settings and requires a second explicit submit before Context IR', async ({ page }) => {
+test('prompt fusion advances the same client request through GET without another submit', async ({ page }) => {
   const candidate = detail('prompt-fusion-refresh', {
     title: '最终提示词融合',
     duration_s: 20,
@@ -784,47 +802,41 @@ test('prompt fusion preserves settings and requires a second explicit submit bef
       required: true, accepted: true, expected_meta_sha256: '4'.repeat(64),
     },
   });
-  let attempt = 0;
+  let operationRequestId: string | null = null;
+  const detailOperationRequestIds: string[] = [];
   const controller: ApiController = {
     details: { 'prompt-fusion-refresh': candidate },
     order: ['prompt-fusion-refresh'],
     requests: [],
     submit: async (route, id, current) => {
-      attempt += 1;
-      if (attempt === 1) {
-        current.details[id] = {
-          ...current.details[id],
-          prompt_fusion: {
-            status: 'pending', error: null,
-            segments: [1, 2].map((index) => ({
-              index, status: 'pending', final_prompt: null, error: null,
-            })),
-          },
-        };
-        setTimeout(() => {
-          current.details[id] = {
-            ...current.details[id],
-            prompt_fusion: {
-              status: 'done', error: null,
-              segments: [1, 2].map((index) => ({
-                index, status: 'done', final_prompt: `片段${index}最终融合提示词`, error: null,
-              })),
-            },
-          };
-        }, 1_000);
-        await route.fulfill({ status: 409, json: { detail: 'prompt_fusion_refresh_required' } });
-        return;
-      }
+      const payload = JSON.parse(route.request().postData() ?? '{}') as {
+        client_request_id: string;
+        dialogue_delivery: string;
+      };
+      operationRequestId = payload.client_request_id;
       current.details[id] = {
         ...current.details[id],
         navigation_status: 'generation_running',
+        dialogue_delivery: payload.dialogue_delivery,
+        prompt_fusion: {
+          status: 'pending', error: null,
+          segments: [1, 2].map((index) => ({
+            index, status: 'pending', final_prompt: null, error: null,
+          })),
+        },
         generation: {
-          status: 'running', stage: 'context_ir', client_request_id: 'prompt-fusion-request',
+          status: 'running', stage: 'context_ir', client_request_id: payload.client_request_id,
           fast_mode: false,
           segments: [1, 2].map((index) => ({ index, status: 'running' })),
         },
       };
-      await route.fulfill({ json: { status: 'queued', attempt: 1 } });
+      await route.fulfill({ status: 202, json: { status: 'running', attempt: 1 } });
+    },
+    detailRead: (id, current) => {
+      const generation = current.details[id].generation as JsonRecord | null;
+      if (typeof generation?.client_request_id === 'string') {
+        detailOperationRequestIds.push(generation.client_request_id);
+      }
     },
   };
   await installApi(page, controller);
@@ -838,17 +850,13 @@ test('prompt fusion preserves settings and requires a second explicit submit bef
     .getByText('画外', { exact: true }).click();
   await page.getByRole('button', { name: '确认生成' }).click();
 
-  await expect(page.getByText('最终提示词正在融合；完成后请再次确认生成。')).toBeVisible();
+  await expect(page.getByText('系统正在融合最终提示词，完成后将沿同一任务自动继续生成。')).toBeVisible();
   await expect(page.getByText('片段 1 · 等待融合')).toBeVisible();
-  await expect(page.getByRole('button', { name: '确认生成' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: '确认生成' })).toHaveCount(0);
   expect(controller.requests.filter(({ method, path }) => (
     method === 'POST' && path.endsWith('/submit')
   ))).toHaveLength(1);
-
-  await expect(page.getByLabel('片段 1 最终提示词')).toHaveText('片段1最终融合提示词');
-  await expect(page.getByLabel('片段 2 最终提示词')).toHaveText('片段2最终融合提示词');
-  await expect(page.getByRole('radio', { name: '画外' })).toBeChecked();
-  await expect(page.getByRole('button', { name: '确认生成' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: '确认生成' })).toHaveCount(0);
   expect(controller.requests.filter(({ method, path }) => (
     method === 'POST' && path.endsWith('/submit')
   ))).toHaveLength(1);
@@ -862,14 +870,18 @@ test('prompt fusion preserves settings and requires a second explicit submit bef
   ].join(',')).evaluateAll((elements) => elements.map((element) => element.getAttribute('aria-label')));
   expect(orderedSections).toEqual(['源视频', '长视频分段', '关键帧后处理', '最终提示词融合', '视频生成']);
 
-  await page.getByRole('button', { name: '确认生成' }).click();
-  await expect(page.getByText('Context IR 正在优化最终提示词')).toBeVisible();
   const submits = controller.requests.filter(({ method, path }) => (
     method === 'POST' && path.endsWith('/submit')
   ));
-  expect(submits).toHaveLength(2);
-  expect(submits.map(({ body }) => JSON.parse(body ?? '{}').dialogue_delivery))
-    .toEqual(['off_screen', 'off_screen']);
+  expect(submits).toHaveLength(1);
+  const submitted = JSON.parse(submits[0].body ?? '{}') as {
+    client_request_id: string;
+    dialogue_delivery: string;
+  };
+  expect(submitted.dialogue_delivery).toBe('off_screen');
+  expect(operationRequestId).toBe(submitted.client_request_id);
+  expect(detailOperationRequestIds.length).toBeGreaterThanOrEqual(1);
+  expect(new Set(detailOperationRequestIds)).toEqual(new Set([submitted.client_request_id]));
 });
 
 test('has_video renders authenticated source and final videos together', async ({ page }) => {

@@ -239,7 +239,7 @@ function payloadForAction(
   return newGenerationPayload(detail, draft);
 }
 
-const PROMPT_FUSION_REFRESH_MESSAGE = '最终提示词正在融合；完成后请再次确认生成。';
+const PROMPT_FUSION_CONTINUATION_MESSAGE = '系统正在融合最终提示词，完成后将沿同一任务自动继续生成。';
 
 function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail: ConversationDetail }) {
   const [draft, setDraft] = useState(() => safeGenerationDraft(detail));
@@ -271,10 +271,10 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
     && actionContract.action !== 'none';
   const deliveryMissing = draft?.dialogueMode !== 'none' && draft?.dialogueDelivery === null;
   const actionBlocked = deliveryMissing || promptFusionPending || promptFusionInvalid
-    || error === PROMPT_FUSION_REFRESH_MESSAGE;
+    || error === PROMPT_FUSION_CONTINUATION_MESSAGE;
   useEffect(() => {
     if (adapted.promptFusion?.status === 'done' || adapted.promptFusion?.status === 'failed') {
-      setError((current) => current === PROMPT_FUSION_REFRESH_MESSAGE ? undefined : current);
+      setError((current) => current === PROMPT_FUSION_CONTINUATION_MESSAGE ? undefined : current);
     }
   }, [adapted.promptFusion?.status]);
   const submit = async (action: GenerationAction) => {
@@ -286,9 +286,9 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
       if (apiClient.isSubmissionReconciling(detail.id)) {
         setReconciling(true);
       } else if (apiErrorMatches(submitError, 'multimodal_input_refresh_required')) {
-        setError('音频与画面输入需要刷新，请等待页面更新后再次确认生成。');
+        setError('音频与画面输入正在同一任务内刷新，完成后将自动继续生成。');
       } else if (apiErrorMatches(submitError, 'prompt_fusion_refresh_required')) {
-        setError(PROMPT_FUSION_REFRESH_MESSAGE);
+        setError(PROMPT_FUSION_CONTINUATION_MESSAGE);
       } else {
         setError(errorMessage(submitError, '生成请求提交失败'));
       }
@@ -330,7 +330,7 @@ function GenerationSection({ apiClient, detail }: { apiClient: ApiClient; detail
         <Alert type="warning" showIcon title="请选择声音呈现方式后再生成视频" />
       ) : null}
       {promptFusionPending ? (
-        <Alert type="info" showIcon title="最终提示词正在融合，完成后请再次确认生成" />
+        <Alert type="info" showIcon title={PROMPT_FUSION_CONTINUATION_MESSAGE} />
       ) : null}
       {promptFusionInvalid ? (
         <Alert type="error" showIcon title="服务端最终提示词融合状态无效，已禁止生成" />

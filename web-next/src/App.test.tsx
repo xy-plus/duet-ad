@@ -1,7 +1,8 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import App from './App';
+import { queryKeys } from './state';
 import { createApiRuntime } from './state/runtime';
 import { AppThemeProvider } from './ui/theme';
 
@@ -342,15 +343,23 @@ describe('production App integration', () => {
     expect(acceptanceCalls).toBe(1);
   });
 
-  it('keeps an explicit off-screen choice across multimodal refresh without automatic resubmit', async () => {
+  it('continues a legacy multimodal refresh as one operation without another submit', async () => {
     const storage = new MemoryStorage();
     storage.setItem('cvs_token', 'stored-token');
-    const submitPayloads: unknown[] = [];
-    const detail = {
+    const submitPayloads: Array<{
+      client_request_id: string;
+      dialogue_delivery?: string;
+    }> = [];
+    const detailOperationRequestIds: string[] = [];
+    let operationRequestId: string | null = null;
+    const currentDetail = () => ({
       ...baseDetail,
-      navigation_status: 'analysis_complete',
-      generation: null,
-      dialogue_delivery: null,
+      navigation_status: operationRequestId ? 'generation_running' : 'analysis_complete',
+      generation: operationRequestId ? {
+        status: 'running', stage: 'context_ir', attempt: 1,
+        client_request_id: operationRequestId, segments: [],
+      } : null,
+      dialogue_delivery: operationRequestId ? 'off_screen' : null,
       image_acceptance: {
         required: true, accepted: true, expected_meta_sha256: 'c'.repeat(64),
       },
@@ -364,61 +373,77 @@ describe('production App integration', () => {
           total_frames: 1, revision: 1, error: null,
         }],
       },
-    };
+    });
     const { apiClient, queryClient } = createApiRuntime({
       storage,
       sessionKeyFactory: () => 'delivery-refresh-session',
       fetchImplementation: vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
-        if (url === '/api/conversations') return Response.json([detail]);
-        if (url === '/api/conversations/cid-1') return Response.json(detail);
+        if (url === '/api/conversations') return Response.json([currentDetail()]);
+        if (url === '/api/conversations/cid-1') {
+          if (operationRequestId) detailOperationRequestIds.push(operationRequestId);
+          return Response.json(currentDetail());
+        }
         if (url === '/api/conversations/cid-1/submit') {
-          submitPayloads.push(JSON.parse(String(init?.body)));
-          if (submitPayloads.length === 1) {
-            return Response.json({
-              detail: {
-                code: 'multimodal_input_refresh_required',
-                message: '需要刷新多模态输入',
-              },
-            }, { status: 409 });
-          }
-          return Response.json({ status: 'queued', attempt: 1 });
+          const payload = JSON.parse(String(init?.body)) as {
+            client_request_id: string;
+            dialogue_delivery?: string;
+          };
+          submitPayloads.push(payload);
+          operationRequestId = payload.client_request_id;
+          return Response.json({
+            detail: {
+              code: 'multimodal_input_refresh_required',
+              message: '需要刷新多模态输入',
+            },
+          }, { status: 409 });
         }
         throw new Error(`unexpected request: ${url}`);
       }),
     });
+    queryClient.setQueryData(queryKeys.list(apiClient.sessionKey), [currentDetail()]);
+    queryClient.setQueryData(queryKeys.detail(apiClient.sessionKey, 'cid-1'), currentDetail());
 
     render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
-    const user = userEvent.setup();
     expect(await screen.findByRole('button', { name: '确认生成' })).toBeDisabled();
-    await user.click(screen.getByText('画外', { exact: true }));
-    await user.click(screen.getByRole('button', { name: '确认生成' }));
+    fireEvent.click(screen.getByText('画外', { exact: true }));
+    fireEvent.click(screen.getByRole('button', { name: '确认生成' }));
 
-    expect(await screen.findByText('音频与画面输入需要刷新，请等待页面更新后再次确认生成。'))
+    expect(await screen.findByText('音频与画面输入正在同一任务内刷新，完成后将自动继续生成。'))
       .toBeInTheDocument();
+    expect(await screen.findByText('生成进行中')).toBeInTheDocument();
+    await waitFor(() => expect(detailOperationRequestIds.length).toBeGreaterThanOrEqual(1));
     expect(submitPayloads).toHaveLength(1);
     expect(submitPayloads[0]).toMatchObject({ dialogue_delivery: 'off_screen' });
-    expect(screen.getByRole('radio', { name: '画外' })).toBeChecked();
-
-    await user.click(screen.getByRole('button', { name: '确认生成' }));
-    await waitFor(() => expect(submitPayloads).toHaveLength(2));
-    expect(submitPayloads[1]).toMatchObject({ dialogue_delivery: 'off_screen' });
+    expect(operationRequestId).toBe(submitPayloads[0]?.client_request_id);
+    expect(new Set(detailOperationRequestIds)).toEqual(
+      new Set([submitPayloads[0]!.client_request_id]),
+    );
+    expect(screen.queryByRole('button', { name: '确认生成' })).not.toBeInTheDocument();
   });
 
-  it('polls prompt fusion after the first 409 and requires a second explicit submit', async () => {
+  it('polls prompt fusion inside the same client request without another submit', async () => {
     const storage = new MemoryStorage();
     storage.setItem('cvs_token', 'stored-token');
-    const submitPayloads: unknown[] = [];
+    const submitPayloads: Array<{
+      client_request_id: string;
+      dialogue_delivery?: string;
+    }> = [];
+    const detailOperationRequestIds: string[] = [];
+    let operationRequestId: string | null = null;
     let fusionStatus: 'missing' | 'pending' | 'done' = 'missing';
     const currentDetail = () => ({
       ...baseDetail,
-      navigation_status: 'analysis_complete',
+      navigation_status: operationRequestId ? 'generation_running' : 'analysis_complete',
       duration_s: 12,
       segment_count: 1,
       plan_receipt: '1'.repeat(64),
       segments: [{ index: 1, prompt: '旧视频提示词', lines: [], keyframes: [] }],
-      generation: null,
-      dialogue_delivery: null,
+      generation: operationRequestId ? {
+        status: 'running', stage: 'context_ir', attempt: 1,
+        client_request_id: operationRequestId, segments: [],
+      } : null,
+      dialogue_delivery: operationRequestId ? 'off_screen' : null,
       image_acceptance: {
         required: true, accepted: true, expected_meta_sha256: '2'.repeat(64),
       },
@@ -450,47 +475,40 @@ describe('production App integration', () => {
       fetchImplementation: vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url === '/api/conversations') return Response.json([currentDetail()]);
-        if (url === '/api/conversations/cid-1') return Response.json(currentDetail());
+        if (url === '/api/conversations/cid-1') {
+          if (operationRequestId) detailOperationRequestIds.push(operationRequestId);
+          return Response.json(currentDetail());
+        }
         if (url === '/api/conversations/cid-1/submit') {
-          submitPayloads.push(JSON.parse(String(init?.body)));
-          if (submitPayloads.length === 1) {
-            fusionStatus = 'pending';
-            return Response.json(
-              { detail: 'prompt_fusion_refresh_required' },
-              { status: 409 },
-            );
-          }
-          return Response.json({ status: 'queued', attempt: 1 });
+          const payload = JSON.parse(String(init?.body)) as {
+            client_request_id: string;
+            dialogue_delivery?: string;
+          };
+          submitPayloads.push(payload);
+          operationRequestId = payload.client_request_id;
+          fusionStatus = 'pending';
+          return Response.json({ status: 'running', attempt: 1 }, { status: 202 });
         }
         throw new Error(`unexpected request: ${url}`);
       }),
     });
+    queryClient.setQueryData(queryKeys.list(apiClient.sessionKey), [currentDetail()]);
+    queryClient.setQueryData(queryKeys.detail(apiClient.sessionKey, 'cid-1'), currentDetail());
 
     render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
-    const user = userEvent.setup();
-    await user.click(await screen.findByText('画外', { exact: true }));
-    await user.click(screen.getByRole('button', { name: '确认生成' }));
+    fireEvent.click(await screen.findByText('画外', { exact: true }));
+    fireEvent.click(screen.getByRole('button', { name: '确认生成' }));
 
-    expect(await screen.findByText('最终提示词正在融合；完成后请再次确认生成。'))
+    expect(await screen.findByText('系统正在融合最终提示词，完成后将沿同一任务自动继续生成。'))
       .toBeInTheDocument();
     expect(await screen.findByText('片段 1 · 等待融合')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '确认生成' })).toBeDisabled();
-    expect(screen.getByRole('radio', { name: '画外' })).toBeChecked();
+    expect(screen.queryByRole('button', { name: '确认生成' })).not.toBeInTheDocument();
     expect(submitPayloads).toHaveLength(1);
-
-    fusionStatus = 'done';
-    await queryClient.invalidateQueries();
-    expect(await screen.findByLabelText('片段 1 最终提示词')).toHaveTextContent('最终融合提示词');
-    expect(screen.getByRole('radio', { name: '画外' })).toBeChecked();
-    expect(screen.getByRole('button', { name: '确认生成' })).toBeEnabled();
-    expect(submitPayloads).toHaveLength(1);
-
-    await user.click(screen.getByRole('button', { name: '确认生成' }));
-    await waitFor(() => expect(submitPayloads).toHaveLength(2));
-    expect(submitPayloads).toEqual([
-      expect.objectContaining({ dialogue_delivery: 'off_screen' }),
-      expect.objectContaining({ dialogue_delivery: 'off_screen' }),
-    ]);
+    expect(submitPayloads[0]).toMatchObject({ dialogue_delivery: 'off_screen' });
+    expect(detailOperationRequestIds.length).toBeGreaterThanOrEqual(1);
+    expect(new Set(detailOperationRequestIds)).toEqual(
+      new Set([submitPayloads[0]!.client_request_id]),
+    );
   });
 
   it.each([
@@ -644,13 +662,14 @@ describe('production App integration', () => {
         throw new Error(`unexpected request: ${url}`);
       }),
     });
+    queryClient.setQueryData(queryKeys.list(apiClient.sessionKey), [newDetail]);
+    queryClient.setQueryData(queryKeys.detail(apiClient.sessionKey, 'cid-1'), newDetail);
 
     render(<AppThemeProvider queryClient={queryClient}><App apiClient={apiClient} /></AppThemeProvider>);
-    const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: '确认生成' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认生成' }));
 
     expect(await screen.findByText('正在核对提交结果，已锁定再次提交')).toBeInTheDocument();
-    await waitFor(() => expect(detailCalls).toBeGreaterThan(1));
+    await waitFor(() => expect(detailCalls).toBeGreaterThanOrEqual(1));
     expect(screen.queryByRole('button', { name: '确认生成' })).not.toBeInTheDocument();
     expect(submitCalls).toBe(1);
   });
