@@ -226,8 +226,103 @@ class _ParallelRunner(_Runner):
 
 def _skill_contract() -> tuple[str, dict]:
     text = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
-    example = json.loads(text.split("```json", 1)[1].split("```", 1)[0])
+    contracts = _json_contracts(text)
+    example = (
+        {**contracts[0], **contracts[1]}
+        if len(contracts) == 2
+        else contracts[0]
+    )
     return text, example
+
+
+def _json_contracts(text: str) -> list[dict]:
+    return [
+        json.loads(block)
+        for block in re.findall(r"```json\s*(.*?)\s*```", text, re.DOTALL)
+    ]
+
+
+def test_skill_exposes_closed_global_and_segment_json_contracts():
+    skill, _example = _skill_contract()
+    contracts = _json_contracts(skill)
+
+    assert len(contracts) == 2
+    global_plan, segment_frames = contracts
+    assert set(global_plan) == {"people", "entities", "scenes"}
+    assert set(segment_frames) == {"frames"}
+    assert set(next(iter(global_plan["people"].values()))) == {
+        "source_identity", "replacement_identity", "wardrobe_change",
+        "local_color_change",
+    }
+    assert set(next(iter(global_plan["entities"].values()))) == {
+        "description", "owner", "association", "persistence",
+    }
+    assert set(next(iter(global_plan["scenes"].values()))) == {
+        "source_scene", "replacement_scene", "semantic_change",
+        "geometry_change", "depth_change", "layout_change",
+        "local_color_change",
+    }
+    frame = next(iter(segment_frames["frames"].values()))
+    assert set(frame) == {"people", "relationships", "entities", "crop"}
+    person = next(iter(frame["people"].values()))
+    assert set(person) == {
+        "visible_region", "boundary", "body_and_pose",
+        "derived_observations",
+    }
+    observation = next(iter(person["derived_observations"].values()))
+    assert set(observation) == {
+        "mode", "source_carrier", "visible_region", "boundary",
+        "relationship",
+    }
+    entity = next(iter(frame["entities"].values()))
+    assert set(entity) == {"visibility", "relationship"}
+    assert global_plan["entities"]["<stable-entity-key>"]["owner"] == "project"
+    assert observation["mode"] in {
+        "optical_projection", "temporal_residual", "source-preserve",
+    }
+    assert entity["visibility"] in {"visible", "occluded"}
+
+
+def test_skill_frame_entities_are_direct_evidence_only_and_omit_out_of_frame():
+    skill, _example = _skill_contract()
+    segment_frames = _json_contracts(skill)[1]
+    encoded = json.dumps(segment_frames, ensure_ascii=False)
+
+    assert '"visibility": "out_of_frame"' not in encoded
+    assert "当前帧有直接像素证据" in skill
+    assert "完全出画、完全不可见或仅由邻帧推知时省略 key" in skill
+    assert "不写 `out_of_frame` 占位" in skill
+
+
+def test_skill_requires_slot_coverage_key_reuse_and_atomic_nonempty_completion():
+    skill, _example = _skill_contract()
+
+    for required in (
+        "semantic_slots.scenes[].key",
+        "semantic_slots.frames[].key",
+        "全部 key",
+        "逐字复用",
+        "同目录临时文件",
+        "自检",
+        "原子替换",
+        "输出非空",
+        "不得结束或只给解释",
+    ):
+        assert required in skill
+    assert "唯一输出" in skill
+    assert "任何单一阶段不得直接输出四个字段" in skill
+
+
+def test_skill_matches_runtime_semantic_enum_boundary_and_stays_short():
+    skill, _example = _skill_contract()
+    encoded = json.dumps(_json_contracts(skill), ensure_ascii=False)
+
+    assert '"visibility": "visible/occluded/out_of_frame"' not in encoded
+    assert "source-preserve 是 mode 的第三个值" in skill
+    assert "不新增质量门禁" in skill
+    assert "不新增 reject、retry 或 fallback" in skill
+    assert len(skill.splitlines()) <= 70
+    assert len(skill.encode("utf-8")) <= 7 * 1024
 
 
 def _element_index() -> dict:
@@ -479,10 +574,8 @@ def test_skill_additively_consumes_element_index_without_changing_output_schema(
         "element_index",
         "stable key",
         "逐字复用",
-        "合并参考图",
-        "每个被替换元素恰好一个编号 tile",
         "所有片段共享",
-        "video-prompt-fusion",
+        "跨段一致",
     ):
         assert contract in skill
     assert "不要输出版本、段号、帧号" in skill
@@ -555,7 +648,7 @@ def test_skill_and_human_plan_scope_only_define_source_to_target_image_editing()
         assert visual_rule in skill
 
     for out_of_scope in (
-        "素材准入", "供应商", "发布", "H3", "重试", "验收",
+        "素材准入", "供应商", "H3", "重试", "验收",
         "plan_audit", "verify_pack", "runtime protocol correction",
     ):
         assert out_of_scope not in skill
@@ -565,7 +658,8 @@ def test_skill_delegates_the_exact_v4_generation_contract_to_backend():
     skill, example = _skill_contract()
 
     assert "实体 ID、关系图和完整机械字段由后端构造" in skill
-    assert "不要输出版本、段号、帧号、连续编号 ID、哈希、transition、枚举 palette、实体图、组件图或流程判断" in skill
+    assert "不新增元数据字段" in skill
+    assert "semantic_slots 要求的 key 仍须逐字输出" in skill
     encoded = json.dumps(example, ensure_ascii=False)
     for mechanical in (
         "component_id", "target_spec", "topology",
@@ -1247,9 +1341,9 @@ def test_skill_closes_each_frame_person_count_and_body_part_ownership():
     assert set(observation) == {
         "mode", "source_carrier", "visible_region", "boundary", "relationship",
     }
-    assert observation["mode"] == (
-        "optical_projection/temporal_residual；无法唯一判断时为 source-preserve"
-    )
+    assert observation["mode"] in {
+        "optical_projection", "temporal_residual", "source-preserve",
+    }
     for rule in (
         "物理人物全集",
         "人物数量闭合",
