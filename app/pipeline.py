@@ -771,6 +771,7 @@ def _frame_inventory(
     frame_paths: dict[int, list[Path]],
     *,
     segment_lineage: dict[int, dict] | None = None,
+    keyframe_sources: dict[int, list[dict]] | None = None,
 ) -> list[dict]:
     inventory = []
     previous: dict | None = None
@@ -792,6 +793,11 @@ def _frame_inventory(
             or lineage["join_mode"] not in {"hard_cut", "continue"}
         ):
             raise PipelineError("image optimization frame inventory is invalid")
+        sources = None if keyframe_sources is None else keyframe_sources.get(segment_index)
+        if keyframe_sources is not None and (
+            not isinstance(sources, list) or len(sources) != len(paths)
+        ):
+            raise PipelineError("image optimization frame inventory is invalid")
         for frame_index, path in enumerate(paths, 1):
             if not isinstance(path, Path) or path.name != f"{frame_index:02d}.png":
                 raise PipelineError("image optimization frame inventory is invalid")
@@ -806,23 +812,66 @@ def _frame_inventory(
                 "source_sha256": source_sha256,
             }
             if lineage is not None:
-                transition = (
-                    "start"
-                    if previous is None
-                    else (
-                        "hard_cut"
-                        if frame_index == 1 and lineage["join_mode"] == "hard_cut"
-                        # Chain lineage proves continuity but contains no measured
-                        # camera transform.  It can therefore establish only the
-                        # conservative same-camera relation; motion needs a
-                        # versioned, source-bound measurement before it may be
-                        # frozen as evidence.
-                        else "same_camera"
+                source = None if sources is None else sources[frame_index - 1]
+                if source is not None:
+                    source_transition = (
+                        source.get("transition") if isinstance(source, dict) else None
                     )
-                )
+                    if (
+                        not isinstance(source, dict)
+                        or set(source) != {
+                            "order", "source_time_s", "source_scene_id", "transition",
+                        }
+                        or source.get("order") != frame_index
+                        or isinstance(source.get("source_time_s"), bool)
+                        or not isinstance(source.get("source_time_s"), (int, float))
+                        or not math.isfinite(float(source["source_time_s"]))
+                        or not isinstance(source.get("source_scene_id"), str)
+                        or not source["source_scene_id"]
+                        or not isinstance(source_transition, dict)
+                        or set(source_transition) != {"type", "at_s"}
+                        or source_transition.get("type") not in {
+                            "start", "hard_cut", "continuous",
+                        }
+                        or (
+                            source_transition["type"] == "continuous"
+                            and source_transition.get("at_s") is not None
+                        )
+                        or (
+                            source_transition["type"] != "continuous"
+                            and (
+                                isinstance(source_transition.get("at_s"), bool)
+                                or not isinstance(
+                                    source_transition.get("at_s"), (int, float)
+                                )
+                                or not math.isfinite(float(source_transition["at_s"]))
+                            )
+                        )
+                    ):
+                        raise PipelineError(
+                            "image optimization frame inventory is invalid"
+                        )
+                    transition = {
+                        "start": "start",
+                        "hard_cut": "hard_cut",
+                        "continuous": "same_camera",
+                    }[source_transition["type"]]
+                else:
+                    transition = (
+                        "start"
+                        if previous is None
+                        else (
+                            "hard_cut"
+                            if frame_index == 1 and lineage["join_mode"] == "hard_cut"
+                            else "same_camera"
+                        )
+                    )
+                if (transition == "start") != (previous is None):
+                    raise PipelineError("image optimization frame inventory is invalid")
                 evidence = {
                     "chain_id": lineage["chain_id"],
                     "join_mode": lineage["join_mode"],
+                    **({"keyframe_source": source} if source is not None else {}),
                     "previous": previous,
                     "current": {
                         "segment_index": segment_index,
@@ -844,6 +893,8 @@ def _frame_inventory(
             inventory.append(item)
     if segment_lineage is not None and set(segment_lineage) != set(frame_paths):
         raise PipelineError("image optimization frame inventory is invalid")
+    if keyframe_sources is not None and set(keyframe_sources) != set(frame_paths):
+        raise PipelineError("image optimization frame inventory is invalid")
     return inventory
 
 
@@ -856,6 +907,7 @@ def _freeze_image_optimization(
     *,
     require_dual_target: bool,
     segment_lineage: dict[int, dict] | None = None,
+    keyframe_sources: dict[int, list[dict]] | None = None,
 ) -> tuple[dict, dict]:
     """Freeze either the legacy segment prompt or V3 source-frame prompts."""
     try:
@@ -863,6 +915,7 @@ def _freeze_image_optimization(
             inventory = _frame_inventory(
                 frame_paths,
                 segment_lineage=segment_lineage if continuity.get("version") == 4 else None,
+                keyframe_sources=keyframe_sources if continuity.get("version") == 4 else None,
             )
             frame_counts = {
                 index: len(paths) for index, paths in frame_paths.items()
@@ -987,6 +1040,11 @@ def _generate_segmented_image_prompts(
         frame_paths[segment["index"]] = paths
     transitions_by_segment = {}
     if all(frame_paths.values()):
+        source_timelines = {
+            meta["index"]: meta["keyframe_sources"]
+            for meta in seg_metas
+            if isinstance(meta, dict) and isinstance(meta.get("keyframe_sources"), list)
+        }
         transition_inventory = _frame_inventory(
             frame_paths,
             segment_lineage={
@@ -995,6 +1053,11 @@ def _generate_segmented_image_prompts(
                 }
                 for segment in segments
             },
+            keyframe_sources=(
+                source_timelines
+                if set(source_timelines) == set(frame_paths)
+                else None
+            ),
         )
         transitions_by_segment = {
             index: [item for item in transition_inventory if item["segment_index"] == index]
@@ -3288,6 +3351,17 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                         }
                         for seg in seg_metas
                     },
+                    keyframe_sources=(
+                        {
+                            seg["index"]: seg["keyframe_sources"]
+                            for seg in seg_metas
+                        }
+                        if all(
+                            isinstance(seg.get("keyframe_sources"), list)
+                            for seg in seg_metas
+                        )
+                        else None
+                    ),
                 )
                 changes.update(frozen_continuity)
                 changes.update(frozen_prompts)

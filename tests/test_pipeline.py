@@ -614,11 +614,11 @@ def test_two_generation_segments_without_source_cut_remain_continuous(
     assert bound[1]["keyframe_sources"][0]["source_time_s"] == 14.5
 
 
-def test_source_timeline_is_not_an_image_optimization_input():
-    assert "keyframe_sources" not in inspect.signature(
+def test_source_timeline_is_an_explicit_image_optimization_input():
+    assert "keyframe_sources" in inspect.signature(
         pipeline._frame_inventory
     ).parameters
-    assert "keyframe_sources" not in inspect.signature(
+    assert "keyframe_sources" in inspect.signature(
         pipeline._freeze_image_optimization
     ).parameters
 
@@ -745,6 +745,50 @@ def test_v4_frame_inventory_derives_transition_from_lineage_and_frame_pair(tmp_p
     ]
 
 
+def test_v4_frame_inventory_prefers_bound_source_cut_timeline(tmp_path):
+    frames = {}
+    for index in (1, 2):
+        directory = tmp_path / str(index)
+        directory.mkdir()
+        frames[index] = []
+        for frame_index in (1, 2):
+            path = directory / f"{frame_index:02d}.png"
+            path.write_bytes(f"{index}-{frame_index}".encode())
+            frames[index].append(path)
+    sources = {
+        1: [
+            {"order": 1, "source_time_s": 0.0, "source_scene_id": "SCENE_01",
+             "transition": {"type": "start", "at_s": 0.0}},
+            {"order": 2, "source_time_s": 1.0, "source_scene_id": "SCENE_02",
+             "transition": {"type": "hard_cut", "at_s": 1.0}},
+        ],
+        2: [
+            {"order": 1, "source_time_s": 2.0, "source_scene_id": "SCENE_02",
+             "transition": {"type": "continuous", "at_s": None}},
+            {"order": 2, "source_time_s": 3.0, "source_scene_id": "SCENE_03",
+             "transition": {"type": "hard_cut", "at_s": 3.0}},
+        ],
+    }
+    lineage = {
+        1: {"chain_id": "chain-001", "join_mode": "hard_cut"},
+        2: {"chain_id": "chain-001", "join_mode": "continue"},
+    }
+    inventory = pipeline._frame_inventory(
+        frames, segment_lineage=lineage, keyframe_sources=sources,
+    )
+    assert [item["source_transition_from_previous"] for item in inventory] == [
+        "start", "hard_cut", "same_camera", "hard_cut",
+    ]
+    changed = deepcopy(sources)
+    changed[2][0]["source_time_s"] = 2.25
+    rebound = pipeline._frame_inventory(
+        frames, segment_lineage=lineage, keyframe_sources=changed,
+    )
+    assert rebound[2]["source_transition_evidence_sha256"] != inventory[2][
+        "source_transition_evidence_sha256"
+    ]
+
+
 def test_v4_plan_input_receives_backend_transition_skeleton_before_codex(tmp_path, monkeypatch):
     work = tmp_path / "work"
     segments = [
@@ -758,7 +802,29 @@ def test_v4_plan_input_receives_backend_transition_skeleton_before_codex(tmp_pat
         directory.mkdir(parents=True)
         for name in keyframes:
             (directory / name).write_bytes(_PX_PNG)
-        metas.append({"index": segment["index"], "keyframes": keyframes})
+        first_transition = (
+            {"type": "start", "at_s": 0.0}
+            if segment["index"] == 1
+            else {"type": "hard_cut", "at_s": 2.0}
+        )
+        metas.append({
+            "index": segment["index"],
+            "keyframes": keyframes,
+            "keyframe_sources": [
+                {
+                    "order": 1,
+                    "source_time_s": float((segment["index"] - 1) * 2),
+                    "source_scene_id": f"SCENE_{segment['index']:02d}",
+                    "transition": first_transition,
+                },
+                {
+                    "order": 2,
+                    "source_time_s": float((segment["index"] - 1) * 2 + 1),
+                    "source_scene_id": f"SCENE_{segment['index']:02d}",
+                    "transition": {"type": "continuous", "at_s": None},
+                },
+            ],
+        })
     captured = []
 
     def generate(_settings, _runner, specs, **_kwargs):
@@ -774,7 +840,7 @@ def test_v4_plan_input_receives_backend_transition_skeleton_before_codex(tmp_pat
 
     assert continuity["version"] == 1
     assert [item["transition_skeleton"][0]["source_transition_from_previous"]
-            for item in captured] == ["start", "same_camera"]
+            for item in captured] == ["start", "hard_cut"]
     assert all(
         item["transition_skeleton"][-1]["source_transition_evidence_sha256"]
         for item in captured

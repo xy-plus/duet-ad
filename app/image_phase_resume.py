@@ -634,6 +634,10 @@ def _execute_snapshot(snapshot: _Snapshot, runner) -> dict:
                 }
                 for item in snapshot.segments
             },
+            keyframe_sources={
+                item["index"]: item["keyframe_sources"]
+                for item in snapshot.segment_metas
+            },
         )
         changes.update(frozen_continuity)
         changes.update(frozen_prompts)
