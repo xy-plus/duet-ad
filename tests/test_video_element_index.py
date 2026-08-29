@@ -93,6 +93,7 @@ def test_project_index_call_is_once_isolated_and_preserves_segment_outputs(tmp_p
         runner,
         cdir,
         {1: frame_paths},
+        skill_bytes=b"frozen video-maker skill",
     )
 
     assert result == work / "element_index.json"
@@ -123,7 +124,9 @@ def test_project_index_call_has_no_retry_or_fallback(tmp_path):
 
     runner = FailingRunner()
     with pytest.raises(RuntimeError, match="project index failed"):
-        pipeline._generate_project_element_index(runner, cdir, {0: [frame]})
+        pipeline._generate_project_element_index(
+            runner, cdir, {0: [frame]}, skill_bytes=b"frozen video-maker skill"
+        )
     assert runner.calls == 1
     assert not (cdir / "work" / "element_index.json").exists()
 
@@ -149,6 +152,7 @@ def test_segmented_image_prompt_generation_passes_element_index_once(
         session_dir,
         step,
         element_index_path,
+        **_kwargs,
     ):
         captured.append((specs, session_dir, step, element_index_path))
         return {"version": 4}, {1: {}}
@@ -163,6 +167,7 @@ def test_segmented_image_prompt_generation_passes_element_index_once(
         work,
         session_dir=tmp_path,
         element_index_path=element_index_path,
+        skill_bytes=b"frozen image-postprocess skill",
     )
 
     assert result == ({"version": 4}, {1: {}})
@@ -180,7 +185,7 @@ def test_image_project_creates_index_once_outside_existing_image_retries(
     index_calls = []
     image_calls = []
 
-    def make_index(_runner, session_dir, frame_paths):
+    def make_index(_runner, session_dir, frame_paths, **_kwargs):
         index_calls.append((session_dir, frame_paths))
         element_index_path.write_text(
             json.dumps(_element_index(), ensure_ascii=False), encoding="utf-8"
@@ -216,6 +221,8 @@ def test_image_project_creates_index_once_outside_existing_image_retries(
         ],
         session_dir=tmp_path,
         step="image project",
+        skill_bytes=b"frozen image-postprocess skill",
+        video_skill_bytes=b"frozen video-maker skill",
     )
 
     assert result == ({"version": 4}, {0: {}})

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,8 @@ DIMENSIONS = (
     "fragment_non_promotion",
     "frozen_readonly_prompt_isolation",
 )
+
+_NEUTRAL_KEY_RE = re.compile(r"^(person|entity|scene)-[0-9]{2,}$")
 
 
 def _f1(true_positive: float, false_positive: float, false_negative: float) -> float:
@@ -55,6 +58,8 @@ class ReviewCounts:
     request_entries_correct: float
     request_entries_total: float
     prompt_absent_credit: float
+    stable_key_identity_credit: float = 0.0
+    stable_key_identity_total: float = 0.0
 
 
 def score_review(counts: ReviewCounts) -> dict[str, float]:
@@ -86,13 +91,23 @@ def score_review(counts: ReviewCounts) -> dict[str, float]:
         / counts.request_entries_total
     )
     isolation = (immutable + request + 100.0 * counts.prompt_absent_credit) / 3.0
+    stable_key = _f1(
+        counts.stable_pair_tp,
+        counts.stable_pair_fp,
+        counts.stable_pair_fn,
+    )
+    if counts.stable_key_identity_total:
+        stable_key = min(
+            stable_key,
+            100.0
+            * counts.stable_key_identity_credit
+            / counts.stable_key_identity_total,
+        )
     scores = {
         "project_element_coverage": _f1(
             counts.coverage_tp, counts.coverage_fp, counts.coverage_fn
         ),
-        "stable_key_consistency": _f1(
-            counts.stable_pair_tp, counts.stable_pair_fp, counts.stable_pair_fn
-        ),
+        "stable_key_consistency": stable_key,
         "occurrence_accuracy": _f1(
             counts.occurrence_tp, counts.occurrence_fp, counts.occurrence_fn
         ),
@@ -154,9 +169,13 @@ class _EvidenceRunner:
 
 
 def run_real_project_index(
-    segment_directories: list[Path], evidence_dir: Path, *, timeout_s: int = 1800
+    segment_directories: list[Path],
+    evidence_dir: Path,
+    *,
+    skill_bytes: bytes,
+    timeout_s: int = 1800,
 ) -> Path:
-    """Execute project_index against absolute frozen PNG directories."""
+    """Execute project_index against absolute frozen PNG directories and Skill bytes."""
     if not segment_directories or not evidence_dir.is_absolute():
         raise ValueError("absolute evidence directory and at least one segment are required")
     if any(not directory.is_absolute() for directory in segment_directories):
@@ -182,6 +201,7 @@ def run_real_project_index(
         _EvidenceRunner(evidence_dir, timeout_s=timeout_s),
         session_dir,
         frame_paths,
+        skill_bytes=skill_bytes,
     )
     after = {
         f"{segment_index}/{frame_order:02d}": _digest(path)
@@ -216,6 +236,42 @@ def index_summary(index_path: Path) -> dict[str, object]:
             if isinstance(item, dict)
         }
     return summary
+
+
+def audit_key_identity(index_path: Path) -> dict[str, object]:
+    """Measure whether project keys are neutral, immutable binding IDs.
+
+    This is a continuous review signal.  It intentionally does not decide
+    whether an execution may continue or be released.
+    """
+    value = json.loads(index_path.read_text(encoding="utf-8"))
+    rows: list[dict[str, object]] = []
+    for category in ("people", "entities", "scenes"):
+        items = value.get(category, {})
+        if not isinstance(items, dict):
+            continue
+        prefix = {
+            "people": "person",
+            "entities": "entity",
+            "scenes": "scene",
+        }[category]
+        for key in items:
+            neutral = isinstance(key, str) and bool(
+                _NEUTRAL_KEY_RE.fullmatch(key)
+            ) and key.startswith(f"{prefix}-")
+            rows.append({
+                "category": category,
+                "key": key,
+                "neutral": neutral,
+            })
+    total = len(rows)
+    neutral = sum(1 for row in rows if row["neutral"])
+    return {
+        "total_keys": total,
+        "neutral_keys": neutral,
+        "neutral_ratio": 100.0 if total == 0 else round(100.0 * neutral / total, 2),
+        "violations": [row for row in rows if not row["neutral"]],
+    }
 
 
 def write_run_manifest(
@@ -301,3 +357,58 @@ def test_score_review_has_no_pass_fail_result():
     assert set(scores) == set(DIMENSIONS)
     assert "pass" not in scores
     assert "fail" not in scores
+
+
+def test_score_review_includes_neutral_key_identity_without_a_gate():
+    scores = score_review(
+        ReviewCounts(
+            coverage_tp=1,
+            coverage_fp=0,
+            coverage_fn=0,
+            stable_pair_tp=10,
+            stable_pair_fp=0,
+            stable_pair_fn=0,
+            occurrence_tp=1,
+            occurrence_fp=0,
+            occurrence_fn=0,
+            separation_credit=1,
+            separation_total=1,
+            fragment_promotions=0,
+            fragment_traps=1,
+            frozen_hashes_unchanged=1,
+            frozen_hashes_total=1,
+            request_entries_correct=1,
+            request_entries_total=1,
+            prompt_absent_credit=1,
+            stable_key_identity_credit=1,
+            stable_key_identity_total=2,
+        )
+    )
+
+    assert scores["stable_key_consistency"] == 50.0
+    assert "pass" not in scores
+    assert "fail" not in scores
+
+
+def test_audit_key_identity_is_continuous_and_category_scoped(tmp_path):
+    path = tmp_path / "element_index.json"
+    path.write_text(
+        json.dumps(
+            {
+                "people": {"person-01": {}},
+                "entities": {"entity-01": {}, "red-object": {}},
+                "scenes": {"scene-01": {}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    audit = audit_key_identity(path)
+
+    assert audit["total_keys"] == 4
+    assert audit["neutral_keys"] == 3
+    assert audit["neutral_ratio"] == 75.0
+    assert audit["violations"] == [
+        {"category": "entities", "key": "red-object", "neutral": False}
+    ]

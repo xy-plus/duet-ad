@@ -139,6 +139,31 @@ def test_project_index_phase_adds_one_optional_output_without_replacing_segment_
     assert "不改变逐 segment 阶段的任何既有输入、输出或规则" in text
 
 
+def test_project_index_keys_are_neutral_ids_and_keep_instance_identity():
+    text = _skill_text()
+
+    for required in (
+        "不可变索引 key",
+        "stable key 是跨帧绑定用的 ID",
+        "按 segment 顺序逐帧建立可见元素清单",
+        "不得只输出首个 segment 或只输出画面主体",
+        "person-01",
+        "entity-01",
+        "scene-01",
+        "逐帧回查已建 ID",
+        "换 scene 不会清除可见人物或实体的 occurrence",
+        "硬切后先按新 scene 判断",
+        "key 本身不得包含或暗示可替换的源属性",
+        "逐字复用原 ID",
+        "物理上独立、可分别移动或分别接触的同类元素分别分配 ID",
+        "不用集合或群组 ID",
+        "非人物实体优先限于前景、被持握或被动作直接作用的独立对象",
+        "单帧出镜只有在对象清晰、完整且位于前景、被持握或被动作直接作用时才记录",
+        "过渡扫到的家具/收纳物/陈设/杂物不升格为实体",
+    ):
+        assert required in text
+
+
 def test_project_index_is_a_single_additive_phase_without_quality_control_flow():
     text = _skill_text()
     section = text.split("## 项目级可替换元素索引", 1)[1]
