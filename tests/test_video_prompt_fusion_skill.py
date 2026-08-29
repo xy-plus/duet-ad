@@ -250,6 +250,23 @@ def test_dynamic_inheritance_requires_two_sided_new_frame_evidence():
         assert required in text
 
 
+def test_interval_ledger_closes_current_bindings_and_audio_scope():
+    text = _skill()
+
+    for required in (
+        "每个 hard-cut 区间先建立内部证据账本（不输出）",
+        "逐帧记录当前帧直接可见的 `stable_key`/`TILE_XX` 及可见范围",
+        "仅消费同一当前帧同时映射且可见的绑定",
+        "前一帧、相邻区间或其他 segment 的人物、服装、环境、对象、动作补当前区间",
+        "边缘、局部、遮挡、模糊或紧裁切只能写可见片段",
+        "动态短语必须有本区间起止帧支持并停在最后支持状态",
+        "`audio_content` 仅作为冻结台词事件的冲突边界，不生成声音、拟声、台词、说话动作或口型",
+        "不生成声音、拟声、台词、说话动作或口型",
+        "无证据短语删除，不拒绝、不重试、不回退、不改 schema",
+    ):
+        assert required in text
+
+
 def test_people_and_entity_instance_counts_are_closed_by_new_frames():
     text = _skill()
 
