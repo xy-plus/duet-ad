@@ -2658,7 +2658,7 @@ def _automatic_v4_pre_fusion_claim(
         }
         or owner.get("kind") != "submit"
         or owner.get("request_id") != f"auto-{cid}"
-        or owner.get("fast_mode") is not False
+        or owner.get("fast_mode") is not True
         or not isinstance(owner.get("process_generation"), str)
         or not isinstance(owner.get("frozen_input_snapshot"), dict)
     ):
@@ -3135,7 +3135,7 @@ def _start_automatic_v4_generation(
     )
     if claimed is None:
         return
-    owner = {**claimed["_input_owner"], "fast_mode": False}
+    owner = {**claimed["_input_owner"], "fast_mode": True}
     accepted = storage.update_meta(
         settings.data_dir,
         cid,

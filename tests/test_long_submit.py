@@ -1958,9 +1958,15 @@ def test_technical_acceptance_auto_claim_reaches_fusion_and_h3_once(
         },
     )
     finalize_calls = []
+    owner_fast_modes = []
 
     def finalize(*_args, **_kwargs):
         finalize_calls.append(True)
+        owner_fast_modes.append(
+            storage.load_meta(settings.data_dir, cid)["_input_owner"][
+                "fast_mode"
+            ]
+        )
         if len(finalize_calls) > 1:
             return "c" * 64
         storage.update_meta(
@@ -2026,6 +2032,8 @@ def test_technical_acceptance_auto_claim_reaches_fusion_and_h3_once(
     stored = storage.load_meta(settings.data_dir, cid)
     assert stored["_input_owner"] is None
     assert stored["generation"]["client_request_id"] == f"auto-{cid}"
+    assert owner_fast_modes == [True, True]
+    assert stored["generation"]["fast_mode"] is True
     assert finalize_calls == [True, True]
     assert coordinator_calls == [True]
 
@@ -2062,7 +2070,7 @@ def _make_automatic_pre_fusion_claim(
         request_id or f"auto-{cid}",
     )
     assert claimed is not None
-    owner = {**claimed["_input_owner"], "fast_mode": False}
+    owner = {**claimed["_input_owner"], "fast_mode": True}
     storage.update_meta(
         settings.data_dir,
         cid,
