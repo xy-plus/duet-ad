@@ -1401,8 +1401,51 @@ def test_v4_postprocess_builds_board_before_existing_dag_without_quality_pack_ga
 
     asyncio.run(postprocess._run_v4_task(
         settings, "cid", cdir, {}, private, {}, asyncio.Semaphore(1),
+        skill_bytes=b"skill",
     ))
     assert calls == ["replacement-board", "global-anchor", "layout", "fanout"]
+
+
+def test_v4_postprocess_preserves_the_failing_technical_phase(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    cdir = tmp_path / "session"
+    cdir.mkdir()
+    private = {
+        "options": {"remove_subtitle": False, "remove_brand": False},
+        "plan_sha256": "a" * 64,
+        "continuity_sha256": "b" * 64,
+    }
+    metric = {
+        "version": 1,
+        "algorithm": postprocess._PALETTE_METRIC_ALGORITHM,
+        "thresholds": postprocess._PALETTE_METRIC_THRESHOLDS,
+        "frames": [],
+    }
+    metric["sha256"] = postprocess._receipt_sha256(metric)
+    monkeypatch.setattr(postprocess, "_v4_frozen_plan", lambda *_args: {"segments": []})
+    monkeypatch.setattr(postprocess, "_v4_frame_sources", lambda *_args: {})
+    monkeypatch.setattr(postprocess, "_v4_preflight", lambda *_args: None)
+    monkeypatch.setattr(postprocess, "_v4_palette_metrics", lambda *_args: metric)
+
+    async def board(*_args, **_kwargs):
+        return None
+
+    async def bootstrap(*_args, **_kwargs):
+        return {}, []
+
+    async def broken_layout(*_args, **_kwargs):
+        raise RuntimeError("transport exploded")
+
+    monkeypatch.setattr(postprocess, "_v4_generate_composite_replacement_board", board)
+    monkeypatch.setattr(postprocess, "_v4_bootstrap_scene_anchors", bootstrap)
+    monkeypatch.setattr(postprocess, "_v4_generate_layout_anchors", broken_layout)
+
+    with pytest.raises(postprocess.PostprocessError) as raised:
+        asyncio.run(postprocess._run_v4_task(
+            settings, "cid", cdir, {}, private, {}, asyncio.Semaphore(1),
+            skill_bytes=b"skill",
+        ))
+    assert raised.value.detail == "postprocess_layout_anchor_failed"
 
 
 def test_v4_every_segment_anchor_reuses_the_same_composite_board_path(tmp_path):

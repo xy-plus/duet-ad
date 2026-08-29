@@ -3390,31 +3390,9 @@ def create_app(settings: Settings) -> FastAPI:
         elif post.get("status") == "running":
             should_run = True
         elif post.get("status") == "failed":
-            failed = next(
-                (
-                    item for item in post.get("segments", [])
-                    if isinstance(item, Mapping)
-                    and item.get("status") == "failed"
-                    and item.get("error") == "provider_rejected"
-                ),
-                None,
-            )
-            if failed is None:
-                return
-            try:
-                await postprocess.retry_segment(
-                    settings,
-                    cid,
-                    int(failed["index"]),
-                    {
-                        "confirm": True,
-                        "expected_revision": failed["revision"],
-                    },
-                    postprocess_locks,
-                )
-            except (postprocess.PostprocessError, KeyError, TypeError, ValueError):
-                return
-            should_run = True
+            # A failed provider attempt is terminal for the automatic path.
+            # Starting another paid attempt requires an explicit user request.
+            return
         if should_run:
             await postprocess.run_task(
                 settings,

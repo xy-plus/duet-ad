@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -19,6 +20,8 @@ from app import image_optimization, mediakit, seedream, skill_milestone, storage
 from app.config import Settings
 from app.sanitize import sanitize
 
+log = logging.getLogger(__name__)
+
 OPTION_KEYS = ("remove_subtitle", "remove_brand", "optimize_image")
 _OLD_OPTION_KEYS = frozenset({"remove_subtitle", "remove_brand"})
 _OPTION_SET = frozenset(OPTION_KEYS)
@@ -31,6 +34,9 @@ _PUBLIC_ERROR_CODES = frozenset({
     "postprocess_canonical_conflict", "image_optimization_prompt_invalid",
     "postprocess_receipt_invalid", "image_plan_audit_failed",
     "image_verification_failed", "segment_failed",
+    "postprocess_replacement_board_failed", "postprocess_scene_anchor_failed",
+    "postprocess_layout_anchor_failed", "postprocess_frame_generation_failed",
+    "postprocess_publish_failed",
 })
 _FRAME_ERROR_RE = re.compile(r"^frame ([A-Za-z0-9_.-]{1,128}) failed(?:$|:)")
 _PUBLIC_FRAME_RE = re.compile(
@@ -2445,42 +2451,54 @@ async def _run_v4_task(
     grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
     *, skill_bytes: bytes,
 ) -> None:
-    plan = _v4_frozen_plan(meta, private)
-    sources = _v4_frame_sources(grouped, private)
-    _v4_preflight(plan, private, sources)
-    source_metrics = _v4_palette_metrics(plan, sources)
-    source_payload = {
-        "version": 1,
-        "plan_sha256": private["plan_sha256"],
-        "continuity_sha256": private["continuity_sha256"],
-        "metrics": source_metrics,
-    }
-    source_palette_receipt = {
-        **source_payload, "sha256": _receipt_sha256(source_payload),
-    }
-    _write_json_receipt(
-        cdir / "work" / ".postprocess-private" / "scene-anchors" / "palette-source.json",
-        source_palette_receipt,
-    )
-    await _v4_generate_composite_replacement_board(
-        settings, cdir, cid, private, grouped, seedream_sem, plan,
-    )
-    bootstrap_outputs, anchor_receipts = await _v4_bootstrap_scene_anchors(
-        settings, cdir, cid, private, grouped, seedream_sem
-    )
-    await _v4_generate_layout_anchors(
-        settings, cdir, cid, private, grouped, seedream_sem,
-        bootstrap_outputs, anchor_receipts,
-    )
-    outputs = await _v4_fan_out(
-        settings, cdir, cid, private, grouped, seedream_sem,
-        bootstrap_outputs, anchor_receipts,
-    )
-    offset = 0
-    for index in sorted(grouped):
-        targets = grouped[index]
-        _publish_segment(outputs[offset:offset + len(targets)], targets)
-        offset += len(targets)
+    phase = "scene_anchor"
+    try:
+        plan = _v4_frozen_plan(meta, private)
+        sources = _v4_frame_sources(grouped, private)
+        _v4_preflight(plan, private, sources)
+        source_metrics = _v4_palette_metrics(plan, sources)
+        source_payload = {
+            "version": 1,
+            "plan_sha256": private["plan_sha256"],
+            "continuity_sha256": private["continuity_sha256"],
+            "metrics": source_metrics,
+        }
+        source_palette_receipt = {
+            **source_payload, "sha256": _receipt_sha256(source_payload),
+        }
+        _write_json_receipt(
+            cdir / "work" / ".postprocess-private" / "scene-anchors" / "palette-source.json",
+            source_palette_receipt,
+        )
+        phase = "replacement_board"
+        await _v4_generate_composite_replacement_board(
+            settings, cdir, cid, private, grouped, seedream_sem, plan,
+        )
+        phase = "scene_anchor"
+        bootstrap_outputs, anchor_receipts = await _v4_bootstrap_scene_anchors(
+            settings, cdir, cid, private, grouped, seedream_sem
+        )
+        phase = "layout_anchor"
+        await _v4_generate_layout_anchors(
+            settings, cdir, cid, private, grouped, seedream_sem,
+            bootstrap_outputs, anchor_receipts,
+        )
+        phase = "frame_generation"
+        outputs = await _v4_fan_out(
+            settings, cdir, cid, private, grouped, seedream_sem,
+            bootstrap_outputs, anchor_receipts,
+        )
+        phase = "publish"
+        offset = 0
+        for index in sorted(grouped):
+            targets = grouped[index]
+            _publish_segment(outputs[offset:offset + len(targets)], targets)
+            offset += len(targets)
+    except (asyncio.CancelledError, PostprocessError):
+        raise
+    except Exception as exc:
+        log.exception("v4 postprocess failed cid=%s phase=%s", cid, phase)
+        raise PostprocessError(502, f"postprocess_{phase}_failed") from exc
 
 
 async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore,
