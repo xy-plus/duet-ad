@@ -172,6 +172,42 @@ def test_old_dynamic_is_confined_to_each_hard_cut_interval():
     assert "必须在切点终止，不得在切后自动续写" not in text
 
 
+def test_dynamic_inheritance_requires_two_sided_new_frame_evidence():
+    text = _skill()
+
+    for required in (
+        "旧动态的起点状态和终点状态都由该区间的新关键帧独立支持",
+        "只支持一端",
+        "不得外推、补全或保留该动态",
+        "`continuous` 只维持 hard-cut 区间归属",
+        "不得自由扩展运动",
+    ):
+        assert required in text
+
+
+def test_people_and_entity_instance_counts_are_closed_by_new_frames():
+    text = _skill()
+
+    for required in (
+        "人物和实体的实例集合及数量以该 hard-cut 区间的新关键帧闭合",
+        "不得把反射、残影、边缘片段或旧提示词中的称谓计为独立人物或实体",
+        "不得据此增加实例数量",
+    ):
+        assert required in text
+
+
+def test_fusion_cannot_invent_transitions_or_motion_discontinuities():
+    text = _skill()
+
+    for required in (
+        "不得增加任何切点",
+        "不得输出 morph",
+        "不得无证据反转镜头运动方向",
+        "不得无证据重置镜头运动速度",
+    ):
+        assert required in text
+
+
 def test_audio_and_provider_syntax_stay_out_of_skill_output():
     text = _skill()
 
