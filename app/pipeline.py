@@ -42,6 +42,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from app import asr, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
@@ -56,7 +57,6 @@ SCENES_SCRIPT = ROOT / "app" / "scenes.py"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 PROMPT_FUSION_SKILL_MD = ROOT / "skills" / "video-prompt-fusion" / "SKILL.md"
 PROMPT_FUSION_FROZEN_SKILL_FILENAME = "video_prompt_fusion_skill.md"
-
 MAX_PROMPT_BYTES = 32 * 1024
 SCENES_TIMEOUT_S = 300  # scenes.py 场景检测超时（长视频 PySceneDetect 较慢）
 CUT_DURATION_TOLERANCE_S = 0.1  # 切段时长允许误差（秒）
@@ -575,6 +575,30 @@ def _materialize_skill_bytes(destination: Path, data: bytes) -> None:
         raise PipelineError("frozen Skill stage is invalid") from None
 
 
+def _analysis_keyframe_proxy(data: bytes) -> bytes:
+    """Create the sole half-size PNG representation used by visual analyzers."""
+    if not isinstance(data, bytes) or not data:
+        raise PipelineError("analysis keyframe source is invalid")
+    image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None or image.size == 0:
+        raise PipelineError("analysis keyframe source is invalid")
+    height, width = image.shape[:2]
+    resized = cv2.resize(
+        image,
+        (
+            max(1, (width + 1) // 2),
+            max(1, (height + 1) // 2),
+        ),
+        interpolation=cv2.INTER_AREA,
+    )
+    encoded, proxy = cv2.imencode(
+        ".png", resized, [cv2.IMWRITE_PNG_COMPRESSION, 3]
+    )
+    if not encoded:
+        raise PipelineError("analysis keyframe proxy is invalid")
+    return proxy.tobytes()
+
+
 def _generate_project_element_index(
     runner,
     cdir: Path,
@@ -606,7 +630,7 @@ def _generate_project_element_index(
             )
             destination.mkdir(parents=True)
             for frame_order, source in enumerate(frame_paths[segment_index], 1):
-                data = source.read_bytes()
+                data = _analysis_keyframe_proxy(source.read_bytes())
                 relative = Path(
                     "work", "segments", str(segment_index), "keyframes",
                     f"{frame_order:02d}.png",
@@ -738,7 +762,8 @@ def _run_visual_codex(
                 raise PipelineError("backend frozen keyframes are invalid")
             for order, data in enumerate(frozen_keyframes, 1):
                 _materialize_skill_bytes(
-                    stage_keyframes / f"{order:02d}.png", data
+                    stage_keyframes / f"{order:02d}.png",
+                    _analysis_keyframe_proxy(data),
                 )
         else:
             for order in range(1, scene_planner.KEYFRAMES_PER_SEGMENT + 1):

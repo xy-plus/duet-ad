@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 import httpx
+import cv2
+import numpy as np
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
@@ -392,10 +394,16 @@ def test_visual_attempt_restores_backend_frozen_frames_after_codex_mutation(tmp_
     frozen = tuple(_PX_PNG for _index in range(9))
 
     class MutatingRunner:
-        def run(self, _cdir, _prompt):
+        def run_isolated(
+            self, stage, _prompt, *, session_dir, writable_paths,
+        ):
+            assert session_dir == cdir
+            isolated_work = stage / "work"
             (keyframes / "01.png").write_bytes(b"mutated")
             (keyframes / "09.png").unlink()
-            (work / "prompt.txt").write_text(PROMPT_TEXT, encoding="utf-8")
+            (isolated_work / "prompt.txt").write_text(
+                PROMPT_TEXT, encoding="utf-8"
+            )
 
     names, _prompt = pipeline._run_visual_attempt(
         MutatingRunner(),
@@ -404,10 +412,53 @@ def test_visual_attempt_restores_backend_frozen_frames_after_codex_mutation(tmp_
         work,
         isolate_dialogue=False,
         frozen_keyframes=frozen,
+        skill_bytes=b"frozen video-maker skill",
     )
 
     assert names == [f"{index:02d}.png" for index in range(1, 10)]
     assert tuple((keyframes / name).read_bytes() for name in names) == frozen
+
+
+def test_visual_analyzer_receives_half_resolution_proxies_and_restores_originals(
+    tmp_path,
+):
+    cdir = tmp_path / "conversation"
+    work = cdir / "work"
+    work.mkdir(parents=True)
+    source = np.full((8, 12, 3), 96, dtype=np.uint8)
+    ok, encoded = cv2.imencode(".png", source)
+    assert ok
+    frozen = tuple(encoded.tobytes() for _index in range(9))
+
+    class InspectingRunner:
+        def run_isolated(
+            self, stage, _prompt, *, session_dir, writable_paths,
+        ):
+            assert session_dir == cdir
+            for order in range(1, 10):
+                data = (stage / "work" / "keyframes" / f"{order:02d}.png").read_bytes()
+                image = cv2.imdecode(
+                    np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR
+                )
+                assert image.shape[:2] == (4, 6)
+            (stage / "work" / "prompt.txt").write_text(
+                PROMPT_TEXT, encoding="utf-8"
+            )
+
+    names, _prompt = pipeline._run_visual_attempt(
+        InspectingRunner(),
+        cdir,
+        "analyze proxies",
+        work,
+        isolate_dialogue=False,
+        frozen_keyframes=frozen,
+        skill_bytes=b"frozen video-maker skill",
+    )
+
+    assert names == [f"{index:02d}.png" for index in range(1, 10)]
+    assert tuple(
+        (work / "keyframes" / name).read_bytes() for name in names
+    ) == frozen
 
 
 def test_source_scene_cut_is_frozen_on_the_first_post_cut_keyframe(tmp_path):

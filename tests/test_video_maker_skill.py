@@ -123,7 +123,7 @@ def test_project_index_phase_adds_one_optional_output_without_replacing_segment_
         '`phase="project_index"`',
         "`work/project_index_request.json`",
         "`work/element_index.json`",
-        "所有 segment 的冻结关键帧",
+        "所有 segment 的半尺寸分析副本",
         "`people/entities/scenes`",
         "`source_visual_description`",
         "`occurrences`",
@@ -136,7 +136,7 @@ def test_project_index_phase_adds_one_optional_output_without_replacing_segment_
         assert added in text
 
     assert "project_index 不读取 `work/prompt.txt`" in text
-    assert "不改变逐 segment 阶段的任何既有输入、输出或规则" in text
+    assert "不改变冻结原图、逐 segment 输出或后续节点" in text
 
 
 def test_project_index_keys_are_neutral_ids_and_keep_instance_identity():

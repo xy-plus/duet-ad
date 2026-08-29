@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import cv2
+import numpy as np
 import pytest
 
 from app import pipeline
@@ -26,26 +28,19 @@ class _IndexRunner:
                 encoding="utf-8"
             )
         )
-        assert request == {
-            "phase": "project_index",
-            "segments": [
-                {
-                    "segment_index": 1,
-                    "frames": [
-                        {
-                            "frame_order": 1,
-                            "path": "work/segments/1/keyframes/01.png",
-                            "sha256": hashlib.sha256(b"frozen-1").hexdigest(),
-                        },
-                        {
-                            "frame_order": 2,
-                            "path": "work/segments/1/keyframes/02.png",
-                            "sha256": hashlib.sha256(b"frozen-2").hexdigest(),
-                        },
-                    ],
-                }
-            ],
-        }
+        assert request["phase"] == "project_index"
+        assert [item["segment_index"] for item in request["segments"]] == [1]
+        frame_items = request["segments"][0]["frames"]
+        assert [item["frame_order"] for item in frame_items] == [1, 2]
+        assert [item["path"] for item in frame_items] == [
+            "work/segments/1/keyframes/01.png",
+            "work/segments/1/keyframes/02.png",
+        ]
+        for item in frame_items:
+            data = (cdir / item["path"]).read_bytes()
+            image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            assert image.shape[:2] == (4, 6)
+            assert item["sha256"] == hashlib.sha256(data).hexdigest()
         assert sorted(
             path.relative_to(isolated_work).as_posix()
             for path in isolated_work.rglob("*")
@@ -77,14 +72,22 @@ def _element_index() -> dict:
     }
 
 
+def _png(width: int = 12, height: int = 8, value: int = 96) -> bytes:
+    image = np.full((height, width, 3), value, dtype=np.uint8)
+    ok, encoded = cv2.imencode(".png", image)
+    assert ok
+    return encoded.tobytes()
+
+
 def test_project_index_call_is_once_isolated_and_preserves_segment_outputs(tmp_path):
     cdir = tmp_path / "conversation"
     work = cdir / "work"
     frames = work / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
     frame_paths = [frames / "01.png", frames / "02.png"]
-    frame_paths[0].write_bytes(b"frozen-1")
-    frame_paths[1].write_bytes(b"frozen-2")
+    originals = [_png(value=64), _png(value=128)]
+    frame_paths[0].write_bytes(originals[0])
+    frame_paths[1].write_bytes(originals[1])
     segment_prompt = work / "segments" / "1" / "work" / "prompt.txt"
     segment_prompt.write_text("original segment prompt", encoding="utf-8")
     runner = _IndexRunner(_element_index())
@@ -99,7 +102,7 @@ def test_project_index_call_is_once_isolated_and_preserves_segment_outputs(tmp_p
     assert result == work / "element_index.json"
     assert json.loads(result.read_text(encoding="utf-8")) == _element_index()
     assert segment_prompt.read_text(encoding="utf-8") == "original segment prompt"
-    assert [path.read_bytes() for path in frame_paths] == [b"frozen-1", b"frozen-2"]
+    assert [path.read_bytes() for path in frame_paths] == originals
     assert len(runner.calls) == 1
     assert runner.calls[0][0] != cdir
     assert 'phase="project_index"' in runner.calls[0][1]
@@ -110,7 +113,7 @@ def test_project_index_call_has_no_retry_or_fallback(tmp_path):
     cdir = tmp_path / "conversation"
     frame = cdir / "work" / "keyframes" / "01.png"
     frame.parent.mkdir(parents=True)
-    frame.write_bytes(b"frozen")
+    frame.write_bytes(_png())
 
     class FailingRunner:
         calls = 0

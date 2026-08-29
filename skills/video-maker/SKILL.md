@@ -7,7 +7,7 @@ description: 从参考视频预先抽取的图片和文字做关键词与片段�
 
 ## 单一职责
 
-只分析原视频。项目统一表示为 `segments[N>=1]`；N=1 与 N>1 使用同一规则。后端把每个 segment 放入独立工作目录；逐 segment 阶段只处理当前目录，不跨目录取帧或补叙事。全部 segment 原功能完成后，后端可在隔离目录以 `phase="project_index"` 额外调用本 Skill 一次；该阶段只读调用方明确冻结的全项目关键帧，不改变逐 segment 阶段的任何既有输入、输出或规则。
+只分析原视频。项目统一表示为 `segments[N>=1]`；N=1 与 N>1 使用同一规则。后端把每个 segment 放入独立工作目录；逐 segment 阶段只处理当前目录，不跨目录取帧或补叙事。为减少分析耗时，后端可把原始关键帧确定性缩小约一半后放入分析沙箱；帧编号、顺序和源时间语义不变，原始全分辨率帧仍由后端冻结并供后续节点使用。全部 segment 原功能完成后，后端可在隔离目录以 `phase="project_index"` 额外调用本 Skill 一次；该阶段只读同一规则生成的全项目分析关键帧，不改变逐 segment 阶段的任何既有输出或后续原图合同。
 
 当前 segment 完成三件事：
 
@@ -62,12 +62,12 @@ description: 从参考视频预先抽取的图片和文字做关键词与片段�
 
 ## 项目级可替换元素索引
 
-仅当 `work/project_index_request.json` 明确声明 `phase="project_index"` 时执行本阶段，且每个项目只执行一次。在所有 segment 的逐段视觉分析、9 张原始关键帧选择和旧视频提示词生成后增量补充；只读所有 segment 的冻结关键帧，不改变逐 segment 阶段的任何既有输入、输出或规则。
+仅当 `work/project_index_request.json` 明确声明 `phase="project_index"` 时执行本阶段，且每个项目只执行一次。在所有 segment 的逐段视觉分析、9 张原始关键帧选择和旧视频提示词生成后增量补充；只读所有 segment 的半尺寸分析副本，不改变冻结原图、逐 segment 输出或后续节点。
 
 请求只含冻结帧，形如：
 
 ```json
-{"phase":"project_index","segments":[{"segment_index":1,"frames":[{"frame_order":1,"path":"work/segments/1/keyframes/01.png","sha256":"调用方冻结的原始字节哈希"}]}]}
+{"phase":"project_index","segments":[{"segment_index":1,"frames":[{"frame_order":1,"path":"work/segments/1/keyframes/01.png","sha256":"调用方冻结的分析副本字节哈希"}]}]}
 ```
 
 严格按 `segments` 和 `frames` 顺序查看全部冻结帧。project_index 不读取 `work/prompt.txt`，也不从字幕、文件名、常识或片段提示词补造事实。

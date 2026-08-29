@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import cv2
+import numpy as np
 
 from app import h3_project, image_optimization, long_generation, pipeline, skill_milestone, storage
 from conftest import make_settings
@@ -185,7 +187,10 @@ def test_pipeline_video_and_image_calls_consume_same_frozen_bytes(
     monkeypatch.setattr(pipeline, "SKILL_MD", drifted_video_skill)
 
     frame = project / "source-frame.png"
-    frame.write_bytes(b"frame")
+    image = np.full((8, 12, 3), 96, dtype=np.uint8)
+    ok, encoded = cv2.imencode(".png", image)
+    assert ok
+    frame.write_bytes(encoded.tobytes())
     seen_video = []
 
     class VideoRunner:
