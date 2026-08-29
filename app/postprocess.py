@@ -1421,11 +1421,14 @@ def _v4_expected_anchor_descriptors(plan: dict, schedule: dict) -> list[dict]:
 
 def _v4_semantic_labels(schedule: dict) -> list[str]:
     try:
-        return ["bootstrap", *[
-            f"layout-{layout['segment_index']:04d}"
-            for scene in schedule["scenes"]
-            for layout in scene["segment_layout_anchors"]
-        ]]
+        return [
+            "bootstrap",
+            *[
+                item["label"]
+                for item in schedule["nodes"]
+                if item["label"].startswith("layout-interval-")
+            ],
+        ]
     except (KeyError, TypeError):
         raise ValueError from None
 
@@ -1505,9 +1508,15 @@ def _valid_v4_anchor_receipt(
         source_sha256 = source_sha256s[key]
         if (
             set(anchor) != {
-                "order", "segment_index", "frame_index", "frame_name", "source_sha256",
+                "order", "segment_index", "frame_index", "frame_name",
+                "source_sha256", "source_interval_index",
             }
             or anchor["source_sha256"] != source_sha256
+            or (
+                isinstance(anchor["source_interval_index"], bool)
+                or not isinstance(anchor["source_interval_index"], int)
+                or anchor["source_interval_index"] < 1
+            )
             or not isinstance(receipt["input_roles"], list)
             or not isinstance(receipt["input_sha256s"], list)
             or len(receipt["input_roles"]) != len(receipt["input_sha256s"])
@@ -1528,11 +1537,16 @@ def _valid_v4_anchor_receipt(
                 and receipt["input_sha256s"][1:] == board_sha256s
             )
         if receipt["label"].startswith("fanout-"):
-            layout_sha = next(
-                item["output_sha256"] for item in anchors.values()
-                if item["label"] == f"layout-{anchor['segment_index']:04d}"
+            layout_matches = [
+                item for item in anchors.values()
+                if item["label"].startswith("layout-interval-")
                 and item["scene_id"] == receipt["scene_id"]
-            )
+                and item["anchor"].get("source_interval_index")
+                == anchor["source_interval_index"]
+            ]
+            if len(layout_matches) != 1:
+                return False
+            layout_sha = layout_matches[0]["output_sha256"]
             return (
                 roles == ["canvas", "segment_layout_anchor", *board_roles]
                 and receipt["input_sha256s"][1:] == [layout_sha, *board_sha256s]
@@ -2090,10 +2104,11 @@ async def _v4_generate_layout_anchors(
         global_output = _anchor_receipt_path(cdir, scene_id, "global").with_suffix(".png")
         for layout in scene["segment_layout_anchors"]:
             key = (layout["segment_index"], layout["frame_index"])
+            label = f"layout-interval-{layout['source_interval_index']:04d}"
             output, receipt = await _v4_anchor(
                 settings, cdir, cid, private, seedream_sem,
                 scene_id=scene_id,
-                label=f"layout-{layout['segment_index']:04d}",
+                label=label,
                 anchor=layout,
                 canvas=sources[key],
                 references=[("global_scene_anchor", global_output)],
@@ -2247,17 +2262,23 @@ async def _v4_fan_out(
     bootstrap_outputs: dict[tuple[int, int], Path], anchor_receipts: list[dict],
 ) -> list[Path]:
     sources = _v4_frame_sources(grouped, private)
-    layout_outputs = {
+    layout_outputs_by_key = {
         (layout["segment_index"], layout["frame_index"]): bootstrap_outputs[
             (layout["segment_index"], layout["frame_index"])
         ]
         for scene in private["scene_anchor_schedule"]["scenes"]
         for layout in scene["segment_layout_anchors"]
     }
-    layout_by_segment = {
-        segment_index: frame_index
-        for segment_index, frame_index in layout_outputs
+    layout_outputs_by_interval = {
+        layout["source_interval_index"]: layout_outputs_by_key[
+            (layout["segment_index"], layout["frame_index"])
+        ]
+        for scene in private["scene_anchor_schedule"]["scenes"]
+        for layout in scene["segment_layout_anchors"]
     }
+    interval_by_key = image_optimization.source_hard_cut_interval_indices(
+        private["execution_inputs"]["frames"]
+    )
     scene_by_segment = {
         frame["segment_index"]: frame["scene_id"]
         for frame in private["execution_inputs"]["frames"]
@@ -2268,7 +2289,7 @@ async def _v4_fan_out(
     }
     pending = [
         key for key in sorted(sources)
-        if key not in layout_outputs
+        if key not in layout_outputs_by_key
     ]
     async def one(key: tuple[int, int]) -> dict:
         index, frame_index = key
@@ -2292,9 +2313,10 @@ async def _v4_fan_out(
             label=f"fanout-{index:04d}-{frame_index:04d}",
             anchor=anchor,
             canvas=sources[key],
-            references=[("segment_layout_anchor", layout_outputs[(
-                index, layout_by_segment[index]
-            )])],
+            references=[(
+                "segment_layout_anchor",
+                layout_outputs_by_interval[interval_by_key[key]],
+            )],
             output=_private_dir(cdir, index) / "seedream" / frame["frame_name"],
         )
         return {"key": key, "output": output, "receipt": receipt}
@@ -2313,7 +2335,7 @@ async def _v4_fan_out(
         raise PostprocessError(502, sanitize(str(error)))
     for result in results:
         _append_anchor_receipt(anchor_receipts, result["receipt"])
-    outputs = dict(layout_outputs)
+    outputs = dict(layout_outputs_by_key)
     outputs.update({result["key"]: result["output"] for result in results})
     return [
         outputs[(index, frame_index)]
@@ -2947,13 +2969,20 @@ def _v4_user_acceptance_receipt(settings: Settings, cid: str, meta: dict) -> dic
             for scene in runtime_private["scene_anchor_schedule"]["scenes"]
             for item in scene["segment_layout_anchors"]
         }
+        layout_labels = {
+            (item["segment_index"], item["frame_index"]): (
+                f"layout-interval-{item['source_interval_index']:04d}"
+            )
+            for scene in runtime_private["scene_anchor_schedule"]["scenes"]
+            for item in scene["segment_layout_anchors"]
+        }
         frames = []
         cursor = 0
         for index in sorted(grouped):
             for frame_index, (raw, output) in enumerate(grouped[index], 1):
                 key = (index, frame_index)
                 label = (
-                    f"layout-{index:04d}" if key in layout_keys
+                    layout_labels[key] if key in layout_keys
                     else f"fanout-{index:04d}-{frame_index:04d}"
                 )
                 matches = [

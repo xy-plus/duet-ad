@@ -701,6 +701,9 @@ _ENTITY_VISIBILITIES = {
     "full", "partial", "edge_fragment", "occluded", "out_of_frame",
     "source_preserve",
 }
+_DIRECTLY_VISIBLE_ENTITY_VISIBILITIES = {
+    "full", "partial", "edge_fragment", "occluded",
+}
 _ENTITY_RELATION_PREDICATES = {
     "supports", "contacts", "separate_from", "occludes", "owned_by",
 }
@@ -2646,7 +2649,7 @@ def compile_frame_prompts(
             visible_keys.extend(
                 _split_stable_key(entity["description"])[0]
                 for entity in constraint["non_person_entity_ledger"]["entities"]
-                if entity["visibility"] != "out_of_frame"
+                if entity["visibility"] in _DIRECTLY_VISIBLE_ENTITY_VISIBILITIES
             )
             visible_keys.append(scene_key_by_id.get(segment["scene"]["scene_id"]))
             frame_tiles = [
@@ -3035,6 +3038,48 @@ def freeze_execution_inputs(
     return payload
 
 
+def source_hard_cut_interval_indices(frames: list[dict]) -> dict[tuple[int, int], int]:
+    """Return one deterministic interval id for every frozen source frame.
+
+    An interval starts at the first source frame and at each source
+    ``hard_cut`` transition.  Outer generation segments are deliberately not
+    boundaries: a segment split without a source cut must keep the same layout
+    reference.  The function only derives topology from the already frozen
+    source transition skeleton; it does not inspect generated images.
+    """
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("invalid image optimization source intervals")
+    result: dict[tuple[int, int], int] = {}
+    previous_key: tuple[int, int] | None = None
+    interval_index = 0
+    for position, frame in enumerate(frames):
+        if not isinstance(frame, dict):
+            raise ValueError("invalid image optimization source intervals")
+        segment_index = frame.get("segment_index")
+        frame_index = frame.get("frame_index")
+        transition = frame.get("source_transition_from_previous")
+        if (
+            isinstance(segment_index, bool)
+            or not isinstance(segment_index, int)
+            or isinstance(frame_index, bool)
+            or not isinstance(frame_index, int)
+            or frame_index < 1
+            or not isinstance(transition, str)
+            or transition not in _SCENE_CONTINUITY_TRANSITIONS
+            or position == 0 and transition != "start"
+            or position > 0 and transition == "start"
+        ):
+            raise ValueError("invalid image optimization source intervals")
+        key = (segment_index, frame_index)
+        if key in result or previous_key is not None and key <= previous_key:
+            raise ValueError("invalid image optimization source intervals")
+        if position == 0 or transition == "hard_cut":
+            interval_index += 1
+        result[key] = interval_index
+        previous_key = key
+    return result
+
+
 def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
     """Derive the only v4 scene-anchor DAG from frozen plan and frame inputs."""
     canonical = _canonical_plan_v4(plan)
@@ -3067,36 +3112,70 @@ def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
             "source_sha256": frame["source_sha256"],
         }
 
-    segments = {item["segment_index"]: item for item in canonical["segments"]}
+    interval_by_key = source_hard_cut_interval_indices(frames)
+    first_key_by_interval: dict[int, tuple[int, int]] = {}
+    scene_by_interval: dict[int, str] = {}
+    for frame in frames:
+        key = (frame["segment_index"], frame["frame_index"])
+        interval_index = interval_by_key[key]
+        first_key_by_interval.setdefault(interval_index, key)
+        scene_id = frame["scene_id"]
+        prior_scene = scene_by_interval.setdefault(interval_index, scene_id)
+        if prior_scene != scene_id:
+            raise ValueError("invalid image optimization anchor schedule")
+
+    scenes_by_id = {item["id"]: item for item in canonical["scene_plans"]}
     # Every paid node is ordered and named before runtime.  Runtime may only
     # replay this immutable DAG, never allocate an order with a dynamic max().
     # Quality-review-only alternate/person packs are deliberately excluded:
     # valid generation must not depend on a model-facing acceptance topology.
-    node_specs: list[tuple[str, str, int, int]] = []
+    node_specs: list[tuple[str, str, int, int, int]] = []
     for scene in canonical["scene_plans"]:
         reference = scene["reference"]
-        node_specs.append((scene["id"], "global", reference["segment_index"], reference["frame_index"]))
-    layout_keys = set()
-    for scene in canonical["scene_plans"]:
-        for segment_index in scene["segments"]:
-            segment = segments.get(segment_index)
-            if segment is None or segment["scene"]["scene_id"] != scene["id"]:
-                raise ValueError("invalid image optimization anchor schedule")
-            frame_index = segment["scene"]["layout_reference_frame_index"]
-            layout_keys.add((segment_index, frame_index))
-            node_specs.append((scene["id"], f"layout-{segment_index:04d}", segment_index, frame_index))
-    for segment in canonical["segments"]:
-        index = segment["segment_index"]
-        scene_id = segment["scene"]["scene_id"]
-        for frame in segment["frame_constraints"]:
-            frame_index = frame["frame_index"]
-            if (index, frame_index) not in layout_keys:
-                node_specs.append((scene_id, f"fanout-{index:04d}-{frame_index:04d}", index, frame_index))
-    if len({(scene_id, label) for scene_id, label, _segment, _frame in node_specs}) != len(node_specs):
+        key = (reference["segment_index"], reference["frame_index"])
+        interval_index = interval_by_key.get(key)
+        if interval_index is None or scene["id"] != scene_by_interval.get(interval_index):
+            raise ValueError("invalid image optimization anchor schedule")
+        node_specs.append((scene["id"], "global", *key, interval_index))
+    for interval_index in sorted(first_key_by_interval):
+        key = first_key_by_interval[interval_index]
+        scene_id = scene_by_interval[interval_index]
+        if scene_id not in scenes_by_id:
+            raise ValueError("invalid image optimization anchor schedule")
+        node_specs.append(
+            (
+                scene_id,
+                f"layout-interval-{interval_index:04d}",
+                *key,
+                interval_index,
+            )
+        )
+    layout_keys = set(first_key_by_interval.values())
+    for frame in frames:
+        key = (frame["segment_index"], frame["frame_index"])
+        if key not in layout_keys:
+            scene_id = frame["scene_id"]
+            node_specs.append(
+                (
+                    scene_id,
+                    f"fanout-{key[0]:04d}-{key[1]:04d}",
+                    *key,
+                    interval_by_key[key],
+                )
+            )
+    if len({(scene_id, label) for scene_id, label, _segment, _frame, _interval in node_specs}) != len(node_specs):
         raise ValueError("invalid image optimization anchor schedule")
     nodes = [
-        {"scene_id": scene_id, "label": label, "anchor": frozen_anchor(segment_index, frame_index, order)}
-        for order, (scene_id, label, segment_index, frame_index) in enumerate(node_specs, 1)
+        {
+            "scene_id": scene_id,
+            "label": label,
+            "anchor": {
+                **frozen_anchor(segment_index, frame_index, order),
+                "source_interval_index": interval_index,
+            },
+        }
+        for order, (scene_id, label, segment_index, frame_index, interval_index)
+        in enumerate(node_specs, 1)
     ]
     node_by_identity = {(item["scene_id"], item["label"]): item["anchor"] for item in nodes}
     scenes = []
@@ -3105,8 +3184,9 @@ def _scene_anchor_schedule(plan: dict, execution_inputs: dict) -> dict:
             "scene_id": scene["id"],
             "global_anchor": node_by_identity[(scene["id"], "global")],
             "segment_layout_anchors": [
-                node_by_identity[(scene["id"], f"layout-{segment_index:04d}")]
-                for segment_index in scene["segments"]
+                node_by_identity[(scene["id"], f"layout-interval-{interval_index:04d}")]
+                for interval_index in sorted(first_key_by_interval)
+                if scene_by_interval[interval_index] == scene["id"]
             ],
         })
     return {

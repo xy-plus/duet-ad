@@ -1050,6 +1050,137 @@ def _v4_frame_bound_plan() -> dict:
     return plan
 
 
+def _v4_multicut_frame_bound_plan() -> dict:
+    """Build two outer segments containing three source hard-cut intervals."""
+    plan = _v4_frame_bound_plan()
+    template = deepcopy(plan["segments"][0]["frame_constraints"][0])
+
+    def constraint(frame_index: int) -> dict:
+        item = deepcopy(template)
+        item["frame_index"] = frame_index
+        item["visible_body_parts"] = f"帧{frame_index}身体可见部位数量保持"
+        item["pose_skeleton"] = f"帧{frame_index}姿态骨架保持"
+        item["contact_points"] = f"帧{frame_index}接触点保持"
+        item["occlusion_order"] = f"帧{frame_index}遮挡顺序保持"
+        item["out_of_frame_crop"] = f"帧{frame_index}画外裁切保持"
+        return item
+
+    def segment(index: int) -> dict:
+        item = deepcopy(plan["segments"][0])
+        item["segment_index"] = index
+        item["persons"][0]["observable_frames"] = list(range(1, 10))
+        item["frame_constraints"] = [constraint(frame_index) for frame_index in range(1, 10)]
+        item["scene"]["layout_reference_frame_index"] = 1
+        return item
+
+    plan["segment_indices"] = [1, 2]
+    plan["person_plans"][0]["reference"] = {"segment_index": 1, "frame_index": 1}
+    plan["person_plans"][0]["observable_segments"] = [1, 2]
+    plan["scene_plans"][0]["reference"] = {"segment_index": 1, "frame_index": 1}
+    plan["scene_plans"][0]["segments"] = [1, 2]
+    plan["segments"] = [segment(1), segment(2)]
+    transitions = {}
+    for segment_index in (1, 2):
+        for frame_index in range(1, 10):
+            transitions[(segment_index, frame_index)] = "same_camera"
+    transitions[(1, 1)] = "start"
+    transitions[(1, 9)] = "hard_cut"
+    transitions[(2, 8)] = "hard_cut"
+    plan["scene_plans"][0]["continuity_graph"]["views"] = [
+        {
+            "segment_index": segment_index,
+            "frame_index": frame_index,
+            "transition_from_previous": transitions[(segment_index, frame_index)],
+            "observations": [{
+                "component_id": "COMPONENT_01",
+                "visibility": "full",
+            }],
+            "view_relations": [],
+        }
+        for segment_index in (1, 2)
+        for frame_index in range(1, 10)
+    ]
+    return plan
+
+
+def _v4_multicut_execution(settings, plan: dict) -> dict:
+    inventory = []
+    for segment_index in (1, 2):
+        for frame_index in range(1, 10):
+            inventory.append({
+                "segment_index": segment_index,
+                "frame_index": frame_index,
+                "frame_name": f"{frame_index:02d}.png",
+                "source_sha256": hashlib.sha256(
+                    f"source-{segment_index}-{frame_index}".encode()
+                ).hexdigest(),
+                "source_transition_from_previous": (
+                    "start" if (segment_index, frame_index) == (1, 1)
+                    else "hard_cut" if (segment_index, frame_index) in {(1, 9), (2, 8)}
+                    else "same_camera"
+                ),
+                "source_transition_evidence_sha256": hashlib.sha256(
+                    f"evidence-{segment_index}-{frame_index}".encode()
+                ).hexdigest(),
+            })
+    return image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={"id": "image-postprocess", "revision": 1},
+        model=settings.seedream_model,
+        frame_inventory=inventory,
+    )
+
+
+def test_v4_schedule_binds_a831_cut_frames_to_new_interval_layouts(tmp_path):
+    settings = make_settings(tmp_path)
+    plan = _v4_multicut_frame_bound_plan()
+    execution = _v4_multicut_execution(settings, plan)
+    schedule = image_optimization._scene_anchor_schedule(plan, execution)
+    nodes = schedule["nodes"]
+
+    layout_nodes = [
+        node for node in nodes if node["label"].startswith("layout-")
+    ]
+    assert [
+        (node["anchor"]["segment_index"], node["anchor"]["frame_index"])
+        for node in layout_nodes
+    ] == [(1, 1), (1, 9), (2, 8)]
+    assert [node["label"] for node in layout_nodes] == [
+        "layout-interval-0001", "layout-interval-0002",
+        "layout-interval-0003",
+    ]
+    assert [
+        node["anchor"]["source_interval_index"] for node in layout_nodes
+    ] == [1, 2, 3]
+
+    frame_nodes = {
+        (node["anchor"]["segment_index"], node["anchor"]["frame_index"]): node
+        for node in nodes
+        if node["label"].startswith("fanout-")
+    }
+    assert frame_nodes[(2, 1)]["anchor"]["source_interval_index"] == 2
+    assert frame_nodes[(2, 7)]["anchor"]["source_interval_index"] == 2
+    assert frame_nodes[(2, 9)]["anchor"]["source_interval_index"] == 3
+
+
+def test_v4_schedule_uses_no_outer_segment_layout_for_generic_multiple_cuts(tmp_path):
+    settings = make_settings(tmp_path)
+    plan = _v4_multicut_frame_bound_plan()
+    execution = _v4_multicut_execution(settings, plan)
+    schedule = image_optimization._scene_anchor_schedule(plan, execution)
+
+    assert len(schedule["nodes"]) == 1 + 3 + (18 - 3)
+    assert sum(
+        node["label"].startswith("layout-") for node in schedule["nodes"]
+    ) == 3
+    assert not any(
+        node["label"] == "layout-interval-0002"
+        and (node["anchor"]["segment_index"], node["anchor"]["frame_index"]) == (2, 1)
+        for node in schedule["nodes"]
+    )
+
+
 def test_v4_canonical_plan_accepts_sparse_observations_as_prompt_facts():
     plan = _v4_frame_bound_plan()
     plan["person_plans"] = []
@@ -1528,7 +1659,7 @@ def test_v4_schedule_freezes_unique_typed_paid_dag_order(tmp_path):
     assert [node["anchor"]["order"] for node in nodes] == list(range(1, len(nodes) + 1))
     assert [(node["scene_id"], node["label"]) for node in nodes] == [
         ("SCENE_01", "global"),
-        ("SCENE_01", "layout-0000"),
+        ("SCENE_01", "layout-interval-0001"),
         ("SCENE_01", "fanout-0000-0002"),
     ]
 
@@ -1567,6 +1698,35 @@ def test_v4_composite_board_and_frame_prompts_share_one_stable_tile_mapping():
         assert "严格保持当前源帧构图、表现形式、色调、光照、动作和关系不变" in text
     assert "hero-prop -> TILE_02 -> 替换为银色金属手持道具" in prompts[0][1]
     assert "hero-prop -> TILE_02 -> 替换为银色金属手持道具" not in prompts[0][2]
+
+
+def test_v4_source_preserve_entity_stays_on_shared_board_but_not_frame_binding():
+    plan = _v4_frame_bound_plan()
+    plan["person_plans"][0]["replacement_identity"] = (
+        "stable_key=hero；短发、清晰颧骨的新人物身份"
+    )
+    plan["scene_plans"][0]["replacement_scene"] = (
+        "stable_key=studio；同用途但空间结构不同的新摄影棚"
+    )
+    for frame in plan["segments"][0]["frame_constraints"]:
+        frame["non_person_entity_ledger"]["entities"][0]["description"] = (
+            "stable_key=source-only-prop；仅保留源帧中的既有实体"
+        )
+        frame["non_person_entity_ledger"]["entities"][0]["visibility"] = (
+            "source_preserve"
+        )
+
+    board = image_optimization.composite_replacement_board_spec(plan)
+    prompts = image_optimization.compile_frame_prompts(
+        plan, "anchor_consistency",
+    )
+
+    assert "source-only-prop" in {
+        tile["stable_key"] for tile in board["tiles"]
+    }
+    assert all(
+        "source-only-prop ->" not in text for text in prompts[0].values()
+    )
 
 
 def test_legacy_plan_keeps_existing_prompt_without_composite_board_binding():
@@ -2443,7 +2603,7 @@ def test_v4_runtime_publishes_without_in_band_acceptance(tmp_path, monkeypatch):
     private = cdir / "work" / ".postprocess-private" / "scene-anchors" / "SCENE_01"
     assert json.loads((private / "global.json").read_text())["input_roles"] == ["canvas"]
     assert not (private / "pack-alternate.json").exists()
-    assert json.loads((private / "layout-0000.json").read_text())["input_roles"] == [
+    assert json.loads((private / "layout-interval-0001.json").read_text())["input_roles"] == [
         "canvas", "global_scene_anchor",
     ]
     latest = storage.load_meta(settings.data_dir, cid)
