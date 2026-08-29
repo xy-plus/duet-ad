@@ -11,8 +11,12 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
+
+from app.codex_runner import CodexRunner
 
 
 DIMENSIONS = (
@@ -50,6 +54,153 @@ def _load_json(path: Path) -> tuple[bytes, dict[str, Any]]:
     if not isinstance(value, dict):
         raise ValueError(f"{path}: expected JSON object")
     return raw, value
+
+
+def _validate_fusion_output(
+    data: bytes, *, input_sha256: str, segment_count: int
+) -> dict[str, Any]:
+    """Validate only the production output envelope; semantic quality is review-only."""
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("fusion output is not JSON") from exc
+    segments = value.get("segments") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "version", "input_sha256", "segments"}
+        or value.get("schema") != "duet.video-prompt-fusion-output"
+        or value.get("version") != 2
+        or value.get("input_sha256") != input_sha256
+        or not isinstance(segments, list)
+        or len(segments) != segment_count
+    ):
+        raise ValueError("fusion output envelope is invalid")
+    for index, segment in enumerate(segments, 1):
+        visuals = segment.get("visual") if isinstance(segment, dict) else None
+        if (
+            not isinstance(segment, dict)
+            or set(segment) != {"index", "visual"}
+            or segment.get("index") != index
+            or not isinstance(visuals, list)
+            or not visuals
+            or any(not isinstance(text, str) or not text.strip() for text in visuals)
+        ):
+            raise ValueError("fusion output segment is invalid")
+    return value
+
+
+def _copy_frozen_frame(*, source_root: Path, stage: Path, frame: dict[str, Any]) -> None:
+    """Copy one receipt-bound frame into the isolated stage without touching its source."""
+    raw_path = frame.get("path")
+    expected_sha256 = frame.get("sha256")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("frame path is missing")
+    relative = Path(raw_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("frame path must be relative to the frozen input root")
+    source = (source_root / relative).resolve(strict=True)
+    source.relative_to(source_root)
+    if not source.is_file() or source.is_symlink():
+        raise ValueError("frame source is not a regular file")
+    data = source.read_bytes()
+    if not isinstance(expected_sha256, str) or hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise ValueError("frame source SHA-256 does not match the frozen receipt")
+    destination = stage / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(data)
+
+
+def run_real_fusion(
+    input_path: Path,
+    skill_path: Path,
+    evidence_dir: Path,
+    *,
+    timeout_s: int = 1800,
+) -> Path:
+    """Run the actual fusion Skill against one frozen v2 multimodal input.
+
+    The source input tree is read-only.  Codex receives only the frozen Skill,
+    the descriptor, and its SHA-bound images in a disposable isolated stage;
+    the returned artifact and byte evidence are copied to ``evidence_dir``.
+    This function intentionally has no semantic acceptance decision.
+    """
+    input_path = input_path.resolve(strict=True)
+    skill_path = skill_path.resolve(strict=True)
+    evidence_dir = evidence_dir.resolve()
+    if not input_path.is_file() or not skill_path.is_file() or not evidence_dir.is_absolute():
+        raise ValueError("absolute input, Skill, and evidence paths are required")
+    input_data, frozen = _load_json(input_path)
+    if (
+        frozen.get("schema") != "duet.video-prompt-fusion-input"
+        or frozen.get("version") != 2
+        or not isinstance(frozen.get("segments"), list)
+        or not frozen["segments"]
+    ):
+        raise ValueError("run_real_fusion requires a frozen v2 input")
+    source_root = input_path.parent.parent.resolve(strict=True)
+    skill_data = skill_path.read_bytes()
+    if not skill_data:
+        raise ValueError("Skill file is empty")
+    input_sha256 = _sha256_bytes(input_data)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    (evidence_dir / "frozen_input.json").write_bytes(input_data)
+    (evidence_dir / "skill.md").write_bytes(skill_data)
+    (evidence_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "input_sha256": input_sha256,
+                "skill_sha256": _sha256_bytes(skill_data),
+                "segment_count": len(frozen["segments"]),
+                "source_root": str(source_root),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    session_dir = evidence_dir / "session"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix="duet-fusion-stage-", dir="/tmp"))
+    try:
+        stage_work = stage / "work"
+        stage_work.mkdir(mode=0o700)
+        (stage / "SKILL.md").write_bytes(skill_data)
+        (stage_work / "multimodal_input.json").write_bytes(input_data)
+        for segment in frozen["segments"]:
+            frames = segment.get("new_keyframes")
+            if not isinstance(frames, list):
+                raise ValueError("frozen segment keyframes are invalid")
+            for frame in frames:
+                _copy_frozen_frame(source_root=source_root, stage=stage, frame=frame)
+        output_path = stage_work / "h3_prompt_plan.json"
+        runner = CodexRunner(timeout_s=timeout_s, concurrency=1)
+        runner.run_isolated_until_output(
+            stage,
+            "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json 及其中 SHA 绑定的有序图片；原子发布 work/h3_prompt_plan.json 后立即退出。",
+            session_dir=session_dir,
+            output_path=output_path,
+            max_output_bytes=64 * 1024 + 32 * 1024 * len(frozen["segments"]),
+            validate_output=lambda data: _validate_fusion_output(
+                data,
+                input_sha256=input_sha256,
+                segment_count=len(frozen["segments"]),
+            ),
+        )
+        artifact_data = output_path.read_bytes()
+        _validate_fusion_output(
+            artifact_data,
+            input_sha256=input_sha256,
+            segment_count=len(frozen["segments"]),
+        )
+        artifact_path = evidence_dir / "h3_prompt_plan.json"
+        artifact_path.write_bytes(artifact_data)
+        (evidence_dir / "artifact_sha256.txt").write_text(
+            _sha256_bytes(artifact_data) + "\n", encoding="ascii"
+        )
+        return artifact_path
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
 
 def _extract_bindings(text: str) -> list[dict[str, str]]:

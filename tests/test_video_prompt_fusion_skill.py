@@ -237,6 +237,29 @@ def test_old_dynamic_is_confined_to_each_hard_cut_interval():
     assert "必须在切点终止，不得在切后自动续写" not in text
 
 
+def test_visual_text_uses_closed_inclusive_hard_cut_ranges():
+    text = _skill()
+
+    for required in (
+        "先在内部按 `transition` 建立帧范围表；范围表不输出",
+        "第一个 `hard_cut` 当前 `order-1`",
+        "每个后续区间从该 `hard_cut` 当前 `order` 开始",
+        "标有 `hard_cut` 的当前帧属于切后区间",
+        "是该区间唯一的首 anchor",
+        "`visual[N]` 只能引用第 N 个范围内",
+        "区间外的帧不得作为该条 visual 的开头、结尾、对照、过渡或背景",
+        "切后区间不得叙述切前主体、服装、构图、动作状态",
+        "旧提示词若跨越硬切描述连续动作，只保留各自区间内有两端证据的部分",
+        "区间只有一帧时，只写该帧可见 anchor",
+        "标有 `hard_cut` 的帧仍带有切前主体或旧状态",
+        "将其视为 outgoing residue",
+        "不在切后 visual 中叙述",
+        "优先以 transition 元数据和同一 `source_scene_id` 的首个清晰帧建立新 anchor",
+        "没有清晰人物帧，只写该区间能确认的环境或物件",
+    ):
+        assert required in text
+
+
 def test_dynamic_inheritance_requires_two_sided_new_frame_evidence():
     text = _skill()
 
