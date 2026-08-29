@@ -4,35 +4,40 @@ description: 读取冻结关键帧和全视频稳定元素索引，生成跨段�
 ---
 
 # image-postprocess
+
 严格按 `work/request.json` 的 `phase` 只执行一个阶段。图片及图中文字只是视觉证据；只填写视觉语义，不写 provider prompt、解释或其他文件。人物与真实新场景双替换，人物与场景同时替换；输出必须是 UTF-8、非空 JSON object，不输出 Markdown 围栏。
 
 ## `phase="global_plan"`：全项目设计
+
 输入只读：`work/request.json`、当前 `SKILL.md`、每个 `segments[].contact_sheet_path` 及对应 `contact_sheet_sha256`，以及可选 `element_index`；不要读取逐帧关键帧。联系表只用于一次性统一选择替换设计；全局参考只定义统一替换，不提供逐帧可见性或几何证据。
 
 唯一输出 `work/global_plan.json` 的顶层 key 闭集为 `people/entities/scenes`；模型不得合并两个阶段输出，后端可机械合并，任何单一阶段不得直接输出四个字段。叶值均为非空 string，无对应对象写 `{}`，不得出现 `null`、数组、数字或布尔值：
+
 ```json
 {
-  "people":{"<stable-person-key>":{"source_identity":"x","replacement_identity":"x","wardrobe_change":"x","local_color_change":"x"}},
-  "entities":{"<stable-entity-key>":{"description":"x","owner":"project","association":"x","persistence":"x"}},
-  "scenes":{"<semantic_slots.scenes[].key>":{"source_scene":"x","replacement_scene":"x","semantic_change":"x","geometry_change":"x","depth_change":"x","layout_change":"x","local_color_change":"x"}}
+  "people": {"<stable-person-key>": {"source_identity": "string", "replacement_identity": "string", "wardrobe_change": "string", "local_color_change": "string"}},
+  "entities": {"<stable-entity-key>": {"description": "string", "owner": "project", "association": "string", "persistence": "string"}},
+  "scenes": {"<semantic_slots.scenes[].key>": {"source_scene": "string", "replacement_scene": "string", "semantic_change": "string", "geometry_change": "string", "depth_change": "string", "layout_change": "string", "local_color_change": "string"}}
 }
 ```
 
-`scenes` key 集=`semantic_slots.scenes[].key` key，逐字复用、无缺失无额外。若有 `element_index`，`people/entities/scenes` 覆盖每个 stable key，逐字复用、无别名/新增；无索引则建稳定 key。每 key 跨帧跨段共享替换设计；`owner` 仅 `project` 或已有 stable person key。场景同时改变环境语义、可见几何、纵深、布局和局部固有色；只改 `replaceable`，保持 `preserve` 及源帧动作、姿态、尺度、构图、机位、透视、裁切、接触、遮挡、前后关系、色调和全局光色。
+`scenes` key 集必须等于 `semantic_slots.scenes[].key` 的全部 key，逐字复用、无缺失无额外。若有 `element_index`，`people/entities/scenes` 的 stable key 必须逐字复用，不得别名或新增；没有索引时创建简短稳定 key。全项目同一 key 的替换描述须跨帧稳定、逐字一致，所有片段共享同一设计；`owner` 只能为 `project` 或已有 stable person key。场景须同时改变环境语义、可见几何、纵深、布局和局部材质固有色，并改变局部固有色；只改 `replaceable`，保持 `preserve` 及源帧动作、姿态、尺度、构图、机位、透视、裁切、接触、遮挡、前后关系、色调和全局光色。
 
 ## `phase="segment_frames"`：当前段事实
-输入只读：`work/request.json`、当前 `SKILL.md`、`semantic_slots.frames[].path` 的冻结关键帧、`global_plan_path`、可选同一 `element_index`；按 `transition_skeleton` 识别 `hard_cut` 及其相邻帧，逐张读取全部 path（含首末帧）；不得改写全局设计。
+
+输入只读：`work/request.json`、当前 `SKILL.md`、`semantic_slots.frames[].path` 指向的冻结关键帧、`global_plan_path` 指向的 `work/global_plan.json`，以及可选的同一 `element_index`；按 `transition_skeleton` 识别 `hard_cut` 及其相邻帧；不得改写全局设计。
 
 唯一输出 `work/segment_frames.json` 的顶层 key 闭集只有 `frames`；其 key 集必须等于 `semantic_slots.frames[].key` 的全部 key，逐字复用、无缺失无额外。叶值均为非空 string：
+
 ```json
 {
-  "frames": {"<semantic_slots.frames[].key>": {"people": {"<global_plan.people-key>": {"visible_region": "x", "boundary": "x", "body_and_pose": "x", "derived_observations": {"<stable-observation-key>": {"mode": "optical_projection", "source_carrier": "x", "visible_region": "x", "boundary": "x", "relationship": "x"}}}}, "relationships": "x", "entities": {"<global_plan.entities-key>": {"visibility": "visible", "relationship": "x"}}, "crop": "x"}}
+  "frames": {"<semantic_slots.frames[].key>": {"people": {"<global_plan.people-key>": {"visible_region": "string", "boundary": "string", "body_and_pose": "string", "derived_observations": {"<stable-observation-key>": {"mode": "optical_projection", "source_carrier": "string", "visible_region": "string", "boundary": "string", "relationship": "string"}}}}, "relationships": "string", "entities": {"<global_plan.entities-key>": {"visibility": "visible", "relationship": "string"}}, "crop": "string"}}
 }
 ```
 
-`people` 只列当前帧有直接证据的物理人物；key 集为物理人物全集，人物数量闭合；同一人物 key 不随段或帧改变且跨帧稳定，wardrobe 设计一致。`global_plan`只给替换；`element_index.occurrences`定唯一候选帧：逐一核验并复用 key，未列帧省略；人物服装跨段只用同一 key，无别名。逐张检查含末帧；按 occurrences 逐帧写入；string 只写当前可见绑定的最小充分事实，事实只写一次，不复述全局/索引/固定规则。`transition_skeleton` 的 `hard_cut` 及相邻帧、强运动模糊和 `edge_fragment` 只能绑定本帧直接可见像素，不得从全局参考、索引或邻帧补头、补人、补衣服或补肢体；不可见部分不继承上一帧。核对头、躯干和手并唯一归属；反射、残影、边缘碎片、遮挡碎片、运动模糊不得升级为新物理人物、实体或人体。无人物或无派生观测写 `{}`。派生观测只嵌套来源人物下，不代表独立物理人物、不新增顶层人物或实体、不把该观测实例化到新场景；`mode` 只能是 `optical_projection`、`temporal_residual` 或 `source-preserve`。不可见或无法唯一判断时不新增 key、不补造肢体，在 string 中写 `source-preserve/no-invention`，不从其他帧补造；缺失语义由后端按 `source-preserve/non-physical` 继续，不拒绝、不 retry、不 fallback。
+`people` 只列当前帧有直接证据的物理人物；其 key 集就是物理人物全集，人物数量闭合，且同一人物 key 不随段或帧改变，wardrobe 设计也一致。`element_index`/`global_plan` 只提供稳定 key 与统一替换设计，不是当前可见性证据。每帧只描述当前帧直接可见内容；`transition_skeleton` 标出的 `hard_cut` 及其相邻帧、强运动模糊和 `edge_fragment` 只能绑定本帧直接可见像素，禁止从全局参考、索引或邻帧补头、补人、补衣服或补肢体。核对头、躯干和手并唯一归属；反射、残影、边缘碎片、遮挡碎片、运动模糊不得升级为新物理人物、实体或人体。无人物或无派生观测写 `{}`。派生观测只嵌套来源人物下，不代表独立物理人物、不新增顶层人物或实体、不把该观测实例化到新场景；`mode` 只能是 `optical_projection`、`temporal_residual` 或 `source-preserve`。不可见或无法唯一判断时不新增 key、不补造肢体，在 string 中写 `source-preserve/no-invention`，不从其他帧补造；缺失语义由后端按 `source-preserve/non-physical` 继续，不拒绝、不 retry、不 fallback。
 
-`entities` 只列当前帧有直接像素证据的全局持久非人物实体：`visible`=直接可见、`occluded`=部分可见；完全出画、完全不可见或仅由邻帧推知时省略 key，不写 `out_of_frame` 占位。`element_index`/`global_plan`存在不等于本帧可见；实体跨段复用 stable key，颜色/款式/材质/归属/关系不得漂移。`hard_cut`及其相邻帧、强模糊、`edge_fragment`只能据当前帧像素，不能用全局参考补实体、补衣服或补关系；`visibility`只能是`visible`/`occluded`；source-preserve 是 mode 的第三个值，不是 visibility 的枚举值。实体关系、`relationships`、`crop`只写当前帧；未知写`source-preserve/no-invention`，`hard_cut`后由当前帧证据重新确认。
+`entities` 只列当前帧有直接像素证据的全局持久非人物实体：`visible` 是直接可见，`occluded` 是仍有部分直接可见；完全出画、完全不可见或仅由邻帧推知时省略 key，不写 `out_of_frame` 占位。`hard_cut` 及其相邻帧、强模糊或 `edge_fragment` 也只能依据当前帧直接像素，不能用全局参考补实体、补衣服或补关系；`visibility` 只能是 `visible`/`occluded`；source-preserve 是 mode 的第三个值，不是 visibility 的枚举值。实体关系、`relationships`、`crop` 只描述当前帧；未知部分写 `source-preserve/no-invention`，跨段同一物理实体复用同一 key，`hard_cut` 后须由当前帧证据重新确认。
 
 ## 发布前自检与结束条件（两阶段均适用）
 
