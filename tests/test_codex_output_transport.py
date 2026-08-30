@@ -1,5 +1,7 @@
 import hashlib
 import json
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -125,6 +127,76 @@ def test_structured_sandbox_mounts_stage_readonly_and_only_final_output_writable
         assert argv[final_bind - 1] == "--bind"
         assert argv[final_bind + 1] == str(final_output)
         assert str(business_output) not in argv
+
+
+def test_structured_sandbox_supports_nested_git_mountpoint_without_writable_stage(
+    tmp_path: Path,
+) -> None:
+    """Codex's inner fs sandbox must not need to mkdir under the read-only stage."""
+    if not shutil.which("bwrap"):
+        pytest.skip("bwrap unavailable")
+    session = tmp_path / "conversation"
+    session.mkdir()
+    with tempfile.TemporaryDirectory(
+        prefix="duet-final-output-nested-sandbox-", dir="/tmp",
+    ) as raw_stage:
+        stage = Path(raw_stage).resolve(strict=True)
+        work = stage / "work"
+        work.mkdir()
+        business_output = work / "result.json"
+        final_output = work / ".codex-final-output.json"
+        final_output.touch(mode=0o600)
+        inner = [
+            str(codex_runner._resolve_bwrap()),
+            "--bind", "/", "/",
+            "--dir", str(stage / ".git"),
+            "--chdir", str(stage),
+            "/usr/bin/bash", "-c",
+            "test -d .git && "
+            "! /usr/bin/touch .git/forbidden 2>/dev/null && "
+            "! /usr/bin/touch work/result.json 2>/dev/null && "
+            "printf '{\"ok\":true}' > work/.codex-final-output.json",
+        ]
+        argv = codex_runner._isolated_outer_argv(
+            stage,
+            session,
+            inner,
+            writable_paths=(final_output,),
+            readonly_stage=True,
+        )
+
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+
+        assert proc.returncode == 0, proc.stderr
+        assert (stage / ".git").is_dir()
+        assert not list((stage / ".git").iterdir())
+        assert not business_output.exists()
+        assert final_output.read_bytes() == b'{"ok":true}'
+
+
+def test_structured_sandbox_rejects_staged_git_content(tmp_path: Path) -> None:
+    session = tmp_path / "conversation"
+    session.mkdir()
+    with tempfile.TemporaryDirectory(
+        prefix="duet-final-output-git-content-", dir="/tmp",
+    ) as raw_stage:
+        stage = Path(raw_stage).resolve(strict=True)
+        work = stage / "work"
+        work.mkdir()
+        final_output = work / ".codex-final-output.json"
+        final_output.touch(mode=0o600)
+        git_mountpoint = stage / ".git"
+        git_mountpoint.mkdir()
+        (git_mountpoint / "config").write_text("untrusted", encoding="utf-8")
+
+        with pytest.raises(CodexError, match="git mountpoint"):
+            codex_runner._isolated_outer_argv(
+                stage,
+                session,
+                ["codex", "exec", "-o", str(final_output)],
+                writable_paths=(final_output,),
+                readonly_stage=True,
+            )
 
 
 def test_rejected_final_output_keeps_structured_error_tree(

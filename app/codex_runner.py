@@ -265,6 +265,31 @@ def _isolated_readonly_inputs(
     return tuple(readonly)
 
 
+def _prepare_readonly_git_mountpoint(stage: Path) -> None:
+    """Create only the empty mountpoint required by Codex's nested fs sandbox."""
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    stage_fd = -1
+    git_fd = -1
+    try:
+        stage_fd = os.open(stage, directory_flags)
+        try:
+            os.mkdir(".git", mode=0o700, dir_fd=stage_fd)
+        except FileExistsError:
+            pass
+        git_fd = os.open(".git", directory_flags, dir_fd=stage_fd)
+        if not stat.S_ISDIR(os.fstat(git_fd).st_mode) or os.listdir(git_fd):
+            raise OSError("git mountpoint is not an empty directory")
+    except OSError:
+        raise CodexError("isolated git mountpoint is invalid") from None
+    finally:
+        if git_fd >= 0:
+            os.close(git_fd)
+        if stage_fd >= 0:
+            os.close(stage_fd)
+
+
 def _isolated_outer_argv(
     stage: Path,
     session_dir: Path,
@@ -290,6 +315,8 @@ def _isolated_outer_argv(
     if not inner_argv:
         raise CodexError("isolated inner command is empty")
     writable = _isolated_writable_paths(stage, writable_paths)
+    if readonly_stage:
+        _prepare_readonly_git_mountpoint(stage)
     readonly_inputs = _isolated_readonly_inputs(stage, writable)
 
     argv = [
