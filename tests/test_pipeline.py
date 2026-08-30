@@ -386,6 +386,84 @@ def test_backend_materializes_exact_nine_in_frozen_order_with_repeat_receipt(
     ]
 
 
+def test_twelfth_boundary_plan_sampling_and_backend_binding_have_no_phantom_cut(
+    tmp_path,
+):
+    bounds = [(0, 36), (36, 72), (72, 97), (97, 144), (144, 192)]
+    scenes = []
+    decode_index = 0
+    for index, (start, end) in enumerate(bounds, 1):
+        frames = []
+        for pts in range(start, end, 4):
+            decode_index += 1
+            frames.append({
+                "decode_frame_index": decode_index,
+                "pts": pts,
+                "time_base_num": 1,
+                "time_base_den": 12,
+            })
+        scenes.append({
+            "index": index,
+            "start_s": round(start / 12, 6),
+            "end_s": round(end / 12, 6),
+            "start_time": {
+                "pts": start, "time_base_num": 1, "time_base_den": 12,
+            },
+            "end_time": {
+                "pts": end, "time_base_num": 1, "time_base_den": 12,
+            },
+            "frames": frames,
+        })
+    segments = scene_planner.plan_segments(16.0, scenes, [])
+    selections = [
+        scene_planner.select_segment_keyframes(scenes, segment)
+        for segment in segments
+    ]
+    work = tmp_path / "work"
+    metas = []
+    for segment, selection in zip(segments, selections, strict=True):
+        keyframe_dir = (
+            work / "segments" / str(segment["index"]) / "work" / "keyframes"
+        )
+        keyframe_dir.mkdir(parents=True)
+        names = []
+        receipt_items = []
+        for order, selected in enumerate(selection, 1):
+            name = f"{order:02d}.png"
+            data = f"segment-{segment['index']}-frame-{order}".encode()
+            (keyframe_dir / name).write_bytes(data)
+            names.append(name)
+            receipt_items.append({
+                **selected,
+                "path": f"keyframes/{name}",
+                "sha256": hashlib.sha256(data).hexdigest(),
+            })
+        metas.append({
+            **segment,
+            "keyframes": names,
+            "keyframe_sampling": {
+                "schema": "duet.backend-keyframe-sampling",
+                "version": 1,
+                "keyframes": receipt_items,
+            },
+        })
+
+    bound = pipeline._bind_keyframe_source_timeline(
+        work, segments, metas, scenes,
+    )
+
+    assert [
+        [cut["source_scene_id"] for cut in item["source_cut_timeline"]]
+        for item in bound
+    ] == [
+        ["SCENE_01", "SCENE_02", "SCENE_03"],
+        ["SCENE_04", "SCENE_05"],
+    ]
+    assert sorted({
+        source["source_scene_id"] for source in bound[1]["keyframe_sources"]
+    }) == ["SCENE_04", "SCENE_05"]
+
+
 def test_visual_attempt_restores_backend_frozen_frames_after_codex_mutation(tmp_path):
     cdir = tmp_path / "conversation"
     work = cdir / "work"

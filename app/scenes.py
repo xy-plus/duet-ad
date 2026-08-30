@@ -247,11 +247,15 @@ def _source_cut_timeline(
         clipped_end = min(end, scene_end)
         if clipped_end <= clipped_start:
             continue
+        canonical_start = _display_time(clipped_start)
+        canonical_end = _display_time(clipped_end)
+        if canonical_end <= canonical_start:
+            continue
         timeline.append({
             "order": len(timeline) + 1,
             "source_scene_id": f"SCENE_{scene['index']:02d}",
-            "start_s": _display_time(clipped_start),
-            "end_s": _display_time(clipped_end),
+            "start_s": canonical_start,
+            "end_s": canonical_end,
         })
     if not timeline:
         raise ValueError("segment source cut timeline is empty")

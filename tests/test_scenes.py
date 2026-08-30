@@ -373,6 +373,59 @@ def _decoded_frame(index: int, pts: int, *, denominator: int = 1) -> dict:
     }
 
 
+def _twelfth_boundary_scenes() -> list[dict]:
+    bounds = [(0, 36), (36, 72), (72, 97), (97, 144), (144, 192)]
+    scenes = []
+    decode_index = 0
+    for index, (start, end) in enumerate(bounds, 1):
+        frames = []
+        for pts in range(start, end, 4):
+            decode_index += 1
+            frames.append(_decoded_frame(decode_index, pts, denominator=12))
+        scenes.append({
+            "index": index,
+            "start_s": round(start / 12, 6),
+            "end_s": round(end / 12, 6),
+            "start_time": {
+                "pts": start, "time_base_num": 1, "time_base_den": 12,
+            },
+            "end_time": {
+                "pts": end, "time_base_num": 1, "time_base_den": 12,
+            },
+            "frames": frames,
+        })
+    return scenes
+
+
+def test_canonical_segment_boundary_drops_zero_length_phantom_cut():
+    scenes = _twelfth_boundary_scenes()
+    segments = plan_segments(16.0, scenes, [])
+
+    assert [(item["start_s"], item["end_s"]) for item in segments] == [
+        (0.0, 8.083333), (8.083333, 16.0),
+    ]
+    assert [
+        [cut["source_scene_id"] for cut in segment["source_cut_timeline"]]
+        for segment in segments
+    ] == [
+        ["SCENE_01", "SCENE_02", "SCENE_03"],
+        ["SCENE_04", "SCENE_05"],
+    ]
+    assert all(
+        cut["end_s"] > cut["start_s"]
+        for segment in segments
+        for cut in segment["source_cut_timeline"]
+    )
+    selections = [select_segment_keyframes(scenes, segment) for segment in segments]
+    assert [
+        sorted({item["source_scene_id"] for item in selection})
+        for selection in selections
+    ] == [
+        ["SCENE_01", "SCENE_02", "SCENE_03"],
+        ["SCENE_04", "SCENE_05"],
+    ]
+
+
 def _exact_scene(index: int, start: int, end: int) -> dict:
     return {
         "index": index,
