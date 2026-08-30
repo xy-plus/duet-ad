@@ -260,18 +260,43 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
                 )
                 raise SeedreamError("provider_rejected")
             try:
-                raw = _decode(response.json())
-            except (ValueError, SeedreamError) as exc:
+                response_payload = response.json()
+            except ValueError as exc:
                 attempts[-1]["status"] = "failed"
-                _atomic_json(receipt_path, {**current, "status": "failed", "attempts": attempts})
+                _atomic_json(receipt_path, {
+                    **current, "status": "failed", "http_status": response.status_code,
+                    "attempts": attempts,
+                })
                 error_trace.record(
                     receipt_path.with_suffix(".error.json"),
-                    call_path=["postprocess", "seedream", receipt_path.stem, "decode"],
-                    error=exc,
+                    call_path=["postprocess", "seedream", receipt_path.stem, "response_json"],
+                    reason={
+                        "cause": error_trace.exception_tree(exc, secrets=(key,)),
+                        "provider": error_trace.provider_response(response, secrets=(key,)),
+                    },
                     logger=_LOGGER,
                     secrets=(key,),
                 )
                 raise SeedreamError("provider_protocol_error") from None
+            try:
+                raw = _decode(response_payload)
+            except SeedreamError as exc:
+                attempts[-1]["status"] = "failed"
+                _atomic_json(receipt_path, {
+                    **current, "status": "failed", "http_status": response.status_code,
+                    "attempts": attempts,
+                })
+                error_trace.record(
+                    receipt_path.with_suffix(".error.json"),
+                    call_path=["postprocess", "seedream", receipt_path.stem, "decode"],
+                    reason={
+                        "cause": error_trace.exception_tree(exc, secrets=(key,)),
+                        "provider": error_trace.provider_response(response, secrets=(key,)),
+                    },
+                    logger=_LOGGER,
+                    secrets=(key,),
+                )
+                raise
             # Persist the received bytes before publishing the canonical output. Recovery may
             # replay this local result, but must never issue another POST for this attempt.
             result_path = receipt_path.with_suffix(".result")
@@ -283,7 +308,25 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
                 "result_file": result_path.name,
                 "attempts": attempts,
             })
-            _write_exact_png(raw, out, width, height)
+            try:
+                _write_exact_png(raw, out, width, height)
+            except SeedreamError as exc:
+                attempts[-1]["status"] = "failed"
+                _atomic_json(receipt_path, {
+                    **current, "status": "failed", "http_status": response.status_code,
+                    "attempts": attempts,
+                })
+                error_trace.record(
+                    receipt_path.with_suffix(".error.json"),
+                    call_path=["postprocess", "seedream", receipt_path.stem, "output"],
+                    reason={
+                        "cause": error_trace.exception_tree(exc, secrets=(key,)),
+                        "provider": error_trace.provider_response(response, secrets=(key,)),
+                    },
+                    logger=_LOGGER,
+                    secrets=(key,),
+                )
+                raise
             attempts[-1]["status"] = "succeeded"
             _atomic_json(receipt_path, {
                 **current, "status": "succeeded",
