@@ -2296,6 +2296,137 @@ class TestCodexRunner:
                     validate_output=lambda raw: raw,
                 )
 
+    def test_isolated_path_validation_failure_writes_pre_spawn_call_tree(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="duet-output-invalid-path-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            outside = tmp_path / "outside"
+            outside.mkdir()
+
+            with pytest.raises(CodexError, match="output path"):
+                CodexRunner(timeout_s=3, concurrency=1).run_isolated_until_output(
+                    stage,
+                    "prompt",
+                    session_dir=cdir,
+                    output_path=outside / "result.json",
+                    max_output_bytes=1024,
+                    validate_output=lambda raw: raw,
+                )
+
+            trace = json.loads(
+                (cdir / "work/errors" / f"{stage.name}.json").read_text()
+            )
+            assert trace["call_path"] == [
+                "pipeline", "codex", stage.name, "result.json",
+            ]
+            assert trace["error"]["type"] == "CodexError"
+            assert trace["error"]["traceback"]
+
+    def test_isolated_placeholder_failure_writes_original_cause_before_spawn(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        original_open = codex_runner.os.open
+
+        def fail_placeholder(path, flags, *args, **kwargs):
+            if path == "result.json":
+                raise OSError("placeholder storage unavailable")
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(codex_runner.os, "open", fail_placeholder)
+        with tempfile.TemporaryDirectory(
+            prefix="duet-output-placeholder-failure-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            work.mkdir()
+
+            with pytest.raises(CodexError, match="placeholder"):
+                CodexRunner(timeout_s=3, concurrency=1).run_isolated_until_output(
+                    stage,
+                    "prompt",
+                    session_dir=cdir,
+                    output_path=work / "result.json",
+                    max_output_bytes=1024,
+                    validate_output=lambda raw: raw,
+                )
+
+            trace = json.loads(
+                (cdir / "work/errors" / f"{stage.name}.json").read_text()
+            )
+            assert trace["error"]["type"] == "CodexError"
+            assert trace["error"]["cause"]["type"] == "OSError"
+            assert trace["error"]["traceback"]
+            assert trace["error"]["cause"]["traceback"]
+
+    def test_isolated_build_argv_failure_is_recorded_and_record_failure_cannot_mask_it(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="duet-output-build-argv-failure-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            work.mkdir()
+            output = work / "result.json"
+            runner = CodexRunner(timeout_s=3, concurrency=1)
+            original_record = codex_runner.error_trace.record
+
+            def fail_build_argv(_workdir, _prompt):
+                raise RuntimeError("build argv exploded")
+
+            monkeypatch.setattr(runner, "build_argv", fail_build_argv)
+            with pytest.raises(RuntimeError, match="build argv exploded"):
+                runner.run_isolated_until_output(
+                    stage,
+                    "prompt",
+                    session_dir=cdir,
+                    output_path=output,
+                    max_output_bytes=1024,
+                    validate_output=lambda raw: raw,
+                )
+            trace = json.loads(
+                (cdir / "work/errors" / f"{stage.name}.json").read_text()
+            )
+            assert trace["error"]["type"] == "RuntimeError"
+
+            monkeypatch.setattr(
+                codex_runner.error_trace,
+                "record",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    OSError("diagnostic storage unavailable")
+                ),
+            )
+            output.unlink()
+            (work / ".codex-final-output.json").unlink()
+            with pytest.raises(RuntimeError, match="build argv exploded"):
+                runner.run_isolated_until_output(
+                    stage,
+                    "prompt",
+                    session_dir=cdir,
+                    output_path=output,
+                    max_output_bytes=1024,
+                    validate_output=lambda raw: raw,
+                )
+            monkeypatch.setattr(codex_runner.error_trace, "record", original_record)
+
     def test_readonly_isolated_fails_closed_on_namespace_error(
         self, monkeypatch, tmp_path,
     ):

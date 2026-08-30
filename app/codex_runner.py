@@ -30,7 +30,7 @@ import threading
 import time
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Callable, NoReturn, TypeVar
 
 from app import error_trace
 
@@ -394,14 +394,71 @@ class CodexRunner:
         caller, not a content-quality decision.  Unrelated Codex work is
         untouched.
         """
+        stage_hint = Path(workdir)
+        session_hint = Path(session_dir)
+        requested_hint = Path(output_path)
+
+        def record_failure(exc: BaseException) -> None:
+            """Best-effort diagnostics must never replace the operational error."""
+            call_path = [
+                "pipeline",
+                "codex",
+                stage_hint.name or "pre-spawn",
+                requested_hint.name or "output",
+            ]
+            try:
+                diagnostic_session = session_hint.resolve(strict=True)
+                if not diagnostic_session.is_dir():
+                    raise OSError("isolated session path is invalid")
+                error_trace.record(
+                    diagnostic_session / "work" / "errors"
+                    / f"{stage_hint.name or 'pre-spawn'}.json",
+                    call_path=call_path,
+                    error=exc,
+                    logger=_LOGGER,
+                )
+            except BaseException as record_error:
+                try:
+                    _LOGGER.error(
+                        "codex_error_record_failed call_path=%s original=%s record_error=%s",
+                        json.dumps(call_path, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(
+                            error_trace.exception_tree(exc),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        json.dumps(
+                            error_trace.exception_tree(record_error),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    )
+                except BaseException:
+                    pass
+
+        def raise_recorded(
+            exc: BaseException, *, cause: BaseException | None = None,
+        ) -> NoReturn:
+            try:
+                if cause is not None:
+                    raise exc from cause
+                raise exc
+            except BaseException as raised:
+                record_failure(raised)
+                raise
+
         if (
             isinstance(max_output_bytes, bool)
             or not isinstance(max_output_bytes, int)
             or max_output_bytes <= 0
             or not callable(validate_output)
         ):
-            raise CodexError("isolated output contract is invalid")
-        _resolve_bwrap()
+            raise_recorded(CodexError("isolated output contract is invalid"))
+        try:
+            _resolve_bwrap()
+        except BaseException as exc:
+            record_failure(exc)
+            raise
         parent_fd = -1
         placeholder_fd = -1
         final_output_fd = -1
@@ -412,10 +469,10 @@ class CodexRunner:
             requested = Path(output_path)
             parent = requested.parent.resolve(strict=True)
             parent.relative_to(stage)
-        except (OSError, ValueError):
-            raise CodexError("isolated output path is invalid") from None
+        except (OSError, ValueError) as cause:
+            raise_recorded(CodexError("isolated output path is invalid"), cause=cause)
         if stage.parent != tmp_root or not stage.is_dir() or not session.is_dir():
-            raise CodexError("isolated execution path is missing or invalid")
+            raise_recorded(CodexError("isolated execution path is missing or invalid"))
         if (
             not requested.is_absolute()
             or requested.parent != parent
@@ -423,7 +480,7 @@ class CodexRunner:
             or requested.exists()
             or requested.is_symlink()
         ):
-            raise CodexError("isolated output must not already exist")
+            raise_recorded(CodexError("isolated output must not already exist"))
         try:
             parent_fd = os.open(
                 parent,
@@ -446,14 +503,17 @@ class CodexRunner:
             )
             final_initial = os.fstat(final_output_fd)
             final_output = final_output.resolve(strict=True)
-        except OSError:
+        except OSError as cause:
             if final_output_fd >= 0:
                 os.close(final_output_fd)
             if placeholder_fd >= 0:
                 os.close(placeholder_fd)
             if parent_fd >= 0:
                 os.close(parent_fd)
-            raise CodexError("isolated output placeholder could not be created") from None
+            raise_recorded(
+                CodexError("isolated output placeholder could not be created"),
+                cause=cause,
+            )
 
         try:
             writable = _isolated_writable_paths(stage, (declared, final_output))
@@ -464,7 +524,8 @@ class CodexRunner:
                 argv = self.build_argv(stage, prompt)
             finally:
                 _ACTIVE_ISOLATED_STAGE.reset(token)
-        except BaseException:
+        except BaseException as exc:
+            record_failure(exc)
             os.close(final_output_fd)
             os.close(placeholder_fd)
             os.close(parent_fd)
@@ -600,12 +661,7 @@ class CodexRunner:
                     if not process_group_stopped:
                         _terminate_process_group(proc)
         except BaseException as exc:
-            error_trace.record(
-                session / "work" / "errors" / f"{stage.name}.json",
-                call_path=["pipeline", "codex", stage.name, requested.name],
-                error=exc,
-                logger=_LOGGER,
-            )
+            record_failure(exc)
             raise
         finally:
             os.close(final_output_fd)
