@@ -55,6 +55,12 @@ _TIMELINE_OPEN = "<KEYFRAME_TIMELINE_JSON>"
 _TIMELINE_CLOSE = "</KEYFRAME_TIMELINE_JSON>"
 _RELATION_STATES_OPEN = "<RELATION_STATES_JSON>"
 _RELATION_STATES_CLOSE = "</RELATION_STATES_JSON>"
+_CUT_TIMELINE_OPEN = "<CUT_TIMELINE_JSON>"
+_CUT_TIMELINE_CLOSE = "</CUT_TIMELINE_JSON>"
+_CUT_TIMELINE_POLICY = (
+    "Each boundary is an immediate hard cut: stop action/geometry/relation; "
+    "an interval without its own image has unknown visual facts."
+)
 _DIALOGUE_POLICY_OPEN = "<DUET_DIALOGUE_POLICY_V1>"
 _DIALOGUE_POLICY_CLOSE = "</DUET_DIALOGUE_POLICY_V1>"
 _DIALOGUE_POLICY = "\n".join(
@@ -784,6 +790,64 @@ def _without_relation_states(prompt: str) -> str:
     return text.replace(_RELATION_STATES_CLOSE, "")
 
 
+def _cut_timeline_contract(prompt: str) -> str | None:
+    """Extract the one canonical backend-compiled hard-cut authority block."""
+    opening_count = prompt.count(_CUT_TIMELINE_OPEN)
+    closing_count = prompt.count(_CUT_TIMELINE_CLOSE)
+    if opening_count == closing_count == 0:
+        return None
+    if opening_count != 1 or closing_count != 1:
+        raise ContextIrContractError("source_cut_timeline_invalid")
+    start = prompt.find(_CUT_TIMELINE_OPEN)
+    data_start = start + len(_CUT_TIMELINE_OPEN)
+    end = prompt.find(_CUT_TIMELINE_CLOSE, data_start)
+    if end < data_start:
+        raise ContextIrContractError("source_cut_timeline_invalid")
+    raw = prompt[data_start:end]
+    try:
+        value = json.loads(raw)
+        canonical = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise ContextIrContractError("source_cut_timeline_invalid") from None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"v", "b"}
+        or value.get("v") != 1
+        or not isinstance(value.get("b"), list)
+        or raw != canonical
+    ):
+        raise ContextIrContractError("source_cut_timeline_invalid")
+    previous = 0.0
+    for boundary in value["b"]:
+        if (
+            isinstance(boundary, bool)
+            or not isinstance(boundary, (int, float))
+            or not math.isfinite(float(boundary))
+            or float(boundary) <= previous
+        ):
+            raise ContextIrContractError("source_cut_timeline_invalid")
+        previous = float(boundary)
+    return f"{_CUT_TIMELINE_OPEN}{raw}{_CUT_TIMELINE_CLOSE}"
+
+
+def _without_cut_timeline(prompt: str) -> str:
+    """Remove model-authored cut blocks before restoring frozen bytes."""
+    text = prompt
+    while _CUT_TIMELINE_OPEN in text:
+        start = text.find(_CUT_TIMELINE_OPEN)
+        end = text.find(_CUT_TIMELINE_CLOSE, start)
+        if end < 0:
+            text = text[:start]
+            break
+        text = text[:start] + text[end + len(_CUT_TIMELINE_CLOSE):]
+    return text.replace(_CUT_TIMELINE_CLOSE, "").replace(
+        _CUT_TIMELINE_POLICY, ""
+    )
+
+
 def _effective_preserves_fusion_policy(
     effective_prompt: str, expected_suffix: str,
 ) -> bool:
@@ -882,7 +946,17 @@ def _compile_effective_prompt(
 ) -> str:
     """Mechanically restore immutable Fusion fields around Context semantics."""
     relation_contract = _relation_states_contract(request.source_prompt)
+    cut_contract = _cut_timeline_contract(request.source_prompt)
     context_output_prompt = _without_relation_states(context_output_prompt)
+    context_output_prompt = _without_cut_timeline(context_output_prompt)
+    authority_contracts = []
+    if cut_contract is not None:
+        authority_contracts.append(
+            f"{cut_contract}\n{_CUT_TIMELINE_POLICY}"
+        )
+    if relation_contract is not None:
+        authority_contracts.append(relation_contract)
+    authority_suffix = "\n".join(authority_contracts)
     if _is_current_ref2va(request):
         context_output_prompt = _bind_exact_dialogue(
             request, context_output_prompt,
@@ -891,21 +965,23 @@ def _compile_effective_prompt(
     if suffix is None:
         effective = _with_dialogue_policy(context_output_prompt)
         compiled = (
-            f"{effective}\n{relation_contract}"
-            if relation_contract is not None else effective
+            f"{effective}\n{authority_suffix}"
+            if authority_suffix else effective
         )
-        if relation_contract is None or len(compiled) <= MAX_SOURCE_PROMPT_CHARS:
+        if not authority_suffix or len(compiled) <= MAX_SOURCE_PROMPT_CHARS:
             return compiled
         # Context IR may expand prose up to its 32 KiB response ceiling.  For
         # relation-bearing Ref2VA prompts, fall back to the exact backend source
         # semantics rather than failing the pipeline or sending an unproven
         # over-7000 provider prompt.  Dialogue language is still resolved
         # mechanically and the authoritative relation block remains byte exact.
-        source_visual = _without_relation_states(request.source_prompt)
+        source_visual = _without_cut_timeline(
+            _without_relation_states(request.source_prompt)
+        )
         if _is_current_ref2va(request):
             source_visual = _bind_exact_dialogue(request, source_visual)
         fallback = (
-            f"{_with_dialogue_policy(source_visual)}\n{relation_contract}"
+            f"{_with_dialogue_policy(source_visual)}\n{authority_suffix}"
         )
         if len(fallback) > MAX_SOURCE_PROMPT_CHARS:
             raise ContextIrContractError("source_prompt_too_long")
@@ -943,22 +1019,24 @@ def _compile_effective_prompt(
     visual = visual.strip()
     if not visual:
         visual = _without_dialogue_policy(context_output_prompt.strip())
-    relation_suffix = (
-        f"\n{relation_contract}" if relation_contract is not None else ""
+    authority_visual_suffix = (
+        f"\n{authority_suffix}" if authority_suffix else ""
     )
     compiled = (
-        f"<VISUAL>\n{visual}{relation_suffix}\n</VISUAL>\n"
+        f"<VISUAL>\n{visual}{authority_visual_suffix}\n</VISUAL>\n"
         f"{_DIALOGUE_POLICY}\n{suffix}"
     )
-    if relation_contract is None or len(compiled) <= MAX_SOURCE_PROMPT_CHARS:
+    if not authority_suffix or len(compiled) <= MAX_SOURCE_PROMPT_CHARS:
         return compiled
-    source_visual = _without_relation_states(request.source_prompt)
+    source_visual = _without_cut_timeline(
+        _without_relation_states(request.source_prompt)
+    )
     if source_visual.endswith(suffix):
         source_visual = source_visual[:-len(suffix)].rstrip()
     if source_visual.startswith("<VISUAL>") and source_visual.endswith("</VISUAL>"):
         source_visual = source_visual[len("<VISUAL>"):-len("</VISUAL>")].strip()
     fallback = (
-        f"<VISUAL>\n{source_visual}\n{relation_contract}\n</VISUAL>\n"
+        f"<VISUAL>\n{source_visual}\n{authority_suffix}\n</VISUAL>\n"
         f"{_DIALOGUE_POLICY}\n{suffix}"
     )
     if len(fallback) > MAX_SOURCE_PROMPT_CHARS:

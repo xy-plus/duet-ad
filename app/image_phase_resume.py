@@ -306,9 +306,15 @@ def _load_segments(
     if abs(previous_end - duration) > 1e-6:
         raise ResumeRejected("scene segments do not cover the source duration")
     segments = [
-        {key: item[key] for key in (
-            "index", "start_s", "end_s", "chain_id", "join_mode",
-        )}
+        {
+            **{key: item[key] for key in (
+                "index", "start_s", "end_s", "chain_id", "join_mode",
+            )},
+            **({"scene_indices": item["scene_indices"]}
+               if "scene_indices" in item else {}),
+            **({"source_cut_timeline": item["source_cut_timeline"]}
+               if "source_cut_timeline" in item else {}),
+        }
         for item in segments
     ]
 

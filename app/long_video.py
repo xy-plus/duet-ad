@@ -681,6 +681,52 @@ def freeze_keyframe_sources(
     return frozen, prior
 
 
+def freeze_source_cut_timeline(
+    value: object, *, segment_start_s: object, segment_end_s: object,
+) -> list[dict]:
+    """Freeze complete global source cuts without conflating them with frames."""
+    try:
+        segment_start = round(float(segment_start_s), BOUNDARY_PRECISION)
+        segment_end = round(float(segment_end_s), BOUNDARY_PRECISION)
+    except (TypeError, ValueError):
+        raise LongVideoError("long_video_plan_invalid_cut_timeline") from None
+    if not isinstance(value, list) or not value:
+        raise LongVideoError("long_video_plan_invalid_cut_timeline")
+    frozen = []
+    previous_end = segment_start
+    previous_scene_id = None
+    for order, raw in enumerate(value, 1):
+        if (
+            not isinstance(raw, Mapping)
+            or set(raw) != {"order", "start_s", "end_s", "source_scene_id"}
+            or raw.get("order") != order
+            or isinstance(raw.get("start_s"), bool)
+            or isinstance(raw.get("end_s"), bool)
+            or not isinstance(raw.get("start_s"), (int, float))
+            or not isinstance(raw.get("end_s"), (int, float))
+            or not isinstance(raw.get("source_scene_id"), str)
+            or not raw["source_scene_id"].strip()
+        ):
+            raise LongVideoError("long_video_plan_invalid_cut_timeline")
+        start = round(float(raw["start_s"]), BOUNDARY_PRECISION)
+        end = round(float(raw["end_s"]), BOUNDARY_PRECISION)
+        if (
+            not math.isfinite(start) or not math.isfinite(end)
+            or start != previous_end or end <= start
+            or raw["source_scene_id"] == previous_scene_id
+        ):
+            raise LongVideoError("long_video_plan_invalid_cut_timeline")
+        frozen.append({
+            "order": order, "start_s": start, "end_s": end,
+            "source_scene_id": raw["source_scene_id"],
+        })
+        previous_end = end
+        previous_scene_id = raw["source_scene_id"]
+    if previous_end != segment_end:
+        raise LongVideoError("long_video_plan_invalid_cut_timeline")
+    return frozen
+
+
 def _write_plan_receipt(
     root: Path,
     *,
@@ -776,6 +822,12 @@ def _write_plan_receipt(
                 previous=previous_keyframe_source,
             )
             receipt_segment["keyframe_sources"] = keyframe_sources
+        if raw.get("source_cut_timeline") is not None:
+            receipt_segment["source_cut_timeline"] = freeze_source_cut_timeline(
+                raw["source_cut_timeline"],
+                segment_start_s=start_s,
+                segment_end_s=end_s,
+            )
         if all(has_multimodal):
             try:
                 manifest_path = Path(raw["multimodal_manifest_path"]).resolve()

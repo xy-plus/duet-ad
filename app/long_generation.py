@@ -66,6 +66,8 @@ PROMPT_FUSION_MANIFEST_SCHEMA = "duet.video-prompt-fusion-production"
 PROMPT_FUSION_MANIFEST_VERSION = 1
 RELATION_STATES_OPEN = "<RELATION_STATES_JSON>"
 RELATION_STATES_CLOSE = "</RELATION_STATES_JSON>"
+CUT_TIMELINE_OPEN = "<CUT_TIMELINE_JSON>"
+CUT_TIMELINE_CLOSE = "</CUT_TIMELINE_JSON>"
 _RELATION_CONTRACT_LEGEND = (
     "d[R]=[S,P,O,preserve[],replace];i=[a,b,C,H,[R,runs][]];"
     "run=[a,b,state,geometry];H:0=start/1=hard_cut;direction:S->O;"
@@ -196,6 +198,84 @@ def _freeze_local_keyframe_sources(value: object) -> list[dict]:
     return frozen
 
 
+def _freeze_local_cut_timeline(value: object, duration_s: float) -> list[dict]:
+    """Validate the complete source-cut topology independently of 9 frames."""
+    if (
+        not isinstance(value, list) or not value
+        or isinstance(duration_s, bool)
+        or not isinstance(duration_s, (int, float))
+        or not math.isfinite(float(duration_s))
+        or float(duration_s) <= 0
+    ):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    frozen = []
+    previous_end = 0.0
+    previous_scene_id = None
+    for order, item in enumerate(value, 1):
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {
+                "order", "start_segment_s", "end_segment_s",
+                "source_scene_id",
+            }
+            or item.get("order") != order
+            or isinstance(item.get("start_segment_s"), bool)
+            or isinstance(item.get("end_segment_s"), bool)
+            or not isinstance(item.get("start_segment_s"), (int, float))
+            or not isinstance(item.get("end_segment_s"), (int, float))
+            or not math.isfinite(float(item["start_segment_s"]))
+            or not math.isfinite(float(item["end_segment_s"]))
+            or not isinstance(item.get("source_scene_id"), str)
+            or not item["source_scene_id"].strip()
+        ):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        start = round(float(item["start_segment_s"]), 6)
+        end = round(float(item["end_segment_s"]), 6)
+        if (
+            start != round(previous_end, 6)
+            or end <= start
+            or item["source_scene_id"] == previous_scene_id
+        ):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        frozen.append({
+            "order": order,
+            "start_segment_s": start,
+            "end_segment_s": end,
+            "source_scene_id": item["source_scene_id"],
+        })
+        previous_end = end
+        previous_scene_id = item["source_scene_id"]
+    if round(previous_end, 6) != round(float(duration_s), 6):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    return frozen
+
+
+def _localize_source_cut_timeline(
+    value: object, *, segment_start_s: float, segment_end_s: float,
+) -> list[dict]:
+    if not isinstance(value, list):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    localized = []
+    for order, item in enumerate(value, 1):
+        if not isinstance(item, Mapping):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        try:
+            start = round(float(item["start_s"]) - segment_start_s, 6)
+            end = round(float(item["end_s"]) - segment_start_s, 6)
+            scene_id = item["source_scene_id"]
+        except (KeyError, TypeError, ValueError):
+            raise LongGenerationError("prompt_fusion_input_invalid") from None
+        localized.append({
+            "order": order,
+            "start_segment_s": start,
+            "end_segment_s": end,
+            "source_scene_id": scene_id,
+        })
+    return _freeze_local_cut_timeline(
+        localized, round(segment_end_s - segment_start_s, 6)
+    )
+
+
 def _bounded_relation_text(value: object, *, maximum: int) -> str:
     if not isinstance(value, str) or not value.strip():
         raise LongGenerationError("prompt_fusion_input_invalid")
@@ -283,8 +363,68 @@ def _freeze_fusion_relation_occurrences(
 
 def _expected_fusion_relation_states(
     timeline: list[dict], occurrences: list[dict],
+    cut_timeline: list[dict] | None = None,
 ) -> list[dict]:
     """Project frame evidence into hard-cut-local intervals mechanically."""
+    if cut_timeline is not None:
+        duration = float(cut_timeline[-1].get("end_segment_s", 0)) \
+            if cut_timeline else 0.0
+        cuts = _freeze_local_cut_timeline(cut_timeline, duration)
+        frames_by_cut: list[list[dict]] = [[] for _item in cuts]
+        for frame in timeline:
+            matches = [
+                index for index, cut in enumerate(cuts)
+                if cut["source_scene_id"] == frame["source_scene_id"]
+                and cut["start_segment_s"] <= frame["segment_time_s"]
+                and (
+                    frame["segment_time_s"] < cut["end_segment_s"]
+                    or index == len(cuts) - 1
+                    and frame["segment_time_s"] == cut["end_segment_s"]
+                )
+            ]
+            if len(matches) != 1:
+                raise LongGenerationError("prompt_fusion_input_invalid")
+            frames_by_cut[matches[0]].append(frame)
+        projected = []
+        for cut, frames in zip(cuts, frames_by_cut, strict=True):
+            if not frames:
+                continue
+            orders = {frame["order"] for frame in frames}
+            members: dict[tuple, dict] = {}
+            for occurrence in occurrences:
+                if occurrence["frame"]["order"] not in orders:
+                    continue
+                identity = tuple(occurrence[key] for key in (
+                    "relation_id", "subject_key", "predicate", "object_key",
+                ))
+                base = members.setdefault(identity, {
+                    "relation_id": occurrence["relation_id"],
+                    "subject_key": occurrence["subject_key"],
+                    "predicate": occurrence["predicate"],
+                    "object_key": occurrence["object_key"],
+                    "preserve": occurrence["preserve"],
+                    "replace_together": occurrence["replace_together"],
+                    "states": [],
+                })
+                if (
+                    base["preserve"] != occurrence["preserve"]
+                    or base["replace_together"] != occurrence["replace_together"]
+                ):
+                    raise LongGenerationError("prompt_fusion_input_invalid")
+                base["states"].append({
+                    "frame_order": occurrence["frame"]["order"],
+                    "state": occurrence["state"],
+                    "geometry": occurrence["geometry"],
+                })
+            projected.append({
+                "interval": {
+                    "start_frame_order": frames[0]["order"],
+                    "end_frame_order": frames[-1]["order"],
+                    "source_scene_id": cut["source_scene_id"],
+                },
+                "relations": [members[key] for key in sorted(members)],
+            })
+        return projected
     intervals: list[list[dict]] = []
     for frame in timeline:
         if not intervals or frame["transition"]["type"] == "hard_cut":
@@ -395,13 +535,18 @@ def _compact_h3_relation_contract(relation_states: list[dict]) -> dict:
             prior = definitions_by_id.setdefault(relation_id, definition)
             if prior != definition:
                 raise LongGenerationError("prompt_fusion_output_invalid")
+    def canonical_alias_order(values: set[str], prefix: str) -> list[str]:
+        expected = {f"{prefix}{index}" for index in range(1, len(values) + 1)}
+        if values == expected:
+            return sorted(values, key=lambda value: int(value[len(prefix):]))
+        return sorted(values)
 
-    relation_ids = sorted(definitions_by_id)
-    endpoints = sorted({
+    relation_ids = canonical_alias_order(set(definitions_by_id), "R")
+    endpoints = canonical_alias_order({
         endpoint
         for definition in definitions_by_id.values()
         for endpoint in (definition[0], definition[2])
-    })
+    }, "E")
     predicates = sorted({definition[1] for definition in definitions_by_id.values()})
     preserve_facts = sorted({
         fact
@@ -420,7 +565,9 @@ def _compact_h3_relation_contract(relation_states: list[dict]) -> dict:
         for relation in item["relations"]
         for state in relation["states"]
     })
-    scenes = sorted({item["interval"]["source_scene_id"] for item in relation_states})
+    scenes = canonical_alias_order({
+        item["interval"]["source_scene_id"] for item in relation_states
+    }, "C")
 
     def aliases(values: list[str]) -> dict[str, int]:
         return {value: index for index, value in enumerate(values)}
@@ -534,28 +681,32 @@ def _compact_h3_relation_contract(relation_states: list[dict]) -> dict:
             _relation_predicate_category(definitions_by_id[relation_id][1])
         ]
         del compact["d"][relation_index][3]
-    categorized_states = sorted({
-        _relation_state_category(state["state"])
-        for item in relation_states
-        for relation in item["relations"]
-        for state in relation["states"]
-    } | {"active/as-shown"})
-    categorized_geometries = sorted({
-        _relation_geometry_category(state["geometry"])
-        for item in relation_states
-        for relation in item["relations"]
-        for state in relation["states"]
-    } | {"as-shown"})
-    compact["s"] = categorized_states
-    compact["g"] = categorized_geometries
-    categorized_state_alias = aliases(categorized_states)
-    categorized_geometry_alias = aliases(categorized_geometries)
     states_by_relation: dict[str, list[dict]] = {
         relation_id: [] for relation_id in relation_ids
     }
     for source_interval in relation_states:
         for relation in source_interval["relations"]:
             states_by_relation[relation["relation_id"]].extend(relation["states"])
+    retained_boundaries = [
+        boundary
+        for relation_id in relation_ids
+        for boundary in (
+            min(states_by_relation[relation_id], key=lambda state: state["frame_order"]),
+            max(states_by_relation[relation_id], key=lambda state: state["frame_order"]),
+        )
+    ]
+    categorized_states = sorted({
+        _relation_state_category(state["state"])
+        for state in retained_boundaries
+    } | {"active/as-shown"})
+    categorized_geometries = sorted({
+        _relation_geometry_category(state["geometry"])
+        for state in retained_boundaries
+    } | {"as-shown"})
+    compact["s"] = categorized_states
+    compact["g"] = categorized_geometries
+    categorized_state_alias = aliases(categorized_states)
+    categorized_geometry_alias = aliases(categorized_geometries)
     compact_definitions = []
     for relation_id in relation_ids:
         subject, predicate, object_key, _preserve, replace_together = (
@@ -628,13 +779,21 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
     geometries = contract["g"]
     scenes = contract["c"]
     definitions = contract["d"]
-    for dictionary in (
-        relation_ids, endpoints, predicates, preserve_facts,
-        states, geometries, scenes,
-    ):
+    for dictionary in (predicates, preserve_facts, states, geometries):
         if (
             any(not isinstance(value, str) or not value for value in dictionary)
             or dictionary != sorted(set(dictionary))
+        ):
+            raise LongGenerationError("prompt_fusion_output_invalid")
+    for dictionary, prefix in (
+        (relation_ids, "R"), (endpoints, "E"), (scenes, "C"),
+    ):
+        runtime_order = [
+            f"{prefix}{index}" for index in range(1, len(dictionary) + 1)
+        ]
+        if (
+            any(not isinstance(value, str) or not value for value in dictionary)
+            or dictionary not in (sorted(set(dictionary)), runtime_order)
         ):
             raise LongGenerationError("prompt_fusion_output_invalid")
     if (
@@ -657,7 +816,36 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
             raise LongGenerationError("prompt_fusion_output_invalid")
         return f"{prefix}{index + 1}"
 
+    if compact_level == 2:
+        endpoint_domain = set()
+        for definition in definitions:
+            if not isinstance(definition, list) or len(definition) != 9:
+                raise LongGenerationError("prompt_fusion_output_invalid")
+            for endpoint_index in (definition[0], definition[2]):
+                runtime_alias(endpoint_index, "E")
+                endpoint_domain.add(endpoint_index)
+        if sorted(endpoint_domain) != list(range(len(endpoint_domain))):
+            raise LongGenerationError("prompt_fusion_output_invalid")
+        scene_domain = set()
+        for encoded_interval in contract["i"]:
+            if not isinstance(encoded_interval, list) or len(encoded_interval) != 4:
+                raise LongGenerationError("prompt_fusion_output_invalid")
+            runtime_alias(encoded_interval[2], "C")
+            scene_domain.add(encoded_interval[2])
+        if sorted(scene_domain) != list(range(len(scene_domain))):
+            raise LongGenerationError("prompt_fusion_output_invalid")
+
+    used_definitions: set[int] = set()
+    used_endpoints: set[int] = set()
+    used_predicates: set[int] = set()
+    used_preserve: set[int] = set()
+    used_states: set[int] = set()
+    used_geometries: set[int] = set()
+    used_scenes: set[int] = set()
     expanded = []
+    previous_interval_end = 0
+    if not contract["i"]:
+        raise LongGenerationError("prompt_fusion_output_invalid")
     for interval_index, encoded_interval in enumerate(contract["i"]):
         expected_interval_size = 4 if compact_level == 2 else 5
         if (
@@ -673,10 +861,15 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
             isinstance(first, bool) or not isinstance(first, int)
             or isinstance(last, bool) or not isinstance(last, int)
             or not 1 <= first <= last <= 9
+            or first != previous_interval_end + 1
             or boundary != (0 if interval_index == 0 else 1)
             or not isinstance(encoded_relations, list)
         ):
             raise LongGenerationError("prompt_fusion_output_invalid")
+        previous_interval_end = last
+        if scenes:
+            lookup(scenes, scene_index)
+            used_scenes.add(scene_index)
         relations = []
         if compact_level == 2:
             active_state_index = states.index("active/as-shown")
@@ -736,6 +929,7 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
             ):
                 raise LongGenerationError("prompt_fusion_output_invalid")
             previous_relation_index = relation_index
+            used_definitions.add(relation_index)
             relation_id = (
                 lookup(relation_ids, relation_index)
                 if compact_level == 0 else runtime_alias(relation_index, "R")
@@ -758,6 +952,15 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
                 or not isinstance(encoded_runs, list)
             ):
                 raise LongGenerationError("prompt_fusion_output_invalid")
+            if endpoints:
+                lookup(endpoints, subject)
+                lookup(endpoints, object_key)
+                used_endpoints.update((subject, object_key))
+            lookup(predicates, predicate)
+            used_predicates.add(predicate)
+            for preserve_index in preserve:
+                lookup(preserve_facts, preserve_index)
+                used_preserve.add(preserve_index)
             expanded_states = []
             previous_frame = 0
             for run in encoded_runs:
@@ -779,6 +982,10 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
                     )
                 ):
                     raise LongGenerationError("prompt_fusion_output_invalid")
+                lookup(states, state_index)
+                lookup(geometries, geometry_index)
+                used_states.add(state_index)
+                used_geometries.add(geometry_index)
                 for frame_order in range(run_first, run_last + 1):
                     expanded_states.append({
                         "frame_order": frame_order,
@@ -812,6 +1019,29 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
             },
             "relations": relations,
         })
+    if previous_interval_end != 9:
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    if used_definitions != set(range(len(definitions))):
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    exact_domains = (
+        (endpoints, used_endpoints),
+        (predicates, used_predicates),
+        (preserve_facts, used_preserve),
+        (scenes, used_scenes),
+    )
+    if any(used != set(range(len(values))) for values, used in exact_domains):
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    allowed_unused_states = set()
+    allowed_unused_geometries = set()
+    if compact_level == 2:
+        allowed_unused_states.add(states.index("active/as-shown"))
+        allowed_unused_geometries.add(geometries.index("as-shown"))
+    if (
+        set(range(len(states))) - used_states - allowed_unused_states
+        or set(range(len(geometries))) - used_geometries
+        - allowed_unused_geometries
+    ):
+        raise LongGenerationError("prompt_fusion_output_invalid")
     return expanded
 
 
@@ -856,6 +1086,7 @@ def _provider_neutral_visual(
 def _compile_fusion_ref2va_prompt(
     *, visual: object, timeline: object, lines: object, music_policy: object,
     relation_occurrences: object = None, relation_states: object = None,
+    cut_timeline: object = None,
 ) -> str:
     """Compile the only provider-sendable prompt from backend authorities."""
     if music_policy != "forbid" or not isinstance(lines, list):
@@ -878,8 +1109,15 @@ def _compile_fusion_ref2va_prompt(
         [] if relation_occurrences is None else relation_occurrences,
         frozen_timeline,
     )
+    frozen_cuts = None
+    if cut_timeline is not None:
+        if not isinstance(cut_timeline, list) or not cut_timeline:
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        frozen_cuts = _freeze_local_cut_timeline(
+            cut_timeline, float(cut_timeline[-1].get("end_segment_s", 0)),
+        )
     expected_relation_states = _expected_fusion_relation_states(
-        frozen_timeline, frozen_occurrences,
+        frozen_timeline, frozen_occurrences, frozen_cuts,
     )
     # Model-authored relation_states is intentionally non-authoritative.  Keep
     # the argument for callers that still echo it, but compile only the exact
@@ -914,7 +1152,9 @@ def _compile_fusion_ref2va_prompt(
                 )
         orders = [int(frame["order"]) for frame in frames]
         anchors = _h3_picture_list(orders)
-        if shot_index == 1:
+        if relation_contract_enabled and frozen_cuts is not None:
+            opening = f"[Shot {shot_index}] {anchors}."
+        elif shot_index == 1:
             opening = f"[Shot 1] The shot follows the ordered storyboard anchors {anchors}."
         else:
             cut = frames[0]["transition"]["at_segment_s"]
@@ -927,6 +1167,7 @@ def _compile_fusion_ref2va_prompt(
             f"{opening} {visual_by_shot[shot_index - 1]}"
         ])
 
+    cut_dialogue_lines: list[str] = []
     for expected_order, line in enumerate(lines, 1):
         if (
             not isinstance(line, Mapping)
@@ -947,32 +1188,74 @@ def _compile_fusion_ref2va_prompt(
             or not 0 <= float(line["start_s"]) < float(line["end_s"])
         ):
             raise LongGenerationError("prompt_fusion_input_invalid")
-        shot_index = 1
-        for index, cut in enumerate(cut_times, 2):
-            if float(line["start_s"]) + _EPS >= cut:
-                shot_index = index
-        details[shot_index - 1].append(
-            f"From {_h3_timecode(line['start_s'])} to "
-            f"{_h3_timecode(line['end_s'])}, the off-screen narrator (S1) "
-            "says in an off-screen voiceover: "
-            f"<d>[Undetermined]{line['text']}</d> while every visible "
-            "person's lips remain completely closed."
-        )
+        if frozen_cuts is not None:
+            cut_segments = [{
+                "index": cut["order"],
+                "start_s": cut["start_segment_s"],
+                "end_s": cut["end_segment_s"],
+            } for cut in frozen_cuts]
+            for cut, cut_segment in zip(
+                frozen_cuts, cut_segments, strict=True
+            ):
+                fragments = long_video.localize_dialogue(
+                    [line], cut_segment, segments=cut_segments,
+                )
+                for fragment in fragments:
+                    absolute_start = round(
+                        cut["start_segment_s"] + fragment["start_s"], 6
+                    )
+                    absolute_end = round(
+                        cut["start_segment_s"] + fragment["end_s"], 6
+                    )
+                    cut_dialogue_lines.append(
+                        f"[Source Cut {cut['order']}] From "
+                        f"{_h3_timecode(absolute_start)} to "
+                        f"{_h3_timecode(absolute_end)}, S1 off-screen: "
+                        f"<d>[Undetermined]{fragment['text']}</d> while every "
+                        "visible person's lips remain completely closed."
+                    )
+        else:
+            shot_index = 1
+            for index, cut in enumerate(cut_times, 2):
+                if float(line["start_s"]) + _EPS >= cut:
+                    shot_index = index
+            details[shot_index - 1].append(
+                f"From {_h3_timecode(line['start_s'])} to "
+                f"{_h3_timecode(line['end_s'])}, the off-screen narrator (S1) "
+                "says in an off-screen voiceover: "
+                f"<d>[Undetermined]{line['text']}</d> while every visible "
+                "person's lips remain completely closed."
+            )
 
+    cut_authority = []
+    if frozen_cuts is not None:
+        cut_contract = json.dumps(
+            {
+                "v": 1,
+                "b": [
+                    cut["start_segment_s"] for cut in frozen_cuts[1:]
+                ],
+            },
+            sort_keys=True, separators=(",", ":"), allow_nan=False,
+        )
+        cut_authority = [
+            f"{CUT_TIMELINE_OPEN}{cut_contract}{CUT_TIMELINE_CLOSE}",
+            context_ir_bridge._CUT_TIMELINE_POLICY,
+            *cut_dialogue_lines,
+        ]
     if relation_contract_enabled:
         prompt_lines = subject_definitions + [
             "summary:",
             "Use <Picture 1> through <Picture 9> as exact ordered anchors.",
             "retention_analysis:",
             "Preserve all nine anchors and the backend relation contract.",
-            "detailed_description:",
-        ]
+        ] + cut_authority + ["detailed_description:"]
     else:
         prompt_lines = subject_definitions + [
             "summary:",
             "[keyframe completion] The target video follows <Picture 1> through "
             "<Picture 9> as ordered storyboard keyframe anchors.",
-        ] + retention + ["detailed_description:"]
+    ] + retention + cut_authority + ["detailed_description:"]
     for shot in details:
         prompt_lines.extend(shot)
     prompt_lines.extend([
@@ -1063,18 +1346,27 @@ def load_prompt_fusion(
     ):
         raise LongGenerationError("prompt_fusion_input_invalid")
     timelines: list[list[dict] | None] = []
+    cut_timelines: list[list[dict] | None] = []
     relation_occurrences_by_segment: list[list[dict] | None] = []
     for index, segment in enumerate(segments, 1):
         base_segment_keys = {
             "index", "new_keyframes", "old_video_prompt",
             "image_optimization_prompt", "audio_content",
         }
+        allowed_segment_keys = {
+            frozenset(base_segment_keys),
+            frozenset(base_segment_keys | {"relation_occurrences"}),
+        }
+        if source_version == PROMPT_FUSION_VERSION:
+            allowed_segment_keys.update({
+                frozenset(base_segment_keys | {"source_cut_timeline"}),
+                frozenset(base_segment_keys | {
+                    "relation_occurrences", "source_cut_timeline",
+                }),
+            })
         if (
             not isinstance(segment, Mapping)
-            or frozenset(segment) not in {
-                frozenset(base_segment_keys),
-                frozenset(base_segment_keys | {"relation_occurrences"}),
-            }
+            or frozenset(segment) not in allowed_segment_keys
             or segment.get("index") != index
             or (
                 source_version == PROMPT_FUSION_LEGACY_VERSION
@@ -1146,10 +1438,20 @@ def load_prompt_fusion(
                         segment.get("relation_occurrences", []), frozen_sources,
                     ) if "relation_occurrences" in segment else None
                 )
+                raw_cuts = segment.get("source_cut_timeline")
+                cut_timelines.append(
+                    _freeze_local_cut_timeline(
+                        raw_cuts,
+                        float(raw_cuts[-1].get("end_segment_s", 0)),
+                    )
+                    if isinstance(raw_cuts, list) and raw_cuts
+                    else None
+                )
             except (KeyError, TypeError, ValueError, long_video.LongVideoError):
                 raise LongGenerationError("prompt_fusion_input_invalid") from None
         else:
             timelines.append(None)
+            cut_timelines.append(None)
             relation_occurrences_by_segment.append(None)
         audio = segment.get("audio_content")
         audio_keys = {
@@ -1259,6 +1561,7 @@ def load_prompt_fusion(
                 lines=json.loads(audio["lines_json"]),
                 music_policy=audio["music_policy"],
                 relation_occurrences=relation_occurrences,
+                cut_timeline=cut_timelines[index - 1],
             ))
         else:
             if (
@@ -1444,6 +1747,7 @@ class FrozenSegment:
     prompt: str
     keyframes: tuple[h3.FrozenFrame, ...] = ()
     keyframe_sources: tuple[Mapping, ...] = ()
+    source_cut_timeline: tuple[Mapping, ...] = ()
     multimodal: h3_project.FrozenProjectMultimodal | None = None
     dialogue: tuple[dict, ...] = ()
     dialogue_sha256: str | None = None
@@ -1882,6 +2186,20 @@ def build_prompt_fusion_input(
                 "music_policy": "forbid",
             },
         }
+        # The existing keyframe transition contract is already complete when
+        # every cut has an analysis image.  Add the independent authority only
+        # for dense montages, preserving the normal-video Fusion bytes.
+        if (
+            segment.source_cut_timeline
+            and len(segment.source_cut_timeline) > len(segment.keyframe_sources)
+        ):
+            compiled_segment["source_cut_timeline"] = (
+                _localize_source_cut_timeline(
+                    list(segment.source_cut_timeline),
+                    segment_start_s=segment.start_s,
+                    segment_end_s=segment.end_s,
+                )
+            )
         if relation_occurrences is not None:
             compiled_segment["relation_occurrences"] = relation_occurrences
         compiled_segments.append(compiled_segment)
@@ -3150,6 +3468,19 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             frozen_keyframe_sources = tuple(source_values)
         elif raw.get("keyframe_sources") is not None:
             raise LongGenerationError("long_video_plan_invalid")
+        frozen_source_cuts: tuple[Mapping, ...] = ()
+        if raw.get("source_cut_timeline") is not None:
+            try:
+                source_cuts = long_video.freeze_source_cut_timeline(
+                    raw["source_cut_timeline"],
+                    segment_start_s=start_s,
+                    segment_end_s=end_s,
+                )
+            except long_video.LongVideoError:
+                raise LongGenerationError("long_video_plan_invalid") from None
+            if current.get("source_cut_timeline") != source_cuts:
+                raise LongGenerationError("long_video_plan_invalid")
+            frozen_source_cuts = tuple(source_cuts)
         anchors = raw.get("anchors")
         if (
             not isinstance(anchors, list)
@@ -3428,6 +3759,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             prompt=prompt,
             keyframes=frozen_keyframes,
             keyframe_sources=frozen_keyframe_sources,
+            source_cut_timeline=frozen_source_cuts,
             multimodal=frozen_multimodal,
             dialogue=tuple(dict(line) for line in dialogue),
             dialogue_sha256=dialogue_binding["sha256"],

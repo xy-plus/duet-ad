@@ -248,6 +248,10 @@ def _recover_long_plan(cdir: Path, meta: dict, settings: Settings) -> dict:
                 {"keyframe_sources": raw["keyframe_sources"]}
                 if "keyframe_sources" in raw else {}
             ),
+            **(
+                {"source_cut_timeline": raw["source_cut_timeline"]}
+                if "source_cut_timeline" in raw else {}
+            ),
             "first_frame_path": Path(first_path).relative_to("work").as_posix(),
             "last_frame_path": Path(last_path).relative_to("work").as_posix(),
             "visual_prompt": visual,
@@ -1875,6 +1879,7 @@ def _bind_keyframe_source_timeline(
             ):
                 raise PipelineError("backend keyframe source timeline is invalid")
             sources = []
+            covered_scene_ids: list[str] = []
             segwork = work / "segments" / str(expected_index) / "work"
             for order, item in enumerate(items, 1):
                 name = names[order - 1]
@@ -1925,9 +1930,54 @@ def _bind_keyframe_source_timeline(
                     "transition": transition,
                 }
                 sources.append(source)
-                seen_scenes.add(item["source_scene_id"])
+                analysis_slot = item.get("analysis_slot")
+                if analysis_slot is None:
+                    covered = [item["source_scene_id"]]
+                elif (
+                    not isinstance(analysis_slot, dict)
+                    or analysis_slot.get("index") != order
+                    or not isinstance(analysis_slot.get("source_scene_ids"), list)
+                    or not analysis_slot["source_scene_ids"]
+                    or any(
+                        not isinstance(scene_id, str) or not scene_id
+                        for scene_id in analysis_slot["source_scene_ids"]
+                    )
+                    or len(set(analysis_slot["source_scene_ids"]))
+                    != len(analysis_slot["source_scene_ids"])
+                    or item["source_scene_id"]
+                    not in analysis_slot["source_scene_ids"]
+                    or not isinstance(
+                        analysis_slot.get("source_cut_timeline"), list
+                    )
+                    or [
+                        entry.get("source_scene_id")
+                        for entry in analysis_slot["source_cut_timeline"]
+                        if isinstance(entry, dict)
+                    ] != analysis_slot["source_scene_ids"]
+                ):
+                    raise PipelineError(
+                        "backend keyframe analysis slot is invalid"
+                    )
+                else:
+                    covered = analysis_slot["source_scene_ids"]
+                for scene_id in covered:
+                    if not covered_scene_ids or covered_scene_ids[-1] != scene_id:
+                        covered_scene_ids.append(scene_id)
+                seen_scenes.update(covered)
                 previous = source
             meta["keyframe_sources"] = sources
+            timeline = segment.get("source_cut_timeline")
+            if timeline is not None:
+                if (
+                    not isinstance(timeline, list)
+                    or not timeline
+                    or covered_scene_ids != [
+                        entry.get("source_scene_id")
+                        for entry in timeline if isinstance(entry, dict)
+                    ]
+                ):
+                    raise PipelineError("backend source cut timeline is invalid")
+                meta["source_cut_timeline"] = timeline
         expected_scenes = {
             f"SCENE_{scene['index']:02d}" for scene in source_scenes
         }
@@ -2390,6 +2440,9 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             "prompt": prompt,
             "lines": [line["text"] for line in (lines or [])],
         }
+        for authority_key in ("scene_indices", "source_cut_timeline"):
+            if authority_key in seg:
+                result[authority_key] = seg[authority_key]
         if new_input_contract:
             result.update(
                 chain_id=seg["chain_id"],

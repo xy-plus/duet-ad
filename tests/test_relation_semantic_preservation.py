@@ -320,6 +320,7 @@ def test_sixty_relations_with_540_unique_verbose_states_fit_visual_budget() -> N
     assert len(marker) / context_ir_bridge.MAX_SOURCE_PROMPT_CHARS <= 0.30
     assert context_ir_bridge.MAX_SOURCE_PROMPT_CHARS - len(marker) >= 4_200
     expanded = long_generation._expand_h3_relation_contract(contract)
+    assert long_generation._compact_h3_relation_contract(expanded) == contract
     assert len(expanded[0]["relations"]) == 60
     assert all(
         relation["subject_key"].startswith("E")
@@ -340,6 +341,28 @@ def test_sixty_relations_with_540_unique_verbose_states_fit_visual_budget() -> N
         ]
         for relation in expanded[0]["relations"]
     )
+    for mutate in (
+        lambda value: value["d"][0].__setitem__(0, 999),
+        lambda value: value["i"][0].__setitem__(2, 777),
+    ):
+        malformed = json.loads(json.dumps(contract))
+        mutate(malformed)
+        with pytest.raises(
+            long_generation.LongGenerationError,
+            match="prompt_fusion_output_invalid",
+        ):
+            long_generation._expand_h3_relation_contract(malformed)
+        encoded = json.dumps(
+            malformed, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        with pytest.raises(
+            context_ir_bridge.ContextIrContractError,
+            match="source_relation_states_invalid",
+        ):
+            context_ir_bridge._relation_states_contract(
+                f"{long_generation.RELATION_STATES_OPEN}{encoded}"
+                f"{long_generation.RELATION_STATES_CLOSE}"
+            )
 
     prompt = long_generation._compile_fusion_ref2va_prompt(
         visual=["V" * 3_200],
@@ -412,6 +435,37 @@ def test_relation_runs_do_not_cross_missing_frames_or_hard_cuts() -> None:
     assert contract["i"][1][4][0][1] == [[5, 6, 0, 0]]
     assert long_generation._expand_h3_relation_contract(contract) == projected
 
+    mutations = []
+    overlap = json.loads(json.dumps(contract))
+    overlap["i"][1][0] = overlap["i"][0][1]
+    mutations.append(overlap)
+    gap = json.loads(json.dumps(contract))
+    gap["i"][1][0] = gap["i"][0][1] + 2
+    mutations.append(gap)
+    missing_head = json.loads(json.dumps(contract))
+    missing_head["i"][0][0] = 2
+    mutations.append(missing_head)
+    missing_tail = json.loads(json.dumps(contract))
+    missing_tail["i"][-1][1] = 8
+    mutations.append(missing_tail)
+    for malformed in mutations:
+        with pytest.raises(
+            long_generation.LongGenerationError,
+            match="prompt_fusion_output_invalid",
+        ):
+            long_generation._expand_h3_relation_contract(malformed)
+        encoded = json.dumps(
+            malformed, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        with pytest.raises(
+            context_ir_bridge.ContextIrContractError,
+            match="source_relation_states_invalid",
+        ):
+            context_ir_bridge._relation_states_contract(
+                f"{long_generation.RELATION_STATES_OPEN}{encoded}"
+                f"{long_generation.RELATION_STATES_CLOSE}"
+            )
+
 
 def test_context_rejects_noncanonical_v3_aliases_indexes_and_runs() -> None:
     timeline = _timeline()
@@ -443,6 +497,9 @@ def test_context_rejects_noncanonical_v3_aliases_indexes_and_runs() -> None:
     split_run = json.loads(json.dumps(canonical))
     split_run["i"][0][4][0][1] = [[1, 1, 0, 0], [2, 2, 0, 0]]
     mutations.append(split_run)
+    unused_predicate = json.loads(json.dumps(canonical))
+    unused_predicate["q"] = sorted([*unused_predicate["q"], "zzz-unused"])
+    mutations.append(unused_predicate)
 
     for malformed in mutations:
         encoded = json.dumps(

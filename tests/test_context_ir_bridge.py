@@ -196,6 +196,54 @@ def test_effective_prompt_mechanically_restores_frozen_relation_states(
     assert '{"v":1,"d":{},"i":[]}' not in effective
 
 
+def test_effective_prompt_preserves_independent_compact_cut_authority(
+    tmp_path: Path,
+) -> None:
+    frozen = _frozen(tmp_path)
+    contract = {"v": 1, "b": [0.3, 0.6, 1.0]}
+    encoded = json.dumps(
+        contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    block = (
+        f"{context_ir_bridge._CUT_TIMELINE_OPEN}{encoded}"
+        f"{context_ir_bridge._CUT_TIMELINE_CLOSE}"
+    )
+    frozen = replace(frozen, source_prompt=f"{frozen.source_prompt}\n{block}")
+
+    effective = context_ir_bridge._compile_effective_prompt(
+        frozen,
+        "rewritten visual\n<CUT_TIMELINE_JSON>"
+        '{"b":[9.0],"v":1}'
+        "</CUT_TIMELINE_JSON>",
+    )
+
+    assert effective.count(context_ir_bridge._CUT_TIMELINE_OPEN) == 1
+    assert block in effective
+    assert json.loads(
+        context_ir_bridge._cut_timeline_contract(effective).removeprefix(
+            context_ir_bridge._CUT_TIMELINE_OPEN
+        ).removesuffix(context_ir_bridge._CUT_TIMELINE_CLOSE)
+    )["b"] == contract["b"]
+
+
+@pytest.mark.parametrize("raw", [
+    '{"b":[0.6,0.3],"v":1}',
+    '{"b":[0.3,0.3],"v":1}',
+    '{"b":[true],"v":1}',
+    '{"b":[0.3], "v":1}',
+])
+def test_cut_timeline_contract_rejects_invalid_or_noncanonical_data(raw: str):
+    prompt = (
+        f"{context_ir_bridge._CUT_TIMELINE_OPEN}{raw}"
+        f"{context_ir_bridge._CUT_TIMELINE_CLOSE}"
+    )
+    with pytest.raises(
+        context_ir_bridge.ContextIrContractError,
+        match="source_cut_timeline_invalid",
+    ):
+        context_ir_bridge._cut_timeline_contract(prompt)
+
+
 def _no_audio_frozen(
     tmp_path: Path, *, prompt: str | None = None,
 ) -> context_ir_bridge.FrozenContextIrRequest:

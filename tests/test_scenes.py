@@ -458,7 +458,7 @@ def test_unified_planner_splits_more_than_nine_effective_scenes_on_hard_cut():
     ]
 
 
-def test_capacity_split_redistributes_a_one_second_tail_to_real_scene_boundary():
+def test_nine_frames_is_analysis_capacity_not_a_provider_segment_limit():
     scenes = [
         {
             "index": index + 1,
@@ -474,14 +474,89 @@ def test_capacity_split_redistributes_a_one_second_tail_to_real_scene_boundary()
     segments = plan_segments(10.0, scenes, [])
 
     assert [(segment["start_s"], segment["end_s"]) for segment in segments] == [
-        (0.0, 6.0), (6.0, 10.0),
+        (0.0, 10.0),
     ]
-    assert [segment["scene_indices"] for segment in segments] == [
-        list(range(1, 7)), list(range(7, 11)),
+    assert segments[0]["scene_indices"] == list(range(1, 11))
+    assert [item["source_scene_id"] for item in segments[0][
+        "source_cut_timeline"
+    ]] == [f"SCENE_{index:02d}" for index in range(1, 11)]
+
+
+def test_dense_ten_second_montage_compacts_analysis_and_keeps_every_cut():
+    scenes = []
+    for index in range(10):
+        scenes.append({
+            "index": index + 1,
+            "start_s": round(index * 0.3, 6),
+            "end_s": round((index + 1) * 0.3, 6),
+            "frames": [_decoded_frame(index, index * 3, denominator=10)],
+        })
+    scenes.append({
+        "index": 11,
+        "start_s": 3.0,
+        "end_s": 10.0,
+        "frames": [
+            _decoded_frame(10 + offset, 30 + offset, denominator=10)
+            for offset in range(70)
+        ],
+    })
+
+    segments = plan_segments(
+        10.0,
+        scenes,
+        [{"text": "完整保留", "start_s": 2.9, "end_s": 3.2}],
+    )
+    assert len(segments) == 1
+    assert segments[0]["start_s"] == 0.0
+    assert segments[0]["end_s"] == 10.0
+    assert provider_duration_s(0.0, 10.0) == 10
+    timeline = segments[0]["source_cut_timeline"]
+    assert len(timeline) == 11
+    assert timeline[0]["start_s"] == 0.0
+    assert timeline[-1]["end_s"] == 10.0
+    assert all(
+        left["end_s"] == right["start_s"]
+        for left, right in zip(timeline, timeline[1:])
+    )
+
+    selected = select_segment_keyframes(scenes, segments[0])
+    assert len(selected) == 9
+    slot_scenes = [
+        scene_id
+        for item in selected
+        for scene_id in item["analysis_slot"]["source_scene_ids"]
     ]
-    assert [segment["join_mode"] for segment in segments] == [
-        "hard_cut", "hard_cut",
+    assert slot_scenes == [f"SCENE_{index:02d}" for index in range(1, 12)]
+    assert any(
+        len(item["analysis_slot"]["source_scene_ids"]) > 1
+        for item in selected
+    )
+    assert all(
+        item["transition"]["type"] == "hard_cut"
+        for item in selected[1:]
+    )
+
+
+def test_twenty_five_cuts_keep_complete_timeline_with_nine_analysis_slots():
+    scenes = [
+        {
+            "index": index + 1,
+            "start_s": index * 0.4,
+            "end_s": (index + 1) * 0.4,
+            "frames": [_decoded_frame(index, index * 4, denominator=10)],
+        }
+        for index in range(25)
     ]
+    segment = plan_segments(10.0, scenes, [])[0]
+    selected = select_segment_keyframes(scenes, segment)
+
+    assert len(segment["source_cut_timeline"]) == 25
+    assert len(selected) == 9
+    assert [
+        scene_id
+        for item in selected
+        for scene_id in item["analysis_slot"]["source_scene_ids"]
+    ] == [f"SCENE_{index:02d}" for index in range(1, 26)]
 
 
 def test_keyframe_sampler_uses_anchor_then_capacity_hamilton_and_ordinal_spacing():

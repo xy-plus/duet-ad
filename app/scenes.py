@@ -27,7 +27,6 @@ except ImportError as exc:  # pragma: no cover - environment-dependent message
 
 
 KEYFRAMES_PER_SEGMENT = 9
-MAX_EFFECTIVE_SCENES_PER_SEGMENT = KEYFRAMES_PER_SEGMENT
 DISPLAY_TIME_PRECISION = 6
 
 
@@ -222,73 +221,41 @@ def _scene_indices_for_interval(
     return indices
 
 
-def _capacity_safe_boundaries(
-    scenes: list[dict], start: Fraction, end: Fraction
-) -> list[Fraction]:
-    """Split one provider-safe interval without creating a short source tail.
+def _scene_exact_bound(scene: Mapping, edge: str) -> Fraction:
+    receipt = scene.get(f"{edge}_time")
+    return (
+        _receipt_time(receipt, f"scene {edge}")
+        if receipt is not None
+        else Fraction(str(scene[f"{edge}_s"]))
+    )
 
-    Capacity splits may only use real scene starts, so every added boundary is
-    a hard cut already present in the source.  Dynamic programming chooses the
-    fewest segments, then the latest feasible boundary, deterministically.
+
+def _source_cut_timeline(
+    scenes: Iterable[Mapping], start: Fraction, end: Fraction
+) -> list[dict]:
+    """Return every real scene interval clipped to one provider segment.
+
+    This is deliberately independent of the nine analysis images.  A dense
+    montage can therefore retain every hard-cut fact even when several tiny
+    scenes must share one analysis slot.
     """
-    candidates = [
-        start,
-        *sorted({
-            (
-                _receipt_time(scene["start_time"], "scene start")
-                if "start_time" in scene
-                else Fraction(str(scene["start_s"]))
-            )
-            for scene in scenes[1:]
-            if start < (
-                _receipt_time(scene["start_time"], "scene start")
-                if "start_time" in scene
-                else Fraction(str(scene["start_s"]))
-            ) < end
-        }),
-        end,
-    ]
-    suffixes: dict[int, list[Fraction]] = {len(candidates) - 1: [end]}
-    for left in range(len(candidates) - 2, -1, -1):
-        choices: list[list[Fraction]] = []
-        for right in range(left + 1, len(candidates)):
-            suffix = suffixes.get(right)
-            if suffix is None:
-                continue
-            boundary_start, boundary_end = candidates[left], candidates[right]
-            try:
-                source_duration = long_video.segment_duration_s(
-                    float(boundary_start), float(boundary_end)
-                )
-                provider_duration = long_video.provider_duration_s(
-                    float(boundary_start), float(boundary_end)
-                )
-            except long_video.LongVideoError:
-                continue
-            scene_indices = _scene_indices_for_interval(
-                scenes, float(boundary_start), float(boundary_end)
-            )
-            if (
-                source_duration < long_video.SEGMENT_SOURCE_MIN_S
-                or provider_duration > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
-                or not 1 <= len(scene_indices) <= MAX_EFFECTIVE_SCENES_PER_SEGMENT
-            ):
-                continue
-            choices.append([boundary_start, *suffix])
-        if choices:
-            suffixes[left] = min(
-                choices,
-                key=lambda path: (
-                    len(path),
-                    tuple(-value for value in path[1:-1]),
-                ),
-            )
-    try:
-        return suffixes[0]
-    except KeyError:
-        raise ValueError(
-            "segment scene capacity cannot satisfy provider duration minimum"
-        ) from None
+    timeline = []
+    for scene in scenes:
+        scene_start = _scene_exact_bound(scene, "start")
+        scene_end = _scene_exact_bound(scene, "end")
+        clipped_start = max(start, scene_start)
+        clipped_end = min(end, scene_end)
+        if clipped_end <= clipped_start:
+            continue
+        timeline.append({
+            "order": len(timeline) + 1,
+            "source_scene_id": f"SCENE_{scene['index']:02d}",
+            "start_s": _display_time(clipped_start),
+            "end_s": _display_time(clipped_end),
+        })
+    if not timeline:
+        raise ValueError("segment source cut timeline is empty")
+    return timeline
 
 
 def plan_segments(
@@ -296,42 +263,21 @@ def plan_segments(
     effective_scenes: Iterable[Mapping],
     dialogue: Iterable[Mapping],
 ) -> list[dict]:
-    """Return the one segment plan constrained by provider and scene capacity.
+    """Return provider-safe segments plus the complete source-cut timeline.
 
-    ``long_video.plan_segments`` remains the provider/dialogue planner.  This
-    entry point adds the keyframe-capacity invariant to the same frozen result:
-    no segment may contain more than nine populated scenes, and any required
-    capacity split is an existing scene boundary (therefore a hard cut).
+    Provider duration (4..10 seconds) determines segmentation.  Nine images is
+    an analysis sampling capacity, not a source-scene limit; dense montages are
+    compacted later by :func:`select_segment_keyframes` without deleting cuts.
     """
     scenes = [dict(scene) for scene in effective_scenes]
     if not scenes or any(not scene.get("frames") for scene in scenes):
         raise ValueError("effective scenes must be populated")
     base = long_video.plan_segments(duration_s, scenes, dialogue)
-    cut_points = {Fraction(str(segment["start_s"])) for segment in base[1:]}
-    hard_cuts = {
-        (
-            _receipt_time(scene["start_time"], "scene start")
-            if "start_time" in scene
-            else Fraction(str(scene["start_s"]))
-        )
-        for scene in scenes[1:]
-    }
-    for segment in base:
-        capacity_boundaries = _capacity_safe_boundaries(
-            scenes,
-            Fraction(str(segment["start_s"])),
-            Fraction(str(segment["end_s"])),
-        )
-        cut_points.update(capacity_boundaries[1:-1])
-
-    boundaries = [Fraction(0), *sorted(cut_points), Fraction(str(duration_s))]
-    # A base-plan boundary may be identical to the outer boundaries.
-    boundaries = list(dict.fromkeys(boundaries))
     planned: list[dict] = []
-    chain = 0
-    for index, (start, end) in enumerate(zip(boundaries, boundaries[1:]), 1):
-        if end <= start:
-            raise ValueError("segment boundaries must be strictly increasing")
+    for segment in base:
+        index = segment["index"]
+        start = Fraction(str(segment["start_s"]))
+        end = Fraction(str(segment["end_s"]))
         scene_indices = _scene_indices_for_interval(scenes, float(start), float(end))
         try:
             source_duration = long_video.segment_duration_s(float(start), float(end))
@@ -342,19 +288,12 @@ def plan_segments(
             or long_video.provider_duration_s(float(start), float(end))
             > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
             or not scene_indices
-            or len(scene_indices) > MAX_EFFECTIVE_SCENES_PER_SEGMENT
         ):
-            raise ValueError("segment scene capacity invariant violated")
-        hard_cut = index == 1 or start in hard_cuts
-        if hard_cut:
-            chain += 1
+            raise ValueError("segment provider duration invariant violated")
         planned.append({
-            "index": index,
-            "start_s": round(float(start), long_video.BOUNDARY_PRECISION),
-            "end_s": round(float(end), long_video.BOUNDARY_PRECISION),
-            "chain_id": f"chain-{chain:03d}",
-            "join_mode": "hard_cut" if hard_cut else "continue",
+            **segment,
             "scene_indices": scene_indices,
+            "source_cut_timeline": _source_cut_timeline(scenes, start, end),
         })
     return planned
 
@@ -436,6 +375,74 @@ def _under_capacity_counts(frames: list[dict], seats: int) -> list[int]:
     return counts
 
 
+def _compact_analysis_scene_groups(
+    scenes: list[dict], start: Fraction, end: Fraction
+) -> list[list[dict]]:
+    """Partition dense consecutive scenes into exactly nine analysis slots.
+
+    Each scene belongs to one slot and scene order is retained.  The greedy
+    target is the remaining source duration divided by remaining seats; it is
+    deterministic, keeps every slot nonempty, and preferentially compacts the
+    shortest neighboring scenes instead of discarding them.
+    """
+    if len(scenes) <= KEYFRAMES_PER_SEGMENT:
+        return [[scene] for scene in scenes]
+    weights = [
+        min(end, _scene_exact_bound(scene, "end"))
+        - max(start, _scene_exact_bound(scene, "start"))
+        for scene in scenes
+    ]
+    if any(weight <= 0 for weight in weights):
+        raise ValueError("analysis scenes must overlap the segment")
+    groups: list[list[dict]] = []
+    cursor = 0
+    for seat in range(KEYFRAMES_PER_SEGMENT - 1):
+        remaining_seats = KEYFRAMES_PER_SEGMENT - seat
+        last_allowed = len(scenes) - (remaining_seats - 1)
+        remaining_weight = sum(weights[cursor:])
+        target = remaining_weight / remaining_seats
+        running = Fraction(0)
+        candidates = []
+        for stop in range(cursor + 1, last_allowed + 1):
+            running += weights[stop - 1]
+            candidates.append((abs(running - target), stop))
+        stop = min(candidates)[1]
+        groups.append(scenes[cursor:stop])
+        cursor = stop
+    groups.append(scenes[cursor:])
+    if (
+        len(groups) != KEYFRAMES_PER_SEGMENT
+        or any(not group for group in groups)
+        or [scene["index"] for group in groups for scene in group]
+        != [scene["index"] for scene in scenes]
+    ):
+        raise AssertionError("analysis scene compaction invariant violated")
+    return groups
+
+
+def _analysis_group_representative(
+    group: list[dict], start: Fraction, end: Fraction
+) -> tuple[dict, dict]:
+    group_start = max(start, _scene_exact_bound(group[0], "start"))
+    group_end = min(end, _scene_exact_bound(group[-1], "end"))
+    target = group_start + (group_end - group_start) / 2
+    candidates = [
+        (scene, frame)
+        for scene in group
+        for frame in scene["frames"]
+        if start <= _frame_time(frame) < end
+    ]
+    if not candidates:
+        raise ValueError("analysis slot contains no source frame")
+    return min(
+        candidates,
+        key=lambda item: (
+            abs(_frame_time(item[1]) - target),
+            item[1]["decode_frame_index"],
+        ),
+    )
+
+
 def select_segment_keyframes(
     effective_scenes: Iterable[Mapping], segment: Mapping
 ) -> list[dict]:
@@ -459,10 +466,17 @@ def select_segment_keyframes(
         if frames:
             scene["frames"] = frames
             scenes.append(scene)
-    if not scenes or len(scenes) > MAX_EFFECTIVE_SCENES_PER_SEGMENT:
-        raise ValueError("segment effective scene count must be in 1..9")
+    if not scenes:
+        raise ValueError("segment must contain at least one effective scene")
     all_frames = [frame for scene in scenes for frame in scene["frames"]]
-    if len(all_frames) >= KEYFRAMES_PER_SEGMENT:
+    dense_groups: list[list[dict]] | None = None
+    if len(scenes) > KEYFRAMES_PER_SEGMENT:
+        dense_groups = _compact_analysis_scene_groups(scenes, start, end)
+        chosen = [
+            (*_analysis_group_representative(group, start, end), False)
+            for group in dense_groups
+        ]
+    elif len(all_frames) >= KEYFRAMES_PER_SEGMENT:
         counts = _hamilton_scene_counts(
             [len(scene["frames"]) for scene in scenes], KEYFRAMES_PER_SEGMENT
         )
@@ -497,7 +511,7 @@ def select_segment_keyframes(
             }
         else:
             transition = {"type": "continuous", "at_s": None}
-        selected.append({
+        item = {
             "order": order,
             "decode_frame_index": frame["decode_frame_index"],
             "pts": frame["pts"],
@@ -514,7 +528,18 @@ def select_segment_keyframes(
             "repeat_of_decode_frame_index": (
                 frame["decode_frame_index"] if repeated else None
             ),
-        })
+        }
+        if dense_groups is not None:
+            group = dense_groups[order - 1]
+            group_timeline = _source_cut_timeline(group, start, end)
+            item["analysis_slot"] = {
+                "index": order,
+                "source_scene_ids": [
+                    entry["source_scene_id"] for entry in group_timeline
+                ],
+                "source_cut_timeline": group_timeline,
+            }
+        selected.append(item)
         previous_scene = scene["index"]
     if len(selected) != KEYFRAMES_PER_SEGMENT:
         raise AssertionError("keyframe sampler did not produce exactly nine frames")
