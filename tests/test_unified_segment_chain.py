@@ -1590,23 +1590,23 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
         def run(self, _cwd: Path, _prompt: str) -> None:
             raise AssertionError("prompt fusion must not see the project root")
 
-        def run_isolated(
+        def run_isolated_until_output(
             self, cwd: Path, prompt: str, *, session_dir: Path,
-            writable_paths: tuple[Path, ...],
-        ) -> None:
+            output_path: Path, max_output_bytes: int, validate_output,
+            output_schema: dict,
+        ) -> bytes:
             calls.append(session_dir)
             assert session_dir == root
             assert cwd != root
             assert "multimodal_input.json" in prompt
-            output_path = cwd / "work" / "h3_prompt_plan.json"
-            assert writable_paths == (output_path,)
-            assert output_path.read_bytes() == b""
+            assert output_path == cwd / "work" / "h3_prompt_plan.json"
+            assert max_output_bytes > 0
+            assert output_schema["type"] == "object"
             frozen_input = (cwd / "work" / "multimodal_input.json").read_bytes()
             payload = json.loads(frozen_input.decode("utf-8"))
             expected_files = {
                 "SKILL.md",
                 "work/multimodal_input.json",
-                "work/h3_prompt_plan.json",
                 *(
                     frame["path"]
                     for segment in payload["segments"]
@@ -1627,7 +1627,7 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
                     for item in payload["segments"]
                 ],
             }
-            output_path.write_bytes(_canonical(output))
+            return validate_output(_canonical(output))
 
     if segment_count == 1:
         legacy = json.loads(input_data)
@@ -2277,15 +2277,16 @@ def test_producer_failure_binds_raw_sha_and_rejects_schema_valid_replacement(
         ) == "queued"
 
     class Runner:
-        def run_isolated(
+        def run_isolated_until_output(
             self, cwd: Path, _prompt: str, *, session_dir: Path,
-            writable_paths: tuple[Path, ...],
-        ) -> None:
+            output_path: Path, max_output_bytes: int, validate_output,
+            output_schema: dict,
+        ) -> bytes:
             assert session_dir == root
-            assert writable_paths == (
-                cwd / "work" / "h3_prompt_plan.json",
-            )
-            (cwd / "work" / "h3_prompt_plan.json").write_bytes(_canonical({
+            assert output_path == cwd / "work" / "h3_prompt_plan.json"
+            assert max_output_bytes > 0
+            assert output_schema["type"] == "object"
+            return validate_output(_canonical({
                 "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
                 "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
                 "input_sha256": hashlib.sha256(input_data).hexdigest(),
@@ -2352,17 +2353,18 @@ def test_new_producer_ignores_unbound_ambient_skill_path_drift(
         ) == "queued"
 
     class Runner:
-        def run_isolated(
+        def run_isolated_until_output(
             self, cwd: Path, _prompt: str, *, session_dir: Path,
-            writable_paths: tuple[Path, ...],
-        ) -> None:
+            output_path: Path, max_output_bytes: int, validate_output,
+            output_schema: dict,
+        ) -> bytes:
             assert session_dir == root
-            assert writable_paths == (
-                cwd / "work" / "h3_prompt_plan.json",
-            )
+            assert output_path == cwd / "work" / "h3_prompt_plan.json"
+            assert max_output_bytes > 0
+            assert output_schema["type"] == "object"
             skill_path.write_text("drifted prompt fusion Skill", encoding="utf-8")
             segment = json.loads(input_data)["segments"][0]
-            (cwd / "work" / "h3_prompt_plan.json").write_bytes(_canonical({
+            return validate_output(_canonical({
                 "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
                 "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
                 "input_sha256": hashlib.sha256(input_data).hexdigest(),
