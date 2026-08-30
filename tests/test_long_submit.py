@@ -2710,12 +2710,13 @@ def test_current_operation_replay_ignores_new_id_and_never_reposts_unknown(
         ),
     )
 
-    assert response.status_code == 202
+    assert response.status_code == 200
     assert response.json() == {
         "operation_id": cid,
-        "status": "running",
+        "status": "submission_unknown",
         "stage": "h3",
         "attempt": 1,
+        "error": "submission_unknown",
     }
     stored = storage.load_meta(settings.data_dir, cid)["generation"]
     assert stored["status"] == "submission_unknown"

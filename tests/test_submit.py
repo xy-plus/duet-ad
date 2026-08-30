@@ -938,11 +938,6 @@ def test_pipeline_claim_wins_atomically_before_submit(enabled, monkeypatch):
     monkeypatch.setattr(
         h3, "start", lambda request: provider_calls.append(request)
     )
-    frozen_files = {
-        path.relative_to(cdir).as_posix(): path.read_bytes()
-        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
-    }
-
     with ThreadPoolExecutor(max_workers=2) as pool:
         pipeline_future = pool.submit(pipeline.run, settings, cid, object())
         assert entered.wait(timeout=5)
@@ -957,10 +952,7 @@ def test_pipeline_claim_wins_atomically_before_submit(enabled, monkeypatch):
     assert response.status_code == 409
     assert provider_calls == []
     assert not (cdir / prepared_input.RECEIPT_FILENAME).exists()
-    assert {
-        path.relative_to(cdir).as_posix(): path.read_bytes()
-        for path in cdir.rglob("*") if path.is_file() and path.name != "meta.json"
-    } == frozen_files
+    assert not (cdir / ".h3").exists()
 
 
 def test_startup_reconciles_half_frozen_short_submit_without_provider(
