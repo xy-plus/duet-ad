@@ -20,7 +20,7 @@ description: 分析后端为每个 segment 冻结的 9 张原始关键帧并生�
 
 先逐帧列出直接可见的人物、可独立移动或被动作作用的持久实体、场景以及元素间关系，再跨帧回查并合并。使用不可变中性 ID：`person-01`、`entity-01`、`scene-01`、`relation-01`。stable key 只是绑定 ID，不得含源属性。同一实例逐字复用；证据不足、特征冲突或同类实例可分别移动/接触时分开。硬切后重新依据当前帧确认；位置、相邻帧、服装颜色或叙事角色不能单独证明同一性。碎片、倒影、残影、模糊、过渡扫到的背景杂物不升格；occurrence 只记录当前帧可证实内容。
 
-输出格式以本次调用注入的 JSON Schema 为唯一权威。`people/entities/scenes/relations` 都是数组，发现的稳定 ID 写入各记录的 `key`；人物、实体和场景记录包含 `source_visual_description/occurrences/replaceable/preserve`，关系记录包含 `subject_key/predicate/object_key/occurrences/preserve/replace_together`。后端按 `key` 建索引，不接受重复 key、额外字段或缺字段。
+输出格式以本次调用注入的 JSON Schema 为唯一权威。`people/entities/scenes/relations` 都是数组，发现的稳定 ID 写入各记录的 `key`；人物、实体和场景记录包含 `source_visual_description/occurrences/replaceable/preserve`，关系记录包含 `subject_key/predicate/object_key/occurrences/preserve/replace_together`，关系逐帧记录包含 `frame_order/state/geometry`。后端按 `key` 建索引，不接受重复 key、额外字段或缺字段。
 
 `scenes` 必须非空，且每个输入帧必须且只能归属一个 scene occurrence；所有 scene occurrences 合并后逐项等于输入中的全部 segment/frame，不得引用未知帧、重复归属或漏帧。人物、实体和关系只记录有直接证据的内容，可以为空。
 
