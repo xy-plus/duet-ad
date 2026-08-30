@@ -2110,9 +2110,10 @@ def _load_scenes(work: Path) -> list[dict]:
 def _detect_segments(settings: Settings, cid: str, source: Path, work: Path) -> list[dict]:
     """跑 app/scenes.py 检测场景并读拆段建议。
 
-    检测失败或 scenes.json 非法（含拆段结构不变量违规）→ 回退空列表 = 单段模式，
-    不判失败，meta.scenes_note 留痕；segments 空（≤15s）是合法单段结果，不留痕。
+    检测失败或当前 scenes receipt 非法时，不猜测场景：后端直接从源视频
+    decoded-frame PTS 构造一个精确场景，并让同一 planner/九帧采样器继续处理。
     """
+    fallback_reason: str | None = None
     try:
         _run_cmd(
             [sys.executable, str(SCENES_SCRIPT), str(source), "--work-dir", str(work)],
@@ -2121,20 +2122,37 @@ def _detect_segments(settings: Settings, cid: str, source: Path, work: Path) -> 
         )
     except PipelineError as e:
         print(f"scenes detection failed ({e}); falling back to single-segment mode")
-        storage.update_meta(
-            settings.data_dir, cid,
-            scenes_note="scenes detection failed, single-segment fallback",
-        )
-        return []
+        fallback_reason = "scene_detector_process_failed"
+    if fallback_reason is None:
+        try:
+            detected = _load_scenes(work)
+            source_scenes = _source_scenes_for_timeline(
+                work, _manifest_duration(work)
+            )
+            if not _has_exact_scene_inventory(source_scenes):
+                raise PipelineError("exact scene inventory is missing")
+            return detected
+        except PipelineError as e:
+            print(f"scenes.json invalid ({e}); falling back to single-segment mode")
+            fallback_reason = "scene_detector_receipt_invalid"
+    assert fallback_reason is not None
     try:
-        return _load_scenes(work)
-    except PipelineError as e:
-        print(f"scenes.json invalid ({e}); falling back to single-segment mode")
+        fallback = scene_planner.build_single_scene_fallback(
+            source, work, diagnostic=fallback_reason
+        )
+        _atomic_bytes(
+            work / "scenes.json",
+            (json.dumps(fallback, ensure_ascii=False, indent=2) + "\n").encode(
+                "utf-8"
+            ),
+        )
         storage.update_meta(
             settings.data_dir, cid,
-            scenes_note="scenes.json invalid, single-segment fallback",
+            scenes_note="scene detector unavailable, exact single-scene fallback",
         )
-        return []
+        return _load_scenes(work)
+    except (SystemExit, ValueError, OSError, PipelineError) as exc:
+        raise PipelineError("exact single-scene fallback failed") from exc
 
 
 def _scene_bounds_for_long_plan(work: Path, duration_s: float) -> list[dict]:
@@ -2209,6 +2227,22 @@ def _source_scenes_for_timeline(work: Path, duration_s: float) -> list[dict]:
             "end_s": bound["end_s"],
         })
     return result
+
+
+def _has_exact_scene_inventory(source_scenes: list[dict]) -> bool:
+    return bool(source_scenes) and all(
+        isinstance(scene.get("frames"), list)
+        and bool(scene["frames"])
+        and all(
+            isinstance(frame, dict)
+            and isinstance(frame.get("decode_frame_index"), int)
+            and not isinstance(frame.get("decode_frame_index"), bool)
+            and isinstance(frame.get("pts"), int)
+            and not isinstance(frame.get("pts"), bool)
+            for frame in scene["frames"]
+        )
+        for scene in source_scenes
+    )
 
 
 def _bind_keyframe_source_timeline(
@@ -3842,39 +3876,19 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             meta = refreshed
             planner_dialogue = _planner_dialogue(meta, voice_lines or [])
             source_scenes = _source_scenes_for_timeline(work, duration_s)
-            exact_inventory = all(
-                isinstance(scene.get("frames"), list)
-                and scene["frames"]
-                and all(
-                    isinstance(frame, dict)
-                    and isinstance(frame.get("decode_frame_index"), int)
-                    and not isinstance(frame.get("decode_frame_index"), bool)
-                    and isinstance(frame.get("pts"), int)
-                    and not isinstance(frame.get("pts"), bool)
-                    for frame in scene["frames"]
-                )
-                for scene in source_scenes
+            if not _has_exact_scene_inventory(source_scenes):
+                raise PipelineError("exact scene inventory is missing")
+            segments = scene_planner.plan_segments(
+                duration_s,
+                source_scenes,
+                planner_dialogue,
             )
-            if exact_inventory:
-                segments = scene_planner.plan_segments(
-                    duration_s,
-                    source_scenes,
-                    planner_dialogue,
+            backend_keyframe_selections = {
+                segment["index"]: scene_planner.select_segment_keyframes(
+                    source_scenes, segment
                 )
-                backend_keyframe_selections = {
-                    segment["index"]: scene_planner.select_segment_keyframes(
-                        source_scenes, segment
-                    )
-                    for segment in segments
-                }
-            else:
-                # Read-only compatibility for pre-exact scene receipts.  New
-                # scenes.py output always carries the exact inventory above.
-                segments = long_video.plan_segments(
-                    duration_s,
-                    source_scenes,
-                    planner_dialogue,
-                )
+                for segment in segments
+            }
         if not segments:
             # 单段模式：work/keyframes + work/prompt.txt，不注入 workaround 前缀；
             # 裁剪工具以 scripts/crop_image.py 相对工作目录引用，scripts/ 拷进会话目录

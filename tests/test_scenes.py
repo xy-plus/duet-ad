@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app import scenes as scenes_module
+from app import pipeline, scenes as scenes_module, storage
 from app.scenes import (
     build_segments,
     normalize_scene_inventory,
@@ -15,6 +15,7 @@ from app.scenes import (
     select_segment_keyframes,
 )
 from app.long_video import provider_duration_s
+from conftest import make_settings
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENES_SCRIPT = ROOT / "app" / "scenes.py"
@@ -724,4 +725,90 @@ def test_keyframe_sampler_repeats_nearest_pts_when_source_has_under_nine_frames(
     assert all(
         item["transition"] == {"type": "continuous", "at_s": None}
         for item in selected[1:]
+    )
+
+
+def test_detector_process_failure_builds_exact_inventory_for_visual_sampler(
+    tmp_path, monkeypatch, video_10s,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "fallback", "source.mp4")
+    work = settings.data_dir / meta["id"] / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "manifest.json").write_text(
+        json.dumps({
+            "duration_seconds": 10.0,
+            "frames": [
+                {"index": index, "file": f"{index:02d}.png", "time_seconds": time_s}
+                for index, time_s in enumerate((0.0, 3.0, 6.0, 9.0), 1)
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_run_cmd",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            pipeline.PipelineError("detector crashed")
+        ),
+    )
+
+    detected = pipeline._detect_segments(
+        settings, meta["id"], video_10s, work
+    )
+
+    assert detected == []
+    receipt = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
+    assert receipt["diagnostics"] == ["scene_detector_process_failed"]
+    assert receipt["effective_scenes"][0]["frames"]
+    source_scenes = pipeline._source_scenes_for_timeline(work, 10.0)
+    planned = plan_segments(10.0, source_scenes, [])
+    assert len(planned) == 1
+    selected = select_segment_keyframes(source_scenes, planned[0])
+    assert len(selected) == 9
+    assert all(
+        isinstance(item["decode_frame_index"], int) for item in selected
+    )
+
+
+def test_detector_receipt_without_exact_inventory_is_mechanically_replaced(
+    tmp_path, monkeypatch, video_10s,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "fallback", "source.mp4")
+    work = settings.data_dir / meta["id"] / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "duration_seconds": 10.0,
+        "frames": [
+            {"index": index, "file": f"{index:02d}.png", "time_seconds": time_s}
+            for index, time_s in enumerate((0.0, 3.0, 6.0, 9.0), 1)
+        ],
+    }
+    (work / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    def write_incomplete_receipt(*_args, **_kwargs):
+        (work / "scenes.json").write_text(
+            json.dumps({
+                "duration_s": 10.0,
+                "scenes": [{
+                    "index": 1, "start_s": 0.0, "end_s": 10.0,
+                    "frames": ["01.png", "02.png", "03.png", "04.png"],
+                }],
+                "segments": [],
+            }),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(pipeline, "_run_cmd", write_incomplete_receipt)
+
+    assert pipeline._detect_segments(
+        settings, meta["id"], video_10s, work
+    ) == []
+    receipt = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
+    assert receipt["diagnostics"] == ["scene_detector_receipt_invalid"]
+    assert pipeline._has_exact_scene_inventory(
+        pipeline._source_scenes_for_timeline(work, 10.0)
     )

@@ -708,6 +708,45 @@ def _exclusive_end_time(decoded_frames: list[dict], end_index: int) -> Fraction:
     raise SystemExit("无法确定最后一帧的排他结束 PTS。")
 
 
+def single_scene_bounds(
+    decoded_frames: list[dict], *, diagnostics: list[str],
+) -> list[dict]:
+    """Build one exact scene from the decoded-frame authority.
+
+    This is the deterministic fallback for detector failure.  It does not
+    infer timing from sampled image bytes and therefore remains safe for
+    static or duplicated frames.
+    """
+    if (
+        not decoded_frames
+        or not isinstance(diagnostics, list)
+        or not diagnostics
+        or any(not isinstance(item, str) or not item for item in diagnostics)
+    ):
+        raise ValueError("single-scene fallback input is invalid")
+    start_exact = _frame_time(decoded_frames[0])
+    end_exact = _exclusive_end_time(decoded_frames, len(decoded_frames))
+    common_denominator = math.lcm(
+        start_exact.denominator, end_exact.denominator
+    )
+    return [{
+        "index": 1,
+        "start_decode_frame_index": 0,
+        "end_decode_frame_index": len(decoded_frames),
+        "start_pts": start_exact.numerator * (
+            common_denominator // start_exact.denominator
+        ),
+        "end_pts": end_exact.numerator * (
+            common_denominator // end_exact.denominator
+        ),
+        "time_base_num": 1,
+        "time_base_den": common_denominator,
+        "start_s": _display_time(start_exact),
+        "end_s": _display_time(end_exact),
+        "diagnostics": list(diagnostics),
+    }]
+
+
 def detect_exact_scene_bounds(
     video: Path, threshold: float, decoded_frames: list[dict]
 ) -> list[dict]:
@@ -724,27 +763,9 @@ def detect_exact_scene_bounds(
         diagnostics.append("scene_detector_error_normalized")
     if not scene_list:
         diagnostics.append("scene_detector_no_cut_normalized")
-        start_exact = _frame_time(decoded_frames[0])
-        end_exact = _exclusive_end_time(decoded_frames, len(decoded_frames))
-        common_denominator = math.lcm(
-            start_exact.denominator, end_exact.denominator
+        return single_scene_bounds(
+            decoded_frames, diagnostics=diagnostics
         )
-        return [{
-            "index": 1,
-            "start_decode_frame_index": 0,
-            "end_decode_frame_index": len(decoded_frames),
-            "start_pts": start_exact.numerator * (
-                common_denominator // start_exact.denominator
-            ),
-            "end_pts": end_exact.numerator * (
-                common_denominator // end_exact.denominator
-            ),
-            "time_base_num": 1,
-            "time_base_den": common_denominator,
-            "start_s": _display_time(start_exact),
-            "end_s": _display_time(end_exact),
-            "diagnostics": diagnostics,
-        }]
     bounds: list[dict] = []
     for index, (start, end) in enumerate(scene_list, 1):
         start_index = max(0, min(int(start.frame_num), len(decoded_frames)))
@@ -827,6 +848,45 @@ def build_segments(
         return []
     planned = long_video.plan_segments(duration, bounds, [])
     return [(item["start_s"], item["end_s"]) for item in planned]
+
+
+def build_single_scene_fallback(
+    video: Path, work_dir: Path, *, diagnostic: str,
+) -> dict:
+    """Construct the normal scenes receipt without invoking scene detection."""
+    duration, sampled_frames = load_manifest(work_dir)
+    decoded_frames = probe_decoded_frames(video)
+    exact_bounds = single_scene_bounds(
+        decoded_frames, diagnostics=[diagnostic]
+    )
+    effective_scenes = normalize_scene_inventory(exact_bounds, decoded_frames)
+    bounds = [(0.0, round(duration, 3))]
+    groups = group_frames(sampled_frames, bounds)
+    result = {
+        "duration_s": round(duration, 3),
+        "scenes": [{
+            "index": 1,
+            "start_s": 0.0,
+            "end_s": round(duration, 3),
+            "frames": groups[0],
+        }],
+        "effective_scenes": effective_scenes,
+        "diagnostics": [diagnostic],
+        "segments": [],
+    }
+    chain = 0
+    for index, (start, end) in enumerate(
+        build_segments(bounds, duration), start=1
+    ):
+        chain += 1
+        result["segments"].append({
+            "index": index,
+            "start_s": round(start, 3),
+            "end_s": round(end, 3),
+            "chain_id": f"chain-{chain:03d}",
+            "join_mode": "hard_cut",
+        })
+    return result
 
 
 def main() -> int:
