@@ -30,7 +30,22 @@ _LOGGER = logging.getLogger(__name__)
 
 MAX_PROMPT_BYTES = 32 * 1024
 MAX_CONTINUITY_BYTES = 32 * 1024
+MIN_ELEMENT_INDEX_BYTES = 256 * 1024
+ELEMENT_INDEX_BASE_BYTES = 64 * 1024
+ELEMENT_INDEX_PER_FRAME_BYTES = 16 * 1024
 MAX_PROJECT_OUTPUT_OVERHEAD_BYTES = 64 * 1024
+
+
+def element_index_max_bytes(frame_count: int) -> int:
+    """Return one input-derived producer/consumer budget for Project Index."""
+    if isinstance(frame_count, bool) or not isinstance(frame_count, int) or frame_count < 0:
+        raise ValueError("invalid project index frame count")
+    return max(
+        MIN_ELEMENT_INDEX_BYTES,
+        ELEMENT_INDEX_BASE_BYTES + frame_count * ELEMENT_INDEX_PER_FRAME_BYTES,
+    )
+
+
 PALETTE_METRIC_ALGORITHM = "area-weighted-cie-lab-hsv-v1"
 PALETTE_METRIC_THRESHOLDS = {
     "lab_b_star_neutral": 128.0,
@@ -4106,7 +4121,8 @@ def generate_project_prompts(
     element_index = None
     if element_index_path is not None:
         raw_element_index = _read_json_output(
-            Path(element_index_path), MAX_CONTINUITY_BYTES
+            Path(element_index_path),
+            element_index_max_bytes(sum(len(frames) for _segment, frames in prepared)),
         )
         if (
             not isinstance(raw_element_index, dict)

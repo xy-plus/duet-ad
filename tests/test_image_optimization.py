@@ -2103,6 +2103,53 @@ def test_v4_plan_rejects_model_transition_that_differs_from_backend_skeleton(tmp
         )
 
 
+def test_relation_rich_project_index_uses_the_producer_size_contract(
+    tmp_path, monkeypatch,
+):
+    session = tmp_path / "session"
+    session.mkdir()
+    element_index = session / "element_index.json"
+    payload = {
+        "people": {"person-01": {"description": "x" * (300 * 1024)}},
+        "entities": {},
+        "scenes": {},
+        "relations": {},
+    }
+    element_index.write_text(json.dumps(payload), encoding="utf-8")
+    assert element_index.stat().st_size > image_optimization.MIN_ELEMENT_INDEX_BYTES
+
+    monkeypatch.setattr(
+        image_optimization,
+        "_project_segment_inputs",
+        lambda *_args, **_kwargs: (
+            session,
+            [1, 2, 3],
+            [(object(), [object()] * 9) for _index in range(3)],
+        ),
+    )
+
+    class ReachedCanonicalization(Exception):
+        pass
+
+    def stop_after_read(value):
+        assert value == payload
+        raise ReachedCanonicalization
+
+    monkeypatch.setattr(
+        image_optimization, "_canonical_element_index", stop_after_read,
+    )
+
+    with pytest.raises(ReachedCanonicalization):
+        image_optimization.generate_project_prompts(
+            object(),
+            [],
+            "independent_parallel",
+            session_dir=session,
+            element_index_path=element_index,
+            skill_bytes=b"frozen image-postprocess skill",
+        )
+
+
 class _PlanAuditRunner:
     def __init__(self, status: str, verify_status: str = "pass") -> None:
         self.status = status

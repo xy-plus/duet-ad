@@ -687,7 +687,9 @@ def _generate_project_element_index(
                 _project_index_codex_prompt(isolated_root),
                 session_dir=cdir,
                 output_path=isolated_output,
-                max_output_bytes=256 * 1024,
+                max_output_bytes=image_optimization.element_index_max_bytes(
+                    sum(len(paths) for paths in frame_paths.values())
+                ),
                 validate_output=validate,
             )
         else:
