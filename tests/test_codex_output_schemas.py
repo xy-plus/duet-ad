@@ -155,7 +155,7 @@ def test_codex_argv_receives_readonly_output_schema(monkeypatch, tmp_path: Path)
         schema.write_text('{"type":"object"}\n', encoding="utf-8")
         runner = CodexRunner(timeout_s=3, concurrency=1)
         token = codex_runner._ACTIVE_ISOLATED_STAGE.set(
-            (id(runner), stage, session, (final,), final)
+            (id(runner), stage, session, (final,), final, True)
         )
         try:
             argv = runner.build_argv(stage, "prompt")
@@ -163,8 +163,8 @@ def test_codex_argv_receives_readonly_output_schema(monkeypatch, tmp_path: Path)
             codex_runner._ACTIVE_ISOLATED_STAGE.reset(token)
         assert "--output-schema" in argv
         assert argv[argv.index("--output-schema") + 1] == str(schema)
-        schema_mount = ["--ro-bind", str(schema), str(schema)]
+        stage_mount = ["--ro-bind", str(stage), str(stage)]
         assert any(
-            argv[index:index + 3] == schema_mount
+            argv[index:index + 3] == stage_mount
             for index in range(len(argv) - 2)
         )

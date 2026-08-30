@@ -25,7 +25,7 @@ def test_metadata_and_backend_bound_input_contract_are_explicit():
 def test_relation_binding_and_state_lifecycle_are_consumed():
     text = _text()
     for required in (
-        "全项目共享关系绑定：relation_key -> subject_key -> predicate -> object_key -> replacement_system",
+        "`relation_occurrences.preserve`", "`replacement_system=`", "关系的唯一结构化权威",
         "主客体和功能角色全项目不变", "状态生命周期", "连接、装载、作用、释放、分离",
         "不能互换主客体", "末帧若仍在运动，只写可见状态",
     ):
