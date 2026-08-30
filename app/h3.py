@@ -1533,6 +1533,39 @@ def _attempt_path(request: H3Request, attempt_id: str) -> Path:
     return _state_root(request) / "attempts" / attempt_id / "attempt.json"
 
 
+def _record_attempt_error(
+    request: H3Request,
+    attempt_id: object,
+    event: str,
+    *,
+    call_path: list[str],
+    error: BaseException | None = None,
+    reason: object | None = None,
+    latest_name: str | None = None,
+) -> None:
+    """Persist ordered per-attempt diagnostics and an optional latest alias."""
+    normalized = str(attempt_id)
+    directory = request.workdir / "errors" / "attempts" / normalized
+    sequence = 1
+    while (directory / f"h3-{event}-{sequence:06d}.json").exists():
+        sequence += 1
+    destination = directory / f"h3-{event}-{sequence:06d}.json"
+    kwargs = {
+        "call_path": [*call_path, f"attempt:{normalized}"],
+        "logger": log,
+        "secrets": (request.autodl_token,),
+    }
+    if error is not None:
+        kwargs["error"] = error
+    else:
+        kwargs["reason"] = reason
+    error_trace.record(destination, **kwargs)
+    if latest_name is not None:
+        kwargs["logger"] = None
+        kwargs["call_path"] = call_path
+        error_trace.record(request.workdir / "errors" / latest_name, **kwargs)
+
+
 def load_media_timeline_receipt(
     request: H3Request,
     attempt_id: str,
@@ -1631,7 +1664,13 @@ def output_is_reusable(
             if abs(duration - expected) > 0.5:
                 return False
         elif (
-            expected < request.duration - 1 - _DURATION_EPS_S
+            (
+                expected < request.duration - 1 - _DURATION_EPS_S
+                and not (
+                    request.duration == 4
+                    and expected >= 1 - _DURATION_EPS_S
+                )
+            )
             or expected > request.duration + _DURATION_EPS_S
             or duration < expected - H3_OUTPUT_FRAME_DURATION_S - _DURATION_EPS_S
             or duration > request.duration + 1
@@ -2884,6 +2923,7 @@ def _query_json_with_retry(
     request: H3Request,
     operation: Callable[[], httpx.Response],
     *,
+    attempt_id: str,
     code: str,
     step: str,
     deadline: float,
@@ -2894,17 +2934,20 @@ def _query_json_with_retry(
         try:
             response = operation()
         except httpx.HTTPError as exc:
-            error_trace.record(
-                request.workdir / "errors" / f"h3-{step}-query.json",
+            _record_attempt_error(
+                request,
+                attempt_id,
+                "query",
                 call_path=["generation", "h3", step, "GET"],
                 error=exc,
-                logger=log,
-                secrets=(request.autodl_token,),
+                latest_name=f"h3-{step}-query.json",
             )
             raise _AutomaticRetryH3Error(code, retryable=True) from None
         if response.status_code != 200:
-            error_trace.record(
-                request.workdir / "errors" / f"h3-{step}-query.json",
+            _record_attempt_error(
+                request,
+                attempt_id,
+                "query",
                 call_path=["generation", "h3", step, "GET"],
                 reason={
                     "code": code,
@@ -2912,8 +2955,7 @@ def _query_json_with_retry(
                         response, secrets=(request.autodl_token,)
                     ),
                 },
-                logger=log,
-                secrets=(request.autodl_token,),
+                latest_name=f"h3-{step}-query.json",
             )
             error_type = (
                 _AutomaticRetryH3Error
@@ -2924,8 +2966,10 @@ def _query_json_with_retry(
         try:
             payload = _response_json(response)
         except (ValueError, TypeError) as exc:
-            error_trace.record(
-                request.workdir / "errors" / f"h3-{step}-query.json",
+            _record_attempt_error(
+                request,
+                attempt_id,
+                "query-decode",
                 call_path=["generation", "h3", step, "decode"],
                 reason={
                     "code": code,
@@ -2936,8 +2980,7 @@ def _query_json_with_retry(
                         response, secrets=(request.autodl_token,)
                     ),
                 },
-                logger=log,
-                secrets=(request.autodl_token,),
+                latest_name=f"h3-{step}-query.json",
             )
             raise _AutomaticRetryH3Error(code, retryable=True) from None
         return response, payload
@@ -2974,12 +3017,13 @@ def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) 
         payload = _response_json(response)
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         _submission_unknown(request, state, "h3")
-        error_trace.record(
-            request.workdir / "errors" / "h3-submit.json",
+        _record_attempt_error(
+            request,
+            state.get("attempt_id"),
+            "submit",
             call_path=["generation", "h3", "submit"],
             error=exc,
-            logger=log,
-            secrets=(request.autodl_token,),
+            latest_name="h3-submit.json",
         )
         raise H3Error("submission_unknown") from None
     data = payload.get("data")
@@ -3015,15 +3059,16 @@ def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) 
             retryable=False,
             gateway_diagnostic=gateway_diagnostic,
         )
-        error_trace.record(
-            request.workdir / "errors" / "h3-submit.json",
+        _record_attempt_error(
+            request,
+            state.get("attempt_id"),
+            "submit",
             call_path=["generation", "h3", "submit"],
             reason={
                 "code": "h3_submit_rejected",
                 "provider": error_trace.provider_response(response, secrets=(request.autodl_token,)),
             },
-            logger=log,
-            secrets=(request.autodl_token,),
+            latest_name="h3-submit.json",
         )
         raise H3Error("h3_submit_rejected")
     task_id = str(task_value).strip()
@@ -3058,13 +3103,14 @@ def _poll_h3(
     headers = {"Authorization": request.autodl_token}
     while True:
         try:
-            _, payload = _query_json_with_retry(
+            response, payload = _query_json_with_retry(
                 request,
                 lambda: client.get(
                     f"{AUTODL_BASE_URL}/api/v1/comfyui/comfyui_workflow/result/{task_id}",
                     headers=headers,
                     timeout=request.timeouts.request_s,
                 ),
+                attempt_id=str(state["attempt_id"]),
                 code="h3_query_failed",
                 step="H3 result query",
                 deadline=deadline,
@@ -3086,7 +3132,20 @@ def _poll_h3(
                 None,
             ) if isinstance(results, list) else None
             if not url:
+                state["h3"]["status"] = "failed"
                 _fail(request, state, "h3_result_missing", retryable=False, keep_task=True)
+                _record_attempt_error(
+                    request,
+                    state.get("attempt_id"),
+                    "result-missing",
+                    call_path=["generation", "h3", "poll", task_id],
+                    reason={
+                        "code": "h3_result_missing",
+                        "provider": error_trace.provider_response(
+                            response, secrets=(request.autodl_token,)
+                        ),
+                    },
+                )
                 raise H3Error("h3_result_missing")
             output_receipt = _download(request, state, client, url)
             state["h3"]["status"] = "succeeded"
@@ -3115,14 +3174,37 @@ def _poll_h3(
                 keep_task=True,
                 provider_diagnostic=diagnostic,
             )
-            error_trace.record(
-                request.workdir / "errors" / "h3-provider.json",
+            _record_attempt_error(
+                request,
+                state.get("attempt_id"),
+                "provider-failed",
                 call_path=["generation", "h3", "poll", task_id],
-                reason={"code": "h3_provider_failed", "provider": diagnostic},
-                logger=log,
-                secrets=(request.autodl_token,),
+                reason={
+                    "code": "h3_provider_failed",
+                    "provider": error_trace.provider_response(
+                        response, secrets=(request.autodl_token,)
+                    ),
+                    "diagnostic": diagnostic,
+                },
+                latest_name="h3-provider.json",
             )
             return _result(state)
+        if provider_status not in {"", "QUEUED", "RUNNING", "PENDING"}:
+            _fail(request, state, "h3_query_failed", retryable=True, keep_task=True)
+            _record_attempt_error(
+                request,
+                state.get("attempt_id"),
+                "unknown-status",
+                call_path=["generation", "h3", "poll", task_id],
+                reason={
+                    "code": "h3_query_failed",
+                    "provider": error_trace.provider_response(
+                        response, secrets=(request.autodl_token,)
+                    ),
+                    "provider_status": provider_status,
+                },
+            )
+            raise H3Error("h3_query_failed", retryable=True)
         if time.monotonic() >= deadline:
             _fail(request, state, "h3_timeout", retryable=True, keep_task=True)
             return _result(state)
@@ -3138,12 +3220,13 @@ def _poll_gateway_h3(
     deadline = time.monotonic() + request.timeouts.h3_poll_s
     while True:
         try:
-            _, payload = _query_json_with_retry(
+            response, payload = _query_json_with_retry(
                 request,
                 lambda: client.get(
                     f"{H3_GATEWAY_BASE_URL}/v1/videos/{task_id}",
                     timeout=request.timeouts.request_s,
                 ),
+                attempt_id=str(state["attempt_id"]),
                 code="h3_query_failed",
                 step="H3 gateway result query",
                 deadline=deadline,
@@ -3179,9 +3262,36 @@ def _poll_gateway_h3(
                 keep_task=True,
                 provider_diagnostic=diagnostic,
             )
+            _record_attempt_error(
+                request,
+                state.get("attempt_id"),
+                "provider-failed",
+                call_path=["generation", "h3", "gateway-poll", task_id],
+                reason={
+                    "code": "h3_provider_failed",
+                    "provider": error_trace.provider_response(
+                        response, secrets=(request.autodl_token,)
+                    ),
+                    "diagnostic": diagnostic,
+                },
+                latest_name="h3-provider.json",
+            )
             return _result(state)
         if provider_status not in {"queued", "running"}:
             _fail(request, state, "h3_query_failed", retryable=True, keep_task=True)
+            _record_attempt_error(
+                request,
+                state.get("attempt_id"),
+                "unknown-status",
+                call_path=["generation", "h3", "gateway-poll", task_id],
+                reason={
+                    "code": "h3_query_failed",
+                    "provider": error_trace.provider_response(
+                        response, secrets=(request.autodl_token,)
+                    ),
+                    "provider_status": provider_status,
+                },
+            )
             raise H3Error("h3_query_failed", retryable=True)
         if time.monotonic() >= deadline:
             _fail(request, state, "h3_timeout", retryable=True, keep_task=True)
@@ -3201,7 +3311,11 @@ def _download(
         receipt = _run_automatic_retry(
             request.timeouts,
             lambda: _download_once(
-                request, client, url, trusted_loopback=trusted_loopback
+                request,
+                client,
+                url,
+                attempt_id=str(state["attempt_id"]),
+                trusted_loopback=trusted_loopback,
             ),
             step="H3 result download",
         )
@@ -3223,14 +3337,31 @@ def _download_once(
     client: httpx.Client,
     url: str,
     *,
+    attempt_id: str,
     trusted_loopback: bool = False,
 ) -> dict[str, Any]:
+    def record(
+        *,
+        error: BaseException | None = None,
+        reason: object | None = None,
+    ) -> None:
+        _record_attempt_error(
+            request,
+            attempt_id,
+            "download",
+            call_path=["generation", "h3", "download"],
+            error=error,
+            reason=reason,
+        )
+
     if not trusted_loopback:
         try:
             public_url = _is_public_https_url(url)
-        except _DNSLookupFailed:
+        except _DNSLookupFailed as exc:
+            record(error=exc)
             _raise_download_error("download_dns_failed", retryable=True)
         if not public_url:
+            record(reason={"code": "download_url_rejected", "url": url})
             _raise_download_error("download_url_rejected", retryable=False)
 
     destination = request.workdir / "generated.mp4"
@@ -3261,11 +3392,23 @@ def _download_once(
                             retryable=False,
                         )
                 if 300 <= response.status_code < 400:
+                    record(reason={
+                        "code": "download_redirect_rejected",
+                        "provider": error_trace.provider_response(
+                            response, secrets=(request.autodl_token,)
+                        ),
+                    })
                     _raise_download_error(
                         "download_redirect_rejected",
                         retryable=False,
                     )
                 if response.status_code != 200:
+                    record(reason={
+                        "code": "download_failed",
+                        "provider": error_trace.provider_response(
+                            response, secrets=(request.autodl_token,)
+                        ),
+                    })
                     _raise_download_error(
                         "download_failed",
                         retryable=True,
@@ -3289,9 +3432,11 @@ def _download_once(
                         _raise_download_error("download_too_large", retryable=False)
                     _write_all(fd, chunk)
                     digest.update(chunk)
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            record(error=exc)
             _raise_download_error("download_failed", retryable=True)
         if size <= 0:
+            record(reason={"code": "download_failed", "reason": "empty_response"})
             _raise_download_error("download_failed", retryable=True)
         os.fsync(fd)
         os.close(fd)
@@ -3300,10 +3445,14 @@ def _download_once(
         def probe_attempt() -> dict[str, Any]:
             try:
                 return _probe_media_timeline(temporary, request.timeouts.probe_s)
-            except _ProbeUnavailable:
+            except _ProbeUnavailable as exc:
+                record(error=exc)
                 raise _AutomaticRetryH3Error(
                     "output_probe_failed", retryable=True
                 ) from None
+            except H3Error as exc:
+                record(error=exc)
+                raise
 
         try:
             media_timeline = _run_automatic_retry(
@@ -3318,10 +3467,12 @@ def _download_once(
                 automatic_retryable=False,
             )
         if request.audio_required and media_timeline.get("audio") is None:
+            record(reason={"code": "output_audio_missing"})
             _raise_download_error("output_audio_missing", retryable=False)
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
-    except OSError:
+    except OSError as exc:
+        record(error=exc)
         raise _AutomaticRetryH3Error("output_write_failed", retryable=True) from None
     finally:
         if fd is not None:
@@ -4245,8 +4396,8 @@ def _pause(seconds: float) -> None:
 def _save_state(request: H3Request, state: Mapping[str, Any]) -> None:
     try:
         _atomic_write_json(_attempt_path(request, str(state["attempt_id"])), state)
-    except OSError:
-        raise H3Error("state_persist_failed") from None
+    except OSError as exc:
+        raise H3Error("state_persist_failed") from exc
 
 
 def _atomic_create_json(path: Path, payload: Mapping[str, Any]) -> None:

@@ -1348,6 +1348,37 @@ def _attempt_path(request: FrozenContextIrRequest, attempt_id: str) -> Path:
     return _attempts_root(request) / attempt_id / "attempt.json"
 
 
+def _record_attempt_error(
+    request: FrozenContextIrRequest,
+    path: Path,
+    event: str,
+    *,
+    call_path: list[str],
+    error: BaseException | None = None,
+    reason: object | None = None,
+) -> None:
+    """Persist every diagnostic without replacing earlier attempt evidence."""
+    directory = path.parent / "errors"
+    sequence = 1
+    while (directory / f"context-ir-{event}-{sequence:06d}.json").exists():
+        sequence += 1
+    destination = directory / f"context-ir-{event}-{sequence:06d}.json"
+    kwargs = {
+        "call_path": [*call_path, f"attempt:{path.parent.name}"],
+        "logger": _LOGGER,
+        "secrets": (request.minimax_api_key,),
+    }
+    if error is not None:
+        kwargs["error"] = error
+    else:
+        kwargs["reason"] = reason
+    error_trace.record(destination, **kwargs)
+    # Retain the established latest-error location for existing support tools.
+    kwargs["logger"] = None
+    kwargs["call_path"] = call_path
+    error_trace.record(path.with_name("error.json"), **kwargs)
+
+
 def _matching_attempt_path(request: FrozenContextIrRequest) -> Path | None:
     attempts = _attempts_root(request)
     if not attempts.is_dir():
@@ -1644,8 +1675,8 @@ def _prepare(request: FrozenContextIrRequest) -> tuple[dict[str, Any], Path]:
 def _persist(path: Path, state: Mapping[str, Any]) -> None:
     try:
         _atomic_write_json(path, state)
-    except OSError:
-        raise ContextIrError("context_ir_state_unavailable") from None
+    except OSError as exc:
+        raise ContextIrError("context_ir_state_unavailable") from exc
 
 
 def _parse_json(response: httpx.Response) -> Mapping[str, Any] | None:
@@ -1753,12 +1784,12 @@ def _upload_references(
                 status="submission_unknown",
                 error="context_ir_submission_unknown",
             )
-            error_trace.record(
-                path.with_name("error.json"),
+            _record_attempt_error(
+                request,
+                path,
+                "upload",
                 call_path=["generation", "context_ir", "upload", str(index + 1)],
                 error=exc,
-                logger=_LOGGER,
-                secrets=(request.minimax_api_key,),
             )
             return False
         payload = _parse_json(response)
@@ -1787,12 +1818,12 @@ def _upload_references(
                     else None
                 ),
             )
-            error_trace.record(
-                path.with_name("error.json"),
+            _record_attempt_error(
+                request,
+                path,
+                "upload",
                 call_path=["generation", "context_ir", "upload", str(index + 1)],
                 reason={"code": error, "provider": error_trace.provider_response(response, secrets=(request.minimax_api_key,))},
-                logger=_LOGGER,
-                secrets=(request.minimax_api_key,),
             )
             return False
         state["references"][index]["file_id"] = file_id
@@ -1843,12 +1874,12 @@ def _submit(
             status="submission_unknown",
             error="context_ir_submission_unknown",
         )
-        error_trace.record(
-            path.with_name("error.json"),
+        _record_attempt_error(
+            request,
+            path,
+            "submit",
             call_path=["generation", "context_ir", "submit"],
             error=exc,
-            logger=_LOGGER,
-            secrets=(request.minimax_api_key,),
         )
         return
     payload = _parse_json(response)
@@ -1878,15 +1909,15 @@ def _submit(
                 http_status=http_status,
                 provider_error_code=provider_error_code,
             )
-        error_trace.record(
-            path.with_name("error.json"),
+        _record_attempt_error(
+            request,
+            path,
+            "submit",
             call_path=["generation", "context_ir", "submit"],
             reason={
                 "code": state["error"],
                 "provider": error_trace.provider_response(response, secrets=(request.minimax_api_key,)),
             },
-            logger=_LOGGER,
-            secrets=(request.minimax_api_key,),
         )
         return
     state["provider_task_id"] = task_id
@@ -1995,6 +2026,7 @@ def _poll_once(
     state: dict[str, Any],
     path: Path,
     client: httpx.Client,
+    last_response: dict[str, object] | None = None,
 ) -> Literal["continue", "stop"]:
     task_id = state.get("provider_task_id")
     if not isinstance(task_id, str) or not task_id:
@@ -2018,12 +2050,12 @@ def _poll_once(
             status="query_unknown",
             error="context_ir_query_unknown",
         )
-        error_trace.record(
-            path.with_name("error.json"),
+        _record_attempt_error(
+            request,
+            path,
+            "poll",
             call_path=["generation", "context_ir", "poll"],
             error=exc,
-            logger=_LOGGER,
-            secrets=(request.minimax_api_key,),
         )
         return "stop"
     if not response.is_success:
@@ -2033,19 +2065,27 @@ def _poll_once(
             status="query_unknown",
             error="context_ir_query_unknown",
         )
-        error_trace.record(
-            path.with_name("error.json"),
+        _record_attempt_error(
+            request,
+            path,
+            "poll",
             call_path=["generation", "context_ir", "poll"],
             reason={
                 "code": "context_ir_query_unknown",
                 "provider": error_trace.provider_response(response, secrets=(request.minimax_api_key,)),
             },
-            logger=_LOGGER,
-            secrets=(request.minimax_api_key,),
         )
         return "stop"
     payload = _parse_json(response)
     task = _task_from_payload(payload)
+    if last_response is not None:
+        last_response.clear()
+        last_response.update(
+            provider=error_trace.provider_response(
+                response, secrets=(request.minimax_api_key,)
+            ),
+            task=task,
+        )
     if task is None:
         _mark_terminal(
             path,
@@ -2053,8 +2093,10 @@ def _poll_once(
             status="query_unknown",
             error="context_ir_query_unknown",
         )
-        error_trace.record(
-            path.with_name("error.json"),
+        _record_attempt_error(
+            request,
+            path,
+            "poll-decode",
             call_path=["generation", "context_ir", "poll", "decode"],
             reason={
                 "code": "context_ir_query_unknown",
@@ -2062,8 +2104,6 @@ def _poll_once(
                     response, secrets=(request.minimax_api_key,)
                 ),
             },
-            logger=_LOGGER,
-            secrets=(request.minimax_api_key,),
         )
         return "stop"
     if task.get("id") != task_id:
@@ -2073,12 +2113,12 @@ def _poll_once(
             status="failed",
             error="context_ir_task_mismatch",
         )
-        error_trace.record(
-            path.with_name("error.json"),
+        _record_attempt_error(
+            request,
+            path,
+            "task-mismatch",
             call_path=["generation", "context_ir", "poll", task_id],
             reason={"code": "context_ir_task_mismatch", "provider_task": task},
-            logger=_LOGGER,
-            secrets=(request.minimax_api_key,),
         )
         return "stop"
     status = task.get("status")
@@ -2089,12 +2129,12 @@ def _poll_once(
             status="query_unknown",
             error="context_ir_unknown_status",
         )
-        error_trace.record(
-            path.with_name("error.json"),
+        _record_attempt_error(
+            request,
+            path,
+            "unknown-status",
             call_path=["generation", "context_ir", "poll", task_id],
             reason={"code": "context_ir_unknown_status", "provider_task": task},
-            logger=_LOGGER,
-            secrets=(request.minimax_api_key,),
         )
         return "stop"
     modality = task.get("modality")
@@ -2108,12 +2148,12 @@ def _poll_once(
             status="failed",
             error="context_ir_result_type_invalid",
         )
-        error_trace.record(
-            path.with_name("error.json"),
+        _record_attempt_error(
+            request,
+            path,
+            "result-type",
             call_path=["generation", "context_ir", "poll", task_id],
             reason={"code": "context_ir_result_type_invalid", "provider_task": task},
-            logger=_LOGGER,
-            secrets=(request.minimax_api_key,),
         )
         return "stop"
     if status in {"queued", "running"}:
@@ -2128,12 +2168,12 @@ def _poll_once(
             status="failed",
             error="context_ir_provider_failed",
         )
-        error_trace.record(
-            path.with_name("error.json"),
+        _record_attempt_error(
+            request,
+            path,
+            "provider-failed",
             call_path=["generation", "context_ir", "poll", task_id],
             reason={"code": "context_ir_provider_failed", "provider_task": task},
-            logger=_LOGGER,
-            secrets=(request.minimax_api_key,),
         )
         return "stop"
     if status == "cancelled":
@@ -2142,6 +2182,19 @@ def _poll_once(
             state,
             status="failed",
             error="context_ir_cancelled",
+        )
+        _record_attempt_error(
+            request,
+            path,
+            "cancelled",
+            call_path=["generation", "context_ir", "poll", task_id],
+            reason={
+                "code": "context_ir_cancelled",
+                "provider": error_trace.provider_response(
+                    response, secrets=(request.minimax_api_key,)
+                ),
+                "provider_task": task,
+            },
         )
         return "stop"
     content = task.get("content")
@@ -2152,6 +2205,40 @@ def _poll_once(
             state,
             status="query_unknown",
             error="context_ir_query_unknown",
+        )
+        _record_attempt_error(
+            request,
+            path,
+            "result-missing",
+            call_path=["generation", "context_ir", "poll", task_id],
+            reason={
+                "code": "context_ir_query_unknown",
+                "provider": error_trace.provider_response(
+                    response, secrets=(request.minimax_api_key,)
+                ),
+                "provider_task": task,
+            },
+        )
+        return "stop"
+    if len(effective_prompt.encode("utf-8")) > MAX_EFFECTIVE_PROMPT_BYTES:
+        _mark_terminal(
+            path,
+            state,
+            status="failed",
+            error="context_ir_result_invalid",
+        )
+        _record_attempt_error(
+            request,
+            path,
+            "result-invalid",
+            call_path=["generation", "context_ir", "poll", task_id],
+            reason={
+                "code": "context_ir_result_invalid",
+                "provider": error_trace.provider_response(
+                    response, secrets=(request.minimax_api_key,)
+                ),
+                "provider_task": task,
+            },
         )
         return "stop"
     _complete(request, state, path, effective_prompt)
@@ -2250,8 +2337,11 @@ def optimize_h3_prompt(
                 state["error"] = None
                 _persist(path, state)
             deadline = time.monotonic() + request.timeouts.poll_total_s
+            last_response: dict[str, object] = {}
             while state["status"] == "polling":
-                outcome = _poll_once(request, state, path, active_client)
+                outcome = _poll_once(
+                    request, state, path, active_client, last_response
+                )
                 if outcome == "stop":
                     break
                 if time.monotonic() >= deadline:
@@ -2260,6 +2350,16 @@ def optimize_h3_prompt(
                         state,
                         status="query_unknown",
                         error="context_ir_poll_timeout",
+                    )
+                    _record_attempt_error(
+                        request,
+                        path,
+                        "poll-timeout",
+                        call_path=["generation", "context_ir", "poll"],
+                        reason={
+                            "code": "context_ir_poll_timeout",
+                            "last_response": last_response,
+                        },
                     )
                     break
                 if request.timeouts.poll_interval_s:

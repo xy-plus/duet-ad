@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app import h3
+from app import h3, h3_project, stitch
 
 
 VOICE_TEXTS = ("第一句台词", "第二句台词")
@@ -98,6 +98,39 @@ def _request(tmp_path: Path, *, request_id: str = "request-1") -> h3.H3Request:
             retry_interval_s=0,
         ),
     )
+
+
+def test_short_native_stitch_preserves_original_failure_trace(
+    tmp_path, monkeypatch,
+):
+    request = _request(tmp_path)
+    original = stitch.StitchError("ffmpeg exited with provider artifact detail")
+    monkeypatch.setattr(h3_project, "_native_segment", lambda **_kwargs: object())
+
+    def fail_stitch(**_kwargs):
+        raise original
+
+    monkeypatch.setattr(stitch, "stitch_video", fail_stitch)
+
+    with pytest.raises(
+        h3_project.ProjectMultimodalError,
+        match="h3_native_stitch_failed",
+    ) as caught:
+        h3_project.stitch_short_native(
+            request=request,
+            result=h3.H3Result("succeeded", "000001"),
+            source_video=tmp_path / "source.mp4",
+            output=tmp_path / "output.mp4",
+            target_duration_s=4,
+        )
+
+    assert caught.value.__cause__ is original
+    trace_path = (
+        request.workdir / "errors" / "attempts" / "000001"
+        / "h3-short-stitch-000001.json"
+    )
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["error"]["message"] == str(original)
 
 
 def _current_fusion_no_audio_request(tmp_path: Path) -> h3.H3Request:
@@ -845,6 +878,13 @@ def test_provider_failure_diagnostic_survives_successful_paid_retry(
     }
     assert "provider-request-1" in caplog.text
     assert "art-secret" not in caplog.text
+    traces = sorted(
+        (request.workdir / "errors" / "attempts" / "000001").glob(
+            "h3-provider-failed-*.json"
+        )
+    )
+    assert len(traces) == 1
+    assert "GPU OOM" in traces[0].read_text(encoding="utf-8")
 
     failed_attempt = _attempt_file(request).read_bytes()
 
@@ -1104,10 +1144,46 @@ def test_non_provider_terminal_states_never_create_automatic_attempt(
         else:
             with pytest.raises(h3.H3Error, match=terminal):
                 h3.start(request, client=client)
+            state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
+            assert state["status"] == "failed"
+            assert state["h3"]["status"] == "failed"
+            traces = sorted(
+                (request.workdir / "errors" / "attempts" / "000001").glob(
+                    "h3-result-missing-*.json"
+                )
+            )
+            assert len(traces) == 1
         assert h3.resume(request, client=client).status != "succeeded"
 
     assert posts == 1
     assert not _attempt_file(request, 2).exists()
+
+
+def test_unknown_provider_status_closes_poll_and_preserves_response(tmp_path):
+    request = _boundary_request(tmp_path)
+
+    def provider(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST":
+            return httpx.Response(200, json={"data": {"task_id": "task-1"}})
+        return httpx.Response(200, json={
+            "request_id": "provider-request-unknown",
+            "data": {"status": "UNRECOGNIZED", "detail": "new provider state"},
+        })
+
+    with _client(provider) as client:
+        with pytest.raises(h3.H3Error, match="h3_query_failed"):
+            h3.start(request, client=client)
+
+    state = json.loads(_attempt_file(request).read_text(encoding="utf-8"))
+    assert state["status"] == "retryable_failure"
+    assert state["h3"]["status"] == "running"
+    traces = sorted(
+        (request.workdir / "errors" / "attempts" / "000001").glob(
+            "h3-unknown-status-*.json"
+        )
+    )
+    assert len(traces) == 1
+    assert "provider-request-unknown" in traces[0].read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -1261,6 +1337,21 @@ def test_reference_long_segment_accepts_integer_provider_ceiling_for_stitch(
         request,
         expected_duration_s=1.133333,
     ) is False
+
+
+def test_reference_one_second_tail_accepts_four_second_provider_floor(
+    tmp_path, monkeypatch,
+):
+    request = replace(_request(tmp_path), duration=4)
+    with _client(HappyProvider()) as client:
+        assert h3.start(request, client=client).status == "succeeded"
+    monkeypatch.setattr(h3, "_probe_video_duration", lambda *_args: 4.0)
+
+    assert h3.output_is_reusable(
+        request,
+        expected_duration_s=1.0,
+        allow_provider_duration_ceiling=True,
+    ) is True
 
 
 def test_succeeded_attempt_with_missing_output_redownloads_by_get_only(tmp_path):
@@ -1698,6 +1789,40 @@ def test_download_rejects_unsafe_urls(tmp_path, url):
         assert h3.resume(request, client=client).status == "failed"
     assert len(provider.h3_posts) == 1
     assert not _attempt_file(request, 2).exists()
+
+
+def test_download_http_failure_preserves_response_in_attempt_trace(tmp_path):
+    request = replace(
+        _request(tmp_path),
+        timeouts=replace(_request(tmp_path).timeouts, retry_count=0),
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/minimax_h3_lightx2v_v5_15s"):
+            return httpx.Response(200, json={"data": {"task_id": "task-download"}})
+        if req.url.path.endswith("/result/task-download"):
+            return httpx.Response(200, json={"data": {
+                "status": "SUCCESS",
+                "results": [{"url": "https://download.invalid/video.mp4"}],
+            }})
+        return _download_response(
+            503,
+            json={"code": "StorageUnavailable", "marker": "download-response"},
+        )
+
+    with _client(handler) as client:
+        with pytest.raises(h3.H3Error, match="download_failed"):
+            h3.start(request, client=client)
+
+    traces = sorted(
+        (request.workdir / "errors" / "attempts" / "000001").glob(
+            "h3-download-*.json"
+        )
+    )
+    assert len(traces) == 1
+    raw = traces[0].read_text(encoding="utf-8")
+    assert '"http_status": 503' in raw
+    assert "download-response" in raw
 
 
 def test_voice_receipt_is_canonical_and_required(tmp_path):

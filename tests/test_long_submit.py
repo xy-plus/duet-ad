@@ -514,6 +514,95 @@ def test_fast_mode_preflight_failure_makes_zero_provider_posts(tmp_path, monkeyp
     assert trace["error"]["message"] == "attempt_claim_failed"
 
 
+def test_long_generation_parameter_mismatch_closes_state_and_records_trace(
+    tmp_path,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, joins=("hard_cut",))
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=True
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        aspect_ratio="16:9",
+        dialogue_mode="auto",
+        generation=generation,
+    )
+
+    long_generation.run(settings, cid, plan)
+
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "submission_unknown"
+    assert stored["error"] == "submission_unknown"
+    trace = json.loads(
+        (
+            settings.data_dir / cid / "work" / "errors"
+            / "long-generation-parameter-mismatch.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert trace["error"]["code"] == "long_generation_parameter_mismatch"
+    assert trace["error"]["aspect_ratio"] == {
+        "expected": "9:16", "actual": "16:9",
+    }
+
+
+def test_fast_worker_base_exception_is_closed_by_daemon_boundary(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
+    cid, receipt = _make_long(settings, joins=("hard_cut",))
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid,
+        storage.load_meta(settings.data_dir, cid),
+        receipt,
+        "none",
+        "auto",
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=True
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        dialogue_mode="auto",
+        generation=generation,
+    )
+
+    class FatalWorker(BaseException):
+        pass
+
+    monkeypatch.setattr(
+        h3, "prepare", lambda _request: h3.H3Result("not_started", "000001")
+    )
+    monkeypatch.setattr(h3, "submit", lambda _request: (_ for _ in ()).throw(
+        FatalWorker("future worker terminated")
+    ))
+
+    long_generation.run(settings, cid, plan)
+
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "submission_unknown"
+    assert stored["segments"][0]["status"] == "submission_unknown"
+    trace = json.loads(
+        (
+            settings.data_dir / cid / "work" / "errors"
+            / "long-generation-daemon.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert trace["error"]["type"] == "FatalWorker"
+    assert trace["error"]["message"] == "future worker terminated"
+
+
 def test_fast_mode_ambiguous_prepared_child_locks_without_posting_siblings(
     tmp_path, monkeypatch,
 ):

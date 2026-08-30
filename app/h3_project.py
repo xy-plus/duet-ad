@@ -14,7 +14,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from app import context_ir_bridge, dialogue_timing, h3, h3_multimodal, stitch
+from app import (
+    context_ir_bridge,
+    dialogue_timing,
+    error_trace,
+    h3,
+    h3_multimodal,
+    stitch,
+)
 
 
 SOURCE_FILENAME = "h3_multimodal_source.json"
@@ -1469,8 +1476,21 @@ def stitch_short_native(
             output=output,
             audio_mode="provider_generated",
         )
-    except (OSError, TypeError, ValueError, stitch.StitchError):
-        _fail("h3_native_stitch_failed")
+    except (OSError, TypeError, ValueError, stitch.StitchError) as exc:
+        attempt_id = result.attempt_id or "unknown"
+        directory = request.workdir / "errors" / "attempts" / attempt_id
+        sequence = 1
+        while (directory / f"h3-short-stitch-{sequence:06d}.json").exists():
+            sequence += 1
+        error_trace.record(
+            directory / f"h3-short-stitch-{sequence:06d}.json",
+            call_path=[
+                "generation", "h3", "short-stitch", f"attempt:{attempt_id}",
+            ],
+            error=exc,
+            secrets=(request.autodl_token,),
+        )
+        raise ProjectMultimodalError("h3_native_stitch_failed") from exc
 
 
 def short_output_is_reusable(

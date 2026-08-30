@@ -1056,6 +1056,95 @@ def test_unknown_or_missing_query_fields_fail_closed(
     assert result.receipt_path is None
 
 
+@pytest.mark.parametrize(
+    ("status", "content", "error", "event"),
+    [
+        ("cancelled", {}, "context_ir_cancelled", "cancelled"),
+        ("succeeded", {}, "context_ir_query_unknown", "result-missing"),
+        (
+            "succeeded",
+            {"prompt": "x" * (context_ir_bridge.MAX_EFFECTIVE_PROMPT_BYTES + 1)},
+            "context_ir_result_invalid",
+            "result-invalid",
+        ),
+    ],
+)
+def test_terminal_context_ir_responses_preserve_attempt_scoped_diagnostic(
+    tmp_path, status, content, error, event,
+):
+    frozen = _frozen(tmp_path)
+    base = _success_handler(frozen)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/query/video_generation/context-task-1":
+            return _response({
+                "task": {
+                    "id": "context-task-1",
+                    "task_type": "h3_context_ir",
+                    "modality": "text",
+                    "status": status,
+                    "content": content,
+                    "provider_marker": f"marker-{event}",
+                },
+            })
+        return base(request)
+
+    with _client(handler) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.error_code == error
+    traces = sorted(
+        (
+            frozen.source_h3_request.workdir
+            / ".context-ir" / "attempts" / "000001" / "errors"
+        ).glob(f"context-ir-{event}-*.json")
+    )
+    assert len(traces) == 1
+    raw = traces[0].read_text(encoding="utf-8")
+    assert f"marker-{event}" in raw
+    assert '"000001"' in raw or "attempt:000001" in raw
+
+
+def test_context_ir_poll_timeout_preserves_last_running_response(tmp_path):
+    frozen = replace(
+        _frozen(tmp_path),
+        timeouts=context_ir_bridge.ContextIrTimeouts(
+            request_s=0.1,
+            poll_total_s=0.001,
+            poll_interval_s=0,
+        ),
+    )
+    base = _success_handler(frozen)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/query/video_generation/context-task-1":
+            return _response({
+                "task": {
+                    "id": "context-task-1",
+                    "task_type": "h3_context_ir",
+                    "modality": "text",
+                    "status": "running",
+                    "content": {},
+                    "provider_marker": "last-running-response",
+                },
+            })
+        return base(request)
+
+    with _client(handler) as client:
+        result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+
+    assert result.status == "query_unknown"
+    assert result.error_code == "context_ir_poll_timeout"
+    traces = sorted(
+        (
+            frozen.source_h3_request.workdir
+            / ".context-ir" / "attempts" / "000001" / "errors"
+        ).glob("context-ir-poll-timeout-*.json")
+    )
+    assert len(traces) == 1
+    assert "last-running-response" in traces[0].read_text(encoding="utf-8")
+
+
 def test_undocumented_video_list_query_shape_is_rejected(tmp_path):
     frozen = _frozen(tmp_path)
     base = _success_handler(frozen)

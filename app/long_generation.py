@@ -3085,7 +3085,7 @@ def _revalidate_speaker_authority(
             ),
         )
     except h3_project.ProjectMultimodalError as exc:
-        raise LongGenerationError(exc.code) from None
+        raise LongGenerationError(exc.code) from exc
 
 
 def _freeze_segment_context_ir(
@@ -3113,7 +3113,7 @@ def _freeze_segment_context_ir(
             poll_interval_s=settings.h3_poll_interval_s,
         )
     except h3_project.ProjectMultimodalError as exc:
-        raise LongGenerationError(exc.code) from None
+        raise LongGenerationError(exc.code) from exc
 
 
 def _optimize_segment_context_ir(
@@ -3139,7 +3139,9 @@ def _optimize_segment_context_ir(
             )
     except (context_ir_bridge.ContextIrError,
             h3_project.ProjectMultimodalError) as exc:
-        raise LongGenerationError(getattr(exc, "code", "context_ir_invalid")) from None
+        raise LongGenerationError(
+            getattr(exc, "code", "context_ir_invalid")
+        ) from exc
     if result.status == "submission_unknown":
         return None, binding, "submission_unknown", "submission_unknown"
     if result.status in {"running", "query_unknown"}:
@@ -3832,7 +3834,9 @@ def stitched_output_is_reusable(
         return False
 
 
-def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
+def _run_unchecked(
+    settings, cid: str, plan: FrozenPlan, *, startup: bool = False
+) -> None:
     """Drive frozen serial chains or fast fan-out; only this coordinator writes meta."""
     meta = storage.load_meta(settings.data_dir, cid)
     if not meta or not isinstance(meta.get("generation"), dict):
@@ -3921,6 +3925,53 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         or meta.get("resolution", h3.H3_DEFAULT_RESOLUTION)
         != plan.resolution
     ):
+        reason = {
+            "code": "long_generation_parameter_mismatch",
+            "parent_id_valid": isinstance(parent_id, str) and bool(parent_id),
+            "fit_mode": {"expected": "none|crop|pad", "actual": fit_mode},
+            "aspect_ratio": {
+                "expected": plan.aspect_ratio,
+                "actual": meta.get("aspect_ratio", h3.H3_DEFAULT_ASPECT_RATIO),
+            },
+            "resolution": {
+                "expected": plan.resolution,
+                "actual": meta.get("resolution", h3.H3_DEFAULT_RESOLUTION),
+            },
+        }
+        error_trace.record(
+            settings.data_dir / cid / "work" / "errors"
+            / "long-generation-parameter-mismatch.json",
+            call_path=["pipeline", "long_generation", "parameters"],
+            reason=reason,
+            logger=_LOGGER,
+        )
+        closed_segments = [
+            {
+                **item,
+                "status": (
+                    item.get("status")
+                    if item.get("status") in {"succeeded", "failed"}
+                    else "submission_unknown"
+                ),
+                "error": (
+                    item.get("error")
+                    if item.get("status") in {"succeeded", "failed"}
+                    else "submission_unknown"
+                ),
+            }
+            for item in generation.get("segments", [])
+            if isinstance(item, dict)
+        ]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            generation={
+                **generation,
+                "segments": closed_segments,
+                "status": "submission_unknown",
+                "error": "submission_unknown",
+            },
+        )
         return
 
     def persist(status: str | None = None, error: str | None = None, stage: str = "h3") -> None:
@@ -4744,3 +4795,52 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
         persist("resume_required", "long_video_resume_required")
     else:
         persist("failed", "long_video_segment_failed")
+
+
+def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
+    """Daemon-safe public boundary: unexpected worker failures close durably."""
+    try:
+        _run_unchecked(settings, cid, plan, startup=startup)
+    except BaseException as exc:
+        error_trace.record(
+            settings.data_dir / cid / "work" / "errors"
+            / "long-generation-daemon.json",
+            call_path=["pipeline", "long_generation", "daemon"],
+            error=exc,
+            logger=_LOGGER,
+        )
+        try:
+            meta = storage.load_meta(settings.data_dir, cid)
+            generation = meta.get("generation") if isinstance(meta, Mapping) else None
+            if not isinstance(generation, dict):
+                return
+            segments = []
+            for item in generation.get("segments", []):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("status") in {"succeeded", "failed"}:
+                    segments.append(item)
+                else:
+                    segments.append({
+                        **item,
+                        "status": "submission_unknown",
+                        "error": "submission_unknown",
+                    })
+            storage.update_meta(
+                settings.data_dir,
+                cid,
+                generation={
+                    **generation,
+                    "segments": segments,
+                    "status": "submission_unknown",
+                    "error": "submission_unknown",
+                },
+            )
+        except BaseException as persist_exc:
+            error_trace.record(
+                settings.data_dir / cid / "work" / "errors"
+                / "long-generation-daemon-persist.json",
+                call_path=["pipeline", "long_generation", "daemon", "persist"],
+                error=persist_exc,
+                logger=_LOGGER,
+            )
