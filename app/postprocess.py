@@ -16,7 +16,7 @@ from pathlib import Path
 
 import cv2
 
-from app import image_optimization, mediakit, seedream, skill_milestone, storage
+from app import error_trace, image_optimization, mediakit, seedream, skill_milestone, storage
 from app.config import Settings
 from app.sanitize import sanitize
 
@@ -2314,9 +2314,21 @@ async def _v4_verify_bootstrap_packs(
             session_dir=cdir,
             skill_bytes=skill_bytes,
         )
-    except Exception:
+    except Exception as exc:
+        error_trace.record(
+            cdir / "work" / "errors" / "postprocess-reference-pack.json",
+            call_path=["postprocess", cid, "reference_pack", label],
+            error=exc,
+            logger=log,
+        )
         raise PostprocessError(409, "image_reference_pack_failed") from None
     if verdict.get("passed") is not True:
+        error_trace.record(
+            cdir / "work" / "errors" / "postprocess-reference-pack.json",
+            call_path=["postprocess", cid, "reference_pack", label],
+            reason={"code": "image_reference_pack_failed", "verdict": verdict},
+            logger=log,
+        )
         raise PostprocessError(409, "image_reference_pack_failed")
     receipt = _semantic_receipt(
         cdir=cdir,
@@ -2508,6 +2520,12 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
         )
         raise
     except Exception as exc:
+        error_trace.record(
+            cdir / "work" / "errors" / f"postprocess-segment-{index}.json",
+            call_path=["postprocess", cid, "segment", str(index)],
+            error=exc,
+            logger=log,
+        )
         detail = exc.detail if isinstance(exc, PostprocessError) else sanitize(str(exc))
         _update_segment(settings, cid, index, status="failed", error=detail)
 
@@ -2560,9 +2578,23 @@ async def _run_v4_task(
             targets = grouped[index]
             _publish_segment(outputs[offset:offset + len(targets)], targets)
             offset += len(targets)
-    except (asyncio.CancelledError, PostprocessError):
+    except asyncio.CancelledError:
+        raise
+    except PostprocessError as exc:
+        error_trace.record(
+            cdir / "work" / "errors" / f"postprocess-{phase}.json",
+            call_path=["postprocess", cid, phase],
+            error=exc,
+            logger=log,
+        )
         raise
     except Exception as exc:
+        error_trace.record(
+            cdir / "work" / "errors" / f"postprocess-{phase}.json",
+            call_path=["postprocess", cid, phase],
+            error=exc,
+            logger=log,
+        )
         log.exception("v4 postprocess failed cid=%s phase=%s", cid, phase)
         raise PostprocessError(502, f"postprocess_{phase}_failed") from exc
 
@@ -2640,12 +2672,24 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         except asyncio.CancelledError:
             raise
         except PostprocessError as exc:
+            error_trace.record(
+                cdir / "work" / "errors" / "postprocess-canvas.json",
+                call_path=["postprocess", cid, "canvas"],
+                error=exc,
+                logger=log,
+            )
             _mark_image_verification_failed(
                 settings, cid, set(grouped),
                 error=exc.detail if isinstance(exc.detail, str) else "image_verification_failed",
             )
             return
-        except Exception:
+        except Exception as exc:
+            error_trace.record(
+                cdir / "work" / "errors" / "postprocess-canvas.json",
+                call_path=["postprocess", cid, "canvas"],
+                error=exc,
+                logger=log,
+            )
             _mark_image_verification_failed(settings, cid, set(grouped))
             return
     if private["version"] == 4 and options["optimize_image"] and runtime_grouped:
@@ -2657,6 +2701,12 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         except asyncio.CancelledError:
             raise
         except PostprocessError as exc:
+            error_trace.record(
+                cdir / "work" / "errors" / "postprocess-v4.json",
+                call_path=["postprocess", cid, "v4"],
+                error=exc,
+                logger=log,
+            )
             _mark_image_verification_failed(
                 settings, cid, set(grouped),
                 error=exc.detail if isinstance(exc.detail, str) else "image_verification_failed",
@@ -2666,7 +2716,13 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
                 lambda _meta, post: post.update(error=exc.detail),
             )
             return
-        except Exception:
+        except Exception as exc:
+            error_trace.record(
+                cdir / "work" / "errors" / "postprocess-v4.json",
+                call_path=["postprocess", cid, "v4"],
+                error=exc,
+                logger=log,
+            )
             _mark_image_verification_failed(settings, cid, set(grouped))
             return
         def finalize_v4(_meta: dict, post: dict) -> None:
@@ -2731,7 +2787,13 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
                         settings, cid, index, status="done", stage="done",
                         completed_frames=len(targets), error=None,
                     )
-            except Exception:
+            except Exception as exc:
+                error_trace.record(
+                    cdir / "work" / "errors" / "postprocess-publish.json",
+                    call_path=["postprocess", cid, "publish"],
+                    error=exc,
+                    logger=log,
+                )
                 _mark_image_verification_failed(settings, cid, set(unpublished))
                 return
 

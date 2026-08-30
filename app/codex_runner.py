@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -30,6 +31,11 @@ import time
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, TypeVar
+
+from app import error_trace
+
+
+_LOGGER = logging.getLogger(__name__)
 
 # 调用级固定 medium：流水线看图/听写任务要速度不要 max 深度（实测 max 下段任务 30 分钟超时 vs medium 410s）；用户交互式 codex 的全局 effort 不受影响
 _SANDBOX_CONFIGS = [
@@ -51,7 +57,7 @@ _T = TypeVar("_T")
 # 隔离任务仍经由公开 run() 进入同一并发/超时/env 清洗路径；ContextVar 只把本次同步调用
 # 标为独立 stage，使 build_argv() 加上外层 bwrap。线程间不共享，普通视觉 run() 不会误继承。
 _ACTIVE_ISOLATED_STAGE: ContextVar[
-    tuple[int, Path, Path, tuple[Path, ...]] | None
+    tuple[int, Path, Path, tuple[Path, ...], Path | None] | None
 ] = ContextVar(
     "active_isolated_stage", default=None
 )
@@ -75,6 +81,19 @@ def clean_stderr(text: str | None, limit: int = 500) -> str:
         return ""
     lines = [l for l in text.splitlines() if not _ENV_LINE_RE.match(l.strip())]
     return "\n".join(lines).strip()[-limit:]
+
+
+def _output_candidates(raw: bytes) -> tuple[bytes, ...]:
+    """Normalize only transport wrappers; semantic JSON stays model-owned."""
+    stripped = raw.strip()
+    candidates = [stripped]
+    if stripped.startswith(b"```") and stripped.endswith(b"```"):
+        first_newline = stripped.find(b"\n")
+        if first_newline >= 0:
+            fenced = stripped[first_newline + 1:-3].strip()
+            if fenced and fenced not in candidates:
+                candidates.append(fenced)
+    return tuple(candidates)
 
 
 def _scrubbed_env() -> dict[str, str]:
@@ -270,7 +289,7 @@ class CodexRunner:
         active = _ACTIVE_ISOLATED_STAGE.get()
         isolated_stage: tuple[Path, Path, tuple[Path, ...]] | None = None
         if active is not None and active[0] == id(self):
-            isolated_stage = (active[1], active[2], active[3])
+            isolated_stage = (active[1], active[2], active[3], active[4])
             try:
                 actual = Path(workdir).resolve(strict=True)
             except OSError:
@@ -286,7 +305,9 @@ class CodexRunner:
             "--ephemeral",
             "--color", "never",
             "-o",
-            "/dev/null"
+            str(isolated_stage[3])
+            if isolated_stage is not None and isolated_stage[3] is not None
+            else "/dev/null"
             if isolated_stage is not None
             else str(workdir / "codex_last_message.txt"),
         ]
@@ -346,7 +367,7 @@ class CodexRunner:
         if not session.is_dir():
             raise CodexError("isolated session path is invalid")
         writable = _isolated_writable_paths(stage, writable_paths)
-        token = _ACTIVE_ISOLATED_STAGE.set((id(self), stage, session, writable))
+        token = _ACTIVE_ISOLATED_STAGE.set((id(self), stage, session, writable, None))
         try:
             self.run(stage, prompt)
         finally:
@@ -383,6 +404,7 @@ class CodexRunner:
         _resolve_bwrap()
         parent_fd = -1
         placeholder_fd = -1
+        final_output_fd = -1
         try:
             tmp_root = Path("/tmp").resolve(strict=True)
             stage = Path(workdir).resolve(strict=True)
@@ -415,7 +437,18 @@ class CodexRunner:
             )
             initial = os.fstat(placeholder_fd)
             declared = Path(requested).resolve(strict=True)
+            final_output = parent / ".codex-final-output.json"
+            final_output_fd = os.open(
+                final_output.name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            final_initial = os.fstat(final_output_fd)
+            final_output = final_output.resolve(strict=True)
         except OSError:
+            if final_output_fd >= 0:
+                os.close(final_output_fd)
             if placeholder_fd >= 0:
                 os.close(placeholder_fd)
             if parent_fd >= 0:
@@ -423,13 +456,16 @@ class CodexRunner:
             raise CodexError("isolated output placeholder could not be created") from None
 
         try:
-            writable = _isolated_writable_paths(stage, (declared,))
-            token = _ACTIVE_ISOLATED_STAGE.set((id(self), stage, session, writable))
+            writable = _isolated_writable_paths(stage, (declared, final_output))
+            token = _ACTIVE_ISOLATED_STAGE.set(
+                (id(self), stage, session, writable, final_output)
+            )
             try:
                 argv = self.build_argv(stage, prompt)
             finally:
                 _ACTIVE_ISOLATED_STAGE.reset(token)
         except BaseException:
+            os.close(final_output_fd)
             os.close(placeholder_fd)
             os.close(parent_fd)
             raise
@@ -437,11 +473,14 @@ class CodexRunner:
         missing = object()
 
         def read_once(
-            *, allow_initial_inode: bool,
+            name: str,
+            initial_stat: os.stat_result,
+            *,
+            allow_initial_inode: bool,
         ) -> tuple[tuple[int, int, int, int], bytes] | None:
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             try:
-                fd = os.open(requested.name, flags, dir_fd=parent_fd)
+                fd = os.open(name, flags, dir_fd=parent_fd)
             except OSError:
                 return None
             try:
@@ -451,7 +490,7 @@ class CodexRunner:
                     or (
                         not allow_initial_inode
                         and (info.st_dev, info.st_ino)
-                        == (initial.st_dev, initial.st_ino)
+                        == (initial_stat.st_dev, initial_stat.st_ino)
                     )
                     or info.st_size <= 0
                     or info.st_size > max_output_bytes
@@ -471,21 +510,32 @@ class CodexRunner:
             finally:
                 os.close(fd)
 
-        def read_published(*, allow_initial_inode: bool = False) -> _T | object:
-            first = read_once(allow_initial_inode=allow_initial_inode)
+        def read_published(
+            name: str = requested.name,
+            initial_stat: os.stat_result = initial,
+            *,
+            allow_initial_inode: bool = False,
+        ) -> _T | object:
+            first = read_once(
+                name, initial_stat, allow_initial_inode=allow_initial_inode,
+            )
             if first is None:
                 return missing
             time.sleep(0.1)
-            second = read_once(allow_initial_inode=allow_initial_inode)
+            second = read_once(
+                name, initial_stat, allow_initial_inode=allow_initial_inode,
+            )
             if second is None or first != second:
                 return missing
-            try:
-                value = validate_output(first[1])
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return missing
-            if value is None:
-                raise CodexError("isolated output validator returned None")
-            return value
+            for candidate in _output_candidates(first[1]):
+                try:
+                    value = validate_output(candidate)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if value is None:
+                    raise CodexError("isolated output validator returned None")
+                return value
+            return missing
 
         try:
             with self._sem, tempfile.TemporaryFile(mode="w+b") as stderr_file:
@@ -529,6 +579,13 @@ class CodexRunner:
                             adopted = read_published(allow_initial_inode=True)
                             if adopted is not missing:
                                 return adopted
+                            adopted = read_published(
+                                final_output.name,
+                                final_initial,
+                                allow_initial_inode=True,
+                            )
+                            if adopted is not missing:
+                                return adopted
                             raise CodexError(
                                 "codex exited without publishing valid output: "
                                 f"{clean_stderr(stderr)}",
@@ -542,7 +599,16 @@ class CodexRunner:
                 finally:
                     if not process_group_stopped:
                         _terminate_process_group(proc)
+        except BaseException as exc:
+            error_trace.record(
+                session / "work" / "errors" / f"{stage.name}.json",
+                call_path=["pipeline", "codex", stage.name, requested.name],
+                error=exc,
+                logger=_LOGGER,
+            )
+            raise
         finally:
+            os.close(final_output_fd)
             os.close(placeholder_fd)
             os.close(parent_fd)
 

@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from app import image_optimization
+from app.codex_runner import CodexError
 from conftest import make_settings
 
 
@@ -189,6 +190,41 @@ class _Runner:
         )
 
 
+class _PhaseRetryRunner(_Runner):
+    def __init__(self, output: object, *, failed_segment: int) -> None:
+        super().__init__(output)
+        self.failed_segment = failed_segment
+        self.failures = 0
+
+    def run_isolated_until_output(
+        self, workdir, prompt, *, session_dir, output_path,
+        max_output_bytes, validate_output,
+    ):
+        root = Path(workdir)
+        request = json.loads(
+            (root / "work" / "request.json").read_text(encoding="utf-8")
+        )
+        self.calls.append({"request": request, "session_dir": Path(session_dir)})
+        if (
+            request["phase"] == "segment_frames"
+            and request["segment"]["index"] == self.failed_segment
+            and self.failures == 0
+        ):
+            self.failures += 1
+            raise CodexError("transient segment failure", retryable=True)
+        output = self.output(request) if callable(self.output) else self.output
+        if request["phase"] == "global_plan":
+            output = {
+                key: output.get(key, {})
+                for key in ("people", "entities", "scenes", "relations")
+            }
+        else:
+            output = {"frames": output.get("frames", {})}
+        raw = json.dumps(output, ensure_ascii=False).encode("utf-8")
+        assert len(raw) <= max_output_bytes
+        return validate_output(raw)
+
+
 class _ParallelRunner(_Runner):
     def __init__(self, output: object, segment_count: int) -> None:
         super().__init__(output)
@@ -314,7 +350,7 @@ def test_skill_requires_slot_coverage_key_reuse_and_backend_owned_publication():
         "文件校验和正式发布由后端负责",
     ):
         assert required in skill
-    assert "唯一目标文件" in skill
+    assert "最终回答只返回" in skill
 
 
 def test_skill_matches_runtime_semantic_enum_boundary_and_stays_short():
@@ -2498,6 +2534,35 @@ def test_two_phase_semantics_are_mechanically_canonicalized_per_frame(tmp_path):
     assert set(prompts) == {1, 2}
     assert set(prompts[1]) == {1}
     assert set(prompts[2]) == {1}
+
+
+def test_two_phase_retry_repeats_only_the_failed_segment(tmp_path):
+    session = tmp_path / "session"
+    runner = _PhaseRetryRunner(_semantic_output, failed_segment=2)
+    segments = _transition_skeleton(_segments(session, indices=[1, 2]))
+    skill, _example = _skill_contract()
+
+    plan, prompts = image_optimization.generate_project_prompts(
+        runner,
+        segments,
+        "independent_parallel",
+        session_dir=session,
+        skill_bytes=skill.encode("utf-8"),
+        phase_retry_count=1,
+        phase_retry_interval_s=0,
+    )
+
+    phases = [call["request"]["phase"] for call in runner.calls]
+    segment_indices = [
+        call["request"]["segment"]["index"]
+        for call in runner.calls
+        if call["request"]["phase"] == "segment_frames"
+    ]
+    assert phases.count("global_plan") == 1
+    assert segment_indices.count(1) == 1
+    assert segment_indices.count(2) == 2
+    assert plan["version"] == 4
+    assert set(prompts) == {1, 2}
 
 
 def test_generate_project_prompts_rejects_v4_without_backend_transition_skeleton(tmp_path):

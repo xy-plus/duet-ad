@@ -44,7 +44,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app import asr, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
+from app import asr, error_trace, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -317,7 +317,13 @@ def reconcile_stale_pipeline(settings: Settings, cid: str, owner: object) -> Non
             if has_prepared
             else _recover_long_plan(cdir, meta, settings)
         )
-    except Exception:
+    except Exception as exc:
+        error_trace.record(
+            cdir / "work" / "errors" / "pipeline-stale-recovery.json",
+            call_path=["pipeline", cid, "stale_recovery"],
+            error=exc,
+            logger=log,
+        )
         changes = {"status": "failed", "error": "input_recovery_required"}
     storage.finish_input_claim(settings.data_dir, cid, owner, **changes)
 H3_BOUNDARY_WORKFLOW = "minimax_h3_lightx2v"
@@ -555,8 +561,8 @@ def _project_index_codex_prompt(cdir: Path) -> str:
         "严格执行当前目录 SKILL.md（该文档只读，禁止修改）。"
         "本次仅执行 phase=\"project_index\"：只读取 "
         "work/project_index_request.json 及其中列出的冻结关键帧，"
-        "只将完整、可解析的 JSON 写入 work/element_index.json；"
-        "不要读取或生成 prompt.txt。文件校验与正式发布由后端负责。\n\n"
+        "不要读取或生成 prompt.txt；最终回答只返回完整 JSON object，"
+        "不加解释或其他文本。后端负责捕获、校验和发布。\n\n"
         + _hard_rules()
         + "\n"
     )
@@ -1149,8 +1155,6 @@ def _generate_image_optimization_project(
         element_index_path = _generate_project_element_index(
             runner, session_dir, frame_paths, skill_bytes=video_skill_bytes,
         )
-    policy = _retry_policy(settings)
-
     def attempt() -> tuple[dict | None, dict]:
         try:
             kwargs = {
@@ -1163,25 +1167,26 @@ def _generate_image_optimization_project(
                 segments,
                 settings.seedream_edit_mode,
                 skill_bytes=skill_bytes,
+                phase_retry_count=settings.retry_count,
+                phase_retry_interval_s=settings.retry_interval_s,
                 **kwargs,
             )
         except image_optimization.ImageOptimizationOutputError as exc:
             raise PipelineError(str(exc), retryable=True) from None
         except ValueError:
             raise
-        except Exception:
+        except CodexError as exc:
+            raise PipelineError(str(exc), retryable=False) from None
+        except Exception as exc:
+            _LOGGER.exception("image optimization planner failed")
             raise PipelineError(
-                "image optimization planner unavailable", retryable=True,
+                f"image optimization planner failed: {type(exc).__name__}",
+                retryable=False,
             ) from None
 
-    # There is exactly one compiler.  Operational retries repeat the same
-    # frozen request; they never switch to a second prompt-generation scheme.
-    return run_with_retry(
-        attempt,
-        policy=policy,
-        is_retryable=_retryable_operation_error,
-        on_retry=_retry_logger(step, policy),
-    )
+    # There is exactly one compiler.  Operational retries happen inside the
+    # failed global/segment phase so completed sibling phases are not repeated.
+    return attempt()
 
 
 def _generate_segmented_image_prompts(
@@ -3114,8 +3119,8 @@ def produce_prompt_fusion(
                     )
             fusion_prompt = (
                 "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json "
-                "及其中 SHA 绑定的有序图片；将完整、可解析的 JSON 写入 "
-                "work/h3_prompt_plan.json 后立即退出，文件校验与正式发布由后端负责。"
+                "及其中 SHA 绑定的有序图片；最终回答只返回规定的完整 JSON "
+                "object，不加解释或其他文本。后端负责捕获、校验和发布。"
             )
             if hasattr(runner, "run_isolated_until_output"):
                 raw_output_data = runner.run_isolated_until_output(
@@ -3630,6 +3635,12 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                 settings.data_dir, cid, claim_owner, **changes
             )
     except Exception as e:
+        error_trace.record(
+            work / "errors" / "pipeline.json",
+            call_path=["pipeline", cid],
+            error=e,
+            logger=_LOGGER,
+        )
         if claim_owner is not None:
             storage.finish_input_claim(
                 settings.data_dir, cid, claim_owner,

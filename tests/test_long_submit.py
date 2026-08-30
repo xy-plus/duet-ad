@@ -498,6 +498,20 @@ def test_fast_mode_preflight_failure_makes_zero_provider_posts(tmp_path, monkeyp
     assert posts == []
     stored = storage.load_meta(settings.data_dir, cid)["generation"]
     assert stored["status"] == "failed"
+    trace = json.loads(
+        (
+            settings.data_dir
+            / cid
+            / "work"
+            / "errors"
+            / "long-generation-fast-prepare-segment-2.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert trace["call_path"] == [
+        "pipeline", "long_generation", "fast-prepare", "segment:2",
+    ]
+    assert trace["error"]["type"] == "H3Error"
+    assert trace["error"]["message"] == "attempt_claim_failed"
 
 
 def test_fast_mode_ambiguous_prepared_child_locks_without_posting_siblings(
@@ -1659,6 +1673,90 @@ def test_finalize_exception_auto_continues_done_fusion_without_new_producer(
     assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
         "status"
     ] == "done"
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert recovered["_input_owner"] == owner
+    assert recovered["_prompt_fusion"]["continuation_failures"] == 1
+    trace = json.loads(
+        (
+            settings.data_dir
+            / cid
+            / "work"
+            / "errors"
+            / "prompt-fusion-continue.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert trace["schema"] == "duet.error-call-tree"
+    assert trace["call_path"] == ["pipeline", "prompt_fusion", "continue"]
+    assert trace["error"]["type"] == "OSError"
+    assert trace["error"]["message"] == "transient local finalize error"
+
+
+def test_persistent_finalize_exception_exhausts_retry_budget_and_stops_owner(
+    tmp_path, monkeypatch,
+):
+    settings = replace(make_settings(tmp_path), retry_count=2)
+    cid, owner = _make_prompt_fusion_claim(
+        settings, status="done", error=None
+    )
+    continuation_calls = []
+    scheduled = []
+
+    def fail_continuation(_settings, received_cid, received_owner):
+        continuation_calls.append((received_cid, received_owner))
+        raise RuntimeError("persistent local continuation error")
+
+    def schedule(*args):
+        scheduled.append(args[1])
+        main_module._produce_prompt_fusion_and_continue(*args)
+
+    monkeypatch.setattr(
+        pipeline,
+        "produce_prompt_fusion",
+        lambda *_args, **_kwargs: pytest.fail("done Fusion must be reused"),
+    )
+    monkeypatch.setattr(
+        main_module, "_continue_after_prompt_fusion", fail_continuation
+    )
+    monkeypatch.setattr(
+        main_module, "_schedule_prompt_fusion_continuation", schedule
+    )
+
+    main_module._produce_prompt_fusion_and_continue(
+        settings, cid, object(), owner
+    )
+
+    assert scheduled == [cid] * settings.retry_count
+    assert continuation_calls == [
+        (cid, owner)
+    ] * (settings.retry_count + 1)
+    failed = storage.load_meta(settings.data_dir, cid)
+    assert failed["_input_owner"] == owner
+    assert failed["_prompt_fusion"]["status"] == "failed"
+    assert (
+        failed["_prompt_fusion"]["error"]
+        == "prompt_fusion_continuation_failed"
+    )
+    assert (
+        failed["_prompt_fusion"]["continuation_failures"]
+        == settings.retry_count + 1
+    )
+    main_module._produce_prompt_fusion_and_continue(
+        settings, cid, object(), owner
+    )
+    assert scheduled == [cid] * settings.retry_count
+    assert len(continuation_calls) == settings.retry_count + 1
+    trace = json.loads(
+        (
+            settings.data_dir
+            / cid
+            / "work"
+            / "errors"
+            / "prompt-fusion-continue.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert trace["call_path"] == ["pipeline", "prompt_fusion", "continue"]
+    assert trace["error"]["type"] == "RuntimeError"
+    assert trace["error"]["message"] == "persistent local continuation error"
 
 
 def test_prompt_fusion_refresh_is_one_202_operation_without_second_submit_job(

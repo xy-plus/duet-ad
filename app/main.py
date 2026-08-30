@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import re
@@ -21,6 +22,7 @@ from app import (
     context_ir_bridge,
     dialogue_delivery,
     downloader,
+    error_trace,
     frame_fit,
     h3,
     h3_project,
@@ -71,6 +73,7 @@ _GENERATED_VIDEO_VALIDATION_CACHE_SIZE = 256
 _PROMPT_FUSION_CONTINUATION_INTERVAL_S = 1.0
 _PROMPT_FUSION_TIMER_LOCK = threading.Lock()
 _PROMPT_FUSION_TIMERS: dict[tuple[str, str, str, str], threading.Timer] = {}
+_LOGGER = logging.getLogger(__name__)
 
 
 def _short_provider_failure_is_recoverable(generation: object) -> bool:
@@ -2556,7 +2559,14 @@ def _resume_generation(settings: Settings, cid: str) -> None:
             _mark_submission_unknown(settings, cid, generation)
         else:
             _generation_error(settings, cid, request, exc.code)
-    except Exception:
+    except Exception as exc:
+        error_trace.record(
+            settings.data_dir / cid / "work" / "errors" / "generation-resume.json",
+            call_path=["startup", "generation", "resume"],
+            error=exc,
+            logger=_LOGGER,
+            secrets=(settings.autodl_art_token, settings.minimax_api_key),
+        )
         if request is not None:
             _generation_error(settings, cid, request, "h3_internal_error")
         else:
@@ -2597,7 +2607,14 @@ def _resume_long_generation(settings: Settings, cid: str) -> None:
             prepare_fit=False,
             settings=settings,
         )
-    except Exception:
+    except Exception as exc:
+        error_trace.record(
+            settings.data_dir / cid / "work" / "errors" / "long-generation-resume.json",
+            call_path=["startup", "long_generation", "freeze_plan"],
+            error=exc,
+            logger=_LOGGER,
+            secrets=(settings.autodl_art_token, settings.minimax_api_key),
+        )
         storage.update_meta(
             settings.data_dir, cid,
             generation={**generation, "status": "submission_unknown",
@@ -2909,6 +2926,75 @@ def _prompt_fusion_failure_is_retryable(state: object) -> bool:
     )
 
 
+def _fail_prompt_fusion_continuation(
+    settings: Settings,
+    cid: str,
+    owner: object,
+    exc: BaseException,
+    *,
+    phase: str,
+) -> bool:
+    """Record a local failure; retry the owner only within the existing budget."""
+    error_trace.record(
+        settings.data_dir / cid / "work" / "errors" / f"prompt-fusion-{phase}.json",
+        call_path=["pipeline", "prompt_fusion", phase],
+        error=exc,
+        logger=_LOGGER,
+    )
+
+    retry: dict[str, bool] = {}
+
+    def fail(current: dict) -> None:
+        if current.get("_input_owner") != owner:
+            return
+        state = current.get("_prompt_fusion")
+        if isinstance(state, Mapping):
+            failures = state.get("continuation_failures", 0)
+            if isinstance(failures, bool) or not isinstance(failures, int):
+                failures = 0
+            failures += 1
+            if failures <= settings.retry_count:
+                current["_prompt_fusion"] = {
+                    **state,
+                    "continuation_failures": failures,
+                }
+                retry["value"] = True
+                return
+            current["_prompt_fusion"] = {
+                **state,
+                "status": "failed",
+                "error": "prompt_fusion_continuation_failed",
+                "continuation_failures": failures,
+            }
+        else:
+            failures = current.get("_prompt_fusion_continuation_failures", 0)
+            if isinstance(failures, bool) or not isinstance(failures, int):
+                failures = 0
+            failures += 1
+            current["_prompt_fusion_continuation_failures"] = failures
+            if failures <= settings.retry_count:
+                retry["value"] = True
+                return
+            current["_prompt_fusion"] = {
+                "version": long_generation.PROMPT_FUSION_VERSION,
+                "status": "failed",
+                "error": "prompt_fusion_continuation_failed",
+                "continuation_failures": failures,
+            }
+        generation = current.get("generation")
+        if isinstance(generation, Mapping) and generation.get("status") in {
+            "queued", "running",
+        }:
+            current["generation"] = {
+                **generation,
+                "status": "failed",
+                "error": "prompt_fusion_continuation_failed",
+            }
+
+    storage.mutate_meta(settings.data_dir, cid, fail)
+    return bool(retry.get("value"))
+
+
 def _prompt_fusion_continuation_step(
     settings: Settings, cid: str, runner, owner: object,
 ) -> bool:
@@ -2935,10 +3021,10 @@ def _prompt_fusion_continuation_step(
                 "prompt_fusion_failed",
             }:
                 return False
-        except Exception:
-            # This is still the same local, receipt-bound operation. Preserve
-            # its owner and retry locally; no provider boundary has been hit.
-            return True
+        except Exception as exc:
+            return _fail_prompt_fusion_continuation(
+                settings, cid, owner, exc, phase="finalize"
+            )
         meta = storage.load_submission_claim(settings.data_dir, cid, owner)
         if meta is None:
             return False
@@ -2987,10 +3073,10 @@ def _prompt_fusion_continuation_step(
         return False
     try:
         completed = _continue_after_prompt_fusion(settings, cid, owner)
-    except Exception:
-        # Finalization is local and receipt-bound. Keep polling this exact
-        # owner; never make a second Fusion invocation or provider operation.
-        return True
+    except Exception as exc:
+        return _fail_prompt_fusion_continuation(
+            settings, cid, owner, exc, phase="continue"
+        )
     if completed:
         return False
     current = storage.load_submission_claim(settings.data_dir, cid, owner)

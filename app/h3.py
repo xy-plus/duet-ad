@@ -34,7 +34,7 @@ import httpx
 
 from app.retry import RetryPolicy, run_with_retry
 from app.sanitize import sanitize
-from app import dialogue_timing, storage, voice
+from app import dialogue_timing, error_trace, storage, voice
 
 
 SCHEMA_VERSION = 1
@@ -2893,9 +2893,28 @@ def _query_json_with_retry(
     def attempt() -> tuple[httpx.Response, dict[str, Any]]:
         try:
             response = operation()
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            error_trace.record(
+                request.workdir / "errors" / f"h3-{step}-query.json",
+                call_path=["generation", "h3", step, "GET"],
+                error=exc,
+                logger=log,
+                secrets=(request.autodl_token,),
+            )
             raise _AutomaticRetryH3Error(code, retryable=True) from None
         if response.status_code != 200:
+            error_trace.record(
+                request.workdir / "errors" / f"h3-{step}-query.json",
+                call_path=["generation", "h3", step, "GET"],
+                reason={
+                    "code": code,
+                    "provider": error_trace.provider_response(
+                        response, secrets=(request.autodl_token,)
+                    ),
+                },
+                logger=log,
+                secrets=(request.autodl_token,),
+            )
             error_type = (
                 _AutomaticRetryH3Error
                 if _retryable_http_status(response.status_code)
@@ -2904,7 +2923,22 @@ def _query_json_with_retry(
             raise error_type(code, retryable=True)
         try:
             payload = _response_json(response)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
+            error_trace.record(
+                request.workdir / "errors" / f"h3-{step}-query.json",
+                call_path=["generation", "h3", step, "decode"],
+                reason={
+                    "code": code,
+                    "exception": error_trace.exception_tree(
+                        exc, secrets=(request.autodl_token,)
+                    ),
+                    "provider": error_trace.provider_response(
+                        response, secrets=(request.autodl_token,)
+                    ),
+                },
+                logger=log,
+                secrets=(request.autodl_token,),
+            )
             raise _AutomaticRetryH3Error(code, retryable=True) from None
         return response, payload
 
@@ -2938,8 +2972,15 @@ def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) 
             timeout=request.timeouts.request_s,
         )
         payload = _response_json(response)
-    except (httpx.HTTPError, ValueError, TypeError):
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
         _submission_unknown(request, state, "h3")
+        error_trace.record(
+            request.workdir / "errors" / "h3-submit.json",
+            call_path=["generation", "h3", "submit"],
+            error=exc,
+            logger=log,
+            secrets=(request.autodl_token,),
+        )
         raise H3Error("submission_unknown") from None
     data = payload.get("data")
     task_value = payload.get("task_id") if use_gateway else (
@@ -2973,6 +3014,16 @@ def _submit_h3(request: H3Request, state: dict[str, Any], client: httpx.Client) 
             "h3_submit_rejected",
             retryable=False,
             gateway_diagnostic=gateway_diagnostic,
+        )
+        error_trace.record(
+            request.workdir / "errors" / "h3-submit.json",
+            call_path=["generation", "h3", "submit"],
+            reason={
+                "code": "h3_submit_rejected",
+                "provider": error_trace.provider_response(response, secrets=(request.autodl_token,)),
+            },
+            logger=log,
+            secrets=(request.autodl_token,),
         )
         raise H3Error("h3_submit_rejected")
     task_id = str(task_value).strip()
@@ -3063,6 +3114,13 @@ def _poll_h3(
                 retryable=False,
                 keep_task=True,
                 provider_diagnostic=diagnostic,
+            )
+            error_trace.record(
+                request.workdir / "errors" / "h3-provider.json",
+                call_path=["generation", "h3", "poll", task_id],
+                reason={"code": "h3_provider_failed", "provider": diagnostic},
+                logger=log,
+                secrets=(request.autodl_token,),
             )
             return _result(state)
         if time.monotonic() >= deadline:

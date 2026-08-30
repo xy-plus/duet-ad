@@ -484,6 +484,11 @@ def test_post_timeout_without_identifier_is_terminal_and_never_resubmits(tmp_pat
     assert json.loads(receipt.read_text())["status"] == "submission_unknown"
     assert adapter.submit_calls == 1
     assert adapter.get_calls == adapter.download_calls == 0
+    diagnostic = json.loads(
+        (root / "work/masks/0001.attempt.json.error.json").read_text()
+    )
+    assert diagnostic["call_path"] == ["image_masks", "provider", "submit"]
+    assert diagnostic["error"]["type"] == "TimeoutError"
 
 
 def test_accepted_task_recovers_with_get_only(tmp_path):
@@ -540,6 +545,11 @@ def test_accepted_get_timeout_remains_get_only_and_retryable(tmp_path):
     assert result.path.is_file()
     assert adapter.submit_calls == 1
     assert adapter.get_calls == 2
+    diagnostic = json.loads(
+        (root / "work/masks/0001.attempt.json.error.json").read_text()
+    )
+    assert diagnostic["call_path"] == ["image_masks", "provider", "get"]
+    assert diagnostic["error"]["type"] == "TimeoutError"
 
 
 def test_uncertain_submission_with_task_id_switches_to_get_not_post(tmp_path):
@@ -663,6 +673,11 @@ def test_response_received_receipt_recovers_download_without_post(tmp_path):
     with pytest.raises(image_masks.MaskError) as raised:
         _generate(root, adapter)
     assert raised.value.code == "mask_download_failed"
+    diagnostic = json.loads(
+        (root / "work/masks/0001.attempt.json.error.json").read_text()
+    )
+    assert diagnostic["call_path"] == ["image_masks", "provider", "download"]
+    assert diagnostic["error"]["type"] == "TimeoutError"
 
     adapter.download = original_download
     result = _generate(root, adapter)

@@ -1446,6 +1446,11 @@ def test_v4_postprocess_preserves_the_failing_technical_phase(tmp_path, monkeypa
             skill_bytes=b"skill",
         ))
     assert raised.value.detail == "postprocess_layout_anchor_failed"
+    diagnostic = json.loads(
+        (cdir / "work/errors/postprocess-layout_anchor.json").read_text()
+    )
+    assert diagnostic["call_path"] == ["postprocess", "cid", "layout_anchor"]
+    assert diagnostic["error"]["type"] == "RuntimeError"
 
 
 def test_v4_every_segment_anchor_reuses_the_same_composite_board_path(tmp_path):

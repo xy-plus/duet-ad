@@ -2118,6 +2118,41 @@ class TestCodexRunner:
                 validate_output=lambda raw: json.loads(raw.decode("utf-8")),
             ) == {"ok": True}
 
+    def test_isolated_final_answer_is_adopted_after_clean_exit(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="duet-output-final-answer-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            work.mkdir()
+            output = work / "result.json"
+            runner = CodexRunner(timeout_s=3, concurrency=1)
+            monkeypatch.setattr(
+                runner,
+                "build_argv",
+                lambda _workdir, _prompt: [
+                    "/usr/bin/bash", "-c",
+                    f"printf '```json\\n{{\"ok\":true}}\\n```' > "
+                    f"'{work / '.codex-final-output.json'}'",
+                ],
+            )
+
+            assert runner.run_isolated_until_output(
+                stage,
+                "prompt",
+                session_dir=cdir,
+                output_path=output,
+                max_output_bytes=1024,
+                validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+            ) == {"ok": True}
+
     def test_isolated_direct_write_is_not_adopted_before_clean_exit(
         self, monkeypatch, tmp_path,
     ):
@@ -4345,12 +4380,21 @@ def test_startup_does_not_resume_stale_pipeline_after_input_freezes(
     if frozen == "generation":
         assert after == before
     else:
-        assert {key: value for key, value in after.items() if key != "meta.json"} == {
+        assert {
+            key: value for key, value in after.items()
+            if key not in {"meta.json", "work/errors/pipeline-stale-recovery.json"}
+        } == {
             key: value for key, value in before.items() if key != "meta.json"
         }
         recovered = storage.load_meta(settings.data_dir, meta["id"])
         assert recovered["status"] == "failed"
         assert recovered["error"] == "input_recovery_required"
+        diagnostic = json.loads(
+            (cdir / "work/errors/pipeline-stale-recovery.json").read_text()
+        )
+        assert diagnostic["call_path"] == [
+            "pipeline", meta["id"], "stale_recovery",
+        ]
 
 
 def test_startup_does_not_duplicate_current_process_pipeline_claim(
@@ -4615,6 +4659,12 @@ def test_startup_marks_corrupt_half_frozen_pipeline_as_recovery_required(
     assert recovered["error"] == "input_recovery_required"
     assert recovered["_input_owner"] is None
     assert receipt.read_bytes() == before
+    diagnostic = json.loads(
+        (cdir / "work/errors/pipeline-stale-recovery.json").read_text()
+    )
+    assert diagnostic["call_path"] == [
+        "pipeline", meta["id"], "stale_recovery",
+    ]
 
 
 def test_post_triggers_pipeline_and_detail_filled(tmp_path, video_1s, fake_steps):

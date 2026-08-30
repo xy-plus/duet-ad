@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import subprocess
@@ -17,6 +18,7 @@ from typing import Mapping
 from app import (
     context_ir_bridge,
     dialogue_delivery as dialogue_delivery_contract,
+    error_trace,
     frame_fit,
     h3,
     h3_project,
@@ -37,6 +39,7 @@ FIT_LAYOUT_LEGACY = "legacy-v0"
 FIT_LAYOUT_ASPECT = "aspect-v1"
 _FIT_LAYOUTS = frozenset({FIT_LAYOUT_LEGACY, FIT_LAYOUT_ASPECT})
 _FAST_MODE_WORKERS = 8
+_LOGGER = logging.getLogger(__name__)
 AUDIO_ROUTE_SCHEMA = "duet.long-generation.audio-route"
 AUDIO_ROUTE_VERSION = 1
 H3_NATIVE_AUDIO_ROUTE = {
@@ -3866,6 +3869,33 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
     dialogue_mode = meta.get("dialogue_mode")
     states = {item["index"]: dict(item) for item in generation.get("segments", [])}
     native_audio_indices = _native_audio_segment_indices(plan)
+
+    def record_error(
+        phase: str,
+        exc: BaseException,
+        *,
+        segment_index: int | None = None,
+        action: str | None = None,
+    ) -> None:
+        parts = ["pipeline", "long_generation", phase]
+        filename_parts = ["long-generation", phase]
+        if segment_index is not None:
+            parts.append(f"segment:{segment_index}")
+            filename_parts.append(f"segment-{segment_index}")
+        if action is not None:
+            parts.append(f"action:{action}")
+            filename_parts.append(action)
+        error_trace.record(
+            settings.data_dir
+            / cid
+            / "work"
+            / "errors"
+            / ("-".join(filename_parts) + ".json"),
+            call_path=parts,
+            error=exc,
+            logger=_LOGGER,
+            secrets=(settings.autodl_art_token, settings.minimax_api_key),
+        )
     if any(
         ("context_ir" in state) != context_ir_required
         for state in states.values()
@@ -4063,7 +4093,8 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                         status[2],
                     )
                 return status
-            except Exception:
+            except Exception as exc:
+                record_error("startup-recover", exc, segment_index=segment.index)
                 return (
                     "submission_unknown",
                     "submission_unknown",
@@ -4092,8 +4123,10 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     generation=exact_generation(),
                 )
             except LongGenerationError as exc:
+                record_error("startup-stitch", exc)
                 persist("failed", exc.code, "stitch")
-            except Exception:
+            except Exception as exc:
+                record_error("startup-stitch", exc)
                 persist("failed", "long_video_stitch_failed", "stitch")
             else:
                 persist("succeeded", None, "stitch")
@@ -4267,6 +4300,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 ),
                 None,
             )
+            record_error("fast-prepare", exc, segment_index=failed_index)
             if failed_index is not None:
                 states[failed_index].update(status="failed", error=code)
             persist("failed", "long_video_segment_failed")
@@ -4306,6 +4340,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     )
                 return status
             except h3.H3Error as exc:
+                record_error("fast-submit", exc, segment_index=segment.index)
                 if exc.code == "attempt_not_prepared":
                     return (
                         "submission_unknown",
@@ -4315,7 +4350,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 try:
                     inspected = h3.inspect(requests[segment.index])
                     status = _result_state(inspected, previous_attempt)
-                except Exception:
+                except Exception as inspect_exc:
+                    record_error(
+                        "fast-submit-inspect",
+                        inspect_exc,
+                        segment_index=segment.index,
+                    )
                     status = (
                         "submission_unknown",
                         "submission_unknown",
@@ -4326,7 +4366,8 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 }:
                     return "submission_unknown", "submission_unknown", status[2]
                 return status
-            except Exception:
+            except Exception as exc:
+                record_error("fast-submit", exc, segment_index=segment.index)
                 return (
                     "submission_unknown",
                     "submission_unknown",
@@ -4367,6 +4408,7 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     )
                 return status
             except h3.H3Error as exc:
+                record_error("fast-poll", exc, segment_index=segment.index)
                 return (
                     "submission_unknown",
                     "submission_unknown",
@@ -4378,7 +4420,8 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     exc.code,
                     _exact_h3_attempt_id(previous_attempt),
                 )
-            except Exception:
+            except Exception as exc:
+                record_error("fast-poll", exc, segment_index=segment.index)
                 return (
                     "submission_unknown",
                     "submission_unknown",
@@ -4405,8 +4448,10 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     generation=exact_generation(),
                 )
             except LongGenerationError as exc:
+                record_error("fast-stitch", exc)
                 persist("failed", exc.code, "stitch")
-            except Exception:
+            except Exception as exc:
+                record_error("fast-stitch", exc)
                 persist("failed", "long_video_stitch_failed", "stitch")
             else:
                 persist("succeeded", None, "stitch")
@@ -4543,6 +4588,12 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     if action == "resume":
                         h3_action = "start"
         except LongGenerationError as exc:
+            record_error(
+                "serial-request",
+                exc,
+                segment_index=segment.index,
+                action=action,
+            )
             if action == "resume":
                 return existing_child_id, (
                     "submission_unknown", "submission_unknown",
@@ -4551,7 +4602,13 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
             return None, (
                 "failed", exc.code, _exact_h3_attempt_id(previous_attempt)
             )
-        except Exception:
+        except Exception as exc:
+            record_error(
+                "serial-request",
+                exc,
+                segment_index=segment.index,
+                action=action,
+            )
             if action == "resume":
                 return existing_child_id, (
                     "submission_unknown", "submission_unknown",
@@ -4582,10 +4639,22 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 )
             return request.client_request_id, status
         except h3.H3Error as exc:
+            record_error(
+                "serial-provider",
+                exc,
+                segment_index=segment.index,
+                action=h3_action,
+            )
             try:
                 inspected = h3.inspect(request)
                 status = _result_state(inspected, previous_attempt)
-            except Exception:
+            except Exception as inspect_exc:
+                record_error(
+                    "serial-provider-inspect",
+                    inspect_exc,
+                    segment_index=segment.index,
+                    action=h3_action,
+                )
                 status = (
                     "submission_unknown",
                     "submission_unknown",
@@ -4596,7 +4665,13 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                     "submission_unknown", "submission_unknown", status[2]
                 )
             return request.client_request_id, status
-        except Exception:
+        except Exception as exc:
+            record_error(
+                "serial-provider",
+                exc,
+                segment_index=segment.index,
+                action=h3_action,
+            )
             return request.client_request_id, (
                 "submission_unknown",
                 "submission_unknown",
@@ -4658,8 +4733,10 @@ def run(settings, cid: str, plan: FrozenPlan, *, startup: bool = False) -> None:
                 generation=exact_generation(),
             )
         except LongGenerationError as exc:
+            record_error("serial-stitch", exc)
             persist("failed", exc.code, "stitch")
-        except Exception:
+        except Exception as exc:
+            record_error("serial-stitch", exc)
             persist("failed", "long_video_stitch_failed", "stitch")
         else:
             persist("succeeded", None, "stitch")

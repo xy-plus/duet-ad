@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -28,6 +29,11 @@ from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
+
+from app import error_trace
+
+
+log = logging.getLogger(__name__)
 
 
 ATTEMPT_SCHEMA = "duet.image-mask-attempt"
@@ -1366,6 +1372,12 @@ def generate_mask(
             )
             provider_state = _provider_state(response)
         except SubmissionUncertain as exc:
+            error_trace.record(
+                root / f"{receipt_relative}.error.json",
+                call_path=["image_masks", "provider", "submit"],
+                error=exc,
+                logger=log,
+            )
             request_id = _optional_private_identifier(exc.request_id)
             task_id = _optional_private_identifier(exc.task_id)
             if task_id is None:
@@ -1388,9 +1400,21 @@ def generate_mask(
             )
             status = "accepted"
         except MaskError as exc:
+            error_trace.record(
+                root / f"{receipt_relative}.error.json",
+                call_path=["image_masks", "provider", "submit"],
+                error=exc,
+                logger=log,
+            )
             _failed(root, receipt_relative, receipt, exc)
             raise
-        except Exception:
+        except Exception as exc:
+            error_trace.record(
+                root / f"{receipt_relative}.error.json",
+                call_path=["image_masks", "provider", "submit"],
+                error=exc,
+                logger=log,
+            )
             receipt = _transition(
                 root,
                 receipt_relative,
@@ -1428,9 +1452,21 @@ def generate_mask(
         try:
             response = provider.get(task_id)
             next_state = _provider_state(response)
-        except MaskError:
+        except MaskError as exc:
+            error_trace.record(
+                root / f"{receipt_relative}.error.json",
+                call_path=["image_masks", "provider", "get"],
+                error=exc,
+                logger=log,
+            )
             raise
-        except Exception:
+        except Exception as exc:
+            error_trace.record(
+                root / f"{receipt_relative}.error.json",
+                call_path=["image_masks", "provider", "get"],
+                error=exc,
+                logger=log,
+            )
             raise MaskError("provider_query_failed", retryable=True) from None
         if next_state.get("task_id") not in {None, task_id}:
             raise MaskError("provider_protocol_error")
@@ -1457,9 +1493,21 @@ def generate_mask(
             if len(downloaded) > MAX_MASK_BYTES:
                 raise MaskError("mask_download_too_large")
             _atomic_project_bytes(root, landing_relative, downloaded)
-        except MaskError:
+        except MaskError as exc:
+            error_trace.record(
+                root / f"{receipt_relative}.error.json",
+                call_path=["image_masks", "provider", "download"],
+                error=exc,
+                logger=log,
+            )
             raise
-        except Exception:
+        except Exception as exc:
+            error_trace.record(
+                root / f"{receipt_relative}.error.json",
+                call_path=["image_masks", "provider", "download"],
+                error=exc,
+                logger=log,
+            )
             raise MaskError("mask_download_failed", retryable=True) from None
         receipt = _transition(
             root,

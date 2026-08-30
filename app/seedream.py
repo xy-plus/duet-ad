@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -15,10 +16,12 @@ import cv2
 import httpx
 import numpy as np
 
+from app import error_trace
 from app.config import SEEDREAM_PRO_MODEL, Settings
 
 ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
 MAX_POST_ATTEMPTS = 3
+_LOGGER = logging.getLogger(__name__)
 
 
 class SeedreamError(RuntimeError):
@@ -217,9 +220,16 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
                     **current, "status": "submission_unknown", "attempts": attempts,
                 })
                 raise
-            except httpx.RequestError:
+            except httpx.RequestError as exc:
                 attempts[-1]["status"] = "submission_unknown"
                 _atomic_json(receipt_path, {**current, "status": "submission_unknown", "attempts": attempts})
+                error_trace.record(
+                    receipt_path.with_suffix(".error.json"),
+                    call_path=["postprocess", "seedream", receipt_path.stem, "POST"],
+                    error=exc,
+                    logger=_LOGGER,
+                    secrets=(key,),
+                )
                 raise SeedreamError("submission_unknown") from None
             if _exact_quota(response) and attempt < MAX_POST_ATTEMPTS:
                 attempts[-1]["status"] = "quota_retryable"
@@ -238,12 +248,29 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
                 if error_code:
                     failed_receipt["provider_error_code"] = error_code
                 _atomic_json(receipt_path, failed_receipt)
+                error_trace.record(
+                    receipt_path.with_suffix(".error.json"),
+                    call_path=["postprocess", "seedream", receipt_path.stem, "POST"],
+                    reason={
+                        "code": "provider_rejected",
+                        "provider": error_trace.provider_response(response, secrets=(key,)),
+                    },
+                    logger=_LOGGER,
+                    secrets=(key,),
+                )
                 raise SeedreamError("provider_rejected")
             try:
                 raw = _decode(response.json())
-            except (ValueError, SeedreamError):
+            except (ValueError, SeedreamError) as exc:
                 attempts[-1]["status"] = "failed"
                 _atomic_json(receipt_path, {**current, "status": "failed", "attempts": attempts})
+                error_trace.record(
+                    receipt_path.with_suffix(".error.json"),
+                    call_path=["postprocess", "seedream", receipt_path.stem, "decode"],
+                    error=exc,
+                    logger=_LOGGER,
+                    secrets=(key,),
+                )
                 raise SeedreamError("provider_protocol_error") from None
             # Persist the received bytes before publishing the canonical output. Recovery may
             # replay this local result, but must never issue another POST for this attempt.

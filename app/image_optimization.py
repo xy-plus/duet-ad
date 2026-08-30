@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
@@ -3828,8 +3829,8 @@ def _run_image_skill_phase(
 ) -> dict:
     output = stage / "work" / output_name
     prompt = (
-        "严格执行当前目录 SKILL.md；只读取允许的输入；将完整、可解析的规定 JSON "
-        "写入唯一输出文件并立即退出。文件校验与正式发布由后端负责。"
+        "严格执行当前目录 SKILL.md；只读取允许的输入；最终回答只返回规定的完整 "
+        "JSON object，不加解释或其他文本。后端负责捕获、校验和发布。"
     )
     if hasattr(runner, "run_isolated_until_output"):
         return runner.run_isolated_until_output(
@@ -3850,6 +3851,36 @@ def _run_image_skill_phase(
     return value
 
 
+def _run_image_skill_phase_with_retry(
+    operation,
+    *,
+    phase: str,
+    retry_count: int,
+    retry_interval_s: float,
+) -> dict:
+    """Retry only the failed Codex phase; completed sibling phases stay frozen."""
+    for attempt in range(retry_count + 1):
+        try:
+            return operation()
+        except CodexError as exc:
+            if not exc.retryable or attempt >= retry_count:
+                raise CodexError(
+                    f"image optimization {phase} failed: {exc}",
+                    retryable=exc.retryable,
+                ) from None
+            _LOGGER.warning(
+                "image optimization %s failed; retry %s/%s in %.1fs: %s",
+                phase,
+                attempt + 1,
+                retry_count,
+                retry_interval_s,
+                exc,
+            )
+            if retry_interval_s:
+                time.sleep(retry_interval_s)
+    raise AssertionError("unreachable")
+
+
 def generate_project_prompts(
     runner,
     segments: list[dict],
@@ -3860,6 +3891,8 @@ def generate_project_prompts(
     element_index_path: Path | None = None,
     skill_bytes: bytes | None = None,
     skill_path: Path | None = None,
+    phase_retry_count: int = 0,
+    phase_retry_interval_s: float = 0.0,
 ) -> tuple[dict, dict]:
     """Plan globally from contact sheets, then describe source frames per segment."""
     if edit_mode not in SEEDREAM_EDIT_MODES or expected_version not in {2, 3, 4}:
@@ -3890,93 +3923,118 @@ def generate_project_prompts(
         for item in raw_slots["scenes"]
     ]
 
-    with tempfile.TemporaryDirectory(prefix="duet-image-global-", dir="/tmp") as raw:
-        stage = Path(raw).resolve(strict=True)
-        work = stage / "work"
-        _write_skill_stage(skill, stage / "SKILL.md")
-        for segment, frames in prepared:
-            destination = work / "contact_sheets" / f"segment-{segment['index']:04d}.jpg"
-            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            _contact_sheet(frames, destination)
-        request = {
-            "phase": "global_plan",
-            "edit_mode": edit_mode,
-            "segments": [{
-                **segment,
-                "contact_sheet_path": (
-                    f"work/contact_sheets/segment-{segment['index']:04d}.jpg"
-                ),
-                "contact_sheet_sha256": _sha256_regular(
+    def describe_global() -> dict:
+        with tempfile.TemporaryDirectory(
+            prefix="duet-image-global-", dir="/tmp",
+        ) as raw:
+            stage = Path(raw).resolve(strict=True)
+            work = stage / "work"
+            _write_skill_stage(skill, stage / "SKILL.md")
+            for segment, frames in prepared:
+                destination = (
                     work / "contact_sheets" / f"segment-{segment['index']:04d}.jpg"
-                ),
-            } for segment in request_segments],
-            "semantic_slots": {"scenes": scene_slots},
-        }
-        if element_index is not None:
-            request["element_index"] = element_index
-        work.mkdir(parents=True, exist_ok=True)
-        (work / "request.json").write_text(
-            json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
-        global_plan = _run_image_skill_phase(
-            runner,
-            stage=stage,
-            session=session,
-            output_name="global_plan.json",
-            expected_keys={"people", "entities", "scenes", "relations"},
-            max_bytes=MAX_CONTINUITY_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
-        )
+                )
+                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _contact_sheet(frames, destination)
+            request = {
+                "phase": "global_plan",
+                "edit_mode": edit_mode,
+                "segments": [{
+                    **segment,
+                    "contact_sheet_path": (
+                        f"work/contact_sheets/segment-{segment['index']:04d}.jpg"
+                    ),
+                    "contact_sheet_sha256": _sha256_regular(
+                        work / "contact_sheets" /
+                        f"segment-{segment['index']:04d}.jpg"
+                    ),
+                } for segment in request_segments],
+                "semantic_slots": {"scenes": scene_slots},
+            }
+            if element_index is not None:
+                request["element_index"] = element_index
+            work.mkdir(parents=True, exist_ok=True)
+            (work / "request.json").write_text(
+                json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            return _run_image_skill_phase(
+                runner,
+                stage=stage,
+                session=session,
+                output_name="global_plan.json",
+                expected_keys={"people", "entities", "scenes", "relations"},
+                max_bytes=MAX_CONTINUITY_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
+            )
+
+    global_plan = _run_image_skill_phase_with_retry(
+        describe_global,
+        phase="global_plan",
+        retry_count=phase_retry_count,
+        retry_interval_s=phase_retry_interval_s,
+    )
 
     frames_by_segment: dict[int, list[dict]] = {}
 
     def describe_segment(item: tuple[dict, list[Path]]) -> tuple[int, dict]:
         segment, frames = item
-        with tempfile.TemporaryDirectory(
-            prefix=f"duet-image-segment-{segment['index']}-", dir="/tmp",
-        ) as raw:
-            stage = Path(raw).resolve(strict=True)
-            work = stage / "work"
-            destination = work / "keyframes"
-            destination.mkdir(parents=True, mode=0o700)
-            _write_skill_stage(skill, stage / "SKILL.md")
-            for frame in frames:
-                _copy_regular(frame, destination / frame.name)
-            (work / "global_plan.json").write_text(
-                json.dumps(global_plan, ensure_ascii=False, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
-            segment_slots = [
-                {"key": slot["key"], "scene_key": slot["scene_key"],
-                 "path": f"work/keyframes/{slot['frame_name']}"}
-                for slot in raw_slots["frames"]
-                if slot["segment_index"] == segment["index"]
-            ]
-            request = {
-                "phase": "segment_frames",
-                "edit_mode": edit_mode,
-                "segment": next(
-                    value for value in request_segments
-                    if value["index"] == segment["index"]
-                ),
-                "semantic_slots": {"frames": segment_slots},
-                "global_plan_path": "work/global_plan.json",
-            }
-            if element_index is not None:
-                request["element_index"] = element_index
-            (work / "request.json").write_text(
-                json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
-            result = _run_image_skill_phase(
-                runner,
-                stage=stage,
-                session=session,
-                output_name="segment_frames.json",
-                expected_keys={"frames"},
-                max_bytes=MAX_PROMPT_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
-            )
-            return segment["index"], result["frames"]
+        def describe_once() -> dict:
+            with tempfile.TemporaryDirectory(
+                prefix=f"duet-image-segment-{segment['index']}-", dir="/tmp",
+            ) as raw:
+                stage = Path(raw).resolve(strict=True)
+                work = stage / "work"
+                destination = work / "keyframes"
+                destination.mkdir(parents=True, mode=0o700)
+                _write_skill_stage(skill, stage / "SKILL.md")
+                for frame in frames:
+                    _copy_regular(frame, destination / frame.name)
+                (work / "global_plan.json").write_text(
+                    json.dumps(
+                        global_plan, ensure_ascii=False, separators=(",", ":"),
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+                segment_slots = [
+                    {"key": slot["key"], "scene_key": slot["scene_key"],
+                     "path": f"work/keyframes/{slot['frame_name']}"}
+                    for slot in raw_slots["frames"]
+                    if slot["segment_index"] == segment["index"]
+                ]
+                request = {
+                    "phase": "segment_frames",
+                    "edit_mode": edit_mode,
+                    "segment": next(
+                        value for value in request_segments
+                        if value["index"] == segment["index"]
+                    ),
+                    "semantic_slots": {"frames": segment_slots},
+                    "global_plan_path": "work/global_plan.json",
+                }
+                if element_index is not None:
+                    request["element_index"] = element_index
+                (work / "request.json").write_text(
+                    json.dumps(
+                        request, ensure_ascii=False, separators=(",", ":"),
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+                return _run_image_skill_phase(
+                    runner,
+                    stage=stage,
+                    session=session,
+                    output_name="segment_frames.json",
+                    expected_keys={"frames"},
+                    max_bytes=MAX_PROMPT_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
+                )
+
+        result = _run_image_skill_phase_with_retry(
+            describe_once,
+            phase=f"segment_frames[{segment['index']}]",
+            retry_count=phase_retry_count,
+            retry_interval_s=phase_retry_interval_s,
+        )
+        return segment["index"], result["frames"]
 
     with ThreadPoolExecutor(max_workers=len(prepared)) as executor:
         futures = [executor.submit(describe_segment, item) for item in prepared]

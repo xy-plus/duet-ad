@@ -18,6 +18,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -31,7 +32,10 @@ from urllib.parse import quote
 
 import httpx
 
-from app import h3
+from app import error_trace, h3
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 SCHEMA_VERSION = 1
@@ -1742,12 +1746,19 @@ def _upload_references(
                 headers={"Authorization": f"Bearer {request.minimax_api_key}"},
                 timeout=request.timeouts.request_s,
             )
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             _mark_terminal(
                 path,
                 state,
                 status="submission_unknown",
                 error="context_ir_submission_unknown",
+            )
+            error_trace.record(
+                path.with_name("error.json"),
+                call_path=["generation", "context_ir", "upload", str(index + 1)],
+                error=exc,
+                logger=_LOGGER,
+                secrets=(request.minimax_api_key,),
             )
             return False
         payload = _parse_json(response)
@@ -1775,6 +1786,13 @@ def _upload_references(
                     if not response.is_success
                     else None
                 ),
+            )
+            error_trace.record(
+                path.with_name("error.json"),
+                call_path=["generation", "context_ir", "upload", str(index + 1)],
+                reason={"code": error, "provider": error_trace.provider_response(response, secrets=(request.minimax_api_key,))},
+                logger=_LOGGER,
+                secrets=(request.minimax_api_key,),
             )
             return False
         state["references"][index]["file_id"] = file_id
@@ -1818,12 +1836,19 @@ def _submit(
             },
             timeout=request.timeouts.request_s,
         )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
         _mark_terminal(
             path,
             state,
             status="submission_unknown",
             error="context_ir_submission_unknown",
+        )
+        error_trace.record(
+            path.with_name("error.json"),
+            call_path=["generation", "context_ir", "submit"],
+            error=exc,
+            logger=_LOGGER,
+            secrets=(request.minimax_api_key,),
         )
         return
     payload = _parse_json(response)
@@ -1853,6 +1878,16 @@ def _submit(
                 http_status=http_status,
                 provider_error_code=provider_error_code,
             )
+        error_trace.record(
+            path.with_name("error.json"),
+            call_path=["generation", "context_ir", "submit"],
+            reason={
+                "code": state["error"],
+                "provider": error_trace.provider_response(response, secrets=(request.minimax_api_key,)),
+            },
+            logger=_LOGGER,
+            secrets=(request.minimax_api_key,),
+        )
         return
     state["provider_task_id"] = task_id
     state["context_ir_task_sha256"] = _canonical_sha256(
@@ -1976,12 +2011,19 @@ def _poll_once(
             headers={"Authorization": f"Bearer {request.minimax_api_key}"},
             timeout=request.timeouts.request_s,
         )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
         _mark_terminal(
             path,
             state,
             status="query_unknown",
             error="context_ir_query_unknown",
+        )
+        error_trace.record(
+            path.with_name("error.json"),
+            call_path=["generation", "context_ir", "poll"],
+            error=exc,
+            logger=_LOGGER,
+            secrets=(request.minimax_api_key,),
         )
         return "stop"
     if not response.is_success:
@@ -1990,6 +2032,16 @@ def _poll_once(
             state,
             status="query_unknown",
             error="context_ir_query_unknown",
+        )
+        error_trace.record(
+            path.with_name("error.json"),
+            call_path=["generation", "context_ir", "poll"],
+            reason={
+                "code": "context_ir_query_unknown",
+                "provider": error_trace.provider_response(response, secrets=(request.minimax_api_key,)),
+            },
+            logger=_LOGGER,
+            secrets=(request.minimax_api_key,),
         )
         return "stop"
     payload = _parse_json(response)
@@ -2001,6 +2053,18 @@ def _poll_once(
             status="query_unknown",
             error="context_ir_query_unknown",
         )
+        error_trace.record(
+            path.with_name("error.json"),
+            call_path=["generation", "context_ir", "poll", "decode"],
+            reason={
+                "code": "context_ir_query_unknown",
+                "provider": error_trace.provider_response(
+                    response, secrets=(request.minimax_api_key,)
+                ),
+            },
+            logger=_LOGGER,
+            secrets=(request.minimax_api_key,),
+        )
         return "stop"
     if task.get("id") != task_id:
         _mark_terminal(
@@ -2008,6 +2072,13 @@ def _poll_once(
             state,
             status="failed",
             error="context_ir_task_mismatch",
+        )
+        error_trace.record(
+            path.with_name("error.json"),
+            call_path=["generation", "context_ir", "poll", task_id],
+            reason={"code": "context_ir_task_mismatch", "provider_task": task},
+            logger=_LOGGER,
+            secrets=(request.minimax_api_key,),
         )
         return "stop"
     status = task.get("status")
@@ -2017,6 +2088,13 @@ def _poll_once(
             state,
             status="query_unknown",
             error="context_ir_unknown_status",
+        )
+        error_trace.record(
+            path.with_name("error.json"),
+            call_path=["generation", "context_ir", "poll", task_id],
+            reason={"code": "context_ir_unknown_status", "provider_task": task},
+            logger=_LOGGER,
+            secrets=(request.minimax_api_key,),
         )
         return "stop"
     modality = task.get("modality")
@@ -2030,6 +2108,13 @@ def _poll_once(
             status="failed",
             error="context_ir_result_type_invalid",
         )
+        error_trace.record(
+            path.with_name("error.json"),
+            call_path=["generation", "context_ir", "poll", task_id],
+            reason={"code": "context_ir_result_type_invalid", "provider_task": task},
+            logger=_LOGGER,
+            secrets=(request.minimax_api_key,),
+        )
         return "stop"
     if status in {"queued", "running"}:
         state["status"] = "polling"
@@ -2042,6 +2127,13 @@ def _poll_once(
             state,
             status="failed",
             error="context_ir_provider_failed",
+        )
+        error_trace.record(
+            path.with_name("error.json"),
+            call_path=["generation", "context_ir", "poll", task_id],
+            reason={"code": "context_ir_provider_failed", "provider_task": task},
+            logger=_LOGGER,
+            secrets=(request.minimax_api_key,),
         )
         return "stop"
     if status == "cancelled":

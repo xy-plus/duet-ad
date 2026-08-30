@@ -34,10 +34,10 @@ FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice
 
 后端按 transition 建区间：第一帧开始区间，hard_cut 当前帧开始新区间，continuous 留在当前区间。每个区间输出一条英文 `visual` prose，只引用本区间图片；不输出时间戳、图片标记、stable key、tile、relation key、音频字段或 provider 语法。
 
-只写 `work/h3_prompt_plan.json`：
+后端发布到 `work/h3_prompt_plan.json`，输出合同：
 
 ```text
 VideoPromptFusionOutput = { schema: "duet.video-prompt-fusion-output"; version: 2; input_sha256: Sha256; segments: NonEmptyArray<{ index: Int1; visual: NonEmptyArray<NonEmptyText> }> }
 ```
 
-segments 与输入一一对应，visual 数量等于 hard-cut 区间数。将完整、可解析的 JSON 写入唯一目标后立即退出；校验和正式发布由后端负责。输出供 Context IR 优化，再由后端按冻结素材逐段独立生成视频。
+segments 与输入一一对应，visual 数量等于 hard-cut 区间数。最终回答只返回上述 JSON object；后端捕获、校验并发布，供 Context IR 优化，再按冻结素材逐段生成视频。
