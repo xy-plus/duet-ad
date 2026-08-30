@@ -217,14 +217,12 @@ class _Runner:
             ),
             "prompt": prompt,
             "session_dir": Path(session_dir),
+            "output_schema": output_schema,
         })
         output = self.output(request) if callable(self.output) else self.output
         if request["phase"] == "global_plan":
             model = {
-                category: [
-                    {"key": key, **item}
-                    for key, item in output.get(category, {}).items()
-                ]
+                category: output.get(category, {})
                 for category in ("people", "entities", "scenes", "relations")
             }
         else:
@@ -373,8 +371,12 @@ def test_skill_exposes_closed_global_and_segment_json_contracts():
         "people", "entities", "scenes", "relations",
     )}
     segment_frames = {"frames": example["frames"]}
+    global_schema = codex_output_schemas.global_plan_schema(stable_keys={
+        category: set(global_plan[category])
+        for category in ("people", "entities", "scenes", "relations")
+    })
     for schema in (
-        codex_output_schemas.GLOBAL_PLAN_SCHEMA,
+        global_schema,
         codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
     ):
         assert schema["type"] == "object"
@@ -715,6 +717,15 @@ def test_skill_additively_consumes_element_index_without_changing_output_schema(
 
     assert runner.calls[0]["request"]["element_index"] == element_index
     assert runner.calls[0]["request"]["phase"] == "global_plan"
+    global_properties = runner.calls[0]["output_schema"]["properties"]
+    assert set(global_properties["people"]["properties"]) == {"subject"}
+    assert set(global_properties["entities"]["properties"]) == set()
+    assert set(global_properties["scenes"]["properties"]) == {"scene-001"}
+    assert set(global_properties["relations"]["properties"]) == set()
+    assert "key" not in global_properties["people"]["properties"][
+        "subject"
+    ]["properties"]
+    assert "不要在 value 内回显 key" in runner.calls[0]["prompt"]
     assert {call["request"]["phase"] for call in runner.calls[1:]} == {
         "segment_frames"
     }
@@ -734,6 +745,84 @@ def test_skill_additively_consumes_element_index_without_changing_output_schema(
         "逐字一致",
     ):
         assert contract in skill
+
+
+def test_dynamic_global_relation_value_reaches_image_prompt(tmp_path):
+    session = tmp_path / "session"
+    segments = _transition_skeleton(_segments(session, [1]))
+    element_index = _element_index()
+    element_index["entities"] = {"entity-01": {
+        "source_visual_description": "visible fixture",
+        "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+        "replaceable": ["design"],
+        "preserve": ["function"],
+    }}
+    element_index["relations"] = {"relation-01": {
+        "subject_key": "entity-01",
+        "predicate": "installed_in",
+        "object_key": "scene-001",
+        "occurrences": [{
+            "segment_index": 1,
+            "frames": [{
+                "frame_order": 1,
+                "state": "standing",
+                "geometry": "centered in the visible room",
+            }],
+        }],
+        "preserve": ["directed role"],
+        "replace_together": False,
+    }}
+    index_path = session / "work" / "element_index.json"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(
+        json.dumps(element_index, ensure_ascii=False), encoding="utf-8",
+    )
+
+    def output(request):
+        value = _semantic_output(request)
+        if request["phase"] == "global_plan":
+            value["entities"] = {"entity-01": {
+                "description": "replacement fixture",
+                "owner": "project",
+                "association": "room fixture",
+                "persistence": "same fixture across frames",
+            }}
+            value["relations"] = {"relation-01": {
+                "replacement_system": "shared scale and spatial interface",
+                "preserve": "keep the fixture-to-scene direction",
+            }}
+        else:
+            for frame in value["frames"].values():
+                frame["entities"] = {"entity-01": {
+                    "visibility": "visible",
+                    "relationship": "installed in the visible room",
+                }}
+        return value
+
+    runner = _Runner(output)
+    plan, prompts = _generate_project_prompts(
+        runner,
+        segments,
+        "anchor_consistency",
+        session_dir=session,
+        element_index_path=index_path,
+    )
+
+    relation_schema = runner.calls[0]["output_schema"]["properties"][
+        "relations"
+    ]
+    assert set(relation_schema["properties"]) == {"relation-01"}
+    occurrence = plan["segments"][0]["frame_constraints"][0][
+        "relation_occurrences"
+    ][0]
+    assert occurrence["subject_key"] == "entity-01"
+    assert occurrence["predicate"] == "installed_in"
+    assert occurrence["object_key"] == "scene-001"
+    assert occurrence["preserve"][:2] == [
+        "replacement_system=shared scale and spatial interface",
+        "keep the fixture-to-scene direction",
+    ]
+    assert "replacement_system=shared scale and spatial interface" in prompts[1][1]
 
 
 def test_skill_adds_no_content_gate_retry_or_fallback_for_element_index():

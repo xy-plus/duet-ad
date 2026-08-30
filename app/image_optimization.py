@@ -4026,13 +4026,11 @@ def _contact_sheet(frames: list[Path], output: Path) -> None:
         raise ValueError("invalid image optimization segments")
 
 
-def _phase_output(raw: bytes, expected_keys: set[str]) -> dict:
+def _phase_output(raw: bytes) -> object:
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError("invalid image optimization phase output") from None
-    if not isinstance(value, dict) or set(value) != expected_keys:
-        raise ValueError("invalid image optimization phase output")
     return value
 
 
@@ -4042,7 +4040,6 @@ def _run_image_skill_phase(
     stage: Path,
     session: Path,
     output_name: str,
-    expected_keys: set[str],
     max_bytes: int,
     output_schema: dict,
     normalize_output,
@@ -4050,7 +4047,8 @@ def _run_image_skill_phase(
     output = stage / "work" / output_name
     prompt = (
         "严格执行当前目录 SKILL.md；只读取允许的输入；按注入的输出 Schema "
-        "填写当前 phase 的语义结果。"
+        "填写当前 phase 的语义结果。若 stable key 已是 object property 名，"
+        "直接填写对应 value，不要在 value 内回显 key。"
     )
     if not callable(getattr(runner, "run_isolated_until_output", None)):
         raise ImageOptimizationOutputError(
@@ -4062,9 +4060,7 @@ def _run_image_skill_phase(
         session_dir=session,
         output_path=output,
         max_output_bytes=max_bytes,
-        validate_output=lambda raw: normalize_output(
-            _phase_output(raw, expected_keys)
-        ),
+        validate_output=lambda raw: normalize_output(_phase_output(raw)),
         output_schema=output_schema,
     )
 
@@ -4175,15 +4171,14 @@ def generate_project_prompts(
         } | set((element_index or {}).get("scenes", {})),
         "relations": set((element_index or {}).get("relations", {})),
     }
+    global_output_schema = codex_output_schemas.global_plan_schema(
+        stable_keys=expected_global_keys,
+    )
 
     def normalize_global_output(value: object) -> dict:
-        normalized = codex_output_schemas.normalize_global_plan(value)
-        if any(
-            set(normalized[category]) != expected_global_keys[category]
-            for category in expected_global_keys
-        ):
-            raise ValueError("global plan stable keys do not match frozen input")
-        return normalized
+        return codex_output_schemas.normalize_global_plan(
+            value, stable_keys=expected_global_keys,
+        )
 
     def describe_global() -> dict:
         with tempfile.TemporaryDirectory(
@@ -4225,9 +4220,8 @@ def generate_project_prompts(
                 stage=stage,
                 session=session,
                 output_name="global_plan.json",
-                expected_keys={"people", "entities", "scenes", "relations"},
                 max_bytes=MAX_CONTINUITY_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
-                output_schema=codex_output_schemas.GLOBAL_PLAN_SCHEMA,
+                output_schema=global_output_schema,
                 normalize_output=normalize_global_output,
             )
 
@@ -4308,7 +4302,6 @@ def generate_project_prompts(
                     stage=stage,
                     session=session,
                     output_name="segment_frames.json",
-                    expected_keys={"frames"},
                     max_bytes=MAX_PROMPT_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
                     output_schema=codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
                     normalize_output=normalize_segment_output,

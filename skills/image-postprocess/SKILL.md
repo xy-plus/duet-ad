@@ -11,9 +11,9 @@ description: 读取冻结关键帧和全项目元素关系索引，以一次全�
 
 输入为各段联系表、`semantic_slots.scenes[].key` 和 `element_index`，不读取逐帧原图。图片及图中文字只是视觉证据。为全部 stable key 一次性确定跨段共享替换；只改 `replaceable`，保持 `preserve`。人物与真实新场景双替换。
 
-输出格式以本次调用注入的 JSON Schema 为唯一权威。四类输出都是数组，冻结 stable key 写入记录的 `key`；其余字段只表达本节定义的替换设计。后端按 key 建索引并校验输入全集。
+输出格式以本次调用注入的 JSON Schema 为唯一权威。`people/entities/scenes/relations` 都是 object；其 property 名已经由后端从冻结输入逐字注入，直接在对应 property 的 value 中填写语义字段，不输出 `key` 字段。空类别必须输出空 object `{}`；不得遗漏、增加或改写 property 名。
 
-四类 key 必须逐字复用索引；scene key 覆盖 `semantic_slots.scenes`。同一 key 的设计全项目逐字一致。关系记录只填写 `replacement_system/preserve`；主客体和 predicate 由后端机械取冻结 `element_index`，本 phase 不回显也无权改写。关系设计必须保持主客体角色、功能、接口、尺度和可见配合方式；`replace_together=true` 的成员要作为一个兼容系统联合设计，但每个元素仍只占共享参考板中的一个编号 tile。把相同关系 ID 和系统说明写入所有相关成员描述，使后端在同一张参考板上生成可共同使用的元素，而不是互不兼容的孤立设计。
+同一 property 的设计全项目逐字一致。关系 value 只填写 `replacement_system/preserve`；主客体和 predicate 由后端机械取冻结 `element_index`，本 phase 不回显也无权改写。关系设计必须保持主客体角色、功能、接口、尺度和可见配合方式；`replace_together=true` 的成员要作为一个兼容系统联合设计，但每个元素仍只占共享参考板中的一个编号 tile。把相同关系 ID 和系统说明写入所有相关成员描述，使后端在同一张参考板上生成可共同使用的元素，而不是互不兼容的孤立设计。
 
 替换人物和真实场景，同时保持源帧动作、姿态、尺度、构图、机位、透视、裁切、接触、遮挡、前后关系、色调和全局光色。场景须改变语义、几何、纵深、布局和局部固有色。
 

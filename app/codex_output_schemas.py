@@ -1,14 +1,16 @@
 """Strict model-output DTOs for the three Codex Skill phases.
 
 The schemas shape model transport only.  Backend validators still bind IDs,
-counts, hashes, timelines, and publication.  Maps whose keys are discovered by
-the model use arrays with an explicit ``key`` field; the backend indexes them
-after checking uniqueness.
+counts, hashes, timelines, and publication.  Backend-known Global keys are
+injected as exact object properties; only keys discovered by the model use
+arrays with an explicit ``key`` field.
 """
 
 from __future__ import annotations
 
 from typing import Iterable, Mapping
+
+from app.codex_runner import CodexOutputValidationError
 
 
 def _object(properties: Mapping[str, dict]) -> dict:
@@ -73,21 +75,18 @@ PROJECT_INDEX_SCHEMA = _object({
 
 
 _GLOBAL_PERSON = _object({
-    "key": _TEXT,
     "source_identity": _TEXT,
     "replacement_identity": _TEXT,
     "wardrobe_change": _TEXT,
     "local_color_change": _TEXT,
 })
 _GLOBAL_ENTITY = _object({
-    "key": _TEXT,
     "description": _TEXT,
     "owner": _TEXT,
     "association": _TEXT,
     "persistence": _TEXT,
 })
 _GLOBAL_SCENE = _object({
-    "key": _TEXT,
     "source_scene": _TEXT,
     "replacement_scene": _TEXT,
     "semantic_change": _TEXT,
@@ -97,16 +96,48 @@ _GLOBAL_SCENE = _object({
     "local_color_change": _TEXT,
 })
 _GLOBAL_RELATION = _object({
-    "key": _TEXT,
     "replacement_system": _TEXT,
     "preserve": _TEXT,
 })
-GLOBAL_PLAN_SCHEMA = _object({
-    "people": _array(_GLOBAL_PERSON, maximum=100),
-    "entities": _array(_GLOBAL_ENTITY, maximum=100),
-    "scenes": _array(_GLOBAL_SCENE, maximum=100),
-    "relations": _array(_GLOBAL_RELATION, maximum=200),
-})
+_GLOBAL_VALUE_SCHEMAS = {
+    "people": _GLOBAL_PERSON,
+    "entities": _GLOBAL_ENTITY,
+    "scenes": _GLOBAL_SCENE,
+    "relations": _GLOBAL_RELATION,
+}
+
+
+def _global_stable_keys(value: object) -> dict[str, tuple[str, ...]]:
+    if not isinstance(value, Mapping) or set(value) != set(_GLOBAL_VALUE_SCHEMAS):
+        raise ValueError("global plan stable keys are invalid")
+    normalized: dict[str, tuple[str, ...]] = {}
+    for category in _GLOBAL_VALUE_SCHEMAS:
+        keys = value[category]
+        if isinstance(keys, (str, bytes)) or not isinstance(keys, Iterable):
+            raise ValueError("global plan stable keys are invalid")
+        materialized = tuple(keys)
+        if (
+            any(
+                not isinstance(key, str) or not key.strip() or key != key.strip()
+                for key in materialized
+            )
+            or len(materialized) != len(set(materialized))
+        ):
+            raise ValueError("global plan stable keys are invalid")
+        normalized[category] = tuple(sorted(materialized))
+    return normalized
+
+
+def global_plan_schema(*, stable_keys: Mapping[str, Iterable[str]]) -> dict:
+    """Bind every Global output property to one backend-frozen stable key."""
+    keys = _global_stable_keys(stable_keys)
+    return _object({
+        category: _object({
+            stable_key: _GLOBAL_VALUE_SCHEMAS[category]
+            for stable_key in keys[category]
+        })
+        for category in _GLOBAL_VALUE_SCHEMAS
+    })
 
 
 _DERIVED_OBSERVATION = _object({
@@ -210,28 +241,41 @@ def normalize_project_index(value: object) -> dict:
     return result
 
 
-def normalize_global_plan(value: object) -> dict:
+def _reject_global_plan(reason: str, field_path: str) -> None:
+    raise CodexOutputValidationError(
+        reason, field_path, message="global plan output is invalid",
+    )
+
+
+def normalize_global_plan(
+    value: object, *, stable_keys: Mapping[str, Iterable[str]],
+) -> dict:
+    expected = _global_stable_keys(stable_keys)
     if not isinstance(value, dict) or set(value) != {
         "people", "entities", "scenes", "relations",
     }:
-        raise ValueError("global plan output is invalid")
-    return {
-        "people": _index_records(value["people"], fields={
-            "source_identity", "replacement_identity", "wardrobe_change",
-            "local_color_change",
-        }),
-        "entities": _index_records(value["entities"], fields={
-            "description", "owner", "association", "persistence",
-        }),
-        "scenes": _index_records(value["scenes"], fields={
-            "source_scene", "replacement_scene", "semantic_change",
-            "geometry_change", "depth_change", "layout_change",
-            "local_color_change",
-        }),
-        "relations": _index_records(value["relations"], fields={
-            "replacement_system", "preserve",
-        }),
-    }
+        _reject_global_plan("global_plan_shape_invalid", "/global_plan")
+    normalized: dict[str, dict[str, dict]] = {}
+    for category, record_schema in _GLOBAL_VALUE_SCHEMAS.items():
+        records = value[category]
+        if not isinstance(records, dict) or set(records) != set(expected[category]):
+            _reject_global_plan("global_plan_keys_invalid", f"/{category}")
+        fields = set(record_schema["properties"])
+        normalized[category] = {}
+        for stable_key in expected[category]:
+            record = records[stable_key]
+            if not isinstance(record, dict) or set(record) != fields:
+                _reject_global_plan("global_plan_record_invalid", f"/{category}")
+            for field in fields:
+                text = record[field]
+                if not isinstance(text, str) or not text.strip():
+                    _reject_global_plan(
+                        "global_plan_text_invalid", f"/{category}/{field}",
+                    )
+            normalized[category][stable_key] = {
+                field: record[field] for field in fields
+            }
+    return normalized
 
 
 def normalize_segment_frames(value: object) -> dict:

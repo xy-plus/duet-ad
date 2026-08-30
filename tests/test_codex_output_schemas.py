@@ -6,7 +6,15 @@ import jsonschema
 import pytest
 
 from app import codex_output_schemas, codex_runner
-from app.codex_runner import CodexRunner
+from app.codex_runner import CodexOutputValidationError, CodexRunner
+
+
+_GLOBAL_KEYS = {
+    "people": {"person-01"},
+    "entities": set(),
+    "scenes": set(),
+    "relations": {"relation-01"},
+}
 
 
 def _assert_all_objects_closed(schema: object) -> None:
@@ -24,7 +32,7 @@ def _assert_all_objects_closed(schema: object) -> None:
 def test_all_skill_output_schemas_are_valid_and_closed() -> None:
     schemas = [
         codex_output_schemas.PROJECT_INDEX_SCHEMA,
-        codex_output_schemas.GLOBAL_PLAN_SCHEMA,
+        codex_output_schemas.global_plan_schema(stable_keys=_GLOBAL_KEYS),
         codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
         codex_output_schemas.prompt_fusion_schema(
             input_sha256="a" * 64, segment_count=3,
@@ -105,37 +113,134 @@ def test_project_index_schema_requires_scene_but_not_people_or_entities() -> Non
         jsonschema.validate(without_people_or_entities, schema)
 
 
-def test_image_dtos_use_explicit_keys_and_backend_indexes_every_level() -> None:
+def test_global_dto_uses_backend_frozen_properties_without_echoed_keys() -> None:
     global_model = {
-        "people": [{
-            "key": "person-01", "source_identity": "source",
+        "people": {"person-01": {
+            "source_identity": "source",
             "replacement_identity": "replacement", "wardrobe_change": "wardrobe",
             "local_color_change": "color",
-        }],
-        "entities": [],
-        "scenes": [],
-        "relations": [{
-            "key": "relation-01",
+        }},
+        "entities": {},
+        "scenes": {},
+        "relations": {"relation-01": {
             "replacement_system": "compatible interface",
             "preserve": "directed roles",
-        }],
+        }},
     }
-    jsonschema.validate(global_model, codex_output_schemas.GLOBAL_PLAN_SCHEMA)
-    normalized_global = codex_output_schemas.normalize_global_plan(global_model)
+    schema = codex_output_schemas.global_plan_schema(stable_keys=_GLOBAL_KEYS)
+    jsonschema.validate(global_model, schema)
+    normalized_global = codex_output_schemas.normalize_global_plan(
+        global_model, stable_keys=_GLOBAL_KEYS,
+    )
     assert "person-01" in normalized_global["people"]
     assert normalized_global["relations"]["relation-01"] == {
         "replacement_system": "compatible interface",
         "preserve": "directed roles",
     }
 
-    invalid_global = json.loads(json.dumps(global_model))
-    invalid_global["relations"][0]["subject_key"] = "person-01"
-    try:
-        jsonschema.validate(invalid_global, codex_output_schemas.GLOBAL_PLAN_SCHEMA)
-    except jsonschema.ValidationError:
-        pass
+    assert "key" not in schema["properties"]["people"]["properties"][
+        "person-01"
+    ]["properties"]
+
+
+@pytest.mark.parametrize("mutation", ["wrong", "missing"])
+def test_global_schema_rejects_wrong_or_missing_frozen_key(mutation: str) -> None:
+    keys = {**_GLOBAL_KEYS, "entities": {"entity-01"}}
+    schema = codex_output_schemas.global_plan_schema(stable_keys=keys)
+    model = {
+        "people": {"person-01": {
+            "source_identity": "source", "replacement_identity": "replacement",
+            "wardrobe_change": "wardrobe", "local_color_change": "color",
+        }},
+        "entities": {"entity-01": {
+            "description": "entity", "owner": "project",
+            "association": "member", "persistence": "persistent",
+        }},
+        "scenes": {},
+        "relations": {"relation-01": {
+            "replacement_system": "system", "preserve": "roles",
+        }},
+    }
+    if mutation == "wrong":
+        model["entities"]["wrong-entity"] = model["entities"].pop("entity-01")
     else:
-        raise AssertionError("global plan accepted an index-owned relation endpoint")
+        del model["entities"]["entity-01"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(model, schema)
+    with pytest.raises(CodexOutputValidationError) as caught:
+        codex_output_schemas.normalize_global_plan(model, stable_keys=keys)
+    assert caught.value.reason == "global_plan_keys_invalid"
+    assert caught.value.field_path == "/entities"
+
+
+def test_global_schema_scales_to_real_inventory_and_empty_categories() -> None:
+    keys = {
+        "people": {f"person-{index:02d}" for index in range(1, 22)},
+        "entities": {f"entity-{index:02d}" for index in range(1, 12)},
+        "scenes": {f"scene-{index:02d}" for index in range(1, 4)},
+        "relations": {f"relation-{index:02d}" for index in range(1, 32)},
+    }
+    schema = codex_output_schemas.global_plan_schema(stable_keys=keys)
+    model = {
+        "people": {key: {
+            "source_identity": "source", "replacement_identity": "replacement",
+            "wardrobe_change": "wardrobe", "local_color_change": "color",
+        } for key in keys["people"]},
+        "entities": {key: {
+            "description": "entity", "owner": "project",
+            "association": "member", "persistence": "persistent",
+        } for key in keys["entities"]},
+        "scenes": {key: {
+            "source_scene": "source", "replacement_scene": "replacement",
+            "semantic_change": "semantic", "geometry_change": "geometry",
+            "depth_change": "depth", "layout_change": "layout",
+            "local_color_change": "color",
+        } for key in keys["scenes"]},
+        "relations": {key: {
+            "replacement_system": "system", "preserve": "roles",
+        } for key in keys["relations"]},
+    }
+    jsonschema.validate(model, schema)
+    normalized = codex_output_schemas.normalize_global_plan(
+        model, stable_keys=keys,
+    )
+    assert tuple(map(len, normalized.values())) == (21, 11, 3, 31)
+
+    empty_keys = {category: set() for category in keys}
+    empty = {category: {} for category in keys}
+    empty_schema = codex_output_schemas.global_plan_schema(stable_keys=empty_keys)
+    jsonschema.validate(empty, empty_schema)
+    assert codex_output_schemas.normalize_global_plan(
+        empty, stable_keys=empty_keys,
+    ) == empty
+
+
+def test_global_normalizer_reports_safe_reason_and_field_path() -> None:
+    empty_keys = {
+        "people": set(), "entities": set(), "scenes": set(), "relations": set(),
+    }
+    with pytest.raises(CodexOutputValidationError) as caught:
+        codex_output_schemas.normalize_global_plan(
+            {"people": {}, "entities": {}, "scenes": {}},
+            stable_keys=empty_keys,
+        )
+    assert caught.value.reason == "global_plan_shape_invalid"
+    assert caught.value.field_path == "/global_plan"
+
+    keys = {**empty_keys, "relations": {"relation-01"}}
+    value = {
+        "people": {}, "entities": {}, "scenes": {},
+        "relations": {"relation-01": {
+            "replacement_system": "", "preserve": "roles",
+        }},
+    }
+    with pytest.raises(CodexOutputValidationError) as caught:
+        codex_output_schemas.normalize_global_plan(value, stable_keys=keys)
+    assert caught.value.reason == "global_plan_text_invalid"
+    assert caught.value.field_path == "/relations/replacement_system"
+
+
+def test_segment_dto_still_indexes_model_discovered_nested_keys() -> None:
 
     frame_model = {"frames": [{
         "key": "frame-001",
