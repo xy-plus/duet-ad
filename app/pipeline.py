@@ -40,12 +40,18 @@ import tempfile
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NoReturn
 
 import cv2
 import numpy as np
 
 from app import asr, codex_output_schemas, dialogue_review, error_trace, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
-from app.codex_runner import CodexError, CodexOutputError, clean_stderr
+from app.codex_runner import (
+    CodexError,
+    CodexOutputError,
+    CodexOutputValidationError,
+    clean_stderr,
+)
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
 
@@ -609,62 +615,101 @@ def _analysis_keyframe_proxy(data: bytes) -> bytes:
     return proxy.tobytes()
 
 
+def _reject_project_index(reason: str, field_path: str) -> NoReturn:
+    raise CodexOutputValidationError(
+        reason, field_path, message="project index output is invalid",
+    )
+
+
 def _validate_project_index_frame_bindings(
     index: dict,
     frame_orders_by_segment: dict[int, frozenset[int]],
 ) -> None:
     """Bind every model occurrence to one real staged segment/frame."""
-    if (
-        not frame_orders_by_segment
-        or any(not orders for orders in frame_orders_by_segment.values())
-        or not index["scenes"]
+    if not frame_orders_by_segment or any(
+        not orders for orders in frame_orders_by_segment.values()
     ):
-        raise ValueError("project index output is invalid")
+        _reject_project_index("input_frame_set_invalid", "/scenes")
+    if not index["scenes"]:
+        _reject_project_index("scenes_empty", "/scenes")
 
     def validate_occurrences(
-        occurrences: object, *, relation: bool,
+        occurrences: object, *, category: str, item_index: int, relation: bool,
     ) -> set[tuple[int, int]]:
+        occurrence_path = f"/{category}/{item_index}/occurrences"
         if not isinstance(occurrences, list) or not occurrences:
-            raise ValueError("project index output is invalid")
+            _reject_project_index("occurrences_empty", occurrence_path)
         seen_segments: set[int] = set()
         bound_frames: set[tuple[int, int]] = set()
-        for occurrence in occurrences:
+        for occurrence_index, occurrence in enumerate(occurrences):
+            item_path = f"{occurrence_path}/{occurrence_index}"
             if not isinstance(occurrence, dict):
-                raise ValueError("project index output is invalid")
+                _reject_project_index("occurrence_invalid", item_path)
             segment_index = occurrence.get("segment_index")
             if (
                 isinstance(segment_index, bool)
                 or not isinstance(segment_index, int)
-                or segment_index not in frame_orders_by_segment
-                or segment_index in seen_segments
             ):
-                raise ValueError("project index output is invalid")
+                _reject_project_index(
+                    "segment_index_invalid", f"{item_path}/segment_index",
+                )
+            if segment_index not in frame_orders_by_segment:
+                _reject_project_index(
+                    "segment_index_unknown", f"{item_path}/segment_index",
+                )
+            if segment_index in seen_segments:
+                _reject_project_index(
+                    "segment_index_duplicate", f"{item_path}/segment_index",
+                )
             seen_segments.add(segment_index)
-            raw_frames = occurrence.get("frames" if relation else "frame_orders")
+            frame_field = "frames" if relation else "frame_orders"
+            raw_frames = occurrence.get(frame_field)
+            frame_path = f"{item_path}/{frame_field}"
             if not isinstance(raw_frames, list) or not raw_frames:
-                raise ValueError("project index output is invalid")
+                _reject_project_index("frame_list_empty", frame_path)
             orders = [
                 frame.get("frame_order") if relation and isinstance(frame, dict)
                 else frame
                 for frame in raw_frames
             ]
-            if (
-                any(
-                    isinstance(order, bool) or not isinstance(order, int)
-                    for order in orders
+            for frame_index, order in enumerate(orders):
+                order_path = (
+                    f"{frame_path}/{frame_index}/frame_order" if relation
+                    else f"{frame_path}/{frame_index}"
                 )
-                or len(orders) != len(set(orders))
-                or not set(orders).issubset(frame_orders_by_segment[segment_index])
-            ):
-                raise ValueError("project index output is invalid")
+                if isinstance(order, bool) or not isinstance(order, int):
+                    _reject_project_index("frame_order_invalid", order_path)
+                if order not in frame_orders_by_segment[segment_index]:
+                    _reject_project_index("frame_order_unknown", order_path)
+            if len(orders) != len(set(orders)):
+                _reject_project_index("frame_order_duplicate", frame_path)
+            if orders != sorted(orders):
+                _reject_project_index("frame_order_unsorted", frame_path)
+            if relation:
+                for frame_index, frame in enumerate(raw_frames):
+                    for field in ("state", "geometry"):
+                        if (
+                            not isinstance(frame.get(field), str)
+                            or not frame[field].strip()
+                        ):
+                            _reject_project_index(
+                                f"relation_{field}_blank",
+                                f"{frame_path}/{frame_index}/{field}",
+                            )
             bound_frames.update((segment_index, order) for order in orders)
         return bound_frames
 
     for category in ("people", "entities"):
-        for item in index[category].values():
-            validate_occurrences(item.get("occurrences"), relation=False)
-    for item in index["relations"].values():
-        validate_occurrences(item.get("occurrences"), relation=True)
+        for item_index, item in enumerate(index[category].values()):
+            validate_occurrences(
+                item.get("occurrences"), category=category,
+                item_index=item_index, relation=False,
+            )
+    for item_index, item in enumerate(index["relations"].values()):
+        validate_occurrences(
+            item.get("occurrences"), category="relations",
+            item_index=item_index, relation=True,
+        )
 
     expected_scene_frames = {
         (segment_index, frame_order)
@@ -672,15 +717,18 @@ def _validate_project_index_frame_bindings(
         for frame_order in frame_orders
     }
     bound_scene_frames: set[tuple[int, int]] = set()
-    for item in index["scenes"].values():
+    for item_index, item in enumerate(index["scenes"].values()):
         item_frames = validate_occurrences(
-            item.get("occurrences"), relation=False,
+            item.get("occurrences"), category="scenes",
+            item_index=item_index, relation=False,
         )
         if bound_scene_frames.intersection(item_frames):
-            raise ValueError("project index output is invalid")
+            _reject_project_index(
+                "scene_frame_duplicate", f"/scenes/{item_index}/occurrences",
+            )
         bound_scene_frames.update(item_frames)
     if bound_scene_frames != expected_scene_frames:
-        raise ValueError("project index output is invalid")
+        _reject_project_index("scene_frame_coverage_incomplete", "/scenes")
 
 
 def _generate_project_element_index(
@@ -753,35 +801,104 @@ def _generate_project_element_index(
             try:
                 value = json.loads(raw_output.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("project index output is invalid") from None
-            normalized = codex_output_schemas.normalize_project_index(value)
+                _reject_project_index("json_invalid", "/project_index")
+            try:
+                normalized = codex_output_schemas.normalize_project_index(value)
+            except ValueError:
+                _reject_project_index("shape_invalid", "/project_index")
+            for category in ("people", "entities", "scenes"):
+                for item_index, item in enumerate(normalized[category].values()):
+                    description = item["source_visual_description"]
+                    if not isinstance(description, str) or not description.strip():
+                        _reject_project_index(
+                            "source_description_blank",
+                            f"/{category}/{item_index}/source_visual_description",
+                        )
+            for item_index, item in enumerate(normalized["relations"].values()):
+                predicate = item["predicate"]
+                if not isinstance(predicate, str) or not predicate.strip():
+                    _reject_project_index(
+                        "relation_predicate_blank",
+                        f"/relations/{item_index}/predicate",
+                    )
             _validate_project_index_frame_bindings(
                 normalized, frame_orders_by_segment,
             )
+            known_keys = set().union(*(
+                set(normalized[category])
+                for category in ("people", "entities", "scenes")
+            ))
+            for item_index, item in enumerate(normalized["relations"].values()):
+                subject = item["subject_key"]
+                object_key = item["object_key"]
+                if subject not in known_keys:
+                    _reject_project_index(
+                        "relation_subject_unknown",
+                        f"/relations/{item_index}/subject_key",
+                    )
+                if object_key not in known_keys:
+                    _reject_project_index(
+                        "relation_object_unknown",
+                        f"/relations/{item_index}/object_key",
+                    )
+                if subject == object_key:
+                    _reject_project_index(
+                        "relation_endpoints_identical",
+                        f"/relations/{item_index}/object_key",
+                    )
             canonical = image_optimization._canonical_element_index(normalized)
             for category, prefix in (
                 ("people", "person"), ("entities", "entity"),
                 ("scenes", "scene"), ("relations", "relation"),
             ):
                 keys = list(normalized[category])
-                if keys != [
+                expected_keys = [
                     f"{prefix}-{index:02d}" for index in range(1, len(keys) + 1)
-                ] or set(canonical[category]) != set(keys):
-                    raise ValueError("project index output is invalid")
+                ]
+                for item_index, (key, expected_key) in enumerate(
+                    zip(keys, expected_keys)
+                ):
+                    if key != expected_key:
+                        _reject_project_index(
+                            "stable_key_nonsequential",
+                            f"/{category}/{item_index}/key",
+                        )
+                missing_keys = set(keys).difference(canonical[category])
+                if missing_keys:
+                    item_index = next(
+                        index for index, key in enumerate(keys) if key in missing_keys
+                    )
+                    _reject_project_index(
+                        "record_rejected",
+                        f"/{category}/{item_index}",
+                    )
             for category in ("people", "entities", "scenes"):
-                for key, item in normalized[category].items():
+                for item_index, (key, item) in enumerate(
+                    normalized[category].items()
+                ):
                     if len(canonical[category][key]["occurrences"]) != len(
                         item["occurrences"]
                     ):
-                        raise ValueError("project index output is invalid")
-            for key, item in normalized["relations"].items():
+                        _reject_project_index(
+                            "occurrence_rejected",
+                            f"/{category}/{item_index}/occurrences",
+                        )
+            for item_index, (key, item) in enumerate(
+                normalized["relations"].items()
+            ):
                 frozen = canonical["relations"][key]
-                if (
-                    len(frozen["occurrences"]) != len(item["occurrences"])
-                    or sum(len(entry["frames"]) for entry in frozen["occurrences"])
-                    != sum(len(entry["frames"]) for entry in item["occurrences"])
-                ):
-                    raise ValueError("project index output is invalid")
+                if len(frozen["occurrences"]) != len(item["occurrences"]):
+                    _reject_project_index(
+                        "occurrence_rejected",
+                        f"/relations/{item_index}/occurrences",
+                    )
+                if sum(
+                    len(entry["frames"]) for entry in frozen["occurrences"]
+                ) != sum(len(entry["frames"]) for entry in item["occurrences"]):
+                    _reject_project_index(
+                        "relation_frame_rejected",
+                        f"/relations/{item_index}/occurrences",
+                    )
             return _canonical_json_bytes(canonical)
 
         if not callable(getattr(runner, "run_isolated_until_output", None)):

@@ -81,6 +81,28 @@ class CodexOutputError(RuntimeError):
     """codex 成功退出，但音频隔离区没有可安全读取的唯一输出。"""
 
 
+class CodexOutputValidationError(ValueError):
+    """A backend-owned, safe-to-log model-output rejection."""
+
+    _REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+    _PATH_RE = re.compile(r"^/(?:[a-z_]+|[0-9]+)(?:/(?:[a-z_]+|[0-9]+))*$")
+
+    def __init__(
+        self,
+        reason: str,
+        field_path: str,
+        *,
+        message: str = "model output is invalid",
+    ) -> None:
+        if self._REASON_RE.fullmatch(reason) is None:
+            raise ValueError("validation reason is invalid")
+        if self._PATH_RE.fullmatch(field_path) is None:
+            raise ValueError("validation field path is invalid")
+        super().__init__(f"{message}: {reason} at {field_path}")
+        self.reason = reason
+        self.field_path = field_path
+
+
 def clean_stderr(text: str | None, limit: int = 500) -> str:
     """剔除环境变量行（KEY=VALUE），截断到 limit 字。"""
     if not text:
@@ -803,6 +825,11 @@ class CodexRunner:
                 first_diagnostic["validator_error_type"] = (
                     type(validation_error).__name__
                 )
+                if isinstance(validation_error, CodexOutputValidationError):
+                    first_diagnostic["validator_error"] = {
+                        "reason": validation_error.reason,
+                        "field_path": validation_error.field_path,
+                    }
                 final_failure_diagnostic = first_diagnostic
                 return invalid
             if value is None:

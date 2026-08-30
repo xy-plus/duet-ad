@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from app import pipeline
+from app.codex_runner import CodexOutputValidationError
 
 
 class _IndexRunner:
@@ -277,6 +278,28 @@ def test_project_index_allows_empty_people_and_entities(tmp_path):
     )
 
     assert json.loads(result.read_text(encoding="utf-8")) == payload
+
+
+def test_project_index_rejection_exposes_safe_reason_and_field_path(tmp_path):
+    cdir = tmp_path / "conversation"
+    frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
+    frames.mkdir(parents=True)
+    frame_paths = [frames / "01.png", frames / "02.png"]
+    for path in frame_paths:
+        path.write_bytes(_png())
+    payload = copy.deepcopy(_element_index())
+    payload["relations"]["relation-01"]["object_key"] = "entity-99"
+
+    with pytest.raises(CodexOutputValidationError) as caught:
+        pipeline._generate_project_element_index(
+            _IndexRunner(payload),
+            cdir,
+            {1: frame_paths},
+            skill_bytes=b"frozen video-maker skill",
+        )
+
+    assert caught.value.reason == "relation_object_unknown"
+    assert caught.value.field_path == "/relations/0/object_key"
 
 
 def test_segmented_image_prompt_generation_passes_element_index_once(

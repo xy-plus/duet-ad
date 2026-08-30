@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from app import codex_runner
-from app.codex_runner import CodexError, CodexRunner
+from app.codex_runner import CodexError, CodexOutputValidationError, CodexRunner
 
 
 def test_clean_json_transport_is_byte_for_byte_unchanged() -> None:
@@ -296,7 +296,10 @@ def test_rejected_final_output_records_exact_bounded_diagnostic_reason(
     def validate_ok(raw: bytes) -> dict[str, object]:
         value = json.loads(raw.decode("utf-8"))
         if set(value) != {"ok"}:
-            raise ValueError("unexpected schema")
+            raise CodexOutputValidationError(
+                "field_set_invalid", "/people/0/key",
+                message="sensitive validator context",
+            )
         return value
 
     with tempfile.TemporaryDirectory(
@@ -339,6 +342,15 @@ def test_rejected_final_output_records_exact_bounded_diagnostic_reason(
         assert diagnostic["max_bytes"] == max_output_bytes
         assert diagnostic["sha256"] == hashlib.sha256(payload).hexdigest()
         assert diagnostic["telemetry_suffix_matched"] is False
+        if reason == "schema_invalid":
+            assert diagnostic["validator_error_type"] == (
+                "CodexOutputValidationError"
+            )
+            assert diagnostic["validator_error"] == {
+                "reason": "field_set_invalid",
+                "field_path": "/people/0/key",
+            }
         serialized_diagnostic = json.dumps(diagnostic, ensure_ascii=False)
         assert "sensitive-model-output" not in serialized_diagnostic
         assert "unexpected" not in serialized_diagnostic
+        assert "sensitive validator context" not in serialized_diagnostic
