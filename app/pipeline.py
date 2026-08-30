@@ -1151,6 +1151,7 @@ def _generate_image_optimization_project(
         video_skill_bytes = milestone.read_bytes("video-maker")
     if skill_bytes is None:
         raise PipelineError("frozen image-postprocess Skill is required")
+    policy = _retry_policy(settings)
     if element_index_path is None:
         frame_paths = {
             segment["index"]: sorted(
@@ -1176,7 +1177,6 @@ def _generate_image_optimization_project(
                 )
                 raise
 
-        policy = _retry_policy(settings)
         element_index_path = run_with_retry(
             generate_element_index,
             policy=policy,
@@ -1212,9 +1212,15 @@ def _generate_image_optimization_project(
                 retryable=False,
             ) from None
 
-    # There is exactly one compiler.  Operational retries happen inside the
-    # failed global/segment phase so completed sibling phases are not repeated.
-    return attempt()
+    # Phase-local retries preserve completed siblings.  This outer retry covers
+    # only whole-call output failures and re-enters the same phase cache; the
+    # project index above is intentionally outside it and is never regenerated.
+    return run_with_retry(
+        attempt,
+        policy=policy,
+        is_retryable=_retryable_operation_error,
+        on_retry=_retry_logger(step, policy),
+    )
 
 
 def _generate_segmented_image_prompts(
