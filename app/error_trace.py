@@ -305,6 +305,7 @@ def record(
     call_path: list[str],
     error: BaseException | None = None,
     reason: object | None = None,
+    details: object | None = None,
     logger: logging.Logger | None = None,
     secrets: Iterable[str] = (),
 ) -> dict[str, Any]:
@@ -321,6 +322,8 @@ def record(
                 else _bounded(reason, secret_values)
             ),
         }
+        if details is not None:
+            payload["details"] = _bounded(details, secret_values)
     except BaseException as payload_error:
         payload = {
             "schema": "duet.error-call-tree",

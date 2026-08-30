@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -52,6 +53,7 @@ _CODEX_TELEMETRY_RE = re.compile(
     r"(?:0|[1-9][0-9]*|[1-9][0-9]{0,2}(?:,[0-9]{3})+)[ \t\r\n]*"
 )
 _VOICE_OUTPUT_MAX_BYTES = 32 * 1024
+_FINAL_OUTPUT_EXCERPT_BYTES = 256
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _CHECKOUT_BOUNDARY = (
     _SOURCE_ROOT.parent.parent if _SOURCE_ROOT.parent.name == ".worktree" else _SOURCE_ROOT
@@ -153,6 +155,37 @@ def _extract_codex_json_output(raw: bytes) -> bytes:
     if _CODEX_TELEMETRY_RE.fullmatch(suffix) is None:
         raise ValueError("Codex final output has unknown text outside its JSON value")
     return text[start:end].encode("utf-8")
+
+
+def _redacted_output_excerpt(raw: bytes) -> str:
+    """Preserve transport shape without persisting model-owned text."""
+    rendered: list[str] = []
+    for byte in raw:
+        if 65 <= byte <= 90 or 97 <= byte <= 122:
+            rendered.append("x")
+        elif 48 <= byte <= 57:
+            rendered.append("0")
+        elif byte == 10:
+            rendered.append(r"\n")
+        elif byte == 13:
+            rendered.append(r"\r")
+        elif byte == 9:
+            rendered.append(r"\t")
+        elif byte == 32:
+            rendered.append(" ")
+        elif byte in b'{}[]:,"`':
+            rendered.append(chr(byte))
+        else:
+            rendered.append(".")
+    return "".join(rendered)
+
+
+def _known_telemetry_suffix_matched(raw_tail: bytes) -> bool:
+    text = raw_tail.decode("utf-8", errors="replace")
+    return any(
+        _CODEX_TELEMETRY_RE.fullmatch(text[index:]) is not None
+        for index in range(len(text) + 1)
+    )
 
 
 def _atomic_publish_output(parent: Path, destination: Path, payload: bytes) -> None:
@@ -489,6 +522,7 @@ class CodexRunner:
         stage_hint = Path(workdir)
         session_hint = Path(session_dir)
         requested_hint = Path(output_path)
+        final_failure_diagnostic: dict[str, object] | None = None
 
         def record_failure(exc: BaseException) -> None:
             """Best-effort diagnostics must never replace the operational error."""
@@ -507,6 +541,11 @@ class CodexRunner:
                     / f"{stage_hint.name or 'pre-spawn'}.json",
                     call_path=call_path,
                     error=exc,
+                    details=(
+                        {"codex_final_output": final_failure_diagnostic}
+                        if final_failure_diagnostic is not None
+                        else None
+                    ),
                     logger=_LOGGER,
                 )
             except BaseException as record_error:
@@ -593,7 +632,6 @@ class CodexRunner:
                 0o600,
                 dir_fd=parent_fd,
             )
-            final_initial = os.fstat(final_output_fd)
             final_output = final_output.resolve(strict=True)
         except OSError as cause:
             if final_output_fd >= 0:
@@ -669,7 +707,6 @@ class CodexRunner:
             initial_stat: os.stat_result = initial,
             *,
             allow_initial_inode: bool = False,
-            final_transport: bool = False,
         ) -> tuple[_T, bytes] | object:
             first = read_once(
                 name, initial_stat, allow_initial_inode=allow_initial_inode,
@@ -682,13 +719,7 @@ class CodexRunner:
             )
             if second is None or first != second:
                 return missing
-            if final_transport:
-                try:
-                    candidates = (_extract_codex_json_output(first[1]),)
-                except ValueError:
-                    return missing
-            else:
-                candidates = _output_candidates(first[1])
+            candidates = _output_candidates(first[1])
             for candidate in candidates:
                 try:
                     value = validate_output(candidate)
@@ -704,29 +735,143 @@ class CodexRunner:
             _atomic_publish_output(parent, requested, payload)
             return value
 
-        def read_authoritative_final() -> tuple[_T, bytes] | object:
-            observed = read_once(
-                final_output.name,
-                final_initial,
-                allow_initial_inode=True,
-            )
-            if observed is None:
+        def final_snapshot() -> tuple[
+            tuple[int, int, int, int], bytes, dict[str, object]
+        ] | tuple[None, None, dict[str, object]]:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(final_output.name, flags, dir_fd=parent_fd)
+            except OSError:
                 try:
                     info = os.stat(
                         final_output.name, dir_fd=parent_fd, follow_symlinks=False,
                     )
                 except OSError:
-                    return invalid
-                if not stat.S_ISREG(info.st_mode) or info.st_size != 0:
-                    return invalid
-                return missing
-            adopted = read_published(
-                final_output.name,
-                final_initial,
-                allow_initial_inode=True,
-                final_transport=True,
-            )
-            return invalid if adopted is missing else adopted
+                    return None, None, {
+                        "reason": "missing",
+                        "size_bytes": None,
+                        "sha256": None,
+                        "telemetry_suffix_matched": False,
+                        "head_redacted": "",
+                        "tail_redacted": "",
+                    }
+                return None, None, {
+                    "reason": (
+                        "not_regular" if not stat.S_ISREG(info.st_mode)
+                        else "unreadable"
+                    ),
+                    "size_bytes": info.st_size,
+                    "sha256": None,
+                    "telemetry_suffix_matched": False,
+                    "head_redacted": "",
+                    "tail_redacted": "",
+                }
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode):
+                    return None, None, {
+                        "reason": "not_regular",
+                        "size_bytes": info.st_size,
+                        "sha256": None,
+                        "telemetry_suffix_matched": False,
+                        "head_redacted": "",
+                        "tail_redacted": "",
+                    }
+                digest = hashlib.sha256()
+                head = bytearray()
+                tail = bytearray()
+                payload = bytearray()
+                total = 0
+                while True:
+                    chunk = os.read(fd, 64 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    total += len(chunk)
+                    if len(head) < _FINAL_OUTPUT_EXCERPT_BYTES:
+                        head.extend(
+                            chunk[:_FINAL_OUTPUT_EXCERPT_BYTES - len(head)]
+                        )
+                    tail.extend(chunk)
+                    if len(tail) > _FINAL_OUTPUT_EXCERPT_BYTES:
+                        del tail[:-_FINAL_OUTPUT_EXCERPT_BYTES]
+                    if len(payload) <= max_output_bytes:
+                        payload.extend(chunk)
+                        if len(payload) > max_output_bytes:
+                            payload.clear()
+                after = os.fstat(fd)
+            finally:
+                os.close(fd)
+            identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+            diagnostic: dict[str, object] = {
+                "reason": "",
+                "size_bytes": total,
+                "max_bytes": max_output_bytes,
+                "sha256": digest.hexdigest(),
+                "telemetry_suffix_matched": _known_telemetry_suffix_matched(
+                    bytes(tail)
+                ),
+                "excerpt_limit_bytes": _FINAL_OUTPUT_EXCERPT_BYTES,
+                "head_redacted": _redacted_output_excerpt(bytes(head)),
+                "tail_redacted": _redacted_output_excerpt(bytes(tail)),
+            }
+            if identity != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+            ) or total != info.st_size:
+                diagnostic["reason"] = "unstable"
+                return None, None, diagnostic
+            if total == 0:
+                diagnostic["reason"] = "empty"
+                return None, None, diagnostic
+            if total > max_output_bytes:
+                diagnostic["reason"] = "oversize"
+                return None, None, diagnostic
+            return identity, bytes(payload), diagnostic
+
+        def read_authoritative_final() -> tuple[_T, bytes] | object:
+            nonlocal final_failure_diagnostic
+            observed_identity, _observed_raw, observed_diagnostic = final_snapshot()
+            if observed_identity is None:
+                final_failure_diagnostic = observed_diagnostic
+                if observed_diagnostic["reason"] in {"empty", "missing"}:
+                    return missing
+                return invalid
+
+            first_identity, first_raw, first_diagnostic = final_snapshot()
+            if first_identity is None or first_raw is None:
+                first_diagnostic["reason"] = "unstable"
+                final_failure_diagnostic = first_diagnostic
+                return invalid
+            time.sleep(0.1)
+            second_identity, second_raw, second_diagnostic = final_snapshot()
+            if (
+                second_identity is None
+                or second_raw is None
+                or first_identity != second_identity
+                or first_raw != second_raw
+            ):
+                second_diagnostic["reason"] = "unstable"
+                final_failure_diagnostic = second_diagnostic
+                return invalid
+            try:
+                candidate = _extract_codex_json_output(first_raw)
+            except ValueError:
+                first_diagnostic["reason"] = "transport_invalid"
+                final_failure_diagnostic = first_diagnostic
+                return invalid
+            try:
+                value = validate_output(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError) as validation_error:
+                first_diagnostic["reason"] = "schema_invalid"
+                first_diagnostic["validator_error_type"] = (
+                    type(validation_error).__name__
+                )
+                final_failure_diagnostic = first_diagnostic
+                return invalid
+            if value is None:
+                raise CodexError("isolated output validator returned None")
+            final_failure_diagnostic = None
+            return value, candidate
 
         try:
             with self._sem, tempfile.TemporaryFile(mode="w+b") as stderr_file:
@@ -765,6 +910,8 @@ class CodexRunner:
                             _terminate_process_group(proc)
                             process_group_stopped = True
                             adopted = read_authoritative_final()
+                            if final_failure_diagnostic is not None:
+                                final_failure_diagnostic["returncode"] = proc.returncode
                             if adopted is invalid:
                                 raise CodexError(
                                     "codex exited without publishing valid output: "
@@ -796,6 +943,8 @@ class CodexRunner:
                             _terminate_process_group(proc)
                             process_group_stopped = True
                             final_adopted = read_authoritative_final()
+                            if final_failure_diagnostic is not None:
+                                final_failure_diagnostic["returncode"] = proc.returncode
                             if final_adopted is invalid:
                                 raise CodexError(
                                     "codex exited without publishing valid output",
