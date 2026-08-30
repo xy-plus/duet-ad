@@ -609,6 +609,53 @@ def _analysis_keyframe_proxy(data: bytes) -> bytes:
     return proxy.tobytes()
 
 
+def _validate_project_index_frame_bindings(
+    index: dict,
+    frame_orders_by_segment: dict[int, frozenset[int]],
+) -> None:
+    """Bind every model occurrence to one real staged segment/frame."""
+
+    def validate_occurrences(occurrences: object, *, relation: bool) -> None:
+        if not isinstance(occurrences, list) or not occurrences:
+            raise ValueError("project index output is invalid")
+        seen_segments: set[int] = set()
+        for occurrence in occurrences:
+            if not isinstance(occurrence, dict):
+                raise ValueError("project index output is invalid")
+            segment_index = occurrence.get("segment_index")
+            if (
+                isinstance(segment_index, bool)
+                or not isinstance(segment_index, int)
+                or segment_index not in frame_orders_by_segment
+                or segment_index in seen_segments
+            ):
+                raise ValueError("project index output is invalid")
+            seen_segments.add(segment_index)
+            raw_frames = occurrence.get("frames" if relation else "frame_orders")
+            if not isinstance(raw_frames, list) or not raw_frames:
+                raise ValueError("project index output is invalid")
+            orders = [
+                frame.get("frame_order") if relation and isinstance(frame, dict)
+                else frame
+                for frame in raw_frames
+            ]
+            if (
+                any(
+                    isinstance(order, bool) or not isinstance(order, int)
+                    for order in orders
+                )
+                or len(orders) != len(set(orders))
+                or not set(orders).issubset(frame_orders_by_segment[segment_index])
+            ):
+                raise ValueError("project index output is invalid")
+
+    for category in ("people", "entities", "scenes"):
+        for item in index[category].values():
+            validate_occurrences(item.get("occurrences"), relation=False)
+    for item in index["relations"].values():
+        validate_occurrences(item.get("occurrences"), relation=True)
+
+
 def _generate_project_element_index(
     runner,
     cdir: Path,
@@ -633,7 +680,15 @@ def _generate_project_element_index(
         isolated_work.mkdir()
         _materialize_skill_bytes(isolated_root / "SKILL.md", skill_bytes)
         segments = []
+        frame_orders_by_segment: dict[int, frozenset[int]] = {}
         for segment_index in sorted(frame_paths):
+            if (
+                isinstance(segment_index, bool)
+                or not isinstance(segment_index, int)
+                or segment_index < 0
+                or not frame_paths[segment_index]
+            ):
+                raise PipelineError("project index frame set is invalid")
             frames = []
             destination = (
                 isolated_work / "segments" / str(segment_index) / "keyframes"
@@ -655,6 +710,9 @@ def _generate_project_element_index(
                 "segment_index": segment_index,
                 "frames": frames,
             })
+            frame_orders_by_segment[segment_index] = frozenset(
+                frame["frame_order"] for frame in frames
+            )
         (isolated_work / "project_index_request.json").write_text(
             json.dumps(
                 {"phase": "project_index", "segments": segments},
@@ -670,6 +728,9 @@ def _generate_project_element_index(
             except (UnicodeDecodeError, json.JSONDecodeError):
                 raise ValueError("project index output is invalid") from None
             normalized = codex_output_schemas.normalize_project_index(value)
+            _validate_project_index_frame_bindings(
+                normalized, frame_orders_by_segment,
+            )
             canonical = image_optimization._canonical_element_index(normalized)
             for category, prefix in (
                 ("people", "person"), ("entities", "entity"),

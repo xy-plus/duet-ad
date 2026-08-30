@@ -2319,7 +2319,7 @@ class TestCodexRunner:
         )
         assert argv[argv.index("-C") + 1] == str(stage)
 
-    def test_isolated_atomic_output_is_completion_signal_before_process_exit(
+    def test_isolated_business_output_is_never_adopted(
         self, monkeypatch, tmp_path,
     ):
         cdir = tmp_path / "conversation"
@@ -2334,32 +2334,28 @@ class TestCodexRunner:
             work = stage / "work"
             work.mkdir()
             output = work / "result.json"
-            runner = CodexRunner(timeout_s=10, concurrency=1)
+            runner = CodexRunner(timeout_s=3, concurrency=1)
             monkeypatch.setattr(
                 runner,
                 "build_argv",
                 lambda _workdir, _prompt: [
                     "/usr/bin/bash", "-c",
-                    f"printf '{{\"ok\":true}}' > '{work / '.result.tmp'}'; "
-                    f"mv -f '{work / '.result.tmp'}' '{output}'; /usr/bin/sleep 8",
+                    f"printf '{{\"ok\":true}}' > '{output}'",
                 ],
             )
 
-            started = time.monotonic()
-            result = runner.run_isolated_until_output(
-                stage,
-                "prompt",
-                session_dir=cdir,
-                output_path=output,
-                max_output_bytes=1024,
-                validate_output=lambda raw: json.loads(raw.decode("utf-8")),
-                output_schema={"type": "object"},
-            )
+            with pytest.raises(CodexError, match="without publishing valid output"):
+                runner.run_isolated_until_output(
+                    stage,
+                    "prompt",
+                    session_dir=cdir,
+                    output_path=output,
+                    max_output_bytes=1024,
+                    validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                    output_schema={"type": "object"},
+                )
 
-            assert result == {"ok": True}
-            assert time.monotonic() - started < 3
-
-    def test_isolated_direct_write_is_adopted_after_clean_exit(
+    def test_isolated_direct_write_cannot_replace_final_output(
         self, monkeypatch, tmp_path,
     ):
         cdir = tmp_path / "conversation"
@@ -2379,7 +2375,10 @@ class TestCodexRunner:
                 runner,
                 "build_argv",
                 lambda _workdir, _prompt: [
-                    "/usr/bin/bash", "-c", f"printf '{{\"ok\":true}}' > '{output}'",
+                    "/usr/bin/bash", "-c",
+                    f"printf '{{\"source\":\"business\"}}' > '{output}'; "
+                    f"printf '{{\"source\":\"final\"}}' > "
+                    f"'{work / '.codex-final-output.json'}'",
                 ],
             )
 
@@ -2391,7 +2390,8 @@ class TestCodexRunner:
                 max_output_bytes=1024,
                 validate_output=lambda raw: json.loads(raw.decode("utf-8")),
                 output_schema={"type": "object"},
-            ) == {"ok": True}
+            ) == {"source": "final"}
+            assert json.loads(output.read_text()) == {"source": "final"}
 
     def test_isolated_final_answer_is_adopted_after_clean_exit(
         self, monkeypatch, tmp_path,
@@ -2526,8 +2526,8 @@ class TestCodexRunner:
                     "/usr/bin/bash", "-c",
                     "trap '' TERM; "
                     f"(trap '' TERM; /usr/bin/sleep 2; /usr/bin/touch '{marker}') & "
-                    f"printf '{{\"ok\":true}}' > '{work / '.result.tmp'}'; "
-                    f"mv -f '{work / '.result.tmp'}' '{output}'; wait",
+                    f"printf '{{\"ok\":true}}' > "
+                    f"'{work / '.codex-final-output.json'}'; exit 0",
                 ],
             )
 
@@ -2611,7 +2611,7 @@ class TestCodexRunner:
             assert trace["error"]["type"] == "CodexError"
             assert trace["error"]["traceback"]
 
-    def test_isolated_placeholder_failure_writes_original_cause_before_spawn(
+    def test_isolated_final_output_failure_writes_original_cause_before_spawn(
         self, monkeypatch, tmp_path,
     ):
         cdir = tmp_path / "conversation"
@@ -2621,20 +2621,20 @@ class TestCodexRunner:
         )
         original_open = codex_runner.os.open
 
-        def fail_placeholder(path, flags, *args, **kwargs):
-            if path == "result.json":
-                raise OSError("placeholder storage unavailable")
+        def fail_final_output(path, flags, *args, **kwargs):
+            if path == ".codex-final-output.json":
+                raise OSError("final output storage unavailable")
             return original_open(path, flags, *args, **kwargs)
 
-        monkeypatch.setattr(codex_runner.os, "open", fail_placeholder)
+        monkeypatch.setattr(codex_runner.os, "open", fail_final_output)
         with tempfile.TemporaryDirectory(
-            prefix="duet-output-placeholder-failure-", dir="/tmp",
+            prefix="duet-final-output-failure-", dir="/tmp",
         ) as raw_stage:
             stage = Path(raw_stage).resolve(strict=True)
             work = stage / "work"
             work.mkdir()
 
-            with pytest.raises(CodexError, match="placeholder"):
+            with pytest.raises(CodexError, match="final output"):
                 CodexRunner(timeout_s=3, concurrency=1).run_isolated_until_output(
                     stage,
                     "prompt",
@@ -2697,7 +2697,7 @@ class TestCodexRunner:
                     OSError("diagnostic storage unavailable")
                 ),
             )
-            output.unlink()
+            output.unlink(missing_ok=True)
             (work / ".codex-final-output.json").unlink()
             (stage / ".codex-output-schema.json").unlink()
             with pytest.raises(RuntimeError, match="build argv exploded"):

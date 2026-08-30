@@ -63,7 +63,7 @@ _T = TypeVar("_T")
 # 隔离任务仍经由公开 run() 进入同一并发/超时/env 清洗路径；ContextVar 只把本次同步调用
 # 标为独立 stage，使 build_argv() 加上外层 bwrap。线程间不共享，普通视觉 run() 不会误继承。
 _ACTIVE_ISOLATED_STAGE: ContextVar[
-    tuple[int, Path, Path, tuple[Path, ...], Path | None] | None
+    tuple[int, Path, Path, tuple[Path, ...], Path | None, bool] | None
 ] = ContextVar(
     "active_isolated_stage", default=None
 )
@@ -87,19 +87,6 @@ def clean_stderr(text: str | None, limit: int = 500) -> str:
         return ""
     lines = [l for l in text.splitlines() if not _ENV_LINE_RE.match(l.strip())]
     return "\n".join(lines).strip()[-limit:]
-
-
-def _output_candidates(raw: bytes) -> tuple[bytes, ...]:
-    """Normalize only transport wrappers; semantic JSON stays model-owned."""
-    stripped = raw.strip()
-    candidates = [stripped]
-    if stripped.startswith(b"```") and stripped.endswith(b"```"):
-        first_newline = stripped.find(b"\n")
-        if first_newline >= 0:
-            fenced = stripped[first_newline + 1:-3].strip()
-            if fenced and fenced not in candidates:
-                candidates.append(fenced)
-    return tuple(candidates)
 
 
 def _extract_codex_json_output(raw: bytes) -> bytes:
@@ -284,6 +271,7 @@ def _isolated_outer_argv(
     inner_argv: list[str],
     *,
     writable_paths: tuple[Path, ...] = (),
+    readonly_stage: bool = False,
 ) -> list[str]:
     """构造单次任务外层挂载沙箱；任一路径异常都拒绝运行。"""
     try:
@@ -316,7 +304,14 @@ def _isolated_outer_argv(
     if not _is_relative_to(session_dir, checkout) and not _is_relative_to(session_dir, tmp_root):
         argv += ["--tmpfs", str(session_dir)]
     argv += ["--tmpfs", str(tmp_root)]
-    if writable:
+    if readonly_stage:
+        # Structured calls expose one pre-created transport file as writable.
+        # The stage, including the not-yet-created business output path, stays
+        # read-only; only the backend may publish the validated business file.
+        argv += ["--ro-bind", str(stage), str(stage)]
+        for path in writable:
+            argv += ["--bind", str(path), str(path)]
+    elif writable:
         # Keep the stage directories writable so tools that publish atomically
         # (temporary file + rename) can replace the declared output.  Overlay
         # every staged input as a read-only file mount; those mount points
@@ -410,9 +405,11 @@ class CodexRunner:
 
     def build_argv(self, workdir: Path, prompt: str) -> list[str]:
         active = _ACTIVE_ISOLATED_STAGE.get()
-        isolated_stage: tuple[Path, Path, tuple[Path, ...]] | None = None
+        isolated_stage: (
+            tuple[Path, Path, tuple[Path, ...], Path | None, bool] | None
+        ) = None
         if active is not None and active[0] == id(self):
-            isolated_stage = (active[1], active[2], active[3], active[4])
+            isolated_stage = (active[1], active[2], active[3], active[4], active[5])
             try:
                 actual = Path(workdir).resolve(strict=True)
             except OSError:
@@ -450,6 +447,7 @@ class CodexRunner:
             isolated_stage[1],
             argv,
             writable_paths=isolated_stage[2],
+            readonly_stage=isolated_stage[4],
         )
 
     def run(self, workdir: Path, prompt: str) -> None:
@@ -496,7 +494,9 @@ class CodexRunner:
         if not session.is_dir():
             raise CodexError("isolated session path is invalid")
         writable = _isolated_writable_paths(stage, writable_paths)
-        token = _ACTIVE_ISOLATED_STAGE.set((id(self), stage, session, writable, None))
+        token = _ACTIVE_ISOLATED_STAGE.set(
+            (id(self), stage, session, writable, None, False)
+        )
         try:
             self.run(stage, prompt)
         finally:
@@ -513,15 +513,12 @@ class CodexRunner:
         validate_output: Callable[[bytes], _T],
         output_schema: Mapping[str, object],
     ) -> _T:
-        """Return one valid declared output without delegating publication safety.
+        """Validate one schema-constrained final answer, then publish it.
 
-        The API creates the empty regular output placeholder itself.  A
-        replacement inode that is byte-stable across two observations remains
-        an early completion signal.  A normal in-place write is accepted only
-        after Codex exits successfully and its process group has been stopped;
-        the backend atomically publishes validated bytes to the declared path.
-        Validation is a protocol/shape check supplied by the caller, not a
-        content-quality decision.  Unrelated Codex work is untouched.
+        Codex may write only ``.codex-final-output.json``.  The requested
+        business output does not exist in the read-only sandbox and is created
+        atomically by the backend only after Codex exits cleanly and validation
+        succeeds.  There is deliberately no direct-write adoption path.
         """
         stage_hint = Path(workdir)
         session_hint = Path(session_dir)
@@ -597,7 +594,6 @@ class CodexRunner:
             record_failure(exc)
             raise
         parent_fd = -1
-        placeholder_fd = -1
         final_output_fd = -1
         try:
             tmp_root = Path("/tmp").resolve(strict=True)
@@ -614,6 +610,7 @@ class CodexRunner:
             not requested.is_absolute()
             or requested.parent != parent
             or requested.name in {"", ".", ".."}
+            or requested.name == ".codex-final-output.json"
             or requested.exists()
             or requested.is_symlink()
         ):
@@ -623,14 +620,6 @@ class CodexRunner:
                 parent,
                 os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
             )
-            placeholder_fd = os.open(
-                requested.name,
-                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=parent_fd,
-            )
-            initial = os.fstat(placeholder_fd)
-            declared = Path(requested).resolve(strict=True)
             final_output = parent / ".codex-final-output.json"
             final_output_fd = os.open(
                 final_output.name,
@@ -642,12 +631,10 @@ class CodexRunner:
         except OSError as cause:
             if final_output_fd >= 0:
                 os.close(final_output_fd)
-            if placeholder_fd >= 0:
-                os.close(placeholder_fd)
             if parent_fd >= 0:
                 os.close(parent_fd)
             raise_recorded(
-                CodexError("isolated output placeholder could not be created"),
+                CodexError("isolated final output could not be created"),
                 cause=cause,
             )
 
@@ -668,9 +655,9 @@ class CodexRunner:
                 stream.write(schema_bytes)
                 stream.flush()
                 os.fsync(stream.fileno())
-            writable = _isolated_writable_paths(stage, (declared, final_output))
+            writable = _isolated_writable_paths(stage, (final_output,))
             token = _ACTIVE_ISOLATED_STAGE.set(
-                (id(self), stage, session, writable, final_output)
+                (id(self), stage, session, writable, final_output, True)
             )
             try:
                 argv = self.build_argv(stage, prompt)
@@ -679,78 +666,11 @@ class CodexRunner:
         except BaseException as exc:
             record_failure(exc)
             os.close(final_output_fd)
-            os.close(placeholder_fd)
             os.close(parent_fd)
             raise
 
         missing = object()
         invalid = object()
-
-        def read_once(
-            name: str,
-            initial_stat: os.stat_result,
-            *,
-            allow_initial_inode: bool,
-        ) -> tuple[tuple[int, int, int, int], bytes] | None:
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            try:
-                fd = os.open(name, flags, dir_fd=parent_fd)
-            except OSError:
-                return None
-            try:
-                info = os.fstat(fd)
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or (
-                        not allow_initial_inode
-                        and (info.st_dev, info.st_ino)
-                        == (initial_stat.st_dev, initial_stat.st_ino)
-                    )
-                    or info.st_size <= 0
-                    or info.st_size > max_output_bytes
-                ):
-                    return None
-                with os.fdopen(fd, "rb", closefd=False) as stream:
-                    raw = stream.read(max_output_bytes + 1)
-                if len(raw) > max_output_bytes:
-                    return None
-                after = os.fstat(fd)
-                identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
-                if identity != (
-                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
-                ):
-                    return None
-                return identity, raw
-            finally:
-                os.close(fd)
-
-        def read_published(
-            name: str = requested.name,
-            initial_stat: os.stat_result = initial,
-            *,
-            allow_initial_inode: bool = False,
-        ) -> tuple[_T, bytes] | object:
-            first = read_once(
-                name, initial_stat, allow_initial_inode=allow_initial_inode,
-            )
-            if first is None:
-                return missing
-            time.sleep(0.1)
-            second = read_once(
-                name, initial_stat, allow_initial_inode=allow_initial_inode,
-            )
-            if second is None or first != second:
-                return missing
-            candidates = _output_candidates(first[1])
-            for candidate in candidates:
-                try:
-                    value = validate_output(candidate)
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    continue
-                if value is None:
-                    raise CodexError("isolated output validator returned None")
-                return value, candidate
-            return missing
 
         def publish(adopted: tuple[_T, bytes]) -> _T:
             value, payload = adopted
@@ -922,13 +842,8 @@ class CodexRunner:
                                     f"codex exit {returncode}: {clean_stderr(stderr)}",
                                     retryable=True,
                                 )
-                            # Codex often follows its general file-editing
-                            # contract and writes the declared file in place.
-                            # That is not an early completion signal because a
-                            # live descendant could still be writing.  Once the
-                            # leader exits cleanly, stop the invocation's whole
-                            # process group, then let the backend validate and
-                            # adopt the stable bytes.
+                            # Stop every descendant before the backend reads the
+                            # sole transport file or publishes business output.
                             _terminate_process_group(proc)
                             process_group_stopped = True
                             adopted = read_authoritative_final()
@@ -942,9 +857,6 @@ class CodexRunner:
                                 )
                             if adopted is not missing:
                                 return publish(adopted)
-                            adopted = read_published(allow_initial_inode=True)
-                            if adopted is not missing:
-                                return publish(adopted)
                             raise CodexError(
                                 "codex exited without publishing valid output: "
                                 f"{clean_stderr(stderr)}",
@@ -953,33 +865,6 @@ class CodexRunner:
                         if time.monotonic() >= deadline:
                             raise CodexError(
                                 f"codex timed out after {self._timeout_s}s", retryable=True
-                            )
-                        adopted = read_published()
-                        if adopted is not missing:
-                            if proc.poll() is not None:
-                                continue
-                            # Stop this invocation before backend publication,
-                            # then re-read both transports.  This closes the
-                            # post-validation write race while preserving the
-                            # declared file's early-completion contract.
-                            _terminate_process_group(proc)
-                            process_group_stopped = True
-                            final_adopted = read_authoritative_final()
-                            if final_failure_diagnostic is not None:
-                                final_failure_diagnostic["returncode"] = proc.returncode
-                            if final_adopted is invalid:
-                                raise CodexError(
-                                    "codex exited without publishing valid output",
-                                    retryable=True,
-                                )
-                            if final_adopted is not missing:
-                                return publish(final_adopted)
-                            adopted = read_published(allow_initial_inode=True)
-                            if adopted is not missing:
-                                return publish(adopted)
-                            raise CodexError(
-                                "codex exited without publishing valid output",
-                                retryable=True,
                             )
                         time.sleep(0.1)
                 finally:
@@ -990,7 +875,6 @@ class CodexRunner:
             raise
         finally:
             os.close(final_output_fd)
-            os.close(placeholder_fd)
             os.close(parent_fd)
 
     def run_voice(

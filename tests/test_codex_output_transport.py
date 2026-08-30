@@ -92,6 +92,41 @@ def test_final_output_wins_and_is_atomically_published_after_validation(
         assert not list(work.glob(".result.json-transport-*"))
 
 
+def test_structured_sandbox_mounts_stage_readonly_and_only_final_output_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = tmp_path / "conversation"
+    session.mkdir()
+    monkeypatch.setattr(
+        codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="duet-final-output-permissions-", dir="/tmp",
+    ) as raw_stage:
+        stage = Path(raw_stage).resolve(strict=True)
+        work = stage / "work"
+        work.mkdir()
+        business_output = work / "result.json"
+        final_output = work / ".codex-final-output.json"
+        final_output.touch(mode=0o600)
+
+        argv = codex_runner._isolated_outer_argv(
+            stage,
+            session,
+            ["codex", "exec", "-o", str(final_output)],
+            writable_paths=(final_output,),
+            readonly_stage=True,
+        )
+
+        assert ["--ro-bind", str(stage), str(stage)] == argv[
+            argv.index("--ro-bind"):argv.index("--ro-bind") + 3
+        ]
+        final_bind = argv.index(str(final_output))
+        assert argv[final_bind - 1] == "--bind"
+        assert argv[final_bind + 1] == str(final_output)
+        assert str(business_output) not in argv
+
+
 def test_rejected_final_output_keeps_structured_error_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
