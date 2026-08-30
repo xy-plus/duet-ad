@@ -73,7 +73,10 @@ _CLIENT_REFRESH_MESSAGE = "页面版本已更新，请刷新页面后重试。"
 _GENERATED_VIDEO_VALIDATION_CACHE_SIZE = 256
 _PROMPT_FUSION_CONTINUATION_INTERVAL_S = 1.0
 _PROMPT_FUSION_PRODUCER_LEASE_S = 60 * 60.0
-_PIPELINE_GATE_WAIT_S = 24 * 60 * 60.0
+_PIPELINE_GATE_WAIT_S = 1.0
+_PIPELINE_RETRY_BASE_S = 1.0
+_PIPELINE_RETRY_MAX_S = 60.0
+_PIPELINE_DISPATCH_POLL_S = 0.25
 _PROMPT_FUSION_TIMER_LOCK = threading.Lock()
 _PROMPT_FUSION_TIMERS: dict[tuple[str, str, str, str], threading.Timer] = {}
 _LOGGER = logging.getLogger(__name__)
@@ -96,19 +99,44 @@ def _run_pipeline_under_gate(
     runner,
     gate,
     claimed_owner: object = None,
+    gate_acquired: bool = False,
 ) -> bool:
-    """Run one pipeline under a bounded gate and close every local failure."""
-    acquired = False
+    """Run one pipeline under a bounded gate; contention stays retryable."""
+    acquired = gate_acquired
     try:
-        acquired = gate.acquire(timeout=_PIPELINE_GATE_WAIT_S)
+        if not acquired:
+            acquired = gate.acquire(timeout=_PIPELINE_GATE_WAIT_S)
         if not acquired:
             exc = TimeoutError("pipeline gate wait expired")
-            storage.fail_pipeline_input(
-                settings.data_dir,
-                cid,
-                claimed_owner,
-                error="pipeline_gate_timeout",
+            owner = claimed_owner
+            if owner is None:
+                claimed = storage.claim_ready_queued_pipeline_input(
+                    settings.data_dir, cid
+                )
+                owner = claimed.get("_input_owner") if claimed else None
+            current = (
+                storage.load_pipeline_claim(settings.data_dir, cid, owner)
+                if owner is not None else None
             )
+            retry = current.get("_pipeline_retry") if current else None
+            previous_attempt = (
+                retry.get("attempt", 0) if isinstance(retry, Mapping) else 0
+            )
+            next_attempt = (
+                previous_attempt + 1
+                if isinstance(previous_attempt, int)
+                and not isinstance(previous_attempt, bool)
+                and previous_attempt >= 0
+                else 1
+            )
+            if owner is not None:
+                storage.requeue_pipeline_input(
+                    settings.data_dir,
+                    cid,
+                    owner,
+                    retry_delay_s=_pipeline_retry_delay(next_attempt),
+                    reason="pipeline_gate_timeout",
+                )
             _record_error_fail_open(
                 settings.data_dir / cid / "work" / "errors" / "pipeline-gate.json",
                 call_path=["pipeline", cid, "gate"],
@@ -138,6 +166,12 @@ def _run_pipeline_under_gate(
     finally:
         if acquired:
             gate.release()
+
+
+def _pipeline_retry_delay(attempt: int) -> float:
+    """Deterministic exponential backoff with a hard time bound."""
+    exponent = min(max(attempt - 1, 0), 30)
+    return min(_PIPELINE_RETRY_BASE_S * (2 ** exponent), _PIPELINE_RETRY_MAX_S)
 
 
 class _GeneratedVideoValidationCache:
@@ -3608,6 +3642,9 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.postprocess_recovery_tasks = []
     app.state.operation_recovery_tasks = []
     app.state.operation_loop = None
+    app.state.pipeline_dispatcher_thread = None
+    pipeline_dispatcher_stop = threading.Event()
+    pipeline_dispatcher_wakeup = threading.Event()
 
     async def advance_v4_operation(cid: str) -> None:
         """Ensure the accepted A keeps advancing on the one existing CID."""
@@ -3794,14 +3831,20 @@ def create_app(settings: Settings) -> FastAPI:
                 app.state.h3_resume_threads.append(thread)
                 thread.start()
 
-    def run_pipeline_gated(cid: str, claimed_owner: object = None) -> None:
+    def run_pipeline_gated(
+        cid: str,
+        claimed_owner: object = None,
+        gate_acquired: bool = False,
+    ) -> None:
         if not _run_pipeline_under_gate(
             settings,
             cid,
             codex_runner,
             pipeline_sem,
             claimed_owner,
+            gate_acquired,
         ):
+            pipeline_dispatcher_wakeup.set()
             return
         operation_loop = app.state.operation_loop
         if (
@@ -3812,6 +3855,77 @@ def create_app(settings: Settings) -> FastAPI:
         asyncio.run_coroutine_threadsafe(
             advance_v4_operation(cid), operation_loop
         ).result()
+
+    def dispatch_pipeline_retries() -> None:
+        """Use one bounded worker dispatcher; durable meta remains the queue."""
+        while not pipeline_dispatcher_stop.is_set():
+            acquired = False
+            try:
+                acquired = pipeline_sem.acquire(
+                    timeout=_PIPELINE_DISPATCH_POLL_S
+                )
+                if not acquired:
+                    continue
+                if pipeline_dispatcher_stop.is_set():
+                    pipeline_sem.release()
+                    acquired = False
+                    break
+                claimed = storage.claim_next_ready_queued_pipeline_input(
+                    settings.data_dir
+                )
+                if claimed is None:
+                    pipeline_sem.release()
+                    acquired = False
+                    pipeline_dispatcher_wakeup.wait(
+                        _PIPELINE_DISPATCH_POLL_S
+                    )
+                    pipeline_dispatcher_wakeup.clear()
+                    continue
+                cid, owner = claimed
+                try:
+                    threading.Thread(
+                        target=run_pipeline_gated,
+                        args=(cid, owner, True),
+                        daemon=True,
+                        name=f"pipeline-retry-{cid[:8]}",
+                    ).start()
+                    acquired = False  # the worker now owns this permit
+                except BaseException:
+                    storage.requeue_pipeline_input(
+                        settings.data_dir,
+                        cid,
+                        owner,
+                        retry_delay_s=_PIPELINE_RETRY_MAX_S,
+                        reason="pipeline_dispatch_failed",
+                    )
+                    pipeline_sem.release()
+                    acquired = False
+                    raise
+            except BaseException:
+                if acquired:
+                    pipeline_sem.release()
+                _LOGGER.exception("pipeline retry dispatcher iteration failed")
+                pipeline_dispatcher_stop.wait(_PIPELINE_DISPATCH_POLL_S)
+
+    @app.on_event("startup")
+    async def start_pipeline_retry_dispatcher() -> None:
+        if not settings.enable_pipeline:
+            return
+        thread = threading.Thread(
+            target=dispatch_pipeline_retries,
+            daemon=True,
+            name="pipeline-retry-dispatcher",
+        )
+        app.state.pipeline_dispatcher_thread = thread
+        thread.start()
+
+    @app.on_event("shutdown")
+    async def stop_pipeline_retry_dispatcher() -> None:
+        pipeline_dispatcher_stop.set()
+        pipeline_dispatcher_wakeup.set()
+        thread = app.state.pipeline_dispatcher_thread
+        if isinstance(thread, threading.Thread):
+            thread.join(timeout=max(1.0, _PIPELINE_DISPATCH_POLL_S * 2))
 
     @app.on_event("startup")
     async def recover_pipeline_inputs() -> None:

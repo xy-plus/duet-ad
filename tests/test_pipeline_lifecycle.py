@@ -164,15 +164,75 @@ def test_pipeline_gate_releases_and_closes_after_runner_exception(
     assert failed["error"] == "pipeline_internal_error"
 
 
-def test_pipeline_gate_timeout_closes_waiter(tmp_path, monkeypatch):
+def test_pipeline_gate_timeout_requeues_waiter_without_failing(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, enable_pipeline=True)
     meta = _ready_queued(settings)
     gate = threading.Semaphore(0)
     monkeypatch.setattr(main_module, "_PIPELINE_GATE_WAIT_S", 0.01)
+    monkeypatch.setattr(main_module, "_PIPELINE_RETRY_BASE_S", 0.01)
+    monkeypatch.setattr(main_module, "_PIPELINE_RETRY_MAX_S", 0.01)
 
     assert main_module._run_pipeline_under_gate(
         settings, meta["id"], object(), gate
     ) is False
-    failed = storage.load_meta(settings.data_dir, meta["id"])
-    assert failed["status"] == "failed"
-    assert failed["error"] == "pipeline_gate_timeout"
+    queued = storage.load_meta(settings.data_dir, meta["id"])
+    assert queued["status"] == "queued"
+    assert queued["error"] is None
+    assert queued["_input_owner"] is None
+    assert queued["_pipeline_retry"]["attempt"] == 1
+    assert queued["_pipeline_retry"]["reason"] == "pipeline_gate_timeout"
+
+
+def test_pipeline_gate_retry_is_resumed_by_single_dispatcher(tmp_path, monkeypatch):
+    settings = make_settings(
+        tmp_path, enable_pipeline=True, enable_h3_submit=False
+    )
+    meta = _ready_queued(settings)
+    called = threading.Event()
+
+    monkeypatch.setattr(main_module, "_PIPELINE_GATE_WAIT_S", 0.01)
+    monkeypatch.setattr(main_module, "_PIPELINE_RETRY_BASE_S", 0.01)
+    monkeypatch.setattr(main_module, "_PIPELINE_RETRY_MAX_S", 0.01)
+    monkeypatch.setattr(main_module, "_PIPELINE_DISPATCH_POLL_S", 0.01)
+
+    owner = storage.claim_ready_queued_pipeline_input(
+        settings.data_dir, meta["id"]
+    )["_input_owner"]
+    assert storage.requeue_pipeline_input(
+        settings.data_dir,
+        meta["id"],
+        owner,
+        retry_delay_s=0,
+        reason="pipeline_gate_timeout",
+    ) is not None
+
+    def fake_run(_settings, cid, _runner, **kwargs):
+        assert cid == meta["id"]
+        assert kwargs["claimed_owner"]
+        assert storage.finish_input_claim(
+            settings.data_dir,
+            cid,
+            kwargs["claimed_owner"],
+            status="failed",
+            error="dispatcher-test",
+        )
+        called.set()
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+    with TestClient(create_app(settings)) as client:
+        assert client.get("/api/health").status_code == 200
+        assert called.wait(timeout=1)
+
+    recovered = storage.load_meta(settings.data_dir, meta["id"])
+    assert recovered["status"] == "failed"
+    assert recovered["error"] == "dispatcher-test"
+    assert "_pipeline_retry" not in recovered
+
+
+def test_pipeline_retry_delay_is_deterministic_and_bounded(monkeypatch):
+    monkeypatch.setattr(main_module, "_PIPELINE_RETRY_BASE_S", 2.0)
+    monkeypatch.setattr(main_module, "_PIPELINE_RETRY_MAX_S", 30.0)
+
+    assert main_module._pipeline_retry_delay(1) == 2.0
+    assert main_module._pipeline_retry_delay(4) == 16.0
+    assert main_module._pipeline_retry_delay(1000) == 30.0

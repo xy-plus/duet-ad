@@ -8,7 +8,7 @@ import tempfile
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import isfinite
 from pathlib import Path
 from typing import Callable, NamedTuple
@@ -24,6 +24,7 @@ _SEG_FILE_RE = re.compile(r"^([1-9]\d*)/work/(keyframes|postprocessed)/([^/]+)$"
 _META_LOCKS: dict[str, threading.Lock] = {}
 _META_LOCKS_GUARD = threading.Lock()
 PROCESS_GENERATION = uuid.uuid4().hex
+_PIPELINE_RETRY_ATTEMPT_CAP = 31
 
 
 class UploadError(ValueError):
@@ -258,9 +259,23 @@ def _ready_queued_pipeline_input(cdir: Path, meta: dict) -> bool:
         for path in cdir.glob("source.*")
         if path.is_file() and path.suffix.lower() in ALLOWED_EXT
     ]
+    retry = meta.get("_pipeline_retry")
+    retry_due = True
+    if isinstance(retry, dict):
+        not_before = retry.get("not_before")
+        if isinstance(not_before, str):
+            try:
+                retry_due = datetime.fromisoformat(not_before) <= datetime.now(
+                    timezone.utc
+                )
+            except (TypeError, ValueError):
+                # A malformed private hint must not strand an otherwise valid
+                # durable task. Claiming it rewrites the state on the next run.
+                retry_due = True
     return bool(
         meta.get("status") == "queued"
         and not meta.get("_input_owner")
+        and retry_due
         and not _has_frozen_input(cdir, meta)
         and isinstance(duration, (int, float))
         and not isinstance(duration, bool)
@@ -305,12 +320,39 @@ def claim_ready_queued_pipeline_inputs(
     claimed = []
     for listed in list_conversations(data_dir):
         cid = listed.get("id")
-        if not isinstance(cid, str):
+        if not isinstance(cid, str) or isinstance(
+            listed.get("_pipeline_retry"), dict
+        ):
             continue
         meta = claim_ready_queued_pipeline_input(data_dir, cid)
         if meta is not None:
             claimed.append((cid, meta["_input_owner"]))
     return claimed
+
+
+def claim_next_ready_queued_pipeline_input(
+    data_dir: Path,
+) -> tuple[str, dict] | None:
+    """Claim at most one due durable item for a capacity-bounded dispatcher."""
+    candidates = [
+        listed
+        for listed in list_conversations(data_dir)
+        if isinstance(listed.get("_pipeline_retry"), dict)
+    ]
+    candidates.sort(
+        key=lambda item: (
+            str(item["_pipeline_retry"].get("not_before") or ""),
+            str(item.get("created_at") or ""),
+        )
+    )
+    for listed in candidates:
+        cid = listed.get("id")
+        if not isinstance(cid, str):
+            continue
+        meta = claim_ready_queued_pipeline_input(data_dir, cid)
+        if meta is not None:
+            return cid, meta["_input_owner"]
+    return None
 
 
 def prepare_incomplete_queued_pipeline_retry(
@@ -373,6 +415,63 @@ def fail_pipeline_input(
         if not eligible:
             return None
         meta.update(status="failed", error=error, _input_owner=None)
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
+
+
+def requeue_pipeline_input(
+    data_dir: Path,
+    cid: str,
+    owner: object,
+    *,
+    retry_delay_s: float,
+    reason: str,
+) -> dict | None:
+    """CAS-release one pipeline lease back to the durable queue."""
+    if (
+        not _ID_RE.match(cid)
+        or not isinstance(owner, dict)
+        or owner.get("kind") != "pipeline"
+        or not isinstance(retry_delay_s, (int, float))
+        or isinstance(retry_delay_s, bool)
+        or not isfinite(retry_delay_s)
+        or retry_delay_s < 0
+        or not isinstance(reason, str)
+        or not reason
+    ):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = load_meta(data_dir, cid)
+        if (
+            meta is None
+            or meta.get("status") != "processing"
+            or meta.get("_input_owner") != owner
+        ):
+            return None
+        previous = meta.get("_pipeline_retry")
+        previous_attempt = (
+            previous.get("attempt", 0) if isinstance(previous, dict) else 0
+        )
+        if not isinstance(previous_attempt, int) or isinstance(
+            previous_attempt, bool
+        ) or previous_attempt < 0:
+            previous_attempt = 0
+        attempt = min(previous_attempt + 1, _PIPELINE_RETRY_ATTEMPT_CAP)
+        not_before = datetime.now(timezone.utc) + timedelta(
+            seconds=float(retry_delay_s)
+        )
+        meta.update(
+            status="queued",
+            error=None,
+            _input_owner=None,
+            _pipeline_retry={
+                "attempt": attempt,
+                "not_before": not_before.isoformat(),
+                "reason": reason,
+            },
+        )
         meta["updated_at"] = _now()
         _write_meta(cdir, meta)
         return meta
@@ -529,6 +628,12 @@ def finish_input_claim(
             return None
         meta.update(changes)
         meta["_input_owner"] = None
+        if (
+            isinstance(owner, dict)
+            and owner.get("kind") == "pipeline"
+            and changes.get("status") in {"done", "failed"}
+        ):
+            meta.pop("_pipeline_retry", None)
         meta["updated_at"] = _now()
         _write_meta(cdir, meta)
         return meta

@@ -318,6 +318,37 @@ def test_finish_input_claim_is_bound_to_exact_process_generation(tmp_path, monke
     )["status"] == "done"
 
 
+def test_requeue_pipeline_input_is_exact_owner_cas(tmp_path):
+    meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
+    owner = storage.claim_pipeline_input(tmp_path, meta["id"])["_input_owner"]
+    before = (tmp_path / meta["id"] / "meta.json").read_bytes()
+
+    wrong = {**owner, "process_generation": "not-the-owner"}
+    assert storage.requeue_pipeline_input(
+        tmp_path,
+        meta["id"],
+        wrong,
+        retry_delay_s=1,
+        reason="pipeline_gate_timeout",
+    ) is None
+    assert (tmp_path / meta["id"] / "meta.json").read_bytes() == before
+
+    queued = storage.requeue_pipeline_input(
+        tmp_path,
+        meta["id"],
+        owner,
+        retry_delay_s=0,
+        reason="pipeline_gate_timeout",
+    )
+    assert queued["status"] == "queued"
+    assert queued["error"] is None
+    assert queued["_input_owner"] is None
+    assert queued["_pipeline_retry"]["attempt"] == 1
+    assert storage.claim_ready_queued_pipeline_input(
+        tmp_path, meta["id"]
+    ) is None
+
+
 def test_legacy_meta_without_owner_remains_claimable(tmp_path, monkeypatch):
     meta = storage.new_conversation(tmp_path, note="", orig_name="a.mp4")
     monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
