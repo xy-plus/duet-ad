@@ -47,6 +47,10 @@ _SANDBOX_CONFIGS = [
 
 _ENV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SECRET_ENV_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.IGNORECASE)
+_CODEX_TELEMETRY_RE = re.compile(
+    r"[ \t\r\n]*tokens used\r?\n"
+    r"(?:0|[1-9][0-9]*|[1-9][0-9]{0,2}(?:,[0-9]{3})+)[ \t\r\n]*"
+)
 _VOICE_OUTPUT_MAX_BYTES = 32 * 1024
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _CHECKOUT_BOUNDARY = (
@@ -94,6 +98,79 @@ def _output_candidates(raw: bytes) -> tuple[bytes, ...]:
             if fenced and fenced not in candidates:
                 candidates.append(fenced)
     return tuple(candidates)
+
+
+def _extract_codex_json_output(raw: bytes) -> bytes:
+    """Extract exactly one JSON value from Codex's final-answer transport.
+
+    Plain JSON is returned byte-for-byte.  The only accepted suffix outside
+    that value is Codex CLI's known two-line token counter.  A complete JSON
+    Markdown fence remains supported as an explicit transport wrapper; prose,
+    a second JSON value, and every unknown prefix or suffix fail closed.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("Codex final output is not UTF-8 JSON") from None
+
+    def reject_constant(_value: str) -> NoReturn:
+        raise ValueError("Codex final output contains a non-JSON constant")
+
+    decoder = json.JSONDecoder(parse_constant=reject_constant)
+    leading = re.match(r"[ \t\r\n]*", text)
+    assert leading is not None
+    start = leading.end()
+    fenced = False
+    if text.startswith("```", start):
+        header = re.match(r"```(?:json)?[ \t]*\r?\n", text[start:])
+        if header is None:
+            raise ValueError("Codex final output has an invalid JSON fence")
+        fenced = True
+        start += header.end()
+        json_leading = re.match(r"[ \t\r\n]*", text[start:])
+        assert json_leading is not None
+        start += json_leading.end()
+
+    try:
+        _value, end = decoder.raw_decode(text, start)
+    except (json.JSONDecodeError, ValueError):
+        raise ValueError("Codex final output does not start with one JSON value") from None
+
+    suffix_start = end
+    if fenced:
+        fence_gap = re.match(r"[ \t\r\n]*", text[end:])
+        assert fence_gap is not None
+        closing = end + fence_gap.end()
+        if not text.startswith("```", closing):
+            raise ValueError("Codex final output has an incomplete JSON fence")
+        suffix_start = closing + 3
+
+    suffix = text[suffix_start:]
+    if not suffix.strip():
+        if not fenced:
+            return raw
+        return text[start:end].encode("utf-8")
+    if _CODEX_TELEMETRY_RE.fullmatch(suffix) is None:
+        raise ValueError("Codex final output has unknown text outside its JSON value")
+    return text[start:end].encode("utf-8")
+
+
+def _atomic_publish_output(parent: Path, destination: Path, payload: bytes) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}-transport-", dir=parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def _scrubbed_env() -> dict[str, str]:
@@ -389,10 +466,9 @@ class CodexRunner:
         replacement inode that is byte-stable across two observations remains
         an early completion signal.  A normal in-place write is accepted only
         after Codex exits successfully and its process group has been stopped;
-        the caller remains responsible for publishing the returned bytes to
-        durable storage.  Validation is a protocol/shape check supplied by the
-        caller, not a content-quality decision.  Unrelated Codex work is
-        untouched.
+        the backend atomically publishes validated bytes to the declared path.
+        Validation is a protocol/shape check supplied by the caller, not a
+        content-quality decision.  Unrelated Codex work is untouched.
         """
         stage_hint = Path(workdir)
         session_hint = Path(session_dir)
@@ -532,6 +608,7 @@ class CodexRunner:
             raise
 
         missing = object()
+        invalid = object()
 
         def read_once(
             name: str,
@@ -576,7 +653,8 @@ class CodexRunner:
             initial_stat: os.stat_result = initial,
             *,
             allow_initial_inode: bool = False,
-        ) -> _T | object:
+            final_transport: bool = False,
+        ) -> tuple[_T, bytes] | object:
             first = read_once(
                 name, initial_stat, allow_initial_inode=allow_initial_inode,
             )
@@ -588,15 +666,51 @@ class CodexRunner:
             )
             if second is None or first != second:
                 return missing
-            for candidate in _output_candidates(first[1]):
+            if final_transport:
+                try:
+                    candidates = (_extract_codex_json_output(first[1]),)
+                except ValueError:
+                    return missing
+            else:
+                candidates = _output_candidates(first[1])
+            for candidate in candidates:
                 try:
                     value = validate_output(candidate)
                 except (TypeError, ValueError, json.JSONDecodeError):
                     continue
                 if value is None:
                     raise CodexError("isolated output validator returned None")
-                return value
+                return value, candidate
             return missing
+
+        def publish(adopted: tuple[_T, bytes]) -> _T:
+            value, payload = adopted
+            _atomic_publish_output(parent, requested, payload)
+            return value
+
+        def read_authoritative_final() -> tuple[_T, bytes] | object:
+            observed = read_once(
+                final_output.name,
+                final_initial,
+                allow_initial_inode=True,
+            )
+            if observed is None:
+                try:
+                    info = os.stat(
+                        final_output.name, dir_fd=parent_fd, follow_symlinks=False,
+                    )
+                except OSError:
+                    return invalid
+                if not stat.S_ISREG(info.st_mode) or info.st_size != 0:
+                    return invalid
+                return missing
+            adopted = read_published(
+                final_output.name,
+                final_initial,
+                allow_initial_inode=True,
+                final_transport=True,
+            )
+            return invalid if adopted is missing else adopted
 
         try:
             with self._sem, tempfile.TemporaryFile(mode="w+b") as stderr_file:
@@ -614,9 +728,6 @@ class CodexRunner:
                 process_group_stopped = False
                 try:
                     while True:
-                        adopted = read_published()
-                        if adopted is not missing:
-                            return adopted
                         returncode = proc.poll()
                         if returncode is not None:
                             stderr_file.seek(0, os.SEEK_END)
@@ -637,16 +748,18 @@ class CodexRunner:
                             # adopt the stable bytes.
                             _terminate_process_group(proc)
                             process_group_stopped = True
+                            adopted = read_authoritative_final()
+                            if adopted is invalid:
+                                raise CodexError(
+                                    "codex exited without publishing valid output: "
+                                    f"{clean_stderr(stderr)}",
+                                    retryable=True,
+                                )
+                            if adopted is not missing:
+                                return publish(adopted)
                             adopted = read_published(allow_initial_inode=True)
                             if adopted is not missing:
-                                return adopted
-                            adopted = read_published(
-                                final_output.name,
-                                final_initial,
-                                allow_initial_inode=True,
-                            )
-                            if adopted is not missing:
-                                return adopted
+                                return publish(adopted)
                             raise CodexError(
                                 "codex exited without publishing valid output: "
                                 f"{clean_stderr(stderr)}",
@@ -655,6 +768,31 @@ class CodexRunner:
                         if time.monotonic() >= deadline:
                             raise CodexError(
                                 f"codex timed out after {self._timeout_s}s", retryable=True
+                            )
+                        adopted = read_published()
+                        if adopted is not missing:
+                            if proc.poll() is not None:
+                                continue
+                            # Stop this invocation before backend publication,
+                            # then re-read both transports.  This closes the
+                            # post-validation write race while preserving the
+                            # declared file's early-completion contract.
+                            _terminate_process_group(proc)
+                            process_group_stopped = True
+                            final_adopted = read_authoritative_final()
+                            if final_adopted is invalid:
+                                raise CodexError(
+                                    "codex exited without publishing valid output",
+                                    retryable=True,
+                                )
+                            if final_adopted is not missing:
+                                return publish(final_adopted)
+                            adopted = read_published(allow_initial_inode=True)
+                            if adopted is not missing:
+                                return publish(adopted)
+                            raise CodexError(
+                                "codex exited without publishing valid output",
+                                retryable=True,
                             )
                         time.sleep(0.1)
                 finally:
