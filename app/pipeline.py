@@ -621,11 +621,11 @@ def _reject_project_index(reason: str, field_path: str) -> NoReturn:
     )
 
 
-def _validate_project_index_frame_bindings(
+def _canonicalize_project_index_frame_bindings(
     index: dict,
     frame_orders_by_segment: dict[int, frozenset[int]],
 ) -> None:
-    """Bind every model occurrence to one real staged segment/frame."""
+    """Merge equivalent occurrences, then bind them to real staged frames."""
     if not frame_orders_by_segment or any(
         not orders for orders in frame_orders_by_segment.values()
     ):
@@ -633,13 +633,14 @@ def _validate_project_index_frame_bindings(
     if not index["scenes"]:
         _reject_project_index("scenes_empty", "/scenes")
 
-    def validate_occurrences(
+    def canonicalize_occurrences(
         occurrences: object, *, category: str, item_index: int, relation: bool,
-    ) -> set[tuple[int, int]]:
+    ) -> tuple[list[dict], set[tuple[int, int]]]:
         occurrence_path = f"/{category}/{item_index}/occurrences"
         if not isinstance(occurrences, list) or not occurrences:
             _reject_project_index("occurrences_empty", occurrence_path)
-        seen_segments: set[int] = set()
+        element_frames: dict[int, set[int]] = {}
+        relation_frames: dict[int, dict[int, dict]] = {}
         bound_frames: set[tuple[int, int]] = set()
         for occurrence_index, occurrence in enumerate(occurrences):
             item_path = f"{occurrence_path}/{occurrence_index}"
@@ -657,11 +658,6 @@ def _validate_project_index_frame_bindings(
                 _reject_project_index(
                     "segment_index_unknown", f"{item_path}/segment_index",
                 )
-            if segment_index in seen_segments:
-                _reject_project_index(
-                    "segment_index_duplicate", f"{item_path}/segment_index",
-                )
-            seen_segments.add(segment_index)
             frame_field = "frames" if relation else "frame_orders"
             raw_frames = occurrence.get(frame_field)
             frame_path = f"{item_path}/{frame_field}"
@@ -681,10 +677,6 @@ def _validate_project_index_frame_bindings(
                     _reject_project_index("frame_order_invalid", order_path)
                 if order not in frame_orders_by_segment[segment_index]:
                     _reject_project_index("frame_order_unknown", order_path)
-            if len(orders) != len(set(orders)):
-                _reject_project_index("frame_order_duplicate", frame_path)
-            if orders != sorted(orders):
-                _reject_project_index("frame_order_unsorted", frame_path)
             if relation:
                 for frame_index, frame in enumerate(raw_frames):
                     for field in ("state", "geometry"):
@@ -696,17 +688,51 @@ def _validate_project_index_frame_bindings(
                                 f"relation_{field}_blank",
                                 f"{frame_path}/{frame_index}/{field}",
                             )
+                    canonical_frame = {
+                        "frame_order": frame["frame_order"],
+                        "state": frame["state"].strip(),
+                        "geometry": frame["geometry"].strip(),
+                    }
+                    by_order = relation_frames.setdefault(segment_index, {})
+                    existing = by_order.get(frame["frame_order"])
+                    if existing is not None and existing != canonical_frame:
+                        _reject_project_index(
+                            "relation_frame_conflict",
+                            f"{frame_path}/{frame_index}",
+                        )
+                    by_order[frame["frame_order"]] = canonical_frame
+            else:
+                element_frames.setdefault(segment_index, set()).update(orders)
             bound_frames.update((segment_index, order) for order in orders)
-        return bound_frames
+        if relation:
+            canonical = [
+                {
+                    "segment_index": segment_index,
+                    "frames": [
+                        frames[frame_order]
+                        for frame_order in sorted(frames)
+                    ],
+                }
+                for segment_index, frames in sorted(relation_frames.items())
+            ]
+        else:
+            canonical = [
+                {
+                    "segment_index": segment_index,
+                    "frame_orders": sorted(frames),
+                }
+                for segment_index, frames in sorted(element_frames.items())
+            ]
+        return canonical, bound_frames
 
     for category in ("people", "entities"):
         for item_index, item in enumerate(index[category].values()):
-            validate_occurrences(
+            item["occurrences"], _ = canonicalize_occurrences(
                 item.get("occurrences"), category=category,
                 item_index=item_index, relation=False,
             )
     for item_index, item in enumerate(index["relations"].values()):
-        validate_occurrences(
+        item["occurrences"], _ = canonicalize_occurrences(
             item.get("occurrences"), category="relations",
             item_index=item_index, relation=True,
         )
@@ -718,7 +744,7 @@ def _validate_project_index_frame_bindings(
     }
     bound_scene_frames: set[tuple[int, int]] = set()
     for item_index, item in enumerate(index["scenes"].values()):
-        item_frames = validate_occurrences(
+        item["occurrences"], item_frames = canonicalize_occurrences(
             item.get("occurrences"), category="scenes",
             item_index=item_index, relation=False,
         )
@@ -821,7 +847,7 @@ def _generate_project_element_index(
                         "relation_predicate_blank",
                         f"/relations/{item_index}/predicate",
                     )
-            _validate_project_index_frame_bindings(
+            _canonicalize_project_index_frame_bindings(
                 normalized, frame_orders_by_segment,
             )
             known_keys = set().union(*(

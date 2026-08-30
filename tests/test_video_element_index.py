@@ -174,15 +174,11 @@ def test_project_index_call_has_no_retry_or_fallback(tmp_path):
     [
         "element_segment_out_of_range",
         "element_frame_out_of_range",
-        "element_duplicate_occurrence",
-        "element_duplicate_frame",
         "relation_segment_out_of_range",
         "relation_frame_out_of_range",
-        "relation_duplicate_occurrence",
-        "relation_duplicate_frame",
     ],
 )
-def test_project_index_rejects_unbound_or_duplicate_frame_references(
+def test_project_index_rejects_unbound_frame_references(
     tmp_path, invalid_case,
 ):
     cdir = tmp_path / "conversation"
@@ -198,18 +194,10 @@ def test_project_index_rejects_unbound_or_duplicate_frame_references(
         element_occurrences[0]["segment_index"] = 2
     elif invalid_case == "element_frame_out_of_range":
         element_occurrences[0]["frame_orders"] = [1, 3]
-    elif invalid_case == "element_duplicate_occurrence":
-        element_occurrences.append(copy.deepcopy(element_occurrences[0]))
-    elif invalid_case == "element_duplicate_frame":
-        element_occurrences[0]["frame_orders"] = [1, 1]
     elif invalid_case == "relation_segment_out_of_range":
         relation_occurrences[0]["segment_index"] = 2
-    elif invalid_case == "relation_frame_out_of_range":
-        relation_occurrences[0]["frames"][1]["frame_order"] = 3
-    elif invalid_case == "relation_duplicate_occurrence":
-        relation_occurrences.append(copy.deepcopy(relation_occurrences[0]))
     else:
-        relation_occurrences[0]["frames"][1]["frame_order"] = 1
+        relation_occurrences[0]["frames"][1]["frame_order"] = 3
 
     with pytest.raises(ValueError, match="project index output is invalid"):
         pipeline._generate_project_element_index(
@@ -219,6 +207,94 @@ def test_project_index_rejects_unbound_or_duplicate_frame_references(
             skill_bytes=b"frozen video-maker skill",
         )
     assert not (cdir / "work" / "element_index.json").exists()
+
+
+def test_project_index_canonicalizes_equivalent_same_segment_occurrences(
+    tmp_path,
+):
+    cdir = tmp_path / "conversation"
+    frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
+    frames.mkdir(parents=True)
+    frame_paths = [frames / "01.png", frames / "02.png"]
+    for path in frame_paths:
+        path.write_bytes(_png())
+    payload = copy.deepcopy(_element_index())
+    payload["people"]["person-01"]["occurrences"] = [
+        {"segment_index": 1, "frame_orders": [2, 1, 1]},
+    ]
+    payload["entities"]["entity-01"]["occurrences"] = [
+        {"segment_index": 1, "frame_orders": [2]},
+        {"segment_index": 1, "frame_orders": [1]},
+    ]
+    payload["scenes"]["scene-01"]["occurrences"] = [
+        {"segment_index": 1, "frame_orders": [2]},
+        {"segment_index": 1, "frame_orders": [1]},
+    ]
+    relation = payload["relations"]["relation-01"]
+    relation["occurrences"] = [
+        {
+            "segment_index": 1,
+            "frames": list(reversed(relation["occurrences"][0]["frames"])),
+        },
+        {
+            "segment_index": 1,
+            "frames": [{
+                "frame_order": 1,
+                "state": " held ",
+                "geometry": " inside hand ",
+            }],
+        },
+    ]
+
+    result = pipeline._generate_project_element_index(
+        _IndexRunner(payload),
+        cdir,
+        {1: frame_paths},
+        skill_bytes=b"frozen video-maker skill",
+    )
+
+    frozen = json.loads(result.read_text(encoding="utf-8"))
+    for category in ("people", "entities", "scenes"):
+        item = next(iter(frozen[category].values()))
+        assert item["occurrences"] == [
+            {"segment_index": 1, "frame_orders": [1, 2]},
+        ]
+    assert frozen["relations"]["relation-01"]["occurrences"] == [{
+        "segment_index": 1,
+        "frames": [
+            {"frame_order": 1, "state": "held", "geometry": "inside hand"},
+            {"frame_order": 2, "state": "released", "geometry": "apart"},
+        ],
+    }]
+
+
+def test_project_index_rejects_conflicting_relation_frame_facts(tmp_path):
+    cdir = tmp_path / "conversation"
+    frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
+    frames.mkdir(parents=True)
+    frame_paths = [frames / "01.png", frames / "02.png"]
+    for path in frame_paths:
+        path.write_bytes(_png())
+    payload = copy.deepcopy(_element_index())
+    payload["relations"]["relation-01"]["occurrences"].append({
+        "segment_index": 1,
+        "frames": [{
+            "frame_order": 1,
+            "state": "released",
+            "geometry": "apart",
+        }],
+    })
+
+    with pytest.raises(CodexOutputValidationError) as caught:
+        pipeline._generate_project_element_index(
+            _IndexRunner(payload),
+            cdir,
+            {1: frame_paths},
+            skill_bytes=b"frozen video-maker skill",
+        )
+
+    assert caught.value.reason == "relation_frame_conflict"
+    assert caught.value.field_path == "/relations/0/occurrences/1/frames/0"
 
 
 @pytest.mark.parametrize(
