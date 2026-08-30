@@ -112,7 +112,10 @@ def test_idempotent_create_finishes_incomplete_orphan_upload(
     called = threading.Event()
 
     def fake_run(_settings, _cid, _runner, **kwargs):
-        assert kwargs.get("claimed_owner") is None
+        owner = kwargs.get("claimed_owner")
+        assert owner["kind"] == "pipeline"
+        assert owner["process_generation"]
+        assert isinstance(owner["frozen_input_snapshot"], dict)
         called.set()
 
     monkeypatch.setattr(pipeline, "run", fake_run)
