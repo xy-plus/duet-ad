@@ -303,14 +303,13 @@ def test_dense_cuts_and_unique_540_relations_share_budget_without_loss():
             reference_audios=(),
         ),
     )
-    effective = context_ir_bridge._compile_effective_prompt(
-        request,
+    provider_output = (
         "Context-expanded visual prose. " * 300
         + "<CUT_TIMELINE_JSON>{\"b\":[9.0],\"v\":1}"
-        "</CUT_TIMELINE_JSON>",
+        "</CUT_TIMELINE_JSON>"
     )
-    assert len(effective) <= context_ir_bridge.MAX_SOURCE_PROMPT_CHARS
-    assert effective.count(long_generation.RELATION_STATES_OPEN) == 1
-    assert effective.count(long_generation.CUT_TIMELINE_OPEN) == 1
-    assert f"{long_generation.CUT_TIMELINE_OPEN}{cut_marker}" in effective
-    assert f"{long_generation.RELATION_STATES_OPEN}{relation_marker}" in effective
+    effective = context_ir_bridge._compile_effective_prompt(
+        request,
+        provider_output,
+    )
+    assert effective == provider_output

@@ -944,104 +944,9 @@ def _semantic_score(
 def _compile_effective_prompt(
     request: FrozenContextIrRequest, context_output_prompt: str,
 ) -> str:
-    """Mechanically restore immutable Fusion fields around Context semantics."""
-    relation_contract = _relation_states_contract(request.source_prompt)
-    cut_contract = _cut_timeline_contract(request.source_prompt)
-    context_output_prompt = _without_relation_states(context_output_prompt)
-    context_output_prompt = _without_cut_timeline(context_output_prompt)
-    authority_contracts = []
-    if cut_contract is not None:
-        authority_contracts.append(
-            f"{cut_contract}\n{_CUT_TIMELINE_POLICY}"
-        )
-    if relation_contract is not None:
-        authority_contracts.append(relation_contract)
-    authority_suffix = "\n".join(authority_contracts)
-    if _is_current_ref2va(request):
-        context_output_prompt = _bind_exact_dialogue(
-            request, context_output_prompt,
-        )
-    suffix = _fusion_policy_suffix(request.source_prompt)
-    if suffix is None:
-        effective = _with_dialogue_policy(context_output_prompt)
-        compiled = (
-            f"{effective}\n{authority_suffix}"
-            if authority_suffix else effective
-        )
-        if not authority_suffix or len(compiled) <= MAX_SOURCE_PROMPT_CHARS:
-            return compiled
-        # Context IR may expand prose up to its 32 KiB response ceiling.  For
-        # relation-bearing Ref2VA prompts, fall back to the exact backend source
-        # semantics rather than failing the pipeline or sending an unproven
-        # over-7000 provider prompt.  Dialogue language is still resolved
-        # mechanically and the authoritative relation block remains byte exact.
-        source_visual = _without_cut_timeline(
-            _without_relation_states(request.source_prompt)
-        )
-        if _is_current_ref2va(request):
-            source_visual = _bind_exact_dialogue(request, source_visual)
-        fallback = (
-            f"{_with_dialogue_policy(source_visual)}\n{authority_suffix}"
-        )
-        if len(fallback) > MAX_SOURCE_PROMPT_CHARS:
-            raise ContextIrContractError("source_prompt_too_long")
-        return fallback
-    visual = _without_dialogue_policy(context_output_prompt)
-    opening = "<VISUAL>"
-    closing = "</VISUAL>"
-    if visual.startswith(opening):
-        end = visual.find(closing, len(opening))
-        if end >= 0:
-            visual = visual[len(opening):end]
-    else:
-        positions = [
-            visual.find(marker)
-            for marker in (
-                _TIMELINE_OPEN,
-                "<AUDIO_CONTENT_JSON>",
-                "<MUSIC_POLICY>",
-            )
-            if visual.find(marker) >= 0
-        ]
-        if positions:
-            visual = visual[:min(positions)]
-    for marker in (
-        opening,
-        closing,
-        _TIMELINE_OPEN,
-        _TIMELINE_CLOSE,
-        "<AUDIO_CONTENT_JSON>",
-        "</AUDIO_CONTENT_JSON>",
-        "<MUSIC_POLICY>",
-        "</MUSIC_POLICY>",
-    ):
-        visual = visual.replace(marker, "")
-    visual = visual.strip()
-    if not visual:
-        visual = _without_dialogue_policy(context_output_prompt.strip())
-    authority_visual_suffix = (
-        f"\n{authority_suffix}" if authority_suffix else ""
-    )
-    compiled = (
-        f"<VISUAL>\n{visual}{authority_visual_suffix}\n</VISUAL>\n"
-        f"{_DIALOGUE_POLICY}\n{suffix}"
-    )
-    if not authority_suffix or len(compiled) <= MAX_SOURCE_PROMPT_CHARS:
-        return compiled
-    source_visual = _without_cut_timeline(
-        _without_relation_states(request.source_prompt)
-    )
-    if source_visual.endswith(suffix):
-        source_visual = source_visual[:-len(suffix)].rstrip()
-    if source_visual.startswith("<VISUAL>") and source_visual.endswith("</VISUAL>"):
-        source_visual = source_visual[len("<VISUAL>"):-len("</VISUAL>")].strip()
-    fallback = (
-        f"<VISUAL>\n{source_visual}\n{authority_suffix}\n</VISUAL>\n"
-        f"{_DIALOGUE_POLICY}\n{suffix}"
-    )
-    if len(fallback) > MAX_SOURCE_PROMPT_CHARS:
-        raise ContextIrContractError("source_prompt_too_long")
-    return fallback
+    """Return the provider result byte-for-byte for direct H3 submission."""
+    del request
+    return context_output_prompt
 
 
 def _mime_type(path: Path, *, audio: bool) -> str:
@@ -2214,15 +2119,11 @@ def _complete(
             error="context_ir_result_invalid",
         )
         return
-    compiled_prompt = _compile_effective_prompt(request, effective_prompt)
     semantic_score = _semantic_score(request, effective_prompt)
-    semantic_score["dialogue_policy"] = _dialogue_policy_score(
-        request, compiled_prompt
-    )
     payload = _receipt_payload(
         request,
         state,
-        compiled_prompt,
+        effective_prompt,
         effective_prompt,
         semantic_score,
     )
@@ -2682,13 +2583,6 @@ def load_effective_prompt_receipt(
         raise ContextIrReceiptError("context_ir_receipt_invalid")
     if raw.get("source_prompt_sha256") != _sha256_text(str(raw.get("source_prompt"))):
         raise ContextIrReceiptError("context_ir_receipt_invalid")
-    try:
-        source_relations = _relation_states_contract(str(raw.get("source_prompt")))
-        effective_relations = _relation_states_contract(effective_prompt)
-    except ContextIrContractError:
-        raise ContextIrReceiptError("context_ir_receipt_invalid") from None
-    if source_relations != effective_relations:
-        raise ContextIrReceiptError("context_ir_receipt_mismatch")
     if legacy_receipt:
         semantic_score: Mapping[str, object] = {}
     else:
@@ -2699,6 +2593,7 @@ def load_effective_prompt_receipt(
             or not context_output_prompt.strip()
             or raw.get("context_output_prompt_sha256")
             != _sha256_text(context_output_prompt)
+            or context_output_prompt != effective_prompt
             or not isinstance(semantic_score, Mapping)
             or set(semantic_score) not in {
                 _SEMANTIC_SCORE_KEYS, _PRE_RELATION_SEMANTIC_SCORE_KEYS,

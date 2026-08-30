@@ -432,14 +432,12 @@ def test_sixty_relations_with_540_unique_verbose_states_fit_visual_budget() -> N
             reference_audios=(),
         ),
     )
+    provider_output = "Context-expanded visual prose. " * 400
     effective = context_ir_bridge._compile_effective_prompt(
         request,
-        "Context-expanded visual prose. " * 400,
+        provider_output,
     )
-    assert len(effective) <= context_ir_bridge.MAX_SOURCE_PROMPT_CHARS
-    assert effective.count(long_generation.RELATION_STATES_OPEN) == 1
-    assert parsed in effective
-    assert "V" * 3_200 in effective
+    assert effective == provider_output
 
 
 def test_relation_runs_do_not_cross_missing_frames_or_hard_cuts() -> None:

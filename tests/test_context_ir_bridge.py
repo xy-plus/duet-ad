@@ -159,7 +159,7 @@ def _frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
     )
 
 
-def test_effective_prompt_mechanically_restores_frozen_relation_states(
+def test_effective_prompt_does_not_rewrite_provider_relation_states(
     tmp_path: Path,
 ) -> None:
     frozen = _frozen(tmp_path)
@@ -191,12 +191,11 @@ def test_effective_prompt_mechanically_restores_frozen_relation_states(
         frozen, model_output,
     )
 
-    assert effective.count(context_ir_bridge._RELATION_STATES_OPEN) == 1
-    assert block in effective
-    assert '{"v":1,"d":{},"i":[]}' not in effective
+    assert effective == model_output
+    assert block not in effective
 
 
-def test_effective_prompt_preserves_independent_compact_cut_authority(
+def test_effective_prompt_does_not_rewrite_provider_cut_timeline(
     tmp_path: Path,
 ) -> None:
     frozen = _frozen(tmp_path)
@@ -210,20 +209,18 @@ def test_effective_prompt_preserves_independent_compact_cut_authority(
     )
     frozen = replace(frozen, source_prompt=f"{frozen.source_prompt}\n{block}")
 
-    effective = context_ir_bridge._compile_effective_prompt(
-        frozen,
+    model_output = (
         "rewritten visual\n<CUT_TIMELINE_JSON>"
         '{"b":[9.0],"v":1}'
-        "</CUT_TIMELINE_JSON>",
+        "</CUT_TIMELINE_JSON>"
+    )
+    effective = context_ir_bridge._compile_effective_prompt(
+        frozen,
+        model_output,
     )
 
-    assert effective.count(context_ir_bridge._CUT_TIMELINE_OPEN) == 1
-    assert block in effective
-    assert json.loads(
-        context_ir_bridge._cut_timeline_contract(effective).removeprefix(
-            context_ir_bridge._CUT_TIMELINE_OPEN
-        ).removesuffix(context_ir_bridge._CUT_TIMELINE_CLOSE)
-    )["b"] == contract["b"]
+    assert effective == model_output
+    assert block not in effective
 
 
 @pytest.mark.parametrize("raw", [
@@ -471,16 +468,11 @@ def test_reference_ref2va_uses_context_ir_and_binds_optimized_prompt(
     assert receipt.effective_prompt == context_ir_bridge._compile_effective_prompt(
         frozen, optimized,
     )
-    after = receipt.semantic_score["dialogue_policy"]
-    assert isinstance(after, dict)
-    assert after == {
-        "language_explicit": 1.0,
-        "exact_text": 1.0,
-        "stop_after_line": 1.0,
-        "no_repeat_or_improvise": 1.0,
-        "no_extra_speech": 1.0,
-        "overall": 1.0,
-    }
+    assert receipt.effective_prompt == optimized
+    assert raw_receipt["effective_prompt"] == optimized
+    assert raw_receipt["effective_prompt_sha256"] == raw_receipt[
+        "context_output_prompt_sha256"
+    ]
     final_request = context_ir_bridge.apply_effective_prompt(
         frozen, result.receipt_path,
     )
@@ -496,7 +488,7 @@ def test_reference_ref2va_uses_context_ir_and_binds_optimized_prompt(
     h3._require_context_ir_receipt(final_request)
 
 
-def test_reference_ref2va_restores_exact_dialogue_and_removes_extra_dialogue(
+def test_reference_ref2va_passes_provider_dialogue_through_unchanged(
     tmp_path: Path,
 ) -> None:
     frozen = _reference_fusion_frozen(tmp_path, dialogue=True)
@@ -514,10 +506,10 @@ def test_reference_ref2va_restores_exact_dialogue_and_removes_extra_dialogue(
     final_request = context_ir_bridge.apply_effective_prompt(
         frozen, result.receipt_path,
     )
-    assert final_request.prompt.count("<d>") == 1
-    assert "<d>[Chinese]这是严格冻结的台词</d>" in final_request.prompt
-    assert "provider changed" not in final_request.prompt
-    assert "provider invented" not in final_request.prompt
+    assert final_request.prompt == optimized
+    assert final_request.prompt.count("<d>") == 2
+    assert "provider changed" in final_request.prompt
+    assert "provider invented" in final_request.prompt
     assert final_request.voice_texts == ("这是严格冻结的台词",)
 
 
@@ -554,17 +546,11 @@ def test_reference_no_dialogue_prompt_explicitly_forbids_human_voice(
         frozen, result.receipt_path,
     )
     after = receipt.semantic_score["dialogue_policy"]
-    assert before["overall"] < after["overall"]
-    assert isinstance(after, dict)
-    assert after["language_explicit"] == 1.0
-    assert after["exact_text"] == 1.0
-    assert after["no_extra_speech"] == 1.0
-    assert after["overall"] == 1.0
+    assert before["overall"] == after["overall"]
     final_request = context_ir_bridge.apply_effective_prompt(
         frozen, result.receipt_path,
     )
-    assert "no human voice" in final_request.prompt.lower()
-    assert "closed lips" in final_request.prompt.lower()
+    assert final_request.prompt == optimized
     h3._require_context_ir_receipt(final_request)
 
 
@@ -621,10 +607,11 @@ def test_context_scores_fusion_audio_or_music_policy_drift(
         tmp_path, prompt=f"<VISUAL>source</VISUAL>\n{source_suffix}",
     )
 
+    provider_output = f"<VISUAL>optimized</VISUAL>\n{effective_suffix}"
     with _client(
         _success_handler(
             frozen,
-            effective_prompt=f"<VISUAL>optimized</VISUAL>\n{effective_suffix}",
+            effective_prompt=provider_output,
         )
     ) as client:
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
@@ -634,7 +621,7 @@ def test_context_scores_fusion_audio_or_music_policy_drift(
         frozen, result.receipt_path
     )
     assert receipt.semantic_score["music_policy"] == 0.0
-    assert receipt.effective_prompt.endswith(source_suffix)
+    assert receipt.effective_prompt == provider_output
     assert not (frozen.workdir / ".h3").exists()
 
 
@@ -913,9 +900,7 @@ def test_context_effective_prompt_is_not_blocked_or_rewritten_by_internal_syntax
     final_request = context_ir_bridge.apply_effective_prompt(
         frozen, result.receipt_path
     )
-    assert final_request.prompt.encode() == context_ir_bridge._with_dialogue_policy(
-        effective
-    ).encode()
+    assert final_request.prompt.encode() == effective.encode()
 
 
 def test_poll_transport_unknown_recovers_by_get_on_same_task_without_post(tmp_path):
@@ -1398,9 +1383,7 @@ def test_context_ir_scores_hard_cut_time_drift_without_blocking_h3(tmp_path):
         frozen, result.receipt_path
     )
     assert receipt.semantic_score["keyframe_timeline"] == 0.0
-    assert receipt.effective_prompt.endswith(
-        context_ir_bridge._fusion_policy_suffix(frozen.source_prompt)
-    )
+    assert receipt.effective_prompt == effective
     assert not (frozen.workdir / ".h3").exists()
 
 
@@ -1431,9 +1414,7 @@ def test_context_ir_scores_moved_fusion_contract_blocks_without_blocking_h3(
         frozen, result.receipt_path
     )
     assert receipt.semantic_score["music_policy"] == 0.0
-    assert receipt.effective_prompt.endswith(
-        context_ir_bridge._fusion_policy_suffix(frozen.source_prompt)
-    )
+    assert receipt.effective_prompt == effective
     assert not (frozen.workdir / ".h3").exists()
 
 
@@ -1471,9 +1452,7 @@ def test_receipt_bound_voice_allows_context_to_split_off_screen_dialogue(tmp_pat
         result = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
     assert result.status == "succeeded"
-    assert result.effective_prompt == context_ir_bridge._with_dialogue_policy(
-        effective
-    )
+    assert result.effective_prompt == effective
     assert result.receipt_path is not None and result.receipt_path.is_file()
 
 
@@ -1601,9 +1580,7 @@ def test_semantic_mismatch_voice_task_recovers_by_get_only_and_writes_receipt(
         recovered = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
 
     assert recovered.status == "succeeded"
-    assert recovered.effective_prompt == context_ir_bridge._with_dialogue_policy(
-        effective
-    )
+    assert recovered.effective_prompt == effective
     assert recovered.receipt_path is not None
     assert recovered.receipt_path.is_file()
     assert [(call.method, call.url.path) for call in resumed_calls] == [
