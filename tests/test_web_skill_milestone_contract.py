@@ -6,13 +6,18 @@ WEB_APP = Path(__file__).resolve().parents[1] / "web" / "app.js"
 
 def test_legacy_web_renders_read_only_cid_skill_milestone_summary():
     source = WEB_APP.read_text(encoding="utf-8")
+    view_start = source.index("function skillMilestoneView")
+    view_end = source.index("function materialIndexView", view_start)
+    view = source[view_start:view_end]
     start = source.index("function skillMilestoneSection")
     end = source.index("function renderResults", start)
     section = source[start:end]
-    assert "detail.skill_milestone" in section
+    assert "detail && detail.skill_milestone" in view
     assert "milestone.id" in section
     assert "skill.sha256" in section
-    assert "skill.size" in section
+    assert "skill.short" in section
+    assert "Skill v" in view
+    assert "查看完整校验信息" in section
     assert "source_path" not in section
     assert "frozen_path" not in section
     assert "dataset.testid = \"skill-milestone\"" in section

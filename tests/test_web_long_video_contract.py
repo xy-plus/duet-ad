@@ -354,12 +354,15 @@ def test_long_video_ui_copy_and_segment_progress_contract():
         "完成 ",
         "generation-segments",
         "当前阶段",
-        "chain",
-        "join",
         "长视频生成计划尚未就绪，请刷新后重试",
     ):
         assert text in source
     assert 'if (stage === "stitch") return "视频拼接"' in source
+    progress = source.split("function appendGenerationProgress", 1)[1].split(
+        "function renderIntermediateStages", 1
+    )[0]
+    assert "chain" not in progress
+    assert "join" not in progress
 
 
 def test_published_video_does_not_hide_stitch_recovery():

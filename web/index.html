@@ -63,6 +63,8 @@
       <h1 id="main-title" class="main-title">视频工作室</h1>
     </header>
 
+    <section id="operation-status" class="operation-status" aria-label="项目运行状态" aria-live="polite" hidden></section>
+
     <div id="stream" class="stream" aria-live="polite"></div>
 
     <div class="composer-dock">
@@ -161,7 +163,7 @@
 <dialog id="pp-dialog" class="pp-dialog" aria-labelledby="pp-title">
   <form id="pp-form" class="pp-form" novalidate>
     <h2 id="pp-title" class="pp-title">后处理关键帧</h2>
-    <p class="pp-sub">勾选处理项（至少一项），AI 将逐帧优化并生成对比图</p>
+    <p class="pp-sub">勾选处理项（至少一项）。确认后才会提交素材处理；取消不会提交。</p>
     <p id="pp-lock-hint" class="pp-lock-hint" hidden>已运行过后处理，选项已锁定为上次选择</p>
     <div class="pp-opts" role="group" aria-label="后处理选项">
       <label class="pp-opt">
@@ -180,7 +182,7 @@
     <p id="pp-error" class="form-error" role="alert" hidden></p>
     <div class="pp-actions">
       <button type="button" id="pp-cancel" class="btn btn-ghost">取消</button>
-      <button type="submit" id="pp-confirm" class="btn btn-primary" disabled>确认处理</button>
+      <button type="submit" id="pp-confirm" class="btn btn-primary" disabled>开始素材处理</button>
     </div>
   </form>
 </dialog>

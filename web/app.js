@@ -29,6 +29,9 @@ const state = {
   segmentProductsExpanded: {}, // cid → 分段产物是否由用户展开；轮询重渲染时保留，切会话重置
   generationDrafts: {}, // cid → 最终视频表单草稿；轮询重渲染时保留用户输入
   generationSubmitting: {}, // cid → true：本页已有 /submit 请求在途，阻止重复提交
+  historyDetails: {}, // cid → 近期会话的 GET 详情；只用于补齐历史识别信息
+  historyThumbnailURLs: {}, // cid → 侧栏首帧 ObjectURL，与 stream 媒体生命周期隔离
+  historyHydrating: false, // 受限并发补齐进行中，避免重复 GET 风暴
   promptDraft: null,   // 当前图片优化提示词草稿；跨轮询保留，跨操作由统一守卫处理
   promptWorkspaceMode: {}, // cid:segment → generation/dialogue/image
   detailSig: null,     // 当前已渲染详情的状态签名：轮询比对，签名不变不碰 DOM（根治轮询闪烁）
@@ -583,6 +586,350 @@ function fmtSec(x) {
   return Number.isFinite(x) ? Number(x).toFixed(1) : "?";
 }
 
+function shortId(value) {
+  return typeof value === "string" && value ? value.slice(0, 8) : "--------";
+}
+
+function formatDuration(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "时长待载入";
+  if (seconds < 60) return seconds.toFixed(seconds < 10 ? 1 : 0) + " 秒";
+  const minutes = Math.floor(seconds / 60);
+  const tail = Math.round(seconds % 60);
+  return minutes + " 分 " + String(tail).padStart(2, "0") + " 秒";
+}
+
+function formatElapsed(createdAt, endAt, nowMs = Date.now()) {
+  const start = new Date(createdAt).getTime();
+  const terminal = endAt ? new Date(endAt).getTime() : Number.NaN;
+  if (!Number.isFinite(start)) return "已耗时未知";
+  const end = Number.isFinite(terminal) ? Math.min(nowMs, Math.max(start, terminal)) : nowMs;
+  const total = Math.max(0, Math.floor((end - start) / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return `已耗时 ${hours}时 ${String(minutes).padStart(2, "0")}分`;
+  if (minutes > 0) return `已耗时 ${minutes}分 ${String(seconds).padStart(2, "0")}秒`;
+  return `已耗时 ${seconds}秒`;
+}
+
+function totalKeyframes(detail) {
+  const segments = Array.isArray(detail && detail.segments) ? detail.segments : [];
+  if (segments.length > 0) {
+    return segments.reduce((sum, segment) =>
+      sum + (Array.isArray(segment && segment.keyframes) ? segment.keyframes.length : 0), 0);
+  }
+  return Array.isArray(detail && detail.keyframes) ? detail.keyframes.length : 0;
+}
+
+function safeErrorSummary(raw, fallback = "阶段执行失败，请查看诊断后处理") {
+  const code = raw && typeof raw === "object"
+    ? String(raw.code || raw.error || "") : String(raw || "");
+  const labels = new Map([
+    ["submission_unknown", "提交结果未知，已禁止重复提交"],
+    ["context_ir_query_unknown", "Context IR 查询结果未知，请继续原任务"],
+    ["context_ir_resume_required", "Context IR 可从原任务继续"],
+    ["prompt_fusion_failed", "最终提示词融合失败"],
+    ["prompt_fusion_output_invalid", "最终提示词融合结果无效"],
+    ["provider_rejected", "素材服务商未接受本次处理"],
+    ["output_missing", "生成已结束，但成片 B 尚未提交"],
+    ["generation_path_removed", "该历史任务只能查看，不能重新生成"],
+  ]);
+  if (labels.has(code)) return labels.get(code);
+  if (/^[a-z][a-z0-9_]{2,80}$/.test(code)) {
+    return fallback + `（${code}）`;
+  }
+  if (code && code.length <= 120 && !/[\r\n{}\[\]+]/.test(code)) return code;
+  return fallback;
+}
+
+function diagnosticText(raw) {
+  const text = raw && typeof raw === "object"
+    ? JSON.stringify(raw, null, 2) : String(raw || "");
+  return text.length > 1200 ? text.slice(0, 1200) + "\n…诊断内容已截断" : text;
+}
+
+function stageState(status, detail = "", count = "") {
+  return { status, detail, count };
+}
+
+function operationTimeline(detail, nowMs = Date.now()) {
+  const sourceReady = detail && detail.has_source === true;
+  const analysis = detail && detail.status;
+  const post = detail && detail.postprocess;
+  const fusion = detail && detail.prompt_fusion;
+  const generation = detail && detail.generation;
+  const generationStatus = generation && generation.status;
+  const generationStage = generation && generation.stage;
+  const segments = Array.isArray(detail && detail.segments) ? detail.segments : [];
+  const generationSegments = generation && Array.isArray(generation.segments)
+    ? generation.segments : [];
+  const frameCount = totalKeyframes(detail);
+  const completedImages = ppCompletedFrames(detail);
+  const totalImages = ppTotalFrames(detail);
+  const fusionSegments = fusion && Array.isArray(fusion.segments) ? fusion.segments : [];
+  const fusionDone = fusionSegments.filter((item) => item && item.status === "done").length;
+  const h3Done = generationSegments.filter((item) => item && item.status === "succeeded").length;
+  const h3Total = generationSegments.length || segments.length;
+  const afterContext = ["h3", "stitch", "stitching"].includes(generationStage)
+    || generationStatus === "succeeded" || detail.has_video === true;
+
+  const stages = [
+    {
+      key: "source", label: "源视频 A",
+      ...stageState(sourceReady ? "done" : analysis === "queued" ? "running" : "unknown",
+        sourceReady ? "源视频已由服务器接收" : "等待服务器确认源视频"),
+    },
+    {
+      key: "analysis", label: "分析",
+      ...stageState(
+        analysis === "done" ? "done"
+          : analysis === "processing" ? "running"
+            : analysis === "queued" ? "waiting"
+              : analysis === "failed" ? "failed" : "unknown",
+        analysis === "done" ? "分析产物已发布"
+          : analysis === "processing" ? "正在抽帧并生成项目描述"
+            : analysis === "queued" ? "等待分析" : "分析状态异常",
+      ),
+    },
+    {
+      key: "index", label: "素材索引",
+      ...stageState(
+        analysis === "done" && frameCount > 0 ? "done"
+          : analysis === "processing" ? "running"
+            : analysis === "failed" ? "blocked"
+              : analysis === "done" ? "unknown" : "waiting",
+        analysis === "done" && frameCount > 0
+          ? "已发布关键帧与分段索引"
+          : analysis === "done" ? "服务器未公开可用索引" : "随分析阶段建立",
+        frameCount > 0 ? `${frameCount} 帧` : "",
+      ),
+    },
+    {
+      key: "image", label: "图片优化",
+      ...stageState(
+        post && post.status === "done" ? "done"
+          : post && ["queued", "running"].includes(post.status) ? "running"
+            : post && post.status === "failed" ? "failed"
+              : (fusion || generation || detail.has_video) ? "skipped" : "waiting",
+        post && post.status === "done" ? "优化素材已发布"
+          : post && post.status === "failed" ? safeErrorSummary(post.error, "图片优化失败")
+            : post ? "正在处理服务器已确认的素材" : "当前项目未公开图片优化任务",
+        totalImages > 0 ? `${completedImages}/${totalImages} 帧` : "",
+      ),
+    },
+    {
+      key: "fusion", label: "Prompt Fusion",
+      ...stageState(
+        fusion && fusion.status === "done" ? "done"
+          : fusion && fusion.status === "running" ? "running"
+            : fusion && fusion.status === "failed" ? "failed"
+              : fusion && fusion.status === "pending" ? "waiting"
+                : generation ? "skipped" : "waiting",
+        fusion && fusion.status === "done" ? "最终提示词已冻结"
+          : fusion && fusion.status === "running" ? "正在融合逐段提示词"
+            : fusion && fusion.status === "failed" ? safeErrorSummary(fusion.error, "Prompt Fusion 失败")
+              : fusion ? "等待融合" : "当前项目未公开 Fusion 状态",
+        fusionSegments.length > 0 ? `${fusionDone}/${fusionSegments.length} 段` : "",
+      ),
+    },
+    {
+      key: "context", label: "Context IR",
+      ...stageState(
+        ["context_ir", "context_ir_native"].includes(generationStage)
+          ? ["failed"].includes(generationStatus) ? "failed"
+            : ["resume_required", "submission_unknown"].includes(generationStatus) ? "attention"
+              : "running"
+          : afterContext && fusion ? "done"
+            : afterContext ? "skipped" : "waiting",
+        ["context_ir", "context_ir_native"].includes(generationStage)
+          ? generationStatus === "submission_unknown" ? "查询结果未知，禁止重复提交"
+            : generationStatus === "resume_required" ? "可继续原任务"
+              : generationStatus === "failed" ? safeErrorSummary(generation.error, "Context IR 失败")
+                : "正在优化最终提示词；服务器未公开逐段计数"
+          : afterContext && fusion ? "Context IR 已完成"
+            : afterContext ? "该历史任务未公开 Context IR" : "等待前序阶段",
+      ),
+    },
+    {
+      key: "h3", label: "H3 生成",
+      ...stageState(
+        generation && ["stitch", "stitching"].includes(generationStage) ? "done"
+          : generationStatus === "succeeded" || detail.has_video === true ? "done"
+            : generation && !["context_ir", "context_ir_native"].includes(generationStage)
+              ? generationStatus === "failed" ? "failed"
+                : ["resume_required", "submission_unknown"].includes(generationStatus) ? "attention"
+                  : ["queued", "running", "submitting"].includes(generationStatus) ? "running" : "unknown"
+              : "waiting",
+        generationStatus === "submission_unknown" ? "供应商是否接单未知，禁止重复提交"
+          : generationStatus === "resume_required" ? "继续原任务不会创建新请求"
+            : generationStatus === "failed" && !["stitch", "stitching"].includes(generationStage)
+              ? safeErrorSummary(generation.error, "H3 生成失败")
+              : generation ? "逐段生成视频" : "等待生成任务",
+        h3Total > 0 ? `${h3Done}/${h3Total} 段` : "",
+      ),
+    },
+    {
+      key: "stitch", label: "拼接",
+      ...stageState(
+        detail.has_video === true || generationStatus === "succeeded" ? "done"
+          : generation && ["stitch", "stitching"].includes(generationStage)
+            ? generationStatus === "failed" ? "failed"
+              : ["resume_required", "submission_unknown"].includes(generationStatus) ? "attention" : "running"
+            : "waiting",
+        generation && ["stitch", "stitching"].includes(generationStage)
+          ? generationStatus === "failed" ? safeErrorSummary(generation.error, "视频拼接失败")
+            : "正在复用已完成分段合成成片"
+          : detail.has_video === true ? "拼接产物已校验" : "等待全部分段",
+        h3Total > 0 && (generationStatus === "succeeded" || ["stitch", "stitching"].includes(generationStage))
+          ? `${h3Total} 段` : "",
+      ),
+    },
+    {
+      key: "output", label: "成片 B",
+      ...stageState(
+        detail.has_video === true ? "done"
+          : generationStatus === "succeeded" ? "failed" : "waiting",
+        detail.has_video === true ? "成片已由服务器校验并提交"
+          : generationStatus === "succeeded" ? "生成成功，但成片 B 缺失" : "等待最终成片",
+        detail.has_video === true ? "可播放" : "",
+      ),
+    },
+  ];
+
+  const current = stages.find((stage) => ["failed", "attention"].includes(stage.status))
+    || stages.find((stage) => stage.status === "running")
+    || stages.find((stage) => stage.status === "unknown")
+    || stages.find((stage) => stage.status === "waiting")
+    || stages[stages.length - 1];
+  const terminal = detail.has_video === true
+    || ["failed"].includes(analysis)
+    || ["failed", "submission_unknown", "resume_required"].includes(generationStatus);
+  return {
+    operationId: detail && detail.id,
+    stages,
+    current,
+    elapsed: formatElapsed(detail && detail.created_at, terminal ? detail && detail.updated_at : null, nowMs),
+    updated: fmtTime(detail && detail.updated_at),
+  };
+}
+
+function stageStatusText(status) {
+  return ({
+    done: "已完成", running: "进行中", waiting: "等待中", blocked: "已阻塞",
+    failed: "失败", attention: "需要处理", unknown: "状态未知", skipped: "未启用",
+  })[status] || "状态未知";
+}
+
+function segmentJoinText(value) {
+  return ({hard_cut: "硬切衔接", continuous: "连续衔接", crossfade: "淡化衔接"})[value]
+    || "衔接方式未公开";
+}
+
+function skillMilestoneView(detail) {
+  const milestone = detail && detail.skill_milestone;
+  const skills = milestone && Array.isArray(milestone.skills) ? milestone.skills : [];
+  if (!milestone || typeof milestone.id !== "string" || !/^skill-[0-9a-f]{64}$/.test(milestone.id)
+      || !Number.isInteger(milestone.version) || skills.length === 0
+      || skills.some((skill) => !skill || typeof skill.name !== "string"
+        || typeof skill.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(skill.sha256))) return null;
+  return {
+    label: `Skill v${milestone.version} · ${milestone.id.slice(6, 14)}`,
+    id: milestone.id,
+    skills: skills.map((skill) => ({name: skill.name, short: skill.sha256.slice(0, 8), sha256: skill.sha256})),
+  };
+}
+
+function materialIndexView(detail) {
+  const candidate = detail && (detail.element_index || detail.material_index || detail.project_index);
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+  const groups = ["people", "entities", "scenes"].map((key) => {
+    const source = candidate[key];
+    const entries = source && typeof source === "object" && !Array.isArray(source)
+      ? Object.entries(source).map(([id, value]) => ({
+        id,
+        description: value && typeof value === "object"
+          ? String(value.source_visual_description || value.description || "") : "",
+        occurrences: value && Array.isArray(value.occurrences) ? value.occurrences.length : 0,
+      })) : [];
+    return {key, entries};
+  });
+  const relations = candidate.relations && typeof candidate.relations === "object"
+    && !Array.isArray(candidate.relations)
+    ? Object.entries(candidate.relations).map(([id, value]) => ({
+      id,
+      subject: value && String(value.subject || value.subject_id || ""),
+      predicate: value && String(value.predicate || value.relationship || ""),
+      object: value && String(value.object || value.object_id || ""),
+    })) : [];
+  return {groups, relations};
+}
+
+function conversationThumbnailPath(detail) {
+  const segments = Array.isArray(detail && detail.segments) ? detail.segments : [];
+  if (segments.length > 0) {
+    const paths = authoritativeSegmentKeyframePaths(detail, segments[0]);
+    return paths.length > 0 ? paths[0] : null;
+  }
+  const names = Array.isArray(detail && detail.keyframes) ? detail.keyframes : [];
+  return names.length > 0 && safeMediaBasename(names[0]) ? "keyframes/" + names[0] : null;
+}
+
+function errorDiagnostic(raw, label = "高级诊断") {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const details = el("details", "error-diagnostic");
+  details.appendChild(el("summary", null, label));
+  details.appendChild(el("pre", null, diagnosticText(raw)));
+  return details;
+}
+
+function hideOperationHeader() {
+  const host = typeof document !== "undefined" ? $("operation-status") : null;
+  if (!host) return;
+  host.textContent = "";
+  host.hidden = true;
+}
+
+function renderOperationHeader(detail) {
+  const host = $("operation-status");
+  const model = operationTimeline(detail);
+  host.textContent = "";
+  host.hidden = false;
+  host.dataset.status = model.current.status;
+
+  const summary = el("div", "operation-summary");
+  const identity = el("div", "operation-identity");
+  identity.appendChild(el("span", "operation-kicker", `项目 #${shortId(model.operationId)}`));
+  const title = el("strong", "operation-current", model.current.label + " · " + stageStatusText(model.current.status));
+  title.setAttribute("aria-label", `当前阶段：${model.current.label}，${stageStatusText(model.current.status)}`);
+  identity.appendChild(title);
+  if (model.current.count) identity.appendChild(el("span", "operation-count", model.current.count));
+  summary.appendChild(identity);
+
+  const meta = el("div", "operation-meta");
+  meta.appendChild(el("span", null, model.elapsed));
+  meta.appendChild(el("span", null, model.updated ? "服务器更新 " + model.updated : "更新时间未知"));
+  summary.appendChild(meta);
+  host.appendChild(summary);
+
+  const currentDetail = el("p", "operation-current-detail", model.current.detail);
+  host.appendChild(currentDetail);
+
+  const timeline = el("ol", "operation-timeline");
+  for (const stage of model.stages) {
+    const item = el("li", `operation-stage status-${stage.status}`);
+    if (stage.key === model.current.key) item.setAttribute("aria-current", "step");
+    const marker = el("span", "operation-stage-marker", stage.status === "done" ? "✓" : "");
+    marker.setAttribute("aria-hidden", "true");
+    item.appendChild(marker);
+    item.appendChild(el("span", "operation-stage-label", stage.label));
+    item.appendChild(el("span", "operation-stage-state", stage.count || stageStatusText(stage.status)));
+    item.title = stage.detail;
+    timeline.appendChild(item);
+  }
+  host.appendChild(timeline);
+}
+
 function trackURL(url) {
   state.objectURLs.push(url);
   return url;
@@ -654,6 +1001,8 @@ function handleAuthError(err) {
 /* ===== 登录 / 会话鉴权 ===== */
 function showLogin(message) {
   stopPolling();
+  hideOperationHeader();
+  releaseHistoryThumbnails();
   state.currentId = null;
   state.detail = null;
   $("app-view").hidden = true;
@@ -726,13 +1075,24 @@ async function refreshList(autoSelect) {
       Array.isArray(list) ? list : [],
       state.conversations,
     );
+    releaseHistoryThumbnails(new Set(state.conversations.map((item) => item.id)));
     renderList();
     if (autoSelect && state.conversations.length > 0 && !state.currentId) {
       selectConversation(state.conversations[0].id);
     }
+    void hydrateConversationSummaries();
   } catch (err) {
     if (handleAuthError(err)) return;
     renderListError(err.message);
+  }
+}
+
+function releaseHistoryThumbnails(keepIds = null) {
+  for (const [id, url] of Object.entries(state.historyThumbnailURLs)) {
+    if (keepIds && keepIds.has(id)) continue;
+    URL.revokeObjectURL(url);
+    delete state.historyThumbnailURLs[id];
+    delete state.historyDetails[id];
   }
 }
 
@@ -742,7 +1102,10 @@ function mergeConversationList(incoming, previous) {
     const known = previousById.get(item.id);
     if (!known) return item;
     const merged = Object.assign({}, item);
-    for (const field of ["generation", "navigation_status"]) {
+    for (const field of [
+      "generation", "navigation_status", "duration_s", "updated_at", "segment_count",
+      "skill_milestone", "thumbnail_path", "prompt_fusion", "postprocess", "_hydrated",
+    ]) {
       if (!Object.prototype.hasOwnProperty.call(item, field)
           && Object.prototype.hasOwnProperty.call(known, field)) {
         merged[field] = known[field];
@@ -758,10 +1121,64 @@ function syncConversationDetail(conversations, detail) {
   summary.status = detail.status;
   summary.has_video = detail.has_video === true;
   summary.generation = detail.generation || null;
+  summary.duration_s = detail.duration_s;
+  summary.updated_at = detail.updated_at;
+  summary.segment_count = detail.segment_count;
+  summary.skill_milestone = detail.skill_milestone || null;
+  summary.prompt_fusion = detail.prompt_fusion || null;
+  summary.postprocess = detail.postprocess || null;
+  summary.thumbnail_path = conversationThumbnailPath(detail);
+  summary._hydrated = true;
+  state.historyDetails[detail.id] = detail;
   if (Object.prototype.hasOwnProperty.call(detail, "navigation_status")) {
     summary.navigation_status = detail.navigation_status;
   }
   return true;
+}
+
+async function loadHistoryThumbnail(summary) {
+  if (!summary || !summary.id || !summary.thumbnail_path
+      || state.historyThumbnailURLs[summary.id]) return;
+  try {
+    const response = await api(
+      "/api/conversations/" + encodeURIComponent(summary.id)
+        + "/files/" + encodedMediaPath(summary.thumbnail_path),
+    );
+    if (!response.ok) return;
+    const blob = await response.blob();
+    if (!state.conversations.some((item) => item.id === summary.id)) return;
+    state.historyThumbnailURLs[summary.id] = URL.createObjectURL(blob);
+  } catch (error) {
+    if (handleAuthError(error)) throw error;
+  }
+}
+
+async function hydrateConversationSummaries() {
+  if (state.historyHydrating || !state.token) return;
+  const pending = state.conversations.filter((item) => item && item.id && item._hydrated !== true).slice(0, 24);
+  if (pending.length === 0) return;
+  state.historyHydrating = true;
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < pending.length) {
+      const summary = pending[cursor++];
+      try {
+        const detail = await apiJSON("/api/conversations/" + encodeURIComponent(summary.id));
+        if (syncConversationDetail(state.conversations, detail)) {
+          await loadHistoryThumbnail(summary);
+        }
+      } catch (error) {
+        if (handleAuthError(error)) return;
+        summary._hydrated = true;
+      }
+    }
+  };
+  try {
+    await Promise.all([worker(), worker(), worker()]);
+  } finally {
+    state.historyHydrating = false;
+    if (state.token) renderList();
+  }
 }
 
 function renderList() {
@@ -774,13 +1191,40 @@ function renderList() {
   for (const c of state.conversations) {
     const item = el("button", "conv-item" + (c.id === state.currentId ? " selected" : ""));
     item.type = "button";
-    item.appendChild(el("span", "conv-title", c.title || "未命名会话"));
-    const meta = el("span", "conv-meta");
+    const thumb = el("span", "conv-thumb");
+    const thumbnailURL = state.historyThumbnailURLs[c.id];
+    if (thumbnailURL) {
+      const image = el("img");
+      image.src = thumbnailURL;
+      image.alt = "";
+      thumb.appendChild(image);
+    } else {
+      thumb.appendChild(icon("i-film"));
+    }
+    item.appendChild(thumb);
+    const content = el("span", "conv-content");
+    const heading = el("span", "conv-heading");
+    heading.appendChild(el("span", "conv-title", c.title || "未命名项目"));
     const badgeState = conversationBadge(c);
     const badge = el("span", "badge " + badgeState.className, badgeState.text);
-    meta.appendChild(badge);
-    meta.appendChild(el("span", "conv-time", fmtTime(c.created_at)));
-    item.appendChild(meta);
+    heading.appendChild(badge);
+    content.appendChild(heading);
+    const identity = el("span", "conv-identity");
+    identity.appendChild(el("span", "conv-id", "#" + shortId(c.id)));
+    identity.appendChild(el("span", null, formatDuration(c.duration_s)));
+    if (Number.isInteger(c.segment_count) && c.segment_count > 0) {
+      identity.appendChild(el("span", null, c.segment_count + " 段"));
+    }
+    content.appendChild(identity);
+    const footer = el("span", "conv-footer");
+    const detail = state.historyDetails[c.id];
+    const timeline = detail ? operationTimeline(detail) : null;
+    footer.appendChild(el("span", null, timeline ? timeline.current.label : badgeState.text));
+    footer.appendChild(el("span", "conv-time", fmtTime(c.updated_at || c.created_at)));
+    footer.appendChild(el("span", "conv-output " + (c.has_video === true ? "is-ready" : "is-waiting"),
+      c.has_video === true ? "B 已提交" : "B 未提交"));
+    content.appendChild(footer);
+    item.appendChild(content);
     item.addEventListener("click", () => {
       selectConversation(c.id);
       closeDrawer();
@@ -876,6 +1320,7 @@ function clearStream() {
 
 function renderEmptyHero() {
   stopPolling();
+  hideOperationHeader();
   clearStream();
   $("main-title").textContent = "视频工作室";
 
@@ -904,6 +1349,7 @@ function renderEmptyHero() {
 }
 
 function renderSkeleton() {
+  hideOperationHeader();
   clearStream();
   const inner = el("div", "stream-inner");
   inner.appendChild(el("div", "sk-block shimmer sk-user"));
@@ -982,9 +1428,11 @@ function renderFail(detail) {
   const card = el("div", "fail-card");
   card.appendChild(icon("i-alert", "ic-danger"));
   const body = el("div");
-  body.appendChild(el("p", "fail-title", "处理失败"));
-  body.appendChild(el("p", "fail-msg", detail.error || "后端未返回具体原因"));
-  body.appendChild(el("p", "fail-tip", "输入准备未完成；请保留上方错误信息后重试，若重复出现请联系管理员"));
+  body.appendChild(el("p", "fail-title", "分析未完成"));
+  body.appendChild(el("p", "fail-msg", safeErrorSummary(detail.error, "分析阶段执行失败")));
+  body.appendChild(el("p", "fail-tip", "成片流程尚未开始；刷新不会重复提交任务。"));
+  const diagnostic = errorDiagnostic(detail.error);
+  if (diagnostic) body.appendChild(diagnostic);
   card.appendChild(body);
   row.appendChild(card);
   return row;
@@ -1017,21 +1465,105 @@ function videoSection(detail, file, title, sub) {
 
 /* 研究链路只展示 CID 已冻结的只读 Skill 摘要；不渲染任何本机路径。 */
 function skillMilestoneSection(detail) {
-  const milestone = detail && detail.skill_milestone;
-  if (!milestone || typeof milestone.id !== "string" || !milestone.id) return null;
-  const skills = Array.isArray(milestone.skills) ? milestone.skills : [];
-  if (skills.length !== 3) return null;
+  const milestone = skillMilestoneView(detail);
+  if (!milestone) return null;
   const section = el("section", "res-section");
   section.dataset.testid = "skill-milestone";
-  section.appendChild(el("h3", "res-h3", "Skill 里程碑"));
-  section.appendChild(el("p", "milestone-id", milestone.id));
+  const card = el("div", "skill-card");
+  const heading = el("div", "skill-heading");
+  heading.appendChild(el("h3", "res-h3", "运行配方"));
+  heading.appendChild(el("span", "skill-version", milestone.label));
+  card.appendChild(heading);
+  card.appendChild(el("p", "skill-freeze", "已按该项目冻结；后续 Skill 更新不会改变本项目的运行依据。"));
   const list = el("ul", "milestone-skills");
-  for (const skill of skills) {
-    if (!skill || typeof skill.name !== "string"
-        || typeof skill.sha256 !== "string" || !Number.isInteger(skill.size)) return null;
-    list.appendChild(el("li", null, skill.name + " · " + skill.sha256 + " · " + skill.size + " B"));
+  const roles = {
+    "video-maker": "视频分析与镜头规划",
+    "image-postprocess": "图片优化与一致性",
+    "video-prompt-fusion": "最终提示词融合",
+  };
+  for (const skill of milestone.skills) {
+    const item = el("li");
+    item.appendChild(el("strong", null, skill.name));
+    item.appendChild(el("span", null, roles[skill.name] || "项目 Skill"));
+    item.appendChild(el("code", null, skill.short));
+    list.appendChild(item);
   }
-  section.appendChild(list);
+  card.appendChild(list);
+  const audit = el("details", "skill-audit");
+  audit.appendChild(el("summary", null, "查看完整校验信息"));
+  audit.appendChild(el("code", null, milestone.id));
+  for (const skill of milestone.skills) {
+    audit.appendChild(el("code", null, skill.name + " · " + skill.sha256));
+  }
+  card.appendChild(audit);
+  section.appendChild(card);
+  return section;
+}
+
+function renderMaterialIndexSection(detail) {
+  const section = el("section", "res-section material-index-section");
+  section.dataset.testid = "material-index";
+  section.appendChild(el("h3", "res-h3", "素材与关系"));
+  const facts = el("div", "material-facts");
+  const segments = Array.isArray(detail && detail.segments) ? detail.segments : [];
+  for (const [label, value] of [
+    ["关键帧", totalKeyframes(detail) + " 帧"],
+    ["视频分段", segments.length > 0 ? segments.length + " 段" : "单段"],
+    ["源片时长", formatDuration(detail && detail.duration_s)],
+  ]) {
+    const fact = el("div", "material-fact");
+    fact.appendChild(el("span", null, label));
+    fact.appendChild(el("strong", null, value));
+    facts.appendChild(fact);
+  }
+  section.appendChild(facts);
+
+  const index = materialIndexView(detail);
+  const cards = el("div", "material-card-grid");
+  if (index) {
+    const groupLabels = {people: "人物", entities: "物体", scenes: "场景"};
+    for (const group of index.groups) {
+      for (const entry of group.entries) {
+        const card = el("article", "material-card");
+        card.appendChild(el("span", "material-type", groupLabels[group.key] || group.key));
+        card.appendChild(el("strong", null, entry.id));
+        if (entry.description) card.appendChild(el("p", null, entry.description));
+        card.appendChild(el("span", "material-occurrences", entry.occurrences + " 个分段记录"));
+        cards.appendChild(card);
+      }
+    }
+    for (const relation of index.relations) {
+      const card = el("article", "material-card relation-card");
+      card.appendChild(el("span", "material-type", "关系"));
+      card.appendChild(el("strong", null, relation.id));
+      card.appendChild(el("p", null,
+        [relation.subject, relation.predicate, relation.object].filter(Boolean).join(" → ") || "关系说明未公开"));
+      cards.appendChild(card);
+    }
+  } else {
+    const unavailable = el("article", "material-card material-unavailable");
+    unavailable.appendChild(el("span", "material-type", "元素索引"));
+    unavailable.appendChild(el("strong", null, "人物与物体明细未公开"));
+    unavailable.appendChild(el("p", null,
+      "当前只读详情 API 未返回元素索引，因此页面不会从提示词猜测人物、物体或关系。"));
+    cards.appendChild(unavailable);
+  }
+
+  for (const segment of segments) {
+    const card = el("article", "material-card relation-card");
+    const indexLabel = Number.isInteger(segment && segment.index) ? segment.index : "?";
+    card.appendChild(el("span", "material-type", "分段关系"));
+    card.appendChild(el("strong", null, `第 ${indexLabel} 段 · ${segmentJoinText(segment && segment.join_mode)}`));
+    const start = Number(segment && segment.start_s);
+    const end = Number(segment && segment.end_s);
+    const frameCount = Array.isArray(segment && segment.keyframes) ? segment.keyframes.length : 0;
+    card.appendChild(el("p", null,
+      Number.isFinite(start) && Number.isFinite(end)
+        ? `${start.toFixed(1)}–${end.toFixed(1)} 秒 · ${frameCount} 帧`
+        : `${frameCount} 帧 · 时间边界未公开`));
+    cards.appendChild(card);
+  }
+  section.appendChild(cards);
   return section;
 }
 
@@ -1048,6 +1580,8 @@ function renderResults(detail) {
 
   const milestone = skillMilestoneSection(detail);
   if (milestone) frag.appendChild(milestone);
+
+  frag.appendChild(renderMaterialIndexSection(detail));
 
   // 原始视频（上传即存在，与生成物明确分区）
   if (detail.has_source) {
@@ -1201,10 +1735,12 @@ async function submitGeneration(detail, card) {
 }
 
 function generationStageText(stage) {
-  if (stage === "h3") return "视频子任务生成";
+  if (stage === "context_ir" || stage === "context_ir_native") return "Context IR 提示词优化";
+  if (stage === "prompt_fusion") return "Prompt Fusion 最终提示词融合";
+  if (stage === "h3") return "H3 分段视频生成";
   if (stage === "stitch") return "视频拼接";
   if (stage === "stitching") return "视频拼接";
-  return stage ? String(stage) : "等待开始";
+  return stage ? "服务器阶段：" + String(stage) : "等待开始";
 }
 
 function generationSegmentStatusText(status) {
@@ -1233,15 +1769,88 @@ function appendGenerationProgress(card, generation) {
   segments.forEach((segment, position) => {
     const item = el("li", "generation-segment status-" + String(segment.status || "pending"));
     item.appendChild(el("strong", null, generationSegmentLabel(segment, position)));
-    const meta = el("span", null, "chain：" + (segment.chain_id || "-")
-      + " · join：" + (segment.join_mode || "-")
-      + " · 尝试 " + (segment.attempt || 0));
+    const meta = el("span", null,
+      Number.isInteger(segment && segment.attempt) && segment.attempt > 0
+        ? "第 " + segment.attempt + " 次执行" : "等待服务端更新");
     item.appendChild(meta);
-    if (segment.error) item.appendChild(el("span", "generation-segment-error", segment.error));
+    if (segment.error) {
+      item.appendChild(el("span", "generation-segment-error", safeErrorSummary(segment.error, "本段生成失败")));
+      const diagnostic = errorDiagnostic(segment.error, "本段高级诊断");
+      if (diagnostic) item.appendChild(diagnostic);
+    }
     list.appendChild(item);
   });
   progress.appendChild(list);
   card.appendChild(progress);
+}
+
+function renderIntermediateStages(detail) {
+  const fusion = detail && detail.prompt_fusion;
+  const timeline = operationTimeline(detail);
+  const contextStage = timeline.stages.find((stage) => stage.key === "context");
+  if (!fusion && (!contextStage || ["waiting", "skipped"].includes(contextStage.status))) return null;
+  const section = el("section", "res-section intermediate-stages");
+  section.appendChild(el("h3", "res-h3", "中间阶段"));
+
+  if (fusion) {
+    const card = el("article", "intermediate-card");
+    const fusionStage = timeline.stages.find((stage) => stage.key === "fusion");
+    const heading = el("div", "intermediate-heading");
+    heading.appendChild(el("strong", null, "Prompt Fusion"));
+    heading.appendChild(el("span", `stage-pill status-${fusionStage.status}`,
+      fusionStage.count || stageStatusText(fusionStage.status)));
+    card.appendChild(heading);
+    card.appendChild(el("p", "ac-sub", fusionStage.detail));
+    if (fusion.error) {
+      const diagnostic = errorDiagnostic(fusion.error);
+      if (diagnostic) card.appendChild(diagnostic);
+    }
+    const segments = Array.isArray(fusion.segments) ? fusion.segments : [];
+    if (segments.length > 0) {
+      const list = el("ol", "intermediate-list");
+      for (const segment of segments) {
+        const item = el("li");
+        item.appendChild(el("strong", null,
+          `第 ${Number.isInteger(segment && segment.index) ? segment.index : "?"} 段`));
+        item.appendChild(el("span", null,
+          ({pending: "等待融合", running: "融合中", done: "已冻结", failed: "融合失败"})[segment && segment.status]
+            || "状态未知"));
+        if (segment && segment.status === "done" && typeof segment.final_prompt === "string"
+            && segment.final_prompt.trim()) {
+          const prompt = el("details", "fusion-prompt");
+          prompt.appendChild(el("summary", null, "查看最终提示词"));
+          prompt.appendChild(el("pre", null, segment.final_prompt));
+          item.appendChild(prompt);
+        }
+        if (segment && segment.error) {
+          item.appendChild(el("span", "generation-segment-error",
+            safeErrorSummary(segment.error, "本段融合失败")));
+          const diagnostic = errorDiagnostic(segment.error, "本段高级诊断");
+          if (diagnostic) item.appendChild(diagnostic);
+        }
+        list.appendChild(item);
+      }
+      card.appendChild(list);
+    }
+    section.appendChild(card);
+  }
+
+  if (contextStage && !["waiting", "skipped"].includes(contextStage.status)) {
+    const card = el("article", "intermediate-card");
+    const heading = el("div", "intermediate-heading");
+    heading.appendChild(el("strong", null, "Context IR"));
+    heading.appendChild(el("span", `stage-pill status-${contextStage.status}`,
+      contextStage.count || stageStatusText(contextStage.status)));
+    card.appendChild(heading);
+    card.appendChild(el("p", "ac-sub", contextStage.detail));
+    const generation = detail && detail.generation;
+    if (generation && generation.error && ["failed", "attention"].includes(contextStage.status)) {
+      const diagnostic = errorDiagnostic(generation.error);
+      if (diagnostic) card.appendChild(diagnostic);
+    }
+    section.appendChild(card);
+  }
+  return section;
 }
 
 async function resumeGeneration(detail, card) {
@@ -1289,8 +1898,8 @@ async function postGeneration(
       const button = card.querySelector(".generation-submit");
       if (button) {
         const action = generationAction(generation.status, generation.stage);
-        button.textContent = action === "retry_stitch" ? "重试拼接"
-          : action === "retry" ? "重试生成" : "生成最终视频";
+        button.textContent = action === "retry_stitch" ? "仅重试拼接（0 新增付费）"
+          : action === "retry" ? "重新生成失败内容" : "开始生成成片 B";
       }
     }
   }
@@ -1325,13 +1934,16 @@ function renderFinalSection(detail) {
     const failedTitle = generation.stage === "stitch" ? "视频拼接失败" : "视频生成失败";
     status.appendChild(el("strong", null,
       generation.status === "submission_unknown" ? "提交结果未知" : failedTitle));
-    const errorText = generation.error || "后端未返回具体原因";
-    status.appendChild(el("span", null, errorText));
+    status.appendChild(el("span", null, safeErrorSummary(generation.error, "视频任务执行失败")));
     card.appendChild(status);
+    const diagnostic = errorDiagnostic(generation.error);
+    if (diagnostic) card.appendChild(diagnostic);
   } else if (generation.status === "resume_required") {
     const status = el("div", "generation-status is-resume");
     status.appendChild(el("strong", null, "既有生成任务等待继续"));
-    status.appendChild(el("span", null, generation.error || "任务已保存，可从原进度继续"));
+    status.appendChild(el("span", null,
+      generation.error ? safeErrorSummary(generation.error, "任务已保存，可从原进度继续")
+        : "任务已保存，可从原进度继续"));
     card.appendChild(status);
   }
 
@@ -1391,7 +2003,7 @@ function renderFinalSection(detail) {
     errorBox.hidden = true;
     card.appendChild(errorBox);
     const row = el("div", "final-row");
-    const button = el("button", "btn btn-primary generation-submit", "继续生成");
+    const button = el("button", "btn btn-primary generation-submit", "继续原任务（0 新增付费）");
     button.type = "button";
     button.addEventListener("click", () => {
       resumeGeneration(detail, card);
@@ -1418,7 +2030,8 @@ function renderFinalSection(detail) {
     errorBox.hidden = true;
     card.appendChild(errorBox);
     const row = el("div", "final-row");
-    const label = stitchOnly ? "重试拼接" : "重试生成";
+    const label = stitchOnly ? "仅重试拼接（0 新增付费）"
+      : "重新生成失败分段（新增 " + retryContract.paidTaskCount + " 个付费任务）";
     const button = el("button", "btn btn-primary generation-submit", label);
     button.type = "button";
     button.addEventListener("click", () => submitGeneration(detail, card));
@@ -1547,7 +2160,9 @@ function renderFinalSection(detail) {
   errorBox.hidden = true;
   card.appendChild(errorBox);
   const row = el("div", "final-row");
-  const buttonLabel = generation.status === "failed" ? "重试生成" : "生成最终视频";
+  const buttonLabel = generation.status === "failed"
+    ? "重新生成（新增 " + retryContract.paidTaskCount + " 个付费任务）"
+    : "开始生成成片 B（新增 " + retryContract.paidTaskCount + " 个付费任务）";
   const button = el("button", "btn btn-primary generation-submit", buttonLabel);
   button.type = "button";
   button.addEventListener("click", () => submitGeneration(detail, card));
@@ -2588,27 +3203,28 @@ function renderPpAssistant(detail, pp) {
 }
 
 /* 后处理入口消息：仅 postprocess 尚未开始且接口开放时，结果区末尾提问。
-   点「是」打开弹窗（消息流照旧）；点「否」原位标记已结束，不再弹窗（会话内记忆）。
+   “设置素材处理”只打开配置；真正提交发生在弹窗的“开始素材处理”。
    running/done 时不显示——renderPpChat 的进行中卡/结果卡接管。 */
 function renderPpAsk(detail) {
   if (!shouldRenderPostprocessAsk(detail)) return null;
   const row = el("div", "msg-row");
   row.appendChild(assistantHead(detail.updated_at));
   const card = el("div", "activity-card pp-ask-card");
-  card.appendChild(el("p", "pp-ask-text", "是否优化素材？"));
+  card.appendChild(el("p", "pp-ask-text", "需要处理关键帧素材吗？"));
+  card.appendChild(el("p", "ac-sub", "设置选项不会提交；在确认弹窗中点击“开始素材处理”后才会执行。"));
   if (state.ppAskDismissed[detail.id]) {
-    card.appendChild(el("p", "pp-ask-ended", "已跳过优化，素材保持原样"));
+    card.appendChild(el("p", "pp-ask-ended", "已保持原素材；未提交素材处理任务。"));
   } else {
     const actions = el("div", "pp-ask-actions");
     const defaultChoice = postprocessAskDefault();
-    const yes = el("button", defaultChoice === "yes" ? "btn btn-primary pp-ask-btn is-selected" : "btn btn-ghost pp-ask-btn", "是");
+    const yes = el("button", defaultChoice === "yes" ? "btn btn-primary pp-ask-btn is-selected" : "btn btn-ghost pp-ask-btn", "设置素材处理");
     yes.type = "button";
     yes.addEventListener("click", () => requestOpenPostprocessModal(detail));
-    const no = el("button", defaultChoice === "no" ? "btn btn-primary pp-ask-btn is-selected" : "btn btn-ghost pp-ask-btn", "否");
+    const no = el("button", defaultChoice === "no" ? "btn btn-primary pp-ask-btn is-selected" : "btn btn-ghost pp-ask-btn", "保持原素材");
     no.type = "button";
     no.addEventListener("click", () => {
       state.ppAskDismissed[detail.id] = true;
-      actions.replaceWith(el("p", "pp-ask-ended", "已跳过优化，素材保持原样"));
+      actions.replaceWith(el("p", "pp-ask-ended", "已保持原素材；未提交素材处理任务。"));
     });
     actions.appendChild(yes);
     actions.appendChild(no);
@@ -2636,6 +3252,7 @@ function renderPpChat(detail) {
 }
 
 function renderDetail(detail) {
+  renderOperationHeader(detail);
   renderStable(detail);
   renderPpDynamic(detail);
   renderGenerationDynamic(detail);
@@ -2675,6 +3292,8 @@ function renderGenerationDynamic(detail) {
   const slot = document.querySelector(".generation-dynamic");
   if (!slot) return;
   slot.textContent = "";
+  const intermediate = renderIntermediateStages(detail);
+  if (intermediate) slot.appendChild(intermediate);
   slot.appendChild(renderFinalSection(detail));
 }
 
@@ -2691,6 +3310,9 @@ function detailSignature(detail) {
   const pp = detail.postprocess || null;
   const segments = Array.isArray(detail.segments) ? detail.segments : [];
   const stable = JSON.stringify([
+    detail.id,
+    detail.title,
+    detail.note,
     detail.status,
     detail.read_only === true,
     detail.submit_enabled === true,
@@ -2706,6 +3328,8 @@ function detailSignature(detail) {
     detail.image_optimization_prompt || null,
     detail.postprocess_capabilities || null,
     detail.dialogue || null,
+    detail.skill_milestone || null,
+    detail.element_index || detail.material_index || detail.project_index || null,
     pp ? pp.status : "",
     pp && pp.error ? pp.error : "",
     Array.isArray(detail.keyframes) ? detail.keyframes.join(",") : "",
@@ -2727,6 +3351,7 @@ function detailSignature(detail) {
     detail.plan_receipt || null,
     Number.isInteger(detail.segment_count) ? detail.segment_count : null,
     detail.generation || null,
+    detail.prompt_fusion || null,
     detail.has_video ? 1 : 0,
   ]);
   return { stable, dyn, generation };
@@ -2742,7 +3367,14 @@ async function loadDetail(id, silent) {
       state.generationSubmitting[id] = false;
     }
     state.detail = detail;
-    if (syncConversationDetail(state.conversations, detail)) renderList();
+    if (syncConversationDetail(state.conversations, detail)) {
+      renderList();
+      const summary = state.conversations.find((item) => item.id === detail.id);
+      if (summary) void loadHistoryThumbnail(summary).then(() => {
+        if (state.token) renderList();
+      });
+    }
+    renderOperationHeader(detail);
     const sig = detailSignature(detail);
     if (!silent) {
       // 手动切换 / 首次进入：全量渲染照旧
@@ -3217,10 +3849,14 @@ if (typeof module !== "undefined" && module.exports) {
     clearStream,
     closeLightbox,
     conversationBadge,
+    conversationThumbnailPath,
     createDisclosure,
     detailSignature,
+    diagnosticText,
     dirtyPromptDecision,
     fitProfile,
+    formatDuration,
+    formatElapsed,
     formatDialogueLines,
     generationDraft,
     generationAction,
@@ -3231,9 +3867,11 @@ if (typeof module !== "undefined" && module.exports) {
     imagePromptEditable,
     isPostprocessSubmissionUnknown,
     longVideoContract,
+    materialIndexView,
     mergeConversationList,
     mergeImagePromptDraft,
     normalizeDialogueLines,
+    operationTimeline,
     parseDialogueLines,
     postprocessReadyForGeneration,
     ppCompletedFrames,
@@ -3244,6 +3882,7 @@ if (typeof module !== "undefined" && module.exports) {
     openLightbox,
     releaseTrackedURLs,
     releaseTrackedURL,
+    releaseHistoryThumbnails,
     readOnlyImageFramePromptText,
     resetSegmentProductsDisclosure,
     requestGenerationSubmit,
@@ -3252,14 +3891,19 @@ if (typeof module !== "undefined" && module.exports) {
     recoverLockedPostprocess,
     runSingleFlightPollCycle,
     safePostprocessError,
+    safeErrorSummary,
     safePostprocessStage,
     saveImageOptimizationPrompt,
     segmentProductsDisclosure,
+    segmentJoinText,
     setDisclosureState,
     showActionError,
     shouldRenderPostprocessAsk,
     shouldPollDetail,
+    shortId,
+    skillMilestoneView,
     syncConversationDetail,
+    totalKeyframes,
   };
 }
 

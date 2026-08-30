@@ -37,13 +37,14 @@ def _run_contract(expression: str):
     return json.loads(completed.stdout)
 
 
-def test_creation_and_copy_use_provider_neutral_contract_only():
+def test_creation_contract_stays_provider_neutral_while_status_names_h3():
     source = _web_source()
     assert "voice-mode" in source
     assert "target_language" in source
-    assert "H3" not in source
+    assert "H3 生成" in source
+    assert "minimax" not in source.lower()
     assert "最长 300 秒" in source
-    assert "超过 15 秒会拆分为单次不超过 14 秒的视频生成子任务" in source
+    assert "超过 10 秒会拆分为单次不超过 10 秒的视频生成子任务" in source
     assert "时长不限" not in source
 
 
@@ -78,12 +79,12 @@ def test_stale_page_error_shows_refresh_instruction():
     }
 
 
-def test_context_ir_is_absent_from_web_runtime():
+def test_context_ir_is_read_only_server_state_without_new_endpoint():
     source = _web_source().lower()
-    assert "context ir" not in source
-    assert "context_ir" not in source
-    assert "contextir" not in source
+    assert "context ir" in source
+    assert "context_ir" in source
     assert "/context-ir" not in source
+    assert "服务器未公开逐段计数" in source
 
 
 def test_submit_and_detail_state_are_part_of_static_contract():
@@ -177,7 +178,7 @@ def test_failed_stitch_has_distinct_non_paid_retry_action():
 def test_resume_ui_is_locked_and_explicit_about_cost():
     source = APP_JS.read_text(encoding="utf-8")
     assert "继续既有生成任务" in source
-    assert "继续原任务，不创建新的生成请求" in source
+    assert "继续原任务（0 新增付费）" in source
     assert "buildResumePayload(detail)" in source
 
 
