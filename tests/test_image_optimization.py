@@ -14,10 +14,53 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from app import image_optimization, mediakit, postprocess, seedream, storage
+from app import (
+    image_optimization,
+    mediakit,
+    postprocess,
+    seedream,
+    skill_milestone,
+    storage,
+)
 from app.config import Settings, get_settings
 from app.main import create_app
 from conftest import AUTH, make_settings
+
+
+@pytest.fixture(autouse=True)
+def _route_postprocess_recovery_edge_to_seedream_test_double(monkeypatch):
+    """Keep postprocess tests at the current recovery boundary.
+
+    Recovery behavior itself is covered in ``test_seedream_recovery.py``.
+    These tests replace ``postprocess.seedream.edit`` with deterministic
+    doubles, so route the current recovery edge through that double without
+    reaching a provider.
+    """
+
+    async def edit_with_content_recovery(
+        settings,
+        images,
+        prompt,
+        output,
+        *,
+        receipt_path,
+        session_dir,
+        semantic_context,
+    ):
+        del session_dir, semantic_context
+        return await postprocess.seedream.edit(
+            settings,
+            images,
+            prompt,
+            output,
+            receipt_path=receipt_path,
+        )
+
+    monkeypatch.setattr(
+        postprocess.seedream_recovery,
+        "edit_with_content_recovery",
+        edit_with_content_recovery,
+    )
 
 
 def _png(width=5, height=3, value=127):
@@ -69,6 +112,11 @@ def _done(settings, *, segments=False):
             settings.data_dir, cid, status="done", duration_s=5,
             prompt="base", keyframes=["01.png"],
         )
+    skill_milestone.freeze(
+        cdir,
+        repository_root=Path(__file__).resolve().parents[1],
+        git_commit=None,
+    )
     return cid
 
 
@@ -1670,14 +1718,25 @@ def test_relation_index_compiles_joint_design_and_frame_state_into_prompt(tmp_pa
     )
     prompts = image_optimization.compile_frame_prompts(plan, "anchor_consistency")[1]
 
-    assert "matched interface and scale" in image_optimization.composite_replacement_board_prompt(plan)
-    assert "全项目共享关系绑定：relation-01" in prompts[1]
-    assert "当前状态=engaged" in prompts[1]
-    assert "当前状态=released" in prompts[2]
-    assert any(
-        relation["predicate"] == "loaded_in"
-        for relation in plan["segments"][0]["frame_constraints"][0]["non_person_entity_ledger"]["relations"]
-    )
+    # The replacement board is element-only.  Directed relation semantics are
+    # carried by the per-frame prompts below, not painted into reference tiles.
+    assert "matched interface and scale" not in image_optimization.composite_replacement_board_prompt(plan)
+    # Relation authority is a structured sidecar; the image edit prose keeps
+    # only the visible element bindings and must not duplicate that authority.
+    assert "全项目共享关系绑定：relation-01" not in prompts[1]
+    relations = [
+        frame["relation_occurrences"][0]
+        for frame in plan["segments"][0]["frame_constraints"]
+    ]
+    assert [relation["predicate"] for relation in relations] == [
+        "loaded_in", "loaded_in",
+    ]
+    assert [relation["state"] for relation in relations] == [
+        "engaged", "released",
+    ]
+    assert [relation["geometry"] for relation in relations] == [
+        "aligned", "separated",
+    ]
 
 
 def test_relation_index_normalization_is_tolerant_and_preserves_valid_edges():
@@ -2040,6 +2099,7 @@ def test_v4_plan_rejects_model_transition_that_differs_from_backend_skeleton(tmp
             }],
             settings.seedream_edit_mode,
             session_dir=session,
+            skill_bytes=b"frozen image verification skill",
         )
 
 

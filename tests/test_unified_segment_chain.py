@@ -15,9 +15,21 @@ from app import (
     long_video,
     main,
     pipeline,
+    skill_milestone,
     storage,
 )
 from conftest import make_settings
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _freeze_current_skill_milestone(root: Path):
+    return skill_milestone.freeze(
+        root,
+        repository_root=REPOSITORY_ROOT,
+        git_commit=None,
+    )
 
 
 def _canonical(value: object) -> bytes:
@@ -854,13 +866,6 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
     ).encode()
     artifact_path.write_bytes(artifact_data)
 
-    class NoHttp:
-        def get(self, *_args, **_kwargs):
-            raise AssertionError("current Fusion Context must perform zero HTTP")
-
-        def post(self, *_args, **_kwargs):
-            raise AssertionError("current Fusion Context must perform zero HTTP")
-
     for segment, prompt in zip(frozen_segments, frozen.final_prompts):
         request = h3.H3Request(
             cid=f"segment-{segment.index}",
@@ -884,15 +889,14 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
             upstream_artifact_sha256=hashlib.sha256(artifact_data).hexdigest(),
             upstream_dialogue_sha256_path=("dialogue", "sha256"),
             source_prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
-            minimax_api_key="",
+            minimax_api_key="minimax-test-secret",
         )
         assert context.keyframe_timeline_json is None
-        result = context_ir_bridge.optimize_h3_prompt(context, client=NoHttp())
-        assert result.status == "succeeded"
-        assert result.effective_prompt == prompt
-        assert result.provider_task_id == (
-            "local:identity:" + hashlib.sha256(prompt.encode()).hexdigest()
-        )
+        assert context.source_prompt == prompt
+        assert context.source_prompt_sha256 == hashlib.sha256(
+            prompt.encode()
+        ).hexdigest()
+        assert context.source_h3_request == request
 
     hard_cuts = [
         frame["transition"]["at_segment_s"]
@@ -1652,7 +1656,9 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
     assert calls == [root]
     frozen = long_generation.load_prompt_fusion_manifest(
         root=root,
-        skill_source_path=skill_path,
+        skill_source_path=(
+            REPOSITORY_ROOT / "skills" / "video-prompt-fusion" / "SKILL.md"
+        ),
     )
     assert frozen.final_prompts == tuple(
         _fusion_v2_final_prompt(
@@ -2066,7 +2072,8 @@ def _failed_lf_prompt_fusion(
         },
     )
     frozen_skill = root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME
-    frozen_skill.write_bytes(skill_path.read_bytes())
+    milestone = _freeze_current_skill_milestone(root)
+    frozen_skill.write_bytes(milestone.read_bytes("video-prompt-fusion"))
     output = root / "work" / "h3_prompt_plan.json"
     if version == long_generation.PROMPT_FUSION_VERSION:
         output_segment = _fusion_v2_output(
@@ -2276,10 +2283,10 @@ def test_producer_failure_binds_raw_sha_and_rejects_schema_valid_replacement(
                 "input_sha256": hashlib.sha256(input_data).hexdigest(),
                 "segments": [{
                     "index": 1,
-                    "final_prompt": (
-                        "<VISUAL>original</VISUAL>"
-                        "<AUDIO_CONTENT_JSON> [] </AUDIO_CONTENT_JSON>"
-                    ),
+                    # The early bounded envelope is valid, while the second
+                    # visual cannot map to this one-shot timeline.  This
+                    # reaches durable raw-output binding before final compile.
+                    "visual": ["original", "unexpected second shot"],
                 }],
             }))
 
@@ -2298,10 +2305,7 @@ def test_producer_failure_binds_raw_sha_and_rejects_schema_valid_replacement(
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
         "segments": [{
             "index": 1,
-            "final_prompt": (
-                "<VISUAL>schema-valid replacement</VISUAL>"
-                "<AUDIO_CONTENT_JSON>\n[]\n</AUDIO_CONTENT_JSON>"
-            ),
+            "visual": ["replacement", "unexpected second shot"],
         }],
     }))
 
@@ -2310,7 +2314,7 @@ def test_producer_failure_binds_raw_sha_and_rejects_schema_valid_replacement(
     assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
 
 
-def test_new_producer_rejects_current_skill_source_drift(
+def test_new_producer_ignores_unbound_ambient_skill_path_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = make_settings(tmp_path)
@@ -2357,13 +2361,13 @@ def test_new_producer_rejects_current_skill_source_drift(
                 "segments": [_fusion_v2_output(segment, "valid")],
             }))
 
-    assert pipeline.produce_prompt_fusion(settings, cid, Runner()) == "failed"
-    failed = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
-    assert failed["error"] == "prompt fusion Skill drifted"
-    assert failed["raw_output_sha256"] == hashlib.sha256(
+    assert pipeline.produce_prompt_fusion(settings, cid, Runner()) == "done"
+    done = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+    assert done["error"] is None
+    assert done["raw_output_sha256"] == hashlib.sha256(
         (root / "work" / "h3_prompt_plan.json").read_bytes()
     ).hexdigest()
-    assert not (root / "work" / h3_project.SOURCE_FILENAME).exists()
+    assert (root / "work" / h3_project.SOURCE_FILENAME).is_file()
 
 
 def test_receipt_finalization_serializes_a_concurrent_generation_writer(
@@ -2462,7 +2466,8 @@ def test_receipt_finalization_cleans_exact_manifest_after_publish_failure(
 
     def write_then_fail(path: Path, data: bytes) -> None:
         original_atomic(path, data)
-        raise OSError("simulated publish failure")
+        if path == root / "work" / h3_project.SOURCE_FILENAME:
+            raise OSError("simulated publish failure")
 
     monkeypatch.setattr(pipeline, "_atomic_bytes", write_then_fail)
 
@@ -2538,9 +2543,8 @@ def test_receipt_only_finalization_rejects_any_frozen_authority_drift(
     elif drift == "output":
         output.write_bytes(b"{}")
     elif drift == "skill":
-        (root / "work" / pipeline.PROMPT_FUSION_FROZEN_SKILL_FILENAME).write_bytes(
-            b"drifted skill"
-        )
+        frozen_skill = skill_milestone.load(root).path("video-prompt-fusion")
+        frozen_skill.write_bytes(b"drifted skill")
     elif drift == "acceptance":
         storage.update_meta(
             settings.data_dir,
