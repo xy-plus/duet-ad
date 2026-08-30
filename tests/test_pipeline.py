@@ -2940,7 +2940,91 @@ def test_run_extract_failure(tmp_path, video_1s, monkeypatch):
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert "extract" in m["error"]
+    assert m["error"] == "pipeline_failed"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (
+            pipeline.PipelineError(
+                "image optimization global failed: MODEL_TAIL_MARKER "
+                "tokens used 42,452 Bearer provider-secret"
+            ),
+            "image_optimization_output_invalid",
+        ),
+        (
+            CodexError(
+                "CODEX_MODEL_TAIL_MARKER tokens used 42,452 "
+                "Bearer codex-secret"
+            ),
+            "codex_execution_failed",
+        ),
+        (
+            RuntimeError(
+                'PROVIDER_BODY_MARKER {"authorization":"Bearer provider-secret"}'
+            ),
+            "pipeline_failed",
+        ),
+    ],
+)
+def test_run_projects_terminal_errors_to_short_codes_but_keeps_internal_trace(
+    tmp_path, video_1s, monkeypatch, failure, expected,
+):
+    settings = make_settings(tmp_path)
+    meta = _make_conversation(settings, video_1s)
+
+    def boom(argv, *, timeout, step, cwd=None):
+        raise failure
+
+    monkeypatch.setattr(pipeline, "_run_cmd", boom)
+    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+
+    stored = storage.load_meta(settings.data_dir, meta["id"])
+    assert stored["status"] == "failed"
+    assert stored["error"] == expected
+    public_meta = json.dumps(stored, ensure_ascii=False)
+    assert "MODEL_TAIL_MARKER" not in public_meta
+    assert "tokens used" not in public_meta
+    assert "PROVIDER_BODY_MARKER" not in public_meta
+    assert "provider-secret" not in public_meta
+    assert "codex-secret" not in public_meta
+
+    trace = json.loads(
+        (
+            settings.data_dir / meta["id"] / "work" / "errors" / "pipeline.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert trace["error"]["type"] == type(failure).__name__
+    assert trace["error"]["traceback"]
+    assert any(
+        marker in trace["error"]["message"]
+        for marker in (
+            "MODEL_TAIL_MARKER",
+            "CODEX_MODEL_TAIL_MARKER",
+            "PROVIDER_BODY_MARKER",
+        )
+    )
+    assert "[REDACTED]" in trace["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "provider_rejected",
+        "provider_protocol_error",
+        "submission_unknown",
+        "long_video_audio_mode_unsupported",
+    ],
+)
+def test_public_pipeline_error_preserves_existing_faithful_codes(code):
+    assert pipeline._public_pipeline_error(RuntimeError(code)) == code
+
+
+def test_public_pipeline_error_does_not_reflect_unknown_code_shaped_secrets():
+    assert pipeline._public_pipeline_error(
+        pipeline.PipelineError("api_key_super_secret")
+    ) == "pipeline_failed"
 
 
 def test_run_codex_failure(tmp_path, video_1s, monkeypatch):
@@ -2966,7 +3050,7 @@ def test_run_codex_failure(tmp_path, video_1s, monkeypatch):
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert "codex" in m["error"]
+    assert m["error"] == "codex_execution_failed"
 
 
 def test_run_codex_timeout(tmp_path, video_1s, monkeypatch):
@@ -2992,7 +3076,7 @@ def test_run_codex_timeout(tmp_path, video_1s, monkeypatch):
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert "timed out" in m["error"]
+    assert m["error"] == "codex_execution_failed"
 
 
 def test_run_visual_retries_invalid_output_and_transient_timeout(
@@ -3078,11 +3162,7 @@ def test_run_validation_failure(tmp_path, video_1s, monkeypatch):
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert m["error"] == (
-        "codex visual output invalid: required keyframes/prompt artifacts "
-        "are missing or invalid"
-    )
-    assert "keyframe count 0" not in m["error"]
+    assert m["error"] == "pipeline_failed"
 
 
 # ---------- 口播步（ASR，抽帧之后） ----------
@@ -3419,8 +3499,7 @@ def test_run_voice_vocal_failure_fails_pipeline(tmp_path, video_1s, monkeypatch)
 
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "failed"
-    assert "vocal classification unavailable" in stored["error"]
-    assert "模型校验失败" in stored["error"]
+    assert stored["error"] == "pipeline_failed"
 
 
 def test_run_voice_rejects_audio_replaced_during_vocal_analysis(
@@ -3447,7 +3526,7 @@ def test_run_voice_rejects_audio_replaced_during_vocal_analysis(
 
     stored = storage.load_meta(settings.data_dir, meta["id"])
     assert stored["status"] == "failed"
-    assert stored["error"] == "vocal analysis audio drifted"
+    assert stored["error"] == "pipeline_failed"
 
 
 def test_run_voice_audio_longer_than_container(tmp_path, video_1s, monkeypatch):
@@ -3701,7 +3780,7 @@ def test_run_voice_mode_unknown_fails(tmp_path, video_1s, monkeypatch):
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert "unknown voice_mode" in m["error"]
+    assert m["error"] == "pipeline_failed"
 
 
 def test_run_voice_translate_whitespace_target_fails(tmp_path, video_1s, monkeypatch):
@@ -3714,7 +3793,7 @@ def test_run_voice_translate_whitespace_target_fails(tmp_path, video_1s, monkeyp
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert "target_language" in m["error"]
+    assert m["error"] == "pipeline_failed"
 
 
 def test_run_voice_translate_requires_target_language(tmp_path, video_1s, monkeypatch):
@@ -3726,7 +3805,7 @@ def test_run_voice_translate_requires_target_language(tmp_path, video_1s, monkey
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert "target_language" in m["error"]
+    assert m["error"] == "pipeline_failed"
 
 
 def test_run_voice_no_audio_track_fails(tmp_path, video_1s, monkeypatch):
@@ -3739,7 +3818,7 @@ def test_run_voice_no_audio_track_fails(tmp_path, video_1s, monkeypatch):
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert "audio" in m["error"]
+    assert m["error"] == "pipeline_failed"
 
 
 def test_run_dialogue_auto_no_audio_is_valid_and_writes_visual_plan_receipt(
@@ -4717,7 +4796,7 @@ def test_run_voice_codex_failure_no_product(tmp_path, video_1s, monkeypatch):
 
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert "timed out" in m["error"]
+    assert m["error"] == "codex_execution_failed"
 
 
 def test_run_voice_validation_failure(tmp_path, video_1s, monkeypatch):
@@ -4742,10 +4821,7 @@ def test_run_voice_validation_failure(tmp_path, video_1s, monkeypatch):
 
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert m["error"] == (
-        "codex voice output invalid: required voice_lines artifact "
-        "is missing or invalid"
-    )
+    assert m["error"] == "pipeline_failed"
 
 
 def test_run_voice_missing_output_reports_codex_stage(tmp_path, video_1s, monkeypatch):
@@ -4767,8 +4843,7 @@ def test_run_voice_missing_output_reports_codex_stage(tmp_path, video_1s, monkey
 
     m = storage.load_meta(settings.data_dir, meta["id"])
     assert m["status"] == "failed"
-    assert m["error"].startswith("codex voice output invalid:")
-    assert "voice_lines.json missing" not in m["error"]
+    assert m["error"] == "pipeline_failed"
 
 
 # ---------- HTTP 接线 ----------

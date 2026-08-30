@@ -652,7 +652,7 @@ def test_run_segment_failure_marks_overall_failed(tmp_path, monkeypatch):
 
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "failed"
-    assert "segment 2" in m["error"]
+    assert m["error"] == "pipeline_failed"
 
 
 def test_run_segment_zero_exit_without_outputs_reports_codex_stage(tmp_path, monkeypatch):
@@ -677,8 +677,7 @@ def test_run_segment_zero_exit_without_outputs_reports_codex_stage(tmp_path, mon
 
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "failed"
-    assert "segment 2 failed: keyframe undecodable: 01.png" in m["error"]
-    assert "keyframe count 0" not in m["error"]
+    assert m["error"] == "pipeline_failed"
 
 
 def test_run_segment_codex_error_salvages_complete_outputs(tmp_path, monkeypatch):
@@ -940,8 +939,7 @@ def test_run_segment_cut_failure_marks_overall_failed(tmp_path, monkeypatch):
 
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "failed"
-    assert "segment 1" in m["error"]
-    assert "segment cut" in m["error"]
+    assert m["error"] == "pipeline_failed"
 
 
 # ---------- 拆段 e2e：真 subprocess 全链路 + 桩 codex ----------

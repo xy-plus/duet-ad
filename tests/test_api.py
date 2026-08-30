@@ -25,8 +25,8 @@ def test_list_conversations_shape(client, video_1s):
     assert response.status_code == 200
     (item,) = response.json()
     assert set(item) == {
-        "id", "title", "note", "status", "navigation_status", "created_at",
-        "has_video",
+        "id", "title", "note", "status", "analysis_status",
+        "navigation_status", "created_at", "has_video",
     }
     assert item["id"] == cid
     assert item["status"] == "queued"
@@ -56,7 +56,8 @@ def test_detail_shape_has_no_context_ir_contract(client, video_1s):
     body = response.json()
     assert "context_ir" not in body
     assert set(body) == {
-        "id", "title", "note", "status", "error", "created_at", "updated_at",
+        "id", "title", "note", "status", "analysis_status", "error",
+        "created_at", "updated_at",
         "keyframes", "prompt", "source_prompt", "source_prompt_sha256", "segments",
         "voice_lines", "read_only", "duration_s", "fit_required", "fit_mode",
         "aspect_ratio", "resolution", "fit_profiles",
@@ -179,6 +180,88 @@ def test_navigation_status_matrix_is_authoritative_and_consistent(
     assert listed["has_video"] is has_video
     assert detail["has_video"] is has_video
     assert "secret-provider-task" not in json.dumps(detail)
+
+
+@pytest.mark.parametrize("generation_status", [None, "succeeded"])
+def test_terminal_postprocess_failure_overrides_public_operation_not_analysis(
+    tmp_path, monkeypatch, generation_status,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(
+        settings.data_dir, note="failed delivery", orig_name="a.mp4"
+    )
+    generation = None if generation_status is None else {
+        "status": generation_status,
+        "error": None,
+        "attempt": 1,
+        "client_request_id": "request-postprocess-failed",
+        "stage": "h3",
+    }
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        status="done",
+        error=None,
+        generation=generation,
+        postprocess={
+            "status": "failed",
+            "error": "provider_rejected",
+            "options": {"optimize_image": True},
+            "frames": [],
+            "segments": [],
+        },
+    )
+    monkeypatch.setattr(
+        main_module.postprocess, "recover_running", lambda _settings: []
+    )
+
+    with TestClient(create_app(settings)) as client:
+        listed = client.get("/api/conversations", headers=AUTH).json()[0]
+        detail = client.get(
+            f"/api/conversations/{meta['id']}", headers=AUTH
+        ).json()
+
+    assert listed["status"] == "failed"
+    assert listed["analysis_status"] == "done"
+    assert listed["navigation_status"] == "postprocess_failed"
+    assert listed["has_video"] is False
+    assert detail["status"] == "failed"
+    assert detail["analysis_status"] == "done"
+    assert detail["error"] == "provider_rejected"
+    assert detail["navigation_status"] == "postprocess_failed"
+    assert detail["has_video"] is False
+    if generation_status is None:
+        assert detail["generation"] is None
+    else:
+        assert detail["generation"]["status"] == "succeeded"
+
+
+def test_detail_does_not_republish_legacy_internal_analysis_error(tmp_path):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(
+        settings.data_dir, note="legacy failure", orig_name="a.mp4"
+    )
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        status="failed",
+        error=(
+            "LEGACY_MODEL_TAIL tokens used 42,452 "
+            'provider_body={"authorization":"Bearer secret"}'
+        ),
+    )
+
+    with TestClient(create_app(settings)) as client:
+        detail = client.get(
+            f"/api/conversations/{meta['id']}", headers=AUTH
+        ).json()
+
+    assert detail["status"] == "failed"
+    assert detail["analysis_status"] == "failed"
+    assert detail["error"] == "pipeline_failed"
+    assert "LEGACY_MODEL_TAIL" not in json.dumps(detail)
+    assert "tokens used" not in json.dumps(detail)
+    assert "Bearer secret" not in json.dumps(detail)
 
 
 def test_removed_context_ir_endpoints_are_not_registered(tmp_path):

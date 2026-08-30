@@ -1728,7 +1728,15 @@ def test_prompt_fusion_runner_refuses_historical_v1_queue(tmp_path: Path) -> Non
     assert pipeline.produce_prompt_fusion(settings, cid, Runner()) == "failed"
     assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"][
         "error"
-    ] == "prompt fusion input is invalid"
+    ] == "prompt_fusion_output_invalid"
+    trace = json.loads(
+        (root / "work" / "errors" / "prompt-fusion.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert trace["error"]["type"] == "PipelineError"
+    assert trace["error"]["message"] == "prompt fusion input is invalid"
+    assert trace["error"]["traceback"]
 
 
 def test_new_prompt_fusion_queue_rejects_legacy_v1_input(

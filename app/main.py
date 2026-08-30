@@ -350,6 +350,31 @@ def _public_dialogue_review(meta: dict) -> dict | None:
     return dialogue_review.public_state(meta.get("dialogue_review"))
 
 
+def _public_conversation_status(meta: dict) -> tuple[str | None, str | None]:
+    """Keep analysis state visible without masking a terminal delivery failure."""
+    raw_status = meta.get("status")
+    analysis_status = raw_status if isinstance(raw_status, str) else None
+    public_postprocess = postprocess.public_state(meta.get("postprocess"))
+    if (
+        analysis_status == "done"
+        and isinstance(public_postprocess, dict)
+        and public_postprocess.get("status") == "failed"
+    ):
+        postprocess_error = public_postprocess.get("error")
+        return "failed", (
+            postprocess_error
+            if isinstance(postprocess_error, str) and " " not in postprocess_error
+            else "postprocess_failed"
+        )
+    if analysis_status == "failed":
+        raw_error = meta.get("error")
+        internal_error = pipeline.PipelineError(
+            raw_error if isinstance(raw_error, str) else ""
+        )
+        return "failed", pipeline._public_pipeline_error(internal_error)
+    return analysis_status, None
+
+
 def _navigation_status(meta: dict, *, has_video: bool) -> str:
     review = _public_dialogue_review(meta)
     if review is not None and review["status"] == "waiting":
@@ -364,6 +389,13 @@ def _navigation_status(meta: dict, *, has_video: bool) -> str:
         return analysis_states[analysis]
     if analysis != "done":
         return "analysis_unknown"
+
+    postprocess_state = postprocess.public_state(meta.get("postprocess"))
+    if (
+        isinstance(postprocess_state, dict)
+        and postprocess_state.get("status") == "failed"
+    ):
+        return "postprocess_failed"
 
     generation = meta.get("generation")
     if not isinstance(generation, dict):
@@ -383,7 +415,7 @@ def _navigation_status(meta: dict, *, has_video: bool) -> str:
     if not has_video:
         return "output_missing"
 
-    postprocess_state = meta.get("postprocess")
+    postprocess_state = postprocess.public_state(meta.get("postprocess"))
     if isinstance(postprocess_state, dict):
         postprocess_states = {
             "running": "postprocessing",
@@ -4081,11 +4113,13 @@ def create_app(settings: Settings) -> FastAPI:
         result = []
         for meta in storage.list_conversations(settings.data_dir):
             has_video = _has_valid_generated_video(settings, meta)
+            public_status, _public_error = _public_conversation_status(meta)
             result.append({
                 "id": meta["id"],
                 "title": meta["title"],
                 "note": meta["note"],
-                "status": meta["status"],
+                "status": public_status,
+                "analysis_status": meta["status"],
                 "navigation_status": _navigation_status(meta, has_video=has_video),
                 "created_at": meta["created_at"],
                 "has_video": has_video,
@@ -4364,13 +4398,15 @@ def create_app(settings: Settings) -> FastAPI:
         image_acceptance = postprocess.image_acceptance_status(
             settings, cid, meta
         )
+        public_status, public_error = _public_conversation_status(meta)
         result = {
             "id": meta["id"],
             "title": meta["title"],
             "note": meta["note"],
-            "status": meta["status"],
+            "status": public_status,
+            "analysis_status": meta["status"],
             "navigation_status": _navigation_status(meta, has_video=has_video),
-            "error": meta["error"],
+            "error": public_error,
             "created_at": meta["created_at"],
             "updated_at": meta["updated_at"],
             "keyframes": meta.get("keyframes", []),

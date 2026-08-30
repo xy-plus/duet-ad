@@ -349,6 +349,42 @@ class PipelineError(RuntimeError):
         self.retryable = retryable
 
 
+_PUBLIC_PIPELINE_ERROR_CODES = frozenset({
+    "codex_execution_failed",
+    "image_optimization_output_invalid",
+    "input_recovery_required",
+    "long_video_audio_mode_unsupported",
+    "long_video_duration_below_provider_minimum",
+    "long_video_duration_exceeded",
+    "long_video_multimodal_incomplete",
+    "pipeline_failed",
+    "prompt_fusion_output_invalid",
+    "provider_protocol_error",
+    "provider_rejected",
+    "submission_unknown",
+})
+
+
+def _public_pipeline_error(
+    error: BaseException,
+    *,
+    fallback: str = "pipeline_failed",
+) -> str:
+    """Project an internal failure to a bounded, non-reflective public code."""
+    try:
+        message = str(error)
+    except BaseException:
+        return fallback
+    if message in _PUBLIC_PIPELINE_ERROR_CODES:
+        return message
+    if isinstance(error, PipelineError):
+        if message.startswith("image optimization "):
+            return "image_optimization_output_invalid"
+    if isinstance(error, CodexError):
+        return "codex_execution_failed"
+    return fallback
+
+
 class _EmptyTranscript(PipelineError):
     def __init__(self) -> None:
         super().__init__("voice transcript empty despite vocal evidence", retryable=True)
@@ -3577,7 +3613,18 @@ def produce_prompt_fusion(
         )
         return "done"
     except Exception as exc:
-        persist("failed", str(exc))
+        error_trace.record(
+            work / "errors" / "prompt-fusion.json",
+            call_path=["pipeline", cid, "prompt_fusion"],
+            error=exc,
+            logger=log,
+        )
+        persist(
+            "failed",
+            _public_pipeline_error(
+                exc, fallback="prompt_fusion_output_invalid",
+            ),
+        )
         return "failed"
 
 
@@ -4077,5 +4124,5 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
         if claim_owner is not None:
             storage.finish_input_claim(
                 settings.data_dir, cid, claim_owner,
-                status="failed", error=str(e)[:500],
+                status="failed", error=_public_pipeline_error(e),
             )
