@@ -361,6 +361,7 @@ _PUBLIC_PIPELINE_ERROR_CODES = frozenset({
     "prompt_fusion_output_invalid",
     "provider_protocol_error",
     "provider_rejected",
+    "scene_detection_failed",
     "submission_unknown",
 })
 
@@ -2108,33 +2109,21 @@ def _load_scenes(work: Path) -> list[dict]:
 
 
 def _detect_segments(settings: Settings, cid: str, source: Path, work: Path) -> list[dict]:
-    """跑 app/scenes.py 检测场景并读拆段建议。
-
-    检测失败或 scenes.json 非法（含拆段结构不变量违规）→ 回退空列表 = 单段模式，
-    不判失败，meta.scenes_note 留痕；segments 空（≤15s）是合法单段结果，不留痕。
-    """
+    """Run scene detection and return only its validated authoritative output."""
     try:
         _run_cmd(
             [sys.executable, str(SCENES_SCRIPT), str(source), "--work-dir", str(work)],
             timeout=SCENES_TIMEOUT_S,
             step="scenes",
         )
-    except PipelineError as e:
-        print(f"scenes detection failed ({e}); falling back to single-segment mode")
-        storage.update_meta(
-            settings.data_dir, cid,
-            scenes_note="scenes detection failed, single-segment fallback",
-        )
-        return []
+    except PipelineError:
+        log.exception("scene detection process failed for %s", cid)
+        raise PipelineError("scene_detection_failed") from None
     try:
         return _load_scenes(work)
-    except PipelineError as e:
-        print(f"scenes.json invalid ({e}); falling back to single-segment mode")
-        storage.update_meta(
-            settings.data_dir, cid,
-            scenes_note="scenes.json invalid, single-segment fallback",
-        )
-        return []
+    except PipelineError:
+        log.exception("scene detection output is invalid for %s", cid)
+        raise PipelineError("scene_detection_failed") from None
 
 
 def _scene_bounds_for_long_plan(work: Path, duration_s: float) -> list[dict]:

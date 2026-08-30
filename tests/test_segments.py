@@ -763,8 +763,10 @@ def test_run_segments_processed_concurrently(tmp_path, monkeypatch):
     assert max_active >= 2  # 串行执行时该值为 1
 
 
-def test_run_scenes_detection_failure_falls_back_to_single_segment(tmp_path, monkeypatch):
-    """scenes.py 检测不出场景（如无硬切的单场景视频）→ 回退单段模式并留痕，照常 done。"""
+def test_scene_detection_process_failure_stops_with_public_error(
+    tmp_path, monkeypatch,
+):
+    """A detector failure never changes scene semantics to keep the task moving."""
     settings = make_settings(tmp_path)
     meta = _make_segment_conversation(settings, [])
     cid = meta["id"]
@@ -777,21 +779,18 @@ def test_run_scenes_detection_failure_falls_back_to_single_segment(tmp_path, mon
         elif step == "scenes":
             raise pipeline.PipelineError("scenes exit 1: 未检测到任何场景")
 
-    def fake_codex(self, workdir, prompt):
-        _write_valid_package(Path(workdir) / "work")
-
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
-    monkeypatch.setattr(CodexRunner, "run", fake_codex)
-    pipeline.run(settings, cid, CodexRunner(1, 1))
+    with pytest.raises(pipeline.PipelineError, match="^scene_detection_failed$"):
+        pipeline._detect_segments(
+            settings, cid, tmp_path / "source.mp4", tmp_path / "work"
+        )
+    assert pipeline._public_pipeline_error(
+        pipeline.PipelineError("scene_detection_failed")
+    ) == "scene_detection_failed"
 
-    m = storage.load_meta(settings.data_dir, cid)
-    assert m["status"] == "done", m["error"]
-    assert "segments" not in m
-    assert "fallback" in m["scenes_note"]  # 回退留痕（内部字段）
 
-
-def test_run_scenes_invalid_segments_falls_back_to_single_segment(tmp_path, monkeypatch):
-    """scenes.json 的 segments 违反结构不变量（长度/连续性/覆盖）→ 回退单段模式并留痕。"""
+def test_scene_detection_invalid_output_stops_without_fallback(tmp_path, monkeypatch):
+    """Invalid detector output is reported instead of becoming a different scene plan."""
     settings = make_settings(tmp_path)
     meta = _make_segment_conversation(settings, [])
     cid = meta["id"]
@@ -807,22 +806,17 @@ def test_run_scenes_invalid_segments_falls_back_to_single_segment(tmp_path, monk
             (out / "manifest.json").write_text("{}")
         elif step == "scenes":
             work = Path(argv[argv.index("--work-dir") + 1])
+            work.mkdir(parents=True, exist_ok=True)
             (work / "scenes.json").write_text(
                 json.dumps({"duration_s": 24.0, "scenes": [], "segments": bad}),
                 encoding="utf-8",
             )
 
-    def fake_codex(self, workdir, prompt):
-        _write_valid_package(Path(workdir) / "work")
-
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
-    monkeypatch.setattr(CodexRunner, "run", fake_codex)
-    pipeline.run(settings, cid, CodexRunner(1, 1))
-
-    m = storage.load_meta(settings.data_dir, cid)
-    assert m["status"] == "done", m["error"]
-    assert "segments" not in m
-    assert "invalid" in m["scenes_note"]
+    with pytest.raises(pipeline.PipelineError, match="^scene_detection_failed$"):
+        pipeline._detect_segments(
+            settings, cid, tmp_path / "source.mp4", tmp_path / "work"
+        )
 
 
 def test_run_translate_target_language_in_segment_prompt(tmp_path, monkeypatch):
