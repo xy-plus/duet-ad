@@ -222,6 +222,75 @@ def _scene_indices_for_interval(
     return indices
 
 
+def _capacity_safe_boundaries(
+    scenes: list[dict], start: Fraction, end: Fraction
+) -> list[Fraction]:
+    """Split one provider-safe interval without creating a short source tail.
+
+    Capacity splits may only use real scene starts, so every added boundary is
+    a hard cut already present in the source.  Dynamic programming chooses the
+    fewest segments, then the latest feasible boundary, deterministically.
+    """
+    candidates = [
+        start,
+        *sorted({
+            (
+                _receipt_time(scene["start_time"], "scene start")
+                if "start_time" in scene
+                else Fraction(str(scene["start_s"]))
+            )
+            for scene in scenes[1:]
+            if start < (
+                _receipt_time(scene["start_time"], "scene start")
+                if "start_time" in scene
+                else Fraction(str(scene["start_s"]))
+            ) < end
+        }),
+        end,
+    ]
+    suffixes: dict[int, list[Fraction]] = {len(candidates) - 1: [end]}
+    for left in range(len(candidates) - 2, -1, -1):
+        choices: list[list[Fraction]] = []
+        for right in range(left + 1, len(candidates)):
+            suffix = suffixes.get(right)
+            if suffix is None:
+                continue
+            boundary_start, boundary_end = candidates[left], candidates[right]
+            try:
+                source_duration = long_video.segment_duration_s(
+                    float(boundary_start), float(boundary_end)
+                )
+                provider_duration = long_video.provider_duration_s(
+                    float(boundary_start), float(boundary_end)
+                )
+            except long_video.LongVideoError:
+                continue
+            scene_indices = _scene_indices_for_interval(
+                scenes, float(boundary_start), float(boundary_end)
+            )
+            if (
+                source_duration < long_video.SEGMENT_SOURCE_MIN_S
+                or provider_duration > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
+                or not 1 <= len(scene_indices) <= MAX_EFFECTIVE_SCENES_PER_SEGMENT
+            ):
+                continue
+            choices.append([boundary_start, *suffix])
+        if choices:
+            suffixes[left] = min(
+                choices,
+                key=lambda path: (
+                    len(path),
+                    tuple(-value for value in path[1:-1]),
+                ),
+            )
+    try:
+        return suffixes[0]
+    except KeyError:
+        raise ValueError(
+            "segment scene capacity cannot satisfy provider duration minimum"
+        ) from None
+
+
 def plan_segments(
     duration_s: float,
     effective_scenes: Iterable[Mapping],
@@ -248,16 +317,12 @@ def plan_segments(
         for scene in scenes[1:]
     }
     for segment in base:
-        indices = _scene_indices_for_interval(
-            scenes, float(segment["start_s"]), float(segment["end_s"])
+        capacity_boundaries = _capacity_safe_boundaries(
+            scenes,
+            Fraction(str(segment["start_s"])),
+            Fraction(str(segment["end_s"])),
         )
-        for offset in range(MAX_EFFECTIVE_SCENES_PER_SEGMENT, len(indices), 9):
-            next_scene = scenes[indices[offset] - 1]
-            cut_points.add(
-                _receipt_time(next_scene["start_time"], "scene start")
-                if "start_time" in next_scene
-                else Fraction(str(next_scene["start_s"]))
-            )
+        cut_points.update(capacity_boundaries[1:-1])
 
     boundaries = [Fraction(0), *sorted(cut_points), Fraction(str(duration_s))]
     # A base-plan boundary may be identical to the outer boundaries.
@@ -268,7 +333,17 @@ def plan_segments(
         if end <= start:
             raise ValueError("segment boundaries must be strictly increasing")
         scene_indices = _scene_indices_for_interval(scenes, float(start), float(end))
-        if not scene_indices or len(scene_indices) > MAX_EFFECTIVE_SCENES_PER_SEGMENT:
+        try:
+            source_duration = long_video.segment_duration_s(float(start), float(end))
+        except long_video.LongVideoError:
+            raise ValueError("segment duration invariant violated") from None
+        if (
+            source_duration < long_video.SEGMENT_SOURCE_MIN_S
+            or long_video.provider_duration_s(float(start), float(end))
+            > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
+            or not scene_indices
+            or len(scene_indices) > MAX_EFFECTIVE_SCENES_PER_SEGMENT
+        ):
             raise ValueError("segment scene capacity invariant violated")
         hard_cut = index == 1 or start in hard_cuts
         if hard_cut:

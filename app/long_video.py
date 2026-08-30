@@ -17,9 +17,12 @@ from app import h3, h3_project
 SHORT_VIDEO_MAX_S = 10.0
 PREVIOUS_SHORT_VIDEO_MAX_S = 10.0
 LONG_VIDEO_MAX_S = 300.0
-SEGMENT_MIN_S = 1.0
+RECEIPT_COMPAT_SEGMENT_MIN_S = 1.0
+# Historical public name retained for receipt readers outside this module.
+SEGMENT_MIN_S = RECEIPT_COMPAT_SEGMENT_MIN_S
 SEGMENT_PROVIDER_MIN_DURATION_S = 4
 SEGMENT_PROVIDER_MAX_DURATION_S = 10
+SEGMENT_SOURCE_MIN_S = float(SEGMENT_PROVIDER_MIN_DURATION_S)
 PREVIOUS_SEGMENT_PROVIDER_MAX_DURATION_S = 10
 LEGACY_PROVIDER_MAX_DURATION_S = 15
 BOUNDARY_PRECISION = 6
@@ -188,6 +191,8 @@ def plan_segments(
     one-element form of the same plan consumed by longer projects.
     """
     duration = _finite_duration(duration_s)
+    if duration < SEGMENT_SOURCE_MIN_S:
+        raise LongVideoError("long_video_duration_below_provider_minimum")
     if duration <= SHORT_VIDEO_MAX_S:
         _dialogue_intervals(dialogue, duration)
         return [{
@@ -206,14 +211,14 @@ def plan_segments(
         start = cuts[-1]
         target = min(
             round(start + SEGMENT_PROVIDER_MAX_DURATION_S, BOUNDARY_PRECISION),
-            duration - SEGMENT_MIN_S,
+            duration - SEGMENT_SOURCE_MIN_S,
         )
-        minimum = start + SEGMENT_MIN_S
+        minimum = start + SEGMENT_SOURCE_MIN_S
         eligible_hard_cuts = [
             cut
             for cut in hard_cuts
             if minimum <= cut <= target
-            and segment_duration_s(cut, duration) >= SEGMENT_MIN_S
+            and segment_duration_s(cut, duration) >= SEGMENT_SOURCE_MIN_S
             and provider_duration_s(start, cut) <= SEGMENT_PROVIDER_MAX_DURATION_S
         ]
         boundary = max(eligible_hard_cuts) if eligible_hard_cuts else target
@@ -222,12 +227,13 @@ def plan_segments(
         cuts.append(round(boundary, 6))
     cuts.append(duration)
 
-    # The final remainder may be shorter than one second after a preferred hard
-    # cut.  Fold that cut back and choose the latest safe ordinary boundary.
-    if segment_duration_s(cuts[-2], cuts[-1]) < SEGMENT_MIN_S:
+    # A preferred hard cut must never leave a source tail shorter than the
+    # provider's real minimum.  Pull the boundary earlier; the source timeline
+    # remains complete and the provider receives no invented duration.
+    if segment_duration_s(cuts[-2], cuts[-1]) < SEGMENT_SOURCE_MIN_S:
         cuts.pop(-2)
         start = cuts[-2]
-        target = duration - SEGMENT_MIN_S
+        target = duration - SEGMENT_SOURCE_MIN_S
         boundary = target
         if (
             provider_duration_s(boundary, duration)
@@ -240,7 +246,7 @@ def plan_segments(
     chain_number = 1
     for index, (start, end) in enumerate(zip(cuts, cuts[1:]), start=1):
         if (
-            segment_duration_s(start, end) < SEGMENT_MIN_S
+            segment_duration_s(start, end) < SEGMENT_SOURCE_MIN_S
             or provider_duration_s(start, end) > SEGMENT_PROVIDER_MAX_DURATION_S
         ):
             raise LongVideoError("long_video_no_safe_dialogue_boundary")
@@ -686,6 +692,7 @@ def _write_plan_receipt(
     dialogue_delivery: str | None = None,
     resolved_dialogue_delivery: str | None = None,
     prompt_fusion_manifest_path: Path | None = None,
+    minimum_source_duration_s: float,
     provider_max_duration_s: int,
 ) -> Path:
     """Write a canonical receipt binding the complete generated long-video plan."""
@@ -724,7 +731,7 @@ def _write_plan_receipt(
             index != expected_index
             or not (math.isfinite(start_s) and math.isfinite(end_s))
             or abs(start_s - previous_end) > _EPS
-            or frozen_duration < SEGMENT_MIN_S
+            or frozen_duration < minimum_source_duration_s
             or provider_duration_s(start_s, end_s)
             > provider_max_duration_s
             or not isinstance(chain_id, str)
@@ -849,7 +856,7 @@ def write_plan_receipt(
     resolved_dialogue_delivery: str | None = None,
     prompt_fusion_manifest_path: Path | None = None,
 ) -> Path:
-    """Write a new canonical plan; every provider segment is at most 10s."""
+    """Write a new canonical plan; every source segment is truly 4..10s."""
     return _write_plan_receipt(
         root,
         source=source,
@@ -860,6 +867,7 @@ def write_plan_receipt(
         dialogue_delivery=dialogue_delivery,
         resolved_dialogue_delivery=resolved_dialogue_delivery,
         prompt_fusion_manifest_path=prompt_fusion_manifest_path,
+        minimum_source_duration_s=SEGMENT_SOURCE_MIN_S,
         provider_max_duration_s=SEGMENT_PROVIDER_MAX_DURATION_S,
     )
 
@@ -917,5 +925,6 @@ def _write_frozen_v4_n1_plan_receipt(
         dialogue_delivery=dialogue_delivery,
         resolved_dialogue_delivery=resolved_dialogue_delivery,
         prompt_fusion_manifest_path=prompt_fusion_manifest_path,
+        minimum_source_duration_s=RECEIPT_COMPAT_SEGMENT_MIN_S,
         provider_max_duration_s=LEGACY_PROVIDER_MAX_DURATION_S,
     )

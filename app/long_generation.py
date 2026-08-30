@@ -2339,7 +2339,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             or not math.isfinite(start_s)
             or not math.isfinite(end_s)
             or abs(start_s - previous_end) > _EPS
-            or frozen_duration < long_video.SEGMENT_MIN_S
+            or frozen_duration < long_video.RECEIPT_COMPAT_SEGMENT_MIN_S
             or long_video.provider_duration_s(
                 start_s, end_s, receipt_version=receipt_version
             )
@@ -3987,6 +3987,39 @@ def _run_unchecked(
             "segments": [states[item.index] for item in plan.segments],
         }
 
+    # New work must never turn a short source interval into an invented
+    # provider-length interval.  Historical running/succeeded attempts remain
+    # readable and GET-resumable, but no Context IR or H3 task is created for
+    # an unpaid segment below the current provider minimum.
+    short_unsubmitted = [
+        segment
+        for segment in plan.segments
+        if _segment_duration_s(plan, segment) < long_video.SEGMENT_SOURCE_MIN_S
+        and (
+            states[segment.index].get("status") in {"not_started", "queued"}
+            or (
+                states[segment.index].get("status") == "failed"
+                and states[segment.index].get("error") == "h3_provider_failed"
+            )
+            or (
+                states[segment.index].get("status") == "resume_required"
+                and states[segment.index].get("child_request_id") is None
+                and states[segment.index].get("h3_attempt_id") is None
+            )
+        )
+    ]
+    if short_unsubmitted:
+        code = "long_video_segment_below_provider_minimum"
+        for segment in short_unsubmitted:
+            states[segment.index].update(status="failed", error=code)
+            record_error(
+                "provider-duration-preflight",
+                LongGenerationError(code),
+                segment_index=segment.index,
+            )
+        persist("failed", code)
+        return
+
     def parallel_update(segments, operation) -> None:
         with ThreadPoolExecutor(
             max_workers=min(_FAST_MODE_WORKERS, len(segments))
@@ -4538,6 +4571,14 @@ def _run_unchecked(
         return candidates
 
     def worker(segment: FrozenSegment, action: str):
+        if (
+            action == "start"
+            and _segment_duration_s(plan, segment)
+            < long_video.SEGMENT_SOURCE_MIN_S
+        ):
+            return None, (
+                "failed", "long_video_segment_below_provider_minimum", None
+            )
         if (
             action == "start"
             and long_video.provider_duration_s(

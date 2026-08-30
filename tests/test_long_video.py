@@ -61,6 +61,21 @@ def test_short_video_is_the_single_segment_contract():
     }]
 
 
+def test_existing_four_second_or_longer_scene_segments_are_unchanged():
+    segments = plan_segments(
+        24.0,
+        [(0.0, 8.0), (8.0, 16.0), (16.0, 24.0)],
+        [],
+    )
+
+    assert [(item["start_s"], item["end_s"]) for item in segments] == [
+        (0.0, 8.0), (8.0, 16.0), (16.0, 24.0),
+    ]
+    assert [item["join_mode"] for item in segments] == [
+        "hard_cut", "hard_cut", "hard_cut",
+    ]
+
+
 def test_provider_integer_duration_boundaries_do_not_hide_positive_overflow():
     assert provider_duration_s(0.0, 2.58) == 4
     assert provider_duration_s(37.52, 47.52) == 10
@@ -87,8 +102,8 @@ def test_long_scene_is_split_at_production_limit_and_continues_chain():
     assert [(s["start_s"], s["end_s"]) for s in segments] == [
         (0.0, 10.0),
         (10.0, 20.0),
-        (20.0, 30.0),
-        (30.0, 31.0),
+        (20.0, 27.0),
+        (27.0, 31.0),
     ]
     assert [s["chain_id"] for s in segments] == ["chain-001"] * 4
     assert [s["join_mode"] for s in segments] == [
@@ -131,17 +146,16 @@ def test_scene_cut_starts_a_new_chain_and_coverage_is_exact():
 
     assert [(s["start_s"], s["end_s"]) for s in segments] == [
         (0.0, 10.0),
-        (10.0, 13.0),
-        (13.0, 23.0),
-        (23.0, 28.0),
+        (10.0, 20.0),
+        (20.0, 28.0),
     ]
     assert [s["chain_id"] for s in segments] == [
-        "chain-001", "chain-001", "chain-002", "chain-002"
+        "chain-001", "chain-001", "chain-001"
     ]
     assert [s["join_mode"] for s in segments] == [
-        "hard_cut", "continue", "hard_cut", "continue"
+        "hard_cut", "continue", "continue"
     ]
-    assert all(1.0 <= s["end_s"] - s["start_s"] for s in segments)
+    assert all(4.0 <= s["end_s"] - s["start_s"] for s in segments)
     assert all(
         provider_duration_s(s["start_s"], s["end_s"])
         <= long_video_module.SEGMENT_PROVIDER_MAX_DURATION_S
@@ -174,7 +188,7 @@ def test_real_scene_bounds_never_plan_over_production_limit():
     )
 
 
-def test_reserved_one_second_tail_uses_frozen_boundary_precision():
+def test_short_tail_is_redistributed_with_frozen_boundary_precision():
     duration = 128.842639
     scenes = [
         (0.0, 33.97548),
@@ -184,9 +198,9 @@ def test_reserved_one_second_tail_uses_frozen_boundary_precision():
 
     segments = plan_segments(duration, scenes, [])
 
-    assert segments[-1]["start_s"] == 127.842639
+    assert segments[-1]["start_s"] == 124.842639
     assert segments[-1]["end_s"] == duration
-    assert round(segments[-1]["end_s"] - segments[-1]["start_s"], 6) == 1.0
+    assert round(segments[-1]["end_s"] - segments[-1]["start_s"], 6) == 4.0
     assert all(
         provider_duration_s(item["start_s"], item["end_s"])
         <= long_video_module.SEGMENT_PROVIDER_MAX_DURATION_S
@@ -213,7 +227,7 @@ def test_six_decimal_plans_keep_frozen_segment_lengths_in_range(duration):
         for left, right in zip(segments, segments[1:])
     )
     assert all(
-        1.0
+        long_video_module.SEGMENT_SOURCE_MIN_S
         <= long_video_module.segment_duration_s(item["start_s"], item["end_s"])
         <= long_video_module.SEGMENT_PROVIDER_MAX_DURATION_S
         for item in segments
@@ -250,6 +264,79 @@ def test_dialogue_cannot_move_visual_boundaries_and_has_one_owner():
     assert "".join(
         item["text"] for items in localized for item in items
     ) == lines[0]["text"]
+
+
+@pytest.mark.parametrize(
+    ("duration", "old_tail_s", "expected_penultimate_end"),
+    [(31.0, 1.0, 27.0), (32.5, 2.5, 28.5)],
+)
+def test_short_tail_moves_the_previous_boundary_without_changing_total_duration(
+    duration, old_tail_s, expected_penultimate_end,
+):
+    segments = plan_segments(duration, [(0.0, duration)], [])
+
+    assert old_tail_s < long_video_module.SEGMENT_SOURCE_MIN_S
+    assert segments[-2]["end_s"] == expected_penultimate_end
+    assert segments[-1]["start_s"] == expected_penultimate_end
+    assert segments[0]["start_s"] == 0.0
+    assert segments[-1]["end_s"] == duration
+    assert sum(
+        long_video_module.segment_duration_s(item["start_s"], item["end_s"])
+        for item in segments
+    ) == pytest.approx(duration)
+    assert all(
+        long_video_module.segment_duration_s(item["start_s"], item["end_s"])
+        >= long_video_module.SEGMENT_SOURCE_MIN_S
+        for item in segments
+    )
+
+
+def test_hard_cut_is_kept_only_when_both_source_sides_meet_provider_minimum():
+    safe = plan_segments(11.0, [(0.0, 7.0), (7.0, 11.0)], [])
+    unsafe = plan_segments(11.0, [(0.0, 8.0), (8.0, 11.0)], [])
+
+    assert [(item["start_s"], item["end_s"]) for item in safe] == [
+        (0.0, 7.0), (7.0, 11.0),
+    ]
+    assert [item["join_mode"] for item in safe] == ["hard_cut", "hard_cut"]
+    assert [(item["start_s"], item["end_s"]) for item in unsafe] == [
+        (0.0, 7.0), (7.0, 11.0),
+    ]
+    assert [item["join_mode"] for item in unsafe] == ["hard_cut", "continue"]
+
+
+def test_boundary_spanning_dialogue_is_repartitioned_without_text_or_time_loss():
+    line = {"text": "abcdefgh", "start_s": 8.0, "end_s": 10.0}
+    segments = plan_segments(12.5, [(0.0, 12.5)], [line])
+    localized = [
+        localize_dialogue([line], segment, segments=segments)
+        for segment in segments
+    ]
+
+    assert [(item["start_s"], item["end_s"]) for item in segments] == [
+        (0.0, 8.5), (8.5, 12.5),
+    ]
+    assert "".join(
+        fragment["text"] for fragments in localized for fragment in fragments
+    ) == line["text"]
+    absolute_intervals = [
+        (
+            fragment["start_s"] + segment["start_s"],
+            fragment["end_s"] + segment["start_s"],
+        )
+        for segment, fragments in zip(segments, localized)
+        for fragment in fragments
+    ]
+    assert absolute_intervals == [(8.0, 8.5), (8.5, 10.0)]
+
+
+@pytest.mark.parametrize("duration", [1.0, 2.5, 3.999999])
+def test_video_below_provider_minimum_fails_without_fabricating_duration(duration):
+    with pytest.raises(
+        LongVideoError,
+        match="long_video_duration_below_provider_minimum",
+    ):
+        plan_segments(duration, [(0.0, duration)], [])
 
 
 def test_source_spanning_dialogue_never_blocks_a_ten_second_plan():

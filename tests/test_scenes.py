@@ -141,7 +141,7 @@ def test_segments_cover_and_sized(video_30s, tmp_path):
     data = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
 
     segments = data["segments"]
-    assert segments  # >15s 视频必须给出拆段建议
+    assert segments  # >10s 视频必须给出拆段建议
     bounds = [(seg["start_s"], seg["end_s"]) for seg in segments]
     assert bounds[0][0] == 0.0
     assert bounds[-1][1] == pytest.approx(data["duration_s"])  # 覆盖全程
@@ -149,8 +149,8 @@ def test_segments_cover_and_sized(video_30s, tmp_path):
         assert cur[0] == pytest.approx(prev[1])  # 无缝隙
         assert cur[0] >= prev[0]  # 单调递增
     for start, end in bounds:
-        assert 1.0 <= end - start
-        assert provider_duration_s(start, end) <= 14
+        assert 4.0 <= end - start
+        assert provider_duration_s(start, end) <= 10
     assert all(seg["chain_id"].startswith("chain-") for seg in segments)
     assert all(seg["join_mode"] in {"hard_cut", "continue"} for seg in segments)
 
@@ -169,7 +169,7 @@ def test_segments_empty_for_short_video(video_10s, tmp_path):
 
 def test_build_segments_starts_immediately_above_ten_seconds():
     segments = build_segments([(0.0, 10.001)], 10.001)
-    assert segments == [(0.0, 9.001), (9.001, 10.001)]
+    assert segments == [(0.0, 6.001), (6.001, 10.001)]
 
 
 def test_missing_manifest_fails(video_10s, tmp_path):
@@ -272,21 +272,21 @@ def test_build_segments_splits_long_scene_at_provider_safe_boundaries():
     assert build_segments([(0.0, 10.0), (10.0, 32.0)], 32.0) == [
         (0.0, 10.0),
         (10.0, 20.0),
-        (20.0, 30.0),
-        (30.0, 32.0),
+        (20.0, 28.0),
+        (28.0, 32.0),
     ]
 
 
 def assert_segments_valid(segments, duration):
-    """拆段不变量：非空、请求不超过 14s、首 0 尾 duration、相邻无缝。"""
+    """拆段不变量：非空、源段 4..10s、首 0 尾 duration、相邻无缝。"""
     assert segments
     assert segments[0][0] == pytest.approx(0.0)
     assert segments[-1][1] == pytest.approx(duration)
     prev_end = 0.0
     for start, end in segments:
         assert start == pytest.approx(prev_end)  # 无缝隙
-        assert 1.0 <= end - start
-        assert provider_duration_s(start, end) <= 14
+        assert 4.0 <= end - start
+        assert provider_duration_s(start, end) <= 10
         assert end > start  # 单调
         prev_end = end
 
@@ -446,17 +446,41 @@ def test_unified_planner_splits_more_than_nine_effective_scenes_on_hard_cut():
     segments = plan_segments(12.0, scenes, [])
 
     assert [(segment["start_s"], segment["end_s"]) for segment in segments] == [
-        (0.0, 9.0),
-        (9.0, 10.0),
-        (10.0, 12.0),
+        (0.0, 8.0),
+        (8.0, 12.0),
     ]
     assert [segment["join_mode"] for segment in segments] == [
-        "hard_cut", "hard_cut", "hard_cut",
+        "hard_cut", "hard_cut",
     ]
     assert [segment["scene_indices"] for segment in segments] == [
-        list(range(1, 10)),
-        [10],
-        [11, 12],
+        list(range(1, 9)),
+        [9, 10, 11, 12],
+    ]
+
+
+def test_capacity_split_redistributes_a_one_second_tail_to_real_scene_boundary():
+    scenes = [
+        {
+            "index": index + 1,
+            "start_decode_frame_index": index,
+            "end_decode_frame_index": index + 1,
+            "start_s": float(index),
+            "end_s": float(index + 1),
+            "frames": [_decoded_frame(index, index)],
+        }
+        for index in range(10)
+    ]
+
+    segments = plan_segments(10.0, scenes, [])
+
+    assert [(segment["start_s"], segment["end_s"]) for segment in segments] == [
+        (0.0, 6.0), (6.0, 10.0),
+    ]
+    assert [segment["scene_indices"] for segment in segments] == [
+        list(range(1, 7)), list(range(7, 11)),
+    ]
+    assert [segment["join_mode"] for segment in segments] == [
+        "hard_cut", "hard_cut",
     ]
 
 

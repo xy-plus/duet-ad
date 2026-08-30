@@ -154,7 +154,11 @@ def _make_long(settings, *, joins=("hard_cut", "continue"), dialogue_text="æºå
             "visual_prompt_path": visual,
             "final_prompt_path": final,
         })
-    if legacy or planned is None and segment_duration >= long_video.SEGMENT_MIN_S:
+    if (
+        legacy
+        or planned is None
+        and segment_duration >= long_video.RECEIPT_COMPAT_SEGMENT_MIN_S
+    ):
         def artifact(path):
             path = Path(path)
             return {
@@ -4606,6 +4610,57 @@ def test_new_receipt_rejects_true_six_decimal_subsecond_segment(tmp_path):
         match="long_video_plan_invalid_segment",
     ):
         _make_long(settings, joins=joins, segment_duration=0.999999)
+
+
+def test_unpaid_short_source_segment_fails_terminal_before_context_or_h3(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path, enable_h3_submit=True, autodl_art_token="art"
+    )
+    cid, receipt = _make_long(
+        settings, joins=("hard_cut",), segment_duration=2.5
+    )
+    meta = storage.load_meta(settings.data_dir, cid)
+    plan = long_generation.freeze_plan(
+        settings.data_dir / cid, meta, receipt, "none", "auto"
+    )
+    generation = long_generation.initial_generation(
+        settings, cid, plan, "parent-request-123", 1, fast_mode=True
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        fit_mode="none",
+        dialogue_mode="auto",
+        frozen_plan_receipt=receipt,
+        generation=generation,
+    )
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("short source segment must not reach Context IR or H3")
+
+    monkeypatch.setattr(long_generation, "_optimize_segment_context_ir", forbidden)
+    monkeypatch.setattr(h3, "prepare", forbidden)
+    monkeypatch.setattr(h3, "submit", forbidden)
+    monkeypatch.setattr(h3, "start", forbidden)
+
+    long_generation.run(settings, cid, plan)
+
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "failed"
+    assert stored["error"] == "long_video_segment_below_provider_minimum"
+    assert stored["segments"][0]["status"] == "failed"
+    assert stored["segments"][0]["error"] == (
+        "long_video_segment_below_provider_minimum"
+    )
+    assert (
+        settings.data_dir
+        / cid
+        / "work"
+        / "errors"
+        / "long-generation-provider-duration-preflight-segment-1.json"
+    ).is_file()
 
 
 def test_freeze_preserves_existing_multisegment_receipt_at_h3_limit(

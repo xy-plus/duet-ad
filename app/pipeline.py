@@ -1714,16 +1714,18 @@ def _load_scenes(work: Path) -> list[dict]:
         except long_video.LongVideoError:
             raise PipelineError(
                 f"scenes.json segments[{i}] provider duration not in "
-                f"1..{long_video.SEGMENT_PROVIDER_MAX_DURATION_S}s"
+                f"{long_video.SEGMENT_PROVIDER_MIN_DURATION_S}.."
+                f"{long_video.SEGMENT_PROVIDER_MAX_DURATION_S}s"
             ) from None
         if (
-            frozen_duration < long_video.SEGMENT_MIN_S
+            frozen_duration < long_video.SEGMENT_SOURCE_MIN_S
             or long_video.provider_duration_s(seg["start_s"], seg["end_s"])
             > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
         ):
             raise PipelineError(
                 f"scenes.json segments[{i}] provider duration not in "
-                f"1..{long_video.SEGMENT_PROVIDER_MAX_DURATION_S}s"
+                f"{long_video.SEGMENT_PROVIDER_MIN_DURATION_S}.."
+                f"{long_video.SEGMENT_PROVIDER_MAX_DURATION_S}s"
             )
         if abs(seg["start_s"] - prev_end) > 1e-6:
             raise PipelineError(f"scenes.json segments[{i}] not contiguous with previous")
