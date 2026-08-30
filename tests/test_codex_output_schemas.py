@@ -299,8 +299,21 @@ def test_codex_argv_receives_readonly_output_schema(monkeypatch, tmp_path: Path)
             codex_runner._ACTIVE_ISOLATED_STAGE.reset(token)
         assert "--output-schema" in argv
         assert argv[argv.index("--output-schema") + 1] == str(schema)
-        stage_mount = ["--ro-bind", str(stage), str(stage)]
+        # The directory itself stays writable for Codex' nested sandbox
+        # mountpoints.  Every staged input, including the schema, is overlaid
+        # read-only; only the declared final transport is consumed.
+        stage_mount = ["--bind", str(stage), str(stage)]
         assert any(
             argv[index:index + 3] == stage_mount
+            for index in range(len(argv) - 2)
+        )
+        schema_mount = ["--ro-bind", str(schema), str(schema)]
+        assert any(
+            argv[index:index + 3] == schema_mount
+            for index in range(len(argv) - 2)
+        )
+        final_mount = ["--ro-bind", str(final), str(final)]
+        assert not any(
+            argv[index:index + 3] == final_mount
             for index in range(len(argv) - 2)
         )
