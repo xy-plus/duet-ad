@@ -464,6 +464,118 @@ def test_twelfth_boundary_plan_sampling_and_backend_binding_have_no_phantom_cut(
     }) == ["SCENE_04", "SCENE_05"]
 
 
+def test_toy_artifact_rounded_up_hard_cut_replays_without_cross_segment_scene(
+    tmp_path,
+):
+    """Replay the exact scene/frame receipts from CID 755043... at its failure cut."""
+    exact_bounds = [
+        (0, 1), (2, 3), (2, 1), (29, 6), (89, 10), (379, 30),
+        (67, 5), (229, 15), (493, 30), (283, 15), (613, 30),
+        (145, 6), (757, 30), (279, 10),
+    ]
+    artifact_frames = [
+        [(9, 4608)],
+        [(20, 10240), (59, 30208)],
+        [(60, 30720), (102, 52224), (144, 73728)],
+        [(145, 74240), (206, 105472), (266, 136192)],
+        [(267, 136704), (378, 193536)],
+        [(390, 199680)],
+        [(402, 205824), (457, 233984)],
+        [(475, 243200)],
+        [(493, 252416), (565, 289280)],
+        [(566, 289792), (567, 290304), (612, 313344)],
+        [(613, 313856), (669, 342528), (724, 370688)],
+        [(725, 371200), (756, 387072)],
+        [(757, 387584), (836, 428032)],
+    ]
+    scenes = []
+    for index, (start, end, frames) in enumerate(
+        zip(exact_bounds[:-1], exact_bounds[1:], artifact_frames, strict=True), 1
+    ):
+        start_pts, start_den = start
+        end_pts, end_den = end
+        scenes.append({
+            "index": index,
+            "start_s": round(start_pts / start_den, 6),
+            "end_s": round(end_pts / end_den, 6),
+            "start_time": {
+                "pts": start_pts, "time_base_num": 1,
+                "time_base_den": start_den,
+            },
+            "end_time": {
+                "pts": end_pts, "time_base_num": 1,
+                "time_base_den": end_den,
+            },
+            "frames": [
+                {
+                    "decode_frame_index": decode_index,
+                    "pts": pts,
+                    "pts_origin": 0,
+                    "time_base_num": 1,
+                    "time_base_den": 15360,
+                }
+                for decode_index, pts in frames
+            ],
+        })
+
+    segments = scene_planner.plan_segments(27.9, scenes, [])
+    selections = [
+        scene_planner.select_segment_keyframes(scenes, segment)
+        for segment in segments
+    ]
+    assert segments[1]["end_s"] == 18.866667
+    assert [
+        cut["source_scene_id"]
+        for cut in segments[1]["source_cut_timeline"]
+    ] == ["SCENE_05", "SCENE_06", "SCENE_07", "SCENE_08", "SCENE_09"]
+    assert "SCENE_10" not in {
+        frame["source_scene_id"] for frame in selections[1]
+    }
+    assert selections[2][0]["source_scene_id"] == "SCENE_10"
+    assert selections[2][0]["source_time_s"] == 18.866667
+
+    work = tmp_path / "work"
+    metas = []
+    for segment, selection in zip(segments, selections, strict=True):
+        keyframe_dir = (
+            work / "segments" / str(segment["index"]) / "work" / "keyframes"
+        )
+        keyframe_dir.mkdir(parents=True)
+        names = []
+        receipt_items = []
+        for order, selected in enumerate(selection, 1):
+            name = f"{order:02d}.png"
+            data = f"toy-artifact-{segment['index']}-{order}".encode()
+            (keyframe_dir / name).write_bytes(data)
+            names.append(name)
+            receipt_items.append({
+                **selected,
+                "path": f"keyframes/{name}",
+                "sha256": hashlib.sha256(data).hexdigest(),
+            })
+        metas.append({
+            **segment,
+            "keyframes": names,
+            "keyframe_sampling": {
+                "schema": "duet.backend-keyframe-sampling",
+                "version": 1,
+                "keyframes": receipt_items,
+            },
+        })
+
+    bound = pipeline._bind_keyframe_source_timeline(
+        work, segments, metas, scenes,
+    )
+    assert [
+        [cut["source_scene_id"] for cut in segment["source_cut_timeline"]]
+        for segment in bound
+    ] == [
+        ["SCENE_01", "SCENE_02", "SCENE_03", "SCENE_04"],
+        ["SCENE_05", "SCENE_06", "SCENE_07", "SCENE_08", "SCENE_09"],
+        ["SCENE_10", "SCENE_11", "SCENE_12", "SCENE_13"],
+    ]
+
+
 def test_visual_attempt_restores_backend_frozen_frames_after_codex_mutation(tmp_path):
     cdir = tmp_path / "conversation"
     work = cdir / "work"

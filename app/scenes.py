@@ -210,10 +210,8 @@ def normalize_scene_inventory(
 
 
 def _scene_indices_for_interval(
-    scenes: list[dict], start_s: float, end_s: float
+    scenes: list[dict], start: Fraction, end: Fraction
 ) -> list[int]:
-    start = Fraction(str(start_s))
-    end = Fraction(str(end_s))
     indices = []
     for scene in scenes:
         if any(start <= _frame_time(frame) < end for frame in scene["frames"]):
@@ -228,6 +226,31 @@ def _scene_exact_bound(scene: Mapping, edge: str) -> Fraction:
         if receipt is not None
         else Fraction(str(scene[f"{edge}_s"]))
     )
+
+
+def _segment_exact_bound(scenes: Iterable[Mapping], value: object) -> Fraction:
+    """Restore a canonical planner boundary to its detector-owned exact cut.
+
+    Segment JSON is canonicalized to six decimals, while scene ownership is
+    defined by rational PTS.  A rounded-up hard cut must not capture the first
+    frame of the following scene.  Snap only an exact scene boundary whose
+    canonical serialization equals the planner value; timed splits retain the
+    canonical value itself.
+    """
+    canonical = Fraction(str(value))
+    display = _display_time(canonical)
+    matches = {
+        exact
+        for scene in scenes
+        for exact in (
+            _scene_exact_bound(scene, "start"),
+            _scene_exact_bound(scene, "end"),
+        )
+        if _display_time(exact) == display
+    }
+    if len(matches) > 1:
+        raise ValueError("segment boundary is ambiguous at canonical precision")
+    return next(iter(matches), canonical)
 
 
 def _source_cut_timeline(
@@ -280,16 +303,20 @@ def plan_segments(
     planned: list[dict] = []
     for segment in base:
         index = segment["index"]
-        start = Fraction(str(segment["start_s"]))
-        end = Fraction(str(segment["end_s"]))
-        scene_indices = _scene_indices_for_interval(scenes, float(start), float(end))
+        start = _segment_exact_bound(scenes, segment["start_s"])
+        end = _segment_exact_bound(scenes, segment["end_s"])
+        scene_indices = _scene_indices_for_interval(scenes, start, end)
         try:
-            source_duration = long_video.segment_duration_s(float(start), float(end))
+            source_duration = long_video.segment_duration_s(
+                segment["start_s"], segment["end_s"]
+            )
         except long_video.LongVideoError:
             raise ValueError("segment duration invariant violated") from None
         if (
             source_duration < long_video.SEGMENT_SOURCE_MIN_S
-            or long_video.provider_duration_s(float(start), float(end))
+            or long_video.provider_duration_s(
+                segment["start_s"], segment["end_s"]
+            )
             > long_video.SEGMENT_PROVIDER_MAX_DURATION_S
             or not scene_indices
         ):
@@ -452,15 +479,16 @@ def select_segment_keyframes(
 ) -> list[dict]:
     """Select exactly nine deterministic backend-owned source frames."""
     try:
-        start = Fraction(str(segment["start_s"]))
-        end = Fraction(str(segment["end_s"]))
+        scene_inventory = [dict(scene) for scene in effective_scenes]
+        start = _segment_exact_bound(scene_inventory, segment["start_s"])
+        end = _segment_exact_bound(scene_inventory, segment["end_s"])
     except (KeyError, TypeError, ValueError):
         raise ValueError("segment bounds are invalid") from None
     if start < 0 or end <= start:
         raise ValueError("segment bounds are invalid")
 
     scenes: list[dict] = []
-    for raw in effective_scenes:
+    for raw in scene_inventory:
         scene = dict(raw)
         frames = [
             dict(frame)
