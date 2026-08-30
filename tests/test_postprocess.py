@@ -2493,6 +2493,107 @@ def test_run_task_cancelled_writes_failed(tmp_path, monkeypatch):
     assert pp["options"] == {**OPTIONS_SUB, "optimize_image": False}
 
 
+def test_missing_material_closes_top_and_all_running_segments_with_trace(
+    tmp_path,
+):
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
+    cid = _make_conv(settings, segments=True)
+    cdir = settings.data_dir / cid
+    asyncio.run(postprocess.start(
+        settings, cid, {"confirm": True, "options": OPTIONS_SUB}, {}
+    ))
+    for index in (1, 2):
+        keyframes = cdir / "work" / "segments" / str(index) / "work" / "keyframes"
+        for frame in keyframes.glob("*.png"):
+            frame.unlink()
+
+    asyncio.run(postprocess.run_task(settings, cid, asyncio.Semaphore(1)))
+
+    post = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    assert post["status"] == "failed"
+    assert post["error"] == "postprocess_artifacts_invalid"
+    assert {item["status"] for item in post["segments"]} == {"failed"}
+    assert {item["error"] for item in post["segments"]} == {
+        "postprocess_artifacts_invalid"
+    }
+    trace = json.loads(
+        (cdir / "work" / "errors" / "postprocess-materials.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert trace["error"]["type"] == "PostprocessError"
+
+
+def test_missing_skill_milestone_closes_every_running_segment_with_trace(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path)
+    cid = _make_conv(settings, segments=True)
+    cdir = settings.data_dir / cid
+    asyncio.run(postprocess.start(
+        settings,
+        cid,
+        {"confirm": True, "options": {
+            "remove_subtitle": False,
+            "remove_brand": False,
+            "optimize_image": True,
+        }},
+        {},
+    ))
+
+    asyncio.run(postprocess.run_task(settings, cid, asyncio.Semaphore(1)))
+
+    post = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    assert post["status"] == "failed"
+    assert {item["status"] for item in post["segments"]} == {"failed"}
+    assert (cdir / "work" / "errors" / "postprocess-milestone.json").is_file()
+
+
+def test_final_persist_error_preserves_done_segments_and_closes_top(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
+    cid = _make_conv(settings)
+    cdir = settings.data_dir / cid
+    asyncio.run(postprocess.start(
+        settings, cid, {"confirm": True, "options": OPTIONS_SUB}, {}
+    ))
+    original_mutate = postprocess._mutate_postprocess
+    fail_finalize = False
+
+    async def completed_segment(*_args, **_kwargs):
+        nonlocal fail_finalize
+        postprocess._update_segment(
+            settings, cid, 0, status="done", stage="done",
+            completed_frames=2, error=None,
+        )
+        fail_finalize = True
+
+    def transient_final_persist(settings_, cid_, mutator):
+        nonlocal fail_finalize
+        if fail_finalize and getattr(mutator, "__name__", "") == "finalize":
+            fail_finalize = False
+            raise OSError("meta persist interrupted")
+        return original_mutate(settings_, cid_, mutator)
+
+    monkeypatch.setattr(postprocess, "_run_segment", completed_segment)
+    monkeypatch.setattr(postprocess, "_mutate_postprocess", transient_final_persist)
+
+    asyncio.run(postprocess.run_task(settings, cid, asyncio.Semaphore(1)))
+
+    post = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    assert post["status"] == "failed"
+    assert post["error"] == "postprocess_publish_failed"
+    assert post["segments"][0]["status"] == "done"
+    trace = json.loads(
+        (cdir / "work" / "errors" / "postprocess-final-persist.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert trace["error"]["type"] == "OSError"
+
+
 def test_parallel_segment_updates_use_atomic_storage_mutation(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, enable_mediakit_erase=True)
     cid = _make_conv(settings, segments=True)

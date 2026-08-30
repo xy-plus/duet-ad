@@ -600,6 +600,61 @@ def _mark_image_verification_failed(
     _mutate_postprocess(settings, cid, mutate)
 
 
+def _record_and_close_failure(
+    settings: Settings,
+    cid: str,
+    cdir: Path,
+    *,
+    error: str,
+    trace_name: str,
+    call_path: list[str],
+    exception: BaseException,
+    indices: set[int] | None = None,
+) -> None:
+    """Record the full exception and close every affected non-terminal segment."""
+    error_trace.record(
+        cdir / "work" / "errors" / trace_name,
+        call_path=call_path,
+        error=exception,
+        logger=log,
+    )
+
+    def mutate(_meta: dict, post: dict) -> None:
+        original = _meta.get("postprocess")
+        if not isinstance(original, dict) or not isinstance(
+            original.get("segments"), list
+        ):
+            post.update(status="failed", error=error)
+            return
+        segments = [
+            dict(item) for item in post.get("segments", [])
+            if isinstance(item, dict)
+        ]
+        for item in segments:
+            if (
+                item.get("status") not in {"done", "failed"}
+                and (indices is None or item.get("index") in indices)
+            ):
+                item.update(status="failed", error=error)
+        post.update(status="failed", error=error, segments=segments)
+        post["frames"] = sorted(
+            _frame_ref(item["index"], path.name)
+            for item in segments if item.get("status") == "done"
+            for path in _canonical_files(cdir, item["index"])
+        )
+
+    try:
+        _mutate_postprocess(settings, cid, mutate)
+    except Exception as persist_error:
+        error_trace.record(
+            cdir / "work" / "errors" / "postprocess-terminal-persist.json",
+            call_path=["postprocess", cid, "terminal_persist"],
+            error=persist_error,
+            logger=log,
+        )
+        raise
+
+
 def _segment_state(index: int, total: int, revision: int = 1) -> dict:
     return {
         "index": index, "status": "running", "stage": "queued",
@@ -2615,12 +2670,13 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         return
     try:
         private = _private_receipt(meta)
-    except PostprocessError:
-        _mutate_postprocess(
-            settings, cid,
-            lambda _meta, post: post.update(
-                status="failed", error="postprocess_receipt_invalid"
-            ),
+    except PostprocessError as exc:
+        _record_and_close_failure(
+            settings, cid, cdir,
+            error="postprocess_receipt_invalid",
+            trace_name="postprocess-receipt.json",
+            call_path=["postprocess", cid, "receipt"],
+            exception=exc,
         )
         return
     options = private["options"]
@@ -2629,13 +2685,29 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         try:
             milestone = skill_milestone.load(cdir)
             frozen_image_skill = milestone.read_bytes("image-postprocess")
-        except skill_milestone.SkillMilestoneError:
-            _mark_image_verification_failed(settings, cid, set())
+        except skill_milestone.SkillMilestoneError as exc:
+            _record_and_close_failure(
+                settings, cid, cdir,
+                error="image_verification_failed",
+                trace_name="postprocess-milestone.json",
+                call_path=["postprocess", cid, "milestone"],
+                exception=exc,
+            )
             return
     # Both V3 and V4 are receipt-bound verification contracts.  Only legacy
     # V2 may use the old immediate per-frame publication path.
     defer_v3_publish = options["optimize_image"] and private["version"] in {3, 4}
-    audit_grouped = _group_targets(cdir, meta)
+    try:
+        audit_grouped = _group_targets(cdir, meta)
+    except Exception as exc:
+        _record_and_close_failure(
+            settings, cid, cdir,
+            error="postprocess_artifacts_invalid",
+            trace_name="postprocess-materials.json",
+            call_path=["postprocess", cid, "materials"],
+            exception=exc,
+        )
+        return
     grouped = audit_grouped
     v4_project_dag = private["version"] == 4 and options["optimize_image"]
     if only_segments is not None and not v4_project_dag:
@@ -2741,7 +2813,16 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
                 for item in post.get("segments", []) if item.get("status") == "done"
                 for path in _canonical_files(settings.data_dir / cid, item["index"])
             ]
-        _mutate_postprocess(settings, cid, finalize_v4)
+        try:
+            _mutate_postprocess(settings, cid, finalize_v4)
+        except Exception as exc:
+            _record_and_close_failure(
+                settings, cid, cdir,
+                error="postprocess_publish_failed",
+                trace_name="postprocess-final-persist.json",
+                call_path=["postprocess", cid, "final_persist"],
+                exception=exc,
+            )
         return
     try:
         await asyncio.gather(*(
@@ -2813,7 +2894,16 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
             for path in _canonical_files(cdir, item["index"])
         )
 
-    _mutate_postprocess(settings, cid, finalize)
+    try:
+        _mutate_postprocess(settings, cid, finalize)
+    except Exception as exc:
+        _record_and_close_failure(
+            settings, cid, cdir,
+            error="postprocess_publish_failed",
+            trace_name="postprocess-final-persist.json",
+            call_path=["postprocess", cid, "final_persist"],
+            exception=exc,
+        )
 
 
 async def retry_segment(settings: Settings, cid: str, index: int, payload: dict,

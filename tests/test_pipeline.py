@@ -923,7 +923,9 @@ def test_v4_semantic_diagnostics_do_not_retry_or_switch_compilers(
             work = Path(workdir) / "work"
             if (work / "project_index_request.json").is_file():
                 (work / "element_index.json").write_text(
-                    json.dumps({"people": {}, "entities": {}, "scenes": {}}),
+                    json.dumps({
+                        "people": {}, "entities": {}, "scenes": {}, "relations": {},
+                    }),
                     encoding="utf-8",
                 )
                 return
@@ -985,6 +987,199 @@ def test_v4_semantic_diagnostics_do_not_retry_or_switch_compilers(
     assert "score=" in caplog.text
     assert "missing:people.subject.wardrobe_change" in caplog.text
     assert "palette_description" in caplog.text
+
+
+def test_project_index_structure_error_retries_without_replaying_image_phases(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        pipeline, "_generate_project_element_index", _GENERATE_PROJECT_ELEMENT_INDEX,
+    )
+    monkeypatch.setattr(
+        pipeline.image_optimization,
+        "generate_project_prompts",
+        _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
+    )
+    settings = make_settings(tmp_path, retry_count=1, retry_interval_s=0)
+    keyframes = tmp_path / "keyframes"
+    keyframes.mkdir()
+    (keyframes / "01.png").write_bytes(_PX_PNG)
+
+    class Runner:
+        def __init__(self):
+            self.calls = []
+
+        def run_isolated(self, workdir, _prompt, *, session_dir):
+            work = Path(workdir) / "work"
+            if (work / "project_index_request.json").is_file():
+                self.calls.append("project_index")
+                value = (
+                    {"people": {}, "entities": {}, "scenes": {}}
+                    if self.calls.count("project_index") == 1 else
+                    {
+                        "people": {},
+                        "entities": {
+                            "broken-entity": {
+                                "source_visual_description": "",
+                                "occurrences": [],
+                            },
+                        },
+                        "scenes": {},
+                        "relations": {},
+                    }
+                )
+                (work / "element_index.json").write_text(
+                    json.dumps(value), encoding="utf-8",
+                )
+                return
+            request = json.loads((work / "request.json").read_text(encoding="utf-8"))
+            self.calls.append(
+                request["phase"]
+                if request["phase"] == "global_plan" else
+                f"segment_frames[{request['segment']['index']}]"
+            )
+            semantic = _semantic_image_output(request)
+            output = (
+                work / "global_plan.json"
+                if request["phase"] == "global_plan" else
+                work / "segment_frames.json"
+            )
+            output.write_text(
+                json.dumps(
+                        {
+                            key: semantic.get(key, {})
+                            for key in ("people", "entities", "scenes", "relations")
+                        }
+                    if request["phase"] == "global_plan" else
+                    {"frames": semantic["frames"]}
+                ),
+                encoding="utf-8",
+            )
+
+    runner = Runner()
+    plan, prompts = pipeline._generate_image_optimization_project(
+        settings,
+        runner,
+        [{
+            "index": 0,
+            "chain_id": "short-000",
+            "join_mode": "hard_cut",
+            "keyframes_dir": keyframes,
+            "transition_skeleton": pipeline._frame_inventory(
+                {0: [keyframes / "01.png"]},
+                segment_lineage={0: {"chain_id": "short-000", "join_mode": "hard_cut"}},
+            ),
+        }],
+        session_dir=tmp_path,
+        step="project image plan",
+        skill_bytes=b"image skill",
+        video_skill_bytes=b"video skill",
+    )
+
+    assert plan["version"] == 4
+    assert list(prompts) == [0]
+    assert runner.calls == [
+        "project_index", "project_index", "global_plan", "segment_frames[0]",
+    ]
+    trace = json.loads(
+        (tmp_path / "work" / "errors" / "project-index.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert trace["error"]["type"] == "PipelineError"
+    filtered = json.loads(
+        (tmp_path / "work" / "errors" / "project-index-filtered.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert filtered["error"] == {
+        "code": "project_index_fields_filtered",
+        "dropped_paths": ["/entities/broken-entity"],
+        "dropped_count": 1,
+    }
+
+
+def test_segment_output_retry_reuses_successful_global_and_sibling_segment(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        image_optimization,
+        "generate_project_prompts",
+        _GENERATE_IMAGE_OPTIMIZATION_PROJECT,
+    )
+    segments = []
+    for index in (1, 2):
+        directory = tmp_path / "segments" / str(index) / "keyframes"
+        directory.mkdir(parents=True)
+        frame = directory / "01.png"
+        frame.write_bytes(_PX_PNG)
+        skeleton = pipeline._frame_inventory(
+            {index: [frame]},
+            segment_lineage={
+                index: {"chain_id": f"chain-{index:03d}", "join_mode": "hard_cut"}
+            },
+        )
+        if index == 2:
+            skeleton[0]["source_transition_from_previous"] = "hard_cut"
+        segments.append({
+            "index": index,
+            "chain_id": f"chain-{index:03d}",
+            "join_mode": "hard_cut",
+            "keyframes_dir": directory,
+            "transition_skeleton": skeleton,
+        })
+    element_index = tmp_path / "element_index.json"
+    element_index.write_text(
+        json.dumps({
+            "people": {}, "entities": {}, "scenes": {}, "relations": {},
+        }),
+        encoding="utf-8",
+    )
+
+    class Runner:
+        def __init__(self):
+            self.calls = {"global_plan": 0, 1: 0, 2: 0}
+
+        def run_isolated(self, workdir, _prompt, *, session_dir):
+            work = Path(workdir) / "work"
+            request = json.loads((work / "request.json").read_text(encoding="utf-8"))
+            semantic = _semantic_image_output(request)
+            if request["phase"] == "global_plan":
+                self.calls["global_plan"] += 1
+                (work / "global_plan.json").write_text(
+                    json.dumps({
+                        key: semantic.get(key, {})
+                        for key in ("people", "entities", "scenes", "relations")
+                    }),
+                    encoding="utf-8",
+                )
+                return
+            index = request["segment"]["index"]
+            self.calls[index] += 1
+            output = work / "segment_frames.json"
+            if index == 2 and self.calls[index] == 1:
+                output.write_text("not-json", encoding="utf-8")
+            else:
+                output.write_text(
+                    json.dumps({"frames": semantic["frames"]}), encoding="utf-8",
+                )
+
+    runner = Runner()
+    plan, prompts = image_optimization.generate_project_prompts(
+        runner,
+        segments,
+        make_settings(tmp_path).seedream_edit_mode,
+        session_dir=tmp_path,
+        expected_version=4,
+        element_index_path=element_index,
+        skill_bytes=b"image skill",
+        phase_retry_count=1,
+        phase_retry_interval_s=0,
+    )
+
+    assert plan["version"] == 4
+    assert set(prompts) == {1, 2}
+    assert runner.calls == {"global_plan": 1, 1: 1, 2: 2}
 
 
 def test_v4_pipeline_freezes_authoritative_transitions_and_anchor_schedule(tmp_path):

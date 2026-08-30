@@ -17,6 +17,7 @@ from pathlib import Path
 
 import cv2
 
+from app import error_trace
 from app.codex_runner import CodexError
 from app.config import (
     SEEDREAM_EDIT_MODES,
@@ -1692,6 +1693,91 @@ def _canonical_element_index(value: object) -> dict:
                 "replace_together": raw.get("replace_together") is True,
             }
     return result
+
+
+def _element_index_filter_diagnostics(raw: dict, canonical: dict) -> dict | None:
+    """Describe deterministic filtering without turning sparse facts into failure."""
+    paths: list[str] = []
+    dropped_count = 0
+
+    def mark(path: str, count: int = 1) -> None:
+        nonlocal dropped_count
+        if path not in paths:
+            paths.append(path)
+        dropped_count += max(1, count)
+
+    item_fields = {
+        "source_visual_description", "occurrences", "replaceable", "preserve",
+    }
+    for category in ("people", "entities", "scenes"):
+        raw_items = raw[category]
+        kept_items = canonical[category]
+        for stable_key, item in raw_items.items():
+            base = f"/{category}/{stable_key}"
+            if stable_key not in kept_items:
+                mark(base)
+                continue
+            kept = kept_items[stable_key]
+            for extra in sorted(set(item) - item_fields):
+                mark(f"{base}/{extra}")
+            for field in ("occurrences", "replaceable", "preserve"):
+                source = item.get(field)
+                if not isinstance(source, list):
+                    if field in item:
+                        mark(f"{base}/{field}")
+                    continue
+                difference = len(source) - len(kept[field])
+                if difference > 0:
+                    mark(f"{base}/{field}", difference)
+
+    relation_fields = {
+        "subject_key", "predicate", "object_key", "occurrences", "preserve",
+        "replace_together",
+    }
+    for relation_key, item in raw["relations"].items():
+        base = f"/relations/{relation_key}"
+        if relation_key not in canonical["relations"]:
+            mark(base)
+            continue
+        kept = canonical["relations"][relation_key]
+        for extra in sorted(set(item) - relation_fields):
+            mark(f"{base}/{extra}")
+        raw_occurrences = item.get("occurrences")
+        if not isinstance(raw_occurrences, list):
+            if "occurrences" in item:
+                mark(f"{base}/occurrences")
+        else:
+            difference = len(raw_occurrences) - len(kept["occurrences"])
+            if difference > 0:
+                mark(f"{base}/occurrences", difference)
+            raw_frames = sum(
+                len(occurrence.get("frames", []))
+                for occurrence in raw_occurrences
+                if isinstance(occurrence, dict)
+                and isinstance(occurrence.get("frames"), list)
+            )
+            kept_frames = sum(
+                len(occurrence["frames"]) for occurrence in kept["occurrences"]
+            )
+            if raw_frames > kept_frames:
+                mark(f"{base}/occurrences/*/frames", raw_frames - kept_frames)
+        raw_preserve = item.get("preserve")
+        if not isinstance(raw_preserve, list):
+            if "preserve" in item:
+                mark(f"{base}/preserve")
+        elif len(raw_preserve) > len(kept["preserve"]):
+            mark(
+                f"{base}/preserve",
+                len(raw_preserve) - len(kept["preserve"]),
+            )
+
+    if not paths:
+        return None
+    return {
+        "code": "project_index_fields_filtered",
+        "dropped_paths": sorted(paths),
+        "dropped_count": dropped_count,
+    }
 
 
 def _tag_stable_key(stable_key: str, text: str) -> str:
@@ -3862,11 +3948,16 @@ def _run_image_skill_phase_with_retry(
     for attempt in range(retry_count + 1):
         try:
             return operation()
-        except CodexError as exc:
-            if not exc.retryable or attempt >= retry_count:
+        except (CodexError, ImageOptimizationOutputError) as exc:
+            retryable = (
+                exc.retryable if isinstance(exc, CodexError) else True
+            )
+            if not retryable or attempt >= retry_count:
+                if isinstance(exc, ImageOptimizationOutputError):
+                    raise
                 raise CodexError(
                     f"image optimization {phase} failed: {exc}",
-                    retryable=exc.retryable,
+                    retryable=retryable,
                 ) from None
             _LOGGER.warning(
                 "image optimization %s failed; retry %s/%s in %.1fs: %s",
@@ -3903,12 +3994,33 @@ def generate_project_prompts(
     skill = _skill_bytes(skill_bytes=skill_bytes, skill_path=skill_path)
     element_index = None
     if element_index_path is not None:
-        try:
-            element_index = _canonical_element_index(
-                _read_json_output(Path(element_index_path), MAX_CONTINUITY_BYTES)
+        raw_element_index = _read_json_output(
+            Path(element_index_path), MAX_CONTINUITY_BYTES
+        )
+        if (
+            not isinstance(raw_element_index, dict)
+            or set(raw_element_index) != {
+                "people", "entities", "scenes", "relations"
+            }
+            or any(
+                not isinstance(raw_element_index[key], dict)
+                for key in ("people", "entities", "scenes", "relations")
             )
-        except ImageOptimizationOutputError:
-            element_index = _canonical_element_index(None)
+        ):
+            raise ImageOptimizationOutputError(
+                "project index output is missing or invalid"
+            )
+        element_index = _canonical_element_index(raw_element_index)
+        filter_diagnostics = _element_index_filter_diagnostics(
+            raw_element_index, element_index
+        )
+        if filter_diagnostics is not None:
+            error_trace.record(
+                session / "work" / "errors" / "project-index-filtered.json",
+                call_path=["pipeline", session.name, "project_index", "filter"],
+                reason=filter_diagnostics,
+                logger=_LOGGER,
+            )
 
     request_segments = [{
         "index": segment["index"],

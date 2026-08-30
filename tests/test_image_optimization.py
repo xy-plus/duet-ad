@@ -3100,3 +3100,23 @@ def test_semantic_scene_uses_dominant_segment_occurrence_not_lexical_first(
         element_index=element_index,
     )
     assert plan["eligible"] is True
+
+
+def test_retryable_output_error_retries_only_the_failed_image_phase():
+    calls = []
+
+    def operation():
+        calls.append("segment-2")
+        if len(calls) == 1:
+            raise image_optimization.ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        return {"frames": {}}
+
+    assert image_optimization._run_image_skill_phase_with_retry(
+        operation,
+        phase="segment_frames[2]",
+        retry_count=1,
+        retry_interval_s=0,
+    ) == {"frames": {}}
+    assert calls == ["segment-2", "segment-2"]

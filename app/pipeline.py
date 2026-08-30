@@ -661,18 +661,23 @@ def _generate_project_element_index(
             encoding="utf-8",
         )
         isolated_output = isolated_work / "element_index.json"
-        if hasattr(runner, "run_isolated_until_output"):
-            def validate(raw_output: bytes) -> bytes:
-                try:
-                    value = json.loads(raw_output.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    raise ValueError("project index output is invalid") from None
-                if not isinstance(value, dict) or set(value) != {
-                    "people", "entities", "scenes", "relations"
-                }:
-                    raise ValueError("project index output is invalid")
-                return raw_output
+        def validate(raw_output: bytes) -> bytes:
+            try:
+                value = json.loads(raw_output.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError("project index output is invalid") from None
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"people", "entities", "scenes", "relations"}
+                or any(
+                    not isinstance(value[key], dict)
+                    for key in ("people", "entities", "scenes", "relations")
+                )
+            ):
+                raise ValueError("project index output is invalid")
+            return raw_output
 
+        if hasattr(runner, "run_isolated_until_output"):
             staged_data = runner.run_isolated_until_output(
                 isolated_root,
                 _project_index_codex_prompt(isolated_root),
@@ -687,7 +692,12 @@ def _generate_project_element_index(
                 _project_index_codex_prompt(isolated_root),
                 session_dir=cdir,
             )
-            staged_data = isolated_output.read_bytes()
+            try:
+                staged_data = validate(isolated_output.read_bytes())
+            except (OSError, ValueError) as exc:
+                raise PipelineError(
+                    "project index output is missing or invalid", retryable=True,
+                ) from exc
         staged = target.with_name(".element_index.tmp")
         try:
             staged.write_bytes(staged_data)
@@ -1152,8 +1162,26 @@ def _generate_image_optimization_project(
         }
         if video_skill_bytes is None:
             raise PipelineError("frozen video-maker Skill is required")
-        element_index_path = _generate_project_element_index(
-            runner, session_dir, frame_paths, skill_bytes=video_skill_bytes,
+        def generate_element_index() -> Path:
+            try:
+                return _generate_project_element_index(
+                    runner, session_dir, frame_paths, skill_bytes=video_skill_bytes,
+                )
+            except Exception as exc:
+                error_trace.record(
+                    session_dir / "work" / "errors" / "project-index.json",
+                    call_path=["pipeline", session_dir.name, "project_index"],
+                    error=exc,
+                    logger=log,
+                )
+                raise
+
+        policy = _retry_policy(settings)
+        element_index_path = run_with_retry(
+            generate_element_index,
+            policy=policy,
+            is_retryable=_retryable_operation_error,
+            on_retry=_retry_logger("project index", policy),
         )
     def attempt() -> tuple[dict | None, dict]:
         try:
@@ -1178,7 +1206,7 @@ def _generate_image_optimization_project(
         except CodexError as exc:
             raise PipelineError(str(exc), retryable=False) from None
         except Exception as exc:
-            _LOGGER.exception("image optimization planner failed")
+            log.exception("image optimization planner failed")
             raise PipelineError(
                 f"image optimization planner failed: {type(exc).__name__}",
                 retryable=False,
@@ -3639,7 +3667,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
             work / "errors" / "pipeline.json",
             call_path=["pipeline", cid],
             error=e,
-            logger=_LOGGER,
+            logger=log,
         )
         if claim_owner is not None:
             storage.finish_input_claim(
