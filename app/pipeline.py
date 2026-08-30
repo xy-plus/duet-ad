@@ -1,7 +1,8 @@
 """处理流水线：queued → processing → done|failed。
 
 步骤：extract_keyframes --fps 4 抽帧 + 分页联系表 → （voice_mode ≠ none 时）抽音轨 +
-codex 听写台词（voice_lines.json 白名单校验，落 meta.voice_lines）→ scenes.py 场景检测
+本地 ASR 听写；rewrite/translate 再经 schema-only Codex 改写，后端绑定时间轴并原子发布
+voice_lines.json → scenes.py 场景检测
 （work/scenes.json）→ 按 segments 决定模式：
 - 单段模式（segments 空）：codex 沙箱按 SKILL.md 选帧/写 prompt → 后端白名单校验 →
   meta 落盘（work/keyframes + work/prompt.txt，保持视觉 prompt 原文）。
@@ -48,7 +49,6 @@ import numpy as np
 from app import asr, codex_output_schemas, dialogue_review, error_trace, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
 from app.codex_runner import (
     CodexError,
-    CodexOutputError,
     CodexOutputValidationError,
     clean_stderr,
 )
@@ -393,8 +393,8 @@ class _EmptyTranscript(PipelineError):
 def _codex_output_error(stage: str) -> PipelineError:
     """把 Codex 成功退出后的产物问题归到正确阶段，不暴露内部文件校验细节。"""
     details = {
-        "voice": "required voice_lines artifact is missing or invalid",
-        "visual": "required keyframes/prompt artifacts are missing or invalid",
+        "voice": "required dialogue final answer is missing or invalid",
+        "visual": "required visual prompt final answer is missing or invalid",
     }
     detail = details[stage]
     return PipelineError(f"codex {stage} output invalid: {detail}", retryable=True)
@@ -588,7 +588,8 @@ def _codex_prompt(
     skill_path: Path | None = None,
 ) -> str:
     parts = [
-        "按当前隔离目录的 SKILL.md 执行（该文档只读，禁止修改；「只读」指文档本身，不是执行模式）。输入在 work/，产物（keyframes/ 与 prompt.txt）必须按文档写入 work/。"
+        "按当前隔离目录的 SKILL.md 执行（该文档只读，禁止修改）。"
+        "输入在 work/；最终回答必须严格服从注入的 JSON Schema，禁止创建或修改业务输出文件。"
     ]
     if target_language:
         parts.append(_language_note(target_language))
@@ -1068,9 +1069,16 @@ def _run_visual_codex(
     skill_bytes: bytes,
     frozen_keyframes: tuple[bytes, ...] | None = None,
 ) -> None:
-    """Run visual Codex in a single-use /tmp stage and adopt only its outputs."""
-    if not callable(getattr(runner, "run_isolated", None)):
-        raise PipelineError("visual Codex isolation unavailable")
+    """Publish one validated final-answer prompt against backend-frozen frames."""
+    if not callable(getattr(runner, "run_isolated_until_output", None)):
+        raise PipelineError("visual Codex structured output unavailable")
+    if (
+        frozen_keyframes is None
+        or len(frozen_keyframes) != scene_planner.KEYFRAMES_PER_SEGMENT
+        or any(not isinstance(data, bytes) or not data for data in frozen_keyframes)
+    ):
+        raise PipelineError("backend frozen keyframes are required")
+    _restore_backend_keyframes(work, frozen_keyframes)
     with tempfile.TemporaryDirectory(prefix="duet-visual-", dir="/tmp") as raw:
         stage = Path(raw).resolve(strict=True)
         stage_work = stage / "work"
@@ -1092,50 +1100,36 @@ def _run_visual_codex(
         _copy_visual_tree(cdir / "scripts", stage / "scripts", skip=set())
         stage_keyframes = stage_work / "keyframes"
         stage_keyframes.mkdir(mode=0o700)
-        writable: list[Path] = []
-        if frozen_keyframes is not None:
-            if len(frozen_keyframes) != scene_planner.KEYFRAMES_PER_SEGMENT:
-                raise PipelineError("backend frozen keyframes are invalid")
-            for order, data in enumerate(frozen_keyframes, 1):
-                _materialize_skill_bytes(
-                    stage_keyframes / f"{order:02d}.png",
-                    _analysis_keyframe_proxy(data),
-                )
-        else:
-            for order in range(1, scene_planner.KEYFRAMES_PER_SEGMENT + 1):
-                path = stage_keyframes / f"{order:02d}.png"
-                path.touch(mode=0o600)
-                writable.append(path)
-        stage_prompt = stage_work / "prompt.txt"
-        stage_prompt.touch(mode=0o600)
-        writable.insert(0, stage_prompt)
-        run_error: CodexError | None = None
+        for order, data in enumerate(frozen_keyframes, 1):
+            _materialize_skill_bytes(
+                stage_keyframes / f"{order:02d}.png",
+                _analysis_keyframe_proxy(data),
+            )
+
+        def validate(raw_output: bytes) -> str:
+            try:
+                value = json.loads(raw_output.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise CodexOutputValidationError(
+                    "visual_prompt_json_invalid",
+                    "/prompt",
+                    message="visual prompt output is invalid",
+                ) from None
+            return codex_output_schemas.normalize_visual_prompt(value)
+
         try:
-            runner.run_isolated(
+            visual_prompt = runner.run_isolated_until_output(
                 stage,
                 prompt,
                 session_dir=cdir,
-                writable_paths=tuple(writable),
+                output_path=stage_work / "visual_prompt.json",
+                max_output_bytes=MAX_PROMPT_BYTES + 1024,
+                validate_output=validate,
+                output_schema=codex_output_schemas.VISUAL_PROMPT_SCHEMA,
             )
-        except CodexError as error:
-            run_error = error
-        try:
-            names, text = validate_work_dir(
-                stage_work,
-                expected_keyframe_count=(
-                    scene_planner.KEYFRAMES_PER_SEGMENT
-                    if frozen_keyframes is not None else None
-                ),
-            )
-        except PipelineError:
-            if run_error is not None:
-                raise run_error from None
-            raise
-        _remove_local_path(work / "keyframes")
-        (work / "keyframes").mkdir(mode=0o700)
-        for name in names:
-            _copy_visual_regular(stage_work / "keyframes" / name, work / "keyframes" / name)
-        _materialize_skill_bytes(work / "prompt.txt", text.encode("utf-8"))
+        except (CodexOutputValidationError, UnicodeDecodeError, json.JSONDecodeError):
+            raise _codex_output_error("visual") from None
+        _atomic_bytes(work / "prompt.txt", visual_prompt.encode("utf-8"))
 
 
 def _clear_visual_outputs(
@@ -1620,27 +1614,26 @@ def _generate_segmented_image_prompts(
 
 
 def _voice_prompt(_cdir: Path, voice_mode: str, target_language: str, duration_s: float) -> str:
-    """口播步 codex prompt：只使用隔离区内的音频输入，不暴露原会话路径。"""
-    if voice_mode == "keep":
-        rule = "原文保持：只修正错别字与标点，不改写措辞。"
-    elif voice_mode == "rewrite":
+    """Rewrite/translate frozen local-ASR text without echoing backend fields."""
+    if voice_mode == "rewrite":
         rule = (
-            "洗稿：把台词改写得更自然；句数不变、句序不变、每句时间边界不变；"
+            "洗稿：把台词改写得更自然；文本条目数与顺序不变；"
             "产品和工具使用准确的通用称呼，不保留未经确认的夸张别名。"
         )
-    else:  # translate
-        rule = f"翻译成{target_language}：句对句对齐，每句时间边界不变。"
-    return f"""听写并处理视频台词。输入：work/voice.mp3（源视频音轨，16kHz 单声道）与 work/manifest.json（源视频元信息，供参考）。音频时长约 {duration_s:.3f} 秒。
+    elif voice_mode == "translate":
+        rule = f"翻译成{target_language}：逐条对齐，文本条目数与顺序不变。"
+    else:
+        raise PipelineError("dialogue model phase is only available for rewrite/translate")
+    return f"""处理后端已冻结的本地听写文本。输入：work/dialogue_request.json。源音频时长约 {duration_s:.3f} 秒，仅供理解上下文。
 
 任务：
-- 自动识别实际语言并听写音频中的人声台词，按句切分；必须支持中文、英文、西班牙语、马来语及其他源音频语言；
-- 每句标出起止时间（秒，从音频开头起算）；
 - {rule}
-- `[无法辨识]`、`[无法识别]`、`[inaudible]`、`[unintelligible]` 等只是失败占位符，禁止作为 text 输出；无法得到任何可靠原文时输出空数组 `[]`；
-- 输出 work/voice_lines.json（UTF-8）：JSON 数组 [{{"text": "...", "start_s": 0.5, "end_s": 2.1}}]，0 ≤ start_s < end_s ≤ 音频时长，按 start_s 升序，覆盖人声区间；不写其他文件。
+- `lines` 每项只填写一个完整自然语言台词 `content`；不要拆词、拼接、重排，
+  不要输出或猜测 ID、原台词、帧序、起止时间。
+- 最终回答严格服从注入的 JSON Schema；禁止创建或修改业务输出文件。
 
 硬性禁令：
-- 只在当前音频专用工作区内创建/修改文件。
+- 只读取当前隔离工作区内的声明输入。
 - 禁止联网（沙箱已断网，联网必然失败）。
 - 禁止打印、读取或记录任何环境变量。
 """
@@ -1650,19 +1643,54 @@ def _run_voice_attempt(
     runner,
     work: Path,
     prompt: str,
-    duration_s: float,
+    source_lines: list[dict],
 ) -> list[dict]:
-    """在音频隔离区听写；成功退出后的缺失/非法产物稳定归因为 voice 输出错误。"""
+    """Run one schema-only dialogue text phase over backend-frozen lines."""
+    if not source_lines:
+        return []
+    if not callable(getattr(runner, "run_isolated_until_output", None)):
+        raise PipelineError("voice Codex structured output unavailable")
+    session_dir = work.parent
     try:
-        return runner.run_voice(
-            work,
-            prompt,
-            duration_s=duration_s,
-            validate_output=lambda raw: voice.validate_voice_lines(raw, duration_s),
-        )
+        with tempfile.TemporaryDirectory(prefix="duet-dialogue-", dir="/tmp") as raw:
+            stage = Path(raw).resolve(strict=True)
+            stage_work = stage / "work"
+            stage_work.mkdir(mode=0o700)
+            request = {
+                "lines": [{"content": line["text"]} for line in source_lines],
+            }
+            (stage_work / "dialogue_request.json").write_text(
+                json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+            def validate(raw_output: bytes) -> list[dict]:
+                try:
+                    value = json.loads(raw_output.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    raise CodexOutputValidationError(
+                        "dialogue_json_invalid",
+                        "/lines",
+                        message="dialogue output is invalid",
+                    ) from None
+                return codex_output_schemas.normalize_dialogue_lines(
+                    value, source_lines=source_lines,
+                )
+
+            return runner.run_isolated_until_output(
+                stage,
+                prompt,
+                session_dir=session_dir,
+                output_path=stage_work / "voice_lines.json",
+                max_output_bytes=voice.MAX_VOICE_LINES_BYTES,
+                validate_output=validate,
+                output_schema=codex_output_schemas.dialogue_lines_schema(
+                    line_count=len(source_lines),
+                ),
+            )
     except CodexError:
         raise
-    except (CodexOutputError, PipelineError, OSError):
+    except (CodexOutputValidationError, PipelineError, OSError):
         raise _codex_output_error("voice") from None
 
 
@@ -1674,25 +1702,40 @@ def _transcribe_voice_attempt(
     duration_s: float,
     voice_mode: str,
 ) -> list[dict]:
-    """Use deterministic local multilingual ASR for keep mode when configured."""
-    if (settings.asr_cli is None) != (settings.asr_model is None):
-        raise PipelineError("local ASR configuration incomplete")
-    if voice_mode == "keep" and settings.asr_cli is not None:
-        try:
-            lines = asr.transcribe(
-                work / "voice.mp3",
-                cli=settings.asr_cli,
-                model=settings.asr_model,
-                duration_s=duration_s,
-                timeout_s=settings.asr_timeout_s,
-                threads=settings.asr_threads,
-                process_budget=settings.asr_process_budget,
-            )
-            raw = json.dumps(lines, ensure_ascii=False).encode("utf-8")
-            return voice.validate_voice_lines(raw, duration_s)
-        except asr.ASRError as exc:
-            raise PipelineError(str(exc), retryable=exc.retryable) from None
-    return _run_voice_attempt(runner, work, prompt, duration_s)
+    """Use deterministic local multilingual ASR for every dialogue mode."""
+    if settings.asr_cli is None or settings.asr_model is None:
+        raise PipelineError("local ASR is required for dialogue transcription")
+    try:
+        lines = asr.transcribe(
+            work / "voice.mp3",
+            cli=settings.asr_cli,
+            model=settings.asr_model,
+            duration_s=duration_s,
+            timeout_s=settings.asr_timeout_s,
+            threads=settings.asr_threads,
+            process_budget=settings.asr_process_budget,
+        )
+        raw = json.dumps(lines, ensure_ascii=False).encode("utf-8")
+        return voice.validate_voice_lines(raw, duration_s)
+    except asr.ASRError as exc:
+        raise PipelineError(str(exc), retryable=exc.retryable) from None
+
+
+def _transform_voice_with_retry(
+    settings: Settings,
+    runner,
+    work: Path,
+    prompt: str,
+    source_lines: list[dict],
+) -> list[dict]:
+    """Retry only the model text phase; never repeat successful local ASR."""
+    policy = _retry_policy(settings)
+    return run_with_retry(
+        lambda: _run_voice_attempt(runner, work, prompt, source_lines),
+        policy=policy,
+        is_retryable=_retryable_operation_error,
+        on_retry=_retry_logger("voice rewrite/translate", policy),
+    )
 
 
 def _vocal_filter_enabled() -> bool:
@@ -1807,7 +1850,10 @@ def _normalize_voice_timeline(
                 }
             )
 
-    normalized_lines = voice.validate_voice_lines(
+    # Reuse the existing business validator for shape/timeline bounds, but do
+    # not adopt its historical whitespace normalization: structured dialogue
+    # content is published character-for-character exactly as the model returned it.
+    voice.validate_voice_lines(
         json.dumps(effective_lines, ensure_ascii=False).encode("utf-8"), duration_s
     )
     warnings = []
@@ -1819,16 +1865,16 @@ def _normalize_voice_timeline(
                 dropped=dropped,
             )
         )
-    return normalized_lines, normalized_decisions, warnings
+    return effective_lines, normalized_decisions, warnings
 
 
 def _voice_step(
     settings: Settings, cid: str, cdir: Path, work: Path, runner,
     voice_mode: str, target_language: str, *, allow_no_audio: bool = False,
 ) -> list[dict]:
-    """口播步（抽帧后）：抽音轨 → 声学预判 → codex 听写 → 白名单校验 → voice_lines 落 meta。
+    """口播步：抽音轨 → 本地 ASR → 可选 schema-only 改写 → 后端发布。
 
-    台词时间戳在音频时间轴上（codex 听 voice.mp3），校验基准与提示词时长用音频实际时长
+    台词时间戳在音频时间轴上，校验基准与提示词时长用音频实际时长
     （音频流可比容器长几十 ms，常态）；YAMNet 分类后再把最终行裁到 manifest 视频时间轴。
     空台词数组且音轨有人声证据 → 按统一策略重试，再空则写 warning 后以无台词继续。新 auto
     契约下无音轨同样是合法空台词；旧 voice_mode 可保留严格失败行为。返回白名单净化后的台词列表。
@@ -1844,7 +1890,7 @@ def _voice_step(
         if not allow_no_audio:
             raise PipelineError("source video has no audio track")
         (work / "voice.mp3").unlink(missing_ok=True)
-        (work / "voice_lines.json").write_text("[]\n", encoding="utf-8")
+        _atomic_bytes(work / "voice_lines.json", b"[]\n")
         storage.update_meta(
             settings.data_dir,
             cid,
@@ -1902,16 +1948,23 @@ def _voice_step(
     ):
         raise PipelineError("vocal analysis audio drifted")
     has_vocal = _has_retryable_vocal_evidence(analysis)
-    prompt = _voice_prompt(cdir, voice_mode, target_language, audio_duration_s)
     lines, unrecognized = _transcribe_voice_with_retry(
         settings,
         runner,
         work,
-        prompt,
+        "",
         audio_duration_s,
         voice_mode,
         has_vocal=has_vocal,
     )
+    if lines and voice_mode in {"rewrite", "translate"}:
+        lines = _transform_voice_with_retry(
+            settings,
+            runner,
+            work,
+            _voice_prompt(cdir, voice_mode, target_language, audio_duration_s),
+            lines,
+        )
     warnings = [EMPTY_TRANSCRIPT_WARNING] if not lines and has_vocal else []
     if unrecognized:
         warnings.append(UNRECOGNIZED_TRANSCRIPT_WARNING)
@@ -1966,9 +2019,11 @@ def _voice_step(
         decision.get("drop_reason") == "subtitle_credit" for decision in decisions
     )
     # 后续视觉步骤看到的 voice_lines 也只能是最终有效集，不能重新收养已过滤行。
-    (work / "voice_lines.json").write_text(
-        json.dumps(filtered_lines, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    _atomic_bytes(
+        work / "voice_lines.json",
+        (json.dumps(filtered_lines, ensure_ascii=False, indent=2) + "\n").encode(
+            "utf-8"
+        ),
     )
 
     changes = {
@@ -2709,8 +2764,9 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
         anchor_frames = _read_segment_anchor_frames(segwork) if new_input_contract else None
         # 该段台词（白名单净化后；lines 为 None = 无口播，不写文件）
         if lines is not None:
-            (segwork / "voice_lines.json").write_text(
-                json.dumps(lines, ensure_ascii=False, indent=2), encoding="utf-8"
+            _atomic_bytes(
+                segwork / "voice_lines.json",
+                json.dumps(lines, ensure_ascii=False, indent=2).encode("utf-8"),
             )
         # 裁剪工具按 scripts/crop_image.py 相对 cwd 引用：scripts/ 拷入段目录
         _replace_scripts(work.parent, segdir)

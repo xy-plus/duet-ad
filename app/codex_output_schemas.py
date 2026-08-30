@@ -36,6 +36,104 @@ _BOOL = {"type": "boolean"}
 _TEXTS = _array(_TEXT, maximum=20)
 
 
+# Per-segment video-maker transport.  Segment identity and ordered keyframes
+# are frozen by the backend invocation and deliberately absent here.
+VISUAL_PROMPT_SCHEMA = _object({
+    "prompt": {"type": "string", "minLength": 1, "maxLength": 32768},
+})
+
+
+def dialogue_lines_schema(*, line_count: int) -> dict:
+    """Wrap complete model-owned lines without backend fields or text surgery."""
+    if (
+        isinstance(line_count, bool)
+        or not isinstance(line_count, int)
+        or not 1 <= line_count <= 200
+    ):
+        raise ValueError("dialogue line count is invalid")
+    return _object({
+        "lines": _array(
+            _object({
+                "content": {"type": "string", "minLength": 1, "maxLength": 500},
+            }),
+            minimum=line_count,
+            maximum=line_count,
+        ),
+    })
+
+
+def _reject(reason: str, field_path: str, message: str) -> None:
+    raise CodexOutputValidationError(reason, field_path, message=message)
+
+
+def normalize_visual_prompt(value: object) -> str:
+    """Accept only model-owned visual prose; backend bindings stay implicit."""
+    if not isinstance(value, dict) or set(value) != {"prompt"}:
+        _reject(
+            "visual_prompt_shape_invalid",
+            "/prompt",
+            "visual prompt output is invalid",
+        )
+    prompt = value["prompt"]
+    if not isinstance(prompt, str):
+        _reject(
+            "visual_prompt_type_invalid",
+            "/prompt",
+            "visual prompt output is invalid",
+        )
+    if not prompt:
+        _reject("visual_prompt_empty", "/prompt", "visual prompt output is invalid")
+    if len(prompt.encode("utf-8")) > 32 * 1024:
+        _reject("visual_prompt_oversize", "/prompt", "visual prompt output is invalid")
+    return prompt
+
+
+def normalize_dialogue_lines(
+    value: object, *, source_lines: Iterable[Mapping[str, object]],
+) -> list[dict]:
+    """Positionally bind untouched model content to backend-frozen line data."""
+    if isinstance(source_lines, (str, bytes)):
+        _reject("dialogue_source_invalid", "/lines", "dialogue output is invalid")
+    try:
+        frozen = [dict(line) for line in source_lines]
+    except (TypeError, ValueError):
+        _reject("dialogue_source_invalid", "/lines", "dialogue output is invalid")
+    if not 1 <= len(frozen) <= 200:
+        _reject("dialogue_source_invalid", "/lines", "dialogue output is invalid")
+    for index, line in enumerate(frozen):
+        if (
+            not isinstance(line.get("text"), str)
+            or isinstance(line.get("start_s"), bool)
+            or not isinstance(line.get("start_s"), (int, float))
+            or isinstance(line.get("end_s"), bool)
+            or not isinstance(line.get("end_s"), (int, float))
+        ):
+            _reject(
+                "dialogue_source_invalid",
+                f"/lines/{index}",
+                "dialogue output is invalid",
+            )
+    if not isinstance(value, dict) or set(value) != {"lines"}:
+        _reject("dialogue_shape_invalid", "/lines", "dialogue output is invalid")
+    lines = value["lines"]
+    if not isinstance(lines, list) or len(lines) != len(frozen):
+        _reject("dialogue_count_invalid", "/lines", "dialogue output is invalid")
+    normalized: list[dict] = []
+    for index, (line, output_line) in enumerate(zip(frozen, lines, strict=True)):
+        path = f"/lines/{index}/content"
+        if not isinstance(output_line, dict) or set(output_line) != {"content"}:
+            _reject("dialogue_line_shape_invalid", path, "dialogue output is invalid")
+        content = output_line["content"]
+        if not isinstance(content, str):
+            _reject("dialogue_content_type_invalid", path, "dialogue output is invalid")
+        if not content:
+            _reject("dialogue_content_empty", path, "dialogue output is invalid")
+        if len(content) > 500:
+            _reject("dialogue_content_oversize", path, "dialogue output is invalid")
+        normalized.append({**line, "text": content})
+    return normalized
+
+
 _ELEMENT_OCCURRENCE = _object({
     "segment_index": _INT0,
     "frame_orders": _array(_INT1, minimum=1, maximum=9),

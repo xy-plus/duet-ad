@@ -13,15 +13,14 @@ def _text() -> str:
     return SKILL.read_text(encoding="utf-8")
 
 
-def test_segment_contract_keeps_original_analysis_outputs():
+def test_segment_contract_keeps_backend_authority_and_schema_output():
     text = _text()
     for required in (
-        "segments[N>=1]", "work/NN_frame_*.png", "恰好 9 张不同原始帧",
-        "work/keyframes/01.png", "09.png", "逐字节复制", "work/prompt.txt",
-        "动作因果", "segment 时间轴",
+        "segments[N>=1]", "work/keyframes/01.png", "09.png", "由后端负责",
+        "JSON Schema", "禁止创建或修改", "动作因果", "segment 时间轴",
     ):
         assert required in text
-    for forbidden in ("H3", "Context IR", "multimodal_input.json"):
+    for forbidden in ("H3", "Context IR", "multimodal_input.json", "写 `work/prompt.txt`"):
         assert forbidden not in text
 
 
