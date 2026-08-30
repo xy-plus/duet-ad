@@ -1659,14 +1659,66 @@ input, textarea { font-family: inherit; }
 
 /* ===== Composer ===== */
 .composer-dock {
+  position: relative;
   flex-shrink: 0;
   padding: 8px 16px 14px;
   background: rgba(245, 245, 247, .85);
   -webkit-backdrop-filter: blur(20px);
   backdrop-filter: blur(20px);
+  transition: padding .2s ease, background-color .2s ease;
 }
 
 .composer-dock.is-dialogue-review-waiting { display: none; }
+
+.composer-dock.is-collapsed {
+  min-height: 18px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+.composer-toggle {
+  position: absolute;
+  z-index: 22;
+  top: -22px;
+  left: 50%;
+  min-width: 76px;
+  min-height: 32px;
+  padding: 5px 12px;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .96);
+  box-shadow: 0 3px 12px rgba(0, 0, 0, .12);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.composer-toggle:hover { color: var(--accent); border-color: rgba(0, 113, 227, .35); }
+.composer-toggle:focus-visible { outline: 3px solid rgba(0, 113, 227, .28); outline-offset: 2px; }
+.composer-toggle:disabled { cursor: default; opacity: .55; }
+
+.composer-toggle-chevron {
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform .2s ease, margin .2s ease;
+}
+
+.composer-dock.is-collapsed .composer-toggle-chevron {
+  margin-top: 4px;
+  transform: rotate(-135deg);
+}
 
 .composer-inner {
   max-width: 768px;

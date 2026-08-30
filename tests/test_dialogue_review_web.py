@@ -187,3 +187,57 @@ def test_timeline_and_mobile_layout_make_wait_explicit():
     assert ".dialogue-review-line" in css
     mobile = css.split("@media (max-width: 768px)", 1)[1]
     assert ".dialogue-review-policy { grid-template-columns: 1fr; }" in mobile
+
+
+def test_composer_drawer_toggle_is_accessible_and_mobile_safe():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    assert 'id="composer-toggle"' in html
+    assert 'aria-controls="composer-panel"' in html
+    assert 'aria-expanded="true"' in html
+    assert 'aria-label="收起创建抽屉"' in html
+
+    source = APP_JS.read_text(encoding="utf-8")
+    assert 'panel.hidden = !next' in source
+    assert 'setComposerExpanded(true)' in source
+
+    css = STYLES.read_text(encoding="utf-8")
+    assert ".composer-dock.is-collapsed" in css
+    assert "min-height: 32px" in css
+
+
+def test_composer_drawer_dom_collapses_only_its_panel():
+
+    result = _run_jsdom_contract(
+        "(()=>{document.body.innerHTML='<div class=\"composer-dock\">' +"
+        "'<button id=\"composer-toggle\" aria-controls=\"composer-panel\" aria-expanded=\"true\">' +"
+        "'<span id=\"composer-toggle-label\">收起</span></button>' +"
+        "'<div id=\"composer-panel\">内容</div></div>';"
+        "const collapsed=contract.setComposerExpanded(false);"
+        "const afterCollapse={collapsed,hidden:document.getElementById('composer-panel').hidden,"
+        "className:document.querySelector('.composer-dock').className,"
+        "expanded:document.getElementById('composer-toggle').getAttribute('aria-expanded'),"
+        "label:document.getElementById('composer-toggle').getAttribute('aria-label'),"
+        "text:document.getElementById('composer-toggle-label').textContent};"
+        "const expanded=contract.setComposerExpanded(true);"
+        "return {afterCollapse,afterExpand:{expanded,hidden:document.getElementById('composer-panel').hidden,"
+        "className:document.querySelector('.composer-dock').className,"
+        "aria:document.getElementById('composer-toggle').getAttribute('aria-expanded'),"
+        "label:document.getElementById('composer-toggle').getAttribute('aria-label')}}})()"
+    )
+    assert result == {
+        "afterCollapse": {
+            "collapsed": False,
+            "hidden": True,
+            "className": "composer-dock is-collapsed",
+            "expanded": "false",
+            "label": "展开创建抽屉",
+            "text": "展开",
+        },
+        "afterExpand": {
+            "expanded": True,
+            "hidden": False,
+            "className": "composer-dock",
+            "aria": "true",
+            "label": "收起创建抽屉",
+        },
+    }

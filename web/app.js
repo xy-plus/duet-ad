@@ -1449,6 +1449,23 @@ function closeDrawer() {
   $("menu-btn").setAttribute("aria-expanded", "false");
 }
 
+/* ===== 底部创建抽屉 ===== */
+function setComposerExpanded(expanded) {
+  const dock = document.querySelector(".composer-dock");
+  const toggle = $("composer-toggle");
+  const panel = $("composer-panel");
+  if (!dock || !toggle || !panel) return false;
+  const next = expanded === true;
+  dock.classList.toggle("is-collapsed", !next);
+  panel.hidden = !next;
+  toggle.setAttribute("aria-expanded", String(next));
+  const action = next ? "收起创建抽屉" : "展开创建抽屉";
+  toggle.setAttribute("aria-label", action);
+  toggle.title = action;
+  $("composer-toggle-label").textContent = next ? "收起" : "展开";
+  return next;
+}
+
 /* ===== Stream 渲染 ===== */
 function clearStream() {
   closeLightbox({ restoreFocus: false });
@@ -1460,6 +1477,7 @@ function renderEmptyHero() {
   stopPolling();
   hideOperationHeader();
   document.querySelector(".composer-dock").classList.remove("is-dialogue-review-waiting");
+  setComposerExpanded(true);
   clearStream();
   $("main-title").textContent = "视频工作室";
 
@@ -4386,6 +4404,7 @@ function clearFile() {
 
 function setUploading(on) {
   state.uploading = on;
+  $("composer-toggle").disabled = on;
   $("attach-btn").disabled = on;
   $("note-input").disabled = on;
   $("url-input").disabled = on;
@@ -4580,6 +4599,9 @@ function bindEvents() {
 
   $("menu-btn").addEventListener("click", openDrawer);
   $("drawer-backdrop").addEventListener("click", closeDrawer);
+  $("composer-toggle").addEventListener("click", () => {
+    setComposerExpanded($("composer-toggle").getAttribute("aria-expanded") !== "true");
+  });
 
   $("new-chat-btn").addEventListener("click", async () => {
     if (state.uploading) return;
@@ -4762,6 +4784,7 @@ if (typeof module !== "undefined" && module.exports) {
     saveImageOptimizationPrompt,
     segmentProductsDisclosure,
     segmentJoinText,
+    setComposerExpanded,
     setDisclosureState,
     showActionError,
     shouldRenderPostprocessAsk,

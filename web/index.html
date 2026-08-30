@@ -68,7 +68,12 @@
     <div id="stream" class="stream" aria-live="polite"></div>
 
     <div class="composer-dock">
-      <div class="composer-inner">
+      <button id="composer-toggle" class="composer-toggle" type="button"
+              aria-controls="composer-panel" aria-expanded="true" aria-label="收起创建抽屉" title="收起创建抽屉">
+        <span class="composer-toggle-chevron" aria-hidden="true"></span>
+        <span id="composer-toggle-label">收起</span>
+      </button>
+      <div id="composer-panel" class="composer-inner">
         <p id="composer-error" class="inline-error" role="alert" hidden></p>
         <form id="composer" class="composer" novalidate>
           <div class="source-switch" role="radiogroup" aria-label="视频来源">
