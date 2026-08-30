@@ -3,7 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import AUTH, make_settings
-from app import main as main_module, skill_milestone, storage
+from app import main as main_module, storage
 from app.main import create_app
 
 
@@ -64,35 +64,37 @@ def test_detail_shape_has_no_context_ir_contract(client, video_1s):
             "dialogue", "dialogue_review", "receipt_version", "generation", "has_source", "has_video",
         "navigation_status", "submit_enabled", "postprocess", "postprocess_enabled",
         "postprocess_capabilities", "image_optimization_prompt",
-            "image_acceptance", "skill_milestone",
+            "image_acceptance", "element_index",
             "generation_config", "generation_config_sha256",
         }
     assert body["generation"] is None
     assert body["has_source"] is True
     assert 0.9 <= body["duration_s"] <= 1.1
-    assert body["skill_milestone"] is None
+    assert body["element_index"] is None
+    assert "skill_milestone" not in body
 
 
-def test_detail_skill_milestone_reads_cid_frozen_manifest_after_live_source_drift(
-    tmp_path,
-):
+def test_detail_returns_backend_published_element_index(tmp_path):
     settings = make_settings(tmp_path)
     meta = storage.new_conversation(
         settings.data_dir, note="frozen", orig_name="a.mp4",
     )
     root = settings.data_dir / meta["id"]
-    source_root = tmp_path / "skill-repo"
-    for name in skill_milestone.SKILL_NAMES:
-        source = source_root / "skills" / name / "SKILL.md"
-        source.parent.mkdir(parents=True, exist_ok=True)
-        source.write_bytes(f"initial {name}\n".encode())
-    frozen = skill_milestone.freeze(
-        root, repository_root=source_root, git_commit=None,
+    element_index = {
+        "people": {"person-01": {"description": "人物", "occurrences": []}},
+        "entities": {"entity-01": {"description": "杯子", "occurrences": []}},
+        "scenes": {"scene-01": {"description": "室内", "occurrences": []}},
+        "relations": {
+            "relation-01": {
+                "subject_key": "person-01", "predicate": "拿着",
+                "object_key": "entity-01",
+            }
+        },
+    }
+    (root / "work").mkdir(parents=True, exist_ok=True)
+    (root / "work" / "element_index.json").write_text(
+        json.dumps(element_index, ensure_ascii=False), encoding="utf-8",
     )
-    for name in skill_milestone.SKILL_NAMES:
-        (source_root / "skills" / name / "SKILL.md").write_bytes(
-            f"drifted {name}\n".encode()
-        )
 
     with TestClient(create_app(settings)) as client:
         response = client.get(
@@ -100,15 +102,9 @@ def test_detail_skill_milestone_reads_cid_frozen_manifest_after_live_source_drif
         )
 
     assert response.status_code == 200
-    summary = response.json()["skill_milestone"]
-    assert summary == frozen.public_summary()
-    assert summary["id"] == frozen.milestone_id
-    assert [item["name"] for item in summary["skills"]] == list(
-        skill_milestone.SKILL_NAMES
-    )
-    assert all(set(item) == {"name", "sha256", "size"} for item in summary["skills"])
-    assert "source_path" not in json.dumps(summary)
-    assert "frozen_path" not in json.dumps(summary)
+    body = response.json()
+    assert body["element_index"] == element_index
+    assert "skill_milestone" not in body
 
 
 @pytest.mark.parametrize(

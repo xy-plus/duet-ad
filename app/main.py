@@ -299,15 +299,12 @@ def _public_lines(value) -> list[dict]:
     return lines
 
 
-def _public_skill_milestone(cdir: Path) -> dict | None:
-    """Expose only the validated CID-local Skill freeze, never live sources."""
-    manifest_path = cdir / skill_milestone.MANIFEST_RELATIVE_PATH
-    if not manifest_path.exists():
+def _public_element_index(cdir: Path) -> dict | None:
+    """Return the backend-published project index without prompt inference."""
+    path = cdir / "work" / "element_index.json"
+    if not path.is_file():
         return None
-    try:
-        return skill_milestone.load(cdir).public_summary()
-    except skill_milestone.SkillMilestoneError:
-        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _automatic_public_lines(meta: dict) -> list[dict]:
@@ -4430,7 +4427,7 @@ def create_app(settings: Settings) -> FastAPI:
             "fit_profiles": fit_profiles,
             "dialogue": _public_dialogue(meta),
             "dialogue_review": _public_dialogue_review(meta),
-            "skill_milestone": _public_skill_milestone(cdir),
+            "element_index": _public_element_index(cdir),
             "receipt_version": _receipt_version(cdir, meta),
             "generation": _public_generation(meta, cdir, settings),
             "has_source": any(cdir.glob("source.*")),
