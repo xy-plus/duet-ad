@@ -90,8 +90,9 @@ def test_postprocess_done_wires_lazy_results_only_when_frames_exist():
     )[0]
     assert 'expandText: "展开优化后素材"' in result
     assert 'collapseText: "收起优化后素材"' in result
-    assert "ppFramesSection(detail, frames)" in result
+    assert "ppFramesSection(detail, frames, disposeHooks)" in result
     assert "state.ppResultExpanded[detail.id]" in result
+    assert "disposeHooks.splice(0)" in result
 
     select = source.split("function selectConversation(id)", 1)[1].split(
         "function startPolling", 1

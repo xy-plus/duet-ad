@@ -83,7 +83,7 @@ def test_segment_products_wiring_is_lazy_and_absent_without_segments():
     assert 'collapseText: "收起分段产物"' in products
     assert "() => renderSegments(detail" in products
     assert "closeLightbox({ restoreFocus: false })" in products
-    assert "releaseTrackedURLs(mediaURLs)" in products
+    assert "disposeHooks.splice(0)" in products
 
     select = source.split("function selectConversation(id)", 1)[1].split(
         "function startPolling", 1

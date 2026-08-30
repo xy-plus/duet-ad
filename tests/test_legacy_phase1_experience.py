@@ -96,7 +96,7 @@ def test_output_b_is_done_only_when_server_reports_has_video():
         "return stages.find(x=>x.key==='output')})"
     )
     assert result[0]["status"] == "failed"
-    assert "缺失" in result[0]["detail"]
+    assert result[0]["detail"] == "生成成功，但成片未生成"
     assert result[1]["status"] == "done"
     assert result[1]["count"] == "可播放"
 
@@ -153,10 +153,10 @@ def test_persistent_header_history_and_unambiguous_cost_copy_are_shipped():
     assert 'aria-live="polite"' in html
     assert ".operation-timeline" in css
     assert "repeat(9" in css
-    for token in ("conv-thumb", "conv-id", "conv-output", "B 已提交", "B 未提交"):
+    for token in ("conv-thumb", "conv-id", "conv-output", "成片已提交", "等待成片"):
         assert token in js
     for copy in (
-        "开始生成成片 B（新增 ",
+        "开始生成成片（新增 ",
         "继续原任务（0 新增付费）",
         "仅重试拼接（0 新增付费）",
         "设置素材处理",

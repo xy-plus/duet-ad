@@ -16,7 +16,7 @@ The page presents one project operation through these stages:
 6. Context IR
 7. H3 generation
 8. Stitching
-9. committed output B
+9. committed final video
 
 Only public GET response fields may determine a stage. Missing element-index or
 Context IR segment detail is shown as unavailable instead of being inferred
@@ -28,7 +28,7 @@ from prompts or local files.
   elapsed time, last server update, and the whole timeline.
 - The history rail is enriched by bounded-concurrency detail GETs. It shows a
   short CID, first published keyframe when available, duration, server update
-  time, current stage, and output-B state.
+  time, current stage, and final-video state.
 - Skill identity uses the CID-frozen milestone. Short hashes are primary;
   complete hashes remain in an expandable audit view.
 - Material cards use a public element index when one exists. With the current
@@ -85,7 +85,7 @@ duet-ad1 service.
 - All legacy web tests: 104 passed.
 - Headless Chromium at 1440 px and 390 px: passed. The mocked GET-only detail
   showed nine stages, current Context IR, a short CID, duration, server update,
-  output-B state, Skill v3 short identity, and the explicit unavailable element
+  final-video state, Skill v3 short identity, and the explicit unavailable element
   index. There were no browser console errors; the mobile drawer was off-canvas.
 - Repository-wide `pytest -q` was stopped after the shared suite made no
   progress past 23 percent. Its first failure,

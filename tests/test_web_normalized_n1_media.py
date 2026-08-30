@@ -110,5 +110,8 @@ def test_legacy_media_fetch_keeps_bearer_api_and_does_not_guess_segment_paths():
     assert 'headers["Authorization"] = "Bearer " + state.token' in api
     assert "apiBlobURL(" in grid
     assert "encodedMediaPath(path)" in grid
-    assert "authoritativeSegmentKeyframePaths(detail, seg)" in segments
+    viewer = source.split("function frameViewerEntries", 1)[1].split(
+        "function selectedFrameEntry", 1
+    )[0]
+    assert "authoritativeSegmentKeyframePaths(detail, segment)" in viewer
     assert '"segments/" + n + "/work/keyframes"' not in segments

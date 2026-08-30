@@ -32,6 +32,8 @@ const state = {
   historyDetails: {}, // cid → 近期会话的 GET 详情；只用于补齐历史识别信息
   historyThumbnailURLs: {}, // cid → 侧栏首帧 ObjectURL，与 stream 媒体生命周期隔离
   historyHydrating: false, // 受限并发补齐进行中，避免重复 GET 风暴
+  frameSelections: {}, // cid:scope → 选中的 segment/frame；轮询和展开切换时保留
+  framePickerOpen: {}, // cid:scope → 图片下拉是否展开
   promptDraft: null,   // 当前图片优化提示词草稿；跨轮询保留，跨操作由统一守卫处理
   promptWorkspaceMode: {}, // cid:segment → generation/dialogue/image
   detailSig: null,     // 当前已渲染详情的状态签名：轮询比对，签名不变不碰 DOM（根治轮询闪烁）
@@ -632,7 +634,7 @@ function safeErrorSummary(raw, fallback = "阶段执行失败，请查看诊断�
     ["prompt_fusion_failed", "最终提示词融合失败"],
     ["prompt_fusion_output_invalid", "最终提示词融合结果无效"],
     ["provider_rejected", "素材服务商未接受本次处理"],
-    ["output_missing", "生成已结束，但成片 B 尚未提交"],
+    ["output_missing", "生成已结束，但成片尚未生成"],
     ["generation_path_removed", "该历史任务只能查看，不能重新生成"],
   ]);
   if (labels.has(code)) return labels.get(code);
@@ -786,13 +788,13 @@ function operationTimeline(detail, nowMs = Date.now()) {
       ),
     },
     {
-      key: "output", label: "成片 B",
+      key: "output", label: "成片",
       ...stageState(
         detail.has_video === true ? "done"
           : generationStatus === "succeeded" ? "failed" : "waiting",
         detail.has_video === true ? "成片已由服务器校验并提交"
-          : generationStatus === "succeeded" ? "生成成功，但成片 B 缺失" : "等待最终成片",
-        detail.has_video === true ? "可播放" : "",
+          : generationStatus === "succeeded" ? "生成成功，但成片未生成" : "等待最终成片",
+      detail.has_video === true ? "可播放" : "等待成片",
       ),
     },
   ];
@@ -1222,7 +1224,7 @@ function renderList() {
     footer.appendChild(el("span", null, timeline ? timeline.current.label : badgeState.text));
     footer.appendChild(el("span", "conv-time", fmtTime(c.updated_at || c.created_at)));
     footer.appendChild(el("span", "conv-output " + (c.has_video === true ? "is-ready" : "is-waiting"),
-      c.has_video === true ? "B 已提交" : "B 未提交"));
+      c.has_video === true ? "成片已提交" : "等待成片"));
     content.appendChild(footer);
     item.appendChild(content);
     item.addEventListener("click", () => {
@@ -1899,7 +1901,7 @@ async function postGeneration(
       if (button) {
         const action = generationAction(generation.status, generation.stage);
         button.textContent = action === "retry_stitch" ? "仅重试拼接（0 新增付费）"
-          : action === "retry" ? "重新生成失败内容" : "开始生成成片 B";
+          : action === "retry" ? "重新生成失败内容" : "开始生成成片";
       }
     }
   }
@@ -2162,7 +2164,7 @@ function renderFinalSection(detail) {
   const row = el("div", "final-row");
   const buttonLabel = generation.status === "failed"
     ? "重新生成（新增 " + retryContract.paidTaskCount + " 个付费任务）"
-    : "开始生成成片 B（新增 " + retryContract.paidTaskCount + " 个付费任务）";
+    : "开始生成成片（新增 " + retryContract.paidTaskCount + " 个付费任务）";
   const button = el("button", "btn btn-primary generation-submit", buttonLabel);
   button.type = "button";
   button.addEventListener("click", () => submitGeneration(detail, card));
@@ -2270,6 +2272,300 @@ function authoritativePostprocessFrameGroups(detail, frames) {
     });
   }
   return consumed.size === frames.length ? groups : [];
+}
+
+function validatedFramePromptMap(value, names) {
+  if (!Array.isArray(value) || !Array.isArray(names) || value.length !== names.length) return null;
+  const result = new Map();
+  for (let offset = 0; offset < names.length; offset += 1) {
+    const item = value[offset];
+    if (!item || item.frame_name !== names[offset]
+        || typeof item.text !== "string" || !item.text.trim()
+        || typeof item.default_text !== "string" || !item.default_text.trim()
+        || typeof item.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(item.sha256)) return null;
+    result.set(item.frame_name, {
+      text: item.text,
+      defaultText: item.default_text,
+      sha256: item.sha256,
+    });
+  }
+  return result;
+}
+
+function frameViewerEntries(detail, requestedSegment = null) {
+  if (!detail || typeof detail !== "object") return [];
+  const segments = Array.isArray(detail.segments) ? detail.segments : [];
+  let sources;
+  if (requestedSegment !== null) {
+    if (!segments.includes(requestedSegment)) return [];
+    sources = [requestedSegment];
+  } else if (segments.length > 0) {
+    sources = segments;
+  } else {
+    sources = [{
+      index: null,
+      start_s: 0,
+      end_s: detail.duration_s,
+      join_mode: null,
+      keyframes: Array.isArray(detail.keyframes) ? detail.keyframes : [],
+      prompt: detail.source_prompt || detail.prompt || "",
+      image_optimization_prompt: detail.image_optimization_prompt,
+      image_optimization_prompts: null,
+    }];
+  }
+  const post = detail.postprocess && typeof detail.postprocess === "object" ? detail.postprocess : null;
+  const postGroups = authoritativePostprocessFrameGroups(
+    detail,
+    post && Array.isArray(post.frames) ? post.frames : [],
+  );
+  const postSegments = post && Array.isArray(post.segments) ? post.segments : [];
+  const entries = [];
+  for (const segment of sources) {
+    const names = Array.isArray(segment && segment.keyframes) ? segment.keyframes : [];
+    if (names.some((name) => !safeMediaBasename(name))) continue;
+    const segmentIndex = Number.isInteger(segment && segment.index) ? segment.index : null;
+    const paths = segmentIndex === null
+      ? names.map((name) => "keyframes/" + name)
+      : authoritativeSegmentKeyframePaths(detail, segment);
+    if (paths.length !== names.length) continue;
+    const promptMap = validatedFramePromptMap(segment && segment.image_optimization_prompts, names);
+    const group = postGroups.find((item) => item.index === segmentIndex)
+      || (segmentIndex === null ? postGroups.find((item) => item.index === null) : null);
+    const optimizedByName = new Map();
+    if (group) group.names.forEach((name, offset) => optimizedByName.set(name, group.paths[offset]));
+    const postSegment = postSegments.find((item) => item && item.index === (segmentIndex || 1));
+    for (let offset = 0; offset < names.length; offset += 1) {
+      const name = names[offset];
+      const optimizedPath = optimizedByName.get(name) || null;
+      const framePrompt = promptMap && promptMap.get(name);
+      const optimizationRequested = !!(post && post.options && post.options.optimize_image === true);
+      const status = optimizedPath ? "processed"
+        : optimizationRequested && post.status === "running" ? "running"
+          : optimizationRequested && post.status === "failed" ? "failed"
+            : optimizationRequested && post.status === "done" ? "unavailable" : "source";
+      const start = Number(segment && segment.start_s);
+      const end = Number(segment && segment.end_s);
+      entries.push({
+        id: `s${segmentIndex || 0}-f${offset + 1}-${name}`,
+        segmentIndex,
+        frameIndex: offset + 1,
+        name,
+        originalPath: paths[offset],
+        optimizedPath,
+        status,
+        statusLabel: ({
+          processed: "已优化", running: "处理中", failed: "处理失败",
+          unavailable: "优化图未发布", source: "原图",
+        })[status],
+        generationPrompt: String(segment && segment.prompt || detail.source_prompt || detail.prompt || ""),
+        imagePrompt: framePrompt ? framePrompt.text
+          : String(segment && segment.image_optimization_prompt && segment.image_optimization_prompt.text
+            || detail.image_optimization_prompt && detail.image_optimization_prompt.text || ""),
+        relation: segmentIndex === null
+          ? `单段项目 · 第 ${offset + 1} 帧`
+          : `第 ${segmentIndex} 段 · ${segmentJoinText(segment && segment.join_mode)} · 第 ${offset + 1} 帧`,
+        timeRange: Number.isFinite(start) && Number.isFinite(end)
+          ? `${start.toFixed(1)}–${end.toFixed(1)} 秒` : "时间边界未公开",
+        completedFrames: postSegment && Number.isInteger(postSegment.completed_frames)
+          ? postSegment.completed_frames : null,
+        totalFrames: postSegment && Number.isInteger(postSegment.total_frames)
+          ? postSegment.total_frames : null,
+      });
+    }
+  }
+  return entries;
+}
+
+function selectedFrameEntry(entries, selectedId) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+  return entries.find((entry) => entry.id === selectedId)
+    || entries.find((entry) => entry.status === "running")
+    || entries[0];
+}
+
+function frameViewerScope(detail, segment, context) {
+  const index = Number.isInteger(segment && segment.index) ? segment.index : 0;
+  return `${detail.id}:${context}:s${index}`;
+}
+
+function frameMediaCard(detail, path, title, alt, urls) {
+  const card = el("figure", "frame-media-card shimmer");
+  card.appendChild(el("figcaption", "frame-media-title", title));
+  const button = el("button", "frame-media-button");
+  button.type = "button";
+  button.disabled = true;
+  button.setAttribute("aria-label", "放大查看" + title);
+  const img = el("img");
+  img.alt = alt;
+  button.appendChild(img);
+  card.appendChild(button);
+  apiBlobURL("/api/conversations/" + encodeURIComponent(detail.id)
+    + "/files/" + encodedMediaPath(path))
+    .then((url) => {
+      if (card.isConnected === false) {
+        releaseTrackedURL(url);
+        return;
+      }
+      urls.push(url);
+      img.src = url;
+      img.addEventListener("load", () => {
+        card.classList.remove("shimmer");
+        card.classList.add("is-loaded");
+      }, { once: true });
+      button.disabled = false;
+      button.addEventListener("click", () => openLightbox(img.src, img.alt, button));
+    })
+    .catch(() => {
+      card.classList.remove("shimmer");
+      card.appendChild(el("div", "kf-err", "加载失败"));
+    });
+  return card;
+}
+
+function framePickerOption(detail, entry, selected, urls, onSelect) {
+  const option = el("button", "frame-picker-option");
+  option.type = "button";
+  option.setAttribute("role", "option");
+  option.setAttribute("aria-selected", String(selected));
+  option.dataset.frameId = entry.id;
+  const thumb = el("span", "frame-picker-thumb shimmer");
+  const img = el("img");
+  img.alt = "";
+  thumb.appendChild(img);
+  option.appendChild(thumb);
+  const text = el("span", "frame-picker-option-text");
+  text.appendChild(el("strong", null,
+    (entry.segmentIndex === null ? "单段" : "第 " + entry.segmentIndex + " 段")
+      + " · 第 " + entry.frameIndex + " 帧"));
+  text.appendChild(el("small", null, entry.name));
+  option.appendChild(text);
+  option.appendChild(el("span", "frame-status status-" + entry.status, entry.statusLabel));
+  option.addEventListener("click", () => onSelect(entry.id));
+  apiBlobURL("/api/conversations/" + encodeURIComponent(detail.id)
+    + "/files/" + encodedMediaPath(entry.optimizedPath || entry.originalPath))
+    .then((url) => {
+      if (option.isConnected === false) {
+        releaseTrackedURL(url);
+        return;
+      }
+      urls.push(url);
+      img.src = url;
+      img.addEventListener("load", () => thumb.classList.remove("shimmer"), { once: true });
+    })
+    .catch(() => thumb.classList.remove("shimmer"));
+  return option;
+}
+
+function frameInspector(detail, segment = null, options = {}) {
+  const context = options.context || "frames";
+  const mode = options.mode === "image" ? "image" : "generation";
+  const scope = frameViewerScope(detail, segment, context);
+  const entries = frameViewerEntries(detail, segment);
+  const wrap = el("div", "frame-inspector");
+  const pickerURLs = [];
+  let detailURLs = [];
+  let selected = selectedFrameEntry(entries, state.frameSelections[scope]);
+  if (!selected) {
+    wrap.appendChild(el("p", "prompt-unavailable", "当前没有可展示的图片"));
+    return { node: wrap, dispose: () => {} };
+  }
+  state.frameSelections[scope] = selected.id;
+
+  const picker = el("details", "frame-picker");
+  picker.open = state.framePickerOpen[scope] === true;
+  const summary = el("summary", "frame-picker-summary");
+  const selectedLabel = el("span", "frame-picker-selected");
+  const selectedStatus = el("span", "frame-status");
+  summary.appendChild(selectedLabel);
+  summary.appendChild(selectedStatus);
+  picker.appendChild(summary);
+  const list = el("div", "frame-picker-list");
+  list.setAttribute("role", "listbox");
+  list.setAttribute("aria-label", "按分段和帧选择图片");
+  picker.appendChild(list);
+  wrap.appendChild(picker);
+  const selectedHost = el("div", "frame-inspector-detail");
+  wrap.appendChild(selectedHost);
+  let optionsBuilt = false;
+
+  const renderSelected = () => {
+    releaseTrackedURLs(detailURLs);
+    detailURLs = [];
+    selectedHost.textContent = "";
+    selectedLabel.textContent = (selected.segmentIndex === null ? "单段" : "第 " + selected.segmentIndex + " 段")
+      + " · 第 " + selected.frameIndex + " 帧 · " + selected.name;
+    selectedStatus.className = "frame-status status-" + selected.status;
+    selectedStatus.textContent = selected.statusLabel;
+    for (const option of list.querySelectorAll("[role=option]")) {
+      option.setAttribute("aria-selected", String(option.dataset.frameId === selected.id));
+    }
+
+    const compare = el("div", "frame-compare");
+    compare.appendChild(frameMediaCard(
+      detail, selected.originalPath, "原图",
+      selected.relation + "原图", detailURLs,
+    ));
+    if (selected.optimizedPath) {
+      compare.appendChild(frameMediaCard(
+        detail, selected.optimizedPath, "优化图",
+        selected.relation + "优化图", detailURLs,
+      ));
+    } else {
+      const missing = el("div", "frame-media-card frame-media-placeholder");
+      missing.appendChild(el("span", "frame-media-title", "优化图"));
+      missing.appendChild(el("p", null, selected.status === "source"
+        ? "本次未生成优化图" : selected.statusLabel));
+      compare.appendChild(missing);
+    }
+    selectedHost.appendChild(compare);
+    const relation = el("div", "frame-relation");
+    relation.appendChild(el("strong", null, "素材关系"));
+    relation.appendChild(el("span", null, selected.relation));
+    relation.appendChild(el("span", null, selected.timeRange));
+    if (selected.completedFrames !== null && selected.totalFrames !== null) {
+      relation.appendChild(el("span", null,
+        "本段优化 " + selected.completedFrames + "/" + selected.totalFrames + " 帧"));
+    }
+    selectedHost.appendChild(relation);
+    if (options.showPrompt !== false) {
+      const prompt = mode === "image" ? selected.imagePrompt : selected.generationPrompt;
+      selectedHost.appendChild(prompt
+        ? promptCard(prompt, [], mode === "image" ? "该帧图片优化提示词" : "该帧生成提示词")
+        : el("p", "prompt-unavailable", mode === "image"
+          ? "该帧没有已发布的图片优化提示词" : "该帧没有已发布的生成提示词"));
+    }
+  };
+
+  const buildOptions = () => {
+    if (optionsBuilt) return;
+    optionsBuilt = true;
+    for (const entry of entries) {
+      list.appendChild(framePickerOption(
+        detail, entry, entry.id === selected.id, pickerURLs,
+        (id) => {
+          selected = selectedFrameEntry(entries, id);
+          state.frameSelections[scope] = selected.id;
+          picker.open = false;
+          state.framePickerOpen[scope] = false;
+          renderSelected();
+          summary.focus();
+        },
+      ));
+    }
+  };
+  if (picker.open) buildOptions();
+  picker.addEventListener("toggle", () => {
+    state.framePickerOpen[scope] = picker.open;
+    if (picker.open) buildOptions();
+  });
+  renderSelected();
+  return {
+    node: wrap,
+    dispose: () => {
+      releaseTrackedURLs(detailURLs);
+      releaseTrackedURLs(pickerURLs);
+    },
+  };
 }
 
 /* 关键帧网格：长视频分段用小缩略图按钮，其他结果保持现有网格。 */
@@ -2408,16 +2704,13 @@ function readOnlyImageFramePromptText(value) {
   return sections.join("\n\n");
 }
 
-function promptWorkspace(detail, segment = null) {
+function promptWorkspace(detail, segment = null, disposeHooks = null) {
   const segmentIndex = promptSegmentIndex(segment);
   const scope = promptScopeKey(detail.id, segmentIndex);
   const isLong = Array.isArray(detail.segments) && detail.segments.length > 0;
   const generationText = String(segment ? segment.prompt || "" : detail.source_prompt || detail.prompt || "");
   const lines = segment ? segment.lines : detail.dialogue;
   const imagePrompt = segment ? segment.image_optimization_prompt : detail.image_optimization_prompt;
-  const imageFramePromptText = readOnlyImageFramePromptText(
-    segment && segment.image_optimization_prompts,
-  );
   const wrap = el("div", "prompt-workspace");
   const tabs = el("div", "prompt-workspace-tabs");
   tabs.setAttribute("role", "tablist");
@@ -2427,8 +2720,17 @@ function promptWorkspace(detail, segment = null) {
   const modes = promptWorkspaceModes();
   const buttons = {};
   let currentMode = state.promptWorkspaceMode[scope] || null;
+  let disposeMode = null;
+  if (Array.isArray(disposeHooks)) {
+    disposeHooks.push(() => {
+      if (disposeMode) disposeMode();
+      disposeMode = null;
+    });
+  }
 
   const renderMode = () => {
+    if (disposeMode) disposeMode();
+    disposeMode = null;
     panel.textContent = "";
     panel.hidden = currentMode === null;
     for (const [mode, label] of modes) {
@@ -2443,10 +2745,19 @@ function promptWorkspace(detail, segment = null) {
       return;
     }
     if (currentMode === "generation") {
-      if (isLong || !sourcePromptEditable(detail)) {
+      const editable = !isLong && sourcePromptEditable(detail);
+      const inspector = frameInspector(detail, segment, {
+        context: "generation-prompt",
+        mode: "generation",
+        showPrompt: !editable,
+      });
+      if (frameViewerEntries(detail, segment).length) {
+        panel.appendChild(inspector.node);
+        disposeMode = inspector.dispose;
+      } else if (!editable) {
         panel.appendChild(promptCard(generationText));
-        return;
       }
+      if (!editable) return;
       panel.appendChild(editablePromptCard({
         text: generationText,
         defaultText: generationText,
@@ -2486,9 +2797,17 @@ function promptWorkspace(detail, segment = null) {
       }));
       return;
     }
-    if (imageFramePromptText !== null) {
-      panel.appendChild(promptCard(imageFramePromptText));
-      return;
+    const inspector = frameInspector(detail, segment, {
+      context: "image-optimization",
+      mode: "image",
+      showPrompt: true,
+    });
+    const entries = frameViewerEntries(detail, segment);
+    const hasFramePrompt = entries.some((entry) => !!entry.imagePrompt);
+    if (entries.length) {
+      panel.appendChild(inspector.node);
+      disposeMode = inspector.dispose;
+      if (hasFramePrompt) return;
     }
     if (!imagePrompt || typeof imagePrompt.text !== "string") {
       panel.appendChild(el("p", "prompt-unavailable", "当前会话没有可编辑的图片优化提示词"));
@@ -2615,10 +2934,10 @@ function sourcePromptEditable(detail) {
 }
 
 /* prompt 卡片（复制按钮 + 全文；源提示词、IR、单段/多段共用） */
-function promptCard(text, actions = []) {
+function promptCard(text, actions = [], hint = "用于视频生成") {
   const card = el("div", "prompt-card");
   const head = el("div", "prompt-head");
-  head.appendChild(el("span", "prompt-hint", "用于视频生成"));
+  head.appendChild(el("span", "prompt-hint", hint));
   for (const action of actions) head.appendChild(action);
   const output = el("pre", "prompt-text", text);
   const copyBtn = el("button", "copy-btn");
@@ -2648,13 +2967,17 @@ function keyframesSection(detail) {
   const h = el("h3", "res-h3", "关键帧");
   h.appendChild(el("span", "res-count", names.length + " 张"));
   sec.appendChild(h);
-  sec.appendChild(kfGrid(detail, names, "keyframes", "关键帧 "));
+  sec.appendChild(frameInspector(detail, null, {
+    context: "source-frames",
+    mode: "generation",
+    showPrompt: false,
+  }).node);
   return sec;
 }
 
-/* 多段模式：逐段「第 N 段」卡片（段关键帧 grid + 段提示词 + 段台词） */
+/* 多段模式：逐段「第 N 段」卡片；帧媒体由提示词工作区的单帧查看器按需展示。 */
 function renderSegments(detail) {
-  const mediaURLs = arguments[1] || [];
+  const disposeHooks = arguments[1] || [];
   const frag = document.createDocumentFragment();
   const headSec = el("section", "res-section");
   const h = el("h3", "res-h3", "分段产物");
@@ -2668,23 +2991,7 @@ function renderSegments(detail) {
     const sh = el("h3", "res-h3", "第 " + n + " 段");
     sh.appendChild(el("span", "res-count", fmtSec(seg.start_s) + "s – " + fmtSec(seg.end_s) + "s"));
     card.appendChild(sh);
-    const names = Array.isArray(seg.keyframes) ? seg.keyframes : [];
-    const paths = authoritativeSegmentKeyframePaths(detail, seg);
-    if (paths.length) {
-      card.appendChild(kfGrid(
-        detail,
-        names,
-        null,
-        "第 " + n + " 段关键帧 ",
-        {
-          compact: true,
-          expandable: true,
-          paths,
-          onURL: (url) => mediaURLs.push(url),
-        },
-      ));
-    }
-    card.appendChild(promptWorkspace(detail, seg));
+    card.appendChild(promptWorkspace(detail, seg, disposeHooks));
     frag.appendChild(card);
   }
   return frag;
@@ -2695,14 +3002,14 @@ function resetSegmentProductsDisclosure(id) {
 }
 
 function segmentProductsDisclosure(detail, buildContent = null) {
-  const mediaURLs = [];
+  const disposeHooks = [];
   const labels = {
     expand: "展开分段产物",
     collapse: "收起分段产物",
     expandText: "展开分段产物",
     collapseText: "收起分段产物",
   };
-  return createDisclosure(labels, buildContent || (() => renderSegments(detail, mediaURLs)), {
+  return createDisclosure(labels, buildContent || (() => renderSegments(detail, disposeHooks)), {
     idPrefix: "segment-products",
     wrapClass: "segment-products-disclosure",
     buttonClass: "btn btn-primary segment-products-toggle",
@@ -2714,7 +3021,7 @@ function segmentProductsDisclosure(detail, buildContent = null) {
       if (activeLightboxDisclosure && panel.contains(activeLightboxDisclosure)) {
         closeLightbox({ restoreFocus: false });
       }
-      releaseTrackedURLs(mediaURLs);
+      for (const dispose of disposeHooks.splice(0)) dispose();
     },
   });
 }
@@ -2946,22 +3253,22 @@ function renderPpUserBubble(pp) {
 }
 
 /* 「优化后」结果区（done）：多段逐段分组；单段按一个虚拟段统一处理 */
-function ppFramesSection(detail, frames) {
+function ppFramesSection(detail, frames, disposeHooks = null) {
   const wrap = el("div");
-  for (const group of authoritativePostprocessFrameGroups(detail, frames)) {
-    const n = group.index;
-    const title = n == null ? "优化后" : "第 " + n + " 段优化后";
-    const block = el("div", "pp-seg");
-    block.appendChild(el("h4", "res-sub", title));
-    block.appendChild(kfGrid(detail, group.names, null, title + " ", {
-      paths: group.paths,
-    }));
-    wrap.appendChild(block);
-  }
+  const published = authoritativePostprocessFrameGroups(detail, frames);
+  if (!published.length) return wrap;
+  const inspector = frameInspector(detail, null, {
+    context: "optimized-frames",
+    mode: "image",
+    showPrompt: true,
+  });
+  wrap.appendChild(inspector.node);
+  if (Array.isArray(disposeHooks)) disposeHooks.push(inspector.dispose);
   return wrap;
 }
 
 function ppResultDisclosure(detail, frames) {
+  const disposeHooks = [];
   const labels = {
     expand: "展开优化后素材",
     collapse: "收起优化后素材",
@@ -2970,7 +3277,7 @@ function ppResultDisclosure(detail, frames) {
   };
   return createDisclosure(labels, () => {
     const card = el("div", "activity-card");
-    card.appendChild(ppFramesSection(detail, frames));
+    card.appendChild(ppFramesSection(detail, frames, disposeHooks));
     return card;
   }, {
     idPrefix: "pp-result",
@@ -2979,6 +3286,9 @@ function ppResultDisclosure(detail, frames) {
     panelClass: "pp-result-panel",
     expanded: state.ppResultExpanded[detail.id] === true,
     onChange: (expanded) => { state.ppResultExpanded[detail.id] = expanded; },
+    onDispose: () => {
+      for (const dispose of disposeHooks.splice(0)) dispose();
+    },
   });
 }
 
@@ -3854,6 +4164,9 @@ if (typeof module !== "undefined" && module.exports) {
     detailSignature,
     diagnosticText,
     dirtyPromptDecision,
+    frameInspector,
+    frameViewerEntries,
+    selectedFrameEntry,
     fitProfile,
     formatDuration,
     formatElapsed,

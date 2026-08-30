@@ -427,26 +427,25 @@ def test_long_segment_prompt_workspace_and_keyframes_are_accessible():
     source = APP_JS.read_text(encoding="utf-8")
     branch = source.split("function renderSegments(detail)", 1)[1]
     branch = branch.split("/* 关键帧放大查看", 1)[0]
-    assert "promptWorkspace(detail, seg)" in branch
-    assert "compact: true" in branch
-    assert "expandable: true" in branch
-    assert "authoritativeSegmentKeyframePaths(detail, seg)" in branch
-    assert "onURL: (url) => mediaURLs.push(url)" in branch
+    assert "promptWorkspace(detail, seg, disposeHooks)" in branch
+    assert "kfGrid(" not in branch
 
-    grid = source.split("function kfGrid", 1)[1]
-    grid = grid.split("function sourcePromptEditable", 1)[0]
-    assert 'el("button", "kf-expand-button")' in grid
-    assert 'button.type = "button"' in grid
-    assert "setDisclosureState(button, null, false" in grid
-    assert "openLightbox(img.src, img.alt, button)" in grid
-    assert 'trigger.setAttribute("aria-expanded", String(expanded))' in source
+    viewer = source.split("function frameInspector", 1)[1]
+    viewer = viewer.split("/* 关键帧网格", 1)[0]
+    assert 'el("details", "frame-picker")' in viewer
+    assert 'list.setAttribute("role", "listbox")' in viewer
+    assert 'option.setAttribute("role", "option")' in source
+    assert 'option.setAttribute("aria-selected", String(selected))' in source
+    assert "state.frameSelections[scope]" in viewer
+    assert "state.framePickerOpen[scope]" in viewer
+    assert "summary.focus()" in viewer
 
 
 def test_long_segment_dialogue_reuses_the_three_way_prompt_workspace():
     source = APP_JS.read_text(encoding="utf-8")
     branch = source.split("function renderSegments(detail)", 1)[1]
     branch = branch.split("/* 关键帧放大查看", 1)[0]
-    assert "promptWorkspace(detail, seg)" in branch
+    assert "promptWorkspace(detail, seg, disposeHooks)" in branch
 
     generic = source.split("function createDisclosure", 1)[1]
     generic = generic.split("function dialogueText", 1)[0]

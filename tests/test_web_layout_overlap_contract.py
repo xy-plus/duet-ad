@@ -24,8 +24,14 @@ def test_featured_keyframe_keeps_intrinsic_height_for_single_image_results():
         "function ppResultDisclosure", 1
     )[0]
     assert "authoritativePostprocessFrameGroups(detail, frames)" in postprocess
-    assert "kfGrid(detail, group.names, null" in postprocess
-    assert "paths: group.paths" in postprocess
+    assert "frameInspector(detail, null" in postprocess
+    assert 'context: "optimized-frames"' in postprocess
+
+    compare = _rule(css, ".frame-compare")
+    mobile = css.split("@media (max-width: 768px)", 1)[1]
+    mobile_compare = _rule(mobile, ".frame-compare")
+    assert "repeat(2, minmax(0, 1fr))" in compare
+    assert "grid-template-columns: 1fr" in mobile_compare
 
 
 def test_keyframe_grid_tracks_cannot_overflow_narrow_result_cards():
