@@ -2735,6 +2735,7 @@ def _prompt_fusion_early_output(
         or len(segments) != segment_count
     ):
         raise ValueError("prompt fusion raw output is invalid")
+    normalized_relations = False
     for index, segment in enumerate(segments, 1):
         source_segment = (
             input_segments[index - 1]
@@ -2746,13 +2747,13 @@ def _prompt_fusion_early_output(
             isinstance(source_segment, dict)
             and "relation_occurrences" in source_segment
         )
-        expected_keys = (
-            {"index", "visual", "relation_states"}
-            if relation_contract else {"index", "visual"}
+        allowed_keys = (
+            ({"index", "visual"}, {"index", "visual", "relation_states"})
+            if relation_contract else ({"index", "visual"},)
         )
         if (
             not isinstance(segment, dict)
-            or set(segment) != expected_keys
+            or set(segment) not in allowed_keys
             or segment.get("index") != index
             or not isinstance(segment.get("visual"), list)
             or not segment["visual"]
@@ -2779,11 +2780,12 @@ def _prompt_fusion_early_output(
                 )
             except (KeyError, TypeError, long_generation.LongGenerationError):
                 raise ValueError("prompt fusion raw output is invalid") from None
-            if (
-                len(segment["visual"]) != len(expected)
-                or segment.get("relation_states") != expected
-            ):
+            if len(segment["visual"]) != len(expected):
                 raise ValueError("prompt fusion raw output is invalid")
+            # relation_states from the model is merely a hint.  Overwrite a
+            # wrong echo, or inject a missing one, from frozen backend input.
+            segment["relation_states"] = expected
+            normalized_relations = True
             try:
                 long_generation._compile_fusion_ref2va_prompt(
                     visual=segment["visual"],
@@ -2793,14 +2795,13 @@ def _prompt_fusion_early_output(
                     ),
                     music_policy=source_segment["audio_content"]["music_policy"],
                     relation_occurrences=occurrences,
-                    relation_states=expected,
                 )
             except (
                 KeyError, TypeError, json.JSONDecodeError,
                 long_generation.LongGenerationError,
             ):
                 raise ValueError("prompt fusion raw output is invalid") from None
-    return data
+    return _canonical_json_bytes(value) if normalized_relations else data
 
 
 def queue_prompt_fusion(
@@ -3245,6 +3246,12 @@ def produce_prompt_fusion(
                     stage_output,
                     segment_count=len(input_payload["segments"]),
                 )
+        raw_output_data = _prompt_fusion_early_output(
+            raw_output_data,
+            input_sha256=state["input_sha256"],
+            segment_count=len(input_payload["segments"]),
+            input_segments=input_payload["segments"],
+        )
         _atomic_bytes(output_path, raw_output_data)
         state = {
             **state,

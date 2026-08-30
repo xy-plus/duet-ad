@@ -44,4 +44,4 @@ VideoPromptFusionOutput = { schema: "duet.video-prompt-fusion-output"; version: 
 RelationInterval = { interval: { start_frame_order: Int1; end_frame_order: Int1; source_scene_id: NonEmpty }; relations: Array<{ relation_id: NonEmpty; subject_key: NonEmpty; predicate: NonEmpty; object_key: NonEmpty; preserve: Array<NonEmpty>; replace_together: Bool; states: NonEmptyArray<{ frame_order: Int1; state: NonEmpty; geometry: NonEmpty }> }> }
 ```
 
-segments 与输入一一对应，visual 和 relation_states 数量都等于 hard-cut 区间数。后端按输入机械计算 expected relation_states 并做 exact equality 校验，再把冻结关系机械编译进 Context IR/H3 effective prompt；模型不得自行摘要关系。最终回答只返回上述 JSON object；后端捕获、校验并发布，供 Context IR 优化，再按冻结素材逐段生成视频。
+segments 与输入一一对应，visual 和 relation_states 数量都等于 hard-cut 区间数。后端按输入机械计算 expected relation_states，并覆盖错误回显或注入缺失字段，再把冻结关系机械编译进 Context IR/H3 effective prompt；模型回显不作为关系权威，也不因关系回显差异触发失败。最终回答只返回上述 JSON object；后端捕获、校验并发布，供 Context IR 优化，再按冻结素材逐段生成视频。

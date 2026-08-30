@@ -220,6 +220,26 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
         "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{
+            **_fusion_v2_output(
+                input_payload["segments"][0],
+                "hard cut at the frozen source boundary",
+            ),
+            "relation_states": [],
+        }],
+    }))
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_output_invalid",
+    ):
+        long_generation.load_prompt_fusion(
+            input_path=input_path, output_path=output_path, root=tmp_path,
+        )
+
+    output_path.write_bytes(_canonical({
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
         "segments": [{"index": 1, "visual": []}],
     }))
     with pytest.raises(
@@ -323,7 +343,15 @@ def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> No
     frozen = long_generation.load_prompt_fusion(
         input_path=input_path, output_path=output_path, root=tmp_path,
     )
-    expected = output["segments"][0]["relation_states"]
+    expected = long_generation._expected_fusion_relation_states(
+        long_generation._freeze_local_keyframe_sources([{
+            key: frame[key]
+            for key in (
+                "order", "segment_time_s", "source_scene_id", "transition",
+            )
+        } for frame in frames]),
+        long_generation._freeze_fusion_relation_occurrences(relations, frames),
+    )
     assert [item["interval"] for item in expected] == [
         {"start_frame_order": 1, "end_frame_order": 4, "source_scene_id": "scene-a"},
         {"start_frame_order": 5, "end_frame_order": 9, "source_scene_id": "scene-b"},
@@ -331,30 +359,58 @@ def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> No
     assert expected[0]["relations"][0]["states"][0]["state"] == "attached"
     assert expected[1]["relations"][0]["states"][0]["state"] == "released"
     contract = long_generation._compact_h3_relation_contract(expected)
-    assert (
+    encoded_contract = (
         f"{long_generation.RELATION_STATES_OPEN}"
         f"{json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
         f"{long_generation.RELATION_STATES_CLOSE}"
+    )
+    assert (
+        encoded_contract
     ) in frozen.final_prompts[0]
 
     output["segments"][0]["relation_states"][1]["relations"][0][
         "object_key"
     ] = "entity-without-frame-evidence"
+    output["segments"][0]["relation_states"][0]["relations"].append({
+        "relation_id": "model-invented-relation",
+        "subject_key": "person-01",
+        "predicate": "uses",
+        "object_key": "model-invented-object",
+        "preserve": [],
+        "replace_together": False,
+        "states": [{
+            "frame_order": 1,
+            "state": "invented",
+            "geometry": "invented",
+        }],
+    })
     output_path.write_bytes(_canonical(output))
-    with pytest.raises(ValueError, match="prompt fusion raw output is invalid"):
-        pipeline._prompt_fusion_early_output(
-            output_path.read_bytes(),
-            input_sha256=output["input_sha256"],
-            segment_count=1,
-            input_segments=payload["segments"],
-        )
-    with pytest.raises(
-        long_generation.LongGenerationError,
-        match="prompt_fusion_output_invalid",
-    ):
-        long_generation.load_prompt_fusion(
-            input_path=input_path, output_path=output_path, root=tmp_path,
-        )
+    corrected = pipeline._prompt_fusion_early_output(
+        output_path.read_bytes(),
+        input_sha256=output["input_sha256"],
+        segment_count=1,
+        input_segments=payload["segments"],
+    )
+    assert json.loads(corrected)["segments"][0]["relation_states"] == expected
+    frozen_wrong_echo = long_generation.load_prompt_fusion(
+        input_path=input_path, output_path=output_path, root=tmp_path,
+    )
+    assert "entity-without-frame-evidence" not in frozen_wrong_echo.final_prompts[0]
+    assert "model-invented-relation" not in frozen_wrong_echo.final_prompts[0]
+    assert encoded_contract in frozen_wrong_echo.final_prompts[0]
+
+    del output["segments"][0]["relation_states"]
+    output_path.write_bytes(_canonical(output))
+    injected = pipeline._prompt_fusion_early_output(
+        output_path.read_bytes(),
+        input_sha256=output["input_sha256"],
+        segment_count=1,
+        input_segments=payload["segments"],
+    )
+    assert json.loads(injected)["segments"][0]["relation_states"] == expected
+    assert long_generation.load_prompt_fusion(
+        input_path=input_path, output_path=output_path, root=tmp_path,
+    ).final_prompts == frozen.final_prompts
 
 
 def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:

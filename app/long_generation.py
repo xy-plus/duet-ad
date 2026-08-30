@@ -400,7 +400,7 @@ def _compile_fusion_ref2va_prompt(
     *, visual: object, timeline: object, lines: object, music_policy: object,
     relation_occurrences: object = None, relation_states: object = None,
 ) -> str:
-    """Compile the only provider-sendable current Fusion prompt."""
+    """Compile the only provider-sendable prompt from backend authorities."""
     if music_policy != "forbid" or not isinstance(lines, list):
         raise LongGenerationError("prompt_fusion_input_invalid")
     frozen_timeline = _freeze_local_keyframe_sources(timeline)
@@ -424,10 +424,10 @@ def _compile_fusion_ref2va_prompt(
     expected_relation_states = _expected_fusion_relation_states(
         frozen_timeline, frozen_occurrences,
     )
-    if relation_states is None:
-        relation_states = expected_relation_states
-    if relation_states != expected_relation_states:
-        raise LongGenerationError("prompt_fusion_output_invalid")
+    # Model-authored relation_states is intentionally non-authoritative.  Keep
+    # the argument for callers that still echo it, but compile only the exact
+    # backend projection from frozen occurrences.
+    _ = relation_states
 
     subject_definitions = ["subject_definitions:"]
     retention = ["retention_analysis:"]
@@ -782,12 +782,12 @@ def load_prompt_fusion(
         audio = segments[index - 1]["audio_content"]
         if source_version == PROMPT_FUSION_VERSION:
             relation_occurrences = relation_occurrences_by_segment[index - 1]
-            expected_output_keys = (
-                {"index", "visual", "relation_states"}
+            allowed_output_keys = (
+                ({"index", "visual"}, {"index", "visual", "relation_states"})
                 if relation_occurrences is not None
-                else {"index", "visual"}
+                else ({"index", "visual"},)
             )
-            if set(segment) != expected_output_keys:
+            if set(segment) not in allowed_output_keys:
                 raise LongGenerationError("prompt_fusion_output_invalid")
             timeline = timelines[index - 1]
             if timeline is None:
@@ -798,7 +798,6 @@ def load_prompt_fusion(
                 lines=json.loads(audio["lines_json"]),
                 music_policy=audio["music_policy"],
                 relation_occurrences=relation_occurrences,
-                relation_states=segment.get("relation_states"),
             ))
         else:
             if (
