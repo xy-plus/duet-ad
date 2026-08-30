@@ -1284,6 +1284,70 @@ def test_active_or_succeeded_generation_cannot_be_duplicated(enabled, status):
     assert different.status_code == 409
 
 
+@pytest.mark.parametrize(
+    ("generation_status", "expected_detail"),
+    [
+        ("failed", "new client_request_id required"),
+        ("submission_unknown", "submission_outcome_unknown"),
+    ],
+)
+def test_same_client_legacy_controlled_storage_receipt_never_reposts(
+    enabled, monkeypatch, generation_status, expected_detail,
+):
+    settings, client = enabled
+    cid, _ = _make_conv(settings)
+    attempt_path = _write_legacy_pre_h3_attempt(settings, cid)
+    attempt = json.loads(attempt_path.read_text())
+    attempt.update(
+        status="failed",
+        retryable=False,
+        h3={"status": "failed"},
+        error={
+            "code": "h3_submit_rejected",
+            "gateway": {"http_status": 400, "reason": "controlled_storage"},
+        },
+    )
+    attempt_path.write_text(json.dumps(attempt), encoding="utf-8")
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={
+            "status": generation_status,
+            "error": "h3_submit_rejected",
+            "attempt": 1,
+            "client_request_id": REQUEST_ID,
+            "stage": "h3",
+            "h3_attempt_id": None,
+        },
+        prepared_dialogue=[],
+        fit_mode="none",
+        dialogue_mode="none",
+        dialogue_delivery="auto",
+        resolved_dialogue_delivery="none",
+    )
+    provider_calls = []
+    for name in ("start", "resume", "retry", "retry_controlled_storage_rejection"):
+        monkeypatch.setattr(
+            h3,
+            name,
+            lambda *_args, _name=name, **_kwargs: provider_calls.append(_name),
+        )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": expected_detail}
+    assert provider_calls == []
+    assert sorted(
+        path.parent.name
+        for path in (settings.data_dir / cid / ".h3" / "attempts").glob("*/attempt.json")
+    ) == ["000001"]
+
+
 def test_result_fields_only_contains_direct_h3_states():
     assert _result_fields(h3.H3Result("succeeded", "000001")) == ("succeeded", None)
     assert _result_fields(h3.H3Result("h3_running", "000001")) == (

@@ -35,11 +35,23 @@ _JSON_BINDING_RE = re.compile(
 )
 _MENTION_RE = re.compile(r"@[A-Za-z0-9_.:/-]{1,256}")
 _SHA_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
-_SEMANTIC_KEY_RE = re.compile(
-    r"(?:stable|person|entity|scene|frame|asset|material|binding|tile|relation|"
-    r"subject|predicate|object|action|phase|caus|chronolog|timeline|timing|"
-    r"transition|order|sequence|count|quantity|number|composition|camera|"
-    r"layout|geometry|position|environment|background|setting|source)",
+_REJECTED_TEXT_KEYS = frozenset({
+    "current", "default", "prompt", "text", "free_text",
+    "neutralized_free_text", "description", "caption", "narrative",
+    "instruction", "original_prompt", "replacement_description",
+})
+_STRUCTURAL_SCALAR_KEY_RE = re.compile(
+    r"^(?:"
+    r"(?:stable|person|entity|scene|frame|asset|material|binding|tile|subject|object|relation)_id|"
+    r"(?:stable|person|entity|scene|frame|asset|material|binding|tile|subject|object|relation)_key|"
+    r"(?:source|input|output|plan|continuity|execution_input|evidence|receipt)_sha256|"
+    r"frame_name|predicate|state|geometry|preserve|visibility|count|quantity|number|"
+    r"order|sequence|frame_index|segment_index|source_interval_index|"
+    r"start|end|start_s|end_s|duration_s|timestamp|time|timing|chronology|causality|"
+    r"action|phase|transition|source_transition_from_previous|"
+    r"camera|camera_motion|composition|layout|position|environment|background|setting|"
+    r"input_role|purpose|kind|role|owner_id|observable_person_ids"
+    r")$",
     re.IGNORECASE,
 )
 
@@ -60,25 +72,52 @@ def _protected_literals(prompt: str) -> list[str]:
     return sorted(set(values))
 
 
-def _semantic_projection(value: object, *, path: str = "$") -> object | None:
-    """Keep existing structured semantic fields without asking a model to judge them."""
+def _semantic_projection(
+    value: object, *, path: str = "$", allow_scalar: bool = False,
+) -> object | None:
+    """Recursively retain only explicitly structural fields.
+
+    No parent/container key can authorize an entire child object.  In
+    particular, frozen frame records also contain ``default``/``current``
+    provider prose; those values and all other free-form text fields are
+    excluded at every depth.
+    """
     if isinstance(value, Mapping):
         projected: dict[str, object] = {}
         for raw_key in sorted(value, key=str):
             if not isinstance(raw_key, str):
                 continue
+            normalized_key = raw_key.casefold()
+            if (
+                normalized_key in _REJECTED_TEXT_KEYS
+                or "prompt" in normalized_key
+                or normalized_key.endswith("_text")
+            ):
+                continue
             child = value[raw_key]
             child_path = f"{path}.{raw_key}"
-            nested = _semantic_projection(child, path=child_path)
-            if _SEMANTIC_KEY_RE.search(raw_key) or nested not in (None, {}, []):
-                projected[raw_key] = child if _SEMANTIC_KEY_RE.search(raw_key) else nested
+            scalar_allowed = _STRUCTURAL_SCALAR_KEY_RE.fullmatch(raw_key) is not None
+            nested = _semantic_projection(
+                child, path=child_path, allow_scalar=scalar_allowed,
+            )
+            if nested not in (None, {}, []):
+                projected[raw_key] = nested
         return projected or None
     if isinstance(value, (list, tuple)):
         projected_items = [
-            item for index, raw in enumerate(value)
-            if (item := _semantic_projection(raw, path=f"{path}[{index}]")) is not None
+            item
+            for index, raw in enumerate(value)
+            if (
+                item := _semantic_projection(
+                    raw, path=f"{path}[{index}]", allow_scalar=allow_scalar,
+                )
+            ) is not None
         ]
         return projected_items or None
+    if allow_scalar and (
+        value is None or isinstance(value, (str, int, float, bool))
+    ):
+        return value
     return None
 
 

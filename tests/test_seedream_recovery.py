@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import hashlib
 import json
+import multiprocessing
 import threading
 import time
 from pathlib import Path
@@ -35,6 +36,11 @@ def _paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     receipt = attempts / "0001-r1.json"
     receipt.write_text("{}", encoding="utf-8")
     return session, receipt, tmp_path / "out.png"
+
+
+def _exclusive_claim_worker(path: str, payload: dict, start, results) -> None:
+    start.wait()
+    results.put(seedream._exclusive_json(Path(path), payload))
 
 
 def _valid_result(prompt: str, neutralized: str, semantic_context=None) -> dict:
@@ -294,6 +300,70 @@ def test_schema_preserves_all_semantic_contract_fields_and_stable_literals() -> 
     assert '"object_key":"主体B"' in published
 
 
+def test_real_frozen_frame_schema_never_reinjects_rejected_free_text() -> None:
+    rejected = "两件玩具激烈碰撞并产生危险冲突"
+    original = f"请编辑画面：{rejected}"
+    frame = {
+        "segment_index": 2,
+        "frame_index": 3,
+        "frame_name": "03.png",
+        "source_sha256": "b" * 64,
+        "default": rejected,
+        "current": rejected,
+        "prompt": rejected,
+        "frame_constraint": {
+            "frame_index": 3,
+            "visible_body_parts": rejected,
+            "relation_occurrences": [{
+                "relation_id": "REL_01",
+                "subject_key": "toy-a",
+                "predicate": "contacts",
+                "object_key": "toy-b",
+                "state": "active",
+                "geometry": "left-to-right",
+                "preserve": True,
+                "count": 2,
+                "order": 1,
+                "time": 1.25,
+            }],
+        },
+        "scene_continuity_view": {
+            "scene_id": "SCENE_01",
+            "camera": "fixed",
+            "composition": "two-shot",
+            "environment": "indoor-workbench",
+            "transition_from_previous": "same_camera",
+            "unknown_notes": {"text": rejected, "anything": rejected},
+        },
+        # An unknown parent must never grant blanket access to its descendants.
+        "unknown_dict": {
+            "default": rejected,
+            "arbitrary": rejected,
+            "nested": {"free_text": rejected},
+        },
+    }
+    contract = seedream_recovery.freeze_semantic_contract(
+        original, {"frozen_frame": frame},
+    )
+    retry_prompt = seedream_recovery._inject_semantic_contract(
+        "两件玩具进行轻柔、克制的接触", contract,
+    )
+
+    assert rejected not in retry_prompt
+    assert '"relation_id":"REL_01"' in retry_prompt
+    assert '"subject_key":"toy-a"' in retry_prompt
+    assert '"predicate":"contacts"' in retry_prompt
+    assert '"object_key":"toy-b"' in retry_prompt
+    assert '"count":2' in retry_prompt
+    assert '"order":1' in retry_prompt
+    assert '"time":1.25' in retry_prompt
+    assert '"camera":"fixed"' in retry_prompt
+    assert '"composition":"two-shot"' in retry_prompt
+    assert '"environment":"indoor-workbench"' in retry_prompt
+    assert '"source_sha256":"' + "b" * 64 + '"' in retry_prompt
+    assert "unknown_dict" not in retry_prompt
+
+
 def test_neutralizer_runner_explicitly_uses_luna_max(tmp_path: Path) -> None:
     argv = CodexRunner(
         timeout_s=1,
@@ -405,6 +475,69 @@ def test_seedream_paid_receipt_has_one_cross_thread_post_winner(
         receipt_path=receipt, transport=transport,
     )) == output
     assert calls == 1
+
+
+def test_seedream_claim_has_one_multiprocess_winner_and_crash_is_get_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARK_API_KEY", "secret")
+    context = multiprocessing.get_context("fork")
+    claim = tmp_path / "attempt.json.post-claim"
+    prompt = "same frozen prompt"
+    image = _png()
+    settings = _settings(tmp_path)
+    binding = {
+        "model": settings.seedream_model,
+        "mode": settings.seedream_edit_mode,
+        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "input_sha256": [hashlib.sha256(image).hexdigest()],
+    }
+    request_sha = hashlib.sha256(json.dumps(
+        binding, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    payload = {
+        "version": 1,
+        "kind": "seedream_paid_post",
+        "request_sha256": request_sha,
+        "claimed_at_unix_ns": 1,
+    }
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_exclusive_claim_worker,
+            args=(str(claim), payload, start, results),
+        )
+        for _index in range(4)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    outcomes = [results.get(timeout=1) for _process in processes]
+    assert outcomes.count(True) == 1
+    assert outcomes.count(False) == 3
+    assert json.loads(claim.read_text()) == payload
+
+    # The winner is now treated as if it crashed before writing the receipt.
+    # The surviving process must not infer that no provider POST occurred.
+    calls = 0
+
+    async def forbidden_post(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    with pytest.raises(seedream.SeedreamError) as caught:
+        asyncio.run(seedream.edit(
+            settings, [image], prompt, tmp_path / "out.png",
+            receipt_path=tmp_path / "attempt.json",
+            transport=httpx.MockTransport(forbidden_post),
+        ))
+    assert caught.value.code == "submission_unknown"
+    assert calls == 0
 
 
 def test_neutralization_claim_caps_codex_and_retry_post_across_threads(
