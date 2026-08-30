@@ -614,11 +614,20 @@ def _validate_project_index_frame_bindings(
     frame_orders_by_segment: dict[int, frozenset[int]],
 ) -> None:
     """Bind every model occurrence to one real staged segment/frame."""
+    if (
+        not frame_orders_by_segment
+        or any(not orders for orders in frame_orders_by_segment.values())
+        or not index["scenes"]
+    ):
+        raise ValueError("project index output is invalid")
 
-    def validate_occurrences(occurrences: object, *, relation: bool) -> None:
+    def validate_occurrences(
+        occurrences: object, *, relation: bool,
+    ) -> set[tuple[int, int]]:
         if not isinstance(occurrences, list) or not occurrences:
             raise ValueError("project index output is invalid")
         seen_segments: set[int] = set()
+        bound_frames: set[tuple[int, int]] = set()
         for occurrence in occurrences:
             if not isinstance(occurrence, dict):
                 raise ValueError("project index output is invalid")
@@ -648,12 +657,30 @@ def _validate_project_index_frame_bindings(
                 or not set(orders).issubset(frame_orders_by_segment[segment_index])
             ):
                 raise ValueError("project index output is invalid")
+            bound_frames.update((segment_index, order) for order in orders)
+        return bound_frames
 
-    for category in ("people", "entities", "scenes"):
+    for category in ("people", "entities"):
         for item in index[category].values():
             validate_occurrences(item.get("occurrences"), relation=False)
     for item in index["relations"].values():
         validate_occurrences(item.get("occurrences"), relation=True)
+
+    expected_scene_frames = {
+        (segment_index, frame_order)
+        for segment_index, frame_orders in frame_orders_by_segment.items()
+        for frame_order in frame_orders
+    }
+    bound_scene_frames: set[tuple[int, int]] = set()
+    for item in index["scenes"].values():
+        item_frames = validate_occurrences(
+            item.get("occurrences"), relation=False,
+        )
+        if bound_scene_frames.intersection(item_frames):
+            raise ValueError("project index output is invalid")
+        bound_scene_frames.update(item_frames)
+    if bound_scene_frames != expected_scene_frames:
+        raise ValueError("project index output is invalid")
 
 
 def _generate_project_element_index(

@@ -82,7 +82,14 @@ def _element_index() -> dict:
                 "preserve": ["function", "interface"],
             }
         },
-        "scenes": {},
+        "scenes": {
+            "scene-01": {
+                "source_visual_description": "indoor activity area",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1, 2]}],
+                "replaceable": ["environment"],
+                "preserve": ["layout", "camera geometry"],
+            }
+        },
         "relations": {
             "relation-01": {
                 "subject_key": "entity-01",
@@ -211,6 +218,65 @@ def test_project_index_rejects_unbound_or_duplicate_frame_references(
             skill_bytes=b"frozen video-maker skill",
         )
     assert not (cdir / "work" / "element_index.json").exists()
+
+
+@pytest.mark.parametrize(
+    "invalid_case",
+    ["empty", "missing_frame", "duplicate_frame", "unknown_frame"],
+)
+def test_project_index_requires_exactly_one_scene_for_every_input_frame(
+    tmp_path, invalid_case,
+):
+    cdir = tmp_path / "conversation"
+    frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
+    frames.mkdir(parents=True)
+    frame_paths = [frames / "01.png", frames / "02.png"]
+    for path in frame_paths:
+        path.write_bytes(_png())
+    payload = copy.deepcopy(_element_index())
+    scene = payload["scenes"]["scene-01"]
+    if invalid_case == "empty":
+        payload["scenes"] = {}
+    elif invalid_case == "missing_frame":
+        scene["occurrences"][0]["frame_orders"] = [1]
+    elif invalid_case == "duplicate_frame":
+        payload["scenes"]["scene-02"] = {
+            **copy.deepcopy(scene),
+            "occurrences": [{"segment_index": 1, "frame_orders": [2]}],
+        }
+    else:
+        scene["occurrences"][0]["frame_orders"] = [1, 3]
+
+    with pytest.raises(ValueError, match="project index output is invalid"):
+        pipeline._generate_project_element_index(
+            _IndexRunner(payload),
+            cdir,
+            {1: frame_paths},
+            skill_bytes=b"frozen video-maker skill",
+        )
+    assert not (cdir / "work" / "element_index.json").exists()
+
+
+def test_project_index_allows_empty_people_and_entities(tmp_path):
+    cdir = tmp_path / "conversation"
+    frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
+    frames.mkdir(parents=True)
+    frame_paths = [frames / "01.png", frames / "02.png"]
+    for path in frame_paths:
+        path.write_bytes(_png())
+    payload = copy.deepcopy(_element_index())
+    payload["people"] = {}
+    payload["entities"] = {}
+    payload["relations"] = {}
+
+    result = pipeline._generate_project_element_index(
+        _IndexRunner(payload),
+        cdir,
+        {1: frame_paths},
+        skill_bytes=b"frozen video-maker skill",
+    )
+
+    assert json.loads(result.read_text(encoding="utf-8")) == payload
 
 
 def test_segmented_image_prompt_generation_passes_element_index_once(

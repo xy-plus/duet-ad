@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 
 import jsonschema
+import pytest
 
 from app import codex_output_schemas, codex_runner
 from app.codex_runner import CodexRunner
@@ -50,7 +51,13 @@ def test_project_index_dto_is_indexed_without_losing_relation_fields() -> None:
             "replaceable": ["appearance"],
             "preserve": ["function"],
         }],
-        "scenes": [],
+        "scenes": [{
+            "key": "scene-01",
+            "source_visual_description": "room",
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+            "replaceable": ["environment"],
+            "preserve": ["layout"],
+        }],
         "relations": [{
             "key": "relation-01",
             "subject_key": "person-01",
@@ -72,6 +79,30 @@ def test_project_index_dto_is_indexed_without_losing_relation_fields() -> None:
     assert normalized["relations"]["relation-01"] == {
         key: value for key, value in model["relations"][0].items() if key != "key"
     }
+
+
+def test_project_index_schema_requires_scene_but_not_people_or_entities() -> None:
+    schema = codex_output_schemas.PROJECT_INDEX_SCHEMA
+    assert schema["properties"]["scenes"]["minItems"] == 1
+    assert schema["properties"]["people"]["minItems"] == 0
+    assert schema["properties"]["entities"]["minItems"] == 0
+
+    without_people_or_entities = {
+        "people": [],
+        "entities": [],
+        "scenes": [{
+            "key": "scene-01",
+            "source_visual_description": "room",
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+            "replaceable": ["environment"],
+            "preserve": ["layout"],
+        }],
+        "relations": [],
+    }
+    jsonschema.validate(without_people_or_entities, schema)
+    without_people_or_entities["scenes"] = []
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(without_people_or_entities, schema)
 
 
 def test_image_dtos_use_explicit_keys_and_backend_indexes_every_level() -> None:

@@ -67,7 +67,7 @@ _RELATION = _object({
 PROJECT_INDEX_SCHEMA = _object({
     "people": _array(_ELEMENT, maximum=100),
     "entities": _array(_ELEMENT, maximum=100),
-    "scenes": _array(_ELEMENT, maximum=100),
+    "scenes": _array(_ELEMENT, minimum=1, maximum=100),
     "relations": _array(_RELATION, maximum=200),
 })
 

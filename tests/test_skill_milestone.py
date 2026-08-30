@@ -200,7 +200,21 @@ def test_pipeline_video_and_image_calls_consume_same_frozen_bytes(
         ):
             seen_video.append((cwd / "SKILL.md").read_bytes())
             assert output_schema["properties"]["people"]["type"] == "array"
-            output = b'{"people":[],"entities":[],"scenes":[],"relations":[]}\n'
+            output = json.dumps({
+                "people": [],
+                "entities": [],
+                "scenes": [{
+                    "key": "scene-01",
+                    "source_visual_description": "room",
+                    "occurrences": [{
+                        "segment_index": 1,
+                        "frame_orders": [1],
+                    }],
+                    "replaceable": ["environment"],
+                    "preserve": ["layout"],
+                }],
+                "relations": [],
+            }).encode("utf-8")
             output_path.write_bytes(output)
             return validate_output(output)
 
