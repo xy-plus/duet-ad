@@ -1,6 +1,7 @@
 import json
 
 from test_web_h3_contract import APP_JS, _run_contract
+from test_legacy_phase2_frame_viewer import _run_jsdom_contract
 
 
 INDEX_HTML = APP_JS.parent / "index.html"
@@ -85,6 +86,28 @@ def test_precreate_controls_expose_defaults_and_conservative_fallback_copy():
     assert '"使用服务器默认配置"' in source
     assert '"当前服务器未声明可选配置；页面不会发送未知字段。"' in source
     assert '"提交一次后将按此配置自动运行至成片，中途无需确认。"' in source
+
+
+def test_generation_config_disclosure_is_open_on_first_render_and_creation_reset():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    assert '<details id="generation-config" class="generation-config" open>' in html
+
+    enter = source.split("function enterApp()", 1)[1].split(
+        "/* ===== 侧栏会话列表", 1
+    )[0]
+    new_chat = source.split('$("new-chat-btn").addEventListener', 1)[1].split(
+        '$("attach-btn")', 1
+    )[0]
+    assert "resetGenerationConfigDisclosure()" in enter
+    assert "resetGenerationConfigDisclosure()" in new_chat
+
+    result = _run_jsdom_contract(
+        "(()=>{const details=document.createElement('details');details.id='generation-config';"
+        "details.open=false;document.body.appendChild(details);"
+        "contract.resetGenerationConfigDisclosure();return {open:details.open,connected:details.isConnected}})()"
+    )
+    assert result == {"open": True, "connected": True}
 
 
 def test_upload_wires_capability_gated_multipart_json_without_provider_calls():

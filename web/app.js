@@ -1131,6 +1131,7 @@ function enterApp() {
   $("app-view").hidden = false;
   state.currentId = null;
   state.detail = null;
+  resetGenerationConfigDisclosure();
   renderEmptyHero();
   void loadGenerationConfigCapability();
   refreshList(true);
@@ -3892,6 +3893,10 @@ function setComposerError(msg) {
   }
 }
 
+function resetGenerationConfigDisclosure() {
+  $("generation-config").open = true;
+}
+
 function selectedGenerationConfig() {
   return {
     optimize_image: $("generation-optimize-image").checked,
@@ -4234,6 +4239,7 @@ function bindEvents() {
     if (!await guardDirtyPrompt()) return;
     state.currentId = null;
     state.detail = null;
+    resetGenerationConfigDisclosure();
     renderList();
     renderEmptyHero();
     closeDrawer();
@@ -4387,6 +4393,7 @@ if (typeof module !== "undefined" && module.exports) {
     releaseTrackedURL,
     releaseHistoryThumbnails,
     readOnlyImageFramePromptText,
+    resetGenerationConfigDisclosure,
     resetSegmentProductsDisclosure,
     requestGenerationSubmit,
     retryPostprocessSegment,
