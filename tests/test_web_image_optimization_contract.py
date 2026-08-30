@@ -146,8 +146,9 @@ def test_dirty_prompt_dialog_escape_resolves_as_cancel():
 
 def test_postprocess_modal_uses_capabilities_and_image_default_off():
     js, html, _ = _sources()
-    assert 'value="optimize_image"' in html
-    assert 'value="optimize_image" checked' not in html
+    postprocess_form = html.split('id="pp-form"', 1)[1].split("</form>", 1)[0]
+    assert 'value="optimize_image"' in postprocess_form
+    assert 'value="optimize_image" checked' not in postprocess_form
     assert "postprocess_capabilities" in js
     assert 'c.value !== "optimize_image"' in js
     assert "c.disabled = !capabilities[c.value]" in js

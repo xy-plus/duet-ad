@@ -8,6 +8,9 @@ const TOKEN_KEY = "cvs_token";
 const POLL_MS = 2000;
 const GENERATION_ASPECT_RATIOS = Object.freeze(["16:9", "9:16"]);
 const GENERATION_RESOLUTIONS = Object.freeze(["480p", "768p"]);
+const GENERATION_CONFIG_KEYS = Object.freeze([
+  "optimize_image", "remove_subtitle", "remove_watermark",
+]);
 
 const STATUS_TEXT = { queued: "排队中", processing: "处理中", done: "已完成", failed: "失败" };
 
@@ -32,6 +35,8 @@ const state = {
   historyDetails: {}, // cid → 近期会话的 GET 详情；只用于补齐历史识别信息
   historyThumbnailURLs: {}, // cid → 侧栏首帧 ObjectURL，与 stream 媒体生命周期隔离
   historyHydrating: false, // 受限并发补齐进行中，避免重复 GET 风暴
+  generationConfigCapability: null, // 仅接受 /api/capabilities 的精确 generation_config 合同
+  generationConfigCapabilityLoaded: false,
   frameSelections: {}, // cid:scope → 选中的 segment/frame；轮询和展开切换时保留
   framePickerOpen: {}, // cid:scope → 图片下拉是否展开
   promptDraft: null,   // 当前图片优化提示词草稿；跨轮询保留，跨操作由统一守卫处理
@@ -177,6 +182,65 @@ function promptWorkspaceModes() {
 
 function postprocessAskDefault() {
   return "no";
+}
+
+function hasExactKeys(value, keys) {
+  return !!value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).sort().join("|") === keys.slice().sort().join("|");
+}
+
+function validGenerationConfig(value) {
+  return hasExactKeys(value, GENERATION_CONFIG_KEYS)
+    && GENERATION_CONFIG_KEYS.every((key) => typeof value[key] === "boolean");
+}
+
+function normalizeGenerationConfigCapability(payload) {
+  const capability = payload && payload.generation_config;
+  if (!capability || capability.supported !== true
+      || capability.create_field !== "generation_config"
+      || capability.encoding !== "multipart_json"
+      || !hasExactKeys(capability.fields, GENERATION_CONFIG_KEYS)
+      || !GENERATION_CONFIG_KEYS.every((key) => capability.fields[key] === "boolean")
+      || !validGenerationConfig(capability.defaults)
+      || capability.defaults.optimize_image !== true
+      || capability.defaults.remove_subtitle !== false
+      || capability.defaults.remove_watermark !== false) return null;
+  return {
+    supported: true,
+    create_field: "generation_config",
+    encoding: "multipart_json",
+    fields: Object.assign({}, capability.fields),
+    defaults: Object.assign({}, capability.defaults),
+  };
+}
+
+function buildGenerationConfigCreateField(capability, value) {
+  const normalized = normalizeGenerationConfigCapability({ generation_config: capability });
+  if (!normalized || !validGenerationConfig(value)) return null;
+  return {
+    name: normalized.create_field,
+    value: JSON.stringify({
+      optimize_image: value.optimize_image,
+      remove_subtitle: value.remove_subtitle,
+      remove_watermark: value.remove_watermark,
+    }),
+  };
+}
+
+function generationConfigLabels(value) {
+  if (!validGenerationConfig(value)) return [];
+  return [
+    value.optimize_image ? "图片优化" : "保留原图",
+    value.remove_subtitle ? "去字幕" : "保留字幕",
+    value.remove_watermark ? "去水印" : "保留水印",
+  ];
+}
+
+function frozenGenerationConfig(detail) {
+  const config = detail && detail.generation_config;
+  const sha256 = String(detail && detail.generation_config_sha256 || "");
+  if (!validGenerationConfig(config) || !/^[0-9a-f]{64}$/.test(sha256)) return null;
+  return { config: Object.assign({}, config), sha256 };
 }
 
 async function saveActiveImagePrompt() {
@@ -1007,6 +1071,8 @@ function showLogin(message) {
   releaseHistoryThumbnails();
   state.currentId = null;
   state.detail = null;
+  state.generationConfigCapability = null;
+  state.generationConfigCapabilityLoaded = false;
   $("app-view").hidden = true;
   $("login-view").hidden = false;
   const errEl = $("login-error");
@@ -1066,6 +1132,7 @@ function enterApp() {
   state.currentId = null;
   state.detail = null;
   renderEmptyHero();
+  void loadGenerationConfigCapability();
   refreshList(true);
 }
 
@@ -1392,6 +1459,27 @@ function renderUserBubble(detail) {
   bubble.appendChild(fileRow);
   row.appendChild(bubble);
   return row;
+}
+
+function renderFrozenGenerationConfig(detail) {
+  const frozen = frozenGenerationConfig(detail);
+  if (!frozen) return null;
+  const section = el("section", "generation-config-receipt");
+  section.setAttribute("aria-label", "已冻结的生成配置");
+  const heading = el("div", "generation-config-receipt-heading");
+  heading.appendChild(el("strong", null, "生成配置"));
+  heading.appendChild(el("span", "stage-pill", "已冻结"));
+  section.appendChild(heading);
+  const chips = el("div", "generation-config-chips");
+  for (const label of generationConfigLabels(frozen.config)) {
+    chips.appendChild(el("span", "generation-config-chip", label));
+  }
+  section.appendChild(chips);
+  section.appendChild(el(
+    "p", "generation-config-freeze",
+    "创建时已固定 · 配置指纹 #" + frozen.sha256.slice(0, 8),
+  ));
+  return section;
 }
 
 /* 状态时间线（queued / processing） */
@@ -1957,6 +2045,15 @@ function renderFinalSection(detail) {
 
   if (!canOperate(detail)) {
     card.appendChild(el("p", "final-caption", "此会话为只读状态，不能修改台词、画幅、后处理或再次生成。"));
+    sec.appendChild(card);
+    return published;
+  }
+
+  if (frozenGenerationConfig(detail) && generation.status === null) {
+    const automatic = el("div", "generation-status is-running");
+    automatic.appendChild(el("strong", null, "正在按生成配置继续处理"));
+    automatic.appendChild(el("span", null, "服务端会自动运行至成片，无需再次确认或提交。"));
+    card.appendChild(automatic);
     sec.appendChild(card);
     return published;
   }
@@ -3545,6 +3642,7 @@ function renderPpAsk(detail) {
 }
 
 function shouldRenderPostprocessAsk(detail) {
+  if (frozenGenerationConfig(detail)) return false;
   const capabilities = detail.postprocess_capabilities || {};
   const enabled = Object.values(capabilities).some((value) => value === true) || detail.postprocess_enabled === true;
   const pp = detail.postprocess || {};
@@ -3573,6 +3671,8 @@ function renderStable(detail) {
   clearStream();
   const inner = el("div", "stream-inner");
   inner.appendChild(renderUserBubble(detail));
+  const frozenConfig = renderFrozenGenerationConfig(detail);
+  if (frozenConfig) inner.appendChild(frozenConfig);
   if (detail.status === "queued" || detail.status === "processing") {
     inner.appendChild(renderActivity(detail.status));
   } else if (detail.status === "failed") {
@@ -3638,6 +3738,8 @@ function detailSignature(detail) {
     detail.image_optimization_prompt || null,
     detail.postprocess_capabilities || null,
     detail.dialogue || null,
+    detail.generation_config || null,
+    detail.generation_config_sha256 || null,
     detail.skill_milestone || null,
     detail.element_index || detail.material_index || detail.project_index || null,
     pp ? pp.status : "",
@@ -3726,6 +3828,8 @@ function shouldPollDetail(detail) {
   const fusionStatus = detail.prompt_fusion && detail.prompt_fusion.status;
   const generationStatus = detail.generation && detail.generation.status;
   const navigationStatus = detail.navigation_status;
+  const automaticPending = !!frozenGenerationConfig(detail)
+    && detail.status === "done" && detail.has_video !== true && !generationStatus;
   return detail.status === "queued"
     || detail.status === "processing"
     || ppStatus === "queued"
@@ -3734,6 +3838,7 @@ function shouldPollDetail(detail) {
     || fusionStatus === "running"
     || generationStatus === "queued"
     || generationStatus === "running"
+    || automaticPending
     || ["analysis_queued", "analysis_processing", "generation_queued",
       "generation_running", "postprocessing"].includes(navigationStatus);
 }
@@ -3784,6 +3889,65 @@ function setComposerError(msg) {
     box.hidden = false;
   } else {
     box.hidden = true;
+  }
+}
+
+function selectedGenerationConfig() {
+  return {
+    optimize_image: $("generation-optimize-image").checked,
+    remove_subtitle: $("generation-remove-subtitle").checked,
+    remove_watermark: $("generation-remove-watermark").checked,
+  };
+}
+
+function applyGenerationConfigDefaults(defaults) {
+  if (!validGenerationConfig(defaults)) return;
+  $("generation-optimize-image").checked = defaults.optimize_image;
+  $("generation-remove-subtitle").checked = defaults.remove_subtitle;
+  $("generation-remove-watermark").checked = defaults.remove_watermark;
+}
+
+function renderGenerationConfigControl() {
+  const capability = state.generationConfigCapability;
+  const loaded = state.generationConfigCapabilityLoaded;
+  $("generation-config-fields").disabled = state.uploading || !capability;
+  if (!loaded) {
+    $("generation-config-summary-text").textContent = "正在读取服务器配置能力…";
+    $("generation-config-status").textContent = "配置能力确认前不会发送额外字段。";
+    return;
+  }
+  if (!capability) {
+    $("generation-config-summary-text").textContent = "使用服务器默认配置";
+    $("generation-config-status").textContent = "当前服务器未声明可选配置；页面不会发送未知字段。";
+    return;
+  }
+  $("generation-config-summary-text").textContent = generationConfigLabels(
+    selectedGenerationConfig(),
+  ).join(" · ");
+  $("generation-config-status").textContent = "提交一次后将按此配置自动运行至成片，中途无需确认。";
+}
+
+async function loadGenerationConfigCapability() {
+  const token = state.token;
+  state.generationConfigCapability = null;
+  state.generationConfigCapabilityLoaded = false;
+  renderGenerationConfigControl();
+  try {
+    const payload = await apiJSON("/api/capabilities");
+    if (token !== state.token) return;
+    state.generationConfigCapability = normalizeGenerationConfigCapability(payload);
+    if (state.generationConfigCapability) {
+      applyGenerationConfigDefaults(state.generationConfigCapability.defaults);
+    }
+  } catch (error) {
+    if (handleAuthError(error)) return;
+    if (token !== state.token) return;
+    state.generationConfigCapability = null;
+  } finally {
+    if (token === state.token) {
+      state.generationConfigCapabilityLoaded = true;
+      renderGenerationConfigControl();
+    }
   }
 }
 
@@ -3890,11 +4054,15 @@ function setUploading(on) {
   document.querySelectorAll('input[name="dialogue-mode"]').forEach((r) => {
     r.disabled = on;
   });
+  renderGenerationConfigControl();
   updateSendBtn();
   if (!on) $("upload-progress").hidden = true;
 }
 
-function uploadConversation({ file, url, note, requestId, voiceMode: mode, targetLanguage, dialogue }, onProgress) {
+function uploadConversation({
+  file, url, note, requestId, voiceMode: mode, targetLanguage, dialogue,
+  generationConfig, generationConfigCapability,
+}, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/conversations");
@@ -3935,6 +4103,11 @@ function uploadConversation({ file, url, note, requestId, voiceMode: mode, targe
     if (mode === "translate" && targetLanguage) fd.append("target_language", targetLanguage);
     fd.append("dialogue_mode", dialogue.dialogue_mode);
     if (dialogue.lines) fd.append("lines", dialogue.lines);
+    const configField = buildGenerationConfigCreateField(
+      generationConfigCapability,
+      generationConfig,
+    );
+    if (configField) fd.append(configField.name, configField.value);
     xhr.send(fd);
   });
 }
@@ -3949,6 +4122,8 @@ async function handleSend(event) {
   const note = $("note-input").value.trim();
   const vMode = voiceMode();
   const targetLanguage = $("lang-input").value.trim();
+  const generationConfig = state.generationConfigCapability
+    ? selectedGenerationConfig() : null;
   let dialogue;
   if (!file && !url) {
     setComposerError(mode === "upload" ? "请先选择视频文件" : "请先粘贴视频链接");
@@ -3982,7 +4157,8 @@ async function handleSend(event) {
     const created = await uploadConversation(
       {
         file, url, note, requestId: state.clientRequestId,
-        voiceMode: vMode, targetLanguage, dialogue,
+        voiceMode: vMode, targetLanguage, dialogue, generationConfig,
+        generationConfigCapability: state.generationConfigCapability,
       },
       (ratio) => {
         if (url) return;
@@ -4006,6 +4182,10 @@ async function handleSend(event) {
     $("create-dialogue-lines").value = "";
     $("create-dialogue-lines").required = false;
     $("create-dialogue-editor").hidden = true;
+    if (state.generationConfigCapability) {
+      applyGenerationConfigDefaults(state.generationConfigCapability.defaults);
+      renderGenerationConfigControl();
+    }
     setUploading(false);
     await refreshList(false);
     if (created && created.id) {
@@ -4093,6 +4273,12 @@ function bindEvents() {
     setComposerError(null);
     updateSendBtn();
   });
+  $("generation-config-fields").addEventListener("change", () => {
+    if (!state.generationConfigCapability || state.uploading) return;
+    state.clientRequestId = newRequestId();
+    setComposerError(null);
+    renderGenerationConfigControl();
+  });
 
   $("pp-form").addEventListener("submit", submitPostprocess);
   $("pp-cancel").addEventListener("click", closePostprocessModal);
@@ -4147,6 +4333,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildLongRetryPayload,
     buildCreateDialogueFields,
+    buildGenerationConfigCreateField,
     buildImagePromptPatch,
     buildStitchRetryPayload,
     buildResumePayload,
@@ -4171,7 +4358,9 @@ if (typeof module !== "undefined" && module.exports) {
     formatDuration,
     formatElapsed,
     formatDialogueLines,
+    frozenGenerationConfig,
     generationDraft,
+    generationConfigLabels,
     generationAction,
     generationParameterDraft,
     generationParameterSnapshot,
@@ -4183,6 +4372,7 @@ if (typeof module !== "undefined" && module.exports) {
     materialIndexView,
     mergeConversationList,
     mergeImagePromptDraft,
+    normalizeGenerationConfigCapability,
     normalizeDialogueLines,
     operationTimeline,
     parseDialogueLines,
