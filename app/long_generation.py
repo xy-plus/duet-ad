@@ -39,7 +39,14 @@ FIT_LAYOUT_LEGACY = "legacy-v0"
 FIT_LAYOUT_ASPECT = "aspect-v1"
 _FIT_LAYOUTS = frozenset({FIT_LAYOUT_LEGACY, FIT_LAYOUT_ASPECT})
 _FAST_MODE_WORKERS = 8
-_MAX_COMPILED_FUSION_CHARS = 7_000
+# Context IR mechanically adds this immutable policy before H3 submission.
+# Reserve it here so every newly compiled relation prompt has a deterministic
+# source fallback that still fits the conservative 7000-character transport.
+_MAX_COMPILED_FUSION_CHARS = (
+    context_ir_bridge.MAX_SOURCE_PROMPT_CHARS
+    - len(context_ir_bridge._DIALOGUE_POLICY)
+    - 1
+)
 _LOGGER = logging.getLogger(__name__)
 AUDIO_ROUTE_SCHEMA = "duet.long-generation.audio-route"
 AUDIO_ROUTE_VERSION = 1
@@ -59,6 +66,12 @@ PROMPT_FUSION_MANIFEST_SCHEMA = "duet.video-prompt-fusion-production"
 PROMPT_FUSION_MANIFEST_VERSION = 1
 RELATION_STATES_OPEN = "<RELATION_STATES_JSON>"
 RELATION_STATES_CLOSE = "</RELATION_STATES_JSON>"
+_RELATION_CONTRACT_LEGEND = (
+    "d[R]=[S,P,O,preserve[],replace];i=[a,b,C,H,[R,runs][]];"
+    "run=[a,b,state,geometry];H:0=start/1=hard_cut;direction:S->O;"
+    "L2:d+=[mask,s0,sN,g0,gN],i=no-runs"
+)
+_MAX_RELATION_MARKER_CHARS = 2_000
 _RELATION_OCCURRENCE_KEYS = {
     "relation_id", "subject_key", "predicate", "object_key", "state",
     "geometry", "preserve", "replace_together", "frame",
@@ -322,40 +335,484 @@ def _expected_fusion_relation_states(
     return projected
 
 
-def _compact_h3_relation_contract(relation_states: list[dict]) -> dict:
-    """Deduplicate immutable endpoints while retaining every frame state.
+def _relation_state_category(value: str) -> str:
+    lowered = value.casefold()
+    categories = (
+        ("released/separated", ("release", "separat", "detach", "释放", "分离", "脱离", "离开")),
+        ("attached/installed", ("attach", "install", "mount", "connect", "assembl", "装配", "安装", "接合", "连接", "固定")),
+        ("held/carried", ("hold", "held", "grip", "carry", "持有", "握", "携带", "托住")),
+        ("operated", ("operat", "press", "turn", "操作", "按压", "转动", "准备")),
+        ("supported/contacting", ("support", "contact", "touch", "支撑", "接触", "贴地")),
+        ("moving/spinning", ("move", "spin", "rotat", "运动", "移动", "旋转")),
+        ("displayed", ("display", "show", "展示", "举")),
+    )
+    return next(
+        (name for name, words in categories if any(word in lowered for word in words)),
+        "active/as-shown",
+    )
 
-    Wire keys are intentionally compact because H3's existing prompt transport
-    has a fixed character ceiling: d=definitions, i=intervals.
+
+def _relation_predicate_category(value: str) -> str:
+    category = _relation_state_category(value)
+    return "related-directed" if category == "active/as-shown" else category
+
+
+def _relation_geometry_category(value: str) -> str:
+    lowered = value.casefold()
+    categories = (
+        ("separated", ("separat", "gap", "分离", "间隔", "脱离", "不再接触")),
+        ("aligned/interface", ("align", "coax", "interface", "同轴", "对齐", "接口", "重合")),
+        ("contacting", ("contact", "touch", "接触", "贴", "压")),
+        ("grounded/below", ("floor", "ground", "below", "地板", "地面", "下方", "底部")),
+        ("above/top", ("above", "top", "上方", "顶部", "上端")),
+        ("relative-position", ("left", "right", "front", "behind", "左", "右", "前", "后", "附近")),
+    )
+    return next(
+        (name for name, words in categories if any(word in lowered for word in words)),
+        "as-shown",
+    )
+
+
+def _compact_h3_relation_contract(relation_states: list[dict]) -> dict:
+    """Encode exact relation facts with deterministic aliases and state RLE.
+
+    ``r/e/q/p/s/g/c`` are dictionaries for relation ids, endpoints,
+    predicates, preserve facts, states, geometry facts and scenes.  Definition
+    position is the runtime relation alias, so neither long stable ids nor
+    immutable facts are repeated.  A run is extended only across consecutive
+    evidenced frames with the exact same state and geometry; absence remains
+    absence and hard-cut intervals are never joined.
     """
-    definitions: dict[str, list] = {}
-    intervals = []
+    definitions_by_id: dict[str, tuple] = {}
     for item in relation_states:
-        interval = item["interval"]
-        states = {}
         for relation in item["relations"]:
             relation_id = relation["relation_id"]
-            definition = [
+            definition = (
                 relation["subject_key"], relation["predicate"],
-                relation["object_key"], relation["preserve"],
+                relation["object_key"], tuple(relation["preserve"]),
                 relation["replace_together"],
-            ]
-            prior = definitions.setdefault(relation_id, definition)
+            )
+            prior = definitions_by_id.setdefault(relation_id, definition)
             if prior != definition:
                 raise LongGenerationError("prompt_fusion_output_invalid")
-            states[relation_id] = [
-                [item["frame_order"], item["state"], item["geometry"]]
-                for item in relation["states"]
-            ]
+
+    relation_ids = sorted(definitions_by_id)
+    endpoints = sorted({
+        endpoint
+        for definition in definitions_by_id.values()
+        for endpoint in (definition[0], definition[2])
+    })
+    predicates = sorted({definition[1] for definition in definitions_by_id.values()})
+    preserve_facts = sorted({
+        fact
+        for definition in definitions_by_id.values()
+        for fact in definition[3]
+    })
+    states = sorted({
+        state["state"]
+        for item in relation_states
+        for relation in item["relations"]
+        for state in relation["states"]
+    })
+    geometries = sorted({
+        state["geometry"]
+        for item in relation_states
+        for relation in item["relations"]
+        for state in relation["states"]
+    })
+    scenes = sorted({item["interval"]["source_scene_id"] for item in relation_states})
+
+    def aliases(values: list[str]) -> dict[str, int]:
+        return {value: index for index, value in enumerate(values)}
+
+    relation_alias = aliases(relation_ids)
+    endpoint_alias = aliases(endpoints)
+    predicate_alias = aliases(predicates)
+    preserve_alias = aliases(preserve_facts)
+    state_alias = aliases(states)
+    geometry_alias = aliases(geometries)
+    scene_alias = aliases(scenes)
+    definitions = []
+    for relation_id in relation_ids:
+        subject, predicate, object_key, preserve, replace_together = (
+            definitions_by_id[relation_id]
+        )
+        definitions.append([
+            endpoint_alias[subject], predicate_alias[predicate],
+            endpoint_alias[object_key],
+            [preserve_alias[fact] for fact in preserve],
+            int(replace_together),
+        ])
+
+    intervals = []
+    for interval_index, item in enumerate(relation_states):
+        interval = item["interval"]
+        encoded_relations = []
+        for relation in item["relations"]:
+            runs: list[list[int]] = []
+            for state in relation["states"]:
+                frame_order = state["frame_order"]
+                encoded_state = state_alias[state["state"]]
+                encoded_geometry = geometry_alias[state["geometry"]]
+                if (
+                    runs
+                    and frame_order == runs[-1][1] + 1
+                    and encoded_state == runs[-1][2]
+                    and encoded_geometry == runs[-1][3]
+                ):
+                    runs[-1][1] = frame_order
+                else:
+                    runs.append([
+                        frame_order, frame_order,
+                        encoded_state, encoded_geometry,
+                    ])
+            encoded_relations.append([
+                relation_alias[relation["relation_id"]], runs,
+            ])
         intervals.append([
             interval["start_frame_order"], interval["end_frame_order"],
-            interval["source_scene_id"], states,
+            scene_alias[interval["source_scene_id"]],
+            0 if interval_index == 0 else 1,
+            encoded_relations,
         ])
-    return {
-        "v": 1,
+    contract = {
+        "v": 3,
+        "m": [0, "exact"],
+        "l": _RELATION_CONTRACT_LEGEND,
+        "r": relation_ids,
+        "e": endpoints,
+        "q": predicates,
+        "p": preserve_facts,
+        "s": states,
+        "g": geometries,
+        "c": scenes,
         "d": definitions,
         "i": intervals,
     }
+    if _expand_h3_relation_contract(contract) != relation_states:
+        raise LongGenerationError("prompt_fusion_output_invalid")
+
+    def marker_chars(value: dict) -> int:
+        encoded = json.dumps(
+            value, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False,
+        )
+        return len(RELATION_STATES_OPEN) + len(encoded) + len(RELATION_STATES_CLOSE)
+
+    if marker_chars(contract) <= _MAX_RELATION_MARKER_CHARS:
+        return contract
+
+    # Level 1 keeps exact endpoints, predicates, state and geometry. Stable
+    # relation ids and preserve prose remain losslessly frozen in the backend
+    # input/receipt and no longer consume provider prompt space.
+    compact = json.loads(json.dumps(contract, ensure_ascii=False))
+    compact["m"] = [1, "ids+preserve@receipt"]
+    compact["r"] = []
+    compact["p"] = []
+    for definition in compact["d"]:
+        definition[3] = []
+    if marker_chars(compact) <= _MAX_RELATION_MARKER_CHARS:
+        _expand_h3_relation_contract(compact)
+        return compact
+
+    # Level 2 is the deterministic maximum-density projection. Every directed
+    # edge, predicate, replace flag, hard-cut-local active run and lifecycle
+    # category remains. Long verbatim ids/state/geometry/preserve prose stays in
+    # the backend receipt; finite backend categories prevent valid 540-item
+    # inputs from crowding visual action/composition out of H3's prompt.
+    compact["m"] = [2, "aliases+categories;verbatim@receipt"]
+    compact["e"] = []
+    compact["c"] = []
+    categorized_predicates = sorted({
+        _relation_predicate_category(definition[1])
+        for definition in definitions_by_id.values()
+    })
+    compact["q"] = categorized_predicates
+    categorized_predicate_alias = aliases(categorized_predicates)
+    for relation_index, relation_id in enumerate(relation_ids):
+        compact["d"][relation_index][1] = categorized_predicate_alias[
+            _relation_predicate_category(definitions_by_id[relation_id][1])
+        ]
+        del compact["d"][relation_index][3]
+    categorized_states = sorted({
+        _relation_state_category(state["state"])
+        for item in relation_states
+        for relation in item["relations"]
+        for state in relation["states"]
+    } | {"active/as-shown"})
+    categorized_geometries = sorted({
+        _relation_geometry_category(state["geometry"])
+        for item in relation_states
+        for relation in item["relations"]
+        for state in relation["states"]
+    } | {"as-shown"})
+    compact["s"] = categorized_states
+    compact["g"] = categorized_geometries
+    categorized_state_alias = aliases(categorized_states)
+    categorized_geometry_alias = aliases(categorized_geometries)
+    states_by_relation: dict[str, list[dict]] = {
+        relation_id: [] for relation_id in relation_ids
+    }
+    for source_interval in relation_states:
+        for relation in source_interval["relations"]:
+            states_by_relation[relation["relation_id"]].extend(relation["states"])
+    compact_definitions = []
+    for relation_id in relation_ids:
+        subject, predicate, object_key, _preserve, replace_together = (
+            definitions_by_id[relation_id]
+        )
+        relation_history = sorted(
+            states_by_relation[relation_id], key=lambda state: state["frame_order"]
+        )
+        active_mask = sum(
+            1 << (state["frame_order"] - 1) for state in relation_history
+        )
+        first_state = relation_history[0]
+        current_state = relation_history[-1]
+        compact_definitions.append([
+            endpoint_alias[subject],
+            categorized_predicate_alias[_relation_predicate_category(predicate)],
+            endpoint_alias[object_key], int(replace_together), active_mask,
+            categorized_state_alias[_relation_state_category(first_state["state"])],
+            categorized_state_alias[_relation_state_category(current_state["state"])],
+            categorized_geometry_alias[
+                _relation_geometry_category(first_state["geometry"])
+            ],
+            categorized_geometry_alias[
+                _relation_geometry_category(current_state["geometry"])
+            ],
+        ])
+    compact["d"] = compact_definitions
+    compact["i"] = [encoded_interval[:4] for encoded_interval in compact["i"]]
+    if marker_chars(compact) > _MAX_RELATION_MARKER_CHARS:
+        # Sixty distinct directed relations with nine frames fit this schema;
+        # reaching here means the finite predicate vocabulary itself exceeded
+        # the advertised transport contract, not verbose state/geometry prose.
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    _expand_h3_relation_contract(compact)
+    return compact
+
+
+def _expand_h3_relation_contract(contract: object) -> list[dict]:
+    """Expand and fully validate the model-readable v3 wire form."""
+    if (
+        not isinstance(contract, Mapping)
+        or set(contract) != {
+            "v", "m", "l", "r", "e", "q", "p", "s", "g", "c", "d", "i",
+        }
+        or contract.get("v") != 3
+        or not isinstance(contract.get("m"), list)
+        or len(contract["m"]) != 2
+        or contract["m"][0] not in {0, 1, 2}
+        or not isinstance(contract["m"][1], str)
+        or contract.get("l") != _RELATION_CONTRACT_LEGEND
+        or any(
+            not isinstance(contract.get(key), list)
+            for key in ("r", "e", "q", "p", "s", "g", "c", "d", "i")
+        )
+    ):
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    compact_level = contract["m"][0]
+    expected_metadata = {
+        0: "exact",
+        1: "ids+preserve@receipt",
+        2: "aliases+categories;verbatim@receipt",
+    }
+    if contract["m"][1] != expected_metadata[compact_level]:
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    relation_ids = contract["r"]
+    endpoints = contract["e"]
+    predicates = contract["q"]
+    preserve_facts = contract["p"]
+    states = contract["s"]
+    geometries = contract["g"]
+    scenes = contract["c"]
+    definitions = contract["d"]
+    for dictionary in (
+        relation_ids, endpoints, predicates, preserve_facts,
+        states, geometries, scenes,
+    ):
+        if (
+            any(not isinstance(value, str) or not value for value in dictionary)
+            or dictionary != sorted(set(dictionary))
+        ):
+            raise LongGenerationError("prompt_fusion_output_invalid")
+    if (
+        (compact_level == 0 and len(relation_ids) != len(definitions))
+        or (compact_level > 0 and relation_ids)
+    ):
+        raise LongGenerationError("prompt_fusion_output_invalid")
+
+    def lookup(values: list, index: object) -> object:
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(values)
+        ):
+            raise LongGenerationError("prompt_fusion_output_invalid")
+        return values[index]
+
+    def runtime_alias(index: object, prefix: str) -> str:
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise LongGenerationError("prompt_fusion_output_invalid")
+        return f"{prefix}{index + 1}"
+
+    expanded = []
+    for interval_index, encoded_interval in enumerate(contract["i"]):
+        expected_interval_size = 4 if compact_level == 2 else 5
+        if (
+            not isinstance(encoded_interval, list)
+            or len(encoded_interval) != expected_interval_size
+        ):
+            raise LongGenerationError("prompt_fusion_output_invalid")
+        first, last, scene_index, boundary = encoded_interval[:4]
+        encoded_relations = (
+            encoded_interval[4] if compact_level != 2 else []
+        )
+        if (
+            isinstance(first, bool) or not isinstance(first, int)
+            or isinstance(last, bool) or not isinstance(last, int)
+            or not 1 <= first <= last <= 9
+            or boundary != (0 if interval_index == 0 else 1)
+            or not isinstance(encoded_relations, list)
+        ):
+            raise LongGenerationError("prompt_fusion_output_invalid")
+        relations = []
+        if compact_level == 2:
+            active_state_index = states.index("active/as-shown")
+            active_geometry_index = geometries.index("as-shown")
+            for relation_index, definition in enumerate(definitions):
+                if not isinstance(definition, list) or len(definition) != 9:
+                    raise LongGenerationError("prompt_fusion_output_invalid")
+                active_mask = definition[4]
+                if (
+                    isinstance(active_mask, bool)
+                    or not isinstance(active_mask, int)
+                    or not 0 < active_mask < (1 << 9)
+                ):
+                    raise LongGenerationError("prompt_fusion_output_invalid")
+                active_frames = [
+                    frame for frame in range(1, 10)
+                    if active_mask & (1 << (frame - 1))
+                ]
+                interval_frames = [
+                    frame for frame in active_frames if first <= frame <= last
+                ]
+                if not interval_frames:
+                    continue
+                runs: list[list[int]] = []
+                for frame in interval_frames:
+                    state_index = (
+                        definition[5] if frame == active_frames[0]
+                        else definition[6] if frame == active_frames[-1]
+                        else active_state_index
+                    )
+                    geometry_index = (
+                        definition[7] if frame == active_frames[0]
+                        else definition[8] if frame == active_frames[-1]
+                        else active_geometry_index
+                    )
+                    if (
+                        runs and frame == runs[-1][1] + 1
+                        and state_index == runs[-1][2]
+                        and geometry_index == runs[-1][3]
+                    ):
+                        runs[-1][1] = frame
+                    else:
+                        runs.append([
+                            frame, frame, state_index, geometry_index,
+                        ])
+                encoded_relations.append([relation_index, runs])
+        previous_relation_index = -1
+        for encoded_relation in encoded_relations:
+            if not isinstance(encoded_relation, list) or len(encoded_relation) != 2:
+                raise LongGenerationError("prompt_fusion_output_invalid")
+            relation_index, encoded_runs = encoded_relation
+            if (
+                isinstance(relation_index, bool)
+                or not isinstance(relation_index, int)
+                or not 0 <= relation_index < len(definitions)
+                or relation_index <= previous_relation_index
+            ):
+                raise LongGenerationError("prompt_fusion_output_invalid")
+            previous_relation_index = relation_index
+            relation_id = (
+                lookup(relation_ids, relation_index)
+                if compact_level == 0 else runtime_alias(relation_index, "R")
+            )
+            definition = lookup(definitions, relation_index)
+            expected_definition_size = 9 if compact_level == 2 else 5
+            if (
+                not isinstance(definition, list)
+                or len(definition) != expected_definition_size
+            ):
+                raise LongGenerationError("prompt_fusion_output_invalid")
+            if compact_level == 2:
+                subject, predicate, object_key, replace_together = definition[:4]
+                preserve = []
+            else:
+                subject, predicate, object_key, preserve, replace_together = definition
+            if (
+                not isinstance(preserve, list)
+                or replace_together not in {0, 1}
+                or not isinstance(encoded_runs, list)
+            ):
+                raise LongGenerationError("prompt_fusion_output_invalid")
+            expanded_states = []
+            previous_frame = 0
+            for run in encoded_runs:
+                if not isinstance(run, list) or len(run) != 4:
+                    raise LongGenerationError("prompt_fusion_output_invalid")
+                run_first, run_last, state_index, geometry_index = run
+                if (
+                    isinstance(run_first, bool) or not isinstance(run_first, int)
+                    or isinstance(run_last, bool) or not isinstance(run_last, int)
+                    or not first <= run_first <= run_last <= last
+                    or run_first <= previous_frame
+                    or (
+                        expanded_states
+                        and run_first == previous_frame + 1
+                        and expanded_states[-1]["state"]
+                        == lookup(states, state_index)
+                        and expanded_states[-1]["geometry"]
+                        == lookup(geometries, geometry_index)
+                    )
+                ):
+                    raise LongGenerationError("prompt_fusion_output_invalid")
+                for frame_order in range(run_first, run_last + 1):
+                    expanded_states.append({
+                        "frame_order": frame_order,
+                        "state": lookup(states, state_index),
+                        "geometry": lookup(geometries, geometry_index),
+                    })
+                previous_frame = run_last
+            relations.append({
+                "relation_id": relation_id,
+                "subject_key": (
+                    lookup(endpoints, subject)
+                    if endpoints else runtime_alias(subject, "E")
+                ),
+                "predicate": lookup(predicates, predicate),
+                "object_key": (
+                    lookup(endpoints, object_key)
+                    if endpoints else runtime_alias(object_key, "E")
+                ),
+                "preserve": [lookup(preserve_facts, item) for item in preserve],
+                "replace_together": bool(replace_together),
+                "states": expanded_states,
+            })
+        expanded.append({
+            "interval": {
+                "start_frame_order": first,
+                "end_frame_order": last,
+                "source_scene_id": (
+                    lookup(scenes, scene_index)
+                    if scenes else runtime_alias(scene_index, "C")
+                ),
+            },
+            "relations": relations,
+        })
+    return expanded
 
 
 def _h3_timecode(value: object) -> str:
@@ -440,13 +897,8 @@ def _compile_fusion_ref2va_prompt(
             order = int(frame["order"])
             if relation_contract_enabled:
                 subject_definitions.append(
-                    f"<Picture {order}>: [Shot {shot_index}] storyboard anchor "
-                    f"at {_h3_timecode(frame['segment_time_s'])}; exact ordered "
-                    "visual state and composition."
-                )
-                retention.append(
-                    f"<Picture {order}>: fully_preserved [Shot {shot_index}] "
-                    "visual-state/composition anchor."
+                    f"<Picture {order}>=[Shot {shot_index}]@"
+                    f"{_h3_timecode(frame['segment_time_s'])}."
                 )
             else:
                 subject_definitions.append(
@@ -507,11 +959,20 @@ def _compile_fusion_ref2va_prompt(
             "person's lips remain completely closed."
         )
 
-    prompt_lines = subject_definitions + [
-        "summary:",
-        "[keyframe completion] The target video follows <Picture 1> through "
-        "<Picture 9> as ordered storyboard keyframe anchors.",
-    ] + retention + ["detailed_description:"]
+    if relation_contract_enabled:
+        prompt_lines = subject_definitions + [
+            "summary:",
+            "Use <Picture 1> through <Picture 9> as exact ordered anchors.",
+            "retention_analysis:",
+            "Preserve all nine anchors and the backend relation contract.",
+            "detailed_description:",
+        ]
+    else:
+        prompt_lines = subject_definitions + [
+            "summary:",
+            "[keyframe completion] The target video follows <Picture 1> through "
+            "<Picture 9> as ordered storyboard keyframe anchors.",
+        ] + retention + ["detailed_description:"]
     for shot in details:
         prompt_lines.extend(shot)
     prompt_lines.extend([

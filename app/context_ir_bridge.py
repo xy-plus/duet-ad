@@ -722,15 +722,52 @@ def _relation_states_contract(prompt: str) -> str | None:
         )
     except (TypeError, ValueError):
         raise ContextIrContractError("source_relation_states_invalid") from None
-    if (
-        not isinstance(value, dict)
-        or set(value) != {"v", "d", "i"}
-        or value.get("v") != 1
-        or not isinstance(value.get("d"), dict)
-        or not isinstance(value.get("i"), list)
-        or raw != canonical
-    ):
+    legacy_shape = bool(
+        isinstance(value, dict)
+        and set(value) == {"v", "d", "i"}
+        and value.get("v") == 1
+        and isinstance(value.get("d"), dict)
+        and isinstance(value.get("i"), list)
+    )
+    compact_shape = bool(
+        isinstance(value, dict)
+        and (
+            (
+                set(value) == {
+                    "v", "l", "r", "e", "q", "p", "s", "g", "c", "d", "i",
+                }
+                and value.get("v") == 2
+            )
+            or (
+                set(value) == {
+                    "v", "m", "l", "r", "e", "q", "p", "s", "g", "c", "d", "i",
+                }
+                and value.get("v") == 3
+            )
+        )
+        and isinstance(value.get("l"), str) and value["l"].strip()
+        and all(isinstance(value.get(key), list) for key in (
+            "r", "e", "q", "p", "s", "g", "c", "d", "i",
+        ))
+    )
+    if raw != canonical or not (legacy_shape or compact_shape):
         raise ContextIrContractError("source_relation_states_invalid")
+    if isinstance(value, dict) and value.get("v") == 3:
+        try:
+            # Lazy import avoids the module-level Context IR/Fusion dependency
+            # cycle while making H3 intake run the authoritative alias/index,
+            # legend, boundary and canonical-RLE decoder.
+            from app import long_generation
+
+            long_generation._expand_h3_relation_contract(value)
+        except ImportError:
+            raise ContextIrContractError(
+                "source_relation_states_invalid"
+            ) from None
+        except long_generation.LongGenerationError:
+            raise ContextIrContractError(
+                "source_relation_states_invalid"
+            ) from None
     return f"{_RELATION_STATES_OPEN}{raw}{_RELATION_STATES_CLOSE}"
 
 
@@ -853,10 +890,26 @@ def _compile_effective_prompt(
     suffix = _fusion_policy_suffix(request.source_prompt)
     if suffix is None:
         effective = _with_dialogue_policy(context_output_prompt)
-        return (
+        compiled = (
             f"{effective}\n{relation_contract}"
             if relation_contract is not None else effective
         )
+        if relation_contract is None or len(compiled) <= MAX_SOURCE_PROMPT_CHARS:
+            return compiled
+        # Context IR may expand prose up to its 32 KiB response ceiling.  For
+        # relation-bearing Ref2VA prompts, fall back to the exact backend source
+        # semantics rather than failing the pipeline or sending an unproven
+        # over-7000 provider prompt.  Dialogue language is still resolved
+        # mechanically and the authoritative relation block remains byte exact.
+        source_visual = _without_relation_states(request.source_prompt)
+        if _is_current_ref2va(request):
+            source_visual = _bind_exact_dialogue(request, source_visual)
+        fallback = (
+            f"{_with_dialogue_policy(source_visual)}\n{relation_contract}"
+        )
+        if len(fallback) > MAX_SOURCE_PROMPT_CHARS:
+            raise ContextIrContractError("source_prompt_too_long")
+        return fallback
     visual = _without_dialogue_policy(context_output_prompt)
     opening = "<VISUAL>"
     closing = "</VISUAL>"
@@ -893,10 +946,24 @@ def _compile_effective_prompt(
     relation_suffix = (
         f"\n{relation_contract}" if relation_contract is not None else ""
     )
-    return (
+    compiled = (
         f"<VISUAL>\n{visual}{relation_suffix}\n</VISUAL>\n"
         f"{_DIALOGUE_POLICY}\n{suffix}"
     )
+    if relation_contract is None or len(compiled) <= MAX_SOURCE_PROMPT_CHARS:
+        return compiled
+    source_visual = _without_relation_states(request.source_prompt)
+    if source_visual.endswith(suffix):
+        source_visual = source_visual[:-len(suffix)].rstrip()
+    if source_visual.startswith("<VISUAL>") and source_visual.endswith("</VISUAL>"):
+        source_visual = source_visual[len("<VISUAL>"):-len("</VISUAL>")].strip()
+    fallback = (
+        f"<VISUAL>\n{source_visual}\n{relation_contract}\n</VISUAL>\n"
+        f"{_DIALOGUE_POLICY}\n{suffix}"
+    )
+    if len(fallback) > MAX_SOURCE_PROMPT_CHARS:
+        raise ContextIrContractError("source_prompt_too_long")
+    return fallback
 
 
 def _mime_type(path: Path, *, audio: bool) -> str:
