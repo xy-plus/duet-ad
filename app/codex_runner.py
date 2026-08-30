@@ -37,9 +37,9 @@ from app import error_trace
 
 _LOGGER = logging.getLogger(__name__)
 
-# 调用级固定 medium：流水线看图/听写任务要速度不要 max 深度（实测 max 下段任务 30 分钟超时 vs medium 410s）；用户交互式 codex 的全局 effort 不受影响
+# 默认调用级固定 medium；少数明确恢复任务可在构造器中显式覆盖。流水线看图/听写任务仍取默认值，
+# 用户交互式 codex 的全局 effort 不受影响。
 _SANDBOX_CONFIGS = [
-    "model_reasoning_effort=\"medium\"",
     "sandbox_workspace_write.network_access=false",
     'shell_environment_policy.inherit="core"',
     'shell_environment_policy.exclude=["*KEY*","*TOKEN*","*SECRET*","*PASSWORD*"]',
@@ -358,9 +358,22 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
 
 
 class CodexRunner:
-    def __init__(self, timeout_s: int, concurrency: int) -> None:
+    def __init__(
+        self,
+        timeout_s: int,
+        concurrency: int,
+        *,
+        model: str | None = None,
+        reasoning_effort: str = "medium",
+    ) -> None:
+        if model is not None and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", model) is None:
+            raise ValueError("invalid Codex model")
+        if reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("invalid Codex reasoning effort")
         self._timeout_s = timeout_s
         self._sem = threading.Semaphore(concurrency)
+        self._model = model
+        self._reasoning_effort = reasoning_effort
 
     def build_argv(self, workdir: Path, prompt: str) -> list[str]:
         active = _ACTIVE_ISOLATED_STAGE.get()
@@ -388,6 +401,9 @@ class CodexRunner:
             if isolated_stage is not None
             else str(workdir / "codex_last_message.txt"),
         ]
+        if self._model is not None:
+            argv += ["-m", self._model]
+        argv += ["-c", f'model_reasoning_effort="{self._reasoning_effort}"']
         for cfg in _SANDBOX_CONFIGS:
             argv += ["-c", cfg]
         argv.append(prompt)

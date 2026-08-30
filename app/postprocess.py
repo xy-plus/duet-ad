@@ -16,7 +16,15 @@ from pathlib import Path
 
 import cv2
 
-from app import error_trace, image_optimization, mediakit, seedream, skill_milestone, storage
+from app import (
+    error_trace,
+    image_optimization,
+    mediakit,
+    seedream,
+    seedream_recovery,
+    skill_milestone,
+    storage,
+)
 from app.config import Settings
 from app.sanitize import sanitize
 
@@ -1184,9 +1192,10 @@ async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
             raise PostprocessError(409, "image_optimization_prompt_invalid")
         prompt = _frame_prompt(private, index, source.name, source_sha256)
         async with sem:
-            await seedream.edit(
+            await seedream_recovery.edit_with_content_recovery(
                 task_settings, [path.read_bytes() for path in image_inputs], prompt, output,
                 receipt_path=attempts / f"{position:04d}-r{revision}.json",
+                session_dir=cdir,
             )
         publish_progress()
 
@@ -2019,12 +2028,13 @@ async def _v4_generate_composite_replacement_board(
             seedream_timeout_s=private["timeout_s"],
         )
         async with seedream_sem:
-            await seedream.edit(
+            await seedream_recovery.edit_with_content_recovery(
                 task_settings,
                 [canvas.read_bytes(), evidence_sheet.read_bytes()],
                 image_optimization.composite_replacement_board_prompt(plan),
                 raw_output,
                 receipt_path=attempt,
+                session_dir=cdir,
             )
         _draw_replacement_board_labels(raw_output, output, len(tiles))
     except seedream.SeedreamError as exc:
@@ -2089,9 +2099,10 @@ async def _v4_anchor(
         if not attempt_path.is_file():
             raise PostprocessError(409, "submission_unknown")
         try:
-            await seedream.edit(
+            await seedream_recovery.edit_with_content_recovery(
                 task_settings, [path.read_bytes() for path in inputs], prompt, output,
                 receipt_path=attempt_path,
+                session_dir=cdir,
             )
         except seedream.SeedreamError as exc:
             raise PostprocessError(502, exc.code) from None
@@ -2110,12 +2121,13 @@ async def _v4_anchor(
     attempts.mkdir(parents=True, exist_ok=True)
     try:
         async with seedream_sem:
-            await seedream.edit(
+            await seedream_recovery.edit_with_content_recovery(
                 task_settings,
                 [path.read_bytes() for path in inputs],
                 prompt,
                 output,
                 receipt_path=attempt_path,
+                session_dir=cdir,
             )
     except seedream.SeedreamError as exc:
         raise PostprocessError(502, exc.code) from None

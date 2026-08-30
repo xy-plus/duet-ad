@@ -25,10 +25,17 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class SeedreamError(RuntimeError):
-    def __init__(self, code: str, detail: str = "Seedream image edit failed"):
+    def __init__(
+        self,
+        code: str,
+        detail: str = "Seedream image edit failed",
+        *,
+        provider_error_code: str | None = None,
+    ):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+        self.provider_error_code = provider_error_code
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -114,11 +121,18 @@ def _write_exact_png(raw: bytes, out: Path, width: int, height: int) -> None:
 
 
 async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, *,
-               receipt_path: Path, transport=None) -> Path:
+               receipt_path: Path, transport=None,
+               max_post_attempts: int = MAX_POST_ATTEMPTS) -> Path:
     key = os.environ.get("ARK_API_KEY", "").strip()
     if not key:
         raise SeedreamError("seedream_not_configured")
     if not images:
+        raise SeedreamError("invalid_input")
+    if (
+        isinstance(max_post_attempts, bool)
+        or not isinstance(max_post_attempts, int)
+        or not 1 <= max_post_attempts <= MAX_POST_ATTEMPTS
+    ):
         raise SeedreamError("invalid_input")
     first = cv2.imdecode(np.frombuffer(images[0], np.uint8), cv2.IMREAD_UNCHANGED)
     if first is None:
@@ -164,7 +178,13 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
         if status in {"submitting", "submission_unknown"}:
             raise SeedreamError("submission_unknown")
         if status == "failed":
-            raise SeedreamError("provider_rejected")
+            provider_error_code = existing.get("provider_error_code")
+            raise SeedreamError(
+                "provider_rejected",
+                provider_error_code=(
+                    provider_error_code if isinstance(provider_error_code, str) else None
+                ),
+            )
         if status == "quota_retryable":
             # This legacy state proves that the frozen request was already
             # submitted once.  Never turn recovery into another paid POST.
@@ -190,7 +210,7 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
         payload["sequential_image_generation"] = "disabled"
     timeout = httpx.Timeout(settings.seedream_timeout_s)
     async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
-        for attempt in range(1, MAX_POST_ATTEMPTS + 1):
+        for attempt in range(1, max_post_attempts + 1):
             attempts = [{"number": attempt, "status": "submitting"}]
             current = {**base_receipt, "attempt": attempt, "attempts": attempts}
             _atomic_json(receipt_path, current)
@@ -235,7 +255,9 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
                     logger=_LOGGER,
                     secrets=(key,),
                 )
-                raise SeedreamError("provider_rejected")
+                raise SeedreamError(
+                    "provider_rejected", provider_error_code=error_code,
+                )
             try:
                 response_payload = response.json()
             except ValueError as exc:
