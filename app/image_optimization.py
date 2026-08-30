@@ -3828,8 +3828,8 @@ def _run_image_skill_phase(
 ) -> dict:
     output = stage / "work" / output_name
     prompt = (
-        "严格执行当前目录 SKILL.md；只读取允许的输入；用同目录临时文件完整写出"
-        "规定 JSON，再原子替换唯一输出文件，并立即退出。"
+        "严格执行当前目录 SKILL.md；只读取允许的输入；将完整、可解析的规定 JSON "
+        "写入唯一输出文件并立即退出。文件校验与正式发布由后端负责。"
     )
     if hasattr(runner, "run_isolated_until_output"):
         return runner.run_isolated_until_output(

@@ -2085,7 +2085,7 @@ class TestCodexRunner:
             assert result == {"ok": True}
             assert time.monotonic() - started < 3
 
-    def test_isolated_direct_partial_write_is_not_a_completion_signal(
+    def test_isolated_direct_write_is_adopted_after_clean_exit(
         self, monkeypatch, tmp_path,
     ):
         cdir = tmp_path / "conversation"
@@ -2109,7 +2109,77 @@ class TestCodexRunner:
                 ],
             )
 
-            with pytest.raises(CodexError, match="atomically publishing"):
+            assert runner.run_isolated_until_output(
+                stage,
+                "prompt",
+                session_dir=cdir,
+                output_path=output,
+                max_output_bytes=1024,
+                validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+            ) == {"ok": True}
+
+    def test_isolated_direct_write_is_not_adopted_before_clean_exit(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="duet-output-in-place-live-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            work.mkdir()
+            output = work / "result.json"
+            runner = CodexRunner(timeout_s=3, concurrency=1)
+            monkeypatch.setattr(
+                runner,
+                "build_argv",
+                lambda _workdir, _prompt: [
+                    "/usr/bin/bash", "-c",
+                    f"printf '{{\"ok\":true}}' > '{output}'; "
+                    f"/usr/bin/sleep 0.3; printf '{{' > '{output}'",
+                ],
+            )
+
+            with pytest.raises(CodexError, match="without publishing valid output"):
+                runner.run_isolated_until_output(
+                    stage,
+                    "prompt",
+                    session_dir=cdir,
+                    output_path=output,
+                    max_output_bytes=1024,
+                    validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                )
+
+    def test_isolated_direct_write_does_not_hide_nonzero_exit(
+        self, monkeypatch, tmp_path,
+    ):
+        cdir = tmp_path / "conversation"
+        cdir.mkdir()
+        monkeypatch.setattr(
+            codex_runner, "_resolve_bwrap", lambda: Path("/usr/bin/bwrap"),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="duet-output-in-place-error-", dir="/tmp",
+        ) as raw_stage:
+            stage = Path(raw_stage).resolve(strict=True)
+            work = stage / "work"
+            work.mkdir()
+            output = work / "result.json"
+            runner = CodexRunner(timeout_s=3, concurrency=1)
+            monkeypatch.setattr(
+                runner,
+                "build_argv",
+                lambda _workdir, _prompt: [
+                    "/usr/bin/bash", "-c",
+                    f"printf '{{\"ok\":true}}' > '{output}'; exit 7",
+                ],
+            )
+
+            with pytest.raises(CodexError, match="codex exit 7"):
                 runner.run_isolated_until_output(
                     stage,
                     "prompt",

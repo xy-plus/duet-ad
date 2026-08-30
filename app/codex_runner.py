@@ -362,14 +362,16 @@ class CodexRunner:
         max_output_bytes: int,
         validate_output: Callable[[bytes], _T],
     ) -> _T:
-        """Return as soon as Codex atomically publishes one valid declared output.
+        """Return one valid declared output without delegating publication safety.
 
         The API creates the empty regular output placeholder itself.  A
-        completed result is signalled only by replacing that inode and keeping
-        the replacement byte-stable across two observations.  Validation is a
-        protocol/shape check supplied by the caller, not a content-quality
-        decision.  Once adopted, only this invocation's process group is
-        terminated; unrelated Codex work is untouched.
+        replacement inode that is byte-stable across two observations remains
+        an early completion signal.  A normal in-place write is accepted only
+        after Codex exits successfully and its process group has been stopped;
+        the caller remains responsible for publishing the returned bytes to
+        durable storage.  Validation is a protocol/shape check supplied by the
+        caller, not a content-quality decision.  Unrelated Codex work is
+        untouched.
         """
         if (
             isinstance(max_output_bytes, bool)
@@ -434,7 +436,9 @@ class CodexRunner:
 
         missing = object()
 
-        def read_once() -> tuple[tuple[int, int, int, int], bytes] | None:
+        def read_once(
+            *, allow_initial_inode: bool,
+        ) -> tuple[tuple[int, int, int, int], bytes] | None:
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             try:
                 fd = os.open(requested.name, flags, dir_fd=parent_fd)
@@ -444,7 +448,11 @@ class CodexRunner:
                 info = os.fstat(fd)
                 if (
                     not stat.S_ISREG(info.st_mode)
-                    or (info.st_dev, info.st_ino) == (initial.st_dev, initial.st_ino)
+                    or (
+                        not allow_initial_inode
+                        and (info.st_dev, info.st_ino)
+                        == (initial.st_dev, initial.st_ino)
+                    )
                     or info.st_size <= 0
                     or info.st_size > max_output_bytes
                 ):
@@ -463,12 +471,12 @@ class CodexRunner:
             finally:
                 os.close(fd)
 
-        def read_published() -> _T | object:
-            first = read_once()
+        def read_published(*, allow_initial_inode: bool = False) -> _T | object:
+            first = read_once(allow_initial_inode=allow_initial_inode)
             if first is None:
                 return missing
             time.sleep(0.1)
-            second = read_once()
+            second = read_once(allow_initial_inode=allow_initial_inode)
             if second is None or first != second:
                 return missing
             try:
@@ -492,6 +500,7 @@ class CodexRunner:
                 except FileNotFoundError:
                     raise CodexError("codex executable not found on PATH") from None
                 deadline = time.monotonic() + self._timeout_s
+                process_group_stopped = False
                 try:
                     while True:
                         adopted = read_published()
@@ -508,8 +517,20 @@ class CodexRunner:
                                     f"codex exit {returncode}: {clean_stderr(stderr)}",
                                     retryable=True,
                                 )
+                            # Codex often follows its general file-editing
+                            # contract and writes the declared file in place.
+                            # That is not an early completion signal because a
+                            # live descendant could still be writing.  Once the
+                            # leader exits cleanly, stop the invocation's whole
+                            # process group, then let the backend validate and
+                            # adopt the stable bytes.
+                            _terminate_process_group(proc)
+                            process_group_stopped = True
+                            adopted = read_published(allow_initial_inode=True)
+                            if adopted is not missing:
+                                return adopted
                             raise CodexError(
-                                "codex exited without atomically publishing valid output: "
+                                "codex exited without publishing valid output: "
                                 f"{clean_stderr(stderr)}",
                                 retryable=True,
                             )
@@ -519,7 +540,8 @@ class CodexRunner:
                             )
                         time.sleep(0.1)
                 finally:
-                    _terminate_process_group(proc)
+                    if not process_group_stopped:
+                        _terminate_process_group(proc)
         finally:
             os.close(placeholder_fd)
             os.close(parent_fd)

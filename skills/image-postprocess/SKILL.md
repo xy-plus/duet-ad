@@ -42,4 +42,4 @@ frames key 必须覆盖 `semantic_slots.frames[].key` 的全部 key 并逐字复
 
 ## 完成
 
-输出须为 UTF-8 非空 JSON object，顶层和嵌套 key 只用上述合同；所有 required string 非空。实体 ID、关系图和完整机械字段由后端构造。写入同目录临时文件，自检后 flush/fsync 并原子替换唯一输出；确认目标为非空 regular file 后立即退出，不得结束或只给解释。语义缺损只降级为 source-preserve，不新增质量门禁，不新增 reject、retry 或 fallback。
+输出须为 UTF-8 非空 JSON object，顶层和嵌套 key 只用上述合同；所有 required string 非空。实体 ID、关系图和完整机械字段由后端构造。将完整、可解析的 JSON 写入唯一目标文件，自检后立即退出，不得只给解释；文件校验和正式发布由后端负责。语义缺损只降级为 source-preserve，不新增质量门禁，不新增 reject、retry 或 fallback。

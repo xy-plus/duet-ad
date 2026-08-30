@@ -300,7 +300,7 @@ def test_skill_frame_entities_are_direct_evidence_only_and_omit_out_of_frame():
     assert "不写 `out_of_frame` 占位" in skill
 
 
-def test_skill_requires_slot_coverage_key_reuse_and_atomic_nonempty_completion():
+def test_skill_requires_slot_coverage_key_reuse_and_backend_owned_publication():
     skill, _example = _skill_contract()
 
     for required in (
@@ -308,15 +308,13 @@ def test_skill_requires_slot_coverage_key_reuse_and_atomic_nonempty_completion()
         "semantic_slots.frames[].key",
         "全部 key",
         "逐字复用",
-        "同目录临时文件",
         "自检",
-        "原子替换",
-        "输出非空",
-        "不得结束或只给解释",
+        "完整、可解析的 JSON",
+        "不得只给解释",
+        "文件校验和正式发布由后端负责",
     ):
         assert required in skill
-    assert "唯一输出" in skill
-    assert "任何单一阶段不得直接输出四个字段" in skill
+    assert "唯一目标文件" in skill
 
 
 def test_skill_matches_runtime_semantic_enum_boundary_and_stays_short():

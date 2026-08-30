@@ -555,7 +555,8 @@ def _project_index_codex_prompt(cdir: Path) -> str:
         "严格执行当前目录 SKILL.md（该文档只读，禁止修改）。"
         "本次仅执行 phase=\"project_index\"：只读取 "
         "work/project_index_request.json 及其中列出的冻结关键帧，"
-        "只生成 work/element_index.json；不要读取或生成 prompt.txt。\n\n"
+        "只将完整、可解析的 JSON 写入 work/element_index.json；"
+        "不要读取或生成 prompt.txt。文件校验与正式发布由后端负责。\n\n"
         + _hard_rules()
         + "\n"
     )
@@ -3113,7 +3114,8 @@ def produce_prompt_fusion(
                     )
             fusion_prompt = (
                 "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json "
-                "及其中 SHA 绑定的有序图片；原子发布 work/h3_prompt_plan.json 后立即退出。"
+                "及其中 SHA 绑定的有序图片；将完整、可解析的 JSON 写入 "
+                "work/h3_prompt_plan.json 后立即退出，文件校验与正式发布由后端负责。"
             )
             if hasattr(runner, "run_isolated_until_output"):
                 raw_output_data = runner.run_isolated_until_output(

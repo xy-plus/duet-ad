@@ -40,4 +40,4 @@ FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice
 VideoPromptFusionOutput = { schema: "duet.video-prompt-fusion-output"; version: 2; input_sha256: Sha256; segments: NonEmptyArray<{ index: Int1; visual: NonEmptyArray<NonEmptyText> }> }
 ```
 
-segments 与输入一一对应，visual 数量等于 hard-cut 区间数。先写临时文件，原子替换目标后立即退出。输出供 Context IR 优化，再由后端按冻结素材逐段独立生成视频。
+segments 与输入一一对应，visual 数量等于 hard-cut 区间数。将完整、可解析的 JSON 写入唯一目标后立即退出；校验和正式发布由后端负责。输出供 Context IR 优化，再由后端按冻结素材逐段独立生成视频。
