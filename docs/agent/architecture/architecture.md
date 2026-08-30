@@ -117,7 +117,7 @@ current v4 的每个 segment 都使用本段 exact 9 张冻结 Picture reference
 
 视觉关键帧冻结后，`skills/image-postprocess` current 只执行 `phase=plan`，以通用 stable keys 输出人物、持久实体、场景和逐帧可见状态的视觉语义。后端补齐 v4 实体 ID、所有权关系图及其他结构，冻结 source/scene/transition 与 SHA，再确定性生成逐帧 Seedream prompt；缺失语义使用 `source_preserve` 继续并记录 diagnostics。semantic compiler 的 `score/issues/ignored_mechanical_fields` 只写日志、测试断言和迭代分析，不参与生产控制流。旧 `_image_continuity` 和 quality-verdict receipt 只读，不升级。
 
-每个 Seedream POST 前原子持久化绑定模型、模式、提示词摘要和输入摘要的 attempt。只有完整 HTTP 429、精确 `QuotaExceeded` 且没有 `data` 时才继续，单帧硬上限 3 次；网络/超时/取消等 POST 结果不明都写为 `submission_unknown`。服务启动仅恢复能由本地产物证明安全的阶段；当前 revision 存在 submitting/unknown attempt 时将该段和整体标为失败，不自动重发。人工重试用 revision CAS 创建下一 revision，旧 attempt 不删除。
+每个 Seedream POST 前原子持久化绑定模型、模式、提示词摘要和输入摘要的 attempt。每个冻结帧请求硬上限一次 POST；`QuotaExceeded` 和其他确定拒绝直接终态失败，网络/超时/取消等 POST 结果不明都写为 `submission_unknown`。服务启动仅恢复能由本地产物证明安全的阶段；当前 revision 存在 submitting/unknown attempt 时将该段和整体标为失败，不自动重发。人工重试用 revision CAS 创建下一 revision，旧 attempt 不删除。
 
 只有某段 exact 9 张输出全部完成时才以目录级原子替换发布 canonical `postprocessed/`。所选优化 bytes 经画幅处理后写入统一分段 H3 input receipt；文件缺失、列表不全、顺序或 SHA 漂移属于技术失败，不由旧图或质量 fallback 补位。
 
@@ -141,11 +141,11 @@ stateDiagram-v2
 - `attempts/000001/attempt.json` 以 0600 创建，后续原子写 + `fsync`；attempt state schema 为 v1。
 - input、H3 task 和最终输出各有 receipt；状态中不保存结果 URL或凭据，只保存安全错误码。
 - `start` 以同一 client id 幂等推进；公开 `resume_required` 由用户用同 id、同台词、同画幅、同清晰度和同 fit 确认后再次调用 `start`，继续同一 receipt/attempt。普通确定 `failed` 仍由新 id 调 `retry` 创建 attempt。
-- 启动 `resume` 默认只对已经持久化的 task 做 GET 查询/下载。唯一自动新 POST 例外要求上一 attempt 精确为 `failed + h3_provider_failed + h3.failed`，并有 task id、task receipt、受净化 provider 诊断、相同 input receipt 和剩余额度；它等待固定间隔后沿用同 client id 创建下一顺序 attempt。失败后已原子落盘的 `ready_to_submit/h3.ready` 自动 attempt 可由 `resume` 提交一次；无 task id 的 `submitting` 仍锁为 `submission_unknown`。
+- 启动 `resume` 只对已经持久化的 task 做 GET 查询/下载，绝不创建或提交后续 attempt。`h3_provider_failed` 保持真实失败；历史自动创建但仍为 `ready_to_submit/h3.ready` 的后续 attempt 也不会由恢复器 POST。无 task id 的 `submitting` 锁为 `submission_unknown`。
 - provider 成片 URL 必须是无 userinfo 的 HTTPS，且 DNS/IP 预解析结果全部为公网地址。下载 client 不读取代理环境；响应到达后在读取 status/body 前，从 httpx network stream 取得实际 socket peer 并再次要求公网地址，从而不把预解析结果当作连接事实。无法解析 DNS、无法验证 peer、ffprobe 缺失/超时属于已有 task 的可恢复故障；预解析或实际 peer 为私网则确定拒绝。
 - 下载不跟随重定向。Content-Length 和实际流都限制为 200 MiB，内容先写同目录 0600 临时文件；原子替换前必须读取完整 packet/frame 时间轴并用 ffmpeg `-xerror` 解码完整视频和可选音频。视频唯一、音频至多一轨；每轨 DTS 与解码展示顺序不得回退，stream start/time base/duration、首尾 packet/frame PTS、视频 `avg/r_frame_rate` 均写入 `duet.h3.media_timeline` v1 receipt。音频存在时另写解码音频 SHA-256、采样率、声道及 A/V 展示首尾差，差值绝对值须不超过 100 ms；容器 `format.duration` 只供审计，不能替代视频流与解码帧验收。确定性媒体异常直接失败，不会新建付费 POST；探测工具不可用或超时沿用已知 task 的 GET-only 恢复语义。
 
-API 暴露的 coarse generation 是 `queued/running/resume_required/succeeded/failed/submission_unknown`。四类 provider 查询/超时及 `download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed` 映射为 `resume_required`；URL/实际 peer、重定向、体积、无效视频等确定性安全拒绝映射为 `failed`。只有完整确认的 `h3_provider_failed` 会在额度内自动新建 attempt；`h3_submit_rejected`、结果缺失、输入/安全错误和 `submission_unknown` 都不会。`submission_unknown` 对任何 id 固定返回 409 `submission_outcome_unknown`。
+API 暴露的 coarse generation 是 `queued/running/resume_required/succeeded/failed/submission_unknown`。四类 provider 查询/超时及 `download_failed/download_dns_failed/download_peer_unverified/output_write_failed/output_probe_failed` 映射为 `resume_required`；URL/实际 peer、重定向、体积、无效视频等确定性安全拒绝映射为 `failed`。`h3_provider_failed`、`h3_submit_rejected`、结果缺失、输入/安全错误和 `submission_unknown` 都不会自动新建 attempt。`submission_unknown` 对任何 id 固定返回 409 `submission_outcome_unknown`。
 
 长链在 `generation.fast_mode` 冻结调度语义；字段缺失精确解释为 `false`。`generation.segments` 保存每段 `index/chain_id/join_mode/status/attempt/error/child_request_id`，公开接口省略 `child_request_id`。快速模式先为 exact-9 H3 请求落全部 unpaid input receipt，再有界 fan-out；默认模式按 chain 顺序推进。成功兄弟独立复用，未知段绝不二次 POST，启动恢复遵守 receipt 的 GET-only 边界。全部成功后使用同一 EDL：有音轨段消费 H3 原生音频，无音轨段补有限静音；源音频、source reference 和 conditioning audio 永不回挂或 overlay。
 

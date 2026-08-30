@@ -444,34 +444,80 @@ def test_prompt_patch_cannot_cross_first_submit_claim_window(tmp_path, monkeypat
     assert latest["_image_optimization"]["segments"][0]["current"] != "must not win"
 
 
-def test_seedream_retries_only_exact_quota_and_restores_png_size(tmp_path, monkeypatch):
+def test_seedream_quota_rejection_posts_once_and_is_terminal(tmp_path, monkeypatch):
     monkeypatch.setenv("ARK_API_KEY", "secret")
     settings = Settings(access_token="x", data_dir=tmp_path, retry_interval_s=0)
     calls = []
-    output = base64.b64encode(_png(2, 2, 33)).decode()
 
     async def handler(request):
         calls.append(json.loads(request.content))
-        if len(calls) < 3:
-            return httpx.Response(429, json={"error": {"code": "QuotaExceeded"}})
-        return httpx.Response(200, json={"data": [{"b64_json": output}]})
+        return httpx.Response(429, json={"error": {"code": "QuotaExceeded"}})
 
     transport = httpx.MockTransport(handler)
     out = tmp_path / "out.png"
-    asyncio.run(seedream.edit(
-        settings, [_png(5, 3)], "safe prompt", out,
-        receipt_path=tmp_path / "attempt.json", transport=transport,
-    ))
-    assert len(calls) == 3
-    decoded = cv2.imread(str(out), cv2.IMREAD_UNCHANGED)
-    assert decoded.shape[:2] == (3, 5)
-    assert out.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    with pytest.raises(seedream.SeedreamError, match="Seedream image edit failed"):
+        asyncio.run(seedream.edit(
+            settings, [_png(5, 3)], "safe prompt", out,
+            receipt_path=tmp_path / "attempt.json", transport=transport,
+        ))
+    assert len(calls) == 1
+    assert not out.exists()
     receipt = json.loads((tmp_path / "attempt.json").read_text())
-    assert receipt["status"] == "succeeded" and receipt["attempt"] == 3
-    assert [item["status"] for item in receipt["attempts"]] == [
-        "quota_retryable", "quota_retryable", "succeeded",
-    ]
+    assert receipt["status"] == "failed" and receipt["attempt"] == 1
+    assert receipt["provider_error_code"] == "QuotaExceeded"
+    assert [item["status"] for item in receipt["attempts"]] == ["failed"]
     assert "secret" not in json.dumps(receipt)
+
+    async def must_not_post(request):
+        pytest.fail(f"terminal receipt must not POST on restart: {request}")
+
+    with pytest.raises(seedream.SeedreamError) as repeated:
+        asyncio.run(seedream.edit(
+            settings, [_png(5, 3)], "safe prompt", out,
+            receipt_path=tmp_path / "attempt.json",
+            transport=httpx.MockTransport(must_not_post),
+        ))
+    assert repeated.value.code == "provider_rejected"
+
+
+def test_seedream_succeeded_receipt_is_idempotent_without_repost(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARK_API_KEY", "secret")
+    settings = Settings(access_token="x", data_dir=tmp_path)
+    output = base64.b64encode(_png(2, 2, 33)).decode()
+    calls = 0
+
+    async def success(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"data": [{"b64_json": output}]})
+
+    out = tmp_path / "out.png"
+    receipt = tmp_path / "attempt.json"
+    asyncio.run(seedream.edit(
+        settings,
+        [_png(5, 3)],
+        "safe prompt",
+        out,
+        receipt_path=receipt,
+        transport=httpx.MockTransport(success),
+    ))
+    first_output = out.read_bytes()
+
+    async def must_not_post(request):
+        pytest.fail(f"succeeded receipt must not POST: {request}")
+
+    repeated = asyncio.run(seedream.edit(
+        settings,
+        [_png(5, 3)],
+        "safe prompt",
+        out,
+        receipt_path=receipt,
+        transport=httpx.MockTransport(must_not_post),
+    ))
+    assert repeated == out
+    assert calls == 1
+    assert out.read_bytes() == first_output
+    assert json.loads(receipt.read_text())["status"] == "succeeded"
 
 
 def test_seedream_timeout_is_submission_unknown_without_retry(tmp_path, monkeypatch):
@@ -524,6 +570,42 @@ def test_seedream_unknown_existing_receipt_status_never_posts(tmp_path, monkeypa
     assert calls == 0
 
 
+def test_seedream_legacy_quota_receipt_is_closed_without_repost(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARK_API_KEY", "secret")
+    settings = Settings(access_token="x", data_dir=tmp_path, retry_interval_s=0)
+    image = _png()
+    prompt = "p"
+    receipt = tmp_path / "attempt.json"
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "status": "quota_retryable",
+        "attempt": 1,
+        "model": settings.seedream_model,
+        "mode": settings.seedream_edit_mode,
+        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "input_sha256": [hashlib.sha256(image).hexdigest()],
+        "attempts": [{"number": 1, "status": "quota_retryable"}],
+    }))
+
+    async def must_not_post(request):
+        pytest.fail(f"legacy quota receipt must not POST: {request}")
+
+    with pytest.raises(seedream.SeedreamError) as caught:
+        asyncio.run(seedream.edit(
+            settings,
+            [image],
+            prompt,
+            tmp_path / "out.png",
+            receipt_path=receipt,
+            transport=httpx.MockTransport(must_not_post),
+        ))
+    assert caught.value.code == "provider_rejected"
+    closed = json.loads(receipt.read_text())
+    assert closed["status"] == "failed"
+    assert closed["http_status"] == 429
+    assert closed["provider_error_code"] == "QuotaExceeded"
+
+
 def test_seedream_deterministic_4xx_never_retries(tmp_path, monkeypatch):
     monkeypatch.setenv("ARK_API_KEY", "secret")
     settings = Settings(access_token="x", data_dir=tmp_path, retry_interval_s=0)
@@ -543,7 +625,7 @@ def test_seedream_deterministic_4xx_never_retries(tmp_path, monkeypatch):
     assert calls == 1
 
 
-def test_seedream_all_request_errors_are_unknown_and_retry_budget_is_hard_capped(
+def test_seedream_request_errors_and_quota_ignore_generic_retry_budget(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setenv("ARK_API_KEY", "secret")
@@ -578,8 +660,10 @@ def test_seedream_all_request_errors_are_unknown_and_retry_budget_is_hard_capped
             receipt_path=tmp_path / "quota.json",
             transport=httpx.MockTransport(quota),
         ))
-    assert quota_calls == 3
-    assert json.loads((tmp_path / "quota.json").read_text())["attempt"] == 3
+    assert quota_calls == 1
+    receipt = json.loads((tmp_path / "quota.json").read_text())
+    assert receipt["attempt"] == 1
+    assert receipt["status"] == "failed"
 
 
 def test_seedream_cancel_during_post_persists_unknown(tmp_path, monkeypatch):

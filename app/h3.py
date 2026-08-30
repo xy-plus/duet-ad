@@ -1119,7 +1119,7 @@ def start(request: H3Request, *, client: httpx.Client | None = None) -> H3Result
             state = existing
             is_new = False
         with _client(client) as active_client:
-            return _advance_with_provider_retry(
+            return _advance_once(
                 request,
                 state,
                 active_client,
@@ -1390,7 +1390,7 @@ def legacy_h3_is_provably_unsubmitted(
 
 
 def resume(request: H3Request, *, client: httpx.Client | None = None) -> H3Result:
-    """Recover existing work, including the strict provider-failure exception."""
+    """Recover only the existing paid task; never create a provider retry."""
     _require_h3_boundary(request)
     with _session_lease(request):
         state = _find_attempt(request, request.client_request_id)
@@ -1399,7 +1399,7 @@ def resume(request: H3Request, *, client: httpx.Client | None = None) -> H3Resul
         if state is None:
             return H3Result(status="not_started", attempt_id=None)
         with _client(client) as active_client:
-            return _advance_with_provider_retry(
+            return _advance_once(
                 request,
                 state,
                 active_client,
@@ -1462,7 +1462,7 @@ def retry(
         is_new = existing is None
         state = _create_attempt(retried, client_request_id) if is_new else existing
         with _client(client) as active_client:
-            return _advance_with_provider_retry(
+            return _advance_once(
                 retried,
                 state,
                 active_client,
@@ -1516,7 +1516,7 @@ def retry_controlled_storage_rejection(
             raise H3Error("controlled_storage_retry_not_allowed")
         state = _create_attempt(request, request.client_request_id)
         with _client(client) as active_client:
-            return _advance_with_provider_retry(
+            return _advance_once(
                 request,
                 state,
                 active_client,
@@ -2285,104 +2285,6 @@ def _find_attempt(request: H3Request, client_request_id: str) -> dict[str, Any] 
     return None
 
 
-def _attempt_chain(
-    request: H3Request, state: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    """Load the exact same-request/input attempt chain in creation order."""
-    ledger = _validated_attempt_ledger(request)
-    chain = []
-    for raw in ledger:
-        if raw.get("client_request_id") != request.client_request_id:
-            continue
-        _validate_state(request, raw)
-        if raw.get("input_receipt") == state.get("input_receipt"):
-            chain.append(raw)
-    return chain
-
-
-def _validated_attempt_ledger(request: H3Request) -> list[dict[str, Any]]:
-    """Validate the append-only attempt directory structure without input drift.
-
-    Unrelated client ids need only structural validation here. Matching records
-    receive the full current-request receipt validation in ``_attempt_chain``.
-    """
-    root = _state_root(request)
-    if _read_json(root / "session.json") != {
-        "schema_version": SCHEMA_VERSION,
-        "cid": request.cid,
-    }:
-        raise ReceiptError("state_invalid")
-    attempts = root / "attempts"
-    try:
-        numbered = sorted(
-            (path for path in attempts.iterdir() if path.name.isdigit()),
-            key=lambda path: int(path.name),
-        )
-    except OSError:
-        raise H3Error("state_unavailable") from None
-    if not numbered:
-        raise ReceiptError("state_invalid")
-    expected_names = [f"{index:06d}" for index in range(1, len(numbered) + 1)]
-    if [path.name for path in numbered] != expected_names:
-        raise ReceiptError("state_invalid")
-    ledger = []
-    for path in numbered:
-        attempt_path = path / "attempt.json"
-        if not path.is_dir() or not attempt_path.is_file():
-            raise ReceiptError("state_invalid")
-        raw = _read_json(attempt_path)
-        if (
-            raw.get("schema_version") != SCHEMA_VERSION
-            or raw.get("cid") != request.cid
-            or raw.get("attempt_id") != path.name
-        ):
-            raise ReceiptError("state_invalid")
-        ledger.append(raw)
-    return ledger
-
-
-def _is_complete_provider_failure(state: Mapping[str, Any]) -> bool:
-    error = state.get("error")
-    h3_state = state.get("h3")
-    return (
-        state.get("status") == "failed"
-        and state.get("retryable") is False
-        and isinstance(error, dict)
-        and set(error) == {"code", "provider"}
-        and error.get("code") == "h3_provider_failed"
-        and isinstance(error.get("provider"), dict)
-        and isinstance(h3_state, dict)
-        and set(h3_state) == {"status", "task_id", "receipt"}
-        and h3_state.get("status") == "failed"
-        and _task_id(h3_state.get("task_id"), required=True) is not None
-        and isinstance(h3_state.get("receipt"), dict)
-    )
-
-
-def _is_ready_automatic_attempt(
-    state: Mapping[str, Any], chain: Sequence[Mapping[str, Any]],
-) -> bool:
-    if len(chain) < 2 or chain[-1].get("attempt_id") != state.get("attempt_id"):
-        return False
-    previous = chain[-2]
-    h3_state = state.get("h3")
-    try:
-        sequential = int(str(state.get("attempt_id"))) == int(
-            str(previous.get("attempt_id"))
-        ) + 1
-    except ValueError:
-        return False
-    return (
-        sequential
-        and _is_complete_provider_failure(previous)
-        and state.get("status") == "ready_to_submit"
-        and state.get("retryable") is False
-        and "error" not in state
-        and isinstance(h3_state, dict)
-        and h3_state == {"status": "ready"}
-    )
-
-
 def _latest_attempt(request: H3Request) -> dict[str, Any] | None:
     attempts = _state_root(request) / "attempts"
     if not attempts.is_dir():
@@ -2858,7 +2760,7 @@ def _advance(
     return _poll_h3(request, state, client, h3_task_id)
 
 
-def _advance_with_provider_retry(
+def _advance_once(
     request: H3Request,
     state: dict[str, Any],
     client: httpx.Client,
@@ -2866,51 +2768,19 @@ def _advance_with_provider_retry(
     allow_submit: bool,
     new_attempt: bool,
 ) -> H3Result:
-    """Advance while the strictly verified provider-failure budget permits.
+    """Advance one frozen attempt without creating another provider POST.
 
-    This is the sole automatic new-POST path. It deliberately excludes the
-    public ``submit`` boundary so a prepared fan-out child still crosses only
-    one provider POST per submit call.
+    ``retry_count`` remains available to idempotent GET/download/local work,
+    but a provider terminal result is faithfully terminal for this attempt.
+    Explicit user/operator retry entry points must claim a distinct attempt.
     """
-    chain = _attempt_chain(request, state)
-    limit = request.timeouts.retry_count + 1
-    # A ready automatic attempt already consumed its quota when its receipt was
-    # created. Lowering the live limit stops further creation, but must not
-    # strand that exactly identified unpaid attempt after a crash.
-    resume_ready = _is_ready_automatic_attempt(state, chain)
-    result = _advance(
+    return _advance(
         request,
         state,
         client,
-        allow_submit=allow_submit or resume_ready,
+        allow_submit=allow_submit,
         new_attempt=new_attempt,
     )
-    while _is_complete_provider_failure(state):
-        chain = _attempt_chain(request, state)
-        if (
-            not chain
-            or chain[-1].get("attempt_id") != state.get("attempt_id")
-            or len(chain) >= limit
-        ):
-            return result
-        log.warning(
-            "H3 provider failure retry cid=%s attempt=%s next=%d/%d in %.1fs",
-            request.cid,
-            state.get("attempt_id"),
-            len(chain) + 1,
-            limit,
-            request.timeouts.retry_interval_s,
-        )
-        _pause(request.timeouts.retry_interval_s)
-        state = _create_attempt(request, request.client_request_id)
-        result = _advance(
-            request,
-            state,
-            client,
-            allow_submit=True,
-            new_attempt=True,
-        )
-    return result
 
 
 def _query_json_with_retry(

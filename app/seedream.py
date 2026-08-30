@@ -20,7 +20,7 @@ from app import error_trace
 from app.config import SEEDREAM_PRO_MODEL, Settings
 
 ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
-MAX_POST_ATTEMPTS = 3
+MAX_POST_ATTEMPTS = 1
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -69,20 +69,6 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
 
 def _data_url(raw: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
-
-
-def _exact_quota(response: httpx.Response) -> bool:
-    if response.status_code != 429:
-        return False
-    try:
-        body = response.json()
-    except ValueError:
-        return False
-    return (
-        isinstance(body, dict) and "data" not in body
-        and isinstance(body.get("error"), dict)
-        and body["error"].get("code") == "QuotaExceeded"
-    )
 
 
 def _safe_provider_error_code(response: httpx.Response) -> str | None:
@@ -145,7 +131,6 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
         "model": settings.seedream_model, "mode": settings.seedream_edit_mode,
         "prompt_sha256": prompt_sha, "input_sha256": input_shas, "attempts": [],
     }
-    start_attempt = 1
     if receipt_path.is_file():
         try:
             existing = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -181,15 +166,15 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
         if status == "failed":
             raise SeedreamError("provider_rejected")
         if status == "quota_retryable":
-            base_receipt = existing
-            previous_attempt = existing.get("attempt")
-            if (
-                isinstance(previous_attempt, bool)
-                or not isinstance(previous_attempt, int)
-                or previous_attempt < 1
-            ):
-                raise SeedreamError("attempt_receipt_invalid")
-            start_attempt = previous_attempt + 1
+            # This legacy state proves that the frozen request was already
+            # submitted once.  Never turn recovery into another paid POST.
+            existing.update(
+                status="failed",
+                http_status=429,
+                provider_error_code="QuotaExceeded",
+            )
+            _atomic_json(receipt_path, existing)
+            raise SeedreamError("provider_rejected")
         elif status not in {
             "succeeded", "response_received", "submitting", "submission_unknown", "failed",
         }:
@@ -205,9 +190,8 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
         payload["sequential_image_generation"] = "disabled"
     timeout = httpx.Timeout(settings.seedream_timeout_s)
     async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
-        for attempt in range(start_attempt, MAX_POST_ATTEMPTS + 1):
-            attempts = list(base_receipt.get("attempts") or [])
-            attempts.append({"number": attempt, "status": "submitting"})
+        for attempt in range(1, MAX_POST_ATTEMPTS + 1):
+            attempts = [{"number": attempt, "status": "submitting"}]
             current = {**base_receipt, "attempt": attempt, "attempts": attempts}
             _atomic_json(receipt_path, current)
             try:
@@ -231,13 +215,6 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
                     secrets=(key,),
                 )
                 raise SeedreamError("submission_unknown") from None
-            if _exact_quota(response) and attempt < MAX_POST_ATTEMPTS:
-                attempts[-1]["status"] = "quota_retryable"
-                base_receipt = {**current, "status": "quota_retryable", "attempts": attempts}
-                _atomic_json(receipt_path, base_receipt)
-                if settings.retry_interval_s:
-                    await asyncio.sleep(settings.retry_interval_s)
-                continue
             if response.status_code >= 400:
                 attempts[-1]["status"] = "failed"
                 failed_receipt = {

@@ -1676,6 +1676,17 @@ def test_submit_http_rejection_persists_private_provider_diagnostics(
     assert state["provider_error_code"] == expected_code
     assert "provider-private-secret" not in raw
     assert "provider_body" not in state
+    assert sum(
+        call.method == "POST" and call.url.path == "/v2/h3_context_ir"
+        for call in calls
+    ) == 1
+
+    with _client(
+        lambda request: pytest.fail(f"terminal Context IR must not repost: {request}")
+    ) as client:
+        repeated = context_ir_bridge.optimize_h3_prompt(frozen, client=client)
+    assert repeated.status == expected_status
+    assert repeated.error_code == expected_error
 
 
 def test_forged_frozen_request_and_changed_upstream_artifact_fail_before_network(

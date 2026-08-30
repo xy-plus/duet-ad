@@ -765,7 +765,7 @@ def test_fast_mode_startup_is_get_only_and_leaves_prepared_child_unpaid(
     assert [item["status"] for item in stored["segments"]] == ["queued", "queued"]
 
 
-def test_fast_startup_auto_retries_only_provider_failed_child(
+def test_fast_startup_leaves_provider_failed_child_terminal_and_reuses_sibling(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
@@ -811,12 +811,14 @@ def test_fast_startup_auto_retries_only_provider_failed_child(
 
     long_generation.run(settings, cid, plan, startup=True)
 
-    assert resumed == [1]
+    assert resumed == []
     stored = storage.load_meta(settings.data_dir, cid)["generation"]
-    assert [item["status"] for item in stored["segments"]] == ["succeeded", "succeeded"]
+    assert stored["status"] == "failed"
+    assert [item["status"] for item in stored["segments"]] == ["failed", "succeeded"]
+    assert stored["segments"][0]["error"] == "h3_provider_failed"
 
 
-def test_serial_provider_auto_retry_success_precedes_downstream_submit(
+def test_serial_first_submit_success_precedes_downstream_submit(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
@@ -836,9 +838,9 @@ def test_serial_provider_auto_retry_success_precedes_downstream_submit(
 
     def start(request):
         index = int(request.workdir.name)
-        events.append("provider-auto-retried-1" if index == 1 else "submitted-2")
+        events.append("submitted-1" if index == 1 else "submitted-2")
         request.workdir.joinpath("generated.mp4").write_bytes(b"segment")
-        return h3.H3Result("succeeded", "000002" if index == 1 else "000001")
+        return h3.H3Result("succeeded", "000001")
 
     monkeypatch.setattr(h3, "start", start)
     monkeypatch.setattr(h3, "output_is_reusable", lambda *_a, **_kw: True)
@@ -851,10 +853,10 @@ def test_serial_provider_auto_retry_success_precedes_downstream_submit(
 
     long_generation.run(settings, cid, plan)
 
-    assert events == ["provider-auto-retried-1", "submitted-2"]
+    assert events == ["submitted-1", "submitted-2"]
 
 
-def test_serial_startup_provider_retry_success_automatically_starts_downstream(
+def test_serial_startup_provider_failure_is_terminal_without_downstream_submit(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
@@ -901,20 +903,23 @@ def test_serial_startup_provider_retry_success_automatically_starts_downstream(
 
     long_generation.run(settings, cid, plan, startup=True)
 
-    assert resumed == [1]
-    assert started == [2]
-    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+    assert resumed == []
+    assert started == []
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "failed"
+    assert stored["error"] == "long_video_segment_failed"
+    assert stored["segments"][0]["error"] == "h3_provider_failed"
 
 
 @pytest.mark.parametrize(
     ("root_error", "segment_error", "expected"),
     [
-        ("long_video_segment_failed", "h3_provider_failed", 1),
+        ("long_video_segment_failed", "h3_provider_failed", 0),
         ("submission_unknown", "submission_unknown", 0),
         ("long_video_segment_failed", "download_invalid_video", 0),
     ],
 )
-def test_long_startup_scanner_only_claims_provider_failed_root(
+def test_long_startup_scanner_never_claims_terminal_provider_failure(
     tmp_path, monkeypatch, root_error, segment_error, expected,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")

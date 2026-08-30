@@ -4052,20 +4052,9 @@ def _run_unchecked(
 
     if startup:
         recoverable = []
-        recovered_provider_failure = False
         for segment in plan.segments:
             state = states[segment.index]
-            provider_failed = (
-                state.get("status") == "failed"
-                and state.get("error") == "h3_provider_failed"
-            )
-            recovered_provider_failure = (
-                recovered_provider_failure or provider_failed
-            )
-            if (
-                state.get("status") not in {"queued", "running", "resume_required"}
-                and not provider_failed
-            ):
+            if state.get("status") not in {"queued", "running", "resume_required"}:
                 continue
             recoverable.append(segment)
 
@@ -4218,16 +4207,10 @@ def _run_unchecked(
         elif any(item.get("status") == "failed" for item in states.values()):
             persist("failed", "long_video_segment_failed")
             return
-        if fast_mode or not recovered_provider_failure:
-            # General startup remains GET-only. A prepared child still awaits
-            # explicit confirmation unless this is the narrow serial provider-
-            # failure continuation handled below.
-            persist("resume_required", "long_video_resume_required")
-            return
-        # The serial chain was already authorized and stopped only at a
-        # provider-declared, non-billable failure. Once that exact attempt is
-        # recovered, continue its already-frozen downstream without a click.
-        persist("running", None)
+        # General startup remains GET-only. A prepared child still awaits
+        # explicit confirmation, while provider failures remain terminal.
+        persist("resume_required", "long_video_resume_required")
+        return
 
     if fast_mode:
         # Phase 1: construct every immutable request before creating any paid

@@ -1475,7 +1475,7 @@ def test_startup_resume_uses_direct_h3_state(tmp_path, monkeypatch):
     assert meta["generation"]["status"] == "failed"
 
 
-def test_short_submit_background_converges_after_provider_auto_retry(
+def test_short_submit_provider_failure_posts_once_and_stays_terminal(
     enabled, monkeypatch, recovery_video_bytes,
 ):
     settings, client = enabled
@@ -1527,11 +1527,13 @@ def test_short_submit_background_converges_after_provider_auto_retry(
     )
 
     assert response.status_code == 202
-    assert posts == 2
-    assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
+    assert posts == 1
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation["status"] == "failed"
+    assert generation["error"] == "h3_provider_failed"
 
 
-def test_short_startup_scanner_claims_persisted_provider_failure(
+def test_short_startup_scanner_leaves_persisted_provider_failure_terminal(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(
@@ -1568,8 +1570,10 @@ def test_short_startup_scanner_claims_persisted_provider_failure(
         for thread in client.app.state.h3_resume_threads:
             thread.join(timeout=2)
 
-    assert len(resumed) == 1
-    assert resumed[0].client_request_id == REQUEST_ID
+    assert resumed == []
+    generation = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert generation["status"] == "failed"
+    assert generation["error"] == "h3_provider_failed"
 
 
 @pytest.mark.parametrize(

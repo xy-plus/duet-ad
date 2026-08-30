@@ -316,7 +316,7 @@ detail 的 `postprocess` 为 `{status,options,frames,segments,error}`；每段�
 
 请求 key 必须恰为 `{"confirm":true,"expected_revision":N}`，仅允许重试当前 failed 段；revision 漂移返回结构化 409 `postprocess_revision_changed`。服务复用项目冻结的选项、提示词、模型、模式和已完成本地产物，不接受客户端覆盖。未知提交的公共真源是分段 `error=submission_unknown`，不得从 `status/stage` 推断；用户明确确认潜在重复计费后才能人工调用。旧 revision 的 attempt 保留，启动恢复不会替用户调用该接口。
 
-Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。自动重试硬上限为总计 3 次，并且只认完整 HTTP 429、精确 `QuotaExceeded`、响应无 `data`；网络、超时、取消及其他不明结果写为 `submission_unknown` 且不自动重发。确定性 4xx/协议错误不重试；成功响应 bytes 已落盘时，恢复只做本地 PNG 发布。
+Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。每个冻结请求总计只允许一次 POST；HTTP 429 `QuotaExceeded`、确定性 4xx 和协议错误都不自动重试，网络、超时、取消及其他不明结果写为 `submission_unknown` 且不自动重发。成功响应 bytes 已落盘时，恢复只做本地 PNG 发布。
 
 `/`、`/index.html`、`/app.js`、`/styles.css` 的 GET/HEAD 响应（含条件请求的 304）均带 `Cache-Control: no-store`，避免 HTML、脚本和样式跨版本组合。
 
@@ -435,10 +435,10 @@ current v4 路径为 `work/segments/<N>/.h3/attempts/<六位递增号>/attempt.j
 - `h3.prepare(request)`：只创建/校验 unpaid attempt 与 input receipt，绝不联网；返回 `not_started` 表示可安全提交。
 - `h3.submit(request)`：只接受已 prepare 的 exact attempt，最多跨越一次 POST 边界，task id/receipt 落盘后立即返回，不做 GET 轮询；无 prepare、输入漂移或无 task id 的 submitting 状态都 fail closed。
 - `h3.inspect(request)`：纯读，不写、不联网；验证 session/attempt receipts。
-- `h3.resume(request)`：获取会话 flock 后默认 GET-only 推进已有任务；只有完整确认的 `h3_provider_failed` 有额度，或其后已落盘的 `ready_to_submit/h3.ready` 自动 attempt，才允许跨越新的 POST 边界。
-- `h3.retry(request,new_id)`：底层显式创建人工新逻辑请求的 attempt；短链 runtime 只在普通确定失败或 provider 自动额度耗尽后，由用户提交新 id 调用。长链同样要求新父 id并只重做未成功段；`stage=stitch` 失败复用原父 id，且只运行本地拼接。`resume_required` 调 `start` 续同 attempt，`submission_unknown` 不调用。
+- `h3.resume(request)`：获取会话 flock 后仅以 GET/download 推进已有 task；失败或历史 ready 后续 attempt 都不允许跨越新的 POST 边界。
+- `h3.retry(request,new_id)`：底层显式创建人工新逻辑请求的 attempt；短链 runtime 只在普通确定失败后，由用户提交新 id 调用。长链同样要求新父 id并只重做未成功段；`stage=stitch` 失败复用原父 id，且只运行本地拼接。`resume_required` 调 `start` 续同 attempt，`submission_unknown` 不调用。
 
-`start/resume/retry` 共用同一私有自动推进器；`submit` 始终只提交当前 prepared attempt 一次。自动额度只统计同 `client_request_id + input_receipt` 的有效 attempt 链，已创建的 ready attempt 已占额度，总上限为 `1 + retry_count`。每个新 attempt 先原子写 receipt 再 POST；配置降低只停止新增，提高后可从最新完整 provider failure 继续。`h3_submit_rejected/h3_result_missing`、输入与下载安全拒绝不创建新 attempt；查询、超时和下载传输失败继续同 task；`submission_unknown` 永不重复 POST。
+`start/resume/retry` 共用单-attempt 推进器；`submit` 始终只提交当前 prepared attempt 一次。每个新 attempt 先原子写 receipt 再 POST，只有显式 `retry(request,new_id)` 或经精确证据授权的受控存储拒绝接口能创建后续 attempt。`retry_count` 仅用于同 task 的 GET、下载和本地可重试操作。`h3_provider_failed/h3_submit_rejected/h3_result_missing`、输入与下载安全拒绝不自动创建新 attempt；查询、超时和下载传输失败继续同 task；`submission_unknown` 永不重复 POST。
 
 current v5 每段把 exact 9 张冻结 Picture 与后端编译的 Ref2VA prompt 提交同一 H3 workflow；`reference_audios=()`，Context receipt 是同字节 local identity。历史 1–9 图、多模态 source-audio 或首尾帧 receipt 只按原 workflow GET 恢复，不迁移付费提交。
 

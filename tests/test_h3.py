@@ -917,200 +917,52 @@ def test_provider_failure_diagnostic_survives_successful_paid_retry(
     assert recovered_state["input_receipt"] == state["input_receipt"]
 
 
-def test_provider_failure_automatically_creates_same_request_attempt_and_succeeds(
-    tmp_path,
-):
-    request = _boundary_request(tmp_path)
-    posts = []
-
-    def provider(req: httpx.Request) -> httpx.Response:
-        if req.method == "POST":
-            posts.append(req)
-            return httpx.Response(
-                200, json={"data": {"task_id": f"task-{len(posts)}"}}
-            )
-        if req.url.path.endswith("/result/task-1"):
-            return httpx.Response(200, json={
-                "request_id": "provider-failure-1",
-                "msg": "GPU OOM",
-                "data": {"status": "FAILED"},
-            })
-        if req.url.path.endswith("/result/task-2"):
-            return httpx.Response(200, json={"data": {
-                "status": "SUCCESS",
-                "results": [{"url": "https://download.invalid/video.mp4"}],
-            }})
-        if req.url.host == "download.invalid":
-            return _download_response(200, content=HappyProvider.video_bytes)
-        raise AssertionError(req.url.path)
-
-    with _client(provider) as client:
-        result = h3.start(request, client=client)
-
-    assert result.status == "succeeded"
-    assert len(posts) == 2
-    first_bytes = _attempt_file(request, 1).read_bytes()
-    first = json.loads(first_bytes)
-    second = json.loads(_attempt_file(request, 2).read_text(encoding="utf-8"))
-    assert first["client_request_id"] == second["client_request_id"] == "boundary-1"
-    assert first["input_receipt"] == second["input_receipt"]
-    assert first["h3"]["task_id"] == "task-1"
-    assert first["error"]["provider"]["request_id"] == "provider-failure-1"
-    assert _attempt_file(request, 1).read_bytes() == first_bytes
-
-
-def test_provider_failure_auto_retry_budget_counts_created_attempts(tmp_path):
+def test_provider_failure_posts_once_and_restart_preserves_terminal_receipt(tmp_path):
     request = replace(
         _boundary_request(tmp_path),
-        timeouts=replace(_boundary_request(tmp_path).timeouts, retry_count=2),
+        timeouts=replace(_boundary_request(tmp_path).timeouts, retry_count=99),
     )
-    posts = 0
+    requests = []
 
     def provider(req: httpx.Request) -> httpx.Response:
-        nonlocal posts
+        requests.append(req)
         if req.method == "POST":
-            posts += 1
-            return httpx.Response(200, json={"data": {"task_id": f"task-{posts}"}})
+            return httpx.Response(200, json={"data": {"task_id": "task-1"}})
         return httpx.Response(200, json={
-            "request_id": f"provider-failure-{posts}",
+            "request_id": "provider-failure-1",
             "data": {"status": "ERROR"},
         })
 
     with _client(provider) as client:
         result = h3.start(request, client=client)
-        assert h3.resume(request, client=client).status == "failed"
-
     assert result.status == "failed"
-    assert posts == 1 + request.timeouts.retry_count
-    assert not _attempt_file(request, posts + 1).exists()
+    assert [item.method for item in requests].count("POST") == 1
+    assert not _attempt_file(request, 2).exists()
+    first_receipt = _attempt_file(request).read_bytes()
+
+    with _client(
+        lambda req: pytest.fail(f"terminal restart must not access provider: {req}")
+    ) as client:
+        resumed = h3.resume(request, client=client)
+    assert resumed.status == "failed"
+    assert resumed.error_code == "h3_provider_failed"
+    assert _attempt_file(request).read_bytes() == first_receipt
 
 
-@pytest.mark.parametrize("damage", ["first_attempt_json", "middle_attempt_dir"])
-def test_provider_auto_retry_rejects_attempt_ledger_gaps_without_new_post(
-    tmp_path, damage,
-):
+def test_resume_never_submits_legacy_ready_automatic_attempt(tmp_path):
     request = _boundary_request(tmp_path)
-    posts = 0
-
-    def failed(req: httpx.Request) -> httpx.Response:
-        nonlocal posts
-        if req.method == "POST":
-            posts += 1
-            return httpx.Response(200, json={"data": {"task_id": f"task-{posts}"}})
-        return httpx.Response(200, json={
-            "request_id": f"provider-failure-{posts}",
-            "data": {"status": "FAILED"},
-        })
-
-    with _client(failed) as client:
-        assert h3.start(request, client=client).status == "failed"
-    assert posts == 3
-    if damage == "first_attempt_json":
-        _attempt_file(request, 1).unlink()
-    else:
-        shutil.rmtree(_attempt_file(request, 2).parent)
-
-    calls = []
-    expanded = replace(
-        request, timeouts=replace(request.timeouts, retry_count=3)
-    )
-    with _client(lambda req: calls.append(req) or failed(req)) as client:
-        with pytest.raises(h3.ReceiptError, match="state_invalid"):
-            h3.resume(expanded, client=client)
-
-    assert calls == []
-    assert not _attempt_file(request, 4).exists()
-
-
-def test_provider_auto_retry_accepts_structurally_valid_other_request_attempt(
-    tmp_path,
-):
-    request = _boundary_request(tmp_path)
-    request = replace(request, timeouts=replace(request.timeouts, retry_count=1))
-    assert h3.prepare(request).attempt_id == "000001"
-    posts = 0
-
-    def provider(req: httpx.Request) -> httpx.Response:
-        nonlocal posts
-        if req.method == "POST":
-            posts += 1
-            return httpx.Response(200, json={"data": {"task_id": f"task-{posts}"}})
-        if req.url.path.endswith("/result/task-1"):
-            return httpx.Response(200, json={
-                "request_id": "provider-failure",
-                "data": {"status": "FAILED"},
-            })
-        if req.url.path.endswith("/result/task-2"):
-            return httpx.Response(200, json={"data": {
-                "status": "SUCCESS",
-                "results": [{"url": "https://download.invalid/video.mp4"}],
-            }})
-        return _download_response(200, content=HappyProvider.video_bytes)
-
-    with _client(provider) as client:
-        result = h3.retry(request, "boundary-2", client=client)
-
-    assert result.status == "succeeded"
-    assert posts == 2
-    ids = [
-        json.loads(_attempt_file(request, number).read_text())["client_request_id"]
-        for number in (1, 2, 3)
-    ]
-    assert ids == ["boundary-1", "boundary-2", "boundary-2"]
-
-
-def test_resume_automatically_retries_complete_provider_failure(tmp_path):
-    request = _boundary_request(tmp_path)
-
-    def failed(req: httpx.Request) -> httpx.Response:
-        if req.method == "POST":
-            return httpx.Response(200, json={"data": {"task_id": "failed-task"}})
-        return httpx.Response(200, json={
-            "request_id": "provider-failure",
-            "data": {"status": "FAIL"},
-        })
-
-    no_auto = replace(request, timeouts=replace(request.timeouts, retry_count=0))
-    with _client(failed) as client:
-        assert h3.start(no_auto, client=client).status == "failed"
-
-    posts = []
-    provider = HappyProvider()
-    with _client(lambda req: posts.append(req) or provider(req)) as client:
-        assert h3.resume(request, client=client).status == "succeeded"
-
-    assert len([item for item in posts if item.method == "POST"]) == 1
-    assert _attempt_file(request, 2).is_file()
-
-
-def test_resume_submits_persisted_ready_auto_attempt_only_once(tmp_path, monkeypatch):
-    request = _boundary_request(tmp_path)
-    original_create = h3._create_attempt
-    created = False
-
-    def crash_after_create(*args, **kwargs):
-        nonlocal created
-        state = original_create(*args, **kwargs)
-        if state["attempt_id"] == "000002" and not created:
-            created = True
-            raise RuntimeError("simulated crash after automatic receipt")
-        return state
-
-    provider_failed = HappyProvider(result_status="FAILED")
-    monkeypatch.setattr(h3, "_create_attempt", crash_after_create)
-    with _client(provider_failed) as client:
-        with pytest.raises(RuntimeError, match="simulated crash"):
-            h3.start(request, client=client)
-    monkeypatch.setattr(h3, "_create_attempt", original_create)
-    ready = json.loads(_attempt_file(request, 2).read_text(encoding="utf-8"))
+    with h3._session_lease(request):
+        h3._create_attempt(request, request.client_request_id)
+        ready = h3._create_attempt(request, request.client_request_id)
+    assert ready["attempt_id"] == "000002"
     assert ready["status"] == "ready_to_submit"
 
-    lowered = replace(request, timeouts=replace(request.timeouts, retry_count=0))
-    provider = HappyProvider()
-    with _client(provider) as client:
-        assert h3.resume(lowered, client=client).status == "succeeded"
-        assert h3.resume(lowered, client=client).status == "succeeded"
-    assert len(provider.h3_posts) == 1
+    with _client(
+        lambda req: pytest.fail(f"legacy automatic attempt needs confirmation: {req}")
+    ) as client:
+        resumed = h3.resume(request, client=client)
+    assert resumed.status == "not_started"
+    assert resumed.attempt_id == "000002"
 
 
 @pytest.mark.parametrize(

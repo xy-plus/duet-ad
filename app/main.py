@@ -139,31 +139,6 @@ def _run_pipeline_under_gate(
             gate.release()
 
 
-def _short_provider_failure_is_recoverable(generation: object) -> bool:
-    return (
-        isinstance(generation, dict)
-        and not isinstance(generation.get("segments"), list)
-        and generation.get("status") == "failed"
-        and generation.get("error") == "h3_provider_failed"
-    )
-
-
-def _long_provider_failure_is_recoverable(generation: object) -> bool:
-    if (
-        not isinstance(generation, dict)
-        or generation.get("status") != "failed"
-        or generation.get("error") != "long_video_segment_failed"
-        or not isinstance(generation.get("segments"), list)
-    ):
-        return False
-    return any(
-        isinstance(segment, dict)
-        and segment.get("status") == "failed"
-        and segment.get("error") == "h3_provider_failed"
-        for segment in generation["segments"]
-    )
-
-
 class _GeneratedVideoValidationCache:
     """Bound strict local validation without weakening its file bindings."""
 
@@ -2590,7 +2565,6 @@ def _resume_generation(settings: Settings, cid: str) -> None:
     )
     if (
         generation.get("status") not in _GENERATION_ACTIVE
-        and not _short_provider_failure_is_recoverable(generation)
         and not recovering_missing_output
     ):
         return
@@ -3449,9 +3423,9 @@ def _ensure_existing_generation(
 ) -> dict:
     """Ensure one frozen operation is scheduled without creating a new attempt.
 
-    Ambiguous submissions deliberately remain untouched.  The current H3
-    recovery functions are GET-only for an existing attempt; provider-declared
-    failures may use their receipt-proven automatic retry path.
+    Ambiguous and provider-failed submissions deliberately remain untouched.
+    Recovery is GET-only for an existing attempt and never creates a paid
+    provider retry.
     """
     generation = meta.get("generation")
     if not isinstance(generation, dict):
@@ -3460,8 +3434,6 @@ def _ensure_existing_generation(
     has_output = _has_valid_generated_video(settings, meta)
     recoverable = (
         status == "resume_required"
-        or _short_provider_failure_is_recoverable(generation)
-        or _long_provider_failure_is_recoverable(generation)
         or (
             status == "failed"
             and generation.get("stage") == "stitch"
@@ -3737,8 +3709,6 @@ def create_app(settings: Settings) -> FastAPI:
                 and isinstance(generation, dict)
                 and (
                     generation.get("status") in _GENERATION_ACTIVE
-                    or _short_provider_failure_is_recoverable(generation)
-                    or _long_provider_failure_is_recoverable(generation)
                     or (
                         generation.get("status") == "succeeded"
                         and not _has_valid_generated_video(settings, meta)
