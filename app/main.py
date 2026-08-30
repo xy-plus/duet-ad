@@ -3061,6 +3061,7 @@ def _prompt_fusion_failure_is_retryable(state: object) -> bool:
             or re.match(r"^codex exit -?[0-9]+:", error)
             or error
             in {
+                "codex_execution_failed",
                 "prompt_fusion_output_invalid",
                 "prompt fusion raw output is missing",
                 "prompt fusion raw output is invalid",
@@ -3080,6 +3081,7 @@ def _fail_prompt_fusion_continuation(
 ) -> bool:
     """Record a local failure; retry the owner only within the existing budget."""
     retry: dict[str, bool] = {}
+    recorded_attempt: dict[str, int] = {}
 
     def fail(current: dict) -> None:
         if current.get("_input_owner") != owner:
@@ -3090,6 +3092,7 @@ def _fail_prompt_fusion_continuation(
             if isinstance(failures, bool) or not isinstance(failures, int):
                 failures = 0
             failures += 1
+            recorded_attempt["value"] = failures
             if failures <= settings.retry_count:
                 next_state = {
                     **state,
@@ -3113,6 +3116,7 @@ def _fail_prompt_fusion_continuation(
             if isinstance(failures, bool) or not isinstance(failures, int):
                 failures = 0
             failures += 1
+            recorded_attempt["value"] = failures
             current["_prompt_fusion_continuation_failures"] = failures
             if failures <= settings.retry_count:
                 retry["value"] = True
@@ -3135,15 +3139,17 @@ def _fail_prompt_fusion_continuation(
         current["_input_owner"] = None
 
     storage.mutate_meta(settings.data_dir, cid, fail)
-    _record_error_fail_open(
-        settings.data_dir
-        / cid
-        / "work"
-        / "errors"
-        / f"prompt-fusion-{phase}.json",
-        call_path=["pipeline", "prompt_fusion", phase],
-        error=exc,
-    )
+    attempt = recorded_attempt.get("value")
+    if attempt is not None:
+        _record_error_fail_open(
+            settings.data_dir
+            / cid
+            / "work"
+            / "errors"
+            / f"prompt-fusion-attempt-{attempt}.json",
+            call_path=["pipeline", "prompt_fusion", phase],
+            error=exc,
+        )
     return bool(retry.get("value"))
 
 

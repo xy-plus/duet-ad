@@ -1651,14 +1651,14 @@ def test_trace_failure_cannot_prevent_fusion_terminal_state(
     )
 
 
-def test_retryable_technical_fusion_failure_auto_continues_same_owner(
+def test_codex_execution_failure_retries_once_then_continues_same_owner(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path)
     cid, owner = _make_prompt_fusion_claim(
         settings,
         status="failed",
-        error="codex timed out after 30.0s",
+        error="codex_execution_failed",
     )
     producer_calls = []
     continuation_calls = []
@@ -1697,7 +1697,9 @@ def test_retryable_technical_fusion_failure_auto_continues_same_owner(
     assert scheduled == [cid]
     assert producer_calls == [cid]
     assert continuation_calls == [(cid, owner)]
-    assert storage.load_meta(settings.data_dir, cid)["_input_owner"] == owner
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert recovered["_input_owner"] == owner
+    assert recovered["_prompt_fusion"]["continuation_failures"] == 1
 
 
 def test_persistent_prompt_fusion_producer_failure_exhausts_budget(
@@ -1705,7 +1707,7 @@ def test_persistent_prompt_fusion_producer_failure_exhausts_budget(
 ):
     settings = replace(make_settings(tmp_path), retry_count=1)
     cid, owner = _make_prompt_fusion_claim(
-        settings, status="failed", error="prompt_fusion_output_invalid"
+        settings, status="failed", error="codex_execution_failed"
     )
     producer_calls = []
     scheduled = []
@@ -1719,7 +1721,7 @@ def test_persistent_prompt_fusion_producer_failure_exhausts_budget(
             _prompt_fusion={
                 **current,
                 "status": "failed",
-                "error": "prompt_fusion_output_invalid",
+                "error": "codex_execution_failed",
             },
         )
         return "failed"
@@ -1742,7 +1744,20 @@ def test_persistent_prompt_fusion_producer_failure_exhausts_budget(
     failed = storage.load_meta(settings.data_dir, cid)
     assert failed["_input_owner"] is None
     assert failed["_prompt_fusion"]["status"] == "failed"
+    assert failed["_prompt_fusion"]["error"] == (
+        "prompt_fusion_continuation_failed"
+    )
     assert failed["_prompt_fusion"]["continuation_failures"] == 2
+    error_dir = settings.data_dir / cid / "work" / "errors"
+    attempts = sorted(error_dir.glob("prompt-fusion-attempt-*.json"))
+    assert [path.name for path in attempts] == [
+        "prompt-fusion-attempt-1.json",
+        "prompt-fusion-attempt-2.json",
+    ]
+    assert [
+        json.loads(path.read_text(encoding="utf-8"))["error"]["message"]
+        for path in attempts
+    ] == ["codex_execution_failed", "codex_execution_failed"]
 
 
 @pytest.mark.parametrize(
@@ -1803,6 +1818,8 @@ def test_invalid_or_missing_fusion_output_auto_continues_same_operation(
 @pytest.mark.parametrize(
     "error",
     [
+        "prompt_fusion_input_invalid",
+        "prompt_fusion_manifest_invalid",
         "prompt fusion input drifted",
         "prompt fusion Skill drifted",
         "prompt fusion manifest drifted",
@@ -1832,6 +1849,67 @@ def test_fusion_evidence_drift_never_reposts(
     )
 
     assert storage.load_meta(settings.data_dir, cid)["_prompt_fusion"] == before
+
+
+def test_startup_takes_over_codex_failure_and_keeps_retry_attempt_number(
+    tmp_path, monkeypatch,
+):
+    settings = replace(make_settings(tmp_path), retry_count=2)
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-old")
+    cid, owner = _make_prompt_fusion_claim(
+        settings, status="failed", error="codex_execution_failed"
+    )
+    current = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _prompt_fusion={**current, "continuation_failures": 1},
+    )
+    monkeypatch.setattr(storage, "PROCESS_GENERATION", "boot-new")
+    producer_owners = []
+
+    def produce(_settings, received_cid, _runner):
+        producer_owners.append(
+            storage.load_meta(settings.data_dir, received_cid)["_input_owner"]
+        )
+        state = storage.load_meta(settings.data_dir, received_cid)[
+            "_prompt_fusion"
+        ]
+        storage.update_meta(
+            settings.data_dir,
+            received_cid,
+            _prompt_fusion={**state, "status": "done", "error": None},
+        )
+        return "done"
+
+    monkeypatch.setattr(pipeline, "produce_prompt_fusion", produce)
+    monkeypatch.setattr(
+        main_module, "_continue_after_prompt_fusion", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_schedule_prompt_fusion_continuation",
+        lambda *args: main_module._produce_prompt_fusion_and_continue(*args),
+    )
+
+    with TestClient(create_app(settings)) as client:
+        for thread in client.app.state.prompt_fusion_recovery_threads:
+            thread.join(timeout=5)
+
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert owner["process_generation"] == "boot-old"
+    assert producer_owners == [
+        {**owner, "process_generation": "boot-new"}
+    ]
+    assert recovered["_input_owner"]["process_generation"] == "boot-new"
+    assert recovered["_prompt_fusion"]["continuation_failures"] == 2
+    assert (
+        settings.data_dir
+        / cid
+        / "work"
+        / "errors"
+        / "prompt-fusion-attempt-2.json"
+    ).is_file()
 
 
 def test_quality_score_does_not_trigger_fusion_retry(
@@ -1918,7 +1996,7 @@ def test_finalize_exception_auto_continues_done_fusion_without_new_producer(
             / cid
             / "work"
             / "errors"
-            / "prompt-fusion-continue.json"
+            / "prompt-fusion-attempt-1.json"
         ).read_text(encoding="utf-8")
     )
     assert trace["schema"] == "duet.error-call-tree"
@@ -1987,7 +2065,7 @@ def test_persistent_finalize_exception_exhausts_retry_budget_and_stops_owner(
             / cid
             / "work"
             / "errors"
-            / "prompt-fusion-continue.json"
+            / "prompt-fusion-attempt-3.json"
         ).read_text(encoding="utf-8")
     )
     assert trace["call_path"] == ["pipeline", "prompt_fusion", "continue"]
