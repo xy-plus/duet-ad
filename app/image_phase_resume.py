@@ -24,13 +24,13 @@ from typing import Iterator, Mapping
 
 import cv2
 
-from app import image_optimization, long_video, pipeline, storage
+from app import image_optimization, long_video, pipeline, skill_milestone, storage
 from app.config import Settings
 from app.codex_runner import CodexRunner
 
 
 SCHEMA = "duet.image-phase-resume"
-VERSION = 1
+VERSION = 2
 IMAGE_FAILURE = "image optimization output is missing or invalid"
 _CID_RE = r"[0-9a-f]{32}"
 _PROMPT_BYTES = 32 * 1024
@@ -148,6 +148,7 @@ class _Snapshot:
     meta: dict
     source: Path
     element_index: Path
+    milestone: skill_milestone.FrozenSkillMilestone
     segments: list[dict]
     segment_metas: list[dict]
     manifest: dict
@@ -434,6 +435,12 @@ def _collect(settings: Settings, cid: str) -> _Snapshot:
         raise ResumeRejected("conversation not found")
     duration = _guard_meta(meta, cid)
     root = (settings.data_dir / cid).resolve()
+    try:
+        milestone = skill_milestone.load(root)
+    except skill_milestone.SkillMilestoneError as exc:
+        raise ResumeRejected(f"Skill milestone is invalid: {exc}") from None
+    if meta.get("skill_milestone") != milestone.public_summary():
+        raise ResumeRejected("Skill milestone does not match conversation")
     if any((root / name).exists() for name in (
         long_video.PLAN_RECEIPT_FILENAME,
         "prepared_input.json",
@@ -488,6 +495,8 @@ def _collect(settings: Settings, cid: str) -> _Snapshot:
     artifact_paths = [
         f"source{source.suffix}",
         "work/manifest.json", "work/scenes.json", "work/element_index.json",
+        skill_milestone.MANIFEST_RELATIVE_PATH.as_posix(),
+        *[item.frozen_path for item in milestone.skills],
     ]
     for segment in segments:
         index = segment["index"]
@@ -511,6 +520,7 @@ def _collect(settings: Settings, cid: str) -> _Snapshot:
         "version": VERSION,
         "cid": cid,
         "failure": {"status": "failed", "error": IMAGE_FAILURE},
+        "skill_milestone": milestone.public_summary(),
         "meta": _meta_projection(meta),
         "segments": segments,
         "artifacts": artifacts,
@@ -520,7 +530,7 @@ def _collect(settings: Settings, cid: str) -> _Snapshot:
     del canonical_index, root_manifest
     return _Snapshot(
         settings=settings, cid=cid, root=root, meta=meta, source=source,
-        element_index=raw_index_path, segments=segments,
+        element_index=raw_index_path, milestone=milestone, segments=segments,
         segment_metas=segment_metas, manifest=manifest,
     )
 
@@ -594,6 +604,7 @@ def _execute_snapshot(snapshot: _Snapshot, runner) -> dict:
             work,
             session_dir=root,
             element_index_path=snapshot.element_index,
+            skill_bytes=snapshot.milestone.read_bytes("image-postprocess"),
         )
         if (
             not isinstance(continuity, dict)

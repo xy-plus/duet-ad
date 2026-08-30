@@ -10,7 +10,13 @@ import cv2
 import numpy as np
 import pytest
 
-from app import codex_output_schemas, image_phase_resume, pipeline, storage
+from app import (
+    codex_output_schemas,
+    image_phase_resume,
+    pipeline,
+    skill_milestone,
+    storage,
+)
 from conftest import make_settings
 
 
@@ -51,6 +57,11 @@ def _candidate(tmp_path: Path, *, status: str = "failed") -> tuple[object, Path]
     work = cdir / "work"
     work.mkdir(parents=True)
     (cdir / "source.mp4").write_bytes(b"source")
+    milestone = skill_milestone.freeze(
+        cdir,
+        repository_root=Path(__file__).resolve().parents[1],
+        git_commit=None,
+    )
     storage._write_meta(cdir, {
         "schema_version": 2,
         "id": CID,
@@ -66,6 +77,7 @@ def _candidate(tmp_path: Path, *, status: str = "failed") -> tuple[object, Path]
         "generation": None,
         "keyframes": [],
         "prompt": None,
+        "skill_milestone": milestone.public_summary(),
     })
     _json(work / "manifest.json", {
         "duration_seconds": DURATION_S,
@@ -126,7 +138,14 @@ def test_dry_run_requires_terminal_image_failure_and_complete_artifacts(tmp_path
     settings, _ = _candidate(tmp_path)
     manifest = image_phase_resume.inspect(settings, CID)
     assert manifest["schema"] == image_phase_resume.SCHEMA
+    assert manifest["version"] == 2
     assert manifest["cid"] == CID
+    assert manifest["skill_milestone"] == storage.load_meta(
+        settings.data_dir, CID,
+    )["skill_milestone"]
+    artifact_paths = {item["path"] for item in manifest["artifacts"]}
+    assert "work/skills/skill_milestone.json" in artifact_paths
+    assert "work/skills/image-postprocess/SKILL.md" in artifact_paths
     assert manifest["segments"] == [{
         "index": 1,
         "start_s": 0.0,
@@ -166,6 +185,7 @@ def test_execute_reuses_index_and_enters_existing_image_phase(tmp_path, monkeypa
 
     def generate(*args, **kwargs):
         seen["element_index_path"] = kwargs["element_index_path"]
+        seen["skill_bytes"] = kwargs["skill_bytes"]
         return {"version": 4}, {1: "edited"}
 
     monkeypatch.setattr(pipeline, "_generate_segmented_image_prompts", generate)
@@ -190,6 +210,9 @@ def test_execute_reuses_index_and_enters_existing_image_phase(tmp_path, monkeypa
     )
     result = image_phase_resume.execute(settings, CID, manifest, runner=object())
     assert seen["element_index_path"].name == "element_index.json"
+    assert seen["skill_bytes"] == skill_milestone.load(
+        settings.data_dir / CID,
+    ).read_bytes("image-postprocess")
     assert result["status"] == "done"
     assert storage.load_meta(settings.data_dir, CID)["status"] == "done"
 
@@ -198,6 +221,21 @@ def test_nonterminal_candidate_is_rejected(tmp_path):
     settings, _ = _candidate(tmp_path, status="processing")
     with pytest.raises(image_phase_resume.ResumeRejected, match="terminal"):
         image_phase_resume.inspect(settings, CID)
+
+
+def test_frozen_image_skill_drift_is_rejected_before_codex(tmp_path, monkeypatch):
+    settings, cdir = _candidate(tmp_path)
+    manifest = image_phase_resume.inspect(settings, CID)
+    image_skill = cdir / "work" / "skills" / "image-postprocess" / "SKILL.md"
+    image_skill.write_bytes(image_skill.read_bytes() + b"\ndrift\n")
+    called = []
+    monkeypatch.setattr(
+        pipeline, "_generate_segmented_image_prompts",
+        lambda *args, **kwargs: called.append(True),
+    )
+    with pytest.raises(image_phase_resume.ResumeRejected, match="Skill milestone"):
+        image_phase_resume.execute(settings, CID, manifest, runner=object())
+    assert called == []
 
 
 def test_image_failure_keeps_terminal_meta_and_removes_partial_plan(
