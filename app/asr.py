@@ -11,7 +11,10 @@ import json
 import math
 import subprocess
 import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 
 class ASRError(RuntimeError):
@@ -21,6 +24,48 @@ class ASRError(RuntimeError):
         super().__init__(code)
         self.code = code
         self.retryable = code in self._RETRYABLE_CODES
+
+
+class ASRProcessBudget:
+    """One process-wide ASR CPU budget shared by every pipeline task.
+
+    ``threads`` is both whisper.cpp's per-process thread count and the total
+    ASR thread budget for one service instance.  Requiring an exact match makes
+    the default impossible to accidentally oversubscribe: one invocation owns
+    the complete budget while its conversion and transcription subprocesses
+    are alive, and every exit path releases it.
+    """
+
+    def __init__(self, threads: int) -> None:
+        if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
+            raise ValueError("ASR process budget threads must be a positive integer")
+        self.threads = threads
+        self._permit = threading.BoundedSemaphore(1)
+
+    @contextmanager
+    def claim(self, threads: int) -> Iterator[None]:
+        if threads != self.threads:
+            raise ASRError("asr_thread_budget_mismatch")
+        self._permit.acquire()
+        try:
+            yield
+        finally:
+            self._permit.release()
+
+
+_PROCESS_BUDGET_LOCK = threading.Lock()
+_PROCESS_BUDGET: ASRProcessBudget | None = None
+
+
+def process_budget(threads: int) -> ASRProcessBudget:
+    """Return the sole ASR budget for this process and freeze its thread size."""
+    global _PROCESS_BUDGET
+    with _PROCESS_BUDGET_LOCK:
+        if _PROCESS_BUDGET is None:
+            _PROCESS_BUDGET = ASRProcessBudget(threads)
+        elif _PROCESS_BUDGET.threads != threads:
+            raise ValueError("asr_threads cannot change within one process")
+        return _PROCESS_BUDGET
 
 
 def _lines_from_json(payload: object, duration_s: float) -> list[dict]:
@@ -61,11 +106,14 @@ def transcribe(
     duration_s: float,
     timeout_s: int,
     threads: int,
+    process_budget: ASRProcessBudget,
 ) -> list[dict]:
     """Transcribe one audio file locally with automatic language detection."""
     if not cli.is_file() or not model.is_file():
         raise ASRError("asr_not_configured")
-    with tempfile.TemporaryDirectory(prefix="duet-asr-") as raw_tmp:
+    with process_budget.claim(threads), tempfile.TemporaryDirectory(
+        prefix="duet-asr-"
+    ) as raw_tmp:
         tmp = Path(raw_tmp)
         wav = tmp / "input.wav"
         output = tmp / "result"

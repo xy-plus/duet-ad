@@ -3,6 +3,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.asr import ASRProcessBudget, process_budget
+
 SEEDREAM_PRO_MODEL = "doubao-seedream-5-0-pro-260628"
 SEEDREAM_MODELS = frozenset({
     SEEDREAM_PRO_MODEL,
@@ -45,6 +47,9 @@ class Settings:
     asr_model: Path | None = None
     asr_timeout_s: int = 600
     asr_threads: int = 4
+    asr_process_budget: ASRProcessBudget = field(
+        init=False, repr=False, compare=False
+    )
     # queued 状态会话数上限（不计 processing/done/failed），超过即 429
     max_queued: int = 100
     # TikTok 解析/下载走的 HTTP 代理（空 = 直连）；URL 下载大小上限复用 max_upload_mb
@@ -111,6 +116,15 @@ class Settings:
             or self.retry_interval_s < 0
         ):
             raise ValueError("retry_interval_s must be a non-negative finite number")
+        if (
+            isinstance(self.asr_threads, bool)
+            or not isinstance(self.asr_threads, int)
+            or self.asr_threads < 1
+        ):
+            raise ValueError("asr_threads must be a positive integer")
+        object.__setattr__(
+            self, "asr_process_budget", process_budget(self.asr_threads)
+        )
 
 
 def get_settings() -> Settings:

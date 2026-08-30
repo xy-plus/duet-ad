@@ -1,5 +1,7 @@
 import json
+import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -145,6 +147,7 @@ def test_local_asr_ignores_non_utf8_process_diagnostics(tmp_path, monkeypatch):
         duration_s=2.0,
         timeout_s=600,
         threads=4,
+        process_budget=asr.ASRProcessBudget(4),
     ) == []
 
 
@@ -172,6 +175,7 @@ def test_local_asr_repairs_truncated_utf8_token_in_json(tmp_path, monkeypatch):
         duration_s=2.0,
         timeout_s=600,
         threads=4,
+        process_budget=asr.ASRProcessBudget(4),
     ) == [{"text": "Hola", "start_s": 0.0, "end_s": 1.0}]
 
 
@@ -186,3 +190,151 @@ def test_production_config_defaults_to_pinned_multilingual_small(monkeypatch):
     )
     assert settings.asr_timeout_s == 600
     assert settings.asr_threads == 4
+    assert settings.asr_process_budget.threads == 4
+    assert (
+        Settings(access_token="second").asr_process_budget
+        is settings.asr_process_budget
+    )
+
+
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _real_asr_fixture(tmp_path: Path, monkeypatch):
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps({"active": 0, "max_active": 0, "calls": 0}),
+        encoding="utf-8",
+    )
+    fail_once = tmp_path / "fail-once"
+    _write_executable(
+        binary_dir / "ffmpeg",
+        """#!/usr/bin/python3
+import pathlib
+import sys
+pathlib.Path(sys.argv[-1]).write_bytes(b"wav")
+""",
+    )
+    cli = binary_dir / "whisper-cli"
+    _write_executable(
+        cli,
+        """#!/usr/bin/python3
+import fcntl
+import json
+import os
+import pathlib
+import sys
+import time
+
+state_path = pathlib.Path(os.environ["DUET_ASR_TEST_STATE"])
+with state_path.open("r+", encoding="utf-8") as stream:
+    fcntl.flock(stream, fcntl.LOCK_EX)
+    state = json.load(stream)
+    state["active"] += 1
+    state["max_active"] = max(state["max_active"], state["active"])
+    stream.seek(0)
+    stream.truncate()
+    json.dump(state, stream)
+    stream.flush()
+    fcntl.flock(stream, fcntl.LOCK_UN)
+
+time.sleep(0.15)
+failure_marker = os.environ.get("DUET_ASR_TEST_FAIL_ONCE")
+failed = False
+if failure_marker:
+    marker = pathlib.Path(failure_marker)
+    try:
+        marker.open("x").close()
+        failed = True
+    except FileExistsError:
+        pass
+if not failed:
+    output = pathlib.Path(sys.argv[sys.argv.index("-of") + 1]).with_suffix(".json")
+    output.write_text('{"transcription": []}', encoding="utf-8")
+
+with state_path.open("r+", encoding="utf-8") as stream:
+    fcntl.flock(stream, fcntl.LOCK_EX)
+    state = json.load(stream)
+    state["active"] -= 1
+    state["calls"] += 1
+    stream.seek(0)
+    stream.truncate()
+    json.dump(state, stream)
+    stream.flush()
+    fcntl.flock(stream, fcntl.LOCK_UN)
+sys.exit(7 if failed else 0)
+""",
+    )
+    model = tmp_path / "ggml-small.bin"
+    model.write_bytes(b"model")
+    audio = tmp_path / "voice.mp3"
+    audio.write_bytes(b"audio")
+    monkeypatch.setenv("PATH", f"{binary_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("DUET_ASR_TEST_STATE", str(state))
+    return cli, model, audio, state, fail_once
+
+
+def test_process_budget_serializes_real_asr_subprocesses(tmp_path, monkeypatch):
+    cli, model, audio, state_path, _fail_once = _real_asr_fixture(
+        tmp_path, monkeypatch
+    )
+    budget = asr.ASRProcessBudget(4)
+
+    def run_one(_index: int):
+        return asr.transcribe(
+            audio,
+            cli=cli,
+            model=model,
+            duration_s=2.0,
+            timeout_s=10,
+            threads=4,
+            process_budget=budget,
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(run_one, range(3))) == [[], [], []]
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state == {"active": 0, "max_active": 1, "calls": 3}
+
+
+def test_process_budget_releases_after_real_asr_failure(tmp_path, monkeypatch):
+    cli, model, audio, state_path, fail_once = _real_asr_fixture(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setenv("DUET_ASR_TEST_FAIL_ONCE", str(fail_once))
+    budget = asr.ASRProcessBudget(4)
+    kwargs = {
+        "cli": cli,
+        "model": model,
+        "duration_s": 2.0,
+        "timeout_s": 10,
+        "threads": 4,
+        "process_budget": budget,
+    }
+
+    with pytest.raises(asr.ASRError, match="asr_failed"):
+        asr.transcribe(audio, **kwargs)
+    assert asr.transcribe(audio, **kwargs) == []
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state == {"active": 0, "max_active": 1, "calls": 2}
+
+
+def test_process_budget_rejects_thread_count_drift():
+    budget = asr.ASRProcessBudget(4)
+    with pytest.raises(asr.ASRError, match="asr_thread_budget_mismatch"):
+        with budget.claim(2):
+            pytest.fail("mismatched thread count must not acquire the budget")
+
+
+def test_process_budget_releases_after_cancellation():
+    budget = asr.ASRProcessBudget(4)
+    with pytest.raises(KeyboardInterrupt):
+        with budget.claim(4):
+            raise KeyboardInterrupt
+    with budget.claim(4):
+        pass

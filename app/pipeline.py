@@ -1448,6 +1448,7 @@ def _transcribe_voice_attempt(
                 duration_s=duration_s,
                 timeout_s=settings.asr_timeout_s,
                 threads=settings.asr_threads,
+                process_budget=settings.asr_process_budget,
             )
             raw = json.dumps(lines, ensure_ascii=False).encode("utf-8")
             return voice.validate_voice_lines(raw, duration_s)
