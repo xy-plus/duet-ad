@@ -1372,6 +1372,14 @@ def _make_prompt_fusion_claim(
     )
     assert claimed is not None
     owner = {**claimed["_input_owner"], "fast_mode": False}
+    producer_lease = (
+        {
+            "producer_owner": owner,
+            "producer_lease_deadline": time.time() + 60.0,
+        }
+        if status == "running"
+        else {}
+    )
     storage.update_meta(
         settings.data_dir,
         cid,
@@ -1383,6 +1391,7 @@ def _make_prompt_fusion_claim(
             "input_sha256": "a" * 64,
             "image_acceptance_sha256": "b" * 64,
             "manifest_sha256": "d" * 64 if status == "done" else None,
+            **producer_lease,
         },
         dialogue_mode="auto",
         dialogue_delivery="auto",
@@ -1460,6 +1469,90 @@ def test_running_prompt_fusion_has_only_one_owner_timer(
         main_module._PROMPT_FUSION_TIMERS.pop(key, None)
 
 
+def test_stale_running_prompt_fusion_requeues_with_bounded_failure(
+    tmp_path, monkeypatch,
+):
+    settings = replace(make_settings(tmp_path), retry_count=1)
+    cid, owner = _make_prompt_fusion_claim(
+        settings, status="running", error=None
+    )
+    current = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        _prompt_fusion={
+            **current,
+            "producer_lease_deadline": time.time() - 1.0,
+        },
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "produce_prompt_fusion",
+        lambda *_args, **_kwargs: pytest.fail("stale observer only requeues"),
+    )
+
+    assert main_module._prompt_fusion_continuation_step(
+        settings, cid, object(), owner
+    ) is True
+    recovered = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+    assert recovered["status"] == "queued"
+    assert recovered["continuation_failures"] == 1
+
+
+def test_false_fusion_continuation_exhausts_budget_instead_of_polling_forever(
+    tmp_path, monkeypatch,
+):
+    settings = replace(make_settings(tmp_path), retry_count=1)
+    cid, owner = _make_prompt_fusion_claim(
+        settings, status="done", error=None
+    )
+    monkeypatch.setattr(
+        main_module, "_continue_after_prompt_fusion", lambda *_args: False
+    )
+
+    assert main_module._prompt_fusion_continuation_step(
+        settings, cid, object(), owner
+    ) is True
+    assert main_module._prompt_fusion_continuation_step(
+        settings, cid, object(), owner
+    ) is False
+    failed = storage.load_meta(settings.data_dir, cid)
+    assert failed["_input_owner"] is None
+    assert failed["_prompt_fusion"]["status"] == "failed"
+    assert failed["generation"] is None
+
+
+def test_trace_failure_cannot_prevent_fusion_terminal_state(
+    tmp_path, monkeypatch,
+):
+    settings = replace(make_settings(tmp_path), retry_count=0)
+    cid, owner = _make_prompt_fusion_claim(
+        settings, status="done", error=None
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_continue_after_prompt_fusion",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("continue failed")),
+    )
+    monkeypatch.setattr(
+        main_module.error_trace,
+        "record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("trace failed")
+        ),
+    )
+
+    assert main_module._prompt_fusion_continuation_step(
+        settings, cid, object(), owner
+    ) is False
+    failed = storage.load_meta(settings.data_dir, cid)
+    assert failed["_input_owner"] is None
+    assert failed["_prompt_fusion"]["status"] == "failed"
+    assert failed["_prompt_fusion"]["error"] == (
+        "prompt_fusion_continuation_failed"
+    )
+
+
 def test_retryable_technical_fusion_failure_auto_continues_same_owner(
     tmp_path, monkeypatch,
 ):
@@ -1507,6 +1600,51 @@ def test_retryable_technical_fusion_failure_auto_continues_same_owner(
     assert producer_calls == [cid]
     assert continuation_calls == [(cid, owner)]
     assert storage.load_meta(settings.data_dir, cid)["_input_owner"] == owner
+
+
+def test_persistent_prompt_fusion_producer_failure_exhausts_budget(
+    tmp_path, monkeypatch,
+):
+    settings = replace(make_settings(tmp_path), retry_count=1)
+    cid, owner = _make_prompt_fusion_claim(
+        settings, status="failed", error="prompt_fusion_output_invalid"
+    )
+    producer_calls = []
+    scheduled = []
+
+    def produce(_settings, received_cid, _runner):
+        producer_calls.append(received_cid)
+        current = storage.load_meta(settings.data_dir, cid)["_prompt_fusion"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            _prompt_fusion={
+                **current,
+                "status": "failed",
+                "error": "prompt_fusion_output_invalid",
+            },
+        )
+        return "failed"
+
+    def schedule(*args):
+        scheduled.append(args[1])
+        main_module._produce_prompt_fusion_and_continue(*args)
+
+    monkeypatch.setattr(pipeline, "produce_prompt_fusion", produce)
+    monkeypatch.setattr(
+        main_module, "_schedule_prompt_fusion_continuation", schedule
+    )
+
+    main_module._produce_prompt_fusion_and_continue(
+        settings, cid, object(), owner
+    )
+
+    assert scheduled == [cid]
+    assert producer_calls == [cid]
+    failed = storage.load_meta(settings.data_dir, cid)
+    assert failed["_input_owner"] is None
+    assert failed["_prompt_fusion"]["status"] == "failed"
+    assert failed["_prompt_fusion"]["continuation_failures"] == 2
 
 
 @pytest.mark.parametrize(
@@ -1730,7 +1868,7 @@ def test_persistent_finalize_exception_exhausts_retry_budget_and_stops_owner(
         (cid, owner)
     ] * (settings.retry_count + 1)
     failed = storage.load_meta(settings.data_dir, cid)
-    assert failed["_input_owner"] == owner
+    assert failed["_input_owner"] is None
     assert failed["_prompt_fusion"]["status"] == "failed"
     assert (
         failed["_prompt_fusion"]["error"]

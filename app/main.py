@@ -71,9 +71,72 @@ _NO_STORE_WEB_PATHS = frozenset({"/", "/index.html", "/app.js", "/styles.css"})
 _CLIENT_REFRESH_MESSAGE = "页面版本已更新，请刷新页面后重试。"
 _GENERATED_VIDEO_VALIDATION_CACHE_SIZE = 256
 _PROMPT_FUSION_CONTINUATION_INTERVAL_S = 1.0
+_PROMPT_FUSION_PRODUCER_LEASE_S = 60 * 60.0
+_PIPELINE_GATE_WAIT_S = 24 * 60 * 60.0
 _PROMPT_FUSION_TIMER_LOCK = threading.Lock()
 _PROMPT_FUSION_TIMERS: dict[tuple[str, str, str, str], threading.Timer] = {}
 _LOGGER = logging.getLogger(__name__)
+
+
+def _record_error_fail_open(path: Path, **kwargs) -> None:
+    """Diagnostics must never prevent the durable state transition they explain."""
+    try:
+        error_trace.record(path, logger=_LOGGER, **kwargs)
+    except BaseException:
+        try:
+            _LOGGER.exception("failed to persist error trace at %s", path)
+        except BaseException:
+            pass
+
+
+def _run_pipeline_under_gate(
+    settings: Settings,
+    cid: str,
+    runner,
+    gate,
+    claimed_owner: object = None,
+) -> bool:
+    """Run one pipeline under a bounded gate and close every local failure."""
+    acquired = False
+    try:
+        acquired = gate.acquire(timeout=_PIPELINE_GATE_WAIT_S)
+        if not acquired:
+            exc = TimeoutError("pipeline gate wait expired")
+            storage.fail_pipeline_input(
+                settings.data_dir,
+                cid,
+                claimed_owner,
+                error="pipeline_gate_timeout",
+            )
+            _record_error_fail_open(
+                settings.data_dir / cid / "work" / "errors" / "pipeline-gate.json",
+                call_path=["pipeline", cid, "gate"],
+                error=exc,
+            )
+            return False
+        if claimed_owner is None:
+            pipeline.run(settings, cid, runner)
+        else:
+            pipeline.run(
+                settings, cid, runner, claimed_owner=claimed_owner
+            )
+        return True
+    except BaseException as exc:
+        storage.fail_pipeline_input(
+            settings.data_dir,
+            cid,
+            claimed_owner,
+            error="pipeline_internal_error",
+        )
+        _record_error_fail_open(
+            settings.data_dir / cid / "work" / "errors" / "pipeline-main.json",
+            call_path=["pipeline", cid, "main"],
+            error=exc,
+        )
+        return False
+    finally:
+        if acquired:
+            gate.release()
 
 
 def _short_provider_failure_is_recoverable(generation: object) -> bool:
@@ -2933,15 +2996,9 @@ def _fail_prompt_fusion_continuation(
     exc: BaseException,
     *,
     phase: str,
+    requeue_fusion: bool = False,
 ) -> bool:
     """Record a local failure; retry the owner only within the existing budget."""
-    error_trace.record(
-        settings.data_dir / cid / "work" / "errors" / f"prompt-fusion-{phase}.json",
-        call_path=["pipeline", "prompt_fusion", phase],
-        error=exc,
-        logger=_LOGGER,
-    )
-
     retry: dict[str, bool] = {}
 
     def fail(current: dict) -> None:
@@ -2954,10 +3011,15 @@ def _fail_prompt_fusion_continuation(
                 failures = 0
             failures += 1
             if failures <= settings.retry_count:
-                current["_prompt_fusion"] = {
+                next_state = {
                     **state,
                     "continuation_failures": failures,
                 }
+                if requeue_fusion:
+                    next_state.update(status="queued", error=None)
+                    next_state.pop("producer_owner", None)
+                    next_state.pop("producer_lease_deadline", None)
+                current["_prompt_fusion"] = next_state
                 retry["value"] = True
                 return
             current["_prompt_fusion"] = {
@@ -2990,9 +3052,64 @@ def _fail_prompt_fusion_continuation(
                 "status": "failed",
                 "error": "prompt_fusion_continuation_failed",
             }
+        current["_input_owner"] = None
 
     storage.mutate_meta(settings.data_dir, cid, fail)
+    _record_error_fail_open(
+        settings.data_dir
+        / cid
+        / "work"
+        / "errors"
+        / f"prompt-fusion-{phase}.json",
+        call_path=["pipeline", "prompt_fusion", phase],
+        error=exc,
+    )
     return bool(retry.get("value"))
+
+
+def _prompt_fusion_running_lease_is_current(
+    fusion: Mapping, owner: object,
+) -> bool:
+    deadline = fusion.get("producer_lease_deadline")
+    return bool(
+        fusion.get("producer_owner") == owner
+        and isinstance(deadline, (int, float))
+        and not isinstance(deadline, bool)
+        and math.isfinite(deadline)
+        and deadline > time.time()
+    )
+
+
+def _arm_prompt_fusion_producer_lease(
+    settings: Settings, cid: str, owner: object,
+) -> bool:
+    armed: dict[str, bool] = {}
+
+    def arm(current: dict) -> None:
+        state = current.get("_prompt_fusion")
+        if (
+            current.get("_input_owner") == owner
+            and isinstance(state, Mapping)
+            and state.get("status") == "queued"
+        ):
+            current["_prompt_fusion"] = {
+                **state,
+                "producer_owner": owner,
+                "producer_lease_deadline": (
+                    time.time() + _PROMPT_FUSION_PRODUCER_LEASE_S
+                ),
+            }
+            armed["value"] = True
+
+    storage.mutate_meta(settings.data_dir, cid, arm)
+    return bool(armed.get("value"))
+
+
+def _release_prompt_fusion_failed_owner(
+    settings: Settings, cid: str, owner: object,
+) -> None:
+    """Release a terminal Fusion claim while preserving its specific error."""
+    storage.finish_input_claim(settings.data_dir, cid, owner)
 
 
 def _prompt_fusion_continuation_step(
@@ -3020,7 +3137,9 @@ def _prompt_fusion_continuation_step(
                 "prompt_fusion_refresh_required",
                 "prompt_fusion_failed",
             }:
-                return False
+                return _fail_prompt_fusion_continuation(
+                    settings, cid, owner, exc, phase="finalize"
+                )
         except Exception as exc:
             return _fail_prompt_fusion_continuation(
                 settings, cid, owner, exc, phase="finalize"
@@ -3035,42 +3154,75 @@ def _prompt_fusion_continuation_step(
     fusion = meta["_prompt_fusion"]
     status = fusion.get("status")
     if status == "running":
-        # The current producer owns the exact frozen invocation. Observers
-        # only poll its durable state; they must never create another producer.
-        return True
+        if _prompt_fusion_running_lease_is_current(fusion, owner):
+            # The current producer owns the exact frozen invocation. Observers
+            # poll only while its durable lease proves it can still finish.
+            return True
+        return _fail_prompt_fusion_continuation(
+            settings,
+            cid,
+            owner,
+            RuntimeError("prompt fusion producer lease expired"),
+            phase="producer-lease",
+            requeue_fusion=True,
+        )
     if status == "failed":
         if not _prompt_fusion_failure_is_retryable(fusion):
+            _release_prompt_fusion_failed_owner(
+                settings, cid, owner
+            )
             return False
-        reset: dict[str, bool] = {}
-
-        def requeue(current: dict) -> None:
-            state = current.get("_prompt_fusion")
-            if (
-                current.get("_input_owner") == owner
-                and state == fusion
-                and _prompt_fusion_failure_is_retryable(state)
-            ):
-                current["_prompt_fusion"] = {
-                    **state,
-                    "status": "queued",
-                    "error": None,
-                }
-                reset["value"] = True
-
-        storage.mutate_meta(settings.data_dir, cid, requeue)
-        # A separate scheduled step owns the new producer claim. This keeps a
-        # failed observer from falling through into an immediate duplicate.
-        return bool(reset.get("value"))
+        return _fail_prompt_fusion_continuation(
+            settings,
+            cid,
+            owner,
+            RuntimeError(str(fusion.get("error"))),
+            phase="producer",
+            requeue_fusion=True,
+        )
     if status == "queued":
-        status = pipeline.produce_prompt_fusion(settings, cid, runner)
+        if not _arm_prompt_fusion_producer_lease(
+            settings, cid, owner
+        ):
+            return False
+        try:
+            status = pipeline.produce_prompt_fusion(settings, cid, runner)
+        except Exception as exc:
+            return _fail_prompt_fusion_continuation(
+                settings,
+                cid,
+                owner,
+                exc,
+                phase="producer",
+                requeue_fusion=True,
+            )
     if status in {"queued", "running"}:
         return True
     if status == "failed":
         current = storage.load_submission_claim(settings.data_dir, cid, owner)
         state = current.get("_prompt_fusion") if current else None
-        return _prompt_fusion_failure_is_retryable(state)
+        if not _prompt_fusion_failure_is_retryable(state):
+            _release_prompt_fusion_failed_owner(
+                settings, cid, owner
+            )
+            return False
+        return _fail_prompt_fusion_continuation(
+            settings,
+            cid,
+            owner,
+            RuntimeError(str(state.get("error"))),
+            phase="producer",
+            requeue_fusion=True,
+        )
     if status != "done":
-        return False
+        return _fail_prompt_fusion_continuation(
+            settings,
+            cid,
+            owner,
+            RuntimeError(f"unexpected prompt fusion status: {status}"),
+            phase="producer-contract",
+            requeue_fusion=True,
+        )
     try:
         completed = _continue_after_prompt_fusion(settings, cid, owner)
     except Exception as exc:
@@ -3079,10 +3231,12 @@ def _prompt_fusion_continuation_step(
         )
     if completed:
         return False
-    current = storage.load_submission_claim(settings.data_dir, cid, owner)
-    return bool(
-        current is not None
-        and _prompt_fusion_continuation_claim(current, owner)
+    return _fail_prompt_fusion_continuation(
+        settings,
+        cid,
+        owner,
+        RuntimeError("prompt fusion continuation did not commit"),
+        phase="continue-contract",
     )
 
 
@@ -3606,13 +3760,14 @@ def create_app(settings: Settings) -> FastAPI:
                 thread.start()
 
     def run_pipeline_gated(cid: str, claimed_owner: object = None) -> None:
-        with pipeline_sem:
-            if claimed_owner is None:
-                pipeline.run(settings, cid, codex_runner)
-            else:
-                pipeline.run(
-                    settings, cid, codex_runner, claimed_owner=claimed_owner
-                )
+        if not _run_pipeline_under_gate(
+            settings,
+            cid,
+            codex_runner,
+            pipeline_sem,
+            claimed_owner,
+        ):
+            return
         operation_loop = app.state.operation_loop
         if (
             not isinstance(operation_loop, asyncio.AbstractEventLoop)
@@ -3657,7 +3812,11 @@ def create_app(settings: Settings) -> FastAPI:
             start_prompt_fusion_continuation(cid, owner)
         if not settings.enable_pipeline:
             return
-        for cid, owner in storage.claim_stale_pipeline_inputs(settings.data_dir):
+        recoverable = storage.claim_stale_pipeline_inputs(settings.data_dir)
+        recoverable.extend(
+            storage.claim_ready_queued_pipeline_inputs(settings.data_dir)
+        )
+        for cid, owner in recoverable:
             thread = threading.Thread(
                 target=run_pipeline_gated,
                 args=(cid, owner),
@@ -3739,24 +3898,56 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=422, detail=f"invalid voice_mode: {voice_mode}")
         if voice_mode == "translate" and not target_language:
             raise HTTPException(status_code=422, detail="target_language required for translate")
+        resumed_meta = None
         with create_lock:
             metas = storage.list_conversations(settings.data_dir)
             if client_request_id:
                 for m in metas:
                     if m.get("client_request_id") == client_request_id:
-                        # 幂等命中：不建目录、不重复入队，200 返回既有会话
+                        # A durable upload may have lost its BackgroundTask
+                        # between commit and response.  The CAS claim makes
+                        # repeated retries safe while restoring that enqueue.
+                        claimed = None
+                        if settings.enable_pipeline:
+                            claimed = storage.claim_ready_queued_pipeline_input(
+                                settings.data_dir, m["id"]
+                            )
+                        if claimed is not None:
+                            background_tasks.add_task(
+                                run_pipeline_gated,
+                                m["id"],
+                                claimed["_input_owner"],
+                            )
+                        elif settings.enable_pipeline:
+                            resumed_meta = (
+                                storage.prepare_incomplete_queued_pipeline_retry(
+                                    settings.data_dir, m["id"]
+                                )
+                            )
+                        if resumed_meta is not None:
+                            break
                         response.status_code = 200
-                        return {"id": m["id"], "status": m["status"]}
-            if sum(1 for m in metas if m["status"] == "queued") >= settings.max_queued:
-                raise HTTPException(status_code=429, detail="too many queued tasks")
-            meta = storage.new_conversation(
-                settings.data_dir,
-                note,
-                (file.filename or "") if file else reference_url,
-                client_request_id,
-                voice_mode=voice_mode,
-                target_language=target_language if voice_mode == "translate" else "",
-            )
+                        return {
+                            "id": m["id"],
+                            "status": (
+                                claimed["status"]
+                                if claimed is not None
+                                else m["status"]
+                            ),
+                        }
+            if resumed_meta is None:
+                if sum(1 for m in metas if m["status"] == "queued") >= settings.max_queued:
+                    raise HTTPException(status_code=429, detail="too many queued tasks")
+                meta = storage.new_conversation(
+                    settings.data_dir,
+                    note,
+                    (file.filename or "") if file else reference_url,
+                    client_request_id,
+                    voice_mode=voice_mode,
+                    target_language=target_language if voice_mode == "translate" else "",
+                )
+            else:
+                meta = resumed_meta
         cdir = settings.data_dir / meta["id"]
         try:
             if file is not None:
@@ -3807,6 +3998,8 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(e)) from e
         if settings.enable_pipeline:
             background_tasks.add_task(run_pipeline_gated, meta["id"])
+        if resumed_meta is not None:
+            response.status_code = 200
         return {"id": meta["id"], "status": "queued"}
 
     @app.get("/api/conversations/{cid}", dependencies=[Depends(require_auth)])

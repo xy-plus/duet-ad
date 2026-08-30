@@ -220,6 +220,136 @@ def claim_pipeline_input(data_dir: Path, cid: str) -> dict | None:
         return meta
 
 
+def _ready_queued_pipeline_input(cdir: Path, meta: dict) -> bool:
+    """Recognize a fully persisted upload that is safe to enqueue again."""
+    duration = meta.get("duration_s")
+    width = meta.get("source_width")
+    height = meta.get("source_height")
+    sources = [
+        path
+        for path in cdir.glob("source.*")
+        if path.is_file() and path.suffix.lower() in ALLOWED_EXT
+    ]
+    return bool(
+        meta.get("status") == "queued"
+        and not meta.get("_input_owner")
+        and not _has_frozen_input(cdir, meta)
+        and isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and isfinite(duration)
+        and duration > 0
+        and isinstance(width, int)
+        and not isinstance(width, bool)
+        and width > 0
+        and isinstance(height, int)
+        and not isinstance(height, bool)
+        and height > 0
+        and isinstance(meta.get("dialogue_mode"), str)
+        and len(sources) == 1
+    )
+
+
+def claim_ready_queued_pipeline_input(
+    data_dir: Path, cid: str,
+) -> dict | None:
+    """Atomically claim one durable queued upload after a lost enqueue."""
+    if not _ID_RE.match(cid):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = load_meta(data_dir, cid)
+        if meta is None or not _ready_queued_pipeline_input(cdir, meta):
+            return None
+        meta.update(
+            status="processing",
+            error=None,
+            _input_owner=_input_owner(cdir, "pipeline"),
+        )
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
+
+
+def claim_ready_queued_pipeline_inputs(
+    data_dir: Path,
+) -> list[tuple[str, dict]]:
+    """Claim every complete queued upload left without a background task."""
+    claimed = []
+    for listed in list_conversations(data_dir):
+        cid = listed.get("id")
+        if not isinstance(cid, str):
+            continue
+        meta = claim_ready_queued_pipeline_input(data_dir, cid)
+        if meta is not None:
+            claimed.append((cid, meta["_input_owner"]))
+    return claimed
+
+
+def prepare_incomplete_queued_pipeline_retry(
+    data_dir: Path, cid: str,
+) -> dict | None:
+    """Reuse an unclaimed pre-enqueue CID and clear only its partial source."""
+    if not _ID_RE.match(cid):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = load_meta(data_dir, cid)
+        if (
+            meta is None
+            or meta.get("status") != "queued"
+            or meta.get("_input_owner")
+            or _has_frozen_input(cdir, meta)
+            or _ready_queued_pipeline_input(cdir, meta)
+        ):
+            return None
+        for path in cdir.glob("source.*"):
+            if path.is_file():
+                path.unlink()
+        meta.update(
+            error=None,
+            duration_s=None,
+            source_width=None,
+            source_height=None,
+        )
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
+
+
+def fail_pipeline_input(
+    data_dir: Path,
+    cid: str,
+    owner: object,
+    *,
+    error: str,
+) -> dict | None:
+    """Close a queued/current pipeline claim without overwriting another owner."""
+    if not _ID_RE.match(cid):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = load_meta(data_dir, cid)
+        if meta is None:
+            return None
+        current = meta.get("_input_owner")
+        if owner is not None:
+            eligible = current == owner
+        else:
+            eligible = (
+                meta.get("status") == "queued" and not current
+            ) or (
+                isinstance(current, dict)
+                and current.get("kind") == "pipeline"
+                and current.get("process_generation") == PROCESS_GENERATION
+            )
+        if not eligible:
+            return None
+        meta.update(status="failed", error=error, _input_owner=None)
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
+
+
 def claim_stale_pipeline_inputs(data_dir: Path) -> list[tuple[str, dict]]:
     """Move recoverable pipeline leases from an older boot to this process."""
     claimed = []
