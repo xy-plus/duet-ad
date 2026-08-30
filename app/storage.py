@@ -48,6 +48,20 @@ def sanitize_title(filename: str) -> str:
     return stem[:80] or "untitled"
 
 
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError:
+        raise OSError(f"cannot open durable directory: {path.name}") from None
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _write_meta(cdir: Path, meta: dict) -> None:
     payload = json.dumps(meta, ensure_ascii=False, indent=2)
     fd, temporary = tempfile.mkstemp(prefix=".meta-", suffix=".json", dir=cdir)
@@ -57,6 +71,7 @@ def _write_meta(cdir: Path, meta: dict) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, cdir / "meta.json")
+        _fsync_directory(cdir)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -72,6 +87,7 @@ def _write_receipt(path: Path, receipt: dict) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -92,7 +108,11 @@ def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_i
                      dialogue_mode: str = "auto") -> dict:
     cid = uuid.uuid4().hex
     cdir = data_dir / cid
-    (cdir / "work").mkdir(parents=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    cdir.mkdir()
+    _fsync_directory(data_dir)
+    (cdir / "work").mkdir()
+    _fsync_directory(cdir)
     now = _now()
     meta = {
         "schema_version": 2,

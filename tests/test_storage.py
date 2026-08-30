@@ -1,9 +1,12 @@
 import hashlib
 import json
+import os
 import shutil
+import stat
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -78,6 +81,41 @@ def test_new_conversation_layout(tmp_path):
     assert saved["generation"] is None
     assert saved["voice_mode"] == "keep"
     assert len(saved["id"]) == 32
+
+
+def test_new_conversation_and_meta_replace_fsync_parent_directories(
+    tmp_path, monkeypatch,
+):
+    directory_syncs = []
+    original_fsync = os.fsync
+
+    def record_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_syncs.append(
+                Path(os.readlink(f"/proc/self/fd/{descriptor}")).resolve()
+            )
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(storage.os, "fsync", record_fsync)
+    meta = storage.new_conversation(
+        tmp_path,
+        note="durable",
+        orig_name="source.mp4",
+        generation_config={
+            "optimize_image": True,
+            "remove_subtitle": False,
+            "remove_watermark": False,
+        },
+    )
+    cdir = (tmp_path / meta["id"]).resolve()
+
+    assert tmp_path.resolve() in directory_syncs
+    assert cdir in directory_syncs
+    assert (cdir / "work").resolve() in directory_syncs
+
+    directory_syncs.clear()
+    storage.update_meta(tmp_path, meta["id"], status="processing")
+    assert directory_syncs == [cdir]
 
 
 def test_title_falls_back_to_sanitized_filename(tmp_path):
