@@ -17,13 +17,13 @@ description: Fuse frozen optimized keyframes, old segment dynamics, frame replac
 
 1. 新关键帧独占静态事实权威，包括人物、对象、场景、材质、数量、构图、机位、裁切、接触和遮挡；边缘、局部、模糊或不可见内容不补全。
 2. 旧提示词只贡献同一区间内、起止帧都支持的动作顺序、因果、camera movement type 和相对节奏；不贡献旧静态事实，不新增切点、morph、方向反转或末帧之后的终态。
-3. 同 order 的 `image_optimization_prompt[].text` 消费两个既有固定块：`全项目共享替换参考板绑定：stable_key -> TILE_XX -> replacement_description` 和 `全项目共享关系绑定：relation_key -> subject_key -> predicate -> object_key -> replacement_system`。前者是素材绑定权威，后者描述全项目关系系统；`relation_occurrences` 是逐帧关系状态的唯一结构化权威。只绑定当前新关键帧直接有记录的元素和关系，空数组表示当前帧没有关系证据。
+3. 同 order 的 `image_optimization_prompt[].text` 消费共享替换参考板绑定和结构化 `relation_occurrences`。前者是素材绑定权威；后者同时携带全局 `replacement_system` 与逐帧关系状态，是关系的唯一结构化权威。只绑定当前新关键帧直接有记录的元素和关系，空数组表示当前帧没有关系证据。
 4. 关系 ID、主客体、predicate、state、geometry、preserve 和 replace_together 由后端逐字段机械冻结；模型不得互换主客体、合并关系、改写状态、给同一 subject 添加无输入证据的 object，或从邻帧补关系。每个 hard cut 开始新账本，上一 interval 的关系不传播。
 5. `audio_content` 不进入 visual 文本，只用于避免视觉动作与冻结台词时间冲突。
 
 跨段只共享 stable element design 和 relation system；动作阶段、因果、camera movement、hard-cut 和剧情仍严格段内。若图片已经不呈现某关系，不得凭旧提示词修复；删除最小无证据片段，继续融合其他内容。质量评分不触发拒绝、重试、回退或新 workflow。
 
-固定块中的 `relation_key -> subject_key -> predicate -> object_key -> replacement_system` 继续约束全项目关系设计；`relation_occurrences.relation_id` 对应该关系的逐帧证据。主客体和功能角色全项目不变，不能互换主客体；状态生命周期覆盖连接、装载、作用、释放、分离。末帧若仍在运动，只写可见状态，不授权跨 hard cut 或无证据传播。
+`relation_occurrences.preserve` 中冻结的 `replacement_system=` 条目继续约束全项目关系设计；`relation_id` 对应该关系的逐帧证据。主客体和功能角色全项目不变，不能互换主客体；状态生命周期覆盖连接、装载、作用、释放、分离。末帧若仍在运动，只写可见状态，不授权跨 hard cut 或无证据传播。
 
 ## 输出
 

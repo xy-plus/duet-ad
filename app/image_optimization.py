@@ -72,6 +72,7 @@ _COMPONENT_ID_RE = re.compile(r"^COMPONENT_([0-9]{2})$")
 _ENTITY_ID_MENTION_RE = re.compile(r"(?<![A-Z0-9_])ENTITY_[0-9]{2}(?![A-Z0-9_])")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STABLE_KEY_PREFIX = "stable_key="
+_RELATION_SYSTEM_PREFIX = "replacement_system="
 _INELIGIBLE_REASONS = {
     "no_observable_narrative_person",
     "narrative_person_tracks_ambiguous",
@@ -2128,9 +2129,14 @@ def compile_semantic_plan(
             "subject_key": subject,
             "predicate": predicate,
             "object_key": object_key,
-            "replacement_system": replacement_system,
-            "preserve": preserve,
-            "preserve_items": indexed_preserve or [preserve],
+            # The global replacement design is not model prose decoration: it
+            # is a frozen relation fact consumed by Image prompts, Fusion and
+            # the bounded H3 relation contract.
+            "preserve_items": list(dict.fromkeys([
+                f"{_RELATION_SYSTEM_PREFIX}{replacement_system}",
+                preserve,
+                *indexed_preserve,
+            ])),
             "replace_together": indexed.get("replace_together") is True,
             "occurrences": deepcopy(indexed.get("occurrences", [])),
         }
@@ -4290,9 +4296,6 @@ def generate_project_prompts(
                             not set(frame["people"]).issubset(global_plan["people"])
                             or not set(frame["entities"]).issubset(
                                 global_plan["entities"]
-                            )
-                            or not set(frame["relations"]).issubset(
-                                global_plan["relations"]
                             )
                         ):
                             raise ValueError(

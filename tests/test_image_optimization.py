@@ -1685,8 +1685,7 @@ def test_relation_index_compiles_joint_design_and_frame_state_into_prompt(tmp_pa
         },
         "relations": {
             "relation-01": {
-                "subject_key": "entity-01", "predicate": "loaded_in",
-                "object_key": "entity-02", "replacement_system": "matched interface and scale",
+                "replacement_system": "matched interface and scale",
                 "preserve": "keep roles and current state",
             }
         },
@@ -1703,11 +1702,6 @@ def test_relation_index_compiles_joint_design_and_frame_state_into_prompt(tmp_pa
                     "entity-01": {"visibility": "visible", "relationship": "directly visible"},
                     "entity-02": {"visibility": "visible", "relationship": "directly visible"},
                 },
-                "relations": {"relation-01": {
-                    "state": "engaged" if number == 1 else "released",
-                    "geometry": "aligned" if number == 1 else "separated",
-                    "evidence": "current pixels",
-                }},
                 "relationships": "preserve visible relations", "crop": "preserve crop",
             } for number in (1, 2)
         },
@@ -1721,9 +1715,9 @@ def test_relation_index_compiles_joint_design_and_frame_state_into_prompt(tmp_pa
     # The replacement board is element-only.  Directed relation semantics are
     # carried by the per-frame prompts below, not painted into reference tiles.
     assert "matched interface and scale" not in image_optimization.composite_replacement_board_prompt(plan)
-    # Relation authority is a structured sidecar; the image edit prose keeps
-    # only the visible element bindings and must not duplicate that authority.
-    assert "全项目共享关系绑定：relation-01" not in prompts[1]
+    # The shared replacement system is visible to the image edit and is also
+    # carried by the structured sidecar to Fusion/H3.
+    assert "matched interface and scale" in prompts[1]
     relations = [
         frame["relation_occurrences"][0]
         for frame in plan["segments"][0]["frame_constraints"]
@@ -1737,6 +1731,11 @@ def test_relation_index_compiles_joint_design_and_frame_state_into_prompt(tmp_pa
     assert [relation["geometry"] for relation in relations] == [
         "aligned", "separated",
     ]
+    assert all(
+        relation["preserve"][0]
+        == "replacement_system=matched interface and scale"
+        for relation in relations
+    )
 
 
 def test_relation_index_normalization_is_tolerant_and_preserves_valid_edges():

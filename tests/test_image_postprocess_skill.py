@@ -253,10 +253,6 @@ class _Runner:
                         {"key": key, **item}
                         for key, item in frame.get("entities", {}).items()
                     ],
-                    "relations": [
-                        {"key": key, **item}
-                        for key, item in frame.get("relations", {}).items()
-                    ],
                     "relationships": frame.get("relationships", "source-preserve"),
                     "crop": frame.get("crop", "source-preserve"),
                 })
@@ -349,8 +345,7 @@ def _skill_contract() -> tuple[str, dict]:
             "local_color_change": "color",
         }},
         "relations": {"relation-01": {
-            "subject_key": "person-01", "predicate": "holds",
-            "object_key": "entity-01", "replacement_system": "system",
+            "replacement_system": "system",
             "preserve": "direction and interface",
         }},
     }
@@ -366,9 +361,6 @@ def _skill_contract() -> tuple[str, dict]:
         }},
         "entities": {"entity-01": {
             "visibility": "visible", "relationship": "held",
-        }},
-        "relations": {"relation-01": {
-            "state": "held", "geometry": "in hand", "evidence": "pixels",
         }},
         "relationships": "person holds entity", "crop": "full frame",
     }}}
@@ -402,7 +394,7 @@ def test_skill_exposes_closed_global_and_segment_json_contracts():
         "local_color_change",
     }
     frame = next(iter(segment_frames["frames"].values()))
-    assert set(frame) == {"people", "relationships", "entities", "relations", "crop"}
+    assert set(frame) == {"people", "relationships", "entities", "crop"}
     person = next(iter(frame["people"].values()))
     assert set(person) == {
         "visible_region", "boundary", "body_and_pose",
@@ -415,7 +407,6 @@ def test_skill_exposes_closed_global_and_segment_json_contracts():
     }
     entity = next(iter(frame["entities"].values()))
     relation = next(iter(global_plan["relations"].values()))
-    frame_relation = next(iter(frame["relations"].values()))
     assert set(entity) == {"visibility", "relationship"}
     assert next(iter(global_plan["entities"].values()))["owner"] == "project"
     assert observation["mode"] in {
@@ -423,9 +414,8 @@ def test_skill_exposes_closed_global_and_segment_json_contracts():
     }
     assert entity["visibility"] in {"visible", "occluded"}
     assert set(relation) == {
-        "subject_key", "predicate", "object_key", "replacement_system", "preserve",
+        "replacement_system", "preserve",
     }
-    assert set(frame_relation) == {"state", "geometry", "evidence"}
 
 
 def test_skill_frame_entities_are_direct_evidence_only_and_omit_out_of_frame():
@@ -544,7 +534,6 @@ def _semantic_output(request: dict, *, sparse: bool = False) -> dict:
                 }},
                 "relationships": f"{slot['key']} 当前可见接触与遮挡关系",
                 "entities": {},
-                "relations": {},
                 "crop": f"{slot['key']} 当前画外裁切",
             }
         )

@@ -83,10 +83,28 @@ def test_image_dtos_use_explicit_keys_and_backend_indexes_every_level() -> None:
         }],
         "entities": [],
         "scenes": [],
-        "relations": [],
+        "relations": [{
+            "key": "relation-01",
+            "replacement_system": "compatible interface",
+            "preserve": "directed roles",
+        }],
     }
     jsonschema.validate(global_model, codex_output_schemas.GLOBAL_PLAN_SCHEMA)
-    assert "person-01" in codex_output_schemas.normalize_global_plan(global_model)["people"]
+    normalized_global = codex_output_schemas.normalize_global_plan(global_model)
+    assert "person-01" in normalized_global["people"]
+    assert normalized_global["relations"]["relation-01"] == {
+        "replacement_system": "compatible interface",
+        "preserve": "directed roles",
+    }
+
+    invalid_global = json.loads(json.dumps(global_model))
+    invalid_global["relations"][0]["subject_key"] = "person-01"
+    try:
+        jsonschema.validate(invalid_global, codex_output_schemas.GLOBAL_PLAN_SCHEMA)
+    except jsonschema.ValidationError:
+        pass
+    else:
+        raise AssertionError("global plan accepted an index-owned relation endpoint")
 
     frame_model = {"frames": [{
         "key": "frame-001",
@@ -94,7 +112,7 @@ def test_image_dtos_use_explicit_keys_and_backend_indexes_every_level() -> None:
             "key": "person-01", "visible_region": "full", "boundary": "outline",
             "body_and_pose": "standing", "derived_observations": [],
         }],
-        "entities": [], "relations": [], "relationships": "none", "crop": "full",
+        "entities": [], "relationships": "none", "crop": "full",
     }]}
     jsonschema.validate(frame_model, codex_output_schemas.SEGMENT_FRAMES_SCHEMA)
     normalized = codex_output_schemas.normalize_segment_frames(frame_model)
@@ -150,4 +168,3 @@ def test_codex_argv_receives_readonly_output_schema(monkeypatch, tmp_path: Path)
             argv[index:index + 3] == schema_mount
             for index in range(len(argv) - 2)
         )
-

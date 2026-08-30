@@ -98,9 +98,6 @@ _GLOBAL_SCENE = _object({
 })
 _GLOBAL_RELATION = _object({
     "key": _TEXT,
-    "subject_key": _TEXT,
-    "predicate": _TEXT,
-    "object_key": _TEXT,
     "replacement_system": _TEXT,
     "preserve": _TEXT,
 })
@@ -135,17 +132,10 @@ _FRAME_ENTITY = _object({
     "visibility": {"type": "string", "enum": ["visible", "occluded"]},
     "relationship": _TEXT,
 })
-_FRAME_RELATION = _object({
-    "key": _TEXT,
-    "state": _TEXT,
-    "geometry": _TEXT,
-    "evidence": _TEXT,
-})
 _FRAME = _object({
     "key": _TEXT,
     "people": _array(_FRAME_PERSON, maximum=30),
     "entities": _array(_FRAME_ENTITY, maximum=100),
-    "relations": _array(_FRAME_RELATION, maximum=200),
     "relationships": _TEXT,
     "crop": _TEXT,
 })
@@ -239,8 +229,7 @@ def normalize_global_plan(value: object) -> dict:
             "local_color_change",
         }),
         "relations": _index_records(value["relations"], fields={
-            "subject_key", "predicate", "object_key", "replacement_system",
-            "preserve",
+            "replacement_system", "preserve",
         }),
     }
 
@@ -249,7 +238,7 @@ def normalize_segment_frames(value: object) -> dict:
     if not isinstance(value, dict) or set(value) != {"frames"}:
         raise ValueError("segment frames output is invalid")
     frames = _index_records(value["frames"], fields={
-        "people", "entities", "relations", "relationships", "crop",
+        "people", "entities", "relationships", "crop",
     })
     for frame in frames.values():
         frame["people"] = _index_records(frame["people"], fields={
@@ -265,8 +254,5 @@ def normalize_segment_frames(value: object) -> dict:
             )
         frame["entities"] = _index_records(
             frame["entities"], fields={"visibility", "relationship"},
-        )
-        frame["relations"] = _index_records(
-            frame["relations"], fields={"state", "geometry", "evidence"},
         )
     return {"frames": frames}

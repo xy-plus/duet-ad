@@ -56,7 +56,6 @@ def test_image_compiler_freezes_relation_outside_truncated_descriptions() -> Non
             "persistence": "one persistent instance",
         }},
         "relations": {"relation-01": {
-            "predicate": "generic contact",
             "replacement_system": "compatible replacement interface",
             "preserve": "keep the directed installation",
         }},
@@ -75,7 +74,6 @@ def test_image_compiler_freezes_relation_outside_truncated_descriptions() -> Non
                 "visibility": "visible",
                 "relationship": "mounted at the visible interface",
             }},
-            "relations": {},
             "relationships": "directly visible mounting",
             "crop": "current source crop",
         }},
@@ -93,9 +91,46 @@ def test_image_compiler_freezes_relation_outside_truncated_descriptions() -> Non
         "object_key": "scene-01",
         "state": "已安装并保持连接",
         "geometry": "位于环境左侧固定接口",
-        "preserve": ["有向安装角色", "数量一一对应"],
+        "preserve": [
+            "replacement_system=compatible replacement interface",
+            "keep the directed installation",
+            "有向安装角色", "数量一一对应",
+        ],
         "replace_together": True,
     }]
+    image_prompt = image_optimization.compile_frame_prompts(
+        plan, "anchor_consistency",
+    )[1][1]
+    assert "replacement_system=compatible replacement interface" in image_prompt
+
+    timeline = [{
+        "order": order,
+        "segment_time_s": float(order - 1),
+        "source_scene_id": "scene-01",
+        "transition": {
+            "type": "start" if order == 1 else "continuous",
+            "at_segment_s": 0.0 if order == 1 else None,
+        },
+    } for order in range(1, 10)]
+    fusion_occurrence = [{
+        **frame["relation_occurrences"][0],
+        "frame": {
+            "order": 1,
+            "segment_time_s": 0.0,
+            "source_scene_id": "scene-01",
+        },
+    }]
+    h3_prompt = long_generation._compile_fusion_ref2va_prompt(
+        visual=["The visible replacement system keeps its current composition."],
+        timeline=timeline,
+        lines=[],
+        music_policy="forbid",
+        relation_occurrences=fusion_occurrence,
+    )
+    relation_marker = context_ir_bridge._relation_states_contract(h3_prompt)
+    assert relation_marker is not None
+    assert "replacement_system=compatible replacement interface" in relation_marker
+    assert len(relation_marker) <= long_generation._MAX_RELATION_MARKER_CHARS
     assert {
         "subject_id": "ENTITY_01",
         "predicate": "installs",
