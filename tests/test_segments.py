@@ -80,7 +80,7 @@ SEGMENTS_4 = [
 ]
 
 
-def _write_valid_package(work: Path, frames: int = 3, prompt: str = "分段桩产物"):
+def _write_valid_package(work: Path, frames: int = 9, prompt: str = "分段桩产物"):
     """按约定文件名造一套合法产物（同 test_pipeline 的桩约定）。"""
     kdir = work / "keyframes"
     kdir.mkdir(parents=True, exist_ok=True)
@@ -286,7 +286,7 @@ def _fake_cut(source, start_s, end_s, segdir):
 def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     tmp_path, monkeypatch
 ):
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, codex_concurrency=2)
     meta = _make_segment_conversation(settings, [])
     cid = meta["id"]
     cdir = settings.data_dir / cid
@@ -300,15 +300,57 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     line = {"text": "局部台词", "start_s": 16.5, "end_s": 17.5}
     calls = {"cmd": [], "codex": []}
     image_calls = []
+    visual_call_count = 0
 
     def fake_voice_step(*args, **kwargs):
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            voice_line_provenance=[{
+                **line,
+                "classification": "spoken",
+                "provenance": "asr",
+                "kept": True,
+            }],
+        )
         return [line]
 
     def fake_codex(self, workdir, prompt):
+        nonlocal visual_call_count
+        visual_call_count += 1
         calls["codex"].append(Path(workdir))
-        _write_valid_package(Path(workdir) / "work", prompt=f"局部动作-{Path(workdir).name}")
+        staged_work = Path(workdir) / "work"
+        keyframes = staged_work / "keyframes"
+        keyframes.mkdir(parents=True, exist_ok=True)
+        for order, source_frame in enumerate(
+            sorted(staged_work.glob("*_frame_*.png")), 1
+        ):
+            shutil.copy(source_frame, keyframes / f"{order:02d}.png")
+        (staged_work / "prompt.txt").write_text(
+            f"局部动作-{visual_call_count}", encoding="utf-8"
+        )
 
-    def fake_image_project(_runner, segments, mode, *, session_dir):
+    def fake_isolated_until_output(
+        self, workdir, prompt, *, session_dir, output_path,
+        max_output_bytes, validate_output,
+    ):
+        raw = json.dumps({
+            "people": {},
+            "entities": {},
+            "scenes": {},
+            "relations": {},
+        }).encode("utf-8")
+        assert len(raw) <= max_output_bytes
+        return validate_output(raw)
+
+    def fake_image_project(
+        _runner, segments, mode, *, session_dir, expected_version,
+        element_index_path, skill_bytes, phase_retry_count,
+        phase_retry_interval_s,
+    ):
+        assert expected_version == 4
+        assert Path(element_index_path).is_file()
+        assert skill_bytes
         indices = [segment["index"] for segment in segments]
         image_calls.append((Path(session_dir), indices))
         return {
@@ -343,16 +385,30 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
         elif step.startswith("segment ") and step.endswith(" extract"):
             out = Path(argv[argv.index("--out-dir") + 1])
             out.mkdir(parents=True, exist_ok=True)
-            (out / "001_frame_000.000s.png").write_bytes(_SOURCE_FIRST_PNG)
-            (out / "002_frame_007.750s.png").write_bytes(_SOURCE_LAST_PNG)
+            frame_data = [
+                _SOURCE_FIRST_PNG,
+                *(_solid_png(value) for value in range(45, 80, 5)),
+                _SOURCE_LAST_PNG,
+            ]
+            frame_times = [round(7.75 * index / 8, 3) for index in range(9)]
+            frame_names = [
+                f"{index:03d}_frame_{time_s:07.3f}s.png"
+                for index, time_s in enumerate(frame_times, 1)
+            ]
+            for name, data in zip(frame_names, frame_data):
+                (out / name).write_bytes(data)
             (out / "manifest.json").write_text(
                 json.dumps(
                     {
                         "frames": [
-                            {"index": 1, "time_seconds": 0.0,
-                             "file": "001_frame_000.000s.png"},
-                            {"index": 2, "time_seconds": 7.75,
-                             "file": "002_frame_007.750s.png"},
+                            {
+                                "index": index,
+                                "time_seconds": time_s,
+                                "file": name,
+                            }
+                            for index, (time_s, name) in enumerate(
+                                zip(frame_times, frame_names), 1
+                            )
                         ]
                     }
                 ),
@@ -366,6 +422,9 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
     monkeypatch.setattr(pipeline, "_cut_segment", _fake_cut)
     monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        CodexRunner, "run_isolated_until_output", fake_isolated_until_output,
+    )
     monkeypatch.setattr(
         pipeline.image_optimization,
         "generate_project_prompts",
@@ -406,7 +465,10 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     )
     assert [s["join_mode"] for s in stored["segments"]] == ["hard_cut"] * 3
     assert stored["segments"][2]["dialogue"] == [
-        {"text": "局部台词", "start_s": 0.5, "end_s": 1.5}
+        {
+            "text": "局部台词", "start_s": 0.5, "end_s": 1.5,
+            "classification": "spoken",
+        }
     ]
     assert stored["segments"][0]["source"] == "segments/1/source.mp4"
     assert stored["segments"][0]["keyframe_paths"][0].startswith(
@@ -436,7 +498,7 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
     assert receipt["segments"][0]["anchors"][1]["sha256"] == hashlib.sha256(
         _SOURCE_LAST_PNG
     ).hexdigest()
-    assert receipt["segments"][0]["anchors"][0]["sha256"] != (
+    assert receipt["segments"][0]["anchors"][0]["sha256"] == (
         receipt["segments"][0]["keyframes"][0]["sha256"]
     )
     assert [s["chain_id"] for s in receipt["segments"]] == [
@@ -510,8 +572,8 @@ def test_run_single_segment_has_no_prefix_and_no_segments_key(tmp_path, monkeypa
 
 
 def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
-    """分段 codex 调用：cwd=段目录（物理隔离）；prompt 与单段逐字相同（_codex_prompt），
-    段目录内嵌套 work/ 使 SKILL.md 的 work/ 路径逐字适用；不含「分段模式」/ scenes.json。"""
+    """分段 visual Codex 在一次性 /tmp stage 中运行；prompt 与单段逐字相同，
+    stage 内仍使用 SKILL.md 的 work/ 路径，且不暴露「分段模式」/ scenes.json。"""
     settings = make_settings(tmp_path)
     meta = _make_segment_conversation(settings, SEGMENTS)
     cid = meta["id"]
@@ -519,8 +581,13 @@ def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
     calls = {"cmd": [], "codex": []}
 
     def fake_codex(self, workdir, prompt):
-        calls["codex"].append({"workdir": Path(workdir), "prompt": prompt})
-        # 按 SKILL.md 字面执行：产物写 workdir/work/（与单段 codex 对文档无任何差异）
+        stage = Path(workdir)
+        calls["codex"].append({
+            "workdir": stage,
+            "prompt": prompt,
+            "has_scenes": (stage / "work" / "scenes.json").exists(),
+            "has_voice_lines": (stage / "work" / "voice_lines.json").exists(),
+        })
         _write_valid_package(Path(workdir) / "work")
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
@@ -531,18 +598,20 @@ def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "done", m["error"]
     assert len(calls["codex"]) == 3
-    assert {c["workdir"] for c in calls["codex"]} == {
-        cdir / "work" / "segments" / str(n) for n in (1, 2, 3)
-    }  # cwd = 段目录，看不到段外
-    by_index = {c["workdir"].name: c for c in calls["codex"]}
-    prompt = by_index["2"]["prompt"]
-    # 两模式 prompt 逐字相同：agent 感知不到任何模式差异
+    assert all(
+        call["workdir"].parent == Path("/tmp")
+        and call["workdir"].name.startswith("duet-visual-")
+        for call in calls["codex"]
+    )
+    assert all(not call["has_scenes"] for call in calls["codex"])
+    assert all(not call["has_voice_lines"] for call in calls["codex"])
+    prompt = calls["codex"][0]["prompt"]
     assert prompt == pipeline._codex_prompt(cdir / "work" / "segments" / "2", "")
     for needle in (
-        str(pipeline.SKILL_MD),
+        "SKILL.md",
         "输入在 work/",
         sys.executable,
-        str((cdir / "work" / "segments" / "2").resolve()),  # 硬性禁令限定的写目录 = 段目录
+        "当前隔离目录",
         "禁止联网",
         "环境变量",
     ):
@@ -550,7 +619,7 @@ def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
     for banned in ("分段模式", "scenes.json"):
         assert banned not in prompt
     assert "voice.mp3" not in prompt
-    # scripts 拷入每段目录；段目录（含其 work/）不拷 scenes.json；无口播不写段台词文件
+    # 持久段目录保留 scripts，但不写 scenes.json 或无口播台词。
     for n in (1, 2, 3):
         segdir = cdir / "work" / "segments" / str(n)
         assert (segdir / "scripts" / "crop_image.py").is_file()
@@ -562,13 +631,17 @@ def test_run_segment_codex_cwd_and_prompt(tmp_path, monkeypatch):
 
 def test_run_segment_failure_marks_overall_failed(tmp_path, monkeypatch):
     """任一段失败 → 整体 failed，error 指明段号。"""
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, codex_concurrency=2)
     meta = _make_segment_conversation(settings, SEGMENTS)
     cid = meta["id"]
     calls = {"cmd": []}
 
+    call_count = 0
+
     def fake_codex(self, workdir, prompt):
-        if Path(workdir).name == "2":
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
             raise CodexError("codex exit 3: segment crashed")
         _write_valid_package(Path(workdir) / "work")
 
@@ -583,14 +656,18 @@ def test_run_segment_failure_marks_overall_failed(tmp_path, monkeypatch):
 
 
 def test_run_segment_zero_exit_without_outputs_reports_codex_stage(tmp_path, monkeypatch):
-    """段 Codex 返回 0 但缺产物时，错误归因到视觉输出而非 keyframe 数量。"""
-    settings = make_settings(tmp_path)
+    """段 Codex 返回 0 但未填充预建帧位时，解码校验精确指向首个空帧。"""
+    settings = make_settings(tmp_path, codex_concurrency=2)
     meta = _make_segment_conversation(settings, SEGMENTS)
     cid = meta["id"]
     calls = {"cmd": []}
 
+    call_count = 0
+
     def fake_codex(self, workdir, prompt):
-        if Path(workdir).name != "2":
+        nonlocal call_count
+        call_count += 1
+        if call_count != 2:
             _write_valid_package(Path(workdir) / "work")
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_cmd_segments(calls, SEGMENTS))
@@ -600,7 +677,7 @@ def test_run_segment_zero_exit_without_outputs_reports_codex_stage(tmp_path, mon
 
     m = storage.load_meta(settings.data_dir, cid)
     assert m["status"] == "failed"
-    assert "segment 2 failed: codex visual output invalid" in m["error"]
+    assert "segment 2 failed: keyframe undecodable: 01.png" in m["error"]
     assert "keyframe count 0" not in m["error"]
 
 
@@ -888,9 +965,9 @@ def _make_scene_video_24s(path: Path) -> Path:
     return path
 
 
-def _write_stub_codex_segments(bin_dir: Path, frames: int = 3) -> Path:
-    """桩 codex 兼处理两种调用：ASR 写 3 句台词；分段调用 cwd 即段目录，
-    按 SKILL.md 字面路径写 workdir/work/ 产物（段目录内嵌套 work/ 的设计前提）。"""
+def _write_stub_codex_segments(bin_dir: Path, frames: int = 9) -> Path:
+    """桩 codex 兼处理两种调用：ASR 写 3 句台词；视觉阶段在隔离 cwd 中
+    按 SKILL.md 字面路径写 work/ 下的 9 帧和 prompt。"""
     stub = bin_dir / "codex"
     stub.write_text(
         "#!/usr/bin/python3\n"
@@ -975,7 +1052,7 @@ def test_run_multi_segment_full_pipeline(tmp_path, monkeypatch, segment_voice_st
     for seg, (start, end) in zip(segs, [(0.0, 8.0), (8.0, 16.0), (16.0, 24.0)]):
         assert abs(seg["start_s"] - start) < 0.001
         assert abs(seg["end_s"] - end) < 0.001
-        assert seg["keyframes"] == ["01.png", "02.png", "03.png"]
+        assert seg["keyframes"] == [f"{index:02d}.png" for index in range(1, 10)]
         assert seg["prompt"] == pipeline.NO_BGM_LINE + "\n分段桩产物"
     # 顶层 keyframes/prompt 保持空值，不重复写
     assert m["keyframes"] == [] and m["prompt"] is None
@@ -1000,6 +1077,6 @@ def test_run_multi_segment_full_pipeline(tmp_path, monkeypatch, segment_voice_st
     for n in (1, 2, 3):
         segdir = cdir / "work" / "segments" / str(n)
         assert (segdir / "scripts" / "crop_image.py").is_file()  # scripts 逐段拷入（段目录根）
-        assert (segdir / "codex_last_message.txt").is_file()  # -o 随 cwd 落段目录
+        assert not (segdir / "codex_last_message.txt").exists()
         assert not (segdir / "scenes.json").exists()  # scenes.json 不拷入段目录
         assert not (segdir / "work" / "scenes.json").exists()
