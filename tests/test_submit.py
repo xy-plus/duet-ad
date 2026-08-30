@@ -29,6 +29,48 @@ PROMPT = "镜头从整洁的房间缓慢推进。"
 REQUEST_ID = "request-123456"
 
 
+def test_h3_recovery_validation_does_not_block_application_startup(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True)
+    cid, _ = _make_conv(settings)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        generation={
+            "status": "succeeded",
+            "error": None,
+            "attempt": 1,
+            "client_request_id": REQUEST_ID,
+            "stage": "h3",
+        },
+    )
+    validation_entered = threading.Event()
+    release_validation = threading.Event()
+
+    def blocked_validation(_settings, _meta):
+        validation_entered.set()
+        assert release_validation.wait(timeout=2)
+        return True
+
+    monkeypatch.setattr(
+        main_module, "_has_valid_generated_video", blocked_validation
+    )
+    try:
+        with TestClient(create_app(settings)) as client:
+            assert validation_entered.wait(timeout=1)
+            assert client.get("/api/health").json() == {"ok": True}
+            assert any(
+                thread.name == "h3-recovery-scan" and thread.is_alive()
+                for thread in client.app.state.h3_resume_threads
+            )
+            release_validation.set()
+            for thread in client.app.state.h3_resume_threads:
+                thread.join(timeout=2)
+    finally:
+        release_validation.set()
+
+
 def test_auto_dialogue_keeps_only_verified_spoken_but_manual_modes_are_verbatim() -> None:
     meta = {
         "duration_s": 10.0,

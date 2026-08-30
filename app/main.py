@@ -3868,32 +3868,45 @@ def create_app(settings: Settings) -> FastAPI:
     async def resume_h3_generations() -> None:
         if not settings.enable_h3_submit:
             return
-        for meta in storage.list_conversations(settings.data_dir):
-            generation = meta.get("generation")
-            if (
-                meta.get("schema_version") == 2
-                and isinstance(generation, dict)
-                and (
-                    generation.get("status") in _GENERATION_ACTIVE
-                    or (
-                        generation.get("status") == "succeeded"
-                        and not _has_valid_generated_video(settings, meta)
+
+        def scan() -> None:
+            for meta in storage.list_conversations(settings.data_dir):
+                generation = meta.get("generation")
+                if (
+                    meta.get("schema_version") == 2
+                    and isinstance(generation, dict)
+                    and (
+                        generation.get("status") in _GENERATION_ACTIVE
+                        or (
+                            generation.get("status") == "succeeded"
+                            and not _has_valid_generated_video(settings, meta)
+                        )
                     )
-                )
-            ):
-                target = (
-                    _resume_long_generation
-                    if isinstance(generation.get("segments"), list)
-                    else _resume_generation
-                )
-                thread = threading.Thread(
-                    target=target,
-                    args=(settings, meta["id"]),
-                    daemon=True,
-                    name=f"h3-resume-{meta['id'][:8]}",
-                )
-                app.state.h3_resume_threads.append(thread)
-                thread.start()
+                ):
+                    target = (
+                        _resume_long_generation
+                        if isinstance(generation.get("segments"), list)
+                        else _resume_generation
+                    )
+                    thread = threading.Thread(
+                        target=target,
+                        args=(settings, meta["id"]),
+                        daemon=True,
+                        name=f"h3-resume-{meta['id'][:8]}",
+                    )
+                    app.state.h3_resume_threads.append(thread)
+                    thread.start()
+
+        # Strict output validation can inspect every segment and invoke
+        # ffprobe.  Keep that exact recovery gate, but do not run its O(N)
+        # cold-cache scan on the application event-loop startup path.
+        scanner = threading.Thread(
+            target=scan,
+            daemon=True,
+            name="h3-recovery-scan",
+        )
+        app.state.h3_resume_threads.append(scanner)
+        scanner.start()
 
     def run_pipeline_gated(
         cid: str,
