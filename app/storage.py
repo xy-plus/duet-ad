@@ -13,6 +13,8 @@ from math import isfinite
 from pathlib import Path
 from typing import Callable, NamedTuple
 
+from app import generation_config as generation_config_contract
+
 ALLOWED_EXT = {".mp4", ".mov", ".webm"}
 _CHUNK = 1024 * 1024
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -58,6 +60,21 @@ def _write_meta(cdir: Path, meta: dict) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def _write_receipt(path: Path, receipt: dict) -> None:
+    payload = json.dumps(receipt, ensure_ascii=False, indent=2)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{path.stem}-", suffix=".json", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 @contextmanager
 def _meta_lock(cdir: Path):
     key = str(cdir.resolve())
@@ -68,7 +85,8 @@ def _meta_lock(cdir: Path):
 
 
 def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_id: str = "",
-                     voice_mode: str = "keep", target_language: str = "") -> dict:
+                     voice_mode: str = "keep", target_language: str = "",
+                     generation_config: dict | None = None) -> dict:
     cid = uuid.uuid4().hex
     cdir = data_dir / cid
     (cdir / "work").mkdir(parents=True)
@@ -94,6 +112,16 @@ def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_i
         meta["client_request_id"] = client_request_id
     if target_language:
         meta["target_language"] = target_language
+    if generation_config is not None:
+        generation_config_receipt = generation_config_contract.receipt(
+            generation_config
+        )
+        meta["generation_config"] = dict(generation_config)
+        meta["generation_config_sha256"] = generation_config_receipt[
+            "generation_config_sha256"
+        ]
+        receipt_path = cdir / "work" / "generation-config.json"
+        _write_receipt(receipt_path, generation_config_receipt)
     _write_meta(cdir, meta)
     return meta
 

@@ -24,6 +24,7 @@ from app import (
     downloader,
     error_trace,
     frame_fit,
+    generation_config,
     h3,
     h3_project,
     image_optimization,
@@ -3256,6 +3257,30 @@ def _produce_prompt_fusion_and_continue(
         )
 
 
+def _automatic_postprocess_request(cdir: Path, meta: Mapping) -> dict | None:
+    frozen = generation_config.resolve(cdir, meta)
+    if frozen is None:
+        return None
+    return {
+        "confirm": True,
+        "options": generation_config.postprocess_options(frozen),
+    }
+
+
+def _postprocess_matches_automatic_request(
+    state: object, request: Mapping, *, private: object = None,
+) -> bool:
+    if not isinstance(state, Mapping):
+        return False
+    options = state.get("options")
+    if not isinstance(options, Mapping) and isinstance(private, Mapping):
+        options = private.get("options")
+    return (
+        isinstance(options, Mapping)
+        and dict(options) == request.get("options")
+    )
+
+
 def _start_automatic_v4_generation(
     settings: Settings, cid: str, runner,
 ) -> None:
@@ -3283,8 +3308,30 @@ def _start_automatic_v4_generation(
                 settings, cid, runner, owner
             )
         return
+    automatic_request = _automatic_postprocess_request(
+        settings.data_dir / cid, meta
+    )
+    if automatic_request is None:
+        return
     post = meta.get("postprocess")
-    if not isinstance(post, Mapping) or post.get("status") != "done":
+    frozen_preflight = generation_config.is_frozen(
+        settings.data_dir / cid, meta
+    )
+    if frozen_preflight and any(automatic_request["options"].values()):
+        if (
+            not _postprocess_matches_automatic_request(
+                post,
+                automatic_request,
+                private=meta.get("_postprocess_receipt"),
+            )
+            or post.get("status") != "done"
+        ):
+            return
+    elif frozen_preflight and post is not None:
+        return
+    elif not frozen_preflight and (
+        not isinstance(post, Mapping) or post.get("status") != "done"
+    ):
         return
     acceptance = postprocess.image_acceptance_status(settings, cid, meta)
     if acceptance.get("required") and not acceptance.get("accepted"):
@@ -3573,28 +3620,35 @@ def create_app(settings: Settings) -> FastAPI:
             or long_generation.plan_receipt(settings.data_dir / cid, meta) is None
         ):
             return
+        automatic_request = _automatic_postprocess_request(
+            settings.data_dir / cid, meta
+        )
+        if automatic_request is None:
+            return
+        automatic_options = automatic_request["options"]
+        frozen_preflight = generation_config.is_frozen(
+            settings.data_dir / cid, meta
+        )
         post = meta.get("postprocess")
         should_run = False
         if not isinstance(post, Mapping):
-            if not os.environ.get("ARK_API_KEY", "").strip():
-                return
-            try:
-                await postprocess.start(
-                    settings,
-                    cid,
-                    {
-                        "confirm": True,
-                        "options": {
-                            "remove_subtitle": False,
-                            "remove_brand": False,
-                            "optimize_image": True,
-                        },
-                    },
-                    postprocess_locks,
-                )
-            except postprocess.PostprocessError:
-                return
-            should_run = True
+            if any(automatic_options.values()):
+                try:
+                    await postprocess.start(
+                        settings,
+                        cid,
+                        automatic_request,
+                        postprocess_locks,
+                    )
+                except postprocess.PostprocessError:
+                    return
+                should_run = True
+        elif frozen_preflight and not _postprocess_matches_automatic_request(
+            post,
+            automatic_request,
+            private=meta.get("_postprocess_receipt"),
+        ):
+            return
         elif post.get("status") == "running":
             should_run = True
         elif post.get("status") == "failed":
@@ -3612,22 +3666,38 @@ def create_app(settings: Settings) -> FastAPI:
             )
         meta = storage.load_meta(settings.data_dir, cid)
         post = meta.get("postprocess") if isinstance(meta, Mapping) else None
-        if not isinstance(post, Mapping) or post.get("status") != "done":
-            return
-        acceptance = postprocess.image_acceptance_status(settings, cid, meta)
-        if acceptance.get("required") and not acceptance.get("accepted"):
-            expected = acceptance.get("expected_meta_sha256")
-            if not isinstance(expected, str):
-                return
-            try:
-                await asyncio.to_thread(
-                    postprocess.accept_images,
-                    settings,
-                    cid,
-                    {"confirm": True, "expected_meta_sha256": expected},
+        skip_postprocess = not any(automatic_options.values())
+        if not skip_postprocess and (
+            not isinstance(post, Mapping)
+            or post.get("status") != "done"
+            or (
+                frozen_preflight
+                and not _postprocess_matches_automatic_request(
+                    post,
+                    automatic_request,
+                    private=(
+                        meta.get("_postprocess_receipt")
+                        if isinstance(meta, Mapping) else None
+                    ),
                 )
-            except postprocess.PostprocessError:
-                return
+            )
+        ):
+            return
+        if not skip_postprocess:
+            acceptance = postprocess.image_acceptance_status(settings, cid, meta)
+            if acceptance.get("required") and not acceptance.get("accepted"):
+                expected = acceptance.get("expected_meta_sha256")
+                if not isinstance(expected, str):
+                    return
+                try:
+                    await asyncio.to_thread(
+                        postprocess.accept_images,
+                        settings,
+                        cid,
+                        {"confirm": True, "expected_meta_sha256": expected},
+                    )
+                except postprocess.PostprocessError:
+                    return
         await asyncio.to_thread(
             _start_automatic_v4_generation,
             settings,
@@ -3794,6 +3864,10 @@ def create_app(settings: Settings) -> FastAPI:
     async def health():
         return {"ok": True}
 
+    @app.get("/api/capabilities", dependencies=[Depends(require_auth)])
+    async def capabilities():
+        return {"generation_config": generation_config.capability()}
+
     @app.post("/api/login")
     async def login(payload: dict):
         token = payload.get("token")
@@ -3832,6 +3906,7 @@ def create_app(settings: Settings) -> FastAPI:
         target_language: str = Form(""),
         dialogue_mode: str = Form("auto"),
         lines: str = Form(""),
+        generation_config_json: str = Form("", alias="generation_config"),
     ):
         ip = request.client.host if request.client else "unknown"
         if not limiter.allow(ip):
@@ -3840,6 +3915,7 @@ def create_app(settings: Settings) -> FastAPI:
         allowed_form_fields = {
             "file", "reference_url", "note", "client_request_id",
             "voice_mode", "target_language", "dialogue_mode", "lines",
+            "generation_config",
         }
         if set(form) - allowed_form_fields or any(
             len(form.getlist(key)) != 1 for key in form
@@ -3854,6 +3930,13 @@ def create_app(settings: Settings) -> FastAPI:
         dialogue_payload = _create_dialogue_payload(
             dialogue_mode.strip(), lines, has_lines="lines" in form
         )
+        try:
+            frozen_generation_config = generation_config.parse_form(
+                generation_config_json,
+                provided="generation_config" in form,
+            )
+        except generation_config.GenerationConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
         # 口播转换：模式白名单 + 翻译必填目标语言；非 translate 忽略 target_language
         voice_mode = voice_mode.strip()
         target_language = target_language.strip()
@@ -3869,6 +3952,14 @@ def create_app(settings: Settings) -> FastAPI:
             if client_request_id:
                 for m in metas:
                     if m.get("client_request_id") == client_request_id:
+                        existing_config = generation_config.resolve(
+                            settings.data_dir / m["id"], m
+                        )
+                        if existing_config != frozen_generation_config:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="client_request_id_generation_config_conflict",
+                            )
                         # A durable upload may have lost its BackgroundTask
                         # between commit and response.  The CAS claim makes
                         # repeated retries safe while restoring that enqueue.
@@ -3910,6 +4001,7 @@ def create_app(settings: Settings) -> FastAPI:
                     client_request_id,
                     voice_mode=voice_mode,
                     target_language=target_language if voice_mode == "translate" else "",
+                    generation_config=frozen_generation_config,
                 )
             else:
                 meta = resumed_meta
@@ -4074,6 +4166,10 @@ def create_app(settings: Settings) -> FastAPI:
                     "expected_meta_sha256"
                 ),
             },
+            "generation_config": meta.get("generation_config"),
+            "generation_config_sha256": meta.get(
+                "generation_config_sha256"
+            ),
         }
         if not _uses_segment_coordinator(meta):
             result["image_optimization_prompt"] = optimization_prompts.get(0)
@@ -5385,6 +5481,20 @@ def create_app(settings: Settings) -> FastAPI:
         if _is_read_only(meta):
             raise HTTPException(status_code=409, detail="read_only")
         single_operation = _uses_single_operation_contract(meta)
+        if single_operation and generation_config.is_frozen(
+            settings.data_dir / cid, meta
+        ):
+            automatic_request = _automatic_postprocess_request(
+                settings.data_dir / cid, meta
+            )
+            if automatic_request is None:
+                raise HTTPException(
+                    status_code=409, detail="generation_config_invalid"
+                )
+            if payload != automatic_request:
+                raise HTTPException(
+                    status_code=409, detail="generation_config_locked"
+                )
         if not single_operation:
             if capability_disabled:
                 raise HTTPException(
