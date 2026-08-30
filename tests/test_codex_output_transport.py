@@ -1,7 +1,6 @@
 import hashlib
 import json
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 
@@ -94,7 +93,7 @@ def test_final_output_wins_and_is_atomically_published_after_validation(
         assert not list(work.glob(".result.json-transport-*"))
 
 
-def test_structured_sandbox_mounts_stage_readonly_and_only_final_output_writable(
+def test_structured_sandbox_mounts_inputs_readonly_with_writable_directories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = tmp_path / "conversation"
@@ -108,8 +107,11 @@ def test_structured_sandbox_mounts_stage_readonly_and_only_final_output_writable
         stage = Path(raw_stage).resolve(strict=True)
         work = stage / "work"
         work.mkdir()
-        business_output = work / "result.json"
+        skill = stage / "SKILL.md"
+        descriptor = work / "input.json"
         final_output = work / ".codex-final-output.json"
+        skill.write_text("skill", encoding="utf-8")
+        descriptor.write_text("input", encoding="utf-8")
         final_output.touch(mode=0o600)
 
         argv = codex_runner._isolated_outer_argv(
@@ -117,22 +119,29 @@ def test_structured_sandbox_mounts_stage_readonly_and_only_final_output_writable
             session,
             ["codex", "exec", "-o", str(final_output)],
             writable_paths=(final_output,),
-            readonly_stage=True,
+            structured_stage=True,
         )
 
-        assert ["--ro-bind", str(stage), str(stage)] == argv[
-            argv.index("--ro-bind"):argv.index("--ro-bind") + 3
-        ]
-        final_bind = argv.index(str(final_output))
-        assert argv[final_bind - 1] == "--bind"
-        assert argv[final_bind + 1] == str(final_output)
-        assert str(business_output) not in argv
+        assert any(
+            argv[index:index + 3] == ["--bind", str(stage), str(stage)]
+            for index in range(len(argv) - 2)
+        )
+        for frozen in (skill, descriptor):
+            assert any(
+                argv[index:index + 3] == ["--ro-bind", str(frozen), str(frozen)]
+                for index in range(len(argv) - 2)
+            )
+        assert not any(
+            argv[index:index + 3]
+            == ["--ro-bind", str(final_output), str(final_output)]
+            for index in range(len(argv) - 2)
+        )
 
 
-def test_structured_sandbox_supports_nested_git_mountpoint_without_writable_stage(
-    tmp_path: Path,
+def test_structured_runner_allows_arbitrary_nested_mountpoints_but_consumes_only_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex's inner fs sandbox must not need to mkdir under the read-only stage."""
+    """Real double-bwrap probe; no model or provider is invoked."""
     if not shutil.which("bwrap"):
         pytest.skip("bwrap unavailable")
     session = tmp_path / "conversation"
@@ -143,60 +152,64 @@ def test_structured_sandbox_supports_nested_git_mountpoint_without_writable_stag
         stage = Path(raw_stage).resolve(strict=True)
         work = stage / "work"
         work.mkdir()
+        skill = stage / "SKILL.md"
+        descriptor = work / "input.json"
+        fake_codex = stage / "codex"
         business_output = work / "result.json"
-        final_output = work / ".codex-final-output.json"
-        final_output.touch(mode=0o600)
-        inner = [
-            str(codex_runner._resolve_bwrap()),
-            "--bind", "/", "/",
-            "--dir", str(stage / ".git"),
-            "--chdir", str(stage),
-            "/usr/bin/bash", "-c",
-            "test -d .git && "
-            "! /usr/bin/touch .git/forbidden 2>/dev/null && "
-            "! /usr/bin/touch work/result.json 2>/dev/null && "
-            "printf '{\"ok\":true}' > work/.codex-final-output.json",
-        ]
-        argv = codex_runner._isolated_outer_argv(
+        evidence = work / "direct-write-evidence.json"
+        skill.write_text("frozen-skill", encoding="utf-8")
+        descriptor.write_text("frozen-input", encoding="utf-8")
+        fake_codex.write_text(
+            "#!/usr/bin/bash\n"
+            "exec /usr/bin/bwrap --bind / / "
+            f"--dir '{stage / '.git'}' "
+            f"--dir '{stage / '.agents'}' "
+            f"--dir '{stage / '.arbitrary-tool-state'}' "
+            f"--chdir '{stage}' /usr/bin/bash -c '"
+            "test -d .git && test -d .agents && "
+            "test -d .arbitrary-tool-state && "
+            "! printf tampered > SKILL.md 2>/dev/null && "
+            "! rm -f SKILL.md 2>/dev/null && "
+            "! printf tampered > work/input.json 2>/dev/null && "
+            "! printf tampered > .codex-output-schema.json 2>/dev/null && "
+            "printf \"{\\\"source\\\":\\\"business\\\"}\" > work/result.json && "
+            "printf \"{\\\"source\\\":\\\"business\\\"}\" "
+            "> work/direct-write-evidence.json && "
+            "printf \"{\\\"source\\\":\\\"final\\\"}\" "
+            "> work/.codex-final-output.json'\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o700)
+        monkeypatch.setenv("PATH", f"{stage}:/usr/bin:/bin")
+        runner = CodexRunner(timeout_s=5, concurrency=1)
+
+        value = runner.run_isolated_until_output(
             stage,
-            session,
-            inner,
-            writable_paths=(final_output,),
-            readonly_stage=True,
+            "structured prompt",
+            session_dir=session,
+            output_path=business_output,
+            max_output_bytes=1024,
+            validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+            output_schema={
+                "type": "object",
+                "properties": {"source": {"type": "string"}},
+                "required": ["source"],
+                "additionalProperties": False,
+            },
         )
 
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
-
-        assert proc.returncode == 0, proc.stderr
-        assert (stage / ".git").is_dir()
-        assert not list((stage / ".git").iterdir())
-        assert not business_output.exists()
-        assert final_output.read_bytes() == b'{"ok":true}'
-
-
-def test_structured_sandbox_rejects_staged_git_content(tmp_path: Path) -> None:
-    session = tmp_path / "conversation"
-    session.mkdir()
-    with tempfile.TemporaryDirectory(
-        prefix="duet-final-output-git-content-", dir="/tmp",
-    ) as raw_stage:
-        stage = Path(raw_stage).resolve(strict=True)
-        work = stage / "work"
-        work.mkdir()
-        final_output = work / ".codex-final-output.json"
-        final_output.touch(mode=0o600)
-        git_mountpoint = stage / ".git"
-        git_mountpoint.mkdir()
-        (git_mountpoint / "config").write_text("untrusted", encoding="utf-8")
-
-        with pytest.raises(CodexError, match="git mountpoint"):
-            codex_runner._isolated_outer_argv(
-                stage,
-                session,
-                ["codex", "exec", "-o", str(final_output)],
-                writable_paths=(final_output,),
-                readonly_stage=True,
-            )
+        assert value == {"source": "final"}
+        assert json.loads(business_output.read_text(encoding="utf-8")) == value
+        assert json.loads(evidence.read_text(encoding="utf-8")) == {
+            "source": "business",
+        }
+        assert skill.read_text(encoding="utf-8") == "frozen-skill"
+        assert descriptor.read_text(encoding="utf-8") == "frozen-input"
+        assert json.loads(
+            (stage / ".codex-output-schema.json").read_text(encoding="utf-8")
+        )["type"] == "object"
+        for hidden in (".git", ".agents", ".arbitrary-tool-state"):
+            assert (stage / hidden).is_dir()
 
 
 def test_rejected_final_output_keeps_structured_error_tree(

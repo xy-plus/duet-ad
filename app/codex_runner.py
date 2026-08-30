@@ -265,38 +265,13 @@ def _isolated_readonly_inputs(
     return tuple(readonly)
 
 
-def _prepare_readonly_git_mountpoint(stage: Path) -> None:
-    """Create only the empty mountpoint required by Codex's nested fs sandbox."""
-    directory_flags = (
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-    )
-    stage_fd = -1
-    git_fd = -1
-    try:
-        stage_fd = os.open(stage, directory_flags)
-        try:
-            os.mkdir(".git", mode=0o700, dir_fd=stage_fd)
-        except FileExistsError:
-            pass
-        git_fd = os.open(".git", directory_flags, dir_fd=stage_fd)
-        if not stat.S_ISDIR(os.fstat(git_fd).st_mode) or os.listdir(git_fd):
-            raise OSError("git mountpoint is not an empty directory")
-    except OSError:
-        raise CodexError("isolated git mountpoint is invalid") from None
-    finally:
-        if git_fd >= 0:
-            os.close(git_fd)
-        if stage_fd >= 0:
-            os.close(stage_fd)
-
-
 def _isolated_outer_argv(
     stage: Path,
     session_dir: Path,
     inner_argv: list[str],
     *,
     writable_paths: tuple[Path, ...] = (),
-    readonly_stage: bool = False,
+    structured_stage: bool = False,
 ) -> list[str]:
     """构造单次任务外层挂载沙箱；任一路径异常都拒绝运行。"""
     try:
@@ -315,8 +290,6 @@ def _isolated_outer_argv(
     if not inner_argv:
         raise CodexError("isolated inner command is empty")
     writable = _isolated_writable_paths(stage, writable_paths)
-    if readonly_stage:
-        _prepare_readonly_git_mountpoint(stage)
     readonly_inputs = _isolated_readonly_inputs(stage, writable)
 
     argv = [
@@ -331,18 +304,12 @@ def _isolated_outer_argv(
     if not _is_relative_to(session_dir, checkout) and not _is_relative_to(session_dir, tmp_root):
         argv += ["--tmpfs", str(session_dir)]
     argv += ["--tmpfs", str(tmp_root)]
-    if readonly_stage:
-        # Structured calls expose one pre-created transport file as writable.
-        # The stage, including the not-yet-created business output path, stays
-        # read-only; only the backend may publish the validated business file.
-        argv += ["--ro-bind", str(stage), str(stage)]
-        for path in writable:
-            argv += ["--bind", str(path), str(path)]
-    elif writable:
-        # Keep the stage directories writable so tools that publish atomically
-        # (temporary file + rename) can replace the declared output.  Overlay
-        # every staged input as a read-only file mount; those mount points
-        # cannot be modified, removed, or replaced from inside the namespace.
+    if structured_stage or writable:
+        # Nested Codex sandboxes need writable directories for transient
+        # mountpoints such as .git and .agents.  Every staged input remains an
+        # individual read-only mount, so it cannot be modified, removed, or
+        # replaced even though new sibling paths may be created.  Structured
+        # callers separately consume only their final-answer transport.
         argv += ["--bind", str(stage), str(stage)]
         for path in readonly_inputs:
             argv += ["--ro-bind", str(path), str(path)]
@@ -474,7 +441,7 @@ class CodexRunner:
             isolated_stage[1],
             argv,
             writable_paths=isolated_stage[2],
-            readonly_stage=isolated_stage[4],
+            structured_stage=isolated_stage[4],
         )
 
     def run(self, workdir: Path, prompt: str) -> None:
@@ -542,10 +509,11 @@ class CodexRunner:
     ) -> _T:
         """Validate one schema-constrained final answer, then publish it.
 
-        Codex may write only ``.codex-final-output.json``.  The requested
-        business output does not exist in the read-only sandbox and is created
-        atomically by the backend only after Codex exits cleanly and validation
-        succeeds.  There is deliberately no direct-write adoption path.
+        Stage directories remain writable for nested sandbox mountpoints, while
+        every staged input file is mounted read-only.  Only
+        ``.codex-final-output.json`` is consumed; a requested business output
+        written directly by Codex is ignored and replaced atomically by the
+        backend only after final-answer validation succeeds.
         """
         stage_hint = Path(workdir)
         session_hint = Path(session_dir)
