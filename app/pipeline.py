@@ -621,6 +621,46 @@ def _reject_project_index(reason: str, field_path: str) -> NoReturn:
     )
 
 
+def _filter_invalid_project_index_relations(index: dict) -> dict | None:
+    """Drop relations that cannot bind two distinct indexed elements."""
+    known_keys = set().union(*(
+        set(index[category]) for category in ("people", "entities", "scenes")
+    ))
+    kept: dict[str, dict] = {}
+    filtered: list[dict[str, object]] = []
+    for item_index, (key, item) in enumerate(index["relations"].items()):
+        subject = item["subject_key"]
+        object_key = item["object_key"]
+        reason = None
+        field = None
+        if subject == object_key:
+            reason = "relation_endpoints_identical"
+            field = "object_key"
+        elif subject not in known_keys:
+            reason = "relation_subject_unknown"
+            field = "subject_key"
+        elif object_key not in known_keys:
+            reason = "relation_object_unknown"
+            field = "object_key"
+        if reason is None:
+            kept[key] = item
+            continue
+        filtered.append({
+            "path": f"/relations/{item_index}/{field}",
+            "reason": reason,
+            "count": 1,
+        })
+    index["relations"] = kept
+    if not filtered:
+        return None
+    return {
+        "code": "project_index_fields_filtered",
+        "dropped_paths": [item["path"] for item in filtered],
+        "dropped_count": len(filtered),
+        "filters": filtered,
+    }
+
+
 def _canonicalize_project_index_frame_bindings(
     index: dict,
     frame_orders_by_segment: dict[int, frozenset[int]],
@@ -823,7 +863,9 @@ def _generate_project_element_index(
             encoding="utf-8",
         )
         isolated_output = isolated_work / "element_index.json"
+        filter_diagnostics: dict | None = None
         def validate(raw_output: bytes) -> bytes:
+            nonlocal filter_diagnostics
             try:
                 value = json.loads(raw_output.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -832,47 +874,6 @@ def _generate_project_element_index(
                 normalized = codex_output_schemas.normalize_project_index(value)
             except ValueError:
                 _reject_project_index("shape_invalid", "/project_index")
-            for category in ("people", "entities", "scenes"):
-                for item_index, item in enumerate(normalized[category].values()):
-                    description = item["source_visual_description"]
-                    if not isinstance(description, str) or not description.strip():
-                        _reject_project_index(
-                            "source_description_blank",
-                            f"/{category}/{item_index}/source_visual_description",
-                        )
-            for item_index, item in enumerate(normalized["relations"].values()):
-                predicate = item["predicate"]
-                if not isinstance(predicate, str) or not predicate.strip():
-                    _reject_project_index(
-                        "relation_predicate_blank",
-                        f"/relations/{item_index}/predicate",
-                    )
-            _canonicalize_project_index_frame_bindings(
-                normalized, frame_orders_by_segment,
-            )
-            known_keys = set().union(*(
-                set(normalized[category])
-                for category in ("people", "entities", "scenes")
-            ))
-            for item_index, item in enumerate(normalized["relations"].values()):
-                subject = item["subject_key"]
-                object_key = item["object_key"]
-                if subject not in known_keys:
-                    _reject_project_index(
-                        "relation_subject_unknown",
-                        f"/relations/{item_index}/subject_key",
-                    )
-                if object_key not in known_keys:
-                    _reject_project_index(
-                        "relation_object_unknown",
-                        f"/relations/{item_index}/object_key",
-                    )
-                if subject == object_key:
-                    _reject_project_index(
-                        "relation_endpoints_identical",
-                        f"/relations/{item_index}/object_key",
-                    )
-            canonical = image_optimization._canonical_element_index(normalized)
             for category, prefix in (
                 ("people", "person"), ("entities", "entity"),
                 ("scenes", "scene"), ("relations", "relation"),
@@ -889,6 +890,30 @@ def _generate_project_element_index(
                             "stable_key_nonsequential",
                             f"/{category}/{item_index}/key",
                         )
+            for category in ("people", "entities", "scenes"):
+                for item_index, item in enumerate(normalized[category].values()):
+                    description = item["source_visual_description"]
+                    if not isinstance(description, str) or not description.strip():
+                        _reject_project_index(
+                            "source_description_blank",
+                            f"/{category}/{item_index}/source_visual_description",
+                        )
+            filter_diagnostics = _filter_invalid_project_index_relations(
+                normalized
+            )
+            for item_index, item in enumerate(normalized["relations"].values()):
+                predicate = item["predicate"]
+                if not isinstance(predicate, str) or not predicate.strip():
+                    _reject_project_index(
+                        "relation_predicate_blank",
+                        f"/relations/{item_index}/predicate",
+                    )
+            _canonicalize_project_index_frame_bindings(
+                normalized, frame_orders_by_segment,
+            )
+            canonical = image_optimization._canonical_element_index(normalized)
+            for category in ("people", "entities", "scenes", "relations"):
+                keys = list(normalized[category])
                 missing_keys = set(keys).difference(canonical[category])
                 if missing_keys:
                     item_index = next(
@@ -940,6 +965,13 @@ def _generate_project_element_index(
             validate_output=validate,
             output_schema=codex_output_schemas.PROJECT_INDEX_SCHEMA,
         )
+        if filter_diagnostics is not None:
+            error_trace.record(
+                cdir / "work" / "errors" / "project-index-filtered.json",
+                call_path=["pipeline", cdir.name, "project_index", "filter"],
+                reason=filter_diagnostics,
+                logger=log,
+            )
         staged = target.with_name(".element_index.tmp")
         try:
             staged.write_bytes(staged_data)

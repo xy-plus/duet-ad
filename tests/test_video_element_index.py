@@ -356,7 +356,9 @@ def test_project_index_allows_empty_people_and_entities(tmp_path):
     assert json.loads(result.read_text(encoding="utf-8")) == payload
 
 
-def test_project_index_rejection_exposes_safe_reason_and_field_path(tmp_path):
+def test_project_index_filters_invalid_relation_endpoints_with_diagnostics(
+    tmp_path,
+):
     cdir = tmp_path / "conversation"
     frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
@@ -364,18 +366,67 @@ def test_project_index_rejection_exposes_safe_reason_and_field_path(tmp_path):
     for path in frame_paths:
         path.write_bytes(_png())
     payload = copy.deepcopy(_element_index())
-    payload["relations"]["relation-01"]["object_key"] = "entity-99"
+    valid_relation = copy.deepcopy(payload["relations"]["relation-01"])
+    payload["relations"]["relation-02"] = {
+        **copy.deepcopy(valid_relation),
+        "object_key": "entity-99",
+    }
+    payload["relations"]["relation-03"] = {
+        **copy.deepcopy(valid_relation),
+        "subject_key": "entity-01",
+        "object_key": "entity-01",
+    }
+    payload["relations"]["relation-04"] = {
+        **copy.deepcopy(valid_relation),
+    }
+    payload["relations"]["relation-05"] = {
+        **copy.deepcopy(valid_relation),
+        "subject_key": "entity-99",
+    }
 
-    with pytest.raises(CodexOutputValidationError) as caught:
-        pipeline._generate_project_element_index(
-            _IndexRunner(payload),
-            cdir,
-            {1: frame_paths},
-            skill_bytes=b"frozen video-maker skill",
+    result = pipeline._generate_project_element_index(
+        _IndexRunner(payload),
+        cdir,
+        {1: frame_paths},
+        skill_bytes=b"frozen video-maker skill",
+    )
+
+    frozen = json.loads(result.read_text(encoding="utf-8"))
+    assert frozen["relations"] == {
+        "relation-01": valid_relation,
+        "relation-04": valid_relation,
+    }
+    diagnostic = json.loads(
+        (cdir / "work" / "errors" / "project-index-filtered.json").read_text(
+            encoding="utf-8"
         )
-
-    assert caught.value.reason == "relation_object_unknown"
-    assert caught.value.field_path == "/relations/0/object_key"
+    )
+    assert diagnostic["error"] == {
+        "code": "project_index_fields_filtered",
+        "dropped_paths": [
+            "/relations/1/object_key",
+            "/relations/2/object_key",
+            "/relations/4/subject_key",
+        ],
+        "dropped_count": 3,
+        "filters": [
+            {
+                "path": "/relations/1/object_key",
+                "reason": "relation_object_unknown",
+                "count": 1,
+            },
+            {
+                "path": "/relations/2/object_key",
+                "reason": "relation_endpoints_identical",
+                "count": 1,
+            },
+            {
+                "path": "/relations/4/subject_key",
+                "reason": "relation_subject_unknown",
+                "count": 1,
+            },
+        ],
+    }
 
 
 def test_segmented_image_prompt_generation_passes_element_index_once(
