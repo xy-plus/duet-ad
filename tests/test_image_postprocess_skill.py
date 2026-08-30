@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import pytest
 
-from app import image_optimization
+from app import codex_output_schemas, image_optimization
 from app.codex_runner import CodexError
 from conftest import make_settings
 
@@ -145,6 +145,14 @@ def _transition_skeleton(segments: list[dict]) -> list[dict]:
     ]
 
 
+def _generate_project_prompts(*args, **kwargs):
+    kwargs.setdefault(
+        "skill_bytes",
+        Path("skills/image-postprocess/SKILL.md").read_bytes(),
+    )
+    return image_optimization.generate_project_prompts(*args, **kwargs)
+
+
 class _Runner:
     def __init__(self, output: object) -> None:
         self.output = output
@@ -189,6 +197,75 @@ class _Runner:
             json.dumps(output, ensure_ascii=False), encoding="utf-8"
         )
 
+    def run_isolated_until_output(
+        self, workdir, prompt, *, session_dir, output_path,
+        max_output_bytes, validate_output, output_schema,
+    ):
+        root = Path(workdir)
+        request = json.loads(
+            (root / "work" / "request.json").read_text(encoding="utf-8")
+        )
+        self.calls.append({
+            "files": sorted(
+                str(path.relative_to(root))
+                for path in root.rglob("*") if path.is_file()
+            ),
+            "request": request,
+            "global_plan": (
+                json.loads((root / "work/global_plan.json").read_text())
+                if (root / "work/global_plan.json").is_file() else None
+            ),
+            "prompt": prompt,
+            "session_dir": Path(session_dir),
+        })
+        output = self.output(request) if callable(self.output) else self.output
+        if request["phase"] == "global_plan":
+            model = {
+                category: [
+                    {"key": key, **item}
+                    for key, item in output.get(category, {}).items()
+                ]
+                for category in ("people", "entities", "scenes", "relations")
+            }
+        else:
+            model_frames = []
+            for frame_key, frame in output.get("frames", {}).items():
+                people = []
+                for person_key, person in frame.get("people", {}).items():
+                    derived = [
+                        {"key": key, **item}
+                        for key, item in person.get(
+                            "derived_observations", {}
+                        ).items()
+                    ]
+                    people.append({
+                        "key": person_key,
+                        **{
+                            key: value for key, value in person.items()
+                            if key != "derived_observations"
+                        },
+                        "derived_observations": derived,
+                    })
+                model_frames.append({
+                    "key": frame_key,
+                    "people": people,
+                    "entities": [
+                        {"key": key, **item}
+                        for key, item in frame.get("entities", {}).items()
+                    ],
+                    "relations": [
+                        {"key": key, **item}
+                        for key, item in frame.get("relations", {}).items()
+                    ],
+                    "relationships": frame.get("relationships", "source-preserve"),
+                    "crop": frame.get("crop", "source-preserve"),
+                })
+            model = {"frames": model_frames}
+        assert output_schema["type"] == "object"
+        raw = json.dumps(model, ensure_ascii=False).encode("utf-8")
+        assert len(raw) <= max_output_bytes
+        return validate_output(raw)
+
 
 class _PhaseRetryRunner(_Runner):
     def __init__(self, output: object, *, failed_segment: int) -> None:
@@ -198,7 +275,7 @@ class _PhaseRetryRunner(_Runner):
 
     def run_isolated_until_output(
         self, workdir, prompt, *, session_dir, output_path,
-        max_output_bytes, validate_output,
+        max_output_bytes, validate_output, output_schema,
     ):
         root = Path(workdir)
         request = json.loads(
@@ -212,17 +289,11 @@ class _PhaseRetryRunner(_Runner):
         ):
             self.failures += 1
             raise CodexError("transient segment failure", retryable=True)
-        output = self.output(request) if callable(self.output) else self.output
-        if request["phase"] == "global_plan":
-            output = {
-                key: output.get(key, {})
-                for key in ("people", "entities", "scenes", "relations")
-            }
-        else:
-            output = {"frames": output.get("frames", {})}
-        raw = json.dumps(output, ensure_ascii=False).encode("utf-8")
-        assert len(raw) <= max_output_bytes
-        return validate_output(raw)
+        return super().run_isolated_until_output(
+            workdir, prompt, session_dir=session_dir, output_path=output_path,
+            max_output_bytes=max_output_bytes, validate_output=validate_output,
+            output_schema=output_schema,
+        )
 
 
 class _ParallelRunner(_Runner):
@@ -234,15 +305,15 @@ class _ParallelRunner(_Runner):
         self.max_active_segments = 0
         self.entered_segments: list[int] = []
 
-    def run_isolated(self, workdir, prompt, *, session_dir):
+    def run_isolated_until_output(self, workdir, prompt, **kwargs):
         request = json.loads(
             (Path(workdir) / "work" / "request.json").read_text(
                 encoding="utf-8"
             )
         )
         if request["phase"] != "segment_frames":
-            return super().run_isolated(
-                workdir, prompt, session_dir=session_dir
+            return super().run_isolated_until_output(
+                workdir, prompt, **kwargs
             )
         with self.lock:
             self.active_segments += 1
@@ -252,8 +323,8 @@ class _ParallelRunner(_Runner):
             self.entered_segments.append(request["segment"]["index"])
         try:
             self.barrier.wait(timeout=5)
-            return super().run_isolated(
-                workdir, prompt, session_dir=session_dir
+            return super().run_isolated_until_output(
+                workdir, prompt, **kwargs
             )
         finally:
             with self.lock:
@@ -262,28 +333,60 @@ class _ParallelRunner(_Runner):
 
 def _skill_contract() -> tuple[str, dict]:
     text = Path("skills/image-postprocess/SKILL.md").read_text(encoding="utf-8")
-    contracts = _json_contracts(text)
-    example = (
-        {**contracts[0], **contracts[1]}
-        if len(contracts) == 2
-        else contracts[0]
-    )
-    return text, example
-
-
-def _json_contracts(text: str) -> list[dict]:
-    return [
-        json.loads(block)
-        for block in re.findall(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-    ]
+    global_plan = {
+        "people": {"person-01": {
+            "source_identity": "source", "replacement_identity": "replacement",
+            "wardrobe_change": "wardrobe", "local_color_change": "color",
+        }},
+        "entities": {"entity-01": {
+            "description": "entity", "owner": "project",
+            "association": "association", "persistence": "persistent",
+        }},
+        "scenes": {"scene-01": {
+            "source_scene": "source scene", "replacement_scene": "new scene",
+            "semantic_change": "semantic", "geometry_change": "geometry",
+            "depth_change": "depth", "layout_change": "layout",
+            "local_color_change": "color",
+        }},
+        "relations": {"relation-01": {
+            "subject_key": "person-01", "predicate": "holds",
+            "object_key": "entity-01", "replacement_system": "system",
+            "preserve": "direction and interface",
+        }},
+    }
+    segment_frames = {"frames": {"frame-001": {
+        "people": {"person-01": {
+            "visible_region": "full", "boundary": "outline",
+            "body_and_pose": "standing",
+            "derived_observations": {"observation-01": {
+                "mode": "source-preserve", "source_carrier": "person-01",
+                "visible_region": "region", "boundary": "boundary",
+                "relationship": "attached",
+            }},
+        }},
+        "entities": {"entity-01": {
+            "visibility": "visible", "relationship": "held",
+        }},
+        "relations": {"relation-01": {
+            "state": "held", "geometry": "in hand", "evidence": "pixels",
+        }},
+        "relationships": "person holds entity", "crop": "full frame",
+    }}}
+    return text, {**global_plan, **segment_frames}
 
 
 def test_skill_exposes_closed_global_and_segment_json_contracts():
-    skill, _example = _skill_contract()
-    contracts = _json_contracts(skill)
-
-    assert len(contracts) == 2
-    global_plan, segment_frames = contracts
+    skill, example = _skill_contract()
+    global_plan = {key: example[key] for key in (
+        "people", "entities", "scenes", "relations",
+    )}
+    segment_frames = {"frames": example["frames"]}
+    for schema in (
+        codex_output_schemas.GLOBAL_PLAN_SCHEMA,
+        codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
+    ):
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
     assert set(global_plan) == {"people", "entities", "scenes", "relations"}
     assert set(segment_frames) == {"frames"}
     assert set(next(iter(global_plan["people"].values()))) == {
@@ -326,8 +429,8 @@ def test_skill_exposes_closed_global_and_segment_json_contracts():
 
 
 def test_skill_frame_entities_are_direct_evidence_only_and_omit_out_of_frame():
-    skill, _example = _skill_contract()
-    segment_frames = _json_contracts(skill)[1]
+    skill, example = _skill_contract()
+    segment_frames = {"frames": example["frames"]}
     encoded = json.dumps(segment_frames, ensure_ascii=False)
 
     assert '"visibility": "out_of_frame"' not in encoded
@@ -345,17 +448,17 @@ def test_skill_requires_slot_coverage_key_reuse_and_backend_owned_publication():
         "全部 key",
         "逐字复用",
         "自检",
-        "完整、可解析的 JSON",
-        "不得只给解释",
-        "文件校验和正式发布由后端负责",
+        "注入 Schema",
+        "required string 非空",
+        "校验和与正式发布由后端负责",
     ):
         assert required in skill
-    assert "最终回答只返回" in skill
+    assert "JSON Schema 为唯一权威" in skill
 
 
 def test_skill_matches_runtime_semantic_enum_boundary_and_stays_short():
-    skill, _example = _skill_contract()
-    encoded = json.dumps(_json_contracts(skill), ensure_ascii=False)
+    skill, example = _skill_contract()
+    encoded = json.dumps(example, ensure_ascii=False)
 
     assert '"visibility": "visible/occluded/out_of_frame"' not in encoded
     assert "source-preserve 是 mode 的第三个值" in skill
@@ -374,11 +477,10 @@ def test_skill_scopes_hard_cut_blur_and_edge_fragments_to_current_pixels():
         "相邻帧",
         "强运动模糊",
         "edge_fragment",
-        "全局参考",
-        "补头",
-        "补人",
-        "补衣服",
-        "本帧直接可见像素",
+        "不得用全局设计或邻帧补造",
+        "人物数量闭合",
+        "反射、残影、模糊和碎片不升级为实例",
+        "当前帧直接可见像素",
     ):
         assert rule in skill
     assert len(skill.splitlines()) <= 52
@@ -409,6 +511,7 @@ def _element_index() -> dict:
                 "preserve": ["composition", "lighting", "tone"],
             }
         },
+        "relations": {},
     }
 
 
@@ -440,7 +543,8 @@ def _semantic_output(request: dict, *, sparse: bool = False) -> dict:
                     "derived_observations": {},
                 }},
                 "relationships": f"{slot['key']} 当前可见接触与遮挡关系",
-                "entities": f"{slot['key']} 当前可见非人物实体",
+                "entities": {},
+                "relations": {},
                 "crop": f"{slot['key']} 当前画外裁切",
             }
         )
@@ -452,7 +556,10 @@ def _semantic_output(request: dict, *, sparse: bool = False) -> dict:
         "wardrobe_change": "不同款式且保持用途的服装",
         "local_color_change": "人物局部固有色明显变化",
     }}
-    return {"people": people, "scenes": scenes, "frames": frames}
+    return {
+        "people": people, "entities": {}, "scenes": scenes,
+        "relations": {}, "frames": frames,
+    }
 
 
 def _compiled_semantic(tmp_path: Path, *, frames: int = 1, sparse: bool = False):
@@ -580,10 +687,10 @@ def test_skill_uses_one_global_plan_and_parallel_segment_frame_contracts():
     assert "name: image-postprocess" in skill
     assert '`phase="global_plan"' in skill
     assert '`phase="segment_frames"' in skill
-    assert set(example) == {"people", "entities", "scenes", "frames"}
-    assert "只填写视觉语义" in skill
-    assert "后端据此确定性编译" in skill
-    assert "人物与场景同时替换" in skill
+    assert set(example) == {"people", "entities", "scenes", "relations", "frames"}
+    assert "其余字段只表达本节定义的替换设计" in skill
+    assert "实体 ID、关系图和完整机械字段由后端构造" in skill
+    assert "替换人物和真实场景" in skill
     assert "source-preserve/no-invention" in skill
     encoded = json.dumps(example, ensure_ascii=False)
     for backend_field in (
@@ -609,7 +716,7 @@ def test_skill_additively_consumes_element_index_without_changing_output_schema(
     )
     runner = _Runner(_semantic_output)
 
-    plan, prompts = image_optimization.generate_project_prompts(
+    plan, prompts = _generate_project_prompts(
         runner,
         segments,
         "anchor_consistency",
@@ -628,16 +735,16 @@ def test_skill_additively_consumes_element_index_without_changing_output_schema(
     ] == [("subject", "TILE_01"), ("scene-001", "TILE_02")]
     assert "subject -> TILE_01" in prompts[1][1]
     assert "scene-001 -> TILE_02" in prompts[2][1]
-    assert set(example) == {"people", "entities", "scenes", "frames"}
+    assert set(example) == {"people", "entities", "scenes", "relations", "frames"}
     for contract in (
         "element_index",
         "stable key",
         "逐字复用",
-        "所有片段共享",
-        "跨段一致",
+        "全项目",
+        "跨段共享",
+        "逐字一致",
     ):
         assert contract in skill
-    assert "不要输出版本、段号、帧号" in skill
 
 
 def test_skill_adds_no_content_gate_retry_or_fallback_for_element_index():
@@ -672,7 +779,7 @@ def test_element_index_semantic_damage_is_non_blocking_normalization(tmp_path):
     }, ensure_ascii=False), encoding="utf-8")
     runner = _Runner(_semantic_output)
 
-    plan, _prompts = image_optimization.generate_project_prompts(
+    plan, _prompts = _generate_project_prompts(
         runner,
         segments,
         "anchor_consistency",
@@ -783,7 +890,7 @@ def test_two_phase_inputs_are_minimal_and_merge_into_exact_v4_prompts(tmp_path):
     runner = _Runner(_semantic_output)
     segments = _transition_skeleton(_segments(session))
 
-    plan, prompts = image_optimization.generate_project_prompts(
+    plan, prompts = _generate_project_prompts(
         runner,
         segments,
         "independent_parallel",
@@ -872,7 +979,7 @@ def test_short_video_semantics_compile_to_both_targets_in_two_phases(tmp_path):
     session = tmp_path / "session"
     runner = _Runner(_semantic_output)
     segments = _transition_skeleton(_segments(session, [0]))
-    generated, prompts = image_optimization.generate_project_prompts(
+    generated, prompts = _generate_project_prompts(
         runner,
         segments,
         "anchor_consistency",
@@ -893,7 +1000,7 @@ def test_segment_frame_skill_calls_overlap_and_mechanically_merge_to_v4(tmp_path
     segments = _transition_skeleton(_segments(session, [1, 2, 3]))
     runner = _ParallelRunner(_semantic_output, segment_count=3)
 
-    plan, prompts = image_optimization.generate_project_prompts(
+    plan, prompts = _generate_project_prompts(
         runner,
         segments,
         "independent_parallel",
@@ -918,7 +1025,7 @@ def test_plan_phase_v4_compiles_one_prompt_for_each_frozen_source_frame(tmp_path
     runner = _Runner(_semantic_output)
     segments = _transition_skeleton(_segments(session, [0], frames=2))
 
-    generated, prompts = image_optimization.generate_project_prompts(
+    generated, prompts = _generate_project_prompts(
         runner,
         segments,
         "independent_parallel",
@@ -1392,7 +1499,7 @@ def test_skill_closes_each_frame_person_count_and_body_part_ownership():
     person = next(iter(frame["people"].values()))
     observation = next(iter(person["derived_observations"].values()))
 
-    assert set(example) == {"people", "entities", "scenes", "frames"}
+    assert set(example) == {"people", "entities", "scenes", "relations", "frames"}
     assert set(frame) == {"people", "relationships", "entities", "crop"}
     assert set(person) == {
         "visible_region", "boundary", "body_and_pose", "derived_observations",
@@ -2512,7 +2619,7 @@ def test_two_phase_semantics_are_mechanically_canonicalized_per_frame(tmp_path):
     runner = _Runner(_semantic_output)
     segments = _transition_skeleton(_segments(session, indices=[1, 2]))
 
-    plan, prompts = image_optimization.generate_project_prompts(
+    plan, prompts = _generate_project_prompts(
         runner,
         segments,
         "independent_parallel",
@@ -2542,7 +2649,7 @@ def test_two_phase_retry_repeats_only_the_failed_segment(tmp_path):
     segments = _transition_skeleton(_segments(session, indices=[1, 2]))
     skill, _example = _skill_contract()
 
-    plan, prompts = image_optimization.generate_project_prompts(
+    plan, prompts = _generate_project_prompts(
         runner,
         segments,
         "independent_parallel",
@@ -2568,7 +2675,7 @@ def test_two_phase_retry_repeats_only_the_failed_segment(tmp_path):
 def test_generate_project_prompts_rejects_v4_without_backend_transition_skeleton(tmp_path):
     session = tmp_path / "session"
     with pytest.raises(ValueError, match="image optimization segments"):
-        image_optimization.generate_project_prompts(
+        _generate_project_prompts(
             _Runner(_generic_scene_continuity_plan()),
             _segments(session, indices=[1, 2]),
             "independent_parallel",
@@ -2703,7 +2810,7 @@ def test_v4_skill_defines_semantic_target_authority_without_audit_role():
     skill, example = _skill_contract()
     encoded = json.dumps(example, ensure_ascii=False)
 
-    assert set(example) == {"people", "entities", "scenes", "frames"}
+    assert set(example) == {"people", "entities", "scenes", "relations", "frames"}
     assert set(next(iter(example["scenes"].values()))) == {
         "source_scene", "replacement_scene", "semantic_change",
         "geometry_change", "depth_change", "layout_change",

@@ -17,7 +17,7 @@ from pathlib import Path
 
 import cv2
 
-from app import error_trace
+from app import codex_output_schemas, error_trace
 from app.codex_runner import CodexError
 from app.config import (
     SEEDREAM_EDIT_MODES,
@@ -4038,29 +4038,29 @@ def _run_image_skill_phase(
     output_name: str,
     expected_keys: set[str],
     max_bytes: int,
+    output_schema: dict,
+    normalize_output,
 ) -> dict:
     output = stage / "work" / output_name
     prompt = (
-        "严格执行当前目录 SKILL.md；只读取允许的输入；最终回答只返回规定的完整 "
-        "JSON object，不加解释或其他文本。后端负责捕获、校验和发布。"
+        "严格执行当前目录 SKILL.md；只读取允许的输入；按注入的输出 Schema "
+        "填写当前 phase 的语义结果。"
     )
-    if hasattr(runner, "run_isolated_until_output"):
-        return runner.run_isolated_until_output(
-            stage,
-            prompt,
-            session_dir=session,
-            output_path=output,
-            max_output_bytes=max_bytes,
-            validate_output=lambda raw: _phase_output(raw, expected_keys),
-        )
-    output.touch(mode=0o600)
-    runner.run_isolated(stage, prompt, session_dir=session)
-    value = _read_json_output(output, max_bytes)
-    if not isinstance(value, dict) or set(value) != expected_keys:
+    if not callable(getattr(runner, "run_isolated_until_output", None)):
         raise ImageOptimizationOutputError(
-            "image optimization output is missing or invalid"
+            "image optimization structured output unavailable"
         )
-    return value
+    return runner.run_isolated_until_output(
+        stage,
+        prompt,
+        session_dir=session,
+        output_path=output,
+        max_output_bytes=max_bytes,
+        validate_output=lambda raw: normalize_output(
+            _phase_output(raw, expected_keys)
+        ),
+        output_schema=output_schema,
+    )
 
 
 def _run_image_skill_phase_with_retry(
@@ -4161,6 +4161,23 @@ def generate_project_prompts(
         {"key": item["key"], "chain_id": item["chain_id"]}
         for item in raw_slots["scenes"]
     ]
+    expected_global_keys = {
+        "people": set((element_index or {}).get("people", {})),
+        "entities": set((element_index or {}).get("entities", {})),
+        "scenes": {
+            item["key"] for item in scene_slots
+        } | set((element_index or {}).get("scenes", {})),
+        "relations": set((element_index or {}).get("relations", {})),
+    }
+
+    def normalize_global_output(value: object) -> dict:
+        normalized = codex_output_schemas.normalize_global_plan(value)
+        if any(
+            set(normalized[category]) != expected_global_keys[category]
+            for category in expected_global_keys
+        ):
+            raise ValueError("global plan stable keys do not match frozen input")
+        return normalized
 
     def describe_global() -> dict:
         with tempfile.TemporaryDirectory(
@@ -4204,6 +4221,8 @@ def generate_project_prompts(
                 output_name="global_plan.json",
                 expected_keys={"people", "entities", "scenes", "relations"},
                 max_bytes=MAX_CONTINUITY_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
+                output_schema=codex_output_schemas.GLOBAL_PLAN_SCHEMA,
+                normalize_output=normalize_global_output,
             )
 
     global_plan = _run_image_skill_phase_with_retry(
@@ -4258,6 +4277,29 @@ def generate_project_prompts(
                     ) + "\n",
                     encoding="utf-8",
                 )
+                expected_frame_keys = {item["key"] for item in segment_slots}
+
+                def normalize_segment_output(value: object) -> dict:
+                    normalized = codex_output_schemas.normalize_segment_frames(value)
+                    if set(normalized["frames"]) != expected_frame_keys:
+                        raise ValueError(
+                            "segment frame keys do not match frozen input"
+                        )
+                    for frame in normalized["frames"].values():
+                        if (
+                            not set(frame["people"]).issubset(global_plan["people"])
+                            or not set(frame["entities"]).issubset(
+                                global_plan["entities"]
+                            )
+                            or not set(frame["relations"]).issubset(
+                                global_plan["relations"]
+                            )
+                        ):
+                            raise ValueError(
+                                "segment facts reference an unknown stable key"
+                            )
+                    return normalized
+
                 return _run_image_skill_phase(
                     runner,
                     stage=stage,
@@ -4265,6 +4307,8 @@ def generate_project_prompts(
                     output_name="segment_frames.json",
                     expected_keys={"frames"},
                     max_bytes=MAX_PROMPT_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
+                    output_schema=codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
+                    normalize_output=normalize_segment_output,
                 )
 
         result = _run_image_skill_phase_with_retry(

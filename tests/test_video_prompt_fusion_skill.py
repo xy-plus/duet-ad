@@ -10,16 +10,14 @@ def _text() -> str:
     return SKILL.read_text(encoding="utf-8")
 
 
-def test_metadata_and_four_input_contract_are_unchanged():
+def test_metadata_and_backend_bound_input_contract_are_explicit():
     text = _text()
     assert text.startswith("---\nname: video-prompt-fusion\n")
     assert AGENT.is_file()
     for required in (
-        'schema: "duet.video-prompt-fusion-input"', "version: 2",
-        "new_keyframes: NineOrdered<KeyframeReceipt>",
-        "old_video_prompt: FrozenText",
-        "image_optimization_prompt: NineOrdered<FrozenFramePrompt>",
-        "audio_content: FrozenAudioContent", "不新增第五类输入",
+        "multimodal_input.json", "schema/version", "new_keyframes",
+        "old_video_prompt", "image_optimization_prompt",
+        "relation_occurrences", "audio_content", "不要重述或改写输入结构",
     ):
         assert required in text
 
@@ -40,7 +38,7 @@ def test_authority_boundaries_and_output_remain_closed():
         "新关键帧独占静态事实权威", "旧提示词只贡献同一区间内",
         "跨段只共享 stable element design 和 relation system",
         "质量评分不触发拒绝、重试、回退", "work/h3_prompt_plan.json",
-        'schema: "duet.video-prompt-fusion-output"', "供 Context IR 优化",
+        "注入的 JSON Schema", "Context IR/H3 effective prompt",
     ):
         assert required in text
     assert "不输出时间戳、图片标记、stable key、tile、relation key" in text

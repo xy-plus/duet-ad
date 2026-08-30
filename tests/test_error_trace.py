@@ -363,6 +363,7 @@ def test_isolated_process_failure_writes_call_tree_and_sanitized_stderr(
                 output_path=output,
                 max_output_bytes=1024,
                 validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                output_schema={"type": "object"},
             )
 
         trace = json.loads(

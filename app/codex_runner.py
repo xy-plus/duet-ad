@@ -31,7 +31,7 @@ import threading
 import time
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable, NoReturn, TypeVar
+from typing import Callable, Mapping, NoReturn, TypeVar
 
 from app import error_trace
 
@@ -436,6 +436,9 @@ class CodexRunner:
         ]
         if self._model is not None:
             argv += ["-m", self._model]
+        output_schema = Path(workdir) / ".codex-output-schema.json"
+        if isolated_stage is not None and output_schema.is_file():
+            argv += ["--output-schema", str(output_schema)]
         argv += ["-c", f'model_reasoning_effort="{self._reasoning_effort}"']
         for cfg in _SANDBOX_CONFIGS:
             argv += ["-c", cfg]
@@ -508,6 +511,7 @@ class CodexRunner:
         output_path: Path,
         max_output_bytes: int,
         validate_output: Callable[[bytes], _T],
+        output_schema: Mapping[str, object],
     ) -> _T:
         """Return one valid declared output without delegating publication safety.
 
@@ -583,6 +587,8 @@ class CodexRunner:
             or not isinstance(max_output_bytes, int)
             or max_output_bytes <= 0
             or not callable(validate_output)
+            or not isinstance(output_schema, Mapping)
+            or output_schema.get("type") != "object"
         ):
             raise_recorded(CodexError("isolated output contract is invalid"))
         try:
@@ -646,6 +652,22 @@ class CodexRunner:
             )
 
         try:
+            schema_path = stage / ".codex-output-schema.json"
+            schema_bytes = (
+                json.dumps(
+                    dict(output_schema),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ) + "\n"
+            ).encode("utf-8")
+            if len(schema_bytes) > 256 * 1024:
+                raise CodexError("isolated output schema is invalid")
+            with schema_path.open("xb") as stream:
+                stream.write(schema_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
             writable = _isolated_writable_paths(stage, (declared, final_output))
             token = _ACTIVE_ISOLATED_STAGE.set(
                 (id(self), stage, session, writable, final_output)

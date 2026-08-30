@@ -44,7 +44,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app import asr, error_trace, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
+from app import asr, codex_output_schemas, error_trace, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -565,8 +565,7 @@ def _project_index_codex_prompt(cdir: Path) -> str:
         "严格执行当前目录 SKILL.md（该文档只读，禁止修改）。"
         "本次仅执行 phase=\"project_index\"：只读取 "
         "work/project_index_request.json 及其中列出的冻结关键帧，"
-        "不要读取或生成 prompt.txt；最终回答只返回完整 JSON object，"
-        "不加解释或其他文本。后端负责捕获、校验和发布。\n\n"
+        "不要读取或生成 prompt.txt；按注入的输出 Schema 填写索引。\n\n"
         + _hard_rules()
         + "\n"
     )
@@ -670,40 +669,46 @@ def _generate_project_element_index(
                 value = json.loads(raw_output.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 raise ValueError("project index output is invalid") from None
-            if (
-                not isinstance(value, dict)
-                or set(value) != {"people", "entities", "scenes", "relations"}
-                or any(
-                    not isinstance(value[key], dict)
-                    for key in ("people", "entities", "scenes", "relations")
-                )
+            normalized = codex_output_schemas.normalize_project_index(value)
+            canonical = image_optimization._canonical_element_index(normalized)
+            for category, prefix in (
+                ("people", "person"), ("entities", "entity"),
+                ("scenes", "scene"), ("relations", "relation"),
             ):
-                raise ValueError("project index output is invalid")
-            return raw_output
+                keys = list(normalized[category])
+                if keys != [
+                    f"{prefix}-{index:02d}" for index in range(1, len(keys) + 1)
+                ] or set(canonical[category]) != set(keys):
+                    raise ValueError("project index output is invalid")
+            for category in ("people", "entities", "scenes"):
+                for key, item in normalized[category].items():
+                    if len(canonical[category][key]["occurrences"]) != len(
+                        item["occurrences"]
+                    ):
+                        raise ValueError("project index output is invalid")
+            for key, item in normalized["relations"].items():
+                frozen = canonical["relations"][key]
+                if (
+                    len(frozen["occurrences"]) != len(item["occurrences"])
+                    or sum(len(entry["frames"]) for entry in frozen["occurrences"])
+                    != sum(len(entry["frames"]) for entry in item["occurrences"])
+                ):
+                    raise ValueError("project index output is invalid")
+            return _canonical_json_bytes(canonical)
 
-        if hasattr(runner, "run_isolated_until_output"):
-            staged_data = runner.run_isolated_until_output(
-                isolated_root,
-                _project_index_codex_prompt(isolated_root),
-                session_dir=cdir,
-                output_path=isolated_output,
-                max_output_bytes=image_optimization.element_index_max_bytes(
-                    sum(len(paths) for paths in frame_paths.values())
-                ),
-                validate_output=validate,
-            )
-        else:
-            runner.run_isolated(
-                isolated_root,
-                _project_index_codex_prompt(isolated_root),
-                session_dir=cdir,
-            )
-            try:
-                staged_data = validate(isolated_output.read_bytes())
-            except (OSError, ValueError) as exc:
-                raise PipelineError(
-                    "project index output is missing or invalid", retryable=True,
-                ) from exc
+        if not callable(getattr(runner, "run_isolated_until_output", None)):
+            raise PipelineError("project index structured output unavailable")
+        staged_data = runner.run_isolated_until_output(
+            isolated_root,
+            _project_index_codex_prompt(isolated_root),
+            session_dir=cdir,
+            output_path=isolated_output,
+            max_output_bytes=image_optimization.element_index_max_bytes(
+                sum(len(paths) for paths in frame_paths.values())
+            ),
+            validate_output=validate,
+            output_schema=codex_output_schemas.PROJECT_INDEX_SCHEMA,
+        )
         staged = target.with_name(".element_index.tmp")
         try:
             staged.write_bytes(staged_data)
@@ -2749,27 +2754,6 @@ def _copy_prompt_fusion_frame(
         raise PipelineError("prompt fusion input is invalid") from None
 
 
-def _read_prompt_fusion_stage_output(path: Path, *, segment_count: int) -> bytes:
-    max_bytes = 64 * 1024 + MAX_PROMPT_BYTES * segment_count
-    try:
-        descriptor = os.open(
-            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-        )
-    except OSError:
-        raise PipelineError("prompt fusion raw output is missing") from None
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
-            raise PipelineError("prompt fusion raw output is invalid")
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            data = stream.read(max_bytes + 1)
-    finally:
-        os.close(descriptor)
-    if not data or len(data) > max_bytes:
-        raise PipelineError("prompt fusion raw output is invalid")
-    return data
-
-
 def _prompt_fusion_early_output(
     data: bytes, *, input_sha256: str, segment_count: int,
     input_segments: list | None = None,
@@ -3248,7 +3232,7 @@ def produce_prompt_fusion(
         skill_data = frozen_skill_data
         if not skill_data:
             raise PipelineError("prompt fusion Skill is missing")
-        if not callable(getattr(runner, "run_isolated", None)):
+        if not callable(getattr(runner, "run_isolated_until_output", None)):
             raise PipelineError("prompt fusion isolation unavailable")
         _atomic_bytes(frozen_skill_path, skill_data)
         output_path.unlink(missing_ok=True)
@@ -3269,38 +3253,28 @@ def produce_prompt_fusion(
                     )
             fusion_prompt = (
                 "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json "
-                "及其中 SHA 绑定的有序图片；最终回答只返回规定的完整 JSON "
-                "object，不加解释或其他文本。后端负责捕获、校验和发布。"
+                "及其中 SHA 绑定的有序图片；按注入的输出 Schema 填写融合结果。"
             )
-            if hasattr(runner, "run_isolated_until_output"):
-                raw_output_data = runner.run_isolated_until_output(
-                    stage,
-                    fusion_prompt,
-                    session_dir=root,
-                    output_path=stage_output,
-                    max_output_bytes=(
-                        64 * 1024
-                        + MAX_PROMPT_BYTES * len(input_payload["segments"])
-                    ),
-                    validate_output=lambda data: _prompt_fusion_early_output(
-                        data,
-                        input_sha256=state["input_sha256"],
-                        segment_count=len(input_payload["segments"]),
-                        input_segments=input_payload["segments"],
-                    ),
-                )
-            else:
-                stage_output.touch(mode=0o600, exist_ok=False)
-                runner.run_isolated(
-                    stage,
-                    fusion_prompt,
-                    session_dir=root,
-                    writable_paths=(stage_output,),
-                )
-                raw_output_data = _read_prompt_fusion_stage_output(
-                    stage_output,
+            raw_output_data = runner.run_isolated_until_output(
+                stage,
+                fusion_prompt,
+                session_dir=root,
+                output_path=stage_output,
+                max_output_bytes=(
+                    64 * 1024
+                    + MAX_PROMPT_BYTES * len(input_payload["segments"])
+                ),
+                validate_output=lambda data: _prompt_fusion_early_output(
+                    data,
+                    input_sha256=state["input_sha256"],
                     segment_count=len(input_payload["segments"]),
-                )
+                    input_segments=input_payload["segments"],
+                ),
+                output_schema=codex_output_schemas.prompt_fusion_schema(
+                    input_sha256=state["input_sha256"],
+                    segment_count=len(input_payload["segments"]),
+                ),
+            )
         raw_output_data = _prompt_fusion_early_output(
             raw_output_data,
             input_sha256=state["input_sha256"],

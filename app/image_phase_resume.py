@@ -121,6 +121,7 @@ class _DiagnosticRunner:
         output_path: Path,
         max_output_bytes: int,
         validate_output,
+        output_schema,
     ):
         try:
             result = self._inner.run_isolated_until_output(
@@ -130,6 +131,7 @@ class _DiagnosticRunner:
                 output_path=output_path,
                 max_output_bytes=max_output_bytes,
                 validate_output=validate_output,
+                output_schema=output_schema,
             )
         except BaseException as exc:
             self._capture(workdir, output_path, max_output_bytes, exc)

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app import error_trace, seedream
+from app import codex_output_schemas
 from app.codex_runner import CodexRunner
 from app.config import Settings
 
@@ -194,11 +195,7 @@ def _neutralization_prompt(input_name: str) -> str:
 
 你只能修改 original_free_text 中可能触发审核的自由措辞，使其客观、中性、非煽动。semantic_contract 是后端冻结的只读权威语义，禁止改写、删减、概括或自行判断是否保持；后端会独立注入并校验它。不得新增故事或元素。
 
-输出且仅输出一个 JSON 对象，字段必须恰好为：
-- version: 1
-- original_prompt_sha256: 原样返回输入值
-- semantic_contract_sha256: 原样返回输入值
-- neutralized_free_text: 中性化后的完整自由文本，且不得与原文相同
+按注入的输出 Schema 返回；两个 SHA 字段原样绑定输入，neutralized_free_text 是中性化后的完整自由文本且不得与原文相同。
 
 无法只改自由措辞时进程失败，不得伪造合同或自报语义一致。"""
 
@@ -302,6 +299,10 @@ def _run_codex(
                 raw,
                 original_prompt=original_prompt,
                 semantic_contract=semantic_contract,
+            ),
+            output_schema=codex_output_schemas.neutralization_schema(
+                original_prompt_sha256=_sha256(original_prompt),
+                semantic_contract_sha256=str(semantic_contract["sha256"]),
             ),
         )
 

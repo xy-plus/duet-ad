@@ -15,9 +15,10 @@ class _IndexRunner:
         self.payload = payload
         self.calls: list[tuple[Path, str]] = []
 
-    def run_isolated(
-        self, cdir: Path, prompt: str, *, session_dir: Path
-    ) -> None:
+    def run_isolated_until_output(
+        self, cdir: Path, prompt: str, *, session_dir: Path, output_path: Path,
+        max_output_bytes: int, validate_output, output_schema: dict,
+    ):
         self.calls.append((cdir, prompt))
         assert session_dir.name == "conversation"
         assert (cdir / "SKILL.md").is_file()
@@ -50,15 +51,20 @@ class _IndexRunner:
             "segments/1/keyframes/01.png",
             "segments/1/keyframes/02.png",
         ]
-        (isolated_work / "element_index.json").write_text(
-            json.dumps(self.payload, ensure_ascii=False), encoding="utf-8"
-        )
+        assert output_schema["properties"]["people"]["type"] == "array"
+        model_payload = {
+            category: [{"key": key, **item} for key, item in values.items()]
+            for category, values in self.payload.items()
+        }
+        raw = json.dumps(model_payload, ensure_ascii=False).encode("utf-8")
+        assert len(raw) <= max_output_bytes
+        return validate_output(raw)
 
 
 def _element_index() -> dict:
     return {
         "people": {
-            "woman-red-coat": {
+            "person-01": {
                 "source_visual_description": "红色外套女性",
                 "occurrences": [
                     {"segment_index": 1, "frame_orders": [1, 2]}
@@ -80,7 +86,7 @@ def _element_index() -> dict:
             "relation-01": {
                 "subject_key": "entity-01",
                 "predicate": "held_by",
-                "object_key": "woman-red-coat",
+                "object_key": "person-01",
                 "occurrences": [{"segment_index": 1, "frames": [
                     {"frame_order": 1, "state": "held", "geometry": "inside hand"},
                     {"frame_order": 2, "state": "released", "geometry": "apart"},
@@ -138,9 +144,9 @@ def test_project_index_call_has_no_retry_or_fallback(tmp_path):
     class FailingRunner:
         calls = 0
 
-        def run_isolated(
-            self, _cdir: Path, _prompt: str, *, session_dir: Path
-        ) -> None:
+        def run_isolated_until_output(
+            self, _cdir: Path, _prompt: str, *, session_dir: Path, **_kwargs
+        ):
             self.calls += 1
             assert session_dir == cdir
             raise RuntimeError("project index failed")

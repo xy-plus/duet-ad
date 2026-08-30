@@ -196,10 +196,11 @@ def test_pipeline_video_and_image_calls_consume_same_frozen_bytes(
     class VideoRunner:
         def run_isolated_until_output(
             self, cwd, _prompt, *, session_dir, output_path,
-            max_output_bytes, validate_output,
+            max_output_bytes, validate_output, output_schema,
         ):
             seen_video.append((cwd / "SKILL.md").read_bytes())
-            output = b'{"people":[],"entities":[],"scenes":[]}\n'
+            assert output_schema["properties"]["people"]["type"] == "array"
+            output = b'{"people":[],"entities":[],"scenes":[],"relations":[]}\n'
             output_path.write_bytes(output)
             return validate_output(output)
 
@@ -324,9 +325,10 @@ def test_prompt_fusion_call_consumes_cid_frozen_bytes_after_source_drift(
 
         def run_isolated_until_output(
             self, cwd, _prompt, *, session_dir, output_path,
-            max_output_bytes, validate_output,
+            max_output_bytes, validate_output, output_schema,
         ):
             seen.append((cwd / "SKILL.md").read_bytes())
+            assert output_schema["properties"]["segments"]["type"] == "array"
             input_sha256 = hashlib.sha256(
                 (cwd / "work" / h3_project.SKILL_INPUT_FILENAME).read_bytes()
             ).hexdigest()

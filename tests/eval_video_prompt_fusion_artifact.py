@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from app import codex_output_schemas
 from app.codex_runner import CodexRunner
 
 
@@ -183,6 +184,10 @@ def run_real_fusion(
             max_output_bytes=64 * 1024 + 32 * 1024 * len(frozen["segments"]),
             validate_output=lambda data: _validate_fusion_output(
                 data,
+                input_sha256=input_sha256,
+                segment_count=len(frozen["segments"]),
+            ),
+            output_schema=codex_output_schemas.prompt_fusion_schema(
                 input_sha256=input_sha256,
                 segment_count=len(frozen["segments"]),
             ),

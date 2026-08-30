@@ -2353,6 +2353,7 @@ class TestCodexRunner:
                 output_path=output,
                 max_output_bytes=1024,
                 validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                output_schema={"type": "object"},
             )
 
             assert result == {"ok": True}
@@ -2389,6 +2390,7 @@ class TestCodexRunner:
                 output_path=output,
                 max_output_bytes=1024,
                 validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                output_schema={"type": "object"},
             ) == {"ok": True}
 
     def test_isolated_final_answer_is_adopted_after_clean_exit(
@@ -2424,6 +2426,7 @@ class TestCodexRunner:
                 output_path=output,
                 max_output_bytes=1024,
                 validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                output_schema={"type": "object"},
             ) == {"ok": True}
 
     def test_isolated_direct_write_is_not_adopted_before_clean_exit(
@@ -2460,6 +2463,7 @@ class TestCodexRunner:
                     output_path=output,
                     max_output_bytes=1024,
                     validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                    output_schema={"type": "object"},
                 )
 
     def test_isolated_direct_write_does_not_hide_nonzero_exit(
@@ -2495,6 +2499,7 @@ class TestCodexRunner:
                     output_path=output,
                     max_output_bytes=1024,
                     validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                    output_schema={"type": "object"},
                 )
 
     def test_isolated_completion_kills_term_ignoring_descendants(
@@ -2533,6 +2538,7 @@ class TestCodexRunner:
                 output_path=output,
                 max_output_bytes=1024,
                 validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                output_schema={"type": "object"},
             ) == {"ok": True}
             time.sleep(1.2)
             assert not marker.exists()
@@ -2567,6 +2573,7 @@ class TestCodexRunner:
                     output_path=stage / "work" / "result.json",
                     max_output_bytes=1024,
                     validate_output=lambda raw: raw,
+                    output_schema={"type": "object"},
                 )
 
     def test_isolated_path_validation_failure_writes_pre_spawn_call_tree(
@@ -2592,6 +2599,7 @@ class TestCodexRunner:
                     output_path=outside / "result.json",
                     max_output_bytes=1024,
                     validate_output=lambda raw: raw,
+                    output_schema={"type": "object"},
                 )
 
             trace = json.loads(
@@ -2634,6 +2642,7 @@ class TestCodexRunner:
                     output_path=work / "result.json",
                     max_output_bytes=1024,
                     validate_output=lambda raw: raw,
+                    output_schema={"type": "object"},
                 )
 
             trace = json.loads(
@@ -2674,6 +2683,7 @@ class TestCodexRunner:
                     output_path=output,
                     max_output_bytes=1024,
                     validate_output=lambda raw: raw,
+                    output_schema={"type": "object"},
                 )
             trace = json.loads(
                 (cdir / "work/errors" / f"{stage.name}.json").read_text()
@@ -2689,6 +2699,7 @@ class TestCodexRunner:
             )
             output.unlink()
             (work / ".codex-final-output.json").unlink()
+            (stage / ".codex-output-schema.json").unlink()
             with pytest.raises(RuntimeError, match="build argv exploded"):
                 runner.run_isolated_until_output(
                     stage,
@@ -2697,6 +2708,7 @@ class TestCodexRunner:
                     output_path=output,
                     max_output_bytes=1024,
                     validate_output=lambda raw: raw,
+                    output_schema={"type": "object"},
                 )
             monkeypatch.setattr(codex_runner.error_trace, "record", original_record)
 

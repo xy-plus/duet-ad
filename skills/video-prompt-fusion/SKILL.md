@@ -7,17 +7,9 @@ description: Fuse frozen optimized keyframes, old segment dynamics, frame replac
 
 只读取 `work/multimodal_input.json` 及其中列出的新关键帧。一次调用处理全部 ordered segments；不选帧、不改音频、不写 provider 字段。四类既有模态输入不变，不新增第五类输入；`relation_occurrences` 是 `image_optimization_prompt` 的后端结构化关系 sidecar。输入输出 schema 保持 version 2。
 
-```text
-VideoPromptFusionInput = { schema: "duet.video-prompt-fusion-input"; version: 2; segments: NonEmptyArray<SegmentInput> }
-SegmentInput = { index: Int1; new_keyframes: NineOrdered<KeyframeReceipt>; old_video_prompt: FrozenText; image_optimization_prompt: NineOrdered<FrozenFramePrompt>; relation_occurrences: Array<RelationOccurrence>; audio_content: FrozenAudioContent }
-KeyframeReceipt = { order: Int1; path: NonEmpty; sha256: Sha256; segment_time_s: Number; source_scene_id: NonEmpty; transition: { type: "start" | "continuous" | "hard_cut"; at_segment_s: Number | null } }
-FrozenText = { text: NonEmpty; sha256: Sha256 }
-FrozenFramePrompt = { order: Int1; text: NonEmpty; sha256: Sha256 }
-RelationOccurrence = { relation_id: NonEmpty; subject_key: NonEmpty; predicate: NonEmpty; object_key: NonEmpty; state: NonEmpty; geometry: NonEmpty; preserve: Array<NonEmpty>; replace_together: Bool; frame: { order: Int1; segment_time_s: Number; source_scene_id: NonEmpty } }
-FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice_references: []; music_policy: "forbid" }
-```
+输入合同由 `multimodal_input.json` 的 `schema/version` 和后端校验器冻结。每段依次提供 `index/new_keyframes/old_video_prompt/image_optimization_prompt/relation_occurrences/audio_content`；关键帧、文本、台词均带 SHA，关系 occurrence 带逐帧主客体、predicate、state、geometry、preserve 和 replace_together。不要重述或改写输入结构。
 
-每段 9 张图片和 9 条 frame prompt 按 order 一一对应；segment 索引连续。核对列出文件及文本 exact bytes SHA。局部时间严格递增，order 1 为 `segment_time_s=0/type=start/at_segment_s=0`；continuous 的 `at_segment_s=null`；hard_cut 时间位于前后关键帧局部时间之间。`audio_content` 只作为冻结台词冲突边界，`voice_references=[]`、`music_policy="forbid"`，不生成声音、台词、口型或音乐。version 1 只读，不创建输出。
+每段 9 张图片和 9 条 frame prompt 按 order 一一对应；segment 索引连续。核对列出文件及文本 exact bytes SHA。局部时间严格递增，order 1 为 `segment_time_s=0/type=start/at_segment_s=0`；continuous 的 `at_segment_s=null`；hard_cut 时间位于前后关键帧局部时间之间。`audio_content` 只作为冻结台词冲突边界，`voice_references=[]`、`music_policy="forbid"`，不生成声音、台词、口型或音乐。
 
 ## 融合
 
@@ -37,12 +29,4 @@ FrozenAudioContent = { lines_json: NonEmptyJsonText; lines_sha256: Sha256; voice
 
 后端按 transition 建区间：第一帧开始区间，hard_cut 当前帧开始新区间，continuous 留在当前区间。每个区间输出一条简洁英文 `visual` prose，只引用本区间图片；不输出时间戳、图片标记、stable key、tile、relation key、音频字段或 provider 语法。visual 与后端机械关系块合计必须适配现有 H3 7000 字符 transport 合同；这不是质量评分。模型可以省略 `relation_states`；即使回显，后端也会按冻结输入覆盖，模型回显不是权威且不影响任务成败。
 
-后端发布到 `work/h3_prompt_plan.json`，输出合同：
-
-```text
-ModelOutput = { schema: "duet.video-prompt-fusion-output"; version: 2; input_sha256: Sha256; segments: NonEmptyArray<{ index: Int1; visual: NonEmptyArray<NonEmptyText>; relation_states?: Array<RelationInterval> }> }
-PublishedVideoPromptFusionOutput = { schema: "duet.video-prompt-fusion-output"; version: 2; input_sha256: Sha256; segments: NonEmptyArray<{ index: Int1; visual: NonEmptyArray<NonEmptyText>; relation_states: NonEmptyArray<RelationInterval> }> }
-RelationInterval = { interval: { start_frame_order: Int1; end_frame_order: Int1; source_scene_id: NonEmpty }; relations: Array<{ relation_id: NonEmpty; subject_key: NonEmpty; predicate: NonEmpty; object_key: NonEmpty; preserve: Array<NonEmpty>; replace_together: Bool; states: NonEmptyArray<{ frame_order: Int1; state: NonEmpty; geometry: NonEmpty }> }> }
-```
-
-segments 与输入一一对应，visual 数量等于 hard-cut 区间数。后端按输入机械计算 relation_states，覆盖错误回显或注入缺失字段，并保证发布结果的 relation_states 数量等于 hard-cut 区间数；随后把冻结关系机械编译进 Context IR/H3 effective prompt。最终回答只返回 `ModelOutput` JSON object；后端捕获、规范化并发布 `PublishedVideoPromptFusionOutput`，供 Context IR 优化，再按冻结素材逐段生成视频。
+输出格式以本次调用注入的 JSON Schema 为唯一权威：固定 `schema/version/input_sha256`，`segments` 与输入一一对应，每段只填写 `index/visual`，visual 数量等于 hard-cut 区间数。模型不输出 relation states；后端完全依据冻结 occurrence 机械生成并编译进 Context IR/H3 effective prompt，再原子发布 `work/h3_prompt_plan.json`。

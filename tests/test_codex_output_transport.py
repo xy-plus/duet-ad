@@ -82,6 +82,7 @@ def test_final_output_wins_and_is_atomically_published_after_validation(
             output_path=output,
             max_output_bytes=1024,
             validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+            output_schema={"type": "object"},
         )
 
         assert value == {"source": "final"}
@@ -126,6 +127,7 @@ def test_rejected_final_output_keeps_structured_error_tree(
                 output_path=output,
                 max_output_bytes=1024,
                 validate_output=lambda raw: json.loads(raw.decode("utf-8")),
+                output_schema={"type": "object"},
             )
 
         trace = json.loads(
@@ -202,6 +204,7 @@ def test_rejected_final_output_records_exact_bounded_diagnostic_reason(
                 output_path=output,
                 max_output_bytes=max_output_bytes,
                 validate_output=validate_ok,
+                output_schema={"type": "object"},
             )
 
         trace = json.loads(
