@@ -816,6 +816,41 @@ def _frame_prompt(private: dict, index: int, name: str, source_sha256: str) -> s
     raise PostprocessError(409, "image_optimization_prompt_invalid")
 
 
+def _frame_semantic_context(
+    private: dict, index: int, name: str, source_sha256: str,
+) -> dict:
+    """Return only already-frozen backend semantics for neutralization."""
+    context: dict = {
+        "segment_index": index,
+        "frame_name": name,
+        "source_sha256": source_sha256,
+    }
+    for frame in private.get("frames", []):
+        if (
+            isinstance(frame, dict)
+            and frame.get("segment_index") == index
+            and frame.get("frame_name") == name
+            and frame.get("source_sha256") == source_sha256
+        ):
+            context["frozen_frame"] = deepcopy(frame)
+            break
+    execution = private.get("execution_inputs")
+    if isinstance(execution, dict):
+        for frame in execution.get("frames", []):
+            if (
+                isinstance(frame, dict)
+                and frame.get("segment_index") == index
+                and frame.get("frame_name") == name
+                and frame.get("source_sha256") == source_sha256
+            ):
+                context["execution_frame"] = deepcopy(frame)
+                break
+        for key in ("identity_slots", "scene_slots", "layout_slots"):
+            if isinstance(execution.get(key), list):
+                context[key] = deepcopy(execution[key])
+    return context
+
+
 def _frame_ref(index: int, name: str) -> str:
     return name if index == 0 else f"segments/{index}/work/postprocessed/{name}"
 
@@ -1196,6 +1231,9 @@ async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
                 task_settings, [path.read_bytes() for path in image_inputs], prompt, output,
                 receipt_path=attempts / f"{position:04d}-r{revision}.json",
                 session_dir=cdir,
+                semantic_context=_frame_semantic_context(
+                    private, index, source.name, source_sha256,
+                ),
             )
         publish_progress()
 
@@ -2035,6 +2073,10 @@ async def _v4_generate_composite_replacement_board(
                 raw_output,
                 receipt_path=attempt,
                 session_dir=cdir,
+                semantic_context={
+                    "replacement_board": board,
+                    "plan_sha256": private.get("plan_sha256"),
+                },
             )
         _draw_replacement_board_labels(raw_output, output, len(tiles))
     except seedream.SeedreamError as exc:
@@ -2103,6 +2145,12 @@ async def _v4_anchor(
                 task_settings, [path.read_bytes() for path in inputs], prompt, output,
                 receipt_path=attempt_path,
                 session_dir=cdir,
+                semantic_context=_frame_semantic_context(
+                    private,
+                    anchor["segment_index"],
+                    anchor["frame_name"],
+                    anchor["source_sha256"],
+                ),
             )
         except seedream.SeedreamError as exc:
             raise PostprocessError(502, exc.code) from None
@@ -2128,6 +2176,12 @@ async def _v4_anchor(
                 output,
                 receipt_path=attempt_path,
                 session_dir=cdir,
+                semantic_context=_frame_semantic_context(
+                    private,
+                    anchor["segment_index"],
+                    anchor["frame_name"],
+                    anchor["source_sha256"],
+                ),
             )
     except seedream.SeedreamError as exc:
         raise PostprocessError(502, exc.code) from None

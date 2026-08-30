@@ -1477,23 +1477,9 @@ def controlled_storage_rejection_is_safely_retryable(
     legacy_attempt_sha256: str = "",
     legacy_evidence_sha256: str = "",
 ) -> bool:
-    """Recognize only a definite local Gateway storage rejection.
-
-    A legacy exception is operator-authorized by the exact immutable attempt
-    bytes plus an external rejection-evidence digest.  It is intentionally not
-    inferred from the generic ``h3_submit_rejected`` code.
-    """
+    """Legacy compatibility query; same-client paid retry is disabled."""
     _require_h3_boundary(request)
-    try:
-        state = _find_attempt(request, request.client_request_id)
-    except ReceiptError:
-        return False
-    return _controlled_storage_retry_state_is_valid(
-        request,
-        state,
-        legacy_attempt_sha256=legacy_attempt_sha256,
-        legacy_evidence_sha256=legacy_evidence_sha256,
-    )
+    return False
 
 
 def retry_controlled_storage_rejection(
@@ -1503,26 +1489,9 @@ def retry_controlled_storage_rejection(
     legacy_evidence_sha256: str = "",
     client: httpx.Client | None = None,
 ) -> H3Result:
-    """Append one same-client attempt after a proven local 400 rejection."""
+    """Reject the retired same-client paid retry path unconditionally."""
     _require_h3_boundary(request)
-    with _session_lease(request):
-        previous = _find_attempt(request, request.client_request_id)
-        if not _controlled_storage_retry_state_is_valid(
-            request,
-            previous,
-            legacy_attempt_sha256=legacy_attempt_sha256,
-            legacy_evidence_sha256=legacy_evidence_sha256,
-        ):
-            raise H3Error("controlled_storage_retry_not_allowed")
-        state = _create_attempt(request, request.client_request_id)
-        with _client(client) as active_client:
-            return _advance_once(
-                request,
-                state,
-                active_client,
-                allow_submit=True,
-                new_attempt=True,
-            )
+    raise H3Error("new_client_request_id_required")
 
 
 def _state_root(request: H3Request) -> Path:

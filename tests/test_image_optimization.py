@@ -936,6 +936,68 @@ def test_manual_segment_retry_preserves_unknown_attempt_while_recovery_never_pos
     assert latest["status"] == "done" and latest["segments"][0]["revision"] == 2
 
 
+def test_single_operation_failed_postprocess_post_replay_is_terminal_and_read_only(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARK_API_KEY", "secret")
+    settings = make_settings(tmp_path)
+    cid = _done(settings)
+    cdir = settings.data_dir / cid
+    (cdir / "work" / "keyframes" / "02.png").write_bytes(_png(value=62))
+    _freeze_v4_image_optimization(settings, cid, _v4_frame_bound_plan())
+    frozen_options = {
+        "remove_subtitle": False,
+        "remove_brand": False,
+        "optimize_image": True,
+    }
+    asyncio.run(postprocess.start(
+        settings, cid, {"confirm": True, "options": frozen_options}, {},
+    ))
+    storage.update_meta(
+        settings.data_dir, cid,
+        postprocess={
+            "status": "failed",
+            "options": frozen_options,
+            "frames": [],
+            "error": "provider_rejected",
+            "segments": [{
+                "index": 0,
+                "status": "failed",
+                "stage": "seedream",
+                "completed_frames": 0,
+                "total_frames": 2,
+                "revision": 7,
+                "error": "provider_rejected",
+            }],
+        },
+    )
+
+    async def forbidden_retry(*_args, **_kwargs):
+        pytest.fail("ordinary POST replay must never open a segment revision")
+
+    monkeypatch.setattr(postprocess, "retry_segment", forbidden_retry)
+    payload = {"confirm": True, "options": frozen_options}
+    with TestClient(create_app(settings)) as client:
+        first = client.post(
+            f"/api/conversations/{cid}/postprocess", headers=AUTH, json=payload,
+        )
+        second = client.post(
+            f"/api/conversations/{cid}/postprocess", headers=AUTH, json=payload,
+        )
+
+    expected = {
+        "operation_id": cid,
+        "status": "failed",
+        "stage": "postprocess",
+        "error": "provider_rejected",
+    }
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json() == expected
+    latest = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    assert latest["status"] == "failed"
+    assert latest["segments"][0]["revision"] == 7
+
+
 def test_recovery_ignores_old_unknown_revision_on_done_segment(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, enable_mediakit_erase=True)
     cid = _done(settings, segments=True)

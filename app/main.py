@@ -1345,21 +1345,6 @@ def _load_h3_request(settings: Settings, cid: str, meta: dict) -> h3.H3Request:
     return _bind_short_h3_operational_roots(settings, cid, request)
 
 
-def _load_controlled_storage_retry_requests(
-    settings: Settings, cid: str, meta: dict,
-) -> tuple[h3.H3Request, h3.H3Request]:
-    """Rebuild semantic source first; bind Context before execution routing."""
-    frozen, request_id = _load_short_frozen_input(settings, cid, meta)
-    source_request = _make_h3_request(settings, cid, frozen, request_id)
-    context = _freeze_short_context_ir(settings, frozen, source_request)
-    generation = meta.get("generation")
-    binding = generation.get("context_ir") if isinstance(generation, dict) else None
-    effective_request = h3_project.apply_bound_context_ir(context, binding)
-    return source_request, _bind_short_h3_operational_roots(
-        settings, cid, effective_request
-    )
-
-
 def _freeze_short_context_ir(
     settings: Settings,
     frozen: prepared_input.PreparedInput,
@@ -1565,7 +1550,7 @@ def _run_generation(
     request: h3.H3Request,
     action: str,
 ) -> None:
-    if action not in {"start", "resume", "retry", "retry_controlled_storage"}:
+    if action not in {"start", "resume", "retry"}:
         raise ValueError("invalid generation action")
     meta = storage.load_meta(settings.data_dir, cid)
     generation = meta.get("generation") if meta else None
@@ -1658,18 +1643,8 @@ def _run_generation(
             result = h3.start(request)
         elif h3_action == "resume":
             result = h3.resume(request)
-        elif h3_action == "retry":
-            result = h3.retry(request, request.client_request_id)
         else:
-            result = h3.retry_controlled_storage_rejection(
-                request,
-                legacy_attempt_sha256=(
-                    settings.h3_controlled_storage_retry_attempt_sha256
-                ),
-                legacy_evidence_sha256=(
-                    settings.h3_controlled_storage_retry_evidence_sha256
-                ),
-            )
+            result = h3.retry(request, request.client_request_id)
         if h3_action == "resume" and result.status == "not_started":
             _mark_submission_unknown(settings, cid, generation)
             return
@@ -3397,22 +3372,42 @@ def _operation_view(
     *,
     stage: str | None = None,
 ) -> tuple[int, dict[str, object]]:
-    """Return the only public terminal: a receipt-bound B, otherwise running."""
+    """Project the durable operation state without mutating or retrying it."""
     generation = meta.get("generation")
     succeeded = (
         isinstance(generation, dict)
         and _effective_generation_status(generation) == "succeeded"
         and _has_valid_generated_video(settings, dict(meta))
     )
+    terminal_status: str | None = "succeeded" if succeeded else None
+    terminal_error: object | None = None
+    if not succeeded and isinstance(generation, Mapping):
+        generation_status = _effective_generation_status(dict(generation))
+        if generation_status in {"failed", "submission_unknown"}:
+            terminal_status = generation_status
+            terminal_error = generation.get("error")
+    post = meta.get("postprocess")
+    if terminal_status is None and isinstance(post, Mapping) and post.get("status") == "failed":
+        terminal_status = "failed"
+        terminal_error = post.get("error")
+    fusion = meta.get("_prompt_fusion")
+    if terminal_status is None and isinstance(fusion, Mapping) and fusion.get("status") == "failed":
+        terminal_status = "failed"
+        terminal_error = fusion.get("error")
+    if terminal_status is None and meta.get("status") == "failed":
+        terminal_status = "failed"
+        terminal_error = meta.get("error")
     body: dict[str, object] = {
         "operation_id": cid,
-        "status": "succeeded" if succeeded else "running",
+        "status": terminal_status or "running",
         "stage": "commit_b" if succeeded else _operation_stage(meta, stage),
     }
+    if terminal_error is not None:
+        body["error"] = terminal_error
     attempt = generation.get("attempt") if isinstance(generation, Mapping) else None
     if isinstance(attempt, int) and not isinstance(attempt, bool):
         body["attempt"] = attempt
-    return (200 if succeeded else 202), body
+    return (200 if terminal_status is not None else 202), body
 
 
 def _ensure_existing_generation(
@@ -4952,10 +4947,14 @@ def create_app(settings: Settings) -> FastAPI:
                     )
                     if exact_paid_resume:
                         try:
-                            source_request, effective_request = (
-                                _load_controlled_storage_retry_requests(
-                                    settings, cid, meta
-                                )
+                            frozen_resume, resume_request_id = _load_short_frozen_input(
+                                settings, cid, meta
+                            )
+                            source_request = _make_h3_request(
+                                settings, cid, frozen_resume, resume_request_id
+                            )
+                            effective_request = _load_h3_request(
+                                settings, cid, meta
                             )
                             inspected = h3.inspect(effective_request)
                         except (
@@ -4994,67 +4993,12 @@ def create_app(settings: Settings) -> FastAPI:
                             "status": "queued",
                             "attempt": generation.get("attempt"),
                         }
-                    safe_storage_recovery = (
-                        previous_id == request_id
-                        and generation.get("stage") == "h3"
-                        and generation.get("h3_attempt_id") is None
-                        and _short_generation_parameters_match(
-                            meta,
-                            dialogue_mode=payload["dialogue_mode"],
-                            dialogue=dialogue,
-                            requested_dialogue_delivery=requested_dialogue_delivery,
-                            resolved_dialogue_delivery=resolved_dialogue_delivery,
-                            fit_mode=fit_mode,
-                            aspect_ratio=aspect_ratio,
-                            resolution=resolution,
-                        )
+                    # An unknown same-client outcome is terminal for this
+                    # authorization.  A new POST requires an explicit request
+                    # carrying a new client_request_id.
+                    raise HTTPException(
+                        status_code=409, detail="submission_outcome_unknown"
                     )
-                    if safe_storage_recovery:
-                        try:
-                            source_request, effective_request = (
-                                _load_controlled_storage_retry_requests(
-                                    settings, cid, meta
-                                )
-                            )
-                        except (
-                            _SubmitError,
-                            h3.H3Error,
-                            h3_project.ProjectMultimodalError,
-                        ):
-                            safe_storage_recovery = False
-                        else:
-                            safe_storage_recovery = (
-                                h3.controlled_storage_rejection_is_safely_retryable(
-                                    effective_request,
-                                    legacy_attempt_sha256=(
-                                        settings.h3_controlled_storage_retry_attempt_sha256
-                                    ),
-                                    legacy_evidence_sha256=(
-                                        settings.h3_controlled_storage_retry_evidence_sha256
-                                    ),
-                                )
-                            )
-                    if not safe_storage_recovery:
-                        raise HTTPException(
-                            status_code=409, detail="submission_outcome_unknown"
-                        )
-                    updated = {
-                        **generation,
-                        "status": "queued",
-                        "error": None,
-                    }
-                    storage.update_meta(settings.data_dir, cid, generation=updated)
-                    background_tasks.add_task(
-                        _run_generation,
-                        settings,
-                        cid,
-                        source_request,
-                        "retry_controlled_storage",
-                    )
-                    return {
-                        "status": "queued",
-                        "attempt": generation.get("attempt"),
-                    }
                 if previous_status not in (
                     _GENERATION_ACTIVE
                     | _GENERATION_RETRYABLE
@@ -5131,69 +5075,10 @@ def create_app(settings: Settings) -> FastAPI:
                     raise HTTPException(status_code=409, detail=detail)
                 if previous_status in _GENERATION_RETRYABLE and previous_id == request_id:
                     if generation.get("error") == "h3_submit_rejected":
-                        if not _short_generation_parameters_match(
-                            meta,
-                            dialogue_mode=payload["dialogue_mode"],
-                            dialogue=dialogue,
-                            requested_dialogue_delivery=requested_dialogue_delivery,
-                            resolved_dialogue_delivery=resolved_dialogue_delivery,
-                            fit_mode=fit_mode,
-                            aspect_ratio=aspect_ratio,
-                            resolution=resolution,
-                        ):
-                            raise HTTPException(
-                                status_code=409,
-                                detail="resume_parameters_changed",
-                            )
-                        try:
-                            source_request, request = (
-                                _load_controlled_storage_retry_requests(
-                                    settings, cid, meta
-                                )
-                            )
-                        except (
-                            _SubmitError,
-                            h3.H3Error,
-                            h3_project.ProjectMultimodalError,
-                        ) as exc:
-                            _mark_submission_unknown(settings, cid, generation)
-                            raise HTTPException(
-                                status_code=409,
-                                detail="submission_outcome_unknown",
-                            ) from exc
-                        if not h3.controlled_storage_rejection_is_safely_retryable(
-                            request,
-                            legacy_attempt_sha256=(
-                                settings.h3_controlled_storage_retry_attempt_sha256
-                            ),
-                            legacy_evidence_sha256=(
-                                settings.h3_controlled_storage_retry_evidence_sha256
-                            ),
-                        ):
-                            raise HTTPException(
-                                status_code=409,
-                                detail="new client_request_id required",
-                            )
-                        updated = {
-                            **generation,
-                            "status": "queued",
-                            "error": None,
-                            "stage": "h3",
-                        }
-                        storage.update_meta(
-                            settings.data_dir, cid, generation=updated
+                        raise HTTPException(
+                            status_code=409,
+                            detail="new client_request_id required",
                         )
-                        background_tasks.add_task(
-                            _run_generation,
-                            settings,
-                            cid,
-                            source_request,
-                            "retry_controlled_storage",
-                        )
-                        return {
-                            "status": "queued",
-                            "attempt": generation.get("attempt"),
-                        }
                     if generation.get("error") not in {
                         "context_ir_result_invalid",
                         "context_ir_semantic_mismatch",
@@ -5541,41 +5426,9 @@ def create_app(settings: Settings) -> FastAPI:
             return JSONResponse(status_code=status_code, content=content)
         existing = meta.get("postprocess")
         if isinstance(existing, Mapping):
-            if existing.get("status") == "failed":
-                failed = next(
-                    (
-                        item for item in existing.get("segments", [])
-                        if isinstance(item, Mapping)
-                        and item.get("status") == "failed"
-                    ),
-                    None,
-                )
-                if isinstance(failed, Mapping):
-                    try:
-                        await postprocess.retry_segment(
-                            settings,
-                            cid,
-                            int(failed.get("index")),
-                            {
-                                "confirm": True,
-                                "expected_revision": failed.get("revision"),
-                            },
-                            postprocess_locks,
-                        )
-                    except (postprocess.PostprocessError, TypeError, ValueError):
-                        # Ambiguous and quality failures remain on the same
-                        # operation; this API never turns them into a new job.
-                        pass
-                    else:
-                        background_tasks.add_task(
-                            postprocess.run_task,
-                            settings,
-                            cid,
-                            mediakit_sem,
-                            seedream_sem,
-                            audit_runner=codex_runner,
-                            verification_runner=codex_runner,
-                        )
+            # Ordinary network replay is read-only.  Only the explicit segment
+            # retry endpoint, with confirm=true and expected_revision, may open
+            # a new revision and authorize another paid edge.
             current = storage.load_meta(settings.data_dir, cid) or meta
             status_code, content = _operation_view(
                 settings, cid, current, stage="postprocess"

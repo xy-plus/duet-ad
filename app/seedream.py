@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
 import cv2
@@ -50,6 +51,49 @@ def _atomic_json(path: Path, payload: dict) -> None:
         _fsync_dir(path.parent)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+def _claim_path(receipt_path: Path) -> Path:
+    """Return the permanent, request-bound paid-POST ownership record."""
+    return receipt_path.with_name(f"{receipt_path.name}.post-claim")
+
+
+def _exclusive_json(path: Path, payload: dict) -> bool:
+    """Create one durable JSON file exactly once across threads/processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_dir(path.parent)
+    except BaseException:
+        # The file is deliberately retained.  Once ownership may have been
+        # observed, deleting it could authorize a second paid POST.
+        raise
+    return True
+
+
+def _read_bound_claim(path: Path, request_sha256: str) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # The O_EXCL winner becomes visible before its fsync completes.  A
+        # concurrent reader (or a crashed writer) must conservatively treat
+        # that observation as ambiguous, never as permission to POST.
+        raise SeedreamError("submission_unknown") from None
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != 1
+        or value.get("request_sha256") != request_sha256
+        or value.get("kind") != "seedream_paid_post"
+    ):
+        raise SeedreamError("attempt_receipt_invalid")
+    return value
 
 
 def _fsync_dir(path: Path) -> None:
@@ -140,6 +184,18 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
     height, width = first.shape[:2]
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     input_shas = [hashlib.sha256(item).hexdigest() for item in images]
+    request_binding = {
+        "model": settings.seedream_model,
+        "mode": settings.seedream_edit_mode,
+        "prompt_sha256": prompt_sha,
+        "input_sha256": input_shas,
+    }
+    request_sha = hashlib.sha256(
+        json.dumps(
+            request_binding, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     base_receipt = {
         "version": 1, "status": "submitting", "attempt": 0,
         "model": settings.seedream_model, "mode": settings.seedream_edit_mode,
@@ -199,6 +255,40 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
             "succeeded", "response_received", "submitting", "submission_unknown", "failed",
         }:
             raise SeedreamError("attempt_receipt_invalid")
+    claim_path = _claim_path(receipt_path)
+    won_claim = _exclusive_json(claim_path, {
+        "version": 1,
+        "kind": "seedream_paid_post",
+        "request_sha256": request_sha,
+        "claimed_at_unix_ns": time.time_ns(),
+    })
+    if not won_claim:
+        _read_bound_claim(claim_path, request_sha)
+        # A missing receipt means the winner may have crashed after the
+        # durable claim and before/during POST.  Never infer "not submitted".
+        if not receipt_path.is_file():
+            raise SeedreamError("submission_unknown")
+        try:
+            existing = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise SeedreamError("attempt_receipt_invalid") from None
+        status = existing.get("status") if isinstance(existing, dict) else None
+        if status == "failed":
+            provider_code = existing.get("provider_error_code")
+            raise SeedreamError(
+                "provider_rejected",
+                provider_error_code=provider_code if isinstance(provider_code, str) else None,
+            )
+        if status in {"submitting", "submission_unknown"}:
+            raise SeedreamError("submission_unknown")
+        # A terminal local result can only have been missed if it appeared
+        # after the first replay check.  Re-enter the read-only replay path.
+        return await edit(
+            settings, images, prompt, out,
+            receipt_path=receipt_path,
+            transport=transport,
+            max_post_attempts=max_post_attempts,
+        )
     payload = {
         "model": settings.seedream_model,
         "prompt": prompt,

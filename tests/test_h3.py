@@ -2001,7 +2001,7 @@ def test_controlled_gateway_projection_rejects_source_symlink_and_drift(tmp_path
         h3._materialize_gateway_inputs(request)
 
 
-def test_exact_legacy_storage_rejection_appends_same_client_attempt(
+def test_exact_legacy_storage_rejection_never_reposts_same_client_request(
     tmp_path, monkeypatch,
 ):
     request = _controlled_multimodal_request(tmp_path, tmp_path / "controlled")
@@ -2031,29 +2031,24 @@ def test_exact_legacy_storage_rejection_appends_same_client_attempt(
             return httpx.Response(201, json={"task_id": "new-task"})
         return httpx.Response(200, json={"status": "failed"})
 
-    with _client(gateway) as client:
-        result = h3.retry_controlled_storage_rejection(
+    with _client(gateway) as client, pytest.raises(
+        h3.H3Error, match="new_client_request_id_required",
+    ):
+        h3.retry_controlled_storage_rejection(
             request,
             legacy_attempt_sha256=old_sha,
             legacy_evidence_sha256=evidence_sha,
             client=client,
         )
 
-    assert result.attempt_id == "000002"
     assert h3._attempt_path(request, "000001").read_bytes() == old_bytes
-    assert len([call for call in calls if call.method == "POST"]) == 1
-    posted = json.loads(next(call for call in calls if call.method == "POST").content)
-    assert all(
-        Path(path).resolve().is_relative_to(request.gateway_storage_root.resolve())
-        for path in posted["images"]
-    )
-    with pytest.raises(h3.H3Error, match="controlled_storage_retry_not_allowed"):
-        h3.retry_controlled_storage_rejection(
-            request,
-            legacy_attempt_sha256=old_sha,
-            legacy_evidence_sha256=evidence_sha,
-            client=httpx.Client(transport=httpx.MockTransport(gateway)),
-        )
+    assert not h3._attempt_path(request, "000002").exists()
+    assert [call for call in calls if call.method == "POST"] == []
+    assert h3.controlled_storage_rejection_is_safely_retryable(
+        request,
+        legacy_attempt_sha256=old_sha,
+        legacy_evidence_sha256=evidence_sha,
+    ) is False
 
 
 def test_timeout_get_only_resume_is_bound_to_latest_running_task(

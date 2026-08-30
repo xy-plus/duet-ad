@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
+import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -34,16 +37,13 @@ def _paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     return session, receipt, tmp_path / "out.png"
 
 
-def _valid_result(prompt: str, neutralized: str) -> dict:
+def _valid_result(prompt: str, neutralized: str, semantic_context=None) -> dict:
+    contract = seedream_recovery.freeze_semantic_contract(prompt, semantic_context)
     return {
         "version": 1,
         "original_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-        "neutralized_prompt": neutralized,
-        "protected_literals": seedream_recovery._protected_literals(prompt),
-        "semantic_fidelity": {
-            field: True for field in seedream_recovery._FIDELITY_FIELDS
-        },
-        "changes": [{"original": "激烈对抗", "neutralized": "克制互动"}],
+        "semantic_contract_sha256": contract["sha256"],
+        "neutralized_free_text": neutralized,
     }
 
 
@@ -95,7 +95,7 @@ def test_content_rejection_neutralizes_once_and_resubmits_once(
         output.write_bytes(b"png")
         return output
 
-    def neutralize(_settings, _session, prompt):
+    def neutralize(_settings, _session, prompt, _contract):
         codex_calls.append(prompt)
         return _valid_result(prompt, neutralized)
 
@@ -106,14 +106,20 @@ def test_content_rejection_neutralizes_once_and_resubmits_once(
         receipt_path=receipt, session_dir=session,
     ))
     assert result == out
-    assert provider_calls == [(original, None), (neutralized, 1)]
+    assert provider_calls[0] == (original, None)
+    assert provider_calls[1][1] == 1
+    assert provider_calls[1][0].startswith(neutralized)
+    assert "BACKEND_IMMUTABLE_SEMANTIC_CONTRACT" in provider_calls[1][0]
     assert codex_calls == [original]
     diagnostic = json.loads(
         receipt.with_name("0001-r1.neutralization.json").read_text(encoding="utf-8")
     )
     assert diagnostic["status"] == "succeeded"
     assert diagnostic["original_prompt_sha256"] == hashlib.sha256(original.encode()).hexdigest()
-    assert diagnostic["neutralized_prompt_sha256"] == hashlib.sha256(neutralized.encode()).hexdigest()
+    assert diagnostic["neutralized_free_text"] == neutralized
+    assert diagnostic["neutralized_prompt_sha256"] == hashlib.sha256(
+        provider_calls[1][0].encode()
+    ).hexdigest()
     assert diagnostic["codex_call"] == {
         "call_path": ["postprocess", "seedream", "0001-r1", "neutralize"],
         "model": "gpt-5.6-luna",
@@ -197,7 +203,8 @@ def test_codex_failure_keeps_original_provider_rejection_and_never_retries(
     diagnostic = json.loads(
         receipt.with_name("0001-r1.neutralization.json").read_text(encoding="utf-8")
     )
-    assert diagnostic["status"] == "codex_failed"
+    assert diagnostic["status"] == "failed"
+    assert diagnostic["stage"] == "codex"
     assert diagnostic["codex_error"]["type"] == "RuntimeError"
     with pytest.raises(seedream.SeedreamError):
         asyncio.run(seedream_recovery.edit_with_content_recovery(
@@ -223,7 +230,7 @@ def test_recovery_receipt_failure_never_masks_original_provider_rejection(
         raise OSError("disk failure")
 
     monkeypatch.setattr(seedream, "edit", rejected)
-    monkeypatch.setattr(seedream_recovery, "_write_recovery", cannot_write)
+    monkeypatch.setattr(seedream, "_exclusive_json", cannot_write)
     monkeypatch.setattr(
         seedream_recovery, "_run_codex",
         lambda *_args: pytest.fail("must not invoke Codex without a durable budget receipt"),
@@ -246,18 +253,45 @@ def test_schema_preserves_all_semantic_contract_fields_and_stable_literals() -> 
         '主体A对主体B克制互动，先靠近再停下；镜头固定。'
         '"scene_id":"scene-001","source_sha256":"' + "a" * 64 + '" @asset/hero'
     )
-    value = _valid_result(original, neutralized)
+    semantic_context = {
+        "entities": [
+            {"stable_key": "主体A", "count": 1},
+            {"stable_key": "主体B", "count": 1},
+        ],
+        "relations": [{
+            "subject_key": "主体A", "predicate": "approaches",
+            "object_key": "主体B", "order": 1,
+        }],
+        "camera": {"composition": "fixed"},
+    }
+    contract = seedream_recovery.freeze_semantic_contract(original, semantic_context)
+    value = _valid_result(original, neutralized, semantic_context)
     parsed = seedream_recovery._validate_output(
-        json.dumps(value, ensure_ascii=False).encode(), original_prompt=original,
+        json.dumps(value, ensure_ascii=False).encode(),
+        original_prompt=original, semantic_contract=contract,
     )
-    assert set(parsed["semantic_fidelity"]) == seedream_recovery._FIDELITY_FIELDS
-    assert parsed["protected_literals"] == ["@asset/hero", "a" * 64, "scene-001"]
+    assert parsed["semantic_contract_sha256"] == contract["sha256"]
+    assert contract["protected_literals"] == ["@asset/hero", "a" * 64, "scene-001"]
+    assert contract["structured_semantics"]["relations"][0] == {
+        "object_key": "主体B", "order": 1, "predicate": "approaches",
+        "subject_key": "主体A",
+    }
     damaged = json.loads(json.dumps(value))
-    damaged["neutralized_prompt"] = neutralized.replace("scene-001", "scene-002")
-    with pytest.raises(ValueError, match="stable binding"):
+    damaged["semantic_contract_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="immutable input"):
         seedream_recovery._validate_output(
             json.dumps(damaged).encode(), original_prompt=original,
+            semantic_contract=contract,
         )
+    published = seedream_recovery._inject_semantic_contract(
+        "仅保留克制互动，不写数量或关系", contract,
+    )
+    # Even a non-literal deletion cannot remove direction, quantity, bindings,
+    # camera or environment: the backend reconstructs the authoritative block.
+    assert '"count":1' in published
+    assert '"predicate":"approaches"' in published
+    assert '"subject_key":"主体A"' in published
+    assert '"object_key":"主体B"' in published
 
 
 def test_neutralizer_runner_explicitly_uses_luna_max(tmp_path: Path) -> None:
@@ -324,3 +358,190 @@ def test_neutralized_seedream_budget_hard_caps_provider_post_to_one(
         ))
     assert caught.value.code == "provider_rejected"
     assert calls == 1
+
+
+def test_seedream_paid_receipt_has_one_cross_thread_post_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARK_API_KEY", "secret")
+    calls = 0
+    calls_lock = threading.Lock()
+    start = threading.Barrier(2)
+    encoded = __import__("base64").b64encode(_png()).decode()
+
+    async def handler(_request):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        await asyncio.sleep(0.1)
+        return httpx.Response(200, json={"data": [{"b64_json": encoded}]})
+
+    transport = httpx.MockTransport(handler)
+    receipt = tmp_path / "attempt.json"
+    output = tmp_path / "output.png"
+
+    def invoke():
+        start.wait()
+        try:
+            return asyncio.run(seedream.edit(
+                _settings(tmp_path), [_png()], "same frozen prompt", output,
+                receipt_path=receipt, transport=transport,
+            ))
+        except seedream.SeedreamError as exc:
+            return exc.code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _item: invoke(), range(2)))
+
+    assert calls == 1
+    assert output in outcomes
+    assert set(item for item in outcomes if isinstance(item, str)) <= {"submission_unknown"}
+    assert json.loads(receipt.read_text())["status"] == "succeeded"
+    assert seedream._claim_path(receipt).is_file()
+
+    # A network replay is strictly local and cannot issue another POST.
+    assert asyncio.run(seedream.edit(
+        _settings(tmp_path), [_png()], "same frozen prompt", output,
+        receipt_path=receipt, transport=transport,
+    )) == output
+    assert calls == 1
+
+
+def test_neutralization_claim_caps_codex_and_retry_post_across_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARK_API_KEY", "secret")
+    session = tmp_path / "conversation"
+    attempts = session / "work" / ".postprocess-private" / "0" / "attempts"
+    attempts.mkdir(parents=True)
+    receipt = attempts / "0001-r1.json"
+    output = session / "output.png"
+    original = "两件玩具激烈碰撞"
+    neutral = "两件玩具轻柔接触"
+    context = {
+        "entities": [
+            {"stable_key": "toy-a", "count": 1},
+            {"stable_key": "toy-b", "count": 1},
+        ],
+        "relations": [{
+            "subject_key": "toy-a", "predicate": "contacts",
+            "object_key": "toy-b", "order": 1,
+        }],
+    }
+    post_prompts: list[str] = []
+    post_lock = threading.Lock()
+    start = threading.Barrier(2)
+    codex_calls = 0
+    codex_lock = threading.Lock()
+    encoded = __import__("base64").b64encode(_png()).decode()
+
+    async def handler(request):
+        prompt = json.loads(request.content)["prompt"]
+        with post_lock:
+            post_prompts.append(prompt)
+        await asyncio.sleep(0.08)
+        if prompt == original:
+            return httpx.Response(400, json={
+                "error": {"code": "InputTextSensitiveContentDetected"},
+            })
+        return httpx.Response(200, json={"data": [{"b64_json": encoded}]})
+
+    def neutralize(_settings, _session, prompt, contract):
+        nonlocal codex_calls
+        with codex_lock:
+            codex_calls += 1
+        time.sleep(0.08)
+        return {
+            "version": 1,
+            "original_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "semantic_contract_sha256": contract["sha256"],
+            "neutralized_free_text": neutral,
+        }
+
+    monkeypatch.setattr(seedream_recovery, "_run_codex", neutralize)
+    transport = httpx.MockTransport(handler)
+
+    def invoke():
+        start.wait()
+        try:
+            return asyncio.run(seedream_recovery.edit_with_content_recovery(
+                _settings(tmp_path), [_png()], original, output,
+                receipt_path=receipt, session_dir=session,
+                semantic_context=context, transport=transport,
+            ))
+        except seedream.SeedreamError as exc:
+            return exc.code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _item: invoke(), range(2)))
+
+    assert codex_calls == 1
+    assert len(post_prompts) == 2
+    assert post_prompts.count(original) == 1
+    neutralized_posts = [item for item in post_prompts if item != original]
+    assert len(neutralized_posts) == 1
+    assert '"count":1' in neutralized_posts[0]
+    assert '"predicate":"contacts"' in neutralized_posts[0]
+    assert output in outcomes
+
+    # Replay after both receipts settle is entirely local.
+    assert asyncio.run(seedream_recovery.edit_with_content_recovery(
+        _settings(tmp_path), [_png()], original, output,
+        receipt_path=receipt, session_dir=session,
+        semantic_context=context, transport=transport,
+    )) == output
+    assert codex_calls == 1
+    assert len(post_prompts) == 2
+
+    # A crash after the neutralized provider receipt settles but before the
+    # diagnostic terminal update is repaired from local bytes, not reposted.
+    diagnostic = receipt.with_name("0001-r1.neutralization.json")
+    crashed = json.loads(diagnostic.read_text())
+    crashed.update(status="submission_unknown", stage="provider_retry")
+    seedream._atomic_json(diagnostic, crashed)
+    output.unlink()
+    assert asyncio.run(seedream_recovery.edit_with_content_recovery(
+        _settings(tmp_path), [_png()], original, output,
+        receipt_path=receipt, session_dir=session,
+        semantic_context=context, transport=transport,
+    )) == output
+    assert len(post_prompts) == 2
+    assert json.loads(diagnostic.read_text())["status"] == "succeeded"
+
+
+def test_crashed_codex_claim_stays_submission_unknown_without_new_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, receipt, out = _paths(tmp_path)
+    prompt = "激烈对抗"
+    contract = seedream_recovery.freeze_semantic_contract(prompt, None)
+    diagnostic = receipt.with_name("0001-r1.neutralization.json")
+    seedream._exclusive_json(diagnostic, {
+        "version": 1,
+        "status": "submission_unknown",
+        "stage": "codex",
+        "original_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "semantic_contract_sha256": contract["sha256"],
+    })
+    provider_calls = 0
+
+    async def original_replay(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise seedream.SeedreamError(
+            "provider_rejected",
+            provider_error_code="InputTextSensitiveContentDetected",
+        )
+
+    monkeypatch.setattr(seedream, "edit", original_replay)
+    monkeypatch.setattr(
+        seedream_recovery, "_run_codex",
+        lambda *_args: pytest.fail("crashed claim must never rerun Codex"),
+    )
+    with pytest.raises(seedream.SeedreamError) as caught:
+        asyncio.run(seedream_recovery.edit_with_content_recovery(
+            _settings(tmp_path), [b"image"], prompt, out,
+            receipt_path=receipt, session_dir=session,
+        ))
+    assert caught.value.code == "submission_unknown"
+    assert provider_calls == 1  # receipt inspection mock, not a new real POST

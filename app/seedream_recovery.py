@@ -1,8 +1,9 @@
-"""One-shot Codex neutralization after an explicit Seedream policy rejection.
+"""One-shot, receipt-bound neutralization after a Seedream policy rejection.
 
-This is an error-recovery middleware around the existing Seedream call.  It does
-not add a pipeline node: the same image-edit node either returns its normal
-output or closes with the original provider rejection and durable diagnostics.
+The Codex process may rewrite only free text.  Structural semantics are frozen
+by the backend, SHA-bound to the Codex response, and injected by the backend
+after validation.  Durable exclusive claims make both Codex and provider
+budgets single-winner across threads and processes.
 """
 
 from __future__ import annotations
@@ -12,7 +13,9 @@ import hashlib
 import json
 import re
 import tempfile
+import time
 from pathlib import Path
+from typing import Any, Mapping
 
 from app import error_trace, seedream
 from app.codex_runner import CodexRunner
@@ -26,22 +29,25 @@ CONTENT_REJECTION_CODES = frozenset({
     "OutputImageSensitiveContentDetected",
 })
 _MAX_OUTPUT_BYTES = 128 * 1024
-_FIDELITY_FIELDS = frozenset({
-    "subject_stable_keys",
-    "subject_object_relations",
-    "action_phases_and_causality",
-    "composition_and_camera",
-    "environment",
-    "chronology",
-    "dialogue_boundaries",
-    "material_bindings",
-})
 _JSON_BINDING_RE = re.compile(
     r'"(?:person_id|entity_id|scene_id|frame_id|source_sha256|frame_name|asset_id|'
     r'material_id|stable_key|binding_key)"\s*:\s*"([^"\\]{1,256})"'
 )
 _MENTION_RE = re.compile(r"@[A-Za-z0-9_.:/-]{1,256}")
 _SHA_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
+_SEMANTIC_KEY_RE = re.compile(
+    r"(?:stable|person|entity|scene|frame|asset|material|binding|tile|relation|"
+    r"subject|predicate|object|action|phase|caus|chronolog|timeline|timing|"
+    r"transition|order|sequence|count|quantity|number|composition|camera|"
+    r"layout|geometry|position|environment|background|setting|source)",
+    re.IGNORECASE,
+)
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
 
 
 def _sha256(text: str) -> str:
@@ -54,7 +60,56 @@ def _protected_literals(prompt: str) -> list[str]:
     return sorted(set(values))
 
 
-def _validate_output(raw: bytes, *, original_prompt: str) -> dict:
+def _semantic_projection(value: object, *, path: str = "$") -> object | None:
+    """Keep existing structured semantic fields without asking a model to judge them."""
+    if isinstance(value, Mapping):
+        projected: dict[str, object] = {}
+        for raw_key in sorted(value, key=str):
+            if not isinstance(raw_key, str):
+                continue
+            child = value[raw_key]
+            child_path = f"{path}.{raw_key}"
+            nested = _semantic_projection(child, path=child_path)
+            if _SEMANTIC_KEY_RE.search(raw_key) or nested not in (None, {}, []):
+                projected[raw_key] = child if _SEMANTIC_KEY_RE.search(raw_key) else nested
+        return projected or None
+    if isinstance(value, (list, tuple)):
+        projected_items = [
+            item for index, raw in enumerate(value)
+            if (item := _semantic_projection(raw, path=f"{path}[{index}]")) is not None
+        ]
+        return projected_items or None
+    return None
+
+
+def freeze_semantic_contract(
+    original_prompt: str,
+    semantic_context: Mapping[str, Any] | None,
+) -> dict:
+    """Build the immutable backend authority injected after neutralization."""
+    if not isinstance(original_prompt, str) or not original_prompt:
+        raise ValueError("invalid original prompt")
+    if semantic_context is not None and not isinstance(semantic_context, Mapping):
+        raise ValueError("invalid semantic context")
+    projection = _semantic_projection(dict(semantic_context or {})) or {}
+    payload = {
+        "version": 1,
+        "original_prompt_sha256": _sha256(original_prompt),
+        "protected_literals": _protected_literals(original_prompt),
+        "structured_semantics": projection,
+    }
+    encoded = _canonical_json(payload).encode("utf-8")
+    if len(encoded) > 256 * 1024:
+        raise ValueError("semantic contract is too large")
+    return {**payload, "sha256": hashlib.sha256(encoded).hexdigest()}
+
+
+def _validate_output(
+    raw: bytes,
+    *,
+    original_prompt: str,
+    semantic_contract: Mapping[str, Any],
+) -> dict:
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -62,70 +117,51 @@ def _validate_output(raw: bytes, *, original_prompt: str) -> dict:
     if not isinstance(value, dict) or set(value) != {
         "version",
         "original_prompt_sha256",
-        "neutralized_prompt",
-        "protected_literals",
-        "semantic_fidelity",
-        "changes",
+        "semantic_contract_sha256",
+        "neutralized_free_text",
     }:
         raise ValueError("neutralization output has unexpected fields")
-    if value["version"] != 1 or value["original_prompt_sha256"] != _sha256(original_prompt):
-        raise ValueError("neutralization output is not bound to its input")
-    neutralized = value["neutralized_prompt"]
+    if (
+        value["version"] != 1
+        or value["original_prompt_sha256"] != _sha256(original_prompt)
+        or value["semantic_contract_sha256"] != semantic_contract.get("sha256")
+    ):
+        raise ValueError("neutralization output is not bound to immutable input")
+    neutralized = value["neutralized_free_text"]
     if (
         not isinstance(neutralized, str)
         or not neutralized.strip()
         or len(neutralized.encode("utf-8")) > 64 * 1024
         or neutralized == original_prompt
     ):
-        raise ValueError("neutralized_prompt violates the string contract")
-    protected = _protected_literals(original_prompt)
-    if value["protected_literals"] != protected:
-        raise ValueError("protected literal ledger does not match the input")
-    if any(literal not in neutralized for literal in protected):
-        raise ValueError("neutralized_prompt changed a stable binding")
-    fidelity = value["semantic_fidelity"]
-    if (
-        not isinstance(fidelity, dict)
-        or set(fidelity) != _FIDELITY_FIELDS
-        or any(item is not True for item in fidelity.values())
-    ):
-        raise ValueError("semantic fidelity contract is incomplete")
-    changes = value["changes"]
-    if not isinstance(changes, list) or not 1 <= len(changes) <= 64:
-        raise ValueError("neutralization change ledger is invalid")
-    for change in changes:
-        if not isinstance(change, dict) or set(change) != {"original", "neutralized"}:
-            raise ValueError("neutralization change entry is invalid")
-        before = change["original"]
-        after = change["neutralized"]
-        if (
-            not isinstance(before, str)
-            or not isinstance(after, str)
-            or not before
-            or not after
-            or before == after
-            or before not in original_prompt
-            or after not in neutralized
-        ):
-            raise ValueError("neutralization change entry is not evidenced")
+        raise ValueError("neutralized_free_text violates the string contract")
     return value
 
 
-def _neutralization_prompt(input_name: str, protected: list[str]) -> str:
-    fidelity = ", ".join(sorted(_FIDELITY_FIELDS))
-    return f"""你是供应商内容审核拒绝后的提示词中性化器。只处理 {input_name} 中的 original_prompt。
+def _inject_semantic_contract(free_text: str, contract: Mapping[str, Any]) -> str:
+    # The model never authors this block.  It is always reconstructed from the
+    # frozen backend value, so deletion/reversal/count drift is mechanically
+    # corrected before the one authorized provider retry.
+    return (
+        f"{free_text.strip()}\n\n"
+        "[BACKEND_IMMUTABLE_SEMANTIC_CONTRACT; authoritative; preserve exactly]\n"
+        f"semantic_contract_sha256={contract['sha256']}\n"
+        f"semantic_contract={_canonical_json(contract)}"
+    )
 
-目标：只把可能触发供应商内容审核的措辞改成客观、中性、非煽动的视觉表达，并最大限度逐字保留原语义。不得删除关键语义，不得新增人物、实体、动作、因果、镜头、环境、时序、台词或故事。主体 stable key、关系的主客体与方向、动作阶段和因果、构图、机位、环境、时间顺序、台词边界、素材绑定必须保持。素材引用和 protected_literals 必须逐字保留。
 
-输出且仅输出一个 JSON 对象，禁止 Markdown 或解释。字段必须恰好是：
+def _neutralization_prompt(input_name: str) -> str:
+    return f"""你是供应商内容审核拒绝后的提示词中性化器。读取 {input_name}。
+
+你只能修改 original_free_text 中可能触发审核的自由措辞，使其客观、中性、非煽动。semantic_contract 是后端冻结的只读权威语义，禁止改写、删减、概括或自行判断是否保持；后端会独立注入并校验它。不得新增故事或元素。
+
+输出且仅输出一个 JSON 对象，字段必须恰好为：
 - version: 1
-- original_prompt_sha256: 原输入中的值
-- neutralized_prompt: 完整的中性化提示词；不得与原文相同
-- protected_literals: 原样返回输入数组（当前为 {json.dumps(protected, ensure_ascii=False)}）
-- semantic_fidelity: 恰好包含 {fidelity}，每项仅当确实保持时写 true
-- changes: 1 到 64 个对象，每项字段恰为 original 和 neutralized；两段都必须逐字出现在各自完整提示词中，仅记录必要措辞替换
+- original_prompt_sha256: 原样返回输入值
+- semantic_contract_sha256: 原样返回输入值
+- neutralized_free_text: 中性化后的完整自由文本，且不得与原文相同
 
-如果无法在不改变关键语义的前提下中性化，也不要编造或删减；进程应失败而不是发布不忠实输出。"""
+无法只改自由措辞时进程失败，不得伪造合同或自报语义一致。"""
 
 
 def _diagnostic_path(receipt_path: Path) -> Path:
@@ -156,7 +192,7 @@ def _try_write_recovery(path: Path, payload: dict) -> bool:
         return False
 
 
-def _load_recovery(path: Path, original_sha: str) -> dict | None:
+def _load_recovery(path: Path, original_sha: str, contract_sha: str) -> dict | None:
     if not path.is_file():
         return None
     try:
@@ -167,26 +203,28 @@ def _load_recovery(path: Path, original_sha: str) -> dict | None:
         not isinstance(value, dict)
         or value.get("version") != 1
         or value.get("original_prompt_sha256") != original_sha
+        or value.get("semantic_contract_sha256") != contract_sha
     ):
         raise ValueError("neutralization receipt is not bound to the prompt")
     return value
 
 
-def _validated_recovery_output(recovery: dict, original_prompt: str) -> dict:
+def _validated_recovery_output(
+    recovery: dict,
+    original_prompt: str,
+    semantic_contract: Mapping[str, Any],
+) -> dict:
     contract = {
         key: recovery.get(key)
         for key in (
-            "version",
-            "original_prompt_sha256",
-            "neutralized_prompt",
-            "protected_literals",
-            "semantic_fidelity",
-            "changes",
+            "version", "original_prompt_sha256", "semantic_contract_sha256",
+            "neutralized_free_text",
         )
     }
     return _validate_output(
-        json.dumps(contract, ensure_ascii=False).encode("utf-8"),
+        _canonical_json(contract).encode("utf-8"),
         original_prompt=original_prompt,
+        semantic_contract=semantic_contract,
     )
 
 
@@ -194,24 +232,19 @@ def _run_codex(
     settings: Settings,
     session_dir: Path,
     original_prompt: str,
+    semantic_contract: Mapping[str, Any],
 ) -> dict:
-    protected = _protected_literals(original_prompt)
-    with tempfile.TemporaryDirectory(
-        prefix="seedream-neutralize-", dir="/tmp"
-    ) as temporary:
+    with tempfile.TemporaryDirectory(prefix="seedream-neutralize-", dir="/tmp") as temporary:
         stage = Path(temporary).resolve()
         input_path = stage / "input.json"
         input_path.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "original_prompt_sha256": _sha256(original_prompt),
-                    "original_prompt": original_prompt,
-                    "protected_literals": protected,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps({
+                "version": 1,
+                "original_prompt_sha256": _sha256(original_prompt),
+                "semantic_contract_sha256": semantic_contract["sha256"],
+                "original_free_text": original_prompt,
+                "semantic_contract": semantic_contract,
+            }, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         runner = CodexRunner(
@@ -222,12 +255,14 @@ def _run_codex(
         )
         return runner.run_isolated_until_output(
             stage,
-            _neutralization_prompt(input_path.name, protected),
+            _neutralization_prompt(input_path.name),
             session_dir=session_dir,
             output_path=stage / "output.json",
             max_output_bytes=_MAX_OUTPUT_BYTES,
             validate_output=lambda raw: _validate_output(
-                raw, original_prompt=original_prompt,
+                raw,
+                original_prompt=original_prompt,
+                semantic_contract=semantic_contract,
             ),
         )
 
@@ -240,17 +275,16 @@ async def edit_with_content_recovery(
     *,
     receipt_path: Path,
     session_dir: Path,
+    semantic_context: Mapping[str, Any] | None = None,
     transport=None,
 ) -> Path:
-    """Run Seedream and permit exactly one policy-neutralized resubmission."""
+    """Run Seedream and permit exactly one contract-bound neutralized POST."""
     original_error: seedream.SeedreamError | None = None
-    first_kwargs = {"receipt_path": receipt_path}
-    if transport is not None:
-        first_kwargs["transport"] = transport
     try:
         return await seedream.edit(
             settings, images, prompt, out,
-            **first_kwargs,
+            receipt_path=receipt_path,
+            **({"transport": transport} if transport is not None else {}),
         )
     except seedream.SeedreamError as caught:
         if (
@@ -268,92 +302,131 @@ async def edit_with_content_recovery(
         receipt.relative_to(session)
         if not session.is_dir() or not receipt.is_file():
             raise OSError
+        semantic_contract = freeze_semantic_contract(prompt, semantic_context)
     except (OSError, ValueError):
         raise original_error
 
     original_sha = _sha256(prompt)
+    contract_sha = semantic_contract["sha256"]
     diagnostic = _diagnostic_path(receipt)
     retry_receipt = _retry_receipt_path(receipt)
+    initial = {
+        "version": 1,
+        # Persist uncertainty before starting Codex.  A process crash can
+        # therefore never reopen its one-shot budget.
+        "status": "submission_unknown",
+        "stage": "codex",
+        "original_prompt_sha256": original_sha,
+        "semantic_contract_sha256": contract_sha,
+        "neutralized_prompt_sha256": None,
+        "provider_error_codes": [original_error.provider_error_code],
+        "provider_error_traces": [str(
+            receipt.with_suffix(".error.json").relative_to(session)
+        )],
+        "codex_call": {
+            "call_path": ["postprocess", "seedream", receipt.stem, "neutralize"],
+            "model": MODEL,
+            "reasoning_effort": REASONING_EFFORT,
+            "attempt": 1,
+        },
+        "claimed_at_unix_ns": time.time_ns(),
+    }
     try:
-        recovery = _load_recovery(diagnostic, original_sha)
+        recovery = _load_recovery(diagnostic, original_sha, contract_sha)
     except ValueError:
-        raise original_error
+        raise seedream.SeedreamError("submission_unknown") from None
     if recovery is None:
-        recovery = {
-            "version": 1,
-            "status": "codex_running",
-            "original_prompt_sha256": original_sha,
-            "neutralized_prompt_sha256": None,
-            "provider_error_codes": [original_error.provider_error_code],
-            "provider_error_traces": [str(
-                receipt.with_suffix(".error.json").relative_to(session)
-            )],
-            "codex_call": {
-                "call_path": ["postprocess", "seedream", receipt.stem, "neutralize"],
-                "model": MODEL,
-                "reasoning_effort": REASONING_EFFORT,
-                "attempt": 1,
-            },
-        }
-        if not _try_write_recovery(diagnostic, recovery):
-            raise original_error
         try:
-            result = await asyncio.to_thread(_run_codex, settings, session, prompt)
-        except Exception as codex_error:
+            won_codex = seedream._exclusive_json(diagnostic, initial)
+        except Exception:
+            raise original_error
+        if not won_codex:
+            try:
+                recovery = _load_recovery(diagnostic, original_sha, contract_sha)
+            except ValueError:
+                raise seedream.SeedreamError("submission_unknown") from None
+        else:
+            recovery = initial
+            try:
+                result = await asyncio.to_thread(
+                    _run_codex, settings, session, prompt, semantic_contract,
+                )
+            except Exception as codex_error:
+                recovery.update(
+                    status="failed",
+                    stage="codex",
+                    codex_error=error_trace.exception_tree(codex_error),
+                )
+                _try_write_recovery(diagnostic, recovery)
+                raise original_error
+            free_text = result["neutralized_free_text"]
+            neutralized = _inject_semantic_contract(free_text, semantic_contract)
             recovery.update(
-                status="codex_failed",
-                codex_error=error_trace.exception_tree(codex_error),
+                status="neutralized_prompt_ready",
+                stage="provider_retry",
+                neutralized_free_text=free_text,
+                neutralized_prompt=neutralized,
+                neutralized_prompt_sha256=_sha256(neutralized),
             )
-            _try_write_recovery(diagnostic, recovery)
-            raise original_error
-        neutralized = result["neutralized_prompt"]
-        recovery.update(
-            status="neutralized_prompt_ready",
-            neutralized_prompt=neutralized,
-            neutralized_prompt_sha256=_sha256(neutralized),
-            semantic_fidelity=result["semantic_fidelity"],
-            protected_literals=result["protected_literals"],
-            changes=result["changes"],
-        )
-        if not _try_write_recovery(diagnostic, recovery):
-            raise original_error
-    elif recovery.get("status") in {
-        "codex_running", "codex_failed", "provider_rejected",
-    }:
+            if not _try_write_recovery(diagnostic, recovery):
+                raise original_error
+
+    assert recovery is not None
+    if (
+        recovery.get("status") == "submission_unknown"
+        and recovery.get("stage") != "provider_retry"
+    ):
+        raise seedream.SeedreamError("submission_unknown")
+    if recovery.get("status") == "failed":
         raise original_error
+    if recovery.get("status") == "provider_rejected":
+        codes = recovery.get("provider_error_codes")
+        provider_code = codes[-1] if isinstance(codes, list) and codes else None
+        raise seedream.SeedreamError(
+            "provider_rejected",
+            provider_error_code=provider_code if isinstance(provider_code, str) else None,
+        )
     try:
-        neutralized = _validated_recovery_output(recovery, prompt)["neutralized_prompt"]
+        validated = _validated_recovery_output(recovery, prompt, semantic_contract)
+        neutralized = _inject_semantic_contract(
+            validated["neutralized_free_text"], semantic_contract,
+        )
     except (TypeError, ValueError, json.JSONDecodeError):
         raise original_error
-    if recovery.get("neutralized_prompt_sha256") != _sha256(neutralized):
+    if (
+        recovery.get("neutralized_prompt") != neutralized
+        or recovery.get("neutralized_prompt_sha256") != _sha256(neutralized)
+    ):
         raise original_error
 
-    retry_kwargs = {
-        "receipt_path": retry_receipt,
-        "max_post_attempts": 1,
-    }
-    if transport is not None:
-        retry_kwargs["transport"] = transport
     try:
         result_path = await seedream.edit(
             settings, images, neutralized, out,
-            **retry_kwargs,
+            receipt_path=retry_receipt,
+            max_post_attempts=1,
+            **({"transport": transport} if transport is not None else {}),
         )
     except seedream.SeedreamError as retry_error:
-        if retry_error.code == "provider_rejected":
-            codes = list(recovery.get("provider_error_codes") or [])
+        codes = list(recovery.get("provider_error_codes") or [])
+        if retry_error.provider_error_code is not None:
             codes.append(retry_error.provider_error_code)
-            traces = list(recovery.get("provider_error_traces") or [])
-            traces.append(str(
-                retry_receipt.with_suffix(".error.json").relative_to(session)
-            ))
-            recovery.update(
-                status="provider_rejected",
-                provider_error_codes=codes,
-                provider_error_traces=traces,
-            )
-            _try_write_recovery(diagnostic, recovery)
+        traces = list(recovery.get("provider_error_traces") or [])
+        traces.append(str(retry_receipt.with_suffix(".error.json").relative_to(session)))
+        recovery.update(
+            status=(
+                "provider_rejected"
+                if retry_error.code == "provider_rejected"
+                else "submission_unknown"
+                if retry_error.code == "submission_unknown"
+                else "failed"
+            ),
+            stage="provider_retry",
+            provider_error_codes=codes,
+            provider_error_traces=traces,
+            retry_error_code=retry_error.code,
+        )
+        _try_write_recovery(diagnostic, recovery)
         raise
-    recovery["status"] = "succeeded"
+    recovery.update(status="succeeded", stage="done")
     _try_write_recovery(diagnostic, recovery)
     return result_path
