@@ -30,11 +30,12 @@ def _run_contract(expression: str):
     return json.loads(completed.stdout)
 
 
-def test_success_operation_has_one_truthful_nine_stage_timeline():
+def test_success_operation_has_one_truthful_ten_stage_timeline():
     result = _run_contract(
         "(()=>{const detail={id:'conversation-12345678',has_source:true,status:'done',"
         "created_at:'2026-08-30T00:00:00Z',updated_at:'2026-08-30T00:03:00Z',"
-        "duration_s:20,has_video:true,segments:["
+        "duration_s:20,has_video:true,"
+        "dialogue_review:{status:'frozen',frozen_by:'automatic',revision:1},segments:["
         "{index:1,start_s:0,end_s:10,keyframes:['01.png','02.png']},"
         "{index:2,start_s:10,end_s:20,keyframes:['01.png','02.png']}],"
         "postprocess:{status:'done',segments:["
@@ -47,9 +48,9 @@ def test_success_operation_has_one_truthful_nine_stage_timeline():
         "counts:model.stages.map(x=>x.count),current:model.current.key,elapsed:model.elapsed};})()"
     )
     assert result == {
-        "keys": ["source", "analysis", "index", "image", "fusion", "context", "h3", "stitch", "output"],
-        "statuses": ["done"] * 9,
-        "counts": ["", "", "4 帧", "4/4 帧", "2/2 段", "", "2/2 段", "2 段", "可播放"],
+        "keys": ["source", "analysis", "dialogue-review", "index", "image", "fusion", "context", "h3", "stitch", "output"],
+        "statuses": ["done"] * 10,
+        "counts": ["", "", "v1", "4 帧", "4/4 帧", "2/2 段", "", "2/2 段", "2 段", "可播放"],
         "current": "output",
         "elapsed": "已耗时 3分 00秒",
     }
@@ -152,7 +153,7 @@ def test_persistent_header_history_and_unambiguous_cost_copy_are_shipped():
     assert 'id="operation-status"' in html
     assert 'aria-live="polite"' in html
     assert ".operation-timeline" in css
-    assert "repeat(9" in css
+    assert "repeat(10" in css
     for token in ("conv-thumb", "conv-id", "conv-output", "成片已提交", "等待成片"):
         assert token in js
     for copy in (

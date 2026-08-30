@@ -1,0 +1,189 @@
+import json
+
+from test_legacy_phase2_frame_viewer import _run_jsdom_contract
+from test_web_h3_contract import APP_JS, _run_contract
+
+
+INDEX_HTML = APP_JS.parent / "index.html"
+STYLES = APP_JS.parent / "styles.css"
+
+
+def _capability(**overrides):
+    value = {
+        "supported": True,
+        "create_field": "dialogue_review_policy",
+        "policies": ["auto_continue", "review_required"],
+        "default": "auto_continue",
+        "commit_path": "/api/conversations/{id}/dialogue-review/commit",
+    }
+    value.update(overrides)
+    return {"dialogue_review": value}
+
+
+def _review(status="waiting", **overrides):
+    value = {
+        "version": 1,
+        "policy": "review_required",
+        "status": status,
+        "outcome": "recognized",
+        "revision": 1,
+        "machine_lines": [
+            {"text": "机器稿", "start_s": 0.2, "end_s": 1.1}
+        ],
+        "machine_sha256": "a" * 64,
+        "lines": [{"text": "机器稿", "start_s": 0.2, "end_s": 1.1}],
+        "sha256": "b" * 64,
+        "frozen_by": None if status == "waiting" else "user",
+        "editable": status == "waiting",
+    }
+    value.update(overrides)
+    return value
+
+
+def test_capability_is_exact_and_unknown_contract_never_enables_post():
+    good = _capability()
+    result = _run_contract(
+        "(()=>{const good=" + json.dumps(good) + ";return {"
+        "good:contract.normalizeDialogueReviewCapability(good),"
+        "unsupported:contract.normalizeDialogueReviewCapability({dialogue_review:{...good.dialogue_review,supported:false}}),"
+        "wrongField:contract.normalizeDialogueReviewCapability({dialogue_review:{...good.dialogue_review,create_field:'other'}}),"
+        "extraPolicy:contract.normalizeDialogueReviewCapability({dialogue_review:{...good.dialogue_review,policies:[...good.dialogue_review.policies,'other']}})}})()"
+    )
+    assert result["good"] == good["dialogue_review"]
+    assert result["unsupported"] is None
+    assert result["wrongField"] is None
+    assert result["extraPolicy"] is None
+
+
+def test_create_policy_defaults_auto_and_is_sent_only_for_supported_auto_mode():
+    capability = _capability()["dialogue_review"]
+    result = _run_contract(
+        "(()=>{const capability=" + json.dumps(capability) + ";return {"
+        "auto:contract.buildDialogueReviewCreateField(capability,'auto_continue','auto'),"
+        "review:contract.buildDialogueReviewCreateField(capability,'review_required','auto'),"
+        "none:contract.buildDialogueReviewCreateField(capability,'review_required','none'),"
+        "unsupported:contract.buildDialogueReviewCreateField({...capability,supported:false},'review_required','auto')}})()"
+    )
+    assert result["auto"] == {
+        "name": "dialogue_review_policy",
+        "value": "auto_continue",
+    }
+    assert result["review"] == {
+        "name": "dialogue_review_policy",
+        "value": "review_required",
+    }
+    assert result["none"] is None
+    assert result["unsupported"] is None
+
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    auto = html.split('name="dialogue-review-policy" value="auto_continue"', 1)[1]
+    assert "checked" in auto.split(">", 1)[0]
+    assert "自动识别并继续" in html
+    assert "暂停校对台词" in html
+
+
+def test_commit_payload_is_exact_cas_and_does_not_invent_asr_metadata():
+    review = _review()
+    result = _run_contract(
+        "(()=>{const review=" + json.dumps(review) + ";return {"
+        "payload:contract.buildDialogueReviewCommitPayload(review,review.lines,'dialogue-review-0001'),"
+        "view:contract.dialogueReviewView({dialogue_review:review})}})()"
+    )
+    assert result["payload"] == {
+        "confirm": True,
+        "client_request_id": "dialogue-review-0001",
+        "expected_revision": 1,
+        "expected_sha256": "b" * 64,
+        "lines": [{"text": "机器稿", "start_s": 0.2, "end_s": 1.1}],
+    }
+    assert set(result["view"]["lines"][0]) == {"text", "start_s", "end_s"}
+    assert not ({"language", "speaker", "confidence"} & set(result["view"]["lines"][0]))
+
+
+def test_local_line_validation_covers_empty_out_of_range_and_order():
+    result = _run_contract(
+        "(()=>{const run=(lines)=>{try{return contract.validateDialogueReviewDraft({lines},6)}catch(error){return error.message}};return ["
+        "run([]),"
+        "run([{text:'',start_s:0,end_s:1}]),"
+        "run([{text:'x',start_s:1,end_s:7}]),"
+        "run([{text:'x',start_s:2,end_s:3},{text:'y',start_s:1,end_s:2}])]"
+        "})()"
+    )
+    assert result == [
+        [],
+        "第 1 行台词不能为空",
+        "第 1 行超过视频时长 6.00 秒",
+        "第 2 行开始时间早于上一行",
+    ]
+
+
+def test_commit_conflicts_have_recoverable_user_copy():
+    result = _run_contract(
+        "['dialogue_review_conflict','dialogue_review_read_only','dialogue_review_not_waiting',"
+        "'invalid_dialogue_review_lines'].map(message=>contract.dialogueReviewCommitErrorMessage({message}))"
+    )
+    assert result == [
+        "服务端台词稿已更新，请刷新后重新校对。",
+        "台词稿已冻结，当前任务已不能修改。",
+        "当前任务已不再等待台词校对，请刷新查看最新状态。",
+        "台词或时间码不符合要求，请逐行检查。",
+    ]
+
+
+def test_asr_operational_failure_is_distinct_from_valid_empty_outcomes():
+    result = _run_contract(
+        "({failure:contract.safeErrorSummary('codex voice output invalid: missing artifact'),"
+        "noAudio:contract.dialogueReviewOutcomeText({outcome:'no_audio',lines:[]}),"
+        "noVocal:contract.dialogueReviewOutcomeText({outcome:'no_vocal',lines:[]}),"
+        "emptyVoice:contract.dialogueReviewOutcomeText({outcome:'vocal_unrecognized',lines:[]})})"
+    )
+    assert result == {
+        "failure": "台词识别失败，未进入校对或后续生成",
+        "noAudio": "未检测到音轨。你可以补充台词，或采用空稿按无台词继续。",
+        "noVocal": "未检测到可信口播。你可以补充台词，或采用空稿继续。",
+        "emptyVoice": "检测到人声，但未识别出可靠台词。请补充台词，或采用空稿继续。",
+    }
+
+
+def test_waiting_and_frozen_dom_have_one_clear_action_and_read_only_boundary():
+    waiting = _review()
+    frozen = _review(
+        status="frozen",
+        revision=2,
+        sha256="c" * 64,
+        frozen_by="user",
+        editable=False,
+    )
+    result = _run_jsdom_contract(
+        "(()=>{const waiting=" + json.dumps(waiting) + ";const frozen=" + json.dumps(frozen) + ";"
+        "const editable=contract.renderDialogueReview({id:'cid-wait',duration_s:6,dialogue_review:waiting});"
+        "const readonly=contract.renderDialogueReview({id:'cid-frozen',duration_s:6,dialogue_review:frozen});"
+        "return {editableText:editable.textContent,rows:editable.querySelectorAll('.dialogue-review-line').length,"
+        "submit:editable.querySelector('button[type=submit]').textContent,"
+        "readonlyText:readonly.textContent,readonlyInputs:readonly.querySelectorAll('input').length}})()"
+    )
+    assert result["rows"] == 1
+    assert result["submit"] == "采用此稿并继续"
+    assert "等待你确认" in result["editableText"]
+    assert "下游已开始后，本稿不可修改" in result["readonlyText"]
+    assert result["readonlyInputs"] == 0
+
+
+def test_timeline_and_mobile_layout_make_wait_explicit():
+    review = _review()
+    result = _run_contract(
+        "(()=>{const model=contract.operationTimeline({id:'cid',status:'processing',has_source:true,"
+        "created_at:'2026-08-30T00:00:00Z',updated_at:'2026-08-30T00:01:00Z',dialogue_review:"
+        + json.dumps(review)
+        + "},Date.parse('2026-08-30T00:02:00Z'));return {count:model.stages.length,current:model.current}})()"
+    )
+    assert result["count"] == 10
+    assert result["current"]["key"] == "dialogue-review"
+    assert result["current"]["status"] == "attention"
+    assert "等待你校对" in result["current"]["detail"]
+
+    css = STYLES.read_text(encoding="utf-8")
+    assert "repeat(10" in css
+    assert ".dialogue-review-line" in css
+    mobile = css.split("@media (max-width: 768px)", 1)[1]
+    assert ".dialogue-review-policy { grid-template-columns: 1fr; }" in mobile

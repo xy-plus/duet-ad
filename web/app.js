@@ -11,6 +11,9 @@ const GENERATION_RESOLUTIONS = Object.freeze(["480p", "768p"]);
 const GENERATION_CONFIG_KEYS = Object.freeze([
   "optimize_image", "remove_subtitle", "remove_watermark",
 ]);
+const DIALOGUE_REVIEW_POLICIES = Object.freeze([
+  "auto_continue", "review_required",
+]);
 
 const STATUS_TEXT = { queued: "排队中", processing: "处理中", done: "已完成", failed: "失败" };
 
@@ -37,6 +40,9 @@ const state = {
   historyHydrating: false, // 受限并发补齐进行中，避免重复 GET 风暴
   generationConfigCapability: null, // 仅接受 /api/capabilities 的精确 generation_config 合同
   generationConfigCapabilityLoaded: false,
+  dialogueReviewCapability: null,
+  dialogueReviewCapabilityLoaded: false,
+  dialogueReviewDrafts: {}, // cid → 本地校对稿；轮询保留，服务端 revision 变化时重置
   frameSelections: {}, // cid:scope → 选中的 segment/frame；轮询和展开切换时保留
   framePickerOpen: {}, // cid:scope → 图片下拉是否展开
   promptDraft: null,   // 当前图片优化提示词草稿；跨轮询保留，跨操作由统一守卫处理
@@ -227,6 +233,52 @@ function buildGenerationConfigCreateField(capability, value) {
   };
 }
 
+function normalizeDialogueReviewCapability(payload) {
+  const capability = payload && payload.dialogue_review;
+  if (!capability || capability.supported !== true
+      || capability.create_field !== "dialogue_review_policy"
+      || capability.default !== "auto_continue"
+      || capability.commit_path !== "/api/conversations/{id}/dialogue-review/commit"
+      || !Array.isArray(capability.policies)
+      || capability.policies.length !== DIALOGUE_REVIEW_POLICIES.length
+      || !DIALOGUE_REVIEW_POLICIES.every((value, index) => capability.policies[index] === value)) {
+    return null;
+  }
+  return {
+    supported: true,
+    create_field: capability.create_field,
+    default: capability.default,
+    policies: capability.policies.slice(),
+    commit_path: capability.commit_path,
+  };
+}
+
+function buildDialogueReviewCreateField(capability, policy, mode) {
+  const normalized = normalizeDialogueReviewCapability({ dialogue_review: capability });
+  if (!normalized || mode !== "auto" || !normalized.policies.includes(policy)) return null;
+  return { name: normalized.create_field, value: policy };
+}
+
+function buildDialogueReviewCommitPayload(review, lines, requestId) {
+  if (!review || review.status !== "waiting" || review.editable !== true
+      || !Number.isInteger(review.revision) || review.revision < 1
+      || typeof review.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(review.sha256)
+      || !Array.isArray(lines) || typeof requestId !== "string" || !requestId.trim()) {
+    throw new Error("台词校对状态已变化，请刷新后重试");
+  }
+  return {
+    confirm: true,
+    client_request_id: requestId.trim(),
+    expected_revision: review.revision,
+    expected_sha256: review.sha256,
+    lines: lines.map((line) => ({
+      text: String(line.text || "").trim(),
+      start_s: Number(line.start_s),
+      end_s: Number(line.end_s),
+    })),
+  };
+}
+
 function generationConfigLabels(value) {
   if (!validGenerationConfig(value)) return [];
   return [
@@ -365,20 +417,10 @@ function parseDialogueLines(text) {
 }
 
 function buildCreateDialogueFields(mode, linesText) {
-  if (!["auto", "none", "edit", "custom"].includes(mode)) {
+  if (!["auto", "none"].includes(mode)) {
     throw new Error("请选择台词模式");
   }
-  const fields = { dialogue_mode: mode };
-  if (mode === "edit" || mode === "custom") {
-    const lines = parseDialogueLines(linesText);
-    if (lines.length === 0) {
-      throw new Error(mode === "edit"
-        ? "编辑台词模式请至少填写一行台词"
-        : "自定义台词模式请至少填写一行台词");
-    }
-    fields.lines = JSON.stringify(lines);
-  }
-  return fields;
+  return { dialogue_mode: mode };
 }
 
 function longVideoContract(detail) {
@@ -702,6 +744,9 @@ function safeErrorSummary(raw, fallback = "阶段执行失败，请查看诊断�
     ["generation_path_removed", "该历史任务只能查看，不能重新生成"],
   ]);
   if (labels.has(code)) return labels.get(code);
+  if (/(?:asr|voice_lines|codex voice|vocal classification|audio extract|transcri)/i.test(code)) {
+    return "台词识别失败，未进入校对或后续生成";
+  }
   if (/^[a-z][a-z0-9_]{2,80}$/.test(code)) {
     return fallback + `（${code}）`;
   }
@@ -739,6 +784,9 @@ function operationTimeline(detail, nowMs = Date.now()) {
   const h3Total = generationSegments.length || segments.length;
   const afterContext = ["h3", "stitch", "stitching"].includes(generationStage)
     || generationStatus === "succeeded" || detail.has_video === true;
+  const review = detail && detail.dialogue_review;
+  const reviewWaiting = !!review && review.status === "waiting";
+  const reviewFrozen = !!review && review.status === "frozen";
 
   const stages = [
     {
@@ -749,20 +797,37 @@ function operationTimeline(detail, nowMs = Date.now()) {
     {
       key: "analysis", label: "分析",
       ...stageState(
-        analysis === "done" ? "done"
+        analysis === "done" || reviewWaiting || reviewFrozen ? "done"
           : analysis === "processing" ? "running"
             : analysis === "queued" ? "waiting"
               : analysis === "failed" ? "failed" : "unknown",
         analysis === "done" ? "分析产物已发布"
+          : reviewWaiting || reviewFrozen ? "上传分析与台词识别已完成"
           : analysis === "processing" ? "正在抽帧并生成项目描述"
             : analysis === "queued" ? "等待分析" : "分析状态异常",
+      ),
+    },
+    {
+      key: "dialogue-review", label: "台词校对",
+      ...stageState(
+        reviewWaiting ? "attention"
+          : reviewFrozen ? "done"
+            : analysis === "failed" ? "blocked"
+              : analysis === "done" ? "skipped" : "waiting",
+        reviewWaiting ? "识别稿正在等待你校对并采用"
+          : reviewFrozen ? (review.frozen_by === "user"
+            ? "校对稿已冻结，正在继续同一任务"
+            : "自动识别稿已冻结，无需中途确认")
+            : analysis === "failed" ? "分析失败，未产生可校对台词"
+              : "等待台词识别",
+        review && Number.isInteger(review.revision) ? `v${review.revision}` : "",
       ),
     },
     {
       key: "index", label: "素材索引",
       ...stageState(
         analysis === "done" && frameCount > 0 ? "done"
-          : analysis === "processing" ? "running"
+          : analysis === "processing" && !reviewWaiting ? "running"
             : analysis === "failed" ? "blocked"
               : analysis === "done" ? "unknown" : "waiting",
         analysis === "done" && frameCount > 0
@@ -1073,6 +1138,8 @@ function showLogin(message) {
   state.detail = null;
   state.generationConfigCapability = null;
   state.generationConfigCapabilityLoaded = false;
+  state.dialogueReviewCapability = null;
+  state.dialogueReviewCapabilityLoaded = false;
   $("app-view").hidden = true;
   $("login-view").hidden = false;
   const errEl = $("login-error");
@@ -1308,6 +1375,7 @@ function conversationBadge(conversation) {
   const navigationBadges = {
     analysis_queued: { className: "queued", text: "分析排队中" },
     analysis_processing: { className: "processing", text: "分析中" },
+    waiting_for_dialogue_review: { className: "processing", text: "等待台词校对" },
     analysis_failed: { className: "failed", text: "分析失败" },
     analysis_unknown: { className: "failed", text: "分析状态未知" },
     analysis_complete: { className: "analyzed", text: "分析完成" },
@@ -1391,6 +1459,7 @@ function clearStream() {
 function renderEmptyHero() {
   stopPolling();
   hideOperationHeader();
+  document.querySelector(".composer-dock").classList.remove("is-dialogue-review-waiting");
   clearStream();
   $("main-title").textContent = "视频工作室";
 
@@ -1483,6 +1552,228 @@ function renderFrozenGenerationConfig(detail) {
   return section;
 }
 
+function dialogueReviewView(detail) {
+  const review = detail && detail.dialogue_review;
+  if (!review || !["waiting", "frozen"].includes(review.status)
+      || !["recognized", "no_audio", "no_vocal", "vocal_unrecognized"].includes(review.outcome)
+      || !Number.isInteger(review.revision) || review.revision < 1
+      || typeof review.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(review.sha256)
+      || !Array.isArray(review.lines)) return null;
+  const lines = normalizeDialogueLines(review.lines);
+  if (lines.length !== review.lines.length) return null;
+  return Object.assign({}, review, { lines });
+}
+
+function dialogueReviewOutcomeText(review) {
+  const count = review.lines.length;
+  return ({
+    recognized: `已识别 ${count} 行台词，请核对文字与时间码。`,
+    no_audio: "未检测到音轨。你可以补充台词，或采用空稿按无台词继续。",
+    no_vocal: "未检测到可信口播。你可以补充台词，或采用空稿继续。",
+    vocal_unrecognized: "检测到人声，但未识别出可靠台词。请补充台词，或采用空稿继续。",
+  })[review.outcome];
+}
+
+function dialogueReviewCommitErrorMessage(error) {
+  const value = String(error && error.message ? error.message : error || "");
+  const messages = {
+    dialogue_review_conflict: "服务端台词稿已更新，请刷新后重新校对。",
+    dialogue_review_read_only: "台词稿已冻结，当前任务已不能修改。",
+    dialogue_review_not_waiting: "当前任务已不再等待台词校对，请刷新查看最新状态。",
+    dialogue_review_unavailable: "当前任务没有可提交的台词校对稿。",
+    invalid_dialogue_review_lines: "台词或时间码不符合要求，请逐行检查。",
+  };
+  return messages[value] || value || "采用台词稿失败，请重试";
+}
+
+function dialogueReviewDraft(detail, review) {
+  const existing = state.dialogueReviewDrafts[detail.id];
+  if (existing && existing.revision === review.revision
+      && existing.sha256 === review.sha256) return existing;
+  const draft = {
+    revision: review.revision,
+    sha256: review.sha256,
+    lines: review.lines.map((line) => Object.assign({}, line)),
+    requestId: newRequestId(),
+    dirty: false,
+    submitting: false,
+  };
+  state.dialogueReviewDrafts[detail.id] = draft;
+  return draft;
+}
+
+function validateDialogueReviewDraft(draft, duration) {
+  const limit = Number(duration);
+  let previousStart = -1;
+  return draft.lines.map((line, index) => {
+    const text = String(line.text || "").trim();
+    const start = Number(line.start_s);
+    const end = Number(line.end_s);
+    if (!text) throw new Error(`第 ${index + 1} 行台词不能为空`);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start >= end) {
+      throw new Error(`第 ${index + 1} 行时间码无效`);
+    }
+    if (Number.isFinite(limit) && end > limit + 0.01) {
+      throw new Error(`第 ${index + 1} 行超过视频时长 ${limit.toFixed(2)} 秒`);
+    }
+    if (start < previousStart) throw new Error(`第 ${index + 1} 行开始时间早于上一行`);
+    previousStart = start;
+    return { text, start_s: start, end_s: end };
+  });
+}
+
+function renderDialogueReview(detail) {
+  const review = dialogueReviewView(detail);
+  if (!review) return null;
+  const section = el("section", "dialogue-review-card");
+  section.dataset.testid = "dialogue-review";
+  const heading = el("div", "dialogue-review-heading");
+  heading.appendChild(el("h3", "res-h3", review.status === "waiting"
+    ? "校对识别台词" : "台词稿已冻结"));
+  heading.appendChild(el("span", "stage-pill " + (review.status === "waiting"
+    ? "status-attention" : "status-done"), review.status === "waiting" ? "等待你确认" : "只读"));
+  section.appendChild(heading);
+  section.appendChild(el("p", "dialogue-review-outcome", dialogueReviewOutcomeText(review)));
+
+  if (review.status === "frozen") {
+    section.appendChild(el("p", "dialogue-review-lock", review.frozen_by === "user"
+      ? "已采用此稿并继续同一任务。下游已开始后，本稿不可修改；如需改台词，请创建新任务。"
+      : "已按创建时的“自动识别并继续”冻结机器稿，无需中途确认。"));
+    const frozen = el("details", "dialogue-review-readonly");
+    frozen.appendChild(el("summary", null, `查看已冻结台词（${review.lines.length} 行） · v${review.revision} · #${review.sha256.slice(0, 8)}`));
+    if (review.lines.length === 0) {
+      frozen.appendChild(el("p", "final-help", "该冻结稿无台词。"));
+    } else {
+      const list = el("ol", "dialogue-review-readonly-lines");
+      review.lines.forEach((line) => {
+        list.appendChild(el("li", null, `${line.start_s.toFixed(2)}–${line.end_s.toFixed(2)} 秒 · ${line.text}`));
+      });
+      frozen.appendChild(list);
+    }
+    section.appendChild(frozen);
+    return section;
+  }
+
+  const draft = dialogueReviewDraft(detail, review);
+  const form = el("form", "dialogue-review-form");
+  form.noValidate = true;
+  const rows = el("div", "dialogue-review-lines");
+  const error = el("p", "form-error");
+  error.setAttribute("role", "alert");
+  error.hidden = true;
+  const updateDraft = () => {
+    draft.dirty = true;
+    draft.requestId = newRequestId();
+    error.hidden = true;
+  };
+  const renderRows = () => {
+    rows.textContent = "";
+    if (draft.lines.length === 0) {
+      rows.appendChild(el("p", "dialogue-review-empty", "当前识别稿为空。可新增台词；直接采用将按无台词继续。"));
+      return;
+    }
+    draft.lines.forEach((line, index) => {
+      const row = el("div", "dialogue-review-line");
+      row.appendChild(el("span", "dialogue-review-line-index", String(index + 1)));
+      for (const [field, label] of [["start_s", "开始秒"], ["end_s", "结束秒"]]) {
+        const wrapper = el("label", "dialogue-review-time");
+        wrapper.appendChild(el("span", "sr-only", `第 ${index + 1} 行${label}`));
+        const input = el("input", "text-input");
+        input.type = "number";
+        input.inputMode = "decimal";
+        input.min = "0";
+        input.step = "0.01";
+        input.value = String(line[field]);
+        input.addEventListener("input", () => {
+          line[field] = input.value;
+          updateDraft();
+        });
+        wrapper.appendChild(input);
+        row.appendChild(wrapper);
+      }
+      const textLabel = el("label", "dialogue-review-text");
+      textLabel.appendChild(el("span", "sr-only", `第 ${index + 1} 行台词`));
+      const textInput = el("input", "text-input");
+      textInput.type = "text";
+      textInput.value = line.text;
+      textInput.placeholder = "台词内容";
+      textInput.addEventListener("input", () => {
+        line.text = textInput.value;
+        updateDraft();
+      });
+      textLabel.appendChild(textInput);
+      row.appendChild(textLabel);
+      const remove = el("button", "btn btn-ghost dialogue-review-remove", "移除");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `移除第 ${index + 1} 行台词`);
+      remove.addEventListener("click", () => {
+        draft.lines.splice(index, 1);
+        updateDraft();
+        renderRows();
+      });
+      row.appendChild(remove);
+      rows.appendChild(row);
+    });
+  };
+  renderRows();
+  form.appendChild(rows);
+  const actions = el("div", "dialogue-review-actions");
+  const add = el("button", "btn btn-ghost", "新增一行");
+  add.type = "button";
+  add.addEventListener("click", () => {
+    const duration = Number(detail.duration_s);
+    const previous = draft.lines[draft.lines.length - 1];
+    const start = previous ? Number(previous.end_s) : 0;
+    if (Number.isFinite(duration) && start >= duration) {
+      error.textContent = "已到视频末尾，请先调整上一行时间码";
+      error.hidden = false;
+      return;
+    }
+    draft.lines.push({
+      start_s: Number.isFinite(start) ? start : 0,
+      end_s: Number.isFinite(duration) ? Math.min(duration, (Number.isFinite(start) ? start : 0) + 1) : 1,
+      text: "",
+    });
+    updateDraft();
+    renderRows();
+    const inputs = rows.querySelectorAll('input[type="text"]');
+    if (inputs.length) inputs[inputs.length - 1].focus();
+  });
+  actions.appendChild(add);
+  const submit = el("button", "btn btn-primary", "采用此稿并继续");
+  submit.type = "submit";
+  actions.appendChild(submit);
+  form.appendChild(actions);
+  form.appendChild(error);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (draft.submitting) return;
+    try {
+      const lines = validateDialogueReviewDraft(draft, detail.duration_s);
+      const payload = buildDialogueReviewCommitPayload(review, lines, draft.requestId);
+      draft.submitting = true;
+      form.querySelectorAll("input,button").forEach((control) => { control.disabled = true; });
+      submit.textContent = "正在采用…";
+      await apiJSON(
+        "/api/conversations/" + encodeURIComponent(detail.id) + "/dialogue-review/commit",
+        { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload) },
+      );
+      delete state.dialogueReviewDrafts[detail.id];
+      await loadDetail(detail.id, true);
+    } catch (err) {
+      if (handleAuthError(err)) return;
+      draft.submitting = false;
+      error.textContent = dialogueReviewCommitErrorMessage(err);
+      error.hidden = false;
+      form.querySelectorAll("input,button").forEach((control) => { control.disabled = false; });
+      submit.textContent = "采用此稿并继续";
+    }
+  });
+  section.appendChild(form);
+  section.appendChild(el("p", "dialogue-review-fingerprint", `机器稿 v${review.revision} · #${review.sha256.slice(0, 8)} · 提交后冻结并继续同一任务`));
+  return section;
+}
+
 /* 状态时间线（queued / processing） */
 function renderActivity(status) {
   const row = el("div", "msg-row");
@@ -1519,8 +1810,10 @@ function renderFail(detail) {
   const card = el("div", "fail-card");
   card.appendChild(icon("i-alert", "ic-danger"));
   const body = el("div");
-  body.appendChild(el("p", "fail-title", "分析未完成"));
-  body.appendChild(el("p", "fail-msg", safeErrorSummary(detail.error, "分析阶段执行失败")));
+  const summary = safeErrorSummary(detail.error, "分析阶段执行失败");
+  body.appendChild(el("p", "fail-title", summary.startsWith("台词识别失败")
+    ? "台词识别失败" : "分析未完成"));
+  body.appendChild(el("p", "fail-msg", summary));
   body.appendChild(el("p", "fail-tip", "成片流程尚未开始；刷新不会重复提交任务。"));
   const diagnostic = errorDiagnostic(detail.error);
   if (diagnostic) body.appendChild(diagnostic);
@@ -3661,6 +3954,10 @@ function renderPpChat(detail) {
 }
 
 function renderDetail(detail) {
+  document.querySelector(".composer-dock").classList.toggle(
+    "is-dialogue-review-waiting",
+    !!(detail.dialogue_review && detail.dialogue_review.status === "waiting"),
+  );
   renderOperationHeader(detail);
   renderStable(detail);
   renderPpDynamic(detail);
@@ -3674,8 +3971,12 @@ function renderStable(detail) {
   inner.appendChild(renderUserBubble(detail));
   const frozenConfig = renderFrozenGenerationConfig(detail);
   if (frozenConfig) inner.appendChild(frozenConfig);
+  const dialogueReview = renderDialogueReview(detail);
+  if (dialogueReview) inner.appendChild(dialogueReview);
   if (detail.status === "queued" || detail.status === "processing") {
-    inner.appendChild(renderActivity(detail.status));
+    if (!(detail.dialogue_review && detail.dialogue_review.status === "waiting")) {
+      inner.appendChild(renderActivity(detail.status));
+    }
   } else if (detail.status === "failed") {
     inner.appendChild(renderFail(detail));
   } else if (detail.status === "done") {
@@ -3739,6 +4040,7 @@ function detailSignature(detail) {
     detail.image_optimization_prompt || null,
     detail.postprocess_capabilities || null,
     detail.dialogue || null,
+    detail.dialogue_review || null,
     detail.generation_config || null,
     detail.generation_config_sha256 || null,
     detail.skill_milestone || null,
@@ -3932,26 +4234,68 @@ function renderGenerationConfigControl() {
   $("generation-config-status").textContent = "提交一次后将按此配置自动运行至成片，中途无需确认。";
 }
 
+function dialogueReviewPolicy() {
+  const checked = document.querySelector('input[name="dialogue-review-policy"]:checked');
+  return checked ? checked.value : "auto_continue";
+}
+
+function selectDialogueReviewPolicy(policy) {
+  const value = DIALOGUE_REVIEW_POLICIES.includes(policy) ? policy : "auto_continue";
+  const radio = document.querySelector(`input[name="dialogue-review-policy"][value="${value}"]`);
+  if (radio) radio.checked = true;
+}
+
+function renderDialogueReviewPolicyControl() {
+  const fieldset = $("dialogue-review-fields");
+  const loaded = state.dialogueReviewCapabilityLoaded;
+  const capability = state.dialogueReviewCapability;
+  const automatic = dialogueMode() === "auto";
+  if (!automatic) selectDialogueReviewPolicy("auto_continue");
+  fieldset.disabled = state.uploading || !capability || !automatic;
+  if (!automatic) {
+    $("dialogue-review-policy-status").textContent = "无台词模式不会运行语音识别，将直接继续后续流程。";
+  } else if (!loaded) {
+    $("dialogue-review-policy-status").textContent = "能力确认前使用自动继续，且不发送额外字段。";
+  } else if (!capability) {
+    selectDialogueReviewPolicy("auto_continue");
+    $("dialogue-review-policy-status").textContent = "当前服务器未声明校对能力；使用服务器默认配置，不发送未知字段。";
+  } else if (dialogueReviewPolicy() === "review_required") {
+    $("dialogue-review-policy-status").textContent = "识别完成后会持久等待；采用台词稿后恢复同一任务。";
+  } else {
+    $("dialogue-review-policy-status").textContent = "默认无人值守：机器稿自动冻结并继续至成片。";
+  }
+}
+
 async function loadGenerationConfigCapability() {
   const token = state.token;
   state.generationConfigCapability = null;
   state.generationConfigCapabilityLoaded = false;
+  state.dialogueReviewCapability = null;
+  state.dialogueReviewCapabilityLoaded = false;
   renderGenerationConfigControl();
+  renderDialogueReviewPolicyControl();
   try {
     const payload = await apiJSON("/api/capabilities");
     if (token !== state.token) return;
     state.generationConfigCapability = normalizeGenerationConfigCapability(payload);
+    state.dialogueReviewCapability = normalizeDialogueReviewCapability(payload);
     if (state.generationConfigCapability) {
       applyGenerationConfigDefaults(state.generationConfigCapability.defaults);
+    }
+    if (state.dialogueReviewCapability) {
+      selectDialogueReviewPolicy(state.dialogueReviewCapability.default);
     }
   } catch (error) {
     if (handleAuthError(error)) return;
     if (token !== state.token) return;
     state.generationConfigCapability = null;
+    state.dialogueReviewCapability = null;
   } finally {
     if (token === state.token) {
       state.generationConfigCapabilityLoaded = true;
+      state.dialogueReviewCapabilityLoaded = true;
       renderGenerationConfigControl();
+      renderDialogueReviewPolicyControl();
     }
   }
 }
@@ -3982,9 +4326,7 @@ function setVoiceMode() {
 }
 
 function setDialogueMode() {
-  const manual = dialogueMode() === "edit" || dialogueMode() === "custom";
-  $("create-dialogue-editor").hidden = !manual;
-  $("create-dialogue-lines").required = manual;
+  renderDialogueReviewPolicyControl();
   state.clientRequestId = newRequestId();
   setComposerError(null);
   updateSendBtn();
@@ -4049,7 +4391,6 @@ function setUploading(on) {
   $("url-input").disabled = on;
   $("file-remove").disabled = on;
   $("lang-input").disabled = on;
-  $("create-dialogue-lines").disabled = on;
   document.querySelectorAll('input[name="source-mode"]').forEach((r) => {
     r.disabled = on;
   });
@@ -4060,6 +4401,7 @@ function setUploading(on) {
     r.disabled = on;
   });
   renderGenerationConfigControl();
+  renderDialogueReviewPolicyControl();
   updateSendBtn();
   if (!on) $("upload-progress").hidden = true;
 }
@@ -4067,6 +4409,7 @@ function setUploading(on) {
 function uploadConversation({
   file, url, note, requestId, voiceMode: mode, targetLanguage, dialogue,
   generationConfig, generationConfigCapability,
+  dialogueReviewPolicy: reviewPolicy, dialogueReviewCapability,
 }, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -4107,7 +4450,12 @@ function uploadConversation({
     fd.append("voice_mode", mode || "keep");
     if (mode === "translate" && targetLanguage) fd.append("target_language", targetLanguage);
     fd.append("dialogue_mode", dialogue.dialogue_mode);
-    if (dialogue.lines) fd.append("lines", dialogue.lines);
+    const reviewField = buildDialogueReviewCreateField(
+      dialogueReviewCapability,
+      reviewPolicy,
+      dialogue.dialogue_mode,
+    );
+    if (reviewField) fd.append(reviewField.name, reviewField.value);
     const configField = buildGenerationConfigCreateField(
       generationConfigCapability,
       generationConfig,
@@ -4129,6 +4477,7 @@ async function handleSend(event) {
   const targetLanguage = $("lang-input").value.trim();
   const generationConfig = state.generationConfigCapability
     ? selectedGenerationConfig() : null;
+  const reviewPolicy = dialogueReviewPolicy();
   let dialogue;
   if (!file && !url) {
     setComposerError(mode === "upload" ? "请先选择视频文件" : "请先粘贴视频链接");
@@ -4139,12 +4488,9 @@ async function handleSend(event) {
     return;
   }
   try {
-    dialogue = buildCreateDialogueFields(dialogueMode(), $("create-dialogue-lines").value);
+    dialogue = buildCreateDialogueFields(dialogueMode(), "");
   } catch (err) {
     setComposerError(err.message);
-    if (dialogueMode() === "edit" || dialogueMode() === "custom") {
-      $("create-dialogue-lines").focus();
-    }
     return;
   }
 
@@ -4164,6 +4510,8 @@ async function handleSend(event) {
         file, url, note, requestId: state.clientRequestId,
         voiceMode: vMode, targetLanguage, dialogue, generationConfig,
         generationConfigCapability: state.generationConfigCapability,
+        dialogueReviewPolicy: reviewPolicy,
+        dialogueReviewCapability: state.dialogueReviewCapability,
       },
       (ratio) => {
         if (url) return;
@@ -4184,9 +4532,8 @@ async function handleSend(event) {
     $("lang-input").required = false;
     const autoDialogue = document.querySelector('input[name="dialogue-mode"][value="auto"]');
     autoDialogue.checked = true;
-    $("create-dialogue-lines").value = "";
-    $("create-dialogue-lines").required = false;
-    $("create-dialogue-editor").hidden = true;
+    selectDialogueReviewPolicy("auto_continue");
+    renderDialogueReviewPolicyControl();
     if (state.generationConfigCapability) {
       applyGenerationConfigDefaults(state.generationConfigCapability.defaults);
       renderGenerationConfigControl();
@@ -4264,9 +4611,11 @@ function bindEvents() {
   document.querySelectorAll('input[name="dialogue-mode"]').forEach((radio) => {
     radio.addEventListener("change", setDialogueMode);
   });
-  $("create-dialogue-lines").addEventListener("input", () => {
+  $("dialogue-review-fields").addEventListener("change", () => {
+    if (!state.dialogueReviewCapability || state.uploading || dialogueMode() !== "auto") return;
     state.clientRequestId = newRequestId();
     setComposerError(null);
+    renderDialogueReviewPolicyControl();
   });
   $("lang-input").addEventListener("input", () => {
     state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
@@ -4339,6 +4688,8 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildLongRetryPayload,
     buildCreateDialogueFields,
+    buildDialogueReviewCommitPayload,
+    buildDialogueReviewCreateField,
     buildGenerationConfigCreateField,
     buildImagePromptPatch,
     buildStitchRetryPayload,
@@ -4356,6 +4707,10 @@ if (typeof module !== "undefined" && module.exports) {
     createDisclosure,
     detailSignature,
     diagnosticText,
+    dialogueReviewOutcomeText,
+    dialogueReviewCommitErrorMessage,
+    dialogueReviewView,
+    renderDialogueReview,
     dirtyPromptDecision,
     frameInspector,
     frameViewerEntries,
@@ -4379,6 +4734,7 @@ if (typeof module !== "undefined" && module.exports) {
     mergeConversationList,
     mergeImagePromptDraft,
     normalizeGenerationConfigCapability,
+    normalizeDialogueReviewCapability,
     normalizeDialogueLines,
     operationTimeline,
     parseDialogueLines,
@@ -4414,6 +4770,7 @@ if (typeof module !== "undefined" && module.exports) {
     skillMilestoneView,
     syncConversationDetail,
     totalKeyframes,
+    validateDialogueReviewDraft,
   };
 }
 

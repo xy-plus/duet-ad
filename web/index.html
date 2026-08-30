@@ -121,21 +121,19 @@
               <input type="radio" name="dialogue-mode" value="none">
               <span>无台词</span>
             </label>
-            <label class="voice-option">
-              <input type="radio" name="dialogue-mode" value="edit">
-              <span>编辑台词</span>
-            </label>
-            <label class="voice-option">
-              <input type="radio" name="dialogue-mode" value="custom">
-              <span>自定义台词</span>
-            </label>
           </div>
-          <div id="create-dialogue-editor" class="dialogue-editor" hidden>
-            <label class="sr-only" for="create-dialogue-lines">台词，每行格式为开始 - 结束 | 文本</label>
-            <textarea id="create-dialogue-lines" class="dialogue-textarea" rows="5"
-                      placeholder="0 - 1.5 | 第一行台词&#10;1.5 - 3 | 第二行台词"></textarea>
-            <p class="final-help">每行格式：开始秒 - 结束秒 | 台词。</p>
-          </div>
+          <fieldset id="dialogue-review-fields" class="dialogue-review-policy" disabled>
+            <legend>识别完成后</legend>
+            <label class="dialogue-review-policy-option">
+              <input type="radio" name="dialogue-review-policy" value="auto_continue" checked>
+              <span><strong>自动识别并继续</strong><small>默认无人值守，一路运行至成片</small></span>
+            </label>
+            <label class="dialogue-review-policy-option">
+              <input type="radio" name="dialogue-review-policy" value="review_required">
+              <span><strong>暂停校对台词</strong><small>识别后等待采用此稿，再继续同一任务</small></span>
+            </label>
+            <p id="dialogue-review-policy-status" class="generation-config-status" aria-live="polite">能力确认前使用自动继续，且不发送额外字段。</p>
+          </fieldset>
           <details id="generation-config" class="generation-config" open>
             <summary class="generation-config-summary">
               <span>生成配置</span>

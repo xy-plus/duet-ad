@@ -13,7 +13,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-from app import generation_config as generation_config_contract
+from app import dialogue_review, generation_config as generation_config_contract
 
 ALLOWED_EXT = {".mp4", ".mov", ".webm"}
 _CHUNK = 1024 * 1024
@@ -87,7 +87,9 @@ def _meta_lock(cdir: Path):
 
 def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_id: str = "",
                      voice_mode: str = "keep", target_language: str = "",
-                     generation_config: dict | None = None) -> dict:
+                     generation_config: dict | None = None,
+                     dialogue_review_policy: str = dialogue_review.AUTO_CONTINUE,
+                     dialogue_mode: str = "auto") -> dict:
     cid = uuid.uuid4().hex
     cdir = data_dir / cid
     (cdir / "work").mkdir(parents=True)
@@ -106,7 +108,8 @@ def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_i
         "voice_mode": voice_mode,
         "duration_s": None,
         "fit_required": None,
-        "dialogue_mode": "auto",
+        "dialogue_mode": dialogue_mode,
+        "dialogue_review_policy": dialogue_review_policy,
         "generation": None,
     }
     if client_request_id:
@@ -627,6 +630,8 @@ def finish_input_claim(
         if meta is None or meta.get("_input_owner") != owner:
             return None
         meta.update(changes)
+        if meta.get("_dialogue_review_continuation") == "running":
+            meta.pop("_dialogue_review_continuation", None)
         meta["_input_owner"] = None
         if (
             isinstance(owner, dict)
@@ -637,6 +642,145 @@ def finish_input_claim(
         meta["updated_at"] = _now()
         _write_meta(cdir, meta)
         return meta
+
+
+def record_dialogue_analysis(
+    data_dir: Path,
+    cid: str,
+    owner: object,
+    *,
+    policy: str,
+    outcome: str,
+    machine_lines: list[dict],
+) -> dict | None:
+    """Freeze ASR output or durably release the pipeline into review waiting."""
+    if not _ID_RE.match(cid):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = _load_meta_unlocked(data_dir, cid)
+        if meta is None or meta.get("_input_owner") != owner:
+            return None
+        if meta.get("dialogue_review") is not None:
+            return None
+        review = dialogue_review.analysis_state(policy, outcome, machine_lines)
+        meta["dialogue_review"] = review
+        if review["status"] == "waiting":
+            meta["_input_owner"] = None
+            meta["status"] = "processing"
+            meta["error"] = None
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
+
+
+def commit_dialogue_review(
+    data_dir: Path,
+    cid: str,
+    *,
+    request_id: str,
+    expected_revision: int,
+    expected_sha256: str,
+    lines: list[dict],
+) -> tuple[dict | None, bool]:
+    """CAS-freeze one reviewed draft. Returns ``(meta, idempotent_replay)``."""
+    if not _ID_RE.match(cid):
+        return None, False
+    cdir = data_dir / cid
+    payload_sha256 = dialogue_review.commit_payload_sha256(
+        expected_revision=expected_revision,
+        expected_sha256=expected_sha256,
+        lines=lines,
+    )
+    with _meta_lock(cdir):
+        meta = _load_meta_unlocked(data_dir, cid)
+        if meta is None:
+            return None, False
+        review = meta.get("dialogue_review")
+        if not isinstance(review, dict):
+            raise dialogue_review.DialogueReviewError("dialogue_review_unavailable")
+        if review.get("status") == "frozen":
+            if (
+                review.get("_commit_request_id") == request_id
+                and review.get("_commit_payload_sha256") == payload_sha256
+            ):
+                return meta, True
+            raise dialogue_review.DialogueReviewError("dialogue_review_read_only")
+        if review.get("status") != "waiting" or meta.get("_input_owner"):
+            raise dialogue_review.DialogueReviewError("dialogue_review_not_waiting")
+        if (
+            review.get("revision") != expected_revision
+            or review.get("sha256") != expected_sha256
+        ):
+            raise dialogue_review.DialogueReviewError("dialogue_review_conflict")
+        normalized = dialogue_review.canonical_lines(lines)
+        digest = dialogue_review.lines_sha256(normalized)
+        machine_lines = dialogue_review.canonical_lines(
+            review.get("machine_lines", [])
+        )
+        review.update(
+            status="frozen",
+            revision=expected_revision + 1,
+            lines=normalized,
+            sha256=digest,
+            frozen_by="user",
+            _commit_request_id=request_id,
+            _commit_payload_sha256=payload_sha256,
+        )
+        if not normalized:
+            meta["dialogue_mode"] = "none"
+        elif normalized == machine_lines:
+            meta["dialogue_mode"] = "auto"
+        else:
+            meta["dialogue_mode"] = "edit"
+        meta["voice_lines"] = normalized
+        meta["dialogue_review"] = review
+        meta["_dialogue_review_continuation"] = "queued"
+        meta["status"] = "processing"
+        meta["error"] = None
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta, False
+
+
+def claim_queued_dialogue_review_continuation(
+    data_dir: Path, cid: str,
+) -> dict | None:
+    """Claim a committed review continuation exactly once in this boot."""
+    if not _ID_RE.match(cid):
+        return None
+    cdir = data_dir / cid
+    with _meta_lock(cdir):
+        meta = _load_meta_unlocked(data_dir, cid)
+        if (
+            meta is None
+            or meta.get("status") != "processing"
+            or meta.get("_input_owner")
+            or meta.get("_dialogue_review_continuation") != "queued"
+            or not isinstance(meta.get("dialogue_review"), dict)
+            or meta["dialogue_review"].get("status") != "frozen"
+        ):
+            return None
+        owner = _input_owner(cdir, "pipeline")
+        meta["_input_owner"] = owner
+        meta["_dialogue_review_continuation"] = "running"
+        meta["updated_at"] = _now()
+        _write_meta(cdir, meta)
+        return meta
+
+
+def claim_queued_dialogue_review_continuations(
+    data_dir: Path,
+) -> list[tuple[str, dict]]:
+    claimed = []
+    for listed in list_conversations(data_dir):
+        cid = listed.get("id")
+        if not isinstance(cid, str):
+            continue
+        meta = claim_queued_dialogue_review_continuation(data_dir, cid)
+        if meta is not None:
+            claimed.append((cid, meta["_input_owner"]))
+    return claimed
 
 
 def load_meta(data_dir: Path, cid: str) -> dict | None:

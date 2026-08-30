@@ -179,6 +179,13 @@ def test_capability_get_declares_exact_create_contract(client):
     response = client.get("/api/capabilities", headers=AUTH)
     assert response.status_code == 200
     assert response.json() == {
+        "dialogue_review": {
+            "supported": True,
+            "create_field": "dialogue_review_policy",
+            "policies": ["auto_continue", "review_required"],
+            "default": "auto_continue",
+            "commit_path": "/api/conversations/{id}/dialogue-review/commit",
+        },
         "generation_config": {
             "supported": True,
             "create_field": "generation_config",

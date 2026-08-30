@@ -20,6 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app import (
     context_ir_bridge,
+    dialogue_review,
     dialogue_delivery,
     downloader,
     error_trace,
@@ -144,11 +145,13 @@ def _run_pipeline_under_gate(
             )
             return False
         if claimed_owner is None:
-            pipeline.run(settings, cid, runner)
-        else:
-            pipeline.run(
-                settings, cid, runner, claimed_owner=claimed_owner
-            )
+            claimed = storage.claim_pipeline_input(settings.data_dir, cid)
+            if claimed is None:
+                return True
+            claimed_owner = claimed["_input_owner"]
+        pipeline.run(
+            settings, cid, runner, claimed_owner=claimed_owner
+        )
         return True
     except BaseException as exc:
         storage.fail_pipeline_input(
@@ -343,7 +346,14 @@ def _public_dialogue(meta: dict) -> dict:
     return {"mode": mode, "lines": effective, "auto_lines": automatic}
 
 
+def _public_dialogue_review(meta: dict) -> dict | None:
+    return dialogue_review.public_state(meta.get("dialogue_review"))
+
+
 def _navigation_status(meta: dict, *, has_video: bool) -> str:
+    review = _public_dialogue_review(meta)
+    if review is not None and review["status"] == "waiting":
+        return "waiting_for_dialogue_review"
     analysis = meta.get("status")
     analysis_states = {
         "queued": "analysis_queued",
@@ -954,6 +964,60 @@ def _create_dialogue_payload(
     ):
         raise HTTPException(status_code=422, detail="invalid_dialogue")
     return {"dialogue_mode": dialogue_mode, "lines": lines}
+
+
+def _validate_dialogue_review_commit_payload(
+    meta: dict, payload: object,
+) -> tuple[str, int, str, list[dict]]:
+    required = {
+        "confirm", "client_request_id", "expected_revision",
+        "expected_sha256", "lines",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise _SubmitError(422, "invalid_dialogue_review_commit")
+    if payload.get("confirm") is not True:
+        raise _SubmitError(409, "dialogue_review_confirmation_required")
+    request_id = payload.get("client_request_id")
+    if (
+        not isinstance(request_id, str)
+        or not _CLIENT_REQUEST_ID_RE.fullmatch(request_id)
+    ):
+        raise _SubmitError(422, "invalid_dialogue_review_commit")
+    revision = payload.get("expected_revision")
+    digest = payload.get("expected_sha256")
+    raw_lines = payload.get("lines")
+    if (
+        not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or not isinstance(raw_lines, list)
+        or any(
+            not isinstance(line, dict)
+            or set(line) != {"text", "start_s", "end_s"}
+            for line in raw_lines
+        )
+    ):
+        raise _SubmitError(422, "invalid_dialogue_review_commit")
+    duration = meta.get("duration_s")
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(float(duration))
+        or float(duration) <= 0
+    ):
+        raise _SubmitError(409, "dialogue_review_unavailable")
+    try:
+        lines = voice.validate_voice_lines(
+            json.dumps(
+                raw_lines, ensure_ascii=False, allow_nan=False
+            ).encode("utf-8"),
+            float(duration),
+        )
+    except (pipeline.PipelineError, TypeError, ValueError):
+        raise _SubmitError(422, "invalid_dialogue_review_lines") from None
+    return request_id, revision, digest, lines
 
 
 def _validate_submit_payload(
@@ -3965,6 +4029,11 @@ def create_app(settings: Settings) -> FastAPI:
         recoverable.extend(
             storage.claim_ready_queued_pipeline_inputs(settings.data_dir)
         )
+        recoverable.extend(
+            storage.claim_queued_dialogue_review_continuations(
+                settings.data_dir
+            )
+        )
         for cid, owner in recoverable:
             thread = threading.Thread(
                 target=run_pipeline_gated,
@@ -3980,7 +4049,10 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/capabilities", dependencies=[Depends(require_auth)])
     async def capabilities():
-        return {"generation_config": generation_config.capability()}
+        return {
+            "generation_config": generation_config.capability(),
+            "dialogue_review": dialogue_review.capability(),
+        }
 
     @app.post("/api/login")
     async def login(payload: dict):
@@ -4021,6 +4093,7 @@ def create_app(settings: Settings) -> FastAPI:
         dialogue_mode: str = Form("auto"),
         lines: str = Form(""),
         generation_config_json: str = Form("", alias="generation_config"),
+        dialogue_review_policy: str = Form(dialogue_review.AUTO_CONTINUE),
     ):
         ip = request.client.host if request.client else "unknown"
         if not limiter.allow(ip):
@@ -4029,7 +4102,7 @@ def create_app(settings: Settings) -> FastAPI:
         allowed_form_fields = {
             "file", "reference_url", "note", "client_request_id",
             "voice_mode", "target_language", "dialogue_mode", "lines",
-            "generation_config",
+            "generation_config", "dialogue_review_policy",
         }
         if set(form) - allowed_form_fields or any(
             len(form.getlist(key)) != 1 for key in form
@@ -4044,6 +4117,21 @@ def create_app(settings: Settings) -> FastAPI:
         dialogue_payload = _create_dialogue_payload(
             dialogue_mode.strip(), lines, has_lines="lines" in form
         )
+        try:
+            frozen_dialogue_review_policy = dialogue_review.parse_create_policy(
+                dialogue_review_policy,
+                provided="dialogue_review_policy" in form,
+            )
+        except dialogue_review.DialogueReviewError as exc:
+            raise HTTPException(status_code=422, detail=exc.code) from None
+        if (
+            frozen_dialogue_review_policy == dialogue_review.REVIEW_REQUIRED
+            and dialogue_payload["dialogue_mode"] != "auto"
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="dialogue_review_requires_auto_dialogue",
+            )
         try:
             frozen_generation_config = generation_config.parse_form(
                 generation_config_json,
@@ -4073,6 +4161,26 @@ def create_app(settings: Settings) -> FastAPI:
                             raise HTTPException(
                                 status_code=409,
                                 detail="client_request_id_generation_config_conflict",
+                            )
+                        if (
+                            m.get(
+                                "dialogue_review_policy",
+                                dialogue_review.AUTO_CONTINUE,
+                            )
+                            != frozen_dialogue_review_policy
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "client_request_id_dialogue_review_policy_conflict"
+                                ),
+                            )
+                        if m.get("dialogue_mode") != dialogue_payload[
+                            "dialogue_mode"
+                        ]:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="client_request_id_dialogue_mode_conflict",
                             )
                         # A durable upload may have lost its BackgroundTask
                         # between commit and response.  The CAS claim makes
@@ -4116,6 +4224,8 @@ def create_app(settings: Settings) -> FastAPI:
                     voice_mode=voice_mode,
                     target_language=target_language if voice_mode == "translate" else "",
                     generation_config=frozen_generation_config,
+                    dialogue_review_policy=frozen_dialogue_review_policy,
+                    dialogue_mode=dialogue_payload["dialogue_mode"],
                 )
             else:
                 meta = resumed_meta
@@ -4264,6 +4374,7 @@ def create_app(settings: Settings) -> FastAPI:
             "resolution": resolution,
             "fit_profiles": fit_profiles,
             "dialogue": _public_dialogue(meta),
+            "dialogue_review": _public_dialogue_review(meta),
             "skill_milestone": _public_skill_milestone(cdir),
             "receipt_version": _receipt_version(cdir, meta),
             "generation": _public_generation(meta, cdir, settings),
@@ -4293,6 +4404,55 @@ def create_app(settings: Settings) -> FastAPI:
             result["segment_count"] = len(segments) if isinstance(segments, list) else 0
             result["prompt_fusion"] = _public_prompt_fusion(meta, cdir)
         return result
+
+    @app.post(
+        "/api/conversations/{cid}/dialogue-review/commit",
+        dependencies=[Depends(require_auth)],
+    )
+    async def commit_dialogue_review(
+        cid: str,
+        payload: dict,
+        background_tasks: BackgroundTasks,
+    ):
+        meta = storage.load_meta(settings.data_dir, cid)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            request_id, revision, digest, lines = (
+                _validate_dialogue_review_commit_payload(meta, payload)
+            )
+            committed, replay = storage.commit_dialogue_review(
+                settings.data_dir,
+                cid,
+                request_id=request_id,
+                expected_revision=revision,
+                expected_sha256=digest,
+                lines=lines,
+            )
+        except dialogue_review.DialogueReviewError as exc:
+            raise HTTPException(status_code=409, detail=exc.code) from None
+        except _SubmitError as exc:
+            raise HTTPException(
+                status_code=exc.status, detail=exc.detail
+            ) from None
+        if committed is None:
+            raise HTTPException(status_code=404, detail="not found")
+        claimed = None
+        if settings.enable_pipeline:
+            claimed = storage.claim_queued_dialogue_review_continuation(
+                settings.data_dir, cid
+            )
+            if claimed is not None:
+                background_tasks.add_task(
+                    run_pipeline_gated, cid, claimed["_input_owner"]
+                )
+        effective = claimed or committed
+        return {
+            "id": cid,
+            "status": effective["status"],
+            "idempotent_replay": replay,
+            "dialogue_review": _public_dialogue_review(effective),
+        }
 
     @app.post(
         "/api/conversations/{cid}/image-acceptance",

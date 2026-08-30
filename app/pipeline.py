@@ -44,7 +44,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app import asr, codex_output_schemas, error_trace, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
+from app import asr, codex_output_schemas, dialogue_review, error_trace, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
 from app.codex_runner import CodexError, CodexOutputError, clean_stderr
 from app.config import Settings
 from app.retry import RetryPolicy, run_with_retry
@@ -1618,6 +1618,7 @@ def _voice_step(
             voice_lines_vocal_dropped=0,
             voice_lines_credit_dropped=0,
             voice_text_normalizations=[],
+            voice_analysis_outcome="no_audio",
         )
         return []
     try:
@@ -1741,6 +1742,11 @@ def _voice_step(
         "voice_lines_vocal_dropped": vocal_dropped,
         "voice_lines_credit_dropped": credit_dropped,
         "voice_text_normalizations": [],
+        "voice_analysis_outcome": (
+            "recognized"
+            if dialogue_review.effective_machine_lines(decisions)
+            else "vocal_unrecognized" if has_vocal else "no_vocal"
+        ),
     }
     storage.update_meta(settings.data_dir, cid, **changes)
     return filtered_lines
@@ -3442,7 +3448,12 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
         voice_mode = meta.get("voice_mode", "none")
         voice_lines: list[dict] | None = None
         if new_input_contract:
-            if dialogue_mode == "auto":
+            review = dialogue_review.public_state(meta.get("dialogue_review"))
+            if review is not None:
+                if review["status"] != "frozen":
+                    raise PipelineError("waiting dialogue review cannot own pipeline")
+                voice_lines = [dict(line) for line in review["lines"]]
+            elif dialogue_mode == "auto":
                 auto_voice_mode = meta.get("voice_mode")
                 if auto_voice_mode in (None, ""):
                     auto_voice_mode = "keep"
@@ -3460,6 +3471,33 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     meta.get("target_language") or "",
                     allow_no_audio=True,
                 )
+                analyzed_meta = storage.load_pipeline_claim(
+                    settings.data_dir, cid, claim_owner
+                )
+                if analyzed_meta is None:
+                    raise PipelineError("dialogue analysis claim was lost")
+                machine_lines = dialogue_review.effective_machine_lines(
+                    analyzed_meta.get("voice_line_provenance")
+                )
+                outcome = analyzed_meta.get("voice_analysis_outcome")
+                if outcome not in dialogue_review.OUTCOMES:
+                    outcome = "recognized" if machine_lines else "no_vocal"
+                persisted_meta = storage.record_dialogue_analysis(
+                    settings.data_dir,
+                    cid,
+                    claim_owner,
+                    policy=analyzed_meta.get(
+                        "dialogue_review_policy", dialogue_review.AUTO_CONTINUE
+                    ),
+                    outcome=outcome,
+                    machine_lines=machine_lines,
+                )
+                if persisted_meta is None:
+                    raise PipelineError("dialogue review state was not persisted")
+                if persisted_meta["dialogue_review"]["status"] == "waiting":
+                    return
+                meta = persisted_meta
+                voice_lines = machine_lines
             elif dialogue_mode in {"edit", "custom"}:
                 supplied = meta.get("voice_lines")
                 if not isinstance(supplied, list) or not supplied:
