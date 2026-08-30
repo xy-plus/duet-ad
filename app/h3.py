@@ -1664,13 +1664,7 @@ def output_is_reusable(
             if abs(duration - expected) > 0.5:
                 return False
         elif (
-            (
-                expected < request.duration - 1 - _DURATION_EPS_S
-                and not (
-                    request.duration == 4
-                    and expected >= 1 - _DURATION_EPS_S
-                )
-            )
+            expected < request.duration - 1 - _DURATION_EPS_S
             or expected > request.duration + _DURATION_EPS_S
             or duration < expected - H3_OUTPUT_FRAME_DURATION_S - _DURATION_EPS_S
             or duration > request.duration + 1

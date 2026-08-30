@@ -271,6 +271,7 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
                     receipt_path.with_suffix(".error.json"),
                     call_path=["postprocess", "seedream", receipt_path.stem, "response_json"],
                     reason={
+                        "code": "provider_protocol_error",
                         "cause": error_trace.exception_tree(exc, secrets=(key,)),
                         "provider": error_trace.provider_response(response, secrets=(key,)),
                     },
@@ -288,8 +289,9 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
                 })
                 error_trace.record(
                     receipt_path.with_suffix(".error.json"),
-                    call_path=["postprocess", "seedream", receipt_path.stem, "decode"],
+                    call_path=["postprocess", "seedream", receipt_path.stem, "response_decode"],
                     reason={
+                        "code": exc.code,
                         "cause": error_trace.exception_tree(exc, secrets=(key,)),
                         "provider": error_trace.provider_response(response, secrets=(key,)),
                     },
@@ -318,8 +320,9 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
                 })
                 error_trace.record(
                     receipt_path.with_suffix(".error.json"),
-                    call_path=["postprocess", "seedream", receipt_path.stem, "output"],
+                    call_path=["postprocess", "seedream", receipt_path.stem, "output_validation"],
                     reason={
+                        "code": exc.code,
                         "cause": error_trace.exception_tree(exc, secrets=(key,)),
                         "provider": error_trace.provider_response(response, secrets=(key,)),
                     },

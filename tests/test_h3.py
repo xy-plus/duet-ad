@@ -1339,21 +1339,6 @@ def test_reference_long_segment_accepts_integer_provider_ceiling_for_stitch(
     ) is False
 
 
-def test_reference_one_second_tail_accepts_four_second_provider_floor(
-    tmp_path, monkeypatch,
-):
-    request = replace(_request(tmp_path), duration=4)
-    with _client(HappyProvider()) as client:
-        assert h3.start(request, client=client).status == "succeeded"
-    monkeypatch.setattr(h3, "_probe_video_duration", lambda *_args: 4.0)
-
-    assert h3.output_is_reusable(
-        request,
-        expected_duration_s=1.0,
-        allow_provider_duration_ceiling=True,
-    ) is True
-
-
 def test_succeeded_attempt_with_missing_output_redownloads_by_get_only(tmp_path):
     request = _request(tmp_path)
     provider = HappyProvider()

@@ -84,7 +84,11 @@ def test_seedream_2xx_protocol_failures_persist_redacted_diagnostics(
     error_trace = json.loads(receipt_path.with_suffix(".error.json").read_text())
     assert error_trace["error"]["provider"]["http_status"] == 200
     assert error_trace["error"]["provider"]["body"] is not None
-    assert error_trace["error"]["cause"]["type"] == "SeedreamError"
+    assert error_trace["error"]["code"] == expected_code
+    assert error_trace["error"]["cause"]["type"] in {
+        "JSONDecodeError",
+        "SeedreamError",
+    }
     assert expected_stage in error_trace["call_path"]
     assert "sk-live-secret" not in json.dumps(receipt)
     assert not output_path.exists()
