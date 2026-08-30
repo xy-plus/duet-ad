@@ -10,11 +10,12 @@ import cv2
 import numpy as np
 import pytest
 
-from app import image_phase_resume, pipeline, storage
+from app import codex_output_schemas, image_phase_resume, pipeline, storage
 from conftest import make_settings
 
 
 CID = "a" * 32
+DURATION_S = 4.0
 
 
 @pytest.fixture(autouse=True)
@@ -25,7 +26,7 @@ def _fixed_current_segment_plan(monkeypatch):
         lambda _duration, _scenes, _dialogue: [{
             "index": 1,
             "start_s": 0.0,
-            "end_s": 2.0,
+            "end_s": DURATION_S,
             "chain_id": "chain-001",
             "join_mode": "hard_cut",
             "scene_indices": [1],
@@ -55,7 +56,7 @@ def _candidate(tmp_path: Path, *, status: str = "failed") -> tuple[object, Path]
         "id": CID,
         "status": status,
         "error": image_phase_resume.IMAGE_FAILURE,
-        "duration_s": 2.0,
+        "duration_s": DURATION_S,
         "dialogue_mode": "none",
         "voice_mode": "keep",
         "voice_lines": [],
@@ -67,28 +68,32 @@ def _candidate(tmp_path: Path, *, status: str = "failed") -> tuple[object, Path]
         "prompt": None,
     })
     _json(work / "manifest.json", {
-        "duration_seconds": 2.0,
+        "duration_seconds": DURATION_S,
         "frames": [{"index": 1, "file": "01.png", "time_seconds": 0.0}],
     })
     _json(work / "scenes.json", {
-        "duration_s": 2.0,
-        "scenes": [{"index": 1, "start_s": 0.0, "end_s": 2.0, "frames": []}],
+        "duration_s": DURATION_S,
+        "scenes": [{
+            "index": 1, "start_s": 0.0, "end_s": DURATION_S, "frames": [],
+        }],
         "effective_scenes": [{
-            "index": 1, "start_s": 0.0, "end_s": 2.0,
+            "index": 1, "start_s": 0.0, "end_s": DURATION_S,
             "frames": [{"decode_frame_index": 0}],
         }],
         "diagnostics": [],
         "segments": [{
-            "index": 1, "start_s": 0.0, "end_s": 2.0,
+            "index": 1, "start_s": 0.0, "end_s": DURATION_S,
             "chain_id": "chain-001", "join_mode": "hard_cut",
         }],
     })
-    _json(work / "element_index.json", {"people": {}, "entities": {}, "scenes": {}})
+    _json(work / "element_index.json", {
+        "people": {}, "entities": {}, "scenes": {}, "relations": {},
+    })
     segment = work / "segments" / "1" / "work"
     (segment / "keyframes").mkdir(parents=True)
     (segment / "anchors").mkdir()
     (work / "segments" / "1" / "source.mp4").write_bytes(b"segment")
-    _json(segment / "manifest.json", {"duration_seconds": 2.0})
+    _json(segment / "manifest.json", {"duration_seconds": DURATION_S})
     (segment / "visual_prompt.txt").write_text("visual", encoding="utf-8")
     (segment / "prompt.txt").write_text("prompt", encoding="utf-8")
     _json(segment / "voice_lines.json", [])
@@ -125,9 +130,10 @@ def test_dry_run_requires_terminal_image_failure_and_complete_artifacts(tmp_path
     assert manifest["segments"] == [{
         "index": 1,
         "start_s": 0.0,
-        "end_s": 2.0,
+        "end_s": DURATION_S,
         "chain_id": "chain-001",
         "join_mode": "hard_cut",
+        "scene_indices": [1],
     }]
     assert all(item["sha256"] for item in manifest["artifacts"])
 
@@ -169,7 +175,7 @@ def test_execute_reuses_index_and_enters_existing_image_phase(tmp_path, monkeypa
             "status": "done",
             "error": None,
             "segments": [{
-                "index": 1, "start_s": 0.0, "end_s": 2.0,
+                "index": 1, "start_s": 0.0, "end_s": DURATION_S,
                 "chain_id": "chain-001", "join_mode": "hard_cut",
             }],
             "long_video_plan_receipt": "long_video_plan.json",
@@ -235,10 +241,12 @@ def test_diagnostic_runner_preserves_successful_phase_protocol(tmp_path):
     work.mkdir(parents=True)
     request = b'{"phase":"segment_frames"}\n'
     output = b'{"frames":{}}\n'
+    output_schema = codex_output_schemas.SEGMENT_FRAMES_SCHEMA
     (work / "request.json").write_bytes(request)
 
     class Inner:
         def run_isolated_until_output(self, *args, **kwargs):
+            assert kwargs["output_schema"] is output_schema
             kwargs["output_path"].write_bytes(output)
             return {"frames": {}}
 
@@ -251,6 +259,7 @@ def test_diagnostic_runner_preserves_successful_phase_protocol(tmp_path):
         output_path=work / "segment_frames.json",
         max_output_bytes=1024,
         validate_output=lambda raw: json.loads(raw),
+        output_schema=output_schema,
     )
     assert result == {"frames": {}}
     assert (destination / "segment-0002.request.json").read_bytes() == request
@@ -263,9 +272,16 @@ def test_diagnostic_runner_preserves_invalid_output_and_error(tmp_path):
     work = stage / "work"
     work.mkdir(parents=True)
     (work / "request.json").write_text('{"phase":"global_plan"}\n')
+    output_schema = codex_output_schemas.global_plan_schema(
+        stable_keys={
+            "people": set(), "entities": set(), "scenes": set(),
+            "relations": set(),
+        },
+    )
 
     class Inner:
         def run_isolated_until_output(self, *args, **kwargs):
+            assert kwargs["output_schema"] is output_schema
             kwargs["output_path"].write_bytes(b'{"unexpected":true}\n')
             raise RuntimeError("invalid phase shape")
 
@@ -279,6 +295,7 @@ def test_diagnostic_runner_preserves_invalid_output_and_error(tmp_path):
             output_path=work / "global_plan.json",
             max_output_bytes=1024,
             validate_output=lambda raw: json.loads(raw),
+            output_schema=output_schema,
         )
     assert (destination / "global-plan.output.json").read_bytes() == (
         b'{"unexpected":true}\n'
