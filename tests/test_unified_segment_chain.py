@@ -233,6 +233,130 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
         )
 
 
+def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> None:
+    frames = []
+    for order in range(1, 10):
+        data = f"relation-frame-{order}".encode()
+        (tmp_path / f"{order:02d}.png").write_bytes(data)
+        frames.append({
+            "order": order,
+            "path": f"{order:02d}.png",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "segment_time_s": float(order - 1),
+            "source_scene_id": "scene-a" if order < 5 else "scene-b",
+            "transition": (
+                {"type": "start", "at_segment_s": 0.0}
+                if order == 1 else
+                {"type": "hard_cut", "at_segment_s": 3.5}
+                if order == 5 else
+                {"type": "continuous", "at_segment_s": None}
+            ),
+        })
+    def occurrence(
+        relation_id: str, subject: str, object_: str, order: int, state: str,
+    ) -> dict:
+        frame = frames[order - 1]
+        return {
+            "relation_id": relation_id,
+            "subject_key": subject,
+            "predicate": "uses",
+            "object_key": object_,
+            "state": state,
+            "geometry": f"direct geometry at frame {order}",
+            "preserve": ["role", "count"],
+            "replace_together": True,
+            "frame": {
+                "order": order,
+                "segment_time_s": frame["segment_time_s"],
+                "source_scene_id": frame["source_scene_id"],
+            },
+        }
+    relations = [
+        occurrence("relation-01", "person-01", "entity-01", 4, "attached"),
+        occurrence("relation-01", "person-01", "entity-01", 5, "released"),
+        occurrence("relation-02", "entity-02", "scene-02", 6, "supported"),
+    ]
+    text = "replace current directly visible elements"
+    segment = {
+        "index": 1,
+        "new_keyframes": frames,
+        "old_video_prompt": {
+            "text": "motion only",
+            "sha256": hashlib.sha256(b"motion only").hexdigest(),
+        },
+        "image_optimization_prompt": [{
+            "order": order,
+            "text": text,
+            "sha256": hashlib.sha256(text.encode()).hexdigest(),
+        } for order in range(1, 10)],
+        "relation_occurrences": relations,
+        "audio_content": {
+            "lines_json": "[]",
+            "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
+            "voice_references": [],
+            "music_policy": "forbid",
+        },
+    }
+    payload = {
+        "schema": long_generation.PROMPT_FUSION_INPUT_SCHEMA,
+        "version": long_generation.PROMPT_FUSION_VERSION,
+        "segments": [segment],
+    }
+    input_data = _canonical(payload)
+    output = {
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [_fusion_v2_output(segment, "bounded visual")],
+    }
+    input_path = tmp_path / "multimodal_input.json"
+    output_path = tmp_path / "h3_prompt_plan.json"
+    input_path.write_bytes(input_data)
+    output_path.write_bytes(_canonical(output))
+    assert pipeline._prompt_fusion_early_output(
+        output_path.read_bytes(),
+        input_sha256=output["input_sha256"],
+        segment_count=1,
+        input_segments=payload["segments"],
+    ) == output_path.read_bytes()
+
+    frozen = long_generation.load_prompt_fusion(
+        input_path=input_path, output_path=output_path, root=tmp_path,
+    )
+    expected = output["segments"][0]["relation_states"]
+    assert [item["interval"] for item in expected] == [
+        {"start_frame_order": 1, "end_frame_order": 4, "source_scene_id": "scene-a"},
+        {"start_frame_order": 5, "end_frame_order": 9, "source_scene_id": "scene-b"},
+    ]
+    assert expected[0]["relations"][0]["states"][0]["state"] == "attached"
+    assert expected[1]["relations"][0]["states"][0]["state"] == "released"
+    contract = long_generation._compact_h3_relation_contract(expected)
+    assert (
+        f"{long_generation.RELATION_STATES_OPEN}"
+        f"{json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
+        f"{long_generation.RELATION_STATES_CLOSE}"
+    ) in frozen.final_prompts[0]
+
+    output["segments"][0]["relation_states"][1]["relations"][0][
+        "object_key"
+    ] = "entity-without-frame-evidence"
+    output_path.write_bytes(_canonical(output))
+    with pytest.raises(ValueError, match="prompt fusion raw output is invalid"):
+        pipeline._prompt_fusion_early_output(
+            output_path.read_bytes(),
+            input_sha256=output["input_sha256"],
+            segment_count=1,
+            input_segments=payload["segments"],
+        )
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_output_invalid",
+    ):
+        long_generation.load_prompt_fusion(
+            input_path=input_path, output_path=output_path, root=tmp_path,
+        )
+
+
 def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
     frames = []
     timeline = []
@@ -440,6 +564,22 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
     meta = {
         "segments": [{"index": 1, "visual_prompt": "source actions"}],
         "_image_optimization": {"frames": optimization_frames},
+        "_image_continuity": {"segments": [{
+            "segment_index": 1,
+            "frame_constraints": [{
+                "frame_index": order,
+                "relation_occurrences": ([{
+                    "relation_id": "relation-01",
+                    "subject_key": "person-01",
+                    "predicate": "uses",
+                    "object_key": "entity-01",
+                    "state": "directly evidenced",
+                    "geometry": "in the current hand",
+                    "preserve": ["role", "count"],
+                    "replace_together": True,
+                }] if order == 1 else []),
+            } for order in range(1, 10)],
+        }]},
     }
 
     payload = json.loads(long_generation.build_prompt_fusion_input(
@@ -460,6 +600,21 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
         "transition": {"type": "hard_cut", "at_segment_s": 2.267},
     }
     assert payload["segments"][0]["audio_content"]["music_policy"] == "forbid"
+    assert payload["segments"][0]["relation_occurrences"] == [{
+        "relation_id": "relation-01",
+        "subject_key": "person-01",
+        "predicate": "uses",
+        "object_key": "entity-01",
+        "state": "directly evidenced",
+        "geometry": "in the current hand",
+        "preserve": ["role", "count"],
+        "replace_together": True,
+        "frame": {
+            "order": 1,
+            "segment_time_s": 0.0,
+            "source_scene_id": "SCENE_01",
+        },
+    }]
 
     legacy_plan = replace(
         plan,
@@ -1290,10 +1445,21 @@ def _fusion_v2_visual(segment: dict, visual: str) -> list[str]:
 
 
 def _fusion_v2_output(segment: dict, visual: str) -> dict:
-    return {
+    output = {
         "index": segment["index"],
         "visual": _fusion_v2_visual(segment, visual),
     }
+    if "relation_occurrences" in segment:
+        timeline = [{
+            key: frame[key]
+            for key in (
+                "order", "segment_time_s", "source_scene_id", "transition",
+            )
+        } for frame in segment["new_keyframes"]]
+        output["relation_states"] = long_generation._expected_fusion_relation_states(
+            timeline, segment["relation_occurrences"],
+        )
+    return output
 
 
 def _fusion_v2_final_prompt(segment: dict, visual: str) -> str:
@@ -1311,6 +1477,8 @@ def _fusion_v2_final_prompt(segment: dict, visual: str) -> str:
         timeline=timeline,
         lines=json.loads(segment["audio_content"]["lines_json"]),
         music_policy=segment["audio_content"]["music_policy"],
+        relation_occurrences=segment.get("relation_occurrences"),
+        relation_states=_fusion_v2_output(segment, visual).get("relation_states"),
     )
 
 

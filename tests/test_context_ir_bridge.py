@@ -159,6 +159,43 @@ def _frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
     )
 
 
+def test_effective_prompt_mechanically_restores_frozen_relation_states(
+    tmp_path: Path,
+) -> None:
+    frozen = _frozen(tmp_path)
+    contract = {
+        "v": 1,
+        "d": {"relation-01": [
+            "person-01", "holds", "entity-01", ["count"], True,
+        ]},
+        "i": [[1, 4, "scene-01", {
+            "relation-01": [[1, "held", "left of subject"]],
+        }]],
+    }
+    encoded = json.dumps(
+        contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    block = (
+        f"{context_ir_bridge._RELATION_STATES_OPEN}{encoded}"
+        f"{context_ir_bridge._RELATION_STATES_CLOSE}"
+    )
+    frozen = replace(frozen, source_prompt=f"{frozen.source_prompt}\n{block}")
+    model_output = (
+        "rewritten visual\n"
+        f"{context_ir_bridge._RELATION_STATES_OPEN}"
+        '{"v":1,"d":{},"i":[]}'
+        f"{context_ir_bridge._RELATION_STATES_CLOSE}"
+    )
+
+    effective = context_ir_bridge._compile_effective_prompt(
+        frozen, model_output,
+    )
+
+    assert effective.count(context_ir_bridge._RELATION_STATES_OPEN) == 1
+    assert block in effective
+    assert '{"v":1,"d":{},"i":[]}' not in effective
+
+
 def _no_audio_frozen(
     tmp_path: Path, *, prompt: str | None = None,
 ) -> context_ir_bridge.FrozenContextIrRequest:

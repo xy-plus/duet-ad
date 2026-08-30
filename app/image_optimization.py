@@ -728,9 +728,17 @@ _FRAME_CONSTRAINT_KEYS = (
     "non_person_entity_ledger",
     "dominant_palette_contract",
 )
+_FRAME_CONSTRAINT_KEYS_WITH_RELATIONS = (
+    *_FRAME_CONSTRAINT_KEYS,
+    "relation_occurrences",
+)
 _NON_PERSON_ENTITY_LEDGER_KEYS = {"entities", "relations"}
 _ENTITY_LEDGER_ENTITY_KEYS = {"entity_id", "description", "visibility"}
 _ENTITY_LEDGER_RELATION_KEYS = {"subject_id", "predicate", "object_id"}
+_RELATION_OCCURRENCE_KEYS = {
+    "relation_id", "subject_key", "predicate", "object_key", "state",
+    "geometry", "preserve", "replace_together",
+}
 _ENTITY_VISIBILITIES = {
     "full", "partial", "edge_fragment", "occluded", "out_of_frame",
     "source_preserve",
@@ -741,11 +749,48 @@ _DIRECTLY_VISIBLE_ENTITY_VISIBILITIES = {
 _ENTITY_RELATION_PREDICATES = {
     "supports", "contacts", "separate_from", "occludes", "owned_by",
     "attached_to", "loaded_in", "held_by", "drives", "releases",
-    "inside", "part_of",
+    "inside", "part_of", "holds", "installs", "assembles", "operates",
+    "acts_on",
 }
 _PHYSICAL_ENTITY_RELATION_PREDICATES = {
     "supports", "contacts", "separate_from",
 }
+
+
+def _lower_relation_predicate(predicate: str, state: str) -> str:
+    """Lower free-form relation semantics without erasing direction or lifecycle."""
+    source = f"{predicate} {state}".casefold().replace("-", "_")
+    predicate_only = predicate.casefold().replace("-", "_")
+    rules = (
+        (("释放", "松开", "release"), "releases"),
+        (("分离", "脱离", "断开", "separate", "detach"), "separate_from"),
+        (("安装", "装入", "插入", "mount", "install"), "installs"),
+        (("组装", "装配", "assemble"), "assembles"),
+        (("持有", "握持", "握住", "拿着", "托住", "抱着", "hold", "grip"), "holds"),
+        (("操作", "操控", "驱动", "启动", "operate", "drive"), "operates"),
+        (("连接", "固定", "附着", "attach", "connect"), "attached_to"),
+        (("装载", "loaded"), "loaded_in"),
+        (("支撑", "承托", "support"), "supports"),
+        (("遮挡", "occlud"), "occludes"),
+        (("内部", "位于", "inside"), "inside"),
+        (("组成", "部分", "part_of"), "part_of"),
+        (("接触", "贴着", "contact"), "contacts"),
+    )
+    normalized = predicate_only.strip().replace(" ", "_")
+    if normalized in _ENTITY_RELATION_PREDICATES:
+        return normalized
+    # Lifecycle transitions are allowed to be carried by the frame state when
+    # the global predicate is generic, but a specific global role wins.
+    predicate_specific = next(
+        (lowered for needles, lowered in rules if any(n in predicate_only for n in needles)),
+        None,
+    )
+    if predicate_specific is not None:
+        return predicate_specific
+    return next(
+        (lowered for needles, lowered in rules if any(n in source for n in needles)),
+        "acts_on",
+    )
 _PHOTOMETRIC_CONTRACT_KEYS = (
     "light_direction",
     "light_quality",
@@ -1090,7 +1135,9 @@ def _canonical_scene_continuity_graph(
 
 
 def _canonical_non_person_entity_ledger(
-    value: object, allowed_person_ids: set[str], *, allow_sparse: bool = False,
+    value: object, allowed_person_ids: set[str], *,
+    allowed_scene_ids: set[str] | None = None,
+    allow_sparse: bool = False,
 ) -> dict:
     if (
         not isinstance(value, dict)
@@ -1147,7 +1194,10 @@ def _canonical_non_person_entity_ledger(
             "visibility": visibility,
         })
 
-    identifiers = entity_ids | allowed_person_ids | {_PROJECT_ENTITY_OWNER_ID}
+    scene_ids = allowed_scene_ids or set()
+    identifiers = (
+        entity_ids | allowed_person_ids | scene_ids | {_PROJECT_ENTITY_OWNER_ID}
+    )
     relations = []
     physical_pairs = set()
     occlusion_pairs = set()
@@ -1184,7 +1234,7 @@ def _canonical_non_person_entity_ledger(
                 and _PROJECT_ENTITY_OWNER_ID in {subject, object_}
             )
             or (
-                predicate in {"contacts", "separate_from"}
+                predicate == "contacts"
                 and subject >= object_
             )
         ):
@@ -1259,10 +1309,69 @@ def _canonical_dominant_palette_contract(value: object) -> dict:
     }
 
 
+def _canonical_relation_occurrences(value: object) -> list[dict]:
+    """Freeze direct per-frame relation evidence without prose truncation."""
+    if not isinstance(value, list) or len(value) > 60:
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    occurrences = []
+    seen_ids = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != _RELATION_OCCURRENCE_KEYS:
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        relation_id = _canonical_text(item.get("relation_id"), max_bytes=128)
+        subject_key = _canonical_text(item.get("subject_key"), max_bytes=128)
+        predicate = _canonical_text(item.get("predicate"), max_bytes=128)
+        object_key = _canonical_text(item.get("object_key"), max_bytes=128)
+        state = _canonical_text(item.get("state"), max_bytes=512)
+        geometry = _canonical_text(item.get("geometry"), max_bytes=512)
+        raw_preserve = item.get("preserve")
+        if (
+            relation_id in seen_ids
+            or subject_key == object_key
+            or not isinstance(raw_preserve, list)
+            or len(raw_preserve) > 30
+            or not isinstance(item.get("replace_together"), bool)
+        ):
+            raise ImageOptimizationOutputError(
+                "image optimization output is missing or invalid"
+            )
+        preserve = [
+            _canonical_text(text, max_bytes=512) for text in raw_preserve
+        ]
+        seen_ids.add(relation_id)
+        occurrences.append({
+            "relation_id": relation_id,
+            "subject_key": subject_key,
+            "predicate": predicate,
+            "object_key": object_key,
+            "state": state,
+            "geometry": geometry,
+            "preserve": preserve,
+            "replace_together": item["replace_together"],
+        })
+    if occurrences != sorted(occurrences, key=lambda item: item["relation_id"]):
+        raise ImageOptimizationOutputError(
+            "image optimization output is missing or invalid"
+        )
+    return occurrences
+
+
 def _canonical_frame_constraint(
-    value: object, allowed_person_ids: set[str], *, allow_sparse: bool = False,
+    value: object, allowed_person_ids: set[str], *,
+    allowed_scene_ids: set[str] | None = None,
+    allow_sparse: bool = False,
 ) -> dict:
-    if not isinstance(value, dict) or set(value) != set(_FRAME_CONSTRAINT_KEYS):
+    if (
+        not isinstance(value, dict)
+        or frozenset(value) not in {
+            frozenset(_FRAME_CONSTRAINT_KEYS),
+            frozenset(_FRAME_CONSTRAINT_KEYS_WITH_RELATIONS),
+        }
+    ):
         raise ImageOptimizationOutputError(
             "image optimization output is missing or invalid"
         )
@@ -1271,7 +1380,7 @@ def _canonical_frame_constraint(
         raise ImageOptimizationOutputError(
             "image optimization output is missing or invalid"
         )
-    return {
+    canonical = {
         "frame_index": frame_index,
         **{
             key: _canonical_text(value.get(key))
@@ -1279,12 +1388,18 @@ def _canonical_frame_constraint(
         },
         "non_person_entity_ledger": _canonical_non_person_entity_ledger(
             value.get("non_person_entity_ledger"), allowed_person_ids,
+            allowed_scene_ids=allowed_scene_ids,
             allow_sparse=allow_sparse,
         ),
         "dominant_palette_contract": _canonical_dominant_palette_contract(
             value.get("dominant_palette_contract")
         ),
     }
+    if "relation_occurrences" in value:
+        canonical["relation_occurrences"] = _canonical_relation_occurrences(
+            value["relation_occurrences"]
+        )
+    return canonical
 
 
 def _canonical_plan_v3(
@@ -1353,7 +1468,9 @@ def _canonical_plan_v3(
                 if raw_index in person["observable_frames"]
             }
             constraint = _canonical_frame_constraint(
-                item, allowed_person_ids, allow_sparse=allow_sparse_facts,
+                item, allowed_person_ids,
+                allowed_scene_ids={base["scene"]["scene_id"]},
+                allow_sparse=allow_sparse_facts,
             )
             index = constraint["frame_index"]
             if (
@@ -1965,7 +2082,6 @@ def compile_semantic_plan(
     classified_derived_appearances = 0
 
     relation_designs: dict[str, dict] = {}
-    relation_systems_by_member: dict[str, list[str]] = {}
     for relation_key, indexed in indexed_relations.items():
         if not isinstance(indexed, dict):
             continue
@@ -1974,9 +2090,10 @@ def compile_semantic_plan(
             design = {}
         subject = indexed["subject_key"]
         object_key = indexed["object_key"]
-        predicate = _semantic_text(
-            design.get("predicate"), indexed["predicate"], max_bytes=128,
-        )
+        # Endpoint roles and the predicate are upstream index authority.  The
+        # image Skill may describe replacement mechanics, but cannot rename a
+        # relation into a different semantic edge.
+        predicate = _semantic_text(indexed["predicate"], "acts_on", max_bytes=128)
         replacement_system = _semantic_text(
             design.get("replacement_system"),
             "保持两个替换元素的功能接口、尺度和配合方式",
@@ -1987,16 +2104,21 @@ def compile_semantic_plan(
             "保持源帧直接可见的角色分工、接触几何和状态",
             max_bytes=512,
         )
+        indexed_preserve = [
+            _semantic_text(text, preserve, max_bytes=512)
+            for text in indexed.get("preserve", [])
+            if isinstance(text, str) and text.strip()
+        ]
         relation_designs[relation_key] = {
             "subject_key": subject,
             "predicate": predicate,
             "object_key": object_key,
             "replacement_system": replacement_system,
             "preserve": preserve,
+            "preserve_items": indexed_preserve or [preserve],
+            "replace_together": indexed.get("replace_together") is True,
+            "occurrences": deepcopy(indexed.get("occurrences", [])),
         }
-        system = f"关系 {relation_key}：{subject} {predicate} {object_key}；{replacement_system}"
-        relation_systems_by_member.setdefault(subject, []).append(system)
-        relation_systems_by_member.setdefault(object_key, []).append(system)
 
     def field(
         container: object,
@@ -2122,8 +2244,6 @@ def compile_semantic_plan(
         if replacement_identity == source_identity:
             replacement_identity = f"与源身份不同的新人物：{replacement_identity}"
             issues.append(f"unchanged_identity:{key}")
-        if relation_systems_by_member.get(key):
-            replacement_identity += "；" + "；".join(relation_systems_by_member[key])
         if key in indexed_people:
             replacement_identity = _tag_stable_key(key, replacement_identity)
         first_key = next(
@@ -2209,10 +2329,7 @@ def compile_semantic_plan(
                 (
                     _tag_stable_key(
                         entity_key,
-                        description.strip() + (
-                            "；" + "；".join(relation_systems_by_member[entity_key])
-                            if relation_systems_by_member.get(entity_key) else ""
-                        ),
+                        description.strip(),
                     )
                     if entity_key in indexed_entities
                     and isinstance(description, str) and description.strip()
@@ -2430,6 +2547,7 @@ def compile_semantic_plan(
             ledger_entities = []
             ledger_relations = []
             entity_relation_notes = []
+            relation_occurrences = []
             for entity_key in scene_entity_keys:
                 observation = frame_entity_semantics.get(entity_key)
                 observation_path = f"{frame_path}.entities.{entity_key}"
@@ -2482,68 +2600,58 @@ def compile_semantic_plan(
                     f"{_semantic_text(relationship, '')}；"
                     f"{entity_designs[entity_key]['persistence']}"
                 )
-            frame_relation_semantics = (
-                frame_value.get("relations")
-                if isinstance(frame_value, dict)
-                and isinstance(frame_value.get("relations"), dict)
-                else {}
-            )
             stable_to_runtime = {
                 **{
                     key: identifier for key, identifier in person_id_by_key.items()
                     if identifier in current_person_ids
                 },
                 **scene_entity_ids,
+                scene_key: scene_id_by_key[scene_key],
             }
-            directly_visible_stable_keys = {
-                person_key for person_key in observed_person_keys
-                if frame["key"] in observations[person_key]
-            } | {
-                entity_key for entity_key, observation in frame_entity_semantics.items()
-                if isinstance(observation, dict)
-                and observation.get("visibility") in {"visible", "occluded"}
-            }
-            for relation_key, design in relation_designs.items():
-                observation = frame_relation_semantics.get(relation_key)
-                if not isinstance(observation, dict):
+            for relation_key in sorted(relation_designs):
+                design = relation_designs[relation_key]
+                indexed_frame = next((
+                    indexed_frame
+                    for occurrence in design["occurrences"]
+                    if occurrence.get("segment_index") == index
+                    for indexed_frame in occurrence.get("frames", [])
+                    if indexed_frame.get("frame_order") == frame["frame_index"]
+                ), None)
+                if not isinstance(indexed_frame, dict):
                     continue
-                if not {
-                    design["subject_key"], design["object_key"]
-                }.issubset(directly_visible_stable_keys):
-                    continue
+                state = _semantic_text(
+                    indexed_frame.get("state"), "source-preserve/no-invention",
+                    max_bytes=512,
+                )
+                geometry = _semantic_text(
+                    indexed_frame.get("geometry"),
+                    "保持当前帧直接可见的相对几何", max_bytes=512,
+                )
+                relation_occurrences.append({
+                    "relation_id": relation_key,
+                    "subject_key": design["subject_key"],
+                    "predicate": design["predicate"],
+                    "object_key": design["object_key"],
+                    "state": state,
+                    "geometry": geometry,
+                    "preserve": list(design["preserve_items"]),
+                    "replace_together": design["replace_together"],
+                })
+                # The stable-key occurrence above is the lossless authority.
+                # The legacy runtime ledger remains useful when both endpoints
+                # have a concrete runtime identifier in this frame.
                 subject_id = stable_to_runtime.get(design["subject_key"])
                 object_id = stable_to_runtime.get(design["object_key"])
                 if subject_id is None or object_id is None:
                     continue
-                state = _semantic_text(
-                    observation.get("state"), "source-preserve/no-invention",
-                    max_bytes=256,
-                )
-                geometry = _semantic_text(
-                    observation.get("geometry"), "保持当前帧直接可见的相对几何",
-                    max_bytes=256,
-                )
-                evidence = _semantic_text(
-                    observation.get("evidence"), "当前帧直接可见像素",
-                    max_bytes=256,
-                )
-                predicate = design["predicate"].strip().lower().replace(" ", "_")
-                if predicate not in _ENTITY_RELATION_PREDICATES:
-                    predicate = "contacts"
-                    if subject_id > object_id:
-                        subject_id, object_id = object_id, subject_id
+                predicate = _lower_relation_predicate(design["predicate"], state)
+                if predicate == "contacts" and subject_id > object_id:
+                    subject_id, object_id = object_id, subject_id
                 ledger_relations.append({
                     "subject_id": subject_id,
                     "predicate": predicate,
                     "object_id": object_id,
                 })
-                entity_relation_notes.append(
-                    "全项目共享关系绑定："
-                    f"{relation_key} -> {design['subject_key']} -> {design['predicate']} -> "
-                    f"{design['object_key']} -> {design['replacement_system']}；"
-                    f"当前状态={state}；当前几何={geometry}；证据={evidence}；"
-                    f"保持={design['preserve']}"
-                )
             ledger_relations = [
                 dict(item) for item in {
                     (item["subject_id"], item["predicate"], item["object_id"]): item
@@ -2691,6 +2799,7 @@ def compile_semantic_plan(
                     "entities": ledger_entities,
                     "relations": ledger_relations,
                 },
+                "relation_occurrences": relation_occurrences,
                 "dominant_palette_contract": {
                     "area_weighted_warm_cool_family": "balanced",
                     "saturation_style": "natural",
@@ -2993,6 +3102,8 @@ def compile_frame_prompts(
             frame_clause = (
                 f"{frame_clause}；non_person_entity_ledger="
                 f"{_plan_json(constraint['non_person_entity_ledger'])}"
+                f"；relation_occurrences="
+                f"{_plan_json(constraint.get('relation_occurrences', []))}"
                 f"；dominant_palette_contract="
                 f"{_plan_json(constraint['dominant_palette_contract'])}"
             )

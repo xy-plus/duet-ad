@@ -53,6 +53,8 @@ _SPEECH_PREFIX = "DUET_SPEECH_V1"
 _DIALOGUE_TOKEN = re.compile(r"<d>\[[^\]\r\n]+\][\s\S]*?</d>")
 _TIMELINE_OPEN = "<KEYFRAME_TIMELINE_JSON>"
 _TIMELINE_CLOSE = "</KEYFRAME_TIMELINE_JSON>"
+_RELATION_STATES_OPEN = "<RELATION_STATES_JSON>"
+_RELATION_STATES_CLOSE = "</RELATION_STATES_JSON>"
 _DIALOGUE_POLICY_OPEN = "<DUET_DIALOGUE_POLICY_V1>"
 _DIALOGUE_POLICY_CLOSE = "</DUET_DIALOGUE_POLICY_V1>"
 _DIALOGUE_POLICY = "\n".join(
@@ -80,10 +82,12 @@ _SEMANTIC_SCORE_KEYS = frozenset(
         "speech",
         "keyframe_timeline",
         "music_policy",
+        "relation_states",
         "overall",
         "dialogue_policy",
     }
 )
+_PRE_RELATION_SEMANTIC_SCORE_KEYS = _SEMANTIC_SCORE_KEYS - {"relation_states"}
 _DIALOGUE_POLICY_SCORE_KEYS = frozenset(
     {
         "language_explicit",
@@ -693,6 +697,56 @@ def _fusion_policy_suffix(prompt: str) -> str | None:
     return suffix
 
 
+def _relation_states_contract(prompt: str) -> str | None:
+    """Extract the one canonical backend-compiled relation authority block."""
+    opening_count = prompt.count(_RELATION_STATES_OPEN)
+    closing_count = prompt.count(_RELATION_STATES_CLOSE)
+    if opening_count == closing_count == 0:
+        return None
+    if opening_count != 1 or closing_count != 1:
+        raise ContextIrContractError("source_relation_states_invalid")
+    start = prompt.find(_RELATION_STATES_OPEN)
+    data_start = start + len(_RELATION_STATES_OPEN)
+    end = prompt.find(_RELATION_STATES_CLOSE, data_start)
+    if end < data_start:
+        raise ContextIrContractError("source_relation_states_invalid")
+    raw = prompt[data_start:end]
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ContextIrContractError("source_relation_states_invalid") from None
+    try:
+        canonical = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        raise ContextIrContractError("source_relation_states_invalid") from None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"v", "d", "i"}
+        or value.get("v") != 1
+        or not isinstance(value.get("d"), dict)
+        or not isinstance(value.get("i"), list)
+        or raw != canonical
+    ):
+        raise ContextIrContractError("source_relation_states_invalid")
+    return f"{_RELATION_STATES_OPEN}{raw}{_RELATION_STATES_CLOSE}"
+
+
+def _without_relation_states(prompt: str) -> str:
+    """Remove model-authored relation blocks before restoring frozen bytes."""
+    text = prompt
+    while _RELATION_STATES_OPEN in text:
+        start = text.find(_RELATION_STATES_OPEN)
+        end = text.find(_RELATION_STATES_CLOSE, start)
+        if end < 0:
+            text = text[:start]
+            break
+        text = text[:start] + text[end + len(_RELATION_STATES_CLOSE):]
+    return text.replace(_RELATION_STATES_CLOSE, "")
+
+
 def _effective_preserves_fusion_policy(
     effective_prompt: str, expected_suffix: str,
 ) -> bool:
@@ -766,12 +820,21 @@ def _semantic_score(
         suffix is None
         or _effective_preserves_fusion_policy(context_output_prompt, suffix)
     )
-    values = (speech, timeline, music_policy)
+    try:
+        relation_contract = _relation_states_contract(request.source_prompt)
+    except ContextIrContractError:
+        relation_contract = None
+    relations = float(
+        relation_contract is None
+        or relation_contract in context_output_prompt
+    )
+    values = (speech, timeline, music_policy, relations)
     return {
         "speech_expected": bool(expected_voice_texts),
         "speech": speech,
         "keyframe_timeline": timeline,
         "music_policy": music_policy,
+        "relation_states": relations,
         "overall": sum(values) / len(values),
         "dialogue_policy": _dialogue_policy_score(request, context_output_prompt),
     }
@@ -781,13 +844,19 @@ def _compile_effective_prompt(
     request: FrozenContextIrRequest, context_output_prompt: str,
 ) -> str:
     """Mechanically restore immutable Fusion fields around Context semantics."""
+    relation_contract = _relation_states_contract(request.source_prompt)
+    context_output_prompt = _without_relation_states(context_output_prompt)
     if _is_current_ref2va(request):
         context_output_prompt = _bind_exact_dialogue(
             request, context_output_prompt,
         )
     suffix = _fusion_policy_suffix(request.source_prompt)
     if suffix is None:
-        return _with_dialogue_policy(context_output_prompt)
+        effective = _with_dialogue_policy(context_output_prompt)
+        return (
+            f"{effective}\n{relation_contract}"
+            if relation_contract is not None else effective
+        )
     visual = _without_dialogue_policy(context_output_prompt)
     opening = "<VISUAL>"
     closing = "</VISUAL>"
@@ -821,7 +890,13 @@ def _compile_effective_prompt(
     visual = visual.strip()
     if not visual:
         visual = _without_dialogue_policy(context_output_prompt.strip())
-    return f"<VISUAL>\n{visual}\n</VISUAL>\n{_DIALOGUE_POLICY}\n{suffix}"
+    relation_suffix = (
+        f"\n{relation_contract}" if relation_contract is not None else ""
+    )
+    return (
+        f"<VISUAL>\n{visual}{relation_suffix}\n</VISUAL>\n"
+        f"{_DIALOGUE_POLICY}\n{suffix}"
+    )
 
 
 def _mime_type(path: Path, *, audio: bool) -> str:
@@ -1061,6 +1136,9 @@ def freeze_context_ir_request(
     keyframe_timeline_json = _keyframe_timeline_contract(
         source_h3_request.prompt
     )
+    relation_states_contract = _relation_states_contract(
+        source_h3_request.prompt
+    )
     fusion_policy_suffix = _fusion_policy_suffix(source_h3_request.prompt)
     fusion_voice_texts = _fusion_voice_texts(source_h3_request.prompt)
     if (
@@ -1125,6 +1203,10 @@ def freeze_context_ir_request(
     if fusion_policy_suffix is not None:
         semantic_contract["fusion_policy_suffix_sha256"] = _sha256_text(
             fusion_policy_suffix
+        )
+    if relation_states_contract is not None:
+        semantic_contract["relation_states_sha256"] = _sha256_text(
+            relation_states_contract
         )
     semantic_contract_sha256 = _canonical_sha256(semantic_contract)
     input_manifest = _source_input_manifest(
@@ -2455,6 +2537,13 @@ def load_effective_prompt_receipt(
         raise ContextIrReceiptError("context_ir_receipt_invalid")
     if raw.get("source_prompt_sha256") != _sha256_text(str(raw.get("source_prompt"))):
         raise ContextIrReceiptError("context_ir_receipt_invalid")
+    try:
+        source_relations = _relation_states_contract(str(raw.get("source_prompt")))
+        effective_relations = _relation_states_contract(effective_prompt)
+    except ContextIrContractError:
+        raise ContextIrReceiptError("context_ir_receipt_invalid") from None
+    if source_relations != effective_relations:
+        raise ContextIrReceiptError("context_ir_receipt_mismatch")
     if legacy_receipt:
         semantic_score: Mapping[str, object] = {}
     else:
@@ -2466,14 +2555,17 @@ def load_effective_prompt_receipt(
             or raw.get("context_output_prompt_sha256")
             != _sha256_text(context_output_prompt)
             or not isinstance(semantic_score, Mapping)
-            or set(semantic_score) != _SEMANTIC_SCORE_KEYS
+            or set(semantic_score) not in {
+                _SEMANTIC_SCORE_KEYS, _PRE_RELATION_SEMANTIC_SCORE_KEYS,
+            }
             or not isinstance(semantic_score.get("speech_expected"), bool)
             or any(
                 isinstance(semantic_score.get(key), bool)
                 or not isinstance(semantic_score.get(key), (int, float))
                 or not 0.0 <= float(semantic_score[key]) <= 1.0
                 for key in (
-                    "speech", "keyframe_timeline", "music_policy", "overall"
+                    "speech", "keyframe_timeline", "music_policy", "overall",
+                    *(('relation_states',) if 'relation_states' in semantic_score else ()),
                 )
             )
             or not isinstance(semantic_score.get("dialogue_policy"), Mapping)

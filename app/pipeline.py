@@ -2623,7 +2623,7 @@ def _require_prompt_fusion_v2_input(input_data: bytes) -> dict:
         ):
             raise PipelineError("prompt fusion input is invalid")
         try:
-            long_generation._freeze_local_keyframe_sources(
+            timeline = long_generation._freeze_local_keyframe_sources(
                 [{
                     key: frame[key]
                     for key in (
@@ -2631,6 +2631,10 @@ def _require_prompt_fusion_v2_input(input_data: bytes) -> dict:
                     )
                 } for frame in frames],
             )
+            if "relation_occurrences" in segment:
+                long_generation._freeze_fusion_relation_occurrences(
+                    segment["relation_occurrences"], timeline,
+                )
         except (
             KeyError,
             TypeError,
@@ -2713,6 +2717,7 @@ def _read_prompt_fusion_stage_output(path: Path, *, segment_count: int) -> bytes
 
 def _prompt_fusion_early_output(
     data: bytes, *, input_sha256: str, segment_count: int,
+    input_segments: list | None = None,
 ) -> bytes:
     """Validate the bounded output envelope before adopting its atomic publish."""
     try:
@@ -2728,9 +2733,26 @@ def _prompt_fusion_early_output(
         or value.get("input_sha256") != input_sha256
         or not isinstance(segments, list)
         or len(segments) != segment_count
-        or any(
+    ):
+        raise ValueError("prompt fusion raw output is invalid")
+    for index, segment in enumerate(segments, 1):
+        source_segment = (
+            input_segments[index - 1]
+            if isinstance(input_segments, list)
+            and len(input_segments) == segment_count
+            else None
+        )
+        relation_contract = (
+            isinstance(source_segment, dict)
+            and "relation_occurrences" in source_segment
+        )
+        expected_keys = (
+            {"index", "visual", "relation_states"}
+            if relation_contract else {"index", "visual"}
+        )
+        if (
             not isinstance(segment, dict)
-            or set(segment) != {"index", "visual"}
+            or set(segment) != expected_keys
             or segment.get("index") != index
             or not isinstance(segment.get("visual"), list)
             or not segment["visual"]
@@ -2738,10 +2760,46 @@ def _prompt_fusion_early_output(
                 not isinstance(text, str) or not text.strip()
                 for text in segment["visual"]
             )
-            for index, segment in enumerate(segments, 1)
-        )
-    ):
-        raise ValueError("prompt fusion raw output is invalid")
+        ):
+            raise ValueError("prompt fusion raw output is invalid")
+        if relation_contract:
+            try:
+                timeline = long_generation._freeze_local_keyframe_sources([{
+                    key: frame[key]
+                    for key in (
+                        "order", "segment_time_s", "source_scene_id",
+                        "transition",
+                    )
+                } for frame in source_segment["new_keyframes"]])
+                occurrences = long_generation._freeze_fusion_relation_occurrences(
+                    source_segment["relation_occurrences"], timeline,
+                )
+                expected = long_generation._expected_fusion_relation_states(
+                    timeline, occurrences,
+                )
+            except (KeyError, TypeError, long_generation.LongGenerationError):
+                raise ValueError("prompt fusion raw output is invalid") from None
+            if (
+                len(segment["visual"]) != len(expected)
+                or segment.get("relation_states") != expected
+            ):
+                raise ValueError("prompt fusion raw output is invalid")
+            try:
+                long_generation._compile_fusion_ref2va_prompt(
+                    visual=segment["visual"],
+                    timeline=timeline,
+                    lines=json.loads(
+                        source_segment["audio_content"]["lines_json"]
+                    ),
+                    music_policy=source_segment["audio_content"]["music_policy"],
+                    relation_occurrences=occurrences,
+                    relation_states=expected,
+                )
+            except (
+                KeyError, TypeError, json.JSONDecodeError,
+                long_generation.LongGenerationError,
+            ):
+                raise ValueError("prompt fusion raw output is invalid") from None
     return data
 
 
@@ -3172,6 +3230,7 @@ def produce_prompt_fusion(
                         data,
                         input_sha256=state["input_sha256"],
                         segment_count=len(input_payload["segments"]),
+                        input_segments=input_payload["segments"],
                     ),
                 )
             else:

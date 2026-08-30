@@ -42,4 +42,4 @@ frames key 必须覆盖 `semantic_slots.frames[].key` 的全部 key 并逐字复
 
 ## 完成
 
-自检后最终回答只返回上述完整、可解析的 JSON object（UTF-8），不得只给解释；顶层及嵌套 key 遵守合同，required string 非空。实体 ID、关系图和完整机械字段由后端构造；文件校验和正式发布由后端负责。语义缺损写 `source-preserve/no-invention`；不新增质量门禁，不新增 reject、retry 或 fallback。
+自检后最终回答只返回上述完整、可解析的 JSON object（UTF-8），不得只给解释；顶层及嵌套 key 遵守合同，required string 非空。实体 ID、关系图和完整机械字段由后端构造；后端把 element_index 中每帧直接证据机械冻结为独立 relation occurrences，描述字段即使达到长度预算也不得成为关系主客体、数量或状态的唯一载体。文件校验和正式发布由后端负责。语义缺损写 `source-preserve/no-invention`；不新增质量门禁，不新增 reject、retry 或 fallback。
