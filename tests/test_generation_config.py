@@ -273,3 +273,191 @@ def test_startup_recovery_reuses_frozen_config_without_reordering(
     with TestClient(create_app(settings)):
         assert completed.wait(2)
     assert events == expected_events
+
+
+def test_successful_image_retry_reenters_the_same_operation(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(
+        settings.data_dir,
+        "",
+        "clip.mp4",
+        generation_config=generation_config.DEFAULTS,
+    )
+    cid = meta["id"]
+    options = generation_config.postprocess_options(generation_config.DEFAULTS)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status="done",
+        _postprocess_receipt={"version": 4, "options": options},
+        postprocess={
+            "status": "failed",
+            "error": "provider_rejected",
+            "options": options,
+            "segments": [{
+                "index": 1,
+                "status": "failed",
+                "error": "provider_rejected",
+                "revision": 3,
+            }],
+        },
+    )
+    events = []
+
+    async def retry(_settings, called_cid, index, payload, _locks):
+        assert (called_cid, index) == (cid, 1)
+        assert payload == {"confirm": True, "expected_revision": 3}
+        events.append("retry")
+        current = storage.load_meta(settings.data_dir, cid)["postprocess"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            postprocess={**current, "status": "running", "error": None},
+        )
+
+    async def run(_settings, called_cid, _media, _seedream, only, **_kwargs):
+        assert (called_cid, only) == (cid, {1})
+        events.append("run")
+        current = storage.load_meta(settings.data_dir, cid)["postprocess"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            postprocess={**current, "status": "done", "error": None},
+        )
+
+    def generate(*_args):
+        events.append("generation")
+
+    monkeypatch.setattr(postprocess, "retry_segment", retry)
+    monkeypatch.setattr(postprocess, "run_task", run)
+    monkeypatch.setattr(long_generation, "plan_receipt", lambda *_args: object())
+    monkeypatch.setattr(
+        postprocess,
+        "image_acceptance_status",
+        lambda *_args: {"required": False, "accepted": False},
+    )
+    monkeypatch.setattr(main_module, "_start_automatic_v4_generation", generate)
+
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            f"/api/conversations/{cid}/postprocess/segments/1/retry",
+            headers=AUTH,
+            json={"confirm": True, "expected_revision": 3},
+        )
+    assert response.status_code == 202
+    assert events == ["retry", "run", "generation"]
+
+
+def test_failed_image_retry_does_not_advance_the_operation(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(
+        settings.data_dir,
+        "",
+        "clip.mp4",
+        generation_config=generation_config.DEFAULTS,
+    )
+    cid = meta["id"]
+    options = generation_config.postprocess_options(generation_config.DEFAULTS)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status="done",
+        _postprocess_receipt={"version": 4, "options": options},
+        postprocess={
+            "status": "failed",
+            "error": "provider_rejected",
+            "options": options,
+            "segments": [{
+                "index": 1,
+                "status": "failed",
+                "error": "provider_rejected",
+                "revision": 1,
+            }],
+        },
+    )
+
+    async def retry(_settings, _cid, _index, _payload, _locks):
+        current = storage.load_meta(settings.data_dir, cid)["postprocess"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            postprocess={**current, "status": "running", "error": None},
+        )
+
+    async def run(*_args, **_kwargs):
+        current = storage.load_meta(settings.data_dir, cid)["postprocess"]
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            postprocess={**current, "status": "failed", "error": "provider_rejected"},
+        )
+
+    monkeypatch.setattr(postprocess, "retry_segment", retry)
+    monkeypatch.setattr(postprocess, "run_task", run)
+    monkeypatch.setattr(long_generation, "plan_receipt", lambda *_args: object())
+    monkeypatch.setattr(
+        main_module,
+        "_start_automatic_v4_generation",
+        lambda *_args: pytest.fail("failed image retry must not advance"),
+    )
+
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            f"/api/conversations/{cid}/postprocess/segments/1/retry",
+            headers=AUTH,
+            json={"confirm": True, "expected_revision": 1},
+        )
+    assert response.status_code == 202
+    assert storage.load_meta(settings.data_dir, cid)["postprocess"]["status"] == "failed"
+
+
+def test_image_acceptance_reenters_the_same_operation(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(
+        settings.data_dir,
+        "",
+        "clip.mp4",
+        generation_config=generation_config.DEFAULTS,
+    )
+    cid = meta["id"]
+    options = generation_config.postprocess_options(generation_config.DEFAULTS)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status="done",
+        _postprocess_receipt={"version": 4, "options": options},
+        postprocess={"status": "done", "error": None, "options": options},
+    )
+    events = []
+
+    def accept(_settings, called_cid, payload):
+        assert called_cid == cid
+        assert payload == {"confirm": True}
+        events.append("accept")
+        return {"required": True, "accepted": True}
+
+    def acceptance_status(*_args):
+        return {"required": True, "accepted": bool(events)}
+
+    def generate(*_args):
+        events.append("generation")
+
+    monkeypatch.setattr(postprocess, "accept_images", accept)
+    monkeypatch.setattr(postprocess, "image_acceptance_status", acceptance_status)
+    monkeypatch.setattr(long_generation, "plan_receipt", lambda *_args: object())
+    monkeypatch.setattr(main_module, "_start_automatic_v4_generation", generate)
+
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            f"/api/conversations/{cid}/image-acceptance",
+            headers=AUTH,
+            json={"confirm": True},
+        )
+    assert response.status_code == 202
+    assert events == ["accept", "generation"]

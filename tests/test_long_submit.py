@@ -2801,6 +2801,150 @@ def test_current_operation_replay_ignores_new_id_and_never_reposts_unknown(
     assert stored["client_request_id"] == "parent-request-123"
 
 
+def test_current_operation_context_failure_reaches_strict_recovery(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings, joins=("hard_cut",))
+    options = {
+        "remove_subtitle": False,
+        "remove_brand": False,
+        "optimize_image": True,
+    }
+    generation = {
+        "status": "failed",
+        "error": "long_video_segment_failed",
+        "stage": "h3",
+        "attempt": 1,
+        "client_request_id": "parent-request-123",
+        "fast_mode": False,
+        "segments": [{
+            "index": 1,
+            "status": "failed",
+            "error": "context_ir_semantic_mismatch",
+        }],
+    }
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        dialogue_mode="auto",
+        dialogue_delivery="auto",
+        resolved_dialogue_delivery="off_screen",
+        fit_mode="none",
+        aspect_ratio="9:16",
+        resolution="768p",
+        frozen_plan_receipt=receipt,
+        _postprocess_receipt={"version": 4, "options": options},
+        postprocess={"status": "done", "error": None, "options": options},
+        generation=generation,
+    )
+    plan = SimpleNamespace(
+        prompt_fusion=SimpleNamespace(version=long_generation.PROMPT_FUSION_VERSION)
+    )
+    events = []
+
+    monkeypatch.setattr(
+        long_generation, "generation_segments_are_valid", lambda *_args: True
+    )
+    monkeypatch.setattr(long_generation, "freeze_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(
+        long_generation,
+        "context_ir_semantic_failure_is_recoverable",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        long_generation, "run", lambda *_args, **_kwargs: events.append("run")
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_resume_long_generation",
+        lambda *_args, **_kwargs: pytest.fail("must use the strict normal coordinator"),
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt, dialogue_delivery="auto"),
+    )
+
+    assert response.status_code == 202, response.json()
+    assert response.json() == {"status": "queued", "attempt": 1}
+    assert events == ["run"]
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "queued"
+    assert stored["segments"][0]["status"] == "queued"
+
+
+def test_current_operation_context_ready_uses_explicit_h3_continuation(
+    enabled, monkeypatch,
+):
+    settings, client = enabled
+    cid, receipt = _make_long(settings, joins=("hard_cut",))
+    options = {
+        "remove_subtitle": False,
+        "remove_brand": False,
+        "optimize_image": True,
+    }
+    generation = {
+        "status": "resume_required",
+        "error": "context_ir_ready",
+        "stage": "h3",
+        "attempt": 1,
+        "client_request_id": "parent-request-123",
+        "fast_mode": False,
+        "segments": [{
+            "index": 1,
+            "status": "resume_required",
+            "error": "context_ir_ready",
+            "child_request_id": None,
+            "h3_attempt_id": None,
+        }],
+    }
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        dialogue_mode="auto",
+        dialogue_delivery="auto",
+        resolved_dialogue_delivery="off_screen",
+        fit_mode="none",
+        aspect_ratio="9:16",
+        resolution="768p",
+        frozen_plan_receipt=receipt,
+        _postprocess_receipt={"version": 4, "options": options},
+        postprocess={"status": "done", "error": None, "options": options},
+        generation=generation,
+    )
+    plan = SimpleNamespace(
+        prompt_fusion=SimpleNamespace(version=long_generation.PROMPT_FUSION_VERSION)
+    )
+    events = []
+
+    monkeypatch.setattr(
+        long_generation, "generation_segments_are_valid", lambda *_args: True
+    )
+    monkeypatch.setattr(long_generation, "freeze_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(
+        long_generation, "run", lambda *_args, **_kwargs: events.append("run")
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_resume_long_generation",
+        lambda *_args, **_kwargs: pytest.fail("must not resume a missing H3 attempt"),
+    )
+
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt, dialogue_delivery="auto"),
+    )
+
+    assert response.status_code == 202, response.json()
+    assert response.json() == {"status": "queued", "attempt": 1}
+    assert events == ["run"]
+    stored = storage.load_meta(settings.data_dir, cid)["generation"]
+    assert stored["status"] == "queued"
+
+
 def test_long_v4_combined_first_promotion_binds_settings_and_is_unpaid(
     enabled, monkeypatch,
 ):

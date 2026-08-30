@@ -3635,6 +3635,17 @@ def _ensure_existing_generation(
     return updated
 
 
+def _generation_requires_explicit_context_resume(meta: Mapping) -> bool:
+    """Keep the existing two-step Context recovery reachable for one operation."""
+    generation = meta.get("generation")
+    if not isinstance(generation, Mapping):
+        return False
+    return long_generation.has_context_ir_semantic_failure_intent(generation) or (
+        _effective_generation_status(generation) == "resume_required"
+        and generation.get("error") == "context_ir_ready"
+    )
+
+
 def _reconcile_stale_submission(settings: Settings, cid: str, owner: object) -> None:
     """Release a half-frozen first submit without creating paid generation evidence."""
     meta = storage.load_submission_claim(settings.data_dir, cid, owner)
@@ -3840,6 +3851,23 @@ def create_app(settings: Settings) -> FastAPI:
             cid,
             codex_runner,
         )
+
+    async def run_postprocess_operation(
+        cid: str, only_segments: set[int] | None = None,
+    ) -> None:
+        """Run one authorized image pass, then re-enter the durable operation."""
+        await postprocess.run_task(
+            settings,
+            cid,
+            mediakit_sem,
+            seedream_sem,
+            only_segments,
+            audit_runner=codex_runner,
+            verification_runner=codex_runner,
+        )
+        meta = storage.load_meta(settings.data_dir, cid)
+        if isinstance(meta, Mapping) and _uses_single_operation_contract(meta):
+            await advance_v4_operation(cid)
 
     @app.on_event("startup")
     async def bind_operation_loop() -> None:
@@ -4552,6 +4580,8 @@ def create_app(settings: Settings) -> FastAPI:
                     "expected_meta_sha256"
                 ),
             }
+        await advance_v4_operation(cid)
+        meta = storage.load_meta(settings.data_dir, cid) or meta
         status_code, content = _operation_view(
             settings, cid, meta, stage="postprocess"
         )
@@ -4692,7 +4722,11 @@ def create_app(settings: Settings) -> FastAPI:
         if _is_read_only(meta):
             raise HTTPException(status_code=409, detail="read_only")
         single_operation = _uses_single_operation_contract(meta)
-        if single_operation and isinstance(meta.get("generation"), dict):
+        if (
+            single_operation
+            and isinstance(meta.get("generation"), dict)
+            and not _generation_requires_explicit_context_resume(meta)
+        ):
             # A conversation owns exactly one generation operation. Replays
             # never reinterpret a new request id or mutable payload as a new
             # job; they only ensure the frozen operation is scheduled.
@@ -4837,6 +4871,7 @@ def create_app(settings: Settings) -> FastAPI:
                 if (
                     _uses_single_operation_contract(meta)
                     and isinstance(meta.get("generation"), dict)
+                    and not _generation_requires_explicit_context_resume(meta)
                 ):
                     meta = _ensure_existing_generation(
                         settings, cid, meta, background_tasks
@@ -5885,10 +5920,7 @@ def create_app(settings: Settings) -> FastAPI:
                     status_code=status_code, content=content
                 )
             raise HTTPException(status_code=e.status, detail=e.detail) from e
-        background_tasks.add_task(
-            postprocess.run_task, settings, cid, mediakit_sem, seedream_sem,
-            audit_runner=codex_runner, verification_runner=codex_runner,
-        )
+        background_tasks.add_task(run_postprocess_operation, cid)
         current = storage.load_meta(settings.data_dir, cid) or meta
         status_code, content = _operation_view(
             settings, cid, current, stage="postprocess"
@@ -5925,10 +5957,7 @@ def create_app(settings: Settings) -> FastAPI:
                     status_code=status_code, content=content
                 )
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-        background_tasks.add_task(
-            postprocess.run_task, settings, cid, mediakit_sem, seedream_sem, {index},
-            audit_runner=codex_runner, verification_runner=codex_runner,
-        )
+        background_tasks.add_task(run_postprocess_operation, cid, {index})
         if not single_operation:
             return {"status": "running", "segment_index": index}
         current = storage.load_meta(settings.data_dir, cid) or meta
