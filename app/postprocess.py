@@ -50,13 +50,26 @@ _FRAME_ERROR_RE = re.compile(r"^frame ([A-Za-z0-9_.-]{1,128}) failed(?:$|:)")
 _PUBLIC_FRAME_RE = re.compile(
     r"^(?:[A-Za-z0-9_.-]{1,128}|segments/[1-9]\d*/work/postprocessed/[A-Za-z0-9_.-]{1,128})$"
 )
+_PUBLIC_PROVIDER_ERROR_CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
 class PostprocessError(Exception):
-    def __init__(self, status: int, detail: str | dict[str, str]) -> None:
+    def __init__(
+        self,
+        status: int,
+        detail: str | dict[str, str],
+        *,
+        provider_error_code: str | None = None,
+    ) -> None:
         super().__init__(str(detail))
         self.status = status
         self.detail = detail
+        self.provider_error_code = (
+            provider_error_code
+            if isinstance(provider_error_code, str)
+            and _PUBLIC_PROVIDER_ERROR_CODE_RE.fullmatch(provider_error_code)
+            else None
+        )
 
 
 def _structured(code: str, message: str) -> dict[str, str]:
@@ -73,6 +86,34 @@ def _public_error(value: object) -> str | None:
         if matched and matched.group(1) not in {".", ".."}:
             return f"frame {matched.group(1)} failed"
     return "postprocess_failed"
+
+
+def _safe_provider_error_code(error: object, value: object) -> str | None:
+    if (
+        error == "provider_rejected"
+        and isinstance(value, str)
+        and _PUBLIC_PROVIDER_ERROR_CODE_RE.fullmatch(value)
+    ):
+        return value
+    return None
+
+
+def _set_provider_error_code(state: dict, error: object, value: object) -> None:
+    safe = _safe_provider_error_code(error, value)
+    if safe is None:
+        state.pop("provider_error_code", None)
+    else:
+        state["provider_error_code"] = safe
+
+
+def _common_provider_error_code(failed: list[dict]) -> str | None:
+    if not failed or any(item.get("error") != "provider_rejected" for item in failed):
+        return None
+    codes = [
+        _safe_provider_error_code(item.get("error"), item.get("provider_error_code"))
+        for item in failed
+    ]
+    return codes[0] if codes[0] is not None and len(set(codes)) == 1 else None
 
 
 def public_state(value: object) -> dict | None:
@@ -97,6 +138,9 @@ def public_state(value: object) -> dict | None:
             and item.rsplit("/", 1)[-1] not in {".", ".."}
         ] if isinstance(raw_frames, list) else [],
         "error": _public_error(value.get("error")),
+        "provider_error_code": _safe_provider_error_code(
+            value.get("error"), value.get("provider_error_code")
+        ),
     }
     raw_segments = value.get("segments")
     if raw_segments is None:
@@ -145,11 +189,19 @@ def public_state(value: object) -> dict | None:
             "total_frames": item["total_frames"],
             "revision": item["revision"],
             "error": _public_error(item.get("error")),
+            "provider_error_code": _safe_provider_error_code(
+                item.get("error"), item.get("provider_error_code")
+            ),
         }
         for item in raw_segments
     ] if valid_segments else []
     if not valid_segments:
-        result.update(status="failed", frames=[], error="postprocess_receipt_invalid")
+        result.update(
+            status="failed",
+            frames=[],
+            error="postprocess_receipt_invalid",
+            provider_error_code=None,
+        )
     return result
 
 
@@ -575,9 +627,11 @@ def _mark_plan_audit_failed(
         for item in segments:
             if item.get("index") in indices and item.get("status") != "done":
                 item.update(status="failed", error="image_plan_audit_failed")
+                _set_provider_error_code(item, item["error"], None)
         post["segments"] = segments
         post["status"] = "failed"
         post["error"] = "image_plan_audit_failed"
+        _set_provider_error_code(post, post["error"], None)
         post["frames"] = sorted(
             _frame_ref(item["index"], path.name)
             for item in segments if item.get("status") == "done"
@@ -589,6 +643,7 @@ def _mark_plan_audit_failed(
 
 def _mark_image_verification_failed(
     settings: Settings, cid: str, indices: set[int], *, error: str = "image_verification_failed",
+    provider_error_code: str | None = None,
 ) -> None:
     public_error = error if error in _PUBLIC_ERROR_CODES else "image_verification_failed"
     def mutate(_meta: dict, post: dict) -> None:
@@ -596,9 +651,11 @@ def _mark_image_verification_failed(
         for item in segments:
             if item.get("index") in indices and item.get("status") != "done":
                 item.update(status="failed", error=public_error)
+                _set_provider_error_code(item, public_error, provider_error_code)
         post["segments"] = segments
         post["status"] = "failed"
         post["error"] = public_error
+        _set_provider_error_code(post, public_error, provider_error_code)
         post["frames"] = sorted(
             _frame_ref(item["index"], path.name)
             for item in segments if item.get("status") == "done"
@@ -633,6 +690,7 @@ def _record_and_close_failure(
             original.get("segments"), list
         ):
             post.update(status="failed", error=error)
+            _set_provider_error_code(post, error, None)
             return
         segments = [
             dict(item) for item in post.get("segments", [])
@@ -644,7 +702,9 @@ def _record_and_close_failure(
                 and (indices is None or item.get("index") in indices)
             ):
                 item.update(status="failed", error=error)
+                _set_provider_error_code(item, error, None)
         post.update(status="failed", error=error, segments=segments)
+        _set_provider_error_code(post, error, None)
         post["frames"] = sorted(
             _frame_ref(item["index"], path.name)
             for item in segments if item.get("status") == "done"
@@ -874,7 +934,13 @@ def _update_segment(settings: Settings, cid: str, index: int, **changes) -> None
         segments = [dict(item) for item in post.get("segments", [])]
         for item in segments:
             if item.get("index") == index:
+                provider_error_code = changes.pop(
+                    "provider_error_code", item.get("provider_error_code")
+                )
                 item.update(changes)
+                _set_provider_error_code(
+                    item, item.get("error"), provider_error_code
+                )
                 break
         post["segments"] = segments
         post["frames"] = sorted(
@@ -1260,7 +1326,11 @@ async def _seedream_stage(settings: Settings, cdir: Path, cid: str, index: int,
         if isinstance(error, asyncio.CancelledError):
             raise error
         if isinstance(error, seedream.SeedreamError):
-            raise PostprocessError(502, error.code)
+            raise PostprocessError(
+                502,
+                error.code,
+                provider_error_code=error.provider_error_code,
+            )
         raise PostprocessError(502, sanitize(str(error)))
     return outputs
 
@@ -2080,7 +2150,9 @@ async def _v4_generate_composite_replacement_board(
             )
         _draw_replacement_board_labels(raw_output, output, len(tiles))
     except seedream.SeedreamError as exc:
-        raise PostprocessError(502, exc.code) from None
+        raise PostprocessError(
+            502, exc.code, provider_error_code=exc.provider_error_code
+        ) from None
     except OSError as exc:
         raise PostprocessError(502, sanitize(str(exc))) from None
     return output
@@ -2154,7 +2226,9 @@ async def _v4_anchor(
                     ),
                 )
         except seedream.SeedreamError as exc:
-            raise PostprocessError(502, exc.code) from None
+            raise PostprocessError(
+                502, exc.code, provider_error_code=exc.provider_error_code
+            ) from None
         if not _valid_png(output, canvas):
             raise PostprocessError(409, "scene_anchor_verification_failed")
         receipt = _anchor_receipt_payload(
@@ -2185,7 +2259,9 @@ async def _v4_anchor(
                 ),
             )
     except seedream.SeedreamError as exc:
-        raise PostprocessError(502, exc.code) from None
+        raise PostprocessError(
+            502, exc.code, provider_error_code=exc.provider_error_code
+        ) from None
     except OSError as exc:
         raise PostprocessError(502, sanitize(str(exc))) from None
     if not _valid_png(output, canvas):
@@ -2645,7 +2721,7 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
         _publish_segment(inputs, targets)
         _update_segment(
             settings, cid, index, status="done", stage="done",
-            completed_frames=len(targets), error=None,
+            completed_frames=len(targets), error=None, provider_error_code=None,
         )
     except asyncio.CancelledError:
         latest = storage.load_meta(settings.data_dir, cid) or {}
@@ -2663,7 +2739,16 @@ async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
             logger=log,
         )
         detail = exc.detail if isinstance(exc, PostprocessError) else sanitize(str(exc))
-        _update_segment(settings, cid, index, status="failed", error=detail)
+        _update_segment(
+            settings,
+            cid,
+            index,
+            status="failed",
+            error=detail,
+            provider_error_code=(
+                exc.provider_error_code if isinstance(exc, PostprocessError) else None
+            ),
+        )
 
 
 async def _run_v4_task(
@@ -2831,6 +2916,7 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
             _mark_image_verification_failed(
                 settings, cid, set(grouped),
                 error=exc.detail if isinstance(exc.detail, str) else "image_verification_failed",
+                provider_error_code=exc.provider_error_code,
             )
             return
         except Exception as exc:
@@ -2860,10 +2946,7 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
             _mark_image_verification_failed(
                 settings, cid, set(grouped),
                 error=exc.detail if isinstance(exc.detail, str) else "image_verification_failed",
-            )
-            _mutate_postprocess(
-                settings, cid,
-                lambda _meta, post: post.update(error=exc.detail),
+                provider_error_code=exc.provider_error_code,
             )
             return
         except Exception as exc:
@@ -2885,7 +2968,9 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
                         status="done", stage="done",
                         completed_frames=item.get("total_frames"), error=None,
                     )
+                    _set_provider_error_code(item, None, None)
             post.update(status="done", error=None)
+            _set_provider_error_code(post, None, None)
             post["frames"] = [
                 _frame_ref(item["index"], path.name)
                 for item in post.get("segments", []) if item.get("status") == "done"
@@ -2918,6 +3003,7 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
                 status="failed",
                 error="submission_unknown" if unknown else "cancelled",
             )
+            _set_provider_error_code(post, post["error"], None)
 
         _mutate_postprocess(settings, cid, cancel)
         raise
@@ -2945,6 +3031,7 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
                     _update_segment(
                         settings, cid, index, status="done", stage="done",
                         completed_frames=len(targets), error=None,
+                        provider_error_code=None,
                     )
             except Exception as exc:
                 error_trace.record(
@@ -2964,7 +3051,14 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore
         post["error"] = (
             "submission_unknown"
             if any(item.get("error") == "submission_unknown" for item in failed)
-            else ("segment_failed" if failed else None)
+            else (
+                "provider_rejected"
+                if failed and all(item.get("error") == "provider_rejected" for item in failed)
+                else ("segment_failed" if failed else None)
+            )
+        )
+        _set_provider_error_code(
+            post, post["error"], _common_provider_error_code(failed)
         )
         post["frames"] = sorted(
             _frame_ref(item["index"], path.name)
@@ -3026,12 +3120,15 @@ async def retry_segment(settings: Settings, cid: str, index: int, payload: dict,
                     item.update(
                         status="running", error=None, stage="queued", revision=expected + 1,
                     )
+                    _set_provider_error_code(item, None, None)
             else:
                 target.update(
                     status="running", error=None, revision=expected + 1,
                     stage=target.get("stage") or "queued",
                 )
+                _set_provider_error_code(target, None, None)
             post.update(status="running", error=None, segments=segments)
+            _set_provider_error_code(post, None, None)
             meta["postprocess"] = post
 
         updated = storage.mutate_meta(settings.data_dir, cid, mutate)

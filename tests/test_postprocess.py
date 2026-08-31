@@ -2527,6 +2527,97 @@ def test_failed_start_preserves_meta_revision_and_never_calls_provider(enabled, 
     assert len(fake.calls) == calls_before
 
 
+def test_segment_retry_clears_provider_rejection_code(tmp_path):
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
+    cid = _make_conv(settings)
+    asyncio.run(postprocess.start(
+        settings, cid, {"confirm": True, "options": OPTIONS_SUB}, {}
+    ))
+    postprocess._update_segment(
+        settings, cid, 0, status="failed", error="provider_rejected",
+        provider_error_code="InputTextSensitiveContentDetected",
+    )
+    postprocess._update_segment(
+        settings, cid, 0, status="done", error=None,
+    )
+    assert "provider_error_code" not in storage.load_meta(
+        settings.data_dir, cid
+    )["postprocess"]["segments"][0]
+    postprocess._update_segment(
+        settings, cid, 0, status="failed", error="provider_rejected",
+        provider_error_code="InputTextSensitiveContentDetected",
+    )
+    storage.update_meta(
+        settings.data_dir, cid, postprocess={
+            **storage.load_meta(settings.data_dir, cid)["postprocess"],
+            "status": "failed",
+            "error": "provider_rejected",
+            "provider_error_code": "InputTextSensitiveContentDetected",
+        },
+    )
+
+    asyncio.run(postprocess.retry_segment(
+        settings, cid, 0, {"confirm": True, "expected_revision": 1}, {}
+    ))
+
+    post = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    assert post["status"] == "running"
+    assert "provider_error_code" not in post
+    assert "provider_error_code" not in post["segments"][0]
+
+
+def test_seedream_stage_preserves_only_safe_provider_rejection_code(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
+    cid = meta["id"]
+    cdir = settings.data_dir / cid
+    source = cdir / "source.png"
+    source.write_bytes(PNG)
+    source_sha256 = hashlib.sha256(PNG).hexdigest()
+    storage.update_meta(settings.data_dir, cid, postprocess={
+        "segments": [postprocess._segment_state(0, 1)],
+    })
+    private = {
+        "version": 3,
+        "model": settings.seedream_model,
+        "edit_mode": "independent_parallel",
+        "timeout_s": settings.seedream_timeout_s,
+        "frames": [{
+            "segment_index": 0,
+            "frame_name": source.name,
+            "source_sha256": source_sha256,
+            "current": "safe frozen prompt",
+        }],
+    }
+
+    async def reject(*_args, **_kwargs):
+        raise postprocess.seedream.SeedreamError(
+            "provider_rejected",
+            provider_error_code="InputTextSensitiveContentDetected",
+        )
+
+    monkeypatch.setattr(
+        postprocess.seedream_recovery, "edit_with_content_recovery", reject,
+    )
+    with pytest.raises(postprocess.PostprocessError) as caught:
+        asyncio.run(postprocess._seedream_stage(
+            settings, cdir, cid, 0, [source], private,
+            {source.name: source_sha256}, asyncio.Semaphore(1),
+        ))
+
+    assert caught.value.detail == "provider_rejected"
+    assert caught.value.provider_error_code == "InputTextSensitiveContentDetected"
+    postprocess._update_segment(
+        settings, cid, 0, status="failed", error=caught.value.detail,
+        provider_error_code="unsafe code: body=secret",
+    )
+    assert "provider_error_code" not in storage.load_meta(
+        settings.data_dir, cid
+    )["postprocess"]["segments"][0]
+
+
 def test_corrupt_existing_canonical_is_not_reused(enabled, monkeypatch):
     settings, c = enabled
     cid = _make_conv(settings)
@@ -2880,10 +2971,73 @@ def test_public_state_maps_untrusted_status_stage_and_error_to_safe_closed_value
     assert public["segments"][0] == {
         "index": 1, "status": "failed", "stage": "unknown",
         "completed_frames": 0, "total_frames": 1, "revision": 1,
-        "error": "postprocess_failed",
+        "error": "postprocess_failed", "provider_error_code": None,
     }
     assert public["segments"][1]["error"] == "frame 02.png failed"
     assert "secret" not in json.dumps(public)
+
+
+def test_public_state_revalidates_provider_code_and_never_projects_raw_fields():
+    state = {
+        "status": "failed",
+        "options": {**OPTIONS_SUB, "optimize_image": False},
+        "frames": [],
+        "error": "provider_rejected",
+        "provider_error_code": "InputTextSensitiveContentDetected",
+        "body": {"prompt": "private prompt", "headers": {"Authorization": "secret"}},
+        "segments": [{
+            "index": 0, "status": "failed", "stage": "seedream",
+            "completed_frames": 0, "total_frames": 1, "revision": 1,
+            "error": "provider_rejected",
+            "provider_error_code": "bad code: secret body",
+            "prompt": "private prompt",
+        }],
+    }
+
+    public = postprocess.public_state(state)
+
+    assert public["provider_error_code"] == "InputTextSensitiveContentDetected"
+    assert public["segments"][0]["provider_error_code"] is None
+    serialized = json.dumps(public)
+    assert "private prompt" not in serialized
+    assert "Authorization" not in serialized
+    assert "bad code" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("codes", "expected_top"),
+    [
+        (("QuotaExceeded", "QuotaExceeded"), "QuotaExceeded"),
+        (("QuotaExceeded", "InputTextSensitiveContentDetected"), None),
+    ],
+)
+def test_provider_rejection_codes_persist_per_segment_and_only_common_code_reaches_top(
+    tmp_path, monkeypatch, codes, expected_top,
+):
+    settings = make_settings(tmp_path, enable_mediakit_erase=True)
+    cid = _make_conv(settings, segments=True)
+    asyncio.run(postprocess.start(
+        settings, cid, {"confirm": True, "options": OPTIONS_SUB}, {}
+    ))
+
+    async def reject_segment(
+        _settings, _cid, _cdir, index, _targets, _options, _private,
+        _mediakit_sem, _seedream_sem, **_kwargs,
+    ):
+        postprocess._update_segment(
+            settings, cid, index, status="failed", error="provider_rejected",
+            provider_error_code=codes[index - 1],
+        )
+
+    monkeypatch.setattr(postprocess, "_run_segment", reject_segment)
+    asyncio.run(postprocess.run_task(settings, cid, asyncio.Semaphore(1)))
+
+    post = storage.load_meta(settings.data_dir, cid)["postprocess"]
+    assert post["error"] == "provider_rejected"
+    assert [item["provider_error_code"] for item in post["segments"]] == list(codes)
+    assert post.get("provider_error_code") == expected_top
+    public = postprocess.public_state(post)
+    assert public["provider_error_code"] == expected_top
 
 
 @pytest.mark.parametrize("segments", [
