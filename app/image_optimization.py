@@ -4026,6 +4026,23 @@ def _contact_sheet(frames: list[Path], output: Path) -> None:
         raise ValueError("invalid image optimization segments")
 
 
+def _segment_frame_proxy(source: Path, output: Path) -> None:
+    """Encode one bounded low-resolution JPEG for segment-frame analysis."""
+    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    if image is None or image.size == 0:
+        raise ValueError("invalid image optimization segments")
+    height, width = image.shape[:2]
+    scale = min(1.0, 512 / max(width, height))
+    if scale < 1.0:
+        image = cv2.resize(
+            image,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    if not cv2.imwrite(str(output), image, [cv2.IMWRITE_JPEG_QUALITY, 82]):
+        raise ValueError("invalid image optimization segments")
+
+
 def _phase_output(raw: bytes) -> object:
     try:
         value = json.loads(raw.decode("utf-8"))
@@ -4245,8 +4262,11 @@ def generate_project_prompts(
                 destination = work / "keyframes"
                 destination.mkdir(parents=True, mode=0o700)
                 _write_skill_stage(skill, stage / "SKILL.md")
+                proxy_names: dict[str, str] = {}
                 for frame in frames:
-                    _copy_regular(frame, destination / frame.name)
+                    proxy_name = f"{frame.stem}.jpg"
+                    _segment_frame_proxy(frame, destination / proxy_name)
+                    proxy_names[frame.name] = proxy_name
                 (work / "global_plan.json").write_text(
                     json.dumps(
                         global_plan, ensure_ascii=False, separators=(",", ":"),
@@ -4255,7 +4275,7 @@ def generate_project_prompts(
                 )
                 segment_slots = [
                     {"key": slot["key"], "scene_key": slot["scene_key"],
-                     "path": f"work/keyframes/{slot['frame_name']}"}
+                     "path": f"work/keyframes/{proxy_names[slot['frame_name']]}"}
                     for slot in raw_slots["frames"]
                     if slot["segment_index"] == segment["index"]
                 ]

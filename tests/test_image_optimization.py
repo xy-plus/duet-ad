@@ -90,6 +90,84 @@ def test_global_contact_sheet_is_bounded_navigation_without_mutating_frames(
     ] == source_digests
 
 
+def test_segment_frame_proxy_is_low_resolution_jpeg_without_mutating_source(
+    tmp_path,
+):
+    source = tmp_path / "01.png"
+    source.write_bytes(_png(width=1600, height=900, value=127))
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    proxy = tmp_path / "01.jpg"
+
+    image_optimization._segment_frame_proxy(source, proxy)
+
+    decoded = cv2.imread(str(proxy), cv2.IMREAD_COLOR)
+    assert decoded is not None and decoded.shape[:2] == (288, 512)
+    assert proxy.read_bytes()[:2] == b"\xff\xd8"
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_digest
+
+
+def test_segment_frames_phase_receives_only_low_resolution_jpeg_proxies(
+    tmp_path, monkeypatch,
+):
+    session = tmp_path / "session"
+    keyframes = session / "work" / "segments" / "1" / "work" / "keyframes"
+    keyframes.mkdir(parents=True)
+    source = keyframes / "01.png"
+    source.write_bytes(_png(width=1600, height=900, value=127))
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    segment = {
+        "index": 1,
+        "chain_id": "chain-001",
+        "join_mode": "hard_cut",
+        "keyframes_dir": keyframes,
+        "transition_skeleton": [{
+            "segment_index": 1,
+            "frame_index": 1,
+            "frame_name": "01.png",
+            "source_sha256": source_digest,
+            "source_transition_from_previous": "start",
+            "source_transition_evidence_sha256": "1" * 64,
+        }],
+    }
+
+    class SegmentCaptured(Exception):
+        pass
+
+    captured = {}
+
+    def phase(_runner, *, stage, output_name, **_kwargs):
+        if output_name == "global_plan.json":
+            return {"people": {}, "entities": {}, "scenes": {}, "relations": {}}
+        proxy = stage / "work" / "keyframes" / "01.jpg"
+        request = json.loads(
+            (stage / "work" / "request.json").read_text(encoding="utf-8")
+        )
+        decoded = cv2.imread(str(proxy), cv2.IMREAD_COLOR)
+        captured.update(
+            files=sorted(path.name for path in proxy.parent.iterdir()),
+            shape=decoded.shape[:2] if decoded is not None else None,
+            magic=proxy.read_bytes()[:2],
+            path=request["semantic_slots"]["frames"][0]["path"],
+        )
+        raise SegmentCaptured
+
+    monkeypatch.setattr(image_optimization, "_run_image_skill_phase", phase)
+
+    with pytest.raises(SegmentCaptured):
+        image_optimization.generate_project_prompts(
+            object(), [segment], "independent_parallel",
+            session_dir=session, skill_bytes=b"skill",
+        )
+
+    assert captured == {
+        "files": ["01.jpg"],
+        "shape": (288, 512),
+        "magic": b"\xff\xd8",
+        "path": "work/keyframes/01.jpg",
+    }
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_digest
+
+
 def _done(settings, *, segments=False):
     meta = storage.new_conversation(settings.data_dir, "x", "x.mp4")
     cid = meta["id"]

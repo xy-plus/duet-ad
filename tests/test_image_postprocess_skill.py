@@ -425,6 +425,8 @@ def test_skill_frame_entities_are_direct_evidence_only_and_omit_out_of_frame():
     segment_frames = {"frames": example["frames"]}
     encoded = json.dumps(segment_frames, ensure_ascii=False)
 
+    assert "低清 JPEG 视觉代理" in skill
+    assert "保持原帧宽高比和顺序" in skill
     assert '"visibility": "out_of_frame"' not in encoded
     assert "当前帧有直接像素证据" in skill
     assert "完全出画、完全不可见或仅由邻帧推知时省略 key" in skill
@@ -1047,7 +1049,7 @@ def test_two_phase_inputs_are_minimal_and_merge_into_exact_v4_prompts(tmp_path):
         assert call["files"] == [
             "SKILL.md",
             "work/global_plan.json",
-            "work/keyframes/01.png",
+            "work/keyframes/01.jpg",
             "work/request.json",
             "work/segment_frames.json",
         ]

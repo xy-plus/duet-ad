@@ -19,7 +19,7 @@ description: 读取冻结关键帧和全项目元素关系索引，以一次全�
 
 ## `phase="segment_frames"`
 
-输入为当前段原始关键帧、冻结 `global_plan`、`element_index` 和 `transition_skeleton`；不得重设计全局方案。
+输入为当前段关键帧的低清 JPEG 视觉代理、冻结 `global_plan`、`element_index` 和 `transition_skeleton`；代理图保持原帧宽高比和顺序，只用于视觉分析，不得重设计全局方案。
 
 输出格式以注入 Schema 为准。`frames` 是数组；帧、人物、实体和派生观测的稳定 key 都写入各层记录的 `key`，后端再建立索引。每帧同时填写 `relationships/crop`；可见记录分别填写 Schema 中的姿态、边界和可见性字段。
 
