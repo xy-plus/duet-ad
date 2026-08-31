@@ -623,21 +623,21 @@ def test_visual_analyzer_receives_half_resolution_proxies_and_restores_originals
     (work / "contact_sheet_01.jpg").write_bytes(b"overview")
 
     class InspectingRunner:
-        def run_isolated(
-            self, stage, _prompt, *, session_dir, writable_paths,
+        def run_isolated_until_output(
+            self, stage, _prompt, *, session_dir, output_path,
+            max_output_bytes, validate_output, output_schema,
         ):
+            del output_path, max_output_bytes, output_schema
             assert session_dir == cdir
             assert not list((stage / "work").glob("*_frame_*.png"))
-            assert (stage / "work" / "contact_sheet_01.jpg").read_bytes() == b"overview"
+            assert not list((stage / "work").glob("contact_sheet*.jpg"))
             for order in range(1, 10):
                 data = (stage / "work" / "keyframes" / f"{order:02d}.png").read_bytes()
                 image = cv2.imdecode(
                     np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR
                 )
                 assert image.shape[:2] == (4, 6)
-            (stage / "work" / "prompt.txt").write_text(
-                PROMPT_TEXT, encoding="utf-8"
-            )
+            return validate_output(json.dumps({"prompt": PROMPT_TEXT}).encode())
 
     names, _prompt = pipeline._run_visual_attempt(
         InspectingRunner(),

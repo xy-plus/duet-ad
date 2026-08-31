@@ -14,6 +14,7 @@ import json
 import mimetypes
 import os
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,17 @@ SCENES = frozenset({TEXT_SCENE, ICON_SCENE})
 MAX_INPUT_BYTES = 10 * 1024 * 1024
 MAX_OUTPUT_BYTES = 20 * 1024 * 1024
 RECEIPT_VERSION = 1
+
+
+def canvas_stage_path(
+    cdir: Path, segment_index: int, stage: str, name: str,
+) -> Path:
+    if stage not in {"text", "brand"}:
+        raise MediaKitError(409, "invalid erase request")
+    return (
+        cdir / "work" / ".postprocess-private" / "v4-canvases"
+        / f"{segment_index:04d}" / stage / name
+    )
 
 
 class MediaKitError(Exception):
@@ -62,6 +74,8 @@ async def erase_image(
     out: Path,
     confirm: bool,
     scenes: tuple[str, ...],
+    *,
+    gate: threading.BoundedSemaphore | None = None,
 ) -> Path:
     """Erase selected text/icon scenes and atomically produce a real PNG.
 
@@ -87,7 +101,8 @@ async def erase_image(
         raise MediaKitError(409, "invalid erase request")
     source = _inspect_input(image)
     await asyncio.to_thread(
-        _run,
+        _run_with_gate,
+        gate,
         settings,
         image,
         out,
@@ -95,6 +110,86 @@ async def erase_image(
         source,
     )
     return out
+
+
+def _run_with_gate(
+    gate: threading.BoundedSemaphore | None,
+    settings: Settings,
+    image: Path,
+    out: Path,
+    scenes: tuple[str, ...],
+    source: dict[str, Any],
+) -> None:
+    if gate is None:
+        _run(settings, image, out, scenes, source)
+        return
+    with gate:
+        _run(settings, image, out, scenes, source)
+
+
+def succeeded_output(
+    image: Path,
+    out: Path,
+    scenes: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """Return exact terminal evidence, or None when no submission exists."""
+    receipt_path = out.parent / ".mediakit" / f"{out.name}.json"
+    if not out.exists() and not receipt_path.exists():
+        return None
+    try:
+        source = _inspect_input(image.resolve())
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        stages = receipt["stages"]
+        if not out.exists():
+            if (
+                not isinstance(receipt, dict)
+                or receipt.get("version") != RECEIPT_VERSION
+                or receipt.get("source") != source
+                or receipt.get("scenes") != list(scenes)
+                or not isinstance(stages, list)
+                or len(stages) != len(scenes)
+                or any(
+                    not isinstance(stage, dict)
+                    or stage.get("scene") != scene
+                    or stage.get("state") not in {
+                        "pending", "failed", "submitting", "response_received", "succeeded",
+                    }
+                    for stage, scene in zip(stages, scenes, strict=True)
+                )
+            ):
+                raise ValueError
+            return None
+        output = _inspect_input(out.resolve(), max_bytes=MAX_OUTPUT_BYTES)
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("version") != RECEIPT_VERSION
+            or receipt.get("state") != "succeeded"
+            or receipt.get("source") != source
+            or receipt.get("scenes") != list(scenes)
+            or receipt.get("output") != out.name
+            or not isinstance(stages, list)
+            or len(stages) != len(scenes)
+                or any(
+                    not isinstance(stage, dict)
+                    or stage.get("scene") != scene
+                    or stage.get("state") != "succeeded"
+                    or not isinstance(stage.get("output_sha256"), str)
+                    for stage, scene in zip(stages, scenes, strict=True)
+                )
+                or receipt.get("output_sha256") != output["sha256"]
+                or output["width"] != source["width"]
+            or output["height"] != source["height"]
+        ):
+            raise ValueError
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        raise MediaKitError(409, "MediaKit receipt is invalid") from None
+    return {
+        "input_sha256": source["sha256"],
+        "output_sha256": output["sha256"],
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "scenes": list(scenes),
+    }
 
 
 def _run(
@@ -117,7 +212,24 @@ def _run(
             artifact = artifact_dir / f"{out.stem}.stage-{index + 1}.png"
             stage = receipt["stages"][index]
             state = stage.get("state")
-            if state == "succeeded" and artifact.is_file():
+            if state == "succeeded":
+                if artifact.is_file():
+                    artifact_output = _inspect_input(
+                        artifact, max_bytes=MAX_OUTPUT_BYTES,
+                    )
+                    if artifact_output["sha256"] != stage.get("output_sha256"):
+                        raise MediaKitError(409, "MediaKit receipt is invalid")
+                    current = artifact
+                    continue
+                result_url = stage.get("result_url")
+                if not isinstance(result_url, str) or not result_url.startswith("https://"):
+                    raise MediaKitError(502, "MediaKit succeeded artifact is missing")
+                _download_png(client, result_url, artifact, source)
+                artifact_output = _inspect_input(
+                    artifact, max_bytes=MAX_OUTPUT_BYTES,
+                )
+                if artifact_output["sha256"] != stage.get("output_sha256"):
+                    raise MediaKitError(409, "MediaKit receipt is invalid")
                 current = artifact
                 continue
             if state == "response_received":
@@ -125,8 +237,12 @@ def _run(
                 if not isinstance(result_url, str) or not result_url.startswith("https://"):
                     raise MediaKitError(502, "MediaKit receipt is invalid")
                 _download_png(client, result_url, artifact, source)
+                artifact_output = _inspect_input(
+                    artifact, max_bytes=MAX_OUTPUT_BYTES,
+                )
                 stage["state"] = "succeeded"
                 stage["artifact"] = artifact.name
+                stage["output_sha256"] = artifact_output["sha256"]
                 _finish_current_attempt(stage)
                 _atomic_json(receipt_path, receipt)
                 current = artifact
@@ -146,8 +262,12 @@ def _run(
             except _RequestLimitExceeded as error:
                 raise MediaKitError(429, error.detail) from None
             _download_png(client, result_url, artifact, source)
+            artifact_output = _inspect_input(
+                artifact, max_bytes=MAX_OUTPUT_BYTES,
+            )
             stage["state"] = "succeeded"
             stage["artifact"] = artifact.name
+            stage["output_sha256"] = artifact_output["sha256"]
             stage["finished_at"] = _now()
             _finish_current_attempt(stage)
             _atomic_json(receipt_path, receipt)
@@ -155,11 +275,15 @@ def _run(
 
     if not current.is_file():
         raise MediaKitError(502, "MediaKit output is missing")
-    _atomic_bytes(out, current.read_bytes())
+    output = _inspect_input(current, max_bytes=MAX_OUTPUT_BYTES)
+    if receipt.get("state") == "succeeded" and receipt.get("output_sha256") != output["sha256"]:
+        raise MediaKitError(409, "MediaKit receipt is invalid")
     receipt["state"] = "succeeded"
     receipt["output"] = out.name
+    receipt["output_sha256"] = output["sha256"]
     receipt["finished_at"] = _now()
     _atomic_json(receipt_path, receipt)
+    _atomic_bytes(out, current.read_bytes())
 
 
 def _submit_erase_once(
@@ -260,11 +384,13 @@ def _finish_current_attempt(stage: dict[str, Any]) -> None:
         attempts[-1]["finished_at"] = _now()
 
 
-def _inspect_input(path: Path) -> dict[str, Any]:
+def _inspect_input(
+    path: Path, *, max_bytes: int = MAX_INPUT_BYTES,
+) -> dict[str, Any]:
     if not path.is_file():
         raise MediaKitError(409, "invalid erase request")
     size = path.stat().st_size
-    if size <= 0 or size > MAX_INPUT_BYTES:
+    if size <= 0 or size > max_bytes:
         raise MediaKitError(409, "image exceeds MediaKit input limit")
     image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if image is None:

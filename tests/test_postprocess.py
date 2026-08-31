@@ -1833,7 +1833,7 @@ class FakeEdit:
         self.fail = list(fail)
         self.receipts = receipts
 
-    async def __call__(self, settings, cdir, image, out, confirm, scenes):
+    async def __call__(self, settings, cdir, image, out, confirm, scenes, **_kwargs):
         self.calls.append({
             "image": image.name, "out": out, "confirm": confirm, "scenes": scenes,
         })
@@ -1842,18 +1842,24 @@ class FakeEdit:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(PNG + b"edited")
         if self.receipts:
+            output_sha256 = hashlib.sha256(out.read_bytes()).hexdigest()
             receipt = out.parent / ".mediakit" / f"{out.name}.json"
             receipt.parent.mkdir(parents=True, exist_ok=True)
             receipt.write_text(json.dumps({
                 "version": mediakit.RECEIPT_VERSION,
                 "state": "succeeded",
                 "output": out.name,
+                "output_sha256": output_sha256,
                 "scenes": list(scenes),
                 "source": {
                     "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
                 },
                 "stages": [
-                    {"scene": scene, "state": "succeeded"}
+                    {
+                        "scene": scene,
+                        "state": "succeeded",
+                        "output_sha256": output_sha256,
+                    }
                     for scene in scenes
                 ],
             }), encoding="utf-8")
@@ -2666,7 +2672,9 @@ class SlowEdit:
         self.active = 0
         self.max_active = 0
 
-    async def __call__(self, settings, cdir, image, out, confirm, scenes):
+    async def __call__(self, settings, cdir, image, out, confirm, scenes, *, gate=None):
+        if gate is not None:
+            await asyncio.to_thread(gate.acquire)
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         self.calls.append({"image": image.name, "scenes": scenes})
@@ -2682,6 +2690,8 @@ class SlowEdit:
             return out
         finally:
             self.active -= 1
+            if gate is not None:
+                gate.release()
 
 
 def _add_frames(settings, cid, names):

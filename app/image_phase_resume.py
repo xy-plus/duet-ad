@@ -24,7 +24,7 @@ from typing import Iterator, Mapping
 
 import cv2
 
-from app import image_optimization, long_video, pipeline, skill_milestone, storage
+from app import image_optimization, long_video, mediakit, pipeline, skill_milestone, storage
 from app.config import Settings
 from app.codex_runner import CodexRunner
 
@@ -360,9 +360,17 @@ def _load_segments(
         )
         sampling = _json(sampling_path, label=f"segment {index} keyframe sampling")
         if not isinstance(sampling, dict) or set(sampling) != {
-            "schema", "version", "selection_method", "keyframes",
+            "schema", "version", "selection_method", "preprocess", "keyframes",
         } or sampling.get("schema") != "duet.backend-keyframe-sampling" \
-                or sampling.get("version") != 1 \
+                or sampling.get("version") != 2 \
+                or not isinstance(sampling.get("preprocess"), dict) \
+                or set(sampling["preprocess"]) != {
+                    "remove_subtitle", "remove_watermark",
+                } \
+                or any(
+                    not isinstance(value, bool)
+                    for value in sampling["preprocess"].values()
+                ) \
                 or not isinstance(sampling.get("keyframes"), list) \
                 or len(sampling["keyframes"]) != 9:
             raise ResumeRejected(f"segment {index} keyframe sampling is invalid")
@@ -375,11 +383,79 @@ def _load_segments(
                     or not isinstance(item.get("source_scene_id"), str) \
                     or not item["source_scene_id"] \
                     or isinstance(item.get("repeated"), bool) is False \
-                    or re.fullmatch(_SHA_RE, str(item.get("sha256"))) is None:
+                    or re.fullmatch(_SHA_RE, str(item.get("sha256"))) is None \
+                    or not isinstance(item.get("artifact"), dict) \
+                    or set(item["artifact"]) != {"path", "sha256", "stages"} \
+                    or not isinstance(item["artifact"].get("path"), str) \
+                    or not item["artifact"]["path"].startswith("work/") \
+                    or re.fullmatch(
+                        _SHA_RE, str(item["artifact"].get("sha256"))
+                    ) is None \
+                    or not isinstance(item["artifact"].get("stages"), list):
                 raise ResumeRejected(f"segment {index} keyframe sampling is invalid")
             sha256, _size = _digest(keyframe_dir / f"{order:02d}.png")
             if sha256 != item["sha256"]:
                 raise ResumeRejected(f"segment {index} keyframe bytes drifted")
+            expected_scenes = []
+            if sampling["preprocess"]["remove_subtitle"]:
+                expected_scenes.append(mediakit.TEXT_SCENE)
+            if sampling["preprocess"]["remove_watermark"]:
+                expected_scenes.append(mediakit.ICON_SCENE)
+            stages = item["artifact"]["stages"]
+            if len(stages) != len(expected_scenes):
+                raise ResumeRejected(
+                    f"segment {index} previsual keyframe lineage is invalid"
+                )
+            current_sha256 = sha256
+            for stage_number, (stage, scene) in enumerate(
+                zip(stages, expected_scenes, strict=True), 1,
+            ):
+                if (
+                    not isinstance(stage, dict)
+                    or set(stage) != {
+                        "input_sha256", "output_sha256", "receipt_path",
+                        "receipt_sha256", "scenes",
+                    }
+                    or stage.get("input_sha256") != current_sha256
+                    or re.fullmatch(
+                        _SHA_RE, str(stage.get("output_sha256")),
+                    ) is None
+                    or stage.get("scenes") != [scene]
+                    or re.fullmatch(
+                        _SHA_RE, str(stage.get("receipt_sha256")),
+                    ) is None
+                ):
+                    raise ResumeRejected(
+                        f"segment {index} previsual keyframe lineage is invalid"
+                    )
+                stage_receipt = _regular(
+                    root,
+                    stage.get("receipt_path"),
+                    label=(
+                        f"segment {index} previsual keyframe {order} "
+                        f"stage {stage_number} receipt"
+                    ),
+                )
+                stage_receipt_sha256, _size = _digest(stage_receipt)
+                if stage_receipt_sha256 != stage["receipt_sha256"]:
+                    raise ResumeRejected(
+                        f"segment {index} previsual keyframe receipt drifted"
+                    )
+                current_sha256 = stage["output_sha256"]
+            artifact_path = _regular(
+                root,
+                item["artifact"].get("path"),
+                label=f"segment {index} previsual keyframe {order}",
+            )
+            artifact_sha256, _size = _digest(artifact_path)
+            if artifact_sha256 != item["artifact"]["sha256"]:
+                raise ResumeRejected(
+                    f"segment {index} previsual keyframe bytes drifted"
+                )
+            if artifact_sha256 != current_sha256:
+                raise ResumeRejected(
+                    f"segment {index} previsual keyframe lineage is invalid"
+                )
 
         dialogue_path = _regular(
             root, f"work/segments/{index}/work/voice_lines.json",
@@ -411,7 +487,10 @@ def _load_segments(
             **segment,
             "source": source_relative,
             "keyframes": names,
-            "keyframe_paths": [f"segments/{index}/work/keyframes/{name}" for name in names],
+            "keyframe_paths": [
+                item["artifact"]["path"].removeprefix("work/")
+                for item in sampling["keyframes"]
+            ],
             "first_frame_path": f"segments/{index}/work/anchors/first.png",
             "last_frame_path": f"segments/{index}/work/anchors/last.png",
             "visual_prompt": visual,
@@ -511,6 +590,16 @@ def _collect(settings: Settings, cid: str) -> _Snapshot:
             f"work/segments/{index}/work/anchors/last.png",
             *[f"work/segments/{index}/work/keyframes/{order:02d}.png" for order in range(1, 10)],
         ])
+    for segment_meta in segment_metas:
+        artifact_paths.extend(
+            f"work/{relative}" for relative in segment_meta["keyframe_paths"]
+        )
+        for keyframe in segment_meta["keyframe_sampling"]["keyframes"]:
+            artifact_paths.extend(
+                stage["receipt_path"]
+                for stage in keyframe["artifact"]["stages"]
+            )
+    artifact_paths = list(dict.fromkeys(artifact_paths))
     artifacts = [
         _record(root, relative, label="resume artifact")
         for relative in artifact_paths
@@ -578,7 +667,7 @@ def _receipt_segments(root: Path, segment_metas: list[dict]) -> list[dict]:
             **item,
             "source_path": segroot / "source.mp4",
             "keyframe_paths": [
-                segroot / "work" / "keyframes" / name for name in item["keyframes"]
+                root / "work" / relative for relative in item["keyframe_paths"]
             ],
             "first_frame_path": segroot / "work" / "anchors" / "first.png",
             "last_frame_path": segroot / "work" / "anchors" / "last.png",

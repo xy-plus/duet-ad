@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shutil
+import threading
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -515,11 +516,39 @@ def _group_targets(cdir: Path, meta: dict) -> dict[int, list[tuple[Path, Path]]]
             index = segment.get("index") if isinstance(segment, dict) else None
             if not isinstance(index, int) or isinstance(index, bool) or index < 1:
                 raise PostprocessError(409, "artifacts not ready")
-            src_dir = cdir / "work" / "segments" / str(index) / "work" / "keyframes"
-            dst_dir = cdir / "work" / "segments" / str(index) / "work" / "postprocessed"
-            files = sorted(path for path in src_dir.glob("*.png") if path.is_file())
-            if not files:
+            relative_paths = segment.get("keyframe_paths")
+            if (
+                not isinstance(relative_paths, list)
+                or len(relative_paths) != 9
+                or any(not isinstance(path, str) or not path for path in relative_paths)
+            ):
                 raise PostprocessError(409, "artifacts not ready")
+            work = (cdir / "work").resolve()
+            files = [(work / path).resolve() for path in relative_paths]
+            if any(
+                not path.is_relative_to(work) or not path.is_file()
+                for path in files
+            ) or [path.name for path in files] != [
+                f"{order:02d}.png" for order in range(1, 10)
+            ]:
+                raise PostprocessError(409, "artifacts not ready")
+            try:
+                expected_sha256s = [
+                    item["artifact"]["sha256"]
+                    for item in segment["keyframe_sampling"]["keyframes"]
+                ]
+            except (KeyError, TypeError):
+                raise PostprocessError(409, "artifacts not ready") from None
+            if (
+                segment["keyframe_sampling"].get("version") != 2
+                or len(expected_sha256s) != 9
+                or any(
+                    _sha256_path(path) != expected
+                    for path, expected in zip(files, expected_sha256s, strict=True)
+                )
+            ):
+                raise PostprocessError(409, "artifacts not ready")
+            dst_dir = cdir / "work" / "segments" / str(index) / "work" / "postprocessed"
             grouped[index] = [(path, dst_dir / path.name) for path in files]
     else:
         src_dir = cdir / "work" / "keyframes"
@@ -962,7 +991,7 @@ def _canonical_files(cdir: Path, index: int) -> list[Path]:
 
 async def _mediakit_stage(settings: Settings, cdir: Path, index: int,
                           inputs: list[Path], stage: str, scene: str,
-                          sem: asyncio.Semaphore) -> list[Path]:
+                          sem: threading.BoundedSemaphore) -> list[Path]:
     root = _private_dir(cdir, index) / stage
     root.mkdir(parents=True, exist_ok=True)
     outputs = [root / path.name for path in inputs]
@@ -974,8 +1003,9 @@ async def _mediakit_stage(settings: Settings, cdir: Path, index: int,
             # receipt to bind this exact source and scene.
             _v4_mediakit_success(source, output, scene)
             return
-        async with sem:
-            await mediakit.erase_image(settings, cdir, source, output, True, (scene,))
+        await mediakit.erase_image(
+            settings, cdir, source, output, True, (scene,), gate=sem,
+        )
 
     results = await asyncio.gather(
         *(one(source, output) for source, output in zip(inputs, outputs)),
@@ -1004,62 +1034,11 @@ def _v4_canvas_stage_path(cdir: Path, index: int, stage: str, name: str) -> Path
 
 def _v4_mediakit_success(source: Path, output: Path, scene: str) -> dict | None:
     """Return one replay-safe MediaKit stage receipt, never infer success from bytes."""
-    receipt_path = output.parent / ".mediakit" / f"{output.name}.json"
-    if not output.exists() and not receipt_path.exists():
-        return None
-    if not output.exists():
-        # A durable response_received receipt has already crossed the paid
-        # boundary.  Hand it back to MediaKit's own GET/download recovery
-        # rather than treating it as permission for a second erase POST.
-        try:
-            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            if (
-                isinstance(receipt, dict)
-                and receipt.get("version") == mediakit.RECEIPT_VERSION
-                and receipt.get("state") == "response_received"
-                and receipt.get("scenes") == [scene]
-                and isinstance(receipt.get("source"), dict)
-                and receipt["source"].get("sha256") == _sha256_path(source)
-                and isinstance(receipt.get("stages"), list)
-                and len(receipt["stages"]) == 1
-                and receipt["stages"][0].get("state") == "response_received"
-                and receipt["stages"][0].get("scene") == scene
-            ):
-                return None
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            pass
-        raise PostprocessError(409, "submission_unknown")
     try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        source_sha256 = _sha256_path(source)
-        output_sha256 = _sha256_path(output)
-        stages = receipt["stages"]
-        if (
-            not isinstance(receipt, dict)
-            or receipt.get("version") != mediakit.RECEIPT_VERSION
-            or receipt.get("state") != "succeeded"
-            or receipt.get("output") != output.name
-            or receipt.get("scenes") != [scene]
-            or not isinstance(receipt.get("source"), dict)
-            or receipt["source"].get("sha256") != source_sha256
-            or not isinstance(stages, list)
-            or len(stages) != 1
-            or stages[0].get("scene") != scene
-            or stages[0].get("state") != "succeeded"
-            or not _valid_png(output, source)
-        ):
-            raise ValueError
-    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-        # A preexisting artifact without an exact terminal receipt may be a
-        # paid request in its crash window.  It is strictly GET-only.
+        result = mediakit.succeeded_output(source, output, (scene,))
+    except mediakit.MediaKitError:
         raise PostprocessError(409, "submission_unknown") from None
-    return {
-        "scene": scene,
-        "input_sha256": source_sha256,
-        "output_sha256": output_sha256,
-        "receipt_path": str(receipt_path),
-        "receipt_sha256": _sha256_path(receipt_path),
-    }
+    return None if result is None else {"scene": scene, **result}
 
 
 def _v4_canvas_record(
@@ -1158,7 +1137,7 @@ def _v4_effective_private(private: dict, derived: dict, canvas_sha256: str) -> d
 
 async def _v4_prepare_canvases(
     settings: Settings, cdir: Path, cid: str, meta: dict, private: dict,
-    grouped: dict[int, list[tuple[Path, Path]]], sem: asyncio.Semaphore,
+    grouped: dict[int, list[tuple[Path, Path]]], sem: threading.BoundedSemaphore,
 ) -> tuple[dict, dict[int, list[tuple[Path, Path]]]]:
     """Complete and freeze all requested MediaKit stages before v4 audit/POSTs."""
     if not (private["options"]["remove_subtitle"] or private["options"]["remove_brand"]):
@@ -1184,13 +1163,12 @@ async def _v4_prepare_canvases(
             output = _v4_canvas_stage_path(cdir, index, stage, source.name)
             stage_receipt = _v4_mediakit_success(source, output, scene)
             if stage_receipt is None:
-                async with sem:
-                    try:
-                        await mediakit.erase_image(
-                            settings, cdir, source, output, True, (scene,)
-                        )
-                    except mediakit.MediaKitError as exc:
-                        raise PostprocessError(exc.status, exc.detail) from None
+                try:
+                    await mediakit.erase_image(
+                        settings, cdir, source, output, True, (scene,), gate=sem,
+                    )
+                except mediakit.MediaKitError as exc:
+                    raise PostprocessError(exc.status, exc.detail) from None
                 stage_receipt = _v4_mediakit_success(source, output, scene)
                 if stage_receipt is None:
                     raise PostprocessError(409, "submission_unknown")
@@ -2687,7 +2665,7 @@ def _publish_segment(outputs: list[Path], targets: list[tuple[Path, Path]]) -> N
 
 async def _run_segment(settings: Settings, cid: str, cdir: Path, index: int,
                        targets: list[tuple[Path, Path]], options: dict[str, bool],
-                       private: dict, mediakit_sem: asyncio.Semaphore,
+                       private: dict, mediakit_sem: threading.BoundedSemaphore,
                        seedream_sem: asyncio.Semaphore,
                        *, defer_publish: bool = False) -> None:
     inputs = [source for source, _ in targets]
@@ -2817,7 +2795,7 @@ async def _run_v4_task(
         raise PostprocessError(502, f"postprocess_{phase}_failed") from exc
 
 
-async def run_task(settings: Settings, cid: str, mediakit_sem: asyncio.Semaphore,
+async def run_task(settings: Settings, cid: str, mediakit_sem: threading.BoundedSemaphore,
                    seedream_sem: asyncio.Semaphore | None = None,
                    only_segments: set[int] | None = None, *, audit_runner=None,
                    verification_runner=None) -> None:

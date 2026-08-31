@@ -46,8 +46,8 @@ def receipt(config: Mapping[str, bool]) -> dict:
         "generation_config_sha256": sha256(frozen),
         "postprocess_options": {
             "optimize_image": frozen["optimize_image"],
-            "remove_subtitle": frozen["remove_subtitle"],
-            "remove_brand": frozen["remove_watermark"],
+            "remove_subtitle": False,
+            "remove_brand": False,
         },
     }
 

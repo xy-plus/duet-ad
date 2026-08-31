@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -238,6 +240,95 @@ def test_response_received_recovers_with_get_only(tmp_path, monkeypatch):
     assert out.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def test_succeeded_stage_missing_artifact_recovers_with_get_only(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    cdir = settings.data_dir / "c1"
+    source = _png(cdir / "work/keyframes/01.png")
+    out = cdir / "work/postprocessed/01.png"
+    erase_calls = 0
+
+    def handler(request: httpx.Request):
+        nonlocal erase_calls
+        if request.url.path.endswith("request-media-upload-url"):
+            return httpx.Response(200, json={
+                "success": True,
+                "result": {
+                    "file_id": "mediakit://file-1",
+                    "upload_url": "https://upload.example/file-1",
+                    "upload_headers": [],
+                },
+            })
+        if request.url.host == "upload.example":
+            return httpx.Response(200)
+        if request.url.path.endswith("erase-image"):
+            erase_calls += 1
+            return httpx.Response(200, json={
+                "success": True,
+                "request_id": "rid",
+                "task_id": "task",
+                "result": {"image_url": "https://result.example/out.webp"},
+            })
+        if request.url.host == "result.example":
+            return httpx.Response(200, content=_webp())
+        raise AssertionError(request.url)
+
+    _install_client(monkeypatch, handler)
+    _call(settings, cdir, source, out)
+    receipt_path = out.parent / ".mediakit/01.png.json"
+    receipt = json.loads(receipt_path.read_text())
+    artifact = out.parent / ".mediakit/artifacts/01.stage-1.png"
+    out.unlink()
+    artifact.unlink()
+
+    assert mediakit.succeeded_output(source, out, (mediakit.TEXT_SCENE,)) is None
+    _call(settings, cdir, source, out)
+    assert erase_calls == 1
+    recovered = json.loads(receipt_path.read_text())
+    assert recovered["stages"] == receipt["stages"]
+
+
+def test_succeeded_output_freezes_exact_artifact_and_receipt_hashes(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    cdir = settings.data_dir / "c1"
+    source = _png(cdir / "work/keyframes/01.png")
+    out = cdir / "work/postprocessed/01.png"
+
+    def handler(request: httpx.Request):
+        if request.url.path.endswith("request-media-upload-url"):
+            return httpx.Response(200, json={
+                "success": True,
+                "result": {
+                    "file_id": "mediakit://file-1",
+                    "upload_url": "https://upload.example/file-1",
+                    "upload_headers": [],
+                },
+            })
+        if request.url.host == "upload.example":
+            return httpx.Response(200)
+        if request.url.path.endswith("erase-image"):
+            return httpx.Response(200, json={
+                "success": True,
+                "result": {"image_url": "https://result.example/out.webp"},
+            })
+        if request.url.host == "result.example":
+            return httpx.Response(200, content=_webp())
+        raise AssertionError(request.url)
+
+    _install_client(monkeypatch, handler)
+    _call(settings, cdir, source, out)
+    evidence = mediakit.succeeded_output(source, out, (mediakit.TEXT_SCENE,))
+    assert evidence is not None
+    assert evidence["input_sha256"] == mediakit._inspect_input(source)["sha256"]
+    assert evidence["output_sha256"] == mediakit._inspect_input(
+        out, max_bytes=mediakit.MAX_OUTPUT_BYTES,
+    )["sha256"]
+    assert len(evidence["receipt_sha256"]) == 64
+
+    _png(out, width=64, height=48, value=5)
+    with pytest.raises(mediakit.MediaKitError, match="receipt is invalid"):
+        mediakit.succeeded_output(source, out, (mediakit.TEXT_SCENE,))
+
+
 def test_explicit_provider_rejection_can_be_retried(tmp_path, monkeypatch):
     settings = _settings(tmp_path)
     cdir = settings.data_dir / "c1"
@@ -460,3 +551,45 @@ def test_settings_mediakit_env_and_secret_repr(monkeypatch):
     assert settings.mediakit_concurrency == 1
     assert settings.mediakit_timeout_s == 77
     assert "secret-key" not in repr(settings)
+
+
+def test_process_gate_bounds_parallel_calls_across_event_loops(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    cdir = settings.data_dir / "c1"
+    sources = [
+        _png(cdir / f"work/keyframes/{order:02d}.png", value=order)
+        for order in range(1, 7)
+    ]
+    gate = threading.BoundedSemaphore(2)
+    state = {"active": 0, "maximum": 0}
+    lock = threading.Lock()
+
+    def run(_settings, _image, out, _scenes, _source):
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        try:
+            time.sleep(0.02)
+            _png(out)
+        finally:
+            with lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr(mediakit, "_run", run)
+
+    async def drive():
+        await asyncio.gather(*(
+            mediakit.erase_image(
+                settings,
+                cdir,
+                source,
+                cdir / f"work/postprocessed/{order:02d}.png",
+                True,
+                (mediakit.TEXT_SCENE,),
+                gate=gate,
+            )
+            for order, source in enumerate(sources, 1)
+        ))
+
+    asyncio.run(drive())
+    assert state == {"active": 0, "maximum": 2}

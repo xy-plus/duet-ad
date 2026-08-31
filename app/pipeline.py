@@ -28,6 +28,7 @@ video-maker project_index，并把 work/element_index.json 直接交给项目级
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -38,15 +39,17 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 from typing import NoReturn
 
 import cv2
 import numpy as np
 
-from app import asr, codex_output_schemas, dialogue_review, error_trace, frame_fit, generation_config, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
+from app import asr, codex_output_schemas, dialogue_review, error_trace, frame_fit, generation_config, h3, h3_project, image_optimization, long_generation, long_video, mediakit, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
 from app.codex_runner import (
     CodexError,
     CodexOutputValidationError,
@@ -552,6 +555,119 @@ def _materialize_backend_keyframes(
     )
     os.replace(staged_receipt, work / "keyframe_sampling.json")
     return names, receipt, frozen
+
+
+def _prepare_previsual_keyframes(
+    settings: Settings,
+    cdir: Path,
+    segment_index: int,
+    work: Path,
+    sampling_receipt: dict,
+    render_options: dict[str, bool],
+    gate: threading.BoundedSemaphore | None,
+) -> tuple[tuple[bytes, ...], dict, list[Path]]:
+    """Seal the only visual artifact set before any model can observe it."""
+    if (
+        set(render_options) != {"remove_subtitle", "remove_watermark"}
+        or any(not isinstance(value, bool) for value in render_options.values())
+    ):
+        raise PipelineError("generation_config_invalid")
+    if (
+        not isinstance(sampling_receipt, dict)
+        or sampling_receipt.get("schema") != "duet.backend-keyframe-sampling"
+        or sampling_receipt.get("version") != 1
+        or not isinstance(sampling_receipt.get("keyframes"), list)
+        or len(sampling_receipt["keyframes"]) != scene_planner.KEYFRAMES_PER_SEGMENT
+        or any(
+            not isinstance(item, dict) or item.get("order") != order
+            for order, item in enumerate(sampling_receipt["keyframes"], 1)
+        )
+    ):
+        raise PipelineError("backend keyframe sampling receipt is invalid")
+    names = [f"{order:02d}.png" for order in range(1, 10)]
+    sources = [work / "keyframes" / name for name in names]
+    if any(not path.is_file() for path in sources):
+        raise PipelineError("backend frozen keyframes are required")
+    stages = [
+        ("text", mediakit.TEXT_SCENE, render_options["remove_subtitle"]),
+        ("brand", mediakit.ICON_SCENE, render_options["remove_watermark"]),
+    ]
+    evidence: dict[str, list[dict]] = {name: [] for name in names}
+
+    async def prepare() -> list[Path]:
+        current = list(sources)
+        for stage, scene, enabled in stages:
+            if not enabled:
+                continue
+            outputs = [
+                mediakit.canvas_stage_path(
+                    cdir, segment_index, stage, source.name,
+                )
+                for source in sources
+            ]
+
+            async def one(source: Path, output: Path) -> dict:
+                receipt = mediakit.succeeded_output(source, output, (scene,))
+                if receipt is None:
+                    await mediakit.erase_image(
+                        settings,
+                        cdir,
+                        source,
+                        output,
+                        True,
+                        (scene,),
+                        gate=gate,
+                    )
+                    receipt = mediakit.succeeded_output(source, output, (scene,))
+                if receipt is None:
+                    raise mediakit.MediaKitError(
+                        409, "MediaKit submission outcome unknown"
+                    )
+                return receipt
+
+            results = await asyncio.gather(
+                *(one(source, output) for source, output in zip(current, outputs)),
+                return_exceptions=True,
+            )
+            for name, result in zip(names, results):
+                if isinstance(result, BaseException):
+                    raise result
+                item = dict(result)
+                try:
+                    item["receipt_path"] = str(
+                        Path(item["receipt_path"]).resolve().relative_to(
+                            cdir.resolve()
+                        )
+                    )
+                except (KeyError, ValueError):
+                    raise PipelineError("MediaKit receipt is invalid") from None
+                evidence[name].append(item)
+            current = outputs
+        return current
+
+    try:
+        canonical_paths = asyncio.run(prepare())
+    except mediakit.MediaKitError as exc:
+        raise PipelineError(exc.detail) from None
+    canonical = tuple(path.read_bytes() for path in canonical_paths)
+    if len(canonical) != 9 or any(not data for data in canonical):
+        raise PipelineError("previsual keyframe set is invalid")
+    sealed = deepcopy(sampling_receipt)
+    sealed["version"] = 2
+    sealed["preprocess"] = dict(render_options)
+    for name, item, path, data in zip(
+        names, sealed["keyframes"], canonical_paths, canonical,
+    ):
+        item["artifact"] = {
+            "path": str(path.resolve().relative_to(cdir.resolve())),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "stages": evidence[name],
+        }
+    _atomic_bytes(
+        work / "keyframe_sampling.json",
+        (json.dumps(sealed, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    )
+    return canonical, sealed, canonical_paths
 
 
 def _restore_backend_keyframes(work: Path, frozen: tuple[bytes, ...]) -> None:
@@ -1085,6 +1201,7 @@ def _run_visual_codex(
     isolate_dialogue: bool,
     skill_bytes: bytes,
     frozen_keyframes: tuple[bytes, ...] | None = None,
+    analysis_keyframes: tuple[bytes, ...] | None = None,
 ) -> None:
     """Publish one validated final-answer prompt against backend-frozen frames."""
     if not callable(getattr(runner, "run_isolated_until_output", None)):
@@ -1095,6 +1212,13 @@ def _run_visual_codex(
         or any(not isinstance(data, bytes) or not data for data in frozen_keyframes)
     ):
         raise PipelineError("backend frozen keyframes are required")
+    if analysis_keyframes is None:
+        analysis_keyframes = frozen_keyframes
+    if (
+        len(analysis_keyframes) != scene_planner.KEYFRAMES_PER_SEGMENT
+        or any(not isinstance(data, bytes) or not data for data in analysis_keyframes)
+    ):
+        raise PipelineError("previsual keyframes are invalid")
     _restore_backend_keyframes(work, frozen_keyframes)
     with tempfile.TemporaryDirectory(prefix="duet-visual-", dir="/tmp") as raw:
         stage = Path(raw).resolve(strict=True)
@@ -1104,11 +1228,15 @@ def _run_visual_codex(
         skip = {"keyframes", "prompt.txt", "codex_last_message.txt"}
         if frozen_keyframes is not None:
             # Current projects arrive with nine server-selected keyframes.
-            # Keep the contact sheets as a cheap overview, but do not expose
-            # every 4-fps extraction to the visual model as a second image set.
+            # Do not expose the raw extraction/contact sheets as a second image set.
             skip.update(
                 candidate.name
                 for candidate in work.glob("*_frame_*.png")
+                if candidate.is_file()
+            )
+            skip.update(
+                candidate.name
+                for candidate in work.glob("contact_sheet*.jpg")
                 if candidate.is_file()
             )
         if isolate_dialogue:
@@ -1117,7 +1245,7 @@ def _run_visual_codex(
         _copy_visual_tree(cdir / "scripts", stage / "scripts", skip=set())
         stage_keyframes = stage_work / "keyframes"
         stage_keyframes.mkdir(mode=0o700)
-        for order, data in enumerate(frozen_keyframes, 1):
+        for order, data in enumerate(analysis_keyframes, 1):
             _materialize_skill_bytes(
                 stage_keyframes / f"{order:02d}.png",
                 _analysis_keyframe_proxy(data),
@@ -1173,6 +1301,7 @@ def _run_visual_attempt(
     *,
     isolate_dialogue: bool,
     frozen_keyframes: tuple[bytes, ...] | None = None,
+    analysis_keyframes: tuple[bytes, ...] | None = None,
     skill_bytes: bytes | None = None,
 ) -> tuple[list[str], str]:
     """Run once, adopting complete outputs even when Codex exits abnormally."""
@@ -1189,6 +1318,7 @@ def _run_visual_attempt(
             isolate_dialogue=isolate_dialogue,
             skill_bytes=skill_bytes,
             frozen_keyframes=frozen_keyframes,
+            analysis_keyframes=analysis_keyframes,
         )
     except CodexError as exc:
         run_error = exc
@@ -1222,6 +1352,7 @@ def _run_visual_with_retry(
     isolate_dialogue: bool,
     step: str,
     frozen_keyframes: tuple[bytes, ...] | None = None,
+    analysis_keyframes: tuple[bytes, ...] | None = None,
     skill_bytes: bytes | None = None,
 ) -> tuple[list[str], str]:
     policy = _retry_policy(settings)
@@ -1233,6 +1364,7 @@ def _run_visual_with_retry(
             work,
             isolate_dialogue=isolate_dialogue,
             frozen_keyframes=frozen_keyframes,
+            analysis_keyframes=analysis_keyframes,
             skill_bytes=skill_bytes,
         ),
         policy=policy,
@@ -1572,13 +1704,36 @@ def _generate_segmented_image_prompts(
         raise PipelineError("frozen image-postprocess Skill is required")
     frame_paths = {}
     for segment, meta in zip(segments, seg_metas):
-        directory = work / "segments" / str(segment["index"]) / "work" / "keyframes"
-        names = meta.get("keyframes") if isinstance(meta, dict) else None
-        paths = (
-            [directory / name for name in names]
-            if isinstance(names, list) and all(isinstance(name, str) for name in names)
-            else sorted(path for path in directory.glob("*.png") if path.is_file())
-        )
+        relative_paths = meta.get("keyframe_paths") if isinstance(meta, dict) else None
+        if (
+            not isinstance(relative_paths, list)
+            or len(relative_paths) != scene_planner.KEYFRAMES_PER_SEGMENT
+            or any(not isinstance(path, str) or not path for path in relative_paths)
+        ):
+            raise PipelineError("previsual keyframe set is invalid")
+        paths = [(work / path).resolve() for path in relative_paths]
+        if any(
+            not path.is_relative_to(work.resolve()) or not path.is_file()
+            for path in paths
+        ):
+            raise PipelineError("previsual keyframe set is invalid")
+        sampling = meta.get("keyframe_sampling")
+        try:
+            expected_sha256s = [
+                item["artifact"]["sha256"] for item in sampling["keyframes"]
+            ]
+        except (KeyError, TypeError):
+            raise PipelineError("previsual keyframe set is invalid") from None
+        if (
+            not isinstance(sampling, dict)
+            or sampling.get("version") != 2
+            or len(expected_sha256s) != scene_planner.KEYFRAMES_PER_SEGMENT
+            or any(
+                hashlib.sha256(path.read_bytes()).hexdigest() != expected
+                for path, expected in zip(paths, expected_sha256s, strict=True)
+            )
+        ):
+            raise PipelineError("previsual keyframe set is invalid")
         frame_paths[segment["index"]] = paths
     transitions_by_segment = {}
     if all(frame_paths.values()):
@@ -1609,9 +1764,7 @@ def _generate_segmented_image_prompts(
         "index": segment["index"],
         "chain_id": segment["chain_id"],
         "join_mode": segment["join_mode"],
-        "keyframes_dir": (
-            work / "segments" / str(segment["index"]) / "work" / "keyframes"
-        ),
+        "keyframes_dir": frame_paths[segment["index"]][0].parent,
         **({"transition_skeleton": transitions_by_segment[segment["index"]]}
            if segment["index"] in transitions_by_segment else {}),
     } for segment in segments]
@@ -2256,7 +2409,7 @@ def _bind_keyframe_source_timeline(
                 segment.get("index") != expected_index
                 or meta.get("index") != expected_index
                 or receipt.get("schema") != "duet.backend-keyframe-sampling"
-                or receipt.get("version") != 1
+                or receipt.get("version") != 2
                 or not isinstance(items, list)
                 or len(items) != scene_planner.KEYFRAMES_PER_SEGMENT
                 or names != [f"{order:02d}.png" for order in range(1, 10)]
@@ -2748,6 +2901,7 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
                      milestone: skill_milestone.FrozenSkillMilestone | None = None,
                      skill_bytes: bytes | None = None,
                      render_options: dict[str, bool] | None = None,
+                     mediakit_gate: threading.BoundedSemaphore | None = None,
                      ) -> dict:
     """单段完整流程：切段 → 抽帧 → 写该段台词 → codex（cwd=段目录）→ 校验 → 后端加前缀。
 
@@ -2774,11 +2928,31 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
         )
         sampling_receipt = None
         frozen_keyframes = None
+        analysis_keyframes = None
+        canonical_keyframe_paths = None
         if keyframe_selection is not None:
             _names, sampling_receipt, frozen_keyframes = (
                 _materialize_backend_keyframes(source, segwork, keyframe_selection)
             )
-        anchor_frames = _read_segment_anchor_frames(segwork) if new_input_contract else None
+            if new_input_contract:
+                if render_options is None:
+                    raise PipelineError("generation_config_invalid")
+                analysis_keyframes, sampling_receipt, canonical_keyframe_paths = (
+                    _prepare_previsual_keyframes(
+                        settings,
+                        work.parent,
+                        index,
+                        segwork,
+                        sampling_receipt,
+                        render_options,
+                        mediakit_gate,
+                    )
+                )
+        anchor_frames = (
+            (analysis_keyframes[0], analysis_keyframes[-1])
+            if new_input_contract and analysis_keyframes is not None
+            else (_read_segment_anchor_frames(segwork) if new_input_contract else None)
+        )
         # 该段台词（白名单净化后；lines 为 None = 无口播，不写文件）
         if lines is not None:
             _atomic_bytes(
@@ -2807,6 +2981,7 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             isolate_dialogue=new_input_contract,
             step=f"segment {index} visual codex",
             frozen_keyframes=frozen_keyframes,
+            analysis_keyframes=analysis_keyframes,
             skill_bytes=skill_bytes,
         )
         visual_prompt = prompt
@@ -2836,7 +3011,12 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
                 join_mode=seg["join_mode"],
                 source=f"segments/{index}/source.mp4",
                 keyframe_paths=[
-                    f"segments/{index}/work/keyframes/{name}" for name in keyframes
+                    str(path.resolve().relative_to(work.resolve()))
+                    for path in (
+                        canonical_keyframe_paths
+                        if canonical_keyframe_paths is not None
+                        else [segwork / "keyframes" / name for name in keyframes]
+                    )
                 ],
                 first_frame_path=f"segments/{index}/work/anchors/{first_anchor.name}",
                 last_frame_path=f"segments/{index}/work/anchors/{last_anchor.name}",
@@ -3702,7 +3882,14 @@ def produce_prompt_fusion(
         return "failed"
 
 
-def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -> None:
+def run(
+    settings: Settings,
+    cid: str,
+    runner,
+    *,
+    claimed_owner: object = None,
+    mediakit_gate: threading.BoundedSemaphore | None = None,
+) -> None:
     """后台任务入口；任何步骤失败 → status=failed + error，不抛异常。"""
     # data_dir 可能是相对路径（生产默认 "data"）：子进程带 cwd 时相对路径会错位，统一起点解析为绝对
     cdir = (settings.data_dir / cid).resolve()
@@ -4048,6 +4235,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     new_input_contract=new_input_contract,
                     skill_bytes=video_skill_bytes,
                     render_options=render_options,
+                    mediakit_gate=mediakit_gate,
                     **(
                         {"keyframe_selection": backend_keyframe_selections[seg["index"]]}
                         if seg["index"] in backend_keyframe_selections
@@ -4098,7 +4286,8 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                             **seg,
                             "source_path": segdir / "source.mp4",
                             "keyframe_paths": [
-                                segwork / "keyframes" / name for name in seg["keyframes"]
+                                (work / path).resolve()
+                                for path in seg["keyframe_paths"]
                             ],
                             "first_frame_path": segwork / "anchors" / "first.png",
                             "last_frame_path": segwork / "anchors" / "last.png",
@@ -4169,9 +4358,8 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     image_prompts,
                     {
                         seg["index"]: [
-                            work / "segments" / str(seg["index"]) / "work"
-                            / "keyframes" / name
-                            for name in seg["keyframes"]
+                            (work / path).resolve()
+                            for path in seg["keyframe_paths"]
                         ]
                         for seg in seg_metas
                     },

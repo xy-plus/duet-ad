@@ -101,6 +101,7 @@ def _run_pipeline_under_gate(
     gate,
     claimed_owner: object = None,
     gate_acquired: bool = False,
+    mediakit_gate: threading.BoundedSemaphore | None = None,
 ) -> bool:
     """Run one pipeline under a bounded gate; contention stays retryable."""
     acquired = gate_acquired
@@ -150,7 +151,11 @@ def _run_pipeline_under_gate(
                 return True
             claimed_owner = claimed["_input_owner"]
         pipeline.run(
-            settings, cid, runner, claimed_owner=claimed_owner
+            settings,
+            cid,
+            runner,
+            claimed_owner=claimed_owner,
+            mediakit_gate=mediakit_gate,
         )
         return True
     except BaseException as exc:
@@ -3745,7 +3750,9 @@ def create_app(settings: Settings) -> FastAPI:
     submit_locks = conversation_locks
     postprocess_locks = conversation_locks
     # MediaKit 后处理并行提交的进程级信号量：单进程内跨会话全局并发上限
-    mediakit_sem = asyncio.Semaphore(settings.mediakit_concurrency)
+    mediakit_sem = threading.BoundedSemaphore(
+        settings.mediakit_concurrency
+    )
     seedream_sem = asyncio.Semaphore(settings.seedream_concurrency)
     app.state.h3_resume_threads = []
     app.state.prompt_fusion_recovery_threads = []
@@ -3983,6 +3990,7 @@ def create_app(settings: Settings) -> FastAPI:
             pipeline_sem,
             claimed_owner,
             gate_acquired,
+            mediakit_sem,
         ):
             pipeline_dispatcher_wakeup.set()
             return

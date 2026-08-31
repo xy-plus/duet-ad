@@ -59,7 +59,7 @@ def test_create_defaults_are_frozen_in_meta_and_work_receipt(
     ]
 
 
-def test_create_custom_config_maps_watermark_to_internal_brand(
+def test_create_custom_config_moves_erasure_before_postprocess(
     client, settings, video_1s,
 ):
     response = _post(client, video_1s, config=CUSTOM)
@@ -71,18 +71,18 @@ def test_create_custom_config_maps_watermark_to_internal_brand(
         "confirm": True,
         "options": {
             "optimize_image": False,
-            "remove_subtitle": True,
-            "remove_brand": True,
+            "remove_subtitle": False,
+            "remove_brand": False,
         },
     }
     assert _postprocess_matches_automatic_request(
         {"status": "running", "options": request["options"]}, request
     )
     assert not _postprocess_matches_automatic_request(
-        {
-            "status": "running",
-            "options": {**request["options"], "remove_brand": False},
-        },
+            {
+                "status": "running",
+                "options": {**request["options"], "optimize_image": True},
+            },
         request,
     )
 
@@ -203,7 +203,7 @@ def test_capability_get_declares_exact_create_contract(client):
 @pytest.mark.parametrize(
     ("config", "expected_events"),
     [
-        (CUSTOM, ["start", "run", "generation"]),
+        (CUSTOM, ["generation"]),
         (
             {
                 "optimize_image": False,

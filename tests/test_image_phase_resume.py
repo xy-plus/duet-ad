@@ -122,11 +122,20 @@ def _candidate(tmp_path: Path, *, status: str = "failed") -> tuple[object, Path]
             "source_scene_start_s": 0.0,
             "source_time_s": round((order - 1) * 0.2, 6),
             "repeated": order != 1,
+            "artifact": {
+                "path": f"work/segments/1/work/keyframes/{name}",
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "stages": [],
+            },
         })
     _json(segment / "keyframe_sampling.json", {
         "schema": "duet.backend-keyframe-sampling",
-        "version": 1,
+        "version": 2,
         "selection_method": "scene-anchor-capacity-hamilton-v1",
+        "preprocess": {
+            "remove_subtitle": False,
+            "remove_watermark": False,
+        },
         "keyframes": entries,
     })
     (segment / "anchors" / "first.png").write_bytes(data)

@@ -442,7 +442,8 @@ def test_segmented_image_prompt_generation_passes_element_index_once(
     work = tmp_path / "work"
     keyframes = work / "segments" / "1" / "work" / "keyframes"
     keyframes.mkdir(parents=True)
-    (keyframes / "01.png").write_bytes(b"frozen")
+    for order in range(1, 10):
+        (keyframes / f"{order:02d}.png").write_bytes(f"frozen-{order}".encode())
     element_index_path = work / "element_index.json"
     element_index_path.write_text(
         json.dumps(_element_index(), ensure_ascii=False), encoding="utf-8"
@@ -468,7 +469,23 @@ def test_segmented_image_prompt_generation_passes_element_index_once(
         object(),
         object(),
         [{"index": 1, "chain_id": "chain-1", "join_mode": "hard_cut"}],
-        [{"index": 1, "keyframes": ["01.png"]}],
+        [{
+            "index": 1,
+            "keyframes": [f"{order:02d}.png" for order in range(1, 10)],
+            "keyframe_paths": [
+                f"segments/1/work/keyframes/{order:02d}.png"
+                for order in range(1, 10)
+            ],
+            "keyframe_sampling": {
+                "version": 2,
+                "keyframes": [
+                    {"artifact": {"sha256": hashlib.sha256(
+                        (keyframes / f"{order:02d}.png").read_bytes()
+                    ).hexdigest()}}
+                    for order in range(1, 10)
+                ],
+            },
+        }],
         work,
         session_dir=tmp_path,
         element_index_path=element_index_path,
