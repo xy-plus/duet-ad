@@ -1154,6 +1154,7 @@ def _canonical_non_person_entity_ledger(
     value: object, allowed_person_ids: set[str], *,
     allowed_scene_ids: set[str] | None = None,
     allow_sparse: bool = False,
+    strict_semantics: bool = False,
 ) -> dict:
     if (
         not isinstance(value, dict)
@@ -1250,32 +1251,36 @@ def _canonical_non_person_entity_ledger(
                 and _PROJECT_ENTITY_OWNER_ID in {subject, object_}
             )
             or (
-                predicate == "contacts"
+                strict_semantics
+                and predicate == "contacts"
                 and subject >= object_
             )
         ):
             raise ImageOptimizationOutputError(
                 "image optimization output is missing or invalid"
             )
+        if predicate == "contacts" and subject > object_:
+            subject, object_ = object_, subject
         pair = tuple(sorted((subject, object_)))
-        if predicate in _PHYSICAL_ENTITY_RELATION_PREDICATES:
-            if pair in physical_pairs:
-                raise ImageOptimizationOutputError(
-                    "image optimization output is missing or invalid"
-                )
-            physical_pairs.add(pair)
-        elif predicate == "occludes":
-            if pair in occlusion_pairs:
-                raise ImageOptimizationOutputError(
-                    "image optimization output is missing or invalid"
-                )
-            occlusion_pairs.add(pair)
-        elif predicate == "owned_by":
-            if subject in ownership_subjects:
-                raise ImageOptimizationOutputError(
-                    "image optimization output is missing or invalid"
-                )
-            ownership_subjects.add(subject)
+        if strict_semantics:
+            if predicate in _PHYSICAL_ENTITY_RELATION_PREDICATES:
+                if pair in physical_pairs:
+                    raise ImageOptimizationOutputError(
+                        "image optimization output is missing or invalid"
+                    )
+                physical_pairs.add(pair)
+            elif predicate == "occludes":
+                if pair in occlusion_pairs:
+                    raise ImageOptimizationOutputError(
+                        "image optimization output is missing or invalid"
+                    )
+                occlusion_pairs.add(pair)
+            elif predicate == "owned_by":
+                if subject in ownership_subjects:
+                    raise ImageOptimizationOutputError(
+                        "image optimization output is missing or invalid"
+                    )
+                ownership_subjects.add(subject)
         if predicate in directed_edges:
             directed_edges[predicate].append((subject, object_))
         relations.append({
@@ -1283,21 +1288,24 @@ def _canonical_non_person_entity_ledger(
             "predicate": predicate,
             "object_id": object_,
         })
-    if relations != sorted(
+    sorted_relations = sorted(
         relations,
         key=lambda item: (item["subject_id"], item["predicate"], item["object_id"]),
-    ) or any(_contains_directed_cycle(edges) for edges in directed_edges.values()) or (
-        not allow_sparse and {
+    )
+    if strict_semantics and (
+        relations != sorted_relations
+        or any(_contains_directed_cycle(edges) for edges in directed_edges.values())
+        or (not allow_sparse and {
             identifier
             for relation in relations
             for identifier in (relation["subject_id"], relation["object_id"])
             if identifier in entity_ids
-        } != entity_ids
+        } != entity_ids)
     ):
         raise ImageOptimizationOutputError(
             "image optimization output is missing or invalid"
         )
-    return {"entities": entities, "relations": relations}
+    return {"entities": entities, "relations": sorted_relations}
 
 
 def _canonical_dominant_palette_contract(value: object) -> dict:
@@ -1380,6 +1388,7 @@ def _canonical_frame_constraint(
     value: object, allowed_person_ids: set[str], *,
     allowed_scene_ids: set[str] | None = None,
     allow_sparse: bool = False,
+    strict_entity_ledger_semantics: bool = False,
 ) -> dict:
     if (
         not isinstance(value, dict)
@@ -1406,6 +1415,7 @@ def _canonical_frame_constraint(
             value.get("non_person_entity_ledger"), allowed_person_ids,
             allowed_scene_ids=allowed_scene_ids,
             allow_sparse=allow_sparse,
+            strict_semantics=strict_entity_ledger_semantics,
         ),
         "dominant_palette_contract": _canonical_dominant_palette_contract(
             value.get("dominant_palette_contract")
@@ -1424,6 +1434,7 @@ def _canonical_plan_v3(
     frame_counts: dict[int, int] | None = None,
     *,
     allow_sparse_facts: bool = False,
+    strict_entity_ledger_semantics: bool = False,
 ) -> dict:
     if not isinstance(value, dict) or value.get("version") != 3:
         raise ImageOptimizationOutputError(
@@ -1487,6 +1498,9 @@ def _canonical_plan_v3(
                 item, allowed_person_ids,
                 allowed_scene_ids={base["scene"]["scene_id"]},
                 allow_sparse=allow_sparse_facts,
+                strict_entity_ledger_semantics=(
+                    strict_entity_ledger_semantics
+                ),
             )
             index = constraint["frame_index"]
             if (
@@ -1533,15 +1547,24 @@ def canonical_plan_v3(
     value: object,
     segment_indices: list[int] | None = None,
     frame_counts: dict[int, int] | None = None,
+    *,
+    strict_entity_ledger_semantics: bool = False,
 ) -> dict:
     """Return an isolated v3 plan with one hard constraint record per frame."""
-    return deepcopy(_canonical_plan_v3(value, segment_indices, frame_counts))
+    return deepcopy(_canonical_plan_v3(
+        value,
+        segment_indices,
+        frame_counts,
+        strict_entity_ledger_semantics=strict_entity_ledger_semantics,
+    ))
 
 
 def _canonical_plan_v4(
     value: object,
     expected_indices: list[int] | None = None,
     frame_counts: dict[int, int] | None = None,
+    *,
+    strict_entity_ledger_semantics: bool = False,
 ) -> dict:
     if not isinstance(value, dict) or value.get("version") != 4:
         raise ImageOptimizationOutputError(
@@ -1566,6 +1589,7 @@ def _canonical_plan_v4(
     v3_value["scene_plans"] = v3_scenes
     canonical = _canonical_plan_v3(
         v3_value, expected_indices, frame_counts, allow_sparse_facts=True,
+        strict_entity_ledger_semantics=strict_entity_ledger_semantics,
     )
     if not canonical["eligible"]:
         return {**canonical, "version": 4}
@@ -1603,9 +1627,16 @@ def canonical_plan_v4(
     value: object,
     segment_indices: list[int] | None = None,
     frame_counts: dict[int, int] | None = None,
+    *,
+    strict_entity_ledger_semantics: bool = False,
 ) -> dict:
     """Return an isolated v4 plan with scene-level target continuity authority."""
-    return deepcopy(_canonical_plan_v4(value, segment_indices, frame_counts))
+    return deepcopy(_canonical_plan_v4(
+        value,
+        segment_indices,
+        frame_counts,
+        strict_entity_ledger_semantics=strict_entity_ledger_semantics,
+    ))
 
 
 def _canonical_plan(
@@ -2063,6 +2094,7 @@ def compile_semantic_plan(
     *,
     source_frames: dict[int, list[Path]] | None = None,
     element_index: dict | None = None,
+    strict_entity_ledger_semantics: bool = False,
 ) -> tuple[dict, dict]:
     """Compile tolerant visual semantics into the one canonical executable v4 plan."""
     slots = _semantic_slots(
@@ -2863,7 +2895,9 @@ def compile_semantic_plan(
         "person_plans": person_plans,
         "scene_plans": scene_plans,
         "segments": segments,
-    }, indices, frame_counts)
+    }, indices, frame_counts,
+        strict_entity_ledger_semantics=strict_entity_ledger_semantics,
+    )
     if source_frames is not None:
         plan = _bind_source_palette_contracts(plan, source_frames)
     diagnostics = {
@@ -3879,6 +3913,7 @@ def _canonical_project_output(
     source_frames: dict[int, list[Path]] | None = None,
     segment_specs: list[dict] | None = None,
     element_index: dict | None = None,
+    strict_entity_ledger_semantics: bool = False,
 ) -> tuple[dict, dict]:
     semantic_output = isinstance(value, dict) and value.get("version") is None
     if semantic_output:
@@ -3889,6 +3924,7 @@ def _canonical_project_output(
             segment_specs,
             source_frames=source_frames,
             element_index=element_index,
+            strict_entity_ledger_semantics=strict_entity_ledger_semantics,
         )
         _LOGGER.info(
             "image semantic compiler score=%s issues=%s ignored=%s "
@@ -4129,10 +4165,18 @@ def generate_project_prompts(
     skill_path: Path | None = None,
     phase_retry_count: int = 0,
     phase_retry_interval_s: float = 0.0,
+    strict_entity_ledger_semantics: bool = False,
+    generation_config: dict[str, bool] | None = None,
 ) -> tuple[dict, dict]:
     """Plan globally from contact sheets, then describe source frames per segment."""
     if edit_mode not in SEEDREAM_EDIT_MODES or expected_version not in {2, 3, 4}:
         raise ValueError("unsupported image optimization edit mode")
+    if (
+        not isinstance(generation_config, dict)
+        or set(generation_config) != {"remove_subtitle", "remove_watermark"}
+        or any(not isinstance(value, bool) for value in generation_config.values())
+    ):
+        raise ValueError("image generation_config is invalid")
     session, indices, prepared = _project_segment_inputs(
         segments, session_dir, expected_version=expected_version,
     )
@@ -4212,6 +4256,7 @@ def generate_project_prompts(
                 _contact_sheet(frames, destination)
             request = {
                 "phase": "global_plan",
+                "generation_config": generation_config,
                 "edit_mode": edit_mode,
                 "segments": [{
                     **segment,
@@ -4281,6 +4326,7 @@ def generate_project_prompts(
                 ]
                 request = {
                     "phase": "segment_frames",
+                    "generation_config": generation_config,
                     "edit_mode": edit_mode,
                     "segment": next(
                         value for value in request_segments
@@ -4362,6 +4408,7 @@ def generate_project_prompts(
         source_frames={segment["index"]: frames for segment, frames in prepared},
         segment_specs=[segment for segment, _frames in prepared],
         element_index=element_index,
+        strict_entity_ledger_semantics=strict_entity_ledger_semantics,
     )
     if plan.get("version") != expected_version:
         raise ImageOptimizationOutputError(

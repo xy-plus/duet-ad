@@ -40,6 +40,21 @@ def test_visual_and_dialogue_schemas_are_closed_and_do_not_echo_backend_fields()
             assert f'"{forbidden}"' not in rendered
 
 
+def test_visual_prompt_input_carries_exact_render_switches():
+    prompt = pipeline._codex_prompt(
+        Path("/tmp/visual-contract-test"),
+        visual_only=True,
+        render_options={
+            "remove_subtitle": True,
+            "remove_watermark": False,
+        },
+    )
+    assert (
+        'generation_config={"remove_subtitle":true,"remove_watermark":false}'
+        in prompt
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [

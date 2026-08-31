@@ -22,6 +22,12 @@ def test_segment_contract_keeps_backend_authority_and_schema_output():
         assert forbidden not in text
 
 
+def test_render_switch_instruction_is_single_and_short():
+    instruction = "开关为真时不描述字幕或标志。"
+    assert _text().count(instruction) == 1
+    assert len(instruction.removesuffix("。")) <= 15
+
+
 def test_project_index_has_first_class_neutral_relations():
     text = _text()
     for required in (

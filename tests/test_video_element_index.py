@@ -13,8 +13,9 @@ from app.codex_runner import CodexOutputValidationError
 
 
 class _IndexRunner:
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, expected_generation_config: dict | None = None):
         self.payload = payload
+        self.expected_generation_config = expected_generation_config
         self.calls: list[tuple[Path, str]] = []
 
     def run_isolated_until_output(
@@ -32,6 +33,8 @@ class _IndexRunner:
             )
         )
         assert request["phase"] == "project_index"
+        if self.expected_generation_config is not None:
+            assert request["generation_config"] == self.expected_generation_config
         assert [item["segment_index"] for item in request["segments"]] == [1]
         frame_items = request["segments"][0]["frames"]
         assert [item["frame_order"] for item in frame_items] == [1, 2]
@@ -125,13 +128,17 @@ def test_project_index_call_is_once_isolated_and_preserves_segment_outputs(tmp_p
     frame_paths[1].write_bytes(originals[1])
     segment_prompt = work / "segments" / "1" / "work" / "prompt.txt"
     segment_prompt.write_text("original segment prompt", encoding="utf-8")
-    runner = _IndexRunner(_element_index())
+    render_options = {"remove_subtitle": True, "remove_watermark": False}
+    runner = _IndexRunner(
+        _element_index(), expected_generation_config=render_options,
+    )
 
     result = pipeline._generate_project_element_index(
         runner,
         cdir,
         {1: frame_paths},
         skill_bytes=b"frozen video-maker skill",
+        render_options=render_options,
     )
 
     assert result == work / "element_index.json"
@@ -504,6 +511,7 @@ def test_image_project_creates_index_once_outside_existing_image_retries(
         retry_count=1,
         retry_interval_s=0,
         seedream_edit_mode="conservative",
+        strict_entity_ledger_semantics=False,
     )
 
     result = pipeline._generate_image_optimization_project(
@@ -521,6 +529,7 @@ def test_image_project_creates_index_once_outside_existing_image_retries(
         step="image project",
         skill_bytes=b"frozen image-postprocess skill",
         video_skill_bytes=b"frozen video-maker skill",
+        render_options={"remove_subtitle": False, "remove_watermark": False},
     )
 
     assert result == ({"version": 4}, {0: {}})

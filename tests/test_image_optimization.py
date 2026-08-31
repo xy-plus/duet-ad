@@ -136,18 +136,20 @@ def test_segment_frames_phase_receives_only_low_resolution_jpeg_proxies(
     captured = {}
 
     def phase(_runner, *, stage, output_name, **_kwargs):
-        if output_name == "global_plan.json":
-            return {"people": {}, "entities": {}, "scenes": {}, "relations": {}}
-        proxy = stage / "work" / "keyframes" / "01.jpg"
         request = json.loads(
             (stage / "work" / "request.json").read_text(encoding="utf-8")
         )
+        if output_name == "global_plan.json":
+            captured["global_generation_config"] = request["generation_config"]
+            return {"people": {}, "entities": {}, "scenes": {}, "relations": {}}
+        proxy = stage / "work" / "keyframes" / "01.jpg"
         decoded = cv2.imread(str(proxy), cv2.IMREAD_COLOR)
         captured.update(
             files=sorted(path.name for path in proxy.parent.iterdir()),
             shape=decoded.shape[:2] if decoded is not None else None,
             magic=proxy.read_bytes()[:2],
             path=request["semantic_slots"]["frames"][0]["path"],
+            segment_generation_config=request["generation_config"],
         )
         raise SegmentCaptured
 
@@ -156,7 +158,12 @@ def test_segment_frames_phase_receives_only_low_resolution_jpeg_proxies(
     with pytest.raises(SegmentCaptured):
         image_optimization.generate_project_prompts(
             object(), [segment], "independent_parallel",
-            session_dir=session, skill_bytes=b"skill",
+            session_dir=session,
+            skill_bytes=b"skill",
+            generation_config={
+                "remove_subtitle": True,
+                "remove_watermark": False,
+            },
         )
 
     assert captured == {
@@ -164,6 +171,14 @@ def test_segment_frames_phase_receives_only_low_resolution_jpeg_proxies(
         "shape": (288, 512),
         "magic": b"\xff\xd8",
         "path": "work/keyframes/01.jpg",
+        "global_generation_config": {
+            "remove_subtitle": True,
+            "remove_watermark": False,
+        },
+        "segment_generation_config": {
+            "remove_subtitle": True,
+            "remove_watermark": False,
+        },
     }
     assert hashlib.sha256(source.read_bytes()).hexdigest() == source_digest
 
@@ -245,6 +260,15 @@ def test_seedream_edit_mode_environment_default_and_explicit_anchor(monkeypatch)
 
     monkeypatch.setenv("SEEDREAM_EDIT_MODE", "anchor_consistency")
     assert get_settings().seedream_edit_mode == "anchor_consistency"
+
+
+def test_strict_entity_ledger_semantics_defaults_off_and_can_be_enabled(monkeypatch):
+    monkeypatch.setenv("ACCESS_TOKEN", "test-token")
+    monkeypatch.delenv("STRICT_ENTITY_LEDGER_SEMANTICS", raising=False)
+    assert get_settings().strict_entity_ledger_semantics is False
+
+    monkeypatch.setenv("STRICT_ENTITY_LEDGER_SEMANTICS", "true")
+    assert get_settings().strict_entity_ledger_semantics is True
 
 
 @pytest.mark.parametrize(("model", "has_sequential"), [
@@ -1478,6 +1502,36 @@ def test_v4_canonical_plan_accepts_sparse_observations_as_prompt_facts():
     assert "dominant_palette_contract=" in prompts[0][2]
 
 
+def test_entity_ledger_strict_semantics_is_optional_and_defaults_off():
+    plan = _v3_frame_bound_plan()
+    ledger = plan["segments"][0]["frame_constraints"][0][
+        "non_person_entity_ledger"
+    ]
+    ledger["entities"].append({
+        "entity_id": "ENTITY_02",
+        "description": "当前帧可见但没有关系边的实体",
+        "visibility": "full",
+    })
+
+    canonical = image_optimization.canonical_plan_v3(
+        plan, segment_indices=[0], frame_counts={0: 2},
+    )
+    assert [
+        item["entity_id"]
+        for item in canonical["segments"][0]["frame_constraints"][0][
+            "non_person_entity_ledger"
+        ]["entities"]
+    ] == ["ENTITY_01", "ENTITY_02"]
+
+    with pytest.raises(image_optimization.ImageOptimizationOutputError):
+        image_optimization.canonical_plan_v3(
+            plan,
+            segment_indices=[0],
+            frame_counts={0: 2},
+            strict_entity_ledger_semantics=True,
+        )
+
+
 @pytest.mark.parametrize("eligible", [False, True])
 def test_v4_empty_or_refusal_plan_is_protocol_error_not_content_ineligibility(eligible):
     value = {
@@ -2177,6 +2231,10 @@ def test_v4_plan_rejects_model_transition_that_differs_from_backend_skeleton(tmp
             settings.seedream_edit_mode,
             session_dir=session,
             skill_bytes=b"frozen image verification skill",
+            generation_config={
+                "remove_subtitle": False,
+                "remove_watermark": False,
+            },
         )
 
 
@@ -2224,6 +2282,10 @@ def test_relation_rich_project_index_uses_the_producer_size_contract(
             session_dir=session,
             element_index_path=element_index,
             skill_bytes=b"frozen image-postprocess skill",
+            generation_config={
+                "remove_subtitle": False,
+                "remove_watermark": False,
+            },
         )
 
 

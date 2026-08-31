@@ -46,7 +46,7 @@ from typing import NoReturn
 import cv2
 import numpy as np
 
-from app import asr, codex_output_schemas, dialogue_review, error_trace, frame_fit, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
+from app import asr, codex_output_schemas, dialogue_review, error_trace, frame_fit, generation_config, h3, h3_project, image_optimization, long_generation, long_video, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
 from app.codex_runner import (
     CodexError,
     CodexOutputValidationError,
@@ -587,6 +587,7 @@ def _codex_prompt(
     *,
     visual_only: bool = False,
     skill_path: Path | None = None,
+    render_options: dict[str, bool] | None = None,
 ) -> str:
     parts = [
         "按当前隔离目录的 SKILL.md 执行（该文档只读，禁止修改）。"
@@ -594,6 +595,16 @@ def _codex_prompt(
     ]
     if target_language:
         parts.append(_language_note(target_language))
+    if render_options is not None:
+        parts.append(
+            "generation_config="
+            + json.dumps(
+                render_options,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     if visual_only:
         parts.append(
             "本次只生成视觉叙事 prompt：不要读取、生成、推断、改写或编排 voice_lines；"
@@ -842,6 +853,7 @@ def _generate_project_element_index(
     *,
     milestone: skill_milestone.FrozenSkillMilestone | None = None,
     skill_bytes: bytes | None = None,
+    render_options: dict[str, bool] | None = None,
 ) -> Path:
     """Run the additive video-maker project phase against keyframes only."""
     if skill_bytes is None and milestone is not None:
@@ -894,7 +906,11 @@ def _generate_project_element_index(
             )
         (isolated_work / "project_index_request.json").write_text(
             json.dumps(
-                {"phase": "project_index", "segments": segments},
+                {
+                    "phase": "project_index",
+                    "generation_config": render_options,
+                    "segments": segments,
+                },
                 ensure_ascii=False,
                 indent=2,
             ) + "\n",
@@ -1449,6 +1465,7 @@ def _generate_image_optimization_project(
     milestone: skill_milestone.FrozenSkillMilestone | None = None,
     skill_bytes: bytes | None = None,
     video_skill_bytes: bytes | None = None,
+    render_options: dict[str, bool] | None = None,
 ) -> tuple[dict | None, dict]:
     if skill_bytes is None and milestone is not None:
         skill_bytes = milestone.read_bytes("image-postprocess")
@@ -1471,7 +1488,11 @@ def _generate_image_optimization_project(
         def generate_element_index() -> Path:
             try:
                 return _generate_project_element_index(
-                    runner, session_dir, frame_paths, skill_bytes=video_skill_bytes,
+                    runner,
+                    session_dir,
+                    frame_paths,
+                    skill_bytes=video_skill_bytes,
+                    render_options=render_options,
                 )
             except Exception as exc:
                 error_trace.record(
@@ -1502,6 +1523,10 @@ def _generate_image_optimization_project(
                 skill_bytes=skill_bytes,
                 phase_retry_count=settings.retry_count,
                 phase_retry_interval_s=settings.retry_interval_s,
+                generation_config=render_options,
+                strict_entity_ledger_semantics=(
+                    settings.strict_entity_ledger_semantics
+                ),
                 **kwargs,
             )
         except image_optimization.ImageOptimizationOutputError as exc:
@@ -1539,6 +1564,7 @@ def _generate_segmented_image_prompts(
     element_index_path: Path | None = None,
     milestone: skill_milestone.FrozenSkillMilestone | None = None,
     skill_bytes: bytes | None = None,
+    render_options: dict[str, bool] | None = None,
 ) -> tuple[dict, dict]:
     if skill_bytes is None and milestone is not None:
         skill_bytes = milestone.read_bytes("image-postprocess")
@@ -1601,6 +1627,7 @@ def _generate_segmented_image_prompts(
         specs,
         skill_bytes=skill_bytes,
         milestone=milestone,
+        render_options=render_options,
         **kwargs,
     )
     if continuity is None:
@@ -2720,6 +2747,7 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
                      keyframe_selection: list[dict] | None = None,
                      milestone: skill_milestone.FrozenSkillMilestone | None = None,
                      skill_bytes: bytes | None = None,
+                     render_options: dict[str, bool] | None = None,
                      ) -> dict:
     """单段完整流程：切段 → 抽帧 → 写该段台词 → codex（cwd=段目录）→ 校验 → 后端加前缀。
 
@@ -2763,6 +2791,7 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
             segdir,
             target_language,
             visual_only=new_input_contract,
+            render_options=render_options,
         )
         if frozen_keyframes is not None:
             visual_request += (
@@ -3708,7 +3737,15 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
         # Reject an invalid/oversized new contract before extraction, ASR, Codex,
         # or any later provider can observe the input.
         new_input_contract = "dialogue_mode" in meta and meta.get("duration_s") is not None
+        render_options: dict[str, bool] | None = None
         if new_input_contract:
+            frozen_generation_config = generation_config.resolve(cdir, meta)
+            if frozen_generation_config is None:
+                raise PipelineError("generation_config_invalid")
+            render_options = {
+                "remove_subtitle": frozen_generation_config["remove_subtitle"],
+                "remove_watermark": frozen_generation_config["remove_watermark"],
+            }
             try:
                 source_probe = storage.probe_video(source)
                 probed_duration = source_probe.duration_s
@@ -3876,6 +3913,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     cdir,
                     translate_lang,
                     visual_only=new_input_contract,
+                    render_options=render_options,
                 ),
                 work,
                 isolate_dialogue=new_input_contract,
@@ -3904,6 +3942,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     step="project image postprocess codex",
                     skill_bytes=image_skill_bytes,
                     video_skill_bytes=video_skill_bytes,
+                    render_options=render_options,
                 )
                 if continuity is None or set(image_prompts) != {0}:
                     raise PipelineError("image optimization output is missing or invalid")
@@ -4008,6 +4047,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     translate_lang,
                     new_input_contract=new_input_contract,
                     skill_bytes=video_skill_bytes,
+                    render_options=render_options,
                     **(
                         {"keyframe_selection": backend_keyframe_selections[seg["index"]]}
                         if seg["index"] in backend_keyframe_selections
@@ -4034,6 +4074,7 @@ def run(settings: Settings, cid: str, runner, *, claimed_owner: object = None) -
                     session_dir=cdir,
                     skill_bytes=image_skill_bytes,
                     milestone=milestone,
+                    render_options=render_options,
                 )
             changes: dict = {"status": "done", "segments": seg_metas}
             if new_input_contract:

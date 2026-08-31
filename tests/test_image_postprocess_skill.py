@@ -150,6 +150,10 @@ def _generate_project_prompts(*args, **kwargs):
         "skill_bytes",
         Path("skills/image-postprocess/SKILL.md").read_bytes(),
     )
+    kwargs.setdefault(
+        "generation_config",
+        {"remove_subtitle": False, "remove_watermark": False},
+    )
     return image_optimization.generate_project_prompts(*args, **kwargs)
 
 
@@ -1984,7 +1988,10 @@ def test_v3_frame_contract_fails_closed_on_missing_duplicate_or_tampered_constra
     mutate(value)
     with pytest.raises(image_optimization.ImageOptimizationOutputError):
         image_optimization.canonical_plan_v3(
-            value, segment_indices=[0], frame_counts={0: 2}
+            value,
+            segment_indices=[0],
+            frame_counts={0: 2},
+            strict_entity_ledger_semantics=True,
         )
 
 
@@ -2016,7 +2023,10 @@ def test_v3_frame_entity_ledger_is_exact_and_fails_closed(mutate):
     mutate(value)
     with pytest.raises(image_optimization.ImageOptimizationOutputError):
         image_optimization.canonical_plan_v3(
-            value, segment_indices=[0], frame_counts={0: 2}
+            value,
+            segment_indices=[0],
+            frame_counts={0: 2},
+            strict_entity_ledger_semantics=True,
         )
 
 
@@ -2043,7 +2053,10 @@ def test_v3_frame_entity_ledger_requires_visible_entities_and_relations(mutate):
     mutate(value)
     with pytest.raises(image_optimization.ImageOptimizationOutputError):
         image_optimization.canonical_plan_v3(
-            value, segment_indices=[0], frame_counts={0: 2}
+            value,
+            segment_indices=[0],
+            frame_counts={0: 2},
+            strict_entity_ledger_semantics=True,
         )
 
 
@@ -2076,7 +2089,10 @@ def test_v3_frame_entity_ledger_rejects_unresolved_or_ambiguous_relations(mutate
     mutate(value)
     with pytest.raises(image_optimization.ImageOptimizationOutputError):
         image_optimization.canonical_plan_v3(
-            value, segment_indices=[0], frame_counts={0: 2}
+            value,
+            segment_indices=[0],
+            frame_counts={0: 2},
+            strict_entity_ledger_semantics=True,
         )
 
 
@@ -2165,7 +2181,10 @@ def test_v3_frame_entity_ledger_rejects_ambiguous_graphs_and_nonobservable_peopl
     mutate(value)
     with pytest.raises(image_optimization.ImageOptimizationOutputError):
         image_optimization.canonical_plan_v3(
-            value, segment_indices=[0], frame_counts={0: 2}
+            value,
+            segment_indices=[0],
+            frame_counts={0: 2},
+            strict_entity_ledger_semantics=True,
         )
 
 
@@ -3076,3 +3095,12 @@ def test_skill_leaves_pixel_palette_contract_to_backend(tmp_path):
         "area_weighted_warm_cool_family", "saturation_style",
     }
     assert diagnostics["score"] == 1.0
+def test_render_switch_instruction_is_single_and_short():
+    instruction = "开关为真时不描述字幕或标志。"
+    text = (
+        Path(__file__).parents[1] / "skills/image-postprocess/SKILL.md"
+    ).read_text(
+        encoding="utf-8"
+    )
+    assert text.count(instruction) == 1
+    assert len(instruction.removesuffix("。")) <= 15

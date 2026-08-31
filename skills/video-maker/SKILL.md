@@ -5,6 +5,8 @@ description: 分析后端为每个 segment 冻结的 9 张原始关键帧并生�
 
 # video-maker
 
+开关为真时不描述字幕或标志。
+
 ## 逐段分析
 
 项目统一为 `segments[N>=1]`。每次只处理当前 segment 的 `work/keyframes/01.png` 至 `09.png`、联系表和 `manifest.json`；像素证据优先于辅助信息。九帧由后端按源时间冻结，模型无权选帧或修改其数量、顺序和字节。
