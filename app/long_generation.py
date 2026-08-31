@@ -3219,6 +3219,26 @@ def _validate_frozen_dialogue_delivery(
         raise LongGenerationError("long_video_plan_invalid")
 
 
+def _frozen_fusion_frame_orders(
+    fusion_segment: Mapping, *, expected_count: int,
+) -> tuple[int, ...]:
+    """Bind Fusion to the H3 frame positions, never to image re-encodings."""
+    frames = fusion_segment.get("new_keyframes")
+    if (
+        not isinstance(frames, list)
+        or len(frames) != expected_count
+        or expected_count != 9
+    ):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    orders = tuple(
+        frame.get("order") if isinstance(frame, Mapping) else None
+        for frame in frames
+    )
+    if orders != tuple(range(1, expected_count + 1)):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    return orders
+
+
 def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                 dialogue_mode: str, *, aspect_ratio: str | None = None,
                 resolution: str | None = None,
@@ -3394,48 +3414,10 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         raise LongGenerationError("long_video_plan_invalid")
 
     project_selected_paths: dict[int, tuple[Path, ...]] = {}
-    frozen_fusion_proxy_data: dict[int, tuple[bytes, ...]] = {}
     if workflow in h3.H3_REFERENCE_WORKFLOWS:
         if frozen_fusion is not None:
             for index, fusion_segment in enumerate(frozen_fusion.segments, 1):
-                frames = fusion_segment.get("new_keyframes")
-                if not isinstance(frames, list) or len(frames) != 9:
-                    raise LongGenerationError("prompt_fusion_input_invalid")
-                proxies: list[bytes] = []
-                for order, frame in enumerate(frames, 1):
-                    expected_keys = (
-                        {"order", "path", "sha256"}
-                        if frozen_fusion.version == PROMPT_FUSION_LEGACY_VERSION
-                        else {
-                            "order", "path", "sha256", "segment_time_s",
-                            "source_scene_id", "transition",
-                        }
-                    )
-                    if (
-                        not isinstance(frame, Mapping)
-                        or set(frame) != expected_keys
-                        or frame.get("order") != order
-                    ):
-                        raise LongGenerationError("prompt_fusion_input_invalid")
-                    try:
-                        resolved, data = _bound_bytes(
-                            root,
-                            {key: frame[key] for key in ("path", "sha256")},
-                        )
-                    except LongGenerationError:
-                        raise LongGenerationError(
-                            "prompt_fusion_input_invalid"
-                        ) from None
-                    expected_proxy = (
-                        root / "work" / PROMPT_FUSION_PROXY_DIR
-                        / f"{frame['sha256']}.png"
-                    )
-                    if resolved != expected_proxy:
-                        raise LongGenerationError(
-                            "prompt_fusion_input_invalid"
-                        )
-                    proxies.append(data)
-                frozen_fusion_proxy_data[index] = tuple(proxies)
+                _frozen_fusion_frame_orders(fusion_segment, expected_count=9)
         project_originals: list[Path] = []
         project_counts: list[int] = []
         for raw in raw_segments:
@@ -3464,20 +3446,9 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             cursor += count
             project_selected_paths[index] = selected
             if frozen_fusion is not None:
-                proxies = frozen_fusion_proxy_data.get(index)
-                if proxies is None or len(proxies) != len(selected):
-                    raise LongGenerationError("prompt_fusion_input_invalid")
-                try:
-                    rebuilt = tuple(
-                        image_optimization.half_resolution_png(path.read_bytes())
-                        for path in selected
-                    )
-                except (OSError, ValueError):
-                    raise LongGenerationError(
-                        "prompt_fusion_input_invalid"
-                    ) from None
-                if rebuilt != proxies:
-                    raise LongGenerationError("prompt_fusion_input_invalid")
+                _frozen_fusion_frame_orders(
+                    frozen_fusion.segments[index - 1], expected_count=len(selected),
+                )
 
     frozen: list[FrozenSegment] = []
     authoritative_dialogue_for_delivery: list[dict] = []

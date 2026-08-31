@@ -157,6 +157,23 @@ def test_prompt_fusion_rejects_tampered_content_addressed_proxy(tmp_path: Path) 
         )
 
 
+def test_fusion_to_h3_binds_frame_positions_not_image_bytes() -> None:
+    frames = [{"order": order} for order in range(1, 10)]
+
+    assert long_generation._frozen_fusion_frame_orders(
+        {"new_keyframes": frames}, expected_count=9,
+    ) == tuple(range(1, 10))
+
+    frames[4] = {"order": 9}
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_input_invalid",
+    ):
+        long_generation._frozen_fusion_frame_orders(
+            {"new_keyframes": frames}, expected_count=9,
+        )
+
+
 def test_h3_request_keeps_full_resolution_frames_after_fusion_proxy(
     tmp_path: Path,
 ) -> None:
