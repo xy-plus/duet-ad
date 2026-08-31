@@ -96,41 +96,15 @@ def _write_valid_package(work: Path, frames: int = 9, prompt: str = "分段桩�
 # ---------- 句子归属 ----------
 
 
-def test_sub_four_second_input_reaches_real_failed_terminal_before_extraction(
-    tmp_path, monkeypatch,
-):
-    settings = make_settings(tmp_path)
-    meta = storage.new_conversation(settings.data_dir, "short", "source.mp4")
-    cid = meta["id"]
-    (settings.data_dir / cid / "source.mp4").write_bytes(b"source")
-    storage.update_meta(
-        settings.data_dir,
-        cid,
-        dialogue_mode="none",
-        voice_mode="none",
-        duration_s=2.5,
-    )
-    monkeypatch.setattr(
-        storage,
-        "probe_video",
-        lambda _path: storage.VideoProbe(2.5, 320, 240),
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "_run_cmd",
-        lambda *_args, **_kwargs: pytest.fail(
-            "sub-four-second input must fail before extraction"
-        ),
+def test_sub_four_second_input_keeps_real_source_timeline():
+    segments = long_video.plan_segments(
+        2.5, [{"start_s": 0.0, "end_s": 2.5}], [],
     )
 
-    pipeline.run(settings, cid, None)
-
-    stored = storage.load_meta(settings.data_dir, cid)
-    assert stored["status"] == "failed"
-    assert stored["error"] == "long_video_duration_below_provider_minimum"
-    assert (
-        settings.data_dir / cid / "work" / "errors" / "pipeline.json"
-    ).is_file()
+    assert [(item["start_s"], item["end_s"]) for item in segments] == [
+        (0.0, 2.5),
+    ]
+    assert long_video.provider_duration_s(0.0, 2.5) == 4
 
 
 def test_attribute_lines_basic():

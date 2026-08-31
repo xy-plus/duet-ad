@@ -191,8 +191,6 @@ def plan_segments(
     one-element form of the same plan consumed by longer projects.
     """
     duration = _finite_duration(duration_s)
-    if duration < SEGMENT_SOURCE_MIN_S:
-        raise LongVideoError("long_video_duration_below_provider_minimum")
     if duration <= SHORT_VIDEO_MAX_S:
         _dialogue_intervals(dialogue, duration)
         return [{
@@ -908,7 +906,7 @@ def write_plan_receipt(
     resolved_dialogue_delivery: str | None = None,
     prompt_fusion_manifest_path: Path | None = None,
 ) -> Path:
-    """Write a new canonical plan; every source segment is truly 4..10s."""
+    """Write a canonical plan while keeping a short source timeline exact."""
     return _write_plan_receipt(
         root,
         source=source,
@@ -919,7 +917,9 @@ def write_plan_receipt(
         dialogue_delivery=dialogue_delivery,
         resolved_dialogue_delivery=resolved_dialogue_delivery,
         prompt_fusion_manifest_path=prompt_fusion_manifest_path,
-        minimum_source_duration_s=SEGMENT_SOURCE_MIN_S,
+        minimum_source_duration_s=min(
+            _finite_duration(duration_s), SEGMENT_SOURCE_MIN_S,
+        ),
         provider_max_duration_s=SEGMENT_PROVIDER_MAX_DURATION_S,
     )
 

@@ -790,11 +790,6 @@ _ENTITY_RELATION_PREDICATES = {
     "inside", "part_of", "holds", "installs", "assembles", "operates",
     "acts_on",
 }
-_PHYSICAL_ENTITY_RELATION_PREDICATES = {
-    "supports", "contacts", "separate_from",
-}
-
-
 def _lower_relation_predicate(predicate: str, state: str) -> str:
     """Lower free-form relation semantics without erasing direction or lifecycle."""
     source = f"{predicate} {state}".casefold().replace("-", "_")
@@ -1175,8 +1170,6 @@ def _canonical_scene_continuity_graph(
 def _canonical_non_person_entity_ledger(
     value: object, allowed_person_ids: set[str], *,
     allowed_scene_ids: set[str] | None = None,
-    allow_sparse: bool = False,
-    strict_semantics: bool = False,
 ) -> dict:
     if (
         not isinstance(value, dict)
@@ -1197,13 +1190,11 @@ def _canonical_non_person_entity_ledger(
         or len(raw_entities) > 30
         or not isinstance(raw_relations, list)
         or len(raw_relations) > 60
-        or not allow_sparse and (not raw_entities or not raw_relations)
     ):
         raise ImageOptimizationOutputError(
             "image optimization output is missing or invalid"
         )
     entities = []
-    descriptions = set()
     entity_ids = set()
     for index, item in enumerate(raw_entities, 1):
         if not isinstance(item, dict) or set(item) != _ENTITY_LEDGER_ENTITY_KEYS:
@@ -1217,15 +1208,10 @@ def _canonical_non_person_entity_ledger(
             )
         description = _canonical_text(item.get("description"), max_bytes=512)
         visibility = item.get("visibility")
-        if (
-            description in descriptions
-            or not isinstance(visibility, str)
-            or visibility not in _ENTITY_VISIBILITIES
-        ):
+        if not isinstance(visibility, str) or visibility not in _ENTITY_VISIBILITIES:
             raise ImageOptimizationOutputError(
                 "image optimization output is missing or invalid"
             )
-        descriptions.add(description)
         entity_ids.add(entity_id)
         entities.append({
             "entity_id": entity_id,
@@ -1238,96 +1224,36 @@ def _canonical_non_person_entity_ledger(
         entity_ids | allowed_person_ids | scene_ids | {_PROJECT_ENTITY_OWNER_ID}
     )
     relations = []
-    physical_pairs = set()
-    occlusion_pairs = set()
-    ownership_subjects = set()
-    directed_edges = {"supports": [], "occludes": []}
     for item in raw_relations:
         if not isinstance(item, dict) or set(item) != _ENTITY_LEDGER_RELATION_KEYS:
             raise ImageOptimizationOutputError(
                 "image optimization output is missing or invalid"
             )
         subject = item.get("subject_id")
-        predicate = item.get("predicate")
         object_ = item.get("object_id")
         if (
             not isinstance(subject, str)
             or not isinstance(object_, str)
-            or subject == object_
             or subject not in identifiers
             or object_ not in identifiers
-            or (subject not in entity_ids and object_ not in entity_ids)
-            or not isinstance(predicate, str)
-            or predicate not in _ENTITY_RELATION_PREDICATES
-            or (
-                predicate == "owned_by"
-                and (
-                    subject not in entity_ids
-                    or object_ not in (
-                        allowed_person_ids | {_PROJECT_ENTITY_OWNER_ID}
-                    )
-                )
-            )
-            or (
-                predicate != "owned_by"
-                and _PROJECT_ENTITY_OWNER_ID in {subject, object_}
-            )
-            or (
-                strict_semantics
-                and predicate == "contacts"
-                and subject >= object_
-            )
         ):
             raise ImageOptimizationOutputError(
                 "image optimization output is missing or invalid"
             )
-        if predicate == "contacts" and subject > object_:
-            subject, object_ = object_, subject
-        pair = tuple(sorted((subject, object_)))
-        if strict_semantics:
-            if predicate in _PHYSICAL_ENTITY_RELATION_PREDICATES:
-                if pair in physical_pairs:
-                    raise ImageOptimizationOutputError(
-                        "image optimization output is missing or invalid"
-                    )
-                physical_pairs.add(pair)
-            elif predicate == "occludes":
-                if pair in occlusion_pairs:
-                    raise ImageOptimizationOutputError(
-                        "image optimization output is missing or invalid"
-                    )
-                occlusion_pairs.add(pair)
-            elif predicate == "owned_by":
-                if subject in ownership_subjects:
-                    raise ImageOptimizationOutputError(
-                        "image optimization output is missing or invalid"
-                    )
-                ownership_subjects.add(subject)
-        if predicate in directed_edges:
-            directed_edges[predicate].append((subject, object_))
+        predicate = _canonical_text(item.get("predicate"), max_bytes=128)
         relations.append({
             "subject_id": subject,
             "predicate": predicate,
             "object_id": object_,
         })
-    sorted_relations = sorted(
-        relations,
+    canonical_relations = sorted(
+        {
+            (item["subject_id"], item["predicate"], item["object_id"]): item
+            for item in relations
+        }.values(),
         key=lambda item: (item["subject_id"], item["predicate"], item["object_id"]),
     )
-    if strict_semantics and (
-        relations != sorted_relations
-        or any(_contains_directed_cycle(edges) for edges in directed_edges.values())
-        or (not allow_sparse and {
-            identifier
-            for relation in relations
-            for identifier in (relation["subject_id"], relation["object_id"])
-            if identifier in entity_ids
-        } != entity_ids)
-    ):
-        raise ImageOptimizationOutputError(
-            "image optimization output is missing or invalid"
-        )
-    return {"entities": entities, "relations": sorted_relations}
+    return {"entities": entities, "relations": canonical_relations}
 
 
 def _canonical_dominant_palette_contract(value: object) -> dict:
@@ -1377,7 +1303,6 @@ def _canonical_relation_occurrences(value: object) -> list[dict]:
         raw_preserve = item.get("preserve")
         if (
             relation_id in seen_ids
-            or subject_key == object_key
             or not isinstance(raw_preserve, list)
             or len(raw_preserve) > 30
             or not isinstance(item.get("replace_together"), bool)
@@ -1399,18 +1324,12 @@ def _canonical_relation_occurrences(value: object) -> list[dict]:
             "preserve": preserve,
             "replace_together": item["replace_together"],
         })
-    if occurrences != sorted(occurrences, key=lambda item: item["relation_id"]):
-        raise ImageOptimizationOutputError(
-            "image optimization output is missing or invalid"
-        )
-    return occurrences
+    return sorted(occurrences, key=lambda item: item["relation_id"])
 
 
 def _canonical_frame_constraint(
     value: object, allowed_person_ids: set[str], *,
     allowed_scene_ids: set[str] | None = None,
-    allow_sparse: bool = False,
-    strict_entity_ledger_semantics: bool = False,
 ) -> dict:
     if (
         not isinstance(value, dict)
@@ -1436,8 +1355,6 @@ def _canonical_frame_constraint(
         "non_person_entity_ledger": _canonical_non_person_entity_ledger(
             value.get("non_person_entity_ledger"), allowed_person_ids,
             allowed_scene_ids=allowed_scene_ids,
-            allow_sparse=allow_sparse,
-            strict_semantics=strict_entity_ledger_semantics,
         ),
         "dominant_palette_contract": _canonical_dominant_palette_contract(
             value.get("dominant_palette_contract")
@@ -1456,7 +1373,6 @@ def _canonical_plan_v3(
     frame_counts: dict[int, int] | None = None,
     *,
     allow_sparse_facts: bool = False,
-    strict_entity_ledger_semantics: bool = False,
 ) -> dict:
     if not isinstance(value, dict) or value.get("version") != 3:
         raise ImageOptimizationOutputError(
@@ -1519,10 +1435,6 @@ def _canonical_plan_v3(
             constraint = _canonical_frame_constraint(
                 item, allowed_person_ids,
                 allowed_scene_ids={base["scene"]["scene_id"]},
-                allow_sparse=allow_sparse_facts,
-                strict_entity_ledger_semantics=(
-                    strict_entity_ledger_semantics
-                ),
             )
             index = constraint["frame_index"]
             if (
@@ -1569,15 +1481,12 @@ def canonical_plan_v3(
     value: object,
     segment_indices: list[int] | None = None,
     frame_counts: dict[int, int] | None = None,
-    *,
-    strict_entity_ledger_semantics: bool = False,
 ) -> dict:
     """Return an isolated v3 plan with one hard constraint record per frame."""
     return deepcopy(_canonical_plan_v3(
         value,
         segment_indices,
         frame_counts,
-        strict_entity_ledger_semantics=strict_entity_ledger_semantics,
     ))
 
 
@@ -1585,8 +1494,6 @@ def _canonical_plan_v4(
     value: object,
     expected_indices: list[int] | None = None,
     frame_counts: dict[int, int] | None = None,
-    *,
-    strict_entity_ledger_semantics: bool = False,
 ) -> dict:
     if not isinstance(value, dict) or value.get("version") != 4:
         raise ImageOptimizationOutputError(
@@ -1611,7 +1518,6 @@ def _canonical_plan_v4(
     v3_value["scene_plans"] = v3_scenes
     canonical = _canonical_plan_v3(
         v3_value, expected_indices, frame_counts, allow_sparse_facts=True,
-        strict_entity_ledger_semantics=strict_entity_ledger_semantics,
     )
     if not canonical["eligible"]:
         return {**canonical, "version": 4}
@@ -1649,15 +1555,12 @@ def canonical_plan_v4(
     value: object,
     segment_indices: list[int] | None = None,
     frame_counts: dict[int, int] | None = None,
-    *,
-    strict_entity_ledger_semantics: bool = False,
 ) -> dict:
     """Return an isolated v4 plan with scene-level target continuity authority."""
     return deepcopy(_canonical_plan_v4(
         value,
         segment_indices,
         frame_counts,
-        strict_entity_ledger_semantics=strict_entity_ledger_semantics,
     ))
 
 
@@ -1827,7 +1730,7 @@ def _canonical_element_index(value: object) -> dict:
             object_key = raw.get("object_key")
             if (
                 subject not in known_keys or object_key not in known_keys
-                or subject == object_key or not isinstance(predicate, str)
+                or not isinstance(predicate, str)
                 or not predicate.strip()
             ):
                 continue
@@ -2116,7 +2019,6 @@ def compile_semantic_plan(
     *,
     source_frames: dict[int, list[Path]] | None = None,
     element_index: dict | None = None,
-    strict_entity_ledger_semantics: bool = False,
 ) -> tuple[dict, dict]:
     """Compile tolerant visual semantics into the one canonical executable v4 plan."""
     slots = _semantic_slots(
@@ -2720,8 +2622,6 @@ def compile_semantic_plan(
                 if subject_id is None or object_id is None:
                     continue
                 predicate = _lower_relation_predicate(design["predicate"], state)
-                if predicate == "contacts" and subject_id > object_id:
-                    subject_id, object_id = object_id, subject_id
                 ledger_relations.append({
                     "subject_id": subject_id,
                     "predicate": predicate,
@@ -2917,9 +2817,7 @@ def compile_semantic_plan(
         "person_plans": person_plans,
         "scene_plans": scene_plans,
         "segments": segments,
-    }, indices, frame_counts,
-        strict_entity_ledger_semantics=strict_entity_ledger_semantics,
-    )
+    }, indices, frame_counts)
     if source_frames is not None:
         plan = _bind_source_palette_contracts(plan, source_frames)
     diagnostics = {
@@ -3935,7 +3833,6 @@ def _canonical_project_output(
     source_frames: dict[int, list[Path]] | None = None,
     segment_specs: list[dict] | None = None,
     element_index: dict | None = None,
-    strict_entity_ledger_semantics: bool = False,
 ) -> tuple[dict, dict]:
     semantic_output = isinstance(value, dict) and value.get("version") is None
     if semantic_output:
@@ -3946,7 +3843,6 @@ def _canonical_project_output(
             segment_specs,
             source_frames=source_frames,
             element_index=element_index,
-            strict_entity_ledger_semantics=strict_entity_ledger_semantics,
         )
         _LOGGER.info(
             "image semantic compiler score=%s issues=%s ignored=%s "
@@ -4187,7 +4083,6 @@ def generate_project_prompts(
     skill_path: Path | None = None,
     phase_retry_count: int = 0,
     phase_retry_interval_s: float = 0.0,
-    strict_entity_ledger_semantics: bool = False,
     generation_config: dict[str, bool] | None = None,
 ) -> tuple[dict, dict]:
     """Plan globally from contact sheets, then describe source frames per segment."""
@@ -4430,7 +4325,6 @@ def generate_project_prompts(
         source_frames={segment["index"]: frames for segment, frames in prepared},
         segment_specs=[segment for segment, _frames in prepared],
         element_index=element_index,
-        strict_entity_ledger_semantics=strict_entity_ledger_semantics,
     )
     if plan.get("version") != expected_version:
         raise ImageOptimizationOutputError(

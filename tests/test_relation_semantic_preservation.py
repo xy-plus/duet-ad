@@ -143,6 +143,94 @@ def test_image_compiler_freezes_relation_outside_truncated_descriptions() -> Non
     )[1][1]
 
 
+def test_image_compiler_preserves_person_to_person_contact_relation() -> None:
+    segment_specs = [{
+        "index": 1,
+        "chain_id": "chain-01",
+        "join_mode": "hard_cut",
+        "transition_skeleton": [{
+            "frame_index": 1,
+            "frame_name": "01.png",
+            "source_transition_from_previous": "start",
+        }],
+    }]
+    element_index = {
+        "people": {
+            "person-01": _indexed_item("left person"),
+            "person-02": _indexed_item("right person"),
+        },
+        "entities": {},
+        "scenes": {"scene-01": _indexed_item("shared room")},
+        "relations": {"relation-01": {
+            "subject_key": "person-01",
+            "predicate": "clasps_hands_with",
+            "object_key": "person-02",
+            "occurrences": [{
+                "segment_index": 1,
+                "frames": [{
+                    "frame_order": 1,
+                    "state": "两人双手接触",
+                    "geometry": "两人相邻站立，手部位于画面中央",
+                }],
+            }],
+            "preserve": ["人物身份与接触方向"],
+            "replace_together": False,
+        }},
+    }
+    semantics = {
+        "people": {
+            key: {
+                "source_identity": key,
+                "replacement_identity": f"replacement {key}",
+                "wardrobe_change": "change wardrobe",
+                "local_color_change": "change local colors",
+            }
+            for key in ("person-01", "person-02")
+        },
+        "entities": {},
+        "relations": {"relation-01": {
+            "replacement_system": "keep both people compatible",
+            "preserve": "keep the visible hand contact",
+        }},
+        "scenes": {"scene-01": {
+            "source_scene": "shared room",
+            "replacement_scene": "new shared room",
+            "semantic_change": "same function",
+            "geometry_change": "new visible geometry",
+            "depth_change": "new depth",
+            "layout_change": "new layout",
+            "local_color_change": "new colors",
+        }},
+        "frames": {"frame-001": {
+            "people": {
+                key: {
+                    "visible_region": "full visible person",
+                    "boundary": "visible body boundary",
+                    "body_and_pose": "standing and reaching a hand",
+                    "derived_observations": {},
+                }
+                for key in ("person-01", "person-02")
+            },
+            "entities": {},
+            "relationships": "two visible people clasp hands",
+            "crop": "source crop",
+        }},
+    }
+
+    plan, _diagnostics = image_optimization.compile_semantic_plan(
+        semantics, segment_specs, element_index=element_index,
+    )
+    frame = plan["segments"][0]["frame_constraints"][0]
+
+    assert frame["relation_occurrences"][0]["subject_key"] == "person-01"
+    assert frame["relation_occurrences"][0]["object_key"] == "person-02"
+    assert {
+        "subject_id": "PERSON_01",
+        "predicate": "contacts",
+        "object_id": "PERSON_02",
+    } in frame["non_person_entity_ledger"]["relations"]
+
+
 def _timeline() -> list[dict]:
     return [{
         "order": order,
@@ -216,6 +304,21 @@ def test_real_regression_shapes_do_not_mix_or_repair_upstream_relations() -> Non
     )
     assert wrong_projected[0]["relations"][0]["object_key"] == "entity-wrong"
     assert len(wrong_projected[0]["relations"]) == 1
+
+    # A relation may describe two roles of the same indexed subject (for
+    # example, a person touching their own hair).  Transport preserves that
+    # evidence instead of applying a physical-meaning veto.
+    self_relation = [
+        _occurrence("relation-01", "person-01", "person-01", 1, "touching hair"),
+    ]
+    self_projected = long_generation._expected_fusion_relation_states(
+        _timeline(),
+        long_generation._freeze_fusion_relation_occurrences(
+            self_relation, _timeline(),
+        ),
+    )
+    assert self_projected[0]["relations"][0]["subject_key"] == "person-01"
+    assert self_projected[0]["relations"][0]["object_key"] == "person-01"
 
     encoded = json.dumps(
         long_generation._compact_h3_relation_contract(projected),

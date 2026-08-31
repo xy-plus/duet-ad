@@ -356,7 +356,6 @@ _PUBLIC_PIPELINE_ERROR_CODES = frozenset({
     "image_optimization_output_invalid",
     "input_recovery_required",
     "long_video_audio_mode_unsupported",
-    "long_video_duration_below_provider_minimum",
     "long_video_duration_exceeded",
     "long_video_multimodal_incomplete",
     "pipeline_failed",
@@ -766,31 +765,31 @@ def _filter_invalid_project_index_relations(index: dict) -> dict | None:
     known_keys = set().union(*(
         set(index[category]) for category in ("people", "entities", "scenes")
     ))
-    kept: dict[str, dict] = {}
+    kept_records: list[dict] = []
     filtered: list[dict[str, object]] = []
-    for item_index, (key, item) in enumerate(index["relations"].items()):
+    for item_index, item in enumerate(index["relations"].values()):
         subject = item["subject_key"]
         object_key = item["object_key"]
         reason = None
         field = None
-        if subject == object_key:
-            reason = "relation_endpoints_identical"
-            field = "object_key"
-        elif subject not in known_keys:
+        if subject not in known_keys:
             reason = "relation_subject_unknown"
             field = "subject_key"
         elif object_key not in known_keys:
             reason = "relation_object_unknown"
             field = "object_key"
         if reason is None:
-            kept[key] = item
+            kept_records.append(item)
             continue
         filtered.append({
             "path": f"/relations/{item_index}/{field}",
             "reason": reason,
             "count": 1,
         })
-    index["relations"] = kept
+    index["relations"] = {
+        f"relation-{position:02d}": item
+        for position, item in enumerate(kept_records, 1)
+    }
     if not filtered:
         return None
     return {
@@ -1026,22 +1025,6 @@ def _generate_project_element_index(
                 normalized = codex_output_schemas.normalize_project_index(value)
             except ValueError:
                 _reject_project_index("shape_invalid", "/project_index")
-            for category, prefix in (
-                ("people", "person"), ("entities", "entity"),
-                ("scenes", "scene"), ("relations", "relation"),
-            ):
-                keys = list(normalized[category])
-                expected_keys = [
-                    f"{prefix}-{index:02d}" for index in range(1, len(keys) + 1)
-                ]
-                for item_index, (key, expected_key) in enumerate(
-                    zip(keys, expected_keys)
-                ):
-                    if key != expected_key:
-                        _reject_project_index(
-                            "stable_key_nonsequential",
-                            f"/{category}/{item_index}/key",
-                        )
             for category in ("people", "entities", "scenes"):
                 for item_index, item in enumerate(normalized[category].values()):
                     description = item["source_visual_description"]
@@ -1643,9 +1626,6 @@ def _generate_image_optimization_project(
                 phase_retry_count=settings.retry_count,
                 phase_retry_interval_s=settings.retry_interval_s,
                 generation_config=render_options,
-                strict_entity_ledger_semantics=(
-                    settings.strict_entity_ledger_semantics
-                ),
                 **kwargs,
             )
         except image_optimization.ImageOptimizationOutputError as exc:

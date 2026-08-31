@@ -262,15 +262,6 @@ def test_seedream_edit_mode_environment_default_and_explicit_anchor(monkeypatch)
     assert get_settings().seedream_edit_mode == "anchor_consistency"
 
 
-def test_strict_entity_ledger_semantics_defaults_off_and_can_be_enabled(monkeypatch):
-    monkeypatch.setenv("ACCESS_TOKEN", "test-token")
-    monkeypatch.delenv("STRICT_ENTITY_LEDGER_SEMANTICS", raising=False)
-    assert get_settings().strict_entity_ledger_semantics is False
-
-    monkeypatch.setenv("STRICT_ENTITY_LEDGER_SEMANTICS", "true")
-    assert get_settings().strict_entity_ledger_semantics is True
-
-
 @pytest.mark.parametrize(("model", "has_sequential"), [
     ("doubao-seedream-5-0-pro-260628", False),
     ("doubao-seedream-5-0-260128", True),
@@ -1502,7 +1493,7 @@ def test_v4_canonical_plan_accepts_sparse_observations_as_prompt_facts():
     assert "dominant_palette_contract=" in prompts[0][2]
 
 
-def test_entity_ledger_strict_semantics_is_optional_and_defaults_off():
+def test_entity_ledger_accepts_unconnected_visible_entities():
     plan = _v3_frame_bound_plan()
     ledger = plan["segments"][0]["frame_constraints"][0][
         "non_person_entity_ledger"
@@ -1522,15 +1513,6 @@ def test_entity_ledger_strict_semantics_is_optional_and_defaults_off():
             "non_person_entity_ledger"
         ]["entities"]
     ] == ["ENTITY_01", "ENTITY_02"]
-
-    with pytest.raises(image_optimization.ImageOptimizationOutputError):
-        image_optimization.canonical_plan_v3(
-            plan,
-            segment_indices=[0],
-            frame_counts={0: 2},
-            strict_entity_ledger_semantics=True,
-        )
-
 
 @pytest.mark.parametrize("eligible", [False, True])
 def test_v4_empty_or_refusal_plan_is_protocol_error_not_content_ineligibility(eligible):

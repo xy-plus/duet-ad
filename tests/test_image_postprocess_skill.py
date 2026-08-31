@@ -1991,7 +1991,6 @@ def test_v3_frame_contract_fails_closed_on_missing_duplicate_or_tampered_constra
             value,
             segment_indices=[0],
             frame_counts={0: 2},
-            strict_entity_ledger_semantics=True,
         )
 
 
@@ -2026,38 +2025,20 @@ def test_v3_frame_entity_ledger_is_exact_and_fails_closed(mutate):
             value,
             segment_indices=[0],
             frame_counts={0: 2},
-            strict_entity_ledger_semantics=True,
         )
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda value: value["segments"][0]["frame_constraints"][0].update(
-            non_person_entity_ledger={"entities": [], "relations": []}
-        ),
-        lambda value: value["segments"][0]["frame_constraints"][0][
-            "non_person_entity_ledger"
-        ].update(relations=[]),
-        lambda value: value["segments"][0]["frame_constraints"][0][
-            "non_person_entity_ledger"
-        ]["entities"].append({
-            "entity_id": "ENTITY_02",
-            "description": "未参与关系的当前帧实体",
-            "visibility": "full",
-        }),
-    ],
-)
-def test_v3_frame_entity_ledger_requires_visible_entities_and_relations(mutate):
+def test_v3_frame_entity_ledger_allows_sparse_facts():
     value = _plan_v3()
-    mutate(value)
-    with pytest.raises(image_optimization.ImageOptimizationOutputError):
-        image_optimization.canonical_plan_v3(
-            value,
-            segment_indices=[0],
-            frame_counts={0: 2},
-            strict_entity_ledger_semantics=True,
-        )
+    value["segments"][0]["frame_constraints"][0][
+        "non_person_entity_ledger"
+    ] = {"entities": [], "relations": []}
+    canonical = image_optimization.canonical_plan_v3(
+        value, segment_indices=[0], frame_counts={0: 2},
+    )
+    assert canonical["segments"][0]["frame_constraints"][0][
+        "non_person_entity_ledger"
+    ] == {"entities": [], "relations": []}
 
 
 @pytest.mark.parametrize(
@@ -2072,19 +2053,9 @@ def test_v3_frame_entity_ledger_requires_visible_entities_and_relations(mutate):
         lambda value: value["segments"][0]["frame_constraints"][0][
             "non_person_entity_ledger"
         ]["relations"][0].update(object_id="PERSON_02"),
-        lambda value: value["segments"][0]["frame_constraints"][0][
-            "non_person_entity_ledger"
-        ]["relations"][0].update(object_id="ENTITY_01"),
-        lambda value: value["segments"][0]["frame_constraints"][0][
-            "non_person_entity_ledger"
-        ]["relations"].append({
-            "subject_id": "ENTITY_01",
-            "predicate": "separate_from",
-            "object_id": "PERSON_01",
-        }),
     ],
 )
-def test_v3_frame_entity_ledger_rejects_unresolved_or_ambiguous_relations(mutate):
+def test_v3_frame_entity_ledger_rejects_only_structurally_invalid_relations(mutate):
     value = _plan_v3()
     mutate(value)
     with pytest.raises(image_optimization.ImageOptimizationOutputError):
@@ -2092,100 +2063,72 @@ def test_v3_frame_entity_ledger_rejects_unresolved_or_ambiguous_relations(mutate
             value,
             segment_indices=[0],
             frame_counts={0: 2},
-            strict_entity_ledger_semantics=True,
         )
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda value: value["segments"][0]["scene"].pop(
-            "layout_reference_frame_index"
-        ),
-        lambda value: value["segments"][0]["frame_constraints"][0][
-            "non_person_entity_ledger"
-        ]["relations"][0].update(
-            subject_id="PERSON_01", object_id="ENTITY_01"
-        ),
-    ],
-)
-def test_v3_backend_exact_scene_and_symmetric_relation_order_fail_closed(mutate):
+def test_v3_backend_exact_scene_contract_fails_closed():
     value = _plan_v3()
-    mutate(value)
+    value["segments"][0]["scene"].pop("layout_reference_frame_index")
     with pytest.raises(image_optimization.ImageOptimizationOutputError):
         image_optimization.canonical_plan_v3(
             value, segment_indices=[0], frame_counts={0: 2}
         )
 
 
-def _set_entity_relation_cycle(value: dict, predicate: str) -> None:
-    ledger = value["segments"][0]["frame_constraints"][0][
-        "non_person_entity_ledger"
-    ]
-    ledger["entities"] = [
+def test_entity_ledger_canonicalizes_without_judging_relationship_semantics():
+    ledger = image_optimization._canonical_non_person_entity_ledger(
         {
-            "entity_id": f"ENTITY_{index:02d}",
-            "description": f"当前帧可见实体{index}",
-            "visibility": "full",
-        }
-        for index in range(1, 4)
-    ]
-    ledger["relations"] = [
-        {
-            "subject_id": f"ENTITY_{index:02d}",
-            "predicate": predicate,
-            "object_id": f"ENTITY_{index % 3 + 1:02d}",
-        }
-        for index in range(1, 4)
-    ]
+            "entities": [
+                {
+                    "entity_id": f"ENTITY_{index:02d}",
+                    "description": "同类物体",
+                    "visibility": "full",
+                }
+                for index in range(1, 4)
+            ],
+            "relations": [
+                {
+                    "subject_id": "PERSON_01",
+                    "predicate": "clasps_hands_with",
+                    "object_id": "PERSON_02",
+                },
+                {
+                    "subject_id": "ENTITY_01",
+                    "predicate": "supports",
+                    "object_id": "ENTITY_02",
+                },
+                {
+                    "subject_id": "ENTITY_02",
+                    "predicate": "supports",
+                    "object_id": "ENTITY_03",
+                },
+                {
+                    "subject_id": "ENTITY_03",
+                    "predicate": "supports",
+                    "object_id": "ENTITY_01",
+                },
+                {
+                    "subject_id": "PERSON_01",
+                    "predicate": "self-observed",
+                    "object_id": "PERSON_01",
+                },
+            ],
+        },
+        {"PERSON_01", "PERSON_02"},
+    )
 
-
-def _add_unsorted_entity_relation(value: dict) -> None:
-    ledger = value["segments"][0]["frame_constraints"][0][
-        "non_person_entity_ledger"
-    ]
-    ledger["entities"].append({
-        "entity_id": "ENTITY_02",
-        "description": "第二个当前帧可见实体",
-        "visibility": "full",
-    })
-    ledger["relations"].insert(0, {
-        "subject_id": "ENTITY_02",
-        "predicate": "supports",
-        "object_id": "ENTITY_01",
-    })
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        _add_unsorted_entity_relation,
-        lambda value: value["segments"][0]["frame_constraints"][0][
-            "non_person_entity_ledger"
-        ]["relations"].append({
-            "subject_id": "ENTITY_01",
-            "predicate": "supports",
-            "object_id": "PERSON_01",
-        }),
-        lambda value: _set_entity_relation_cycle(value, "supports"),
-        lambda value: _set_entity_relation_cycle(value, "occludes"),
-        lambda value: value["segments"][0]["persons"][0].update(
-            observable_frames=[1]
-        ),
-    ],
-)
-def test_v3_frame_entity_ledger_rejects_ambiguous_graphs_and_nonobservable_people(
-    mutate,
-):
-    value = _plan_v3()
-    mutate(value)
-    with pytest.raises(image_optimization.ImageOptimizationOutputError):
-        image_optimization.canonical_plan_v3(
-            value,
-            segment_indices=[0],
-            frame_counts={0: 2},
-            strict_entity_ledger_semantics=True,
-        )
+    assert {
+        "subject_id": "PERSON_01",
+        "predicate": "clasps_hands_with",
+        "object_id": "PERSON_02",
+    } in ledger["relations"]
+    assert {
+        "subject_id": "PERSON_01",
+        "predicate": "self-observed",
+        "object_id": "PERSON_01",
+    } in ledger["relations"]
+    assert len(ledger["entities"]) == 3
+    assert len(ledger["relations"]) == 5
 
 
 def test_v3_frame_entity_ledger_roundtrips_without_cross_frame_identity():

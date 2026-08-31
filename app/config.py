@@ -38,7 +38,6 @@ class Settings:
     seedream_edit_mode: str = "independent_parallel"
     seedream_concurrency: int = 4
     seedream_timeout_s: float = 300.0
-    strict_entity_ledger_semantics: bool = False
     data_dir: Path = Path("data")
     codex_timeout_s: int = 1800
     codex_concurrency: int = 10
@@ -163,9 +162,6 @@ def get_settings() -> Settings:
         ).strip(),
         seedream_concurrency=int(os.environ.get("SEEDREAM_CONCURRENCY", "4")),
         seedream_timeout_s=float(os.environ.get("SEEDREAM_TIMEOUT_S", "300")),
-        strict_entity_ledger_semantics=os.environ.get(
-            "STRICT_ENTITY_LEDGER_SEMANTICS", ""
-        ).lower() in ("1", "true", "yes"),
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),

@@ -151,6 +151,77 @@ def test_project_index_call_is_once_isolated_and_preserves_segment_outputs(tmp_p
     assert not runner.calls[0][0].exists()
 
 
+def test_project_index_assigns_stable_ids_instead_of_trusting_model_keys(tmp_path):
+    cdir = tmp_path / "conversation"
+    frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
+    frames.mkdir(parents=True)
+    frame_paths = [frames / "01.png", frames / "02.png"]
+    for path in frame_paths:
+        path.write_bytes(_png())
+    payload = copy.deepcopy(_element_index())
+    person = payload["people"].pop("person-01")
+    entity = payload["entities"].pop("entity-01")
+    scene = payload["scenes"].pop("scene-01")
+    relation = payload["relations"].pop("relation-01")
+    payload["people"]["woman-at-table"] = person
+    payload["entities"]["cup-on-table"] = entity
+    payload["scenes"]["dining-room"] = scene
+    payload["relations"]["hand-near-cup"] = {
+        **relation,
+        "subject_key": "cup-on-table",
+        "object_key": "woman-at-table",
+    }
+
+    result = pipeline._generate_project_element_index(
+        _IndexRunner(payload),
+        cdir,
+        {1: frame_paths},
+        skill_bytes=b"frozen video-maker skill",
+    )
+
+    frozen = json.loads(result.read_text(encoding="utf-8"))
+    assert list(frozen["people"]) == ["person-01"]
+    assert list(frozen["entities"]) == ["entity-01"]
+    assert list(frozen["scenes"]) == ["scene-01"]
+    assert list(frozen["relations"]) == ["relation-01"]
+    assert frozen["relations"]["relation-01"]["subject_key"] == "entity-01"
+    assert frozen["relations"]["relation-01"]["object_key"] == "person-01"
+
+
+def test_project_index_drops_records_without_frame_evidence(tmp_path):
+    cdir = tmp_path / "conversation"
+    frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
+    frames.mkdir(parents=True)
+    frame_paths = [frames / "01.png", frames / "02.png"]
+    for path in frame_paths:
+        path.write_bytes(_png())
+    payload = copy.deepcopy(_element_index())
+    payload["people"]["unused-person"] = {
+        **copy.deepcopy(payload["people"]["person-01"]),
+        "occurrences": [],
+    }
+    payload["entities"]["unused-entity"] = {
+        **copy.deepcopy(payload["entities"]["entity-01"]),
+        "occurrences": [],
+    }
+    payload["relations"]["unused-relation"] = {
+        **copy.deepcopy(payload["relations"]["relation-01"]),
+        "occurrences": [],
+    }
+
+    result = pipeline._generate_project_element_index(
+        _IndexRunner(payload),
+        cdir,
+        {1: frame_paths},
+        skill_bytes=b"frozen video-maker skill",
+    )
+
+    frozen = json.loads(result.read_text(encoding="utf-8"))
+    assert list(frozen["people"]) == ["person-01"]
+    assert list(frozen["entities"]) == ["entity-01"]
+    assert list(frozen["relations"]) == ["relation-01"]
+
+
 def test_project_index_call_has_no_retry_or_fallback(tmp_path):
     cdir = tmp_path / "conversation"
     frame = cdir / "work" / "keyframes" / "01.png"
@@ -399,10 +470,16 @@ def test_project_index_filters_invalid_relation_endpoints_with_diagnostics(
     )
 
     frozen = json.loads(result.read_text(encoding="utf-8"))
-    assert frozen["relations"] == {
-        "relation-01": valid_relation,
-        "relation-04": valid_relation,
+    assert list(frozen["relations"]) == [
+        "relation-01", "relation-02", "relation-03",
+    ]
+    assert frozen["relations"]["relation-01"] == valid_relation
+    assert frozen["relations"]["relation-02"] == {
+        **valid_relation,
+        "subject_key": "entity-01",
+        "object_key": "entity-01",
     }
+    assert frozen["relations"]["relation-03"] == valid_relation
     diagnostic = json.loads(
         (cdir / "work" / "errors" / "project-index-filtered.json").read_text(
             encoding="utf-8"
@@ -412,19 +489,13 @@ def test_project_index_filters_invalid_relation_endpoints_with_diagnostics(
         "code": "project_index_fields_filtered",
         "dropped_paths": [
             "/relations/1/object_key",
-            "/relations/2/object_key",
             "/relations/4/subject_key",
         ],
-        "dropped_count": 3,
+        "dropped_count": 2,
         "filters": [
             {
                 "path": "/relations/1/object_key",
                 "reason": "relation_object_unknown",
-                "count": 1,
-            },
-            {
-                "path": "/relations/2/object_key",
-                "reason": "relation_endpoints_identical",
                 "count": 1,
             },
             {
@@ -528,7 +599,6 @@ def test_image_project_creates_index_once_outside_existing_image_retries(
         retry_count=1,
         retry_interval_s=0,
         seedream_edit_mode="conservative",
-        strict_entity_ledger_semantics=False,
     )
 
     result = pipeline._generate_image_optimization_project(

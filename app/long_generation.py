@@ -321,8 +321,7 @@ def _freeze_fusion_relation_occurrences(
         geometry = _bounded_relation_text(item.get("geometry"), maximum=512)
         preserve_value = item.get("preserve")
         if (
-            subject_key == object_key
-            or not isinstance(preserve_value, list)
+            not isinstance(preserve_value, list)
             or len(preserve_value) > 30
             or not isinstance(item.get("replace_together"), bool)
             or (order, relation_id) in seen

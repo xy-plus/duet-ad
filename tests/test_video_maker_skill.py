@@ -34,7 +34,7 @@ def test_project_index_has_first_class_neutral_relations():
         "people/entities/scenes/relations",
         "subject_key/predicate/object_key/occurrences/preserve/replace_together",
         "frame_order", "state", "geometry",
-        "不可变中性 ID", "主客体互换", "当前状态和相对几何",
+        "调用内唯一", "机械分配稳定 ID", "主客体互换", "当前状态和相对几何",
         "接口、尺度或功能配合", "不因常识补造功能",
     ):
         assert required in text

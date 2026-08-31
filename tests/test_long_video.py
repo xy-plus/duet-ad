@@ -331,12 +331,17 @@ def test_boundary_spanning_dialogue_is_repartitioned_without_text_or_time_loss()
 
 
 @pytest.mark.parametrize("duration", [1.0, 2.5, 3.999999])
-def test_video_below_provider_minimum_fails_without_fabricating_duration(duration):
-    with pytest.raises(
-        LongVideoError,
-        match="long_video_duration_below_provider_minimum",
-    ):
-        plan_segments(duration, [(0.0, duration)], [])
+def test_short_source_keeps_exact_timeline_and_uses_provider_minimum(duration):
+    segments = plan_segments(duration, [(0.0, duration)], [])
+
+    assert segments == [{
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": round(duration, 6),
+        "chain_id": "chain-001",
+        "join_mode": "hard_cut",
+    }]
+    assert provider_duration_s(0.0, duration) == 4
 
 
 def test_source_spanning_dialogue_never_blocks_a_ten_second_plan():
@@ -636,6 +641,56 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
             segments=over_limit,
             workflow="minimax_h3_lightx2v",
         )
+
+
+def test_plan_receipt_accepts_short_source_without_faking_its_timeline(tmp_path):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"short source")
+    segment_dir = tmp_path / "work" / "segments" / "1"
+    segment_work = segment_dir / "work"
+    keyframes = segment_work / "keyframes"
+    anchors = segment_work / "anchors"
+    keyframes.mkdir(parents=True)
+    anchors.mkdir()
+    segment_source = segment_dir / "source.mp4"
+    segment_source.write_bytes(b"short segment")
+    frame = keyframes / "01.png"
+    frame.write_bytes(b"frame")
+    first = anchors / "first.png"
+    last = anchors / "last.png"
+    first.write_bytes(b"first")
+    last.write_bytes(b"last")
+    visual = segment_work / "visual_prompt.txt"
+    final = segment_work / "prompt.txt"
+    visual.write_text("visual", encoding="utf-8")
+    final.write_text("final", encoding="utf-8")
+
+    path = write_plan_receipt(
+        tmp_path,
+        source=source,
+        duration_s=2.5,
+        segments=[{
+            "index": 1,
+            "start_s": 0.0,
+            "end_s": 2.5,
+            "chain_id": "chain-001",
+            "join_mode": "hard_cut",
+            "source_path": segment_source,
+            "keyframe_paths": [frame],
+            "first_frame_path": first,
+            "last_frame_path": last,
+            "visual_prompt_path": visual,
+            "final_prompt_path": final,
+            "dialogue": [],
+        }],
+        workflow="minimax_h3_lightx2v",
+    )
+
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    assert receipt["video"]["duration_s"] == 2.5
+    assert receipt["segments"][0]["start_s"] == 0.0
+    assert receipt["segments"][0]["end_s"] == 2.5
+    assert provider_duration_s(0.0, 2.5) == 4
 
 
 def test_visual_plan_receipt_binds_keyframe_source_timeline(tmp_path):

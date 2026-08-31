@@ -141,7 +141,7 @@ _ELEMENT_OCCURRENCE = _object({
 _ELEMENT = _object({
     "key": _TEXT,
     "source_visual_description": _TEXT,
-    "occurrences": _array(_ELEMENT_OCCURRENCE, minimum=1, maximum=100),
+    "occurrences": _array(_ELEMENT_OCCURRENCE, maximum=100),
     "replaceable": _TEXTS,
     "preserve": _TEXTS,
 })
@@ -159,7 +159,7 @@ _RELATION = _object({
     "subject_key": _TEXT,
     "predicate": _TEXT,
     "object_key": _TEXT,
-    "occurrences": _array(_RELATION_OCCURRENCE, minimum=1, maximum=100),
+    "occurrences": _array(_RELATION_OCCURRENCE, maximum=100),
     "preserve": _TEXTS,
     "replace_together": _BOOL,
 })
@@ -328,14 +328,58 @@ def normalize_project_index(value: object) -> dict:
     element_fields = {
         "source_visual_description", "occurrences", "replaceable", "preserve",
     }
-    result = {
+    discovered = {
         category: _index_records(value[category], fields=element_fields)
         for category in ("people", "entities", "scenes")
     }
-    result["relations"] = _index_records(value["relations"], fields={
+    discovered["relations"] = _index_records(value["relations"], fields={
         "subject_key", "predicate", "object_key", "occurrences", "preserve",
         "replace_together",
     })
+
+    # Model keys are invocation-local references, not backend identities.  Drop
+    # records with no visual evidence and assign stable IDs mechanically in the
+    # observed order.  Ambiguous or unknown relation aliases remain unresolved
+    # and are filtered by the backend relation binder.
+    result: dict[str, dict[str, dict]] = {}
+    alias_candidates: dict[str, list[str]] = {}
+    for category, prefix in (
+        ("people", "person"),
+        ("entities", "entity"),
+        ("scenes", "scene"),
+    ):
+        retained = [
+            (local_key, record)
+            for local_key, record in discovered[category].items()
+            if record["occurrences"]
+        ]
+        result[category] = {}
+        for index, (local_key, record) in enumerate(retained, 1):
+            stable_key = f"{prefix}-{index:02d}"
+            result[category][stable_key] = record
+            alias_candidates.setdefault(local_key, []).append(stable_key)
+
+    aliases = {
+        local_key: candidates[0]
+        for local_key, candidates in alias_candidates.items()
+        if len(candidates) == 1
+    }
+    result["relations"] = {}
+    retained_relations = [
+        record
+        for record in discovered["relations"].values()
+        if record["occurrences"]
+    ]
+    for index, record in enumerate(retained_relations, 1):
+        result["relations"][f"relation-{index:02d}"] = {
+            **record,
+            "subject_key": aliases.get(
+                record["subject_key"], f"unresolved:{record['subject_key']}",
+            ),
+            "object_key": aliases.get(
+                record["object_key"], f"unresolved:{record['object_key']}",
+            ),
+        }
     return result
 
 

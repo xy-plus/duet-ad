@@ -89,6 +89,72 @@ def test_project_index_dto_is_indexed_without_losing_relation_fields() -> None:
     }
 
 
+def test_project_index_assigns_backend_ids_and_drops_unobserved_records() -> None:
+    model = {
+        "people": [{
+            "key": "woman-at-table",
+            "source_visual_description": "person",
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+            "replaceable": [],
+            "preserve": [],
+        }, {
+            "key": "not-observed",
+            "source_visual_description": "uncertain person",
+            "occurrences": [],
+            "replaceable": [],
+            "preserve": [],
+        }],
+        "entities": [{
+            "key": "cup-on-table",
+            "source_visual_description": "cup",
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+            "replaceable": [],
+            "preserve": [],
+        }],
+        "scenes": [{
+            "key": "dining-room",
+            "source_visual_description": "room",
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+            "replaceable": [],
+            "preserve": [],
+        }],
+        "relations": [{
+            "key": "free-form-relation-name",
+            "subject_key": "woman-at-table",
+            "predicate": "looks toward",
+            "object_key": "cup-on-table",
+            "occurrences": [{
+                "segment_index": 1,
+                "frames": [{
+                    "frame_order": 1,
+                    "state": "visible",
+                    "geometry": "person beside cup",
+                }],
+            }],
+            "preserve": [],
+            "replace_together": False,
+        }, {
+            "key": "unobserved-relation",
+            "subject_key": "woman-at-table",
+            "predicate": "unknown",
+            "object_key": "cup-on-table",
+            "occurrences": [],
+            "preserve": [],
+            "replace_together": False,
+        }],
+    }
+
+    jsonschema.validate(model, codex_output_schemas.PROJECT_INDEX_SCHEMA)
+    normalized = codex_output_schemas.normalize_project_index(model)
+
+    assert list(normalized["people"]) == ["person-01"]
+    assert list(normalized["entities"]) == ["entity-01"]
+    assert list(normalized["scenes"]) == ["scene-01"]
+    assert list(normalized["relations"]) == ["relation-01"]
+    assert normalized["relations"]["relation-01"]["subject_key"] == "person-01"
+    assert normalized["relations"]["relation-01"]["object_key"] == "entity-01"
+
+
 def test_project_index_schema_requires_scene_but_not_people_or_entities() -> None:
     schema = codex_output_schemas.PROJECT_INDEX_SCHEMA
     assert schema["properties"]["scenes"]["minItems"] == 1
