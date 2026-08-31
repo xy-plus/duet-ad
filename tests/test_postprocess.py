@@ -1353,7 +1353,7 @@ def test_generation_keyframes_rejects_orphaned_manual_acceptance_authority(tmp_p
 def test_v4_postprocess_builds_board_before_existing_dag_without_quality_pack_gate(
     tmp_path, monkeypatch,
 ):
-    """The generation DAG is global -> layout -> fanout, without verify_pack."""
+    """The generation DAG is board -> global -> dependent frames, without verify_pack."""
     settings = make_settings(tmp_path)
     cdir = tmp_path / "session"
     cdir.mkdir()
@@ -1386,24 +1386,121 @@ def test_v4_postprocess_builds_board_before_existing_dag_without_quality_pack_ga
     async def forbidden_pack(*_args, **_kwargs):
         pytest.fail("verify_pack must not be called by runtime")
 
-    async def layout(*_args, **_kwargs):
-        calls.append("layout")
-
     async def fanout(*_args, **_kwargs):
-        calls.append("fanout")
+        calls.append("layout-and-fanout")
         return []
 
     monkeypatch.setattr(postprocess, "_v4_bootstrap_scene_anchors", bootstrap)
     monkeypatch.setattr(postprocess, "_v4_generate_composite_replacement_board", board)
     monkeypatch.setattr(postprocess, "_v4_verify_bootstrap_packs", forbidden_pack)
-    monkeypatch.setattr(postprocess, "_v4_generate_layout_anchors", layout)
     monkeypatch.setattr(postprocess, "_v4_fan_out", fanout)
 
     asyncio.run(postprocess._run_v4_task(
         settings, "cid", cdir, {}, private, {}, asyncio.Semaphore(1),
         skill_bytes=b"skill",
     ))
-    assert calls == ["replacement-board", "global-anchor", "layout", "fanout"]
+    assert calls == ["replacement-board", "global-anchor", "layout-and-fanout"]
+
+
+def test_v4_layouts_run_in_parallel_and_release_only_their_dependent_frames(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    cdir = tmp_path / "session"
+    cdir.mkdir()
+    sources = {}
+    grouped = {1: []}
+    frames = []
+    for frame_index in range(1, 5):
+        source = cdir / f"source-{frame_index:02d}.png"
+        source.write_bytes(PNG)
+        target = cdir / "canonical" / f"{frame_index:02d}.png"
+        sources[(1, frame_index)] = source
+        grouped[1].append((source, target))
+        frames.append({
+            "segment_index": 1,
+            "frame_index": frame_index,
+            "frame_name": f"{frame_index:02d}.png",
+            "source_sha256": f"{frame_index:064x}",
+            "scene_id": "SCENE_01",
+        })
+    layouts = [
+        {**frames[0], "source_interval_index": 1},
+        {**frames[2], "source_interval_index": 2},
+    ]
+    private = {
+        "execution_inputs": {"frames": frames},
+        "scene_anchor_schedule": {"scenes": [{
+            "scene_id": "SCENE_01",
+            "segment_layout_anchors": layouts,
+        }]},
+    }
+    layout_one_started = asyncio.Event()
+    layout_two_started = asyncio.Event()
+    release_layout_one = asyncio.Event()
+    release_layout_two = asyncio.Event()
+    fanout_one_started = asyncio.Event()
+    fanout_two_started = asyncio.Event()
+
+    monkeypatch.setattr(postprocess, "_v4_frame_sources", lambda *_args: sources)
+    monkeypatch.setattr(
+        postprocess.image_optimization,
+        "source_hard_cut_interval_indices",
+        lambda _frames: {(1, 1): 1, (1, 2): 1, (1, 3): 2, (1, 4): 2},
+    )
+    monkeypatch.setattr(
+        postprocess,
+        "_v4_scheduled_anchor",
+        lambda _schedule, _scene_id, label: frames[int(label[-4:]) - 1],
+    )
+
+    async def anchor(
+        _settings, _cdir, _cid, _private, semaphore, *, scene_id, label, anchor,
+        canvas, references, output,
+    ):
+        del scene_id, anchor, canvas, references
+        async with semaphore:
+            if label == "layout-interval-0001":
+                layout_one_started.set()
+                await release_layout_one.wait()
+            elif label == "layout-interval-0002":
+                layout_two_started.set()
+                await release_layout_two.wait()
+            elif label == "fanout-0001-0002":
+                fanout_one_started.set()
+            elif label == "fanout-0001-0004":
+                fanout_two_started.set()
+            return output, {
+                "scene_id": "SCENE_01", "label": label, "sha256": label,
+            }
+
+    monkeypatch.setattr(postprocess, "_v4_anchor", anchor)
+
+    async def drive():
+        receipts = []
+        task = asyncio.create_task(postprocess._v4_fan_out(
+            settings, cdir, "cid", private, grouped, asyncio.Semaphore(4),
+            {}, receipts,
+        ))
+        await asyncio.wait_for(layout_one_started.wait(), timeout=1)
+        await asyncio.wait_for(layout_two_started.wait(), timeout=1)
+        assert not fanout_one_started.is_set()
+        assert not fanout_two_started.is_set()
+        release_layout_one.set()
+        await asyncio.wait_for(fanout_one_started.wait(), timeout=1)
+        assert not fanout_two_started.is_set()
+        release_layout_two.set()
+        await asyncio.wait_for(fanout_two_started.wait(), timeout=1)
+        outputs = await asyncio.wait_for(task, timeout=1)
+        assert [path.name for path in outputs] == [
+            "01.png", "02.png", "03.png", "04.png",
+        ]
+        assert [item["label"] for item in receipts] == [
+            "layout-interval-0001", "layout-interval-0002",
+            "fanout-0001-0002", "fanout-0001-0004",
+        ]
+
+    asyncio.run(drive())
 
 
 def test_v4_postprocess_preserves_the_failing_technical_phase(tmp_path, monkeypatch):
@@ -1438,7 +1535,7 @@ def test_v4_postprocess_preserves_the_failing_technical_phase(tmp_path, monkeypa
 
     monkeypatch.setattr(postprocess, "_v4_generate_composite_replacement_board", board)
     monkeypatch.setattr(postprocess, "_v4_bootstrap_scene_anchors", bootstrap)
-    monkeypatch.setattr(postprocess, "_v4_generate_layout_anchors", broken_layout)
+    monkeypatch.setattr(postprocess, "_v4_fan_out", broken_layout)
 
     with pytest.raises(postprocess.PostprocessError) as raised:
         asyncio.run(postprocess._run_v4_task(
@@ -1609,6 +1706,90 @@ def test_v4_anchor_recovery_reads_only_frozen_typed_schedule_paths(tmp_path):
         json.dumps({"status": "submission_unknown"}), encoding="utf-8"
     )
     assert postprocess._ambiguous_v4_anchor_attempts(cdir, private, post)
+
+
+def test_v4_existing_anchor_attempt_recovery_obeys_shared_semaphore(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    cdir = tmp_path / "session"
+    cdir.mkdir()
+    canvas = cdir / "canvas.png"
+    canvas.write_bytes(PNG)
+    private = {
+        "model": settings.seedream_model,
+        "edit_mode": settings.seedream_edit_mode,
+        "timeout_s": settings.seedream_timeout_s,
+    }
+    anchors = [
+        {
+            "order": order,
+            "segment_index": 1,
+            "frame_index": order,
+            "frame_name": f"{order:02d}.png",
+            "source_sha256": f"{order:064x}",
+        }
+        for order in (1, 2)
+    ]
+    for anchor in anchors:
+        label = f"fanout-0001-{anchor['frame_index']:04d}"
+        receipt_path = postprocess._anchor_receipt_path(cdir, "SCENE_01", label)
+        attempt_path = receipt_path.parent / "attempts" / (
+            f"{anchor['order']:04d}-{label}-r1.json"
+        )
+        attempt_path.parent.mkdir(parents=True, exist_ok=True)
+        attempt_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(postprocess, "_load_anchor_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        postprocess.storage,
+        "load_meta",
+        lambda *_args, **_kwargs: {"postprocess": {"segments": [{"revision": 1}]}},
+    )
+    monkeypatch.setattr(postprocess, "_frame_prompt", lambda *_args: "prompt")
+    monkeypatch.setattr(postprocess, "_frame_semantic_context", lambda *_args: {})
+    monkeypatch.setattr(postprocess, "_valid_png", lambda *_args: True)
+    monkeypatch.setattr(postprocess, "_anchor_receipt_payload", lambda **kwargs: {
+        "scene_id": kwargs["scene_id"], "label": kwargs["label"],
+    })
+    monkeypatch.setattr(postprocess, "_write_anchor_receipt", lambda *_args: None)
+    monkeypatch.setattr(postprocess, "_record_v4_completed_frames", lambda *_args: None)
+
+    active = 0
+    peak_active = 0
+
+    async def recover(_settings, _images, _prompt, output, **_kwargs):
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        try:
+            await asyncio.sleep(0.02)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(PNG)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(
+        postprocess.seedream_recovery, "edit_with_content_recovery", recover,
+    )
+
+    async def drive():
+        semaphore = asyncio.Semaphore(1)
+        await asyncio.gather(*(
+            postprocess._v4_anchor(
+                settings, cdir, "cid", private, semaphore,
+                scene_id="SCENE_01",
+                label=f"fanout-0001-{anchor['frame_index']:04d}",
+                anchor=anchor,
+                canvas=canvas,
+                references=[],
+                output=cdir / "outputs" / anchor["frame_name"],
+            )
+            for anchor in anchors
+        ))
+
+    asyncio.run(drive())
+    assert peak_active == 1
 
 
 def test_palette_metric_uses_area_weighted_lab_b_star_and_allows_local_change(tmp_path):

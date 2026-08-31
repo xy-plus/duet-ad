@@ -2141,17 +2141,18 @@ async def _v4_anchor(
         if not attempt_path.is_file():
             raise PostprocessError(409, "submission_unknown")
         try:
-            await seedream_recovery.edit_with_content_recovery(
-                task_settings, [path.read_bytes() for path in inputs], prompt, output,
-                receipt_path=attempt_path,
-                session_dir=cdir,
-                semantic_context=_frame_semantic_context(
-                    private,
-                    anchor["segment_index"],
-                    anchor["frame_name"],
-                    anchor["source_sha256"],
-                ),
-            )
+            async with seedream_sem:
+                await seedream_recovery.edit_with_content_recovery(
+                    task_settings, [path.read_bytes() for path in inputs], prompt, output,
+                    receipt_path=attempt_path,
+                    session_dir=cdir,
+                    semantic_context=_frame_semantic_context(
+                        private,
+                        anchor["segment_index"],
+                        anchor["frame_name"],
+                        anchor["source_sha256"],
+                    ),
+                )
         except seedream.SeedreamError as exc:
             raise PostprocessError(502, exc.code) from None
         if not _valid_png(output, canvas):
@@ -2284,32 +2285,6 @@ async def _v4_bootstrap_scene_anchors(
         )
         receipts.append(receipt)
     return outputs, receipts
-
-
-async def _v4_generate_layout_anchors(
-    settings: Settings, cdir: Path, cid: str, private: dict,
-    grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
-    bootstrap_outputs: dict[tuple[int, int], Path], anchor_receipts: list[dict],
-) -> None:
-    sources = _v4_frame_sources(grouped, private)
-    for scene in private["scene_anchor_schedule"]["scenes"]:
-        scene_id = scene["scene_id"]
-        global_output = _anchor_receipt_path(cdir, scene_id, "global").with_suffix(".png")
-        for layout in scene["segment_layout_anchors"]:
-            key = (layout["segment_index"], layout["frame_index"])
-            label = f"layout-interval-{layout['source_interval_index']:04d}"
-            output, receipt = await _v4_anchor(
-                settings, cdir, cid, private, seedream_sem,
-                scene_id=scene_id,
-                label=label,
-                anchor=layout,
-                canvas=sources[key],
-                references=[("global_scene_anchor", global_output)],
-                output=_private_dir(cdir, layout["segment_index"])
-                / "seedream" / layout["frame_name"],
-            )
-            bootstrap_outputs[key] = output
-            _append_anchor_receipt(anchor_receipts, receipt)
 
 
 async def _v4_verify_bootstrap_packs(
@@ -2470,20 +2445,16 @@ async def _v4_fan_out(
     grouped: dict[int, list[tuple[Path, Path]]], seedream_sem: asyncio.Semaphore,
     bootstrap_outputs: dict[tuple[int, int], Path], anchor_receipts: list[dict],
 ) -> list[Path]:
+    """Run every layout immediately and release each interval's frames on completion."""
     sources = _v4_frame_sources(grouped, private)
-    layout_outputs_by_key = {
-        (layout["segment_index"], layout["frame_index"]): bootstrap_outputs[
-            (layout["segment_index"], layout["frame_index"])
-        ]
+    layouts = [
+        (scene["scene_id"], layout)
         for scene in private["scene_anchor_schedule"]["scenes"]
         for layout in scene["segment_layout_anchors"]
-    }
-    layout_outputs_by_interval = {
-        layout["source_interval_index"]: layout_outputs_by_key[
-            (layout["segment_index"], layout["frame_index"])
-        ]
-        for scene in private["scene_anchor_schedule"]["scenes"]
-        for layout in scene["segment_layout_anchors"]
+    ]
+    layout_keys = {
+        (layout["segment_index"], layout["frame_index"])
+        for _scene_id, layout in layouts
     }
     interval_by_key = image_optimization.source_hard_cut_interval_indices(
         private["execution_inputs"]["frames"]
@@ -2498,12 +2469,46 @@ async def _v4_fan_out(
     }
     pending = [
         key for key in sorted(sources)
-        if key not in layout_outputs_by_key
+        if key not in layout_keys
     ]
+
+    async def layout_one(scene_id: str, layout: dict) -> dict:
+        key = (layout["segment_index"], layout["frame_index"])
+        label = f"layout-interval-{layout['source_interval_index']:04d}"
+        output, receipt = await _v4_anchor(
+            settings, cdir, cid, private, seedream_sem,
+            scene_id=scene_id,
+            label=label,
+            anchor=layout,
+            canvas=sources[key],
+            references=[(
+                "global_scene_anchor",
+                _anchor_receipt_path(cdir, scene_id, "global").with_suffix(".png"),
+            )],
+            output=_private_dir(cdir, layout["segment_index"])
+            / "seedream" / layout["frame_name"],
+        )
+        return {
+            "key": key,
+            "source_interval_index": layout["source_interval_index"],
+            "output": output,
+            "receipt": receipt,
+        }
+
+    layout_tasks = [
+        asyncio.create_task(layout_one(scene_id, layout))
+        for scene_id, layout in layouts
+    ]
+    layout_task_by_interval = {
+        layout["source_interval_index"]: task
+        for (_scene_id, layout), task in zip(layouts, layout_tasks)
+    }
+
     async def one(key: tuple[int, int]) -> dict:
         index, frame_index = key
         frame = frame_by_key[key]
         scene_id = scene_by_segment[index]
+        layout = await layout_task_by_interval[interval_by_key[key]]
         try:
             anchor = _v4_scheduled_anchor(
                 private["scene_anchor_schedule"], scene_id,
@@ -2524,27 +2529,37 @@ async def _v4_fan_out(
             canvas=sources[key],
             references=[(
                 "segment_layout_anchor",
-                layout_outputs_by_interval[interval_by_key[key]],
+                layout["output"],
             )],
             output=_private_dir(cdir, index) / "seedream" / frame["frame_name"],
         )
         return {"key": key, "output": output, "receipt": receipt}
 
     results = await asyncio.gather(
+        *layout_tasks,
         *(one(key) for key in pending),
         return_exceptions=True,
     )
-    errors = [item for item in results if isinstance(item, BaseException)]
-    if errors:
-        error = errors[0]
+    failed_index = next(
+        (index for index, item in enumerate(results)
+         if isinstance(item, BaseException)),
+        None,
+    )
+    if failed_index is not None:
+        error = results[failed_index]
         if isinstance(error, asyncio.CancelledError):
             raise error
-        if isinstance(error, PostprocessError):
-            raise error
-        raise PostprocessError(502, sanitize(str(error)))
+        failed_phase = (
+            "layout_anchor" if failed_index < len(layout_tasks)
+            else "frame_generation"
+        )
+        if not isinstance(error, PostprocessError):
+            error = PostprocessError(502, sanitize(str(error)))
+        error._postprocess_phase = failed_phase
+        raise error
     for result in results:
         _append_anchor_receipt(anchor_receipts, result["receipt"])
-    outputs = dict(layout_outputs_by_key)
+    outputs = dict(bootstrap_outputs)
     outputs.update({result["key"]: result["output"] for result in results})
     return [
         outputs[(index, frame_index)]
@@ -2684,11 +2699,6 @@ async def _run_v4_task(
             settings, cdir, cid, private, grouped, seedream_sem
         )
         phase = "layout_anchor"
-        await _v4_generate_layout_anchors(
-            settings, cdir, cid, private, grouped, seedream_sem,
-            bootstrap_outputs, anchor_receipts,
-        )
-        phase = "frame_generation"
         outputs = await _v4_fan_out(
             settings, cdir, cid, private, grouped, seedream_sem,
             bootstrap_outputs, anchor_receipts,
@@ -2702,6 +2712,7 @@ async def _run_v4_task(
     except asyncio.CancelledError:
         raise
     except PostprocessError as exc:
+        phase = getattr(exc, "_postprocess_phase", phase)
         error_trace.record(
             cdir / "work" / "errors" / f"postprocess-{phase}.json",
             call_path=["postprocess", cid, phase],
@@ -2710,6 +2721,7 @@ async def _run_v4_task(
         )
         raise
     except Exception as exc:
+        phase = getattr(exc, "_postprocess_phase", phase)
         error_trace.record(
             cdir / "work" / "errors" / f"postprocess-{phase}.json",
             call_path=["postprocess", cid, phase],
