@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import subprocess
 import tempfile
 import threading
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -57,6 +59,44 @@ _PROCESS_BUDGET_LOCK = threading.Lock()
 _PROCESS_BUDGET: ASRProcessBudget | None = None
 
 
+_PURE_FILLERS = frozenset({
+    "ah", "ano", "eh", "er", "erm", "hmm", "hm", "mm", "mhm",
+    "oh", "uh", "um", "uhm", "umm", "ya", "yah",
+    "あの", "ええと", "えー", "うーん",
+    "啊", "呃", "额", "嗯", "哦", "喔", "唔", "哎", "哎呀", "呀",
+    "哈", "哈哈", "呵", "呵呵",
+})
+_LATIN_FILLER = re.compile(
+    r"(?:a+h+|e+h+|e+r+m*|h+m+|m+h+m+|o+h+|u+h+|u+h*m+|u+m+)",
+    re.IGNORECASE,
+)
+_WRAPPED_NON_SPEECH = (
+    re.compile(r"^\*+\s*\S(?:[\s\S]*\S)?\s*\*+$"),
+    re.compile(r"^\[[\s\S]+\]$"),
+    re.compile(r"^\([\s\S]+\)$"),
+    re.compile(r"^<[^<>]+>$"),
+    re.compile(r"^[♪♫][\s\S]*[♪♫]$"),
+)
+
+
+def _is_non_dialogue_text(text: str) -> bool:
+    """Reject ASR event labels and standalone fillers before voice_lines exist."""
+    normalized = unicodedata.normalize("NFKC", text).strip()
+    if not normalized:
+        return True
+    if any(pattern.fullmatch(normalized) for pattern in _WRAPPED_NON_SPEECH):
+        return True
+    tokens = [
+        token
+        for token in re.split(r"[^\w\u3040-\u30ff\u3400-\u9fff]+", normalized.casefold())
+        if token
+    ]
+    return bool(tokens) and all(
+        token in _PURE_FILLERS or _LATIN_FILLER.fullmatch(token)
+        for token in tokens
+    )
+
+
 def process_budget(threads: int) -> ASRProcessBudget:
     """Return the sole ASR budget for this process and freeze its thread size."""
     global _PROCESS_BUDGET
@@ -93,7 +133,13 @@ def _lines_from_json(payload: object, duration_s: float) -> list[dict]:
         text = text.replace("\ufffd", "").strip()
         start_s = max(0.0, float(start_ms) / 1000.0)
         end_s = min(duration_s, float(end_ms) / 1000.0)
-        if text and math.isfinite(start_s) and math.isfinite(end_s) and start_s < end_s:
+        if (
+            text
+            and not _is_non_dialogue_text(text)
+            and math.isfinite(start_s)
+            and math.isfinite(end_s)
+            and start_s < end_s
+        ):
             lines.append({"text": text, "start_s": start_s, "end_s": end_s})
     return lines
 

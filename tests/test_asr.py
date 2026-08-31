@@ -47,6 +47,37 @@ def test_whisper_full_json_becomes_multilingual_timed_lines():
     ]
 
 
+def test_whisper_drops_non_speech_labels_and_standalone_fillers_before_output():
+    texts = [
+        "*tepuk tangan*",
+        "[applause]",
+        "(music)",
+        "<laughter>",
+        "♪ instrumental ♪",
+        "嗯……",
+        "um, uh",
+        "hmmm",
+        "嗯，我知道了。",
+        "Oh no!",
+        "1, 2, 3",
+    ]
+    payload = {
+        "transcription": [
+            {
+                "text": text,
+                "offsets": {"from": index * 1000, "to": (index + 1) * 1000},
+            }
+            for index, text in enumerate(texts)
+        ]
+    }
+
+    assert asr._lines_from_json(payload, float(len(texts))) == [
+        {"text": "嗯，我知道了。", "start_s": 8.0, "end_s": 9.0},
+        {"text": "Oh no!", "start_s": 9.0, "end_s": 10.0},
+        {"text": "1, 2, 3", "start_s": 10.0, "end_s": 11.0},
+    ]
+
+
 def test_keep_mode_uses_configured_local_asr_not_codex(tmp_path, monkeypatch):
     cli = tmp_path / "whisper-cli"
     model = tmp_path / "ggml-small.bin"
@@ -77,7 +108,10 @@ def test_keep_mode_uses_configured_local_asr_not_codex(tmp_path, monkeypatch):
 
 def test_half_configured_local_asr_fails_closed(tmp_path):
     settings = Settings(access_token="test", asr_cli=tmp_path / "whisper-cli")
-    with pytest.raises(pipeline.PipelineError, match="configuration incomplete"):
+    with pytest.raises(
+        pipeline.PipelineError,
+        match="local ASR is required for dialogue transcription",
+    ):
         pipeline._transcribe_voice_attempt(
             settings, object(), tmp_path, "unused", 2.0, "keep"
         )
@@ -149,6 +183,62 @@ def test_local_asr_ignores_non_utf8_process_diagnostics(tmp_path, monkeypatch):
         threads=4,
         process_budget=asr.ASRProcessBudget(4),
     ) == []
+
+
+def test_local_asr_filters_non_dialogue_before_returning_voice_lines(
+    tmp_path, monkeypatch
+):
+    cli = tmp_path / "whisper-cli"
+    model = tmp_path / "ggml-small.bin"
+    work = tmp_path / "work"
+    work.mkdir()
+    audio = work / "voice.mp3"
+    cli.write_bytes(b"binary")
+    model.write_bytes(b"model")
+    audio.write_bytes(b"audio")
+
+    def fake_run(argv, **_kwargs):
+        if argv[0] != "ffmpeg":
+            output = Path(argv[argv.index("-of") + 1]).with_suffix(".json")
+            output.write_text(
+                json.dumps(
+                    {
+                        "transcription": [
+                            {
+                                "text": "*tepuk tangan*",
+                                "offsets": {"from": 0, "to": 1000},
+                            },
+                            {
+                                "text": " um ",
+                                "offsets": {"from": 1000, "to": 1500},
+                            },
+                            {
+                                "text": "Produk ini mudah digunakan.",
+                                "offsets": {"from": 1500, "to": 3000},
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(asr.subprocess, "run", fake_run)
+    settings = Settings(access_token="test", asr_cli=cli, asr_model=model)
+    assert pipeline._transcribe_voice_attempt(
+        settings,
+        object(),
+        work,
+        "unused",
+        3.0,
+        "keep",
+    ) == [
+        {
+            "text": "Produk ini mudah digunakan.",
+            "start_s": 1.5,
+            "end_s": 3.0,
+        }
+    ]
 
 
 def test_local_asr_repairs_truncated_utf8_token_in_json(tmp_path, monkeypatch):
