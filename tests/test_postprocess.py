@@ -1849,6 +1849,263 @@ def test_v4_existing_anchor_attempt_recovery_obeys_shared_semaphore(
     assert peak_active == 1
 
 
+def _v4_revision_retry_case(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    cdir = tmp_path / "session"
+    cdir.mkdir()
+    canvas = cdir / "canvas.png"
+    canvas.write_bytes(PNG)
+    private = {
+        "model": settings.seedream_model,
+        "edit_mode": settings.seedream_edit_mode,
+        "timeout_s": settings.seedream_timeout_s,
+        "plan_sha256": "a" * 64,
+        "continuity_sha256": "b" * 64,
+    }
+    anchor = {
+        "order": 1,
+        "segment_index": 1,
+        "frame_index": 1,
+        "frame_name": "01.png",
+        "source_sha256": hashlib.sha256(PNG).hexdigest(),
+    }
+    monkeypatch.setattr(
+        postprocess.storage,
+        "load_meta",
+        lambda *_args, **_kwargs: {
+            "postprocess": {"segments": [{"revision": 2}]},
+        },
+    )
+    monkeypatch.setattr(postprocess, "_frame_prompt", lambda *_args: "prompt-r2")
+    monkeypatch.setattr(postprocess, "_frame_semantic_context", lambda *_args: {})
+    monkeypatch.setattr(postprocess, "_record_v4_completed_frames", lambda *_args: None)
+    receipt = postprocess._anchor_receipt_path(
+        cdir, "SCENE_01", "global", revision=2,
+    )
+    attempt = receipt.parent / "attempts" / "0001-global-r2.json"
+    output = receipt.with_suffix(".png")
+
+    async def run():
+        return await postprocess._v4_anchor(
+            settings,
+            cdir,
+            "cid",
+            private,
+            asyncio.Semaphore(1),
+            scene_id="SCENE_01",
+            label="global",
+            anchor=anchor,
+            canvas=canvas,
+            references=[],
+            output=postprocess._anchor_receipt_path(
+                cdir, "SCENE_01", "global",
+            ).with_suffix(".png"),
+        )
+
+    return settings, cdir, canvas, private, anchor, receipt, attempt, output, run
+
+
+def test_v4_r1_rejection_allows_one_fresh_r2_paid_attempt(tmp_path, monkeypatch):
+    (
+        settings, cdir, _canvas, _private, _anchor, receipt, attempt, output, run,
+    ) = _v4_revision_retry_case(tmp_path, monkeypatch)
+    legacy_receipt = postprocess._anchor_receipt_path(cdir, "SCENE_01", "global")
+    legacy_attempt = legacy_receipt.parent / "attempts" / "0001-global-r1.json"
+    legacy_attempt.parent.mkdir(parents=True)
+    legacy_attempt.write_text(json.dumps({
+        "status": "failed", "provider_error_code": "InputTextSensitiveContentDetected",
+    }), encoding="utf-8")
+    posts = 0
+
+    def provider(_request):
+        nonlocal posts
+        posts += 1
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(PNG).decode("ascii")}],
+        })
+
+    transport = httpx.MockTransport(provider)
+
+    async def recover(task_settings, images, prompt, out, *, receipt_path, **_kwargs):
+        return await postprocess.seedream.edit(
+            task_settings,
+            images,
+            prompt,
+            out,
+            receipt_path=receipt_path,
+            transport=transport,
+        )
+
+    monkeypatch.setattr(
+        postprocess.seedream_recovery, "edit_with_content_recovery", recover,
+    )
+    actual_output, business_receipt = asyncio.run(run())
+
+    assert posts == 1
+    assert actual_output == output
+    assert attempt.is_file() and json.loads(attempt.read_text())["status"] == "succeeded"
+    assert receipt.is_file() and business_receipt["revision"] == 2
+    assert legacy_attempt.is_file()
+
+
+@pytest.mark.parametrize("durable_state", ["claim", "submitting"])
+def test_v4_r2_claim_or_submitting_replay_never_posts(
+    tmp_path, monkeypatch, durable_state,
+):
+    (
+        settings, _cdir, canvas, _private, _anchor, _receipt, attempt, output, run,
+    ) = _v4_revision_retry_case(tmp_path, monkeypatch)
+    prompt = "prompt-r2"
+    input_shas = [hashlib.sha256(canvas.read_bytes()).hexdigest()]
+    if durable_state == "submitting":
+        attempt.parent.mkdir(parents=True)
+        attempt.write_text(json.dumps({
+            "version": 1,
+            "status": "submitting",
+            "model": settings.seedream_model,
+            "mode": settings.seedream_edit_mode,
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "input_sha256": input_shas,
+        }), encoding="utf-8")
+    else:
+        request_binding = {
+            "model": settings.seedream_model,
+            "mode": settings.seedream_edit_mode,
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "input_sha256": input_shas,
+        }
+        request_sha = hashlib.sha256(json.dumps(
+            request_binding,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()).hexdigest()
+        claim = postprocess.seedream._claim_path(attempt)
+        claim.parent.mkdir(parents=True)
+        claim.write_text(json.dumps({
+            "version": 1,
+            "kind": "seedream_paid_post",
+            "request_sha256": request_sha,
+        }), encoding="utf-8")
+    posts = 0
+
+    def provider(_request):
+        nonlocal posts
+        posts += 1
+        return httpx.Response(500)
+
+    transport = httpx.MockTransport(provider)
+
+    async def recover(task_settings, images, actual_prompt, out, *, receipt_path, **_kwargs):
+        return await postprocess.seedream.edit(
+            task_settings,
+            images,
+            actual_prompt,
+            out,
+            receipt_path=receipt_path,
+            transport=transport,
+        )
+
+    monkeypatch.setattr(
+        postprocess.seedream_recovery, "edit_with_content_recovery", recover,
+    )
+    with pytest.raises(postprocess.PostprocessError) as caught:
+        asyncio.run(run())
+
+    assert caught.value.detail == "submission_unknown"
+    assert posts == 0
+    assert not output.exists()
+
+
+def test_v4_r2_succeeded_attempt_crash_recovery_reuses_local_result(
+    tmp_path, monkeypatch,
+):
+    (
+        settings, _cdir, canvas, _private, _anchor, receipt, attempt, output, run,
+    ) = _v4_revision_retry_case(tmp_path, monkeypatch)
+    posts = 0
+
+    def provider(_request):
+        nonlocal posts
+        posts += 1
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(PNG).decode("ascii")}],
+        })
+
+    transport = httpx.MockTransport(provider)
+    asyncio.run(postprocess.seedream.edit(
+        settings,
+        [canvas.read_bytes()],
+        "prompt-r2",
+        output,
+        receipt_path=attempt,
+        transport=transport,
+    ))
+    assert posts == 1
+    output.unlink()
+
+    async def recover(task_settings, images, prompt, out, *, receipt_path, **_kwargs):
+        return await postprocess.seedream.edit(
+            task_settings,
+            images,
+            prompt,
+            out,
+            receipt_path=receipt_path,
+            transport=transport,
+        )
+
+    monkeypatch.setattr(
+        postprocess.seedream_recovery, "edit_with_content_recovery", recover,
+    )
+    actual_output, business_receipt = asyncio.run(run())
+
+    assert posts == 1
+    assert actual_output == output and output.is_file()
+    assert receipt.is_file() and business_receipt["revision"] == 2
+
+
+def test_v4_r1_business_output_is_never_adopted_as_r2(tmp_path, monkeypatch):
+    (
+        _settings, cdir, canvas, private, anchor, _receipt, _attempt, output, run,
+    ) = _v4_revision_retry_case(tmp_path, monkeypatch)
+    legacy_receipt = postprocess._anchor_receipt_path(cdir, "SCENE_01", "global")
+    legacy_output = legacy_receipt.with_suffix(".png")
+    legacy_output.parent.mkdir(parents=True)
+    legacy_output.write_bytes(PNG)
+    old_business = postprocess._anchor_receipt_payload(
+        private=private,
+        scene_id="SCENE_01",
+        label="global",
+        anchor=anchor,
+        input_roles=["canvas"],
+        inputs=[canvas],
+        output=legacy_output,
+    )
+    postprocess._write_anchor_receipt(legacy_receipt, old_business)
+    legacy_bytes = legacy_output.read_bytes()
+    calls = 0
+
+    async def stop_before_post(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise postprocess.seedream.SeedreamError("submission_unknown")
+
+    monkeypatch.setattr(
+        postprocess.seedream_recovery,
+        "edit_with_content_recovery",
+        stop_before_post,
+    )
+    with pytest.raises(postprocess.PostprocessError) as caught:
+        asyncio.run(run())
+
+    assert caught.value.detail == "submission_unknown"
+    assert calls == 1
+    assert legacy_output.read_bytes() == legacy_bytes
+    assert json.loads(legacy_receipt.read_text()) == old_business
+    assert not output.exists()
+
+
 def test_palette_metric_uses_area_weighted_lab_b_star_and_allows_local_change(tmp_path):
     yellow = tmp_path / "yellow.png"
     blue = tmp_path / "blue.png"

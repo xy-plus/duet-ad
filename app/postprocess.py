@@ -1355,10 +1355,18 @@ def _v4_frame_sources(
     return sources
 
 
-def _anchor_receipt_path(cdir: Path, scene_id: str, label: str) -> Path:
-    return cdir / "work" / ".postprocess-private" / "scene-anchors" / scene_id / (
-        f"{label}.json"
-    )
+def _anchor_receipt_path(
+    cdir: Path, scene_id: str, label: str, *, revision: int = 1,
+) -> Path:
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise ValueError("invalid anchor revision")
+    root = cdir / "work" / ".postprocess-private" / "scene-anchors"
+    # Revision 1 predates revision-scoped anchor artifacts.  Keep that path
+    # readable, but every later user retry owns a completely independent
+    # namespace so old paid outputs can neither block nor be adopted by it.
+    if revision > 1:
+        root = root / "revisions" / f"r{revision:04d}"
+    return root / scene_id / f"{label}.json"
 
 
 def _anchor_receipt_payload(
@@ -1370,6 +1378,7 @@ def _anchor_receipt_payload(
     input_roles: list[str],
     inputs: list[Path],
     output: Path,
+    revision: int = 1,
 ) -> dict:
     if (
         not output.is_file()
@@ -1389,6 +1398,8 @@ def _anchor_receipt_payload(
         "input_sha256s": [hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs],
         "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
     }
+    if revision > 1:
+        payload["revision"] = revision
     return {**payload, "sha256": hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()}
@@ -1401,6 +1412,7 @@ def _write_anchor_receipt(path: Path, receipt: dict) -> None:
 def _load_anchor_receipt(
     path: Path, *, private: dict, scene_id: str, label: str,
     anchor: dict, input_roles: list[str], inputs: list[Path], output: Path,
+    revision: int = 1,
 ) -> dict | None:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -1412,6 +1424,7 @@ def _load_anchor_receipt(
             input_roles=input_roles,
             inputs=inputs,
             output=output,
+            revision=revision,
         )
     except (OSError, ValueError, PostprocessError):
         return None
@@ -1517,18 +1530,19 @@ def _semantic_receipt(
 
 def _anchor_output_path(cdir: Path, receipt: dict) -> Path:
     label = receipt["label"]
+    revision = receipt.get("revision", 1)
     if (
         label in {"global", "pack-alternate"}
         or label.startswith("person-")
     ):
-        return _anchor_receipt_path(cdir, receipt["scene_id"], label).with_suffix(
-            ".png"
-        ).resolve()
+        return _anchor_receipt_path(
+            cdir, receipt["scene_id"], label, revision=revision,
+        ).with_suffix(".png").resolve()
     anchor = receipt["anchor"]
-    return (
-        _private_dir(cdir, anchor["segment_index"])
-        / "seedream" / anchor["frame_name"]
-    ).resolve()
+    root = _private_dir(cdir, anchor["segment_index"]) / "seedream"
+    if revision > 1:
+        root = root / "revisions" / f"r{revision:04d}"
+    return (root / anchor["frame_name"]).resolve()
 
 
 def _append_anchor_receipt(receipts: list[dict], receipt: dict) -> None:
@@ -1555,6 +1569,9 @@ def _record_v4_completed_frames(
         descriptors = _v4_expected_anchor_descriptors(
             {}, private["scene_anchor_schedule"]
         )
+        revision = _v4_project_revision(
+            (storage.load_meta(settings.data_dir, cid) or {}).get("postprocess")
+        )
     except (KeyError, TypeError, ValueError):
         return
     completed: dict[int, set[int]] = {}
@@ -1566,7 +1583,7 @@ def _record_v4_completed_frames(
         ):
             continue
         receipt = _load_json_receipt(_anchor_receipt_path(
-            cdir, descriptor["scene_id"], label
+            cdir, descriptor["scene_id"], label, revision=revision,
         ))
         if (
             receipt is None
@@ -1688,12 +1705,14 @@ def _v4_scheduled_anchor(schedule: dict, scene_id: str, label: str) -> dict:
     return deepcopy(matches[0])
 
 
-def _v4_anchor_receipt_index(cdir: Path, plan: dict, schedule: dict) -> dict[str, dict]:
+def _v4_anchor_receipt_index(
+    cdir: Path, plan: dict, schedule: dict, *, revision: int = 1,
+) -> dict[str, dict]:
     """Load exactly the frozen DAG's receipts; PERSON labels never fan out by scene."""
     result = {}
     for descriptor in _v4_expected_anchor_descriptors(plan, schedule):
         receipt = _load_json_receipt(_anchor_receipt_path(
-            cdir, descriptor["scene_id"], descriptor["label"]
+            cdir, descriptor["scene_id"], descriptor["label"], revision=revision,
         ))
         if receipt is None:
             raise ValueError
@@ -1715,11 +1734,20 @@ def _valid_v4_anchor_receipt(
     source_sha256s: dict[tuple[int, int], str],
     source_paths: dict[tuple[int, int], Path], anchors: dict[str, dict],
 ) -> bool:
-    if not isinstance(receipt, dict) or set(receipt) != {
+    fields = {
         "version", "plan_sha256", "continuity_sha256", "scene_id", "label",
         "anchor", "input_roles", "input_sha256s", "output_sha256", "sha256",
+    }
+    if not isinstance(receipt, dict) or frozenset(receipt) not in {
+        frozenset(fields), frozenset({*fields, "revision"}),
     } or receipt.get("version") != 1 or receipt.get("plan_sha256") != plan_sha256 \
             or receipt.get("continuity_sha256") != continuity_sha256:
+        return False
+    revision = receipt.get("revision", 1)
+    if (
+        isinstance(revision, bool) or not isinstance(revision, int)
+        or revision < 1 or (revision == 1 and "revision" in receipt)
+    ):
         return False
     try:
         anchor = receipt["anchor"]
@@ -1747,7 +1775,7 @@ def _valid_v4_anchor_receipt(
         ):
             return False
         roles = receipt["input_roles"]
-        board = _replacement_board_path(cdir)
+        board = _replacement_board_path(cdir, revision=revision)
         board_roles = ["composite_replacement_board"] if board.is_file() else []
         board_sha256s = [hashlib.sha256(board.read_bytes()).hexdigest()] if board_roles else []
         if receipt["label"] == "global":
@@ -1965,18 +1993,20 @@ def _valid_palette_metrics_for_outputs(
     return len(seen) == len(expected)
 
 
-def _replacement_board_path(cdir: Path) -> Path:
-    return (
-        cdir / "work" / ".postprocess-private" / "replacement-board"
-        / "composite.png"
-    )
+def _replacement_board_path(cdir: Path, *, revision: int = 1) -> Path:
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise ValueError("invalid replacement board revision")
+    root = cdir / "work" / ".postprocess-private" / "replacement-board"
+    if revision > 1:
+        root = root / "revisions" / f"r{revision:04d}"
+    return root / "composite.png"
 
 
 def _v4_shared_references(
-    cdir: Path, references: list[tuple[str, Path]],
+    cdir: Path, references: list[tuple[str, Path]], *, revision: int = 1,
 ) -> list[tuple[str, Path]]:
     """Append the one project board to every existing v4 anchor input list."""
-    board = _replacement_board_path(cdir)
+    board = _replacement_board_path(cdir, revision=revision)
     if not board.is_file() or any(path == board for _role, path in references):
         return list(references)
     return [*references, ("composite_replacement_board", board)]
@@ -2087,11 +2117,14 @@ async def _v4_generate_composite_replacement_board(
         sources[(tile["reference"]["segment_index"], tile["reference"]["frame_index"])]
         for tile in tiles
     ]
-    root = _replacement_board_path(cdir).parent
+    revision = _v4_project_revision(
+        (storage.load_meta(settings.data_dir, cid) or {}).get("postprocess")
+    )
+    output = _replacement_board_path(cdir, revision=revision)
+    root = output.parent
     canvas = root / "canvas.png"
     evidence_sheet = root / "source-evidence.png"
     raw_output = root / "provider.png"
-    output = _replacement_board_path(cdir)
     root.mkdir(parents=True, exist_ok=True)
     _compose_replacement_evidence_sheet(reference_paths, evidence_sheet)
     blank = cv2.imread(str(evidence_sheet), cv2.IMREAD_COLOR)
@@ -2101,9 +2134,6 @@ async def _v4_generate_composite_replacement_board(
     if not cv2.imwrite(str(canvas), blank):
         raise PostprocessError(502, "postprocess_artifacts_invalid")
     try:
-        revision = _v4_project_revision(
-            (storage.load_meta(settings.data_dir, cid) or {}).get("postprocess")
-        )
         attempt = _private_dir(cdir, min(grouped)) / "attempts" / (
             f"00-r{revision}.json"
         )
@@ -2142,24 +2172,6 @@ async def _v4_anchor(
     anchor: dict, canvas: Path, references: list[tuple[str, Path]], output: Path,
 ) -> tuple[Path, dict]:
     """Generate one typed anchor; no dependent may use an unverified result."""
-    references = _v4_shared_references(cdir, references)
-    input_roles = ["canvas", *[role for role, _ in references]]
-    inputs = [canvas, *[path for _, path in references]]
-    receipt_path = _anchor_receipt_path(cdir, scene_id, label)
-    existing = _load_anchor_receipt(
-        receipt_path,
-        private=private,
-        scene_id=scene_id,
-        label=label,
-        anchor=anchor,
-        input_roles=input_roles,
-        inputs=inputs,
-        output=output,
-    )
-    if existing is not None and _valid_png(output, canvas):
-        _record_v4_completed_frames(settings, cid, cdir, private)
-        return output, existing
-    attempts = receipt_path.parent / "attempts"
     latest = storage.load_meta(settings.data_dir, cid) or {}
     revisions = {
         item.get("revision")
@@ -2171,6 +2183,32 @@ async def _v4_anchor(
     revision = next(iter(revisions))
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
         raise PostprocessError(409, "postprocess_receipt_invalid")
+    references = _v4_shared_references(cdir, references, revision=revision)
+    input_roles = ["canvas", *[role for role, _ in references]]
+    inputs = [canvas, *[path for _, path in references]]
+    receipt_path = _anchor_receipt_path(
+        cdir, scene_id, label, revision=revision,
+    )
+    if revision > 1:
+        output = _anchor_output_path(cdir, {
+            "scene_id": scene_id, "label": label, "anchor": anchor,
+            "revision": revision,
+        })
+    existing = _load_anchor_receipt(
+        receipt_path,
+        private=private,
+        scene_id=scene_id,
+        label=label,
+        anchor=anchor,
+        input_roles=input_roles,
+        inputs=inputs,
+        output=output,
+        revision=revision,
+    )
+    if existing is not None and _valid_png(output, canvas):
+        _record_v4_completed_frames(settings, cid, cdir, private)
+        return output, existing
+    attempts = receipt_path.parent / "attempts"
     attempt_path = attempts / f"{anchor['order']:04d}-{label}-r{revision}.json"
     task_settings = replace(
         settings,
@@ -2211,7 +2249,7 @@ async def _v4_anchor(
             raise PostprocessError(409, "scene_anchor_verification_failed")
         receipt = _anchor_receipt_payload(
             private=private, scene_id=scene_id, label=label, anchor=anchor,
-            input_roles=input_roles, inputs=inputs, output=output,
+            input_roles=input_roles, inputs=inputs, output=output, revision=revision,
         )
         _write_anchor_receipt(receipt_path, receipt)
         _record_v4_completed_frames(settings, cid, cdir, private)
@@ -2252,6 +2290,7 @@ async def _v4_anchor(
         input_roles=input_roles,
         inputs=inputs,
         output=output,
+        revision=revision,
     )
     _write_anchor_receipt(receipt_path, receipt)
     _record_v4_completed_frames(settings, cid, cdir, private)
@@ -2363,10 +2402,17 @@ async def _v4_verify_bootstrap_packs(
         segment["segment_index"]: segment["scene"]["scene_id"]
         for segment in plan["segments"]
     }
-    global_outputs = {
-        scene_id: _anchor_receipt_path(cdir, scene_id, "global").with_suffix(".png")
-        for scene_id in schedules
-    }
+    global_outputs = {}
+    for scene_id in schedules:
+        receipt = next((
+            item for item in anchor_receipts
+            if item.get("scene_id") == scene_id and item.get("label") == "global"
+        ), None)
+        global_outputs[scene_id] = (
+            _anchor_output_path(cdir, receipt)
+            if receipt is not None
+            else _anchor_receipt_path(cdir, scene_id, "global").with_suffix(".png")
+        )
     person_targets: dict[tuple[tuple[int, int], str], Path] = {}
 
     async def target_for(key: tuple[int, int], label: str) -> Path:
@@ -2526,6 +2572,17 @@ async def _v4_fan_out(
         if key not in layout_keys
     ]
 
+    def global_output_for(scene_id: str) -> Path:
+        receipt = next((
+            item for item in anchor_receipts
+            if item.get("scene_id") == scene_id and item.get("label") == "global"
+        ), None)
+        return (
+            _anchor_output_path(cdir, receipt)
+            if receipt is not None
+            else _anchor_receipt_path(cdir, scene_id, "global").with_suffix(".png")
+        )
+
     async def layout_one(scene_id: str, layout: dict) -> dict:
         key = (layout["segment_index"], layout["frame_index"])
         label = f"layout-interval-{layout['source_interval_index']:04d}"
@@ -2537,7 +2594,7 @@ async def _v4_fan_out(
             canvas=sources[key],
             references=[(
                 "global_scene_anchor",
-                _anchor_receipt_path(cdir, scene_id, "global").with_suffix(".png"),
+                global_output_for(scene_id),
             )],
             output=_private_dir(cdir, layout["segment_index"])
             / "seedream" / layout["frame_name"],
@@ -3351,7 +3408,10 @@ def _v4_user_acceptance_receipt(settings: Settings, cid: str, meta: dict) -> dic
         if source_palette != expected_source_palette:
             raise ValueError
         anchors = _v4_anchor_receipt_index(
-            cdir, plan, runtime_private["scene_anchor_schedule"],
+            cdir,
+            plan,
+            runtime_private["scene_anchor_schedule"],
+            revision=_v4_project_revision(post),
         )
         canvas_sha256s = {
             key: _sha256_path(path) for key, path in canvas_sources.items()
@@ -3741,9 +3801,6 @@ def _ambiguous_v4_anchor_attempts(cdir: Path, private: dict, post: object) -> bo
     except (KeyError, TypeError, ValueError):
         return True
     for descriptor in descriptors:
-        attempts = _anchor_receipt_path(
-            cdir, descriptor["scene_id"], descriptor["label"],
-        ).parent / "attempts"
         order = descriptor["anchor"].get("order")
         if isinstance(order, bool) or not isinstance(order, int) or order < 1:
             return True
@@ -3751,6 +3808,12 @@ def _ambiguous_v4_anchor_attempts(cdir: Path, private: dict, post: object) -> bo
         # still ambiguous; an explicit retry can only follow a determinate
         # provider rejection, never an unknown submission.
         for attempt_revision in range(1, revision + 1):
+            attempts = _anchor_receipt_path(
+                cdir,
+                descriptor["scene_id"],
+                descriptor["label"],
+                revision=attempt_revision,
+            ).parent / "attempts"
             attempt = attempts / (
                 f"{order:04d}-{descriptor['label']}-r{attempt_revision}.json"
             )
