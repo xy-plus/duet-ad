@@ -26,6 +26,7 @@ from app import (
     pipeline,
     postprocess,
     prepared_input,
+    skill_milestone,
     stitch,
     storage,
 )
@@ -63,6 +64,11 @@ def _make_conv(
     meta = storage.new_conversation(settings.data_dir, "n", "a.mp4")
     cid = meta["id"]
     cdir = settings.data_dir / cid
+    skill_milestone.freeze(
+        cdir,
+        repository_root=Path(__file__).resolve().parents[1],
+        git_commit=None,
+    )
     if segments:
         counts = (
             (segment_frame_count, segment_frame_count)
@@ -494,6 +500,29 @@ def test_v4_manual_acceptance_receipt_enables_h3_without_image_verification(
     assert postprocess.generation_keyframes(
         cdir, latest, originals, settings=settings,
     ) == sorted((cdir / "work" / "postprocessed").glob("*.png"))
+
+
+def test_v4_image_acceptance_is_independent_of_downstream_prompt_fields(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    cid, _cdir, _originals = _completed_v4_project(settings, monkeypatch)
+    meta = storage.load_meta(settings.data_dir, cid)
+    status = postprocess.image_acceptance_status(settings, cid, meta)
+    postprocess.accept_images(settings, cid, {
+        "confirm": True,
+        "expected_meta_sha256": status["expected_meta_sha256"],
+    })
+    accepted = storage.load_meta(settings.data_dir, cid)
+    promoted = json.loads(json.dumps(accepted))
+    for segment in promoted.get("segments", []):
+        segment["prompt"] = "Fusion output"
+        segment["dialogue"] = []
+        segment["lines"] = []
+
+    assert postprocess._v4_user_acceptance_matches(
+        settings, cid, promoted,
+    ) is True
 
 
 def test_v4_acceptance_uses_grouped_frame_keys_for_private_canvas_paths(

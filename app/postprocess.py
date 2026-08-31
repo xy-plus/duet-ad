@@ -3416,9 +3416,8 @@ def _v4_user_acceptance_receipt(settings: Settings, cid: str, meta: dict) -> dic
         if cursor != len(outputs):
             raise ValueError
         payload = {
-            "version": 1,
+            "version": 2,
             "cid": cid,
-            "meta_snapshot_sha256": _image_acceptance_meta_sha256(meta),
             "postprocess_receipt_sha256": runtime_private["receipt_sha256"],
             "plan_sha256": runtime_private["plan_sha256"],
             "continuity_sha256": runtime_private["continuity_sha256"],
