@@ -4271,6 +4271,62 @@ def _revalidate_speaker_authority(
         raise LongGenerationError(exc.code) from exc
 
 
+def _context_ir_fusion_keyframes(
+    plan: FrozenPlan,
+    segment: FrozenSegment,
+    source_request: h3.H3Request,
+) -> h3.FrozenKeyframes:
+    """Load the already-frozen Fusion proxies in exact H3 frame order."""
+    if plan.prompt_fusion is None:
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    try:
+        fusion_segment = plan.prompt_fusion.segments[segment.index - 1]
+        fusion_frames = fusion_segment["new_keyframes"]
+    except (IndexError, KeyError, TypeError):
+        raise LongGenerationError("prompt_fusion_input_invalid") from None
+    if (
+        not isinstance(fusion_frames, list)
+        or len(fusion_frames) != len(source_request.keyframes)
+    ):
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    context_ir_keyframes: list[h3.FrozenFrame] = []
+    for order, ((source_path, source_data), frame) in enumerate(zip(
+        source_request.keyframes, fusion_frames,
+    ), 1):
+        if (
+            not isinstance(frame, Mapping)
+            or frame.get("order") != order
+            or not source_data
+        ):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        relative = frame.get("path")
+        proxy_sha256 = frame.get("sha256")
+        if not isinstance(relative, str) or not isinstance(proxy_sha256, str):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        proxy_candidate = plan.root / relative
+        if proxy_candidate.is_symlink():
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        try:
+            proxy_path = proxy_candidate.resolve()
+            expected_parent = (
+                plan.root / "work" / PROMPT_FUSION_PROXY_DIR
+            ).resolve()
+            if proxy_path.parent != expected_parent:
+                raise ValueError
+            if proxy_path.name != f"{proxy_sha256}.png":
+                raise ValueError
+            proxy_data = proxy_path.read_bytes()
+        except (OSError, ValueError):
+            raise LongGenerationError("prompt_fusion_input_invalid") from None
+        if (
+            not proxy_data
+            or hashlib.sha256(proxy_data).hexdigest() != proxy_sha256
+        ):
+            raise LongGenerationError("prompt_fusion_input_invalid")
+        context_ir_keyframes.append((source_path, proxy_data))
+    return tuple(context_ir_keyframes)
+
+
 def _freeze_segment_context_ir(
     settings,
     plan: FrozenPlan,
@@ -4279,9 +4335,13 @@ def _freeze_segment_context_ir(
 ) -> context_ir_bridge.FrozenContextIrRequest:
     if not getattr(settings, "minimax_api_key", ""):
         raise LongGenerationError("context_ir_credential_missing", 503)
+    context_ir_keyframes = _context_ir_fusion_keyframes(
+        plan, segment, source_request,
+    )
     try:
         return h3_project.freeze_context_ir(
             source_request=source_request,
+            context_ir_keyframes=context_ir_keyframes,
             upstream_dialogue_sha256=segment.dialogue_sha256 or "",
             upstream_artifact_path=(
                 plan.root / long_video.PLAN_RECEIPT_FILENAME

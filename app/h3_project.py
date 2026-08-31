@@ -1200,6 +1200,7 @@ def build_request_from_parts(
 def freeze_context_ir(
     *,
     source_request: h3.H3Request,
+    context_ir_keyframes: h3.FrozenKeyframes,
     upstream_dialogue_sha256: str,
     upstream_artifact_path: Path,
     upstream_artifact_sha256: str,
@@ -1213,6 +1214,7 @@ def freeze_context_ir(
     try:
         return context_ir_bridge.freeze_context_ir_request(
             source_h3_request=source_request,
+            context_ir_keyframes=context_ir_keyframes,
             upstream_dialogue_sha256=upstream_dialogue_sha256,
             upstream_artifact_path=upstream_artifact_path,
             upstream_artifact_sha256=upstream_artifact_sha256,

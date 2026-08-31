@@ -905,6 +905,10 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
         )
         context = context_ir_bridge.freeze_context_ir_request(
             source_h3_request=request,
+            context_ir_keyframes=tuple(
+                (path, image_optimization.half_resolution_png(data))
+                for path, data in request.keyframes
+            ),
             upstream_dialogue_sha256=dialogue_sha256,
             upstream_artifact_path=artifact_path,
             upstream_artifact_sha256=hashlib.sha256(artifact_data).hexdigest(),

@@ -1917,14 +1917,14 @@ def test_speaker_authority_root_is_operational_not_source_request_semantics(tmp_
         source_prompt_sha256=hashlib.sha256(
             source.prompt.encode("utf-8")
         ).hexdigest(),
-        references_sha256=h3._context_ir_reference_receipt(source),
+        references_sha256="a" * 64,
     )
     effective_receipt = h3._context_ir_source_request_receipt(
         effective,
         source_prompt_sha256=hashlib.sha256(
             effective.prompt.encode("utf-8")
         ).hexdigest(),
-        references_sha256=h3._context_ir_reference_receipt(effective),
+        references_sha256="a" * 64,
     )
 
     assert effective_receipt == source_receipt
@@ -1946,7 +1946,7 @@ def test_speaker_authority_root_is_operational_not_source_request_semantics(tmp_
         source_prompt_sha256=hashlib.sha256(
             legacy.prompt.encode("utf-8")
         ).hexdigest(),
-        references_sha256=h3._context_ir_reference_receipt(legacy),
+        references_sha256="a" * 64,
     )
 
 

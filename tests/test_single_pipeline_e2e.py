@@ -409,6 +409,10 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
         )
         frozen_context = context_ir_bridge.freeze_context_ir_request(
             source_h3_request=source_request,
+            context_ir_keyframes=tuple(
+                (path, image_optimization.half_resolution_png(data))
+                for path, data in source_request.keyframes
+            ),
             upstream_dialogue_sha256=dialogue_sha256,
             upstream_artifact_path=upstream_artifact,
             upstream_artifact_sha256=hashlib.sha256(upstream_data).hexdigest(),

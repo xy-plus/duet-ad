@@ -6,14 +6,38 @@ from fractions import Fraction
 from pathlib import Path
 
 import httpx
+import cv2
+import numpy as np
 import pytest
 
-from app import context_ir_bridge, dialogue_timing, h3, h3_multimodal
+from app import (
+    context_ir_bridge,
+    dialogue_timing,
+    h3,
+    h3_multimodal,
+    image_optimization,
+)
 
 
 UPSTREAM_DIALOGUE_SHA256 = hashlib.sha256(
     b"verified-prepared-or-long-dialogue-receipt"
 ).hexdigest()
+
+
+def _png(width: int, height: int, value: int) -> bytes:
+    image = np.full((height, width, 3), value, dtype=np.uint8)
+    encoded, data = cv2.imencode(
+        ".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 3],
+    )
+    assert encoded
+    return data.tobytes()
+
+
+def _context_keyframes(source: h3.H3Request) -> h3.FrozenKeyframes:
+    return tuple(
+        (path, image_optimization.half_resolution_png(data))
+        for path, data in source.keyframes
+    )
 
 
 def _audio(path: Path, order: int, purpose: h3.ReferenceAudioPurpose) -> h3.FrozenReferenceAudio:
@@ -72,8 +96,8 @@ def _plan(visual_prompt: str) -> dict:
 def _source_request(tmp_path: Path) -> tuple[h3.H3Request, dict]:
     visual_prompt = "雨夜车站，人物面对镜头，镜头缓慢推进。"
     keyframes = (
-        (tmp_path / "01.png", b"frame-one"),
-        (tmp_path / "02.png", b"frame-two"),
+        (tmp_path / "01.png", _png(7, 9, 32)),
+        (tmp_path / "02.png", _png(8, 10, 224)),
     )
     visual = h3_multimodal.FrozenVisualInput(visual_prompt, keyframes)
     audios = (
@@ -145,6 +169,7 @@ def _frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
     artifact_path, artifact_sha256 = _upstream_artifact(tmp_path)
     return context_ir_bridge.freeze_context_ir_request(
         source_h3_request=source,
+        context_ir_keyframes=_context_keyframes(source),
         upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
         upstream_artifact_path=artifact_path,
         upstream_artifact_sha256=artifact_sha256,
@@ -250,7 +275,7 @@ def _no_audio_frozen(
         workdir=tmp_path / "silent-segment-1",
         client_request_id="silent-h3-request-1",
         prompt=prompt,
-        keyframes=((Path("01.png"), b"silent-frame-one"),),
+        keyframes=((Path("01.png"), _png(7, 9, 64)),),
         voice_texts=(),
         voice_receipt=h3.voice_texts_receipt(()),
         duration=8,
@@ -263,6 +288,7 @@ def _no_audio_frozen(
     artifact_path, artifact_sha256 = _upstream_artifact(tmp_path)
     return context_ir_bridge.freeze_context_ir_request(
         source_h3_request=source,
+        context_ir_keyframes=_context_keyframes(source),
         upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
         upstream_artifact_path=artifact_path,
         upstream_artifact_sha256=artifact_sha256,
@@ -308,7 +334,10 @@ def _reference_fusion_frozen(
         "N/A",
     ])
     keyframes = tuple(
-        (tmp_path / f"fusion-{order:02d}.png", f"fusion-frame-{order}".encode())
+        (
+            tmp_path / f"fusion-{order:02d}.png",
+            _png(7 + order, 9 + order, 16 * order),
+        )
         for order in range(1, 10)
     )
     voice_texts = ("这是严格冻结的台词",) if dialogue else ()
@@ -328,6 +357,7 @@ def _reference_fusion_frozen(
     artifact_path, artifact_sha256 = _upstream_artifact(tmp_path)
     return context_ir_bridge.freeze_context_ir_request(
         source_h3_request=source,
+        context_ir_keyframes=_context_keyframes(source),
         upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
         upstream_artifact_path=artifact_path,
         upstream_artifact_sha256=artifact_sha256,
@@ -381,6 +411,7 @@ def _timeline_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest
     )
     return context_ir_bridge.freeze_context_ir_request(
         source_h3_request=source,
+        context_ir_keyframes=_context_keyframes(source),
         upstream_dialogue_sha256=base.upstream_dialogue_sha256,
         upstream_artifact_path=base.upstream_artifact_path,
         upstream_artifact_sha256=base.upstream_artifact_sha256,
@@ -486,6 +517,39 @@ def test_reference_ref2va_uses_context_ir_and_binds_optimized_prompt(
         receipt.effective_prompt_sha256
     )
     h3._require_context_ir_receipt(final_request)
+
+
+def test_context_ir_images_are_half_resolution_but_h3_keeps_full_order(
+    tmp_path: Path,
+) -> None:
+    frozen = _reference_fusion_frozen(tmp_path, dialogue=False)
+    images = tuple(
+        reference for reference in frozen.references
+        if reference.role == "reference_image"
+    )
+
+    assert len(images) == len(frozen.source_h3_request.keyframes) == 9
+    for order, (reference, (path, source_data)) in enumerate(zip(
+        images, frozen.source_h3_request.keyframes,
+    ), 1):
+        source = cv2.imdecode(
+            np.frombuffer(source_data, np.uint8), cv2.IMREAD_COLOR,
+        )
+        proxy = cv2.imdecode(
+            np.frombuffer(reference.data, np.uint8), cv2.IMREAD_COLOR,
+        )
+        assert reference.order == order
+        assert reference.name == path.name
+        assert reference.source_sha256 == hashlib.sha256(source_data).hexdigest()
+        assert reference.sha256 == hashlib.sha256(reference.data).hexdigest()
+        assert proxy.shape[:2] == (
+            (source.shape[0] + 1) // 2,
+            (source.shape[1] + 1) // 2,
+        )
+
+    assert tuple(path.name for path, _data in frozen.source_h3_request.keyframes) == (
+        tuple(reference.name for reference in images)
+    )
 
 
 def test_reference_ref2va_passes_provider_dialogue_through_unchanged(
@@ -642,7 +706,7 @@ def _reference_audio_frozen(
         workdir=tmp_path / f"{purpose}-segment-1",
         client_request_id=f"{purpose}-h3-request-1",
         prompt=prompt,
-        keyframes=((Path("01.png"), b"reference-frame-one"),),
+        keyframes=((Path("01.png"), _png(7, 9, 96)),),
         voice_texts=(),
         voice_receipt=h3.voice_texts_receipt(()),
         duration=8,
@@ -660,6 +724,7 @@ def _reference_audio_frozen(
     artifact_path, artifact_sha256 = _upstream_artifact(tmp_path)
     return context_ir_bridge.freeze_context_ir_request(
         source_h3_request=source,
+        context_ir_keyframes=_context_keyframes(source),
         upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
         upstream_artifact_path=artifact_path,
         upstream_artifact_sha256=artifact_sha256,
@@ -1069,6 +1134,7 @@ def test_completed_duplicate_has_zero_network_and_exact_input_drift_is_rejected(
     ):
         context_ir_bridge.freeze_context_ir_request(
             source_h3_request=drifted,
+            context_ir_keyframes=_context_keyframes(drifted),
             upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
             upstream_artifact_path=frozen.upstream_artifact_path,
             upstream_artifact_sha256=frozen.upstream_artifact_sha256,
@@ -1279,6 +1345,7 @@ def test_source_hash_and_compiler_markers_are_required_before_any_state_or_netwo
     ):
         context_ir_bridge.freeze_context_ir_request(
             source_h3_request=source,
+            context_ir_keyframes=_context_keyframes(source),
             upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
             upstream_artifact_path=artifact_path,
             upstream_artifact_sha256=artifact_sha256,
@@ -1298,6 +1365,7 @@ def test_upstream_dialogue_receipt_is_required_and_frozen_into_final_receipt(tmp
     ):
         context_ir_bridge.freeze_context_ir_request(
             source_h3_request=source,
+            context_ir_keyframes=_context_keyframes(source),
             upstream_dialogue_sha256="not-a-receipt",
             upstream_artifact_path=artifact_path,
             upstream_artifact_sha256=artifact_sha256,
@@ -1785,6 +1853,7 @@ def test_source_prompt_official_limit_fails_before_state_or_upload(tmp_path):
     ):
         context_ir_bridge.freeze_context_ir_request(
             source_h3_request=source,
+            context_ir_keyframes=_context_keyframes(source),
             upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
             upstream_artifact_path=artifact_path,
             upstream_artifact_sha256=artifact_sha256,

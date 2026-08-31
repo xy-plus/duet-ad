@@ -763,7 +763,11 @@ def _require_h3_boundary(request: H3Request) -> None:
     _require_speaker_timing_production_authority(request)
 
 
-def _context_ir_reference_receipt(request: H3Request) -> str:
+def _context_ir_reference_receipt(
+    request: H3Request, manifest: object,
+) -> str:
+    if not isinstance(manifest, list):
+        raise ReceiptError("context_ir_receipt_invalid")
     references: list[dict[str, Any]] = []
     image_types = {
         ".png": "image/png",
@@ -772,26 +776,45 @@ def _context_ir_reference_receipt(request: H3Request) -> str:
         ".webp": "image/webp",
     }
     audio_types = {".wav": "audio/wav", ".mp3": "audio/mpeg"}
+    expected_sources: list[dict[str, Any]] = []
     for order, (path, data) in enumerate(request.keyframes, 1):
-        references.append({
+        expected_sources.append({
             "order": order,
             "type": "image_url",
             "role": "reference_image",
             "name": path.name,
             "mime_type": image_types.get(path.suffix.lower()),
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "size": len(data),
+            "source_sha256": hashlib.sha256(data).hexdigest(),
         })
     for audio in request.reference_audios:
-        references.append({
+        expected_sources.append({
             "order": audio.order,
             "type": "audio_url",
             "role": "reference_audio",
             "name": audio.path.name,
             "mime_type": audio_types.get(audio.path.suffix.lower()),
-            "sha256": audio.sha256,
-            "size": len(audio.data),
+            "source_sha256": audio.sha256,
         })
+    if len(manifest) != len(expected_sources):
+        raise ReceiptError("context_ir_receipt_invalid")
+    for actual, expected in zip(manifest, expected_sources):
+        if (
+            not isinstance(actual, dict)
+            or set(actual) != {
+                "order", "type", "role", "name", "mime_type", "sha256",
+                "source_sha256", "size",
+            }
+            or any(actual.get(key) != value for key, value in expected.items())
+            or not _is_sha256(actual.get("sha256"))
+            or not isinstance(actual.get("size"), int)
+            or actual["size"] <= 0
+            or (
+                actual["role"] == "reference_audio"
+                and actual["sha256"] != actual["source_sha256"]
+            )
+        ):
+            raise ReceiptError("context_ir_receipt_invalid")
+        references.append(dict(actual))
     if any(item["mime_type"] is None for item in references):
         raise ReceiptError("context_ir_receipt_invalid")
     return canonical_json_sha256(references)
@@ -885,10 +908,12 @@ def _require_context_ir_receipt(request: H3Request) -> None:
     receipt_sha256 = unhashed.pop("receipt_sha256", None)
     source_prompt = receipt.get("source_prompt")
     source_prompt_sha256 = receipt.get("source_prompt_sha256")
-    references_sha256 = _context_ir_reference_receipt(request)
+    references_sha256 = _context_ir_reference_receipt(
+        request, receipt.get("reference_manifest"),
+    )
     if (
         receipt.get("schema") != "duet.context-ir.effective-prompt"
-        or receipt.get("version") != 1
+        or receipt.get("version") != 2
         or receipt.get("cid") != request.cid
         or receipt.get("client_request_id") != request.client_request_id
         or receipt.get("attempt_id") != relative.parts[0]
@@ -912,7 +937,7 @@ def _require_context_ir_receipt(request: H3Request) -> None:
             references_sha256=references_sha256,
         )
         or attempt.get("schema") != "duet.context-ir.attempt"
-        or attempt.get("version") != 1
+        or attempt.get("version") != 2
         or attempt.get("cid") != request.cid
         or attempt.get("attempt_id") != relative.parts[0]
         or attempt.get("client_request_id") != request.client_request_id

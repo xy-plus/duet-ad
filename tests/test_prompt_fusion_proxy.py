@@ -203,3 +203,76 @@ def test_h3_request_keeps_full_resolution_frames_after_fusion_proxy(
     assert request.keyframes[0][0] != root / input_payload["segments"][0][
         "new_keyframes"
     ][0]["path"]
+
+
+def test_context_ir_reuses_frozen_fusion_proxies_in_full_h3_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    source = _png(width=7, height=5, bgr=(10, 20, 30))
+    plan, meta = _fusion_fixture(root, first_frame=source)
+    input_data = long_generation.build_prompt_fusion_input(
+        root=root,
+        meta=meta,
+        plan=plan,
+        dialogue_mode="none",
+        dialogue_delivery="auto",
+    )
+    input_payload = json.loads(input_data)
+    fusion = long_generation.FrozenPromptFusion(
+        version=long_generation.PROMPT_FUSION_VERSION,
+        input_path=root / "work" / "multimodal_input.json",
+        input_data=input_data,
+        input_sha256=hashlib.sha256(input_data).hexdigest(),
+        output_path=root / "work" / "h3_prompt_plan.json",
+        output_data=b"{}\n",
+        output_sha256=hashlib.sha256(b"{}\n").hexdigest(),
+        segments=tuple(input_payload["segments"]),
+        final_prompts=("fused visual",),
+    )
+    fused_plan = replace(plan, prompt_fusion=fusion)
+    request = long_generation._request(
+        make_settings(tmp_path, autodl_art_token="art"),
+        "cid",
+        fused_plan,
+        fused_plan.segments[0],
+        "parent-request",
+        "none",
+        prepare_inputs=False,
+    )
+    monkeypatch.setattr(
+        image_optimization,
+        "half_resolution_png",
+        lambda _data: pytest.fail("Context IR must not resize Fusion proxies again"),
+    )
+
+    context_frames = long_generation._context_ir_fusion_keyframes(
+        fused_plan, fused_plan.segments[0], request,
+    )
+
+    assert tuple(path for path, _data in context_frames) == tuple(
+        path for path, _data in request.keyframes
+    )
+    assert tuple(data for _path, data in context_frames) == tuple(
+        (root / frame["path"]).read_bytes()
+        for frame in input_payload["segments"][0]["new_keyframes"]
+    )
+    assert request.keyframes[0][1] == source
+    assert context_frames[0][1] != source
+
+    swapped = list(fusion.segments[0]["new_keyframes"])
+    swapped[0], swapped[1] = swapped[1], swapped[0]
+    broken_segment = dict(fusion.segments[0])
+    broken_segment["new_keyframes"] = swapped
+    broken = replace(
+        fused_plan,
+        prompt_fusion=replace(fusion, segments=(broken_segment,)),
+    )
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_input_invalid",
+    ):
+        long_generation._context_ir_fusion_keyframes(
+            broken, broken.segments[0], request,
+        )

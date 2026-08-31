@@ -38,7 +38,7 @@ from app import error_trace, h3
 _LOGGER = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SESSION_SCHEMA = "duet.context-ir.session"
 ATTEMPT_SCHEMA = "duet.context-ir.attempt"
 RECEIPT_SCHEMA = "duet.context-ir.effective-prompt"
@@ -180,6 +180,7 @@ class FrozenContextIrReference:
     mime_type: str
     data: bytes = field(repr=False)
     sha256: str
+    source_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -978,6 +979,7 @@ def _reference_manifest(
             "name": reference.name,
             "mime_type": reference.mime_type,
             "sha256": reference.sha256,
+            "source_sha256": reference.source_sha256,
             "size": len(reference.data),
         }
         for reference in references
@@ -1136,6 +1138,7 @@ def _source_input_manifest(
 def freeze_context_ir_request(
     *,
     source_h3_request: h3.H3Request,
+    context_ir_keyframes: h3.FrozenKeyframes,
     upstream_dialogue_sha256: str,
     upstream_artifact_path: Path,
     upstream_artifact_sha256: str,
@@ -1210,17 +1213,34 @@ def freeze_context_ir_request(
         speech_markers = ()
         dialogue_tokens = fusion_voice_texts
 
+    if (
+        not isinstance(context_ir_keyframes, tuple)
+        or len(context_ir_keyframes) != len(source_h3_request.keyframes)
+    ):
+        raise ContextIrContractError("context_ir_reference_order_invalid")
     references: list[FrozenContextIrReference] = []
-    for order, (path, data) in enumerate(source_h3_request.keyframes, 1):
+    for order, (source_frame, context_frame) in enumerate(zip(
+        source_h3_request.keyframes, context_ir_keyframes,
+    ), 1):
+        source_path, source_data = source_frame
+        context_path, proxy_data = context_frame
+        if (
+            not isinstance(context_path, Path)
+            or context_path != source_path
+            or not isinstance(proxy_data, bytes)
+            or not proxy_data
+        ):
+            raise ContextIrContractError("context_ir_reference_order_invalid")
         references.append(
             FrozenContextIrReference(
                 order=order,
                 type="image_url",
                 role="reference_image",
-                name=path.name,
-                mime_type=_mime_type(path, audio=False),
-                data=data,
-                sha256=hashlib.sha256(data).hexdigest(),
+                name=source_path.name,
+                mime_type=_mime_type(source_path, audio=False),
+                data=proxy_data,
+                sha256=hashlib.sha256(proxy_data).hexdigest(),
+                source_sha256=hashlib.sha256(source_data).hexdigest(),
             )
         )
     for audio in source_h3_request.reference_audios:
@@ -1233,6 +1253,7 @@ def freeze_context_ir_request(
                 mime_type=_mime_type(audio.path, audio=True),
                 data=audio.data,
                 sha256=audio.sha256,
+                source_sha256=audio.sha256,
             )
         )
     frozen_references = tuple(references)
@@ -1318,6 +1339,16 @@ def _validate_frozen_request(request: FrozenContextIrRequest) -> None:
         raise ContextIrContractError("context_ir_request_invalid")
     expected = freeze_context_ir_request(
         source_h3_request=request.source_h3_request,
+        context_ir_keyframes=tuple(
+            (source_path, reference.data)
+            for (source_path, _source_data), reference in zip(
+                request.source_h3_request.keyframes,
+                (
+                    item for item in request.references
+                    if item.role == "reference_image"
+                ),
+            )
+        ),
         upstream_dialogue_sha256=request.upstream_dialogue_sha256,
         upstream_artifact_path=request.upstream_artifact_path,
         upstream_artifact_sha256=request.upstream_artifact_sha256,
@@ -2086,6 +2117,7 @@ def _receipt_payload(
         "skill_plan_sha256": request.skill_plan_sha256,
         "semantic_contract_sha256": request.semantic_contract_sha256,
         "references_sha256": request.references_sha256,
+        "reference_manifest": _reference_manifest(request.references),
         "voice_texts_sha256": request.voice_texts_sha256,
         "source_h3_request_sha256": request.source_h3_request_sha256,
         "upstream_dialogue_sha256": request.upstream_dialogue_sha256,
@@ -2512,6 +2544,7 @@ _RECEIPT_KEYS = frozenset(
         "skill_plan_sha256",
         "semantic_contract_sha256",
         "references_sha256",
+        "reference_manifest",
         "voice_texts_sha256",
         "source_h3_request_sha256",
         "upstream_dialogue_sha256",
@@ -2562,6 +2595,7 @@ def load_effective_prompt_receipt(
         "skill_plan_sha256": request.skill_plan_sha256,
         "semantic_contract_sha256": request.semantic_contract_sha256,
         "references_sha256": request.references_sha256,
+        "reference_manifest": _reference_manifest(request.references),
         "voice_texts_sha256": request.voice_texts_sha256,
         "source_h3_request_sha256": request.source_h3_request_sha256,
         "upstream_dialogue_sha256": request.upstream_dialogue_sha256,

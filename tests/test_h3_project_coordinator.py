@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from app import (
     context_ir_bridge, dialogue_timing, h3, h3_multimodal, h3_project,
-    long_generation, long_video,
+    image_optimization, long_generation, long_video,
     prepared_input, stitch, storage,
 )
 from app import main as main_module
@@ -1314,6 +1314,10 @@ def test_short_query_unknown_with_missing_context_attempt_never_posts(
     )
     context = h3_project.freeze_context_ir(
         source_request=request,
+        context_ir_keyframes=tuple(
+            (path, image_optimization.half_resolution_png(data))
+            for path, data in request.keyframes
+        ),
         upstream_dialogue_sha256=frozen.dialogue_sha256,
         upstream_artifact_path=frozen.receipt_path,
         upstream_artifact_sha256=frozen.receipt_sha256,
@@ -1448,6 +1452,10 @@ def test_short_submit_resumes_reconcilable_context_failure_with_same_client_and_
     )
     context = h3_project.freeze_context_ir(
         source_request=request,
+        context_ir_keyframes=tuple(
+            (path, image_optimization.half_resolution_png(data))
+            for path, data in request.keyframes
+        ),
         upstream_dialogue_sha256=frozen.dialogue_sha256,
         upstream_artifact_path=frozen.receipt_path,
         upstream_artifact_sha256=frozen.receipt_sha256,
@@ -2200,6 +2208,10 @@ def test_submission_unknown_has_zero_stitch_and_zero_followup_post(tmp_path, mon
     assert gateway.posts == []
     context = h3_project.freeze_context_ir(
         source_request=request,
+        context_ir_keyframes=tuple(
+            (path, image_optimization.half_resolution_png(data))
+            for path, data in request.keyframes
+        ),
         upstream_dialogue_sha256=frozen.dialogue_sha256,
         upstream_artifact_path=frozen.receipt_path,
         upstream_artifact_sha256=frozen.receipt_sha256,
@@ -2223,10 +2235,10 @@ def test_submission_unknown_has_zero_stitch_and_zero_followup_post(tmp_path, mon
     context_receipt = Path(str(request.context_ir_receipt_path))
     context_receipt_bytes = context_receipt.read_bytes()
     context_receipt.write_text("{}", encoding="utf-8")
-    with pytest.raises(h3.ReceiptError, match="context_ir_receipt_mismatch"):
+    with pytest.raises(h3.ReceiptError, match="context_ir_receipt_invalid"):
         h3.output_is_reusable(request)
     with _client(gateway) as client:
-        with pytest.raises(h3.ReceiptError, match="context_ir_receipt_mismatch"):
+        with pytest.raises(h3.ReceiptError, match="context_ir_receipt_invalid"):
             h3.start(request, client=client)
     assert gateway.posts == []
     context_receipt.write_bytes(context_receipt_bytes)

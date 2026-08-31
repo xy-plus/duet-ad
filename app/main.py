@@ -1487,6 +1487,10 @@ def _freeze_short_context_ir(
         raise h3_project.ProjectMultimodalError("context_ir_credential_missing")
     return h3_project.freeze_context_ir(
         source_request=source_request,
+        context_ir_keyframes=tuple(
+            (path, image_optimization.half_resolution_png(data))
+            for path, data in source_request.keyframes
+        ),
         upstream_dialogue_sha256=frozen.dialogue_sha256,
         upstream_artifact_path=frozen.receipt_path,
         upstream_artifact_sha256=frozen.receipt_sha256,
