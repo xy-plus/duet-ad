@@ -492,6 +492,156 @@ def output_is_reusable(
         return False
 
 
+def terminal_output_is_valid(root: Path) -> bool:
+    """Validate an immutable completed stitch without reopening upstream schemas."""
+    try:
+        root = Path(root).resolve()
+        output = root / "generated.mp4"
+        receipt_path = root / RECEIPT_FILENAME
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema", "version", "segments", "audio", "output"}
+            or payload.get("schema") != "duet.stitch"
+            or payload.get("version") not in {1, 2}
+        ):
+            return False
+        segments = payload.get("segments")
+        if not isinstance(segments, list) or not segments:
+            return False
+        requested_duration = 0.0
+        for index, segment in enumerate(segments, 1):
+            if (
+                not isinstance(segment, dict)
+                or set(segment) != {
+                    "index", "path", "sha256", "target_duration_s",
+                    "output_frames", "join_mode",
+                }
+                or segment.get("index") != index
+                or segment.get("join_mode") not in {"continue", "hard_cut"}
+                or isinstance(segment.get("output_frames"), bool)
+                or not isinstance(segment.get("output_frames"), int)
+                or segment["output_frames"] <= 0
+            ):
+                return False
+            target_duration = float(segment.get("target_duration_s"))
+            if not math.isfinite(target_duration) or not (
+                0 < target_duration <= MAX_SEGMENT_DURATION_S
+            ):
+                return False
+            expected_path = (
+                root / "work" / "segments" / str(index) / "generated.mp4"
+            )
+            path = Path(segment.get("path", ""))
+            if (
+                path.resolve() != expected_path.resolve()
+                or not path.is_file()
+                or path.is_symlink()
+                or segment.get("sha256") != _sha256(path)
+            ):
+                return False
+            requested_duration += target_duration
+        audio = payload.get("audio")
+        version = payload["version"]
+        expected_audio_keys = {
+            "mode", "source", "source_sha256", "source_has_audio",
+            *({"provider_segments", "edl"} if version == 2 else set()),
+        }
+        if (
+            not isinstance(audio, dict)
+            or set(audio) != expected_audio_keys
+            or audio.get("mode")
+            != ("provider_generated" if version == 2 else "mute")
+            or not isinstance(audio.get("source_has_audio"), bool)
+        ):
+            return False
+        source = Path(audio.get("source", ""))
+        if (
+            source.parent.resolve() != root
+            or not source.name.startswith("source.")
+            or not source.is_file()
+            or source.is_symlink()
+            or audio.get("source_sha256") != _sha256(source)
+        ):
+            return False
+        if version == 2:
+            provider_segments = audio.get("provider_segments")
+            if (
+                not isinstance(provider_segments, list)
+                or len(provider_segments) != len(segments)
+            ):
+                return False
+            for provider in provider_segments:
+                if (
+                    not isinstance(provider, dict)
+                    or set(provider) != {
+                        "attempt_id", "decoded_audio_sha256",
+                        "media_timeline_sha256", "source",
+                    }
+                    or provider.get("source") != "h3"
+                    or not isinstance(provider.get("media_timeline_sha256"), str)
+                    or len(provider["media_timeline_sha256"]) != 64
+                    or any(
+                        char not in "0123456789abcdef"
+                        for char in provider["media_timeline_sha256"]
+                    )
+                    or (
+                        provider.get("decoded_audio_sha256") is not None
+                        and (
+                            not isinstance(provider["decoded_audio_sha256"], str)
+                            or len(provider["decoded_audio_sha256"]) != 64
+                            or any(
+                                char not in "0123456789abcdef"
+                                for char in provider["decoded_audio_sha256"]
+                            )
+                        )
+                    )
+                    or not isinstance(provider.get("attempt_id"), str)
+                    or not provider["attempt_id"]
+                ):
+                    return False
+            if audio.get("edl") != {
+                "schema": "duet.av-edl",
+                "version": 1,
+                "fps": FPS,
+                "interval": "integer-half-open",
+            }:
+                return False
+        bound_output = payload.get("output")
+        stat = output.stat()
+        if (
+            not output.is_file()
+            or output.is_symlink()
+            or stat.st_size <= 0
+            or not isinstance(bound_output, dict)
+            or set(bound_output) != {"name", "sha256", "size", "duration_s", "fps"}
+            or bound_output.get("name") != output.name
+            or bound_output.get("sha256") != _sha256(output)
+            or bound_output.get("size") != stat.st_size
+            or bound_output.get("fps") != FPS
+        ):
+            return False
+        info = _validate_output(
+            output,
+            requested_duration,
+            audio["mode"],
+            audio["source_has_audio"],
+        )
+        receipt_duration = float(bound_output.get("duration_s"))
+        return math.isfinite(receipt_duration) and abs(
+            receipt_duration - info.duration_s
+        ) <= FRAME_DURATION_S + 1e-6
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        StitchError,
+    ):
+        return False
+
+
 def stitch_video(
     *,
     segments: Sequence[StitchSegment],

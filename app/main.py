@@ -2152,6 +2152,31 @@ def _long_validation_paths(
     return paths
 
 
+def _terminal_stitch_validation_paths(cdir: Path) -> set[Path]:
+    paths = {cdir / "generated.mp4", cdir / stitch.RECEIPT_FILENAME}
+    try:
+        payload = json.loads(
+            (cdir / stitch.RECEIPT_FILENAME).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return paths
+    if not isinstance(payload, Mapping):
+        return paths
+    audio = payload.get("audio")
+    if isinstance(audio, Mapping):
+        source = audio.get("source")
+        if isinstance(source, str):
+            paths.add(Path(source))
+    segments = payload.get("segments")
+    if isinstance(segments, list):
+        paths.update(
+            Path(item["path"])
+            for item in segments
+            if isinstance(item, Mapping) and isinstance(item.get("path"), str)
+        )
+    return paths
+
+
 def _speaker_timing_fingerprint_entries(
     cdir: Path, meta: Mapping[str, object],
 ) -> list[dict[str, object]]:
@@ -2354,30 +2379,13 @@ def _generated_video_validation_fingerprint(
         if _uses_segment_coordinator(meta):
             binding = {
                 "id": meta.get("id"),
-                "duration_s": meta.get("duration_s"),
-                "fit_mode": meta.get("fit_mode"),
-                "aspect_ratio": meta.get("aspect_ratio"),
-                "resolution": meta.get("resolution"),
-                "dialogue_mode": meta.get("dialogue_mode"),
-                "dialogue_delivery": meta.get("dialogue_delivery"),
-                "resolved_dialogue_delivery": meta.get(
-                    "resolved_dialogue_delivery"
-                ),
-                "has_bgm": meta.get("has_bgm"),
-                "voice_line_provenance": meta.get("voice_line_provenance"),
-                "segments": meta.get("segments"),
-                "postprocess": meta.get("postprocess"),
-                "frozen_plan_receipt": meta.get("frozen_plan_receipt"),
-                "long_video_plan_receipt": meta.get("long_video_plan_receipt"),
-                "generation": generation_binding,
-                "speaker_timing": _speaker_timing_fingerprint_entries(
-                    cdir, meta
-                ),
-                "prompt_fusion": _prompt_fusion_fingerprint_entries(
-                    cdir, meta
+                "generation_status": (
+                    generation.get("status")
+                    if isinstance(generation, Mapping)
+                    else None
                 ),
             }
-            paths = _long_validation_paths(cdir, meta, settings)
+            paths = _terminal_stitch_validation_paths(cdir)
         else:
             binding = {
                 "id": meta.get("id"),
@@ -2561,74 +2569,11 @@ def _validate_generated_video_uncached(settings: Settings, meta: dict) -> bool:
     if not isinstance(cid, str):
         return False
     if _uses_segment_coordinator(meta):
-        immutable_multimodal_intent = _long_receipt_multimodal_intent(
-            settings.data_dir / cid, meta
-        )
-        expected = meta.get("frozen_plan_receipt")
-        if (
-            isinstance(expected, str)
-            and long_generation.generation_segments_are_valid(
-                meta.get("segments"), generation
-            )
-        ):
-            try:
-                plan = long_generation.freeze_plan(
-                    settings.data_dir / cid,
-                    meta,
-                    expected,
-                    meta.get("fit_mode"),
-                    meta.get("dialogue_mode"),
-                    dialogue_delivery=meta.get(
-                        "dialogue_delivery", "auto"
-                    ),
-                    prepare_fit=False,
-                    settings=settings,
-                )
-                legacy_fusion_read = (
-                    plan.prompt_fusion is not None
-                    and plan.prompt_fusion.version
-                    == long_generation.PROMPT_FUSION_LEGACY_VERSION
-                )
-                reusable = (
-                    frozenset(item.index for item in plan.segments)
-                    if legacy_fusion_read
-                    else long_generation.bound_reusable_segment_indices(
-                        settings, cid, plan, generation
-                    )
-                )
-                provider_media = (
-                    long_generation.bound_h3_native_media(
-                        settings,
-                        cid,
-                        plan,
-                        generation,
-                        legacy_terminal_read=legacy_fusion_read,
-                    )
-                    if generation.get("audio_route")
-                    == long_generation.H3_NATIVE_AUDIO_ROUTE
-                    else None
-                )
-                stitched_reusable = (
-                    long_generation.stitched_output_is_reusable(
-                        plan,
-                        meta.get("dialogue_mode"),
-                        generation=generation,
-                        provider_media=provider_media,
-                    )
-                    if provider_media is not None
-                    else long_generation.stitched_output_is_reusable(
-                        plan, meta.get("dialogue_mode")
-                    )
-                )
-                if (
-                    reusable == frozenset(item.index for item in plan.segments)
-                    and stitched_reusable
-                ):
-                    return True
-            except long_generation.LongGenerationError:
-                pass
-        if immutable_multimodal_intent is not False:
-            return False
+        # A completed stitch receipt is the terminal authority.  Upstream
+        # Context/H3 schemas may evolve, but cannot revoke an already-published
+        # output whose exact segment bytes, source bytes and final media still
+        # match the immutable stitch receipt.
+        return stitch.terminal_output_is_valid(settings.data_dir / cid)
     else:
         try:
             request = _load_h3_request(settings, cid, meta)
@@ -2671,14 +2616,7 @@ def _resume_generation(settings: Settings, cid: str) -> None:
     generation = meta.get("generation")
     if not isinstance(generation, dict):
         return
-    recovering_missing_output = (
-        generation.get("status") == "succeeded"
-        and not _has_valid_generated_video(settings, meta)
-    )
-    if (
-        generation.get("status") not in _GENERATION_ACTIVE
-        and not recovering_missing_output
-    ):
+    if generation.get("status") not in _GENERATION_ACTIVE:
         return
     if _is_legacy_generation_contract(generation):
         storage.update_meta(
@@ -2734,6 +2672,8 @@ def _resume_long_generation(settings: Settings, cid: str) -> None:
     meta = storage.load_meta(settings.data_dir, cid)
     generation = meta.get("generation") if meta else None
     if not isinstance(generation, dict) or not isinstance(generation.get("segments"), list):
+        return
+    if generation.get("status") == "succeeded":
         return
     if not long_generation.generation_segments_are_valid(
         meta.get("segments"), generation
@@ -3949,13 +3889,7 @@ def create_app(settings: Settings) -> FastAPI:
                 if (
                     meta.get("schema_version") == 2
                     and isinstance(generation, dict)
-                    and (
-                        generation.get("status") in _GENERATION_ACTIVE
-                        or (
-                            generation.get("status") == "succeeded"
-                            and not _has_valid_generated_video(settings, meta)
-                        )
-                    )
+                    and generation.get("status") in _GENERATION_ACTIVE
                 ):
                     target = (
                         _resume_long_generation

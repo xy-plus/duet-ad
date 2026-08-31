@@ -38,7 +38,7 @@ def test_h3_recovery_validation_does_not_block_application_startup(
         settings.data_dir,
         cid,
         generation={
-            "status": "succeeded",
+            "status": "running",
             "error": None,
             "attempt": 1,
             "client_request_id": REQUEST_ID,
@@ -48,20 +48,17 @@ def test_h3_recovery_validation_does_not_block_application_startup(
     validation_entered = threading.Event()
     release_validation = threading.Event()
 
-    def blocked_validation(_settings, _meta):
+    def blocked_resume(_settings, _cid):
         validation_entered.set()
         assert release_validation.wait(timeout=2)
-        return True
 
-    monkeypatch.setattr(
-        main_module, "_has_valid_generated_video", blocked_validation
-    )
+    monkeypatch.setattr(main_module, "_resume_generation", blocked_resume)
     try:
         with TestClient(create_app(settings)) as client:
             assert validation_entered.wait(timeout=1)
             assert client.get("/api/health").json() == {"ok": True}
             assert any(
-                thread.name == "h3-recovery-scan" and thread.is_alive()
+                thread.name == f"h3-resume-{cid[:8]}" and thread.is_alive()
                 for thread in client.app.state.h3_resume_threads
             )
             release_validation.set()
@@ -69,6 +66,38 @@ def test_h3_recovery_validation_does_not_block_application_startup(
                 thread.join(timeout=2)
     finally:
         release_validation.set()
+
+
+def test_startup_never_revalidates_or_downgrades_succeeded_generation(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path, enable_h3_submit=True)
+    cid, _ = _make_conv(settings)
+    generation = {
+        "status": "succeeded",
+        "error": None,
+        "attempt": 1,
+        "client_request_id": REQUEST_ID,
+        "stage": "stitch",
+    }
+    storage.update_meta(settings.data_dir, cid, generation=generation)
+    monkeypatch.setattr(
+        main_module,
+        "_has_valid_generated_video",
+        lambda *_args: pytest.fail("terminal success must not be startup-scanned"),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_resume_generation",
+        lambda *_args: pytest.fail("terminal success must not be resumed"),
+    )
+
+    with TestClient(create_app(settings)) as client:
+        assert client.get("/api/health").json() == {"ok": True}
+        for thread in client.app.state.h3_resume_threads:
+            thread.join(timeout=2)
+
+    assert storage.load_meta(settings.data_dir, cid)["generation"] == generation
 
 
 def test_auto_dialogue_keeps_only_verified_spoken_but_manual_modes_are_verbatim() -> None:

@@ -177,6 +177,41 @@ def test_provider_generated_stitch_supports_native_then_missing_audio_segment(
     )
 
 
+def test_terminal_stitch_validation_ignores_upstream_schema_but_binds_media(
+    tmp_path,
+):
+    root = tmp_path / "conversation"
+    segment = root / "work" / "segments" / "1" / "generated.mp4"
+    source = root / "source.mp4"
+    output = root / "generated.mp4"
+    segment.parent.mkdir(parents=True)
+    _make_video(segment, "red", 1.0, codec="libx264", rate=24, audio=True)
+    _make_video(source, "black", 1.0, codec="libx264", rate=24, audio=True)
+    stitch.stitch_video(
+        segments=[stitch.StitchSegment(
+            segment, 1.0, "hard_cut", "000001", _native_audio_timeline(),
+        )],
+        source_video=source,
+        output=output,
+        audio_mode="provider_generated",
+    )
+    upstream = segment.parent / ".context-ir" / "receipt.json"
+    upstream.parent.mkdir()
+    upstream.write_text('{"version":1}', encoding="utf-8")
+
+    assert stitch.terminal_output_is_valid(root)
+    upstream.write_text('{"version":999}', encoding="utf-8")
+    assert stitch.terminal_output_is_valid(root)
+
+    original = segment.read_bytes()
+    segment.write_bytes(original + b"tampered")
+    assert not stitch.terminal_output_is_valid(root)
+    segment.write_bytes(original)
+    assert stitch.terminal_output_is_valid(root)
+    output.write_bytes(output.read_bytes() + b"tampered")
+    assert not stitch.terminal_output_is_valid(root)
+
+
 def test_provider_generated_stitch_fills_missing_h3_audio_on_same_edl(
     tmp_path,
 ):
