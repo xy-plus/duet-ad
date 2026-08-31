@@ -4,6 +4,8 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 from app import (
@@ -11,6 +13,7 @@ from app import (
     dialogue_delivery,
     h3,
     h3_project,
+    image_optimization,
     long_generation,
     long_video,
     main,
@@ -22,6 +25,16 @@ from conftest import make_settings
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _test_png(label: str) -> bytes:
+    digest = hashlib.sha256(label.encode()).digest()
+    image = np.full((5, 7, 3), tuple(digest[:3]), dtype=np.uint8)
+    ok, encoded = cv2.imencode(
+        ".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 3],
+    )
+    assert ok
+    return encoded.tobytes()
 
 
 def _freeze_current_skill_milestone(root: Path):
@@ -582,7 +595,7 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
         [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0], 1
     ):
         path = keyframe_dir / f"{order:02d}.png"
-        data = f"frame-{order}".encode()
+        data = _test_png(f"frame-{order}")
         path.write_bytes(data)
         keyframes.append((path, data))
         sources.append({
@@ -659,10 +672,14 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
     ))
 
     assert payload["version"] == long_generation.VISUAL_PROMPT_FUSION_VERSION
+    frame_4_proxy = image_optimization.half_resolution_png(
+        _test_png("frame-4")
+    )
+    frame_4_sha256 = hashlib.sha256(frame_4_proxy).hexdigest()
     assert payload["segments"][0]["new_keyframes"][3] == {
         "order": 4,
-        "path": "work/segments/1/work/keyframes/04.png",
-        "sha256": hashlib.sha256(b"frame-4").hexdigest(),
+        "path": f"work/prompt-fusion-proxies/{frame_4_sha256}.png",
+        "sha256": frame_4_sha256,
         "segment_time_s": 2.5,
         "source_scene_id": "SCENE_02",
         "transition": {"type": "hard_cut", "at_segment_s": 2.267},
@@ -728,7 +745,7 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
                 if segment_index > 1 and order == 1
                 else local_time
             )
-            data = f"segment-{segment_index}-source-{order}".encode()
+            data = _test_png(f"segment-{segment_index}-source-{order}")
             raw_name = f"frames/{order:03d}.png"
             (segwork / raw_name).write_bytes(data)
             name = f"{order:02d}.png"
@@ -834,10 +851,14 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
         source = bound[1]["keyframe_sources"][0]
         compiled = input_payload["segments"][1]["new_keyframes"][0]
         assert source["source_time_s"] == 10.033333
-        assert compiled["path"].endswith("/segments/2/work/keyframes/01.png")
-        assert compiled["sha256"] == hashlib.sha256(
-            b"segment-2-source-1"
-        ).hexdigest()
+        expected_proxy = image_optimization.half_resolution_png(
+            _test_png("segment-2-source-1")
+        )
+        expected_sha256 = hashlib.sha256(expected_proxy).hexdigest()
+        assert compiled["path"] == (
+            f"work/prompt-fusion-proxies/{expected_sha256}.png"
+        )
+        assert compiled["sha256"] == expected_sha256
         assert compiled["source_scene_id"] == source["source_scene_id"]
     assert "source_time_s" not in input_data.decode("utf-8")
     assert '"at_s"' not in input_data.decode("utf-8")
@@ -921,7 +942,7 @@ def _audio_compile_fixture(
         for order in range(1, 10):
             path = segment_work / "postprocessed" / f"{order:02d}.png"
             path.parent.mkdir(parents=True, exist_ok=True)
-            data = f"segment-{index}-frame-{order}".encode()
+            data = _test_png(f"segment-{index}-frame-{order}")
             path.write_bytes(data)
             frames.append((path, data))
             prompt = f"optimization {index}-{order}"

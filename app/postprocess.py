@@ -3115,16 +3115,16 @@ async def retry_segment(settings: Settings, cid: str, index: int, payload: dict,
 
 
 def _v4_canvas_execution_for_h3(
-    settings: Settings | None, cdir: Path, meta: dict, private: dict, originals: list[Path],
+    settings: Settings | None,
+    cdir: Path,
+    meta: dict,
+    private: dict,
+    originals: dict[tuple[int, int], Path],
 ) -> tuple[dict, dict[tuple[int, int], Path]]:
     """Rebuild the only legal v4 canvas source map from terminal MediaKit receipts."""
     combined = private["options"]["remove_subtitle"] or private["options"]["remove_brand"]
     if not combined:
-        return private, {
-            (0 if len(path.resolve().relative_to(cdir / "work").parts) == 2
-             else int(path.resolve().relative_to(cdir / "work").parts[1]), int(path.stem)): path
-            for path in originals
-        }
+        return private, dict(originals)
     if settings is None:
         raise PostprocessError(409, "postprocess_artifacts_invalid")
     raw = meta.get("_v4_canvas_execution")
@@ -3144,12 +3144,7 @@ def _v4_canvas_execution_for_h3(
         or not isinstance(raw.get("derived_optimization"), dict)
     ):
         raise PostprocessError(409, "postprocess_artifacts_invalid")
-    raw_sources = {}
-    work = (cdir / "work").resolve()
-    for path in originals:
-        relative = path.resolve().relative_to(work)
-        index = 0 if len(relative.parts) == 2 else int(relative.parts[1])
-        raw_sources[(index, int(path.stem))] = path
+    raw_sources = dict(originals)
     expected_records = []
     canvas_sources = {}
     for index, frame_index in sorted(raw_sources):
@@ -3225,7 +3220,10 @@ def _v4_canvas_execution_for_h3(
 
 
 def _validate_mediakit_only_outputs(
-    cdir: Path, private: dict, originals: list[Path], selected: list[Path],
+    cdir: Path,
+    private: dict,
+    originals: list[tuple[int, int, Path]],
+    selected: list[Path],
 ) -> None:
     """Keep MediaKit-only H3 reuse bound to its durable provider receipts."""
     if private["options"]["optimize_image"]:
@@ -3236,11 +3234,10 @@ def _validate_mediakit_only_outputs(
     ]
     if not any(enabled for _stage, _scene, enabled in stages):
         return
-    work = (cdir / "work").resolve()
     try:
-        for original, canonical in zip(originals, selected):
-            relative = original.resolve().relative_to(work)
-            index = 0 if len(relative.parts) == 2 else int(relative.parts[1])
+        for (index, _frame_index, original), canonical in zip(
+            originals, selected, strict=True,
+        ):
             current = original
             for stage, scene, enabled in stages:
                 if not enabled:
@@ -3325,9 +3322,11 @@ def _v4_user_acceptance_receipt(settings: Settings, cid: str, meta: dict) -> dic
             or post.get("frames") != expected_refs
         ):
             raise ValueError
-        originals = [
-            source for index in sorted(grouped) for source, _output in grouped[index]
-        ]
+        originals = {
+            (index, frame_index): source
+            for index in sorted(grouped)
+            for frame_index, (source, _output) in enumerate(grouped[index], 1)
+        }
         outputs = [
             output for index in sorted(grouped) for _source, output in grouped[index]
         ]
@@ -3548,26 +3547,28 @@ def generation_keyframes(
     frame_refs = state.get("frames")
     if not isinstance(frame_refs, list) or any(not isinstance(item, str) for item in frame_refs):
         raise PostprocessError(409, "postprocess_artifacts_invalid")
-    selected = []
-    expected_refs = []
-    work = cdir.resolve() / "work"
+    selected: list[Path] = []
+    expected_refs: list[str] = []
+    identified_originals: list[tuple[int, int, Path]] = []
+    grouped = _group_targets(cdir, meta)
+    authority: dict[Path, tuple[int, int, Path, str]] = {}
+    for index in sorted(grouped):
+        for frame_index, (source, output) in enumerate(grouped[index], 1):
+            resolved = source.resolve()
+            if resolved in authority:
+                raise PostprocessError(409, "postprocess_artifacts_invalid")
+            authority[resolved] = (
+                index, frame_index, output, _frame_ref(index, source.name),
+            )
     for original in originals:
         source = original.resolve()
-        try:
-            relative = source.relative_to(work)
-        except ValueError:
-            raise PostprocessError(409, "postprocess_artifacts_invalid") from None
-        parts = relative.parts
-        if len(parts) == 2 and parts[0] == "keyframes":
-            output, ref = work / "postprocessed" / source.name, source.name
-        elif len(parts) == 5 and parts[0] == "segments" and parts[1].isdigit() \
-                and parts[2:4] == ("work", "keyframes"):
-            output = work / "segments" / parts[1] / "work" / "postprocessed" / source.name
-            ref = f"segments/{parts[1]}/work/postprocessed/{source.name}"
-        else:
+        bound = authority.get(source)
+        if bound is None:
             raise PostprocessError(409, "postprocess_artifacts_invalid")
+        index, frame_index, output, ref = bound
         if not output.is_file():
             raise PostprocessError(409, "postprocess_artifacts_invalid")
+        identified_originals.append((index, frame_index, source))
         expected_refs.append(ref)
         selected.append(output)
     # The public postprocess manifest is an ordered frozen input contract for
@@ -3628,7 +3629,9 @@ def generation_keyframes(
         # `_postprocess_receipt` is immutable start intent.  Do not let a
         # deleted image receipt or a copied PNG downgrade a media-only job.
         media_private = _private_receipt(meta)
-        _validate_mediakit_only_outputs(cdir, media_private, originals, selected)
+        _validate_mediakit_only_outputs(
+            cdir, media_private, identified_originals, selected,
+        )
     except PostprocessError:
         raise PostprocessError(409, "postprocess_artifacts_invalid") from None
     if expected_v3:
@@ -3657,9 +3660,9 @@ def generation_keyframes(
             ):
                 raise ValueError
             expected_frames = []
-            for original, output in zip(originals, selected):
-                relative = original.resolve().relative_to(work)
-                segment_index = 0 if len(relative.parts) == 2 else int(relative.parts[1])
+            for (segment_index, _frame_index, original), output in zip(
+                identified_originals, selected, strict=True,
+            ):
                 if not _valid_png(output, original):
                     raise ValueError
                 expected_frames.append({

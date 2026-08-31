@@ -47,7 +47,6 @@ from pathlib import Path
 from typing import NoReturn
 
 import cv2
-import numpy as np
 
 from app import asr, codex_output_schemas, dialogue_review, error_trace, frame_fit, generation_config, h3, h3_project, image_optimization, long_generation, long_video, mediakit, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
 from app.codex_runner import (
@@ -756,30 +755,6 @@ def _materialize_skill_bytes(destination: Path, data: bytes) -> None:
         raise PipelineError("frozen Skill stage is invalid") from None
 
 
-def _analysis_keyframe_proxy(data: bytes) -> bytes:
-    """Create the sole half-size PNG representation used by visual analyzers."""
-    if not isinstance(data, bytes) or not data:
-        raise PipelineError("analysis keyframe source is invalid")
-    image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if image is None or image.size == 0:
-        raise PipelineError("analysis keyframe source is invalid")
-    height, width = image.shape[:2]
-    resized = cv2.resize(
-        image,
-        (
-            max(1, (width + 1) // 2),
-            max(1, (height + 1) // 2),
-        ),
-        interpolation=cv2.INTER_AREA,
-    )
-    encoded, proxy = cv2.imencode(
-        ".png", resized, [cv2.IMWRITE_PNG_COMPRESSION, 3]
-    )
-    if not encoded:
-        raise PipelineError("analysis keyframe proxy is invalid")
-    return proxy.tobytes()
-
-
 def _reject_project_index(reason: str, field_path: str) -> NoReturn:
     raise CodexOutputValidationError(
         reason, field_path, message="project index output is invalid",
@@ -1002,7 +977,14 @@ def _generate_project_element_index(
             )
             destination.mkdir(parents=True)
             for frame_order, source in enumerate(frame_paths[segment_index], 1):
-                data = _analysis_keyframe_proxy(source.read_bytes())
+                try:
+                    data = image_optimization.half_resolution_png(
+                        source.read_bytes()
+                    )
+                except ValueError:
+                    raise PipelineError(
+                        "analysis keyframe source is invalid"
+                    ) from None
                 relative = Path(
                     "work", "segments", str(segment_index), "keyframes",
                     f"{frame_order:02d}.png",
@@ -1246,9 +1228,14 @@ def _run_visual_codex(
         stage_keyframes = stage_work / "keyframes"
         stage_keyframes.mkdir(mode=0o700)
         for order, data in enumerate(analysis_keyframes, 1):
+            try:
+                proxy = image_optimization.half_resolution_png(data)
+            except ValueError:
+                raise PipelineError(
+                    "analysis keyframe source is invalid"
+                ) from None
             _materialize_skill_bytes(
-                stage_keyframes / f"{order:02d}.png",
-                _analysis_keyframe_proxy(data),
+                stage_keyframes / f"{order:02d}.png", proxy,
             )
 
         def validate(raw_output: bytes) -> str:

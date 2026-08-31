@@ -496,6 +496,34 @@ def test_v4_manual_acceptance_receipt_enables_h3_without_image_verification(
     ) == sorted((cdir / "work" / "postprocessed").glob("*.png"))
 
 
+def test_v4_acceptance_uses_grouped_frame_keys_for_private_canvas_paths(
+    tmp_path,
+):
+    cdir = tmp_path / "conversation"
+    canvases = cdir / "work" / ".postprocess-private" / "v4-canvases"
+    first = canvases / "0001" / "brand" / "01.png"
+    second = canvases / "0002" / "brand" / "01.png"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_bytes(PNG)
+    second.write_bytes(PNG)
+    grouped = {(1, 1): first, (2, 1): second}
+    private = {
+        "options": {
+            "remove_subtitle": False,
+            "remove_brand": False,
+            "optimize_image": True,
+        },
+    }
+
+    effective, sources = postprocess._v4_canvas_execution_for_h3(
+        None, cdir, {}, private, grouped,
+    )
+
+    assert effective is private
+    assert sources == grouped
+
+
 def _assert_off_screen_fusion_bootstraps_then_enters_context_h3(
     tmp_path, monkeypatch, segment_count, *, postprocess_options=None,
     historical_pre_unification=False, forbid_legacy_short=False,

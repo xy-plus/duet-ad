@@ -16,6 +16,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from app import codex_output_schemas, error_trace
 from app.codex_runner import CodexError
@@ -34,6 +35,27 @@ MIN_ELEMENT_INDEX_BYTES = 256 * 1024
 ELEMENT_INDEX_BASE_BYTES = 64 * 1024
 ELEMENT_INDEX_PER_FRAME_BYTES = 16 * 1024
 MAX_PROJECT_OUTPUT_OVERHEAD_BYTES = 64 * 1024
+
+
+def half_resolution_png(data: bytes) -> bytes:
+    """Return the deterministic half-size PNG used by visual model inputs."""
+    if not isinstance(data, bytes) or not data:
+        raise ValueError("analysis image source is invalid")
+    image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None or image.size == 0:
+        raise ValueError("analysis image source is invalid")
+    height, width = image.shape[:2]
+    resized = cv2.resize(
+        image,
+        (max(1, (width + 1) // 2), max(1, (height + 1) // 2)),
+        interpolation=cv2.INTER_AREA,
+    )
+    encoded, proxy = cv2.imencode(
+        ".png", resized, [cv2.IMWRITE_PNG_COMPRESSION, 3]
+    )
+    if not encoded:
+        raise ValueError("analysis image proxy is invalid")
+    return proxy.tobytes()
 
 
 def element_index_max_bytes(frame_count: int) -> int:

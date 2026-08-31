@@ -22,6 +22,7 @@ from app import (
     frame_fit,
     h3,
     h3_project,
+    image_optimization,
     long_video,
     postprocess,
     prepared_input,
@@ -64,6 +65,7 @@ PROMPT_FUSION_VERSION = 2
 VISUAL_PROMPT_FUSION_VERSION = PROMPT_FUSION_VERSION
 PROMPT_FUSION_MANIFEST_SCHEMA = "duet.video-prompt-fusion-production"
 PROMPT_FUSION_MANIFEST_VERSION = 1
+PROMPT_FUSION_PROXY_DIR = "prompt-fusion-proxies"
 RELATION_STATES_OPEN = "<RELATION_STATES_JSON>"
 RELATION_STATES_CLOSE = "</RELATION_STATES_JSON>"
 CUT_TIMELINE_OPEN = "<CUT_TIMELINE_JSON>"
@@ -1952,6 +1954,55 @@ def _atomic_bytes(path: Path, data: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _publish_prompt_fusion_proxy(root: Path, data: bytes) -> tuple[Path, str]:
+    """Publish one immutable content-addressed Fusion analysis image."""
+    digest = hashlib.sha256(data).hexdigest()
+    work = root / "work"
+    directory = work / PROMPT_FUSION_PROXY_DIR
+    if work.is_symlink():
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    try:
+        directory.mkdir(mode=0o700, parents=False, exist_ok=True)
+        if directory.is_symlink() or directory.resolve() != directory:
+            raise OSError
+    except OSError:
+        raise LongGenerationError("prompt_fusion_input_invalid") from None
+    path = directory / f"{digest}.png"
+    if path.exists() or path.is_symlink():
+        try:
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+                raise OSError
+        except OSError:
+            raise LongGenerationError("prompt_fusion_input_invalid") from None
+        return path, digest
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{digest}.", suffix=".tmp", dir=directory,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+                raise OSError
+        descriptor = os.open(
+            directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise LongGenerationError("prompt_fusion_input_invalid") from None
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path, digest
+
+
 def build_prompt_fusion_input(
     *, root: Path, meta: Mapping, plan: FrozenPlan,
     dialogue_mode: str, dialogue_delivery: str,
@@ -2034,10 +2085,19 @@ def build_prompt_fusion_input(
                 != hashlib.sha256(data).hexdigest()
             ):
                 raise LongGenerationError("prompt_fusion_input_invalid")
+            try:
+                proxy_data = image_optimization.half_resolution_png(data)
+            except ValueError:
+                raise LongGenerationError(
+                    "prompt_fusion_input_invalid"
+                ) from None
+            proxy_path, proxy_sha256 = _publish_prompt_fusion_proxy(
+                root, proxy_data,
+            )
             binding = {
                 "order": order,
-                "path": relative,
-                "sha256": hashlib.sha256(data).hexdigest(),
+                "path": proxy_path.relative_to(root).as_posix(),
+                "sha256": proxy_sha256,
             }
             if fusion_version == PROMPT_FUSION_VERSION:
                 source = segment.keyframe_sources[order - 1]
@@ -3334,14 +3394,14 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
         raise LongGenerationError("long_video_plan_invalid")
 
     project_selected_paths: dict[int, tuple[Path, ...]] = {}
-    frozen_fusion_frame_data: dict[Path, bytes] = {}
+    frozen_fusion_proxy_data: dict[int, tuple[bytes, ...]] = {}
     if workflow in h3.H3_REFERENCE_WORKFLOWS:
         if frozen_fusion is not None:
             for index, fusion_segment in enumerate(frozen_fusion.segments, 1):
                 frames = fusion_segment.get("new_keyframes")
                 if not isinstance(frames, list) or len(frames) != 9:
                     raise LongGenerationError("prompt_fusion_input_invalid")
-                selected_paths: list[Path] = []
+                proxies: list[bytes] = []
                 for order, frame in enumerate(frames, 1):
                     expected_keys = (
                         {"order", "path", "sha256"}
@@ -3366,38 +3426,58 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                         raise LongGenerationError(
                             "prompt_fusion_input_invalid"
                         ) from None
-                    selected_paths.append(resolved)
-                    frozen_fusion_frame_data[resolved] = data
-                project_selected_paths[index] = tuple(selected_paths)
-        else:
-            project_originals: list[Path] = []
-            project_counts: list[int] = []
-            for raw in raw_segments:
-                keys = raw.get("keyframes") if isinstance(raw, Mapping) else None
-                if not isinstance(keys, list) or not 1 <= len(keys) <= 9:
-                    raise LongGenerationError("long_video_plan_invalid")
-                originals = [_bound_path(root, artifact) for artifact in keys]
-                project_originals.extend(originals)
-                project_counts.append(len(originals))
-            try:
-                selected_project = postprocess.generation_keyframes(
-                    root, dict(meta), project_originals, settings=settings,
-                )
-            except postprocess.PostprocessError as exc:
-                detail = (
-                    exc.detail
-                    if isinstance(exc.detail, str)
-                    else exc.detail["code"]
-                )
-                raise LongGenerationError(detail, exc.status) from None
-            if len(selected_project) != len(project_originals):
-                raise LongGenerationError("postprocess_artifacts_invalid")
-            cursor = 0
-            for index, count in enumerate(project_counts, 1):
-                project_selected_paths[index] = tuple(
-                    selected_project[cursor:cursor + count]
-                )
-                cursor += count
+                    expected_proxy = (
+                        root / "work" / PROMPT_FUSION_PROXY_DIR
+                        / f"{frame['sha256']}.png"
+                    )
+                    if resolved != expected_proxy:
+                        raise LongGenerationError(
+                            "prompt_fusion_input_invalid"
+                        )
+                    proxies.append(data)
+                frozen_fusion_proxy_data[index] = tuple(proxies)
+        project_originals: list[Path] = []
+        project_counts: list[int] = []
+        for raw in raw_segments:
+            keys = raw.get("keyframes") if isinstance(raw, Mapping) else None
+            if not isinstance(keys, list) or not 1 <= len(keys) <= 9:
+                raise LongGenerationError("long_video_plan_invalid")
+            originals = [_bound_path(root, artifact) for artifact in keys]
+            project_originals.extend(originals)
+            project_counts.append(len(originals))
+        try:
+            selected_project = postprocess.generation_keyframes(
+                root, dict(meta), project_originals, settings=settings,
+            )
+        except postprocess.PostprocessError as exc:
+            detail = (
+                exc.detail
+                if isinstance(exc.detail, str)
+                else exc.detail["code"]
+            )
+            raise LongGenerationError(detail, exc.status) from None
+        if len(selected_project) != len(project_originals):
+            raise LongGenerationError("postprocess_artifacts_invalid")
+        cursor = 0
+        for index, count in enumerate(project_counts, 1):
+            selected = tuple(selected_project[cursor:cursor + count])
+            cursor += count
+            project_selected_paths[index] = selected
+            if frozen_fusion is not None:
+                proxies = frozen_fusion_proxy_data.get(index)
+                if proxies is None or len(proxies) != len(selected):
+                    raise LongGenerationError("prompt_fusion_input_invalid")
+                try:
+                    rebuilt = tuple(
+                        image_optimization.half_resolution_png(path.read_bytes())
+                        for path in selected
+                    )
+                except (OSError, ValueError):
+                    raise LongGenerationError(
+                        "prompt_fusion_input_invalid"
+                    ) from None
+                if rebuilt != proxies:
+                    raise LongGenerationError("prompt_fusion_input_invalid")
 
     frozen: list[FrozenSegment] = []
     authoritative_dialogue_for_delivery: list[dict] = []
@@ -3606,9 +3686,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             original_data = {path.resolve(): data for path, data in bound_keyframes}
             for selected_path in selected_paths:
                 resolved = selected_path.resolve()
-                data = frozen_fusion_frame_data.get(resolved)
-                if data is None:
-                    data = original_data.get(resolved)
+                data = original_data.get(resolved)
                 if data is None:
                     try:
                         data = resolved.read_bytes()
