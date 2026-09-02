@@ -273,16 +273,25 @@ SEGMENT_FRAMES_SCHEMA = _object({
 })
 
 
-def prompt_fusion_schema(*, input_sha256: str, segment_count: int) -> dict:
+def prompt_fusion_schema(
+    *, input_sha256: str, segment_count: int, visual_max_chars: int,
+) -> dict:
     if (
         isinstance(segment_count, bool)
         or not isinstance(segment_count, int)
         or segment_count < 1
     ):
         raise ValueError("prompt fusion segment count is invalid")
+    if (
+        isinstance(visual_max_chars, bool)
+        or not isinstance(visual_max_chars, int)
+        or visual_max_chars < 1
+    ):
+        raise ValueError("prompt fusion visual character limit is invalid")
+    visual = {"type": "string", "minLength": 1, "maxLength": visual_max_chars}
     segment = _object({
         "index": _INT1,
-        "visual": _array(_TEXT, minimum=9, maximum=9),
+        "visual": _array(visual, minimum=9, maximum=9),
     })
     return _object({
         "schema": {

@@ -3359,6 +3359,7 @@ def _prompt_fusion_early_output(
                     ),
                     music_policy=source_segment["audio_content"]["music_policy"],
                     relation_occurrences=occurrences,
+                    cut_timeline=source_segment.get("source_cut_timeline"),
                 )
             except (
                 KeyError, TypeError, json.JSONDecodeError,
@@ -3366,6 +3367,35 @@ def _prompt_fusion_early_output(
             ):
                 raise ValueError("prompt fusion raw output is invalid") from None
     return _canonical_json_bytes(value) if normalized_relations else data
+
+
+def _prompt_fusion_visual_max_chars(input_segments: list) -> int:
+    """Compute one schema-safe limit from the complete frozen segment inputs."""
+    limits: list[int] = []
+    try:
+        for source_segment in input_segments:
+            timeline = [{
+                key: frame[key]
+                for key in (
+                    "order", "segment_time_s", "source_scene_id", "transition",
+                )
+            } for frame in source_segment["new_keyframes"]]
+            audio = source_segment["audio_content"]
+            limits.append(long_generation.prompt_fusion_visual_max_chars(
+                timeline=timeline,
+                lines=json.loads(audio["lines_json"]),
+                music_policy=audio["music_policy"],
+                relation_occurrences=source_segment.get("relation_occurrences"),
+                cut_timeline=source_segment.get("source_cut_timeline"),
+            ))
+    except (
+        AttributeError, KeyError, TypeError, ValueError,
+        long_generation.LongGenerationError,
+    ):
+        raise PipelineError("prompt fusion input is invalid") from None
+    if not limits:
+        raise PipelineError("prompt fusion input is invalid")
+    return min(limits)
 
 
 def queue_prompt_fusion(
@@ -3754,6 +3784,9 @@ def produce_prompt_fusion(
         if hashlib.sha256(input_data).hexdigest() != state.get("input_sha256"):
             raise PipelineError("prompt fusion input drifted")
         input_payload = _require_prompt_fusion_v2_input(input_data)
+        visual_max_chars = _prompt_fusion_visual_max_chars(
+            input_payload["segments"],
+        )
         frozen_skill_data = milestone.read_bytes("video-prompt-fusion")
         if skill_bytes is not None and skill_bytes != frozen_skill_data:
             raise PipelineError("prompt fusion Skill bytes do not match CID milestone")
@@ -3781,7 +3814,8 @@ def produce_prompt_fusion(
                     )
             fusion_prompt = (
                 "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json "
-                "及其中 SHA 绑定的有序图片；按注入的输出 Schema 填写融合结果。"
+                "及其中 SHA 绑定的有序图片；按注入的输出 Schema 填写融合结果；"
+                f"每条 visual 不超过 {visual_max_chars} 个字符。"
             )
             raw_output_data = runner.run_isolated_until_output(
                 stage,
@@ -3801,6 +3835,7 @@ def produce_prompt_fusion(
                 output_schema=codex_output_schemas.prompt_fusion_schema(
                     input_sha256=state["input_sha256"],
                     segment_count=len(input_payload["segments"]),
+                    visual_max_chars=visual_max_chars,
                 ),
             )
         raw_output_data = _prompt_fusion_early_output(

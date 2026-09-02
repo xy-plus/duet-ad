@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from app import codex_output_schemas
+from app import codex_output_schemas, pipeline
 from app.codex_runner import CodexRunner
 
 
@@ -143,6 +143,9 @@ def run_real_fusion(
     if not skill_data:
         raise ValueError("Skill file is empty")
     input_sha256 = _sha256_bytes(input_data)
+    visual_max_chars = pipeline._prompt_fusion_visual_max_chars(
+        frozen["segments"],
+    )
     evidence_dir.mkdir(parents=True, exist_ok=True)
     (evidence_dir / "frozen_input.json").write_bytes(input_data)
     (evidence_dir / "skill.md").write_bytes(skill_data)
@@ -152,6 +155,7 @@ def run_real_fusion(
                 "input_sha256": input_sha256,
                 "skill_sha256": _sha256_bytes(skill_data),
                 "segment_count": len(frozen["segments"]),
+                "visual_max_chars": visual_max_chars,
                 "source_root": str(source_root),
             },
             ensure_ascii=False,
@@ -178,7 +182,9 @@ def run_real_fusion(
         runner = CodexRunner(timeout_s=timeout_s, concurrency=1)
         runner.run_isolated_until_output(
             stage,
-            "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json 及其中 SHA 绑定的有序图片；原子发布 work/h3_prompt_plan.json 后立即退出。",
+            "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json "
+            "及其中 SHA 绑定的有序图片；按注入的输出 Schema 填写融合结果；"
+            f"每条 visual 不超过 {visual_max_chars} 个字符。",
             session_dir=session_dir,
             output_path=output_path,
             max_output_bytes=64 * 1024 + 32 * 1024 * len(frozen["segments"]),
@@ -190,6 +196,7 @@ def run_real_fusion(
             output_schema=codex_output_schemas.prompt_fusion_schema(
                 input_sha256=input_sha256,
                 segment_count=len(frozen["segments"]),
+                visual_max_chars=visual_max_chars,
             ),
         )
         artifact_data = output_path.read_bytes()

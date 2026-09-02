@@ -147,7 +147,7 @@ def test_prompt_fusion_sends_exactly_nine_visuals_per_segment(
 ) -> None:
     digest = "d" * 64
     schema = codex_output_schemas.prompt_fusion_schema(
-        input_sha256=digest, segment_count=2,
+        input_sha256=digest, segment_count=2, visual_max_chars=426,
     )
     visuals = [f"frame {index}" for index in range(1, 10)]
     result = {

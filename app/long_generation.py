@@ -1300,6 +1300,29 @@ def _compile_fusion_ref2va_prompt(
     return compiled
 
 
+def prompt_fusion_visual_max_chars(
+    *, timeline: object, lines: object, music_policy: object,
+    relation_occurrences: object = None, cut_timeline: object = None,
+) -> int:
+    """Derive the per-frame prose budget before the Fusion model is called."""
+    try:
+        baseline = _compile_fusion_ref2va_prompt(
+            visual=["x"] * 9,
+            timeline=timeline,
+            lines=lines,
+            music_policy=music_policy,
+            relation_occurrences=relation_occurrences,
+            cut_timeline=cut_timeline,
+        )
+    except LongGenerationError as exc:
+        raise LongGenerationError("prompt_fusion_input_invalid") from exc
+    fixed_chars = len(baseline) - 9
+    visual_max_chars = (_MAX_COMPILED_FUSION_CHARS - fixed_chars) // 9
+    if visual_max_chars < 1:
+        raise LongGenerationError("prompt_fusion_input_invalid")
+    return visual_max_chars
+
+
 def _canonical_fusion_prompt(
     prompt: str,
     lines_json: str,

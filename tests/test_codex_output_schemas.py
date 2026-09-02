@@ -35,7 +35,7 @@ def test_all_skill_output_schemas_are_valid_and_closed() -> None:
         codex_output_schemas.global_plan_schema(stable_keys=_GLOBAL_KEYS),
         codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
         codex_output_schemas.prompt_fusion_schema(
-            input_sha256="a" * 64, segment_count=3,
+            input_sha256="a" * 64, segment_count=3, visual_max_chars=426,
         ),
     ]
     for schema in schemas:
@@ -332,7 +332,7 @@ def test_segment_dto_still_indexes_model_discovered_nested_keys() -> None:
 def test_fusion_schema_binds_hash_segments_and_exactly_nine_visuals() -> None:
     digest = "b" * 64
     schema = codex_output_schemas.prompt_fusion_schema(
-        input_sha256=digest, segment_count=2,
+        input_sha256=digest, segment_count=2, visual_max_chars=12,
     )
     visuals = [f"frame {index}" for index in range(1, 10)]
     valid = {
@@ -344,6 +344,13 @@ def test_fusion_schema_binds_hash_segments_and_exactly_nine_visuals() -> None:
         ],
     }
     jsonschema.validate(valid, schema)
+    exact_limit = json.loads(json.dumps(valid))
+    exact_limit["segments"][0]["visual"][0] = "x" * 12
+    jsonschema.validate(exact_limit, schema)
+    over_limit = json.loads(json.dumps(valid))
+    over_limit["segments"][0]["visual"][0] = "x" * 13
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(over_limit, schema)
     invalid = json.loads(json.dumps(valid))
     invalid["segments"].append({"index": 3, "visual": visuals})
     try:
@@ -372,6 +379,19 @@ def test_fusion_schema_refuses_an_invalid_segment_count(
     with pytest.raises(ValueError, match="segment count is invalid"):
         codex_output_schemas.prompt_fusion_schema(
             input_sha256="c" * 64, segment_count=segment_count,
+            visual_max_chars=426,
+        )
+
+
+@pytest.mark.parametrize("visual_max_chars", [0, -1, True])
+def test_fusion_schema_refuses_an_invalid_visual_character_limit(
+    visual_max_chars: int,
+) -> None:
+    with pytest.raises(ValueError, match="visual character limit is invalid"):
+        codex_output_schemas.prompt_fusion_schema(
+            input_sha256="c" * 64,
+            segment_count=1,
+            visual_max_chars=visual_max_chars,
         )
 
 

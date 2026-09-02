@@ -1636,6 +1636,60 @@ def test_nine_fusion_visuals_are_grouped_by_frozen_hard_cuts() -> None:
         assert f"<Picture {order}>: frame description {order}" in prompt
 
 
+def test_fusion_visual_budget_is_derived_before_generation() -> None:
+    timeline = [{
+        "order": order,
+        "segment_time_s": float(order - 1),
+        "source_scene_id": "SCENE_01",
+        "transition": (
+            {"type": "start", "at_segment_s": 0.0}
+            if order == 1 else
+            {"type": "continuous", "at_segment_s": None}
+        ),
+    } for order in range(1, 10)]
+    without_cut_limit = long_generation.prompt_fusion_visual_max_chars(
+        timeline=timeline,
+        lines=[],
+        music_policy="forbid",
+        relation_occurrences=[],
+    )
+    cut_timeline = [{
+        "order": 1,
+        "start_segment_s": 0.0,
+        "end_segment_s": 8.0,
+        "source_scene_id": "SCENE_01",
+    }]
+    limit = long_generation.prompt_fusion_visual_max_chars(
+        timeline=timeline,
+        lines=[],
+        music_policy="forbid",
+        relation_occurrences=[],
+        cut_timeline=cut_timeline,
+    )
+    assert limit < without_cut_limit
+    compiled = long_generation._compile_fusion_ref2va_prompt(
+        visual=["x" * limit] * 9,
+        timeline=timeline,
+        lines=[],
+        music_policy="forbid",
+        relation_occurrences=[],
+        cut_timeline=cut_timeline,
+    )
+    assert len(compiled) <= long_generation._MAX_COMPILED_FUSION_CHARS
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_output_invalid",
+    ):
+        long_generation._compile_fusion_ref2va_prompt(
+            visual=["x" * (limit + 1)] * 9,
+            timeline=timeline,
+            lines=[],
+            music_policy="forbid",
+            relation_occurrences=[],
+            cut_timeline=cut_timeline,
+        )
+
+
 def _fusion_v2_output(segment: dict, visual: str) -> dict:
     output = {
         "index": segment["index"],
@@ -1731,11 +1785,19 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
             assert session_dir == root
             assert cwd != root
             assert "multimodal_input.json" in prompt
+            frozen_input = (cwd / "work" / "multimodal_input.json").read_bytes()
+            payload = json.loads(frozen_input.decode("utf-8"))
+            visual_max_chars = pipeline._prompt_fusion_visual_max_chars(
+                payload["segments"],
+            )
+            assert f"每条 visual 不超过 {visual_max_chars} 个字符" in prompt
+            visual_schema = output_schema["properties"]["segments"]["items"][
+                "properties"
+            ]["visual"]["items"]
+            assert visual_schema["maxLength"] == visual_max_chars
             assert output_path == cwd / "work" / "h3_prompt_plan.json"
             assert max_output_bytes > 0
             assert output_schema["type"] == "object"
-            frozen_input = (cwd / "work" / "multimodal_input.json").read_bytes()
-            payload = json.loads(frozen_input.decode("utf-8"))
             expected_files = {
                 "SKILL.md",
                 "work/multimodal_input.json",
