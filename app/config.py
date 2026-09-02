@@ -41,6 +41,7 @@ class Settings:
     data_dir: Path = Path("data")
     codex_timeout_s: int = 1800
     codex_concurrency: int = 10
+    deepseek_credential_file: Path = Path("/home/xy/.config/claude/deepseek.env")
     retry_count: int = 2
     retry_interval_s: float = 15.0
     asr_cli: Path | None = None
@@ -59,6 +60,10 @@ class Settings:
     enable_pipeline: bool = False
 
     def __post_init__(self) -> None:
+        credential_file = Path(self.deepseek_credential_file)
+        if not credential_file.is_absolute():
+            raise ValueError("deepseek_credential_file must be absolute")
+        object.__setattr__(self, "deepseek_credential_file", credential_file)
         if self.h3_gateway_storage_root is not None:
             root = Path(self.h3_gateway_storage_root)
             if not root.is_absolute():
@@ -165,6 +170,9 @@ def get_settings() -> Settings:
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
         codex_timeout_s=int(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),
+        deepseek_credential_file=Path(os.environ.get(
+            "DEEPSEEK_CREDENTIAL_FILE", "/home/xy/.config/claude/deepseek.env"
+        )),
         retry_count=int(os.environ.get("AUTO_RETRY_COUNT", "2")),
         retry_interval_s=float(os.environ.get("AUTO_RETRY_INTERVAL_S", "15")),
         asr_cli=Path(os.environ.get(

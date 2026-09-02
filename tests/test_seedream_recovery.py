@@ -15,7 +15,8 @@ import numpy as np
 import pytest
 
 from app import seedream, seedream_recovery
-from app.codex_runner import CodexRunner
+from app.codex_runner import CodexError
+from app.deepseek_runner import DeepSeekRunner
 from app.config import Settings
 
 
@@ -128,8 +129,9 @@ def test_content_rejection_neutralizes_once_and_resubmits_once(
     ).hexdigest()
     assert diagnostic["codex_call"] == {
         "call_path": ["postprocess", "seedream", "0001-r1", "neutralize"],
-        "model": "gpt-5.6-luna",
-        "reasoning_effort": "max",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash-vision-exp",
+        "thinking": "disabled",
         "attempt": 1,
     }
 
@@ -364,17 +366,16 @@ def test_real_frozen_frame_schema_never_reinjects_rejected_free_text() -> None:
     assert "unknown_dict" not in retry_prompt
 
 
-def test_neutralizer_runner_explicitly_uses_luna_max(tmp_path: Path) -> None:
-    argv = CodexRunner(
+def test_neutralizer_runner_explicitly_uses_deepseek_transport(tmp_path: Path) -> None:
+    runner = DeepSeekRunner(
         timeout_s=1,
         concurrency=1,
-        model=seedream_recovery.MODEL,
-        reasoning_effort=seedream_recovery.REASONING_EFFORT,
-    ).build_argv(tmp_path, "prompt")
-    assert argv[argv.index("-m") + 1] == "gpt-5.6-luna"
-    configs = [argv[index + 1] for index, item in enumerate(argv) if item == "-c"]
-    assert 'model_reasoning_effort="max"' in configs
-    assert 'model_reasoning_effort="medium"' not in configs
+        credential_file=tmp_path / "deepseek.env",
+    )
+    assert seedream_recovery.MODEL == "deepseek-v4-flash-vision-exp"
+    assert seedream_recovery.REASONING_EFFORT == "disabled"
+    with pytest.raises(CodexError, match="schema-constrained"):
+        runner.run(tmp_path, "prompt")
 
 
 def test_seedream_exposes_and_durably_recovers_policy_error_code(

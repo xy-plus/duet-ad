@@ -41,7 +41,7 @@ from app import (
     voice,
 )
 from app.auth import require_auth
-from app.codex_runner import CodexRunner
+from app.deepseek_runner import DeepSeekRunner
 from app.config import Settings, get_settings
 
 _RATE_LIMIT = 10  # 每 IP 每分钟上传次数
@@ -3683,8 +3683,10 @@ def create_app(settings: Settings) -> FastAPI:
         return response
 
     limiter = _RateLimiter()
-    codex_runner = CodexRunner(
-        timeout_s=settings.codex_timeout_s, concurrency=settings.codex_concurrency
+    codex_runner = DeepSeekRunner(
+        timeout_s=settings.codex_timeout_s,
+        concurrency=settings.codex_concurrency,
+        credential_file=settings.deepseek_credential_file,
     )
     # 管道闸：同时处理的会话数上限；拿不到闸的会话保持 queued
     pipeline_sem = threading.Semaphore(settings.codex_concurrency)

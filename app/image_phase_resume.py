@@ -26,7 +26,7 @@ import cv2
 
 from app import image_optimization, long_video, mediakit, pipeline, skill_milestone, storage
 from app.config import Settings
-from app.codex_runner import CodexRunner
+from app.deepseek_runner import DeepSeekRunner
 
 
 SCHEMA = "duet.image-phase-resume"
@@ -867,8 +867,10 @@ def main(argv: list[str] | None = None) -> int:
         expected = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SystemExit(f"manifest is invalid: {exc}") from exc
-    runner = CodexRunner(
-        timeout_s=settings.codex_timeout_s, concurrency=settings.codex_concurrency,
+    runner = DeepSeekRunner(
+        timeout_s=settings.codex_timeout_s,
+        concurrency=settings.codex_concurrency,
+        credential_file=settings.deepseek_credential_file,
     )
     if args.diagnostics_dir is not None:
         runner = _DiagnosticRunner(runner, args.diagnostics_dir)

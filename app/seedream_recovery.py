@@ -19,12 +19,11 @@ from typing import Any, Mapping
 
 from app import error_trace, seedream
 from app import codex_output_schemas
-from app.codex_runner import CodexRunner
+from app.deepseek_runner import DeepSeekRunner, MODEL
 from app.config import Settings
 
 
-MODEL = "gpt-5.6-luna"
-REASONING_EFFORT = "max"
+REASONING_EFFORT = "disabled"
 CONTENT_REJECTION_CODES = frozenset({
     "InputTextSensitiveContentDetected",
     "OutputImageSensitiveContentDetected",
@@ -283,11 +282,10 @@ def _run_codex(
             }, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        runner = CodexRunner(
+        runner = DeepSeekRunner(
             timeout_s=settings.codex_timeout_s,
             concurrency=1,
-            model=MODEL,
-            reasoning_effort=REASONING_EFFORT,
+            credential_file=settings.deepseek_credential_file,
         )
         return runner.run_isolated_until_output(
             stage,
@@ -365,8 +363,9 @@ async def edit_with_content_recovery(
         )],
         "codex_call": {
             "call_path": ["postprocess", "seedream", receipt.stem, "neutralize"],
+            "provider": "deepseek",
             "model": MODEL,
-            "reasoning_effort": REASONING_EFFORT,
+            "thinking": REASONING_EFFORT,
             "attempt": 1,
         },
         "claimed_at_unix_ns": time.time_ns(),
