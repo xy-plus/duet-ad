@@ -142,6 +142,52 @@ def test_visual_uses_one_strict_function_and_publishes_only_validated_json(
     assert content[3]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
+def test_prompt_fusion_sends_exact_backend_derived_visual_counts(
+    tmp_path: Path,
+) -> None:
+    digest = "d" * 64
+    schema = codex_output_schemas.prompt_fusion_schema(
+        input_sha256=digest, visual_counts=(3, 2),
+    )
+    result = {
+        "schema": "duet.video-prompt-fusion-output",
+        "version": 2,
+        "input_sha256": digest,
+        "segments": [
+            {"index": 1, "visual": ["one", "two", "three"]},
+            {"index": 2, "visual": ["one", "two"]},
+        ],
+    }
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["tools"][0]["function"]["parameters"] == schema
+        return httpx.Response(200, json=_envelope(result))
+
+    owner, stage = _stage()
+    try:
+        output = stage / "work" / "h3_prompt_plan.json"
+        runner = DeepSeekRunner(
+            timeout_s=30,
+            concurrency=1,
+            credential_file=_credential(tmp_path),
+            transport=httpx.MockTransport(handle),
+        )
+        produced = runner.run_isolated_until_output(
+            stage,
+            "严格执行当前目录 SKILL.md",
+            session_dir=tmp_path,
+            output_path=output,
+            max_output_bytes=4096,
+            validate_output=lambda raw: json.loads(raw),
+            output_schema=schema,
+        )
+        assert produced == result
+        assert json.loads(output.read_text(encoding="utf-8")) == result
+    finally:
+        owner.cleanup()
+
+
 def test_global_plan_omits_only_frozen_empty_objects_then_restores_them(
     tmp_path: Path,
 ) -> None:

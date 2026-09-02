@@ -1529,6 +1529,24 @@ def _fusion_v2_visual(segment: dict, visual: str) -> list[str]:
     return [f"{visual} shot {index}" for index in range(1, shot_count + 1)]
 
 
+def test_prompt_fusion_visual_slots_come_from_frozen_hard_cuts() -> None:
+    transition_types = (
+        ("start", "continuous", "continuous", "continuous", "continuous",
+         "hard_cut", "continuous", "hard_cut", "continuous"),
+        ("start", "continuous", "continuous", "continuous", "hard_cut",
+         "continuous", "continuous", "continuous", "continuous"),
+        ("start", "continuous", "continuous", "hard_cut", "continuous",
+         "continuous", "hard_cut", "continuous", "continuous"),
+    )
+    segments = [{
+        "new_keyframes": [{
+            "transition": {"type": transition_type},
+        } for transition_type in types],
+    } for types in transition_types]
+
+    assert pipeline._prompt_fusion_visual_counts(segments) == (3, 2, 3)
+
+
 def _fusion_v2_output(segment: dict, visual: str) -> dict:
     output = {
         "index": segment["index"],

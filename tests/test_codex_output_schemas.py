@@ -35,7 +35,7 @@ def test_all_skill_output_schemas_are_valid_and_closed() -> None:
         codex_output_schemas.global_plan_schema(stable_keys=_GLOBAL_KEYS),
         codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
         codex_output_schemas.prompt_fusion_schema(
-            input_sha256="a" * 64, segment_count=3,
+            input_sha256="a" * 64, visual_counts=(1, 2, 3),
         ),
     ]
     for schema in schemas:
@@ -307,31 +307,39 @@ def test_global_normalizer_reports_safe_reason_and_field_path() -> None:
 
 
 def test_segment_dto_still_indexes_model_discovered_nested_keys() -> None:
-
     frame_model = {"frames": [{
-        "key": "frame-001",
+        "key": f"frame-{index:03d}",
         "people": [{
             "key": "person-01", "visible_region": "full", "boundary": "outline",
             "body_and_pose": "standing", "derived_observations": [],
         }],
         "entities": [], "relationships": "none", "crop": "full",
-    }]}
+    } for index in range(1, 10)]}
     jsonschema.validate(frame_model, codex_output_schemas.SEGMENT_FRAMES_SCHEMA)
     normalized = codex_output_schemas.normalize_segment_frames(frame_model)
     assert normalized["frames"]["frame-001"]["people"]["person-01"]["body_and_pose"] == "standing"
 
+    for invalid_count in (8, 10):
+        invalid = {"frames": frame_model["frames"][:invalid_count]}
+        if invalid_count == 10:
+            invalid["frames"] = [*frame_model["frames"], frame_model["frames"][-1]]
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(
+                invalid, codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
+            )
 
-def test_fusion_schema_binds_hash_and_exact_segment_count() -> None:
+
+def test_fusion_schema_binds_hash_segments_and_exact_visual_counts() -> None:
     digest = "b" * 64
     schema = codex_output_schemas.prompt_fusion_schema(
-        input_sha256=digest, segment_count=2,
+        input_sha256=digest, visual_counts=(3, 2),
     )
     valid = {
         "schema": "duet.video-prompt-fusion-output", "version": 2,
         "input_sha256": digest,
         "segments": [
-            {"index": 1, "visual": ["first"]},
-            {"index": 2, "visual": ["second"]},
+            {"index": 1, "visual": ["first", "middle", "last"]},
+            {"index": 2, "visual": ["first", "last"]},
         ],
     }
     jsonschema.validate(valid, schema)
@@ -343,6 +351,27 @@ def test_fusion_schema_binds_hash_and_exact_segment_count() -> None:
         pass
     else:
         raise AssertionError("fusion schema accepted an extra segment")
+
+    for segment_index in (0, 1):
+        for mutation in ("missing", "extra"):
+            invalid = json.loads(json.dumps(valid))
+            visuals = invalid["segments"][segment_index]["visual"]
+            if mutation == "missing":
+                visuals.pop()
+            else:
+                visuals.append("extra")
+            with pytest.raises(jsonschema.ValidationError):
+                jsonschema.validate(invalid, schema)
+
+
+@pytest.mark.parametrize("visual_counts", [(), (0,), (10,), (True,)])
+def test_fusion_schema_refuses_an_invalid_generation_contract(
+    visual_counts: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match="visual counts are invalid"):
+        codex_output_schemas.prompt_fusion_schema(
+            input_sha256="c" * 64, visual_counts=visual_counts,
+        )
 
 
 def test_codex_argv_receives_readonly_output_schema(monkeypatch, tmp_path: Path) -> None:
