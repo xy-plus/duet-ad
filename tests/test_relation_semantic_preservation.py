@@ -120,8 +120,12 @@ def test_image_compiler_freezes_relation_outside_truncated_descriptions() -> Non
             "source_scene_id": "scene-01",
         },
     }]
+    fusion_visuals = [
+        "The visible replacement system keeps its current composition."
+        for _ in range(9)
+    ]
     h3_prompt = long_generation._compile_fusion_ref2va_prompt(
-        visual=["The visible replacement system keeps its current composition."],
+        visual=fusion_visuals,
         timeline=timeline,
         lines=[],
         music_policy="forbid",
@@ -502,8 +506,13 @@ def test_sixty_relations_with_540_unique_verbose_states_fit_visual_budget() -> N
                 f"{long_generation.RELATION_STATES_CLOSE}"
             )
 
+    visual_payload = "V" * 3_200
+    visual_chunks = [
+        visual_payload[index * 356:(index + 1) * 356]
+        for index in range(8)
+    ] + [visual_payload[8 * 356:]]
     prompt = long_generation._compile_fusion_ref2va_prompt(
-        visual=["V" * 3_200],
+        visual=visual_chunks,
         timeline=timeline,
         lines=[],
         music_policy="forbid",
@@ -514,6 +523,7 @@ def test_sixty_relations_with_540_unique_verbose_states_fit_visual_budget() -> N
         len(prompt) + len(context_ir_bridge._DIALOGUE_POLICY) + 1
         <= context_ir_bridge.MAX_SOURCE_PROMPT_CHARS
     )
+    assert "".join(visual_chunks) == visual_payload
     parsed = context_ir_bridge._relation_states_contract(prompt)
     assert parsed is not None
     parsed_contract = json.loads(

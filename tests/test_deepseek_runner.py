@@ -142,20 +142,21 @@ def test_visual_uses_one_strict_function_and_publishes_only_validated_json(
     assert content[3]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
-def test_prompt_fusion_sends_exact_backend_derived_visual_counts(
+def test_prompt_fusion_sends_exactly_nine_visuals_per_segment(
     tmp_path: Path,
 ) -> None:
     digest = "d" * 64
     schema = codex_output_schemas.prompt_fusion_schema(
-        input_sha256=digest, visual_counts=(3, 2),
+        input_sha256=digest, segment_count=2,
     )
+    visuals = [f"frame {index}" for index in range(1, 10)]
     result = {
         "schema": "duet.video-prompt-fusion-output",
         "version": 2,
         "input_sha256": digest,
         "segments": [
-            {"index": 1, "visual": ["one", "two", "three"]},
-            {"index": 2, "visual": ["one", "two"]},
+            {"index": 1, "visual": visuals},
+            {"index": 2, "visual": visuals},
         ],
     }
 

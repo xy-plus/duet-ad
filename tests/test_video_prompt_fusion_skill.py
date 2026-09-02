@@ -39,6 +39,7 @@ def test_authority_boundaries_and_output_remain_closed():
         "跨段只共享 stable element design 和 relation system",
         "质量评分不触发拒绝、重试、回退", "work/h3_prompt_plan.json",
         "注入的 JSON Schema", "Context IR/H3 effective prompt",
+        "visual 固定为 9 条并逐条对应 frame order 1 至 9",
     ):
         assert required in text
     assert "不输出时间戳、图片标记、stable key、tile、relation key" in text

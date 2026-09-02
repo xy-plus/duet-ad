@@ -505,7 +505,7 @@ def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
             "index": 1,
             "visual": [
                 "the cut happens at 99 seconds",
-                "the second visual interval continues",
+                *[f"frame {order} continues" for order in range(2, 10)],
             ],
         }],
     }))
@@ -532,8 +532,12 @@ def test_backend_ref2va_compiler_has_one_exact_provider_prompt() -> None:
             {"type": "continuous", "at_segment_s": None}
         ),
     } for order in range(1, 10)]
+    visuals = [
+        "first <Picture 99> visual",
+        *[f"frame {order} visual" for order in range(2, 10)],
+    ]
     prompt = long_generation._compile_fusion_ref2va_prompt(
-        visual=["first <Picture 99> visual", "second visual"],
+        visual=visuals,
         timeline=timeline,
         lines=[{
             "order": 1,
@@ -570,9 +574,9 @@ def test_backend_ref2va_compiler_has_one_exact_provider_prompt() -> None:
         "<Picture 8> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
         "<Picture 9> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
         "detailed_description:",
-        "[Shot 1] The shot follows the ordered storyboard anchors <Picture 1>, <Picture 2>, and <Picture 3>. first ‹Picture 99› visual",
+        "[Shot 1] The shot follows the ordered storyboard anchors <Picture 1>, <Picture 2>, and <Picture 3>. <Picture 1>: first ‹Picture 99› visual <Picture 2>: frame 2 visual <Picture 3>: frame 3 visual",
         "From 00:01.000 to 00:02.000, the off-screen narrator (S1) says in an off-screen voiceover: <d>[Undetermined]spoken exactly</d> while every visible person's lips remain completely closed.",
-        "[Shot 2] At 00:02.500, the shot cuts to <Picture 4>. The shot then follows the ordered storyboard anchors <Picture 4>, <Picture 5>, <Picture 6>, <Picture 7>, <Picture 8>, and <Picture 9>. second visual",
+        "[Shot 2] At 00:02.500, the shot cuts to <Picture 4>. The shot then follows the ordered storyboard anchors <Picture 4>, <Picture 5>, <Picture 6>, <Picture 7>, <Picture 8>, and <Picture 9>. <Picture 4>: frame 4 visual <Picture 5>: frame 5 visual <Picture 6>: frame 6 visual <Picture 7>: frame 7 visual <Picture 8>: frame 8 visual <Picture 9>: frame 9 visual",
         "overall_soundscape:",
         "The frozen spoken events described above are the only specified audible layer; no additional ambience, physical-action sounds, or non-verbal human sounds are added.",
         "non_diegetic_music:",
@@ -1522,29 +1526,37 @@ def _fusion_v1_input(root: Path, segment_count: int) -> bytes:
 
 
 def _fusion_v2_visual(segment: dict, visual: str) -> list[str]:
-    shot_count = 1 + sum(
-        frame["transition"]["type"] == "hard_cut"
-        for frame in segment["new_keyframes"][1:]
-    )
-    return [f"{visual} shot {index}" for index in range(1, shot_count + 1)]
+    return [
+        f"{visual} frame {frame['order']}"
+        for frame in segment["new_keyframes"]
+    ]
 
 
-def test_prompt_fusion_visual_slots_come_from_frozen_hard_cuts() -> None:
+def test_nine_fusion_visuals_are_grouped_by_frozen_hard_cuts() -> None:
     transition_types = (
-        ("start", "continuous", "continuous", "continuous", "continuous",
-         "hard_cut", "continuous", "hard_cut", "continuous"),
-        ("start", "continuous", "continuous", "continuous", "hard_cut",
-         "continuous", "continuous", "continuous", "continuous"),
-        ("start", "continuous", "continuous", "hard_cut", "continuous",
-         "continuous", "hard_cut", "continuous", "continuous"),
+        "start", "continuous", "continuous", "continuous", "continuous",
+        "hard_cut", "continuous", "hard_cut", "continuous",
     )
-    segments = [{
-        "new_keyframes": [{
-            "transition": {"type": transition_type},
-        } for transition_type in types],
-    } for types in transition_types]
+    timeline = [{
+        "order": order,
+        "segment_time_s": float(order - 1),
+        "source_scene_id": f"SCENE_{1 if order < 6 else 2 if order < 8 else 3:02d}",
+        "transition": {
+            "type": transition_type,
+            "at_segment_s": float(order - 1) if transition_type == "hard_cut" else (
+                0.0 if transition_type == "start" else None
+            ),
+        },
+    } for order, transition_type in enumerate(transition_types, 1)]
+    prompt = long_generation._compile_fusion_ref2va_prompt(
+        visual=[f"frame description {order}" for order in range(1, 10)],
+        timeline=timeline,
+        lines=[],
+        music_policy="forbid",
+    )
 
-    assert pipeline._prompt_fusion_visual_counts(segments) == (3, 2, 3)
+    for order in range(1, 10):
+        assert f"<Picture {order}>: frame description {order}" in prompt
 
 
 def _fusion_v2_output(segment: dict, visual: str) -> dict:

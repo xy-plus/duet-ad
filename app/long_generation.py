@@ -1099,10 +1099,10 @@ def _compile_fusion_ref2va_prompt(
         if not shots or transition_type == "hard_cut":
             shots.append([])
         shots[-1].append(frame)
-    if not isinstance(visual, list) or len(visual) != len(shots):
+    if not isinstance(visual, list) or len(visual) != len(frozen_timeline):
         raise LongGenerationError("prompt_fusion_output_invalid")
     relation_contract_enabled = relation_occurrences is not None
-    visual_by_shot = [
+    visual_by_frame = [
         _provider_neutral_visual(item)
         for item in visual
     ]
@@ -1164,9 +1164,12 @@ def _compile_fusion_ref2va_prompt(
                 f"to <Picture {orders[0]}>. The shot then follows the ordered "
                 f"storyboard anchors {anchors}."
             )
-        details.append([
-            f"{opening} {visual_by_shot[shot_index - 1]}"
-        ])
+        frame_evidence = " ".join(
+            f"<Picture {int(frame['order'])}>: "
+            f"{visual_by_frame[int(frame['order']) - 1]}"
+            for frame in frames
+        )
+        details.append([f"{opening} {frame_evidence}"])
 
     cut_dialogue_lines: list[str] = []
     for expected_order, line in enumerate(lines, 1):

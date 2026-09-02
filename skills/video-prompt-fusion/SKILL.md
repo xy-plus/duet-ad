@@ -27,6 +27,6 @@ description: Fuse frozen optimized keyframes, old segment dynamics, frame replac
 
 ## 输出
 
-后端按 transition 建区间：第一帧开始区间，hard_cut 当前帧开始新区间，continuous 留在当前区间。每个区间输出一条简洁英文 `visual` prose，只引用本区间图片；不输出时间戳、图片标记、stable key、tile、relation key、音频字段或 provider 语法。visual 与后端机械关系块合计必须适配现有 H3 7000 字符 transport 合同；这不是质量评分。模型可以省略 `relation_states`；即使回显，后端也会按冻结输入覆盖，模型回显不是权威且不影响任务成败。
+每段严格按 order 为 9 张关键帧分别输出 9 条简洁英文 `visual` prose，一帧一条，不合并、不缺省、不增加。每条只描述对应图片及同区间已有动态证据；不输出时间戳、图片标记、stable key、tile、relation key、音频字段或 provider 语法。后端按 transition 将九条描述机械归入 hard-cut 区间，再与关系块共同编译到现有 H3 transport；这不是质量评分。模型不输出 `relation_states`，关系状态完全由后端按冻结输入生成。
 
-输出格式以本次调用注入的 JSON Schema 为唯一权威：固定 `schema/version/input_sha256`，`segments` 与输入一一对应，每段只填写 `index/visual`，visual 数量等于 hard-cut 区间数。模型不输出 relation states；后端完全依据冻结 occurrence 机械生成并编译进 Context IR/H3 effective prompt，再原子发布 `work/h3_prompt_plan.json`。
+输出格式以本次调用注入的 JSON Schema 为唯一权威：固定 `schema/version/input_sha256`，`segments` 与输入一一对应，每段只填写 `index/visual`，visual 固定为 9 条并逐条对应 frame order 1 至 9。后端完全依据冻结 occurrence 机械生成关系状态、按 hard cut 组合九条视觉描述并编译进 Context IR/H3 effective prompt，再原子发布 `work/h3_prompt_plan.json`。

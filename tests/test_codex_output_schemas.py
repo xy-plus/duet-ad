@@ -35,7 +35,7 @@ def test_all_skill_output_schemas_are_valid_and_closed() -> None:
         codex_output_schemas.global_plan_schema(stable_keys=_GLOBAL_KEYS),
         codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
         codex_output_schemas.prompt_fusion_schema(
-            input_sha256="a" * 64, visual_counts=(1, 2, 3),
+            input_sha256="a" * 64, segment_count=3,
         ),
     ]
     for schema in schemas:
@@ -329,22 +329,23 @@ def test_segment_dto_still_indexes_model_discovered_nested_keys() -> None:
             )
 
 
-def test_fusion_schema_binds_hash_segments_and_exact_visual_counts() -> None:
+def test_fusion_schema_binds_hash_segments_and_exactly_nine_visuals() -> None:
     digest = "b" * 64
     schema = codex_output_schemas.prompt_fusion_schema(
-        input_sha256=digest, visual_counts=(3, 2),
+        input_sha256=digest, segment_count=2,
     )
+    visuals = [f"frame {index}" for index in range(1, 10)]
     valid = {
         "schema": "duet.video-prompt-fusion-output", "version": 2,
         "input_sha256": digest,
         "segments": [
-            {"index": 1, "visual": ["first", "middle", "last"]},
-            {"index": 2, "visual": ["first", "last"]},
+            {"index": 1, "visual": visuals},
+            {"index": 2, "visual": visuals},
         ],
     }
     jsonschema.validate(valid, schema)
     invalid = json.loads(json.dumps(valid))
-    invalid["segments"].append({"index": 3, "visual": ["third"]})
+    invalid["segments"].append({"index": 3, "visual": visuals})
     try:
         jsonschema.validate(invalid, schema)
     except jsonschema.ValidationError:
@@ -364,13 +365,13 @@ def test_fusion_schema_binds_hash_segments_and_exact_visual_counts() -> None:
                 jsonschema.validate(invalid, schema)
 
 
-@pytest.mark.parametrize("visual_counts", [(), (0,), (10,), (True,)])
-def test_fusion_schema_refuses_an_invalid_generation_contract(
-    visual_counts: tuple[int, ...],
+@pytest.mark.parametrize("segment_count", [0, -1, True])
+def test_fusion_schema_refuses_an_invalid_segment_count(
+    segment_count: int,
 ) -> None:
-    with pytest.raises(ValueError, match="visual counts are invalid"):
+    with pytest.raises(ValueError, match="segment count is invalid"):
         codex_output_schemas.prompt_fusion_schema(
-            input_sha256="c" * 64, visual_counts=visual_counts,
+            input_sha256="c" * 64, segment_count=segment_count,
         )
 
 

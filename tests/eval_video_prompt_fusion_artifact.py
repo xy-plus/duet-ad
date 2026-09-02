@@ -45,16 +45,6 @@ _BINDING_RE = re.compile(
 )
 
 
-def _visual_counts(segments: list[dict]) -> tuple[int, ...]:
-    return tuple(
-        1 + sum(
-            frame["transition"]["type"] == "hard_cut"
-            for frame in segment["new_keyframes"][1:]
-        )
-        for segment in segments
-    )
-
-
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -199,7 +189,7 @@ def run_real_fusion(
             ),
             output_schema=codex_output_schemas.prompt_fusion_schema(
                 input_sha256=input_sha256,
-                visual_counts=_visual_counts(frozen["segments"]),
+                segment_count=len(frozen["segments"]),
             ),
         )
         artifact_data = output_path.read_bytes()

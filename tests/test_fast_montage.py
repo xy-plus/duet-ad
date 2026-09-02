@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import cv2
+import numpy as np
 import pytest
 
 from app import context_ir_bridge, h3, h3_project, long_generation, long_video
@@ -135,7 +137,12 @@ def test_build_and_load_fusion_consumes_all_twenty_five_cuts(tmp_path: Path):
     optimization_frames = []
     for frame in local_timeline:
         path = keyframe_dir / f"{frame['order']:02d}.png"
-        data = f"frame-{frame['order']}".encode()
+        ok, encoded = cv2.imencode(
+            ".png",
+            np.full((8, 8, 3), frame["order"], dtype=np.uint8),
+        )
+        assert ok
+        data = encoded.tobytes()
         path.write_bytes(data)
         frozen_frames.append((path, data))
         source_timeline.append({

@@ -3346,8 +3346,6 @@ def _prompt_fusion_early_output(
                 )
             except (KeyError, TypeError, long_generation.LongGenerationError):
                 raise ValueError("prompt fusion raw output is invalid") from None
-            if len(segment["visual"]) != len(expected):
-                raise ValueError("prompt fusion raw output is invalid")
             # relation_states from the model is merely a hint.  Overwrite a
             # wrong echo, or inject a missing one, from frozen backend input.
             segment["relation_states"] = expected
@@ -3368,17 +3366,6 @@ def _prompt_fusion_early_output(
             ):
                 raise ValueError("prompt fusion raw output is invalid") from None
     return _canonical_json_bytes(value) if normalized_relations else data
-
-
-def _prompt_fusion_visual_counts(input_segments: list[dict]) -> tuple[int, ...]:
-    """Derive the exact model-owned shot slots from frozen transitions."""
-    return tuple(
-        1 + sum(
-            frame["transition"]["type"] == "hard_cut"
-            for frame in segment["new_keyframes"][1:]
-        )
-        for segment in input_segments
-    )
 
 
 def queue_prompt_fusion(
@@ -3764,7 +3751,6 @@ def produce_prompt_fusion(
         if hashlib.sha256(input_data).hexdigest() != state.get("input_sha256"):
             raise PipelineError("prompt fusion input drifted")
         input_payload = _require_prompt_fusion_v2_input(input_data)
-        visual_counts = _prompt_fusion_visual_counts(input_payload["segments"])
         frozen_skill_data = milestone.read_bytes("video-prompt-fusion")
         if skill_bytes is not None and skill_bytes != frozen_skill_data:
             raise PipelineError("prompt fusion Skill bytes do not match CID milestone")
@@ -3811,7 +3797,7 @@ def produce_prompt_fusion(
                 ),
                 output_schema=codex_output_schemas.prompt_fusion_schema(
                     input_sha256=state["input_sha256"],
-                    visual_counts=visual_counts,
+                    segment_count=len(input_payload["segments"]),
                 ),
             )
         raw_output_data = _prompt_fusion_early_output(
