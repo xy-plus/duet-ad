@@ -519,6 +519,83 @@ def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
     assert "99 seconds" in frozen.final_prompts[0]
 
 
+def test_historical_shot_fusion_is_read_only_but_cannot_be_republished(
+    tmp_path: Path,
+) -> None:
+    frames = []
+    for order in range(1, 10):
+        data = f"frame-{order}".encode()
+        path = tmp_path / f"{order:02d}.png"
+        path.write_bytes(data)
+        frames.append({
+            "order": order,
+            "path": path.name,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "segment_time_s": float(order - 1),
+            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "transition": (
+                {"type": "start", "at_segment_s": 0.0}
+                if order == 1 else
+                {"type": "hard_cut", "at_segment_s": 3.0}
+                if order == 4 else
+                {"type": "continuous", "at_segment_s": None}
+            ),
+        })
+    input_data = _canonical({
+        "schema": long_generation.PROMPT_FUSION_INPUT_SCHEMA,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "segments": [{
+            "index": 1,
+            "new_keyframes": frames,
+            "old_video_prompt": {
+                "text": "old",
+                "sha256": hashlib.sha256(b"old").hexdigest(),
+            },
+            "image_optimization_prompt": [{
+                "order": order,
+                "text": "replace",
+                "sha256": hashlib.sha256(b"replace").hexdigest(),
+            } for order in range(1, 10)],
+            "audio_content": {
+                "lines_json": "[]",
+                "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
+                "voice_references": [],
+                "music_policy": "forbid",
+            },
+        }],
+    })
+    input_path = tmp_path / "multimodal_input.json"
+    output_path = tmp_path / "h3_prompt_plan.json"
+    input_path.write_bytes(input_data)
+    output_path.write_bytes(_canonical({
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{
+            "index": 1,
+            "visual": ["historical shot one", "historical shot two"],
+        }],
+    }))
+
+    historical = long_generation.load_prompt_fusion(
+        input_path=input_path,
+        output_path=output_path,
+        root=tmp_path,
+    )
+    assert "historical shot one" in historical.final_prompts[0]
+    assert "historical shot two" in historical.final_prompts[0]
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_output_invalid",
+    ):
+        long_generation.load_prompt_fusion(
+            input_path=input_path,
+            output_path=output_path,
+            root=tmp_path,
+            require_frame_visuals=True,
+        )
+
+
 def test_backend_ref2va_compiler_has_one_exact_provider_prompt() -> None:
     timeline = [{
         "order": order,

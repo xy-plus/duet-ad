@@ -1088,6 +1088,7 @@ def _compile_fusion_ref2va_prompt(
     *, visual: object, timeline: object, lines: object, music_policy: object,
     relation_occurrences: object = None, relation_states: object = None,
     cut_timeline: object = None,
+    allow_historical_shot_visuals: bool = False,
 ) -> str:
     """Compile the only provider-sendable prompt from backend authorities."""
     if music_policy != "forbid" or not isinstance(lines, list):
@@ -1099,10 +1100,16 @@ def _compile_fusion_ref2va_prompt(
         if not shots or transition_type == "hard_cut":
             shots.append([])
         shots[-1].append(frame)
-    if not isinstance(visual, list) or len(visual) != len(frozen_timeline):
+    frame_visuals = isinstance(visual, list) and len(visual) == len(frozen_timeline)
+    shot_visuals = (
+        allow_historical_shot_visuals
+        and isinstance(visual, list)
+        and len(visual) == len(shots)
+    )
+    if not frame_visuals and not shot_visuals:
         raise LongGenerationError("prompt_fusion_output_invalid")
     relation_contract_enabled = relation_occurrences is not None
-    visual_by_frame = [
+    normalized_visuals = [
         _provider_neutral_visual(item)
         for item in visual
     ]
@@ -1164,12 +1171,15 @@ def _compile_fusion_ref2va_prompt(
                 f"to <Picture {orders[0]}>. The shot then follows the ordered "
                 f"storyboard anchors {anchors}."
             )
-        frame_evidence = " ".join(
-            f"<Picture {int(frame['order'])}>: "
-            f"{visual_by_frame[int(frame['order']) - 1]}"
-            for frame in frames
-        )
-        details.append([f"{opening} {frame_evidence}"])
+        if frame_visuals:
+            frame_evidence = " ".join(
+                f"<Picture {int(frame['order'])}>: "
+                f"{normalized_visuals[int(frame['order']) - 1]}"
+                for frame in frames
+            )
+            details.append([f"{opening} {frame_evidence}"])
+        else:
+            details.append([f"{opening} {normalized_visuals[shot_index - 1]}"])
 
     cut_dialogue_lines: list[str] = []
     for expected_order, line in enumerate(lines, 1):
@@ -1318,6 +1328,7 @@ def _canonical_fusion_prompt(
 
 def load_prompt_fusion(
     *, input_path: Path, output_path: Path, root: Path | None = None,
+    require_frame_visuals: bool = False,
 ) -> FrozenPromptFusion:
     """Load one project-level fusion result and verify all ordered inputs."""
     input_path = Path(input_path)
@@ -1566,6 +1577,7 @@ def load_prompt_fusion(
                 music_policy=audio["music_policy"],
                 relation_occurrences=relation_occurrences,
                 cut_timeline=cut_timelines[index - 1],
+                allow_historical_shot_visuals=not require_frame_visuals,
             ))
         else:
             if (

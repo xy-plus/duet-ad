@@ -3476,7 +3476,10 @@ def _publish_prompt_fusion_manifest(
         raise PipelineError("prompt fusion Skill drifted")
     try:
         frozen = long_generation.load_prompt_fusion(
-            input_path=input_path, output_path=output_path, root=root,
+            input_path=input_path,
+            output_path=output_path,
+            root=root,
+            require_frame_visuals=True,
         )
     except long_generation.LongGenerationError as exc:
         raise PipelineError(exc.code) from None
