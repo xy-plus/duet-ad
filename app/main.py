@@ -2464,6 +2464,27 @@ def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
     )
 
 
+def _has_listable_generated_video(settings: Settings, meta: dict) -> bool:
+    """Validate only the terminal artifact needed by conversation summaries."""
+    if "published_preview_receipt" in meta:
+        return _has_valid_generated_video(settings, meta)
+    generation = meta.get("generation")
+    if generation is None:
+        cid = meta.get("id")
+        return (
+            isinstance(cid, str)
+            and (settings.data_dir / cid / "generated.mp4").is_file()
+        )
+    if not isinstance(generation, dict) or generation.get("status") != "succeeded":
+        return False
+    cid = meta.get("id")
+    if not isinstance(cid, str):
+        return False
+    if _uses_segment_coordinator(meta):
+        return stitch.terminal_output_is_listable(settings.data_dir / cid)
+    return _has_valid_generated_video(settings, meta)
+
+
 def _validate_published_preview(settings: Settings, meta: dict) -> bool:
     """Validate a portable display copy against its untouched source chain."""
     cid = meta.get("id")
@@ -4091,7 +4112,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def list_conversations():
         result = []
         for meta in storage.list_conversations(settings.data_dir):
-            has_video = _has_valid_generated_video(settings, meta)
+            has_video = _has_listable_generated_video(settings, meta)
             public_status, _public_error = _public_conversation_status(meta)
             result.append({
                 "id": meta["id"],

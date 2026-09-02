@@ -166,6 +166,13 @@ def test_navigation_status_matrix_is_authoritative_and_consistent(
             _settings.data_dir / candidate["id"] / "generated.mp4"
         ).is_file(),
     )
+    monkeypatch.setattr(
+        main_module,
+        "_has_listable_generated_video",
+        lambda _settings, candidate: (
+            _settings.data_dir / candidate["id"] / "generated.mp4"
+        ).is_file(),
+    )
 
     with TestClient(create_app(settings)) as client:
         listed = client.get("/api/conversations", headers=AUTH).json()[0]
@@ -176,6 +183,41 @@ def test_navigation_status_matrix_is_authoritative_and_consistent(
     assert listed["has_video"] is has_video
     assert detail["has_video"] is has_video
     assert "secret-provider-task" not in json.dumps(detail)
+
+
+def test_list_uses_terminal_output_binding_without_full_media_validation(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(
+        settings.data_dir, note="fast list", orig_name="a.mp4"
+    )
+    cid = meta["id"]
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status="done",
+        generation={"status": "succeeded"},
+        _postprocess_receipt={"version": 4, "options": {}},
+    )
+    calls = []
+    monkeypatch.setattr(
+        main_module.stitch,
+        "terminal_output_is_listable",
+        lambda root: calls.append(root) or True,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_has_valid_generated_video",
+        lambda *_args: pytest.fail("list must not run full media validation"),
+    )
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/api/conversations", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json()[0]["has_video"] is True
+    assert calls == [settings.data_dir / cid]
 
 
 @pytest.mark.parametrize("generation_status", [None, "succeeded"])

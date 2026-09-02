@@ -212,6 +212,33 @@ def test_terminal_stitch_validation_ignores_upstream_schema_but_binds_media(
     assert not stitch.terminal_output_is_valid(root)
 
 
+def test_terminal_output_summary_binds_only_final_artifact(tmp_path):
+    root = tmp_path / "conversation"
+    root.mkdir()
+    output = root / "generated.mp4"
+    output.write_bytes(b"published-video")
+    receipt = {
+        "schema": "duet.stitch",
+        "version": 2,
+        "segments": [{"summary-does-not-open-upstream": True}],
+        "audio": {"summary-does-not-open-upstream": True},
+        "output": {
+            "name": "generated.mp4",
+            "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+            "size": output.stat().st_size,
+            "duration_s": 1.0,
+            "fps": stitch.FPS,
+        },
+    }
+    (root / stitch.RECEIPT_FILENAME).write_text(
+        json.dumps(receipt), encoding="utf-8"
+    )
+
+    assert stitch.terminal_output_is_listable(root)
+    output.write_bytes(b"tampered")
+    assert not stitch.terminal_output_is_listable(root)
+
+
 def test_provider_generated_stitch_fills_missing_h3_audio_on_same_edl(
     tmp_path,
 ):

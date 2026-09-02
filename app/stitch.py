@@ -642,6 +642,62 @@ def terminal_output_is_valid(root: Path) -> bool:
         return False
 
 
+def terminal_output_is_listable(root: Path) -> bool:
+    """Check the terminal publication metadata used by list summaries.
+
+    This intentionally avoids hashing or probing media.  It checks the final
+    file's publication metadata against the immutable receipt; full source,
+    segment, audio, content-hash, and media validation remains the authority
+    when a conversation detail is opened.
+    """
+    try:
+        root = Path(root).resolve()
+        output = root / "generated.mp4"
+        receipt_path = root / RECEIPT_FILENAME
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema", "version", "segments", "audio", "output"}
+            or payload.get("schema") != "duet.stitch"
+            or payload.get("version") not in {1, 2}
+        ):
+            return False
+        bound_output = payload.get("output")
+        if (
+            not isinstance(bound_output, dict)
+            or set(bound_output) != {"name", "sha256", "size", "duration_s", "fps"}
+            or bound_output.get("name") != output.name
+            or not isinstance(bound_output.get("sha256"), str)
+            or len(bound_output["sha256"]) != 64
+            or any(char not in "0123456789abcdef" for char in bound_output["sha256"])
+            or isinstance(bound_output.get("size"), bool)
+            or not isinstance(bound_output.get("size"), int)
+            or bound_output["size"] <= 0
+            or bound_output.get("fps") != FPS
+        ):
+            return False
+        duration_s = float(bound_output.get("duration_s"))
+        if not math.isfinite(duration_s) or duration_s <= 0:
+            return False
+        output_stat = output.stat()
+        receipt_stat = receipt_path.stat()
+        return (
+            output.is_file()
+            and not output.is_symlink()
+            and not receipt_path.is_symlink()
+            and output_stat.st_size == bound_output["size"]
+            and output_stat.st_mtime_ns <= receipt_stat.st_mtime_ns
+        )
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
 def stitch_video(
     *,
     segments: Sequence[StitchSegment],
