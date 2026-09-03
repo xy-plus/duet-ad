@@ -287,7 +287,6 @@ input, textarea { font-family: inherit; }
   color: rgba(0, 0, 0, .24);
 }
 
-.conv-id { font-family: var(--mono); }
 .conv-footer > span:first-child { overflow: hidden; text-overflow: ellipsis; }
 .conv-footer .conv-time { margin-left: auto; }
 .conv-output { padding: 1px 5px; border-radius: 999px; }

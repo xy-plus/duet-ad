@@ -746,9 +746,10 @@ def test_view_only_configuration_blocks_hidden_file_and_drop_paths():
     )
 
 
-def test_reference_image_picker_defers_real_format_validation_to_server():
+def test_reference_image_picker_rejects_unsupported_formats_before_submit():
     html = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
+    file_check = _function_source(source, "isReferenceImageFile")
     picker = _function_source(source, "pickReplacementImage")
     capability_loader = _function_source(source, "loadMinimalCreationCapability")
 
@@ -756,10 +757,10 @@ def test_reference_image_picker_defers_real_format_validation_to_server():
         html, "input", "replacement-image-input"
     )
     assert '$("replacement-image-input").accept = normalized.replacement.accept.join(",")' in capability_loader
-    assert "isReferenceImageFile" not in source
-    assert "file.type" not in picker
-    assert "jpe?g|png|webp" not in picker
-    assert "参考图仅支持" not in picker
+    assert "REPLACEMENT_IMAGE_TYPES.includes(file.type)" in file_check
+    assert "jpe?g|png|webp" in file_check
+    assert "if (!isReferenceImageFile(file))" in picker
+    assert "参考图仅支持 JPG、PNG 或 WebP" in picker
     assert "file.size > capability.replacement.max_bytes" in picker
     assert "state.replacementImage = file" in picker
 
@@ -857,7 +858,6 @@ def test_sidebar_project_cards_restore_0903_information_density_and_manual_selec
         'const badgeState = conversationBadge(c);',
         'el("span", "badge " + badgeState.className, badgeState.text)',
         'el("span", "conv-identity")',
-        'el("span", "conv-id", "#" + shortId(c.id))',
         "formatDuration(c.duration_s)",
         'c.segment_count + " 段"',
         'el("span", "conv-footer")',
@@ -866,6 +866,7 @@ def test_sidebar_project_cards_restore_0903_information_density_and_manual_selec
         'c.has_video === true ? "成片已提交" : "等待成片"',
     ):
         assert visible_project_field in render_list
+    assert 'el("span", "conv-id", "#" + shortId(c.id))' not in render_list
 
     assert 'c.id === state.currentId ? " selected" : ""' in render_list
     click_handler = render_list.split('item.addEventListener("click", () => {', 1)[1]
@@ -894,9 +895,8 @@ def test_sidebar_refresh_uses_list_summaries_without_n_plus_one_detail_requests(
     assert "loadDetail(" not in thumbnail
 
 
-def test_enter_app_restores_stored_selection_once_after_list_load():
+def test_enter_app_stays_new_until_manual_or_created_project_selection():
     source = APP_JS.read_text(encoding="utf-8")
-    show_login = _function_source(source, "showLogin")
     enter = _function_source(source, "enterApp").split(
         "/* ===== 侧栏会话列表 ===== */", 1
     )[0]
@@ -915,19 +915,15 @@ def test_enter_app_restores_stored_selection_once_after_list_load():
         "refreshList(false)",
     ):
         assert new_project_action in enter
-    assert "state.pendingRestoreId = storedSelectedProjectId();" in enter
-    assert "storedSelectedProjectId()" not in show_login
+    assert "SELECTED_PROJECT_KEY" not in source
+    assert "storedSelectedProjectId" not in source
+    assert "state.pendingRestoreId" not in source
+    assert "rememberSelectedProjectId" not in source
+    assert "clearSelectedProjectId" not in source
     assert "refreshList(true)" not in enter
     assert "selectConversation(" not in enter
-    assert refresh.index('apiJSON("/api/conversations")') < refresh.index(
-        "const restoreId = state.pendingRestoreId;"
-    )
-    assert refresh.index("state.pendingRestoreId = null;") < refresh.index(
-        "selectConversation(restoreId);"
-    )
-    assert refresh.count("selectConversation(restoreId);") == 1
-    assert "state.conversations.some((item) => item.id === restoreId)" in refresh
-    assert "clearSelectedProjectId();" in refresh
+    assert refresh.count('apiJSON("/api/conversations")') == 1
+    assert "selectConversation(" not in refresh
 
     click_handler = render_list.split('item.addEventListener("click", () => {', 1)[1]
     assert "selectConversation(c.id);" in click_handler
@@ -939,7 +935,6 @@ def test_enter_app_restores_stored_selection_once_after_list_load():
     for reset_action in (
         "state.currentId = null",
         "state.detail = null",
-        "clearSelectedProjectId()",
         "resetComposerForNewProject()",
         "renderEmptyHero()",
     ):
@@ -970,7 +965,6 @@ def test_initial_detail_failure_clears_selection_and_returns_to_new_project():
     for action in (
         "state.currentId = null",
         "state.detail = null",
-        "clearSelectedProjectId()",
         "resetComposerForNewProject()",
         "resetGenerationConfigDisclosure()",
         "renderList()",
@@ -982,7 +976,6 @@ def test_initial_detail_failure_clears_selection_and_returns_to_new_project():
     ordered_actions = (
         "state.currentId = null",
         "state.detail = null",
-        "clearSelectedProjectId()",
         "resetComposerForNewProject()",
         "renderList()",
         "renderEmptyHero()",

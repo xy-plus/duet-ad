@@ -6,7 +6,6 @@
 /* ===== 常量与状态 ===== */
 const TOKEN_KEY = "cvs_token";
 const COMPOSER_SNAPSHOTS_KEY = "cvs_minimal_creation_snapshots_v1";
-const SELECTED_PROJECT_KEY = "cvs_selected_project_v1";
 const POLL_MS = 2000;
 const GENERATION_ASPECT_RATIOS = Object.freeze(["16:9", "9:16"]);
 const GENERATION_RESOLUTIONS = Object.freeze(["480p", "768p"]);
@@ -36,7 +35,6 @@ const state = {
   authEpoch: 0,       // 同一口令重新登录也必须使旧异步请求失效
   conversations: [],
   currentId: null,
-  pendingRestoreId: null,
   detail: null,        // 当前会话详情
   file: null,          // composer 已选文件
   replacementImage: null,
@@ -394,35 +392,6 @@ function storedComposerDraft(conversationId) {
   }
 }
 
-function storedSelectedProjectId() {
-  if (typeof sessionStorage === "undefined") return null;
-  try {
-    const value = sessionStorage.getItem(SELECTED_PROJECT_KEY);
-    return typeof value === "string" && value.trim() ? value.trim() : null;
-  } catch (_error) {
-    return null;
-  }
-}
-
-function rememberSelectedProjectId(conversationId) {
-  if (!conversationId || typeof sessionStorage === "undefined") return;
-  try {
-    sessionStorage.setItem(SELECTED_PROJECT_KEY, conversationId);
-  } catch (_error) {
-    // 浏览器禁用会话存储时，仅失去刷新后恢复当前项目的能力。
-  }
-}
-
-function clearSelectedProjectId() {
-  state.pendingRestoreId = null;
-  if (typeof sessionStorage === "undefined") return;
-  try {
-    sessionStorage.removeItem(SELECTED_PROJECT_KEY);
-  } catch (_error) {
-    // 无法访问会话存储时，内存状态仍会回到新建项目。
-  }
-}
-
 function rememberSubmittedComposer(conversationId, request, inputs, response = null) {
   if (!conversationId) return;
   const input = resolveCreationInputSnapshot(response, creationInputSnapshot(inputs));
@@ -451,7 +420,6 @@ function clearComposerSnapshots() {
   if (state.replacementPreviewURL) URL.revokeObjectURL(state.replacementPreviewURL);
   state.replacementPreviewURL = null;
   state.replacementPreviewOwnerId = null;
-  clearSelectedProjectId();
   if (typeof sessionStorage !== "undefined") {
     try {
       sessionStorage.removeItem(COMPOSER_SNAPSHOTS_KEY);
@@ -1581,7 +1549,6 @@ function enterApp() {
   $("app-view").hidden = false;
   state.currentId = null;
   state.detail = null;
-  state.pendingRestoreId = storedSelectedProjectId();
   resetComposerForNewProject();
   resetGenerationConfigDisclosure();
   renderEmptyHero();
@@ -1599,14 +1566,6 @@ async function refreshList() {
     );
     releaseHistoryThumbnails(new Set(state.conversations.map((item) => item.id)));
     renderList();
-    const restoreId = state.pendingRestoreId;
-    state.pendingRestoreId = null;
-    if (restoreId && !state.currentId
-        && state.conversations.some((item) => item.id === restoreId)) {
-      selectConversation(restoreId);
-    } else if (restoreId) {
-      clearSelectedProjectId();
-    }
     void hydrateConversationSummaries();
   } catch (err) {
     if (handleAuthError(err)) return;
@@ -1736,7 +1695,6 @@ function renderList() {
     heading.appendChild(badge);
     content.appendChild(heading);
     const identity = el("span", "conv-identity");
-    identity.appendChild(el("span", "conv-id", "#" + shortId(c.id)));
     identity.appendChild(el("span", null, formatDuration(c.duration_s)));
     if (Number.isInteger(c.segment_count) && c.segment_count > 0) {
       identity.appendChild(el("span", null, c.segment_count + " 段"));
@@ -4449,7 +4407,6 @@ async function loadDetail(id, silent) {
     }
     state.currentId = null;
     state.detail = null;
-    clearSelectedProjectId();
     resetComposerForNewProject();
     resetGenerationConfigDisclosure();
     renderList();
@@ -4471,7 +4428,6 @@ async function selectConversation(id) {
   delete state.ppResultExpanded[id];
   resetSegmentProductsDisclosure(id);
   state.currentId = id;
-  rememberSelectedProjectId(id);
   if (switchingProject) {
     state.detail = null;
     prepareComposerForProjectLoad();
@@ -4784,6 +4740,12 @@ function clearFile() {
   updateSendBtn();
 }
 
+function isReferenceImageFile(file) {
+  if (!file) return false;
+  if (file.type) return REPLACEMENT_IMAGE_TYPES.includes(file.type);
+  return /\.(jpe?g|png|webp)$/i.test(file.name || "");
+}
+
 function updateReplacementHint() {
   const hasImage = !!state.replacementImage;
   const hasSubmittedImage = !!state.submittedReplacement;
@@ -4826,6 +4788,10 @@ function pickReplacementImage(file) {
   if (state.viewingSubmittedConfig) return;
   setComposerError(null);
   if (!file) return;
+  if (!isReferenceImageFile(file)) {
+    setComposerError("参考图仅支持 JPG、PNG 或 WebP");
+    return;
+  }
   const capability = state.minimalCreationCapability;
   if (capability && file.size > capability.replacement.max_bytes) {
     setComposerError("参考图过大，请选择不超过 " + fmtBytes(capability.replacement.max_bytes) + " 的图片");
@@ -5221,7 +5187,6 @@ function bindEvents() {
     if (!await guardDirtyPrompt()) return;
     state.currentId = null;
     state.detail = null;
-    clearSelectedProjectId();
     resetComposerForNewProject();
     resetGenerationConfigDisclosure();
     renderList();
