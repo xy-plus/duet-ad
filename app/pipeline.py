@@ -48,7 +48,7 @@ from typing import NoReturn
 
 import cv2
 
-from app import asr, codex_output_schemas, dialogue_review, error_trace, frame_fit, generation_config, h3, h3_project, image_optimization, long_generation, long_video, mediakit, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
+from app import asr, codex_output_schemas, dialogue_review, error_trace, frame_fit, generation_config, h3, h3_project, image_optimization, keyframe_contract, long_generation, long_video, mediakit, prepared_input, scenes as scene_planner, skill_milestone, storage, vocal, voice
 from app.codex_runner import (
     CodexError,
     CodexOutputValidationError,
@@ -475,12 +475,14 @@ def _materialize_backend_keyframes(
     work: Path,
     selection: list[dict],
 ) -> tuple[list[str], dict, tuple[bytes, ...]]:
-    """Decode and freeze the backend planner's exact ordered nine frames."""
+    """Decode and freeze the backend planner's exact ordered three frames."""
     if (
         not isinstance(selection, list)
         or len(selection) != scene_planner.KEYFRAMES_PER_SEGMENT
     ):
-        raise PipelineError("backend keyframe selection must contain exactly nine frames")
+        raise PipelineError(
+            "backend keyframe selection must contain exactly three frames"
+        )
     indices: list[int] = []
     for order, item in enumerate(selection, 1):
         decode_index = item.get("decode_frame_index") if isinstance(item, dict) else None
@@ -520,7 +522,7 @@ def _materialize_backend_keyframes(
         )
 
     frozen = tuple(encoded[index] for index in indices)
-    names = [f"{order:02d}.png" for order in range(1, 10)]
+    names = list(keyframe_contract.FRAME_NAMES)
     stage_root = Path(tempfile.mkdtemp(prefix=".keyframes-stage-", dir=work))
     staged = stage_root / "keyframes"
     target = work / "keyframes"
@@ -582,7 +584,7 @@ def _prepare_previsual_keyframes(
         )
     ):
         raise PipelineError("backend keyframe sampling receipt is invalid")
-    names = [f"{order:02d}.png" for order in range(1, 10)]
+    names = list(keyframe_contract.FRAME_NAMES)
     sources = [work / "keyframes" / name for name in names]
     if any(not path.is_file() for path in sources):
         raise PipelineError("backend frozen keyframes are required")
@@ -648,10 +650,14 @@ def _prepare_previsual_keyframes(
     except mediakit.MediaKitError as exc:
         raise PipelineError(exc.detail) from None
     canonical = tuple(path.read_bytes() for path in canonical_paths)
-    if len(canonical) != 9 or any(not data for data in canonical):
+    if (
+        len(canonical) != keyframe_contract.KEYFRAMES_PER_SEGMENT
+        or any(not data for data in canonical)
+    ):
         raise PipelineError("previsual keyframe set is invalid")
     sealed = deepcopy(sampling_receipt)
-    sealed["version"] = 2
+    sealed["version"] = keyframe_contract.SAMPLING_RECEIPT_VERSION
+    sealed["keyframe_count"] = keyframe_contract.KEYFRAMES_PER_SEGMENT
     sealed["preprocess"] = dict(render_options)
     for name, item, path, data in zip(
         names, sealed["keyframes"], canonical_paths, canonical,
@@ -950,6 +956,14 @@ def _generate_project_element_index(
         skill_bytes = milestone.read_bytes("video-maker")
     if skill_bytes is None:
         raise PipelineError("frozen video-maker Skill is required")
+    frame_counts = {len(paths) for paths in frame_paths.values()}
+    if (
+        len(frame_counts) != 1
+        or next(iter(frame_counts), None)
+        not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS
+    ):
+        raise PipelineError("project index frame set is invalid")
+    keyframe_count = next(iter(frame_counts))
     target = cdir / "work" / "element_index.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.unlink(missing_ok=True)
@@ -1098,7 +1112,9 @@ def _generate_project_element_index(
                 sum(len(paths) for paths in frame_paths.values())
             ),
             validate_output=validate,
-            output_schema=codex_output_schemas.PROJECT_INDEX_SCHEMA,
+            output_schema=codex_output_schemas.project_index_schema(
+                keyframe_count=keyframe_count,
+            ),
         )
         if filter_diagnostics is not None:
             error_trace.record(
@@ -1192,7 +1208,7 @@ def _run_visual_codex(
         _materialize_skill_bytes(stage / "SKILL.md", skill_bytes)
         skip = {"keyframes", "prompt.txt", "codex_last_message.txt"}
         if frozen_keyframes is not None:
-            # Current projects arrive with nine server-selected keyframes.
+            # Current projects arrive with three server-selected keyframes.
             # Do not expose the raw extraction/contact sheets as a second image set.
             skip.update(
                 candidate.name
@@ -1674,7 +1690,7 @@ def _generate_segmented_image_prompts(
         relative_paths = meta.get("keyframe_paths") if isinstance(meta, dict) else None
         if (
             not isinstance(relative_paths, list)
-            or len(relative_paths) != scene_planner.KEYFRAMES_PER_SEGMENT
+            or not relative_paths
             or any(not isinstance(path, str) or not path for path in relative_paths)
         ):
             raise PipelineError("previsual keyframe set is invalid")
@@ -1691,10 +1707,23 @@ def _generate_segmented_image_prompts(
             ]
         except (KeyError, TypeError):
             raise PipelineError("previsual keyframe set is invalid") from None
+        sampling_version = (
+            sampling.get("version") if isinstance(sampling, dict) else None
+        )
+        if sampling_version == keyframe_contract.SAMPLING_RECEIPT_VERSION:
+            expected_count = keyframe_contract.KEYFRAMES_PER_SEGMENT
+            marker_valid = sampling.get("keyframe_count") == expected_count
+        elif sampling_version == keyframe_contract.LEGACY_SAMPLING_RECEIPT_VERSION:
+            expected_count = keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+            marker_valid = True
+        else:
+            expected_count = 0
+            marker_valid = False
         if (
             not isinstance(sampling, dict)
-            or sampling.get("version") != 2
-            or len(expected_sha256s) != scene_planner.KEYFRAMES_PER_SEGMENT
+            or not marker_valid
+            or len(relative_paths) != expected_count
+            or len(expected_sha256s) != expected_count
             or any(
                 hashlib.sha256(path.read_bytes()).hexdigest() != expected
                 for path, expected in zip(paths, expected_sha256s, strict=True)
@@ -2372,14 +2401,24 @@ def _bind_keyframe_source_timeline(
             receipt = meta["keyframe_sampling"]
             items = receipt.get("keyframes")
             names = meta.get("keyframes")
+            receipt_version = receipt.get("version")
+            if receipt_version == keyframe_contract.SAMPLING_RECEIPT_VERSION:
+                expected_count = keyframe_contract.KEYFRAMES_PER_SEGMENT
+                marker_valid = receipt.get("keyframe_count") == expected_count
+            elif receipt_version == keyframe_contract.LEGACY_SAMPLING_RECEIPT_VERSION:
+                expected_count = keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+                marker_valid = True
+            else:
+                expected_count = 0
+                marker_valid = False
             if (
                 segment.get("index") != expected_index
                 or meta.get("index") != expected_index
                 or receipt.get("schema") != "duet.backend-keyframe-sampling"
-                or receipt.get("version") != 2
+                or not marker_valid
                 or not isinstance(items, list)
-                or len(items) != scene_planner.KEYFRAMES_PER_SEGMENT
-                or names != [f"{order:02d}.png" for order in range(1, 10)]
+                or len(items) != expected_count
+                or names != list(keyframe_contract.frame_names(expected_count))
             ):
                 raise PipelineError("backend keyframe source timeline is invalid")
             sources = []
@@ -2536,8 +2575,8 @@ def _bind_keyframe_source_timeline(
         names = meta.get("keyframes")
         if (
             not isinstance(names, list)
-            or len(names) != 9
-            or names != [f"{order:02d}.png" for order in range(1, 10)]
+            or len(names) != keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+            or names != list(keyframe_contract.LEGACY_FRAME_NAMES)
         ):
             raise PipelineError("keyframe source timeline is invalid")
         segwork = work / "segments" / str(expected_index) / "work"
@@ -2936,8 +2975,8 @@ def _process_segment(settings: Settings, work: Path, source: Path, seg: dict, ru
         )
         if frozen_keyframes is not None:
             visual_request += (
-                "\n后端已按唯一场景采样算法冻结 work/keyframes/01.png 至 09.png。"
-                "逐张读取这九帧并据其既定顺序写 prompt.txt；禁止增删、替换、重排或修改任何关键帧。\n"
+                "\n后端已按唯一场景采样算法冻结 work/keyframes/01.png 至 03.png。"
+                "逐张读取这三帧并据其既定顺序写 prompt.txt；禁止增删、替换、重排或修改任何关键帧。\n"
             )
         keyframes, prompt = _run_visual_with_retry(
             settings,
@@ -3184,7 +3223,7 @@ def _canonical_json_bytes(value: object) -> bytes:
         raise PipelineError("prompt fusion artifact is invalid") from None
 
 
-def _require_prompt_fusion_v2_input(input_data: bytes) -> dict:
+def _require_current_prompt_fusion_input(input_data: bytes) -> dict:
     """Creation may consume only the current source-timeline contract."""
     try:
         payload = json.loads(input_data.decode("utf-8"))
@@ -3206,7 +3245,7 @@ def _require_prompt_fusion_v2_input(input_data: bytes) -> dict:
             not isinstance(segment, dict)
             or segment.get("index") != index
             or not isinstance(frames, list)
-            or len(frames) != 9
+            or len(frames) != keyframe_contract.KEYFRAMES_PER_SEGMENT
         ):
             raise PipelineError("prompt fusion input is invalid")
         try:
@@ -3217,6 +3256,7 @@ def _require_prompt_fusion_v2_input(input_data: bytes) -> dict:
                         "order", "segment_time_s", "source_scene_id", "transition",
                     )
                 } for frame in frames],
+                expected_count=keyframe_contract.KEYFRAMES_PER_SEGMENT,
             )
             if "relation_occurrences" in segment:
                 long_generation._freeze_fusion_relation_occurrences(
@@ -3337,7 +3377,9 @@ def _prompt_fusion_early_output(
                         "order", "segment_time_s", "source_scene_id",
                         "transition",
                     )
-                } for frame in source_segment["new_keyframes"]])
+                } for frame in source_segment["new_keyframes"]],
+                    expected_count=keyframe_contract.KEYFRAMES_PER_SEGMENT,
+                )
                 occurrences = long_generation._freeze_fusion_relation_occurrences(
                     source_segment["relation_occurrences"], timeline,
                 )
@@ -3414,7 +3456,7 @@ def queue_prompt_fusion(
         or len(image_acceptance_sha256) != 64
     ):
         raise PipelineError("prompt fusion input is invalid")
-    _require_prompt_fusion_v2_input(input_data)
+    _require_current_prompt_fusion_input(input_data)
     input_path = work / h3_project.SKILL_INPUT_FILENAME
     output_path = work / "h3_prompt_plan.json"
     manifest_path = work / h3_project.SOURCE_FILENAME
@@ -3783,7 +3825,7 @@ def produce_prompt_fusion(
         input_data = input_path.read_bytes()
         if hashlib.sha256(input_data).hexdigest() != state.get("input_sha256"):
             raise PipelineError("prompt fusion input drifted")
-        input_payload = _require_prompt_fusion_v2_input(input_data)
+        input_payload = _require_current_prompt_fusion_input(input_data)
         visual_max_chars = _prompt_fusion_visual_max_chars(
             input_payload["segments"],
         )
@@ -3836,6 +3878,7 @@ def produce_prompt_fusion(
                     input_sha256=state["input_sha256"],
                     segment_count=len(input_payload["segments"]),
                     visual_max_chars=visual_max_chars,
+                    keyframe_count=keyframe_contract.KEYFRAMES_PER_SEGMENT,
                 ),
             )
         raw_output_data = _prompt_fusion_early_output(

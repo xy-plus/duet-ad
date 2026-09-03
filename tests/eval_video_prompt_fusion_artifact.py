@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from app import codex_output_schemas, pipeline
+from app import codex_output_schemas, keyframe_contract, pipeline
 from app.codex_runner import CodexRunner
 
 
@@ -83,7 +83,7 @@ def _validate_fusion_output(
             or set(segment) != {"index", "visual"}
             or segment.get("index") != index
             or not isinstance(visuals, list)
-            or not visuals
+            or len(visuals) != keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
             or any(not isinstance(text, str) or not text.strip() for text in visuals)
         ):
             raise ValueError("fusion output segment is invalid")
@@ -197,6 +197,7 @@ def run_real_fusion(
                 input_sha256=input_sha256,
                 segment_count=len(frozen["segments"]),
                 visual_max_chars=visual_max_chars,
+                keyframe_count=keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT,
             ),
         )
         artifact_data = output_path.read_bytes()
@@ -319,7 +320,7 @@ def build_inventory(input_path: Path, artifact_path: Path) -> dict[str, Any]:
                 "media": media,
                 "hard_cut_intervals": intervals,
                 "interval_bindings": interval_bindings,
-                "expected_visual_count": len(intervals),
+                "expected_visual_count": len(media),
                 "actual_visual_count": len(visuals),
                 "visual": visuals,
                 "visual_binding_token_leaks": [

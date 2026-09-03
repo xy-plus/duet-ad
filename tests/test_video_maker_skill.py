@@ -14,7 +14,7 @@ def _text() -> str:
 def test_segment_contract_keeps_backend_authority_and_schema_output():
     text = _text()
     for required in (
-        "segments[N>=1]", "work/keyframes/01.png", "09.png", "由后端负责",
+        "segments[N>=1]", "work/keyframes/01.png", "03.png", "由后端负责",
         "JSON Schema", "禁止创建或修改", "动作因果", "segment 时间轴",
     ):
         assert required in text

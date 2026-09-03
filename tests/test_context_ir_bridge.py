@@ -306,7 +306,7 @@ def _no_audio_frozen(
 def _reference_fusion_frozen(
     tmp_path: Path, *, dialogue: bool = True,
 ) -> context_ir_bridge.FrozenContextIrRequest:
-    """Freeze the current nine-frame Ref2VA/reference prompt shape."""
+    """Freeze the current three-frame Ref2VA/reference prompt shape."""
     base = _no_audio_frozen(tmp_path)
     line = (
         "From 00:01.000 to 00:02.000, the off-screen narrator says: "
@@ -319,7 +319,7 @@ def _reference_fusion_frozen(
         "subject_definitions:",
         *[
             f"<Picture {order}> is the storyboard anchor for ordered visual state."
-            for order in range(1, 10)
+            for order in range(1, 4)
         ],
         "summary:",
         "The target follows all ordered storyboard anchors.",
@@ -338,7 +338,7 @@ def _reference_fusion_frozen(
             tmp_path / f"fusion-{order:02d}.png",
             _png(7 + order, 9 + order, 16 * order),
         )
-        for order in range(1, 10)
+        for order in range(1, 4)
     )
     voice_texts = ("这是严格冻结的台词",) if dialogue else ()
     source = replace(
@@ -376,17 +376,17 @@ def _timeline_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest
     base = _no_audio_frozen(tmp_path)
     timeline = []
     for order, segment_time_s in enumerate(
-        [0.0, 1.0, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0], 1
+        [0.0, 2.5, 14.0], 1
     ):
         timeline.append({
             "order": order,
             "segment_time_s": segment_time_s,
-            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "source_scene_id": "SCENE_01" if order < 2 else "SCENE_02",
             "transition": (
                 {"type": "start", "at_segment_s": 0.0}
                 if order == 1 else
                 {"type": "hard_cut", "at_segment_s": 2.267}
-                if order == 4 else
+                if order == 2 else
                 {"type": "continuous", "at_segment_s": None}
             ),
         })
@@ -407,6 +407,13 @@ def _timeline_frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest
     source = replace(
         base.source_h3_request,
         prompt=prompt,
+        keyframes=tuple(
+            (
+                tmp_path / f"timeline-{order:02d}.png",
+                _png(7 + order, 9 + order, 16 * order),
+            )
+            for order in range(1, 4)
+        ),
         skill_plan_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
     )
     return context_ir_bridge.freeze_context_ir_request(
@@ -468,7 +475,7 @@ def test_reference_ref2va_uses_context_ir_and_binds_optimized_prompt(
     assert sum(
         request.method == "POST" and request.url.path == "/v1/files/upload"
         for request in observed
-    ) == 9
+    ) == 3
     assert sum(
         request.method == "POST" and request.url.path == "/v2/h3_context_ir"
         for request in observed
@@ -528,7 +535,7 @@ def test_context_ir_images_are_half_resolution_but_h3_keeps_full_order(
         if reference.role == "reference_image"
     )
 
-    assert len(images) == len(frozen.source_h3_request.keyframes) == 9
+    assert len(images) == len(frozen.source_h3_request.keyframes) == 3
     for order, (reference, (path, source_data)) in enumerate(zip(
         images, frozen.source_h3_request.keyframes,
     ), 1):
@@ -1486,7 +1493,7 @@ def test_context_ir_scores_moved_fusion_contract_blocks_without_blocking_h3(
     assert not (frozen.workdir / ".h3").exists()
 
 
-def test_context_ir_rejects_non_nine_keyframe_timeline():
+def test_context_ir_rejects_non_three_keyframe_timeline():
     timeline = [{
         "order": 1,
         "segment_time_s": 0.0,
@@ -1503,7 +1510,9 @@ def test_context_ir_rejects_non_nine_keyframe_timeline():
         context_ir_bridge.ContextIrContractError,
         match="context_ir_semantic_mismatch",
     ):
-        context_ir_bridge._keyframe_timeline_contract(prompt)
+        context_ir_bridge._keyframe_timeline_contract(
+            prompt, expected_count=3,
+        )
 
 
 def test_receipt_bound_voice_allows_context_to_split_off_screen_dialogue(tmp_path):

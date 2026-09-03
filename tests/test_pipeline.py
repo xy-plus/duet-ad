@@ -182,7 +182,10 @@ def _long_dual_target_plan_v3(*, frame_count: int = 3):
 
 @pytest.fixture(autouse=True)
 def _stub_image_postprocess_codex(monkeypatch):
-    def project_index(_runner, cdir, _frame_paths):
+    def project_index(
+        _runner, cdir, _frame_paths, *, skill_bytes, render_options=None,
+    ):
+        del skill_bytes, render_options
         path = Path(cdir) / "work" / "element_index.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -314,7 +317,7 @@ def _replace_source_with_duration(settings, cid: str, duration_s: float) -> Path
     return source
 
 
-def test_backend_materializes_exact_nine_in_frozen_order_with_repeat_receipt(
+def test_backend_materializes_exact_three_in_frozen_order_without_repeat(
     tmp_path, video_1s,
 ):
     work = tmp_path / "work"
@@ -344,15 +347,16 @@ def test_backend_materializes_exact_nine_in_frozen_order_with_repeat_receipt(
         video_1s, work, selection
     )
 
-    assert names == [f"{index:02d}.png" for index in range(1, 10)]
-    assert len(frozen) == 9
+    assert names == [f"{index:02d}.png" for index in range(1, 4)]
+    assert len(frozen) == 3
     assert [item["decode_frame_index"] for item in receipt["keyframes"]] == [
         item["decode_frame_index"] for item in selection
     ]
     assert [item["repeated"] for item in receipt["keyframes"]] == [
         item["repeated"] for item in selection
     ]
-    assert receipt["keyframes"][0]["sha256"] == receipt["keyframes"][1]["sha256"]
+    assert len({item["sha256"] for item in receipt["keyframes"]}) == 3
+    assert not any(item["repeated"] for item in receipt["keyframes"])
     assert receipt["keyframes"][0]["path"] == "keyframes/01.png"
     assert receipt["keyframes"][1]["path"] == "keyframes/02.png"
     persisted = json.loads((work / "keyframe_sampling.json").read_text(encoding="utf-8"))
@@ -368,6 +372,8 @@ def test_backend_materializes_exact_nine_in_frozen_order_with_repeat_receipt(
     segwork.mkdir(parents=True)
     shutil.copytree(work / "keyframes", segwork / "keyframes")
     bound_receipt = deepcopy(receipt)
+    bound_receipt["version"] = 3
+    bound_receipt["keyframe_count"] = 3
     for item in bound_receipt["keyframes"]:
         item["path"] = f"keyframes/{Path(item['path']).name}"
     bound = pipeline._bind_keyframe_source_timeline(
@@ -380,7 +386,7 @@ def test_backend_materializes_exact_nine_in_frozen_order_with_repeat_receipt(
         }],
         scenes,
     )
-    assert len(bound[0]["keyframe_sources"]) == 9
+    assert len(bound[0]["keyframe_sources"]) == 3
     assert [item["source_time_s"] for item in bound[0]["keyframe_sources"]] == [
         item["source_time_s"] for item in selection
     ]
@@ -443,7 +449,8 @@ def test_twelfth_boundary_plan_sampling_and_backend_binding_have_no_phantom_cut(
             "keyframes": names,
             "keyframe_sampling": {
                 "schema": "duet.backend-keyframe-sampling",
-                "version": 1,
+                "version": 3,
+                "keyframe_count": 3,
                 "keyframes": receipt_items,
             },
         })
@@ -532,7 +539,10 @@ def test_toy_artifact_rounded_up_hard_cut_replays_without_cross_segment_scene(
         frame["source_scene_id"] for frame in selections[1]
     }
     assert selections[2][0]["source_scene_id"] == "SCENE_10"
-    assert selections[2][0]["source_time_s"] == 18.866667
+    assert selections[2][0]["source_time_s"] == 18.9
+    assert selections[2][0]["transition"] == {
+        "type": "start", "at_s": 18.9,
+    }
 
     work = tmp_path / "work"
     metas = []
@@ -558,7 +568,8 @@ def test_toy_artifact_rounded_up_hard_cut_replays_without_cross_segment_scene(
             "keyframes": names,
             "keyframe_sampling": {
                 "schema": "duet.backend-keyframe-sampling",
-                "version": 1,
+                "version": 3,
+                "keyframe_count": 3,
                 "keyframes": receipt_items,
             },
         })
@@ -581,7 +592,7 @@ def test_visual_attempt_restores_backend_frozen_frames_after_codex_mutation(tmp_
     work = cdir / "work"
     keyframes = work / "keyframes"
     keyframes.mkdir(parents=True)
-    frozen = tuple(_PX_PNG for _index in range(9))
+    frozen = tuple(_PX_PNG for _index in range(3))
 
     class MutatingRunner:
         def run_isolated(
@@ -590,7 +601,7 @@ def test_visual_attempt_restores_backend_frozen_frames_after_codex_mutation(tmp_
             assert session_dir == cdir
             isolated_work = stage / "work"
             (keyframes / "01.png").write_bytes(b"mutated")
-            (keyframes / "09.png").unlink()
+            (keyframes / "03.png").unlink()
             (isolated_work / "prompt.txt").write_text(
                 PROMPT_TEXT, encoding="utf-8"
             )
@@ -605,7 +616,7 @@ def test_visual_attempt_restores_backend_frozen_frames_after_codex_mutation(tmp_
         skill_bytes=b"frozen video-maker skill",
     )
 
-    assert names == [f"{index:02d}.png" for index in range(1, 10)]
+    assert names == [f"{index:02d}.png" for index in range(1, 4)]
     assert tuple((keyframes / name).read_bytes() for name in names) == frozen
 
 
@@ -618,7 +629,7 @@ def test_visual_analyzer_receives_half_resolution_proxies_and_restores_originals
     source = np.full((8, 12, 3), 96, dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", source)
     assert ok
-    frozen = tuple(encoded.tobytes() for _index in range(9))
+    frozen = tuple(encoded.tobytes() for _index in range(3))
     (work / "01_frame_000.000s.png").write_bytes(encoded.tobytes())
     (work / "contact_sheet_01.jpg").write_bytes(b"overview")
 
@@ -631,7 +642,7 @@ def test_visual_analyzer_receives_half_resolution_proxies_and_restores_originals
             assert session_dir == cdir
             assert not list((stage / "work").glob("*_frame_*.png"))
             assert not list((stage / "work").glob("contact_sheet*.jpg"))
-            for order in range(1, 10):
+            for order in range(1, 4):
                 data = (stage / "work" / "keyframes" / f"{order:02d}.png").read_bytes()
                 image = cv2.imdecode(
                     np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR
@@ -649,7 +660,7 @@ def test_visual_analyzer_receives_half_resolution_proxies_and_restores_originals
         skill_bytes=b"frozen video-maker skill",
     )
 
-    assert names == [f"{index:02d}.png" for index in range(1, 10)]
+    assert names == [f"{index:02d}.png" for index in range(1, 4)]
     assert tuple(
         (work / "keyframes" / name).read_bytes() for name in names
     ) == frozen
@@ -1769,7 +1780,7 @@ def test_run_converges_container_duration_to_visual_manifest_timeline(
             (anchors.parent / "image_optimization_prompt.txt").write_text(
                 "Codex 分段图片二次编辑提示词", encoding="utf-8"
             )
-            keyframes = _write_valid_package(anchors.parent, frames=9, prompt="p")
+            keyframes = _write_valid_package(anchors.parent, frames=3, prompt="p")
             return {
                 **seg,
                 "keyframes": keyframes,
@@ -1972,7 +1983,7 @@ def fake_steps(monkeypatch):
         calls["codex"].append({"workdir": Path(workdir), "prompt": prompt})
         _write_valid_package(
             Path(workdir) / "work",
-            frames=9 if "最终台词由后端" in prompt else 3,
+            frames=3,
         )
 
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
@@ -3824,7 +3835,7 @@ def test_run_voice_no_audio_track_fails(tmp_path, video_1s, monkeypatch):
 def test_run_dialogue_auto_no_audio_is_valid_and_writes_visual_plan_receipt(
     tmp_path, video_1s, monkeypatch
 ):
-    """新 H3 auto：无音轨等价于空台词，exact-nine 视觉计划仍会冻结。"""
+    """新 H3 auto：无音轨等价于空台词，exact-three 视觉计划仍会冻结。"""
 
     settings = make_settings(tmp_path)
     meta = _make_conversation(settings, video_1s)
@@ -3840,7 +3851,7 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_visual_plan_receipt(
     )
 
     def fake_codex(self, workdir, prompt):
-        _write_valid_package(Path(workdir) / "work", frames=9)
+        _write_valid_package(Path(workdir) / "work", frames=3)
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
     monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
@@ -3862,7 +3873,7 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_visual_plan_receipt(
     assert len(receipt["segments"]) == 1
     assert receipt["segments"][0]["dialogue"]["count"] == 0
     assert stored["segments"][0]["keyframes"] == [
-        f"{index:02d}.png" for index in range(1, 10)
+        f"{index:02d}.png" for index in range(1, 4)
     ]
     frozen = stored["_image_optimization"]
     continuity = stored["_image_continuity"]
@@ -3873,7 +3884,7 @@ def test_run_dialogue_auto_no_audio_is_valid_and_writes_visual_plan_receipt(
     assert frozen["version"] == 4
     assert [(item["segment_index"], item["frame_name"])
             for item in frozen["frames"]] == [
-        (1, f"{index:02d}.png") for index in range(1, 10)
+        (1, f"{index:02d}.png") for index in range(1, 4)
     ]
 
 
@@ -3907,7 +3918,7 @@ def test_run_manual_dialogue_uses_frozen_lines_without_source_audio(
 
     def fake_codex(self, workdir, prompt):
         assert "voice.mp3" not in prompt
-        _write_valid_package(Path(workdir) / "work", frames=9)
+        _write_valid_package(Path(workdir) / "work", frames=3)
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
     monkeypatch.setattr(
@@ -3960,7 +3971,7 @@ def test_run_none_dialogue_skips_asr_and_source_audio(tmp_path, video_1s, monkey
         CodexRunner,
         "run",
         lambda self, workdir, prompt: _write_valid_package(
-            Path(workdir) / "work", frames=9
+            Path(workdir) / "work", frames=3
         ),
     )
 
@@ -3972,7 +3983,7 @@ def test_run_none_dialogue_skips_asr_and_source_audio(tmp_path, video_1s, monkey
     assert stored["segments"][0]["dialogue"] == []
 
 
-def test_exact_nine_freezes_a_complete_v4_frame_bound_prompt_receipt(
+def test_exact_three_freezes_a_complete_v4_frame_bound_prompt_receipt(
     tmp_path, video_1s, monkeypatch
 ):
     settings = make_settings(tmp_path)
@@ -3990,12 +4001,19 @@ def test_exact_nine_freezes_a_complete_v4_frame_bound_prompt_receipt(
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
     monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
+
+    def return_valid_visual(
+        self, stage, prompt, *, session_dir, output_path,
+        max_output_bytes, validate_output, output_schema,
+    ):
+        del self, stage, prompt, session_dir, output_path
+        del max_output_bytes, output_schema
+        return validate_output(json.dumps({"prompt": PROMPT_TEXT}).encode())
+
     monkeypatch.setattr(
         CodexRunner,
-        "run",
-        lambda self, workdir, prompt: _write_valid_package(
-            Path(workdir) / "work", frames=9,
-        ),
+        "run_isolated_until_output",
+        return_valid_visual,
     )
     pipeline.run(settings, meta["id"], CodexRunner(1, 1))
 
@@ -4005,7 +4023,7 @@ def test_exact_nine_freezes_a_complete_v4_frame_bound_prompt_receipt(
     frozen = stored["_image_optimization"]
     assert frozen["version"] == 4
     assert [item["frame_name"] for item in frozen["frames"]] == [
-        f"{index:02d}.png" for index in range(1, 10)
+        f"{index:02d}.png" for index in range(1, 4)
     ]
     assert all(item["segment_index"] == 1 for item in frozen["frames"])
     assert all(item["current"].strip() for item in frozen["frames"])
@@ -4187,7 +4205,7 @@ def test_run_dialogue_auto_ignores_external_lines_and_isolates_visual_codex(
         maker_saw_voice_file.append((work / "voice_lines.json").exists())
         assert "最终台词由后端" in prompt
         _write_valid_package(
-            work, frames=9, prompt="画面包装上可见 OCR ONLY。",
+            work, frames=3, prompt="画面包装上可见 OCR ONLY。",
         )
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
@@ -4250,7 +4268,7 @@ def test_run_dialogue_auto_preserves_requested_voice_processing_mode(
                 encoding="utf-8",
             )
         else:
-            _write_valid_package(work, frames=9)
+            _write_valid_package(work, frames=3)
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
@@ -4304,7 +4322,7 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
         if "voice.mp3" in prompt:
             (work / "voice_lines.json").write_text(json.dumps([line]), encoding="utf-8")
         else:
-            _write_valid_package(work, frames=9)
+            _write_valid_package(work, frames=3)
 
     monkeypatch.setattr(pipeline, "_run_cmd", fake_steps)
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
@@ -4356,7 +4374,7 @@ def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan
     ) == line["text"]
     assert stored["voice_lines_dropped"] == 0
     assert all(
-        len(segment["keyframe_sampling"]["keyframes"]) == 9
+        len(segment["keyframe_sampling"]["keyframes"]) == 3
         for segment in stored["segments"]
     )
     assert [
@@ -4506,7 +4524,7 @@ def test_run_dialogue_auto_clips_mp3_encoder_tail_to_video_timeline(
                 json.dumps([asr_line]), encoding="utf-8"
             )
         else:
-            _write_valid_package(work, frames=9)
+            _write_valid_package(work, frames=3)
 
     monkeypatch.setattr(pipeline, "_run_cmd", fake_steps)
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
@@ -5156,10 +5174,10 @@ def test_startup_reconciles_half_committed_long_plan_without_rewrite(
     cdir = settings.data_dir / meta["id"]
     segdir = cdir / "work" / "segments" / "1"
     segwork = segdir / "work"
-    key = segwork / "keyframes" / "01.png"
+    keys = [segwork / "keyframes" / f"{order:02d}.png" for order in range(1, 4)]
     first = segwork / "anchors" / "first.png"
     last = segwork / "anchors" / "last.png"
-    for path in (key, first, last):
+    for path in (*keys, first, last):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(_PX_PNG)
     (segdir / "source.mp4").write_bytes(b"segment")
@@ -5178,8 +5196,11 @@ def test_startup_reconciles_half_committed_long_plan_without_rewrite(
     public = {
         "index": 1, "start_s": 0.0, "end_s": duration,
         "chain_id": "chain-001", "join_mode": "hard_cut",
-        "source": "segments/1/source.mp4", "keyframes": ["01.png"],
-        "keyframe_paths": ["segments/1/work/keyframes/01.png"],
+        "source": "segments/1/source.mp4",
+        "keyframes": [path.name for path in keys],
+        "keyframe_paths": [
+            f"segments/1/work/keyframes/{path.name}" for path in keys
+        ],
         "first_frame_path": "segments/1/work/anchors/first.png",
         "last_frame_path": "segments/1/work/anchors/last.png",
         "visual_prompt": visual_text, "prompt": final.read_text(encoding="utf-8"),
@@ -5198,7 +5219,7 @@ def test_startup_reconciles_half_committed_long_plan_without_rewrite(
             cdir, source=cdir / "source.mp4", duration_s=duration,
             segments=[{
                 **public, "source_path": segdir / "source.mp4",
-                "keyframe_paths": [key], "first_frame_path": first,
+                "keyframe_paths": keys, "first_frame_path": first,
                 "last_frame_path": last, "visual_prompt_path": visual,
                 "final_prompt_path": final,
             }],
@@ -5285,7 +5306,7 @@ def test_post_triggers_pipeline_and_detail_filled(tmp_path, video_1s, fake_steps
     body = r.json()
     assert body["status"] == "done", body.get("error")
     assert body["segments"][0]["keyframes"] == [
-        f"{index:02d}.png" for index in range(1, 10)
+        f"{index:02d}.png" for index in range(1, 4)
     ]
     assert body["segments"][0]["visual_prompt"] == PROMPT_TEXT
     assert body["aspect_ratio"] == "16:9"

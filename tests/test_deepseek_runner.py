@@ -142,17 +142,17 @@ def test_visual_uses_one_strict_function_and_publishes_only_validated_json(
     assert content[3]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
-def test_prompt_fusion_sends_exactly_nine_visuals_per_segment(
+def test_prompt_fusion_sends_exactly_three_visuals_per_segment(
     tmp_path: Path,
 ) -> None:
     digest = "d" * 64
     schema = codex_output_schemas.prompt_fusion_schema(
         input_sha256=digest, segment_count=2, visual_max_chars=426,
     )
-    visuals = [f"frame {index}" for index in range(1, 10)]
+    visuals = [f"frame {index}" for index in range(1, 4)]
     result = {
         "schema": "duet.video-prompt-fusion-output",
-        "version": 2,
+        "version": 3,
         "input_sha256": digest,
         "segments": [
             {"index": 1, "visual": visuals},
@@ -483,7 +483,7 @@ def test_provider_rejection_is_short_and_does_not_persist_raw_body(tmp_path: Pat
     os.environ.get("RUN_REAL_DEEPSEEK_TRANSPORT") != "1",
     reason="explicit opt-in real DeepSeek request",
 )
-def test_real_deepseek_accepts_nine_ordered_images_and_production_visual_schema() -> None:
+def test_real_deepseek_accepts_three_ordered_images_and_production_visual_schema() -> None:
     source = Path(
         "/home/xy/duet-ad1/data/test-instances/three-skill-preview-3211/data/"
         "f54011007d654e55ad03aeef85fe801f/work/segments/1/work/keyframes/01.png"
@@ -498,12 +498,12 @@ def test_real_deepseek_accepts_nine_ordered_images_and_production_visual_schema(
             "skills/video-maker/SKILL.md",
             stage / "SKILL.md",
         )
-        for order in range(1, 10):
+        for order in range(1, 4):
             shutil.copyfile(source, frames / f"{order:02d}.png")
         (stage / "work" / "request.json").write_text(
             json.dumps({
                 "phase": "visual",
-                "frames": [f"work/keyframes/{order:02d}.png" for order in range(1, 10)],
+                "frames": [f"work/keyframes/{order:02d}.png" for order in range(1, 4)],
             }, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
@@ -513,7 +513,7 @@ def test_real_deepseek_accepts_nine_ordered_images_and_production_visual_schema(
             credential_file=Path("/home/xy/.config/claude/deepseek.env"),
         ).run_isolated_until_output(
             stage,
-            "严格执行当前目录 SKILL.md；观察九张有序关键帧并填写输出 Schema。",
+            "严格执行当前目录 SKILL.md；观察三张有序关键帧并填写输出 Schema。",
             session_dir=stage,
             output_path=stage / "work" / "visual_prompt.json",
             max_output_bytes=32768,

@@ -5,11 +5,11 @@ description: Fuse frozen optimized keyframes, old segment dynamics, frame replac
 
 # Video Prompt Fusion
 
-只读取 `work/multimodal_input.json` 及其中列出的新关键帧。一次调用处理全部 ordered segments；不选帧、不改音频、不写 provider 字段。四类既有模态输入不变，不新增第五类输入；`relation_occurrences` 是 `image_optimization_prompt` 的后端结构化关系 sidecar。输入输出 schema 保持 version 2。
+只读取 `work/multimodal_input.json` 及其中列出的新关键帧。一次调用处理全部 ordered segments；不选帧、不改音频、不写 provider 字段。四类既有模态输入不变，不新增第五类输入；`relation_occurrences` 是 `image_optimization_prompt` 的后端结构化关系 sidecar。输入输出 schema 保持 version 3。
 
 输入合同由 `multimodal_input.json` 的 `schema/version` 和后端校验器冻结。每段依次提供 `index/new_keyframes/old_video_prompt/image_optimization_prompt/relation_occurrences/audio_content`；关键帧、文本、台词均带 SHA，关系 occurrence 带逐帧主客体、predicate、state、geometry、preserve 和 replace_together。不要重述或改写输入结构。
 
-每段 9 张图片和 9 条 frame prompt 按 order 一一对应；segment 索引连续。核对列出文件及文本 exact bytes SHA。局部时间严格递增，order 1 为 `segment_time_s=0/type=start/at_segment_s=0`；continuous 的 `at_segment_s=null`；hard_cut 时间位于前后关键帧局部时间之间。`audio_content` 只作为冻结台词冲突边界，`voice_references=[]`、`music_policy="forbid"`，不生成声音、台词、口型或音乐。
+每段 3 张图片和 3 条 frame prompt 按 order 一一对应；segment 索引连续。核对列出文件及文本 exact bytes SHA。局部时间严格递增，order 1 为 `segment_time_s=0/type=start/at_segment_s=0`；continuous 的 `at_segment_s=null`；hard_cut 时间位于前后关键帧局部时间之间。`audio_content` 只作为冻结台词冲突边界，`voice_references=[]`、`music_policy="forbid"`，不生成声音、台词、口型或音乐。
 
 ## 融合
 
@@ -27,6 +27,6 @@ description: Fuse frozen optimized keyframes, old segment dynamics, frame replac
 
 ## 输出
 
-每段严格按 order 为 9 张关键帧分别输出 9 条简洁英文 `visual` prose，一帧一条，不合并、不缺省、不增加。每条只描述对应图片及同区间已有动态证据；不输出时间戳、图片标记、stable key、tile、relation key、音频字段或 provider 语法。后端按 transition 将九条描述机械归入 hard-cut 区间，再与关系块共同编译到现有 H3 transport；这不是质量评分。模型不输出 `relation_states`，关系状态完全由后端按冻结输入生成。
+每段严格按 order 为 3 张关键帧分别输出 3 条简洁英文 `visual` prose，一帧一条，不合并、不缺省、不增加。每条只描述对应图片及同区间已有动态证据；不输出时间戳、图片标记、stable key、tile、relation key、音频字段或 provider 语法。后端按 transition 将三条描述机械归入 hard-cut 区间，再与关系块共同编译到现有 H3 transport；这不是质量评分。模型不输出 `relation_states`，关系状态完全由后端按冻结输入生成。
 
-输出格式以本次调用注入的 JSON Schema 为唯一权威：固定 `schema/version/input_sha256`，`segments` 与输入一一对应，每段只填写 `index/visual`，visual 固定为 9 条并逐条对应 frame order 1 至 9。后端完全依据冻结 occurrence 机械生成关系状态、按 hard cut 组合九条视觉描述并编译进 Context IR/H3 effective prompt，再原子发布 `work/h3_prompt_plan.json`。
+输出格式以本次调用注入的 JSON Schema 为唯一权威：固定 `schema/version/input_sha256`，`segments` 与输入一一对应，每段只填写 `index/visual`，visual 固定为 3 条并逐条对应 frame order 1 至 3。后端完全依据冻结 occurrence 机械生成关系状态、按 hard cut 组合三条视觉描述并编译进 Context IR/H3 effective prompt，再原子发布 `work/h3_prompt_plan.json`。

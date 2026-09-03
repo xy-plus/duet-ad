@@ -106,20 +106,26 @@ def test_visual_codex_consumes_frozen_skill_in_single_use_stage(tmp_path):
     work = project / "work"
     keyframes = work / "keyframes"
     keyframes.mkdir(parents=True)
-    frozen_frames = tuple(png for _ in range(9))
+    frozen_frames = tuple(png for _ in range(3))
     (work / "voice_lines.json").write_text("[]", encoding="utf-8")
     skill = b"frozen video-maker skill"
     seen = {}
 
     class Runner:
-        def run_isolated(self, stage, prompt, *, session_dir, writable_paths):
+        def run_isolated_until_output(
+            self, stage, prompt, *, session_dir, output_path,
+            max_output_bytes, validate_output, output_schema,
+        ):
             seen["stage"] = stage
             seen["prompt"] = prompt
             seen["session"] = session_dir
-            seen["writable"] = writable_paths
             assert (stage / "SKILL.md").read_bytes() == skill
             assert not (stage / "work" / "voice_lines.json").exists()
-            (stage / "work" / "prompt.txt").write_text("visual result", encoding="utf-8")
+            assert output_schema is pipeline.codex_output_schemas.VISUAL_PROMPT_SCHEMA
+            raw = b'{"prompt":"visual result"}'
+            assert len(raw) <= max_output_bytes
+            output_path.write_bytes(raw)
+            return validate_output(raw)
 
     names, text = pipeline._run_visual_attempt(
         Runner(), project, "visual prompt", work,
@@ -128,11 +134,10 @@ def test_visual_codex_consumes_frozen_skill_in_single_use_stage(tmp_path):
         skill_bytes=skill,
     )
 
-    assert names == [f"{index:02d}.png" for index in range(1, 10)]
+    assert names == [f"{index:02d}.png" for index in range(1, 4)]
     assert text == "visual result"
     assert seen["stage"].parent == Path("/tmp")
     assert seen["session"] == project
-    assert len(seen["writable"]) == 1
     assert (work / "voice_lines.json").read_text(encoding="utf-8") == "[]"
     assert tuple((keyframes / name).read_bytes() for name in names) == frozen_frames
 
@@ -151,7 +156,21 @@ def test_segmented_image_project_keeps_milestone_for_element_index(
     segments = [
         {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut"},
     ]
-    (work / "segments" / "1" / "work" / "keyframes").mkdir(parents=True)
+    keyframes = work / "segments" / "1" / "work" / "keyframes"
+    keyframes.mkdir(parents=True)
+    relative_paths = []
+    sampling_items = []
+    for order in range(1, 4):
+        frame = keyframes / f"{order:02d}.png"
+        frame.write_bytes(f"frame-{order}".encode())
+        relative_paths.append(
+            f"segments/1/work/keyframes/{order:02d}.png"
+        )
+        sampling_items.append({
+            "artifact": {
+                "sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
+            },
+        })
     milestone = object()
     observed = {}
 
@@ -166,7 +185,15 @@ def test_segmented_image_project_keeps_milestone_for_element_index(
         object(),
         object(),
         segments,
-        [dict(segments[0])],
+        [{
+            **segments[0],
+            "keyframe_paths": relative_paths,
+            "keyframe_sampling": {
+                "version": 3,
+                "keyframe_count": 3,
+                "keyframes": sampling_items,
+            },
+        }],
         work,
         session_dir=work.parent,
         milestone=milestone,

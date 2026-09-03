@@ -150,7 +150,7 @@ def test_visual_uses_final_answer_only_and_publishes_against_backend_frozen_fram
     cdir = tmp_path / "conversation"
     work = cdir / "work"
     work.mkdir(parents=True)
-    frozen = tuple(_png() for _ in range(9))
+    frozen = tuple(_png() for _ in range(3))
     runner = _VisualRunner({"prompt": "authoritative visual"})
 
     pipeline._run_visual_codex(
@@ -164,7 +164,7 @@ def test_visual_uses_final_answer_only_and_publishes_against_backend_frozen_fram
     )
 
     assert (work / "prompt.txt").read_text(encoding="utf-8") == "authoritative visual"
-    assert [(work / "keyframes" / f"{index:02d}.png").read_bytes() for index in range(1, 10)] == list(frozen)
+    assert [(work / "keyframes" / f"{index:02d}.png").read_bytes() for index in range(1, 4)] == list(frozen)
     assert runner.calls[0][3] == codex_output_schemas.VISUAL_PROMPT_SCHEMA
 
 
@@ -172,7 +172,7 @@ def test_visual_retry_exhaustion_is_phase_local_and_publishes_nothing(tmp_path):
     cdir = tmp_path / "conversation"
     work = cdir / "work"
     work.mkdir(parents=True)
-    frozen = tuple(_png() for _ in range(9))
+    frozen = tuple(_png() for _ in range(3))
     runner = _VisualRunner({"prompt": "unused"}, fail=True)
     settings = Settings(
         access_token="test", data_dir=tmp_path / "data", retry_count=2,
@@ -194,7 +194,7 @@ def test_visual_retry_exhaustion_is_phase_local_and_publishes_nothing(tmp_path):
 
     assert len(runner.calls) == 3
     assert not (work / "prompt.txt").exists()
-    assert [(work / "keyframes" / f"{index:02d}.png").read_bytes() for index in range(1, 10)] == list(frozen)
+    assert [(work / "keyframes" / f"{index:02d}.png").read_bytes() for index in range(1, 4)] == list(frozen)
 
 
 class _DialogueRunner:

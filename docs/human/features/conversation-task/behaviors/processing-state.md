@@ -14,11 +14,11 @@ current v4 对外只有一个从 accepted A 到 commit B 的 operation，不把�
 
 | 内部阶段 | current operation 投影 | 行为 |
 | --- | --- | --- |
-| analysis / postprocess | `202 running` | 生成每段 exact-9 图片；技术验收 A 后自动继续 |
-| prompt_fusion | `202 running` | 同一 accepted claim 调用一次 Fusion v2；输出 shape 暂不可用时保留 durable work item，不创建备用 prompt |
+| analysis / postprocess | `202 running` | 生成每段 exact-3 图片；技术验收 A 后自动继续 |
+| prompt_fusion | `202 running` | 同一 accepted claim 调用一次 Fusion v3；输出 shape 暂不可用时保留 durable work item，不创建备用 prompt |
 | Ref2VA compile | `202 running` | 后端从 visual prose + frozen mechanics 编译唯一 provider prompt |
 | Context | `202 running` | local identity 同字节 receipt；HTTP 0 |
-| H3 / stitch | `202 running` | exact-9 Picture、零 source audio reference；按 receipt 推进 task 与 EDL |
+| H3 / stitch | `202 running` | exact-3 Picture、零 source audio reference；按 receipt 推进 task 与 EDL |
 | 最终媒体验收通过 | `200 succeeded / commit_b` | 原子发布 `generated.mp4` |
 
 相同 CID 的重放只确保既有 operation 继续；即使请求 id 或兼容 image-acceptance payload 不同，也不能创建竞争 operation。进程重启认领同一 input owner、Fusion continuation 或已冻结 generation。

@@ -2571,13 +2571,21 @@ def _long_receipt_multimodal_intent(
             long_video.LEGACY_PLAN_RECEIPT_VERSION,
             long_video.PLAN_RECEIPT_VERSION,
             long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
+            long_video.VISUAL_PLAN_RECEIPT_VERSION,
+            long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+            long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
+            long_video.THREE_FRAME_VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
         }
         or workflow not in (
             h3.H3_REFERENCE_WORKFLOWS | {h3.H3_BOUNDARY_WORKFLOW}
         )
     ):
         return None if has_expected else False
-    if version == long_video.MULTIMODAL_PLAN_RECEIPT_VERSION:
+    if version in {
+        long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
+        long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+        long_video.THREE_FRAME_VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+    }:
         return workflow in h3.H3_MULTIMODAL_WORKFLOWS
     return False
 

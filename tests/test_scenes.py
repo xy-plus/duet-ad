@@ -511,7 +511,7 @@ def test_unified_planner_splits_more_than_nine_effective_scenes_on_hard_cut():
     ]
 
 
-def test_nine_frames_is_analysis_capacity_not_a_provider_segment_limit():
+def test_three_frames_is_analysis_capacity_not_a_provider_segment_limit():
     scenes = [
         {
             "index": index + 1,
@@ -573,7 +573,7 @@ def test_dense_ten_second_montage_compacts_analysis_and_keeps_every_cut():
     )
 
     selected = select_segment_keyframes(scenes, segments[0])
-    assert len(selected) == 9
+    assert len(selected) == 3
     slot_scenes = [
         scene_id
         for item in selected
@@ -590,7 +590,7 @@ def test_dense_ten_second_montage_compacts_analysis_and_keeps_every_cut():
     )
 
 
-def test_twenty_five_cuts_keep_complete_timeline_with_nine_analysis_slots():
+def test_twenty_five_cuts_keep_complete_timeline_with_three_analysis_slots():
     scenes = [
         {
             "index": index + 1,
@@ -604,7 +604,7 @@ def test_twenty_five_cuts_keep_complete_timeline_with_nine_analysis_slots():
     selected = select_segment_keyframes(scenes, segment)
 
     assert len(segment["source_cut_timeline"]) == 25
-    assert len(selected) == 9
+    assert len(selected) == 3
     assert [
         scene_id
         for item in selected
@@ -636,21 +636,21 @@ def test_keyframe_sampler_uses_anchor_then_capacity_hamilton_and_ordinal_spacing
         {"index": 1, "start_s": 0.0, "end_s": 13.0},
     )
 
-    assert len(selected) == 9
+    assert len(selected) == 3
     assert [
         sum(item["source_scene_id"] == f"SCENE_{index:02d}" for item in selected)
         for index in range(1, 4)
-    ] == [1, 2, 6]
+    ] == [1, 1, 1]
     assert [
         item["decode_frame_index"]
         for item in selected
         if item["source_scene_id"] == "SCENE_03"
-    ] == [3, 5, 7, 8, 10, 12]
+    ] == [7]
     assert selected[1]["transition"] == {
         "type": "hard_cut",
         "at_s": 1.0,
     }
-    assert selected[3]["transition"] == {
+    assert selected[2]["transition"] == {
         "type": "hard_cut",
         "at_s": 3.0,
     }
@@ -680,28 +680,24 @@ def test_single_scene_anchor_uses_lower_median_actual_frame():
         {"index": 1, "start_s": 0.0, "end_s": 435.0},
     )
 
+    assert [item["decode_frame_index"] for item in selected] == [34, 196, 380]
     assert [
-        sum(item["source_scene_id"] == f"SCENE_{index:02d}" for item in selected)
-        for index in range(1, 6)
-    ] == [2, 3, 1, 2, 1]
-    scene_three = next(
-        item for item in selected if item["source_scene_id"] == "SCENE_03"
-    )
-    assert scene_three["decode_frame_index"] == 325 + 19
-    assert selected[-1]["decode_frame_index"] == 434
+        scene_id
+        for item in selected
+        for scene_id in item["analysis_slot"]["source_scene_ids"]
+    ] == [f"SCENE_{index:02d}" for index in range(1, 6)]
 
 
-def test_keyframe_sampler_repeats_nearest_pts_when_source_has_under_nine_frames():
+def test_keyframe_sampler_repeats_nearest_pts_when_source_has_under_three_frames():
     scenes = [{
         "index": 1,
         "start_decode_frame_index": 0,
-        "end_decode_frame_index": 3,
+        "end_decode_frame_index": 2,
         "start_s": 0.0,
         "end_s": 1.001,
         "frames": [
             _decoded_frame(0, 0, denominator=10),
-            _decoded_frame(1, 3, denominator=10),
-            _decoded_frame(2, 10, denominator=10),
+            _decoded_frame(1, 10, denominator=10),
         ],
     }]
 
@@ -710,15 +706,11 @@ def test_keyframe_sampler_repeats_nearest_pts_when_source_has_under_nine_frames(
         {"index": 1, "start_s": 0.0, "end_s": 1.001},
     )
 
-    assert len(selected) == 9
-    assert [item["decode_frame_index"] for item in selected] == [
-        0, 0, 1, 1, 1, 1, 2, 2, 2,
-    ]
-    assert [item["repeated"] for item in selected] == [
-        False, True, False, True, True, True, False, True, True,
-    ]
+    assert len(selected) == 3
+    assert [item["decode_frame_index"] for item in selected] == [0, 0, 1]
+    assert [item["repeated"] for item in selected] == [False, True, False]
     assert [item["repeat_of_decode_frame_index"] for item in selected] == [
-        None, 0, None, 1, 1, 1, None, 2, 2,
+        None, 0, None,
     ]
     assert selected[0]["transition"] == {"type": "start", "at_s": 0.0}
     assert all(

@@ -70,13 +70,13 @@ def _install_fake_mediakit(monkeypatch, calls: list[tuple[str, str]]) -> None:
     monkeypatch.setattr(mediakit, "erase_image", erase)
 
 
-def test_nine_frames_are_cleaned_in_stage_order_and_reused(tmp_path, monkeypatch):
+def test_three_frames_are_cleaned_in_stage_order_and_reused(tmp_path, monkeypatch):
     settings = make_settings(tmp_path)
     cdir = settings.data_dir / "cid"
     work = cdir / "work/segments/1/work"
     keyframes = work / "keyframes"
     keyframes.mkdir(parents=True)
-    raw = tuple(_png(order) for order in range(1, 10))
+    raw = tuple(_png(order) for order in range(1, 4))
     for order, data in enumerate(raw, 1):
         (keyframes / f"{order:02d}.png").write_bytes(data)
     calls: list[tuple[str, str]] = []
@@ -92,13 +92,14 @@ def test_nine_frames_are_cleaned_in_stage_order_and_reused(tmp_path, monkeypatch
         None,
     )
 
-    assert len(canonical) == len(paths) == 9
+    assert len(canonical) == len(paths) == 3
     assert [scene for scene, _path in calls] == (
-        [mediakit.TEXT_SCENE] * 9 + [mediakit.ICON_SCENE] * 9
+        [mediakit.TEXT_SCENE] * 3 + [mediakit.ICON_SCENE] * 3
     )
-    assert all("/text/" in source for _scene, source in calls[9:])
-    assert tuple((keyframes / f"{order:02d}.png").read_bytes() for order in range(1, 10)) == raw
-    assert receipt["version"] == 2
+    assert all("/text/" in source for _scene, source in calls[3:])
+    assert tuple((keyframes / f"{order:02d}.png").read_bytes() for order in range(1, 4)) == raw
+    assert receipt["version"] == 3
+    assert receipt["keyframe_count"] == 3
     assert receipt["preprocess"] == {
         "remove_subtitle": True,
         "remove_watermark": True,
@@ -116,7 +117,7 @@ def test_nine_frames_are_cleaned_in_stage_order_and_reused(tmp_path, monkeypatch
         {"remove_subtitle": True, "remove_watermark": True},
         None,
     )
-    assert len(calls) == 18
+    assert len(calls) == 6
 
 
 def test_previsual_failure_stops_before_any_visual_model(tmp_path, monkeypatch):
@@ -125,7 +126,7 @@ def test_previsual_failure_stops_before_any_visual_model(tmp_path, monkeypatch):
     work = cdir / "work/segments/1/work"
     keyframes = work / "keyframes"
     keyframes.mkdir(parents=True)
-    raw = tuple(_png(order) for order in range(1, 10))
+    raw = tuple(_png(order) for order in range(1, 4))
     for order, data in enumerate(raw, 1):
         (keyframes / f"{order:02d}.png").write_bytes(data)
 
@@ -154,8 +155,8 @@ def test_video_maker_sees_only_cleaned_proxies(tmp_path):
     cdir = tmp_path / "conversation"
     work = cdir / "work"
     work.mkdir(parents=True)
-    raw = tuple(_png(10) for _order in range(9))
-    cleaned = tuple(_png(200) for _order in range(9))
+    raw = tuple(_png(10) for _order in range(3))
+    cleaned = tuple(_png(200) for _order in range(3))
     (work / "01_frame_000.000s.png").write_bytes(raw[0])
     (work / "contact_sheet_01.jpg").write_bytes(b"raw-overview")
 
@@ -168,7 +169,7 @@ def test_video_maker_sees_only_cleaned_proxies(tmp_path):
             assert session_dir == cdir
             assert not list((stage / "work").glob("*_frame_*.png"))
             assert not list((stage / "work").glob("contact_sheet*.jpg"))
-            for order in range(1, 10):
+            for order in range(1, 4):
                 image = cv2.imread(
                     str(stage / "work/keyframes" / f"{order:02d}.png"),
                     cv2.IMREAD_COLOR,
@@ -187,7 +188,7 @@ def test_video_maker_sees_only_cleaned_proxies(tmp_path):
         analysis_keyframes=cleaned,
         skill_bytes=b"frozen video-maker skill",
     )
-    assert names == [f"{order:02d}.png" for order in range(1, 10)]
+    assert names == [f"{order:02d}.png" for order in range(1, 4)]
     assert prompt == "complete natural language prompt"
     assert tuple((work / "keyframes" / name).read_bytes() for name in names) == raw
 
@@ -199,7 +200,7 @@ def test_project_index_and_image_canonical_share_the_cleaned_frame_set(
     cdir = settings.data_dir / "cid"
     cleaned = cdir / "work/.postprocess-private/v4-canvases/0001/brand"
     cleaned.mkdir(parents=True)
-    for order in range(1, 10):
+    for order in range(1, 4):
         (cleaned / f"{order:02d}.png").write_bytes(_png(200))
     element_index = cdir / "work/element_index.json"
     element_index.parent.mkdir(parents=True, exist_ok=True)
@@ -209,7 +210,7 @@ def test_project_index_and_image_canonical_share_the_cleaned_frame_set(
     def index(_runner, session_dir, frame_paths, **_kwargs):
         assert session_dir == cdir
         assert list(frame_paths) == [1]
-        assert [path.parent for path in frame_paths[1]] == [cleaned] * 9
+        assert [path.parent for path in frame_paths[1]] == [cleaned] * 3
         observed.append("project-index")
         return element_index
 
@@ -247,7 +248,7 @@ def test_seedream_uses_cleaned_frames_and_postprocess_does_not_erase_again(tmp_p
     cleaned = work / ".postprocess-private/v4-canvases/0001/brand"
     cleaned.mkdir(parents=True)
     relative_paths = []
-    for order in range(1, 10):
+    for order in range(1, 4):
         path = cleaned / f"{order:02d}.png"
         path.write_bytes(_png(200))
         relative_paths.append(str(path.relative_to(work)))
@@ -256,18 +257,19 @@ def test_seedream_uses_cleaned_frames_and_postprocess_does_not_erase_again(tmp_p
             "index": 1,
             "keyframe_paths": relative_paths,
             "keyframe_sampling": {
-                "version": 2,
+                "version": 3,
+                "keyframe_count": 3,
                 "keyframes": [
                     {"artifact": {"sha256": hashlib.sha256(
                         (cleaned / f"{order:02d}.png").read_bytes()
                     ).hexdigest()}}
-                    for order in range(1, 10)
+                    for order in range(1, 4)
                 ],
             },
         }],
     })
     assert [source for source, _target in grouped[1]] == [
-        cleaned / f"{order:02d}.png" for order in range(1, 10)
+        cleaned / f"{order:02d}.png" for order in range(1, 4)
     ]
     assert generation_config.postprocess_options({
         "optimize_image": True,

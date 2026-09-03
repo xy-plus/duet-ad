@@ -186,11 +186,14 @@ def test_pipeline_video_and_image_calls_consume_same_frozen_bytes(
     drifted_video_skill.write_bytes(b"drifted video-maker")
     monkeypatch.setattr(pipeline, "SKILL_MD", drifted_video_skill)
 
-    frame = project / "source-frame.png"
     image = np.full((8, 12, 3), 96, dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", image)
     assert ok
-    frame.write_bytes(encoded.tobytes())
+    frames = []
+    for order in range(1, 4):
+        frame = project / f"source-frame-{order:02d}.png"
+        frame.write_bytes(encoded.tobytes())
+        frames.append(frame)
     seen_video = []
 
     class VideoRunner:
@@ -208,7 +211,7 @@ def test_pipeline_video_and_image_calls_consume_same_frozen_bytes(
                     "source_visual_description": "room",
                     "occurrences": [{
                         "segment_index": 1,
-                        "frame_orders": [1],
+                            "frame_orders": [1, 2, 3],
                     }],
                     "replaceable": ["environment"],
                     "preserve": ["layout"],
@@ -221,7 +224,7 @@ def test_pipeline_video_and_image_calls_consume_same_frozen_bytes(
     pipeline._generate_project_element_index(
         VideoRunner(),
         project,
-        {1: [frame]},
+        {1: frames},
         milestone=frozen,
     )
     assert seen_video == [frozen.read_bytes("video-maker")]
@@ -259,7 +262,7 @@ def _fusion_input_for_milestone(root: Path) -> bytes:
     frame_prompts = []
     frame_dir = root / "work" / "segments" / "1" / "new_keyframes"
     frame_dir.mkdir(parents=True, exist_ok=True)
-    for order in range(1, 10):
+    for order in range(1, 4):
         frame_path = frame_dir / f"{order:02d}.png"
         frame_data = f"frame-{order}".encode()
         frame_path.write_bytes(frame_data)

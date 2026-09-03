@@ -11,6 +11,13 @@ import pytest
 from app import context_ir_bridge, h3, h3_project, long_generation, long_video
 
 
+def _png(value: int) -> bytes:
+    image = np.full((8, 8, 3), value, dtype=np.uint8)
+    ok, encoded = cv2.imencode(".png", image)
+    assert ok
+    return encoded.tobytes()
+
+
 def _cuts() -> list[dict]:
     bounds = [round(index * 0.3, 6) for index in range(11)]
     bounds += [round(3.0 + index * (7.0 / 15), 6) for index in range(1, 16)]
@@ -26,7 +33,7 @@ def _cuts() -> list[dict]:
 
 
 def _timeline(cuts: list[dict]) -> list[dict]:
-    cut_orders = [1, 4, 7, 11, 14, 17, 20, 23, 25]
+    cut_orders = [1, 13, 25]
     result = []
     for order, cut_order in enumerate(cut_orders, 1):
         cut = cuts[cut_order - 1]
@@ -72,13 +79,13 @@ def test_twenty_five_cut_fusion_keeps_empty_intervals_and_splits_dialogue():
     projected = long_generation._expected_fusion_relation_states(
         timeline, occurrences, cuts,
     )
-    assert len(projected) == 9
+    assert len(projected) == 3
     assert projected[0]["relations"][0]["relation_id"] == "relation-first"
     assert projected[-1]["relations"][0]["relation_id"] == "relation-last"
     assert all(not item["relations"] for item in projected[1:-1])
 
     prompt = long_generation._compile_fusion_ref2va_prompt(
-        visual=[f"analysis visual {index}" for index in range(1, 10)],
+        visual=[f"analysis visual {index}" for index in range(1, 4)],
         timeline=timeline,
         lines=[{
             "order": 1,
@@ -101,7 +108,7 @@ def test_twenty_five_cut_fusion_keeps_empty_intervals_and_splits_dialogue():
     )[1].split(long_generation.RELATION_STATES_CLOSE, 1)[0]
     contract = json.loads(encoded)
     assert contract["v"] == 3
-    assert len(long_generation._expand_h3_relation_contract(contract)) == 9
+    assert len(long_generation._expand_h3_relation_contract(contract)) == 3
     encoded_cuts = prompt.split(
         long_generation.CUT_TIMELINE_OPEN, 1
     )[1].split(long_generation.CUT_TIMELINE_CLOSE, 1)[0]
@@ -137,12 +144,7 @@ def test_build_and_load_fusion_consumes_all_twenty_five_cuts(tmp_path: Path):
     optimization_frames = []
     for frame in local_timeline:
         path = keyframe_dir / f"{frame['order']:02d}.png"
-        ok, encoded = cv2.imencode(
-            ".png",
-            np.full((8, 8, 3), frame["order"], dtype=np.uint8),
-        )
-        assert ok
-        data = encoded.tobytes()
+        data = _png(30 + frame["order"])
         path.write_bytes(data)
         frozen_frames.append((path, data))
         source_timeline.append({
@@ -203,7 +205,7 @@ def test_build_and_load_fusion_consumes_all_twenty_five_cuts(tmp_path: Path):
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
         "segments": [{
             "index": 1,
-            "visual": [f"visual {index}" for index in range(1, 10)],
+            "visual": [f"visual {index}" for index in range(1, 4)],
         }],
     }
     output_path = root / "work" / "h3_prompt_plan.json"
@@ -227,8 +229,8 @@ def test_dense_cut_prompt_stays_within_budget_without_truncating_visual(cut_coun
         "source_scene_id": f"SCENE_{index:03d}",
     } for index in range(1, cut_count + 1)]
     selected = [
-        1 + round(position * (cut_count - 1) / 8)
-        for position in range(9)
+        1 + round(position * (cut_count - 1) / 2)
+        for position in range(3)
     ]
     timeline = []
     for order, cut_order in enumerate(selected, 1):
@@ -243,7 +245,7 @@ def test_dense_cut_prompt_stays_within_budget_without_truncating_visual(cut_coun
                 "at_segment_s": time_s,
             },
         })
-    visuals = [f"V{index}-" + "语义" * 99 for index in range(1, 10)]
+    visuals = [f"V{index}-" + "语义" * 99 for index in range(1, 4)]
     prompt = long_generation._compile_fusion_ref2va_prompt(
         visual=visuals, timeline=timeline, lines=[], music_policy="forbid",
         relation_occurrences=[], cut_timeline=cuts,
@@ -252,7 +254,7 @@ def test_dense_cut_prompt_stays_within_budget_without_truncating_visual(cut_coun
     assert all(visual in prompt for visual in visuals)
     if cut_count == 25:
         compact_prompt = long_generation._compile_fusion_ref2va_prompt(
-            visual=[f"V{index}" for index in range(1, 10)],
+            visual=[f"V{index}" for index in range(1, 4)],
             timeline=timeline, lines=[], music_policy="forbid",
             relation_occurrences=[], cut_timeline=cuts,
         )
@@ -264,7 +266,7 @@ def test_dense_cut_prompt_stays_within_budget_without_truncating_visual(cut_coun
         assert len(compact_prompt) < 3_000
 
 
-def test_dense_cuts_and_unique_540_relations_share_budget_without_loss():
+def test_dense_cuts_and_unique_180_relations_share_budget_without_loss():
     cuts = _cuts()
     timeline = _timeline(cuts)
     occurrences = []
@@ -281,7 +283,7 @@ def test_dense_cuts_and_unique_540_relations_share_budget_without_loss():
                 "with a visible separation gap"
             )
             occurrences.append(occurrence)
-    visuals = [f"V{index}-" + "视觉语义" * 75 for index in range(1, 10)]
+    visuals = [f"V{index}-" + "视觉语义" * 75 for index in range(1, 4)]
 
     prompt = long_generation._compile_fusion_ref2va_prompt(
         visual=visuals, timeline=timeline, lines=[], music_policy="forbid",
@@ -306,7 +308,7 @@ def test_dense_cuts_and_unique_540_relations_share_budget_without_loss():
         dialogue_tokens=(),
         source_h3_request=SimpleNamespace(
             mode="reference", workflow=h3.H3_WORKFLOW,
-            context_ir_required=True, keyframes=tuple(range(9)),
+            context_ir_required=True, keyframes=tuple(range(3)),
             reference_audios=(),
         ),
     )

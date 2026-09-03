@@ -16,7 +16,7 @@ from typing import Iterable, Mapping
 if __package__ in {None, ""}:  # direct script execution: expose repository package root
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import long_video
+from app import keyframe_contract, long_video
 
 try:
     from scenedetect import ContentDetector, detect
@@ -26,7 +26,7 @@ except ImportError as exc:  # pragma: no cover - environment-dependent message
     ) from exc
 
 
-KEYFRAMES_PER_SEGMENT = 9
+KEYFRAMES_PER_SEGMENT = keyframe_contract.KEYFRAMES_PER_SEGMENT
 DISPLAY_TIME_PRECISION = 6
 
 
@@ -258,7 +258,7 @@ def _source_cut_timeline(
 ) -> list[dict]:
     """Return every real scene interval clipped to one provider segment.
 
-    This is deliberately independent of the nine analysis images.  A dense
+    This is deliberately independent of the three analysis images.  A dense
     montage can therefore retain every hard-cut fact even when several tiny
     scenes must share one analysis slot.
     """
@@ -292,7 +292,7 @@ def plan_segments(
 ) -> list[dict]:
     """Return provider-safe segments plus the complete source-cut timeline.
 
-    Provider duration (4..10 seconds) determines segmentation.  Nine images is
+    Provider duration (4..10 seconds) determines segmentation.  Three images is
     an analysis sampling capacity, not a source-scene limit; dense montages are
     compacted later by :func:`select_segment_keyframes` without deleting cuts.
     """
@@ -409,7 +409,7 @@ def _under_capacity_counts(frames: list[dict], seats: int) -> list[int]:
 def _compact_analysis_scene_groups(
     scenes: list[dict], start: Fraction, end: Fraction
 ) -> list[list[dict]]:
-    """Partition dense consecutive scenes into exactly nine analysis slots.
+    """Partition dense consecutive scenes into exactly three analysis slots.
 
     Each scene belongs to one slot and scene order is retained.  The greedy
     target is the remaining source duration divided by remaining seats; it is
@@ -477,7 +477,7 @@ def _analysis_group_representative(
 def select_segment_keyframes(
     effective_scenes: Iterable[Mapping], segment: Mapping
 ) -> list[dict]:
-    """Select exactly nine deterministic backend-owned source frames."""
+    """Select exactly three deterministic backend-owned source frames."""
     try:
         scene_inventory = [dict(scene) for scene in effective_scenes]
         start = _segment_exact_bound(scene_inventory, segment["start_s"])
@@ -574,7 +574,9 @@ def select_segment_keyframes(
         selected.append(item)
         previous_scene = scene["index"]
     if len(selected) != KEYFRAMES_PER_SEGMENT:
-        raise AssertionError("keyframe sampler did not produce exactly nine frames")
+        raise AssertionError(
+            "keyframe sampler did not produce exactly three frames"
+        )
     return selected
 
 

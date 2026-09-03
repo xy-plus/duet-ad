@@ -8,8 +8,10 @@ arrays with an explicit ``key`` field.
 
 from __future__ import annotations
 
+import json
 from typing import Iterable, Mapping
 
+from app import keyframe_contract
 from app.codex_runner import CodexOutputValidationError
 
 
@@ -172,6 +174,27 @@ PROJECT_INDEX_SCHEMA = _object({
 })
 
 
+def project_index_schema(*, keyframe_count: int) -> dict:
+    """Bind model-visible frame orders to one frozen segment cardinality."""
+    if keyframe_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS:
+        raise ValueError("project index keyframe count is invalid")
+    schema = json.loads(json.dumps(PROJECT_INDEX_SCHEMA))
+    for category in ("people", "entities", "scenes"):
+        occurrences = schema["properties"][category]["items"]["properties"][
+            "occurrences"
+        ]["items"]["properties"]["frame_orders"]
+        occurrences["maxItems"] = keyframe_count
+        occurrences["items"]["maximum"] = keyframe_count
+    relation_frames = schema["properties"]["relations"]["items"]["properties"][
+        "occurrences"
+    ]["items"]["properties"]["frames"]
+    relation_frames["maxItems"] = keyframe_count
+    relation_frames["items"]["properties"]["frame_order"][
+        "maximum"
+    ] = keyframe_count
+    return schema
+
+
 _GLOBAL_PERSON = _object({
     "source_identity": _TEXT,
     "replacement_identity": _TEXT,
@@ -273,8 +296,41 @@ SEGMENT_FRAMES_SCHEMA = _object({
 })
 
 
+def segment_frames_schema(
+    *, frame_keys: Iterable[str], stable_keys: Mapping[str, Iterable[str]],
+) -> dict:
+    """Require exactly the backend-frozen frames and Global stable keys."""
+    frames = tuple(frame_keys)
+    if (
+        len(frames) not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS
+        or len(frames) != len(set(frames))
+        or any(not isinstance(key, str) or not key for key in frames)
+    ):
+        raise ValueError("segment frame keys are invalid")
+    frames = tuple(sorted(frames))
+    globals_ = _global_stable_keys(stable_keys)
+    # Static schema fragments intentionally share objects.  JSON round-trip
+    # materializes every location before adding independent enums.
+    schema = json.loads(json.dumps(SEGMENT_FRAMES_SCHEMA))
+    frame_array = schema["properties"]["frames"]
+    frame_array["minItems"] = len(frames)
+    frame_array["maxItems"] = len(frames)
+    frame = frame_array["items"]
+    frame["properties"]["key"]["enum"] = list(frames)
+    for category in ("people", "entities"):
+        collection = frame["properties"][category]
+        keys = list(globals_[category])
+        if keys:
+            collection["items"]["properties"]["key"]["enum"] = keys
+        else:
+            collection["minItems"] = 0
+            collection["maxItems"] = 0
+    return schema
+
+
 def prompt_fusion_schema(
     *, input_sha256: str, segment_count: int, visual_max_chars: int,
+    keyframe_count: int = keyframe_contract.KEYFRAMES_PER_SEGMENT,
 ) -> dict:
     if (
         isinstance(segment_count, bool)
@@ -288,17 +344,26 @@ def prompt_fusion_schema(
         or visual_max_chars < 1
     ):
         raise ValueError("prompt fusion visual character limit is invalid")
+    if keyframe_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS:
+        raise ValueError("prompt fusion keyframe count is invalid")
+    output_version = (
+        3
+        if keyframe_count == keyframe_contract.KEYFRAMES_PER_SEGMENT
+        else 2
+    )
     visual = {"type": "string", "minLength": 1, "maxLength": visual_max_chars}
     segment = _object({
         "index": _INT1,
-        "visual": _array(visual, minimum=9, maximum=9),
+        "visual": _array(
+            visual, minimum=keyframe_count, maximum=keyframe_count,
+        ),
     })
     return _object({
         "schema": {
             "type": "string",
             "enum": ["duet.video-prompt-fusion-output"],
         },
-        "version": {"type": "integer", "enum": [2]},
+        "version": {"type": "integer", "enum": [output_version]},
         "input_sha256": {"type": "string", "enum": [input_sha256]},
         "segments": _array(
             segment, minimum=segment_count, maximum=segment_count,

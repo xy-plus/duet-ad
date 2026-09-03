@@ -18,7 +18,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app import codex_output_schemas, error_trace
+from app import codex_output_schemas, error_trace, keyframe_contract
 from app.codex_runner import CodexError
 from app.config import (
     SEEDREAM_EDIT_MODES,
@@ -1581,7 +1581,10 @@ def _validated_frames(source: Path) -> list[Path]:
         raise ValueError("invalid image optimization keyframes directory")
     frames = sorted(source.glob("[0-9][0-9].png"))
     expected = [f"{index:02d}.png" for index in range(1, len(frames) + 1)]
-    if not frames or len(frames) > 9 or [frame.name for frame in frames] != expected:
+    if (
+        len(frames) not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS
+        or [frame.name for frame in frames] != expected
+    ):
         raise ValueError("invalid image optimization keyframes")
     return frames
 
@@ -3937,11 +3940,14 @@ def _project_segment_inputs(
             ):
                 raise ValueError("invalid image optimization segments")
         prepared.append((segment, frames))
+    frame_counts = {len(frames) for _segment, frames in prepared}
+    if len(frame_counts) != 1:
+        raise ValueError("invalid image optimization segments")
     return session, indices, prepared
 
 
 def _contact_sheet(frames: list[Path], output: Path) -> None:
-    """Build one bounded 3x3 navigation sheet without replacing source evidence."""
+    """Build a bounded three-column sheet without inventing empty frames."""
     cells = []
     for number, frame in enumerate(frames, 1):
         image = cv2.imread(str(frame), cv2.IMREAD_COLOR)
@@ -3970,11 +3976,14 @@ def _contact_sheet(frames: list[Path], output: Path) -> None:
             0.7, (255, 255, 255), 2, cv2.LINE_AA,
         )
         cells.append(cell)
-    if not cells or len(cells) > 9:
+    if len(cells) not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS:
         raise ValueError("invalid image optimization segments")
-    cells.extend([cells[0] * 0 for _ in range(9 - len(cells))])
+    remainder = len(cells) % 3
+    if remainder:
+        cells.extend([cells[0] * 0 for _ in range(3 - remainder)])
     sheet = cv2.vconcat([
-        cv2.hconcat(cells[offset:offset + 3]) for offset in range(0, 9, 3)
+        cv2.hconcat(cells[offset:offset + 3])
+        for offset in range(0, len(cells), 3)
     ])
     if not cv2.imwrite(str(output), sheet, [cv2.IMWRITE_JPEG_QUALITY, 88]):
         raise ValueError("invalid image optimization segments")
@@ -4261,6 +4270,15 @@ def generate_project_prompts(
                     encoding="utf-8",
                 )
                 expected_frame_keys = {item["key"] for item in segment_slots}
+                segment_output_schema = codex_output_schemas.segment_frames_schema(
+                    frame_keys=expected_frame_keys,
+                    stable_keys={
+                        "people": global_plan["people"],
+                        "entities": global_plan["entities"],
+                        "scenes": global_plan["scenes"],
+                        "relations": global_plan["relations"],
+                    },
+                )
 
                 def normalize_segment_output(value: object) -> dict:
                     normalized = codex_output_schemas.normalize_segment_frames(value)
@@ -4286,7 +4304,7 @@ def generate_project_prompts(
                     session=session,
                     output_name="segment_frames.json",
                     max_bytes=MAX_PROMPT_BYTES + MAX_PROJECT_OUTPUT_OVERHEAD_BYTES,
-                    output_schema=codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
+                    output_schema=segment_output_schema,
                     normalize_output=normalize_segment_output,
                 )
 

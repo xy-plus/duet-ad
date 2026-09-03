@@ -108,10 +108,15 @@ def _make_long(settings, *, joins=("hard_cut", "continue"), dialogue_text="Ê∫êÂè
         work = segdir / "work"
         (segdir / "source.mp4").parent.mkdir(parents=True, exist_ok=True)
         (segdir / "source.mp4").write_bytes(f"segment-{index}".encode())
-        key = work / "keyframes" / "01.png"
+        keyframe_count = 3 if planned is not None else 1
+        keys = [
+            work / "keyframes" / f"{order:02d}.png"
+            for order in range(1, keyframe_count + 1)
+        ]
         first = work / "anchors" / "first.png"
         last = work / "anchors" / "last.png"
-        _png(key, 20 + index)
+        for order, key in enumerate(keys, 1):
+            _png(key, 20 + index + order)
         if index in landscape_first_indices:
             _png(first, 40 + index, width=160, height=90)
         else:
@@ -135,8 +140,10 @@ def _make_long(settings, *, joins=("hard_cut", "continue"), dialogue_text="Ê∫êÂè
             "chain_id": chain_id,
             "join_mode": join_mode,
             "source": f"segments/{index}/source.mp4",
-            "keyframes": ["01.png"],
-            "keyframe_paths": [f"segments/{index}/work/keyframes/01.png"],
+            "keyframes": [key.name for key in keys],
+            "keyframe_paths": [
+                f"segments/{index}/work/keyframes/{key.name}" for key in keys
+            ],
             "first_frame_path": f"segments/{index}/work/anchors/first.png",
             "last_frame_path": f"segments/{index}/work/anchors/last.png",
             "visual_prompt": visual_text,
@@ -148,7 +155,7 @@ def _make_long(settings, *, joins=("hard_cut", "continue"), dialogue_text="Ê∫êÂè
         receipt_input.append({
             **segment,
             "source_path": segdir / "source.mp4",
-            "keyframe_paths": [key],
+            "keyframe_paths": keys,
             "first_frame_path": first,
             "last_frame_path": last,
             "visual_prompt_path": visual,

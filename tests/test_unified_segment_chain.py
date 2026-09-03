@@ -91,11 +91,11 @@ def test_current_v4_n1_and_n2_use_the_same_segment_coordinator() -> None:
 def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> None:
     old_prompt = "OLD_VISUAL_PROMPT_MUST_NOT_REACH_CONTEXT_OR_H3"
     final_visual = "FUSED_PROMPT_FROM_OPTIMIZED_IMAGES"
-    for order in range(1, 10):
+    for order in range(1, 4):
         (tmp_path / f"{order:02d}.png").write_bytes(f"frame-{order}".encode())
     fusion_input = {
         "schema": "duet.video-prompt-fusion-input",
-        "version": 2,
+        "version": long_generation.PROMPT_FUSION_VERSION,
         "segments": [{
             "index": 1,
             "new_keyframes": [
@@ -111,7 +111,7 @@ def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> No
                             {"type": "continuous", "at_segment_s": None}
                         ),
                     }
-                for order in range(1, 10)
+                for order in range(1, 4)
             ],
             "old_video_prompt": {
                 "text": old_prompt,
@@ -121,7 +121,7 @@ def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> No
                 "order": order,
                 "text": "replace person and scene",
                 "sha256": hashlib.sha256(b"replace person and scene").hexdigest(),
-            } for order in range(1, 10)],
+            } for order in range(1, 4)],
             "audio_content": {
                 "lines_json": "[]",
                 "voice_references": [],
@@ -133,7 +133,7 @@ def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> No
     input_data = _canonical(fusion_input)
     fusion_output = {
         "schema": "duet.video-prompt-fusion-output",
-        "version": 2,
+        "version": long_generation.PROMPT_FUSION_VERSION,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
         "segments": [
             _fusion_v2_output(fusion_input["segments"][0], final_visual)
@@ -156,12 +156,12 @@ def test_prompt_fusion_output_is_the_only_prompt_authority(tmp_path: Path) -> No
     assert old_prompt not in frozen.final_prompts
 
 
-def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
+def test_prompt_fusion_v3_binds_exact_source_timeline_and_hard_cut(
     tmp_path: Path,
 ) -> None:
     frames = []
     timeline = []
-    source_times = [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0]
+    source_times = [0.0, 2.5, 14.0]
     for order, segment_time_s in enumerate(source_times, 1):
         data = f"frame-{order}".encode()
         path = tmp_path / f"{order:02d}.png"
@@ -170,13 +170,13 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
             {"type": "start", "at_segment_s": 0.0}
             if order == 1 else
             {"type": "hard_cut", "at_segment_s": 2.267}
-            if order == 4 else
+            if order == 2 else
             {"type": "continuous", "at_segment_s": None}
         )
         source = {
             "order": order,
             "segment_time_s": segment_time_s,
-            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "source_scene_id": "SCENE_01" if order < 2 else "SCENE_02",
             "transition": transition,
         }
         timeline.append(source)
@@ -205,7 +205,7 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
                 "sha256": hashlib.sha256(
                     b"replace person and scene"
                 ).hexdigest(),
-            } for order in range(1, 10)],
+            } for order in range(1, 4)],
             "audio_content": {
                 "lines_json": "[]",
                 "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
@@ -237,7 +237,7 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
     )
 
     assert frozen.final_prompts == (final_prompt,)
-    assert frozen.segments[0]["new_keyframes"][3]["transition"] == {
+    assert frozen.segments[0]["new_keyframes"][1]["transition"] == {
         "type": "hard_cut", "at_segment_s": 2.267,
     }
 
@@ -280,20 +280,20 @@ def test_prompt_fusion_v2_binds_exact_source_timeline_and_hard_cut(
 
 def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> None:
     frames = []
-    for order in range(1, 10):
+    for order in range(1, 4):
         data = f"relation-frame-{order}".encode()
         (tmp_path / f"{order:02d}.png").write_bytes(data)
         frames.append({
             "order": order,
             "path": f"{order:02d}.png",
             "sha256": hashlib.sha256(data).hexdigest(),
-            "segment_time_s": float(order - 1),
-            "source_scene_id": "scene-a" if order < 5 else "scene-b",
+            "segment_time_s": float((order - 1) * 4),
+            "source_scene_id": "scene-a" if order < 2 else "scene-b",
             "transition": (
                 {"type": "start", "at_segment_s": 0.0}
                 if order == 1 else
                 {"type": "hard_cut", "at_segment_s": 3.5}
-                if order == 5 else
+                if order == 2 else
                 {"type": "continuous", "at_segment_s": None}
             ),
         })
@@ -317,9 +317,9 @@ def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> No
             },
         }
     relations = [
-        occurrence("relation-01", "person-01", "entity-01", 4, "attached"),
-        occurrence("relation-01", "person-01", "entity-01", 5, "released"),
-        occurrence("relation-02", "entity-02", "scene-02", 6, "supported"),
+        occurrence("relation-01", "person-01", "entity-01", 1, "attached"),
+        occurrence("relation-01", "person-01", "entity-01", 2, "released"),
+        occurrence("relation-02", "entity-02", "scene-02", 3, "supported"),
     ]
     text = "replace current directly visible elements"
     segment = {
@@ -333,7 +333,7 @@ def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> No
             "order": order,
             "text": text,
             "sha256": hashlib.sha256(text.encode()).hexdigest(),
-        } for order in range(1, 10)],
+        } for order in range(1, 4)],
         "relation_occurrences": relations,
         "audio_content": {
             "lines_json": "[]",
@@ -378,8 +378,8 @@ def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> No
         long_generation._freeze_fusion_relation_occurrences(relations, frames),
     )
     assert [item["interval"] for item in expected] == [
-        {"start_frame_order": 1, "end_frame_order": 4, "source_scene_id": "scene-a"},
-        {"start_frame_order": 5, "end_frame_order": 9, "source_scene_id": "scene-b"},
+        {"start_frame_order": 1, "end_frame_order": 1, "source_scene_id": "scene-a"},
+        {"start_frame_order": 2, "end_frame_order": 3, "source_scene_id": "scene-b"},
     ]
     assert expected[0]["relations"][0]["states"][0]["state"] == "attached"
     assert expected[1]["relations"][0]["states"][0]["state"] == "released"
@@ -438,10 +438,10 @@ def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> No
     ).final_prompts == frozen.final_prompts
 
 
-def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
+def test_prompt_fusion_v3_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
     frames = []
     timeline = []
-    for order in range(1, 10):
+    for order in range(1, 4):
         data = f"frame-{order}".encode()
         path = tmp_path / f"{order:02d}.png"
         path.write_bytes(data)
@@ -449,16 +449,13 @@ def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
             {"type": "start", "at_segment_s": 0.0}
             if order == 1 else
             {"type": "hard_cut", "at_segment_s": 2.267}
-            if order == 4 else
+            if order == 2 else
             {"type": "continuous", "at_segment_s": None}
         )
         source = {
             "order": order,
-            "segment_time_s": (
-                0.0 if order == 1 else float(order - 1)
-                if order < 4 else float(order)
-            ),
-            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "segment_time_s": (0.0, 2.5, 4.0)[order - 1],
+            "source_scene_id": "SCENE_01" if order < 2 else "SCENE_02",
             "transition": transition,
         }
         timeline.append(source)
@@ -484,7 +481,7 @@ def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
                 "order": order,
                 "text": "replace",
                 "sha256": hashlib.sha256(b"replace").hexdigest(),
-            } for order in range(1, 10)],
+            } for order in range(1, 4)],
             "audio_content": {
                 "lines_json": "[]",
                 "lines_sha256": hashlib.sha256(b"[]").hexdigest(),
@@ -505,7 +502,7 @@ def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
             "index": 1,
             "visual": [
                 "the cut happens at 99 seconds",
-                *[f"frame {order} continues" for order in range(2, 10)],
+                *[f"frame {order} continues" for order in range(2, 4)],
             ],
         }],
     }))
@@ -543,7 +540,7 @@ def test_historical_shot_fusion_is_read_only_but_cannot_be_republished(
         })
     input_data = _canonical({
         "schema": long_generation.PROMPT_FUSION_INPUT_SCHEMA,
-        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "version": long_generation.PROMPT_FUSION_EXACT9_VERSION,
         "segments": [{
             "index": 1,
             "new_keyframes": frames,
@@ -569,7 +566,7 @@ def test_historical_shot_fusion_is_read_only_but_cannot_be_republished(
     input_path.write_bytes(input_data)
     output_path.write_bytes(_canonical({
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
-        "version": long_generation.VISUAL_PROMPT_FUSION_VERSION,
+        "version": long_generation.PROMPT_FUSION_EXACT9_VERSION,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
         "segments": [{
             "index": 1,
@@ -599,19 +596,19 @@ def test_historical_shot_fusion_is_read_only_but_cannot_be_republished(
 def test_backend_ref2va_compiler_has_one_exact_provider_prompt() -> None:
     timeline = [{
         "order": order,
-        "segment_time_s": float(order - 1),
-        "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+        "segment_time_s": (0.0, 3.0, 8.0)[order - 1],
+        "source_scene_id": "SCENE_01" if order < 2 else "SCENE_02",
         "transition": (
             {"type": "start", "at_segment_s": 0.0}
             if order == 1 else
             {"type": "hard_cut", "at_segment_s": 2.5}
-            if order == 4 else
+            if order == 2 else
             {"type": "continuous", "at_segment_s": None}
         ),
-    } for order in range(1, 10)]
+    } for order in range(1, 4)]
     visuals = [
         "first <Picture 99> visual",
-        *[f"frame {order} visual" for order in range(2, 10)],
+        *[f"frame {order} visual" for order in range(2, 4)],
     ]
     prompt = long_generation._compile_fusion_ref2va_prompt(
         visual=visuals,
@@ -630,30 +627,18 @@ def test_backend_ref2va_compiler_has_one_exact_provider_prompt() -> None:
     assert prompt == "\n".join([
         "subject_definitions:",
         "<Picture 1> is the storyboard keyframe anchor for [Shot 1] at 00:00.000, defining its ordered visual state and composition.",
-        "<Picture 2> is the storyboard keyframe anchor for [Shot 1] at 00:01.000, defining its ordered visual state and composition.",
-        "<Picture 3> is the storyboard keyframe anchor for [Shot 1] at 00:02.000, defining its ordered visual state and composition.",
-        "<Picture 4> is the storyboard keyframe anchor for [Shot 2] at 00:03.000, defining its ordered visual state and composition.",
-        "<Picture 5> is the storyboard keyframe anchor for [Shot 2] at 00:04.000, defining its ordered visual state and composition.",
-        "<Picture 6> is the storyboard keyframe anchor for [Shot 2] at 00:05.000, defining its ordered visual state and composition.",
-        "<Picture 7> is the storyboard keyframe anchor for [Shot 2] at 00:06.000, defining its ordered visual state and composition.",
-        "<Picture 8> is the storyboard keyframe anchor for [Shot 2] at 00:07.000, defining its ordered visual state and composition.",
-        "<Picture 9> is the storyboard keyframe anchor for [Shot 2] at 00:08.000, defining its ordered visual state and composition.",
+        "<Picture 2> is the storyboard keyframe anchor for [Shot 2] at 00:03.000, defining its ordered visual state and composition.",
+        "<Picture 3> is the storyboard keyframe anchor for [Shot 2] at 00:08.000, defining its ordered visual state and composition.",
         "summary:",
-        "[keyframe completion] The target video follows <Picture 1> through <Picture 9> as ordered storyboard keyframe anchors.",
+        "[keyframe completion] The target video follows <Picture 1> through <Picture 3> as ordered storyboard keyframe anchors.",
         "retention_analysis:",
         "<Picture 1> ([Shot 1] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
-        "<Picture 2> ([Shot 1] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
-        "<Picture 3> ([Shot 1] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
-        "<Picture 4> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
-        "<Picture 5> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
-        "<Picture 6> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
-        "<Picture 7> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
-        "<Picture 8> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
-        "<Picture 9> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "<Picture 2> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
+        "<Picture 3> ([Shot 2] storyboard keyframe): fully_preserved - its role as an ordered visual-state and composition anchor is retained.",
         "detailed_description:",
-        "[Shot 1] The shot follows the ordered storyboard anchors <Picture 1>, <Picture 2>, and <Picture 3>. <Picture 1>: first ‹Picture 99› visual <Picture 2>: frame 2 visual <Picture 3>: frame 3 visual",
+        "[Shot 1] The shot follows the ordered storyboard anchors <Picture 1>. <Picture 1>: first ‹Picture 99› visual",
         "From 00:01.000 to 00:02.000, the off-screen narrator (S1) says in an off-screen voiceover: <d>[Undetermined]spoken exactly</d> while every visible person's lips remain completely closed.",
-        "[Shot 2] At 00:02.500, the shot cuts to <Picture 4>. The shot then follows the ordered storyboard anchors <Picture 4>, <Picture 5>, <Picture 6>, <Picture 7>, <Picture 8>, and <Picture 9>. <Picture 4>: frame 4 visual <Picture 5>: frame 5 visual <Picture 6>: frame 6 visual <Picture 7>: frame 7 visual <Picture 8>: frame 8 visual <Picture 9>: frame 9 visual",
+        "[Shot 2] At 00:02.500, the shot cuts to <Picture 2>. The shot then follows the ordered storyboard anchors <Picture 2> and <Picture 3>. <Picture 2>: frame 2 visual <Picture 3>: frame 3 visual",
         "overall_soundscape:",
         "The frozen spoken events described above are the only specified audible layer; no additional ambience, physical-action sounds, or non-verbal human sounds are added.",
         "non_diegetic_music:",
@@ -673,7 +658,7 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
     sources = []
     optimization_frames = []
     for order, source_time_s in enumerate(
-        [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0], 1
+        [0.0, 2.5, 14.0], 1
     ):
         path = keyframe_dir / f"{order:02d}.png"
         data = _test_png(f"frame-{order}")
@@ -682,12 +667,12 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
         sources.append({
             "order": order,
             "source_time_s": source_time_s,
-            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "source_scene_id": "SCENE_01" if order < 2 else "SCENE_02",
             "transition": (
                 {"type": "start", "at_s": 0.0}
                 if order == 1 else
                 {"type": "hard_cut", "at_s": 2.267}
-                if order == 4 else
+                if order == 2 else
                 {"type": "continuous", "at_s": None}
             ),
         })
@@ -708,7 +693,7 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
         workdir=workdir,
         first_frame=anchor,
         first_frame_data=keyframes[0][1],
-        last_frame=keyframe_dir / "09.png",
+        last_frame=keyframe_dir / "03.png",
         last_frame_data=keyframes[-1][1],
         prompt="final",
         keyframes=tuple(keyframes),
@@ -721,7 +706,7 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
         source=tmp_path / "source.mp4",
         receipt="a" * 64,
         segments=(segment,),
-        receipt_version=long_video.VISUAL_PLAN_RECEIPT_VERSION,
+        receipt_version=long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
     )
     meta = {
         "segments": [{"index": 1, "visual_prompt": "source actions"}],
@@ -740,7 +725,7 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
                     "preserve": ["role", "count"],
                     "replace_together": True,
                 }] if order == 1 else []),
-            } for order in range(1, 10)],
+            } for order in range(1, 4)],
         }]},
     }
 
@@ -753,14 +738,14 @@ def test_prompt_fusion_builder_copies_receipt_bound_source_timeline(
     ))
 
     assert payload["version"] == long_generation.VISUAL_PROMPT_FUSION_VERSION
-    frame_4_proxy = image_optimization.half_resolution_png(
-        _test_png("frame-4")
+    frame_2_proxy = image_optimization.half_resolution_png(
+        _test_png("frame-2")
     )
-    frame_4_sha256 = hashlib.sha256(frame_4_proxy).hexdigest()
-    assert payload["segments"][0]["new_keyframes"][3] == {
-        "order": 4,
-        "path": f"work/prompt-fusion-proxies/{frame_4_sha256}.png",
-        "sha256": frame_4_sha256,
+    frame_2_sha256 = hashlib.sha256(frame_2_proxy).hexdigest()
+    assert payload["segments"][0]["new_keyframes"][1] == {
+        "order": 2,
+        "path": f"work/prompt-fusion-proxies/{frame_2_sha256}.png",
+        "sha256": frame_2_sha256,
         "segment_time_s": 2.5,
         "source_scene_id": "SCENE_02",
         "transition": {"type": "hard_cut", "at_segment_s": 2.267},
@@ -810,7 +795,8 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
     (root / "source.mp4").write_bytes(b"source-video")
     segments = []
     metas = []
-    local_times = [float(value) for value in range(9)]
+    local_times = [0.0, 4.0, 8.0]
+    cut_at_s = 2.267 if segment_count == 1 else 12.267
     for segment_index in range(1, segment_count + 1):
         start_s = float((segment_index - 1) * 10)
         segwork = work / "segments" / str(segment_index) / "work"
@@ -820,6 +806,7 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
         frames_dir.mkdir()
         names = []
         manifest_frames = []
+        sampling_items = []
         for order, local_time in enumerate(local_times, 1):
             sampled_time = (
                 0.033333
@@ -837,6 +824,21 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
                 "time_seconds": sampled_time,
                 "file": raw_name,
             })
+            source_time_s = start_s + sampled_time
+            source_scene_id = (
+                "SCENE_01" if source_time_s < cut_at_s else "SCENE_02"
+            )
+            sampling_items.append({
+                "order": order,
+                "path": f"keyframes/{name}",
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "source_scene_id": source_scene_id,
+                "source_scene_start_s": (
+                    0.0 if source_scene_id == "SCENE_01" else cut_at_s
+                ),
+                "source_time_s": source_time_s,
+                "repeated": False,
+            })
         (segwork / "manifest.json").write_text(
             json.dumps({"frames": manifest_frames}), encoding="utf-8"
         )
@@ -848,9 +850,17 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
             "join_mode": "hard_cut" if segment_index == 1 else "continue",
         }
         segments.append(segment)
-        metas.append({**segment, "keyframes": names})
+        metas.append({
+            **segment,
+            "keyframes": names,
+            "keyframe_sampling": {
+                "schema": "duet.backend-keyframe-sampling",
+                "version": 3,
+                "keyframe_count": 3,
+                "keyframes": sampling_items,
+            },
+        })
 
-    cut_at_s = 2.267 if segment_count == 1 else 12.267
     bound = pipeline._bind_keyframe_source_timeline(
         work,
         segments,
@@ -875,7 +885,7 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
             (selected_dir / name, (selected_dir / name).read_bytes())
             for name in meta["keyframes"]
         )
-        for order in range(1, 10):
+        for order in range(1, 4):
             prompt = f"optimized segment {segment['index']} frame {order}"
             optimization_frames.append({
                 "segment_index": segment["index"],
@@ -905,7 +915,7 @@ def test_real_source_binding_reaches_fusion_v2_and_context_contract(
         source=root / "source.mp4",
         receipt="a" * 64,
         segments=tuple(frozen_segments),
-        receipt_version=long_video.VISUAL_PLAN_RECEIPT_VERSION,
+        receipt_version=long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
     )
     meta = {
         "segments": [{
@@ -1024,7 +1034,7 @@ def _audio_compile_fixture(
         segment_work = root / "work" / "segments" / str(index) / "work"
         frames = []
         sources = []
-        for order in range(1, 10):
+        for order in range(1, 4):
             path = segment_work / "postprocessed" / f"{order:02d}.png"
             path.parent.mkdir(parents=True, exist_ok=True)
             data = _test_png(f"segment-{index}-frame-{order}")
@@ -1108,7 +1118,7 @@ def _audio_compile_fixture(
         source=root / "source.mp4",
         receipt="a" * 64,
         segments=tuple(frozen_segments),
-        receipt_version=long_video.VISUAL_PLAN_RECEIPT_VERSION,
+        receipt_version=long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
     ))
 
 
@@ -1130,7 +1140,7 @@ def test_auto_sung_compiles_empty_audio_with_forbid_music_policy(
         dialogue_delivery="off_screen",
     ))
 
-    assert payload["version"] == 2
+    assert payload["version"] == long_generation.PROMPT_FUSION_VERSION
     assert [segment["audio_content"] for segment in payload["segments"]] == [
         {
             "lines_json": "[]",
@@ -1532,7 +1542,12 @@ def _fusion_input(
     for index in range(1, segment_count + 1):
         frames = []
         prompts = []
-        for order in range(1, 10):
+        frame_count = (
+            3
+            if version == long_generation.PROMPT_FUSION_VERSION
+            else 9
+        )
+        for order in range(1, frame_count + 1):
             relative = f"work/segment-{index}-{order:02d}.png"
             data = f"segment-{index}-frame-{order}".encode()
             (root / relative).write_bytes(data)
@@ -1609,7 +1624,37 @@ def _fusion_v2_visual(segment: dict, visual: str) -> list[str]:
     ]
 
 
-def test_nine_fusion_visuals_are_grouped_by_frozen_hard_cuts() -> None:
+def test_current_three_frame_fusion_rejects_historical_shot_visual_shape(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "work").mkdir()
+    input_data = _fusion_input(tmp_path, 1)
+    input_path = tmp_path / "multimodal_input.json"
+    output_path = tmp_path / "h3_prompt_plan.json"
+    input_path.write_bytes(input_data)
+    output_path.write_bytes(_canonical({
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.PROMPT_FUSION_VERSION,
+        "input_sha256": hashlib.sha256(input_data).hexdigest(),
+        "segments": [{
+            "index": 1,
+            "visual": ["historical shot-level description"],
+        }],
+    }))
+
+    with pytest.raises(
+        long_generation.LongGenerationError,
+        match="prompt_fusion_output_invalid",
+    ):
+        long_generation.load_prompt_fusion(
+            input_path=input_path,
+            output_path=output_path,
+            root=tmp_path,
+            require_frame_visuals=False,
+        )
+
+
+def test_legacy_nine_fusion_visuals_are_grouped_by_frozen_hard_cuts() -> None:
     transition_types = (
         "start", "continuous", "continuous", "continuous", "continuous",
         "hard_cut", "continuous", "hard_cut", "continuous",
@@ -1646,7 +1691,7 @@ def test_fusion_visual_budget_is_derived_before_generation() -> None:
             if order == 1 else
             {"type": "continuous", "at_segment_s": None}
         ),
-    } for order in range(1, 10)]
+    } for order in range(1, 4)]
     without_cut_limit = long_generation.prompt_fusion_visual_max_chars(
         timeline=timeline,
         lines=[],
@@ -1656,7 +1701,7 @@ def test_fusion_visual_budget_is_derived_before_generation() -> None:
     cut_timeline = [{
         "order": 1,
         "start_segment_s": 0.0,
-        "end_segment_s": 8.0,
+        "end_segment_s": 2.0,
         "source_scene_id": "SCENE_01",
     }]
     limit = long_generation.prompt_fusion_visual_max_chars(
@@ -1668,7 +1713,7 @@ def test_fusion_visual_budget_is_derived_before_generation() -> None:
     )
     assert limit < without_cut_limit
     compiled = long_generation._compile_fusion_ref2va_prompt(
-        visual=["x" * limit] * 9,
+        visual=["x" * limit] * len(timeline),
         timeline=timeline,
         lines=[],
         music_policy="forbid",
@@ -1681,7 +1726,7 @@ def test_fusion_visual_budget_is_derived_before_generation() -> None:
         match="prompt_fusion_output_invalid",
     ):
         long_generation._compile_fusion_ref2va_prompt(
-            visual=["x" * (limit + 1)] * 9,
+            visual=["x" * (limit + 1)] * len(timeline),
             timeline=timeline,
             lines=[],
             music_policy="forbid",

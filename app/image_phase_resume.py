@@ -24,13 +24,22 @@ from typing import Iterator, Mapping
 
 import cv2
 
-from app import image_optimization, long_video, mediakit, pipeline, skill_milestone, storage
+from app import (
+    image_optimization,
+    keyframe_contract,
+    long_video,
+    mediakit,
+    pipeline,
+    skill_milestone,
+    storage,
+)
 from app.config import Settings
 from app.deepseek_runner import DeepSeekRunner
 
 
 SCHEMA = "duet.image-phase-resume"
-VERSION = 2
+VERSION = 3
+LEGACY_VERSION = 2
 IMAGE_FAILURE = "image optimization output is missing or invalid"
 _CID_RE = r"[0-9a-f]{32}"
 _PROMPT_BYTES = 32 * 1024
@@ -343,26 +352,34 @@ def _load_segments(
         if abs(segment_duration - (segment["end_s"] - segment["start_s"])) > 0.11:
             raise ResumeRejected(f"segment {index} duration does not match boundary")
 
-        keyframe_dir = segwork / "keyframes"
-        names = [f"{order:02d}.png" for order in range(1, 10)]
-        if not keyframe_dir.is_dir() or sorted(
-            path.name for path in keyframe_dir.glob("*.png") if path.is_file()
-        ) != names:
-            raise ResumeRejected(f"segment {index} keyframe set is incomplete")
-        for name in names:
-            path = keyframe_dir / name
-            if path.is_symlink() or cv2.imread(str(path), cv2.IMREAD_UNCHANGED) is None:
-                raise ResumeRejected(f"segment {index} keyframe {name} is invalid")
-
         sampling_path = _regular(
             root, f"work/segments/{index}/work/keyframe_sampling.json",
             label=f"segment {index} keyframe sampling",
         )
         sampling = _json(sampling_path, label=f"segment {index} keyframe sampling")
-        if not isinstance(sampling, dict) or set(sampling) != {
-            "schema", "version", "selection_method", "preprocess", "keyframes",
-        } or sampling.get("schema") != "duet.backend-keyframe-sampling" \
-                or sampling.get("version") != 2 \
+        sampling_version = (
+            sampling.get("version") if isinstance(sampling, dict) else None
+        )
+        if sampling_version == keyframe_contract.SAMPLING_RECEIPT_VERSION:
+            expected_count = keyframe_contract.KEYFRAMES_PER_SEGMENT
+            expected_sampling_keys = {
+                "schema", "version", "keyframe_count", "selection_method",
+                "preprocess", "keyframes",
+            }
+            count_marker_valid = sampling.get("keyframe_count") == expected_count
+        elif sampling_version == keyframe_contract.LEGACY_SAMPLING_RECEIPT_VERSION:
+            expected_count = keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+            expected_sampling_keys = {
+                "schema", "version", "selection_method", "preprocess", "keyframes",
+            }
+            count_marker_valid = True
+        else:
+            expected_count = 0
+            expected_sampling_keys = set()
+            count_marker_valid = False
+        if not isinstance(sampling, dict) or set(sampling) != expected_sampling_keys \
+                or sampling.get("schema") != "duet.backend-keyframe-sampling" \
+                or not count_marker_valid \
                 or not isinstance(sampling.get("preprocess"), dict) \
                 or set(sampling["preprocess"]) != {
                     "remove_subtitle", "remove_watermark",
@@ -372,8 +389,18 @@ def _load_segments(
                     for value in sampling["preprocess"].values()
                 ) \
                 or not isinstance(sampling.get("keyframes"), list) \
-                or len(sampling["keyframes"]) != 9:
+                or len(sampling["keyframes"]) != expected_count:
             raise ResumeRejected(f"segment {index} keyframe sampling is invalid")
+        keyframe_dir = segwork / "keyframes"
+        names = list(keyframe_contract.frame_names(expected_count))
+        if not keyframe_dir.is_dir() or sorted(
+            path.name for path in keyframe_dir.glob("*.png") if path.is_file()
+        ) != names:
+            raise ResumeRejected(f"segment {index} keyframe set is incomplete")
+        for name in names:
+            path = keyframe_dir / name
+            if path.is_symlink() or cv2.imread(str(path), cv2.IMREAD_UNCHANGED) is None:
+                raise ResumeRejected(f"segment {index} keyframe {name} is invalid")
         for order, item in enumerate(sampling["keyframes"], 1):
             if not isinstance(item, dict) or not {
                 "order", "path", "source_scene_id", "source_time_s", "repeated",
@@ -577,8 +604,12 @@ def _collect(settings: Settings, cid: str) -> _Snapshot:
         skill_milestone.MANIFEST_RELATIVE_PATH.as_posix(),
         *[item.frozen_path for item in milestone.skills],
     ]
+    segment_metas_by_index = {
+        item["index"]: item for item in segment_metas
+    }
     for segment in segments:
         index = segment["index"]
+        keyframe_names = segment_metas_by_index[index]["keyframes"]
         artifact_paths.extend([
             f"work/segments/{index}/source.mp4",
             f"work/segments/{index}/work/manifest.json",
@@ -588,7 +619,10 @@ def _collect(settings: Settings, cid: str) -> _Snapshot:
             f"work/segments/{index}/work/prompt.txt",
             f"work/segments/{index}/work/anchors/first.png",
             f"work/segments/{index}/work/anchors/last.png",
-            *[f"work/segments/{index}/work/keyframes/{order:02d}.png" for order in range(1, 10)],
+            *[
+                f"work/segments/{index}/work/keyframes/{name}"
+                for name in keyframe_names
+            ],
         ])
     for segment_meta in segment_metas:
         artifact_paths.extend(
@@ -604,9 +638,20 @@ def _collect(settings: Settings, cid: str) -> _Snapshot:
         _record(root, relative, label="resume artifact")
         for relative in artifact_paths
     ]
+    frame_counts = {len(item["keyframes"]) for item in segment_metas}
+    if len(frame_counts) != 1:
+        raise ResumeRejected("segment keyframe counts are inconsistent")
+    keyframe_count = next(iter(frame_counts))
+    if keyframe_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS:
+        raise ResumeRejected("segment keyframe count is unsupported")
+    manifest_version = (
+        VERSION
+        if keyframe_count == keyframe_contract.KEYFRAMES_PER_SEGMENT
+        else LEGACY_VERSION
+    )
     manifest = {
         "schema": SCHEMA,
-        "version": VERSION,
+        "version": manifest_version,
         "cid": cid,
         "failure": {"status": "failed", "error": IMAGE_FAILURE},
         "skill_milestone": milestone.public_summary(),
@@ -614,6 +659,8 @@ def _collect(settings: Settings, cid: str) -> _Snapshot:
         "segments": segments,
         "artifacts": artifacts,
     }
+    if manifest_version == VERSION:
+        manifest["keyframe_count"] = keyframe_count
     # Preserve source scene parsing as part of collection even though its
     # bytes are represented by the scenes artifact digest above.
     del canonical_index, root_manifest
@@ -708,13 +755,30 @@ def _execute_snapshot(snapshot: _Snapshot, runner) -> dict:
             raise ResumeRejected("resume artifacts changed during image generation")
 
         receipt_segments = _receipt_segments(root, snapshot.segment_metas)
-        long_video.write_plan_receipt(
-            root,
-            source=snapshot.source,
-            duration_s=float(snapshot.meta["duration_s"]),
-            segments=receipt_segments,
-            workflow=pipeline.H3_ENGINE_WORKFLOW,
-        )
+        if snapshot.manifest["version"] == VERSION:
+            long_video.write_plan_receipt(
+                root,
+                source=snapshot.source,
+                duration_s=float(snapshot.meta["duration_s"]),
+                segments=receipt_segments,
+                workflow=pipeline.H3_ENGINE_WORKFLOW,
+            )
+        else:
+            duration_s = float(snapshot.meta["duration_s"])
+            long_video._write_plan_receipt(
+                root,
+                source=snapshot.source,
+                duration_s=duration_s,
+                segments=receipt_segments,
+                workflow=pipeline.H3_ENGINE_WORKFLOW,
+                minimum_source_duration_s=min(
+                    duration_s, long_video.SEGMENT_SOURCE_MIN_S,
+                ),
+                provider_max_duration_s=long_video.SEGMENT_PROVIDER_MAX_DURATION_S,
+                expected_keyframe_count=(
+                    keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+                ),
+            )
         plan_written = True
         candidate = {
             **snapshot.meta,

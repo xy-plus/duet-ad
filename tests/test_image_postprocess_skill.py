@@ -96,7 +96,7 @@ def _ineligible(reason: str = "no_observable_narrative_person") -> dict:
 
 
 def _segments(
-    session: Path, indices: list[int] | None = None, *, frames: int = 1
+    session: Path, indices: list[int] | None = None, *, frames: int = 3
 ) -> list[dict]:
     indices = indices or [1, 2]
     result = []
@@ -985,11 +985,11 @@ def test_two_phase_inputs_are_minimal_and_merge_into_exact_v4_prompts(tmp_path):
     assert plan["version"] == 4
     assert plan["eligible"] is True
     assert image_optimization.canonical_plan_v4(
-        plan, segment_indices=[1, 2], frame_counts={1: 1, 2: 1},
+        plan, segment_indices=[1, 2], frame_counts={1: 3, 2: 3},
     ) == plan
     assert set(prompts) == {1, 2}
     for prompt_by_frame in prompts.values():
-        assert set(prompt_by_frame) == {1}
+        assert set(prompt_by_frame) == {1, 2, 3}
         prompt = prompt_by_frame[1]
         assert "替换人物" in prompt
         assert "替换场景" in prompt
@@ -1098,16 +1098,16 @@ def test_segment_frame_skill_calls_overlap_and_mechanically_merge_to_v4(tmp_path
     assert image_optimization.canonical_plan_v4(
         plan,
         segment_indices=[1, 2, 3],
-        frame_counts={1: 1, 2: 1, 3: 1},
+        frame_counts={1: 3, 2: 3, 3: 3},
     ) == plan
     assert set(prompts) == {1, 2, 3}
-    assert all(set(frames) == {1} for frames in prompts.values())
+    assert all(set(frames) == {1, 2, 3} for frames in prompts.values())
 
 
 def test_plan_phase_v4_compiles_one_prompt_for_each_frozen_source_frame(tmp_path):
     session = tmp_path / "session"
     runner = _Runner(_semantic_output)
-    segments = _transition_skeleton(_segments(session, [0], frames=2))
+    segments = _transition_skeleton(_segments(session, [0], frames=3))
 
     generated, prompts = _generate_project_prompts(
         runner,
@@ -1121,7 +1121,7 @@ def test_plan_phase_v4_compiles_one_prompt_for_each_frozen_source_frame(tmp_path
         "global_plan", "segment_frames"
     ]
     assert generated["version"] == 4
-    assert set(prompts) == {0} and set(prompts[0]) == {1, 2}
+    assert set(prompts) == {0} and set(prompts[0]) == {1, 2, 3}
     assert prompts[0][1] != prompts[0][2]
     assert "frame-001 当前可见身体与姿态" in prompts[0][1]
     assert "frame-002 当前可见身体与姿态" in prompts[0][2]
@@ -2672,17 +2672,17 @@ def test_two_phase_semantics_are_mechanically_canonicalized_per_frame(tmp_path):
     assert image_optimization.canonical_plan_v4(
         plan,
         segment_indices=[1, 2],
-        frame_counts={1: 1, 2: 1},
+        frame_counts={1: 3, 2: 3},
     ) == plan
     assert plan["person_plans"] and plan["scene_plans"]
     assert [
         frame["frame_index"]
         for segment in plan["segments"]
         for frame in segment["frame_constraints"]
-    ] == [1, 1]
+    ] == [1, 2, 3, 1, 2, 3]
     assert set(prompts) == {1, 2}
-    assert set(prompts[1]) == {1}
-    assert set(prompts[2]) == {1}
+    assert set(prompts[1]) == {1, 2, 3}
+    assert set(prompts[2]) == {1, 2, 3}
 
 
 def test_two_phase_retry_repeats_only_the_failed_segment(tmp_path):

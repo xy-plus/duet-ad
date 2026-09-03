@@ -12,7 +12,7 @@ import math
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-from app import h3, h3_project
+from app import h3, h3_project, keyframe_contract
 
 SHORT_VIDEO_MAX_S = 10.0
 PREVIOUS_SHORT_VIDEO_MAX_S = 10.0
@@ -31,6 +31,8 @@ PLAN_RECEIPT_VERSION = 2
 MULTIMODAL_PLAN_RECEIPT_VERSION = 3
 VISUAL_PLAN_RECEIPT_VERSION = 4
 VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION = 5
+THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION = 6
+THREE_FRAME_VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION = 7
 LEGACY_PLAN_RECEIPT_VERSION = 1
 
 _EPS = 1e-6
@@ -90,6 +92,8 @@ def segment_duration_s(
             MULTIMODAL_PLAN_RECEIPT_VERSION,
             VISUAL_PLAN_RECEIPT_VERSION,
             VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+            THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
+            THREE_FRAME_VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
         }
     ):
         raise LongVideoError("long_video_invalid_segment_duration")
@@ -377,11 +381,12 @@ def localize_dialogue(
 def localize_keyframe_sources(
     value: object,
     *,
+    expected_count: int,
     segment_start_s: object,
     segment_end_s: object,
     provider_duration_s: object,
 ) -> tuple[list[dict], list[dict]]:
-    """Project nine frozen global frame receipts onto one H3-local timeline.
+    """Project frozen global frame receipts onto one H3-local timeline.
 
     Paths, hashes and source-scene ids remain receipt authorities.  Timing and
     transitions are a deterministic backend projection: source coordinates are
@@ -390,7 +395,11 @@ def localize_keyframe_sources(
     anomalies never become a quality rejection; every normalization is returned
     as an ordered diagnostic for the coordinator to expose or persist.
     """
-    if not isinstance(value, list) or len(value) != 9:
+    if (
+        expected_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS
+        or not isinstance(value, list)
+        or len(value) != expected_count
+    ):
         raise LongVideoError("long_video_plan_invalid_keyframe_sources")
     try:
         duration = segment_duration_s(segment_start_s, segment_end_s)
@@ -414,7 +423,7 @@ def localize_keyframe_sources(
         })
 
     quantum = 10 ** -BOUNDARY_PRECISION
-    if duration < quantum * 8:
+    if duration < quantum * (expected_count - 1):
         raise LongVideoError("long_video_invalid_segment_duration")
     required = {
         "order", "path", "sha256", "source_time_s",
@@ -446,7 +455,8 @@ def localize_keyframe_sources(
             or not math.isfinite(float(source_value))
         ):
             source_time = round(
-                start_s + duration * (order - 1) / 8, BOUNDARY_PRECISION
+                start_s + duration * (order - 1) / (expected_count - 1),
+                BOUNDARY_PRECISION,
             )
             diagnostics.append({
                 "order": order, "code": "source_time_reconstructed",
@@ -474,7 +484,8 @@ def localize_keyframe_sources(
                 previous["segment_time_s"] + quantum, BOUNDARY_PRECISION
             )
             upper = round(
-                duration - quantum * (9 - order), BOUNDARY_PRECISION
+                duration - quantum * (expected_count - order),
+                BOUNDARY_PRECISION,
             )
             local_time = round(
                 min(upper, max(lower, raw_local)), BOUNDARY_PRECISION
@@ -604,7 +615,7 @@ def freeze_keyframe_sources(
 ) -> tuple[list[dict], dict]:
     """Validate one ordered source timeline without guessing visual facts."""
     if (
-        expected_count != 9
+        expected_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS
         or not isinstance(value, list)
         or len(value) != expected_count
     ):
@@ -642,7 +653,7 @@ def freeze_keyframe_sources(
             previous_time_s = float(prior["source_time_s"])
             previous_scene_id = prior["source_scene_id"]
             # The scene sampler may deliberately repeat the nearest decoded
-            # source frame when a valid segment contains fewer than nine
+            # source frame when a valid segment contains fewer decoded frames
             # distinct frames.  Equal PTS within the same continuous scene is
             # therefore a canonical receipt, not a reason to stop A -> B.
             if source_time_s < previous_time_s or transition_type == "start":
@@ -738,6 +749,7 @@ def _write_plan_receipt(
     prompt_fusion_manifest_path: Path | None = None,
     minimum_source_duration_s: float,
     provider_max_duration_s: int,
+    expected_keyframe_count: int,
 ) -> Path:
     """Write a canonical receipt binding the complete generated long-video plan."""
     root = root.resolve()
@@ -746,6 +758,8 @@ def _write_plan_receipt(
         raise LongVideoError("long_video_plan_requires_segments")
     if not isinstance(workflow, str) or not workflow.strip():
         raise LongVideoError("long_video_plan_invalid_workflow")
+    if expected_keyframe_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS:
+        raise LongVideoError("long_video_plan_invalid_keyframes")
     has_multimodal = ["multimodal_manifest_path" in raw for raw in segments]
     if any(has_multimodal) and not all(has_multimodal):
         raise LongVideoError("long_video_multimodal_incomplete")
@@ -784,7 +798,7 @@ def _write_plan_receipt(
         ):
             raise LongVideoError("long_video_plan_invalid_segment")
         keyframe_paths = list(raw.get("keyframe_paths", []))
-        if not 1 <= len(keyframe_paths) <= 9:
+        if len(keyframe_paths) != expected_keyframe_count:
             raise LongVideoError("long_video_plan_invalid_keyframes")
         try:
             first_frame_path = Path(raw["first_frame_path"])
@@ -854,13 +868,23 @@ def _write_plan_receipt(
         "schema": "duet.long-video-plan",
         "version": (
             (
-                VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION
+                (
+                    THREE_FRAME_VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION
+                    if expected_keyframe_count
+                    == keyframe_contract.KEYFRAMES_PER_SEGMENT
+                    else VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION
+                )
                 if all(has_keyframe_sources)
                 else MULTIMODAL_PLAN_RECEIPT_VERSION
             )
             if all(has_multimodal) or has_prompt_fusion
             else (
-                VISUAL_PLAN_RECEIPT_VERSION
+                (
+                    THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION
+                    if expected_keyframe_count
+                    == keyframe_contract.KEYFRAMES_PER_SEGMENT
+                    else VISUAL_PLAN_RECEIPT_VERSION
+                )
                 if all(has_keyframe_sources)
                 else PLAN_RECEIPT_VERSION
             )
@@ -921,6 +945,7 @@ def write_plan_receipt(
             _finite_duration(duration_s), SEGMENT_SOURCE_MIN_S,
         ),
         provider_max_duration_s=SEGMENT_PROVIDER_MAX_DURATION_S,
+        expected_keyframe_count=keyframe_contract.KEYFRAMES_PER_SEGMENT,
     )
 
 
@@ -962,8 +987,10 @@ def _write_frozen_v4_n1_plan_receipt(
         index != 1
         or start_s != 0.0
         or abs(end_s - duration) > _EPS
-        or len(keyframe_paths) != 9
-        or len(keyframe_sources) != 9
+        or len(keyframe_paths)
+        != keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+        or len(keyframe_sources)
+        != keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
         or "multimodal_manifest_path" in raw
     ):
         raise LongVideoError("long_video_plan_invalid_segment")
@@ -979,4 +1006,5 @@ def _write_frozen_v4_n1_plan_receipt(
         prompt_fusion_manifest_path=prompt_fusion_manifest_path,
         minimum_source_duration_s=RECEIPT_COMPAT_SEGMENT_MIN_S,
         provider_max_duration_s=LEGACY_PROVIDER_MAX_DURATION_S,
+        expected_keyframe_count=keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT,
     )

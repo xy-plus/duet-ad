@@ -395,13 +395,14 @@ def test_local_dialogue_is_shifted_clipped_and_owned_once():
 
 def test_n1_keyframe_sources_are_projected_to_exact_h3_local_receipts():
     source = _global_keyframe_receipts(
-        [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0],
-        cut_order=4,
+        [0.0, 2.5, 14.0],
+        cut_order=2,
         cut_at_s=2.267,
     )
 
     localized, diagnostics = localize_keyframe_sources(
         source,
+        expected_count=3,
         segment_start_s=0.0,
         segment_end_s=14.5,
         provider_duration_s=15,
@@ -409,15 +410,15 @@ def test_n1_keyframe_sources_are_projected_to_exact_h3_local_receipts():
 
     assert diagnostics == []
     assert [item["segment_time_s"] for item in localized] == [
-        0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0,
+        0.0, 2.5, 14.0,
     ]
     assert localized[0]["transition"] == {
         "type": "start", "at_segment_s": 0.0,
     }
-    assert localized[3] == {
-        "order": 4,
-        "path": "work/keyframes/04.png",
-        "sha256": "4" * 64,
+    assert localized[1] == {
+        "order": 2,
+        "path": "work/keyframes/02.png",
+        "sha256": "2" * 64,
         "segment_time_s": 2.5,
         "source_scene_id": "SCENE_02",
         "transition": {"type": "hard_cut", "at_segment_s": 2.267},
@@ -433,14 +434,15 @@ def test_n1_keyframe_sources_are_projected_to_exact_h3_local_receipts():
 
 def test_n2_keyframe_sources_reset_origin_and_preserve_inner_hard_cut():
     source = _global_keyframe_receipts(
-        [14.0, 14.75, 16.0, 16.5, 18.0, 20.0, 22.0, 25.0, 28.0],
-        cut_order=4,
+        [14.0, 16.5, 28.0],
+        cut_order=2,
         cut_at_s=16.267,
         first_transition="continuous",
     )
 
     localized, diagnostics = localize_keyframe_sources(
         source,
+        expected_count=3,
         segment_start_s=14.0,
         segment_end_s=28.0,
         provider_duration_s=14,
@@ -448,12 +450,12 @@ def test_n2_keyframe_sources_reset_origin_and_preserve_inner_hard_cut():
 
     assert diagnostics == []
     assert [item["segment_time_s"] for item in localized] == [
-        0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 11.0, 14.0,
+        0.0, 2.5, 14.0,
     ]
     assert localized[0]["transition"] == {
         "type": "start", "at_segment_s": 0.0,
     }
-    assert localized[3]["transition"] == {
+    assert localized[1]["transition"] == {
         "type": "hard_cut", "at_segment_s": 2.267,
     }
     assert 16.267 not in {
@@ -465,10 +467,7 @@ def test_n2_keyframe_sources_reset_origin_and_preserve_inner_hard_cut():
 
 def test_local_timeline_anchors_first_sample_after_segment_start_to_zero():
     source = _global_keyframe_receipts(
-        [
-            2.3, 3.5, 4.75, 6.0, 7.25,
-            8.5, 9.75, 11.0, 12.1,
-        ],
+        [2.3, 7.25, 12.1],
         first_transition="continuous",
     )
     first_authority = {
@@ -478,6 +477,7 @@ def test_local_timeline_anchors_first_sample_after_segment_start_to_zero():
 
     localized, diagnostics = localize_keyframe_sources(
         source,
+        expected_count=3,
         segment_start_s=2.266667,
         segment_end_s=12.133333,
         provider_duration_s=10,
@@ -499,25 +499,26 @@ def test_local_timeline_anchors_first_sample_after_segment_start_to_zero():
 
 def test_local_timeline_normalizes_bad_cut_without_quality_rejection():
     source = _global_keyframe_receipts(
-        [14.0, 14.75, 16.0, 16.5, 18.0, 20.0, 22.0, 25.0, 28.0],
-        cut_order=4,
+        [14.0, 16.5, 28.0],
+        cut_order=2,
         cut_at_s=13.0,
         first_transition="continuous",
     )
 
     localized, diagnostics = localize_keyframe_sources(
         source,
+        expected_count=3,
         segment_start_s=14.0,
         segment_end_s=28.0,
         provider_duration_s=14,
     )
 
-    assert len(localized) == 9
-    assert localized[3]["transition"] == {
+    assert len(localized) == 3
+    assert localized[1]["transition"] == {
         "type": "hard_cut", "at_segment_s": 2.5,
     }
     assert diagnostics == [{
-        "order": 4,
+        "order": 2,
         "code": "hard_cut_time_normalized",
         "from": -1.0,
         "to": 2.5,
@@ -545,8 +546,11 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     keyframes.mkdir(parents=True)
     segment_source = segment_dir / "source.mp4"
     segment_source.write_bytes(b"segment source")
-    frame = keyframes / "01.png"
-    frame.write_bytes(b"frame")
+    frame_paths = []
+    for order in range(1, 4):
+        frame = keyframes / f"{order:02d}.png"
+        frame.write_bytes(f"frame-{order}".encode())
+        frame_paths.append(frame)
     anchors = segment_work / "anchors"
     anchors.mkdir()
     first_anchor = anchors / "first.png"
@@ -566,7 +570,7 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
         "chain_id": "chain-001",
         "join_mode": "hard_cut",
         "source_path": segment_source,
-        "keyframe_paths": [frame],
+        "keyframe_paths": frame_paths,
         "first_frame_path": first_anchor,
         "last_frame_path": last_anchor,
         "visual_prompt_path": visual,
@@ -608,7 +612,7 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     assert (planned["start_s"], planned["end_s"]) == (0.0, 10.0)
     assert (planned["chain_id"], planned["join_mode"]) == ("chain-001", "hard_cut")
     assert planned["source"]["sha256"] == hashlib.sha256(b"segment source").hexdigest()
-    assert planned["keyframes"][0]["sha256"] == hashlib.sha256(b"frame").hexdigest()
+    assert planned["keyframes"][0]["sha256"] == hashlib.sha256(b"frame-1").hexdigest()
     assert planned["anchors"] == [
         {
             "role": "first",
@@ -654,8 +658,11 @@ def test_plan_receipt_accepts_short_source_without_faking_its_timeline(tmp_path)
     anchors.mkdir()
     segment_source = segment_dir / "source.mp4"
     segment_source.write_bytes(b"short segment")
-    frame = keyframes / "01.png"
-    frame.write_bytes(b"frame")
+    frame_paths = []
+    for order in range(1, 4):
+        frame = keyframes / f"{order:02d}.png"
+        frame.write_bytes(f"frame-{order}".encode())
+        frame_paths.append(frame)
     first = anchors / "first.png"
     last = anchors / "last.png"
     first.write_bytes(b"first")
@@ -676,7 +683,7 @@ def test_plan_receipt_accepts_short_source_without_faking_its_timeline(tmp_path)
             "chain_id": "chain-001",
             "join_mode": "hard_cut",
             "source_path": segment_source,
-            "keyframe_paths": [frame],
+            "keyframe_paths": frame_paths,
             "first_frame_path": first,
             "last_frame_path": last,
             "visual_prompt_path": visual,
@@ -706,21 +713,19 @@ def test_visual_plan_receipt_binds_keyframe_source_timeline(tmp_path):
     segment_source.write_bytes(b"segment source")
     frame_paths = []
     keyframe_sources = []
-    for order, source_time_s in enumerate(
-        [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 9.0, 10.0], 1
-    ):
+    for order, source_time_s in enumerate([0.0, 2.5, 10.0], 1):
         frame = keyframes / f"{order:02d}.png"
         frame.write_bytes(f"frame-{order}".encode())
         frame_paths.append(frame)
         keyframe_sources.append({
             "order": order,
             "source_time_s": source_time_s,
-            "source_scene_id": "SCENE_01" if order < 4 else "SCENE_02",
+            "source_scene_id": "SCENE_01" if order < 2 else "SCENE_02",
             "transition": (
                 {"type": "start", "at_s": 0.0}
                 if order == 1 else
                 {"type": "hard_cut", "at_s": 2.267}
-                if order == 4 else
+                if order == 2 else
                 {"type": "continuous", "at_s": None}
             ),
         })
@@ -756,7 +761,9 @@ def test_visual_plan_receipt_binds_keyframe_source_timeline(tmp_path):
     )
 
     receipt = json.loads(path.read_text(encoding="utf-8"))
-    assert receipt["version"] == long_video_module.VISUAL_PLAN_RECEIPT_VERSION
+    assert receipt["version"] == (
+        long_video_module.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION
+    )
     assert receipt["segments"][0]["keyframe_sources"] == keyframe_sources
 
     with pytest.raises(
@@ -774,8 +781,8 @@ def test_visual_plan_receipt_binds_keyframe_source_timeline(tmp_path):
                 "chain_id": "chain-001",
                 "join_mode": "hard_cut",
                 "source_path": segment_source,
-                "keyframe_paths": frame_paths[:8],
-                "keyframe_sources": keyframe_sources[:8],
+                "keyframe_paths": frame_paths,
+                "keyframe_sources": keyframe_sources[:2],
                 "first_frame_path": first,
                 "last_frame_path": last,
                 "visual_prompt_path": visual,
@@ -786,10 +793,85 @@ def test_visual_plan_receipt_binds_keyframe_source_timeline(tmp_path):
         )
 
 
+def test_legacy_exact_nine_visual_receipt_promotes_without_reinterpretation(
+    tmp_path,
+):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"legacy whole source")
+    segment_dir = tmp_path / "work" / "segments" / "1"
+    segment_work = segment_dir / "work"
+    keyframes = segment_work / "keyframes"
+    anchors = segment_work / "anchors"
+    keyframes.mkdir(parents=True)
+    anchors.mkdir()
+    segment_source = segment_dir / "source.mp4"
+    segment_source.write_bytes(b"legacy segment source")
+    frame_paths = []
+    keyframe_sources = []
+    for order in range(1, 10):
+        frame = keyframes / f"{order:02d}.png"
+        frame.write_bytes(f"legacy-frame-{order}".encode())
+        frame_paths.append(frame)
+        keyframe_sources.append({
+            "order": order,
+            "source_time_s": float(order - 1),
+            "source_scene_id": "SCENE_01",
+            "transition": (
+                {"type": "start", "at_s": 0.0}
+                if order == 1
+                else {"type": "continuous", "at_s": None}
+            ),
+        })
+    first = anchors / "first.png"
+    last = anchors / "last.png"
+    first.write_bytes(b"legacy first")
+    last.write_bytes(b"legacy last")
+    visual = segment_work / "visual_prompt.txt"
+    final = segment_work / "prompt.txt"
+    visual.write_text("legacy visual", encoding="utf-8")
+    final.write_text("legacy final", encoding="utf-8")
+    fusion = tmp_path / "work" / "h3_project_source.json"
+    fusion.write_bytes(b"legacy prompt fusion")
+
+    path = long_video_module._write_plan_receipt(
+        tmp_path,
+        source=source,
+        duration_s=10.0,
+        segments=[{
+            "index": 1,
+            "start_s": 0.0,
+            "end_s": 10.0,
+            "chain_id": "chain-001",
+            "join_mode": "hard_cut",
+            "source_path": segment_source,
+            "keyframe_paths": frame_paths,
+            "keyframe_sources": keyframe_sources,
+            "first_frame_path": first,
+            "last_frame_path": last,
+            "visual_prompt_path": visual,
+            "final_prompt_path": final,
+            "dialogue": [],
+        }],
+        workflow="minimax_h3_lightx2v",
+        prompt_fusion_manifest_path=fusion,
+        minimum_source_duration_s=long_video_module.SEGMENT_SOURCE_MIN_S,
+        provider_max_duration_s=(
+            long_video_module.SEGMENT_PROVIDER_MAX_DURATION_S
+        ),
+        expected_keyframe_count=9,
+    )
+
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    assert receipt["version"] == (
+        long_video_module.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION
+    )
+    assert len(receipt["segments"][0]["keyframes"]) == 9
+
+
 @pytest.mark.parametrize("invented_type", ["same_camera", "camera_motion"])
 def test_visual_timeline_rejects_backend_invented_camera_facts(invented_type):
     timeline = []
-    for order in range(1, 10):
+    for order in range(1, 4):
         timeline.append({
             "order": order,
             "source_time_s": float(order - 1),
@@ -806,13 +888,13 @@ def test_visual_timeline_rejects_backend_invented_camera_facts(invented_type):
         match="long_video_plan_invalid_keyframe_sources",
     ):
         long_video_module.freeze_keyframe_sources(
-            timeline, expected_count=9,
+            timeline, expected_count=3,
         )
 
 
 def test_visual_timeline_accepts_deterministic_repeated_pts_fill():
     timeline = []
-    for order in range(1, 10):
+    for order in range(1, 4):
         timeline.append({
             "order": order,
             "source_time_s": 0.0,
@@ -825,10 +907,10 @@ def test_visual_timeline_accepts_deterministic_repeated_pts_fill():
         })
 
     frozen, previous = long_video_module.freeze_keyframe_sources(
-        timeline, expected_count=9,
+        timeline, expected_count=3,
     )
 
-    assert [item["source_time_s"] for item in frozen] == [0.0] * 9
+    assert [item["source_time_s"] for item in frozen] == [0.0] * 3
     assert previous == frozen[-1]
 
 
@@ -848,8 +930,11 @@ def test_exact_planner_receipts_bind_source_anchors_not_codex_keyframes(tmp_path
         anchors.mkdir()
         segment_source = segdir / "source.mp4"
         segment_source.write_bytes(f"segment-{index}".encode())
-        selected = keyframes / "01.png"
-        selected.write_bytes(f"codex-selected-{index}".encode())
+        selected = []
+        for order in range(1, 4):
+            frame = keyframes / f"{order:02d}.png"
+            frame.write_bytes(f"codex-selected-{index}-{order}".encode())
+            selected.append(frame)
         first = anchors / "first.png"
         last = anchors / "last.png"
         first.write_bytes(f"source-first-{index}".encode())
@@ -862,7 +947,7 @@ def test_exact_planner_receipts_bind_source_anchors_not_codex_keyframes(tmp_path
             {
                 **segment,
                 "source_path": segment_source,
-                "keyframe_paths": [selected],
+                    "keyframe_paths": selected,
                 "first_frame_path": first,
                 "last_frame_path": last,
                 "visual_prompt_path": visual,

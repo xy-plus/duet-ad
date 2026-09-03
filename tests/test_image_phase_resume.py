@@ -111,7 +111,7 @@ def _candidate(tmp_path: Path, *, status: str = "failed") -> tuple[object, Path]
     _json(segment / "voice_lines.json", [])
     data = _png()
     entries = []
-    for order in range(1, 10):
+    for order in range(1, 4):
         name = f"{order:02d}.png"
         (segment / "keyframes" / name).write_bytes(data)
         entries.append({
@@ -130,7 +130,8 @@ def _candidate(tmp_path: Path, *, status: str = "failed") -> tuple[object, Path]
         })
     _json(segment / "keyframe_sampling.json", {
         "schema": "duet.backend-keyframe-sampling",
-        "version": 2,
+        "version": 3,
+        "keyframe_count": 3,
         "selection_method": "scene-anchor-capacity-hamilton-v1",
         "preprocess": {
             "remove_subtitle": False,
@@ -147,7 +148,8 @@ def test_dry_run_requires_terminal_image_failure_and_complete_artifacts(tmp_path
     settings, _ = _candidate(tmp_path)
     manifest = image_phase_resume.inspect(settings, CID)
     assert manifest["schema"] == image_phase_resume.SCHEMA
-    assert manifest["version"] == 2
+    assert manifest["version"] == 3
+    assert manifest["keyframe_count"] == 3
     assert manifest["cid"] == CID
     assert manifest["skill_milestone"] == storage.load_meta(
         settings.data_dir, CID,

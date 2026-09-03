@@ -80,7 +80,7 @@ SEGMENTS_4 = [
 ]
 
 
-def _write_valid_package(work: Path, frames: int = 9, prompt: str = "分段桩产物"):
+def _write_valid_package(work: Path, frames: int = 3, prompt: str = "分段桩产物"):
     """按约定文件名造一套合法产物（同 test_pipeline 的桩约定）。"""
     kdir = work / "keyframes"
     kdir.mkdir(parents=True, exist_ok=True)
@@ -297,7 +297,7 @@ def test_new_input_long_video_keeps_segments_and_writes_bound_plan_receipt(
         keyframes = staged_work / "keyframes"
         keyframes.mkdir(parents=True, exist_ok=True)
         for order, source_frame in enumerate(
-            sorted(staged_work.glob("*_frame_*.png")), 1
+            sorted(staged_work.glob("*_frame_*.png"))[:3], 1
         ):
             shutil.copy(source_frame, keyframes / f"{order:02d}.png")
         (staged_work / "prompt.txt").write_text(
@@ -931,9 +931,9 @@ def _make_scene_video_24s(path: Path) -> Path:
     return path
 
 
-def _write_stub_codex_segments(bin_dir: Path, frames: int = 9) -> Path:
+def _write_stub_codex_segments(bin_dir: Path, frames: int = 3) -> Path:
     """桩 codex 兼处理两种调用：ASR 写 3 句台词；视觉阶段在隔离 cwd 中
-    按 SKILL.md 字面路径写 work/ 下的 9 帧和 prompt。"""
+    按 SKILL.md 字面路径写 work/ 下的 3 帧和 prompt。"""
     stub = bin_dir / "codex"
     stub.write_text(
         "#!/usr/bin/python3\n"
@@ -1018,7 +1018,7 @@ def test_run_multi_segment_full_pipeline(tmp_path, monkeypatch, segment_voice_st
     for seg, (start, end) in zip(segs, [(0.0, 8.0), (8.0, 16.0), (16.0, 24.0)]):
         assert abs(seg["start_s"] - start) < 0.001
         assert abs(seg["end_s"] - end) < 0.001
-        assert seg["keyframes"] == [f"{index:02d}.png" for index in range(1, 10)]
+        assert seg["keyframes"] == [f"{index:02d}.png" for index in range(1, 4)]
         assert seg["prompt"] == pipeline.NO_BGM_LINE + "\n分段桩产物"
     # 顶层 keyframes/prompt 保持空值，不重复写
     assert m["keyframes"] == [] and m["prompt"] is None

@@ -3,7 +3,7 @@
 current v4 不是 source-audio multimodal。每个 segment 的 `H3Request` 固定满足：
 
 - `mode=reference`，使用后端编译的唯一 Ref2VA prompt；
-- exactly 9 张有序 Picture reference，并逐值绑定 source scene/time/transition；
+- exactly 3 张有序 Picture reference，并逐值绑定 source scene/time/transition；
 - `reference_audios=()`，Fusion 输入 `voice_references=[]`，逐行 `voice_ref=null`；
 - Context 为 `local:identity:<source_prompt_sha256>` 同字节 receipt，HTTP 调用数为 0。
 

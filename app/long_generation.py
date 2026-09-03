@@ -23,6 +23,7 @@ from app import (
     h3,
     h3_project,
     image_optimization,
+    keyframe_contract,
     long_video,
     postprocess,
     prepared_input,
@@ -59,7 +60,12 @@ H3_NATIVE_AUDIO_ROUTE = {
 PROMPT_FUSION_INPUT_SCHEMA = "duet.video-prompt-fusion-input"
 PROMPT_FUSION_OUTPUT_SCHEMA = "duet.video-prompt-fusion-output"
 PROMPT_FUSION_LEGACY_VERSION = 1
-PROMPT_FUSION_VERSION = 2
+PROMPT_FUSION_EXACT9_VERSION = 2
+PROMPT_FUSION_VERSION = 3
+PROMPT_FUSION_STRUCTURED_VERSIONS = frozenset({
+    PROMPT_FUSION_EXACT9_VERSION,
+    PROMPT_FUSION_VERSION,
+})
 # Compatibility name retained for the visual-v2 callers and receipts.  Audio
 # policy and the source timeline are one indivisible v2 contract.
 VISUAL_PROMPT_FUSION_VERSION = PROMPT_FUSION_VERSION
@@ -89,6 +95,17 @@ class LongGenerationError(RuntimeError):
         self.code = code
         self.status = status
         super().__init__(code)
+
+
+def _prompt_fusion_keyframe_count(version: object) -> int:
+    if version == PROMPT_FUSION_VERSION:
+        return keyframe_contract.KEYFRAMES_PER_SEGMENT
+    if version in {
+        PROMPT_FUSION_LEGACY_VERSION,
+        PROMPT_FUSION_EXACT9_VERSION,
+    }:
+        return keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+    raise LongGenerationError("prompt_fusion_input_invalid")
 
 
 @dataclass(frozen=True)
@@ -134,9 +151,17 @@ def _fusion_audio_block(lines_json: str) -> str:
     )
 
 
-def _freeze_local_keyframe_sources(value: object) -> list[dict]:
-    """Validate one provider-segment-local nine-frame timeline."""
-    if not isinstance(value, list) or len(value) != 9:
+def _freeze_local_keyframe_sources(
+    value: object, *, expected_count: int | None = None,
+) -> list[dict]:
+    """Validate one provider-segment-local ordered timeline."""
+    if expected_count is None and isinstance(value, list):
+        expected_count = len(value)
+    if (
+        expected_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS
+        or not isinstance(value, list)
+        or len(value) != expected_count
+    ):
         raise LongGenerationError("prompt_fusion_input_invalid")
     frozen: list[dict] = []
     previous: dict | None = None
@@ -201,7 +226,7 @@ def _freeze_local_keyframe_sources(value: object) -> list[dict]:
 
 
 def _freeze_local_cut_timeline(value: object, duration_s: float) -> list[dict]:
-    """Validate the complete source-cut topology independently of 9 frames."""
+    """Validate the complete source-cut topology independently of frame count."""
     if (
         not isinstance(value, list) or not value
         or isinstance(duration_s, bool)
@@ -737,7 +762,7 @@ def _compact_h3_relation_contract(relation_states: list[dict]) -> dict:
     compact["d"] = compact_definitions
     compact["i"] = [encoded_interval[:4] for encoded_interval in compact["i"]]
     if marker_chars(compact) > _MAX_RELATION_MARKER_CHARS:
-        # Sixty distinct directed relations with nine frames fit this schema;
+        # Sixty distinct directed relations fit this bounded schema;
         # reaching here means the finite predicate vocabulary itself exceeded
         # the advertised transport contract, not verbose state/geometry prose.
         raise LongGenerationError("prompt_fusion_input_invalid")
@@ -780,6 +805,19 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
     geometries = contract["g"]
     scenes = contract["c"]
     definitions = contract["d"]
+    if not contract["i"]:
+        raise LongGenerationError("prompt_fusion_output_invalid")
+    terminal_interval = contract["i"][-1]
+    frame_count = (
+        terminal_interval[1]
+        if isinstance(terminal_interval, list)
+        and len(terminal_interval) >= 2
+        and isinstance(terminal_interval[1], int)
+        and not isinstance(terminal_interval[1], bool)
+        else None
+    )
+    if frame_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS:
+        raise LongGenerationError("prompt_fusion_output_invalid")
     for dictionary in (predicates, preserve_facts, states, geometries):
         if (
             any(not isinstance(value, str) or not value for value in dictionary)
@@ -820,6 +858,8 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
     if compact_level == 2:
         endpoint_domain = set()
         for definition in definitions:
+            # This is the compact relation record's field count, not the
+            # per-segment keyframe cardinality.
             if not isinstance(definition, list) or len(definition) != 9:
                 raise LongGenerationError("prompt_fusion_output_invalid")
             for endpoint_index in (definition[0], definition[2]):
@@ -845,8 +885,6 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
     used_scenes: set[int] = set()
     expanded = []
     previous_interval_end = 0
-    if not contract["i"]:
-        raise LongGenerationError("prompt_fusion_output_invalid")
     for interval_index, encoded_interval in enumerate(contract["i"]):
         expected_interval_size = 4 if compact_level == 2 else 5
         if (
@@ -861,7 +899,7 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
         if (
             isinstance(first, bool) or not isinstance(first, int)
             or isinstance(last, bool) or not isinstance(last, int)
-            or not 1 <= first <= last <= 9
+            or not 1 <= first <= last <= frame_count
             or first != previous_interval_end + 1
             or boundary != (0 if interval_index == 0 else 1)
             or not isinstance(encoded_relations, list)
@@ -876,17 +914,19 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
             active_state_index = states.index("active/as-shown")
             active_geometry_index = geometries.index("as-shown")
             for relation_index, definition in enumerate(definitions):
+                # Keep the same nine-field record contract for both 3-frame
+                # and historical 9-frame timelines.
                 if not isinstance(definition, list) or len(definition) != 9:
                     raise LongGenerationError("prompt_fusion_output_invalid")
                 active_mask = definition[4]
                 if (
                     isinstance(active_mask, bool)
                     or not isinstance(active_mask, int)
-                    or not 0 < active_mask < (1 << 9)
+                    or not 0 < active_mask < (1 << frame_count)
                 ):
                     raise LongGenerationError("prompt_fusion_output_invalid")
                 active_frames = [
-                    frame for frame in range(1, 10)
+                    frame for frame in range(1, frame_count + 1)
                     if active_mask & (1 << (frame - 1))
                 ]
                 interval_frames = [
@@ -1020,7 +1060,7 @@ def _expand_h3_relation_contract(contract: object) -> list[dict]:
             },
             "relations": relations,
         })
-    if previous_interval_end != 9:
+    if previous_interval_end != frame_count:
         raise LongGenerationError("prompt_fusion_output_invalid")
     if used_definitions != set(range(len(definitions))):
         raise LongGenerationError("prompt_fusion_output_invalid")
@@ -1257,18 +1297,21 @@ def _compile_fusion_ref2va_prompt(
             context_ir_bridge._CUT_TIMELINE_POLICY,
             *cut_dialogue_lines,
         ]
+    picture_count = len(timeline)
+    if picture_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS:
+        raise LongGenerationError("prompt_fusion_input_invalid")
     if relation_contract_enabled:
         prompt_lines = subject_definitions + [
             "summary:",
-            "Use <Picture 1> through <Picture 9> as exact ordered anchors.",
+            f"Use <Picture 1> through <Picture {picture_count}> as exact ordered anchors.",
             "retention_analysis:",
-            "Preserve all nine anchors and the backend relation contract.",
+            f"Preserve all {picture_count} anchors and the backend relation contract.",
         ] + cut_authority + ["detailed_description:"]
     else:
         prompt_lines = subject_definitions + [
             "summary:",
             "[keyframe completion] The target video follows <Picture 1> through "
-            "<Picture 9> as ordered storyboard keyframe anchors.",
+            f"<Picture {picture_count}> as ordered storyboard keyframe anchors.",
     ] + retention + cut_authority + ["detailed_description:"]
     for shot in details:
         prompt_lines.extend(shot)
@@ -1306,9 +1349,11 @@ def prompt_fusion_visual_max_chars(
 ) -> int:
     """Derive the per-frame prose budget before the Fusion model is called."""
     try:
+        frozen_timeline = _freeze_local_keyframe_sources(timeline)
+        frame_count = len(frozen_timeline)
         baseline = _compile_fusion_ref2va_prompt(
-            visual=["x"] * 9,
-            timeline=timeline,
+            visual=["x"] * frame_count,
+            timeline=frozen_timeline,
             lines=lines,
             music_policy=music_policy,
             relation_occurrences=relation_occurrences,
@@ -1316,8 +1361,10 @@ def prompt_fusion_visual_max_chars(
         )
     except LongGenerationError as exc:
         raise LongGenerationError("prompt_fusion_input_invalid") from exc
-    fixed_chars = len(baseline) - 9
-    visual_max_chars = (_MAX_COMPILED_FUSION_CHARS - fixed_chars) // 9
+    fixed_chars = len(baseline) - frame_count
+    visual_max_chars = (
+        _MAX_COMPILED_FUSION_CHARS - fixed_chars
+    ) // frame_count
     if visual_max_chars < 1:
         raise LongGenerationError("prompt_fusion_input_invalid")
     return visual_max_chars
@@ -1377,7 +1424,8 @@ def load_prompt_fusion(
         or set(source) != {"schema", "version", "segments"}
         or source.get("schema") != PROMPT_FUSION_INPUT_SCHEMA
         or source_version not in {
-            PROMPT_FUSION_LEGACY_VERSION, PROMPT_FUSION_VERSION,
+            PROMPT_FUSION_LEGACY_VERSION,
+            *PROMPT_FUSION_STRUCTURED_VERSIONS,
         }
         or not isinstance(segments, list)
         or not segments
@@ -1395,7 +1443,7 @@ def load_prompt_fusion(
             frozenset(base_segment_keys),
             frozenset(base_segment_keys | {"relation_occurrences"}),
         }
-        if source_version == PROMPT_FUSION_VERSION:
+        if source_version in PROMPT_FUSION_STRUCTURED_VERSIONS:
             allowed_segment_keys.update({
                 frozenset(base_segment_keys | {"source_cut_timeline"}),
                 frozenset(base_segment_keys | {
@@ -1415,11 +1463,12 @@ def load_prompt_fusion(
             raise LongGenerationError("prompt_fusion_input_invalid")
         frames = segment.get("new_keyframes")
         prompts = segment.get("image_optimization_prompt")
+        expected_keyframe_count = _prompt_fusion_keyframe_count(source_version)
         if (
             not isinstance(frames, list)
-            or len(frames) != 9
+            or len(frames) != expected_keyframe_count
             or not isinstance(prompts, list)
-            or len(prompts) != 9
+            or len(prompts) != expected_keyframe_count
         ):
             raise LongGenerationError("prompt_fusion_input_invalid")
         for order, (frame, prompt) in enumerate(zip(frames, prompts), 1):
@@ -1461,7 +1510,7 @@ def load_prompt_fusion(
                 or hashlib.sha256(frame_data).hexdigest() != frame["sha256"]
             ):
                 raise LongGenerationError("prompt_fusion_input_invalid")
-        if source_version == PROMPT_FUSION_VERSION:
+        if source_version in PROMPT_FUSION_STRUCTURED_VERSIONS:
             try:
                 frozen_sources = _freeze_local_keyframe_sources([{
                     key: frame[key]
@@ -1469,7 +1518,7 @@ def load_prompt_fusion(
                         "order", "segment_time_s", "source_scene_id",
                         "transition",
                     )
-                } for frame in frames])
+                } for frame in frames], expected_count=expected_keyframe_count)
                 timelines.append(frozen_sources)
                 relation_occurrences_by_segment.append(
                     _freeze_fusion_relation_occurrences(
@@ -1495,7 +1544,7 @@ def load_prompt_fusion(
         audio_keys = {
             "lines_json", "lines_sha256", "voice_references",
         }
-        if source_version == PROMPT_FUSION_VERSION:
+        if source_version in PROMPT_FUSION_STRUCTURED_VERSIONS:
             audio_keys.add("music_policy")
         if (
             not isinstance(audio, Mapping)
@@ -1505,7 +1554,7 @@ def load_prompt_fusion(
             or audio.get("lines_sha256")
             != hashlib.sha256(audio["lines_json"].encode("utf-8")).hexdigest()
             or (
-                source_version == PROMPT_FUSION_VERSION
+                source_version in PROMPT_FUSION_STRUCTURED_VERSIONS
                 and audio.get("music_policy") != "forbid"
             )
         ):
@@ -1529,7 +1578,7 @@ def load_prompt_fusion(
                 or line.get("delivery") not in {"on_screen", "off_screen"}
                 or (
                     line.get("voice_ref") is not None
-                    if source_version == PROMPT_FUSION_VERSION
+                    if source_version in PROMPT_FUSION_STRUCTURED_VERSIONS
                     else line.get("voice_ref") not in {None, 1}
                 )
             ):
@@ -1581,7 +1630,7 @@ def load_prompt_fusion(
         if not isinstance(segment, Mapping) or segment.get("index") != index:
             raise LongGenerationError("prompt_fusion_output_invalid")
         audio = segments[index - 1]["audio_content"]
-        if source_version == PROMPT_FUSION_VERSION:
+        if source_version in PROMPT_FUSION_STRUCTURED_VERSIONS:
             relation_occurrences = relation_occurrences_by_segment[index - 1]
             allowed_output_keys = (
                 ({"index", "visual"}, {"index", "visual", "relation_states"})
@@ -1600,7 +1649,10 @@ def load_prompt_fusion(
                 music_policy=audio["music_policy"],
                 relation_occurrences=relation_occurrences,
                 cut_timeline=cut_timelines[index - 1],
-                allow_historical_shot_visuals=not require_frame_visuals,
+                allow_historical_shot_visuals=(
+                    source_version == PROMPT_FUSION_EXACT9_VERSION
+                    and not require_frame_visuals
+                ),
             ))
         else:
             if (
@@ -1742,7 +1794,8 @@ def load_bound_prompt_fusion_manifest(
     if (
         not isinstance(state, Mapping)
         or state.get("version") not in {
-            PROMPT_FUSION_LEGACY_VERSION, PROMPT_FUSION_VERSION,
+            PROMPT_FUSION_LEGACY_VERSION,
+            *PROMPT_FUSION_STRUCTURED_VERSIONS,
         }
         or state.get("status") != "done"
         or state.get("error") is not None
@@ -2073,7 +2126,9 @@ def build_prompt_fusion_input(
             and resolved_delivery == "on_screen":
         raise LongGenerationError("on_screen_authority_unavailable")
     has_visual_timeline = [
-        len(segment.keyframe_sources) == len(segment.keyframes) == 9
+        len(segment.keyframe_sources)
+        == len(segment.keyframes)
+        == keyframe_contract.KEYFRAMES_PER_SEGMENT
         for segment in plan.segments
     ]
     if any(has_visual_timeline) and not all(has_visual_timeline):
@@ -2099,7 +2154,7 @@ def build_prompt_fusion_input(
         old_prompt = raw.get("visual_prompt")
         if not isinstance(old_prompt, str) or not old_prompt.strip():
             raise LongGenerationError("prompt_fusion_input_invalid")
-        if len(segment.keyframes) != 9:
+        if len(segment.keyframes) != keyframe_contract.KEYFRAMES_PER_SEGMENT:
             raise LongGenerationError("postprocess_artifacts_invalid")
         keyframes: list[dict] = []
         for order, (path, data) in enumerate(segment.keyframes, 1):
@@ -2148,6 +2203,7 @@ def build_prompt_fusion_input(
         try:
             keyframes, _timeline_diagnostics = long_video.localize_keyframe_sources(
                 keyframes,
+                expected_count=keyframe_contract.KEYFRAMES_PER_SEGMENT,
                 segment_start_s=segment.start_s,
                 segment_end_s=segment.end_s,
                 provider_duration_s=long_video.provider_duration_s(
@@ -2165,7 +2221,7 @@ def build_prompt_fusion_input(
             if isinstance(item, Mapping)
             and item.get("segment_index") == source_index
         ]
-        if len(prompts) != 9:
+        if len(prompts) != keyframe_contract.KEYFRAMES_PER_SEGMENT:
             raise LongGenerationError("image_optimization_prompt_invalid")
         prompt_bindings: list[dict] = []
         for order, item in enumerate(prompts, 1):
@@ -2199,7 +2255,8 @@ def build_prompt_fusion_input(
             )
             if (
                 isinstance(frame_constraints, list)
-                and len(frame_constraints) == 9
+                and len(frame_constraints)
+                == keyframe_contract.KEYFRAMES_PER_SEGMENT
                 and all(
                     isinstance(item, Mapping)
                     and "relation_occurrences" in item
@@ -2240,7 +2297,9 @@ def build_prompt_fusion_input(
                             "order", "segment_time_s", "source_scene_id",
                             "transition",
                         )
-                    } for frame in keyframes]),
+                    } for frame in keyframes],
+                        expected_count=keyframe_contract.KEYFRAMES_PER_SEGMENT,
+                    ),
                 )
 
         dialogue = _compiled_dialogue(dialogue_mode, segment.dialogue)
@@ -2607,7 +2666,8 @@ def _derive_normalized_n1_keyframe_sources(
         selected_time = candidate["time_s"]
     try:
         frozen, _last = long_video.freeze_keyframe_sources(
-            selected, expected_count=9
+            selected,
+            expected_count=keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT,
         )
     except long_video.LongVideoError:
         raise LongGenerationError("long_video_plan_invalid") from None
@@ -2694,7 +2754,10 @@ def normalize_single_segment_project(
     if not 0 < duration <= long_video.LEGACY_PROVIDER_MAX_DURATION_S:
         raise LongGenerationError("long_video_plan_invalid")
     names = meta.get("keyframes")
-    if not isinstance(names, list) or len(names) != 9:
+    if (
+        not isinstance(names, list)
+        or len(names) != keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+    ):
         raise LongGenerationError("postprocess_artifacts_invalid")
     originals = [root / "work" / "keyframes" / str(name) for name in names]
     try:
@@ -2704,7 +2767,7 @@ def normalize_single_segment_project(
     except postprocess.PostprocessError as exc:
         detail = exc.detail if isinstance(exc.detail, str) else exc.detail["code"]
         raise LongGenerationError(detail, exc.status) from None
-    if len(selected) != 9:
+    if len(selected) != keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT:
         raise LongGenerationError("postprocess_artifacts_invalid")
     sources = sorted(root.glob("source.*"))
     if len(sources) != 1:
@@ -2962,6 +3025,7 @@ def finalize_multimodal_plan(
     if receipt_version in {
         long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
         long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+        long_video.THREE_FRAME_VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
     }:
         if isinstance(payload, Mapping) and payload.get("prompt_fusion") is not None:
             if settings is None:
@@ -2976,6 +3040,7 @@ def finalize_multimodal_plan(
     if receipt_version not in {
         long_video.PLAN_RECEIPT_VERSION,
         long_video.VISUAL_PLAN_RECEIPT_VERSION,
+        long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
     }:
         return None
     private_postprocess = meta.get("_postprocess_receipt")
@@ -3077,23 +3142,42 @@ def finalize_multimodal_plan(
         < duration
         <= long_video.LEGACY_PROVIDER_MAX_DURATION_S
     )
-    receipt_writer = (
-        long_video._write_frozen_v4_n1_plan_receipt
-        if historical_v4_n1
-        else long_video.write_plan_receipt
-    )
     try:
-        receipt_writer(
-            root,
-            source=base.source,
-            duration_s=duration,
-            segments=receipt_segments,
-            workflow=promoted_workflow,
-            dialogue_mode=dialogue_mode,
-            dialogue_delivery=dialogue_delivery,
-            resolved_dialogue_delivery=resolved_delivery,
-            prompt_fusion_manifest_path=root / "work" / h3_project.SOURCE_FILENAME,
-        )
+        receipt_options = {
+            "source": base.source,
+            "duration_s": duration,
+            "segments": receipt_segments,
+            "workflow": promoted_workflow,
+            "dialogue_mode": dialogue_mode,
+            "dialogue_delivery": dialogue_delivery,
+            "resolved_dialogue_delivery": resolved_delivery,
+            "prompt_fusion_manifest_path": (
+                root / "work" / h3_project.SOURCE_FILENAME
+            ),
+        }
+        if historical_v4_n1:
+            long_video._write_frozen_v4_n1_plan_receipt(
+                root, **receipt_options,
+            )
+        elif receipt_version == long_video.VISUAL_PLAN_RECEIPT_VERSION:
+            # A frozen v4 project remains exact-nine authority while it is
+            # promoted to v5.  Never reinterpret its paid artifacts as the
+            # current three-frame creation contract.
+            long_video._write_plan_receipt(
+                root,
+                **receipt_options,
+                minimum_source_duration_s=min(
+                    duration, long_video.SEGMENT_SOURCE_MIN_S,
+                ),
+                provider_max_duration_s=(
+                    long_video.SEGMENT_PROVIDER_MAX_DURATION_S
+                ),
+                expected_keyframe_count=(
+                    keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+                ),
+            )
+        else:
+            long_video.write_plan_receipt(root, **receipt_options)
         promoted = _digest(receipt_path)
         promoted_meta = {**dict(meta), "segments": updated_segments}
         freeze_plan(
@@ -3264,7 +3348,7 @@ def _frozen_fusion_frame_orders(
     if (
         not isinstance(frames, list)
         or len(frames) != expected_count
-        or expected_count != 9
+        or expected_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS
     ):
         raise LongGenerationError("prompt_fusion_input_invalid")
     orders = tuple(
@@ -3343,6 +3427,8 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
             long_video.VISUAL_PLAN_RECEIPT_VERSION,
             long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+            long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
+            long_video.THREE_FRAME_VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
         }
         or payload.get("workflow") not in _PLAN_WORKFLOWS
     ):
@@ -3352,11 +3438,25 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
     is_multimodal_receipt = receipt_version in {
         long_video.MULTIMODAL_PLAN_RECEIPT_VERSION,
         long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+        long_video.THREE_FRAME_VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
     }
     has_visual_timeline = receipt_version in {
         long_video.VISUAL_PLAN_RECEIPT_VERSION,
         long_video.VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+        long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
+        long_video.THREE_FRAME_VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
     }
+    expected_visual_keyframe_count = (
+        keyframe_contract.KEYFRAMES_PER_SEGMENT
+        if receipt_version in {
+            long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
+            long_video.THREE_FRAME_VISUAL_MULTIMODAL_PLAN_RECEIPT_VERSION,
+        }
+        else (
+            keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+            if has_visual_timeline else None
+        )
+    )
     if is_multimodal_receipt and (
         ("dialogue_delivery" in payload)
         != ("resolved_dialogue_delivery" in payload)
@@ -3423,6 +3523,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             if receipt_version in {
                 long_video.PLAN_RECEIPT_VERSION,
                 long_video.VISUAL_PLAN_RECEIPT_VERSION,
+                long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
             }
             else receipt_workflow
         )
@@ -3453,13 +3554,30 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
     project_selected_paths: dict[int, tuple[Path, ...]] = {}
     if workflow in h3.H3_REFERENCE_WORKFLOWS:
         if frozen_fusion is not None:
+            fusion_keyframe_count = _prompt_fusion_keyframe_count(
+                frozen_fusion.version
+            )
+            if (
+                expected_visual_keyframe_count is not None
+                and fusion_keyframe_count != expected_visual_keyframe_count
+            ):
+                raise LongGenerationError("prompt_fusion_input_invalid")
             for index, fusion_segment in enumerate(frozen_fusion.segments, 1):
-                _frozen_fusion_frame_orders(fusion_segment, expected_count=9)
+                _frozen_fusion_frame_orders(
+                    fusion_segment, expected_count=fusion_keyframe_count,
+                )
         project_originals: list[Path] = []
         project_counts: list[int] = []
         for raw in raw_segments:
             keys = raw.get("keyframes") if isinstance(raw, Mapping) else None
-            if not isinstance(keys, list) or not 1 <= len(keys) <= 9:
+            if (
+                not isinstance(keys, list)
+                or (
+                    len(keys) != expected_visual_keyframe_count
+                    if expected_visual_keyframe_count is not None
+                    else not 1 <= len(keys) <= 9
+                )
+            ):
                 raise LongGenerationError("long_video_plan_invalid")
             originals = [_bound_path(root, artifact) for artifact in keys]
             project_originals.extend(originals)
@@ -3535,7 +3653,14 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             raise LongGenerationError("long_video_plan_invalid")
         segment_source = _bound_path(root, raw["source"])
         keys = raw.get("keyframes")
-        if not isinstance(keys, list) or not 1 <= len(keys) <= 9:
+        if (
+            not isinstance(keys, list)
+            or (
+                len(keys) != expected_visual_keyframe_count
+                if expected_visual_keyframe_count is not None
+                else not 1 <= len(keys) <= 9
+            )
+        ):
             raise LongGenerationError("long_video_plan_invalid")
         bound_keyframes = [_bound_bytes(root, artifact) for artifact in keys]
         keyframe_paths = [path for path, _data in bound_keyframes]
@@ -3720,7 +3845,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             fusion_segment = frozen_fusion.segments[position - 1]
             if final != frozen_fusion.final_prompts[position - 1]:
                 raise LongGenerationError("prompt_fusion_output_invalid")
-            if frozen_fusion.version == PROMPT_FUSION_VERSION:
+            if frozen_fusion.version in PROMPT_FUSION_STRUCTURED_VERSIONS:
                 fusion_sources = [{
                     key: frame[key]
                     for key in (
@@ -3737,6 +3862,9 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                     localized_sources, _timeline_diagnostics = (
                         long_video.localize_keyframe_sources(
                             localization_input,
+                            expected_count=_prompt_fusion_keyframe_count(
+                                frozen_fusion.version
+                            ),
                             segment_start_s=start_s,
                             segment_end_s=end_s,
                             provider_duration_s=long_video.provider_duration_s(
@@ -3770,7 +3898,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
             if not isinstance(fusion_lines, list) or len(fusion_lines) != len(dialogue):
                 raise LongGenerationError("prompt_fusion_input_invalid")
             if (
-                frozen_fusion.version == PROMPT_FUSION_VERSION
+                frozen_fusion.version in PROMPT_FUSION_STRUCTURED_VERSIONS
                 and voice_references
             ):
                 raise LongGenerationError("prompt_fusion_input_invalid")
@@ -3786,7 +3914,7 @@ def freeze_plan(root: Path, meta: Mapping, expected_receipt: str, fit_mode: str,
                         "resolved_dialogue_delivery"
                     )
                     or (
-                        frozen_fusion.version == PROMPT_FUSION_VERSION
+                        frozen_fusion.version in PROMPT_FUSION_STRUCTURED_VERSIONS
                         and compiled.get("voice_ref") is not None
                     )
                 ):
@@ -4002,9 +4130,12 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
                     getattr(exc, "code", "prompt_fusion_input_invalid")
                 ) from None
         try:
+            expected_keyframe_count = _prompt_fusion_keyframe_count(
+                plan.prompt_fusion.version
+            )
             if (
-                len(segment.keyframes) != 9
-                or len(segment.keyframe_sources) != 9
+                len(segment.keyframes) != expected_keyframe_count
+                or len(segment.keyframe_sources) != expected_keyframe_count
             ):
                 raise LongGenerationError("prompt_fusion_input_invalid")
             localization_input = [{
@@ -4016,6 +4147,7 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
             localized_sources, _timeline_diagnostics = (
                 long_video.localize_keyframe_sources(
                     localization_input,
+                    expected_count=expected_keyframe_count,
                     segment_start_s=segment.start_s,
                     segment_end_s=segment.end_s,
                     provider_duration_s=long_video.provider_duration_s(
@@ -4030,7 +4162,7 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
                 for key in (
                     "order", "segment_time_s", "source_scene_id", "transition",
                 )
-            } for frame in localized_sources])
+            } for frame in localized_sources], expected_count=expected_keyframe_count)
             frozen_fusion_sources = _freeze_local_keyframe_sources([{
                 key: frame[key]
                 for key in (
@@ -4038,7 +4170,7 @@ def _request(settings, cid: str, plan: FrozenPlan, segment: FrozenSegment,
                 )
             } for frame in plan.prompt_fusion.segments[segment.index - 1][
                 "new_keyframes"
-            ]])
+            ]], expected_count=expected_keyframe_count)
             if (
                 frozen_input_sources != frozen_fusion_sources
                 or segment.prompt

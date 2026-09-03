@@ -24,7 +24,7 @@ def _fusion_fixture(root: Path, *, first_frame: bytes):
     frames = []
     sources = []
     optimization_frames = []
-    for order in range(1, 10):
+    for order in range(1, 4):
         data = first_frame if order == 1 else _png(
             width=7, height=5, bgr=(order, order * 2, order * 3),
         )
@@ -70,7 +70,7 @@ def _fusion_fixture(root: Path, *, first_frame: bytes):
         source=root / "source.mp4",
         receipt="a" * 64,
         segments=(segment,),
-        receipt_version=long_video.VISUAL_PLAN_RECEIPT_VERSION,
+        receipt_version=long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
     )
     meta = {
         "segments": [{"index": 1, "visual_prompt": "source action"}],
@@ -158,19 +158,19 @@ def test_prompt_fusion_rejects_tampered_content_addressed_proxy(tmp_path: Path) 
 
 
 def test_fusion_to_h3_binds_frame_positions_not_image_bytes() -> None:
-    frames = [{"order": order} for order in range(1, 10)]
+    frames = [{"order": order} for order in range(1, 4)]
 
     assert long_generation._frozen_fusion_frame_orders(
-        {"new_keyframes": frames}, expected_count=9,
-    ) == tuple(range(1, 10))
+        {"new_keyframes": frames}, expected_count=3,
+    ) == tuple(range(1, 4))
 
-    frames[4] = {"order": 9}
+    frames[1] = {"order": 3}
     with pytest.raises(
         long_generation.LongGenerationError,
         match="prompt_fusion_input_invalid",
     ):
         long_generation._frozen_fusion_frame_orders(
-            {"new_keyframes": frames}, expected_count=9,
+            {"new_keyframes": frames}, expected_count=3,
         )
 
 

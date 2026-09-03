@@ -18,7 +18,7 @@ links: [conversation-task, app/main.py, app/h3.py, app/prepared_input.py, app/lo
 
 ### Current v4 single operation
 
-current v4 的唯一 create path 是 `segments[N>=1] + Fusion v2 + backend Ref2VA compiler + Context local identity + H3 + EDL`。技术验收 A 接受后，所有阶段共用同一 `operation_id=cid` 并自动延续：
+current v4 的唯一 create path 是 `segments[N>=1] + Fusion v3 + backend Ref2VA compiler + Context local identity + H3 + EDL`。技术验收 A 接受后，所有阶段共用同一 `operation_id=cid` 并自动延续：
 
 ```text
 202 {operation_id:<cid>,status:"running",stage:<current-stage>}
@@ -26,9 +26,9 @@ current v4 的唯一 create path 是 `segments[N>=1] + Fusion v2 + backend Ref2V
 200 {operation_id:<cid>,status:"succeeded",stage:"commit_b"}
 ```
 
-内部 Fusion refresh/CAS、image acceptance 冲突和质量诊断不会成为 current 的公开 409/刷新步骤；重放只确保同一 operation。Fusion v2 每段只输出 `{index,visual[]}`，后端独占 Ref2VA provider prompt 的编译权。Context 将该 prompt 原样绑定为 `local:identity:<sha256>`，effective prompt 同 SHA，HTTP 调用数为 0。
+内部 Fusion refresh/CAS、image acceptance 冲突和质量诊断不会成为 current 的公开 409/刷新步骤；重放只确保同一 operation。Fusion v3 每段只输出 `{index,visual[]}`，后端独占 Ref2VA provider prompt 的编译权。Context 将该 prompt 原样绑定为 `local:identity:<sha256>`，effective prompt 同 SHA，HTTP 调用数为 0。
 
-current 每段固定 exact 9 个 Picture reference，允许极短连续 scene 重复最近合法源帧并绑定 provenance；H3 `reference_audios=()`，源音频只供 ASR/YAMNet 分析。成片音频只取 H3 原生音轨，缺音轨的 segment 在同一 EDL 补静音，源音频不回挂或 overlay。quality score/diagnostics 只用于测试和 Skill 迭代，不阻断、不重试、不产生 fallback。
+current 每段固定 exact 3 个 Picture reference，允许极短连续 scene 重复最近合法源帧并绑定 provenance；H3 `reference_audios=()`，源音频只供 ASR/YAMNet 分析。成片音频只取 H3 原生音轨，缺音轨的 segment 在同一 EDL 补静音，源音频不回挂或 overlay。quality score/diagnostics 只用于测试和 Skill 迭代，不阻断、不重试、不产生 fallback。
 
 Fusion v1、旧 Context HTTP、多模态 source-audio reference、旧 short/long、speaker visibility 与 quality-verdict receipt 均只读；历史已知 provider task 只按原 receipt GET 恢复，不能迁移为 current 或新建 fallback POST。
 
@@ -229,7 +229,7 @@ current v4 请求严格为：
 }
 ```
 
-统一分段请求允许上述八个键；`fast_mode` 缺失等价 `false`，显式值必须是 JSON boolean。`dialogue_mode` 当前只允许 `auto|none`：`auto` 只把冻结 spoken 文本/时间投影进 Ref2VA，`none` 使用空台词；两者都固定 `voice_references=[]`，不会复用源音轨或发送 source audio reference。`expected_plan_receipt` 是当前 canonical plan 的 64 位小写 SHA-256。服务在任何付费 POST 前重新校验 plan、meta、exact-9 图片、Fusion input/output、Ref2VA prompt 和文件哈希；所有段共用冻结画幅、清晰度和 fit。
+统一分段请求允许上述八个键；`fast_mode` 缺失等价 `false`，显式值必须是 JSON boolean。`dialogue_mode` 当前只允许 `auto|none`：`auto` 只把冻结 spoken 文本/时间投影进 Ref2VA，`none` 使用空台词；两者都固定 `voice_references=[]`，不会复用源音轨或发送 source audio reference。`expected_plan_receipt` 是当前 canonical plan 的 64 位小写 SHA-256。服务在任何付费 POST 前重新校验 plan、meta、exact-3 图片、Fusion input/output、Ref2VA prompt 和文件哈希；所有段共用冻结画幅、清晰度和 fit。
 
 旧标签页的四键请求和 `client_refresh_required` 只属于历史兼容诊断，不是 current 推进方式。历史项目/receipt 只读；current v4 的 accepted A 由同一后台 continuation 自动推进。
 
@@ -398,10 +398,10 @@ current v4 不按 15 秒复制合同：`≤15s` 是 `segments.length=1`，更长
 
 ## Long-video plan receipt v5（current；v1-v4 只读）
 
-`data/<cid>/long_video_plan.json` 是 canonical JSON。current Fusion v2 promotion 固定 `schema=duet.long-video-plan`、`version=5`；顶层绑定完整 source、实际总时长、统一 H3 workflow、Fusion production manifest 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，provider 整秒时长不得超过 14 秒，并绑定：
+`data/<cid>/long_video_plan.json` 是 canonical JSON。current Fusion v3 promotion 固定 `schema=duet.long-video-plan`、`version=7`；顶层绑定完整 source、实际总时长、统一 H3 workflow、Fusion production manifest 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，provider 整秒时长不得超过 14 秒，并绑定：
 
 - `index/start_s/end_s/chain_id/join_mode`；首段必须 `hard_cut`，后续为 `hard_cut` 或 `continue`；
-- 分段 source、exact 9 张关键帧及各自 source time/scene/transition、兼容锚点和 SHA-256；
+- 分段 source、exact 3 张关键帧及各自 source time/scene/transition、兼容锚点和 SHA-256；
 - Fusion visual prose、后端编译的最终 Ref2VA prompt 及 production manifest 的路径/SHA-256；
 - 本段局部台词的 canonical 数量与 SHA-256。
 
@@ -440,7 +440,7 @@ current v4 路径为 `work/segments/<N>/.h3/attempts/<六位递增号>/attempt.j
 
 `start/resume/retry` 共用单-attempt 推进器；`submit` 始终只提交当前 prepared attempt 一次。每个新 attempt 先原子写 receipt 再 POST，只有显式 `retry(request,new_id)` 或经精确证据授权的受控存储拒绝接口能创建后续 attempt。`retry_count` 仅用于同 task 的 GET、下载和本地可重试操作。`h3_provider_failed/h3_submit_rejected/h3_result_missing`、输入与下载安全拒绝不自动创建新 attempt；查询、超时和下载传输失败继续同 task；`submission_unknown` 永不重复 POST。
 
-current v5 每段把 exact 9 张冻结 Picture 与后端编译的 Ref2VA prompt 提交同一 H3 workflow；`reference_audios=()`，Context receipt 是同字节 local identity。历史 1–9 图、多模态 source-audio 或首尾帧 receipt 只按原 workflow GET 恢复，不迁移付费提交。
+current v7 每段把 exact 3 张冻结 Picture 与后端编译的 Ref2VA prompt 提交同一 H3 workflow；`reference_audios=()`，Context receipt 是同字节 local identity。历史 1–9 图、多模态 source-audio 或首尾帧 receipt 只按原 workflow GET 恢复，不迁移付费提交。
 
 默认同一 `chain_id` 严格串行，快速模式先预构造并 prepare 全部分段，再有界 fan-out POST/GET。成功兄弟独立复用，`submission_unknown` 段不再 POST。全部成功后按统一 EDL 归一 24fps H.264/yuv420p：有音轨段使用 H3 原生音频，无音轨段补有限静音；源音频、source reference 与 conditioning audio 从不回挂或 overlay。拼接失败只重做本地 EDL。
 

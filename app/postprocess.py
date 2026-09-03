@@ -20,6 +20,7 @@ import cv2
 from app import (
     error_trace,
     image_optimization,
+    keyframe_contract,
     mediakit,
     seedream,
     seedream_recovery,
@@ -516,10 +517,22 @@ def _group_targets(cdir: Path, meta: dict) -> dict[int, list[tuple[Path, Path]]]
             index = segment.get("index") if isinstance(segment, dict) else None
             if not isinstance(index, int) or isinstance(index, bool) or index < 1:
                 raise PostprocessError(409, "artifacts not ready")
+            sampling = segment.get("keyframe_sampling")
+            sampling_version = (
+                sampling.get("version") if isinstance(sampling, dict) else None
+            )
+            if sampling_version == keyframe_contract.SAMPLING_RECEIPT_VERSION:
+                expected_count = keyframe_contract.KEYFRAMES_PER_SEGMENT
+                if sampling.get("keyframe_count") != expected_count:
+                    raise PostprocessError(409, "artifacts not ready")
+            elif sampling_version == keyframe_contract.LEGACY_SAMPLING_RECEIPT_VERSION:
+                expected_count = keyframe_contract.LEGACY_KEYFRAMES_PER_SEGMENT
+            else:
+                raise PostprocessError(409, "artifacts not ready")
             relative_paths = segment.get("keyframe_paths")
             if (
                 not isinstance(relative_paths, list)
-                or len(relative_paths) != 9
+                or len(relative_paths) != expected_count
                 or any(not isinstance(path, str) or not path for path in relative_paths)
             ):
                 raise PostprocessError(409, "artifacts not ready")
@@ -528,20 +541,19 @@ def _group_targets(cdir: Path, meta: dict) -> dict[int, list[tuple[Path, Path]]]
             if any(
                 not path.is_relative_to(work) or not path.is_file()
                 for path in files
-            ) or [path.name for path in files] != [
-                f"{order:02d}.png" for order in range(1, 10)
-            ]:
+            ) or [path.name for path in files] != list(
+                keyframe_contract.frame_names(expected_count)
+            ):
                 raise PostprocessError(409, "artifacts not ready")
             try:
                 expected_sha256s = [
                     item["artifact"]["sha256"]
-                    for item in segment["keyframe_sampling"]["keyframes"]
+                    for item in sampling["keyframes"]
                 ]
             except (KeyError, TypeError):
                 raise PostprocessError(409, "artifacts not ready") from None
             if (
-                segment["keyframe_sampling"].get("version") != 2
-                or len(expected_sha256s) != 9
+                len(expected_sha256s) != expected_count
                 or any(
                     _sha256_path(path) != expected
                     for path, expected in zip(files, expected_sha256s, strict=True)

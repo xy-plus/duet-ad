@@ -83,7 +83,7 @@ def test_global_contact_sheet_is_bounded_navigation_without_mutating_frames(
     image_optimization._contact_sheet(frames, sheet)
 
     decoded = cv2.imread(str(sheet), cv2.IMREAD_COLOR)
-    assert decoded is not None and decoded.shape[:2] == (756, 1344)
+    assert decoded is not None and decoded.shape[:2] == (252, 1344)
     assert sheet.read_bytes()[:2] == b"\xff\xd8"
     assert [
         hashlib.sha256(frame.read_bytes()).hexdigest() for frame in frames
@@ -112,22 +112,29 @@ def test_segment_frames_phase_receives_only_low_resolution_jpeg_proxies(
     session = tmp_path / "session"
     keyframes = session / "work" / "segments" / "1" / "work" / "keyframes"
     keyframes.mkdir(parents=True)
-    source = keyframes / "01.png"
-    source.write_bytes(_png(width=1600, height=900, value=127))
-    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    sources = []
+    for order in range(1, 4):
+        source = keyframes / f"{order:02d}.png"
+        source.write_bytes(_png(width=1600, height=900, value=126 + order))
+        sources.append(source)
     segment = {
         "index": 1,
         "chain_id": "chain-001",
         "join_mode": "hard_cut",
         "keyframes_dir": keyframes,
-        "transition_skeleton": [{
-            "segment_index": 1,
-            "frame_index": 1,
-            "frame_name": "01.png",
-            "source_sha256": source_digest,
-            "source_transition_from_previous": "start",
-            "source_transition_evidence_sha256": "1" * 64,
-        }],
+        "transition_skeleton": [
+            {
+                "segment_index": 1,
+                "frame_index": order,
+                "frame_name": source.name,
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "source_transition_from_previous": (
+                    "start" if order == 1 else "same_camera"
+                ),
+                "source_transition_evidence_sha256": str(order) * 64,
+            }
+            for order, source in enumerate(sources, 1)
+        ],
     }
 
     class SegmentCaptured(Exception):
@@ -167,7 +174,7 @@ def test_segment_frames_phase_receives_only_low_resolution_jpeg_proxies(
         )
 
     assert captured == {
-        "files": ["01.jpg"],
+        "files": ["01.jpg", "02.jpg", "03.jpg"],
         "shape": (288, 512),
         "magic": b"\xff\xd8",
         "path": "work/keyframes/01.jpg",
@@ -180,7 +187,11 @@ def test_segment_frames_phase_receives_only_low_resolution_jpeg_proxies(
             "remove_watermark": False,
         },
     }
-    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_digest
+    assert all(
+        hashlib.sha256(source.read_bytes()).hexdigest()
+        == segment["transition_skeleton"][order - 1]["source_sha256"]
+        for order, source in enumerate(sources, 1)
+    )
 
 
 def _done(settings, *, segments=False):
@@ -2175,7 +2186,7 @@ def test_v4_plan_rejects_model_transition_that_differs_from_backend_skeleton(tmp
     session = tmp_path / "session"
     frames = session / "work" / "keyframes"
     frames.mkdir(parents=True)
-    for number in (1, 2):
+    for number in (1, 2, 3):
         (frames / f"{number:02d}.png").write_bytes(_png(value=number))
     skeleton = [
         {
@@ -2186,9 +2197,9 @@ def test_v4_plan_rejects_model_transition_that_differs_from_backend_skeleton(tmp
                 (frames / f"{number:02d}.png").read_bytes()
             ).hexdigest(),
             "source_transition_from_previous": "start" if number == 1 else "same_camera",
-            "source_transition_evidence_sha256": str(number + 7) * 64,
+            "source_transition_evidence_sha256": f"{number + 7:x}" * 64,
         }
-        for number in (1, 2)
+        for number in (1, 2, 3)
     ]
 
     class Runner:

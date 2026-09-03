@@ -32,7 +32,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app import error_trace, h3
+from app import error_trace, h3, keyframe_contract
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -413,12 +413,14 @@ def _is_current_ref2va(request: FrozenContextIrRequest) -> bool:
         source.mode == "reference"
         and source.workflow == h3.H3_WORKFLOW
         and source.context_ir_required is True
-        and len(source.keyframes) == 9
+        and len(source.keyframes) == keyframe_contract.KEYFRAMES_PER_SEGMENT
         and source.reference_audios == ()
     )
 
 
-def _keyframe_timeline_contract(prompt: str) -> str | None:
+def _keyframe_timeline_contract(
+    prompt: str, *, expected_count: int,
+) -> str | None:
     """Extract one canonical timeline block; absence preserves v1 recovery."""
     opening_count = prompt.count(_TIMELINE_OPEN)
     closing_count = prompt.count(_TIMELINE_CLOSE)
@@ -435,7 +437,11 @@ def _keyframe_timeline_contract(prompt: str) -> str | None:
         value = json.loads(raw_json)
     except json.JSONDecodeError:
         raise ContextIrContractError("context_ir_semantic_mismatch") from None
-    if not isinstance(value, list) or len(value) != 9:
+    if (
+        expected_count not in keyframe_contract.SUPPORTED_KEYFRAME_COUNTS
+        or not isinstance(value, list)
+        or len(value) != expected_count
+    ):
         raise ContextIrContractError("context_ir_semantic_mismatch")
     frozen: list[dict[str, Any]] = []
     previous: dict[str, Any] | None = None
@@ -909,7 +915,8 @@ def _semantic_score(
     if request.keyframe_timeline_json is not None:
         try:
             actual_timeline = _keyframe_timeline_contract(
-                context_output_prompt
+                context_output_prompt,
+                expected_count=len(request.source_h3_request.keyframes),
             )
         except ContextIrContractError:
             actual_timeline = None
@@ -1187,7 +1194,8 @@ def freeze_context_ir_request(
         upstream_dialogue_sha256_path,
     )
     keyframe_timeline_json = _keyframe_timeline_contract(
-        source_h3_request.prompt
+        source_h3_request.prompt,
+        expected_count=len(source_h3_request.keyframes),
     )
     relation_states_contract = _relation_states_contract(
         source_h3_request.prompt

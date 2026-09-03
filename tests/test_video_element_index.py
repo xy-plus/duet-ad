@@ -37,10 +37,11 @@ class _IndexRunner:
             assert request["generation_config"] == self.expected_generation_config
         assert [item["segment_index"] for item in request["segments"]] == [1]
         frame_items = request["segments"][0]["frames"]
-        assert [item["frame_order"] for item in frame_items] == [1, 2]
+        assert [item["frame_order"] for item in frame_items] == [1, 2, 3]
         assert [item["path"] for item in frame_items] == [
             "work/segments/1/keyframes/01.png",
             "work/segments/1/keyframes/02.png",
+            "work/segments/1/keyframes/03.png",
         ]
         for item in frame_items:
             data = (cdir / item["path"]).read_bytes()
@@ -55,6 +56,7 @@ class _IndexRunner:
             "project_index_request.json",
             "segments/1/keyframes/01.png",
             "segments/1/keyframes/02.png",
+            "segments/1/keyframes/03.png",
         ]
         assert output_schema["properties"]["people"]["type"] == "array"
         model_payload = {
@@ -72,7 +74,7 @@ def _element_index() -> dict:
             "person-01": {
                 "source_visual_description": "红色外套女性",
                 "occurrences": [
-                    {"segment_index": 1, "frame_orders": [1, 2]}
+                    {"segment_index": 1, "frame_orders": [1, 2, 3]}
                 ],
                 "replaceable": ["face", "hair", "wardrobe"],
                 "preserve": ["one identity", "body shape", "relationships"],
@@ -81,7 +83,7 @@ def _element_index() -> dict:
         "entities": {
             "entity-01": {
                 "source_visual_description": "handheld component",
-                "occurrences": [{"segment_index": 1, "frame_orders": [1, 2]}],
+                "occurrences": [{"segment_index": 1, "frame_orders": [1, 2, 3]}],
                 "replaceable": ["appearance"],
                 "preserve": ["function", "interface"],
             }
@@ -89,7 +91,7 @@ def _element_index() -> dict:
         "scenes": {
             "scene-01": {
                 "source_visual_description": "indoor activity area",
-                "occurrences": [{"segment_index": 1, "frame_orders": [1, 2]}],
+                "occurrences": [{"segment_index": 1, "frame_orders": [1, 2, 3]}],
                 "replaceable": ["environment"],
                 "preserve": ["layout", "camera geometry"],
             }
@@ -102,6 +104,7 @@ def _element_index() -> dict:
                 "occurrences": [{"segment_index": 1, "frames": [
                     {"frame_order": 1, "state": "held", "geometry": "inside hand"},
                     {"frame_order": 2, "state": "released", "geometry": "apart"},
+                    {"frame_order": 3, "state": "released", "geometry": "far apart"},
                 ]}],
                 "preserve": ["roles", "state sequence"],
                 "replace_together": True,
@@ -122,10 +125,10 @@ def test_project_index_call_is_once_isolated_and_preserves_segment_outputs(tmp_p
     work = cdir / "work"
     frames = work / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
-    frame_paths = [frames / "01.png", frames / "02.png"]
-    originals = [_png(value=64), _png(value=128)]
-    frame_paths[0].write_bytes(originals[0])
-    frame_paths[1].write_bytes(originals[1])
+    frame_paths = [frames / f"{order:02d}.png" for order in range(1, 4)]
+    originals = [_png(value=64), _png(value=128), _png(value=192)]
+    for path, data in zip(frame_paths, originals, strict=True):
+        path.write_bytes(data)
     segment_prompt = work / "segments" / "1" / "work" / "prompt.txt"
     segment_prompt.write_text("original segment prompt", encoding="utf-8")
     render_options = {"remove_subtitle": True, "remove_watermark": False}
@@ -155,7 +158,7 @@ def test_project_index_assigns_stable_ids_instead_of_trusting_model_keys(tmp_pat
     cdir = tmp_path / "conversation"
     frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
-    frame_paths = [frames / "01.png", frames / "02.png"]
+    frame_paths = [frames / f"{order:02d}.png" for order in range(1, 4)]
     for path in frame_paths:
         path.write_bytes(_png())
     payload = copy.deepcopy(_element_index())
@@ -192,7 +195,7 @@ def test_project_index_drops_records_without_frame_evidence(tmp_path):
     cdir = tmp_path / "conversation"
     frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
-    frame_paths = [frames / "01.png", frames / "02.png"]
+    frame_paths = [frames / f"{order:02d}.png" for order in range(1, 4)]
     for path in frame_paths:
         path.write_bytes(_png())
     payload = copy.deepcopy(_element_index())
@@ -224,9 +227,13 @@ def test_project_index_drops_records_without_frame_evidence(tmp_path):
 
 def test_project_index_call_has_no_retry_or_fallback(tmp_path):
     cdir = tmp_path / "conversation"
-    frame = cdir / "work" / "keyframes" / "01.png"
-    frame.parent.mkdir(parents=True)
-    frame.write_bytes(_png())
+    frames = [
+        cdir / "work" / "keyframes" / f"{order:02d}.png"
+        for order in range(1, 4)
+    ]
+    frames[0].parent.mkdir(parents=True)
+    for frame in frames:
+        frame.write_bytes(_png())
 
     class FailingRunner:
         calls = 0
@@ -241,7 +248,7 @@ def test_project_index_call_has_no_retry_or_fallback(tmp_path):
     runner = FailingRunner()
     with pytest.raises(RuntimeError, match="project index failed"):
         pipeline._generate_project_element_index(
-            runner, cdir, {0: [frame]}, skill_bytes=b"frozen video-maker skill"
+            runner, cdir, {0: frames}, skill_bytes=b"frozen video-maker skill"
         )
     assert runner.calls == 1
     assert not (cdir / "work" / "element_index.json").exists()
@@ -262,7 +269,7 @@ def test_project_index_rejects_unbound_frame_references(
     cdir = tmp_path / "conversation"
     frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
-    frame_paths = [frames / "01.png", frames / "02.png"]
+    frame_paths = [frames / f"{order:02d}.png" for order in range(1, 4)]
     for path in frame_paths:
         path.write_bytes(_png())
     payload = copy.deepcopy(_element_index())
@@ -271,11 +278,11 @@ def test_project_index_rejects_unbound_frame_references(
     if invalid_case == "element_segment_out_of_range":
         element_occurrences[0]["segment_index"] = 2
     elif invalid_case == "element_frame_out_of_range":
-        element_occurrences[0]["frame_orders"] = [1, 3]
+        element_occurrences[0]["frame_orders"] = [1, 4]
     elif invalid_case == "relation_segment_out_of_range":
         relation_occurrences[0]["segment_index"] = 2
     else:
-        relation_occurrences[0]["frames"][1]["frame_order"] = 3
+        relation_occurrences[0]["frames"][1]["frame_order"] = 4
 
     with pytest.raises(ValueError, match="project index output is invalid"):
         pipeline._generate_project_element_index(
@@ -293,20 +300,22 @@ def test_project_index_canonicalizes_equivalent_same_segment_occurrences(
     cdir = tmp_path / "conversation"
     frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
-    frame_paths = [frames / "01.png", frames / "02.png"]
+    frame_paths = [frames / f"{order:02d}.png" for order in range(1, 4)]
     for path in frame_paths:
         path.write_bytes(_png())
     payload = copy.deepcopy(_element_index())
     payload["people"]["person-01"]["occurrences"] = [
-        {"segment_index": 1, "frame_orders": [2, 1, 1]},
+        {"segment_index": 1, "frame_orders": [3, 2, 1, 1]},
     ]
     payload["entities"]["entity-01"]["occurrences"] = [
         {"segment_index": 1, "frame_orders": [2]},
         {"segment_index": 1, "frame_orders": [1]},
+        {"segment_index": 1, "frame_orders": [3]},
     ]
     payload["scenes"]["scene-01"]["occurrences"] = [
         {"segment_index": 1, "frame_orders": [2]},
         {"segment_index": 1, "frame_orders": [1]},
+        {"segment_index": 1, "frame_orders": [3]},
     ]
     relation = payload["relations"]["relation-01"]
     relation["occurrences"] = [
@@ -335,13 +344,14 @@ def test_project_index_canonicalizes_equivalent_same_segment_occurrences(
     for category in ("people", "entities", "scenes"):
         item = next(iter(frozen[category].values()))
         assert item["occurrences"] == [
-            {"segment_index": 1, "frame_orders": [1, 2]},
+            {"segment_index": 1, "frame_orders": [1, 2, 3]},
         ]
     assert frozen["relations"]["relation-01"]["occurrences"] == [{
         "segment_index": 1,
         "frames": [
             {"frame_order": 1, "state": "held", "geometry": "inside hand"},
             {"frame_order": 2, "state": "released", "geometry": "apart"},
+            {"frame_order": 3, "state": "released", "geometry": "far apart"},
         ],
     }]
 
@@ -350,7 +360,7 @@ def test_project_index_rejects_conflicting_relation_frame_facts(tmp_path):
     cdir = tmp_path / "conversation"
     frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
-    frame_paths = [frames / "01.png", frames / "02.png"]
+    frame_paths = [frames / f"{order:02d}.png" for order in range(1, 4)]
     for path in frame_paths:
         path.write_bytes(_png())
     payload = copy.deepcopy(_element_index())
@@ -385,7 +395,7 @@ def test_project_index_requires_exactly_one_scene_for_every_input_frame(
     cdir = tmp_path / "conversation"
     frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
-    frame_paths = [frames / "01.png", frames / "02.png"]
+    frame_paths = [frames / f"{order:02d}.png" for order in range(1, 4)]
     for path in frame_paths:
         path.write_bytes(_png())
     payload = copy.deepcopy(_element_index())
@@ -393,14 +403,14 @@ def test_project_index_requires_exactly_one_scene_for_every_input_frame(
     if invalid_case == "empty":
         payload["scenes"] = {}
     elif invalid_case == "missing_frame":
-        scene["occurrences"][0]["frame_orders"] = [1]
+        scene["occurrences"][0]["frame_orders"] = [1, 2]
     elif invalid_case == "duplicate_frame":
         payload["scenes"]["scene-02"] = {
             **copy.deepcopy(scene),
-            "occurrences": [{"segment_index": 1, "frame_orders": [2]}],
+            "occurrences": [{"segment_index": 1, "frame_orders": [3]}],
         }
     else:
-        scene["occurrences"][0]["frame_orders"] = [1, 3]
+        scene["occurrences"][0]["frame_orders"] = [1, 2, 4]
 
     with pytest.raises(ValueError, match="project index output is invalid"):
         pipeline._generate_project_element_index(
@@ -416,7 +426,7 @@ def test_project_index_allows_empty_people_and_entities(tmp_path):
     cdir = tmp_path / "conversation"
     frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
-    frame_paths = [frames / "01.png", frames / "02.png"]
+    frame_paths = [frames / f"{order:02d}.png" for order in range(1, 4)]
     for path in frame_paths:
         path.write_bytes(_png())
     payload = copy.deepcopy(_element_index())
@@ -440,7 +450,7 @@ def test_project_index_filters_invalid_relation_endpoints_with_diagnostics(
     cdir = tmp_path / "conversation"
     frames = cdir / "work" / "segments" / "1" / "work" / "keyframes"
     frames.mkdir(parents=True)
-    frame_paths = [frames / "01.png", frames / "02.png"]
+    frame_paths = [frames / f"{order:02d}.png" for order in range(1, 4)]
     for path in frame_paths:
         path.write_bytes(_png())
     payload = copy.deepcopy(_element_index())

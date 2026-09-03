@@ -3,6 +3,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import httpx
 import pytest
 
 from app import (
@@ -95,7 +96,7 @@ class _FailOnProviderCall:
     request = fail
 
 
-def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
+def test_n2_single_pipeline_stays_local_from_exact3_to_h3_request(
     tmp_path: Path,
     video_1s: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -148,9 +149,9 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
             source, segment_work, selection
         )
 
-        assert names == [f"{order:02d}.png" for order in range(1, 10)]
-        assert len(receipt["keyframes"]) == len(frozen) == 9
-        assert any(item["repeated"] for item in receipt["keyframes"])
+        assert names == [f"{order:02d}.png" for order in range(1, 4)]
+        assert len(receipt["keyframes"]) == len(frozen) == 3
+        assert all(not item["repeated"] for item in receipt["keyframes"])
         by_decode_index = {
             item["decode_frame_index"]: item["sha256"]
             for item in receipt["keyframes"]
@@ -164,6 +165,8 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
         assert json.loads(
             (segment_work / "keyframe_sampling.json").read_text(encoding="utf-8")
         ) == receipt
+        receipt["version"] = 3
+        receipt["keyframe_count"] = 3
 
         segment_metas.append({
             **segment,
@@ -181,9 +184,9 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
     bound = pipeline._bind_keyframe_source_timeline(
         work, segments, segment_metas, source_scenes
     )
-    assert [len(item["keyframe_sources"]) for item in bound] == [9, 9]
+    assert [len(item["keyframe_sources"]) for item in bound] == [3, 3]
     assert all(
-        len({frame["source_time_s"] for frame in item["keyframe_sources"]}) < 9
+        len({frame["source_time_s"] for frame in item["keyframe_sources"]}) == 3
         for item in bound
     )
 
@@ -218,14 +221,45 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
     class SparseSemanticSkill:
         calls = 0
 
-        def run_isolated(
-            self, cwd: Path, _prompt: str, *, session_dir: Path
-        ) -> None:
+        @classmethod
+        def schema_value(cls, schema: dict):
+            if "enum" in schema:
+                return schema["enum"][0]
+            schema_type = schema.get("type")
+            if schema_type == "object":
+                return {
+                    key: cls.schema_value(schema["properties"][key])
+                    for key in schema.get("required", [])
+                }
+            if schema_type == "array":
+                item_schema = schema["items"]
+                key_schema = item_schema.get("properties", {}).get("key", {})
+                if "enum" in key_schema:
+                    return [
+                        {**cls.schema_value(item_schema), "key": key}
+                        for key in key_schema["enum"]
+                    ]
+                return [
+                    cls.schema_value(item_schema)
+                    for _index in range(schema.get("minItems", 0))
+                ]
+            if schema_type == "integer":
+                return schema.get("minimum", 1)
+            if schema_type == "number":
+                return schema.get("minimum", 0.0)
+            if schema_type == "boolean":
+                return False
+            return "observed"
+
+        def run_isolated_until_output(
+            self, cwd: Path, _prompt: str, *, session_dir: Path,
+            output_path: Path, max_output_bytes: int, validate_output,
+            output_schema: dict,
+        ):
+            del cwd, output_path, max_output_bytes
             self.calls += 1
             assert session_dir == root
-            (cwd / "work" / "image_optimization.json").write_bytes(
-                _canonical({})
-            )
+            return validate_output(_canonical(self.schema_value(output_schema)))
 
     semantic_skill = SparseSemanticSkill()
     image_plan, image_prompts = image_optimization.generate_project_prompts(
@@ -234,12 +268,17 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
         settings.seedream_edit_mode,
         session_dir=root,
         expected_version=4,
+        skill_bytes=b"frozen image-postprocess skill",
+        generation_config={
+            "remove_subtitle": False,
+            "remove_watermark": False,
+        },
     )
-    assert semantic_skill.calls == 1
-    assert compiler_scores == [0.0]
+    assert semantic_skill.calls == 3
+    assert compiler_scores == [1.0]
     assert image_plan["eligible"] is True
     assert set(image_prompts) == {1, 2}
-    assert all(set(prompts) == set(range(1, 10)) for prompts in image_prompts.values())
+    assert all(set(prompts) == set(range(1, 4)) for prompts in image_prompts.values())
 
     execution_inputs = image_optimization.freeze_execution_inputs(
         image_plan,
@@ -280,7 +319,7 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
         source=source,
         receipt="f" * 64,
         segments=frozen_segments,
-        receipt_version=long_video.VISUAL_PLAN_RECEIPT_VERSION,
+        receipt_version=long_video.THREE_FRAME_VISUAL_PLAN_RECEIPT_VERSION,
         workflow=h3.H3_WORKFLOW,
     )
     acceptance_sha256 = "a" * 64
@@ -297,7 +336,7 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
             "sha256": acceptance_sha256,
         },
         **image_optimization.freeze_continuity(
-            image_plan, frame_counts={1: 9, 2: 9}
+            image_plan, frame_counts={1: 3, 2: 3}
         ),
         **frozen_image,
     )
@@ -316,36 +355,38 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
         def run(self, _cwd: Path, _prompt: str) -> None:
             raise AssertionError("Fusion Skill must run in its isolated stage")
 
-        def run_isolated(
+        def run_isolated_until_output(
             self,
             cwd: Path,
             _prompt: str,
             *,
             session_dir: Path,
-            writable_paths: tuple[Path, ...],
-        ) -> None:
+            output_path: Path,
+            max_output_bytes: int,
+            validate_output,
+            output_schema: dict,
+        ) -> bytes:
+            del max_output_bytes, output_schema
             self.calls += 1
             assert session_dir == root
             input_data = (cwd / "work" / "multimodal_input.json").read_bytes()
             payload = json.loads(input_data)
-            output_path = cwd / "work" / "h3_prompt_plan.json"
-            assert writable_paths == (output_path,)
-            output_path.write_bytes(_canonical({
+            assert output_path == cwd / "work" / "h3_prompt_plan.json"
+            return validate_output(_canonical({
                 "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
                 "version": long_generation.PROMPT_FUSION_VERSION,
                 "input_sha256": hashlib.sha256(input_data).hexdigest(),
                 "segments": [
                     {
-                        "index": segment["index"],
-                        "visual": [
-                            f"segment {segment['index']} local visual motion"
-                            for frame in segment["new_keyframes"]
-                            if frame["transition"]["type"] in {"start", "hard_cut"}
-                        ],
-                    }
-                    for segment in payload["segments"]
-                ],
-            }))
+                            "index": segment["index"],
+                            "visual": [
+                                f"segment {segment['index']} local visual motion"
+                                for _frame in segment["new_keyframes"]
+                            ],
+                        }
+                        for segment in payload["segments"]
+                    ],
+                }))
 
     fusion_skill = VisualOnlyFusionSkill()
     assert pipeline.queue_prompt_fusion(
@@ -361,7 +402,8 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
         (work / "h3_prompt_plan.json").read_text(encoding="utf-8")
     )
     assert all(
-        set(segment) == {"index", "visual"}
+        set(segment) == {"index", "visual", "relation_states"}
+        and len(segment["visual"]) == 3
         for segment in raw_fusion_output["segments"]
     )
     fusion = long_generation.load_prompt_fusion_manifest(
@@ -380,9 +422,10 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
     for index, prompt in enumerate(fusion.final_prompts, 1):
         assert [prompt.count(section) for section in ref2va_sections] == [1] * 6
         assert f"segment {index} local visual motion" in prompt
-        assert "<Picture 1> is the storyboard keyframe anchor for [Shot 1] at 00:00.000" in prompt
+        assert "<Picture 1>=[Shot 1]@00:00.000." in prompt
+        assert "<Picture 3>=[Shot 1]@00:00.400." in prompt
+        assert "<Picture 1>: segment" in prompt
         assert "[Shot 2]" not in prompt
-        assert "<Picture 9>" in prompt
         assert "<Audio " not in prompt
 
     plan = replace(
@@ -420,17 +463,44 @@ def test_n2_single_pipeline_stays_local_from_exact9_to_h3_request(
             source_prompt_sha256=hashlib.sha256(
                 source_request.prompt.encode("utf-8")
             ).hexdigest(),
-            minimax_api_key="",
+            minimax_api_key="offline-test-key",
         )
-        result = context_ir_bridge.optimize_h3_prompt(
-            frozen_context, client=provider
-        )
+        task_id = f"context-task-{segment.index}"
+        uploaded_files = 0
+
+        def context_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal uploaded_files
+            if request.url.path == "/v1/files/upload":
+                uploaded_files += 1
+                return httpx.Response(200, json={
+                    "file": {"file_id": str(427752006353317 + uploaded_files)},
+                    "base_resp": {"status_code": 0, "status_msg": "success"},
+                })
+            if request.url.path == "/v2/h3_context_ir":
+                return httpx.Response(200, json={"task_id": task_id})
+            if request.url.path == f"/v2/query/video_generation/{task_id}":
+                return httpx.Response(200, json={
+                    "task": {
+                        "id": task_id,
+                        "task_type": "h3_context_ir",
+                        "status": "succeeded",
+                        "modality": "text",
+                        "content": {"prompt": source_request.prompt},
+                    },
+                })
+            raise AssertionError(
+                f"unexpected request: {request.method} {request.url}"
+            )
+
+        with httpx.Client(
+            transport=httpx.MockTransport(context_handler)
+        ) as context_client:
+            result = context_ir_bridge.optimize_h3_prompt(
+                frozen_context, client=context_client
+            )
         assert result.status == "succeeded"
         assert result.effective_prompt == source_request.prompt
-        assert result.provider_task_id == (
-            "local:identity:"
-            + hashlib.sha256(source_request.prompt.encode("utf-8")).hexdigest()
-        )
+        assert result.provider_task_id == task_id
         final_requests.append(h3_project.apply_bound_context_ir(
             frozen_context, h3_project.context_ir_binding(result)
         ))

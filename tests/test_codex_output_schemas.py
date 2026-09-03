@@ -32,8 +32,13 @@ def _assert_all_objects_closed(schema: object) -> None:
 def test_all_skill_output_schemas_are_valid_and_closed() -> None:
     schemas = [
         codex_output_schemas.PROJECT_INDEX_SCHEMA,
+        codex_output_schemas.project_index_schema(keyframe_count=3),
         codex_output_schemas.global_plan_schema(stable_keys=_GLOBAL_KEYS),
         codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
+        codex_output_schemas.segment_frames_schema(
+            frame_keys=("frame-001", "frame-002", "frame-003"),
+            stable_keys=_GLOBAL_KEYS,
+        ),
         codex_output_schemas.prompt_fusion_schema(
             input_sha256="a" * 64, segment_count=3, visual_max_chars=426,
         ),
@@ -329,14 +334,14 @@ def test_segment_dto_still_indexes_model_discovered_nested_keys() -> None:
             )
 
 
-def test_fusion_schema_binds_hash_segments_and_exactly_nine_visuals() -> None:
+def test_fusion_schema_binds_hash_segments_and_exactly_three_visuals() -> None:
     digest = "b" * 64
     schema = codex_output_schemas.prompt_fusion_schema(
         input_sha256=digest, segment_count=2, visual_max_chars=12,
     )
-    visuals = [f"frame {index}" for index in range(1, 10)]
+    visuals = [f"frame {index}" for index in range(1, 4)]
     valid = {
-        "schema": "duet.video-prompt-fusion-output", "version": 2,
+        "schema": "duet.video-prompt-fusion-output", "version": 3,
         "input_sha256": digest,
         "segments": [
             {"index": 1, "visual": visuals},
@@ -393,6 +398,25 @@ def test_fusion_schema_refuses_an_invalid_visual_character_limit(
             segment_count=1,
             visual_max_chars=visual_max_chars,
         )
+
+
+def test_current_dynamic_schemas_reject_a_fourth_frame() -> None:
+    project_schema = codex_output_schemas.project_index_schema(keyframe_count=3)
+    occurrences = project_schema["properties"]["people"]["items"][
+        "properties"
+    ]["occurrences"]["items"]["properties"]["frame_orders"]
+    assert occurrences["maxItems"] == 3
+    assert occurrences["items"]["maximum"] == 3
+
+    segment_schema = codex_output_schemas.segment_frames_schema(
+        frame_keys=("frame-001", "frame-002", "frame-003"),
+        stable_keys=_GLOBAL_KEYS,
+    )
+    frames = segment_schema["properties"]["frames"]
+    assert frames["minItems"] == frames["maxItems"] == 3
+    assert frames["items"]["properties"]["key"]["enum"] == [
+        "frame-001", "frame-002", "frame-003",
+    ]
 
 
 def test_codex_argv_receives_readonly_output_schema(monkeypatch, tmp_path: Path) -> None:

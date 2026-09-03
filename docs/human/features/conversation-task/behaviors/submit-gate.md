@@ -40,8 +40,8 @@ links: [conversation-task, processing-state, long-video, postprocess]
 
 | 冻结输入 | 后端结果 |
 | --- | --- |
-| 每段 source timeline | exact 9 个有序 Picture 槽位；scene 改变机械编译为 hard cut，scene 不变为 continuous |
-| Fusion v2 `visual[]` | 只作为每个冻结 hard-cut 区间的视觉 prose；无 provider 标签解释权 |
+| 每段 source timeline | exact 3 个有序 Picture 槽位；scene 改变机械编译为 hard cut，scene 不变为 continuous |
+| Fusion v3 `visual[]` | 只作为每个冻结 hard-cut 区间的视觉 prose；无 provider 标签解释权 |
 | `dialogue_mode=none` | 零台词、零 source audio reference |
 | `dialogue_mode=auto` | 只投影冻结的 `spoken` 文本和时间；逐行 `voice_ref=null`，项目 `voice_references=[]` |
 | `dialogue_delivery` | 当前 Ref2VA compiler 固定投影为 off-screen voiceover；不新增 speaker/binding Skill |
@@ -53,9 +53,9 @@ links: [conversation-task, processing-state, long-video, postprocess]
 ## A 前技术校验
 
 - schema、字段闭集、`confirm`、client id、枚举和 receipt 必须合法。
-- 每个 segment 必须具备 exact 9 张确认图片及其有序 SHA、source scene/time/transition；极短 scene 的受 receipt 证明重复帧合法。
-- Fusion 四类输入、Skill SHA、input/output SHA 和 segment 顺序必须一致；Fusion v2 输出只能是 `{index,visual[]}`。
-- Ref2VA compiler 必须从冻结机械字段生成 Picture 1…9、Shot/cut 时间、台词和 music policy；Skill 文本不能覆盖这些字段。
+- 每个 segment 必须具备 exact 3 张确认图片及其有序 SHA、source scene/time/transition；极短 scene 的受 receipt 证明重复帧合法。
+- Fusion 四类输入、Skill SHA、input/output SHA 和 segment 顺序必须一致；Fusion v3 输出只能是 `{index,visual[]}`。
+- Ref2VA compiler 必须从冻结机械字段生成 Picture 1…3、Shot/cut 时间、台词和 music policy；Skill 文本不能覆盖这些字段。
 - H3 request 必须为零 source audio reference；源音频路径和 bytes 不能出现在 Fusion、Context、H3 或 stitch 输入中。
 - 付费 attempt 必须先落 exact input receipt；`submission_unknown` 仍是 GET-only。
 
@@ -71,6 +71,6 @@ links: [conversation-task, processing-state, long-video, postprocess]
 
 ## Current / history 边界
 
-- current create contract 只有 v4 + Fusion v2 + backend Ref2VA + Context local identity。
+- current create contract 只有 v4 + Fusion v3 + backend Ref2VA + Context local identity。
 - Fusion v1、旧 Context HTTP、多模态 source-audio reference、旧 short/long、speaker visibility 与 quality-verdict receipt 均只读。
 - 历史已知 task 只按原 receipt GET；历史成片可查看，但不得迁移为 current、覆盖输出或作为 fallback 新 POST。
