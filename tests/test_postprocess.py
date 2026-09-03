@@ -18,6 +18,7 @@ from conftest import AUTH, make_settings
 
 from app import (
     context_ir_bridge,
+    frame_fit,
     h3,
     image_optimization,
     long_generation,
@@ -47,6 +48,99 @@ def _solid_png(path: Path, bgr: tuple[int, int, int], *, local_bgr=None) -> None
     if local_bgr is not None:
         image[:5, :5] = local_bgr
     assert cv2.imwrite(str(path), image)
+
+
+@pytest.mark.parametrize(
+    ("extension", "image"),
+    [
+        (".jpg", np.full((4, 10, 3), (31, 63, 127), dtype=np.uint8)),
+        (".webp", np.full((4, 10, 3), (47, 95, 191), dtype=np.uint8)),
+        (".png", np.full((4, 10, 4), (59, 117, 223, 32), dtype=np.uint8)),
+        (".png", np.full((4, 10), 149, dtype=np.uint8)),
+    ],
+)
+def test_provider_raster_normalization_is_bgr_contain_centered_png(extension, image):
+    ok, encoded = cv2.imencode(extension, image)
+    assert ok
+
+    normalized = frame_fit.normalize_image_to_canvas_png(
+        encoded.tobytes(), 6, 8, label="provider output",
+    )
+
+    assert normalized.startswith(b"\x89PNG\r\n\x1a\n")
+    decoded = cv2.imdecode(
+        np.frombuffer(normalized, dtype=np.uint8), cv2.IMREAD_UNCHANGED,
+    )
+    assert decoded is not None and decoded.shape == (8, 6, 3)
+    assert np.all(decoded[:3] == 0)
+    assert np.any(decoded[3:5] != 0)
+    assert np.all(decoded[5:] == 0)
+
+
+def test_provider_raster_normalization_rejects_undecodable_bytes():
+    with pytest.raises(frame_fit.FrameFitError, match="cannot decode"):
+        frame_fit.normalize_image_to_canvas_png(
+            b"not-an-image", 6, 8, label="provider output",
+        )
+
+
+def test_seedream_hashes_normalized_png_before_attempt_and_business_receipts(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = make_settings(tmp_path, retry_interval_s=0)
+    canvas = tmp_path / "canvas.png"
+    ok, canvas_encoded = cv2.imencode(
+        ".png", np.full((8, 6, 3), 83, dtype=np.uint8),
+    )
+    assert ok
+    canvas.write_bytes(canvas_encoded.tobytes())
+    ok, provider_encoded = cv2.imencode(
+        ".png", np.full((4, 10, 4), (29, 101, 211, 19), dtype=np.uint8),
+    )
+    assert ok
+    provider_bytes = provider_encoded.tobytes()
+
+    def provider(_request):
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(provider_bytes).decode("ascii")}],
+        })
+
+    output = tmp_path / "anchor.png"
+    attempt_path = tmp_path / "attempt.json"
+    asyncio.run(postprocess.seedream.edit(
+        settings,
+        [canvas.read_bytes()],
+        "replace the requested element",
+        output,
+        receipt_path=attempt_path,
+        transport=httpx.MockTransport(provider),
+    ))
+
+    output_bytes = output.read_bytes()
+    output_sha256 = hashlib.sha256(output_bytes).hexdigest()
+    decoded = cv2.imread(str(output), cv2.IMREAD_UNCHANGED)
+    assert output_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    assert decoded is not None and decoded.shape == (8, 6, 3)
+    assert np.all(decoded[:3] == 0) and np.all(decoded[5:] == 0)
+    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+    assert attempt["status"] == "succeeded"
+    assert attempt["output_sha256"] == output_sha256
+    assert attempt["result_sha256"] == hashlib.sha256(provider_bytes).hexdigest()
+
+    business = postprocess._anchor_receipt_payload(
+        private={"plan_sha256": "a" * 64, "continuity_sha256": "b" * 64},
+        scene_id="SCENE_01",
+        label="global",
+        anchor={"order": 1},
+        input_roles=["canvas"],
+        inputs=[canvas],
+        output=output,
+    )
+    business_path = tmp_path / "anchor.json"
+    postprocess._write_anchor_receipt(business_path, business)
+    assert business["output_sha256"] == output_sha256
+    assert json.loads(business_path.read_text(encoding="utf-8")) == business
 
 
 @pytest.fixture
@@ -473,32 +567,16 @@ def test_n2_frame_prompt_projection_is_exact_and_fails_closed_on_index_drift(
     )
 
 
-def test_v4_manual_acceptance_receipt_enables_h3_without_image_verification(
+def test_v4_finalize_writes_technical_authority_without_manual_acceptance(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path, retry_interval_s=0)
     cid, cdir, originals = _completed_v4_project(settings, monkeypatch)
     meta = storage.load_meta(settings.data_dir, cid)
-    before = postprocess.image_acceptance_status(settings, cid, meta)
-    assert before == {
-        "required": True,
-        "accepted": False,
-        "expected_meta_sha256": before["expected_meta_sha256"],
-    }
-    assert len(before["expected_meta_sha256"]) == 64
-    with pytest.raises(postprocess.PostprocessError, match="artifacts_invalid"):
-        postprocess.generation_keyframes(cdir, meta, originals, settings=settings)
-
-    accepted = postprocess.accept_images(settings, cid, {
-        "confirm": True,
-        "expected_meta_sha256": before["expected_meta_sha256"],
-    })
-
-    assert accepted["required"] is True and accepted["accepted"] is True
-    latest = storage.load_meta(settings.data_dir, cid)
-    assert "_image_verification" not in latest
+    assert "_image_user_acceptance" not in meta
+    assert "_image_verification" not in meta
     assert postprocess.generation_keyframes(
-        cdir, latest, originals, settings=settings,
+        cdir, meta, originals, settings=settings,
     ) == sorted((cdir / "work" / "postprocessed").glob("*.png"))
 
 
@@ -1646,6 +1724,69 @@ def test_v4_element_evidence_is_locally_collapsed_to_one_numbered_sheet(tmp_path
     assert decoded.shape[:2] == (8, 12)
 
 
+def test_v4_canvas_reconstruction_reuses_frozen_user_pair(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    cid = "session"
+    cdir = settings.data_dir / cid
+    reference = cdir / "inputs" / "replacement.png"
+    reference.parent.mkdir(parents=True)
+    reference.write_bytes(PNG)
+    prompt = "把杯子替换成参考图产品"
+    private = {
+        "model": settings.seedream_model,
+        "edit_mode": settings.seedream_edit_mode,
+        "execution_inputs": {
+            "revision": 1,
+            "profile": {"id": "image-postprocess", "revision": 2},
+            "user_reference_image": {
+                "path": "inputs/replacement.png",
+                "sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
+            },
+            "user_replacement_prompt": prompt,
+            "frames": [{
+                "segment_index": 0,
+                "frame_index": 1,
+                "frame_name": "01.png",
+                "source_transition_from_previous": "start",
+                "source_transition_evidence_sha256": "1" * 64,
+            }],
+        },
+    }
+    records = [{
+        "segment_index": 0,
+        "frame_index": 1,
+        "frame_name": "01.png",
+        "canvas_sha256": "2" * 64,
+    }]
+    captured = {}
+
+    monkeypatch.setattr(postprocess, "_v4_frozen_plan", lambda *_args: {"plan": 1})
+
+    def freeze(_plan, **kwargs):
+        captured.update(kwargs)
+        return {"rebuilt": True}
+
+    monkeypatch.setattr(image_optimization, "freeze_execution_inputs", freeze)
+    monkeypatch.setattr(image_optimization, "compile_frame_prompts", lambda *_args: {})
+    monkeypatch.setattr(
+        image_optimization,
+        "freeze_frame_prompts",
+        lambda _settings, execution, _prompts, *, plan: {
+            "_image_optimization": {"execution": execution, "plan": plan}
+        },
+    )
+
+    rebuilt = postprocess._v4_derive_canvas_optimization(
+        settings, {"id": cid}, private, records,
+    )
+
+    assert rebuilt == {"execution": {"rebuilt": True}, "plan": {"plan": 1}}
+    assert captured["session_dir"] == cdir
+    assert captured["user_reference_image_path"] == reference
+    assert captured["user_replacement_prompt"] == prompt
+    assert captured["frame_inventory"][0]["source_sha256"] == "2" * 64
+
+
 def test_v4_board_provider_call_uses_only_blank_canvas_and_one_evidence_sheet(
     tmp_path, monkeypatch,
 ):
@@ -1714,6 +1855,89 @@ def test_v4_board_provider_call_uses_only_blank_canvas_and_one_evidence_sheet(
     assert output.is_file()
     assert calls and calls[0][0] == 2
     assert "TILE_01=hero" in calls[0][1]
+
+
+def test_v4_board_appends_user_reference_as_third_image_and_scopes_prompt(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    cdir = tmp_path / "session"
+    source = cdir / "work" / "keyframes" / "01.png"
+    reference = cdir / "inputs" / "replacement.png"
+    source.parent.mkdir(parents=True)
+    reference.parent.mkdir(parents=True)
+    ok, source_encoded = cv2.imencode(
+        ".png", np.full((4, 6, 3), 63, dtype=np.uint8)
+    )
+    assert ok
+    ok, reference_encoded = cv2.imencode(
+        ".png", np.full((5, 7, 3), 211, dtype=np.uint8)
+    )
+    assert ok
+    source.write_bytes(source_encoded.tobytes())
+    reference.write_bytes(reference_encoded.tobytes())
+    user_prompt = "把白色水杯替换成参考图里的蓝色产品杯"
+    private = {
+        "model": settings.seedream_model,
+        "edit_mode": settings.seedream_edit_mode,
+        "timeout_s": settings.seedream_timeout_s,
+        "execution_inputs": {
+            "user_reference_image": {
+                "path": "inputs/replacement.png",
+                "sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
+            },
+            "user_replacement_prompt": user_prompt,
+        },
+    }
+    calls = []
+
+    monkeypatch.setattr(postprocess, "_v4_project_revision", lambda *_args: 1)
+    monkeypatch.setattr(
+        image_optimization,
+        "composite_replacement_board_spec",
+        lambda _plan: {"tiles": [{
+            "tile_id": "TILE_01",
+            "stable_key": "product-cup",
+            "kind": "entity",
+            "replacement_description": user_prompt,
+            "reference": {"segment_index": 0, "frame_index": 1},
+        }]},
+    )
+    monkeypatch.setattr(
+        image_optimization,
+        "composite_replacement_board_prompt",
+        lambda _plan, *, user_replacement_prompt=None: (
+            "图1=canvas；图2=source evidence；"
+            f"图3=user reference；{user_replacement_prompt or ''}"
+        ),
+    )
+    monkeypatch.setattr(
+        postprocess, "_v4_frame_sources", lambda *_args: {(0, 1): source}
+    )
+
+    async def edit(_settings, images, prompt, output, *, receipt_path):
+        calls.append((list(images), prompt, receipt_path))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(images[0])
+
+    monkeypatch.setattr(postprocess.seedream, "edit", edit)
+    output = asyncio.run(postprocess._v4_generate_composite_replacement_board(
+        settings,
+        cdir,
+        "cid",
+        private,
+        {0: [(source, cdir / "canonical" / "01.png")]},
+        asyncio.Semaphore(1),
+        {},
+    ))
+
+    assert output == postprocess._replacement_board_path(cdir)
+    assert len(calls) == 1
+    images, prompt, _receipt = calls[0]
+    assert len(images) == 3
+    assert images[2] == reference.read_bytes()
+    assert "图1=canvas；图2=source evidence；图3=user reference" in prompt
+    assert user_prompt in prompt
 
 
 def test_v4_startup_marks_ambiguous_typed_anchor_attempt_get_only(tmp_path, monkeypatch):
@@ -2201,8 +2425,7 @@ def test_upload_single_operation_continues_despite_nonblocking_quality_scores(
     monkeypatch.setenv("ARK_API_KEY", "test-key")
     events = []
 
-    def run_pipeline(_settings, cid, _runner, *, claimed_owner=None):
-        assert claimed_owner is None
+    def run_pipeline(_settings, cid, _runner, *, claimed_owner=None, **_kwargs):
         events.append(("pipeline", cid))
         storage.update_meta(
             settings.data_dir, cid, status="done", error=None,
@@ -2237,22 +2460,6 @@ def test_upload_single_operation_continues_despite_nonblocking_quality_scores(
             },
         )
 
-    def acceptance_status(_settings, cid, meta):
-        return {
-            "required": True,
-            "accepted": meta.get("test_technical_acceptance") is True,
-            "expected_meta_sha256": "a" * 64,
-        }
-
-    def accept(_settings, cid, payload):
-        events.append(("receipt_commit", cid, payload))
-        storage.update_meta(
-            settings.data_dir, cid, test_technical_acceptance=True,
-        )
-        return acceptance_status(
-            settings, cid, storage.load_meta(settings.data_dir, cid)
-        )
-
     def generate(_settings, cid, _runner):
         diagnostics = storage.load_meta(settings.data_dir, cid)[
             "_image_optimization"
@@ -2263,10 +2470,6 @@ def test_upload_single_operation_continues_despite_nonblocking_quality_scores(
     monkeypatch.setattr(pipeline, "run", run_pipeline)
     monkeypatch.setattr(postprocess, "start", start_postprocess)
     monkeypatch.setattr(postprocess, "run_task", run_postprocess)
-    monkeypatch.setattr(
-        postprocess, "image_acceptance_status", acceptance_status
-    )
-    monkeypatch.setattr(postprocess, "accept_images", accept)
     monkeypatch.setattr(
         long_generation, "plan_receipt", lambda *_args, **_kwargs: "a" * 64,
     )
@@ -2288,7 +2491,6 @@ def test_upload_single_operation_continues_despite_nonblocking_quality_scores(
         "pipeline",
         "postprocess_start",
         "postprocess_done",
-        "receipt_commit",
         "generation",
     ]
     assert all(event[1] == cid for event in events)

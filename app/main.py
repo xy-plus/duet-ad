@@ -11,12 +11,15 @@ import time
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Mapping
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from app import (
     context_ir_bridge,
@@ -31,9 +34,11 @@ from app import (
     image_optimization,
     long_generation,
     long_video,
+    minimal_creation,
     pipeline,
     postprocess,
     prepared_input,
+    project_progress,
     published_preview,
     skill_milestone,
     stitch,
@@ -41,7 +46,8 @@ from app import (
     voice,
 )
 from app.auth import require_auth
-from app.deepseek_runner import DeepSeekRunner
+from app.codex_runner import CodexError
+from app.deepseek_runner import DeepSeekRunner, _load_api_key
 from app.config import Settings, get_settings
 
 _RATE_LIMIT = 10  # 每 IP 每分钟上传次数
@@ -81,6 +87,68 @@ _PIPELINE_DISPATCH_POLL_S = 0.25
 _PROMPT_FUSION_TIMER_LOCK = threading.Lock()
 _PROMPT_FUSION_TIMERS: dict[tuple[str, str, str, str], threading.Timer] = {}
 _LOGGER = logging.getLogger(__name__)
+
+_MINIMAL_STORAGE_MESSAGES = {
+    "source_too_large": "原视频超过大小限制",
+    "replacement_image_too_large": "替换图超过大小限制",
+    "unsupported_replacement_media_type": "替换图格式不受支持",
+    "invalid_replacement_image": "替换图无法读取",
+    "invalid_source_media": "原视频无法读取",
+    "creation_id_conflict": "创建请求发生冲突",
+}
+
+_MINIMAL_PAIR_ERROR_CODES = frozenset({
+    "replacement_image_required",
+    "replacement_guidance_required",
+})
+_MINIMAL_GENERIC_REQUEST_ERROR_CODES = frozenset({
+    "invalid_generation_request_json",
+    "unsupported_generation_request_version",
+    "invalid_generation_request",
+    "invalid_output_config",
+    "processing_must_be_enabled",
+    "target_language_too_long",
+    "replacement_instruction_required",
+    "replacement_instruction_too_long",
+})
+_MINIMAL_REPLACEMENT_MEDIA_ERROR_CODES = frozenset({
+    "replacement_image_too_large",
+    "unsupported_replacement_media_type",
+    "invalid_replacement_image",
+})
+
+
+def _minimal_http_exception(
+    status_code: int,
+    code: str,
+    *,
+    message: str | None = None,
+    field: str | None = None,
+) -> HTTPException:
+    detail: dict[str, str] = {
+        "code": code,
+        "message": message or _MINIMAL_STORAGE_MESSAGES.get(code, code),
+    }
+    if field is not None:
+        detail["field"] = field
+    return HTTPException(status_code=status_code, detail=detail)
+
+
+def _minimal_generation_request_exception(
+    exc: minimal_creation.MinimalCreationError,
+) -> HTTPException:
+    if exc.code in _MINIMAL_PAIR_ERROR_CODES:
+        code = "replacement_pair_required"
+    elif exc.code in _MINIMAL_GENERIC_REQUEST_ERROR_CODES:
+        code = "invalid_generation_request"
+    else:
+        code = exc.code
+    return _minimal_http_exception(
+        exc.status_code,
+        code,
+        message=exc.message,
+        field=exc.field,
+    )
 
 
 def _record_error_fail_open(path: Path, **kwargs) -> None:
@@ -429,7 +497,31 @@ def _navigation_status(meta: dict, *, has_video: bool) -> str:
     return "completed"
 
 
-def _public_generation(meta: dict, cdir: Path, settings: Settings) -> dict | None:
+def _public_image_acceptance(meta: dict) -> dict:
+    post = meta.get("postprocess")
+    private = meta.get("_postprocess_receipt")
+    required = bool(
+        isinstance(post, dict)
+        and post.get("status") == "done"
+        and isinstance(private, dict)
+        and private.get("version") == 4
+        and isinstance(private.get("options"), dict)
+        and private["options"].get("optimize_image") is True
+        and meta.get("generation") is None
+        and not meta.get("_input_owner")
+    )
+    return {
+        "required": required,
+        "accepted": isinstance(meta.get("_image_user_acceptance"), dict),
+        "expected_meta_sha256": (
+            postprocess._image_acceptance_meta_sha256(meta)
+            if required
+            else None
+        ),
+    }
+
+
+def _public_generation(meta: dict) -> dict | None:
     generation = meta.get("generation")
     if not isinstance(generation, dict):
         return None
@@ -451,34 +543,18 @@ def _public_generation(meta: dict, cdir: Path, settings: Settings) -> dict | Non
         public["segments"] = long_generation.public_segments(generation)
         if _uses_segment_coordinator(meta) and status == "failed":
             frozen_segments = meta.get("segments")
-            if isinstance(frozen_segments, list):
-                expected = tuple(range(1, len(frozen_segments) + 1))
-                reusable = frozenset()
-                receipt = meta.get("frozen_plan_receipt")
-                if isinstance(receipt, str):
-                    try:
-                        plan = long_generation.freeze_plan(
-                            cdir,
-                            meta,
-                            receipt,
-                            meta.get("fit_mode"),
-                            meta.get("dialogue_mode"),
-                            dialogue_delivery=meta.get(
-                                "dialogue_delivery", "auto"
-                            ),
-                            prepare_fit=False,
-                            settings=settings,
-                        )
-                        reusable = long_generation.bound_reusable_segment_indices(
-                            settings, meta["id"], plan, generation
-                        )
-                    except long_generation.LongGenerationError:
-                        pass
-                public["retry_paid_segment_count"] = len(expected) - len(reusable)
+            retry_count = generation.get("retry_paid_segment_count")
+            if (
+                isinstance(frozen_segments, list)
+                and isinstance(retry_count, int)
+                and not isinstance(retry_count, bool)
+                and 0 <= retry_count <= len(frozen_segments)
+            ):
+                public["retry_paid_segment_count"] = retry_count
     return public
 
 
-def _public_prompt_fusion(meta: dict, cdir: Path) -> dict:
+def _public_prompt_fusion(meta: dict) -> dict:
     raw_segments = meta.get("segments")
     count = len(raw_segments) if isinstance(raw_segments, list) else 0
     if count == 0 and _uses_segment_coordinator(meta):
@@ -487,29 +563,8 @@ def _public_prompt_fusion(meta: dict, cdir: Path) -> dict:
         count = 1
     state = meta.get("_prompt_fusion")
     status = state.get("status") if isinstance(state, dict) else None
-    if status == "done":
-        try:
-            frozen = long_generation.load_bound_prompt_fusion_manifest(
-                root=cdir,
-                meta=meta,
-            )
-            return {
-                "status": "done",
-                "error": None,
-                "segments": [
-                    {
-                        "index": index,
-                        "status": "done",
-                        "final_prompt": prompt,
-                        "error": None,
-                    }
-                    for index, prompt in enumerate(frozen.final_prompts, 1)
-                ],
-            }
-        except long_generation.LongGenerationError:
-            status = "failed"
     public_status = (
-        status if status in {"running", "failed"} else "pending"
+        status if status in {"running", "failed", "done"} else "pending"
     )
     error = (
         str(state.get("error") or "prompt_fusion_invalid")
@@ -575,7 +630,7 @@ def _uses_segment_coordinator(meta: dict) -> bool:
     return _is_current_v4_segment_project(meta) or _is_long_video(meta)
 
 
-def _is_normalized_single_segment_layout(cdir: Path, meta: dict) -> bool:
+def _is_normalized_single_segment_layout(meta: dict) -> bool:
     """Recognize only the frozen v4 N=1 adapter that retains root media."""
     segments = meta.get("segments")
     if (
@@ -584,7 +639,8 @@ def _is_normalized_single_segment_layout(cdir: Path, meta: dict) -> bool:
         or len(segments) != 1
         or not isinstance(segments[0], dict)
         or segments[0].get("index") != 1
-        or long_generation.plan_receipt(cdir, meta) is None
+        or not isinstance(meta.get("frozen_plan_receipt"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", meta["frozen_plan_receipt"]) is None
     ):
         return False
     segment = segments[0]
@@ -610,14 +666,17 @@ def _is_normalized_single_segment_layout(cdir: Path, meta: dict) -> bool:
 
 
 def _public_image_frame_prompts(
-    meta: dict, settings: Settings,
+    meta: dict,
 ) -> dict[int, list[dict[str, str]]]:
-    """Project validated v4 frame prompts without exposing the private receipt."""
-    raw = image_optimization.receipt(meta, settings)
+    """Project persisted v4 frame prompts without rebuilding their receipt."""
+    raw = meta.get("_image_optimization")
     if not isinstance(raw, dict) or raw.get("version") != 4:
         return {}
+    frames = raw.get("frames")
+    if not isinstance(frames, list):
+        return {}
     result: dict[int, list[dict[str, str]]] = {}
-    for item in raw.get("frames", []):
+    for item in frames:
         if not isinstance(item, dict):
             return {}
         index = item.get("segment_index")
@@ -882,6 +941,54 @@ def _timeouts(settings: Settings) -> h3.Timeouts:
 
 def _credentials_ready(settings: Settings) -> bool:
     return bool(settings.autodl_art_token.strip())
+
+
+def _minimal_creation_ready(settings: Settings) -> bool:
+    if (
+        not settings.minimal_creation_settings_ready()
+        or not os.environ.get("ARK_API_KEY", "").strip()
+    ):
+        return False
+    try:
+        _load_api_key(settings.deepseek_credential_file)
+    except CodexError:
+        return False
+    return True
+
+
+class _GenerationRequestDecodeError(ValueError):
+    pass
+
+
+class _StrictGenerationRequestParser(MultiPartParser):
+    """Keep Starlette file spooling while decoding v1 JSON as strict UTF-8."""
+
+    def on_part_end(self) -> None:
+        if (
+            self._current_part.file is None
+            and self._current_part.field_name == "generation_request"
+        ):
+            try:
+                value = bytes(self._current_part.data).decode("utf-8")
+            except UnicodeDecodeError:
+                raise _GenerationRequestDecodeError from None
+            self.items.append((self._current_part.field_name, value))
+            return
+        super().on_part_end()
+
+
+async def _strict_request_form(request: Request) -> FormData:
+    content_type = request.headers.get("content-type", "")
+    if content_type.lower().startswith("multipart/form-data"):
+        try:
+            form = await _StrictGenerationRequestParser(
+                request.headers, request.stream()
+            ).parse()
+        except MultiPartException:
+            raise HTTPException(status_code=422, detail="invalid multipart") from None
+        request._form = form
+        return form
+    return await request.form()
 
 
 def _source(cdir: Path) -> Path:
@@ -2431,6 +2538,25 @@ def _generated_video_validation_fingerprint(
         return None
 
 
+def _has_persisted_generated_video(
+    settings: Settings, meta: Mapping,
+) -> bool:
+    """Cheap public projection; strict artifact validation stays at write boundaries."""
+    if meta.get("status") != "done":
+        return False
+    generation = meta.get("generation")
+    if generation is not None and (
+        not isinstance(generation, Mapping)
+        or generation.get("status") != "succeeded"
+    ):
+        return False
+    cid = meta.get("id")
+    return bool(
+        isinstance(cid, str)
+        and (settings.data_dir / cid / "generated.mp4").is_file()
+    )
+
+
 def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
     if "published_preview_receipt" in meta:
         return _validate_published_preview(settings, meta)
@@ -2438,11 +2564,21 @@ def _has_valid_generated_video(settings: Settings, meta: dict) -> bool:
     # Pre-H3 legacy conversations have no receipt to validate. Preserve their
     # historical visibility; every receipt-aware generation is fail closed.
     if generation is None:
+        effective_request = meta.get("effective_request")
+        if (
+            isinstance(effective_request, dict)
+            and type(effective_request.get("version")) is int
+            and effective_request.get("version") == 1
+        ):
+            return False
         cid = meta.get("id")
-        return (
-            isinstance(cid, str)
-            and (settings.data_dir / cid / "generated.mp4").is_file()
-        )
+        if not isinstance(cid, str):
+            return False
+        try:
+            storage.probe_video(settings.data_dir / cid / "generated.mp4")
+        except storage.UploadError:
+            return False
+        return True
     if not isinstance(generation, dict) or generation.get("status") != "succeeded":
         return False
     cid = meta.get("id")
@@ -2470,11 +2606,14 @@ def _has_listable_generated_video(settings: Settings, meta: dict) -> bool:
         return _has_valid_generated_video(settings, meta)
     generation = meta.get("generation")
     if generation is None:
-        cid = meta.get("id")
-        return (
-            isinstance(cid, str)
-            and (settings.data_dir / cid / "generated.mp4").is_file()
-        )
+        effective_request = meta.get("effective_request")
+        if (
+            isinstance(effective_request, dict)
+            and type(effective_request.get("version")) is int
+            and effective_request.get("version") == 1
+        ):
+            return False
+        return _has_valid_generated_video(settings, meta)
     if not isinstance(generation, dict) or generation.get("status") != "succeeded":
         return False
     cid = meta.get("id")
@@ -2794,11 +2933,6 @@ def _automatic_v4_pre_fusion_claim(
     if not isinstance(post, Mapping) or post.get("status") != "done":
         return False
     try:
-        acceptance = postprocess.image_acceptance_status(
-            settings, cid, dict(meta)
-        )
-        if acceptance.get("required") and not acceptance.get("accepted"):
-            return False
         aspect_ratio, resolution = _generation_semantics(dict(meta))
         dialogue_mode = meta.get("dialogue_mode")
         authoritative_dialogue = tuple(
@@ -3436,9 +3570,6 @@ def _start_automatic_v4_generation(
         not isinstance(post, Mapping) or post.get("status") != "done"
     ):
         return
-    acceptance = postprocess.image_acceptance_status(settings, cid, meta)
-    if acceptance.get("required") and not acceptance.get("accepted"):
-        return
     expected_receipt = long_generation.plan_receipt(
         settings.data_dir / cid, meta
     )
@@ -3804,21 +3935,6 @@ def create_app(settings: Settings) -> FastAPI:
             )
         ):
             return
-        if not skip_postprocess:
-            acceptance = postprocess.image_acceptance_status(settings, cid, meta)
-            if acceptance.get("required") and not acceptance.get("accepted"):
-                expected = acceptance.get("expected_meta_sha256")
-                if not isinstance(expected, str):
-                    return
-                try:
-                    await asyncio.to_thread(
-                        postprocess.accept_images,
-                        settings,
-                        cid,
-                        {"confirm": True, "expected_meta_sha256": expected},
-                    )
-                except postprocess.PostprocessError:
-                    return
         await asyncio.to_thread(
             _start_automatic_v4_generation,
             settings,
@@ -4088,16 +4204,40 @@ def create_app(settings: Settings) -> FastAPI:
             )
             thread.start()
 
+    def project_snapshot(meta: Mapping) -> dict[str, object]:
+        current = dict(meta)
+        has_video = _has_persisted_generated_video(settings, current)
+        return {
+            "has_video": has_video,
+            "project_progress": project_progress.aggregate_project_progress(
+                current, has_video=has_video
+            ),
+        }
+
+    def minimal_creation_response(meta: Mapping) -> dict[str, object]:
+        snapshot = project_snapshot(meta)
+        return {
+            "id": meta["id"],
+            "title": meta["title"],
+            **snapshot,
+            "effective_request": meta.get("effective_request"),
+            "input_receipt": meta.get("input_receipt"),
+            "creation_input": meta.get("creation_input"),
+        }
+
     @app.get("/api/health")
     async def health():
         return {"ok": True}
 
     @app.get("/api/capabilities", dependencies=[Depends(require_auth)])
     async def capabilities():
-        return {
+        result = {
             "generation_config": generation_config.capability(),
             "dialogue_review": dialogue_review.capability(),
         }
+        if _minimal_creation_ready(settings):
+            result["minimal_creation"] = minimal_creation.capability()
+        return result
 
     @app.post("/api/login")
     async def login(payload: dict):
@@ -4112,7 +4252,24 @@ def create_app(settings: Settings) -> FastAPI:
     async def list_conversations():
         result = []
         for meta in storage.list_conversations(settings.data_dir):
-            has_video = _has_listable_generated_video(settings, meta)
+            segments = meta.get("segments")
+            segment_count = len(segments) if isinstance(segments, list) else 0
+            thumbnail_path = None
+            if segment_count:
+                first_segment = segments[0]
+                if isinstance(first_segment, dict):
+                    first_frame_path = first_segment.get("first_frame_path")
+                    if isinstance(first_frame_path, str):
+                        thumbnail_path = first_frame_path
+            else:
+                keyframes = meta.get("keyframes")
+                if (
+                    isinstance(keyframes, list)
+                    and keyframes
+                    and isinstance(keyframes[0], str)
+                ):
+                    thumbnail_path = f"keyframes/{keyframes[0]}"
+            has_video = _has_persisted_generated_video(settings, meta)
             public_status, _public_error = _public_conversation_status(meta)
             result.append({
                 "id": meta["id"],
@@ -4122,30 +4279,349 @@ def create_app(settings: Settings) -> FastAPI:
                 "analysis_status": meta["status"],
                 "navigation_status": _navigation_status(meta, has_video=has_video),
                 "created_at": meta["created_at"],
+                "updated_at": meta.get("updated_at"),
+                "duration_s": meta.get("duration_s"),
+                "segment_count": segment_count,
+                "thumbnail_path": thumbnail_path,
                 "has_video": has_video,
+                "project_progress": project_progress.aggregate_project_progress(
+                    dict(meta), has_video=has_video
+                ),
             })
         return result
+
+    async def create_minimal_conversation(
+        *,
+        form,
+        response: Response,
+        background_tasks: BackgroundTasks,
+        file: UploadFile | None,
+        reference_url: str,
+        client_request_id: str,
+        generation_request_json: str,
+        replacement_image: UploadFile | None,
+    ) -> dict[str, object]:
+        allowed = {
+            "file",
+            "reference_url",
+            "client_request_id",
+            "generation_request",
+            "replacement_image",
+        }
+        if set(form) - allowed or any(
+            len(form.getlist(key)) != 1 for key in form
+        ):
+            raise _minimal_http_exception(
+                422,
+                "invalid_create_request",
+                message="创建请求包含未知或重复字段",
+            )
+        reference_url = reference_url.strip()
+        if (file is None) == (not reference_url):
+            raise _minimal_http_exception(
+                400,
+                "source_exactly_one_required",
+                message="原视频文件和视频链接必须且只能提供一个",
+            )
+        client_request_id = client_request_id.strip()
+        if not _CLIENT_REQUEST_ID_RE.fullmatch(client_request_id):
+            raise _minimal_http_exception(
+                400,
+                "invalid_client_request_id",
+                message="client_request_id 格式无效",
+                field="client_request_id",
+            )
+        try:
+            parsed = minimal_creation.parse_generation_request(
+                generation_request_json
+            )
+            minimal_creation.validate_replacement_pair(
+                parsed,
+                replacement_image_present=replacement_image is not None,
+            )
+        except minimal_creation.MinimalCreationError as exc:
+            raise _minimal_generation_request_exception(exc) from None
+
+        try:
+            with storage.staged_creation(settings.data_dir) as (cid, staging):
+                if file is not None:
+                    frozen_source = await storage.save_creation_source(
+                        staging,
+                        file,
+                        settings.max_upload_mb * 1024 * 1024,
+                    )
+                    source_title = file.filename or "source"
+                else:
+                    source_path = await run_in_threadpool(
+                        downloader.fetch_reference,
+                        reference_url,
+                        staging,
+                        settings,
+                    )
+                    frozen_source = await run_in_threadpool(
+                        storage.freeze_creation_source_file,
+                        source_path,
+                        settings.max_upload_mb * 1024 * 1024,
+                    )
+                    source_title = reference_url
+                frozen_replacement = None
+                if replacement_image is not None:
+                    frozen_replacement = (
+                        await storage.save_creation_replacement_image(
+                            staging,
+                            replacement_image,
+                            minimal_creation.REPLACEMENT_MAX_BYTES,
+                        )
+                    )
+                video = await run_in_threadpool(
+                    storage.probe_video, frozen_source.path
+                )
+                if _duration_exceeds_h3_limit(video.duration_s):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=_duration_limit_detail(video.duration_s),
+                    )
+                now = datetime.now(timezone.utc).isoformat()
+                target_language = parsed.effective_request["dialogue"][
+                    "target_language"
+                ]
+                meta = {
+                    "schema_version": 2,
+                    "id": cid,
+                    "title": storage.sanitize_title(source_title),
+                    "note": "",
+                    "status": "queued",
+                    "error": None,
+                    "created_at": now,
+                    "updated_at": now,
+                    "keyframes": [],
+                    "prompt": None,
+                    "voice_mode": "translate",
+                    "target_language": target_language,
+                    "duration_s": video.duration_s,
+                    "source_width": video.width,
+                    "source_height": video.height,
+                    "fit_required": None,
+                    "dialogue_mode": "auto",
+                    "dialogue_review_policy": dialogue_review.AUTO_CONTINUE,
+                    "generation": None,
+                    "generation_config": parsed.internal_processing,
+                    project_progress.PROGRESS_FLOOR_FIELD: 0,
+                }
+                with storage.creation_lock(settings.data_dir):
+                    existing = next(
+                        (
+                            item
+                            for item in storage.list_conversations(
+                                settings.data_dir
+                            )
+                            if item.get("client_request_id")
+                            == client_request_id
+                        ),
+                        None,
+                    )
+                    if existing is not None:
+                        receipt = existing.get("input_receipt")
+                        expected_replacement = (
+                            None
+                            if frozen_replacement is None
+                            else {
+                                "sha256": frozen_replacement.sha256,
+                                "bytes": frozen_replacement.bytes,
+                            }
+                        )
+                        same = (
+                            isinstance(receipt, Mapping)
+                            and receipt.get("version") == 1
+                            and receipt.get("generation_request_sha256")
+                            == parsed.generation_request_sha256
+                            and receipt.get("source")
+                            == {
+                                "sha256": frozen_source.sha256,
+                                "bytes": frozen_source.bytes,
+                            }
+                            and receipt.get("replacement_image")
+                            == expected_replacement
+                        )
+                        if not same:
+                            raise _minimal_http_exception(
+                                409,
+                                "client_request_id_conflict",
+                                message=(
+                                    "client_request_id 已绑定到不同的创建输入"
+                                ),
+                                field="client_request_id",
+                            )
+                        published = existing
+                        response.status_code = 200
+                    else:
+                        queued = sum(
+                            1
+                            for item in storage.list_conversations(
+                                settings.data_dir
+                            )
+                            if item.get("status") == "queued"
+                        )
+                        if queued >= settings.max_queued:
+                            raise _minimal_http_exception(
+                                429,
+                                "queue_full",
+                                message="当前任务队列已满",
+                            )
+                        published = storage.publish_staged_creation(
+                            settings.data_dir,
+                            staging,
+                            cid,
+                            meta=meta,
+                            effective_request=parsed.effective_request,
+                            client_request_id=client_request_id,
+                            source=frozen_source,
+                            source_filename=(
+                                file.filename if file is not None else None
+                            ),
+                            source_reference_url=(
+                                reference_url if file is None else None
+                            ),
+                            replacement_image=frozen_replacement,
+                            replacement_image_filename=(
+                                replacement_image.filename
+                                if replacement_image is not None
+                                else None
+                            ),
+                        )
+                if settings.enable_pipeline:
+                    claimed = None
+                    if response.status_code == 200:
+                        claimed = storage.claim_ready_queued_pipeline_input(
+                            settings.data_dir, published["id"]
+                        )
+                    if claimed is not None:
+                        background_tasks.add_task(
+                            run_pipeline_gated,
+                            published["id"],
+                            claimed["_input_owner"],
+                        )
+                        published = claimed
+                    elif response.status_code != 200:
+                        background_tasks.add_task(
+                            run_pipeline_gated, published["id"]
+                        )
+                return minimal_creation_response(published)
+        except storage.CreationStorageError as exc:
+            public_code = (
+                "invalid_replacement_image"
+                if exc.code in _MINIMAL_REPLACEMENT_MEDIA_ERROR_CODES
+                else exc.code
+            )
+            raise _minimal_http_exception(
+                exc.status_code,
+                public_code,
+                message=_MINIMAL_STORAGE_MESSAGES.get(exc.code, exc.code),
+            ) from None
+        except downloader.DownloadError as exc:
+            if exc.code == "source_too_large":
+                raise _minimal_http_exception(
+                    413, "source_too_large"
+                ) from None
+            raise _minimal_http_exception(
+                422, "invalid_source_media"
+            ) from None
+        except storage.UploadError:
+            raise _minimal_http_exception(
+                422, "invalid_source_media"
+            ) from None
 
     @app.post("/api/conversations", status_code=201, dependencies=[Depends(require_auth)])
     async def create_conversation(
         request: Request,
         response: Response,
         background_tasks: BackgroundTasks,
-        file: UploadFile | None = File(None),
-        reference_url: str = Form(""),
-        note: str = Form(""),
-        client_request_id: str = Form(""),
-        voice_mode: str = Form("keep"),
-        target_language: str = Form(""),
-        dialogue_mode: str = Form("auto"),
-        lines: str = Form(""),
-        generation_config_json: str = Form("", alias="generation_config"),
-        dialogue_review_policy: str = Form(dialogue_review.AUTO_CONTINUE),
     ):
         ip = request.client.host if request.client else "unknown"
+        try:
+            form = await _strict_request_form(request)
+        except _GenerationRequestDecodeError:
+            if not _minimal_creation_ready(settings):
+                raise _minimal_http_exception(
+                    503,
+                    "minimal_creation_unavailable",
+                    message="当前创建方式尚未启用",
+                ) from None
+            raise _minimal_http_exception(
+                422,
+                "invalid_generation_request",
+                message="generation_request 必须是 UTF-8 JSON 字符串",
+                field="generation_request",
+            ) from None
+        is_minimal = "generation_request" in form
+        if is_minimal and not _minimal_creation_ready(settings):
+            raise _minimal_http_exception(
+                503,
+                "minimal_creation_unavailable",
+                message="当前创建方式尚未启用",
+            )
         if not limiter.allow(ip):
+            if is_minimal:
+                raise _minimal_http_exception(
+                    429,
+                    "rate_limited",
+                    message="创建请求过于频繁，请稍后重试",
+                )
             raise HTTPException(status_code=429, detail="too many uploads")
-        form = await request.form()
+        if is_minimal:
+            allowed = {
+                "file",
+                "reference_url",
+                "client_request_id",
+                "generation_request",
+                "replacement_image",
+            }
+            values = {key: form.get(key) for key in form}
+            if (
+                set(form) - allowed
+                or any(len(form.getlist(key)) != 1 for key in form)
+                or any(
+                    key in values
+                    and not isinstance(values[key], StarletteUploadFile)
+                    for key in ("file", "replacement_image")
+                )
+                or any(
+                    key in values and not isinstance(values[key], str)
+                    for key in (
+                        "reference_url",
+                        "client_request_id",
+                        "generation_request",
+                    )
+                )
+            ):
+                raise _minimal_http_exception(
+                    422,
+                    "invalid_create_request",
+                    message="创建请求包含未知或重复字段",
+                )
+            return await create_minimal_conversation(
+                form=form,
+                response=response,
+                background_tasks=background_tasks,
+                file=values.get("file"),
+                reference_url=values.get("reference_url", ""),
+                client_request_id=values.get("client_request_id", ""),
+                generation_request_json=values["generation_request"],
+                replacement_image=values.get("replacement_image"),
+            )
+        file = form.get("file")
+        reference_url = form.get("reference_url", "")
+        note = form.get("note", "")
+        client_request_id = form.get("client_request_id", "")
+        voice_mode = form.get("voice_mode", "keep")
+        target_language = form.get("target_language", "")
+        dialogue_mode = form.get("dialogue_mode", "auto")
+        lines = form.get("lines", "")
+        generation_config_json = form.get("generation_config", "")
+        replacement_image = form.get("replacement_image")
+        dialogue_review_policy = form.get(
+            "dialogue_review_policy", dialogue_review.AUTO_CONTINUE
+        )
         allowed_form_fields = {
             "file", "reference_url", "note", "client_request_id",
             "voice_mode", "target_language", "dialogue_mode", "lines",
@@ -4336,25 +4812,35 @@ def create_app(settings: Settings) -> FastAPI:
         if meta is None:
             raise HTTPException(status_code=404, detail="not found")
         cdir = settings.data_dir / cid
-        has_video = _has_valid_generated_video(settings, meta)
+        has_video = _has_persisted_generated_video(settings, meta)
+        progress = project_progress.aggregate_project_progress(
+            meta, has_video=has_video
+        )
         source_prompt, source_prompt_sha256 = _source_prompt_snapshot(cdir)
         try:
-            effective_meta = meta
-            if _uses_segment_coordinator(meta) and not isinstance(meta.get("fit_profiles"), dict):
-                effective_meta = {
-                    **meta,
-                    "fit_required": _long_fit_required(cdir, meta, settings),
-                }
-            aspect_ratio, resolution = _generation_semantics(effective_meta)
-            fit_profiles = _validated_fit_profiles(effective_meta)
+            aspect_ratio, resolution = _generation_semantics(meta)
+            fit_profiles = _validated_fit_profiles(meta)
             effective_fit_required = fit_profiles[aspect_ratio]["fit_required"]
         except _SubmitError:
             aspect_ratio = resolution = fit_profiles = None
             effective_fit_required = None
-        optimization_prompts = image_optimization.public_prompts(meta, settings)
-        optimization_frame_prompts = _public_image_frame_prompts(meta, settings)
-        normalized_single = _is_normalized_single_segment_layout(cdir, meta)
-        if normalized_single and not optimization_prompts:
+        raw_image_optimization = meta.get("_image_optimization")
+        is_v4_image_optimization = (
+            isinstance(raw_image_optimization, dict)
+            and raw_image_optimization.get("version") == 4
+        )
+        optimization_prompts = (
+            {}
+            if is_v4_image_optimization
+            else image_optimization.public_prompts(meta, settings)
+        )
+        optimization_frame_prompts = _public_image_frame_prompts(meta)
+        normalized_single = _is_normalized_single_segment_layout(meta)
+        if (
+            normalized_single
+            and not is_v4_image_optimization
+            and not optimization_prompts
+        ):
             compatibility_meta = {**meta, "segments": []}
             internal_prompts = image_optimization.public_prompts(
                 compatibility_meta, settings
@@ -4395,9 +4881,7 @@ def create_app(settings: Settings) -> FastAPI:
             "remove_brand": bool(settings.enable_mediakit_erase),
             "optimize_image": bool(os.environ.get("ARK_API_KEY", "").strip()),
         }
-        image_acceptance = postprocess.image_acceptance_status(
-            settings, cid, meta
-        )
+        image_acceptance = _public_image_acceptance(meta)
         public_status, public_error = _public_conversation_status(meta)
         result = {
             "id": meta["id"],
@@ -4426,9 +4910,13 @@ def create_app(settings: Settings) -> FastAPI:
             "dialogue_review": _public_dialogue_review(meta),
             "element_index": _public_element_index(cdir),
             "receipt_version": _receipt_version(cdir, meta),
-            "generation": _public_generation(meta, cdir, settings),
+            "generation": _public_generation(meta),
             "has_source": any(cdir.glob("source.*")),
             "has_video": has_video,
+            "project_progress": progress,
+            "effective_request": meta.get("effective_request"),
+            "input_receipt": meta.get("input_receipt"),
+            "creation_input": meta.get("creation_input"),
             "submit_enabled": settings.enable_h3_submit,
             "postprocess": postprocess.public_state(meta.get("postprocess")),
             "postprocess_capabilities": capabilities,
@@ -4448,10 +4936,10 @@ def create_app(settings: Settings) -> FastAPI:
         if not _uses_segment_coordinator(meta):
             result["image_optimization_prompt"] = optimization_prompts.get(0)
         if _uses_segment_coordinator(meta):
-            result["plan_receipt"] = long_generation.plan_receipt(cdir, meta)
+            result["plan_receipt"] = meta.get("frozen_plan_receipt")
             segments = meta.get("segments")
             result["segment_count"] = len(segments) if isinstance(segments, list) else 0
-            result["prompt_fusion"] = _public_prompt_fusion(meta, cdir)
+            result["prompt_fusion"] = _public_prompt_fusion(meta)
         return result
 
     @app.post(
@@ -4641,6 +5129,24 @@ def create_app(settings: Settings) -> FastAPI:
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
         return {"prompt": updated, "sha256": digest, "final_prompt": final_prompt}
 
+    @app.get(
+        storage.CREATION_REPLACEMENT_PREVIEW_ROUTE,
+        dependencies=[Depends(require_auth)],
+    )
+    async def get_creation_replacement_image(cid: str):
+        frozen = await run_in_threadpool(
+            storage.resolve_creation_replacement_image,
+            settings.data_dir,
+            cid,
+        )
+        if frozen is None:
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(
+            frozen.path,
+            media_type=frozen.media_type,
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
+
     @app.get("/api/conversations/{cid}/files/{name:path}", dependencies=[Depends(require_auth)])
     async def get_file(cid: str, name: str):
         # A v4 project writes canonical files only after technical generation, but
@@ -4649,6 +5155,11 @@ def create_app(settings: Settings) -> FastAPI:
         # until the project-level manifest is visible.  External quality
         # acceptance is advisory for the gallery and remains an H3-only gate.
         meta = storage.load_meta(settings.data_dir, cid)
+        if name == "generated.mp4" and (
+            not isinstance(meta, dict)
+            or not _has_persisted_generated_video(settings, meta)
+        ):
+            raise HTTPException(status_code=404, detail="not found")
         frozen = meta.get("_postprocess_receipt") if isinstance(meta, dict) else None
         post = meta.get("postprocess") if isinstance(meta, dict) else None
         is_v4_optimized = (

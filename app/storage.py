@@ -1,8 +1,10 @@
+import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -13,7 +15,11 @@ from math import isfinite
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-from app import dialogue_review, generation_config as generation_config_contract
+from app import (
+    dialogue_review,
+    generation_config as generation_config_contract,
+    project_progress,
+)
 
 ALLOWED_EXT = {".mp4", ".mov", ".webm"}
 _CHUNK = 1024 * 1024
@@ -25,16 +31,42 @@ _META_LOCKS: dict[str, threading.Lock] = {}
 _META_LOCKS_GUARD = threading.Lock()
 PROCESS_GENERATION = uuid.uuid4().hex
 _PIPELINE_RETRY_ATTEMPT_CAP = 31
+CREATION_REPLACEMENT_PREVIEW_ROUTE = (
+    "/api/conversations/{cid}/creation-input/replacement-image"
+)
+_MINIMAL_CREATION_FROZEN_FIELDS = (
+    "client_request_id",
+    "effective_request",
+    "input_receipt",
+    "creation_input",
+    "_minimal_replacement_image_path",
+)
 
 
 class UploadError(ValueError):
     """上传校验失败（HTTP 层转 422）。"""
 
 
+class CreationStorageError(UploadError):
+    """v1 creation input failure with a stable HTTP-facing code."""
+
+    def __init__(self, code: str, status_code: int):
+        super().__init__(code)
+        self.code = code
+        self.status_code = status_code
+
+
 class VideoProbe(NamedTuple):
     duration_s: float
     width: int
     height: int
+
+
+class FrozenCreationFile(NamedTuple):
+    path: Path
+    sha256: str
+    bytes: int
+    media_type: str | None = None
 
 
 def _now() -> str:
@@ -46,6 +78,13 @@ def sanitize_title(filename: str) -> str:
     base = _CONTROL_RE.sub("", filename.replace("\\", "/").rsplit("/", 1)[-1]).strip()
     stem = Path(base).stem.strip()
     return stem[:80] or "untitled"
+
+
+def _creation_display_filename(filename: object, fallback: str) -> str:
+    """Keep an untrusted client filename as bounded display data, never a path."""
+    raw = filename if isinstance(filename, str) else ""
+    base = _CONTROL_RE.sub("", raw.replace("\\", "/").rsplit("/", 1)[-1]).strip()
+    return base[:255] or fallback
 
 
 def _fsync_directory(path: Path) -> None:
@@ -62,7 +101,63 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _is_minimal_creation_v1(meta: dict) -> bool:
+    effective_request = meta.get("effective_request")
+    input_receipt = meta.get("input_receipt")
+    if not isinstance(effective_request, dict) or not isinstance(
+        input_receipt, dict
+    ):
+        return False
+    request_version = effective_request.get("version")
+    receipt_version = input_receipt.get("version")
+    return (
+        isinstance(request_version, int)
+        and not isinstance(request_version, bool)
+        and request_version == 1
+        and isinstance(receipt_version, int)
+        and not isinstance(receipt_version, bool)
+        and receipt_version == 1
+    )
+
+
+def _stored_progress_floor(meta: dict | None) -> int:
+    if meta is None or not _is_minimal_creation_v1(meta):
+        return 0
+    value = meta.get(project_progress.PROGRESS_FLOOR_FIELD)
+    if not isinstance(value, int) or isinstance(value, bool):
+        return 0
+    return min(max(value, 0), 99)
+
+
+def _advance_project_progress_floor(meta: dict, current: dict | None) -> None:
+    if not _is_minimal_creation_v1(meta):
+        return
+    projection_input = dict(meta)
+    projection_input.pop(project_progress.PROGRESS_FLOOR_FIELD, None)
+    candidate = project_progress.aggregate_project_progress(
+        projection_input,
+        has_video=False,
+    )["percent"]
+    meta[project_progress.PROGRESS_FLOOR_FIELD] = max(
+        _stored_progress_floor(current),
+        min(candidate, 99),
+    )
+
+
 def _write_meta(cdir: Path, meta: dict) -> None:
+    current_path = cdir / "meta.json"
+    current = None
+    if current_path.is_file():
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        if (
+            _is_minimal_creation_v1(current)
+            and any(
+                meta.get(field) != current.get(field)
+                for field in _MINIMAL_CREATION_FROZEN_FIELDS
+            )
+        ):
+            raise ValueError("minimal creation inputs are immutable")
+    _advance_project_progress_floor(meta, current)
     payload = json.dumps(meta, ensure_ascii=False, indent=2)
     fd, temporary = tempfile.mkstemp(prefix=".meta-", suffix=".json", dir=cdir)
     try:
@@ -99,6 +194,54 @@ def _meta_lock(cdir: Path):
         lock = _META_LOCKS.setdefault(key, threading.Lock())
     with lock:
         yield
+
+
+@contextmanager
+def creation_lock(data_dir: Path):
+    """Serialize v1 idempotency lookup and publish across threads/processes."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = data_dir / ".minimal-creation.lock"
+    with _meta_lock(lock_path):
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT
+            | os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("minimal creation lock is not a regular file")
+            os.fsync(descriptor)
+            _fsync_directory(data_dir)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
+@contextmanager
+def staged_creation(data_dir: Path):
+    """Create a list-invisible v1 conversation and remove it unless published."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    cid = uuid.uuid4().hex
+    staging = Path(tempfile.mkdtemp(
+        prefix=f".{cid}.creation-", suffix=".staging", dir=data_dir
+    ))
+    try:
+        (staging / "work").mkdir()
+        (staging / "inputs").mkdir()
+        _fsync_directory(staging / "work")
+        _fsync_directory(staging / "inputs")
+        _fsync_directory(staging)
+        _fsync_directory(data_dir)
+        yield cid, staging
+    finally:
+        if os.path.lexists(staging):
+            shutil.rmtree(staging)
+            _fsync_directory(data_dir)
 
 
 def new_conversation(data_dir: Path, note: str, orig_name: str, client_request_id: str = "",
@@ -830,6 +973,476 @@ def list_conversations(data_dir: Path) -> list[dict]:
 def remove_conversation(data_dir: Path, cid: str) -> None:
     if _ID_RE.match(cid):
         shutil.rmtree(data_dir / cid, ignore_errors=True)
+
+
+def _creation_limit(max_bytes: int) -> int:
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or max_bytes < 0
+    ):
+        raise ValueError("max_bytes must be a non-negative integer")
+    return max_bytes
+
+
+async def _save_creation_upload(
+    destination: Path,
+    upload,
+    max_bytes: int,
+    *,
+    too_large_code: str,
+) -> FrozenCreationFile:
+    limit = _creation_limit(max_bytes)
+    digest = hashlib.sha256()
+    written = 0
+    created = False
+    descriptor = None
+    try:
+        descriptor = os.open(
+            destination,
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_WRONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        created = True
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            while chunk := await upload.read(_CHUNK):
+                written += len(chunk)
+                if written > limit:
+                    raise CreationStorageError(too_large_code, 413)
+                digest.update(chunk)
+                stream.write(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_directory(destination.parent)
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            destination.unlink(missing_ok=True)
+            _fsync_directory(destination.parent)
+        raise
+    return FrozenCreationFile(destination, digest.hexdigest(), written)
+
+
+async def save_creation_source(
+    staging: Path, upload, max_bytes: int,
+) -> FrozenCreationFile:
+    """Stream a v1 source upload to staging and return its byte receipt."""
+    ext = Path(upload.filename or "").suffix.lower()
+    if ext not in ALLOWED_EXT:
+        raise CreationStorageError("invalid_source_media", 422)
+    destination = staging / f"source{ext}"
+    return await _save_creation_upload(
+        destination,
+        upload,
+        max_bytes,
+        too_large_code="source_too_large",
+    )
+
+
+def freeze_creation_source_file(
+    path: Path, max_bytes: int,
+) -> FrozenCreationFile:
+    """Durably hash a source already streamed into staging (for URL input)."""
+    limit = _creation_limit(max_bytes)
+    if path.suffix.lower() not in ALLOWED_EXT or not path.is_file():
+        raise CreationStorageError("invalid_source_media", 422)
+    digest = hashlib.sha256()
+    written = 0
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        with os.fdopen(descriptor, "rb") as stream:
+            while chunk := stream.read(_CHUNK):
+                written += len(chunk)
+                if written > limit:
+                    raise CreationStorageError("source_too_large", 413)
+                digest.update(chunk)
+            os.fsync(stream.fileno())
+        _fsync_directory(path.parent)
+    except CreationStorageError:
+        path.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
+        raise
+    except OSError as exc:
+        raise CreationStorageError("invalid_source_media", 422) from exc
+    return FrozenCreationFile(path, digest.hexdigest(), written)
+
+
+_REPLACEMENT_MEDIA = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+
+
+def _replacement_media_type(path: Path) -> str:
+    with open(path, "rb") as stream:
+        header = stream.read(16)
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if (
+        len(header) >= 12
+        and header[:4] == b"RIFF"
+        and header[8:12] == b"WEBP"
+    ):
+        return "image/webp"
+    if (
+        header.startswith((b"GIF87a", b"GIF89a", b"BM", b"II*\x00", b"MM\x00*"))
+        or (len(header) >= 12 and header[4:8] == b"ftyp")
+    ):
+        raise CreationStorageError("unsupported_replacement_media_type", 415)
+    raise CreationStorageError("invalid_replacement_image", 422)
+
+
+def _validate_replacement_decode(path: Path) -> None:
+    import cv2
+    import numpy as np
+
+    image = cv2.imdecode(
+        np.frombuffer(path.read_bytes(), dtype=np.uint8),
+        cv2.IMREAD_UNCHANGED,
+    )
+    if (
+        image is None
+        or image.size == 0
+        or image.ndim < 2
+        or image.shape[0] <= 0
+        or image.shape[1] <= 0
+    ):
+        raise CreationStorageError("invalid_replacement_image", 422)
+
+
+async def save_creation_replacement_image(
+    staging: Path, upload, max_bytes: int,
+) -> FrozenCreationFile:
+    """Stream, identify, and actually decode a v1 replacement image.
+
+    The multipart media type is untrusted transport metadata.  Canonical type
+    and filename are derived only from the uploaded bytes.
+    """
+    inputs = staging / "inputs"
+    temporary = inputs / f".replacement-image-{uuid.uuid4().hex}.upload"
+    frozen = await _save_creation_upload(
+        temporary,
+        upload,
+        max_bytes,
+        too_large_code="replacement_image_too_large",
+    )
+    try:
+        actual_media_type = _replacement_media_type(temporary)
+        _validate_replacement_decode(temporary)
+        destination = inputs / (
+            "replacement_image" + _REPLACEMENT_MEDIA[actual_media_type]
+        )
+        os.replace(temporary, destination)
+        _fsync_directory(inputs)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        _fsync_directory(inputs)
+        raise
+    return FrozenCreationFile(
+        destination,
+        frozen.sha256,
+        frozen.bytes,
+        actual_media_type,
+    )
+
+
+def _canonical_creation_request(effective_request: dict) -> tuple[dict, str]:
+    if not isinstance(effective_request, dict):
+        raise TypeError("effective_request must be a dict")
+    payload = json.dumps(
+        effective_request,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return json.loads(payload), hashlib.sha256(payload).hexdigest()
+
+
+def _check_frozen_creation_file(
+    frozen: FrozenCreationFile,
+    *,
+    parent: Path,
+    replacement: bool,
+) -> None:
+    if not isinstance(frozen, FrozenCreationFile):
+        raise TypeError("creation input must be a FrozenCreationFile")
+    try:
+        relative = frozen.path.relative_to(parent)
+    except ValueError:
+        raise ValueError("creation input escaped staging") from None
+    if len(relative.parts) != 1 or not frozen.path.is_file():
+        raise ValueError("creation input is not a direct staged file")
+    if frozen.path.stat().st_size != frozen.bytes:
+        raise ValueError("creation input size changed after freezing")
+    if not re.fullmatch(r"[0-9a-f]{64}", frozen.sha256):
+        raise ValueError("creation input sha256 is invalid")
+    digest = hashlib.sha256()
+    descriptor = os.open(
+        frozen.path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    with os.fdopen(descriptor, "rb") as stream:
+        while chunk := stream.read(_CHUNK):
+            digest.update(chunk)
+    if digest.hexdigest() != frozen.sha256:
+        raise ValueError("creation input bytes changed after freezing")
+    if replacement:
+        expected = "replacement_image" + _REPLACEMENT_MEDIA.get(
+            frozen.media_type or "", ""
+        )
+        if (
+            frozen.path.name != expected
+            or frozen.media_type not in _REPLACEMENT_MEDIA
+        ):
+            raise ValueError("replacement image path is not canonical")
+    elif frozen.path.name != f"source{frozen.path.suffix.lower()}" or (
+        frozen.path.suffix.lower() not in ALLOWED_EXT
+    ):
+        raise ValueError("source path is not canonical")
+
+
+def _creation_input_snapshot(
+    cid: str,
+    *,
+    source: FrozenCreationFile,
+    source_filename: str | None,
+    source_reference_url: str | None,
+    replacement_image: FrozenCreationFile | None,
+    replacement_image_filename: str | None,
+) -> dict:
+    is_upload = source_filename is not None
+    is_link = source_reference_url is not None
+    if is_upload == is_link:
+        raise ValueError("creation source display must identify exactly one mode")
+    if is_link:
+        if (
+            not isinstance(source_reference_url, str)
+            or not source_reference_url
+            or source_reference_url != source_reference_url.strip()
+        ):
+            raise ValueError("creation source reference URL is invalid")
+        source_input = {
+            "mode": "link",
+            "reference_url": source_reference_url,
+        }
+    else:
+        source_input = {
+            "mode": "upload",
+            "filename": _creation_display_filename(
+                source_filename, source.path.name
+            ),
+            "bytes": source.bytes,
+        }
+
+    if replacement_image is None:
+        if replacement_image_filename is not None:
+            raise ValueError("replacement image display has no frozen file")
+        replacement_input = None
+    else:
+        media_type = replacement_image.media_type
+        if media_type not in _REPLACEMENT_MEDIA:
+            raise ValueError("replacement image media type is invalid")
+        replacement_input = {
+            "filename": _creation_display_filename(
+                replacement_image_filename, replacement_image.path.name
+            ),
+            "bytes": replacement_image.bytes,
+            "media_type": media_type,
+            "preview_url": CREATION_REPLACEMENT_PREVIEW_ROUTE.format(cid=cid),
+        }
+    return {
+        "version": 1,
+        "source": source_input,
+        "replacement_image": replacement_input,
+    }
+
+
+def publish_staged_creation(
+    data_dir: Path,
+    staging: Path,
+    cid: str,
+    *,
+    meta: dict,
+    effective_request: dict,
+    client_request_id: str,
+    source: FrozenCreationFile,
+    source_filename: str | None,
+    source_reference_url: str | None,
+    replacement_image: FrozenCreationFile | None = None,
+    replacement_image_filename: str | None = None,
+) -> dict:
+    """Freeze v1 metadata, then reveal the whole conversation with one rename.
+
+    Callers performing idempotency lookup should hold ``creation_lock`` across
+    their final lookup and this operation.
+    """
+    if not _ID_RE.fullmatch(cid):
+        raise ValueError("invalid conversation id")
+    if not isinstance(meta, dict):
+        raise TypeError("meta must be a dict")
+    if (
+        staging.parent.resolve() != data_dir.resolve()
+        or not staging.name.startswith(".")
+    ):
+        raise ValueError("invalid creation staging directory")
+    _check_frozen_creation_file(source, parent=staging, replacement=False)
+    if replacement_image is not None:
+        _check_frozen_creation_file(
+            replacement_image,
+            parent=staging / "inputs",
+            replacement=True,
+        )
+    frozen_request, request_sha256 = _canonical_creation_request(effective_request)
+    receipt = {
+        "version": 1,
+        "client_request_id": client_request_id,
+        "generation_request_sha256": request_sha256,
+        "source": {"sha256": source.sha256, "bytes": source.bytes},
+        "replacement_image": (
+            None
+            if replacement_image is None
+            else {
+                "sha256": replacement_image.sha256,
+                "bytes": replacement_image.bytes,
+            }
+        ),
+    }
+    creation_input = _creation_input_snapshot(
+        cid,
+        source=source,
+        source_filename=source_filename,
+        source_reference_url=source_reference_url,
+        replacement_image=replacement_image,
+        replacement_image_filename=replacement_image_filename,
+    )
+    frozen_meta = dict(meta)
+    if frozen_meta.get("id") not in (None, cid):
+        raise ValueError("meta id does not match conversation id")
+    frozen_meta.update(
+        id=cid,
+        client_request_id=client_request_id,
+        effective_request=frozen_request,
+        input_receipt=receipt,
+        creation_input=creation_input,
+    )
+    if replacement_image is None:
+        frozen_meta.pop("_minimal_replacement_image_path", None)
+    else:
+        frozen_meta["_minimal_replacement_image_path"] = (
+            replacement_image.path.relative_to(staging).as_posix()
+        )
+    generation_options = frozen_meta.get("generation_config")
+    if generation_options is not None:
+        generation_receipt = generation_config_contract.receipt(
+            generation_options
+        )
+        frozen_meta["generation_config_sha256"] = generation_receipt[
+            "generation_config_sha256"
+        ]
+        _write_receipt(
+            staging / "work" / generation_config_contract.RECEIPT_FILENAME,
+            generation_receipt,
+        )
+    final = data_dir / cid
+    if os.path.lexists(final):
+        raise CreationStorageError("creation_id_conflict", 409)
+    _write_meta(staging, frozen_meta)
+    if os.path.lexists(final):
+        raise CreationStorageError("creation_id_conflict", 409)
+    try:
+        os.rename(staging, final)
+    except FileExistsError:
+        raise CreationStorageError("creation_id_conflict", 409) from None
+    except OSError as exc:
+        if os.path.lexists(final):
+            raise CreationStorageError("creation_id_conflict", 409) from None
+        raise exc
+    _fsync_directory(data_dir)
+    return frozen_meta
+
+
+def resolve_creation_replacement_image(
+    data_dir: Path, cid: str,
+) -> FrozenCreationFile | None:
+    """Project the fixed persisted replacement-image path for GET preview."""
+    if not _ID_RE.fullmatch(cid):
+        return None
+    try:
+        data_root = data_dir.resolve()
+        unresolved_cdir = data_root / cid
+        cdir = unresolved_cdir.resolve(strict=True)
+        if (
+            cdir != unresolved_cdir
+            or not cdir.is_relative_to(data_root)
+            or not cdir.is_dir()
+        ):
+            return None
+        meta = _load_meta_unlocked(data_root, cid)
+    except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+
+    relative_path = meta.get("_minimal_replacement_image_path")
+    media_type = next((
+        candidate_media_type
+        for candidate_media_type, suffix in _REPLACEMENT_MEDIA.items()
+        if relative_path == f"inputs/replacement_image{suffix}"
+    ), None)
+    if media_type is None:
+        return None
+
+    candidate = cdir / relative_path
+    try:
+        resolved = candidate.resolve(strict=True)
+        file_stat = resolved.stat()
+        if (
+            resolved != candidate
+            or not resolved.is_relative_to(cdir)
+            or not stat.S_ISREG(file_stat.st_mode)
+        ):
+            return None
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+    receipt = meta.get("input_receipt")
+    if isinstance(receipt, dict):
+        receipt = receipt.get("replacement_image")
+    receipt_sha256 = receipt.get("sha256") if isinstance(receipt, dict) else None
+    if not isinstance(receipt_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", receipt_sha256
+    ):
+        receipt_sha256 = ""
+    receipt_bytes = receipt.get("bytes") if isinstance(receipt, dict) else None
+    if (
+        isinstance(receipt_bytes, bool)
+        or not isinstance(receipt_bytes, int)
+        or receipt_bytes < 0
+    ):
+        receipt_bytes = file_stat.st_size
+    return FrozenCreationFile(
+        resolved,
+        receipt_sha256,
+        receipt_bytes,
+        media_type,
+    )
 
 
 async def save_upload(cdir: Path, upload, max_bytes: int) -> Path:

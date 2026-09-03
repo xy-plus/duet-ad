@@ -5,7 +5,7 @@ import pytest
 
 from conftest import AUTH, make_settings
 
-from app import postprocess, storage
+from app import frame_fit, long_generation, postprocess, storage
 from app.main import create_app
 
 
@@ -29,34 +29,108 @@ def _conversation(settings) -> tuple[str, dict]:
     return created["id"], storage.load_meta(settings.data_dir, created["id"])
 
 
-def test_detail_projects_only_fixed_image_acceptance_shape(tmp_path, monkeypatch):
+def test_detail_projects_persisted_image_acceptance_without_strict_validation(
+    tmp_path, monkeypatch,
+):
     settings = make_settings(tmp_path)
-    cid, expected_meta = _conversation(settings)
-    calls = []
+    calls: list[str] = []
 
-    def status(received_settings, received_cid, received_meta):
-        calls.append((received_settings, received_cid, received_meta))
+    def strict_acceptance(*_args, **_kwargs):
+        calls.append("image_acceptance_status")
         return {
-            "required": True,
+            "required": False,
             "accepted": False,
-            "expected_meta_sha256": "a" * 64,
-            "private_receipt_path": "must-not-leak.json",
+            "expected_meta_sha256": None,
         }
 
+    def freeze_plan(*_args, **_kwargs):
+        calls.append("freeze_plan")
+        return type("FrozenPlan", (), {"segments": ()})()
+
+    def frame_fit_call(*_args, **_kwargs):
+        calls.append("frame_fit")
+        return False
+
+    monkeypatch.setattr(postprocess, "image_acceptance_status", strict_acceptance)
+    monkeypatch.setattr(long_generation, "plan_receipt", lambda *_args: "frozen-plan")
+    monkeypatch.setattr(long_generation, "freeze_plan", freeze_plan)
     monkeypatch.setattr(
-        postprocess, "image_acceptance_status", status, raising=False
+        frame_fit, "frame_bytes_require_fit", frame_fit_call
     )
+    monkeypatch.setattr(frame_fit, "frames_require_fit", frame_fit_call)
+    monkeypatch.setattr(frame_fit, "fit_frames", frame_fit_call)
 
     with TestClient(create_app(settings)) as client:
+        cid, _meta = _conversation(settings)
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            postprocess={"status": "done"},
+            # The detail view is deliberately a persisted-state projection.
+            # Even an opaque historical dict must not trigger artifact reads.
+            _image_user_acceptance={},
+        )
+        expected_meta = storage.load_meta(settings.data_dir, cid)
         response = client.get(f"/api/conversations/{cid}", headers=AUTH)
 
     assert response.status_code == 200
     assert response.json()["image_acceptance"] == {
         "required": True,
-        "accepted": False,
-        "expected_meta_sha256": "a" * 64,
+        "accepted": True,
+        "expected_meta_sha256": postprocess._image_acceptance_meta_sha256(
+            expected_meta
+        ),
     }
-    assert calls == [(settings, cid, expected_meta)]
+    assert calls == []
+
+
+def test_list_projects_persisted_summary_without_detail_validation(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("list reads must not enter detail validation")
+
+    monkeypatch.setattr(postprocess, "image_acceptance_status", forbidden)
+    monkeypatch.setattr(long_generation, "plan_receipt", forbidden)
+    monkeypatch.setattr(long_generation, "freeze_plan", forbidden)
+    monkeypatch.setattr(frame_fit, "frame_bytes_require_fit", forbidden)
+    monkeypatch.setattr(frame_fit, "frames_require_fit", forbidden)
+    monkeypatch.setattr(frame_fit, "fit_frames", forbidden)
+
+    with TestClient(create_app(settings)) as client:
+        cid, _meta = _conversation(settings)
+        thumbnail_path = "segments/1/work/anchors/persisted-first.png"
+        persisted = storage.update_meta(
+            settings.data_dir,
+            cid,
+            duration_s=37.25,
+            segments=[
+                {"index": 1, "first_frame_path": thumbnail_path},
+                {
+                    "index": 2,
+                    "first_frame_path": (
+                        "segments/2/work/anchors/persisted-first.png"
+                    ),
+                },
+            ],
+        )
+        response = client.get("/api/conversations", headers=AUTH)
+
+    assert response.status_code == 200
+    summaries = {item["id"]: item for item in response.json()}
+    assert {
+        key: summaries[cid][key]
+        for key in (
+            "updated_at", "duration_s", "segment_count", "thumbnail_path"
+        )
+    } == {
+        "updated_at": persisted["updated_at"],
+        "duration_s": 37.25,
+        "segment_count": 2,
+        "thumbnail_path": thumbnail_path,
+    }
 
 
 def test_accept_images_forwards_exact_payload_and_returns_same_operation(

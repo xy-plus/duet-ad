@@ -5,9 +5,23 @@
 
 /* ===== 常量与状态 ===== */
 const TOKEN_KEY = "cvs_token";
+const COMPOSER_SNAPSHOTS_KEY = "cvs_minimal_creation_snapshots_v1";
+const SELECTED_PROJECT_KEY = "cvs_selected_project_v1";
 const POLL_MS = 2000;
 const GENERATION_ASPECT_RATIOS = Object.freeze(["16:9", "9:16"]);
 const GENERATION_RESOLUTIONS = Object.freeze(["480p", "768p"]);
+const MINIMAL_CREATION_VERSION = 1;
+const TARGET_LANGUAGE_MAX_CHARS = 80;
+const SAME_AS_SOURCE_LANGUAGE = "与原视频相同";
+const SOURCE_URL_PLACEHOLDER = "粘贴 http(s) 视频直链或视频页链接";
+const MINIMAL_PROCESSING_DEFAULTS = Object.freeze({
+  optimize_image: true,
+  remove_subtitle: true,
+  remove_logo: true,
+});
+const REPLACEMENT_IMAGE_TYPES = Object.freeze([
+  "image/jpeg", "image/png", "image/webp",
+]);
 const GENERATION_CONFIG_KEYS = Object.freeze([
   "optimize_image", "remove_subtitle", "remove_watermark",
 ]);
@@ -19,10 +33,15 @@ const STATUS_TEXT = { queued: "排队中", processing: "处理中", done: "已�
 
 const state = {
   token: null,
+  authEpoch: 0,       // 同一口令重新登录也必须使旧异步请求失效
   conversations: [],
   currentId: null,
+  pendingRestoreId: null,
   detail: null,        // 当前会话详情
   file: null,          // composer 已选文件
+  replacementImage: null,
+  replacementPreviewURL: null,
+  replacementPreviewOwnerId: null,
   clientRequestId: null, // 幂等键：内容变更/成功才轮换，失败重试复用
   uploading: false,
   pollTimer: null,
@@ -35,7 +54,7 @@ const state = {
   segmentProductsExpanded: {}, // cid → 分段产物是否由用户展开；轮询重渲染时保留，切会话重置
   generationDrafts: {}, // cid → 最终视频表单草稿；轮询重渲染时保留用户输入
   generationSubmitting: {}, // cid → true：本页已有 /submit 请求在途，阻止重复提交
-  historyDetails: {}, // cid → 近期会话的 GET 详情；只用于补齐历史识别信息
+  historyDetails: {}, // cid → 用户显式选中过的会话详情；不为侧栏批量加载
   historyThumbnailURLs: {}, // cid → 侧栏首帧 ObjectURL，与 stream 媒体生命周期隔离
   historyHydrating: false, // 受限并发补齐进行中，避免重复 GET 风暴
   generationConfigCapability: null, // 仅接受 /api/capabilities 的精确 generation_config 合同
@@ -43,6 +62,11 @@ const state = {
   dialogueReviewCapability: null,
   dialogueReviewCapabilityLoaded: false,
   dialogueReviewDrafts: {}, // cid → 本地校对稿；轮询保留，服务端 revision 变化时重置
+  minimalCreationCapability: null,
+  minimalCreationCapabilityLoaded: false,
+  composerDrafts: {}, // cid → 本页提交的可序列化创建输入
+  viewingSubmittedConfig: false, // 当前配置属于既有项目，仅展示；新建项目后才允许再次提交
+  submittedReplacement: null, // 当前展示的是已提交参考图元数据，而非可再次提交的 File
   frameSelections: {}, // cid:scope → 选中的 segment/frame；轮询和展开切换时保留
   framePickerOpen: {}, // cid:scope → 图片下拉是否展开
   promptDraft: null,   // 当前图片优化提示词草稿；跨轮询保留，跨操作由统一守卫处理
@@ -193,6 +217,285 @@ function postprocessAskDefault() {
 function hasExactKeys(value, keys) {
   return !!value && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).sort().join("|") === keys.slice().sort().join("|");
+}
+
+function normalizeMinimalCreationCapability(payload) {
+  const capability = payload && payload.minimal_creation;
+  const dialogue = capability && capability.dialogue;
+  const replacement = capability && capability.replacement;
+  const defaults = capability && capability.defaults;
+  if (!capability || capability.supported !== true
+      || capability.version !== MINIMAL_CREATION_VERSION
+      || capability.endpoint !== "/api/conversations"
+      || capability.encoding !== "multipart/form-data"
+      || capability.request_field !== "generation_request"
+      || capability.replacement_image_field !== "replacement_image"
+      || !Array.isArray(capability.aspect_ratios)
+      || capability.aspect_ratios.join("|") !== GENERATION_ASPECT_RATIOS.join("|")
+      || !Array.isArray(capability.resolutions)
+      || capability.resolutions.join("|") !== GENERATION_RESOLUTIONS.join("|")
+      || !hasExactKeys(defaults, ["fit_mode", "optimize_image", "remove_subtitle", "remove_logo"])
+      || defaults.fit_mode !== "auto"
+      || defaults.optimize_image !== true
+      || defaults.remove_subtitle !== true
+      || defaults.remove_logo !== true
+      || !hasExactKeys(dialogue, ["mode", "translation"])
+      || dialogue.mode !== "auto_rewrite"
+      || dialogue.translation !== true
+      || !replacement || replacement.supported !== true
+      || !Array.isArray(replacement.accept)
+      || replacement.accept.join("|") !== REPLACEMENT_IMAGE_TYPES.join("|")
+      || !Number.isInteger(replacement.max_bytes) || replacement.max_bytes < 1
+      || !Number.isInteger(replacement.max_instruction_chars)
+      || replacement.max_instruction_chars < 1) return null;
+  return {
+    endpoint: capability.endpoint,
+    request_field: capability.request_field,
+    replacement_image_field: capability.replacement_image_field,
+    aspect_ratios: capability.aspect_ratios.slice(),
+    resolutions: capability.resolutions.slice(),
+    dialogue: {
+      mode: dialogue.mode,
+      translation: dialogue.translation,
+    },
+    replacement: {
+      accept: replacement.accept.slice(),
+      max_bytes: replacement.max_bytes,
+      max_instruction_chars: replacement.max_instruction_chars,
+    },
+  };
+}
+
+function buildMinimalGenerationRequest(input, capability) {
+  const normalized = normalizeMinimalCreationCapability({ minimal_creation: capability });
+  if (!normalized) throw new Error("生成服务尚未支持当前创建方式");
+  const aspectRatio = String(input && input.aspectRatio || "");
+  const resolution = String(input && input.resolution || "");
+  const targetLanguage = String(input && input.targetLanguage || "").trim();
+  const hasReplacementImage = !!(input && input.hasReplacementImage);
+  const replacementInstruction = String(input && input.replacementInstruction || "").trim();
+  if (!normalized.aspect_ratios.includes(aspectRatio)) throw new Error("请选择画幅");
+  if (!normalized.resolutions.includes(resolution)) throw new Error("请选择清晰度");
+  if (!targetLanguage) throw new Error("请填写目标语言");
+  if (targetLanguage.length > TARGET_LANGUAGE_MAX_CHARS) throw new Error("目标语言超过长度限制");
+  if (hasReplacementImage !== !!replacementInstruction) {
+    throw new Error("参考图与替换说明需要一起提供");
+  }
+  if (replacementInstruction.length > normalized.replacement.max_instruction_chars) {
+    throw new Error("替换说明内容过长");
+  }
+  return {
+    version: MINIMAL_CREATION_VERSION,
+    output: {
+      aspect_ratio: aspectRatio,
+      resolution,
+      fit_mode: "auto",
+    },
+    processing: Object.assign({}, MINIMAL_PROCESSING_DEFAULTS),
+    dialogue: {
+      mode: "auto_rewrite",
+      target_language: targetLanguage,
+    },
+    replacement_guidance: hasReplacementImage ? {
+      instruction: replacementInstruction,
+      image_field: normalized.replacement_image_field,
+    } : null,
+  };
+}
+
+function creationInputSnapshot({ file = null, url = "", replacementImage = null } = {}) {
+  const source = file ? {
+    mode: "upload",
+    filename: String(file.name || "原视频"),
+    bytes: Number.isFinite(file.size) ? file.size : null,
+  } : {
+    mode: "link",
+    reference_url: String(url || ""),
+  };
+  return {
+    version: 1,
+    source,
+    replacement_image: replacementImage ? {
+      filename: String(replacementImage.name || "参考图"),
+      bytes: Number.isFinite(replacementImage.size) ? replacementImage.size : null,
+      media_type: String(replacementImage.type || ""),
+    } : null,
+  };
+}
+
+function normalizeCreationInputSnapshot(value, { allowLocalPreview = false } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.version !== MINIMAL_CREATION_VERSION
+      || !Object.prototype.hasOwnProperty.call(value, "source")
+      || !Object.prototype.hasOwnProperty.call(value, "replacement_image")) return null;
+  const rawSource = value.source;
+  let source = null;
+  if (rawSource && typeof rawSource === "object" && !Array.isArray(rawSource)
+      && rawSource.mode === "link") {
+    if (rawSource.reference_url === null) {
+      source = { mode: "link", reference_url: null };
+    } else if (typeof rawSource.reference_url === "string" && rawSource.reference_url.trim()) {
+      source = { mode: "link", reference_url: rawSource.reference_url.trim() };
+    } else {
+      return null;
+    }
+  } else if (rawSource && rawSource.mode === "upload"
+      && typeof rawSource.filename === "string" && rawSource.filename.trim()
+      && Number.isInteger(rawSource.bytes) && rawSource.bytes >= 0) {
+    source = {
+      mode: "upload",
+      filename: rawSource.filename.trim(),
+      bytes: rawSource.bytes,
+    };
+  } else {
+    return null;
+  }
+  const rawReplacement = value.replacement_image;
+  let replacementImage = null;
+  if (rawReplacement !== null) {
+    const previewURL = rawReplacement && rawReplacement.preview_url;
+    if (!rawReplacement || typeof rawReplacement !== "object" || Array.isArray(rawReplacement)
+        || typeof rawReplacement.filename !== "string" || !rawReplacement.filename.trim()
+        || !Number.isInteger(rawReplacement.bytes) || rawReplacement.bytes < 0
+        || (allowLocalPreview
+          ? typeof rawReplacement.media_type !== "string"
+            || (!!rawReplacement.media_type
+              && !REPLACEMENT_IMAGE_TYPES.includes(rawReplacement.media_type))
+          : !REPLACEMENT_IMAGE_TYPES.includes(rawReplacement.media_type))
+        || (allowLocalPreview
+          ? previewURL !== undefined && typeof previewURL !== "string"
+          : typeof previewURL !== "string" || !previewURL.trim())) return null;
+    replacementImage = {
+      filename: rawReplacement.filename.trim(),
+      bytes: rawReplacement.bytes,
+      media_type: rawReplacement.media_type,
+      preview_url: typeof previewURL === "string" ? previewURL.trim() : "",
+    };
+  }
+  return { version: MINIMAL_CREATION_VERSION, source, replacement_image: replacementImage };
+}
+
+function resolveCreationInputSnapshot(response, localInput = null) {
+  if (response && typeof response === "object"
+      && Object.prototype.hasOwnProperty.call(response, "creation_input")) {
+    return normalizeCreationInputSnapshot(response.creation_input);
+  }
+  return normalizeCreationInputSnapshot(localInput, { allowLocalPreview: true });
+}
+
+function storedComposerDraft(conversationId) {
+  if (!conversationId || typeof sessionStorage === "undefined") return null;
+  try {
+    const all = JSON.parse(sessionStorage.getItem(COMPOSER_SNAPSHOTS_KEY) || "{}");
+    const record = all && typeof all === "object" ? all[conversationId] : null;
+    return record && typeof record === "object" ? record : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function storedSelectedProjectId() {
+  if (typeof sessionStorage === "undefined") return null;
+  try {
+    const value = sessionStorage.getItem(SELECTED_PROJECT_KEY);
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function rememberSelectedProjectId(conversationId) {
+  if (!conversationId || typeof sessionStorage === "undefined") return;
+  try {
+    sessionStorage.setItem(SELECTED_PROJECT_KEY, conversationId);
+  } catch (_error) {
+    // 浏览器禁用会话存储时，仅失去刷新后恢复当前项目的能力。
+  }
+}
+
+function clearSelectedProjectId() {
+  state.pendingRestoreId = null;
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    sessionStorage.removeItem(SELECTED_PROJECT_KEY);
+  } catch (_error) {
+    // 无法访问会话存储时，内存状态仍会回到新建项目。
+  }
+}
+
+function rememberSubmittedComposer(conversationId, request, inputs, response = null) {
+  if (!conversationId) return;
+  const input = resolveCreationInputSnapshot(response, creationInputSnapshot(inputs));
+  const record = { request, input };
+  state.composerDrafts[conversationId] = record;
+  if (input && input.replacement_image && state.replacementPreviewURL) {
+    state.replacementPreviewOwnerId = conversationId;
+  }
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    const all = JSON.parse(sessionStorage.getItem(COMPOSER_SNAPSHOTS_KEY) || "{}");
+    const snapshots = all && typeof all === "object" ? all : {};
+    snapshots[conversationId] = { request, input };
+    sessionStorage.setItem(COMPOSER_SNAPSHOTS_KEY, JSON.stringify(snapshots));
+  } catch (_error) {
+    // 浏览器禁用会话存储时，服务端 effective_request 仍可恢复标量配置。
+  }
+}
+
+function clearComposerSnapshots() {
+  state.composerDrafts = {};
+  state.viewingSubmittedConfig = false;
+  state.file = null;
+  state.replacementImage = null;
+  state.submittedReplacement = null;
+  if (state.replacementPreviewURL) URL.revokeObjectURL(state.replacementPreviewURL);
+  state.replacementPreviewURL = null;
+  state.replacementPreviewOwnerId = null;
+  clearSelectedProjectId();
+  if (typeof sessionStorage !== "undefined") {
+    try {
+      sessionStorage.removeItem(COMPOSER_SNAPSHOTS_KEY);
+    } catch (_error) {
+      // 显式退出时尽力清理；浏览器拒绝存储访问不影响退出。
+    }
+  }
+}
+
+function projectComposerModel(detail, localDraft = null) {
+  const value = detail && typeof detail === "object" ? detail : {};
+  const serverRequest = value.effective_request;
+  const fallbackRequest = localDraft && localDraft.request;
+  const request = serverRequest && serverRequest.version === MINIMAL_CREATION_VERSION
+    ? serverRequest
+    : fallbackRequest && fallbackRequest.version === MINIMAL_CREATION_VERSION
+      ? fallbackRequest : null;
+  const output = request && request.output;
+  const dialogue = request && request.dialogue;
+  if (!request || !output || !dialogue
+      || !GENERATION_ASPECT_RATIOS.includes(output.aspect_ratio)
+      || !GENERATION_RESOLUTIONS.includes(output.resolution)
+      || typeof dialogue.target_language !== "string"
+      || !dialogue.target_language.trim()) return null;
+  const input = resolveCreationInputSnapshot(value, localDraft && localDraft.input);
+  const guidance = request.replacement_guidance;
+  const receiptReplacement = value.input_receipt
+    && value.input_receipt.replacement_image;
+  const replacementUsed = !!guidance || !!receiptReplacement;
+  return {
+    aspectRatio: output.aspect_ratio,
+    resolution: output.resolution,
+    languageMode: dialogue.target_language.trim() === SAME_AS_SOURCE_LANGUAGE
+      ? "same" : "other",
+    targetLanguage: dialogue.target_language.trim() === SAME_AS_SOURCE_LANGUAGE
+      ? "" : dialogue.target_language.trim(),
+    replacementInstruction: guidance && typeof guidance.instruction === "string"
+      ? guidance.instruction : "",
+    source: input && input.source,
+    replacementImage: input && input.replacement_image
+      ? input.replacement_image
+      : replacementUsed ? { filename: "已提交参考图", bytes: null, media_type: "", preview_url: "" }
+        : null,
+  };
 }
 
 function validGenerationConfig(value) {
@@ -721,6 +1024,14 @@ function formatElapsed(createdAt, endAt, nowMs = Date.now()) {
   return `已耗时 ${seconds}秒`;
 }
 
+function formatProjectTimestamp(iso) {
+  const value = new Date(iso);
+  if (Number.isNaN(value.getTime())) return "未知";
+  const pad = (part) => String(part).padStart(2, "0");
+  return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} `
+    + `${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+}
+
 function totalKeyframes(detail) {
   const segments = Array.isArray(detail && detail.segments) ? detail.segments : [];
   if (segments.length > 0) {
@@ -762,6 +1073,76 @@ function diagnosticText(raw) {
 
 function stageState(status, detail = "", count = "") {
   return { status, detail, count };
+}
+
+function projectPhaseLabel(detail) {
+  const value = detail || {};
+  const progress = value.project_progress || {};
+  const generation = value.generation;
+  const stage = generation && generation.stage;
+  if (progress.status === "succeeded" || value.has_video === true) {
+    return "AI 正在生成视频";
+  }
+  if (["h3", "stitch", "stitching"].includes(stage)) {
+    return "AI 正在生成视频";
+  }
+  if (["context_ir", "context_ir_native"].includes(stage)) {
+    return "AI 正在思考创意";
+  }
+  if (generation && typeof generation === "object") {
+    return "AI 正在生成视频";
+  }
+  const fusionStatus = value.prompt_fusion && value.prompt_fusion.status;
+  if (["running", "done", "failed"].includes(fusionStatus)) {
+    return "AI 正在思考创意";
+  }
+  const postprocessStatus = value.postprocess && value.postprocess.status;
+  if (["queued", "running", "done", "failed"].includes(postprocessStatus)) {
+    return "AI 正在思考创意";
+  }
+  const analysisStatus = value.analysis_status || value.status;
+  return analysisStatus === "done" ? "AI 正在思考创意" : "AI 正在理解视频";
+}
+
+function projectProgressModel(detail, nowMs = Date.now()) {
+  const value = detail || {};
+  const authoritative = value.project_progress;
+  const allowedStates = ["queued", "running", "succeeded", "failed"];
+  const coherentProgress = authoritative && (
+    (authoritative.status === "queued" && authoritative.percent === 0)
+    || (authoritative.status === "running" && authoritative.percent >= 1 && authoritative.percent <= 99)
+    || (authoritative.status === "succeeded" && authoritative.percent === 100)
+    || (authoritative.status === "failed" && authoritative.percent >= 0 && authoritative.percent <= 99)
+  );
+  const progress = authoritative && Number.isInteger(authoritative.percent)
+      && authoritative.percent >= 0 && authoritative.percent <= 100
+      && allowedStates.includes(authoritative.status) && coherentProgress
+    ? {
+      title: String(value.title || "未命名项目"),
+      percent: authoritative.percent,
+      state: authoritative.status,
+    }
+    : {
+      title: String(value.title || "未命名项目"),
+      percent: 0,
+      state: "failed",
+    };
+
+  const terminal = ["succeeded", "failed"].includes(progress.state);
+  const elapsed = terminal && !value.updated_at
+    ? "未知"
+    : formatElapsed(value.created_at, terminal ? value.updated_at : null, nowMs)
+      .replace(/^已耗时\s*/, "");
+  return {
+    ...progress,
+    startedAt: formatProjectTimestamp(value.created_at),
+    elapsedLabel: terminal ? "总耗时" : "当前耗时",
+    elapsed,
+    phase: progress.state === "succeeded" ? "视频生成完成"
+      : progress.state === "failed" ? "视频生成未完成"
+        : projectPhaseLabel(value),
+    loading: !terminal,
+  };
 }
 
 function operationTimeline(detail, nowMs = Date.now()) {
@@ -1023,42 +1404,37 @@ function hideOperationHeader() {
 
 function renderOperationHeader(detail) {
   const host = $("operation-status");
-  const model = operationTimeline(detail);
+  const model = projectProgressModel(detail);
   host.textContent = "";
   host.hidden = false;
-  host.dataset.status = model.current.status;
+  host.dataset.status = model.state;
 
-  const summary = el("div", "operation-summary");
-  const identity = el("div", "operation-identity");
-  identity.appendChild(el("span", "operation-kicker", `项目 #${shortId(model.operationId)}`));
-  const title = el("strong", "operation-current", model.current.label + " · " + stageStatusText(model.current.status));
-  title.setAttribute("aria-label", `当前阶段：${model.current.label}，${stageStatusText(model.current.status)}`);
-  identity.appendChild(title);
-  if (model.current.count) identity.appendChild(el("span", "operation-count", model.current.count));
-  summary.appendChild(identity);
+  const header = el("div", "project-progress-header");
+  const fields = el("div", "project-progress-fields");
+  const project = el("span", "project-progress-field project-progress-project");
+  project.appendChild(el("span", "project-progress-label", "项目"));
+  project.appendChild(el("strong", "project-progress-title", model.title));
+  fields.appendChild(project);
+  const started = el("span", "project-progress-field");
+  started.appendChild(el("span", "project-progress-label", "发起时间"));
+  started.appendChild(el("span", "project-progress-time", model.startedAt));
+  fields.appendChild(started);
+  const elapsed = el("span", "project-progress-field");
+  elapsed.appendChild(el("span", "project-progress-label", model.elapsedLabel));
+  elapsed.appendChild(el("span", "project-progress-time", model.elapsed));
+  fields.appendChild(elapsed);
+  header.appendChild(fields);
+  host.appendChild(header);
 
-  const meta = el("div", "operation-meta");
-  meta.appendChild(el("span", null, model.elapsed));
-  meta.appendChild(el("span", null, model.updated ? "服务器更新 " + model.updated : "更新时间未知"));
-  summary.appendChild(meta);
-  host.appendChild(summary);
-
-  const currentDetail = el("p", "operation-current-detail", model.current.detail);
-  host.appendChild(currentDetail);
-
-  const timeline = el("ol", "operation-timeline");
-  for (const stage of model.stages) {
-    const item = el("li", `operation-stage status-${stage.status}`);
-    if (stage.key === model.current.key) item.setAttribute("aria-current", "step");
-    const marker = el("span", "operation-stage-marker", stage.status === "done" ? "✓" : "");
-    marker.setAttribute("aria-hidden", "true");
-    item.appendChild(marker);
-    item.appendChild(el("span", "operation-stage-label", stage.label));
-    item.appendChild(el("span", "operation-stage-state", stage.count || stageStatusText(stage.status)));
-    item.title = stage.detail;
-    timeline.appendChild(item);
+  const phase = el("div", "project-phase");
+  phase.setAttribute("role", "status");
+  if (model.loading) {
+    const spinner = el("span", "project-phase-spinner");
+    spinner.setAttribute("aria-hidden", "true");
+    phase.appendChild(spinner);
   }
-  host.appendChild(timeline);
+  phase.appendChild(el("span", "project-phase-label", model.phase));
+  host.appendChild(phase);
 }
 
 function trackURL(url) {
@@ -1140,6 +1516,8 @@ function showLogin(message) {
   state.generationConfigCapabilityLoaded = false;
   state.dialogueReviewCapability = null;
   state.dialogueReviewCapabilityLoaded = false;
+  state.minimalCreationCapability = null;
+  state.minimalCreationCapabilityLoaded = false;
   $("app-view").hidden = true;
   $("login-view").hidden = false;
   const errEl = $("login-error");
@@ -1154,8 +1532,12 @@ function showLogin(message) {
 }
 
 function sessionExpired() {
+  state.authEpoch += 1;
   state.token = null;
   localStorage.removeItem(TOKEN_KEY);
+  clearComposerSnapshots();
+  resetComposerForNewProject();
+  clearStream();
   showLogin("登录状态已失效，请重新输入口令");
 }
 
@@ -1181,6 +1563,7 @@ async function doLogin(token) {
       errEl.hidden = false;
       return;
     }
+    state.authEpoch += 1;
     state.token = token;
     localStorage.setItem(TOKEN_KEY, token);
     enterApp();
@@ -1198,14 +1581,16 @@ function enterApp() {
   $("app-view").hidden = false;
   state.currentId = null;
   state.detail = null;
+  state.pendingRestoreId = storedSelectedProjectId();
+  resetComposerForNewProject();
   resetGenerationConfigDisclosure();
   renderEmptyHero();
-  void loadGenerationConfigCapability();
-  refreshList(true);
+  void loadMinimalCreationCapability();
+  refreshList(false);
 }
 
 /* ===== 侧栏会话列表 ===== */
-async function refreshList(autoSelect) {
+async function refreshList() {
   try {
     const list = await apiJSON("/api/conversations");
     state.conversations = mergeConversationList(
@@ -1214,8 +1599,13 @@ async function refreshList(autoSelect) {
     );
     releaseHistoryThumbnails(new Set(state.conversations.map((item) => item.id)));
     renderList();
-    if (autoSelect && state.conversations.length > 0 && !state.currentId) {
-      selectConversation(state.conversations[0].id);
+    const restoreId = state.pendingRestoreId;
+    state.pendingRestoreId = null;
+    if (restoreId && !state.currentId
+        && state.conversations.some((item) => item.id === restoreId)) {
+      selectConversation(restoreId);
+    } else if (restoreId) {
+      clearSelectedProjectId();
     }
     void hydrateConversationSummaries();
   } catch (err) {
@@ -1241,7 +1631,8 @@ function mergeConversationList(incoming, previous) {
     const merged = Object.assign({}, item);
     for (const field of [
       "generation", "navigation_status", "duration_s", "updated_at", "segment_count",
-      "skill_milestone", "thumbnail_path", "prompt_fusion", "postprocess", "_hydrated",
+      "skill_milestone", "thumbnail_path", "prompt_fusion", "postprocess",
+      "project_progress", "error",
     ]) {
       if (!Object.prototype.hasOwnProperty.call(item, field)
           && Object.prototype.hasOwnProperty.call(known, field)) {
@@ -1257,6 +1648,8 @@ function syncConversationDetail(conversations, detail) {
   if (!summary) return false;
   summary.status = detail.status;
   summary.has_video = detail.has_video === true;
+  summary.project_progress = detail.project_progress || null;
+  summary.error = detail.error || null;
   summary.generation = detail.generation || null;
   summary.duration_s = detail.duration_s;
   summary.updated_at = detail.updated_at;
@@ -1265,7 +1658,6 @@ function syncConversationDetail(conversations, detail) {
   summary.prompt_fusion = detail.prompt_fusion || null;
   summary.postprocess = detail.postprocess || null;
   summary.thumbnail_path = conversationThumbnailPath(detail);
-  summary._hydrated = true;
   state.historyDetails[detail.id] = detail;
   if (Object.prototype.hasOwnProperty.call(detail, "navigation_status")) {
     summary.navigation_status = detail.navigation_status;
@@ -1292,7 +1684,8 @@ async function loadHistoryThumbnail(summary) {
 
 async function hydrateConversationSummaries() {
   if (state.historyHydrating || !state.token) return;
-  const pending = state.conversations.filter((item) => item && item.id && item._hydrated !== true).slice(0, 24);
+  const pending = state.conversations.filter((item) => item && item.id
+    && item.thumbnail_path && !state.historyThumbnailURLs[item.id]);
   if (pending.length === 0) return;
   state.historyHydrating = true;
   let cursor = 0;
@@ -1300,13 +1693,9 @@ async function hydrateConversationSummaries() {
     while (cursor < pending.length) {
       const summary = pending[cursor++];
       try {
-        const detail = await apiJSON("/api/conversations/" + encodeURIComponent(summary.id));
-        if (syncConversationDetail(state.conversations, detail)) {
-          await loadHistoryThumbnail(summary);
-        }
+        await loadHistoryThumbnail(summary);
       } catch (error) {
         if (handleAuthError(error)) return;
-        summary._hydrated = true;
       }
     }
   };
@@ -1372,6 +1761,17 @@ function renderList() {
 
 function conversationBadge(conversation) {
   const item = conversation || {};
+  if (Object.prototype.hasOwnProperty.call(item, "project_progress")) {
+    const progress = projectProgressModel(item);
+    if (progress.state === "succeeded") {
+      return item.has_video === true
+        ? { className: "done", text: "已完成" }
+        : { className: "failed", text: "最终视频缺失" };
+    }
+    if (progress.state === "failed") return { className: "failed", text: "生成失败" };
+    if (progress.state === "running") return { className: "processing", text: "生成中" };
+    return { className: "queued", text: "排队中" };
+  }
   const navigationBadges = {
     analysis_queued: { className: "queued", text: "分析排队中" },
     analysis_processing: { className: "processing", text: "分析中" },
@@ -1486,13 +1886,13 @@ function renderEmptyHero() {
   const iconBox = el("div", "empty-icon");
   iconBox.appendChild(icon("i-film"));
   hero.appendChild(iconBox);
-  hero.appendChild(el("h2", null, "上传参考视频，生成复刻配方"));
-  hero.appendChild(el("p", "empty-sub", "AI 会抽取关键帧并准备视频生成"));
+  hero.appendChild(el("h2", null, "提供原视频，生成新视频"));
+  hero.appendChild(el("p", "empty-sub", "Agent 会自动改编台词，你只需选择最终视频语种与生成配置"));
   const steps = el("ol", "empty-steps");
   const items = [
-    "点击回形针或把视频拖进输入框",
-    "可选：填写备注，说明想复刻的镜头重点",
-    "发送后等待处理，结果会出现在这里",
+    "粘贴原视频链接，也可切换为上传",
+    "选择画幅、清晰度与最终视频语种",
+    "点击开始生成，等待新视频完成",
   ];
   items.forEach((t, i) => {
     const li = el("li");
@@ -1545,6 +1945,12 @@ function renderUserBubble(detail) {
   fileRow.appendChild(icon("i-film"));
   fileRow.appendChild(el("span", "bubble-file-name", detail.title || "已上传视频"));
   bubble.appendChild(fileRow);
+  if (detail.has_source === true) {
+    const preview = videoPlayer(detail, "source.mp4");
+    preview.classList.add("bubble-source-video");
+    preview.setAttribute("aria-label", "原视频");
+    bubble.appendChild(preview);
+  }
   row.appendChild(bubble);
   return row;
 }
@@ -1828,13 +2234,9 @@ function renderFail(detail) {
   const card = el("div", "fail-card");
   card.appendChild(icon("i-alert", "ic-danger"));
   const body = el("div");
-  const summary = safeErrorSummary(detail.error, "分析阶段执行失败");
-  body.appendChild(el("p", "fail-title", summary.startsWith("台词识别失败")
-    ? "台词识别失败" : "分析未完成"));
-  body.appendChild(el("p", "fail-msg", summary));
-  body.appendChild(el("p", "fail-tip", "成片流程尚未开始；刷新不会重复提交任务。"));
-  const diagnostic = errorDiagnostic(detail.error);
-  if (diagnostic) body.appendChild(diagnostic);
+  body.appendChild(el("p", "fail-title", "生成未完成"));
+  body.appendChild(el("p", "fail-msg", "项目未能完成，请稍后重试或联系管理员。"));
+  body.appendChild(el("p", "fail-tip", "刷新页面不会重复提交任务。"));
   card.appendChild(body);
   row.appendChild(card);
   return row;
@@ -1842,11 +2244,7 @@ function renderFail(detail) {
 
 /* 结果区（done） */
 /* 视频区块：原始 / 最终成片共用同一加载骨架，靠标题与副标题区分 */
-function videoSection(detail, file, title, sub) {
-  const sec = el("section", "res-section");
-  const h = el("h3", "res-h3", title);
-  if (sub) h.appendChild(el("span", "res-count", sub));
-  sec.appendChild(h);
+function videoPlayer(detail, file) {
   const wrap = el("div", "video-wrap");
   wrap.appendChild(el("div", "video-shimmer shimmer", "正在加载视频…"));
   const video = el("video");
@@ -1854,7 +2252,6 @@ function videoSection(detail, file, title, sub) {
   video.playsInline = true;
   video.preload = "metadata";
   wrap.appendChild(video);
-  sec.appendChild(wrap);
   apiBlobURL("/api/conversations/" + detail.id + "/files/" + file)
     .then((url) => {
       video.src = url;
@@ -1862,6 +2259,15 @@ function videoSection(detail, file, title, sub) {
       video.addEventListener("error", () => wrap.classList.add("is-error"), { once: true });
     })
     .catch(() => wrap.classList.add("is-error"));
+  return wrap;
+}
+
+function videoSection(detail, file, title, sub) {
+  const sec = el("section", "res-section");
+  const h = el("h3", "res-h3", title);
+  if (sub) h.appendChild(el("span", "res-count", sub));
+  sec.appendChild(h);
+  sec.appendChild(videoPlayer(detail, file));
   return sec;
 }
 
@@ -1971,43 +2377,9 @@ function renderMaterialIndexSection(detail) {
 
 function renderResults(detail) {
   const frag = document.createDocumentFragment();
-
-  const headRow = el("div", "msg-row");
-  headRow.appendChild(assistantHead(detail.updated_at));
-  const doneCard = el("div", "activity-card");
-  doneCard.appendChild(el("p", "ac-title", "处理完成"));
-  doneCard.appendChild(el("p", "ac-sub", "关键帧与提示词已生成，可直接复制使用"));
-  headRow.appendChild(doneCard);
-  frag.appendChild(headRow);
-
-  const milestone = skillMilestoneSection(detail);
-  if (milestone) frag.appendChild(milestone);
-
-  frag.appendChild(renderMaterialIndexSection(detail));
-
-  // 原始视频（上传即存在，与生成物明确分区）
-  if (detail.has_source) {
-    frag.appendChild(videoSection(detail, "source.mp4", "原始视频", "上传的源素材"));
+  if (detail.has_video === true) {
+    frag.appendChild(videoSection(detail, "generated.mp4", "新视频", "已完成"));
   }
-
-  // 多段模式：逐段渲染「第 N 段」卡片；单段模式保持现有逻辑
-  const segments = Array.isArray(detail.segments) ? detail.segments : [];
-  if (segments.length > 0) {
-    frag.appendChild(segmentProductsDisclosure(detail));
-  } else {
-    const names = Array.isArray(detail.keyframes) ? detail.keyframes : [];
-    if (names.length > 0) {
-      frag.appendChild(keyframesSection(detail));
-    }
-    const sourcePrompt = detail.source_prompt || detail.prompt;
-    if (sourcePrompt) {
-      const sec = el("section", "res-section");
-      sec.appendChild(el("h3", "res-h3", "提示词与台词"));
-      sec.appendChild(promptWorkspace(detail));
-      frag.appendChild(sec);
-    }
-  }
-
   return frag;
 }
 
@@ -3972,14 +4344,9 @@ function renderPpChat(detail) {
 }
 
 function renderDetail(detail) {
-  document.querySelector(".composer-dock").classList.toggle(
-    "is-dialogue-review-waiting",
-    !!(detail.dialogue_review && detail.dialogue_review.status === "waiting"),
-  );
+  document.querySelector(".composer-dock").classList.remove("is-dialogue-review-waiting");
   renderOperationHeader(detail);
   renderStable(detail);
-  renderPpDynamic(detail);
-  renderGenerationDynamic(detail);
 }
 
 /* 稳定区：用户气泡 + 结果区 + 后处理入口 + 最终视频；中间留 .pp-dynamic 插槽给后处理聊天 */
@@ -3987,22 +4354,11 @@ function renderStable(detail) {
   clearStream();
   const inner = el("div", "stream-inner");
   inner.appendChild(renderUserBubble(detail));
-  const frozenConfig = renderFrozenGenerationConfig(detail);
-  if (frozenConfig) inner.appendChild(frozenConfig);
-  const dialogueReview = renderDialogueReview(detail);
-  if (dialogueReview) inner.appendChild(dialogueReview);
-  if (detail.status === "queued" || detail.status === "processing") {
-    if (!(detail.dialogue_review && detail.dialogue_review.status === "waiting")) {
-      inner.appendChild(renderActivity(detail.status));
-    }
-  } else if (detail.status === "failed") {
+  const progress = projectProgressModel(detail);
+  if (progress.state === "failed") {
     inner.appendChild(renderFail(detail));
-  } else if (detail.status === "done") {
+  } else if (progress.state === "succeeded" && detail.has_video === true) {
     inner.appendChild(renderResults(detail));
-    const ppAsk = renderPpAsk(detail);
-    if (ppAsk) inner.appendChild(ppAsk);
-    inner.appendChild(el("div", "pp-dynamic"));
-    inner.appendChild(el("div", "generation-dynamic"));
   }
   $("stream").appendChild(inner);
 }
@@ -4013,8 +4369,6 @@ function renderPpDynamic(detail) {
   const slot = document.querySelector(".pp-dynamic");
   if (!slot) return;
   slot.textContent = "";
-  const ppChat = renderPpChat(detail);
-  if (ppChat) slot.appendChild(ppChat);
 }
 
 /* 生成任务进度独立刷新，避免每个分段状态变化都重建原视频和关键帧。 */
@@ -4022,75 +4376,26 @@ function renderGenerationDynamic(detail) {
   const slot = document.querySelector(".generation-dynamic");
   if (!slot) return;
   slot.textContent = "";
-  const intermediate = renderIntermediateStages(detail);
-  if (intermediate) slot.appendChild(intermediate);
-  slot.appendChild(renderFinalSection(detail));
 }
 
 /* ===== 会话详情 + 轮询 ===== */
-/* 详情状态签名：
-   stable 变（状态机/产物内容变化）→ 全量重渲染一次；
-   仅 dyn 变（后处理 running 时 frames 逐帧增长）→ 只刷新后处理动态区；
-   generation 变 → 只刷新最终视频区，保留原视频 DOM；
-   完全不变 → 什么都不做（连 DOM 都不碰，杜绝每 2s 清空重建媒体引发的闪烁）。
-   dyn 取逐帧进度和分段阶段：它们在 stable 不变时随轮询增长。 */
+/* 极简详情只在可见内容变化时重建。百分比和阶段标题由
+   renderOperationHeader 单独刷新，隐藏的技术字段不能触发视频重载。 */
 function detailSignature(detail) {
-  // stable 覆盖稳定区渲染消费的全部字段（未覆盖字段如 title/note 由创建后不变兜底，
-  // pp.options 与 status 原子落盘——见审查记录）；dyn 只跟后处理进度（frames 单调增长）。
-  const pp = detail.postprocess || null;
-  const segments = Array.isArray(detail.segments) ? detail.segments : [];
   const stable = JSON.stringify([
     detail.id,
     detail.title,
     detail.note,
-    detail.status,
-    detail.read_only === true,
-    detail.submit_enabled === true,
-    detail.fit_required === true,
-    detail.fit_mode,
-    detail.aspect_ratio,
-    detail.resolution,
-    detail.fit_profiles || null,
-    detail.duration_s,
-    detail.receipt_version,
-    detail.source_prompt || null,
-    detail.source_prompt_sha256 || null,
-    detail.image_optimization_prompt || null,
-    detail.postprocess_capabilities || null,
-    detail.dialogue || null,
-    detail.dialogue_review || null,
-    detail.generation_config || null,
-    detail.generation_config_sha256 || null,
-    detail.skill_milestone || null,
-    detail.element_index || detail.material_index || detail.project_index || null,
-    pp ? pp.status : "",
-    pp && pp.error ? pp.error : "",
-    Array.isArray(detail.keyframes) ? detail.keyframes.join(",") : "",
-    detail.prompt || "",
-    segments.map((seg) => [
-      seg.index,
-      Array.isArray(seg.keyframes) ? seg.keyframes.join(",") : "",
-      seg.prompt || "",
-      Array.isArray(seg.lines) ? seg.lines.join("\n") : "",
-      seg.image_optimization_prompt || null,
-    ]),
+    detail.project_progress && detail.project_progress.status || null,
+    detail.error || null,
+    detail.has_source === true,
     detail.has_video ? 1 : 0,
   ]);
-  const dyn = JSON.stringify([
-    ppCompletedFrames(detail),
-    pp && Array.isArray(pp.segments) ? pp.segments : null,
-  ]);
-  const generation = JSON.stringify([
-    detail.plan_receipt || null,
-    Number.isInteger(detail.segment_count) ? detail.segment_count : null,
-    detail.generation || null,
-    detail.prompt_fusion || null,
-    detail.has_video ? 1 : 0,
-  ]);
-  return { stable, dyn, generation };
+  return { stable, dyn: "", generation: "" };
 }
 
 async function loadDetail(id, silent) {
+  if (!id || state.currentId !== id) return;
   const seq = ++state.detailSeq;
   if (!silent) renderSkeleton();
   try {
@@ -4100,6 +4405,7 @@ async function loadDetail(id, silent) {
       state.generationSubmitting[id] = false;
     }
     state.detail = detail;
+    if (!silent) applyProjectComposer(detail);
     if (syncConversationDetail(state.conversations, detail)) {
       renderList();
       const summary = state.conversations.find((item) => item.id === detail.id);
@@ -4131,45 +4437,45 @@ async function loadDetail(id, silent) {
       startPolling(id);
     } else {
       stopPolling();
-      refreshList(false); // 终态：同步侧栏徽章（轻量更新，不动 stream）
     }
   } catch (err) {
     if (handleAuthError(err)) return;
-    if (seq !== state.detailSeq) return;
+    if (seq !== state.detailSeq || state.currentId !== id) return;
     state.detailSig = null;
-    renderStreamError("会话加载失败：" + err.message);
-    if (silent && state.currentId === id) startPolling(id);
-    else stopPolling();
+    if (silent) {
+      renderStreamError("会话加载失败：" + err.message);
+      startPolling(id);
+      return;
+    }
+    state.currentId = null;
+    state.detail = null;
+    clearSelectedProjectId();
+    resetComposerForNewProject();
+    resetGenerationConfigDisclosure();
+    renderList();
+    renderEmptyHero();
+    setComposerError("项目加载失败，已回到新建项目：" + err.message);
   }
 }
 
 function shouldPollDetail(detail) {
   if (!detail || typeof detail !== "object") return false;
-  const ppStatus = detail.postprocess && detail.postprocess.status;
-  const fusionStatus = detail.prompt_fusion && detail.prompt_fusion.status;
-  const generationStatus = detail.generation && detail.generation.status;
-  const navigationStatus = detail.navigation_status;
-  const automaticPending = !!frozenGenerationConfig(detail)
-    && detail.status === "done" && detail.has_video !== true && !generationStatus;
-  return detail.status === "queued"
-    || detail.status === "processing"
-    || ppStatus === "queued"
-    || ppStatus === "running"
-    || fusionStatus === "pending"
-    || fusionStatus === "running"
-    || generationStatus === "queued"
-    || generationStatus === "running"
-    || automaticPending
-    || ["analysis_queued", "analysis_processing", "generation_queued",
-      "generation_running", "postprocessing"].includes(navigationStatus);
+  const progressState = projectProgressModel(detail).state;
+  return progressState === "queued" || progressState === "running";
 }
 
 async function selectConversation(id) {
   if (state.uploading) return; // 上传中不切换，避免打断
-  if (state.currentId !== id && !await guardDirtyPrompt()) return;
+  const switchingProject = state.currentId !== id;
+  if (switchingProject && !await guardDirtyPrompt()) return;
   delete state.ppResultExpanded[id];
   resetSegmentProductsDisclosure(id);
   state.currentId = id;
+  rememberSelectedProjectId(id);
+  if (switchingProject) {
+    state.detail = null;
+    prepareComposerForProjectLoad();
+  }
   const conv = state.conversations.find((c) => c.id === id);
   $("main-title").textContent = (conv && conv.title) || "会话";
   renderList();
@@ -4320,12 +4626,39 @@ async function loadGenerationConfigCapability() {
 
 function sourceMode() {
   const checked = document.querySelector('input[name="source-mode"]:checked');
-  return checked ? checked.value : "link"; // 与 HTML 默认 checked 一致：默认视频链接
+  return checked ? checked.value : "link";
 }
 
-function voiceMode() {
-  const checked = document.querySelector('input[name="voice-mode"]:checked');
-  return checked ? checked.value : "keep";
+function targetLanguageMode() {
+  const checked = document.querySelector('input[name="target-language-mode"]:checked');
+  return checked ? checked.value : "same";
+}
+
+function resolveTargetLanguage(mode, otherLanguage) {
+  if (mode === "same") return SAME_AS_SOURCE_LANGUAGE;
+  if (mode === "other") return String(otherLanguage || "").trim();
+  return "";
+}
+
+function selectedTargetLanguage() {
+  return resolveTargetLanguage(targetLanguageMode(), $("lang-input").value);
+}
+
+function syncTargetLanguageControls() {
+  const isOther = targetLanguageMode() === "other";
+  $("translation-fields").hidden = !isOther;
+  $("lang-input").required = isOther;
+  $("lang-input").disabled = state.uploading || state.viewingSubmittedConfig || !isOther;
+}
+
+function selectedAspectRatio() {
+  const checked = document.querySelector('input[name="aspect-ratio"]:checked');
+  return checked ? checked.value : "";
+}
+
+function selectedResolution() {
+  const checked = document.querySelector('input[name="resolution"]:checked');
+  return checked ? checked.value : "";
 }
 
 function dialogueMode() {
@@ -4333,45 +4666,93 @@ function dialogueMode() {
   return checked ? checked.value : "auto";
 }
 
-// 口播转换切换：翻译模式才显示语言填空（必填）
-function setVoiceMode() {
-  const translate = voiceMode() === "translate";
-  $("lang-input").hidden = !translate;
-  $("lang-input").required = translate;
-  state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
-  setComposerError(null);
+function renderCreationServiceStatus() {
+  const status = $("creation-service-status");
+  if (!state.minimalCreationCapabilityLoaded) {
+    status.textContent = "正在连接生成服务…";
+    status.classList.remove("is-error");
+  } else if (!state.minimalCreationCapability) {
+    status.textContent = "生成服务尚未升级，暂时无法创建新项目";
+    status.classList.add("is-error");
+  } else {
+    status.textContent = "配置完成后即可一次提交并自动生成";
+    status.classList.remove("is-error");
+  }
+  updateReplacementHint();
   updateSendBtn();
 }
 
-function setDialogueMode() {
-  renderDialogueReviewPolicyControl();
-  state.clientRequestId = newRequestId();
-  setComposerError(null);
-  updateSendBtn();
+async function loadMinimalCreationCapability() {
+  const token = state.token;
+  state.minimalCreationCapability = null;
+  state.minimalCreationCapabilityLoaded = false;
+  renderCreationServiceStatus();
+  try {
+    const payload = await apiJSON("/api/capabilities");
+    if (token !== state.token) return;
+    const normalized = normalizeMinimalCreationCapability(payload);
+    state.minimalCreationCapability = normalized ? payload.minimal_creation : null;
+    if (normalized) {
+      $("replacement-instruction").maxLength = normalized.replacement.max_instruction_chars;
+      $("replacement-image-input").accept = normalized.replacement.accept.join(",");
+    }
+  } catch (error) {
+    if (handleAuthError(error)) return;
+    if (token !== state.token) return;
+    state.minimalCreationCapability = null;
+  } finally {
+    if (token === state.token) {
+      state.minimalCreationCapabilityLoaded = true;
+      renderCreationServiceStatus();
+    }
+  }
+}
+
+function syncSourceModeView(mode) {
+  const isUpload = mode === "upload";
+  const radio = document.querySelector(`input[name="source-mode"][value="${isUpload ? "upload" : "link"}"]`);
+  if (radio) radio.checked = true;
+  $("attach-btn").hidden = !isUpload;
+  $("file-hint").hidden = !isUpload;
+  $("url-row").hidden = isUpload;
+  $("url-input").required = !isUpload;
+}
+
+function showSourceFileSummary(filename, bytes) {
+  $("file-chip-name").textContent = filename || "已提交原视频";
+  $("file-chip-size").textContent = Number.isFinite(bytes) ? fmtBytes(bytes) : "已提交";
+  $("file-chip").hidden = false;
 }
 
 // 来源二选一：同一时刻只存在一种输入，切换即清空另一边
 function setSourceMode(mode) {
   const isUpload = mode === "upload";
+  $("url-input").placeholder = SOURCE_URL_PLACEHOLDER;
   if (isUpload) {
     $("url-input").value = "";
   } else {
     clearFile();
   }
   state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
-  $("attach-btn").hidden = !isUpload;
-  $("file-hint").hidden = !isUpload;
-  $("url-row").hidden = isUpload;
-  $("url-input").required = !isUpload;
+  syncSourceModeView(mode);
   setComposerError(null);
   updateSendBtn();
 }
 
 function updateSendBtn() {
   const ready = sourceMode() === "upload" ? !!state.file : !!$("url-input").value.trim();
-  // 翻译模式必须填目标语言
-  const langReady = voiceMode() !== "translate" || !!$("lang-input").value.trim();
-  $("send-btn").disabled = state.uploading || !ready || !langReady;
+  const targetLanguage = selectedTargetLanguage();
+  const langReady = !!targetLanguage && targetLanguage.length <= TARGET_LANGUAGE_MAX_CHARS;
+  const hasInstruction = !!$("replacement-instruction").value.trim();
+  const replacementReady = !!state.replacementImage === hasInstruction;
+  const replacementSizeReady = !state.replacementImage || !state.minimalCreationCapability
+    || state.replacementImage.size <= state.minimalCreationCapability.replacement.max_bytes;
+  const configReady = GENERATION_ASPECT_RATIOS.includes(selectedAspectRatio())
+    && GENERATION_RESOLUTIONS.includes(selectedResolution());
+  $("send-btn").disabled = state.uploading || state.viewingSubmittedConfig
+    || !state.minimalCreationCapability
+    || !ready || !langReady || !replacementReady
+    || !replacementSizeReady || !configReady;
 }
 
 function isVideoFile(file) {
@@ -4381,6 +4762,7 @@ function isVideoFile(file) {
 }
 
 function pickFile(file) {
+  if (state.viewingSubmittedConfig) return;
   setComposerError(null);
   if (!file) return;
   if (!isVideoFile(file)) {
@@ -4402,37 +4784,281 @@ function clearFile() {
   updateSendBtn();
 }
 
+function updateReplacementHint() {
+  const hasImage = !!state.replacementImage;
+  const hasSubmittedImage = !!state.submittedReplacement;
+  const hasAnyImage = hasImage || hasSubmittedImage;
+  const hasInstruction = !!$("replacement-instruction").value.trim();
+  const capability = state.minimalCreationCapability;
+  const tooLarge = !!(hasImage && capability
+    && state.replacementImage.size > capability.replacement.max_bytes);
+  const hint = $("replacement-hint");
+  hint.classList.toggle("is-error", hasAnyImage !== hasInstruction || tooLarge);
+  hint.textContent = tooLarge
+    ? "参考图过大，请选择不超过 " + fmtBytes(capability.replacement.max_bytes) + " 的图片"
+    : hasAnyImage !== hasInstruction ? "请同时提供参考图和替换说明"
+    : hasSubmittedImage ? "该项目创建时已提交参考图；如需再次创建，请重新选择图片"
+    : hasImage ? "参考图和替换说明将在创建时一起提交" : "参考图与替换说明需要一起提供";
+}
+
+function resetReplacementImageDisplay() {
+  if (state.replacementPreviewURL) URL.revokeObjectURL(state.replacementPreviewURL);
+  state.replacementImage = null;
+  state.replacementPreviewURL = null;
+  state.replacementPreviewOwnerId = null;
+  state.submittedReplacement = null;
+  $("replacement-image-input").value = "";
+  $("replacement-preview").removeAttribute("src");
+  $("replacement-preview").hidden = false;
+  $("replacement-name").textContent = "";
+  $("replacement-chip").hidden = true;
+  $("replacement-select").hidden = false;
+}
+
+function clearReplacementImage() {
+  resetReplacementImageDisplay();
+  state.clientRequestId = newRequestId();
+  updateReplacementHint();
+  updateSendBtn();
+}
+
+function pickReplacementImage(file) {
+  if (state.viewingSubmittedConfig) return;
+  setComposerError(null);
+  if (!file) return;
+  const capability = state.minimalCreationCapability;
+  if (capability && file.size > capability.replacement.max_bytes) {
+    setComposerError("参考图过大，请选择不超过 " + fmtBytes(capability.replacement.max_bytes) + " 的图片");
+    return;
+  }
+  if (state.replacementPreviewURL) URL.revokeObjectURL(state.replacementPreviewURL);
+  state.replacementImage = file;
+  state.submittedReplacement = null;
+  state.replacementPreviewURL = URL.createObjectURL(file);
+  state.replacementPreviewOwnerId = null;
+  state.clientRequestId = newRequestId();
+  $("replacement-preview").src = state.replacementPreviewURL;
+  $("replacement-preview").hidden = false;
+  $("replacement-name").textContent = file.name;
+  $("replacement-chip").hidden = false;
+  $("replacement-select").hidden = true;
+  updateReplacementHint();
+  updateSendBtn();
+}
+
+function showUnavailableSource(message) {
+  document.querySelectorAll('input[name="source-mode"]').forEach((control) => {
+    control.checked = false;
+  });
+  state.file = null;
+  $("file-input").value = "";
+  $("file-chip").hidden = true;
+  $("attach-btn").hidden = true;
+  $("file-hint").hidden = true;
+  $("url-row").hidden = false;
+  $("url-input").required = false;
+  $("url-input").value = "";
+  $("url-input").placeholder = message;
+}
+
+function prepareComposerForProjectLoad() {
+  state.viewingSubmittedConfig = true;
+  showUnavailableSource("正在加载项目配置…");
+  resetReplacementImageDisplay();
+  $("replacement-instruction").value = "";
+  document.querySelectorAll(
+    'input[name="aspect-ratio"], input[name="resolution"], input[name="target-language-mode"]'
+  ).forEach((control) => { control.checked = false; });
+  $("lang-input").value = "";
+  setComposerError(null);
+  syncTargetLanguageControls();
+  updateReplacementHint();
+  setUploading(false);
+}
+
+async function loadSubmittedReplacementPreview(conversationId, previewUrl) {
+  const safePath = creationInputReplacementPreviewPath(conversationId, previewUrl);
+  if (!safePath) return;
+  try {
+    const response = await api(safePath);
+    if (!response.ok) return;
+    const objectUrl = URL.createObjectURL(await response.blob());
+    if (state.currentId !== conversationId
+        || !state.submittedReplacement
+        || state.submittedReplacement.preview_url !== previewUrl) {
+      URL.revokeObjectURL(objectUrl);
+      return;
+    }
+    if (state.replacementPreviewURL) URL.revokeObjectURL(state.replacementPreviewURL);
+    state.replacementPreviewURL = objectUrl;
+    state.replacementPreviewOwnerId = conversationId;
+    $("replacement-preview").src = objectUrl;
+    $("replacement-preview").hidden = false;
+  } catch (error) {
+    if (handleAuthError(error)) return;
+    // 配置文字仍可展示；预览失败不改变已冻结配置。
+  }
+}
+
+function creationInputReplacementPreviewPath(conversationId, previewUrl, origin = null) {
+  if (!conversationId || typeof previewUrl !== "string" || !previewUrl.trim()) return null;
+  const expectedPath = "/api/conversations/" + encodeURIComponent(conversationId)
+    + "/creation-input/replacement-image";
+  const expectedOrigin = origin || (typeof window !== "undefined" && window.location
+    ? window.location.origin : "");
+  if (!expectedOrigin) return null;
+  try {
+    const base = new URL(expectedOrigin);
+    const candidate = new URL(previewUrl, base);
+    if (candidate.origin !== base.origin || candidate.pathname !== expectedPath
+        || candidate.search || candidate.hash) return null;
+    return expectedPath;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function applyProjectComposer(detail) {
+  const memoryDraft = state.composerDrafts[detail.id] || null;
+  const localDraft = memoryDraft || storedComposerDraft(detail.id);
+  const model = projectComposerModel(detail, localDraft);
+  const hasServerInput = Object.prototype.hasOwnProperty.call(detail, "creation_input");
+  const serverInput = hasServerInput
+    ? normalizeCreationInputSnapshot(detail.creation_input) : null;
+  const localPreviewAllowed = !hasServerInput
+    || !!(serverInput && serverInput.replacement_image);
+  const preservedPreview = localPreviewAllowed
+    && state.replacementPreviewOwnerId === detail.id
+    ? state.replacementPreviewURL : null;
+  if (preservedPreview) state.replacementPreviewURL = null;
+
+  state.viewingSubmittedConfig = true;
+  state.file = null;
+  $("file-input").value = "";
+  $("file-chip").hidden = true;
+  $("url-input").value = "";
+  $("url-input").placeholder = SOURCE_URL_PLACEHOLDER;
+  resetReplacementImageDisplay();
+  $("replacement-instruction").value = "";
+
+  if (!model) {
+    if (preservedPreview) URL.revokeObjectURL(preservedPreview);
+    showUnavailableSource("历史项目未保存来源信息");
+    document.querySelectorAll(
+      'input[name="aspect-ratio"], input[name="resolution"], input[name="target-language-mode"]'
+    ).forEach((control) => { control.checked = false; });
+    $("lang-input").value = "";
+    setComposerError("该历史项目未保存创建配置，无法恢复原选项");
+    syncTargetLanguageControls();
+    updateReplacementHint();
+    setUploading(false);
+    return false;
+  }
+
+  const aspect = document.querySelector(`input[name="aspect-ratio"][value="${model.aspectRatio}"]`);
+  const resolution = document.querySelector(`input[name="resolution"][value="${model.resolution}"]`);
+  const language = document.querySelector(`input[name="target-language-mode"][value="${model.languageMode}"]`);
+  if (aspect) aspect.checked = true;
+  if (resolution) resolution.checked = true;
+  if (language) language.checked = true;
+  $("lang-input").value = model.targetLanguage;
+  $("replacement-instruction").value = model.replacementInstruction;
+  setComposerError(null);
+
+  if (model.source && model.source.mode === "upload") {
+    syncSourceModeView("upload");
+    showSourceFileSummary(model.source.filename, model.source.bytes);
+  } else if (model.source && model.source.mode === "link") {
+    syncSourceModeView("link");
+    $("url-input").value = model.source.reference_url || "";
+    if (model.source.reference_url === null) {
+      $("url-input").placeholder = "链接来源已提交";
+    }
+  } else {
+    showUnavailableSource("历史项目未保存来源信息");
+  }
+
+  if (model.replacementImage) {
+    state.submittedReplacement = model.replacementImage;
+    $("replacement-name").textContent = model.replacementImage.filename;
+    $("replacement-chip").hidden = false;
+    $("replacement-select").hidden = true;
+    if (preservedPreview) {
+      state.replacementPreviewURL = preservedPreview;
+      state.replacementPreviewOwnerId = detail.id;
+      $("replacement-preview").src = preservedPreview;
+      $("replacement-preview").hidden = false;
+    } else {
+      $("replacement-preview").hidden = true;
+    }
+    if (!preservedPreview && model.replacementImage.preview_url) {
+      void loadSubmittedReplacementPreview(detail.id, model.replacementImage.preview_url);
+    }
+  } else if (preservedPreview) {
+    URL.revokeObjectURL(preservedPreview);
+  }
+
+  state.clientRequestId = newRequestId();
+  syncTargetLanguageControls();
+  updateReplacementHint();
+  setUploading(false);
+  return true;
+}
+
+function resetComposerForNewProject() {
+  state.viewingSubmittedConfig = false;
+  state.file = null;
+  $("file-input").value = "";
+  $("file-chip").hidden = true;
+  $("url-input").value = "";
+  $("url-input").placeholder = SOURCE_URL_PLACEHOLDER;
+  resetReplacementImageDisplay();
+  $("replacement-instruction").value = "";
+  document.querySelector('input[name="source-mode"][value="link"]').checked = true;
+  document.querySelector('input[name="aspect-ratio"][value="9:16"]').checked = true;
+  document.querySelector('input[name="resolution"][value="768p"]').checked = true;
+  document.querySelector('input[name="target-language-mode"][value="same"]').checked = true;
+  $("lang-input").value = "";
+  state.clientRequestId = newRequestId();
+  syncSourceModeView("link");
+  syncTargetLanguageControls();
+  setComposerError(null);
+  updateReplacementHint();
+  setUploading(false);
+}
+
 function setUploading(on) {
   state.uploading = on;
+  const controlsDisabled = on || state.viewingSubmittedConfig;
   $("composer-toggle").disabled = on;
-  $("attach-btn").disabled = on;
-  $("note-input").disabled = on;
-  $("url-input").disabled = on;
-  $("file-remove").disabled = on;
-  $("lang-input").disabled = on;
+  $("attach-btn").disabled = controlsDisabled;
+  $("file-input").disabled = controlsDisabled;
+  $("url-input").disabled = controlsDisabled;
+  $("file-remove").disabled = controlsDisabled;
+  $("replacement-select").disabled = controlsDisabled;
+  $("replacement-image-input").disabled = controlsDisabled;
+  $("replacement-remove").disabled = controlsDisabled;
+  $("replacement-instruction").disabled = controlsDisabled;
   document.querySelectorAll('input[name="source-mode"]').forEach((r) => {
-    r.disabled = on;
+    r.disabled = controlsDisabled;
   });
-  document.querySelectorAll('input[name="voice-mode"]').forEach((r) => {
-    r.disabled = on;
+  document.querySelectorAll('input[name="target-language-mode"]').forEach((r) => {
+    r.disabled = controlsDisabled;
   });
-  document.querySelectorAll('input[name="dialogue-mode"]').forEach((r) => {
-    r.disabled = on;
+  document.querySelectorAll('input[name="aspect-ratio"], input[name="resolution"]').forEach((r) => {
+    r.disabled = controlsDisabled;
   });
-  renderGenerationConfigControl();
-  renderDialogueReviewPolicyControl();
+  syncTargetLanguageControls();
   updateSendBtn();
   if (!on) $("upload-progress").hidden = true;
 }
 
 function uploadConversation({
-  file, url, note, requestId, voiceMode: mode, targetLanguage, dialogue,
-  generationConfig, generationConfigCapability,
-  dialogueReviewPolicy: reviewPolicy, dialogueReviewCapability,
+  file, url, requestId, generationRequest, replacementImage, capability,
 }, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/conversations");
+    xhr.open("POST", capability.endpoint);
     xhr.setRequestHeader("Authorization", "Bearer " + state.token);
     xhr.responseType = "json";
     xhr.upload.addEventListener("progress", (e) => {
@@ -4444,13 +5070,6 @@ function uploadConversation({
         resolve(xhr.response);
       } else if (xhr.status === 401) {
         reject(new AuthError("口令已失效"));
-      } else if (xhr.status === 429) {
-        // 429 有两种来源：排队满 / IP 限流，按 detail 文案区分
-        const data = xhr.response;
-        const detail = data && data.detail ? String(data.detail) : "";
-        reject(new Error(detail.indexOf("queued") >= 0
-          ? "当前排队任务较多，请稍后再试"
-          : "操作过于频繁，请稍后再试"));
       } else {
         const data = xhr.response;
         reject(apiErrorFromPayload(
@@ -4464,50 +5083,40 @@ function uploadConversation({
     const fd = new FormData();
     if (file) fd.append("file", file, file.name);
     else if (url) fd.append("reference_url", url);
-    if (note) fd.append("note", note);
-    if (requestId) fd.append("client_request_id", requestId);
-    fd.append("voice_mode", mode || "keep");
-    if (mode === "translate" && targetLanguage) fd.append("target_language", targetLanguage);
-    fd.append("dialogue_mode", dialogue.dialogue_mode);
-    const reviewField = buildDialogueReviewCreateField(
-      dialogueReviewCapability,
-      reviewPolicy,
-      dialogue.dialogue_mode,
-    );
-    if (reviewField) fd.append(reviewField.name, reviewField.value);
-    const configField = buildGenerationConfigCreateField(
-      generationConfigCapability,
-      generationConfig,
-    );
-    if (configField) fd.append(configField.name, configField.value);
+    fd.append("client_request_id", requestId);
+    fd.append(capability.request_field, JSON.stringify(generationRequest));
+    if (replacementImage) {
+      fd.append(capability.replacement_image_field, replacementImage, replacementImage.name);
+    }
     xhr.send(fd);
   });
 }
 
 async function handleSend(event) {
   event.preventDefault();
-  if (state.uploading) return;
+  if (state.uploading || state.viewingSubmittedConfig) return;
   if (!await guardDirtyPrompt()) return;
   const mode = sourceMode();
   const file = mode === "upload" ? state.file : null;
   const url = mode === "link" ? $("url-input").value.trim() : "";
-  const note = $("note-input").value.trim();
-  const vMode = voiceMode();
-  const targetLanguage = $("lang-input").value.trim();
-  const generationConfig = state.generationConfigCapability
-    ? selectedGenerationConfig() : null;
-  const reviewPolicy = dialogueReviewPolicy();
-  let dialogue;
+  const capability = state.minimalCreationCapability;
+  let generationRequest;
   if (!file && !url) {
     setComposerError(mode === "upload" ? "请先选择视频文件" : "请先粘贴视频链接");
     return;
   }
-  if (vMode === "translate" && !targetLanguage) {
-    setComposerError("请填写翻译目标语言");
+  if (!capability) {
+    setComposerError("生成服务尚未升级，暂时无法创建新项目");
     return;
   }
   try {
-    dialogue = buildCreateDialogueFields(dialogueMode(), "");
+    generationRequest = buildMinimalGenerationRequest({
+      aspectRatio: selectedAspectRatio(),
+      resolution: selectedResolution(),
+      targetLanguage: selectedTargetLanguage(),
+      hasReplacementImage: !!state.replacementImage,
+      replacementInstruction: $("replacement-instruction").value,
+    }, capability);
   } catch (err) {
     setComposerError(err.message);
     return;
@@ -4515,6 +5124,7 @@ async function handleSend(event) {
 
   setComposerError(null);
   setUploading(true);
+  const submitEpoch = state.authEpoch;
   const progress = $("upload-progress");
   const fill = $("up-fill");
   const label = $("up-label");
@@ -4526,11 +5136,10 @@ async function handleSend(event) {
   try {
     const created = await uploadConversation(
       {
-        file, url, note, requestId: state.clientRequestId,
-        voiceMode: vMode, targetLanguage, dialogue, generationConfig,
-        generationConfigCapability: state.generationConfigCapability,
-        dialogueReviewPolicy: reviewPolicy,
-        dialogueReviewCapability: state.dialogueReviewCapability,
+        file, url, requestId: state.clientRequestId,
+        generationRequest,
+        replacementImage: state.replacementImage,
+        capability,
       },
       (ratio) => {
         if (url) return;
@@ -4539,30 +5148,30 @@ async function handleSend(event) {
         label.textContent = pct >= 100 ? "上传完成，等待处理…" : "正在上传 " + pct + "%";
       }
     );
-    // 成功：清空 composer、换新幂等键，刷新列表并选中新会话
-    state.clientRequestId = newRequestId();
-    clearFile();
-    $("note-input").value = "";
-    $("url-input").value = "";
-    const keepRadio = document.querySelector('input[name="voice-mode"][value="keep"]');
-    keepRadio.checked = true;
-    $("lang-input").value = "";
-    $("lang-input").hidden = true;
-    $("lang-input").required = false;
-    const autoDialogue = document.querySelector('input[name="dialogue-mode"][value="auto"]');
-    autoDialogue.checked = true;
-    selectDialogueReviewPolicy("auto_continue");
-    renderDialogueReviewPolicyControl();
-    if (state.generationConfigCapability) {
-      applyGenerationConfigDefaults(state.generationConfigCapability.defaults);
-      renderGenerationConfigControl();
+    if (submitEpoch !== state.authEpoch) return;
+    // 成功：保留本次配置供用户在可折叠窗口中查看，只轮换下一次提交的幂等键。
+    if (created && created.id) {
+      rememberSubmittedComposer(
+        created.id,
+        created.effective_request || generationRequest,
+        { file, url, replacementImage: state.replacementImage },
+        created,
+      );
+      // 响应成功即冻结，不等待列表或详情请求，避免同一付费任务被再次提交。
+      state.viewingSubmittedConfig = true;
+      state.file = null;
+      state.replacementImage = null;
+      $("file-input").value = "";
+      $("replacement-image-input").value = "";
     }
+    state.clientRequestId = newRequestId();
     setUploading(false);
     await refreshList(false);
     if (created && created.id) {
       selectConversation(created.id);
     }
   } catch (err) {
+    if (submitEpoch !== state.authEpoch) return;
     setUploading(false);
     if (handleAuthError(err)) return;
     if (err.code === "video_duration_exceeds_h3_limit") {
@@ -4592,8 +5201,12 @@ function bindEvents() {
 
   $("logout-btn").addEventListener("click", async () => {
     if (!await guardDirtyPrompt()) return;
+    state.authEpoch += 1;
     state.token = null;
     localStorage.removeItem(TOKEN_KEY);
+    clearComposerSnapshots();
+    resetComposerForNewProject();
+    clearStream();
     showLogin(null);
   });
 
@@ -4608,11 +5221,13 @@ function bindEvents() {
     if (!await guardDirtyPrompt()) return;
     state.currentId = null;
     state.detail = null;
+    clearSelectedProjectId();
+    resetComposerForNewProject();
     resetGenerationConfigDisclosure();
     renderList();
     renderEmptyHero();
     closeDrawer();
-    $("note-input").focus();
+    $(sourceMode() === "upload" ? "attach-btn" : "url-input").focus();
   });
 
   $("attach-btn").addEventListener("click", () => $("file-input").click());
@@ -4620,41 +5235,48 @@ function bindEvents() {
     pickFile(e.target.files && e.target.files[0]);
   });
   $("file-remove").addEventListener("click", clearFile);
+  $("replacement-select").addEventListener("click", () => $("replacement-image-input").click());
+  $("replacement-image-input").addEventListener("change", (event) => {
+    pickReplacementImage(event.target.files && event.target.files[0]);
+  });
+  $("replacement-remove").addEventListener("click", clearReplacementImage);
 
   // 来源 radio 互斥切换
   document.querySelectorAll('input[name="source-mode"]').forEach((radio) => {
     radio.addEventListener("change", () => setSourceMode(radio.value));
   });
 
-  // 口播转换 radio 切换
-  document.querySelectorAll('input[name="voice-mode"]').forEach((radio) => {
-    radio.addEventListener("change", setVoiceMode);
+  document.querySelectorAll('input[name="aspect-ratio"], input[name="resolution"]').forEach((control) => {
+    control.addEventListener("change", () => {
+      state.clientRequestId = newRequestId();
+      setComposerError(null);
+      updateSendBtn();
+    });
   });
-  document.querySelectorAll('input[name="dialogue-mode"]').forEach((radio) => {
-    radio.addEventListener("change", setDialogueMode);
-  });
-  $("dialogue-review-fields").addEventListener("change", () => {
-    if (!state.dialogueReviewCapability || state.uploading || dialogueMode() !== "auto") return;
-    state.clientRequestId = newRequestId();
-    setComposerError(null);
-    renderDialogueReviewPolicyControl();
+  document.querySelectorAll('input[name="target-language-mode"]').forEach((control) => {
+    control.addEventListener("change", () => {
+      state.clientRequestId = newRequestId();
+      setComposerError(null);
+      syncTargetLanguageControls();
+      updateSendBtn();
+      if (control.value === "other" && control.checked) $("lang-input").focus();
+    });
   });
   $("lang-input").addEventListener("input", () => {
     state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
     setComposerError(null);
     updateSendBtn();
   });
-
   $("url-input").addEventListener("input", () => {
-    state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
+    state.clientRequestId = newRequestId();
     setComposerError(null);
     updateSendBtn();
   });
-  $("generation-config-fields").addEventListener("change", () => {
-    if (!state.generationConfigCapability || state.uploading) return;
+  $("replacement-instruction").addEventListener("input", () => {
     state.clientRequestId = newRequestId();
     setComposerError(null);
-    renderGenerationConfigControl();
+    updateReplacementHint();
+    updateSendBtn();
   });
 
   $("pp-form").addEventListener("submit", submitPostprocess);
@@ -4665,11 +5287,15 @@ function bindEvents() {
   composer.addEventListener("submit", handleSend);
   composer.addEventListener("dragenter", (e) => {
     e.preventDefault();
-    if (!state.uploading && sourceMode() === "upload") composer.classList.add("drag-over");
+    if (!state.uploading && !state.viewingSubmittedConfig && sourceMode() === "upload") {
+      composer.classList.add("drag-over");
+    }
   });
   composer.addEventListener("dragover", (e) => {
     e.preventDefault();
-    if (!state.uploading && sourceMode() === "upload") composer.classList.add("drag-over");
+    if (!state.uploading && !state.viewingSubmittedConfig && sourceMode() === "upload") {
+      composer.classList.add("drag-over");
+    }
   });
   composer.addEventListener("dragleave", (e) => {
     if (!composer.contains(e.relatedTarget)) composer.classList.remove("drag-over");
@@ -4677,7 +5303,7 @@ function bindEvents() {
   composer.addEventListener("drop", (e) => {
     e.preventDefault();
     composer.classList.remove("drag-over");
-    if (state.uploading || sourceMode() !== "upload") return;
+    if (state.uploading || state.viewingSubmittedConfig || sourceMode() !== "upload") return;
     const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     pickFile(file);
   });
@@ -4696,7 +5322,8 @@ function boot() {
   state.clientRequestId = newRequestId();
   bindEvents();
   setSourceMode(sourceMode());
-  setDialogueMode();
+  syncTargetLanguageControls();
+  updateReplacementHint();
   const saved = localStorage.getItem(TOKEN_KEY);
   if (saved) {
     state.token = saved;
@@ -4710,6 +5337,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildLongRetryPayload,
     buildCreateDialogueFields,
+    buildMinimalGenerationRequest,
     buildDialogueReviewCommitPayload,
     buildDialogueReviewCreateField,
     buildGenerationConfigCreateField,
@@ -4726,6 +5354,8 @@ if (typeof module !== "undefined" && module.exports) {
     closeLightbox,
     conversationBadge,
     conversationThumbnailPath,
+    creationInputSnapshot,
+    creationInputReplacementPreviewPath,
     createDisclosure,
     detailSignature,
     diagnosticText,
@@ -4756,9 +5386,16 @@ if (typeof module !== "undefined" && module.exports) {
     mergeConversationList,
     mergeImagePromptDraft,
     normalizeGenerationConfigCapability,
+    normalizeMinimalCreationCapability,
+    normalizeCreationInputSnapshot,
+    resolveCreationInputSnapshot,
+    resolveTargetLanguage,
     normalizeDialogueReviewCapability,
     normalizeDialogueLines,
     operationTimeline,
+    projectComposerModel,
+    projectPhaseLabel,
+    projectProgressModel,
     parseDialogueLines,
     postprocessReadyForGeneration,
     ppCompletedFrames,

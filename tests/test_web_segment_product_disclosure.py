@@ -68,13 +68,14 @@ def test_segment_products_state_survives_poll_render_and_resets_on_switch():
     }
 
 
-def test_segment_products_wiring_is_lazy_and_absent_without_segments():
+def test_segment_products_helper_is_lazy_but_results_only_mount_final_video():
     source = APP_JS.read_text(encoding="utf-8")
-    results = source.split("function renderResults", 1)[1].split(
-        "function renderUserBubble", 1
-    )[0]
-    assert "if (segments.length > 0)" in results
-    assert "segmentProductsDisclosure(detail)" in results
+    start = source.index("function renderResults")
+    results = source[start:source.index("function canOperate", start)]
+    assert 'frag.appendChild(videoSection(detail, "generated.mp4", "新视频", "已完成"))' in results
+    assert results.count("videoSection(") == 1
+    assert "segmentProductsDisclosure" not in results
+    assert "skillMilestoneSection" not in results
 
     products = source.split("function segmentProductsDisclosure", 1)[1].split(
         "function openLightbox", 1
@@ -174,7 +175,7 @@ def test_present_but_invalid_navigation_status_never_uses_legacy_fallback():
     ]
 
 
-def test_navigation_has_distinct_yellow_analysis_badge():
+def test_navigation_preserves_badge_identity_footer_and_output_metadata():
     css = (APP_JS.parent / "styles.css").read_text(encoding="utf-8")
     assert ".badge.analyzed" in css
     assert "var(--warning" in css.split(".badge.analyzed", 1)[1].split("}", 1)[0]
@@ -183,7 +184,15 @@ def test_navigation_has_distinct_yellow_analysis_badge():
     render_list = source.split("function renderList()", 1)[1].split(
         "function renderListError", 1
     )[0]
+    assert 'heading.appendChild(el("span", "conv-title", c.title || "未命名项目"))' in render_list
     assert "conversationBadge(c)" in render_list
+    assert 'el("span", "badge " + badgeState.className, badgeState.text)' in render_list
+    assert '"conv-identity"' in render_list
+    assert '"conv-id"' in render_list
+    assert "c.segment_count" in render_list
+    assert "operationTimeline(" in render_list
+    assert '"conv-footer"' in render_list
+    assert '"conv-output "' in render_list
     assert "STATUS_TEXT[c.status]" not in render_list
 
 
@@ -214,18 +223,21 @@ def test_list_refresh_preserves_generation_truth_learned_from_detail():
 
 def test_detail_poll_updates_current_navigation_badge_without_another_request():
     result = _run_contract(
-        "(()=>{const items=[{id:'current',status:'done',has_video:false}];"
+        "(()=>{const items=[{id:'current',status:'done',has_video:false,"
+        "project_progress:{percent:40,status:'running'}}];"
         "const before=contract.conversationBadge(items[0]);"
         "contract.syncConversationDetail(items,{id:'current',status:'done',has_video:false,"
+        "project_progress:{percent:60,status:'running'},"
         "generation:{status:'running'},navigation_status:'generation_running'});"
         "const running=contract.conversationBadge(items[0]);"
         "contract.syncConversationDetail(items,{id:'current',status:'done',has_video:true,"
+        "project_progress:{percent:100,status:'succeeded'},"
         "generation:{status:'succeeded'},navigation_status:'completed'});"
         "const succeeded=contract.conversationBadge(items[0]);"
         "return {before,running,succeeded}})()"
     )
     assert result == {
-        "before": {"className": "analyzed", "text": "分析完成"},
+        "before": {"className": "processing", "text": "生成中"},
         "running": {"className": "processing", "text": "生成中"},
         "succeeded": {"className": "done", "text": "已完成"},
     }

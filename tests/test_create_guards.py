@@ -94,7 +94,7 @@ def test_pipeline_gate_keeps_extra_queued(tmp_path, video_1s, monkeypatch):
     first_in = threading.Event()
     release = threading.Event()
 
-    def fake_run(s, cid, runner, *, claimed_owner=None):
+    def fake_run(s, cid, runner, *, claimed_owner=None, mediakit_gate=None):
         assert claimed_owner is not None
         entered.append(cid)
         first_in.set()

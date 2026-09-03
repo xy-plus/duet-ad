@@ -23,8 +23,9 @@ def test_legacy_web_renders_read_only_cid_skill_milestone_summary():
     assert "dataset.testid = \"skill-milestone\"" in section
 
 
-def test_legacy_web_places_milestone_in_read_only_results_area():
+def test_legacy_web_keeps_milestone_out_of_final_results_area():
     source = WEB_APP.read_text(encoding="utf-8")
     render = source[source.index("function renderResults"):source.index("function canOperate")]
-    assert "skillMilestoneSection(detail)" in render
-    assert "frag.appendChild(milestone)" in render
+    assert 'videoSection(detail, "generated.mp4", "新视频", "已完成")' in render
+    assert "skillMilestoneSection(detail)" not in render
+    assert "frag.appendChild(milestone)" not in render

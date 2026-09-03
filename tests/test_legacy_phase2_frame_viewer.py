@@ -135,8 +135,20 @@ def test_phase2_copy_hides_internal_b_terms_without_rewriting_api_fields():
         "B 未提交", "B未提交", "B 输出", "B输出", "等待 B", "等待B",
     ):
         assert forbidden not in source
-    for copy in ("成片", "成片已提交", "等待成片"):
-        assert copy in source
+
+    results = source.split("function renderResults(detail)", 1)[1].split(
+        "function canOperate", 1
+    )[0]
+    assert '"generated.mp4"' in results
+    assert '"新视频"' in results
+    for internal_mount in (
+        "keyframesSection(",
+        "promptWorkspace(",
+        "renderSegments(",
+        "segmentProductsDisclosure(",
+        "ppFramesSection(",
+    ):
+        assert internal_mount not in results
     assert "has_video" in source
 
 

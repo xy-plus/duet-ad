@@ -26,11 +26,14 @@ def test_list_conversations_shape(client, video_1s):
     (item,) = response.json()
     assert set(item) == {
         "id", "title", "note", "status", "analysis_status",
-        "navigation_status", "created_at", "has_video",
+        "navigation_status", "created_at", "updated_at", "duration_s",
+        "segment_count", "thumbnail_path", "has_video", "project_progress",
     }
     assert item["id"] == cid
     assert item["status"] == "queued"
     assert item["has_video"] is False
+    assert item["segment_count"] == 0
+    assert item["thumbnail_path"] is None
 
 
 def test_html_entrypoints_and_app_contract_are_never_cached(client):
@@ -66,11 +69,14 @@ def test_detail_shape_has_no_context_ir_contract(client, video_1s):
         "postprocess_capabilities", "image_optimization_prompt",
             "image_acceptance", "element_index",
             "generation_config", "generation_config_sha256",
+            "project_progress", "effective_request", "input_receipt",
+            "creation_input",
         }
     assert body["generation"] is None
     assert body["has_source"] is True
     assert 0.9 <= body["duration_s"] <= 1.1
     assert body["element_index"] is None
+    assert body["creation_input"] is None
     assert "skill_milestone" not in body
 
 
@@ -108,7 +114,10 @@ def test_detail_returns_backend_published_element_index(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("analysis", "generation_status", "has_video", "postprocess_status", "expected"),
+    (
+        "analysis", "generation_status", "file_exists", "postprocess_status",
+        "expected",
+    ),
     (
         ("queued", "succeeded", True, "done", "analysis_queued"),
         ("processing", "succeeded", True, "done", "analysis_processing"),
@@ -130,7 +139,7 @@ def test_detail_returns_backend_published_element_index(tmp_path):
     ),
 )
 def test_navigation_status_matrix_is_authoritative_and_consistent(
-    tmp_path, monkeypatch, analysis, generation_status, has_video,
+    tmp_path, analysis, generation_status, file_exists,
     postprocess_status, expected,
 ):
     settings = make_settings(tmp_path)
@@ -157,36 +166,27 @@ def test_navigation_status_matrix_is_authoritative_and_consistent(
         postprocess=postprocess,
     )
     output = settings.data_dir / cid / "generated.mp4"
-    if has_video:
+    if file_exists:
         output.write_bytes(b"accepted-by-test-double")
-    monkeypatch.setattr(
-        main_module,
-        "_has_valid_generated_video",
-        lambda _settings, candidate: (
-            _settings.data_dir / candidate["id"] / "generated.mp4"
-        ).is_file(),
-    )
-    monkeypatch.setattr(
-        main_module,
-        "_has_listable_generated_video",
-        lambda _settings, candidate: (
-            _settings.data_dir / candidate["id"] / "generated.mp4"
-        ).is_file(),
-    )
 
     with TestClient(create_app(settings)) as client:
         listed = client.get("/api/conversations", headers=AUTH).json()[0]
         detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
 
+    expected_has_video = bool(
+        analysis == "done"
+        and generation_status in {None, "succeeded"}
+        and file_exists
+    )
     assert listed["navigation_status"] == expected
     assert detail["navigation_status"] == expected
-    assert listed["has_video"] is has_video
-    assert detail["has_video"] is has_video
+    assert listed["has_video"] is expected_has_video
+    assert detail["has_video"] is expected_has_video
     assert "secret-provider-task" not in json.dumps(detail)
 
 
-def test_list_uses_terminal_output_binding_without_full_media_validation(
-    tmp_path, monkeypatch,
+def test_list_and_detail_publish_persisted_completed_output_without_decoding(
+    tmp_path,
 ):
     settings = make_settings(tmp_path)
     meta = storage.new_conversation(
@@ -200,24 +200,26 @@ def test_list_uses_terminal_output_binding_without_full_media_validation(
         generation={"status": "succeeded"},
         _postprocess_receipt={"version": 4, "options": {}},
     )
-    calls = []
-    monkeypatch.setattr(
-        main_module.stitch,
-        "terminal_output_is_listable",
-        lambda root: calls.append(root) or True,
-    )
-    monkeypatch.setattr(
-        main_module,
-        "_has_valid_generated_video",
-        lambda *_args: pytest.fail("list must not run full media validation"),
+    (settings.data_dir / cid / "generated.mp4").write_bytes(
+        b"persisted-but-not-decodable"
     )
 
     with TestClient(create_app(settings)) as client:
-        response = client.get("/api/conversations", headers=AUTH)
+        listed = client.get("/api/conversations", headers=AUTH)
+        detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
 
-    assert response.status_code == 200
-    assert response.json()[0]["has_video"] is True
-    assert calls == [settings.data_dir / cid]
+    assert listed.status_code == 200
+    assert listed.json()[0]["has_video"] is True
+    assert listed.json()[0]["project_progress"] == {
+        "percent": 100,
+        "status": "succeeded",
+    }
+    assert detail.status_code == 200
+    assert detail.json()["has_video"] is True
+    assert detail.json()["project_progress"] == {
+        "percent": 100,
+        "status": "succeeded",
+    }
 
 
 @pytest.mark.parametrize("generation_status", [None, "succeeded"])
@@ -472,17 +474,64 @@ def test_detail_404(client):
 def test_files_endpoint(client, video_1s, settings):
     cid = _make_conv(client, video_1s)
     cdir = settings.data_dir / cid
-    (cdir / "generated.mp4").write_bytes(b"fake-video")
+    generated = video_1s.read_bytes()
+    (cdir / "generated.mp4").write_bytes(generated)
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status="done",
+        generation={"status": "succeeded"},
+    )
     (cdir / "work" / "contact_sheet.jpg").write_bytes(b"sheet")
     (cdir / "work" / "keyframes").mkdir()
     (cdir / "work" / "keyframes" / "k01.jpg").write_bytes(b"k")
-    assert client.get(f"/api/conversations/{cid}/files/generated.mp4", headers=AUTH).content == b"fake-video"
+    assert client.get(
+        f"/api/conversations/{cid}/files/generated.mp4", headers=AUTH
+    ).content == generated
     assert client.get(f"/api/conversations/{cid}/files/source.mp4", headers=AUTH).status_code == 200
     assert client.get(f"/api/conversations/{cid}/files/contact_sheet.jpg", headers=AUTH).content == b"sheet"
     assert client.get(f"/api/conversations/{cid}/files/keyframes/k01.jpg", headers=AUTH).content == b"k"
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
     assert detail["has_source"] is True
     assert detail["has_video"] is True
+
+
+def test_generated_file_uses_persisted_completion_and_presence_contract(
+    client, video_1s, settings,
+):
+    cid = _make_conv(client, video_1s)
+    generated = settings.data_dir / cid / "generated.mp4"
+    generated.write_bytes(b"not-a-video")
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status="done",
+        generation={"status": "succeeded"},
+    )
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+    assert detail.status_code == 200
+    assert detail.json()["has_video"] is True
+    assert detail.json()["project_progress"] == {
+        "percent": 100,
+        "status": "succeeded",
+    }
+    artifact = client.get(
+        f"/api/conversations/{cid}/files/generated.mp4", headers=AUTH
+    )
+    assert artifact.status_code == 200
+    assert artifact.content == b"not-a-video"
+
+    missing_cid = _make_conv(client, video_1s)
+    storage.update_meta(
+        settings.data_dir,
+        missing_cid,
+        status="done",
+        generation={"status": "succeeded"},
+    )
+    missing = client.get(
+        f"/api/conversations/{missing_cid}/files/generated.mp4", headers=AUTH
+    )
+    assert missing.status_code == 404
 
 
 def test_files_traversal_and_unknown_names_are_404(client, video_1s):

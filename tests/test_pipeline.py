@@ -386,6 +386,45 @@ def test_backend_materializes_exact_nine_in_frozen_order_with_repeat_receipt(
     ]
 
 
+def test_prompt_fusion_stage_reuses_duplicate_content_addressed_frame(tmp_path):
+    root = tmp_path / "conversation"
+    stage = tmp_path / "stage"
+    data = b"same-frame"
+    digest = hashlib.sha256(data).hexdigest()
+    relative = Path("work") / "fusion-frames" / f"{digest}.png"
+    source = root / relative
+    source.parent.mkdir(parents=True)
+    source.write_bytes(data)
+    stage.mkdir()
+    frame = {"path": relative.as_posix(), "sha256": digest}
+
+    pipeline._copy_prompt_fusion_frame(root=root, stage=stage, frame=frame)
+    pipeline._copy_prompt_fusion_frame(root=root, stage=stage, frame=frame)
+
+    assert (stage / relative).read_bytes() == data
+
+
+def test_prompt_fusion_stage_rejects_content_address_collision(tmp_path):
+    root = tmp_path / "conversation"
+    stage = tmp_path / "stage"
+    data = b"receipt-bound-frame"
+    digest = hashlib.sha256(data).hexdigest()
+    relative = Path("work") / "fusion-frames" / f"{digest}.png"
+    source = root / relative
+    destination = stage / relative
+    source.parent.mkdir(parents=True)
+    source.write_bytes(data)
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"different-frame")
+
+    with pytest.raises(pipeline.PipelineError, match="prompt fusion input is invalid"):
+        pipeline._copy_prompt_fusion_frame(
+            root=root,
+            stage=stage,
+            frame={"path": relative.as_posix(), "sha256": digest},
+        )
+
+
 def test_twelfth_boundary_plan_sampling_and_backend_binding_have_no_phantom_cut(
     tmp_path,
 ):
@@ -615,7 +654,7 @@ def test_visual_analyzer_receives_half_resolution_proxies_and_restores_originals
     cdir = tmp_path / "conversation"
     work = cdir / "work"
     work.mkdir(parents=True)
-    source = np.full((8, 12, 3), 96, dtype=np.uint8)
+    source = np.full((512, 768, 3), 96, dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", source)
     assert ok
     frozen = tuple(encoded.tobytes() for _index in range(9))
@@ -636,7 +675,7 @@ def test_visual_analyzer_receives_half_resolution_proxies_and_restores_originals
                 image = cv2.imdecode(
                     np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR
                 )
-                assert image.shape[:2] == (4, 6)
+                assert image.shape[:2] == (256, 384)
             return validate_output(json.dumps({"prompt": PROMPT_TEXT}).encode())
 
     names, _prompt = pipeline._run_visual_attempt(
@@ -1943,6 +1982,54 @@ def test_duration_calibration_keeps_short_rewrite_valid():
     assert pipeline._validate_calibrated_duration(
         {"voice_mode": "rewrite"}, 10.0
     ) == 10.0
+
+
+def test_duration_calibration_allows_exact_v1_auto_rewrite_for_long_video():
+    meta = {
+        "effective_request": {
+            "version": 1,
+            "dialogue": {
+                "mode": "auto_rewrite",
+                "target_language": "日语",
+            },
+        },
+        "dialogue_mode": "auto",
+        "voice_mode": "translate",
+        "target_language": "日语",
+        "dialogue_review_policy": "auto_continue",
+    }
+
+    assert pipeline._validate_calibrated_duration(meta, 15.4) == 15.4
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("voice_mode", "rewrite"),
+        ("target_language", "英语"),
+        ("dialogue_review_policy", "review_required"),
+    ],
+)
+def test_duration_calibration_does_not_broaden_v1_translate_exception(
+    field, value,
+):
+    meta = {
+        "effective_request": {
+            "version": 1,
+            "dialogue": {
+                "mode": "auto_rewrite",
+                "target_language": "日语",
+            },
+        },
+        "dialogue_mode": "auto",
+        "voice_mode": "translate",
+        "target_language": "日语",
+        "dialogue_review_policy": "auto_continue",
+    }
+    meta[field] = value
+
+    with pytest.raises(pipeline.PipelineError, match="long_video_audio_mode_unsupported"):
+        pipeline._validate_calibrated_duration(meta, 15.4)
 
 
 @pytest.fixture
@@ -3692,37 +3779,420 @@ def test_run_voice_agent_cannot_see_visual_or_ocr_inputs(
     assert asr_seen[0][0] != cdir
 
 
-def test_run_voice_translate_prompt_has_target_language(tmp_path, video_1s, monkeypatch):
+def test_voice_deepseek_stage_has_skill_and_preserves_line_timestamps(tmp_path):
+    cdir = tmp_path / "conversation"
+    work = cdir / "work"
+    work.mkdir(parents=True)
+    source_lines = [
+        {"text": "Open the box.", "start_s": 0.1, "end_s": 0.8},
+        {"text": "Apply one layer.", "start_s": 0.9, "end_s": 1.6},
+    ]
+    translated = ["盒子を開けます。", "一層塗ります。"]
+    video_prompt = "A hand opens a red cosmetics box on a bright desk."
+    prompt = pipeline._voice_prompt(cdir, "translate", "日语", 2.0)
+
+    class InspectingRunner:
+        def run_isolated_until_output(
+            self, stage, received_prompt, *, session_dir, output_path,
+            max_output_bytes, validate_output, output_schema,
+        ):
+            assert received_prompt == prompt
+            assert "翻译对应的文本" in received_prompt
+            assert "保持格式不变" in received_prompt
+            assert "小众语言" in received_prompt
+            assert "只输出最终翻译文本" in received_prompt
+            assert session_dir == cdir
+            assert output_path == stage / "work" / "voice_lines.json"
+            assert max_output_bytes == voice.MAX_VOICE_LINES_BYTES
+            assert (stage / "SKILL.md").read_text(encoding="utf-8") == (
+                pipeline.DIALOGUE_TRANSFORM_SKILL
+            )
+            assert {
+                path.relative_to(stage).as_posix()
+                for path in stage.rglob("*")
+                if path.is_file()
+            } == {"SKILL.md", "work/dialogue_request.json"}
+            assert json.loads(
+                (stage / "work" / "dialogue_request.json").read_text(
+                    encoding="utf-8"
+                )
+            ) == {
+                "lines": [{"content": line["text"]} for line in source_lines],
+                "video_prompt": video_prompt,
+            }
+            assert output_schema["properties"]["lines"]["minItems"] == 2
+            assert output_schema["properties"]["lines"]["maxItems"] == 2
+            return validate_output(json.dumps({
+                "lines": [{"content": text} for text in translated]
+            }, ensure_ascii=False).encode("utf-8"))
+
+    result = pipeline._run_voice_attempt(
+        InspectingRunner(), work, prompt, source_lines, video_prompt,
+    )
+
+    assert result == [
+        {**line, "text": translated[index]}
+        for index, line in enumerate(source_lines)
+    ]
+
+
+def test_v1_auto_rewrite_recovery_waits_for_video_prompt_before_translation(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(
+        tmp_path,
+        asr_cli=tmp_path / "whisper-cli",
+        asr_model=tmp_path / "whisper-model.bin",
+        retry_count=0,
+    )
+    meta = storage.new_conversation(settings.data_dir, "", "clip.mp4")
+    cid = meta["id"]
+    cdir = settings.data_dir / cid
+    work = cdir / "work"
+    (cdir / "source.mp4").write_bytes(b"source")
+    (work / "manifest.json").write_text(
+        json.dumps({"duration_seconds": 15.4}), encoding="utf-8"
+    )
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        effective_request={
+            "version": 1,
+            "dialogue": {
+                "mode": "auto_rewrite",
+                "target_language": "日语",
+            },
+        },
+        dialogue_mode="auto",
+        voice_mode="translate",
+        target_language="日语",
+        dialogue_review_policy="auto_continue",
+        duration_s=15.4,
+    )
+    stale_lines = [{"text": "stale", "start_s": 0.0, "end_s": 0.5}]
+    (work / "voice_lines.json").write_text(
+        json.dumps(stale_lines, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    assert pipeline._recover_completed_voice_analysis(
+        cdir, storage.load_meta(settings.data_dir, cid), 15.4,
+    ) is None
+    source_lines = [
+        {"text": "Open the box.", "start_s": 0.1, "end_s": 0.8},
+        {"text": "Apply one layer.", "start_s": 0.9, "end_s": 1.6},
+    ]
+    translated = ["盒子を開けます。", "一層塗ります。"]
+    operations = []
+
+    def fake_extract_audio(cdir_arg):
+        audio = cdir_arg / "work" / "voice.mp3"
+        audio.write_bytes(b"normalized-audio")
+        return audio
+
+    def fake_transcribe(*_args, **_kwargs):
+        operations.append("asr")
+        return source_lines
+
+    monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(voice, "probe_audio_duration", lambda _audio: 2.0)
+    monkeypatch.setattr(pipeline.asr, "transcribe", fake_transcribe)
+    monkeypatch.setattr(
+        vocal,
+        "analyze",
+        lambda _audio: vocal.VocalAnalysis(
+            windows=[
+                vocal.VocalWindow(
+                    0, 2000, sung=0.0, spoken=0.8, music=0.0,
+                )
+            ],
+            has_bgm=False,
+        ),
+    )
+    first_lines = pipeline._voice_step(
+        settings,
+        cid,
+        cdir,
+        work,
+        object(),
+        "translate",
+        "日语",
+        allow_no_audio=True,
+        transform=False,
+    )
+
+    expected_lines = [
+        {**line, "text": translated[index]}
+        for index, line in enumerate(source_lines)
+    ]
+    assert operations == ["asr"]
+    assert first_lines == source_lines
+    stored = storage.load_meta(settings.data_dir, cid)
+    assert json.loads(
+        (work / "voice_lines.json").read_text(encoding="utf-8")
+    ) == source_lines
+    assert stored.get("dialogue_review") is None
+    (work / "voice_lines.json").unlink()
+    assert not (work / "voice_lines.json").exists()
+    assert pipeline._recover_completed_voice_analysis(
+        cdir, stored, 15.4,
+    ) == (source_lines, "recognized")
+    assert json.loads(
+        (work / "voice_lines.json").read_text(encoding="utf-8")
+    ) == source_lines
+    incomplete = dict(stored)
+    incomplete.pop("voice_analysis_outcome")
+    with pytest.raises(
+        pipeline.PipelineError, match="voice analysis recovery is incomplete"
+    ):
+        pipeline._recover_completed_voice_analysis(cdir, incomplete, 15.4)
+    inconsistent = dict(stored)
+    inconsistent["voice_analysis_outcome"] = "no_vocal"
+    with pytest.raises(
+        pipeline.PipelineError, match="voice analysis recovery is invalid"
+    ):
+        pipeline._recover_completed_voice_analysis(cdir, inconsistent, 15.4)
+
+    monkeypatch.setattr(
+        pipeline,
+        "_voice_step",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed DeepSeek dialogue must be reused")
+        ),
+    )
+    monkeypatch.setattr(
+        storage,
+        "probe_video",
+        lambda _path: storage.VideoProbe(15.4, 1080, 1920),
+    )
+
+    def fake_extract(argv, *, timeout, step, cwd=None):
+        del argv, timeout, cwd
+        assert step == "extract"
+        (work / "manifest.json").write_text(
+            json.dumps({"duration_seconds": 15.4}), encoding="utf-8"
+        )
+        (work / "contact_sheet.jpg").write_bytes(b"sheet")
+
+    def fake_transform(_settings, _runner, _work, prompt, lines, video_prompt=""):
+        operations.append("deepseek")
+        assert "翻译对应的文本" in prompt
+        assert video_prompt == "visual prompt from video-maker"
+        assert lines == source_lines
+        return expected_lines
+
+    def fake_image_phase(*_args, **_kwargs):
+        persisted = storage.load_meta(settings.data_dir, cid)
+        review = dialogue_review.public_state(persisted["dialogue_review"])
+        assert review is not None
+        assert review["status"] == "frozen"
+        assert review["lines"] == expected_lines
+        assert persisted["voice_lines"] == expected_lines
+        raise pipeline.PipelineError("stop after translated dialogue recovery")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_extract)
+    monkeypatch.setattr(pipeline, "_detect_segments", lambda *_args: [])
+    monkeypatch.setattr(
+        pipeline.scene_planner, "plan_segments", lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        pipeline.long_video, "plan_segments", lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_run_visual_with_retry",
+        lambda *_args, **_kwargs: (["01.png"], "visual prompt from video-maker"),
+    )
+    monkeypatch.setattr(pipeline, "_transform_voice_with_retry", fake_transform)
+    monkeypatch.setattr(
+        pipeline, "_generate_image_optimization_project", fake_image_phase,
+    )
+
+    pipeline.run(settings, cid, object())
+
+    recovered = storage.load_meta(settings.data_dir, cid)
+    assert operations == ["asr", "deepseek"]
+    assert recovered["dialogue_review"]["status"] == "frozen"
+    assert recovered["dialogue_review"]["lines"] == expected_lines
+
+    storage.update_meta(settings.data_dir, cid, status="queued", error=None)
+    monkeypatch.setattr(
+        pipeline,
+        "_transform_voice_with_retry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("frozen translated dialogue must not be translated again")
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_detect_segments",
+        lambda *_args: (_ for _ in ()).throw(
+            pipeline.PipelineError("stop after cached translated dialogue")
+        ),
+    )
+
+    pipeline.run(settings, cid, object())
+
+    assert operations == ["asr", "deepseek"]
+
+
+def test_v1_auto_rewrite_no_audio_freezes_empty_review_without_deepseek(
+    tmp_path, monkeypatch,
+):
     settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "", "clip.mp4")
+    cid = meta["id"]
+    cdir = settings.data_dir / cid
+    work = cdir / "work"
+    (cdir / "source.mp4").write_bytes(b"source")
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        effective_request={
+            "version": 1,
+            "dialogue": {
+                "mode": "auto_rewrite",
+                "target_language": "日语",
+            },
+        },
+        dialogue_mode="auto",
+        voice_mode="translate",
+        target_language="日语",
+        dialogue_review_policy="auto_continue",
+        duration_s=15.4,
+    )
+    monkeypatch.setattr(
+        storage,
+        "probe_video",
+        lambda _path: storage.VideoProbe(15.4, 1080, 1920),
+    )
+    monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
+    monkeypatch.setattr(
+        pipeline,
+        "_transform_voice_with_retry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("empty dialogue must not call DeepSeek")
+        ),
+    )
+
+    def fake_extract(argv, *, timeout, step, cwd=None):
+        del argv, timeout, cwd
+        assert step == "extract"
+        (work / "manifest.json").write_text(
+            json.dumps({"duration_seconds": 15.4}), encoding="utf-8"
+        )
+        (work / "contact_sheet.jpg").write_bytes(b"sheet")
+
+    def stop_after_empty_review(*_args, **_kwargs):
+        persisted = storage.load_meta(settings.data_dir, cid)
+        review = dialogue_review.public_state(persisted["dialogue_review"])
+        assert review is not None
+        assert review["status"] == "frozen"
+        assert review["policy"] == dialogue_review.AUTO_CONTINUE
+        assert review["outcome"] == "no_audio"
+        assert review["lines"] == []
+        raise pipeline.PipelineError("stop after empty dialogue review")
+
+    monkeypatch.setattr(pipeline, "_run_cmd", fake_extract)
+    monkeypatch.setattr(pipeline, "_detect_segments", stop_after_empty_review)
+
+    pipeline.run(settings, cid, object())
+
+    persisted = storage.load_meta(settings.data_dir, cid)
+    assert persisted["dialogue_review"]["status"] == "frozen"
+    assert persisted["dialogue_review"]["lines"] == []
+
+
+def test_auto_no_audio_meta_precedes_and_rebuilds_empty_derived_lines(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(settings.data_dir, "", "clip.mp4")
+    cid = meta["id"]
+    cdir = settings.data_dir / cid
+    work = cdir / "work"
+    storage.update_meta(settings.data_dir, cid, duration_s=1.0)
+    real_atomic_bytes = pipeline._atomic_bytes
+
+    def assert_meta_precedes_derived_file(path, data):
+        if path == work / "voice_lines.json":
+            committed = storage.load_meta(settings.data_dir, cid)
+            assert committed["voice_analysis_outcome"] == "no_audio"
+            assert committed["voice_lines"] == []
+        real_atomic_bytes(path, data)
+
+    monkeypatch.setattr(voice, "extract_audio", lambda _cdir: None)
+    monkeypatch.setattr(
+        pipeline, "_atomic_bytes", assert_meta_precedes_derived_file,
+    )
+
+    assert pipeline._voice_step(
+        settings,
+        cid,
+        cdir,
+        work,
+        object(),
+        "translate",
+        "与原视频相同",
+        allow_no_audio=True,
+    ) == []
+    stored = storage.load_meta(settings.data_dir, cid)
+    assert (work / "voice_lines.json").read_bytes() == b"[]\n"
+    (work / "voice_lines.json").unlink()
+
+    assert pipeline._recover_completed_voice_analysis(
+        cdir, stored, 1.0,
+    ) == ([], "no_audio")
+    assert (work / "voice_lines.json").read_bytes() == b"[]\n"
+
+
+def test_run_voice_translate_prompt_has_target_language(tmp_path, video_1s, monkeypatch):
+    settings = make_settings(
+        tmp_path,
+        asr_cli=tmp_path / "whisper-cli",
+        asr_model=tmp_path / "whisper-model.bin",
+    )
     meta = _make_conversation(settings, video_1s)
     _set_voice_mode(settings, meta, "translate", target_language="英文")
-    calls = []
+    transform_prompts = []
+    cdir = settings.data_dir / meta["id"]
+    work = cdir / "work"
+    (work / "manifest.json").write_text(
+        json.dumps({"duration_seconds": 1.0}), encoding="utf-8"
+    )
 
     def fake_extract_audio(cdir_arg):
         out = cdir_arg / "work" / "voice.mp3"
         out.write_bytes(b"mp3-bytes")
         return out
 
-    def fake_codex(self, workdir, prompt):
-        calls.append(prompt)
-        work = Path(workdir) / "work"
-        if "voice.mp3" in prompt:
-            (work / "voice_lines.json").write_text(json.dumps(VOICE_LINES), encoding="utf-8")
-        else:
-            _write_valid_package(work)
+    def fake_transform(_settings, _runner, _work, prompt, source_lines):
+        transform_prompts.append(prompt)
+        return source_lines
 
-    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        pipeline.asr, "transcribe", lambda *_args, **_kwargs: VOICE_LINES,
+    )
+    monkeypatch.setattr(
+        pipeline, "_transform_voice_with_retry", fake_transform,
+    )
 
-    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+    lines = pipeline._voice_step(
+        settings,
+        meta["id"],
+        cdir,
+        work,
+        object(),
+        "translate",
+        "英文",
+    )
 
     m = storage.load_meta(settings.data_dir, meta["id"])
-    assert m["status"] == "done"
+    assert lines == VOICE_LINES
     assert m["voice_lines"] == VOICE_LINES
-    assert "翻译成英文" in calls[0]
-    # 目标语言由后端注入 maker prompt（codex 不从台词反推）
-    assert "提示词与台词使用目标语言：英文" in calls[1]
+    assert "翻译对应的文本" in transform_prompts[0]
+    assert "保持格式不变" in transform_prompts[0]
+    assert "目标语言是英文" in transform_prompts[0]
 
 
 def test_run_voice_rewrite_prompt_has_rule_and_lines(tmp_path, video_1s, monkeypatch):
@@ -4215,15 +4685,18 @@ def test_run_dialogue_auto_ignores_external_lines_and_isolates_visual_codex(
     ("voice_mode", "target_language", "expected"),
     [
         ("rewrite", "", "洗稿"),
-        ("translate", "日语", "翻译成日语"),
+        ("translate", "日语", "目标语言是日语"),
     ],
 )
 def test_run_dialogue_auto_preserves_requested_voice_processing_mode(
     tmp_path, video_1s, monkeypatch, voice_mode, target_language, expected
 ):
-    settings = make_settings(tmp_path)
+    settings = make_settings(
+        tmp_path,
+        asr_cli=tmp_path / "whisper-cli",
+        asr_model=tmp_path / "whisper-model.bin",
+    )
     meta = _make_conversation(settings, video_1s)
-    _replace_source_with_duration(settings, meta["id"], 10.0)
     storage.update_meta(
         settings.data_dir,
         meta["id"],
@@ -4234,34 +4707,49 @@ def test_run_dialogue_auto_preserves_requested_voice_processing_mode(
         ratio="9:16",
         fit_mode="none",
     )
-    asr_prompts = []
+    transform_prompts = []
+    source_line = {"text": "台词。", "start_s": 0.1, "end_s": 0.8}
+    cdir = settings.data_dir / meta["id"]
+    work = cdir / "work"
+    (work / "manifest.json").write_text(
+        json.dumps({"duration_seconds": 10.0}), encoding="utf-8"
+    )
 
     def fake_extract_audio(cdir_arg):
         out = cdir_arg / "work" / "voice.mp3"
         out.write_bytes(b"normalized-audio")
         return out
 
-    def fake_codex(self, workdir, prompt):
-        work = Path(workdir) / "work"
-        if "voice.mp3" in prompt:
-            asr_prompts.append(prompt)
-            (work / "voice_lines.json").write_text(
-                json.dumps([{"text": "台词。", "start_s": 0.1, "end_s": 0.8}]),
-                encoding="utf-8",
-            )
-        else:
-            _write_valid_package(work, frames=9)
+    def fake_transform(_settings, _runner, _work, prompt, source_lines):
+        transform_prompts.append(prompt)
+        return source_lines
 
-    monkeypatch.setattr(pipeline, "_run_cmd", _fake_extract_ok)
     monkeypatch.setattr(voice, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(CodexRunner, "run", fake_codex)
+    monkeypatch.setattr(
+        pipeline.asr,
+        "transcribe",
+        lambda *_args, **_kwargs: [source_line],
+    )
+    monkeypatch.setattr(
+        pipeline, "_transform_voice_with_retry", fake_transform,
+    )
 
-    pipeline.run(settings, meta["id"], CodexRunner(1, 1))
+    lines = pipeline._voice_step(
+        settings,
+        meta["id"],
+        cdir,
+        work,
+        object(),
+        voice_mode,
+        target_language,
+        allow_no_audio=True,
+    )
 
     stored = storage.load_meta(settings.data_dir, meta["id"])
-    assert stored["status"] == "done", stored.get("error")
-    assert len(asr_prompts) == 1
-    assert expected in asr_prompts[0]
+    assert lines == [source_line]
+    assert stored["voice_lines"] == [source_line]
+    assert len(transform_prompts) == 1
+    assert expected in transform_prompts[0]
 
 
 def test_run_dialogue_auto_routes_explicit_empty_15_4s_scene_result_to_long_plan(
@@ -4689,12 +5177,19 @@ def test_single_voice_line_uses_strong_track_evidence_when_asr_timestamp_misses(
     assert pipeline._classify_voice_line(line, bgm_only, only_line=True) is None
 
 
-def test_voice_prompt_requires_multilingual_transcript_and_forbids_placeholders(tmp_path):
-    prompt = pipeline._voice_prompt(tmp_path, "keep", "", 10.08)
-    assert "自动识别实际语言" in prompt
-    assert "[无法辨识]" in prompt
-    assert "[inaudible]" in prompt
-    assert "输出空数组" in prompt
+def test_voice_prompt_is_transform_only_and_forbids_backend_fields(tmp_path):
+    prompt = pipeline._voice_prompt(tmp_path, "translate", "日语", 10.08)
+    assert "翻译对应的文本" in prompt
+    assert "保持格式不变" in prompt
+    assert "不要输出或猜测 ID、原台词、帧序、起止时间" in prompt
+    source_language = pipeline._voice_prompt(
+        tmp_path, "translate", "与原视频相同", 10.08
+    )
+    assert "保持识别文本的原语种" in source_language
+    assert "无需跨语种翻译" in source_language
+    assert "保持格式不变" in source_language
+    with pytest.raises(pipeline.PipelineError):
+        pipeline._voice_prompt(tmp_path, "keep", "", 10.08)
 
 
 def test_run_voice_placeholder_retries_then_continues_without_fake_dialogue(

@@ -31,9 +31,16 @@ log = logging.getLogger(__name__)
 class DownloadError(RuntimeError):
     """下载或 URL 校验失败（HTTP 层转 422）。"""
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.code = code
 
 
 def _retryable_http_status(status: int) -> bool:
@@ -226,7 +233,10 @@ def download_public_video(
                     )
                 expected = response.getheader("content-length")
                 if expected and expected.isdigit() and int(expected) > max_bytes:
-                    raise DownloadError(f"file exceeds {max_bytes} bytes")
+                    raise DownloadError(
+                        f"file exceeds {max_bytes} bytes",
+                        code="source_too_large",
+                    )
                 total = 0
                 with temporary.open("wb") as handle:
                     while True:
@@ -237,7 +247,10 @@ def download_public_video(
                             break
                         total += len(chunk)
                         if total > max_bytes:
-                            raise DownloadError(f"file exceeds {max_bytes} bytes")
+                            raise DownloadError(
+                                f"file exceeds {max_bytes} bytes",
+                                code="source_too_large",
+                            )
                         handle.write(chunk)
                 if total == 0:
                     raise DownloadError("downloaded file is empty", retryable=True)

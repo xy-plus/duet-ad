@@ -63,3 +63,21 @@ def test_segment_products_leave_message_spacing_before_postprocess_chat():
     disclosure = _rule(css, ".segment-products-disclosure")
 
     assert "margin-bottom: 24px" in disclosure
+
+
+def test_minimal_creation_sections_form_one_aligned_uniform_grid():
+    css = STYLES.read_text(encoding="utf-8")
+    minimal = _rule(css, ".minimal-composer")
+
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in minimal
+    assert "align-items: stretch" in minimal
+    assert "align-items: start" not in minimal
+    assert ".optional-section { background:" not in css
+
+
+def test_source_video_preview_fits_inside_the_user_bubble():
+    css = STYLES.read_text(encoding="utf-8")
+    preview = _rule(css, ".bubble-source-video")
+
+    assert "max-width: 100%" in preview
+    assert "margin-top: 10px" in preview

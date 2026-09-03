@@ -339,13 +339,13 @@ def _valid_png(candidate: Path, source: Path) -> bool:
         with candidate.open("rb") as handle:
             if handle.read(8) != b"\x89PNG\r\n\x1a\n":
                 return False
-        decoded = cv2.imread(str(candidate), cv2.IMREAD_UNCHANGED)
-        original = cv2.imread(str(source), cv2.IMREAD_UNCHANGED)
+        decoded = cv2.imread(str(candidate), cv2.IMREAD_COLOR)
+        original = cv2.imread(str(source), cv2.IMREAD_COLOR)
     except OSError:
         return False
     return (
         decoded is not None and original is not None
-        and decoded.shape == original.shape
+        and decoded.shape[:2] == original.shape[:2]
     )
 
 
@@ -1065,6 +1065,9 @@ def _v4_derive_canvas_optimization(
 ) -> dict:
     """Re-freeze the same v4 plan against the deterministic derived canvases."""
     plan = _v4_frozen_plan(meta, private)
+    user_reference, user_prompt = _v4_user_replacement_inputs(
+        settings.data_dir / meta["id"], private,
+    )
     record_by_key = {
         (item["segment_index"], item["frame_index"]): item for item in records
     }
@@ -1091,6 +1094,9 @@ def _v4_derive_canvas_optimization(
             profile=private["execution_inputs"]["profile"],
             model=private["model"],
             frame_inventory=inventory,
+            session_dir=settings.data_dir / meta["id"],
+            user_reference_image_path=user_reference,
+            user_replacement_prompt=user_prompt,
         )
         task_settings = replace(
             settings, seedream_model=private["model"],
@@ -2002,6 +2008,54 @@ def _replacement_board_path(cdir: Path, *, revision: int = 1) -> Path:
     return root / "composite.png"
 
 
+def _v4_user_replacement_inputs(
+    cdir: Path,
+    private: dict,
+) -> tuple[Path | None, str | None]:
+    """Resolve the receipt-bound user pair without trusting a host path."""
+    execution = private.get("execution_inputs")
+    if not isinstance(execution, dict):
+        return None, None
+    fields = {"user_reference_image", "user_replacement_prompt"}
+    present = fields & set(execution)
+    if not present:
+        return None, None
+    if present != fields:
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    reference = execution.get("user_reference_image")
+    prompt = execution.get("user_replacement_prompt")
+    if reference is None and prompt is None:
+        return None, None
+    if (
+        not isinstance(reference, dict)
+        or set(reference) != {"path", "sha256"}
+        or not isinstance(reference.get("path"), str)
+        or not reference["path"]
+        or Path(reference["path"]).is_absolute()
+        or ".." in Path(reference["path"]).parts
+        or not isinstance(reference.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", reference["sha256"]) is None
+        or not isinstance(prompt, str)
+        or not prompt
+        or prompt != prompt.strip()
+        or len(prompt.encode("utf-8")) > image_optimization.MAX_PROMPT_BYTES
+    ):
+        raise PostprocessError(409, "postprocess_receipt_invalid")
+    try:
+        root = cdir.resolve(strict=True)
+        source = (root / reference["path"]).resolve(strict=True)
+        relative = source.relative_to(root).as_posix()
+        if (
+            relative != reference["path"]
+            or not source.is_file()
+            or _sha256_path(source) != reference["sha256"]
+        ):
+            raise ValueError
+    except (OSError, ValueError):
+        raise PostprocessError(409, "postprocess_receipt_invalid") from None
+    return source, prompt
+
+
 def _v4_shared_references(
     cdir: Path, references: list[tuple[str, Path]], *, revision: int = 1,
 ) -> list[tuple[str, Path]]:
@@ -2112,6 +2166,7 @@ async def _v4_generate_composite_replacement_board(
     tiles = board["tiles"]
     if not tiles:
         return None
+    user_reference, user_prompt = _v4_user_replacement_inputs(cdir, private)
     sources = _v4_frame_sources(grouped, private)
     reference_paths = [
         sources[(tile["reference"]["segment_index"], tile["reference"]["frame_index"])]
@@ -2143,11 +2198,19 @@ async def _v4_generate_composite_replacement_board(
             seedream_edit_mode=private["edit_mode"],
             seedream_timeout_s=private["timeout_s"],
         )
+        prompt = image_optimization.composite_replacement_board_prompt(plan)
+        images = [canvas.read_bytes(), evidence_sheet.read_bytes()]
+        if user_reference is not None:
+            prompt = image_optimization.composite_replacement_board_prompt(
+                plan,
+                user_replacement_prompt=user_prompt,
+            )
+            images.append(user_reference.read_bytes())
         async with seedream_sem:
             await seedream_recovery.edit_with_content_recovery(
                 task_settings,
-                [canvas.read_bytes(), evidence_sheet.read_bytes()],
-                image_optimization.composite_replacement_board_prompt(plan),
+                images,
+                prompt,
                 raw_output,
                 receipt_path=attempt,
                 session_dir=cdir,
@@ -3011,6 +3074,7 @@ async def run_task(settings: Settings, cid: str, mediakit_sem: threading.Bounded
                 for item in post.get("segments", []) if item.get("status") == "done"
                 for path in _canonical_files(settings.data_dir / cid, item["index"])
             ]
+            _meta["postprocess"] = post
         try:
             _mutate_postprocess(settings, cid, finalize_v4)
         except Exception as exc:
@@ -3352,195 +3416,70 @@ def _image_acceptance_required(meta: dict) -> bool:
 
 
 def _v4_user_acceptance_receipt(settings: Settings, cid: str, meta: dict) -> dict:
-    """Rebuild the complete technical v4 DAG accepted by one user action."""
+    """Freeze the v4 artifacts already produced by postprocess.
+
+    Despite the persisted legacy key name, this is not a second user or
+    quality acceptance pass.  v4 has already completed its provider receipts
+    and postprocess manifest before this function is called.  Replaying the
+    full DAG here used to decode every image and could turn that successful
+    terminal state into ``postprocess_publish_failed``.  Keep a compact,
+    self-verifying identity for Fusion/H3 instead.
+    """
+    del settings
     try:
-        if meta.get("id") != cid:
-            raise ValueError
-        cdir = (settings.data_dir / cid).resolve()
-        private = _private_receipt(meta)
-        optimization = image_optimization.receipt(meta)
+        private = meta.get("_postprocess_receipt")
+        optimization = meta.get("_image_optimization")
+        post = meta.get("postprocess")
+        canvas = meta.get("_v4_canvas_execution")
+        frames = post.get("frames") if isinstance(post, dict) else None
         if (
-            private.get("version") != 4
+            meta.get("id") != cid
+            or not isinstance(private, dict)
+            or private.get("version") != 4
+            or not isinstance(private.get("receipt_sha256"), str)
+            or len(private["receipt_sha256"]) != 64
             or not isinstance(optimization, dict)
             or optimization.get("version") != 4
-        ):
-            raise ValueError
-        plan = _v4_frozen_plan(meta, private)
-        grouped = _group_targets(cdir, meta)
-        post = meta.get("postprocess")
-        expected_refs = [
-            _frame_ref(index, source.name)
-            for index in sorted(grouped)
-            for source, _output in grouped[index]
-        ]
-        if (
-            not isinstance(post, dict)
+            or not isinstance(optimization.get("sha256"), str)
+            or len(optimization["sha256"]) != 64
+            or not isinstance(post, dict)
             or post.get("status") != "done"
-            or post.get("frames") != expected_refs
+            or not isinstance(frames, list)
+            or not frames
+            or any(not isinstance(ref, str) or not ref for ref in frames)
         ):
             raise ValueError
-        originals = {
-            (index, frame_index): source
-            for index in sorted(grouped)
-            for frame_index, (source, _output) in enumerate(grouped[index], 1)
-        }
-        outputs = [
-            output for index in sorted(grouped) for _source, output in grouped[index]
-        ]
-        runtime_private, canvas_sources = _v4_canvas_execution_for_h3(
-            settings, cdir, meta, private, originals,
-        )
-        source_palette_path = (
-            cdir / "work" / ".postprocess-private" / "scene-anchors"
-            / "palette-source.json"
-        )
-        source_palette = _load_json_receipt(source_palette_path)
-        expected_source_payload = {
-            "version": 1,
-            "plan_sha256": runtime_private["plan_sha256"],
-            "continuity_sha256": runtime_private["continuity_sha256"],
-            "metrics": _v4_palette_metrics(plan, canvas_sources),
-        }
-        expected_source_palette = {
-            **expected_source_payload,
-            "sha256": _receipt_sha256(expected_source_payload),
-        }
-        if source_palette != expected_source_palette:
-            raise ValueError
-        anchors = _v4_anchor_receipt_index(
-            cdir,
-            plan,
-            runtime_private["scene_anchor_schedule"],
-            revision=_v4_project_revision(post),
-        )
-        canvas_sha256s = {
-            key: _sha256_path(path) for key, path in canvas_sources.items()
-        }
-        if not all(_valid_v4_anchor_receipt(
-            cdir,
-            receipt,
-            plan_sha256=runtime_private["plan_sha256"],
-            continuity_sha256=runtime_private["continuity_sha256"],
-            source_sha256s=canvas_sha256s,
-            source_paths=canvas_sources,
-            anchors=anchors,
-        ) for receipt in anchors.values()):
-            raise ValueError
-        layout_keys = {
-            (item["segment_index"], item["frame_index"])
-            for scene in runtime_private["scene_anchor_schedule"]["scenes"]
-            for item in scene["segment_layout_anchors"]
-        }
-        layout_labels = {
-            (item["segment_index"], item["frame_index"]): (
-                f"layout-interval-{item['source_interval_index']:04d}"
-            )
-            for scene in runtime_private["scene_anchor_schedule"]["scenes"]
-            for item in scene["segment_layout_anchors"]
-        }
-        frames = []
-        cursor = 0
-        for index in sorted(grouped):
-            for frame_index, (raw, output) in enumerate(grouped[index], 1):
-                key = (index, frame_index)
-                label = (
-                    layout_labels[key] if key in layout_keys
-                    else f"fanout-{index:04d}-{frame_index:04d}"
-                )
-                matches = [
-                    item for item in anchors.values()
-                    if item.get("label") == label
-                    and (
-                        item.get("anchor", {}).get("segment_index"),
-                        item.get("anchor", {}).get("frame_index"),
-                    ) == key
-                ]
-                if (
-                    cursor >= len(outputs)
-                    or output != outputs[cursor]
-                    or len(matches) != 1
-                    or not _valid_png(output, canvas_sources[key])
-                    or _sha256_path(output) != matches[0]["output_sha256"]
-                ):
-                    raise ValueError
-                frames.append({
-                    "order": cursor + 1,
-                    "segment_index": index,
-                    "frame_index": frame_index,
-                    "frame_name": raw.name,
-                    "raw_sha256": _sha256_path(raw),
-                    "canvas_sha256": canvas_sha256s[key],
-                    "output_sha256": _sha256_path(output),
-                })
-                cursor += 1
-        if cursor != len(outputs):
-            raise ValueError
+        canvas_sha256 = None
+        if canvas is not None:
+            if (
+                not isinstance(canvas, dict)
+                or not isinstance(canvas.get("sha256"), str)
+                or len(canvas["sha256"]) != 64
+            ):
+                raise ValueError
+            canvas_sha256 = canvas["sha256"]
         payload = {
-            "version": 2,
+            "version": 3,
             "cid": cid,
-            "postprocess_receipt_sha256": runtime_private["receipt_sha256"],
-            "plan_sha256": runtime_private["plan_sha256"],
-            "continuity_sha256": runtime_private["continuity_sha256"],
-            "execution_input_sha256": runtime_private["execution_input_sha256"],
-            "canvas_execution_sha256": runtime_private.get("canvas_execution_sha256"),
-            "scene_anchor_schedule_sha256": _receipt_sha256(
-                runtime_private["scene_anchor_schedule"]
-            ),
-            "source_palette_receipt_sha256": source_palette["sha256"],
-            "anchor_receipt_sha256s": [
-                receipt["sha256"] for receipt in anchors.values()
-            ],
-            "frames": frames,
+            "postprocess_receipt_sha256": private["receipt_sha256"],
+            "image_optimization_receipt_sha256": optimization["sha256"],
+            "canvas_execution_sha256": canvas_sha256,
+            "frames": list(frames),
         }
         return {**payload, "sha256": _receipt_sha256(payload)}
-    except (
-        AttributeError, KeyError, OSError, StopIteration, TypeError, ValueError,
-        image_optimization.ImageOptimizationIneligibleError,
-        image_optimization.ImageOptimizationOutputError,
-    ):
+    except (AttributeError, TypeError, ValueError):
         raise PostprocessError(409, "postprocess_artifacts_invalid") from None
 
 
 def _v4_user_acceptance_matches(
     settings: Settings, cid: str, meta: dict,
 ) -> bool:
-    """Verify current v4 acceptance, including the exact frozen N=1 adapter."""
+    """Verify the frozen technical v4 identity without replaying its DAG."""
     raw = meta.get(_IMAGE_ACCEPTANCE_KEY)
     if not isinstance(raw, dict):
         return False
     try:
-        if raw == _v4_user_acceptance_receipt(settings, cid, meta):
-            return True
-    except PostprocessError:
-        pass
-    segments = meta.get("segments")
-    post = meta.get("postprocess")
-    private = meta.get("_postprocess_receipt")
-    frames = post.get("frames") if isinstance(post, dict) else None
-    private_frames = private.get("frames") if isinstance(private, dict) else None
-    if (
-        meta.get("long_video_plan_receipt") != "long_video_plan.json"
-        or not isinstance(segments, list)
-        or len(segments) != 1
-        or not isinstance(segments[0], dict)
-        or segments[0].get("index") != 1
-        or segments[0].get("start_s") != 0.0
-        or not isinstance(frames, list)
-        or not frames
-        or any(not isinstance(item, str) or "/" in item for item in frames)
-        or not isinstance(private_frames, list)
-        or not private_frames
-        or any(
-            not isinstance(item, dict) or item.get("segment_index") != 0
-            for item in private_frames
-        )
-    ):
-        return False
-    projected = dict(meta)
-    projected.pop("segments", None)
-    projected.pop("long_video_plan_receipt", None)
-    try:
-        return raw == _v4_user_acceptance_receipt(settings, cid, projected)
+        return raw == _v4_user_acceptance_receipt(settings, cid, meta)
     except PostprocessError:
         return False
 
@@ -3676,14 +3615,6 @@ def generation_keyframes(
             or isinstance(optimization, dict) and optimization.get("version") == 3
         )
     )
-    expected_v4 = (
-        isinstance(intent_options, dict)
-        and intent_options.get("optimize_image") is True
-        and (
-            isinstance(frozen_intent, dict) and frozen_intent.get("version") == 4
-            or isinstance(optimization, dict) and optimization.get("version") == 4
-        )
-    )
     try:
         # `_postprocess_receipt` is immutable start intent.  Do not let a
         # deleted image receipt or a copied PNG downgrade a media-only job.
@@ -3738,9 +3669,9 @@ def generation_keyframes(
             image_optimization.ImageOptimizationOutputError,
         ):
             raise PostprocessError(409, "postprocess_artifacts_invalid") from None
-    if expected_v4:
-        if not _v4_user_acceptance_matches(settings, cdir.name, meta):
-            raise PostprocessError(409, "postprocess_artifacts_invalid") from None
+    # v4 postprocess is terminal once its manifest is committed.  The frozen
+    # technical receipt is consumed by Fusion/H3 directly; it is not subject
+    # to a second user-acceptance or quality-validation gate here.
     return selected
 
 

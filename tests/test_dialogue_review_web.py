@@ -1,4 +1,5 @@
 import json
+import re
 
 from test_legacy_phase2_frame_viewer import _run_jsdom_contract
 from test_web_h3_contract import APP_JS, _run_contract
@@ -18,6 +19,34 @@ def _capability(**overrides):
     }
     value.update(overrides)
     return {"dialogue_review": value}
+
+
+def _minimal_capability(**overrides):
+    value = {
+        "supported": True,
+        "version": 1,
+        "endpoint": "/api/conversations",
+        "encoding": "multipart/form-data",
+        "request_field": "generation_request",
+        "replacement_image_field": "replacement_image",
+        "aspect_ratios": ["16:9", "9:16"],
+        "resolutions": ["480p", "768p"],
+        "defaults": {
+            "fit_mode": "auto",
+            "optimize_image": True,
+            "remove_subtitle": True,
+            "remove_logo": True,
+        },
+        "dialogue": {"mode": "auto_rewrite", "translation": True},
+        "replacement": {
+            "supported": True,
+            "accept": ["image/jpeg", "image/png", "image/webp"],
+            "max_bytes": 10 * 1024 * 1024,
+            "max_instruction_chars": 1000,
+        },
+    }
+    value.update(overrides)
+    return value
 
 
 def _review(status="waiting", **overrides):
@@ -55,7 +84,7 @@ def test_capability_is_exact_and_unknown_contract_never_enables_post():
     assert result["extraPolicy"] is None
 
 
-def test_create_policy_defaults_auto_and_is_sent_only_for_supported_auto_mode():
+def test_legacy_create_policy_helper_is_safe_but_hidden_from_auto_rewrite_creation():
     capability = _capability()["dialogue_review"]
     result = _run_contract(
         "(()=>{const capability=" + json.dumps(capability) + ";return {"
@@ -76,10 +105,81 @@ def test_create_policy_defaults_auto_and_is_sent_only_for_supported_auto_mode():
     assert result["unsupported"] is None
 
     html = INDEX_HTML.read_text(encoding="utf-8")
-    auto = html.split('name="dialogue-review-policy" value="auto_continue"', 1)[1]
+    visible, legacy = html.split(
+        '<div class="legacy-contract-controls" hidden aria-hidden="true">', 1
+    )
+    auto = legacy.split('name="dialogue-review-policy" value="auto_continue"', 1)[1]
     assert "checked" in auto.split(">", 1)[0]
-    assert "自动识别并继续" in html
-    assert "暂停校对台词" in html
+    assert 'id="dialogue-review-fields"' not in visible
+    assert "中途校对" not in visible
+
+    dialogue = visible.split('aria-labelledby="dialogue-title"', 1)[1].split(
+        "</section>", 1
+    )[0]
+    assert 'id="script-input"' not in html
+    assert 'id="translation-toggle"' not in html
+    assert 'name="target-language-mode" value="same" checked' in dialogue
+    assert 'name="target-language-mode" value="other"' in dialogue
+    assert "与原视频相同" in dialogue
+    assert "其他" in dialogue
+    translation_fields = re.search(
+        r'<div\b(?P<attrs>[^>]*)id="translation-fields"(?P<tail>[^>]*)>',
+        dialogue,
+        flags=re.DOTALL,
+    )
+    assert translation_fields is not None
+    fields_attrs = translation_fields.group("attrs") + translation_fields.group("tail")
+    assert "hidden" in fields_attrs
+    language_input = re.search(
+        r'<input\b(?P<attrs>[^>]*)id="lang-input"(?P<tail>[^>]*)>',
+        dialogue,
+        flags=re.DOTALL,
+    )
+    assert language_input is not None
+    language_attrs = language_input.group("attrs") + language_input.group("tail")
+    assert "disabled" in language_attrs
+    assert "required" not in language_attrs
+
+    minimal = _minimal_capability()
+    language_contract = _run_contract(
+        "(()=>{const capability="
+        + json.dumps(minimal)
+        + ";const base={aspectRatio:'9:16',resolution:'768p',"
+        "targetLanguage:contract.resolveTargetLanguage('same',''),"
+        "hasReplacementImage:false,replacementInstruction:''};"
+        "const request=contract.buildMinimalGenerationRequest(base,capability);"
+        "const other=contract.buildMinimalGenerationRequest({...base,"
+        "targetLanguage:contract.resolveTargetLanguage('other',' 日语 ')},capability);"
+        "const injected=contract.buildMinimalGenerationRequest({...base,script:'用户预写台词'},capability);"
+        "const v2={...capability,version:2};let v2Error=null;"
+        "try{contract.buildMinimalGenerationRequest(base,v2)}catch(error){v2Error=error.message}"
+        "return {request:{version:request.version,dialogue:request.dialogue},"
+        "other:{version:other.version,dialogue:other.dialogue},"
+        "injected:{version:injected.version,dialogue:injected.dialogue},"
+        "normalizedV2:contract.normalizeMinimalCreationCapability({minimal_creation:v2}),v2Error}})()"
+    )
+    assert language_contract == {
+        "request": {
+            "version": 1,
+            "dialogue": {
+                "mode": "auto_rewrite",
+                "target_language": "与原视频相同",
+            },
+        },
+        "other": {
+            "version": 1,
+            "dialogue": {"mode": "auto_rewrite", "target_language": "日语"},
+        },
+        "injected": {
+            "version": 1,
+            "dialogue": {
+                "mode": "auto_rewrite",
+                "target_language": "与原视频相同",
+            },
+        },
+        "normalizedV2": None,
+        "v2Error": "生成服务尚未支持当前创建方式",
+    }
 
 
 def test_commit_payload_is_exact_cas_and_does_not_invent_asr_metadata():
@@ -169,7 +269,7 @@ def test_waiting_and_frozen_dom_have_one_clear_action_and_read_only_boundary():
     assert result["readonlyInputs"] == 0
 
 
-def test_timeline_and_mobile_layout_make_wait_explicit():
+def test_legacy_timeline_helper_keeps_dialogue_wait_safety():
     review = _review()
     result = _run_contract(
         "(()=>{const model=contract.operationTimeline({id:'cid',status:'processing',has_source:true,"
@@ -183,7 +283,6 @@ def test_timeline_and_mobile_layout_make_wait_explicit():
     assert "等待你校对" in result["current"]["detail"]
 
     css = STYLES.read_text(encoding="utf-8")
-    assert "repeat(10" in css
     assert ".dialogue-review-line" in css
     mobile = css.split("@media (max-width: 768px)", 1)[1]
     assert ".dialogue-review-policy { grid-template-columns: 1fr; }" in mobile

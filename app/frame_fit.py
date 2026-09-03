@@ -34,6 +34,63 @@ def _decode_frame(data: bytes, label: str) -> np.ndarray:
     return image
 
 
+def normalize_image_to_canvas_png(
+    data: bytes,
+    canvas_width: int,
+    canvas_height: int,
+    *,
+    label: str = "image",
+) -> bytes:
+    """Decode any supported raster into a centered BGR PNG canvas.
+
+    Content is scaled uniformly to fit inside the requested canvas.  A ratio
+    mismatch is padded with black pixels; content is never stretched or
+    cropped.
+    """
+    if (
+        isinstance(canvas_width, bool)
+        or not isinstance(canvas_width, int)
+        or isinstance(canvas_height, bool)
+        or not isinstance(canvas_height, int)
+        or canvas_width <= 0
+        or canvas_height <= 0
+    ):
+        raise FrameFitError("canvas dimensions must be positive integers")
+    image = _decode_frame(data, label)
+    source_height, source_width = image.shape[:2]
+    if source_width * canvas_height > canvas_width * source_height:
+        fitted_width = canvas_width
+        fitted_height = max(1, source_height * canvas_width // source_width)
+    else:
+        fitted_height = canvas_height
+        fitted_width = max(1, source_width * canvas_height // source_height)
+    if (fitted_width, fitted_height) != (source_width, source_height):
+        interpolation = (
+            cv2.INTER_AREA
+            if fitted_width < source_width or fitted_height < source_height
+            else cv2.INTER_CUBIC
+        )
+        image = cv2.resize(
+            image, (fitted_width, fitted_height), interpolation=interpolation,
+        )
+    horizontal = canvas_width - fitted_width
+    vertical = canvas_height - fitted_height
+    if horizontal or vertical:
+        image = cv2.copyMakeBorder(
+            image,
+            vertical // 2,
+            vertical - vertical // 2,
+            horizontal // 2,
+            horizontal - horizontal // 2,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
+    ok, encoded = cv2.imencode(".png", image)
+    if not ok:
+        raise FrameFitError(f"cannot encode image: {label}")
+    return encoded.tobytes()
+
+
 def _byte_dimensions(frames: Sequence[bytes]) -> list[tuple[int, int]]:
     snapshots = list(frames)
     if not snapshots:

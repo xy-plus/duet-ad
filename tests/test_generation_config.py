@@ -4,7 +4,13 @@ import threading
 import pytest
 from fastapi.testclient import TestClient
 
-from app import generation_config, long_generation, main as main_module, postprocess, storage
+from app import (
+    generation_config,
+    long_generation,
+    main as main_module,
+    postprocess,
+    storage,
+)
 from app.main import (
     _automatic_postprocess_request,
     _postprocess_matches_automatic_request,
@@ -196,7 +202,7 @@ def test_capability_get_declares_exact_create_contract(client):
                 "remove_watermark": "boolean",
             },
             "defaults": generation_config.DEFAULTS,
-        }
+        },
     }
 
 

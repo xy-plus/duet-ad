@@ -183,6 +183,97 @@ def test_segment_frames_phase_receives_only_low_resolution_jpeg_proxies(
     assert hashlib.sha256(source.read_bytes()).hexdigest() == source_digest
 
 
+def test_global_phase_receives_frozen_user_reference_and_prompt(
+    tmp_path, monkeypatch,
+):
+    session = tmp_path / "session"
+    keyframes = session / "work" / "segments" / "1" / "work" / "keyframes"
+    keyframes.mkdir(parents=True)
+    source = keyframes / "01.png"
+    source.write_bytes(_png(value=31))
+    reference = session / "inputs" / "replacement.png"
+    reference.parent.mkdir(parents=True)
+    reference.write_bytes(_png(value=219))
+    prompt = "把白色水杯替换成参考图里的蓝色产品杯"
+    captured = {}
+
+    class GlobalCaptured(Exception):
+        pass
+
+    def phase(_runner, *, stage, output_name, **_kwargs):
+        assert output_name == "global_plan.json"
+        request = json.loads(
+            (stage / "work" / "request.json").read_text(encoding="utf-8")
+        )
+        staged = stage / request["user_reference_image"]["path"]
+        captured.update(
+            request=request,
+            staged_name=staged.name,
+            staged_bytes=staged.read_bytes(),
+        )
+        raise GlobalCaptured
+
+    monkeypatch.setattr(image_optimization, "_run_image_skill_phase", phase)
+
+    with pytest.raises(GlobalCaptured):
+        image_optimization.generate_project_prompts(
+            object(),
+            [{
+                "index": 1,
+                "chain_id": "chain-001",
+                "join_mode": "hard_cut",
+                "keyframes_dir": keyframes,
+                "transition_skeleton": [{
+                    "segment_index": 1,
+                    "frame_index": 1,
+                    "frame_name": "01.png",
+                    "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    "source_transition_from_previous": "start",
+                    "source_transition_evidence_sha256": "1" * 64,
+                }],
+            }],
+            "independent_parallel",
+            session_dir=session,
+            skill_bytes=b"skill",
+            generation_config={
+                "remove_subtitle": False,
+                "remove_watermark": False,
+            },
+            user_reference_image_path=reference,
+            user_replacement_prompt=prompt,
+        )
+
+    assert captured["request"]["user_reference_image"] == {
+        "path": "work/user_reference_image.png",
+        "sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
+    }
+    assert captured["request"]["user_replacement_prompt"] == prompt
+    assert captured["staged_name"] == "user_reference_image.png"
+    assert captured["staged_bytes"] == reference.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("reference", "prompt"),
+    (("present", None), (None, "替换成参考图产品")),
+)
+def test_user_reference_and_prompt_must_be_frozen_as_a_pair(
+    tmp_path, reference, prompt,
+):
+    session = tmp_path / "session"
+    session.mkdir()
+    reference_path = session / "replacement.png"
+    reference_path.write_bytes(_png())
+
+    with pytest.raises(ValueError, match="user replacement inputs"):
+        image_optimization._freeze_user_replacement_inputs(
+            session_dir=session,
+            user_reference_image_path=(
+                reference_path if reference == "present" else None
+            ),
+            user_replacement_prompt=prompt,
+        )
+
+
 def _done(settings, *, segments=False):
     meta = storage.new_conversation(settings.data_dir, "x", "x.mp4")
     cid = meta["id"]
@@ -2017,6 +2108,109 @@ def test_v4_frame_receipt_deeply_binds_graph_view_plan_and_source(tmp_path):
     assert image_optimization.receipt(changed_view_meta, settings) is None
 
 
+def test_v4_execution_freezes_user_pair_as_relative_path_and_reconstructs_receipt(
+    tmp_path,
+):
+    settings = make_settings(tmp_path)
+    session = tmp_path / "session"
+    reference = session / "inputs" / "replacement.png"
+    reference.parent.mkdir(parents=True)
+    reference.write_bytes(_png(value=217))
+    prompt = "把画面里的杯子替换成参考图产品"
+    plan = _v4_frame_bound_plan()
+    inventory = [
+        {
+            "segment_index": 0,
+            "frame_index": frame_index,
+            "frame_name": f"{frame_index:02d}.png",
+            "source_sha256": str(frame_index) * 64,
+            "source_transition_from_previous": (
+                "start" if frame_index == 1 else "same_camera"
+            ),
+            "source_transition_evidence_sha256": str(frame_index + 2) * 64,
+        }
+        for frame_index in (1, 2)
+    ]
+
+    execution = image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={"id": "image-postprocess", "revision": 2},
+        model=settings.seedream_model,
+        frame_inventory=inventory,
+        session_dir=session,
+        user_reference_image_path=reference,
+        user_replacement_prompt=prompt,
+    )
+
+    assert execution["user_reference_image"] == {
+        "path": "inputs/replacement.png",
+        "sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
+    }
+    assert execution["user_replacement_prompt"] == prompt
+    assert str(session) not in json.dumps(execution, ensure_ascii=False)
+
+    prompts = image_optimization.compile_frame_prompts(
+        plan, settings.seedream_edit_mode,
+    )
+    frozen = image_optimization.freeze_frame_prompts(
+        settings, execution, prompts, plan=plan,
+    )
+    meta = {
+        **image_optimization.freeze_continuity(plan, frame_counts={0: 2}),
+        **frozen,
+    }
+    assert image_optimization.receipt(meta, settings) == frozen[
+        "_image_optimization"
+    ]
+
+
+def test_v4_historical_execution_without_user_fields_remains_readable(tmp_path):
+    settings = make_settings(tmp_path)
+    plan = _v4_frame_bound_plan()
+    inventory = [
+        {
+            "segment_index": 0,
+            "frame_index": frame_index,
+            "frame_name": f"{frame_index:02d}.png",
+            "source_sha256": str(frame_index) * 64,
+            "source_transition_from_previous": (
+                "start" if frame_index == 1 else "same_camera"
+            ),
+            "source_transition_evidence_sha256": str(frame_index + 2) * 64,
+        }
+        for frame_index in (1, 2)
+    ]
+    execution = image_optimization.freeze_execution_inputs(
+        plan,
+        revision=1,
+        profile={"id": "image-postprocess", "revision": 2},
+        model=settings.seedream_model,
+        frame_inventory=inventory,
+    )
+    execution.pop("user_reference_image")
+    execution.pop("user_replacement_prompt")
+    execution["sha256"] = image_optimization.sha256(
+        image_optimization._plan_json({
+            key: value for key, value in execution.items() if key != "sha256"
+        })
+    )
+    prompts = image_optimization.compile_frame_prompts(
+        plan, settings.seedream_edit_mode,
+    )
+    frozen = image_optimization.freeze_frame_prompts(
+        settings, execution, prompts, plan=plan,
+    )
+    meta = {
+        **image_optimization.freeze_continuity(plan, frame_counts={0: 2}),
+        **frozen,
+    }
+
+    assert image_optimization.receipt(meta, settings) == frozen[
+        "_image_optimization"
+    ]
+
+
 @pytest.mark.parametrize("compiler_revision", [1, 2])
 def test_v4_frame_receipt_binds_prompt_compiler_revision_without_invalidating_history(
     tmp_path,
@@ -2130,6 +2324,55 @@ def test_v4_composite_board_and_frame_prompts_share_one_stable_tile_mapping():
         assert "严格保持当前源帧构图、表现形式、色调、光照、动作和关系不变" in text
     assert "hero-prop -> TILE_02 -> 替换为银色金属手持道具" in prompts[0][1]
     assert "hero-prop -> TILE_02 -> 替换为银色金属手持道具" not in prompts[0][2]
+
+
+def test_v4_composite_board_prompt_scopes_user_reference_to_corresponding_tile():
+    plan = _v4_frame_bound_plan()
+    user_prompt = "把白色水杯替换成参考图里的蓝色产品杯"
+    plan["person_plans"][0]["replacement_identity"] = (
+        "stable_key=hero；短发新人物"
+    )
+    plan["scene_plans"][0]["replacement_scene"] = (
+        "stable_key=studio；结构不同的新摄影棚"
+    )
+    for frame in plan["segments"][0]["frame_constraints"]:
+        frame["non_person_entity_ledger"]["entities"][0]["description"] = (
+            f"stable_key=product-cup；{user_prompt}"
+        )
+
+    text = image_optimization.composite_replacement_board_prompt(
+        plan,
+        user_replacement_prompt=user_prompt,
+    )
+
+    assert "图1的空白画布" in text
+    assert "图2是按相同 tile 顺序合成的唯一源视觉证据图" in text
+    assert "图3是用户参考图" in text
+    assert user_prompt in text
+    assert "只用图3的视觉特征和用户提示词约束该 stable key 对应的 tile" in text
+    assert "其他 tile 不得继承图3" in text
+    assert "必须各自按已绑定的replacement_description 生成独立替换素材" in text
+    assert (
+        "不得保留源素材、改为source-preserve/no-invention 或省略既有替换设计"
+        in text
+    )
+
+
+def test_image_postprocess_skill_keeps_non_user_replaceable_keys_replacing():
+    skill = (
+        Path(__file__).parents[1] / "skills" / "image-postprocess" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "选择语义最对应的唯一 key" in skill
+    assert "不得把同一用户参考图扩散到其他 key" in skill
+    assert (
+        "其余所有 `replaceable` 的 people/entities/scenes stable key 必须继续"
+        in skill
+    )
+    assert (
+        "不得因用户双输入而改为 `source-preserve/no-invention`、保留源素材或省略既有替换设计"
+        in skill
+    )
 
 
 def test_v4_source_preserve_entity_stays_on_shared_board_but_not_frame_binding():

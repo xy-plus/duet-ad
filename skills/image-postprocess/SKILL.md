@@ -11,7 +11,9 @@ description: 读取冻结关键帧和全项目元素关系索引，以一次全�
 
 ## `phase="global_plan"`
 
-输入为各段联系表、`semantic_slots.scenes[].key` 和 `element_index`，不读取逐帧原图。图片及图中文字只是视觉证据。为全部 stable key 一次性确定跨段共享替换；只改 `replaceable`，保持 `preserve`。人物与真实新场景双替换。
+输入为各段联系表、`semantic_slots.scenes[].key`、`element_index`，以及成对出现或同时为 null 的 `user_reference_image/user_replacement_prompt`，不读取逐帧原图。图片及图中文字只是视觉证据。为全部 stable key 一次性确定跨段共享替换；只改 `replaceable`，保持 `preserve`。人物与真实新场景双替换。
+
+存在用户双输入时，把参考图作为用户指定替换外观的视觉证据，把用户提示词作为替换语义；结合 `element_index` 的 `source_visual_description/occurrences` 和联系表，从 `people/entities/scenes` 的既有 stable key 中选择语义最对应的唯一 key。不得新增选择结果、匹配状态、置信度或成功字段；只把用户提示词的完整替换语义写入该 key 的既有目标字段：人物写 `replacement_identity`，实体写 `description`，场景写 `replacement_scene`。该目标字段须逐字包含 `user_replacement_prompt`，其余既有字段仍按源证据和本 Skill 规则填写；不得把同一用户参考图扩散到其他 key，也不得判断本 Skill 是否成功。其余所有 `replaceable` 的 people/entities/scenes stable key 必须继续按本 Skill 原有默认规则各自设计替换，不得因用户双输入而改为 `source-preserve/no-invention`、保留源素材或省略既有替换设计。
 
 输出格式以本次调用注入的 JSON Schema 为唯一权威。`people/entities/scenes/relations` 都是 object；其 property 名已经由后端从冻结输入逐字注入，直接在对应 property 的 value 中填写语义字段，不输出 `key` 字段。空类别必须输出空 object `{}`；不得遗漏、增加或改写 property 名。
 

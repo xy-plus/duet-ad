@@ -110,7 +110,13 @@ def test_runtime_handlers_are_wired_to_structured_recovery_contracts():
         "function selectConversation", 1
     )[0]
     assert "state.detailSig = null" in detail_failure
-    assert "if (silent && state.currentId === id) startPolling(id)" in detail_failure
+    assert "if (seq !== state.detailSeq || state.currentId !== id) return;" in detail_failure
+    silent_failure = detail_failure.split("if (silent) {", 1)[1].split(
+        "state.currentId = null", 1
+    )[0]
+    assert "renderStreamError" in silent_failure
+    assert "startPolling(id);" in silent_failure
+    assert "return;" in silent_failure
 
     prompt = source.split("function promptWorkspace", 1)[1].split(
         "function editablePromptCard", 1

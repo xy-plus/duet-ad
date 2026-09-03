@@ -17,6 +17,65 @@ def _png():
     return encoded.tobytes()
 
 
+def test_seedream_payload_uses_each_input_magic_for_data_url_mime(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = Settings(access_token="x", data_dir=tmp_path, retry_interval_s=0)
+    inputs = []
+    for extension in (".png", ".jpg", ".webp"):
+        ok, encoded = cv2.imencode(
+            extension, np.full((2, 3, 3), 127, dtype=np.uint8),
+        )
+        assert ok
+        inputs.append(encoded.tobytes())
+    payloads = []
+
+    async def handler(request):
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(_png()).decode("ascii")}],
+        })
+
+    asyncio.run(seedream.edit(
+        settings,
+        inputs,
+        "prompt",
+        tmp_path / "output.png",
+        receipt_path=tmp_path / "attempt.json",
+        transport=httpx.MockTransport(handler),
+    ))
+
+    assert len(payloads) == 1
+    urls = payloads[0]["image"]
+    assert [url.split(";", 1)[0] for url in urls] == [
+        "data:image/png", "data:image/jpeg", "data:image/webp",
+    ]
+    assert [base64.b64decode(url.split(",", 1)[1]) for url in urls] == inputs
+
+
+def test_seedream_rejects_unknown_input_magic_before_paid_claim(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    settings = Settings(access_token="x", data_dir=tmp_path, retry_interval_s=0)
+    receipt_path = tmp_path / "attempt.json"
+
+    with pytest.raises(seedream.SeedreamError) as caught:
+        asyncio.run(seedream.edit(
+            settings,
+            [_png(), b"GIF89a"],
+            "prompt",
+            tmp_path / "output.png",
+            receipt_path=receipt_path,
+            transport=httpx.MockTransport(lambda _request: pytest.fail("POST called")),
+        ))
+
+    assert caught.value.code == "invalid_input"
+    assert not receipt_path.exists()
+    assert not seedream._claim_path(receipt_path).exists()
+
+
 @pytest.mark.parametrize(
     ("response", "expected_code", "expected_stage"),
     [

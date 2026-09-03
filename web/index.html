@@ -75,117 +75,155 @@
       </button>
       <div id="composer-panel" class="composer-inner">
         <p id="composer-error" class="inline-error" role="alert" hidden></p>
-        <form id="composer" class="composer" novalidate>
-          <div class="source-switch" role="radiogroup" aria-label="视频来源">
-            <label class="source-option">
-              <input type="radio" name="source-mode" value="upload">
-              <span>上传视频</span>
-            </label>
-            <label class="source-option">
-              <input type="radio" name="source-mode" value="link" checked>
-              <span>视频链接</span>
-            </label>
-          </div>
-          <div id="file-chip" class="file-chip" hidden>
-            <span class="ic ic-film"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-film"></use></svg></span>
-            <span id="file-chip-name" class="file-chip-name"></span>
-            <span id="file-chip-size" class="file-chip-size"></span>
-            <button type="button" id="file-remove" class="icon-btn icon-btn-sm" aria-label="移除已选文件">
-              <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"></use></svg></span>
-            </button>
-          </div>
-          <div id="url-row" class="composer-row url-row">
-            <label class="sr-only" for="url-input">视频链接</label>
-            <input id="url-input" class="composer-input" type="url" inputmode="url" autocomplete="off"
-                   placeholder="视频链接：http(s) 直链 / TikTok 视频页">
-          </div>
-          <div class="voice-row" role="radiogroup" aria-label="台词处理">
-            <span class="voice-label">台词处理</span>
-            <label class="voice-option">
-              <input type="radio" name="voice-mode" value="keep" checked>
-              <span>原文保持</span>
-            </label>
-            <label class="voice-option">
-              <input type="radio" name="voice-mode" value="rewrite">
-              <span>原文改编</span>
-            </label>
-            <label class="voice-option">
-              <input type="radio" name="voice-mode" value="translate">
-              <span>翻译为</span>
-            </label>
-            <label class="sr-only" for="lang-input">翻译目标语言</label>
-            <input id="lang-input" class="lang-input" type="text" placeholder="目标语言，如：日语" autocomplete="off" hidden>
-          </div>
-          <div class="voice-row" role="radiogroup" aria-label="台词模式">
-            <span class="voice-label">台词模式</span>
-            <label class="voice-option">
-              <input type="radio" name="dialogue-mode" value="auto" checked>
-              <span>自动识别</span>
-            </label>
-            <label class="voice-option">
-              <input type="radio" name="dialogue-mode" value="none">
-              <span>无台词</span>
-            </label>
-          </div>
-          <fieldset id="dialogue-review-fields" class="dialogue-review-policy" disabled>
-            <legend>识别完成后</legend>
-            <label class="dialogue-review-policy-option">
-              <input type="radio" name="dialogue-review-policy" value="auto_continue" checked>
-              <span><strong>自动识别并继续</strong><small>默认无人值守，一路运行至成片</small></span>
-            </label>
-            <label class="dialogue-review-policy-option">
-              <input type="radio" name="dialogue-review-policy" value="review_required">
-              <span><strong>暂停校对台词</strong><small>识别后等待采用此稿，再继续同一任务</small></span>
-            </label>
-            <p id="dialogue-review-policy-status" class="generation-config-status" aria-live="polite">能力确认前使用自动继续，且不发送额外字段。</p>
-          </fieldset>
-          <details id="generation-config" class="generation-config" open>
-            <summary class="generation-config-summary">
-              <span>生成配置</span>
-              <span id="generation-config-summary-text" class="generation-config-summary-text">正在读取服务器配置能力…</span>
-            </summary>
-            <fieldset id="generation-config-fields" class="generation-config-fields" disabled>
-              <legend class="sr-only">生成前图片处理配置</legend>
-              <label class="generation-config-option">
-                <input id="generation-optimize-image" type="checkbox" name="generation-config" value="optimize_image" checked>
-                <span>图片优化</span>
+        <form id="composer" class="composer minimal-composer" novalidate>
+          <section class="setup-section source-section" aria-labelledby="source-title">
+            <div class="setup-heading">
+              <span class="setup-step">1</span>
+              <div>
+                <h2 id="source-title">原视频</h2>
+                <p>粘贴可访问的视频链接，也可切换为本地上传</p>
+              </div>
+            </div>
+            <div class="source-switch" role="radiogroup" aria-label="视频来源">
+              <label class="source-option">
+                <input type="radio" name="source-mode" value="link" checked>
+                <span>视频链接</span>
               </label>
-              <label class="generation-config-option">
-                <input id="generation-remove-subtitle" type="checkbox" name="generation-config" value="remove_subtitle">
-                <span>去字幕</span>
+              <label class="source-option">
+                <input type="radio" name="source-mode" value="upload">
+                <span>上传视频</span>
               </label>
-              <label class="generation-config-option">
-                <input id="generation-remove-watermark" type="checkbox" name="generation-config" value="remove_watermark">
-                <span>去水印</span>
-              </label>
-            </fieldset>
-            <p id="generation-config-status" class="generation-config-status" aria-live="polite">配置能力确认前不会发送额外字段。</p>
-          </details>
-          <p id="file-hint" class="file-hint" hidden>最长 300 秒 · 最大 500MB · MP4/MOV/WebM；超过 10 秒会拆分为单次不超过 10 秒的视频生成子任务</p>
-          <div class="composer-row note-row">
-            <button type="button" id="attach-btn" class="icon-btn" aria-label="选择视频文件" hidden>
+            </div>
+            <button type="button" id="attach-btn" class="source-upload-button" hidden>
               <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-attach"></use></svg></span>
+              选择视频
             </button>
-            <label class="sr-only" for="note-input">备注</label>
-            <input id="note-input" class="composer-input" type="text" placeholder="备注（可选）：想复刻的镜头重点" autocomplete="off">
-            <button type="submit" id="send-btn" class="send-btn" aria-label="发送" disabled>
-              <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-send"></use></svg></span>
-            </button>
+            <div id="file-chip" class="file-chip" hidden>
+              <span class="ic ic-film"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-film"></use></svg></span>
+              <span id="file-chip-name" class="file-chip-name"></span>
+              <span id="file-chip-size" class="file-chip-size"></span>
+              <button type="button" id="file-remove" class="icon-btn icon-btn-sm" aria-label="移除已选文件">
+                <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"></use></svg></span>
+              </button>
+            </div>
+            <div id="url-row" class="composer-row url-row">
+              <label class="sr-only" for="url-input">视频链接</label>
+              <input id="url-input" class="composer-input" type="url" inputmode="url" autocomplete="off"
+                     placeholder="粘贴 http(s) 视频直链或视频页链接" required>
+            </div>
+            <p id="file-hint" class="file-hint" hidden>最长 300 秒 · 最大 500MB · MP4/MOV/WebM</p>
+          </section>
+
+          <section class="setup-section" aria-labelledby="output-title">
+            <div class="setup-heading">
+              <span class="setup-step">2</span>
+              <div>
+                <h2 id="output-title">生成配置</h2>
+                <p>选择新视频的画幅与清晰度</p>
+              </div>
+            </div>
+            <div class="output-config-grid">
+              <fieldset class="compact-choice-group">
+                <legend>画幅</legend>
+                <label><input type="radio" name="aspect-ratio" value="9:16" checked><span>竖屏 9:16</span></label>
+                <label><input type="radio" name="aspect-ratio" value="16:9"><span>横屏 16:9</span></label>
+              </fieldset>
+              <fieldset class="compact-choice-group">
+                <legend>清晰度</legend>
+                <label><input type="radio" name="resolution" value="768p" checked><span>高清 768p</span></label>
+                <label><input type="radio" name="resolution" value="480p"><span>标准 480p</span></label>
+              </fieldset>
+            </div>
+          </section>
+
+          <section class="setup-section" aria-labelledby="dialogue-title">
+            <div class="setup-heading">
+              <span class="setup-step">3</span>
+              <div>
+                <h2 id="dialogue-title">改编台词</h2>
+                <p>系统自动识别并改编台词，你只需选择最终视频语种</p>
+              </div>
+            </div>
+            <fieldset class="language-fieldset">
+              <legend>最终视频语种</legend>
+              <div class="language-switch">
+                <label class="language-option">
+                  <input type="radio" name="target-language-mode" value="same" checked>
+                  <span>与原视频相同</span>
+                </label>
+                <label class="language-option">
+                  <input type="radio" name="target-language-mode" value="other">
+                  <span>其他</span>
+                </label>
+              </div>
+              <div id="translation-fields" class="translation-fields" hidden>
+                <label for="lang-input">其他语种</label>
+                <input id="lang-input" class="lang-input" type="text" maxlength="80" disabled
+                       placeholder="例如：中文、英语、日语" autocomplete="off">
+              </div>
+            </fieldset>
+          </section>
+
+          <section class="setup-section optional-section" aria-labelledby="replacement-title">
+            <div class="setup-heading">
+              <span class="setup-step is-optional">可选</span>
+              <div>
+                <h2 id="replacement-title">指定替换</h2>
+                <p>用参考图和一句话说明要替换的内容</p>
+              </div>
+            </div>
+            <div class="replacement-inputs">
+              <button type="button" id="replacement-select" class="reference-image-button">上传参考图</button>
+              <div id="replacement-chip" class="reference-image-chip" hidden>
+                <img id="replacement-preview" alt="已选参考图预览">
+                <span id="replacement-name"></span>
+                <button type="button" id="replacement-remove" class="icon-btn icon-btn-sm" aria-label="移除参考图">
+                  <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"></use></svg></span>
+                </button>
+              </div>
+              <label class="sr-only" for="replacement-instruction">替换说明</label>
+              <textarea id="replacement-instruction" class="setup-textarea" rows="3" maxlength="1000"
+                        placeholder="例如：把画面中的白色水杯替换成参考图中的产品杯"></textarea>
+            </div>
+            <p id="replacement-hint" class="field-hint">参考图与替换说明需要一起提供</p>
+          </section>
+
+          <div class="legacy-contract-controls" hidden aria-hidden="true">
+            <input id="note-input" type="text">
+            <input type="radio" name="voice-mode" value="rewrite" checked>
+            <input type="radio" name="dialogue-mode" value="auto" checked>
+            <fieldset id="dialogue-review-fields" disabled>
+              <input type="radio" name="dialogue-review-policy" value="auto_continue" checked>
+            </fieldset>
+            <span id="dialogue-review-policy-status"></span>
+            <details id="generation-config">
+              <span id="generation-config-summary-text"></span>
+              <fieldset id="generation-config-fields" disabled>
+                <input id="generation-optimize-image" type="checkbox" checked>
+                <input id="generation-remove-subtitle" type="checkbox" checked>
+                <input id="generation-remove-watermark" type="checkbox" checked>
+              </fieldset>
+              <span id="generation-config-status"></span>
+            </details>
           </div>
+
+          <p id="creation-service-status" class="creation-service-status" aria-live="polite">正在连接生成服务…</p>
+          <button type="submit" id="send-btn" class="btn btn-primary create-video-button" disabled>开始生成</button>
           <div id="upload-progress" class="upload-progress" hidden>
             <div class="up-track"><div id="up-fill" class="up-fill"></div></div>
             <span id="up-label" class="up-label">正在上传 0%</span>
           </div>
         </form>
-        <p class="composer-hint">提交一段参考视频，AI 将抽取关键帧并准备视频生成</p>
+        <p class="composer-hint">提交后即可离开页面，项目会自动运行至新视频完成</p>
       </div>
     </div>
   </main>
 
   <input type="file" id="file-input" accept="video/*" hidden>
+  <input type="file" id="replacement-image-input" accept="image/jpeg,image/png,image/webp" hidden>
 </div>
 
-<dialog id="pp-dialog" class="pp-dialog" aria-labelledby="pp-title">
+<dialog id="pp-dialog" class="pp-dialog" aria-labelledby="pp-title" hidden aria-hidden="true">
   <form id="pp-form" class="pp-form" novalidate>
     <h2 id="pp-title" class="pp-title">后处理关键帧</h2>
     <p class="pp-sub">勾选处理项（至少一项）。确认后才会提交素材处理；取消不会提交。</p>

@@ -1,384 +1,367 @@
-# duet-ad1 · H3 与双前端生产部署
+# duet-ad1 · 极简创建 v1 测试部署（3213 → 3214）
 
-目标拓扑固定为同一个 `duet-ad1-caddy.service` 提供两个 HTTPS 入口：
+本 runbook 只更新极简前端测试入口所使用的后端进程：
 
-- `:3211 → 127.0.0.1:3212 uvicorn`，保留原有全路径反代语义；
-- `:3213 /api/* → 127.0.0.1:3212 uvicorn`，不剥离 `/api`；其余路径从 `/home/xy/duet-ad1/web-next/dist` 提供 SPA。
+- 已存在的 `duet-ad1-caddy.service` 在 `:3213` 接收 HTTPS，且仅把
+  `/api/*` 反代到 `127.0.0.1:3214`；
+- `duet-ad1-minimal-frontend-3213.service` 从本工作树启动单进程
+  uvicorn，并只监听 `127.0.0.1:3214`；
+- 测试实例固定使用独立的
+  `/home/xy/duet-ad1/data/test-instances/minimal-frontend-3213/data`；
+- 生产入口 `:3211 → 127.0.0.1:3212`、`duet-ad1.service`、生产
+  `DATA_DIR=/home/xy/duet-ad1/data` 和生产静态文件均不在本次范围内。
 
-不新增前端 service、CORS 或第二个 uvicorn。Caddy 配置只启用 HTTP/1.1、HTTP/2；H3 是模型名，不是 HTTP/3。
+唯一允许重启的服务是
+`duet-ad1-minimal-frontend-3213.service`。不要 reload/restart Caddy，不要
+restart `duet-ad1.service`，不要安装本工作树内的 Caddy 配置，也不要更新
+3211 或 3213 的静态文件。若现有 Caddy 拓扑不满足上述断言，立即停止；本
+runbook 不负责修复代理。
 
-本 runbook 的纯文档部分 TDD=N/A；部署前仍必须运行下面的自动化测试。上线采用 fix-forward，不恢复已删除的 Seedance 提交路径。
+所有部署 smoke 仅使用 GET。不得运行
+`/home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next/.deploy/smoke-h3.sh`，
+不得创建项目，不得调用 submit/retry，也不得为了验收触发任何付费 POST。
 
-## 1. Preflight
+## 1. 固定 unit 合同
 
-在仓库根目录执行：
+本 runbook 假定以下 unit 已经由独立变更预置在
+`/home/xy/.config/systemd/user/duet-ad1-minimal-frontend-3213.service`：
+
+```ini
+[Unit]
+Description=duet-ad1 3213 minimal frontend preview backend
+Wants=network-online.target
+After=network-online.target duet-h3-gateway.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next
+EnvironmentFile=/home/xy/.config/duet-ad1/service.env
+ExecStart=/usr/bin/env DATA_DIR=/home/xy/duet-ad1/data/test-instances/minimal-frontend-3213/data ENABLE_PIPELINE=1 ENABLE_H3_SUBMIT=1 ENABLE_MINIMAL_CREATION=1 CODEX_HOME=/home/xy/.codex-accounts/acct2 /home/xy/duet-ad1/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 3214
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+UMask=0077
+NoNewPrivileges=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=duet-ad1-minimal-frontend-3213
+
+[Install]
+WantedBy=default.target
+```
+
+`EnvironmentFile` 只提供既有秘密和通用参数；`ExecStart` 必须在启动目标进程时
+显式覆盖独立 `DATA_DIR`、三个能力开关和 `CODEX_HOME`。这样测试实例不会读取
+3211 的项目，也不会与生产实例争用会话锁或恢复任务。不要输出、复制或提交
+`/home/xy/.config/duet-ad1/service.env` 的值。
+
+先验证磁盘上的 unit 和 systemd 当前已加载的合同。任何一项不一致都应停止，
+不要在这次代码部署中顺带改 unit：
 
 ```bash
-cd /home/xy/duet-ad1
-test -x .venv/bin/python
-command -v ffmpeg
-command -v ffprobe
-command -v codex
-command -v bwrap
-test -x /home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli
-test -s /home/xy/.local/share/duet-asr/ggml-small.bin
-printf '%s  %s\n' \
-  1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b \
-  /home/xy/.local/share/duet-asr/ggml-small.bin | sha256sum -c -
-.venv/bin/python -m compileall -q app
-bash -n run.sh .deploy/smoke-h3.sh
-.venv/bin/python - <<'PY'
+rtk proxy /usr/bin/test -r /home/xy/.config/systemd/user/duet-ad1-minimal-frontend-3213.service
+rtk proxy /usr/bin/systemd-analyze --user verify /home/xy/.config/systemd/user/duet-ad1-minimal-frontend-3213.service
+rtk rg -x -F 'WorkingDirectory=/home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next' /home/xy/.config/systemd/user/duet-ad1-minimal-frontend-3213.service
+rtk rg -x -F 'EnvironmentFile=/home/xy/.config/duet-ad1/service.env' /home/xy/.config/systemd/user/duet-ad1-minimal-frontend-3213.service
+rtk rg -x -F 'ExecStart=/usr/bin/env DATA_DIR=/home/xy/duet-ad1/data/test-instances/minimal-frontend-3213/data ENABLE_PIPELINE=1 ENABLE_H3_SUBMIT=1 ENABLE_MINIMAL_CREATION=1 CODEX_HOME=/home/xy/.codex-accounts/acct2 /home/xy/duet-ad1/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 3214' /home/xy/.config/systemd/user/duet-ad1-minimal-frontend-3213.service
+rtk proxy /usr/bin/systemctl --user show duet-ad1-minimal-frontend-3213.service --property=FragmentPath --property=WorkingDirectory --property=ExecStart --no-pager
+```
+
+## 2. 只读拓扑与依赖检查
+
+验证现行 Caddy，而不是本工作树内的候选 Caddy 文件。下面只读配置和状态，
+不会 reload 或 restart 任何服务：
+
+```bash
+rtk proxy /home/xy/duet-ad1/.venv/bin/python - <<'PY'
 import json
 from pathlib import Path
 
-config = json.loads(Path('.deploy/caddy/config.json').read_text())
-server = config['apps']['http']['servers']['srv3211']
-assert server['listen'] == [':3211']
-assert server['protocols'] == ['h1', 'h2']
-upstream = server['routes'][0]['handle'][0]['upstreams'][0]['dial']
-assert upstream == '127.0.0.1:3212'
+config = json.loads(
+    Path('/home/xy/duet-ad1/.deploy/caddy/config.json').read_text()
+)
+servers = config['apps']['http']['servers']
 
-server = config['apps']['http']['servers']['srv3213']
-assert server['listen'] == [':3213']
-assert server['protocols'] == ['h1', 'h2']
-api = server['routes'][0]
-assert api['match'] == [{'path': ['/api/*']}]
-assert api['handle'][0]['handler'] == 'reverse_proxy'
-assert api['handle'][0]['upstreams'][0]['dial'] == '127.0.0.1:3212'
+def api_upstream(name: str) -> str:
+    route = next(
+        item
+        for item in servers[name]['routes']
+        if item.get('match') == [{'path': ['/api/*']}]
+    )
+    return route['handle'][0]['upstreams'][0]['dial']
+
+assert servers['srv3211']['listen'] == [':3211']
+assert api_upstream('srv3211') == '127.0.0.1:3212'
+assert servers['srv3213']['listen'] == [':3213']
+assert api_upstream('srv3213') == '127.0.0.1:3214'
+print('caddy-topology-ok')
 PY
-/usr/local/libexec/duet/caddy validate --config "$PWD/.deploy/caddy/config.json"
+rtk proxy /usr/local/libexec/duet/caddy validate --config /home/xy/duet-ad1/.deploy/caddy/config.json
+rtk proxy /usr/bin/systemctl --user is-active duet-ad1-caddy.service
+rtk proxy /usr/bin/systemctl --user is-active duet-ad1.service
+rtk proxy /usr/bin/systemctl --user is-active duet-h3-gateway.service
 ```
 
-Codex 使用 bwrap 创建自己的 user/mount/network namespace。Ubuntu AppArmor
-下不能再在外层 user service 叠加 `PrivateTmp` / `ProtectSystem` /
-`ProtectControlGroups` / `ProtectKernelTunables`，否则
-服务会进入 `unprivileged_userns` profile，内层沙箱在解析开始前就失败。
-仓库 unit 保留 `NoNewPrivileges` / `LockPersonality` / `RestrictSUIDSGID`；
-`RestrictAddressFamilies` 显式加入 bwrap 配置 loopback 所需的 `AF_NETLINK`。
-CodexRunner 仍固定 `workspace-write` 且禁网。
-
-在发布前用与 unit 相同的保留属性执行一次无付费沙箱探针：
+验证本地运行依赖、ASR/声学模型、DeepSeek 凭据文件和专用 Codex 认证目录。
+这些命令不调用模型或视频供应商：
 
 ```bash
-systemd-run --user --wait --pipe --collect \
-  --property=NoNewPrivileges=true \
-  --property=LockPersonality=true \
-  --property=RestrictSUIDSGID=true \
-  --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' \
-  codex sandbox -P :workspace -C "$PWD" -- /bin/true
+rtk proxy /usr/bin/test -x /home/xy/duet-ad1/.venv/bin/python
+rtk proxy /usr/bin/test -x /home/xy/duet-ad1/.venv/bin/uvicorn
+rtk proxy /usr/bin/test -x /home/xy/.local/bin/ffmpeg
+rtk proxy /usr/bin/test -x /home/xy/.local/bin/ffprobe
+rtk proxy /usr/bin/test -x /home/xy/.local/bin/codex
+rtk proxy /usr/bin/test -x /usr/bin/bwrap
+rtk proxy /usr/bin/test -x /home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli
+rtk proxy /usr/bin/test -s /home/xy/.local/share/duet-asr/ggml-small.bin
+rtk proxy /usr/bin/test -s /home/xy/duet-ad1/models/yamnet.tflite
+rtk proxy /usr/bin/test -s /home/xy/.config/claude/deepseek.env
+rtk proxy /usr/bin/test -s /home/xy/.codex-accounts/acct2/auth.json
+rtk proxy /usr/bin/bash -c "printf '%s  %s\n' 1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b /home/xy/.local/share/duet-asr/ggml-small.bin | /usr/bin/sha256sum -c -"
+rtk proxy /usr/bin/env CODEX_HOME=/home/xy/.codex-accounts/acct2 /home/xy/.local/bin/codex login status
+rtk proxy /usr/bin/env PYTHONPATH=/home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next /home/xy/duet-ad1/.venv/bin/python -c 'import ai_edge_litert, cv2, fastapi, httpx, multipart, numpy, scenedetect, uvicorn; import app.config, app.minimal_creation, app.project_progress; print("python-dependencies-ok")'
 ```
 
-该命令必须退出 0；它只启动本地 sandbox，不调用模型或视频 API。
-
-确认磁盘可写且现有恢复状态不会被清理：
+极简 v1 capability 还依赖共享环境文件中的 `ACCESS_TOKEN`、
+`AUTODL_ART_TOKEN`、`MINIMAX_API_KEY`、`ARK_API_KEY`、
+`ENABLE_MEDIAKIT_ERASE=1` 和 `VOLC_MEDIAKIT_API_KEY`。只检查键是否非空，
+不要打印值：
 
 ```bash
-test -d data
-test -w data
-find data -maxdepth 4 -path '*/.h3/attempts/*/attempt.json' -type f -print | head
+rtk proxy /home/xy/duet-ad1/.venv/bin/python - <<'PY'
+from pathlib import Path
+
+values = {}
+for raw_line in Path('/home/xy/.config/duet-ad1/service.env').read_text().splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith('#') or '=' not in line:
+        continue
+    key, value = line.split('=', 1)
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    values[key.strip()] = value
+
+required = (
+    'ACCESS_TOKEN',
+    'AUTODL_ART_TOKEN',
+    'MINIMAX_API_KEY',
+    'ARK_API_KEY',
+    'VOLC_MEDIAKIT_API_KEY',
+)
+missing = [key for key in required if not values.get(key)]
+assert not missing, f'missing service.env keys: {missing}'
+assert values.get('ENABLE_MEDIAKIT_ERASE', '').lower() in {'1', 'true', 'yes'}
+print('minimal-runtime-settings-present')
+PY
 ```
 
-不要删除或改写既有 `prepared_input.json`、`.h3/`、`generated.mp4`；它们是恢复和防重复扣费的依据。
+## 3. 数据兼容与测试门禁
 
-## 2. 测试
+复用并保留同一个测试 `DATA_DIR`；重复部署不得清空、改名或重新初始化它，也
+不得把生产数据复制进来。先确保目录存在，再只读列出已有项目和恢复回执：
 
 ```bash
-/home/xy/duet-ad1/.venv/bin/python -m pytest tests -q
-git diff --check
-systemd-analyze --user verify .deploy/systemd/duet-ad1.service
-/usr/local/libexec/duet/caddy validate --config "$PWD/.deploy/caddy/config.json"
+rtk proxy /usr/bin/install -d -m 0700 /home/xy/duet-ad1/data/test-instances/minimal-frontend-3213/data
+rtk proxy /usr/bin/test -w /home/xy/duet-ad1/data/test-instances/minimal-frontend-3213/data
+rtk proxy /usr/bin/find /home/xy/duet-ad1/data/test-instances/minimal-frontend-3213/data -mindepth 2 -maxdepth 2 -type f -name meta.json -print
+rtk proxy /usr/bin/find /home/xy/duet-ad1/data/test-instances/minimal-frontend-3213/data -type f -name attempt.json -print
 ```
 
-全量测试必须通过。此阶段不运行 `.deploy/smoke-h3.sh`；3213 的生产 smoke 只允许第 6 节列出的 GET/HEAD，不创建会话、不提交生成。
+既有 minimal creation v1 项目的 `effective_request`、`input_receipt`、已生成
+台词和供应商 attempt 都是恢复依据，不迁移、不回写。历史项目缺少 v1 冻结字段
+时，list/detail 仍必须可读，detail 中相关字段返回 `null`，并由后端给出合法的
+`project_progress`；不能伪造 hash，也不能回退到要求用户提交台词的旧流程。
 
-## 3. 唯一 EnvironmentFile 与原 user unit
-
-生产只保留现有 `systemctl --user` 的 `duet-ad1.service`。本次把同名 unit 原地替换，不创建 root system service，也不创建第二个 user service。所有服务环境——包括非秘密的监听、PATH 和开关——统一放在：
-
-```text
-%h/.config/duet-ad1/service.env
-```
-
-先用不会把值写进 shell history 的编辑器创建/迁移环境文件：
+部署前必须通过文法、依赖和兼容测试。测试不得访问真实供应商：
 
 ```bash
-install -d -m 0700 ~/.config/duet-ad1
-test -e ~/.config/duet-ad1/service.env || install -m 0600 /dev/null ~/.config/duet-ad1/service.env
-chmod 0600 ~/.config/duet-ad1/service.env
-${EDITOR:?set EDITOR first} ~/.config/duet-ad1/service.env
-chmod 0600 ~/.config/duet-ad1/service.env
+rtk proxy /usr/bin/git -C /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next status --short
+rtk proxy /usr/bin/git -C /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next rev-parse HEAD
+rtk proxy /usr/bin/git -C /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next diff --check
+rtk proxy /home/xy/duet-ad1/.venv/bin/python -m compileall -q /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next/app
+rtk proxy /usr/bin/env PYTHONPATH=/home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next /home/xy/duet-ad1/.venv/bin/python -m pytest -q /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next/tests/test_minimal_creation_api.py /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next/tests/test_minimal_creation_backend.py /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next/tests/test_minimal_creation_storage.py /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next/tests/test_minimal_frontend_contract.py /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next/tests/test_minimal_pipeline_contract.py /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next/tests/test_project_progress.py
+rtk proxy /usr/bin/env PYTHONPATH=/home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next /home/xy/duet-ad1/.venv/bin/python -m pytest -q /home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next/tests
 ```
 
-首条命令只在文件不存在时创建它；重复执行不得截断或重建已有文件。在编辑器中把原 unit、旧 drop-in 和旧环境文件里的所有服务变量迁入这一份文件；不要在终端打印、复制到工单或提交到仓库。文件按实际启用能力填写以下键，秘密值在现场录入：
+`ENABLE_PIPELINE=1` 和 `ENABLE_H3_SUBMIT=1` 意味着 restart 后会恢复这个独立
+`DATA_DIR` 中已经持久化的任务。部署前必须确认这些任务属于测试实例；不要用新的
+POST 作为健康检查，也不要因状态未知而重新提交。
 
-```text
-HOST=127.0.0.1
-PORT=3212
-PATH=/home/xy/.local/bin:/home/xy/duet-ad1/.venv/bin:/usr/local/bin:/usr/bin:/bin
-DATA_DIR=/home/xy/duet-ad1/data
+## 4. 最小部署
 
-ACCESS_TOKEN=
-ENABLE_PIPELINE=1
-MAX_UPLOAD_MB=500
-CODEX_TIMEOUT_S=1800
-CODEX_CONCURRENCY=10
-AUTO_RETRY_COUNT=2
-AUTO_RETRY_INTERVAL_S=15
-MAX_QUEUED=100
-VOCAL_FILTER=on
-YAMNET_MODEL_PATH=/home/xy/duet-ad1/models/yamnet.tflite
-ASR_CLI=/home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli
-ASR_MODEL=/home/xy/.local/share/duet-asr/ggml-small.bin
-ASR_TIMEOUT_S=600
-ASR_THREADS=4
-
-ENABLE_H3_SUBMIT=1
-AUTODL_ART_TOKEN=
-H3_REQUEST_TIMEOUT_S=30
-H3_POLL_TIMEOUT_S=1500
-H3_DOWNLOAD_TIMEOUT_S=180
-H3_POLL_INTERVAL_S=3
-
-ENABLE_MEDIAKIT_ERASE=0
-VOLC_MEDIAKIT_API_KEY=
-MEDIAKIT_CONCURRENCY=4
-MEDIAKIT_TIMEOUT_S=180
-
-# Seedream 图片优化；ARK_API_KEY 留空即关闭该 capability
-ARK_API_KEY=
-SEEDREAM_MODEL=doubao-seedream-5-0-pro-260628
-SEEDREAM_EDIT_MODE=independent_parallel
-SEEDREAM_CONCURRENCY=4
-SEEDREAM_TIMEOUT_S=300
-
-TIKTOK_PROXY=
-DOWNLOAD_TIMEOUT_S=120
-```
-
-只有确实使用显式 Codex 认证目录时，才另加 `CODEX_HOME=/absolute/path`；否则整行省略，让 Codex 使用默认认证目录，禁止用空值覆盖。未启用的可选能力保留空凭据并关闭对应开关。`HOST=127.0.0.1`、`PORT=3212` 是 Caddy 拓扑的一部分，不得放宽为公网监听。
-
-确认 `service.env` 已完整迁移后，用仓库 unit 覆盖同名原 unit：
+代码、unit、代理和依赖检查全部通过后，只执行下列 restart：
 
 ```bash
-install -d -m 0700 ~/.config/systemd/user
-install -m 0644 .deploy/systemd/duet-ad1.service \
-  ~/.config/systemd/user/duet-ad1.service
-systemd-analyze --user verify ~/.config/systemd/user/duet-ad1.service
+rtk proxy /usr/bin/systemctl --user restart duet-ad1-minimal-frontend-3213.service
+rtk proxy /usr/bin/systemctl --user is-active duet-ad1-minimal-frontend-3213.service
+rtk proxy /usr/bin/systemctl --user show duet-ad1-minimal-frontend-3213.service --property=MainPID --property=ExecMainStatus --property=WorkingDirectory --property=ExecStart --property=NRestarts --no-pager
+rtk proxy /usr/bin/journalctl --user -u duet-ad1-minimal-frontend-3213.service --since '-2 minutes' --no-pager
+rtk proxy /usr/bin/ss -ltnp 'sport = :3214'
 ```
 
-不要将上述 namespace 限制作为 drop-in 加回去；如果需要改变 unit 硬化策略，
-必须先在同样的 user-service 属性下完成一次 bwrap 与 Codex 断网写入测试。
+本次代码部署没有 unit 变更，因此不要执行 `systemctl --user daemon-reload`。
+更不能执行 Caddy 的 reload/restart 或 `duet-ad1.service` 的 restart。3214 必须仍
+仅绑定 `127.0.0.1`，不得暴露为公网监听。
 
-Seedream 模型参数按能力生成：默认 Pro `doubao-seedream-5-0-pro-260628`
-不得发送 `sequential_image_generation`；Lite、4.5、4.0 必须发送
-`sequential_image_generation=disabled`。失败段不迁移模型或改旧回执，只能由用户按当前
-`expected_revision` 调用分段 retry；该确认会递增 revision 并使用新的 attempt 路径。
+## 5. GET-only smoke
 
-新 unit 只有一个 `EnvironmentFile=`，没有任何 inline `Environment=`。在 `daemon-reload` 前删除仅指向旧 `h3.env` 的 drop-in 和旧环境文件，确保本次重启已经只有一个环境源：
+下面脚本只发 GET：验证 3214 本机后端、3213 既有代理和静态入口、3211 生产
+回归、完整 v1 capability，以及隔离目录内所有已有项目的 list/detail 读取兼容。
+访问令牌由终端无回显输入，不写 shell history，也不打印响应中的项目内容。
 
 ```bash
-rm -f ~/.config/systemd/user/duet-ad1.service.d/h3.conf
-rm -f ~/.config/duet-ad1/h3.env
+rtk proxy /usr/bin/env PYTHONPATH=/home/xy/duet-ad1/.worktree/release-fusion-budget-439c4b5-next /home/xy/duet-ad1/.venv/bin/python - <<'PY'
+import getpass
+
+import httpx
+
+token = getpass.getpass('3213 ACCESS_TOKEN: ')
+assert token, 'ACCESS_TOKEN is required'
+headers = {'Authorization': f'Bearer {token}'}
+
+with httpx.Client(verify=False, timeout=30.0) as client:
+    for url in (
+        'http://127.0.0.1:3214/api/health',
+        'https://127.0.0.1:3213/api/health',
+        'https://127.0.0.1:3211/api/health',
+    ):
+        response = client.get(url)
+        response.raise_for_status()
+        assert response.json() == {'ok': True}
+
+    frontend = client.get('https://127.0.0.1:3213/')
+    frontend.raise_for_status()
+
+    response = client.get(
+        'https://127.0.0.1:3213/api/capabilities', headers=headers
+    )
+    response.raise_for_status()
+    capability = response.json().get('minimal_creation')
+    assert isinstance(capability, dict)
+    assert capability.get('supported') is True
+    assert capability.get('version') == 1
+    assert capability.get('endpoint') == '/api/conversations'
+    assert capability.get('encoding') == 'multipart/form-data'
+
+    response = client.get(
+        'https://127.0.0.1:3213/api/conversations', headers=headers
+    )
+    response.raise_for_status()
+    projects = response.json()
+    assert isinstance(projects, list)
+    v1_projects = 0
+    for project in projects:
+        assert isinstance(project.get('has_video'), bool)
+        progress = project.get('project_progress')
+        assert isinstance(progress, dict)
+        assert progress.get('status') in {
+            'queued', 'running', 'succeeded', 'failed'
+        }
+        assert isinstance(progress.get('percent'), int)
+        assert 0 <= progress['percent'] <= 100
+
+        detail = client.get(
+            'https://127.0.0.1:3213/api/conversations/' + project['id'],
+            headers=headers,
+        )
+        detail.raise_for_status()
+        payload = detail.json()
+        assert payload.get('id') == project['id']
+        assert isinstance(payload.get('has_video'), bool)
+        assert isinstance(payload.get('project_progress'), dict)
+        assert 'effective_request' in payload
+        assert 'input_receipt' in payload
+        effective_request = payload['effective_request']
+        if (
+            isinstance(effective_request, dict)
+            and effective_request.get('version') == 1
+        ):
+            input_receipt = payload['input_receipt']
+            assert isinstance(input_receipt, dict)
+            assert input_receipt.get('version') == 1
+            v1_projects += 1
+
+print(f'get-smoke-ok projects={len(projects)} v1_projects={v1_projects}')
+PY
 ```
 
-删除前必须确认所有变量已经迁移；上述两个精确旧路径删除后不可由本 runbook 恢复。不要运行会展开值的 `systemctl --user show ... Environment`，也不要 `cat`、`env`、`set` 或 shell trace 读取 `service.env`。
+成功标准：所有请求为 2xx，3214/3213/3211 health 均为 `{"ok":true}`，
+`minimal_creation` 精确宣告 v1，且已有项目全部能通过 GET list/detail 读取。若失败，
+不要用 POST 探测，也不要动 3211 或 Caddy；进入下一节关闭 capability。
 
-## 4. 原地发布
+## 6. 回滚：先关闭 capability
 
-确保代码和依赖已经位于 `/home/xy/duet-ad1`，再执行：
+回滚的第一步不是切代码、删数据或回滚前端，而是停止接受新的 v1 创建：仅把
+`/home/xy/.config/systemd/user/duet-ad1-minimal-frontend-3213.service` 的
+`ExecStart` 中 `ENABLE_MINIMAL_CREATION=1` 改为
+`ENABLE_MINIMAL_CREATION=0`。必须保留独立 `DATA_DIR`、`ENABLE_PIPELINE=1`、
+`ENABLE_H3_SUBMIT=1` 和 `CODEX_HOME`；这样 capability 消失，新 v1 POST 被拒绝，
+但已经接受的 v1 项目仍可读取和恢复。
+
+该单行 unit 变更需先审核，再只重载 user manager 配置并重启同一个测试 service。
+`daemon-reload` 不会 reload/restart Caddy，但仍不得夹带其他 unit 变更：
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable duet-ad1.service
-systemctl --user restart duet-ad1.service
-systemctl --user is-active duet-ad1.service
-journalctl --user -u duet-ad1.service --since '-2 minutes' --no-pager
+rtk proxy /usr/bin/systemd-analyze --user verify /home/xy/.config/systemd/user/duet-ad1-minimal-frontend-3213.service
+rtk proxy /usr/bin/systemctl --user daemon-reload
+rtk proxy /usr/bin/systemctl --user restart duet-ad1-minimal-frontend-3213.service
+rtk proxy /usr/bin/systemctl --user is-active duet-ad1-minimal-frontend-3213.service
+rtk proxy /usr/bin/journalctl --user -u duet-ad1-minimal-frontend-3213.service --since '-2 minutes' --no-pager
 ```
 
-服务必须是单进程；不要给 uvicorn 增加 `--workers`。Seedream 的模型仅允许 `doubao-seedream-5-0-pro-260628`（默认 5.0 Pro）、`doubao-seedream-5-0-260128`、`doubao-seedream-4-5-251128`、`doubao-seedream-4-0-250828`；模式仅允许 `anchor_consistency|independent_parallel`，非法值会阻止服务启动。分析时隔离 Codex 只执行一次 `skills/image-postprocess`，同时输出跨段统一元素映射和每段真实 Seedream 提示词；短视频使用同一 Skill 的第 0 段契约。输出经用户审阅后冻结。重启时 schema v2 generation 默认只执行 GET-only resume；唯一补发 H3 POST 的例外是完整确认的 `h3_provider_failed` 仍有自动额度，或该失败后已落盘的 ready 自动 attempt。后处理只恢复本地可证明安全的工作；Seedream `submitting/submission_unknown` 会标记失败并等待人工分段确认，绝不自动 POST。
-
-## 5. 3213 静态前端与同一 Caddy unit 发布
-
-先确认构建产物和候选配置；`validate` 只解析候选文件，不监听端口、不重启服务：
+随后只用 GET 证明 capability 已关闭而历史项目仍可读：
 
 ```bash
-cd /home/xy/duet-ad1
-test -s web-next/dist/index.html
-test -d web-next/dist/assets
-/usr/local/libexec/duet/caddy validate --config "$PWD/.deploy/caddy/config.json"
+rtk proxy /home/xy/duet-ad1/.venv/bin/python - <<'PY'
+import getpass
+
+import httpx
+
+token = getpass.getpass('3213 ACCESS_TOKEN: ')
+assert token, 'ACCESS_TOKEN is required'
+headers = {'Authorization': f'Bearer {token}'}
+
+with httpx.Client(verify=False, timeout=30.0) as client:
+    health = client.get('https://127.0.0.1:3213/api/health')
+    health.raise_for_status()
+    assert health.json() == {'ok': True}
+
+    capabilities = client.get(
+        'https://127.0.0.1:3213/api/capabilities', headers=headers
+    )
+    capabilities.raise_for_status()
+    assert 'minimal_creation' not in capabilities.json()
+
+    projects = client.get(
+        'https://127.0.0.1:3213/api/conversations', headers=headers
+    )
+    projects.raise_for_status()
+    listed = projects.json()
+    assert isinstance(listed, list)
+    for project in listed:
+        detail = client.get(
+            'https://127.0.0.1:3213/api/conversations/' + project['id'],
+            headers=headers,
+        )
+        detail.raise_for_status()
+        payload = detail.json()
+        assert 'effective_request' in payload
+        assert 'input_receipt' in payload
+
+print(f'capability-off-history-readable projects={len(listed)}')
+PY
 ```
 
-部署前生成本次 3213 变更的精确 3211-only 回滚配置，并验证它可加载：
+只有确认 capability 已消失后，才允许评估后端代码回滚；优先修复前进。任何回滚
+候选都必须继续识别已落盘的 v1 `effective_request`、`input_receipt`、进度和恢复
+回执，不能切到不理解 v1 数据的版本。不要删除或改指测试 `DATA_DIR`，不要恢复成
+要求用户补台词/校对的流程。前端严格依赖 capability，应在 capability 缺失时自行
+fail closed，因此本回滚不需要也不允许修改 Caddy 或 3211。
 
-```bash
-install -d -m 0700 /home/xy/.local/state/duet-ad1
-ROLLBACK_CONFIG=/home/xy/.local/state/duet-ad1/caddy-config.before-3213.json
-git show 2d6567b:.deploy/caddy/config.json > "${ROLLBACK_CONFIG}.tmp"
-/usr/local/libexec/duet/caddy validate --config "${ROLLBACK_CONFIG}.tmp"
-install -m 0600 "${ROLLBACK_CONFIG}.tmp" "$ROLLBACK_CONFIG"
-rm -f "${ROLLBACK_CONFIG}.tmp"
-```
-
-3213 当前的旧预览不是 service。只允许按完整命令行和工作目录同时确认后，精确停止这一个 Vite 进程；零个进程是合法状态，多个匹配则立即停止发布并调查：
-
-```bash
-OLD_VITE_COMMAND='node ./node_modules/.bin/vite preview --host 0.0.0.0 --port 3213'
-mapfile -t OLD_VITE_PIDS < <(pgrep -fx -- "$OLD_VITE_COMMAND" || true)
-test "${#OLD_VITE_PIDS[@]}" -le 1
-if test "${#OLD_VITE_PIDS[@]}" -eq 1; then
-  OLD_VITE_PID="${OLD_VITE_PIDS[0]}"
-  test "$(readlink -f "/proc/$OLD_VITE_PID/cwd")" = \
-    /home/xy/duet-ad1/.worktree/antd-x-prototype/web-next
-  kill -TERM -- "$OLD_VITE_PID"
-  for _ in {1..50}; do
-    kill -0 "$OLD_VITE_PID" 2>/dev/null || break
-    sleep 0.2
-  done
-  ! kill -0 "$OLD_VITE_PID" 2>/dev/null
-fi
-```
-
-不创建新 service，不启动第二个 uvicorn；原地重启同一个 Caddy unit：
-
-```bash
-systemctl --user restart duet-ad1-caddy.service
-systemctl --user is-active duet-ad1-caddy.service
-journalctl --user -u duet-ad1-caddy.service --since '-2 minutes' --no-pager
-```
-
-## 6. 健康检查与只读生产 smoke
-
-先查本机 uvicorn：
-
-```bash
-curl --fail --silent --show-error \
-  http://127.0.0.1:3212/api/health
-```
-
-应返回 `{"ok":true}`。再查 Caddy 公网入口（替换成实际域名/IP；保留 3211）：
-
-```bash
-PUBLIC_BASE_URL='https://<public-host>:3211'
-curl --fail --silent --show-error \
-  "$PUBLIC_BASE_URL/api/health"
-```
-
-健康接口只证明进程和反代可达，不验证 H3 凭据、余额或付费链路。
-
-3213 生产 smoke 只允许 GET/HEAD；禁止 POST/PUT/PATCH/DELETE，禁止创建会话、提交生成或运行 `.deploy/smoke-h3.sh`。先验证本机 HTTPS、SPA 回退和缓存头，再把 `PUBLIC_3213` 替换为实际公网域名/IP 重复同样的只读请求：
-
-```bash
-curl --fail --silent --show-error --insecure \
-  https://127.0.0.1:3213/api/health
-curl --fail --silent --show-error --insecure --head \
-  https://127.0.0.1:3213/ | rg -i '^cache-control: no-store'
-curl --fail --silent --show-error --insecure --head \
-  https://127.0.0.1:3213/a-client-route | rg -i '^cache-control: no-store'
-
-ASSET_PATH="$(find web-next/dist/assets -maxdepth 1 -type f \
-  -printf '/assets/%f\n' | head -n 1)"
-test -n "$ASSET_PATH"
-curl --fail --silent --show-error --insecure --head \
-  "https://127.0.0.1:3213$ASSET_PATH" | \
-  rg -i '^cache-control: public, max-age=31536000, immutable'
-
-PUBLIC_3213='https://<public-host>:3213'
-curl --fail --silent --show-error "$PUBLIC_3213/api/health"
-curl --fail --silent --show-error --head "$PUBLIC_3213/" | \
-  rg -i '^cache-control: no-store'
-```
-
-### 3213 回滚
-
-若 Caddy restart 或上述只读检查失败，恢复已验证的 3211-only 配置并重启同一 unit；回滚会关闭 3213，不要重新启动旧 Vite：
-
-```bash
-ROLLBACK_CONFIG=/home/xy/.local/state/duet-ad1/caddy-config.before-3213.json
-test -s "$ROLLBACK_CONFIG"
-/usr/local/libexec/duet/caddy validate --config "$ROLLBACK_CONFIG"
-install -m 0644 "$ROLLBACK_CONFIG" \
-  /home/xy/duet-ad1/.deploy/caddy/config.json
-systemctl --user restart duet-ad1-caddy.service
-systemctl --user is-active duet-ad1-caddy.service
-curl --fail --silent --show-error --insecure \
-  https://127.0.0.1:3211/api/health
-```
-
-回滚后将配置恢复变更作为独立 fix-forward commit 审核、测试；不要用 `git reset --hard` 或共享工作区 `git checkout` 掩盖现场状态。
-
-## 7. 可选显式付费验收（不属于生产 smoke）
-
-以下流程不属于 3213 生产部署和生产 smoke，只能在另行批准真实付费验收后人工执行。脚本要求显式 `RUN_PAID_SMOKE=1`，默认走本机 3212，通过正式 API 创建、轮询、提交和验证 H3 成片。每执行一次脚本都会生成新的创建 id 和 generation `client_request_id`，创建一个新会话，并按冻结计划产生真实付费 H3 task；不得把下面三次验收放进自动重试器。脚本会打印 cid、generation request id 和付费子任务数，不会打印 access token、供应商凭据或 task id。
-
-先准备实测时长分别为 10、15、30 秒的样本，并在付费前确认：
-
-```bash
-SAMPLE_10=/absolute/path/to/10s.mp4
-SAMPLE_15=/absolute/path/to/15s.mp4
-SAMPLE_30=/absolute/path/to/30s.mp4
-for sample in "$SAMPLE_10" "$SAMPLE_15" "$SAMPLE_30"; do
-  ffprobe -v error -select_streams v:0 -show_entries stream=duration,duration_ts,time_base \
-    -of default=noprint_wrappers=1:nokey=1 "$sample"
-  # WebM/Matroska 若 stream duration/ticks 为空，以 v:0 packet PTS 起止验收；禁止用 format.duration 或 frame_count/fps。
-  ffprobe -v error -select_streams v:0 -show_packets \
-    -show_entries packet=pts_time,dts_time,duration_time -of csv=p=0 "$sample"
-done
-
-read -rsp 'ACCESS_TOKEN: ' ACCESS_TOKEN; printf '\n'
-export ACCESS_TOKEN
-
-# 第 1 次新建/付费：10s，原 Ref2VA 单任务
-RUN_PAID_SMOKE=1 .deploy/smoke-h3.sh "$SAMPLE_10"
-
-# 第 2 次新建/付费：15s，单次生成；必须使用 prepared receipt v1
-RUN_PAID_SMOKE=1 .deploy/smoke-h3.sh "$SAMPLE_15"
-
-# 第 3 次新建/付费：30s，FL2VA 长链；以脚本打印的 segment_count 为准
-RUN_PAID_SMOKE=1 .deploy/smoke-h3.sh "$SAMPLE_30"
-
-unset ACCESS_TOKEN
-```
-
-非 9:16 样本默认使用 `pad`，可在人工确认内容可裁时加 `FIT_MODE=crop`。脚本默认台词模式为 `auto`；无音轨同样合法。长视频只允许 `DIALOGUE_MODE=auto|none`，其中 auto 复用源音轨：长于画面时裁剪、短于画面时补静音，画面时长不变；none 输出静音。
-
-成功标准：创建阶段到 `done`；10/15 秒输入通过 prepared receipt v1，只有大于 15 秒的输入（本例 30 秒）才通过 64 位 plan receipt 和正整数 `segment_count`；submit 返回 202；generation 到 `succeeded` 且 `has_video=true`。记录每次输出的 cid 和 `client_request_id`，不要复制 token、EnvironmentFile 或供应商响应。
-
-把三次输出的 cid 人工填入以下变量，逐个验证最终文件。长链拼接目标是与源时长误差不超过 1/24 秒；同时确认视频编码/像素格式和音轨。若 `DIALOGUE_MODE=none`，音频 stream 查询应为空。
-
-```bash
-CID_10='replace-with-10s-cid'
-CID_15='replace-with-15s-cid'
-CID_30='replace-with-30s-cid'
-for cid in "$CID_10" "$CID_15" "$CID_30"; do
-  output="data/$cid/generated.mp4"
-  test -s "$output"
-  ffprobe -v error -select_streams v:0 -show_entries stream=duration,duration_ts,time_base \
-    -of default=noprint_wrappers=1:nokey=1 "$output"
-  ffprobe -v error -select_streams v:0 \
-    -show_entries stream=codec_name,pix_fmt,r_frame_rate \
-    -of default=noprint_wrappers=1 "$output"
-  ffprobe -v error -select_streams a:0 \
-    -show_entries stream=codec_name,channels,duration,duration_ts,time_base \
-    -of default=noprint_wrappers=1 "$output"
-  # keep 模式核对 v:0 presentation start 与成片实际起音位置；不要把 AAC/Opus priming packet 当有效音频起点。
-  source=$(find "data/$cid" -maxdepth 1 -type f -name 'source.*' -print -quit)
-  for selector in v:0 a:0; do
-    ffprobe -v error -select_streams "$selector" -read_intervals '%+#1' \
-      -show_packets -show_entries packet=pts_time,dts_time -of csv=p=0 "$source"
-  done
-done
-```
-
-脚本遇到最终 `failed`、`submission_unknown`、`resume_required` 或超时都会退出，且脚本自身绝不重复调用提交 API。服务内部对完整确认且不计费的 `h3_provider_failed` 会按配置自动补交，默认单逻辑请求总计最多 3 次 POST；其他失败不会。保留脚本打印的 cid 和原 `client_request_id`，按下一节判断是原 attempt 继续、自动额度耗尽后的新 id、拼接失败的原 id 本地重拼，还是先去供应商核对。
-
-## 8. 失败时 fix-forward
-
-1. 停止重复点击和重复 smoke；保留 cid、`prepared_input.json`、`long_video_plan.json`、`.h3/` 和 `meta.json`。
-2. 用 detail API 或 journal 确认是输入准备、凭据、H3 查询/下载还是公开反代问题；不要打印环境。
-3. 修复当前 H3 代码/配置，重新运行相关测试和全量测试。
-4. 再次 `daemon-reload`（unit 有改动时）并原地 `restart`，重复本地和公网 `/health`。
-5. `resume_required` 只通过 UI 用原 request id、原台词和原画幅继续同一 attempt；完整确认的 `h3_provider_failed` 先等待服务按额度自动收敛，额度耗尽后才点“重试生成”并使用新 id。其他 H3 确定失败仍按人工新 id 处理，并以 detail API 的 `generation.retry_paid_segment_count` 为本次新增付费任务数。长链 `failed + stage=stitch` 点“重试拼接”，必须用原 id，只本地重拼且新增付费 H3 子任务为 0；半发布成片不会隐藏恢复入口。`submission_unknown` 不得继续或重试，先到 AutoDL 核对原 POST，服务端会固定返回 409 `submission_outcome_unknown`。
-
-禁止以 Seedance 代码、旧 unit 或旧提交开关回退；它们不再属于生产契约。若 H3 仍不可用，保持服务可读、关闭 `ENABLE_H3_SUBMIT`，修复后再开启。
-
-图片后处理失败时还要保留 `work/.postprocess-private/` 与各段 `postprocessed/`；前者包含 Seedream/MediaKit 的 attempt 证据，后者只在整段完成后原子发布。`submission_unknown` 段不得靠重启或重复提交自动重发；若人工确认重试，必须在页面确认潜在重复计费并使用当前 `expected_revision`。不要打印 `service.env`、供应商响应或私有回执。
+修复完成后，只有重新通过第 2、3、5 节，才可把同一行恢复为
+`ENABLE_MINIMAL_CREATION=1`，执行一次 user `daemon-reload` 并仍只重启
+`duet-ad1-minimal-frontend-3213.service`。

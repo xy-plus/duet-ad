@@ -769,12 +769,6 @@ def _context_ir_reference_receipt(
     if not isinstance(manifest, list):
         raise ReceiptError("context_ir_receipt_invalid")
     references: list[dict[str, Any]] = []
-    image_types = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".webp": "image/webp",
-    }
     audio_types = {".wav": "audio/wav", ".mp3": "audio/mpeg"}
     expected_sources: list[dict[str, Any]] = []
     for order, (path, data) in enumerate(request.keyframes, 1):
@@ -782,8 +776,8 @@ def _context_ir_reference_receipt(
             "order": order,
             "type": "image_url",
             "role": "reference_image",
-            "name": path.name,
-            "mime_type": image_types.get(path.suffix.lower()),
+            "name": path.with_suffix(".png").name,
+            "mime_type": "image/png",
             "source_sha256": hashlib.sha256(data).hexdigest(),
         })
     for audio in request.reference_audios:

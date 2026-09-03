@@ -45,7 +45,7 @@ class _IndexRunner:
         for item in frame_items:
             data = (cdir / item["path"]).read_bytes()
             image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
-            assert image.shape[:2] == (4, 6)
+            assert image.shape[:2] == (256, 384)
             assert item["sha256"] == hashlib.sha256(data).hexdigest()
         assert sorted(
             path.relative_to(isolated_work).as_posix()
@@ -110,7 +110,7 @@ def _element_index() -> dict:
     }
 
 
-def _png(width: int = 12, height: int = 8, value: int = 96) -> bytes:
+def _png(width: int = 768, height: int = 512, value: int = 96) -> bytes:
     image = np.full((height, width, 3), value, dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", image)
     assert ok

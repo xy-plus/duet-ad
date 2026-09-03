@@ -322,24 +322,20 @@ def test_live_image_progress_uses_receipt_projected_segment_counts():
     assert result == list(range(10))
 
 
-def test_detail_polling_covers_every_nonterminal_backend_phase_and_stops_terminal():
+def test_detail_polling_uses_authoritative_project_progress_and_stops_terminal():
     result = _run_contract(
-        "(()=>({analysis:contract.shouldPollDetail({status:'processing'}),"
-        "postprocess:contract.shouldPollDetail({status:'done',postprocess:{status:'queued'}}),"
-        "fusion:contract.shouldPollDetail({status:'done',prompt_fusion:{status:'running'}}),"
-        "contextIr:contract.shouldPollDetail({status:'done',generation:{status:'running',stage:'context_ir'}}),"
-        "h3:contract.shouldPollDetail({status:'done',generation:{status:'running',stage:'h3'}}),"
-        "stitch:contract.shouldPollDetail({status:'done',generation:{status:'running',stage:'stitch'}}),"
-        "projected:contract.shouldPollDetail({status:'done',navigation_status:'postprocessing'}),"
-        "done:contract.shouldPollDetail({status:'done',postprocess:{status:'done'},"
-        "prompt_fusion:{status:'done'},generation:{status:'succeeded',stage:'stitch'}}),"
-        "failed:contract.shouldPollDetail({status:'done',generation:{status:'failed'}}),"
-        "unknown:contract.shouldPollDetail({status:'done',generation:{status:'submission_unknown'}})}))()"
+        "(()=>({queued:contract.shouldPollDetail({project_progress:{percent:0,status:'queued'}}),"
+        "running:contract.shouldPollDetail({project_progress:{percent:42,status:'running'}}),"
+        "done:contract.shouldPollDetail({project_progress:{percent:100,status:'succeeded'}}),"
+        "failed:contract.shouldPollDetail({project_progress:{percent:42,status:'failed'}}),"
+        "missing:contract.shouldPollDetail({status:'processing'})}))()"
     )
     assert result == {
-        "analysis": True, "postprocess": True, "fusion": True,
-        "contextIr": True, "h3": True, "stitch": True, "projected": True,
-        "done": False, "failed": False, "unknown": False,
+        "queued": True,
+        "running": True,
+        "done": False,
+        "failed": False,
+        "missing": False,
     }
 
 

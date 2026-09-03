@@ -18,14 +18,14 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Any
 
 import cv2
 import httpx
-import numpy as np
 
+from app import frame_fit
 from app.config import Settings
-from app.retry import RetryPolicy, run_with_retry
 from app.sanitize import sanitize
 
 API_BASE = "https://mediakit.cn-beijing.volces.com/api/v1"
@@ -37,6 +37,8 @@ SCENES = frozenset({TEXT_SCENE, ICON_SCENE})
 MAX_INPUT_BYTES = 10 * 1024 * 1024
 MAX_OUTPUT_BYTES = 20 * 1024 * 1024
 RECEIPT_VERSION = 1
+_ERASE_SUBMIT_LOCK = threading.Lock()
+_last_erase_submit_at: float | None = None
 
 
 def canvas_stage_path(
@@ -251,16 +253,19 @@ def _run(
                 raise MediaKitError(409, "previous MediaKit submission outcome unknown")
 
             file_id = _upload(client, headers, current)
-            try:
-                result_url = run_with_retry(
-                    lambda: _submit_erase_once(
+            for retry_index in range(settings.retry_count + 1):
+                try:
+                    result_url = _submit_erase_once(
                         client, headers, file_id, scene, stage, receipt_path, receipt,
-                    ),
-                    policy=RetryPolicy(settings.retry_count, settings.retry_interval_s),
-                    is_retryable=lambda error: isinstance(error, _RequestLimitExceeded),
-                )
-            except _RequestLimitExceeded as error:
-                raise MediaKitError(429, error.detail) from None
+                        settings.mediakit_submit_interval_s,
+                    )
+                    break
+                except _RequestLimitExceeded as error:
+                    if retry_index >= settings.retry_count:
+                        raise MediaKitError(429, error.detail) from None
+                    delay = float(settings.retry_interval_s) * (2 ** retry_index)
+                    if delay > 0:
+                        sleep(delay)
             _download_png(client, result_url, artifact, source)
             artifact_output = _inspect_input(
                 artifact, max_bytes=MAX_OUTPUT_BYTES,
@@ -294,7 +299,9 @@ def _submit_erase_once(
     stage: dict[str, Any],
     receipt_path: Path,
     receipt: dict[str, Any],
+    submit_interval_s: float,
 ) -> str:
+    global _last_erase_submit_at
     attempts = _attempts(stage)
     attempt = {
         "attempt_id": uuid.uuid4().hex,
@@ -315,7 +322,16 @@ def _submit_erase_once(
         "file_id": file_id,
         "started_at": attempt["started_at"],
     })
-    _atomic_json(receipt_path, receipt)
+    with _ERASE_SUBMIT_LOCK:
+        now = monotonic()
+        if _last_erase_submit_at is not None and submit_interval_s > 0:
+            remaining = submit_interval_s - (now - _last_erase_submit_at)
+            while remaining > 0:
+                sleep(remaining)
+                now = monotonic()
+                remaining = submit_interval_s - (now - _last_erase_submit_at)
+        _atomic_json(receipt_path, receipt)
+        _last_erase_submit_at = monotonic()
     try:
         response = client.post(
             ERASE_URL,
@@ -325,27 +341,47 @@ def _submit_erase_once(
     except httpx.RequestError as error:
         raise MediaKitError(502, "MediaKit submission outcome unknown") from error
 
-    body = _json_body(response)
+    try:
+        body = response.json()
+    except (ValueError, json.JSONDecodeError) as error:
+        if response.status_code != 429:
+            raise MediaKitError(502, "MediaKit returned an invalid response") from error
+        body = {}
+    if not isinstance(body, dict):
+        if response.status_code != 429:
+            raise MediaKitError(502, "MediaKit returned an invalid response")
+        body = {}
+    task_id = _response_task_id(body)
     if response.status_code >= 400 or body.get("success") is not True:
         provider_error = body.get("error") if isinstance(body.get("error"), dict) else {}
-        if body.get("success") is False:
+        if task_id is not None:
+            ambiguous = {
+                "state": "submitting",
+                "request_id": body.get("request_id"),
+                "task_id": task_id,
+            }
+            attempt.update(ambiguous)
+            stage.update(ambiguous)
+            _atomic_json(receipt_path, receipt)
+            raise MediaKitError(502, "MediaKit submission outcome unknown")
+        if body.get("success") is False or response.status_code == 429:
             error_code = sanitize(str(provider_error.get("code") or "provider_rejected"))
-            message = sanitize(str(provider_error.get("message") or "MediaKit erase rejected"))
+            fallback = (
+                "MediaKit request limit exceeded"
+                if response.status_code == 429 else "MediaKit erase rejected"
+            )
+            message = sanitize(str(provider_error.get("message") or fallback))
             failed = {
                 "state": "failed",
                 "failed_at": _now(),
                 "error_code": error_code,
                 "request_id": body.get("request_id"),
-                "task_id": body.get("task_id"),
+                "task_id": None,
             }
             attempt.update(failed)
             stage.update(failed)
             _atomic_json(receipt_path, receipt)
-            if (
-                response.status_code == 429
-                and error_code == "RequestLimitExceeded"
-                and body.get("task_id") in (None, "")
-            ):
+            if response.status_code == 429:
                 raise _RequestLimitExceeded(message)
             raise MediaKitError(502, message)
         raise MediaKitError(502, "MediaKit submission outcome unknown")
@@ -353,11 +389,15 @@ def _submit_erase_once(
     result = body.get("result")
     result_url = result.get("image_url") if isinstance(result, dict) else None
     if not isinstance(result_url, str) or not result_url.startswith("https://"):
+        if task_id is not None:
+            attempt["task_id"] = task_id
+            stage["task_id"] = task_id
+            _atomic_json(receipt_path, receipt)
         raise MediaKitError(502, "MediaKit submission outcome unknown")
     received = {
         "state": "response_received",
         "request_id": body.get("request_id"),
-        "task_id": body.get("task_id"),
+        "task_id": task_id,
         "expires_at": body.get("expires_at"),
         "response_received_at": _now(),
     }
@@ -473,16 +513,16 @@ def _download_png(
     except httpx.HTTPError as error:
         raise MediaKitError(502, "MediaKit output download failed") from error
     encoded = b"".join(chunks)
-    decoded = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-    if decoded is None:
+    try:
+        png = frame_fit.normalize_image_to_canvas_png(
+            encoded,
+            source["width"],
+            source["height"],
+            label="MediaKit provider output",
+        )
+    except frame_fit.FrameFitError:
         raise MediaKitError(502, "MediaKit output is not a valid image")
-    height, width = decoded.shape[:2]
-    if width != source["width"] or height != source["height"]:
-        raise MediaKitError(502, "MediaKit output dimensions changed")
-    ok, png = cv2.imencode(".png", decoded)
-    if not ok:
-        raise MediaKitError(502, "MediaKit output PNG conversion failed")
-    _atomic_bytes(destination, png.tobytes())
+    _atomic_bytes(destination, png)
 
 
 def _json_body(response: httpx.Response) -> dict[str, Any]:
@@ -493,6 +533,24 @@ def _json_body(response: httpx.Response) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise MediaKitError(502, "MediaKit returned an invalid response")
     return body
+
+
+def _response_task_id(body: dict[str, Any]) -> Any | None:
+    containers = [body]
+    for key in ("result", "data"):
+        value = body.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+        elif isinstance(value, list):
+            containers.extend(item for item in value if isinstance(item, dict))
+    return next(
+        (
+            container["task_id"]
+            for container in containers
+            if container.get("task_id") not in (None, "")
+        ),
+        None,
+    )
 
 
 def _receipt_paths(out: Path) -> tuple[Path, Path]:

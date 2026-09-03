@@ -1948,14 +1948,7 @@ def _compiled_dialogue(
 
 
 def prompt_fusion_image_authority_sha256(meta: Mapping) -> str:
-    """Bind manual acceptance, or the exact v4 MediaKit-only receipt."""
-    acceptance = meta.get("_image_user_acceptance")
-    if (
-        isinstance(acceptance, Mapping)
-        and isinstance(acceptance.get("sha256"), str)
-        and len(acceptance["sha256"]) == 64
-    ):
-        return acceptance["sha256"]
+    """Bind Fusion to the terminal v4 postprocess technical receipt."""
     private = meta.get("_postprocess_receipt")
     post = meta.get("postprocess")
     options = private.get("options") if isinstance(private, Mapping) else None
@@ -1963,7 +1956,6 @@ def prompt_fusion_image_authority_sha256(meta: Mapping) -> str:
         isinstance(private, Mapping)
         and private.get("version") == 4
         and isinstance(options, Mapping)
-        and options.get("optimize_image") is False
         and isinstance(post, Mapping)
         and post.get("status") == "done"
     ):

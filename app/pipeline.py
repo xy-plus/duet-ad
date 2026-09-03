@@ -86,6 +86,25 @@ VOICE_TIMELINE_WARNING = (
     "voice lines normalized to video duration {duration_s:.3f}s: "
     "clipped {clipped}, dropped {dropped}"
 )
+DIALOGUE_TRANSFORM_SKILL = """# Dialogue transform
+
+Read `work/dialogue_request.json` and return exactly one schema-constrained
+result. Preserve the input item count and order. Change only each item's
+natural-language content as requested by the caller; never add, remove, merge,
+split, or reorder items, and never invent timestamps or backend fields.
+"""
+_VOICE_ANALYSIS_RECOVERY_FIELDS = frozenset({
+    "voice_lines",
+    "has_bgm",
+    "vocal_filter_enabled",
+    "voice_line_provenance",
+    "voice_warnings",
+    "voice_has_retryable_vocal_evidence",
+    "voice_lines_vocal_dropped",
+    "voice_lines_credit_dropped",
+    "voice_text_normalizations",
+    "voice_analysis_outcome",
+})
 H3_DEFAULT_RATIO = "9:16"
 H3_DEFAULT_FIT_MODE = "none"
 H3_ENGINE_WORKFLOW = "minimax_h3_lightx2v_v5_15s"
@@ -1502,6 +1521,9 @@ def _freeze_image_optimization(
     require_dual_target: bool,
     segment_lineage: dict[int, dict] | None = None,
     keyframe_sources: dict[int, list[dict]] | None = None,
+    session_dir: Path | None = None,
+    user_reference_image_path: Path | None = None,
+    user_replacement_prompt: str | None = None,
 ) -> tuple[dict, dict]:
     """Freeze either the legacy segment prompt or V3 source-frame prompts."""
     try:
@@ -1523,6 +1545,9 @@ def _freeze_image_optimization(
                 profile={"id": "image-postprocess", "revision": 2},
                 model=settings.seedream_model,
                 frame_inventory=inventory,
+                session_dir=session_dir,
+                user_reference_image_path=user_reference_image_path,
+                user_replacement_prompt=user_replacement_prompt,
             )
             frozen_prompts = image_optimization.freeze_frame_prompts(
                 settings,
@@ -1568,6 +1593,8 @@ def _generate_image_optimization_project(
     skill_bytes: bytes | None = None,
     video_skill_bytes: bytes | None = None,
     render_options: dict[str, bool] | None = None,
+    user_reference_image_path: Path | None = None,
+    user_replacement_prompt: str | None = None,
 ) -> tuple[dict | None, dict]:
     if skill_bytes is None and milestone is not None:
         skill_bytes = milestone.read_bytes("image-postprocess")
@@ -1626,6 +1653,8 @@ def _generate_image_optimization_project(
                 phase_retry_count=settings.retry_count,
                 phase_retry_interval_s=settings.retry_interval_s,
                 generation_config=render_options,
+                user_reference_image_path=user_reference_image_path,
+                user_replacement_prompt=user_replacement_prompt,
                 **kwargs,
             )
         except image_optimization.ImageOptimizationOutputError as exc:
@@ -1664,6 +1693,8 @@ def _generate_segmented_image_prompts(
     milestone: skill_milestone.FrozenSkillMilestone | None = None,
     skill_bytes: bytes | None = None,
     render_options: dict[str, bool] | None = None,
+    user_reference_image_path: Path | None = None,
+    user_replacement_prompt: str | None = None,
 ) -> tuple[dict, dict]:
     if skill_bytes is None and milestone is not None:
         skill_bytes = milestone.read_bytes("image-postprocess")
@@ -1748,6 +1779,8 @@ def _generate_segmented_image_prompts(
         skill_bytes=skill_bytes,
         milestone=milestone,
         render_options=render_options,
+        user_reference_image_path=user_reference_image_path,
+        user_replacement_prompt=user_replacement_prompt,
         **kwargs,
     )
     if continuity is None:
@@ -1761,7 +1794,75 @@ def _generate_segmented_image_prompts(
     return continuity, prompts
 
 
-def _voice_prompt(_cdir: Path, voice_mode: str, target_language: str, duration_s: float) -> str:
+def _minimal_image_postprocess_inputs(
+    cdir: Path, meta: Mapping,
+) -> tuple[Path | None, str | None]:
+    """Resolve the v1 transport fields into the two stable Skill inputs."""
+    effective = meta.get("effective_request")
+    if (
+        not isinstance(effective, Mapping)
+        or type(effective.get("version")) is not int
+        or effective.get("version") != 1
+    ):
+        return None, None
+    guidance = effective.get("replacement_guidance")
+    relative_path = meta.get("_minimal_replacement_image_path")
+    if guidance is None and relative_path is None:
+        return None, None
+    if (
+        not isinstance(guidance, Mapping)
+        or not isinstance(guidance.get("instruction"), str)
+        or not guidance["instruction"].strip()
+        or not isinstance(relative_path, str)
+        or not relative_path
+    ):
+        raise PipelineError("minimal replacement inputs are incomplete")
+    root = cdir.resolve()
+    try:
+        image_path = (root / relative_path).resolve(strict=True)
+    except OSError:
+        raise PipelineError("minimal replacement image is missing") from None
+    if not image_path.is_relative_to(root) or not image_path.is_file():
+        raise PipelineError("minimal replacement image is invalid")
+    return image_path, guidance["instruction"].strip()
+
+
+def _minimal_auto_rewrite_target(meta: Mapping) -> str | None:
+    """Return the frozen v1 translation target only for the exact public contract."""
+    effective = meta.get("effective_request")
+    if (
+        not isinstance(effective, Mapping)
+        or type(effective.get("version")) is not int
+        or effective.get("version") != 1
+    ):
+        return None
+    public_dialogue = effective.get("dialogue")
+    if (
+        not isinstance(public_dialogue, Mapping)
+        or set(public_dialogue) != {"mode", "target_language"}
+    ):
+        return None
+    target_language = public_dialogue.get("target_language")
+    if (
+        public_dialogue.get("mode") != "auto_rewrite"
+        or not isinstance(target_language, str)
+        or not target_language.strip()
+        or target_language != target_language.strip()
+        or meta.get("dialogue_mode") != "auto"
+        or meta.get("voice_mode") != "translate"
+        or meta.get("target_language") != target_language
+        or meta.get("dialogue_review_policy") != dialogue_review.AUTO_CONTINUE
+    ):
+        return None
+    return target_language
+
+
+def _voice_prompt(
+    _cdir: Path,
+    voice_mode: str,
+    target_language: str,
+    duration_s: float,
+) -> str:
     """Rewrite/translate frozen local-ASR text without echoing backend fields."""
     if voice_mode == "rewrite":
         rule = (
@@ -1769,16 +1870,29 @@ def _voice_prompt(_cdir: Path, voice_mode: str, target_language: str, duration_s
             "产品和工具使用准确的通用称呼，不保留未经确认的夸张别名。"
         )
     elif voice_mode == "translate":
-        rule = f"翻译成{target_language}：逐条对齐，文本条目数与顺序不变。"
+        if target_language == "与原视频相同":
+            rule = (
+                "目标语言与原视频相同，保持识别文本的原语种，无需跨语种翻译；"
+                "保持格式不变，逐条对齐，"
+                "文本条目数与顺序不变。"
+            )
+        else:
+            rule = (
+                f"目标语言是{target_language}；"
+                "保持格式不变，逐条对齐，文本条目数与顺序不变。"
+            )
     else:
         raise PipelineError("dialogue model phase is only available for rewrite/translate")
-    return f"""处理后端已冻结的本地听写文本。输入：work/dialogue_request.json。源音频时长约 {duration_s:.3f} 秒，仅供理解上下文。
+    return f"""处理后端已冻结的本地听写文本。输入：work/dialogue_request.json，其中 `lines` 是待翻译台词，`video_prompt` 是 video-maker 已输出的视频提示词。源音频时长约 {duration_s:.3f} 秒，仅供理解上下文。
 
 任务：
-- {rule}
+- 翻译对应的文本。{rule}
+- 如果你看到的是小众语言，你的翻译能力可能不太好，你自己检查输出内容是否逻辑通顺、符合上下文，并与视频提示词描述的场景相关；如果翻译结果和视频提示词所描述的场景差异很大，允许你适当调整最后输出的结果。
 - `lines` 每项只填写一个完整自然语言台词 `content`；不要拆词、拼接、重排，
   不要输出或猜测 ID、原台词、帧序、起止时间。
-- 最终回答严格服从注入的 JSON Schema；禁止创建或修改业务输出文件。
+- 最终只输出最终翻译文本，并严格服从注入的 JSON Schema；不要输出思考过程或其他内容。
+
+禁止创建或修改业务输出文件。
 
 硬性禁令：
 - 只读取当前隔离工作区内的声明输入。
@@ -1792,6 +1906,7 @@ def _run_voice_attempt(
     work: Path,
     prompt: str,
     source_lines: list[dict],
+    video_prompt: str = "",
 ) -> list[dict]:
     """Run one schema-only dialogue text phase over backend-frozen lines."""
     if not source_lines:
@@ -1804,8 +1919,12 @@ def _run_voice_attempt(
             stage = Path(raw).resolve(strict=True)
             stage_work = stage / "work"
             stage_work.mkdir(mode=0o700)
+            _materialize_skill_bytes(
+                stage / "SKILL.md", DIALOGUE_TRANSFORM_SKILL.encode("utf-8"),
+            )
             request = {
                 "lines": [{"content": line["text"]} for line in source_lines],
+                "video_prompt": video_prompt,
             }
             (stage_work / "dialogue_request.json").write_text(
                 json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n",
@@ -1875,11 +1994,14 @@ def _transform_voice_with_retry(
     work: Path,
     prompt: str,
     source_lines: list[dict],
+    video_prompt: str = "",
 ) -> list[dict]:
     """Retry only the model text phase; never repeat successful local ASR."""
     policy = _retry_policy(settings)
     return run_with_retry(
-        lambda: _run_voice_attempt(runner, work, prompt, source_lines),
+        lambda: _run_voice_attempt(
+            runner, work, prompt, source_lines, video_prompt,
+        ),
         policy=policy,
         is_retryable=_retryable_operation_error,
         on_retry=_retry_logger("voice rewrite/translate", policy),
@@ -2019,6 +2141,7 @@ def _normalize_voice_timeline(
 def _voice_step(
     settings: Settings, cid: str, cdir: Path, work: Path, runner,
     voice_mode: str, target_language: str, *, allow_no_audio: bool = False,
+    transform: bool = True,
 ) -> list[dict]:
     """口播步：抽音轨 → 本地 ASR → 可选 schema-only 改写 → 后端发布。
 
@@ -2038,8 +2161,7 @@ def _voice_step(
         if not allow_no_audio:
             raise PipelineError("source video has no audio track")
         (work / "voice.mp3").unlink(missing_ok=True)
-        _atomic_bytes(work / "voice_lines.json", b"[]\n")
-        storage.update_meta(
+        persisted = storage.update_meta(
             settings.data_dir,
             cid,
             voice_lines=[],
@@ -2053,6 +2175,9 @@ def _voice_step(
             voice_text_normalizations=[],
             voice_analysis_outcome="no_audio",
         )
+        if persisted is None:
+            raise PipelineError("voice analysis state was not persisted")
+        _atomic_bytes(work / "voice_lines.json", b"[]\n")
         return []
     try:
         manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
@@ -2105,7 +2230,7 @@ def _voice_step(
         voice_mode,
         has_vocal=has_vocal,
     )
-    if lines and voice_mode in {"rewrite", "translate"}:
+    if lines and transform and voice_mode in {"rewrite", "translate"}:
         lines = _transform_voice_with_retry(
             settings,
             runner,
@@ -2166,14 +2291,6 @@ def _voice_step(
     credit_dropped = sum(
         decision.get("drop_reason") == "subtitle_credit" for decision in decisions
     )
-    # 后续视觉步骤看到的 voice_lines 也只能是最终有效集，不能重新收养已过滤行。
-    _atomic_bytes(
-        work / "voice_lines.json",
-        (json.dumps(filtered_lines, ensure_ascii=False, indent=2) + "\n").encode(
-            "utf-8"
-        ),
-    )
-
     changes = {
         "voice_lines": filtered_lines,
         "has_bgm": bool(analysis.has_bgm),
@@ -2190,8 +2307,286 @@ def _voice_step(
             else "vocal_unrecognized" if has_vocal else "no_vocal"
         ),
     }
-    storage.update_meta(settings.data_dir, cid, **changes)
+    persisted = storage.update_meta(settings.data_dir, cid, **changes)
+    if persisted is None:
+        raise PipelineError("voice analysis state was not persisted")
+    # meta 是权威原子提交；该派生文件可在提交后的任意崩溃窗口由 meta 重建。
+    _atomic_bytes(
+        work / "voice_lines.json",
+        (json.dumps(filtered_lines, ensure_ascii=False, indent=2) + "\n").encode(
+            "utf-8"
+        ),
+    )
     return filtered_lines
+
+
+def _publish_translated_voice_lines(
+    settings: Settings,
+    cid: str,
+    cdir: Path,
+    work: Path,
+    source_lines: list[dict],
+    translated_lines: list[dict],
+) -> list[dict]:
+    """Atomically replace only automatic dialogue text after visual context exists."""
+    if len(source_lines) != len(translated_lines):
+        raise PipelineError("translated dialogue line count changed")
+    replacements: dict[tuple[float, float], str] = {}
+    for source, translated in zip(source_lines, translated_lines):
+        source_key = (float(source["start_s"]), float(source["end_s"]))
+        translated_key = (float(translated["start_s"]), float(translated["end_s"]))
+        if source_key != translated_key:
+            raise PipelineError("translated dialogue timeline changed")
+        replacements[source_key] = translated["text"]
+    current = storage.load_meta(settings.data_dir, cid)
+    if current is None:
+        raise PipelineError("conversation disappeared during dialogue translation")
+    provenance = current.get("voice_line_provenance")
+    persisted_voice_lines = current.get("voice_lines")
+    if (
+        not isinstance(provenance, list)
+        or not isinstance(persisted_voice_lines, list)
+    ):
+        raise PipelineError("automatic dialogue translation state is missing")
+    if current.get("dialogue_review") is not None:
+        raise PipelineError("automatic dialogue translation was already frozen")
+    updated_voice_lines = []
+    for item in persisted_voice_lines:
+        updated = dict(item)
+        key = (float(updated["start_s"]), float(updated["end_s"]))
+        if key in replacements:
+            updated["text"] = replacements[key]
+        updated_voice_lines.append(updated)
+    updated_provenance = []
+    for item in provenance:
+        updated = dict(item)
+        key = (float(updated["start_s"]), float(updated["end_s"]))
+        if updated.get("kept") is True and key in replacements:
+            updated["text"] = replacements[key]
+        updated_provenance.append(updated)
+    if dialogue_review.effective_machine_lines(updated_provenance) != [
+        line for line in translated_lines
+        if any(
+            item.get("kept") is True
+            and item.get("classification") == "spoken"
+            and float(item["start_s"]) == float(line["start_s"])
+            and float(item["end_s"]) == float(line["end_s"])
+            for item in updated_provenance
+        )
+    ]:
+        raise PipelineError("translated dialogue provenance is invalid")
+    outcome = current.get("voice_analysis_outcome")
+    if outcome not in dialogue_review.OUTCOMES:
+        raise PipelineError("automatic dialogue translation outcome is invalid")
+    updated_review = dialogue_review.analysis_state(
+        dialogue_review.AUTO_CONTINUE,
+        outcome,
+        dialogue_review.effective_machine_lines(updated_provenance),
+    )
+    persisted = storage.update_meta(
+        settings.data_dir,
+        cid,
+        voice_lines=updated_voice_lines,
+        voice_line_provenance=updated_provenance,
+        dialogue_review=updated_review,
+    )
+    if persisted is None:
+        raise PipelineError("translated dialogue was not persisted")
+    _atomic_bytes(
+        work / "voice_lines.json",
+        (json.dumps(updated_voice_lines, ensure_ascii=False, indent=2) + "\n").encode(
+            "utf-8"
+        ),
+    )
+    return translated_lines
+
+
+def _recover_completed_voice_analysis(
+    cdir: Path, meta: Mapping, duration_s: float,
+) -> tuple[list[dict], str] | None:
+    """Recover complete analysis meta and rebuild its derived lines file."""
+    output_path = cdir / "work" / "voice_lines.json"
+    present_fields = _VOICE_ANALYSIS_RECOVERY_FIELDS.intersection(meta)
+    if not present_fields:
+        return None
+    if (
+        isinstance(duration_s, bool)
+        or not isinstance(duration_s, (int, float))
+        or not math.isfinite(float(duration_s))
+        or float(duration_s) <= 0
+    ):
+        raise PipelineError("voice analysis recovery is invalid")
+    if present_fields != _VOICE_ANALYSIS_RECOVERY_FIELDS:
+        raise PipelineError("voice analysis recovery is incomplete")
+
+    has_bgm = meta["has_bgm"]
+    filter_enabled = meta["vocal_filter_enabled"]
+    has_retryable_vocal = meta["voice_has_retryable_vocal_evidence"]
+    vocal_dropped = meta["voice_lines_vocal_dropped"]
+    credit_dropped = meta["voice_lines_credit_dropped"]
+    provenance = meta["voice_line_provenance"]
+    warnings = meta["voice_warnings"]
+    outcome = meta["voice_analysis_outcome"]
+    if (
+        not isinstance(has_bgm, bool)
+        or not isinstance(filter_enabled, bool)
+        or not isinstance(has_retryable_vocal, bool)
+        or isinstance(vocal_dropped, bool)
+        or not isinstance(vocal_dropped, int)
+        or vocal_dropped < 0
+        or isinstance(credit_dropped, bool)
+        or not isinstance(credit_dropped, int)
+        or credit_dropped < 0
+        or not isinstance(provenance, list)
+        or not isinstance(warnings, list)
+        or any(not isinstance(item, str) for item in warnings)
+        or meta["voice_text_normalizations"] != []
+        or not isinstance(outcome, str)
+        or outcome not in dialogue_review.OUTCOMES
+    ):
+        raise PipelineError("voice analysis recovery is invalid")
+
+    meta_lines = meta["voice_lines"]
+    if (
+        not isinstance(meta_lines, list)
+        or any(
+            not isinstance(line, dict)
+            or set(line) != {"text", "start_s", "end_s"}
+            for line in meta_lines
+        )
+    ):
+        raise PipelineError("voice analysis recovery is invalid")
+    try:
+        derived_lines = (
+            json.dumps(
+                meta_lines,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            ) + "\n"
+        ).encode("utf-8")
+        voice.validate_voice_lines(derived_lines, duration_s)
+    except (TypeError, ValueError, PipelineError):
+        raise PipelineError("voice analysis recovery is invalid") from None
+
+    kept_lines: list[dict] = []
+    for decision in provenance:
+        if (
+            not isinstance(decision, dict)
+            or not isinstance(decision.get("text"), str)
+            or not decision["text"].strip()
+            or isinstance(decision.get("start_s"), bool)
+            or not isinstance(decision.get("start_s"), (int, float))
+            or isinstance(decision.get("end_s"), bool)
+            or not isinstance(decision.get("end_s"), (int, float))
+            or not math.isfinite(float(decision["start_s"]))
+            or not math.isfinite(float(decision["end_s"]))
+            or float(decision["start_s"]) < 0
+            or float(decision["start_s"]) >= float(decision["end_s"])
+            or "classification" not in decision
+            or decision.get("classification") not in (None, "spoken", "sung")
+            or decision.get("provenance") != "asr"
+            or not isinstance(decision.get("kept"), bool)
+        ):
+            raise PipelineError("voice analysis recovery is invalid")
+        if decision["kept"]:
+            kept_lines.append({
+                "text": decision["text"],
+                "start_s": decision["start_s"],
+                "end_s": decision["end_s"],
+            })
+    if kept_lines != meta_lines:
+        raise PipelineError("voice analysis recovery is invalid")
+
+    audio_path = cdir / "work" / "voice.mp3"
+    audio_present = audio_path.exists() or audio_path.is_symlink()
+    if outcome == "no_audio":
+        if (
+            provenance
+            or meta_lines
+            or audio_present
+            or has_bgm
+            or has_retryable_vocal
+            or vocal_dropped
+            or credit_dropped
+            or warnings
+        ):
+            raise PipelineError("voice analysis recovery is invalid")
+        machine_lines = []
+    else:
+        if audio_path.is_symlink() or not audio_path.is_file():
+            raise PipelineError("voice analysis recovery is invalid")
+        try:
+            audio_data = audio_path.read_bytes()
+        except OSError:
+            raise PipelineError("voice analysis recovery is invalid") from None
+        if not audio_data:
+            raise PipelineError("voice analysis recovery is invalid")
+
+        if provenance:
+            audio_sha256 = hashlib.sha256(audio_data).hexdigest()
+            evidence_sha256 = provenance[0].get(
+                "classification_evidence_sha256"
+            )
+            for decision in provenance:
+                if (
+                    decision.get("analysis_audio_path") != "work/voice.mp3"
+                    or decision.get("analysis_audio_sha256") != audio_sha256
+                    or decision.get("analysis_has_bgm") is not has_bgm
+                    or decision.get("classification_evidence_sha256")
+                    != evidence_sha256
+                ):
+                    raise PipelineError("voice analysis recovery is invalid")
+            try:
+                expected_evidence = (
+                    long_generation.classification_evidence_sha256(
+                        audio_path="work/voice.mp3",
+                        audio_sha256=audio_sha256,
+                        has_bgm=has_bgm,
+                        decisions=provenance,
+                    )
+                )
+            except long_generation.LongGenerationError:
+                raise PipelineError("voice analysis recovery is invalid") from None
+            if evidence_sha256 != expected_evidence:
+                raise PipelineError("voice analysis recovery is invalid")
+
+        expected_vocal_dropped = sum(
+            decision["classification"] not in ("spoken", "sung")
+            for decision in provenance
+            if filter_enabled
+        )
+        expected_credit_dropped = sum(
+            decision.get("drop_reason") == "subtitle_credit"
+            for decision in provenance
+        )
+        machine_lines = dialogue_review.effective_machine_lines(provenance)
+        expected_outcome = (
+            "recognized"
+            if machine_lines
+            else "vocal_unrecognized" if has_retryable_vocal else "no_vocal"
+        )
+        if (
+            vocal_dropped != expected_vocal_dropped
+            or credit_dropped != expected_credit_dropped
+            or outcome != expected_outcome
+        ):
+            raise PipelineError("voice analysis recovery is invalid")
+
+    current_lines = None
+    if not output_path.is_symlink() and output_path.is_file():
+        try:
+            current_lines = output_path.read_bytes()
+        except OSError:
+            pass
+    if current_lines != derived_lines:
+        try:
+            _atomic_bytes(output_path, derived_lines)
+        except OSError:
+            raise PipelineError(
+                "voice analysis derived output could not be rebuilt"
+            ) from None
+    return machine_lines, outcome
 
 
 def _load_scenes(work: Path) -> list[dict]:
@@ -2659,9 +3054,11 @@ def _validate_calibrated_duration(meta: dict, duration_s: float) -> float:
     """Apply every gate whenever the authoritative visual duration changes."""
     long_video.plan_segments(duration_s, [], [])
     duration = float(duration_s)
+    minimal_auto_dialogue = _minimal_auto_rewrite_target(meta) is not None
     if (
         duration > long_video.SHORT_VIDEO_MAX_S
         and meta.get("voice_mode") != "keep"
+        and not minimal_auto_dialogue
     ):
         raise PipelineError("long_video_audio_mode_unsupported")
     return duration
@@ -2761,6 +3158,67 @@ def _generation_defaults_from_bytes(
         raise PipelineError(str(exc)) from None
     fit_mode = str(profiles[aspect_ratio]["default_fit_mode"])
     return profiles, aspect_ratio, resolution, fit_mode
+
+
+def _requested_generation_output(meta: Mapping) -> tuple[str, str] | None:
+    effective = meta.get("effective_request")
+    if effective is None:
+        return None
+    if not isinstance(effective, Mapping):
+        raise PipelineError("minimal output config is invalid")
+    version = effective.get("version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != 1
+    ):
+        raise PipelineError("minimal output config is invalid")
+    output = effective.get("output")
+    if (
+        not isinstance(output, Mapping)
+        or set(output) != {"aspect_ratio", "resolution", "fit_mode"}
+        or output.get("fit_mode") != "auto"
+    ):
+        raise PipelineError("minimal output config is invalid")
+    aspect_ratio = output.get("aspect_ratio")
+    resolution = output.get("resolution")
+    if aspect_ratio not in h3.H3_ASPECT_RATIOS or resolution not in h3.H3_RESOLUTIONS:
+        raise PipelineError("minimal output config is invalid")
+    return str(aspect_ratio), str(resolution)
+
+
+def _generation_defaults_for_request(
+    paths: list[Path], meta: dict,
+) -> tuple[dict[str, dict[str, object]], str, str, str]:
+    profiles, aspect_ratio, resolution, fit_mode = _generation_defaults(paths, meta)
+    requested = _requested_generation_output(meta)
+    if requested is None:
+        return profiles, aspect_ratio, resolution, fit_mode
+    aspect_ratio, resolution = requested
+    return (
+        profiles,
+        aspect_ratio,
+        resolution,
+        str(profiles[aspect_ratio]["default_fit_mode"]),
+    )
+
+
+def _generation_defaults_from_bytes_for_request(
+    frames: list[bytes], meta: dict,
+) -> tuple[dict[str, dict[str, object]], str, str, str]:
+    profiles, aspect_ratio, resolution, fit_mode = _generation_defaults_from_bytes(
+        frames, meta
+    )
+    requested = _requested_generation_output(meta)
+    if requested is None:
+        return profiles, aspect_ratio, resolution, fit_mode
+    aspect_ratio, resolution = requested
+    return (
+        profiles,
+        aspect_ratio,
+        resolution,
+        str(profiles[aspect_ratio]["default_fit_mode"]),
+    )
 
 
 def _legacy_generation_defaults(
@@ -3277,6 +3735,23 @@ def _copy_prompt_fusion_frame(
     try:
         with destination.open("xb") as stream:
             stream.write(data)
+    except FileExistsError:
+        try:
+            descriptor = os.open(
+                destination, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError:
+            raise PipelineError("prompt fusion input is invalid") from None
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise PipelineError("prompt fusion input is invalid")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                existing = stream.read()
+        finally:
+            os.close(descriptor)
+        if hashlib.sha256(existing).hexdigest() != expected_sha256:
+            raise PipelineError("prompt fusion input is invalid")
     except OSError:
         raise PipelineError("prompt fusion input is invalid") from None
 
@@ -3927,6 +4402,17 @@ def run(
         # Reject an invalid/oversized new contract before extraction, ASR, Codex,
         # or any later provider can observe the input.
         new_input_contract = "dialogue_mode" in meta and meta.get("duration_s") is not None
+        effective_request = meta.get("effective_request")
+        minimal_v1 = (
+            isinstance(effective_request, Mapping)
+            and type(effective_request.get("version")) is int
+            and effective_request.get("version") == 1
+        )
+        minimal_auto_target = _minimal_auto_rewrite_target(meta)
+        if minimal_v1 and (
+            not new_input_contract or minimal_auto_target is None
+        ):
+            raise PipelineError("minimal auto rewrite dialogue is invalid")
         render_options: dict[str, bool] | None = None
         if new_input_contract:
             frozen_generation_config = generation_config.resolve(cdir, meta)
@@ -3968,7 +4454,11 @@ def run(
         # 或历史会话没有实际时长时，仍走旧流水线且不伪造 prepared receipt。
         dialogue_mode = meta.get("dialogue_mode") if new_input_contract else None
         voice_mode = meta.get("voice_mode", "none")
+        user_reference_image_path, user_replacement_prompt = (
+            _minimal_image_postprocess_inputs(cdir, meta)
+        )
         voice_lines: list[dict] | None = None
+        defer_minimal_voice_translation = False
         if new_input_contract:
             review = dialogue_review.public_state(meta.get("dialogue_review"))
             if review is not None:
@@ -3983,43 +4473,85 @@ def run(
                     raise PipelineError(
                         f"unknown voice_mode for auto dialogue: {auto_voice_mode}"
                     )
-                voice_lines = _voice_step(
-                    settings,
-                    cid,
-                    cdir,
-                    work,
-                    runner,
-                    auto_voice_mode,
-                    meta.get("target_language") or "",
-                    allow_no_audio=True,
-                )
+                recovered_analysis = None
+                if minimal_auto_target is not None:
+                    recovered_analysis = _recover_completed_voice_analysis(
+                        cdir, meta, float(meta["duration_s"]),
+                    )
+                if recovered_analysis is None:
+                    defer_minimal_voice_translation = (
+                        minimal_auto_target is not None
+                        and auto_voice_mode == "translate"
+                    )
+                    voice_lines = _voice_step(
+                        settings,
+                        cid,
+                        cdir,
+                        work,
+                        runner,
+                        auto_voice_mode,
+                        meta.get("target_language") or "",
+                        allow_no_audio=True,
+                        transform=not defer_minimal_voice_translation,
+                    )
                 analyzed_meta = storage.load_pipeline_claim(
                     settings.data_dir, cid, claim_owner
                 )
                 if analyzed_meta is None:
                     raise PipelineError("dialogue analysis claim was lost")
-                machine_lines = dialogue_review.effective_machine_lines(
-                    analyzed_meta.get("voice_line_provenance")
-                )
-                outcome = analyzed_meta.get("voice_analysis_outcome")
-                if outcome not in dialogue_review.OUTCOMES:
-                    outcome = "recognized" if machine_lines else "no_vocal"
-                persisted_meta = storage.record_dialogue_analysis(
-                    settings.data_dir,
-                    cid,
-                    claim_owner,
-                    policy=analyzed_meta.get(
+                if minimal_auto_target is not None:
+                    recovered_analysis = _recover_completed_voice_analysis(
+                        cdir, analyzed_meta, float(analyzed_meta["duration_s"]),
+                    )
+                    if recovered_analysis is None:
+                        raise PipelineError("voice analysis recovery is incomplete")
+                    machine_lines, outcome = recovered_analysis
+                    defer_minimal_voice_translation = auto_voice_mode == "translate"
+                else:
+                    machine_lines = dialogue_review.effective_machine_lines(
+                        analyzed_meta.get("voice_line_provenance")
+                    )
+                    outcome = analyzed_meta.get("voice_analysis_outcome")
+                    if outcome not in dialogue_review.OUTCOMES:
+                        outcome = "recognized" if machine_lines else "no_vocal"
+                    review_policy = analyzed_meta.get(
                         "dialogue_review_policy", dialogue_review.AUTO_CONTINUE
-                    ),
-                    outcome=outcome,
-                    machine_lines=machine_lines,
-                )
-                if persisted_meta is None:
-                    raise PipelineError("dialogue review state was not persisted")
-                if persisted_meta["dialogue_review"]["status"] == "waiting":
-                    return
-                meta = persisted_meta
-                voice_lines = machine_lines
+                    )
+                if minimal_auto_target is not None:
+                    # Translation depends on the video-maker output.  Keep only
+                    # the complete ASR analysis durable until that translation
+                    # succeeds; a restart must therefore resume this branch.
+                    voice_lines = machine_lines
+                    if not machine_lines:
+                        persisted_meta = storage.record_dialogue_analysis(
+                            settings.data_dir,
+                            cid,
+                            claim_owner,
+                            policy=dialogue_review.AUTO_CONTINUE,
+                            outcome=outcome,
+                            machine_lines=[],
+                        )
+                        if persisted_meta is None:
+                            raise PipelineError(
+                                "empty dialogue review state was not persisted"
+                            )
+                        meta = persisted_meta
+                        defer_minimal_voice_translation = False
+                else:
+                    persisted_meta = storage.record_dialogue_analysis(
+                        settings.data_dir,
+                        cid,
+                        claim_owner,
+                        policy=review_policy,
+                        outcome=outcome,
+                        machine_lines=machine_lines,
+                    )
+                    if persisted_meta is None:
+                        raise PipelineError("dialogue review state was not persisted")
+                    if persisted_meta["dialogue_review"]["status"] == "waiting":
+                        return
+                    meta = persisted_meta
+                    voice_lines = machine_lines
             elif dialogue_mode in {"edit", "custom"}:
                 supplied = meta.get("voice_lines")
                 if not isinstance(supplied, list) or not supplied:
@@ -4111,6 +4643,27 @@ def run(
                 skill_bytes=video_skill_bytes,
             )
             if new_input_contract:
+                if defer_minimal_voice_translation and voice_lines:
+                    voice_lines = _publish_translated_voice_lines(
+                        settings,
+                        cid,
+                        cdir,
+                        work,
+                        voice_lines,
+                        _transform_voice_with_retry(
+                            settings,
+                            runner,
+                            work,
+                            _voice_prompt(
+                                cdir,
+                                "translate",
+                                minimal_auto_target or "",
+                                float(meta["duration_s"]),
+                            ),
+                            voice_lines,
+                            prompt,
+                        ),
+                    )
                 frame_paths = [work / "keyframes" / name for name in keyframes]
                 transition_skeleton = _frame_inventory(
                     {0: frame_paths},
@@ -4133,6 +4686,8 @@ def run(
                     skill_bytes=image_skill_bytes,
                     video_skill_bytes=video_skill_bytes,
                     render_options=render_options,
+                    user_reference_image_path=user_reference_image_path,
+                    user_replacement_prompt=user_replacement_prompt,
                 )
                 if continuity is None or set(image_prompts) != {0}:
                     raise PipelineError("image optimization output is missing or invalid")
@@ -4142,7 +4697,7 @@ def run(
             prompt = _apply_no_bgm_prefix(prompt, work / "prompt.txt", enabled=False)
             frame_paths = [work / "keyframes" / name for name in keyframes]
             profiles, aspect_ratio, resolution, default_fit_mode = (
-                _generation_defaults(frame_paths, meta)
+                _generation_defaults_for_request(frame_paths, meta)
                 if new_input_contract
                 else _legacy_generation_defaults(frame_paths)
             )
@@ -4183,6 +4738,9 @@ def run(
                     segment_lineage={
                         0: {"chain_id": "short-000", "join_mode": "hard_cut"},
                     },
+                    session_dir=cdir,
+                    user_reference_image_path=user_reference_image_path,
+                    user_replacement_prompt=user_replacement_prompt,
                 )
                 completion.update(frozen_continuity)
                 completion.update(frozen_prompts)
@@ -4253,6 +4811,60 @@ def run(
                 seg_metas = _bind_keyframe_source_timeline(
                     work, segments, seg_metas, source_scenes,
                 )
+                if defer_minimal_voice_translation and voice_lines:
+                    video_prompt = "\n\n".join(
+                        str(item["visual_prompt"])
+                        for item in sorted(seg_metas, key=lambda item: item["index"])
+                    )
+                    voice_lines = _publish_translated_voice_lines(
+                        settings,
+                        cid,
+                        cdir,
+                        work,
+                        voice_lines,
+                        _transform_voice_with_retry(
+                            settings,
+                            runner,
+                            work,
+                            _voice_prompt(
+                                cdir,
+                                "translate",
+                                minimal_auto_target or "",
+                                float(meta["duration_s"]),
+                            ),
+                            voice_lines,
+                            video_prompt,
+                        ),
+                    )
+                    refreshed = storage.load_meta(settings.data_dir, cid)
+                    if refreshed is None:
+                        raise PipelineError("conversation disappeared during dialogue translation")
+                    translated_dialogue = _planner_dialogue(refreshed, voice_lines)
+                    translated_by_seg = {
+                        seg["index"]: long_video.localize_dialogue(
+                            translated_dialogue, seg, segments=segments
+                        )
+                        for seg in segments
+                    }
+                    for segment_meta in seg_metas:
+                        translated_lines = translated_by_seg[segment_meta["index"]]
+                        translated_prompt = prepared_input.compose_final_prompt(
+                            long_video.compose_segment_visual_prompt(
+                                segment_meta["visual_prompt"]
+                            ),
+                            translated_lines,
+                        )
+                        translated_prompt = _apply_no_bgm_prefix(
+                            translated_prompt,
+                            work / "segments" / str(segment_meta["index"])
+                            / "work" / "prompt.txt",
+                            enabled=True,
+                        )
+                        segment_meta["prompt"] = translated_prompt
+                        segment_meta["lines"] = [
+                            line["text"] for line in translated_lines
+                        ]
+                        segment_meta["dialogue"] = translated_lines
             image_prompts: dict[int, str] | None = None
             continuity: dict | None = None
             if new_input_contract:
@@ -4266,6 +4878,8 @@ def run(
                     skill_bytes=image_skill_bytes,
                     milestone=milestone,
                     render_options=render_options,
+                    user_reference_image_path=user_reference_image_path,
+                    user_replacement_prompt=user_replacement_prompt,
                 )
             changes: dict = {"status": "done", "segments": seg_metas}
             if new_input_contract:
@@ -4335,7 +4949,7 @@ def run(
                         )
                     ]
                     profiles, aspect_ratio, resolution, default_fit_mode = (
-                        _generation_defaults_from_bytes(anchors, meta)
+                        _generation_defaults_from_bytes_for_request(anchors, meta)
                     )
                 except (
                     OSError,
@@ -4385,6 +4999,9 @@ def run(
                         )
                         else None
                     ),
+                    session_dir=cdir,
+                    user_reference_image_path=user_reference_image_path,
+                    user_replacement_prompt=user_replacement_prompt,
                 )
                 changes.update(frozen_continuity)
                 changes.update(frozen_prompts)

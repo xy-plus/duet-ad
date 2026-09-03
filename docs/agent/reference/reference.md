@@ -471,6 +471,7 @@ current 每个 segment 在 attempt/input/output receipt 完整匹配后按供应
 | --- | --- | --- |
 | `ACCESS_TOKEN` | 无，必填 | 共享 Bearer 口令 |
 | `ENABLE_PIPELINE` | `1` | 生产是否启动输入准备；直接构造 Settings 的测试默认 false |
+| `ENABLE_MINIMAL_CREATION` | false | 极简创建 v1 独立发布开关；关闭时不声明 capability 且拒绝新的 v1 创建 |
 | `DATA_DIR` | `data` | 会话根目录 |
 | `MAX_UPLOAD_MB` | `500` | 上传/URL 下载上限 |
 | `CODEX_TIMEOUT_S` | `1800` | 单次 codex 硬超时 |

@@ -184,6 +184,34 @@ def _frozen(tmp_path: Path) -> context_ir_bridge.FrozenContextIrRequest:
     )
 
 
+def test_context_ir_png_proxy_metadata_does_not_inherit_source_suffix(
+    tmp_path: Path,
+) -> None:
+    source, _plan_value = _source_request(tmp_path)
+    source = replace(
+        source,
+        keyframes=tuple(
+            (path.with_suffix(".jpg"), data) for path, data in source.keyframes
+        ),
+    )
+    artifact_path, artifact_sha256 = _upstream_artifact(tmp_path)
+    frozen = context_ir_bridge.freeze_context_ir_request(
+        source_h3_request=source,
+        context_ir_keyframes=_context_keyframes(source),
+        upstream_dialogue_sha256=UPSTREAM_DIALOGUE_SHA256,
+        upstream_artifact_path=artifact_path,
+        upstream_artifact_sha256=artifact_sha256,
+        upstream_dialogue_sha256_path=("dialogue", "sha256"),
+        source_prompt_sha256=hashlib.sha256(source.prompt.encode()).hexdigest(),
+        minimax_api_key="minimax-secret",
+    )
+
+    images = [item for item in frozen.references if item.type == "image_url"]
+    assert [item.name for item in images] == ["01.png", "02.png"]
+    assert all(item.mime_type == "image/png" for item in images)
+    assert all(item.data.startswith(b"\x89PNG\r\n\x1a\n") for item in images)
+
+
 def test_effective_prompt_does_not_rewrite_provider_relation_states(
     tmp_path: Path,
 ) -> None:
@@ -336,7 +364,7 @@ def _reference_fusion_frozen(
     keyframes = tuple(
         (
             tmp_path / f"fusion-{order:02d}.png",
-            _png(7 + order, 9 + order, 16 * order),
+            _png(512 + order, 640 + order, 16 * order),
         )
         for order in range(1, 10)
     )

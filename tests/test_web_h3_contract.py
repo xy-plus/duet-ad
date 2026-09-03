@@ -37,15 +37,33 @@ def _run_contract(expression: str):
     return json.loads(completed.stdout)
 
 
-def test_creation_contract_stays_provider_neutral_while_status_names_h3():
-    source = _web_source()
-    assert "voice-mode" in source
-    assert "target_language" in source
-    assert "H3 生成" in source
-    assert "minimax" not in source.lower()
-    assert "最长 300 秒" in source
-    assert "超过 10 秒会拆分为单次不超过 10 秒的视频生成子任务" in source
-    assert "时长不限" not in source
+def test_visible_creation_contract_defaults_to_link_and_hides_pipeline_copy():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    composer = html.split('<form id="composer"', 1)[1].split("</form>", 1)[0]
+    visible = composer.split(
+        '<div class="legacy-contract-controls" hidden aria-hidden="true">', 1
+    )[0]
+
+    assert 'name="source-mode" value="link" checked' in visible
+    assert 'name="source-mode" value="upload">' in visible
+    assert '<h2 id="dialogue-title">改编台词</h2>' in visible
+    assert "系统自动识别并改编台词" in visible
+    assert "script-input" not in html
+    assert "script-input" not in source
+    assert 'id="translation-toggle"' not in visible
+    assert 'id="lang-input"' in visible
+    assert 'name="voice-mode"' not in visible
+    assert 'name="dialogue-mode"' not in visible
+    assert "target_language" not in visible
+    for technical_copy in (
+        "H3",
+        "Context IR",
+        "超过 10 秒会拆分为单次不超过 10 秒的视频生成子任务",
+        "十秒分段",
+    ):
+        assert technical_copy not in visible
+    assert "minimax" not in visible.lower()
 
 
 def test_duration_limit_error_is_structured_and_shown_as_popup():
@@ -121,7 +139,7 @@ def test_read_only_gate_fails_closed_for_legacy_details():
     assert result == [True, False, False, False]
 
 
-def test_detail_signature_tracks_direct_h3_render_fields():
+def test_hidden_direct_h3_fields_do_not_rebuild_the_minimal_view():
     result = _run_contract(
         "(() => {"
         "const base={status:'done',read_only:false,submit_enabled:true,fit_required:false,duration_s:10,"
@@ -138,7 +156,7 @@ def test_detail_signature_tracks_direct_h3_render_fields():
         "return next.stable !== original.stable || next.generation !== original.generation;});"
         "})()"
     )
-    assert result == [True, True, True, True, True, True]
+    assert result == [False, False, False, False, False, False]
 
 
 def test_resume_builder_reuses_persisted_h3_attempt_exactly():

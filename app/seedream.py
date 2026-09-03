@@ -17,7 +17,7 @@ import cv2
 import httpx
 import numpy as np
 
-from app import error_trace
+from app import error_trace, frame_fit
 from app.config import SEEDREAM_PRO_MODEL, Settings
 
 ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
@@ -119,7 +119,15 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
 
 
 def _data_url(raw: bytes) -> str:
-    return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif raw.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    elif len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        raise SeedreamError("invalid_input")
+    return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
 
 
 def _safe_provider_error_code(response: httpx.Response) -> str | None:
@@ -143,19 +151,17 @@ def _decode(payload: dict) -> bytes:
 
 
 def _write_exact_png(raw: bytes, out: Path, width: int, height: int) -> None:
-    image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
-    if image is None:
-        raise SeedreamError("provider_output_invalid")
-    if image.shape[1] != width or image.shape[0] != height:
-        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_LANCZOS4)
-    ok, encoded = cv2.imencode(".png", image)
-    if not ok:
+    try:
+        encoded = frame_fit.normalize_image_to_canvas_png(
+            raw, width, height, label="Seedream provider output",
+        )
+    except frame_fit.FrameFitError:
         raise SeedreamError("provider_output_invalid")
     out.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=".seedream-", suffix=".png", dir=out.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
-            stream.write(encoded.tobytes())
+            stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, out)
@@ -182,6 +188,7 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
     if first is None:
         raise SeedreamError("invalid_input")
     height, width = first.shape[:2]
+    image_data_urls = [_data_url(item) for item in images]
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     input_shas = [hashlib.sha256(item).hexdigest() for item in images]
     request_binding = {
@@ -292,7 +299,7 @@ async def edit(settings: Settings, images: list[bytes], prompt: str, out: Path, 
     payload = {
         "model": settings.seedream_model,
         "prompt": prompt,
-        "image": [_data_url(item) for item in images],
+        "image": image_data_urls,
         "response_format": "b64_json",
         "watermark": False,
     }

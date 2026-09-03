@@ -33,6 +33,8 @@ class Settings:
     mediakit_api_key: str = field(default="", repr=False)
     # MediaKit 后处理逐帧并行提交的进程级并发上限（单进程内跨会话全局）
     mediakit_concurrency: int = 4
+    # 直建 Settings 默认关闭节流，生产 get_settings 默认启用一秒提交间隔。
+    mediakit_submit_interval_s: float = 0.0
     mediakit_timeout_s: float = 180.0
     seedream_model: str = SEEDREAM_PRO_MODEL
     seedream_edit_mode: str = "independent_parallel"
@@ -58,6 +60,8 @@ class Settings:
     download_timeout_s: int = 120
     # 直建 Settings（测试）默认不跑流水线；get_settings（生产）默认开
     enable_pipeline: bool = False
+    # 极简创建是独立的发布合同；默认关闭，待完整后端链就绪后一次启用。
+    enable_minimal_creation: bool = False
 
     def __post_init__(self) -> None:
         credential_file = Path(self.deepseek_credential_file)
@@ -102,6 +106,15 @@ class Settings:
         ):
             raise ValueError("mediakit_concurrency must be a positive integer")
         if (
+            isinstance(self.mediakit_submit_interval_s, bool)
+            or not isinstance(self.mediakit_submit_interval_s, (int, float))
+            or not math.isfinite(float(self.mediakit_submit_interval_s))
+            or self.mediakit_submit_interval_s < 0
+        ):
+            raise ValueError(
+                "mediakit_submit_interval_s must be a non-negative finite number"
+            )
+        if (
             isinstance(self.mediakit_timeout_s, bool)
             or not isinstance(self.mediakit_timeout_s, (int, float))
             or not math.isfinite(float(self.mediakit_timeout_s))
@@ -131,6 +144,23 @@ class Settings:
             self, "asr_process_budget", process_budget(self.asr_threads)
         )
 
+    def minimal_creation_settings_ready(self) -> bool:
+        """Return whether configured, non-secret v1 dependencies are usable."""
+        return bool(
+            self.enable_minimal_creation
+            and self.enable_pipeline
+            and self.enable_h3_submit
+            and self.autodl_art_token.strip()
+            and self.minimax_api_key.strip()
+            and self.enable_mediakit_erase
+            and self.mediakit_api_key.strip()
+            and self.asr_cli is not None
+            and self.asr_cli.is_file()
+            and os.access(self.asr_cli, os.X_OK)
+            and self.asr_model is not None
+            and self.asr_model.is_file()
+        )
+
 
 def get_settings() -> Settings:
     token = os.environ.get("ACCESS_TOKEN")
@@ -158,6 +188,9 @@ def get_settings() -> Settings:
         enable_mediakit_erase=os.environ.get("ENABLE_MEDIAKIT_ERASE", "").lower() in ("1", "true", "yes"),
         mediakit_api_key=os.environ.get("VOLC_MEDIAKIT_API_KEY", "").strip(),
         mediakit_concurrency=max(1, int(os.environ.get("MEDIAKIT_CONCURRENCY", "4"))),
+        mediakit_submit_interval_s=float(os.environ.get(
+            "MEDIAKIT_SUBMIT_INTERVAL_S", "1.0"
+        )),
         mediakit_timeout_s=float(os.environ.get("MEDIAKIT_TIMEOUT_S", "180")),
         seedream_model=os.environ.get(
             "SEEDREAM_MODEL", SEEDREAM_PRO_MODEL
@@ -188,4 +221,7 @@ def get_settings() -> Settings:
         tiktok_proxy=os.environ.get("TIKTOK_PROXY", ""),
         download_timeout_s=int(os.environ.get("DOWNLOAD_TIMEOUT_S", "120")),
         enable_pipeline=os.environ.get("ENABLE_PIPELINE", "1").lower() in ("1", "true", "yes"),
+        enable_minimal_creation=os.environ.get(
+            "ENABLE_MINIMAL_CREATION", ""
+        ).lower() in ("1", "true", "yes"),
     )

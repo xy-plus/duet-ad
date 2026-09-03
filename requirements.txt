@@ -3,6 +3,7 @@ uvicorn[standard]
 python-multipart
 opencv-python-headless>=4.8,<5
 pytest
+jsonschema>=4.18.5,<5  # 测试直接 import；Draft 2020-12 schema 校验
 httpx
 scenedetect>=0.7
 numpy  # vocal/测试直接 import（此前靠 opencv/litert 传递引入，显式声明）

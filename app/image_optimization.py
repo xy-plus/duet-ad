@@ -35,21 +35,105 @@ MIN_ELEMENT_INDEX_BYTES = 256 * 1024
 ELEMENT_INDEX_BASE_BYTES = 64 * 1024
 ELEMENT_INDEX_PER_FRAME_BYTES = 16 * 1024
 MAX_PROJECT_OUTPUT_OVERHEAD_BYTES = 64 * 1024
+ANALYSIS_IMAGE_MIN_EDGE = 256
+ANALYSIS_IMAGE_MAX_EDGE = 5760
+ANALYSIS_IMAGE_MIN_RATIO = 0.4
+ANALYSIS_IMAGE_MAX_RATIO = 2.5
+
+
+def _pad_analysis_image_ratio(image: np.ndarray) -> np.ndarray:
+    """Pad an image into the provider edge/ratio interval without cropping."""
+    height, width = image.shape[:2]
+    target_height = max(height, ANALYSIS_IMAGE_MIN_EDGE)
+    target_width = max(width, ANALYSIS_IMAGE_MIN_EDGE)
+    if 2 * target_width > 5 * target_height:
+        target_height = (2 * target_width + 4) // 5
+    elif 5 * target_width < 2 * target_height:
+        target_width = (2 * target_height + 4) // 5
+    if target_width == width and target_height == height:
+        return image
+    vertical = target_height - height
+    horizontal = target_width - width
+    return cv2.copyMakeBorder(
+        image,
+        vertical // 2,
+        vertical - vertical // 2,
+        horizontal // 2,
+        horizontal - horizontal // 2,
+        cv2.BORDER_CONSTANT,
+        value=(0, 0, 0),
+    )
+
+
+def _normalize_analysis_image_bounds(image: np.ndarray) -> np.ndarray:
+    """Fit an image into MiniMax bounds without stretching its content."""
+    height, width = image.shape[:2]
+    target_height = height
+    target_width = width
+    shortest, longest = min(width, height), max(width, height)
+    ratio_is_valid = 5 * width >= 2 * height and 2 * width <= 5 * height
+
+    if ratio_is_valid:
+        if shortest < ANALYSIS_IMAGE_MIN_EDGE:
+            if width <= height:
+                target_width = ANALYSIS_IMAGE_MIN_EDGE
+                target_height = round(height * target_width / width)
+            else:
+                target_height = ANALYSIS_IMAGE_MIN_EDGE
+                target_width = round(width * target_height / height)
+        elif longest > ANALYSIS_IMAGE_MAX_EDGE:
+            if width >= height:
+                target_width = ANALYSIS_IMAGE_MAX_EDGE
+                target_height = round(height * target_width / width)
+            else:
+                target_height = ANALYSIS_IMAGE_MAX_EDGE
+                target_width = round(width * target_height / height)
+        else:
+            resized = image
+    else:
+        # For an out-of-ratio source, clamp only its long content edge. Padding
+        # below supplies a legal canvas without needlessly enlarging tiny strips.
+        target_longest = min(
+            ANALYSIS_IMAGE_MAX_EDGE,
+            max(ANALYSIS_IMAGE_MIN_EDGE, longest),
+        )
+        if longest != target_longest:
+            if width >= height:
+                target_width = target_longest
+                target_height = max(1, round(height * target_width / width))
+            else:
+                target_height = target_longest
+                target_width = max(1, round(width * target_height / height))
+    if target_width != width or target_height != height:
+        interpolation = (
+            cv2.INTER_AREA
+            if target_width < width or target_height < height
+            else cv2.INTER_CUBIC
+        )
+        resized = cv2.resize(
+            image, (target_width, target_height), interpolation=interpolation,
+        )
+    else:
+        resized = image
+    return _pad_analysis_image_ratio(resized)
 
 
 def half_resolution_png(data: bytes) -> bytes:
-    """Return the deterministic half-size PNG used by visual model inputs."""
+    """Return a deterministic bounded PNG used by visual model inputs."""
     if not isinstance(data, bytes) or not data:
         raise ValueError("analysis image source is invalid")
     image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None or image.size == 0:
         raise ValueError("analysis image source is invalid")
+    image = _normalize_analysis_image_bounds(image)
     height, width = image.shape[:2]
-    resized = cv2.resize(
-        image,
-        (max(1, (width + 1) // 2), max(1, (height + 1) // 2)),
-        interpolation=cv2.INTER_AREA,
+    half_size = ((width + 1) // 2, (height + 1) // 2)
+    resized = (
+        cv2.resize(image, half_size, interpolation=cv2.INTER_AREA)
+        if min(half_size) >= ANALYSIS_IMAGE_MIN_EDGE
+        else image
     )
+    resized = _pad_analysis_image_ratio(resized)
     encoded, proxy = cv2.imencode(
         ".png", resized, [cv2.IMWRITE_PNG_COMPRESSION, 3]
     )
@@ -234,6 +318,97 @@ def _sha256_regular(source: Path) -> str:
         return digest.hexdigest()
     finally:
         os.close(fd)
+
+
+def _freeze_user_replacement_inputs(
+    *,
+    session_dir: Path | None,
+    user_reference_image_path: Path | None,
+    user_replacement_prompt: str | None,
+) -> tuple[dict | None, str | None]:
+    """Bind the optional user replacement pair without freezing host paths."""
+    if user_reference_image_path is None and user_replacement_prompt is None:
+        return None, None
+    if (
+        not isinstance(user_reference_image_path, Path)
+        or not isinstance(user_replacement_prompt, str)
+        or not user_replacement_prompt.strip()
+        or user_replacement_prompt != user_replacement_prompt.strip()
+        or len(user_replacement_prompt.encode("utf-8")) > MAX_PROMPT_BYTES
+        or not isinstance(session_dir, Path)
+    ):
+        raise ValueError("invalid image optimization user replacement inputs")
+    try:
+        root = session_dir.resolve(strict=True)
+        source = user_reference_image_path.resolve(strict=True)
+        relative = source.relative_to(root)
+    except (OSError, ValueError):
+        raise ValueError("invalid image optimization user replacement inputs") from None
+    if (
+        user_reference_image_path.is_symlink()
+        or relative == Path(".")
+        or not source.is_file()
+    ):
+        raise ValueError("invalid image optimization user replacement inputs")
+    try:
+        digest = _sha256_regular(user_reference_image_path)
+    except ValueError:
+        raise ValueError("invalid image optimization user replacement inputs") from None
+    return {
+        "path": relative.as_posix(),
+        "sha256": digest,
+    }, user_replacement_prompt
+
+
+def _frozen_user_replacement_inputs(
+    execution_inputs: dict,
+) -> tuple[dict | None, str | None, bool]:
+    """Read the new pair while keeping already persisted v4 receipts readable."""
+    fields = {"user_reference_image", "user_replacement_prompt"}
+    present = fields & set(execution_inputs)
+    if not present:
+        return None, None, True
+    if present != fields:
+        raise ValueError("invalid image optimization execution inputs")
+    reference = execution_inputs.get("user_reference_image")
+    prompt = execution_inputs.get("user_replacement_prompt")
+    if reference is None and prompt is None:
+        return None, None, False
+    if (
+        not isinstance(reference, dict)
+        or set(reference) != {"path", "sha256"}
+        or not isinstance(reference.get("path"), str)
+        or not reference["path"]
+        or Path(reference["path"]).is_absolute()
+        or Path(reference["path"]) == Path(".")
+        or ".." in Path(reference["path"]).parts
+        or not isinstance(reference.get("sha256"), str)
+        or _SHA256_RE.fullmatch(reference["sha256"]) is None
+        or not isinstance(prompt, str)
+        or not prompt
+        or prompt != prompt.strip()
+        or len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES
+    ):
+        raise ValueError("invalid image optimization execution inputs")
+    return deepcopy(reference), prompt, False
+
+
+def _align_frozen_user_replacement_inputs(
+    expected: dict,
+    actual: dict,
+) -> dict:
+    """Reconstruct either the historical or current v4 execution shape."""
+    reference, prompt, legacy = _frozen_user_replacement_inputs(actual)
+    if legacy:
+        expected.pop("user_reference_image", None)
+        expected.pop("user_replacement_prompt", None)
+    else:
+        expected["user_reference_image"] = reference
+        expected["user_replacement_prompt"] = prompt
+    expected["sha256"] = sha256(_plan_json({
+        key: value for key, value in expected.items() if key != "sha256"
+    }))
+    return expected
 
 
 def _read_json_output(path: Path, max_bytes: int) -> object:
@@ -3161,8 +3336,22 @@ def composite_replacement_board_spec(plan: dict) -> dict:
     return {"tiles": tiles}
 
 
-def composite_replacement_board_prompt(plan: dict) -> str:
+def composite_replacement_board_prompt(
+    plan: dict,
+    *,
+    user_replacement_prompt: str | None = None,
+) -> str:
     board = composite_replacement_board_spec(plan)
+    if (
+        user_replacement_prompt is not None
+        and (
+            not isinstance(user_replacement_prompt, str)
+            or not user_replacement_prompt
+            or user_replacement_prompt != user_replacement_prompt.strip()
+            or len(user_replacement_prompt.encode("utf-8")) > MAX_PROMPT_BYTES
+        )
+    ):
+        raise ValueError("invalid image optimization user replacement inputs")
     columns = max(1, int(len(board["tiles"]) ** 0.5 + 0.999999))
     rows = max(1, (len(board["tiles"]) + columns - 1) // columns)
     bindings = "；".join(
@@ -3170,13 +3359,24 @@ def composite_replacement_board_prompt(plan: dict) -> str:
         f"{tile['replacement_description']}"
         for tile in board["tiles"]
     )
+    user_clause = ""
+    if user_replacement_prompt is not None:
+        user_clause = (
+            "图3是用户参考图；用户替换提示词为"
+            f"{json.dumps(user_replacement_prompt, ensure_ascii=False)}。"
+            "global_plan 已把该提示词的替换语义写入最对应 stable key 的现有目标字段；"
+            "只用图3的视觉特征和用户提示词约束该 stable key 对应的 tile，"
+            "其他 tile 不得继承图3的身份、外观或设计，且必须各自按已绑定的"
+            "replacement_description 生成独立替换素材；不得保留源素材、改为"
+            "source-preserve/no-invention 或省略既有替换设计。"
+        )
     return _canonical_prompt(
         "在图1的空白画布上生成一张全项目共享的合并替换参考图；"
         f"按 {columns} 列 {rows} 行的固定网格编号分块，且每个元素恰好一个 tile："
         f"{bindings}。"
         "图2是按相同 tile 顺序合成的唯一源视觉证据图。每个 tile 只需一块能清晰展示"
         "对应替换元素特征的代表图，不生成三视图或四视图，不重复、不遗漏、"
-        "不合并不同 stable key。"
+        f"不合并不同 stable key。{user_clause}"
     )
 
 
@@ -3347,6 +3547,9 @@ def freeze_execution_inputs(
     profile: dict,
     model: str,
     frame_inventory: list[dict],
+    session_dir: Path | None = None,
+    user_reference_image_path: Path | None = None,
+    user_replacement_prompt: str | None = None,
 ) -> dict:
     if (
         isinstance(revision, bool)
@@ -3364,6 +3567,13 @@ def freeze_execution_inputs(
     ):
         raise ValueError("invalid image optimization execution inputs")
     canonical, inventory = _canonical_plan_with_frame_inventory(plan, frame_inventory)
+    user_reference_image, canonical_user_prompt = _freeze_user_replacement_inputs(
+        session_dir=session_dir,
+        user_reference_image_path=user_reference_image_path,
+        user_replacement_prompt=user_replacement_prompt,
+    )
+    if canonical["version"] != 4 and user_reference_image is not None:
+        raise ValueError("invalid image optimization execution inputs")
     lookup = {
         (item["segment_index"], item["frame_index"]): item
         for item in inventory
@@ -3424,6 +3634,8 @@ def freeze_execution_inputs(
     }
     if canonical["version"] == 4:
         payload["continuity_sha256"] = _scene_graph_digest(canonical, inventory)
+        payload["user_reference_image"] = user_reference_image
+        payload["user_replacement_prompt"] = canonical_user_prompt
         payload["sha256"] = sha256(_plan_json(payload))
     return payload
 
@@ -3631,14 +3843,19 @@ def _freeze_frame_prompts_v4(
     prompts: dict[int, dict[int, str]],
     plan: dict | None,
 ) -> dict:
-    expected_keys = {
+    legacy_keys = {
         "version", "plan_sha256", "profile", "revision", "model",
         "identity_slots", "scene_slots", "layout_slots", "frames",
         "continuity_sha256", "sha256",
     }
+    expected_keys = legacy_keys | {
+        "user_reference_image", "user_replacement_prompt",
+    }
     if (
         not isinstance(execution_inputs, dict)
-        or set(execution_inputs) != expected_keys
+        or frozenset(execution_inputs) not in {
+            frozenset(legacy_keys), frozenset(expected_keys),
+        }
         or execution_inputs.get("version") != 4
         or execution_inputs.get("model") != settings.seedream_model
         or not isinstance(plan, dict)
@@ -3670,6 +3887,9 @@ def _freeze_frame_prompts_v4(
             profile=execution_inputs["profile"],
             model=execution_inputs["model"],
             frame_inventory=inventory,
+        )
+        expected_inputs = _align_frozen_user_replacement_inputs(
+            expected_inputs, execution_inputs,
         )
         expected_prompts = compile_frame_prompts(
             plan,
@@ -4084,6 +4304,8 @@ def generate_project_prompts(
     phase_retry_count: int = 0,
     phase_retry_interval_s: float = 0.0,
     generation_config: dict[str, bool] | None = None,
+    user_reference_image_path: Path | None = None,
+    user_replacement_prompt: str | None = None,
 ) -> tuple[dict, dict]:
     """Plan globally from contact sheets, then describe source frames per segment."""
     if edit_mode not in SEEDREAM_EDIT_MODES or expected_version not in {2, 3, 4}:
@@ -4096,6 +4318,11 @@ def generate_project_prompts(
         raise ValueError("image generation_config is invalid")
     session, indices, prepared = _project_segment_inputs(
         segments, session_dir, expected_version=expected_version,
+    )
+    user_reference_image, canonical_user_prompt = _freeze_user_replacement_inputs(
+        session_dir=session,
+        user_reference_image_path=user_reference_image_path,
+        user_replacement_prompt=user_replacement_prompt,
     )
     skill = _skill_bytes(skill_bytes=skill_bytes, skill_path=skill_path)
     element_index = None
@@ -4171,6 +4398,19 @@ def generate_project_prompts(
                 )
                 destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 _contact_sheet(frames, destination)
+            staged_user_reference = None
+            if user_reference_image is not None:
+                suffix = user_reference_image_path.suffix.lower()
+                if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+                    raise ValueError(
+                        "invalid image optimization user replacement inputs"
+                    )
+                staged_user_reference = work / f"user_reference_image{suffix}"
+                _copy_regular(user_reference_image_path, staged_user_reference)
+                if _sha256_regular(staged_user_reference) != user_reference_image["sha256"]:
+                    raise ValueError(
+                        "invalid image optimization user replacement inputs"
+                    )
             request = {
                 "phase": "global_plan",
                 "generation_config": generation_config,
@@ -4186,6 +4426,14 @@ def generate_project_prompts(
                     ),
                 } for segment in request_segments],
                 "semantic_slots": {"scenes": scene_slots},
+                "user_reference_image": (
+                    {
+                        "path": f"work/{staged_user_reference.name}",
+                        "sha256": user_reference_image["sha256"],
+                    }
+                    if staged_user_reference is not None else None
+                ),
+                "user_replacement_prompt": canonical_user_prompt,
             }
             if element_index is not None:
                 request["element_index"] = element_index
@@ -5764,6 +6012,9 @@ def _receipt_v4(raw: dict, meta: dict) -> dict | None:
             profile=execution["profile"],
             model=execution["model"],
             frame_inventory=inventory,
+        )
+        expected_execution = _align_frozen_user_replacement_inputs(
+            expected_execution, execution,
         )
         expected_prompts = compile_frame_prompts(
             plan,

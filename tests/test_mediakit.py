@@ -1,6 +1,7 @@
 """AI MediaKit erase-image provider contract and paid-attempt safety."""
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -12,7 +13,7 @@ import numpy as np
 import pytest
 
 from app import mediakit
-from app.config import get_settings
+from app.config import Settings, get_settings
 from conftest import make_settings
 
 
@@ -91,18 +92,24 @@ def test_single_text_erase_uploads_local_file_downloads_and_converts_png(tmp_pat
                 "result": {"image_url": "https://result.example/out.webp"},
             })
         if request.url.host == "result.example":
-            return httpx.Response(200, content=_webp())
+            return httpx.Response(200, content=_webp(width=96, height=24))
         raise AssertionError(request.url)
 
     _install_client(monkeypatch, handler)
     assert _call(settings, cdir, source, out) == out.resolve()
     assert out.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
-    decoded = cv2.imread(str(out))
-    assert decoded.shape[:2] == (48, 64)
+    decoded = cv2.imread(str(out), cv2.IMREAD_UNCHANGED)
+    assert decoded.shape == (48, 64, 3)
+    assert np.all(decoded[:16] == 0)
+    assert np.any(decoded[16:32] != 0)
+    assert np.all(decoded[32:] == 0)
     receipt = json.loads((out.parent / ".mediakit/01.png.json").read_text())
     assert receipt["state"] == "succeeded"
     assert receipt["stages"][0]["state"] == "succeeded"
     assert receipt["stages"][0]["request_id"] == "erase-rid"
+    output_sha256 = hashlib.sha256(out.read_bytes()).hexdigest()
+    assert receipt["stages"][0]["output_sha256"] == output_sha256
+    assert receipt["output_sha256"] == output_sha256
     assert calls == [
         ("POST", "/api/v1/tools-sync/request-media-upload-url"),
         ("PUT", "/file-1"),
@@ -373,13 +380,14 @@ def test_explicit_provider_rejection_can_be_retried(tmp_path, monkeypatch):
     assert erase_calls == 2
 
 
-def test_exact_rate_limit_retries_with_one_upload_and_durable_attempts(tmp_path, monkeypatch):
-    settings = _settings(tmp_path, retry_count=2, retry_interval_s=0)
+def test_mixed_429_responses_retry_with_exponential_backoff(tmp_path, monkeypatch):
+    settings = _settings(tmp_path, retry_count=2, retry_interval_s=15)
     cdir = settings.data_dir / "c1"
     source = _png(cdir / "work/keyframes/01.png")
     out = cdir / "work/postprocessed/01.png"
     upload_requests = 0
     erase_calls = 0
+    waits = []
 
     def handler(request: httpx.Request):
         nonlocal upload_requests, erase_calls
@@ -397,15 +405,17 @@ def test_exact_rate_limit_retries_with_one_upload_and_durable_attempts(tmp_path,
             return httpx.Response(200)
         if request.url.path.endswith("erase-image"):
             erase_calls += 1
-            if erase_calls < 3:
+            if erase_calls == 1:
                 return httpx.Response(429, json={
                     "success": False,
-                    "request_id": f"limit-{erase_calls}",
+                    "request_id": "limit-1",
                     "error": {
                         "code": "RequestLimitExceeded",
                         "message": "slow down",
                     },
                 })
+            if erase_calls == 2:
+                return httpx.Response(429, content=b"not-json")
             return httpx.Response(200, json={
                 "success": True,
                 "request_id": "erase-rid",
@@ -417,6 +427,7 @@ def test_exact_rate_limit_retries_with_one_upload_and_durable_attempts(tmp_path,
         raise AssertionError(request.url)
 
     _install_client(monkeypatch, handler)
+    monkeypatch.setattr(mediakit, "sleep", waits.append)
     _call(settings, cdir, source, out)
 
     receipt = json.loads((out.parent / ".mediakit/01.png.json").read_text())
@@ -425,7 +436,8 @@ def test_exact_rate_limit_retries_with_one_upload_and_durable_attempts(tmp_path,
     assert erase_calls == 3
     assert [attempt["state"] for attempt in attempts] == ["failed", "failed", "succeeded"]
     assert len({attempt["attempt_id"] for attempt in attempts}) == 3
-    assert [attempt["request_id"] for attempt in attempts[:2]] == ["limit-1", "limit-2"]
+    assert [attempt["request_id"] for attempt in attempts[:2]] == ["limit-1", None]
+    assert waits == [15.0, 30.0]
 
 
 def test_exact_rate_limit_exhaustion_preserves_every_attempt(tmp_path, monkeypatch):
@@ -473,15 +485,16 @@ def test_exact_rate_limit_exhaustion_preserves_every_attempt(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(
-    ("status", "error_code", "task_id"),
+    ("status", "error_code", "task_id", "expected_calls", "expected_status"),
     [
-        (200, "RequestLimitExceeded", None),
-        (429, "OtherLimit", None),
-        (429, "RequestLimitExceeded", "possibly-accepted-task"),
+        (200, "RequestLimitExceeded", None, 1, 502),
+        (500, "RequestLimitExceeded", None, 1, 502),
+        (429, "OtherLimit", None, 3, 429),
     ],
 )
-def test_rate_limit_retry_requires_exact_http_and_error_shape(
+def test_rate_limit_retry_requires_429_without_task_id(
     tmp_path, monkeypatch, status, error_code, task_id,
+    expected_calls, expected_status,
 ):
     settings = _settings(tmp_path, retry_count=2, retry_interval_s=0)
     cdir = settings.data_dir / "c1"
@@ -512,9 +525,157 @@ def test_rate_limit_retry_requires_exact_http_and_error_shape(
         raise AssertionError(request.url)
 
     _install_client(monkeypatch, handler)
-    with pytest.raises(mediakit.MediaKitError, match="rejected"):
+    with pytest.raises(mediakit.MediaKitError, match="rejected") as caught:
+        _call(settings, cdir, source, out)
+    assert caught.value.status == expected_status
+    assert erase_calls == expected_calls
+
+
+def test_malformed_429_retries_to_exhaustion_and_exposes_429(
+    tmp_path, monkeypatch,
+):
+    settings = _settings(tmp_path, retry_count=2, retry_interval_s=0)
+    cdir = settings.data_dir / "c1"
+    source = _png(cdir / "work/keyframes/01.png")
+    out = cdir / "work/postprocessed/01.png"
+    erase_calls = 0
+
+    def handler(request: httpx.Request):
+        nonlocal erase_calls
+        if request.url.path.endswith("request-media-upload-url"):
+            return httpx.Response(200, json={
+                "success": True,
+                "result": {
+                    "file_id": "mediakit://file-1",
+                    "upload_url": "https://upload.example/file-1",
+                    "upload_headers": [],
+                },
+            })
+        if request.url.host == "upload.example":
+            return httpx.Response(200)
+        if request.url.path.endswith("erase-image"):
+            erase_calls += 1
+            return httpx.Response(429, content=b"not-json")
+        raise AssertionError(request.url)
+
+    _install_client(monkeypatch, handler)
+    with pytest.raises(mediakit.MediaKitError, match="request limit exceeded") as caught:
+        _call(settings, cdir, source, out)
+    assert caught.value.status == 429
+    assert erase_calls == 3
+    receipt = json.loads((out.parent / ".mediakit/01.png.json").read_text())
+    assert [item["state"] for item in receipt["stages"][0]["attempts"]] == [
+        "failed", "failed", "failed",
+    ]
+
+
+@pytest.mark.parametrize("task_location", ["top", "result", "data"])
+def test_any_visible_task_id_blocks_retry_and_future_reentry(
+    tmp_path, monkeypatch, task_location,
+):
+    settings = _settings(tmp_path, retry_count=2, retry_interval_s=15)
+    cdir = settings.data_dir / "c1"
+    source = _png(cdir / "work/keyframes/01.png")
+    out = cdir / "work/postprocessed/01.png"
+    erase_calls = 0
+    waits = []
+
+    def handler(request: httpx.Request):
+        nonlocal erase_calls
+        if request.url.path.endswith("request-media-upload-url"):
+            return httpx.Response(200, json={
+                "success": True,
+                "result": {
+                    "file_id": "mediakit://file-1",
+                    "upload_url": "https://upload.example/file-1",
+                    "upload_headers": [],
+                },
+            })
+        if request.url.host == "upload.example":
+            return httpx.Response(200)
+        if request.url.path.endswith("erase-image"):
+            erase_calls += 1
+            body = {
+                "success": False,
+                "error": {"code": "RequestLimitExceeded", "message": "slow down"},
+            }
+            if task_location == "top":
+                body["task_id"] = "possibly-accepted-task"
+            else:
+                body[task_location] = {"task_id": "possibly-accepted-task"}
+            return httpx.Response(429, json=body)
+        raise AssertionError(request.url)
+
+    _install_client(monkeypatch, handler)
+    monkeypatch.setattr(mediakit, "sleep", waits.append)
+    with pytest.raises(mediakit.MediaKitError, match="outcome unknown"):
+        _call(settings, cdir, source, out)
+    receipt = json.loads((out.parent / ".mediakit/01.png.json").read_text())
+    stage = receipt["stages"][0]
+    assert stage["state"] == "submitting"
+    assert stage["task_id"] == "possibly-accepted-task"
+    with pytest.raises(mediakit.MediaKitError, match="previous.*outcome unknown"):
         _call(settings, cdir, source, out)
     assert erase_calls == 1
+    assert waits == []
+
+
+def test_process_submit_interval_applies_across_independent_erases(
+    tmp_path, monkeypatch,
+):
+    settings = _settings(tmp_path, mediakit_submit_interval_s=1.0)
+    cdir = settings.data_dir / "c1"
+    sources = [
+        _png(cdir / f"work/keyframes/{index:02d}.png", value=index)
+        for index in (1, 2)
+    ]
+    outputs = [
+        cdir / f"work/postprocessed/{index:02d}.png" for index in (1, 2)
+    ]
+    clock = [100.0]
+    waits = []
+    erase_times = []
+    uploads = 0
+
+    monkeypatch.setattr(mediakit, "_last_erase_submit_at", None)
+    monkeypatch.setattr(mediakit, "monotonic", lambda: clock[0])
+
+    def advance(delay):
+        waits.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(mediakit, "sleep", advance)
+
+    def handler(request: httpx.Request):
+        nonlocal uploads
+        if request.url.path.endswith("request-media-upload-url"):
+            uploads += 1
+            return httpx.Response(200, json={
+                "success": True,
+                "result": {
+                    "file_id": f"mediakit://file-{uploads}",
+                    "upload_url": f"https://upload.example/file-{uploads}",
+                    "upload_headers": [],
+                },
+            })
+        if request.url.host == "upload.example":
+            return httpx.Response(200)
+        if request.url.path.endswith("erase-image"):
+            erase_times.append(clock[0])
+            return httpx.Response(200, json={
+                "success": True,
+                "result": {"image_url": "https://result.example/out.webp"},
+            })
+        if request.url.host == "result.example":
+            return httpx.Response(200, content=_webp())
+        raise AssertionError(request.url)
+
+    _install_client(monkeypatch, handler)
+    for source, output in zip(sources, outputs, strict=True):
+        _call(settings, cdir, source, output)
+
+    assert erase_times == [100.0, 101.0]
+    assert waits == [1.0]
 
 
 def test_provider_gates_and_input_limits(tmp_path):
@@ -544,13 +705,27 @@ def test_settings_mediakit_env_and_secret_repr(monkeypatch):
     monkeypatch.setenv("ENABLE_MEDIAKIT_ERASE", "true")
     monkeypatch.setenv("VOLC_MEDIAKIT_API_KEY", "secret-key")
     monkeypatch.setenv("MEDIAKIT_CONCURRENCY", "0")
+    monkeypatch.setenv("MEDIAKIT_SUBMIT_INTERVAL_S", "1.25")
     monkeypatch.setenv("MEDIAKIT_TIMEOUT_S", "77")
     settings = get_settings()
     assert settings.enable_mediakit_erase is True
     assert settings.mediakit_api_key == "secret-key"
     assert settings.mediakit_concurrency == 1
+    assert settings.mediakit_submit_interval_s == 1.25
     assert settings.mediakit_timeout_s == 77
     assert "secret-key" not in repr(settings)
+
+
+@pytest.mark.parametrize("value", [True, -1, float("nan"), float("inf"), -float("inf")])
+def test_mediakit_submit_interval_defaults_and_rejects_invalid_values(
+    monkeypatch, value,
+):
+    assert Settings(access_token="token").mediakit_submit_interval_s == 0.0
+    monkeypatch.setenv("ACCESS_TOKEN", "token")
+    monkeypatch.delenv("MEDIAKIT_SUBMIT_INTERVAL_S", raising=False)
+    assert get_settings().mediakit_submit_interval_s == 1.0
+    with pytest.raises(ValueError, match="mediakit_submit_interval_s"):
+        Settings(access_token="token", mediakit_submit_interval_s=value)
 
 
 def test_process_gate_bounds_parallel_calls_across_event_loops(tmp_path, monkeypatch):

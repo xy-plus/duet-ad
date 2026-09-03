@@ -1,498 +1,160 @@
-import json
-import threading
-import time
-
+import pytest
 from fastapi.testclient import TestClient
 
-from app import main as main_module, storage
+from app import main as main_module, published_preview, storage
 from app.main import create_app
 from conftest import AUTH, make_settings
 
 
-def _succeeded_conversation(settings, cid="same-cid"):
-    cdir = settings.data_dir / cid
-    (cdir / "work").mkdir(parents=True)
-    (cdir / "generated.mp4").write_bytes(b"published")
-    artifacts = {
-        "source": "source.mp4",
-        "visual_prompt": "work/visual_prompt.txt",
-        "final_prompt": "work/prompt.txt",
-    }
-    for name, relative in artifacts.items():
-        path = cdir / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(name.encode())
-    receipt = {
-        "bindings": {
-            "source": {"path": artifacts["source"], "sha256": "unused"},
-            "normalized_audio": None,
-            "keyframes": [],
-            "visual_prompt": {
-                "path": artifacts["visual_prompt"], "sha256": "unused"
-            },
-            "final_prompt": {
-                "path": artifacts["final_prompt"], "sha256": "unused"
-            },
-        }
-    }
-    (cdir / "prepared_input.json").write_text(
-        json.dumps(receipt), encoding="utf-8"
+def _persisted_terminal_conversation(settings, *, cid_title="pure-read"):
+    meta = storage.new_conversation(
+        settings.data_dir,
+        cid_title,
+        "source.mp4",
     )
-    return {
-        "id": cid,
-        "prepared_input_receipt": "prepared_input.json",
-        "generation": {
+    cid = meta["id"]
+    storage.update_meta(
+        settings.data_dir,
+        cid,
+        status="done",
+        generation={
             "status": "succeeded",
-            "client_request_id": "request-cache-test",
+            "client_request_id": "request-pure-read",
+            "attempt": 1,
+            "stage": "stitch",
         },
-    }
+    )
+    (settings.data_dir / cid / "generated.mp4").write_bytes(b"published")
+    return cid
 
 
-def test_generated_video_validation_cache_hits_and_meta_change_invalidates(
-    tmp_path, monkeypatch
-):
-    settings = make_settings(tmp_path)
-    meta = _succeeded_conversation(settings)
-    calls = []
+def _forbid_read_time_validation(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("read routes must not perform strict output validation")
 
-    def validate(_settings, _meta):
-        calls.append((_settings, _meta))
-        return True
-
-    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
-
-    assert main_module._has_valid_generated_video(settings, meta) is True
-    assert main_module._has_valid_generated_video(settings, meta) is True
-    assert len(calls) == 1
-
-    changed = {
-        **meta,
-        "generation": {
-            **meta["generation"],
-            "client_request_id": "request-cache-changed",
-        },
-    }
-    assert main_module._has_valid_generated_video(settings, changed) is True
-    assert len(calls) == 2
+    monkeypatch.setattr(
+        main_module,
+        "_validate_generated_video_uncached",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_generated_video_validation_fingerprint",
+        forbidden,
+        raising=False,
+    )
+    monkeypatch.setattr(storage, "probe_video", forbidden)
 
 
-def test_generated_video_validation_cache_invalidates_every_artifact_class(
-    tmp_path, monkeypatch
-):
-    settings = make_settings(tmp_path)
-    meta = _succeeded_conversation(settings)
-    calls = 0
-
-    def validate(_settings, _meta):
-        nonlocal calls
-        calls += 1
-        return False
-
-    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
-    assert main_module._has_valid_generated_video(settings, meta) is False
-
-    paths = [
-        settings.data_dir / meta["id"] / "generated.mp4",
-        settings.data_dir / meta["id"] / "source.mp4",
-        settings.data_dir / meta["id"] / "prepared_input.json",
-    ]
-    for index, path in enumerate(paths, 1):
-        path.write_bytes(f"mutation-{index}".encode())
-        assert main_module._has_valid_generated_video(settings, meta) is False
-
-    assert calls == 1 + len(paths)
-
-
-def test_generated_video_validation_cache_ignores_unrelated_files_and_meta(
-    tmp_path, monkeypatch
-):
-    settings = make_settings(tmp_path)
-    meta = _succeeded_conversation(settings)
-    calls = 0
-
-    def validate(_settings, _meta):
-        nonlocal calls
-        calls += 1
-        return True
-
-    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
-    assert main_module._has_valid_generated_video(settings, meta) is True
-
-    cdir = settings.data_dir / meta["id"]
-    unrelated = cdir / "work" / "unrelated-keyframe.png"
-    unrelated.write_bytes(b"not bound by either receipt")
-    changed = {**meta, "updated_at": "later", "postprocess": {"status": "done"}}
-    assert main_module._has_valid_generated_video(settings, changed) is True
-    assert calls == 1
-
-
-def test_validation_fingerprint_hashes_bound_speaker_timing_raw_bytes(
+def test_list_detail_and_file_are_pure_reads_of_terminal_state_and_file(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path)
-    meta = _succeeded_conversation(settings)
-    cdir = settings.data_dir / meta["id"]
-    timing = cdir / "work" / "speaker_timing.json"
-    timing.write_bytes(b'{"timing":"aaaa"}')
-    prepared = cdir / "prepared_input.json"
-    receipt = json.loads(prepared.read_text(encoding="utf-8"))
-    receipt["multimodal"] = {
-        "schema": "duet.h3-project-multimodal",
-        "version": 3,
-        "speaker_timing": {
-            "path": "work/speaker_timing.json",
-            "sha256": "expected-bound-sha",
-            "canonical_sha256": "expected-canonical-sha",
-        },
-    }
-    prepared.write_text(json.dumps(receipt), encoding="utf-8")
+    _forbid_read_time_validation(monkeypatch)
 
-    before_stat = timing.stat()
-    before = main_module._generated_video_validation_fingerprint(cdir, meta)
-    timing.write_bytes(b'{"timing":"bbbb"}')
-    real_stat = main_module.Path.stat
-
-    def stable_stat(path, *args, **kwargs):
-        if str(path) == str(timing):
-            return before_stat
-        return real_stat(path, *args, **kwargs)
-
-    monkeypatch.setattr(main_module.Path, "stat", stable_stat)
-    after = main_module._generated_video_validation_fingerprint(cdir, meta)
-
-    assert before is not None
-    assert after is not None
-    assert after != before
-
-
-def test_validation_fingerprint_hashes_every_producer_evidence_byte(
-    tmp_path, monkeypatch,
-):
-    settings = make_settings(tmp_path)
-    meta = _succeeded_conversation(settings, cid="producer-cache")
-    cdir = settings.data_dir / meta["id"]
-    work = cdir / "work"
-    sample = work / "speaker-visibility-frames" / "000001.png"
-    sample.parent.mkdir(parents=True)
-    sample.write_bytes(b"sample-a")
-    producer_input = work / "speaker_visibility_input.json"
-    producer_input.write_text(json.dumps({
-        "frames": [{
-            "path": "speaker-visibility-frames/000001.png",
-            "sha256": "bound-sample-sha",
-        }],
-        "contact_sheets": [],
-        "persons": [],
-        "cut_source": None,
-    }), encoding="utf-8")
-    raw_output = work / "speaker_visibility_output.json"
-    raw_output.write_bytes(b"raw-output-a")
-    frozen_skill = work / "speaker_visibility_skill.md"
-    frozen_skill.write_bytes(b"skill-a")
-    timing = work / "speaker_timing.json"
-    timing.write_bytes(b"timing-a")
-    production_receipt = work / "speaker_timing_production.json"
-    production_receipt.write_text(json.dumps({
-        "artifacts": {
-            "producer_input": {
-                "path": producer_input.name,
-                "sha256": "bound-input-sha",
-            },
-            "raw_output": {
-                "path": raw_output.name,
-                "sha256": "bound-output-sha",
-            },
-            "skill": {
-                "path": frozen_skill.name,
-                "sha256": "bound-skill-sha",
-            },
-            "speaker_timing": {
-                "path": timing.name,
-                "sha256": "bound-timing-sha",
-                "canonical_sha256": "bound-canonical-sha",
-            },
-        },
-    }), encoding="utf-8")
-    prepared = cdir / "prepared_input.json"
-    receipt = json.loads(prepared.read_text(encoding="utf-8"))
-    receipt["multimodal"] = {
-        "speaker_timing": {
-            "path": "work/speaker_timing.json",
-            "sha256": "bound-timing-sha",
-            "canonical_sha256": "bound-canonical-sha",
-        },
-        "speaker_timing_producer": {
-            "path": "work/speaker_timing_production.json",
-            "sha256": "bound-production-sha",
-            "raw_output_path": raw_output.name,
-            "raw_output_sha256": "bound-output-sha",
-        },
-    }
-    prepared.write_text(json.dumps(receipt), encoding="utf-8")
-    paths = [production_receipt, producer_input, raw_output, frozen_skill, sample]
-    stable_stats = {str(path): path.stat() for path in paths}
-    real_stat = main_module.Path.stat
-
-    def stable_stat(path, *args, **kwargs):
-        return stable_stats.get(str(path), real_stat(path, *args, **kwargs))
-
-    monkeypatch.setattr(main_module.Path, "stat", stable_stat)
-    baseline = main_module._generated_video_validation_fingerprint(cdir, meta)
-    assert baseline is not None
-    replacements = {
-        production_receipt: production_receipt.read_bytes().replace(
-            b"bound-input", b"other-input"
-        ),
-        producer_input: producer_input.read_bytes().replace(
-            b"bound-sample", b"other-sample"
-        ),
-        raw_output: b"raw-output-b",
-        frozen_skill: b"skill-b",
-        sample: b"sample-b",
-    }
-    for path, replacement in replacements.items():
-        original = path.read_bytes()
-        path.write_bytes(replacement)
-        assert main_module._generated_video_validation_fingerprint(
-            cdir, meta
-        ) != baseline
-        path.write_bytes(original)
-
-
-def test_long_video_cache_invalidates_plan_segment_state_and_stitch_artifacts(
-    tmp_path, monkeypatch
-):
-    settings = make_settings(tmp_path)
-    cid = "long-cid"
-    cdir = settings.data_dir / cid
-    segment = cdir / "work" / "segments" / "1"
-    attempt = segment / ".h3" / "attempts" / "000001" / "attempt.json"
-    attempt.parent.mkdir(parents=True)
-    bindings = {
-        "source": "source.mp4",
-        "segment_source": "work/segments/1/source.mp4",
-        "anchor_first": "work/segments/1/first.png",
-        "anchor_end": "work/segments/1/end.png",
-        "visual": "work/segments/1/visual.txt",
-        "final": "work/segments/1/final.txt",
-    }
-    for name, relative in bindings.items():
-        path = cdir / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(name.encode())
-    for path in (
-        segment / "generated.mp4",
-        segment / ".h3" / "session.json",
-        attempt,
-        cdir / "generated.mp4",
-        cdir / "stitch-receipt.json",
-    ):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(path.name.encode())
-    def artifact(name):
-        return {"path": bindings[name], "sha256": "unused"}
-
-    plan = {
-        "source": artifact("source"),
-        "segments": [{
-            "index": 1,
-            "source": artifact("segment_source"),
-            "keyframes": [],
-            "anchors": [
-                {"role": "first", **artifact("anchor_first")},
-                {"role": "end", **artifact("anchor_end")},
-            ],
-            "visual_prompt": artifact("visual"),
-            "final_prompt": artifact("final"),
-        }],
-    }
-    (cdir / "long_video_plan.json").write_text(json.dumps(plan), encoding="utf-8")
-    meta = {
-        "id": cid,
-        "duration_s": 20,
-        "fit_mode": "none",
-        "dialogue_mode": "auto",
-        "segments": [{"index": 1}],
-        "frozen_plan_receipt": "receipt",
-        "long_video_plan_receipt": "long_video_plan.json",
-        "generation": {
-            "status": "succeeded",
-            "client_request_id": "request-long-cache",
-            "segments": [{"index": 1}],
-        },
-    }
-    calls = 0
-
-    def validate(_settings, _meta):
-        nonlocal calls
-        calls += 1
-        return True
-
-    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
-    assert main_module._has_valid_generated_video(settings, meta) is True
-
-    relevant = [
-        cdir / bindings["anchor_first"],
-        segment / "generated.mp4",
-        attempt,
-        cdir / "stitch-receipt.json",
-        cdir / "generated.mp4",
-    ]
-    for index, path in enumerate(relevant, 1):
-        path.write_bytes(f"changed-{index}".encode())
-        assert main_module._has_valid_generated_video(settings, meta) is True
-
-    assert calls == 1 + len(relevant)
-
-
-def test_generated_video_validation_cache_separates_data_roots(tmp_path, monkeypatch):
-    first = make_settings(tmp_path / "first")
-    second = make_settings(tmp_path / "second")
-    first_meta = _succeeded_conversation(first)
-    second_meta = _succeeded_conversation(second)
-    calls = []
-
-    def validate(settings, _meta):
-        calls.append(settings.data_dir)
-        return True
-
-    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
-
-    assert main_module._has_valid_generated_video(first, first_meta) is True
-    assert main_module._has_valid_generated_video(second, second_meta) is True
-    assert main_module._has_valid_generated_video(first, first_meta) is True
-    assert calls == [first.data_dir, second.data_dir]
-
-
-def test_generated_video_validation_cache_coalesces_concurrent_misses(
-    tmp_path, monkeypatch
-):
-    settings = make_settings(tmp_path)
-    meta = _succeeded_conversation(settings)
-    start = threading.Barrier(5)
-    calls = 0
-    calls_lock = threading.Lock()
-
-    def validate(_settings, _meta):
-        nonlocal calls
-        with calls_lock:
-            calls += 1
-        time.sleep(0.05)
-        return True
-
-    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
-
-    results = []
-
-    def worker():
-        start.wait()
-        results.append(main_module._has_valid_generated_video(settings, meta))
-
-    threads = [threading.Thread(target=worker) for _ in range(5)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=2)
-
-    assert results == [True] * 5
-    assert calls == 1
-
-
-def test_generated_video_validation_cache_does_not_persist_false(
-    tmp_path, monkeypatch
-):
-    settings = make_settings(tmp_path)
-    meta = _succeeded_conversation(settings)
-    results = iter((False, True))
-    calls = 0
-
-    def validate(_settings, _meta):
-        nonlocal calls
-        calls += 1
-        return next(results)
-
-    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
-
-    assert main_module._has_valid_generated_video(settings, meta) is False
-    assert main_module._has_valid_generated_video(settings, meta) is True
-    assert calls == 2
-
-
-def test_concurrent_false_validation_waiters_do_not_deadlock(tmp_path, monkeypatch):
-    settings = make_settings(tmp_path)
-    meta = _succeeded_conversation(settings)
-    start = threading.Barrier(5)
-    calls = 0
-    calls_lock = threading.Lock()
-
-    def validate(_settings, _meta):
-        nonlocal calls
-        with calls_lock:
-            calls += 1
-        time.sleep(0.01)
-        return False
-
-    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
-    results = []
-
-    def worker():
-        start.wait()
-        results.append(main_module._has_valid_generated_video(settings, meta))
-
-    threads = [threading.Thread(target=worker) for _ in range(5)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=2)
-
-    assert all(not thread.is_alive() for thread in threads)
-    assert results == [False] * 5
-    assert calls == 5
-
-
-def test_repeated_list_and_detail_share_one_expensive_validation(tmp_path, monkeypatch):
-    settings = make_settings(tmp_path)
-    calls = 0
-
-    def validate(_settings, _meta):
-        nonlocal calls
-        calls += 1
-        return True
-
-    monkeypatch.setattr(main_module, "_validate_generated_video_uncached", validate)
     with TestClient(create_app(settings)) as client:
-        meta = storage.new_conversation(settings.data_dir, "cache", "source.mp4")
+        cid = _persisted_terminal_conversation(settings)
+
+        detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+        listed = client.get("/api/conversations", headers=AUTH)
+        video = client.get(
+            f"/api/conversations/{cid}/files/generated.mp4",
+            headers=AUTH,
+        )
+
+    assert detail.status_code == 200
+    assert detail.json()["has_video"] is True
+    summary = next(item for item in listed.json() if item["id"] == cid)
+    assert summary["has_video"] is True
+    assert video.status_code == 200
+    assert video.content == b"published"
+
+
+def test_read_routes_fail_closed_without_terminal_state_or_output_file(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    _forbid_read_time_validation(monkeypatch)
+
+    with TestClient(create_app(settings)) as client:
+        cid = _persisted_terminal_conversation(settings, cid_title="read-state")
+        meta = storage.load_meta(settings.data_dir, cid)
         storage.update_meta(
             settings.data_dir,
-            meta["id"],
-            generation={
-                "status": "succeeded",
-                "client_request_id": "request-cache-test",
-            },
-            prepared_input_receipt="prepared_input.json",
+            cid,
+            generation={**meta["generation"], "status": "running"},
         )
-        (settings.data_dir / meta["id"] / "generated.mp4").write_bytes(b"video")
 
-        assert client.get("/api/conversations", headers=AUTH).status_code == 200
-        assert client.get(
-            f"/api/conversations/{meta['id']}", headers=AUTH
-        ).status_code == 200
-        assert client.get("/api/conversations", headers=AUTH).status_code == 200
+        running_detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+        running_list = client.get("/api/conversations", headers=AUTH)
+        running_file = client.get(
+            f"/api/conversations/{cid}/files/generated.mp4",
+            headers=AUTH,
+        )
 
-    assert calls == 1
+        meta = storage.load_meta(settings.data_dir, cid)
+        storage.update_meta(
+            settings.data_dir,
+            cid,
+            generation={**meta["generation"], "status": "succeeded"},
+        )
+        (settings.data_dir / cid / "generated.mp4").unlink()
+
+        missing_detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
+        missing_list = client.get("/api/conversations", headers=AUTH)
+        missing_file = client.get(
+            f"/api/conversations/{cid}/files/generated.mp4",
+            headers=AUTH,
+        )
+
+    assert running_detail.json()["has_video"] is False
+    running_summary = next(
+        item for item in running_list.json() if item["id"] == cid
+    )
+    assert running_summary["has_video"] is False
+    assert running_file.status_code == 404
+
+    assert missing_detail.json()["has_video"] is False
+    missing_summary = next(
+        item for item in missing_list.json() if item["id"] == cid
+    )
+    assert missing_summary["has_video"] is False
+    assert missing_file.status_code == 404
 
 
-def test_generated_video_validation_cache_is_bounded_lru():
-    cache = main_module._GeneratedVideoValidationCache(2)
+def test_published_preview_builder_keeps_strict_validation_boundary(
+    tmp_path, monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(
+        settings.data_dir,
+        "publish-boundary",
+        "source.mp4",
+    )
+    source_root = settings.data_dir / meta["id"]
+    target_root = tmp_path / "published" / meta["id"]
+    target_root.mkdir(parents=True)
     calls = []
 
-    def validate(name):
-        calls.append(name)
-        return True
+    def reject_source(source_settings, source_meta):
+        calls.append((source_settings.data_dir, source_meta["id"]))
+        return False
 
-    for name in ("a", "b", "c", "a"):
-        assert cache.get_or_validate(
-            (name,), "same", lambda: "same", lambda name=name: validate(name)
-        ) is True
+    monkeypatch.setattr(
+        main_module,
+        "_validate_generated_video_uncached",
+        reject_source,
+    )
 
-    assert calls == ["a", "b", "c", "a"]
+    with pytest.raises(
+        published_preview.PublishedPreviewError,
+        match="published_preview_source_invalid",
+    ):
+        main_module.build_published_preview_receipt(
+            settings,
+            source_root=source_root,
+            target_root=target_root,
+            target_meta=meta,
+        )
+
+    assert calls == [(settings.data_dir, meta["id"])]

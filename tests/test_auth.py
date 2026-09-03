@@ -10,7 +10,14 @@ def test_health_no_auth(client):
 
 
 def test_protected_route_no_token_401(client):
-    assert client.get("/api/conversations").status_code == 401
+    response = client.get("/api/conversations")
+    assert response.status_code == 401
+    assert response.json() == {
+        "detail": {
+            "code": "unauthorized",
+            "message": "登录凭据无效或已过期",
+        }
+    }
 
 
 def test_protected_route_wrong_token_401(client):

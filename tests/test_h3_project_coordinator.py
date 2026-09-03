@@ -42,6 +42,46 @@ def _png(path: Path, value: int) -> None:
     path.write_bytes(encoded.tobytes())
 
 
+def test_short_context_ir_freezes_current_proxy_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    source_data = np.full((360, 203, 3), 40, dtype=np.uint8)
+    ok, encoded = cv2.imencode(".png", source_data)
+    assert ok
+    keyframe = tmp_path / "01.png"
+    calls: list[h3.FrozenKeyframes] = []
+
+    def fake_freeze_context_ir(**kwargs):
+        calls.append(kwargs["context_ir_keyframes"])
+        raise h3_project.ProjectMultimodalError(
+            "context_ir_request_receipt_mismatch"
+        )
+
+    monkeypatch.setattr(h3_project, "freeze_context_ir", fake_freeze_context_ir)
+    with pytest.raises(
+        h3_project.ProjectMultimodalError,
+        match="context_ir_request_receipt_mismatch",
+    ):
+        main_module._freeze_short_context_ir(
+            SimpleNamespace(
+                minimax_api_key="minimax-secret",
+                h3_request_timeout_s=1,
+                h3_poll_timeout_s=1,
+                h3_poll_interval_s=0,
+            ),
+            SimpleNamespace(
+                dialogue_sha256="a" * 64,
+                receipt_path=tmp_path / "prepared_input.json",
+                receipt_sha256="b" * 64,
+            ),
+            SimpleNamespace(keyframes=((keyframe, encoded.tobytes()),)),
+        )
+
+    assert len(calls) == 1
+    current = cv2.imdecode(np.frombuffer(calls[0][0][1], np.uint8), cv2.IMREAD_COLOR)
+    assert current.shape[:2] == (454, 256)
+
+
 def _wav(path: Path, *, frequency: int = 330, seconds: int = 2) -> None:
     sample_rate = 8000
     samples = (

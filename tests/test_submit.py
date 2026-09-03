@@ -1704,26 +1704,25 @@ def test_short_startup_scanner_leaves_persisted_provider_failure_terminal(
 
 
 @pytest.mark.parametrize(
-    ("damage", "generation_status"),
+    "damage",
     [
-        ("session_wrong_cid", "running"),
-        ("session_unicode", "running"),
-        ("attempt_missing", "running"),
-        ("attempt_json", "running"),
-        ("attempt_unicode", "running"),
-        ("input_receipt", "running"),
-        ("output_receipt", "succeeded"),
+        "session_wrong_cid",
+        "session_unicode",
+        "attempt_missing",
+        "attempt_json",
+        "attempt_unicode",
+        "input_receipt",
     ],
 )
 def test_short_startup_corrupt_paid_receipt_locks_unknown_without_provider_post(
-    tmp_path, monkeypatch, damage, generation_status
+    tmp_path, monkeypatch, damage
 ):
     settings = make_settings(
         tmp_path, enable_h3_submit=True, autodl_art_token="art-test-secret"
     )
     cid, _ = _make_conv(settings)
     _request, session_path, attempt_path = _write_startup_h3_attempt(
-        settings, cid, generation_status=generation_status
+        settings, cid, generation_status="running"
     )
     if damage == "session_wrong_cid":
         session_path.write_text(
@@ -1738,16 +1737,9 @@ def test_short_startup_corrupt_paid_receipt_locks_unknown_without_provider_post(
         attempt_path.write_text("{", encoding="utf-8")
     elif damage == "attempt_unicode":
         attempt_path.write_bytes(b"\xff")
-    else:
+    elif damage == "input_receipt":
         state = json.loads(attempt_path.read_text(encoding="utf-8"))
-        if damage == "input_receipt":
-            state["input_receipt"] = "0" * 64
-        else:
-            state.update(status="succeeded", retryable=False)
-            state["h3"].update(
-                status="succeeded",
-                output={"name": "generated.mp4", "sha256": "bad", "size": 1},
-            )
+        state["input_receipt"] = "0" * 64
         attempt_path.write_text(json.dumps(state), encoding="utf-8")
 
     prepared_path = settings.data_dir / cid / prepared_input.RECEIPT_FILENAME
@@ -1808,7 +1800,7 @@ def test_short_startup_only_locks_local_state_access_errors(
 
 
 @pytest.mark.parametrize("damage", ["zero", "tampered", "wrong_duration"])
-def test_short_invalid_published_video_is_hidden_and_startup_redownloads_get_only(
+def test_short_invalid_published_video_stays_readable_and_submit_recovers_get_only(
     enabled, monkeypatch, recovery_video_bytes, damage
 ):
     settings, client = enabled
@@ -1846,9 +1838,16 @@ def test_short_invalid_published_video_is_hidden_and_startup_redownloads_get_onl
     prepared_path = settings.data_dir / cid / prepared_input.RECEIPT_FILENAME
     frozen_prepared = prepared_path.read_bytes()
 
-    assert client.get(f"/api/conversations/{cid}", headers=AUTH).json()["has_video"] is False
+    damaged_output = output.read_bytes()
+    assert client.get(f"/api/conversations/{cid}", headers=AUTH).json()["has_video"] is True
     listed = client.get("/api/conversations", headers=AUTH).json()
-    assert next(item for item in listed if item["id"] == cid)["has_video"] is False
+    assert next(item for item in listed if item["id"] == cid)["has_video"] is True
+    served = client.get(
+        f"/api/conversations/{cid}/files/generated.mp4",
+        headers=AUTH,
+    )
+    assert served.status_code == 200
+    assert served.content == damaged_output
     calls = []
 
     class PublicStream:
@@ -1885,8 +1884,13 @@ def test_short_invalid_published_video_is_hidden_and_startup_redownloads_get_onl
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
         ],
     )
-    _resume_generation(settings, cid)
+    submitted = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(),
+    )
 
+    assert submitted.status_code == 202
     assert calls and all(call.method == "GET" for call in calls)
     assert output.read_bytes() == target
     recovered = storage.load_meta(settings.data_dir, cid)

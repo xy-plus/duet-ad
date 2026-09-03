@@ -3134,11 +3134,13 @@ def test_long_paid_boundary_revalidation_failure_makes_zero_h3_post(
     assert stored["segments"][0]["error"] == "submission_unknown"
 
 
-def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkeypatch):
+def test_long_plan_cas_and_detail_read_only_persisted_receipt_do_not_expose_task_id(
+    enabled, monkeypatch,
+):
     settings, client = enabled
     cid, receipt = _make_long(settings)
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
-    assert detail["plan_receipt"] == receipt
+    assert detail["plan_receipt"] is None
     assert detail["segment_count"] == 2
     wrong = client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH,
@@ -3154,7 +3156,9 @@ def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkey
     assert client.post(
         f"/api/conversations/{cid}/submit", headers=AUTH, json=_payload(receipt)
     ).status_code == 202
-    generation = client.get(f"/api/conversations/{cid}", headers=AUTH).json()["generation"]
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert detail["plan_receipt"] == receipt
+    generation = detail["generation"]
     assert generation["segments"] == [
         {
             "index": 1, "chain_id": "chain-001", "join_mode": "hard_cut",
@@ -3168,7 +3172,7 @@ def test_long_plan_cas_and_detail_contract_do_not_expose_task_id(enabled, monkey
     assert "provider-task-secret" not in str(generation)
 
 
-def test_legacy_long_detail_and_submit_derive_fit_from_frozen_h3_anchors(
+def test_legacy_long_detail_is_passive_and_submit_derives_fit_from_frozen_h3_anchors(
     enabled, monkeypatch,
 ):
     settings, client = enabled
@@ -3196,7 +3200,7 @@ def test_legacy_long_detail_and_submit_derive_fit_from_frozen_h3_anchors(
     )
 
     assert detail.status_code == 200
-    assert detail.json()["fit_required"] is True
+    assert detail.json()["fit_required"] is None
     assert rejected.status_code == 422
     assert rejected.json() == {"detail": "fit_mode_required"}
     assert accepted.status_code == 202
@@ -3204,14 +3208,14 @@ def test_legacy_long_detail_and_submit_derive_fit_from_frozen_h3_anchors(
     assert storage.load_meta(settings.data_dir, cid)["fit_required"] is None
 
 
-def test_legacy_long_detail_derives_false_from_all_portrait_h3_anchors(enabled):
+def test_legacy_long_detail_does_not_derive_fit_from_h3_anchors(enabled):
     settings, client = enabled
     cid, _receipt = _make_long(settings, fit_required=None)
 
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
 
     assert detail.status_code == 200
-    assert detail.json()["fit_required"] is False
+    assert detail.json()["fit_required"] is None
     assert storage.load_meta(settings.data_dir, cid)["fit_required"] is None
 
 
@@ -3255,7 +3259,7 @@ def test_legacy_long_invalid_anchor_path_fails_closed_before_paid_submit(
         ("resume_required", "pad", None, True),
     ],
 )
-def test_frozen_long_fit_uses_frozen_mode_without_reinterpreting_anchors(
+def test_frozen_long_submit_uses_frozen_mode_but_detail_reads_persisted_fit(
     enabled, status, fit_mode, stored_required, expected,
 ):
     settings, client = enabled
@@ -3286,11 +3290,11 @@ def test_frozen_long_fit_uses_frozen_mode_without_reinterpreting_anchors(
     assert effective is expected
     assert parsed[1] == fit_mode
     assert detail.status_code == 200
-    assert detail.json()["fit_required"] is expected
+    assert detail.json()["fit_required"] is stored_required
     assert storage.load_meta(settings.data_dir, cid)["fit_required"] is stored_required
 
 
-def test_legacy_long_ignores_continue_source_first_when_deriving_fit(enabled):
+def test_legacy_long_detail_does_not_inspect_continue_source_first(enabled):
     settings, client = enabled
     cid, _receipt = _make_long(
         settings,
@@ -3302,10 +3306,10 @@ def test_legacy_long_ignores_continue_source_first_when_deriving_fit(enabled):
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
 
     assert detail.status_code == 200
-    assert detail.json()["fit_required"] is False
+    assert detail.json()["fit_required"] is None
 
 
-def test_legacy_long_uses_continue_end_when_deriving_fit(enabled):
+def test_legacy_long_detail_does_not_inspect_continue_end(enabled):
     settings, client = enabled
     cid, _receipt = _make_long(
         settings,
@@ -3317,10 +3321,10 @@ def test_legacy_long_uses_continue_end_when_deriving_fit(enabled):
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
 
     assert detail.status_code == 200
-    assert detail.json()["fit_required"] is True
+    assert detail.json()["fit_required"] is None
 
 
-def test_frozen_receipt_without_generation_still_derives_from_h3_anchors(enabled):
+def test_frozen_receipt_without_generation_does_not_trigger_fit_derivation(enabled):
     settings, client = enabled
     cid, receipt = _make_long(
         settings, fit_required=None, landscape_first_indices=(1,)
@@ -3332,7 +3336,7 @@ def test_frozen_receipt_without_generation_still_derives_from_h3_anchors(enabled
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH)
 
     assert detail.status_code == 200
-    assert detail.json()["fit_required"] is True
+    assert detail.json()["fit_required"] is None
 
 
 def test_active_frozen_null_fit_change_reaches_locked_parameter_cas(
@@ -3988,8 +3992,8 @@ def test_stitch_receipt_publish_failure_can_rebuild_over_existing_output_without
     assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "succeeded"
 
 
-def test_detail_retry_paid_count_uses_segment_files_and_stitch_is_free(
-    enabled,
+def test_detail_retry_paid_count_reads_only_persisted_value(
+    enabled, monkeypatch,
 ):
     settings, client = enabled
     cid, _receipt = _make_long(settings, joins=("hard_cut", "hard_cut"))
@@ -4000,6 +4004,7 @@ def test_detail_retry_paid_count_uses_segment_files_and_stitch_is_free(
         "attempt": 1,
         "client_request_id": "parent-request-123",
         "stage": "h3",
+        "retry_paid_segment_count": 1,
         "segments": [
             {"index": 1, "chain_id": "chain-001", "join_mode": "hard_cut",
              "status": "succeeded", "attempt": 1, "error": None},
@@ -4009,28 +4014,41 @@ def test_detail_retry_paid_count_uses_segment_files_and_stitch_is_free(
     }
     (root / "work" / "segments" / "2" / "generated.mp4").write_bytes(b"segment")
     storage.update_meta(settings.data_dir, cid, generation=generation)
+    monkeypatch.setattr(
+        long_generation,
+        "freeze_plan",
+        lambda *_args, **_kwargs: pytest.fail("detail GET must not freeze a plan"),
+    )
+    monkeypatch.setattr(
+        long_generation,
+        "bound_reusable_segment_indices",
+        lambda *_args, **_kwargs: pytest.fail(
+            "detail GET must not validate segment reuse"
+        ),
+    )
 
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
-    assert detail["generation"]["retry_paid_segment_count"] == 2
+    assert detail["generation"]["retry_paid_segment_count"] == 1
     assert all("path" not in item and "task_id" not in item
                for item in detail["generation"]["segments"])
 
     generation.update(stage="stitch", error="long_video_stitch_failed")
+    generation["retry_paid_segment_count"] = 0
     (root / "generated.mp4").write_bytes(b"previous-published-video")
     storage.update_meta(settings.data_dir, cid, generation=generation)
     detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
     assert detail["has_video"] is False
-    assert detail["generation"]["retry_paid_segment_count"] == 2
+    assert detail["navigation_status"] == "generation_failed"
+    assert detail["generation"]["retry_paid_segment_count"] == 0
 
 
-def test_detail_retry_paid_count_uses_complete_frozen_segment_set(
+def test_detail_retry_paid_count_omits_missing_or_invalid_persisted_value(
     enabled,
 ):
     settings, client = enabled
     cid, _receipt = _make_long(
         settings, joins=("hard_cut", "hard_cut", "hard_cut")
     )
-    root = settings.data_dir / cid
     storage.update_meta(
         settings.data_dir,
         cid,
@@ -4038,10 +4056,6 @@ def test_detail_retry_paid_count_uses_complete_frozen_segment_set(
         dialogue_mode="auto",
         frozen_plan_receipt=_receipt,
     )
-    for index in (1, 2, 3):
-        (root / "work" / "segments" / str(index) / "generated.mp4").write_bytes(
-            b"segment"
-        )
 
     def segment(index):
         return {
@@ -4054,23 +4068,35 @@ def test_detail_retry_paid_count_uses_complete_frozen_segment_set(
             "child_request_id": f"child-{index}",
         }
 
+    missing = object()
     cases = (
-        ([segment(1), segment(3)], 3),
-        ([segment(1), segment(1), segment(3)], 3),
-        ([segment(2), segment(1), segment(3)], 3),
-        ([segment(1), segment(2), segment(3)], 0),
+        (missing, None),
+        (None, None),
+        (True, None),
+        (-1, None),
+        (4, None),
+        (1.5, None),
+        ("1", None),
+        (0, 0),
+        (3, 3),
     )
-    for segments, expected in cases:
-        storage.update_meta(settings.data_dir, cid, generation={
+    for persisted, expected in cases:
+        generation = {
             "status": "failed",
             "error": "long_video_segment_failed",
             "attempt": 1,
             "client_request_id": "parent-request-123",
             "stage": "h3",
-            "segments": segments,
-        })
+            "segments": [segment(1), segment(2), segment(3)],
+        }
+        if persisted is not missing:
+            generation["retry_paid_segment_count"] = persisted
+        storage.update_meta(settings.data_dir, cid, generation=generation)
         detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
-        assert detail["generation"]["retry_paid_segment_count"] == expected
+        if expected is None:
+            assert "retry_paid_segment_count" not in detail["generation"]
+        else:
+            assert detail["generation"]["retry_paid_segment_count"] == expected
 
 
 def test_retry_initialization_uses_same_fail_closed_reuse_contract(enabled):
@@ -5574,10 +5600,9 @@ def test_stitched_receipt_and_success_validation_use_receipt_version_duration(
     }
 
 
-@pytest.mark.parametrize("entrypoint", ["startup", "submit"])
 @pytest.mark.parametrize("damage", ["missing", "zero", "tampered", "receipt"])
-def test_long_invalid_top_output_is_hidden_and_restitched_without_provider(
-    enabled, monkeypatch, entrypoint, damage
+def test_long_succeeded_detail_is_passive_but_submit_revalidates_top_output(
+    enabled, monkeypatch, damage
 ):
     settings, client = enabled
     cid, receipt = _make_long(settings)
@@ -5618,7 +5643,10 @@ def test_long_invalid_top_output_is_hidden_and_restitched_without_provider(
         generation=generation,
     )
 
-    def top_is_valid(current_plan, _dialogue_mode):
+    validation_calls = []
+
+    def top_is_valid(current_plan, _dialogue_mode, **_kwargs):
+        validation_calls.append(current_plan)
         try:
             return (
                 current_plan.root.joinpath("generated.mp4").read_bytes() == b"valid-top"
@@ -5644,27 +5672,43 @@ def test_long_invalid_top_output_is_hidden_and_restitched_without_provider(
     monkeypatch.setattr(long_generation.stitch, "stitch_video", restitch)
     monkeypatch.setattr(h3, "start", lambda _request: pytest.fail("must not POST"))
     monkeypatch.setattr(h3, "resume", lambda _request: pytest.fail("must not GET"))
-    assert client.get(f"/api/conversations/{cid}", headers=AUTH).json()["has_video"] is False
+    expected_visible = damage != "missing"
+    expected_navigation = "completed" if expected_visible else "output_missing"
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert detail["has_video"] is expected_visible
+    assert detail["navigation_status"] == expected_navigation
     listed = client.get("/api/conversations", headers=AUTH).json()
-    assert next(item for item in listed if item["id"] == cid)["has_video"] is False
-
-    if entrypoint == "startup":
-        _resume_long_generation(settings, cid)
+    summary = next(item for item in listed if item["id"] == cid)
+    assert summary["has_video"] is expected_visible
+    assert summary["navigation_status"] == expected_navigation
+    served = client.get(
+        f"/api/conversations/{cid}/files/generated.mp4", headers=AUTH
+    )
+    if expected_visible:
+        assert served.status_code == 200
+        assert served.content == output.read_bytes()
     else:
-        response = client.post(
-            f"/api/conversations/{cid}/submit",
-            headers=AUTH,
-            json=_payload(receipt),
-        )
-        assert response.status_code == 202
+        assert served.status_code == 404
+    assert validation_calls == []
 
+    response = client.post(
+        f"/api/conversations/{cid}/submit",
+        headers=AUTH,
+        json=_payload(receipt),
+    )
+    assert response.status_code == 202
+    assert validation_calls
     assert len(stitch_calls) == 1
     recovered = storage.load_meta(settings.data_dir, cid)["generation"]
     assert recovered["status"] == "succeeded"
     assert recovered["attempt"] == 1
-    assert client.get(f"/api/conversations/{cid}", headers=AUTH).json()["has_video"] is True
+    detail = client.get(f"/api/conversations/{cid}", headers=AUTH).json()
+    assert detail["has_video"] is True
+    assert detail["navigation_status"] == "completed"
     listed = client.get("/api/conversations", headers=AUTH).json()
-    assert next(item for item in listed if item["id"] == cid)["has_video"] is True
+    summary = next(item for item in listed if item["id"] == cid)
+    assert summary["has_video"] is True
+    assert summary["navigation_status"] == "completed"
 
 
 def _native_audio_plan(settings, *, segment_count: int = 2):

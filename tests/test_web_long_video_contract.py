@@ -19,32 +19,81 @@ def test_create_dialogue_fields_reject_old_manual_create_modes():
     assert result == ["请选择台词模式", "请选择台词模式"]
 
 
-def test_create_dialogue_ui_and_formdata_are_bound_before_creation_only():
+def test_agent_dialogue_ui_and_v1_generation_request_are_bound_before_creation_only():
     html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
+    composer = html.split('<form id="composer"', 1)[1].split("</form>", 1)[0]
+    visible = composer.split(
+        '<div class="legacy-contract-controls" hidden aria-hidden="true">', 1
+    )[0]
     upload_source = source.split("function uploadConversation", 1)[1]
     upload_source = upload_source.split("async function handleSend", 1)[0]
     send_source = source.split("async function handleSend", 1)[1]
     send_source = send_source.split("/* ===== 事件绑定与启动 ===== */", 1)[0]
 
-    assert html.count('name="dialogue-mode"') == 2
-    for mode in ("auto", "none"):
-        assert f'name="dialogue-mode" value="{mode}"' in html
-    assert 'name="dialogue-mode" value="edit"' not in html
-    assert 'name="dialogue-mode" value="custom"' not in html
-    assert 'id="create-dialogue-lines"' not in html
-    assert 'fd.append("dialogue_mode", dialogue.dialogue_mode)' in upload_source
-    assert 'fd.append("lines", dialogue.lines)' not in upload_source
-    assert "buildCreateDialogueFields" in send_source
+    assert '<h2 id="dialogue-title">改编台词</h2>' in visible
+    assert "系统自动识别并改编台词" in visible
+    assert "script-input" not in html
+    assert "script-input" not in source
+    assert 'id="translation-toggle"' not in visible
+    assert 'id="translation-fields" class="translation-fields"' in visible
+    assert 'name="target-language-mode" value="same" checked' in visible
+    assert 'name="target-language-mode" value="other"' in visible
+    assert 'id="lang-input"' in visible
+    assert 'maxlength="80" disabled' in visible
+    assert 'id="translation-fields" class="translation-fields" hidden' in visible
+    assert 'name="dialogue-mode"' not in visible
+    assert 'name="voice-mode"' not in visible
+
+    requests = _run_contract(
+        "(()=>{const capability={supported:true,version:1,endpoint:'/api/conversations',"
+        "encoding:'multipart/form-data',request_field:'generation_request',"
+        "replacement_image_field:'replacement_image',aspect_ratios:['16:9','9:16'],"
+        "resolutions:['480p','768p'],defaults:{fit_mode:'auto',optimize_image:true,"
+        "remove_subtitle:true,remove_logo:true},dialogue:{mode:'auto_rewrite',"
+        "translation:true},replacement:{"
+        "supported:true,accept:['image/jpeg','image/png','image/webp'],max_bytes:10485760,"
+        "max_instruction_chars:1000}};const base={aspectRatio:'9:16',resolution:'768p',"
+        "targetLanguage:' 日语 ',hasReplacementImage:false,"
+        "replacementInstruction:''};const request=contract.buildMinimalGenerationRequest(base,capability);"
+        "const injected=contract.buildMinimalGenerationRequest({...base,script:'用户台词'},capability);"
+        "return [request,injected]"
+        ".map(request=>({version:request.version,dialogue:request.dialogue}))})()"
+    )
+    assert requests == [
+        {
+            "version": 1,
+            "dialogue": {
+                "mode": "auto_rewrite",
+                "target_language": "日语",
+            },
+        },
+        {
+            "version": 1,
+            "dialogue": {"mode": "auto_rewrite", "target_language": "日语"},
+        },
+    ]
+
+    assert 'fd.append(capability.request_field, JSON.stringify(generationRequest))' in upload_source
+    assert 'fd.append("target_language"' not in upload_source
+    assert 'fd.append("dialogue_mode"' not in upload_source
+    assert 'fd.append("lines"' not in upload_source
+    assert "buildMinimalGenerationRequest" in send_source
+    assert 'targetLanguage: selectedTargetLanguage()' in send_source
+    assert "translationEnabled" not in send_source
+    assert "script-input" not in send_source
     assert "buildSubmitPayload" not in send_source
 
 
-def test_upload_hint_uses_the_single_ten_second_segmentation_contract():
+def test_upload_hint_only_describes_total_duration_size_and_formats():
     html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    hint = html.split('<p id="file-hint"', 1)[1].split("</p>", 1)[0]
+    hint = hint.split(">", 1)[1].strip()
 
-    assert "超过 10 秒会拆分为单次不超过 10 秒的视频生成子任务" in html
-    assert "超过 15 秒" not in html
-    assert "不超过 14 秒" not in html
+    assert hint == "最长 300 秒 · 最大 500MB · MP4/MOV/WebM"
+    assert "分段" not in hint
+    assert "H3" not in hint
+    assert "Context IR" not in hint
 
 
 def test_long_video_task_count_comes_from_frozen_plan():
@@ -290,7 +339,7 @@ def test_long_submit_rejects_edit_custom_and_missing_receipt():
     ]
 
 
-def test_generation_signature_tracks_plan_and_segment_progress_separately():
+def test_hidden_generation_details_do_not_rebuild_the_minimal_view():
     result = _run_contract(
         "(()=>{const base={status:'done',duration_s:30,plan_receipt:'a'.repeat(64),segment_count:2,"
         "generation:{status:'running',stage:'h3',segments:[{index:1,status:'running'}]}};"
@@ -300,9 +349,9 @@ def test_generation_signature_tracks_plan_and_segment_progress_separately():
         "return {progress:contract.detailSignature(progressed),replanned:contract.detailSignature(replanned),original};})()"
     )
     assert result["progress"]["stable"] == result["original"]["stable"]
-    assert result["progress"]["generation"] != result["original"]["generation"]
+    assert result["progress"]["generation"] == result["original"]["generation"]
     assert result["replanned"]["stable"] == result["original"]["stable"]
-    assert result["replanned"]["generation"] != result["original"]["generation"]
+    assert result["replanned"]["generation"] == result["original"]["generation"]
 
 
 def test_generation_segment_display_keeps_one_based_contract_index():
