@@ -1,0 +1,296 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+import ipaddress
+import os
+import socket
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Awaitable, Callable, Sequence
+from urllib.parse import urljoin, urlsplit, urlunsplit
+
+import httpx
+
+
+ResolverResult = Sequence[str | ipaddress.IPv4Address | ipaddress.IPv6Address]
+Resolver = Callable[[str, int], ResolverResult | Awaitable[ResolverResult]]
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+class ReferenceDownloadError(RuntimeError):
+    def __init__(self, code: str, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class ApprovedTarget:
+    original_url: str
+    pinned_url: str
+    host_header: str
+    sni_hostname: str
+
+
+async def resolve_addresses(hostname: str, port: int) -> ResolverResult:
+    """Resolve A/AAAA records without allowing the HTTP client to resolve again."""
+
+    loop = asyncio.get_running_loop()
+    records = await loop.getaddrinfo(
+        hostname,
+        port,
+        family=socket.AF_UNSPEC,
+        type=socket.SOCK_STREAM,
+    )
+    return [record[4][0] for record in records if record[0] in {socket.AF_INET, socket.AF_INET6}]
+
+
+def _invalid(message: str = "视频链接无效") -> ReferenceDownloadError:
+    return ReferenceDownloadError("invalid_reference_url", message, status_code=400)
+
+
+async def _approved_target(url: str, resolver: Resolver) -> ApprovedTarget:
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise _invalid() from exc
+
+    if scheme not in DEFAULT_PORTS or not hostname:
+        raise _invalid()
+    if parsed.username is not None or parsed.password is not None:
+        raise _invalid("视频链接不能包含用户凭据")
+    if parsed.netloc.rsplit("@", 1)[-1].endswith(":"):
+        raise _invalid("视频链接端口无效")
+    expected_port = DEFAULT_PORTS[scheme]
+    if port is not None and port != expected_port:
+        raise _invalid("视频链接端口不受支持")
+    port = expected_port
+
+    hostname = hostname.rstrip(".")
+    if not hostname or "%" in hostname:
+        raise _invalid()
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise _invalid() from exc
+
+    try:
+        numeric_host = ipaddress.ip_address(ascii_hostname)
+        raw_addresses: ResolverResult = [numeric_host]
+    except ValueError:
+        try:
+            result = resolver(ascii_hostname, port)
+            raw_addresses = await result if inspect.isawaitable(result) else result
+        except Exception as exc:
+            raise _invalid("视频链接无法解析") from exc
+
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    try:
+        for raw_address in raw_addresses:
+            address = raw_address if isinstance(raw_address, (ipaddress.IPv4Address, ipaddress.IPv6Address)) else ipaddress.ip_address(raw_address)
+            if address not in addresses:
+                addresses.append(address)
+    except (TypeError, ValueError) as exc:
+        raise _invalid("视频链接无法解析") from exc
+    if not addresses:
+        raise _invalid("视频链接无法解析")
+    if any(not address.is_global or address.is_multicast for address in addresses):
+        raise ReferenceDownloadError(
+            "reference_url_forbidden",
+            "视频链接不能指向内部或非公网网络",
+            status_code=400,
+        )
+
+    selected = addresses[0]
+    pinned_host = f"[{selected.compressed}]" if selected.version == 6 else selected.compressed
+    original_host = f"[{ascii_hostname}]" if numeric_host_or_none(ascii_hostname, version=6) else ascii_hostname
+    explicit_port = parsed.port is not None
+    host_header = f"{original_host}:{port}" if explicit_port else original_host
+    path = parsed.path or "/"
+    pinned_url = urlunsplit((scheme, f"{pinned_host}:{port}", path, parsed.query, ""))
+    return ApprovedTarget(
+        original_url=urlunsplit((scheme, parsed.netloc, path, parsed.query, "")),
+        pinned_url=pinned_url,
+        host_header=host_header,
+        sni_hostname=ascii_hostname,
+    )
+
+
+def numeric_host_or_none(hostname: str, *, version: int) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return None
+    return address if address.version == version else None
+
+
+def _content_length(response: httpx.Response) -> int | None:
+    raw = response.headers.get("content-length")
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value or not value.isascii() or not value.isdecimal() or len(value) > 20:
+        raise ReferenceDownloadError(
+            "reference_download_failed",
+            "视频链接返回了无效的 Content-Length",
+            status_code=502,
+        )
+    return int(value)
+
+
+async def download_reference_url(
+    url: str,
+    destination: Path,
+    *,
+    max_bytes: int,
+    timeout_s: float,
+    resolver: Resolver = resolve_addresses,
+    transport: httpx.AsyncBaseTransport | None = None,
+    max_redirects: int = 5,
+) -> int:
+    """Download a public URL to ``destination`` without a DNS-rebinding window.
+
+    Every redirect is resolved and approved independently.  The actual TCP URL
+    contains the approved numeric address while Host and TLS SNI retain the
+    original hostname.  A completed body is atomically published from a
+    same-directory temporary file.
+    """
+
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+        raise ValueError("max_bytes must be a positive integer")
+    if isinstance(max_redirects, bool) or not isinstance(max_redirects, int) or max_redirects < 0:
+        raise ValueError("max_redirects must be a non-negative integer")
+
+    current_url = url if isinstance(url, str) else ""
+    if (
+        not current_url
+        or current_url != current_url.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in current_url)
+    ):
+        raise _invalid()
+    redirects = 0
+    try:
+        async with (
+            asyncio.timeout(timeout_s),
+            httpx.AsyncClient(
+                transport=transport,
+                trust_env=False,
+                follow_redirects=False,
+                timeout=timeout_s,
+                limits=httpx.Limits(max_keepalive_connections=0),
+            ) as client,
+        ):
+            while True:
+                target = await _approved_target(current_url, resolver)
+                async with client.stream(
+                    "GET",
+                    target.pinned_url,
+                    headers={"Host": target.host_header, "Accept": "*/*", "Accept-Encoding": "identity"},
+                    extensions={"sni_hostname": target.sni_hostname},
+                ) as response:
+                    if response.status_code in REDIRECT_STATUSES:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ReferenceDownloadError(
+                                "reference_download_failed",
+                                "视频链接重定向缺少目标地址",
+                                status_code=502,
+                            )
+                        if redirects >= max_redirects:
+                            raise ReferenceDownloadError(
+                                "reference_redirect_limit",
+                                "视频链接重定向次数过多",
+                                status_code=400,
+                            )
+                        redirects += 1
+                        current_url = urljoin(target.original_url, location)
+                        continue
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        raise ReferenceDownloadError(
+                            "reference_download_failed",
+                            f"视频链接返回 HTTP {response.status_code}",
+                            status_code=502,
+                        ) from exc
+
+                    declared_length = _content_length(response)
+                    if declared_length is not None and declared_length > max_bytes:
+                        raise ReferenceDownloadError(
+                            "reference_too_large",
+                            "链接视频超过大小限制",
+                            status_code=413,
+                        )
+                    content_encoding = response.headers.get("content-encoding", "identity").strip().lower()
+                    if content_encoding not in {"", "identity"}:
+                        raise ReferenceDownloadError(
+                            "reference_content_encoding",
+                            "视频链接返回了不受支持的压缩编码",
+                            status_code=502,
+                        )
+
+                    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    descriptor, temporary_name = tempfile.mkstemp(
+                        prefix=f".{destination.name}.",
+                        suffix=".tmp",
+                        dir=destination.parent,
+                    )
+                    temporary = Path(temporary_name)
+                    total = 0
+                    try:
+                        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+                            async for chunk in response.aiter_bytes():
+                                if not chunk:
+                                    continue
+                                total += len(chunk)
+                                if total > max_bytes:
+                                    raise ReferenceDownloadError(
+                                        "reference_too_large",
+                                        "链接视频超过大小限制",
+                                        status_code=413,
+                                    )
+                                handle.write(chunk)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        os.chmod(temporary, 0o600)
+                        os.replace(temporary, destination)
+                    except BaseException:
+                        try:
+                            temporary.unlink()
+                        except FileNotFoundError:
+                            pass
+                        raise
+                    return total
+    except ReferenceDownloadError:
+        raise
+    except TimeoutError as exc:
+        raise ReferenceDownloadError(
+            "reference_download_timeout",
+            "下载链接视频超时",
+            status_code=504,
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise ReferenceDownloadError(
+            "reference_download_timeout",
+            "下载链接视频超时",
+            status_code=504,
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise ReferenceDownloadError(
+            "reference_download_failed",
+            "无法下载链接视频",
+            status_code=502,
+        ) from exc
+    except OSError as exc:
+        raise ReferenceDownloadError(
+            "reference_download_failed",
+            "无法保存链接视频",
+            status_code=500,
+        ) from exc
