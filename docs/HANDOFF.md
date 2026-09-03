@@ -132,13 +132,15 @@
 
 - submit 第一次失败且没有 `taskId` 时可再次 POST；结果未知时明确接受重复付费风险。
 - 一旦取得 `taskId`，poll 和 download 的失败只重试自身，不能返回 submit。
+- MediaKit 调用使用进程级 `MEDIAKIT_CONCURRENCY` 信号量；当前研究部署固定为 `1`，避免多个项目和分段同时提交导致 429。
+- `POST /api/conversations/{id}/resume-pre-picsart` 只接受从未出现 Picsart submit 痕迹的失败项目。它复用原切段、4 fps manifest、九帧选择、已完成的 MediaKit 帧、分析副本和逐段 video-maker；仅从首个缺失 MediaKit 阶段继续，再进入项目级公共输入屏障。
 - `POST /api/conversations/{id}/resume-picsart` 只复用冻结的静音片段和 R2V 提示词；已有且未明确失败的 task ID 只继续 poll，已完成片段直接复用，只有供应商已明确 `FAILED` 或 HTTP 4xx 的片段才允许重新 submit。
 - 不因生成质量、替换效果或媒体观感增加重试。
 - 固定 Master 的 YAMNet 检出人声但第一次 Whisper 为空时，仍在同一个最多两次的 ASR attempt 边界内复核一次；第二次仍空则以空台词继续。
 
 ## 验证与剩余事项
 
-已完成离线测试，覆盖前端合同、API、SSRF/路径归属、供应商 MockTransport、研究日志、固定 Master 媒体算法、MiniMax 图片尺寸/比例归一化、签名素材 `GET/HEAD`、YAMNet、video-maker 两阶段、公共屏障、逐段并行、受控续跑、Picsart 重试和 4.x 秒裁回。当前结果：`150 passed, 1 warning`；唯一 warning 是 FastAPI TestClient 引入的 Starlette/httpx 弃用提示。
+已完成离线测试，覆盖前端合同、API、SSRF/路径归属、供应商 MockTransport、研究日志、固定 Master 媒体算法、MiniMax 图片尺寸/比例归一化、签名素材 `GET/HEAD`、YAMNet、video-maker 两阶段、公共屏障、逐段并行、受控续跑、Picsart 重试和 4.x 秒裁回。当前结果：`151 passed, 1 warning`；唯一 warning 是 FastAPI TestClient 引入的 Starlette/httpx 弃用提示。
 
 YAMNet 模型：
 
@@ -152,3 +154,4 @@ YAMNet 模型：
 2. 统一模型 API 对 `minimax-h3-max-r2v` 返回过 `unknown_model`；已按官方 Advanced 文档改为直接调用 workflow `minimax/h3-max/reference-to-video`。真实复测的两段任务 ID 为 `2126f442-60c9-4291-8e8d-344d1757ba60`、`2f0829d7-6e35-443e-bcd9-7503025524de`，均为 `COMPLETED`。
 3. Picsart 的真实访问证实会对签名图片和视频发出 `GET` 与 `HEAD`；修复后两种方法均返回 `200`。最终视频为 H.264 `480x832`、`24 fps`，AAC `48 kHz` 双声道，时长 `16.957683` 秒；3301 下载接口 Range 请求返回 `206 video/mp4`。
 4. 当前 `.env` 仅作为本机部署覆盖配置，权限为 `0600` 且被 `.gitignore` 忽略；其他密钥由受限源配置文件加载。
+5. 三个不同的 3213 成功项目已作为源素材，在 3301 创建三个全新 E2E 项目并全部成功：`1b51a06bd0474933979873d2e95e6e2e`、`61c3f276e82042b2add48bfde2b9ae2c`、`0bb0dfdd9eeb417c88c38f6a9f7573cb`。三份源 SHA-256 互不相同；最终视频分别为 5.041016、20.957683、29.457683 秒，均为 H.264 `768x1344`、`24 fps`、AAC，3301 Range 下载均返回 `206 video/mp4`。后两项首次遇到 MediaKit 429，部署进程级串行限流后从缺失帧续跑，没有重做已成功的前置节点，也没有重复 Picsart submit。

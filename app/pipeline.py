@@ -4,6 +4,7 @@ import concurrent.futures
 import hashlib
 import json
 import math
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -50,6 +51,18 @@ class Pipeline:
         self.deepseek = deepseek or DeepSeekClient(settings)
         self.mediakit = mediakit or MediaKitClient(settings)
         self.picsart = picsart or PicsartClient(settings)
+        self._mediakit_gate = threading.BoundedSemaphore(
+            settings.mediakit_concurrency,
+        )
+
+    def _erase_with_limit(
+        self,
+        source: Path,
+        destination: Path,
+        stages: list[str],
+    ) -> ProviderResult[Path]:
+        with self._mediakit_gate:
+            return self.mediakit.erase(source, destination, stages)
 
     def _progress(
         self,
@@ -304,161 +317,15 @@ class Pipeline:
                 ]
                 prepared = [future.result() for future in futures]
             prepared.sort(key=lambda item: int(item["index"]))
-
-            visual_prompts = "\n\n".join(
-                f"Segment {item['index']}: {item['visual_prompt']}"
-                for item in prepared
-            )
-            target_language = str(
-                ((request.get("dialogue") or {}).get("target_language"))
-                or SAME_AS_SOURCE_LANGUAGE
-            ).strip()
-            self._progress(project_id, 43, "translation")
-            translated_lines = self._node(
-                log,
-                "deepseek-translation",
-                "project",
-                {
-                    "target_language": target_language,
-                    "source_lines": spoken_lines,
-                    "visual_prompts": visual_prompts,
-                },
-                [],
-                lambda: self._translation_request(
-                    spoken_lines, target_language, visual_prompts,
-                ),
-                transform=lambda value: self._normalize_translation(
-                    value, spoken_lines,
-                ),
-            )
-            for item in prepared:
-                item["dialogue"] = self._node(
-                    log,
-                    "dialogue-localize",
-                    self._segment_scope(int(item["index"])),
-                    {"translated_lines": translated_lines, "segment": item},
-                    [],
-                    lambda item=item: media.localize_dialogue(
-                        translated_lines, item, segments=prepared,
-                    ),
-                )
-
-            index_request, index_images = self._project_index_request(
+            self._continue_after_prepared(
+                project_id,
                 project,
                 prepared,
-                self._generation_config(request),
-            )
-            index_request_path = project / "work" / "project_index_request.json"
-            index_request_path.write_text(
-                json.dumps(index_request, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            self._progress(project_id, 50, "video-maker-project-index")
-            skill = VIDEO_SKILL.read_text(encoding="utf-8")
-            element_index = self._node(
+                spoken_lines,
+                replacement,
+                request,
                 log,
-                "video-maker-project-index",
-                "project",
-                index_request,
-                index_images,
-                lambda: self.deepseek.complete_structured(
-                    skill
-                    + "\n\n严格执行项目级索引阶段；只根据输入帧填写本次注入的 Schema。",
-                    index_request,
-                    PROJECT_INDEX_SCHEMA,
-                    index_images,
-                ),
-                transform=normalize_project_index,
             )
-            element_path = project / "work" / "element_index.json"
-            element_path.write_text(
-                json.dumps(element_index, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            public_segments = [self._public_segment(item) for item in prepared]
-            self.store.update(
-                project_id,
-                segments=public_segments,
-                element_index=element_index,
-                translated_voice_lines=translated_lines,
-            )
-
-            # This is the public-input barrier.  No paid segment branch starts
-            # before every visual prompt, translation, localization and the
-            # single project index above have completed.
-            self._progress(
-                project_id, 57, "h3-max-r2v", segments=public_segments,
-            )
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, len(prepared)),
-            ) as pool:
-                futures = [
-                    pool.submit(
-                        self._generate_segment,
-                        project_id,
-                        project,
-                        item,
-                        element_index,
-                        replacement,
-                        request,
-                        log,
-                    )
-                    for item in prepared
-                ]
-                outputs = [future.result() for future in futures]
-
-            final = project / "output" / "generated.mp4"
-            self._progress(
-                project_id,
-                95,
-                "stitch",
-                segments=[self._public_segment(item) for item in prepared],
-            )
-            self._node(
-                log,
-                "stitch",
-                "project",
-                {
-                    "segments": outputs,
-                    "target_durations": [item["duration_s"] for item in prepared],
-                    "join_modes": [
-                        item.get("join_mode", "hard_cut") for item in prepared
-                    ],
-                    "output": final,
-                },
-                outputs,
-                lambda: media.concat(
-                    outputs,
-                    final,
-                    target_durations=[item["duration_s"] for item in prepared],
-                    join_modes=[
-                        item.get("join_mode", "hard_cut") for item in prepared
-                    ],
-                ),
-                lambda _value: [final],
-            )
-            self.store.update(
-                project_id,
-                status="succeeded",
-                has_video=True,
-                output_path="output/generated.mp4",
-                project_progress={
-                    "status": "succeeded",
-                    "percent": 100,
-                    "stage": "completed",
-                },
-                generation={
-                    "status": "succeeded",
-                    "stage": "completed",
-                    "error": None,
-                },
-                segments=[
-                    {**self._public_segment(item), "status": "succeeded"}
-                    for item in prepared
-                ],
-                error=None,
-            )
-            log.event("pipeline_succeeded", output=final)
         except Exception as exc:
             log.event("pipeline_failed", error=str(exc))
             current = self.store.read(project_id)
@@ -482,6 +349,329 @@ class Pipeline:
                 error={
                     "code": "pipeline_failed",
                     "message": "流水线执行失败",
+                },
+            )
+
+    def _continue_after_prepared(
+        self,
+        project_id: str,
+        project: Path,
+        prepared: list[dict[str, Any]],
+        spoken_lines: list[dict[str, Any]],
+        replacement: Path | None,
+        request: dict[str, Any],
+        log: ResearchLog,
+    ) -> None:
+        visual_prompts = "\n\n".join(
+            f"Segment {item['index']}: {item['visual_prompt']}"
+            for item in prepared
+        )
+        target_language = str(
+            ((request.get("dialogue") or {}).get("target_language"))
+            or SAME_AS_SOURCE_LANGUAGE
+        ).strip()
+        self._progress(project_id, 43, "translation")
+        translated_lines = self._node(
+            log,
+            "deepseek-translation",
+            "project",
+            {
+                "target_language": target_language,
+                "source_lines": spoken_lines,
+                "visual_prompts": visual_prompts,
+            },
+            [],
+            lambda: self._translation_request(
+                spoken_lines, target_language, visual_prompts,
+            ),
+            transform=lambda value: self._normalize_translation(
+                value, spoken_lines,
+            ),
+        )
+        for item in prepared:
+            item["dialogue"] = self._node(
+                log,
+                "dialogue-localize",
+                self._segment_scope(int(item["index"])),
+                {"translated_lines": translated_lines, "segment": item},
+                [],
+                lambda item=item: media.localize_dialogue(
+                    translated_lines, item, segments=prepared,
+                ),
+            )
+
+        index_request, index_images = self._project_index_request(
+            project,
+            prepared,
+            self._generation_config(request),
+        )
+        index_request_path = project / "work" / "project_index_request.json"
+        index_request_path.write_text(
+            json.dumps(index_request, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self._progress(project_id, 50, "video-maker-project-index")
+        skill = VIDEO_SKILL.read_text(encoding="utf-8")
+        element_index = self._node(
+            log,
+            "video-maker-project-index",
+            "project",
+            index_request,
+            index_images,
+            lambda: self.deepseek.complete_structured(
+                skill
+                + "\n\n严格执行项目级索引阶段；只根据输入帧填写本次注入的 Schema。",
+                index_request,
+                PROJECT_INDEX_SCHEMA,
+                index_images,
+            ),
+            transform=normalize_project_index,
+        )
+        element_path = project / "work" / "element_index.json"
+        element_path.write_text(
+            json.dumps(element_index, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        public_segments = [self._public_segment(item) for item in prepared]
+        self.store.update(
+            project_id,
+            segments=public_segments,
+            element_index=element_index,
+            translated_voice_lines=translated_lines,
+        )
+
+        # This is the public-input barrier.  No paid segment branch starts
+        # before every visual prompt, translation, localization and the
+        # single project index above have completed.
+        self._progress(
+            project_id, 57, "h3-max-r2v", segments=public_segments,
+        )
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(prepared)),
+        ) as pool:
+            futures = [
+                pool.submit(
+                    self._generate_segment,
+                    project_id,
+                    project,
+                    item,
+                    element_index,
+                    replacement,
+                    request,
+                    log,
+                )
+                for item in prepared
+            ]
+            outputs = [future.result() for future in futures]
+
+        final = project / "output" / "generated.mp4"
+        self._progress(
+            project_id,
+            95,
+            "stitch",
+            segments=[self._public_segment(item) for item in prepared],
+        )
+        self._node(
+            log,
+            "stitch",
+            "project",
+            {
+                "segments": outputs,
+                "target_durations": [item["duration_s"] for item in prepared],
+                "join_modes": [
+                    item.get("join_mode", "hard_cut") for item in prepared
+                ],
+                "output": final,
+            },
+            outputs,
+            lambda: media.concat(
+                outputs,
+                final,
+                target_durations=[item["duration_s"] for item in prepared],
+                join_modes=[
+                    item.get("join_mode", "hard_cut") for item in prepared
+                ],
+            ),
+            lambda _value: [final],
+        )
+        self.store.update(
+            project_id,
+            status="succeeded",
+            has_video=True,
+            output_path="output/generated.mp4",
+            project_progress={
+                "status": "succeeded",
+                "percent": 100,
+                "stage": "completed",
+            },
+            generation={
+                "status": "succeeded",
+                "stage": "completed",
+                "error": None,
+            },
+            segments=[
+                {**self._public_segment(item), "status": "succeeded"}
+                for item in prepared
+            ],
+            error=None,
+        )
+        log.event("pipeline_succeeded", output=final)
+
+    def _load_pre_picsart_resume(
+        self,
+        project_id: str,
+    ) -> tuple[
+        Path,
+        Path,
+        Path | None,
+        dict[str, Any],
+        list[dict[str, Any]],
+        dict[int, list[dict[str, Any]]],
+        list[dict[str, Any]],
+    ]:
+        project = self.store.path(project_id)
+        state = self.store.read(project_id)
+        status = state.get("status")
+        stage = (state.get("project_progress") or {}).get("stage")
+        if status != "failed" and not (
+            status == "queued" and stage == "pre_picsart_resume_queued"
+        ):
+            raise ValueError("only failed projects can resume preparation")
+        logs = project / "logs"
+        if any(path.is_dir() for path in logs.glob("picsart*-submit")):
+            raise ValueError("project has Picsart submission evidence")
+        source_path = state.get("source_path")
+        if not isinstance(source_path, str):
+            raise TypeError("stored source path is invalid")
+        source = project / source_path
+        if not source.is_file():
+            raise FileNotFoundError("stored source is missing")
+        replacement = (
+            project / state["replacement_image_path"]
+            if state.get("replacement_image_path")
+            else None
+        )
+        if replacement is not None and not replacement.is_file():
+            raise FileNotFoundError("replacement image is missing")
+        raw_segments = state.get("segments")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise ValueError("stored segments are missing")
+        segments: list[dict[str, Any]] = []
+        selections: dict[int, list[dict[str, Any]]] = {}
+        for raw in raw_segments:
+            if not isinstance(raw, dict):
+                raise TypeError("stored segment must be an object")
+            segment = dict(raw)
+            index = int(segment["index"])
+            if index < 1 or float(segment["duration_s"]) <= 0:
+                raise ValueError("stored segment metadata is invalid")
+            scope = self._segment_scope(index)
+            directory = project / "work" / "segments" / f"{index:04d}"
+            selection_path = directory / "keyframe_selection.json"
+            if not selection_path.is_file():
+                raise FileNotFoundError("reusable keyframe selection is missing")
+            selection = json.loads(selection_path.read_text(encoding="utf-8"))
+            if not isinstance(selection, list) or len(selection) != 9:
+                raise ValueError("reusable keyframe selection must contain 9 items")
+            if not (directory / "source.mp4").is_file():
+                raise FileNotFoundError("reusable segment source is missing")
+            if len(list((directory / "keyframes").glob("*.png"))) != 9:
+                raise ValueError("reusable segment must contain exactly 9 keyframes")
+            if not isinstance(
+                self._completed_node_value(
+                    project, "segment-frames-4fps", scope,
+                ),
+                dict,
+            ):
+                raise TypeError("reusable segment manifest is invalid")
+            segments.append(segment)
+            selections[index] = selection
+        spoken_lines = state.get("voice_lines") or []
+        if not isinstance(spoken_lines, list) or not all(
+            isinstance(line, dict) for line in spoken_lines
+        ):
+            raise TypeError("stored spoken dialogue is invalid")
+        return (
+            project,
+            source,
+            replacement,
+            state.get("effective_request") or {},
+            segments,
+            selections,
+            [dict(line) for line in spoken_lines],
+        )
+
+    def validate_pre_picsart_resume(self, project_id: str) -> None:
+        self._load_pre_picsart_resume(project_id)
+
+    def resume_pre_picsart(self, project_id: str) -> None:
+        (
+            project,
+            source,
+            replacement,
+            request,
+            segments,
+            selections,
+            spoken_lines,
+        ) = self._load_pre_picsart_resume(project_id)
+        log = ResearchLog(project)
+        log.event("pre_picsart_resume_started")
+        try:
+            self._progress(
+                project_id, 24, "video-maker-resume", segments=segments,
+            )
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, len(segments)),
+            ) as pool:
+                futures = [
+                    pool.submit(
+                        self._prepare_segment,
+                        project_id,
+                        project,
+                        source,
+                        segment,
+                        selections[int(segment["index"])],
+                        request,
+                        log,
+                        resume=True,
+                    )
+                    for segment in segments
+                ]
+                prepared = [future.result() for future in futures]
+            prepared.sort(key=lambda item: int(item["index"]))
+            self._continue_after_prepared(
+                project_id,
+                project,
+                prepared,
+                spoken_lines,
+                replacement,
+                request,
+                log,
+            )
+            log.event("pre_picsart_resume_succeeded")
+        except Exception as exc:
+            log.event("pre_picsart_resume_failed", error=str(exc))
+            current = self.store.read(project_id)
+            percent = max(
+                24,
+                int((current.get("project_progress") or {}).get("percent") or 24),
+            )
+            self.store.update(
+                project_id,
+                status="failed",
+                project_progress={
+                    "status": "failed",
+                    "percent": min(percent, 99),
+                    "stage": "pre_picsart_resume_failed",
+                },
+                generation={
+                    "status": "failed",
+                    "stage": "pre_picsart_resume_failed",
+                    "error": "pre_picsart_resume_failed",
+                },
+                error={
+                    "code": "pre_picsart_resume_failed",
+                    "message": "前置产物续跑失败",
                 },
             )
 
@@ -921,6 +1111,19 @@ class Pipeline:
         )
         return yamnet, asr_lines, spoken_lines, voice_decisions
 
+    @staticmethod
+    def _completed_node_value(project: Path, node: str, scope: str) -> Any:
+        attempts = project / "logs" / node / scope
+        for directory in sorted(attempts.glob("attempt-*"), reverse=True):
+            output = directory / "output.json"
+            if not output.is_file() or (directory / "error.json").exists():
+                continue
+            value = json.loads(output.read_text(encoding="utf-8"))
+            if isinstance(value, dict) and "value" in value:
+                return value["value"]
+            return value
+        raise FileNotFoundError(f"completed node output is missing: {node}/{scope}")
+
     def _prepare_segment(
         self,
         project_id: str,
@@ -930,6 +1133,8 @@ class Pipeline:
         selection: list[dict[str, Any]],
         request: dict[str, Any],
         log: ResearchLog,
+        *,
+        resume: bool = False,
     ) -> dict[str, Any]:
         del project_id
         index = int(segment["index"])
@@ -937,46 +1142,57 @@ class Pipeline:
         directory = project / "work" / "segments" / f"{index:04d}"
         directory.mkdir(parents=True, exist_ok=True)
         segment_source = directory / "source.mp4"
-        self._node(
-            log,
-            "segment-cut",
-            scope,
-            {"source": source, **segment},
-            [source],
-            lambda: media.cut_segment(
-                source,
-                float(segment["start_s"]),
-                float(segment["duration_s"]),
-                segment_source,
-            ),
-            lambda _value: [segment_source],
-        )
-
         segment_frames = directory / "source-4fps"
-        segment_manifest = self._node(
-            log,
-            "segment-frames-4fps",
-            scope,
-            {"source": segment_source, "fps": 4, "output": segment_frames},
-            [segment_source],
-            lambda: media.extract_frames_4fps(segment_source, segment_frames),
-            lambda value: self._manifest_media(segment_frames, value),
-        )
-
         raw_dir = directory / "keyframes"
-        frames = self._node(
-            log,
-            "keyframes-exact-nine",
-            scope,
-            {"source": source, "selection": selection, "count": 9},
-            [source],
-            lambda: media.materialize_keyframes(source, selection, raw_dir),
-            lambda paths: list(paths),
-        )
-        (directory / "keyframe_selection.json").write_text(
-            json.dumps(selection, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        if resume:
+            if not segment_source.is_file():
+                raise FileNotFoundError("reusable segment source is missing")
+            segment_manifest = self._completed_node_value(
+                project, "segment-frames-4fps", scope,
+            )
+            if not isinstance(segment_manifest, dict):
+                raise TypeError("reusable segment manifest is invalid")
+            frames = sorted(raw_dir.glob("*.png"))
+            if len(frames) != 9:
+                raise ValueError("reusable segment must contain exactly 9 keyframes")
+            log.event("segment_preparation_reused", scope=scope)
+        else:
+            self._node(
+                log,
+                "segment-cut",
+                scope,
+                {"source": source, **segment},
+                [source],
+                lambda: media.cut_segment(
+                    source,
+                    float(segment["start_s"]),
+                    float(segment["duration_s"]),
+                    segment_source,
+                ),
+                lambda _value: [segment_source],
+            )
+            segment_manifest = self._node(
+                log,
+                "segment-frames-4fps",
+                scope,
+                {"source": segment_source, "fps": 4, "output": segment_frames},
+                [segment_source],
+                lambda: media.extract_frames_4fps(segment_source, segment_frames),
+                lambda value: self._manifest_media(segment_frames, value),
+            )
+            frames = self._node(
+                log,
+                "keyframes-exact-nine",
+                scope,
+                {"source": source, "selection": selection, "count": 9},
+                [source],
+                lambda: media.materialize_keyframes(source, selection, raw_dir),
+                lambda paths: list(paths),
+            )
+            (directory / "keyframe_selection.json").write_text(
+                json.dumps(selection, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
         processing = request.get("processing") or {}
         generation_config = self._generation_config(request)
@@ -997,14 +1213,36 @@ class Pipeline:
             authoritative_frames = []
             for order, frame in enumerate(frames, 1):
                 target = optimized / frame.name
+                if resume and target.is_file():
+                    authoritative_frames.append(target)
+                    log.event(
+                        "mediakit_artifact_reused",
+                        scope=f"{scope}-frame-{order:02d}",
+                        output=target,
+                    )
+                    continue
+                erase_source = frame
+                remaining_stages = stages
+                node = "mediakit-erase"
+                if resume:
+                    node = "mediakit-erase-resume"
+                    for completed in range(1, len(stages)):
+                        checkpoint = target.with_name(
+                            f"{target.stem}.mediakit-stage-{completed:02d}{target.suffix}"
+                        )
+                        if checkpoint.is_file():
+                            erase_source = checkpoint
+                            remaining_stages = stages[completed:]
                 result = self._node(
                     log,
-                    "mediakit-erase",
+                    node,
                     f"{scope}-frame-{order:02d}",
-                    {"source": frame, "scenes": stages},
-                    [frame],
-                    lambda frame=frame, target=target: self.mediakit.erase(
-                        frame, target, stages,
+                    {"source": erase_source, "scenes": remaining_stages},
+                    [erase_source],
+                    lambda erase_source=erase_source,
+                    target=target,
+                    remaining_stages=remaining_stages: self._erase_with_limit(
+                        erase_source, target, remaining_stages,
                     ),
                     lambda path: [path],
                 )
@@ -1020,15 +1258,21 @@ class Pipeline:
                 proxies.append(media.half_resolution_png(frame, target))
             return proxies
 
-        analysis_frames = self._node(
-            log,
-            "video-maker-analysis-proxies",
-            scope,
-            {"frames": authoritative_frames, "scale": "half-resolution"},
-            authoritative_frames,
-            make_proxies,
-            lambda paths: list(paths),
-        )
+        reusable_proxies = sorted(proxy_dir.glob("*.png")) if resume else []
+        if len(reusable_proxies) == 9:
+            analysis_frames = reusable_proxies
+            log.event("analysis_proxies_reused", scope=scope)
+        else:
+            analysis_frames = self._node(
+                log,
+                "video-maker-analysis-proxies-resume"
+                if resume else "video-maker-analysis-proxies",
+                scope,
+                {"frames": authoritative_frames, "scale": "half-resolution"},
+                authoritative_frames,
+                make_proxies,
+                lambda paths: list(paths),
+            )
         visual_payload = {
             "generation_config": generation_config,
             "segment": {
@@ -1046,24 +1290,28 @@ class Pipeline:
                 for order, path in enumerate(analysis_frames, 1)
             ],
         }
-        skill = VIDEO_SKILL.read_text(encoding="utf-8")
-        visual_prompt = self._node(
-            log,
-            "video-maker",
-            scope,
-            visual_payload,
-            analysis_frames,
-            lambda: self.deepseek.complete_structured(
-                skill
-                + "\n\n本次只执行逐段视觉分析；通过唯一 submit_result 调用填写注入的 Schema。",
-                visual_payload,
-                VISUAL_PROMPT_SCHEMA,
-                analysis_frames,
-            ),
-            transform=normalize_visual_prompt,
-        )
         visual_path = directory / "visual_prompt.txt"
-        visual_path.write_text(visual_prompt, encoding="utf-8")
+        visual_prompt = visual_path.read_text(encoding="utf-8").strip() if resume and visual_path.is_file() else ""
+        if visual_prompt:
+            log.event("video_maker_artifact_reused", scope=scope)
+        else:
+            skill = VIDEO_SKILL.read_text(encoding="utf-8")
+            visual_prompt = self._node(
+                log,
+                "video-maker-resume" if resume else "video-maker",
+                scope,
+                visual_payload,
+                analysis_frames,
+                lambda: self.deepseek.complete_structured(
+                    skill
+                    + "\n\n本次只执行逐段视觉分析；通过唯一 submit_result 调用填写注入的 Schema。",
+                    visual_payload,
+                    VISUAL_PROMPT_SCHEMA,
+                    analysis_frames,
+                ),
+                transform=normalize_visual_prompt,
+            )
+            visual_path.write_text(visual_prompt, encoding="utf-8")
         return {
             **segment,
             "source": segment_source,

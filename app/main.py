@@ -448,6 +448,53 @@ def create_app(
         return _read_project(_store(request), project_id)
 
     @app.post(
+        "/api/conversations/{project_id}/resume-pre-picsart",
+        status_code=202,
+        dependencies=[Depends(require_auth)],
+    )
+    async def resume_pre_picsart(project_id: str, request: Request):
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise _error(400, "invalid_json", "请求体必须是 JSON 对象") from None
+        if not isinstance(body, dict) or body.get("confirm") is not True:
+            raise _error(400, "confirmation_required", "必须明确确认续跑前置产物")
+        store = _store(request)
+        state = _read_project(store, project_id)
+        if state.get("status") != "failed":
+            raise _error(409, "project_not_failed", "只有失败项目可以续跑前置产物")
+        try:
+            app.state.pipeline.validate_pre_picsart_resume(project_id)
+        except (FileNotFoundError, TypeError, ValueError, OSError):
+            raise _error(
+                409,
+                "pre_picsart_resume_not_ready",
+                "项目缺少可安全复用的前置产物，或已存在 Picsart 提交痕迹",
+            ) from None
+        state = store.update(
+            project_id,
+            status="queued",
+            has_video=False,
+            project_progress={
+                "status": "queued",
+                "percent": 0,
+                "stage": "pre_picsart_resume_queued",
+            },
+            generation={
+                "status": "queued",
+                "stage": "pre_picsart_resume_queued",
+                "error": None,
+            },
+            error=None,
+        )
+        task = asyncio.create_task(
+            asyncio.to_thread(pipeline_entry, project_id, "resume_pre_picsart")
+        )
+        app.state.tasks.add(task)
+        task.add_done_callback(app.state.tasks.discard)
+        return state
+
+    @app.post(
         "/api/conversations/{project_id}/resume-picsart",
         status_code=202,
         dependencies=[Depends(require_auth)],
