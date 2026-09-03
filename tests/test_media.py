@@ -31,6 +31,56 @@ def _scene(index: int, start: int, end: int) -> dict:
     }
 
 
+def _png_bytes(width: int, height: int) -> bytes:
+    image = np.full((height, width, 3), (10, 20, 30), dtype=np.uint8)
+    ok, encoded = cv2.imencode(
+        ".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 3]
+    )
+    assert ok
+    return encoded.tobytes()
+
+
+def _assert_minimax_image_contract(image: np.ndarray) -> None:
+    height, width = image.shape[:2]
+    assert 256 <= width <= 5760
+    assert 256 <= height <= 5760
+    assert 5 * width >= 2 * height
+    assert 2 * width <= 5 * height
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "expected_shape"),
+    [
+        (477, 848, (848, 477)),
+        (512, 512, (256, 256)),
+        (203, 360, (454, 256)),
+        (200, 400, (512, 256)),
+        (6000, 300, (1152, 2880)),
+        (100, 1, (256, 256)),
+        (1, 100, (256, 256)),
+        (1285, 514, (258, 643)),
+        (514, 1285, (643, 258)),
+    ],
+)
+def test_provider_reference_png_uses_duet_minimax_bounds(
+    tmp_path: Path,
+    width: int,
+    height: int,
+    expected_shape: tuple[int, int],
+) -> None:
+    source = tmp_path / "source.png"
+    destination = tmp_path / "reference.png"
+    source.write_bytes(_png_bytes(width, height))
+
+    first = media.provider_reference_png(source, destination).read_bytes()
+    second = media.provider_reference_png(source, destination).read_bytes()
+    decoded = cv2.imdecode(np.frombuffer(first, np.uint8), cv2.IMREAD_COLOR)
+
+    assert first == second
+    assert decoded.shape[:2] == expected_shape
+    _assert_minimax_image_contract(decoded)
+
+
 def test_probe_uses_duration_ts_before_packet_fallback_and_never_format_duration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

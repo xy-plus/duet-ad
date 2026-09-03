@@ -92,12 +92,12 @@ data/projects/{project_id}/
    - 不出现原语言台词。
    - 不生成字幕或屏幕文字。
    - 台词在原片段时长内结束，补齐时段不新增台词。
-4. 将本段原视频静音，生成内置临时签名 URL；用户图片存在时同样生成签名 URL。
+4. 将本段原视频静音，生成内置临时签名 URL；用户图片存在时，先按 MiniMax 的 `256–5760` 双边范围与 `1:2.5–2.5:1` 比例范围生成确定性 PNG，再生成签名 URL。归一化只做等比缩放和必要黑边补齐，不拉伸或裁剪内容。
 5. 调用 Picsart：
-   - 模型：`minimax-h3-max-r2v`
-   - `promptExpansionMode: "quality"`
-   - `videoUrls`: 当前静音片段
-   - `imageUrls`: 可选的一张用户图片
+   - Advanced workflow：`minimax/h3-max/reference-to-video`
+   - `prompt_expansion_mode: "quality"`
+   - `reference_video_urls`: 当前静音片段
+   - `reference_image_urls`: 可选的一张用户图片
    - `prompt`: Skill 输出与机械附加台词
    - `duration`: `max(5, ceil(原片段秒数))`
 6. 轮询任务、下载结果，用 ffmpeg 将音视频裁回原片段准确时长。
@@ -109,9 +109,9 @@ data/projects/{project_id}/
 
 新增无 Bearer 鉴权的内部素材读取端点：
 
-`GET /internal/provider-assets/{project_id}/{asset_id}?token=...`
+`GET|HEAD /internal/provider-assets/{project_id}/{asset_id}?token=...`
 
-- URL 基于 `PUBLIC_BASE_URL` 生成，供 Picsart 从公网读取。
+- URL 基于 `PUBLIC_BASE_URL` 生成，供 Picsart 从公网读取；`HEAD` 与 `GET` 使用完全相同的 token、归属和路径校验。
 - 每个素材使用独立高熵 token，默认有效期为素材注册后 24 小时。
 - token、项目归属和路径安全属于技术访问控制，不属于质量校验。
 - 不接入 Picsart Drive 或外部对象存储。
@@ -151,10 +151,11 @@ logs/{node}/{segment_or_project}/attempt-{1|2}/
 - 验证 Master 上游链仍产生每段 9 帧、视频描述、本地化台词和全局对象索引，但不对其内容质量做断言。
 - 验证所有片段在公共输入准备完成后并行进入新 Skill 和 H3 R2V。
 - 验证 4.x 秒片段使用供应商 5 秒参数并裁回原时长。
-- 验证 `promptExpansionMode` 固定为 `"quality"`，静音视频和可选图片同时传入。
+- 验证 `prompt_expansion_mode` 固定为 `"quality"`，静音视频和可选图片同时传入。
 - 验证用户未提供替换图时仍能执行；图片和说明不配对时也不由后端门禁拦截。
 - 验证每个节点的两次尝试、未知提交重提及原始输入输出日志均被记录。
 - 验证签名素材 URL 可供无 Bearer 的供应商读取，但错误 token 不能跨项目访问。
+- 验证签名素材的 `GET/HEAD` 均可用，并验证参考图满足 MiniMax 双边和比例约束。
 - 测试只断言流程、API 兼容和日志存在，不增加模型输出、媒体质量或业务语义断言。
 
 ## 默认边界
@@ -165,4 +166,4 @@ logs/{node}/{segment_or_project}/attempt-{1|2}/
 - 不实现旧前端中不可达的 `/submit`、提示词编辑、后处理和手工重试接口。
 - 默认同时启动全部片段任务，不增加业务并发门禁；HTTP 连接池和操作系统资源限制保持库默认行为。
 - `PUBLIC_BASE_URL` 必须是 Picsart 可以访问的公网地址。
-- Picsart 契约以其当前 [H3 Max R2V API 文档](https://picsart.com/api-platform/models/minimax-h3-max-r2v/api)为准。
+- Picsart 契约以其当前 [H3 Max R2V Advanced 文档](https://picsart.com/api-platform/models/minimax-h3-max-r2v/advanced)为准。

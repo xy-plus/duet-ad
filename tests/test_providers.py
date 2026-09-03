@@ -329,15 +329,8 @@ def test_mediakit_http_and_init_shape_failures_keep_stage_record(
     assert stage["initialize"]["response"]["body"] == response.json()
 
 
-@pytest.mark.parametrize(
-    "completed_result",
-    [
-        {"url": "https://result.test/video.mp4"},
-        {"items": [{"url": "https://result.test/video.mp4"}]},
-    ],
-)
 def test_picsart_submit_and_poll_are_split_and_poll_one_task(
-    tmp_path: Path, completed_result: dict[str, object]
+    tmp_path: Path,
 ) -> None:
     poll_paths: list[str] = []
     poll_count = 0
@@ -346,19 +339,37 @@ def test_picsart_submit_and_poll_are_split_and_poll_one_task(
         nonlocal poll_count
         if request.url.path.endswith("/submit"):
             body = json.loads(request.content)
-            params = body["params"]["params"]
-            assert body["params"]["model"] == "minimax-h3-max-r2v"
-            assert params["promptExpansionMode"] == "quality"
-            assert params["videoUrls"] == ["https://assets.test/source.mp4"]
-            assert params["imageUrls"] == ["https://assets.test/reference.png"]
+            params = body["params"]
+            assert request.url.path == (
+                "/workflows/minimax/h3-max/reference-to-video/submit"
+            )
+            assert set(body) == {"params"}
+            assert "model" not in params
+            assert params["prompt_expansion_mode"] == "quality"
+            assert params["reference_video_urls"] == [
+                "https://assets.test/source.mp4"
+            ]
+            assert params["reference_image_urls"] == [
+                "https://assets.test/reference.png"
+            ]
+            assert params["resolution"] == "768P"
+            assert params["aspect_ratio"] == "16:9"
             return httpx.Response(200, json={"response": {"id": "task-fixed"}})
         poll_paths.append(request.url.path)
         poll_count += 1
         if poll_count == 1:
-            return httpx.Response(200, json={"response": {"status": "RUNNING"}})
+            return httpx.Response(200, json={"response": {"status": "IN_PROGRESS"}})
         return httpx.Response(
             200,
-            json={"response": {"status": "COMPLETED", "result": completed_result}},
+            json={
+                "response": {
+                    "status": "COMPLETED",
+                    "result": {
+                        "expanded_prompt": "expanded",
+                        "video": {"url": "https://result.test/video.mp4"},
+                    },
+                }
+            },
         )
 
     client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
@@ -377,9 +388,37 @@ def test_picsart_submit_and_poll_are_split_and_poll_one_task(
     assert polled.value == "https://result.test/video.mp4"
     assert polled.record["task_id"] == "task-fixed"
     assert poll_paths == [
-        "/workflows/v1/models/task-fixed/result",
-        "/workflows/v1/models/task-fixed/result",
+        "/workflows/minimax/h3-max/reference-to-video/task-fixed/result",
+        "/workflows/minimax/h3-max/reference-to-video/task-fixed/result",
     ]
+
+
+def test_picsart_advanced_request_omits_absent_optional_image(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body == {
+            "params": {
+                "prompt": "prompt",
+                "reference_video_urls": ["https://assets.test/source.mp4"],
+                "resolution": "480P",
+                "duration": 5,
+                "aspect_ratio": "9:16",
+                "prompt_expansion_mode": "quality",
+            }
+        }
+        return httpx.Response(200, json={"response": {"id": "task-no-image"}})
+
+    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
+    result = client.submit(
+        prompt="prompt",
+        video_url="https://assets.test/source.mp4",
+        image_url=None,
+        duration=5,
+        resolution="480p",
+        aspect_ratio="9:16",
+    )
+
+    assert result.value == "task-no-image"
 
 
 @pytest.mark.parametrize(
@@ -421,7 +460,9 @@ def test_picsart_poll_failure_keeps_task_and_download_records_binary(
     tmp_path: Path,
 ) -> None:
     def failed_poll(request: httpx.Request) -> httpx.Response:
-        assert request.url.path.endswith("/same-task/result")
+        assert request.url.path == (
+            "/workflows/minimax/h3-max/reference-to-video/same-task/result"
+        )
         return httpx.Response(
             200,
             json={"response": {"status": "FAILED", "error": {"message": "nope"}}},

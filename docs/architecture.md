@@ -50,7 +50,7 @@ h3-max-r2v-prompt Skill
 
 新 `h3-max-r2v-prompt` Skill 每段执行一次并输出纯文本。它读取本段视觉提示词、完整且无供应商记录污染的对象索引、本段翻译台词、可选图片和用户说明。后端随后机械附加“不说原语言、不生成字幕、在冻结时间窗内结束”的台词要求。
 
-Picsart 使用 unified API 的 `minimax-h3-max-r2v`，内层字段为 camelCase，并固定 `promptExpansionMode: "quality"`。4.x 秒片段提交为 5 秒，结果再裁回源时长。compatibility workflow 的 snake_case 参数不得混入。
+Picsart 使用 Advanced compatibility workflow `minimax/h3-max/reference-to-video`。提交地址为 `/workflows/minimax/h3-max/reference-to-video/submit`，请求体只有一层 `params`，字段使用供应商原生的 `reference_video_urls`、`reference_image_urls`、`aspect_ratio` 和 `prompt_expansion_mode: "quality"`；分辨率映射为 `480P`/`768P`。用户参考图先复用 `duet-ad1` 的 MiniMax 代理规则，等比落入 `256–5760` 双边和 `1:2.5–2.5:1` 比例范围，必要时补黑边，再编码为 PNG。轮询同一 workflow 下的 `/{taskId}/result`，从 `response.result.video.url` 读取结果。4.x 秒片段提交为 5 秒，结果再裁回源时长。
 
 ## 重试、证据与付费边界
 
@@ -67,5 +67,5 @@ Picsart submit、poll、download 是三个节点。submit 第一次失败且未�
 - 登录和前端 API 使用 Bearer 鉴权；供应商素材 URL 只使用独立高熵、项目绑定且限时的 token。
 - 上传磁盘名由服务端决定，客户端 filename 只作显示元数据；视频和替换图分别执行字节上限。
 - 外链视频每次跳转都重新做 URL、DNS 与全局 IP 校验，实际连接钉扎到已批准 IP，同时保留 Host/SNI；下载流同时受 Content-Length 和实际累计字节限制。
-- 项目文件路由是逻辑名 allowlist，不接受任意项目相对路径。签名素材在注册和读取时都重新验证真实路径属于对应项目。
+- 项目文件路由是逻辑名 allowlist，不接受任意项目相对路径。签名素材在注册和读取时都重新验证真实路径属于对应项目，`GET` 与供应商预检使用的 `HEAD` 共用同一验证路径。
 - 状态只使用 `queued/running/succeeded/failed`。纯文件存储、后台任务和内存 token 表限定单实例；同一数据目录不允许重叠进程。

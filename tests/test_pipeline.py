@@ -274,6 +274,10 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
         destination.write_bytes(source.read_bytes() + b"-half")
         return destination
 
+    def provider_reference(source: Path, destination: Path) -> Path:
+        destination.write_bytes(source.read_bytes() + b"-provider-reference")
+        return destination
+
     def localize(
         lines: list[dict[str, Any]],
         segment: dict[str, Any],
@@ -343,6 +347,9 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
     monkeypatch.setattr(media, "cut_segment", cut)
     monkeypatch.setattr(media, "materialize_keyframes", materialize, raising=False)
     monkeypatch.setattr(media, "half_resolution_png", half, raising=False)
+    monkeypatch.setattr(
+        media, "provider_reference_png", provider_reference, raising=False,
+    )
     monkeypatch.setattr(media, "localize_dialogue", localize, raising=False)
     monkeypatch.setattr(media, "mute", mute)
     monkeypatch.setattr(media, "trim_24fps", trim, raising=False)
@@ -465,6 +472,123 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         (scope / "attempt-2").exists()
         for scope in (project / "logs" / "picsart-submit").iterdir()
     )
+
+
+def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    request = {"output": {"resolution": "480p", "aspect_ratio": "9:16"}}
+    project_id, project, _state = store.create(request, "resume-only")
+    replacement = project / "inputs" / "replacement-image"
+    replacement.write_bytes(b"replacement")
+    segments = [
+        {
+            "index": 1,
+            "start_s": 0.0,
+            "end_s": 4.2,
+            "duration_s": 4.2,
+            "chain_id": "chain-1",
+            "join_mode": "hard_cut",
+            "dialogue": [],
+            "visual_prompt": "visual-1",
+            "status": "running",
+        },
+        {
+            "index": 2,
+            "start_s": 4.2,
+            "end_s": 9.2,
+            "duration_s": 5.0,
+            "chain_id": "chain-2",
+            "join_mode": "hard_cut",
+            "dialogue": [],
+            "visual_prompt": "visual-2",
+            "status": "running",
+        },
+    ]
+    for segment in segments:
+        segment_dir = project / "work" / "segments" / f"{segment['index']:04d}"
+        segment_dir.mkdir(parents=True)
+        (segment_dir / "source.mp4").write_bytes(b"source")
+        (segment_dir / "source-muted.mp4").write_bytes(b"muted")
+        (segment_dir / "h3_prompt.txt").write_text(
+            f"frozen prompt {segment['index']}", encoding="utf-8",
+        )
+    store.update(
+        project_id,
+        status="failed",
+        replacement_image_path="inputs/replacement-image",
+        segments=segments,
+        project_progress={"status": "failed", "percent": 57, "stage": "pipeline_failed"},
+        generation={"status": "failed", "stage": "pipeline_failed", "error": "failed"},
+    )
+    accepted = (
+        project / "logs" / "picsart-submit"
+        / "segment-0001" / "attempt-1"
+    )
+    accepted.mkdir(parents=True)
+    (accepted / "output.json").write_text(json.dumps({
+        "value": "existing-task",
+        "provider_record": {
+            "outcome": "accepted", "task_id": "existing-task",
+        },
+    }), encoding="utf-8")
+    failed = (
+        project / "logs" / "picsart-submit"
+        / "segment-0002" / "attempt-1"
+    )
+    failed.mkdir(parents=True)
+    (failed / "output.json").write_text(json.dumps({
+        "value": "failed-task",
+        "provider_record": {
+            "outcome": "accepted", "task_id": "failed-task",
+        },
+    }), encoding="utf-8")
+    terminal = (
+        project / "logs" / "picsart-poll"
+        / "segment-0002" / "attempt-1"
+    )
+    terminal.mkdir(parents=True)
+    (terminal / "output.json").write_text(json.dumps({
+        "provider_record": {
+            "task_id": "failed-task",
+            "polls": [{"response": {"status_code": 422, "body": {}}}],
+        },
+    }), encoding="utf-8")
+    events: list[str] = []
+    _install_fake_media(monkeypatch, events)
+    picsart = _FlowPicsart()
+    registered: list[Path] = []
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, path: (
+            registered.append(path) or f"https://assets.invalid/{path.name}"
+        ),
+        deepseek=object(),
+        mediakit=object(),
+        picsart=picsart,
+    )
+
+    pipeline.validate_r2v_resume(project_id)
+    pipeline.resume_r2v(project_id)
+
+    state = store.read(project_id)
+    assert state["status"] == "succeeded"
+    assert state["has_video"] is True
+    assert len(picsart.submits) == 1
+    assert [call["prompt"] for call in picsart.submits] == ["frozen prompt 2"]
+    assert picsart.poll_counts["existing-task"] == 1
+    assert "failed-task" not in picsart.poll_counts
+    assert {path.name for path in registered} == {
+        "source-muted.mp4", "provider-reference-resume.png",
+    }
+    assert (project / "output" / "generated.mp4").is_file()
+    assert (project / "logs" / "picsart-resume-submit").is_dir()
+    assert not (
+        project / "logs" / "picsart-resume-submit" / "segment-0001"
+    ).exists()
+    assert not (project / "logs" / "h3-max-r2v-prompt").exists()
 
 
 def test_same_language_translation_is_an_explicit_skipped_attempt(

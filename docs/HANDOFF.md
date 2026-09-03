@@ -8,11 +8,12 @@
 - 已有仓库提交：
   - `2141263 chore: import minimal frontend from duet-ad Master`
   - `4f68eb6 test: preserve minimal frontend API contract`
+  - `b91e771 feat: deploy independent H3 Max R2V pipeline`
 - 独立 FastAPI 后端、媒体链路、供应商适配、Skills、测试和文档均已实现。
 - 本轮实现已写入本仓库工作树；源仓库 `/home/xy/duet-ad1` 没有被修改。
 - 3301 前端入口和 3302 内部后端已由 user systemd 单元运行，Caddy 使用现有公网证书。
-- DeepSeek、MediaKit 和 Picsart 已接通运行配置；真实冒烟已走通 Picsart 前的全部节点。
-- 真实 Picsart 请求在提交阶段返回 `unknown_model`，未取得 taskId；因此当前没有成功生成视频的证据，也没有可核对的付费任务回执。
+- DeepSeek、MediaKit 和 Picsart 已接通运行配置；完整真实链路已经生成并拼接最终视频。
+- 实测项目 `8b50222f84f94220b92b0255d3c64a36` 已成功：两段 Advanced workflow 任务均完成，最终文件为 `/home/xy/duet-ad1-h3-max-r2v/data/projects/8b50222f84f94220b92b0255d3c64a36/output/generated.mp4`。
 
 ## 已实现链路
 
@@ -103,14 +104,16 @@
 
 它输出纯文本 R2V 提示词，要求优先执行用户替换；其余人物换为同性别、种族和整体风格但脸略有不同、服装同色同风格但款式略变的新人物；场景换为同类别同风格但不同布局和细节的同类场景；动作、机位、构图、运动、焦段、光线和转场保持不变。
 
-后端不让 Skill 改写台词，而是在其输出后机械附加目标语言台词、段内时间窗、禁止原语言和禁止字幕的要求。随后把静音原片段、可选用户图及最终提示词提交 Picsart：
+后端不让 Skill 改写台词，而是在其输出后机械附加目标语言台词、段内时间窗、禁止原语言和禁止字幕的要求。随后通过 Picsart Advanced compatibility workflow `minimax/h3-max/reference-to-video` 提交静音原片段、可选用户图及最终提示词：
 
-- `model`: `minimax-h3-max-r2v`
-- `promptExpansionMode`: `quality`
-- `videoUrls`: 当前静音片段的临时签名公网 URL
-- `imageUrls`: 可选用户图片的临时签名公网 URL
+- `prompt_expansion_mode`: `quality`
+- `reference_video_urls`: 当前静音片段的临时签名公网 URL
+- `reference_image_urls`: 可选用户图片经过 MiniMax 约束归一化后的 PNG 临时签名公网 URL
 - `duration`: `max(5, ceil(原片段秒数))`
-- `resolution`、`aspectRatio`: 前端请求值
+- `resolution`: 前端 `480p`/`768p` 映射为兼容 API 的 `480P`/`768P`
+- `aspect_ratio`: 前端请求值
+
+用户图片沿用 `duet-ad1` 的 MiniMax 图片代理机制：内容保持原比例等比缩放；宽、高均限制在 `256–5760`，宽高比限制在 `1:2.5–2.5:1`；极端比例通过黑边补齐，不拉伸、不裁掉内容。签名素材端点同时支持 `GET` 和 `HEAD`，因为 Picsart 下载器会先后使用这两种方法检查同一素材。
 
 ## API、存储与技术边界
 
@@ -118,7 +121,7 @@
 - 项目只使用 `queued/running/succeeded/failed` 四态；成功快照同时包含 `percent=100` 和 `has_video=true`。
 - 上传使用服务端固定磁盘名并流式执行字节上限；外链视频逐跳做 URL、DNS、全局 IP、重定向和累计字节限制。
 - 通用文件 API 只允许源视频与成功态最终视频；状态、日志和中间文件不能下载。
-- 供应商素材 token 与项目、asset 和真实项目内路径绑定；替换图签名响应保留冻结的图片媒体类型。
+- 供应商素材 token 与项目、asset 和真实项目内路径绑定；归一化替换图以 `.png` 和 `image/png` 提供，并支持 `GET/HEAD`。
 - 状态文件原子写入；项目与日志目录为 `0700`，文件为 `0600`。
 - 原始请求、响应、headers、密钥、签名 URL、媒体副本、异常和命令输出按节点/attempt 本地保存，不脱敏；日志失败不阻断业务。
 - 只支持单进程实例；同一数据目录由生命周期文件锁阻止重叠 worker。
@@ -129,12 +132,13 @@
 
 - submit 第一次失败且没有 `taskId` 时可再次 POST；结果未知时明确接受重复付费风险。
 - 一旦取得 `taskId`，poll 和 download 的失败只重试自身，不能返回 submit。
+- `POST /api/conversations/{id}/resume-picsart` 只复用冻结的静音片段和 R2V 提示词；已有且未明确失败的 task ID 只继续 poll，已完成片段直接复用，只有供应商已明确 `FAILED` 或 HTTP 4xx 的片段才允许重新 submit。
 - 不因生成质量、替换效果或媒体观感增加重试。
 - 固定 Master 的 YAMNet 检出人声但第一次 Whisper 为空时，仍在同一个最多两次的 ASR attempt 边界内复核一次；第二次仍空则以空台词继续。
 
 ## 验证与剩余事项
 
-已完成离线测试，覆盖前端合同、API、SSRF/路径归属、供应商 MockTransport、研究日志、固定 Master 媒体算法、YAMNet、video-maker 两阶段、公共屏障、逐段并行、Picsart 重试和 4.x 秒裁回。当前结果：`139 passed, 1 warning`；唯一 warning 是 FastAPI TestClient 引入的 Starlette/httpx 弃用提示。
+已完成离线测试，覆盖前端合同、API、SSRF/路径归属、供应商 MockTransport、研究日志、固定 Master 媒体算法、MiniMax 图片尺寸/比例归一化、签名素材 `GET/HEAD`、YAMNet、video-maker 两阶段、公共屏障、逐段并行、受控续跑、Picsart 重试和 4.x 秒裁回。当前结果：`150 passed, 1 warning`；唯一 warning 是 FastAPI TestClient 引入的 Starlette/httpx 弃用提示。
 
 YAMNet 模型：
 
@@ -142,8 +146,9 @@ YAMNet 模型：
 - 字节数：`4,126,810`
 - SHA-256：`4d8b4a53282dc83ef04e3e7dbc4fbc98082e34e44ed798e16c3a0cdd4c584faf`
 
-部署与剩余事项：
+部署与真实验收：
 
 1. 运行入口为 `https://8.166.140.227:3301`；登录使用部署环境的 `ACCESS_TOKEN`，凭据保存在受限配置文件，不写入仓库。
-2. Picsart 官方文档使用的模型 ID 仍为 `minimax-h3-max-r2v`，但当前 token 对该模型返回 `unknown_model`。需要在 Picsart 账户/目录侧开通该模型后，使用同一输入再次运行最后一步；不自动替换为其他模型。
-3. 当前 `.env` 仅作为本机部署覆盖配置，权限为 `0600` 且被 `.gitignore` 忽略；其他密钥由受限源配置文件加载。
+2. 统一模型 API 对 `minimax-h3-max-r2v` 返回过 `unknown_model`；已按官方 Advanced 文档改为直接调用 workflow `minimax/h3-max/reference-to-video`。真实复测的两段任务 ID 为 `2126f442-60c9-4291-8e8d-344d1757ba60`、`2f0829d7-6e35-443e-bcd9-7503025524de`，均为 `COMPLETED`。
+3. Picsart 的真实访问证实会对签名图片和视频发出 `GET` 与 `HEAD`；修复后两种方法均返回 `200`。最终视频为 H.264 `480x832`、`24 fps`，AAC `48 kHz` 双声道，时长 `16.957683` 秒；3301 下载接口 Range 请求返回 `206 video/mp4`。
+4. 当前 `.env` 仅作为本机部署覆盖配置，权限为 `0600` 且被 `.gitignore` 忽略；其他密钥由受限源配置文件加载。

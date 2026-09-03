@@ -485,6 +485,302 @@ class Pipeline:
                 },
             )
 
+    @staticmethod
+    def _resume_prefix_key(prefix: str) -> int:
+        if prefix == "picsart-resume":
+            return 1
+        marker = "picsart-resume-"
+        if prefix.startswith(marker):
+            try:
+                return int(prefix[len(marker):])
+            except ValueError:
+                return 0
+        return 0
+
+    def _resume_prefixes(self, project: Path) -> list[str]:
+        prefixes = {
+            path.name.removesuffix("-submit")
+            for path in (project / "logs").glob("picsart-resume*-submit")
+            if path.is_dir()
+        }
+        return sorted(prefixes, key=self._resume_prefix_key, reverse=True)
+
+    def _next_resume_identity(self, project: Path) -> tuple[str, str]:
+        prefixes = self._resume_prefixes(project)
+        number = max((self._resume_prefix_key(value) for value in prefixes), default=0) + 1
+        if number == 1:
+            return "picsart-resume", "-resume"
+        return f"picsart-resume-{number:02d}", f"-resume-{number:02d}"
+
+    def _picsart_receipt_prefixes(self, project: Path) -> list[str]:
+        prefixes = self._resume_prefixes(project)
+        if (project / "logs" / "picsart-submit").is_dir():
+            prefixes.append("picsart")
+        return prefixes
+
+    @staticmethod
+    def _poll_record_is_terminal_failure(record: dict[str, Any]) -> bool:
+        for exchange in record.get("polls") or []:
+            if not isinstance(exchange, dict):
+                continue
+            response = exchange.get("response")
+            if not isinstance(response, dict):
+                continue
+            status_code = response.get("status_code")
+            if isinstance(status_code, int) and 400 <= status_code < 500:
+                return True
+            body = response.get("body")
+            envelope = body.get("response") if isinstance(body, dict) else None
+            if isinstance(envelope, dict) and str(envelope.get("status") or "").upper() == "FAILED":
+                return True
+        return False
+
+    def _active_resume_task(
+        self, project: Path, scope: str,
+    ) -> str | None:
+        terminal_task_ids: set[str] = set()
+        for prefix in self._picsart_receipt_prefixes(project):
+            poll_root = project / "logs" / f"{prefix}-poll" / scope
+            for poll_output in poll_root.glob("attempt-*/output.json"):
+                try:
+                    poll_logged = json.loads(
+                        poll_output.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    continue
+                poll_record = (
+                    poll_logged.get("provider_record")
+                    if isinstance(poll_logged, dict)
+                    else None
+                )
+                task_id = (
+                    poll_record.get("task_id")
+                    if isinstance(poll_record, dict)
+                    else None
+                )
+                if (
+                    isinstance(task_id, str)
+                    and task_id
+                    and self._poll_record_is_terminal_failure(poll_record)
+                ):
+                    terminal_task_ids.add(task_id)
+
+        for prefix in self._picsart_receipt_prefixes(project):
+            submit_root = project / "logs" / f"{prefix}-submit" / scope
+            outputs = sorted(
+                submit_root.glob("attempt-*/output.json"), reverse=True,
+            )
+            for output in outputs:
+                try:
+                    logged = json.loads(output.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                record = logged.get("provider_record") if isinstance(logged, dict) else None
+                task_id = record.get("task_id") if isinstance(record, dict) else None
+                if not isinstance(task_id, str) or not task_id:
+                    continue
+                if task_id not in terminal_task_ids:
+                    return task_id
+        return None
+
+    def _completed_resume_output(
+        self, project: Path, segment_dir: Path, scope: str,
+    ) -> Path | None:
+        for prefix in self._picsart_receipt_prefixes(project):
+            number = self._resume_prefix_key(prefix)
+            suffix = (
+                "" if prefix == "picsart"
+                else "-resume" if number == 1
+                else f"-resume-{number:02d}"
+            )
+            output = segment_dir / f"generated{suffix}.mp4"
+            trim_root = (
+                project / "logs"
+                / (
+                    "trim-provider-output-24fps"
+                    if prefix == "picsart"
+                    else f"{prefix}-trim-provider-output-24fps"
+                )
+                / scope
+            )
+            if output.is_file() and any(trim_root.glob("attempt-*/output.json")):
+                return output
+        return None
+
+    def _load_r2v_resume(
+        self, project_id: str,
+    ) -> tuple[Path, list[dict[str, Any]], Path | None, dict[str, Any]]:
+        project = self.store.path(project_id)
+        state = self.store.read(project_id)
+        if state.get("status") not in {"failed", "queued"}:
+            raise ValueError("only a failed or explicitly queued project can resume Picsart")
+        raw_segments = state.get("segments")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise ValueError("project has no reusable segments")
+        replacement = (
+            project / state["replacement_image_path"]
+            if state.get("replacement_image_path")
+            else None
+        )
+        if replacement is not None and not replacement.is_file():
+            raise FileNotFoundError("replacement image is missing")
+
+        prepared: list[dict[str, Any]] = []
+        for raw in raw_segments:
+            if not isinstance(raw, dict):
+                raise TypeError("stored segment must be an object")
+            item = dict(raw)
+            index = int(item["index"])
+            duration_s = float(item["duration_s"])
+            if index < 1 or duration_s <= 0:
+                raise ValueError("stored segment metadata is invalid")
+            segment_dir = project / "work" / "segments" / f"{index:04d}"
+            source = segment_dir / "source.mp4"
+            muted = segment_dir / "source-muted.mp4"
+            prompt_path = segment_dir / "h3_prompt.txt"
+            for required in (source, muted, prompt_path):
+                if not required.is_file():
+                    raise FileNotFoundError(
+                        f"reusable segment artifact is missing: {required.name}"
+                    )
+            final_prompt = prompt_path.read_text(encoding="utf-8").strip()
+            if not final_prompt:
+                raise ValueError("reusable H3 prompt is empty")
+            item.update({
+                "source": source,
+                "resume_muted": muted,
+                "resume_prompt": final_prompt,
+                "resume_task_id": self._active_resume_task(
+                    project, self._segment_scope(index),
+                ),
+                "resume_output": self._completed_resume_output(
+                    project, segment_dir, self._segment_scope(index),
+                ),
+                "status": "running",
+            })
+            prepared.append(item)
+        prepared.sort(key=lambda item: int(item["index"]))
+        return project, prepared, replacement, state.get("effective_request") or {}
+
+    def validate_r2v_resume(self, project_id: str) -> None:
+        self._load_r2v_resume(project_id)
+
+    def resume_r2v(self, project_id: str) -> None:
+        project, prepared, replacement, request = self._load_r2v_resume(project_id)
+        log = ResearchLog(project)
+        node_prefix, artifact_suffix = self._next_resume_identity(project)
+        log.event("picsart_resume_started")
+        try:
+            self._progress(
+                project_id,
+                57,
+                "picsart-resume",
+                segments=[self._public_segment(item) for item in prepared],
+            )
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, len(prepared)),
+            ) as pool:
+                futures: list[concurrent.futures.Future[Path] | None] = []
+                for item in prepared:
+                    reusable = item.get("resume_output")
+                    if isinstance(reusable, Path):
+                        item["final_prompt"] = item["resume_prompt"]
+                        item["task_id"] = item.get("resume_task_id")
+                        item["status"] = "succeeded"
+                        futures.append(None)
+                        continue
+                    futures.append(pool.submit(
+                        self._generate_picsart_segment,
+                        project_id,
+                        item,
+                        replacement,
+                        request,
+                        log,
+                        final_prompt=item["resume_prompt"],
+                        muted=item["resume_muted"],
+                        node_prefix=node_prefix,
+                        artifact_suffix=artifact_suffix,
+                        existing_task_id=item.get("resume_task_id"),
+                    ))
+                outputs = [
+                    item["resume_output"] if future is None else future.result()
+                    for item, future in zip(prepared, futures)
+                ]
+
+            final = project / "output" / "generated.mp4"
+            self._progress(
+                project_id,
+                95,
+                "stitch-resume",
+                segments=[self._public_segment(item) for item in prepared],
+            )
+            self._node(
+                log,
+                "stitch-resume",
+                "project",
+                {
+                    "segments": outputs,
+                    "target_durations": [item["duration_s"] for item in prepared],
+                    "join_modes": [
+                        item.get("join_mode", "hard_cut") for item in prepared
+                    ],
+                    "output": final,
+                },
+                outputs,
+                lambda: media.concat(
+                    outputs,
+                    final,
+                    target_durations=[item["duration_s"] for item in prepared],
+                    join_modes=[
+                        item.get("join_mode", "hard_cut") for item in prepared
+                    ],
+                ),
+                lambda _value: [final],
+            )
+            self.store.update(
+                project_id,
+                status="succeeded",
+                has_video=True,
+                output_path="output/generated.mp4",
+                project_progress={
+                    "status": "succeeded",
+                    "percent": 100,
+                    "stage": "completed",
+                },
+                generation={
+                    "status": "succeeded",
+                    "stage": "completed",
+                    "error": None,
+                },
+                segments=[
+                    {**self._public_segment(item), "status": "succeeded"}
+                    for item in prepared
+                ],
+                error=None,
+            )
+            log.event("picsart_resume_succeeded", output=final)
+        except Exception as exc:
+            log.event("picsart_resume_failed", error=str(exc))
+            self.store.update(
+                project_id,
+                status="failed",
+                project_progress={
+                    "status": "failed",
+                    "percent": 57,
+                    "stage": "picsart_resume_failed",
+                },
+                generation={
+                    "status": "failed",
+                    "stage": "picsart_resume_failed",
+                    "error": "picsart_resume_failed",
+                },
+                segments=[self._public_segment(item) for item in prepared],
+                error={
+                    "code": "picsart_resume_failed",
+                    "message": "Picsart 后续链路执行失败",
+                },
+            )
+
     def _analyze_audio_dialogue(
         self,
         project_id: str,
@@ -933,59 +1229,128 @@ class Pipeline:
                 lambda: media.mute(item["source"], muted),
                 lambda _value: [muted],
             )
-            video_url = self.register_asset(project_id, muted)
-            image_url = (
-                self.register_asset(project_id, replacement) if replacement else None
-            )
-            output_request = request.get("output") or {}
-            provider_duration = max(5, math.ceil(float(item["duration_s"])))
-            submit_input = {
-                "model": "minimax-h3-max-r2v",
-                "prompt": final_prompt,
-                "videoUrls": [video_url],
-                "imageUrls": [image_url] if image_url else [],
-                "resolution": output_request.get("resolution", "768p"),
-                "duration": provider_duration,
-                "aspectRatio": output_request.get("aspect_ratio", "adaptive"),
-                "promptExpansionMode": "quality",
-            }
-            task_id = self._node(
+            return self._generate_picsart_segment(
+                project_id,
+                item,
+                replacement,
+                request,
                 log,
-                "picsart-submit",
-                scope,
-                submit_input,
-                [muted] + ([replacement] if replacement else []),
-                lambda: self.picsart.submit(
-                    prompt=final_prompt,
-                    video_url=video_url,
-                    image_url=image_url,
-                    duration=provider_duration,
-                    resolution=output_request.get("resolution", "768p"),
-                    aspect_ratio=output_request.get("aspect_ratio", "adaptive"),
-                ),
+                final_prompt=final_prompt,
+                muted=muted,
             )
+        except Exception:
+            item["status"] = "failed"
+            raise
+
+    def _generate_picsart_segment(
+        self,
+        project_id: str,
+        item: dict[str, Any],
+        replacement: Path | None,
+        request: dict[str, Any],
+        log: ResearchLog,
+        *,
+        final_prompt: str,
+        muted: Path,
+        node_prefix: str = "picsart",
+        artifact_suffix: str = "",
+        existing_task_id: str | None = None,
+    ) -> Path:
+        index = int(item["index"])
+        scope = self._segment_scope(index)
+        segment_dir = muted.parent
+        try:
+            task_id = existing_task_id
+            if task_id is None:
+                video_url = self.register_asset(project_id, muted)
+                provider_replacement = None
+                if replacement is not None:
+                    provider_replacement = (
+                        segment_dir / f"provider-reference{artifact_suffix}.png"
+                    )
+                    self._node(
+                        log,
+                        f"{node_prefix}-reference-image",
+                        scope,
+                        {"source": replacement, "output": provider_replacement},
+                        [replacement],
+                        lambda: media.provider_reference_png(
+                            replacement, provider_replacement,
+                        ),
+                        lambda _value: [provider_replacement],
+                    )
+                image_url = (
+                    self.register_asset(project_id, provider_replacement)
+                    if provider_replacement is not None
+                    else None
+                )
+                output_request = request.get("output") or {}
+                provider_duration = max(5, math.ceil(float(item["duration_s"])))
+                submit_input = {
+                    "workflow": PicsartClient.WORKFLOW,
+                    "prompt": final_prompt,
+                    "reference_video_urls": [video_url],
+                    "reference_image_urls": [image_url] if image_url else [],
+                    "resolution": str(
+                        output_request.get("resolution", "768p")
+                    ).upper(),
+                    "duration": provider_duration,
+                    "aspect_ratio": output_request.get(
+                        "aspect_ratio", "adaptive"
+                    ),
+                    "prompt_expansion_mode": "quality",
+                }
+                task_id = self._node(
+                    log,
+                    f"{node_prefix}-submit",
+                    scope,
+                    submit_input,
+                    [muted]
+                    + ([provider_replacement] if provider_replacement else []),
+                    lambda: self.picsart.submit(
+                        prompt=final_prompt,
+                        video_url=video_url,
+                        image_url=image_url,
+                        duration=provider_duration,
+                        resolution=output_request.get("resolution", "768p"),
+                        aspect_ratio=output_request.get(
+                            "aspect_ratio", "adaptive"
+                        ),
+                    ),
+                )
+            else:
+                log.event(
+                    "picsart_task_reused",
+                    segment_index=index,
+                    task_id=task_id,
+                )
             generated_url = self._node(
                 log,
-                "picsart-poll",
+                f"{node_prefix}-poll",
                 scope,
                 {"task_id": task_id},
                 [],
                 lambda: self.picsart.poll(task_id),
             )
-            downloaded = segment_dir / "h3-provider.mp4"
+            downloaded = segment_dir / f"h3-provider{artifact_suffix}.mp4"
             self._node(
                 log,
-                "picsart-download",
+                f"{node_prefix}-download",
                 scope,
                 {"url": generated_url, "task_id": task_id},
                 [],
                 lambda: self.picsart.download(generated_url, downloaded),
                 lambda path: [path],
             )
-            trimmed = segment_dir / "generated.mp4"
+            trimmed = segment_dir / f"generated{artifact_suffix}.mp4"
+            trim_node = (
+                "trim-provider-output-24fps"
+                if node_prefix == "picsart"
+                else f"{node_prefix}-trim-provider-output-24fps"
+            )
             self._node(
                 log,
-                "trim-provider-output-24fps",
+                trim_node,
                 scope,
                 {"source": downloaded, "target_duration_s": item["duration_s"]},
                 [downloaded],

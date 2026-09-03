@@ -762,6 +762,12 @@ def half_resolution_png(source: Path, destination: Path) -> Path:
     return destination
 
 
+def provider_reference_png(source: Path, destination: Path) -> Path:
+    """Derive the same bounded MiniMax PNG proxy used by duet-ad1."""
+
+    return half_resolution_png(source, destination)
+
+
 def _integer(value: object, label: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{label} must be an integer >= {minimum}")

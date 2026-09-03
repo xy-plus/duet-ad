@@ -52,6 +52,35 @@ class ExplodingPipeline:
         raise RuntimeError("background exploded")
 
 
+class ResumablePipeline:
+    def __init__(self, store: ProjectStore) -> None:
+        self.store = store
+        self.validated: list[str] = []
+        self.resumed: list[str] = []
+
+    def run(self, _project_id: str) -> None:
+        raise AssertionError("full pipeline must not run during Picsart resume")
+
+    def validate_r2v_resume(self, project_id: str) -> None:
+        self.validated.append(project_id)
+
+    def resume_r2v(self, project_id: str) -> None:
+        self.resumed.append(project_id)
+        project = self.store.path(project_id)
+        output = project / "output" / "generated.mp4"
+        output.write_bytes(b"resumed-video")
+        self.store.update(
+            project_id,
+            status="succeeded",
+            has_video=True,
+            output_path="output/generated.mp4",
+            project_progress={
+                "status": "succeeded", "percent": 100, "stage": "completed",
+            },
+            generation={"status": "succeeded", "stage": "completed", "error": None},
+        )
+
+
 def settings(tmp_path: Path, *, max_upload_mb: int = 1) -> Settings:
     return Settings(
         access_token="test-secret",
@@ -137,6 +166,51 @@ def test_login_and_api_auth_fail_closed_with_structured_json_errors(tmp_path: Pa
         assert client.post("/api/login", json={"token": "wrong"}).status_code == 401
         assert client.post("/api/login", json={"token": "test-secret"}).json() == {"ok": True}
         assert client.get("/api/capabilities", headers=AUTH).status_code == 200
+
+
+def test_failed_project_picsart_resume_requires_confirmation_and_skips_full_run(
+    tmp_path: Path,
+):
+    app = create_app(
+        settings(tmp_path),
+        pipeline_factory=lambda _settings, store, _register_asset: ResumablePipeline(store),
+    )
+    project_id, _project, _state = app.state.store.create({}, "resume-request")
+    app.state.store.update(
+        project_id,
+        status="failed",
+        project_progress={"status": "failed", "percent": 57, "stage": "pipeline_failed"},
+        generation={"status": "failed", "stage": "pipeline_failed", "error": "failed"},
+    )
+
+    with TestClient(app) as client:
+        unconfirmed = client.post(
+            f"/api/conversations/{project_id}/resume-picsart",
+            headers=AUTH,
+            json={"confirm": False},
+        )
+        assert unconfirmed.status_code == 400
+        assert unconfirmed.json()["detail"]["code"] == "confirmation_required"
+
+        accepted = client.post(
+            f"/api/conversations/{project_id}/resume-picsart",
+            headers=AUTH,
+            json={"confirm": True},
+        )
+        assert accepted.status_code == 202
+        assert accepted.json()["project_progress"]["stage"] == "picsart_resume_queued"
+        terminal = wait_for_status(client, project_id, "succeeded")
+        assert terminal["has_video"] is True
+        assert app.state.pipeline.validated == [project_id]
+        assert app.state.pipeline.resumed == [project_id]
+
+        repeated = client.post(
+            f"/api/conversations/{project_id}/resume-picsart",
+            headers=AUTH,
+            json={"confirm": True},
+        )
+        assert repeated.status_code == 409
+        assert repeated.json()["detail"]["code"] == "project_not_failed"
 
 
 def test_create_uses_exact_recovery_shape_fixed_paths_and_four_public_statuses(tmp_path: Path):
@@ -334,11 +408,18 @@ def test_provider_asset_signature_binds_project_asset_id_token_and_real_path(tmp
         signed = urlsplit(app.state.register_asset(first["id"], source))
         token = parse_qs(signed.query)["token"][0]
         asset_id = signed.path.rsplit("/", 1)[-1]
+        assert asset_id.endswith(".mp4")
 
         delivered = client.get(f"{signed.path}?{signed.query}")
         assert delivered.status_code == 200
         assert delivered.content == b"first"
+        metadata = client.head(f"{signed.path}?{signed.query}")
+        assert metadata.status_code == 200
+        assert metadata.content == b""
+        assert metadata.headers["content-length"] == str(len(b"first"))
+        assert metadata.headers["content-type"].startswith("video/mp4")
         assert client.get(f"{signed.path}?token=wrong").status_code == 404
+        assert client.head(f"{signed.path}?token=wrong").status_code == 404
         assert client.get(
             f"/internal/provider-assets/{first['id']}/different?token={token}"
         ).status_code == 404
@@ -372,6 +453,7 @@ def test_provider_asset_preserves_replacement_image_media_type(tmp_path: Path):
             app.state.store.path(created["id"]) / "inputs" / "replacement-image"
         )
         signed = urlsplit(app.state.register_asset(created["id"], replacement))
+        assert signed.path.endswith(".png")
 
         delivered = client.get(f"{signed.path}?{signed.query}")
         assert delivered.status_code == 200

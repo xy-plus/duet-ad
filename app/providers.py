@@ -519,7 +519,7 @@ class MediaKitClient:
 
 
 class PicsartClient:
-    MODEL = "minimax-h3-max-r2v"
+    WORKFLOW = "minimax/h3-max/reference-to-video"
 
     def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None) -> None:
         self.settings = settings
@@ -535,17 +535,17 @@ class PicsartClient:
         resolution: str,
         aspect_ratio: str,
     ) -> ProviderResult[str]:
-        inner: dict[str, Any] = {
+        params: dict[str, Any] = {
             "prompt": prompt,
-            "videoUrls": [video_url],
-            "resolution": resolution,
+            "reference_video_urls": [video_url],
+            "resolution": resolution.upper(),
             "duration": duration,
-            "aspectRatio": aspect_ratio,
-            "promptExpansionMode": "quality",
+            "aspect_ratio": aspect_ratio,
+            "prompt_expansion_mode": "quality",
         }
         if image_url:
-            inner["imageUrls"] = [image_url]
-        body = {"params": {"model": self.MODEL, "params": inner}}
+            params["reference_image_urls"] = [image_url]
+        body = {"params": params}
         record: dict[str, Any] | None = None
         try:
             with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
@@ -553,7 +553,7 @@ class PicsartClient:
                     response, record = _send(
                         client,
                         "POST",
-                        f"{self.settings.picsart_api_base}/workflows/v1/models/submit",
+                        f"{self.settings.picsart_api_base}/workflows/{self.WORKFLOW}/submit",
                         headers=_headers(self.settings.picsart_api_key),
                         json_body=body,
                     )
@@ -582,7 +582,7 @@ class PicsartClient:
     def poll(self, task_id: str) -> ProviderResult[str]:
         record: dict[str, Any] = {"task_id": task_id, "polls": []}
         poll_url = (
-            f"{self.settings.picsart_api_base}/workflows/v1/models/{task_id}/result"
+            f"{self.settings.picsart_api_base}/workflows/{self.WORKFLOW}/{task_id}/result"
         )
         deadline = time.monotonic() + self.settings.provider_poll_timeout_s
         try:
@@ -609,13 +609,12 @@ class PicsartClient:
                         result = envelope.get("result")
                         if not isinstance(result, dict):
                             raise TypeError("Picsart completed result must be an object")
-                        url = result.get("url")
+                        video = result.get("video")
+                        if not isinstance(video, dict):
+                            raise TypeError("Picsart completed result must contain a video object")
+                        url = video.get("url")
                         if not isinstance(url, str) or not url:
-                            items = result.get("items")
-                            first = items[0] if isinstance(items, list) and items else None
-                            url = first.get("url") if isinstance(first, dict) else None
-                        if not isinstance(url, str) or not url:
-                            raise ValueError("Picsart completed result has no URL")
+                            raise ValueError("Picsart completed video has no URL")
                         return ProviderResult(url, record)
                     if status == "FAILED":
                         raise RuntimeError("Picsart task failed: " + json.dumps(envelope, ensure_ascii=False))

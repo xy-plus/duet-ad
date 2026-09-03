@@ -35,6 +35,12 @@ UPLOAD_CHUNK_BYTES = MIB
 CREATION_REQUEST_OVERHEAD_BYTES = 4 * MIB
 PROVIDER_ASSET_TTL_S = 24 * 60 * 60
 REPLACEMENT_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+PROVIDER_ASSET_SUFFIXES = {
+    "video/mp4": ".mp4",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
 PUBLIC_PROJECT_FILES = {
     "source.mp4": ("inputs/source.mp4", "video/mp4"),
     "generated.mp4": ("output/generated.mp4", "video/mp4"),
@@ -252,16 +258,18 @@ def create_app(
                     media_type = declared_type
         now = time.time()
         asset_id = secrets.token_urlsafe(18)
+        asset_name = asset_id + PROVIDER_ASSET_SUFFIXES.get(media_type or "", "")
         token = secrets.token_urlsafe(32)
         with app.state.assets_lock:
             expired = [key for key, record in app.state.assets.items() if record["expires_at"] < now]
             for key in expired:
                 app.state.assets.pop(key, None)
-            while asset_id in app.state.assets:
+            while asset_name in app.state.assets:
                 asset_id = secrets.token_urlsafe(18)
-            app.state.assets[asset_id] = {
+                asset_name = asset_id + PROVIDER_ASSET_SUFFIXES.get(media_type or "", "")
+            app.state.assets[asset_name] = {
                 "project_id": project_id,
-                "asset_id": asset_id,
+                "asset_id": asset_name,
                 "token": token,
                 "path": owned_path,
                 "media_type": media_type or "application/octet-stream",
@@ -269,7 +277,7 @@ def create_app(
             }
         return (
             f"{configured.public_base_url}/internal/provider-assets/"
-            f"{quote(project_id, safe='')}/{quote(asset_id, safe='')}?token={quote(token, safe='')}"
+            f"{quote(project_id, safe='')}/{quote(asset_name, safe='')}?token={quote(token, safe='')}"
         )
 
     app.state.register_asset = register_asset
@@ -283,11 +291,11 @@ def create_app(
         app.state.store.close()
         raise
 
-    def pipeline_entry(project_id: str) -> None:
+    def pipeline_entry(project_id: str, operation: str = "run") -> None:
         with app.state.pipeline_workers_lock:
             app.state.pipeline_workers += 1
         try:
-            app.state.pipeline.run(project_id)
+            getattr(app.state.pipeline, operation)(project_id)
             state = app.state.store.read(project_id)
             if state["status"] not in {"succeeded", "failed"}:
                 app.state.store.mark_failed(
@@ -439,6 +447,53 @@ def create_app(
     async def conversation(project_id: str, request: Request):
         return _read_project(_store(request), project_id)
 
+    @app.post(
+        "/api/conversations/{project_id}/resume-picsart",
+        status_code=202,
+        dependencies=[Depends(require_auth)],
+    )
+    async def resume_picsart(project_id: str, request: Request):
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise _error(400, "invalid_json", "请求体必须是 JSON 对象") from None
+        if not isinstance(body, dict) or body.get("confirm") is not True:
+            raise _error(400, "confirmation_required", "必须明确确认续跑 Picsart")
+        store = _store(request)
+        state = _read_project(store, project_id)
+        if state.get("status") != "failed":
+            raise _error(409, "project_not_failed", "只有失败项目可以续跑 Picsart")
+        try:
+            app.state.pipeline.validate_r2v_resume(project_id)
+        except (FileNotFoundError, TypeError, ValueError, OSError):
+            raise _error(
+                409,
+                "picsart_resume_not_ready",
+                "项目缺少可复用的 Picsart 前置产物",
+            ) from None
+        state = store.update(
+            project_id,
+            status="queued",
+            has_video=False,
+            project_progress={
+                "status": "queued",
+                "percent": 0,
+                "stage": "picsart_resume_queued",
+            },
+            generation={
+                "status": "queued",
+                "stage": "picsart_resume_queued",
+                "error": None,
+            },
+            error=None,
+        )
+        task = asyncio.create_task(
+            asyncio.to_thread(pipeline_entry, project_id, "resume_r2v")
+        )
+        app.state.tasks.add(task)
+        task.add_done_callback(app.state.tasks.discard)
+        return state
+
     @app.get("/api/conversations/{project_id}/creation-input/replacement-image", dependencies=[Depends(require_auth)])
     async def replacement(project_id: str, request: Request):
         store = _store(request)
@@ -466,7 +521,10 @@ def create_app(
         path = _project_file(store, project_id, target[0])
         return FileResponse(path, media_type=target[1])
 
-    @app.get("/internal/provider-assets/{project_id}/{asset_id}")
+    @app.api_route(
+        "/internal/provider-assets/{project_id}/{asset_id}",
+        methods=["GET", "HEAD"],
+    )
     async def provider_asset(project_id: str, asset_id: str, token: str):
         now = time.time()
         with app.state.assets_lock:
