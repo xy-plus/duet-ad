@@ -40,6 +40,7 @@ _MINIMAL_CREATION_FROZEN_FIELDS = (
     "input_receipt",
     "creation_input",
     "_minimal_replacement_image_path",
+    "_public_api",
 )
 
 

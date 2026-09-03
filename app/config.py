@@ -62,12 +62,23 @@ class Settings:
     enable_pipeline: bool = False
     # 极简创建是独立的发布合同；默认关闭，待完整后端链就绪后一次启用。
     enable_minimal_creation: bool = False
+    # 第三方 API 与内部 UI 使用完全独立的鉴权域。默认关闭，避免升级后意外暴露。
+    public_api_enabled: bool = False
+    public_api_clients_file: Path = Path(
+        "/home/xy/.config/duet-ad1/public-api-clients.json"
+    )
 
     def __post_init__(self) -> None:
         credential_file = Path(self.deepseek_credential_file)
         if not credential_file.is_absolute():
             raise ValueError("deepseek_credential_file must be absolute")
         object.__setattr__(self, "deepseek_credential_file", credential_file)
+        clients_file = Path(self.public_api_clients_file)
+        if not clients_file.is_absolute():
+            raise ValueError("public_api_clients_file must be absolute")
+        object.__setattr__(self, "public_api_clients_file", clients_file)
+        if self.public_api_enabled and not Path(self.data_dir).is_absolute():
+            raise ValueError("data_dir must be absolute when public API is enabled")
         if self.h3_gateway_storage_root is not None:
             root = Path(self.h3_gateway_storage_root)
             if not root.is_absolute():
@@ -224,4 +235,11 @@ def get_settings() -> Settings:
         enable_minimal_creation=os.environ.get(
             "ENABLE_MINIMAL_CREATION", ""
         ).lower() in ("1", "true", "yes"),
+        public_api_enabled=os.environ.get(
+            "PUBLIC_API_ENABLED", ""
+        ).lower() in ("1", "true", "yes"),
+        public_api_clients_file=Path(os.environ.get(
+            "PUBLIC_API_CLIENTS_FILE",
+            "/home/xy/.config/duet-ad1/public-api-clients.json",
+        )),
     )

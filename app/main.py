@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Mapping
 from dataclasses import replace
@@ -39,6 +40,8 @@ from app import (
     postprocess,
     prepared_input,
     project_progress,
+    public_api,
+    public_credits,
     published_preview,
     skill_milestone,
     stitch,
@@ -3829,9 +3832,14 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.middleware("http")
     async def prevent_stale_web_contracts(request: Request, call_next):
+        if request.url.path.startswith("/api/v1/"):
+            request.state.public_request_id = f"req_{uuid.uuid4().hex}"
         response = await call_next(request)
         if request.method in {"GET", "HEAD"} and request.url.path in _NO_STORE_WEB_PATHS:
             response.headers["Cache-Control"] = "no-store"
+        if request.url.path.startswith("/api/v1/"):
+            response.headers["Cache-Control"] = "private, no-store"
+            response.headers["X-Request-ID"] = request.state.public_request_id
         return response
 
     limiter = _RateLimiter()
@@ -4300,6 +4308,7 @@ def create_app(settings: Settings) -> FastAPI:
         client_request_id: str,
         generation_request_json: str,
         replacement_image: UploadFile | None,
+        public_context: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         allowed = {
             "file",
@@ -4408,49 +4417,116 @@ def create_app(settings: Settings) -> FastAPI:
                     "generation_config": parsed.internal_processing,
                     project_progress.PROGRESS_FLOOR_FIELD: 0,
                 }
-                with storage.creation_lock(settings.data_dir):
-                    existing = next(
-                        (
-                            item
-                            for item in storage.list_conversations(
-                                settings.data_dir
-                            )
-                            if item.get("client_request_id")
-                            == client_request_id
-                        ),
-                        None,
+                public_request_sha256 = None
+                if public_context is not None:
+                    descriptor = public_context.get("request_descriptor")
+                    if not isinstance(descriptor, Mapping):
+                        raise _minimal_http_exception(
+                            422, "invalid_create_request",
+                            message="公共创建请求缺少冻结输入",
+                        )
+                    source_identity = (
+                        {
+                            "kind": "upload",
+                            "sha256": frozen_source.sha256,
+                            "bytes": frozen_source.bytes,
+                        }
+                        if file is not None
+                        else {"kind": "url", "url": reference_url}
                     )
+                    replacement_identity = (
+                        None
+                        if frozen_replacement is None
+                        else {
+                            "sha256": frozen_replacement.sha256,
+                            "bytes": frozen_replacement.bytes,
+                        }
+                    )
+                    public_request_sha256 = minimal_creation.canonical_json_sha256({
+                        "request": dict(descriptor),
+                        "source": source_identity,
+                        "replacement_image": replacement_identity,
+                    })
+                with storage.creation_lock(settings.data_dir):
+                    if public_context is None:
+                        existing = next(
+                            (
+                                item
+                                for item in storage.list_conversations(
+                                    settings.data_dir
+                                )
+                                if item.get("client_request_id")
+                                == client_request_id
+                            ),
+                            None,
+                        )
+                    else:
+                        owner_id = public_context.get("owner_id")
+                        idempotency_digest = public_context.get(
+                            "idempotency_digest"
+                        )
+                        existing = next(
+                            (
+                                item
+                                for item in storage.list_conversations(
+                                    settings.data_dir
+                                )
+                                if isinstance(item.get("_public_api"), Mapping)
+                                and item["_public_api"].get("owner_id") == owner_id
+                                and item["_public_api"].get("idempotency_digest")
+                                == idempotency_digest
+                            ),
+                            None,
+                        )
                     if existing is not None:
-                        receipt = existing.get("input_receipt")
-                        expected_replacement = (
-                            None
-                            if frozen_replacement is None
-                            else {
-                                "sha256": frozen_replacement.sha256,
-                                "bytes": frozen_replacement.bytes,
-                            }
-                        )
-                        same = (
-                            isinstance(receipt, Mapping)
-                            and receipt.get("version") == 1
-                            and receipt.get("generation_request_sha256")
-                            == parsed.generation_request_sha256
-                            and receipt.get("source")
-                            == {
-                                "sha256": frozen_source.sha256,
-                                "bytes": frozen_source.bytes,
-                            }
-                            and receipt.get("replacement_image")
-                            == expected_replacement
-                        )
+                        if public_context is not None:
+                            public_receipt = existing.get("_public_api")
+                            same = bool(
+                                isinstance(public_receipt, Mapping)
+                                and public_receipt.get("request_sha256")
+                                == public_request_sha256
+                            )
+                        else:
+                            receipt = existing.get("input_receipt")
+                            expected_replacement = (
+                                None
+                                if frozen_replacement is None
+                                else {
+                                    "sha256": frozen_replacement.sha256,
+                                    "bytes": frozen_replacement.bytes,
+                                }
+                            )
+                            same = (
+                                isinstance(receipt, Mapping)
+                                and receipt.get("version") == 1
+                                and receipt.get("generation_request_sha256")
+                                == parsed.generation_request_sha256
+                                and receipt.get("source")
+                                == {
+                                    "sha256": frozen_source.sha256,
+                                    "bytes": frozen_source.bytes,
+                                }
+                                and receipt.get("replacement_image")
+                                == expected_replacement
+                            )
                         if not same:
                             raise _minimal_http_exception(
                                 409,
-                                "client_request_id_conflict",
-                                message=(
-                                    "client_request_id 已绑定到不同的创建输入"
+                                (
+                                    "idempotency_key_reused"
+                                    if public_context is not None
+                                    else "client_request_id_conflict"
                                 ),
-                                field="client_request_id",
+                                message=(
+                                    "Idempotency-Key 已绑定到不同的创建输入"
+                                    if public_context is not None
+                                    else "client_request_id 已绑定到不同的创建输入"
+                                ),
+                                field=(
+                                    "Idempotency-Key"
+                                    if public_context is not None
+                                    else "client_request_id"
+                                ),
                             )
                         published = existing
                         response.status_code = 200
@@ -4467,6 +4543,33 @@ def create_app(settings: Settings) -> FastAPI:
                                 429,
                                 "queue_full",
                                 message="当前任务队列已满",
+                            )
+                        if public_context is not None:
+                            job_id = f"vg_{cid}"
+                            meta["_public_api"] = {
+                                "version": 1,
+                                "job_id": job_id,
+                                "owner_id": public_context["owner_id"],
+                                "creator_key_id": public_context[
+                                    "creator_key_id"
+                                ],
+                                "idempotency_digest": public_context[
+                                    "idempotency_digest"
+                                ],
+                                "request_sha256": public_request_sha256,
+                                "parameters": dict(
+                                    public_context["parameters"]
+                                ),
+                                "credits_per_cny": 100,
+                                "quoted_credits": 1000,
+                                "quoted_amount_minor": 1000,
+                                "currency": "CNY",
+                                "price_version": public_credits.PRICE_VERSION,
+                            }
+                            public_credits.reserve(
+                                settings.data_dir,
+                                str(public_context["owner_id"]),
+                                job_id,
                             )
                         published = storage.publish_staged_creation(
                             settings.data_dir,
@@ -6448,6 +6551,21 @@ def create_app(settings: Settings) -> FastAPI:
             status_code=status_code,
             content=content,
             background=background_tasks,
+        )
+
+    if settings.public_api_enabled:
+        public_api.install(
+            app,
+            settings,
+            create_job=create_minimal_conversation,
+            valid_generated_video=lambda meta: _has_valid_generated_video(
+                settings, meta
+            ),
+            progress_for=lambda meta, has_video: (
+                project_progress.aggregate_project_progress(
+                    meta, has_video=has_video
+                ).get("percent")
+            ),
         )
 
     web = Path(__file__).resolve().parent.parent / "web"
