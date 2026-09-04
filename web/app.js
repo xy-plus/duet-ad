@@ -1693,7 +1693,7 @@ function renderList() {
     content.appendChild(identity);
     const footer = el("span", "conv-footer");
     const progress = projectProgressModel(c);
-    footer.appendChild(el("span", null, progress.elapsedLabel + " " + progress.elapsed));
+    footer.appendChild(el("span", null, progress.elapsed));
     const cardTime = progress.loading ? c.created_at : (c.updated_at || c.created_at);
     footer.appendChild(el("span", "conv-time", fmtTime(cardTime)));
     footer.appendChild(el("span", "conv-output " + (c.has_video === true ? "is-ready" : "is-waiting"),

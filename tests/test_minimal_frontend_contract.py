@@ -880,7 +880,7 @@ def test_sidebar_project_cards_restore_0903_information_density_and_manual_selec
         "formatDuration(c.duration_s)",
         'el("span", "conv-footer")',
         "const progress = projectProgressModel(c);",
-        'progress.elapsedLabel + " " + progress.elapsed',
+        'el("span", null, progress.elapsed)',
         "progress.loading ? c.created_at : (c.updated_at || c.created_at)",
         'el("span", "conv-time", fmtTime(cardTime))',
         'el("span", "conv-output " + (c.has_video === true ? "is-ready" : "is-waiting")',
@@ -891,6 +891,7 @@ def test_sidebar_project_cards_restore_0903_information_density_and_manual_selec
     assert "segment_count" not in render_list
     assert "operationTimeline" not in render_list
     assert "timeline.current.label" not in render_list
+    assert "progress.elapsedLabel" not in render_list
 
     assert 'c.id === state.currentId ? " selected" : ""' in render_list
     click_handler = render_list.split('item.addEventListener("click", () => {', 1)[1]
