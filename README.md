@@ -2,14 +2,14 @@
 
 这是从 `github-xy-plus/Master@043166b13f21fdf715390b964e843be2c010ddcf` 的极简前端出发建立的独立研究仓库。它不依赖 `/home/xy/duet-ad1` 的运行目录，也不修改源仓库。
 
-后端使用 Python 3.12、FastAPI 和纯文件系统存储。上游保持固定 Master 的视频分析语义；`video-maker` 之后由后端选定的 Fusion 执行器运行逐段提示词 Skill，再调用 Picsart `minimax-h3-max-r2v`，最后裁回源片段时长并合并。当前部署的新项目固定使用 DeepSeek，前端和公开 API 均不暴露模型选择。
+后端使用 Python 3.12、FastAPI 和纯文件系统存储。上游保持固定 Master 的视频分析语义；`video-maker` 先生成项目级原始索引，再由 DeepSeek Object Replace 一次性冻结全项目的替换与人物音色，后端机械合并为增强索引。此后的逐段 Fusion 只把增强索引编译为 H3 提示词，再调用 Picsart `minimax-h3-max-r2v`，最后裁回源片段时长并合并。Fusion 执行器由后端选定，前端和公开 API 均不暴露模型选择。
 
 ## 研究版边界
 
-- 不增加媒体质量、替换成功率、人物一致性、台词、口型、分辨率或成片可播放性门禁。
-- 不增加模型输出质量重试、CAS、幂等冲突、恢复状态机或旧生产回执框架。
-- 只保留鉴权、解析、项目与路径归属、SSRF、命令参数隔离、请求大小、供应商必填组装和超时等技术边界。
-- 每个执行节点首次失败后最多重试一次。Picsart submit 在未取得任务 ID 的未知结果下也会重提；研究方案明确接受可能重复付费的风险。
+- 不增加媒体质量、替换成功率、人物一致性、台词、口型、模型语义覆盖或成片观感门禁。只要节点结果能按结构传给下一节点，就不因“做得不够好”拦截、失败或重试。
+- closed Schema 只保证 JSON 形状、字段类型和本次输入绑定，不承担业务语义复审。Skill 里的替换与音色规则是生成职责，不是后端再次评分的通过条件。
+- 只保留鉴权、解析、项目与路径归属、SSRF、命令参数隔离、请求大小、必要媒体可用性、Picsart 硬参数限制、付费提交幂等和超时等技术边界。
+- 普通执行节点首次失败后最多重试一次；Picsart submit 不做通用重试。发出 POST 前先持久化不可自动重投的提交回执，只有供应商明确拒绝时才允许后续重提；未知结果必须人工对账。
 - 日志故意保存未脱敏的请求、响应、鉴权信息、签名 URL 和媒体副本。日志仅存服务器本地，不通过 API 提供，目录权限为 `0700`、文件权限为 `0600`。
 - 当前实现只支持单进程实例。后台任务、签名素材 token 与文件状态不支持多 worker 共享。
 
@@ -22,15 +22,18 @@
   -> MediaKit 可选去字幕、去标志
   -> video-maker 逐段视觉描述
   -> 项目级台词翻译
-  -> video-maker 项目级对象索引
-  -> 项目级 Fusion 从 30 条音色目录选择并冻结唯一参考音色
-  -> 各段并行：内部 Fusion -> 同一 Audio 1 + H3 Max R2V -> 裁回源时长
+  -> video-maker 项目级原始对象索引
+  -> 一次项目级 DeepSeek Object Replace：全局索引 + 全部视觉提示 + Image 1/说明 + 当前音色目录
+  -> 后端机械合并增强索引；按可用 voice_id 生成全项目 Audio 1..N（N <= 3）
+  -> 第一屏障：所有段并行完成 Fusion、best-effort 约束编译、最终提示词和静音 Video 1
+  -> 第二屏障：所有段完成 Image 1 归一化、素材注册和 H3 参数预检
+  -> 各段并行 H3：Video 1 + 可选 Image 1 + 全项目同序 Audio 1..N -> 裁回源时长
   -> 顺序合并 generated.mp4
 ```
 
-`video-maker` 的两个历史阶段、项目级翻译和 DeepSeek Fusion 都通过 DeepSeek Responses API 的原生 `text.format=json_schema` 输出 closed JSON；不使用工具调用、`tool_choice` 或虚构的提交函数。新 H3 提示词 Skill 的两种内部执行器共用同一份 closed JSON Schema；Schema 动态绑定本段 `input_sha256` 与 `segment_index`，后端再次严格解包 `prompt`，再机械附加翻译台词及冻结时间窗。DeepSeek thinking 以 `reasoning.effort=high` 显式开启，请求不设置供应商级 `max_output_tokens`；业务结果仍由各节点本地合同校验。
+`video-maker` 的两个历史阶段、项目级翻译、Object Replace 和 DeepSeek Fusion 都通过 DeepSeek Responses API 的原生 `text.format=json_schema` 输出 closed JSON；不使用工具调用、`tool_choice` 或虚构的提交函数。Schema 只约束可传递的结构和输入绑定：Object Replace 的 patch 中 `replacement` 与人物 `voice_id` 都允许为 `null`，后端不复审人物/场景是否替换正确、用户对象是否命中、普通实体是否达到数量或关系是否闭包；Fusion 只校验 closed 结构、`input_sha256` 和 `segment_index`，不检查正文是否覆盖 stable ID、`Image 1` 或 `Audio N`。DeepSeek thinking 以 `reasoning.effort=high` 显式开启，请求不设置供应商级 `max_output_tokens`。
 
-音色目录位于 `/home/xy/duet-ad1-h3-max-r2v/assets/voice-library`。30 条音频均为 2–5 秒单声道 PCM WAV；模型只接收每条一行、用 ` - ` 分隔的短描述，不接收目录 JSON。完整来源标签、许可、哈希和剪辑说明保留在后端目录与项目快照中。没有 spoken 台词的项目不选择、不上传音色。
+音色目录位于 `/home/xy/duet-ad1-h3-max-r2v/assets/voice-library`。当前随仓库提供 30 条 2–5 秒单声道 PCM WAV；运行时只要求目录中存在可用条目，不把“恰好 30 条”设为门禁，也不复审年龄、性格等标签是否与声音主观相符。Object Replace 每条只接收一行 `voice_id - file - language - gender - 短特征`。Skill 仍负责为人物选择合适音色；后端只消费可用选择，并按稳定人物顺序保留最先出现的最多 3 个不同 `voice_id`，后续新增音色稳定降级为 `null`，再机械映射为 `Audio 1..N`。Picsart 的每个 segment 接收同一份、同一顺序的 0–3 条参考音频。
 
 ## 配置
 
@@ -38,7 +41,7 @@
 
 - `ACCESS_TOKEN`：前端登录 Bearer token；禁止使用缺省或空值。
 - `DEEPSEEK_API_KEY`、`PICSART_API_KEY`。DeepSeek 仍负责 video-maker 和翻译。
-- `FUSION_AGENT`：内部 Fusion 执行器，只能为 `codex` 或 `deepseek`，当前部署为 `deepseek`。客户端传入的同名字段会被忽略，服务端选择在创建时冻结；历史项目保留原冻结值用于续跑。
+- `FUSION_AGENT`：内部逐段 Fusion 执行器，只能为 `codex` 或 `deepseek`，缺省值为 `deepseek`。客户端传入的同名字段会被忽略，服务端选择在创建时冻结；Object Replace 则固定为项目级 DeepSeek 节点，不受该配置影响。
 - Codex Fusion 固定通过 `/home/xy/.local/bin/codex-acct acct2 exec` 使用 `gpt-5.6-sol`、reasoning `low`；`CODEX_TIMEOUT_S` 和 `CODEX_CONCURRENCY` 只控制执行边界，不改变账号、模型或 reasoning。
 - 启用 MediaKit 时提供 `VOLC_MEDIAKIT_API_KEY`。
 - `PUBLIC_BASE_URL`：Picsart 能从公网访问的 HTTPS 服务根地址，不能使用 loopback 地址。
@@ -60,13 +63,17 @@ python3 /home/xy/duet-ad1-h3-max-r2v/run.py
 /home/xy/duet-ad1-h3-max-r2v/data/projects/{project_id}/
   state.json
   inputs/
+  work/element_index.json
+  work/enhanced_element_index.json
   work/segments/{segment_id}/
-  work/voice-reference.wav
+  work/voice-references/audio-01.wav ... audio-03.wav
   output/generated.mp4
   logs/
 ```
 
-重启时遗留的 `queued/running` 项目会失败为 `process_restarted`，不做断点恢复。通用文件接口只暴露源视频和最终视频，不能读取状态、日志或中间文件。
+`work/element_index.json` 与 `state.element_index` 保存 video-maker 原始结果；`work/enhanced_element_index.json` 与 `state.enhanced_element_index` 保存后端机械合并的 replacement/voice patch。`state.object_replace` 保存版本、输入哈希和目录哈希，`state.voice_references` 按 `Audio 1..N` 顺序冻结实际可用的文件路径与哈希。`state.h3_prepared_artifacts` v2 把各段 prompt/源片段/静音片段哈希绑定到增强索引、音色列表、Object Replace 输入、可选替换图、输出配置，以及每段的起止时间、时长和 join mode。它用于保证恢复时复用的是同一批技术输入，不判断替换质量。`state.picsart_submission_receipts` 是付费提交恢复的权威账本；签名 URL 不持久化。
+
+重启时遗留的 `queued/running` 项目会失败为 `process_restarted`，不做自动断点恢复。`resume-pre-picsart` 只接受没有任何 Picsart submit 痕迹的项目；它可复用仍可读取的切段、帧、MediaKit 和逐段视觉产物，然后重新进入翻译、原始索引、Object Replace 和增强索引屏障。`resume-picsart` 只复用 v2 manifest 冻结的 `h3_prompt.txt`、静音 Video 1、可选 Image 1 和参考音频，不重跑 Object Replace/Fusion；恢复时只校验文件、哈希、路径和请求绑定等技术一致性，不复审 enhanced index 的替换/音色语义。只有新字段缺失的旧项目才使用兼容回退。通用文件接口只暴露源视频和最终视频，不能读取状态、日志或中间文件。
 
 ## 验证
 
@@ -77,3 +84,7 @@ python3 -m pytest /home/xy/duet-ad1-h3-max-r2v/tests -q
 ```
 
 真实供应商冒烟测试需要另行明确授权，并且必须先配置可公网回源的 `PUBLIC_BASE_URL`。
+
+非空 `client_request_id` 会持久绑定规范化请求、源视频内容和可选替换图内容。首次创建返回 `201`；相同 ID 与相同输入的重放返回原项目 `200`，不会重写输入或再次启动流水线；相同 ID 绑定不同输入时返回 `409`。索引损坏或无法证明绑定关系时以 `503` 停止创建，避免产生第二个可能付费的项目。
+
+当前完整离线结果：`251 passed, 1 warning`。

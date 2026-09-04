@@ -93,14 +93,19 @@ def classify_segment(
     end_ms: int,
     windows: Sequence[VocalWindow],
 ) -> str | None:
-    """Classify an ASR interval using exact overlap-duration weighting."""
+    """Classify an ASR interval using exact overlap-duration weighting.
+
+    Missing acoustic coverage is an absence of classification evidence, not an
+    invalid ASR result.  Preserve the line for provenance and let callers move
+    on with an unclassified result instead of failing the whole project.
+    """
     overlapping = [
         window
         for window in windows
         if window.start_ms < end_ms and window.end_ms > start_ms
     ]
     if not overlapping:
-        raise VocalError("转录片段没有重叠的声学分类窗口")
+        return None
     values = [
         value
         for window in overlapping

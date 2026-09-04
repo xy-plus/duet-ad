@@ -1,0 +1,28 @@
+---
+name: object-replace
+description: 基于 video-maker 的稳定全局索引、全部分段视频描述、用户替换要求和 Image 1，规划项目级元素替换，并从固定音色目录为每个人物选择 voice_id。用于在逐段 Fusion 前冻结唯一的替换与人物音色权威，不生成最终视频提示词。
+---
+
+# Object Replace
+
+只规划替换和人物音色，不重写原视频事实、稳定 ID、occurrences、preserve 或 relations。输出格式以本次注入的 JSON Schema 为唯一权威；逐字回填固定的 `schema`、`version` 和 `input_sha256`，覆盖 Schema 列出的每个稳定 ID，不增删字段，不输出 Markdown。
+
+后端只检查输出能否按 Schema 结构、输入绑定和稳定 ID 机械传给下游，不会二次判断替换是否充分、对象是否匹配或音色是否最优；完成下列语义要求是本节点自身职责。
+
+输入中的 `global_element_index` 是 video-maker 的只读事实；`segment_visual_prompts` 用于理解动作和跨段语境。用户上传的替换图片在模型输入中称为 Image 1。`voice_catalog_lines` 每行格式为 `voice_id - file - language - gender - 短特征`；这些标签和文件对应关系不可改写或补猜。
+
+## 替换规划
+
+1. 用户替换要求与 Image 1 必须同时存在或同时不存在。存在时，将要求匹配到所有相关稳定 ID：把这些记录的 `matches_user_request` 设为 `true`，`replacement.source` 设为 `image_1`，并在 `target_visual_description` 中明确写成 Image 1 里的对应对象；不得只写“按用户要求替换”，也不得把整张参考图的背景当成目标对象。
+2. 每个人物都必须设置非空 `replacement`。保留源索引明确给出的性别、种族与整体风格，换成明显不同的新脸；服装保持原颜色和风格，款式略有变化。源索引没有明确属性时不得推断受保护属性。
+3. 每个场景都必须设置非空 `replacement`。替换为相同场景类型但布局、陈设和细节略有不同的新场景，同时保持原色调、构图、机位、镜头运动、焦段和光线。
+4. 对未匹配用户要求的 `entities`，至少选择两个设置 `generated_variant` 替换；不足两个时全部替换。其余确实无需替换的实体将 `replacement` 设为 `null`。
+5. 替换描述必须具体、简短、可直接供 Fusion 使用，并服从原记录的 `preserve` 与相关 `relations`。`replace_together=true` 只要求关系两端同时替换或同时保留，不会自动传播 `matches_user_request` 或 `replacement.source`；只有确实属于用户文字和 Image 1 所指目标的记录才标为 `matches_user_request=true`。不得改变对象功能、动作接口、尺度关系或跨段身份。
+
+## 人物音色
+
+1. 为 `people` 中每个人物选择一个目录内存在的 `voice_id`；即使人物未匹配用户替换要求，也不得省略音色。
+2. 只依据索引明确给出的语言、性别、种族、年龄和表达风格匹配；缺失属性不得推断。多人可以复用 voice_id，全项目最多使用三个不同 voice_id。
+3. 人物超过三个时，按相近语言与表达风格复用最合适的已有 voice_id。不要输出文件路径、Audio 序号、目录标签副本或解释；这些由后端根据稳定人物顺序机械补入增强索引。
+
+`replacement=null` 只允许用于不属于人物、场景或用户指定目标的实体。关系不在本阶段重新生成。

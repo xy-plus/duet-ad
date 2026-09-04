@@ -8,12 +8,21 @@ import os
 import shutil
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from app import media
 from app.config import Settings
 from app.fusion_schema import fusion_prompt_schema, normalize_fusion_prompt
+from app.object_replace_schema import (
+    MAX_REFERENCE_AUDIO,
+    OBJECT_REPLACE_OUTPUT_VERSION,
+    merge_object_replace_index,
+    normalize_object_replace,
+    object_replace_schema,
+)
 from app.providers import (
     CodexClient,
     DeepSeekClient,
@@ -24,12 +33,7 @@ from app.providers import (
 )
 from app.research_log import ResearchLog
 from app.store import ProjectStore
-from app.voice_catalog import (
-    VoiceLibrary,
-    load_voice_library,
-    normalize_voice_selection,
-    voice_selection_schema,
-)
+from app.voice_catalog import VoiceLibrary, load_voice_library
 from app.video_maker_schemas import (
     PROJECT_INDEX_SCHEMA,
     VISUAL_PROMPT_SCHEMA,
@@ -40,8 +44,8 @@ from app.video_maker_schemas import (
 
 VIDEO_SKILL = Path(__file__).resolve().parents[1] / "skills" / "video-maker" / "SKILL.md"
 R2V_SKILL = Path(__file__).resolve().parents[1] / "skills" / "h3-max-r2v-prompt" / "SKILL.md"
-VOICE_SELECTION_SKILL = (
-    Path(__file__).resolve().parents[1] / "skills" / "voice-selection" / "SKILL.md"
+OBJECT_REPLACE_SKILL = (
+    Path(__file__).resolve().parents[1] / "skills" / "object-replace" / "SKILL.md"
 )
 SAME_AS_SOURCE_LANGUAGE = "与原视频相同"
 MASTER_EMPTY_ASR_SIGNAL = 51 / 256
@@ -61,6 +65,59 @@ TRANSLATION_SCHEMA: dict[str, Any] = {
     "required": ["lines"],
     "additionalProperties": False,
 }
+
+PICSART_RECEIPT_VERSION = 1
+H3_PREPARED_ARTIFACTS_VERSION = 2
+PICSART_PROMPT_MAX_CHARS = 50_000
+PICSART_REFERENCE_MIN_DURATION_S = 2
+PICSART_REFERENCE_MAX_DURATION_S = 15
+PICSART_GENERATION_MIN_DURATION_S = 5
+PICSART_GENERATION_MAX_DURATION_S = 15
+PICSART_RESOLUTIONS = frozenset({"480p", "768p"})
+PICSART_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPicsartRequest:
+    """Immutable boundary between local preparation and paid provider work."""
+
+    project_id: str
+    segment_index: int
+    scope: str
+    run_identity: str
+    artifact_suffix: str
+    final_prompt: str
+    muted: Path
+    provider_replacement: Path | None
+    voice_references: tuple[Path, ...]
+    video_url: str | None
+    image_url: str | None
+    audio_urls: tuple[str, ...]
+    provider_duration: int
+    resolution: str
+    aspect_ratio: str
+    target_duration_s: float
+    request_sha256: str
+    existing_task_id: str | None = None
+
+    def submit_input(self) -> dict[str, Any]:
+        if self.existing_task_id is not None:
+            raise ValueError("an existing Picsart task has no submit input")
+        if self.video_url is None:
+            raise ValueError("prepared Picsart video URL is missing")
+        return {
+            "workflow": PicsartClient.WORKFLOW,
+            "prompt": self.final_prompt,
+            "reference_video_urls": [self.video_url],
+            "reference_image_urls": (
+                [self.image_url] if self.image_url is not None else []
+            ),
+            "reference_audio_urls": list(self.audio_urls),
+            "resolution": self.resolution.upper(),
+            "duration": self.provider_duration,
+            "aspect_ratio": self.aspect_ratio,
+            "prompt_expansion_mode": "quality",
+        }
 
 
 class Pipeline:
@@ -86,6 +143,11 @@ class Pipeline:
         self._mediakit_gate = threading.BoundedSemaphore(
             settings.mediakit_concurrency,
         )
+        # ProjectStore.update() is atomic, but a receipt ledger change is a
+        # read-modify-write operation assembled here.  Serialize that whole
+        # operation so parallel segment transitions cannot overwrite each
+        # other before the paid POST boundary.
+        self._picsart_receipt_lock = threading.Lock()
 
     def _erase_with_limit(
         self,
@@ -211,7 +273,9 @@ class Pipeline:
                     error=str(exc),
                 )
             should_retry = attempt == 1 and (
-                retry_if(last_error) if retry_if is not None else True
+                retry_if(last_error)
+                if retry_if is not None
+                else not node.endswith("-submit")
             )
             if not should_retry:
                 break
@@ -232,16 +296,45 @@ class Pipeline:
         if isinstance(stderr, str):
             log.write_text(directory / "stderr.log", stderr)
 
+    @staticmethod
+    def _stored_input_paths(
+        project: Path,
+        state: dict[str, Any],
+    ) -> tuple[Path, Path | None]:
+        """Resolve only the two canonical project-owned input locations."""
+        if state.get("source_path") != "inputs/source.mp4":
+            raise ValueError("stored source path must be inputs/source.mp4")
+        replacement_path = state.get("replacement_image_path")
+        if replacement_path not in {None, "inputs/replacement-image"}:
+            raise ValueError(
+                "stored replacement path must be inputs/replacement-image"
+            )
+        project_root = project.resolve(strict=True)
+        source_path = project / "inputs" / "source.mp4"
+        source = source_path.resolve(strict=True)
+        if (
+            project_root not in source.parents
+            or source_path.is_symlink()
+            or not source.is_file()
+        ):
+            raise ValueError("stored source is outside the project")
+        replacement: Path | None = None
+        if replacement_path is not None:
+            candidate = project / "inputs" / "replacement-image"
+            replacement = candidate.resolve(strict=True)
+            if (
+                project_root not in replacement.parents
+                or candidate.is_symlink()
+                or not replacement.is_file()
+            ):
+                raise ValueError("stored replacement image is outside the project")
+        return source, replacement
+
     def run(self, project_id: str) -> None:
         project = self.store.path(project_id)
         log = ResearchLog(project)
         state = self.store.read(project_id)
-        source = project / state["source_path"]
-        replacement = (
-            project / state["replacement_image_path"]
-            if state.get("replacement_image_path")
-            else None
-        )
+        source, replacement = self._stored_input_paths(project, state)
         request = state.get("effective_request") or {}
         try:
             self._progress(project_id, 2, "probe")
@@ -428,121 +521,355 @@ class Pipeline:
             raise ValueError("stored voice reference checksum does not match")
         return selection, voice_reference
 
-    def _select_project_voice(
+    @staticmethod
+    def _stored_voice_references(
+        project: Path, state: dict[str, Any],
+    ) -> list[Path]:
+        """Load the frozen Audio 1..N list, with legacy Audio 1 fallback."""
+        if "voice_references" not in state:
+            _selection, legacy = Pipeline._stored_voice_reference(project, state)
+            return [legacy] if legacy is not None else []
+
+        references = state["voice_references"]
+        if not isinstance(references, list) or len(references) > MAX_REFERENCE_AUDIO:
+            raise ValueError("stored voice references are invalid")
+        project_root = project.resolve(strict=True)
+        paths: list[Path] = []
+        for slot, reference in enumerate(references, 1):
+            if not isinstance(reference, dict):
+                raise ValueError("stored voice reference is invalid")
+            expected_path = f"work/voice-references/audio-{slot:02d}.wav"
+            expected_sha256 = reference.get("asset_sha256")
+            if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+                raise ValueError("stored voice reference checksum is invalid")
+            resolved = (project / expected_path).resolve(strict=True)
+            if project_root not in resolved.parents or not resolved.is_file():
+                raise ValueError("stored voice reference is outside the project")
+            if Pipeline._sha256(resolved) != expected_sha256:
+                raise ValueError("stored voice reference checksum does not match")
+            paths.append(resolved)
+        return paths
+
+    def _materialize_voice_references(
         self,
-        project_id: str,
+        project: Path,
+        patch: dict[str, dict[str, dict[str, Any]]],
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[Path]]:
+        selected_ids: list[str] = []
+        people = patch.get("people")
+        records = people.values() if isinstance(people, dict) else ()
+        for person in records:
+            voice_id = person.get("voice_id") if isinstance(person, dict) else None
+            if (
+                isinstance(voice_id, str)
+                and voice_id in self.voice_library.files
+                and voice_id not in selected_ids
+                and len(selected_ids) < MAX_REFERENCE_AUDIO
+            ):
+                selected_ids.append(voice_id)
+
+        directory = project / "work" / "voice-references"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+        metadata_by_id: dict[str, dict[str, Any]] = {}
+        references: list[dict[str, Any]] = []
+        paths: list[Path] = []
+        for slot, voice_id in enumerate(selected_ids, 1):
+            voice = self.voice_library.voice(voice_id)
+            source = self.voice_library.files[voice_id]
+            relative = f"work/voice-references/audio-{slot:02d}.wav"
+            destination = project / relative
+            temporary = directory / f".audio-{slot:02d}.wav.tmp"
+            try:
+                shutil.copyfile(source, temporary)
+                temporary.chmod(0o600)
+                os.replace(temporary, destination)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+            if self._sha256(destination) != voice["sha256"]:
+                raise ValueError("materialized voice reference checksum does not match")
+            metadata = {
+                "audio_reference": f"Audio {slot}",
+                "voice_id": voice_id,
+                "asset_path": relative,
+                "asset_sha256": voice["sha256"],
+                "features": self.voice_library.model_line(voice_id),
+            }
+            metadata_by_id[voice_id] = metadata
+            references.append(metadata)
+            paths.append(destination)
+        return metadata_by_id, references, paths
+
+    def _run_object_replace(
+        self,
         project: Path,
         prepared: list[dict[str, Any]],
         translated_lines: list[dict[str, Any]],
         element_index: dict[str, Any],
+        replacement: Path | None,
         request: dict[str, Any],
         log: ResearchLog,
-    ) -> tuple[dict[str, Any], Path | None]:
-        library = self.voice_library
-        if not any(str(line.get("text") or "").strip() for line in translated_lines):
-            selection = self._node(
-                log,
-                "voice-selection",
-                "project",
-                {
-                    "voice_catalog_sha256": library.digest,
-                    "reason": "no_spoken_dialogue",
-                },
-                [],
-                lambda: ProviderResult(
-                    {"status": "not_needed", "reason": "no_spoken_dialogue"},
-                    {"outcome": "skipped", "reason": "no_spoken_dialogue"},
-                ),
-            )
-            self.store.update(project_id, voice_selection=selection)
-            return selection, None
-
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[Path]]:
+        user_instruction = str(
+            ((request.get("replacement_guidance") or {}).get("instruction"))
+            or ""
+        ).strip()
         target_language = str(
             ((request.get("dialogue") or {}).get("target_language"))
             or SAME_AS_SOURCE_LANGUAGE
         ).strip()
+        voice_ids = [voice["voice_id"] for voice in self.voice_library.voices]
         payload = {
-            "target_language": target_language,
-            "translated_dialogue": translated_lines,
+            "global_element_index": element_index,
             "segment_visual_prompts": [
                 {
                     "segment_index": int(item["index"]),
                     "visual_prompt": item["visual_prompt"],
                 }
-                for item in prepared
+                for item in sorted(prepared, key=lambda value: int(value["index"]))
             ],
-            "global_element_index": element_index,
-            "voice_catalog_sha256": library.digest,
-            "voice_catalog_lines": library.model_lines(),
+            "target_language": target_language,
+            "translated_dialogue": translated_lines,
+            "user_replacement_instruction": user_instruction,
+            "has_user_image": replacement is not None,
+            "user_replacement_image": (
+                {"name": "Image 1", "sha256": self._sha256(replacement)}
+                if replacement is not None else None
+            ),
+            "voice_catalog_sha256": self.voice_library.digest,
+            "voice_catalog_lines": self.voice_library.model_lines(),
         }
-        voice_ids = [voice["voice_id"] for voice in library.voices]
-        output_schema, input_sha256 = voice_selection_schema(payload, voice_ids)
-        current_state = self.store.read(project_id)
-        existing = current_state.get("voice_selection")
-        if (
-            isinstance(existing, dict)
-            and existing.get("status") == "selected"
-            and existing.get("catalog_sha256") == library.digest
-            and existing.get("selection_input_sha256") == input_sha256
-        ):
-            stored_selection, stored_reference = self._stored_voice_reference(
-                project, current_state,
-            )
-            assert stored_selection is not None and stored_reference is not None
-            log.event(
-                "voice_selection_reused",
-                voice_id=stored_selection["voice_id"],
-            )
-            return stored_selection, stored_reference
+        output_schema, input_sha256 = object_replace_schema(payload, voice_ids)
+        materialized: dict[str, Any] = {}
 
-        agent, fusion_client = self._fusion_client_for_request(request)
-        skill = VOICE_SELECTION_SKILL.read_text(encoding="utf-8")
-        voice_id = self._node(
+        def normalize_and_merge(value: object) -> dict[str, Any]:
+            patch = normalize_object_replace(
+                value,
+                input_sha256=input_sha256,
+                element_index=element_index,
+                voice_ids=voice_ids,
+                has_user_image=replacement is not None,
+                user_instruction=user_instruction,
+            )
+            metadata_by_id, references, paths = self._materialize_voice_references(
+                project, patch,
+            )
+            materialized["references"] = references
+            materialized["paths"] = paths
+            return merge_object_replace_index(
+                element_index, patch, metadata_by_id,
+            )
+
+        skill = OBJECT_REPLACE_SKILL.read_text(encoding="utf-8")
+        enhanced_index = self._node(
             log,
-            "voice-selection",
+            "object-replace",
             "project",
             {
-                "agent": agent,
+                "agent": "deepseek",
                 "skill": skill,
                 "input_sha256": input_sha256,
                 "payload": payload,
                 "output_schema": output_schema,
             },
-            [],
-            lambda: fusion_client.complete_structured(
-                skill, payload, output_schema, [],
+            [replacement] if replacement is not None else [],
+            lambda: self.deepseek.complete_structured(
+                skill,
+                payload,
+                output_schema,
+                [replacement] if replacement is not None else [],
             ),
-            transform=lambda value: normalize_voice_selection(
-                value,
-                input_sha256=input_sha256,
-                voice_ids=set(voice_ids),
-            ),
+            transform=normalize_and_merge,
+            output_media=lambda _value: list(materialized.get("paths") or []),
         )
-        voice = library.voice(voice_id)
-        source = library.files[voice_id]
-        destination = project / "work" / "voice-reference.wav"
-        temporary = project / "work" / ".voice-reference.wav.tmp"
-        try:
-            shutil.copyfile(source, temporary)
-            temporary.chmod(0o600)
-            os.replace(temporary, destination)
-        finally:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-        selection = {
-            "status": "selected",
-            "voice_id": voice_id,
-            "catalog_sha256": library.digest,
-            "selection_input_sha256": input_sha256,
-            "asset_path": "work/voice-reference.wav",
-            "asset_sha256": voice["sha256"],
-            "features": dict(voice["features"]),
-            "source": dict(voice["source"]),
+        references = list(materialized.get("references") or [])
+        paths = list(materialized.get("paths") or [])
+        metadata = {
+            "version": OBJECT_REPLACE_OUTPUT_VERSION,
+            "input_sha256": input_sha256,
+            "voice_catalog_sha256": self.voice_library.digest,
         }
-        self.store.update(project_id, voice_selection=selection)
-        return selection, destination
+        return enhanced_index, metadata, references, paths
+
+    @staticmethod
+    def _project_artifact_receipt(
+        project: Path,
+        path: Path,
+        relative_path: str,
+    ) -> dict[str, Any]:
+        expected = project / relative_path
+        project_root = project.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        if (
+            resolved != expected.resolve(strict=True)
+            or project_root not in resolved.parents
+            or path.is_symlink()
+            or not resolved.is_file()
+        ):
+            raise ValueError("prepared H3 artifact path is invalid")
+        size_bytes = resolved.stat().st_size
+        if size_bytes < 1:
+            raise ValueError("prepared H3 artifact is empty")
+        return {
+            "path": relative_path,
+            "size_bytes": size_bytes,
+            "sha256": Pipeline._sha256(resolved),
+        }
+
+    def _freeze_h3_prepared_artifacts(
+        self,
+        project_id: str,
+        project: Path,
+        h3_inputs: list[tuple[dict[str, Any], str, Path, str]],
+        *,
+        replacement: Path | None = None,
+        request: dict[str, Any] | None = None,
+    ) -> None:
+        segments: dict[str, dict[str, Any]] = {}
+        for item, final_prompt, muted, fusion_input_sha256 in sorted(
+            h3_inputs, key=lambda value: int(value[0]["index"]),
+        ):
+            index = int(item["index"])
+            if str(final_prompt).strip() != final_prompt:
+                raise ValueError("prepared H3 prompt is not canonical")
+            base = f"work/segments/{index:04d}"
+            segments[str(index)] = {
+                "segment_index": index,
+                "source_video": self._project_artifact_receipt(
+                    project, item["source"], f"{base}/source.mp4",
+                ),
+                "muted_video": self._project_artifact_receipt(
+                    project, muted, f"{base}/source-muted.mp4",
+                ),
+                "prompt": self._project_artifact_receipt(
+                    project, muted.parent / "h3_prompt.txt", f"{base}/h3_prompt.txt",
+                ),
+                "fusion_input_sha256": fusion_input_sha256,
+                "segment_metadata_sha256": self._json_sha256({
+                    "index": item.get("index"),
+                    "start_s": item.get("start_s"),
+                    "end_s": item.get("end_s"),
+                    "duration_s": item.get("duration_s"),
+                    "join_mode": item.get("join_mode", "hard_cut"),
+                }),
+            }
+        state = self.store.read(project_id)
+        enhanced_index = state.get("enhanced_element_index")
+        voice_references = state.get("voice_references")
+        object_replace = state.get("object_replace")
+        if (
+            not isinstance(enhanced_index, dict)
+            or not isinstance(voice_references, list)
+            or not isinstance(object_replace, dict)
+            or not isinstance(object_replace.get("input_sha256"), str)
+            or len(object_replace["input_sha256"]) != 64
+        ):
+            raise ValueError("H3 preparation binding state is invalid")
+        if replacement is None and state.get("replacement_image_path") is not None:
+            replacement = project / "inputs" / "replacement-image"
+        replacement_receipt = (
+            self._project_artifact_receipt(
+                project, replacement, "inputs/replacement-image",
+            )
+            if replacement is not None
+            else None
+        )
+        effective_request = request if isinstance(request, dict) else (
+            state.get("effective_request") or {}
+        )
+        output_request = (
+            effective_request.get("output") or {}
+            if isinstance(effective_request, dict)
+            else {}
+        )
+        self.store.update(
+            project_id,
+            h3_prepared_artifacts={
+                "version": H3_PREPARED_ARTIFACTS_VERSION,
+                "bindings": {
+                    "enhanced_element_index_sha256": self._json_sha256(
+                        enhanced_index,
+                    ),
+                    "voice_references_sha256": self._json_sha256(
+                        voice_references,
+                    ),
+                    "object_replace_input_sha256": object_replace[
+                        "input_sha256"
+                    ],
+                    "replacement_image": replacement_receipt,
+                    "output_request_sha256": self._json_sha256(output_request),
+                },
+                "segments": segments,
+            },
+        )
+
+    def _run_h3_segments(
+        self,
+        project_id: str,
+        project: Path,
+        prepared: list[dict[str, Any]],
+        enhanced_element_index: dict[str, Any],
+        voice_reference_paths: list[Path],
+        replacement: Path | None,
+        request: dict[str, Any],
+        log: ResearchLog,
+    ) -> list[Path]:
+        """Cross both free-work barriers before scheduling any paid submit."""
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(prepared)),
+        ) as pool:
+            prepare_futures = [
+                pool.submit(
+                    self._prepare_h3_segment,
+                    project,
+                    item,
+                    enhanced_element_index,
+                    request,
+                    log,
+                )
+                for item in prepared
+            ]
+            h3_inputs = [future.result() for future in prepare_futures]
+            self._freeze_h3_prepared_artifacts(
+                project_id,
+                project,
+                h3_inputs,
+                replacement=replacement,
+                request=request,
+            )
+            preflight_futures = [
+                pool.submit(
+                    self._prepare_picsart_segment,
+                    project_id,
+                    project,
+                    item,
+                    voice_reference_paths,
+                    replacement,
+                    request,
+                    log,
+                    final_prompt=final_prompt,
+                    muted=muted,
+                )
+                for item, final_prompt, muted, _fusion_input_sha256 in h3_inputs
+            ]
+            picsart_requests = [
+                future.result() for future in preflight_futures
+            ]
+            self._begin_submission_batch(picsart_requests)
+            submit_futures = [
+                pool.submit(
+                    self._generate_picsart_segment,
+                    picsart_request,
+                    item,
+                    log,
+                )
+                for (item, _final_prompt, _muted, _fusion_hash), picsart_request
+                in zip(h3_inputs, picsart_requests)
+            ]
+            return [future.result() for future in submit_futures]
 
     def _continue_after_prepared(
         self,
@@ -633,43 +960,63 @@ class Pipeline:
         )
 
         self._progress(
-            project_id, 53, "voice-selection", segments=public_segments,
+            project_id, 53, "object-replace", segments=public_segments,
         )
-        voice_selection, voice_reference = self._select_project_voice(
-            project_id,
+        (
+            enhanced_element_index,
+            object_replace,
+            voice_references,
+            voice_reference_paths,
+        ) = self._run_object_replace(
             project,
             prepared,
             translated_lines,
             element_index,
+            replacement,
             request,
             log,
+        )
+        enhanced_path = project / "work" / "enhanced_element_index.json"
+        enhanced_temporary = project / "work" / ".enhanced_element_index.json.tmp"
+        try:
+            enhanced_temporary.write_text(
+                json.dumps(
+                    enhanced_element_index,
+                    ensure_ascii=False,
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            enhanced_temporary.chmod(0o600)
+            os.replace(enhanced_temporary, enhanced_path)
+        finally:
+            try:
+                enhanced_temporary.unlink()
+            except FileNotFoundError:
+                pass
+        self.store.update(
+            project_id,
+            enhanced_element_index=enhanced_element_index,
+            object_replace=object_replace,
+            voice_references=voice_references,
         )
 
         # This is the public-input barrier.  No paid segment branch starts
         # before every visual prompt, translation, localization, the single
-        # project index and the project-wide voice choice have completed.
+        # project index and project-wide replacement/voice plan have completed.
         self._progress(
             project_id, 57, "h3-max-r2v", segments=public_segments,
         )
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, len(prepared)),
-        ) as pool:
-            futures = [
-                pool.submit(
-                    self._generate_segment,
-                    project_id,
-                    project,
-                    item,
-                    element_index,
-                    voice_selection,
-                    voice_reference,
-                    replacement,
-                    request,
-                    log,
-                )
-                for item in prepared
-            ]
-            outputs = [future.result() for future in futures]
+        outputs = self._run_h3_segments(
+            project_id,
+            project,
+            prepared,
+            enhanced_element_index,
+            voice_reference_paths,
+            replacement,
+            request,
+            log,
+        )
 
         final = project / "output" / "generated.mp4"
         self._progress(
@@ -724,6 +1071,53 @@ class Pipeline:
         )
         log.event("pipeline_succeeded", output=final)
 
+    @staticmethod
+    def _validated_stored_segments(
+        state: dict[str, Any],
+        *,
+        missing_message: str,
+    ) -> list[dict[str, Any]]:
+        raw_segments = state.get("segments")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise ValueError(missing_message)
+        segment_count = state.get("segment_count")
+        if (
+            isinstance(segment_count, bool)
+            or not isinstance(segment_count, int)
+            or segment_count < 1
+            or segment_count != len(raw_segments)
+        ):
+            raise ValueError("stored segment count is invalid")
+        segments: list[dict[str, Any]] = []
+        indices: list[int] = []
+        for raw in raw_segments:
+            if not isinstance(raw, dict):
+                raise TypeError("stored segment must be an object")
+            index = raw.get("index")
+            duration = raw.get("duration_s")
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(float(duration))
+                or float(duration) * 24 < 1
+            ):
+                raise ValueError("stored segment metadata is invalid")
+            join_mode = raw.get("join_mode", "hard_cut")
+            if join_mode not in {"hard_cut", "continue"}:
+                raise ValueError("stored segment join mode is invalid")
+            indices.append(index)
+            segments.append({**raw, "join_mode": join_mode})
+        if sorted(indices) != list(range(1, segment_count + 1)):
+            raise ValueError(
+                "stored segment indices must be unique and contiguous"
+            )
+        segments.sort(key=lambda item: int(item["index"]))
+        if segments[0]["join_mode"] != "hard_cut":
+            raise ValueError("first stored segment must use a hard cut")
+        return segments
+
     def _load_pre_picsart_resume(
         self,
         project_id: str,
@@ -745,33 +1139,20 @@ class Pipeline:
         ):
             raise ValueError("only failed projects can resume preparation")
         logs = project / "logs"
-        if any(path.is_dir() for path in logs.glob("picsart*-submit")):
+        if (
+            state.get("picsart_submission_receipts") is not None
+            or any(path.is_dir() for path in logs.glob("picsart*-submit"))
+        ):
             raise ValueError("project has Picsart submission evidence")
-        source_path = state.get("source_path")
-        if not isinstance(source_path, str):
-            raise TypeError("stored source path is invalid")
-        source = project / source_path
-        if not source.is_file():
-            raise FileNotFoundError("stored source is missing")
-        replacement = (
-            project / state["replacement_image_path"]
-            if state.get("replacement_image_path")
-            else None
+        source, replacement = self._stored_input_paths(project, state)
+        raw_segments = self._validated_stored_segments(
+            state, missing_message="stored segments are missing",
         )
-        if replacement is not None and not replacement.is_file():
-            raise FileNotFoundError("replacement image is missing")
-        raw_segments = state.get("segments")
-        if not isinstance(raw_segments, list) or not raw_segments:
-            raise ValueError("stored segments are missing")
         segments: list[dict[str, Any]] = []
         selections: dict[int, list[dict[str, Any]]] = {}
         for raw in raw_segments:
-            if not isinstance(raw, dict):
-                raise TypeError("stored segment must be an object")
             segment = dict(raw)
-            index = int(segment["index"])
-            if index < 1 or float(segment["duration_s"]) <= 0:
-                raise ValueError("stored segment metadata is invalid")
+            index = segment["index"]
             scope = self._segment_scope(index)
             directory = project / "work" / "segments" / f"{index:04d}"
             selection_path = directory / "keyframe_selection.json"
@@ -895,19 +1276,245 @@ class Pipeline:
         return 0
 
     def _resume_prefixes(self, project: Path) -> list[str]:
-        prefixes = {
-            path.name.removesuffix("-submit")
-            for path in (project / "logs").glob("picsart-resume*-submit")
-            if path.is_dir()
-        }
+        prefixes: set[str] = set()
+        for suffix in ("-submit", "-poll"):
+            prefixes.update(
+                path.name.removesuffix(suffix)
+                for path in (project / "logs").glob(
+                    f"picsart-resume*{suffix}"
+                )
+                if path.is_dir()
+            )
         return sorted(prefixes, key=self._resume_prefix_key, reverse=True)
 
-    def _next_resume_identity(self, project: Path) -> tuple[str, str]:
+    def _next_resume_identity(
+        self,
+        project: Path,
+        state: dict[str, Any],
+    ) -> tuple[str, str]:
         prefixes = self._resume_prefixes(project)
+        receipts = self._validated_submission_receipts(state)
+        if receipts is not None:
+            prefixes.extend(
+                receipt["run_identity"]
+                for records in receipts["segments"].values()
+                for receipt in records
+                if receipt["run_identity"].startswith("picsart-resume")
+            )
         number = max((self._resume_prefix_key(value) for value in prefixes), default=0) + 1
         if number == 1:
             return "picsart-resume", "-resume"
         return f"picsart-resume-{number:02d}", f"-resume-{number:02d}"
+
+    @staticmethod
+    def _validated_submission_receipts(
+        state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        raw = state.get("picsart_submission_receipts")
+        if raw is None:
+            return None
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"version", "segments"}
+            or raw.get("version") != PICSART_RECEIPT_VERSION
+            or isinstance(raw.get("version"), bool)
+            or not isinstance(raw.get("segments"), dict)
+        ):
+            raise ValueError("stored Picsart receipt ledger is invalid")
+        normalized: dict[str, list[dict[str, Any]]] = {}
+        allowed_statuses = {
+            "submission_started", "accepted", "unknown", "rejected",
+            "provider_failed",
+        }
+        for segment_key, records in raw["segments"].items():
+            if (
+                not isinstance(segment_key, str)
+                or not segment_key.isdecimal()
+                or str(int(segment_key)) != segment_key
+                or int(segment_key) < 1
+                or not isinstance(records, list)
+                or not records
+            ):
+                raise ValueError("stored Picsart segment receipts are invalid")
+            seen_runs: set[str] = set()
+            copied: list[dict[str, Any]] = []
+            for offset, receipt in enumerate(records):
+                if not isinstance(receipt, dict) or set(receipt) != {
+                    "segment_index", "run_identity", "request_sha256",
+                    "status", "task_id",
+                }:
+                    raise ValueError("stored Picsart receipt is invalid")
+                run_identity = receipt["run_identity"]
+                digest = receipt["request_sha256"]
+                status = receipt["status"]
+                task_id = receipt["task_id"]
+                if (
+                    receipt["segment_index"] != int(segment_key)
+                    or isinstance(receipt["segment_index"], bool)
+                    or not isinstance(run_identity, str)
+                    or not run_identity
+                    or run_identity != run_identity.strip()
+                    or run_identity in seen_runs
+                    or not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    or status not in allowed_statuses
+                    or (
+                        status in {"accepted", "provider_failed"}
+                        and (not isinstance(task_id, str) or not task_id.strip())
+                    )
+                    or (
+                        status not in {"accepted", "provider_failed"}
+                        and task_id is not None
+                    )
+                    or (
+                        offset < len(records) - 1
+                        and status not in {"rejected", "provider_failed"}
+                    )
+                ):
+                    raise ValueError("stored Picsart receipt fields are invalid")
+                seen_runs.add(run_identity)
+                copied.append(dict(receipt))
+            normalized[segment_key] = copied
+        return {"version": PICSART_RECEIPT_VERSION, "segments": normalized}
+
+    def _begin_submission_batch(
+        self,
+        requests: list[PreparedPicsartRequest],
+    ) -> None:
+        pending = [item for item in requests if item.existing_task_id is None]
+        if not pending:
+            return
+        project_ids = {item.project_id for item in pending}
+        segment_indices = [item.segment_index for item in pending]
+        if len(project_ids) != 1 or len(segment_indices) != len(set(segment_indices)):
+            raise ValueError("prepared Picsart submission batch is invalid")
+        project_id = pending[0].project_id
+        with self._picsart_receipt_lock:
+            state = self.store.read(project_id)
+            ledger = self._validated_submission_receipts(state) or {
+                "version": PICSART_RECEIPT_VERSION,
+                "segments": {},
+            }
+            for prepared in sorted(pending, key=lambda item: item.segment_index):
+                key = str(prepared.segment_index)
+                records = ledger["segments"].setdefault(key, [])
+                if any(
+                    receipt["run_identity"] == prepared.run_identity
+                    for receipt in records
+                ):
+                    raise ValueError("Picsart run identity was already used")
+                if records and records[-1]["status"] not in {
+                    "rejected", "provider_failed",
+                }:
+                    raise ValueError(
+                        "Picsart submission is not proven safe to retry"
+                    )
+                records.append({
+                    "segment_index": prepared.segment_index,
+                    "run_identity": prepared.run_identity,
+                    "request_sha256": prepared.request_sha256,
+                    "status": "submission_started",
+                    "task_id": None,
+                })
+            self.store.update(
+                project_id,
+                picsart_submission_receipts=ledger,
+            )
+
+    def _transition_submission_receipt(
+        self,
+        prepared: PreparedPicsartRequest,
+        *,
+        status: str,
+        task_id: str | None = None,
+    ) -> None:
+        if status not in {"accepted", "unknown", "rejected"}:
+            raise ValueError("invalid Picsart submission receipt transition")
+        if status == "accepted":
+            if not isinstance(task_id, str) or not task_id.strip():
+                raise ValueError("accepted Picsart receipt requires a task id")
+        elif task_id is not None:
+            raise ValueError("non-accepted Picsart receipt cannot have a task id")
+        with self._picsart_receipt_lock:
+            state = self.store.read(prepared.project_id)
+            ledger = self._validated_submission_receipts(state)
+            if ledger is None:
+                raise ValueError("Picsart submission receipt ledger is missing")
+            records = ledger["segments"].get(str(prepared.segment_index)) or []
+            matches = [
+                receipt for receipt in records
+                if receipt["run_identity"] == prepared.run_identity
+            ]
+            if len(matches) != 1:
+                raise ValueError("Picsart submission receipt identity is missing")
+            receipt = matches[0]
+            if (
+                receipt["request_sha256"] != prepared.request_sha256
+                or receipt["status"] != "submission_started"
+            ):
+                raise ValueError("Picsart submission receipt transition is unsafe")
+            receipt["status"] = status
+            receipt["task_id"] = task_id
+            self.store.update(
+                prepared.project_id,
+                picsart_submission_receipts=ledger,
+            )
+
+    def _mark_submission_task_failed(
+        self,
+        project_id: str,
+        segment_index: int,
+        task_id: str,
+    ) -> None:
+        with self._picsart_receipt_lock:
+            state = self.store.read(project_id)
+            ledger = self._validated_submission_receipts(state)
+            if ledger is None:
+                return
+            records = ledger["segments"].get(str(segment_index)) or []
+            # A ledger may first appear when a different segment is resumed
+            # from a mixed legacy/new project. This segment's accepted task
+            # can still be owned solely by the legacy research log, so there
+            # is no state receipt to transition here.
+            if not records:
+                return
+            matches = [
+                receipt for receipt in records
+                if receipt["status"] == "accepted"
+                and receipt["task_id"] == task_id
+            ]
+            if len(matches) != 1:
+                raise ValueError("accepted Picsart task receipt is missing")
+            matches[0]["status"] = "provider_failed"
+            self.store.update(
+                project_id,
+                picsart_submission_receipts=ledger,
+            )
+
+    @classmethod
+    def _state_submission_task(
+        cls,
+        state: dict[str, Any],
+        segment_index: int,
+    ) -> tuple[bool, str | None]:
+        ledger = cls._validated_submission_receipts(state)
+        if ledger is None:
+            return False, None
+        records = ledger["segments"].get(str(segment_index)) or []
+        if not records:
+            # A ledger can first appear during a mixed legacy resume where a
+            # different segment needed a new POST.  Absence for this segment
+            # does not erase its older accepted-task evidence.
+            return False, None
+        receipt = records[-1]
+        if receipt["status"] in {"submission_started", "unknown"}:
+            raise ValueError(
+                "Picsart submission outcome is unknown; reconcile it before resume"
+            )
+        if receipt["status"] == "accepted":
+            return True, receipt["task_id"]
+        return True, None
 
     def _picsart_receipt_prefixes(self, project: Path) -> list[str]:
         prefixes = self._resume_prefixes(project)
@@ -923,18 +1530,20 @@ class Pipeline:
             response = exchange.get("response")
             if not isinstance(response, dict):
                 continue
-            status_code = response.get("status_code")
-            if isinstance(status_code, int) and 400 <= status_code < 500:
-                return True
+            if response.get("status_code") != 200:
+                continue
             body = response.get("body")
             envelope = body.get("response") if isinstance(body, dict) else None
-            if isinstance(envelope, dict) and str(envelope.get("status") or "").upper() == "FAILED":
+            if (
+                isinstance(envelope, dict)
+                and str(envelope.get("status") or "").upper() == "FAILED"
+            ):
                 return True
         return False
 
-    def _active_resume_task(
+    def _terminal_resume_task_ids(
         self, project: Path, scope: str,
-    ) -> str | None:
+    ) -> set[str]:
         terminal_task_ids: set[str] = set()
         for prefix in self._picsart_receipt_prefixes(project):
             poll_root = project / "logs" / f"{prefix}-poll" / scope
@@ -961,6 +1570,12 @@ class Pipeline:
                     and self._poll_record_is_terminal_failure(poll_record)
                 ):
                     terminal_task_ids.add(task_id)
+        return terminal_task_ids
+
+    def _active_resume_task(
+        self, project: Path, scope: str,
+    ) -> str | None:
+        terminal_task_ids = self._terminal_resume_task_ids(project, scope)
 
         for prefix in self._picsart_receipt_prefixes(project):
             submit_root = project / "logs" / f"{prefix}-submit" / scope
@@ -979,6 +1594,80 @@ class Pipeline:
                 if task_id not in terminal_task_ids:
                     return task_id
         return None
+
+    def _has_retryable_submit_evidence(
+        self, project: Path, scope: str,
+    ) -> bool:
+        terminal_task_ids = self._terminal_resume_task_ids(project, scope)
+        for prefix in self._picsart_receipt_prefixes(project):
+            submit_root = project / "logs" / f"{prefix}-submit" / scope
+            for output in submit_root.glob("attempt-*/output.json"):
+                try:
+                    logged = json.loads(output.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                record = (
+                    logged.get("provider_record")
+                    if isinstance(logged, dict)
+                    else None
+                )
+                if not isinstance(record, dict):
+                    continue
+                task_id = record.get("task_id")
+                if isinstance(task_id, str) and task_id in terminal_task_ids:
+                    return True
+                response = record.get("response")
+                status_code = (
+                    response.get("status_code")
+                    if isinstance(response, dict)
+                    else None
+                )
+                if (
+                    record.get("outcome") == "rejected"
+                    and status_code in PicsartClient.SAFE_REJECT_STATUS_CODES
+                ):
+                    return True
+        return False
+
+    def _has_unknown_submit_receipt(
+        self, project: Path, scope: str,
+    ) -> bool:
+        for prefix in self._picsart_receipt_prefixes(project):
+            submit_root = project / "logs" / f"{prefix}-submit" / scope
+            for attempt in submit_root.glob("attempt-*"):
+                if not attempt.is_dir():
+                    continue
+                output = attempt / "output.json"
+                try:
+                    logged = json.loads(output.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    # Input evidence is written before the paid POST. A
+                    # missing or corrupt result cannot prove rejection.
+                    return True
+                record = (
+                    logged.get("provider_record")
+                    if isinstance(logged, dict)
+                    else None
+                )
+                if not isinstance(record, dict):
+                    return True
+                task_id = record.get("task_id")
+                if isinstance(task_id, str) and task_id.strip():
+                    continue
+                # Explicit rejection is the only no-task-id result that
+                # makes another paid POST safe.
+                response = record.get("response")
+                status_code = (
+                    response.get("status_code")
+                    if isinstance(response, dict)
+                    else None
+                )
+                if (
+                    record.get("outcome") != "rejected"
+                    or status_code not in PicsartClient.SAFE_REJECT_STATUS_CODES
+                ):
+                    return True
+        return False
 
     def _completed_resume_output(
         self, project: Path, segment_dir: Path, scope: str,
@@ -1001,38 +1690,197 @@ class Pipeline:
                 / scope
             )
             if output.is_file() and any(trim_root.glob("attempt-*/output.json")):
+                if output.stat().st_size < 1:
+                    raise ValueError("reusable generated segment is empty")
+                info = media.probe(output)
+                duration = info.get("duration_s") if isinstance(info, dict) else None
+                if (
+                    isinstance(duration, bool)
+                    or not isinstance(duration, (int, float))
+                    or not math.isfinite(float(duration))
+                    or float(duration) <= 0
+                ):
+                    raise ValueError("reusable generated segment is invalid")
                 return output
         return None
+
+    @staticmethod
+    def _validate_artifact_receipt(
+        project: Path,
+        receipt: object,
+        expected_path: str,
+    ) -> Path:
+        if not isinstance(receipt, dict) or set(receipt) != {
+            "path", "size_bytes", "sha256",
+        }:
+            raise ValueError("stored H3 artifact receipt is invalid")
+        size_bytes = receipt.get("size_bytes")
+        digest = receipt.get("sha256")
+        if (
+            receipt.get("path") != expected_path
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 1
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("stored H3 artifact receipt fields are invalid")
+        candidate = project / expected_path
+        resolved = candidate.resolve(strict=True)
+        project_root = project.resolve(strict=True)
+        if (
+            project_root not in resolved.parents
+            or candidate.is_symlink()
+            or not resolved.is_file()
+            or resolved.stat().st_size != size_bytes
+            or Pipeline._sha256(resolved) != digest
+        ):
+            raise ValueError("stored H3 artifact receipt does not match")
+        return resolved
+
+    @classmethod
+    def _validated_h3_prepared_artifacts(
+        cls,
+        project: Path,
+        state: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]] | None:
+        raw = state.get("h3_prepared_artifacts")
+        if raw is None:
+            return None
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"version", "bindings", "segments"}
+            or raw.get("version") != H3_PREPARED_ARTIFACTS_VERSION
+            or isinstance(raw.get("version"), bool)
+            or not isinstance(raw.get("bindings"), dict)
+            or not isinstance(raw.get("segments"), dict)
+        ):
+            raise ValueError("stored H3 preparation manifest is invalid")
+        bindings = raw["bindings"]
+        if set(bindings) != {
+            "enhanced_element_index_sha256", "voice_references_sha256",
+            "object_replace_input_sha256", "replacement_image",
+            "output_request_sha256",
+        }:
+            raise ValueError("stored H3 preparation bindings are invalid")
+        enhanced_index = state.get("enhanced_element_index")
+        voice_references = state.get("voice_references")
+        object_replace = state.get("object_replace")
+        effective_request = state.get("effective_request") or {}
+        output_request = (
+            effective_request.get("output") or {}
+            if isinstance(effective_request, dict)
+            else {}
+        )
+        if (
+            not isinstance(enhanced_index, dict)
+            or not isinstance(voice_references, list)
+            or not isinstance(object_replace, dict)
+            or bindings.get("enhanced_element_index_sha256")
+            != cls._json_sha256(enhanced_index)
+            or bindings.get("voice_references_sha256")
+            != cls._json_sha256(voice_references)
+            or bindings.get("object_replace_input_sha256")
+            != object_replace.get("input_sha256")
+            or bindings.get("output_request_sha256")
+            != cls._json_sha256(output_request)
+        ):
+            raise ValueError("stored H3 preparation bindings do not match")
+        replacement_receipt = bindings.get("replacement_image")
+        has_replacement = state.get("replacement_image_path") is not None
+        if has_replacement != (replacement_receipt is not None):
+            raise ValueError("stored H3 preparation replacement binding does not match")
+        if replacement_receipt is not None:
+            cls._validate_artifact_receipt(
+                project, replacement_receipt, "inputs/replacement-image",
+            )
+        expected_keys = {str(item["index"]) for item in segments}
+        if set(raw["segments"]) != expected_keys:
+            raise ValueError("stored H3 preparation segments do not match")
+        normalized: dict[str, dict[str, Any]] = {}
+        for item in segments:
+            index = item["index"]
+            entry = raw["segments"].get(str(index))
+            if not isinstance(entry, dict) or set(entry) != {
+                "segment_index", "source_video", "muted_video", "prompt",
+                "fusion_input_sha256", "segment_metadata_sha256",
+            }:
+                raise ValueError("stored H3 preparation segment is invalid")
+            fusion_digest = entry.get("fusion_input_sha256")
+            metadata_digest = entry.get("segment_metadata_sha256")
+            expected_metadata_digest = cls._json_sha256({
+                "index": item.get("index"),
+                "start_s": item.get("start_s"),
+                "end_s": item.get("end_s"),
+                "duration_s": item.get("duration_s"),
+                "join_mode": item.get("join_mode", "hard_cut"),
+            })
+            if (
+                entry.get("segment_index") != index
+                or isinstance(entry.get("segment_index"), bool)
+                or not isinstance(fusion_digest, str)
+                or len(fusion_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in fusion_digest
+                )
+                or metadata_digest != expected_metadata_digest
+            ):
+                raise ValueError("stored H3 preparation segment fields are invalid")
+            base = f"work/segments/{index:04d}"
+            cls._validate_artifact_receipt(
+                project, entry["source_video"], f"{base}/source.mp4",
+            )
+            cls._validate_artifact_receipt(
+                project, entry["muted_video"], f"{base}/source-muted.mp4",
+            )
+            cls._validate_artifact_receipt(
+                project, entry["prompt"], f"{base}/h3_prompt.txt",
+            )
+            normalized[str(index)] = dict(entry)
+        return normalized
 
     def _load_r2v_resume(
         self, project_id: str,
     ) -> tuple[
-        Path, list[dict[str, Any]], Path | None, dict[str, Any], Path | None,
+        Path, list[dict[str, Any]], Path | None, dict[str, Any], list[Path],
     ]:
         project = self.store.path(project_id)
         state = self.store.read(project_id)
-        if state.get("status") not in {"failed", "queued"}:
+        status = state.get("status")
+        stage = (state.get("project_progress") or {}).get("stage")
+        if status != "failed" and not (
+            status == "queued" and stage == "picsart_resume_queued"
+        ):
             raise ValueError("only a failed or explicitly queued project can resume Picsart")
-        raw_segments = state.get("segments")
-        if not isinstance(raw_segments, list) or not raw_segments:
-            raise ValueError("project has no reusable segments")
-        replacement = (
-            project / state["replacement_image_path"]
-            if state.get("replacement_image_path")
-            else None
+        _source_input, replacement = self._stored_input_paths(project, state)
+        raw_segments = self._validated_stored_segments(
+            state, missing_message="project has no reusable segments",
         )
-        if replacement is not None and not replacement.is_file():
-            raise FileNotFoundError("replacement image is missing")
+        manifest = self._validated_h3_prepared_artifacts(
+            project, state, raw_segments,
+        )
+        if manifest is None and any(
+            key in state
+            for key in (
+                "object_replace", "enhanced_element_index", "voice_references",
+            )
+        ):
+            raise ValueError(
+                "new H3 preparation state is missing its artifact manifest"
+            )
+        state_receipts = self._validated_submission_receipts(state)
+        if state_receipts is not None and not set(
+            state_receipts["segments"]
+        ).issubset({str(item["index"]) for item in raw_segments}):
+            raise ValueError("stored Picsart receipts reference unknown segments")
 
         prepared: list[dict[str, Any]] = []
         for raw in raw_segments:
-            if not isinstance(raw, dict):
-                raise TypeError("stored segment must be an object")
             item = dict(raw)
-            index = int(item["index"])
-            duration_s = float(item["duration_s"])
-            if index < 1 or duration_s <= 0:
-                raise ValueError("stored segment metadata is invalid")
+            index = item["index"]
             segment_dir = project / "work" / "segments" / f"{index:04d}"
             source = segment_dir / "source.mp4"
             muted = segment_dir / "source-muted.mp4"
@@ -1042,43 +1890,96 @@ class Pipeline:
                     raise FileNotFoundError(
                         f"reusable segment artifact is missing: {required.name}"
                     )
+                if required.stat().st_size < 1:
+                    raise ValueError(
+                        f"reusable segment artifact is empty: {required.name}"
+                    )
+            if manifest is None:
+                self._project_artifact_receipt(
+                    project,
+                    source,
+                    f"work/segments/{index:04d}/source.mp4",
+                )
+                self._project_artifact_receipt(
+                    project,
+                    muted,
+                    f"work/segments/{index:04d}/source-muted.mp4",
+                )
+                self._project_artifact_receipt(
+                    project,
+                    prompt_path,
+                    f"work/segments/{index:04d}/h3_prompt.txt",
+                )
+                self._completed_node_value(
+                    project, "mute-reference-video", self._segment_scope(index),
+                )
+                self._completed_node_value(
+                    project, "h3-max-r2v-prompt", self._segment_scope(index),
+                )
+            self._validate_reference_video(muted)
             final_prompt = prompt_path.read_text(encoding="utf-8").strip()
             if not final_prompt:
                 raise ValueError("reusable H3 prompt is empty")
+            resume_output = self._completed_resume_output(
+                project, segment_dir, self._segment_scope(index),
+            )
+            has_state_receipt, resume_task_id = self._state_submission_task(
+                state, index,
+            )
+            if not has_state_receipt:
+                resume_task_id = self._active_resume_task(
+                    project, self._segment_scope(index),
+                )
+                if (
+                    resume_task_id is None
+                    and self._has_unknown_submit_receipt(
+                        project, self._segment_scope(index),
+                    )
+                ):
+                    raise ValueError(
+                        "Picsart submission outcome is unknown; reconcile it before resume"
+                    )
+                if (
+                    resume_task_id is None
+                    and resume_output is None
+                    and not self._has_retryable_submit_evidence(
+                        project, self._segment_scope(index),
+                    )
+                ):
+                    raise ValueError(
+                        "Picsart submission outcome is unproven; use preparation resume "
+                        "or reconcile it before a new paid submit"
+                    )
             item.update({
                 "source": source,
                 "resume_muted": muted,
                 "resume_prompt": final_prompt,
-                "resume_task_id": self._active_resume_task(
-                    project, self._segment_scope(index),
-                ),
-                "resume_output": self._completed_resume_output(
-                    project, segment_dir, self._segment_scope(index),
-                ),
+                "resume_task_id": resume_task_id,
+                "resume_output": resume_output,
                 "status": "running",
             })
             prepared.append(item)
         prepared.sort(key=lambda item: int(item["index"]))
-        _voice_selection, voice_reference = self._stored_voice_reference(
-            project, state,
-        )
+        voice_references = self._stored_voice_references(project, state)
         return (
             project,
             prepared,
             replacement,
             state.get("effective_request") or {},
-            voice_reference,
+            voice_references,
         )
 
     def validate_r2v_resume(self, project_id: str) -> None:
         self._load_r2v_resume(project_id)
 
     def resume_r2v(self, project_id: str) -> None:
-        project, prepared, replacement, request, voice_reference = (
+        project, prepared, replacement, request, voice_references = (
             self._load_r2v_resume(project_id)
         )
         log = ResearchLog(project)
-        node_prefix, artifact_suffix = self._next_resume_identity(project)
+        node_prefix, artifact_suffix = self._next_resume_identity(
+            project, self.store.read(project_id),
+        )
         log.event("picsart_resume_started")
         try:
             self._progress(
@@ -1090,20 +1991,23 @@ class Pipeline:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max(1, len(prepared)),
             ) as pool:
-                futures: list[concurrent.futures.Future[Path] | None] = []
+                preflight_futures: list[
+                    concurrent.futures.Future[PreparedPicsartRequest] | None
+                ] = []
                 for item in prepared:
                     reusable = item.get("resume_output")
                     if isinstance(reusable, Path):
                         item["final_prompt"] = item["resume_prompt"]
                         item["task_id"] = item.get("resume_task_id")
                         item["status"] = "succeeded"
-                        futures.append(None)
+                        preflight_futures.append(None)
                         continue
-                    futures.append(pool.submit(
-                        self._generate_picsart_segment,
+                    preflight_futures.append(pool.submit(
+                        self._prepare_picsart_segment,
                         project_id,
+                        project,
                         item,
-                        voice_reference,
+                        voice_references,
                         replacement,
                         request,
                         log,
@@ -1112,6 +2016,25 @@ class Pipeline:
                         node_prefix=node_prefix,
                         artifact_suffix=artifact_suffix,
                         existing_task_id=item.get("resume_task_id"),
+                    ))
+                picsart_requests = [
+                    None if future is None else future.result()
+                    for future in preflight_futures
+                ]
+                self._begin_submission_batch([
+                    prepared_request for prepared_request in picsart_requests
+                    if prepared_request is not None
+                ])
+                futures: list[concurrent.futures.Future[Path] | None] = []
+                for item, prepared_request in zip(prepared, picsart_requests):
+                    if prepared_request is None:
+                        futures.append(None)
+                        continue
+                    futures.append(pool.submit(
+                        self._generate_picsart_segment,
+                        prepared_request,
+                        item,
+                        log,
                     ))
                 outputs = [
                     item["resume_output"] if future is None else future.result()
@@ -1275,12 +2198,9 @@ class Pipeline:
             lambda: media.yamnet_analyze(audio, self.settings.yamnet_model),
         )
 
-        asr_calls = 0
         vocal_expected = self._yamnet_has_vocal_signal(yamnet)
 
         def transcribe_once() -> ProviderResult[list[dict[str, Any]]]:
-            nonlocal asr_calls
-            asr_calls += 1
             lines, record = media.transcribe(
                 audio,
                 asr_output,
@@ -1293,13 +2213,6 @@ class Pipeline:
                 evidence_media=[asr_output],
             )
 
-        def apply_empty_asr_semantics(
-            lines: list[dict[str, Any]],
-        ) -> list[dict[str, Any]]:
-            if vocal_expected and not lines and asr_calls == 1:
-                raise RuntimeError("empty ASR despite YAMNet vocal signal")
-            return lines
-
         self._progress(project_id, 14, "whisper-asr")
         asr_lines = self._node(
             log,
@@ -1309,18 +2222,17 @@ class Pipeline:
                 "audio": audio,
                 "cli": self.settings.asr_cli,
                 "model": self.settings.asr_model,
-                "retry_empty_when_vocal": vocal_expected,
+                "vocal_signal_observed": vocal_expected,
             },
             [audio, self.settings.asr_model],
             transcribe_once,
-            transform=apply_empty_asr_semantics,
         )
         if vocal_expected and not asr_lines:
             log.event(
                 "empty_asr_accepted",
                 node="whisper-asr",
                 scope="project",
-                attempts=asr_calls,
+                attempts=1,
             )
         spoken_lines, voice_decisions = self._node(
             log,
@@ -1578,19 +2490,17 @@ class Pipeline:
     def _normalize_translation(
         value: Any, source_lines: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        if not isinstance(value, dict) or set(value) != {"lines"}:
-            raise ValueError("translation response must be a closed object")
-        parsed = value["lines"]
-        if not isinstance(parsed, list) or len(parsed) != len(source_lines):
-            raise ValueError("translation line count must match the source")
+        # Structured output owns the ideal shape. Do not turn translation
+        # quality into a second local gate: unusable/missing entries fall back
+        # to their source text, and surplus entries are ignored.
+        parsed = value.get("lines") if isinstance(value, dict) else None
+        candidates = parsed if isinstance(parsed, list) else []
         translated: list[dict[str, Any]] = []
         for index, source in enumerate(source_lines):
-            candidate = parsed[index]
-            if not isinstance(candidate, dict) or set(candidate) != {"text"}:
-                raise ValueError("translation line must contain only text")
-            text = candidate["text"]
+            candidate = candidates[index] if index < len(candidates) else None
+            text = candidate.get("text") if isinstance(candidate, dict) else None
             if not isinstance(text, str) or not text.strip():
-                raise ValueError("translation text must be non-empty")
+                text = str(source.get("text") or "")
             translated.append({
                 **source,
                 "text": text.strip(),
@@ -1621,42 +2531,158 @@ class Pipeline:
             "segments": segments,
         }, images
 
-    def _generate_segment(
+    @staticmethod
+    def _one_line(value: object, fallback: str = "unspecified") -> str:
+        if not isinstance(value, str):
+            return fallback
+        normalized = " ".join(value.split())
+        return normalized or fallback
+
+    @staticmethod
+    def _appears_in_segment(record: dict[str, Any], segment_index: int) -> bool:
+        occurrences = record.get("occurrences")
+        if not isinstance(occurrences, list):
+            # If occurrence metadata is unusable, including the record is less
+            # destructive than blocking the project or silently losing it.
+            return True
+        return any(
+            isinstance(occurrence, dict)
+            and occurrence.get("segment_index") == segment_index
+            for occurrence in occurrences
+        )
+
+    @classmethod
+    def _fusion_authority_block(
+        cls, element_index: dict[str, Any], segment_index: int,
+    ) -> str:
+        lines = [
+            "BEGIN AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN",
+            (
+                "This block is the sole authority. Ignore any conflicting "
+                "replacement or voice statement elsewhere in the prompt."
+            ),
+        ]
+        for category in ("people", "entities", "scenes"):
+            records = element_index.get(category)
+            if not isinstance(records, dict):
+                continue
+            for stable_id, record in records.items():
+                if not isinstance(stable_id, str) or not isinstance(record, dict):
+                    continue
+                if not cls._appears_in_segment(record, segment_index):
+                    continue
+                source = cls._one_line(record.get("source_visual_description"))
+                preserve = record.get("preserve")
+                preserve_items = (
+                    [item for item in preserve if isinstance(item, str) and item.strip()]
+                    if isinstance(preserve, list)
+                    else []
+                )
+                preserve_text = "; ".join(
+                    cls._one_line(item) for item in preserve_items
+                ) or "source action, geometry, scale, and continuity"
+                replacement = record.get("replacement")
+                if isinstance(replacement, dict):
+                    target = cls._one_line(
+                        replacement.get("target_visual_description")
+                    )
+                    reference_text = (
+                        "Image 1"
+                        if replacement.get("source") == "image_1"
+                        else "generated variant"
+                    )
+                    line = (
+                        f"- {stable_id} | REPLACE | source: {source} | target: "
+                        f"{target} | reference: {reference_text} | preserve: "
+                        f"{preserve_text}"
+                    )
+                else:
+                    line = (
+                        f"- {stable_id} | KEEP | source: {source} | preserve: "
+                        f"{preserve_text}"
+                    )
+                if category == "people":
+                    voice = record.get("voice")
+                    if isinstance(voice, dict) and isinstance(
+                        voice.get("audio_reference"), str
+                    ) and voice["audio_reference"].strip():
+                        line += (
+                            f" | voice: {cls._one_line(voice['audio_reference'])}"
+                            f" | voice features: {cls._one_line(voice.get('features'))}"
+                            " | use this voice only when this stable person speaks; "
+                            "ignore the reference audio words"
+                        )
+                    if isinstance(replacement, dict):
+                        line += (
+                            " | person policy: different face; same explicit gender, "
+                            "race, overall style, and clothing color; slightly different "
+                            "clothing design; do not infer missing traits"
+                        )
+                elif category == "scenes" and isinstance(replacement, dict):
+                    line += (
+                        " | scene policy: same scene type with a slightly different "
+                        "layout and details; preserve color tone, composition, camera, "
+                        "shot movement, focal length, and lighting"
+                    )
+                elif category == "entities" and isinstance(replacement, dict):
+                    line += (
+                        " | entity policy: preserve function, action interface, scale, "
+                        "contact, and relation semantics"
+                    )
+                lines.append(line)
+
+        relations = element_index.get("relations")
+        relation_items = relations.items() if isinstance(relations, dict) else ()
+        for stable_id, relation in relation_items:
+            if not isinstance(stable_id, str) or not isinstance(relation, dict):
+                continue
+            if not cls._appears_in_segment(relation, segment_index):
+                continue
+            subject = cls._one_line(relation.get("subject_key"))
+            predicate = cls._one_line(relation.get("predicate"))
+            object_key = cls._one_line(relation.get("object_key"))
+            preserve = relation.get("preserve")
+            preserve_items = (
+                [item for item in preserve if isinstance(item, str) and item.strip()]
+                if isinstance(preserve, list)
+                else []
+            )
+            preserve_text = "; ".join(
+                cls._one_line(item) for item in preserve_items
+            ) or "source relation state and geometry"
+            replace_together = relation.get("replace_together")
+            replace_together_text = (
+                str(replace_together).lower()
+                if isinstance(replace_together, bool)
+                else "unspecified"
+            )
+            lines.append(
+                f"- {stable_id} | RELATION | {subject} {predicate} {object_key} "
+                f"| preserve: {preserve_text} | replace together: "
+                f"{replace_together_text}"
+            )
+        lines.append("END AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN")
+        return "\n".join(lines)
+
+    def _prepare_h3_segment(
         self,
-        project_id: str,
         project: Path,
         item: dict[str, Any],
         element_index: dict[str, Any],
-        voice_selection: dict[str, Any],
-        voice_reference: Path | None,
-        replacement: Path | None,
         request: dict[str, Any],
         log: ResearchLog,
-    ) -> Path:
-        del project
+    ) -> tuple[dict[str, Any], str, Path, str]:
         index = int(item["index"])
         scope = self._segment_scope(index)
         try:
-            user_instruction = str(
-                ((request.get("replacement_guidance") or {}).get("instruction"))
-                or ""
-            )
             skill = R2V_SKILL.read_text(encoding="utf-8")
             fusion_payload = {
                 "segment_index": index,
                 "visual_prompt": item["visual_prompt"],
                 "global_element_index": element_index,
                 "translated_dialogue": item["dialogue"],
-                "user_replacement_instruction": user_instruction,
-                "has_user_image": replacement is not None,
-                "user_replacement_image": (
-                    {"name": "Image 1", "sha256": self._sha256(replacement)}
-                    if replacement is not None else None
-                ),
-                "selected_voice_reference": (
-                    "Audio 1 - "
-                    + self.voice_library.model_line(voice_selection["voice_id"])
-                    if voice_reference is not None else None
+                "authoritative_constraints": self._fusion_authority_block(
+                    element_index, index,
                 ),
             }
             fusion_schema, fusion_input_sha256 = fusion_prompt_schema(
@@ -1674,17 +2700,20 @@ class Pipeline:
                     "payload": fusion_payload,
                     "output_schema": fusion_schema,
                 },
-                [replacement] if replacement else [],
+                [],
                 lambda: fusion_client.complete_structured(
                     skill,
                     fusion_payload,
                     fusion_schema,
-                    [replacement] if replacement else [],
+                    [],
                 ),
                 transform=lambda value: normalize_fusion_prompt(
                     value,
                     input_sha256=fusion_input_sha256,
                     segment_index=index,
+                    authoritative_constraints=fusion_payload[
+                        "authoritative_constraints"
+                    ],
                 ),
             )
             dialogue = "\n".join(
@@ -1700,13 +2729,6 @@ class Pipeline:
                 if dialogue
                 else "\n\nDo not add captions, subtitles, or new dialogue."
             )
-            if voice_reference is not None:
-                final_prompt += (
-                    "\n\nVoice consistency requirements: Audio 1 is the sole "
-                    "project-wide voice reference. Preserve its voice timbre, "
-                    "accent, and delivery style for every spoken line. Ignore "
-                    "the words spoken in Audio 1; speak only the dialogue above."
-                )
             segment_dir = item["source"].parent
             (segment_dir / "h3_prompt.txt").write_text(
                 final_prompt, encoding="utf-8",
@@ -1721,25 +2743,48 @@ class Pipeline:
                 lambda: media.mute(item["source"], muted),
                 lambda _value: [muted],
             )
-            return self._generate_picsart_segment(
-                project_id,
-                item,
-                voice_reference,
-                replacement,
-                request,
-                log,
-                final_prompt=final_prompt,
-                muted=muted,
-            )
+            return item, final_prompt, muted, fusion_input_sha256
         except Exception:
             item["status"] = "failed"
             raise
 
-    def _generate_picsart_segment(
+    @staticmethod
+    def _validated_provider_asset_url(value: object) -> str:
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError("prepared provider asset URL is invalid")
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.fragment:
+            raise ValueError("prepared provider asset URL must be public HTTPS")
+        return value
+
+    @staticmethod
+    def _validate_reference_video(path: Path) -> None:
+        info = media.probe(path)
+        duration = info.get("duration_s") if isinstance(info, dict) else None
+        width = info.get("width") if isinstance(info, dict) else None
+        height = info.get("height") if isinstance(info, dict) else None
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or not PICSART_REFERENCE_MIN_DURATION_S
+            <= float(duration)
+            <= PICSART_REFERENCE_MAX_DURATION_S
+            or isinstance(width, bool)
+            or not isinstance(width, int)
+            or width < 1
+            or isinstance(height, bool)
+            or not isinstance(height, int)
+            or height < 1
+        ):
+            raise ValueError("prepared Picsart reference video is invalid")
+
+    def _prepare_picsart_segment(
         self,
         project_id: str,
+        project: Path,
         item: dict[str, Any],
-        voice_reference: Path | None,
+        voice_references: list[Path],
         replacement: Path | None,
         request: dict[str, Any],
         log: ResearchLog,
@@ -1749,76 +2794,256 @@ class Pipeline:
         node_prefix: str = "picsart",
         artifact_suffix: str = "",
         existing_task_id: str | None = None,
-    ) -> Path:
-        index = int(item["index"])
+    ) -> PreparedPicsartRequest:
+        index = item.get("index")
+        duration = item.get("duration_s")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 1
+            or isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or float(duration) <= 0
+        ):
+            raise ValueError("Picsart segment metadata is invalid")
         scope = self._segment_scope(index)
-        segment_dir = muted.parent
-        try:
-            task_id = existing_task_id
-            if task_id is None:
-                video_url = self.register_asset(project_id, muted)
-                provider_replacement = None
-                if replacement is not None:
-                    provider_replacement = (
-                        segment_dir / f"provider-reference{artifact_suffix}.png"
-                    )
-                    self._node(
-                        log,
-                        f"{node_prefix}-reference-image",
-                        scope,
-                        {"source": replacement, "output": provider_replacement},
-                        [replacement],
-                        lambda: media.provider_reference_png(
-                            replacement, provider_replacement,
-                        ),
-                        lambda _value: [provider_replacement],
-                    )
-                image_url = (
-                    self.register_asset(project_id, provider_replacement)
-                    if provider_replacement is not None
-                    else None
+        segment_dir = project / "work" / "segments" / f"{index:04d}"
+        muted_receipt = self._project_artifact_receipt(
+            project,
+            muted,
+            f"work/segments/{index:04d}/source-muted.mp4",
+        )
+        self._validate_reference_video(muted)
+        if not isinstance(final_prompt, str):
+            raise ValueError("prepared Picsart prompt is invalid")
+        final_prompt = final_prompt.strip()
+        if not final_prompt or len(final_prompt) > PICSART_PROMPT_MAX_CHARS:
+            raise ValueError("prepared Picsart prompt is invalid")
+        if len(voice_references) > MAX_REFERENCE_AUDIO:
+            raise ValueError("H3 accepts at most three reference voices")
+        project_root = project.resolve(strict=True)
+        resolved_voice_references: list[Path] = []
+        for slot, path in enumerate(voice_references, 1):
+            resolved = path.resolve(strict=True)
+            valid_paths = {
+                (project / "work" / "voice-reference.wav").resolve(),
+                (
+                    project / "work" / "voice-references"
+                    / f"audio-{slot:02d}.wav"
+                ).resolve(),
+            }
+            if (
+                project_root not in resolved.parents
+                or resolved not in valid_paths
+                or path.is_symlink()
+                or not resolved.is_file()
+                or resolved.stat().st_size < 1
+            ):
+                raise ValueError("H3 reference voice file is invalid")
+            resolved_voice_references.append(resolved)
+        if len(resolved_voice_references) != len(set(resolved_voice_references)):
+            raise ValueError("H3 reference voice files must be unique")
+        if existing_task_id is not None and (
+            not isinstance(existing_task_id, str)
+            or not existing_task_id
+            or existing_task_id != existing_task_id.strip()
+        ):
+            raise ValueError("stored Picsart task id is invalid")
+        output_request = request.get("output") or {}
+        if not isinstance(output_request, dict):
+            raise ValueError("stored Picsart output request is invalid")
+        resolution = output_request.get("resolution", "768p")
+        aspect_ratio = output_request.get("aspect_ratio", "adaptive")
+        if not isinstance(resolution, str) or resolution not in PICSART_RESOLUTIONS:
+            raise ValueError("Picsart resolution is unsupported")
+        if (
+            not isinstance(aspect_ratio, str)
+            or aspect_ratio not in PICSART_ASPECT_RATIOS
+        ):
+            raise ValueError("Picsart aspect ratio is unsupported")
+        provider_duration = max(
+            PICSART_GENERATION_MIN_DURATION_S,
+            math.ceil(float(duration)),
+        )
+        if not (
+            PICSART_GENERATION_MIN_DURATION_S
+            <= provider_duration
+            <= PICSART_GENERATION_MAX_DURATION_S
+        ):
+            raise ValueError("Picsart generation duration is unsupported")
+
+        provider_replacement: Path | None = None
+        video_url: str | None = None
+        image_url: str | None = None
+        audio_urls: list[str] = []
+        if existing_task_id is None:
+            if replacement is not None:
+                canonical_replacement = project / "inputs" / "replacement-image"
+                resolved_replacement = replacement.resolve(strict=True)
+                if (
+                    resolved_replacement
+                    != canonical_replacement.resolve(strict=True)
+                    or project_root not in resolved_replacement.parents
+                    or replacement.is_symlink()
+                ):
+                    raise ValueError("replacement image path is invalid")
+                provider_replacement = (
+                    segment_dir / f"provider-reference{artifact_suffix}.png"
                 )
-                audio_url = (
-                    self.register_asset(project_id, voice_reference)
-                    if voice_reference is not None
-                    else None
-                )
-                output_request = request.get("output") or {}
-                provider_duration = max(5, math.ceil(float(item["duration_s"])))
-                submit_input = {
-                    "workflow": PicsartClient.WORKFLOW,
-                    "prompt": final_prompt,
-                    "reference_video_urls": [video_url],
-                    "reference_image_urls": [image_url] if image_url else [],
-                    "reference_audio_urls": [audio_url] if audio_url else [],
-                    "resolution": str(
-                        output_request.get("resolution", "768p")
-                    ).upper(),
-                    "duration": provider_duration,
-                    "aspect_ratio": output_request.get(
-                        "aspect_ratio", "adaptive"
+                self._node(
+                    log,
+                    f"{node_prefix}-reference-image",
+                    scope,
+                    {"source": replacement, "output": provider_replacement},
+                    [replacement],
+                    lambda: media.provider_reference_png(
+                        replacement, provider_replacement,
                     ),
-                    "prompt_expansion_mode": "quality",
-                }
+                    lambda _value: [provider_replacement],
+                )
+                provider_bytes = provider_replacement.read_bytes()
+                if (
+                    not provider_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+                    or len(provider_bytes) < 9
+                ):
+                    raise ValueError("prepared provider reference is not PNG")
+            video_url = self._validated_provider_asset_url(
+                self.register_asset(project_id, muted)
+            )
+            if provider_replacement is not None:
+                image_url = self._validated_provider_asset_url(
+                    self.register_asset(project_id, provider_replacement)
+                )
+            audio_urls = [
+                self._validated_provider_asset_url(
+                    self.register_asset(project_id, voice_reference)
+                )
+                for voice_reference in resolved_voice_references
+            ]
+            if len(audio_urls) != len(set(audio_urls)):
+                raise ValueError("prepared Picsart audio URLs must be unique")
+        request_payload = (
+            {
+                "existing_task_id": existing_task_id,
+                "segment_index": index,
+                "muted_video": muted_receipt,
+            }
+            if existing_task_id is not None
+            else {
+                "workflow": PicsartClient.WORKFLOW,
+                "prompt": final_prompt,
+                "reference_video_urls": [video_url],
+                "reference_image_urls": [image_url] if image_url else [],
+                "reference_audio_urls": audio_urls,
+                "resolution": resolution.upper(),
+                "duration": provider_duration,
+                "aspect_ratio": aspect_ratio,
+                "prompt_expansion_mode": "quality",
+            }
+        )
+        prepared = PreparedPicsartRequest(
+            project_id=project_id,
+            segment_index=index,
+            scope=scope,
+            run_identity=node_prefix,
+            artifact_suffix=artifact_suffix,
+            final_prompt=final_prompt,
+            muted=muted.resolve(strict=True),
+            provider_replacement=(
+                provider_replacement.resolve(strict=True)
+                if provider_replacement is not None else None
+            ),
+            voice_references=tuple(resolved_voice_references),
+            video_url=video_url,
+            image_url=image_url,
+            audio_urls=tuple(audio_urls),
+            provider_duration=provider_duration,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            target_duration_s=float(duration),
+            request_sha256=self._json_sha256(request_payload),
+            existing_task_id=existing_task_id,
+        )
+        log.event(
+            "picsart_preflight_succeeded",
+            segment_index=index,
+            run_identity=node_prefix,
+            request_sha256=prepared.request_sha256,
+            reuses_task=existing_task_id is not None,
+        )
+        return prepared
+
+    def _submit_prepared_picsart(
+        self,
+        prepared: PreparedPicsartRequest,
+    ) -> ProviderResult[str]:
+        if prepared.existing_task_id is not None or prepared.video_url is None:
+            raise ValueError("prepared Picsart request is not submittable")
+        try:
+            result = self.picsart.submit(
+                prompt=prepared.final_prompt,
+                video_url=prepared.video_url,
+                image_url=prepared.image_url,
+                audio_urls=list(prepared.audio_urls),
+                duration=prepared.provider_duration,
+                resolution=prepared.resolution,
+                aspect_ratio=prepared.aspect_ratio,
+            )
+            if (
+                not isinstance(result, ProviderResult)
+                or not isinstance(result.value, str)
+                or not result.value.strip()
+            ):
+                raise ValueError("Picsart submit returned no task id")
+            self._transition_submission_receipt(
+                prepared, status="accepted", task_id=result.value,
+            )
+            return result
+        except ProviderFailure as exc:
+            outcome = exc.record.get("outcome")
+            self._transition_submission_receipt(
+                prepared,
+                status="rejected" if outcome == "rejected" else "unknown",
+            )
+            raise
+        except BaseException:
+            try:
+                self._transition_submission_receipt(
+                    prepared, status="unknown",
+                )
+            except BaseException:
+                # The pre-POST submission_started receipt remains fail-closed.
+                pass
+            raise
+
+    def _generate_picsart_segment(
+        self,
+        prepared: PreparedPicsartRequest,
+        item: dict[str, Any],
+        log: ResearchLog,
+    ) -> Path:
+        index = prepared.segment_index
+        scope = prepared.scope
+        segment_dir = prepared.muted.parent
+        node_prefix = prepared.run_identity
+        artifact_suffix = prepared.artifact_suffix
+        try:
+            task_id = prepared.existing_task_id
+            if task_id is None:
                 task_id = self._node(
                     log,
                     f"{node_prefix}-submit",
                     scope,
-                    submit_input,
-                    [muted]
-                    + ([provider_replacement] if provider_replacement else [])
-                    + ([voice_reference] if voice_reference else []),
-                    lambda: self.picsart.submit(
-                        prompt=final_prompt,
-                        video_url=video_url,
-                        image_url=image_url,
-                        audio_url=audio_url,
-                        duration=provider_duration,
-                        resolution=output_request.get("resolution", "768p"),
-                        aspect_ratio=output_request.get(
-                            "aspect_ratio", "adaptive"
-                        ),
-                    ),
+                    prepared.submit_input(),
+                    [prepared.muted]
+                    + (
+                        [prepared.provider_replacement]
+                        if prepared.provider_replacement is not None else []
+                    )
+                    + list(prepared.voice_references),
+                    lambda: self._submit_prepared_picsart(prepared),
+                    retry_if=lambda _exc: False,
                 )
             else:
                 log.event(
@@ -1826,13 +3051,28 @@ class Pipeline:
                     segment_index=index,
                     task_id=task_id,
                 )
+
+            def poll_once() -> ProviderResult[str]:
+                try:
+                    return self.picsart.poll(task_id)
+                except ProviderFailure as exc:
+                    if self._poll_record_is_terminal_failure(exc.record):
+                        self._mark_submission_task_failed(
+                            prepared.project_id, index, task_id,
+                        )
+                    raise
+
             generated_url = self._node(
                 log,
                 f"{node_prefix}-poll",
                 scope,
                 {"task_id": task_id},
                 [],
-                lambda: self.picsart.poll(task_id),
+                poll_once,
+                retry_if=lambda exc: not (
+                    isinstance(exc, ProviderFailure)
+                    and self._poll_record_is_terminal_failure(exc.record)
+                ),
             )
             downloaded = segment_dir / f"h3-provider{artifact_suffix}.mp4"
             self._node(
@@ -1854,14 +3094,17 @@ class Pipeline:
                 log,
                 trim_node,
                 scope,
-                {"source": downloaded, "target_duration_s": item["duration_s"]},
+                {
+                    "source": downloaded,
+                    "target_duration_s": prepared.target_duration_s,
+                },
                 [downloaded],
                 lambda: media.trim_24fps(
-                    downloaded, float(item["duration_s"]), trimmed,
+                    downloaded, prepared.target_duration_s, trimmed,
                 ),
                 lambda _value: [trimmed],
             )
-            item["final_prompt"] = final_prompt
+            item["final_prompt"] = prepared.final_prompt
             item["task_id"] = task_id
             item["status"] = "succeeded"
             return trimmed
@@ -1910,7 +3153,21 @@ class Pipeline:
 
     @staticmethod
     def _sha256(path: Path) -> str:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _json_sha256(value: Any) -> str:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     @staticmethod
     def _segment_scope(index: int) -> str:

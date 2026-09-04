@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import re
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,18 +16,8 @@ VOICE_LIBRARY_ROOT = ROOT / "assets" / "voice-library"
 VOICE_CATALOG_PATH = VOICE_LIBRARY_ROOT / "catalog.json"
 VOICE_CATALOG_NAME = "duet.voice-library"
 VOICE_CATALOG_VERSION = 1
-VOICE_CATALOG_SIZE = 30
 VOICE_SELECTION_OUTPUT_NAME = "duet.voice-selection-output"
 VOICE_SELECTION_OUTPUT_VERSION = 1
-VOICE_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
-
-SOURCE_KEYS = {
-    "dataset", "source_id", "url", "license", "attribution", "modifications",
-}
-FEATURE_KEYS = {
-    "language", "gender", "race", "ethnicity", "accent", "region", "age",
-    "performance_style", "intensity", "personality",
-}
 
 
 @dataclass(frozen=True)
@@ -47,11 +36,16 @@ class VoiceLibrary:
     def model_line(self, voice_id: str) -> str:
         voice = self.voice(voice_id)
         features = voice["features"]
+
+        def feature(key: str) -> str:
+            value = features.get(key)
+            return str(value).strip() if value is not None else ""
+
         parts = [
             voice["voice_id"],
             voice["file"],
-            features["language"],
-            features["gender"],
+            feature("language") or "unspecified",
+            feature("gender") or "unspecified",
         ]
         for key, label in (
             ("race", "race"),
@@ -61,8 +55,8 @@ class VoiceLibrary:
             ("performance_style", "style"),
             ("intensity", "intensity"),
         ):
-            value = features[key]
-            if value not in {"not_reported", "unspecified"}:
+            value = feature(key)
+            if value and value not in {"not_reported", "unspecified"}:
                 parts.append(f"{label}:{value}")
         return " - ".join(str(part) for part in parts)
 
@@ -91,35 +85,30 @@ def load_voice_library(path: Path = VOICE_CATALOG_PATH) -> VoiceLibrary:
     catalog_path = path.resolve(strict=True)
     root = catalog_path.parent
     raw = json.loads(catalog_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or set(raw) != {
-        "schema", "version", "label_policy", "voices",
-    }:
+    if (
+        not isinstance(raw, dict)
+        or not {"schema", "version", "voices"}.issubset(raw)
+    ):
         raise ValueError("voice catalog root is invalid")
     if raw["schema"] != VOICE_CATALOG_NAME or raw["version"] != VOICE_CATALOG_VERSION:
         raise ValueError("voice catalog identity is invalid")
-    policy = raw["label_policy"]
-    if not isinstance(policy, dict) or set(policy) != {
-        "source_truth", "personality", "identity",
-    }:
-        raise ValueError("voice catalog label policy is invalid")
-    for key, value in policy.items():
-        _non_empty_string(value, f"label_policy.{key}")
     voices = raw["voices"]
-    if not isinstance(voices, list) or len(voices) != VOICE_CATALOG_SIZE:
-        raise ValueError(f"voice catalog must contain exactly {VOICE_CATALOG_SIZE} assets")
+    if not isinstance(voices, list) or not voices:
+        raise ValueError("voice catalog must contain at least one asset")
 
     ids: set[str] = set()
     files: dict[str, Path] = {}
     validated: list[dict[str, Any]] = []
     for index, value in enumerate(voices, 1):
-        if not isinstance(value, dict) or set(value) != {
+        required_keys = {
             "voice_id", "file", "sha256", "duration_s", "media_type",
             "source", "features",
-        }:
+        }
+        if not isinstance(value, dict) or not required_keys.issubset(value):
             raise ValueError(f"voice catalog entry {index} is invalid")
         voice_id = _non_empty_string(value["voice_id"], "voice_id")
-        if VOICE_ID_RE.fullmatch(voice_id) is None or voice_id in ids:
-            raise ValueError("voice catalog voice_id is invalid or duplicated")
+        if voice_id in ids:
+            raise ValueError("voice catalog voice_id is duplicated")
         ids.add(voice_id)
         relative = Path(_non_empty_string(value["file"], "file"))
         if relative.is_absolute() or ".." in relative.parts:
@@ -136,8 +125,8 @@ def load_voice_library(path: Path = VOICE_CATALOG_PATH) -> VoiceLibrary:
         if isinstance(duration, bool) or not isinstance(duration, (int, float)):
             raise ValueError("voice catalog duration is invalid")
         duration = float(duration)
-        if not math.isfinite(duration) or not 2.0 <= duration <= 5.0:
-            raise ValueError("voice asset duration must be between 2 and 5 seconds")
+        if not math.isfinite(duration):
+            raise ValueError("voice catalog duration is invalid")
         if value["media_type"] != "audio/wav" or resolved.suffix.lower() != ".wav":
             raise ValueError("voice asset must be declared as audio/wav")
         with wave.open(str(resolved), "rb") as handle:
@@ -148,24 +137,13 @@ def load_voice_library(path: Path = VOICE_CATALOG_PATH) -> VoiceLibrary:
             ):
                 raise ValueError("voice asset must be mono 16-bit PCM WAV")
             actual_duration = handle.getnframes() / handle.getframerate()
-        if not 2.0 <= actual_duration <= 5.0 or abs(actual_duration - duration) > 0.002:
-            raise ValueError(f"voice asset duration mismatch: {voice_id}")
-        source = value["source"]
-        if not isinstance(source, dict) or set(source) != SOURCE_KEYS:
+        if not 2.0 <= actual_duration <= 5.0:
+            raise ValueError("voice asset duration must be between 2 and 5 seconds")
+        if not isinstance(value["source"], dict):
             raise ValueError("voice catalog source metadata is invalid")
-        for key, item in source.items():
-            _non_empty_string(item, f"source.{key}")
         features = value["features"]
-        if not isinstance(features, dict) or set(features) != FEATURE_KEYS:
+        if not isinstance(features, dict):
             raise ValueError("voice catalog features are invalid")
-        for key, item in features.items():
-            if key == "age" and isinstance(item, int) and not isinstance(item, bool):
-                if item < 18:
-                    raise ValueError("voice catalog does not accept minors")
-                continue
-            _non_empty_string(item, f"features.{key}")
-        if features["personality"] != "not_reported":
-            raise ValueError("personality must not be inferred from a recording")
         files[voice_id] = resolved
         validated.append(value)
     return VoiceLibrary(

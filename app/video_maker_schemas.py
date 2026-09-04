@@ -32,27 +32,27 @@ def _array(
     return value
 
 
-_TEXT = {"type": "string", "minLength": 1}
+_TEXT = {"type": "string"}
 _INT0 = {"type": "integer", "minimum": 0}
 _INT1 = {"type": "integer", "minimum": 1}
 _BOOL = {"type": "boolean"}
-_TEXTS = _array(_TEXT, maximum=20)
+_TEXTS = _array(_TEXT)
 
 
 # Segment identity and ordered frames are backend-owned and absent here.
 VISUAL_PROMPT_SCHEMA = _object({
-    "prompt": {"type": "string", "minLength": 1, "maxLength": 32768},
+    "prompt": {"type": "string"},
 })
 
 
 _ELEMENT_OCCURRENCE = _object({
     "segment_index": _INT0,
-    "frame_orders": _array(_INT1, minimum=1, maximum=9),
+    "frame_orders": _array(_INT1, maximum=9),
 })
 _ELEMENT = _object({
     "key": _TEXT,
     "source_visual_description": _TEXT,
-    "occurrences": _array(_ELEMENT_OCCURRENCE, maximum=100),
+    "occurrences": _array(_ELEMENT_OCCURRENCE),
     "replaceable": _TEXTS,
     "preserve": _TEXTS,
 })
@@ -63,23 +63,23 @@ _RELATION_FRAME = _object({
 })
 _RELATION_OCCURRENCE = _object({
     "segment_index": _INT0,
-    "frames": _array(_RELATION_FRAME, minimum=1, maximum=9),
+    "frames": _array(_RELATION_FRAME, maximum=9),
 })
 _RELATION = _object({
     "key": _TEXT,
     "subject_key": _TEXT,
     "predicate": _TEXT,
     "object_key": _TEXT,
-    "occurrences": _array(_RELATION_OCCURRENCE, maximum=100),
+    "occurrences": _array(_RELATION_OCCURRENCE),
     "preserve": _TEXTS,
     "replace_together": _BOOL,
 })
 
 PROJECT_INDEX_SCHEMA = _object({
-    "people": _array(_ELEMENT, maximum=100),
-    "entities": _array(_ELEMENT, maximum=100),
-    "scenes": _array(_ELEMENT, minimum=1, maximum=100),
-    "relations": _array(_RELATION, maximum=200),
+    "people": _array(_ELEMENT),
+    "entities": _array(_ELEMENT),
+    "scenes": _array(_ELEMENT),
+    "relations": _array(_RELATION),
 })
 
 
@@ -88,26 +88,24 @@ def normalize_visual_prompt(value: object) -> str:
     if not isinstance(value, dict) or set(value) != {"prompt"}:
         raise ValueError("visual prompt output is invalid")
     prompt = value["prompt"]
-    if not isinstance(prompt, str) or not prompt:
-        raise ValueError("visual prompt output is invalid")
-    if len(prompt.encode("utf-8")) > 32 * 1024:
+    if not isinstance(prompt, str):
         raise ValueError("visual prompt output is invalid")
     return prompt
 
 
-def _index_records(value: object, *, fields: set[str]) -> dict[str, dict[str, Any]]:
+def _index_records(
+    value: object, *, fields: set[str],
+) -> list[tuple[str, dict[str, Any]]]:
     if not isinstance(value, list):
         raise ValueError("model output collection is invalid")
-    indexed: dict[str, dict[str, Any]] = {}
+    indexed: list[tuple[str, dict[str, Any]]] = []
     for item in value:
         if not isinstance(item, dict) or set(item) != fields | {"key"}:
             raise ValueError("model output record is invalid")
         key = item.get("key")
-        if not isinstance(key, str) or not key.strip() or key != key.strip():
+        if not isinstance(key, str):
             raise ValueError("model output key is invalid")
-        if key in indexed:
-            raise ValueError("model output key is duplicated")
-        indexed[key] = {name: item[name] for name in fields}
+        indexed.append((key, {name: item[name] for name in fields}))
     return indexed
 
 
@@ -136,13 +134,8 @@ def normalize_project_index(value: object) -> dict[str, dict[str, dict[str, Any]
         ("entities", "entity"),
         ("scenes", "scene"),
     ):
-        retained = [
-            (local_key, record)
-            for local_key, record in discovered[category].items()
-            if record["occurrences"]
-        ]
         result[category] = {}
-        for index, (local_key, record) in enumerate(retained, 1):
+        for index, (local_key, record) in enumerate(discovered[category], 1):
             stable_key = f"{prefix}-{index:02d}"
             result[category][stable_key] = record
             alias_candidates.setdefault(local_key, []).append(stable_key)
@@ -153,12 +146,7 @@ def normalize_project_index(value: object) -> dict[str, dict[str, dict[str, Any]
         if len(candidates) == 1
     }
     result["relations"] = {}
-    retained_relations = [
-        record
-        for record in discovered["relations"].values()
-        if record["occurrences"]
-    ]
-    for index, record in enumerate(retained_relations, 1):
+    for index, (_local_key, record) in enumerate(discovered["relations"], 1):
         result["relations"][f"relation-{index:02d}"] = {
             **record,
             "subject_key": aliases.get(

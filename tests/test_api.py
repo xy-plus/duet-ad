@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -51,6 +53,30 @@ class SuccessfulPipeline:
 class ExplodingPipeline:
     def run(self, _project_id: str) -> None:
         raise RuntimeError("background exploded")
+
+
+class BlockingCountingPipeline:
+    def __init__(self, store: ProjectStore) -> None:
+        self.store = store
+        self.run_count = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def run(self, project_id: str) -> None:
+        self.run_count += 1
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError("test did not release pipeline")
+        SuccessfulPipeline(self.store).run(project_id)
+
+
+class NeverRunPipeline:
+    def __init__(self) -> None:
+        self.run_count = 0
+
+    def run(self, _project_id: str) -> None:
+        self.run_count += 1
+        raise AssertionError("idempotency replay must not start the pipeline")
 
 
 class ResumablePipeline:
@@ -368,6 +394,284 @@ def test_create_uses_exact_recovery_shape_fixed_paths_and_four_public_statuses(t
         assert replacement.content == b"replacement"
 
 
+def test_create_client_request_id_replays_same_project_without_rewriting_or_rerunning(
+    tmp_path: Path,
+):
+    app = create_app(
+        settings(tmp_path),
+        pipeline_factory=lambda _settings, store, _register_asset: BlockingCountingPipeline(
+            store
+        ),
+    )
+    pipeline = app.state.pipeline
+    with TestClient(app) as client:
+        try:
+            first = client.post(
+                "/api/conversations",
+                headers=AUTH,
+                data=create_payload(client_request_id="durable-request-1"),
+                files={
+                    "file": ("source.mp4", b"source-video", "video/mp4"),
+                    "replacement_image": (
+                        "product.png",
+                        b"replacement-image",
+                        "image/png",
+                    ),
+                },
+            )
+            assert first.status_code == 201, first.text
+            assert pipeline.started.wait(timeout=2)
+            project_id = first.json()["id"]
+            source = app.state.store.path(project_id) / "inputs" / "source.mp4"
+            replacement = (
+                app.state.store.path(project_id) / "inputs" / "replacement-image"
+            )
+            source_stat = source.stat()
+            replacement_stat = replacement.stat()
+
+            replay = client.post(
+                "/api/conversations",
+                headers=AUTH,
+                data=create_payload(
+                    client_request_id="durable-request-1",
+                    generation_request=json.dumps(
+                        GENERATION_REQUEST,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        indent=2,
+                    ),
+                ),
+                files={
+                    "file": ("source.mp4", b"source-video", "video/mp4"),
+                    "replacement_image": (
+                        "product.png",
+                        b"replacement-image",
+                        "image/png",
+                    ),
+                },
+            )
+            assert replay.status_code == 200, replay.text
+            assert replay.json() == first.json()
+            assert pipeline.run_count == 1
+            assert source.stat().st_ino == source_stat.st_ino
+            assert source.stat().st_mtime_ns == source_stat.st_mtime_ns
+            assert replacement.stat().st_ino == replacement_stat.st_ino
+            assert replacement.stat().st_mtime_ns == replacement_stat.st_mtime_ns
+            assert len(client.get("/api/conversations", headers=AUTH).json()) == 1
+            assert list(app.state.store.root.glob(".create-staging-*")) == []
+
+            receipt = first.json()["input_receipt"]
+            assert receipt["source"] == {
+                "sha256": hashlib.sha256(b"source-video").hexdigest(),
+                "bytes": len(b"source-video"),
+            }
+            assert receipt["replacement_image"] == {
+                "sha256": hashlib.sha256(b"replacement-image").hexdigest(),
+                "bytes": len(b"replacement-image"),
+            }
+            index_path = app.state.store.idempotency_index_path
+            index_text = index_path.read_text(encoding="utf-8")
+            assert os.stat(index_path).st_mode & 0o777 == 0o600
+            assert "durable-request-1" not in index_text
+            assert "source-video" not in index_text
+            assert "replacement-image" not in index_text
+            assert len(json.loads(index_text)["entries"]) == 1
+        finally:
+            pipeline.release.set()
+        wait_for_status(client, first.json()["id"], "succeeded")
+
+
+def test_create_client_request_id_conflicts_on_any_bound_input_change(tmp_path: Path):
+    app = create_app(
+        settings(tmp_path),
+        pipeline_factory=lambda _settings, store, _register_asset: BlockingCountingPipeline(
+            store
+        ),
+    )
+    pipeline = app.state.pipeline
+    with TestClient(app) as client:
+        try:
+            first = client.post(
+                "/api/conversations",
+                headers=AUTH,
+                data=create_payload(client_request_id="durable-conflict-1"),
+                files={
+                    "file": ("source.mp4", b"source-a", "video/mp4"),
+                    "replacement_image": ("product.png", b"image-a", "image/png"),
+                },
+            )
+            assert first.status_code == 201
+            assert pipeline.started.wait(timeout=2)
+
+            changed_request = {
+                **GENERATION_REQUEST,
+                "output": {
+                    **GENERATION_REQUEST["output"],
+                    "resolution": "768p",
+                },
+            }
+            conflicts = [
+                (
+                    create_payload(client_request_id="durable-conflict-1"),
+                    {
+                        "file": ("source.mp4", b"source-b", "video/mp4"),
+                        "replacement_image": (
+                            "product.png",
+                            b"image-a",
+                            "image/png",
+                        ),
+                    },
+                ),
+                (
+                    create_payload(
+                        client_request_id="durable-conflict-1",
+                        generation_request=json.dumps(changed_request),
+                    ),
+                    {
+                        "file": ("source.mp4", b"source-a", "video/mp4"),
+                        "replacement_image": (
+                            "product.png",
+                            b"image-a",
+                            "image/png",
+                        ),
+                    },
+                ),
+                (
+                    create_payload(client_request_id="durable-conflict-1"),
+                    {
+                        "file": ("source.mp4", b"source-a", "video/mp4"),
+                        "replacement_image": (
+                            "product.png",
+                            b"image-b",
+                            "image/png",
+                        ),
+                    },
+                ),
+            ]
+            for data, files in conflicts:
+                conflict = client.post(
+                    "/api/conversations",
+                    headers=AUTH,
+                    data=data,
+                    files=files,
+                )
+                assert conflict.status_code == 409, conflict.text
+                assert conflict.json()["detail"]["code"] == (
+                    "client_request_id_conflict"
+                )
+            assert pipeline.run_count == 1
+            assert len(client.get("/api/conversations", headers=AUTH).json()) == 1
+        finally:
+            pipeline.release.set()
+        wait_for_status(client, first.json()["id"], "succeeded")
+
+
+def test_blank_client_request_id_always_creates_a_new_project(tmp_path: Path):
+    app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
+    with TestClient(app) as client:
+        responses = [
+            client.post(
+                "/api/conversations",
+                headers=AUTH,
+                data=create_payload(client_request_id=""),
+                files={"file": ("source.mp4", b"same-source", "video/mp4")},
+            )
+            for _ in range(2)
+        ]
+        assert [item.status_code for item in responses] == [201, 201]
+        assert responses[0].json()["id"] != responses[1].json()["id"]
+        assert len(client.get("/api/conversations", headers=AUTH).json()) == 2
+
+
+def test_client_request_id_replay_survives_app_restart(tmp_path: Path):
+    configured = settings(tmp_path)
+    first_app = create_app(configured, pipeline_factory=successful_factory)
+    with TestClient(first_app) as client:
+        created = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(client_request_id="restart-request-1"),
+            files={"file": ("source.mp4", b"restart-source", "video/mp4")},
+        )
+        assert created.status_code == 201
+        project_id = created.json()["id"]
+        wait_for_status(client, project_id, "succeeded")
+
+    second_app = create_app(
+        configured,
+        pipeline_factory=lambda _settings, _store, _register_asset: NeverRunPipeline(),
+    )
+    with TestClient(second_app) as client:
+        replay = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(client_request_id="restart-request-1"),
+            files={"file": ("source.mp4", b"restart-source", "video/mp4")},
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["id"] == project_id
+        assert replay.json()["status"] == "succeeded"
+        assert second_app.state.pipeline.run_count == 0
+        assert len(client.get("/api/conversations", headers=AUTH).json()) == 1
+
+
+@pytest.mark.parametrize("damage", ["missing", "malformed", "incomplete"])
+def test_client_request_id_index_damage_fails_closed_without_new_project(
+    tmp_path: Path,
+    damage: str,
+):
+    configured = settings(tmp_path)
+    first_app = create_app(configured, pipeline_factory=successful_factory)
+    with TestClient(first_app) as client:
+        created = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(client_request_id="damaged-index-request"),
+            files={"file": ("source.mp4", b"damaged-index-source", "video/mp4")},
+        )
+        assert created.status_code == 201
+        project_id = created.json()["id"]
+        wait_for_status(client, project_id, "succeeded")
+        index_path = first_app.state.store.idempotency_index_path
+
+    if damage == "missing":
+        index_path.unlink()
+    elif damage == "malformed":
+        index_path.write_text("{", encoding="utf-8")
+    else:
+        index_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": {
+                        "0" * 64: {
+                            "project_id": project_id,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    second_app = create_app(
+        configured,
+        pipeline_factory=lambda _settings, _store, _register_asset: NeverRunPipeline(),
+    )
+    with TestClient(second_app) as client:
+        replay = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(client_request_id="damaged-index-request"),
+            files={"file": ("source.mp4", b"damaged-index-source", "video/mp4")},
+        )
+        assert replay.status_code == 503, replay.text
+        assert replay.json()["detail"]["code"] == "idempotency_index_unavailable"
+        assert second_app.state.pipeline.run_count == 0
+        projects = client.get("/api/conversations", headers=AUTH).json()
+        assert [item["id"] for item in projects] == [project_id]
+        assert list(second_app.state.store.root.glob(".create-staging-*")) == []
+
+
 def test_generation_request_and_missing_source_errors_are_stable_and_create_nothing(tmp_path: Path):
     app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
     with TestClient(app) as client:
@@ -505,7 +809,7 @@ def test_provider_asset_signature_binds_project_asset_id_token_and_real_path(tmp
         second = client.post(
             "/api/conversations",
             headers=AUTH,
-            data=create_payload(),
+            data=create_payload(client_request_id="request-2"),
             files={"file": ("source.mp4", b"second", "video/mp4")},
         ).json()
         source = app.state.store.path(first["id"]) / "inputs" / "source.mp4"

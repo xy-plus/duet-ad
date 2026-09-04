@@ -1058,7 +1058,7 @@ function projectPhaseLabel(detail) {
   if (["h3", "h3-max-r2v", "picsart-resume", "stitch", "stitching", "stitch-resume"].includes(stage)) {
     return "AI 正在生成视频";
   }
-  if (["video-maker", "video-maker-resume", "translation", "video-maker-project-index",
+  if (["video-maker", "video-maker-resume", "translation", "video-maker-project-index", "object-replace",
     "context_ir", "context_ir_native"].includes(stage)) {
     return "AI 正在思考创意";
   }

@@ -918,6 +918,12 @@ class MediaKitClient:
 
 class PicsartClient:
     WORKFLOW = "minimax/h3-max/reference-to-video"
+    # These client errors establish that the request was not accepted. Timeout,
+    # conflict/early-data and rate-limit responses remain submission-unknown.
+    SAFE_REJECT_STATUS_CODES = frozenset(
+        code for code in range(400, 500)
+        if code not in {408, 409, 425, 429}
+    )
 
     def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None) -> None:
         self.settings = settings
@@ -929,11 +935,28 @@ class PicsartClient:
         prompt: str,
         video_url: str,
         image_url: str | None,
-        audio_url: str | None = None,
+        audio_urls: list[str] | None = None,
         duration: int,
         resolution: str,
         aspect_ratio: str,
     ) -> ProviderResult[str]:
+        if audio_urls is not None:
+            if not isinstance(audio_urls, list):
+                raise ValueError("Picsart audio_urls must be a list or None")
+            if len(audio_urls) > 3:
+                raise ValueError("Picsart audio_urls supports at most 3 URLs")
+            if any(
+                not isinstance(url, str)
+                or not url
+                or url != url.strip()
+                for url in audio_urls
+            ):
+                raise ValueError(
+                    "Picsart audio_urls must contain trimmed non-empty strings"
+                )
+            if len(audio_urls) != len(set(audio_urls)):
+                raise ValueError("Picsart audio_urls must not contain duplicates")
+
         params: dict[str, Any] = {
             "prompt": prompt,
             "reference_video_urls": [video_url],
@@ -944,8 +967,8 @@ class PicsartClient:
         }
         if image_url:
             params["reference_image_urls"] = [image_url]
-        if audio_url:
-            params["reference_audio_urls"] = [audio_url]
+        if audio_urls:
+            params["reference_audio_urls"] = audio_urls
         body = {"params": params}
         record: dict[str, Any] | None = None
         try:
@@ -962,7 +985,12 @@ class PicsartClient:
                     exc.record["outcome"] = "unknown"
                     raise
             if not response.is_success:
-                record["outcome"] = "rejected"
+                status_code = response.status_code
+                record["outcome"] = (
+                    "rejected"
+                    if status_code in self.SAFE_REJECT_STATUS_CODES
+                    else "unknown"
+                )
                 _ensure_success(response, record)
             payload = _json_body(response)
             envelope = payload.get("response") if isinstance(payload, dict) else None

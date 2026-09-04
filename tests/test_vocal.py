@@ -83,6 +83,32 @@ def test_per_asr_line_classification_uses_overlap_duration():
     ) is None
 
 
+def test_asr_interval_without_acoustic_coverage_is_unclassified():
+    assert vocal.classify_segment(
+        2000,
+        3000,
+        [_window(0, 1000, spoken=0.9)],
+    ) is None
+
+
+def test_filter_continues_when_asr_interval_has_no_acoustic_coverage():
+    analysis = vocal.VocalAnalysis(
+        windows=[_window(0, 1000, spoken=0.9)],
+        has_bgm=False,
+    )
+    lines = [
+        {"text": "covered", "start_s": 0.0, "end_s": 1.0},
+        {"text": "outside", "start_s": 2.0, "end_s": 3.0},
+    ]
+
+    effective, decisions = media.filter_spoken_lines(lines, analysis)
+
+    assert effective == [{"text": "covered", "start_s": 0.0, "end_s": 1.0}]
+    assert decisions[1]["classification"] is None
+    assert decisions[1]["kept"] is False
+    assert decisions[1]["drop_reason"] == "no_vocal_evidence"
+
+
 def test_filter_spoken_lines_keeps_provenance_but_excludes_sung_and_sentinels():
     analysis = vocal.VocalAnalysis(
         windows=[

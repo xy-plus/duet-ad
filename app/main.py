@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import hmac
 import json
 import logging
@@ -17,7 +18,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -26,7 +27,14 @@ from app.config import Settings, get_settings
 from app.pipeline import Pipeline
 from app.research_log import ResearchLog
 from app.safe_download import ReferenceDownloadError, Resolver, download_reference_url, resolve_addresses
-from app.store import ProjectStateError, ProjectStore
+from app.store import (
+    ClientRequestIdConflict,
+    IdempotencyIndexUnavailable,
+    ProjectStateError,
+    ProjectStore,
+    canonical_json_sha256,
+    creation_request_digest,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -156,6 +164,17 @@ async def _write_upload(upload: UploadFile, destination: Path, max_bytes: int) -
         raise
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _parse_generation_request(
     raw: str, internal_fusion_agent: str = "deepseek",
 ) -> dict[str, Any]:
@@ -212,6 +231,7 @@ def create_app(
     app.state.tasks = set()
     app.state.assets: dict[str, dict[str, Any]] = {}
     app.state.assets_lock = threading.Lock()
+    app.state.resume_lock = threading.Lock()
     app.state.pipeline_workers = 0
     app.state.pipeline_workers_lock = threading.Lock()
 
@@ -354,6 +374,7 @@ def create_app(
     @app.post("/api/conversations", status_code=201, dependencies=[Depends(require_auth)])
     async def create_conversation(
         request: Request,
+        response: Response,
         file: UploadFile | None = File(default=None),
         reference_url: str | None = Form(default=None),
         client_request_id: str = Form(default=""),
@@ -377,69 +398,122 @@ def create_app(
             if replacement_media_type not in REPLACEMENT_MEDIA_TYPES:
                 raise _error(415, "unsupported_replacement_image", "替换图片类型不受支持")
 
-        project_id, project, state = app.state.store.create(effective_request, client_request_id)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".create-staging-",
+                dir=app.state.store.root,
+            ) as staging_name:
+                staging = Path(staging_name)
+                os.chmod(staging, 0o700)
+                staged_source = staging / "source.mp4"
+                staged_replacement = staging / "replacement-image"
+                if file is not None:
+                    source_bytes = await _write_upload(file, staged_source, source_limit)
+                    source_snapshot = {
+                        "mode": "upload",
+                        "filename": _safe_basename(file.filename, "source.mp4"),
+                        "bytes": source_bytes,
+                    }
+                else:
+                    source_bytes = await download_reference_url(
+                        normalized_reference_url,
+                        staged_source,
+                        max_bytes=source_limit,
+                        timeout_s=configured.request_timeout_s,
+                        resolver=reference_resolver,
+                        transport=reference_transport,
+                    )
+                    source_snapshot = {
+                        "mode": "link",
+                        "reference_url": normalized_reference_url,
+                    }
+                source_sha256 = _sha256_file(staged_source)
+
+                replacement_snapshot = None
+                replacement_receipt = None
+                if replacement_image is not None:
+                    replacement_bytes = await _write_upload(
+                        replacement_image,
+                        staged_replacement,
+                        REPLACEMENT_MAX_BYTES,
+                    )
+                    replacement_sha256 = _sha256_file(staged_replacement)
+                    replacement_snapshot = {
+                        "filename": _safe_basename(
+                            replacement_image.filename,
+                            "replacement-image",
+                        ),
+                        "bytes": replacement_bytes,
+                        "media_type": replacement_media_type,
+                    }
+                    replacement_receipt = {
+                        "sha256": replacement_sha256,
+                        "bytes": replacement_bytes,
+                    }
+
+                generation_request_sha256 = canonical_json_sha256(effective_request)
+                input_receipt = {
+                    "version": 1,
+                    "client_request_id": client_request_id,
+                    "generation_request_sha256": generation_request_sha256,
+                    "source": {
+                        "sha256": source_sha256,
+                        "bytes": source_bytes,
+                    },
+                    "replacement_image": replacement_receipt,
+                }
+                request_digest = creation_request_digest(
+                    generation_request_sha256,
+                    source_sha256,
+                    (
+                        replacement_receipt["sha256"]
+                        if replacement_receipt is not None
+                        else None
+                    ),
+                )
+                project_id, project, state, created = app.state.store.create_from_staging(
+                    effective_request,
+                    client_request_id,
+                    request_digest=request_digest,
+                    input_receipt=input_receipt,
+                    source_snapshot=source_snapshot,
+                    staged_source=staged_source,
+                    replacement_snapshot=replacement_snapshot,
+                    staged_replacement=(
+                        staged_replacement if replacement_image is not None else None
+                    ),
+                )
+        except UploadTooLarge:
+            raise _error(413, "upload_too_large", "上传文件超过大小限制") from None
+        except ReferenceDownloadError as exc:
+            raise _error(exc.status_code, exc.code, exc.message) from None
+        except ClientRequestIdConflict:
+            raise _error(
+                409,
+                "client_request_id_conflict",
+                "client_request_id 已绑定到不同的创建输入",
+            ) from None
+        except IdempotencyIndexUnavailable:
+            LOGGER.exception("durable client request index is unavailable")
+            raise _error(
+                503,
+                "idempotency_index_unavailable",
+                "创建请求幂等记录不可用，已停止创建以避免重复项目",
+            ) from None
+        except OSError:
+            raise _error(500, "input_write_failed", "无法保存上传文件") from None
+        except Exception:
+            LOGGER.exception("could not commit creation input")
+            raise _error(500, "input_read_failed", "无法读取上传文件") from None
+
+        response.status_code = 201 if created else 200
+        if not created:
+            return state
+
         log = ResearchLog(project)
         input_dir = project / "inputs"
         source = input_dir / "source.mp4"
         replacement_path = input_dir / "replacement-image"
-        try:
-            if file is not None:
-                source_bytes = await _write_upload(file, source, source_limit)
-                source_mode = {
-                    "mode": "upload",
-                    "filename": _safe_basename(file.filename, "source.mp4"),
-                    "bytes": source_bytes,
-                }
-            else:
-                source_bytes = await download_reference_url(
-                    normalized_reference_url,
-                    source,
-                    max_bytes=source_limit,
-                    timeout_s=configured.request_timeout_s,
-                    resolver=reference_resolver,
-                    transport=reference_transport,
-                )
-                source_mode = {"mode": "link", "reference_url": normalized_reference_url}
-
-            replacement_snapshot = None
-            if replacement_image is not None:
-                replacement_bytes = await _write_upload(
-                    replacement_image,
-                    replacement_path,
-                    REPLACEMENT_MAX_BYTES,
-                )
-                replacement_snapshot = {
-                    "filename": _safe_basename(replacement_image.filename, "replacement-image"),
-                    "bytes": replacement_bytes,
-                    "media_type": replacement_media_type,
-                    "preview_url": f"/api/conversations/{project_id}/creation-input/replacement-image",
-                }
-        except UploadTooLarge:
-            app.state.store.mark_failed(project_id, code="upload_too_large", message="上传文件超过大小限制")
-            raise _error(413, "upload_too_large", "上传文件超过大小限制") from None
-        except ReferenceDownloadError as exc:
-            app.state.store.mark_failed(project_id, code=exc.code, message=exc.message)
-            raise _error(exc.status_code, exc.code, exc.message) from None
-        except OSError:
-            app.state.store.mark_failed(project_id, code="input_write_failed", message="无法保存上传文件")
-            raise _error(500, "input_write_failed", "无法保存上传文件") from None
-        except Exception:
-            app.state.store.mark_failed(project_id, code="input_read_failed", message="无法读取上传文件")
-            raise _error(500, "input_read_failed", "无法读取上传文件") from None
-
-        creation_input = {
-            "version": 1,
-            "source": source_mode,
-            "replacement_image": replacement_snapshot,
-        }
-        state = app.state.store.update(
-            project_id,
-            source_path="inputs/source.mp4",
-            source_bytes=source_bytes,
-            replacement_image_path="inputs/replacement-image" if replacement_image is not None else None,
-            creation_input=creation_input,
-            has_source=True,
-        )
         attempt = log.attempt_dir("http-create", "project", 1)
         log.write_json(attempt / "input.json", {
             "headers": dict(request.headers),
@@ -475,33 +549,34 @@ def create_app(
         if not isinstance(body, dict) or body.get("confirm") is not True:
             raise _error(400, "confirmation_required", "必须明确确认续跑前置产物")
         store = _store(request)
-        state = _read_project(store, project_id)
-        if state.get("status") != "failed":
-            raise _error(409, "project_not_failed", "只有失败项目可以续跑前置产物")
-        try:
-            app.state.pipeline.validate_pre_picsart_resume(project_id)
-        except (FileNotFoundError, TypeError, ValueError, OSError):
-            raise _error(
-                409,
-                "pre_picsart_resume_not_ready",
-                "项目缺少可安全复用的前置产物，或已存在 Picsart 提交痕迹",
-            ) from None
-        state = store.update(
-            project_id,
-            status="queued",
-            has_video=False,
-            project_progress={
-                "status": "queued",
-                "percent": 0,
-                "stage": "pre_picsart_resume_queued",
-            },
-            generation={
-                "status": "queued",
-                "stage": "pre_picsart_resume_queued",
-                "error": None,
-            },
-            error=None,
-        )
+        with app.state.resume_lock:
+            state = _read_project(store, project_id)
+            if state.get("status") != "failed":
+                raise _error(409, "project_not_failed", "只有失败项目可以续跑前置产物")
+            try:
+                app.state.pipeline.validate_pre_picsart_resume(project_id)
+            except (FileNotFoundError, TypeError, ValueError, OSError):
+                raise _error(
+                    409,
+                    "pre_picsart_resume_not_ready",
+                    "项目缺少可安全复用的前置产物，或已存在 Picsart 提交痕迹",
+                ) from None
+            state = store.update(
+                project_id,
+                status="queued",
+                has_video=False,
+                project_progress={
+                    "status": "queued",
+                    "percent": 0,
+                    "stage": "pre_picsart_resume_queued",
+                },
+                generation={
+                    "status": "queued",
+                    "stage": "pre_picsart_resume_queued",
+                    "error": None,
+                },
+                error=None,
+            )
         task = asyncio.create_task(
             asyncio.to_thread(pipeline_entry, project_id, "resume_pre_picsart")
         )
@@ -522,33 +597,34 @@ def create_app(
         if not isinstance(body, dict) or body.get("confirm") is not True:
             raise _error(400, "confirmation_required", "必须明确确认续跑 Picsart")
         store = _store(request)
-        state = _read_project(store, project_id)
-        if state.get("status") != "failed":
-            raise _error(409, "project_not_failed", "只有失败项目可以续跑 Picsart")
-        try:
-            app.state.pipeline.validate_r2v_resume(project_id)
-        except (FileNotFoundError, TypeError, ValueError, OSError):
-            raise _error(
-                409,
-                "picsart_resume_not_ready",
-                "项目缺少可复用的 Picsart 前置产物",
-            ) from None
-        state = store.update(
-            project_id,
-            status="queued",
-            has_video=False,
-            project_progress={
-                "status": "queued",
-                "percent": 0,
-                "stage": "picsart_resume_queued",
-            },
-            generation={
-                "status": "queued",
-                "stage": "picsart_resume_queued",
-                "error": None,
-            },
-            error=None,
-        )
+        with app.state.resume_lock:
+            state = _read_project(store, project_id)
+            if state.get("status") != "failed":
+                raise _error(409, "project_not_failed", "只有失败项目可以续跑 Picsart")
+            try:
+                app.state.pipeline.validate_r2v_resume(project_id)
+            except (FileNotFoundError, TypeError, ValueError, OSError):
+                raise _error(
+                    409,
+                    "picsart_resume_not_ready",
+                    "项目缺少可复用的 Picsart 前置产物",
+                ) from None
+            state = store.update(
+                project_id,
+                status="queued",
+                has_video=False,
+                project_progress={
+                    "status": "queued",
+                    "percent": 0,
+                    "stage": "picsart_resume_queued",
+                },
+                generation={
+                    "status": "queued",
+                    "stage": "picsart_resume_queued",
+                    "error": None,
+                },
+                error=None,
+            )
         task = asyncio.create_task(
             asyncio.to_thread(pipeline_entry, project_id, "resume_r2v")
         )

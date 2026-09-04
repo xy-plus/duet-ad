@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
+import stat
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -12,8 +14,11 @@ from typing import Any
 
 
 PROJECT_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 PUBLIC_STATUSES = frozenset({"queued", "running", "succeeded", "failed"})
 LEGACY_STATUS_ALIASES = {"processing": "running", "done": "succeeded"}
+IDEMPOTENCY_INDEX_VERSION = 1
+IDEMPOTENCY_INDEX_NAME = ".client-request-index.json"
 
 
 def utcnow() -> str:
@@ -22,6 +27,51 @@ def utcnow() -> str:
 
 class ProjectStateError(RuntimeError):
     """Persisted project state is structurally unsafe to expose or update."""
+
+
+class ClientRequestIdConflict(RuntimeError):
+    """A client request id is already bound to different immutable inputs."""
+
+
+class IdempotencyIndexUnavailable(RuntimeError):
+    """The durable create claim cannot be trusted, so creation must fail closed."""
+
+
+def canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def creation_request_digest(
+    generation_request_sha256: str,
+    source_sha256: str,
+    replacement_image_sha256: str | None,
+) -> str:
+    """Hash the immutable v1 idempotency tuple without retaining input data."""
+
+    for digest in (generation_request_sha256, source_sha256):
+        if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            raise ValueError("invalid creation input digest")
+    if (
+        replacement_image_sha256 is not None
+        and (
+            not isinstance(replacement_image_sha256, str)
+            or SHA256_RE.fullmatch(replacement_image_sha256) is None
+        )
+    ):
+        raise ValueError("invalid creation input digest")
+    return canonical_json_sha256(
+        [
+            generation_request_sha256,
+            source_sha256,
+            replacement_image_sha256,
+        ]
+    )
 
 
 class ProjectStore:
@@ -36,6 +86,7 @@ class ProjectStore:
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
+        self.idempotency_index_path = self.root / IDEMPOTENCY_INDEX_NAME
         self._lock = threading.RLock()
         self._process_lock_fd: int | None = None
         if acquire_process_lock:
@@ -65,6 +116,431 @@ class ProjectStore:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _file_receipt(path: Path) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        total = 0
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                digest.update(chunk)
+        return total, digest.hexdigest()
+
+    @staticmethod
+    def _validated_receipt_digest(
+        receipt: Any,
+        *,
+        client_request_id: str,
+    ) -> str:
+        if not isinstance(receipt, dict) or receipt.get("version") != 1:
+            raise IdempotencyIndexUnavailable("project input receipt is missing or invalid")
+        if receipt.get("client_request_id") != client_request_id:
+            raise IdempotencyIndexUnavailable("project input receipt belongs to another request")
+        generation_digest = receipt.get("generation_request_sha256")
+        source = receipt.get("source")
+        replacement = receipt.get("replacement_image")
+        if not isinstance(source, dict):
+            raise IdempotencyIndexUnavailable("project source receipt is missing")
+        source_digest = source.get("sha256")
+        source_bytes = source.get("bytes")
+        if (
+            not isinstance(source_digest, str)
+            or SHA256_RE.fullmatch(source_digest) is None
+            or isinstance(source_bytes, bool)
+            or not isinstance(source_bytes, int)
+            or source_bytes < 0
+        ):
+            raise IdempotencyIndexUnavailable("project source receipt is invalid")
+        replacement_digest: str | None
+        if replacement is None:
+            replacement_digest = None
+        elif isinstance(replacement, dict):
+            replacement_digest = replacement.get("sha256")
+            replacement_bytes = replacement.get("bytes")
+            if (
+                not isinstance(replacement_digest, str)
+                or SHA256_RE.fullmatch(replacement_digest) is None
+                or isinstance(replacement_bytes, bool)
+                or not isinstance(replacement_bytes, int)
+                or replacement_bytes < 0
+            ):
+                raise IdempotencyIndexUnavailable("project replacement receipt is invalid")
+        else:
+            raise IdempotencyIndexUnavailable("project replacement receipt is invalid")
+        try:
+            return creation_request_digest(
+                generation_digest,
+                source_digest,
+                replacement_digest,
+            )
+        except ValueError as exc:
+            raise IdempotencyIndexUnavailable(
+                "project generation request receipt is invalid"
+            ) from exc
+
+    def _has_persisted_idempotent_project_unlocked(self) -> bool:
+        """Distinguish a fresh store from a lost index after prior commits."""
+
+        for project in self.root.iterdir():
+            if not project.is_dir() or PROJECT_ID_RE.fullmatch(project.name) is None:
+                continue
+            try:
+                raw = json.loads((project / "state.json").read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            receipt = raw.get("input_receipt") if isinstance(raw, dict) else None
+            if (
+                isinstance(receipt, dict)
+                and isinstance(receipt.get("client_request_id"), str)
+                and receipt["client_request_id"]
+            ):
+                return True
+        return False
+
+    def _read_idempotency_index_unlocked(self) -> dict[str, Any]:
+        try:
+            descriptor = os.open(
+                self.idempotency_index_path,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            if self._has_persisted_idempotent_project_unlocked():
+                raise IdempotencyIndexUnavailable(
+                    "idempotency index is missing after committed projects"
+                ) from None
+            return {"version": IDEMPOTENCY_INDEX_VERSION, "entries": {}}
+        except OSError as exc:
+            raise IdempotencyIndexUnavailable("idempotency index cannot be opened") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise IdempotencyIndexUnavailable("idempotency index is not a regular file")
+            with os.fdopen(descriptor, "r", encoding="utf-8", closefd=True) as handle:
+                descriptor = -1
+                value = json.load(handle)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise IdempotencyIndexUnavailable("idempotency index is not valid JSON") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"version", "entries"}
+            or isinstance(value.get("version"), bool)
+            or value.get("version") != IDEMPOTENCY_INDEX_VERSION
+            or not isinstance(value.get("entries"), dict)
+        ):
+            raise IdempotencyIndexUnavailable("idempotency index schema is invalid")
+        project_ids: set[str] = set()
+        for key_digest, entry in value["entries"].items():
+            if (
+                not isinstance(key_digest, str)
+                or SHA256_RE.fullmatch(key_digest) is None
+                or not isinstance(entry, dict)
+                or set(entry) != {"project_id", "request_digest"}
+                or not isinstance(entry.get("project_id"), str)
+                or PROJECT_ID_RE.fullmatch(entry["project_id"]) is None
+                or not isinstance(entry.get("request_digest"), str)
+                or SHA256_RE.fullmatch(entry["request_digest"]) is None
+                or entry["project_id"] in project_ids
+            ):
+                raise IdempotencyIndexUnavailable("idempotency index entry is invalid")
+            project_ids.add(entry["project_id"])
+        return value
+
+    def _write_idempotency_index_unlocked(self, value: dict[str, Any]) -> None:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        temporary = self.idempotency_index_path.with_name(
+            f".{self.idempotency_index_path.name}.tmp"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, self.idempotency_index_path)
+            self._fsync_directory(self.root)
+        except BaseException:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _read_claimed_project_unlocked(
+        self,
+        *,
+        project_id: str,
+        client_request_id: str,
+        request_digest: str,
+    ) -> tuple[Path, dict[str, Any]]:
+        try:
+            state = self._read_unlocked(project_id)
+        except (FileNotFoundError, OSError, ProjectStateError) as exc:
+            raise IdempotencyIndexUnavailable(
+                "idempotency claim does not reference a readable project"
+            ) from exc
+        if state.get("client_request_id") != client_request_id:
+            raise IdempotencyIndexUnavailable(
+                "idempotency claim and project request id disagree"
+            )
+        receipt = state.get("input_receipt")
+        receipt_digest = self._validated_receipt_digest(
+            receipt,
+            client_request_id=client_request_id,
+        )
+        if receipt_digest != request_digest:
+            raise IdempotencyIndexUnavailable(
+                "idempotency claim and project receipt disagree"
+            )
+        if canonical_json_sha256(state.get("effective_request")) != receipt.get(
+            "generation_request_sha256"
+        ):
+            raise IdempotencyIndexUnavailable(
+                "project effective request no longer matches its receipt"
+            )
+        if state.get("has_source") is not True or state.get("source_path") != "inputs/source.mp4":
+            raise IdempotencyIndexUnavailable("claimed project source is incomplete")
+        project = self.path(project_id)
+        try:
+            source_path = self.resolve_project_file(
+                project_id,
+                project / "inputs" / "source.mp4",
+            )
+            source_bytes, source_digest = self._file_receipt(source_path)
+        except (FileNotFoundError, OSError) as exc:
+            raise IdempotencyIndexUnavailable("claimed project source is unreadable") from exc
+        if (
+            source_bytes != receipt["source"]["bytes"]
+            or source_digest != receipt["source"]["sha256"]
+        ):
+            raise IdempotencyIndexUnavailable("claimed project source does not match its receipt")
+        replacement_receipt = receipt.get("replacement_image")
+        if replacement_receipt is None:
+            if state.get("replacement_image_path") is not None:
+                raise IdempotencyIndexUnavailable(
+                    "claimed project replacement state is inconsistent"
+                )
+        else:
+            if state.get("replacement_image_path") != "inputs/replacement-image":
+                raise IdempotencyIndexUnavailable(
+                    "claimed project replacement image is incomplete"
+                )
+            try:
+                replacement_path = self.resolve_project_file(
+                    project_id,
+                    project / "inputs" / "replacement-image",
+                )
+                replacement_bytes, replacement_digest = self._file_receipt(replacement_path)
+            except (FileNotFoundError, OSError) as exc:
+                raise IdempotencyIndexUnavailable(
+                    "claimed project replacement image is unreadable"
+                ) from exc
+            if (
+                replacement_bytes != replacement_receipt["bytes"]
+                or replacement_digest != replacement_receipt["sha256"]
+            ):
+                raise IdempotencyIndexUnavailable(
+                    "claimed project replacement image does not match its receipt"
+                )
+        return project, state
+
+    def create_from_staging(
+        self,
+        effective_request: dict[str, Any],
+        client_request_id: str,
+        *,
+        request_digest: str,
+        input_receipt: dict[str, Any],
+        source_snapshot: dict[str, Any],
+        staged_source: Path,
+        replacement_snapshot: dict[str, Any] | None,
+        staged_replacement: Path | None,
+    ) -> tuple[str, Path, dict[str, Any], bool]:
+        """Commit staged inputs and a durable idempotency claim as one create step.
+
+        The claim is fsynced before a project is materialized.  A crash can
+        therefore leave a claim that returns an availability error, but it can
+        never make a retry create a second project for the same request id.
+        """
+
+        if not isinstance(client_request_id, str):
+            raise TypeError("client_request_id must be a string")
+        if not isinstance(request_digest, str) or SHA256_RE.fullmatch(request_digest) is None:
+            raise ValueError("invalid request digest")
+        receipt_digest = self._validated_receipt_digest(
+            input_receipt,
+            client_request_id=client_request_id,
+        )
+        if receipt_digest != request_digest:
+            raise ValueError("request digest does not match input receipt")
+        if canonical_json_sha256(effective_request) != input_receipt.get(
+            "generation_request_sha256"
+        ):
+            raise ValueError("effective request does not match input receipt")
+        try:
+            staged_source_resolved = staged_source.resolve(strict=True)
+        except (FileNotFoundError, OSError) as exc:
+            raise ValueError("staged source is missing") from exc
+        if self.root not in staged_source_resolved.parents or not staged_source_resolved.is_file():
+            raise ValueError("staged source must be a regular file inside the store")
+        source_bytes, source_digest = self._file_receipt(staged_source_resolved)
+        if (
+            source_bytes != input_receipt["source"]["bytes"]
+            or source_digest != input_receipt["source"]["sha256"]
+        ):
+            raise ValueError("staged source does not match input receipt")
+        replacement_receipt = input_receipt.get("replacement_image")
+        staged_replacement_resolved: Path | None = None
+        if replacement_receipt is None:
+            if staged_replacement is not None or replacement_snapshot is not None:
+                raise ValueError("unexpected staged replacement image")
+        else:
+            if staged_replacement is None or replacement_snapshot is None:
+                raise ValueError("staged replacement image is missing")
+            try:
+                staged_replacement_resolved = staged_replacement.resolve(strict=True)
+            except (FileNotFoundError, OSError) as exc:
+                raise ValueError("staged replacement image is missing") from exc
+            if (
+                self.root not in staged_replacement_resolved.parents
+                or not staged_replacement_resolved.is_file()
+            ):
+                raise ValueError(
+                    "staged replacement image must be a regular file inside the store"
+                )
+            replacement_bytes, replacement_digest = self._file_receipt(
+                staged_replacement_resolved
+            )
+            if (
+                replacement_bytes != replacement_receipt["bytes"]
+                or replacement_digest != replacement_receipt["sha256"]
+            ):
+                raise ValueError("staged replacement image does not match input receipt")
+
+        with self._lock:
+            index: dict[str, Any] | None = None
+            key_digest: str | None = None
+            if client_request_id:
+                index = self._read_idempotency_index_unlocked()
+                key_digest = hashlib.sha256(client_request_id.encode("utf-8")).hexdigest()
+                existing = index["entries"].get(key_digest)
+                if existing is not None:
+                    if existing["request_digest"] != request_digest:
+                        raise ClientRequestIdConflict(client_request_id)
+                    project, state = self._read_claimed_project_unlocked(
+                        project_id=existing["project_id"],
+                        client_request_id=client_request_id,
+                        request_digest=request_digest,
+                    )
+                    return existing["project_id"], project, state, False
+
+            project_id = uuid.uuid4().hex
+            while self.path(project_id).exists():
+                project_id = uuid.uuid4().hex
+            if index is not None and key_digest is not None:
+                index["entries"][key_digest] = {
+                    "project_id": project_id,
+                    "request_digest": request_digest,
+                }
+                self._write_idempotency_index_unlocked(index)
+
+            project = self.path(project_id)
+            project.mkdir(mode=0o700)
+            os.chmod(project, 0o700)
+            for name in ("inputs", "work", "output", "logs"):
+                directory = project / name
+                directory.mkdir(mode=0o700)
+                os.chmod(directory, 0o700)
+            self._fsync_directory(project)
+            self._fsync_directory(self.root)
+
+            input_dir = project / "inputs"
+            source = input_dir / "source.mp4"
+            os.replace(staged_source_resolved, source)
+            os.chmod(source, 0o600)
+            replacement_path = input_dir / "replacement-image"
+            if staged_replacement_resolved is not None:
+                os.replace(staged_replacement_resolved, replacement_path)
+                os.chmod(replacement_path, 0o600)
+            self._fsync_directory(input_dir)
+
+            now = utcnow()
+            replacement_creation = (
+                {
+                    **replacement_snapshot,
+                    "preview_url": (
+                        f"/api/conversations/{project_id}/creation-input/replacement-image"
+                    ),
+                }
+                if replacement_snapshot is not None
+                else None
+            )
+            state = {
+                "id": project_id,
+                "title": f"视频改编 {project_id[:8]}",
+                "status": "queued",
+                "created_at": now,
+                "updated_at": now,
+                "duration_s": 0,
+                "segment_count": 0,
+                "has_source": True,
+                "has_video": False,
+                "effective_request": effective_request,
+                "client_request_id": client_request_id,
+                "input_receipt": input_receipt,
+                "source_path": "inputs/source.mp4",
+                "source_bytes": input_receipt["source"]["bytes"],
+                "replacement_image_path": (
+                    "inputs/replacement-image" if replacement_snapshot is not None else None
+                ),
+                "project_progress": {
+                    "status": "queued",
+                    "percent": 0,
+                    "stage": "queued",
+                },
+                "generation": {
+                    "status": "queued",
+                    "stage": "upstream",
+                    "error": None,
+                },
+                "creation_input": {
+                    "version": 1,
+                    "source": source_snapshot,
+                    "replacement_image": replacement_creation,
+                },
+                "error": None,
+            }
+            self.write(project_id, state)
+            return project_id, project, state, True
 
     def create(self, effective_request: dict[str, Any], client_request_id: str) -> tuple[str, Path, dict[str, Any]]:
         project_id = uuid.uuid4().hex
@@ -173,6 +649,14 @@ class ProjectStore:
                     os.fsync(handle.fileno())
                 os.chmod(temporary, 0o600)
                 os.replace(temporary, target)
+                directory_descriptor = os.open(
+                    target.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
             except BaseException:
                 try:
                     temporary.unlink()

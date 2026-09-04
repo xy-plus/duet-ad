@@ -634,7 +634,7 @@ def test_picsart_submit_and_poll_are_split_and_poll_one_task(
         prompt="replace subject",
         video_url="https://assets.test/source.mp4",
         image_url="https://assets.test/reference.png",
-        audio_url="https://assets.test/voice.wav",
+        audio_urls=["https://assets.test/voice.wav"],
         duration=5,
         resolution="768p",
         aspect_ratio="16:9",
@@ -651,7 +651,7 @@ def test_picsart_submit_and_poll_are_split_and_poll_one_task(
     ]
 
 
-def test_picsart_advanced_request_omits_absent_optional_image(tmp_path: Path) -> None:
+def test_picsart_advanced_request_omits_empty_optional_inputs(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body == {
@@ -671,13 +671,90 @@ def test_picsart_advanced_request_omits_absent_optional_image(tmp_path: Path) ->
         prompt="prompt",
         video_url="https://assets.test/source.mp4",
         image_url=None,
-        audio_url=None,
+        audio_urls=[],
         duration=5,
         resolution="480p",
         aspect_ratio="9:16",
     )
 
     assert result.value == "task-no-image"
+
+
+def test_picsart_submit_preserves_three_audio_urls_in_order(tmp_path: Path) -> None:
+    audio_urls = [
+        "https://assets.test/first.wav",
+        "https://assets.test/second.wav",
+        "https://assets.test/third.wav",
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert (
+            json.loads(request.content)["params"]["reference_audio_urls"]
+            == audio_urls
+        )
+        return httpx.Response(200, json={"response": {"id": "task-three-audios"}})
+
+    result = PicsartClient(
+        _settings(tmp_path), httpx.MockTransport(handler)
+    ).submit(
+        prompt="prompt",
+        video_url="https://assets.test/source.mp4",
+        image_url=None,
+        audio_urls=audio_urls,
+        duration=5,
+        resolution="768p",
+        aspect_ratio="16:9",
+    )
+
+    assert result.value == "task-three-audios"
+
+
+@pytest.mark.parametrize(
+    ("audio_urls", "message"),
+    [
+        (
+            [
+                "https://assets.test/one.wav",
+                "https://assets.test/two.wav",
+                "https://assets.test/three.wav",
+                "https://assets.test/four.wav",
+            ],
+            "at most 3",
+        ),
+        (
+            [
+                "https://assets.test/repeated.wav",
+                "https://assets.test/repeated.wav",
+            ],
+            "duplicates",
+        ),
+        ([""], "non-empty strings"),
+        ([" https://assets.test/voice.wav"], "trimmed"),
+    ],
+)
+def test_picsart_submit_rejects_invalid_audio_urls_before_network(
+    tmp_path: Path, audio_urls: list[str], message: str
+) -> None:
+    network_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal network_calls
+        network_calls += 1
+        return httpx.Response(200, json={"response": {"id": "unexpected"}})
+
+    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
+    with pytest.raises(ValueError, match=message):
+        client.submit(
+            prompt="prompt",
+            video_url="https://assets.test/source.mp4",
+            image_url=None,
+            audio_urls=audio_urls,
+            duration=5,
+            resolution="768p",
+            aspect_ratio="16:9",
+        )
+
+    assert network_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -692,6 +769,14 @@ def test_picsart_advanced_request_omits_absent_optional_image(tmp_path: Path) ->
         (
             lambda request: httpx.Response(400, json={"error": "bad request"}),
             "rejected",
+        ),
+        (
+            lambda request: httpx.Response(500, json={"error": "upstream"}),
+            "unknown",
+        ),
+        (
+            lambda request: httpx.Response(429, json={"error": "rate limited"}),
+            "unknown",
         ),
         (
             lambda request: httpx.Response(200, json={"response": {}}),

@@ -9,6 +9,8 @@ from typing import Any
 
 FUSION_OUTPUT_NAME = "duet.h3-max-r2v-prompt-output"
 FUSION_OUTPUT_VERSION = 1
+AUTHORITY_BEGIN = "BEGIN AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN"
+AUTHORITY_END = "END AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN"
 
 
 def canonical_input(payload: dict[str, Any]) -> bytes:
@@ -33,7 +35,7 @@ def fusion_prompt_schema(
         "version": {"type": "integer", "enum": [FUSION_OUTPUT_VERSION]},
         "input_sha256": {"type": "string", "enum": [input_sha256]},
         "segment_index": {"type": "integer", "enum": [segment_index]},
-        "prompt": {"type": "string", "minLength": 1, "maxLength": 32768},
+        "prompt": {"type": "string"},
     }
     return {
         "type": "object",
@@ -48,6 +50,7 @@ def normalize_fusion_prompt(
     *,
     input_sha256: str,
     segment_index: int,
+    authoritative_constraints: str = "",
 ) -> str:
     if not isinstance(value, dict) or set(value) != {
         "schema", "version", "input_sha256", "segment_index", "prompt",
@@ -55,14 +58,20 @@ def normalize_fusion_prompt(
         raise ValueError("fusion prompt output is invalid")
     if (
         value["schema"] != FUSION_OUTPUT_NAME
+        or isinstance(value["version"], bool)
         or value["version"] != FUSION_OUTPUT_VERSION
         or value["input_sha256"] != input_sha256
+        or isinstance(value["segment_index"], bool)
         or value["segment_index"] != segment_index
     ):
         raise ValueError("fusion prompt output is not bound to its input")
     prompt = value["prompt"]
-    if not isinstance(prompt, str) or not prompt.strip() or prompt != prompt.strip():
+    if not isinstance(prompt, str):
         raise ValueError("fusion prompt output is invalid")
-    if len(prompt) > 32768 or len(prompt.encode("utf-8")) > 32 * 1024:
-        raise ValueError("fusion prompt output is invalid")
+    prompt = prompt.strip()
+    if not isinstance(authoritative_constraints, str):
+        raise ValueError("fusion authority block is invalid")
+    authoritative_constraints = authoritative_constraints.strip()
+    if authoritative_constraints:
+        prompt = prompt + "\n\n" + authoritative_constraints
     return prompt
