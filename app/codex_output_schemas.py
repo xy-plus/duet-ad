@@ -295,16 +295,34 @@ def prompt_fusion_schema(
         raise ValueError("prompt fusion visual character limit is invalid")
     visual = {"type": "string", "minLength": 1, "maxLength": visual_max_chars}
     segment_options = [
-        _object({
-            "index": {"type": "integer", "enum": [index]},
-            "visual": _array(visual, minimum=count, maximum=count),
-        })
+        {
+            **_object({
+                "index": {"type": "integer", "enum": [index]},
+                "visual": _array(visual, minimum=count, maximum=count),
+            }),
+            "description": (
+                f"Ordered segment {index}; visual must contain exactly {count} "
+                "hard-cut interval entries."
+            ),
+        }
         for index, count in enumerate(visual_counts, 1)
     ]
     segment = (
         segment_options[0]
         if len(segment_options) == 1
         else {"anyOf": segment_options}
+    )
+    segments = _array(
+        segment, minimum=len(visual_counts), maximum=len(visual_counts),
+    )
+    segments["description"] = (
+        "Keep segment indexes in input order with no omissions, duplicates, or "
+        "reordering. Exact visual counts by segment index: "
+        + ", ".join(
+            f"{index}={count}"
+            for index, count in enumerate(visual_counts, 1)
+        )
+        + "."
     )
     return _object({
         "schema": {
@@ -313,9 +331,7 @@ def prompt_fusion_schema(
         },
         "version": {"type": "integer", "enum": [2]},
         "input_sha256": {"type": "string", "enum": [input_sha256]},
-        "segments": _array(
-            segment, minimum=len(visual_counts), maximum=len(visual_counts),
-        ),
+        "segments": segments,
     })
 
 

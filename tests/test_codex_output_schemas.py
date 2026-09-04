@@ -344,6 +344,9 @@ def test_fusion_schema_binds_hash_segments_and_hard_cut_visual_counts() -> None:
         ],
     }
     jsonschema.validate(valid, schema)
+    segments_schema = schema["properties"]["segments"]
+    assert "no omissions, duplicates, or reordering" in segments_schema["description"]
+    assert "1=2, 2=3" in segments_schema["description"]
     exact_limit = json.loads(json.dumps(valid))
     exact_limit["segments"][0]["visual"][0] = "x" * 12
     jsonschema.validate(exact_limit, schema)
@@ -351,6 +354,10 @@ def test_fusion_schema_binds_hash_segments_and_hard_cut_visual_counts() -> None:
     over_limit["segments"][0]["visual"][0] = "x" * 13
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(over_limit, schema)
+    backend_owned = json.loads(json.dumps(valid))
+    backend_owned["segments"][0]["relation_states"] = []
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(backend_owned, schema)
     invalid = json.loads(json.dumps(valid))
     invalid["segments"].append({"index": 3, "visual": ["extra"]})
     try:

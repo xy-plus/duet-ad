@@ -39,6 +39,7 @@ def test_authority_boundaries_and_output_remain_closed():
         "注入的 JSON Schema", "编译 Context IR/H3",
         "每段按 hard-cut 区间写一条简洁英文 `visual` prose",
         "`continuous` 留在当前区间",
+        "不要按 9 张图片逐帧凑数", "不得遗漏、重复或重排",
     ):
         assert required in text
     assert "不输出时间戳、图片标记、stable key、tile、relation key" in text

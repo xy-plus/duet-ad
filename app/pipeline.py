@@ -3793,13 +3793,9 @@ def _prompt_fusion_early_output(
             isinstance(source_segment, dict)
             and "relation_occurrences" in source_segment
         )
-        allowed_keys = (
-            ({"index", "visual"}, {"index", "visual", "relation_states"})
-            if relation_contract else ({"index", "visual"},)
-        )
         if (
             not isinstance(segment, dict)
-            or set(segment) not in allowed_keys
+            or set(segment) != {"index", "visual"}
             or segment.get("index") != index
             or not isinstance(segment.get("visual"), list)
             or len(segment["visual"]) != visual_counts[index - 1]
@@ -3826,8 +3822,8 @@ def _prompt_fusion_early_output(
                 )
             except (KeyError, TypeError, long_generation.LongGenerationError):
                 raise ValueError("prompt fusion raw output is invalid") from None
-            # relation_states from the model is merely a hint.  Overwrite a
-            # wrong echo, or inject a missing one, from frozen backend input.
+            # The model is not allowed to author relation state.  Inject the
+            # backend-owned value only after its exact output shape is valid.
             segment["relation_states"] = expected
             normalized_relations = True
             try:
@@ -4314,6 +4310,9 @@ def produce_prompt_fusion(
             fusion_prompt = (
                 "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json "
                 "及其中 SHA 绑定的有序图片；按注入的输出 Schema 填写融合结果；"
+                f"segments 必须按 index 1 到 {len(visual_counts)} 顺序输出，"
+                "禁止遗漏、重复或重排；各段 visual 条数依次为 "
+                f"{json.dumps(list(visual_counts), separators=(',', ':'))}；"
                 f"每条 visual 不超过 {visual_max_chars} 个字符。"
             )
             raw_output_data = runner.run_isolated_until_output(

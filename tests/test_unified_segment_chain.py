@@ -348,22 +348,26 @@ def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> No
         "segments": [segment],
     }
     input_data = _canonical(payload)
-    output = {
+    model_output = {
         "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
         "version": long_generation.PROMPT_FUSION_VERSION,
         "input_sha256": hashlib.sha256(input_data).hexdigest(),
-        "segments": [_fusion_v2_output(segment, "bounded visual")],
+        "segments": [{
+            "index": segment["index"],
+            "visual": _fusion_v2_visual(segment, "bounded visual"),
+        }],
     }
     input_path = tmp_path / "multimodal_input.json"
     output_path = tmp_path / "h3_prompt_plan.json"
     input_path.write_bytes(input_data)
-    output_path.write_bytes(_canonical(output))
-    assert pipeline._prompt_fusion_early_output(
+    output_path.write_bytes(_canonical(model_output))
+    published = pipeline._prompt_fusion_early_output(
         output_path.read_bytes(),
-        input_sha256=output["input_sha256"],
+        input_sha256=model_output["input_sha256"],
         segment_count=1,
         input_segments=payload["segments"],
-    ) == output_path.read_bytes()
+    )
+    output_path.write_bytes(published)
 
     frozen = long_generation.load_prompt_fusion(
         input_path=input_path, output_path=output_path, root=tmp_path,
@@ -393,42 +397,20 @@ def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> No
         encoded_contract
     ) in frozen.final_prompts[0]
 
-    output["segments"][0]["relation_states"][1]["relations"][0][
-        "object_key"
-    ] = "entity-without-frame-evidence"
-    output["segments"][0]["relation_states"][0]["relations"].append({
-        "relation_id": "model-invented-relation",
-        "subject_key": "person-01",
-        "predicate": "uses",
-        "object_key": "model-invented-object",
-        "preserve": [],
-        "replace_together": False,
-        "states": [{
-            "frame_order": 1,
-            "state": "invented",
-            "geometry": "invented",
-        }],
-    })
-    output_path.write_bytes(_canonical(output))
-    corrected = pipeline._prompt_fusion_early_output(
-        output_path.read_bytes(),
-        input_sha256=output["input_sha256"],
-        segment_count=1,
-        input_segments=payload["segments"],
-    )
-    assert json.loads(corrected)["segments"][0]["relation_states"] == expected
-    frozen_wrong_echo = long_generation.load_prompt_fusion(
-        input_path=input_path, output_path=output_path, root=tmp_path,
-    )
-    assert "entity-without-frame-evidence" not in frozen_wrong_echo.final_prompts[0]
-    assert "model-invented-relation" not in frozen_wrong_echo.final_prompts[0]
-    assert encoded_contract in frozen_wrong_echo.final_prompts[0]
+    invalid_echo = json.loads(published)
+    invalid_echo["segments"][0]["relation_states"] = []
+    with pytest.raises(ValueError, match="prompt fusion raw output is invalid"):
+        pipeline._prompt_fusion_early_output(
+            _canonical(invalid_echo),
+            input_sha256=model_output["input_sha256"],
+            segment_count=1,
+            input_segments=payload["segments"],
+        )
 
-    del output["segments"][0]["relation_states"]
-    output_path.write_bytes(_canonical(output))
+    output_path.write_bytes(_canonical(model_output))
     injected = pipeline._prompt_fusion_early_output(
         output_path.read_bytes(),
-        input_sha256=output["input_sha256"],
+        input_sha256=model_output["input_sha256"],
         segment_count=1,
         input_segments=payload["segments"],
     )
@@ -436,6 +418,43 @@ def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> No
     assert long_generation.load_prompt_fusion(
         input_path=input_path, output_path=output_path, root=tmp_path,
     ).final_prompts == frozen.final_prompts
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        [
+            {"index": 1, "visual": ["first"]},
+            {"index": 1, "visual": ["duplicate"]},
+        ],
+        [
+            {"index": 2, "visual": ["second"]},
+            {"index": 1, "visual": ["first"]},
+        ],
+    ],
+    ids=("duplicate", "reordered"),
+)
+def test_prompt_fusion_model_segments_must_match_input_order(
+    segments: list[dict],
+) -> None:
+    input_segments = [
+        {"new_keyframes": [{"transition": {"type": "start"}}]},
+        {"new_keyframes": [{"transition": {"type": "start"}}]},
+    ]
+    model_output = {
+        "schema": long_generation.PROMPT_FUSION_OUTPUT_SCHEMA,
+        "version": long_generation.PROMPT_FUSION_VERSION,
+        "input_sha256": "a" * 64,
+        "segments": segments,
+    }
+
+    with pytest.raises(ValueError, match="prompt fusion raw output is invalid"):
+        pipeline._prompt_fusion_early_output(
+            _canonical(model_output),
+            input_sha256=model_output["input_sha256"],
+            segment_count=2,
+            input_segments=input_segments,
+        )
 
 
 def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
@@ -1804,6 +1823,16 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
             assert len(segment_options) == len(payload["segments"])
             expected_counts = pipeline._prompt_fusion_visual_counts(
                 payload["segments"]
+            )
+            assert (
+                f"segments 必须按 index 1 到 {len(expected_counts)} 顺序输出"
+                in prompt
+            )
+            assert "禁止遗漏、重复或重排" in prompt
+            assert (
+                "各段 visual 条数依次为 "
+                f"{json.dumps(list(expected_counts), separators=(',', ':'))}"
+                in prompt
             )
             for option, expected_count in zip(
                 segment_options, expected_counts, strict=True,

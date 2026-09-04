@@ -19,4 +19,4 @@ description: Fuse frozen keyframes, segment dynamics, replacement bindings, rela
 
 ## 输出
 
-向 `work/h3_prompt_plan.json` 输出：每段按 hard-cut 区间写一条简洁英文 `visual` prose，第一帧开始第一区间，每个 `hard_cut` 开始新区间，`continuous` 留在当前区间。每条只写该区间图片和已有动态证据；不输出时间戳、图片标记、stable key、tile、relation key、音频字段或 provider 语法。`segments` 与输入一一对应，每段只填 `index`、`visual`；不输出 `relation_states`。后端依据冻结 occurrence、transition 和该输出编译 Context IR/H3。
+向 `work/h3_prompt_plan.json` 输出：每段按 hard-cut 区间写一条简洁英文 `visual` prose，第一帧开始第一区间，每个 `hard_cut` 开始新区间，`continuous` 留在当前区间；不要按 9 张图片逐帧凑数。每条只写该区间图片和已有动态证据；不输出时间戳、图片标记、stable key、tile、relation key、音频字段或 provider 语法。`segments` 必须按输入顺序逐段输出，`index` 连续且不得遗漏、重复或重排；每段只填 `index`、`visual`，条数以注入 Schema 为准；不输出 `relation_states`。后端依据冻结 occurrence、transition 和该输出编译 Context IR/H3。
