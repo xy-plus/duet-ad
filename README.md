@@ -2,7 +2,7 @@
 
 这是从 `github-xy-plus/Master@043166b13f21fdf715390b964e843be2c010ddcf` 的极简前端出发建立的独立研究仓库。它不依赖 `/home/xy/duet-ad1` 的运行目录，也不修改源仓库。
 
-后端使用 Python 3.12、FastAPI 和纯文件系统存储。上游保持固定 Master 的视频分析语义；`video-maker` 先生成项目级原始索引，再由 DeepSeek Object Replace 一次性冻结全项目的替换与人物音色，后端机械合并为增强索引。此后的逐段 Fusion 只把增强索引编译为 H3 提示词，再调用 Picsart `minimax-h3-max-r2v`，最后裁回源片段时长并合并。Fusion 执行器由后端选定，前端和公开 API 均不暴露模型选择。
+后端使用 Python 3.12、FastAPI 和纯文件系统存储。上游沿用固定 Master 的视频分析语义；`video-maker` 先逐段生成视觉描述，再以九帧像素为事实源生成项目级原始索引，逐段描述只作为防漏清单。DeepSeek Object Replace 随后一次性冻结全项目的替换与人物音色，后端机械合并为增强索引。此后的逐段 Fusion 只把增强索引编译为 H3 提示词，再调用 Picsart `minimax-h3-max-r2v`，最后裁回源片段时长并合并。Fusion 执行器由后端选定，前端和公开 API 均不暴露模型选择。
 
 ## 研究版边界
 
@@ -22,7 +22,7 @@
   -> MediaKit 可选去字幕、去标志
   -> video-maker 逐段视觉描述
   -> 项目级台词翻译
-  -> video-maker 项目级原始对象索引
+  -> video-maker 项目级原始对象索引：九帧为事实源，逐段 visual_prompt 仅作防漏清单
   -> 一次项目级 DeepSeek Object Replace：全局索引 + 全部视觉提示 + Image 1/说明 + 当前音色目录
   -> 后端机械合并增强索引；按可用 voice_id 生成全项目 Audio 1..N（N <= 3）
   -> 第一屏障：所有段并行完成 Fusion、best-effort 约束编译、最终提示词和静音 Video 1
@@ -32,6 +32,10 @@
 ```
 
 `video-maker` 的两个历史阶段、项目级翻译、Object Replace 和 DeepSeek Fusion 都通过 DeepSeek Responses API 的原生 `text.format=json_schema` 输出 closed JSON；不使用工具调用、`tool_choice` 或虚构的提交函数。Schema 只约束可传递的结构和输入绑定：Object Replace 的 patch 中 `replacement` 与人物 `voice_id` 都允许为 `null`，后端不复审人物/场景是否替换正确、用户对象是否命中、普通实体是否达到数量或关系是否闭包；Fusion 只校验 closed 结构、`input_sha256` 和 `segment_index`，不检查正文是否覆盖 stable ID、`Image 1` 或 `Audio N`。DeepSeek thinking 以 `reasoning.effort=high` 显式开启，请求不设置供应商级 `max_output_tokens`。
+
+项目级索引在运行时根据本次请求的正整数段号构造动态 closed Schema；人物、实体、场景和关系的所有 occurrence 只能引用这组精确段号，不能输出 `0`、未知段号或自行重排为另一套编号。`segments[].visual_prompt` 只提示模型回看对应九帧，不是新的视觉事实，也不新增本地语义门禁。
+
+Object Replace Skill 要求人物在脸型、五官、发型或服装等至少三项形成一眼可辨差异，仅露出手/手臂时至少改变两项可见特征；场景至少形成三项可辨差异，每个额外替换实体至少改变两项轮廓、结构、材质、部件或配件特征。`target_visual_description` 先描述完整新目标，再简短点明差异。增强索引仍保存 raw `preserve`，但对 `REPLACE`，Fusion 权威约束只保留动作、功能、尺度、接触、相对位置、运动连续性、机位和光线等类别安全不变量；可能与新目标冲突的源脸、服装款式、物体外观、场景陈设及关系外观描述不会带入。raw `preserve` 仍用于 `KEEP`。这些仍是生成与机械编译规则，不是本地质量门禁。
 
 音色目录位于 `/home/xy/duet-ad1-h3-max-r2v/assets/voice-library`。当前随仓库提供 30 条 2–5 秒单声道 PCM WAV；运行时只要求目录中存在可用条目，不把“恰好 30 条”设为门禁，也不复审年龄、性格等标签是否与声音主观相符。Object Replace 每条只接收一行 `voice_id - file - language - gender - 短特征`。Skill 仍负责为人物选择合适音色；后端只消费可用选择，并按稳定人物顺序保留最先出现的最多 3 个不同 `voice_id`，后续新增音色稳定降级为 `null`，再机械映射为 `Audio 1..N`。Picsart 的每个 segment 接收同一份、同一顺序的 0–3 条参考音频。
 
@@ -87,4 +91,4 @@ python3 -m pytest /home/xy/duet-ad1-h3-max-r2v/tests -q
 
 非空 `client_request_id` 会持久绑定规范化请求、源视频内容和可选替换图内容。首次创建返回 `201`；相同 ID 与相同输入的重放返回原项目 `200`，不会重写输入或再次启动流水线；相同 ID 绑定不同输入时返回 `409`。索引损坏或无法证明绑定关系时以 `503` 停止创建，避免产生第二个可能付费的项目。
 
-当前完整离线结果：`251 passed, 1 warning`。
+当前功能代码基线 `3184ea7` 已部署到 3301，完整离线结果为 `259 passed, 1 warning`。最近一次真实付费 E2E 项目 `265935eb58f0441bbb4bcb2621039688` 验证的是 `8c1515d` 与 `285733b`，不是 `3184ea7`；`3184ea7` 的关系约束修复目前只有离线测试与部署证据，没有新的付费 E2E。

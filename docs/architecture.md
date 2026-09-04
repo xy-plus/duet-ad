@@ -16,7 +16,7 @@
 4. 4–10 秒 scene-first 片段计划及逐段 exact-9。
 5. 可选 MediaKit 处理，先文本擦除、再图标擦除。
 6. 每段 `video-maker` 视觉提示词。
-7. 一次项目级台词翻译和一次 `video-maker` 全局原始对象索引。
+7. 一次项目级台词翻译和一次 `video-maker` 全局原始对象索引；索引同时接收各段 `visual_prompt` 作为回看九帧的防漏清单，像素仍是唯一视觉事实。
 8. 一次项目级 DeepSeek Object Replace：同时读取原始全局索引、全部逐段视觉提示、目标语言与项目级翻译台词、可选 Image 1 及用户说明，以及当前音色目录；输出绑定稳定 ID 的 replacement/voice patch。
 9. 后端深拷贝原始索引并机械合并 patch；对可用的 `voice_id` 按稳定顺序映射 `Audio N`，生成项目级增强索引和同序的 0–3 条冻结音频。
 
@@ -45,16 +45,16 @@ h3-max-r2v-prompt Skill
 
 ## 模型合同
 
-`video-maker` 是固定 Master 的既有 Skill：
+`video-maker` 以固定 Master 的既有 Skill 为基线；逐段视觉合同保持不变，项目索引阶段增加防漏清单和精确段身份绑定：
 
 - 逐段阶段用 `VISUAL_PROMPT_SCHEMA` 返回 `{prompt}`，业务层只解包字符串；不设置任意最短长度或内容覆盖门禁。
-- 项目索引阶段接收 `phase`、生效的 `generation_config`，以及按 segment/frame 排序的 `segment_index`、`frame_order`、项目内路径、SHA 和全部分析图片；不接收逐段视觉提示词、台词或用户素材。输出 closed 结构后由后端机械分配已有项的稳定 ID，原样写入 `work/element_index.json` 和 `state.element_index`。people/entities/scenes/relations 允许为空，不要求必须识别场景或达到任意集合大小；Object Replace 不回写 raw index。
+- 项目索引阶段接收 `phase`、生效的 `generation_config`，以及按 segment/frame 排序的 `segment_index`、`visual_prompt`、`frame_order`、项目内路径、SHA 和全部分析图片；不接收台词或用户素材。`visual_prompt` 只用于逐项提示模型回看对应九帧，不能替代或推翻像素证据。运行时根据本次请求中的正整数段号构造动态 closed Schema，人物、实体、场景和关系的 occurrence 只能引用这组精确段号，不能输出 `0`、未知段号或自行重新编号。输出 closed 结构后由后端机械分配已有项的稳定 ID，原样写入 `work/element_index.json` 和 `state.element_index`。people/entities/scenes/relations 允许为空，不要求必须识别场景或达到任意集合大小；Object Replace 不回写 raw index。
 
-项目级 `object-replace` Skill 固定使用 DeepSeek，每项目只设一个公共逻辑节点，不按 segment 重复；首次自然执行错误仍受下文“每节点最多两个 attempt”边界约束。其 closed JSON Schema 由 raw index 中已有稳定 ID、音色 ID 集合和输入哈希动态生成，patch 字段中的 `replacement` 与人物 `voice_id` 均允许 `null`。Skill 仍明确要求：人物和场景必须替换，用户提到的物品必须指向 Image 1，其他实体至少替换两个（不足则全部），关系按 `replace_together` 协同，并为人物选择符合特征的音色；这些是模型生成职责。后端不再逐项判断规则是否完成，不校验人物/场景 replacement 非空、用户目标命中、实体替换数量、关系闭包或声音标签语义。
+项目级 `object-replace` Skill 固定使用 DeepSeek，每项目只设一个公共逻辑节点，不按 segment 重复；首次自然执行错误仍受下文“每节点最多两个 attempt”边界约束。其 closed JSON Schema 由 raw index 中已有稳定 ID、音色 ID 集合和输入哈希动态生成，patch 字段中的 `replacement` 与人物 `voice_id` 均允许 `null`。Skill 仍明确要求：人物和场景必须替换，用户提到的物品必须指向 Image 1，其他实体至少替换两个（不足则全部），关系按 `replace_together` 协同，并为人物选择符合特征的音色。人物应在脸型、五官、发型或服装等至少三项形成一眼可辨差异，仅露出手/手臂时至少改变两项可见特征；场景至少形成三项可辨差异，每个额外替换实体至少改变两项轮廓、结构、材质、部件或配件特征。目标描述先写完整新目标，再简短点明可观察差异；当 raw `preserve` 的源外观与新目标冲突时，以新目标为准。这些都是模型生成职责。后端不再逐项判断规则是否完成，不校验人物/场景 replacement 非空、用户目标命中、实体替换数量、关系闭包或声音标签语义。
 
 后端在 patch 结构可读取后深拷贝 raw index 并机械合并：`occurrences`、`preserve`、relations 和原始描述不变，对应记录增加模型给出的 nullable `replacement`，人物增加 nullable `voice`。人物可共用 `voice_id`；后端按稳定人物顺序保留最先出现的最多 3 个不同可用 ID，后续新 ID 稳定降级为 `null`，而不是让项目失败。保留下来的文件依次复制为 `work/voice-references/audio-01.wav` 至 `audio-03.wav` 并写入增强索引。当前仓库附带 30 条 2–5 秒单声道 PCM WAV，但运行时不要求目录恰好 30 条，也不复审年龄、性格等描述是否主观准确；只保留文件可读、媒体可用和供应商最多 3 条参考音频等技术限制。
 
-新 `h3-max-r2v-prompt` Skill 每段执行一次并通过 closed JSON Schema 返回提示词。它的业务事实源仅有本段视觉提示、完整增强索引和本段翻译台词；不传图片，不再传用户原始说明，也不接收独立音色输入。Skill 负责读取增强索引并把替换、`Image 1`、`Audio N`、preserve 和 relations 表达进提示词。后端只校验返回对象的 closed 结构、`input_sha256` 与 `segment_index`，随后根据增强索引中实际可用字段 best-effort 编译并附加约束块及台词时间窗；不扫描 Fusion 正文是否出现或遗漏 stable ID、`Image 1`、`Audio N`，也不因增强索引中 nullable/缺失的替换或音色而失败。最终语义覆盖与画面执行都交给模型和供应商。
+新 `h3-max-r2v-prompt` Skill 每段执行一次并通过 closed JSON Schema 返回提示词。它的业务事实源仅有本段视觉提示、完整增强索引和本段翻译台词；不传图片，不再传用户原始说明，也不接收独立音色输入。Skill 负责读取增强索引并把替换、`Image 1`、`Audio N`、preserve 和 relations 表达进提示词。后端只校验返回对象的 closed 结构、`input_sha256` 与 `segment_index`，随后根据增强索引中实际可用字段 best-effort 编译并附加约束块及台词时间窗。增强索引保存 raw `preserve`，但 `REPLACE` 项编译时只保留动作、功能、尺度、接触、相对位置、运动连续性、人物明确属性、场景色调/构图/机位/光线等类别安全不变量，不带入冲突的源脸、服装款式、物体外观或场景陈设；raw `preserve` 只直接用于 `KEEP`。关系任一端被替换时，同样只保留通用交互类型、接触、相对位置和运动连续性，不带入指向源对象外观的 predicate/preserve；两端都未替换时保留原关系描述。后端不扫描 Fusion 正文是否出现或遗漏 stable ID、`Image 1`、`Audio N`，也不因增强索引中 nullable/缺失的替换或音色而失败。最终语义覆盖与画面执行都交给模型和供应商。
 
 Picsart 使用 Advanced compatibility workflow `minimax/h3-max/reference-to-video`。提交地址为 `/workflows/minimax/h3-max/reference-to-video/submit`，请求体只有一层 `params`，字段使用供应商原生的 `reference_video_urls`、`reference_image_urls`、`reference_audio_urls`、`aspect_ratio` 和 `prompt_expansion_mode: "quality"`；分辨率映射为 `480P`/`768P`。对 H3 而言，当前静音片段是 Video 1，可选用户图是 Image 1，冻结音频列表按原序对应 `Audio 1..N`。所有 segment 都提交同一份、同一顺序的完整音频列表，不按段删除、去重、排序或重新编号；无参考音频时省略 `reference_audio_urls`。用户参考图先复用 `duet-ad1` 的 MiniMax 代理规则，等比落入 `256–5760` 双边和 `1:2.5–2.5:1` 比例范围，必要时补黑边，再编码为 PNG。轮询同一 workflow 下的 `/{taskId}/result`，从 `response.result.video.url` 读取结果。4.x 秒片段提交为 5 秒，结果再裁回源时长。
 

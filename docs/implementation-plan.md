@@ -6,7 +6,7 @@
 
 - 在 `/home/xy/duet-ad1-h3-max-r2v` 内实现全新的独立 Python/FastAPI 后端，源仓库 `/home/xy/duet-ad1` 保持不动。
 - 前端继续使用已从 `github-xy-plus/Master@043166b13f21fdf715390b964e843be2c010ddcf` 导出的极简版。
-- 从 Master 复制 video-maker 及其之前的功能和 Skill，保留算法、执行顺序和数据语义；不引入模型语义复审或质量型重试。
+- 从 Master 复制 video-maker 及其之前的功能和 Skill，保留算法、执行顺序和数据语义；逐段视觉合同保持不变，项目索引阶段只增加以逐段描述防漏、以输入段号绑定 occurrence 的适配，不引入模型语义复审或质量型重试。
 - video-maker 之后改为：项目级翻译和 raw 对象索引 → 项目级 Object Replace 与 enhanced 索引/音色 → 各片段 Fusion → Picsart MiniMax H3 Max R2V → 裁回原片段长度 → 合并视频。
 
 ## 实施内容
@@ -75,12 +75,12 @@ data/projects/{project_id}/
 7. 按前端请求调用 MediaKit 去字幕/品牌处理。
 8. 每段并行运行 video-maker，生成 `visual_prompt`。
 9. 使用全部片段描述进行一次项目级 DeepSeek 翻译，通过 Responses API 原生 JSON Schema 请求 `lines[{text}]`，按原时间语义回挂到各片段；缺行或空文本回退对应源文。
-10. 显式运行 video-maker 的项目索引阶段，生成 raw `element_index.json`；people/entities/scenes/relations 允许为空，不设置集合大小、描述长度或 scene 非空门禁。
+10. 显式运行 video-maker 的项目索引阶段，生成 raw `element_index.json`；输入九帧像素及各段 `visual_prompt`，后者只作为回看像素的防漏清单。运行时 Schema 把人物、实体、场景和关系的 occurrence 绑定到本次请求的精确正整数段号，禁止 `0`、未知段号或重新编号；people/entities/scenes/relations 允许为空，不设置集合大小、描述长度或 scene 非空门禁。
 11. 运行一次项目级 DeepSeek Object Replace：输入 raw 索引、全部视觉提示、翻译台词、可选 Image 1/说明和当前音色目录，输出 nullable replacement/voice patch。
 12. 后端机械合并 enhanced 索引；按稳定人物顺序保留最先出现的最多 3 个可用不同音色，更多选择降级为 `null`，生成 0–3 条 `Audio N`。
 13. 所有公共输入可传递后，启动逐段 R2V 准备与执行。
 
-Object Replace Skill 本身仍明确要求：人物和场景都应替换；用户点名的物品应使用 Image 1；其他实体至少替换两个，不足两个则全部替换；`replace_together` 关系应协同；人物应从目录中选择符合性别、口音和特征的音色。后端不对这些生成职责逐项打分，nullable 输出可直接流向下游。
+Object Replace Skill 本身仍明确要求：人物和场景都应替换；用户点名的物品应使用 Image 1；其他实体至少替换两个，不足两个则全部替换；`replace_together` 关系应协同；人物应从目录中选择符合性别、口音和特征的音色。人物应在脸型、五官、发型或服装等至少三项形成一眼可辨差异，仅露出手/手臂时至少改变两项可见特征；场景至少形成三项可辨差异，每个额外替换实体至少改变两项轮廓、结构、材质、部件或配件特征。目标描述先写完整新目标，再简短点明差异；raw `preserve` 中与新目标冲突的源外观不约束替换结果。后端不对这些生成职责逐项打分，nullable 输出可直接流向下游。
 
 每段 R2V 分支：
 
@@ -89,7 +89,7 @@ Object Replace Skill 本身仍明确要求：人物和场景都应替换；用�
    - 完整项目级 `enhanced_element_index`
    - 本段本地化后的翻译台词及相对时间
    - Fusion 调用不接收用户图片、用户原始说明或独立音色目录/选择。
-2. Skill 通过动态绑定本段输入哈希和段号的 closed Schema 输出字符串 `prompt`，负责读取 enhanced index 并表达其中的替换、`Image 1`、`Audio N`、preserve 和 relations。后端只验证 closed 结构与绑定，再按实际存在的字段 best-effort 附加约束块；不检查正文是否覆盖 stable ID、`Image 1`、`Audio N` 或任何替换规则。
+2. Skill 通过动态绑定本段输入哈希和段号的 closed Schema 输出字符串 `prompt`，负责读取 enhanced index 并表达其中的替换、`Image 1`、`Audio N`、preserve 和 relations。后端只验证 closed 结构与绑定，再按实际存在的字段 best-effort 附加约束块。增强索引继续保存 raw `preserve`，但 `REPLACE` 项只编译动作、功能、尺度、接触、相对位置、运动连续性、人物明确属性及场景色调/构图/机位/光线等类别安全不变量；raw `preserve` 只直接用于 `KEEP`。关系任一端被替换时，只保留通用交互类型、接触、相对位置和运动连续性，不带入指向源对象外观的 predicate/preserve；两端都未替换时保留原关系描述。不检查正文是否覆盖 stable ID、`Image 1`、`Audio N` 或任何替换规则。
 3. 后端机械附加可用台词及时间窗：
    - 使用目标语言自然说话。
    - 不出现原语言台词。
@@ -155,18 +155,20 @@ logs/{node}/{segment_or_project}/attempt-{1|2}/
 - 增加 API 测试：登录、能力声明、创建、轮询、详情、源视频、结果视频和替换图片读取。
 - 使用假 DeepSeek、MediaKit 和 Picsart 服务完成端到端测试，测试中不发起真实付费生成。
 - 验证 Master 上游链仍产生每段 9 帧、视频描述、本地化台词和全局对象索引，但不对其内容质量做断言。
+- 验证项目索引收到逐段 `visual_prompt` 防漏清单，但像素仍是唯一视觉事实；动态 Schema 只接受请求中的精确正整数段号，拒绝 `0`、未知段号和重新编号。
 - 验证所有片段在公共输入准备完成后并行进入新 Skill 和 H3 R2V。
 - 验证 4.x 秒片段使用供应商 5 秒参数并裁回原时长。
 - 验证 `prompt_expansion_mode` 固定为 `"quality"`，静音视频和可选图片同时传入。
 - 验证用户未提供替换图时仍能执行；nullable replacement/voice 和超过 3 个不同音色都按确定性降级继续。
 - 验证 Object Replace/Fusion 只受 closed 结构和输入绑定约束，不因替换数量、关系闭包或提示词中缺少 ID/Image/Audio 而失败。
+- 验证 `REPLACE` 权威约束不带入冲突的源脸、服装款式、物体外观、场景陈设或关系外观描述；`KEEP` 项和两端均未替换的关系仍保留各自 raw 描述。
 - 验证空 ASR 与 YAMNet 无重叠直接继续，翻译缺行或空行回退源文。
 - 验证普通节点的自然错误重试、Picsart 未知提交禁止重投及原始输入输出日志均被记录。
 - 验证签名素材 URL 可供无 Bearer 的供应商读取，但错误 token 不能跨项目访问。
 - 验证签名素材的 `GET/HEAD` 均可用，并验证参考图满足 MiniMax 双边和比例约束。
 - 测试只断言流程、API 兼容和日志存在，不增加模型输出、媒体质量或业务语义断言。
 
-当前完整离线结果：`251 passed, 1 warning`。
+当前功能代码基线 `3184ea7` 已部署到 3301，完整离线结果为 `259 passed, 1 warning`。该提交的关系约束修复目前只有离线测试与部署证据，没有新的付费 E2E；最近一次真实付费 E2E 验证到 `8c1515d` 与 `285733b`。
 
 ## 默认边界
 

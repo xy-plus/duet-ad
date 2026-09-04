@@ -8,7 +8,8 @@
 - 本轮工作树把旧的项目级单音色选择改为一次项目级 DeepSeek Object Replace；原始索引、增强索引、人物音色映射和有序 Audio 列表分层冻结。
 - 逐段 Fusion 仍由后端 `FUSION_AGENT` 选择 `codex` 或 `deepseek`，缺省为 `deepseek`；前端和公开 capability/request 不暴露该选择，客户端夹带的 `fusion` 会被服务端配置覆盖并在创建时冻结。Object Replace 始终使用 DeepSeek，不受 `FUSION_AGENT` 影响。
 - DeepSeek 代码路径显式开启 thinking，不发送供应商级输出 token 上限；video-maker 两阶段、项目级翻译、Object Replace 和 DeepSeek Fusion 均使用 Responses API 原生 `text.format=json_schema`。本地只处理 closed 结构与输入绑定，不做模型语义二次校验。
-- 本文只描述当前工作树合同，不把它声称为已部署，也不声称新 Object Replace/多音色链路已完成真实供应商 E2E。
+- 当前功能代码基线为 `3184ea7`，已部署到 3301；完整离线结果为 `259 passed, 1 warning`。
+- 最近一次真实付费 E2E 项目 `265935eb58f0441bbb4bcb2621039688` 验证的是 `8c1515d` 与 `285733b`，不是 `3184ea7`。`3184ea7` 的关系约束修复目前只有离线测试与部署证据，没有新的付费 E2E。
 
 ## 已实现链路
 
@@ -22,7 +23,7 @@
   -> 可选 MediaKit：先去字幕、再去标志
   -> 每段并行 video-maker 视觉分析
   -> 一次项目级台词翻译并按时间交集回挂
-  -> 一次 video-maker 项目级 raw 全局对象索引
+  -> 一次 video-maker 项目级 raw 全局对象索引：九帧为事实源，逐段 visual_prompt 仅作防漏清单
   -> 一次项目级 DeepSeek Object Replace：raw 索引 + 全部视觉提示 + Image 1/说明 + 当前音色目录
   -> 后端机械合并 enhanced 索引，按可用 voice_id 生成同序 Audio 1..N（N <= 3）
   -> 公共输入屏障
@@ -37,7 +38,7 @@
 
 ## video-maker 合同
 
-`skills/video-maker/SKILL.md` 保持固定 Master 原文。它有两个阶段，均沿用 Skill 自身的 closed JSON Schema 合同；DeepSeek 传输使用 Responses API 原生 Structured Outputs，不扩展为新链路的通用质量门禁。
+`skills/video-maker/SKILL.md` 以固定 Master 为基线。逐段视觉阶段保持原合同；项目索引阶段增加逐段防漏清单、跨段覆盖账本和精确段身份绑定。两个阶段都沿用 closed JSON Schema 传输；DeepSeek 使用 Responses API 原生 Structured Outputs，不扩展为新链路的通用质量门禁。
 
 ### 逐段视觉阶段
 
@@ -61,7 +62,7 @@
 
 ### 项目级索引阶段
 
-所有逐段视觉阶段完成后执行一次。请求只包括：
+所有逐段视觉阶段完成后执行一次。请求包括：
 
 ```json
 {
@@ -73,6 +74,7 @@
   "segments": [
     {
       "segment_index": 1,
+      "visual_prompt": "本段已发现的人物、手持物、场景与动作描述",
       "frames": [
         {
           "frame_order": 1,
@@ -85,9 +87,9 @@
 }
 ```
 
-图片仍是所有 segment 的九张半分辨率分析副本，按 segment/frame 排序。这个阶段明确不接收逐段 `visual_prompt`、台词、用户图片或用户说明。
+图片仍是所有 segment 的九张半分辨率分析副本，按 segment/frame 排序。`segments[].visual_prompt` 只作为防漏清单：它提示模型逐项回看对应九帧，不能替代或推翻像素证据。这个阶段不接收台词、用户图片或用户说明。
 
-模型通过 `PROJECT_INDEX_SCHEMA` 返回四个数组：`people`、`entities`、`scenes`、`relations`。四类集合允许为空，不要求场景非空或达到任意数量。后端把已有项的调用内 `key` 机械映射为 `person-01`、`entity-01`、`scene-01`、`relation-01` 等稳定 key，保存为 `work/element_index.json` 和 `state.element_index`。这两处是不可覆盖的 raw index；供应商 record 不进入业务索引。
+模型通过本次请求动态生成的 project-index closed Schema 返回四个数组：`people`、`entities`、`scenes`、`relations`。人物、实体、场景和关系的所有 occurrence 只能引用请求中的精确正整数段号，不能输出 `0`、未知段号或自行重新编号。四类集合允许为空，不要求场景非空或达到任意数量。后端把已有项的调用内 `key` 机械映射为 `person-01`、`entity-01`、`scene-01`、`relation-01` 等稳定 key，保存为 `work/element_index.json` 和 `state.element_index`。这两处是不可覆盖的 raw index；供应商 record 不进入业务索引。
 
 ## video-maker 之后
 
@@ -101,13 +103,13 @@
 - 可选 Image 1 与用户替换说明；有图时同时传图片本身和 SHA-256。
 - 目录 SHA-256 及当前可用的 `voice_id - file - language - gender - 短特征` 行。仓库当前提供 30 条，但运行时不要求恰好 30 条。
 
-Object Replace 不回吐完整索引，只通过动态 closed JSON Schema 输出与 raw stable ID 对齐的 patch；`replacement` 和人物 `voice_id` 都允许为 `null`。Skill 仍要求人物与场景必换、用户指定物品引用 Image 1、其他实体至少替换两个（不足则全部）、关系形成闭包，并为人物选择合适音色，但后端不逐项复审这些职责是否完成，也不因未完成而失败或重试。
+Object Replace 不回吐完整索引，只通过动态 closed JSON Schema 输出与 raw stable ID 对齐的 patch；`replacement` 和人物 `voice_id` 都允许为 `null`。Skill 仍要求人物与场景必换、用户指定物品引用 Image 1、其他实体至少替换两个（不足则全部）、关系形成闭包，并为人物选择合适音色。人物应在脸型、五官、发型或服装等至少三项形成一眼可辨差异，仅露出手/手臂时至少改变两项可见特征；场景至少形成三项可辨差异，每个额外替换实体至少改变两项轮廓、结构、材质、部件或配件特征。`target_visual_description` 先描述完整新目标，再简短点明可观察差异；当 raw `preserve` 中的源脸、服装款式、物体外观或场景陈设与新目标冲突时，以新目标为准。后端不逐项复审这些职责是否完成，也不因未完成而失败或重试。
 
 patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable replacement 和人物 voice，原样保留 stable ID、原始描述、occurrences、preserve 与 relations，并写入 `work/enhanced_element_index.json` 与 `state.enhanced_element_index`。后端按稳定人物顺序保留最先出现的最多 3 个不同可用 `voice_id`；第四个及后续新音色稳定降级为 `null`，不会阻断项目。保留项依次分配 `Audio 1..N` 并复制为 `work/voice-references/audio-01.wav` 至 `audio-03.wav`。运行时只校验音频文件与 Picsart 输入可用性，不复审年龄、性格等标签。
 
-新增 `skills/h3-max-r2v-prompt/SKILL.md` 每段执行一次。Fusion 的业务事实源只有本段 `visual_prompt`、完整 `enhanced_element_index` 和本段本地化后的翻译台词；调用不传任何图片，也不再单独传入用户说明、Image 1 元数据或音色选择。Skill 负责读取索引中的 replacement/voice 并将其编译进提示词；后端仅根据实际存在的字段 best-effort 生成 `authoritative_constraints`，不把它当成质量门禁。
+新增 `skills/h3-max-r2v-prompt/SKILL.md` 每段执行一次。Fusion 的业务事实源只有本段 `visual_prompt`、完整 `enhanced_element_index` 和本段本地化后的翻译台词；调用不传任何图片，也不再单独传入用户说明、Image 1 元数据或音色选择。Skill 负责读取索引中的 replacement/voice 并将其编译进提示词；后端仅根据实际存在的字段 best-effort 生成 `authoritative_constraints`，不把它当成质量门禁。增强索引继续保存 raw `preserve`，但 `REPLACE` 项只编译动作、功能、尺度、接触、相对位置、运动连续性、人物明确属性及场景色调/构图/机位/光线等类别安全不变量；可能冲突的源脸、服装款式、物体外观和场景陈设不会带入，raw `preserve` 只直接用于 `KEEP`。
 
-内部 Codex 和 DeepSeek Fusion 共用动态 closed JSON Schema：固定 `schema/version`，并把 `input_sha256/segment_index` 绑定到本次输入，模型填写字符串 `prompt`。本地只校验这套结构和绑定，不扫描正文里的 stable ID、`Image 1`、`Audio N` 或替换覆盖率。后端把能从增强索引得到的约束、目标语言台词和时间窗机械附加；缺少可选语义时继续出片。Codex 路径仍保留独立 `/tmp` stage、bwrap 遮蔽 checkout、只读输入、剔除秘密环境变量、agent shell 断网、进程组硬超时和唯一有界输出的隔离边界。
+内部 Codex 和 DeepSeek Fusion 共用动态 closed JSON Schema：固定 `schema/version`，并把 `input_sha256/segment_index` 绑定到本次输入，模型填写字符串 `prompt`。本地只校验这套结构和绑定，不扫描正文里的 stable ID、`Image 1`、`Audio N` 或替换覆盖率。后端把能从增强索引得到的约束、目标语言台词和时间窗机械附加；缺少可选语义时继续出片。关系任一端被替换时，权威约束只保留通用交互类型、接触、相对位置和运动连续性，不带入指向源对象外观的 predicate/preserve；两端都未替换时保留原关系描述。Codex 路径仍保留独立 `/tmp` stage、bwrap 遮蔽 checkout、只读输入、剔除秘密环境变量、agent shell 断网、进程组硬超时和唯一有界输出的隔离边界。
 
 随后通过 Picsart Advanced compatibility workflow `minimax/h3-max/reference-to-video` 提交最终提示词及 H3 参考素材：
 
@@ -153,19 +155,35 @@ patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable rep
 本次合同变更的离线测试已覆盖：
 
 - Object Replace 每项目只设一个公共节点，不随 segment 重复，并收到 raw index、全部视觉提示、Image 1/说明和当前音色目录；nullable replacement/voice 可直接流向增强索引。
+- project-index 收到逐段 `visual_prompt` 防漏清单，但仍以九帧像素为唯一视觉事实；动态 Schema 只接受本次请求中的精确正整数段号，拒绝 `0`、未知段号和重新编号。
 - raw index 不变，enhanced index 由后端机械合并；人物共用可用 `voice_id` 时共用同一 `Audio N`，第四个不同音色稳定降级而不阻断。
 - 每段 Fusion 只收到视觉提示、enhanced index 和本段翻译台词，其输入媒体为空；原始用户说明、图片和独立音色字段不能泄漏进 Fusion。
+- `REPLACE` 权威约束不带入冲突的源脸、服装款式、物体外观或场景陈设；关系任一端被替换时也不带入指向源对象外观的 predicate/preserve，只保留通用交互、接触、相对位置和运动连续性。`KEEP` 项及两端均未替换的关系仍保留各自 raw 描述。
 - 每个 Picsart segment 收到同序的 0/1/2/3 条音频；超限、重复、空 URL 在网络请求前被拒绝。
 - `resume-pre-picsart` 可为缺少 enhanced 字段的历史失败项目重建新公共屏障；`resume-picsart` 只使用冻结 prompt/媒体，新的空 `voice_references` 不得回退到旧音频，而字段缺失的旧单音频项目仍可恢复。
 
-非空 `client_request_id` 已实现持久化创建幂等：绑定规范化请求与实际输入文件摘要；同键同输入返回原项目且不重启流水线，同键异输入返回 `409`，索引无法可信读取时以 `503` 停止创建。当前完整离线测试为 `251 passed, 1 warning`，两个 Skill 均通过 `quick_validate.py`。本文此处仍只记录发布前工作树验证；部署与真实供应商 E2E 结论应在执行后以运行态证据补充。
+非空 `client_request_id` 已实现持久化创建幂等：绑定规范化请求与实际输入文件摘要；同键同输入返回原项目且不重启流水线，同键异输入返回 `409`，索引无法可信读取时以 `503` 停止创建。功能代码基线 `3184ea7` 的完整离线测试为 `259 passed, 1 warning`，相关 Skill 均通过 `quick_validate.py`。
 
 ## 2026-09-04 部署与真实 E2E
 
-提交 `0bc1d24` 已部署到 3301 实例。3301 的 Caddy 反向代理到本机 3302 后端；部署后后端与 Caddy 均保持 `active/running`，`NRestarts=0`。3213 仍是独立的原 `duet-ad1` 实例，未被本次部署改动。
+功能代码基线 `3184ea7` 已部署到 3301 实例；3301 的 Caddy 反向代理到本机 3302 后端。3213 仍是独立的原 `duet-ad1` 实例，未被本次部署改动。`3184ea7` 使关系任一端被替换时不再把源对象外观描述带进权威约束；该提交目前只有离线测试与部署证据，没有新的付费 E2E。
 
 真实 A→B 测试从 3213 成功项目 `5607f61caeac41bf8168354187aa2599` 取得源视频、参考图和冻结请求配置，并以 multipart 上传到 3301。源视频是 16.95 秒、720×1280、30 fps、带 AAC 音轨的真实狗狗梳理画面，SHA-256 为 `6c55df6dcbcac2314f19b9c7d0cc4adb6bf73b7d63da5fa7ac15580cc1188cd4`；用户说明为“把视频中的狗替换成图片里的狗”。请求使用 9:16、480p、fit auto、中文自动改写，并开启图片优化、去标识和去字幕。
 
 3301 新项目 `beebc22c68dd4b5fb934552a1dee944b` 从 queued 一次运行至 succeeded，没有调用任何 resume。两段均只有 `attempt-1`，每段各有且仅有一个 accepted Picsart submit receipt，没有第二次付费 POST。Object Replace、两段 Fusion、音色物化、Picsart poll/download/trim 和最终 stitch 均完成。
 
 最终 `output/generated.mp4` 为 H.264 480×832、24 fps，带 AAC 48 kHz 双声道音频，时长 16.957683 秒，大小 1,743,355 字节，SHA-256 为 `409e8a71928681a8f3e77fd812063baaa7d6b18a365883527c598c1385a919fb`。全量 ffmpeg 解码成功；3301 公网下载返回 `video/mp4`，Range 请求为 206，完整下载字节数与 SHA-256 均和本地成品一致。两段抽帧均为连贯的真实狗狗梳理场景，白色犬只替换贯穿两段，不是色卡、空白或测试占位视频。
+
+### 多候选验证矩阵
+
+下表把“传输成功”和“视觉语义结论”分开；较早项目可以证明多种真实输入、付费回执与恢复链路，但不能自动证明后续提交的替换效果。
+
+| 3213 来源项目 | 3301 项目 | 用户替换要求 | 分段与付费回执 | 结论边界 |
+| --- | --- | --- | --- | --- |
+| `5607f61caeac41bf8168354187aa2599` | `beebc22c68dd4b5fb934552a1dee944b` | 狗替换为参考图中的狗 | 2 段，各 1 条 accepted | 首个完整真实 E2E；狗替换贯穿两段。只露出手，不能据此评价换脸。 |
+| `88da16ebf6604fa19d94f5c8346735d2` | `8b12473d76b643f2bbc10fe6ede359eb` | 逗猫棒替换为参考图中的逗猫棒 | 3 段；第 1、2 段各 1 条 accepted，第 3 段为 provider_failed 后 receipt-safe 重提并 accepted | 真实链路成功；当时项目索引漏掉视觉描述中的第三只猫，猫和场景差异偏弱，不能作为后续索引修复的通过证据。 |
+| `03ed892b63bd44ba85d43553f8e7a40e` | `5e5931219c2844dea50bfd6ac2a4e1b3` | 项链替换为参考图中的项链 | 4 段；第 1、4 段各 1 条 accepted，第 2 段两次 provider_failed 后 accepted，第 3 段一次 provider_failed 后 accepted | 验证只对供应商明确失败段进行 receipt-safe 恢复；不扩展为最新替换语义证据。 |
+| `7ef9e18fe47d4080a2f90f4c4ffd5044` | `04c089b55ecc4fe28db40ade504514bb` | 牙刷、杯子、药片等手持物替换为参考图小熊 | 5 段，各 1 条 accepted，无 unknown | 验证 `934dc2a` 强差异 Skill；小熊和场景替换明显，但人物变化偏弱且第 5 段仍有瓶子，暴露 raw preserve 冲突和跨段索引漏项。 |
+| 同上 | `265935eb58f0441bbb4bcb2621039688` | 与上一行完全相同的 A/B 输入 | 首次在付费前因零起始段号停止，无 Picsart 回执；部署 `285733b` 后 `resume-pre-picsart`，5 段各 1 条 accepted，无 unknown | 项目 succeeded，验证 `8c1515d` 与 `285733b` 的提示词和精确段号修复，不验证后来的 `3184ea7`。逐时点 A/B 确认 7 类用户指定手持物和场景均明显替换，第 5 段不再残留绿、粉瓶；人物仍接近源人物，项链、手表、手链 3 个自动替换不明显。增强索引和 H3 提示词已包含这些目标，剩余缺口在 H3 的最终视觉遵循。 |
+
+`265935eb58f0441bbb4bcb2621039688` 的成品为 H.264 768×1344、24 fps，带 AAC 48 kHz 双声道音频，时长 34.749349 秒，大小 6,720,643 字节，SHA-256 为 `05186a746da78aebfb25419c43e9bf138b7db7736db84fa5ed2be6bfb2ef70f7`。全量 ffmpeg 解码无错误；经 3301 鉴权完整下载返回 `video/mp4`，字节数、SHA-256 和逐字节比较均与本地文件一致。当前 `3184ea7` 已用该项目的真实增强索引离线重编译第 1 段权威块，确认不再含 `toothbrush` 或 `brush-head`，受影响关系只保留通用交互、接触、相对位置和运动连续性；这仍是确定性离线验证，不冒充新的付费 E2E。
