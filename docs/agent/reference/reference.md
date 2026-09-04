@@ -72,7 +72,7 @@ multipart 字段：
 
 multipart 只允许表中字段及 `file`，未知或重复字段返回 422 `invalid_create_request`，且不会创建会话。已知旧页面提交 `voice_mode=none` 时返回纯文本中文刷新提示，不写文件、不入队；混入未知字段不会被归为旧页面。
 
-新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长是 `v:0` 视觉时长：优先 `stream.duration`，其次 `duration_ts*time_base`，最后扫描视频包 PTS 范围并对缺失的末包 duration 使用相邻 PTS/帧率补尾；不得使用 OpenCV 帧数/FPS、音轨或 `format.duration` 补长。该值须正有限且不超过 300 秒；文件大小默认 ≤500MB。无音轨合法。`>15s` 只接受 `voice_mode=keep`，否则 422 `long_video_audio_mode_unsupported`。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
+新建成功返回 `201 {"id":"...","status":"queued"}`；创建幂等命中返回 200 同形。有效视频时长是 `v:0` 视觉时长：优先 `stream.duration`，其次 `duration_ts*time_base`，最后扫描视频包 PTS 范围并对缺失的末包 duration 使用相邻 PTS/帧率补尾；不得使用 OpenCV 帧数/FPS、音轨或 `format.duration` 补长。该值须正有限且不超过 300 秒；文件大小默认 ≤500MB。无音轨合法。旧入口的 `>8s` 请求只接受 `voice_mode=keep`，否则 422 `long_video_audio_mode_unsupported`；minimal v1 的自动台词合同不受此旧入口限制。超时长返回结构化 `422`，`detail.code=video_duration_exceeds_h3_limit`，不保留刚创建的会话。其他常见错误：400 来源数量错误或创建 id 非法；401；422 下载/媒体/模式校验失败；429 IP 限流或排队已满。
 
 ### `GET /api/conversations/{cid}`
 
@@ -360,7 +360,7 @@ Seedream 每个帧 POST 前先持久化输入/提示词/模型/模式摘要。�
 | `_postprocess_receipt` | 私有执行 receipt：冻结三选项与图片优化设置，不进入公开 detail |
 | `postprocess` | `{status,options,frames,segments,error}`；存在时生成必须等待全部段 done，并使用完整优化帧集合 |
 
-current v4 不按 15 秒复制合同：`≤15s` 是 `segments.length=1`，更长输入是 `segments.length>1`，都使用 v5 `long_video_plan.json`。顶层 keyframes/prompt、prepared input 和 v1-v4 plan 都是历史只读，不能混用或降级。
+current v4 不按旧时长复制合同：`≤8s` 是 `segments.length=1`，更长输入是 `segments.length>1`，都使用 v5 `long_video_plan.json`。顶层 keyframes/prompt、prepared input 和 v1-v4 plan 都是历史只读，不能混用或降级。
 
 ## Prepared input receipt v1（历史只读）
 
@@ -398,7 +398,7 @@ current v4 不按 15 秒复制合同：`≤15s` 是 `segments.length=1`，更长
 
 ## Long-video plan receipt v5（current；v1-v4 只读）
 
-`data/<cid>/long_video_plan.json` 是 canonical JSON。current Fusion v2 promotion 固定 `schema=duet.long-video-plan`、`version=5`；顶层绑定完整 source、实际总时长、统一 H3 workflow、Fusion production manifest 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，provider 整秒时长不得超过 14 秒，并绑定：
+`data/<cid>/long_video_plan.json` 是 canonical JSON。current Fusion v2 promotion 固定 `schema=duet.long-video-plan`、`version=5`；顶层绑定完整 source、实际总时长、统一 H3 workflow、Fusion production manifest 和有序 segments。每段严格连续覆盖 `[0,duration_s]`，provider 整秒时长不得超过 8 秒，并绑定：
 
 - `index/start_s/end_s/chain_id/join_mode`；首段必须 `hard_cut`，后续为 `hard_cut` 或 `continue`；
 - 分段 source、exact 9 张关键帧及各自 source time/scene/transition、兼容锚点和 SHA-256；

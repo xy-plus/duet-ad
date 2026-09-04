@@ -278,12 +278,12 @@ def test_long_upload_rejects_non_keep_audio_and_cleans_up(
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
 
 
-def test_upload_accepts_exact_h3_limit(client, video_1s, monkeypatch, settings):
+def test_upload_accepts_exact_single_segment_limit(client, video_1s, monkeypatch, settings):
     fake = subprocess.CompletedProcess(
         args=[], returncode=0,
         stdout=json.dumps({
-            "format": {"duration": "10.0"},
-            "streams": [{"width": 320, "height": 240, "duration": "10.0"}],
+            "format": {"duration": "8.0"},
+            "streams": [{"width": 320, "height": 240, "duration": "8.0"}],
         }), stderr="",
     )
     monkeypatch.setattr("app.storage.subprocess.run", lambda *a, **kw: fake)
@@ -292,14 +292,14 @@ def test_upload_accepts_exact_h3_limit(client, video_1s, monkeypatch, settings):
                         files={"file": ("clip.mp4", f, "video/mp4")})
     assert r.status_code == 201
     meta = json.loads((settings.data_dir / r.json()["id"] / "meta.json").read_text())
-    assert meta["duration_s"] == 10.0
+    assert meta["duration_s"] == 8.0
 
 
 @pytest.mark.parametrize(
     "video_duration,format_duration,voice_mode,expected_status",
     [
-        (10.0, 10.1, "rewrite", 201),
-        (10.001, 9.9, "rewrite", 422),
+        (8.0, 8.1, "rewrite", 201),
+        (8.001, 7.9, "rewrite", 422),
         (300.0, 300.2, "keep", 201),
         (300.001, 299.9, "keep", 422),
     ],
@@ -374,7 +374,7 @@ def test_url_resolves_to_private_ip_422(client, monkeypatch, settings):
     r = client.post("/api/conversations", headers=AUTH,
                     data={"reference_url": "http://internal.example.com/a.mp4"})
     assert r.status_code == 422
-    assert "private" in r.json()["detail"]
+    assert r.json()["detail"]["code"] == "invalid_source_video_url"
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
 
 
@@ -386,7 +386,7 @@ def test_url_redirect_to_private_ip_422(client, monkeypatch, settings):
     r = client.post("/api/conversations", headers=AUTH,
                     data={"reference_url": "http://cdn.example.com/a.mp4"})
     assert r.status_code == 422
-    assert "private" in r.json()["detail"]
+    assert r.json()["detail"]["code"] == "invalid_source_video_url"
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
 
 
@@ -397,8 +397,8 @@ def test_url_content_length_over_limit_422(client, monkeypatch, settings):
     monkeypatch.setattr("app.downloader._open_pinned", lambda *a, **kw: (_FakeConn(), resp))
     r = client.post("/api/conversations", headers=AUTH,
                     data={"reference_url": "http://cdn.example.com/big.mp4"})
-    assert r.status_code == 422
-    assert "exceeds" in r.json()["detail"]
+    assert r.status_code == 413
+    assert r.json()["detail"]["code"] == "source_too_large"
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
 
 
@@ -413,7 +413,7 @@ def test_url_connection_refused_422(client, monkeypatch, settings):
     r = client.post("/api/conversations", headers=AUTH,
                     data={"reference_url": "http://cdn.example.com/a.mp4"})
     assert r.status_code == 422
-    assert "refused" in r.json()["detail"]
+    assert r.json()["detail"]["code"] == "invalid_source_media"
     assert not settings.data_dir.exists() or list(settings.data_dir.iterdir()) == []
 
 

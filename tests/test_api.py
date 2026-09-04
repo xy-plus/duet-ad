@@ -267,7 +267,7 @@ def test_terminal_postprocess_failure_overrides_public_operation_not_analysis(
     assert listed["has_video"] is False
     assert detail["status"] == "failed"
     assert detail["analysis_status"] == "done"
-    assert detail["error"] == "provider_rejected"
+    assert detail["error"] == "image_rejected_by_provider"
     assert detail["navigation_status"] == "postprocess_failed"
     assert detail["has_video"] is False
     if generation_status is None:
@@ -302,6 +302,117 @@ def test_detail_does_not_republish_legacy_internal_analysis_error(tmp_path):
     assert "LEGACY_MODEL_TAIL" not in json.dumps(detail)
     assert "tokens used" not in json.dumps(detail)
     assert "Bearer secret" not in json.dumps(detail)
+
+
+def test_detail_projects_only_user_actionable_failure_codes(tmp_path):
+    settings = make_settings(tmp_path)
+    no_audio = storage.new_conversation(
+        settings.data_dir, note="no audio", orig_name="a.mp4"
+    )
+    storage.update_meta(
+        settings.data_dir,
+        no_audio["id"],
+        status="failed",
+        error="source video has no audio track",
+    )
+    rejected = storage.new_conversation(
+        settings.data_dir, note="rejected", orig_name="b.mp4"
+    )
+    storage.update_meta(
+        settings.data_dir,
+        rejected["id"],
+        status="done",
+        generation={
+            "status": "failed",
+            "error": "h3_submit_rejected",
+            "attempt": 1,
+            "client_request_id": "request-user-error",
+            "stage": "h3",
+            "segments": [{
+                "index": 1,
+                "status": "failed",
+                "error": "internal_node_stack secret",
+            }],
+        },
+    )
+
+    with TestClient(create_app(settings)) as client:
+        no_audio_detail = client.get(
+            f"/api/conversations/{no_audio['id']}", headers=AUTH
+        ).json()
+        rejected_detail = client.get(
+            f"/api/conversations/{rejected['id']}", headers=AUTH
+        ).json()
+
+    assert no_audio_detail["error"] == "video_audio_required"
+    assert rejected_detail["generation"]["error"] == (
+        "video_rejected_by_provider"
+    )
+    assert rejected_detail["generation"]["segments"][0]["error"] == (
+        "generation_failed"
+    )
+    assert "internal_node_stack" not in json.dumps(rejected_detail)
+    assert "secret" not in json.dumps(rejected_detail)
+
+
+def test_detail_hides_provider_and_prompt_fusion_internal_diagnostics(
+    tmp_path, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    meta = storage.new_conversation(
+        settings.data_dir, note="private failures", orig_name="a.mp4"
+    )
+    storage.update_meta(
+        settings.data_dir,
+        meta["id"],
+        status="done",
+        duration_s=8.0,
+        _postprocess_receipt={
+            "version": 4,
+            "options": {"optimize_image": True},
+        },
+        postprocess={
+            "status": "failed",
+            "error": "provider_rejected",
+            "provider_error_code": "InputTextSensitiveContentDetected",
+            "options": {"optimize_image": True},
+            "frames": [],
+            "segments": [{
+                "index": 1,
+                "status": "failed",
+                "stage": "seedream",
+                "completed_frames": 0,
+                "total_frames": 1,
+                "revision": 1,
+                "error": "provider_rejected",
+                "provider_error_code": "OutputImageSensitiveContentDetected",
+            }],
+        },
+        _prompt_fusion={
+            "status": "failed",
+            "error": "prompt_fusion_continuation_failed private trace",
+        },
+        segments=[{"index": 1}],
+    )
+    monkeypatch.setattr(
+        main_module.postprocess, "recover_running", lambda _settings: []
+    )
+
+    with TestClient(create_app(settings)) as client:
+        detail = client.get(
+            f"/api/conversations/{meta['id']}", headers=AUTH
+        ).json()
+
+    assert detail["error"] == "image_rejected_by_provider"
+    assert detail["postprocess"]["error"] == "image_rejected_by_provider"
+    assert detail["postprocess"]["segments"][0]["error"] == (
+        "image_rejected_by_provider"
+    )
+    assert detail["prompt_fusion"]["error"] == "generation_failed"
+    serialized = json.dumps(detail)
+    assert "InputTextSensitiveContentDetected" not in serialized
+    assert "OutputImageSensitiveContentDetected" not in serialized
+    assert "prompt_fusion_continuation_failed" not in serialized
 
 
 def test_removed_context_ir_endpoints_are_not_registered(tmp_path):

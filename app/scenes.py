@@ -292,7 +292,7 @@ def plan_segments(
 ) -> list[dict]:
     """Return provider-safe segments plus the complete source-cut timeline.
 
-    Provider duration (4..10 seconds) determines segmentation.  Nine images is
+    Provider duration (4..8 seconds) determines segmentation.  Nine images is
     an analysis sampling capacity, not a source-scene limit; dense montages are
     compacted later by :func:`select_segment_keyframes` without deleting cuts.
     """

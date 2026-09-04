@@ -70,7 +70,7 @@ def _png(path: Path, value: int, *, width: int = 90, height: int = 160) -> None:
 
 
 def _make_long(settings, *, joins=("hard_cut", "continue"), dialogue_text="源台词",
-               segment_duration=10.0, duration=None,
+               segment_duration=8.0, duration=None,
                fit_required=False, landscape_first_indices=(),
                landscape_end_indices=(), legacy=False,
                dialogue_classification=None):
@@ -4582,7 +4582,7 @@ def test_success_validation_uses_receipt_version_segment_duration(
     tmp_path, monkeypatch, receipt_version, expected_duration_s, resume,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
-    cid, receipt = _make_long(settings)
+    cid, receipt = _make_long(settings, segment_duration=10.0)
     plan = long_generation.freeze_plan(
         settings.data_dir / cid,
         storage.load_meta(settings.data_dir, cid),
@@ -4771,7 +4771,7 @@ def test_long_resume_required_missing_attempt_locks_batch_without_post(tmp_path,
     assert storage.load_meta(settings.data_dir, cid)["generation"]["status"] == "submission_unknown"
 
 
-def test_new_plan_writer_keeps_every_segment_within_ten_seconds(tmp_path):
+def test_new_plan_writer_keeps_every_segment_within_eight_seconds(tmp_path):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")
     cid, receipt = _make_long(settings, duration=20.000002)
     frozen = long_generation.freeze_plan(
@@ -4996,7 +4996,7 @@ def test_positive_float_boundary_overflow_plans_and_freezes_provider_safe_segmen
     )
 
 
-def test_every_new_long_generation_request_is_at_most_ten_seconds(
+def test_every_new_long_generation_request_is_at_most_eight_seconds(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path, enable_h3_submit=True, autodl_art_token="art")

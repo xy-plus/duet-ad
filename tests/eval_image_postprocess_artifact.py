@@ -17,6 +17,11 @@ from typing import Any
 
 
 STABLE_KEY = re.compile(r"stable_key=([A-Za-z0-9_.-]+)")
+RAW_GLOBAL_FIELDS = {
+    "people": ("source_identity", "replacement_identity"),
+    "entities": (None, "description"),
+    "scenes": ("source_scene", "replacement_scene"),
+}
 VISUAL_AXES = (
     "person_and_object_identity_stability",
     "composition_preservation",
@@ -125,6 +130,89 @@ def _keys(value: object) -> list[str]:
     return STABLE_KEY.findall(json.dumps(value, ensure_ascii=False))
 
 
+def _normalized_text(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return " ".join(value.split()).casefold()
+
+
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _raw_global_plan_evidence(index: dict, raw_plan: dict) -> dict:
+    """Inventory obvious raw-phase no-ops without claiming semantic success.
+
+    Equality after whitespace/case normalization is sufficient evidence of a
+    no-op, but inequality is not evidence that a useful replacement was
+    designed.  Entity source text comes from the frozen element index because
+    the raw global-plan entity record has no source field.
+    """
+    comparisons: list[dict[str, object]] = []
+    exact_noop_keys: list[str] = []
+    source_preserve_target_keys: list[str] = []
+    missing_comparison_keys: list[str] = []
+    for category, (source_field, target_field) in RAW_GLOBAL_FIELDS.items():
+        indexed_records = index.get(category, {})
+        raw_records = raw_plan.get(category, {})
+        if not isinstance(indexed_records, dict):
+            indexed_records = {}
+        if not isinstance(raw_records, dict):
+            raw_records = {}
+        for stable_key in sorted(indexed_records):
+            indexed = indexed_records.get(stable_key)
+            raw = raw_records.get(stable_key)
+            indexed = indexed if isinstance(indexed, dict) else {}
+            raw = raw if isinstance(raw, dict) else {}
+            target = _normalized_text(raw.get(target_field))
+            source_candidates = []
+            if source_field is not None:
+                source_candidates.append((
+                    f"raw_global_plan/{category}/{stable_key}/{source_field}",
+                    _normalized_text(raw.get(source_field)),
+                ))
+            source_candidates.append((
+                f"element_index/{category}/{stable_key}/source_visual_description",
+                _normalized_text(indexed.get("source_visual_description")),
+            ))
+            sources = [(name, value) for name, value in source_candidates if value]
+            matched_source = next(
+                (name for name, value in sources if target is not None and value == target),
+                None,
+            )
+            key = f"{category}/{stable_key}"
+            if target is None or not sources:
+                missing_comparison_keys.append(key)
+            if matched_source is not None:
+                exact_noop_keys.append(key)
+            if target is not None and (
+                "source-preserve" in target or "no-invention" in target
+            ):
+                source_preserve_target_keys.append(key)
+            comparisons.append({
+                "category": category,
+                "stable_key": stable_key,
+                "target_pointer": (
+                    f"/{category}/{stable_key}/{target_field}"
+                ),
+                "target_sha256": _text_sha256(target) if target is not None else None,
+                "source_pointers": [name for name, _value in sources],
+                "source_sha256": [_text_sha256(value) for _name, value in sources],
+                "exact_normalized_noop": matched_source is not None,
+                "matched_source_pointer": matched_source,
+            })
+    return {
+        "comparisons": comparisons,
+        "exact_normalized_source_target_noop_keys": exact_noop_keys,
+        "source_preserve_target_keys": source_preserve_target_keys,
+        "missing_comparison_keys": missing_comparison_keys,
+        "interpretation": (
+            "A listed no-op is a proven raw-phase failure; an unlisted key is "
+            "not proof of a material or useful replacement."
+        ),
+    }
+
+
 def _actual(plan: dict) -> tuple[dict, dict, dict]:
     person_map: dict[str, str] = {}
     scene_map: dict[str, str] = {}
@@ -205,8 +293,8 @@ def _score(
         if (segment, frame + delta) in frames
     }
     direct_special = sum(
-        actual[key]["people"] <= expected[key]["people"]
-        and actual[key]["entities"] <= expected[key]["entities"]
+        actual[key]["people"] == expected[key]["people"]
+        and actual[key]["entities"] == expected[key]["entities"]
         for key in special
     )
     scene_keys = set(scene_map.values())
@@ -238,7 +326,16 @@ def _score(
         },
         "extra_stable_keys": sorted(extras),
         "hard_cut_scope_frames": [
-            {"segment": segment, "frame": frame}
+            {
+                "segment": segment,
+                "frame": frame,
+                "membership_exact": (
+                    actual[(segment, frame)]["people"]
+                    == expected[(segment, frame)]["people"]
+                    and actual[(segment, frame)]["entities"]
+                    == expected[(segment, frame)]["entities"]
+                ),
+            }
             for segment, frame in sorted(special)
         ],
     }
@@ -275,6 +372,7 @@ def evaluate(
     source_sha256: str | None = None,
     request_path: Path | None = None,
     visual_path: Path | None = None,
+    raw_global_plan_path: Path | None = None,
 ) -> dict:
     index = _load(element_index_path)
     plan = _load(output_path)
@@ -284,6 +382,11 @@ def evaluate(
     scores, evidence = _score(index, plan, frames, transitions)
     visual = _load(visual_path) if visual_path is not None else {}
     visual_scores = visual.get("scores", {}) if isinstance(visual, dict) else {}
+    raw_global_plan = (
+        _load(raw_global_plan_path) if raw_global_plan_path is not None else None
+    )
+    if raw_global_plan is not None and not isinstance(raw_global_plan, dict):
+        raise ValueError("raw global plan must be a JSON object")
     for axis in VISUAL_AXES:
         value = visual_scores.get(axis)
         if value is not None and (
@@ -305,11 +408,32 @@ def evaluate(
             if visual_path is not None
             else None
         ),
+        "raw_global_plan": (
+            {
+                "path": str(raw_global_plan_path),
+                "sha256": _sha256(raw_global_plan_path),
+                **_raw_global_plan_evidence(index, raw_global_plan),
+            }
+            if raw_global_plan_path is not None and raw_global_plan is not None
+            else None
+        ),
         "scores": all_scores,
         "descriptive_mean": round(sum(numeric) / len(numeric), 2) if numeric else None,
         "structural_evidence": evidence,
         "visual_evidence": visual.get("evidence", {}) if isinstance(visual, dict) else {},
-        "method": "source-frame evidence; visual scores are external review inputs, not gates",
+        "score_interpretation": {
+            "structural_scores_establish_replacement_success": False,
+            "replacement_semantics_assessed": False,
+            "note": (
+                "Stable-key coverage and membership scores only describe structural "
+                "binding. Raw exact no-op evidence can prove a failure, but neither "
+                "coverage nor lexical inequality proves replacement success."
+            ),
+        },
+        "method": (
+            "source-frame structural evidence; optional raw-phase exact no-op evidence; "
+            "visual scores are external review inputs, not gates"
+        ),
         "decision": None,
     }
 
@@ -323,6 +447,7 @@ def main() -> None:
     parser.add_argument("--source-sha256")
     parser.add_argument("--request", type=Path)
     parser.add_argument("--visual-review", type=Path)
+    parser.add_argument("--raw-global-plan", type=Path)
     args = parser.parse_args()
     report = evaluate(
         args.source_root,
@@ -331,6 +456,7 @@ def main() -> None:
         source_sha256=args.source_sha256,
         request_path=args.request,
         visual_path=args.visual_review,
+        raw_global_plan_path=args.raw_global_plan,
     )
     args.report.write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

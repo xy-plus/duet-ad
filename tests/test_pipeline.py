@@ -1582,8 +1582,8 @@ def test_auto_planner_ignores_source_spanning_sung_and_keeps_scene_cuts(planner)
 
     assert dialogue == []
     assert [(item["start_s"], item["end_s"]) for item in segments] == [
-        (0.0, 10.0),
-        (10.0, 14.5),
+        (0.0, 8.0),
+        (8.0, 14.5),
     ]
 
 
@@ -1608,22 +1608,30 @@ def test_auto_planner_assigns_source_spanning_spoken_without_blocking(planner):
     segments = planner(20.0, _planner_test_scenes(20), dialogue)
 
     assert [(item["start_s"], item["end_s"]) for item in segments] == [
-        (0.0, 10.0), (10.0, 20.0),
+        (0.0, 8.0), (8.0, 16.0), (16.0, 20.0),
     ]
     assert long_video.localize_dialogue(
         dialogue, segments[0], segments=segments
     ) == [{
-        "text": "spoken",
+        "text": "spok",
         "start_s": 0.0,
-        "end_s": 10.0,
+        "end_s": 8.0,
         "classification": "spoken",
     }]
     assert long_video.localize_dialogue(
         dialogue, segments[1], segments=segments
     ) == [{
-        "text": " line",
+        "text": "en li",
         "start_s": 0.0,
-        "end_s": 10.0,
+        "end_s": 8.0,
+        "classification": "spoken",
+    }]
+    assert long_video.localize_dialogue(
+        dialogue, segments[2], segments=segments
+    ) == [{
+        "text": "ne",
+        "start_s": 0.0,
+        "end_s": 4.0,
         "classification": "spoken",
     }]
 
@@ -1662,12 +1670,13 @@ def test_auto_planner_mixed_vocals_only_delivers_spoken_dialogue(planner):
         "classification": "spoken",
     }]
     assert [(item["start_s"], item["end_s"]) for item in segments] == [
-        (0.0, 10.0),
-        (10.0, 20.0),
+        (0.0, 8.0),
+        (8.0, 16.0),
+        (16.0, 20.0),
     ]
 
 
-@pytest.mark.parametrize("duration_s", (10, 20), ids=("n1", "n2"))
+@pytest.mark.parametrize("duration_s", (8, 16), ids=("n1", "n2"))
 def test_planner_projection_keeps_final_dialogue_consistent_for_n1_n2(duration_s):
     sung = {
         "text": "sung lyrics",
@@ -1934,7 +1943,7 @@ def test_run_rejects_rewrite_when_source_probe_crosses_long_threshold(
     assert operations == []
 
 
-def test_run_rejects_translate_when_manifest_crosses_ten_second_threshold_before_voice(
+def test_run_rejects_translate_when_manifest_crosses_eight_second_threshold_before_voice(
     tmp_path, monkeypatch,
 ):
     settings = make_settings(tmp_path)
@@ -1942,7 +1951,7 @@ def test_run_rejects_translate_when_manifest_crosses_ten_second_threshold_before
     cdir = settings.data_dir / meta["id"]
     (cdir / "source.mp4").write_bytes(b"fake")
     storage.update_meta(
-            settings.data_dir, meta["id"], duration_s=9.9, voice_mode="translate",
+            settings.data_dir, meta["id"], duration_s=7.9, voice_mode="translate",
         target_language="English",
     )
     operations = []
@@ -1951,12 +1960,12 @@ def test_run_rejects_translate_when_manifest_crosses_ten_second_threshold_before
         operations.append(step)
         work = Path(argv[argv.index("--out-dir") + 1])
         (work / "manifest.json").write_text(
-                json.dumps({"duration_seconds": 10.001}), encoding="utf-8"
+                json.dumps({"duration_seconds": 8.001}), encoding="utf-8"
         )
 
     monkeypatch.setattr(
         storage, "probe_video",
-            lambda _path: storage.VideoProbe(9.9, 320, 240),
+            lambda _path: storage.VideoProbe(7.9, 320, 240),
     )
     monkeypatch.setattr(pipeline, "_run_cmd", fake_cmd)
     monkeypatch.setattr(
@@ -1974,14 +1983,14 @@ def test_run_rejects_translate_when_manifest_crosses_ten_second_threshold_before
 
 def test_duration_calibration_accepts_keep_after_crossing_long_threshold():
     assert pipeline._validate_calibrated_duration(
-        {"voice_mode": "keep"}, 10.001
-    ) == 10.001
+        {"voice_mode": "keep"}, 8.001
+    ) == 8.001
 
 
 def test_duration_calibration_keeps_short_rewrite_valid():
     assert pipeline._validate_calibrated_duration(
-        {"voice_mode": "rewrite"}, 10.0
-    ) == 10.0
+        {"voice_mode": "rewrite"}, 8.0
+    ) == 8.0
 
 
 def test_duration_calibration_allows_exact_v1_auto_rewrite_for_long_video():

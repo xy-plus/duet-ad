@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
+import ipaddress
 import json
 import logging
+import os
 import re
+import stat
 import threading
 import time
 import uuid
@@ -27,13 +31,19 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.openapi.utils import get_openapi
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 
 from app import minimal_creation, public_api_auth, public_artifacts, public_credits, storage
 from app.config import Settings
@@ -52,6 +62,22 @@ _CREATE_FIELDS = {
     "replacement_instruction",
 }
 _UNKNOWN_MARKERS = frozenset({"submission_unknown", "h3_submitting"})
+_STRICT_LIMIT_RE = re.compile(r"^(?:[1-9]|[1-9][0-9]|100)$")
+_CREATE_ERROR_MESSAGES = {
+    "idempotency_key_reused": "Idempotency-Key 已绑定到不同输入",
+    "invalid_create_request": "创建请求无效",
+    "invalid_generation_request": "生成参数无效",
+    "invalid_replacement_image": "参考图无法读取，请更换图片",
+    "invalid_source_media": "原视频无法读取，请更换视频",
+    "invalid_source_video_url": "视频链接不是可访问的公网 HTTPS 地址",
+    "queue_full": "当前任务队列已满，请稍后重试",
+    "replacement_image_too_large": "参考图超过大小限制",
+    "replacement_pair_required": "参考图和替换说明必须同时提供",
+    "source_exactly_one_required": "必须且只能提供一个视频来源",
+    "source_too_large": "原视频超过大小限制",
+    "unsupported_replacement_media_type": "参考图格式不受支持",
+    "video_duration_exceeds_h3_limit": "原视频时长超过限制，请裁剪后重试",
+}
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -196,6 +222,65 @@ class _RateLimiter:
             hits.append(now)
 
 
+class _DownloadLease:
+    """One cross-process download slot, held until the response body closes."""
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor = descriptor
+        self._guard = threading.Lock()
+
+    def release(self) -> None:
+        with self._guard:
+            descriptor = self._descriptor
+            if descriptor < 0:
+                return
+            self._descriptor = -1
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _acquire_download_lease(
+    data_dir: Path, owner_id: str, *, slots: int = 2
+) -> _DownloadLease | None:
+    directory = (
+        data_dir
+        / ".public-api"
+        / "download-leases"
+        / hashlib.sha256(owner_id.encode("utf-8")).hexdigest()
+    )
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    flags = (
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for index in range(slots):
+        descriptor = os.open(directory / f"slot-{index}.lock", flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("download lease is not a regular file")
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(
+                    descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+            except BlockingIOError:
+                os.close(descriptor)
+                continue
+            return _DownloadLease(descriptor)
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+    return None
+
+
 def _request_id(request: Request) -> str:
     value = getattr(request.state, "public_request_id", None)
     if isinstance(value, str):
@@ -203,6 +288,10 @@ def _request_id(request: Request) -> str:
     value = f"req_{uuid.uuid4().hex}"
     request.state.public_request_id = value
     return value
+
+
+def _is_public_path(path: str) -> bool:
+    return path == "/api/v1" or path.startswith("/api/v1/")
 
 
 def _error_response(request: Request, exc: PublicAPIError) -> JSONResponse:
@@ -221,6 +310,19 @@ def _error_response(request: Request, exc: PublicAPIError) -> JSONResponse:
     )
 
 
+def _public_create_error(status: int, detail: Mapping[str, Any]) -> PublicAPIError:
+    code = detail.get("code")
+    if not isinstance(code, str) or code not in _CREATE_ERROR_MESSAGES:
+        return PublicAPIError(503, "creation_failed", "任务创建暂时失败，请稍后重试")
+    field = detail.get("field")
+    return PublicAPIError(
+        status,
+        code,
+        _CREATE_ERROR_MESSAGES[code],
+        field=field if isinstance(field, str) else None,
+    )
+
+
 def _contains_marker(value: Any, markers: frozenset[str]) -> bool:
     if isinstance(value, Mapping):
         return any(
@@ -234,10 +336,77 @@ def _contains_marker(value: Any, markers: frozenset[str]) -> bool:
 
 def _definitely_failed(meta: Mapping[str, Any]) -> bool:
     generation = meta.get("generation")
+    postprocess = meta.get("postprocess")
+    prompt_fusion = meta.get("_prompt_fusion")
     return bool(
         meta.get("status") == "failed"
         or (isinstance(generation, Mapping) and generation.get("status") == "failed")
+        or (
+            isinstance(postprocess, Mapping)
+            and postprocess.get("status") == "failed"
+        )
+        or (
+            isinstance(prompt_fusion, Mapping)
+            and prompt_fusion.get("status") == "failed"
+        )
     )
+
+
+def _failed_job_error(meta: Mapping[str, Any]) -> JobError:
+    pipeline_error = meta.get("error")
+    if pipeline_error == "provider_rejected":
+        return JobError(
+            code="image_rejected_by_provider",
+            message="图片未通过供应商审核，请更换图片后重新创建任务",
+        )
+    if pipeline_error in {"audio_required", "source video has no audio track"}:
+        return JobError(
+            code="video_audio_required",
+            message="视频没有可用音轨，请上传带口播音轨的视频后重新创建任务",
+        )
+    if pipeline_error == "long_video_duration_exceeded":
+        return JobError(
+            code="video_duration_exceeds_h3_limit",
+            message="视频时长超过限制，请裁剪后重新创建任务",
+        )
+    if pipeline_error == "invalid_duration":
+        return JobError(
+            code="video_duration_invalid",
+            message="无法确认视频时长，请更换视频后重新创建任务",
+        )
+    postprocess = meta.get("postprocess")
+    if (
+        isinstance(postprocess, Mapping)
+        and postprocess.get("status") == "failed"
+        and postprocess.get("error") == "provider_rejected"
+    ):
+        return JobError(
+            code="image_rejected_by_provider",
+            message="图片未通过供应商审核，请更换图片后重新创建任务",
+        )
+    generation = meta.get("generation")
+    generation_errors: list[object] = []
+    if isinstance(generation, Mapping) and generation.get("status") == "failed":
+        generation_errors.append(generation.get("error"))
+        segments = generation.get("segments")
+        if isinstance(segments, list):
+            generation_errors.extend(
+                segment.get("error")
+                for segment in segments
+                if isinstance(segment, Mapping)
+                and segment.get("status") == "failed"
+            )
+    if "h3_submit_rejected" in generation_errors:
+        return JobError(
+            code="video_rejected_by_provider",
+            message="视频内容未通过供应商审核，请调整素材后重新创建任务",
+        )
+    if pipeline_error == "long_video_audio_mode_unsupported":
+        return JobError(
+            code="video_audio_unsupported",
+            message="视频音频模式不受支持，请更换视频后重新创建任务",
+        )
+    return JobError(code="generation_failed", message="视频生成失败")
 
 
 def _normalize_url(value: str) -> str:
@@ -247,9 +416,22 @@ def _normalize_url(value: str) -> str:
         raise PublicAPIError(422, "invalid_source_video_url", "视频链接无效", field="source_video_url") from None
     if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise PublicAPIError(422, "invalid_source_video_url", "视频链接必须是无凭据的 HTTPS 公网地址", field="source_video_url")
-    host = parsed.hostname.lower()
-    port = f":{parsed.port}" if parsed.port not in (None, 443) else ""
-    return urlunsplit(("https", f"{host}{port}", parsed.path or "/", parsed.query, ""))
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise PublicAPIError(422, "invalid_source_video_url", "视频链接必须是无凭据的 HTTPS 公网地址", field="source_video_url")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise PublicAPIError(422, "invalid_source_video_url", "视频链接必须是无凭据的 HTTPS 公网地址", field="source_video_url")
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        raise PublicAPIError(422, "invalid_source_video_url", "视频链接无效", field="source_video_url") from None
+    rendered_host = f"[{host}]" if address is not None and address.version == 6 else host
+    port = f":{parsed_port}" if parsed_port not in (None, 443) else ""
+    return urlunsplit(("https", f"{rendered_host}{port}", parsed.path or "/", parsed.query, ""))
 
 
 def _idempotency_digest(owner_id: str, value: str) -> str:
@@ -299,8 +481,6 @@ def install(
     router = APIRouter(prefix="/api/v1")
     bearer = HTTPBearer(auto_error=False)
     limiter = _RateLimiter()
-    download_locks: dict[str, threading.BoundedSemaphore] = {}
-    download_guard = threading.Lock()
 
     async def principal(
         credentials: HTTPAuthorizationCredentials | None = Security(bearer),
@@ -318,6 +498,57 @@ def install(
             headers = {"WWW-Authenticate": "Bearer"} if exc.status_code == 401 else None
             message = "API Key 无效" if exc.status_code == 401 else "API Key 注册表不可用"
             raise PublicAPIError(exc.status_code, exc.code, message, headers=headers) from None
+
+    async def no_query(request: Request) -> None:
+        if request.query_params:
+            raise PublicAPIError(
+                422,
+                "invalid_query_parameters",
+                "本接口不接受 Query 参数",
+            )
+
+    async def require_multipart(request: Request) -> None:
+        content_type = request.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "multipart/form-data":
+            raise PublicAPIError(
+                415,
+                "unsupported_content_type",
+                "Content-Type 必须是 multipart/form-data",
+                field="Content-Type",
+            )
+
+    async def validate_create_parameters(request: Request) -> None:
+        form = await request.form()
+        for field, allowed, code in (
+            ("aspect_ratio", {"9:16", "16:9"}, "invalid_aspect_ratio"),
+            ("resolution", {"768p", "480p"}, "invalid_resolution"),
+        ):
+            if field in form and form.get(field) not in allowed:
+                raise PublicAPIError(
+                    422,
+                    code,
+                    f"{field} 无效",
+                    field=field,
+                )
+
+    async def validate_credit_query(request: Request) -> None:
+        if set(request.query_params) - {"limit"} or len(
+            request.query_params.getlist("limit")
+        ) > 1:
+            raise PublicAPIError(
+                422,
+                "invalid_query_parameters",
+                "请求包含未知或重复的 Query 参数",
+            )
+        values = request.query_params.getlist("limit")
+        if values and _STRICT_LIMIT_RE.fullmatch(values[0]) is None:
+            raise PublicAPIError(
+                422,
+                "invalid_limit",
+                "limit 必须是 1 到 100 的十进制整数",
+                field="limit",
+            )
 
     def project(owner_id: str, job_id: str) -> tuple[Job, Path | None]:
         cid, meta = _load_owned(settings, owner_id, job_id)
@@ -368,7 +599,7 @@ def install(
             progress = 100
         error = None
         if status == "failed":
-            error = JobError(code="generation_failed", message="视频生成失败")
+            error = _failed_job_error(meta)
         elif status == "submission_unknown":
             error = JobError(
                 code="submission_outcome_unknown",
@@ -431,7 +662,11 @@ def install(
         if reconciliation_thread is not None:
             reconciliation_thread.join(timeout=2)
 
-    @router.get("/video-generations/capabilities", response_model=Capabilities)
+    @router.get(
+        "/video-generations/capabilities",
+        response_model=Capabilities,
+        dependencies=[Depends(no_query)],
+    )
     async def capabilities(identity: public_api_auth.Principal = Depends(principal)):
         limiter.check(identity.owner_id, "read", 120)
         return Capabilities(
@@ -469,6 +704,11 @@ def install(
         "/video-generations",
         response_model=Job,
         status_code=201,
+        dependencies=[
+            Depends(no_query),
+            Depends(require_multipart),
+            Depends(validate_create_parameters),
+        ],
         responses={400: {"model": ErrorEnvelope}, 402: {"model": ErrorEnvelope}, 409: {"model": ErrorEnvelope}, 422: {"model": ErrorEnvelope}, 429: {"model": ErrorEnvelope}},
     )
     async def create_video_generation(
@@ -491,7 +731,10 @@ def install(
         form = await request.form()
         if set(form) - _CREATE_FIELDS or any(len(form.getlist(key)) != 1 for key in form):
             raise PublicAPIError(422, "invalid_create_request", "请求包含未知或重复字段")
-        url = (source_video_url or "").strip()
+        raw_url = form.get("source_video_url")
+        if raw_url is not None and not isinstance(raw_url, str):
+            raise PublicAPIError(422, "invalid_source_video_url", "视频链接无效", field="source_video_url")
+        url = (raw_url or source_video_url or "").strip()
         if (source_video is None) == (not url):
             raise PublicAPIError(422, "source_exactly_one_required", "source_video 与 source_video_url 必须且只能提供一个")
         normalized_url = _normalize_url(url) if url else None
@@ -499,16 +742,30 @@ def install(
             suffix = Path(source_video.filename or "").suffix.lower()
             if suffix not in _VIDEO_SUFFIXES:
                 raise PublicAPIError(415, "unsupported_source_media_type", "原视频格式不受支持", field="source_video")
+        raw_aspect_ratio = form.get("aspect_ratio", aspect_ratio)
+        if raw_aspect_ratio not in {"9:16", "16:9"}:
+            raise PublicAPIError(422, "invalid_aspect_ratio", "aspect_ratio 无效", field="aspect_ratio")
+        aspect_ratio = str(raw_aspect_ratio)
+        raw_resolution = form.get("resolution", resolution)
+        if raw_resolution not in {"768p", "480p"}:
+            raise PublicAPIError(422, "invalid_resolution", "resolution 无效", field="resolution")
+        resolution = str(raw_resolution)
         language = None
-        if target_language is not None:
-            language = target_language.strip()
+        raw_language = form.get("target_language")
+        if raw_language is not None:
+            if not isinstance(raw_language, str):
+                raise PublicAPIError(422, "invalid_target_language", "target_language 无效", field="target_language")
+            language = raw_language.strip()
             if not language:
                 raise PublicAPIError(422, "invalid_target_language", "target_language 不能为空", field="target_language")
             if minimal_creation.utf16_code_units(language) > 80:
                 raise PublicAPIError(422, "target_language_too_long", "target_language 超过长度限制", field="target_language")
         instruction = None
-        if replacement_instruction is not None:
-            instruction = replacement_instruction.strip()
+        raw_instruction = form.get("replacement_instruction")
+        if raw_instruction is not None:
+            if not isinstance(raw_instruction, str):
+                raise PublicAPIError(422, "replacement_pair_required", "replacement_instruction 无效", field="replacement_instruction")
+            instruction = raw_instruction.strip()
         if (replacement_image is None) != (not instruction):
             raise PublicAPIError(422, "replacement_pair_required", "replacement_image 与 replacement_instruction 必须同时提供")
         if instruction is not None and minimal_creation.utf16_code_units(instruction) > 1000:
@@ -576,7 +833,7 @@ def install(
             status = getattr(exc, "status_code", None)
             detail = getattr(exc, "detail", None)
             if isinstance(status, int) and isinstance(detail, Mapping):
-                raise PublicAPIError(status, str(detail.get("code", "invalid_create_request")), str(detail.get("message", "创建请求无效")), field=detail.get("field")) from None
+                raise _public_create_error(status, detail) from None
             raise
         job_id = f"vg_{result['id']}"
         job, _ = await run_in_threadpool(project, identity.owner_id, job_id)
@@ -586,7 +843,11 @@ def install(
         response.headers["Cache-Control"] = "private, no-store"
         return job
 
-    @router.get("/video-generations/{job_id}", response_model=Job)
+    @router.get(
+        "/video-generations/{job_id}",
+        response_model=Job,
+        dependencies=[Depends(no_query)],
+    )
     async def get_video_generation(
         job_id: str,
         response: Response,
@@ -598,7 +859,11 @@ def install(
             response.headers["Retry-After"] = str(job.poll_after_seconds)
         return job
 
-    @router.get("/account/credits", response_model=CreditBalance)
+    @router.get(
+        "/account/credits",
+        response_model=CreditBalance,
+        dependencies=[Depends(no_query)],
+    )
     async def get_credits(identity: public_api_auth.Principal = Depends(principal)):
         limiter.check(identity.owner_id, "read", 120)
         try:
@@ -612,7 +877,11 @@ def install(
             spent_credits=current["spent"],
         )
 
-    @router.get("/account/credit-transactions", response_model=CreditTransactions)
+    @router.get(
+        "/account/credit-transactions",
+        response_model=CreditTransactions,
+        dependencies=[Depends(validate_credit_query)],
+    )
     async def get_credit_transactions(
         identity: public_api_auth.Principal = Depends(principal),
         limit: int = 50,
@@ -656,7 +925,7 @@ def install(
             raise PublicAPIError(416, "invalid_range", "字节范围无效", headers={"Content-Range": f"bytes */{size}"}) from None
         return start, end
 
-    def _stream(path: Path, start: int, length: int, semaphore: threading.BoundedSemaphore):
+    def _stream(path: Path, start: int, length: int, lease: _DownloadLease):
         try:
             with path.open("rb") as stream:
                 stream.seek(start)
@@ -668,7 +937,7 @@ def install(
                     remaining -= len(chunk)
                     yield chunk
         finally:
-            semaphore.release()
+            lease.release()
 
     async def content_response(job_id: str, identity: public_api_auth.Principal, range_value: str | None, *, head: bool):
         limiter.check(identity.owner_id, "read", 120)
@@ -693,18 +962,36 @@ def install(
             headers["Content-Range"] = f"bytes {start}-{end}/{video.size_bytes}"
         if head:
             return Response(status_code=200, media_type="video/mp4", headers=headers)
-        with download_guard:
-            semaphore = download_locks.setdefault(identity.owner_id, threading.BoundedSemaphore(2))
-        if not semaphore.acquire(blocking=False):
+        try:
+            lease = await run_in_threadpool(
+                _acquire_download_lease,
+                settings.data_dir,
+                identity.owner_id,
+            )
+        except OSError as exc:
+            raise PublicAPIError(
+                503,
+                "download_state_unavailable",
+                "下载状态暂时不可用",
+            ) from exc
+        if lease is None:
             raise PublicAPIError(429, "download_limit_exceeded", "并发下载数已达上限", headers={"Retry-After": "1"})
-        return StreamingResponse(
-            _stream(path, start, length, semaphore),
-            status_code=status_code,
-            media_type="video/mp4",
-            headers=headers,
-        )
+        try:
+            return StreamingResponse(
+                _stream(path, start, length, lease),
+                status_code=status_code,
+                media_type="video/mp4",
+                headers=headers,
+                background=BackgroundTask(lease.release),
+            )
+        except BaseException:
+            lease.release()
+            raise
 
-    @router.get("/video-generations/{job_id}/content")
+    @router.get(
+        "/video-generations/{job_id}/content",
+        dependencies=[Depends(no_query)],
+    )
     async def get_content(
         job_id: str,
         request: Request,
@@ -712,7 +999,10 @@ def install(
     ):
         return await content_response(job_id, identity, request.headers.get("Range"), head=False)
 
-    @router.head("/video-generations/{job_id}/content")
+    @router.head(
+        "/video-generations/{job_id}/content",
+        dependencies=[Depends(no_query)],
+    )
     async def head_content(
         job_id: str,
         identity: public_api_auth.Principal = Depends(principal),
@@ -722,7 +1012,8 @@ def install(
     app.include_router(router)
 
     @app.get("/api/v1/openapi.json", include_in_schema=False)
-    async def public_openapi():
+    async def public_openapi(request: Request):
+        await no_query(request)
         return get_openapi(
             title="Duet Video Generation API",
             version="1.0.0",
@@ -734,11 +1025,49 @@ def install(
     async def public_api_error_handler(request: Request, exc: PublicAPIError):
         return _error_response(request, exc)
 
+    @app.exception_handler(StarletteHTTPException)
+    async def public_http_error_handler(
+        request: Request, exc: StarletteHTTPException
+    ):
+        if not _is_public_path(request.url.path):
+            return await http_exception_handler(request, exc)
+        if exc.status_code == 400:
+            code, message = "invalid_multipart", "multipart 请求格式无效"
+        elif exc.status_code == 404:
+            code, message = "endpoint_not_found", "接口不存在"
+        elif exc.status_code == 405:
+            code, message = "method_not_allowed", "HTTP 方法不受支持"
+        elif exc.status_code == 413:
+            code, message = "request_too_large", "请求正文超过大小限制"
+        elif exc.status_code == 415:
+            code, message = "unsupported_content_type", "请求 Content-Type 不受支持"
+        else:
+            code, message = "request_failed", "请求未能完成"
+        headers = dict(exc.headers or {})
+        if exc.status_code == 405 and "Allow" not in headers:
+            allowed = {
+                method
+                for route in router.routes
+                if route.matches(request.scope)[0] is Match.PARTIAL
+                for method in (route.methods or set())
+            }
+            if allowed:
+                headers["Allow"] = ", ".join(sorted(allowed))
+        return _error_response(
+            request,
+            PublicAPIError(
+                exc.status_code,
+                code,
+                message,
+                headers=headers,
+            ),
+        )
+
     @app.exception_handler(RequestValidationError)
     async def public_validation_error_handler(
         request: Request, exc: RequestValidationError
     ):
-        if not request.url.path.startswith("/api/v1/"):
+        if not _is_public_path(request.url.path):
             return await request_validation_exception_handler(request, exc)
         errors = exc.errors()
         first = errors[0] if errors else {}

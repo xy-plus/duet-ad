@@ -238,7 +238,7 @@ def test_asr_operational_failure_is_distinct_from_valid_empty_outcomes():
         "emptyVoice:contract.dialogueReviewOutcomeText({outcome:'vocal_unrecognized',lines:[]})})"
     )
     assert result == {
-        "failure": "台词识别失败，未进入校对或后续生成",
+        "failure": "台词识别失败，请检查原视频音轨后重试",
         "noAudio": "未检测到音轨。你可以补充台词，或采用空稿按无台词继续。",
         "noVocal": "未检测到可信口播。你可以补充台词，或采用空稿继续。",
         "emptyVoice": "检测到人声，但未识别出可靠台词。请补充台词，或采用空稿继续。",

@@ -16,7 +16,7 @@ links: [conversation-task]
 | --- | --- |
 | 上传 `.mp4/.mov/.webm` 或提供受支持的公网视频链接 | 创建 schema v2 会话，立即进入 `queued`；文件与链接必须且只能选一个 |
 | 源视频可读且实际时长为正有限数 | ffprobe 校验视频流尺寸；时长超过 300 秒时删除刚创建的会话并返回结构化 422，前端提示裁剪后重新上传 |
-| 任意 current v4 源视频 | 准备为 `segments[N>=1]`；每段 provider 整秒时长不超过 14 秒并冻结 exact 9 张关键帧及 source scene/time/transition |
+| 任意 current v4 源视频 | 准备为 `segments[N>=1]`；每段 provider 整秒时长不超过 8 秒并冻结 exact 9 张关键帧及 source scene/time/transition |
 | 源视频没有音轨 | 合法；自动台词、声学证据和 normalized audio 均为空，不伪造台词 |
 | 历史 short 选择原文保持/改编/翻译 | 只属于历史 prepared-input；current v4 不从该合同创建或迁移 |
 | 自动台词 agent 开始听写 | 后端把 `voice.mp3` 与仅含必要时长的 `manifest.json` 复制到 `/tmp` 音频专用工作区，并以外层文件系统沙箱运行；agent 不能读取源视频、抽帧、contact sheet、视觉 prompt、会话目录或仓库。缺少沙箱能力或路径校验异常时准备失败，不降级为提示词禁令 |
@@ -34,11 +34,10 @@ links: [conversation-task]
 - 同一 IP 每分钟最多创建 10 次；排队会话数由 `MAX_QUEUED` 限制。
 - `client_request_id` 可用于创建幂等；同 id 命中返回既有会话。
 - `VOCAL_FILTER=off` 可保留未分类为人声的句子，但仍记录分类；未知值按启用处理。
-- current v4 的 `≤15s` 是 `segments.length=1`，`>15s` 是 `segments.length>1`；两者共用同一冻结、Fusion、Context、H3 和 stitch 合同。旧 prepared-input/short receipt 只读。
+- current v4 的 `≤8s` 是 `segments.length=1`，`>8s` 是 `segments.length>1`；两者共用同一冻结、Fusion、Context、H3 和 stitch 合同。旧 prepared-input/short receipt 只读。
 
 ## 例子
 
-- 9.2 秒、无音轨、9:16 视频：准备一个 exact-9 segment，自动台词为空，H3 零 source audio reference。
-- 15 秒视频：使用 `segments.length=1` 的统一任务和统一 EDL。
-- 15.1 秒、`voice_mode=keep` 视频：准备至少 2 个多图参考子任务，每个整秒请求不超过 14 秒。
+- 8 秒、无音轨、9:16 视频：准备一个 exact-9 segment，自动台词为空，H3 零 source audio reference。
+- 8.1 秒视频：准备至少 2 个多图参考子任务，每个整秒请求不超过 8 秒。
 - 300.01 秒视频：上传后返回 `video_duration_exceeds_h3_limit`，不创建可见会话、不运行准备流水线。

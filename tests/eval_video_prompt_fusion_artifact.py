@@ -16,8 +16,15 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+# Import storage first so this standalone CLI enters the app's intentional
+# dialogue_review/voice/storage cycle through its stable production order.
+from app import storage as _storage
 from app import codex_output_schemas, pipeline
 from app.codex_runner import CodexRunner
+from app.deepseek_runner import DeepSeekRunner
+
+
+RUNNER_CHOICES = ("deepseek", "codex")
 
 
 DIMENSIONS = (
@@ -45,8 +52,37 @@ _BINDING_RE = re.compile(
 )
 
 
+def _absolute_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError("path must be absolute")
+    return path
+
+
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _build_runner(
+    runner_name: str,
+    *,
+    timeout_s: int,
+    credential_file: Path | None,
+):
+    if runner_name == "deepseek":
+        if credential_file is None:
+            raise ValueError("DeepSeek requires an explicit credential file")
+        credential = Path(credential_file)
+        if not credential.is_absolute():
+            raise ValueError("DeepSeek credential file must be absolute")
+        return DeepSeekRunner(
+            timeout_s=timeout_s,
+            concurrency=1,
+            credential_file=credential,
+        )
+    if runner_name == "codex":
+        return CodexRunner(timeout_s=timeout_s, concurrency=1)
+    raise ValueError(f"unsupported runner: {runner_name}")
 
 
 def _load_json(path: Path) -> tuple[bytes, dict[str, Any]]:
@@ -58,7 +94,7 @@ def _load_json(path: Path) -> tuple[bytes, dict[str, Any]]:
 
 
 def _validate_fusion_output(
-    data: bytes, *, input_sha256: str, segment_count: int
+    data: bytes, *, input_sha256: str, expected_visual_counts: list[int]
 ) -> dict[str, Any]:
     """Validate only the production output envelope; semantic quality is review-only."""
     try:
@@ -73,17 +109,19 @@ def _validate_fusion_output(
         or value.get("version") != 2
         or value.get("input_sha256") != input_sha256
         or not isinstance(segments, list)
-        or len(segments) != segment_count
+        or len(segments) != len(expected_visual_counts)
     ):
         raise ValueError("fusion output envelope is invalid")
-    for index, segment in enumerate(segments, 1):
+    for index, (segment, expected_visual_count) in enumerate(
+        zip(segments, expected_visual_counts, strict=True), 1
+    ):
         visuals = segment.get("visual") if isinstance(segment, dict) else None
         if (
             not isinstance(segment, dict)
             or set(segment) != {"index", "visual"}
             or segment.get("index") != index
             or not isinstance(visuals, list)
-            or not visuals
+            or len(visuals) != expected_visual_count
             or any(not isinstance(text, str) or not text.strip() for text in visuals)
         ):
             raise ValueError("fusion output segment is invalid")
@@ -117,6 +155,8 @@ def run_real_fusion(
     evidence_dir: Path,
     *,
     timeout_s: int = 1800,
+    runner_name: str = "deepseek",
+    credential_file: Path | None = None,
 ) -> Path:
     """Run the actual fusion Skill against one frozen v2 multimodal input.
 
@@ -138,6 +178,11 @@ def run_real_fusion(
         or not frozen["segments"]
     ):
         raise ValueError("run_real_fusion requires a frozen v2 input")
+    expected_visual_counts = list(
+        pipeline._prompt_fusion_visual_counts(frozen["segments"])
+    )
+    if any(count < 1 for count in expected_visual_counts):
+        raise ValueError("frozen segment keyframes are invalid")
     source_root = input_path.parent.parent.resolve(strict=True)
     skill_data = skill_path.read_bytes()
     if not skill_data:
@@ -145,6 +190,11 @@ def run_real_fusion(
     input_sha256 = _sha256_bytes(input_data)
     visual_max_chars = pipeline._prompt_fusion_visual_max_chars(
         frozen["segments"],
+    )
+    runner = _build_runner(
+        runner_name,
+        timeout_s=timeout_s,
+        credential_file=credential_file,
     )
     evidence_dir.mkdir(parents=True, exist_ok=True)
     (evidence_dir / "frozen_input.json").write_bytes(input_data)
@@ -155,6 +205,7 @@ def run_real_fusion(
                 "input_sha256": input_sha256,
                 "skill_sha256": _sha256_bytes(skill_data),
                 "segment_count": len(frozen["segments"]),
+                "expected_visual_counts": expected_visual_counts,
                 "visual_max_chars": visual_max_chars,
                 "source_root": str(source_root),
             },
@@ -179,7 +230,6 @@ def run_real_fusion(
             for frame in frames:
                 _copy_frozen_frame(source_root=source_root, stage=stage, frame=frame)
         output_path = stage_work / "h3_prompt_plan.json"
-        runner = CodexRunner(timeout_s=timeout_s, concurrency=1)
         runner.run_isolated_until_output(
             stage,
             "严格执行当前目录 SKILL.md；只读取 work/multimodal_input.json "
@@ -191,11 +241,11 @@ def run_real_fusion(
             validate_output=lambda data: _validate_fusion_output(
                 data,
                 input_sha256=input_sha256,
-                segment_count=len(frozen["segments"]),
+                expected_visual_counts=expected_visual_counts,
             ),
             output_schema=codex_output_schemas.prompt_fusion_schema(
                 input_sha256=input_sha256,
-                segment_count=len(frozen["segments"]),
+                visual_counts=tuple(expected_visual_counts),
                 visual_max_chars=visual_max_chars,
             ),
         )
@@ -203,7 +253,7 @@ def run_real_fusion(
         _validate_fusion_output(
             artifact_data,
             input_sha256=input_sha256,
-            segment_count=len(frozen["segments"]),
+            expected_visual_counts=expected_visual_counts,
         )
         artifact_path = evidence_dir / "h3_prompt_plan.json"
         artifact_path.write_bytes(artifact_data)
@@ -373,13 +423,34 @@ def attach_ratings(inventory: dict[str, Any], ratings_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--artifact", required=True, type=Path)
-    parser.add_argument("--ratings", type=Path)
-    parser.add_argument("--report", required=True, type=Path)
+    parser.add_argument("--input", required=True, type=_absolute_path)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--artifact", type=_absolute_path)
+    source.add_argument("--skill", type=_absolute_path)
+    parser.add_argument("--evidence-dir", type=_absolute_path)
+    parser.add_argument("--ratings", type=_absolute_path)
+    parser.add_argument("--report", required=True, type=_absolute_path)
+    parser.add_argument("--timeout-s", type=int, default=1800)
+    parser.add_argument("--runner", choices=RUNNER_CHOICES, default="deepseek")
+    parser.add_argument("--credential-file", type=_absolute_path)
     args = parser.parse_args()
 
-    inventory = build_inventory(args.input, args.artifact)
+    artifact_path = args.artifact
+    if args.skill is not None:
+        if args.evidence_dir is None:
+            parser.error("--evidence-dir is required with --skill")
+        artifact_path = run_real_fusion(
+            args.input,
+            args.skill,
+            args.evidence_dir,
+            timeout_s=args.timeout_s,
+            runner_name=args.runner,
+            credential_file=args.credential_file,
+        )
+    elif args.evidence_dir is not None:
+        parser.error("--evidence-dir is only valid with --skill")
+    assert artifact_path is not None
+    inventory = build_inventory(args.input, artifact_path)
     if args.ratings:
         attach_ratings(inventory, args.ratings)
     args.report.write_text(

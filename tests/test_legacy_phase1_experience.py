@@ -125,9 +125,9 @@ def test_error_summary_is_short_while_diagnostics_are_bounded():
         "(()=>{const raw={code:'submission_unknown',trace:'x'.repeat(2000)};return {"
         "summary:contract.safeErrorSummary(raw),diagnostic:contract.diagnosticText(raw)}})()"
     )
-    assert result["summary"] == "提交结果未知，已禁止重复提交"
-    assert len(result["diagnostic"]) < 1250
-    assert result["diagnostic"].endswith("…诊断内容已截断")
+    assert result["summary"] == "提交结果暂时无法确认，请继续等待，不要重复提交"
+    assert result["diagnostic"] == result["summary"]
+    assert "trace" not in result["diagnostic"]
 
 
 def test_history_thumbnail_and_summary_use_authoritative_detail_fields():

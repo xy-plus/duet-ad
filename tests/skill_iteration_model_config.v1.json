@@ -1,0 +1,26 @@
+{
+  "schema": "duet.skill-iteration-model-config",
+  "version": 1,
+  "provider": "deepseek",
+  "model": "deepseek-v4-flash-vision-exp",
+  "temperature": 0,
+  "max_tokens": 8192,
+  "thinking": {
+    "type": "disabled"
+  },
+  "transport": {
+    "method": "POST",
+    "endpoint": "https://api.deepseek.com/beta/chat/completions",
+    "stream": false,
+    "content_type": "application/json"
+  },
+  "structured_output": {
+    "function_name": "submit_result",
+    "tool_type": "function",
+    "strict": true,
+    "tool_choice_type": "function"
+  },
+  "multimodal": {
+    "image_detail": "low"
+  }
+}

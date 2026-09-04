@@ -52,10 +52,10 @@ def _global_keyframe_receipts(
 
 
 def test_short_video_is_the_single_segment_contract():
-    assert plan_segments(10.0, [(0.0, 10.0)], []) == [{
+    assert plan_segments(8.0, [(0.0, 8.0)], []) == [{
         "index": 1,
         "start_s": 0.0,
-        "end_s": 10.0,
+        "end_s": 8.0,
         "chain_id": "chain-001",
         "join_mode": "hard_cut",
     }]
@@ -100,10 +100,10 @@ def test_long_scene_is_split_at_production_limit_and_continues_chain():
     segments = plan_segments(31.0, [(0.0, 31.0)], [])
 
     assert [(s["start_s"], s["end_s"]) for s in segments] == [
-        (0.0, 10.0),
-        (10.0, 20.0),
-        (20.0, 27.0),
-        (27.0, 31.0),
+        (0.0, 8.0),
+        (8.0, 16.0),
+        (16.0, 24.0),
+        (24.0, 31.0),
     ]
     assert [s["chain_id"] for s in segments] == ["chain-001"] * 4
     assert [s["join_mode"] for s in segments] == [
@@ -117,13 +117,15 @@ def test_long_scene_is_split_at_production_limit_and_continues_chain():
 @pytest.mark.parametrize(
     "duration",
     [
+        8.0,
+        8.000001,
         10.0,
         10.000001,
         14.5,
         30.0,
     ],
 )
-def test_every_new_plan_obeys_the_ten_second_production_contract(duration):
+def test_every_new_plan_obeys_the_eight_second_production_contract(duration):
     segments = plan_segments(duration, [(0.0, duration)], [])
     assert segments[0]["start_s"] == 0.0
     assert segments[-1]["end_s"] == duration
@@ -145,15 +147,16 @@ def test_scene_cut_starts_a_new_chain_and_coverage_is_exact():
     segments = plan_segments(28.0, [(0.0, 13.0), (13.0, 28.0)], [])
 
     assert [(s["start_s"], s["end_s"]) for s in segments] == [
-        (0.0, 10.0),
-        (10.0, 20.0),
-        (20.0, 28.0),
+        (0.0, 8.0),
+        (8.0, 13.0),
+        (13.0, 21.0),
+        (21.0, 28.0),
     ]
     assert [s["chain_id"] for s in segments] == [
-        "chain-001", "chain-001", "chain-001"
+        "chain-001", "chain-001", "chain-002", "chain-002"
     ]
     assert [s["join_mode"] for s in segments] == [
-        "hard_cut", "continue", "continue"
+        "hard_cut", "continue", "hard_cut", "continue"
     ]
     assert all(4.0 <= s["end_s"] - s["start_s"] for s in segments)
     assert all(
@@ -174,7 +177,7 @@ def test_real_scene_bounds_never_plan_over_production_limit():
 
     segments = plan_segments(duration, scenes, [])
 
-    assert segments[0]["end_s"] == 8.92
+    assert segments[0]["end_s"] == 8.0
     assert all(
         provider_duration_s(item["start_s"], item["end_s"])
         <= long_video_module.SEGMENT_PROVIDER_MAX_DURATION_S
@@ -249,16 +252,16 @@ def test_segment_duration_uses_frozen_six_decimal_boundaries(
 
 
 def test_dialogue_cannot_move_visual_boundaries_and_has_one_owner():
-    lines = [{"text": "one sentence", "start_s": 9.0, "end_s": 11.0}]
+    lines = [{"text": "one sentence", "start_s": 7.0, "end_s": 9.0}]
     segments = plan_segments(28.0, [(0.0, 28.0)], lines)
 
-    assert segments[0]["end_s"] == 10.0
-    assert segments[1]["start_s"] == 10.0
+    assert segments[0]["end_s"] == 8.0
+    assert segments[1]["start_s"] == 8.0
     localized = [
         localize_dialogue(lines, segment, segments=segments)
         for segment in segments
     ]
-    assert localized[0] == [{"text": "one se", "start_s": 9.0, "end_s": 10.0}]
+    assert localized[0] == [{"text": "one se", "start_s": 7.0, "end_s": 8.0}]
     assert localized[1] == [{"text": "ntence", "start_s": 0.0, "end_s": 1.0}]
     assert all(items == [] for items in localized[2:])
     assert "".join(
@@ -268,7 +271,7 @@ def test_dialogue_cannot_move_visual_boundaries_and_has_one_owner():
 
 @pytest.mark.parametrize(
     ("duration", "old_tail_s", "expected_penultimate_end"),
-    [(31.0, 1.0, 27.0), (32.5, 2.5, 28.5)],
+    [(25.0, 1.0, 21.0), (26.5, 2.5, 22.5)],
 )
 def test_short_tail_moves_the_previous_boundary_without_changing_total_duration(
     duration, old_tail_s, expected_penultimate_end,
@@ -306,7 +309,7 @@ def test_hard_cut_is_kept_only_when_both_source_sides_meet_provider_minimum():
 
 
 def test_boundary_spanning_dialogue_is_repartitioned_without_text_or_time_loss():
-    line = {"text": "abcdefgh", "start_s": 8.0, "end_s": 10.0}
+    line = {"text": "abcdefgh", "start_s": 7.5, "end_s": 9.5}
     segments = plan_segments(12.5, [(0.0, 12.5)], [line])
     localized = [
         localize_dialogue([line], segment, segments=segments)
@@ -314,7 +317,7 @@ def test_boundary_spanning_dialogue_is_repartitioned_without_text_or_time_loss()
     ]
 
     assert [(item["start_s"], item["end_s"]) for item in segments] == [
-        (0.0, 8.5), (8.5, 12.5),
+        (0.0, 8.0), (8.0, 12.5),
     ]
     assert "".join(
         fragment["text"] for fragments in localized for fragment in fragments
@@ -327,7 +330,7 @@ def test_boundary_spanning_dialogue_is_repartitioned_without_text_or_time_loss()
         for segment, fragments in zip(segments, localized)
         for fragment in fragments
     ]
-    assert absolute_intervals == [(8.0, 8.5), (8.5, 10.0)]
+    assert absolute_intervals == [(7.5, 8.0), (8.0, 9.5)]
 
 
 @pytest.mark.parametrize("duration", [1.0, 2.5, 3.999999])
@@ -344,19 +347,20 @@ def test_short_source_keeps_exact_timeline_and_uses_provider_minimum(duration):
     assert provider_duration_s(0.0, duration) == 4
 
 
-def test_source_spanning_dialogue_never_blocks_a_ten_second_plan():
+def test_source_spanning_dialogue_never_blocks_an_eight_second_plan():
     lines = [{"text": "too long", "start_s": 0.0, "end_s": 16.0}]
     segments = plan_segments(20.0, [(0.0, 20.0)], lines)
 
     assert [(item["start_s"], item["end_s"]) for item in segments] == [
-        (0.0, 10.0), (10.0, 20.0),
+        (0.0, 8.0), (8.0, 16.0), (16.0, 20.0),
     ]
     assert localize_dialogue(lines, segments[0], segments=segments) == [{
-        "text": "too l", "start_s": 0.0, "end_s": 10.0,
+        "text": "too ", "start_s": 0.0, "end_s": 8.0,
     }]
     assert localize_dialogue(lines, segments[1], segments=segments) == [{
-        "text": "ong", "start_s": 0.0, "end_s": 6.0,
+        "text": "long", "start_s": 0.0, "end_s": 8.0,
     }]
+    assert localize_dialogue(lines, segments[2], segments=segments) == []
 
 
 def test_over_three_hundred_seconds_has_stable_error():
@@ -562,7 +566,7 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     first_segment = {
         "index": 1,
         "start_s": 0.0,
-        "end_s": 10.0,
+        "end_s": 8.0,
         "chain_id": "chain-001",
         "join_mode": "hard_cut",
         "source_path": segment_source,
@@ -576,7 +580,7 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     segments = [first_segment, {
         **first_segment,
         "index": 2,
-        "start_s": 10.0,
+        "start_s": 8.0,
         "end_s": duration,
         "join_mode": "continue",
     }]
@@ -605,7 +609,7 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     assert receipt["video"]["duration_s"] == duration
     assert receipt["workflow"] == "minimax_h3_lightx2v"
     planned = receipt["segments"][0]
-    assert (planned["start_s"], planned["end_s"]) == (0.0, 10.0)
+    assert (planned["start_s"], planned["end_s"]) == (0.0, 8.0)
     assert (planned["chain_id"], planned["join_mode"]) == ("chain-001", "hard_cut")
     assert planned["source"]["sha256"] == hashlib.sha256(b"segment source").hexdigest()
     assert planned["keyframes"][0]["sha256"] == hashlib.sha256(b"frame").hexdigest()
@@ -628,8 +632,8 @@ def test_plan_receipt_binds_every_segment_artifact_deterministically(tmp_path):
     assert planned["dialogue"]["count"] == 1
 
     over_limit = [
-        {**segments[0], "end_s": 10.000001},
-        {**segments[1], "start_s": 10.000001},
+        {**segments[0], "end_s": 8.000001},
+        {**segments[1], "start_s": 8.000001},
     ]
     with pytest.raises(
         LongVideoError, match="long_video_plan_invalid_segment"
@@ -707,7 +711,7 @@ def test_visual_plan_receipt_binds_keyframe_source_timeline(tmp_path):
     frame_paths = []
     keyframe_sources = []
     for order, source_time_s in enumerate(
-        [0.0, 0.75, 2.0, 2.5, 4.0, 6.0, 8.0, 9.0, 10.0], 1
+        [0.0, 0.75, 2.0, 2.5, 4.0, 5.0, 6.0, 7.0, 8.0], 1
     ):
         frame = keyframes / f"{order:02d}.png"
         frame.write_bytes(f"frame-{order}".encode())
@@ -736,11 +740,11 @@ def test_visual_plan_receipt_binds_keyframe_source_timeline(tmp_path):
     path = write_plan_receipt(
         tmp_path,
         source=source,
-        duration_s=10.0,
+        duration_s=8.0,
         segments=[{
             "index": 1,
             "start_s": 0.0,
-            "end_s": 10.0,
+            "end_s": 8.0,
             "chain_id": "chain-001",
             "join_mode": "hard_cut",
             "source_path": segment_source,
@@ -766,11 +770,11 @@ def test_visual_plan_receipt_binds_keyframe_source_timeline(tmp_path):
         write_plan_receipt(
             tmp_path,
             source=source,
-            duration_s=10.0,
+            duration_s=8.0,
             segments=[{
                 "index": 1,
                 "start_s": 0.0,
-                "end_s": 10.0,
+                "end_s": 8.0,
                 "chain_id": "chain-001",
                 "join_mode": "hard_cut",
                 "source_path": segment_source,

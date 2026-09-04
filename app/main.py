@@ -119,6 +119,29 @@ _MINIMAL_REPLACEMENT_MEDIA_ERROR_CODES = frozenset({
     "unsupported_replacement_media_type",
     "invalid_replacement_image",
 })
+_USER_ERROR_ALIASES = {
+    "audio_required": "video_audio_required",
+    "h3_submit_rejected": "video_rejected_by_provider",
+    "invalid_duration": "video_duration_invalid",
+    "long_video_audio_mode_unsupported": "video_audio_unsupported",
+    "long_video_duration_exceeded": "video_duration_exceeds_h3_limit",
+    "provider_rejected": "image_rejected_by_provider",
+    "source video has no audio track": "video_audio_required",
+}
+_USER_ACTIONABLE_ERROR_CODES = frozenset({
+    "image_rejected_by_provider",
+    "invalid_replacement_image",
+    "invalid_source_media",
+    "replacement_image_too_large",
+    "source_too_large",
+    "unsupported_replacement_media_type",
+    "unsupported_source_media_type",
+    "video_audio_required",
+    "video_audio_unsupported",
+    "video_duration_exceeds_h3_limit",
+    "video_duration_invalid",
+    "video_rejected_by_provider",
+})
 
 
 def _minimal_http_exception(
@@ -152,6 +175,13 @@ def _minimal_generation_request_exception(
         message=exc.message,
         field=exc.field,
     )
+
+
+def _user_error_code(value: object, *, fallback: str) -> str:
+    if not isinstance(value, str):
+        return fallback
+    code = _USER_ERROR_ALIASES.get(value, value)
+    return code if code in _USER_ACTIONABLE_ERROR_CODES else fallback
 
 
 def _record_error_fail_open(path: Path, **kwargs) -> None:
@@ -423,28 +453,58 @@ def _public_dialogue_review(meta: dict) -> dict | None:
     return dialogue_review.public_state(meta.get("dialogue_review"))
 
 
+def _public_postprocess(meta: dict) -> dict | None:
+    projected = postprocess.public_state(meta.get("postprocess"))
+    if not isinstance(projected, dict):
+        return None
+    result = dict(projected)
+    result.pop("provider_error_code", None)
+    if result.get("status") == "failed":
+        result["error"] = _user_error_code(
+            result.get("error"), fallback="postprocess_failed"
+        )
+    raw_segments = result.get("segments")
+    if isinstance(raw_segments, list):
+        segments = []
+        for raw_segment in raw_segments:
+            if not isinstance(raw_segment, dict):
+                continue
+            segment = dict(raw_segment)
+            segment.pop("provider_error_code", None)
+            if segment.get("status") == "failed":
+                segment["error"] = _user_error_code(
+                    segment.get("error"), fallback="postprocess_failed"
+                )
+            segments.append(segment)
+        result["segments"] = segments
+    return result
+
+
 def _public_conversation_status(meta: dict) -> tuple[str | None, str | None]:
     """Keep analysis state visible without masking a terminal delivery failure."""
     raw_status = meta.get("status")
     analysis_status = raw_status if isinstance(raw_status, str) else None
-    public_postprocess = postprocess.public_state(meta.get("postprocess"))
+    public_postprocess = _public_postprocess(meta)
     if (
         analysis_status == "done"
         and isinstance(public_postprocess, dict)
         and public_postprocess.get("status") == "failed"
     ):
-        postprocess_error = public_postprocess.get("error")
-        return "failed", (
-            postprocess_error
-            if isinstance(postprocess_error, str) and " " not in postprocess_error
-            else "postprocess_failed"
-        )
+        return "failed", str(public_postprocess.get("error"))
     if analysis_status == "failed":
         raw_error = meta.get("error")
+        direct_error = _user_error_code(
+            raw_error, fallback="pipeline_failed"
+        )
+        if direct_error != "pipeline_failed":
+            return "failed", direct_error
         internal_error = pipeline.PipelineError(
             raw_error if isinstance(raw_error, str) else ""
         )
-        return "failed", pipeline._public_pipeline_error(internal_error)
+        return "failed", _user_error_code(
+            pipeline._public_pipeline_error(internal_error),
+            fallback="pipeline_failed",
+        )
     return analysis_status, None
 
 
@@ -463,7 +523,7 @@ def _navigation_status(meta: dict, *, has_video: bool) -> str:
     if analysis != "done":
         return "analysis_unknown"
 
-    postprocess_state = postprocess.public_state(meta.get("postprocess"))
+    postprocess_state = _public_postprocess(meta)
     if (
         isinstance(postprocess_state, dict)
         and postprocess_state.get("status") == "failed"
@@ -488,7 +548,7 @@ def _navigation_status(meta: dict, *, has_video: bool) -> str:
     if not has_video:
         return "output_missing"
 
-    postprocess_state = postprocess.public_state(meta.get("postprocess"))
+    postprocess_state = _public_postprocess(meta)
     if isinstance(postprocess_state, dict):
         postprocess_states = {
             "running": "postprocessing",
@@ -530,20 +590,42 @@ def _public_generation(meta: dict) -> dict | None:
         return None
     legacy = _is_legacy_generation_contract(generation)
     status = _effective_generation_status(generation)
+    if status == "submission_unknown":
+        public_error = "submission_unknown"
+    elif status == "resume_required":
+        public_error = "generation_resume_required"
+    elif status == "failed":
+        public_error = (
+            "generation_path_removed"
+            if legacy
+            else _user_error_code(
+                generation.get("error"), fallback="generation_failed"
+            )
+        )
+    else:
+        public_error = None
     public = {
         "status": status,
-        "error": (
-            "generation_path_removed"
-            if legacy and status == "failed"
-            else generation.get("error")
-        ),
+        "error": public_error,
         "attempt": generation.get("attempt"),
         "client_request_id": generation.get("client_request_id"),
         "stage": "h3" if legacy else generation.get("stage"),
     }
     if isinstance(generation.get("segments"), list):
         public["fast_mode"] = generation.get("fast_mode", False)
-        public["segments"] = long_generation.public_segments(generation)
+        public["segments"] = []
+        for item in long_generation.public_segments(generation):
+            segment = dict(item)
+            segment_status = segment.get("status")
+            if segment_status == "submission_unknown":
+                segment["error"] = "submission_unknown"
+            elif segment_status == "failed":
+                segment["error"] = _user_error_code(
+                    segment.get("error"), fallback="generation_failed"
+                )
+            else:
+                segment["error"] = None
+            public["segments"].append(segment)
         if _uses_segment_coordinator(meta) and status == "failed":
             frozen_segments = meta.get("segments")
             retry_count = generation.get("retry_paid_segment_count")
@@ -569,11 +651,7 @@ def _public_prompt_fusion(meta: dict) -> dict:
     public_status = (
         status if status in {"running", "failed", "done"} else "pending"
     )
-    error = (
-        str(state.get("error") or "prompt_fusion_invalid")
-        if public_status == "failed" and isinstance(state, dict)
-        else None
-    )
+    error = "generation_failed" if public_status == "failed" else None
     return {
         "status": public_status,
         "error": error,
@@ -4626,6 +4704,13 @@ def create_app(settings: Settings) -> FastAPI:
                 raise _minimal_http_exception(
                     413, "source_too_large"
                 ) from None
+            if exc.code == "invalid_source_video_url":
+                raise _minimal_http_exception(
+                    422,
+                    "invalid_source_video_url",
+                    message="视频链接必须是公网地址",
+                    field="reference_url",
+                ) from None
             raise _minimal_http_exception(
                 422, "invalid_source_media"
             ) from None
@@ -4900,9 +4985,34 @@ def create_app(settings: Settings) -> FastAPI:
                 dialogue_mode=dialogue_payload["dialogue_mode"],
                 voice_lines=[dict(line) for line in frozen_dialogue],
             )
-        except (storage.UploadError, downloader.DownloadError) as e:
+        except storage.UploadError:
             storage.remove_conversation(settings.data_dir, meta["id"])
-            raise HTTPException(status_code=422, detail=str(e)) from e
+            raise _minimal_http_exception(
+                422,
+                "invalid_source_media",
+                message="原视频无法读取，请更换视频",
+            ) from None
+        except downloader.DownloadError as exc:
+            storage.remove_conversation(settings.data_dir, meta["id"])
+            if exc.code == "source_too_large":
+                raise _minimal_http_exception(
+                    413,
+                    "source_too_large",
+                    message="原视频超过大小限制",
+                ) from None
+            if exc.code == "invalid_source_video_url":
+                raise _minimal_http_exception(
+                    422,
+                    "invalid_source_video_url",
+                    message="视频链接必须是公网地址",
+                    field="reference_url",
+                ) from None
+            raise _minimal_http_exception(
+                422,
+                "invalid_source_media",
+                message="视频链接无法下载或不是有效视频",
+                field="reference_url",
+            ) from None
         if settings.enable_pipeline:
             background_tasks.add_task(run_pipeline_gated, meta["id"])
         if resumed_meta is not None:
@@ -5021,7 +5131,7 @@ def create_app(settings: Settings) -> FastAPI:
             "input_receipt": meta.get("input_receipt"),
             "creation_input": meta.get("creation_input"),
             "submit_enabled": settings.enable_h3_submit,
-            "postprocess": postprocess.public_state(meta.get("postprocess")),
+            "postprocess": _public_postprocess(meta),
             "postprocess_capabilities": capabilities,
             "postprocess_enabled": any(capabilities.values()),
             "image_acceptance": {

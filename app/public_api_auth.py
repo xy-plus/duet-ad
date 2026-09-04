@@ -20,6 +20,7 @@ from typing import Any
 _KEY_RE = re.compile(
     r"^duet_live_([A-Za-z0-9][A-Za-z0-9_-]{7,31})\.([A-Za-z0-9_-]{32,128})$"
 )
+_AUTHORIZATION_RE = re.compile(r"(?i:Bearer)[ \t]+([^ \t\r\n]+)")
 _OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$")
 _KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,31}$")
 _SCRYPT_N = 1 << 14
@@ -106,9 +107,12 @@ def _load_registry(path: Path) -> dict[str, Any]:
 
 
 def authenticate(path: Path, authorization: str | None) -> Principal:
-    if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+    if not isinstance(authorization, str):
         raise PublicAuthError("invalid_api_key")
-    match = _KEY_RE.fullmatch(authorization[7:])
+    authorization_match = _AUTHORIZATION_RE.fullmatch(authorization)
+    if authorization_match is None:
+        raise PublicAuthError("invalid_api_key")
+    match = _KEY_RE.fullmatch(authorization_match.group(1))
     if match is None:
         raise PublicAuthError("invalid_api_key")
     key_id, secret = match.groups()

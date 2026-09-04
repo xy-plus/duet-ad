@@ -1,6 +1,6 @@
 # 视频工作室（duet-ad1）
 
-FastAPI + 双前端的参考视频复刻工具。`web/` 是 3211 的原生旧前端，`web-next/` 是 3213 的 React 19 + Ant Design/Ant Design X 新前端；两者只消费同一个 FastAPI 和会话目录。生产生成链路是：本地输入准备 → AutoDL Art 的 MiniMax-H3 workflow → `generated.mp4`。H3 是视频模型名称，不是 HTTP/3；公网入口由 Caddy 以 HTTP/1.1、HTTP/2 提供。
+FastAPI + 原生单页前端的参考视频复刻工具。`web/` 是唯一前端，由 FastAPI 直接提供。生产生成链路是：本地输入准备 → AutoDL Art 的 MiniMax-H3 workflow → `generated.mp4`。H3 是视频模型名称，不是 HTTP/3；公网入口由 Caddy 以 HTTP/1.1、HTTP/2 提供。
 
 ## Quickstart
 
@@ -17,20 +17,6 @@ ACCESS_TOKEN='<local-only-token>' HOST=127.0.0.1 PORT=3211 ./run.sh
 ```bash
 .venv/bin/python -m pytest tests -q
 ```
-
-### Ant Design X 前端
-
-```bash
-cd web-next
-npm ci
-npm run dev       # 本地组件开发；不代理真实 /api
-npm run check     # TypeScript + ESLint + Stylelint + Vitest + build
-npm run test:e2e  # Chromium 真实浏览器契约和截图基线
-```
-
-真实 API 始终使用同源相对路径 `/api`；本地 Vite 不提供后端代理，生产联调以 Caddy `:3213` 拓扑为准。`npm run preview` 只用于本地检查构建产物，不是生产服务器。
-
-开发前先读 [web-next 约束](web-next/AGENTS.md)。组件只能从 [`src/ui/antd.ts`](web-next/src/ui/antd.ts) 导入，Token 与 Provider 只在 [`src/ui/theme.tsx`](web-next/src/ui/theme.tsx) 定义；ESLint、Stylelint 和 [`governance.test.ts`](web-next/src/governance.test.ts) 是不可绕过的治理入口。
 
 ## 生产契约摘要
 
@@ -56,32 +42,27 @@ npm run test:e2e  # Chromium 真实浏览器契约和截图基线
 public :3211 (Caddy, h1/h2) ── all paths ──> 127.0.0.1:3212
                                                    uvicorn, legacy web + /api
 
-public :3213 (Caddy, h1/h2)
-  ├─ /api/* ───────────────────────────────> 127.0.0.1:3212, path preserved
-  └─ other paths ──────────────────────────> web-next/dist, SPA fallback
+public :3213 (Caddy, h1/h2) ── all paths ──> 127.0.0.1:3214
+                                                   uvicorn, legacy web + /api
 
 127.0.0.1:3212 ───────────────────────────> AutoDL Art H3
 ```
 
-`:3211` 与 `:3213` 是不同 origin，浏览器登录状态互不共享；3213 复用同一个后端、数据和 Caddy unit，不新增 CORS、前端 service 或第二个 uvicorn。新前端已发布在 `https://8.166.140.227:3213`；预检、只读发布 smoke、回滚和付费保护见 [部署 runbook](.deploy/runbook.md)。
+`:3211` 与 `:3213` 是不同 origin，浏览器登录状态互不共享。3213 是隔离测试实例，Caddy 将全部请求转发到该实例的 uvicorn；预检、只读 smoke、回滚和付费保护见 [部署 runbook](.deploy/runbook.md)。
 
 ## 目录与文档
 
 - `app/`：API、输入准备、长视频计划/编排/拼接、可恢复 H3 状态机、文件存储，以及可选 MediaKit → Seedream 关键帧后处理。
 - `web/`：由 uvicorn 提供的现行原生单页 UI。
-- `web-next/`：3213 的 React/Ant Design X 生产 UI；TanStack Query 只在运行态详情每 2 秒轮询，业务组件受组件门面与 Token/CSS 门禁约束。
 - `skills/video-maker/`：输入准备阶段的关键帧选择/视觉 prompt skill。
 - `data/<cid>/`：会话文件、短链 receipt 或长链 plan receipt、每段 `.h3/` attempt 状态和最终视频。
 - [功能与验收](docs/human/features/conversation-task/README.md)
-- [Ant Design X 用户行为](docs/human/features/antd-x-frontend/README.md)
 - [运行架构](docs/agent/architecture/architecture.md)
-- [Ant Design X 前端架构](docs/agent/architecture/antd-x-frontend.md)
 - [API、schema 与配置参考](docs/agent/reference/reference.md)
-- [web-next 模块、API 与治理参考](docs/agent/reference/web-next.md)
 - [部署 runbook](.deploy/runbook.md)
 - [H3 正式 API smoke](.deploy/smoke-h3.sh)
 - `OPEN_ISSUE.md`：仍未解决的限制；不是现行契约来源。
 
 ## 安全边界
 
-`ACCESS_TOKEN` 必填，所有 `/api/conversations*` 和文件读取都需要 Bearer 鉴权。3213 的 token 只属于该 origin；任一请求返回 401 时新前端会清除 token 和 Query cache。`AUTODL_ART_TOKEN`、`VOLC_MEDIAKIT_API_KEY` 与 `ARK_API_KEY` 只从服务环境读取，不进入公开 API、meta 或日志；供应商回执与中间产物只存于私有目录。生产使用单进程 uvicorn；进程内锁、信号量和文件锁不是多 worker 协调机制。
+`ACCESS_TOKEN` 必填，所有 `/api/conversations*` 和文件读取都需要 Bearer 鉴权。3211 与 3213 的 token 分别保存在各自 origin。`AUTODL_ART_TOKEN`、`VOLC_MEDIAKIT_API_KEY` 与 `ARK_API_KEY` 只从服务环境读取，不进入公开 API、meta 或日志；供应商回执与中间产物只存于私有目录。生产使用单进程 uvicorn；进程内锁、信号量和文件锁不是多 worker 协调机制。

@@ -15,9 +15,9 @@ def test_metadata_and_backend_bound_input_contract_are_explicit():
     assert text.startswith("---\nname: video-prompt-fusion\n")
     assert AGENT.is_file()
     for required in (
-        "multimodal_input.json", "schema/version", "new_keyframes",
+        "multimodal_input.json", "version 2", "new_keyframes",
         "old_video_prompt", "image_optimization_prompt",
-        "relation_occurrences", "audio_content", "不要重述或改写输入结构",
+        "relation_occurrences", "audio_content", "一次处理全部 ordered segments",
     ):
         assert required in text
 
@@ -25,9 +25,8 @@ def test_metadata_and_backend_bound_input_contract_are_explicit():
 def test_relation_binding_and_state_lifecycle_are_consumed():
     text = _text()
     for required in (
-        "`relation_occurrences.preserve`", "`replacement_system=`", "关系的唯一结构化权威",
-        "主客体和功能角色全项目不变", "状态生命周期", "连接、装载、作用、释放、分离",
-        "不能互换主客体", "末帧若仍在运动，只写可见状态",
+        "`relation_occurrences` 是逐帧关系状态", "replacement system",
+        "唯一结构化权威", "不得互换主客体", "末帧仅写可见状态",
     ):
         assert required in text
 
@@ -35,11 +34,11 @@ def test_relation_binding_and_state_lifecycle_are_consumed():
 def test_authority_boundaries_and_output_remain_closed():
     text = _text()
     for required in (
-        "新关键帧独占静态事实权威", "旧提示词只贡献同一区间内",
-        "跨段只共享 stable element design 和 relation system",
-        "质量评分不触发拒绝、重试、回退", "work/h3_prompt_plan.json",
-        "注入的 JSON Schema", "Context IR/H3 effective prompt",
-        "visual 固定为 9 条并逐条对应 frame order 1 至 9",
+        "新关键帧是人物", "旧提示词只可贡献同一区间",
+        "跨段只保持同 stable element", "work/h3_prompt_plan.json",
+        "注入的 JSON Schema", "编译 Context IR/H3",
+        "每段按 hard-cut 区间写一条简洁英文 `visual` prose",
+        "`continuous` 留在当前区间",
     ):
         assert required in text
     assert "不输出时间戳、图片标记、stable key、tile、relation key" in text

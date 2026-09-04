@@ -81,7 +81,7 @@ links: []
 ## 边界
 
 - H3 是模型名，不代表服务启用了 HTTP/3。
-- 当前 Ref2VA 请求逐段使用 exact 9 张冻结 Picture；provider 整秒时长不超过 14 秒，总输入不超过 300 秒。
+- 当前 Ref2VA 请求逐段使用 exact 9 张冻结 Picture；provider 整秒时长不超过 8 秒，总输入不超过 300 秒。
 - 同镜头普通动作不臆造秒数；source hard cut 的 segment-local 精确时点只由冻结时间轴和后端 compiler 负责。
 - 分段链路不是供应商原生 extend；每段是独立、receipt 绑定的 H3 task，再由本地统一 EDL 拼接。
 - 完整可用链只交付到 Web `3211`；生产发布与回滚不属于本文档变更。

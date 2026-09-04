@@ -5,7 +5,7 @@ description: Fuse frozen keyframes, segment dynamics, replacement bindings, rela
 
 只读 `work/multimodal_input.json` 及其中 SHA 绑定的新关键帧；一次处理全部 ordered segments，不选帧、不改音频、不写 provider 字段。输入、输出均为 version 2，注入的 JSON Schema 是输出结构的唯一权威。
 
-每段按 order 提供 `new_keyframes`、`old_video_prompt`、`image_optimization_prompt`、`relation_occurrences` 和 `audio_content`。按输入实际帧数一帧一条；不假定固定数量。关键帧、文本、台词和关系字段均冻结，局部时间与 transition 定义 hard cut。`audio_content` 仅用于避免冲突，不进入 visual，也不生成声音、台词、口型或音乐。
+每段按 order 提供 `new_keyframes`、`old_video_prompt`、`image_optimization_prompt`、`relation_occurrences` 和 `audio_content`。关键帧、文本、台词和关系字段均冻结，局部时间与 transition 定义 hard cut。`audio_content` 仅用于避免冲突，不进入 visual，也不生成声音、台词、口型或音乐。
 
 ## 融合
 
@@ -19,4 +19,4 @@ description: Fuse frozen keyframes, segment dynamics, replacement bindings, rela
 
 ## 输出
 
-每段按 order 为每张输入关键帧输出一条简洁英文 `visual` prose：不合并、缺省或增加。每条只写对应图片和同区间已有动态证据；不输出时间戳、图片标记、stable key、tile、relation key、音频字段或 provider 语法。`segments` 与输入一一对应，每段只填 `index`、`visual`；不输出 `relation_states`。后端依据冻结 occurrence、transition 和该输出编译 Context IR/H3。
+向 `work/h3_prompt_plan.json` 输出：每段按 hard-cut 区间写一条简洁英文 `visual` prose，第一帧开始第一区间，每个 `hard_cut` 开始新区间，`continuous` 留在当前区间。每条只写该区间图片和已有动态证据；不输出时间戳、图片标记、stable key、tile、relation key、音频字段或 provider 语法。`segments` 与输入一一对应，每段只填 `index`、`visual`；不输出 `relation_states`。后端依据冻结 occurrence、transition 和该输出编译 Context IR/H3。

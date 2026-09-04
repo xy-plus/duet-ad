@@ -8,16 +8,23 @@ from test_web_h3_contract import APP_JS, _run_contract
 
 
 STYLES = APP_JS.parent / "styles.css"
-JSDOM = APP_JS.parent.parent / "web-next" / "node_modules" / "jsdom"
 
 
 def _run_jsdom_contract(expression: str):
+    """Run optional DOM contracts without coupling them to a frontend project."""
     node = shutil.which("node")
-    if node is None or not JSDOM.is_dir():
+    if node is None:
+        pytest.skip("node is unavailable")
+    availability = subprocess.run(
+        [node, "-e", "require.resolve('jsdom')"],
+        capture_output=True,
+        text=True,
+    )
+    if availability.returncode != 0:
         pytest.skip("jsdom is unavailable")
     script = (
         "const contract=require(process.argv[1]);"
-        "const {JSDOM}=require(process.argv[2]);"
+        "const {JSDOM}=require('jsdom');"
         "const dom=new JSDOM('<!doctype html><body></body>');"
         "global.document=dom.window.document;global.window=dom.window;"
         "global.URL.createObjectURL=(()=>{let n=0;return()=>`blob:test-${++n}`})();"
@@ -27,7 +34,7 @@ def _run_jsdom_contract(expression: str):
         ".catch(error=>{console.error(error);process.exit(1)});"
     )
     completed = subprocess.run(
-        [node, "-e", script, str(APP_JS), str(JSDOM)],
+        [node, "-e", script, str(APP_JS)],
         check=True,
         capture_output=True,
         text=True,

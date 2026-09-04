@@ -1088,7 +1088,6 @@ def _compile_fusion_ref2va_prompt(
     *, visual: object, timeline: object, lines: object, music_policy: object,
     relation_occurrences: object = None, relation_states: object = None,
     cut_timeline: object = None,
-    allow_historical_shot_visuals: bool = False,
 ) -> str:
     """Compile the only provider-sendable prompt from backend authorities."""
     if music_policy != "forbid" or not isinstance(lines, list):
@@ -1101,11 +1100,7 @@ def _compile_fusion_ref2va_prompt(
             shots.append([])
         shots[-1].append(frame)
     frame_visuals = isinstance(visual, list) and len(visual) == len(frozen_timeline)
-    shot_visuals = (
-        allow_historical_shot_visuals
-        and isinstance(visual, list)
-        and len(visual) == len(shots)
-    )
+    shot_visuals = isinstance(visual, list) and len(visual) == len(shots)
     if not frame_visuals and not shot_visuals:
         raise LongGenerationError("prompt_fusion_output_invalid")
     relation_contract_enabled = relation_occurrences is not None
@@ -1304,11 +1299,16 @@ def prompt_fusion_visual_max_chars(
     *, timeline: object, lines: object, music_policy: object,
     relation_occurrences: object = None, cut_timeline: object = None,
 ) -> int:
-    """Derive the per-frame prose budget before the Fusion model is called."""
+    """Derive the per-shot prose budget before the Fusion model is called."""
     try:
+        frozen_timeline = _freeze_local_keyframe_sources(timeline)
+        visual_count = 1 + sum(
+            frame["transition"]["type"] == "hard_cut"
+            for frame in frozen_timeline[1:]
+        )
         baseline = _compile_fusion_ref2va_prompt(
-            visual=["x"] * 9,
-            timeline=timeline,
+            visual=["x"] * visual_count,
+            timeline=frozen_timeline,
             lines=lines,
             music_policy=music_policy,
             relation_occurrences=relation_occurrences,
@@ -1316,8 +1316,10 @@ def prompt_fusion_visual_max_chars(
         )
     except LongGenerationError as exc:
         raise LongGenerationError("prompt_fusion_input_invalid") from exc
-    fixed_chars = len(baseline) - 9
-    visual_max_chars = (_MAX_COMPILED_FUSION_CHARS - fixed_chars) // 9
+    fixed_chars = len(baseline) - visual_count
+    visual_max_chars = (
+        _MAX_COMPILED_FUSION_CHARS - fixed_chars
+    ) // visual_count
     if visual_max_chars < 1:
         raise LongGenerationError("prompt_fusion_input_invalid")
     return visual_max_chars
@@ -1593,6 +1595,14 @@ def load_prompt_fusion(
             timeline = timelines[index - 1]
             if timeline is None:
                 raise LongGenerationError("prompt_fusion_input_invalid")
+            if (
+                require_frame_visuals
+                and (
+                    not isinstance(segment.get("visual"), list)
+                    or len(segment["visual"]) != len(timeline)
+                )
+            ):
+                raise LongGenerationError("prompt_fusion_output_invalid")
             final_prompts.append(_compile_fusion_ref2va_prompt(
                 visual=segment.get("visual"),
                 timeline=timeline,
@@ -1600,7 +1610,6 @@ def load_prompt_fusion(
                 music_policy=audio["music_policy"],
                 relation_occurrences=relation_occurrences,
                 cut_timeline=cut_timelines[index - 1],
-                allow_historical_shot_visuals=not require_frame_visuals,
             ))
         else:
             if (

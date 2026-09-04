@@ -2,9 +2,10 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
-from app import downloader, public_api_auth, public_credits, storage
+from app import downloader, public_api, public_api_auth, public_credits, storage
 from app.config import Settings
 from app.main import create_app
 from conftest import TOKEN, make_settings
@@ -156,10 +157,14 @@ def test_url_idempotency_binds_url_not_mutable_download_bytes(
     headers = {**auth, "Idempotency-Key": "urlcase01"}
     with TestClient(create_app(settings)) as client:
         first = client.post(
-            "/api/v1/video-generations", headers=headers, data=request
+            "/api/v1/video-generations",
+            headers=headers,
+            files={key: (None, value) for key, value in request.items()},
         )
         second = client.post(
-            "/api/v1/video-generations", headers=headers, data=request
+            "/api/v1/video-generations",
+            headers=headers,
+            files={key: (None, value) for key, value in request.items()},
         )
     assert first.status_code == 201
     assert second.status_code == 200
@@ -235,6 +240,102 @@ def test_failure_releases_and_unknown_keeps_reservation(tmp_path, video_1s):
         assert balance["reserved_credits"] == 1_000
 
 
+def test_prompt_fusion_failure_is_terminal_and_releases_reservation(
+    tmp_path, video_1s
+):
+    settings, auth, _ = _public_setup(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        created = _create(client, auth, video_1s, key="fusionfail01").json()
+        storage.update_meta(
+            settings.data_dir,
+            created["id"][3:],
+            status="done",
+            error=None,
+            generation=None,
+            _prompt_fusion={
+                "status": "failed",
+                "error": "prompt_fusion_output_invalid private detail",
+            },
+        )
+
+        view = client.get(
+            f"/api/v1/video-generations/{created['id']}", headers=auth
+        )
+
+    assert view.status_code == 200
+    assert view.json()["status"] == "failed"
+    assert view.json()["error"] == {
+        "code": "generation_failed",
+        "message": "视频生成失败",
+        "retryable": False,
+    }
+    assert public_credits.balance(settings.data_dir, "partner_one") == {
+        "available": 5_000,
+        "reserved": 0,
+        "spent": 0,
+    }
+
+
+def test_image_provider_rejection_has_actionable_public_job_error(
+    tmp_path, video_1s
+):
+    settings, auth, _ = _public_setup(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        created = _create(client, auth, video_1s, key="imagereject01").json()
+        storage.update_meta(
+            settings.data_dir,
+            created["id"][3:],
+            status="done",
+            postprocess={"status": "failed", "error": "provider_rejected"},
+        )
+
+        view = client.get(
+            f"/api/v1/video-generations/{created['id']}", headers=auth
+        ).json()
+
+    assert view["status"] == "failed"
+    assert view["error"]["code"] == "image_rejected_by_provider"
+    assert "供应商" in view["error"]["message"]
+    assert "provider_rejected" not in str(view)
+
+
+@pytest.mark.parametrize(
+    ("meta", "expected_code"),
+    [
+        (
+            {"status": "failed", "error": "source video has no audio track"},
+            "video_audio_required",
+        ),
+        (
+            {"status": "failed", "error": "long_video_duration_exceeded"},
+            "video_duration_exceeds_h3_limit",
+        ),
+        (
+            {
+                "status": "done",
+                "generation": {
+                    "status": "failed",
+                    "error": "long_generation_failed",
+                    "segments": [
+                        {"status": "failed", "error": "h3_submit_rejected"}
+                    ],
+                },
+            },
+            "video_rejected_by_provider",
+        ),
+        (
+            {"status": "failed", "error": "private_node token=secret"},
+            "generation_failed",
+        ),
+    ],
+)
+def test_failed_job_error_exposes_only_actionable_codes(meta, expected_code):
+    error = public_api._failed_job_error(meta)
+    assert error.code == expected_code
+    assert "private_node" not in error.message
+    assert "secret" not in error.message
+
+
 def test_success_captures_credits_and_content_supports_head_and_range(
     tmp_path, video_1s, monkeypatch
 ):
@@ -292,6 +393,180 @@ def test_public_openapi_contains_only_public_contract(tmp_path):
     assert "/api/v1/account/credits" in schema["paths"]
     assert not any(path.startswith("/api/conversations") for path in schema["paths"])
     assert "multipart/form-data" in schema["paths"]["/api/v1/video-generations"]["post"]["requestBody"]["content"]
+    create_schema = schema["paths"]["/api/v1/video-generations"]["post"][
+        "requestBody"
+    ]["content"]["multipart/form-data"]["schema"]
+    component_name = create_schema["$ref"].rsplit("/", 1)[-1]
+    create_properties = schema["components"]["schemas"][component_name][
+        "properties"
+    ]
+    assert create_properties["aspect_ratio"]["enum"] == ["9:16", "16:9"]
+    assert create_properties["resolution"]["enum"] == ["768p", "480p"]
+    (limit_parameter,) = schema["paths"][
+        "/api/v1/account/credit-transactions"
+    ]["get"]["parameters"]
+    assert limit_parameter["name"] == "limit"
+    assert limit_parameter["schema"]["type"] == "integer"
+
+
+def test_create_rejects_whitespace_language_without_reserving(
+    tmp_path, video_1s
+):
+    settings, auth, _ = _public_setup(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        response = _create(
+            client,
+            auth,
+            video_1s,
+            key="blanklang01",
+            target_language=" \t ",
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_target_language"
+    assert storage.list_conversations(settings.data_dir) == []
+    assert public_credits.balance(settings.data_dir, "partner_one")[
+        "reserved"
+    ] == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    [
+        ("aspect_ratio", "1:1", "invalid_aspect_ratio"),
+        ("resolution", "720p", "invalid_resolution"),
+    ],
+)
+def test_create_uses_specific_parameter_error_codes(
+    tmp_path, video_1s, field, value, code
+):
+    settings, auth, _ = _public_setup(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        response = _create(
+            client,
+            auth,
+            video_1s,
+            key=f"invalid{field[:3]}01",
+            **{field: value},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == code
+
+
+def test_create_requires_multipart_and_wraps_malformed_boundary(
+    tmp_path,
+):
+    settings, auth, _ = _public_setup(tmp_path)
+    headers = {**auth, "Idempotency-Key": "contenttype01"}
+    with TestClient(create_app(settings)) as client:
+        wrong_type = client.post(
+            "/api/v1/video-generations", headers=headers, json={}
+        )
+        malformed = client.post(
+            "/api/v1/video-generations",
+            headers={**headers, "Content-Type": "multipart/form-data"},
+            content=b"not-multipart",
+        )
+
+    assert wrong_type.status_code == 415
+    assert wrong_type.json()["error"]["code"] == "unsupported_content_type"
+    assert malformed.status_code == 400
+    assert malformed.json()["error"]["code"] == "invalid_multipart"
+
+
+def test_public_http_errors_use_the_v1_error_envelope(tmp_path):
+    settings, auth, _ = _public_setup(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        response = client.post("/api/v1/account/credits", headers=auth)
+
+    assert response.status_code == 405
+    assert response.json()["error"]["code"] == "method_not_allowed"
+    assert response.headers["allow"] == "GET"
+
+
+def test_public_api_base_404_uses_the_v1_error_envelope(tmp_path):
+    settings, auth, _ = _public_setup(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/api/v1", headers=auth)
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "endpoint_not_found"
+
+
+def test_private_source_url_is_rejected_before_download(tmp_path, monkeypatch):
+    settings, auth, _ = _public_setup(tmp_path)
+
+    def unexpected_download(*_args, **_kwargs):
+        raise AssertionError("private URL must not reach the downloader")
+
+    monkeypatch.setattr(downloader, "fetch_reference", unexpected_download)
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/api/v1/video-generations",
+            headers={**auth, "Idempotency-Key": "privateurl01"},
+            files={"source_video_url": (None, "https://localhost/video.mp4")},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_source_video_url"
+
+
+@pytest.mark.parametrize("limit", ["", "0", "101", "-1", "+1", "01", "1.0", " 1 "])
+def test_credit_transaction_limit_is_strict(tmp_path, limit):
+    settings, auth, _ = _public_setup(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        response = client.get(
+            "/api/v1/account/credit-transactions",
+            headers=auth,
+            params={"limit": limit},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_limit"
+
+
+def test_unknown_and_duplicate_query_parameters_are_rejected(tmp_path):
+    settings, auth, _ = _public_setup(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        unknown = client.get(
+            "/api/v1/account/credits?extra=1", headers=auth
+        )
+        duplicate = client.get(
+            "/api/v1/account/credit-transactions?limit=1&limit=2",
+            headers=auth,
+        )
+
+    assert unknown.status_code == 422
+    assert unknown.json()["error"]["code"] == "invalid_query_parameters"
+    assert duplicate.status_code == 422
+    assert duplicate.json()["error"]["code"] == "invalid_query_parameters"
+
+
+def test_bearer_scheme_is_case_insensitive(tmp_path):
+    settings, _auth, api_key = _public_setup(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        response = client.get(
+            "/api/v1/account/credits",
+            headers={"Authorization": f"bearer {api_key}"},
+        )
+
+    assert response.status_code == 200
+
+
+def test_download_leases_are_shared_and_bounded(tmp_path):
+    first = public_api._acquire_download_lease(tmp_path, "partner_one")
+    second = public_api._acquire_download_lease(tmp_path, "partner_one")
+    assert first is not None
+    assert second is not None
+    try:
+        assert public_api._acquire_download_lease(tmp_path, "partner_one") is None
+    finally:
+        first.release()
+        second.release()
+    replacement = public_api._acquire_download_lease(tmp_path, "partner_one")
+    assert replacement is not None
+    replacement.release()
 
 
 def test_admin_adjustments_are_idempotent_and_never_overdraw(tmp_path):

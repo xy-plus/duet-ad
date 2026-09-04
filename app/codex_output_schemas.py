@@ -274,14 +274,19 @@ SEGMENT_FRAMES_SCHEMA = _object({
 
 
 def prompt_fusion_schema(
-    *, input_sha256: str, segment_count: int, visual_max_chars: int,
+    *, input_sha256: str, visual_counts: tuple[int, ...],
+    visual_max_chars: int,
 ) -> dict:
     if (
-        isinstance(segment_count, bool)
-        or not isinstance(segment_count, int)
-        or segment_count < 1
+        not visual_counts
+        or any(
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 1 <= count <= 9
+            for count in visual_counts
+        )
     ):
-        raise ValueError("prompt fusion segment count is invalid")
+        raise ValueError("prompt fusion visual counts are invalid")
     if (
         isinstance(visual_max_chars, bool)
         or not isinstance(visual_max_chars, int)
@@ -289,10 +294,18 @@ def prompt_fusion_schema(
     ):
         raise ValueError("prompt fusion visual character limit is invalid")
     visual = {"type": "string", "minLength": 1, "maxLength": visual_max_chars}
-    segment = _object({
-        "index": _INT1,
-        "visual": _array(visual, minimum=9, maximum=9),
-    })
+    segment_options = [
+        _object({
+            "index": {"type": "integer", "enum": [index]},
+            "visual": _array(visual, minimum=count, maximum=count),
+        })
+        for index, count in enumerate(visual_counts, 1)
+    ]
+    segment = (
+        segment_options[0]
+        if len(segment_options) == 1
+        else {"anyOf": segment_options}
+    )
     return _object({
         "schema": {
             "type": "string",
@@ -301,7 +314,7 @@ def prompt_fusion_schema(
         "version": {"type": "integer", "enum": [2]},
         "input_sha256": {"type": "string", "enum": [input_sha256]},
         "segments": _array(
-            segment, minimum=segment_count, maximum=segment_count,
+            segment, minimum=len(visual_counts), maximum=len(visual_counts),
         ),
     })
 

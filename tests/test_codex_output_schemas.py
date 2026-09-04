@@ -35,7 +35,8 @@ def test_all_skill_output_schemas_are_valid_and_closed() -> None:
         codex_output_schemas.global_plan_schema(stable_keys=_GLOBAL_KEYS),
         codex_output_schemas.SEGMENT_FRAMES_SCHEMA,
         codex_output_schemas.prompt_fusion_schema(
-            input_sha256="a" * 64, segment_count=3, visual_max_chars=426,
+            input_sha256="a" * 64, visual_counts=(1, 2, 3),
+            visual_max_chars=426,
         ),
     ]
     for schema in schemas:
@@ -329,18 +330,17 @@ def test_segment_dto_still_indexes_model_discovered_nested_keys() -> None:
             )
 
 
-def test_fusion_schema_binds_hash_segments_and_exactly_nine_visuals() -> None:
+def test_fusion_schema_binds_hash_segments_and_hard_cut_visual_counts() -> None:
     digest = "b" * 64
     schema = codex_output_schemas.prompt_fusion_schema(
-        input_sha256=digest, segment_count=2, visual_max_chars=12,
+        input_sha256=digest, visual_counts=(2, 3), visual_max_chars=12,
     )
-    visuals = [f"frame {index}" for index in range(1, 10)]
     valid = {
         "schema": "duet.video-prompt-fusion-output", "version": 2,
         "input_sha256": digest,
         "segments": [
-            {"index": 1, "visual": visuals},
-            {"index": 2, "visual": visuals},
+            {"index": 1, "visual": ["shot 1", "shot 2"]},
+            {"index": 2, "visual": ["shot 1", "shot 2", "shot 3"]},
         ],
     }
     jsonschema.validate(valid, schema)
@@ -352,7 +352,7 @@ def test_fusion_schema_binds_hash_segments_and_exactly_nine_visuals() -> None:
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(over_limit, schema)
     invalid = json.loads(json.dumps(valid))
-    invalid["segments"].append({"index": 3, "visual": visuals})
+    invalid["segments"].append({"index": 3, "visual": ["extra"]})
     try:
         jsonschema.validate(invalid, schema)
     except jsonschema.ValidationError:
@@ -372,13 +372,13 @@ def test_fusion_schema_binds_hash_segments_and_exactly_nine_visuals() -> None:
                 jsonschema.validate(invalid, schema)
 
 
-@pytest.mark.parametrize("segment_count", [0, -1, True])
-def test_fusion_schema_refuses_an_invalid_segment_count(
-    segment_count: int,
+@pytest.mark.parametrize("visual_counts", [(), (0,), (-1,), (10,), (True,)])
+def test_fusion_schema_refuses_invalid_visual_counts(
+    visual_counts: tuple[int, ...],
 ) -> None:
-    with pytest.raises(ValueError, match="segment count is invalid"):
+    with pytest.raises(ValueError, match="visual counts are invalid"):
         codex_output_schemas.prompt_fusion_schema(
-            input_sha256="c" * 64, segment_count=segment_count,
+            input_sha256="c" * 64, visual_counts=visual_counts,
             visual_max_chars=426,
         )
 
@@ -390,7 +390,7 @@ def test_fusion_schema_refuses_an_invalid_visual_character_limit(
     with pytest.raises(ValueError, match="visual character limit is invalid"):
         codex_output_schemas.prompt_fusion_schema(
             input_sha256="c" * 64,
-            segment_count=1,
+            visual_counts=(1,),
             visual_max_chars=visual_max_chars,
         )
 

@@ -124,7 +124,7 @@ function apiErrorFromPayload(data, fallback) {
 function showActionError(error, errorElement, controls = []) {
   errorElement.textContent = error && error.code === "client_refresh_required"
     ? "页面版本已更新，请刷新页面后重试。"
-    : String(error && error.message ? error.message : error || "操作失败，请稍后重试");
+    : safeErrorSummary(error && error.code ? error.code : error, "操作失败，请稍后重试");
   errorElement.hidden = false;
   for (const control of controls) control.disabled = false;
 }
@@ -1009,34 +1009,53 @@ function totalKeyframes(detail) {
   return Array.isArray(detail && detail.keyframes) ? detail.keyframes.length : 0;
 }
 
-function safeErrorSummary(raw, fallback = "阶段执行失败，请查看诊断后处理") {
+function safeErrorSummary(raw, fallback = "处理未完成，请稍后重试") {
   const code = raw && typeof raw === "object"
     ? String(raw.code || raw.error || "") : String(raw || "");
+  if (code.startsWith("codex voice output invalid")) {
+    return "台词识别失败，请检查原视频音轨后重试";
+  }
   const labels = new Map([
-    ["submission_unknown", "提交结果未知，已禁止重复提交"],
-    ["context_ir_query_unknown", "Context IR 查询结果未知，请继续原任务"],
-    ["context_ir_resume_required", "Context IR 可从原任务继续"],
-    ["prompt_fusion_failed", "最终提示词融合失败"],
-    ["prompt_fusion_output_invalid", "最终提示词融合结果无效"],
-    ["provider_rejected", "素材服务商未接受本次处理"],
+    ["submission_unknown", "提交结果暂时无法确认，请继续等待，不要重复提交"],
+    ["submission_outcome_unknown", "提交结果暂时无法确认，请继续等待，不要重复提交"],
+    ["generation_resume_required", "原任务可以继续，请使用继续原任务操作"],
+    ["context_ir_query_unknown", "任务状态暂时无法确认，请继续原任务"],
+    ["context_ir_resume_required", "任务可以从原进度继续"],
+    ["prompt_fusion_failed", "视频生成未完成，请稍后重试"],
+    ["prompt_fusion_output_invalid", "视频生成未完成，请稍后重试"],
+    ["provider_rejected", "图片未通过供应商审核，请更换图片或调整图片后重试"],
+    ["image_rejected_by_provider", "图片未通过供应商审核，请更换图片或调整图片后重试"],
+    ["video_rejected_by_provider", "视频内容未通过供应商审核，请调整素材后重试"],
+    ["video_duration_exceeds_h3_limit", "视频时长超过限制，请裁剪后重新上传"],
+    ["video_duration_invalid", "无法确认视频时长，请更换视频后重试"],
+    ["video_audio_required", "视频没有可用音轨，请上传带口播音轨的视频"],
+    ["video_audio_unsupported", "视频音频模式不受支持，请更换视频后重试"],
+    ["invalid_source_media", "原视频无法读取，请更换视频"],
+    ["invalid_source_video_url", "视频链接不是可访问的公网地址，请检查链接"],
+    ["source_too_large", "原视频超过大小限制，请压缩或更换视频"],
+    ["unsupported_source_media_type", "原视频格式不受支持，请使用 MP4、MOV 或 WebM"],
+    ["invalid_replacement_image", "参考图无法读取，请更换图片"],
+    ["replacement_image_too_large", "参考图超过大小限制，请压缩或更换图片"],
+    ["unsupported_replacement_media_type", "参考图格式不受支持，请使用 JPEG、PNG 或 WebP"],
+    ["replacement_pair_required", "参考图和替换说明必须同时提供"],
+    ["replacement_instruction_too_long", "替换说明过长，请缩短后重试"],
+    ["source_exactly_one_required", "请上传视频或填写视频链接，二者只能选择一个"],
+    ["invalid_aspect_ratio", "画面比例无效，请重新选择"],
+    ["invalid_generation_request", "生成参数无效，请检查后重试"],
+    ["invalid_resolution", "分辨率无效，请重新选择"],
+    ["invalid_target_language", "目标语言无效，请重新填写"],
+    ["target_language_too_long", "目标语言过长，请缩短后重试"],
+    ["generation_failed", "视频生成未完成，请稍后重试"],
+    ["pipeline_failed", "视频处理未完成，请稍后重试"],
+    ["postprocess_failed", "图片处理未完成，请重试本段"],
     ["output_missing", "生成已结束，但成片尚未生成"],
     ["generation_path_removed", "该历史任务只能查看，不能重新生成"],
   ]);
-  if (labels.has(code)) return labels.get(code);
-  if (/(?:asr|voice_lines|codex voice|vocal classification|audio extract|transcri)/i.test(code)) {
-    return "台词识别失败，未进入校对或后续生成";
-  }
-  if (/^[a-z][a-z0-9_]{2,80}$/.test(code)) {
-    return fallback + `（${code}）`;
-  }
-  if (code && code.length <= 120 && !/[\r\n{}\[\]+]/.test(code)) return code;
-  return fallback;
+  return labels.get(code) || fallback;
 }
 
 function diagnosticText(raw) {
-  const text = raw && typeof raw === "object"
-    ? JSON.stringify(raw, null, 2) : String(raw || "");
-  return text.length > 1200 ? text.slice(0, 1200) + "\n…诊断内容已截断" : text;
+  return safeErrorSummary(raw, "内部诊断信息未公开");
 }
 
 function stageState(status, detail = "", count = "") {
@@ -1357,9 +1376,11 @@ function conversationThumbnailPath(detail) {
 
 function errorDiagnostic(raw, label = "高级诊断") {
   if (raw === null || raw === undefined || raw === "") return null;
+  const text = safeErrorSummary(raw, "");
+  if (!text) return null;
   const details = el("details", "error-diagnostic");
   details.appendChild(el("summary", null, label));
-  details.appendChild(el("pre", null, diagnosticText(raw)));
+  details.appendChild(el("pre", null, text));
   return details;
 }
 
@@ -2193,7 +2214,10 @@ function renderFail(detail) {
   card.appendChild(icon("i-alert", "ic-danger"));
   const body = el("div");
   body.appendChild(el("p", "fail-title", "生成未完成"));
-  body.appendChild(el("p", "fail-msg", "项目未能完成，请稍后重试或联系管理员。"));
+  body.appendChild(el("p", "fail-msg", safeErrorSummary(
+    detail && detail.error,
+    "项目未能完成，请稍后重试。",
+  )));
   body.appendChild(el("p", "fail-tip", "刷新页面不会重复提交任务。"));
   card.appendChild(body);
   row.appendChild(card);
@@ -4134,8 +4158,10 @@ function safePostprocessError(error) {
     ["timeout", "处理超时，请稍后重试"],
     ["postprocess_failed", "图片处理失败，请重试本段"],
     ["provider_failed", "图片处理失败，请重试本段"],
+    ["image_rejected_by_provider", "图片未通过供应商审核，请更换图片或调整图片后重试"],
+    ["provider_rejected", "图片未通过供应商审核，请更换图片或调整图片后重试"],
   ]);
-  return labels.get(code) || "本段处理失败，请重试或联系管理员";
+  return labels.get(code) || "本段处理失败，请稍后重试";
 }
 
 async function retryPostprocessSegment(detail, segment, request = apiJSON, confirmUnknown, onAccepted) {
@@ -5145,10 +5171,7 @@ async function handleSend(event) {
       setComposerError(err.message);
       return;
     }
-    // 422 no audio track in video → 换成可读引导（本产品仅处理带口播视频）
-    setComposerError(err.message.includes("no audio track in video")
-      ? "该视频没有音轨，本产品仅支持带口播的视频"
-      : err.message);
+    setComposerError(safeErrorSummary(err, "创建失败，请检查输入后重试"));
   }
 }
 

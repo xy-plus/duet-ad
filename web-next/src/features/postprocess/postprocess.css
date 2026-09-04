@@ -1,9 +1,0 @@
-.postprocess-status-stack {
-  inline-size: 100%;
-}
-
-.postprocess-result-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(8rem, 1fr));
-  gap: var(--ant-margin-sm);
-}

@@ -28,7 +28,7 @@ LONG_SEGMENTS = [
     ("smptebars", 5.0),
     ("testsrc2", 5.0),
 ]
-SHORT_SEGMENTS = [("color=c=red", 5.0), ("color=c=blue", 5.0)]
+SHORT_SEGMENTS = [("color=c=red", 4.0), ("color=c=blue", 4.0)]
 
 
 def build_scene_video(path: Path, segments: list[tuple[str, float]]) -> Path:
@@ -70,9 +70,9 @@ def video_30s(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
-def video_10s(tmp_path_factory):
+def video_8s(tmp_path_factory):
     return build_scene_video(
-        tmp_path_factory.mktemp("video") / "scenes_10s.mp4", SHORT_SEGMENTS
+        tmp_path_factory.mktemp("video") / "scenes_8s.mp4", SHORT_SEGMENTS
     )
 
 
@@ -141,7 +141,7 @@ def test_segments_cover_and_sized(video_30s, tmp_path):
     data = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
 
     segments = data["segments"]
-    assert segments  # >10s 视频必须给出拆段建议
+    assert segments  # >8s 视频必须给出拆段建议
     bounds = [(seg["start_s"], seg["end_s"]) for seg in segments]
     assert bounds[0][0] == 0.0
     assert bounds[-1][1] == pytest.approx(data["duration_s"])  # 覆盖全程
@@ -150,49 +150,49 @@ def test_segments_cover_and_sized(video_30s, tmp_path):
         assert cur[0] >= prev[0]  # 单调递增
     for start, end in bounds:
         assert 4.0 <= end - start
-        assert provider_duration_s(start, end) <= 10
+        assert provider_duration_s(start, end) <= 8
     assert all(seg["chain_id"].startswith("chain-") for seg in segments)
     assert all(seg["join_mode"] in {"hard_cut", "continue"} for seg in segments)
 
 
-def test_segments_empty_for_short_video(video_10s, tmp_path):
+def test_segments_empty_for_short_video(video_8s, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
-    write_manifest(work, 10.0)
+    write_manifest(work, 8.0)
 
-    result = run_scenes(video_10s, work)
+    result = run_scenes(video_8s, work)
     assert result.returncode == 0, result.stderr
     data = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
-    assert data["segments"] == []  # ≤15s 不算拆段
+    assert data["segments"] == []  # ≤8s 不拆段
     assert data["scenes"]  # 场景照常输出
 
 
-def test_build_segments_starts_immediately_above_ten_seconds():
-    segments = build_segments([(0.0, 10.001)], 10.001)
-    assert segments == [(0.0, 6.001), (6.001, 10.001)]
+def test_build_segments_starts_immediately_above_eight_seconds():
+    segments = build_segments([(0.0, 8.001)], 8.001)
+    assert segments == [(0.0, 4.001), (4.001, 8.001)]
 
 
-def test_missing_manifest_fails(video_10s, tmp_path):
+def test_missing_manifest_fails(video_8s, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
-    result = run_scenes(video_10s, work)
+    result = run_scenes(video_8s, work)
     assert result.returncode != 0
     assert not (work / "scenes.json").exists()
 
 
-def test_corrupt_manifest_fails(video_10s, tmp_path):
+def test_corrupt_manifest_fails(video_8s, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     (work / "manifest.json").write_text("{not json", encoding="utf-8")
-    result = run_scenes(video_10s, work)
+    result = run_scenes(video_8s, work)
     assert result.returncode != 0
 
 
-def test_manifest_missing_fields_fails(video_10s, tmp_path):
+def test_manifest_missing_fields_fails(video_8s, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     (work / "manifest.json").write_text('{"duration_seconds": 10.0}', encoding="utf-8")
-    result = run_scenes(video_10s, work)
+    result = run_scenes(video_8s, work)
     assert result.returncode != 0
 
 
@@ -205,23 +205,23 @@ def test_manifest_missing_fields_fails(video_10s, tmp_path):
         '{"duration_seconds": 10.0, "frames": [{"file": "f1.png", "time_seconds": NaN}]}',
     ],
 )
-def test_manifest_non_finite_numbers_fail(video_10s, tmp_path, manifest_body):
+def test_manifest_non_finite_numbers_fail(video_8s, tmp_path, manifest_body):
     """NaN/Infinity 时长或帧时间 → 非零退出，不产出 scenes.json。"""
     work = tmp_path / "work"
     work.mkdir()
     (work / "manifest.json").write_text(manifest_body, encoding="utf-8")
-    result = run_scenes(video_10s, work)
+    result = run_scenes(video_8s, work)
     assert result.returncode != 0
     assert not (work / "scenes.json").exists()
 
 
-def test_nan_threshold_fails(video_10s, tmp_path):
+def test_nan_threshold_fails(video_8s, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     write_manifest(work, 10.0)
     result = subprocess.run(
         [
-            sys.executable, str(SCENES_SCRIPT), str(video_10s),
+            sys.executable, str(SCENES_SCRIPT), str(video_8s),
             "--work-dir", str(work), "--threshold", "nan",
         ],
         capture_output=True,
@@ -270,15 +270,15 @@ def test_e2e_manifest_duration_frame_quantized(video_24s, tmp_path):
 
 def test_build_segments_splits_long_scene_at_provider_safe_boundaries():
     assert build_segments([(0.0, 10.0), (10.0, 32.0)], 32.0) == [
-        (0.0, 10.0),
-        (10.0, 20.0),
-        (20.0, 28.0),
-        (28.0, 32.0),
+        (0.0, 8.0),
+        (8.0, 16.0),
+        (16.0, 24.0),
+        (24.0, 32.0),
     ]
 
 
 def assert_segments_valid(segments, duration):
-    """拆段不变量：非空、源段 4..10s、首 0 尾 duration、相邻无缝。"""
+    """拆段不变量：非空、源段 4..8s、首 0 尾 duration、相邻无缝。"""
     assert segments
     assert segments[0][0] == pytest.approx(0.0)
     assert segments[-1][1] == pytest.approx(duration)
@@ -286,7 +286,7 @@ def assert_segments_valid(segments, duration):
     for start, end in segments:
         assert start == pytest.approx(prev_end)  # 无缝隙
         assert 4.0 <= end - start
-        assert provider_duration_s(start, end) <= 10
+        assert provider_duration_s(start, end) <= 8
         assert end > start  # 单调
         prev_end = end
 
@@ -302,7 +302,7 @@ def assert_segments_valid(segments, duration):
     ],
 )
 def test_build_segments_long_scene_stays_within_limits(bounds, duration):
-    """长单场景：provider 请求不超过 14s，覆盖全程且边界连续。"""
+    """长单场景：provider 请求不超过 8s，覆盖全程且边界连续。"""
     assert_segments_valid(build_segments(bounds, duration), duration)
 
 
@@ -402,14 +402,15 @@ def test_canonical_segment_boundary_drops_zero_length_phantom_cut():
     segments = plan_segments(16.0, scenes, [])
 
     assert [(item["start_s"], item["end_s"]) for item in segments] == [
-        (0.0, 8.083333), (8.083333, 16.0),
+        (0.0, 6.0), (6.0, 12.0), (12.0, 16.0),
     ]
     assert [
         [cut["source_scene_id"] for cut in segment["source_cut_timeline"]]
         for segment in segments
     ] == [
-        ["SCENE_01", "SCENE_02", "SCENE_03"],
-        ["SCENE_04", "SCENE_05"],
+        ["SCENE_01", "SCENE_02"],
+        ["SCENE_03", "SCENE_04"],
+        ["SCENE_05"],
     ]
     assert all(
         cut["end_s"] > cut["start_s"]
@@ -421,8 +422,9 @@ def test_canonical_segment_boundary_drops_zero_length_phantom_cut():
         sorted({item["source_scene_id"] for item in selection})
         for selection in selections
     ] == [
-        ["SCENE_01", "SCENE_02", "SCENE_03"],
-        ["SCENE_04", "SCENE_05"],
+        ["SCENE_01", "SCENE_02"],
+        ["SCENE_03", "SCENE_04"],
+        ["SCENE_05"],
     ]
 
 
@@ -521,52 +523,52 @@ def test_nine_frames_is_analysis_capacity_not_a_provider_segment_limit():
             "end_s": float(index + 1),
             "frames": [_decoded_frame(index, index)],
         }
-        for index in range(10)
+        for index in range(8)
     ]
 
-    segments = plan_segments(10.0, scenes, [])
+    segments = plan_segments(8.0, scenes, [])
 
     assert [(segment["start_s"], segment["end_s"]) for segment in segments] == [
-        (0.0, 10.0),
+        (0.0, 8.0),
     ]
-    assert segments[0]["scene_indices"] == list(range(1, 11))
+    assert segments[0]["scene_indices"] == list(range(1, 9))
     assert [item["source_scene_id"] for item in segments[0][
         "source_cut_timeline"
-    ]] == [f"SCENE_{index:02d}" for index in range(1, 11)]
+    ]] == [f"SCENE_{index:02d}" for index in range(1, 9)]
 
 
-def test_dense_ten_second_montage_compacts_analysis_and_keeps_every_cut():
+def test_dense_eight_second_montage_compacts_analysis_and_keeps_every_cut():
     scenes = []
     for index in range(10):
         scenes.append({
             "index": index + 1,
-            "start_s": round(index * 0.3, 6),
-            "end_s": round((index + 1) * 0.3, 6),
-            "frames": [_decoded_frame(index, index * 3, denominator=10)],
+            "start_s": round(index * 0.24, 6),
+            "end_s": round((index + 1) * 0.24, 6),
+            "frames": [_decoded_frame(index, index * 6, denominator=25)],
         })
     scenes.append({
         "index": 11,
-        "start_s": 3.0,
-        "end_s": 10.0,
+        "start_s": 2.4,
+        "end_s": 8.0,
         "frames": [
-            _decoded_frame(10 + offset, 30 + offset, denominator=10)
-            for offset in range(70)
+            _decoded_frame(10 + offset, 60 + offset, denominator=25)
+            for offset in range(140)
         ],
     })
 
     segments = plan_segments(
-        10.0,
+        8.0,
         scenes,
-        [{"text": "完整保留", "start_s": 2.9, "end_s": 3.2}],
+        [{"text": "完整保留", "start_s": 2.3, "end_s": 2.6}],
     )
     assert len(segments) == 1
     assert segments[0]["start_s"] == 0.0
-    assert segments[0]["end_s"] == 10.0
-    assert provider_duration_s(0.0, 10.0) == 10
+    assert segments[0]["end_s"] == 8.0
+    assert provider_duration_s(0.0, 8.0) == 8
     timeline = segments[0]["source_cut_timeline"]
     assert len(timeline) == 11
     assert timeline[0]["start_s"] == 0.0
-    assert timeline[-1]["end_s"] == 10.0
+    assert timeline[-1]["end_s"] == 8.0
     assert all(
         left["end_s"] == right["start_s"]
         for left, right in zip(timeline, timeline[1:])
@@ -594,13 +596,13 @@ def test_twenty_five_cuts_keep_complete_timeline_with_nine_analysis_slots():
     scenes = [
         {
             "index": index + 1,
-            "start_s": index * 0.4,
-            "end_s": (index + 1) * 0.4,
-            "frames": [_decoded_frame(index, index * 4, denominator=10)],
+            "start_s": index * 0.32,
+            "end_s": (index + 1) * 0.32,
+            "frames": [_decoded_frame(index, index * 8, denominator=25)],
         }
         for index in range(25)
     ]
-    segment = plan_segments(10.0, scenes, [])[0]
+    segment = plan_segments(8.0, scenes, [])[0]
     selected = select_segment_keyframes(scenes, segment)
 
     assert len(segment["source_cut_timeline"]) == 25

@@ -232,7 +232,7 @@ def test_retry_request_rejection_never_exposes_raw_error():
         "async()=>{throw new Error('provider raw stack token=secret')},()=>true,()=>{});return null}"
         "catch(error){return {message:error.message,leaked:/secret|raw stack/.test(error.message)}}})()"
     )
-    assert result == {"message": "本段处理失败，请重试或联系管理员", "leaked": False}
+    assert result == {"message": "本段处理失败，请稍后重试", "leaked": False}
     js = APP_JS.read_text(encoding="utf-8")
     retry_dom = js.split("function renderPostprocessSegments", 1)[1].split(
         "/* 助手消息", 1
@@ -259,7 +259,7 @@ def test_postprocess_segment_stage_and_error_are_allowlisted():
         "done": "已完成",
         "unknownStage": "处理中",
         "knownError": "分段状态已更新，请刷新后重试",
-        "unknownError": "本段处理失败，请重试或联系管理员",
+        "unknownError": "本段处理失败，请稍后重试",
     }
     prototype_keys = _run_contract(
         "['toString','constructor','__proto__'].map(key=>({"
@@ -270,7 +270,7 @@ def test_postprocess_segment_stage_and_error_are_allowlisted():
         {
             "status": "状态未知",
             "stage": "处理中",
-            "error": "本段处理失败，请重试或联系管理员",
+            "error": "本段处理失败，请稍后重试",
         }
     ] * 3
 

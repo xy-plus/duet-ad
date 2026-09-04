@@ -45,5 +45,5 @@ links: [conversation-task, submit-gate, result-display]
 ## 例子
 
 - 2 秒连续 scene 只有少量不同解码帧：为当前 segment 重复最近合法帧填满 Picture 1…9，并绑定重复 provenance；仍走同一 H3 task。
-- 14.5 秒视频在 2.267 秒存在 source hard cut：仍是一个 exact-9 segment；后端按冻结 timeline 把 visual prose 编译成两个 Shot，第二个 Shot 在 `00:02.267` 切到对应 Picture。
-- 30 秒视频规划为三个 segment：每段 exact 9 Picture、零 source audio reference；三段 H3 成功后按同一 EDL 拼接。
+- 8 秒视频在 2.267 秒存在 source hard cut：仍是一个 exact-9 segment；后端按冻结 timeline 把 visual prose 编译成两个 Shot，第二个 Shot 在 `00:02.267` 切到对应 Picture。
+- 30 秒视频规划为四个 segment：每段 exact 9 Picture、零 source audio reference；四段 H3 成功后按同一 EDL 拼接。

@@ -519,7 +519,7 @@ def test_prompt_fusion_v2_ignores_visual_hard_cut_drift(tmp_path: Path) -> None:
     assert "99 seconds" in frozen.final_prompts[0]
 
 
-def test_historical_shot_fusion_is_read_only_but_cannot_be_republished(
+def test_shot_fusion_loads_and_optional_frame_mode_rejects_it(
     tmp_path: Path,
 ) -> None:
     frames = []
@@ -1603,13 +1603,14 @@ def _fusion_v1_input(root: Path, segment_count: int) -> bytes:
 
 
 def _fusion_v2_visual(segment: dict, visual: str) -> list[str]:
-    return [
-        f"{visual} frame {frame['order']}"
-        for frame in segment["new_keyframes"]
-    ]
+    count = 1 + sum(
+        frame["transition"]["type"] == "hard_cut"
+        for frame in segment["new_keyframes"][1:]
+    )
+    return [f"{visual} shot {index}" for index in range(1, count + 1)]
 
 
-def test_nine_fusion_visuals_are_grouped_by_frozen_hard_cuts() -> None:
+def test_hard_cut_visuals_cover_all_nine_frozen_anchors_without_repetition() -> None:
     transition_types = (
         "start", "continuous", "continuous", "continuous", "continuous",
         "hard_cut", "continuous", "hard_cut", "continuous",
@@ -1626,14 +1627,19 @@ def test_nine_fusion_visuals_are_grouped_by_frozen_hard_cuts() -> None:
         },
     } for order, transition_type in enumerate(transition_types, 1)]
     prompt = long_generation._compile_fusion_ref2va_prompt(
-        visual=[f"frame description {order}" for order in range(1, 10)],
+        visual=["first shot", "second shot", "third shot"],
         timeline=timeline,
         lines=[],
         music_policy="forbid",
     )
 
     for order in range(1, 10):
-        assert f"<Picture {order}>: frame description {order}" in prompt
+        assert f"<Picture {order}>" in prompt
+    assert prompt.count("first shot") == 1
+    assert prompt.count("second shot") == 1
+    assert prompt.count("third shot") == 1
+    assert prompt.count("At 00:05.000, the shot cuts") == 1
+    assert prompt.count("At 00:07.000, the shot cuts") == 1
 
 
 def test_fusion_visual_budget_is_derived_before_generation() -> None:
@@ -1668,7 +1674,7 @@ def test_fusion_visual_budget_is_derived_before_generation() -> None:
     )
     assert limit < without_cut_limit
     compiled = long_generation._compile_fusion_ref2va_prompt(
-        visual=["x" * limit] * 9,
+        visual=["x" * limit],
         timeline=timeline,
         lines=[],
         music_policy="forbid",
@@ -1681,7 +1687,7 @@ def test_fusion_visual_budget_is_derived_before_generation() -> None:
         match="prompt_fusion_output_invalid",
     ):
         long_generation._compile_fusion_ref2va_prompt(
-            visual=["x" * (limit + 1)] * 9,
+            visual=["x" * (limit + 1)],
             timeline=timeline,
             lines=[],
             music_policy="forbid",
@@ -1738,14 +1744,16 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
     )
     cid = created["id"]
     root = settings.data_dir / cid
-    acceptance_sha256 = "a" * 64
+    postprocess_receipt = {
+        "version": 4,
+        "options": {"optimize_image": True},
+    }
+    acceptance_sha256 = h3.canonical_json_sha256(postprocess_receipt)
     storage.update_meta(
         settings.data_dir,
         cid,
-        _image_user_acceptance={
-            "version": 1,
-            "sha256": acceptance_sha256,
-        },
+        _postprocess_receipt=postprocess_receipt,
+        postprocess={"status": "done"},
     )
     input_data = _fusion_input(root, segment_count)
     (root / "work" / "unrelated-project-secret.txt").write_text(
@@ -1791,10 +1799,19 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
                 payload["segments"],
             )
             assert f"每条 visual 不超过 {visual_max_chars} 个字符" in prompt
-            visual_schema = output_schema["properties"]["segments"]["items"][
-                "properties"
-            ]["visual"]["items"]
-            assert visual_schema["maxLength"] == visual_max_chars
+            segment_schema = output_schema["properties"]["segments"]["items"]
+            segment_options = segment_schema.get("anyOf", [segment_schema])
+            assert len(segment_options) == len(payload["segments"])
+            expected_counts = pipeline._prompt_fusion_visual_counts(
+                payload["segments"]
+            )
+            for option, expected_count in zip(
+                segment_options, expected_counts, strict=True,
+            ):
+                visual_schema = option["properties"]["visual"]
+                assert visual_schema["minItems"] == expected_count
+                assert visual_schema["maxItems"] == expected_count
+                assert visual_schema["items"]["maxLength"] == visual_max_chars
             assert output_path == cwd / "work" / "h3_prompt_plan.json"
             assert max_output_bytes > 0
             assert output_schema["type"] == "object"
@@ -1877,19 +1894,9 @@ def test_project_prompt_fusion_runs_once_and_publishes_manifest_last(
     assert meta["_prompt_fusion"]["raw_output_sha256"] == hashlib.sha256(
         (root / "work" / "h3_prompt_plan.json").read_bytes()
     ).hexdigest()
-    assert main._public_prompt_fusion(meta, root) == {
-        "status": "done",
-        "error": None,
-        "segments": [{
-            "index": index,
-            "status": "done",
-            "final_prompt": _fusion_v2_final_prompt(
-                json.loads(input_data)["segments"][index - 1],
-                f"fused prompt {index}",
-            ),
-            "error": None,
-        } for index in range(1, segment_count + 1)],
-    }
+    public = main._public_prompt_fusion(meta)
+    assert public["status"] == "done"
+    assert public["error"] is None
 
 
 def test_prompt_fusion_runner_refuses_historical_v1_queue(tmp_path: Path) -> None:

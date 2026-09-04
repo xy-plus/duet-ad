@@ -2,19 +2,19 @@
 
 本 runbook 只更新极简前端测试入口所使用的后端进程：
 
-- 已存在的 `duet-ad1-caddy.service` 在 `:3213` 接收 HTTPS，且仅把
-  `/api/*` 反代到 `127.0.0.1:3214`；
+- 已存在的 `duet-ad1-caddy.service` 在 `:3213` 接收 HTTPS，并把
+  所有请求原样反代到 `127.0.0.1:3214`；
 - `duet-ad1-minimal-frontend-3213.service` 从本工作树启动单进程
   uvicorn，并只监听 `127.0.0.1:3214`；
 - 测试实例固定使用独立的
   `/home/xy/duet-ad1/data/test-instances/minimal-frontend-3213/data`；
-- 生产入口 `:3211 → 127.0.0.1:3212`、`duet-ad1.service`、生产
-  `DATA_DIR=/home/xy/duet-ad1/data` 和生产静态文件均不在本次范围内。
+- 生产入口 `:3211 → 127.0.0.1:3212`、`duet-ad1.service` 和生产
+  `DATA_DIR=/home/xy/duet-ad1/data` 均不在本次范围内。
 
 唯一允许重启的服务是
 `duet-ad1-minimal-frontend-3213.service`。不要 reload/restart Caddy，不要
-restart `duet-ad1.service`，不要安装本工作树内的 Caddy 配置，也不要更新
-3211 或 3213 的静态文件。若现有 Caddy 拓扑不满足上述断言，立即停止；本
+restart `duet-ad1.service`，不要安装本工作树内的 Caddy 配置。若现有 Caddy
+拓扑不满足上述断言，立即停止；本
 runbook 不负责修复代理。
 
 所有部署 smoke 仅使用 GET。不得运行
@@ -85,18 +85,17 @@ config = json.loads(
 )
 servers = config['apps']['http']['servers']
 
-def api_upstream(name: str) -> str:
-    route = next(
-        item
-        for item in servers[name]['routes']
-        if item.get('match') == [{'path': ['/api/*']}]
-    )
+def only_upstream(name: str) -> str:
+    routes = servers[name]['routes']
+    assert len(routes) == 1
+    route = routes[0]
+    assert 'match' not in route
     return route['handle'][0]['upstreams'][0]['dial']
 
 assert servers['srv3211']['listen'] == [':3211']
-assert api_upstream('srv3211') == '127.0.0.1:3212'
+assert only_upstream('srv3211') == '127.0.0.1:3212'
 assert servers['srv3213']['listen'] == [':3213']
-assert api_upstream('srv3213') == '127.0.0.1:3214'
+assert only_upstream('srv3213') == '127.0.0.1:3214'
 print('caddy-topology-ok')
 PY
 rtk proxy /usr/local/libexec/duet/caddy validate --config /home/xy/duet-ad1/.deploy/caddy/config.json
@@ -209,7 +208,7 @@ rtk proxy /usr/bin/ss -ltnp 'sport = :3214'
 
 ## 5. GET-only smoke
 
-下面脚本只发 GET：验证 3214 本机后端、3213 既有代理和静态入口、3211 生产
+下面脚本只发 GET：验证 3214 本机后端、3213 代理入口、3211 生产
 回归、完整 v1 capability，以及隔离目录内所有已有项目的 list/detail 读取兼容。
 访问令牌由终端无回显输入，不写 shell history，也不打印响应中的项目内容。
 

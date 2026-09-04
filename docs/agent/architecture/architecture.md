@@ -40,7 +40,7 @@ flowchart LR
 | `app/prepared_input.py` | 结构化台词、唯一发声块、文件哈希绑定、fail-closed loader | conversation-task |
 | `app/frame_fit.py` | 按真实 H3 输入推荐 `16:9/9:16`，并显式 crop/pad 为所选目标画幅 | conversation-task |
 | `app/h3.py` | 直接 H3 的 prepare/submit/start/inspect/resume/retry 和磁盘状态机 | conversation-task |
-| `app/long_video.py` | provider 整秒时长不超过 14 秒的安全分段、hard_cut/continue 链语义、canonical plan receipt | conversation-task |
+| `app/long_video.py` | provider 整秒时长不超过 8 秒的安全分段、hard_cut/continue 链语义、canonical plan receipt | conversation-task |
 | `app/long_generation.py` | Fusion v2 装载、Ref2VA 确定性编译、exact-9 H3 子任务冻结、调度、恢复和拼接编排 | conversation-task |
 | `app/context_ir_bridge.py` | current Ref2VA 同字节 local identity receipt；历史 provider receipt 只读恢复 | conversation-task |
 | `app/stitch.py` | 24fps H.264 归一化、连续边界去重帧、H3 原生音频/同 EDL 静音拼接 | conversation-task |
@@ -80,7 +80,7 @@ flowchart LR
 
 关键不变量：
 
-- 新会话 `schema_version=2`，`duration_s` 只表示首个视频流 `v:0` 的正有限视觉时长且不超过 300 秒。current v4 总是形成 `segments[N>=1]`：`≤15s` 通常为 `N=1`，更长输入形成连续覆盖全片、provider 整秒时长不超过 14 秒的多个 segment。
+- 新会话 `schema_version=2`，`duration_s` 只表示首个视频流 `v:0` 的正有限视觉时长且不超过 300 秒。current v4 总是形成 `segments[N>=1]`：`≤8s` 为 `N=1`，更长输入形成连续覆盖全片、provider 整秒时长不超过 8 秒的多个 segment。
 - `keep` 模式由固定的本地 `whisper.cpp` multilingual small 处理 16kHz 单声道音频，自动检测语言；模型和二进制由部署固定，运行时不下载。`rewrite/translate` 才进入音频专用 Codex 隔离区。
 - 自动台词的唯一可收养 agent 输出是隔离区 `work/voice_lines.json`：先做大小、普通文件与 JSON 字段白名单校验，再把净化结果写回主 `work/`。重试创建全新隔离区；Codex 超时/非零退出但完整产物已通过同一校验时仍可收养。
 - 4fps 抽帧由 ffmpeg 按 `v:0` presentation timestamps 顺序批量解码；禁止用 OpenCV `CAP_PROP_POS_MSEC` 随机 seek 假设 CFR。ASR 初次校验和 YAMNet 分类使用 `voice.mp3` 的真实音频时长；这是独立于 `v:0` 的第二条时间轴。抽音以视频 `stream.start_time`（缺失才回落 packet PTS）为零点，用 `aresample first_pts=0` 让解码器先处理 AAC Skip Samples/Opus pre-skip，再按时间戳补前置静音或裁掉视频零点前音频，并在视觉终点裁剪/补静音。随后、写 `voice_lines/meta/receipt` 前，必须把有效台词归一到 manifest 的视觉时间轴。跨越视频结尾的行把 `end_s` 截到视频时长，`start_s >= duration_s` 的音频纯尾部行丢弃并留 provenance/warning，归一结果再过一次 voice 白名单。receipt 的时间真相始终是视觉时长。
@@ -91,7 +91,7 @@ flowchart LR
 - current v4 不直接发送旧 `prompt.txt`。Fusion 只输出 visual prose，后端从 exact-9 Picture timeline、冻结 spoken 台词和 `music_policy=forbid` 编译唯一 Ref2VA prompt；无台词时明确不写 dialogue token。
 - ASR 输出中的 `[无法辨识]`、`[inaudible]`、`[unintelligible]` 等哨兵文本不是业务台词：净化为“本次未得到转写”，复用有声学人声证据时的一次重试；任何哨兵不得进入 `voice_lines.json`、prepared receipt 或 H3 prompt。
 - 后端编译的 Ref2VA prompt 是 current H3 唯一文本输入。Context 为同字节 local identity receipt，不调用 MiniMax Context HTTP，也没有运行时优化或备用 prompt 开关。
-- `duration_s` 以 `v:0` 实际浮点时长写 receipt；current 每个 segment 请求不超过 14 秒。最终 EDL 按源段帧预算精确裁补：使用 H3 原生音轨或该段静音，不读取 source audio。历史 plan v1 只按原浮点和 receipt 恢复已知 task。
+- `duration_s` 以 `v:0` 实际浮点时长写 receipt；current 每个 segment 请求不超过 8 秒。最终 EDL 按源段帧预算精确裁补：使用 H3 原生音轨或该段静音，不读取 source audio。历史 plan v1 只按原浮点和 receipt 恢复已知 task。
 - pipeline 首次进入 `processing` 与首次 submit 冻结输入共用同一个 per-CID 原子所有权 claim；检查 generation/receipt、取得所有权和写 meta 在同一把锁内完成。输家不得运行输入准备、改写 receipt 或触发 provider，完成/回滚也只能由当前 owner 提交。
 - 生成推荐值与 pipeline `done` 原子落盘，统一从全部 segment 的冻结图片/anchors 计算；`N=1` 不使用另一套分支。两种画幅都冻结 `fit_profiles`，最终 fit bytes 仍保持每段 exact-9。
 - current v4 每段 H3 关键帧必须是 postprocess 技术验收后的 exact 9 张有序图片；crop/pad 由这些最终 bytes 派生。极短连续 scene 可以重复最近合法源帧并绑定 provenance，同 scene 相同 PTS 不破坏 exact-9。历史 boundary 布局只按冻结 marker 读取。

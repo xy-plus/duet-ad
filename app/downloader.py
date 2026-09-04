@@ -108,16 +108,32 @@ def _resolver_for(proxy: str | None, timeout: int):
 def _validate_public_url(url: str, resolve):
     """仅 http(s)；解析所得全部 IP 必须公网。返回 (parsed, host, port, 钉死的 IP)。"""
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise DownloadError("only http(s) URLs are supported")
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise DownloadError(
+            "only credential-free http(s) URLs are supported",
+            code="invalid_source_video_url",
+        )
     host = parsed.hostname.strip("[]").lower()
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        raise DownloadError(
+            "URL port is invalid", code="invalid_source_video_url"
+        ) from None
     try:
         addresses = [str(ipaddress.ip_address(host))]  # 字面 IP 无需解析，当场判死
     except ValueError:
         addresses = list(resolve(host))
     if not addresses or any(not _public_ip(a) for a in addresses):
-        raise DownloadError("URL resolves to a local or private address, refused")
+        raise DownloadError(
+            "URL resolves to a local or private address, refused",
+            code="invalid_source_video_url",
+        )
     return parsed, host, port, addresses[0]
 
 

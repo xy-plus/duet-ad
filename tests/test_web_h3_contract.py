@@ -59,6 +59,8 @@ def test_visible_creation_contract_defaults_to_link_and_hides_pipeline_copy():
     for technical_copy in (
         "H3",
         "Context IR",
+        "超过 8 秒会拆分为单次不超过 8 秒的视频生成子任务",
+        "八秒分段",
         "超过 10 秒会拆分为单次不超过 10 秒的视频生成子任务",
         "十秒分段",
     ):
@@ -80,6 +82,35 @@ def test_duration_limit_error_is_structured_and_shown_as_popup():
     assert result == {
         "message": "最长 14 秒",
         "code": "video_duration_exceeds_h3_limit",
+    }
+
+
+def test_user_error_messages_are_actionable_and_unknown_details_are_hidden():
+    result = _run_contract(
+        "({"
+        "image:contract.safeErrorSummary('image_rejected_by_provider','fallback'),"
+        "audio:contract.safeErrorSummary('video_audio_required','fallback'),"
+        "unknown:contract.safeErrorSummary('prompt_fusion_private_stack token=secret','通用失败')"
+        "})"
+    )
+    assert result == {
+        "image": "图片未通过供应商审核，请更换图片或调整图片后重试",
+        "audio": "视频没有可用音轨，请上传带口播音轨的视频",
+        "unknown": "通用失败",
+    }
+
+
+def test_action_and_diagnostic_errors_do_not_render_raw_internal_messages():
+    result = _run_contract(
+        "(()=>{const error={hidden:false,textContent:''};const controls=[{disabled:true}];"
+        "contract.showActionError({code:'private_node_failed',message:'token=secret'},error,controls);"
+        "return {action:error.textContent,diagnostic:contract.diagnosticText({"
+        "code:'private_node_failed',trace:'token=secret'}),disabled:controls[0].disabled}})()"
+    )
+    assert result == {
+        "action": "操作失败，请稍后重试",
+        "diagnostic": "内部诊断信息未公开",
+        "disabled": False,
     }
 
 

@@ -3766,6 +3766,10 @@ def _prompt_fusion_early_output(
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError("prompt fusion raw output is invalid") from None
     segments = value.get("segments") if isinstance(value, dict) else None
+    try:
+        visual_counts = _prompt_fusion_visual_counts(input_segments)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("prompt fusion raw output is invalid") from None
     if (
         not isinstance(value, dict)
         or set(value) != {"schema", "version", "input_sha256", "segments"}
@@ -3774,6 +3778,7 @@ def _prompt_fusion_early_output(
         or value.get("input_sha256") != input_sha256
         or not isinstance(segments, list)
         or len(segments) != segment_count
+        or len(visual_counts) != segment_count
     ):
         raise ValueError("prompt fusion raw output is invalid")
     normalized_relations = False
@@ -3797,7 +3802,7 @@ def _prompt_fusion_early_output(
             or set(segment) not in allowed_keys
             or segment.get("index") != index
             or not isinstance(segment.get("visual"), list)
-            or not segment["visual"]
+            or len(segment["visual"]) != visual_counts[index - 1]
             or any(
                 not isinstance(text, str) or not text.strip()
                 for text in segment["visual"]
@@ -3842,6 +3847,24 @@ def _prompt_fusion_early_output(
             ):
                 raise ValueError("prompt fusion raw output is invalid") from None
     return _canonical_json_bytes(value) if normalized_relations else data
+
+
+def _prompt_fusion_visual_counts(input_segments: object) -> tuple[int, ...]:
+    """Derive one model-owned prose slot for each frozen hard-cut interval."""
+    if not isinstance(input_segments, list) or not input_segments:
+        raise ValueError("prompt fusion input is invalid")
+    counts = []
+    for segment in input_segments:
+        frames = segment.get("new_keyframes") if isinstance(segment, dict) else None
+        if not isinstance(frames, list) or not frames:
+            raise ValueError("prompt fusion input is invalid")
+        counts.append(1 + sum(
+            isinstance(frame, dict)
+            and isinstance(frame.get("transition"), dict)
+            and frame["transition"].get("type") == "hard_cut"
+            for frame in frames[1:]
+        ))
+    return tuple(counts)
 
 
 def _prompt_fusion_visual_max_chars(input_segments: list) -> int:
@@ -3984,7 +4007,7 @@ def _publish_prompt_fusion_manifest(
             input_path=input_path,
             output_path=output_path,
             root=root,
-            require_frame_visuals=True,
+            require_frame_visuals=False,
         )
     except long_generation.LongGenerationError as exc:
         raise PipelineError(exc.code) from None
@@ -4259,6 +4282,7 @@ def produce_prompt_fusion(
         if hashlib.sha256(input_data).hexdigest() != state.get("input_sha256"):
             raise PipelineError("prompt fusion input drifted")
         input_payload = _require_prompt_fusion_v2_input(input_data)
+        visual_counts = _prompt_fusion_visual_counts(input_payload["segments"])
         visual_max_chars = _prompt_fusion_visual_max_chars(
             input_payload["segments"],
         )
@@ -4309,7 +4333,7 @@ def produce_prompt_fusion(
                 ),
                 output_schema=codex_output_schemas.prompt_fusion_schema(
                     input_sha256=state["input_sha256"],
-                    segment_count=len(input_payload["segments"]),
+                    visual_counts=visual_counts,
                     visual_max_chars=visual_max_chars,
                 ),
             )

@@ -1,0 +1,56 @@
+{
+  "schema": "duet.skill-iteration-oracle",
+  "version": 1,
+  "cases": [
+    {
+      "case_id": "necklace-4seg-regression",
+      "split": "regression",
+      "source_project_id": "03ed892b63bd44ba85d43553f8e7a40e",
+      "people_keys": ["person-01"],
+      "people_demographic_style_evaluable_keys": ["person-01"],
+      "people_face_evaluable_keys": ["person-01"],
+      "people_clothing_evaluable_keys": ["person-01"],
+      "non_person_candidate_keys": ["entity-01", "entity-02", "entity-03", "scene-01"],
+      "user_replacement_expected_key": "entity-01",
+      "fusion_expected_replacement_keys": ["person-01", "entity-01", "entity-02", "entity-03", "scene-01"],
+      "known_regressions": [
+        "source and target descriptions were materially identical for entity-02, entity-03 and scene-01",
+        "Fusion restored old necklace, rings, bracelet and house static facts"
+      ]
+    },
+    {
+      "case_id": "cat-toy-3seg-train",
+      "split": "train",
+      "source_project_id": "88da16ebf6604fa19d94f5c8346735d2",
+      "people_keys": ["person-01"],
+      "people_demographic_style_evaluable_keys": [],
+      "people_face_evaluable_keys": [],
+      "people_clothing_evaluable_keys": [],
+      "non_person_candidate_keys": ["entity-01", "entity-02", "entity-03", "entity-04", "entity-05", "scene-01"],
+      "user_replacement_expected_key": "entity-01",
+      "fusion_expected_replacement_keys": ["person-01", "entity-01", "entity-02", "entity-03", "entity-04", "entity-05", "scene-01"],
+      "known_regressions": []
+    },
+    {
+      "case_id": "dog-grooming-2seg-train",
+      "split": "train",
+      "source_project_id": "6920ff446dad40a7b77695aeba4be6c9",
+      "people_keys": ["person-01"],
+      "people_demographic_style_evaluable_keys": [],
+      "people_face_evaluable_keys": [],
+      "people_clothing_evaluable_keys": [],
+      "non_person_candidate_keys": ["entity-01", "entity-02", "entity-03", "scene-01", "scene-02"],
+      "user_replacement_expected_key": "entity-01",
+      "fusion_expected_replacement_keys": ["person-01", "entity-01", "entity-02", "entity-03", "scene-01"],
+      "known_regressions": []
+    }
+  ],
+  "missing_holdout_coverage": [
+    "multiple fully visible people recurring across segments",
+    "no people with at least two non-person candidates",
+    "fewer than two non-person candidates",
+    "autonomous replacement without a user reference",
+    "recurring people, props and scenes across hard cuts and occlusion",
+    "old static prompt facts that conflict with new keyframes"
+  ]
+}
