@@ -835,7 +835,11 @@ class MediaKitClient:
         current_mime = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+            with httpx.Client(
+                timeout=self.settings.request_timeout_s,
+                transport=self.transport,
+                trust_env=False,
+            ) as client:
                 for index, scene in enumerate(scenes, 1):
                     stage: dict[str, Any] = {"scene": scene}
                     record["stages"].append(stage)

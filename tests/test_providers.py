@@ -453,12 +453,21 @@ def test_codex_structured_transport_compatibility(wrapper) -> None:
 
 def test_mediakit_multi_scene_supports_documented_and_nested_upload_shapes(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "input.jpg"
     source.write_bytes(b"jpeg-source")
     destination = tmp_path / "out" / "final.png"
     init_count = 0
     erase_count = 0
+    client_kwargs: list[dict[str, object]] = []
+    real_client = httpx.Client
+
+    def client_factory(*args: object, **kwargs: object) -> httpx.Client:
+        client_kwargs.append(dict(kwargs))
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(providers.httpx, "Client", client_factory)
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal init_count, erase_count
@@ -523,9 +532,10 @@ def test_mediakit_multi_scene_supports_documented_and_nested_upload_shapes(
             )
         raise AssertionError(str(request.url))
 
-    result = MediaKitClient(
-        _settings(tmp_path), httpx.MockTransport(handler)
-    ).erase(source, destination, ["erase-text", "erase-logo"])
+    transport = httpx.MockTransport(handler)
+    result = MediaKitClient(_settings(tmp_path), transport).erase(
+        source, destination, ["erase-text", "erase-logo"]
+    )
 
     assert result.value == destination
     assert destination.read_bytes() == b"final-stage"
@@ -534,6 +544,9 @@ def test_mediakit_multi_scene_supports_documented_and_nested_upload_shapes(
         b"final-stage",
     ]
     assert len(result.record["stages"]) == 2
+    assert len(client_kwargs) == 1
+    assert client_kwargs[0]["transport"] is transport
+    assert client_kwargs[0]["trust_env"] is False
     first_download = result.record["stages"][0]["download"]
     assert first_download["response"]["body"] == {
         "content_type": "image/webp",
