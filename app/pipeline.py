@@ -1530,13 +1530,24 @@ class Pipeline:
             response = exchange.get("response")
             if not isinstance(response, dict):
                 continue
-            if response.get("status_code") != 200:
-                continue
+            status_code = response.get("status_code")
             body = response.get("body")
-            envelope = body.get("response") if isinstance(body, dict) else None
+            if status_code == 200:
+                envelope = body.get("response") if isinstance(body, dict) else None
+                if (
+                    isinstance(envelope, dict)
+                    and str(envelope.get("status") or "").upper() == "FAILED"
+                ):
+                    return True
+                continue
+            # The workflow result endpoint also reports a completed task
+            # failure as this exact 422 envelope.  No other HTTP error proves
+            # that an accepted paid task is terminal.
             if (
-                isinstance(envelope, dict)
-                and str(envelope.get("status") or "").upper() == "FAILED"
+                status_code == 422
+                and isinstance(body, dict)
+                and str(body.get("status") or "").upper() == "ERROR"
+                and body.get("reason") == f"{PicsartClient.WORKFLOW}_failed"
             ):
                 return True
         return False
@@ -1923,17 +1934,34 @@ class Pipeline:
             resume_output = self._completed_resume_output(
                 project, segment_dir, self._segment_scope(index),
             )
+            scope = self._segment_scope(index)
             has_state_receipt, resume_task_id = self._state_submission_task(
                 state, index,
             )
+            if (
+                has_state_receipt
+                and isinstance(resume_task_id, str)
+                and resume_task_id
+                and resume_task_id
+                in self._terminal_resume_task_ids(project, scope)
+            ):
+                # A previous runtime may have persisted the accepted receipt
+                # before it learned this provider-specific terminal envelope.
+                # Reconcile only the same task id under an explicitly
+                # confirmed resume request, then allow this segment alone to
+                # obtain a new submission receipt.
+                self._mark_submission_task_failed(
+                    project_id, index, resume_task_id,
+                )
+                resume_task_id = None
             if not has_state_receipt:
                 resume_task_id = self._active_resume_task(
-                    project, self._segment_scope(index),
+                    project, scope,
                 )
                 if (
                     resume_task_id is None
                     and self._has_unknown_submit_receipt(
-                        project, self._segment_scope(index),
+                        project, scope,
                     )
                 ):
                     raise ValueError(
@@ -1943,7 +1971,7 @@ class Pipeline:
                     resume_task_id is None
                     and resume_output is None
                     and not self._has_retryable_submit_evidence(
-                        project, self._segment_scope(index),
+                        project, scope,
                     )
                 ):
                     raise ValueError(

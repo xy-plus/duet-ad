@@ -1024,6 +1024,25 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
         segments=segments,
         project_progress={"status": "failed", "percent": 57, "stage": "pipeline_failed"},
         generation={"status": "failed", "stage": "pipeline_failed", "error": "failed"},
+        picsart_submission_receipts={
+            "version": 1,
+            "segments": {
+                "1": [{
+                    "segment_index": 1,
+                    "run_identity": "picsart",
+                    "request_sha256": "a" * 64,
+                    "status": "accepted",
+                    "task_id": "existing-task",
+                }],
+                "2": [{
+                    "segment_index": 2,
+                    "run_identity": "picsart",
+                    "request_sha256": "b" * 64,
+                    "status": "accepted",
+                    "task_id": "failed-task",
+                }],
+            },
+        },
         **voice_state,
     )
     accepted = (
@@ -1057,8 +1076,15 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
         "provider_record": {
             "task_id": "failed-task",
             "polls": [{"response": {
-                "status_code": 200,
-                "body": {"response": {"status": "FAILED"}},
+                "status_code": 422,
+                "body": {
+                    "status": "error",
+                    "reason": "minimax/h3-max/reference-to-video_failed",
+                    "message": (
+                        "minimax/h3-max/reference-to-video failed with message: "
+                        "ValidationError: reference video download failed"
+                    ),
+                },
             }}],
         },
     }), encoding="utf-8")
@@ -1101,6 +1127,9 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
         )
 
     pipeline.validate_r2v_resume(project_id)
+    reconciled = store.read(project_id)["picsart_submission_receipts"]
+    assert reconciled["segments"]["1"][0]["status"] == "accepted"
+    assert reconciled["segments"]["2"][0]["status"] == "provider_failed"
     pipeline.resume_r2v(project_id)
 
     state = store.read(project_id)
@@ -1110,6 +1139,10 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
     assert [call["prompt"] for call in picsart.submits] == ["frozen prompt 2"]
     assert picsart.poll_counts["existing-task"] == 1
     assert "failed-task" not in picsart.poll_counts
+    assert [
+        receipt["status"]
+        for receipt in state["picsart_submission_receipts"]["segments"]["2"]
+    ] == ["provider_failed", "accepted"]
     expected_registered = {
         "source-muted.mp4", "provider-reference-resume.png",
     }
@@ -2113,6 +2146,37 @@ def test_poll_http_4xx_is_not_provider_task_terminal_failure() -> None:
             "body": {"response": {"status": "FAILED"}},
         }}],
     }) is True
+    workflow_failed = {
+        "status": "error",
+        "reason": "minimax/h3-max/reference-to-video_failed",
+        "message": (
+            "minimax/h3-max/reference-to-video failed with message: "
+            "ValidationError: reference video download failed"
+        ),
+    }
+    assert Pipeline._poll_record_is_terminal_failure({
+        "polls": [{"response": {
+            "status_code": 422,
+            "body": workflow_failed,
+        }}],
+    }) is True
+    for status_code in (404, 429, 500):
+        assert Pipeline._poll_record_is_terminal_failure({
+            "polls": [{"response": {
+                "status_code": status_code,
+                "body": workflow_failed,
+            }}],
+        }) is False
+    assert Pipeline._poll_record_is_terminal_failure({
+        "polls": [{"response": {
+            "status_code": 422,
+            "body": {
+                "status": "error",
+                "reason": "validation_error",
+                "message": workflow_failed["message"],
+            },
+        }}],
+    }) is False
 
 
 @pytest.mark.parametrize(

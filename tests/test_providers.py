@@ -839,3 +839,34 @@ def test_picsart_poll_failure_keeps_task_and_download_records_binary(
         "length": len(payload),
         "sha256": hashlib.sha256(payload).hexdigest(),
     }
+
+
+def test_picsart_poll_preserves_workflow_failed_422_exchange(
+    tmp_path: Path,
+) -> None:
+    body = {
+        "status": "error",
+        "reason": "minimax/h3-max/reference-to-video_failed",
+        "message": (
+            "minimax/h3-max/reference-to-video failed with message: "
+            "ValidationError: reference video download failed"
+        ),
+    }
+    calls = 0
+
+    def failed_poll(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.url.path == (
+            "/workflows/minimax/h3-max/reference-to-video/failed-task/result"
+        )
+        return httpx.Response(422, json=body)
+
+    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(failed_poll))
+    with pytest.raises(ProviderFailure) as caught:
+        client.poll("failed-task")
+
+    assert calls == 1
+    assert caught.value.record["task_id"] == "failed-task"
+    assert caught.value.record["polls"][-1]["response"]["status_code"] == 422
+    assert caught.value.record["polls"][-1]["response"]["body"] == body
