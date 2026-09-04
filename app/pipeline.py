@@ -2601,6 +2601,7 @@ class Pipeline:
                 "replacement or voice statement elsewhere in the prompt."
             ),
         ]
+        replaced_ids: set[str] = set()
         for category in ("people", "entities", "scenes"):
             records = element_index.get(category)
             if not isinstance(records, dict):
@@ -2608,6 +2609,8 @@ class Pipeline:
             for stable_id, record in records.items():
                 if not isinstance(stable_id, str) or not isinstance(record, dict):
                     continue
+                if isinstance(record.get("replacement"), dict):
+                    replaced_ids.add(stable_id)
                 if not cls._appears_in_segment(record, segment_index):
                     continue
                 source = cls._one_line(record.get("source_visual_description"))
@@ -2714,11 +2717,19 @@ class Pipeline:
                 if isinstance(replace_together, bool)
                 else "unspecified"
             )
-            lines.append(
-                f"- {stable_id} | RELATION | {subject} {predicate} {object_key} "
-                f"| preserve: {preserve_text} | replace together: "
-                f"{replace_together_text}"
-            )
+            if subject in replaced_ids or object_key in replaced_ids:
+                lines.append(
+                    f"- {stable_id} | RELATION | endpoints: {subject} -> "
+                    f"{object_key} | preserve: interaction type, contact, relative "
+                    "position, and motion continuity | replace together: "
+                    f"{replace_together_text}"
+                )
+            else:
+                lines.append(
+                    f"- {stable_id} | RELATION | {subject} {predicate} {object_key} "
+                    f"| preserve: {preserve_text} | replace together: "
+                    f"{replace_together_text}"
+                )
         lines.append("END AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN")
         return "\n".join(lines)
 

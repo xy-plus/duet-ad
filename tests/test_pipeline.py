@@ -1790,6 +1790,12 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
                 "preserve": ["hand-painted logo", "glazed finish"],
                 "replacement": None,
             },
+            "entity-03": {
+                "source_visual_description": "the background tray",
+                "occurrences": [{"segment_index": 1}],
+                "preserve": ["brushed metal finish"],
+                "replacement": None,
+            },
         },
         "scenes": {
             "scene-01": {
@@ -1807,11 +1813,22 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
         "relations": {
             "relation-01": {
                 "subject_key": "person-01",
-                "predicate": "holds",
+                "predicate": "holds the source toothbrush",
                 "object_key": "entity-01",
                 "occurrences": [{"segment_index": 1}],
-                "preserve": ["hand grip and contact geometry"],
+                "preserve": [
+                    "hand grip around the toothbrush handle",
+                    "source brush-head angle",
+                ],
                 "replace_together": True,
+            },
+            "relation-02": {
+                "subject_key": "entity-02",
+                "predicate": "rests beside",
+                "object_key": "entity-03",
+                "occurrences": [{"segment_index": 1}],
+                "preserve": ["cup logo faces the tray"],
+                "replace_together": False,
             },
         },
     }, 1)
@@ -1831,6 +1848,9 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
     )
     relation_line = next(
         line for line in lines if line.startswith("- relation-01 | RELATION |")
+    )
+    keep_relation_line = next(
+        line for line in lines if line.startswith("- relation-02 | RELATION |")
     )
 
     assert "a new woman with an angular face and a braided bob" in person_line
@@ -1853,7 +1873,17 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
     assert "slightly different" not in scene_line
 
     assert "hand-painted logo; glazed finish" in keep_line
-    assert "hand grip and contact geometry" in relation_line
+    assert "endpoints: person-01 -> entity-01" in relation_line
+    assert (
+        "interaction type, contact, relative position, and motion continuity"
+        in relation_line
+    )
+    assert "holds the source toothbrush" not in relation_line
+    assert "toothbrush handle" not in relation_line
+    assert "brush-head angle" not in relation_line
+
+    assert "entity-02 rests beside entity-03" in keep_relation_line
+    assert "cup logo faces the tray" in keep_relation_line
 
 
 def test_node_records_both_failed_attempts_and_process_streams(
