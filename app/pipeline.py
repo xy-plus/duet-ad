@@ -21,6 +21,7 @@ from app.object_replace_schema import (
     OBJECT_REPLACE_OUTPUT_VERSION,
     merge_object_replace_index,
     normalize_object_replace,
+    object_replace_planning_context,
     object_replace_schema,
 )
 from app.providers import (
@@ -622,8 +623,9 @@ class Pipeline:
             or SAME_AS_SOURCE_LANGUAGE
         ).strip()
         voice_ids = [voice["voice_id"] for voice in self.voice_library.voices]
+        planning_context = object_replace_planning_context(element_index)
         payload = {
-            "global_element_index": element_index,
+            **planning_context,
             "segment_visual_prompts": [
                 {
                     "segment_index": int(item["index"]),
@@ -2675,20 +2677,24 @@ class Pipeline:
                         )
                     if isinstance(replacement, dict):
                         line += (
-                            " | person policy: different face; same explicit gender, "
-                            "race, overall style, and clothing color; visibly different "
-                            "clothing design; do not infer missing traits"
+                            " | person policy: replace with a different identity; "
+                            "visibly change the face or visible body; keep only "
+                            "explicitly stated gender, race, age group, overall style, "
+                            "and primary clothing color; when clothing is visible, "
+                            "change its design; do not infer unseen traits"
                         )
                 elif category == "scenes" and isinstance(replacement, dict):
                     line += (
-                        " | scene policy: same scene type with a clearly different "
-                        "layout and details; preserve color tone, composition, camera, "
-                        "shot movement, focal length, and lighting"
+                        " | scene policy: same scene type, use, and layout but a "
+                        "clearly different instance and visible design details; preserve "
+                        "color tone, composition, camera, shot movement, focal length, "
+                        "and lighting"
                     )
                 elif category == "entities" and isinstance(replacement, dict):
                     line += (
                         " | entity policy: preserve function, action interface, scale, "
-                        "contact, and relation semantics"
+                        "contact, and relation semantics; visibly change material, "
+                        "color, breed, outline, structure, or form as specified by target"
                     )
                 lines.append(line)
 

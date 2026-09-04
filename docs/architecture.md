@@ -17,8 +17,9 @@
 5. 可选 MediaKit 处理，先文本擦除、再图标擦除。
 6. 每段 `video-maker` 视觉提示词。
 7. 一次项目级台词翻译和一次 `video-maker` 全局原始对象索引；索引同时接收各段 `visual_prompt` 作为回看九帧的防漏清单，像素仍是唯一视觉事实。
-8. 一次项目级 DeepSeek Object Replace：同时读取原始全局索引、全部逐段视觉提示、目标语言与项目级翻译台词、可选 Image 1 及用户说明，以及当前音色目录；输出绑定稳定 ID 的 replacement/voice patch。
-9. 后端深拷贝原始索引并机械合并 patch；对可用的 `voice_id` 按稳定顺序映射 `Audio N`，生成项目级增强索引和同序的 0–3 条冻结音频。
+8. 后端从 raw stable index 确定性生成 `replacement_set`：`people/entities/scenes` 分别包含本类全部 stable key 并排序；同时生成仅移除这三类记录顶层 `preserve/replaceable` 的模型规划视图，relations 和其他事实不变。
+9. 一次项目级 DeepSeek Object Replace：读取规划视图、`replacement_set`、全部逐段视觉提示、目标语言与项目级翻译台词、可选 Image 1 及用户说明，以及当前音色目录；输出绑定稳定 ID 的 replacement/voice patch。
+10. 后端深拷贝完整 raw index 并机械合并 patch；对可用的 `voice_id` 按稳定顺序映射 `Audio N`，生成项目级增强索引和同序的 0–3 条冻结音频。
 
 只有上述公共输入完成并能传给下游，才启动逐段 R2V 准备。所有片段先并行完成 Fusion、最终提示词和静音 Video 1；随后完成参考图归一化、素材 URL 注册和 Picsart 硬参数预检，才允许发出付费 POST。这些屏障只防止缺文件、供应商参数不合法和半批次付费，不判断模型内容质量。
 
@@ -50,7 +51,9 @@ h3-max-r2v-prompt Skill
 - 逐段阶段用 `VISUAL_PROMPT_SCHEMA` 返回 `{prompt}`，业务层只解包字符串；不设置任意最短长度或内容覆盖门禁。
 - 项目索引阶段接收 `phase`、生效的 `generation_config`，以及按 segment/frame 排序的 `segment_index`、`visual_prompt`、`frame_order`、项目内路径、SHA 和全部分析图片；不接收台词或用户素材。`visual_prompt` 只用于逐项提示模型回看对应九帧，不能替代或推翻像素证据。运行时根据本次请求中的正整数段号构造动态 closed Schema，人物、实体、场景和关系的 occurrence 只能引用这组精确段号，不能输出 `0`、未知段号或自行重新编号。输出 closed 结构后由后端机械分配已有项的稳定 ID，原样写入 `work/element_index.json` 和 `state.element_index`。people/entities/scenes/relations 允许为空，不要求必须识别场景或达到任意集合大小；Object Replace 不回写 raw index。
 
-项目级 `object-replace` Skill 固定使用 DeepSeek，每项目只设一个公共逻辑节点，不按 segment 重复；首次自然执行错误仍受下文“每节点最多两个 attempt”边界约束。其 closed JSON Schema 由 raw index 中已有稳定 ID、音色 ID 集合和输入哈希动态生成，patch 字段中的 `replacement` 与人物 `voice_id` 均允许 `null`。Skill 仍明确要求：人物和场景必须替换，用户提到的物品必须指向 Image 1，其他实体至少替换两个（不足则全部），关系按 `replace_together` 协同，并为人物选择符合特征的音色。人物应在脸型、五官、发型或服装等至少三项形成一眼可辨差异，仅露出手/手臂时至少改变两项可见特征；场景至少形成三项可辨差异，每个额外替换实体至少改变两项轮廓、结构、材质、部件或配件特征。目标描述先写完整新目标，再简短点明可观察差异；当 raw `preserve` 的源外观与新目标冲突时，以新目标为准。这些都是模型生成职责。后端不再逐项判断规则是否完成，不校验人物/场景 replacement 非空、用户目标命中、实体替换数量、关系闭包或声音标签语义。
+项目级 `object-replace` Skill 固定使用 DeepSeek，每项目只设一个公共逻辑节点，不按 segment 重复；首次自然执行错误仍受下文“每节点最多两个 attempt”边界约束。调用前，后端从 raw stable index 确定性生成 `replacement_set={people,entities,scenes}`，每类包含全部 stable key 并排序；送模型的 `global_element_index` 是深拷贝的规划视图，仅移除这三类记录顶层的 `preserve/replaceable`，relations 和其他字段不变。完整 raw index 始终冻结，并在返回 patch 后作为机械合并基底；Fusion 接收的 enhanced index 因而仍包含完整 raw 事实。
+
+closed JSON Schema 由 raw index 中已有稳定 ID、音色 ID 集合和输入哈希动态生成，patch 字段中的 `replacement` 与人物 `voice_id` 均允许 `null`。Skill 自身要求 `replacement_set` 中所有人物、实体和场景输出非空替换，并为人物选择符合特征的音色。同一 stable key 跨图片、分段和 occurrence 使用同一套新设计。Image 1 只约束用户文字唯一语义对应的一个既有 stable key；其他 key 仍各自使用 `generated_variant`，不得因参考图只指向一个元素而停止替换。人物保持索引明确的类型、性别、种族、年龄段、整体风格和服装主色，但更换身份，使人脸或可见身体产生差异；只露出身体局部时，统一改变局部形态、比例、肤色、纹理或标记，不为具体部位写特例；服装保持颜色和风格但改变款式。场景保持类型、用途、布局、色调、构图、机位、镜头运动、焦段和光线，但改成同类不同实例。实体保持功能、动作接口、尺度、接触和相对关系，但改变材质、颜色、品种、轮廓、结构或造型。上述都是模型生成职责；后端只校验结构和输入绑定，不把 replacement 非空、用户目标命中、替换覆盖、关系协同或声音标签语义变成质量门禁。
 
 后端在 patch 结构可读取后深拷贝 raw index 并机械合并：`occurrences`、`preserve`、relations 和原始描述不变，对应记录增加模型给出的 nullable `replacement`，人物增加 nullable `voice`。人物可共用 `voice_id`；后端按稳定人物顺序保留最先出现的最多 3 个不同可用 ID，后续新 ID 稳定降级为 `null`，而不是让项目失败。保留下来的文件依次复制为 `work/voice-references/audio-01.wav` 至 `audio-03.wav` 并写入增强索引。当前仓库附带 30 条 2–5 秒单声道 PCM WAV，但运行时不要求目录恰好 30 条，也不复审年龄、性格等描述是否主观准确；只保留文件可读、媒体可用和供应商最多 3 条参考音频等技术限制。
 

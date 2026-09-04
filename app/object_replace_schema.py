@@ -59,6 +59,26 @@ def _element_ids(
     return result
 
 
+def object_replace_planning_context(
+    element_index: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the model-facing index view and its deterministic replace set."""
+    element_ids = _element_ids(element_index)
+    planning_index = copy.deepcopy(element_index)
+    for category in _ELEMENT_CATEGORIES:
+        for stable_id in element_ids[category]:
+            record = planning_index[category][stable_id]
+            record.pop("preserve", None)
+            record.pop("replaceable", None)
+    return {
+        "global_element_index": planning_index,
+        "replacement_set": {
+            category: sorted(element_ids[category])
+            for category in _ELEMENT_CATEGORIES
+        },
+    }
+
+
 def _catalog_ids(voice_ids: Collection[str]) -> tuple[str, ...]:
     if isinstance(voice_ids, (str, bytes)):
         raise ValueError("object-replace voice catalog is invalid")
@@ -106,6 +126,12 @@ def object_replace_schema(
     if not isinstance(payload, dict):
         raise ValueError("object-replace input is invalid")
     element_ids = _element_ids(payload.get("global_element_index"))
+    expected_replacement_set = {
+        category: sorted(element_ids[category])
+        for category in _ELEMENT_CATEGORIES
+    }
+    if payload.get("replacement_set") != expected_replacement_set:
+        raise ValueError("object-replace replacement set is invalid")
     catalog_ids = _catalog_ids(voice_ids)
     input_sha256 = hashlib.sha256(canonical_input(payload)).hexdigest()
 

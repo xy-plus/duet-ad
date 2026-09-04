@@ -585,6 +585,25 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         "name": "Image 1",
         "sha256": Pipeline._sha256(replacement),
     }
+    raw_object_index = state["element_index"]
+    assert object_replace_call["payload"]["replacement_set"] == {
+        category: sorted(raw_object_index[category])
+        for category in ("people", "entities", "scenes")
+    }
+    planning_index = object_replace_call["payload"]["global_element_index"]
+    assert object_replace_call["payload"]["segment_visual_prompts"] == [
+        {"segment_index": 1, "visual_prompt": "visual-1"},
+        {"segment_index": 2, "visual_prompt": "visual-2"},
+    ]
+    assert planning_index["relations"] == raw_object_index["relations"]
+    for category in ("people", "entities", "scenes"):
+        for stable_id, record in planning_index[category].items():
+            assert "preserve" not in record
+            assert "replaceable" not in record
+            expected = dict(raw_object_index[category][stable_id])
+            expected.pop("preserve", None)
+            expected.pop("replaceable", None)
+            assert record == expected
     assert object_replace_call["images"] == [replacement]
     assert deepseek.events.index("project-index") < deepseek.events.index(
         "object-replace"
@@ -657,6 +676,10 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert index_calls[0]["images"] == expected_index_images
     raw_index = state["element_index"]
     enhanced_index = state["enhanced_element_index"]
+    assert all(
+        call["payload"]["global_element_index"] == enhanced_index
+        for call in fusion_calls
+    )
     assert set(raw_index) == {
         "people", "entities", "scenes", "relations",
     }
@@ -1771,6 +1794,18 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
                     ),
                 },
             },
+            "person-02": {
+                "source_visual_description": "only a forearm is visible",
+                "occurrences": [{"segment_index": 1}],
+                "preserve": ["source hand identity", "source skin texture"],
+                "replacement": {
+                    "source": "generated_variant",
+                    "target_visual_description": (
+                        "a different visible forearm with broader proportions, "
+                        "warmer skin tone, and a small geometric birthmark"
+                    ),
+                },
+            },
         },
         "entities": {
             "entity-01": {
@@ -1837,6 +1872,9 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
     person_line = next(
         line for line in lines if line.startswith("- person-01 | REPLACE |")
     )
+    partial_person_line = next(
+        line for line in lines if line.startswith("- person-02 | REPLACE |")
+    )
     entity_line = next(
         line for line in lines if line.startswith("- entity-01 | REPLACE |")
     )
@@ -1858,8 +1896,19 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
     assert "original haircut" not in person_line
     assert "source role, action, pose, position, and continuity" in person_line
     assert "only explicitly stated gender, race" in person_line
-    assert "visibly different clothing design" in person_line
+    assert "replace with a different identity" in person_line
+    assert "visibly change the face or visible body" in person_line
+    assert "when clothing is visible, change its design" in person_line
     assert "slightly different" not in person_line
+
+    assert "broader proportions" in partial_person_line
+    assert "warmer skin tone" in partial_person_line
+    assert "geometric birthmark" in partial_person_line
+    assert "source hand identity" not in partial_person_line
+    assert "source skin texture" not in partial_person_line
+    assert "different face" not in partial_person_line
+    assert "clothing design" not in partial_person_line
+    assert "do not infer unseen traits" in partial_person_line
 
     assert "the black bear-shaped jewelry case shown in Image 1" in entity_line
     assert "toothbrush form" not in entity_line
@@ -1869,7 +1918,8 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
     assert "original cabinet fronts" not in scene_line
     assert "source scene type, color tone, composition" in scene_line
     assert "camera position and angle, shot movement" in scene_line
-    assert "clearly different layout and details" in scene_line
+    assert "same scene type, use, and layout" in scene_line
+    assert "clearly different instance and visible design details" in scene_line
     assert "slightly different" not in scene_line
 
     assert "hand-painted logo; glazed finish" in keep_line
@@ -1884,6 +1934,82 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
 
     assert "entity-02 rests beside entity-03" in keep_relation_line
     assert "cup logo faces the tray" in keep_relation_line
+
+
+def test_fusion_authority_keeps_image_one_bound_to_its_matching_element() -> None:
+    index = {
+        "people": {
+            "person-01": {
+                "source_visual_description": "the presenter",
+                "occurrences": [
+                    {"segment_index": 1},
+                    {"segment_index": 2},
+                ],
+                "replacement": {
+                    "source": "generated_variant",
+                    "target_visual_description": "one fixed new presenter design",
+                },
+            },
+        },
+        "entities": {
+            "entity-01": {
+                "source_visual_description": "the user-selected cup",
+                "occurrences": [{"segment_index": 1}],
+                "replacement": {
+                    "source": "image_1",
+                    "target_visual_description": "the bear-shaped cup in Image 1",
+                },
+            },
+            "entity-02": {
+                "source_visual_description": "the table lamp",
+                "occurrences": [{"segment_index": 2}],
+                "replacement": {
+                    "source": "generated_variant",
+                    "target_visual_description": "one fixed sculptural brass lamp",
+                },
+            },
+        },
+        "scenes": {
+            "scene-01": {
+                "source_visual_description": "the warm kitchen",
+                "occurrences": [
+                    {"segment_index": 1},
+                    {"segment_index": 2},
+                ],
+                "replacement": {
+                    "source": "generated_variant",
+                    "target_visual_description": "one fixed alternate warm kitchen",
+                },
+            },
+        },
+        "relations": {},
+    }
+
+    first = Pipeline._fusion_authority_block(index, 1)
+    second = Pipeline._fusion_authority_block(index, 2)
+
+    assert "entity-01 | REPLACE" in first
+    assert "reference: Image 1" in first
+    assert "entity-02" not in first
+    assert "Image 1" not in second
+    assert "entity-02 | REPLACE" in second
+    assert "reference: generated variant" in second
+    first_lines = first.splitlines()
+    second_lines = second.splitlines()
+    for stable_id in ("person-01", "scene-01"):
+        first_line = next(
+            line for line in first_lines if line.startswith(f"- {stable_id} |")
+        )
+        second_line = next(
+            line for line in second_lines if line.startswith(f"- {stable_id} |")
+        )
+        assert first_line == second_line
+    for stable_target in (
+        "one fixed new presenter design",
+        "one fixed alternate warm kitchen",
+    ):
+        assert stable_target in first
+        assert stable_target in second
 
 
 def test_node_records_both_failed_attempts_and_process_streams(

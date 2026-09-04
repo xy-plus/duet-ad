@@ -15,6 +15,6 @@ description: 根据原片段描述、Object Replace 增强后的全局对象索�
 2. 当 `replacement.source="image_1"` 时，按冻结目标的外观规划动作与遮挡，但模型主体不写 `Image 1`；后端权威块会明确引用下游收到的 Image 1。没有任何当前元素引用 `image_1` 时，不得暗示存在图片参考。
 3. `replacement=null` 的实体保持原样，不得把它加入替换清单。人物和场景按索引中的非空 replacement 完整执行，不得遗漏。
 4. 对当前片段出现的每个人物，读取其 `voice.audio_reference` 和 `voice.features`；人物到 Audio N 的精确约束由权威块给出。不得交换 Audio 序号，不得把一个人物的音色套给另一个人物。
-5. 保持原片段动作、因果、速度、机位、构图、镜头运动、焦段、光线和转场；同时遵守对象的 `preserve` 与逐帧 `relations`，尤其是 `replace_together=true` 的接口、尺度和功能配合。
+5. 保持原片段动作、因果、速度、机位、构图、镜头运动、焦段、光线和转场，并遵守逐帧 `relations`，尤其是 `replace_together=true` 的接口、尺度和功能配合。对 `replacement` 非 null 的记录，只服从 `authoritative_constraints` 编译出的安全不变量，不得用 raw `preserve` 恢复源身份或外观；raw `preserve` 只直接用于 `replacement=null` 的 KEEP 项。
 6. 原片段在下游模型输入中称为 Video 1。只使用增强索引已经给出的 Image 1 和 Audio N 映射。
 7. 不改写台词。台词和时间窗由后端在你的输出之后机械附加。

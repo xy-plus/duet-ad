@@ -23,7 +23,8 @@
   -> video-maker 逐段视觉描述
   -> 项目级台词翻译
   -> video-maker 项目级原始对象索引：九帧为事实源，逐段 visual_prompt 仅作防漏清单
-  -> 一次项目级 DeepSeek Object Replace：全局索引 + 全部视觉提示 + Image 1/说明 + 当前音色目录
+  -> 后端从 raw 索引生成全 stable-key replacement_set 和去除条目级 preserve/replaceable 的规划视图
+  -> 一次项目级 DeepSeek Object Replace：规划视图 + replacement_set + 全部视觉提示 + Image 1/说明 + 当前音色目录
   -> 后端机械合并增强索引；按可用 voice_id 生成全项目 Audio 1..N（N <= 3）
   -> 第一屏障：所有段并行完成 Fusion、best-effort 约束编译、最终提示词和静音 Video 1
   -> 第二屏障：所有段完成 Image 1 归一化、素材注册和 H3 参数预检
@@ -35,7 +36,9 @@
 
 项目级索引在运行时根据本次请求的正整数段号构造动态 closed Schema；人物、实体、场景和关系的所有 occurrence 只能引用这组精确段号，不能输出 `0`、未知段号或自行重排为另一套编号。`segments[].visual_prompt` 只提示模型回看对应九帧，不是新的视觉事实，也不新增本地语义门禁。
 
-Object Replace Skill 要求人物在脸型、五官、发型或服装等至少三项形成一眼可辨差异，仅露出手/手臂时至少改变两项可见特征；场景至少形成三项可辨差异，每个额外替换实体至少改变两项轮廓、结构、材质、部件或配件特征。`target_visual_description` 先描述完整新目标，再简短点明差异。增强索引仍保存 raw `preserve`，但对 `REPLACE`，Fusion 权威约束只保留动作、功能、尺度、接触、相对位置、运动连续性、机位和光线等类别安全不变量；可能与新目标冲突的源脸、服装款式、物体外观、场景陈设及关系外观描述不会带入。raw `preserve` 仍用于 `KEEP`。这些仍是生成与机械编译规则，不是本地质量门禁。
+Object Replace 调用前，后端从 raw stable index 确定性生成 `replacement_set`：`people/entities/scenes` 分别包含本类全部 stable key 并排序。送模型的 `global_element_index` 是独立规划视图，仅移除这三类记录顶层的 `preserve/replaceable`；relations 和其他事实不变。完整 raw index 继续冻结，并作为机械合并 enhanced index 的基底，使 Fusion 仍能读取完整原始事实和 replacement/voice patch。
+
+Object Replace Skill 要求 `replacement_set` 中每个人物、实体和场景都生成非空替换。同一 stable key 跨图片、分段和 occurrence 使用同一套新设计；Image 1 只约束用户文字唯一语义对应的一个既有 stable key，其他 key 仍使用 `generated_variant`。人物保持明确的类型、性别、种族、年龄段、整体风格和服装主色，但更换身份，使人脸或可见身体产生差异；只露出身体局部时，统一改变局部形态、比例、肤色、纹理或标记，不为具体部位写特例；服装保持颜色和风格但改变款式。场景保持类型、用途、布局、色调、构图、机位、镜头运动、焦段和光线，但改成同类不同实例。实体保持功能、动作接口、尺度、接触和相对关系，但改变材质、颜色、品种、轮廓、结构或造型。增强索引仍保存 raw `preserve`；对 `REPLACE`，Fusion 不带入与新设计冲突的源外观。上述是模型生成职责：Schema/normalizer 仍允许 nullable，后端不以是否完成替换作为失败、拦截或重试条件。
 
 音色目录位于 `/home/xy/duet-ad1-h3-max-r2v/assets/voice-library`。当前随仓库提供 30 条 2–5 秒单声道 PCM WAV；运行时只要求目录中存在可用条目，不把“恰好 30 条”设为门禁，也不复审年龄、性格等标签是否与声音主观相符。Object Replace 每条只接收一行 `voice_id - file - language - gender - 短特征`。Skill 仍负责为人物选择合适音色；后端只消费可用选择，并按稳定人物顺序保留最先出现的最多 3 个不同 `voice_id`，后续新增音色稳定降级为 `null`，再机械映射为 `Audio 1..N`。Picsart 的每个 segment 接收同一份、同一顺序的 0–3 条参考音频。
 

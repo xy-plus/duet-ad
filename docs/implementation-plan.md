@@ -17,7 +17,7 @@
 
 - closed JSON Schema 仅用于 `video-maker` 两阶段、项目级翻译、Object Replace 和 H3 提示词 Fusion 的结构化传输及输入绑定；DeepSeek 走 Responses API 原生 Structured Outputs，不把 Schema 扩展成业务效果门禁。
 - 不检查媒体质量、画面替换成功率、人物一致性、台词准确率、口型、语言、分辨率、码率或成片可播放性。
-- 不因 replacement/voice 为 `null`、对象没有按 Skill 要求替换、普通实体不足两个、关系未闭包、提示词未出现 ID/Image/Audio、空 ASR 或翻译缺行而阻止任务；翻译缺失或空文本回退源文。
+- 不因 replacement/voice 为 `null`、对象没有按 Skill 要求替换、替换覆盖或关系协同不足、提示词未出现 ID/Image/Audio、空 ASR 或翻译缺行而阻止任务；翻译缺失或空文本回退源文。
 - Object Replace 和 Fusion 都使用动态哈希绑定 Schema；本地只检查 JSON 形状、字段类型和绑定。Fusion 的约束块由后端按实际可用字段 best-effort 编译。
 - 只保留使程序能够执行和保护主机所必需的技术边界：登录鉴权、HTTP/JSON/multipart 解析、项目归属、路径穿越、SSRF、命令注入、基础请求体上限、必要媒体可用性、Picsart 硬限制、付费幂等以及进程超时。
 - 文件不存在、命令退出非零、HTTP 请求失败或供应商拒绝属于自然执行错误：记录日志并让任务失败，不包装成质量门禁。
@@ -76,11 +76,12 @@ data/projects/{project_id}/
 8. 每段并行运行 video-maker，生成 `visual_prompt`。
 9. 使用全部片段描述进行一次项目级 DeepSeek 翻译，通过 Responses API 原生 JSON Schema 请求 `lines[{text}]`，按原时间语义回挂到各片段；缺行或空文本回退对应源文。
 10. 显式运行 video-maker 的项目索引阶段，生成 raw `element_index.json`；输入九帧像素及各段 `visual_prompt`，后者只作为回看像素的防漏清单。运行时 Schema 把人物、实体、场景和关系的 occurrence 绑定到本次请求的精确正整数段号，禁止 `0`、未知段号或重新编号；people/entities/scenes/relations 允许为空，不设置集合大小、描述长度或 scene 非空门禁。
-11. 运行一次项目级 DeepSeek Object Replace：输入 raw 索引、全部视觉提示、翻译台词、可选 Image 1/说明和当前音色目录，输出 nullable replacement/voice patch。
-12. 后端机械合并 enhanced 索引；按稳定人物顺序保留最先出现的最多 3 个可用不同音色，更多选择降级为 `null`，生成 0–3 条 `Audio N`。
-13. 所有公共输入可传递后，启动逐段 R2V 准备与执行。
+11. 后端从 raw stable index 确定性生成 `replacement_set={people,entities,scenes}`，每类包含全部 stable key 并排序；同时深拷贝模型规划视图，仅移除这三类记录顶层的 `preserve/replaceable`，relations 和其他字段不变。
+12. 运行一次项目级 DeepSeek Object Replace：输入规划视图、`replacement_set`、全部视觉提示、翻译台词、可选 Image 1/说明和当前音色目录，输出 nullable replacement/voice patch。
+13. 后端以完整 raw index 为基底机械合并 enhanced 索引；按稳定人物顺序保留最先出现的最多 3 个可用不同音色，更多选择降级为 `null`，生成 0–3 条 `Audio N`。Fusion 因而继续读取完整 raw 事实及其 replacement/voice patch。
+14. 所有公共输入可传递后，启动逐段 R2V 准备与执行。
 
-Object Replace Skill 本身仍明确要求：人物和场景都应替换；用户点名的物品应使用 Image 1；其他实体至少替换两个，不足两个则全部替换；`replace_together` 关系应协同；人物应从目录中选择符合性别、口音和特征的音色。人物应在脸型、五官、发型或服装等至少三项形成一眼可辨差异，仅露出手/手臂时至少改变两项可见特征；场景至少形成三项可辨差异，每个额外替换实体至少改变两项轮廓、结构、材质、部件或配件特征。目标描述先写完整新目标，再简短点明差异；raw `preserve` 中与新目标冲突的源外观不约束替换结果。后端不对这些生成职责逐项打分，nullable 输出可直接流向下游。
+Object Replace Skill 本身要求 `replacement_set` 中所有人物、实体和场景输出非空替换，并为人物选择符合特征的音色。同一 stable key 跨图片、分段和 occurrence 使用同一套新设计。Image 1 只约束用户文字唯一语义对应的一个既有 stable key；其他 key 仍使用 `generated_variant`，不能因参考图只指向一个元素而停止替换。人物保持索引明确的类型、性别、种族、年龄段、整体风格和服装主色，但更换身份，使人脸或可见身体产生差异；只露出身体局部时，统一改变局部形态、比例、肤色、纹理或标记，不为具体部位写特例；服装保持颜色和风格但改变款式。场景保持类型、用途、布局、色调、构图、机位、镜头运动、焦段和光线，但改成同类不同实例。实体保持功能、动作接口、尺度、接触和相对关系，但改变材质、颜色、品种、轮廓、结构或造型。后端不对这些生成职责逐项打分；Schema/normalizer 仍允许 nullable，输出可直接流向下游。
 
 每段 R2V 分支：
 
@@ -160,7 +161,7 @@ logs/{node}/{segment_or_project}/attempt-{1|2}/
 - 验证 4.x 秒片段使用供应商 5 秒参数并裁回原时长。
 - 验证 `prompt_expansion_mode` 固定为 `"quality"`，静音视频和可选图片同时传入。
 - 验证用户未提供替换图时仍能执行；nullable replacement/voice 和超过 3 个不同音色都按确定性降级继续。
-- 验证 Object Replace/Fusion 只受 closed 结构和输入绑定约束，不因替换数量、关系闭包或提示词中缺少 ID/Image/Audio 而失败。
+- 验证 Object Replace/Fusion 只受 closed 结构和输入绑定约束，不因替换覆盖、关系协同或提示词中缺少 ID/Image/Audio 而失败。
 - 验证 `REPLACE` 权威约束不带入冲突的源脸、服装款式、物体外观、场景陈设或关系外观描述；`KEEP` 项和两端均未替换的关系仍保留各自 raw 描述。
 - 验证空 ASR 与 YAMNet 无重叠直接继续，翻译缺行或空行回退源文。
 - 验证普通节点的自然错误重试、Picsart 未知提交禁止重投及原始输入输出日志均被记录。
