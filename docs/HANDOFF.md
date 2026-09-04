@@ -159,3 +159,13 @@ patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable rep
 - `resume-pre-picsart` 可为缺少 enhanced 字段的历史失败项目重建新公共屏障；`resume-picsart` 只使用冻结 prompt/媒体，新的空 `voice_references` 不得回退到旧音频，而字段缺失的旧单音频项目仍可恢复。
 
 非空 `client_request_id` 已实现持久化创建幂等：绑定规范化请求与实际输入文件摘要；同键同输入返回原项目且不重启流水线，同键异输入返回 `409`，索引无法可信读取时以 `503` 停止创建。当前完整离线测试为 `251 passed, 1 warning`，两个 Skill 均通过 `quick_validate.py`。本文此处仍只记录发布前工作树验证；部署与真实供应商 E2E 结论应在执行后以运行态证据补充。
+
+## 2026-09-04 部署与真实 E2E
+
+提交 `0bc1d24` 已部署到 3301 实例。3301 的 Caddy 反向代理到本机 3302 后端；部署后后端与 Caddy 均保持 `active/running`，`NRestarts=0`。3213 仍是独立的原 `duet-ad1` 实例，未被本次部署改动。
+
+真实 A→B 测试从 3213 成功项目 `5607f61caeac41bf8168354187aa2599` 取得源视频、参考图和冻结请求配置，并以 multipart 上传到 3301。源视频是 16.95 秒、720×1280、30 fps、带 AAC 音轨的真实狗狗梳理画面，SHA-256 为 `6c55df6dcbcac2314f19b9c7d0cc4adb6bf73b7d63da5fa7ac15580cc1188cd4`；用户说明为“把视频中的狗替换成图片里的狗”。请求使用 9:16、480p、fit auto、中文自动改写，并开启图片优化、去标识和去字幕。
+
+3301 新项目 `beebc22c68dd4b5fb934552a1dee944b` 从 queued 一次运行至 succeeded，没有调用任何 resume。两段均只有 `attempt-1`，每段各有且仅有一个 accepted Picsart submit receipt，没有第二次付费 POST。Object Replace、两段 Fusion、音色物化、Picsart poll/download/trim 和最终 stitch 均完成。
+
+最终 `output/generated.mp4` 为 H.264 480×832、24 fps，带 AAC 48 kHz 双声道音频，时长 16.957683 秒，大小 1,743,355 字节，SHA-256 为 `409e8a71928681a8f3e77fd812063baaa7d6b18a365883527c598c1385a919fb`。全量 ffmpeg 解码成功；3301 公网下载返回 `video/mp4`，Range 请求为 206，完整下载字节数与 SHA-256 均和本地成品一致。两段抽帧均为连贯的真实狗狗梳理场景，白色犬只替换贯穿两段，不是色卡、空白或测试占位视频。
