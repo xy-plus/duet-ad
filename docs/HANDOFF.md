@@ -13,7 +13,8 @@
 - 本轮实现已写入本仓库工作树；源仓库 `/home/xy/duet-ad1` 没有被修改。
 - 3301 前端入口和 3302 内部后端已由 user systemd 单元运行，Caddy 使用现有公网证书。
 - DeepSeek、MediaKit 和 Picsart 已接通运行配置；完整真实链路已经生成并拼接最终视频。
-- 2026-09-04 按后续需求把 `h3-max-r2v-prompt` Fusion 改为 Codex/DeepSeek 可切换：新项目默认 Codex，固定通过 `codex-acct acct2` 使用 `gpt-5.6-sol`、reasoning `low`；历史项目无选择字段时仍使用 DeepSeek。
+- 2026-09-04 最新要求把新项目 Fusion 切回 DeepSeek：选择只在后端配置，前端和公开 capability/request 不再暴露模型切换；客户端夹带的 `fusion` 会被服务端内部值覆盖，历史项目原冻结值仍可续跑。
+- 所有 DeepSeek 请求显式开启 thinking，不发送供应商级 `max_tokens`；video-maker 两阶段、项目级翻译和 DeepSeek Fusion 均通过 strict `submit_result` 传输并由本地再次校验。
 - 实测项目 `8b50222f84f94220b92b0255d3c64a36` 已成功：两段 Advanced workflow 任务均完成，最终文件为 `/home/xy/duet-ad1-h3-max-r2v/data/projects/8b50222f84f94220b92b0255d3c64a36/output/generated.mp4`。
 
 ## 已实现链路
@@ -30,7 +31,7 @@
   -> 一次项目级台词翻译并按时间交集回挂
   -> 一次 video-maker 项目级全局对象索引
   -> 公共输入屏障
-  -> 每段并行：Codex/DeepSeek Fusion -> 静音原片段 -> Picsart H3 Max R2V
+  -> 每段并行：内部 Fusion -> 静音原片段 -> Picsart H3 Max R2V
   -> 供应商片段裁回原时长并统一为 24 fps
   -> 按原顺序合并 output/generated.mp4
 ```
@@ -93,7 +94,7 @@
 
 ## video-maker 之后
 
-项目级 DeepSeek 翻译读取 spoken 台词和所有逐段视觉描述，保持原行顺序；后端再按原时间语义把翻译台词切回每个 segment。
+项目级 DeepSeek 翻译读取 spoken 台词和所有逐段视觉描述，通过 closed strict Schema 返回与输入等长的 `lines[{text}]`；后端再校验条数、字段和非空文本，并按原时间语义把翻译台词切回每个 segment。
 
 新增 `skills/h3-max-r2v-prompt/SKILL.md` 每段执行一次，输入：
 
@@ -103,7 +104,7 @@
 - 可选用户替换图片。
 - 可选用户替换说明。
 
-Codex 和 DeepSeek 共用动态 closed JSON Schema：固定 `schema/version`，并把 `input_sha256/segment_index` 绑定到本次输入，只允许模型填写非空 `prompt`。Codex 通过 CLI `--output-schema`，DeepSeek 通过 strict `submit_result`；后端仍执行同一份本地二次校验并解包提示词。提示词要求优先执行用户替换；其余人物换为同性别、种族和整体风格但脸略有不同、服装同色同风格但款式略变的新人物；场景换为同类别同风格但不同布局和细节的同类场景；动作、机位、构图、运动、焦段、光线和转场保持不变。
+内部 Codex 和 DeepSeek 实现共用动态 closed JSON Schema：固定 `schema/version`，并把 `input_sha256/segment_index` 绑定到本次输入，只允许模型填写非空 `prompt`。当前新项目由后端固定选择 DeepSeek，通过 strict `submit_result` 提交；Codex 仅保留为内部配置和历史冻结项目兼容，不向用户显示。后端仍执行同一份本地二次校验并解包提示词。提示词要求优先执行用户替换；其余人物换为同性别、种族和整体风格但脸略有不同、服装同色同风格但款式略变的新人物；场景换为同类别同风格但不同布局和细节的同类场景；动作、机位、构图、运动、焦段、光线和转场保持不变。
 
 Codex 路径移植自 `/home/xy/duet-ad1` 最后一版稳定 Codex Fusion 提交 `fecbfdc5103117ef2a71f764ba0f3eb60458917c` 的隔离原则：独立 `/tmp` stage、bwrap 遮蔽当前 checkout、stage 输入只读、环境秘密变量剔除、agent shell 断网、进程组硬超时、唯一有界输出。账号/模型配置则按本项目后续需求固定为 `acct2 / gpt-5.6-sol / low`。
 
@@ -143,7 +144,7 @@ Codex 路径移植自 `/home/xy/duet-ad1` 最后一版稳定 Codex Fusion 提交
 
 ## 验证与剩余事项
 
-已完成离线测试，覆盖前端合同、API、SSRF/路径归属、供应商 MockTransport、研究日志、固定 Master 媒体算法、MiniMax 图片尺寸/比例归一化、签名素材 `GET/HEAD`、YAMNet、video-maker 两阶段、公共屏障、逐段并行、Codex/DeepSeek Fusion selector、动态 Schema 绑定、受控续跑、Picsart 重试和 4.x 秒裁回。当前结果：`160 passed, 1 warning`；唯一 warning 是 FastAPI TestClient 引入的 Starlette/httpx 弃用提示。
+已完成离线测试，覆盖前端合同、API、SSRF/路径归属、供应商 MockTransport、研究日志、固定 Master 媒体算法、MiniMax 图片尺寸/比例归一化、签名素材 `GET/HEAD`、YAMNet、video-maker 两阶段、翻译 strict Schema、公共屏障、逐段并行、内部 Fusion 冻结、动态 Schema 绑定、受控续跑、Picsart 重试和 4.x 秒裁回。当前结果：`164 passed, 1 warning`；唯一 warning 是 FastAPI TestClient 引入的 Starlette/httpx 弃用提示。
 
 Codex 已完成不触发 Picsart 的真实冒烟：均经 `codex-acct acct2` 使用 Sol/low；无图输入返回 250 字符提示词，带既有参考图输入返回 372 字符提示词并正确引用 `Image 1`，`input_sha256` 均通过本地绑定校验。另在与生产单元相同的 `NoNewPrivileges/LockPersonality/RestrictSUIDSGID/RestrictAddressFamilies` 下验证成功；首次等价测试暴露 systemd PATH 不含用户 bin，固定子进程 PATH 后复测返回 222 字符提示词并通过 Schema 绑定。
 

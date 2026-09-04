@@ -280,7 +280,7 @@ class DeepSeekClient:
             "model": self.settings.deepseek_model,
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.2,
-            "max_tokens": 8192,
+            "thinking": {"type": "enabled"},
         }
         if structured:
             request.update(
@@ -296,7 +296,6 @@ class DeepSeekClient:
                 ],
                 temperature=0,
                 stream=False,
-                thinking={"type": "disabled"},
             )
             request["tools"] = [
                 {

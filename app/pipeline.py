@@ -34,6 +34,22 @@ VIDEO_SKILL = Path(__file__).resolve().parents[1] / "skills" / "video-maker" / "
 R2V_SKILL = Path(__file__).resolve().parents[1] / "skills" / "h3-max-r2v-prompt" / "SKILL.md"
 SAME_AS_SOURCE_LANGUAGE = "与原视频相同"
 MASTER_EMPTY_ASR_SIGNAL = 51 / 256
+TRANSLATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "lines": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["lines"],
+    "additionalProperties": False,
+}
 
 
 class Pipeline:
@@ -1333,55 +1349,50 @@ class Pipeline:
     ) -> ProviderResult[Any]:
         if not lines:
             return ProviderResult(
-                value=[],
+                value={"lines": []},
                 record={"outcome": "skipped", "reason": "no_spoken_dialogue"},
                 evidence_media=[],
             )
         if target_language == SAME_AS_SOURCE_LANGUAGE:
             return ProviderResult(
-                value=[dict(line) for line in lines],
+                value={
+                    "lines": [{"text": str(line["text"])} for line in lines],
+                },
                 record={"outcome": "skipped", "reason": "same_language"},
                 evidence_media=[],
             )
         instruction = (
             f"把台词翻译并自然改写为{target_language}。保持输入行顺序；"
-            "只返回 JSON 对象 {\"lines\":[{\"text\":\"...\"}]}，"
-            "lines 每项只含 text。不要输出 Markdown。"
+            "输出行数必须与输入完全一致，lines 每项只含非空 text。"
+            "通过唯一一次 submit_result 函数调用提交完整结果。"
             "视频描述仅用于语境。"
         )
-        return self.deepseek.complete(
+        return self.deepseek.complete_structured(
             instruction,
             {"lines": lines, "video_prompts": visual_prompts},
-            json_mode=True,
+            TRANSLATION_SCHEMA,
         )
 
     @staticmethod
     def _normalize_translation(
         value: Any, source_lines: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        if isinstance(value, list) and all(isinstance(line, dict) for line in value):
-            return [dict(line) for line in value]
-        if not isinstance(value, str):
-            raise ValueError("translation response is not JSON text")
-        content = value.strip()
-        if content.startswith("```json"):
-            content = content[len("```json"):]
-        elif content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        parsed = json.loads(content.strip())
-        if isinstance(parsed, dict):
-            parsed = parsed.get("lines")
-        if not isinstance(parsed, list):
-            raise ValueError("translation response must contain a lines array")
+        if not isinstance(value, dict) or set(value) != {"lines"}:
+            raise ValueError("translation response must be a closed object")
+        parsed = value["lines"]
+        if not isinstance(parsed, list) or len(parsed) != len(source_lines):
+            raise ValueError("translation line count must match the source")
         translated: list[dict[str, Any]] = []
         for index, source in enumerate(source_lines):
-            candidate = parsed[index] if index < len(parsed) else None
-            text = candidate.get("text") if isinstance(candidate, dict) else None
+            candidate = parsed[index]
+            if not isinstance(candidate, dict) or set(candidate) != {"text"}:
+                raise ValueError("translation line must contain only text")
+            text = candidate["text"]
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("translation text must be non-empty")
             translated.append({
                 **source,
-                "text": text if isinstance(text, str) and text else source["text"],
+                "text": text.strip(),
             })
         return translated
 
@@ -1444,8 +1455,8 @@ class Pipeline:
                 fusion_payload,
             )
             configured_fusion = request.get("fusion")
-            # Projects created before the selector existed used DeepSeek.
-            # New requests always freeze an explicit agent at API ingress.
+            # Legacy projects without a frozen internal choice used DeepSeek.
+            # New requests always freeze the server choice at API ingress.
             fusion_agent = (
                 configured_fusion.get("agent")
                 if isinstance(configured_fusion, dict)

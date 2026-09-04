@@ -6,10 +6,12 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from app import media
 from app.config import Settings
 from app.fusion_schema import FUSION_OUTPUT_NAME
-from app.pipeline import Pipeline, SAME_AS_SOURCE_LANGUAGE
+from app.pipeline import Pipeline, SAME_AS_SOURCE_LANGUAGE, TRANSLATION_SCHEMA
 from app.providers import ProviderFailure, ProviderResult
 from app.research_log import ResearchLog
 from app.store import ProjectStore
@@ -105,6 +107,13 @@ class _FlowDeepSeek:
                 },
                 {"response": {"tool": "submit_result", "segment": index}},
             )
+        if schema == TRANSLATION_SCHEMA:
+            with self.lock:
+                self.events.append("translation")
+            return ProviderResult(
+                {"lines": [{"text": "translated line"}]},
+                {"response": {"tool": "submit_result", "phase": "translation"}},
+            )
         assert schema == PROJECT_INDEX_SCHEMA
         with self.lock:
             self.events.append("project-index")
@@ -134,24 +143,6 @@ class _FlowDeepSeek:
             raw,
             {"response": {"tool": "submit_result", "phase": "project_index"}},
         )
-
-    def complete(
-        self,
-        instruction: str,
-        payload: Any,
-        images: list[Path] | None = None,
-        *,
-        json_mode: bool = False,
-    ) -> ProviderResult[str]:
-        del instruction, images
-        if json_mode:
-            with self.lock:
-                self.events.append("translation")
-            return ProviderResult(
-                json.dumps({"lines": [{"text": "translated line"}]}),
-                {"response": {"raw": "translation-response"}},
-            )
-        raise AssertionError("plain DeepSeek completion is translation-only")
 
 
 class _FlowPicsart:
@@ -435,9 +426,16 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         call for call in deepseek.structured_calls
         if "input_sha256" in call["schema"].get("properties", {})
     ]
+    translation_calls = [
+        call for call in deepseek.structured_calls
+        if call["schema"] == TRANSLATION_SCHEMA
+    ]
     assert len(visual_calls) == 2
     assert len(index_calls) == 1
     assert len(fusion_calls) == 2
+    assert len(translation_calls) == 1
+    assert translation_calls[0]["schema"]["additionalProperties"] is False
+    assert translation_calls[0]["schema"]["properties"]["lines"]["items"]["additionalProperties"] is False
     assert sorted(call["payload"]["segment_index"] for call in fusion_calls) == [1, 2]
     assert all(call["schema"]["additionalProperties"] is False for call in fusion_calls)
     assert all(
@@ -471,7 +469,9 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         (project / "logs" / "deepseek-translation" / "project" / "attempt-1" / "output.json").read_text(encoding="utf-8")
     )
     assert translation_output["value"][0]["text"] == "translated line"
-    assert translation_output["provider_record"]["response"]["raw"] == "translation-response"
+    assert translation_output["provider_record"]["response"] == {
+        "tool": "submit_result", "phase": "translation",
+    }
 
     poll_root = project / "logs" / "picsart-poll"
     retry_scopes = [
@@ -692,7 +692,7 @@ def test_same_language_translation_is_an_explicit_skipped_attempt(
     tmp_path: Path,
 ) -> None:
     class NoCallDeepSeek:
-        def complete(self, *_args: Any, **_kwargs: Any) -> ProviderResult[str]:
+        def complete_structured(self, *_args: Any, **_kwargs: Any) -> ProviderResult[Any]:
             raise AssertionError("same-language translation must not call DeepSeek")
 
     store = ProjectStore(tmp_path / "projects")
@@ -730,6 +730,23 @@ def test_same_language_translation_is_an_explicit_skipped_attempt(
     }
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert '"event": "node_skipped"' in trace
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ({"lines": []}, "line count"),
+        ({"lines": [{"text": "translated", "extra": True}]}, "only text"),
+        ({"lines": [{"text": "   "}]}, "non-empty"),
+        ({"lines": [{"text": "translated"}], "extra": True}, "closed object"),
+    ],
+)
+def test_translation_strict_result_is_locally_validated(
+    value: Any, message: str,
+) -> None:
+    source = [{"text": "原文", "start_s": 0.0, "end_s": 1.0}]
+    with pytest.raises(ValueError, match=message):
+        Pipeline._normalize_translation(value, source)
 
 
 def test_no_audio_skips_audio_analysis_without_creating_fake_media(

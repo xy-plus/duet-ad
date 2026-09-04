@@ -9,7 +9,6 @@ const COMPOSER_SNAPSHOTS_KEY = "cvs_minimal_creation_snapshots_v1";
 const POLL_MS = 2000;
 const GENERATION_ASPECT_RATIOS = Object.freeze(["16:9", "9:16"]);
 const GENERATION_RESOLUTIONS = Object.freeze(["480p", "768p"]);
-const FUSION_AGENTS = Object.freeze(["codex", "deepseek"]);
 const MINIMAL_CREATION_VERSION = 1;
 const TARGET_LANGUAGE_MAX_CHARS = 80;
 const SAME_AS_SOURCE_LANGUAGE = "与原视频相同";
@@ -222,7 +221,6 @@ function normalizeMinimalCreationCapability(payload) {
   const capability = payload && payload.minimal_creation;
   const dialogue = capability && capability.dialogue;
   const replacement = capability && capability.replacement;
-  const fusion = capability && capability.fusion;
   const defaults = capability && capability.defaults;
   if (!capability || capability.supported !== true
       || capability.version !== MINIMAL_CREATION_VERSION
@@ -242,10 +240,6 @@ function normalizeMinimalCreationCapability(payload) {
       || !hasExactKeys(dialogue, ["mode", "translation"])
       || dialogue.mode !== "auto_rewrite"
       || dialogue.translation !== true
-      || !hasExactKeys(fusion, ["agents", "default_agent"])
-      || !Array.isArray(fusion.agents)
-      || fusion.agents.join("|") !== FUSION_AGENTS.join("|")
-      || !FUSION_AGENTS.includes(fusion.default_agent)
       || !replacement || replacement.supported !== true
       || !Array.isArray(replacement.accept)
       || replacement.accept.join("|") !== REPLACEMENT_IMAGE_TYPES.join("|")
@@ -261,10 +255,6 @@ function normalizeMinimalCreationCapability(payload) {
     dialogue: {
       mode: dialogue.mode,
       translation: dialogue.translation,
-    },
-    fusion: {
-      agents: fusion.agents.slice(),
-      default_agent: fusion.default_agent,
     },
     replacement: {
       accept: replacement.accept.slice(),
@@ -282,7 +272,6 @@ function buildMinimalGenerationRequest(input, capability) {
   const targetLanguage = String(input && input.targetLanguage || "").trim();
   const hasReplacementImage = !!(input && input.hasReplacementImage);
   const replacementInstruction = String(input && input.replacementInstruction || "").trim();
-  const fusionAgent = String(input && input.fusionAgent || "");
   if (!normalized.aspect_ratios.includes(aspectRatio)) throw new Error("请选择画幅");
   if (!normalized.resolutions.includes(resolution)) throw new Error("请选择清晰度");
   if (!targetLanguage) throw new Error("请填写目标语言");
@@ -292,9 +281,6 @@ function buildMinimalGenerationRequest(input, capability) {
   }
   if (replacementInstruction.length > normalized.replacement.max_instruction_chars) {
     throw new Error("替换说明内容过长");
-  }
-  if (!normalized.fusion.agents.includes(fusionAgent)) {
-    throw new Error("请选择提示词融合 Agent");
   }
   return {
     version: MINIMAL_CREATION_VERSION,
@@ -308,7 +294,6 @@ function buildMinimalGenerationRequest(input, capability) {
       mode: "auto_rewrite",
       target_language: targetLanguage,
     },
-    fusion: {agent: fusionAgent},
     replacement_guidance: hasReplacementImage ? {
       instruction: replacementInstruction,
       image_field: normalized.replacement_image_field,
@@ -461,9 +446,6 @@ function projectComposerModel(detail, localDraft = null) {
       || !dialogue.target_language.trim()) return null;
   const input = resolveCreationInputSnapshot(value, localDraft && localDraft.input);
   const guidance = request.replacement_guidance;
-  const fusion = request.fusion;
-  const fusionAgent = fusion && FUSION_AGENTS.includes(fusion.agent)
-    ? fusion.agent : "deepseek";
   const receiptReplacement = value.input_receipt
     && value.input_receipt.replacement_image;
   const replacementUsed = !!guidance || !!receiptReplacement;
@@ -476,7 +458,6 @@ function projectComposerModel(detail, localDraft = null) {
       ? "" : dialogue.target_language.trim(),
     replacementInstruction: guidance && typeof guidance.instruction === "string"
       ? guidance.instruction : "",
-    fusionAgent,
     source: input && input.source,
     replacementImage: input && input.replacement_image
       ? input.replacement_image
@@ -1217,7 +1198,7 @@ function operationTimeline(detail, nowMs = Date.now()) {
       ),
     },
     {
-      key: "fusion", label: "Prompt Fusion",
+      key: "fusion", label: "提示词整理",
       ...stageState(
         fusion && fusion.status === "done" ? "done"
           : fusion && fusion.status === "running" ? "running"
@@ -1226,8 +1207,8 @@ function operationTimeline(detail, nowMs = Date.now()) {
                 : generation ? "skipped" : "waiting",
         fusion && fusion.status === "done" ? "最终提示词已冻结"
           : fusion && fusion.status === "running" ? "正在融合逐段提示词"
-            : fusion && fusion.status === "failed" ? safeErrorSummary(fusion.error, "Prompt Fusion 失败")
-              : fusion ? "等待融合" : "当前项目未公开 Fusion 状态",
+            : fusion && fusion.status === "failed" ? safeErrorSummary(fusion.error, "提示词整理失败")
+              : fusion ? "等待整理" : "当前项目未公开提示词整理状态",
         fusionSegments.length > 0 ? `${fusionDone}/${fusionSegments.length} 段` : "",
       ),
     },
@@ -1250,7 +1231,7 @@ function operationTimeline(detail, nowMs = Date.now()) {
       ),
     },
     {
-      key: "h3", label: "H3 生成",
+      key: "h3", label: "视频生成",
       ...stageState(
         generation && ["stitch", "stitching"].includes(generationStage) ? "done"
           : generationStatus === "succeeded" || detail.has_video === true ? "done"
@@ -1262,7 +1243,7 @@ function operationTimeline(detail, nowMs = Date.now()) {
         generationStatus === "submission_unknown" ? "供应商是否接单未知，禁止重复提交"
           : generationStatus === "resume_required" ? "继续原任务不会创建新请求"
             : generationStatus === "failed" && !["stitch", "stitching"].includes(generationStage)
-              ? safeErrorSummary(generation.error, "H3 生成失败")
+              ? safeErrorSummary(generation.error, "视频生成失败")
               : generation ? "逐段生成视频" : "等待生成任务",
         h3Total > 0 ? `${h3Done}/${h3Total} 段` : "",
       ),
@@ -2483,8 +2464,8 @@ async function submitGeneration(detail, card) {
 
 function generationStageText(stage) {
   if (stage === "context_ir" || stage === "context_ir_native") return "Context IR 提示词优化";
-  if (stage === "prompt_fusion") return "Prompt Fusion 最终提示词融合";
-  if (stage === "h3") return "H3 分段视频生成";
+  if (stage === "prompt_fusion") return "最终提示词整理";
+  if (stage === "h3") return "分段视频生成";
   if (stage === "stitch") return "视频拼接";
   if (stage === "stitching") return "视频拼接";
   return stage ? "服务器阶段：" + String(stage) : "等待开始";
@@ -2543,7 +2524,7 @@ function renderIntermediateStages(detail) {
     const card = el("article", "intermediate-card");
     const fusionStage = timeline.stages.find((stage) => stage.key === "fusion");
     const heading = el("div", "intermediate-heading");
-    heading.appendChild(el("strong", null, "Prompt Fusion"));
+    heading.appendChild(el("strong", null, "提示词整理"));
     heading.appendChild(el("span", `stage-pill status-${fusionStage.status}`,
       fusionStage.count || stageStatusText(fusionStage.status)));
     card.appendChild(heading);
@@ -4632,11 +4613,6 @@ function selectedResolution() {
   return checked ? checked.value : "";
 }
 
-function selectedFusionAgent() {
-  const checked = document.querySelector('input[name="fusion-agent"]:checked');
-  return checked ? checked.value : "";
-}
-
 function dialogueMode() {
   const checked = document.querySelector('input[name="dialogue-mode"]:checked');
   return checked ? checked.value : "auto";
@@ -4671,12 +4647,6 @@ async function loadMinimalCreationCapability() {
     if (normalized) {
       $("replacement-instruction").maxLength = normalized.replacement.max_instruction_chars;
       $("replacement-image-input").accept = normalized.replacement.accept.join(",");
-      if (!state.viewingSubmittedConfig) {
-        const fusionControl = document.querySelector(
-          `input[name="fusion-agent"][value="${normalized.fusion.default_agent}"]`
-        );
-        if (fusionControl) fusionControl.checked = true;
-      }
     }
   } catch (error) {
     if (handleAuthError(error)) return;
@@ -4731,8 +4701,7 @@ function updateSendBtn() {
     || state.replacementImage.size <= state.minimalCreationCapability.replacement.max_bytes;
   const configReady = GENERATION_ASPECT_RATIOS.includes(selectedAspectRatio())
     && GENERATION_RESOLUTIONS.includes(selectedResolution())
-    && !!state.minimalCreationCapability
-    && state.minimalCreationCapability.fusion.agents.includes(selectedFusionAgent());
+    && !!state.minimalCreationCapability;
   $("send-btn").disabled = state.uploading || state.viewingSubmittedConfig
     || !state.minimalCreationCapability
     || !ready || !langReady || !replacementReady
@@ -4861,7 +4830,7 @@ function prepareComposerForProjectLoad() {
   resetReplacementImageDisplay();
   $("replacement-instruction").value = "";
   document.querySelectorAll(
-    'input[name="aspect-ratio"], input[name="resolution"], input[name="fusion-agent"], input[name="target-language-mode"]'
+    'input[name="aspect-ratio"], input[name="resolution"], input[name="target-language-mode"]'
   ).forEach((control) => { control.checked = false; });
   $("lang-input").value = "";
   setComposerError(null);
@@ -4939,7 +4908,7 @@ function applyProjectComposer(detail) {
     if (preservedPreview) URL.revokeObjectURL(preservedPreview);
     showUnavailableSource("历史项目未保存来源信息");
     document.querySelectorAll(
-      'input[name="aspect-ratio"], input[name="resolution"], input[name="fusion-agent"], input[name="target-language-mode"]'
+      'input[name="aspect-ratio"], input[name="resolution"], input[name="target-language-mode"]'
     ).forEach((control) => { control.checked = false; });
     $("lang-input").value = "";
     setComposerError("该历史项目未保存创建配置，无法恢复原选项");
@@ -4952,11 +4921,9 @@ function applyProjectComposer(detail) {
   const aspect = document.querySelector(`input[name="aspect-ratio"][value="${model.aspectRatio}"]`);
   const resolution = document.querySelector(`input[name="resolution"][value="${model.resolution}"]`);
   const language = document.querySelector(`input[name="target-language-mode"][value="${model.languageMode}"]`);
-  const fusion = document.querySelector(`input[name="fusion-agent"][value="${model.fusionAgent}"]`);
   if (aspect) aspect.checked = true;
   if (resolution) resolution.checked = true;
   if (language) language.checked = true;
-  if (fusion) fusion.checked = true;
   $("lang-input").value = model.targetLanguage;
   $("replacement-instruction").value = model.replacementInstruction;
   setComposerError(null);
@@ -5013,9 +4980,6 @@ function resetComposerForNewProject() {
   document.querySelector('input[name="source-mode"][value="link"]').checked = true;
   document.querySelector('input[name="aspect-ratio"][value="9:16"]').checked = true;
   document.querySelector('input[name="resolution"][value="768p"]').checked = true;
-  const defaultFusion = state.minimalCreationCapability
-    && state.minimalCreationCapability.fusion.default_agent || "codex";
-  document.querySelector(`input[name="fusion-agent"][value="${defaultFusion}"]`).checked = true;
   document.querySelector('input[name="target-language-mode"][value="same"]').checked = true;
   $("lang-input").value = "";
   state.clientRequestId = newRequestId();
@@ -5044,7 +5008,7 @@ function setUploading(on) {
   document.querySelectorAll('input[name="target-language-mode"]').forEach((r) => {
     r.disabled = controlsDisabled;
   });
-  document.querySelectorAll('input[name="aspect-ratio"], input[name="resolution"], input[name="fusion-agent"]').forEach((r) => {
+  document.querySelectorAll('input[name="aspect-ratio"], input[name="resolution"]').forEach((r) => {
     r.disabled = controlsDisabled;
   });
   syncTargetLanguageControls();
@@ -5112,7 +5076,6 @@ async function handleSend(event) {
     generationRequest = buildMinimalGenerationRequest({
       aspectRatio: selectedAspectRatio(),
       resolution: selectedResolution(),
-      fusionAgent: selectedFusionAgent(),
       targetLanguage: selectedTargetLanguage(),
       hasReplacementImage: !!state.replacementImage,
       replacementInstruction: $("replacement-instruction").value,
@@ -5245,7 +5208,7 @@ function bindEvents() {
     radio.addEventListener("change", () => setSourceMode(radio.value));
   });
 
-  document.querySelectorAll('input[name="aspect-ratio"], input[name="resolution"], input[name="fusion-agent"]').forEach((control) => {
+  document.querySelectorAll('input[name="aspect-ratio"], input[name="resolution"]').forEach((control) => {
     control.addEventListener("change", () => {
       state.clientRequestId = newRequestId();
       setComposerError(null);

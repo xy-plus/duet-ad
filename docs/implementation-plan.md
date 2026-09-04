@@ -1,6 +1,6 @@
 # MiniMax H3 Max R2V 研究版后端实施计划
 
-> 2026-09-04 后续需求覆盖：原计划“不迁移 video-prompt-fusion、不为新节点使用 JSON Schema”的边界不再适用于 `h3-max-r2v-prompt` 节点。该节点现支持 Codex/DeepSeek 两种执行器，新项目默认 `codex-acct acct2 + gpt-5.6-sol + low`，两路共用动态绑定输入哈希和段号的 closed JSON Schema；其他上游节点、媒体语义和质量边界不变。
+> 2026-09-04 最新需求覆盖：新项目 Fusion 由后端内部固定选择 DeepSeek，前端和公开 API 不提供模型切换；客户端 `fusion` 输入不能覆盖服务端配置。所有 DeepSeek 请求开启 thinking 且不发送 `max_tokens`，项目级翻译也改为 closed strict Schema。Codex 实现仅保留内部配置和历史冻结项目兼容。原计划“不为新节点使用 JSON Schema”的边界已被后续需求覆盖；其他上游节点、媒体语义和质量边界不变。
 
 ## 总结
 
@@ -15,10 +15,10 @@
 
 明确写入 README、架构文档和代码注释：
 
-- 除固定 Master `video-maker` 两阶段自身的 strict `submit_result` 合同外，不增加任何质量门禁、业务参数校验、模型输出校验或输入输出 schema 校验。
+- strict Schema 仅用于固定 Master `video-maker` 两阶段、项目级翻译和 H3 提示词 Fusion 的结构化传输；不把它扩展成媒体质量或业务效果门禁。
 - 不检查媒体质量、画面替换成功率、人物一致性、台词准确率、口型、语言、分辨率、码率或成片可播放性。
 - 不因缺少索引项、对象映射不唯一、时长偏差或提示词质量问题阻止任务；仅当固定 `video-maker` 的既有结构化响应无法解析时按自然执行错误处理。
-- 不为新节点实现 JSON Schema，也不实现哈希回执、CAS、幂等冲突、恢复状态机或质量型重试；`video-maker` 只保留原有两个 Schema。
+- H3 提示词 Fusion 使用动态哈希/段号绑定 Schema，翻译使用 closed `lines[{text}]` Schema；除此之外不增加 CAS、幂等冲突、旧恢复状态机或质量型重试。
 - 只保留使程序能够执行和保护主机所必需的技术边界：登录鉴权、HTTP/JSON/multipart 解析、项目归属、路径穿越、SSRF、命令注入、基础请求体上限、供应商必填字段组装以及进程超时。
 - 文件不存在、命令退出非零、HTTP 请求失败或供应商拒绝属于自然执行错误：记录日志并让任务失败，不包装成质量门禁。
 - 现有严格版后端合同文档全部改写为研究版合同；前端要求的固定响应形状仅用于兼容 UI，不视为模型质量校验。
@@ -71,19 +71,19 @@ data/projects/{project_id}/
 6. 每段确定性选取 9 张关键帧。
 7. 按前端请求调用 MediaKit 去字幕/品牌处理。
 8. 每段并行运行 video-maker，生成 `visual_prompt`。
-9. 使用全部片段描述进行一次项目级 DeepSeek 翻译，并按原时间语义回挂到各片段。
+9. 使用全部片段描述进行一次项目级 DeepSeek 翻译，通过 strict `submit_result` 返回等长 `lines[{text}]`，本地校验后按原时间语义回挂到各片段。
 10. 显式运行 video-maker 的项目索引阶段，生成 `element_index.json`；它仍属于 video-maker，不新增同类业务节点。
 11. 在所有公共输入准备完成后，启动每段一个并行 R2V 分支。
 
 每段 R2V 分支：
 
-1. 新增一个独立 DeepSeek Skill，输入：
+1. 新增一个由后端内部选择执行器的 Skill；当前部署使用 DeepSeek，输入：
    - 本段 `visual_prompt`
    - 完整全局 `element_index`
    - 本段本地化后的翻译台词及相对时间
    - 可选用户替换图片
    - 可选用户替换说明
-2. Skill 输出纯文本 R2V 提示词，规则固定为：
+2. Skill 通过动态绑定本段输入哈希和段号的 closed Schema 输出 R2V 提示词，后端解包 `prompt`，规则固定为：
    - 优先描述用户指定替换的对象、目标和替换方式。
    - 对本段出现且用户未点名的人物：替换为同性别、种族和整体风格，脸略有不同；服装保持颜色和风格但款式稍有变化的新人物。
    - 对场景：保持场景类别和整体风格，但改成不重复的同类地点或布局。
@@ -164,7 +164,7 @@ logs/{node}/{segment_or_project}/attempt-{1|2}/
 
 - 使用 Python 3.12、FastAPI、Uvicorn、httpx、OpenCV、NumPy、PySceneDetect、LiteRT、ffmpeg/ffprobe、本地 whisper-cli 和 `ggml-small`。
 - DeepSeek 默认使用当前链路的 `deepseek-v4-flash-vision-exp`，新仓库自行读取配置，不依赖源仓库运行目录。
-- 不迁移 image-postprocess、video-prompt-fusion、Context IR、旧 H3 后端和旧恢复框架。
+- 不迁移 image-postprocess、Context IR、旧 H3 后端和旧恢复框架；仅保留满足当前内部 Fusion 与历史项目兼容所需的 Codex 执行器。
 - 不实现旧前端中不可达的 `/submit`、提示词编辑、后处理和手工重试接口。
 - 默认同时启动全部片段任务，不增加业务并发门禁；HTTP 连接池和操作系统资源限制保持库默认行为。
 - `PUBLIC_BASE_URL` 必须是 Picsart 可以访问的公网地址。

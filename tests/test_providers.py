@@ -52,6 +52,8 @@ def test_deepseek_complete_uses_canonical_url_json_mode_and_preserves_record(
         assert request.headers["authorization"] == "Bearer deepseek-secret"
         body = json.loads(request.content)
         assert body["response_format"] == {"type": "json_object"}
+        assert body["thinking"] == {"type": "enabled"}
+        assert "max_tokens" not in body
         assert body["messages"][0]["content"][1]["image_url"]["url"].startswith(
             "data:image/png;base64,"
         )
@@ -107,6 +109,8 @@ def test_deepseek_structured_uses_beta_strict_submit_result(tmp_path: Path) -> N
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == httpx.URL("https://deepseek.test/beta/chat/completions")
         body = json.loads(request.content)
+        assert body["thinking"] == {"type": "enabled"}
+        assert "max_tokens" not in body
         assert body["tools"] == [
             {
                 "type": "function",

@@ -21,7 +21,7 @@ class Settings:
     deepseek_api_key: str = ""
     deepseek_api_base: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash-vision-exp"
-    fusion_agent: str = "codex"
+    fusion_agent: str = "deepseek"
     codex_timeout_s: float = 1800.0
     codex_concurrency: int = 10
     mediakit_api_key: str = ""
@@ -118,7 +118,7 @@ def get_settings() -> Settings:
         ),
         deepseek_api_base=os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com").rstrip("/"),
         deepseek_model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash-vision-exp"),
-        fusion_agent=os.environ.get("FUSION_AGENT", "codex").strip().lower(),
+        fusion_agent=os.environ.get("FUSION_AGENT", "deepseek").strip().lower(),
         codex_timeout_s=float(os.environ.get("CODEX_TIMEOUT_S", "1800")),
         codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),
         mediakit_api_key=os.environ.get("VOLC_MEDIAKIT_API_KEY", ""),

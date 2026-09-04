@@ -149,7 +149,7 @@ def test_fusion_agent_configuration_is_closed() -> None:
     assert Settings(
         access_token="test-secret",
         public_base_url="https://studio.example",
-    ).fusion_agent == "codex"
+    ).fusion_agent == "deepseek"
     with pytest.raises(ValueError, match="FUSION_AGENT"):
         Settings(
             access_token="test-secret",
@@ -158,7 +158,7 @@ def test_fusion_agent_configuration_is_closed() -> None:
         )
 
 
-def test_fusion_capability_and_request_are_frozen_at_ingress(tmp_path: Path) -> None:
+def test_fusion_is_internal_and_client_cannot_select_it(tmp_path: Path) -> None:
     configured = Settings(
         access_token="test-secret",
         data_dir=tmp_path / "data",
@@ -169,10 +169,7 @@ def test_fusion_capability_and_request_are_frozen_at_ingress(tmp_path: Path) -> 
     app = create_app(configured, pipeline_factory=successful_factory)
     with TestClient(app) as client:
         capability = client.get("/api/capabilities", headers=AUTH).json()
-        assert capability["minimal_creation"]["fusion"] == {
-            "agents": ["codex", "deepseek"],
-            "default_agent": "deepseek",
-        }
+        assert "fusion" not in capability["minimal_creation"]
         response = client.post(
             "/api/conversations",
             headers=AUTH,
@@ -184,18 +181,20 @@ def test_fusion_capability_and_request_are_frozen_at_ingress(tmp_path: Path) -> 
             "agent": "deepseek",
         }
 
-        for index, invalid_fusion in enumerate((None, {}, {"agent": "other"})):
-            invalid = client.post(
+        for index, client_fusion in enumerate((None, {}, {"agent": "codex"}, {"agent": "other"})):
+            ignored = client.post(
                 "/api/conversations",
                 headers=AUTH,
                 data={
-                    "generation_request": json.dumps({"fusion": invalid_fusion}),
-                    "client_request_id": f"fusion-invalid-{index}",
+                    "generation_request": json.dumps({"fusion": client_fusion}),
+                    "client_request_id": f"fusion-client-value-{index}",
                 },
                 files={"file": ("source.mp4", b"source", "video/mp4")},
             )
-            assert invalid.status_code == 400
-            assert invalid.json()["detail"]["code"] == "invalid_fusion_agent"
+            assert ignored.status_code == 201
+            assert ignored.json()["effective_request"]["fusion"] == {
+                "agent": "deepseek",
+            }
 
 
 def test_creation_request_rejects_oversized_declared_body_before_parsing(tmp_path: Path):

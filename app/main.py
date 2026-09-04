@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 
-from app.config import FUSION_AGENTS, Settings, get_settings
+from app.config import Settings, get_settings
 from app.pipeline import Pipeline
 from app.research_log import ResearchLog
 from app.safe_download import ReferenceDownloadError, Resolver, download_reference_url, resolve_addresses
@@ -59,10 +59,6 @@ CAPABILITY = {
         "resolutions": ["480p", "768p"],
         "defaults": {"fit_mode": "auto", "optimize_image": True, "remove_subtitle": True, "remove_logo": True},
         "dialogue": {"mode": "auto_rewrite", "translation": True},
-        "fusion": {
-            "agents": ["codex", "deepseek"],
-            "default_agent": "codex",
-        },
         "replacement": {
             "supported": True,
             "accept": ["image/jpeg", "image/png", "image/webp"],
@@ -160,7 +156,7 @@ async def _write_upload(upload: UploadFile, destination: Path, max_bytes: int) -
 
 
 def _parse_generation_request(
-    raw: str, default_fusion_agent: str = "codex",
+    raw: str, internal_fusion_agent: str = "deepseek",
 ) -> dict[str, Any]:
     try:
         value = json.loads(raw)
@@ -168,26 +164,14 @@ def _parse_generation_request(
         raise _error(400, "invalid_generation_request", "generation_request 必须是 JSON 对象") from None
     if not isinstance(value, dict):
         raise _error(400, "invalid_generation_request", "generation_request 必须是 JSON 对象")
-    fusion = value.get("fusion")
-    if "fusion" not in value:
-        value = {**value, "fusion": {"agent": default_fusion_agent}}
-    elif (
-        not isinstance(fusion, dict)
-        or set(fusion) != {"agent"}
-        or fusion.get("agent") not in FUSION_AGENTS
-    ):
-        raise _error(
-            400,
-            "invalid_fusion_agent",
-            "fusion.agent 必须是 codex 或 deepseek",
-        )
-    return value
+    # The Fusion implementation is an internal deployment choice.  Never let
+    # a client-supplied field select a provider; freeze the server choice into
+    # the project so retries and resume remain deterministic.
+    return {**value, "fusion": {"agent": internal_fusion_agent}}
 
 
-def _capability(default_fusion_agent: str) -> dict[str, Any]:
-    payload = copy.deepcopy(CAPABILITY)
-    payload["minimal_creation"]["fusion"]["default_agent"] = default_fusion_agent
-    return payload
+def _capability() -> dict[str, Any]:
+    return copy.deepcopy(CAPABILITY)
 
 
 def create_app(
@@ -358,7 +342,7 @@ def create_app(
 
     @app.get("/api/capabilities", dependencies=[Depends(require_auth)])
     async def capabilities():
-        return _capability(configured.fusion_agent)
+        return _capability()
 
     @app.get("/api/conversations", dependencies=[Depends(require_auth)])
     async def conversations(request: Request):
