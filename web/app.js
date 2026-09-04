@@ -1062,33 +1062,8 @@ function stageState(status, detail = "", count = "") {
   return { status, detail, count };
 }
 
-function projectPhaseLabel(detail) {
-  const value = detail || {};
-  const progress = value.project_progress || {};
-  const generation = value.generation;
-  const stage = generation && generation.stage;
-  if (progress.status === "succeeded" || value.has_video === true) {
-    return "AI 正在生成视频";
-  }
-  if (["h3", "stitch", "stitching"].includes(stage)) {
-    return "AI 正在生成视频";
-  }
-  if (["context_ir", "context_ir_native"].includes(stage)) {
-    return "AI 正在思考创意";
-  }
-  if (generation && typeof generation === "object") {
-    return "AI 正在生成视频";
-  }
-  const fusionStatus = value.prompt_fusion && value.prompt_fusion.status;
-  if (["running", "done", "failed"].includes(fusionStatus)) {
-    return "AI 正在思考创意";
-  }
-  const postprocessStatus = value.postprocess && value.postprocess.status;
-  if (["queued", "running", "done", "failed"].includes(postprocessStatus)) {
-    return "AI 正在思考创意";
-  }
-  const analysisStatus = value.analysis_status || value.status;
-  return analysisStatus === "done" ? "AI 正在思考创意" : "AI 正在理解视频";
+function projectPhaseLabel() {
+  return "AI 正在生成视频";
 }
 
 function projectProgressModel(detail, nowMs = Date.now()) {

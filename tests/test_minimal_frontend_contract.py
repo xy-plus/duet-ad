@@ -512,7 +512,7 @@ def test_progress_and_results_renderers_do_not_mount_technical_views():
         assert technical_view not in result_renderers
 
 
-def test_three_public_progress_phases_follow_the_deepest_started_work():
+def test_public_progress_phase_stays_product_level_while_project_is_active():
     result = _run_contract(
         "(()=>({"
         "queued:contract.projectPhaseLabel({analysis_status:'queued',project_progress:{status:'queued'}}),"
@@ -526,15 +526,22 @@ def test_three_public_progress_phases_follow_the_deepest_started_work():
         "}))()"
     )
     assert result == {
-        "queued": "AI 正在理解视频",
-        "analysis": "AI 正在理解视频",
-        "postprocess": "AI 正在思考创意",
-        "fusion": "AI 正在思考创意",
-        "pendingOnly": "AI 正在理解视频",
-        "context": "AI 正在思考创意",
+        "queued": "AI 正在生成视频",
+        "analysis": "AI 正在生成视频",
+        "postprocess": "AI 正在生成视频",
+        "fusion": "AI 正在生成视频",
+        "pendingOnly": "AI 正在生成视频",
+        "context": "AI 正在生成视频",
         "h3": "AI 正在生成视频",
         "stitch": "AI 正在生成视频",
     }
+    phase_label = _function_source(
+        APP_JS.read_text(encoding="utf-8"), "projectPhaseLabel"
+    )
+    for internal_stage in (
+        "analysis_status", "postprocess", "prompt_fusion", "generation", "stage"
+    ):
+        assert internal_stage not in phase_label
 
 
 def test_project_configuration_model_restores_server_values_and_local_inputs():
