@@ -7,8 +7,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app import providers
 from app.config import Settings
+from app.fusion_schema import FUSION_OUTPUT_NAME, fusion_prompt_schema
 from app.providers import (
+    CodexClient,
     DeepSeekClient,
     MediaKitClient,
     PicsartClient,
@@ -195,6 +198,79 @@ def test_deepseek_structured_invalid_arguments_keep_raw_response(tmp_path: Path)
         client.complete_structured("skill", {}, {"type": "object"})
     assert isinstance(caught.value.cause, json.JSONDecodeError)
     assert caught.value.record["response"]["body"] == payload
+
+
+def test_codex_structured_uses_acct2_sol_low_and_output_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"segment_index": 3, "visual_prompt": "walk right"}
+    schema, input_sha256 = fusion_prompt_schema(payload)
+    image = tmp_path / "reference.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nreference")
+    observed: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 987654
+
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            observed["command"] = command
+            observed["env"] = kwargs["env"]
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_text(json.dumps({
+                "schema": FUSION_OUTPUT_NAME,
+                "version": 1,
+                "input_sha256": input_sha256,
+                "segment_index": 3,
+                "prompt": "replace every visible person and scene",
+            }), encoding="utf-8")
+
+        def wait(self, timeout: float | None = None) -> int:
+            observed["timeout"] = timeout
+            return 0
+
+        def poll(self) -> int:
+            return 0
+
+    monkeypatch.setenv("PICSART_API_KEY", "must-not-reach-codex")
+    monkeypatch.setattr(providers.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(providers, "_terminate_process_group", lambda _process: None)
+
+    result = CodexClient(_settings(tmp_path)).complete_structured(
+        "skill", payload, schema, [image],
+    )
+
+    command = observed["command"]
+    assert isinstance(command, list)
+    account_index = command.index("/home/xy/.local/bin/codex-acct")
+    inner = command[account_index:]
+    assert inner[:3] == ["/home/xy/.local/bin/codex-acct", "acct2", "exec"]
+    assert inner[inner.index("-m") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="low"' in inner
+    assert "--output-schema" in inner
+    assert "--ignore-user-config" in inner
+    assert "--ignore-rules" in inner
+    assert "PICSART_API_KEY" not in observed["env"]
+    assert observed["env"]["PATH"].split(":")[0] == "/home/xy/.local/bin"
+    assert result.value["prompt"] == "replace every visible person and scene"
+    assert result.evidence_media == [image]
+    assert result.record["request"]["account"] == "acct2"
+    assert result.record["request"]["model"] == "gpt-5.6-sol"
+    assert result.record["request"]["reasoning_effort"] == "low"
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        lambda value: value,
+        lambda value: "```json\n" + value + "\n```",
+        lambda value: value + "\ntokens used\n1,234\n",
+    ],
+)
+def test_codex_structured_transport_compatibility(wrapper) -> None:
+    body = json.dumps({"prompt": "ok"})
+    assert providers._parse_codex_object(wrapper(body).encode("utf-8")) == {
+        "prompt": "ok",
+    }
 
 
 def test_mediakit_multi_scene_supports_documented_and_nested_upload_shapes(

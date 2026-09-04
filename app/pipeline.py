@@ -11,7 +11,9 @@ from typing import Any, Callable
 
 from app import media
 from app.config import Settings
+from app.fusion_schema import fusion_prompt_schema, normalize_fusion_prompt
 from app.providers import (
+    CodexClient,
     DeepSeekClient,
     MediaKitClient,
     PicsartClient,
@@ -41,6 +43,7 @@ class Pipeline:
         store: ProjectStore,
         register_asset: Callable[[str, Path], str],
         *,
+        codex: CodexClient | None = None,
         deepseek: DeepSeekClient | None = None,
         mediakit: MediaKitClient | None = None,
         picsart: PicsartClient | None = None,
@@ -48,6 +51,7 @@ class Pipeline:
         self.settings = settings
         self.store = store
         self.register_asset = register_asset
+        self.codex = codex or CodexClient(settings)
         self.deepseek = deepseek or DeepSeekClient(settings)
         self.mediakit = mediakit or MediaKitClient(settings)
         self.picsart = picsart or PicsartClient(settings)
@@ -1424,30 +1428,57 @@ class Pipeline:
                 or ""
             )
             skill = R2V_SKILL.read_text(encoding="utf-8")
+            fusion_payload = {
+                "segment_index": index,
+                "visual_prompt": item["visual_prompt"],
+                "global_element_index": element_index,
+                "translated_dialogue": item["dialogue"],
+                "user_replacement_instruction": user_instruction,
+                "has_user_image": replacement is not None,
+                "user_replacement_image": (
+                    {"name": "Image 1", "sha256": self._sha256(replacement)}
+                    if replacement is not None else None
+                ),
+            }
+            fusion_schema, fusion_input_sha256 = fusion_prompt_schema(
+                fusion_payload,
+            )
+            configured_fusion = request.get("fusion")
+            # Projects created before the selector existed used DeepSeek.
+            # New requests always freeze an explicit agent at API ingress.
+            fusion_agent = (
+                configured_fusion.get("agent")
+                if isinstance(configured_fusion, dict)
+                else "deepseek"
+            )
+            if fusion_agent == "codex":
+                fusion_client = self.codex
+            elif fusion_agent == "deepseek":
+                fusion_client = self.deepseek
+            else:
+                raise ValueError("frozen fusion agent is invalid")
             prompt = self._node(
                 log,
                 "h3-max-r2v-prompt",
                 scope,
                 {
+                    "agent": fusion_agent,
                     "skill": skill,
-                    "visual_prompt": item["visual_prompt"],
-                    "element_index": element_index,
-                    "dialogue": item["dialogue"],
-                    "user_instruction": user_instruction,
-                    "replacement_image": replacement,
+                    "input_sha256": fusion_input_sha256,
+                    "payload": fusion_payload,
+                    "output_schema": fusion_schema,
                 },
                 [replacement] if replacement else [],
-                lambda: self.deepseek.complete(
+                lambda: fusion_client.complete_structured(
                     skill,
-                    {
-                        "segment_index": index,
-                        "visual_prompt": item["visual_prompt"],
-                        "global_element_index": element_index,
-                        "translated_dialogue": item["dialogue"],
-                        "user_replacement_instruction": user_instruction,
-                        "has_user_image": replacement is not None,
-                    },
+                    fusion_payload,
+                    fusion_schema,
                     [replacement] if replacement else [],
+                ),
+                transform=lambda value: normalize_fusion_prompt(
+                    value,
+                    input_sha256=fusion_input_sha256,
+                    segment_index=index,
                 ),
             )
             dialogue = "\n".join(

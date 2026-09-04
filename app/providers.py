@@ -4,7 +4,14 @@ import base64
 import hashlib
 import json
 import mimetypes
+import os
+import re
+import signal
 import shutil
+import stat
+import subprocess
+import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +24,17 @@ from app.config import Settings
 
 T = TypeVar("T")
 _MISSING = object()
+_SECRET_ENV_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.IGNORECASE)
+_ENV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_CODEX_TELEMETRY_RE = re.compile(
+    r"[ \t\r\n]*tokens used\r?\n"
+    r"(?:0|[1-9][0-9]*|[1-9][0-9]{0,2}(?:,[0-9]{3})+)[ \t\r\n]*"
+)
+_CODEX_ACCOUNT_COMMAND = ("/home/xy/.local/bin/codex-acct", "acct2")
+_CODEX_MODEL = "gpt-5.6-sol"
+_CODEX_REASONING_EFFORT = "low"
+_CODEX_OUTPUT_MAX_BYTES = 64 * 1024
+_SOURCE_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(slots=True)
@@ -358,6 +376,334 @@ class DeepSeekClient:
             structured=True,
             schema=schema,
         )
+
+
+class CodexProcessError(RuntimeError):
+    def __init__(self, message: str, *, stdout: str = "", stderr: str = "") -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        super().__init__(message)
+
+
+def _scrubbed_process_env() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not _SECRET_ENV_RE.search(key)
+    }
+    environment["PATH"] = "/home/xy/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    return environment
+
+
+def _clean_process_text(value: str, limit: int = 8192) -> str:
+    lines = [
+        line for line in value.splitlines()
+        if _ENV_LINE_RE.match(line.strip()) is None
+    ]
+    return "\n".join(lines).strip()[-limit:]
+
+
+def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            process.wait()
+            return
+        time.sleep(0.02)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def _read_regular_file(path: Path, limit: int) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size < 1 or info.st_size > limit:
+            raise ValueError("Codex structured output has an invalid size")
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b"".join(chunks)
+        if len(value) > limit:
+            raise ValueError("Codex structured output exceeds its limit")
+        return value
+    finally:
+        os.close(descriptor)
+
+
+def _copy_regular_file(source: Path, destination: Path, limit: int) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError("Codex image input is not a bounded regular file")
+        output = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = os.write(output, remaining)
+                    remaining = remaining[written:]
+            os.fsync(output)
+        finally:
+            os.close(output)
+    finally:
+        os.close(descriptor)
+
+
+def _image_suffix(source: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        header = os.read(descriptor, 16)
+    finally:
+        os.close(descriptor)
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return ".webp"
+    raise ValueError("Codex image input format is unsupported")
+
+
+def _parse_codex_object(raw: bytes) -> dict[str, Any]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("Codex structured output is not UTF-8") from None
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-JSON constant is forbidden: {value}")
+
+    decoder = json.JSONDecoder(parse_constant=reject_constant)
+    start = len(text) - len(text.lstrip())
+    fenced = False
+    if text.startswith("```", start):
+        header = re.match(r"```(?:json)?[ \t]*\r?\n", text[start:])
+        if header is None:
+            raise ValueError("Codex structured output has an invalid JSON fence")
+        fenced = True
+        start += header.end()
+        start += len(text[start:]) - len(text[start:].lstrip())
+    try:
+        value, end = decoder.raw_decode(text, start)
+    except (json.JSONDecodeError, ValueError):
+        raise ValueError("Codex structured output is not one JSON value") from None
+    suffix_start = end
+    if fenced:
+        closing = end + len(text[end:]) - len(text[end:].lstrip())
+        if not text.startswith("```", closing):
+            raise ValueError("Codex structured output has an incomplete JSON fence")
+        suffix_start = closing + 3
+    suffix = text[suffix_start:]
+    if suffix.strip() and _CODEX_TELEMETRY_RE.fullmatch(suffix) is None:
+        raise ValueError("Codex structured output contains trailing text")
+    if not isinstance(value, dict):
+        raise TypeError("Codex structured output must be an object")
+    return value
+
+
+class CodexClient:
+    """Run one schema-constrained fusion call through ``codex-acct acct2``."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._gate = threading.BoundedSemaphore(settings.codex_concurrency)
+
+    @staticmethod
+    def _command(stage: Path, output: Path, images: list[Path]) -> list[str]:
+        inner = [
+            *_CODEX_ACCOUNT_COMMAND,
+            "exec",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "-C", str(stage),
+            "-s", "workspace-write",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--color", "never",
+            "-o", str(output),
+            "-m", _CODEX_MODEL,
+            "--output-schema", str(stage / ".codex-output-schema.json"),
+            "-c", f'model_reasoning_effort="{_CODEX_REASONING_EFFORT}"',
+            "-c", "sandbox_workspace_write.network_access=false",
+            "-c", 'shell_environment_policy.inherit="core"',
+            "-c", 'shell_environment_policy.exclude=["*KEY*","*TOKEN*","*SECRET*","*PASSWORD*"]',
+        ]
+        for image in images:
+            inner.extend(("--image", str(image)))
+        inner.append("--")
+        inner.append(
+            "严格执行当前目录 SKILL.md；只读取 input.json 和随消息附带的图片；"
+            "按注入的 JSON Schema 输出唯一完整结果，不执行其他任务。"
+        )
+        bwrap = shutil.which("bwrap")
+        if bwrap is None:
+            raise FileNotFoundError("bwrap executable not found")
+        bwrap_path = Path(bwrap).resolve(strict=True)
+        checkout = _SOURCE_ROOT.resolve(strict=True)
+        command = [
+            str(bwrap_path),
+            "--bind", "/", "/",
+            "--dev-bind", "/dev", "/dev",
+            "--proc", "/proc",
+            "--tmpfs", str(checkout),
+            "--tmpfs", "/tmp",
+            "--bind", str(stage), str(stage),
+        ]
+        for candidate in sorted(stage.iterdir(), key=lambda path: path.name):
+            if candidate != output:
+                command.extend(("--ro-bind", str(candidate), str(candidate)))
+        command.extend(("--chdir", str(stage), *inner))
+        return command
+
+    def complete_structured(
+        self,
+        instruction: str,
+        payload: Any,
+        schema: dict[str, Any],
+        images: list[Path] | None = None,
+    ) -> ProviderResult[dict[str, Any]]:
+        media = list(images or [])
+        request_record: dict[str, Any] = {
+            "provider": "codex",
+            "account": "acct2",
+            "model": _CODEX_MODEL,
+            "reasoning_effort": _CODEX_REASONING_EFFORT,
+            "input": payload,
+            "schema": schema,
+        }
+        response_record: dict[str, Any] | None = None
+        try:
+            if not isinstance(payload, dict) or not isinstance(schema, dict):
+                raise TypeError("Codex structured input and schema must be objects")
+            with tempfile.TemporaryDirectory(
+                prefix="duet-h3-fusion-", dir="/tmp",
+            ) as raw_stage:
+                stage = Path(raw_stage).resolve(strict=True)
+                skill_path = stage / "SKILL.md"
+                input_path = stage / "input.json"
+                schema_path = stage / ".codex-output-schema.json"
+                output_path = stage / ".codex-final-output.json"
+                skill_path.write_text(instruction, encoding="utf-8")
+                input_path.write_text(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                    encoding="utf-8",
+                )
+                schema_path.write_text(
+                    json.dumps(
+                        schema,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                    encoding="utf-8",
+                )
+                for path in (skill_path, input_path, schema_path):
+                    os.chmod(path, 0o600)
+                staged_images: list[Path] = []
+                for index, source in enumerate(media, 1):
+                    suffix = _image_suffix(source)
+                    target = stage / f"image-{index}{suffix}"
+                    _copy_regular_file(source, target, 64 * 1024 * 1024)
+                    staged_images.append(target)
+                descriptor = os.open(
+                    output_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                os.close(descriptor)
+                command = self._command(stage, output_path, staged_images)
+                request_record["command"] = [
+                    value if not value.startswith(str(stage)) else value.replace(str(stage), "<stage>", 1)
+                    for value in command[command.index(str(_CODEX_ACCOUNT_COMMAND[0])):]
+                ]
+                with self._gate, tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(mode="w+b") as stderr_file:
+                    process = subprocess.Popen(
+                        command,
+                        stdout=stdout_file,
+                        stderr=stderr_file,
+                        env=_scrubbed_process_env(),
+                        start_new_session=True,
+                    )
+                    try:
+                        returncode = process.wait(timeout=self.settings.codex_timeout_s)
+                    except subprocess.TimeoutExpired:
+                        _terminate_process_group(process)
+                        stderr_file.seek(0)
+                        stderr = _clean_process_text(
+                            stderr_file.read().decode("utf-8", errors="replace")
+                        )
+                        raise CodexProcessError(
+                            f"codex timed out after {self.settings.codex_timeout_s:g}s",
+                            stderr=stderr,
+                        ) from None
+                    _terminate_process_group(process)
+                    stdout_file.seek(0)
+                    stderr_file.seek(0)
+                    stdout = _clean_process_text(
+                        stdout_file.read().decode("utf-8", errors="replace")
+                    )
+                    stderr = _clean_process_text(
+                        stderr_file.read().decode("utf-8", errors="replace")
+                    )
+                response_record = {
+                    "returncode": returncode,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }
+                if returncode != 0:
+                    raise CodexProcessError(
+                        f"codex exit {returncode}: {stderr[-500:]}",
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+                value = _parse_codex_object(
+                    _read_regular_file(output_path, _CODEX_OUTPUT_MAX_BYTES)
+                )
+                response_record["body"] = value
+                return ProviderResult(
+                    value=value,
+                    record={"request": request_record, "response": response_record},
+                    evidence_media=media,
+                )
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(
+                {"request": request_record, "response": response_record},
+                media,
+                exc,
+            ) from exc
 
 
 def _upload_headers(value: Any) -> dict[str, str]:

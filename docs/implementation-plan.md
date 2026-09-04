@@ -1,5 +1,7 @@
 # MiniMax H3 Max R2V 研究版后端实施计划
 
+> 2026-09-04 后续需求覆盖：原计划“不迁移 video-prompt-fusion、不为新节点使用 JSON Schema”的边界不再适用于 `h3-max-r2v-prompt` 节点。该节点现支持 Codex/DeepSeek 两种执行器，新项目默认 `codex-acct acct2 + gpt-5.6-sol + low`，两路共用动态绑定输入哈希和段号的 closed JSON Schema；其他上游节点、媒体语义和质量边界不变。
+
 ## 总结
 
 - 在 `/home/xy/duet-ad1-h3-max-r2v` 内实现全新的独立 Python/FastAPI 后端，源仓库 `/home/xy/duet-ad1` 保持不动。

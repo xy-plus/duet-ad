@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FUSION_AGENTS = frozenset({"codex", "deepseek"})
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,9 @@ class Settings:
     deepseek_api_key: str = ""
     deepseek_api_base: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash-vision-exp"
+    fusion_agent: str = "codex"
+    codex_timeout_s: float = 1800.0
+    codex_concurrency: int = 10
     mediakit_api_key: str = ""
     mediakit_api_base: str = "https://mediakit.cn-beijing.volces.com/api/v1"
     enable_mediakit: bool = True
@@ -75,6 +79,18 @@ class Settings:
             or self.mediakit_concurrency < 1
         ):
             raise ValueError("MEDIAKIT_CONCURRENCY must be a positive integer")
+        if self.fusion_agent not in FUSION_AGENTS:
+            raise ValueError("FUSION_AGENT must be codex or deepseek")
+        if (
+            isinstance(self.codex_timeout_s, bool)
+            or self.codex_timeout_s <= 0
+        ):
+            raise ValueError("CODEX_TIMEOUT_S must be positive")
+        if (
+            isinstance(self.codex_concurrency, bool)
+            or self.codex_concurrency < 1
+        ):
+            raise ValueError("CODEX_CONCURRENCY must be a positive integer")
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -102,6 +118,9 @@ def get_settings() -> Settings:
         ),
         deepseek_api_base=os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com").rstrip("/"),
         deepseek_model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash-vision-exp"),
+        fusion_agent=os.environ.get("FUSION_AGENT", "codex").strip().lower(),
+        codex_timeout_s=float(os.environ.get("CODEX_TIMEOUT_S", "1800")),
+        codex_concurrency=int(os.environ.get("CODEX_CONCURRENCY", "10")),
         mediakit_api_key=os.environ.get("VOLC_MEDIAKIT_API_KEY", ""),
         mediakit_api_base=os.environ.get("MEDIAKIT_API_BASE", "https://mediakit.cn-beijing.volces.com/api/v1").rstrip("/"),
         enable_mediakit=_bool("ENABLE_MEDIAKIT", True),

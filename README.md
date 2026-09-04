@@ -2,7 +2,7 @@
 
 这是从 `github-xy-plus/Master@043166b13f21fdf715390b964e843be2c010ddcf` 的极简前端出发建立的独立研究仓库。它不依赖 `/home/xy/duet-ad1` 的运行目录，也不修改源仓库。
 
-后端使用 Python 3.12、FastAPI 和纯文件系统存储。上游保持固定 Master 的视频分析语义；`video-maker` 之后改走逐段 DeepSeek 提示词 Skill、Picsart `minimax-h3-max-r2v`，最后裁回源片段时长并合并。
+后端使用 Python 3.12、FastAPI 和纯文件系统存储。上游保持固定 Master 的视频分析语义；`video-maker` 之后通过可切换的 Codex/DeepSeek Fusion 执行逐段提示词 Skill，再调用 Picsart `minimax-h3-max-r2v`，最后裁回源片段时长并合并。新项目默认使用 `codex-acct acct2` 下的 `gpt-5.6-sol`、reasoning `low`。
 
 ## 研究版边界
 
@@ -23,18 +23,20 @@
   -> video-maker 逐段视觉描述
   -> 项目级台词翻译
   -> video-maker 项目级对象索引
-  -> 各段并行：新提示词 Skill -> H3 Max R2V -> 裁回源时长
+  -> 各段并行：Codex/DeepSeek Fusion -> H3 Max R2V -> 裁回源时长
   -> 顺序合并 generated.mp4
 ```
 
-`video-maker` 的两个历史阶段保留固定 JSON Schema 的 `submit_result` 调用，因为这是 Skill 自身格式合同。新 H3 提示词 Skill 输出纯文本；后端只机械附加翻译台词及冻结时间窗。
+`video-maker` 的两个历史阶段保留固定 JSON Schema 的 `submit_result` 调用，因为这是 Skill 自身格式合同。新 H3 提示词 Skill 的两种执行器共用同一份 closed JSON Schema；Schema 动态绑定本段 `input_sha256` 与 `segment_index`，后端再次严格解包 `prompt`，再机械附加翻译台词及冻结时间窗。
 
 ## 配置
 
 参见 `/home/xy/duet-ad1-h3-max-r2v/.env.example`。至少需要显式提供：
 
 - `ACCESS_TOKEN`：前端登录 Bearer token；禁止使用缺省或空值。
-- `DEEPSEEK_API_KEY`、`PICSART_API_KEY`。
+- `DEEPSEEK_API_KEY`、`PICSART_API_KEY`。DeepSeek 仍负责 video-maker 和翻译。
+- `FUSION_AGENT`：新项目默认 Fusion 执行器，只能为 `codex` 或 `deepseek`；前端也可逐项目选择，选择值在创建时冻结。未携带该字段的历史项目继续按 DeepSeek 解释。
+- Codex Fusion 固定通过 `/home/xy/.local/bin/codex-acct acct2 exec` 使用 `gpt-5.6-sol`、reasoning `low`；`CODEX_TIMEOUT_S` 和 `CODEX_CONCURRENCY` 只控制执行边界，不改变账号、模型或 reasoning。
 - 启用 MediaKit 时提供 `VOLC_MEDIAKIT_API_KEY`。
 - `PUBLIC_BASE_URL`：Picsart 能从公网访问的 HTTPS 服务根地址，不能使用 loopback 地址。
 - 可执行的 `ASR_CLI`、存在的 `ASR_MODEL` 和 `YAMNET_MODEL_PATH`。
@@ -64,7 +66,7 @@ python3 /home/xy/duet-ad1-h3-max-r2v/run.py
 
 ## 验证
 
-离线测试使用假 DeepSeek、MediaKit 和 Picsart，不产生付费任务：
+离线测试使用假 Codex、DeepSeek、MediaKit 和 Picsart，不产生付费任务：
 
 ```bash
 python3 -m pytest /home/xy/duet-ad1-h3-max-r2v/tests -q

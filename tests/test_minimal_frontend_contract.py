@@ -28,6 +28,10 @@ def _capability(**overrides):
             "mode": "auto_rewrite",
             "translation": True,
         },
+        "fusion": {
+            "agents": ["codex", "deepseek"],
+            "default_agent": "codex",
+        },
         "replacement": {
             "supported": True,
             "accept": ["image/jpeg", "image/png", "image/webp"],
@@ -197,6 +201,10 @@ def test_minimal_creation_capability_is_exact_and_fails_closed():
             "mode": "auto_rewrite",
             "translation": True,
         },
+        "fusion": {
+            "agents": ["codex", "deepseek"],
+            "default_agent": "codex",
+        },
         "replacement": {
             "accept": ["image/jpeg", "image/png", "image/webp"],
             "max_bytes": 10 * 1024 * 1024,
@@ -211,7 +219,7 @@ def test_minimal_request_has_exact_auto_rewrite_and_replacement_shapes():
     result = _run_contract(
         "(()=>{const capability="
         + json.dumps(capability)
-        + ";const base={aspectRatio:'9:16',resolution:'768p',"
+        + ";const base={aspectRatio:'9:16',resolution:'768p',fusionAgent:'codex',"
         "targetLanguage:' 日语 ',hasReplacementImage:false,replacementInstruction:''};"
         "return {same:contract.buildMinimalGenerationRequest({...base,"
         "targetLanguage:contract.resolveTargetLanguage('same','不会提交')},capability),"
@@ -240,6 +248,7 @@ def test_minimal_request_has_exact_auto_rewrite_and_replacement_shapes():
             "mode": "auto_rewrite",
             "target_language": "日语",
         },
+        "fusion": {"agent": "codex"},
         "replacement_guidance": None,
     }
     same_request = json.loads(json.dumps(request))
@@ -277,7 +286,7 @@ def test_minimal_request_rejects_missing_or_long_language_and_replacement_pair()
     result = _run_contract(
         "(()=>{const capability="
         + json.dumps(capability)
-        + ";const base={aspectRatio:'9:16',resolution:'768p',"
+        + ";const base={aspectRatio:'9:16',resolution:'768p',fusionAgent:'codex',"
         "targetLanguage:'日语',hasReplacementImage:false,replacementInstruction:''};"
         "const capture=(value)=>{try{contract.buildMinimalGenerationRequest(value,capability);return null}"
         "catch(error){return error.message}};return {"
@@ -553,6 +562,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "languageMode": "other",
         "targetLanguage": "日语",
         "replacementInstruction": "替换成参考产品",
+        "fusionAgent": "deepseek",
         "source": {"mode": "link", "reference_url": "https://media.example/source.mp4"},
         "replacementImage": {
             "filename": "product.png", "bytes": 321,
@@ -565,6 +575,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "languageMode": "same",
         "targetLanguage": "",
         "replacementInstruction": "",
+        "fusionAgent": "deepseek",
         "source": {"mode": "upload", "filename": "clip.mp4", "bytes": 456},
         "replacementImage": None,
     }
@@ -574,6 +585,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "languageMode": "other",
         "targetLanguage": "日语",
         "replacementInstruction": "",
+        "fusionAgent": "deepseek",
         "source": None,
         "replacementImage": None,
     }

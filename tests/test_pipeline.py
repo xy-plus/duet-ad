@@ -8,6 +8,7 @@ from typing import Any
 
 from app import media
 from app.config import Settings
+from app.fusion_schema import FUSION_OUTPUT_NAME
 from app.pipeline import Pipeline, SAME_AS_SOURCE_LANGUAGE
 from app.providers import ProviderFailure, ProviderResult
 from app.research_log import ResearchLog
@@ -87,6 +88,23 @@ class _FlowDeepSeek:
                 {"prompt": f"visual-{index}"},
                 {"response": {"tool": "submit_result", "segment": index}},
             )
+        if "input_sha256" in schema.get("properties", {}):
+            index = int(payload["segment_index"])
+            with self.lock:
+                assert self.common_ready
+                assert "translation" in self.events
+                self.events.append(f"branch-start-{index}")
+            self.branch_barrier.wait(timeout=3)
+            return ProviderResult(
+                {
+                    "schema": FUSION_OUTPUT_NAME,
+                    "version": 1,
+                    "input_sha256": schema["properties"]["input_sha256"]["enum"][0],
+                    "segment_index": index,
+                    "prompt": f"r2v prompt {index}",
+                },
+                {"response": {"tool": "submit_result", "segment": index}},
+            )
         assert schema == PROJECT_INDEX_SCHEMA
         with self.lock:
             self.events.append("project-index")
@@ -133,16 +151,7 @@ class _FlowDeepSeek:
                 json.dumps({"lines": [{"text": "translated line"}]}),
                 {"response": {"raw": "translation-response"}},
             )
-        index = int(payload["segment_index"])
-        with self.lock:
-            assert self.common_ready
-            assert "translation" in self.events
-            self.events.append(f"branch-start-{index}")
-        self.branch_barrier.wait(timeout=3)
-        return ProviderResult(
-            f"r2v prompt {index}",
-            {"response": {"raw": f"r2v-{index}"}},
-        )
+        raise AssertionError("plain DeepSeek completion is translation-only")
 
 
 class _FlowPicsart:
@@ -422,8 +431,15 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         call for call in deepseek.structured_calls
         if call["schema"] == PROJECT_INDEX_SCHEMA
     ]
+    fusion_calls = [
+        call for call in deepseek.structured_calls
+        if "input_sha256" in call["schema"].get("properties", {})
+    ]
     assert len(visual_calls) == 2
     assert len(index_calls) == 1
+    assert len(fusion_calls) == 2
+    assert sorted(call["payload"]["segment_index"] for call in fusion_calls) == [1, 2]
+    assert all(call["schema"]["additionalProperties"] is False for call in fusion_calls)
     assert all(
         call["payload"]["generation_config"] == {
             "remove_subtitle": True,
@@ -474,6 +490,87 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     )
 
 
+def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create({}, "codex-fusion")
+    segment_dir = project / "work" / "segments" / "segment-001"
+    segment_dir.mkdir(parents=True)
+    source = segment_dir / "source.mp4"
+    source.write_bytes(b"source")
+    output = segment_dir / "generated.mp4"
+    calls: list[dict[str, Any]] = []
+
+    class FakeCodex:
+        def complete_structured(
+            self,
+            instruction: str,
+            payload: dict[str, Any],
+            schema: dict[str, Any],
+            images: list[Path],
+        ) -> ProviderResult[dict[str, Any]]:
+            calls.append({
+                "instruction": instruction,
+                "payload": payload,
+                "schema": schema,
+                "images": images,
+            })
+            return ProviderResult({
+                "schema": FUSION_OUTPUT_NAME,
+                "version": 1,
+                "input_sha256": schema["properties"]["input_sha256"]["enum"][0],
+                "segment_index": 1,
+                "prompt": "replace all people and all scenes while preserving camera and light",
+            }, {"provider": "codex", "account": "acct2"})
+
+    class RejectDeepSeek:
+        def complete_structured(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("DeepSeek must not run for a Codex-frozen project")
+
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, path: f"https://assets.invalid/{path.name}",
+        codex=FakeCodex(),
+        deepseek=RejectDeepSeek(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    monkeypatch.setattr(
+        media, "mute", lambda input_path, target: target.write_bytes(input_path.read_bytes()),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_picsart_segment",
+        lambda *_args, **_kwargs: output,
+    )
+
+    result = pipeline._generate_segment(
+        project_id,
+        project,
+        {
+            "index": 1,
+            "source": source,
+            "visual_prompt": "a person in a kitchen",
+            "dialogue": [{"start_s": 0.0, "end_s": 1.0, "text": "你好"}],
+        },
+        {"people": {"person-01": {}}, "scenes": {"scene-01": {}}},
+        None,
+        {
+            "fusion": {"agent": "codex"},
+            "replacement_guidance": None,
+        },
+        ResearchLog(project),
+    )
+
+    assert result == output
+    assert len(calls) == 1
+    assert calls[0]["payload"]["segment_index"] == 1
+    assert calls[0]["schema"]["additionalProperties"] is False
+    prompt = (segment_dir / "h3_prompt.txt").read_text(encoding="utf-8")
+    assert prompt.startswith("replace all people and all scenes")
+    assert "[0.000-1.000s] 你好" in prompt
 def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:

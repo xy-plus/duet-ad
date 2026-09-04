@@ -24,6 +24,7 @@ GENERATION_REQUEST = {
     "output": {"aspect_ratio": "16:9", "resolution": "480p", "fit_mode": "auto"},
     "processing": {"optimize_image": True, "remove_subtitle": True, "remove_logo": True},
     "dialogue": {"mode": "auto_rewrite", "target_language": "日语"},
+    "fusion": {"agent": "codex"},
     "replacement_guidance": {"instruction": "替换产品", "image_field": "replacement_image"},
 }
 
@@ -142,6 +143,59 @@ def test_default_and_blank_access_tokens_are_rejected(monkeypatch: pytest.Monkey
 def test_public_base_url_must_be_a_public_https_origin(base: str):
     with pytest.raises(ValueError, match="PUBLIC_BASE_URL"):
         Settings(access_token="test-secret", public_base_url=base)
+
+
+def test_fusion_agent_configuration_is_closed() -> None:
+    assert Settings(
+        access_token="test-secret",
+        public_base_url="https://studio.example",
+    ).fusion_agent == "codex"
+    with pytest.raises(ValueError, match="FUSION_AGENT"):
+        Settings(
+            access_token="test-secret",
+            public_base_url="https://studio.example",
+            fusion_agent="other",
+        )
+
+
+def test_fusion_capability_and_request_are_frozen_at_ingress(tmp_path: Path) -> None:
+    configured = Settings(
+        access_token="test-secret",
+        data_dir=tmp_path / "data",
+        public_base_url="https://studio.example",
+        fusion_agent="deepseek",
+        store_lock_enabled=False,
+    )
+    app = create_app(configured, pipeline_factory=successful_factory)
+    with TestClient(app) as client:
+        capability = client.get("/api/capabilities", headers=AUTH).json()
+        assert capability["minimal_creation"]["fusion"] == {
+            "agents": ["codex", "deepseek"],
+            "default_agent": "deepseek",
+        }
+        response = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data={"generation_request": "{}", "client_request_id": "fusion-default"},
+            files={"file": ("source.mp4", b"source", "video/mp4")},
+        )
+        assert response.status_code == 201
+        assert response.json()["effective_request"]["fusion"] == {
+            "agent": "deepseek",
+        }
+
+        for index, invalid_fusion in enumerate((None, {}, {"agent": "other"})):
+            invalid = client.post(
+                "/api/conversations",
+                headers=AUTH,
+                data={
+                    "generation_request": json.dumps({"fusion": invalid_fusion}),
+                    "client_request_id": f"fusion-invalid-{index}",
+                },
+                files={"file": ("source.mp4", b"source", "video/mp4")},
+            )
+            assert invalid.status_code == 400
+            assert invalid.json()["detail"]["code"] == "invalid_fusion_agent"
 
 
 def test_creation_request_rejects_oversized_declared_body_before_parsing(tmp_path: Path):
