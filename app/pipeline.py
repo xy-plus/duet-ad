@@ -3793,9 +3793,13 @@ def _prompt_fusion_early_output(
             isinstance(source_segment, dict)
             and "relation_occurrences" in source_segment
         )
+        allowed_keys = (
+            ({"index", "visual"}, {"index", "visual", "relation_states"})
+            if relation_contract else ({"index", "visual"},)
+        )
         if (
             not isinstance(segment, dict)
-            or set(segment) != {"index", "visual"}
+            or set(segment) not in allowed_keys
             or segment.get("index") != index
             or not isinstance(segment.get("visual"), list)
             or len(segment["visual"]) != visual_counts[index - 1]
@@ -3822,8 +3826,15 @@ def _prompt_fusion_early_output(
                 )
             except (KeyError, TypeError, long_generation.LongGenerationError):
                 raise ValueError("prompt fusion raw output is invalid") from None
-            # The model is not allowed to author relation state.  Inject the
-            # backend-owned value only after its exact output shape is valid.
+            # The transport schema forbids model-authored relation state.  The
+            # validator is intentionally idempotent for the backend-normalized
+            # bytes, but accepts that field only when it exactly matches the
+            # value derived from frozen input.
+            if (
+                "relation_states" in segment
+                and segment["relation_states"] != expected
+            ):
+                raise ValueError("prompt fusion raw output is invalid")
             segment["relation_states"] = expected
             normalized_relations = True
             try:

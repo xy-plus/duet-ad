@@ -367,6 +367,12 @@ def test_relation_occurrences_are_exact_and_hard_cut_local(tmp_path: Path) -> No
         segment_count=1,
         input_segments=payload["segments"],
     )
+    assert pipeline._prompt_fusion_early_output(
+        published,
+        input_sha256=model_output["input_sha256"],
+        segment_count=1,
+        input_segments=payload["segments"],
+    ) == published
     output_path.write_bytes(published)
 
     frozen = long_generation.load_prompt_fusion(
