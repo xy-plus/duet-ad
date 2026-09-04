@@ -871,14 +871,19 @@ def test_sidebar_project_cards_restore_0903_information_density_and_manual_selec
         'el("span", "badge " + badgeState.className, badgeState.text)',
         'el("span", "conv-identity")',
         "formatDuration(c.duration_s)",
-        'c.segment_count + " 段"',
         'el("span", "conv-footer")',
-        'el("span", "conv-time", fmtTime(c.updated_at || c.created_at))',
+        "const progress = projectProgressModel(c);",
+        'progress.elapsedLabel + " " + progress.elapsed',
+        "progress.loading ? c.created_at : (c.updated_at || c.created_at)",
+        'el("span", "conv-time", fmtTime(cardTime))',
         'el("span", "conv-output " + (c.has_video === true ? "is-ready" : "is-waiting")',
         'c.has_video === true ? "成片已提交" : "等待成片"',
     ):
         assert visible_project_field in render_list
     assert 'el("span", "conv-id", "#" + shortId(c.id))' not in render_list
+    assert "segment_count" not in render_list
+    assert "operationTimeline" not in render_list
+    assert "timeline.current.label" not in render_list
 
     assert 'c.id === state.currentId ? " selected" : ""' in render_list
     click_handler = render_list.split('item.addEventListener("click", () => {', 1)[1]

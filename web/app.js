@@ -1715,15 +1715,12 @@ function renderList() {
     content.appendChild(heading);
     const identity = el("span", "conv-identity");
     identity.appendChild(el("span", null, formatDuration(c.duration_s)));
-    if (Number.isInteger(c.segment_count) && c.segment_count > 0) {
-      identity.appendChild(el("span", null, c.segment_count + " 段"));
-    }
     content.appendChild(identity);
     const footer = el("span", "conv-footer");
-    const detail = state.historyDetails[c.id];
-    const timeline = detail ? operationTimeline(detail) : null;
-    footer.appendChild(el("span", null, timeline ? timeline.current.label : badgeState.text));
-    footer.appendChild(el("span", "conv-time", fmtTime(c.updated_at || c.created_at)));
+    const progress = projectProgressModel(c);
+    footer.appendChild(el("span", null, progress.elapsedLabel + " " + progress.elapsed));
+    const cardTime = progress.loading ? c.created_at : (c.updated_at || c.created_at);
+    footer.appendChild(el("span", "conv-time", fmtTime(cardTime)));
     footer.appendChild(el("span", "conv-output " + (c.has_video === true ? "is-ready" : "is-waiting"),
       c.has_video === true ? "成片已提交" : "等待成片"));
     content.appendChild(footer);
