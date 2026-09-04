@@ -179,7 +179,7 @@ def _load_events(data_dir: Path, owner_id: str) -> list[dict[str, Any]]:
 
 def _balance_unlocked(data_dir: Path, owner_id: str) -> dict[str, int]:
     available = reserved = spent = 0
-    job_events: dict[str, set[str]] = {}
+    job_events: dict[str, dict[str, int]] = {}
     for event in _load_events(data_dir, owner_id):
         kind = event.get("type")
         credits = event["credits"]
@@ -193,31 +193,35 @@ def _balance_unlocked(data_dir: Path, owner_id: str) -> dict[str, int]:
                 raise CreditError("credit_ledger_corrupt")
             continue
         job_id = event.get("job_id")
-        if not isinstance(job_id, str) or not _job_is_published(
-            data_dir, owner_id, job_id
-        ):
+        if not isinstance(job_id, str) or _JOB_RE.fullmatch(job_id) is None:
+            raise CreditError("credit_ledger_corrupt")
+        events = job_events.setdefault(job_id, {})
+        if kind in events or kind not in {"reserve", "capture", "release"}:
+            raise CreditError("credit_ledger_corrupt")
+        events[kind] = credits
+    for job_id, events in job_events.items():
+        if "reserve" not in events or ({"capture", "release"} <= set(events)):
+            raise CreditError("credit_ledger_corrupt")
+        terminal = "capture" if "capture" in events else (
+            "release" if "release" in events else None
+        )
+        if terminal is not None and events[terminal] != events["reserve"]:
+            raise CreditError("credit_ledger_corrupt")
+        if terminal is None and not _job_is_published(data_dir, owner_id, job_id):
             # A reserve can durably land immediately before a process crash and
-            # before the conversation directory is atomically published.  Such
+            # before the conversation directory is atomically published. Such
             # an orphan remains auditable but never reduces spendable credits.
-            if kind == "reserve":
-                continue
-            raise CreditError("credit_ledger_corrupt")
-        seen = job_events.setdefault(job_id, set())
-        if kind in seen or kind not in {"reserve", "capture", "release"}:
-            raise CreditError("credit_ledger_corrupt")
-        seen.add(kind)
-        if kind == "reserve":
-            available -= credits
-            reserved += credits
-        elif kind == "capture":
-            reserved -= credits
-            spent += credits
-        else:
-            reserved -= credits
-            available += credits
-    for seen in job_events.values():
-        if "reserve" not in seen or ({"capture", "release"} <= seen):
-            raise CreditError("credit_ledger_corrupt")
+            continue
+        # A complete reserve + terminal pair remains authoritative after the
+        # corresponding project is intentionally removed from retained data.
+        available -= events["reserve"]
+        reserved += events["reserve"]
+        if terminal == "capture":
+            reserved -= events["capture"]
+            spent += events["capture"]
+        elif terminal == "release":
+            reserved -= events["release"]
+            available += events["release"]
     if available < 0 or reserved < 0:
         raise CreditError("credit_ledger_corrupt")
     return {"available": available, "reserved": reserved, "spent": spent}

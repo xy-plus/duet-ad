@@ -569,6 +569,27 @@ def test_download_leases_are_shared_and_bounded(tmp_path):
     replacement.release()
 
 
+def test_terminal_credit_history_survives_project_retention_cleanup(
+    tmp_path, video_1s
+):
+    settings, auth, _ = _public_setup(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        created = _create(client, auth, video_1s, key="retentioncleanup01").json()
+        cid = created["id"][3:]
+        storage.update_meta(settings.data_dir, cid, status="failed")
+        settled = client.get(
+            f"/api/v1/video-generations/{created['id']}", headers=auth
+        )
+        assert settled.status_code == 200
+        assert settled.json()["billing"]["settlement_status"] == "final"
+
+    before = public_credits.balance(settings.data_dir, "partner_one")
+    storage.remove_conversation(settings.data_dir, cid)
+
+    assert public_credits.balance(settings.data_dir, "partner_one") == before
+    assert before == {"available": 5_000, "reserved": 0, "spent": 0}
+
+
 def test_admin_adjustments_are_idempotent_and_never_overdraw(tmp_path):
     data_dir = tmp_path / "data"
     assert public_credits.adjust(
