@@ -522,6 +522,13 @@ def test_provider_asset_signature_binds_project_asset_id_token_and_real_path(tmp
         assert metadata.content == b""
         assert metadata.headers["content-length"] == str(len(b"first"))
         assert metadata.headers["content-type"].startswith("video/mp4")
+        voice = app.state.store.path(first["id"]) / "work" / "voice-reference.wav"
+        voice.write_bytes(b"RIFFvoice-reference")
+        voice_signed = urlsplit(app.state.register_asset(first["id"], voice))
+        assert voice_signed.path.endswith(".wav")
+        voice_response = client.head(f"{voice_signed.path}?{voice_signed.query}")
+        assert voice_response.status_code == 200
+        assert voice_response.headers["content-type"].startswith("audio/wav")
         assert client.get(f"{signed.path}?token=wrong").status_code == 404
         assert client.head(f"{signed.path}?token=wrong").status_code == 404
         assert client.get(

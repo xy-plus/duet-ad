@@ -876,6 +876,7 @@ class PicsartClient:
         prompt: str,
         video_url: str,
         image_url: str | None,
+        audio_url: str | None = None,
         duration: int,
         resolution: str,
         aspect_ratio: str,
@@ -890,6 +891,8 @@ class PicsartClient:
         }
         if image_url:
             params["reference_image_urls"] = [image_url]
+        if audio_url:
+            params["reference_audio_urls"] = [audio_url]
         body = {"params": params}
         record: dict[str, Any] | None = None
         try:

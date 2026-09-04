@@ -17,15 +17,16 @@
 5. 可选 MediaKit 处理，先文本擦除、再图标擦除。
 6. 每段 `video-maker` 视觉提示词。
 7. 一次项目级台词翻译和一次 `video-maker` 全局对象索引。
+8. 若存在翻译后台词，项目级 Fusion 从固定 30 条音色目录中选择一个音色并冻结；无台词时显式跳过。
 
-只有上述公共输入全部完成，才同时启动所有片段的 R2V 分支。这样每个分支读取同一份冻结对象索引与翻译台词，不会因并发完成顺序产生不同语义。
+只有上述公共输入全部完成，才同时启动所有片段的 R2V 分支。这样每个分支读取同一份冻结对象索引、翻译台词和音色，不会因并发完成顺序产生不同语义。
 
 每段分支按以下顺序执行：
 
 ```text
 h3-max-r2v-prompt Skill
   -> 后端机械附加台词与相对时间窗
-  -> 静音源片段和可选用户图片签名 URL
+  -> 静音源片段、可选用户图片和统一 Audio 1 签名 URL
   -> Picsart submit
   -> 使用同一 task ID poll
   -> 立即下载供应商结果
@@ -48,9 +49,11 @@ h3-max-r2v-prompt Skill
 - 逐段阶段用 `VISUAL_PROMPT_SCHEMA` 返回 `{prompt}`，业务层解包为纯字符串。
 - 项目索引阶段接收 `phase`、生效的 `generation_config`，以及按 segment/frame 排序的 `segment_index`、`frame_order`、项目内路径、SHA 和全部分析图片；不接收逐段视觉提示词、台词或用户素材。输出四类数组后由后端机械分配稳定 ID。
 
-新 `h3-max-r2v-prompt` Skill 每段执行一次并输出纯文本。它读取本段视觉提示词、完整且无供应商记录污染的对象索引、本段翻译台词、可选图片和用户说明。后端随后机械附加“不说原语言、不生成字幕、在冻结时间窗内结束”的台词要求。
+项目级 `voice-selection` Skill 只返回一个由输入哈希和 30 个允许 ID 共同约束的 strict Schema 结果。模型所见目录不是 JSON，而是每条一行的 `voice_id - file - language - gender - 短特征` 文本；未知字段、来源、许可和哈希不占用模型上下文。后端把选中文件复制为项目内只读事实 `work/voice-reference.wav`，冻结 ID、目录哈希、文件哈希和完整来源标签。目录校验要求恰好 30 个单声道 PCM WAV，时长为 2–5 秒且文件哈希完全匹配；标签只采用数据集明确元数据，录音风格不扩写为人格。
 
-Picsart 使用 Advanced compatibility workflow `minimax/h3-max/reference-to-video`。提交地址为 `/workflows/minimax/h3-max/reference-to-video/submit`，请求体只有一层 `params`，字段使用供应商原生的 `reference_video_urls`、`reference_image_urls`、`aspect_ratio` 和 `prompt_expansion_mode: "quality"`；分辨率映射为 `480P`/`768P`。用户参考图先复用 `duet-ad1` 的 MiniMax 代理规则，等比落入 `256–5760` 双边和 `1:2.5–2.5:1` 比例范围，必要时补黑边，再编码为 PNG。轮询同一 workflow 下的 `/{taskId}/result`，从 `response.result.video.url` 读取结果。4.x 秒片段提交为 5 秒，结果再裁回源时长。
+新 `h3-max-r2v-prompt` Skill 每段执行一次并通过 closed JSON Schema 返回提示词。它读取本段视觉提示词、完整且无供应商记录污染的对象索引、本段翻译台词、可选图片、所选 Audio 1 的一行短描述和用户说明。后端随后机械附加“不说原语言、不生成字幕、在冻结时间窗内结束、所有片段沿用同一 Audio 1 音色且忽略参考音频字词”的要求。
+
+Picsart 使用 Advanced compatibility workflow `minimax/h3-max/reference-to-video`。提交地址为 `/workflows/minimax/h3-max/reference-to-video/submit`，请求体只有一层 `params`，字段使用供应商原生的 `reference_video_urls`、`reference_image_urls`、`reference_audio_urls`、`aspect_ratio` 和 `prompt_expansion_mode: "quality"`；分辨率映射为 `480P`/`768P`。每段都提交同一个项目音色 URL；用户参考图先复用 `duet-ad1` 的 MiniMax 代理规则，等比落入 `256–5760` 双边和 `1:2.5–2.5:1` 比例范围，必要时补黑边，再编码为 PNG。轮询同一 workflow 下的 `/{taskId}/result`，从 `response.result.video.url` 读取结果。4.x 秒片段提交为 5 秒，结果再裁回源时长。
 
 ## 重试、证据与付费边界
 

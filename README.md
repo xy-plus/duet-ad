@@ -23,11 +23,14 @@
   -> video-maker 逐段视觉描述
   -> 项目级台词翻译
   -> video-maker 项目级对象索引
-  -> 各段并行：内部 Fusion -> H3 Max R2V -> 裁回源时长
+  -> 项目级 Fusion 从 30 条音色目录选择并冻结唯一参考音色
+  -> 各段并行：内部 Fusion -> 同一 Audio 1 + H3 Max R2V -> 裁回源时长
   -> 顺序合并 generated.mp4
 ```
 
 `video-maker` 的两个历史阶段、项目级翻译和 DeepSeek Fusion 都使用 strict `submit_result`。新 H3 提示词 Skill 的两种内部执行器共用同一份 closed JSON Schema；Schema 动态绑定本段 `input_sha256` 与 `segment_index`，后端再次严格解包 `prompt`，再机械附加翻译台词及冻结时间窗。DeepSeek thinking 显式开启，请求不设置供应商级 `max_tokens`；业务结果仍由各节点本地合同校验。
+
+音色目录位于 `/home/xy/duet-ad1-h3-max-r2v/assets/voice-library`。30 条音频均为 2–5 秒单声道 PCM WAV；模型只接收每条一行、用 ` - ` 分隔的短描述，不接收目录 JSON。完整来源标签、许可、哈希和剪辑说明保留在后端目录与项目快照中。没有 spoken 台词的项目不选择、不上传音色。
 
 ## 配置
 
@@ -58,6 +61,7 @@ python3 /home/xy/duet-ad1-h3-max-r2v/run.py
   state.json
   inputs/
   work/segments/{segment_id}/
+  work/voice-reference.wav
   output/generated.mp4
   logs/
 ```

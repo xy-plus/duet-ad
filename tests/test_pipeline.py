@@ -15,6 +15,7 @@ from app.pipeline import Pipeline, SAME_AS_SOURCE_LANGUAGE, TRANSLATION_SCHEMA
 from app.providers import ProviderFailure, ProviderResult
 from app.research_log import ResearchLog
 from app.store import ProjectStore
+from app.voice_catalog import VOICE_SELECTION_OUTPUT_NAME, load_voice_library
 from app.video_maker_schemas import (
     PROJECT_INDEX_SCHEMA,
     VISUAL_PROMPT_SCHEMA,
@@ -89,6 +90,24 @@ class _FlowDeepSeek:
             return ProviderResult(
                 {"prompt": f"visual-{index}"},
                 {"response": {"tool": "submit_result", "segment": index}},
+            )
+        output_name = (
+            ((schema.get("properties") or {}).get("schema") or {}).get("enum")
+            or [None]
+        )[0]
+        if output_name == VOICE_SELECTION_OUTPUT_NAME:
+            with self.lock:
+                assert self.common_ready
+                assert "translation" in self.events
+                self.events.append("voice-selection")
+            return ProviderResult(
+                {
+                    "schema": VOICE_SELECTION_OUTPUT_NAME,
+                    "version": 1,
+                    "input_sha256": schema["properties"]["input_sha256"]["enum"][0],
+                    "voice_id": schema["properties"]["voice_id"]["enum"][0],
+                },
+                {"response": {"tool": "submit_result", "phase": "voice-selection"}},
             )
         if "input_sha256" in schema.get("properties", {}):
             index = int(payload["segment_index"])
@@ -424,7 +443,17 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     ]
     fusion_calls = [
         call for call in deepseek.structured_calls
-        if "input_sha256" in call["schema"].get("properties", {})
+        if (
+            ((call["schema"].get("properties") or {}).get("schema") or {}).get("enum")
+            == [FUSION_OUTPUT_NAME]
+        )
+    ]
+    voice_calls = [
+        call for call in deepseek.structured_calls
+        if (
+            ((call["schema"].get("properties") or {}).get("schema") or {}).get("enum")
+            == [VOICE_SELECTION_OUTPUT_NAME]
+        )
     ]
     translation_calls = [
         call for call in deepseek.structured_calls
@@ -433,10 +462,21 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert len(visual_calls) == 2
     assert len(index_calls) == 1
     assert len(fusion_calls) == 2
+    assert len(voice_calls) == 1
     assert len(translation_calls) == 1
     assert translation_calls[0]["schema"]["additionalProperties"] is False
     assert translation_calls[0]["schema"]["properties"]["lines"]["items"]["additionalProperties"] is False
     assert sorted(call["payload"]["segment_index"] for call in fusion_calls) == [1, 2]
+    compact_catalog = voice_calls[0]["payload"]["voice_catalog_lines"]
+    assert len(compact_catalog.splitlines()) == 30
+    assert len(compact_catalog) < 3500
+    assert "{" not in compact_catalog
+    assert all(" - " in line for line in compact_catalog.splitlines())
+    assert deepseek.events.index("project-index") < deepseek.events.index("voice-selection")
+    assert all(
+        call["payload"]["selected_voice_reference"].startswith("Audio 1 - ")
+        for call in fusion_calls
+    )
     assert all(call["schema"]["additionalProperties"] is False for call in fusion_calls)
     assert all(
         call["payload"]["generation_config"] == {
@@ -461,6 +501,10 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert set(state["element_index"]) == {
         "people", "entities", "scenes", "relations",
     }
+    assert state["voice_selection"]["status"] == "selected"
+    assert (project / "work" / "voice-reference.wav").is_file()
+    assert all(call["audio_url"] for call in picsart.submits)
+    assert len({call["audio_url"] for call in picsart.submits}) == 1
     serialized_index = json.dumps(state["element_index"])
     for forbidden in ("provider_record", '"id"', "subject_id", "object_id"):
         assert forbidden not in serialized_index
@@ -556,6 +600,8 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
             "dialogue": [{"start_s": 0.0, "end_s": 1.0, "text": "你好"}],
         },
         {"people": {"person-01": {}}, "scenes": {"scene-01": {}}},
+        {"status": "not_needed", "reason": "no_spoken_dialogue"},
+        None,
         None,
         {
             "fusion": {"agent": "codex"},
@@ -571,8 +617,9 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     prompt = (segment_dir / "h3_prompt.txt").read_text(encoding="utf-8")
     assert prompt.startswith("replace all people and all scenes")
     assert "[0.000-1.000s] 你好" in prompt
+@pytest.mark.parametrize("with_voice", [False, True])
 def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
-    tmp_path: Path, monkeypatch: Any,
+    tmp_path: Path, monkeypatch: Any, with_voice: bool,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
     request = {"output": {"resolution": "480p", "aspect_ratio": "9:16"}}
@@ -611,6 +658,24 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
         (segment_dir / "h3_prompt.txt").write_text(
             f"frozen prompt {segment['index']}", encoding="utf-8",
         )
+    voice_state: dict[str, Any] = {}
+    if with_voice:
+        library = load_voice_library()
+        voice = library.voices[0]
+        voice_reference = project / "work" / "voice-reference.wav"
+        voice_reference.write_bytes(library.files[voice["voice_id"]].read_bytes())
+        voice_state = {
+            "voice_selection": {
+                "status": "selected",
+                "voice_id": voice["voice_id"],
+                "catalog_sha256": library.digest,
+                "selection_input_sha256": "0" * 64,
+                "asset_path": "work/voice-reference.wav",
+                "asset_sha256": voice["sha256"],
+                "features": dict(voice["features"]),
+                "source": dict(voice["source"]),
+            }
+        }
     store.update(
         project_id,
         status="failed",
@@ -618,6 +683,7 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
         segments=segments,
         project_progress={"status": "failed", "percent": 57, "stage": "pipeline_failed"},
         generation={"status": "failed", "stage": "pipeline_failed", "error": "failed"},
+        **voice_state,
     )
     accepted = (
         project / "logs" / "picsart-submit"
@@ -677,9 +743,13 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
     assert [call["prompt"] for call in picsart.submits] == ["frozen prompt 2"]
     assert picsart.poll_counts["existing-task"] == 1
     assert "failed-task" not in picsart.poll_counts
-    assert {path.name for path in registered} == {
+    expected_registered = {
         "source-muted.mp4", "provider-reference-resume.png",
     }
+    if with_voice:
+        expected_registered.add("voice-reference.wav")
+    assert {path.name for path in registered} == expected_registered
+    assert bool(picsart.submits[0]["audio_url"]) is with_voice
     assert (project / "output" / "generated.mp4").is_file()
     assert (project / "logs" / "picsart-resume-submit").is_dir()
     assert not (

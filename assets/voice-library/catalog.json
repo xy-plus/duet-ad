@@ -1,0 +1,281 @@
+{
+  "schema": "duet.voice-library",
+  "version": 1,
+  "label_policy": {
+    "source_truth": "Only labels explicitly published by the cited source are copied. not_reported is never inferred from audio, names, language, accent, or geography.",
+    "personality": "A recorded emotion or delivery style is not a stable personality trait. personality remains not_reported for every asset.",
+    "identity": "Assets are anonymous corpus speaker IDs and must not be used to identify, imitate, or imply endorsement by a real person."
+  },
+  "voices": [
+    {
+      "voice_id": "crema-1001-happy",
+      "file": "voices/crema-1001-happy.wav",
+      "sha256": "2ad730e5f3c2520a87f6c8fb360f49bee054d5c4073a64040ef1a1cc9d208ec3",
+      "duration_s": 2.469125,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1001_ITH_HAP_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "male", "race": "Caucasian", "ethnicity": "Not Hispanic", "accent": "not_reported", "region": "not_reported", "age": 51, "performance_style": "happy", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1002-neutral",
+      "file": "voices/crema-1002-neutral.wav",
+      "sha256": "3ee31d38d8e2a3216975505fe111faef333b02adfe508d0567ae4d31b9911799",
+      "duration_s": 2.5025,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1002_DFA_NEU_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "female", "race": "Caucasian", "ethnicity": "Not Hispanic", "accent": "not_reported", "region": "not_reported", "age": 21, "performance_style": "neutral", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1005-angry",
+      "file": "voices/crema-1005-angry.wav",
+      "sha256": "50c380fe2542a3ba6e3b4a0c6659a0c04859924ed89085300c55801ceb90cb8f",
+      "duration_s": 2.602625,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1005_DFA_ANG_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "male", "race": "African American", "ethnicity": "Not Hispanic", "accent": "not_reported", "region": "not_reported", "age": 29, "performance_style": "angry", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1007-sad",
+      "file": "voices/crema-1007-sad.wav",
+      "sha256": "92dedd5f1a56c98c237c1cfdafa8d5c0199f950e9d03cc329548b1aec022ab31",
+      "duration_s": 2.168813,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1007_DFA_SAD_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "female", "race": "African American", "ethnicity": "Not Hispanic", "accent": "not_reported", "region": "not_reported", "age": 38, "performance_style": "sad", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1011-disgust",
+      "file": "voices/crema-1011-disgust.wav",
+      "sha256": "4a34408c41bb903a0dfc0ff455019e399fb21827d7926356e084a4eaf7c56891",
+      "duration_s": 2.535875,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1011_DFA_DIS_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "male", "race": "Caucasian", "ethnicity": "Not Hispanic", "accent": "not_reported", "region": "not_reported", "age": 32, "performance_style": "disgust", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1013-fear",
+      "file": "voices/crema-1013-fear.wav",
+      "sha256": "dd660a0f43c96cfb3a3db573ae21c4fdb6dbdb649127536f072ecce1562caeb8",
+      "duration_s": 2.56925,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1013_ITH_FEA_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "female", "race": "Caucasian", "ethnicity": "Hispanic", "accent": "not_reported", "region": "not_reported", "age": 22, "performance_style": "fear", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1019-happy",
+      "file": "voices/crema-1019-happy.wav",
+      "sha256": "f251d67de96ffa111ffd74501fb8f61394b2dba4f73890eaf68f6573d5e9cf76",
+      "duration_s": 2.275563,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1019_DFA_HAP_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "male", "race": "Asian", "ethnicity": "Not Hispanic", "accent": "not_reported", "region": "not_reported", "age": 29, "performance_style": "happy", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1029-neutral",
+      "file": "voices/crema-1029-neutral.wav",
+      "sha256": "65094e2f5a3e31107c9df14d3358ff676ff6400f9cdf75fa3c3363b8a606fb4b",
+      "duration_s": 2.268938,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1029_DFA_NEU_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "female", "race": "African American", "ethnicity": "Not Hispanic", "accent": "not_reported", "region": "not_reported", "age": 33, "performance_style": "neutral", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1045-angry",
+      "file": "voices/crema-1045-angry.wav",
+      "sha256": "76a8753334f2b13f0d101ed4a65f154de3d44b0e5ef06f3a1d931f6b4267f3e4",
+      "duration_s": 2.535875,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1045_DFA_ANG_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "male", "race": "Asian", "ethnicity": "Not Hispanic", "accent": "not_reported", "region": "not_reported", "age": 22, "performance_style": "angry", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1072-sad",
+      "file": "voices/crema-1072-sad.wav",
+      "sha256": "f823dc7629f73786a29d3b8f39a017d5f0bc67cd3db44577a87a2c3fdd33e666",
+      "duration_s": 2.168813,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1072_DFA_SAD_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "female", "race": "Asian", "ethnicity": "Not Hispanic", "accent": "not_reported", "region": "not_reported", "age": 33, "performance_style": "sad", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1073-disgust",
+      "file": "voices/crema-1073-disgust.wav",
+      "sha256": "f8d53aeeb4f3e77d8a42a66fb21b1b566ba5e9c68ec3480eaa3f174c15b28664",
+      "duration_s": 3.103125,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1073_DFA_DIS_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "female", "race": "African American", "ethnicity": "Hispanic", "accent": "not_reported", "region": "not_reported", "age": 24, "performance_style": "disgust", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "crema-1081-fear",
+      "file": "voices/crema-1081-fear.wav",
+      "sha256": "ab83bbb526b7bf84f20f4750f02df742535547f402250f8e16692fb18ddec9b0",
+      "duration_s": 2.369,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CREMA-D", "source_id": "1081_DFA_FEA_XX", "url": "https://github.com/CheyneyComputerScience/CREMA-D", "license": "ODbL-1.0 and DbCL-1.0", "attribution": "CREMA-D, Cao et al.", "modifications": "none"},
+      "features": {"language": "English", "gender": "male", "race": "Asian", "ethnicity": "Not Hispanic", "accent": "not_reported", "region": "not_reported", "age": 30, "performance_style": "fear", "intensity": "unspecified", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "thorsten-amused",
+      "file": "voices/thorsten-amused.wav",
+      "sha256": "0679ea812757aec1c58778810657781e6cc949a7fa700814624997e1d5c162da",
+      "duration_s": 3.62,
+      "media_type": "audio/wav",
+      "source": {"dataset": "Thorsten-Voice TV-2021.06-Emotional", "source_id": "680eb50a-d8a5-4fc7-b127-e8ec640a58e7---881573f41479190900144279dacb32fb", "url": "https://huggingface.co/datasets/Thorsten-Voice/TV-44kHz-Full", "license": "CC0-1.0", "attribution": "Thorsten Müller, Thorsten-Voice", "modifications": "retrieved as WAV through the Hugging Face dataset viewer"},
+      "features": {"language": "German", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "not_reported", "region": "not_reported", "age": "not_reported", "performance_style": "amused", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "thorsten-angry",
+      "file": "voices/thorsten-angry.wav",
+      "sha256": "5d559a5e3fa7e1d84a3805a6bb4f0c0eb0444d84be595cee88f95fe8a66829ef",
+      "duration_s": 3.8,
+      "media_type": "audio/wav",
+      "source": {"dataset": "Thorsten-Voice TV-2021.06-Emotional", "source_id": "070560e5-3046-2e53-8963-68e9cf0be001---6d0886f1bcbaa6fcfdbfeb501d5c683c", "url": "https://huggingface.co/datasets/Thorsten-Voice/TV-44kHz-Full", "license": "CC0-1.0", "attribution": "Thorsten Müller, Thorsten-Voice", "modifications": "retrieved as WAV through the Hugging Face dataset viewer"},
+      "features": {"language": "German", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "not_reported", "region": "not_reported", "age": "not_reported", "performance_style": "angry", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "thorsten-disgusted",
+      "file": "voices/thorsten-disgusted.wav",
+      "sha256": "24946d40a5771e3f508f4962c8e6aea446e0d8aba24544ddaeb8dcdaf9914c3c",
+      "duration_s": 2.310023,
+      "media_type": "audio/wav",
+      "source": {"dataset": "Thorsten-Voice TV-2021.06-Emotional", "source_id": "disgusted.wav", "url": "https://github.com/thorstenMueller/Thorsten-Voice/tree/master/samples/thorsten-21.06-emotional", "license": "CC0-1.0", "attribution": "Thorsten Müller, Thorsten-Voice", "modifications": "none"},
+      "features": {"language": "German", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "not_reported", "region": "not_reported", "age": "not_reported", "performance_style": "disgusted", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "thorsten-drunk",
+      "file": "voices/thorsten-drunk.wav",
+      "sha256": "4dade146d973b57ceeffef15c52191e3e40d48afa61c1105ab57068aa452cd2b",
+      "duration_s": 4.8,
+      "media_type": "audio/wav",
+      "source": {"dataset": "Thorsten-Voice TV-2021.06-Emotional", "source_id": "a7640256-255d-2a4c-8b9f-9df46e0d2158---fe3c06d9dfd30e585df4d20e593bfc8e", "url": "https://huggingface.co/datasets/Thorsten-Voice/TV-44kHz-Full", "license": "CC0-1.0", "attribution": "Thorsten Müller, Thorsten-Voice", "modifications": "retrieved as WAV, trimmed to 4.8 seconds with a 0.1 second fade-out; no pitch or speed change"},
+      "features": {"language": "German", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "not_reported", "region": "not_reported", "age": "not_reported", "performance_style": "drunk", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "thorsten-sleepy",
+      "file": "voices/thorsten-sleepy.wav",
+      "sha256": "fee7f7661e60e699f9e678c569b1622491d95633e6cc534736efee6ab616add3",
+      "duration_s": 3.090023,
+      "media_type": "audio/wav",
+      "source": {"dataset": "Thorsten-Voice TV-2021.06-Emotional", "source_id": "sleepy.wav", "url": "https://github.com/thorstenMueller/Thorsten-Voice/tree/master/samples/thorsten-21.06-emotional", "license": "CC0-1.0", "attribution": "Thorsten Müller, Thorsten-Voice", "modifications": "none"},
+      "features": {"language": "German", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "not_reported", "region": "not_reported", "age": "not_reported", "performance_style": "sleepy", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "thorsten-whisper",
+      "file": "voices/thorsten-whisper.wav",
+      "sha256": "ea4f62abbce960d97d1a326c461467fcae598d2aaf3615e4ceda2ce042e5972c",
+      "duration_s": 2.490023,
+      "media_type": "audio/wav",
+      "source": {"dataset": "Thorsten-Voice TV-2021.06-Emotional", "source_id": "whisper.wav", "url": "https://github.com/thorstenMueller/Thorsten-Voice/tree/master/samples/thorsten-21.06-emotional", "license": "CC0-1.0", "attribution": "Thorsten Müller, Thorsten-Voice", "modifications": "none"},
+      "features": {"language": "German", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "not_reported", "region": "not_reported", "age": "not_reported", "performance_style": "whispering", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p225-english",
+      "file": "voices/vctk-p225-english.wav",
+      "sha256": "38a6f769129796554e709318d985bb03f57b0b0488995c7d5cdff05791afb3df",
+      "duration_s": 3.289,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p225_218", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded from the source mirror as PCM WAV without intentional signal processing"},
+      "features": {"language": "English", "gender": "female", "race": "not_reported", "ethnicity": "not_reported", "accent": "English", "region": "Southern England", "age": 23, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p234-scottish",
+      "file": "voices/vctk-p234-scottish.wav",
+      "sha256": "a69e45e9b4cf58bd6ddcadd64d8e5f6a5a9096b9f02332ccf7e7468532aa1110",
+      "duration_s": 4.8,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p234_238", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded as PCM WAV, trimmed to 4.8 seconds with a 0.1 second fade-out; no pitch or speed change"},
+      "features": {"language": "English", "gender": "female", "race": "not_reported", "ethnicity": "not_reported", "accent": "Scottish", "region": "West Dumfries", "age": 22, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p237-scottish",
+      "file": "voices/vctk-p237-scottish.wav",
+      "sha256": "023f6964a66274caf93911af1b230b40fe4896d65ce37b2179624a2ff3922862",
+      "duration_s": 4.8,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p237_013", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded as PCM WAV, trimmed to 4.8 seconds with a 0.1 second fade-out; no pitch or speed change"},
+      "features": {"language": "English", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "Scottish", "region": "Fife", "age": 22, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p239-english",
+      "file": "voices/vctk-p239-english.wav",
+      "sha256": "b2731e31115e624b0c3ab8e81cd83ea98489134d2ed0c731e55caa64997c2b8e",
+      "duration_s": 4.997313,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p239_004", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded from the source mirror as PCM WAV without intentional signal processing"},
+      "features": {"language": "English", "gender": "female", "race": "not_reported", "ethnicity": "not_reported", "accent": "English", "region": "South West England", "age": 22, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p243-english",
+      "file": "voices/vctk-p243-english.wav",
+      "sha256": "4b87364749dfbd8b6e0d2f900ac6533b625eb3b663a60169a167c87b0831ecb0",
+      "duration_s": 4.8,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p243_394", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded as PCM WAV, trimmed to 4.8 seconds with a 0.1 second fade-out; no pitch or speed change"},
+      "features": {"language": "English", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "English", "region": "London", "age": 22, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p245-irish",
+      "file": "voices/vctk-p245-irish.wav",
+      "sha256": "7826532c7ae18343069c4c7e171aea6773c7352be7c3bbde0636a0bb9f168029",
+      "duration_s": 4.8,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p245_269", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded as PCM WAV, trimmed to 4.8 seconds with a 0.1 second fade-out; no pitch or speed change"},
+      "features": {"language": "English", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "Irish", "region": "Dublin", "age": 25, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p248-indian",
+      "file": "voices/vctk-p248-indian.wav",
+      "sha256": "7b49a89292832c95100b6fdb8a3cb10b9cdb5690eccda23502e7815bfbd2112b",
+      "duration_s": 4.996813,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p248_112", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded from the source mirror as PCM WAV without intentional signal processing"},
+      "features": {"language": "English", "gender": "female", "race": "not_reported", "ethnicity": "not_reported", "accent": "Indian", "region": "not_reported", "age": 23, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p251-indian",
+      "file": "voices/vctk-p251-indian.wav",
+      "sha256": "07b2b60c665b3630bcf9d682e3c2a6e6260c7661d10b2ea87095a61d0272f51d",
+      "duration_s": 4.994104,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p251_009", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded from the source mirror as PCM WAV without intentional signal processing"},
+      "features": {"language": "English", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "Indian", "region": "not_reported", "age": 26, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p252-scottish",
+      "file": "voices/vctk-p252-scottish.wav",
+      "sha256": "bb8ad5274597c8c891c2a59394fecf3b8f2abcf334e2788739ed6db859344154",
+      "duration_s": 4.8,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p252_007", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded as PCM WAV, trimmed to 4.8 seconds with a 0.1 second fade-out; no pitch or speed change"},
+      "features": {"language": "English", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "Scottish", "region": "Edinburgh", "age": 22, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p253-welsh",
+      "file": "voices/vctk-p253-welsh.wav",
+      "sha256": "a0fc66dd55244ac9406f342bb46d11398ced6d448fb289ef14fac647f2953df9",
+      "duration_s": 4.8,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p253_262", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded as PCM WAV, trimmed to 4.8 seconds with a 0.1 second fade-out; no pitch or speed change"},
+      "features": {"language": "English", "gender": "female", "race": "not_reported", "ethnicity": "not_reported", "accent": "Welsh", "region": "Cardiff", "age": 22, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p256-english",
+      "file": "voices/vctk-p256-english.wav",
+      "sha256": "50bb5cf1765b80a0626f3e94626ee2499c886f9045db3a4e24af77916a402320",
+      "duration_s": 4.8,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p256_241", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded as PCM WAV, trimmed to 4.8 seconds with a 0.1 second fade-out; no pitch or speed change"},
+      "features": {"language": "English", "gender": "male", "race": "not_reported", "ethnicity": "not_reported", "accent": "English", "region": "Birmingham", "age": 24, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    },
+    {
+      "voice_id": "vctk-p261-northern-irish",
+      "file": "voices/vctk-p261-northern-irish.wav",
+      "sha256": "ea4b723e21610a0cf46b6f5532334a970ba4d26b1dfe03e5dcc64508fc39dab7",
+      "duration_s": 4.824708,
+      "media_type": "audio/wav",
+      "source": {"dataset": "CSTR VCTK 0.92", "source_id": "p261_199", "url": "https://datashare.ed.ac.uk/handle/10283/3443", "license": "CC-BY-4.0", "attribution": "Veaux, Yamagishi and MacDonald, CSTR VCTK Corpus 0.92", "modifications": "decoded from the source mirror as PCM WAV without intentional signal processing"},
+      "features": {"language": "English", "gender": "female", "race": "not_reported", "ethnicity": "not_reported", "accent": "Northern Irish", "region": "Belfast", "age": 26, "performance_style": "read speech", "intensity": "not_reported", "personality": "not_reported"}
+    }
+  ]
+}

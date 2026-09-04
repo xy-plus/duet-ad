@@ -4,6 +4,8 @@ import concurrent.futures
 import hashlib
 import json
 import math
+import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -22,6 +24,12 @@ from app.providers import (
 )
 from app.research_log import ResearchLog
 from app.store import ProjectStore
+from app.voice_catalog import (
+    VoiceLibrary,
+    load_voice_library,
+    normalize_voice_selection,
+    voice_selection_schema,
+)
 from app.video_maker_schemas import (
     PROJECT_INDEX_SCHEMA,
     VISUAL_PROMPT_SCHEMA,
@@ -32,6 +40,9 @@ from app.video_maker_schemas import (
 
 VIDEO_SKILL = Path(__file__).resolve().parents[1] / "skills" / "video-maker" / "SKILL.md"
 R2V_SKILL = Path(__file__).resolve().parents[1] / "skills" / "h3-max-r2v-prompt" / "SKILL.md"
+VOICE_SELECTION_SKILL = (
+    Path(__file__).resolve().parents[1] / "skills" / "voice-selection" / "SKILL.md"
+)
 SAME_AS_SOURCE_LANGUAGE = "与原视频相同"
 MASTER_EMPTY_ASR_SIGNAL = 51 / 256
 TRANSLATION_SCHEMA: dict[str, Any] = {
@@ -71,6 +82,7 @@ class Pipeline:
         self.deepseek = deepseek or DeepSeekClient(settings)
         self.mediakit = mediakit or MediaKitClient(settings)
         self.picsart = picsart or PicsartClient(settings)
+        self.voice_library: VoiceLibrary = load_voice_library()
         self._mediakit_gate = threading.BoundedSemaphore(
             settings.mediakit_concurrency,
         )
@@ -372,6 +384,166 @@ class Pipeline:
                 },
             )
 
+    def _fusion_client_for_request(
+        self, request: dict[str, Any],
+    ) -> tuple[str, CodexClient | DeepSeekClient]:
+        configured_fusion = request.get("fusion")
+        # Legacy projects without a frozen internal choice used DeepSeek.
+        agent = (
+            configured_fusion.get("agent")
+            if isinstance(configured_fusion, dict)
+            else "deepseek"
+        )
+        if agent == "codex":
+            return agent, self.codex
+        if agent == "deepseek":
+            return agent, self.deepseek
+        raise ValueError("frozen fusion agent is invalid")
+
+    @staticmethod
+    def _stored_voice_reference(
+        project: Path, state: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, Path | None]:
+        selection = state.get("voice_selection")
+        if selection is None:
+            # Backward compatibility for projects created before voice selection.
+            return None, None
+        if not isinstance(selection, dict):
+            raise TypeError("stored voice selection is invalid")
+        status = selection.get("status")
+        if status == "not_needed":
+            return selection, None
+        if status != "selected":
+            raise ValueError("stored voice selection status is invalid")
+        if selection.get("asset_path") != "work/voice-reference.wav":
+            raise ValueError("stored voice reference path is invalid")
+        expected_sha256 = selection.get("asset_sha256")
+        if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+            raise ValueError("stored voice reference checksum is invalid")
+        voice_reference = (project / "work" / "voice-reference.wav").resolve(strict=True)
+        project_root = project.resolve(strict=True)
+        if project_root not in voice_reference.parents or not voice_reference.is_file():
+            raise ValueError("stored voice reference is outside the project")
+        if Pipeline._sha256(voice_reference) != expected_sha256:
+            raise ValueError("stored voice reference checksum does not match")
+        return selection, voice_reference
+
+    def _select_project_voice(
+        self,
+        project_id: str,
+        project: Path,
+        prepared: list[dict[str, Any]],
+        translated_lines: list[dict[str, Any]],
+        element_index: dict[str, Any],
+        request: dict[str, Any],
+        log: ResearchLog,
+    ) -> tuple[dict[str, Any], Path | None]:
+        library = self.voice_library
+        if not any(str(line.get("text") or "").strip() for line in translated_lines):
+            selection = self._node(
+                log,
+                "voice-selection",
+                "project",
+                {
+                    "voice_catalog_sha256": library.digest,
+                    "reason": "no_spoken_dialogue",
+                },
+                [],
+                lambda: ProviderResult(
+                    {"status": "not_needed", "reason": "no_spoken_dialogue"},
+                    {"outcome": "skipped", "reason": "no_spoken_dialogue"},
+                ),
+            )
+            self.store.update(project_id, voice_selection=selection)
+            return selection, None
+
+        target_language = str(
+            ((request.get("dialogue") or {}).get("target_language"))
+            or SAME_AS_SOURCE_LANGUAGE
+        ).strip()
+        payload = {
+            "target_language": target_language,
+            "translated_dialogue": translated_lines,
+            "segment_visual_prompts": [
+                {
+                    "segment_index": int(item["index"]),
+                    "visual_prompt": item["visual_prompt"],
+                }
+                for item in prepared
+            ],
+            "global_element_index": element_index,
+            "voice_catalog_sha256": library.digest,
+            "voice_catalog_lines": library.model_lines(),
+        }
+        voice_ids = [voice["voice_id"] for voice in library.voices]
+        output_schema, input_sha256 = voice_selection_schema(payload, voice_ids)
+        current_state = self.store.read(project_id)
+        existing = current_state.get("voice_selection")
+        if (
+            isinstance(existing, dict)
+            and existing.get("status") == "selected"
+            and existing.get("catalog_sha256") == library.digest
+            and existing.get("selection_input_sha256") == input_sha256
+        ):
+            stored_selection, stored_reference = self._stored_voice_reference(
+                project, current_state,
+            )
+            assert stored_selection is not None and stored_reference is not None
+            log.event(
+                "voice_selection_reused",
+                voice_id=stored_selection["voice_id"],
+            )
+            return stored_selection, stored_reference
+
+        agent, fusion_client = self._fusion_client_for_request(request)
+        skill = VOICE_SELECTION_SKILL.read_text(encoding="utf-8")
+        voice_id = self._node(
+            log,
+            "voice-selection",
+            "project",
+            {
+                "agent": agent,
+                "skill": skill,
+                "input_sha256": input_sha256,
+                "payload": payload,
+                "output_schema": output_schema,
+            },
+            [],
+            lambda: fusion_client.complete_structured(
+                skill, payload, output_schema, [],
+            ),
+            transform=lambda value: normalize_voice_selection(
+                value,
+                input_sha256=input_sha256,
+                voice_ids=set(voice_ids),
+            ),
+        )
+        voice = library.voice(voice_id)
+        source = library.files[voice_id]
+        destination = project / "work" / "voice-reference.wav"
+        temporary = project / "work" / ".voice-reference.wav.tmp"
+        try:
+            shutil.copyfile(source, temporary)
+            temporary.chmod(0o600)
+            os.replace(temporary, destination)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        selection = {
+            "status": "selected",
+            "voice_id": voice_id,
+            "catalog_sha256": library.digest,
+            "selection_input_sha256": input_sha256,
+            "asset_path": "work/voice-reference.wav",
+            "asset_sha256": voice["sha256"],
+            "features": dict(voice["features"]),
+            "source": dict(voice["source"]),
+        }
+        self.store.update(project_id, voice_selection=selection)
+        return selection, destination
+
     def _continue_after_prepared(
         self,
         project_id: str,
@@ -460,9 +632,22 @@ class Pipeline:
             translated_voice_lines=translated_lines,
         )
 
+        self._progress(
+            project_id, 53, "voice-selection", segments=public_segments,
+        )
+        voice_selection, voice_reference = self._select_project_voice(
+            project_id,
+            project,
+            prepared,
+            translated_lines,
+            element_index,
+            request,
+            log,
+        )
+
         # This is the public-input barrier.  No paid segment branch starts
-        # before every visual prompt, translation, localization and the
-        # single project index above have completed.
+        # before every visual prompt, translation, localization, the single
+        # project index and the project-wide voice choice have completed.
         self._progress(
             project_id, 57, "h3-max-r2v", segments=public_segments,
         )
@@ -476,6 +661,8 @@ class Pipeline:
                     project,
                     item,
                     element_index,
+                    voice_selection,
+                    voice_reference,
                     replacement,
                     request,
                     log,
@@ -819,7 +1006,9 @@ class Pipeline:
 
     def _load_r2v_resume(
         self, project_id: str,
-    ) -> tuple[Path, list[dict[str, Any]], Path | None, dict[str, Any]]:
+    ) -> tuple[
+        Path, list[dict[str, Any]], Path | None, dict[str, Any], Path | None,
+    ]:
         project = self.store.path(project_id)
         state = self.store.read(project_id)
         if state.get("status") not in {"failed", "queued"}:
@@ -870,13 +1059,24 @@ class Pipeline:
             })
             prepared.append(item)
         prepared.sort(key=lambda item: int(item["index"]))
-        return project, prepared, replacement, state.get("effective_request") or {}
+        _voice_selection, voice_reference = self._stored_voice_reference(
+            project, state,
+        )
+        return (
+            project,
+            prepared,
+            replacement,
+            state.get("effective_request") or {},
+            voice_reference,
+        )
 
     def validate_r2v_resume(self, project_id: str) -> None:
         self._load_r2v_resume(project_id)
 
     def resume_r2v(self, project_id: str) -> None:
-        project, prepared, replacement, request = self._load_r2v_resume(project_id)
+        project, prepared, replacement, request, voice_reference = (
+            self._load_r2v_resume(project_id)
+        )
         log = ResearchLog(project)
         node_prefix, artifact_suffix = self._next_resume_identity(project)
         log.event("picsart_resume_started")
@@ -903,6 +1103,7 @@ class Pipeline:
                         self._generate_picsart_segment,
                         project_id,
                         item,
+                        voice_reference,
                         replacement,
                         request,
                         log,
@@ -1426,6 +1627,8 @@ class Pipeline:
         project: Path,
         item: dict[str, Any],
         element_index: dict[str, Any],
+        voice_selection: dict[str, Any],
+        voice_reference: Path | None,
         replacement: Path | None,
         request: dict[str, Any],
         log: ResearchLog,
@@ -1450,24 +1653,16 @@ class Pipeline:
                     {"name": "Image 1", "sha256": self._sha256(replacement)}
                     if replacement is not None else None
                 ),
+                "selected_voice_reference": (
+                    "Audio 1 - "
+                    + self.voice_library.model_line(voice_selection["voice_id"])
+                    if voice_reference is not None else None
+                ),
             }
             fusion_schema, fusion_input_sha256 = fusion_prompt_schema(
                 fusion_payload,
             )
-            configured_fusion = request.get("fusion")
-            # Legacy projects without a frozen internal choice used DeepSeek.
-            # New requests always freeze the server choice at API ingress.
-            fusion_agent = (
-                configured_fusion.get("agent")
-                if isinstance(configured_fusion, dict)
-                else "deepseek"
-            )
-            if fusion_agent == "codex":
-                fusion_client = self.codex
-            elif fusion_agent == "deepseek":
-                fusion_client = self.deepseek
-            else:
-                raise ValueError("frozen fusion agent is invalid")
+            fusion_agent, fusion_client = self._fusion_client_for_request(request)
             prompt = self._node(
                 log,
                 "h3-max-r2v-prompt",
@@ -1505,6 +1700,13 @@ class Pipeline:
                 if dialogue
                 else "\n\nDo not add captions, subtitles, or new dialogue."
             )
+            if voice_reference is not None:
+                final_prompt += (
+                    "\n\nVoice consistency requirements: Audio 1 is the sole "
+                    "project-wide voice reference. Preserve its voice timbre, "
+                    "accent, and delivery style for every spoken line. Ignore "
+                    "the words spoken in Audio 1; speak only the dialogue above."
+                )
             segment_dir = item["source"].parent
             (segment_dir / "h3_prompt.txt").write_text(
                 final_prompt, encoding="utf-8",
@@ -1522,6 +1724,7 @@ class Pipeline:
             return self._generate_picsart_segment(
                 project_id,
                 item,
+                voice_reference,
                 replacement,
                 request,
                 log,
@@ -1536,6 +1739,7 @@ class Pipeline:
         self,
         project_id: str,
         item: dict[str, Any],
+        voice_reference: Path | None,
         replacement: Path | None,
         request: dict[str, Any],
         log: ResearchLog,
@@ -1574,6 +1778,11 @@ class Pipeline:
                     if provider_replacement is not None
                     else None
                 )
+                audio_url = (
+                    self.register_asset(project_id, voice_reference)
+                    if voice_reference is not None
+                    else None
+                )
                 output_request = request.get("output") or {}
                 provider_duration = max(5, math.ceil(float(item["duration_s"])))
                 submit_input = {
@@ -1581,6 +1790,7 @@ class Pipeline:
                     "prompt": final_prompt,
                     "reference_video_urls": [video_url],
                     "reference_image_urls": [image_url] if image_url else [],
+                    "reference_audio_urls": [audio_url] if audio_url else [],
                     "resolution": str(
                         output_request.get("resolution", "768p")
                     ).upper(),
@@ -1596,11 +1806,13 @@ class Pipeline:
                     scope,
                     submit_input,
                     [muted]
-                    + ([provider_replacement] if provider_replacement else []),
+                    + ([provider_replacement] if provider_replacement else [])
+                    + ([voice_reference] if voice_reference else []),
                     lambda: self.picsart.submit(
                         prompt=final_prompt,
                         video_url=video_url,
                         image_url=image_url,
+                        audio_url=audio_url,
                         duration=provider_duration,
                         resolution=output_request.get("resolution", "768p"),
                         aspect_ratio=output_request.get(

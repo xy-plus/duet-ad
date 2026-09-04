@@ -432,6 +432,9 @@ def test_picsart_submit_and_poll_are_split_and_poll_one_task(
             assert params["reference_image_urls"] == [
                 "https://assets.test/reference.png"
             ]
+            assert params["reference_audio_urls"] == [
+                "https://assets.test/voice.wav"
+            ]
             assert params["resolution"] == "768P"
             assert params["aspect_ratio"] == "16:9"
             return httpx.Response(200, json={"response": {"id": "task-fixed"}})
@@ -457,6 +460,7 @@ def test_picsart_submit_and_poll_are_split_and_poll_one_task(
         prompt="replace subject",
         video_url="https://assets.test/source.mp4",
         image_url="https://assets.test/reference.png",
+        audio_url="https://assets.test/voice.wav",
         duration=5,
         resolution="768p",
         aspect_ratio="16:9",
@@ -493,6 +497,7 @@ def test_picsart_advanced_request_omits_absent_optional_image(tmp_path: Path) ->
         prompt="prompt",
         video_url="https://assets.test/source.mp4",
         image_url=None,
+        audio_url=None,
         duration=5,
         resolution="480p",
         aspect_ratio="9:16",

@@ -41,6 +41,7 @@ PROVIDER_ASSET_SUFFIXES = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
     "image/webp": ".webp",
+    "audio/wav": ".wav",
 }
 PUBLIC_PROJECT_FILES = {
     "source.mp4": ("inputs/source.mp4", "video/mp4"),
@@ -259,6 +260,8 @@ def create_app(
         except (FileNotFoundError, OSError):
             raise ValueError("provider asset must be a real file inside its project") from None
         media_type = mimetypes.guess_type(owned_path.name)[0]
+        if owned_path.suffix.lower() == ".wav":
+            media_type = "audio/wav"
         if state.get("replacement_image_path") == "inputs/replacement-image":
             replacement_path = app.state.store.path(project_id) / "inputs" / "replacement-image"
             if owned_path == replacement_path.resolve(strict=True):
