@@ -23,9 +23,9 @@ from app.research_log import ResearchLog
 from app.store import ProjectStore
 from app.voice_catalog import load_voice_library
 from app.video_maker_schemas import (
-    PROJECT_INDEX_SCHEMA,
     VISUAL_PROMPT_SCHEMA,
     normalize_project_index,
+    project_index_schema,
 )
 
 
@@ -180,7 +180,11 @@ class _FlowDeepSeek:
                 {"lines": [{"text": "translated line"}]},
                 {"response": {"api": "responses", "phase": "translation"}},
             )
-        assert schema == PROJECT_INDEX_SCHEMA
+        assert payload["phase"] == "project_index"
+        segment_indices = [
+            segment["segment_index"] for segment in payload["segments"]
+        ]
+        assert schema == project_index_schema(segment_indices)
         with self.lock:
             self.events.append("project-index")
             self.common_ready = True
@@ -517,7 +521,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     ]
     index_calls = [
         call for call in deepseek.structured_calls
-        if call["schema"] == PROJECT_INDEX_SCHEMA
+        if call["payload"].get("phase") == "project_index"
     ]
     fusion_calls = [
         call for call in deepseek.structured_calls
@@ -552,6 +556,20 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert translation_calls[0]["schema"]["properties"]["lines"]["items"]["additionalProperties"] is False
     assert "像素帧是视觉事实的唯一依据" in index_calls[0]["instruction"]
     assert "visual_prompt 只用于汇总逐段已发现对象" in index_calls[0]["instruction"]
+    assert [
+        segment["segment_index"]
+        for segment in index_calls[0]["payload"]["segments"]
+    ] == [1, 2]
+    index_schema = index_calls[0]["schema"]
+    for category in ("people", "entities", "scenes"):
+        assert (
+            index_schema["properties"][category]["items"]["properties"]
+            ["occurrences"]["items"]["properties"]["segment_index"]["enum"]
+        ) == [1, 2]
+    assert (
+        index_schema["properties"]["relations"]["items"]["properties"]
+        ["occurrences"]["items"]["properties"]["segment_index"]["enum"]
+    ) == [1, 2]
     assert sorted(call["payload"]["segment_index"] for call in fusion_calls) == [1, 2]
     object_replace_call = object_replace_calls[0]
     compact_catalog = object_replace_call["payload"]["voice_catalog_lines"]
@@ -1635,21 +1653,21 @@ def test_project_index_normalizer_mechanically_maps_ids_without_metadata() -> No
         "people": [{
             "key": "p",
             "source_visual_description": "person",
-            "occurrences": [{"segment_index": 0, "frame_orders": [1]}],
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
             "replaceable": [],
             "preserve": [],
         }],
         "entities": [{
             "key": "e",
             "source_visual_description": "cup",
-            "occurrences": [{"segment_index": 0, "frame_orders": [1]}],
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
             "replaceable": [],
             "preserve": [],
         }],
         "scenes": [{
             "key": "s",
             "source_visual_description": "kitchen",
-            "occurrences": [{"segment_index": 0, "frame_orders": [1]}],
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
             "replaceable": [],
             "preserve": [],
         }],
@@ -1659,7 +1677,7 @@ def test_project_index_normalizer_mechanically_maps_ids_without_metadata() -> No
             "predicate": "holds",
             "object_key": "e",
             "occurrences": [{
-                "segment_index": 0,
+                "segment_index": 1,
                 "frames": [{"frame_order": 1, "state": "held", "geometry": "hand"}],
             }],
             "preserve": [],

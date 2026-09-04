@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from app.video_maker_schemas import (
     PROJECT_INDEX_SCHEMA,
     VISUAL_PROMPT_SCHEMA,
     normalize_project_index,
     normalize_visual_prompt,
+    project_index_schema,
 )
 
 
@@ -61,6 +64,45 @@ def test_transport_schemas_do_not_cap_prose_or_collection_sizes() -> None:
     )))
 
 
+def test_project_index_schema_binds_all_occurrences_to_exact_segments() -> None:
+    schema = project_index_schema([1, 3, 5])
+    element_segment_schemas = [
+        schema["properties"][category]["items"]["properties"]
+        ["occurrences"]["items"]["properties"]["segment_index"]
+        for category in ("people", "entities", "scenes")
+    ]
+    relation_segment_schema = (
+        schema["properties"]["relations"]["items"]["properties"]
+        ["occurrences"]["items"]["properties"]["segment_index"]
+    )
+
+    for segment_schema in [*element_segment_schemas, relation_segment_schema]:
+        assert segment_schema == {"type": "integer", "enum": [1, 3, 5]}
+        assert all(index not in segment_schema["enum"] for index in (0, 2, 4, 6))
+
+
+def test_static_project_index_schema_is_one_based() -> None:
+    element_segment_schema = (
+        PROJECT_INDEX_SCHEMA["properties"]["people"]["items"]["properties"]
+        ["occurrences"]["items"]["properties"]["segment_index"]
+    )
+    relation_segment_schema = (
+        PROJECT_INDEX_SCHEMA["properties"]["relations"]["items"]["properties"]
+        ["occurrences"]["items"]["properties"]["segment_index"]
+    )
+
+    assert element_segment_schema == {"type": "integer", "minimum": 1}
+    assert relation_segment_schema == {"type": "integer", "minimum": 1}
+
+
+@pytest.mark.parametrize("indices", [[], [0], [1, 1], [True]])
+def test_project_index_schema_rejects_invalid_input_identities(
+    indices: list[int],
+) -> None:
+    with pytest.raises(ValueError, match="segment identities"):
+        project_index_schema(indices)
+
+
 def test_visual_prompt_normalizer_accepts_large_transport_valid_prose() -> None:
     prompt = "画面描述" * 20_000
 
@@ -92,7 +134,7 @@ def test_duplicate_aliases_are_numbered_and_ambiguous_relations_pass_through() -
             _element("person-local"),
             _element(
                 "person-local",
-                occurrences=[{"segment_index": 0, "frame_orders": [1]}],
+                occurrences=[{"segment_index": 1, "frame_orders": [1]}],
             ),
         ],
         "entities": [_element("prop-local")],

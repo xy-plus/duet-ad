@@ -35,10 +35,10 @@ from app.research_log import ResearchLog
 from app.store import ProjectStore
 from app.voice_catalog import VoiceLibrary, load_voice_library
 from app.video_maker_schemas import (
-    PROJECT_INDEX_SCHEMA,
     VISUAL_PROMPT_SCHEMA,
     normalize_project_index,
     normalize_visual_prompt,
+    project_index_schema,
 )
 
 
@@ -929,6 +929,9 @@ class Pipeline:
             json.dumps(index_request, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        index_schema = project_index_schema([
+            segment["segment_index"] for segment in index_request["segments"]
+        ])
         self._progress(project_id, 50, "video-maker-project-index")
         skill = VIDEO_SKILL.read_text(encoding="utf-8")
         element_index = self._node(
@@ -945,7 +948,7 @@ class Pipeline:
                     "不得用它替代或推翻像素证据；最终填写本次注入的 Schema。"
                 ),
                 index_request,
-                PROJECT_INDEX_SCHEMA,
+                index_schema,
                 index_images,
             ),
             transform=normalize_project_index,

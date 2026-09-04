@@ -7,7 +7,7 @@ They describe model transport only; provider records remain attempt-log data.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 def _object(properties: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
@@ -33,7 +33,6 @@ def _array(
 
 
 _TEXT = {"type": "string"}
-_INT0 = {"type": "integer", "minimum": 0}
 _INT1 = {"type": "integer", "minimum": 1}
 _BOOL = {"type": "boolean"}
 _TEXTS = _array(_TEXT)
@@ -45,42 +44,69 @@ VISUAL_PROMPT_SCHEMA = _object({
 })
 
 
-_ELEMENT_OCCURRENCE = _object({
-    "segment_index": _INT0,
-    "frame_orders": _array(_INT1, maximum=9),
-})
-_ELEMENT = _object({
-    "key": _TEXT,
-    "source_visual_description": _TEXT,
-    "occurrences": _array(_ELEMENT_OCCURRENCE),
-    "replaceable": _TEXTS,
-    "preserve": _TEXTS,
-})
 _RELATION_FRAME = _object({
     "frame_order": _INT1,
     "state": _TEXT,
     "geometry": _TEXT,
 })
-_RELATION_OCCURRENCE = _object({
-    "segment_index": _INT0,
-    "frames": _array(_RELATION_FRAME, maximum=9),
-})
-_RELATION = _object({
-    "key": _TEXT,
-    "subject_key": _TEXT,
-    "predicate": _TEXT,
-    "object_key": _TEXT,
-    "occurrences": _array(_RELATION_OCCURRENCE),
-    "preserve": _TEXTS,
-    "replace_together": _BOOL,
-})
 
-PROJECT_INDEX_SCHEMA = _object({
-    "people": _array(_ELEMENT),
-    "entities": _array(_ELEMENT),
-    "scenes": _array(_ELEMENT),
-    "relations": _array(_RELATION),
-})
+
+def _project_index_schema(
+    segment_index_schema: dict[str, Any],
+) -> dict[str, Any]:
+    element_occurrence = _object({
+        "segment_index": dict(segment_index_schema),
+        "frame_orders": _array(_INT1, maximum=9),
+    })
+    element = _object({
+        "key": _TEXT,
+        "source_visual_description": _TEXT,
+        "occurrences": _array(element_occurrence),
+        "replaceable": _TEXTS,
+        "preserve": _TEXTS,
+    })
+    relation_occurrence = _object({
+        "segment_index": dict(segment_index_schema),
+        "frames": _array(_RELATION_FRAME, maximum=9),
+    })
+    relation = _object({
+        "key": _TEXT,
+        "subject_key": _TEXT,
+        "predicate": _TEXT,
+        "object_key": _TEXT,
+        "occurrences": _array(relation_occurrence),
+        "preserve": _TEXTS,
+        "replace_together": _BOOL,
+    })
+    return _object({
+        "people": _array(element),
+        "entities": _array(element),
+        "scenes": _array(element),
+        "relations": _array(relation),
+    })
+
+
+# Kept as the general exported contract for static inspection and callers that
+# do not yet have a concrete request. Runtime calls use ``project_index_schema``
+# so occurrences can only cite segment identities present in that request.
+PROJECT_INDEX_SCHEMA = _project_index_schema(_INT1)
+
+
+def project_index_schema(segment_indices: Sequence[int]) -> dict[str, Any]:
+    """Bind project-index occurrences to the exact input segment identities."""
+    indices = list(segment_indices)
+    if (
+        not indices
+        or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 1
+            for index in indices
+        )
+        or len(indices) != len(set(indices))
+    ):
+        raise ValueError("project-index segment identities are invalid")
+    return _project_index_schema({"type": "integer", "enum": indices})
 
 
 def normalize_visual_prompt(value: object) -> str:
