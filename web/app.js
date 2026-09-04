@@ -1062,8 +1062,32 @@ function stageState(status, detail = "", count = "") {
   return { status, detail, count };
 }
 
-function projectPhaseLabel() {
-  return "AI 正在生成视频";
+function projectPhaseLabel(detail) {
+  const value = detail || {};
+  const progress = value.project_progress || {};
+  const percent = Number(progress.percent);
+  if (Number.isFinite(percent)) {
+    if (percent >= 57) return "AI 正在生成视频";
+    if (percent >= 24) return "AI 正在思考创意";
+    return "AI 正在理解视频";
+  }
+
+  const generation = value.generation;
+  const stage = generation && generation.stage;
+  if (["h3", "h3-max-r2v", "picsart-resume", "stitch", "stitching", "stitch-resume"].includes(stage)) {
+    return "AI 正在生成视频";
+  }
+  if (["video-maker", "video-maker-resume", "translation", "video-maker-project-index",
+    "context_ir", "context_ir_native"].includes(stage)) {
+    return "AI 正在思考创意";
+  }
+  const fusionStatus = value.prompt_fusion && value.prompt_fusion.status;
+  const postprocessStatus = value.postprocess && value.postprocess.status;
+  if (["running", "done", "failed"].includes(fusionStatus)
+      || ["queued", "running", "done", "failed"].includes(postprocessStatus)) {
+    return "AI 正在思考创意";
+  }
+  return "AI 正在理解视频";
 }
 
 function projectProgressModel(detail, nowMs = Date.now()) {
