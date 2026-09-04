@@ -18,9 +18,11 @@ description: 分析后端为每个 segment 冻结的 9 张原始关键帧并生�
 
 ## 项目级索引
 
-仅当 `work/project_index_request.json` 声明 `phase="project_index"` 时执行一次。输入是所有 segment 的半尺寸分析副本及 SHA；按 segment、frame 顺序查看全部帧，不读取 `prompt.txt`，只输出元素索引。
+仅当 `work/project_index_request.json` 声明 `phase="project_index"` 时执行一次。输入是所有 segment 的半尺寸分析副本及 SHA，以及各段已完成的 `visual_prompt` 防漏清单；按 segment、frame 顺序查看全部帧，不读取 `prompt.txt`，只输出元素索引。
 
 先逐帧列出直接可见的人物、可独立移动或被动作作用的持久实体、场景以及元素间关系，再跨帧回查并合并。用调用内唯一的中性 `key` 互相引用，不要编码源属性；后端会机械分配稳定 ID。同一实例逐字复用；证据不足、特征冲突或同类实例可分别移动/接触时分开。硬切后重新依据当前帧确认；位置、相邻帧、服装颜色或叙事角色不能单独证明同一性。碎片、倒影、残影、模糊、过渡扫到的背景杂物不升格；occurrence 只记录当前帧可证实内容。
+
+合并前先在内部建立逐段覆盖账本。`segments[].visual_prompt` 只作为防漏清单，不是新的视觉事实：对其中提到的每个人物、手/手臂、手持物、可操作物和场景逐项回看对应九帧；像素能证实时必须进入索引，像素不能证实时忽略。完成跨段合并后，再按每个 segment 回查一次账本，确保每个已证实实例都有 key，且它在后来片段再次出现时把 occurrence 追加到同一个 key。两个物体若同帧出现、能分别持有/移动/接触，必须保持不同 key，不得因颜色、用途或外形相近而合并；后续更清晰的帧应纠正早先的局部误判，例如不能把清晰可见的瓶子继续写成胶囊。该覆盖核对只影响本次模型输出，不新增字段。
 
 输出格式以本次调用注入的 JSON Schema 为唯一权威。`people/entities/scenes/relations` 都是数组，调用内引用写入各记录的 `key`；人物、实体和场景记录包含 `source_visual_description/occurrences/replaceable/preserve`，关系记录包含 `subject_key/predicate/object_key/occurrences/preserve/replace_together`，关系逐帧记录包含 `frame_order/state/geometry`。后端把调用内 `key` 机械映射为稳定 ID；不接受重复 key、额外字段或缺字段。
 

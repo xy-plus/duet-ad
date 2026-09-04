@@ -939,7 +939,11 @@ class Pipeline:
             index_images,
             lambda: self.deepseek.complete_structured(
                 skill
-                + "\n\n严格执行项目级索引阶段；只根据输入帧填写本次注入的 Schema。",
+                + (
+                    "\n\n严格执行项目级索引阶段；像素帧是视觉事实的唯一依据；"
+                    "segments[].visual_prompt 只用于汇总逐段已发现对象并检查跨段覆盖，"
+                    "不得用它替代或推翻像素证据；最终填写本次注入的 Schema。"
+                ),
                 index_request,
                 PROJECT_INDEX_SCHEMA,
                 index_images,
@@ -2552,7 +2556,11 @@ class Pipeline:
                     "sha256": Pipeline._sha256(path),
                 })
                 images.append(path)
-            segments.append({"segment_index": int(item["index"]), "frames": frames})
+            segments.append({
+                "segment_index": int(item["index"]),
+                "visual_prompt": item["visual_prompt"],
+                "frames": frames,
+            })
         return {
             "phase": "project_index",
             "generation_config": generation_config,
@@ -2600,17 +2608,24 @@ class Pipeline:
                 if not cls._appears_in_segment(record, segment_index):
                     continue
                 source = cls._one_line(record.get("source_visual_description"))
-                preserve = record.get("preserve")
-                preserve_items = (
-                    [item for item in preserve if isinstance(item, str) and item.strip()]
-                    if isinstance(preserve, list)
-                    else []
-                )
-                preserve_text = "; ".join(
-                    cls._one_line(item) for item in preserve_items
-                ) or "source action, geometry, scale, and continuity"
                 replacement = record.get("replacement")
                 if isinstance(replacement, dict):
+                    if category == "people":
+                        preserve_text = (
+                            "source role, action, pose, position, and continuity; "
+                            "only explicitly stated gender, race, overall style, and "
+                            "primary clothing color"
+                        )
+                    elif category == "entities":
+                        preserve_text = (
+                            "source function, action interface, scale, contact, and "
+                            "relation semantics"
+                        )
+                    else:
+                        preserve_text = (
+                            "source scene type, color tone, composition, camera "
+                            "position and angle, shot movement, focal length, and lighting"
+                        )
                     target = cls._one_line(
                         replacement.get("target_visual_description")
                     )
@@ -2625,6 +2640,18 @@ class Pipeline:
                         f"{preserve_text}"
                     )
                 else:
+                    preserve = record.get("preserve")
+                    preserve_items = (
+                        [
+                            item for item in preserve
+                            if isinstance(item, str) and item.strip()
+                        ]
+                        if isinstance(preserve, list)
+                        else []
+                    )
+                    preserve_text = "; ".join(
+                        cls._one_line(item) for item in preserve_items
+                    ) or "source action, geometry, scale, and continuity"
                     line = (
                         f"- {stable_id} | KEEP | source: {source} | preserve: "
                         f"{preserve_text}"
@@ -2643,12 +2670,12 @@ class Pipeline:
                     if isinstance(replacement, dict):
                         line += (
                             " | person policy: different face; same explicit gender, "
-                            "race, overall style, and clothing color; slightly different "
+                            "race, overall style, and clothing color; visibly different "
                             "clothing design; do not infer missing traits"
                         )
                 elif category == "scenes" and isinstance(replacement, dict):
                     line += (
-                        " | scene policy: same scene type with a slightly different "
+                        " | scene policy: same scene type with a clearly different "
                         "layout and details; preserve color tone, composition, camera, "
                         "shot movement, focal length, and lighting"
                     )

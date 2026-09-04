@@ -550,6 +550,8 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert "JSON Schema" in translation_calls[0]["instruction"]
     assert translation_calls[0]["schema"]["additionalProperties"] is False
     assert translation_calls[0]["schema"]["properties"]["lines"]["items"]["additionalProperties"] is False
+    assert "像素帧是视觉事实的唯一依据" in index_calls[0]["instruction"]
+    assert "visual_prompt 只用于汇总逐段已发现对象" in index_calls[0]["instruction"]
     assert sorted(call["payload"]["segment_index"] for call in fusion_calls) == [1, 2]
     object_replace_call = object_replace_calls[0]
     compact_catalog = object_replace_call["payload"]["voice_catalog_lines"]
@@ -611,18 +613,30 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         for call in visual_calls
     )
     index_payload = index_calls[0]["payload"]
-    assert "visual_prompt" not in json.dumps(index_payload)
     assert index_payload["generation_config"] == {
         "remove_subtitle": True,
         "remove_watermark": True,
     }
+    assert [
+        (segment["segment_index"], segment["visual_prompt"])
+        for segment in index_payload["segments"]
+    ] == [(1, "visual-1"), (2, "visual-2")]
+    expected_index_images = []
     for segment in index_payload["segments"]:
-        assert set(segment) == {"segment_index", "frames"}
+        assert set(segment) == {"segment_index", "visual_prompt", "frames"}
         assert len(segment["frames"]) == 9
+        assert [frame["frame_order"] for frame in segment["frames"]] == list(
+            range(1, 10)
+        )
         assert all(
             set(frame) == {"frame_order", "path", "sha256"}
             for frame in segment["frames"]
         )
+        for frame in segment["frames"]:
+            frame_path = project / frame["path"]
+            expected_index_images.append(frame_path)
+            assert frame["sha256"] == Pipeline._sha256(frame_path)
+    assert index_calls[0]["images"] == expected_index_images
     raw_index = state["element_index"]
     enhanced_index = state["enhanced_element_index"]
     assert set(raw_index) == {
@@ -1723,6 +1737,105 @@ def test_nullable_object_replace_plan_is_compiled_without_a_quality_gate(
     assert "person-01 | KEEP" in authority
     assert "scene-01 | KEEP" in authority
     assert "Audio " not in authority
+
+
+def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
+    authority = Pipeline._fusion_authority_block({
+        "people": {
+            "person-01": {
+                "source_visual_description": "the person at frame center",
+                "occurrences": [{"segment_index": 1}],
+                "preserve": ["facial identity", "original haircut"],
+                "replacement": {
+                    "source": "generated_variant",
+                    "target_visual_description": (
+                        "a new woman with an angular face and a braided bob"
+                    ),
+                },
+            },
+        },
+        "entities": {
+            "entity-01": {
+                "source_visual_description": "the held personal-care item",
+                "occurrences": [{"segment_index": 1}],
+                "preserve": ["toothbrush form", "white color"],
+                "replacement": {
+                    "source": "image_1",
+                    "target_visual_description": (
+                        "the black bear-shaped jewelry case shown in Image 1"
+                    ),
+                },
+            },
+            "entity-02": {
+                "source_visual_description": "the background cup",
+                "occurrences": [{"segment_index": 1}],
+                "preserve": ["hand-painted logo", "glazed finish"],
+                "replacement": None,
+            },
+        },
+        "scenes": {
+            "scene-01": {
+                "source_visual_description": "the bathroom",
+                "occurrences": [{"segment_index": 1}],
+                "preserve": ["original cabinet fronts"],
+                "replacement": {
+                    "source": "generated_variant",
+                    "target_visual_description": (
+                        "a bathroom with ribbed oak cabinets and terrazzo walls"
+                    ),
+                },
+            },
+        },
+        "relations": {
+            "relation-01": {
+                "subject_key": "person-01",
+                "predicate": "holds",
+                "object_key": "entity-01",
+                "occurrences": [{"segment_index": 1}],
+                "preserve": ["hand grip and contact geometry"],
+                "replace_together": True,
+            },
+        },
+    }, 1)
+
+    lines = authority.splitlines()
+    person_line = next(
+        line for line in lines if line.startswith("- person-01 | REPLACE |")
+    )
+    entity_line = next(
+        line for line in lines if line.startswith("- entity-01 | REPLACE |")
+    )
+    keep_line = next(
+        line for line in lines if line.startswith("- entity-02 | KEEP |")
+    )
+    scene_line = next(
+        line for line in lines if line.startswith("- scene-01 | REPLACE |")
+    )
+    relation_line = next(
+        line for line in lines if line.startswith("- relation-01 | RELATION |")
+    )
+
+    assert "a new woman with an angular face and a braided bob" in person_line
+    assert "facial identity" not in person_line
+    assert "original haircut" not in person_line
+    assert "source role, action, pose, position, and continuity" in person_line
+    assert "only explicitly stated gender, race" in person_line
+    assert "visibly different clothing design" in person_line
+    assert "slightly different" not in person_line
+
+    assert "the black bear-shaped jewelry case shown in Image 1" in entity_line
+    assert "toothbrush form" not in entity_line
+    assert "white color" not in entity_line
+    assert "source function, action interface, scale, contact" in entity_line
+
+    assert "original cabinet fronts" not in scene_line
+    assert "source scene type, color tone, composition" in scene_line
+    assert "camera position and angle, shot movement" in scene_line
+    assert "clearly different layout and details" in scene_line
+    assert "slightly different" not in scene_line
+
+    assert "hand-painted logo; glazed finish" in keep_line
+    assert "hand grip and contact geometry" in relation_line
 
 
 def test_node_records_both_failed_attempts_and_process_streams(
