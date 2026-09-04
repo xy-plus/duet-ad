@@ -186,19 +186,28 @@ def test_project_header_is_minimal_while_history_and_cost_copy_are_shipped():
         "conv-title",
         "conversationBadge(",
         '"badge "',
-        "conv-id",
-        "shortId(",
         "formatDuration(",
-        "segment_count",
-        '" 段"',
+        "projectProgressModel(c)",
+        "progress.elapsed",
         "conv-footer",
         "conv-time",
+        "cardTime",
         "fmtTime(",
         "conv-output",
         "成片已提交",
         "等待成片",
     ):
         assert token in history
+    for removed_navigation_detail in (
+        '"conv-id"',
+        "shortId(",
+        "segment_count",
+        '" 段"',
+        "operationTimeline(",
+        "timeline.current.label",
+        "progress.elapsedLabel",
+    ):
+        assert removed_navigation_detail not in history
     for copy in (
         "开始生成成片（新增 ",
         "继续原任务（0 新增付费）",

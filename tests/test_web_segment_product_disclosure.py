@@ -188,9 +188,11 @@ def test_navigation_preserves_badge_identity_footer_and_output_metadata():
     assert "conversationBadge(c)" in render_list
     assert 'el("span", "badge " + badgeState.className, badgeState.text)' in render_list
     assert '"conv-identity"' in render_list
-    assert '"conv-id"' in render_list
-    assert "c.segment_count" in render_list
-    assert "operationTimeline(" in render_list
+    assert '"conv-id"' not in render_list
+    assert "c.segment_count" not in render_list
+    assert "operationTimeline(" not in render_list
+    assert "projectProgressModel(c)" in render_list
+    assert "progress.elapsed" in render_list
     assert '"conv-footer"' in render_list
     assert '"conv-output "' in render_list
     assert "STATUS_TEXT[c.status]" not in render_list

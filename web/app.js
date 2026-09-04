@@ -1065,30 +1065,29 @@ function stageState(status, detail = "", count = "") {
 function projectPhaseLabel(detail) {
   const value = detail || {};
   const progress = value.project_progress || {};
+  const percent = Number(progress.percent);
+  if (Number.isFinite(percent)) {
+    if (percent >= 57) return "AI 正在生成视频";
+    if (percent >= 24) return "AI 正在思考创意";
+    return "AI 正在理解视频";
+  }
+
   const generation = value.generation;
   const stage = generation && generation.stage;
-  if (progress.status === "succeeded" || value.has_video === true) {
+  if (["h3", "h3-max-r2v", "picsart-resume", "stitch", "stitching", "stitch-resume"].includes(stage)) {
     return "AI 正在生成视频";
   }
-  if (["h3", "stitch", "stitching"].includes(stage)) {
-    return "AI 正在生成视频";
-  }
-  if (["context_ir", "context_ir_native"].includes(stage)) {
+  if (["video-maker", "video-maker-resume", "translation", "video-maker-project-index",
+    "context_ir", "context_ir_native"].includes(stage)) {
     return "AI 正在思考创意";
-  }
-  if (generation && typeof generation === "object") {
-    return "AI 正在生成视频";
   }
   const fusionStatus = value.prompt_fusion && value.prompt_fusion.status;
-  if (["running", "done", "failed"].includes(fusionStatus)) {
-    return "AI 正在思考创意";
-  }
   const postprocessStatus = value.postprocess && value.postprocess.status;
-  if (["queued", "running", "done", "failed"].includes(postprocessStatus)) {
+  if (["running", "done", "failed"].includes(fusionStatus)
+      || ["queued", "running", "done", "failed"].includes(postprocessStatus)) {
     return "AI 正在思考创意";
   }
-  const analysisStatus = value.analysis_status || value.status;
-  return analysisStatus === "done" ? "AI 正在思考创意" : "AI 正在理解视频";
+  return "AI 正在理解视频";
 }
 
 function projectProgressModel(detail, nowMs = Date.now()) {
@@ -1717,15 +1716,12 @@ function renderList() {
     content.appendChild(heading);
     const identity = el("span", "conv-identity");
     identity.appendChild(el("span", null, formatDuration(c.duration_s)));
-    if (Number.isInteger(c.segment_count) && c.segment_count > 0) {
-      identity.appendChild(el("span", null, c.segment_count + " 段"));
-    }
     content.appendChild(identity);
     const footer = el("span", "conv-footer");
-    const detail = state.historyDetails[c.id];
-    const timeline = detail ? operationTimeline(detail) : null;
-    footer.appendChild(el("span", null, timeline ? timeline.current.label : badgeState.text));
-    footer.appendChild(el("span", "conv-time", fmtTime(c.updated_at || c.created_at)));
+    const progress = projectProgressModel(c);
+    footer.appendChild(el("span", null, progress.elapsed));
+    const cardTime = progress.loading ? c.created_at : (c.updated_at || c.created_at);
+    footer.appendChild(el("span", "conv-time", fmtTime(cardTime)));
     footer.appendChild(el("span", "conv-output " + (c.has_video === true ? "is-ready" : "is-waiting"),
       c.has_video === true ? "成片已提交" : "等待成片"));
     content.appendChild(footer);

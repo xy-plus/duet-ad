@@ -503,26 +503,28 @@ def test_progress_and_results_renderers_do_not_mount_technical_views():
         assert technical_view not in result_renderers
 
 
-def test_three_public_progress_phases_follow_the_deepest_started_work():
+def test_three_public_progress_phases_follow_project_progress_boundaries():
     result = _run_contract(
         "(()=>({"
-        "queued:contract.projectPhaseLabel({analysis_status:'queued',project_progress:{status:'queued'}}),"
-        "analysis:contract.projectPhaseLabel({analysis_status:'processing'}),"
-        "postprocess:contract.projectPhaseLabel({analysis_status:'done',postprocess:{status:'running'}}),"
-        "fusion:contract.projectPhaseLabel({analysis_status:'done',prompt_fusion:{status:'running'}}),"
-        "pendingOnly:contract.projectPhaseLabel({analysis_status:'processing',prompt_fusion:{status:'pending'}}),"
-        "context:contract.projectPhaseLabel({generation:{status:'running',stage:'context_ir'}}),"
-        "h3:contract.projectPhaseLabel({generation:{status:'running',stage:'h3'}}),"
-        "stitch:contract.projectPhaseLabel({generation:{status:'running',stage:'stitch'}})"
+        "queued:contract.projectPhaseLabel({project_progress:{status:'queued',percent:0},"
+        "generation:{status:'queued',stage:'upstream'}}),"
+        "analysis:contract.projectPhaseLabel({project_progress:{status:'running',percent:23},"
+        "generation:{status:'running',stage:'scene-detection'}}),"
+        "videoMaker:contract.projectPhaseLabel({project_progress:{status:'running',percent:24},"
+        "generation:{status:'running',stage:'video-maker'}}),"
+        "projectIndex:contract.projectPhaseLabel({project_progress:{status:'running',percent:56},"
+        "generation:{status:'running',stage:'video-maker-project-index'}}),"
+        "h3:contract.projectPhaseLabel({project_progress:{status:'running',percent:57},"
+        "generation:{status:'running',stage:'h3-max-r2v'}}),"
+        "stitch:contract.projectPhaseLabel({project_progress:{status:'running',percent:95},"
+        "generation:{status:'running',stage:'stitch'}})"
         "}))()"
     )
     assert result == {
         "queued": "AI 正在理解视频",
         "analysis": "AI 正在理解视频",
-        "postprocess": "AI 正在思考创意",
-        "fusion": "AI 正在思考创意",
-        "pendingOnly": "AI 正在理解视频",
-        "context": "AI 正在思考创意",
+        "videoMaker": "AI 正在思考创意",
+        "projectIndex": "AI 正在思考创意",
         "h3": "AI 正在生成视频",
         "stitch": "AI 正在生成视频",
     }
@@ -859,14 +861,20 @@ def test_sidebar_project_cards_restore_0903_information_density_and_manual_selec
         'el("span", "badge " + badgeState.className, badgeState.text)',
         'el("span", "conv-identity")',
         "formatDuration(c.duration_s)",
-        'c.segment_count + " 段"',
         'el("span", "conv-footer")',
-        'el("span", "conv-time", fmtTime(c.updated_at || c.created_at))',
+        "const progress = projectProgressModel(c);",
+        'el("span", null, progress.elapsed)',
+        "progress.loading ? c.created_at : (c.updated_at || c.created_at)",
+        'el("span", "conv-time", fmtTime(cardTime))',
         'el("span", "conv-output " + (c.has_video === true ? "is-ready" : "is-waiting")',
         'c.has_video === true ? "成片已提交" : "等待成片"',
     ):
         assert visible_project_field in render_list
     assert 'el("span", "conv-id", "#" + shortId(c.id))' not in render_list
+    assert "segment_count" not in render_list
+    assert "operationTimeline" not in render_list
+    assert "timeline.current.label" not in render_list
+    assert "progress.elapsedLabel" not in render_list
 
     assert 'c.id === state.currentId ? " selected" : ""' in render_list
     click_handler = render_list.split('item.addEventListener("click", () => {', 1)[1]
