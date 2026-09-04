@@ -28,7 +28,7 @@
   -> 顺序合并 generated.mp4
 ```
 
-`video-maker` 的两个历史阶段、项目级翻译和 DeepSeek Fusion 都使用 strict `submit_result`。新 H3 提示词 Skill 的两种内部执行器共用同一份 closed JSON Schema；Schema 动态绑定本段 `input_sha256` 与 `segment_index`，后端再次严格解包 `prompt`，再机械附加翻译台词及冻结时间窗。DeepSeek thinking 显式开启，请求不设置供应商级 `max_tokens`；业务结果仍由各节点本地合同校验。
+`video-maker` 的两个历史阶段、项目级翻译和 DeepSeek Fusion 都通过 DeepSeek Responses API 的原生 `text.format=json_schema` 输出 closed JSON；不使用工具调用、`tool_choice` 或虚构的提交函数。新 H3 提示词 Skill 的两种内部执行器共用同一份 closed JSON Schema；Schema 动态绑定本段 `input_sha256` 与 `segment_index`，后端再次严格解包 `prompt`，再机械附加翻译台词及冻结时间窗。DeepSeek thinking 以 `reasoning.effort=high` 显式开启，请求不设置供应商级 `max_output_tokens`；业务结果仍由各节点本地合同校验。
 
 音色目录位于 `/home/xy/duet-ad1-h3-max-r2v/assets/voice-library`。30 条音频均为 2–5 秒单声道 PCM WAV；模型只接收每条一行、用 ` - ` 分隔的短描述，不接收目录 JSON。完整来源标签、许可、哈希和剪辑说明保留在后端目录与项目快照中。没有 spoken 台词的项目不选择、不上传音色。
 

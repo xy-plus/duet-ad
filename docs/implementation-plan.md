@@ -1,6 +1,6 @@
 # MiniMax H3 Max R2V 研究版后端实施计划
 
-> 2026-09-04 最新需求覆盖：新项目 Fusion 由后端内部固定选择 DeepSeek，前端和公开 API 不提供模型切换；客户端 `fusion` 输入不能覆盖服务端配置。所有 DeepSeek 请求开启 thinking 且不发送 `max_tokens`，项目级翻译也改为 closed strict Schema。Codex 实现仅保留内部配置和历史冻结项目兼容。原计划“不为新节点使用 JSON Schema”的边界已被后续需求覆盖；其他上游节点、媒体语义和质量边界不变。
+> 2026-09-04 最新需求覆盖：新项目 Fusion 由后端内部固定选择 DeepSeek，前端和公开 API 不提供模型切换；客户端 `fusion` 输入不能覆盖服务端配置。所有 DeepSeek 请求开启 thinking 且不发送供应商级输出 token 上限；结构化节点使用 Responses API 原生 `text.format=json_schema`，不借用工具调用。Codex 实现仅保留内部配置和历史冻结项目兼容。原计划“不为新节点使用 JSON Schema”的边界已被后续需求覆盖；其他上游节点、媒体语义和质量边界不变。
 
 ## 总结
 
@@ -15,7 +15,7 @@
 
 明确写入 README、架构文档和代码注释：
 
-- strict Schema 仅用于固定 Master `video-maker` 两阶段、项目级翻译和 H3 提示词 Fusion 的结构化传输；不把它扩展成媒体质量或业务效果门禁。
+- closed JSON Schema 仅用于固定 Master `video-maker` 两阶段、项目级翻译和 H3 提示词 Fusion 的结构化传输；DeepSeek 走 Responses API 原生 Structured Outputs，不把它扩展成媒体质量或业务效果门禁。
 - 不检查媒体质量、画面替换成功率、人物一致性、台词准确率、口型、语言、分辨率、码率或成片可播放性。
 - 不因缺少索引项、对象映射不唯一、时长偏差或提示词质量问题阻止任务；仅当固定 `video-maker` 的既有结构化响应无法解析时按自然执行错误处理。
 - H3 提示词 Fusion 使用动态哈希/段号绑定 Schema，翻译使用 closed `lines[{text}]` Schema；除此之外不增加 CAS、幂等冲突、旧恢复状态机或质量型重试。
@@ -71,7 +71,7 @@ data/projects/{project_id}/
 6. 每段确定性选取 9 张关键帧。
 7. 按前端请求调用 MediaKit 去字幕/品牌处理。
 8. 每段并行运行 video-maker，生成 `visual_prompt`。
-9. 使用全部片段描述进行一次项目级 DeepSeek 翻译，通过 strict `submit_result` 返回等长 `lines[{text}]`，本地校验后按原时间语义回挂到各片段。
+9. 使用全部片段描述进行一次项目级 DeepSeek 翻译，通过 Responses API 原生 JSON Schema 返回等长 `lines[{text}]`，本地校验后按原时间语义回挂到各片段。
 10. 显式运行 video-maker 的项目索引阶段，生成 `element_index.json`；它仍属于 video-maker，不新增同类业务节点。
 11. 在所有公共输入准备完成后，启动每段一个并行 R2V 分支。
 

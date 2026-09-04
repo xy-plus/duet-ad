@@ -1525,7 +1525,7 @@ class Pipeline:
                 analysis_frames,
                 lambda: self.deepseek.complete_structured(
                     skill
-                    + "\n\n本次只执行逐段视觉分析；通过唯一 submit_result 调用填写注入的 Schema。",
+                    + "\n\n本次只执行逐段视觉分析；最终输出严格遵循本次注入的 JSON Schema。",
                     visual_payload,
                     VISUAL_PROMPT_SCHEMA,
                     analysis_frames,
@@ -1565,7 +1565,7 @@ class Pipeline:
         instruction = (
             f"把台词翻译并自然改写为{target_language}。保持输入行顺序；"
             "输出行数必须与输入完全一致，lines 每项只含非空 text。"
-            "通过唯一一次 submit_result 函数调用提交完整结果。"
+            "最终输出严格遵循本次注入的 JSON Schema。"
             "视频描述仅用于语境。"
         )
         return self.deepseek.complete_structured(

@@ -98,61 +98,94 @@ def test_deepseek_image_mime_uses_bytes_when_processing_suffix_is_stale(tmp_path
     assert result.value == "ok"
 
 
-def test_deepseek_structured_uses_beta_strict_submit_result(tmp_path: Path) -> None:
+def test_deepseek_structured_uses_responses_json_schema_and_preserves_exchange(
+    tmp_path: Path,
+) -> None:
     schema = {
         "type": "object",
         "properties": {"visual_prompt": {"type": "string"}},
         "required": ["visual_prompt"],
         "additionalProperties": False,
     }
+    image = tmp_path / "reference.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nreference")
+    response_payload = {
+        "id": "resp_test",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {
+                "id": "rs_test",
+                "type": "reasoning",
+                "summary": [],
+            },
+            {
+                "id": "msg_test",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": '{"visual_prompt":"move left"}',
+                        "annotations": [],
+                    }
+                ],
+            },
+        ],
+    }
+    observed: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url == httpx.URL("https://deepseek.test/beta/chat/completions")
+        assert request.method == "POST"
+        assert request.url == httpx.URL("https://deepseek.test/responses")
+        assert request.headers["authorization"] == "Bearer deepseek-secret"
         body = json.loads(request.content)
-        assert body["thinking"] == {"type": "enabled"}
-        assert "max_tokens" not in body
-        assert body["tools"] == [
-            {
-                "type": "function",
-                "function": {
-                    "name": "submit_result",
-                    "description": "Submit the complete structured result.",
-                    "strict": True,
-                    "parameters": schema,
-                },
+        observed["body"] = body
+        assert set(body) == {"model", "instructions", "input", "reasoning", "text"}
+        assert body["model"] == "deepseek-test-model"
+        assert body["instructions"] == "skill"
+        assert body["reasoning"] == {"effort": "high"}
+        assert body["text"] == {
+            "format": {
+                "type": "json_schema",
+                "name": "duet_structured_result",
+                "schema": schema,
             }
-        ]
-        assert body["tool_choice"] == {
-            "type": "function",
-            "function": {"name": "submit_result"},
         }
+        assert body["input"][0]["role"] == "user"
+        assert body["input"][0]["content"][0] == {
+            "type": "input_text",
+            "text": '{"segment": 1}',
+        }
+        assert body["input"][0]["content"][1]["type"] == "input_image"
+        assert body["input"][0]["content"][1]["image_url"].startswith(
+            "data:image/png;base64,"
+        )
+        encoded_body = json.dumps(body, ensure_ascii=False)
+        assert "tools" not in body
+        assert "tool_choice" not in body
+        assert "max_output_tokens" not in body
+        assert "submit_result" not in encoded_body
         return httpx.Response(
             200,
-            json={
-                "choices": [
-                    {
-                        "finish_reason": "tool_calls",
-                        "message": {
-                            "tool_calls": [
-                                {
-                                    "type": "function",
-                                    "function": {
-                                        "name": "submit_result",
-                                        "arguments": '{"visual_prompt":"move left"}',
-                                    },
-                                }
-                            ]
-                        }
-                    }
-                ]
-            },
+            headers={"X-Provider": "deepseek"},
+            json=response_payload,
         )
 
     result = DeepSeekClient(
         _settings(tmp_path), httpx.MockTransport(handler)
-    ).complete_structured("skill", {"segment": 1}, schema)
+    ).complete_structured("skill", {"segment": 1}, schema, [image])
+
+    assert isinstance(result, ProviderResult)
     assert result.value == {"visual_prompt": "move left"}
-    assert result.record["request"]["body"]["tools"][0]["function"]["strict"] is True
+    assert result.evidence_media == [image]
+    assert result.record["request"]["method"] == "POST"
+    assert result.record["request"]["url"] == "https://deepseek.test/responses"
+    assert result.record["request"]["body"] == observed["body"]
+    assert result.record["response"]["status_code"] == 200
+    assert result.record["response"]["headers"]["x-provider"] == "deepseek"
+    assert result.record["response"]["body"] == response_payload
 
 
 @pytest.mark.parametrize(
@@ -176,31 +209,172 @@ def test_deepseek_http_and_structure_failures_keep_exchange(
     assert caught.value.record["response"]["body"] == response.json()
 
 
-def test_deepseek_structured_invalid_arguments_keep_raw_response(tmp_path: Path) -> None:
+def test_deepseek_structured_http_error_keeps_exchange_and_media(tmp_path: Path) -> None:
+    image = tmp_path / "reference.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nreference")
+    payload = {"error": {"message": "upstream failed"}}
+    client = DeepSeekClient(
+        _settings(tmp_path),
+        httpx.MockTransport(lambda request: httpx.Response(502, json=payload)),
+    )
+
+    with pytest.raises(ProviderFailure) as caught:
+        client.complete_structured("skill", {"segment": 1}, {"type": "object"}, [image])
+
+    assert isinstance(caught.value.cause, httpx.HTTPStatusError)
+    assert caught.value.evidence_media == [image]
+    assert caught.value.record["request"]["url"] == "https://deepseek.test/responses"
+    assert caught.value.record["request"]["body"]["input"][0]["content"][1]["type"] == (
+        "input_image"
+    )
+    assert caught.value.record["response"]["status_code"] == 502
+    assert caught.value.record["response"]["body"] == payload
+
+
+@pytest.mark.parametrize("status", ["incomplete", "failed"])
+def test_deepseek_structured_non_completed_status_keeps_raw_exchange(
+    tmp_path: Path,
+    status: str,
+) -> None:
     payload = {
-        "choices": [
+        "status": status,
+        "output": [
+            {"type": "reasoning", "summary": []},
             {
-                "finish_reason": "tool_calls",
-                "message": {
-                    "tool_calls": [
-                        {
-                            "function": {
-                                "name": "submit_result",
-                                "arguments": "{not-json",
-                            }
-                        }
-                    ]
-                }
-            }
-        ]
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": '{"ok":true}'}],
+            },
+        ],
     }
     client = DeepSeekClient(
         _settings(tmp_path),
         httpx.MockTransport(lambda request: httpx.Response(200, json=payload)),
     )
+
     with pytest.raises(ProviderFailure) as caught:
         client.complete_structured("skill", {}, {"type": "object"})
-    assert isinstance(caught.value.cause, json.JSONDecodeError)
+
+    assert isinstance(caught.value.cause, ValueError)
+    assert caught.value.record["request"]["url"] == "https://deepseek.test/responses"
+    assert caught.value.record["response"]["status_code"] == 200
+    assert caught.value.record["response"]["body"] == payload
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "output_not_list",
+        "missing_message",
+        "duplicate_message",
+        "incomplete_message",
+        "missing_output_text",
+        "duplicate_output_text",
+        "non_string_output_text",
+    ],
+)
+def test_deepseek_structured_requires_unique_assistant_message_and_output_text(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    reasoning = {"type": "reasoning", "summary": []}
+
+    def message(*texts: str) -> dict[str, object]:
+        return {
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text} for text in texts],
+        }
+
+    if case == "output_not_list":
+        output: object = {}
+    elif case == "missing_message":
+        output = [reasoning]
+    elif case == "duplicate_message":
+        output = [reasoning, message('{"ok":true}'), message('{"ok":true}')]
+    elif case == "incomplete_message":
+        output = [
+            reasoning,
+            {
+                "type": "message",
+                "status": "incomplete",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": '{"ok":true}'}],
+            },
+        ]
+    elif case == "missing_output_text":
+        output = [
+            reasoning,
+            {
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "refusal", "refusal": "cannot comply"}],
+            },
+        ]
+    elif case == "duplicate_output_text":
+        output = [reasoning, message('{"ok":true}', '{"extra":true}')]
+    else:
+        output = [
+            reasoning,
+            {
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": {"ok": True}}],
+            },
+        ]
+
+    payload = {"status": "completed", "output": output}
+    client = DeepSeekClient(
+        _settings(tmp_path),
+        httpx.MockTransport(lambda request: httpx.Response(200, json=payload)),
+    )
+
+    with pytest.raises(ProviderFailure) as caught:
+        client.complete_structured("skill", {}, {"type": "object"})
+
+    assert isinstance(caught.value.cause, (TypeError, ValueError))
+    assert caught.value.record["request"]["url"] == "https://deepseek.test/responses"
+    assert caught.value.record["response"]["body"] == payload
+
+
+@pytest.mark.parametrize(
+    ("text", "error_type"),
+    [
+        ("{not-json", json.JSONDecodeError),
+        ("[]", TypeError),
+    ],
+)
+def test_deepseek_structured_invalid_output_text_keeps_raw_exchange(
+    tmp_path: Path,
+    text: str,
+    error_type: type[Exception],
+) -> None:
+    payload = {
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        ],
+    }
+    client = DeepSeekClient(
+        _settings(tmp_path),
+        httpx.MockTransport(lambda request: httpx.Response(200, json=payload)),
+    )
+
+    with pytest.raises(ProviderFailure) as caught:
+        client.complete_structured("skill", {}, {"type": "object"})
+
+    assert isinstance(caught.value.cause, error_type)
+    assert caught.value.record["request"]["url"] == "https://deepseek.test/responses"
     assert caught.value.record["response"]["body"] == payload
 
 

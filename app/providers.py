@@ -182,12 +182,19 @@ def _json_body(response: httpx.Response) -> Any:
         raise ValueError("provider response is not valid JSON") from exc
 
 
-def _deepseek_url(base: str, *, structured: bool) -> str:
+def _deepseek_base(base: str) -> str:
     canonical = base.rstrip("/")
     if canonical.endswith("/beta"):
         canonical = canonical[:-5]
-    suffix = "/beta/chat/completions" if structured else "/chat/completions"
-    return canonical + suffix
+    return canonical
+
+
+def _deepseek_chat_url(base: str) -> str:
+    return _deepseek_base(base) + "/chat/completions"
+
+
+def _deepseek_responses_url(base: str) -> str:
+    return _deepseek_base(base) + "/responses"
 
 
 def _message_content(body: Any) -> str:
@@ -202,30 +209,36 @@ def _message_content(body: Any) -> str:
     return message["content"]
 
 
-def _structured_arguments(body: Any) -> dict[str, Any]:
+def _structured_output(body: Any) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise TypeError("DeepSeek response must be an object")
-    choices = body.get("choices")
-    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-        raise ValueError("DeepSeek response has no unique choice")
-    choice = choices[0]
-    if choice.get("finish_reason") != "tool_calls":
-        raise ValueError("DeepSeek response did not finish with a tool call")
-    message = choice.get("message")
-    if not isinstance(message, dict):
-        raise ValueError("DeepSeek response has no message")
-    calls = message.get("tool_calls")
-    if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
-        raise ValueError("DeepSeek response must contain exactly one tool call")
-    function = calls[0].get("function")
-    if not isinstance(function, dict) or function.get("name") != "submit_result":
-        raise ValueError("DeepSeek response did not call submit_result")
-    arguments = function.get("arguments")
-    if not isinstance(arguments, str):
-        raise TypeError("DeepSeek submit_result arguments must be JSON text")
-    parsed = json.loads(arguments)
+    status = body.get("status")
+    if status != "completed":
+        raise ValueError(f"DeepSeek structured response status is {status!r}")
+    output = body.get("output")
+    if not isinstance(output, list):
+        raise TypeError("DeepSeek structured response output must be a list")
+    messages = [
+        item for item in output
+        if isinstance(item, dict) and item.get("type") == "message"
+    ]
+    if len(messages) != 1:
+        raise ValueError("DeepSeek structured response must contain one message")
+    message = messages[0]
+    if message.get("status") != "completed" or message.get("role") != "assistant":
+        raise ValueError("DeepSeek structured response message is incomplete")
+    content = message.get("content")
+    if not isinstance(content, list):
+        raise TypeError("DeepSeek structured response content must be a list")
+    text_parts = [
+        item for item in content
+        if isinstance(item, dict) and item.get("type") == "output_text"
+    ]
+    if len(text_parts) != 1 or not isinstance(text_parts[0].get("text"), str):
+        raise ValueError("DeepSeek structured response must contain one output_text")
+    parsed = json.loads(text_parts[0]["text"])
     if not isinstance(parsed, dict):
-        raise TypeError("DeepSeek submit_result arguments must decode to an object")
+        raise TypeError("DeepSeek structured output must decode to an object")
     return parsed
 
 
@@ -251,16 +264,34 @@ class DeepSeekClient:
             )
         return content
 
+    @staticmethod
+    def _responses_content(payload: Any, images: list[Path]) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "input_text",
+                "text": json.dumps(payload, ensure_ascii=False),
+            }
+        ]
+        for image in images:
+            image_bytes = image.read_bytes()
+            mime = _media_type(image, image_bytes)
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{mime};base64,{encoded}",
+                }
+            )
+        return content
+
     def _request(
         self,
         instruction: str,
         payload: Any,
         images: list[Path] | None,
         *,
-        structured: bool,
-        schema: dict[str, Any] | None = None,
         json_mode: bool = False,
-    ) -> ProviderResult[Any]:
+    ) -> ProviderResult[str]:
         media = list(images or [])
         try:
             content = self._content(instruction, payload, media)
@@ -268,7 +299,7 @@ class DeepSeekClient:
             record = {
                 "request": {
                     "method": "POST",
-                    "url": _deepseek_url(self.settings.deepseek_api_base, structured=structured),
+                    "url": _deepseek_chat_url(self.settings.deepseek_api_base),
                     "headers": _headers(self.settings.deepseek_api_key),
                     "body": {"instruction": instruction, "payload": payload},
                 },
@@ -282,37 +313,7 @@ class DeepSeekClient:
             "temperature": 0.2,
             "thinking": {"type": "enabled"},
         }
-        if structured:
-            request.update(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Return the complete result only through one submit_result "
-                            "function call. Do not return prose or Markdown."
-                        ),
-                    },
-                    {"role": "user", "content": content},
-                ],
-                temperature=0,
-                stream=False,
-            )
-            request["tools"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "submit_result",
-                        "description": "Submit the complete structured result.",
-                        "strict": True,
-                        "parameters": schema,
-                    },
-                }
-            ]
-            request["tool_choice"] = {
-                "type": "function",
-                "function": {"name": "submit_result"},
-            }
-        elif json_mode:
+        if json_mode:
             request["response_format"] = {"type": "json_object"}
 
         record: dict[str, Any] | None = None
@@ -321,13 +322,13 @@ class DeepSeekClient:
                 response, record = _send(
                     client,
                     "POST",
-                    _deepseek_url(self.settings.deepseek_api_base, structured=structured),
+                    _deepseek_chat_url(self.settings.deepseek_api_base),
                     headers=_headers(self.settings.deepseek_api_key),
                     json_body=request,
                 )
             _ensure_success(response, record, media)
             body = _json_body(response)
-            value = _structured_arguments(body) if structured else _message_content(body)
+            value = _message_content(body)
             return ProviderResult(value=value, record=record, evidence_media=media)
         except ProviderFailure as exc:
             if exc.evidence_media:
@@ -337,7 +338,7 @@ class DeepSeekClient:
             fallback = record or {
                 "request": {
                     "method": "POST",
-                    "url": _deepseek_url(self.settings.deepseek_api_base, structured=structured),
+                    "url": _deepseek_chat_url(self.settings.deepseek_api_base),
                     "headers": _headers(self.settings.deepseek_api_key),
                     "body": request,
                 },
@@ -357,7 +358,6 @@ class DeepSeekClient:
             instruction,
             payload,
             images,
-            structured=False,
             json_mode=json_mode,
         )
 
@@ -368,13 +368,66 @@ class DeepSeekClient:
         schema: dict[str, Any],
         images: list[Path] | None = None,
     ) -> ProviderResult[dict[str, Any]]:
-        return self._request(
-            instruction,
-            payload,
-            images,
-            structured=True,
-            schema=schema,
-        )
+        media = list(images or [])
+        url = _deepseek_responses_url(self.settings.deepseek_api_base)
+        try:
+            content = self._responses_content(payload, media)
+        except Exception as exc:
+            record = {
+                "request": {
+                    "method": "POST",
+                    "url": url,
+                    "headers": _headers(self.settings.deepseek_api_key),
+                    "body": {"instruction": instruction, "payload": payload},
+                },
+                "response": None,
+            }
+            raise ProviderFailure(record, media, exc) from exc
+
+        request: dict[str, Any] = {
+            "model": self.settings.deepseek_model,
+            "instructions": instruction,
+            "input": [{"role": "user", "content": content}],
+            "reasoning": {"effort": "high"},
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "duet_structured_result",
+                    "schema": schema,
+                }
+            },
+        }
+        record: dict[str, Any] | None = None
+        try:
+            with httpx.Client(
+                timeout=self.settings.request_timeout_s,
+                transport=self.transport,
+            ) as client:
+                response, record = _send(
+                    client,
+                    "POST",
+                    url,
+                    headers=_headers(self.settings.deepseek_api_key),
+                    json_body=request,
+                )
+            _ensure_success(response, record, media)
+            value = _structured_output(_json_body(response))
+            return ProviderResult(value=value, record=record, evidence_media=media)
+        except ProviderFailure as exc:
+            if exc.evidence_media:
+                raise
+            raise ProviderFailure(exc.record, media, exc.cause) from exc.cause
+        except Exception as exc:
+            fallback = record or {
+                "request": {
+                    "method": "POST",
+                    "url": url,
+                    "headers": _headers(self.settings.deepseek_api_key),
+                    "body": request,
+                },
+                "response": None,
+            }
+            raise ProviderFailure(fallback, media, exc) from exc
 
 
 class CodexProcessError(RuntimeError):

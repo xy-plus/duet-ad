@@ -89,7 +89,7 @@ class _FlowDeepSeek:
             self.visual_barrier.wait(timeout=3)
             return ProviderResult(
                 {"prompt": f"visual-{index}"},
-                {"response": {"tool": "submit_result", "segment": index}},
+                {"response": {"api": "responses", "segment": index}},
             )
         output_name = (
             ((schema.get("properties") or {}).get("schema") or {}).get("enum")
@@ -107,7 +107,7 @@ class _FlowDeepSeek:
                     "input_sha256": schema["properties"]["input_sha256"]["enum"][0],
                     "voice_id": schema["properties"]["voice_id"]["enum"][0],
                 },
-                {"response": {"tool": "submit_result", "phase": "voice-selection"}},
+                {"response": {"api": "responses", "phase": "voice-selection"}},
             )
         if "input_sha256" in schema.get("properties", {}):
             index = int(payload["segment_index"])
@@ -124,14 +124,14 @@ class _FlowDeepSeek:
                     "segment_index": index,
                     "prompt": f"r2v prompt {index}",
                 },
-                {"response": {"tool": "submit_result", "segment": index}},
+                {"response": {"api": "responses", "segment": index}},
             )
         if schema == TRANSLATION_SCHEMA:
             with self.lock:
                 self.events.append("translation")
             return ProviderResult(
                 {"lines": [{"text": "translated line"}]},
-                {"response": {"tool": "submit_result", "phase": "translation"}},
+                {"response": {"api": "responses", "phase": "translation"}},
             )
         assert schema == PROJECT_INDEX_SCHEMA
         with self.lock:
@@ -160,7 +160,7 @@ class _FlowDeepSeek:
         }
         return ProviderResult(
             raw,
-            {"response": {"tool": "submit_result", "phase": "project_index"}},
+            {"response": {"api": "responses", "phase": "project_index"}},
         )
 
 
@@ -464,6 +464,12 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert len(fusion_calls) == 2
     assert len(voice_calls) == 1
     assert len(translation_calls) == 1
+    assert all(
+        "submit_result" not in call["instruction"]
+        for call in deepseek.structured_calls
+    )
+    assert all("JSON Schema" in call["instruction"] for call in visual_calls)
+    assert "JSON Schema" in translation_calls[0]["instruction"]
     assert translation_calls[0]["schema"]["additionalProperties"] is False
     assert translation_calls[0]["schema"]["properties"]["lines"]["items"]["additionalProperties"] is False
     assert sorted(call["payload"]["segment_index"] for call in fusion_calls) == [1, 2]
@@ -514,7 +520,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     )
     assert translation_output["value"][0]["text"] == "translated line"
     assert translation_output["provider_record"]["response"] == {
-        "tool": "submit_result", "phase": "translation",
+        "api": "responses", "phase": "translation",
     }
 
     poll_root = project / "logs" / "picsart-poll"
